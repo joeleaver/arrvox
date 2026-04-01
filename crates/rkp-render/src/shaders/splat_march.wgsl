@@ -233,6 +233,74 @@ fn sample_opacity_trilinear(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
     return mix(c0, c1, t.z);
 }
 
+// ── Inverse Skinning ───────────────────────────────────────────────────────
+
+/// Look up bone weights at a local-space position (nearest-neighbor).
+/// Returns packed (indices: u32, weights: u32) from the BoneBrick companion data.
+fn lookup_bone_data(local_pos: vec3<f32>, obj: GpuObject) -> vec2<u32> {
+    let vs = obj.voxel_size;
+    let brick_extent = vs * 8.0;
+    let dims = vec3<u32>(obj.rest_brick_map_dims_x, obj.rest_brick_map_dims_y, obj.rest_brick_map_dims_z);
+    let grid_size = vec3<f32>(dims) * brick_extent;
+    let grid_pos = local_pos + grid_size * 0.5;
+
+    if any(grid_pos < vec3<f32>(0.0)) || any(grid_pos >= grid_size) {
+        return vec2<u32>(0u, 0u);
+    }
+
+    let voxel_coord = grid_pos / vs;
+    let vc = clamp(vec3<i32>(floor(voxel_coord)), vec3<i32>(0), vec3<i32>(dims) * 8 - vec3<i32>(1));
+    let brick = vec3<u32>(vc / vec3<i32>(8));
+    let local = vec3<u32>(vc % vec3<i32>(8));
+    let flat_brick = brick.x + brick.y * dims.x + brick.z * dims.x * dims.y;
+    let slot = brick_maps[obj.rest_brick_map_offset + flat_brick];
+
+    if slot == EMPTY_SLOT || slot == INTERIOR_SLOT {
+        return vec2<u32>(0u, 0u);
+    }
+
+    let vi = local.x + local.y * 8u + local.z * 64u;
+    let bw_base = slot * 1024u + vi * 2u;
+    return vec2<u32>(bone_weights[bw_base], bone_weights[bw_base + 1u]);
+}
+
+/// Inverse-skin a position from posed space to rest-pose space.
+/// Uses the inverse bone matrices (stored after forward matrices in bone_matrices buffer).
+fn inverse_skin_pos(pos: vec3<f32>, packed_indices: u32, packed_weights: u32, obj: GpuObject) -> vec3<f32> {
+    var result = vec3<f32>(0.0);
+    var total_w = 0.0;
+    for (var i = 0u; i < 4u; i++) {
+        let bone_idx = (packed_indices >> (i * 8u)) & 0xFFu;
+        let w = f32((packed_weights >> (i * 8u)) & 0xFFu);
+        if w < 1.0 { continue; }
+        // Inverse matrices are stored after forward matrices: offset + bone_count + bone_idx
+        let inv_mat = bone_matrices[obj.bone_buffer_offset + obj.bone_count + bone_idx];
+        let tp = (inv_mat * vec4<f32>(pos, 1.0)).xyz;
+        result += tp * w;
+        total_w += w;
+    }
+    if total_w > 0.0 { return result / total_w; }
+    return pos;
+}
+
+/// Forward-skin a direction vector from rest-pose to posed space.
+/// Uses the forward bone matrices for normal transformation.
+fn forward_skin_dir(dir: vec3<f32>, packed_indices: u32, packed_weights: u32, obj: GpuObject) -> vec3<f32> {
+    var result = vec3<f32>(0.0);
+    var total_w = 0.0;
+    for (var i = 0u; i < 4u; i++) {
+        let bone_idx = (packed_indices >> (i * 8u)) & 0xFFu;
+        let w = f32((packed_weights >> (i * 8u)) & 0xFFu);
+        if w < 1.0 { continue; }
+        let fwd_mat = bone_matrices[obj.bone_buffer_offset + bone_idx];
+        let td = (fwd_mat * vec4<f32>(dir, 0.0)).xyz;
+        result += td * w;
+        total_w += w;
+    }
+    if total_w > 0.0 { return result / total_w; }
+    return dir;
+}
+
 // ── AABB Ray Intersection ──────────────────────────────────────────────────
 
 /// Returns (t_enter, t_exit) for ray-AABB intersection. t_enter > t_exit means miss.
@@ -273,18 +341,27 @@ fn sample_material_at_hit(local_pos: vec3<f32>, obj: GpuObject) -> vec3<u32> {
 
 /// March a ray through a single object's opacity field.
 /// Returns the t value of the surface hit, or -1.0 on miss.
+/// Dispatches to skinned variant for animated objects.
 fn march_object(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
+    let obj = objects[obj_idx];
+
+    if obj.is_skinned != 0u && obj.bone_count > 0u {
+        return march_object_skinned(origin, dir, obj_idx);
+    }
+
+    return march_object_static(origin, dir, obj_idx);
+}
+
+/// March through a static (non-skinned) object.
+fn march_object_static(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
     let obj = objects[obj_idx];
     let inv_world = obj.inverse_world;
 
-    // Transform ray to local space
     let local_origin = (inv_world * vec4<f32>(origin, 1.0)).xyz;
     let local_dir = normalize((inv_world * vec4<f32>(dir, 0.0)).xyz);
     let safe_dir = select(local_dir, vec3<f32>(1e-10), abs(local_dir) < vec3<f32>(1e-10));
     let inv_local_dir = 1.0 / safe_dir;
 
-    // Compute local-space AABB from brick grid dimensions.
-    // The grid is centered at the local origin: [-grid_size/2, +grid_size/2].
     let brick_extent = obj.voxel_size * 8.0;
     let dims = vec3<f32>(
         f32(obj.brick_map_dims_x),
@@ -292,16 +369,11 @@ fn march_object(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
         f32(obj.brick_map_dims_z),
     );
     let half_grid = dims * brick_extent * 0.5;
-    let local_aabb_min = -half_grid;
-    let local_aabb_max = half_grid;
-    let t_range = intersect_aabb(local_origin, inv_local_dir, local_aabb_min, local_aabb_max);
+    let t_range = intersect_aabb(local_origin, inv_local_dir, -half_grid, half_grid);
     if t_range.x > t_range.y {
-        return -1.0; // Ray misses AABB
+        return -1.0;
     }
 
-    // Fixed-step march at quarter-voxel resolution.
-    // The linear interpolation at threshold crossing gives sub-step precision,
-    // so the step size mainly affects whether we detect the crossing at all.
     let step_size = obj.voxel_size * 0.25;
     let max_steps = min(u32(ceil((t_range.y - t_range.x) / step_size)), MAX_MARCH_STEPS);
 
@@ -313,12 +385,9 @@ fn march_object(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
         let local_pos = local_origin + safe_dir * t;
         let opacity = sample_opacity_trilinear(local_pos, obj);
 
-        // Threshold crossing: opacity went from below to above 0.5
         if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
-            // Linear interpolation to find sub-step crossing point
             let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
-            let refined_t = mix(prev_t, t, frac);
-            return refined_t;
+            return mix(prev_t, t, frac);
         }
 
         prev_opacity = opacity;
@@ -326,7 +395,93 @@ fn march_object(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
         t += step_size;
     }
 
-    return -1.0; // No surface found
+    return -1.0;
+}
+
+/// March through a skinned object using inverse skinning.
+///
+/// At each step, the local-space position is inverse-skinned back to rest-pose
+/// before sampling the opacity field. The brick data never moves — only the
+/// sampling position is warped. This eliminates the scatter-based SkinDeformPass.
+fn march_object_skinned(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
+    let obj = objects[obj_idx];
+    let inv_world = obj.inverse_world;
+
+    let local_origin = (inv_world * vec4<f32>(origin, 1.0)).xyz;
+    let local_dir = normalize((inv_world * vec4<f32>(dir, 0.0)).xyz);
+    let safe_dir = select(local_dir, vec3<f32>(1e-10), abs(local_dir) < vec3<f32>(1e-10));
+    let inv_local_dir = 1.0 / safe_dir;
+
+    // Use the object's world-space AABB (already inflated by the engine for
+    // the animation range) transformed to local space.
+    let aabb_min = obj.aabb_min.xyz;
+    let aabb_max = obj.aabb_max.xyz;
+    // Transform AABB to local space (for identity transform these are the same)
+    let local_aabb_min = (inv_world * vec4<f32>(aabb_min, 1.0)).xyz;
+    let local_aabb_max = (inv_world * vec4<f32>(aabb_max, 1.0)).xyz;
+    let t_range = intersect_aabb(local_origin, inv_local_dir,
+        min(local_aabb_min, local_aabb_max),
+        max(local_aabb_min, local_aabb_max));
+    if t_range.x > t_range.y {
+        return -1.0;
+    }
+
+    let step_size = obj.voxel_size * 0.5; // slightly larger step for skinned (perf)
+    let max_steps = min(u32(ceil((t_range.y - t_range.x) / step_size)), MAX_MARCH_STEPS);
+
+    // We need a GpuObject-like struct pointing to the REST brick map for sampling.
+    // The rest brick map offset and dims are stored in the GpuObject.
+    var rest_obj = obj;
+    rest_obj.brick_map_offset = obj.rest_brick_map_offset;
+    rest_obj.brick_map_dims_x = obj.rest_brick_map_dims_x;
+    rest_obj.brick_map_dims_y = obj.rest_brick_map_dims_y;
+    rest_obj.brick_map_dims_z = obj.rest_brick_map_dims_z;
+
+    var t = t_range.x;
+    var prev_opacity = 0.0;
+    var prev_t = t;
+
+    for (var step = 0u; step < max_steps; step++) {
+        let local_pos = local_origin + safe_dir * t;
+
+        // Inverse skinning via nearest-bone search.
+        // For each march position, find the closest bone joint (using forward
+        // bone matrices — column 3 is the joint world position), then use that
+        // bone's inverse matrix to warp back to rest-pose.
+        var rest_pos = local_pos;
+        var best_bone = 0u;
+        var best_dist_sq = MAX_FLOAT;
+
+        for (var bi = 0u; bi < obj.bone_count; bi++) {
+            let fwd_mat = bone_matrices[obj.bone_buffer_offset + bi];
+            // Column 3 of the forward bone matrix is the joint position
+            let joint_pos = vec3<f32>(fwd_mat[3][0], fwd_mat[3][1], fwd_mat[3][2]);
+            let d = local_pos - joint_pos;
+            let dist_sq = dot(d, d);
+            if dist_sq < best_dist_sq {
+                best_dist_sq = dist_sq;
+                best_bone = bi;
+            }
+        }
+
+        // Use the nearest bone's inverse matrix
+        let inv_mat = bone_matrices[obj.bone_buffer_offset + obj.bone_count + best_bone];
+        rest_pos = (inv_mat * vec4<f32>(local_pos, 1.0)).xyz;
+
+        // Sample opacity in rest-pose space
+        let opacity = sample_opacity_trilinear(rest_pos, rest_obj);
+
+        if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
+            let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
+            return mix(prev_t, t, frac);
+        }
+
+        prev_opacity = opacity;
+        prev_t = t;
+        t += step_size;
+    }
+
+    return -1.0;
 }
 
 // ── Tiled March ────────────────────────────────────────────────────────────
@@ -414,9 +569,15 @@ fn compute_normal(hit_pos: vec3<f32>, obj_idx: u32) -> vec3<f32> {
     let obj = objects[obj_idx];
     let local_pos = (obj.inverse_world * vec4<f32>(hit_pos, 1.0)).xyz;
 
-    // Gradient of the opacity field via 6-tap central differences.
-    // The opacity field is natively smooth (produced by smoothstep in voxelizer),
-    // so this gives clean normals without any intermediate conversion.
+    if obj.is_skinned != 0u && obj.bone_count > 0u {
+        return compute_normal_skinned(local_pos, obj);
+    }
+
+    return compute_normal_static(local_pos, obj);
+}
+
+/// Normal for static objects — gradient directly in local space.
+fn compute_normal_static(local_pos: vec3<f32>, obj: GpuObject) -> vec3<f32> {
     let eps = obj.voxel_size * 2.0;
     let gx = sample_opacity_trilinear(local_pos + vec3<f32>(eps, 0.0, 0.0), obj)
            - sample_opacity_trilinear(local_pos - vec3<f32>(eps, 0.0, 0.0), obj);
@@ -424,16 +585,59 @@ fn compute_normal(hit_pos: vec3<f32>, obj_idx: u32) -> vec3<f32> {
            - sample_opacity_trilinear(local_pos - vec3<f32>(0.0, eps, 0.0), obj);
     let gz = sample_opacity_trilinear(local_pos + vec3<f32>(0.0, 0.0, eps), obj)
            - sample_opacity_trilinear(local_pos - vec3<f32>(0.0, 0.0, eps), obj);
-    // Gradient points from low→high opacity (into the surface). Negate for outward normal.
     let local_grad = -vec3<f32>(gx, gy, gz);
 
-    // Transform gradient from local → world space
     let world_grad = (transpose(obj.inverse_world) * vec4<f32>(local_grad, 0.0)).xyz;
-
     let len = length(world_grad);
-    if len < 1e-10 {
-        return vec3<f32>(0.0, 1.0, 0.0);
+    if len < 1e-10 { return vec3<f32>(0.0, 1.0, 0.0); }
+    return world_grad / len;
+}
+
+/// Normal for skinned objects — gradient in rest-pose space, transformed through skin.
+fn compute_normal_skinned(local_pos: vec3<f32>, obj: GpuObject) -> vec3<f32> {
+    // Use rest-pose brick map for sampling
+    var rest_obj = obj;
+    rest_obj.brick_map_offset = obj.rest_brick_map_offset;
+    rest_obj.brick_map_dims_x = obj.rest_brick_map_dims_x;
+    rest_obj.brick_map_dims_y = obj.rest_brick_map_dims_y;
+    rest_obj.brick_map_dims_z = obj.rest_brick_map_dims_z;
+
+    // Find nearest bone joint (same as in march_object_skinned)
+    var best_bone = 0u;
+    var best_dist_sq = MAX_FLOAT;
+    for (var bi = 0u; bi < obj.bone_count; bi++) {
+        let fwd_mat = bone_matrices[obj.bone_buffer_offset + bi];
+        let joint_pos = vec3<f32>(fwd_mat[3][0], fwd_mat[3][1], fwd_mat[3][2]);
+        let d = local_pos - joint_pos;
+        let dist_sq = dot(d, d);
+        if dist_sq < best_dist_sq {
+            best_dist_sq = dist_sq;
+            best_bone = bi;
+        }
     }
+
+    // Inverse-skin to rest-pose
+    let inv_mat = bone_matrices[obj.bone_buffer_offset + obj.bone_count + best_bone];
+    let rest_pos = (inv_mat * vec4<f32>(local_pos, 1.0)).xyz;
+
+    // Gradient in rest-pose space
+    let eps = obj.voxel_size * 2.0;
+    let gx = sample_opacity_trilinear(rest_pos + vec3<f32>(eps, 0.0, 0.0), rest_obj)
+           - sample_opacity_trilinear(rest_pos - vec3<f32>(eps, 0.0, 0.0), rest_obj);
+    let gy = sample_opacity_trilinear(rest_pos + vec3<f32>(0.0, eps, 0.0), rest_obj)
+           - sample_opacity_trilinear(rest_pos - vec3<f32>(0.0, eps, 0.0), rest_obj);
+    let gz = sample_opacity_trilinear(rest_pos + vec3<f32>(0.0, 0.0, eps), rest_obj)
+           - sample_opacity_trilinear(rest_pos - vec3<f32>(0.0, 0.0, eps), rest_obj);
+    let rest_grad = -vec3<f32>(gx, gy, gz);
+
+    // Forward-skin the gradient direction from rest → posed using nearest bone
+    let fwd_mat = bone_matrices[obj.bone_buffer_offset + best_bone];
+    let posed_grad = (fwd_mat * vec4<f32>(rest_grad, 0.0)).xyz;
+
+    // Transform from local → world space
+    let world_grad = (transpose(obj.inverse_world) * vec4<f32>(posed_grad, 0.0)).xyz;
+    let len = length(world_grad);
+    if len < 1e-10 { return vec3<f32>(0.0, 1.0, 0.0); }
     return world_grad / len;
 }
 

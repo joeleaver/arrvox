@@ -108,7 +108,7 @@ impl rkf_render::MarchPass for SplatMarchPass {
         self.recreate_pipeline(device, module);
     }
 
-    // No transform_brick override — keep SDF distances as-is.
-    // The splat march shader finds surfaces where distance crosses zero
-    // and computes gradient normals from the smooth SDF distance field.
+    fn needs_skin_deform(&self) -> bool {
+        false // Inverse skinning done in march shader — no scatter pass needed.
+    }
 }
