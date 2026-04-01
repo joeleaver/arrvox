@@ -374,15 +374,45 @@ fn march_object_static(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
         return -1.0;
     }
 
-    let step_size = obj.voxel_size * 0.25;
-    let max_steps = min(u32(ceil((t_range.y - t_range.x) / step_size)), MAX_MARCH_STEPS);
+    let fine_step = obj.voxel_size * 0.5;
+    let coarse_step = brick_extent; // skip entire brick when in empty space
+    let udims = vec3<u32>(obj.brick_map_dims_x, obj.brick_map_dims_y, obj.brick_map_dims_z);
+    let grid_size = vec3<f32>(udims) * brick_extent;
 
     var t = t_range.x;
     var prev_opacity = 0.0;
     var prev_t = t;
 
-    for (var step = 0u; step < max_steps; step++) {
+    for (var step = 0u; step < MAX_MARCH_STEPS; step++) {
+        if t > t_range.y { break; }
+
         let local_pos = local_origin + safe_dir * t;
+
+        // Check if we're in an empty brick — skip the whole brick if so
+        let grid_pos = local_pos + grid_size * 0.5;
+        let brick_coord = vec3<i32>(floor(grid_pos / brick_extent));
+
+        var in_empty_brick = false;
+        if all(brick_coord >= vec3<i32>(0)) && all(vec3<u32>(brick_coord) < udims) {
+            let bc = vec3<u32>(brick_coord);
+            let flat = bc.x + bc.y * udims.x + bc.z * udims.x * udims.y;
+            let slot = brick_maps[obj.brick_map_offset + flat];
+            if slot == EMPTY_SLOT {
+                in_empty_brick = true;
+            }
+        }
+
+        if in_empty_brick {
+            // Jump to the exit of this brick
+            let brick_min = vec3<f32>(brick_coord) * brick_extent - grid_size * 0.5;
+            let brick_max = brick_min + vec3<f32>(brick_extent);
+            let t_exit = intersect_aabb(local_origin, inv_local_dir, brick_min, brick_max);
+            prev_opacity = 0.0;
+            prev_t = t;
+            t = t_exit.y + obj.voxel_size * 0.1; // step just past the brick boundary
+            continue;
+        }
+
         let opacity = sample_opacity_trilinear(local_pos, obj);
 
         if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
@@ -392,7 +422,7 @@ fn march_object_static(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
 
         prev_opacity = opacity;
         prev_t = t;
-        t += step_size;
+        t += fine_step;
     }
 
     return -1.0;
