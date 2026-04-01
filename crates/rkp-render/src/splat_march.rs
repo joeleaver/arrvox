@@ -108,7 +108,7 @@ impl rkf_render::MarchPass for SplatMarchPass {
         self.recreate_pipeline(device, module);
     }
 
-    fn needs_skin_deform(&self) -> bool {
-        false // Inverse skinning done in march shader — no scatter pass needed.
-    }
+    // needs_skin_deform: default true — use the SkinDeformPass to scatter
+    // bone weights into posed space. The march shader reads them and inverse-skins
+    // back to rest-pose for opacity sampling.
 }

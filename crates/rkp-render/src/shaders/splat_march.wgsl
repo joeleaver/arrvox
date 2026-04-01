@@ -398,11 +398,50 @@ fn march_object_static(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
     return -1.0;
 }
 
-/// March through a skinned object using inverse skinning.
+/// Read bone data from the deformed pool at a posed-space voxel position.
+/// Returns (packed_indices, packed_weights). Both 0 = no bone data.
+fn read_bone_field(vc: vec3<i32>, dims: vec3<u32>, total_voxels: vec3<i32>, pool_offset: u32) -> vec2<u32> {
+    let c = clamp(vc, vec3<i32>(0), total_voxels - vec3<i32>(1));
+    let brick = vec3<u32>(c) / vec3<u32>(8u);
+    let local = vec3<u32>(c) % vec3<u32>(8u);
+    let flat_brick = brick.x + brick.y * dims.x + brick.z * dims.x * dims.y;
+    let vi = local.x + local.y * 8u + local.z * 64u;
+    let idx = pool_offset + flat_brick * 512u + vi;
+    let s = deformed_pool[idx];
+    return vec2<u32>(s.word0, s.word1);
+}
+
+/// Inverse-skin a deformed position to rest-pose using packed bone weights.
+fn inverse_skin_position(pos: vec3<f32>, packed_indices: u32, packed_weights: u32, obj: GpuObject) -> vec3<f32> {
+    var result = vec3<f32>(0.0);
+    var total_w = 0.0;
+    for (var i = 0u; i < 4u; i++) {
+        let bone_idx = (packed_indices >> (i * 8u)) & 0xFFu;
+        let w = f32((packed_weights >> (i * 8u)) & 0xFFu);
+        if w < 1.0 { continue; }
+        let inv_mat = bone_matrices[obj.bone_buffer_offset + obj.bone_count + bone_idx];
+        let rp = (inv_mat * vec4<f32>(pos, 1.0)).xyz;
+        result += rp * w;
+        total_w += w;
+    }
+    if total_w > 0.0 { return result / total_w; }
+    return pos;
+}
+
+/// Sample rest-pose opacity at a continuous position via the rest brick map.
+fn sample_rest_opacity(rest_pos: vec3<f32>, obj: GpuObject) -> f32 {
+    var rest_obj = obj;
+    rest_obj.brick_map_offset = obj.rest_brick_map_offset;
+    rest_obj.brick_map_dims_x = obj.rest_brick_map_dims_x;
+    rest_obj.brick_map_dims_y = obj.rest_brick_map_dims_y;
+    rest_obj.brick_map_dims_z = obj.rest_brick_map_dims_z;
+    return sample_opacity_trilinear(rest_pos, rest_obj);
+}
+
+/// March through a skinned object.
 ///
-/// At each step, the local-space position is inverse-skinned back to rest-pose
-/// before sampling the opacity field. The brick data never moves — only the
-/// sampling position is warped. This eliminates the scatter-based SkinDeformPass.
+/// Reads bone weights from the deformed pool (scattered by SkinDeformPass),
+/// inverse-skins to rest-pose, and samples opacity from the rest-pose brick pool.
 fn march_object_skinned(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
     let obj = objects[obj_idx];
     let inv_world = obj.inverse_world;
@@ -412,13 +451,9 @@ fn march_object_skinned(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 
     let safe_dir = select(local_dir, vec3<f32>(1e-10), abs(local_dir) < vec3<f32>(1e-10));
     let inv_local_dir = 1.0 / safe_dir;
 
-    // Use the object's world-space AABB (already inflated by the engine for
-    // the animation range) transformed to local space.
-    let aabb_min = obj.aabb_min.xyz;
-    let aabb_max = obj.aabb_max.xyz;
-    // Transform AABB to local space (for identity transform these are the same)
-    let local_aabb_min = (inv_world * vec4<f32>(aabb_min, 1.0)).xyz;
-    let local_aabb_max = (inv_world * vec4<f32>(aabb_max, 1.0)).xyz;
+    // Use the world-space AABB (covers the deformed pose)
+    let local_aabb_min = (inv_world * vec4<f32>(obj.aabb_min.xyz, 1.0)).xyz;
+    let local_aabb_max = (inv_world * vec4<f32>(obj.aabb_max.xyz, 1.0)).xyz;
     let t_range = intersect_aabb(local_origin, inv_local_dir,
         min(local_aabb_min, local_aabb_max),
         max(local_aabb_min, local_aabb_max));
@@ -426,16 +461,15 @@ fn march_object_skinned(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 
         return -1.0;
     }
 
-    let step_size = obj.voxel_size * 0.5; // slightly larger step for skinned (perf)
-    let max_steps = min(u32(ceil((t_range.y - t_range.x) / step_size)), MAX_MARCH_STEPS);
+    // Deformed pool grid dimensions
+    let dims = vec3<u32>(obj.brick_map_dims_x, obj.brick_map_dims_y, obj.brick_map_dims_z);
+    let vs = obj.voxel_size;
+    let brick_extent = vs * 8.0;
+    let grid_size = vec3<f32>(dims) * brick_extent;
+    let total_v = vec3<i32>(dims) * 8;
 
-    // We need a GpuObject-like struct pointing to the REST brick map for sampling.
-    // The rest brick map offset and dims are stored in the GpuObject.
-    var rest_obj = obj;
-    rest_obj.brick_map_offset = obj.rest_brick_map_offset;
-    rest_obj.brick_map_dims_x = obj.rest_brick_map_dims_x;
-    rest_obj.brick_map_dims_y = obj.rest_brick_map_dims_y;
-    rest_obj.brick_map_dims_z = obj.rest_brick_map_dims_z;
+    let step_size = vs * 0.5;
+    let max_steps = min(u32(ceil((t_range.y - t_range.x) / step_size)), MAX_MARCH_STEPS);
 
     var t = t_range.x;
     var prev_opacity = 0.0;
@@ -444,32 +478,35 @@ fn march_object_skinned(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 
     for (var step = 0u; step < max_steps; step++) {
         let local_pos = local_origin + safe_dir * t;
 
-        // Inverse skinning via nearest-bone search.
-        // For each march position, find the closest bone joint (using forward
-        // bone matrices — column 3 is the joint world position), then use that
-        // bone's inverse matrix to warp back to rest-pose.
-        var rest_pos = local_pos;
-        var best_bone = 0u;
-        var best_dist_sq = MAX_FLOAT;
+        // Convert posed position to deformed-pool voxel coords
+        let grid_pos = local_pos + grid_size * 0.5;
+        let vc = vec3<i32>(floor(grid_pos / vs));
 
-        for (var bi = 0u; bi < obj.bone_count; bi++) {
-            let fwd_mat = bone_matrices[obj.bone_buffer_offset + bi];
-            // Column 3 of the forward bone matrix is the joint position
-            let joint_pos = vec3<f32>(fwd_mat[3][0], fwd_mat[3][1], fwd_mat[3][2]);
-            let d = local_pos - joint_pos;
-            let dist_sq = dot(d, d);
-            if dist_sq < best_dist_sq {
-                best_dist_sq = dist_sq;
-                best_bone = bi;
+        // Read bone weights from deformed pool (scattered by SkinDeformPass)
+        var bone_data = read_bone_field(vc, dims, total_v, obj.deformed_pool_offset);
+
+        // If no bone data at nearest voxel, try 6-connected neighbors
+        if bone_data.x == 0u && bone_data.y == 0u {
+            let offsets = array<vec3<i32>, 6>(
+                vec3<i32>(-1,0,0), vec3<i32>(1,0,0),
+                vec3<i32>(0,-1,0), vec3<i32>(0,1,0),
+                vec3<i32>(0,0,-1), vec3<i32>(0,0,1),
+            );
+            for (var ni = 0u; ni < 6u; ni++) {
+                let nb = read_bone_field(vc + offsets[ni], dims, total_v, obj.deformed_pool_offset);
+                if nb.x != 0u || nb.y != 0u {
+                    bone_data = nb;
+                    break;
+                }
             }
         }
 
-        // Use the nearest bone's inverse matrix
-        let inv_mat = bone_matrices[obj.bone_buffer_offset + obj.bone_count + best_bone];
-        rest_pos = (inv_mat * vec4<f32>(local_pos, 1.0)).xyz;
-
-        // Sample opacity in rest-pose space
-        let opacity = sample_opacity_trilinear(rest_pos, rest_obj);
+        var opacity = 0.0;
+        if bone_data.x != 0u || bone_data.y != 0u {
+            // Inverse-skin to rest-pose, sample opacity there
+            let rest_pos = inverse_skin_position(local_pos, bone_data.x, bone_data.y, obj);
+            opacity = sample_rest_opacity(rest_pos, obj);
+        }
 
         if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
             let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
@@ -593,52 +630,90 @@ fn compute_normal_static(local_pos: vec3<f32>, obj: GpuObject) -> vec3<f32> {
     return world_grad / len;
 }
 
-/// Normal for skinned objects — gradient in rest-pose space, transformed through skin.
+/// Normal for skinned objects — read bone data from deformed pool, inverse-skin,
+/// compute gradient in rest-pose, forward-skin back.
 fn compute_normal_skinned(local_pos: vec3<f32>, obj: GpuObject) -> vec3<f32> {
-    // Use rest-pose brick map for sampling
-    var rest_obj = obj;
-    rest_obj.brick_map_offset = obj.rest_brick_map_offset;
-    rest_obj.brick_map_dims_x = obj.rest_brick_map_dims_x;
-    rest_obj.brick_map_dims_y = obj.rest_brick_map_dims_y;
-    rest_obj.brick_map_dims_z = obj.rest_brick_map_dims_z;
+    // Read bone weights from deformed pool
+    let dims = vec3<u32>(obj.brick_map_dims_x, obj.brick_map_dims_y, obj.brick_map_dims_z);
+    let vs = obj.voxel_size;
+    let grid_size = vec3<f32>(dims) * vs * 8.0;
+    let total_v = vec3<i32>(dims) * 8;
 
-    // Find nearest bone joint (same as in march_object_skinned)
-    var best_bone = 0u;
-    var best_dist_sq = MAX_FLOAT;
-    for (var bi = 0u; bi < obj.bone_count; bi++) {
-        let fwd_mat = bone_matrices[obj.bone_buffer_offset + bi];
-        let joint_pos = vec3<f32>(fwd_mat[3][0], fwd_mat[3][1], fwd_mat[3][2]);
-        let d = local_pos - joint_pos;
-        let dist_sq = dot(d, d);
-        if dist_sq < best_dist_sq {
-            best_dist_sq = dist_sq;
-            best_bone = bi;
+    let grid_pos = local_pos + grid_size * 0.5;
+    let vc = vec3<i32>(floor(grid_pos / vs));
+
+    var bone_data = read_bone_field(vc, dims, total_v, obj.deformed_pool_offset);
+    if bone_data.x == 0u && bone_data.y == 0u {
+        let offsets = array<vec3<i32>, 6>(
+            vec3<i32>(-1,0,0), vec3<i32>(1,0,0),
+            vec3<i32>(0,-1,0), vec3<i32>(0,1,0),
+            vec3<i32>(0,0,-1), vec3<i32>(0,0,1),
+        );
+        for (var ni = 0u; ni < 6u; ni++) {
+            let nb = read_bone_field(vc + offsets[ni], dims, total_v, obj.deformed_pool_offset);
+            if nb.x != 0u || nb.y != 0u {
+                bone_data = nb;
+                break;
+            }
         }
     }
 
+    if bone_data.x == 0u && bone_data.y == 0u {
+        return vec3<f32>(0.0, 1.0, 0.0);
+    }
+
     // Inverse-skin to rest-pose
-    let inv_mat = bone_matrices[obj.bone_buffer_offset + obj.bone_count + best_bone];
-    let rest_pos = (inv_mat * vec4<f32>(local_pos, 1.0)).xyz;
+    let rest_pos = inverse_skin_position(local_pos, bone_data.x, bone_data.y, obj);
 
     // Gradient in rest-pose space
-    let eps = obj.voxel_size * 2.0;
-    let gx = sample_opacity_trilinear(rest_pos + vec3<f32>(eps, 0.0, 0.0), rest_obj)
-           - sample_opacity_trilinear(rest_pos - vec3<f32>(eps, 0.0, 0.0), rest_obj);
-    let gy = sample_opacity_trilinear(rest_pos + vec3<f32>(0.0, eps, 0.0), rest_obj)
-           - sample_opacity_trilinear(rest_pos - vec3<f32>(0.0, eps, 0.0), rest_obj);
-    let gz = sample_opacity_trilinear(rest_pos + vec3<f32>(0.0, 0.0, eps), rest_obj)
-           - sample_opacity_trilinear(rest_pos - vec3<f32>(0.0, 0.0, eps), rest_obj);
+    let eps = vs * 2.0;
+    let gx = sample_rest_opacity(rest_pos + vec3<f32>(eps, 0.0, 0.0), obj)
+           - sample_rest_opacity(rest_pos - vec3<f32>(eps, 0.0, 0.0), obj);
+    let gy = sample_rest_opacity(rest_pos + vec3<f32>(0.0, eps, 0.0), obj)
+           - sample_rest_opacity(rest_pos - vec3<f32>(0.0, eps, 0.0), obj);
+    let gz = sample_rest_opacity(rest_pos + vec3<f32>(0.0, 0.0, eps), obj)
+           - sample_rest_opacity(rest_pos - vec3<f32>(0.0, 0.0, eps), obj);
     let rest_grad = -vec3<f32>(gx, gy, gz);
 
-    // Forward-skin the gradient direction from rest → posed using nearest bone
-    let fwd_mat = bone_matrices[obj.bone_buffer_offset + best_bone];
-    let posed_grad = (fwd_mat * vec4<f32>(rest_grad, 0.0)).xyz;
+    // Forward-skin the gradient from rest → posed
+    let posed_grad = forward_skin_dir(rest_grad, bone_data.x, bone_data.y, obj);
 
     // Transform from local → world space
     let world_grad = (transpose(obj.inverse_world) * vec4<f32>(posed_grad, 0.0)).xyz;
     let len = length(world_grad);
     if len < 1e-10 { return vec3<f32>(0.0, 1.0, 0.0); }
     return world_grad / len;
+}
+
+/// Sample per-voxel color from the color companion pool at a rest-pose position.
+/// Returns packed RGB24 as u32 (0 = no color data).
+fn sample_rest_color(rest_pos: vec3<f32>, obj: GpuObject) -> u32 {
+    let vs = obj.voxel_size;
+    let rest_dims = vec3<u32>(obj.rest_brick_map_dims_x, obj.rest_brick_map_dims_y, obj.rest_brick_map_dims_z);
+    let rest_grid_size = vec3<f32>(rest_dims) * vs * 8.0;
+    let gp = rest_pos + rest_grid_size * 0.5;
+
+    if any(gp < vec3<f32>(0.0)) || any(gp >= rest_grid_size) {
+        return 0u;
+    }
+
+    let vc = clamp(vec3<i32>(floor(gp / vs)), vec3<i32>(0), vec3<i32>(rest_dims) * 8 - vec3<i32>(1));
+    let brick = vec3<u32>(vc) / vec3<u32>(8u);
+    let local = vec3<u32>(vc) % vec3<u32>(8u);
+    let flat_brick = brick.x + brick.y * rest_dims.x + brick.z * rest_dims.x * rest_dims.y;
+    let slot = brick_maps[obj.rest_brick_map_offset + flat_brick];
+
+    if slot == EMPTY_SLOT || slot == INTERIOR_SLOT {
+        return 0u;
+    }
+
+    let color_slot = color_companion_map[slot];
+    if color_slot == EMPTY_SLOT {
+        return 0u;
+    }
+
+    let vi = local.x + local.y * 8u + local.z * 64u;
+    return color_pool_data[color_slot * 512u + vi];
 }
 
 // ── Motion Vector ──────────────────────────────────────────────────────────
@@ -689,10 +764,41 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
         let packed_g = (result.blend_weight & 0xFFu)
                      | ((result.object_id & 0xFFu) << 8u);
 
+        // For skinned objects, sample per-voxel color at rest-pose position
+        // and pack into gbuf_motion.z (same convention as rkf-render).
+        var skinned_color_u32 = 0u;
+        let hit_obj = objects[result.obj_idx];
+        if hit_obj.is_skinned != 0u && hit_obj.bone_count > 0u {
+            let local_hit = (hit_obj.inverse_world * vec4<f32>(hit_pos, 1.0)).xyz;
+            let dims = vec3<u32>(hit_obj.brick_map_dims_x, hit_obj.brick_map_dims_y, hit_obj.brick_map_dims_z);
+            let vs = hit_obj.voxel_size;
+            let grid_size = vec3<f32>(dims) * vs * 8.0;
+            let total_v = vec3<i32>(dims) * 8;
+            let grid_pos = local_hit + grid_size * 0.5;
+            let vc = vec3<i32>(floor(grid_pos / vs));
+
+            var bone_data = read_bone_field(vc, dims, total_v, hit_obj.deformed_pool_offset);
+            if bone_data.x == 0u && bone_data.y == 0u {
+                let offsets = array<vec3<i32>, 6>(
+                    vec3<i32>(-1,0,0), vec3<i32>(1,0,0),
+                    vec3<i32>(0,-1,0), vec3<i32>(0,1,0),
+                    vec3<i32>(0,0,-1), vec3<i32>(0,0,1),
+                );
+                for (var ni = 0u; ni < 6u; ni++) {
+                    let nb = read_bone_field(vc + offsets[ni], dims, total_v, hit_obj.deformed_pool_offset);
+                    if nb.x != 0u || nb.y != 0u { bone_data = nb; break; }
+                }
+            }
+            if bone_data.x != 0u || bone_data.y != 0u {
+                let rest_pos = inverse_skin_position(local_hit, bone_data.x, bone_data.y, hit_obj);
+                skinned_color_u32 = sample_rest_color(rest_pos, hit_obj);
+            }
+        }
+
         textureStore(gbuf_position, coord, vec4<f32>(hit_pos, result.t));
         textureStore(gbuf_normal,   coord, vec4<f32>(normal, 0.0));
         textureStore(gbuf_material, coord, vec4<u32>(packed_r, packed_g, 0u, 0u));
-        textureStore(gbuf_motion,   coord, vec4<f32>(motion, 0.0, 0.0));
+        textureStore(gbuf_motion,   coord, vec4<f32>(motion, bitcast<f32>(skinned_color_u32), 0.0));
     } else {
         // Miss — clear G-buffer
         textureStore(gbuf_position, coord, vec4<f32>(0.0, 0.0, 0.0, MAX_FLOAT));
