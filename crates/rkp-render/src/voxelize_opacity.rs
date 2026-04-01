@@ -138,9 +138,11 @@ fn process_brick(
                     }
                 }
 
-                // Bone weights for solid voxels
+                // Bone weights for any voxel with non-zero opacity
+                // (the skin deform pass needs weights for all deformed voxels,
+                // including those in the opacity transition zone)
                 if let (Some(skin), Some(bb)) = (skinning, bone_brick.as_mut()) {
-                    if is_inside {
+                    if opacity > 0.01 {
                         let bv = sample_bone_weights_at_triangle(
                             mesh, skin, nearest.triangle_index, &nearest.barycentric,
                         );
@@ -323,7 +325,9 @@ fn generate_lod(
             for vy in 0..8u8 {
                 for vx in 0..8u8 {
                     let flat = voxel_index(vx, vy, vz) as usize;
-                    if result.opacities[flat] > 0.5 {
+                    // Mark any voxel with non-trivial opacity as solid.
+                    // This ensures bone weights cover the full transition zone.
+                    if result.opacities[flat] > 0.01 {
                         geo.set_solid(vx, vy, vz, true);
                     }
                 }
