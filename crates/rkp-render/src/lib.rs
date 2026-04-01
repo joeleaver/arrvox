@@ -8,5 +8,8 @@
 
 /// Splat march compute pass — surface-finding through opacity field, G-buffer output.
 pub mod splat_march;
+/// Direct mesh-to-opacity voxelization — bypasses SDF for smooth splat fields.
+pub mod voxelize_opacity;
 
 pub use splat_march::SplatMarchPass;
+pub use voxelize_opacity::import_mesh_to_opacity_rkf;

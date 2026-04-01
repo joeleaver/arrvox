@@ -1,7 +1,8 @@
 //! RKIPatch Editor — gaussian splat scene editor.
 //!
 //! Thin wrapper over rkf-editor's shared infrastructure. Uses `SplatMarchPass`
-//! (opacity field surface finding) instead of `RayMarchPass` (SDF sphere tracing).
+//! (opacity field surface finding) instead of `RayMarchPass` (SDF sphere tracing),
+//! and a direct mesh-to-opacity import pipeline instead of SDF voxelization.
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -12,5 +13,11 @@ fn main() -> anyhow::Result<()> {
         },
     );
 
-    rkf_editor::run_editor("RKIPatch Editor", Some(march_factory))
+    let import_fn: rkf_editor::import_worker::ImportFn = Box::new(
+        |input_path, output_path, config| {
+            rkp_render::import_mesh_to_opacity_rkf(input_path, output_path, config)
+        },
+    );
+
+    rkf_editor::run_editor("RKIPatch Editor", Some(march_factory), Some(import_fn))
 }
