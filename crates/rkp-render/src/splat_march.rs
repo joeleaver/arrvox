@@ -108,20 +108,7 @@ impl rkf_render::MarchPass for SplatMarchPass {
         self.recreate_pipeline(device, module);
     }
 
-    fn transform_brick(&self, brick: &mut rkf_core::brick::Brick, voxel_size: f32) {
-        use half::f16;
-
-        for voxel in brick.voxels.iter_mut() {
-            // Extract f16 distance from word0 bits 0-15
-            let dist_bits = (voxel.word0 & 0xFFFF) as u16;
-            let distance = f16::from_bits(dist_bits).to_f32();
-
-            // Convert: opacity = clamp(1.0 - distance / voxel_size, 0.0, 1.0)
-            let opacity = (1.0 - distance / voxel_size).clamp(0.0, 1.0);
-
-            // Write opacity back to word0 bits 0-15, preserving bits 16-31
-            let opacity_bits = f16::from_f32(opacity).to_bits() as u32;
-            voxel.word0 = (voxel.word0 & 0xFFFF_0000) | opacity_bits;
-        }
-    }
+    // No transform_brick override — keep SDF distances as-is.
+    // The splat march shader finds surfaces where distance crosses zero
+    // and computes gradient normals from the smooth SDF distance field.
 }

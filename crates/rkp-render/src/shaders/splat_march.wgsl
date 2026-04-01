@@ -9,7 +9,7 @@
 const MAX_FLOAT: f32 = 3.402823e+38;
 const EMPTY_SLOT: u32 = 0xFFFFFFFFu;
 const INTERIOR_SLOT: u32 = 0xFFFFFFFEu;
-const OPACITY_THRESHOLD: f32 = 0.5;
+const SURFACE_THRESHOLD: f32 = 0.0; // SDF surface is at distance = 0
 const MAX_MARCH_STEPS: u32 = 512u;
 const OBJECT_TILE_SIZE: u32 = 16u;
 const TILE_MAX_OBJECTS: u32 = 32u;
@@ -134,8 +134,8 @@ struct MarchResult {
 
 // ── Voxel Extraction ───────────────────────────────────────────────────────
 
-/// Extract f16 opacity from word0 bits 0–15, returned as f32.
-fn extract_opacity(word0: u32) -> f32 {
+/// Extract f16 distance from word0 bits 0–15, returned as f32.
+fn extract_distance(word0: u32) -> f32 {
     return unpack2x16float(word0 & 0xFFFFu).x;
 }
 
@@ -156,23 +156,23 @@ fn extract_blend_weight(word0: u32) -> u32 {
 
 // ── Brick Pool Sampling ────────────────────────────────────────────────────
 
-/// Sample a single voxel's opacity from the brick pool.
-/// Returns 0.0 for EMPTY_SLOT, 1.0 for INTERIOR_SLOT.
-fn sample_opacity_at(obj_offset: u32, vc: vec3<i32>, dims: vec3<u32>,
-                     total_voxels: vec3<i32>) -> f32 {
+/// Sample a single voxel's SDF distance from the brick pool.
+/// Returns large positive for EMPTY_SLOT (exterior), large negative for INTERIOR_SLOT.
+fn sample_distance_at(obj_offset: u32, vc: vec3<i32>, dims: vec3<u32>,
+                      total_voxels: vec3<i32>, vs: f32) -> f32 {
     let c = clamp(vc, vec3<i32>(0), total_voxels - vec3<i32>(1));
     let brick = vec3<u32>(c / vec3<i32>(8));
     let local = vec3<u32>(c % vec3<i32>(8));
     let flat_brick = brick.x + brick.y * dims.x + brick.z * dims.x * dims.y;
     let slot = brick_maps[obj_offset + flat_brick];
     if slot == EMPTY_SLOT {
-        return 0.0;
+        return vs * 8.0;
     }
     if slot == INTERIOR_SLOT {
-        return 1.0;
+        return -(vs * 2.0);
     }
     let idx = slot * 512u + local.x + local.y * 8u + local.z * 64u;
-    return extract_opacity(brick_pool[idx].word0);
+    return extract_distance(brick_pool[idx].word0);
 }
 
 /// Sample a single voxel's full data (opacity + material) from the brick pool.
@@ -194,8 +194,8 @@ fn sample_voxel_data_at(obj_offset: u32, vc: vec3<i32>, dims: vec3<u32>,
     return brick_pool[idx];
 }
 
-/// Trilinear interpolation of the opacity field at a local-space position.
-fn sample_opacity_trilinear(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
+/// Trilinear interpolation of the SDF distance field at a local-space position.
+fn sample_distance_trilinear(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
     let vs = obj.voxel_size;
     let brick_extent = vs * 8.0;
     let dims = vec3<u32>(obj.brick_map_dims_x, obj.brick_map_dims_y, obj.brick_map_dims_z);
@@ -205,8 +205,105 @@ fn sample_opacity_trilinear(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
     let clamped = clamp(grid_pos, vec3<f32>(vs * 0.01), grid_size - vec3<f32>(vs * 0.01));
     let outside_dist = length(grid_pos - clamped);
 
-    // Outside the grid — empty
-    if outside_dist > vs {
+    // Outside the grid — return large positive (exterior)
+    if outside_dist > brick_extent * 2.0 {
+        return outside_dist;
+    }
+
+    let voxel_coord = clamped / vs - vec3<f32>(0.5);
+    let v0 = vec3<i32>(floor(voxel_coord));
+    let t = voxel_coord - vec3<f32>(v0);
+    let total_voxels = vec3<i32>(dims) * 8;
+
+    let c000 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(0, 0, 0), dims, total_voxels, vs);
+    let c100 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(1, 0, 0), dims, total_voxels, vs);
+    let c010 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(0, 1, 0), dims, total_voxels, vs);
+    let c110 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(1, 1, 0), dims, total_voxels, vs);
+    let c001 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(0, 0, 1), dims, total_voxels, vs);
+    let c101 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(1, 0, 1), dims, total_voxels, vs);
+    let c011 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(0, 1, 1), dims, total_voxels, vs);
+    let c111 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(1, 1, 1), dims, total_voxels, vs);
+
+    let c00 = mix(c000, c100, t.x);
+    let c10 = mix(c010, c110, t.x);
+    let c01 = mix(c001, c101, t.x);
+    let c11 = mix(c011, c111, t.x);
+    let c0 = mix(c00, c10, t.y);
+    let c1 = mix(c01, c11, t.y);
+    return mix(c0, c1, t.z) + outside_dist;
+}
+
+/// Sample a single voxel for gradient computation.
+/// INTERIOR_SLOT returns -vs*8 (matching EMPTY_SLOT's +vs*8 in magnitude)
+/// to produce correct gradient direction across sentinel boundaries.
+fn sample_distance_at_grad(obj_offset: u32, vc: vec3<i32>, dims: vec3<u32>,
+                           total_voxels: vec3<i32>, vs: f32) -> f32 {
+    let c = clamp(vc, vec3<i32>(0), total_voxels - vec3<i32>(1));
+    let brick = vec3<u32>(c / vec3<i32>(8));
+    let local = vec3<u32>(c % vec3<i32>(8));
+    let flat_brick = brick.x + brick.y * dims.x + brick.z * dims.x * dims.y;
+    let slot = brick_maps[obj_offset + flat_brick];
+    if slot == EMPTY_SLOT {
+        return vs * 8.0;
+    }
+    if slot == INTERIOR_SLOT {
+        return -(vs * 8.0);
+    }
+    let idx = slot * 512u + local.x + local.y * 8u + local.z * 64u;
+    return extract_distance(brick_pool[idx].word0);
+}
+
+/// Trilinear SDF sampling for gradient computation (gradient-safe sentinel values).
+fn sample_distance_trilinear_grad(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
+    let vs = obj.voxel_size;
+    let brick_extent = vs * 8.0;
+    let dims = vec3<u32>(obj.brick_map_dims_x, obj.brick_map_dims_y, obj.brick_map_dims_z);
+    let grid_size = vec3<f32>(dims) * brick_extent;
+
+    let grid_pos = local_pos + grid_size * 0.5;
+    let clamped = clamp(grid_pos, vec3<f32>(vs * 0.01), grid_size - vec3<f32>(vs * 0.01));
+    let outside_dist = length(grid_pos - clamped);
+
+    if outside_dist > brick_extent * 2.0 {
+        return outside_dist;
+    }
+
+    let voxel_coord = clamped / vs - vec3<f32>(0.5);
+    let v0 = vec3<i32>(floor(voxel_coord));
+    let t = voxel_coord - vec3<f32>(v0);
+    let total_voxels = vec3<i32>(dims) * 8;
+
+    let c000 = sample_distance_at_grad(obj.brick_map_offset, v0 + vec3<i32>(0,0,0), dims, total_voxels, vs);
+    let c100 = sample_distance_at_grad(obj.brick_map_offset, v0 + vec3<i32>(1,0,0), dims, total_voxels, vs);
+    let c010 = sample_distance_at_grad(obj.brick_map_offset, v0 + vec3<i32>(0,1,0), dims, total_voxels, vs);
+    let c110 = sample_distance_at_grad(obj.brick_map_offset, v0 + vec3<i32>(1,1,0), dims, total_voxels, vs);
+    let c001 = sample_distance_at_grad(obj.brick_map_offset, v0 + vec3<i32>(0,0,1), dims, total_voxels, vs);
+    let c101 = sample_distance_at_grad(obj.brick_map_offset, v0 + vec3<i32>(1,0,1), dims, total_voxels, vs);
+    let c011 = sample_distance_at_grad(obj.brick_map_offset, v0 + vec3<i32>(0,1,1), dims, total_voxels, vs);
+    let c111 = sample_distance_at_grad(obj.brick_map_offset, v0 + vec3<i32>(1,1,1), dims, total_voxels, vs);
+
+    let c00 = mix(c000, c100, t.x);
+    let c10 = mix(c010, c110, t.x);
+    let c01 = mix(c001, c101, t.x);
+    let c11 = mix(c011, c111, t.x);
+    let c0 = mix(c00, c10, t.y);
+    let c1 = mix(c01, c11, t.y);
+    return mix(c0, c1, t.z) + outside_dist;
+}
+
+/// Sample binary density field: solid=1, empty=0, trilinearly interpolated.
+/// Uses the SIGN of SDF distance (not magnitude) to avoid discontinuities
+/// from SDF magnitude artifacts at brick boundaries.
+fn sample_density(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
+    let vs = obj.voxel_size;
+    let brick_extent = vs * 8.0;
+    let dims = vec3<u32>(obj.brick_map_dims_x, obj.brick_map_dims_y, obj.brick_map_dims_z);
+    let grid_size = vec3<f32>(dims) * brick_extent;
+
+    let grid_pos = local_pos + grid_size * 0.5;
+    let clamped = clamp(grid_pos, vec3<f32>(vs * 0.01), grid_size - vec3<f32>(vs * 0.01));
+
+    if any(grid_pos < vec3<f32>(-brick_extent)) || any(grid_pos > grid_size + vec3<f32>(brick_extent)) {
         return 0.0;
     }
 
@@ -215,34 +312,46 @@ fn sample_opacity_trilinear(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
     let t = voxel_coord - vec3<f32>(v0);
     let total_voxels = vec3<i32>(dims) * 8;
 
-    let c000 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(0, 0, 0), dims, total_voxels);
-    let c100 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(1, 0, 0), dims, total_voxels);
-    let c010 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(0, 1, 0), dims, total_voxels);
-    let c110 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(1, 1, 0), dims, total_voxels);
-    let c001 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(0, 0, 1), dims, total_voxels);
-    let c101 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(1, 0, 1), dims, total_voxels);
-    let c011 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(0, 1, 1), dims, total_voxels);
-    let c111 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(1, 1, 1), dims, total_voxels);
+    // Sample 8 corners, apply smoothstep on distance for a gradual 0→1 transition.
+    // This avoids the staircase banding of binary density and the pockmarks of raw SDF.
+    let w = vs * 1.5; // transition half-width
+    let d000 = sample_distance_at_grad(obj.brick_map_offset, v0 + vec3<i32>(0,0,0), dims, total_voxels, vs);
+    let d100 = sample_distance_at_grad(obj.brick_map_offset, v0 + vec3<i32>(1,0,0), dims, total_voxels, vs);
+    let d010 = sample_distance_at_grad(obj.brick_map_offset, v0 + vec3<i32>(0,1,0), dims, total_voxels, vs);
+    let d110 = sample_distance_at_grad(obj.brick_map_offset, v0 + vec3<i32>(1,1,0), dims, total_voxels, vs);
+    let d001 = sample_distance_at_grad(obj.brick_map_offset, v0 + vec3<i32>(0,0,1), dims, total_voxels, vs);
+    let d101 = sample_distance_at_grad(obj.brick_map_offset, v0 + vec3<i32>(1,0,1), dims, total_voxels, vs);
+    let d011 = sample_distance_at_grad(obj.brick_map_offset, v0 + vec3<i32>(0,1,1), dims, total_voxels, vs);
+    let d111 = sample_distance_at_grad(obj.brick_map_offset, v0 + vec3<i32>(1,1,1), dims, total_voxels, vs);
 
-    let c00 = mix(c000, c100, t.x);
-    let c10 = mix(c010, c110, t.x);
-    let c01 = mix(c001, c101, t.x);
-    let c11 = mix(c011, c111, t.x);
-    let c0 = mix(c00, c10, t.y);
-    let c1 = mix(c01, c11, t.y);
-    return mix(c0, c1, t.z);
+    let b000 = 1.0 - smoothstep(-w, w, d000);
+    let b100 = 1.0 - smoothstep(-w, w, d100);
+    let b010 = 1.0 - smoothstep(-w, w, d010);
+    let b110 = 1.0 - smoothstep(-w, w, d110);
+    let b001 = 1.0 - smoothstep(-w, w, d001);
+    let b101 = 1.0 - smoothstep(-w, w, d101);
+    let b011 = 1.0 - smoothstep(-w, w, d011);
+    let b111 = 1.0 - smoothstep(-w, w, d111);
+
+    let b00 = mix(b000, b100, t.x);
+    let b10 = mix(b010, b110, t.x);
+    let b01 = mix(b001, b101, t.x);
+    let b11 = mix(b011, b111, t.x);
+    let b0 = mix(b00, b10, t.y);
+    let b1 = mix(b01, b11, t.y);
+    return mix(b0, b1, t.z);
 }
 
-/// Compute gradient of the opacity field via 6-tap central differences.
-/// Returns unnormalized gradient in local space.
-fn sample_opacity_gradient(local_pos: vec3<f32>, obj: GpuObject) -> vec3<f32> {
+/// Compute surface normal from SDF gradient (gradient-safe sentinel values).
+/// Matches rkf-render's sample_voxelized_gradient exactly.
+fn sample_sdf_gradient(local_pos: vec3<f32>, obj: GpuObject) -> vec3<f32> {
     let eps = obj.voxel_size * 2.0;
-    let gx = sample_opacity_trilinear(local_pos + vec3<f32>(eps, 0.0, 0.0), obj)
-           - sample_opacity_trilinear(local_pos - vec3<f32>(eps, 0.0, 0.0), obj);
-    let gy = sample_opacity_trilinear(local_pos + vec3<f32>(0.0, eps, 0.0), obj)
-           - sample_opacity_trilinear(local_pos - vec3<f32>(0.0, eps, 0.0), obj);
-    let gz = sample_opacity_trilinear(local_pos + vec3<f32>(0.0, 0.0, eps), obj)
-           - sample_opacity_trilinear(local_pos - vec3<f32>(0.0, 0.0, eps), obj);
+    let gx = sample_distance_trilinear_grad(local_pos + vec3<f32>(eps, 0.0, 0.0), obj)
+           - sample_distance_trilinear_grad(local_pos - vec3<f32>(eps, 0.0, 0.0), obj);
+    let gy = sample_distance_trilinear_grad(local_pos + vec3<f32>(0.0, eps, 0.0), obj)
+           - sample_distance_trilinear_grad(local_pos - vec3<f32>(0.0, eps, 0.0), obj);
+    let gz = sample_distance_trilinear_grad(local_pos + vec3<f32>(0.0, 0.0, eps), obj)
+           - sample_distance_trilinear_grad(local_pos - vec3<f32>(0.0, 0.0, eps), obj);
     return vec3<f32>(gx, gy, gz);
 }
 
@@ -312,48 +421,52 @@ fn march_object(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
         return -1.0; // Ray misses AABB
     }
 
-    // Fixed step size: half a voxel for quality
-    let step_size = obj.voxel_size * 0.5;
-    let max_steps = min(u32(ceil((t_range.y - t_range.x) / step_size)), MAX_MARCH_STEPS);
+    // Sphere tracing with overshoot detection and bisection.
+    // Mirrors rkf-render's proven approach for voxelized SDFs.
+    let hit_threshold = obj.voxel_size * 0.01;
+    let min_step = obj.voxel_size * 0.1;
 
     var t = t_range.x;
-    var prev_opacity = 0.0;
+    var prev_dist = MAX_FLOAT;
     var prev_t = t;
 
-    for (var step = 0u; step < max_steps; step++) {
-        let local_pos = local_origin + safe_dir * t;
-        let opacity = sample_opacity_trilinear(local_pos, obj);
+    for (var step = 0u; step < MAX_MARCH_STEPS; step++) {
+        if t > t_range.y {
+            break;
+        }
 
-        if opacity >= OPACITY_THRESHOLD {
-            // Surface found — bisect to refine
+        let local_pos = local_origin + safe_dir * t;
+        let dist = sample_distance_trilinear(local_pos, obj);
+
+        // Overshoot detection: distance went negative (stepped through surface).
+        // Bisect to find the zero-crossing.
+        if dist < 0.0 && prev_dist > hit_threshold {
             var lo = prev_t;
             var hi = t;
-            for (var b = 0u; b < 6u; b++) {
+            for (var b = 0u; b < 8u; b++) {
                 let mid = (lo + hi) * 0.5;
                 let mid_pos = local_origin + safe_dir * mid;
-                let mid_opacity = sample_opacity_trilinear(mid_pos, obj);
-                if mid_opacity >= OPACITY_THRESHOLD {
+                let mid_dist = sample_distance_trilinear(mid_pos, obj);
+                if mid_dist < 0.0 {
                     hi = mid;
                 } else {
                     lo = mid;
                 }
             }
             let refined_t = (lo + hi) * 0.5;
-
-            // Convert local t back to world t (accounting for scale)
-            let local_hit = local_origin + safe_dir * refined_t;
-            let world_hit = (obj.inverse_world * vec4<f32>(0.0, 0.0, 0.0, 1.0)).xyz; // wrong
-            // More correct: compute world-space distance
-            let world_hit_pos = local_hit; // We'll convert in the caller
             return refined_t;
         }
 
-        prev_opacity = opacity;
-        prev_t = t;
-        t += step_size;
-        if t > t_range.y {
-            break;
+        // Direct hit: distance is small and positive
+        if dist < hit_threshold {
+            return t;
         }
+
+        prev_dist = dist;
+        prev_t = t;
+        // Step by distance, but use a conservative multiplier to avoid overshooting
+        // voxelized SDF fields where trilinear distances can be inaccurate.
+        t += max(dist * 0.8, min_step);
     }
 
     return -1.0; // No surface found
@@ -444,14 +557,19 @@ fn compute_normal(hit_pos: vec3<f32>, obj_idx: u32) -> vec3<f32> {
     let obj = objects[obj_idx];
     let local_pos = (obj.inverse_world * vec4<f32>(hit_pos, 1.0)).xyz;
 
-    let local_grad = sample_opacity_gradient(local_pos, obj);
-
-    // Gradient points from low→high opacity (toward interior).
-    // Surface normal should point outward, so negate.
-    let outward_grad = -local_grad;
+    // Smooth density gradient: smoothstep on SDF distance, then central differences.
+    // Produces normals free of both pockmarks and staircase banding.
+    let eps = obj.voxel_size * 2.0;
+    let gx = sample_density(local_pos + vec3<f32>(eps, 0.0, 0.0), obj)
+           - sample_density(local_pos - vec3<f32>(eps, 0.0, 0.0), obj);
+    let gy = sample_density(local_pos + vec3<f32>(0.0, eps, 0.0), obj)
+           - sample_density(local_pos - vec3<f32>(0.0, eps, 0.0), obj);
+    let gz = sample_density(local_pos + vec3<f32>(0.0, 0.0, eps), obj)
+           - sample_density(local_pos - vec3<f32>(0.0, 0.0, eps), obj);
+    let local_grad = -vec3<f32>(gx, gy, gz);
 
     // Transform gradient from local → world space
-    let world_grad = (transpose(obj.inverse_world) * vec4<f32>(outward_grad, 0.0)).xyz;
+    let world_grad = (transpose(obj.inverse_world) * vec4<f32>(local_grad, 0.0)).xyz;
 
     let len = length(world_grad);
     if len < 1e-10 {
