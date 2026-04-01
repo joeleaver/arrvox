@@ -4981,6 +4981,7 @@ dependencies = [
  "log",
  "pollster",
  "rayon",
+ "rkf-animation",
  "rkf-core",
  "rkf-import",
  "rkf-render",
