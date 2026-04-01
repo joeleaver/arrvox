@@ -1,0 +1,16 @@
+[package]
+name = "rkp-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Core data structures for the RKIPatch splat engine: SplatVoxel, SH coefficients, brick format"
+
+[dependencies]
+rkf-core = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true }
+half = { workspace = true }
+serde = { workspace = true }
+log = { workspace = true }
+lz4_flex = { workspace = true }
+thiserror = { workspace = true }

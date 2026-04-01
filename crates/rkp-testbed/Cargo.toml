@@ -1,0 +1,19 @@
+[package]
+name = "rkp-testbed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Visual testing harness for the RKIPatch splat engine"
+
+[dependencies]
+rkp-core = { workspace = true }
+rkp-render = { workspace = true }
+rkp-runtime = { workspace = true }
+rkf-core = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
+glam = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+anyhow = { workspace = true }
+pollster = { workspace = true }

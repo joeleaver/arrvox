@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rkp-core",
+    "crates/rkp-render",
+    "crates/rkp-convert",
+    "crates/rkp-runtime",
+    "crates/rkp-editor",
+    "crates/rkp-testbed",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/joeleaver/rkipatch"
+
+[workspace.dependencies]
+# Internal crates
+rkp-core = { path = "crates/rkp-core" }
+rkp-render = { path = "crates/rkp-render" }
+rkp-convert = { path = "crates/rkp-convert" }
+rkp-runtime = { path = "crates/rkp-runtime" }
+
+# Shared crates from RKIField
+rkf-core = { path = "../rkifield/crates/rkf-core" }
+rkf-render = { path = "../rkifield/crates/rkf-render" }
+rkf-editor = { path = "../rkifield/crates/rkf-editor" }
+rkf-import = { path = "../rkifield/crates/rkf-import" }
+rkf-animation = { path = "../rkifield/crates/rkf-animation" }
+rkf-physics = { path = "../rkifield/crates/rkf-physics" }
+rkf-mcp = { path = "../rkifield/crates/rkf-mcp" }
+
+# External dependencies (versions match RKIField)
+wgpu = "27"
+winit = "0.31.0-beta.2"
+glam = { version = "0.29", features = ["bytemuck", "serde"] }
+bytemuck = { version = "1", features = ["derive"] }
+encase = { version = "0.10", features = ["glam"] }
+hecs = "0.10"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lz4_flex = "0.11"
+anyhow = "1"
+half = { version = "2", features = ["bytemuck"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+image = "0.25"
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+pollster = "0.4"
+crossbeam = "0.8"
+
+# Rinch dependencies (same sources as RKIField)
+rinch = { git = "ssh://git@github.com/joeleaver/rinch.git", default-features = false }
+rinch-core = { git = "ssh://git@github.com/joeleaver/rinch.git" }
+rinch-macros = { git = "ssh://git@github.com/joeleaver/rinch.git" }
+rinch-renderer = { git = "ssh://git@github.com/joeleaver/rinch.git" }
+rinch-theme = { git = "ssh://git@github.com/joeleaver/rinch.git" }
+rinch-components = { git = "ssh://git@github.com/joeleaver/rinch.git" }
+rinch-tabler-icons = { git = "ssh://git@github.com/joeleaver/rinch.git" }
+rinch-dom = { git = "ssh://git@github.com/joeleaver/rinch.git" }
+rinch-editor = { git = "ssh://git@github.com/joeleaver/rinch.git" }
+rinch-editor-macros = { git = "ssh://git@github.com/joeleaver/rinch.git" }
+rinch-platform = { git = "ssh://git@github.com/joeleaver/rinch.git" }
+
+# Rinch external deps
+anyrender = "0.7"
+anyrender_vello = "0.7"
