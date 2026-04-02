@@ -111,4 +111,13 @@ impl rkf_render::MarchPass for SplatMarchPass {
     // needs_skin_deform: default true — use the SkinDeformPass to scatter
     // bone weights into posed space. The march shader reads them and inverse-skins
     // back to rest-pose for opacity sampling.
+
+    fn shader_overrides(&self) -> rkf_render::ShaderOverrides {
+        rkf_render::ShaderOverrides {
+            shadow_ao: Some(include_str!("shaders/opacity_shadow_ao.wgsl").to_string()),
+            radiance_inject: Some(include_str!("shaders/opacity_radiance_inject.wgsl").to_string()),
+            shade_common: Some(include_str!("shaders/opacity_shade_common.wgsl").to_string()),
+            shade_common_shading: Some(include_str!("shaders/opacity_shade_common_shading.wgsl").to_string()),
+        }
+    }
 }
