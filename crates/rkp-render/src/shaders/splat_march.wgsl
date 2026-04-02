@@ -387,7 +387,11 @@ fn sample_distance_at(obj_offset: u32, vc: vec3<i32>, dims: vec3<u32>,
         return vs * 8.0; // far above surface
     }
     if slot == INTERIOR_SLOT {
-        return -vs * 8.0; // deep inside surface
+        // For procedural volumes, INTERIOR_SLOT means "no data propagated here".
+        // The volume builder fills most bricks as INTERIOR_SLOT and only populates
+        // bricks near the painted surface. Treat as slightly below surface so the
+        // volume's base surface is still found but the interior isn't a solid block.
+        return -vs; // just below surface, not deep inside
     }
     let idx = slot * 512u + local.x + local.y * 8u + local.z * 64u;
     return extract_distance(brick_pool[idx].word0);
