@@ -954,11 +954,14 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
         var final_blend_weight = result.blend_weight;
         var final_t = result.t;
 
-        // --- Opacity shell march: check if the surface material has an opacity shader ---
+        // --- Opacity shell march: check if the hit material has a registered opacity shader ---
+        // dispatch_opacity_shader returns -1.0 (sentinel) for shader IDs without an
+        // opacity function. Probe with h_above=-1.0 to distinguish: real opacity shaders
+        // return 0.0 (early-out for h_above<0), the sentinel returns -1.0.
         let hit_obj = objects[result.obj_idx];
         let shader_id = materials[final_mat_id].shader_id;
-        if shader_id != 0u {
-            // Material has an opacity shader — march the shell above the surface.
+        if dispatch_opacity_shader(shader_id, vec3<f32>(0.0), -1.0, hit_obj, final_mat_id) > -0.5 {
+            // Material has a registered opacity shader — march the shell above the surface.
             let inv_world = hit_obj.inverse_world;
             let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
             let local_dir = normalize((inv_world * vec4<f32>(ray_dir, 0.0)).xyz);
