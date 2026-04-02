@@ -12,7 +12,7 @@ const INTERIOR_SLOT: u32 = 0xFFFFFFFEu;
 const OPACITY_THRESHOLD: f32 = 0.5; // Surface is at 50% opacity
 const MAX_MARCH_STEPS: u32 = 512u;
 const OBJECT_TILE_SIZE: u32 = 16u;
-const TILE_MAX_OBJECTS: u32 = 32u;
+// Per-tile stride is scene.num_objects (no fixed limit).
 const SDF_TYPE_PROCEDURAL: u32 = 3u;
 
 // ── Structs ────────────────────────────────────────────────────────────────
@@ -753,7 +753,7 @@ fn march_tiled(origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>) -> MarchResu
         return result;
     }
 
-    let base = tile_id * TILE_MAX_OBJECTS;
+    let base = tile_id * scene.num_objects;
 
     for (var i = 0u; i < count; i++) {
         let obj_idx = tile_object_indices[base + i];
