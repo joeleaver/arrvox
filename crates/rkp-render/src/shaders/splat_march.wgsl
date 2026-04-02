@@ -368,7 +368,7 @@ fn sample_material_at_hit(local_pos: vec3<f32>, obj: GpuObject) -> vec3<u32> {
 
 // ── Shell March ───────────────────────────────────────────────────────────
 
-const SHELL_MAX_STEPS: u32 = 64u;
+const SHELL_MAX_STEPS: u32 = 256u;
 
 /// Compute the local-space surface normal at a position from the opacity gradient.
 fn compute_local_normal(local_pos: vec3<f32>, obj: GpuObject) -> vec3<f32> {
