@@ -54,8 +54,11 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, obj: GpuObject, mat_id: u32
     let cell_freq = 1.0 / cell_size;
     let cell = floor(local_pos.xz * cell_freq);
 
-    // Smooth falloff width for gradient normals (half a voxel)
-    let softness = obj.voxel_size * 0.5;
+    // Smooth falloff width for gradient normals.
+    // Must scale with blade geometry, not voxel size — otherwise overlapping
+    // falloff zones from neighboring blades merge into a solid shell.
+    let blade_width = cell_size * 0.06;
+    let softness = blade_width * 0.5;
 
     var max_opacity = 0.0;
 
@@ -97,7 +100,6 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, obj: GpuObject, mat_id: u32
 
             // Flat blade cross-section: wide in X (face), thin in Z (edge)
             let flatten = 5.0;
-            let blade_width = cell_size * 0.06;
 
             // Clamp Y to blade extent
             let py = clamp(p.y, 0.0, blade_h);
