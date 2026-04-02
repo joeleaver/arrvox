@@ -199,7 +199,10 @@ impl rkf_render::MarchPass for SplatMarchPass {
             radiance_inject: Some(include_str!("shaders/opacity_radiance_inject.wgsl").to_string()),
             shade_common: Some(include_str!("shaders/opacity_shade_common.wgsl").to_string()),
             shade_common_shading: Some(include_str!("shaders/opacity_shade_common_shading.wgsl").to_string()),
-            ..Default::default()
+            shade_main: Some(include_str!("shaders/opacity_shade_main.wgsl").to_string()),
+            shade_models: vec![
+                ("pbr".into(), include_str!("shaders/opacity_shade_pbr.wgsl").to_string()),
+            ],
         }
     }
 

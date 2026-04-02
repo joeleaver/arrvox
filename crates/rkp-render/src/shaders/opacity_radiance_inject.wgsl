@@ -25,7 +25,7 @@ struct GpuObject {
     brick_map_dims_z: u32,
     voxel_size: f32,
     material_id: u32,
-    sdf_type: u32,
+    geom_type: u32,
     blend_mode: u32,
     blend_radius: f32,
     sdf_param_0: f32,
@@ -149,17 +149,10 @@ const INTERIOR_SLOT: u32 = 0xFFFFFFFEu;
 const BVH_INVALID: u32 = 0xFFFFFFFFu;
 const BVH_STACK_SIZE: u32 = 32u;
 
-const SDF_TYPE_NONE: u32       = 0u;
-const SDF_TYPE_ANALYTICAL: u32 = 1u;
-const SDF_TYPE_VOXELIZED: u32  = 2u;
-const SDF_TYPE_PROCEDURAL: u32 = 3u;
-
-const PRIM_SPHERE: u32   = 0u;
-const PRIM_BOX: u32      = 1u;
-const PRIM_CAPSULE: u32  = 2u;
-const PRIM_TORUS: u32    = 3u;
-const PRIM_CYLINDER: u32 = 4u;
-const PRIM_PLANE: u32    = 5u;
+const GEOM_TYPE_NONE: u32       = 0u;
+const GEOM_TYPE_ANALYTICAL: u32 = 1u;
+const GEOM_TYPE_VOXELIZED: u32  = 2u;
+const GEOM_TYPE_PROCEDURAL: u32 = 3u;
 
 const INJECT_SHADOW_MAX_DIST: f32 = 20.0;
 const COARSE_NEAR_THRESHOLD: f32 = 0.5;
@@ -240,7 +233,7 @@ fn sample_opacity_trilinear(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
 /// Evaluate object opacity at a world-space position. Returns (opacity, material_id).
 fn evaluate_object_opacity(world_pos: vec3<f32>, obj_idx: u32) -> vec2<f32> {
     let obj = objects[obj_idx];
-    if obj.sdf_type == SDF_TYPE_NONE {
+    if obj.geom_type == GEOM_TYPE_NONE {
         return vec2<f32>(0.0, 0.0);
     }
     // inverse_world is world-space — transform directly.

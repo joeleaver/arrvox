@@ -94,7 +94,7 @@ fn compute_shadow(origin: vec3<f32>, light_dir: vec3<f32>, max_dist: f32) -> f32
 
 /// 5-layer opacity probe along the surface normal.
 /// Samples opacity at increasing distances and accumulates occlusion.
-fn sdf_ao(pos: vec3<f32>, normal: vec3<f32>) -> f32 {
+fn opacity_ao(pos: vec3<f32>, normal: vec3<f32>) -> f32 {
     var occlusion = 0.0;
     var weight = 1.0;
     for (var i = 1u; i <= 5u; i++) {
@@ -104,6 +104,11 @@ fn sdf_ao(pos: vec3<f32>, normal: vec3<f32>) -> f32 {
         weight *= 0.5;
     }
     return clamp(1.0 - 1.5 * occlusion, 0.0, 1.0);
+}
+
+/// Backward-compatible alias for user shader models (toon, etc.) that call sdf_ao.
+fn sdf_ao(pos: vec3<f32>, normal: vec3<f32>) -> f32 {
+    return opacity_ao(pos, normal);
 }
 
 // ---------- BRDF Evaluation Helper ----------
@@ -513,19 +518,62 @@ fn march_glass_interior(
     obj_idx: u32,
     max_thickness: f32,
 ) -> vec2<f32> {
-    var t = 0.005;
+    let obj = objects[obj_idx];
+    let vs = max(obj.voxel_size, 0.01);
+    let brick_extent = vs * 8.0;
+    let dims = vec3<u32>(obj.brick_map_dims_x, obj.brick_map_dims_y, obj.brick_map_dims_z);
+    let grid_size = vec3<f32>(dims) * brick_extent;
+
+    // Transform to object-local space.
+    let local_origin = (obj.inverse_world * vec4<f32>(entry_pos, 1.0)).xyz;
+    let local_dir = normalize((obj.inverse_world * vec4<f32>(refract_dir, 0.0)).xyz);
+    let safe_dir = select(local_dir, sign(local_dir) * vec3<f32>(1e-10), abs(local_dir) < vec3<f32>(1e-10));
+    let inv_dir = 1.0 / safe_dir;
+
+    var t = vs * 0.1;
+    let max_t = min(max_thickness * length((obj.inverse_world * vec4<f32>(refract_dir, 0.0)).xyz),
+                    brick_extent * f32(max(dims.x, max(dims.y, dims.z))));
+
     for (var i = 0u; i < 64u; i++) {
-        if t > max_thickness { break; }
-        let pos = entry_pos + refract_dir * t;
-        // Shadow SDF: interior bricks return positive (vs*8), not negative.
-        // Standard SDF traps the march in interior (d always negative → never exits).
-        let d = evaluate_object_dist_shadow(pos, obj_idx).x;
-        if d > 0.001 {
-            return vec2<f32>(t, 1.0);
+        if t > max_t { break; }
+        let local_pos = local_origin + safe_dir * t;
+        let grid_pos = local_pos + grid_size * 0.5;
+        let brick_coord = vec3<i32>(floor(grid_pos / brick_extent));
+
+        // Out of grid → exited object.
+        if any(brick_coord < vec3<i32>(0)) || any(vec3<u32>(brick_coord) >= dims) {
+            let world_scale = length((obj.inverse_world * vec4<f32>(refract_dir, 0.0)).xyz);
+            return vec2<f32>(t / max(world_scale, 1e-10), 1.0);
         }
-        t += max(abs(d), 0.01);
+
+        let bc = vec3<u32>(brick_coord);
+        let flat = bc.x + bc.y * dims.x + bc.z * dims.x * dims.y;
+        let slot = brick_maps[obj.brick_map_offset + flat];
+
+        if slot == EMPTY_SLOT {
+            let world_scale = length((obj.inverse_world * vec4<f32>(refract_dir, 0.0)).xyz);
+            return vec2<f32>(t / max(world_scale, 1e-10), 1.0);
+        }
+        if slot == INTERIOR_SLOT {
+            // Skip entire brick via ray-AABB exit.
+            let brick_min = vec3<f32>(brick_coord) * brick_extent - grid_size * 0.5;
+            let brick_max = brick_min + vec3<f32>(brick_extent);
+            let t_exit = intersect_aabb(local_origin, inv_dir, brick_min, brick_max);
+            t = t_exit.y + vs * 0.1;
+            continue;
+        }
+
+        // Allocated brick: fine-step, check opacity threshold for exit.
+        let opacity = sample_opacity_trilinear(local_pos, obj);
+        if opacity < OPACITY_SURFACE_THRESHOLD {
+            let world_scale = length((obj.inverse_world * vec4<f32>(refract_dir, 0.0)).xyz);
+            return vec2<f32>(t / max(world_scale, 1e-10), 1.0);
+        }
+        t += vs * 0.5;
     }
-    return vec2<f32>(t, 0.0);
+
+    let world_scale = length((obj.inverse_world * vec4<f32>(refract_dir, 0.0)).xyz);
+    return vec2<f32>(t / max(world_scale, 1e-10), 0.0);
 }
 
 struct TransmitResult {
@@ -560,63 +608,68 @@ fn trace_and_shade_behind_glass(
     // or passes through another glass layer and continues.
     for (var layer = 0u; layer < MAX_GLASS_LAYERS; layer++) {
 
-        // --- BVH ray march to find next surface ---
+        // --- Opacity ray march to find next surface ---
         var t = 0.005;
         var found_surface = false;
         var hit_pos = vec3<f32>(0.0);
         var best_obj_idx = 0u;
+        var prev_opacity = 0.0;
 
         for (var step = 0u; step < 128u; step++) {
             if t > max_dist { break; }
             let pos = current_origin + current_dir * t;
 
-            var min_dist = MAX_FLOAT;
-            var step_best = 0u;
-
-            var stack: array<u32, 32>;
-            var sp = 0u;
-            stack[0] = 0u;
-            sp = 1u;
-
-            while sp > 0u {
-                sp -= 1u;
-                let ni = stack[sp];
-                let node = bvh_nodes[ni];
-                let nmin = vec3<f32>(node.aabb_min_x, node.aabb_min_y, node.aabb_min_z);
-                let nmax = vec3<f32>(node.aabb_max_x, node.aabb_max_y, node.aabb_max_z);
-                let closest = clamp(pos, nmin, nmax);
-                if length(closest - pos) > min_dist { continue; }
-
-                if node.left == BVH_INVALID {
-                    let oi = node.right_or_object;
-                    if oi < v2_scene.num_objects {
-                        // Shadow SDF: INTERIOR_SLOT → passthrough (vs*8).
-                        // This avoids false hits when the exit position is near
-                        // or inside adjacent objects (window frames, walls).
-                        // Wall interior faces have allocated surface bricks with
-                        // proper SDF, so the shadow variant still detects them.
-                        let d = evaluate_object_dist_shadow(pos, oi).x;
-                        if d < min_dist {
-                            min_dist = d;
-                            step_best = oi;
-                        }
-                    }
-                } else {
-                    if sp < BVH_STACK_SIZE - 1u {
-                        stack[sp] = node.left; sp += 1u;
-                        stack[sp] = node.right_or_object; sp += 1u;
-                    }
-                }
+            // Use coarse field for empty-space skipping.
+            let cam_rel = pos - shade_uniforms.camera_pos.xyz;
+            let coarse_dist = sample_coarse_field(cam_rel);
+            if coarse_dist > COARSE_NEAR_THRESHOLD {
+                t += coarse_dist * 0.8;
+                prev_opacity = 0.0;
+                continue;
             }
 
-            if min_dist < 0.005 {
-                hit_pos = current_origin + current_dir * t;
-                best_obj_idx = step_best;
+            // Sample global opacity via BVH.
+            let opacity = sample_opacity_bvh(pos);
+
+            if opacity > OPACITY_SURFACE_THRESHOLD {
+                // Found a surface. Identify which object by BVH point query.
+                var max_obj_opacity = 0.0;
+                var stack: array<u32, 32>;
+                var sp = 0u;
+                stack[0] = 0u;
+                sp = 1u;
+                while sp > 0u {
+                    sp -= 1u;
+                    let ni = stack[sp];
+                    let node = bvh_nodes[ni];
+                    let nmin = vec3<f32>(node.aabb_min_x, node.aabb_min_y, node.aabb_min_z);
+                    let nmax = vec3<f32>(node.aabb_max_x, node.aabb_max_y, node.aabb_max_z);
+                    let closest = clamp(pos, nmin, nmax);
+                    if length(closest - pos) > 0.0 { continue; }
+                    if node.left == BVH_INVALID {
+                        let oi = node.right_or_object;
+                        if oi < v2_scene.num_objects {
+                            let o = evaluate_object_opacity(pos, oi);
+                            if o > max_obj_opacity {
+                                max_obj_opacity = o;
+                                best_obj_idx = oi;
+                            }
+                        }
+                    } else {
+                        if sp < BVH_STACK_SIZE - 1u {
+                            stack[sp] = node.left; sp += 1u;
+                            stack[sp] = node.right_or_object; sp += 1u;
+                        }
+                    }
+                }
+                hit_pos = pos;
                 found_surface = true;
                 break;
             }
 
-            t += max(min_dist, 0.005);
+            // Adaptive step: smaller near surfaces, larger in empty space.
+            t += mix(0.02, 0.1, 1.0 - opacity);
+            prev_opacity = opacity;
         }
 
         if !found_surface {
@@ -631,23 +684,24 @@ fn trace_and_shade_behind_glass(
             return result;
         }
 
-        // --- Surface hit: compute normal and resolve material ---
+        // --- Surface hit: compute normal from opacity gradient ---
         let obj = objects[best_obj_idx];
 
-        let e = 0.01;
-        let nx = evaluate_object_dist(hit_pos + vec3<f32>(e, 0.0, 0.0), best_obj_idx)
-               - evaluate_object_dist(hit_pos - vec3<f32>(e, 0.0, 0.0), best_obj_idx);
-        let ny = evaluate_object_dist(hit_pos + vec3<f32>(0.0, e, 0.0), best_obj_idx)
-               - evaluate_object_dist(hit_pos - vec3<f32>(0.0, e, 0.0), best_obj_idx);
-        let nz = evaluate_object_dist(hit_pos + vec3<f32>(0.0, 0.0, e), best_obj_idx)
-               - evaluate_object_dist(hit_pos - vec3<f32>(0.0, 0.0, e), best_obj_idx);
-        var normal = normalize(vec3<f32>(nx, ny, nz));
+        let e = max(obj.voxel_size, 0.01);
+        let nx = evaluate_object_opacity(hit_pos + vec3<f32>(e, 0.0, 0.0), best_obj_idx)
+               - evaluate_object_opacity(hit_pos - vec3<f32>(e, 0.0, 0.0), best_obj_idx);
+        let ny = evaluate_object_opacity(hit_pos + vec3<f32>(0.0, e, 0.0), best_obj_idx)
+               - evaluate_object_opacity(hit_pos - vec3<f32>(0.0, e, 0.0), best_obj_idx);
+        let nz = evaluate_object_opacity(hit_pos + vec3<f32>(0.0, 0.0, e), best_obj_idx)
+               - evaluate_object_opacity(hit_pos - vec3<f32>(0.0, 0.0, e), best_obj_idx);
+        // Negate: opacity gradient points inward (toward higher opacity).
+        var normal = normalize(-vec3<f32>(nx, ny, nz));
         if length(vec3<f32>(nx, ny, nz)) < 1e-10 {
             normal = vec3<f32>(0.0, 1.0, 0.0);
         }
 
         var mat_data = vec3<f32>(f32(obj.material_id), 0.0, 0.0);
-        if obj.sdf_type == SDF_TYPE_VOXELIZED || obj.sdf_type == SDF_TYPE_PROCEDURAL {
+        if obj.geom_type == GEOM_TYPE_VOXELIZED || obj.geom_type == GEOM_TYPE_PROCEDURAL {
             let local_hit = (obj.inverse_world * vec4<f32>(hit_pos, 1.0)).xyz;
             mat_data = sample_voxelized_material_full(local_hit, obj);
         }
@@ -661,7 +715,7 @@ fn trace_and_shade_behind_glass(
             resolved = blend_resolved_materials(resolved, secondary_resolved, blend_w);
         }
 
-        if obj.sdf_type == SDF_TYPE_VOXELIZED || obj.sdf_type == SDF_TYPE_PROCEDURAL {
+        if obj.geom_type == GEOM_TYPE_VOXELIZED || obj.geom_type == GEOM_TYPE_PROCEDURAL {
             let local_hit = (obj.inverse_world * vec4<f32>(hit_pos, 1.0)).xyz;
             let paint = sample_voxelized_color(local_hit, obj);
             if paint.a > 0.0 {
@@ -763,7 +817,7 @@ fn trace_and_shade_behind_glass(
             lit += (kd * albedo / PI + d * v * f) * radiance * n_dot_l * shadow;
         }
 
-        let ao = sdf_ao(hit_pos + normal * SHADOW_BIAS, normal);
+        let ao = opacity_ao(hit_pos + normal * SHADOW_BIAS, normal);
 
         var ambient_col: vec3<f32>;
         if shade_uniforms.sky_params.z > 0.5 {

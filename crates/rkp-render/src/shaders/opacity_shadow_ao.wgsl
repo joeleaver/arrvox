@@ -28,7 +28,7 @@ struct GpuObject {
     brick_map_dims_z: u32,
     voxel_size: f32,
     material_id: u32,
-    sdf_type: u32,
+    geom_type: u32,
     blend_mode: u32,
     blend_radius: f32,
     sdf_param_0: f32,
@@ -145,17 +145,10 @@ const INTERIOR_SLOT: u32 = 0xFFFFFFFEu;
 const BVH_INVALID: u32 = 0xFFFFFFFFu;
 const BVH_STACK_SIZE: u32 = 32u;
 
-const SDF_TYPE_NONE: u32       = 0u;
-const SDF_TYPE_ANALYTICAL: u32 = 1u;
-const SDF_TYPE_VOXELIZED: u32  = 2u;
-const SDF_TYPE_PROCEDURAL: u32 = 3u;
-
-const PRIM_SPHERE: u32   = 0u;
-const PRIM_BOX: u32      = 1u;
-const PRIM_CAPSULE: u32  = 2u;
-const PRIM_TORUS: u32    = 3u;
-const PRIM_CYLINDER: u32 = 4u;
-const PRIM_PLANE: u32    = 5u;
+const GEOM_TYPE_NONE: u32       = 0u;
+const GEOM_TYPE_ANALYTICAL: u32 = 1u;
+const GEOM_TYPE_VOXELIZED: u32  = 2u;
+const GEOM_TYPE_PROCEDURAL: u32 = 3u;
 
 // Shadow parameters
 const SHADOW_MAX_DIST: f32 = 12.0;
@@ -170,48 +163,6 @@ const AO_STRENGTH: f32 = 1.5;
 
 fn extract_opacity(word0: u32) -> f32 {
     return clamp(unpack2x16float(word0 & 0xFFFFu).x, 0.0, 1.0);
-}
-
-// ---------- SDF Primitives (kept for bind group layout compatibility) ----------
-
-fn sdf_sphere(p: vec3<f32>, radius: f32) -> f32 {
-    return length(p) - radius;
-}
-
-fn sdf_box(p: vec3<f32>, half_extents: vec3<f32>) -> f32 {
-    let q = abs(p) - half_extents;
-    return length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
-}
-
-fn sdf_capsule(p: vec3<f32>, radius: f32, half_height: f32) -> f32 {
-    let q = vec3<f32>(p.x, max(abs(p.y) - half_height, 0.0), p.z);
-    return length(q) - radius;
-}
-
-fn sdf_torus(p: vec3<f32>, major_radius: f32, minor_radius: f32) -> f32 {
-    let q = vec2<f32>(length(p.xz) - major_radius, p.y);
-    return length(q) - minor_radius;
-}
-
-fn sdf_cylinder(p: vec3<f32>, radius: f32, half_height: f32) -> f32 {
-    let d = vec2<f32>(length(p.xz) - radius, abs(p.y) - half_height);
-    return min(max(d.x, d.y), 0.0) + length(max(d, vec2<f32>(0.0)));
-}
-
-fn sdf_plane(p: vec3<f32>, normal: vec3<f32>, dist: f32) -> f32 {
-    return dot(p, normal) + dist;
-}
-
-fn evaluate_analytical(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
-    switch obj.primitive_type {
-        case PRIM_SPHERE: { return sdf_sphere(local_pos, obj.sdf_param_0); }
-        case PRIM_BOX: { return sdf_box(local_pos, vec3<f32>(obj.sdf_param_0, obj.sdf_param_1, obj.sdf_param_2)); }
-        case PRIM_CAPSULE: { return sdf_capsule(local_pos, obj.sdf_param_0, obj.sdf_param_1); }
-        case PRIM_TORUS: { return sdf_torus(local_pos, obj.sdf_param_0, obj.sdf_param_1); }
-        case PRIM_CYLINDER: { return sdf_cylinder(local_pos, obj.sdf_param_0, obj.sdf_param_1); }
-        case PRIM_PLANE: { return sdf_plane(local_pos, normalize(vec3<f32>(obj.sdf_param_0, obj.sdf_param_1, obj.sdf_param_2)), 0.0); }
-        default: { return MAX_FLOAT; }
-    }
 }
 
 // ---------- Opacity Field Sampling ----------
@@ -287,15 +238,11 @@ fn sample_opacity_trilinear(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
 
 fn evaluate_object_opacity(world_pos: vec3<f32>, obj_idx: u32) -> f32 {
     let obj = objects[obj_idx];
-    if obj.sdf_type == SDF_TYPE_NONE {
-        return 0.0;
-    }
-    if obj.sdf_type == SDF_TYPE_ANALYTICAL {
-        // Splat objects are never analytical — return transparent
+    if obj.geom_type == GEOM_TYPE_NONE {
         return 0.0;
     }
     let local_pos = (obj.inverse_world * vec4<f32>(world_pos, 1.0)).xyz;
-    // SDF_TYPE_VOXELIZED and SDF_TYPE_PROCEDURAL both sample from the brick map.
+    // GEOM_TYPE_VOXELIZED and GEOM_TYPE_PROCEDURAL both sample from the brick map.
     return sample_opacity_trilinear(local_pos, obj);
 }
 
@@ -330,10 +277,7 @@ fn sample_opacity_bvh(pos: vec3<f32>) -> f32 {
         let node_min = vec3<f32>(node.aabb_min_x, node.aabb_min_y, node.aabb_min_z);
         let node_max = vec3<f32>(node.aabb_max_x, node.aabb_max_y, node.aabb_max_z);
         let closest = clamp(pos, node_min, node_max);
-        let box_dist = length(closest - pos);
-        // For opacity, we can skip nodes that are far away — no opacity contribution
-        // Use a generous threshold since opacity falls off at object boundaries
-        if box_dist > 1.0 {
+        if length(closest - pos) > 0.0 {
             continue;
         }
         if node.left == BVH_INVALID {
@@ -355,29 +299,196 @@ fn sample_opacity_bvh(pos: vec3<f32>) -> f32 {
     return max_opacity;
 }
 
-// ---------- Shadow via Transmittance Marching ----------
+// ---------- AABB Ray Intersection ----------
 
-fn compute_shadow(origin: vec3<f32>, light_dir: vec3<f32>, max_dist: f32) -> f32 {
+/// Returns (t_enter, t_exit) for ray-AABB intersection. t_enter > t_exit means miss.
+fn intersect_aabb(origin: vec3<f32>, inv_dir: vec3<f32>,
+                  aabb_min: vec3<f32>, aabb_max: vec3<f32>) -> vec2<f32> {
+    let t0 = (aabb_min - origin) * inv_dir;
+    let t1 = (aabb_max - origin) * inv_dir;
+    let t_near = min(t0, t1);
+    let t_far = max(t0, t1);
+    let t_enter = max(max(t_near.x, t_near.y), t_near.z);
+    let t_exit = min(min(t_far.x, t_far.y), t_far.z);
+    return vec2<f32>(max(t_enter, 0.0), t_exit);
+}
+
+// ---------- Per-Object Shadow Transmittance (DDA Brick Traversal) ----------
+
+/// March a shadow ray through a single object's brick grid using DDA.
+/// Skips EMPTY_SLOT bricks (no geometry), treats INTERIOR_SLOT as fully opaque.
+/// In allocated bricks, accumulates transmittance via Beer's law on trilinear opacity.
+///
+/// `is_origin_obj`: true if this is the object the shadow ray originates from.
+/// When true, the march skips the initial surface (where the ray enters) and
+/// only accumulates opacity after the ray has first exited to empty space.
+/// This prevents the surface's own opacity transition zone from self-shadowing.
+fn shadow_transmittance_object(
+    world_origin: vec3<f32>,
+    world_dir: vec3<f32>,
+    obj: GpuObject,
+    is_origin_obj: bool,
+) -> f32 {
+    let inv_world = obj.inverse_world;
+    let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
+    let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
+    let local_dir = normalize(local_dir_unnorm);
+    let safe_dir = select(local_dir, sign(local_dir) * vec3<f32>(1e-10), abs(local_dir) < vec3<f32>(1e-10));
+    let inv_local_dir = 1.0 / safe_dir;
+
+    let vs = obj.voxel_size;
+    let brick_extent = vs * 8.0;
+    let udims = vec3<u32>(obj.brick_map_dims_x, obj.brick_map_dims_y, obj.brick_map_dims_z);
+    let grid_size = vec3<f32>(udims) * brick_extent;
+    let half_grid = grid_size * 0.5;
+
+    // Intersect ray with object's local grid AABB.
+    let t_range = intersect_aabb(local_origin, inv_local_dir, -half_grid, half_grid);
+    if t_range.x > t_range.y {
+        return 1.0; // miss
+    }
+
     var transmittance = 1.0;
-    var t = 0.02;  // small bias to avoid self-shadowing
-    let step_size = 0.06;
-    for (var i = 0u; i < 48u; i++) {
-        if t > max_dist || transmittance < 0.01 {
+    let fine_step = vs * 0.5;
+    // Extinction coefficient: maps opacity (0-1) to physical extinction.
+    // Calibrated so a single voxel at opacity=1.0 blocks ~95% of light.
+    let extinction = 6.0 / vs;
+
+    var t = max(t_range.x, 0.0);
+
+    // For the origin object, skip the first surface the ray passes through
+    // to avoid self-shadowing. We track two states:
+    //   was_in_surface: have we entered a region with opacity > threshold?
+    //   passed_initial_surface: have we entered AND THEN exited that region?
+    // Only after both are true do we start accumulating transmittance.
+    // For non-self objects, both start true so accumulation begins immediately.
+    var was_in_surface = !is_origin_obj;
+    var passed_initial_surface = !is_origin_obj;
+
+    for (var step = 0u; step < 256u; step++) {
+        if t > t_range.y || transmittance < 0.01 {
             break;
         }
-        let pos = origin + light_dir * t;
-        // Coarse field early-out for empty space
-        let cam_rel = pos - shade_uniforms.camera_pos.xyz;
-        let coarse_dist = sample_coarse_field(cam_rel);
-        if coarse_dist > 0.5 {
-            t += coarse_dist * 0.8;
+
+        let local_pos = local_origin + safe_dir * t;
+        let grid_pos = local_pos + half_grid;
+        let brick_coord = vec3<i32>(floor(grid_pos / brick_extent));
+
+        // Out of grid — done with this object.
+        if any(brick_coord < vec3<i32>(0)) || any(vec3<u32>(brick_coord) >= udims) {
+            break;
+        }
+
+        let bc = vec3<u32>(brick_coord);
+        let flat = bc.x + bc.y * udims.x + bc.z * udims.x * udims.y;
+        let slot = brick_maps[obj.brick_map_offset + flat];
+
+        if slot == EMPTY_SLOT {
+            // Empty space. Skip brick via ray-AABB.
+            if was_in_surface {
+                passed_initial_surface = true;
+            }
+            let brick_min = vec3<f32>(brick_coord) * brick_extent - half_grid;
+            let brick_max = brick_min + vec3<f32>(brick_extent);
+            let t_exit = intersect_aabb(local_origin, inv_local_dir, brick_min, brick_max);
+            t = t_exit.y + vs * 0.1;
             continue;
         }
-        let opacity = sample_opacity_bvh(pos);
-        transmittance *= (1.0 - opacity);
-        // Adaptive stepping: small steps in high-opacity regions
-        t += mix(step_size * 2.0, step_size * 0.5, opacity);
+
+        if slot == INTERIOR_SLOT {
+            // Fully solid brick.
+            was_in_surface = true;
+            if passed_initial_surface {
+                // Re-entered solid after exiting — fully blocked.
+                return 0.0;
+            }
+            // Still in initial surface — skip via ray-AABB.
+            let brick_min = vec3<f32>(brick_coord) * brick_extent - half_grid;
+            let brick_max = brick_min + vec3<f32>(brick_extent);
+            let t_exit = intersect_aabb(local_origin, inv_local_dir, brick_min, brick_max);
+            t = t_exit.y + vs * 0.1;
+            continue;
+        }
+
+        // Allocated brick: sample trilinear opacity.
+        let opacity = sample_opacity_trilinear(local_pos, obj);
+
+        if opacity > 0.3 {
+            was_in_surface = true;
+        }
+
+        if !passed_initial_surface {
+            // Still in or near the initial surface.
+            if was_in_surface && opacity < 0.1 {
+                passed_initial_surface = true;
+            }
+            t += fine_step;
+            continue;
+        }
+
+        // Past the initial surface — accumulate transmittance.
+        transmittance *= exp(-opacity * extinction * fine_step);
+        t += fine_step;
     }
+
+    return transmittance;
+}
+
+// ---------- Shadow via Per-Object DDA Transmittance ----------
+
+/// Compute shadow by marching through all objects along the light ray.
+/// Uses BVH to find intersecting objects, then DDA brick traversal per object.
+/// `origin_object_id`: the object_id of the surface the ray starts from,
+/// used to handle self-shadowing correctly.
+fn compute_shadow(origin: vec3<f32>, light_dir: vec3<f32>, max_dist: f32, origin_object_id: u32) -> f32 {
+    if v2_scene.num_objects == 0u {
+        return 1.0;
+    }
+
+    var transmittance = 1.0;
+
+    // Precompute inverse direction for AABB tests.
+    let safe_dir = select(light_dir, sign(light_dir) * vec3<f32>(1e-10), abs(light_dir) < vec3<f32>(1e-10));
+    let inv_dir = 1.0 / safe_dir;
+
+    // BVH traversal to find objects along the shadow ray.
+    var stack: array<u32, 32>;
+    var stack_ptr = 0u;
+    stack[0] = 0u;
+    stack_ptr = 1u;
+
+    while stack_ptr > 0u && transmittance > 0.01 {
+        stack_ptr -= 1u;
+        let node_idx = stack[stack_ptr];
+        let node = bvh_nodes[node_idx];
+        let node_min = vec3<f32>(node.aabb_min_x, node.aabb_min_y, node.aabb_min_z);
+        let node_max = vec3<f32>(node.aabb_max_x, node.aabb_max_y, node.aabb_max_z);
+
+        // Test ray-AABB intersection with node.
+        let t_node = intersect_aabb(origin, inv_dir, node_min, node_max);
+        if t_node.x > t_node.y || t_node.x > max_dist {
+            continue;
+        }
+
+        if node.left == BVH_INVALID {
+            let obj_idx = node.right_or_object;
+            if obj_idx < v2_scene.num_objects {
+                let obj = objects[obj_idx];
+                if obj.geom_type != GEOM_TYPE_NONE {
+                    let is_self = (obj.object_id & 0xFFu) == origin_object_id;
+                    transmittance *= shadow_transmittance_object(origin, light_dir, obj, is_self);
+                }
+            }
+        } else {
+            if stack_ptr < BVH_STACK_SIZE - 1u {
+                stack[stack_ptr] = node.left;
+                stack_ptr += 1u;
+                stack[stack_ptr] = node.right_or_object;
+                stack_ptr += 1u;
+            }
+        }
+    }
+
     return transmittance;
 }
 
@@ -423,6 +534,10 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
 
     let world_pos = pos_data.xyz;
     let normal = normalize(textureLoad(gbuf_normal, full_coord, 0).xyz);
+
+    // Extract the origin object_id from the G-buffer material channel.
+    let packed_mat = textureLoad(gbuf_material, full_coord, 0);
+    let origin_object_id = (packed_mat.g >> 8u) & 0xFFu;
 
     // --- Single pass: shadow + cloud shadow for first shadow-casting light ---
     var shadow = 1.0;
@@ -477,8 +592,8 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
         if n_dot_l <= 0.0 {
             shadow = 1.0; // behind surface
         } else {
-            let shadow_origin = world_pos + normal * SHADOW_BIAS + light_dir * SHADOW_BIAS * 0.5;
-            shadow = compute_shadow(shadow_origin, light_dir, shadow_max);
+            let shadow_origin = world_pos + normal * SHADOW_BIAS;
+            shadow = compute_shadow(shadow_origin, light_dir, shadow_max, origin_object_id);
         }
 
         shadow *= cloud_transmittance;
@@ -487,7 +602,7 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
     }
 
     // --- Opacity-Probe Ambient Occlusion ---
-    let ao_origin = world_pos + normal * SHADOW_BIAS;
+    let ao_origin = world_pos + normal * SHADOW_BIAS * 2.0;
     let ao = compute_opacity_ao(ao_origin, normal);
 
     // B channel = cloud transmittance (for debug visualization)

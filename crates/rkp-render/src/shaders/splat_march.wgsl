@@ -34,7 +34,7 @@ struct GpuObject {
     brick_map_dims_z: u32,      // @ 108
     voxel_size: f32,             // @ 112
     material_id: u32,            // @ 116
-    sdf_type: u32,               // @ 120
+    geom_type: u32,               // @ 120
     blend_mode: u32,             // @ 124
     blend_radius: f32,           // @ 128
     sdf_param_0: f32,            // @ 132
@@ -766,14 +766,11 @@ fn march_tiled(origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>) -> MarchResu
         // Invert the inverse_world (which is world_to_local) to get local_to_world
         // Since we have the ray origin in world space, compute t from the world hit
         let world_hit_h = vec4<f32>(local_hit, 1.0);
-        // We need local_to_world. For now, compute world t from the ray equation.
-        // world_hit = origin + dir * world_t => world_t = dot(world_hit - origin, dir) / dot(dir, dir)
-        // But we don't have local_to_world directly. Use the AABB relationship.
-        // Actually, we can compute: world_t ≈ local_t * |local_dir| / |world_dir|
-        // but local_dir is normalize(inv_world * dir), so the scale is embedded.
+        // Convert local-space t to world-space t.
+        // Since inverse_world is a linear transform, the ray parameter scales by
+        // the length of the transformed direction: world_t = local_t / |inv_world * dir|.
         let local_dir_unnorm = (inv_world * vec4<f32>(dir, 0.0)).xyz;
-        let scale = length(local_dir_unnorm);
-        let world_t_approx = local_t / scale;
+        let world_t_approx = local_t / max(length(local_dir_unnorm), 1e-10);
 
         if world_t_approx < result.t {
             result.hit = true;

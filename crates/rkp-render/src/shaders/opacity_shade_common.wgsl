@@ -58,7 +58,7 @@ struct GpuObject {
     brick_map_dims_z: u32,
     voxel_size: f32,
     material_id: u32,
-    sdf_type: u32,
+    geom_type: u32,
     blend_mode: u32,
     blend_radius: f32,
     sdf_param_0: f32,
@@ -265,17 +265,10 @@ const INTERIOR_SLOT: u32 = 0xFFFFFFFEu;
 const BVH_INVALID: u32 = 0xFFFFFFFFu;
 const BVH_STACK_SIZE: u32 = 32u;
 
-const SDF_TYPE_NONE: u32       = 0u;
-const SDF_TYPE_ANALYTICAL: u32 = 1u;
-const SDF_TYPE_VOXELIZED: u32  = 2u;
-const SDF_TYPE_PROCEDURAL: u32 = 3u;
-
-const PRIM_SPHERE: u32   = 0u;
-const PRIM_BOX: u32      = 1u;
-const PRIM_CAPSULE: u32  = 2u;
-const PRIM_TORUS: u32    = 3u;
-const PRIM_CYLINDER: u32 = 4u;
-const PRIM_PLANE: u32    = 5u;
+const GEOM_TYPE_NONE: u32       = 0u;
+const GEOM_TYPE_ANALYTICAL: u32 = 1u;
+const GEOM_TYPE_VOXELIZED: u32  = 2u;
+const GEOM_TYPE_PROCEDURAL: u32 = 3u;
 
 // Light types
 const LIGHT_TYPE_DIRECTIONAL: u32 = 0u;
@@ -331,42 +324,7 @@ fn extract_opacity(word0: u32) -> f32 {
     return clamp(unpack2x16float(word0 & 0xFFFFu).x, 0.0, 1.0);
 }
 
-// ---------- SDF Primitives (stubs — not used for opacity objects, kept for compilation) ----------
-
-fn sdf_sphere(p: vec3<f32>, radius: f32) -> f32 {
-    return length(p) - radius;
-}
-
-fn sdf_box(p: vec3<f32>, half_extents: vec3<f32>) -> f32 {
-    let q = abs(p) - half_extents;
-    return length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
-}
-
-fn sdf_capsule(p: vec3<f32>, radius: f32, half_height: f32) -> f32 {
-    let q = vec3<f32>(p.x, max(abs(p.y) - half_height, 0.0), p.z);
-    return length(q) - radius;
-}
-
-fn sdf_torus(p: vec3<f32>, major_radius: f32, minor_radius: f32) -> f32 {
-    let q = vec2<f32>(length(p.xz) - major_radius, p.y);
-    return length(q) - minor_radius;
-}
-
-fn sdf_cylinder(p: vec3<f32>, radius: f32, half_height: f32) -> f32 {
-    let d = vec2<f32>(length(p.xz) - radius, abs(p.y) - half_height);
-    return min(max(d.x, d.y), 0.0) + length(max(d, vec2<f32>(0.0)));
-}
-
-fn sdf_plane(p: vec3<f32>, normal: vec3<f32>, dist: f32) -> f32 {
-    return dot(p, normal) + dist;
-}
-
 // ---------- Opacity Field Evaluation ----------
-
-/// No analytical splat objects — return 0.0 (empty).
-fn evaluate_analytical(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
-    return 0.0;
-}
 
 /// Sample a single voxel's opacity from the brick pool.
 /// EMPTY_SLOT → 0.0 (empty space), INTERIOR_SLOT → 1.0 (fully opaque interior).
@@ -428,15 +386,6 @@ fn sample_opacity_trilinear(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
     let c0 = mix(c00, c10, t.y);
     let c1 = mix(c01, c11, t.y);
     return mix(c0, c1, t.z);
-}
-
-/// Compatibility alias: shade_main.wgsl glass path calls `sample_voxelized()` to detect
-/// when a ray exits an object. Returns a pseudo-SDF: negative inside (opacity > 0.5),
-/// positive outside. The magnitude is scaled by voxel_size so the glass exit check
-/// `probe_sdf > vs` still works.
-fn sample_voxelized(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
-    let opacity = sample_opacity_trilinear(local_pos, obj);
-    return (0.5 - opacity) * obj.voxel_size * 2.0;
 }
 
 /// Sample per-voxel paint color from the companion color pool.
@@ -550,13 +499,10 @@ fn sample_voxelized_material_full(local_pos: vec3<f32>, obj: GpuObject) -> vec3<
 /// No scale multiplication — opacity is dimensionless.
 fn evaluate_object_opacity(world_pos: vec3<f32>, obj_idx: u32) -> f32 {
     let obj = objects[obj_idx];
-    if obj.sdf_type == SDF_TYPE_NONE {
+    if obj.geom_type == GEOM_TYPE_NONE {
         return 0.0;
     }
     let local_pos = (obj.inverse_world * vec4<f32>(world_pos, 1.0)).xyz;
-    if obj.sdf_type == SDF_TYPE_ANALYTICAL {
-        return 0.0;
-    }
     return sample_opacity_trilinear(local_pos, obj);
 }
 
@@ -633,51 +579,17 @@ fn sample_opacity_bvh(pos: vec3<f32>) -> f32 {
     return max_opacity;
 }
 
-// ---------- Compatibility Shims ----------
-//
-// shade_main.wgsl and shade_common_shading.wgsl call sample_sdf / sample_sdf_shadow /
-// sample_sdf_shadow_conf. These shims convert opacity to a pseudo-SDF so downstream
-// code works unchanged. The pseudo-SDF is negative inside (opacity > 0.5) and positive
-// outside (opacity < 0.5), matching SDF sign conventions.
+// ---------- AABB Ray Intersection ----------
 
-/// Pseudo-SDF from opacity: negative inside, positive outside.
-/// sample_sdf(pos) → -(opacity - 0.5)
-fn sample_sdf(pos: vec3<f32>) -> f32 {
-    let opacity = sample_opacity_bvh(pos);
-    return -(opacity - OPACITY_SURFACE_THRESHOLD);
+/// Returns (t_enter, t_exit) for ray-AABB intersection. t_enter > t_exit means miss.
+fn intersect_aabb(origin: vec3<f32>, inv_dir: vec3<f32>,
+                  aabb_min: vec3<f32>, aabb_max: vec3<f32>) -> vec2<f32> {
+    let t0 = (aabb_min - origin) * inv_dir;
+    let t1 = (aabb_max - origin) * inv_dir;
+    let t_near = min(t0, t1);
+    let t_far = max(t0, t1);
+    let t_enter = max(max(t_near.x, t_near.y), t_near.z);
+    let t_exit = min(min(t_far.x, t_far.y), t_far.z);
+    return vec2<f32>(max(t_enter, 0.0), t_exit);
 }
 
-/// Shadow pseudo-SDF: same as sample_sdf for opacity fields.
-fn sample_sdf_shadow(pos: vec3<f32>) -> f32 {
-    let opacity = sample_opacity_bvh(pos);
-    return -(opacity - OPACITY_SURFACE_THRESHOLD);
-}
-
-/// Shadow pseudo-SDF with confidence: returns vec2(pseudo_sdf, confidence).
-/// Confidence is 1.0 where opacity > 0.01 (some geometry present), 0.0 in empty space.
-fn sample_sdf_shadow_conf(pos: vec3<f32>) -> vec2<f32> {
-    let opacity = sample_opacity_bvh(pos);
-    let pseudo_sdf = -(opacity - OPACITY_SURFACE_THRESHOLD);
-    let confidence = select(0.0, 1.0, opacity > 0.01);
-    return vec2<f32>(pseudo_sdf, confidence);
-}
-
-/// Evaluate a single object at a world-space position. Returns world-space distance (pseudo-SDF).
-/// Provided for compatibility with glass refraction and other code that calls evaluate_object_dist.
-fn evaluate_object_dist(world_pos: vec3<f32>, obj_idx: u32) -> f32 {
-    let opacity = evaluate_object_opacity(world_pos, obj_idx);
-    let obj = objects[obj_idx];
-    let min_scale = min(obj.accumulated_scale_x, min(obj.accumulated_scale_y, obj.accumulated_scale_z));
-    // Convert opacity to a pseudo-distance scaled by voxel size for correct step sizing.
-    return -(opacity - OPACITY_SURFACE_THRESHOLD) * obj.voxel_size * min_scale;
-}
-
-/// Shadow variant of evaluate_object_dist returning vec2(distance, confidence).
-fn evaluate_object_dist_shadow(world_pos: vec3<f32>, obj_idx: u32) -> vec2<f32> {
-    let opacity = evaluate_object_opacity(world_pos, obj_idx);
-    let obj = objects[obj_idx];
-    let min_scale = min(obj.accumulated_scale_x, min(obj.accumulated_scale_y, obj.accumulated_scale_z));
-    let pseudo_dist = -(opacity - OPACITY_SURFACE_THRESHOLD) * obj.voxel_size * min_scale;
-    let confidence = select(0.0, 1.0, opacity > 0.01);
-    return vec2<f32>(pseudo_dist, confidence);
-}
