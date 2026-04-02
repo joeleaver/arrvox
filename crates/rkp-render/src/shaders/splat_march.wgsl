@@ -412,13 +412,20 @@ fn march_shell(
     var result: ShellHit;
     result.t = -1.0;
 
-    // Compute how much ray-space distance corresponds to the shell height.
-    // At oblique angles the ray travels further through the shell.
+    // March from the surface outward through the shell.
+    // The ray parameter DECREASES as we move above the surface (closer to camera),
+    // so we march from surface_t backward toward the camera.
     let cos_angle = max(abs(dot(local_dir, surface_normal_local)), 0.05);
     let march_range = shell_height / cos_angle;
+    let step_size = march_range / f32(SHELL_MAX_STEPS);
+
+    // March from the surface toward the camera (decreasing t).
+    // We want the LAST hit (closest to the surface) since the camera sees
+    // the first opaque surface along the ray — which is the outermost blade tip.
+    // Actually: march from camera toward surface (increasing t from shell top to surface).
+    // The first hit IS the outermost blade — that's what we want.
     let march_start = max(surface_t - march_range, 0.001);
     let march_end = surface_t;
-    let step_size = march_range / f32(SHELL_MAX_STEPS);
 
     var prev_opacity = 0.0;
     var prev_t = march_start;
@@ -977,8 +984,12 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
             let local_dir = normalize((inv_world * vec4<f32>(ray_dir, 0.0)).xyz);
             let local_hit = (inv_world * vec4<f32>(hit_pos, 1.0)).xyz;
 
-            // Compute surface normal in local space for h_above calculation
-            let surface_normal_local = compute_local_normal(local_hit, hit_obj);
+            // Compute surface normal in local space for h_above calculation.
+            // Ensure it points toward the camera (away from the surface interior).
+            var surface_normal_local = compute_local_normal(local_hit, hit_obj);
+            if dot(surface_normal_local, -local_dir) < 0.0 {
+                surface_normal_local = -surface_normal_local;
+            }
 
             // Shell height from shader params (param1 = height)
             let raw_shell_h = shader_params[opacity_mat_id].param1;
