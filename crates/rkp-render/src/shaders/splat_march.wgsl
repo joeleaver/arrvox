@@ -132,6 +132,25 @@ struct MarchResult {
 @group(2) @binding(0) var<storage, read> tile_object_indices: array<u32>;
 @group(2) @binding(1) var<storage, read> tile_object_counts: array<u32>;
 
+// Group 3: materials + shader params (for opacity shader evaluation)
+@group(3) @binding(0) var<storage, read> materials: array<Material>;
+@group(3) @binding(1) var<storage, read> shader_params: array<ShaderParams>;
+
+struct Material {
+    albedo_r: f32, albedo_g: f32, albedo_b: f32, roughness: f32,
+    metallic: f32, emission_r: f32, emission_g: f32, emission_b: f32,
+    emission_strength: f32,
+    subsurface: f32, subsurface_r: f32, subsurface_g: f32, subsurface_b: f32,
+    opacity: f32, ior: f32,
+    noise_scale: f32, noise_strength: f32, noise_channels: u32,
+    shader_id: u32, _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32, _pad5: f32,
+}
+
+struct ShaderParams {
+    param0: f32, param1: f32, param2: f32, param3: f32,
+    param4: f32, param5: f32, param6: f32, param7: f32,
+}
+
 // ── Voxel Extraction ───────────────────────────────────────────────────────
 
 /// Extract f16 opacity from word0 bits 0–15, returned as f32 clamped to [0,1].
@@ -335,6 +354,136 @@ fn sample_material_at_hit(local_pos: vec3<f32>, obj: GpuObject) -> vec3<u32> {
     let sec_mat = extract_secondary_material_id(voxel.word1);
     let blend = extract_blend_weight(voxel.word0);
     return vec3<u32>(mat, sec_mat, blend);
+}
+
+// ── Opacity Shader Functions ───────────────────────────────────────────────
+//
+// User-provided opacity shader functions are injected here by ShaderComposer.
+// Each function has signature:
+//   fn opacity_<name>(local_pos: vec3<f32>, h_above: f32, obj: GpuObject, mat_id: u32) -> f32
+// Returns opacity: 0.0 = empty, 1.0 = solid.
+// The dispatch_opacity_shader() switch is also generated here.
+//
+// OPACITY_SHADER_FUNCTIONS
+
+// ── Shell March ───────────────────────────────────────────────────────────
+
+const SHELL_MAX_STEPS: u32 = 64u;
+
+/// Compute the local-space surface normal at a position from the opacity gradient.
+fn compute_local_normal(local_pos: vec3<f32>, obj: GpuObject) -> vec3<f32> {
+    let eps = obj.voxel_size * 2.0;
+    let gx = sample_opacity_trilinear(local_pos + vec3<f32>(eps, 0.0, 0.0), obj)
+           - sample_opacity_trilinear(local_pos - vec3<f32>(eps, 0.0, 0.0), obj);
+    let gy = sample_opacity_trilinear(local_pos + vec3<f32>(0.0, eps, 0.0), obj)
+           - sample_opacity_trilinear(local_pos - vec3<f32>(0.0, eps, 0.0), obj);
+    let gz = sample_opacity_trilinear(local_pos + vec3<f32>(0.0, 0.0, eps), obj)
+           - sample_opacity_trilinear(local_pos - vec3<f32>(0.0, 0.0, eps), obj);
+    let g = -vec3<f32>(gx, gy, gz);
+    let len = length(g);
+    if len < 1e-10 { return vec3<f32>(0.0, 1.0, 0.0); }
+    return g / len;
+}
+
+/// March through the shell above a surface to find procedural geometry.
+///
+/// Evaluates user opacity shaders in the shell region above the voxel surface.
+/// Returns the local-space t of the closest shell hit, or -1.0 on miss.
+/// Also returns the world-space normal and the opacity shader's material ID
+/// via output parameters.
+struct ShellHit {
+    t: f32,
+    local_hit: vec3<f32>,
+    normal_world: vec3<f32>,
+    mat_id: u32,
+}
+
+fn march_shell(
+    local_origin: vec3<f32>,
+    local_dir: vec3<f32>,
+    surface_t: f32,
+    surface_local: vec3<f32>,
+    surface_normal_local: vec3<f32>,
+    shader_id: u32,
+    mat_id: u32,
+    shell_height: f32,
+    obj: GpuObject,
+) -> ShellHit {
+    var result: ShellHit;
+    result.t = -1.0;
+
+    // Compute how much ray-space distance corresponds to the shell height.
+    // At oblique angles the ray travels further through the shell.
+    let cos_angle = max(abs(dot(local_dir, surface_normal_local)), 0.05);
+    let march_range = shell_height / cos_angle;
+    let march_start = max(surface_t - march_range, 0.001);
+    let march_end = surface_t;
+    let step_size = march_range / f32(SHELL_MAX_STEPS);
+
+    var prev_opacity = 0.0;
+    var prev_t = march_start;
+    var t = march_start;
+
+    for (var step = 0u; step < SHELL_MAX_STEPS; step++) {
+        if t >= march_end { break; }
+
+        let local_pos = local_origin + local_dir * t;
+        let h_above = dot(local_pos - surface_local, surface_normal_local);
+
+        // Skip if below the surface or above the shell
+        if h_above < 0.0 {
+            prev_opacity = 0.0;
+            prev_t = t;
+            t += step_size;
+            continue;
+        }
+        if h_above > shell_height {
+            prev_opacity = 0.0;
+            prev_t = t;
+            t += step_size;
+            continue;
+        }
+
+        let opacity = dispatch_opacity_shader(shader_id, local_pos, h_above, obj, mat_id);
+
+        // Check for surface crossing (opacity rises above threshold)
+        if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
+            let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
+            let hit_t = mix(prev_t, t, frac);
+            let hit_pos = local_origin + local_dir * hit_t;
+            let hit_h_above = dot(hit_pos - surface_local, surface_normal_local);
+
+            // Compute normal from gradient of the procedural opacity function
+            let e = obj.voxel_size * 0.5;
+            let gx = dispatch_opacity_shader(shader_id, hit_pos + vec3<f32>(e, 0.0, 0.0), hit_h_above, obj, mat_id)
+                   - dispatch_opacity_shader(shader_id, hit_pos - vec3<f32>(e, 0.0, 0.0), hit_h_above, obj, mat_id);
+            let gy = dispatch_opacity_shader(shader_id, hit_pos + vec3<f32>(0.0, e, 0.0), hit_h_above + e, obj, mat_id)
+                   - dispatch_opacity_shader(shader_id, hit_pos - vec3<f32>(0.0, e, 0.0), hit_h_above - e, obj, mat_id);
+            let gz = dispatch_opacity_shader(shader_id, hit_pos + vec3<f32>(0.0, 0.0, e), hit_h_above, obj, mat_id)
+                   - dispatch_opacity_shader(shader_id, hit_pos - vec3<f32>(0.0, 0.0, e), hit_h_above, obj, mat_id);
+            let local_grad = -vec3<f32>(gx, gy, gz);
+            let world_grad = (transpose(obj.inverse_world) * vec4<f32>(local_grad, 0.0)).xyz;
+            let glen = length(world_grad);
+
+            result.t = hit_t;
+            result.local_hit = hit_pos;
+            result.mat_id = mat_id;
+            if glen > 1e-10 {
+                result.normal_world = world_grad / glen;
+            } else {
+                // Fallback: use the surface normal
+                let world_n = (transpose(obj.inverse_world) * vec4<f32>(surface_normal_local, 0.0)).xyz;
+                result.normal_world = normalize(world_n);
+            }
+            return result;
+        }
+
+        prev_opacity = opacity;
+        prev_t = t;
+        t += step_size;
+    }
+
+    return result;
 }
 
 // ── Per-Object March ───────────────────────────────────────────────────────
@@ -798,20 +947,64 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
     let result = march_tiled(ray_origin, ray_dir, pixel.xy);
 
     if result.hit {
-        let hit_pos = ray_origin + ray_dir * result.t;
-        let normal = compute_normal(hit_pos, result.obj_idx);
+        var hit_pos = ray_origin + ray_dir * result.t;
+        var normal = compute_normal(hit_pos, result.obj_idx);
+        var final_mat_id = result.material_id;
+        var final_sec_mat_id = result.secondary_material_id;
+        var final_blend_weight = result.blend_weight;
+        var final_t = result.t;
+
+        // --- Opacity shell march: check if the surface material has an opacity shader ---
+        let hit_obj = objects[result.obj_idx];
+        let shader_id = materials[final_mat_id].shader_id;
+        if shader_id != 0u {
+            // Material has an opacity shader — march the shell above the surface.
+            let inv_world = hit_obj.inverse_world;
+            let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
+            let local_dir = normalize((inv_world * vec4<f32>(ray_dir, 0.0)).xyz);
+            let local_hit = (inv_world * vec4<f32>(hit_pos, 1.0)).xyz;
+
+            // Compute surface normal in local space for h_above calculation
+            let surface_normal_local = compute_local_normal(local_hit, hit_obj);
+
+            // Shell height from shader params (param1 = height)
+            let raw_shell_h = shader_params[final_mat_id].param1;
+            let shell_h = select(0.5, raw_shell_h, raw_shell_h > 0.0);
+
+            // Compute local-space t of the surface hit
+            let local_dir_unnorm = (inv_world * vec4<f32>(ray_dir, 0.0)).xyz;
+            let scale = length(local_dir_unnorm);
+            let surface_t_local = result.t * scale;
+
+            let shell_result = march_shell(
+                local_origin, local_dir, surface_t_local,
+                local_hit, surface_normal_local,
+                shader_id, final_mat_id, shell_h, hit_obj,
+            );
+
+            if shell_result.t >= 0.0 {
+                // Shell hit — replace the surface with the procedural geometry
+                final_t = shell_result.t / scale; // convert back to world-space t
+                hit_pos = ray_origin + ray_dir * final_t;
+                normal = shell_result.normal_world;
+                final_mat_id = shell_result.mat_id;
+                // Shell geometry uses the same material, no secondary blend
+                final_sec_mat_id = shell_result.mat_id;
+                final_blend_weight = 0u;
+            }
+        }
+
         let motion = compute_motion_vector(hit_pos, pixel.xy);
 
         // Pack material data (same format as rkf-render)
-        let packed_r = (result.material_id & 0xFFFFu)
-                     | ((result.secondary_material_id & 0xFFFFu) << 16u);
-        let packed_g = (result.blend_weight & 0xFFu)
+        let packed_r = (final_mat_id & 0xFFFFu)
+                     | ((final_sec_mat_id & 0xFFFFu) << 16u);
+        let packed_g = (final_blend_weight & 0xFFu)
                      | ((result.object_id & 0xFFu) << 8u);
 
         // For skinned objects, sample per-voxel color at rest-pose position
         // and pack into gbuf_motion.z (same convention as rkf-render).
         var skinned_color_u32 = 0u;
-        let hit_obj = objects[result.obj_idx];
         if hit_obj.is_skinned != 0u && hit_obj.bone_count > 0u {
             let local_hit = (hit_obj.inverse_world * vec4<f32>(hit_pos, 1.0)).xyz;
             let dims = vec3<u32>(hit_obj.brick_map_dims_x, hit_obj.brick_map_dims_y, hit_obj.brick_map_dims_z);
@@ -839,7 +1032,7 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
             }
         }
 
-        textureStore(gbuf_position, coord, vec4<f32>(hit_pos, result.t));
+        textureStore(gbuf_position, coord, vec4<f32>(hit_pos, final_t));
         textureStore(gbuf_normal,   coord, vec4<f32>(normal, 0.0));
         textureStore(gbuf_material, coord, vec4<u32>(packed_r, packed_g, 0u, 0u));
         textureStore(gbuf_motion,   coord, vec4<f32>(motion, bitcast<f32>(skinned_color_u32), 0.0));

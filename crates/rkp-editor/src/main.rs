@@ -8,8 +8,11 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
 
     let march_factory: rkf_editor::engine_loop::MarchFactory = Box::new(
-        |device, scene, gbuffer, tile_cull| -> Box<dyn rkf_render::MarchPass> {
-            Box::new(rkp_render::SplatMarchPass::new(device, scene, gbuffer, tile_cull))
+        |device, scene, gbuffer, tile_cull, material_buffer, shader_params, opacity_code| -> Box<dyn rkf_render::MarchPass> {
+            Box::new(rkp_render::SplatMarchPass::new(
+                device, scene, gbuffer, tile_cull,
+                material_buffer, shader_params, opacity_code,
+            ))
         },
     );
 
