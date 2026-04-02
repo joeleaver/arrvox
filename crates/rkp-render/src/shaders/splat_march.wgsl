@@ -1006,8 +1006,15 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
             );
 
             if shell_result.t >= 0.0 {
-                // Convert local t back to world t
-                final_t = shell_result.t / scale;
+                // Convert local t back to world t.
+                // shell_result.t is in local-space ray parameter. Dividing by scale
+                // converts to world-space ray parameter. The result should be LESS
+                // than result.t (closer to camera = above the surface).
+                let shell_world_t = shell_result.t / scale;
+
+                // Clamp: the shell hit must be closer to camera than the surface.
+                // If it's not, something went wrong — use the surface position.
+                final_t = min(shell_world_t, result.t - 0.001);
                 hit_pos = ray_origin + ray_dir * final_t;
                 normal = shell_result.normal_world;
                 final_mat_id = shell_result.mat_id;
