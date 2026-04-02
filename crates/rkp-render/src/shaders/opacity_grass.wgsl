@@ -57,7 +57,9 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, obj: GpuObject, mat_id: u32
     // Smooth falloff width for gradient normals.
     // Must scale with blade geometry, not voxel size — otherwise overlapping
     // falloff zones from neighboring blades merge into a solid shell.
-    let blade_width = cell_size * 0.06;
+    // Wider than SDF version (0.06) because the fixed-step shell march needs
+    // blades to span at least one march step to be reliably detected.
+    let blade_width = cell_size * 0.15;
     let softness = blade_width * 0.5;
 
     var max_opacity = 0.0;
