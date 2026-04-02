@@ -1007,12 +1007,16 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
             );
 
             if shell_result.t >= 0.0 {
-                // Shell hit — replace the surface with the procedural geometry
-                final_t = shell_result.t / scale; // convert back to world-space t
-                hit_pos = ray_origin + ray_dir * final_t;
-                normal = shell_result.normal_world;
+                // DEBUG: ignore shell march position, just offset surface by 0.3 upward.
+                // If grass appears ABOVE the ground, the issue is in shell_result.t conversion.
+                // If grass appears BELOW, the issue is elsewhere.
+                let original_normal = compute_normal(hit_pos, result.obj_idx);
+                hit_pos = hit_pos + original_normal * 0.3;
+                // Recompute t from the new position
+                let delta = hit_pos - ray_origin;
+                final_t = dot(delta, ray_dir);
+                normal = original_normal;
                 final_mat_id = shell_result.mat_id;
-                // Shell geometry uses the same material, no secondary blend
                 final_sec_mat_id = shell_result.mat_id;
                 final_blend_weight = 0u;
             }
