@@ -960,7 +960,11 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
         // return 0.0 (early-out for h_above<0), the sentinel returns -1.0.
         let hit_obj = objects[result.obj_idx];
         let shader_id = materials[final_mat_id].shader_id;
-        if dispatch_opacity_shader(shader_id, vec3<f32>(0.0), -1.0, hit_obj, final_mat_id) > -0.5 {
+        let opacity_probe = dispatch_opacity_shader(shader_id, vec3<f32>(0.0), -1.0, hit_obj, final_mat_id);
+        // DEBUG: visualize which pixels pass the opacity shader check by shifting
+        // the surface normal to bright red. Remove after debugging.
+        if opacity_probe > -0.5 {
+            normal = vec3<f32>(1.0, 0.0, 0.0); // bright red normal = opacity shader detected
             // Material has a registered opacity shader — march the shell above the surface.
             let inv_world = hit_obj.inverse_world;
             let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
