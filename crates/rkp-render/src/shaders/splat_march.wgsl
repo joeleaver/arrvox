@@ -985,11 +985,7 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
             let local_hit = (inv_world * vec4<f32>(hit_pos, 1.0)).xyz;
 
             // Compute surface normal in local space for h_above calculation.
-            // Ensure it points toward the camera (away from the surface interior).
-            var surface_normal_local = compute_local_normal(local_hit, hit_obj);
-            if dot(surface_normal_local, -local_dir) < 0.0 {
-                surface_normal_local = -surface_normal_local;
-            }
+            let surface_normal_local = compute_local_normal(local_hit, hit_obj);
 
             // Shell height from shader params (param1 = height)
             let raw_shell_h = shader_params[opacity_mat_id].param1;
@@ -1007,18 +1003,15 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
             );
 
             if shell_result.t >= 0.0 {
-                // DEBUG: ignore shell march position, just offset surface by 0.3 upward.
-                // If grass appears ABOVE the ground, the issue is in shell_result.t conversion.
-                // If grass appears BELOW, the issue is elsewhere.
-                let original_normal = compute_normal(hit_pos, result.obj_idx);
-                hit_pos = hit_pos + original_normal * 0.3;
-                // Recompute t from the new position
-                let delta = hit_pos - ray_origin;
-                final_t = dot(delta, ray_dir);
-                normal = original_normal;
+                // Convert local t back to world t
+                final_t = shell_result.t / scale;
+                hit_pos = ray_origin + ray_dir * final_t;
+                normal = shell_result.normal_world;
                 final_mat_id = shell_result.mat_id;
                 final_sec_mat_id = shell_result.mat_id;
                 final_blend_weight = 0u;
+                // DEBUG: magenta normal to confirm hits are found
+                normal = vec3<f32>(1.0, 0.0, 1.0);
             }
         }
 
