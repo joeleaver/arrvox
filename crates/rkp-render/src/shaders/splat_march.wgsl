@@ -13,6 +13,7 @@ const OPACITY_THRESHOLD: f32 = 0.5; // Surface is at 50% opacity
 const MAX_MARCH_STEPS: u32 = 512u;
 const OBJECT_TILE_SIZE: u32 = 16u;
 const TILE_MAX_OBJECTS: u32 = 32u;
+const SDF_TYPE_PROCEDURAL: u32 = 3u;
 
 // ── Structs ────────────────────────────────────────────────────────────────
 
@@ -366,131 +367,134 @@ fn sample_material_at_hit(local_pos: vec3<f32>, obj: GpuObject) -> vec3<u32> {
 //
 // OPACITY_SHADER_FUNCTIONS
 
-// ── Shell March ───────────────────────────────────────────────────────────
+// ── Procedural Volume March ───────────────────────────────────────────────
 
-const SHELL_MAX_STEPS: u32 = 256u;
-
-/// Compute the local-space surface normal at a position from the opacity gradient.
-fn compute_local_normal(local_pos: vec3<f32>, obj: GpuObject) -> vec3<f32> {
-    let eps = obj.voxel_size * 2.0;
-    let gx = sample_opacity_trilinear(local_pos + vec3<f32>(eps, 0.0, 0.0), obj)
-           - sample_opacity_trilinear(local_pos - vec3<f32>(eps, 0.0, 0.0), obj);
-    let gy = sample_opacity_trilinear(local_pos + vec3<f32>(0.0, eps, 0.0), obj)
-           - sample_opacity_trilinear(local_pos - vec3<f32>(0.0, eps, 0.0), obj);
-    let gz = sample_opacity_trilinear(local_pos + vec3<f32>(0.0, 0.0, eps), obj)
-           - sample_opacity_trilinear(local_pos - vec3<f32>(0.0, 0.0, eps), obj);
-    let g = -vec3<f32>(gx, gy, gz);
-    let len = length(g);
-    if len < 1e-10 { return vec3<f32>(0.0, 1.0, 0.0); }
-    return g / len;
+/// Extract f16 SDF distance from word0 bits 0–15 (NOT clamped to [0,1]).
+/// Used for procedural volume bricks which store signed distances, not opacity.
+fn extract_distance(word0: u32) -> f32 {
+    return unpack2x16float(word0 & 0xFFFFu).x;
 }
 
-/// March through the shell above a surface to find procedural geometry.
-///
-/// Evaluates user opacity shaders in the shell region above the voxel surface.
-/// Returns the local-space t of the closest shell hit, or -1.0 on miss.
-/// Also returns the world-space normal and the opacity shader's material ID
-/// via output parameters.
-struct ShellHit {
-    t: f32,
-    local_hit: vec3<f32>,
-    normal_world: vec3<f32>,
-    mat_id: u32,
+/// Sample a single voxel's SDF distance from the brick pool (unclamped).
+fn sample_distance_at(obj_offset: u32, vc: vec3<i32>, dims: vec3<u32>,
+                      total_voxels: vec3<i32>, vs: f32) -> f32 {
+    let c = clamp(vc, vec3<i32>(0), total_voxels - vec3<i32>(1));
+    let brick = vec3<u32>(c / vec3<i32>(8));
+    let local = vec3<u32>(c % vec3<i32>(8));
+    let flat_brick = brick.x + brick.y * dims.x + brick.z * dims.x * dims.y;
+    let slot = brick_maps[obj_offset + flat_brick];
+    if slot == EMPTY_SLOT {
+        return vs * 8.0; // far above surface
+    }
+    if slot == INTERIOR_SLOT {
+        return -vs * 8.0; // deep inside surface
+    }
+    let idx = slot * 512u + local.x + local.y * 8u + local.z * 64u;
+    return extract_distance(brick_pool[idx].word0);
 }
 
-fn march_shell(
-    local_origin: vec3<f32>,
-    local_dir: vec3<f32>,
-    surface_t: f32,
-    surface_local: vec3<f32>,
-    surface_normal_local: vec3<f32>,
-    shader_id: u32,
-    mat_id: u32,
-    shell_height: f32,
-    obj: GpuObject,
-) -> ShellHit {
-    var result: ShellHit;
-    result.t = -1.0;
+/// Trilinear interpolation of the SDF distance field (for procedural volumes).
+fn sample_distance_trilinear(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
+    let vs = obj.voxel_size;
+    let brick_extent = vs * 8.0;
+    let dims = vec3<u32>(obj.brick_map_dims_x, obj.brick_map_dims_y, obj.brick_map_dims_z);
+    let grid_size = vec3<f32>(dims) * brick_extent;
 
-    // March from the surface outward through the shell.
-    // The ray parameter DECREASES as we move above the surface (closer to camera),
-    // so we march from surface_t backward toward the camera.
-    let cos_angle = max(abs(dot(local_dir, surface_normal_local)), 0.05);
-    let march_range = shell_height / cos_angle;
-    let step_size = march_range / f32(SHELL_MAX_STEPS);
+    let grid_pos = local_pos + grid_size * 0.5;
+    let clamped = clamp(grid_pos, vec3<f32>(vs * 0.01), grid_size - vec3<f32>(vs * 0.01));
+    let outside_dist = length(grid_pos - clamped);
 
-    // March from the surface toward the camera (decreasing t).
-    // We want the LAST hit (closest to the surface) since the camera sees
-    // the first opaque surface along the ray — which is the outermost blade tip.
-    // Actually: march from camera toward surface (increasing t from shell top to surface).
-    // The first hit IS the outermost blade — that's what we want.
-    let march_start = max(surface_t - march_range, 0.001);
-    let march_end = surface_t;
+    if outside_dist > brick_extent {
+        return outside_dist; // far outside the grid
+    }
 
+    let voxel_coord = clamped / vs - vec3<f32>(0.5);
+    let v0 = vec3<i32>(floor(voxel_coord));
+    let t = voxel_coord - vec3<f32>(v0);
+    let total_voxels = vec3<i32>(dims) * 8;
+
+    let c000 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(0, 0, 0), dims, total_voxels, vs);
+    let c100 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(1, 0, 0), dims, total_voxels, vs);
+    let c010 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(0, 1, 0), dims, total_voxels, vs);
+    let c110 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(1, 1, 0), dims, total_voxels, vs);
+    let c001 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(0, 0, 1), dims, total_voxels, vs);
+    let c101 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(1, 0, 1), dims, total_voxels, vs);
+    let c011 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(0, 1, 1), dims, total_voxels, vs);
+    let c111 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(1, 1, 1), dims, total_voxels, vs);
+
+    let c00 = mix(c000, c100, t.x);
+    let c10 = mix(c010, c110, t.x);
+    let c01 = mix(c001, c101, t.x);
+    let c11 = mix(c011, c111, t.x);
+    let c0 = mix(c00, c10, t.y);
+    let c1 = mix(c01, c11, t.y);
+    return mix(c0, c1, t.z) + outside_dist;
+}
+
+/// Evaluate combined opacity for a procedural volume at a given position.
+/// Combines the base surface opacity (from SDF distance) with the procedural
+/// blade opacity (from the user's opacity shader).
+fn sample_procedural_opacity(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
+    let h_above = sample_distance_trilinear(local_pos, obj);
+
+    // Convert SDF distance to surface opacity: 1.0 inside, 0.5 at surface, 0.0 above.
+    let surface_opacity = saturate(0.5 - h_above / (obj.voxel_size * 2.0));
+
+    // Evaluate procedural opacity shader (grass blades, etc.)
+    let blade_opacity = dispatch_opacity_shader(
+        obj.sdf_shader_id, local_pos, max(h_above, 0.0), obj, obj.material_id
+    );
+
+    return max(surface_opacity, blade_opacity);
+}
+
+/// March through a procedural volume object.
+/// The volume has its own brick map with pre-computed SDF distances (h_above).
+/// At each step, evaluates the combined surface + procedural opacity.
+fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
+    let obj = objects[obj_idx];
+    let inv_world = obj.inverse_world;
+
+    let local_origin = (inv_world * vec4<f32>(origin, 1.0)).xyz;
+    let local_dir = normalize((inv_world * vec4<f32>(dir, 0.0)).xyz);
+    let safe_dir = select(local_dir, vec3<f32>(1e-10), abs(local_dir) < vec3<f32>(1e-10));
+    let inv_local_dir = 1.0 / safe_dir;
+
+    let brick_extent = obj.voxel_size * 8.0;
+    let dims = vec3<f32>(
+        f32(obj.brick_map_dims_x),
+        f32(obj.brick_map_dims_y),
+        f32(obj.brick_map_dims_z),
+    );
+    let half_grid = dims * brick_extent * 0.5;
+    let t_range = intersect_aabb(local_origin, inv_local_dir, -half_grid, half_grid);
+    if t_range.x > t_range.y {
+        return -1.0;
+    }
+
+    let fine_step = obj.voxel_size * 0.5;
+
+    var t = t_range.x;
     var prev_opacity = 0.0;
-    var prev_t = march_start;
-    var t = march_start;
+    var prev_t = t;
 
-    for (var step = 0u; step < SHELL_MAX_STEPS; step++) {
-        if t >= march_end { break; }
+    for (var step = 0u; step < MAX_MARCH_STEPS; step++) {
+        if t > t_range.y { break; }
 
-        let local_pos = local_origin + local_dir * t;
-        let h_above = dot(local_pos - surface_local, surface_normal_local);
+        let local_pos = local_origin + safe_dir * t;
+        let opacity = sample_procedural_opacity(local_pos, obj);
 
-        // Skip if below the surface or above the shell
-        if h_above < 0.0 {
-            prev_opacity = 0.0;
-            prev_t = t;
-            t += step_size;
-            continue;
-        }
-        if h_above > shell_height {
-            prev_opacity = 0.0;
-            prev_t = t;
-            t += step_size;
-            continue;
-        }
-
-        let opacity = dispatch_opacity_shader(shader_id, local_pos, h_above, obj, mat_id);
-
-        // Check for surface crossing (opacity rises above threshold)
         if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
             let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
-            let hit_t = mix(prev_t, t, frac);
-            let hit_pos = local_origin + local_dir * hit_t;
-            let hit_h_above = dot(hit_pos - surface_local, surface_normal_local);
-
-            // Compute normal from gradient of the procedural opacity function
-            let e = obj.voxel_size * 0.5;
-            let gx = dispatch_opacity_shader(shader_id, hit_pos + vec3<f32>(e, 0.0, 0.0), hit_h_above, obj, mat_id)
-                   - dispatch_opacity_shader(shader_id, hit_pos - vec3<f32>(e, 0.0, 0.0), hit_h_above, obj, mat_id);
-            let gy = dispatch_opacity_shader(shader_id, hit_pos + vec3<f32>(0.0, e, 0.0), hit_h_above + e, obj, mat_id)
-                   - dispatch_opacity_shader(shader_id, hit_pos - vec3<f32>(0.0, e, 0.0), hit_h_above - e, obj, mat_id);
-            let gz = dispatch_opacity_shader(shader_id, hit_pos + vec3<f32>(0.0, 0.0, e), hit_h_above, obj, mat_id)
-                   - dispatch_opacity_shader(shader_id, hit_pos - vec3<f32>(0.0, 0.0, e), hit_h_above, obj, mat_id);
-            let local_grad = -vec3<f32>(gx, gy, gz);
-            let world_grad = (transpose(obj.inverse_world) * vec4<f32>(local_grad, 0.0)).xyz;
-            let glen = length(world_grad);
-
-            result.t = hit_t;
-            result.local_hit = hit_pos;
-            result.mat_id = mat_id;
-            if glen > 1e-10 {
-                result.normal_world = world_grad / glen;
-            } else {
-                // Fallback: use the surface normal
-                let world_n = (transpose(obj.inverse_world) * vec4<f32>(surface_normal_local, 0.0)).xyz;
-                result.normal_world = normalize(world_n);
-            }
-            return result;
+            return mix(prev_t, t, frac);
         }
 
         prev_opacity = opacity;
         prev_t = t;
-        t += step_size;
+        t += fine_step;
     }
 
-    return result;
+    return -1.0;
 }
 
 // ── Per-Object March ───────────────────────────────────────────────────────
@@ -500,6 +504,10 @@ fn march_shell(
 /// Dispatches to skinned variant for animated objects.
 fn march_object(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
     let obj = objects[obj_idx];
+
+    if obj.sdf_type == SDF_TYPE_PROCEDURAL {
+        return march_object_procedural(origin, dir, obj_idx);
+    }
 
     if obj.is_skinned != 0u && obj.bone_count > 0u {
         return march_object_skinned(origin, dir, obj_idx);
@@ -785,11 +793,18 @@ fn march_tiled(origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>) -> MarchResu
             result.object_id = obj.object_id;
             result.obj_idx = obj_idx;
 
-            // Sample material at hit point
-            let mat_data = sample_material_at_hit(local_hit, obj);
-            result.material_id = mat_data.x;
-            result.secondary_material_id = mat_data.y;
-            result.blend_weight = mat_data.z;
+            // Sample material at hit point.
+            // Procedural volumes use the volume's material_id directly.
+            if obj.sdf_type == SDF_TYPE_PROCEDURAL {
+                result.material_id = obj.material_id;
+                result.secondary_material_id = obj.material_id;
+                result.blend_weight = 0u;
+            } else {
+                let mat_data = sample_material_at_hit(local_hit, obj);
+                result.material_id = mat_data.x;
+                result.secondary_material_id = mat_data.y;
+                result.blend_weight = mat_data.z;
+            }
         }
     }
 
@@ -803,11 +818,32 @@ fn compute_normal(hit_pos: vec3<f32>, obj_idx: u32) -> vec3<f32> {
     let obj = objects[obj_idx];
     let local_pos = (obj.inverse_world * vec4<f32>(hit_pos, 1.0)).xyz;
 
+    if obj.sdf_type == SDF_TYPE_PROCEDURAL {
+        return compute_normal_procedural(local_pos, obj);
+    }
+
     if obj.is_skinned != 0u && obj.bone_count > 0u {
         return compute_normal_skinned(local_pos, obj);
     }
 
     return compute_normal_static(local_pos, obj);
+}
+
+/// Normal for procedural volume objects — gradient of the combined opacity field.
+fn compute_normal_procedural(local_pos: vec3<f32>, obj: GpuObject) -> vec3<f32> {
+    let eps = obj.voxel_size * 0.5;
+    let gx = sample_procedural_opacity(local_pos + vec3<f32>(eps, 0.0, 0.0), obj)
+           - sample_procedural_opacity(local_pos - vec3<f32>(eps, 0.0, 0.0), obj);
+    let gy = sample_procedural_opacity(local_pos + vec3<f32>(0.0, eps, 0.0), obj)
+           - sample_procedural_opacity(local_pos - vec3<f32>(0.0, eps, 0.0), obj);
+    let gz = sample_procedural_opacity(local_pos + vec3<f32>(0.0, 0.0, eps), obj)
+           - sample_procedural_opacity(local_pos - vec3<f32>(0.0, 0.0, eps), obj);
+    let local_grad = -vec3<f32>(gx, gy, gz);
+
+    let world_grad = (transpose(obj.inverse_world) * vec4<f32>(local_grad, 0.0)).xyz;
+    let len = length(world_grad);
+    if len < 1e-10 { return vec3<f32>(0.0, 1.0, 0.0); }
+    return world_grad / len;
 }
 
 /// Normal for static objects — gradient directly in local space.
@@ -951,86 +987,20 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
     let result = march_tiled(ray_origin, ray_dir, pixel.xy);
 
     if result.hit {
-        var hit_pos = ray_origin + ray_dir * result.t;
-        var normal = compute_normal(hit_pos, result.obj_idx);
-        var final_mat_id = result.material_id;
-        var final_sec_mat_id = result.secondary_material_id;
-        var final_blend_weight = result.blend_weight;
-        var final_t = result.t;
-
-        // --- Opacity shell march: check if the hit material has a registered opacity shader ---
-        // dispatch_opacity_shader returns -1.0 (sentinel) for shader IDs without an
-        // opacity function. Probe with h_above=-1.0 to distinguish: real opacity shaders
-        // return 0.0 (early-out for h_above<0), the sentinel returns -1.0.
-        let hit_obj = objects[result.obj_idx];
-        // Check both primary and secondary materials for opacity shaders.
-        // Painting often stores the new material as secondary with a blend weight.
-        var opacity_shader_id = 0u;
-        var opacity_mat_id = final_mat_id;
-        let primary_sid = materials[final_mat_id].shader_id;
-        let secondary_sid = materials[final_sec_mat_id].shader_id;
-        if dispatch_opacity_shader(primary_sid, vec3<f32>(0.0), -1.0, hit_obj, final_mat_id) > -0.5 {
-            opacity_shader_id = primary_sid;
-            opacity_mat_id = final_mat_id;
-        } else if dispatch_opacity_shader(secondary_sid, vec3<f32>(0.0), -1.0, hit_obj, final_sec_mat_id) > -0.5 {
-            opacity_shader_id = secondary_sid;
-            opacity_mat_id = final_sec_mat_id;
-        }
-
-        if opacity_shader_id != 0u {
-            // Material has a registered opacity shader — march the shell above the surface.
-            let inv_world = hit_obj.inverse_world;
-            let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
-            let local_dir = normalize((inv_world * vec4<f32>(ray_dir, 0.0)).xyz);
-            let local_hit = (inv_world * vec4<f32>(hit_pos, 1.0)).xyz;
-
-            // Compute surface normal in local space for h_above calculation.
-            let surface_normal_local = compute_local_normal(local_hit, hit_obj);
-
-            // Shell height from shader params (param1 = height)
-            let raw_shell_h = shader_params[opacity_mat_id].param1;
-            let shell_h = select(0.5, raw_shell_h, raw_shell_h > 0.0);
-
-            // Compute local-space t of the surface hit
-            let local_dir_unnorm = (inv_world * vec4<f32>(ray_dir, 0.0)).xyz;
-            let scale = length(local_dir_unnorm);
-            let surface_t_local = result.t * scale;
-
-            let shell_result = march_shell(
-                local_origin, local_dir, surface_t_local,
-                local_hit, surface_normal_local,
-                opacity_shader_id, opacity_mat_id, shell_h, hit_obj,
-            );
-
-            if shell_result.t >= 0.0 {
-                // Convert local t back to world t.
-                // shell_result.t is in local-space ray parameter. Dividing by scale
-                // converts to world-space ray parameter. The result should be LESS
-                // than result.t (closer to camera = above the surface).
-                let shell_world_t = shell_result.t / scale;
-
-                // Clamp: the shell hit must be closer to camera than the surface.
-                // If it's not, something went wrong — use the surface position.
-                final_t = min(shell_world_t, result.t - 0.001);
-                hit_pos = ray_origin + ray_dir * final_t;
-                normal = shell_result.normal_world;
-                final_mat_id = shell_result.mat_id;
-                final_sec_mat_id = shell_result.mat_id;
-                final_blend_weight = 0u;
-            }
-        }
-
+        let hit_pos = ray_origin + ray_dir * result.t;
+        let normal = compute_normal(hit_pos, result.obj_idx);
         let motion = compute_motion_vector(hit_pos, pixel.xy);
 
         // Pack material data (same format as rkf-render)
-        let packed_r = (final_mat_id & 0xFFFFu)
-                     | ((final_sec_mat_id & 0xFFFFu) << 16u);
-        let packed_g = (final_blend_weight & 0xFFu)
+        let packed_r = (result.material_id & 0xFFFFu)
+                     | ((result.secondary_material_id & 0xFFFFu) << 16u);
+        let packed_g = (result.blend_weight & 0xFFu)
                      | ((result.object_id & 0xFFu) << 8u);
 
         // For skinned objects, sample per-voxel color at rest-pose position
         // and pack into gbuf_motion.z (same convention as rkf-render).
         var skinned_color_u32 = 0u;
+        let hit_obj = objects[result.obj_idx];
         if hit_obj.is_skinned != 0u && hit_obj.bone_count > 0u {
             let local_hit = (hit_obj.inverse_world * vec4<f32>(hit_pos, 1.0)).xyz;
             let dims = vec3<u32>(hit_obj.brick_map_dims_x, hit_obj.brick_map_dims_y, hit_obj.brick_map_dims_z);
@@ -1058,7 +1028,7 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
             }
         }
 
-        textureStore(gbuf_position, coord, vec4<f32>(hit_pos, final_t));
+        textureStore(gbuf_position, coord, vec4<f32>(hit_pos, result.t));
         textureStore(gbuf_normal,   coord, vec4<f32>(normal, 0.0));
         textureStore(gbuf_material, coord, vec4<u32>(packed_r, packed_g, 0u, 0u));
         textureStore(gbuf_motion,   coord, vec4<f32>(motion, bitcast<f32>(skinned_color_u32), 0.0));
