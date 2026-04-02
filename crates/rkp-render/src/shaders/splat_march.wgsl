@@ -498,24 +498,34 @@ fn march_object_skinned(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 
     let grid_size = vec3<f32>(dims) * brick_extent;
     let total_v = vec3<i32>(dims) * 8;
 
-    let step_size = vs * 0.5;
-    let max_steps = min(u32(ceil((t_range.y - t_range.x) / step_size)), MAX_MARCH_STEPS);
+    let fine_step = vs * 0.5;
 
     var t = t_range.x;
     var prev_opacity = 0.0;
     var prev_t = t;
 
-    for (var step = 0u; step < max_steps; step++) {
+    for (var step = 0u; step < MAX_MARCH_STEPS; step++) {
+        if t > t_range.y { break; }
+
         let local_pos = local_origin + safe_dir * t;
-
-        // Convert posed position to deformed-pool voxel coords
         let grid_pos = local_pos + grid_size * 0.5;
+
+        // Check if we're inside the deformed grid at all
+        let brick_coord = vec3<i32>(floor(grid_pos / brick_extent));
+        if any(brick_coord < vec3<i32>(0)) || any(vec3<u32>(brick_coord) >= dims) {
+            // Outside deformed grid — skip ahead
+            prev_opacity = 0.0;
+            prev_t = t;
+            t += brick_extent;
+            continue;
+        }
+
+        // Read bone weights from deformed pool at this voxel
         let vc = vec3<i32>(floor(grid_pos / vs));
+        let total_v = vec3<i32>(dims) * 8;
 
-        // Read bone weights from deformed pool (scattered by SkinDeformPass)
         var bone_data = read_bone_field(vc, dims, total_v, obj.deformed_pool_offset);
-
-        // If no bone data at nearest voxel, try 6-connected neighbors
+        // If no bone data, try 6-connected neighbors
         if bone_data.x == 0u && bone_data.y == 0u {
             let offsets = array<vec3<i32>, 6>(
                 vec3<i32>(-1,0,0), vec3<i32>(1,0,0),
@@ -530,13 +540,17 @@ fn march_object_skinned(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 
                 }
             }
         }
-
-        var opacity = 0.0;
-        if bone_data.x != 0u || bone_data.y != 0u {
-            // Inverse-skin to rest-pose, sample opacity there
-            let rest_pos = inverse_skin_position(local_pos, bone_data.x, bone_data.y, obj);
-            opacity = sample_rest_opacity(rest_pos, obj);
+        if bone_data.x == 0u && bone_data.y == 0u {
+            // No bone data at this voxel or neighbors — safe to skip ahead.
+            // Use 4-voxel jump (half a brick) as a conservative skip.
+            prev_opacity = 0.0;
+            prev_t = t;
+            t += vs * 4.0;
+            continue;
         }
+
+        let rest_pos = inverse_skin_position(local_pos, bone_data.x, bone_data.y, obj);
+        let opacity = sample_rest_opacity(rest_pos, obj);
 
         if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
             let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
@@ -545,7 +559,7 @@ fn march_object_skinned(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 
 
         prev_opacity = opacity;
         prev_t = t;
-        t += step_size;
+        t += fine_step;
     }
 
     return -1.0;
