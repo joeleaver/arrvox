@@ -959,15 +959,21 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
         // opacity function. Probe with h_above=-1.0 to distinguish: real opacity shaders
         // return 0.0 (early-out for h_above<0), the sentinel returns -1.0.
         let hit_obj = objects[result.obj_idx];
-        let shader_id = materials[final_mat_id].shader_id;
-        // DEBUG: if shader_id != 0, flip normal downward so grass areas are visibly dark.
-        // This bypasses dispatch_opacity_shader entirely to test if shader_id is set.
-        if shader_id != 0u {
-            normal = vec3<f32>(0.0, -1.0, 0.0); // points down = black
+        // Check both primary and secondary materials for opacity shaders.
+        // Painting often stores the new material as secondary with a blend weight.
+        var opacity_shader_id = 0u;
+        var opacity_mat_id = final_mat_id;
+        let primary_sid = materials[final_mat_id].shader_id;
+        let secondary_sid = materials[final_sec_mat_id].shader_id;
+        if dispatch_opacity_shader(primary_sid, vec3<f32>(0.0), -1.0, hit_obj, final_mat_id) > -0.5 {
+            opacity_shader_id = primary_sid;
+            opacity_mat_id = final_mat_id;
+        } else if dispatch_opacity_shader(secondary_sid, vec3<f32>(0.0), -1.0, hit_obj, final_sec_mat_id) > -0.5 {
+            opacity_shader_id = secondary_sid;
+            opacity_mat_id = final_sec_mat_id;
         }
 
-        let opacity_probe = dispatch_opacity_shader(shader_id, vec3<f32>(0.0), -1.0, hit_obj, final_mat_id);
-        if opacity_probe > -0.5 {
+        if opacity_shader_id != 0u {
             // Material has a registered opacity shader — march the shell above the surface.
             let inv_world = hit_obj.inverse_world;
             let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
@@ -978,7 +984,7 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
             let surface_normal_local = compute_local_normal(local_hit, hit_obj);
 
             // Shell height from shader params (param1 = height)
-            let raw_shell_h = shader_params[final_mat_id].param1;
+            let raw_shell_h = shader_params[opacity_mat_id].param1;
             let shell_h = select(0.5, raw_shell_h, raw_shell_h > 0.0);
 
             // Compute local-space t of the surface hit
@@ -989,7 +995,7 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
             let shell_result = march_shell(
                 local_origin, local_dir, surface_t_local,
                 local_hit, surface_normal_local,
-                shader_id, final_mat_id, shell_h, hit_obj,
+                opacity_shader_id, opacity_mat_id, shell_h, hit_obj,
             );
 
             if shell_result.t >= 0.0 {
