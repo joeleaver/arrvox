@@ -960,11 +960,13 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
         // return 0.0 (early-out for h_above<0), the sentinel returns -1.0.
         let hit_obj = objects[result.obj_idx];
         let shader_id = materials[final_mat_id].shader_id;
-        // DEBUG: encode shader_id and mat_id into the normal for visualization.
-        // R = shader_id / 10 (grass=5 → 0.5), G = final_mat_id / 20, B = probe result
-        let opacity_probe = dispatch_opacity_shader(shader_id, vec3<f32>(0.0), -1.0, hit_obj, final_mat_id);
-        normal = vec3<f32>(f32(shader_id) / 10.0, f32(final_mat_id) / 20.0, select(0.0, 1.0, opacity_probe > -0.5));
+        // DEBUG: if shader_id != 0, flip normal downward so grass areas are visibly dark.
+        // This bypasses dispatch_opacity_shader entirely to test if shader_id is set.
+        if shader_id != 0u {
+            normal = vec3<f32>(0.0, -1.0, 0.0); // points down = black
+        }
 
+        let opacity_probe = dispatch_opacity_shader(shader_id, vec3<f32>(0.0), -1.0, hit_obj, final_mat_id);
         if opacity_probe > -0.5 {
             // Material has a registered opacity shader — march the shell above the surface.
             let inv_world = hit_obj.inverse_world;
