@@ -1013,8 +1013,6 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
                 final_mat_id = shell_result.mat_id;
                 final_sec_mat_id = shell_result.mat_id;
                 final_blend_weight = 0u;
-                // DEBUG: magenta normal to confirm hits are found
-                normal = vec3<f32>(1.0, 0.0, 1.0);
             }
         }
 
