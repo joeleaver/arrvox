@@ -505,7 +505,7 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
 fn march_object(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
     let obj = objects[obj_idx];
 
-    if obj.sdf_type == SDF_TYPE_PROCEDURAL {
+    if obj.geom_type == SDF_TYPE_PROCEDURAL {
         return march_object_procedural(origin, dir, obj_idx);
     }
 
@@ -798,7 +798,7 @@ fn march_tiled(origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>) -> MarchResu
 
             // Sample material at hit point.
             // Procedural volumes use the volume's material_id directly.
-            if obj.sdf_type == SDF_TYPE_PROCEDURAL {
+            if obj.geom_type == SDF_TYPE_PROCEDURAL {
                 result.material_id = obj.material_id;
                 result.secondary_material_id = obj.material_id;
                 result.blend_weight = 0u;
@@ -821,7 +821,7 @@ fn compute_normal(hit_pos: vec3<f32>, obj_idx: u32) -> vec3<f32> {
     let obj = objects[obj_idx];
     let local_pos = (obj.inverse_world * vec4<f32>(hit_pos, 1.0)).xyz;
 
-    if obj.sdf_type == SDF_TYPE_PROCEDURAL {
+    if obj.geom_type == SDF_TYPE_PROCEDURAL {
         return compute_normal_procedural(local_pos, obj);
     }
 

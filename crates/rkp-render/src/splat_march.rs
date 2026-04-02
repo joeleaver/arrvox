@@ -203,4 +203,7 @@ impl rkf_render::MarchPass for SplatMarchPass {
         }
     }
 
+    fn march_source(&self) -> Option<&str> {
+        Some(Self::SOURCE)
+    }
 }
