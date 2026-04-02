@@ -387,11 +387,11 @@ fn sample_distance_at(obj_offset: u32, vc: vec3<i32>, dims: vec3<u32>,
         return vs * 8.0; // far above surface
     }
     if slot == INTERIOR_SLOT {
-        // For procedural volumes, INTERIOR_SLOT means "no data propagated here".
-        // The volume builder fills most bricks as INTERIOR_SLOT and only populates
-        // bricks near the painted surface. Treat as slightly below surface so the
-        // volume's base surface is still found but the interior isn't a solid block.
-        return -vs; // just below surface, not deep inside
+        // In procedural volumes, INTERIOR_SLOT marks bricks where no SDF data was
+        // propagated — typically empty space above the surface. Return a large
+        // positive value (above surface = transparent) so the march passes through.
+        // The opacity shader will provide blade geometry where needed.
+        return vs * 8.0;
     }
     let idx = slot * 512u + local.x + local.y * 8u + local.z * 64u;
     return extract_distance(brick_pool[idx].word0);
