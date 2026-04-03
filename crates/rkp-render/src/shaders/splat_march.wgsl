@@ -411,11 +411,9 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         let local_pos = local_origin + safe_dir * t;
         let h_above = local_pos.y - surface_y;
 
-        // Check if grass material is painted at this XZ by sampling the PARENT's
-        // per-voxel material data (stored in rest_brick_map_* fields).
-        // Scan a few Y levels around the surface to handle terrain that isn't flat.
-        // Sample parent's per-voxel material to check if grass is painted here.
-        // Offset surface_y by half a voxel down to land IN the surface voxel, not on top.
+        // Check if grass material is painted near this XZ by sampling the PARENT's
+        // per-voxel material data. Check a small neighborhood to account for blade
+        // bend — a bent blade tip can extend past the painted boundary.
         let parent_dims = vec3<u32>(obj.rest_brick_map_dims_x, obj.rest_brick_map_dims_y, obj.rest_brick_map_dims_z);
         let parent_vs = obj.voxel_size;
         let parent_grid = vec3<f32>(parent_dims) * parent_vs * 8.0;
@@ -426,12 +424,20 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
             vec3<i32>(floor(check_gp / parent_vs)),
             vec3<i32>(0), parent_total - vec3<i32>(1),
         );
-        let parent_voxel = sample_voxel_data_at(
-            obj.rest_brick_map_offset, check_vc, parent_dims, parent_total
-        );
-        let pri = extract_material_id(parent_voxel.word1);
-        let sec = extract_secondary_material_id(parent_voxel.word1);
-        let has_grass = (pri == obj.material_id) || (sec == obj.material_id);
+        var has_grass = false;
+        for (var dx = -2i; dx <= 2i; dx++) {
+            for (var dz = -2i; dz <= 2i; dz++) {
+                let vc = clamp(check_vc + vec3<i32>(dx, 0, dz), vec3<i32>(0), parent_total - vec3<i32>(1));
+                let v = sample_voxel_data_at(obj.rest_brick_map_offset, vc, parent_dims, parent_total);
+                let p = extract_material_id(v.word1);
+                let s = extract_secondary_material_id(v.word1);
+                if p == obj.material_id || s == obj.material_id {
+                    has_grass = true;
+                    break;
+                }
+            }
+            if has_grass { break; }
+        }
 
         var opacity = 0.0;
         if has_grass {
