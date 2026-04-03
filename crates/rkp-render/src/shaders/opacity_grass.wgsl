@@ -97,9 +97,9 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
             let t_blade = saturate(p.y / blade_h);
             let bend_dir = grass_hash2(c * 73.1) - 0.5;
             // Bend scales with blade_h but has a minimum so short grass still curves.
-            // Bend must exceed blade_width to be visible. Scale so the curve
-            // becomes visible in the bottom half of the blade, not just the tip.
-            let bend_amount = bend * max(blade_h, blade_width * 8.0) * t_blade;
+            // Quadratic bend for a smooth parabolic arc. Scale so the curve
+            // becomes visible in the lower half of the blade.
+            let bend_amount = bend * max(blade_h, blade_width * 12.0) * t_blade * t_blade;
             p.x -= bend_amount * bend_dir.x;
             p.z -= bend_amount * bend_dir.y * 0.3;
 
@@ -118,8 +118,10 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
             let dy = p.y - py;
             let d = sqrt(qx * qx + qz * qz + dy * dy);
 
-            // Convert distance to smooth opacity via smoothstep falloff
-            let blade_opacity = 1.0 - smoothstep(0.0, softness, d);
+            // Convert distance to smooth opacity. Use a minimum softness
+            // so the tapered tip doesn't create aliasing artifacts.
+            let tip_softness = max(softness, obj.voxel_size * 0.15);
+            let blade_opacity = 1.0 - smoothstep(0.0, tip_softness, d);
             max_opacity = max(max_opacity, blade_opacity);
         }
     }
