@@ -58,9 +58,9 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
     // Blade width: proportional to voxel size so the fixed-step march can
     // detect them, but capped at blade height to maintain aspect ratio
     // for short grass.
-    // Blade width proportional to height for natural aspect ratio.
-    // March step = shell_height / 64, so softness >= that for clean detection.
-    let blade_width = height * 0.06;
+    // Realistic blade width: ~2mm base + slight increase with height.
+    // Real grass: 5cm lawn ≈ 2mm, 30cm meadow ≈ 4mm, 1m tall ≈ 7mm.
+    let blade_width = 0.002 + height * 0.005;
     let march_step_approx = height / 64.0;
     let softness = max(blade_width * 0.4, march_step_approx);
 
