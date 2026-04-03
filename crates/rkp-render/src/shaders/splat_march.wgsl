@@ -405,9 +405,10 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
 
     // Per-ray jitter: offset start by a fraction of the step to break
     // coherent step-aligned banding into imperceptible noise.
-    // Small jitter (quarter step) breaks banding without causing blade misses.
+    // Per-ray jitter: full step offset breaks step-aligned banding into noise.
+    // Softness in the opacity shader is >= march_step, so blades aren't missed.
     let jitter = fract(sin(dot(local_origin.xz + local_dir.xz * 100.0, vec2<f32>(127.1, 311.7))) * 43758.5453);
-    var t = t_range.x + march_step * 0.25 * jitter;
+    var t = t_range.x + march_step * jitter;
     var prev_opacity = 0.0;
     var prev_t = t;
 
