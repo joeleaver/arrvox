@@ -1,21 +1,18 @@
 //! Building generator — modular 1920s brick office building (splat engine).
 //!
-//! Produces a `Subtree` where each architectural element is its own object:
+//! Produces a `Subtree` with:
 //!
 //! ```text
 //! Building
-//!   Ground Floor          — walls + slab (window holes cut out)
-//!   Floor 1               — walls + slab
+//!   Walls                 — single continuous object, full height, all cutouts
+//!   Slab F0               — interior floor plate per storey
+//!   Slab F1
 //!   ...
 //!   Window F0-W0          — glass pane + lintel + sill
-//!   Window F0-W1
-//!   Door F0 (front)       — lintel only (no glass, no sill)
+//!   Door F0 (front)       — lintel only
 //!   ...
 //!   Cornice               — decorative top band
 //! ```
-//!
-//! Uses `voxelize_splat` for opacity-field output (binary 1.0/0.0 opacity)
-//! instead of SDF distances.
 
 use glam::Vec3;
 use rkf_core::Aabb;
@@ -96,8 +93,6 @@ fn generate_building(
     let floor_height = p.floor_height.sample_seeded(seed + 300).max(2.0);
     let ground_floor_height = p.ground_floor_height.sample_seeded(seed + 400).max(2.0);
 
-    let upper_floors = if floors > 1 { floors - 1 } else { 0 };
-    let total_height = snap(ground_floor_height + upper_floors as f32 * floor_height + 0.3);
     let half_w = snap(width / 2.0);
     let half_d = snap(depth / 2.0);
     let wt = snap(p.wall_thickness).max(vs * 3.0);
@@ -108,6 +103,17 @@ fn generate_building(
     let overhang = snap(0.06_f32).max(vs);
     let protrusion = snap(0.04_f32).max(vs);
 
+    // Cumulative floor bases from snapped heights.
+    let snapped_ground_h = snap(ground_floor_height);
+    let snapped_floor_h = snap(floor_height);
+    let mut floor_bases = Vec::with_capacity(floors as usize);
+    let mut cumulative_y = 0.0_f32;
+    for i in 0..floors {
+        floor_bases.push(cumulative_y);
+        cumulative_y += if i == 0 { snapped_ground_h } else { snapped_floor_h };
+    }
+    let total_height = cumulative_y;
+
     let sp = SampledParams {
         seed, floors, width, depth, floor_height, ground_floor_height,
         wall_thickness: p.wall_thickness, voxel_size: vs,
@@ -117,34 +123,27 @@ fn generate_building(
         window_width: p.window_width, window_height: p.window_height,
     };
 
-    let windows = compute_window_layout(&sp);
+    let windows = compute_window_layout(&sp, &floor_bases);
 
     let mut children: Vec<GeneratedObject> = Vec::new();
 
-    // ── Floors (walls + slab, with cutout holes for windows/doors) ──────
-    for floor_idx in 0..floors {
-        let is_ground = floor_idx == 0;
-        let floor_base = if is_ground {
-            0.0
-        } else {
-            snap(ground_floor_height + (floor_idx - 1) as f32 * floor_height)
-        };
-        let fh = if is_ground { snap(ground_floor_height) } else { snap(floor_height) };
-        let half_h = fh / 2.0;
-
-        let floor_aabb = Aabb::new(
+    // ── Walls — single continuous object, full building height ──────────
+    // All window/door cutouts are punched in building-space coordinates.
+    // No per-floor seams since it's one piece.
+    {
+        let half_h = total_height / 2.0;
+        let wall_aabb = Aabb::new(
             Vec3::new(-half_w, -half_h, -half_d),
             Vec3::new(half_w, half_h, half_d),
         );
 
-        // Precompute window cutout boxes for this floor (floor-local coords).
+        // Cutout boxes in building-space Y.
         let cutouts: Vec<(Vec3, Vec3)> = windows.iter()
-            .filter(|w| w.floor == floor_idx)
             .map(|w| {
                 let hw = snap(w.half_width);
                 let hh = snap(w.half_height);
                 let cx = snap(w.center_along_wall);
-                let cy = snap(w.local_center_y);
+                let cy = snap(w.building_center_y);
                 wall_box(cx, cy, hw, hh, w.wall, half_w, half_d, wt)
             })
             .collect();
@@ -152,36 +151,31 @@ fn generate_building(
         let f_half_w = half_w;
         let f_half_d = half_d;
         let f_wt = wt;
-        let f_slab = slab_thickness;
-        let f_height = fh;
+        let f_total_h = total_height;
         let f_mat_brick = sp.mat_brick;
-        let f_mat_floor = sp.mat_floor;
 
-        let output = voxelize_splat(floor_aabb, vs, Some(ctx), |pos| {
-            let lp = pos + Vec3::new(0.0, half_h, 0.0); // to floor-local
+        let output = voxelize_splat(wall_aabb, vs, Some(ctx), |pos| {
+            // pos is AABB-local (centered). Convert to building-space (Y=0 at ground).
+            let bp = pos + Vec3::new(0.0, half_h, 0.0);
 
-            // Outside envelope.
-            if lp.x < -f_half_w || lp.x > f_half_w
-                || lp.y < 0.0 || lp.y > f_height
-                || lp.z < -f_half_d || lp.z > f_half_d
+            // Outside building envelope.
+            if bp.x < -f_half_w || bp.x > f_half_w
+                || bp.y < 0.0 || bp.y > f_total_h
+                || bp.z < -f_half_d || bp.z > f_half_d
             {
                 return VoxelQuery { solid: false, material: 0 };
             }
 
-            // Interior: slab or air.
-            let inner_x = lp.x.abs() < f_half_w - f_wt;
-            let inner_z = lp.z.abs() < f_half_d - f_wt;
+            // Interior (not in walls).
+            let inner_x = bp.x.abs() < f_half_w - f_wt;
+            let inner_z = bp.z.abs() < f_half_d - f_wt;
             if inner_x && inner_z {
-                return if lp.y <= f_slab {
-                    VoxelQuery { solid: true, material: f_mat_floor }
-                } else {
-                    VoxelQuery { solid: false, material: 0 }
-                };
+                return VoxelQuery { solid: false, material: 0 };
             }
 
             // Wall — cut holes for windows/doors.
             for (cmin, cmax) in &cutouts {
-                if in_box(lp, *cmin, *cmax) {
+                if in_box(bp, *cmin, *cmax) {
                     return VoxelQuery { solid: false, material: 0 };
                 }
             }
@@ -189,53 +183,72 @@ fn generate_building(
             VoxelQuery { solid: true, material: f_mat_brick }
         })?;
 
-        let floor_name = if is_ground {
-            "Ground Floor".to_string()
-        } else {
-            format!("Floor {}", floor_idx)
-        };
-
         children.push(GeneratedObject::with_geometry(
-            floor_name,
+            "Walls",
             rkf_core::Transform {
-                position: Vec3::new(0.0, floor_base + half_h, 0.0),
+                position: Vec3::new(0.0, half_h, 0.0),
                 rotation: glam::Quat::IDENTITY,
                 scale: Vec3::ONE,
             },
-            rkf_core::SceneNode::new("floor"),
+            rkf_core::SceneNode::new("walls"),
             output,
         ));
     }
 
-    // ── Windows and doors (each is a group of sub-pieces) ───────────────
+    // ── Slabs — one per floor, interior only ────────────────────────────
+    for floor_idx in 0..floors {
+        let floor_base = floor_bases[floor_idx as usize];
+        let slab_half_w = half_w - wt;
+        let slab_half_d = half_d - wt;
+        let slab_half_h = slab_thickness / 2.0;
+
+        let (center, output) = voxelize_box_splat(
+            Vec3::new(-slab_half_w, 0.0, -slab_half_d),
+            Vec3::new(slab_half_w, slab_thickness, slab_half_d),
+            sp.mat_floor,
+            vs,
+            Some(ctx),
+        )?;
+
+        let slab_name = if floor_idx == 0 {
+            "Slab Ground".to_string()
+        } else {
+            format!("Slab F{}", floor_idx)
+        };
+
+        children.push(GeneratedObject::with_geometry(
+            slab_name,
+            rkf_core::Transform {
+                position: center + Vec3::new(0.0, floor_base, 0.0),
+                rotation: glam::Quat::IDENTITY,
+                scale: Vec3::ONE,
+            },
+            rkf_core::SceneNode::new("slab"),
+            output,
+        ));
+    }
+
+    // ── Windows and doors ───────────────────────────────────────────────
     let wall_names = ["front", "back", "left", "right"];
 
     for (wi, win) in windows.iter().enumerate() {
         let hw = snap(win.half_width);
         let hh = snap(win.half_height);
         let cx = snap(win.center_along_wall);
-        let cy = snap(win.local_center_y);
-
-        // Floor base in building-space Y.
-        let floor_base = if win.floor == 0 {
-            0.0
-        } else {
-            snap(ground_floor_height + (win.floor - 1) as f32 * floor_height)
-        };
+        let cy_bld = snap(win.building_center_y);
 
         let wall_name = wall_names[win.wall as usize % 4];
 
         if win.is_door {
-            // Door: just a lintel above the opening.
             let lw = hw + overhang;
-            let lintel_y = cy + hh; // floor-local
+            let lintel_y = cy_bld + hh;
             let (lmin, lmax) = wall_accent(cx, lintel_y, lintel_h, lw, win.wall, half_w, half_d, wt, protrusion);
             let (child_center, child_output) = voxelize_box_splat(lmin, lmax, sp.mat_stone, vs, Some(ctx))?;
 
             children.push(GeneratedObject::with_geometry(
                 format!("Door F{} ({})", win.floor, wall_name),
                 rkf_core::Transform {
-                    position: child_center + Vec3::new(0.0, floor_base, 0.0),
+                    position: child_center,
                     rotation: glam::Quat::IDENTITY,
                     scale: Vec3::ONE,
                 },
@@ -243,16 +256,14 @@ fn generate_building(
                 child_output,
             ));
         } else {
-            // Window: glass pane + lintel + sill — each as separate children.
-
             // Glass pane.
-            let (pmin, pmax) = wall_pane(cx, cy, hw, hh, win.wall, half_w, half_d, pane_thick);
+            let (pmin, pmax) = wall_pane(cx, cy_bld, hw, hh, win.wall, half_w, half_d, pane_thick);
             let (child_center, child_output) = voxelize_box_splat(pmin, pmax, sp.mat_glass, vs, Some(ctx))?;
 
             children.push(GeneratedObject::with_geometry(
                 format!("Window F{}-{} glass ({})", win.floor, wi, wall_name),
                 rkf_core::Transform {
-                    position: child_center + Vec3::new(0.0, floor_base, 0.0),
+                    position: child_center,
                     rotation: glam::Quat::IDENTITY,
                     scale: Vec3::ONE,
                 },
@@ -260,16 +271,16 @@ fn generate_building(
                 child_output,
             ));
 
-            // Lintel (above opening).
+            // Lintel.
             let lw = hw + overhang;
-            let lintel_y = cy + hh;
+            let lintel_y = cy_bld + hh;
             let (lmin, lmax) = wall_accent(cx, lintel_y, lintel_h, lw, win.wall, half_w, half_d, wt, protrusion);
             let (child_center, child_output) = voxelize_box_splat(lmin, lmax, sp.mat_stone, vs, Some(ctx))?;
 
             children.push(GeneratedObject::with_geometry(
                 format!("Window F{}-{} lintel ({})", win.floor, wi, wall_name),
                 rkf_core::Transform {
-                    position: child_center + Vec3::new(0.0, floor_base, 0.0),
+                    position: child_center,
                     rotation: glam::Quat::IDENTITY,
                     scale: Vec3::ONE,
                 },
@@ -277,15 +288,15 @@ fn generate_building(
                 child_output,
             ));
 
-            // Sill (below opening).
-            let sill_y = cy - hh - sill_h;
+            // Sill.
+            let sill_y = cy_bld - hh - sill_h;
             let (smin, smax) = wall_accent(cx, sill_y, sill_h, lw, win.wall, half_w, half_d, wt, protrusion);
             let (child_center, child_output) = voxelize_box_splat(smin, smax, sp.mat_stone, vs, Some(ctx))?;
 
             children.push(GeneratedObject::with_geometry(
                 format!("Window F{}-{} sill ({})", win.floor, wi, wall_name),
                 rkf_core::Transform {
-                    position: child_center + Vec3::new(0.0, floor_base, 0.0),
+                    position: child_center,
                     rotation: glam::Quat::IDENTITY,
                     scale: Vec3::ONE,
                 },
@@ -356,6 +367,7 @@ struct SampledParams {
 
 // ── Wall geometry helpers ────────────────────────────────────────────────
 
+/// Cutout/pane box for a window or door in a wall. Y is building-space.
 fn wall_box(cx: f32, cy: f32, hw: f32, hh: f32, wall: u16, half_w: f32, half_d: f32, wt: f32) -> (Vec3, Vec3) {
     match wall {
         0 => (Vec3::new(cx - hw, cy - hh, -half_d), Vec3::new(cx + hw, cy + hh, -half_d + wt)),
@@ -387,7 +399,8 @@ fn wall_accent(cx: f32, y: f32, h: f32, lw: f32, wall: u16, half_w: f32, half_d:
 
 struct WindowOpening {
     center_along_wall: f32,
-    local_center_y: f32,
+    /// Window center Y in building space (not floor-local).
+    building_center_y: f32,
     half_width: f32,
     half_height: f32,
     wall: u16,
@@ -395,7 +408,9 @@ struct WindowOpening {
     is_door: bool,
 }
 
-fn compute_window_layout(p: &SampledParams) -> Vec<WindowOpening> {
+/// Compute window and door positions for the entire building.
+/// All Y coordinates are in building space (Y=0 at ground level).
+fn compute_window_layout(p: &SampledParams, floor_bases: &[f32]) -> Vec<WindowOpening> {
     let mut windows = Vec::new();
     let seed_base = p.seed as u64;
     let sill_height = 0.9;
@@ -414,15 +429,17 @@ fn compute_window_layout(p: &SampledParams) -> Vec<WindowOpening> {
 
     for floor in 0..p.floors {
         let is_ground = floor == 0;
+        let base = floor_bases[floor as usize];
 
         for i in 0..n_windows_fb {
             let cx = -p.width / 2.0 + spacing_fb * (i + 1) as f32;
 
             if is_ground && i == center_fb {
-                let cy = dhh;
+                let cy_local = dhh;
                 for wall in [0u16, 1] {
                     windows.push(WindowOpening {
-                        center_along_wall: cx, local_center_y: cy,
+                        center_along_wall: cx,
+                        building_center_y: base + cy_local,
                         half_width: dhw, half_height: dhh, wall, floor, is_door: true,
                     });
                     win_index += 1;
@@ -430,10 +447,11 @@ fn compute_window_layout(p: &SampledParams) -> Vec<WindowOpening> {
             } else {
                 let hw = p.window_width.sample_seeded(seed_base + win_index) / 2.0;
                 let hh = p.window_height.sample_seeded(seed_base + win_index + 1000) / 2.0;
-                let cy = sill_height + hh;
+                let cy_local = sill_height + hh;
                 for wall in [0u16, 1] {
                     windows.push(WindowOpening {
-                        center_along_wall: cx, local_center_y: cy,
+                        center_along_wall: cx,
+                        building_center_y: base + cy_local,
                         half_width: hw, half_height: hh, wall, floor, is_door: false,
                     });
                 }
@@ -445,10 +463,11 @@ fn compute_window_layout(p: &SampledParams) -> Vec<WindowOpening> {
             let cz = -p.depth / 2.0 + spacing_side * (i + 1) as f32;
             let hw = p.window_width.sample_seeded(seed_base + win_index) / 2.0;
             let hh = p.window_height.sample_seeded(seed_base + win_index + 1000) / 2.0;
-            let cy = sill_height + hh;
+            let cy_local = sill_height + hh;
             for wall in [2u16, 3] {
                 windows.push(WindowOpening {
-                    center_along_wall: cz, local_center_y: cy,
+                    center_along_wall: cz,
+                    building_center_y: base + cy_local,
                     half_width: hw, half_height: hh, wall, floor, is_door: false,
                 });
             }
