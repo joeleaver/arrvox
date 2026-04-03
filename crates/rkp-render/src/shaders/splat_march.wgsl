@@ -396,12 +396,10 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         return -1.0;
     }
 
-    // DEBUG: return hit slightly past AABB entry to verify loop isn't the issue
-    return t_range.x + 0.01;
-
     // Surface Y in local space (stored in sdf_param_0 by the volume builder).
     let surface_y = obj.sdf_param_0;
-    let fine_step = obj.voxel_size * 0.5;
+    // Step size: guarantee full AABB traversal within MAX_MARCH_STEPS.
+    let march_step = max((t_range.y - t_range.x) / f32(MAX_MARCH_STEPS - 1u), obj.voxel_size * 0.5);
 
     var t = t_range.x;
     var prev_opacity = 0.0;
@@ -413,18 +411,9 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         let local_pos = local_origin + safe_dir * t;
         let h_above = local_pos.y - surface_y;
 
-        // Adaptive stepping: coarse when far from shell, fine when inside.
-        // This handles large volumes without exhausting MAX_MARCH_STEPS.
-        if h_above < -fine_step || h_above > obj.shell_height + fine_step {
-            // Far from the shell — take large steps.
-            prev_opacity = 0.0;
-            prev_t = t;
-            t += max(abs(h_above) * 0.5, fine_step * 4.0);
-            continue;
-        }
-
-        // DEBUG: force solid shell to verify march reaches the shell region
-        let opacity = select(0.0, 1.0, h_above >= 0.0 && h_above <= obj.shell_height);
+        let opacity = dispatch_opacity_shader(
+            obj.sdf_shader_id, local_pos, max(h_above, 0.0), obj, obj.material_id
+        );
 
         if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
             let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
@@ -433,7 +422,7 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
 
         prev_opacity = opacity;
         prev_t = t;
-        t += fine_step;
+        t += march_step;
     }
 
     return -1.0;
