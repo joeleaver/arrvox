@@ -411,9 +411,32 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         let local_pos = local_origin + safe_dir * t;
         let h_above = local_pos.y - surface_y;
 
-        let opacity = dispatch_opacity_shader(
-            obj.sdf_shader_id, local_pos, max(h_above, 0.0), obj, obj.material_id
+        // Check if grass material is painted at this XZ by sampling the PARENT's
+        // per-voxel material data (stored in rest_brick_map_* fields).
+        // Project to surface Y and do nearest-neighbor material lookup.
+        let parent_dims = vec3<u32>(obj.rest_brick_map_dims_x, obj.rest_brick_map_dims_y, obj.rest_brick_map_dims_z);
+        let parent_vs = obj.voxel_size;
+        let parent_grid = vec3<f32>(parent_dims) * parent_vs * 8.0;
+        let surface_pos = vec3<f32>(local_pos.x, surface_y, local_pos.z);
+        let parent_gp = surface_pos + parent_grid * 0.5;
+        let parent_vc = clamp(
+            vec3<i32>(floor(parent_gp / parent_vs)),
+            vec3<i32>(0),
+            vec3<i32>(parent_dims) * 8 - vec3<i32>(1),
         );
+        let parent_voxel = sample_voxel_data_at(
+            obj.rest_brick_map_offset, parent_vc, parent_dims, vec3<i32>(parent_dims) * 8
+        );
+        let pvox_pri = extract_material_id(parent_voxel.word1);
+        let pvox_sec = extract_secondary_material_id(parent_voxel.word1);
+        let has_grass = (pvox_pri == obj.material_id) || (pvox_sec == obj.material_id);
+
+        var opacity = 0.0;
+        if has_grass {
+            opacity = dispatch_opacity_shader(
+                obj.sdf_shader_id, local_pos, max(h_above, 0.0), obj, obj.material_id
+            );
+        }
 
         if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
             let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
