@@ -384,17 +384,15 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
     let safe_dir = select(local_dir, vec3<f32>(1e-10), abs(local_dir) < vec3<f32>(1e-10));
     let inv_local_dir = 1.0 / safe_dir;
 
-    // Use the volume's brick grid for AABB and empty-space skipping.
-    let brick_extent = obj.voxel_size * 8.0;
-    let dims = vec3<f32>(
-        f32(obj.brick_map_dims_x),
-        f32(obj.brick_map_dims_y),
-        f32(obj.brick_map_dims_z),
+    // Use the world AABB transformed to local space. Per-brick volumes have
+    // no brick grid (dims=[0,0,0]) — they're just tight AABBs.
+    let local_aabb_min = (inv_world * vec4<f32>(obj.aabb_min.xyz, 1.0)).xyz;
+    let local_aabb_max = (inv_world * vec4<f32>(obj.aabb_max.xyz, 1.0)).xyz;
+    let t_range = intersect_aabb(
+        local_origin, inv_local_dir,
+        min(local_aabb_min, local_aabb_max),
+        max(local_aabb_min, local_aabb_max),
     );
-    let half_grid = dims * brick_extent * 0.5;
-    let udims = vec3<u32>(obj.brick_map_dims_x, obj.brick_map_dims_y, obj.brick_map_dims_z);
-
-    let t_range = intersect_aabb(local_origin, inv_local_dir, -half_grid, half_grid);
     if t_range.x > t_range.y {
         return -1.0;
     }
@@ -415,31 +413,6 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         if t > t_range.y { break; }
 
         let local_pos = local_origin + safe_dir * t;
-
-        // Brick-level empty-space skipping (same pattern as march_object_static).
-        let grid_pos = local_pos + half_grid;
-        let brick_coord = vec3<i32>(floor(grid_pos / brick_extent));
-        var in_empty_brick = false;
-        if any(brick_coord < vec3<i32>(0)) || any(vec3<u32>(brick_coord) >= udims) {
-            in_empty_brick = true;
-        } else {
-            let flat_brick = u32(brick_coord.x) + u32(brick_coord.y) * udims.x + u32(brick_coord.z) * udims.x * udims.y;
-            let slot = brick_maps[obj.brick_map_offset + flat_brick];
-            if slot == EMPTY_SLOT {
-                in_empty_brick = true;
-            }
-        }
-
-        if in_empty_brick {
-            let brick_min = vec3<f32>(brick_coord) * brick_extent - half_grid;
-            let brick_max = brick_min + vec3<f32>(brick_extent);
-            let t_exit = intersect_aabb(local_origin, inv_local_dir, brick_min, brick_max);
-            prev_opacity = 0.0;
-            prev_t = t;
-            t = t_exit.y + obj.voxel_size * 0.1;
-            continue;
-        }
-
         let h_above = local_pos.y - surface_y;
 
         // Sample the parent's per-voxel material at this XZ to get the blend weight.
