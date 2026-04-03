@@ -118,10 +118,7 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
             let dy = p.y - py;
             let d = sqrt(qx * qx + qz * qz + dy * dy);
 
-            // Convert distance to smooth opacity. Use a minimum softness
-            // so the tapered tip doesn't create aliasing artifacts.
-            let tip_softness = max(softness, obj.voxel_size * 0.15);
-            let blade_opacity = 1.0 - smoothstep(0.0, tip_softness, d);
+            let blade_opacity = 1.0 - smoothstep(0.0, softness, d);
             max_opacity = max(max_opacity, blade_opacity);
         }
     }
