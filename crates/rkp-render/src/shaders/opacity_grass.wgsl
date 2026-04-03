@@ -97,7 +97,7 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
             let t_blade = saturate(p.y / blade_h);
             let bend_dir = grass_hash2(c * 73.1) - 0.5;
             // Bend scales with blade_h but has a minimum so short grass still curves.
-            let bend_amount = bend * max(blade_h, blade_width * 3.0) * t_blade * t_blade;
+            let bend_amount = bend * max(blade_h, blade_width * 3.0) * t_blade;
             p.x -= bend_amount * bend_dir.x;
             p.z -= bend_amount * bend_dir.y * 0.3;
 
