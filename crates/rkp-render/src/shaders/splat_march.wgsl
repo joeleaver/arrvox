@@ -396,6 +396,9 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         return -1.0;
     }
 
+    // DEBUG: return immediate hit at AABB entry to test if rays enter the volume.
+    return t_range.x;
+
     // Surface Y in local space (stored in sdf_param_0 by the volume builder).
     let surface_y = obj.sdf_param_0;
     let fine_step = obj.voxel_size * 0.5;
