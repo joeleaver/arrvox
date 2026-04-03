@@ -112,7 +112,7 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
             // Clamp Y to blade extent
             let py = clamp(p.y, 0.0, blade_h);
             let taper = 1.0 - py / blade_h; // 1 at base, 0 at tip
-            let half_w = blade_width * (0.15 + 0.85 * taper);
+            let half_w = blade_width * (0.3 + 0.7 * taper);
             let half_t = half_w / flatten;
 
             // 2D cross-section distance (flat top, no hemispherical cap
