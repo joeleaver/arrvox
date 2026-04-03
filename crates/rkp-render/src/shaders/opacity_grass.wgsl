@@ -59,7 +59,9 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
     // detect them, but capped at blade height to maintain aspect ratio
     // for short grass.
     let blade_width = min(obj.voxel_size * 0.4, height * 0.3);
-    let softness = blade_width * 0.4;
+    // Softness must be >= march step (voxel_size * 0.3) so the opacity
+    // transition spans at least one step — prevents both rings and jitter misses.
+    let softness = max(blade_width * 0.4, obj.voxel_size * 0.3);
 
     var max_opacity = 0.0;
 
