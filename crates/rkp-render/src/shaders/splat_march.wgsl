@@ -425,14 +425,23 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
             vec3<i32>(0), parent_total - vec3<i32>(1),
         );
         var has_grass = false;
+        var grass_blend = 0.0;
         for (var dx = -2i; dx <= 2i; dx++) {
             for (var dz = -2i; dz <= 2i; dz++) {
                 let vc = clamp(check_vc + vec3<i32>(dx, 0, dz), vec3<i32>(0), parent_total - vec3<i32>(1));
                 let v = sample_voxel_data_at(obj.rest_brick_map_offset, vc, parent_dims, parent_total);
                 let p = extract_material_id(v.word1);
                 let s = extract_secondary_material_id(v.word1);
-                if p == obj.material_id || s == obj.material_id {
+                if p == obj.material_id {
                     has_grass = true;
+                    grass_blend = 1.0; // primary material = full strength
+                    break;
+                }
+                if s == obj.material_id {
+                    has_grass = true;
+                    // Secondary material — use blend weight for grass intensity
+                    let bw = f32(extract_blend_weight(v.word0)) / 255.0;
+                    grass_blend = max(grass_blend, bw);
                     break;
                 }
             }
@@ -441,8 +450,12 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
 
         var opacity = 0.0;
         if has_grass {
+            // Scale h_above by inverse blend — lower blend = shorter grass.
+            // At blend=1.0: h_above unchanged (full height).
+            // At blend=0.3: effective h_above is ~3x larger, making blades ~1/3 height.
+            let effective_h = h_above / max(grass_blend, 0.05);
             opacity = dispatch_opacity_shader(
-                obj.sdf_shader_id, local_pos, max(h_above, 0.0), obj, obj.material_id
+                obj.sdf_shader_id, local_pos, max(effective_h, 0.0), obj, obj.material_id
             );
         }
 
