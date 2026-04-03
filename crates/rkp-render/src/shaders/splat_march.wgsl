@@ -369,9 +369,11 @@ fn sample_material_at_hit(local_pos: vec3<f32>, obj: GpuObject) -> vec3<u32> {
 
 // ── Procedural Volume March ───────────────────────────────────────────────
 
-/// March through a procedural volume object.
-/// The volume has its own brick map with pre-computed SDF distances (h_above).
-/// At each step, evaluates the combined surface + procedural opacity.
+/// March through a procedural volume object (opacity shader).
+///
+/// The volume has NO brick map — just an AABB in the BVH. The march evaluates
+/// the opacity shader at each step, with h_above computed geometrically from
+/// the surface Y level stored in sdf_param_0.
 fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
     let obj = objects[obj_idx];
     let inv_world = obj.inverse_world;
@@ -381,22 +383,22 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
     let safe_dir = select(local_dir, vec3<f32>(1e-10), abs(local_dir) < vec3<f32>(1e-10));
     let inv_local_dir = 1.0 / safe_dir;
 
-    let brick_extent = obj.voxel_size * 8.0;
-    let dims = vec3<f32>(
-        f32(obj.brick_map_dims_x),
-        f32(obj.brick_map_dims_y),
-        f32(obj.brick_map_dims_z),
+    // Intersect the world-space AABB (transformed to local space via inverse_world).
+    // The AABB is tight around the painted region + shell_height.
+    let local_aabb_min = (inv_world * vec4<f32>(obj.aabb_min.xyz, 1.0)).xyz;
+    let local_aabb_max = (inv_world * vec4<f32>(obj.aabb_max.xyz, 1.0)).xyz;
+    let t_range = intersect_aabb(
+        local_origin, inv_local_dir,
+        min(local_aabb_min, local_aabb_max),
+        max(local_aabb_min, local_aabb_max),
     );
-    let half_grid = dims * brick_extent * 0.5;
-    let t_range = intersect_aabb(local_origin, inv_local_dir, -half_grid, half_grid);
     if t_range.x > t_range.y {
         return -1.0;
     }
 
-    let vs = obj.voxel_size;
-    let fine_step = vs * 0.5;
-    let grid_size = dims * brick_extent;
-    let udims = vec3<u32>(obj.brick_map_dims_x, obj.brick_map_dims_y, obj.brick_map_dims_z);
+    // Surface Y in local space (stored in sdf_param_0 by the volume builder).
+    let surface_y = obj.sdf_param_0;
+    let fine_step = obj.voxel_size * 0.5;
 
     var t = t_range.x;
     var prev_opacity = 0.0;
@@ -406,40 +408,6 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         if t > t_range.y { break; }
 
         let local_pos = local_origin + safe_dir * t;
-
-        // Brick-level empty-space skipping: check if current brick is EMPTY or INTERIOR.
-        let grid_pos = local_pos + half_grid;
-        let brick_coord = vec3<i32>(floor(grid_pos / brick_extent));
-        var in_empty_brick = false;
-        if any(brick_coord < vec3<i32>(0)) || any(vec3<u32>(brick_coord) >= udims) {
-            in_empty_brick = true;
-        } else {
-            let flat_brick = u32(brick_coord.x) + u32(brick_coord.y) * udims.x + u32(brick_coord.z) * udims.x * udims.y;
-            let slot = brick_maps[obj.brick_map_offset + flat_brick];
-            if slot == EMPTY_SLOT || slot == INTERIOR_SLOT {
-                in_empty_brick = true;
-            }
-        }
-
-        if in_empty_brick {
-            // Skip EMPTY_SLOT and INTERIOR_SLOT bricks — jump to next brick.
-            // Only bricks with actual propagated data are evaluated.
-            let brick_min = vec3<f32>(brick_coord) * brick_extent - half_grid;
-            let brick_max = brick_min + vec3<f32>(brick_extent);
-            let t_exit = intersect_aabb(local_origin, inv_local_dir, brick_min, brick_max);
-            prev_opacity = 0.0;
-            prev_t = t;
-            t = t_exit.y + vs * 0.1;
-            continue;
-        }
-
-        // Compute h_above geometrically. The volume's grid is taller than the
-        // parent's by extra Y bricks (to accommodate shell_height). The grid center
-        // is shifted up, so the parent surface is at:
-        //   y = -(extra_y_bricks * brick_extent) / 2
-        // in the volume's local space.
-        let extra_y = ceil(obj.shell_height * 1.5 / brick_extent);
-        let surface_y = -(extra_y * brick_extent) * 0.5;
         let h_above = local_pos.y - surface_y;
 
         let opacity = dispatch_opacity_shader(
@@ -796,12 +764,13 @@ fn compute_normal_procedural(local_pos: vec3<f32>, obj: GpuObject) -> vec3<f32> 
     let eps = obj.voxel_size * 0.5;
     let sid = obj.sdf_shader_id;
     let mid = obj.material_id;
-    let hx0 = max((local_pos + vec3<f32>(eps, 0.0, 0.0)).y, 0.0);
-    let hx1 = max((local_pos - vec3<f32>(eps, 0.0, 0.0)).y, 0.0);
-    let hy0 = max((local_pos + vec3<f32>(0.0, eps, 0.0)).y, 0.0);
-    let hy1 = max((local_pos - vec3<f32>(0.0, eps, 0.0)).y, 0.0);
-    let hz0 = max((local_pos + vec3<f32>(0.0, 0.0, eps)).y, 0.0);
-    let hz1 = max((local_pos - vec3<f32>(0.0, 0.0, eps)).y, 0.0);
+    let sy = obj.sdf_param_0; // surface Y
+    let hx0 = max((local_pos + vec3<f32>(eps, 0.0, 0.0)).y - sy, 0.0);
+    let hx1 = max((local_pos - vec3<f32>(eps, 0.0, 0.0)).y - sy, 0.0);
+    let hy0 = max((local_pos + vec3<f32>(0.0, eps, 0.0)).y - sy, 0.0);
+    let hy1 = max((local_pos - vec3<f32>(0.0, eps, 0.0)).y - sy, 0.0);
+    let hz0 = max((local_pos + vec3<f32>(0.0, 0.0, eps)).y - sy, 0.0);
+    let hz1 = max((local_pos - vec3<f32>(0.0, 0.0, eps)).y - sy, 0.0);
     let gx = dispatch_opacity_shader(sid, local_pos + vec3<f32>(eps, 0.0, 0.0), hx0, obj, mid)
            - dispatch_opacity_shader(sid, local_pos - vec3<f32>(eps, 0.0, 0.0), hx1, obj, mid);
     let gy = dispatch_opacity_shader(sid, local_pos + vec3<f32>(0.0, eps, 0.0), hy0, obj, mid)
