@@ -422,28 +422,15 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         }
 
         if in_empty_brick {
-            // EMPTY_SLOT bricks: no data at all, skip entirely.
-            // INTERIOR_SLOT bricks: no SDF data, but still evaluate opacity shader
-            // with h_above estimated from the Y coordinate.
-            var brick_is_interior = false;
-            if !any(brick_coord < vec3<i32>(0)) && !any(vec3<u32>(brick_coord) >= udims) {
-                let flat_brick = u32(brick_coord.x) + u32(brick_coord.y) * udims.x + u32(brick_coord.z) * udims.x * udims.y;
-                let slot = brick_maps[obj.brick_map_offset + flat_brick];
-                brick_is_interior = (slot == INTERIOR_SLOT);
-            }
-
-            if !brick_is_interior {
-                // True empty — skip to brick boundary
-                let brick_min = vec3<f32>(brick_coord) * brick_extent - half_grid;
-                let brick_max = brick_min + vec3<f32>(brick_extent);
-                let t_exit = intersect_aabb(local_origin, inv_local_dir, brick_min, brick_max);
-                prev_opacity = 0.0;
-                prev_t = t;
-                t = t_exit.y + vs * 0.1;
-                continue;
-            }
-            // For INTERIOR_SLOT bricks: fall through to evaluate opacity shader
-            // with h_above estimated below.
+            // Skip EMPTY_SLOT and INTERIOR_SLOT bricks — jump to next brick.
+            // Only bricks with actual propagated data are evaluated.
+            let brick_min = vec3<f32>(brick_coord) * brick_extent - half_grid;
+            let brick_max = brick_min + vec3<f32>(brick_extent);
+            let t_exit = intersect_aabb(local_origin, inv_local_dir, brick_min, brick_max);
+            prev_opacity = 0.0;
+            prev_t = t;
+            t = t_exit.y + vs * 0.1;
+            continue;
         }
 
         // The volume's local space is aligned with the parent: the surface is near y=0.
