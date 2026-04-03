@@ -529,18 +529,14 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
             // with h_above estimated below.
         }
 
-        // For bricks with SDF data, read h_above from brick map.
-        // For INTERIOR_SLOT bricks, the trilinear sample returns 1e6.
-        let raw_h_above = sample_distance_trilinear(local_pos, obj);
-        // If we got the sentinel (no SDF data), estimate h_above from Y position.
-        // The volume extends above the parent surface. Use distance from volume
-        // bottom as a rough h_above estimate.
-        let h_above = select(raw_h_above, max(local_pos.y + half_grid.y, 0.0), raw_h_above > 1e5);
+        // The volume's local space is aligned with the parent: the surface is near y=0.
+        // Extra Y bricks extend upward (positive Y). So local_pos.y ≈ h_above.
+        // Use this directly — avoids dependency on the volume's SDF brick data which
+        // is sparse (only populated near the painted surface).
+        let h_above = local_pos.y;
 
         // The parent object already renders the ground surface.
         // The procedural volume only provides blade geometry above the surface.
-        // Don't combine with surface_opacity — that would create a duplicate
-        // solid surface inside the volume.
         let blade_opacity = dispatch_opacity_shader(
             obj.sdf_shader_id, local_pos, max(h_above, 0.0), obj, obj.material_id
         );
