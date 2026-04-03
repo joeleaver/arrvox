@@ -19,6 +19,26 @@ use rkf_render::gpu_scene::GpuScene;
 use rkf_render::shader_params::ShaderParamsBuffer;
 use rkf_render::tile_object_cull::TileObjectCullPass;
 
+/// Compute axis-aligned half extents for an analytical primitive.
+fn primitive_half_extents(prim: &rkf_core::scene_node::SdfPrimitive) -> glam::Vec3 {
+    use rkf_core::scene_node::SdfPrimitive;
+    match *prim {
+        SdfPrimitive::Sphere { radius } => glam::Vec3::splat(radius),
+        SdfPrimitive::Box { half_extents } => half_extents,
+        SdfPrimitive::Capsule { radius, half_height } => {
+            glam::Vec3::new(radius, half_height + radius, radius)
+        }
+        SdfPrimitive::Torus { major_radius, minor_radius } => {
+            let r = major_radius + minor_radius;
+            glam::Vec3::new(r, minor_radius, r)
+        }
+        SdfPrimitive::Cylinder { radius, half_height } => {
+            glam::Vec3::new(radius, half_height, radius)
+        }
+        SdfPrimitive::Plane { .. } => glam::Vec3::splat(1.0),
+    }
+}
+
 /// Splat march compute pass — fixed-step march through opacity field.
 pub struct SplatMarchPass {
     pipeline: wgpu::ComputePipeline,
@@ -189,6 +209,64 @@ impl rkf_render::MarchPass for SplatMarchPass {
         );
     }
 
+    fn voxelize_primitive(
+        &self,
+        primitive: &rkf_core::scene_node::SdfPrimitive,
+        material_id: u16,
+        voxel_size: f32,
+        bake_scale: glam::Vec3,
+        pool: &mut rkf_core::brick_pool::BrickPool,
+        map_alloc: &mut rkf_core::BrickMapAllocator,
+    ) -> Option<(rkf_core::scene_node::BrickMapHandle, f32, rkf_core::Aabb, u32)> {
+        use rkf_core::scene_node::SdfPrimitive;
+
+        let half_extents = primitive_half_extents(primitive) * bake_scale;
+        let margin = voxel_size * 2.0;
+        let aabb = rkf_core::Aabb::new(
+            -half_extents - glam::Vec3::splat(margin),
+            half_extents + glam::Vec3::splat(margin),
+        );
+
+        // Build an opacity function from the analytical SDF primitive.
+        // For primitives that support exact scaling (Box), evaluate the scaled
+        // primitive directly. For others, use the inv_scale approximation.
+        let opacity_fn: Box<dyn Fn(glam::Vec3) -> (f32, u16)> = match primitive {
+            SdfPrimitive::Box { half_extents: he } => {
+                let scaled = SdfPrimitive::Box { half_extents: *he * bake_scale };
+                Box::new(move |pos: glam::Vec3| {
+                    let d = rkf_core::evaluate_primitive(&scaled, pos);
+                    let opacity = (0.5 - d / voxel_size).clamp(0.0, 1.0);
+                    (opacity, material_id)
+                })
+            }
+            _ => {
+                let prim = primitive.clone();
+                let min_scale = bake_scale.x.min(bake_scale.y).min(bake_scale.z).max(1e-6);
+                let inv_scale = glam::Vec3::new(
+                    1.0 / bake_scale.x.max(1e-6),
+                    1.0 / bake_scale.y.max(1e-6),
+                    1.0 / bake_scale.z.max(1e-6),
+                );
+                Box::new(move |pos: glam::Vec3| {
+                    let d = rkf_core::evaluate_primitive(&prim, pos * inv_scale) * min_scale;
+                    let opacity = (0.5 - d / voxel_size).clamp(0.0, 1.0);
+                    (opacity, material_id)
+                })
+            }
+        };
+
+        let (handle, brick_count) =
+            rkp_core::voxelize_opacity::voxelize_opacity(opacity_fn, &aabb, voxel_size, pool, map_alloc)?;
+
+        // Use the geometry AABB (half_extents + margin) for culling, not the
+        // full grid AABB. The shader's march volume (-half_grid to half_grid)
+        // may be larger due to brick quantization, but the extra region is
+        // empty — no need to include it in the BVH/wireframe AABB.
+        let geometry_aabb = aabb;
+
+        Some((handle, voxel_size, geometry_aabb, brick_count))
+    }
+
     // needs_skin_deform: default true — use the SkinDeformPass to scatter
     // bone weights into posed space. The march shader reads them and inverse-skins
     // back to rest-pose for opacity sampling.
@@ -208,5 +286,124 @@ impl rkf_render::MarchPass for SplatMarchPass {
 
     fn march_source(&self) -> Option<&str> {
         Some(Self::SOURCE)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rkf_core::brick_map::BrickMapAllocator;
+    use rkf_core::brick_pool::BrickPool;
+    use rkf_core::scene_node::SdfPrimitive;
+
+    #[test]
+    fn voxelize_sphere_produces_opacity() {
+        let mut pool = BrickPool::new(256);
+        let mut alloc = BrickMapAllocator::new();
+
+        let prim = SdfPrimitive::Sphere { radius: 0.5 };
+        let voxel_size = 0.05;
+        let scale = glam::Vec3::ONE;
+
+        let half_ext = primitive_half_extents(&prim) * scale;
+        let margin = voxel_size * 2.0;
+        let aabb = rkf_core::Aabb::new(
+            -half_ext - glam::Vec3::splat(margin),
+            half_ext + glam::Vec3::splat(margin),
+        );
+
+        let prim_clone = prim.clone();
+        let opacity_fn = move |pos: glam::Vec3| -> (f32, u16) {
+            let d = rkf_core::evaluate_primitive(&prim_clone, pos);
+            let opacity = (0.5 - d / voxel_size).clamp(0.0, 1.0);
+            (opacity, 1)
+        };
+
+        let result = rkp_core::voxelize_opacity::voxelize_opacity(
+            opacity_fn, &aabb, voxel_size, &mut pool, &mut alloc,
+        );
+        assert!(result.is_some(), "voxelization should succeed");
+
+        let (handle, brick_count) = result.unwrap();
+        assert!(brick_count > 0, "should allocate bricks for a sphere");
+
+        // Verify all stored voxels have opacity in [0, 1] — no SDF distances.
+        for slot_idx in 0..brick_count {
+            let brick = pool.get(slot_idx);
+            for v in &brick.voxels {
+                let bits = (v.word0 & 0xFFFF) as u16;
+                let o = half::f16::from_bits(bits).to_f32();
+                assert!(o >= 0.0 && o <= 1.0, "opacity should be in [0,1], got {o}");
+            }
+        }
+    }
+
+    #[test]
+    fn voxelize_box_with_scale() {
+        let mut pool = BrickPool::new(256);
+        let mut alloc = BrickMapAllocator::new();
+
+        let prim = SdfPrimitive::Box { half_extents: glam::Vec3::splat(0.3) };
+        let voxel_size = 0.05;
+        let scale = glam::Vec3::new(2.0, 1.0, 1.0);
+
+        let half_ext = primitive_half_extents(&prim) * scale;
+        let margin = voxel_size * 2.0;
+        let aabb = rkf_core::Aabb::new(
+            -half_ext - glam::Vec3::splat(margin),
+            half_ext + glam::Vec3::splat(margin),
+        );
+
+        let prim_clone = prim.clone();
+        let min_scale = scale.x.min(scale.y).min(scale.z).max(1e-6);
+        let inv_scale = glam::Vec3::new(
+            1.0 / scale.x.max(1e-6),
+            1.0 / scale.y.max(1e-6),
+            1.0 / scale.z.max(1e-6),
+        );
+        let opacity_fn = move |pos: glam::Vec3| -> (f32, u16) {
+            let d = rkf_core::evaluate_primitive(&prim_clone, pos * inv_scale) * min_scale;
+            let opacity = (0.5 - d / voxel_size).clamp(0.0, 1.0);
+            (opacity, 5)
+        };
+
+        let result = rkp_core::voxelize_opacity::voxelize_opacity(
+            opacity_fn, &aabb, voxel_size, &mut pool, &mut alloc,
+        );
+        assert!(result.is_some());
+
+        let (handle, _) = result.unwrap();
+        // Scaled box: X extent is 2× larger. Grid should be wider on X.
+        assert!(
+            handle.dims.x > handle.dims.y,
+            "X dims ({}) should be larger than Y dims ({}) due to scale",
+            handle.dims.x, handle.dims.y,
+        );
+    }
+
+    #[test]
+    fn aabb_is_tight_around_geometry() {
+        let prim = SdfPrimitive::Box { half_extents: glam::Vec3::splat(0.5) };
+        let voxel_size = 0.05;
+        let scale = glam::Vec3::new(4.0, 0.1, 4.0);
+
+        let half_ext = primitive_half_extents(&prim) * scale;
+        let margin = voxel_size * 2.0;
+
+        // The returned AABB should be the geometry extent + margin,
+        // NOT the full grid extent (which includes brick quantization padding).
+        let expected_half = half_ext + glam::Vec3::splat(margin);
+
+        // The geometry Y half is 0.05. With margin 0.1, expected Y half = 0.15.
+        // A full grid AABB would round up to whole bricks (e.g., 0.2 or 0.4).
+        assert!(
+            expected_half.y < 0.2,
+            "tight AABB Y should be small, got {}",
+            expected_half.y
+        );
+        assert!(
+            expected_half.y > half_ext.y,
+            "tight AABB should include margin"
+        );
     }
 }

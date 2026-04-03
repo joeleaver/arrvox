@@ -241,8 +241,10 @@ fn evaluate_object_opacity(world_pos: vec3<f32>, obj_idx: u32) -> f32 {
     if obj.geom_type == GEOM_TYPE_NONE {
         return 0.0;
     }
+    if obj.geom_type == GEOM_TYPE_PROCEDURAL {
+        return 0.0;
+    }
     let local_pos = (obj.inverse_world * vec4<f32>(world_pos, 1.0)).xyz;
-    // GEOM_TYPE_VOXELIZED and GEOM_TYPE_PROCEDURAL both sample from the brick map.
     return sample_opacity_trilinear(local_pos, obj);
 }
 
