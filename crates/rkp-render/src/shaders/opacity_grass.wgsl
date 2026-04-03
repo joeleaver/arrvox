@@ -24,7 +24,7 @@ fn grass_hash2(p: vec2<f32>) -> vec2<f32> {
 
 // --- Grass blade opacity ---
 
-fn opacity_grass(local_pos: vec3<f32>, h_above: f32, obj: GpuObject, mat_id: u32) -> f32 {
+fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: GpuObject, mat_id: u32) -> f32 {
 
     // Only grow grass above the surface
     if h_above < 0.0 {
@@ -38,7 +38,8 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, obj: GpuObject, mat_id: u32
         return 0.0;
     }
 
-    let height = sp.param1;
+    // Scale height by blend weight — soft paint edges get shorter grass
+    let height = sp.param1 * max(blend_weight, 0.05);
     let height_var = sp.param2;
     let bend = sp.param3;
 
