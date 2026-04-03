@@ -439,12 +439,31 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         // is sparse (only populated near the painted surface).
         let h_above = local_pos.y;
 
-        // The parent object already renders the ground surface.
-        // The procedural volume only provides blade geometry above the surface.
-        let blade_opacity = dispatch_opacity_shader(
-            obj.sdf_shader_id, local_pos, max(h_above, 0.0), obj, obj.material_id
+        // Check if the grass material is actually painted at this XZ position.
+        // Project down to the surface (y≈0) and sample the volume's per-voxel
+        // material data. Only evaluate the opacity shader where the material
+        // is present — this gives smooth per-voxel boundaries instead of blocky
+        // per-brick boundaries.
+        let surface_check_pos = vec3<f32>(local_pos.x, 0.0, local_pos.z);
+        let check_grid = surface_check_pos + half_grid;
+        let check_vc = clamp(
+            vec3<i32>(floor(check_grid / vs)),
+            vec3<i32>(0),
+            vec3<i32>(udims) * 8 - vec3<i32>(1),
         );
-        let opacity = blade_opacity;
+        let check_voxel = sample_voxel_data_at(
+            obj.brick_map_offset, check_vc, udims, vec3<i32>(udims) * 8
+        );
+        let check_primary = extract_material_id(check_voxel.word1);
+        let check_secondary = extract_secondary_material_id(check_voxel.word1);
+        let has_material = (check_primary == obj.material_id) || (check_secondary == obj.material_id);
+
+        var opacity = 0.0;
+        if has_material {
+            opacity = dispatch_opacity_shader(
+                obj.sdf_shader_id, local_pos, max(h_above, 0.0), obj, obj.material_id
+            );
+        }
 
         if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
             let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
