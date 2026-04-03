@@ -1,9 +1,8 @@
 // Opacity grass shader — procedural grass blades via domain repetition.
 //
-// Returns opacity (0.0 = empty, 1.0 = solid) at a point in object-local space.
-// Uses the same domain-repetition and per-blade randomization as the SDF grass
-// shader, but outputs opacity with a smooth falloff at blade edges for clean
-// gradient normals.
+// Returns vec2(opacity, skip_hint) at a point in object-local space.
+// opacity: 0.0 = empty, 1.0 = solid.
+// skip_hint: when opacity is 0, how far along the ray the march can safely skip.
 //
 // Injected into splat_march.wgsl by ShaderComposer. Paired with shade_grass.wgsl.
 
@@ -24,47 +23,41 @@ fn grass_hash2(p: vec2<f32>) -> vec2<f32> {
 
 // --- Grass blade opacity ---
 
-fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: GpuObject, mat_id: u32) -> f32 {
+fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: GpuObject, mat_id: u32) -> vec2<f32> {
 
     // Only grow grass above the surface
     if h_above < 0.0 {
-        return 0.0;
+        return vec2<f32>(0.0, -h_above); // skip to surface
     }
 
-    // Read shader-specific params: param0=density, param1=height, param2=height_variation, param3=bend
+    // Read shader-specific params
     let sp = shader_params[mat_id];
     let density = sp.param0;
     if density <= 0.0 {
-        return 0.0;
+        return vec2<f32>(0.0, 0.0);
     }
 
-    // Scale height by blend weight — soft paint edges get shorter grass
     let height = sp.param1 * max(blend_weight, 0.05);
     let height_var = sp.param2;
     let bend = sp.param3;
 
-    // Cell frequency from density (blades per unit area -> cell size)
     let cell_size = 1.0 / sqrt(max(density, 0.01));
 
-    // Early out: well above the tallest possible blade
+    // Above the tallest blade — skip to exit
     if h_above > height * 1.3 {
-        return 0.0;
+        return vec2<f32>(0.0, h_above - height * 1.3);
     }
 
     // Domain repetition in XZ
     let cell_freq = 1.0 / cell_size;
     let cell = floor(local_pos.xz * cell_freq);
 
-    // Blade width: proportional to voxel size so the fixed-step march can
-    // detect them, but capped at blade height to maintain aspect ratio
-    // for short grass.
-    // Realistic blade width: ~2mm base + slight increase with height.
-    // Real grass: 5cm lawn ≈ 2mm, 30cm meadow ≈ 4mm, 1m tall ≈ 7mm.
+    // Realistic blade width
     let blade_width = 0.002 + height * 0.005;
-    let march_step_approx = height / 64.0;
-    let softness = max(blade_width * 0.4, march_step_approx);
+    let softness = max(blade_width * 0.4, height / 128.0);
 
     var max_opacity = 0.0;
+    var min_dist = 1e6; // track minimum distance to any blade for skip hint
 
     // Check 3x3 neighborhood of cells
     for (var dx = -1i; dx <= 1i; dx++) {
@@ -78,12 +71,12 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
             // Per-blade height variation
             let blade_h = height * (1.0 - height_var * grass_hash1(c * 127.1));
 
-            // Skip if above this blade (hard cutoff — no phantom extension)
+            // Skip if above this blade
             if h_above > blade_h {
                 continue;
             }
 
-            // Per-blade random Y rotation (determines facing direction)
+            // Per-blade random Y rotation
             let rot_angle = grass_hash1(c * 311.7) * 6.283;
             let cos_r = cos(rot_angle);
             let sin_r = sin(rot_angle);
@@ -91,40 +84,41 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
             // Position relative to blade root
             var p = vec3<f32>(local_pos.x - root_xz.x, h_above, local_pos.z - root_xz.y);
 
-            // Rotate around Y axis (blade facing direction)
+            // Rotate around Y axis
             let rx = p.x * cos_r + p.z * sin_r;
             let rz = -p.x * sin_r + p.z * cos_r;
             p = vec3<f32>(rx, p.y, rz);
 
-            // Domain warp: quadratic bend (gravity + per-blade randomness)
+            // Quadratic bend
             let t_blade = saturate(p.y / blade_h);
             let bend_dir = grass_hash2(c * 73.1) - 0.5;
-            // Bend scales with blade_h but has a minimum so short grass still curves.
-            // Quadratic bend for a smooth parabolic arc. Scale so the curve
-            // becomes visible in the lower half of the blade.
             let bend_amount = bend * max(blade_h, blade_width * 12.0) * t_blade * t_blade;
             p.x -= bend_amount * bend_dir.x;
             p.z -= bend_amount * bend_dir.y * 0.3;
 
-            // Flat blade cross-section: wide in X (face), thin in Z (edge)
+            // Flat blade cross-section
             let flatten = 5.0;
-
-            // Clamp Y to blade extent
             let py = clamp(p.y, 0.0, blade_h);
-            let taper = 1.0 - py / blade_h; // 1 at base, 0 at tip
+            let taper = 1.0 - py / blade_h;
             let half_w = blade_width * (0.3 + 0.7 * taper);
             let half_t = half_w / flatten;
 
-            // 2D cross-section distance (flat top, no hemispherical cap
-            // that creates concentric ring artifacts from march stepping)
             let qx = max(abs(p.x) - half_w, 0.0);
             let qz = max(abs(p.z) - half_t, 0.0);
             let d = sqrt(qx * qx + qz * qz);
 
+            min_dist = min(min_dist, d);
             let blade_opacity = 1.0 - smoothstep(0.0, softness, d);
             max_opacity = max(max_opacity, blade_opacity);
         }
     }
 
-    return max_opacity;
+    if max_opacity > 0.0 {
+        return vec2<f32>(max_opacity, 0.0);
+    }
+
+    // No blade hit — return skip hint: distance to nearest blade minus softness,
+    // scaled conservatively. The march can safely advance this far.
+    let safe_skip = max(min_dist - softness, 0.0) * 0.5;
+    return vec2<f32>(0.0, safe_skip);
 }
