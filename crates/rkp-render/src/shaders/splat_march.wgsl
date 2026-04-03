@@ -424,28 +424,37 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
             vec3<i32>(floor(check_gp / parent_vs)),
             vec3<i32>(0), parent_total - vec3<i32>(1),
         );
-        var has_grass = false;
+        // Read blend weight from the CENTER voxel (exact XZ position).
+        let center_v = sample_voxel_data_at(obj.rest_brick_map_offset, check_vc, parent_dims, parent_total);
+        let center_pri = extract_material_id(center_v.word1);
+        let center_sec = extract_secondary_material_id(center_v.word1);
         var grass_blend = 0.0;
-        for (var dx = -2i; dx <= 2i; dx++) {
-            for (var dz = -2i; dz <= 2i; dz++) {
-                let vc = clamp(check_vc + vec3<i32>(dx, 0, dz), vec3<i32>(0), parent_total - vec3<i32>(1));
-                let v = sample_voxel_data_at(obj.rest_brick_map_offset, vc, parent_dims, parent_total);
-                let p = extract_material_id(v.word1);
-                let s = extract_secondary_material_id(v.word1);
-                if p == obj.material_id {
-                    has_grass = true;
-                    grass_blend = 1.0; // primary material = full strength
-                    break;
+        if center_pri == obj.material_id {
+            grass_blend = 1.0;
+        } else if center_sec == obj.material_id {
+            grass_blend = f32(extract_blend_weight(center_v.word0)) / 255.0;
+        }
+
+        // Check neighborhood for grass existence (allows bent blade tips
+        // to extend past the painted boundary).
+        var has_grass = grass_blend > 0.0;
+        if !has_grass {
+            for (var dx = -2i; dx <= 2i; dx++) {
+                for (var dz = -2i; dz <= 2i; dz++) {
+                    if dx == 0 && dz == 0 { continue; } // already checked center
+                    let vc = clamp(check_vc + vec3<i32>(dx, 0, dz), vec3<i32>(0), parent_total - vec3<i32>(1));
+                    let v = sample_voxel_data_at(obj.rest_brick_map_offset, vc, parent_dims, parent_total);
+                    let p = extract_material_id(v.word1);
+                    let s = extract_secondary_material_id(v.word1);
+                    if p == obj.material_id || s == obj.material_id {
+                        has_grass = true;
+                        // Neighbor hit: use a small blend for tapered tips
+                        grass_blend = 0.3;
+                        break;
+                    }
                 }
-                if s == obj.material_id {
-                    has_grass = true;
-                    // Secondary material — use blend weight for grass intensity
-                    let bw = f32(extract_blend_weight(v.word0)) / 255.0;
-                    grass_blend = max(grass_blend, bw);
-                    break;
-                }
+                if has_grass { break; }
             }
-            if has_grass { break; }
         }
 
         var opacity = 0.0;
