@@ -384,15 +384,21 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
     let safe_dir = select(local_dir, vec3<f32>(1e-10), abs(local_dir) < vec3<f32>(1e-10));
     let inv_local_dir = 1.0 / safe_dir;
 
-    // Use the world AABB transformed to local space. Per-brick volumes have
-    // no brick grid (dims=[0,0,0]) — they're just tight AABBs.
-    let local_aabb_min = (inv_world * vec4<f32>(obj.aabb_min.xyz, 1.0)).xyz;
-    let local_aabb_max = (inv_world * vec4<f32>(obj.aabb_max.xyz, 1.0)).xyz;
-    let t_range = intersect_aabb(
-        local_origin, inv_local_dir,
-        min(local_aabb_min, local_aabb_max),
-        max(local_aabb_min, local_aabb_max),
-    );
+    // Transform all 8 world AABB corners to local space and take min/max.
+    // Just transforming 2 corners breaks under rotation.
+    let wmin = obj.aabb_min.xyz;
+    let wmax = obj.aabb_max.xyz;
+    let c0 = (inv_world * vec4<f32>(wmin.x, wmin.y, wmin.z, 1.0)).xyz;
+    let c1 = (inv_world * vec4<f32>(wmax.x, wmin.y, wmin.z, 1.0)).xyz;
+    let c2 = (inv_world * vec4<f32>(wmin.x, wmax.y, wmin.z, 1.0)).xyz;
+    let c3 = (inv_world * vec4<f32>(wmax.x, wmax.y, wmin.z, 1.0)).xyz;
+    let c4 = (inv_world * vec4<f32>(wmin.x, wmin.y, wmax.z, 1.0)).xyz;
+    let c5 = (inv_world * vec4<f32>(wmax.x, wmin.y, wmax.z, 1.0)).xyz;
+    let c6 = (inv_world * vec4<f32>(wmin.x, wmax.y, wmax.z, 1.0)).xyz;
+    let c7 = (inv_world * vec4<f32>(wmax.x, wmax.y, wmax.z, 1.0)).xyz;
+    let local_aabb_min = min(min(min(c0, c1), min(c2, c3)), min(min(c4, c5), min(c6, c7)));
+    let local_aabb_max = max(max(max(c0, c1), max(c2, c3)), max(max(c4, c5), max(c6, c7)));
+    let t_range = intersect_aabb(local_origin, inv_local_dir, local_aabb_min, local_aabb_max);
     if t_range.x > t_range.y {
         return -1.0;
     }
