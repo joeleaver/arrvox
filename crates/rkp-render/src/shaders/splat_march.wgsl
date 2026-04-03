@@ -413,23 +413,25 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
 
         // Check if grass material is painted at this XZ by sampling the PARENT's
         // per-voxel material data (stored in rest_brick_map_* fields).
-        // Project to surface Y and do nearest-neighbor material lookup.
+        // Scan a few Y levels around the surface to handle terrain that isn't flat.
+        // Sample parent's per-voxel material to check if grass is painted here.
+        // Offset surface_y by half a voxel down to land IN the surface voxel, not on top.
         let parent_dims = vec3<u32>(obj.rest_brick_map_dims_x, obj.rest_brick_map_dims_y, obj.rest_brick_map_dims_z);
         let parent_vs = obj.voxel_size;
         let parent_grid = vec3<f32>(parent_dims) * parent_vs * 8.0;
-        let surface_pos = vec3<f32>(local_pos.x, surface_y, local_pos.z);
-        let parent_gp = surface_pos + parent_grid * 0.5;
-        let parent_vc = clamp(
-            vec3<i32>(floor(parent_gp / parent_vs)),
-            vec3<i32>(0),
-            vec3<i32>(parent_dims) * 8 - vec3<i32>(1),
+        let parent_total = vec3<i32>(parent_dims) * 8;
+        let check_y = surface_y - parent_vs * 0.5;
+        let check_gp = vec3<f32>(local_pos.x, check_y, local_pos.z) + parent_grid * 0.5;
+        let check_vc = clamp(
+            vec3<i32>(floor(check_gp / parent_vs)),
+            vec3<i32>(0), parent_total - vec3<i32>(1),
         );
         let parent_voxel = sample_voxel_data_at(
-            obj.rest_brick_map_offset, parent_vc, parent_dims, vec3<i32>(parent_dims) * 8
+            obj.rest_brick_map_offset, check_vc, parent_dims, parent_total
         );
-        let pvox_pri = extract_material_id(parent_voxel.word1);
-        let pvox_sec = extract_secondary_material_id(parent_voxel.word1);
-        let has_grass = (pvox_pri == obj.material_id) || (pvox_sec == obj.material_id);
+        let pri = extract_material_id(parent_voxel.word1);
+        let sec = extract_secondary_material_id(parent_voxel.word1);
+        let has_grass = (pri == obj.material_id) || (sec == obj.material_id);
 
         var opacity = 0.0;
         if has_grass {
