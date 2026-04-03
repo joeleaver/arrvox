@@ -537,11 +537,14 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         // bottom as a rough h_above estimate.
         let h_above = select(raw_h_above, max(local_pos.y + half_grid.y, 0.0), raw_h_above > 1e5);
 
-        let surface_opacity = saturate(0.5 - h_above / (vs * 2.0));
+        // The parent object already renders the ground surface.
+        // The procedural volume only provides blade geometry above the surface.
+        // Don't combine with surface_opacity — that would create a duplicate
+        // solid surface inside the volume.
         let blade_opacity = dispatch_opacity_shader(
             obj.sdf_shader_id, local_pos, max(h_above, 0.0), obj, obj.material_id
         );
-        let opacity = max(surface_opacity, blade_opacity);
+        let opacity = blade_opacity;
 
         if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
             let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
