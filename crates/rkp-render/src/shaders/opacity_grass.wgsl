@@ -55,9 +55,10 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
     let cell_freq = 1.0 / cell_size;
     let cell = floor(local_pos.xz * cell_freq);
 
-    // Blade width: independent of density but proportional to voxel size so
-    // the fixed-step march can detect them (~1.5 march steps wide).
-    let blade_width = obj.voxel_size * 0.4;
+    // Blade width: proportional to voxel size so the fixed-step march can
+    // detect them, but capped at blade height to maintain aspect ratio
+    // for short grass.
+    let blade_width = min(obj.voxel_size * 0.4, height * 0.3);
     let softness = blade_width * 0.4;
 
     var max_opacity = 0.0;
