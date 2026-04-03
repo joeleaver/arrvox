@@ -433,15 +433,14 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
             continue;
         }
 
-        // The volume's local space is aligned with the parent: the surface is near y=0.
-        // Extra Y bricks extend upward (positive Y). So local_pos.y ≈ h_above.
-        // Use this directly — avoids dependency on the volume's SDF brick data which
-        // is sparse (only populated near the painted surface).
-        let h_above = local_pos.y;
+        // Read h_above from the volume's pre-computed SDF data at this voxel.
+        // The volume builder stores accurate signed distances: 0 at the surface,
+        // positive above, negative below. This IS h_above.
+        let voxel_coord = grid_pos / vs;
+        let vc = clamp(vec3<i32>(floor(voxel_coord)), vec3<i32>(0), vec3<i32>(udims) * 8 - vec3<i32>(1));
+        let voxel = sample_voxel_data_at(obj.brick_map_offset, vc, udims, vec3<i32>(udims) * 8);
+        let h_above = unpack2x16float(voxel.word0 & 0xFFFFu).x;
 
-        // Evaluate the opacity shader for blade geometry.
-        // TODO: per-voxel material boundary check to confine grass to painted region.
-        // For now, grass appears in all populated bricks (blocky boundaries).
         let opacity = dispatch_opacity_shader(
             obj.sdf_shader_id, local_pos, max(h_above, 0.0), obj, obj.material_id
         );
