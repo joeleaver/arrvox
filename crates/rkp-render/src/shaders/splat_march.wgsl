@@ -399,10 +399,9 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
     // Surface Y in local space (stored in sdf_param_0 by the volume builder).
     let surface_y = obj.sdf_param_0;
     // Step size: small enough to detect blades (< blade width).
-    // Clamped to voxel_size * 0.3 so blades at voxel_size * 0.4 span > 1 step.
-    // For large AABBs this means we may not traverse the full volume in 512 steps —
-    // but missing distant grass is better than missing all grass.
-    let march_step = obj.voxel_size * 0.3;
+    // Use shell_height to adapt — short grass gets finer steps.
+    // Minimum step = shell_height / 8 ensures at least 8 steps through the shell.
+    let march_step = min(obj.voxel_size * 0.3, obj.shell_height * 0.125);
 
     var t = t_range.x;
     var prev_opacity = 0.0;
