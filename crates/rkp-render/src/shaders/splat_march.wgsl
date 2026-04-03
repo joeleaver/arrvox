@@ -439,36 +439,12 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         // is sparse (only populated near the painted surface).
         let h_above = local_pos.y;
 
-        // Check if the grass material is painted at the surface below this XZ.
-        // Scan downward through Y voxels from the current position to find a voxel
-        // with material data (the surface). This confines grass to the painted region.
-        let check_grid = local_pos + half_grid;
-        var has_material = false;
-        let check_x = clamp(i32(floor(check_grid.x / vs)), 0, i32(udims.x) * 8 - 1);
-        let check_z = clamp(i32(floor(check_grid.z / vs)), 0, i32(udims.z) * 8 - 1);
-        let check_y_start = clamp(i32(floor(check_grid.y / vs)), 0, i32(udims.y) * 8 - 1);
-        // Check current Y and a few below to find the surface voxel
-        for (var dy = 0; dy < 4; dy++) {
-            let cy = check_y_start - dy;
-            if cy < 0 { break; }
-            let vc = vec3<i32>(check_x, cy, check_z);
-            let voxel = sample_voxel_data_at(obj.brick_map_offset, vc, udims, vec3<i32>(udims) * 8);
-            let pri = extract_material_id(voxel.word1);
-            let sec = extract_secondary_material_id(voxel.word1);
-            if pri == obj.material_id || sec == obj.material_id {
-                has_material = true;
-                break;
-            }
-            // If we hit a voxel with nonzero material that isn't grass, stop scanning
-            if pri != 0u { break; }
-        }
-
-        var opacity = 0.0;
-        if has_material {
-            opacity = dispatch_opacity_shader(
-                obj.sdf_shader_id, local_pos, max(h_above, 0.0), obj, obj.material_id
-            );
-        }
+        // Evaluate the opacity shader for blade geometry.
+        // TODO: per-voxel material boundary check to confine grass to painted region.
+        // For now, grass appears in all populated bricks (blocky boundaries).
+        let opacity = dispatch_opacity_shader(
+            obj.sdf_shader_id, local_pos, max(h_above, 0.0), obj, obj.material_id
+        );
 
         if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
             let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
