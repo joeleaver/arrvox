@@ -387,11 +387,11 @@ fn sample_distance_at(obj_offset: u32, vc: vec3<i32>, dims: vec3<u32>,
         return vs * 8.0; // far above surface
     }
     if slot == INTERIOR_SLOT {
-        // In procedural volumes, INTERIOR_SLOT marks bricks where no SDF data was
-        // propagated — typically empty space above the surface. Return a large
-        // positive value (above surface = transparent) so the march passes through.
-        // The opacity shader will provide blade geometry where needed.
-        return vs * 8.0;
+        // In procedural volumes, INTERIOR_SLOT marks bricks with no propagated data.
+        // Return a very large positive distance so:
+        // 1. surface_opacity = 0 (transparent)
+        // 2. opacity shader early-outs (h_above > height * 1.3)
+        return 1e6;
     }
     let idx = slot * 512u + local.x + local.y * 8u + local.z * 64u;
     return extract_distance(brick_pool[idx].word0);
@@ -476,7 +476,10 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         return -1.0;
     }
 
-    let fine_step = obj.voxel_size * 0.5;
+    let vs = obj.voxel_size;
+    let fine_step = vs * 0.5;
+    let grid_size = dims * brick_extent;
+    let udims = vec3<u32>(obj.brick_map_dims_x, obj.brick_map_dims_y, obj.brick_map_dims_z);
 
     var t = t_range.x;
     var prev_opacity = 0.0;
@@ -486,6 +489,32 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         if t > t_range.y { break; }
 
         let local_pos = local_origin + safe_dir * t;
+
+        // Brick-level empty-space skipping: check if current brick is EMPTY or INTERIOR.
+        let grid_pos = local_pos + half_grid;
+        let brick_coord = vec3<i32>(floor(grid_pos / brick_extent));
+        var in_empty_brick = false;
+        if any(brick_coord < vec3<i32>(0)) || any(vec3<u32>(brick_coord) >= udims) {
+            in_empty_brick = true;
+        } else {
+            let flat_brick = u32(brick_coord.x) + u32(brick_coord.y) * udims.x + u32(brick_coord.z) * udims.x * udims.y;
+            let slot = brick_maps[obj.brick_map_offset + flat_brick];
+            if slot == EMPTY_SLOT || slot == INTERIOR_SLOT {
+                in_empty_brick = true;
+            }
+        }
+
+        if in_empty_brick {
+            // Jump to the exit of this brick
+            let brick_min = vec3<f32>(brick_coord) * brick_extent - half_grid;
+            let brick_max = brick_min + vec3<f32>(brick_extent);
+            let t_exit = intersect_aabb(local_origin, inv_local_dir, brick_min, brick_max);
+            prev_opacity = 0.0;
+            prev_t = t;
+            t = t_exit.y + vs * 0.1;
+            continue;
+        }
+
         let opacity = sample_procedural_opacity(local_pos, obj);
 
         if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
