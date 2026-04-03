@@ -402,14 +402,11 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
     // is purely analytical — no voxel data is read. Ensure enough steps to
     // detect thin blades (~2-7mm wide).
     let estimated_blade_width = 0.002 + obj.shell_height * 0.005;
-    let march_step = min(obj.shell_height / 64.0, estimated_blade_width * 0.8);
+    let base_step = min(obj.shell_height / 64.0, estimated_blade_width * 0.8);
 
-    // Per-ray jitter: offset start by a fraction of the step to break
-    // coherent step-aligned banding into imperceptible noise.
-    // Per-ray jitter: full step offset breaks step-aligned banding into noise.
-    // Softness in the opacity shader is >= march_step, so blades aren't missed.
+    // Per-ray jitter to break step-aligned banding.
     let jitter = fract(sin(dot(local_origin.xz + local_dir.xz * 100.0, vec2<f32>(127.1, 311.7))) * 43758.5453);
-    var t = t_range.x + march_step * jitter;
+    var t = t_range.x + base_step * jitter;
     var prev_opacity = 0.0;
     var prev_t = t;
 
@@ -417,6 +414,11 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         if t > t_range.y { break; }
 
         let local_pos = local_origin + safe_dir * t;
+
+        // LOD: scale step with distance from camera. Near = fine (individual blades),
+        // far = coarse (blades merge into solid mass, which is realistic).
+        let dist_from_cam = t - t_range.x;
+        let march_step = base_step * max(1.0, dist_from_cam * 0.5);
         let h_above = local_pos.y - surface_y;
 
         // Skip positions outside the shell range — no geometry there.
