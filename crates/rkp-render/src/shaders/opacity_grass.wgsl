@@ -23,18 +23,18 @@ fn grass_hash2(p: vec2<f32>) -> vec2<f32> {
 
 // --- Grass blade opacity ---
 
-fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: GpuObject, mat_id: u32) -> vec2<f32> {
+fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: GpuObject, mat_id: u32) -> f32 {
 
     // Only grow grass above the surface
     if h_above < 0.0 {
-        return vec2<f32>(0.0, -h_above); // skip to surface
+        return 0.0; // skip to surface
     }
 
     // Read shader-specific params
     let sp = shader_params[mat_id];
     let density = sp.param0;
     if density <= 0.0 {
-        return vec2<f32>(0.0, 0.0);
+        return 0.0;
     }
 
     let height = sp.param1 * max(blend_weight, 0.05);
@@ -45,7 +45,7 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
 
     // Above the tallest blade — skip to exit
     if h_above > height * 1.3 {
-        return vec2<f32>(0.0, h_above - height * 1.3);
+        return 0.0;
     }
 
     // Domain repetition in XZ
@@ -112,10 +112,10 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
     }
 
     if max_opacity > 0.0 {
-        return vec2<f32>(max_opacity, 0.0);
+        return max_opacity;
     }
 
     // No blade hit — skip by a fraction of cell_size. Conservative: the 3x3
     // check already covers 1.5 cells, so skipping 0.25 cells is safe.
-    return vec2<f32>(0.0, cell_size * 0.25);
+    return 0.0;
 }

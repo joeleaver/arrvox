@@ -361,8 +361,8 @@ fn sample_material_at_hit(local_pos: vec3<f32>, obj: GpuObject) -> vec3<u32> {
 //
 // User-provided opacity shader functions are injected here by ShaderComposer.
 // Each function has signature:
-//   fn opacity_<name>(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: GpuObject, mat_id: u32) -> vec2<f32>
-// Returns vec2(opacity, skip_hint). opacity: 0=empty, 1=solid. skip_hint: safe march distance when opacity=0.
+//   fn opacity_<name>(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: GpuObject, mat_id: u32) -> f32
+// Returns opacity: 0.0 = empty, 1.0 = solid.
 // Returns opacity: 0.0 = empty, 1.0 = solid.
 // The dispatch_opacity_shader() switch is also generated here.
 //
@@ -464,16 +464,12 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
             blend_weight = f32(extract_blend_weight(center_v.word0)) / 255.0;
         }
 
-        // Dispatch to the opacity shader. Returns vec2(opacity, skip_hint).
-        // skip_hint > 0 means the shader says it's safe to skip that distance.
-        var result = vec2<f32>(0.0, 0.0);
+        var opacity = 0.0;
         if blend_weight > 0.0 {
-            result = dispatch_opacity_shader(
+            opacity = dispatch_opacity_shader(
                 obj.sdf_shader_id, local_pos, max(h_above, 0.0), blend_weight, obj, obj.material_id
             );
         }
-        let opacity = result.x;
-        let skip_hint = result.y;
 
         if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
             let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
@@ -482,12 +478,7 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
 
         prev_opacity = opacity;
         prev_t = t;
-        // Use skip hint from the shader if available, otherwise fine step.
-        if opacity < OPACITY_THRESHOLD && skip_hint > march_step {
-            t += skip_hint;
-        } else {
-            t += march_step;
-        }
+        t += march_step;
     }
 
     return -1.0;
@@ -840,12 +831,12 @@ fn compute_normal_procedural(local_pos: vec3<f32>, obj: GpuObject) -> vec3<f32> 
     let hy1 = max((local_pos - vec3<f32>(0.0, eps, 0.0)).y - sy, 0.0);
     let hz0 = max((local_pos + vec3<f32>(0.0, 0.0, eps)).y - sy, 0.0);
     let hz1 = max((local_pos - vec3<f32>(0.0, 0.0, eps)).y - sy, 0.0);
-    let gx = dispatch_opacity_shader(sid, local_pos + vec3<f32>(eps, 0.0, 0.0), hx0, 1.0, obj, mid).x
-           - dispatch_opacity_shader(sid, local_pos - vec3<f32>(eps, 0.0, 0.0), hx1, 1.0, obj, mid).x;
-    let gy = dispatch_opacity_shader(sid, local_pos + vec3<f32>(0.0, eps, 0.0), hy0, 1.0, obj, mid).x
-           - dispatch_opacity_shader(sid, local_pos - vec3<f32>(0.0, eps, 0.0), hy1, 1.0, obj, mid).x;
-    let gz = dispatch_opacity_shader(sid, local_pos + vec3<f32>(0.0, 0.0, eps), hz0, 1.0, obj, mid).x
-           - dispatch_opacity_shader(sid, local_pos - vec3<f32>(0.0, 0.0, eps), hz1, 1.0, obj, mid).x;
+    let gx = dispatch_opacity_shader(sid, local_pos + vec3<f32>(eps, 0.0, 0.0), hx0, 1.0, obj, mid)
+           - dispatch_opacity_shader(sid, local_pos - vec3<f32>(eps, 0.0, 0.0), hx1, 1.0, obj, mid);
+    let gy = dispatch_opacity_shader(sid, local_pos + vec3<f32>(0.0, eps, 0.0), hy0, 1.0, obj, mid)
+           - dispatch_opacity_shader(sid, local_pos - vec3<f32>(0.0, eps, 0.0), hy1, 1.0, obj, mid);
+    let gz = dispatch_opacity_shader(sid, local_pos + vec3<f32>(0.0, 0.0, eps), hz0, 1.0, obj, mid)
+           - dispatch_opacity_shader(sid, local_pos - vec3<f32>(0.0, 0.0, eps), hz1, 1.0, obj, mid);
     let local_grad = -vec3<f32>(gx, gy, gz);
 
     let world_grad = (transpose(obj.inverse_world) * vec4<f32>(local_grad, 0.0)).xyz;
