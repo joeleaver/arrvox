@@ -420,9 +420,8 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
             continue;
         }
 
-        let opacity = dispatch_opacity_shader(
-            obj.sdf_shader_id, local_pos, max(h_above, 0.0), obj, obj.material_id
-        );
+        // DEBUG: force solid shell to verify march reaches the shell region
+        let opacity = select(0.0, 1.0, h_above >= 0.0 && h_above <= obj.shell_height);
 
         if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
             let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
