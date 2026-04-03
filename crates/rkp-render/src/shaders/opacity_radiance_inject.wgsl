@@ -240,7 +240,7 @@ fn sample_opacity_trilinear(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
 /// Evaluate object opacity at a world-space position. Returns (opacity, material_id).
 fn evaluate_object_opacity(world_pos: vec3<f32>, obj_idx: u32) -> vec2<f32> {
     let obj = objects[obj_idx];
-    if obj.sdf_type == SDF_TYPE_NONE {
+    if obj.sdf_type == SDF_TYPE_NONE || obj.sdf_type == SDF_TYPE_PROCEDURAL {
         return vec2<f32>(0.0, 0.0);
     }
     // inverse_world is world-space — transform directly.

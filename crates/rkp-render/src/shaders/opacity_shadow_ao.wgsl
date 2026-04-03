@@ -291,11 +291,14 @@ fn evaluate_object_opacity(world_pos: vec3<f32>, obj_idx: u32) -> f32 {
         return 0.0;
     }
     if obj.sdf_type == SDF_TYPE_ANALYTICAL {
-        // Splat objects are never analytical — return transparent
+        return 0.0;
+    }
+    // Skip procedural volumes — their occupancy bricks (INTERIOR_SLOT) appear
+    // solid, casting box-shaped shadows. Grass is too thin for meaningful shadows.
+    if obj.sdf_type == SDF_TYPE_PROCEDURAL {
         return 0.0;
     }
     let local_pos = (obj.inverse_world * vec4<f32>(world_pos, 1.0)).xyz;
-    // SDF_TYPE_VOXELIZED and SDF_TYPE_PROCEDURAL both sample from the brick map.
     return sample_opacity_trilinear(local_pos, obj);
 }
 
