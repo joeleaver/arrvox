@@ -425,15 +425,15 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
             // Compute how far along the ray we need to go to reach the shell.
             // h_above changes by local_dir.y per unit of t.
             let dir_y = safe_dir.y;
-            var skip = march_step * 8.0; // default coarse step
-            if abs(dir_y) > 1e-6 {
+            var skip = march_step * 4.0; // default coarse step
+            if abs(dir_y) > 0.01 {
                 if h_above < 0.0 {
-                    // Below shell: skip to h_above = 0
-                    skip = max(-h_above / abs(dir_y) - march_step, march_step * 4.0);
+                    skip = max(-h_above / abs(dir_y) - march_step * 2.0, march_step * 4.0);
                 } else {
-                    // Above shell: skip to h_above = shell_height
-                    skip = max((h_above - obj.shell_height) / abs(dir_y) - march_step, march_step * 4.0);
+                    skip = max((h_above - obj.shell_height) / abs(dir_y) - march_step * 2.0, march_step * 4.0);
                 }
+                // Clamp skip to prevent overshooting at oblique angles
+                skip = min(skip, obj.shell_height * 2.0);
             }
             prev_opacity = 0.0;
             prev_t = t;
