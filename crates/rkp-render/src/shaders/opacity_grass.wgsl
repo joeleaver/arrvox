@@ -112,11 +112,11 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
             let half_w = blade_width * (0.15 + 0.85 * taper);
             let half_t = half_w / flatten;
 
-            // Box cross-section distance (with rounded edges)
+            // 2D cross-section distance (flat top, no hemispherical cap
+            // that creates concentric ring artifacts from march stepping)
             let qx = max(abs(p.x) - half_w, 0.0);
             let qz = max(abs(p.z) - half_t, 0.0);
-            let dy = p.y - py;
-            let d = sqrt(qx * qx + qz * qz + dy * dy);
+            let d = sqrt(qx * qx + qz * qz);
 
             let blade_opacity = 1.0 - smoothstep(0.0, softness, d);
             max_opacity = max(max_opacity, blade_opacity);
