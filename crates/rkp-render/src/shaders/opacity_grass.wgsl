@@ -57,7 +57,6 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
     let softness = max(blade_width * 0.4, height / 128.0);
 
     var max_opacity = 0.0;
-    var min_dist = 1e6; // track minimum distance to any blade for skip hint
 
     // Check 3x3 neighborhood of cells
     for (var dx = -1i; dx <= 1i; dx++) {
@@ -107,7 +106,6 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
             let qz = max(abs(p.z) - half_t, 0.0);
             let d = sqrt(qx * qx + qz * qz);
 
-            min_dist = min(min_dist, d);
             let blade_opacity = 1.0 - smoothstep(0.0, softness, d);
             max_opacity = max(max_opacity, blade_opacity);
         }
@@ -117,8 +115,7 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
         return vec2<f32>(max_opacity, 0.0);
     }
 
-    // No blade hit — return skip hint: distance to nearest blade minus softness,
-    // scaled conservatively. The march can safely advance this far.
-    let safe_skip = max(min_dist - softness, 0.0) * 0.5;
-    return vec2<f32>(0.0, safe_skip);
+    // No blade hit — skip by a fraction of cell_size. Conservative: the 3x3
+    // check already covers 1.5 cells, so skipping 0.25 cells is safe.
+    return vec2<f32>(0.0, cell_size * 0.25);
 }
