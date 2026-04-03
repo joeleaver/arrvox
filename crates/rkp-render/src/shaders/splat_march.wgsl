@@ -403,7 +403,10 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
     // Minimum step = shell_height / 8 ensures at least 8 steps through the shell.
     let march_step = min(obj.voxel_size * 0.3, obj.shell_height * 0.125);
 
-    var t = t_range.x;
+    // Per-ray jitter: offset start by a fraction of the step to break
+    // coherent step-aligned banding into imperceptible noise.
+    let jitter = fract(sin(dot(local_origin.xz + local_dir.xz * 100.0, vec2<f32>(127.1, 311.7))) * 43758.5453);
+    var t = t_range.x + march_step * jitter;
     var prev_opacity = 0.0;
     var prev_t = t;
 
