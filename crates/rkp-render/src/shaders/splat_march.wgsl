@@ -397,11 +397,57 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         return -1.0;
     }
 
-    // Surface Y in local space (stored in sdf_param_0 by the volume builder).
+    // LOD: estimate screen-space size of this volume. If tiny, simplify or skip.
+    let aabb_extent = obj.aabb_max.xyz - obj.aabb_min.xyz;
+    let aabb_size = max(aabb_extent.x, max(aabb_extent.y, aabb_extent.z));
+    let dist_to_cam = max(t_range.x, 0.1);
+    let screen_size = aabb_size / dist_to_cam; // approximate angular size
+
+    // LOD 2: too small to see — skip entirely.
+    if screen_size < 0.005 {
+        return -1.0;
+    }
+
+    // LOD 1: small on screen — return a hit at the shell surface without
+    // evaluating the opacity shader. Appears as a solid green patch.
+    if screen_size < 0.05 {
+        // Find the shell entry: where h_above first enters [0, shell_height].
+        let surface_y = obj.sdf_param_0;
+        let entry_pos = local_origin + safe_dir * t_range.x;
+        let entry_h = entry_pos.y - surface_y;
+        if entry_h >= 0.0 && entry_h <= obj.shell_height {
+            return t_range.x; // hit at entry
+        }
+        // Ray enters above/below shell — step to shell boundary.
+        let dir_y = safe_dir.y;
+        if abs(dir_y) > 0.001 {
+            var t_shell: f32;
+            if entry_h > obj.shell_height {
+                t_shell = t_range.x + (entry_h - obj.shell_height) / (-dir_y);
+            } else {
+                t_shell = t_range.x + (-entry_h) / dir_y;
+            }
+            if t_shell >= t_range.x && t_shell <= t_range.y {
+                return t_shell;
+            }
+        }
+        return -1.0;
+    }
+
+    // LOD 0: full quality — march with opacity shader.
     let surface_y = obj.sdf_param_0;
 
-    // Step size: shell_height / 128 gives fine resolution through the shell.
-    let march_step = obj.shell_height / 128.0;
+    // Step size: scale with LOD. Close volumes get finer steps.
+    let lod_factor = clamp(screen_size * 10.0, 1.0, 4.0); // 1-4x refinement
+    let march_step = obj.shell_height / (16.0 * lod_factor);
+
+    // Cache parent grid params outside the loop (cheap), but sample per-step
+    // for smooth per-voxel material boundaries.
+    let parent_dims = vec3<u32>(obj.rest_brick_map_dims_x, obj.rest_brick_map_dims_y, obj.rest_brick_map_dims_z);
+    let parent_vs = obj.voxel_size;
+    let parent_grid = vec3<f32>(parent_dims) * parent_vs * 8.0;
+    let parent_total = vec3<i32>(parent_dims) * 8;
+    let check_y = surface_y - parent_vs * 0.5;
 
     // Per-ray jitter to break step-aligned banding.
     let jitter = fract(sin(dot(local_origin.xz + local_dir.xz * 100.0, vec2<f32>(127.1, 311.7))) * 43758.5453);
@@ -415,13 +461,7 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         let local_pos = local_origin + safe_dir * t;
         let h_above = local_pos.y - surface_y;
 
-        // Sample the parent's per-voxel material at this XZ to get the blend weight.
-        // The shader decides how to use it (grass scales height, etc.).
-        let parent_dims = vec3<u32>(obj.rest_brick_map_dims_x, obj.rest_brick_map_dims_y, obj.rest_brick_map_dims_z);
-        let parent_vs = obj.voxel_size;
-        let parent_grid = vec3<f32>(parent_dims) * parent_vs * 8.0;
-        let parent_total = vec3<i32>(parent_dims) * 8;
-        let check_y = surface_y - parent_vs * 0.5;
+        // Per-step material check for smooth boundaries.
         let check_gp = vec3<f32>(local_pos.x, check_y, local_pos.z) + parent_grid * 0.5;
         let check_vc = clamp(
             vec3<i32>(floor(check_gp / parent_vs)),
@@ -789,25 +829,18 @@ fn compute_normal(hit_pos: vec3<f32>, obj_idx: u32) -> vec3<f32> {
     return compute_normal_static(local_pos, obj);
 }
 
-/// Normal for procedural volume objects — gradient of the blade opacity field.
+/// Normal for procedural volume objects — XZ gradient only (4 taps instead of 6).
+/// Blades are mostly vertical so the Y gradient adds little and costs 2 extra evaluations.
 fn compute_normal_procedural(local_pos: vec3<f32>, obj: GpuObject) -> vec3<f32> {
     let eps = obj.voxel_size * 0.5;
     let sid = obj.sdf_shader_id;
     let mid = obj.material_id;
-    let sy = obj.sdf_param_0; // surface Y
-    let hx0 = max((local_pos + vec3<f32>(eps, 0.0, 0.0)).y - sy, 0.0);
-    let hx1 = max((local_pos - vec3<f32>(eps, 0.0, 0.0)).y - sy, 0.0);
-    let hy0 = max((local_pos + vec3<f32>(0.0, eps, 0.0)).y - sy, 0.0);
-    let hy1 = max((local_pos - vec3<f32>(0.0, eps, 0.0)).y - sy, 0.0);
-    let hz0 = max((local_pos + vec3<f32>(0.0, 0.0, eps)).y - sy, 0.0);
-    let hz1 = max((local_pos - vec3<f32>(0.0, 0.0, eps)).y - sy, 0.0);
-    let gx = dispatch_opacity_shader(sid, local_pos + vec3<f32>(eps, 0.0, 0.0), hx0, 1.0, obj, mid)
-           - dispatch_opacity_shader(sid, local_pos - vec3<f32>(eps, 0.0, 0.0), hx1, 1.0, obj, mid);
-    let gy = dispatch_opacity_shader(sid, local_pos + vec3<f32>(0.0, eps, 0.0), hy0, 1.0, obj, mid)
-           - dispatch_opacity_shader(sid, local_pos - vec3<f32>(0.0, eps, 0.0), hy1, 1.0, obj, mid);
-    let gz = dispatch_opacity_shader(sid, local_pos + vec3<f32>(0.0, 0.0, eps), hz0, 1.0, obj, mid)
-           - dispatch_opacity_shader(sid, local_pos - vec3<f32>(0.0, 0.0, eps), hz1, 1.0, obj, mid);
-    let local_grad = -vec3<f32>(gx, gy, gz);
+    let h = max(local_pos.y - obj.sdf_param_0, 0.0);
+    let gx = dispatch_opacity_shader(sid, local_pos + vec3<f32>(eps, 0.0, 0.0), h, 1.0, obj, mid)
+           - dispatch_opacity_shader(sid, local_pos - vec3<f32>(eps, 0.0, 0.0), h, 1.0, obj, mid);
+    let gz = dispatch_opacity_shader(sid, local_pos + vec3<f32>(0.0, 0.0, eps), h, 1.0, obj, mid)
+           - dispatch_opacity_shader(sid, local_pos - vec3<f32>(0.0, 0.0, eps), h, 1.0, obj, mid);
+    let local_grad = -vec3<f32>(gx, 0.0, gz);
 
     let world_grad = (transpose(obj.inverse_world) * vec4<f32>(local_grad, 0.0)).xyz;
     let len = length(world_grad);

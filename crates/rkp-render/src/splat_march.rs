@@ -19,6 +19,12 @@ use rkf_render::gpu_scene::GpuScene;
 use rkf_render::shader_params::ShaderParamsBuffer;
 use rkf_render::tile_object_cull::TileObjectCullPass;
 
+/// Smooth Hermite interpolation (matches WGSL smoothstep and mesh import).
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// Compute axis-aligned half extents for an analytical primitive.
 fn primitive_half_extents(prim: &rkf_core::scene_node::SdfPrimitive) -> glam::Vec3 {
     use rkf_core::scene_node::SdfPrimitive;
@@ -221,21 +227,25 @@ impl rkf_render::MarchPass for SplatMarchPass {
         use rkf_core::scene_node::SdfPrimitive;
 
         let half_extents = primitive_half_extents(primitive) * bake_scale;
-        let margin = voxel_size * 2.0;
+        let margin = voxel_size * 8.0 + voxel_size; // full brick + 1 voxel for interpolation
         let aabb = rkf_core::Aabb::new(
             -half_extents - glam::Vec3::splat(margin),
             half_extents + glam::Vec3::splat(margin),
         );
 
         // Build an opacity function from the analytical SDF primitive.
-        // For primitives that support exact scaling (Box), evaluate the scaled
-        // primitive directly. For others, use the inv_scale approximation.
+        // The fade zone must span across brick boundaries for smooth trilinear
+        // interpolation. Use brick-relative widths matching the mesh import's
+        // narrow_band (1.8 * brick_world_size).
+        let brick_world = voxel_size * 8.0;
+        let fade_inner = voxel_size;
+        let fade_outer = brick_world;
         let opacity_fn: Box<dyn Fn(glam::Vec3) -> (f32, u16)> = match primitive {
             SdfPrimitive::Box { half_extents: he } => {
                 let scaled = SdfPrimitive::Box { half_extents: *he * bake_scale };
                 Box::new(move |pos: glam::Vec3| {
                     let d = rkf_core::evaluate_primitive(&scaled, pos);
-                    let opacity = (0.5 - d / voxel_size).clamp(0.0, 1.0);
+                    let opacity = 1.0 - smoothstep(-fade_inner, fade_outer, d);
                     (opacity, material_id)
                 })
             }
@@ -249,7 +259,7 @@ impl rkf_render::MarchPass for SplatMarchPass {
                 );
                 Box::new(move |pos: glam::Vec3| {
                     let d = rkf_core::evaluate_primitive(&prim, pos * inv_scale) * min_scale;
-                    let opacity = (0.5 - d / voxel_size).clamp(0.0, 1.0);
+                    let opacity = 1.0 - smoothstep(-fade_inner, fade_outer, d);
                     (opacity, material_id)
                 })
             }
@@ -258,10 +268,22 @@ impl rkf_render::MarchPass for SplatMarchPass {
         let (handle, brick_count) =
             rkp_core::voxelize_opacity::voxelize_opacity(opacity_fn, &aabb, voxel_size, pool, map_alloc)?;
 
-        // Use the geometry AABB (half_extents + margin) for culling, not the
-        // full grid AABB. The shader's march volume (-half_grid to half_grid)
-        // may be larger due to brick quantization, but the extra region is
-        // empty — no need to include it in the BVH/wireframe AABB.
+        // Diagnostic: sample opacity along X axis through center to verify smooth gradient
+        {
+            let n = 20;
+            let mut samples = Vec::new();
+            for i in 0..=n {
+                let x = -half_extents.x * 1.2 + (half_extents.x * 2.4) * (i as f32 / n as f32);
+                let pos = glam::Vec3::new(x, 0.0, 0.0);
+                let d = rkf_core::evaluate_primitive(primitive, pos);
+                let o = 1.0 - smoothstep(-fade_inner, fade_outer, d);
+                samples.push(format!("{:.3}", o));
+            }
+            eprintln!("[voxelize_primitive] opacity cross-section: [{}]", samples.join(", "));
+            eprintln!("[voxelize_primitive] vs={}, fade_inner={}, fade_outer={}, bricks={}, dims={:?}",
+                voxel_size, fade_inner, fade_outer, brick_count, handle.dims);
+        }
+
         let geometry_aabb = aabb;
 
         Some((handle, voxel_size, geometry_aabb, brick_count))

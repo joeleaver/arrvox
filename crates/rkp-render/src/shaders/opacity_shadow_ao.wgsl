@@ -331,6 +331,9 @@ fn shadow_transmittance_object(
     obj: GpuObject,
     is_origin_obj: bool,
 ) -> f32 {
+    if obj.geom_type == GEOM_TYPE_PROCEDURAL {
+        return 1.0;
+    }
     let inv_world = obj.inverse_world;
     let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
     let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;

@@ -54,13 +54,19 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
 
     // Realistic blade width
     let blade_width = 0.002 + height * 0.005;
-    let softness = max(blade_width * 0.4, height / 128.0);
+    let softness = max(blade_width * 0.4, height / 32.0);
 
     var max_opacity = 0.0;
 
-    // Check 3x3 neighborhood of cells
+    // Check center cell first, then neighbors only if needed.
+    // This avoids 8 unnecessary blade evaluations for most positions.
+    for (var ring = 0u; ring < 2u; ring++) {
     for (var dx = -1i; dx <= 1i; dx++) {
         for (var dz = -1i; dz <= 1i; dz++) {
+            // Ring 0: center only. Ring 1: neighbors only.
+            let is_center = (dx == 0 && dz == 0);
+            if ring == 0u && !is_center { continue; }
+            if ring == 1u && is_center { continue; }
             let c = cell + vec2<f32>(f32(dx), f32(dz));
             let h = grass_hash2(c);
 
@@ -75,15 +81,13 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
                 continue;
             }
 
-            // Per-blade random Y rotation
-            let rot_angle = grass_hash1(c * 311.7) * 6.283;
-            let cos_r = cos(rot_angle);
-            let sin_r = sin(rot_angle);
+            // Cheap rotation: hash-derived direction vector (avoids sin/cos)
+            let rot_h = grass_hash2(c * 311.7) * 2.0 - 1.0;
+            let rot_len = max(length(rot_h), 0.01);
+            let cos_r = rot_h.x / rot_len;
+            let sin_r = rot_h.y / rot_len;
 
-            // Position relative to blade root
             var p = vec3<f32>(local_pos.x - root_xz.x, h_above, local_pos.z - root_xz.y);
-
-            // Rotate around Y axis
             let rx = p.x * cos_r + p.z * sin_r;
             let rz = -p.x * sin_r + p.z * cos_r;
             p = vec3<f32>(rx, p.y, rz);
@@ -108,14 +112,14 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
 
             let blade_opacity = 1.0 - smoothstep(0.0, softness, d);
             max_opacity = max(max_opacity, blade_opacity);
+            // Early-out: if we found a solid hit, no need to check more blades.
+            if max_opacity > 0.99 { break; }
         }
+        if max_opacity > 0.99 { break; }
+    }
+    // If center cell hit, skip neighbor ring entirely.
+    if max_opacity > 0.0 { break; }
     }
 
-    if max_opacity > 0.0 {
-        return max_opacity;
-    }
-
-    // No blade hit — skip by a fraction of cell_size. Conservative: the 3x3
-    // check already covers 1.5 cells, so skipping 0.25 cells is safe.
-    return 0.0;
+    return max_opacity;
 }
