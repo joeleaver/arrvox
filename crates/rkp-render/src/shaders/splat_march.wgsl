@@ -398,27 +398,27 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
 
     // Surface Y in local space (stored in sdf_param_0 by the volume builder).
     let surface_y = obj.sdf_param_0;
-    // Step size: based on shell_height, not voxel_size. The procedural march
-    // is purely analytical — no voxel data is read. Ensure enough steps to
-    // detect thin blades (~2-7mm wide).
-    let estimated_blade_width = 0.002 + obj.shell_height * 0.005;
-    let base_step = min(obj.shell_height / 64.0, estimated_blade_width * 0.8);
+
+    // Step size: shell_height / 128 gives fine resolution through the shell.
+    // The shader's softness must be >= this for reliable detection.
+    let march_step = obj.shell_height / 128.0;
+
+    // Limit march distance based on ray angle through the shell.
+    // A horizontal ray would traverse infinitely through the shell — cap it.
+    let cos_shell = max(abs(safe_dir.y), 0.02);
+    let max_march_dist = obj.shell_height / cos_shell;
+    let t_end = min(t_range.y, t_range.x + max_march_dist);
 
     // Per-ray jitter to break step-aligned banding.
     let jitter = fract(sin(dot(local_origin.xz + local_dir.xz * 100.0, vec2<f32>(127.1, 311.7))) * 43758.5453);
-    var t = t_range.x + base_step * jitter;
+    var t = t_range.x + march_step * jitter;
     var prev_opacity = 0.0;
     var prev_t = t;
 
     for (var step = 0u; step < MAX_MARCH_STEPS; step++) {
-        if t > t_range.y { break; }
+        if t > t_end { break; }
 
         let local_pos = local_origin + safe_dir * t;
-
-        // LOD: scale step with distance from camera. Near = fine (individual blades),
-        // far = coarse (blades merge into solid mass, which is realistic).
-        let dist_from_cam = t - t_range.x;
-        let march_step = base_step * max(1.0, dist_from_cam * 0.5);
         let h_above = local_pos.y - surface_y;
 
         // Skip positions outside the shell range — no geometry there.
