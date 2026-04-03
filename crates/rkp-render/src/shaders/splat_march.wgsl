@@ -411,8 +411,9 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         let local_pos = local_origin + safe_dir * t;
         let h_above = local_pos.y - surface_y;
 
-        // DEBUG: force opacity=1 everywhere to test if the loop finds crossings at all
-        let opacity = 1.0;
+        let opacity = dispatch_opacity_shader(
+            obj.sdf_shader_id, local_pos, max(h_above, 0.0), obj, obj.material_id
+        );
 
         if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
             let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
