@@ -78,8 +78,8 @@ fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: Gpu
             // Per-blade height variation
             let blade_h = height * (1.0 - height_var * grass_hash1(c * 127.1));
 
-            // Skip if we're way above this blade
-            if h_above > blade_h * 1.2 {
+            // Skip if above this blade (hard cutoff — no phantom extension)
+            if h_above > blade_h {
                 continue;
             }
 
