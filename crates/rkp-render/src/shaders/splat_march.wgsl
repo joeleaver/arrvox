@@ -398,10 +398,10 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
 
     // Surface Y in local space (stored in sdf_param_0 by the volume builder).
     let surface_y = obj.sdf_param_0;
-    // Step size: small enough to detect blades (< blade width).
-    // Use shell_height to adapt — short grass gets finer steps.
-    // Minimum step = shell_height / 8 ensures at least 8 steps through the shell.
-    let march_step = min(obj.voxel_size * 0.3, obj.shell_height * 0.125);
+    // Step size: based on shell_height, not voxel_size. The procedural march
+    // is purely analytical — no voxel data is read. Fine steps through the
+    // shell ensure thin blades are detected.
+    let march_step = obj.shell_height / 64.0;
 
     // Per-ray jitter: offset start by a fraction of the step to break
     // coherent step-aligned banding into imperceptible noise.
