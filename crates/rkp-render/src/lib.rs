@@ -8,8 +8,11 @@
 
 /// Splat march compute pass — surface-finding through opacity field, G-buffer output.
 pub mod splat_march;
+/// Opacity volume manager — procedural geometry volumes for opacity shaders.
+pub mod opacity_volume;
 /// Direct mesh-to-opacity voxelization — bypasses SDF for smooth splat fields.
 pub mod voxelize_opacity;
 
 pub use splat_march::SplatMarchPass;
+pub use opacity_volume::{OpacityVolume, OpacityVolumeManager};
 pub use voxelize_opacity::import_mesh_to_opacity_rkf;
