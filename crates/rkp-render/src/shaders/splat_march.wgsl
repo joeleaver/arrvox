@@ -446,24 +446,8 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         }
 
         if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
-            // Refine the crossing point with binary search to eliminate
-            // banding artifacts from the fixed-step march.
-            var lo = prev_t;
-            var hi = t;
-            for (var refine = 0u; refine < 5u; refine++) {
-                let mid = (lo + hi) * 0.5;
-                let mid_pos = local_origin + safe_dir * mid;
-                let mid_h = mid_pos.y - surface_y;
-                let mid_op = dispatch_opacity_shader(
-                    obj.sdf_shader_id, mid_pos, max(mid_h, 0.0), blend_weight, obj, obj.material_id
-                );
-                if mid_op >= OPACITY_THRESHOLD {
-                    hi = mid;
-                } else {
-                    lo = mid;
-                }
-            }
-            return (lo + hi) * 0.5;
+            let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
+            return mix(prev_t, t, frac);
         }
 
         prev_opacity = opacity;
