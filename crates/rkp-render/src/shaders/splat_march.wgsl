@@ -396,9 +396,6 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         return -1.0;
     }
 
-    // DEBUG: return immediate hit at AABB entry to test if rays enter the volume.
-    return t_range.x;
-
     // Surface Y in local space (stored in sdf_param_0 by the volume builder).
     let surface_y = obj.sdf_param_0;
     let fine_step = obj.voxel_size * 0.5;
@@ -413,9 +410,8 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         let local_pos = local_origin + safe_dir * t;
         let h_above = local_pos.y - surface_y;
 
-        let opacity = dispatch_opacity_shader(
-            obj.sdf_shader_id, local_pos, max(h_above, 0.0), obj, obj.material_id
-        );
+        // DEBUG: force constant opacity to test if the march loop finds crossings
+        let opacity = select(0.0, 1.0, h_above > 0.0 && h_above < obj.shell_height);
 
         if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
             let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
