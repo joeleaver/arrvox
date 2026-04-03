@@ -369,89 +369,6 @@ fn sample_material_at_hit(local_pos: vec3<f32>, obj: GpuObject) -> vec3<u32> {
 
 // ── Procedural Volume March ───────────────────────────────────────────────
 
-/// Extract f16 SDF distance from word0 bits 0–15 (NOT clamped to [0,1]).
-/// Used for procedural volume bricks which store signed distances, not opacity.
-fn extract_distance(word0: u32) -> f32 {
-    return unpack2x16float(word0 & 0xFFFFu).x;
-}
-
-/// Sample a single voxel's SDF distance from the brick pool (unclamped).
-fn sample_distance_at(obj_offset: u32, vc: vec3<i32>, dims: vec3<u32>,
-                      total_voxels: vec3<i32>, vs: f32) -> f32 {
-    let c = clamp(vc, vec3<i32>(0), total_voxels - vec3<i32>(1));
-    let brick = vec3<u32>(c / vec3<i32>(8));
-    let local = vec3<u32>(c % vec3<i32>(8));
-    let flat_brick = brick.x + brick.y * dims.x + brick.z * dims.x * dims.y;
-    let slot = brick_maps[obj_offset + flat_brick];
-    if slot == EMPTY_SLOT {
-        return vs * 8.0; // far above surface
-    }
-    if slot == INTERIOR_SLOT {
-        // In procedural volumes, INTERIOR_SLOT marks bricks with no propagated data.
-        // Return a very large positive distance so:
-        // 1. surface_opacity = 0 (transparent)
-        // 2. opacity shader early-outs (h_above > height * 1.3)
-        return 1e6;
-    }
-    let idx = slot * 512u + local.x + local.y * 8u + local.z * 64u;
-    return extract_distance(brick_pool[idx].word0);
-}
-
-/// Trilinear interpolation of the SDF distance field (for procedural volumes).
-fn sample_distance_trilinear(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
-    let vs = obj.voxel_size;
-    let brick_extent = vs * 8.0;
-    let dims = vec3<u32>(obj.brick_map_dims_x, obj.brick_map_dims_y, obj.brick_map_dims_z);
-    let grid_size = vec3<f32>(dims) * brick_extent;
-
-    let grid_pos = local_pos + grid_size * 0.5;
-    let clamped = clamp(grid_pos, vec3<f32>(vs * 0.01), grid_size - vec3<f32>(vs * 0.01));
-    let outside_dist = length(grid_pos - clamped);
-
-    if outside_dist > brick_extent {
-        return outside_dist; // far outside the grid
-    }
-
-    let voxel_coord = clamped / vs - vec3<f32>(0.5);
-    let v0 = vec3<i32>(floor(voxel_coord));
-    let t = voxel_coord - vec3<f32>(v0);
-    let total_voxels = vec3<i32>(dims) * 8;
-
-    let c000 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(0, 0, 0), dims, total_voxels, vs);
-    let c100 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(1, 0, 0), dims, total_voxels, vs);
-    let c010 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(0, 1, 0), dims, total_voxels, vs);
-    let c110 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(1, 1, 0), dims, total_voxels, vs);
-    let c001 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(0, 0, 1), dims, total_voxels, vs);
-    let c101 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(1, 0, 1), dims, total_voxels, vs);
-    let c011 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(0, 1, 1), dims, total_voxels, vs);
-    let c111 = sample_distance_at(obj.brick_map_offset, v0 + vec3<i32>(1, 1, 1), dims, total_voxels, vs);
-
-    let c00 = mix(c000, c100, t.x);
-    let c10 = mix(c010, c110, t.x);
-    let c01 = mix(c001, c101, t.x);
-    let c11 = mix(c011, c111, t.x);
-    let c0 = mix(c00, c10, t.y);
-    let c1 = mix(c01, c11, t.y);
-    return mix(c0, c1, t.z) + outside_dist;
-}
-
-/// Evaluate combined opacity for a procedural volume at a given position.
-/// Combines the base surface opacity (from SDF distance) with the procedural
-/// blade opacity (from the user's opacity shader).
-fn sample_procedural_opacity(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
-    let h_above = sample_distance_trilinear(local_pos, obj);
-
-    // Convert SDF distance to surface opacity: 1.0 inside, 0.5 at surface, 0.0 above.
-    let surface_opacity = saturate(0.5 - h_above / (obj.voxel_size * 2.0));
-
-    // Evaluate procedural opacity shader (grass blades, etc.)
-    let blade_opacity = dispatch_opacity_shader(
-        obj.sdf_shader_id, local_pos, max(h_above, 0.0), obj, obj.material_id
-    );
-
-    return max(surface_opacity, blade_opacity);
-}
-
 /// March through a procedural volume object.
 /// The volume has its own brick map with pre-computed SDF distances (h_above).
 /// At each step, evaluates the combined surface + procedural opacity.
@@ -890,15 +807,23 @@ fn compute_normal(hit_pos: vec3<f32>, obj_idx: u32) -> vec3<f32> {
     return compute_normal_static(local_pos, obj);
 }
 
-/// Normal for procedural volume objects — gradient of the combined opacity field.
+/// Normal for procedural volume objects — gradient of the blade opacity field.
 fn compute_normal_procedural(local_pos: vec3<f32>, obj: GpuObject) -> vec3<f32> {
     let eps = obj.voxel_size * 0.5;
-    let gx = sample_procedural_opacity(local_pos + vec3<f32>(eps, 0.0, 0.0), obj)
-           - sample_procedural_opacity(local_pos - vec3<f32>(eps, 0.0, 0.0), obj);
-    let gy = sample_procedural_opacity(local_pos + vec3<f32>(0.0, eps, 0.0), obj)
-           - sample_procedural_opacity(local_pos - vec3<f32>(0.0, eps, 0.0), obj);
-    let gz = sample_procedural_opacity(local_pos + vec3<f32>(0.0, 0.0, eps), obj)
-           - sample_procedural_opacity(local_pos - vec3<f32>(0.0, 0.0, eps), obj);
+    let sid = obj.sdf_shader_id;
+    let mid = obj.material_id;
+    let hx0 = max((local_pos + vec3<f32>(eps, 0.0, 0.0)).y, 0.0);
+    let hx1 = max((local_pos - vec3<f32>(eps, 0.0, 0.0)).y, 0.0);
+    let hy0 = max((local_pos + vec3<f32>(0.0, eps, 0.0)).y, 0.0);
+    let hy1 = max((local_pos - vec3<f32>(0.0, eps, 0.0)).y, 0.0);
+    let hz0 = max((local_pos + vec3<f32>(0.0, 0.0, eps)).y, 0.0);
+    let hz1 = max((local_pos - vec3<f32>(0.0, 0.0, eps)).y, 0.0);
+    let gx = dispatch_opacity_shader(sid, local_pos + vec3<f32>(eps, 0.0, 0.0), hx0, obj, mid)
+           - dispatch_opacity_shader(sid, local_pos - vec3<f32>(eps, 0.0, 0.0), hx1, obj, mid);
+    let gy = dispatch_opacity_shader(sid, local_pos + vec3<f32>(0.0, eps, 0.0), hy0, obj, mid)
+           - dispatch_opacity_shader(sid, local_pos - vec3<f32>(0.0, eps, 0.0), hy1, obj, mid);
+    let gz = dispatch_opacity_shader(sid, local_pos + vec3<f32>(0.0, 0.0, eps), hz0, obj, mid)
+           - dispatch_opacity_shader(sid, local_pos - vec3<f32>(0.0, 0.0, eps), hz1, obj, mid);
     let local_grad = -vec3<f32>(gx, gy, gz);
 
     let world_grad = (transpose(obj.inverse_world) * vec4<f32>(local_grad, 0.0)).xyz;
