@@ -383,15 +383,17 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
     let safe_dir = select(local_dir, vec3<f32>(1e-10), abs(local_dir) < vec3<f32>(1e-10));
     let inv_local_dir = 1.0 / safe_dir;
 
-    // Intersect the world-space AABB (transformed to local space via inverse_world).
-    // The AABB is tight around the painted region + shell_height.
-    let local_aabb_min = (inv_world * vec4<f32>(obj.aabb_min.xyz, 1.0)).xyz;
-    let local_aabb_max = (inv_world * vec4<f32>(obj.aabb_max.xyz, 1.0)).xyz;
-    let t_range = intersect_aabb(
-        local_origin, inv_local_dir,
-        min(local_aabb_min, local_aabb_max),
-        max(local_aabb_min, local_aabb_max),
+    // Use the volume's brick grid for AABB and empty-space skipping.
+    let brick_extent = obj.voxel_size * 8.0;
+    let dims = vec3<f32>(
+        f32(obj.brick_map_dims_x),
+        f32(obj.brick_map_dims_y),
+        f32(obj.brick_map_dims_z),
     );
+    let half_grid = dims * brick_extent * 0.5;
+    let udims = vec3<u32>(obj.brick_map_dims_x, obj.brick_map_dims_y, obj.brick_map_dims_z);
+
+    let t_range = intersect_aabb(local_origin, inv_local_dir, -half_grid, half_grid);
     if t_range.x > t_range.y {
         return -1.0;
     }
@@ -400,14 +402,7 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
     let surface_y = obj.sdf_param_0;
 
     // Step size: shell_height / 128 gives fine resolution through the shell.
-    // The shader's softness must be >= this for reliable detection.
     let march_step = obj.shell_height / 128.0;
-
-    // Limit march distance based on ray angle through the shell.
-    // A horizontal ray would traverse infinitely through the shell — cap it.
-    let cos_shell = max(abs(safe_dir.y), 0.02);
-    let max_march_dist = obj.shell_height / cos_shell;
-    let t_end = min(t_range.y, t_range.x + max_march_dist);
 
     // Per-ray jitter to break step-aligned banding.
     let jitter = fract(sin(dot(local_origin.xz + local_dir.xz * 100.0, vec2<f32>(127.1, 311.7))) * 43758.5453);
@@ -416,18 +411,35 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
     var prev_t = t;
 
     for (var step = 0u; step < MAX_MARCH_STEPS; step++) {
-        if t > t_end { break; }
+        if t > t_range.y { break; }
 
         let local_pos = local_origin + safe_dir * t;
-        let h_above = local_pos.y - surface_y;
 
-        // Skip positions outside the shell range — no geometry there.
-        if h_above < 0.0 || h_above > obj.shell_height * 1.3 {
+        // Brick-level empty-space skipping (same pattern as march_object_static).
+        let grid_pos = local_pos + half_grid;
+        let brick_coord = vec3<i32>(floor(grid_pos / brick_extent));
+        var in_empty_brick = false;
+        if any(brick_coord < vec3<i32>(0)) || any(vec3<u32>(brick_coord) >= udims) {
+            in_empty_brick = true;
+        } else {
+            let flat_brick = u32(brick_coord.x) + u32(brick_coord.y) * udims.x + u32(brick_coord.z) * udims.x * udims.y;
+            let slot = brick_maps[obj.brick_map_offset + flat_brick];
+            if slot == EMPTY_SLOT {
+                in_empty_brick = true;
+            }
+        }
+
+        if in_empty_brick {
+            let brick_min = vec3<f32>(brick_coord) * brick_extent - half_grid;
+            let brick_max = brick_min + vec3<f32>(brick_extent);
+            let t_exit = intersect_aabb(local_origin, inv_local_dir, brick_min, brick_max);
             prev_opacity = 0.0;
             prev_t = t;
-            t += march_step;
+            t = t_exit.y + obj.voxel_size * 0.1;
             continue;
         }
+
+        let h_above = local_pos.y - surface_y;
 
         // Sample the parent's per-voxel material at this XZ to get the blend weight.
         // The shader decides how to use it (grass scales height, etc.).
