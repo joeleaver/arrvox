@@ -433,13 +433,14 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
             continue;
         }
 
-        // Read h_above from the volume's pre-computed SDF data at this voxel.
-        // The volume builder stores accurate signed distances: 0 at the surface,
-        // positive above, negative below. This IS h_above.
-        let voxel_coord = grid_pos / vs;
-        let vc = clamp(vec3<i32>(floor(voxel_coord)), vec3<i32>(0), vec3<i32>(udims) * 8 - vec3<i32>(1));
-        let voxel = sample_voxel_data_at(obj.brick_map_offset, vc, udims, vec3<i32>(udims) * 8);
-        let h_above = unpack2x16float(voxel.word0 & 0xFFFFu).x;
+        // Compute h_above geometrically. The volume's grid is taller than the
+        // parent's by extra Y bricks (to accommodate shell_height). The grid center
+        // is shifted up, so the parent surface is at:
+        //   y = -(extra_y_bricks * brick_extent) / 2
+        // in the volume's local space.
+        let extra_y = ceil(obj.shell_height * 1.5 / brick_extent);
+        let surface_y = -(extra_y * brick_extent) * 0.5;
+        let h_above = local_pos.y - surface_y;
 
         let opacity = dispatch_opacity_shader(
             obj.sdf_shader_id, local_pos, max(h_above, 0.0), obj, obj.material_id
