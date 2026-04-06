@@ -20,8 +20,14 @@ pub struct SplatRasterPass {
     raster: SplatRasterPipeline,
     shell: SurfaceShellGpu,
     octree: OctreeGpu,
-    /// Pending surface shell uploads (slot, occupancy) — flushed via `flush_pending`.
+    /// Pending surface shell uploads (slot, occupancy) — flushed in dispatch via staging.
     pending_shell_uploads: std::cell::RefCell<Vec<(u32, [u64; 8])>>,
+    /// Pending face instances from CPU-side emit — uploaded in dispatch.
+    pending_faces: std::cell::RefCell<Vec<crate::splat_emit::FaceInstance>>,
+    /// The device, needed for creating staging buffers in dispatch.
+    device: wgpu::Device,
+    /// Whether face data needs re-upload.
+    faces_dirty: std::cell::Cell<bool>,
 }
 
 impl SplatRasterPass {
@@ -54,6 +60,9 @@ impl SplatRasterPass {
             shell,
             octree,
             pending_shell_uploads: std::cell::RefCell::new(Vec::new()),
+            pending_faces: std::cell::RefCell::new(Vec::new()),
+            device: device.clone(),
+            faces_dirty: std::cell::Cell::new(false),
         }
     }
 
@@ -96,8 +105,9 @@ impl rkf_render::MarchPass for SplatRasterPass {
             root_offset, depth, base_voxel_size, ..
         } = handle
         {
+            let extent = (1u32 << depth) as f32 * 8.0 * base_voxel_size;
             gpu_obj.brick_map_offset = *root_offset;
-            gpu_obj.brick_map_dims = [*depth as u32, base_voxel_size.to_bits(), 0];
+            gpu_obj.brick_map_dims = [*depth as u32, extent.to_bits(), 0];
         }
     }
 
@@ -118,6 +128,7 @@ impl rkf_render::MarchPass for SplatRasterPass {
     fn prepare(&self, queue: &wgpu::Queue) {
         // Flush pending surface shell uploads.
         let mut pending = self.pending_shell_uploads.borrow_mut();
+        eprintln!("[SplatRasterPass] prepare: pending={}", pending.len());
         if !pending.is_empty() {
             eprintln!("[SplatRasterPass] prepare: flushing {} shell uploads", pending.len());
             for &(slot, ref occupancy) in pending.iter() {
@@ -129,15 +140,93 @@ impl rkf_render::MarchPass for SplatRasterPass {
 
     fn dispatch(&self, encoder: &mut wgpu::CommandEncoder, ctx: &rkf_render::MarchContext) {
         let object_count = ctx.scene.num_objects() as u32;
-        eprintln!("[SplatRasterPass] dispatch: object_count={}", object_count);
 
-        // 1. Emit: reset indirect args (staging copy) + traverse octrees.
-        self.emit.dispatch(
-            encoder,
-            &ctx.scene.bind_group,
-            &self.shell.bind_group,
-            object_count,
-        );
+        // Flush pending surface shell uploads via mapped staging buffer + copy.
+        {
+            let mut pending = self.pending_shell_uploads.borrow_mut();
+            if !pending.is_empty() {
+                // Each entry is (slot, [u64; 8]) = 64 bytes of occupancy per slot.
+                let entry_bytes = 64usize; // 8 * size_of::<u64>()
+                let total_bytes = pending.len() * entry_bytes;
+
+                let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("shell staging"),
+                    size: total_bytes as u64,
+                    usage: wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: true,
+                });
+                {
+                    let mut view = staging.slice(..).get_mapped_range_mut();
+                    for (i, &(slot, ref occupancy)) in pending.iter().enumerate() {
+                        // Write each occupancy to the correct offset for its slot
+                        // in the staging buffer. We'll copy per-entry to the shell buffer.
+                        let src_offset = i * entry_bytes;
+                        view[src_offset..src_offset + entry_bytes]
+                            .copy_from_slice(bytemuck::cast_slice(occupancy));
+                    }
+                }
+                staging.unmap();
+
+                // Copy each entry from staging to the correct slot in the shell buffer.
+                let slot_stride = 16u64 * 4; // 16 u32s * 4 bytes = 64 bytes per slot
+                for (i, &(slot, _)) in pending.iter().enumerate() {
+                    encoder.copy_buffer_to_buffer(
+                        &staging,
+                        (i * entry_bytes) as u64,
+                        &self.shell.buffer,
+                        slot as u64 * slot_stride,
+                        entry_bytes as u64,
+                    );
+                }
+                pending.clear();
+            }
+        }
+
+        // Upload face instances from CPU emit (replaces GPU emit pass).
+        {
+            let mut faces = self.pending_faces.borrow_mut();
+            if self.faces_dirty.get() && !faces.is_empty() {
+                let face_count = faces.len() as u32;
+
+                // Upload face data via staging buffer.
+                let face_bytes: &[u8] = bytemuck::cast_slice(&faces);
+                let face_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("face staging"),
+                    size: face_bytes.len() as u64,
+                    usage: wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: true,
+                });
+                face_staging.slice(..).get_mapped_range_mut()
+                    .copy_from_slice(face_bytes);
+                face_staging.unmap();
+                encoder.copy_buffer_to_buffer(
+                    &face_staging, 0,
+                    &self.emit.face_buffer, 0,
+                    face_bytes.len() as u64,
+                );
+
+                // Set indirect draw args: vertex_count=6, instance_count=face_count.
+                let draw_args: [u32; 4] = [6, face_count, 0, 0];
+                let args_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("indirect args staging"),
+                    size: 16,
+                    usage: wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: true,
+                });
+                args_staging.slice(..).get_mapped_range_mut()
+                    .copy_from_slice(bytemuck::cast_slice(&draw_args));
+                args_staging.unmap();
+                encoder.copy_buffer_to_buffer(
+                    &args_staging, 0,
+                    &self.emit.indirect_buffer, 0,
+                    16,
+                );
+
+                self.faces_dirty.set(false);
+                // Keep faces around (don't clear) in case we need them later.
+            }
+        }
+
 
         // 2. Raster: begin render pass with MRT, draw indirect.
         {
@@ -263,44 +352,117 @@ impl rkf_render::MarchPass for SplatRasterPass {
         };
 
         // Octree-native voxelization with adaptive subdivision.
-        let (octree, brick_count, _grid_origin) =
+        let (octree, brick_count, grid_origin) =
             rkp_core::voxelize_octree::voxelize_opacity_octree(
                 opacity_fn, &aabb, voxel_size, pool,
             )?;
 
-        eprintln!("[SplatRasterPass] voxelize_primitive: brick_count={}, octree_nodes={}, depth={}",
-            brick_count, octree.node_count(), octree.depth());
 
-        // Compute surface shell for each leaf brick. Store pending uploads
-        // since we don't have a queue in this context — they'll be flushed
-        // when the engine next calls spatial upload.
-        for (_coord, slot, _depth) in octree.iter_leaves() {
-            let brick = pool.get(slot);
-            let mut geo = rkf_core::BrickGeometry::new();
-            for vz in 0..8u8 {
-                for vy in 0..8u8 {
-                    for vx in 0..8u8 {
-                        let sample = brick.sample(vx as u32, vy as u32, vz as u32);
-                        let sv = rkp_core::SplatVoxel::from(sample);
-                        geo.set_solid(vx, vy, vz, sv.opacity_f32() > 0.5);
+        // Build surface shell + face instances on CPU.
+        // This replaces the GPU emit pass — computed once per voxelization,
+        // drawn every frame by the raster pass.
+        let base_vs = octree.base_voxel_size();
+        let obj_idx = 0u32; // Will be corrected when we support multiple objects.
+
+        {
+            let mut shells = self.pending_shell_uploads.borrow_mut();
+            let mut faces = self.pending_faces.borrow_mut();
+
+            for (coord, slot, leaf_depth) in octree.iter_leaves() {
+                let depth_diff = octree.depth() - leaf_depth;
+                let leaf_vs = base_vs * (1u32 << depth_diff) as f32;
+
+                // Brick's lower corner in octree space (0-based).
+                // The vertex shader offsets by grid_origin for world transform.
+                // The fragment shader uses these directly for octree sampling.
+                let brick_origin = glam::Vec3::new(
+                    coord.x as f32 * base_vs * 8.0,
+                    coord.y as f32 * base_vs * 8.0,
+                    coord.z as f32 * base_vs * 8.0,
+                );
+
+                // Build occupancy from brick data.
+                let brick = pool.get(slot);
+                let mut geo = rkf_core::BrickGeometry::new();
+                for vz in 0..8u8 {
+                    for vy in 0..8u8 {
+                        for vx in 0..8u8 {
+                            let sample = brick.sample(vx as u32, vy as u32, vz as u32);
+                            let sv = rkp_core::SplatVoxel::from(sample);
+                            geo.set_solid(vx, vy, vz, sv.opacity_f32() > 0.5);
+                        }
+                    }
+                }
+
+                // Store shell for GPU upload.
+                shells.push((slot, geo.occupancy));
+                self.shell.ensure_capacity(&self.device, slot + 1);
+
+                // Emit exposed faces for this brick.
+                for vz in 0..8u32 {
+                    for vy in 0..8u32 {
+                        for vx in 0..8u32 {
+                            if !geo.is_solid(vx as u8, vy as u8, vz as u8) {
+                                continue;
+                            }
+                            let voxel_idx = vx + vy * 8 + vz * 64;
+                            let center = brick_origin
+                                + (glam::Vec3::new(vx as f32, vy as f32, vz as f32) + 0.5)
+                                    * leaf_vs;
+
+                            // Check 6 faces: 0=-X, 1=+X, 2=-Y, 3=+Y, 4=-Z, 5=+Z
+                            for face in 0..6u32 {
+                                let (nx, ny, nz) = match face {
+                                    0 => (-1i32, 0i32, 0i32),
+                                    1 => (1, 0, 0),
+                                    2 => (0, -1, 0),
+                                    3 => (0, 1, 0),
+                                    4 => (0, 0, -1),
+                                    5 => (0, 0, 1),
+                                    _ => unreachable!(),
+                                };
+                                let nbx = vx as i32 + nx;
+                                let nby = vy as i32 + ny;
+                                let nbz = vz as i32 + nz;
+
+                                // Exposed if neighbor is out of brick or empty.
+                                let exposed = if nbx < 0 || nbx >= 8 || nby < 0 || nby >= 8 || nbz < 0 || nbz >= 8 {
+                                    true
+                                } else {
+                                    !geo.is_solid(nbx as u8, nby as u8, nbz as u8)
+                                };
+
+                                if exposed {
+                                    faces.push(crate::splat_emit::FaceInstance {
+                                        pos_x: center.x,
+                                        pos_y: center.y,
+                                        pos_z: center.z,
+                                        voxel_size: leaf_vs,
+                                        brick_slot: slot,
+                                        packed: (voxel_idx & 0x1FF)
+                                            | ((face & 0x7) << 9)
+                                            | ((obj_idx & 0xFFFF) << 12),
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }
-            self.pending_shell_uploads.borrow_mut().push((slot, geo.occupancy));
-        }
 
-        eprintln!("[SplatRasterPass] pending_shell_uploads: {}, leaf_count: {}",
-            self.pending_shell_uploads.borrow().len(), octree.leaf_count());
+        }
+        self.faces_dirty.set(true);
 
         // Allocate octree into the GPU allocator.
         let handle = self.octree.allocate(&octree);
-        eprintln!("[SplatRasterPass] octree allocated: root_offset={}, len={}", handle.root_offset, handle.len);
         let spatial = rkf_core::scene_node::SpatialHandle::Octree {
             root_offset: handle.root_offset,
             len: handle.len,
             depth: handle.depth,
             base_voxel_size: handle.base_voxel_size,
         };
+
+        self.faces_dirty.set(true);
 
         let geometry_aabb = rkf_core::Aabb::new(-half_extents, half_extents);
         Some((spatial, voxel_size, geometry_aabb, brick_count))

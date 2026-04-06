@@ -364,7 +364,7 @@ fn octree_trilinear(local_pos: vec3<f32>, root: u32, depth: u32, extent: f32, vs
 struct VsOutput {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) world_pos: vec3<f32>,
-    @location(1) local_pos: vec3<f32>,
+    @location(1) octree_pos: vec3<f32>,  // position in octree space [0, extent] for sampling
     @location(2) @interpolate(flat) brick_slot: u32,
     @location(3) @interpolate(flat) packed: u32,
     @location(4) @interpolate(flat) voxel_size: f32,
@@ -380,7 +380,12 @@ fn vs_main(
     let obj_idx = unpack_obj_idx(face.packed);
     let obj = objects[obj_idx];
 
-    let local_center = vec3<f32>(face.pos_x, face.pos_y, face.pos_z);
+    // Face positions are in octree space (0-based). Convert to object-local space
+    // by subtracting extent/2 (octree is centered on the object's local origin).
+    let octree_center = vec3<f32>(face.pos_x, face.pos_y, face.pos_z);
+    let extent = bitcast<f32>(obj.octree_extent_bits);
+    let grid_offset = vec3<f32>(-extent * 0.5);
+
     let vs = face.voxel_size;
     let half = vs * 0.5;
 
@@ -394,15 +399,16 @@ fn vs_main(
     let tangents = face_tangents(face_id);
     let fn_dir = face_normal(face_id);
 
-    // Quad corners: offset from voxel center along face normal and tangents.
-    let local_pos = local_center + fn_dir * half + tangents[0] * cu * half + tangents[1] * cv * half;
+    // Quad corners in octree space, then convert to object-local space.
+    let octree_pos = octree_center + fn_dir * half + tangents[0] * cu * half + tangents[1] * cv * half;
+    let local_pos = octree_pos + grid_offset;
 
     // For skinned objects: forward-skin the local (rest-pose) position through
     // bone matrices to get posed-space position, then transform to world space.
     var world_pos: vec3<f32>;
     if obj.is_skinned != 0u && obj.bone_count > 0u {
         // Look up bone weights at the voxel center (not corner — bones are per-voxel).
-        let bone_data = raster_lookup_bone_data(local_center, obj);
+        let bone_data = raster_lookup_bone_data(octree_center, obj);
         if bone_data.x != 0u || bone_data.y != 0u {
             let posed_pos = raster_forward_skin_pos(local_pos, bone_data.x, bone_data.y, obj);
             world_pos = transform_local_to_world(posed_pos, obj.inverse_world);
@@ -418,7 +424,7 @@ fn vs_main(
     return VsOutput(
         clip_pos,
         world_pos,
-        local_pos,
+        octree_pos,
         face.brick_slot,
         face.packed,
         vs,
@@ -445,8 +451,9 @@ fn fs_main(in: VsOutput) -> GBufferOutput {
 
     // Trilinear refinement: check if there's actually a surface at this position.
     // The rasterized face is a proxy — the true isosurface may be slightly offset.
-    let local_pos = in.local_pos;
-    let opacity = octree_trilinear(local_pos, root, depth, extent, vs);
+    // octree_pos is in octree space [0, extent] — correct for octree sampling.
+    let octree_pos = in.octree_pos;
+    let opacity = octree_trilinear(octree_pos, root, depth, extent, vs);
 
     if opacity < OPACITY_THRESHOLD {
         discard;
@@ -457,9 +464,9 @@ fn fs_main(in: VsOutput) -> GBufferOutput {
 
     if obj.is_skinned != 0u && obj.bone_count > 0u {
         // Skinned: inverse-skin to rest-pose, compute gradient there, forward-skin back.
-        let bone_data = raster_lookup_bone_data(local_pos, obj);
+        let bone_data = raster_lookup_bone_data(octree_pos, obj);
         if bone_data.x != 0u || bone_data.y != 0u {
-            let rest_pos = raster_inverse_skin_pos(local_pos, bone_data.x, bone_data.y, obj);
+            let rest_pos = raster_inverse_skin_pos(octree_pos, bone_data.x, bone_data.y, obj);
             let eps = vs * 2.0;
             let gx = raster_sample_rest_opacity(rest_pos + vec3(eps, 0.0, 0.0), obj)
                    - raster_sample_rest_opacity(rest_pos - vec3(eps, 0.0, 0.0), obj);
@@ -476,14 +483,14 @@ fn fs_main(in: VsOutput) -> GBufferOutput {
             }
         }
     } else {
-        // Static: gradient in local space, transform to world.
+        // Static: gradient in octree space, transform to world.
         let eps = vs * 2.0;
-        let gx = octree_trilinear(local_pos + vec3(eps, 0.0, 0.0), root, depth, extent, vs)
-               - octree_trilinear(local_pos - vec3(eps, 0.0, 0.0), root, depth, extent, vs);
-        let gy = octree_trilinear(local_pos + vec3(0.0, eps, 0.0), root, depth, extent, vs)
-               - octree_trilinear(local_pos - vec3(0.0, eps, 0.0), root, depth, extent, vs);
-        let gz = octree_trilinear(local_pos + vec3(0.0, 0.0, eps), root, depth, extent, vs)
-               - octree_trilinear(local_pos - vec3(0.0, 0.0, eps), root, depth, extent, vs);
+        let gx = octree_trilinear(octree_pos + vec3(eps, 0.0, 0.0), root, depth, extent, vs)
+               - octree_trilinear(octree_pos - vec3(eps, 0.0, 0.0), root, depth, extent, vs);
+        let gy = octree_trilinear(octree_pos + vec3(0.0, eps, 0.0), root, depth, extent, vs)
+               - octree_trilinear(octree_pos - vec3(0.0, eps, 0.0), root, depth, extent, vs);
+        let gz = octree_trilinear(octree_pos + vec3(0.0, 0.0, eps), root, depth, extent, vs)
+               - octree_trilinear(octree_pos - vec3(0.0, 0.0, eps), root, depth, extent, vs);
         let local_grad = -vec3<f32>(gx, gy, gz);
         let world_grad = transform_dir_to_world(local_grad, obj.inverse_world);
         let grad_len = length(world_grad);

@@ -30,11 +30,11 @@ pub struct FaceInstance {
 /// Uniform parameters for the emit shader.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct EmitParams {
-    max_faces: u32,
-    object_count: u32,
-    _pad0: u32,
-    _pad1: u32,
+pub struct EmitParams {
+    pub max_faces: u32,
+    pub object_count: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
 }
 
 /// The emit compute pass.
@@ -53,7 +53,7 @@ pub struct SplatEmitPass {
     /// Bind group layout for emit params (group 3).
     params_bind_group_layout: wgpu::BindGroupLayout,
     /// Uniform buffer for emit params.
-    params_buffer: wgpu::Buffer,
+    pub params_buffer: wgpu::Buffer,
     /// Bind group for emit params.
     params_bind_group: wgpu::BindGroup,
     /// Maximum face instances the buffer can hold.

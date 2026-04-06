@@ -66,9 +66,10 @@ impl OctreeGpu {
         handle: &OctreeHandle,
         gpu_obj: &mut rkf_render::gpu_object::GpuObject,
     ) {
+        let extent = (1u32 << handle.depth) as f32 * 8.0 * handle.base_voxel_size;
         gpu_obj.brick_map_offset = handle.root_offset;
         gpu_obj.brick_map_dims[0] = handle.depth as u32;
-        gpu_obj.brick_map_dims[1] = handle.base_voxel_size.to_bits();
+        gpu_obj.brick_map_dims[1] = extent.to_bits();
         gpu_obj.brick_map_dims[2] = 0;
     }
 

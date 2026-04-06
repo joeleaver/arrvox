@@ -11,13 +11,8 @@ const OCTREE_EMPTY: u32 = 0xFFFFFFFFu;
 const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
 const OCTREE_LEAF_BIT: u32 = 0x80000000u;
 
-// --- DrawIndirectArgs layout (matches wgpu::DrawIndirectArgs) ---
-struct DrawIndirectArgs {
-    vertex_count: u32,      // 6 (two triangles per face quad)
-    instance_count: atomic<u32>,  // atomically incremented
-    first_vertex: u32,
-    first_instance: u32,
-}
+// DrawIndirectArgs as raw u32 array for atomic access.
+// Layout: [0]=vertex_count, [1]=instance_count (atomic), [2]=first_vertex, [3]=first_instance
 
 // --- Face instance: data passed to the raster vertex shader ---
 struct FaceInstance {
@@ -49,17 +44,17 @@ struct StackEntry {
 
 // --- Bindings ---
 
-// Group 0: octree nodes (same buffer as brick_maps, reinterpreted)
-@group(0) @binding(0) var<storage, read> octree_nodes: array<u32>;
-// Group 0: object metadata
-@group(0) @binding(1) var<storage, read> objects: array<GpuObject>;
+// Group 0: scene data (must match GpuScene bind group layout)
+// binding 0 = brick_pool (not needed by emit, but must be in layout)
+@group(0) @binding(1) var<storage, read> octree_nodes: array<u32>;
+@group(0) @binding(2) var<storage, read> objects: array<GpuObject>;
 
 // Group 1: surface shell occupancy bitmasks
 @group(1) @binding(0) var<storage, read> surface_shell: array<u32>;
 
 // Group 2: output face instances + draw args
 @group(2) @binding(0) var<storage, read_write> face_instances: array<FaceInstance>;
-@group(2) @binding(1) var<storage, read_write> draw_args: DrawIndirectArgs;
+@group(2) @binding(1) var<storage, read_write> draw_args: array<atomic<u32>, 4>;
 
 // Group 3: emit params
 @group(3) @binding(0) var<uniform> emit_params: EmitParams;
@@ -176,7 +171,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         if (node & OCTREE_LEAF_BIT) != 0u {
             // Leaf: emit faces for this brick.
-            let slot = node & ~OCTREE_LEAF_BIT;
+            let slot = node & 0x7FFFFFFFu;
             let depth_diff = max_depth - entry.level;
             let leaf_vs = base_vs * f32(1u << depth_diff);
             let brick_extent = leaf_vs * 8.0;
@@ -211,7 +206,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                 continue;
                             }
 
-                            let idx = atomicAdd(&draw_args.instance_count, 1u);
+                            let idx = atomicAdd(&draw_args[1], 1u); // [1] = instance_count
                             if idx >= emit_params.max_faces {
                                 // Overflow — stop emitting.
                                 return;
