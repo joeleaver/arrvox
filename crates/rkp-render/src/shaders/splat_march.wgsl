@@ -215,6 +215,8 @@ fn sample_voxel_data_at(obj_offset: u32, vc: vec3<i32>, dims: vec3<u32>,
 }
 
 /// Trilinear interpolation of the opacity field at a local-space position.
+/// Includes single-tap pre-filter (skip trilinear for clearly empty/solid voxels)
+/// and same-brick fast path (1 brick_maps lookup when all 8 corners share a brick).
 fn sample_opacity_trilinear(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
     let vs = obj.voxel_size;
     let brick_extent = vs * 8.0;
@@ -235,6 +237,49 @@ fn sample_opacity_trilinear(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
     let t = voxel_coord - vec3<f32>(v0);
     let total_voxels = vec3<i32>(dims) * 8;
 
+    // Pre-filter: read nearest voxel (1 brick_maps + 1 brick_pool read).
+    // If clearly empty or solid, skip the full 8-tap trilinear.
+    let nn = clamp(v0, vec3<i32>(0), total_voxels - vec3<i32>(1));
+    let nn_brick = vec3<u32>(nn / vec3<i32>(8));
+    let nn_local = vec3<u32>(nn % vec3<i32>(8));
+    let nn_flat = nn_brick.x + nn_brick.y * dims.x + nn_brick.z * dims.x * dims.y;
+    let nn_slot = brick_maps[obj.brick_map_offset + nn_flat];
+    if nn_slot == EMPTY_SLOT { return 0.0; }
+    if nn_slot == INTERIOR_SLOT { return 1.0; }
+    let nn_idx = nn_slot * 512u + nn_local.x + nn_local.y * 8u + nn_local.z * 64u;
+    let nn_opacity = extract_opacity(brick_pool[nn_idx].word0);
+    if nn_opacity < 0.01 { return 0.0; }
+    if nn_opacity > 0.99 { return 1.0; }
+
+    // Same-brick fast path: all 8 corners in one brick → 1 brick_maps lookup.
+    let v1 = v0 + vec3<i32>(1);
+    if all(v0 >= vec3<i32>(0)) && all(v1 < total_voxels) {
+        let b0 = v0 / vec3<i32>(8);
+        let b1 = v1 / vec3<i32>(8);
+        if all(b0 == b1) {
+            // Reuse nn_slot — same brick as the pre-filter read.
+            let l = vec3<u32>(v0 - b0 * vec3<i32>(8));
+            let base = nn_slot * 512u;
+            let c000 = extract_opacity(brick_pool[base + l.x + l.y * 8u + l.z * 64u].word0);
+            let c100 = extract_opacity(brick_pool[base + l.x + 1u + l.y * 8u + l.z * 64u].word0);
+            let c010 = extract_opacity(brick_pool[base + l.x + (l.y + 1u) * 8u + l.z * 64u].word0);
+            let c110 = extract_opacity(brick_pool[base + l.x + 1u + (l.y + 1u) * 8u + l.z * 64u].word0);
+            let c001 = extract_opacity(brick_pool[base + l.x + l.y * 8u + (l.z + 1u) * 64u].word0);
+            let c101 = extract_opacity(brick_pool[base + l.x + 1u + l.y * 8u + (l.z + 1u) * 64u].word0);
+            let c011 = extract_opacity(brick_pool[base + l.x + (l.y + 1u) * 8u + (l.z + 1u) * 64u].word0);
+            let c111 = extract_opacity(brick_pool[base + l.x + 1u + (l.y + 1u) * 8u + (l.z + 1u) * 64u].word0);
+
+            let c00 = mix(c000, c100, t.x);
+            let c10 = mix(c010, c110, t.x);
+            let c01 = mix(c001, c101, t.x);
+            let c11 = mix(c011, c111, t.x);
+            let c0 = mix(c00, c10, t.y);
+            let c1 = mix(c01, c11, t.y);
+            return mix(c0, c1, t.z);
+        }
+    }
+
+    // Cross-brick fallback: 8 independent sample_opacity_at calls.
     let c000 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(0, 0, 0), dims, total_voxels);
     let c100 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(1, 0, 0), dims, total_voxels);
     let c010 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(0, 1, 0), dims, total_voxels);
@@ -447,13 +492,49 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
     let lod_factor = clamp(screen_size * 10.0, 1.0, 4.0); // 1-4x refinement
     let march_step = obj.shell_height / (16.0 * lod_factor);
 
-    // Cache parent grid params outside the loop (cheap), but sample per-step
-    // for smooth per-voxel material boundaries.
+    // Per-ray material check: sample parent grid once at ray entry XZ.
+    // Replaces the old per-step check, eliminating 1 brick read per step.
+    // Also fixes INTERIOR_SLOT bug: interior bricks (word1=0) used to give
+    // material_id=0, making grass invisible over solid ground.
     let parent_dims = vec3<u32>(obj.rest_brick_map_dims_x, obj.rest_brick_map_dims_y, obj.rest_brick_map_dims_z);
     let parent_vs = obj.voxel_size;
     let parent_grid = vec3<f32>(parent_dims) * parent_vs * 8.0;
     let parent_total = vec3<i32>(parent_dims) * 8;
     let check_y = surface_y - parent_vs * 0.5;
+
+    let entry_local = local_origin + safe_dir * t_range.x;
+    let check_gp = vec3<f32>(entry_local.x, check_y, entry_local.z) + parent_grid * 0.5;
+    let check_vc = clamp(
+        vec3<i32>(floor(check_gp / parent_vs)),
+        vec3<i32>(0), parent_total - vec3<i32>(1),
+    );
+    let check_brick = vec3<u32>(check_vc / vec3<i32>(8));
+    let check_flat = check_brick.x + check_brick.y * parent_dims.x
+                   + check_brick.z * parent_dims.x * parent_dims.y;
+    let check_slot = brick_maps[obj.rest_brick_map_offset + check_flat];
+
+    var blend_weight = 0.0;
+    if check_slot == INTERIOR_SLOT {
+        // Solid ground — grass should grow here regardless of stored material.
+        blend_weight = 1.0;
+    } else if check_slot != EMPTY_SLOT {
+        // Allocated brick — check voxel material.
+        let check_local = vec3<u32>(check_vc % vec3<i32>(8));
+        let check_idx = check_slot * 512u + check_local.x
+                      + check_local.y * 8u + check_local.z * 64u;
+        let check_v = brick_pool[check_idx];
+        let center_pri = extract_material_id(check_v.word1);
+        let center_sec = extract_secondary_material_id(check_v.word1);
+        if center_pri == obj.material_id {
+            blend_weight = 1.0;
+        } else if center_sec == obj.material_id {
+            blend_weight = f32(extract_blend_weight(check_v.word0)) / 255.0;
+        }
+    }
+    // No matching material at this ray's entry — skip entire volume.
+    if blend_weight <= 0.0 {
+        return -1.0;
+    }
 
     // Per-ray jitter to break step-aligned banding.
     let jitter = fract(sin(dot(local_origin.xz + local_dir.xz * 100.0, vec2<f32>(127.1, 311.7))) * 43758.5453);
@@ -467,26 +548,11 @@ fn march_object_procedural(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f
         let local_pos = local_origin + safe_dir * t;
         let h_above = local_pos.y - surface_y;
 
-        // Per-step material check for smooth boundaries.
-        let check_gp = vec3<f32>(local_pos.x, check_y, local_pos.z) + parent_grid * 0.5;
-        let check_vc = clamp(
-            vec3<i32>(floor(check_gp / parent_vs)),
-            vec3<i32>(0), parent_total - vec3<i32>(1),
-        );
-        let center_v = sample_voxel_data_at(obj.rest_brick_map_offset, check_vc, parent_dims, parent_total);
-        let center_pri = extract_material_id(center_v.word1);
-        let center_sec = extract_secondary_material_id(center_v.word1);
-        var blend_weight = 0.0;
-        if center_pri == obj.material_id {
-            blend_weight = 1.0;
-        } else if center_sec == obj.material_id {
-            blend_weight = f32(extract_blend_weight(center_v.word0)) / 255.0;
-        }
-
+        // Skip shader dispatch when outside the grass shell.
         var opacity = 0.0;
-        if blend_weight > 0.0 {
+        if h_above >= 0.0 && h_above <= obj.shell_height * 1.5 {
             opacity = dispatch_opacity_shader(
-                obj.sdf_shader_id, local_pos, max(h_above, 0.0), blend_weight, obj, obj.material_id
+                obj.sdf_shader_id, local_pos, h_above, blend_weight, obj, obj.material_id
             );
         }
 
@@ -522,7 +588,8 @@ fn march_object(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
     return march_object_static(origin, dir, obj_idx);
 }
 
-/// March through a static (non-skinned) object.
+/// March through a static (non-skinned) object using brick-level DDA
+/// with distance-adaptive fine stepping within allocated bricks.
 fn march_object_static(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
     let obj = objects[obj_idx];
     let inv_world = obj.inverse_world;
@@ -532,67 +599,105 @@ fn march_object_static(origin: vec3<f32>, dir: vec3<f32>, obj_idx: u32) -> f32 {
     let safe_dir = select(local_dir, vec3<f32>(1e-10), abs(local_dir) < vec3<f32>(1e-10));
     let inv_local_dir = 1.0 / safe_dir;
 
-    let brick_extent = obj.voxel_size * 8.0;
-    let dims = vec3<f32>(
-        f32(obj.brick_map_dims_x),
-        f32(obj.brick_map_dims_y),
-        f32(obj.brick_map_dims_z),
-    );
-    let half_grid = dims * brick_extent * 0.5;
+    let vs = obj.voxel_size;
+    let brick_extent = vs * 8.0;
+    let udims = vec3<u32>(obj.brick_map_dims_x, obj.brick_map_dims_y, obj.brick_map_dims_z);
+    let idims = vec3<i32>(udims);
+    let grid_size = vec3<f32>(udims) * brick_extent;
+    let half_grid = grid_size * 0.5;
+
     let t_range = intersect_aabb(local_origin, inv_local_dir, -half_grid, half_grid);
     if t_range.x > t_range.y {
         return -1.0;
     }
 
-    let fine_step = obj.voxel_size * 0.5;
-    let coarse_step = brick_extent; // skip entire brick when in empty space
-    let udims = vec3<u32>(obj.brick_map_dims_x, obj.brick_map_dims_y, obj.brick_map_dims_z);
-    let grid_size = vec3<f32>(udims) * brick_extent;
+    // Pixel footprint for distance-adaptive stepping.
+    // camera.up encodes half-FOV, so 2*length(up)/res_y ≈ angular pixel size.
+    let pixel_size = length(camera.up.xyz) * 2.0 / camera.resolution.y;
+    let fine_step = vs * 0.5;
 
-    var t = t_range.x;
+    // ── Brick-level DDA (Amanatides-Woo) ──
+    // Shift so grid origin is at (0,0,0) instead of (-half_grid).
+    let shifted_origin = local_origin + half_grid;
+    let entry_pos = shifted_origin + safe_dir * t_range.x;
+
+    var brick_coord = vec3<i32>(floor(entry_pos / brick_extent));
+    brick_coord = clamp(brick_coord, vec3<i32>(0), idims - vec3<i32>(1));
+
+    // DDA step direction per axis (+1 or -1)
+    let step_dir = select(vec3<i32>(-1), vec3<i32>(1), safe_dir > vec3<f32>(0.0));
+
+    // Parameter distance to cross one full brick in each axis
+    let t_delta = abs(vec3<f32>(brick_extent) / safe_dir);
+
+    // t at which ray first crosses a brick boundary in each axis
+    let bound_offset = select(vec3<i32>(0), vec3<i32>(1), safe_dir > vec3<f32>(0.0));
+    let next_bound = vec3<f32>(brick_coord + bound_offset) * brick_extent;
+    var t_max = (next_bound - shifted_origin) / safe_dir;
+
+    var t_enter = t_range.x;
     var prev_opacity = 0.0;
-    var prev_t = t;
+    var prev_t = t_range.x;
+    var total_steps = 0u;
 
-    for (var step = 0u; step < MAX_MARCH_STEPS; step++) {
-        if t > t_range.y { break; }
+    for (var brick_step = 0u; brick_step < 256u; brick_step++) {
+        if any(brick_coord < vec3<i32>(0)) || any(brick_coord >= idims) { break; }
+        if t_enter > t_range.y { break; }
 
-        let local_pos = local_origin + safe_dir * t;
+        let brick_exit = min(min(t_max.x, min(t_max.y, t_max.z)), t_range.y);
 
-        // Check if we're in an empty brick — skip the whole brick if so
-        let grid_pos = local_pos + grid_size * 0.5;
-        let brick_coord = vec3<i32>(floor(grid_pos / brick_extent));
+        let bc = vec3<u32>(brick_coord);
+        let flat = bc.x + bc.y * udims.x + bc.z * udims.x * udims.y;
+        let slot = brick_maps[obj.brick_map_offset + flat];
 
-        var in_empty_brick = false;
-        if all(brick_coord >= vec3<i32>(0)) && all(vec3<u32>(brick_coord) < udims) {
-            let bc = vec3<u32>(brick_coord);
-            let flat = bc.x + bc.y * udims.x + bc.z * udims.x * udims.y;
-            let slot = brick_maps[obj.brick_map_offset + flat];
-            if slot == EMPTY_SLOT {
-                in_empty_brick = true;
+        if slot == EMPTY_SLOT {
+            // Empty brick — DDA skips it for free
+            prev_opacity = 0.0;
+            prev_t = brick_exit;
+        } else if slot == INTERIOR_SLOT {
+            // Fully opaque brick — surface is at boundary if approaching from outside
+            if prev_opacity < OPACITY_THRESHOLD {
+                let frac = (OPACITY_THRESHOLD - prev_opacity) / (1.0 - prev_opacity + 1e-10);
+                return mix(prev_t, t_enter, frac);
+            }
+            prev_opacity = 1.0;
+            prev_t = brick_exit;
+        } else {
+            // Allocated brick — fine-step with distance-adaptive step size
+            var t = t_enter;
+            for (var fine = 0u; fine < 128u; fine++) {
+                if t > brick_exit { break; }
+                total_steps++;
+                if total_steps >= MAX_MARCH_STEPS { return -1.0; }
+
+                let local_pos = local_origin + safe_dir * t;
+                let opacity = sample_opacity_trilinear(local_pos, obj);
+
+                if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
+                    let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
+                    return mix(prev_t, t, frac);
+                }
+
+                prev_opacity = opacity;
+                prev_t = t;
+                // Adaptive: near camera use fine_step, far away use pixel footprint,
+                // but never exceed half a brick (guarantees ≥2 samples per brick).
+                t += min(max(fine_step, t * pixel_size), brick_extent * 0.5);
             }
         }
 
-        if in_empty_brick {
-            // Jump to the exit of this brick
-            let brick_min = vec3<f32>(brick_coord) * brick_extent - grid_size * 0.5;
-            let brick_max = brick_min + vec3<f32>(brick_extent);
-            let t_exit = intersect_aabb(local_origin, inv_local_dir, brick_min, brick_max);
-            prev_opacity = 0.0;
-            prev_t = t;
-            t = t_exit.y + obj.voxel_size * 0.1; // step just past the brick boundary
-            continue;
+        // Advance DDA to next brick
+        t_enter = brick_exit;
+        if t_max.x <= t_max.y && t_max.x <= t_max.z {
+            brick_coord.x += step_dir.x;
+            t_max.x += t_delta.x;
+        } else if t_max.y <= t_max.z {
+            brick_coord.y += step_dir.y;
+            t_max.y += t_delta.y;
+        } else {
+            brick_coord.z += step_dir.z;
+            t_max.z += t_delta.z;
         }
-
-        let opacity = sample_opacity_trilinear(local_pos, obj);
-
-        if opacity >= OPACITY_THRESHOLD && prev_opacity < OPACITY_THRESHOLD {
-            let frac = (OPACITY_THRESHOLD - prev_opacity) / (opacity - prev_opacity + 1e-10);
-            return mix(prev_t, t, frac);
-        }
-
-        prev_opacity = opacity;
-        prev_t = t;
-        t += fine_step;
     }
 
     return -1.0;

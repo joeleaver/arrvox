@@ -55,6 +55,8 @@ pub struct SplatMarchPass {
     material_bind_group: wgpu::BindGroup,
     /// Shader params buffer reference (for rebuilding bind group on material update).
     shader_params_buffer: wgpu::Buffer,
+    /// Internal brick map allocator (moved from engine, march pass now owns spatial data).
+    allocator: rkf_core::BrickMapAllocator,
 }
 
 impl SplatMarchPass {
@@ -136,6 +138,7 @@ impl SplatMarchPass {
             material_bind_group_layout,
             material_bind_group,
             shader_params_buffer: shader_params.buffer.clone(),
+            allocator: rkf_core::BrickMapAllocator::new(),
         }
     }
 
@@ -216,38 +219,49 @@ impl rkf_render::MarchPass for SplatMarchPass {
     }
 
     fn voxelize_primitive(
-        &self,
+        &mut self,
         primitive: &rkf_core::scene_node::SdfPrimitive,
         material_id: u16,
         voxel_size: f32,
         bake_scale: glam::Vec3,
         pool: &mut rkf_core::brick_pool::BrickPool,
-        map_alloc: &mut rkf_core::BrickMapAllocator,
-    ) -> Option<(rkf_core::scene_node::BrickMapHandle, f32, rkf_core::Aabb, u32)> {
+    ) -> Option<(rkf_core::scene_node::SpatialHandle, f32, rkf_core::Aabb, u32)> {
+        use rkf_core::brick_map::{BrickMap, EMPTY_SLOT, INTERIOR_SLOT};
+        use rkf_core::constants::BRICK_DIM;
         use rkf_core::scene_node::SdfPrimitive;
 
+        // Same fade parameters as mesh import (generate_lod).
+        let fade_inner = voxel_size;
+        let fade_outer = voxel_size * 3.0;
+
+        let brick_world = voxel_size * BRICK_DIM as f32;
+        // Narrow band: allocate bricks within this distance of the surface.
+        // Matches mesh import's 1.8 * brick_world.
+        let narrow_band = brick_world * 1.8;
+
         let half_extents = primitive_half_extents(primitive) * bake_scale;
-        let margin = voxel_size * 8.0 + voxel_size; // full brick + 1 voxel for interpolation
+        let margin = narrow_band + voxel_size;
         let aabb = rkf_core::Aabb::new(
             -half_extents - glam::Vec3::splat(margin),
             half_extents + glam::Vec3::splat(margin),
         );
+        let aabb_size = aabb.max - aabb.min;
+        let dims = glam::UVec3::new(
+            ((aabb_size.x / brick_world).ceil() as u32).max(1),
+            ((aabb_size.y / brick_world).ceil() as u32).max(1),
+            ((aabb_size.z / brick_world).ceil() as u32).max(1),
+        );
+        let grid_origin = -glam::Vec3::new(
+            dims.x as f32 * brick_world * 0.5,
+            dims.y as f32 * brick_world * 0.5,
+            dims.z as f32 * brick_world * 0.5,
+        );
 
-        // Build an opacity function from the analytical SDF primitive.
-        // The fade zone must span across brick boundaries for smooth trilinear
-        // interpolation. Use brick-relative widths matching the mesh import's
-        // narrow_band (1.8 * brick_world_size).
-        let brick_world = voxel_size * 8.0;
-        let fade_inner = voxel_size;
-        let fade_outer = brick_world;
-        let opacity_fn: Box<dyn Fn(glam::Vec3) -> (f32, u16)> = match primitive {
+        // Build SDF evaluation closure (handles non-uniform scale).
+        let sdf_fn: Box<dyn Fn(glam::Vec3) -> f32> = match primitive {
             SdfPrimitive::Box { half_extents: he } => {
                 let scaled = SdfPrimitive::Box { half_extents: *he * bake_scale };
-                Box::new(move |pos: glam::Vec3| {
-                    let d = rkf_core::evaluate_primitive(&scaled, pos);
-                    let opacity = 1.0 - smoothstep(-fade_inner, fade_outer, d);
-                    (opacity, material_id)
-                })
+                Box::new(move |pos| rkf_core::evaluate_primitive(&scaled, pos))
             }
             _ => {
                 let prim = primitive.clone();
@@ -257,36 +271,105 @@ impl rkf_render::MarchPass for SplatMarchPass {
                     1.0 / bake_scale.y.max(1e-6),
                     1.0 / bake_scale.z.max(1e-6),
                 );
-                Box::new(move |pos: glam::Vec3| {
-                    let d = rkf_core::evaluate_primitive(&prim, pos * inv_scale) * min_scale;
-                    let opacity = 1.0 - smoothstep(-fade_inner, fade_outer, d);
-                    (opacity, material_id)
-                })
+                Box::new(move |pos| rkf_core::evaluate_primitive(&prim, pos * inv_scale) * min_scale)
             }
         };
 
-        let (handle, brick_count) =
-            rkp_core::voxelize_opacity::voxelize_opacity(opacity_fn, &aabb, voxel_size, pool, map_alloc)?;
+        // Pass 1: narrow-band brick classification (same as mesh import).
+        let total = (dims.x * dims.y * dims.z) as usize;
+        let mut needs_alloc = vec![false; total];
+        let mut is_interior = vec![false; total];
+        let mut alloc_count = 0u32;
 
-        // Diagnostic: sample opacity along X axis through center to verify smooth gradient
-        {
-            let n = 20;
-            let mut samples = Vec::new();
-            for i in 0..=n {
-                let x = -half_extents.x * 1.2 + (half_extents.x * 2.4) * (i as f32 / n as f32);
-                let pos = glam::Vec3::new(x, 0.0, 0.0);
-                let d = rkf_core::evaluate_primitive(primitive, pos);
-                let o = 1.0 - smoothstep(-fade_inner, fade_outer, d);
-                samples.push(format!("{:.3}", o));
+        for bz in 0..dims.z {
+            for by in 0..dims.y {
+                for bx in 0..dims.x {
+                    let brick_min = grid_origin + glam::Vec3::new(
+                        bx as f32 * brick_world,
+                        by as f32 * brick_world,
+                        bz as f32 * brick_world,
+                    );
+                    let center = brick_min + glam::Vec3::splat(brick_world * 0.5);
+                    let d = sdf_fn(center);
+                    let bi = (bx + by * dims.x + bz * dims.x * dims.y) as usize;
+
+                    if d.abs() < narrow_band {
+                        needs_alloc[bi] = true;
+                        alloc_count += 1;
+                    } else if d < -narrow_band {
+                        is_interior[bi] = true;
+                    }
+                }
             }
-            eprintln!("[voxelize_primitive] opacity cross-section: [{}]", samples.join(", "));
-            eprintln!("[voxelize_primitive] vs={}, fade_inner={}, fade_outer={}, bricks={}, dims={:?}",
-                voxel_size, fade_inner, fade_outer, brick_count, handle.dims);
         }
 
-        let geometry_aabb = aabb;
+        // Grow pool if needed, then allocate.
+        if pool.free_count() < alloc_count {
+            let new_cap = (pool.capacity() * 2).max(pool.capacity() + alloc_count);
+            pool.grow(new_cap);
+        }
+        let slots = pool.allocate_range(alloc_count)?;
+        let mut slot_idx = 0usize;
 
-        Some((handle, voxel_size, geometry_aabb, brick_count))
+        // Pass 2: populate bricks with opacity data.
+        let mut brick_map = BrickMap::new(dims);
+        let half_voxel = voxel_size * 0.5;
+
+        for bz in 0..dims.z {
+            for by in 0..dims.y {
+                for bx in 0..dims.x {
+                    let bi = (bx + by * dims.x + bz * dims.x * dims.y) as usize;
+                    if is_interior[bi] {
+                        brick_map.set(bx, by, bz, INTERIOR_SLOT);
+                        continue;
+                    }
+                    if !needs_alloc[bi] {
+                        continue; // stays EMPTY_SLOT
+                    }
+
+                    let slot = slots[slot_idx];
+                    slot_idx += 1;
+                    brick_map.set(bx, by, bz, slot);
+
+                    let brick_min = grid_origin + glam::Vec3::new(
+                        bx as f32 * brick_world,
+                        by as f32 * brick_world,
+                        bz as f32 * brick_world,
+                    );
+
+                    let brick = pool.get_mut(slot);
+                    for vz in 0..BRICK_DIM {
+                        for vy in 0..BRICK_DIM {
+                            for vx in 0..BRICK_DIM {
+                                let pos = brick_min + glam::Vec3::new(
+                                    vx as f32 * voxel_size + half_voxel,
+                                    vy as f32 * voxel_size + half_voxel,
+                                    vz as f32 * voxel_size + half_voxel,
+                                );
+                                let d = sdf_fn(pos);
+                                let opacity = 1.0 - smoothstep(-fade_inner, fade_outer, d);
+                                let sample: rkf_core::voxel::VoxelSample =
+                                    rkp_core::SplatVoxel::new(opacity.clamp(0.0, 1.0), material_id).into();
+                                brick.set(vx as u32, vy as u32, vz as u32, sample);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let handle = self.allocator.allocate(&brick_map);
+
+        // Object AABB: exact primitive bounds. The voxel grid extends beyond
+        // (narrow_band margin for smooth surfaces), but culling/wireframe/physics
+        // match the geometry exactly.
+        let geometry_aabb = rkf_core::Aabb::new(-half_extents, half_extents);
+
+        Some((rkf_core::SpatialHandle::BrickMap(handle), voxel_size, geometry_aabb, alloc_count))
+    }
+
+    fn spatial_data(&self) -> &[u32] {
+        self.allocator.as_slice()
     }
 
     // needs_skin_deform: default true — use the SkinDeformPass to scatter

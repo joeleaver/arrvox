@@ -24,11 +24,7 @@ fn grass_hash2(p: vec2<f32>) -> vec2<f32> {
 // --- Grass blade opacity ---
 
 fn opacity_grass(local_pos: vec3<f32>, h_above: f32, blend_weight: f32, obj: GpuObject, mat_id: u32) -> f32 {
-
-    // Only grow grass above the surface
-    if h_above < 0.0 {
-        return 0.0; // skip to surface
-    }
+    // h_above is guaranteed >= 0 by the march (shell bounds check).
 
     // Read shader-specific params
     let sp = shader_params[mat_id];

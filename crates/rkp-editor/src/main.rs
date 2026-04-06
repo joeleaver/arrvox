@@ -9,7 +9,7 @@ fn main() -> anyhow::Result<()> {
 
     let march_factory: rkf_editor::engine_loop::MarchFactory = Box::new(
         |device, scene, gbuffer, tile_cull, material_buffer, shader_params, opacity_code| -> Box<dyn rkf_render::MarchPass> {
-            Box::new(rkp_render::SplatMarchPass::new(
+            Box::new(rkp_render::SplatRasterPass::new(
                 device, scene, gbuffer, tile_cull,
                 material_buffer, shader_params, opacity_code,
             ))

@@ -211,6 +211,47 @@ fn sample_opacity_trilinear(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
     let v0 = vec3<i32>(floor(voxel_coord));
     let t = voxel_coord - vec3<f32>(v0);
     let total_voxels = vec3<i32>(dims) * 8;
+
+    // Pre-filter: read nearest voxel. If clearly empty or solid, skip trilinear.
+    let nn = clamp(v0, vec3<i32>(0), total_voxels - vec3<i32>(1));
+    let nn_brick = vec3<u32>(nn / vec3<i32>(8));
+    let nn_local = vec3<u32>(nn % vec3<i32>(8));
+    let nn_flat = nn_brick.x + nn_brick.y * dims.x + nn_brick.z * dims.x * dims.y;
+    let nn_slot = brick_maps[obj.brick_map_offset + nn_flat];
+    if nn_slot == EMPTY_SLOT { return 0.0; }
+    if nn_slot == INTERIOR_SLOT { return 1.0; }
+    let nn_idx = nn_slot * 512u + nn_local.x + nn_local.y * 8u + nn_local.z * 64u;
+    let nn_opacity = extract_opacity(brick_pool[nn_idx].word0);
+    if nn_opacity < 0.01 { return 0.0; }
+    if nn_opacity > 0.99 { return 1.0; }
+
+    // Same-brick fast path: all 8 corners in one brick → 1 brick_maps lookup.
+    let v1 = v0 + vec3<i32>(1);
+    if all(v0 >= vec3<i32>(0)) && all(v1 < total_voxels) {
+        let b0 = v0 / vec3<i32>(8);
+        let b1 = v1 / vec3<i32>(8);
+        if all(b0 == b1) {
+            let l = vec3<u32>(v0 - b0 * vec3<i32>(8));
+            let base = nn_slot * 512u;
+            let c000 = extract_opacity(brick_pool[base + l.x + l.y * 8u + l.z * 64u].word0);
+            let c100 = extract_opacity(brick_pool[base + l.x + 1u + l.y * 8u + l.z * 64u].word0);
+            let c010 = extract_opacity(brick_pool[base + l.x + (l.y + 1u) * 8u + l.z * 64u].word0);
+            let c110 = extract_opacity(brick_pool[base + l.x + 1u + (l.y + 1u) * 8u + l.z * 64u].word0);
+            let c001 = extract_opacity(brick_pool[base + l.x + l.y * 8u + (l.z + 1u) * 64u].word0);
+            let c101 = extract_opacity(brick_pool[base + l.x + 1u + l.y * 8u + (l.z + 1u) * 64u].word0);
+            let c011 = extract_opacity(brick_pool[base + l.x + (l.y + 1u) * 8u + (l.z + 1u) * 64u].word0);
+            let c111 = extract_opacity(brick_pool[base + l.x + 1u + (l.y + 1u) * 8u + (l.z + 1u) * 64u].word0);
+            let c00 = mix(c000, c100, t.x);
+            let c10 = mix(c010, c110, t.x);
+            let c01 = mix(c001, c101, t.x);
+            let c11 = mix(c011, c111, t.x);
+            let c0 = mix(c00, c10, t.y);
+            let c1 = mix(c01, c11, t.y);
+            return mix(c0, c1, t.z);
+        }
+    }
+
+    // Cross-brick fallback.
     let c000 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(0, 0, 0), dims, total_voxels);
     let c100 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(1, 0, 0), dims, total_voxels);
     let c010 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(0, 1, 0), dims, total_voxels);
@@ -327,23 +368,24 @@ fn sample_opacity_bvh(world_pos: vec3<f32>) -> f32 {
     return max_opacity;
 }
 
-/// Sample opacity and return (opacity, material_id) at a world-space position.
-/// Returns the material from the object with highest opacity.
-fn sample_opacity_with_material(world_pos: vec3<f32>) -> vec2<f32> {
+/// Sample opacity and return (opacity, material_id, object_index) at a world-space position.
+/// Returns the material and object from the object with highest opacity.
+fn sample_opacity_with_material(world_pos: vec3<f32>) -> vec3<f32> {
     let cam_rel = world_to_cam_rel(world_pos);
 
     // Coarse field early-out (camera-relative).
     let coarse_dist = sample_coarse_field(cam_rel);
     if coarse_dist > COARSE_NEAR_THRESHOLD {
-        return vec2<f32>(0.0, 0.0);
+        return vec3<f32>(0.0, 0.0, 0.0);
     }
 
     if v2_scene.num_objects == 0u {
-        return vec2<f32>(0.0, 0.0);
+        return vec3<f32>(0.0, 0.0, 0.0);
     }
 
     var max_opacity = 0.0;
     var mat_id = 0.0;
+    var obj_idx_f = 0.0;
 
     var stack: array<u32, 32>;
     var stack_ptr = 0u;
@@ -371,6 +413,7 @@ fn sample_opacity_with_material(world_pos: vec3<f32>) -> vec2<f32> {
                 if result.x > max_opacity {
                     max_opacity = result.x;
                     mat_id = result.y;
+                    obj_idx_f = f32(leaf_obj_idx);
                 }
             }
         } else {
@@ -383,19 +426,29 @@ fn sample_opacity_with_material(world_pos: vec3<f32>) -> vec2<f32> {
         }
     }
 
-    return vec2<f32>(max_opacity, mat_id);
+    return vec3<f32>(max_opacity, mat_id, obj_idx_f);
 }
 
 // ---------- Opacity Gradient Normal ----------
 
-fn opacity_gradient_normal(pos: vec3<f32>) -> vec3<f32> {
+/// Compute gradient normal using direct trilinear samples on the dominant object.
+/// Replaces 6 full BVH traversals with 6 direct trilinear reads.
+fn opacity_gradient_normal_direct(world_pos: vec3<f32>, obj_idx: u32) -> vec3<f32> {
+    let obj = objects[obj_idx];
     let eps = vol.voxel_sizes.x * 0.5;
-    let nx = sample_opacity_bvh(pos + vec3(eps, 0.0, 0.0)) - sample_opacity_bvh(pos - vec3(eps, 0.0, 0.0));
-    let ny = sample_opacity_bvh(pos + vec3(0.0, eps, 0.0)) - sample_opacity_bvh(pos - vec3(0.0, eps, 0.0));
-    let nz = sample_opacity_bvh(pos + vec3(0.0, 0.0, eps)) - sample_opacity_bvh(pos - vec3(0.0, 0.0, eps));
-    // Gradient points from low to high opacity (toward surface interior).
-    // Negate to get outward-facing normal.
-    return normalize(-vec3(nx, ny, nz));
+    let local_pos = (obj.inverse_world * vec4<f32>(world_pos, 1.0)).xyz;
+    // Transform world-space epsilon offsets to local space
+    let dx = (obj.inverse_world * vec4<f32>(eps, 0.0, 0.0, 0.0)).xyz;
+    let dy = (obj.inverse_world * vec4<f32>(0.0, eps, 0.0, 0.0)).xyz;
+    let dz = (obj.inverse_world * vec4<f32>(0.0, 0.0, eps, 0.0)).xyz;
+
+    let nx = sample_opacity_trilinear(local_pos + dx, obj) - sample_opacity_trilinear(local_pos - dx, obj);
+    let ny = sample_opacity_trilinear(local_pos + dy, obj) - sample_opacity_trilinear(local_pos - dy, obj);
+    let nz = sample_opacity_trilinear(local_pos + dz, obj) - sample_opacity_trilinear(local_pos - dz, obj);
+    let grad = vec3<f32>(nx, ny, nz);
+    let len = length(grad);
+    if len < 1e-10 { return vec3<f32>(0.0, 1.0, 0.0); }
+    return -grad / len;
 }
 
 // ---------- Transmittance Shadow ----------
@@ -447,7 +500,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         + (vec3<f32>(gid) + 0.5) * voxel_size
         - vec3<f32>(half_extent);
 
-    // Sample opacity + material in a single BVH traversal (avoids duplicate traversal).
+    // Sample opacity + material + object index in a single BVH traversal.
     let opacity_mat = sample_opacity_with_material(pos);
     let opacity = opacity_mat.x;
 
@@ -464,10 +517,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // --- Near surface (opacity in [0.01, 0.7]): compute direct lighting ---
 
-    let normal = opacity_gradient_normal(pos);
+    let hit_obj_idx = u32(opacity_mat.z);
+    let hit_obj = objects[hit_obj_idx];
 
-    // Concavity probe: sample opacity along normal to detect concave regions.
-    let probe_opacity = sample_opacity_bvh(pos + normal * voxel_size * 3.0);
+    // Gradient normal via direct trilinear on the dominant object (no BVH).
+    let normal = opacity_gradient_normal_direct(pos, hit_obj_idx);
+
+    // Concavity probe: direct trilinear on the same object (no BVH).
+    let probe_local = (hit_obj.inverse_world * vec4<f32>(pos + normal * voxel_size * 3.0, 1.0)).xyz;
+    let probe_opacity = sample_opacity_trilinear(probe_local, hit_obj);
     let concavity = 1.0 - smoothstep(0.0, 0.5, probe_opacity);
 
     // Material from the already-computed BVH result
