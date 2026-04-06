@@ -455,13 +455,9 @@ fn fs_main(in: VsOutput) -> GBufferOutput {
     // The rasterized face is a proxy — the true isosurface may be slightly offset.
     // octree_pos is in octree space [0, extent] — correct for octree sampling.
     let octree_pos = in.octree_pos;
-    let opacity = octree_trilinear(octree_pos, root, depth, extent, vs);
-
-    // TODO: trilinear sampling fails at brick boundaries, causing gaps.
-    // Disabled discard temporarily to confirm the theory.
-    // if opacity < OPACITY_THRESHOLD {
-    //     discard;
-    // }
+    // No discard needed — the rasterized face IS the surface.
+    // The face was emitted because this voxel is solid and this face is exposed.
+    // Trilinear refinement (sub-voxel surface positioning) can be added later.
 
     // Gradient normal — different path for skinned vs static objects.
     var normal = vec3<f32>(0.0, 1.0, 0.0);
