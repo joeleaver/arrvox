@@ -135,11 +135,11 @@ fn face_normal(face_id: u32) -> vec3<f32> {
 fn face_tangents(face_id: u32) -> mat2x3<f32> {
     switch face_id {
         // -X/+X: tangents are Y and Z
-        case 0u, case 1u: { return mat2x3<f32>(vec3(0.0, 1.0, 0.0), vec3(0.0, 0.0, 1.0)); }
+        case 0u, 1u: { return mat2x3<f32>(vec3(0.0, 1.0, 0.0), vec3(0.0, 0.0, 1.0)); }
         // -Y/+Y: tangents are X and Z
-        case 2u, case 3u: { return mat2x3<f32>(vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, 1.0)); }
+        case 2u, 3u: { return mat2x3<f32>(vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, 1.0)); }
         // -Z/+Z: tangents are X and Y
-        case 4u, case 5u: { return mat2x3<f32>(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0)); }
+        case 4u, 5u: { return mat2x3<f32>(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0)); }
         default: { return mat2x3<f32>(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0)); }
     }
 }
@@ -365,9 +365,9 @@ struct VsOutput {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) world_pos: vec3<f32>,
     @location(1) local_pos: vec3<f32>,
-    @location(2) @interpolation(flat) brick_slot: u32,
-    @location(3) @interpolation(flat) packed: u32,
-    @location(4) @interpolation(flat) voxel_size: f32,
+    @location(2) @interpolate(flat) brick_slot: u32,
+    @location(3) @interpolate(flat) packed: u32,
+    @location(4) @interpolate(flat) voxel_size: f32,
 }
 
 @vertex
