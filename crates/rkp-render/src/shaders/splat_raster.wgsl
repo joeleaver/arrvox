@@ -431,7 +431,7 @@ struct GBufferOutput {
     @location(0) position: vec4<f32>,   // Rgba32Float: xyz + hit_distance
     @location(1) normal: vec4<f32>,     // Rgba16Float: xyz + 0
     @location(2) material: vec4<u32>,   // Rg32Uint: packed_r, packed_g, 0, 0
-    @location(3) motion: vec4<f32>,     // Rgba32Float: motion.xy, skinned_color, 0
+    // Motion vectors omitted from MRT (32 byte/sample limit).
 }
 
 @fragment
@@ -506,32 +506,9 @@ fn fs_main(in: VsOutput) -> GBufferOutput {
     // Hit distance from camera.
     let hit_t = length(in.world_pos - camera.position.xyz);
 
-    // Motion vectors via prev_vp reprojection.
-    let prev_clip = camera.prev_vp * vec4<f32>(in.world_pos, 1.0);
-    let cur_clip = camera.view_proj * vec4<f32>(in.world_pos, 1.0);
-    var motion = vec2<f32>(0.0);
-    if prev_clip.w > 0.0 && cur_clip.w > 0.0 {
-        let prev_ndc = prev_clip.xy / prev_clip.w;
-        let cur_ndc = cur_clip.xy / cur_clip.w;
-        motion = (cur_ndc - prev_ndc) * 0.5;
-    }
-
-    // For skinned objects, sample per-voxel color at rest-pose position.
-    var skinned_color_u32 = 0u;
-    if obj.is_skinned != 0u && obj.bone_count > 0u {
-        let bone_data = raster_lookup_bone_data(local_pos, obj);
-        if bone_data.x != 0u || bone_data.y != 0u {
-            let rest_pos = raster_inverse_skin_pos(local_pos, bone_data.x, bone_data.y, obj);
-            // Sample color from rest-pose octree's companion color pool.
-            // TODO: implement octree-based rest color sampling.
-            skinned_color_u32 = 0u;
-        }
-    }
-
     return GBufferOutput(
         vec4<f32>(in.world_pos, hit_t),
         vec4<f32>(normal, 0.0),
         vec4<u32>(packed_r, packed_g, 0u, 0u),
-        vec4<f32>(motion, bitcast<f32>(skinned_color_u32), 0.0),
     );
 }

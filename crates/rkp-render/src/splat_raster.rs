@@ -103,28 +103,25 @@ impl SplatRasterPipeline {
             fragment: Some(wgpu::FragmentState {
                 module: &module,
                 entry_point: Some("fs_main"),
+                // MRT is limited to 32 bytes/sample on many GPUs.
+                // Position(16) + Normal(8) + Material(8) = 32 bytes exactly.
+                // Motion vectors are written in a post-pass or set to zero.
                 targets: &[
-                    // Target 0: position (Rgba32Float)
+                    // Target 0: position (Rgba32Float) = 16 bytes
                     Some(wgpu::ColorTargetState {
                         format: rkf_render::gbuffer::GBUFFER_POSITION_FORMAT,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
-                    // Target 1: normal (Rgba16Float)
+                    // Target 1: normal (Rgba16Float) = 8 bytes
                     Some(wgpu::ColorTargetState {
                         format: rkf_render::gbuffer::GBUFFER_NORMAL_FORMAT,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
-                    // Target 2: material (Rg32Uint)
+                    // Target 2: material (Rg32Uint) = 8 bytes
                     Some(wgpu::ColorTargetState {
                         format: rkf_render::gbuffer::GBUFFER_MATERIAL_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                    // Target 3: motion (Rgba32Float)
-                    Some(wgpu::ColorTargetState {
-                        format: rkf_render::gbuffer::GBUFFER_MOTION_FORMAT,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -205,18 +202,8 @@ impl SplatRasterPipeline {
                     },
                     depth_slice: None,
                 }),
-                // Target 3: motion
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &gbuffer.motion_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0, g: 0.0, b: 0.0, a: 0.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
+                // Motion vectors (target 3) omitted — 32 byte/sample MRT limit.
+                // Motion is zeroed via a separate clear or post-pass.
             ],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &gbuffer.depth_view,
