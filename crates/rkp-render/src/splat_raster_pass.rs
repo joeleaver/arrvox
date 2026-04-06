@@ -20,8 +20,8 @@ pub struct SplatRasterPass {
     raster: SplatRasterPipeline,
     shell: SurfaceShellGpu,
     octree: OctreeGpu,
-    /// Pending surface shell uploads (slot, occupancy) — flushed during dispatch.
-    pending_shell_uploads: Vec<(u32, [u64; 8])>,
+    /// Pending surface shell uploads (slot, occupancy) — flushed via `flush_pending`.
+    pending_shell_uploads: std::cell::RefCell<Vec<(u32, [u64; 8])>>,
 }
 
 impl SplatRasterPass {
@@ -53,7 +53,7 @@ impl SplatRasterPass {
             raster,
             shell,
             octree,
-            pending_shell_uploads: Vec::new(),
+            pending_shell_uploads: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -80,7 +80,11 @@ impl SplatRasterPass {
 
 impl rkf_render::MarchPass for SplatRasterPass {
     fn spatial_data(&self) -> &[u32] {
-        self.octree.data()
+        let data = self.octree.data();
+        if !data.is_empty() {
+            eprintln!("[SplatRasterPass] spatial_data: {} u32s", data.len());
+        }
+        data
     }
 
     fn write_spatial_fields(
@@ -111,8 +115,21 @@ impl rkf_render::MarchPass for SplatRasterPass {
         }
     }
 
+    fn prepare(&self, queue: &wgpu::Queue) {
+        // Flush pending surface shell uploads.
+        let mut pending = self.pending_shell_uploads.borrow_mut();
+        if !pending.is_empty() {
+            eprintln!("[SplatRasterPass] prepare: flushing {} shell uploads", pending.len());
+            for &(slot, ref occupancy) in pending.iter() {
+                self.shell.upload_slot(queue, slot, occupancy);
+            }
+            pending.clear();
+        }
+    }
+
     fn dispatch(&self, encoder: &mut wgpu::CommandEncoder, ctx: &rkf_render::MarchContext) {
         let object_count = ctx.scene.num_objects() as u32;
+        eprintln!("[SplatRasterPass] dispatch: object_count={}", object_count);
 
         // 1. Emit: reset indirect args (staging copy) + traverse octrees.
         self.emit.dispatch(
@@ -251,6 +268,9 @@ impl rkf_render::MarchPass for SplatRasterPass {
                 opacity_fn, &aabb, voxel_size, pool,
             )?;
 
+        eprintln!("[SplatRasterPass] voxelize_primitive: brick_count={}, octree_nodes={}, depth={}",
+            brick_count, octree.node_count(), octree.depth());
+
         // Compute surface shell for each leaf brick. Store pending uploads
         // since we don't have a queue in this context — they'll be flushed
         // when the engine next calls spatial upload.
@@ -266,11 +286,15 @@ impl rkf_render::MarchPass for SplatRasterPass {
                     }
                 }
             }
-            self.pending_shell_uploads.push((slot, geo.occupancy));
+            self.pending_shell_uploads.borrow_mut().push((slot, geo.occupancy));
         }
+
+        eprintln!("[SplatRasterPass] pending_shell_uploads: {}, leaf_count: {}",
+            self.pending_shell_uploads.borrow().len(), octree.leaf_count());
 
         // Allocate octree into the GPU allocator.
         let handle = self.octree.allocate(&octree);
+        eprintln!("[SplatRasterPass] octree allocated: root_offset={}, len={}", handle.root_offset, handle.len);
         let spatial = rkf_core::scene_node::SpatialHandle::Octree {
             root_offset: handle.root_offset,
             len: handle.len,
