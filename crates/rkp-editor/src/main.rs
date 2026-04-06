@@ -18,7 +18,9 @@ fn main() -> anyhow::Result<()> {
 
     let import_fn: rkf_editor::import_worker::ImportFn = Box::new(
         |input_path, output_path, config| {
-            rkp_render::import_mesh_to_opacity_rkf(input_path, output_path, config)
+            // Use octree-native .rkp import instead of flat .rkf.
+            let rkp_path = output_path.with_extension("rkp");
+            rkp_render::import_mesh_to_opacity_rkp(input_path, &rkp_path, config)
         },
     );
 

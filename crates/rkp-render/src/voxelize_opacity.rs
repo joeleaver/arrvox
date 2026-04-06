@@ -488,3 +488,315 @@ pub fn import_mesh_to_opacity_rkf(
         skeleton_path,
     })
 }
+
+// ── Octree-native mesh import (.rkp) ─────────────────────────────────────
+
+/// Import a mesh file and produce an octree-native .rkp file.
+///
+/// Uses the same BVH-based opacity sampling as `import_mesh_to_opacity_rkf`,
+/// but builds a sparse octree instead of a flat BrickMap. The octree provides
+/// built-in LOD (coarser leaves at shallower depths for uniform regions).
+/// No separate LOD levels — the tree IS the hierarchy.
+pub fn import_mesh_to_opacity_rkp(
+    input_path: &Path,
+    output_path: &Path,
+    config: &ImportConfig,
+) -> Result<ImportResult, String> {
+    use rkf_core::brick_geometry::BrickGeometry;
+    use rkf_core::SdfPrimitive;
+    use rkf_import::mesh::load_mesh;
+
+    eprintln!("Splat import (octree): loading {}", input_path.display());
+
+    // 1. Load and prepare mesh
+    let input_str = input_path.to_string_lossy();
+    let mut mesh = load_mesh(&input_str).map_err(|e| format!("load mesh: {e}"))?;
+    let norm = rkf_import::pipeline::prepare_mesh(&mut mesh, config);
+
+    let aabb = Aabb::new(mesh.bounds_min, mesh.bounds_max);
+    let voxel_size = config.voxel_size.unwrap_or_else(|| auto_voxel_size(&aabb));
+
+    // 2. Build BVH
+    eprintln!("Splat import (octree): building BVH ({} triangles)", mesh.triangle_count());
+    let bvh = TriangleBvh::build(&mesh);
+
+    // 3. Extract skinning data
+    let skinning = {
+        let input_str_ref = input_path.to_str().unwrap_or("");
+        match skeleton_extract::extract_skeleton(input_str_ref) {
+            Ok(Some(extraction)) => {
+                eprintln!("Skeleton found: {} bones", extraction.skeleton.bones.len());
+                Some(extraction)
+            }
+            _ => None,
+        }
+    };
+    let skinning_data = skinning.as_ref().map(|s| &s.skinning);
+
+    // 4. Octree-based voxelization
+    //
+    // Build the octree spatially, then process each leaf brick in parallel
+    // using the same process_brick function as the flat path.
+
+    let brick_world_size = voxel_size * BRICK_DIM as f32;
+    let padding = voxel_size * 4.0;
+    let padded_aabb = Aabb::new(
+        aabb.min - Vec3::splat(padding),
+        aabb.max + Vec3::splat(padding),
+    );
+
+    // Compute octree depth from AABB
+    let aabb_size = padded_aabb.max - padded_aabb.min;
+    let max_dim = aabb_size.x.max(aabb_size.y).max(aabb_size.z);
+    let bricks_needed = (max_dim / brick_world_size).ceil().max(1.0) as u32;
+    let depth = if bricks_needed <= 1 { 1 } else { (32 - (bricks_needed - 1).leading_zeros()) as u8 };
+
+    let octree_bricks = 1u32 << depth;
+    let extent = octree_bricks as f32 * brick_world_size;
+    let aabb_center = (padded_aabb.min + padded_aabb.max) * 0.5;
+    let grid_origin = aabb_center - Vec3::splat(extent * 0.5);
+
+    eprintln!(
+        "Splat import (octree): depth={}, extent={:.3}, voxel_size={}, grid bricks={}^3",
+        depth, extent, voxel_size, octree_bricks,
+    );
+
+    let fade_inner = voxel_size * 1.0;
+    let fade_outer = voxel_size * 3.0;
+    let narrow_band = brick_world_size * 1.8;
+
+    // Classify and process all potential leaf bricks in parallel.
+    // For the octree, we iterate the full grid at the finest level and classify
+    // each brick as EMPTY, INTERIOR, or SURFACE (needs allocation).
+    struct BrickWork {
+        bx: u32,
+        by: u32,
+        bz: u32,
+        brick_min: Vec3,
+    }
+
+    let mut surface_work = Vec::new();
+    let mut interior_coords = Vec::new();
+
+    for bz in 0..octree_bricks {
+        for by in 0..octree_bricks {
+            for bx in 0..octree_bricks {
+                let brick_min = grid_origin
+                    + Vec3::new(
+                        bx as f32 * brick_world_size,
+                        by as f32 * brick_world_size,
+                        bz as f32 * brick_world_size,
+                    );
+                let brick_center = brick_min + Vec3::splat(brick_world_size * 0.5);
+                let nearest = bvh.nearest(brick_center);
+
+                if nearest.distance < narrow_band {
+                    surface_work.push(BrickWork { bx, by, bz, brick_min });
+                } else {
+                    let w = bvh.winding_number(brick_center);
+                    if w > 0.5 {
+                        interior_coords.push(glam::UVec3::new(bx, by, bz));
+                    }
+                    // else: EMPTY, octree default
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "Splat import (octree): {} surface bricks, {} interior bricks, {} empty",
+        surface_work.len(),
+        interior_coords.len(),
+        (octree_bricks as u64).pow(3) - surface_work.len() as u64 - interior_coords.len() as u64,
+    );
+
+    // Process surface bricks in parallel
+    let results: Vec<(BrickWork, BrickResult)> = surface_work
+        .into_par_iter()
+        .map(|w| {
+            let result = process_brick(
+                &mesh, &bvh, w.brick_min, voxel_size, fade_inner, fade_outer,
+                config.material_id_override, config.import_colors, skinning_data,
+            );
+            (w, result)
+        })
+        .collect();
+
+    // Build octree + per-brick data arrays
+    let mut octree = rkp_core::SparseOctree::new(depth, voxel_size);
+    let mut bricks: Vec<Brick> = Vec::new();
+    let mut geometries: Vec<BrickGeometry> = Vec::new();
+    let mut color_bricks: Vec<ColorBrick> = Vec::new();
+    let mut bone_bricks: Vec<BoneBrick> = Vec::new();
+    let mut has_any_bones = false;
+    let mut brick_count = 0u32;
+
+    // Insert interior nodes
+    for coord in &interior_coords {
+        octree.insert_interior(*coord);
+    }
+
+    // Insert surface bricks
+    for (w, result) in results {
+        if !result.has_surface {
+            if result.is_fully_solid {
+                octree.insert_interior(glam::UVec3::new(w.bx, w.by, w.bz));
+            }
+            continue;
+        }
+
+        let slot = brick_count;
+        octree.insert(glam::UVec3::new(w.bx, w.by, w.bz), slot);
+        brick_count += 1;
+
+        // Build BrickGeometry from opacity data
+        let mut geo = BrickGeometry::new();
+        for vz in 0..8u8 {
+            for vy in 0..8u8 {
+                for vx in 0..8u8 {
+                    let flat = voxel_index(vx, vy, vz) as usize;
+                    if result.opacities[flat] > 0.01 {
+                        geo.set_solid(vx, vy, vz, true);
+                    }
+                }
+            }
+        }
+        geo.rebuild_surface_list();
+        for sv in &mut geo.surface_voxels {
+            sv.material_id = result.material_ids[sv.index() as usize];
+        }
+
+        // Build VoxelSample brick
+        let mut brick = Brick::default();
+        for i in 0..512 {
+            let opacity_f16 = f16::from_f32(result.opacities[i]);
+            brick.voxels[i] = VoxelSample::new(opacity_f16.to_f32(), result.material_ids[i], 0);
+        }
+
+        bricks.push(brick);
+        geometries.push(geo);
+        color_bricks.push(result.color_brick);
+
+        if let Some(bb) = result.bone_brick {
+            has_any_bones = true;
+            bone_bricks.push(bb);
+        } else {
+            bone_bricks.push(BoneBrick { data: [BoneVoxel::default(); 512] });
+        }
+    }
+
+    let has_color = color_bricks.iter().any(|cb| cb.data.iter().any(|cv| cv.intensity() > 0));
+
+    eprintln!(
+        "Splat import (octree): {} bricks, {} octree nodes",
+        brick_count, octree.node_count(),
+    );
+
+    // 5. Serialize to .rkp
+    let material_ids: Vec<u16> = if let Some(id) = config.material_id_override {
+        vec![id]
+    } else {
+        (0..mesh.materials.len().min(65536) as u16).collect()
+    };
+
+    // Serialize brick data as raw bytes (512 VoxelSamples per brick = 4096 bytes)
+    let brick_data: Vec<u8> = bricks
+        .iter()
+        .flat_map(|b| bytemuck::cast_slice::<VoxelSample, u8>(&b.voxels))
+        .copied()
+        .collect();
+
+    // Serialize geometry data (occupancy per brick)
+    let geometry_data: Vec<u8> = geometries
+        .iter()
+        .flat_map(|g| bytemuck::cast_slice::<u64, u8>(&g.occupancy))
+        .copied()
+        .collect();
+
+    // Serialize color data
+    let color_data: Option<Vec<u8>> = if has_color {
+        Some(
+            color_bricks
+                .iter()
+                .flat_map(|cb| bytemuck::cast_slice::<ColorVoxel, u8>(&cb.data))
+                .copied()
+                .collect(),
+        )
+    } else {
+        None
+    };
+
+    // Serialize bone data
+    let bone_data: Option<Vec<u8>> = if has_any_bones {
+        Some(
+            bone_bricks
+                .iter()
+                .flat_map(|bb| bytemuck::cast_slice::<BoneVoxel, u8>(&bb.data))
+                .copied()
+                .collect(),
+        )
+    } else {
+        None
+    };
+
+    let file = std::fs::File::create(output_path)
+        .map_err(|e| format!("create output: {e}"))?;
+    let mut writer = std::io::BufWriter::new(file);
+
+    rkp_core::asset_file::write_rkp(
+        &mut writer,
+        octree.as_slice(),
+        depth,
+        voxel_size,
+        brick_count,
+        aabb.min.to_array(),
+        aabb.max.to_array(),
+        &material_ids,
+        &brick_data,
+        &geometry_data,
+        color_data.as_deref(),
+        bone_data.as_deref(),
+    )
+    .map_err(|e| format!("write .rkp: {e}"))?;
+
+    let file_size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+
+    // 6. Save skeleton sidecar
+    let skeleton_path = if let Some(ref extraction) = skinning {
+        let skel_path = output_path.with_extension("rkskel");
+        let asset = rkf_animation::skeleton_asset::SkeletonAsset::with_normalization(
+            extraction.skeleton.clone(),
+            extraction.clips.clone(),
+            norm.center.to_array(),
+            norm.scale,
+            norm.rotation_offset,
+            norm.rotation_center.to_array(),
+        );
+        match rkf_animation::skeleton_asset::save_rkskel(&asset, &skel_path) {
+            Ok(()) => {
+                eprintln!("Saved skeleton: {} bones → {}", extraction.skeleton.bones.len(), skel_path.display());
+                Some(skel_path)
+            }
+            Err(e) => {
+                eprintln!("Failed to save .rkskel: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    eprintln!(
+        "Splat import (octree): wrote {} ({} bricks, {:.1} KiB)",
+        output_path.display(), brick_count, file_size as f64 / 1024.0,
+    );
+
+    Ok(ImportResult {
+        aabb,
+        total_bricks: brick_count,
+        lod_count: 1, // Octree is the LOD hierarchy, no separate levels.
+        finest_voxel_size: voxel_size,
+        file_size,
+        skeleton_path,
+    })
+}

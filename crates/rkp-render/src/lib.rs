@@ -27,6 +27,7 @@ pub use splat_march::SplatMarchPass;
 pub use splat_raster_pass::SplatRasterPass;
 pub use opacity_volume::{OpacityVolume, OpacityVolumeManager};
 pub use voxelize_opacity::import_mesh_to_opacity_rkf;
+pub use voxelize_opacity::import_mesh_to_opacity_rkp;
 pub use octree_gpu::OctreeGpu;
 pub use surface_shell_gpu::SurfaceShellGpu;
 pub use splat_emit::SplatEmitPass;
