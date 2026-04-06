@@ -133,13 +133,15 @@ fn face_normal(face_id: u32) -> vec3<f32> {
 
 // Get two tangent axes for a face (perpendicular to the face normal).
 fn face_tangents(face_id: u32) -> mat2x3<f32> {
+    // Tangent order is swapped for negative-direction faces (0, 2, 4)
+    // to flip triangle winding so the geometric normal matches the face direction.
     switch face_id {
-        // -X/+X: tangents are Y and Z
-        case 0u, 1u: { return mat2x3<f32>(vec3(0.0, 1.0, 0.0), vec3(0.0, 0.0, 1.0)); }
-        // -Y/+Y: tangents are X and Z
-        case 2u, 3u: { return mat2x3<f32>(vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, 1.0)); }
-        // -Z/+Z: tangents are X and Y
-        case 4u, 5u: { return mat2x3<f32>(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0)); }
+        case 0u: { return mat2x3<f32>(vec3(0.0, 0.0, 1.0), vec3(0.0, 1.0, 0.0)); } // -X: swapped
+        case 1u: { return mat2x3<f32>(vec3(0.0, 1.0, 0.0), vec3(0.0, 0.0, 1.0)); } // +X
+        case 2u: { return mat2x3<f32>(vec3(0.0, 0.0, 1.0), vec3(1.0, 0.0, 0.0)); } // -Y: swapped
+        case 3u: { return mat2x3<f32>(vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, 1.0)); } // +Y
+        case 4u: { return mat2x3<f32>(vec3(0.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0)); } // -Z: swapped
+        case 5u: { return mat2x3<f32>(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0)); } // +Z
         default: { return mat2x3<f32>(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0)); }
     }
 }
@@ -455,9 +457,11 @@ fn fs_main(in: VsOutput) -> GBufferOutput {
     let octree_pos = in.octree_pos;
     let opacity = octree_trilinear(octree_pos, root, depth, extent, vs);
 
-    if opacity < OPACITY_THRESHOLD {
-        discard;
-    }
+    // TODO: trilinear sampling fails at brick boundaries, causing gaps.
+    // Disabled discard temporarily to confirm the theory.
+    // if opacity < OPACITY_THRESHOLD {
+    //     discard;
+    // }
 
     // Gradient normal — different path for skinned vs static objects.
     var normal = vec3<f32>(0.0, 1.0, 0.0);
