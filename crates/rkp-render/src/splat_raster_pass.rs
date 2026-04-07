@@ -259,6 +259,7 @@ impl rkf_render::MarchPass for SplatRasterPass {
         &mut self,
         path: &str,
         pool: &mut rkf_core::brick_pool::BrickPool,
+        _object_id: Option<u32>,
     ) -> Result<
         Option<(
             rkf_core::scene_node::SpatialHandle,
@@ -431,9 +432,26 @@ impl rkf_render::MarchPass for SplatRasterPass {
             }
         }
 
+        {
+            let faces = self.pending_faces.borrow();
+            let face_count = faces.len();
+            if face_count > 0 {
+                let mut min_pos = glam::Vec3::splat(f32::MAX);
+                let mut max_pos = glam::Vec3::splat(f32::MIN);
+                for f in faces.iter() {
+                    min_pos = min_pos.min(glam::Vec3::new(f.pos_x, f.pos_y, f.pos_z));
+                    max_pos = max_pos.max(glam::Vec3::new(f.pos_x, f.pos_y, f.pos_z));
+                }
+                eprintln!(
+                    "[SplatRasterPass] loaded .rkp: {} bricks, {} faces, octree_pos range [{:.3},{:.3},{:.3}]→[{:.3},{:.3},{:.3}]",
+                    brick_count, face_count, min_pos.x, min_pos.y, min_pos.z, max_pos.x, max_pos.y, max_pos.z,
+                );
+            }
+        }
         eprintln!(
-            "[SplatRasterPass] loaded .rkp: {} bricks, {} octree nodes, {} colors, {} bones",
-            brick_count, remapped_nodes.len(), color_pairs.len(), bone_pairs.len()
+            "[SplatRasterPass] loaded .rkp: {} octree nodes, {} colors, {} bones, extent={}",
+            remapped_nodes.len(), color_pairs.len(), bone_pairs.len(),
+            (1u32 << octree_depth) as f32 * 8.0 * base_vs,
         );
 
         Ok(Some((spatial, voxel_size, aabb, brick_count, color_pairs, bone_pairs)))
