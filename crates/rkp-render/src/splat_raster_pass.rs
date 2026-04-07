@@ -87,6 +87,149 @@ impl SplatRasterPass {
     }
 }
 
+impl SplatRasterPass {
+    /// Emit face instances from raw octree data (for file loading).
+    ///
+    /// Traverses the octree nodes, and for each leaf, reads occupancy from
+    /// the brick pool and emits exposed face instances.
+    fn emit_faces_from_octree_data(
+        &self,
+        nodes: &[u32],
+        depth: u8,
+        extent: f32,
+        base_vs: f32,
+        pool: &rkf_core::brick_pool::BrickPool,
+        obj_idx: u32,
+    ) {
+        let mut faces = self.pending_faces.borrow_mut();
+
+        // Stack-based traversal (mirrors the GPU emit but on CPU).
+        struct Entry {
+            node_idx: usize,
+            center: glam::Vec3,
+            half_extent: f32,
+            level: u8,
+        }
+
+        let half = extent * 0.5;
+        let mut stack = vec![Entry {
+            node_idx: 0,
+            center: glam::Vec3::splat(half),
+            half_extent: half,
+            level: 0,
+        }];
+
+        while let Some(entry) = stack.pop() {
+            if entry.node_idx >= nodes.len() {
+                continue;
+            }
+            let node = nodes[entry.node_idx];
+
+            if node == rkp_core::sparse_octree::EMPTY_NODE
+                || node == rkp_core::sparse_octree::INTERIOR_NODE
+            {
+                continue;
+            }
+
+            if rkp_core::sparse_octree::is_leaf(node) {
+                let slot = rkp_core::sparse_octree::leaf_slot(node);
+                let depth_diff = depth - entry.level;
+                let leaf_vs = base_vs * (1u32 << depth_diff) as f32;
+
+                let brick_origin = glam::Vec3::new(
+                    entry.center.x - entry.half_extent,
+                    entry.center.y - entry.half_extent,
+                    entry.center.z - entry.half_extent,
+                );
+
+                // Build occupancy from brick pool data
+                let brick = pool.get(slot);
+                let mut geo = rkf_core::BrickGeometry::new();
+                for vz in 0..8u8 {
+                    for vy in 0..8u8 {
+                        for vx in 0..8u8 {
+                            let sample = brick.sample(vx as u32, vy as u32, vz as u32);
+                            let sv = rkp_core::SplatVoxel::from(sample);
+                            geo.set_solid(vx, vy, vz, sv.opacity_f32() > 0.5);
+                        }
+                    }
+                }
+
+                // Emit faces
+                for vz in 0..8u32 {
+                    for vy in 0..8u32 {
+                        for vx in 0..8u32 {
+                            if !geo.is_solid(vx as u8, vy as u8, vz as u8) {
+                                continue;
+                            }
+                            let voxel_idx = vx + vy * 8 + vz * 64;
+                            let center = brick_origin
+                                + (glam::Vec3::new(vx as f32, vy as f32, vz as f32) + 0.5)
+                                    * leaf_vs;
+
+                            for face in 0..6u32 {
+                                let (nx, ny, nz) = match face {
+                                    0 => (-1i32, 0, 0),
+                                    1 => (1, 0, 0),
+                                    2 => (0, -1, 0),
+                                    3 => (0, 1, 0),
+                                    4 => (0, 0, -1),
+                                    5 => (0, 0, 1),
+                                    _ => unreachable!(),
+                                };
+                                let nbx = vx as i32 + nx;
+                                let nby = vy as i32 + ny;
+                                let nbz = vz as i32 + nz;
+
+                                let exposed = if nbx < 0 || nbx >= 8 || nby < 0 || nby >= 8 || nbz < 0 || nbz >= 8 {
+                                    true
+                                } else {
+                                    !geo.is_solid(nbx as u8, nby as u8, nbz as u8)
+                                };
+
+                                if exposed {
+                                    faces.push(crate::splat_emit::FaceInstance {
+                                        pos_x: center.x,
+                                        pos_y: center.y,
+                                        pos_z: center.z,
+                                        voxel_size: leaf_vs,
+                                        brick_slot: slot,
+                                        packed: (voxel_idx & 0x1FF)
+                                            | ((face & 0x7) << 9)
+                                            | ((obj_idx & 0xFFFF) << 12),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if rkp_core::sparse_octree::is_branch(node) {
+                let children_offset = node as usize;
+                let child_half = entry.half_extent * 0.5;
+                for octant in 0..8u32 {
+                    let dx = (octant & 1) as f32;
+                    let dy = ((octant >> 1) & 1) as f32;
+                    let dz = ((octant >> 2) & 1) as f32;
+                    let child_center = glam::Vec3::new(
+                        entry.center.x + (dx * 2.0 - 1.0) * child_half,
+                        entry.center.y + (dy * 2.0 - 1.0) * child_half,
+                        entry.center.z + (dz * 2.0 - 1.0) * child_half,
+                    );
+                    stack.push(Entry {
+                        node_idx: children_offset + octant as usize,
+                        center: child_center,
+                        half_extent: child_half,
+                        level: entry.level + 1,
+                    });
+                }
+            }
+        }
+    }
+}
+
 impl rkf_render::MarchPass for SplatRasterPass {
     fn spatial_data(&self) -> &[u32] {
         let data = self.octree.data();
@@ -109,6 +252,191 @@ impl rkf_render::MarchPass for SplatRasterPass {
             gpu_obj.brick_map_offset = *root_offset;
             gpu_obj.brick_map_dims = [*depth as u32, extent.to_bits(), 0];
         }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn load_asset(
+        &mut self,
+        path: &str,
+        pool: &mut rkf_core::brick_pool::BrickPool,
+    ) -> Result<
+        Option<(
+            rkf_core::scene_node::SpatialHandle,
+            f32,
+            rkf_core::Aabb,
+            u32,
+            Vec<(u32, rkf_core::companion::ColorBrick)>,
+            Vec<(u32, rkf_core::companion::BoneBrick)>,
+        )>,
+        String,
+    > {
+        use rkf_core::companion::{BoneBrick, BoneVoxel, ColorBrick, ColorVoxel};
+        use rkf_core::voxel::VoxelSample;
+
+        // Check for .rkp extension
+        if !path.ends_with(".rkp") {
+            return Ok(None); // Not our format — fall back to default loading
+        }
+
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| format!("open {path}: {e}"))?;
+        let mut reader = std::io::BufReader::new(&mut file);
+
+        let header = rkp_core::asset_file::read_rkp_header(&mut reader)
+            .map_err(|e| format!("read .rkp header: {e}"))?;
+
+        let octree_nodes = rkp_core::asset_file::read_rkp_octree(&mut reader, &header)
+            .map_err(|e| format!("read octree: {e}"))?;
+
+        let brick_data = rkp_core::asset_file::read_rkp_bricks(&mut reader, &header)
+            .map_err(|e| format!("read bricks: {e}"))?;
+
+        let geometry_data = rkp_core::asset_file::read_rkp_geometry(&mut reader, &header)
+            .map_err(|e| format!("read geometry: {e}"))?;
+
+        let voxel_size = header.base_voxel_size;
+        let brick_count = header.brick_count;
+        let aabb = rkf_core::Aabb::new(
+            glam::Vec3::from(header.aabb_min),
+            glam::Vec3::from(header.aabb_max),
+        );
+
+        // Allocate bricks in pool
+        if pool.free_count() < brick_count {
+            let new_cap = (pool.capacity() * 2).max(pool.capacity() + brick_count);
+            pool.grow(new_cap);
+        }
+        let slots = pool.allocate_range(brick_count)
+            .ok_or_else(|| "failed to allocate brick pool slots".to_string())?;
+
+        // Copy brick voxel data into pool
+        let voxels_per_brick = 512usize;
+        let bytes_per_voxel = std::mem::size_of::<VoxelSample>();
+        let bytes_per_brick = voxels_per_brick * bytes_per_voxel;
+
+        for (i, &slot) in slots.iter().enumerate() {
+            let src_offset = i * bytes_per_brick;
+            if src_offset + bytes_per_brick > brick_data.len() {
+                break;
+            }
+            let src_voxels: &[VoxelSample] =
+                bytemuck::cast_slice(&brick_data[src_offset..src_offset + bytes_per_brick]);
+            let brick = pool.get_mut(slot);
+            brick.voxels.copy_from_slice(src_voxels);
+        }
+
+        // Build SparseOctree from the raw nodes, remapping leaf slots to the
+        // newly allocated pool slots.
+        let mut remapped_nodes = octree_nodes.clone();
+        for node in &mut remapped_nodes {
+            if *node != rkp_core::sparse_octree::EMPTY_NODE
+                && *node != rkp_core::sparse_octree::INTERIOR_NODE
+                && (*node & rkp_core::sparse_octree::LEAF_BIT) != 0
+            {
+                let old_slot = *node & !rkp_core::sparse_octree::LEAF_BIT;
+                if (old_slot as usize) < slots.len() {
+                    *node = rkp_core::sparse_octree::make_leaf(slots[old_slot as usize]);
+                }
+            }
+        }
+
+        // Allocate the octree into our OctreeAllocator
+        // (We need to create a SparseOctree from the remapped nodes)
+        let mut octree = rkp_core::SparseOctree::new(header.octree_depth as u8, voxel_size);
+        // Replace the octree's internal nodes with our remapped data.
+        // Since SparseOctree::nodes is private, we rebuild via from_raw.
+        // For now, allocate directly into the allocator from raw data.
+        let handle = self.octree.allocate_raw(&remapped_nodes, header.octree_depth as u8, voxel_size);
+
+        // Build surface shell + face instances for each brick
+        let occupancy_stride = 8usize; // 8 u64s per brick = 64 bytes
+        let base_vs = voxel_size;
+        let octree_depth = header.octree_depth as u8;
+        let octree_extent = (1u32 << octree_depth) as f32 * 8.0 * base_vs;
+
+        {
+            let mut shells = self.pending_shell_uploads.borrow_mut();
+            let mut faces = self.pending_faces.borrow_mut();
+
+            for (i, &slot) in slots.iter().enumerate() {
+                // Read occupancy from geometry data
+                let geo_offset = i * occupancy_stride * 8; // 8 u64s * 8 bytes each = 64 bytes
+                let mut occupancy = [0u64; 8];
+                if geo_offset + 64 <= geometry_data.len() {
+                    let occ_bytes = &geometry_data[geo_offset..geo_offset + 64];
+                    occupancy.copy_from_slice(bytemuck::cast_slice(occ_bytes));
+                }
+
+                shells.push((slot, occupancy));
+                self.shell.ensure_capacity(&self.device, slot + 1);
+
+                // Build face instances (same logic as voxelize_primitive)
+                // We need the brick's position in octree space, but for file-loaded
+                // assets we'd need to reconstruct it from the octree. For now, iterate
+                // the octree leaves to find this slot's position.
+                // TODO: store leaf positions alongside brick data for faster loading.
+            }
+        }
+
+        // To emit faces, we need each brick's octree-space position. Iterate the
+        // octree to find leaf positions. Build a slot→position map.
+        // For now, use a simpler approach: reconstruct from the allocator's data.
+        // Actually, we need to iterate the raw octree to find leaf positions.
+        self.emit_faces_from_octree_data(
+            &remapped_nodes,
+            octree_depth,
+            octree_extent,
+            base_vs,
+            pool,
+            0, // obj_idx
+        );
+
+        self.faces_dirty.set(true);
+
+        let spatial = rkf_core::scene_node::SpatialHandle::Octree {
+            root_offset: handle.root_offset,
+            len: handle.len,
+            depth: handle.depth,
+            base_voxel_size: handle.base_voxel_size,
+        };
+
+        // Parse color bricks
+        let mut color_pairs = Vec::new();
+        if header.flags & rkp_core::asset_file::FLAG_HAS_COLOR != 0 {
+            // Read color section
+            let color_bytes = rkp_core::asset_file::read_rkp_color(&mut reader, &header)
+                .unwrap_or_default();
+            let cb_size = std::mem::size_of::<ColorBrick>();
+            for (i, &slot) in slots.iter().enumerate() {
+                let offset = i * cb_size;
+                if offset + cb_size <= color_bytes.len() {
+                    let cb: ColorBrick = *bytemuck::from_bytes(&color_bytes[offset..offset + cb_size]);
+                    color_pairs.push((slot, cb));
+                }
+            }
+        }
+
+        // Parse bone bricks
+        let mut bone_pairs = Vec::new();
+        if header.flags & rkp_core::asset_file::FLAG_HAS_BONES != 0 {
+            let bone_bytes = rkp_core::asset_file::read_rkp_bones(&mut reader, &header)
+                .unwrap_or_default();
+            let bb_size = std::mem::size_of::<BoneBrick>();
+            for (i, &slot) in slots.iter().enumerate() {
+                let offset = i * bb_size;
+                if offset + bb_size <= bone_bytes.len() {
+                    let bb: BoneBrick = *bytemuck::from_bytes(&bone_bytes[offset..offset + bb_size]);
+                    bone_pairs.push((slot, bb));
+                }
+            }
+        }
+
+        eprintln!(
+            "[SplatRasterPass] loaded .rkp: {} bricks, {} octree nodes, {} colors, {} bones",
+            brick_count, remapped_nodes.len(), color_pairs.len(), bone_pairs.len()
+        );
+
+        Ok(Some((spatial, voxel_size, aabb, brick_count, color_pairs, bone_pairs)))
     }
 
     fn deallocate_spatial(&mut self, handle: &rkf_core::scene_node::SpatialHandle) {

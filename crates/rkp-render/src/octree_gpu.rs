@@ -49,6 +49,15 @@ impl OctreeGpu {
         self.allocator.deallocate(handle);
     }
 
+    /// Allocate raw octree nodes directly (for file loading).
+    ///
+    /// The nodes must already have correct branch offsets (0-based within the
+    /// node array). The allocator rebases them to absolute offsets.
+    pub fn allocate_raw(&mut self, nodes: &[u32], depth: u8, base_voxel_size: f32) -> OctreeHandle {
+        let octree = rkp_core::SparseOctree::from_raw(nodes, depth, base_voxel_size);
+        self.allocator.allocate(&octree)
+    }
+
     /// Raw data slice for GPU upload via `GpuScene::upload_brick_maps()`.
     pub fn data(&self) -> &[u32] {
         self.allocator.as_slice()

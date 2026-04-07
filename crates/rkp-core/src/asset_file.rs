@@ -214,6 +214,34 @@ pub fn read_rkp_geometry<R: Read>(
         .map_err(|e| RkpFileError::Decompress(e.to_string()))
 }
 
+/// Read and decompress the color data section (if present).
+pub fn read_rkp_color<R: Read>(
+    reader: &mut R,
+    header: &RkpHeader,
+) -> Result<Vec<u8>, RkpFileError> {
+    if header.color_compressed_size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut compressed = vec![0u8; header.color_compressed_size as usize];
+    reader.read_exact(&mut compressed)?;
+    lz4_flex::decompress_size_prepended(&compressed)
+        .map_err(|e| RkpFileError::Decompress(e.to_string()))
+}
+
+/// Read and decompress the bone data section (if present).
+pub fn read_rkp_bones<R: Read>(
+    reader: &mut R,
+    header: &RkpHeader,
+) -> Result<Vec<u8>, RkpFileError> {
+    if header.bone_compressed_size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut compressed = vec![0u8; header.bone_compressed_size as usize];
+    reader.read_exact(&mut compressed)?;
+    lz4_flex::decompress_size_prepended(&compressed)
+        .map_err(|e| RkpFileError::Decompress(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

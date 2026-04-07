@@ -104,6 +104,18 @@ impl SparseOctree {
         }
     }
 
+    /// Create from raw node data (for file loading).
+    ///
+    /// The nodes must have valid internal structure (branch offsets are 0-based
+    /// within the node array).
+    pub fn from_raw(nodes: &[u32], depth: u8, base_voxel_size: f32) -> Self {
+        Self {
+            nodes: nodes.to_vec(),
+            depth,
+            base_voxel_size,
+        }
+    }
+
     /// Tree depth (0 = single root node).
     #[inline]
     pub fn depth(&self) -> u8 {
