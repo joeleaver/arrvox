@@ -463,31 +463,17 @@ fn fs_main(in: VsOutput) -> GBufferOutput {
     //     vec4<u32>(0u, 0u, 0u, 0u),
     // );
 
-    // Gradient normal — different path for skinned vs static objects.
-    var normal = vec3<f32>(0.0, 1.0, 0.0);
+    // Gradient normal with flat face normal fallback.
+    // At brick boundaries, octree_trilinear returns 0 for out-of-brick samples,
+    // producing a wrong gradient. Fall back to the flat face normal when the
+    // gradient is too weak (indicating incomplete samples).
+    let face_id = unpack_face_id(in.packed);
+    let flat_fn = face_normal(face_id);
+    let world_face_normal = normalize(transform_dir_to_world(flat_fn, obj.inverse_world));
 
-    if obj.is_skinned != 0u && obj.bone_count > 0u {
-        // Skinned: inverse-skin to rest-pose, compute gradient there, forward-skin back.
-        let bone_data = raster_lookup_bone_data(octree_pos, obj);
-        if bone_data.x != 0u || bone_data.y != 0u {
-            let rest_pos = raster_inverse_skin_pos(octree_pos, bone_data.x, bone_data.y, obj);
-            let eps = vs * 2.0;
-            let gx = raster_sample_rest_opacity(rest_pos + vec3(eps, 0.0, 0.0), obj)
-                   - raster_sample_rest_opacity(rest_pos - vec3(eps, 0.0, 0.0), obj);
-            let gy = raster_sample_rest_opacity(rest_pos + vec3(0.0, eps, 0.0), obj)
-                   - raster_sample_rest_opacity(rest_pos - vec3(0.0, eps, 0.0), obj);
-            let gz = raster_sample_rest_opacity(rest_pos + vec3(0.0, 0.0, eps), obj)
-                   - raster_sample_rest_opacity(rest_pos - vec3(0.0, 0.0, eps), obj);
-            let rest_grad = -vec3<f32>(gx, gy, gz);
-            let posed_grad = raster_forward_skin_dir(rest_grad, bone_data.x, bone_data.y, obj);
-            let world_grad = transform_dir_to_world(posed_grad, obj.inverse_world);
-            let grad_len = length(world_grad);
-            if grad_len > 1e-8 {
-                normal = world_grad / grad_len;
-            }
-        }
-    } else {
-        // Static: gradient in octree space, transform to world.
+    var normal = world_face_normal;
+
+    if obj.is_skinned == 0u || obj.bone_count == 0u {
         let eps = vs * 2.0;
         let gx = octree_trilinear(octree_pos + vec3(eps, 0.0, 0.0), root, depth, extent, vs)
                - octree_trilinear(octree_pos - vec3(eps, 0.0, 0.0), root, depth, extent, vs);
@@ -496,10 +482,12 @@ fn fs_main(in: VsOutput) -> GBufferOutput {
         let gz = octree_trilinear(octree_pos + vec3(0.0, 0.0, eps), root, depth, extent, vs)
                - octree_trilinear(octree_pos - vec3(0.0, 0.0, eps), root, depth, extent, vs);
         let local_grad = -vec3<f32>(gx, gy, gz);
-        let world_grad = transform_dir_to_world(local_grad, obj.inverse_world);
-        let grad_len = length(world_grad);
-        if grad_len > 1e-8 {
-            normal = world_grad / grad_len;
+        let grad_len = length(local_grad);
+        // Only use gradient normal if it's strong enough — weak gradient means
+        // we sampled outside the data (brick boundary or edge of object).
+        if grad_len > 0.1 {
+            let world_grad = transform_dir_to_world(local_grad, obj.inverse_world);
+            normal = normalize(world_grad);
         }
     }
 
