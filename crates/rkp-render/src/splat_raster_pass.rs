@@ -154,7 +154,7 @@ impl SplatRasterPass {
                         for vx in 0..8u8 {
                             let sample = brick.sample(vx as u32, vy as u32, vz as u32);
                             let sv = rkp_core::SplatVoxel::from(sample);
-                            geo.set_solid(vx, vy, vz, sv.opacity_f32() > 0.5);
+                            geo.set_solid(vx, vy, vz, sv.opacity_f32() > 0.01);
                         }
                     }
                 }
@@ -809,7 +809,7 @@ impl rkf_render::MarchPass for SplatRasterPass {
                         for vx in 0..8u8 {
                             let sample = brick.sample(vx as u32, vy as u32, vz as u32);
                             let sv = rkp_core::SplatVoxel::from(sample);
-                            geo.set_solid(vx, vy, vz, sv.opacity_f32() > 0.5);
+                            geo.set_solid(vx, vy, vz, sv.opacity_f32() > 0.01);
                         }
                     }
                 }
