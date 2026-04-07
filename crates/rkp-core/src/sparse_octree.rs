@@ -1,9 +1,12 @@
-//! Sparse octree spatial structure for organizing bricks.
+//! Sparse octree spatial structure for organizing voxels.
 //!
 //! Replaces rkf-core's flat [`BrickMap`](rkf_core::brick_map::BrickMap) with a
 //! compact tree where uniform regions (all-empty or all-solid) collapse to single
 //! nodes. Variable-depth leaves provide built-in LOD — coarser leaves at shallower
-//! depths represent larger spatial extents with the same 8³ brick.
+//! depths represent larger spatial extents.
+//!
+//! Each leaf is an individual voxel (no bricks). Octree traversal lands directly
+//! on a voxel pool slot — no within-brick indexing, no brick boundaries.
 //!
 //! # Node encoding
 //!
@@ -14,7 +17,7 @@
 //! | `0xFFFF_FFFF` | **EMPTY** — entire subtree is empty air |
 //! | `0xFFFF_FFFE` | **INTERIOR** — entire subtree is fully opaque |
 //! | Bit 31 clear | **BRANCH** — value is offset to 8 contiguous child nodes |
-//! | Bit 31 set, < `0xFFFF_FFFE` | **LEAF** — `value & 0x7FFF_FFFF` is brick pool slot |
+//! | Bit 31 set, < `0xFFFF_FFFE` | **LEAF** — `value & 0x7FFF_FFFF` is voxel pool slot |
 //!
 //! Branch nodes always store 8 contiguous children (no child mask). This trades
 //! ~7× overhead for sparse branches in exchange for simple GPU traversal —
@@ -29,11 +32,11 @@ pub const EMPTY_NODE: u32 = 0xFFFF_FFFF;
 /// Sentinel: entire subtree is fully opaque interior.
 pub const INTERIOR_NODE: u32 = 0xFFFF_FFFE;
 
-/// Bit flag indicating a leaf node (brick pool slot in lower 31 bits).
+/// Bit flag indicating a leaf node (voxel pool slot in lower 31 bits).
 pub const LEAF_BIT: u32 = 0x8000_0000;
 
-/// Maximum supported octree depth (2^8 = 256 bricks per axis).
-pub const MAX_DEPTH: u8 = 8;
+/// Maximum supported octree depth (2^11 = 2048 voxels per axis).
+pub const MAX_DEPTH: u8 = 11;
 
 /// Returns `true` if the node value represents a leaf (has `LEAF_BIT` set and is
 /// not one of the sentinel values).
@@ -48,21 +51,21 @@ pub fn is_branch(node: u32) -> bool {
     (node & LEAF_BIT) == 0 && node != EMPTY_NODE && node != INTERIOR_NODE
 }
 
-/// Extract the brick pool slot from a leaf node.
+/// Extract the voxel pool slot from a leaf node.
 #[inline]
 pub fn leaf_slot(node: u32) -> u32 {
     debug_assert!(is_leaf(node));
     node & !LEAF_BIT
 }
 
-/// Encode a brick pool slot as a leaf node.
+/// Encode a voxel pool slot as a leaf node.
 #[inline]
 pub fn make_leaf(slot: u32) -> u32 {
-    debug_assert!(slot < LEAF_BIT, "brick pool slot too large for leaf encoding");
+    debug_assert!(slot < LEAF_BIT, "voxel pool slot too large for leaf encoding");
     slot | LEAF_BIT
 }
 
-/// Compute the octant index (0–7) for a brick coordinate at a given level.
+/// Compute the octant index (0–7) for a voxel coordinate at a given level.
 ///
 /// At each level, the coordinate space is halved. The octant is determined by
 /// which half the coordinate falls in along each axis.
@@ -76,15 +79,15 @@ fn octant_for_coord(coord: UVec3, level: u8, depth: u8) -> u32 {
     x + y * 2 + z * 4
 }
 
-/// A sparse octree organizing brick pool slots in 3D space.
+/// A sparse octree organizing voxel pool slots in 3D space.
 ///
-/// The tree covers a cube of `2^depth` bricks per axis. Each leaf holds a brick
+/// The tree covers a cube of `2^depth` voxels per axis. Each leaf holds a voxel
 /// pool slot. Uniform regions collapse to [`EMPTY_NODE`] or [`INTERIOR_NODE`].
 #[derive(Debug, Clone)]
 pub struct SparseOctree {
     /// Packed node buffer. The root is at index 0.
     nodes: Vec<u32>,
-    /// Maximum depth (0 = single root node, 6 = 64³ bricks per axis).
+    /// Maximum depth (0 = single root node, 8 = 256³ voxels per axis).
     depth: u8,
     /// Voxel size at the finest (deepest) level.
     base_voxel_size: f32,
@@ -93,7 +96,7 @@ pub struct SparseOctree {
 impl SparseOctree {
     /// Create a new octree with the given depth, initially all EMPTY.
     ///
-    /// `depth`: tree depth. The octree covers `2^depth` bricks per axis.
+    /// `depth`: tree depth. The octree covers `2^depth` voxels per axis.
     /// `base_voxel_size`: voxel size at the finest level.
     pub fn new(depth: u8, base_voxel_size: f32) -> Self {
         assert!(depth <= MAX_DEPTH, "depth {depth} exceeds MAX_DEPTH {MAX_DEPTH}");
@@ -128,16 +131,16 @@ impl SparseOctree {
         self.base_voxel_size
     }
 
-    /// Number of bricks per axis at the finest level.
+    /// Number of voxels per axis at the finest level.
     #[inline]
-    pub fn extent_bricks(&self) -> u32 {
+    pub fn extent(&self) -> u32 {
         1u32 << self.depth
     }
 
     /// World-space extent of the root node (one axis).
     #[inline]
     pub fn extent_world(&self) -> f32 {
-        self.extent_bricks() as f32 * 8.0 * self.base_voxel_size
+        self.extent() as f32 * self.base_voxel_size
     }
 
     /// Total number of nodes in the packed buffer.
@@ -152,14 +155,14 @@ impl SparseOctree {
         &self.nodes
     }
 
-    /// Check if a brick coordinate is in bounds for this tree.
+    /// Check if a voxel coordinate is in bounds for this tree.
     #[inline]
     fn in_bounds(&self, coord: UVec3) -> bool {
-        let ext = self.extent_bricks();
+        let ext = self.extent();
         coord.x < ext && coord.y < ext && coord.z < ext
     }
 
-    /// Insert a leaf (brick pool slot) at the given brick coordinate.
+    /// Insert a leaf (voxel pool slot) at the given voxel coordinate.
     ///
     /// Subdivides branch nodes as needed to reach the finest level.
     /// Panics if `coord` is out of bounds.
@@ -168,7 +171,7 @@ impl SparseOctree {
         self.insert_at(0, coord, 0, make_leaf(slot));
     }
 
-    /// Mark the brick coordinate as INTERIOR (fully opaque, no brick needed).
+    /// Mark the voxel coordinate as INTERIOR (fully opaque, no voxel needed).
     ///
     /// Panics if `coord` is out of bounds.
     pub fn insert_interior(&mut self, coord: UVec3) {
@@ -286,7 +289,7 @@ impl SparseOctree {
         // reclaim them, but for typical usage the waste is small.
     }
 
-    /// Look up the node value at a brick coordinate.
+    /// Look up the node value at a voxel coordinate.
     ///
     /// Returns the leaf (with `LEAF_BIT` set), `EMPTY_NODE`, or `INTERIOR_NODE`.
     /// Returns `None` if `coord` is out of bounds.
@@ -331,11 +334,11 @@ impl SparseOctree {
         Some((self.nodes[idx], self.depth))
     }
 
-    /// Iterate all leaf nodes, yielding `(brick_coord, brick_slot, leaf_depth)`.
+    /// Iterate all leaf nodes, yielding `(voxel_coord, voxel_slot, leaf_depth)`.
     ///
-    /// `brick_coord` is the lower-corner coordinate of the leaf's spatial extent.
+    /// `voxel_coord` is the lower-corner coordinate of the leaf's spatial extent.
     /// `leaf_depth` is the depth at which the leaf lives (max_depth = finest).
-    /// The leaf covers `2^(max_depth - leaf_depth)` bricks per axis.
+    /// The leaf covers `2^(max_depth - leaf_depth)` voxels per axis.
     pub fn iter_leaves(&self) -> impl Iterator<Item = (UVec3, u32, u8)> + '_ {
         let mut results = Vec::new();
         self.collect_leaves(0, UVec3::ZERO, 0, &mut results);
@@ -377,7 +380,7 @@ impl SparseOctree {
         }
     }
 
-    /// Count the number of leaf nodes (allocated bricks).
+    /// Count the number of leaf nodes (allocated voxels).
     pub fn leaf_count(&self) -> usize {
         self.count_leaves(0)
     }
@@ -452,7 +455,7 @@ mod tests {
         assert_eq!(tree.node_count(), 1);
         assert_eq!(tree.nodes[0], EMPTY_NODE);
         assert_eq!(tree.depth(), 3);
-        assert_eq!(tree.extent_bricks(), 8); // 2^3
+        assert_eq!(tree.extent(), 8); // 2^3
         assert_eq!(tree.leaf_count(), 0);
     }
 
@@ -615,15 +618,15 @@ mod tests {
         map.set(2, 4, 1, 42);
 
         let tree = SparseOctree::from_brick_map(&map, 0.1);
-        assert!(tree.extent_bricks() >= 5); // must cover the largest dim
+        assert!(tree.extent() >= 5); // must cover the largest dim
         assert_eq!(tree.lookup(UVec3::new(2, 4, 1)), Some(make_leaf(42)));
     }
 
     #[test]
     fn extent_world() {
         let tree = SparseOctree::new(3, 0.1);
-        // 2^3 = 8 bricks, each 8 voxels wide, each voxel 0.1 → 8 * 8 * 0.1 = 6.4
-        assert!((tree.extent_world() - 6.4).abs() < 1e-6);
+        // 2^3 = 8 voxels per axis, each voxel 0.1 → 8 * 0.1 = 0.8
+        assert!((tree.extent_world() - 0.8).abs() < 1e-6);
     }
 
     #[test]

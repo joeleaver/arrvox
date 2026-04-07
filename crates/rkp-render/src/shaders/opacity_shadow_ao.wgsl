@@ -204,14 +204,8 @@ fn sample_opacity_point(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
     let slot = octree_find_slot(obj.brick_map_offset, obj.brick_map_dims_x, extent, octree_pos);
     if slot == EMPTY_SLOT { return 0.0; }
     if slot == INTERIOR_SLOT { return 1.0; }
-    let vs = obj.voxel_size;
-    let brick_extent = vs * 8.0;
-    let brick_origin = floor(octree_pos / brick_extent) * brick_extent;
-    let in_brick = (octree_pos - brick_origin) / vs;
-    let vx = clamp(u32(in_brick.x), 0u, 7u);
-    let vy = clamp(u32(in_brick.y), 0u, 7u);
-    let vz = clamp(u32(in_brick.z), 0u, 7u);
-    return extract_opacity(brick_pool[slot * 512u + vx + vy * 8u + vz * 64u].word0);
+    // Per-voxel octree: direct voxel read, no brick math.
+    return extract_opacity(brick_pool[slot].word0);
 }
 
 fn sample_opacity_trilinear(local_pos: vec3<f32>, obj: GpuObject) -> f32 {

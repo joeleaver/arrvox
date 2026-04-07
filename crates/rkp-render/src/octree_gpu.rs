@@ -29,6 +29,8 @@ use rkp_core::{OctreeAllocator, OctreeHandle, SparseOctree};
 /// `GpuScene::upload_brick_maps()`.
 pub struct OctreeGpu {
     allocator: OctreeAllocator,
+    /// Live handles for all allocated octrees (for building RkpGpuObjects).
+    live_handles: Vec<OctreeHandle>,
 }
 
 impl OctreeGpu {
@@ -36,16 +38,20 @@ impl OctreeGpu {
     pub fn new() -> Self {
         Self {
             allocator: OctreeAllocator::new(),
+            live_handles: Vec::new(),
         }
     }
 
     /// Allocate an octree and return its handle.
     pub fn allocate(&mut self, octree: &SparseOctree) -> OctreeHandle {
-        self.allocator.allocate(octree)
+        let handle = self.allocator.allocate(octree);
+        self.live_handles.push(handle.clone());
+        handle
     }
 
     /// Deallocate an octree.
     pub fn deallocate(&mut self, handle: OctreeHandle) {
+        self.live_handles.retain(|h| h.root_offset != handle.root_offset);
         self.allocator.deallocate(handle);
     }
 
@@ -55,7 +61,14 @@ impl OctreeGpu {
     /// node array). The allocator rebases them to absolute offsets.
     pub fn allocate_raw(&mut self, nodes: &[u32], depth: u8, base_voxel_size: f32) -> OctreeHandle {
         let octree = rkp_core::SparseOctree::from_raw(nodes, depth, base_voxel_size);
-        self.allocator.allocate(&octree)
+        let handle = self.allocator.allocate(&octree);
+        self.live_handles.push(handle.clone());
+        handle
+    }
+
+    /// All currently live octree handles.
+    pub fn handles(&self) -> &[OctreeHandle] {
+        &self.live_handles
     }
 
     /// Raw data slice for GPU upload via `GpuScene::upload_brick_maps()`.

@@ -8,10 +8,12 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
 
     let march_factory: rkf_editor::engine_loop::MarchFactory = Box::new(
-        |device, scene, gbuffer, tile_cull, material_buffer, shader_params, opacity_code| -> Box<dyn rkf_render::MarchPass> {
-            Box::new(rkp_render::SplatRasterPass::new(
-                device, scene, gbuffer, tile_cull,
-                material_buffer, shader_params, opacity_code,
+        |device, queue, _scene, gbuffer, _tile_cull, _material_buffer, _shader_params, _opacity_code| -> Box<dyn rkf_render::MarchPass> {
+            // Use standalone pipeline: own scene buffers, shadow/AO, shading.
+            // The engine skips its shadow_ao + shading because handles_full_pipeline() returns true.
+            let (w, h) = (gbuffer.width, gbuffer.height);
+            Box::new(rkp_render::SplatRasterPass::new_standalone(
+                device, queue, w, h,
             ))
         },
     );

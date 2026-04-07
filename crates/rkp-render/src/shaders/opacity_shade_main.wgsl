@@ -251,19 +251,18 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
         let g = f32((rgb_packed >> 8u) & 0xFFu) / 255.0;
         let b = f32(rgb_packed & 0xFFu) / 255.0;
         resolved.albedo = resolved.albedo * vec3<f32>(r, g, b);
-    } else if object_id_bits > 0u {
-        for (var oi = 0u; oi < v2_scene.num_objects; oi = oi + 1u) {
-            let obj = objects[oi];
-            if obj.object_id == object_id_bits && (obj.geom_type == GEOM_TYPE_VOXELIZED || obj.geom_type == GEOM_TYPE_PROCEDURAL) {
-                if obj.is_skinned == 0u {
-                    let local_pos = (obj.inverse_world * vec4<f32>(world_pos, 1.0)).xyz;
-                    let paint = sample_voxelized_color(local_pos, obj);
-                    if paint.a > 0.0 {
-                        resolved.albedo = mix(resolved.albedo, paint.rgb, paint.a);
-                    }
-                }
-                break;
-            }
+    } else {
+        // Read RGB565 color packed into bits 16-31 of material.g by the raster
+        // fragment shader. This is the direct per-voxel color — no re-traversal needed.
+        let color_rgb565 = (packed.g >> 16u) & 0xFFFFu;
+        if color_rgb565 != 0u {
+            let cr5 = color_rgb565 & 0x1Fu;
+            let cg6 = (color_rgb565 >> 5u) & 0x3Fu;
+            let cb5 = (color_rgb565 >> 11u) & 0x1Fu;
+            let r = f32(cr5) / 31.0;
+            let g = f32(cg6) / 63.0;
+            let b = f32(cb5) / 31.0;
+            resolved.albedo = resolved.albedo * vec3<f32>(r, g, b);
         }
     }
     var albedo = resolved.albedo;

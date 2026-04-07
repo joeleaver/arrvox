@@ -7,7 +7,6 @@
 //! G-buffer via MRT.
 
 use crate::splat_emit::SplatEmitPass;
-use crate::surface_shell_gpu::SurfaceShellGpu;
 
 /// The rasterization render pipeline for surface voxel faces.
 pub struct SplatRasterPipeline {
@@ -21,13 +20,11 @@ pub struct SplatRasterPipeline {
 impl SplatRasterPipeline {
     /// Create the render pipeline.
     ///
-    /// `scene_bind_group_layout`: group 0 (brick_pool, octree_nodes, objects, camera, etc.)
-    /// `shell`: group 2 (surface shell occupancy)
+    /// `scene_bind_group_layout`: group 0 (voxel_pool, octree_nodes, objects, camera, etc.)
     /// `emit`: provides the face instance buffer for group 1
     pub fn new(
         device: &wgpu::Device,
         scene_bind_group_layout: &wgpu::BindGroupLayout,
-        shell: &SurfaceShellGpu,
         emit: &SplatEmitPass,
     ) -> Self {
         // Group 1: face instances (read-only storage).
@@ -62,13 +59,12 @@ impl SplatRasterPipeline {
             source: wgpu::ShaderSource::Wgsl(shader_src.into()),
         });
 
-        // Pipeline layout: group 0 = scene, group 1 = faces, group 2 = shell
+        // Pipeline layout: group 0 = scene, group 1 = faces
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("splat_raster pipeline layout"),
             bind_group_layouts: &[
                 scene_bind_group_layout,     // group 0: scene data
                 &face_bind_group_layout,     // group 1: face instances
-                &shell.bind_group_layout,    // group 2: surface shell
             ],
             push_constant_ranges: &[],
         });
@@ -146,19 +142,15 @@ impl SplatRasterPipeline {
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
         scene_bind_group: &'a wgpu::BindGroup,
-        shell_bind_group: &'a wgpu::BindGroup,
         indirect_buffer: &'a wgpu::Buffer,
     ) {
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_bind_group(0, scene_bind_group, &[]);
         render_pass.set_bind_group(1, &*self.face_bind_group.borrow(), &[]);
-        render_pass.set_bind_group(2, shell_bind_group, &[]);
         render_pass.draw_indirect(indirect_buffer, 0);
     }
 
     /// Create the render pass descriptor for G-buffer MRT + depth.
-    ///
-    /// Returns owned descriptors — caller begins the render pass from these.
     pub fn begin_render_pass<'a>(
         encoder: &'a mut wgpu::CommandEncoder,
         gbuffer: &'a rkf_render::gbuffer::GBuffer,
@@ -166,7 +158,6 @@ impl SplatRasterPipeline {
         encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("splat_raster pass"),
             color_attachments: &[
-                // Target 0: position
                 Some(wgpu::RenderPassColorAttachment {
                     view: &gbuffer.position_view,
                     resolve_target: None,
@@ -178,7 +169,6 @@ impl SplatRasterPipeline {
                     },
                     depth_slice: None,
                 }),
-                // Target 1: normal
                 Some(wgpu::RenderPassColorAttachment {
                     view: &gbuffer.normal_view,
                     resolve_target: None,
@@ -190,7 +180,6 @@ impl SplatRasterPipeline {
                     },
                     depth_slice: None,
                 }),
-                // Target 2: material
                 Some(wgpu::RenderPassColorAttachment {
                     view: &gbuffer.material_view,
                     resolve_target: None,
@@ -202,8 +191,6 @@ impl SplatRasterPipeline {
                     },
                     depth_slice: None,
                 }),
-                // Motion vectors (target 3) omitted — 32 byte/sample MRT limit.
-                // Motion is zeroed via a separate clear or post-pass.
             ],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &gbuffer.depth_view,

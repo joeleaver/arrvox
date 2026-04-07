@@ -1,25 +1,24 @@
-//! .rkp v1 file format — octree-native splat asset serialization.
+//! .rkp v2 file format — per-voxel octree asset serialization.
 //!
-//! The .rkp format stores a sparse octree as the spatial structure instead of a
-//! flat brick map. The octree IS the LOD hierarchy — no separate LOD levels.
+//! The .rkp format stores a sparse octree where each leaf is a single voxel
+//! (no bricks). The octree IS the LOD hierarchy — no separate LOD levels.
 //! Coarser leaves at shallower depths represent lower detail.
 //!
-//! # File layout
+//! # File layout (v2)
 //!
 //! ```text
 //! [RkpHeader]                 128 bytes, fixed
 //! [octree nodes]              LZ4 compressed, u32 per node
-//! [brick data]                LZ4 compressed, per leaf: 512 VoxelSamples (4096 bytes)
-//! [geometry data]             LZ4 compressed, per leaf: BrickGeometry (occupancy + surface)
-//! [color data (optional)]     LZ4 compressed, per leaf: ColorBrick (2048 bytes)
-//! [bone data (optional)]      LZ4 compressed, per leaf: BoneBrick (4096 bytes)
+//! [voxel data]                LZ4 compressed, per leaf: 1 VoxelSample (8 bytes)
+//! [color data (optional)]     LZ4 compressed, per leaf: 1 ColorVoxel (4 bytes)
+//! [bone data (optional)]      LZ4 compressed, per leaf: 1 BoneVoxel (8 bytes)
 //! ```
 //!
-//! Leaf bricks are stored in slot order. The slot-to-leaf mapping is implicit:
+//! Leaf voxels are stored in slot order. The slot-to-leaf mapping is implicit:
 //! iterate the octree's leaves to recover which slot corresponds to which spatial
 //! position.
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, Write};
 
 use bytemuck::{Pod, Zeroable};
 
@@ -27,7 +26,7 @@ use bytemuck::{Pod, Zeroable};
 pub const RKP_MAGIC: [u8; 4] = [b'R', b'K', b'P', 0x01];
 
 /// Current format version.
-pub const RKP_VERSION: u32 = 1;
+pub const RKP_VERSION: u32 = 2;
 
 /// Flags for optional sections.
 pub const FLAG_HAS_COLOR: u32 = 1 << 0;
@@ -47,8 +46,8 @@ pub struct RkpHeader {
     pub octree_depth: u32,
     /// Base voxel size at finest level.
     pub base_voxel_size: f32,
-    /// Number of leaf bricks (with allocated brick pool slots).
-    pub brick_count: u32,
+    /// Number of leaf voxels (with allocated voxel pool slots).
+    pub voxel_count: u32,
     /// Object AABB (world-space).
     pub aabb_min: [f32; 3],
     pub aabb_max: [f32; 3],
@@ -62,10 +61,10 @@ pub struct RkpHeader {
     pub analytical_params: [f32; 4],
     /// Compressed size of octree section.
     pub octree_compressed_size: u32,
-    /// Compressed size of brick data section.
-    pub brick_compressed_size: u32,
-    /// Compressed size of geometry section.
-    pub geometry_compressed_size: u32,
+    /// Compressed size of voxel data section.
+    pub voxel_compressed_size: u32,
+    /// Reserved (was geometry_compressed_size in v1).
+    pub _reserved_geo: u32,
     /// Compressed size of color section (0 if no color).
     pub color_compressed_size: u32,
     /// Compressed size of bone section (0 if no bones).
@@ -87,32 +86,29 @@ pub enum RkpFileError {
     Decompress(String),
 }
 
-/// Write a .rkp file.
+/// Write a .rkp v2 file (per-voxel format).
 ///
 /// `octree_nodes`: packed node buffer from `SparseOctree::as_slice()`.
-/// `brick_data`: raw VoxelSample data, 512 entries per leaf brick, in slot order.
-/// `geometry_data`: serialized BrickGeometry per leaf (occupancy + surface voxels).
-/// `color_data`: optional serialized ColorBrick data per leaf.
-/// `bone_data`: optional serialized BoneBrick data per leaf.
+/// `voxel_data`: raw VoxelSample data, 1 entry per leaf voxel, in slot order.
+/// `color_data`: optional per-voxel ColorVoxel data (4 bytes per leaf).
+/// `bone_data`: optional per-voxel BoneVoxel data.
 pub fn write_rkp<W: Write + Seek>(
     writer: &mut W,
     octree_nodes: &[u32],
     octree_depth: u8,
     base_voxel_size: f32,
-    brick_count: u32,
+    voxel_count: u32,
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
     material_ids: &[u16],
-    brick_data: &[u8],
-    geometry_data: &[u8],
+    voxel_data: &[u8],
     color_data: Option<&[u8]>,
     bone_data: Option<&[u8]>,
 ) -> Result<(), RkpFileError> {
     // Compress sections.
     let octree_bytes: &[u8] = bytemuck::cast_slice(octree_nodes);
     let octree_compressed = lz4_flex::compress_prepend_size(octree_bytes);
-    let brick_compressed = lz4_flex::compress_prepend_size(brick_data);
-    let geometry_compressed = lz4_flex::compress_prepend_size(geometry_data);
+    let voxel_compressed = lz4_flex::compress_prepend_size(voxel_data);
     let color_compressed = color_data.map(|d| lz4_flex::compress_prepend_size(d));
     let bone_compressed = bone_data.map(|d| lz4_flex::compress_prepend_size(d));
 
@@ -135,7 +131,7 @@ pub fn write_rkp<W: Write + Seek>(
         octree_node_count: octree_nodes.len() as u32,
         octree_depth: octree_depth as u32,
         base_voxel_size,
-        brick_count,
+        voxel_count,
         aabb_min,
         aabb_max,
         flags,
@@ -143,8 +139,8 @@ pub fn write_rkp<W: Write + Seek>(
         analytical_type: 0,
         analytical_params: [0.0; 4],
         octree_compressed_size: octree_compressed.len() as u32,
-        brick_compressed_size: brick_compressed.len() as u32,
-        geometry_compressed_size: geometry_compressed.len() as u32,
+        voxel_compressed_size: voxel_compressed.len() as u32,
+        _reserved_geo: 0,
         color_compressed_size: color_compressed.as_ref().map(|d| d.len() as u32).unwrap_or(0),
         bone_compressed_size: bone_compressed.as_ref().map(|d| d.len() as u32).unwrap_or(0),
         _reserved: [0; 4],
@@ -152,8 +148,7 @@ pub fn write_rkp<W: Write + Seek>(
 
     writer.write_all(bytemuck::bytes_of(&header))?;
     writer.write_all(&octree_compressed)?;
-    writer.write_all(&brick_compressed)?;
-    writer.write_all(&geometry_compressed)?;
+    writer.write_all(&voxel_compressed)?;
     if let Some(ref data) = color_compressed {
         writer.write_all(data)?;
     }
@@ -192,23 +187,12 @@ pub fn read_rkp_octree<R: Read>(
     Ok(bytemuck::cast_slice(&decompressed).to_vec())
 }
 
-/// Read and decompress the brick data section.
-pub fn read_rkp_bricks<R: Read>(
+/// Read and decompress the voxel data section (1 VoxelSample per leaf).
+pub fn read_rkp_voxels<R: Read>(
     reader: &mut R,
     header: &RkpHeader,
 ) -> Result<Vec<u8>, RkpFileError> {
-    let mut compressed = vec![0u8; header.brick_compressed_size as usize];
-    reader.read_exact(&mut compressed)?;
-    lz4_flex::decompress_size_prepended(&compressed)
-        .map_err(|e| RkpFileError::Decompress(e.to_string()))
-}
-
-/// Read and decompress the geometry data section.
-pub fn read_rkp_geometry<R: Read>(
-    reader: &mut R,
-    header: &RkpHeader,
-) -> Result<Vec<u8>, RkpFileError> {
-    let mut compressed = vec![0u8; header.geometry_compressed_size as usize];
+    let mut compressed = vec![0u8; header.voxel_compressed_size as usize];
     reader.read_exact(&mut compressed)?;
     lz4_flex::decompress_size_prepended(&compressed)
         .map_err(|e| RkpFileError::Decompress(e.to_string()))
@@ -245,7 +229,7 @@ pub fn read_rkp_bones<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, SeekFrom};
 
     #[test]
     fn header_size_is_128_bytes() {
@@ -258,8 +242,7 @@ mod tests {
         let mut cursor = Cursor::new(&mut buf);
 
         let octree_nodes: Vec<u32> = vec![0xFFFF_FFFF]; // single EMPTY root
-        let brick_data: Vec<u8> = Vec::new();
-        let geometry_data: Vec<u8> = Vec::new();
+        let voxel_data: Vec<u8> = Vec::new();
 
         write_rkp(
             &mut cursor,
@@ -270,8 +253,7 @@ mod tests {
             [-1.0, -1.0, -1.0],
             [1.0, 1.0, 1.0],
             &[0, 1],
-            &brick_data,
-            &geometry_data,
+            &voxel_data,
             None,
             None,
         )
@@ -285,7 +267,7 @@ mod tests {
         assert_eq!(header.octree_node_count, 1);
         assert_eq!(header.octree_depth, 1);
         assert!((header.base_voxel_size - 0.1).abs() < 1e-6);
-        assert_eq!(header.brick_count, 0);
+        assert_eq!(header.voxel_count, 0);
         assert_eq!(header.material_ids[0], 0);
         assert_eq!(header.material_ids[1], 1);
         assert_eq!(header.flags & FLAG_HAS_COLOR, 0);
@@ -310,8 +292,7 @@ mod tests {
             [-1.0; 3],
             [1.0; 3],
             &[],
-            &[0u8; 4096], // one brick = 512 VoxelSamples * 8 bytes
-            &[],
+            &[0u8; 8], // one voxel = 1 VoxelSample * 8 bytes
             None,
             None,
         )

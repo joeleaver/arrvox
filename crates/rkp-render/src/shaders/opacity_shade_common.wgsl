@@ -387,15 +387,8 @@ fn octree_voxel_at(local_pos: vec3<f32>, obj: GpuObject) -> vec2<u32> {
         return vec2<u32>(slot, 0u);
     }
 
-    let vs = obj.voxel_size;
-    let brick_extent = vs * 8.0;
-    let brick_origin = floor(octree_pos / brick_extent) * brick_extent;
-    let in_brick = (octree_pos - brick_origin) / vs;
-    let vx = clamp(u32(in_brick.x), 0u, 7u);
-    let vy = clamp(u32(in_brick.y), 0u, 7u);
-    let vz = clamp(u32(in_brick.z), 0u, 7u);
-    let voxel_idx = vx + vy * 8u + vz * 64u;
-    return vec2<u32>(slot, voxel_idx);
+    // Per-voxel octree: slot IS the voxel. No within-brick index needed.
+    return vec2<u32>(slot, 0u);
 }
 
 // ---------- Opacity Field Evaluation ----------
@@ -405,7 +398,7 @@ fn sample_opacity_point(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
     let sv = octree_voxel_at(local_pos, obj);
     if sv.x == EMPTY_SLOT { return 0.0; }
     if sv.x == INTERIOR_SLOT { return 1.0; }
-    return extract_opacity(brick_pool[sv.x * 512u + sv.y].word0);
+    return extract_opacity(brick_pool[sv.x].word0);
 }
 
 /// 8-tap trilinear interpolation of the opacity field using octree traversal.
@@ -441,12 +434,12 @@ fn sample_voxelized_color(local_pos: vec3<f32>, obj: GpuObject) -> vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    let color_slot = color_companion_map[sv.x];
-    if color_slot == EMPTY_SLOT {
+    // Per-voxel octree: color is a parallel array indexed by voxel_slot directly.
+    // No companion map — same index as the voxel pool.
+    let packed = color_pool_data[sv.x];
+    if packed == 0u {
         return vec4<f32>(0.0);
     }
-
-    let packed = color_pool_data[color_slot * 512u + sv.y];
     let r = f32(packed & 0xFFu) / 255.0;
     let g = f32((packed >> 8u) & 0xFFu) / 255.0;
     let b = f32((packed >> 16u) & 0xFFu) / 255.0;
@@ -460,9 +453,8 @@ fn sample_voxelized_blend(local_pos: vec3<f32>, obj: GpuObject) -> vec2<f32> {
     if sv.x == EMPTY_SLOT || sv.x == INTERIOR_SLOT {
         return vec2<f32>(0.0, 0.0);
     }
-    let idx = sv.x * 512u + sv.y;
-    let w0 = brick_pool[idx].word0;
-    let w1 = brick_pool[idx].word1;
+    let w0 = brick_pool[sv.x].word0;
+    let w1 = brick_pool[sv.x].word1;
     let secondary_mat = f32((w1 >> 16u) & 0xFFFFu);
     let blend_weight = f32((w0 >> 16u) & 0xFFu) / 255.0;
     return vec2<f32>(secondary_mat, blend_weight);
@@ -477,9 +469,8 @@ fn sample_voxelized_material_full(local_pos: vec3<f32>, obj: GpuObject) -> vec3<
     if sv.x == EMPTY_SLOT || sv.x == INTERIOR_SLOT {
         return vec3<f32>(f32(obj.material_id), 0.0, 0.0);
     }
-    let idx = sv.x * 512u + sv.y;
-    let w0 = brick_pool[idx].word0;
-    let w1 = brick_pool[idx].word1;
+    let w0 = brick_pool[sv.x].word0;
+    let w1 = brick_pool[sv.x].word1;
     let primary_mat = f32(w1 & 0xFFFFu);
     let secondary_mat = f32((w1 >> 16u) & 0xFFFFu);
     let blend_weight = f32((w0 >> 16u) & 0xFFu) / 255.0;

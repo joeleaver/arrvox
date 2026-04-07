@@ -15,7 +15,7 @@ const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
 const OCTREE_LEAF_BIT: u32 = 0x80000000u;
 
 struct OctreeResult {
-    /// Brick pool slot, or OCTREE_EMPTY / OCTREE_INTERIOR sentinel.
+    /// Voxel pool slot, or OCTREE_EMPTY / OCTREE_INTERIOR sentinel.
     slot: u32,
     /// Depth at which the result was found (0 = root, max = finest).
     depth: u32,
@@ -31,7 +31,7 @@ fn octree_is_leaf(node: u32) -> bool {
     return (node & OCTREE_LEAF_BIT) != 0u && node != OCTREE_EMPTY && node != OCTREE_INTERIOR;
 }
 
-/// Extract brick pool slot from a leaf node.
+/// Extract voxel pool slot from a leaf node.
 fn octree_leaf_slot(node: u32) -> u32 {
     return node & ~OCTREE_LEAF_BIT;
 }
@@ -99,8 +99,9 @@ fn octree_lookup(root: u32, max_depth: u32, extent: f32, local_pos: vec3<f32>) -
 
 /// Sample opacity at a local-space position using octree traversal.
 ///
+/// Per-voxel octree: each leaf IS a single voxel. No brick math needed.
 /// Returns the opacity value (0.0 for EMPTY, 1.0 for INTERIOR, or sampled
-/// from brick pool for leaf nodes).
+/// from voxel pool for leaf nodes).
 fn sample_opacity_at_octree(
     local_pos: vec3<f32>,
     obj_root: u32,
@@ -117,21 +118,8 @@ fn sample_opacity_at_octree(
         return 1.0;
     }
 
-    // Leaf: compute the effective voxel size at this depth.
-    let depth_diff = obj_depth - result.depth;
-    let leaf_voxel_size = obj_voxel_size * f32(1u << depth_diff);
-
-    // Compute voxel index within the brick.
-    let leaf_extent = leaf_voxel_size * 8.0;
-    // Position of this leaf's origin (snapped to leaf grid).
-    let leaf_grid = floor(local_pos / leaf_extent) * leaf_extent;
-    let local_in_brick = (local_pos - leaf_grid) / leaf_voxel_size;
-    let vx = clamp(u32(local_in_brick.x), 0u, 7u);
-    let vy = clamp(u32(local_in_brick.y), 0u, 7u);
-    let vz = clamp(u32(local_in_brick.z), 0u, 7u);
-
-    let voxel_idx = vx + vy * 8u + vz * 64u;
-    let word0 = brick_pool[result.slot * 512u + voxel_idx].word0;
+    // Leaf: direct voxel read — one voxel per leaf, no brick indexing.
+    let word0 = brick_pool[result.slot].word0;
     return clamp(unpack2x16float(word0 & 0xFFFFu).x, 0.0, 1.0);
 }
 

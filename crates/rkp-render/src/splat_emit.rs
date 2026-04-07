@@ -5,8 +5,6 @@
 //! face instances to an output buffer. The output feeds directly into an indirect
 //! draw call for the rasterization pass.
 
-use crate::surface_shell_gpu::SurfaceShellGpu;
-
 /// Per-face instance data written by the emit shader, read by the raster vertex shader.
 ///
 /// 24 bytes per instance. Must match the WGSL `FaceInstance` struct.
@@ -21,9 +19,9 @@ pub struct FaceInstance {
     pub pos_z: f32,
     /// Voxel size in world units (varies with octree depth).
     pub voxel_size: f32,
-    /// Brick pool slot.
-    pub brick_slot: u32,
-    /// Packed: voxel_index(9) | face_id(3) | obj_idx(16) | unused(4)
+    /// Voxel pool slot (direct index — no within-brick offset).
+    pub voxel_slot: u32,
+    /// Packed: face_id(3) | obj_idx(20) | unused(9)
     pub packed: u32,
 }
 
@@ -73,11 +71,9 @@ impl SplatEmitPass {
     /// Create the emit pass.
     ///
     /// `scene_bind_group_layout`: group 0 layout (octree_nodes + objects).
-    /// `shell`: the surface shell GPU buffer (group 1).
     pub fn new(
         device: &wgpu::Device,
         scene_bind_group_layout: &wgpu::BindGroupLayout,
-        shell: &SurfaceShellGpu,
     ) -> Self {
         let max_faces = DEFAULT_MAX_FACES;
 
@@ -201,9 +197,8 @@ impl SplatEmitPass {
             label: Some("splat_emit pipeline layout"),
             bind_group_layouts: &[
                 scene_bind_group_layout,     // group 0: octree_nodes + objects
-                &shell.bind_group_layout,    // group 1: surface_shell
-                &output_bind_group_layout,   // group 2: face_instances + draw_args
-                &params_bind_group_layout,   // group 3: emit_params
+                &output_bind_group_layout,   // group 1: face_instances + draw_args
+                &params_bind_group_layout,   // group 2: emit_params
             ],
             push_constant_ranges: &[],
         });
@@ -250,7 +245,6 @@ impl SplatEmitPass {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         scene_bind_group: &wgpu::BindGroup,
-        shell_bind_group: &wgpu::BindGroup,
         object_count: u32,
     ) {
         // Reset indirect args: copy from staging buffer (vertex_count=6, instance_count=0).
@@ -269,9 +263,8 @@ impl SplatEmitPass {
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, scene_bind_group, &[]);
-        pass.set_bind_group(1, shell_bind_group, &[]);
-        pass.set_bind_group(2, &self.output_bind_group, &[]);
-        pass.set_bind_group(3, &self.params_bind_group, &[]);
+        pass.set_bind_group(1, &self.output_bind_group, &[]);
+        pass.set_bind_group(2, &self.params_bind_group, &[]);
         pass.dispatch_workgroups(object_count, 1, 1);
     }
 

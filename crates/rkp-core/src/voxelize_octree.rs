@@ -2,18 +2,17 @@
 //!
 //! Top-down recursive: at each octree node, sample the opacity function to decide
 //! whether to subdivide (mixed content), mark as EMPTY (all below threshold),
-//! mark as INTERIOR (all above threshold), or allocate a brick at max depth.
+//! mark as INTERIOR (all above threshold), or allocate a voxel at max depth.
 //!
 //! Produces a [`SparseOctree`] with variable-depth leaves — uniform regions
-//! terminate early, detail concentrates where opacity varies.
+//! terminate early, detail concentrates where opacity varies. Each leaf is a
+//! single voxel (no bricks).
 
 use glam::{UVec3, Vec3};
-use rkf_core::brick::Brick;
-use rkf_core::brick_pool::BrickPool;
-use rkf_core::constants::BRICK_DIM;
 use rkf_core::Aabb;
 
 use crate::sparse_octree::SparseOctree;
+use crate::voxel_pool::VoxelPool;
 use crate::SplatVoxel;
 
 /// Threshold below which a sample is considered empty.
@@ -29,32 +28,32 @@ const OPAQUE_THRESHOLD: f32 = 0.999;
 /// `base_voxel_size`: voxel size at the finest level.
 ///
 /// The octree depth is computed automatically from the AABB and voxel size.
+/// Each leaf is a single voxel in the pool.
 ///
-/// Returns `Some((octree, brick_count, grid_origin))` on success, `None` if pool
+/// Returns `Some((octree, voxel_count, grid_origin))` on success, `None` if pool
 /// allocation fails.
 pub fn voxelize_opacity_octree<F>(
     opacity_fn: F,
     aabb: &Aabb,
     base_voxel_size: f32,
-    pool: &mut BrickPool,
+    pool: &mut VoxelPool,
 ) -> Option<(SparseOctree, u32, Vec3)>
 where
     F: Fn(Vec3) -> (f32, u16),
 {
-    let brick_world_size = base_voxel_size * BRICK_DIM as f32;
     let aabb_size = aabb.max - aabb.min;
     let max_dim = aabb_size.x.max(aabb_size.y).max(aabb_size.z);
 
-    // Compute depth: smallest power of 2 that covers the AABB in bricks.
-    let bricks_needed = (max_dim / brick_world_size).ceil().max(1.0) as u32;
-    let depth = if bricks_needed <= 1 {
+    // Compute depth: smallest power of 2 that covers the AABB in voxels.
+    let voxels_needed = (max_dim / base_voxel_size).ceil().max(1.0) as u32;
+    let depth = if voxels_needed <= 1 {
         1
     } else {
-        (32 - (bricks_needed - 1).leading_zeros()) as u8
+        (32 - (voxels_needed - 1).leading_zeros()) as u8
     };
 
     let mut octree = SparseOctree::new(depth, base_voxel_size);
-    let mut brick_count = 0u32;
+    let mut voxel_count = 0u32;
 
     // Center the octree on the AABB.
     let extent = octree.extent_world();
@@ -65,7 +64,7 @@ where
         &opacity_fn,
         &mut octree,
         pool,
-        &mut brick_count,
+        &mut voxel_count,
         UVec3::ZERO,
         0,
         depth,
@@ -74,12 +73,12 @@ where
         base_voxel_size,
     )?;
 
-    Some((octree, brick_count, grid_origin))
+    Some((octree, voxel_count, grid_origin))
 }
 
 /// Recursive subdivision.
 ///
-/// `coord`: lower-corner brick coordinate of this node's region.
+/// `coord`: lower-corner voxel coordinate of this node's region.
 /// `level`: current depth (0 = root).
 /// `max_depth`: finest level.
 /// `world_min`: world-space minimum corner of this node's region.
@@ -87,8 +86,8 @@ where
 fn subdivide_node<F>(
     opacity_fn: &F,
     octree: &mut SparseOctree,
-    pool: &mut BrickPool,
-    brick_count: &mut u32,
+    pool: &mut VoxelPool,
+    voxel_count: &mut u32,
     coord: UVec3,
     level: u8,
     max_depth: u8,
@@ -112,17 +111,18 @@ where
         }
         RegionClass::Mixed => {
             if level == max_depth {
-                // At finest level — allocate a brick and populate it.
-                let slots = pool.allocate_range(1)?;
-                let slot = slots[0];
-                let brick = pool.get_mut(slot);
-                populate_brick(brick, opacity_fn, world_min, base_voxel_size);
+                // At finest level — this IS a single voxel. Sample at its center.
+                let voxel_center = world_min + Vec3::splat(base_voxel_size * 0.5);
+                let (opacity, material_id) = opacity_fn(voxel_center);
+                let sv = SplatVoxel::new(opacity.clamp(0.0, 1.0), material_id);
+                let slot = pool.allocate()?;
+                *pool.get_mut(slot) = sv;
                 octree.set_at_level(coord, level, crate::sparse_octree::make_leaf(slot));
-                *brick_count += 1;
+                *voxel_count += 1;
             } else {
                 // Subdivide into 8 children.
                 let half = node_extent * 0.5;
-                let child_bricks = 1u32 << (max_depth - level - 1);
+                let child_voxels = 1u32 << (max_depth - level - 1);
 
                 for octant in 0u32..8 {
                     let dx = octant & 1;
@@ -132,16 +132,16 @@ where
                     let child_min = world_min
                         + Vec3::new(dx as f32 * half, dy as f32 * half, dz as f32 * half);
                     let child_coord = UVec3::new(
-                        coord.x + dx * child_bricks,
-                        coord.y + dy * child_bricks,
-                        coord.z + dz * child_bricks,
+                        coord.x + dx * child_voxels,
+                        coord.y + dy * child_voxels,
+                        coord.z + dz * child_voxels,
                     );
 
                     subdivide_node(
                         opacity_fn,
                         octree,
                         pool,
-                        brick_count,
+                        voxel_count,
                         child_coord,
                         level + 1,
                         max_depth,
@@ -212,39 +212,13 @@ where
     }
 }
 
-/// Populate a single brick with opacity-field voxels.
-fn populate_brick<F>(brick: &mut Brick, opacity_fn: &F, brick_min: Vec3, voxel_size: f32)
-where
-    F: Fn(Vec3) -> (f32, u16),
-{
-    let half_voxel = voxel_size * 0.5;
-
-    for vz in 0..BRICK_DIM {
-        for vy in 0..BRICK_DIM {
-            for vx in 0..BRICK_DIM {
-                let pos = brick_min
-                    + Vec3::new(
-                        vx as f32 * voxel_size + half_voxel,
-                        vy as f32 * voxel_size + half_voxel,
-                        vz as f32 * voxel_size + half_voxel,
-                    );
-
-                let (opacity, material_id) = opacity_fn(pos);
-                let sample: rkf_core::voxel::VoxelSample =
-                    SplatVoxel::new(opacity.clamp(0.0, 1.0), material_id).into();
-                brick.set(vx, vy, vz, sample);
-            }
-        }
-    }
-}
-
 /// Convenience: voxelize a sphere into a sparse octree.
 pub fn voxelize_opacity_sphere_octree(
     center: Vec3,
     radius: f32,
     material_id: u16,
     voxel_size: f32,
-    pool: &mut BrickPool,
+    pool: &mut VoxelPool,
 ) -> Option<(SparseOctree, u32, Vec3)> {
     let padding = voxel_size * 2.0;
     let aabb = Aabb {
@@ -268,106 +242,73 @@ mod tests {
 
     #[test]
     fn sphere_produces_leaves() {
-        let mut pool = BrickPool::new(1024);
-        let (octree, brick_count, _) =
+        let mut pool = VoxelPool::new(1_000_000);
+        let (octree, voxel_count, _) =
             voxelize_opacity_sphere_octree(Vec3::ZERO, 0.5, 0, 0.1, &mut pool).unwrap();
 
-        assert!(brick_count > 0, "should allocate bricks for sphere surface");
-        assert_eq!(octree.leaf_count(), brick_count as usize);
+        assert!(voxel_count > 0, "should allocate voxels for sphere surface");
+        assert_eq!(octree.leaf_count(), voxel_count as usize);
     }
 
     #[test]
     fn sphere_has_interior_nodes() {
-        let mut pool = BrickPool::new(4096);
-        // Radius must be >> brick diagonal (sqrt(3) * 0.8 ≈ 1.39) for interior nodes.
+        let mut pool = VoxelPool::new(1_000_000);
         let (octree, _, _) =
             voxelize_opacity_sphere_octree(Vec3::ZERO, 3.0, 0, 0.1, &mut pool).unwrap();
 
         // The interior of a sphere should produce INTERIOR nodes at coarse levels.
         let mut found_interior = false;
-        let ext = octree.extent_bricks();
-        for z in 0..ext {
-            for y in 0..ext {
-                for x in 0..ext {
-                    if let Some(val) = octree.lookup(glam::UVec3::new(x, y, z)) {
-                        if val == INTERIOR_NODE {
-                            found_interior = true;
-                        }
-                    }
-                }
+        let ext = octree.extent();
+        // Don't iterate all voxels (could be millions) — sample a known-interior coord.
+        let mid = ext / 2;
+        if let Some(val) = octree.lookup(glam::UVec3::new(mid, mid, mid)) {
+            if val == INTERIOR_NODE {
+                found_interior = true;
             }
         }
-        assert!(found_interior, "large sphere should have interior nodes");
+        assert!(found_interior, "large sphere should have interior at center");
     }
 
     #[test]
-    fn empty_region_produces_no_bricks() {
-        let mut pool = BrickPool::new(256);
+    fn empty_region_produces_no_voxels() {
+        let mut pool = VoxelPool::new(256);
         let aabb = Aabb {
             min: Vec3::ZERO,
             max: Vec3::splat(1.0),
         };
-        let (octree, brick_count, _) =
+        let (octree, voxel_count, _) =
             voxelize_opacity_octree(|_| (0.0, 0), &aabb, 0.1, &mut pool).unwrap();
 
-        assert_eq!(brick_count, 0);
+        assert_eq!(voxel_count, 0);
         assert_eq!(octree.leaf_count(), 0);
     }
 
     #[test]
     fn fully_opaque_region_is_interior() {
-        let mut pool = BrickPool::new(256);
+        let mut pool = VoxelPool::new(256);
         let aabb = Aabb {
             min: Vec3::ZERO,
-            max: Vec3::splat(0.8),
+            max: Vec3::splat(0.05),
         };
-        let (octree, brick_count, _) =
+        let (octree, voxel_count, _) =
             voxelize_opacity_octree(|_| (1.0, 0), &aabb, 0.1, &mut pool).unwrap();
 
-        assert_eq!(brick_count, 0, "fully opaque should be INTERIOR, not bricks");
+        assert_eq!(voxel_count, 0, "fully opaque should be INTERIOR, not voxels");
         assert_eq!(octree.as_slice()[0], INTERIOR_NODE);
     }
 
     #[test]
-    fn fewer_bricks_than_flat_voxelization() {
-        let mut pool_flat = BrickPool::new(4096);
-        let mut flat_alloc = rkf_core::BrickMapAllocator::new();
-
-        let (_, flat_count, _, _) = crate::voxelize_opacity::voxelize_opacity_sphere(
-            Vec3::ZERO, 0.5, 0, 0.1, &mut pool_flat, &mut flat_alloc,
-        ).unwrap();
-
-        let mut pool_octree = BrickPool::new(4096);
-        let (_, octree_count, _) =
-            voxelize_opacity_sphere_octree(Vec3::ZERO, 0.5, 0, 0.1, &mut pool_octree).unwrap();
-
-        // Octree should allocate fewer bricks because interior/empty regions collapse.
-        assert!(
-            octree_count <= flat_count,
-            "octree {octree_count} should use <= bricks than flat {flat_count}"
-        );
-    }
-
-    #[test]
-    fn leaf_bricks_have_correct_opacity() {
-        let mut pool = BrickPool::new(1024);
+    fn leaf_voxels_have_correct_opacity() {
+        let mut pool = VoxelPool::new(1_000_000);
         let (octree, _, _) =
             voxelize_opacity_sphere_octree(Vec3::ZERO, 0.3, 42, 0.1, &mut pool).unwrap();
 
         let mut found_opaque = false;
         for (_, slot, _) in octree.iter_leaves() {
-            let brick = pool.get(slot);
-            for vz in 0..BRICK_DIM {
-                for vy in 0..BRICK_DIM {
-                    for vx in 0..BRICK_DIM {
-                        let sample = brick.sample(vx, vy, vz);
-                        let sv = SplatVoxel::from(sample);
-                        if sv.opacity_f32() > 0.5 {
-                            found_opaque = true;
-                            assert_eq!(sv.material_id(), 42);
-                        }
-                    }
-                }
+            let sv = pool.get(slot);
+            if sv.opacity_f32() > 0.5 {
+                found_opaque = true;
+                assert_eq!(sv.material_id(), 42);
             }
         }
         assert!(found_opaque, "should have opaque voxels in sphere");
