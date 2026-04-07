@@ -580,9 +580,35 @@ impl rkf_render::MarchPass for SplatRasterPass {
                 drop(mapping);
 
                 let face_count = upload_faces.len() as u32;
+                let face_bytes: &[u8] = bytemuck::cast_slice(&upload_faces);
+
+                // Grow face buffer if needed.
+                {
+                    let buf = self.emit.face_buffer.borrow();
+                    if face_bytes.len() as u64 > buf.size() {
+                        let new_size = (face_bytes.len() as u64).max(buf.size() * 2);
+                        drop(buf);
+                        let new_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("emit face instances"),
+                            size: new_size,
+                            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                        *self.raster.face_bind_group.borrow_mut() = self.device.create_bind_group(
+                            &wgpu::BindGroupDescriptor {
+                                label: Some("raster face bind group"),
+                                layout: &self.raster.face_bind_group_layout,
+                                entries: &[wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: new_buf.as_entire_binding(),
+                                }],
+                            },
+                        );
+                        *self.emit.face_buffer.borrow_mut() = new_buf;
+                    }
+                }
 
                 // Upload face data via staging buffer.
-                let face_bytes: &[u8] = bytemuck::cast_slice(&upload_faces);
                 let face_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("face staging"),
                     size: face_bytes.len() as u64,
@@ -594,7 +620,7 @@ impl rkf_render::MarchPass for SplatRasterPass {
                 face_staging.unmap();
                 encoder.copy_buffer_to_buffer(
                     &face_staging, 0,
-                    &self.emit.face_buffer, 0,
+                    &self.emit.face_buffer.borrow(), 0,
                     face_bytes.len() as u64,
                 );
 

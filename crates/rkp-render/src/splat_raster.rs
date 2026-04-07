@@ -14,8 +14,8 @@ pub struct SplatRasterPipeline {
     pipeline: wgpu::RenderPipeline,
     /// Bind group layout for face instance buffer (group 1).
     pub face_bind_group_layout: wgpu::BindGroupLayout,
-    /// Bind group for face instance buffer.
-    pub face_bind_group: wgpu::BindGroup,
+    /// Bind group for face instance buffer. Recreated when buffer grows.
+    pub face_bind_group: std::cell::RefCell<wgpu::BindGroup>,
 }
 
 impl SplatRasterPipeline {
@@ -51,7 +51,7 @@ impl SplatRasterPipeline {
             layout: &face_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: emit.face_buffer.as_entire_binding(),
+                resource: emit.face_buffer.borrow().as_entire_binding(),
             }],
         });
 
@@ -135,7 +135,7 @@ impl SplatRasterPipeline {
         Self {
             pipeline,
             face_bind_group_layout,
-            face_bind_group,
+            face_bind_group: std::cell::RefCell::new(face_bind_group),
         }
     }
 
@@ -151,7 +151,7 @@ impl SplatRasterPipeline {
     ) {
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_bind_group(0, scene_bind_group, &[]);
-        render_pass.set_bind_group(1, &self.face_bind_group, &[]);
+        render_pass.set_bind_group(1, &*self.face_bind_group.borrow(), &[]);
         render_pass.set_bind_group(2, shell_bind_group, &[]);
         render_pass.draw_indirect(indirect_buffer, 0);
     }

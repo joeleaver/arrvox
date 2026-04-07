@@ -40,8 +40,8 @@ pub struct EmitParams {
 /// The emit compute pass.
 pub struct SplatEmitPass {
     pipeline: wgpu::ComputePipeline,
-    /// Output: face instance buffer (storage, read by raster pass).
-    pub face_buffer: wgpu::Buffer,
+    /// Output: face instance buffer (storage, read by raster pass). Growable.
+    pub face_buffer: std::cell::RefCell<wgpu::Buffer>,
     /// Output: indirect draw args (vertex_count=6, instance_count=atomic).
     pub indirect_buffer: wgpu::Buffer,
     /// Staging buffer with reset values for indirect args (vertex_count=6, rest=0).
@@ -219,7 +219,7 @@ impl SplatEmitPass {
 
         Self {
             pipeline,
-            face_buffer,
+            face_buffer: std::cell::RefCell::new(face_buffer),
             indirect_buffer,
             indirect_reset_buffer,
             output_bind_group_layout,
