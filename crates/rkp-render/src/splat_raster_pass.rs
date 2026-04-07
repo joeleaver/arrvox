@@ -278,13 +278,35 @@ impl rkf_render::MarchPass for SplatRasterPass {
         use rkf_core::companion::{BoneBrick, BoneVoxel, ColorBrick, ColorVoxel};
         use rkf_core::voxel::VoxelSample;
 
-        // Check for .rkp extension
-        if !path.ends_with(".rkp") {
-            return Ok(None); // Not our format — fall back to default loading
+        // Find the .rkp file. Try: exact path, path.rkp, path with .rkf→.rkp, path with ext→.rkp
+        let rkp_path = if path.ends_with(".rkp") {
+            std::path::PathBuf::from(path)
+        } else {
+            let p = std::path::Path::new(path);
+            // Try appending .rkp (e.g., "scene.gltf" → "scene.gltf.rkp")
+            let appended = p.with_file_name(format!(
+                "{}.rkp",
+                p.file_name().map(|f| f.to_string_lossy()).unwrap_or_default()
+            ));
+            if appended.exists() {
+                appended
+            } else {
+                // Try replacing extension (e.g., "scene.gltf.rkf" → "scene.gltf.rkp")
+                let replaced = p.with_extension("rkp");
+                if replaced.exists() {
+                    replaced
+                } else {
+                    return Ok(None); // No .rkp found — fall back to default loading
+                }
+            }
+        };
+
+        if !rkp_path.exists() {
+            return Ok(None);
         }
 
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| format!("open {path}: {e}"))?;
+        let mut file = std::fs::File::open(&rkp_path)
+            .map_err(|e| format!("open {}: {e}", rkp_path.display()))?;
         let mut reader = std::io::BufReader::new(&mut file);
 
         let header = rkp_core::asset_file::read_rkp_header(&mut reader)
