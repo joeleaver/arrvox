@@ -543,23 +543,24 @@ impl rkf_render::MarchPass for SplatRasterPass {
 
         // Upload face instances from CPU emit (replaces GPU emit pass).
         {
-            let mut faces = self.pending_faces.borrow_mut();
+            let faces = self.pending_faces.borrow();
             if self.faces_dirty.get() && !faces.is_empty() {
-                // Patch obj_idx in packed field using the GPU object mapping.
-                // Faces store sdf_object_id in bits 12-27. Replace with GPU index.
+                // Build upload buffer with GPU object indices patched in.
+                // Don't modify pending_faces — the sdf_object_id must be preserved
+                // for future re-uploads when the mapping changes.
                 let mapping = self.object_gpu_mapping.borrow();
-                for face in faces.iter_mut() {
+                let mut upload_faces = faces.clone();
+                for face in upload_faces.iter_mut() {
                     let sdf_obj_id = (face.packed >> 12) & 0xFFFF;
                     let gpu_idx = mapping.get(&sdf_obj_id).copied().unwrap_or(0);
-                    // Clear old obj_idx bits and write new gpu_idx.
                     face.packed = (face.packed & 0xFFF) | ((gpu_idx & 0xFFFF) << 12);
                 }
                 drop(mapping);
 
-                let face_count = faces.len() as u32;
+                let face_count = upload_faces.len() as u32;
 
                 // Upload face data via staging buffer.
-                let face_bytes: &[u8] = bytemuck::cast_slice(&faces);
+                let face_bytes: &[u8] = bytemuck::cast_slice(&upload_faces);
                 let face_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("face staging"),
                     size: face_bytes.len() as u64,
