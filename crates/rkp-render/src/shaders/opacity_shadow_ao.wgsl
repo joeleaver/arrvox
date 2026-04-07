@@ -114,7 +114,7 @@ struct CoarseFieldInfo {
 
 // Group 1: GpuScene (same layout as shade group 4 / ray_march group 0)
 @group(1) @binding(0) var<storage, read> brick_pool: array<VoxelSample>;
-@group(1) @binding(1) var<storage, read> brick_maps: array<u32>;
+@group(1) @binding(1) var<storage, read> octree_nodes: array<u32>;
 @group(1) @binding(2) var<storage, read> objects: array<GpuObject>;
 // binding 3 = camera uniforms (not used here)
 @group(1) @binding(4) var<uniform> v2_scene: SceneUniformsV2;
@@ -165,73 +165,75 @@ fn extract_opacity(word0: u32) -> f32 {
     return clamp(unpack2x16float(word0 & 0xFFFFu).x, 0.0, 1.0);
 }
 
+// ---------- Octree Traversal ----------
+
+const OCTREE_LEAF_BIT: u32 = 0x80000000u;
+
+fn octree_find_slot(root: u32, max_depth: u32, extent: f32, octree_pos: vec3<f32>) -> u32 {
+    var offset = root;
+    var half = extent * 0.5;
+    var center = vec3<f32>(half);
+    for (var level = 0u; level < max_depth; level++) {
+        let node = octree_nodes[offset];
+        if node == EMPTY_SLOT { return EMPTY_SLOT; }
+        if node == INTERIOR_SLOT { return INTERIOR_SLOT; }
+        if (node & OCTREE_LEAF_BIT) != 0u { return node & 0x7FFFFFFFu; }
+        let gt = vec3<u32>(octree_pos >= center);
+        let child = gt.x + gt.y * 2u + gt.z * 4u;
+        offset = node + child;
+        half *= 0.5;
+        center += vec3<f32>(
+            select(-half, half, octree_pos.x >= center.x),
+            select(-half, half, octree_pos.y >= center.y),
+            select(-half, half, octree_pos.z >= center.z),
+        );
+    }
+    let node = octree_nodes[offset];
+    if node == EMPTY_SLOT { return EMPTY_SLOT; }
+    if node == INTERIOR_SLOT { return INTERIOR_SLOT; }
+    if (node & OCTREE_LEAF_BIT) != 0u { return node & 0x7FFFFFFFu; }
+    return EMPTY_SLOT;
+}
+
 // ---------- Opacity Field Sampling ----------
 
-fn sample_opacity_at(obj_offset: u32, vc: vec3<i32>, dims: vec3<u32>,
-                     total_voxels: vec3<i32>) -> f32 {
-    let c = clamp(vc, vec3<i32>(0), total_voxels - vec3<i32>(1));
-    let brick = vec3<u32>(c / vec3<i32>(8));
-    let local = vec3<u32>(c % vec3<i32>(8));
-    let flat_brick = brick.x + brick.y * dims.x + brick.z * dims.x * dims.y;
-    let slot = brick_maps[obj_offset + flat_brick];
-    if slot == EMPTY_SLOT {
-        return 0.0;
-    }
-    if slot == INTERIOR_SLOT {
-        return 1.0;
-    }
-    let idx = slot * 512u + local.x + local.y * 8u + local.z * 64u;
-    return extract_opacity(brick_pool[idx].word0);
+fn sample_opacity_point(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
+    let extent = bitcast<f32>(obj.brick_map_dims_y);
+    let octree_pos = local_pos + vec3<f32>(extent * 0.5);
+    if any(octree_pos < vec3<f32>(0.0)) || any(octree_pos >= vec3<f32>(extent)) { return 0.0; }
+    let slot = octree_find_slot(obj.brick_map_offset, obj.brick_map_dims_x, extent, octree_pos);
+    if slot == EMPTY_SLOT { return 0.0; }
+    if slot == INTERIOR_SLOT { return 1.0; }
+    let vs = obj.voxel_size;
+    let brick_extent = vs * 8.0;
+    let brick_origin = floor(octree_pos / brick_extent) * brick_extent;
+    let in_brick = (octree_pos - brick_origin) / vs;
+    let vx = clamp(u32(in_brick.x), 0u, 7u);
+    let vy = clamp(u32(in_brick.y), 0u, 7u);
+    let vz = clamp(u32(in_brick.z), 0u, 7u);
+    return extract_opacity(brick_pool[slot * 512u + vx + vy * 8u + vz * 64u].word0);
 }
 
 fn sample_opacity_trilinear(local_pos: vec3<f32>, obj: GpuObject) -> f32 {
     let vs = obj.voxel_size;
-    let brick_extent = vs * 8.0;
-    let dims = vec3<u32>(obj.brick_map_dims_x, obj.brick_map_dims_y, obj.brick_map_dims_z);
-    let grid_size = vec3<f32>(dims) * brick_extent;
-    let grid_pos = local_pos + grid_size * 0.5;
-    let clamped = clamp(grid_pos, vec3<f32>(vs * 0.01), grid_size - vec3<f32>(vs * 0.01));
-    let outside_dist = length(grid_pos - clamped);
-
-    // Far outside the grid — transparent
-    if outside_dist > brick_extent * 2.0 {
-        return 0.0;
-    }
-
-    // Geometry AABB early-out
-    let geom_min = vec3<f32>(obj.geometry_aabb_min_x, obj.geometry_aabb_min_y, obj.geometry_aabb_min_z);
-    let geom_max = vec3<f32>(obj.geometry_aabb_max_x, obj.geometry_aabb_max_y, obj.geometry_aabb_max_z);
-    if geom_max.x > geom_min.x {
-        let geom_closest = clamp(local_pos, geom_min, geom_max);
-        let geom_dist = length(local_pos - geom_closest);
-        if geom_dist > brick_extent {
-            return 0.0;
-        }
-    }
-
-    // Trilinear interpolation of opacity values
-    let voxel_coord = clamped / vs - vec3<f32>(0.5);
-    let v0 = vec3<i32>(floor(voxel_coord));
-    let t = voxel_coord - vec3<f32>(v0);
-    let total_voxels = vec3<i32>(dims) * 8;
-
-    let c000 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(0, 0, 0), dims, total_voxels);
-    let c100 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(1, 0, 0), dims, total_voxels);
-    let c010 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(0, 1, 0), dims, total_voxels);
-    let c110 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(1, 1, 0), dims, total_voxels);
-    let c001 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(0, 0, 1), dims, total_voxels);
-    let c101 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(1, 0, 1), dims, total_voxels);
-    let c011 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(0, 1, 1), dims, total_voxels);
-    let c111 = sample_opacity_at(obj.brick_map_offset, v0 + vec3<i32>(1, 1, 1), dims, total_voxels);
-
-    let c00 = mix(c000, c100, t.x);
-    let c10 = mix(c010, c110, t.x);
-    let c01 = mix(c001, c101, t.x);
-    let c11 = mix(c011, c111, t.x);
-    let c0 = mix(c00, c10, t.y);
-    let c1 = mix(c01, c11, t.y);
-
-    return mix(c0, c1, t.z);
+    let h = vs * 0.5;
+    let s000 = sample_opacity_point(local_pos + vec3(-h, -h, -h), obj);
+    let s100 = sample_opacity_point(local_pos + vec3( h, -h, -h), obj);
+    let s010 = sample_opacity_point(local_pos + vec3(-h,  h, -h), obj);
+    let s110 = sample_opacity_point(local_pos + vec3( h,  h, -h), obj);
+    let s001 = sample_opacity_point(local_pos + vec3(-h, -h,  h), obj);
+    let s101 = sample_opacity_point(local_pos + vec3( h, -h,  h), obj);
+    let s011 = sample_opacity_point(local_pos + vec3(-h,  h,  h), obj);
+    let s111 = sample_opacity_point(local_pos + vec3( h,  h,  h), obj);
+    let extent = bitcast<f32>(obj.brick_map_dims_y);
+    let f = fract((local_pos + vec3(extent * 0.5)) / vs + 0.5);
+    let x0 = mix(s000, s100, f.x);
+    let x1 = mix(s010, s110, f.x);
+    let x2 = mix(s001, s101, f.x);
+    let x3 = mix(s011, s111, f.x);
+    let y0 = mix(x0, x1, f.y);
+    let y1 = mix(x2, x3, f.y);
+    return mix(y0, y1, f.z);
 }
 
 // ---------- Object Opacity Evaluation ----------
@@ -384,9 +386,10 @@ fn shadow_transmittance_object(
             break;
         }
 
-        let bc = vec3<u32>(brick_coord);
-        let flat = bc.x + bc.y * udims.x + bc.z * udims.x * udims.y;
-        let slot = brick_maps[obj.brick_map_offset + flat];
+        // Octree lookup for this position instead of flat grid lookup.
+        let extent = bitcast<f32>(obj.brick_map_dims_y);
+        let octree_pos = local_pos + vec3<f32>(extent * 0.5);
+        let slot = octree_find_slot(obj.brick_map_offset, obj.brick_map_dims_x, extent, octree_pos);
 
         if slot == EMPTY_SLOT {
             // Empty space. Skip brick via ray-AABB.

@@ -162,9 +162,10 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
                         break;
                     }
 
-                    let bc = vec3<u32>(brick_coord);
-                    let flat = bc.x + bc.y * dims.x + bc.z * dims.x * dims.y;
-                    let slot = brick_maps[glass_obj.brick_map_offset + flat];
+                    // Octree lookup for glass transparency ray.
+                    let glass_extent = bitcast<f32>(glass_obj.brick_map_dims_y);
+                    let glass_octree_pos = local_pos + vec3<f32>(glass_extent * 0.5);
+                    let slot = octree_find_slot(glass_obj.brick_map_offset, glass_obj.brick_map_dims_x, glass_extent, glass_octree_pos);
 
                     if slot == EMPTY_SLOT {
                         // Exited object.

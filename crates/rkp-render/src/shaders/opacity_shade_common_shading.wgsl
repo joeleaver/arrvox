@@ -546,9 +546,10 @@ fn march_glass_interior(
             return vec2<f32>(t / max(world_scale, 1e-10), 1.0);
         }
 
-        let bc = vec3<u32>(brick_coord);
-        let flat = bc.x + bc.y * dims.x + bc.z * dims.x * dims.y;
-        let slot = brick_maps[obj.brick_map_offset + flat];
+        // Octree lookup for SSS/refraction ray.
+        let sss_extent = bitcast<f32>(obj.brick_map_dims_y);
+        let sss_octree_pos = local_pos + vec3<f32>(sss_extent * 0.5);
+        let slot = octree_find_slot(obj.brick_map_offset, obj.brick_map_dims_x, sss_extent, sss_octree_pos);
 
         if slot == EMPTY_SLOT {
             let world_scale = length((obj.inverse_world * vec4<f32>(refract_dir, 0.0)).xyz);
@@ -852,23 +853,9 @@ fn trace_and_shade_behind_glass(
 
 /// Read a single brush overlay voxel. Returns geodesic distance or -1.0 if unmapped.
 fn read_brush_overlay_voxel(vc: vec3<i32>, dims: vec3<u32>, bm_offset: u32) -> f32 {
-    let max_v = vec3<i32>(dims) * 8 - vec3<i32>(1);
-    if any(vc < vec3<i32>(0)) || any(vc > max_v) {
-        return -1.0;
-    }
-    let brick = vec3<u32>(vc / vec3<i32>(8));
-    let lv = vec3<u32>(vc % vec3<i32>(8));
-    let flat_brick = brick.x + brick.y * dims.x + brick.z * dims.x * dims.y;
-    let slot = brick_maps[bm_offset + flat_brick];
-    if slot == EMPTY_SLOT || slot == INTERIOR_SLOT {
-        return -1.0;
-    }
-    let overlay_slot = brush_overlay_map[slot];
-    if overlay_slot == EMPTY_SLOT {
-        return -1.0;
-    }
-    let vi = lv.x + lv.y * 8u + lv.z * 64u;
-    return brush_overlay_data[overlay_slot * 512u + vi];
+    // Brush overlay not yet supported with octree — return no overlay.
+    // TODO: implement octree-aware brush overlay lookup.
+    return -1.0;
 }
 
 /// Sample the brush overlay geodesic distance at a local-space position on a voxelized object.
