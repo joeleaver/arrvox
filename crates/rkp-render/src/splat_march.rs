@@ -225,6 +225,7 @@ impl rkf_render::MarchPass for SplatMarchPass {
         voxel_size: f32,
         bake_scale: glam::Vec3,
         pool: &mut rkf_core::brick_pool::BrickPool,
+        _object_id: u32,
     ) -> Option<(rkf_core::scene_node::SpatialHandle, f32, rkf_core::Aabb, u32)> {
         use rkf_core::brick_map::{BrickMap, EMPTY_SLOT, INTERIOR_SLOT};
         use rkf_core::constants::BRICK_DIM;

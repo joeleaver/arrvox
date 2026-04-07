@@ -22,12 +22,15 @@ pub struct SplatRasterPass {
     octree: OctreeGpu,
     /// Pending surface shell uploads (slot, occupancy) — flushed in dispatch via staging.
     pending_shell_uploads: std::cell::RefCell<Vec<(u32, [u64; 8])>>,
-    /// Pending face instances from CPU-side emit — uploaded in dispatch.
+    /// Face instances from CPU-side emit. The packed field stores sdf_object_id
+    /// (not GPU index) — corrected during upload using object_gpu_mapping.
     pending_faces: std::cell::RefCell<Vec<crate::splat_emit::FaceInstance>>,
     /// The device, needed for creating staging buffers in dispatch.
     device: wgpu::Device,
     /// Whether face data needs re-upload.
     faces_dirty: std::cell::Cell<bool>,
+    /// Mapping from SDF object_id → GPU object index. Updated by the engine.
+    object_gpu_mapping: std::cell::RefCell<std::collections::HashMap<u32, u32>>,
 }
 
 impl SplatRasterPass {
@@ -63,6 +66,7 @@ impl SplatRasterPass {
             pending_faces: std::cell::RefCell::new(Vec::new()),
             device: device.clone(),
             faces_dirty: std::cell::Cell::new(false),
+            object_gpu_mapping: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -389,7 +393,7 @@ impl rkf_render::MarchPass for SplatRasterPass {
             octree_extent,
             base_vs,
             pool,
-            0, // obj_idx
+            _object_id.unwrap_or(0),
         );
 
         self.faces_dirty.set(true);
@@ -471,6 +475,15 @@ impl rkf_render::MarchPass for SplatRasterPass {
         }
     }
 
+    fn set_object_gpu_index(&self, object_id: u32, gpu_index: u32) {
+        let mut mapping = self.object_gpu_mapping.borrow_mut();
+        let old = mapping.insert(object_id, gpu_index);
+        if old != Some(gpu_index) {
+            // Mapping changed — faces need re-upload with corrected obj_idx.
+            self.faces_dirty.set(true);
+        }
+    }
+
     fn prepare(&self, queue: &wgpu::Queue) {
         // Flush pending surface shell uploads.
         let mut pending = self.pending_shell_uploads.borrow_mut();
@@ -532,6 +545,17 @@ impl rkf_render::MarchPass for SplatRasterPass {
         {
             let mut faces = self.pending_faces.borrow_mut();
             if self.faces_dirty.get() && !faces.is_empty() {
+                // Patch obj_idx in packed field using the GPU object mapping.
+                // Faces store sdf_object_id in bits 12-27. Replace with GPU index.
+                let mapping = self.object_gpu_mapping.borrow();
+                for face in faces.iter_mut() {
+                    let sdf_obj_id = (face.packed >> 12) & 0xFFFF;
+                    let gpu_idx = mapping.get(&sdf_obj_id).copied().unwrap_or(0);
+                    // Clear old obj_idx bits and write new gpu_idx.
+                    face.packed = (face.packed & 0xFFF) | ((gpu_idx & 0xFFFF) << 12);
+                }
+                drop(mapping);
+
                 let face_count = faces.len() as u32;
 
                 // Upload face data via staging buffer.
@@ -636,6 +660,7 @@ impl rkf_render::MarchPass for SplatRasterPass {
         voxel_size: f32,
         bake_scale: glam::Vec3,
         pool: &mut rkf_core::brick_pool::BrickPool,
+        object_id: u32,
     ) -> Option<(rkf_core::scene_node::SpatialHandle, f32, rkf_core::Aabb, u32)> {
         use rkf_core::scene_node::SdfPrimitive;
 
@@ -708,7 +733,7 @@ impl rkf_render::MarchPass for SplatRasterPass {
         // This replaces the GPU emit pass — computed once per voxelization,
         // drawn every frame by the raster pass.
         let base_vs = octree.base_voxel_size();
-        let obj_idx = 0u32; // Will be corrected when we support multiple objects.
+        let obj_idx = object_id; // Stored as sdf_object_id, remapped to GPU index during upload.
 
         {
             let mut shells = self.pending_shell_uploads.borrow_mut();
