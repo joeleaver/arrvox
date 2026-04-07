@@ -463,10 +463,9 @@ fn fs_main(in: VsOutput) -> GBufferOutput {
     //     vec4<u32>(0u, 0u, 0u, 0u),
     // );
 
-    // Gradient normal with flat face normal fallback.
-    // At brick boundaries, octree_trilinear returns 0 for out-of-brick samples,
-    // producing a wrong gradient. Fall back to the flat face normal when the
-    // gradient is too weak (indicating incomplete samples).
+    // Gradient normal via per-tap octree traversal. Each tap does a full octree
+    // lookup, correctly crossing brick boundaries. Falls back to flat face normal
+    // at object edges where gradient is too weak.
     let face_id = unpack_face_id(in.packed);
     let flat_fn = face_normal(face_id);
     let world_face_normal = normalize(transform_dir_to_world(flat_fn, obj.inverse_world));
@@ -475,17 +474,15 @@ fn fs_main(in: VsOutput) -> GBufferOutput {
 
     if obj.is_skinned == 0u || obj.bone_count == 0u {
         let eps = vs * 2.0;
-        let gx = octree_trilinear(octree_pos + vec3(eps, 0.0, 0.0), root, depth, extent, vs)
-               - octree_trilinear(octree_pos - vec3(eps, 0.0, 0.0), root, depth, extent, vs);
-        let gy = octree_trilinear(octree_pos + vec3(0.0, eps, 0.0), root, depth, extent, vs)
-               - octree_trilinear(octree_pos - vec3(0.0, eps, 0.0), root, depth, extent, vs);
-        let gz = octree_trilinear(octree_pos + vec3(0.0, 0.0, eps), root, depth, extent, vs)
-               - octree_trilinear(octree_pos - vec3(0.0, 0.0, eps), root, depth, extent, vs);
+        let gx = octree_sample_opacity(octree_pos + vec3(eps, 0.0, 0.0), root, depth, extent, vs)
+               - octree_sample_opacity(octree_pos - vec3(eps, 0.0, 0.0), root, depth, extent, vs);
+        let gy = octree_sample_opacity(octree_pos + vec3(0.0, eps, 0.0), root, depth, extent, vs)
+               - octree_sample_opacity(octree_pos - vec3(0.0, eps, 0.0), root, depth, extent, vs);
+        let gz = octree_sample_opacity(octree_pos + vec3(0.0, 0.0, eps), root, depth, extent, vs)
+               - octree_sample_opacity(octree_pos - vec3(0.0, 0.0, eps), root, depth, extent, vs);
         let local_grad = -vec3<f32>(gx, gy, gz);
         let grad_len = length(local_grad);
-        // Only use gradient normal if it's strong enough — weak gradient means
-        // we sampled outside the data (brick boundary or edge of object).
-        if grad_len > 0.1 {
+        if grad_len > 0.01 {
             let world_grad = transform_dir_to_world(local_grad, obj.inverse_world);
             normal = normalize(world_grad);
         }
