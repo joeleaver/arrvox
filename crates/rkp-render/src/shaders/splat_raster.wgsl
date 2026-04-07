@@ -29,50 +29,29 @@ struct VoxelSample {
     word1: u32,
 }
 
-// GpuObject — 320 bytes. Matches rkf-render's GpuObject layout exactly so
-// we can read the engine's object buffer directly.
+// RkpGpuObject — 192 bytes. Matches rkp-render's RkpGpuObject layout.
+// No inverse_world — world transform is at offset 0.
 struct RkpObject {
-    inverse_world: mat4x4<f32>,     // offset 0
-    aabb_min: vec4<f32>,            // offset 64
-    aabb_max: vec4<f32>,            // offset 80
-    octree_root: u32,               // offset 96
-    octree_depth: u32,              // offset 100
-    octree_extent_bits: u32,        // offset 104
-    _reserved_dims_z: u32,          // offset 108
-    voxel_size: f32,                // offset 112
-    material_id: u32,               // offset 116
-    geom_type: u32,                 // offset 120
-    blend_mode: u32,                // offset 124
-    blend_radius: f32,              // offset 128
-    sdf_param_0: f32,               // offset 132
-    sdf_param_1: f32,               // offset 136
-    sdf_param_2: f32,               // offset 140
-    sdf_param_3: f32,               // offset 144
-    accumulated_scale_x: f32,       // offset 148
-    accumulated_scale_y: f32,       // offset 152
-    accumulated_scale_z: f32,       // offset 156
-    lod_level: u32,                 // offset 160
-    object_id: u32,                 // offset 164
-    primitive_type: u32,            // offset 168
-    geometry_aabb_min_x: f32,       // offset 172
-    geometry_aabb_min_y: f32,       // offset 176
-    geometry_aabb_min_z: f32,       // offset 180
-    geometry_aabb_max_x: f32,       // offset 184
-    geometry_aabb_max_y: f32,       // offset 188
-    geometry_aabb_max_z: f32,       // offset 192
-    is_skinned: u32,                // offset 196
-    bone_count: u32,                // offset 200
-    bone_buffer_offset: u32,        // offset 204
-    rest_octree_root: u32,          // offset 208
-    rest_octree_depth: u32,         // offset 212
-    rest_octree_extent_bits: u32,   // offset 216
-    _rest_reserved: u32,            // offset 220
-    shell_height: f32,              // offset 224
-    sdf_shader_id: u32,             // offset 228
-    sdf_shader_material: u32,       // offset 232
-    deformed_pool_offset: u32,      // offset 236
-    _pad10: u32, _pad11: u32, _pad12: u32, _pad13: u32, // offset 240-255
-    world: mat4x4<f32>,             // offset 256 — forward transform (local→world)
+    world: mat4x4<f32>,             // offset 0, 64 bytes — local→world
+    aabb_min: vec3<f32>,            // offset 64
+    octree_root: u32,               // offset 76
+    aabb_max: vec3<f32>,            // offset 80
+    octree_depth: u32,              // offset 92
+    octree_extent_bits: u32,        // offset 96
+    voxel_size: f32,                // offset 100
+    material_id: u32,               // offset 104
+    object_id: u32,                 // offset 108
+    geom_type: u32,                 // offset 112
+    is_skinned: u32,                // offset 116
+    bone_count: u32,                // offset 120
+    bone_buffer_offset: u32,        // offset 124
+    rest_octree_root: u32,          // offset 128
+    rest_octree_depth: u32,         // offset 132
+    rest_octree_extent_bits: u32,   // offset 136
+    deformed_pool_offset: u32,      // offset 140
+    _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32,     // offset 144-159
+    _pad4: u32, _pad5: u32, _pad6: u32, _pad7: u32,     // offset 160-175
+    _pad8: u32, _pad9: u32, _pad10: u32, _pad11: u32,   // offset 176-191
 }
 
 struct CameraUniforms {

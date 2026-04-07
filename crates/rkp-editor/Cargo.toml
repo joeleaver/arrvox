@@ -3,12 +3,16 @@ name = "rkp-editor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "RKIPatch editor — gaussian splat scene editor, thin wrapper over rkf-editor"
+description = "RKIPatch editor — gaussian splat scene editor, thin client over RkpEngine"
 
 [dependencies]
+rkp-engine = { workspace = true }
 rkp-render = { workspace = true }
 rkf-render = { workspace = true }
-rkf-editor = { workspace = true }
+rinch = { workspace = true, features = ["desktop", "gpu", "components", "theme"] }
 anyhow = { workspace = true }
+glam = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+crossbeam = "0.8"
 log = { workspace = true }
 env_logger = { workspace = true }

@@ -1,0 +1,19 @@
+[package]
+name = "rkp-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rkp-core = { workspace = true }
+rkp-render = { workspace = true }
+rkf-core = { workspace = true }
+rkf-render = { workspace = true }
+glam = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+crossbeam = "0.8"
+log = { workspace = true }

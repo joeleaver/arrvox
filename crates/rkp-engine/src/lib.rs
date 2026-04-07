@@ -1,0 +1,20 @@
+//! RKP Engine — self-contained game engine for gaussian splat rendering.
+//!
+//! The engine runs on its own thread with its own tick loop. It owns the scene
+//! (ECS world), renderer (RkpRenderer), physics, and animation. Communication
+//! with the outside world (editor, game, test harness) is via:
+//!
+//! - **Commands in:** `crossbeam::channel::Sender<EngineCommand>` — async mutations
+//! - **State out:** `StateCallback` — called each tick with current state
+//! - **Pixels out:** `FrameCallback` — called each tick with rendered frame
+//!
+//! The engine never calls back into the client via traits. Callbacks are plain `Fn`.
+
+pub mod command;
+pub mod snapshot;
+pub mod engine;
+pub mod scene_sync;
+
+pub use command::EngineCommand;
+pub use snapshot::{StateUpdate, SceneObjectInfo};
+pub use engine::RkpEngine;

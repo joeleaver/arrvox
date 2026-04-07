@@ -1,15 +1,9 @@
-//! RKP-Render: Splat rendering pipeline.
+//! RKP-Render: Gaussian splat rendering pipeline.
 //!
-//! Replaces rkf-render's ray march with a fixed-step march through the opacity
-//! field. All other passes (shading, shadows, GI, post-process) are reused from
-//! rkf-render via direct dependency.
-//!
-//! The only new pass is [`SplatMarchPass`] — everything else is orchestration.
+//! Forward rasterization of surface-shell voxels into a G-buffer, followed by
+//! deferred shadow/AO and PBR shading. Post-processing (tone mapping, bloom,
+//! etc.) is handled by the caller (RkpEngine) using rkf-render passes.
 
-/// Splat march compute pass — surface-finding through opacity field, G-buffer output.
-pub mod splat_march;
-/// Opacity volume manager — procedural geometry volumes for opacity shaders.
-pub mod opacity_volume;
 /// Direct mesh-to-opacity voxelization — bypasses SDF for smooth splat fields.
 pub mod voxelize_opacity;
 /// GPU octree buffer management and GpuObject field reinterpretation.
@@ -18,8 +12,6 @@ pub mod octree_gpu;
 pub mod splat_emit;
 /// Rasterization render pipeline — draws face quads into G-buffer via MRT.
 pub mod splat_raster;
-/// SplatRasterPass — MarchPass implementation using forward rasterization.
-pub mod splat_raster_pass;
 /// Per-object GPU struct — forward world transform, octree params, no inverse_world.
 pub mod rkp_gpu_object;
 /// Scene GPU buffer management — single upload path for all data.
@@ -30,11 +22,11 @@ pub mod rkp_shadow_ao;
 pub mod rkp_shade;
 /// Frame renderer — orchestrates the full pipeline.
 pub mod rkp_renderer;
+/// Scene management — voxel pool, octree, face emission, asset loading.
+pub mod rkp_scene_manager;
 
-pub use splat_march::SplatMarchPass;
-pub use splat_raster_pass::SplatRasterPass;
-pub use opacity_volume::{OpacityVolume, OpacityVolumeManager};
 pub use voxelize_opacity::import_mesh_to_opacity_rkf;
 pub use voxelize_opacity::import_mesh_to_opacity_rkp;
 pub use octree_gpu::OctreeGpu;
 pub use splat_emit::SplatEmitPass;
+pub use rkp_scene_manager::RkpSceneManager;
