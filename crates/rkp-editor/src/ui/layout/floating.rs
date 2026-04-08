@@ -53,12 +53,18 @@ fn FloatingPanelWindow(index: usize) -> NodeHandle {
                     let fp = pi.get();
                     let (px, py) = (x.get(), y.get());
                     let (w, h) = fp.map(|f| (f.width, f.height)).unwrap_or((400.0, 300.0));
-                    let pe = if is_being_dragged.get() { "pointer-events:none;" } else { "" };
+                    let drag_style = if is_being_dragged.get() {
+                        // During drag: shrink to just the title bar, move to cursor,
+                        // and make transparent to pointer events below the title bar.
+                        "opacity:0.5;pointer-events:none;"
+                    } else {
+                        ""
+                    };
                     format!(
                         "position:absolute;left:{:.0}px;top:{:.0}px;width:{:.0}px;height:{:.0}px;\
                          z-index:200;background:#252526;border:1px solid #3c3c3c;\
                          border-radius:4px;box-shadow:0 4px 16px rgba(0,0,0,0.4);\
-                         display:flex;flex-direction:column;overflow:hidden;{pe}",
+                         display:flex;flex-direction:column;overflow:hidden;{drag_style}",
                         px, py, w, h
                     )
                 }
@@ -85,9 +91,8 @@ fn FloatingPanelWindow(index: usize) -> NodeHandle {
                     }
                 },
                 ondragmove: move || {
-                    // Track cursor to update floating panel position during drag.
                     let ctx = get_click_context();
-                    // Move panel to follow cursor (offset by half title bar height).
+                    // Track position for when drag ends without docking.
                     x.set(ctx.mouse_x - 100.0);
                     y.set(ctx.mouse_y - 14.0);
                 },
