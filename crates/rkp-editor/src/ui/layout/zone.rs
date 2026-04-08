@@ -56,11 +56,6 @@ pub fn ZoneComponent(container: ContainerKind, zone_idx: usize) -> NodeHandle {
                         store.drop_target.set(Some(DropTarget::Zone { container, zone_idx }));
                     }
                 },
-                ondragleave: move || {
-                    if store.drop_target.get() == Some(DropTarget::Zone { container, zone_idx }) {
-                        store.drop_target.set(None);
-                    }
-                },
                 ondrop: {
                     let store = store;
                     move || {
@@ -170,11 +165,6 @@ fn EdgeDropZone(container: ContainerKind, zone_idx: usize, edge: SplitEdge) -> N
             ondragenter: move || {
                 if store.tab_drag.get().is_some() {
                     store.drop_target.set(Some(target));
-                }
-            },
-            ondragleave: move || {
-                if store.drop_target.get() == Some(target) {
-                    store.drop_target.set(None);
                 }
             },
             ondrop: move || {

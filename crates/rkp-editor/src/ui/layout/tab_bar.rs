@@ -46,12 +46,6 @@ pub fn TabBar(container: ContainerKind, zone_idx: usize) -> NodeHandle {
                     }));
                 }
             },
-            ondragleave: move || {
-                // Only clear if we're the current drop target.
-                if store.drop_target.get() == Some(DropTarget::Zone { container, zone_idx }) {
-                    store.drop_target.set(None);
-                }
-            },
             ondrop: move || {
                 if let Some(data) = store.tab_drag.get() {
                     store.update_layout(|layout| {
