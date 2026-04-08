@@ -38,6 +38,8 @@ pub struct StateUpdate {
     pub project_name: Option<String>,
     /// Available model files — only sent when the list changes.
     pub available_models: Option<Vec<ModelInfo>>,
+    /// Inspector data for the selected entity — sent when selection changes.
+    pub inspector: Option<crate::inspector::InspectorSnapshot>,
 }
 
 /// Info about an available model file.

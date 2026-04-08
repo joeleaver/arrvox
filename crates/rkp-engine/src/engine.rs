@@ -619,6 +619,23 @@ impl EngineState {
                 });
             }
 
+            EngineCommand::SetObjectPosition { entity_id, position } => {
+                let idx = entity_id.as_u128() as usize;
+                if idx < self.gpu_objects.len() {
+                    self.gpu_objects[idx].world[3][0] = position.x;
+                    self.gpu_objects[idx].world[3][1] = position.y;
+                    self.gpu_objects[idx].world[3][2] = position.z;
+                }
+            }
+
+            EngineCommand::SetObjectRotation { entity_id, rotation } => {
+                let _ = (entity_id, rotation); // TODO: apply rotation to world matrix
+            }
+
+            EngineCommand::SetObjectScale { entity_id, scale } => {
+                let _ = (entity_id, scale); // TODO: apply scale to world matrix
+            }
+
             EngineCommand::SelectEntity { entity_id } => {
                 self.selected_entity = Some(entity_id);
             }
@@ -823,6 +840,54 @@ impl EngineState {
                 }
             }
         }
+    }
+
+    fn build_inspector_snapshot(&self) -> Option<crate::inspector::InspectorSnapshot> {
+        let selected = self.selected_entity?;
+        let idx = selected.as_u128() as usize;
+        if idx >= self.gpu_objects.len() {
+            return None;
+        }
+
+        let obj = &self.gpu_objects[idx];
+        let name = self.object_names.get(idx).cloned().unwrap_or_default();
+        let pos = [obj.world[3][0], obj.world[3][1], obj.world[3][2]];
+
+        use crate::inspector::*;
+
+        let transform = ComponentSnapshot {
+            name: "Transform".to_string(),
+            fields: vec![
+                FieldSnapshot {
+                    name: "Position".to_string(),
+                    field_type: FieldType::Vec3,
+                    value: FieldValue::Vec3(pos),
+                    range: None,
+                },
+                FieldSnapshot {
+                    name: "Rotation".to_string(),
+                    field_type: FieldType::Vec3,
+                    value: FieldValue::Vec3([0.0; 3]),
+                    range: Some((-180.0, 180.0)),
+                },
+                FieldSnapshot {
+                    name: "Scale".to_string(),
+                    field_type: FieldType::Vec3,
+                    value: FieldValue::Vec3([1.0; 3]),
+                    range: Some((0.01, 100.0)),
+                },
+            ],
+            removable: false,
+        };
+
+        Some(InspectorSnapshot {
+            entity_name: name,
+            entity_id: format!("{}", selected.as_simple()),
+            position: pos,
+            rotation: [0.0; 3],
+            scale: [1.0; 3],
+            components: vec![transform],
+        })
     }
 
     fn poll_import_completions(&mut self) {
@@ -1214,6 +1279,7 @@ impl EngineState {
             project_loaded: project,
             project_name,
             available_models: models,
+            inspector: self.build_inspector_snapshot(),
         }
     }
 }

@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use rkp_engine::{SceneObjectInfo, ModelInfo};
 use rkp_engine::gizmo::GizmoMode;
+use rkp_engine::inspector::InspectorSnapshot;
 
 use crate::ui::layout::{ContainerKind, LayoutConfig, PanelId, default_layout};
 
@@ -76,6 +77,8 @@ pub struct EditorStore {
     pub available_models: Signal<Vec<ModelInfo>>,
     /// Model path being dragged onto viewport (None = no drag).
     pub model_drag: Signal<Option<String>>,
+    /// Inspector data for the selected entity.
+    pub inspector: Signal<Option<InspectorSnapshot>>,
 
     // ── Drag state (tab dragging) ────────────────────────────────
 
@@ -152,6 +155,7 @@ impl EditorStore {
             project_name: Signal::new(String::new()),
             available_models: Signal::new(Vec::new()),
             model_drag: Signal::new(None),
+            inspector: Signal::new(None),
 
             // Drag state.
             tab_drag: Signal::new(None),
