@@ -95,6 +95,17 @@ pub fn LayoutRoot() -> NodeHandle {
                 }
             }
 
+            // Drop-cancel overlay — covers entire window behind zones.
+            // When cursor enters this (i.e., left all zones), clear drop target.
+            if store.tab_drag.get().is_some() {
+                div {
+                    style: "position:absolute;inset:0;z-index:1;",
+                    ondragenter: move || {
+                        store.drop_target.set(None);
+                    },
+                }
+            }
+
             // Floating panels (absolutely positioned over everything)
             FloatingPanelHost {}
 
