@@ -860,51 +860,33 @@ impl EngineState {
     fn scan_models(&mut self) {
         self.available_models.clear();
         if let Some(ref project_dir) = self.project_dir {
-            let objects_dir = project_dir.join("assets/objects");
-            if objects_dir.exists() {
-                if let Ok(entries) = std::fs::read_dir(&objects_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.extension().map(|e| e == "rkp").unwrap_or(false) {
-                            let name = path.file_stem()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                            self.available_models.push(crate::snapshot::ModelInfo {
-                                name,
-                                path: path.to_string_lossy().into_owned(),
-                                size,
-                            });
-                        }
-                    }
-                }
-            }
-            // Also scan root assets/ for .rkp files.
             let assets_dir = project_dir.join("assets");
             if assets_dir.exists() {
-                if let Ok(entries) = std::fs::read_dir(&assets_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.extension().map(|e| e == "rkp").unwrap_or(false) {
-                            let name = path.file_stem()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                            // Avoid duplicates.
-                            if !self.available_models.iter().any(|m| m.path == path.to_string_lossy().as_ref()) {
-                                self.available_models.push(crate::snapshot::ModelInfo {
-                                    name,
-                                    path: path.to_string_lossy().into_owned(),
-                                    size,
-                                });
-                            }
-                        }
-                    }
-                }
+                Self::scan_rkp_recursive(&assets_dir, &mut self.available_models);
             }
             self.available_models.sort_by(|a, b| a.name.cmp(&b.name));
             self.models_dirty = true;
             eprintln!("[RkpEngine] scanned {} models", self.available_models.len());
+        }
+    }
+
+    fn scan_rkp_recursive(dir: &std::path::Path, out: &mut Vec<crate::snapshot::ModelInfo>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                Self::scan_rkp_recursive(&path, out);
+            } else if path.extension().map(|e| e == "rkp").unwrap_or(false) {
+                let name = path.file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                out.push(crate::snapshot::ModelInfo {
+                    name,
+                    path: path.to_string_lossy().into_owned(),
+                    size,
+                });
+            }
         }
     }
 
