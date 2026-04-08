@@ -1,9 +1,12 @@
 //! Floating panel host — renders detached panels as draggable overlays.
+//!
+//! Drag the title bar to reposition. Drop onto a docked zone to re-dock.
+//! Close (×) removes the panel from the layout entirely.
 
 use rinch::prelude::*;
 
 use super::{ContainerKind, PanelId, panel_registry};
-use crate::ui::store::EditorStore;
+use crate::ui::store::{EditorStore, TabDragData, DropTarget};
 use crate::ui::panels::*;
 
 #[component]
@@ -15,7 +18,6 @@ pub fn FloatingPanelHost() -> NodeHandle {
     });
 
     rsx! {
-        // Floating panels are absolutely positioned over the main layout.
         for i in 0..floating_count.get() {
             FloatingPanelWindow {
                 key: i.to_string(),
@@ -57,38 +59,88 @@ fn FloatingPanelWindow(index: usize) -> NodeHandle {
                     )
                 }
             },
-            // Title bar — draggable
+            // Title bar — drag to reposition OR dock into a zone.
             div {
                 style: "height:28px;display:flex;align-items:center;padding:0 8px;\
                         background:#2d2d2d;cursor:grab;flex-shrink:0;\
                         border-bottom:1px solid #3c3c3c;justify-content:space-between;",
-                onclick: move || {
-                    let ctx = get_click_context();
-                    let start_x = x.get();
-                    let start_y = y.get();
-                    let start_mx = ctx.mouse_x;
-                    let start_my = ctx.mouse_y;
-                    Drag::absolute()
-                        .on_move(move |mx, my| {
-                            x.set(start_x + mx - start_mx);
-                            y.set(start_y + my - start_my);
-                        })
-                        .start();
+                onclick: {
+                    let panel_id = panel_id;
+                    move || {
+                        let ctx = get_click_context();
+                        let start_x = x.get();
+                        let start_y = y.get();
+                        let start_mx = ctx.mouse_x;
+                        let start_my = ctx.mouse_y;
+
+                        // Set up tab drag state so docked zones show drop targets.
+                        if let Some(pid) = panel_id {
+                            store.tab_drag.set(Some(TabDragData {
+                                panel: pid,
+                                source_container: ContainerKind::Left, // dummy — floating
+                                source_zone: 0,
+                            }));
+                        }
+
+                        Drag::absolute()
+                            .on_move(move |mx, my| {
+                                x.set(start_x + mx - start_mx);
+                                y.set(start_y + my - start_my);
+                            })
+                            .on_end(move |_mx, _my| {
+                                let drop = store.drop_target.get();
+                                let drag = store.tab_drag.get();
+
+                                // Clear drag state first.
+                                store.tab_drag.set(None);
+                                store.drop_target.set(None);
+
+                                // If dropped on a zone, dock it there.
+                                if let (Some(_data), Some(dt)) = (drag, drop) {
+                                    store.layout.update(|layout| {
+                                        match dt {
+                                            DropTarget::Zone { container, zone_idx } => {
+                                                layout.dock_panel(index, container, zone_idx);
+                                            }
+                                            DropTarget::Split { container, zone_idx, edge } => {
+                                                // Remove from floating, split-dock.
+                                                if index < layout.floating.len() {
+                                                    let fp = layout.floating.remove(index);
+                                                    let before = matches!(edge,
+                                                        crate::ui::store::SplitEdge::Top |
+                                                        crate::ui::store::SplitEdge::Left
+                                                    );
+                                                    layout.split_zone(fp.panel, container, zone_idx, before);
+                                                }
+                                            }
+                                        }
+                                    });
+                                } else {
+                                    // Stayed floating — update stored position.
+                                    store.layout.update(|layout| {
+                                        if index < layout.floating.len() {
+                                            layout.floating[index].x = x.get();
+                                            layout.floating[index].y = y.get();
+                                        }
+                                    });
+                                }
+                            })
+                            .start();
+                    }
                 },
                 span { style: "font-size:11px;color:#ccc;user-select:none;", {name} }
-                // Dock button — return to default container
+                // Close button
                 div {
-                    style: "cursor:pointer;font-size:10px;color:#888;padding:2px 4px;\
-                            border-radius:2px;",
+                    style: "cursor:pointer;font-size:14px;color:#888;padding:0 4px;\
+                            border-radius:2px;line-height:1;",
                     onclick: move || {
                         store.layout.update(|layout| {
-                            // Dock back to the right container by default.
-                            if !layout.right.zones.is_empty() {
-                                layout.dock_panel(index, ContainerKind::Right, 0);
+                            if index < layout.floating.len() {
+                                layout.floating.remove(index);
                             }
                         });
                     },
-                    {"Dock"}
+                    {"\u{00d7}"} // ×
                 }
             }
             // Panel content
