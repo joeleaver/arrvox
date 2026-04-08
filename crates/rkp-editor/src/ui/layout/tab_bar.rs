@@ -74,20 +74,6 @@ pub fn TabBar(container: ContainerKind, zone_idx: usize) -> NodeHandle {
                         }
                     },
                     ondragend: move || {
-                        // If no drop target was set, float the panel.
-                        let drag_data = store.tab_drag.get();
-                        let drop = store.drop_target.get();
-                        if drop.is_none() {
-                            if let Some(data) = drag_data {
-                                store.update_layout(|layout| {
-                                    let tab_idx = layout.container(data.source_container)
-                                        .zones.get(data.source_zone)
-                                        .and_then(|z| z.tabs.iter().position(|&p| p == data.panel))
-                                        .unwrap_or(0);
-                                    layout.float_panel(data.source_container, data.source_zone, tab_idx);
-                                });
-                            }
-                        }
                         store.tab_drag.set(None);
                         store.drop_target.set(None);
                     },

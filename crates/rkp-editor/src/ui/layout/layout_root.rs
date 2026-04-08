@@ -4,7 +4,6 @@ use rinch::prelude::*;
 
 use super::ContainerKind;
 use super::container::ContainerComponent;
-use super::floating::FloatingPanelHost;
 use super::splitter::{ContainerSplitter, SplitDirection, SplitTarget};
 use crate::ui::store::EditorStore;
 use crate::ui::panels::StatusBar;
@@ -99,9 +98,6 @@ pub fn LayoutRoot() -> NodeHandle {
                     ContainerComponent { kind: ContainerKind::Right }
                 }
             }
-
-            // Floating panels (absolutely positioned over everything)
-            FloatingPanelHost {}
 
             // Status bar
             StatusBar {}
