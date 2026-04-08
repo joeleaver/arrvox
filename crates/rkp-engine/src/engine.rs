@@ -611,12 +611,14 @@ impl EngineState {
                 match crate::project::create_project(&path) {
                     Ok(project_dir) => {
                         self.clear_scene();
-                        self.project_dir = Some(project_dir.clone());
-                        self.project_path = Some(path);
-                        self.scene_path = Some(project_dir.join("scenes/default.rkscene"));
-                        self.project_name = project_dir.file_name()
+                        let project_name = project_dir.file_name()
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_default();
+                        let project_file = project_dir.join(format!("{project_name}.rkproject"));
+                        self.project_dir = Some(project_dir.clone());
+                        self.project_path = Some(project_file);
+                        self.scene_path = Some(project_dir.join("scenes/default.rkscene"));
+                        self.project_name = project_name;
                         self.project_loaded = true;
                         self.project_dirty = true;
                         self.scene_dirty = true;

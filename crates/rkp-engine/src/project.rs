@@ -29,14 +29,21 @@ impl ProjectFile {
 
 /// Create a new project directory structure at the given path.
 ///
-/// `path` should be the desired `.rkproject` file path.
+/// `path` should be the desired `.rkproject` file path. The project
+/// is created inside a new subdirectory named after the project:
+/// e.g. `/home/user/MyProject.rkproject` → `/home/user/MyProject/MyProject.rkproject`
+///
 /// Returns the project root directory.
 pub fn create_project(path: &Path) -> Result<PathBuf, String> {
-    let project_dir = path.parent()
-        .ok_or_else(|| "invalid project path".to_string())?;
     let project_name = path.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "Untitled".to_string());
+
+    // Create the project inside a new subdirectory named after the project.
+    let parent = path.parent()
+        .ok_or_else(|| "invalid project path".to_string())?;
+    let project_dir = parent.join(&project_name);
+    let project_file = project_dir.join(format!("{project_name}.rkproject"));
 
     // Create directory structure.
     std::fs::create_dir_all(project_dir.join("scenes"))
@@ -50,7 +57,7 @@ pub fn create_project(path: &Path) -> Result<PathBuf, String> {
     let project = ProjectFile::new(&project_name);
     let json = serde_json::to_string_pretty(&project)
         .map_err(|e| format!("serialize project: {e}"))?;
-    std::fs::write(path, &json)
+    std::fs::write(&project_file, &json)
         .map_err(|e| format!("write project file: {e}"))?;
 
     // Create default empty scene.
