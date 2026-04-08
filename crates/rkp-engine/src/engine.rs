@@ -165,6 +165,7 @@ struct EngineState {
 
     // ECS — the source of truth for scene state.
     world: hecs::World,
+    registry: crate::component_registry::ComponentRegistry,
     /// Stable UUID ↔ hecs Entity mapping.
     entity_uuids: std::collections::HashMap<hecs::Entity, uuid::Uuid>,
     uuid_to_entity: std::collections::HashMap<uuid::Uuid, hecs::Entity>,
@@ -302,6 +303,11 @@ impl EngineState {
             camera_control,
             camera: CameraState::default(),
             world: hecs::World::new(),
+            registry: {
+                let mut r = crate::component_registry::ComponentRegistry::new();
+                crate::component_registry::register_builtins(&mut r);
+                r
+            },
             entity_uuids: std::collections::HashMap::new(),
             uuid_to_entity: std::collections::HashMap::new(),
             next_entity_uuid: 1,
@@ -786,6 +792,40 @@ impl EngineState {
                 self.input_system.feed_key_up(key);
             }
 
+            EngineCommand::SetComponentField { entity_id, component_name, field_name, value } => {
+                if let Some(entity) = self.resolve_entity(&entity_id) {
+                    if let Some(entry) = self.registry.get(&component_name) {
+                        if let Ok(fv) = serde_json::from_str::<crate::inspector::FieldValue>(&value) {
+                            if let Err(e) = (entry.set_field)(&mut self.world, entity, &field_name, fv) {
+                                eprintln!("[RkpEngine] set_field failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+
+            EngineCommand::AddComponent { entity_id, component_name } => {
+                if let Some(entity) = self.resolve_entity(&entity_id) {
+                    if let Some(entry) = self.registry.get(&component_name) {
+                        if let Err(e) = (entry.add_default)(&mut self.world, entity) {
+                            eprintln!("[RkpEngine] add component failed: {e}");
+                        }
+                        self.scene_dirty = true;
+                    }
+                }
+            }
+
+            EngineCommand::RemoveComponent { entity_id, component_name } => {
+                if let Some(entity) = self.resolve_entity(&entity_id) {
+                    if let Some(entry) = self.registry.get(&component_name) {
+                        if let Err(e) = (entry.remove)(&mut self.world, entity) {
+                            eprintln!("[RkpEngine] remove component failed: {e}");
+                        }
+                        self.scene_dirty = true;
+                    }
+                }
+            }
+
             _ => {
                 eprintln!("[RkpEngine] unhandled command: {cmd:?}");
             }
@@ -907,43 +947,44 @@ impl EngineState {
         let name = self.world.get::<&crate::components::EditorMetadata>(selected)
             .map(|m| m.name.clone())
             .unwrap_or_default();
-        let transform = self.world.get::<&crate::components::Transform>(selected).ok()?;
-        let pos = transform.position.to_array();
 
         use crate::inspector::*;
 
-        let transform_snapshot = ComponentSnapshot {
-            name: "Transform".to_string(),
-            fields: vec![
+        // Build component snapshots from the registry.
+        let mut components = Vec::new();
+        for entry in self.registry.components_on(&self.world, selected) {
+            let fields: Vec<FieldSnapshot> = entry.meta.iter().map(|meta| {
+                let value = (entry.get_field)(&self.world, selected, meta.name)
+                    .unwrap_or(FieldValue::String("<error>".into()));
                 FieldSnapshot {
-                    name: "Position".to_string(),
-                    field_type: FieldType::Vec3,
-                    value: FieldValue::Vec3(pos),
-                    range: None,
-                },
-                FieldSnapshot {
-                    name: "Rotation".to_string(),
-                    field_type: FieldType::Vec3,
-                    value: FieldValue::Vec3(transform.rotation.to_array()),
-                    range: Some((-180.0, 180.0)),
-                },
-                FieldSnapshot {
-                    name: "Scale".to_string(),
-                    field_type: FieldType::Vec3,
-                    value: FieldValue::Vec3(transform.scale.to_array()),
-                    range: Some((0.01, 100.0)),
-                },
-            ],
-            removable: false,
-        };
+                    name: meta.name.to_string(),
+                    field_type: meta.field_type,
+                    value,
+                    range: meta.range,
+                    transient: meta.transient,
+                    ..Default::default()
+                }
+            }).collect();
+            components.push(ComponentSnapshot {
+                name: entry.name.to_string(),
+                fields,
+                removable: !entry.mandatory,
+            });
+        }
+
+        // Extract position/rotation/scale from Transform if present.
+        let transform = self.world.get::<&crate::components::Transform>(selected).ok();
+        let pos = transform.as_ref().map(|t| t.position.to_array()).unwrap_or([0.0; 3]);
+        let rot = transform.as_ref().map(|t| t.rotation.to_array()).unwrap_or([0.0; 3]);
+        let scl = transform.as_ref().map(|t| t.scale.to_array()).unwrap_or([1.0; 3]);
 
         Some(InspectorSnapshot {
             entity_name: name,
             entity_id: format!("{}", self.get_entity_uuid(selected).as_simple()),
             position: pos,
-            rotation: transform.rotation.to_array(),
-            scale: transform.scale.to_array(),
-            components: vec![transform_snapshot],
+            rotation: rot,
+            scale: scl,
+            components,
         })
     }
 
@@ -1394,6 +1435,12 @@ impl EngineState {
             project_name,
             available_models: models,
             inspector: self.build_inspector_snapshot(),
+            available_components: self.selected_entity.map(|entity| {
+                self.registry.available_for(&self.world, entity)
+                    .iter()
+                    .map(|e| e.name.to_string())
+                    .collect()
+            }),
         }
     }
 }

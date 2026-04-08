@@ -40,6 +40,8 @@ pub struct StateUpdate {
     pub available_models: Option<Vec<ModelInfo>>,
     /// Inspector data for the selected entity — sent when selection changes.
     pub inspector: Option<crate::inspector::InspectorSnapshot>,
+    /// Component names that can be added to the selected entity.
+    pub available_components: Option<Vec<String>>,
 }
 
 /// Info about an available model file.

@@ -56,6 +56,10 @@ pub struct FieldSnapshot {
     pub value: FieldValue,
     /// Optional range for numeric fields (min, max).
     pub range: Option<(f64, f64)>,
+    /// Transient fields are runtime-only (not persisted).
+    pub transient: bool,
+    /// For AssetRef fields — file extension filter.
+    pub asset_filter: Option<String>,
 }
 
 /// Snapshot of a single component on an entity.
