@@ -26,9 +26,14 @@ pub fn LayoutRoot() -> NodeHandle {
                 "RKIPatch Editor"
             }
 
-            // Main area
+            // Main area. ondragleave clears drop target when cursor exits
+            // entirely. Child zone ondragenter immediately re-sets it if
+            // the cursor is still over a zone.
             div {
                 style: "display:flex;flex:1;min-height:0;",
+                ondragleave: move || {
+                    store.drop_target.set(None);
+                },
 
                 // Left container
                 div {
@@ -92,17 +97,6 @@ pub fn LayoutRoot() -> NodeHandle {
                         )
                     },
                     ContainerComponent { kind: ContainerKind::Right }
-                }
-            }
-
-            // Drop-cancel overlay — covers entire window behind zones.
-            // When cursor enters this (i.e., left all zones), clear drop target.
-            if store.tab_drag.get().is_some() {
-                div {
-                    style: "position:absolute;inset:0;z-index:1;",
-                    ondragenter: move || {
-                        store.drop_target.set(None);
-                    },
                 }
             }
 
