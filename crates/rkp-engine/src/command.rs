@@ -6,6 +6,7 @@
 //! mode, debug views, tool settings) is NOT here — it stays in the editor client.
 
 use glam::Vec3;
+use rkf_runtime::input::{InputKeyCode, InputMouseButton};
 use uuid::Uuid;
 
 /// A command sent to the engine from the editor or any other client.
@@ -187,6 +188,46 @@ pub enum EngineCommand {
     /// Select an entity (for UI highlight and inspector).
     SelectEntity {
         entity_id: Uuid,
+    },
+
+    // ── Picking ───────────────────────────────────────────────────
+
+    /// Pick the object at viewport pixel (x, y).
+    /// Engine reads the G-buffer and updates selection.
+    Pick {
+        x: u32,
+        y: u32,
+    },
+
+    // ── Raw input (fed from surface events) ────────────────────────
+
+    /// Mouse moved — absolute position + delta in pixels.
+    MouseMove {
+        x: f32,
+        y: f32,
+        dx: f32,
+        dy: f32,
+    },
+
+    /// Mouse button pressed/released.
+    MouseButton {
+        button: InputMouseButton,
+        pressed: bool,
+    },
+
+    /// Scroll wheel.
+    Scroll {
+        delta: f32,
+    },
+
+    /// Key pressed.
+    KeyDown {
+        key: InputKeyCode,
+    },
+
+    /// Key released.
+    KeyUp {
+        key: InputKeyCode,
     },
 
     /// Shut down the engine.

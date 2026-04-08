@@ -10,10 +10,13 @@
 //!
 //! The engine never calls back into the client via traits. Callbacks are plain `Fn`.
 
+pub mod camera;
 pub mod command;
+pub mod gizmo;
 pub mod snapshot;
 pub mod engine;
 pub mod scene_sync;
+pub mod wireframe_builders;
 
 pub use command::EngineCommand;
 pub use snapshot::{StateUpdate, SceneObjectInfo};

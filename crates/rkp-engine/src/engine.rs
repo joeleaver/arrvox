@@ -14,6 +14,7 @@ use rkp_render::rkp_renderer::RkpRenderer;
 use rkp_render::rkp_scene::FrameUpload;
 use rkp_render::rkp_scene_manager::RkpSceneManager;
 
+use crate::camera::CameraControlState;
 use crate::command::EngineCommand;
 use crate::snapshot::StateUpdate;
 
@@ -130,7 +131,9 @@ struct EngineState {
     // Scene management (CPU)
     scene_mgr: RkpSceneManager,
 
-    // Camera
+    // Input + Camera
+    input_system: rkf_runtime::input::InputSystem,
+    camera_control: CameraControlState,
     camera: CameraState,
 
     // GPU objects (built from scene each frame)
@@ -154,6 +157,21 @@ struct EngineState {
 
     // Readback buffer (reads from tone_map.ldr_texture, Rgba8Unorm)
     readback_buffer: wgpu::Buffer,
+
+    // Wireframe overlay
+    wireframe_pass: rkf_render::WireframePass,
+    /// Composite texture — LDR + wireframe overlay. Rgba8Unorm with RENDER_ATTACHMENT.
+    composite_texture: wgpu::Texture,
+    composite_view: wgpu::TextureView,
+
+    // Gizmo state
+    gizmo: crate::gizmo::GizmoState,
+    /// Mouse position in viewport pixels (for gizmo hover).
+    mouse_pos: glam::Vec2,
+
+    // Pick readback (8 bytes for 1 pixel of Rg32Uint material texture)
+    pick_readback_buffer: wgpu::Buffer,
+    pending_pick: Option<(u32, u32)>,
 }
 
 impl EngineState {
@@ -185,8 +203,40 @@ impl EngineState {
 
         let scene_mgr = RkpSceneManager::new(1_000_000);
 
+        // Input system with default action map.
+        let mut input_system = rkf_runtime::input::InputSystem::new();
+        input_system.add_map(crate::camera::default_action_map());
+        input_system.set_active_map("editor");
+        let camera_control = CameraControlState::default();
+
         // Readback buffer — reads from tone_map.ldr_texture (Rgba8Unorm).
         let readback_buffer = Self::create_readback_buffer(&device, width, height);
+
+        // Wireframe pass for gizmo overlay.
+        let wireframe_pass = rkf_render::WireframePass::new(&device, rkf_render::LDR_FORMAT);
+
+        // Composite texture: LDR + wireframes. Needs RENDER_ATTACHMENT for wireframe draw.
+        let composite_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rkp composite"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: rkf_render::LDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let composite_view = composite_texture.create_view(&Default::default());
+
+        // Pick readback buffer — 1 pixel of Rg32Uint (8 bytes), 256-byte aligned.
+        let pick_readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rkp pick readback"),
+            size: 256, // wgpu requires COPY_DST alignment
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
 
         Self {
             device,
@@ -195,6 +245,8 @@ impl EngineState {
             gbuffer,
             tone_map,
             scene_mgr,
+            input_system,
+            camera_control,
             camera: CameraState::default(),
             gpu_objects: Vec::new(),
             object_names: Vec::new(),
@@ -205,6 +257,13 @@ impl EngineState {
             width,
             height,
             readback_buffer,
+            wireframe_pass,
+            composite_texture,
+            composite_view,
+            gizmo: crate::gizmo::GizmoState::new(),
+            mouse_pos: glam::Vec2::ZERO,
+            pick_readback_buffer,
+            pending_pick: None,
         }
     }
 
@@ -249,11 +308,48 @@ impl EngineState {
         // 5. Tone mapping: HDR → LDR (Rgba8Unorm).
         self.tone_map.dispatch(&mut encoder);
 
-        // 6. Copy LDR output to readback buffer.
+        // 6. Copy LDR to composite texture, draw gizmo wireframes, readback.
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: self.tone_map.ldr_texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.composite_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // 6b. Draw gizmo wireframe if an object is selected.
+        let gizmo_verts = self.build_gizmo_wireframe();
+        if !gizmo_verts.is_empty() {
+            let cam_uniforms = self.build_camera_uniforms();
+            let vp_matrix = glam::Mat4::from_cols_array_2d(&cam_uniforms.view_proj);
+            self.wireframe_pass.draw(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &self.composite_view,
+                vp_matrix,
+                (0.0, 0.0, self.width as f32, self.height as f32),
+                &gizmo_verts,
+            );
+        }
+
+        // 6c. Copy composite to readback buffer.
         let padded_row = (self.width * 4 + 255) & !255;
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: self.tone_map.ldr_texture(),
+                texture: &self.composite_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -273,10 +369,39 @@ impl EngineState {
             },
         );
 
-        // 7. Submit GPU work.
+        // 7. If a pick is pending, copy that pixel from material texture.
+        let pick_issued = self.pending_pick.is_some();
+        if let Some((px, py)) = self.pending_pick.take() {
+            if px < self.width && py < self.height {
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.gbuffer.material_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: px, y: py, z: 0 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &self.pick_readback_buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(256),
+                            rows_per_image: Some(1),
+                        },
+                    },
+                    wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                );
+            }
+        }
+
+        // 8. Submit GPU work.
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // 8. Map readback buffer and extract pixels.
+        // 9. Process pick readback if we just issued one.
+        if pick_issued {
+            self.process_pick_result();
+        }
+
+        // 10. Map readback buffer and extract pixels.
         let pixels = self.map_readback();
 
         self.frame_index += 1;
@@ -318,13 +443,15 @@ impl EngineState {
     }
 
     fn build_camera_uniforms(&self) -> rkp_render::rkp_scene::CameraUniforms {
-        let yaw_rad = self.camera.yaw.to_radians();
-        let pitch_rad = self.camera.pitch.to_radians();
+        // yaw/pitch are in radians (set by camera controller).
+        let yaw = self.camera.yaw;
+        let pitch = self.camera.pitch;
 
+        // Same fly_direction formula as the camera controller.
         let forward = glam::Vec3::new(
-            yaw_rad.sin() * pitch_rad.cos(),
-            pitch_rad.sin(),
-            -yaw_rad.cos() * pitch_rad.cos(),
+            -yaw.sin() * pitch.cos(),
+            pitch.sin(),
+            -yaw.cos() * pitch.cos(),
         ).normalize();
         let right = forward.cross(glam::Vec3::Y).normalize();
         let up = right.cross(forward).normalize();
@@ -435,8 +562,33 @@ impl EngineState {
                 }
             }
 
+            EngineCommand::Pick { x, y } => {
+                // Don't pick if clicking on a gizmo handle — let the drag start instead.
+                if self.gizmo.hovered_axis == crate::gizmo::GizmoAxis::None {
+                    self.pending_pick = Some((x, y));
+                }
+            }
+
             EngineCommand::SelectEntity { entity_id } => {
                 self.selected_entity = Some(entity_id);
+            }
+
+            // ── Raw input → feed to InputSystem ──────────────────────
+            EngineCommand::MouseMove { x, y, dx, dy } => {
+                self.mouse_pos = glam::Vec2::new(x, y);
+                self.input_system.feed_mouse_delta(glam::Vec2::new(dx, dy));
+            }
+            EngineCommand::MouseButton { button, pressed } => {
+                self.input_system.feed_mouse_button(button, pressed);
+            }
+            EngineCommand::Scroll { delta } => {
+                self.input_system.feed_scroll(delta);
+            }
+            EngineCommand::KeyDown { key } => {
+                self.input_system.feed_key_down(key);
+            }
+            EngineCommand::KeyUp { key } => {
+                self.input_system.feed_key_up(key);
             }
 
             _ => {
@@ -445,6 +597,170 @@ impl EngineState {
         }
 
         true
+    }
+
+    fn update_gizmo(&mut self) {
+        let Some(selected_id) = self.selected_entity else {
+            self.gizmo.hovered_axis = crate::gizmo::GizmoAxis::None;
+            if self.gizmo.dragging {
+                self.gizmo.end_drag();
+            }
+            return;
+        };
+
+        let idx = selected_id.as_u128() as usize;
+        if idx >= self.gpu_objects.len() {
+            return;
+        }
+
+        let obj = &self.gpu_objects[idx];
+        let center = glam::Vec3::new(obj.world[3][0], obj.world[3][1], obj.world[3][2]);
+        let cam_dist = (center - self.camera.position).length().max(0.1);
+        let gizmo_size = cam_dist * 0.15;
+
+        let (ray_o, ray_d) = self.screen_to_ray(self.mouse_pos.x, self.mouse_pos.y);
+
+        let left_pressed = self.input_system.raw_state().is_mouse_button_pressed(rkf_runtime::input::InputMouseButton::Left);
+
+        if self.gizmo.dragging {
+            // Update drag.
+            match self.gizmo.mode {
+                crate::gizmo::GizmoMode::Translate => {
+                    let delta = crate::gizmo::compute_translate_delta(&self.gizmo, ray_o, ray_d);
+                    let new_pos = self.gizmo.initial_position + delta;
+                    // Apply to GPU object directly.
+                    if idx < self.gpu_objects.len() {
+                        self.gpu_objects[idx].world[3][0] = new_pos.x;
+                        self.gpu_objects[idx].world[3][1] = new_pos.y;
+                        self.gpu_objects[idx].world[3][2] = new_pos.z;
+                    }
+                }
+                crate::gizmo::GizmoMode::Rotate => {
+                    let _delta = crate::gizmo::compute_rotate_delta(&self.gizmo, ray_o, ray_d, center);
+                    // TODO: apply rotation
+                }
+                crate::gizmo::GizmoMode::Scale => {
+                    let _delta = crate::gizmo::compute_scale_delta(&self.gizmo, ray_o, ray_d);
+                    // TODO: apply scale
+                }
+            }
+
+            if !left_pressed {
+                self.gizmo.end_drag();
+            }
+        } else {
+            // Update hover.
+            self.gizmo.hovered_axis = crate::gizmo::pick_gizmo_axis_for_mode(
+                ray_o, ray_d, center, gizmo_size, self.gizmo.mode,
+            );
+
+            // Start drag if left mouse is pressed on a gizmo handle.
+            if left_pressed && self.gizmo.hovered_axis != crate::gizmo::GizmoAxis::None {
+                let start_point = match self.gizmo.hovered_axis {
+                    crate::gizmo::GizmoAxis::X | crate::gizmo::GizmoAxis::Y | crate::gizmo::GizmoAxis::Z => {
+                        let axis_dir = self.gizmo.hovered_axis.direction();
+                        let t = crate::gizmo::ray_axis_closest_point(ray_o, ray_d, center, axis_dir);
+                        center + axis_dir * t
+                    }
+                    _ => {
+                        crate::gizmo::project_to_plane(ray_o, ray_d, center, -ray_d).unwrap_or(center)
+                    }
+                };
+                let forward = (center - self.camera.position).normalize();
+                self.gizmo.pivot = center;
+                self.gizmo.begin_drag(
+                    self.gizmo.hovered_axis,
+                    start_point,
+                    center,
+                    glam::Quat::IDENTITY,
+                    glam::Vec3::ONE,
+                    forward,
+                );
+            }
+        }
+    }
+
+    fn build_gizmo_wireframe(&self) -> Vec<rkf_render::LineVertex> {
+        // Only show gizmo when an object is selected.
+        let Some(selected_id) = self.selected_entity else {
+            return Vec::new();
+        };
+
+        // Find the selected object's position (simple: use GPU object position).
+        let idx = selected_id.as_u128() as usize;
+        if idx >= self.gpu_objects.len() {
+            return Vec::new();
+        }
+
+        let obj = &self.gpu_objects[idx];
+        let center = glam::Vec3::new(obj.world[3][0], obj.world[3][1], obj.world[3][2]);
+
+        // Scale gizmo size proportional to camera distance for consistent screen size.
+        let cam_dist = (center - self.camera.position).length().max(0.1);
+        let gizmo_size = cam_dist * 0.15;
+
+        match self.gizmo.mode {
+            crate::gizmo::GizmoMode::Translate => {
+                crate::wireframe_builders::translate_gizmo_wireframe(
+                    center, gizmo_size, self.gizmo.hovered_axis, self.camera.position,
+                )
+            }
+            crate::gizmo::GizmoMode::Rotate => {
+                crate::wireframe_builders::rotate_gizmo_wireframe(
+                    center, gizmo_size, self.gizmo.hovered_axis, self.camera.position,
+                )
+            }
+            crate::gizmo::GizmoMode::Scale => {
+                crate::wireframe_builders::scale_gizmo_wireframe(
+                    center, gizmo_size, self.gizmo.hovered_axis, self.camera.position,
+                )
+            }
+        }
+    }
+
+    /// Screen-space ray from pixel coordinates.
+    fn screen_to_ray(&self, px: f32, py: f32) -> (glam::Vec3, glam::Vec3) {
+        let cam = self.build_camera_uniforms();
+        let vp = glam::Mat4::from_cols_array_2d(&cam.view_proj);
+        let inv_vp = vp.inverse();
+
+        let ndc_x = (px / self.width as f32) * 2.0 - 1.0;
+        let ndc_y = 1.0 - (py / self.height as f32) * 2.0;
+
+        let near = inv_vp.project_point3(glam::Vec3::new(ndc_x, ndc_y, -1.0));
+        let far = inv_vp.project_point3(glam::Vec3::new(ndc_x, ndc_y, 1.0));
+        let dir = (far - near).normalize();
+        (self.camera.position, dir)
+    }
+
+    fn process_pick_result(&mut self) {
+        let slice = self.pick_readback_buffer.slice(..8);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+
+        if let Ok(Ok(())) = rx.recv() {
+            let data = slice.get_mapped_range();
+            if data.len() >= 8 {
+                let g_channel = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                let object_id = (g_channel >> 8) & 0xFF;
+
+                if object_id > 0 && (object_id as usize) <= self.object_names.len() {
+                    // object_id in shader is the gpu_object index.
+                    let idx = object_id as usize;
+                    let entity_id = uuid::Uuid::from_u128(idx as u128);
+                    self.selected_entity = Some(entity_id);
+                    eprintln!("[RkpEngine] picked object_id={} → {:?}", object_id, self.object_names.get(idx));
+                } else {
+                    // Clicked sky or empty space.
+                    self.selected_entity = None;
+                }
+            }
+            drop(data);
+            self.pick_readback_buffer.unmap();
+        }
     }
 
     fn build_state_update(&mut self, frame_time: Duration) -> StateUpdate {
@@ -507,18 +823,35 @@ fn tick_loop(
             }
         }
 
-        // 2. Render frame.
+        // 2. Update input system + camera.
+        let dt = 1.0 / 60.0; // TODO: use actual delta time
+        state.input_system.evaluate();
+        state.camera_control.update(
+            &state.input_system,
+            dt,
+            &mut state.camera.position,
+            &mut state.camera.yaw,
+            &mut state.camera.pitch,
+        );
+
+        // 3. Update gizmo hover + drag.
+        state.update_gizmo();
+
+        // 4. Render frame.
         let (pixels, w, h) = state.render_frame();
 
-        // 3. Deliver frame to client.
+        // 5. Deliver frame to client.
         frame_callback(&pixels, w, h);
 
-        // 4. Push state to client.
+        // 6. Push state to client.
         let frame_time = frame_start.elapsed();
         let update = state.build_state_update(frame_time);
         state_callback(&update);
 
-        // 5. Frame pacing — target ~60 FPS.
+        // 7. Clear per-frame input state for next tick.
+        state.input_system.begin_frame();
+
+        // 8. Frame pacing — target ~60 FPS.
         let target = Duration::from_micros(16_667);
         let elapsed = frame_start.elapsed();
         if elapsed < target {

@@ -30,6 +30,7 @@ rkf-render = { path = "../rkifield/crates/rkf-render" }
 rkf-editor = { path = "../rkifield/crates/rkf-editor" }
 rkf-import = { path = "../rkifield/crates/rkf-import" }
 rkf-animation = { path = "../rkifield/crates/rkf-animation" }
+rkf-runtime = { path = "../rkifield/crates/rkf-runtime" }
 rkf-physics = { path = "../rkifield/crates/rkf-physics" }
 rkf-mcp = { path = "../rkifield/crates/rkf-mcp" }
 

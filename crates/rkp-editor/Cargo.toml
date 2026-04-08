@@ -9,6 +9,7 @@ description = "RKIPatch editor — gaussian splat scene editor, thin client over
 rkp-engine = { workspace = true }
 rkp-render = { workspace = true }
 rkf-render = { workspace = true }
+rkf-runtime = { workspace = true }
 rinch = { workspace = true, features = ["desktop", "gpu", "components", "theme"] }
 anyhow = { workspace = true }
 glam = { workspace = true }
