@@ -139,6 +139,28 @@ impl LayoutConfig {
         self.cleanup_empty_zones();
     }
 
+    /// Split a zone by inserting a new zone with the given panel before or after it.
+    pub fn split_zone(
+        &mut self,
+        panel: PanelId,
+        container: ContainerKind,
+        zone_idx: usize,
+        before: bool,
+    ) {
+        let c = self.container_mut(container);
+        if zone_idx < c.zones.len() {
+            let new_zone = Zone {
+                tabs: vec![panel],
+                active_tab: 0,
+                fraction: 0.5,
+            };
+            // Halve the existing zone's fraction.
+            c.zones[zone_idx].fraction *= 0.5;
+            let insert_at = if before { zone_idx } else { zone_idx + 1 };
+            c.zones.insert(insert_at, new_zone);
+        }
+    }
+
     /// Remove empty zones and hide containers with no content.
     pub fn cleanup_empty_zones(&mut self) {
         for container in [&mut self.left, &mut self.center, &mut self.right, &mut self.bottom] {

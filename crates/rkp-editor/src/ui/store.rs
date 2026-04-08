@@ -92,6 +92,18 @@ impl TabDragData {
 pub enum DropTarget {
     /// Drop into an existing zone (adds as a new tab).
     Zone { container: ContainerKind, zone_idx: usize },
+    /// Drop on a zone edge to split it and create a new zone.
+    Split { container: ContainerKind, zone_idx: usize, edge: SplitEdge },
+}
+
+/// Edge of a zone for split-drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SplitEdge {
+    #[default]
+    Top,
+    Bottom,
+    Left,
+    Right,
 }
 
 impl EditorStore {
