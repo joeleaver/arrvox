@@ -11,6 +11,7 @@ rkp-render = { workspace = true }
 rkf-render = { workspace = true }
 rkf-runtime = { workspace = true }
 rinch = { workspace = true, features = ["desktop", "gpu", "components", "theme"] }
+rinch-tabler-icons = { workspace = true }
 anyhow = { workspace = true }
 glam = { workspace = true }
 uuid = { version = "1", features = ["v4"] }

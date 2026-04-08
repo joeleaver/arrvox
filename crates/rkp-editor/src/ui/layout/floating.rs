@@ -5,6 +5,8 @@
 
 use rinch::prelude::*;
 
+use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
+
 use super::{ContainerKind, PanelId, panel_registry};
 use crate::ui::store::{EditorStore, TabDragData, DropTarget};
 use crate::ui::panels::*;
@@ -123,8 +125,8 @@ fn FloatingPanelWindow(index: usize) -> NodeHandle {
                 span { style: "font-size:11px;color:#ccc;user-select:none;", {name} }
                 // Close button (stop propagation so click doesn't start a drag)
                 div {
-                    style: "cursor:pointer;font-size:14px;color:#888;padding:0 4px;\
-                            border-radius:2px;line-height:1;",
+                    style: "cursor:pointer;color:#888;padding:2px;\
+                            border-radius:2px;width:14px;height:14px;",
                     onclick: move || {
                         store.update_layout(|layout| {
                             if index < layout.floating.len() {
@@ -132,7 +134,7 @@ fn FloatingPanelWindow(index: usize) -> NodeHandle {
                             }
                         });
                     },
-                    {"\u{00d7}"}
+                    {render_tabler_icon(__scope, TablerIcon::X, TablerIconStyle::Outline)}
                 }
             }
             // Panel content

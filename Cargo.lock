@@ -4527,6 +4527,7 @@ dependencies = [
  "glam 0.29.3",
  "log",
  "rinch",
+ "rinch-tabler-icons",
  "rkf-render",
  "rkf-runtime",
  "rkp-engine",
