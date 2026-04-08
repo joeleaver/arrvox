@@ -1,7 +1,7 @@
 //! Floating panel host — renders detached panels as draggable overlays.
 //!
-//! Drag the title bar to reposition. Drop onto a docked zone to re-dock.
-//! Close (×) removes the panel from the layout entirely.
+//! Title bar uses HTML5 drag so docked zones show drop targets.
+//! Close (×) removes the panel. Drop on a zone to re-dock.
 
 use rinch::prelude::*;
 
@@ -59,73 +59,69 @@ fn FloatingPanelWindow(index: usize) -> NodeHandle {
                     )
                 }
             },
-            // Title bar — drag to reposition OR dock into a zone.
+            // Title bar — HTML5 draggable so docked zones show drop targets.
             div {
                 style: "height:28px;display:flex;align-items:center;padding:0 8px;\
                         background:#2d2d2d;cursor:grab;flex-shrink:0;\
                         border-bottom:1px solid #3c3c3c;justify-content:space-between;",
-                onmousedown: {
+                draggable: "true",
+                ondragstart: {
                     let panel_id = panel_id;
                     move || {
-                        let ctx = get_click_context();
-                        let start_x = x.get();
-                        let start_y = y.get();
-                        let start_mx = ctx.mouse_x;
-                        let start_my = ctx.mouse_y;
-
-                        // Set up tab drag state so docked zones show drop targets.
+                        suppress_drag_ghost();
                         if let Some(pid) = panel_id {
                             store.tab_drag.set(Some(TabDragData {
                                 panel: pid,
-                                source_container: ContainerKind::Left, // dummy — floating
+                                source_container: ContainerKind::Left, // dummy for floating
                                 source_zone: 0,
                             }));
                         }
+                    }
+                },
+                ondragmove: move || {
+                    // Track cursor to update floating panel position during drag.
+                    let ctx = get_click_context();
+                    // Move panel to follow cursor (offset by half title bar height).
+                    x.set(ctx.mouse_x - 100.0);
+                    y.set(ctx.mouse_y - 14.0);
+                },
+                ondragend: move || {
+                    restore_drag_ghost();
+                    let drop = store.drop_target.get();
 
-                        Drag::absolute()
-                            .on_move(move |mx, my| {
-                                x.set(start_x + mx - start_mx);
-                                y.set(start_y + my - start_my);
-                            })
-                            .on_end(move |_mx, _my| {
-                                let drop = store.drop_target.get();
+                    store.tab_drag.set(None);
+                    store.drop_target.set(None);
 
-                                // Clear drag state.
-                                store.tab_drag.set(None);
-                                store.drop_target.set(None);
-
-                                if let Some(dt) = drop {
-                                    store.update_layout(|layout| {
-                                        match dt {
-                                            DropTarget::Zone { container, zone_idx } => {
-                                                layout.dock_panel(index, container, zone_idx);
-                                            }
-                                            DropTarget::Split { container, zone_idx, edge } => {
-                                                if index < layout.floating.len() {
-                                                    let fp = layout.floating.remove(index);
-                                                    let before = matches!(edge,
-                                                        crate::ui::store::SplitEdge::Top |
-                                                        crate::ui::store::SplitEdge::Left
-                                                    );
-                                                    layout.split_zone(fp.panel, container, zone_idx, before);
-                                                }
-                                            }
-                                        }
-                                    });
-                                } else {
-                                    store.update_layout(|layout| {
-                                        if index < layout.floating.len() {
-                                            layout.floating[index].x = x.get();
-                                            layout.floating[index].y = y.get();
-                                        }
-                                    });
+                    if let Some(dt) = drop {
+                        store.update_layout(|layout| {
+                            match dt {
+                                DropTarget::Zone { container, zone_idx } => {
+                                    layout.dock_panel(index, container, zone_idx);
                                 }
-                            })
-                            .start();
+                                DropTarget::Split { container, zone_idx, edge } => {
+                                    if index < layout.floating.len() {
+                                        let fp = layout.floating.remove(index);
+                                        let before = matches!(edge,
+                                            crate::ui::store::SplitEdge::Top |
+                                            crate::ui::store::SplitEdge::Left
+                                        );
+                                        layout.split_zone(fp.panel, container, zone_idx, before);
+                                    }
+                                }
+                            }
+                        });
+                    } else {
+                        // Stayed floating — save new position.
+                        store.update_layout(|layout| {
+                            if index < layout.floating.len() {
+                                layout.floating[index].x = x.get();
+                                layout.floating[index].y = y.get();
+                            }
+                        });
                     }
                 },
                 span { style: "font-size:11px;color:#ccc;user-select:none;", {name} }
-                // Close button
+                // Close button (stop propagation so click doesn't start a drag)
                 div {
                     style: "cursor:pointer;font-size:14px;color:#888;padding:0 4px;\
                             border-radius:2px;line-height:1;",
@@ -136,7 +132,7 @@ fn FloatingPanelWindow(index: usize) -> NodeHandle {
                             }
                         });
                     },
-                    {"\u{00d7}"} // ×
+                    {"\u{00d7}"}
                 }
             }
             // Panel content
