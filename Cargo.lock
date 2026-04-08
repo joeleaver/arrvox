@@ -4849,6 +4849,7 @@ dependencies = [
  "crossbeam",
  "glam 0.29.3",
  "log",
+ "notify",
  "rkf-core",
  "rkf-render",
  "rkf-runtime",

@@ -154,6 +154,9 @@ struct EngineState {
     available_models: Vec<crate::snapshot::ModelInfo>,
     models_dirty: bool,
 
+    /// File watcher for hot-reload (watches project assets/ directory).
+    file_watcher: Option<crate::file_watcher::RkpFileWatcher>,
+
     // Geometry dirty flag
     geometry_dirty: bool,
     /// Scene structure changed — push objects list to UI.
@@ -270,6 +273,7 @@ impl EngineState {
             project_dirty: true, // push initial state
             available_models: Vec::new(),
             models_dirty: false,
+            file_watcher: None,
             geometry_dirty: false,
             scene_dirty: false,
             frame_index: 0,
@@ -623,6 +627,7 @@ impl EngineState {
                         self.project_dirty = true;
                         self.scene_dirty = true;
                         self.scan_models();
+                        self.init_file_watcher();
                     }
                     Err(e) => eprintln!("[RkpEngine] new project failed: {e}"),
                 }
@@ -644,6 +649,7 @@ impl EngineState {
                         self.project_loaded = true;
                         self.project_dirty = true;
                         self.scan_models();
+                        self.init_file_watcher();
                     }
                     Err(e) => eprintln!("[RkpEngine] open project failed: {e}"),
                 }
@@ -698,6 +704,60 @@ impl EngineState {
         }
 
         true
+    }
+
+    fn init_file_watcher(&mut self) {
+        if let Some(ref project_dir) = self.project_dir {
+            let assets_dir = project_dir.join("assets");
+            if assets_dir.exists() {
+                match crate::file_watcher::RkpFileWatcher::new(&[assets_dir.as_path()]) {
+                    Ok(watcher) => {
+                        self.file_watcher = Some(watcher);
+                        eprintln!("[RkpEngine] file watcher started on {}", assets_dir.display());
+                    }
+                    Err(e) => eprintln!("[RkpEngine] file watcher failed: {e}"),
+                }
+            }
+        }
+    }
+
+    fn process_file_events(&mut self) {
+        let events = match self.file_watcher {
+            Some(ref watcher) => watcher.poll_events(),
+            None => return,
+        };
+
+        for event in events {
+            use crate::file_watcher::FileEvent;
+            match event {
+                FileEvent::ModelChanged(path) => {
+                    eprintln!("[RkpEngine] model changed: {}", path.display());
+                    self.scan_models();
+                    let path_str = path.to_string_lossy().to_string();
+                    self.reload_asset(&path_str);
+                }
+                FileEvent::ShaderChanged(path) => {
+                    eprintln!("[RkpEngine] shader changed: {}", path.display());
+                    // TODO: recompile GPU pipelines
+                }
+                FileEvent::MaterialChanged(path) => {
+                    eprintln!("[RkpEngine] material changed: {}", path.display());
+                    // TODO: reload material properties
+                }
+                FileEvent::MeshSourceChanged(path) => {
+                    eprintln!("[RkpEngine] mesh source changed: {}", path.display());
+                    // TODO: auto-reimport mesh → .rkp
+                }
+            }
+        }
+    }
+
+    fn reload_asset(&mut self, path: &str) {
+        // Find any scene objects that reference this asset and reload them.
+        // For now, log that we detected the change.
+        eprintln!("[RkpEngine] hot-reload asset: {path}");
+        // TODO: remove old GPU objects for this asset, re-load from file,
+        // rebuild faces, re-upload geometry.
     }
 
     fn scan_models(&mut self) {
@@ -1101,6 +1161,9 @@ fn tick_loop(
                 return;
             }
         }
+
+        // 1b. Process file watcher events.
+        state.process_file_events();
 
         // 2. Update input system + camera.
         let dt = 1.0 / 60.0; // TODO: use actual delta time
