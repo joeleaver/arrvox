@@ -96,7 +96,7 @@ pub fn ZoneComponent(container: ContainerKind, zone_idx: usize) -> NodeHandle {
 fn handle_drop(store: EditorStore, container: ContainerKind, zone_idx: usize) {
     if let Some(data) = store.tab_drag.get() {
         let dt = store.drop_target.get();
-        store.layout.update(|layout| {
+        store.update_layout(|layout| {
             let tab_idx = layout.container(data.source_container)
                 .zones.get(data.source_zone)
                 .and_then(|z| z.tabs.iter().position(|&p| p == data.panel))

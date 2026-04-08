@@ -54,7 +54,7 @@ pub fn TabBar(container: ContainerKind, zone_idx: usize) -> NodeHandle {
             },
             ondrop: move || {
                 if let Some(data) = store.tab_drag.get() {
-                    store.layout.update(|layout| {
+                    store.update_layout(|layout| {
                         let tab_idx = data.tab_index(layout);
                         layout.move_tab(
                             data.source_container, data.source_zone, tab_idx,
@@ -85,7 +85,7 @@ pub fn TabBar(container: ContainerKind, zone_idx: usize) -> NodeHandle {
                         let drop = store.drop_target.get();
                         if drop.is_none() {
                             if let Some(data) = drag_data {
-                                store.layout.update(|layout| {
+                                store.update_layout(|layout| {
                                     let tab_idx = layout.container(data.source_container)
                                         .zones.get(data.source_zone)
                                         .and_then(|z| z.tabs.iter().position(|&p| p == data.panel))
@@ -126,7 +126,7 @@ pub fn TabBar(container: ContainerKind, zone_idx: usize) -> NodeHandle {
                     onclick: {
                         let tab_idx = tab.idx;
                         move || {
-                            store.layout.update(|layout| {
+                            store.update_layout(|layout| {
                                 layout.set_active_tab(container, zone_idx, tab_idx);
                             });
                         }
