@@ -15,6 +15,88 @@ use ui::LayoutRoot;
 #[derive(Clone)]
 pub struct CommandSender(pub crossbeam::channel::Sender<rkp_engine::EngineCommand>);
 
+fn build_menus(
+    cmd_tx: crossbeam::channel::Sender<rkp_engine::EngineCommand>,
+) -> Vec<(&'static str, rinch::menu::Menu)> {
+    use rinch::menu::{Menu, MenuItem};
+
+    let tx = cmd_tx;
+
+    // File menu
+    let file_menu = Menu::new()
+        .item(MenuItem::new("New Project").on_click({
+            let tx = tx.clone();
+            move || {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("New Project")
+                    .add_filter("RKIPatch Project", &["rkproject"])
+                    .save_file()
+                {
+                    let _ = tx.send(rkp_engine::EngineCommand::NewProject {
+                        path: path.to_string_lossy().into_owned(),
+                    });
+                }
+            }
+        }))
+        .item(MenuItem::new("Open Project...").on_click({
+            let tx = tx.clone();
+            move || {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Open Project")
+                    .add_filter("RKIPatch Project", &["rkproject"])
+                    .pick_file()
+                {
+                    let _ = tx.send(rkp_engine::EngineCommand::OpenProject {
+                        path: path.to_string_lossy().into_owned(),
+                    });
+                }
+            }
+        }))
+        .separator()
+        .item(MenuItem::new("Save").shortcut("Ctrl+S").on_click({
+            let tx = tx.clone();
+            move || {
+                let _ = tx.send(rkp_engine::EngineCommand::SaveScene { path: None });
+            }
+        }))
+        .item(MenuItem::new("Save As...").shortcut("Ctrl+Shift+S").on_click({
+            let tx = tx.clone();
+            move || {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Save Scene As")
+                    .add_filter("RKIPatch Scene", &["rkscene"])
+                    .save_file()
+                {
+                    let _ = tx.send(rkp_engine::EngineCommand::SaveScene {
+                        path: Some(path.to_string_lossy().into_owned()),
+                    });
+                }
+            }
+        }));
+
+    // Edit menu — spawn primitives
+    let mut spawn_menu = Menu::new();
+    for (label, prim_name) in [("Box", "box"), ("Sphere", "sphere"), ("Capsule", "capsule")] {
+        spawn_menu = spawn_menu.item(MenuItem::new(label).on_click({
+            let tx = tx.clone();
+            let name = prim_name.to_string();
+            move || {
+                let _ = tx.send(rkp_engine::EngineCommand::SpawnPrimitive {
+                    name: name.clone(),
+                });
+            }
+        }));
+    }
+
+    let edit_menu = Menu::new()
+        .submenu("Spawn", spawn_menu);
+
+    vec![
+        ("File", file_menu),
+        ("Edit", edit_menu),
+    ]
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init();
 
@@ -45,24 +127,30 @@ fn main() -> anyhow::Result<()> {
                 if let Some(objects) = &update.objects {
                     store.objects.send(objects.clone());
                 }
+                if let Some(loaded) = update.project_loaded {
+                    store.project_loaded.send(loaded);
+                }
+                if let Some(name) = &update.project_name {
+                    store.project_name.send(name.clone());
+                }
             })
         },
     );
 
-    // 4. Spawn a test primitive.
-    engine.send(rkp_engine::EngineCommand::SpawnPrimitive {
-        name: "test_box".into(),
-    });
+    // 5. Build menus.
+    let menus = build_menus(engine.cmd_tx.clone());
 
-    // 5. Run rinch UI.
+    // 6. Run rinch UI.
     let cmd_tx = engine.cmd_tx.clone();
 
     let props = WindowProps {
         title: "RKIPatch Editor".into(),
         width: 1920,
         height: 1080,
-        borderless: false,
+        borderless: true,
         resizable: true,
+        transparent: true,
+        menu_in_titlebar: true,
         ..Default::default()
     };
 
@@ -72,7 +160,7 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     });
 
-    rinch::shell::run_with_window_props(
+    rinch::shell::run_with_window_props_and_menu(
         move |__scope| {
             create_context(surface_handle.clone());
             create_context(store);
@@ -81,6 +169,7 @@ fn main() -> anyhow::Result<()> {
         },
         props,
         theme,
+        Some(menus),
     );
 
     drop(engine);

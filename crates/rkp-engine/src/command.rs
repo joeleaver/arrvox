@@ -127,15 +127,28 @@ pub enum EngineCommand {
         position: Vec3,
     },
 
+    /// Create a new project at the given path.
+    NewProject {
+        path: String,
+    },
+
+    /// Open an existing project (.rkproject file).
+    OpenProject {
+        path: String,
+    },
+
     /// Load a scene from disk.
     LoadScene {
         path: String,
     },
 
-    /// Save the current scene.
+    /// Save the current scene (None = overwrite current path).
     SaveScene {
         path: Option<String>,
     },
+
+    /// Save the project metadata (.rkproject file).
+    SaveProject,
 
     // ── Play mode ────────────────────────────────────────────────────
 

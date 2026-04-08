@@ -13,6 +13,8 @@
 pub mod camera;
 pub mod command;
 pub mod gizmo;
+pub mod project;
+pub mod scene_io;
 pub mod snapshot;
 pub mod engine;
 pub mod scene_sync;

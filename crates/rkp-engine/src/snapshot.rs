@@ -32,4 +32,8 @@ pub struct StateUpdate {
     /// Scene objects — only sent when the scene changes.
     /// `None` means "unchanged since last update."
     pub objects: Option<Vec<SceneObjectInfo>>,
+    /// Project loaded state — only sent when it changes.
+    pub project_loaded: Option<bool>,
+    /// Project name — only sent when it changes.
+    pub project_name: Option<String>,
 }

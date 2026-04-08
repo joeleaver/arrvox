@@ -6,7 +6,7 @@ use super::ContainerKind;
 use super::container::ContainerComponent;
 use super::splitter::{ContainerSplitter, SplitDirection, SplitTarget};
 use crate::ui::store::EditorStore;
-use crate::ui::panels::StatusBar;
+use crate::ui::panels::{StatusBar, WelcomeScreen};
 
 #[component]
 pub fn LayoutRoot() -> NodeHandle {
@@ -16,14 +16,6 @@ pub fn LayoutRoot() -> NodeHandle {
         div {
             style: "display:flex;flex-direction:column;width:100%;height:100%;background:#1e1e1e;\
                     position:relative;",
-
-            // Titlebar
-            div {
-                style: "height:36px;display:flex;align-items:center;padding:0 16px;\
-                        background:#323233;color:#ccc;font-size:13px;font-weight:500;\
-                        flex-shrink:0;border-bottom:1px solid #3c3c3c;",
-                "RKIPatch Editor"
-            }
 
             // Main area. ondragleave clears drop target when cursor exits
             // entirely. Child zone ondragenter immediately re-sets it if
@@ -101,6 +93,11 @@ pub fn LayoutRoot() -> NodeHandle {
 
             // Status bar
             StatusBar {}
+
+            // Welcome screen overlay — shown when no project is loaded.
+            if !store.project_loaded.get() {
+                WelcomeScreen {}
+            }
         }
     }
 }

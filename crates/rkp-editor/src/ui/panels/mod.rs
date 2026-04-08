@@ -8,6 +8,7 @@ pub mod materials_panel;
 pub mod console_panel;
 pub mod profiling_panel;
 pub mod models_panel;
+pub mod welcome_screen;
 
 pub use scene_tree::SceneTree;
 pub use viewport::Viewport;
@@ -17,3 +18,4 @@ pub use materials_panel::MaterialsPanel;
 pub use console_panel::ConsolePanel;
 pub use profiling_panel::ProfilingPanel;
 pub use models_panel::ModelsPanel;
+pub use welcome_screen::WelcomeScreen;

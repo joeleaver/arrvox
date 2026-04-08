@@ -143,6 +143,14 @@ struct EngineState {
     /// Currently selected entity.
     selected_entity: Option<uuid::Uuid>,
 
+    // Project state
+    project_loaded: bool,
+    project_name: String,
+    project_dir: Option<std::path::PathBuf>,
+    project_path: Option<std::path::PathBuf>,
+    scene_path: Option<std::path::PathBuf>,
+    project_dirty: bool,
+
     // Geometry dirty flag
     geometry_dirty: bool,
     /// Scene structure changed — push objects list to UI.
@@ -251,6 +259,12 @@ impl EngineState {
             gpu_objects: Vec::new(),
             object_names: Vec::new(),
             selected_entity: None,
+            project_loaded: false,
+            project_name: String::new(),
+            project_dir: None,
+            project_path: None,
+            scene_path: None,
+            project_dirty: true, // push initial state
             geometry_dirty: false,
             scene_dirty: false,
             frame_index: 0,
@@ -587,6 +601,70 @@ impl EngineState {
                 self.selected_entity = Some(entity_id);
             }
 
+            EngineCommand::NewProject { path } => {
+                let path = std::path::PathBuf::from(&path);
+                match crate::project::create_project(&path) {
+                    Ok(project_dir) => {
+                        self.clear_scene();
+                        self.project_dir = Some(project_dir.clone());
+                        self.project_path = Some(path);
+                        self.scene_path = Some(project_dir.join("scenes/default.rkscene"));
+                        self.project_name = project_dir.file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        self.project_loaded = true;
+                        self.project_dirty = true;
+                        self.scene_dirty = true;
+                    }
+                    Err(e) => eprintln!("[RkpEngine] new project failed: {e}"),
+                }
+            }
+
+            EngineCommand::OpenProject { path } => {
+                let path = std::path::PathBuf::from(&path);
+                match crate::project::load_project(&path) {
+                    Ok((project, project_dir)) => {
+                        self.clear_scene();
+                        let scene_path = project_dir.join(format!("scenes/{}.rkscene", project.default_scene));
+                        if scene_path.exists() {
+                            self.load_scene_from_file(&scene_path);
+                        }
+                        self.project_dir = Some(project_dir);
+                        self.project_path = Some(path);
+                        self.scene_path = Some(scene_path);
+                        self.project_name = project.name;
+                        self.project_loaded = true;
+                        self.project_dirty = true;
+                    }
+                    Err(e) => eprintln!("[RkpEngine] open project failed: {e}"),
+                }
+            }
+
+            EngineCommand::SaveScene { path } => {
+                let save_path = path.map(std::path::PathBuf::from)
+                    .or_else(|| self.scene_path.clone());
+                if let Some(save_path) = save_path {
+                    let scene = self.build_scene_file();
+                    if let Err(e) = crate::scene_io::save_scene(&scene, &save_path) {
+                        eprintln!("[RkpEngine] save scene failed: {e}");
+                    }
+                    self.scene_path = Some(save_path);
+                }
+            }
+
+            EngineCommand::SaveProject => {
+                if let (Some(project_path), Some(_project_dir)) = (&self.project_path, &self.project_dir) {
+                    let project = crate::project::ProjectFile {
+                        name: self.project_name.clone(),
+                        default_scene: "default".to_string(),
+                        recent_scenes: Vec::new(),
+                    };
+                    if let Err(e) = crate::project::save_project(&project, project_path) {
+                        eprintln!("[RkpEngine] save project failed: {e}");
+                    }
+                }
+            }
+
             // ── Raw input → feed to InputSystem ──────────────────────
             EngineCommand::MouseMove { x, y, dx, dy } => {
                 self.mouse_pos = glam::Vec2::new(x, y);
@@ -611,6 +689,109 @@ impl EngineState {
         }
 
         true
+    }
+
+    fn clear_scene(&mut self) {
+        self.gpu_objects.clear();
+        self.object_names.clear();
+        self.scene_mgr = RkpSceneManager::new(1_000_000);
+        self.selected_entity = None;
+        self.geometry_dirty = true;
+        self.scene_dirty = true;
+    }
+
+    fn load_scene_from_file(&mut self, path: &std::path::Path) {
+        match crate::scene_io::load_scene(path) {
+            Ok(scene) => {
+                // Restore camera.
+                self.camera.position = glam::Vec3::from_array(scene.camera.position);
+                self.camera.yaw = scene.camera.yaw;
+                self.camera.pitch = scene.camera.pitch;
+                self.camera.fov = scene.camera.fov;
+
+                // Load objects.
+                for obj in &scene.objects {
+                    if let Some(ref asset_path) = obj.asset_path {
+                        // Resolve relative to project assets dir.
+                        let full_path = self.project_dir.as_ref()
+                            .map(|d| d.join("assets").join(asset_path))
+                            .unwrap_or_else(|| std::path::PathBuf::from(asset_path));
+                        let object_id = self.gpu_objects.len() as u32;
+                        if let Ok(result) = self.scene_mgr.load_rkp(&full_path.to_string_lossy(), object_id) {
+                            let pos = glam::Vec3::from_array(obj.position);
+                            let transform = glam::Mat4::from_translation(pos);
+                            let gpu_obj = crate::scene_sync::build_gpu_object(
+                                &transform, &result.aabb, &result.spatial,
+                                result.voxel_size, obj.material_id, object_id,
+                            );
+                            self.gpu_objects.push(gpu_obj);
+                            self.object_names.push(obj.name.clone());
+                            self.geometry_dirty = true;
+                        }
+                    } else if let Some(ref prim_name) = obj.primitive {
+                        // Spawn primitive.
+                        let primitive = match prim_name.as_str() {
+                            "box" => rkf_core::scene_node::SdfPrimitive::Box {
+                                half_extents: glam::Vec3::from_array(obj.scale) * 0.5,
+                            },
+                            "sphere" => rkf_core::scene_node::SdfPrimitive::Sphere {
+                                radius: obj.scale[0] * 0.5,
+                            },
+                            _ => continue,
+                        };
+                        let object_id = self.gpu_objects.len() as u32;
+                        if let Some(result) = self.scene_mgr.voxelize_primitive(
+                            &primitive, obj.material_id, 0.05, glam::Vec3::ONE, object_id,
+                        ) {
+                            let pos = glam::Vec3::from_array(obj.position);
+                            let transform = glam::Mat4::from_translation(pos);
+                            let gpu_obj = crate::scene_sync::build_gpu_object(
+                                &transform, &result.aabb, &result.spatial,
+                                result.voxel_size, obj.material_id, object_id,
+                            );
+                            self.gpu_objects.push(gpu_obj);
+                            self.object_names.push(obj.name.clone());
+                            self.geometry_dirty = true;
+                        }
+                    }
+                }
+                self.scene_dirty = true;
+            }
+            Err(e) => eprintln!("[RkpEngine] load scene failed: {e}"),
+        }
+    }
+
+    fn build_scene_file(&self) -> crate::scene_io::SceneFile {
+        let objects = self.object_names.iter().enumerate().map(|(i, name)| {
+            let pos = if i < self.gpu_objects.len() {
+                let o = &self.gpu_objects[i];
+                [o.world[3][0], o.world[3][1], o.world[3][2]]
+            } else {
+                [0.0; 3]
+            };
+            crate::scene_io::SceneObject {
+                id: uuid::Uuid::from_u128(i as u128),
+                name: name.clone(),
+                position: pos,
+                rotation: [0.0; 3],
+                scale: [1.0; 3],
+                parent_id: None,
+                asset_path: None,
+                primitive: Some("box".to_string()),
+                material_id: 0,
+            }
+        }).collect();
+
+        crate::scene_io::SceneFile {
+            objects,
+            camera: crate::scene_io::CameraState {
+                position: self.camera.position.to_array(),
+                yaw: self.camera.yaw,
+                pitch: self.camera.pitch,
+                fov: self.camera.fov,
+            },
+            lights: Vec::new(),
+        }
     }
 
     fn update_gizmo(&mut self) {
@@ -804,6 +985,19 @@ impl EngineState {
             None
         };
 
+        let project = if self.project_dirty {
+            self.project_dirty = false;
+            Some(self.project_loaded)
+        } else {
+            None
+        };
+
+        let project_name = if project.is_some() {
+            Some(self.project_name.clone())
+        } else {
+            None
+        };
+
         StateUpdate {
             fps,
             gpu_object_count: self.gpu_objects.len() as u32,
@@ -811,6 +1005,8 @@ impl EngineState {
             play_mode: false,
             selected_entity: self.selected_entity,
             objects,
+            project_loaded: project,
+            project_name,
         }
     }
 }

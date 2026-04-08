@@ -66,6 +66,13 @@ pub struct EditorStore {
     pub sculpt_strength: Signal<f32>,
     pub paint_color: Signal<[f32; 3]>,
 
+    // ── Project state (written by engine) ───────────────────────
+
+    /// Whether a project is loaded (controls welcome screen visibility).
+    pub project_loaded: Signal<bool>,
+    /// Current project name.
+    pub project_name: Signal<String>,
+
     // ── Drag state (tab dragging) ────────────────────────────────
 
     /// Currently dragged tab (None = no drag in progress).
@@ -135,6 +142,10 @@ impl EditorStore {
             sculpt_radius: Signal::new(1.0),
             sculpt_strength: Signal::new(0.5),
             paint_color: Signal::new([0.8, 0.2, 0.2]),
+
+            // Project state.
+            project_loaded: Signal::new(false),
+            project_name: Signal::new(String::new()),
 
             // Drag state.
             tab_drag: Signal::new(None),
