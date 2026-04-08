@@ -150,6 +150,9 @@ struct EngineState {
     project_path: Option<std::path::PathBuf>,
     scene_path: Option<std::path::PathBuf>,
     project_dirty: bool,
+    /// Available .rkp model files in the project.
+    available_models: Vec<crate::snapshot::ModelInfo>,
+    models_dirty: bool,
 
     // Geometry dirty flag
     geometry_dirty: bool,
@@ -265,6 +268,8 @@ impl EngineState {
             project_path: None,
             scene_path: None,
             project_dirty: true, // push initial state
+            available_models: Vec::new(),
+            models_dirty: false,
             geometry_dirty: false,
             scene_dirty: false,
             frame_index: 0,
@@ -615,6 +620,7 @@ impl EngineState {
                         self.project_loaded = true;
                         self.project_dirty = true;
                         self.scene_dirty = true;
+                        self.scan_models();
                     }
                     Err(e) => eprintln!("[RkpEngine] new project failed: {e}"),
                 }
@@ -635,6 +641,7 @@ impl EngineState {
                         self.project_name = project.name;
                         self.project_loaded = true;
                         self.project_dirty = true;
+                        self.scan_models();
                     }
                     Err(e) => eprintln!("[RkpEngine] open project failed: {e}"),
                 }
@@ -689,6 +696,57 @@ impl EngineState {
         }
 
         true
+    }
+
+    fn scan_models(&mut self) {
+        self.available_models.clear();
+        if let Some(ref project_dir) = self.project_dir {
+            let objects_dir = project_dir.join("assets/objects");
+            if objects_dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(&objects_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().map(|e| e == "rkp").unwrap_or(false) {
+                            let name = path.file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                            self.available_models.push(crate::snapshot::ModelInfo {
+                                name,
+                                path: path.to_string_lossy().into_owned(),
+                                size,
+                            });
+                        }
+                    }
+                }
+            }
+            // Also scan root assets/ for .rkp files.
+            let assets_dir = project_dir.join("assets");
+            if assets_dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(&assets_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().map(|e| e == "rkp").unwrap_or(false) {
+                            let name = path.file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                            // Avoid duplicates.
+                            if !self.available_models.iter().any(|m| m.path == path.to_string_lossy().as_ref()) {
+                                self.available_models.push(crate::snapshot::ModelInfo {
+                                    name,
+                                    path: path.to_string_lossy().into_owned(),
+                                    size,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            self.available_models.sort_by(|a, b| a.name.cmp(&b.name));
+            self.models_dirty = true;
+            eprintln!("[RkpEngine] scanned {} models", self.available_models.len());
+        }
     }
 
     fn clear_scene(&mut self) {
@@ -998,6 +1056,13 @@ impl EngineState {
             None
         };
 
+        let models = if self.models_dirty {
+            self.models_dirty = false;
+            Some(self.available_models.clone())
+        } else {
+            None
+        };
+
         StateUpdate {
             fps,
             gpu_object_count: self.gpu_objects.len() as u32,
@@ -1007,6 +1072,7 @@ impl EngineState {
             objects,
             project_loaded: project,
             project_name,
+            available_models: models,
         }
     }
 }

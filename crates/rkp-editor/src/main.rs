@@ -133,6 +133,9 @@ fn main() -> anyhow::Result<()> {
                 if let Some(name) = &update.project_name {
                     store.project_name.send(name.clone());
                 }
+                if let Some(models) = &update.available_models {
+                    store.available_models.send(models.clone());
+                }
             })
         },
     );

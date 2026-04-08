@@ -21,5 +21,5 @@ pub mod scene_sync;
 pub mod wireframe_builders;
 
 pub use command::EngineCommand;
-pub use snapshot::{StateUpdate, SceneObjectInfo};
+pub use snapshot::{StateUpdate, SceneObjectInfo, ModelInfo};
 pub use engine::RkpEngine;

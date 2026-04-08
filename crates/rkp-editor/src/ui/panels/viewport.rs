@@ -4,6 +4,7 @@ use rinch::prelude::*;
 use rinch::render_surface::{RenderSurface, SurfaceEvent, SurfaceMouseButton};
 
 use crate::CommandSender;
+use crate::ui::store::EditorStore;
 
 /// Map rinch SurfaceMouseButton to rkf_runtime InputMouseButton.
 fn map_button(btn: SurfaceMouseButton) -> rkf_runtime::input::InputMouseButton {
@@ -48,6 +49,7 @@ fn map_key(code: &str) -> Option<rkf_runtime::input::InputKeyCode> {
 pub fn Viewport() -> NodeHandle {
     let surface = use_context::<RenderSurfaceHandle>();
     let cmd = use_context::<CommandSender>();
+    let store = use_context::<EditorStore>();
 
     // Track last mouse position for computing deltas.
     let last_mx = std::cell::Cell::new(0.0f32);
@@ -109,6 +111,19 @@ pub fn Viewport() -> NodeHandle {
                 if let Some(key) = map_key(&key_data.code) {
                     let _ = cmd_tx.send(rkp_engine::EngineCommand::KeyUp { key });
                 }
+            }
+            Drop { x, y } => {
+                // Model drag-and-drop: place model at drop position.
+                if let Some(model_path) = store.model_drag.get() {
+                    let _ = cmd_tx.send(rkp_engine::EngineCommand::LoadAsset {
+                        path: model_path,
+                        position: glam::Vec3::ZERO, // TODO: raycast to ground plane
+                    });
+                    store.model_drag.set(None);
+                }
+            }
+            DragEnter { .. } | DragOver { .. } | DragLeave => {
+                // Accept model drags silently.
             }
             _ => {}
         }

@@ -9,7 +9,7 @@ use std::rc::Rc;
 use rinch::prelude::*;
 use uuid::Uuid;
 
-use rkp_engine::SceneObjectInfo;
+use rkp_engine::{SceneObjectInfo, ModelInfo};
 use rkp_engine::gizmo::GizmoMode;
 
 use crate::ui::layout::{ContainerKind, LayoutConfig, PanelId, default_layout};
@@ -72,6 +72,10 @@ pub struct EditorStore {
     pub project_loaded: Signal<bool>,
     /// Current project name.
     pub project_name: Signal<String>,
+    /// Available .rkp model files.
+    pub available_models: Signal<Vec<ModelInfo>>,
+    /// Model path being dragged onto viewport (None = no drag).
+    pub model_drag: Signal<Option<String>>,
 
     // ── Drag state (tab dragging) ────────────────────────────────
 
@@ -146,6 +150,8 @@ impl EditorStore {
             // Project state.
             project_loaded: Signal::new(false),
             project_name: Signal::new(String::new()),
+            available_models: Signal::new(Vec::new()),
+            model_drag: Signal::new(None),
 
             // Drag state.
             tab_drag: Signal::new(None),

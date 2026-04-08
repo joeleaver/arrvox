@@ -254,7 +254,7 @@ pub fn default_layout() -> LayoutConfig {
         bottom: Container {
             kind: ContainerKind::Bottom,
             zones: vec![Zone {
-                tabs: vec![PanelId::Console, PanelId::Profiling],
+                tabs: vec![PanelId::Models, PanelId::Console, PanelId::Profiling],
                 active_tab: 0,
                 fraction: 1.0,
             }],
