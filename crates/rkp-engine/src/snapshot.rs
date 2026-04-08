@@ -42,6 +42,8 @@ pub struct StateUpdate {
     pub inspector: Option<crate::inspector::InspectorSnapshot>,
     /// Component names that can be added to the selected entity.
     pub available_components: Option<Vec<String>>,
+    /// Recent projects list (sent once on startup).
+    pub recent_projects: Option<Vec<crate::recent_projects::RecentProject>>,
 }
 
 /// Info about an available model file.

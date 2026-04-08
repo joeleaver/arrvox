@@ -155,6 +155,9 @@ fn main() -> anyhow::Result<()> {
                 if let Some(ref ac) = update.available_components {
                     store.available_components.send(ac.clone());
                 }
+                if let Some(ref rp) = update.recent_projects {
+                    store.recent_projects.send(rp.clone());
+                }
             })
         },
     );

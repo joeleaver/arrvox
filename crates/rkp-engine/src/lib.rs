@@ -19,6 +19,7 @@ pub mod import_worker;
 pub mod gizmo;
 pub mod inspector;
 pub mod project;
+pub mod recent_projects;
 pub mod scene_io;
 pub mod snapshot;
 pub mod engine;

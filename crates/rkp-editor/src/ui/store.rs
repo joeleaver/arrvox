@@ -12,6 +12,7 @@ use uuid::Uuid;
 use rkp_engine::{SceneObjectInfo, ModelInfo};
 use rkp_engine::gizmo::GizmoMode;
 use rkp_engine::inspector::InspectorSnapshot;
+use rkp_engine::recent_projects::RecentProject;
 
 use crate::ui::layout::{ContainerKind, LayoutConfig, PanelId, default_layout};
 
@@ -71,6 +72,8 @@ pub struct EditorStore {
 
     /// Whether a project is loaded (controls welcome screen visibility).
     pub project_loaded: Signal<bool>,
+    /// Recent projects list for the welcome screen.
+    pub recent_projects: Signal<Vec<RecentProject>>,
     /// Current project name.
     pub project_name: Signal<String>,
     /// Available .rkp model files.
@@ -154,6 +157,7 @@ impl EditorStore {
 
             // Project state.
             project_loaded: Signal::new(false),
+            recent_projects: Signal::new(Vec::new()),
             project_name: Signal::new(String::new()),
             available_models: Signal::new(Vec::new()),
             model_drag: Signal::new(None),

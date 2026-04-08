@@ -614,6 +614,7 @@ impl EngineState {
 
             EngineCommand::SpawnPrimitive { name } => {
                 use crate::components::*;
+                let name = self.unique_name(&name);
                 let primitive = rkf_core::scene_node::SdfPrimitive::Box {
                     half_extents: glam::Vec3::splat(0.5),
                 };
@@ -648,10 +649,8 @@ impl EngineState {
                 self.next_scene_id += 1;
                 match self.scene_mgr.load_rkp(&path, scene_id) {
                     Ok(result) => {
-                        let name = std::path::Path::new(&path)
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| path.clone());
+                        let raw_name = Self::display_name_from_path(&path);
+                        let name = self.unique_name(&raw_name);
                         let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
                         let entity = self.world.spawn((
                             Transform::default(),
@@ -739,6 +738,9 @@ impl EngineState {
                         self.scan_models();
                         self.init_file_watcher();
                         self.auto_import_meshes();
+                        if let Some(ref pp) = self.project_path {
+                            crate::recent_projects::add_recent(&self.project_name, &pp.to_string_lossy());
+                        }
                     }
                     Err(e) => eprintln!("[RkpEngine] new project failed: {e}"),
                 }
@@ -762,6 +764,9 @@ impl EngineState {
                         self.scan_models();
                         self.init_file_watcher();
                         self.auto_import_meshes();
+                        if let Some(ref pp) = self.project_path {
+                            crate::recent_projects::add_recent(&self.project_name, &pp.to_string_lossy());
+                        }
                     }
                     Err(e) => eprintln!("[RkpEngine] open project failed: {e}"),
                 }
@@ -1047,6 +1052,49 @@ impl EngineState {
     fn get_entity_uuid(&self, entity: hecs::Entity) -> uuid::Uuid {
         self.entity_uuids.get(&entity).copied()
             .unwrap_or_else(uuid::Uuid::nil)
+    }
+
+    /// Generate a unique entity name. If `base` already exists, appends a number.
+    fn unique_name(&self, base: &str) -> String {
+        let existing: std::collections::HashSet<String> = self.world
+            .query::<&crate::components::EditorMetadata>()
+            .iter()
+            .map(|(_, m)| m.name.clone())
+            .collect();
+        if !existing.contains(base) {
+            return base.to_string();
+        }
+        for i in 1.. {
+            let candidate = format!("{base} ({i})");
+            if !existing.contains(&candidate) {
+                return candidate;
+            }
+        }
+        base.to_string()
+    }
+
+    /// Extract an intelligent display name from an asset path.
+    /// Uses parent directory name if the filename is generic (scene, model, etc.).
+    fn display_name_from_path(path: &str) -> String {
+        let p = std::path::Path::new(path);
+        let stem = p.file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        // If the filename is generic, use the parent directory name.
+        let generic_names = ["scene", "model", "mesh", "object", "default", "untitled"];
+        if generic_names.iter().any(|g| stem.eq_ignore_ascii_case(g)) {
+            if let Some(parent) = p.parent().and_then(|p| p.file_name()) {
+                let parent_name = parent.to_string_lossy().into_owned();
+                // Don't use generic parent names either.
+                if !generic_names.iter().any(|g| parent_name.eq_ignore_ascii_case(g))
+                    && parent_name != "objects" && parent_name != "assets" && parent_name != "models"
+                {
+                    return parent_name;
+                }
+            }
+        }
+        stem
     }
 
     /// Get or assign a stable scene object ID for face emission.
@@ -1478,6 +1526,11 @@ impl EngineState {
             project_name,
             available_models: models,
             inspector: self.build_inspector_snapshot(),
+            recent_projects: if self.frame_index == 1 {
+                Some(crate::recent_projects::load_recent())
+            } else {
+                None
+            },
             available_components: self.selected_entity.map(|entity| {
                 self.registry.available_for(&self.world, entity)
                     .iter()

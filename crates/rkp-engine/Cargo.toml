@@ -22,4 +22,5 @@ crossbeam = "0.8"
 notify = "7"
 serde = { workspace = true }
 serde_json = { workspace = true }
+dirs = "6"
 log = { workspace = true }
