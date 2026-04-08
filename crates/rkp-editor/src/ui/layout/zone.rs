@@ -29,9 +29,7 @@ pub fn ZoneComponent(container: ContainerKind, zone_idx: usize) -> NodeHandle {
     rsx! {
         div {
             style: "display:flex;flex-direction:column;flex:1;min-height:0;min-width:0;",
-            if tab_count.get() > 1 {
-                TabBar { container: container, zone_idx: zone_idx }
-            }
+            TabBar { container: container, zone_idx: zone_idx }
             // Content area with edge drop targets overlaid.
             div {
                 style: {
