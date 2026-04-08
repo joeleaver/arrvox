@@ -1,26 +1,15 @@
 //! RKIPatch Editor — thin client over the RkpEngine.
 //!
 //! Creates an RkpEngine on its own thread and a rinch UI as a thin client.
-//! The engine pushes state updates via signals. The editor reads them reactively.
+//! All UI state flows through `EditorStore`. The engine pushes state updates
+//! via `send()`. The editor reads them reactively.
 
 mod ui;
 
 use rinch::prelude::*;
 
-use rkp_engine::SceneObjectInfo;
-use ui::EditorUi;
-
-/// Signals the engine writes to (via `send()`), the UI reads (via `get()`).
-///
-/// All fields are `Signal` (Copy). Created before the engine and UI start,
-/// shared by both via rinch context.
-#[derive(Clone, Copy)]
-pub struct EngineSignals {
-    pub fps: Signal<f32>,
-    pub gpu_object_count: Signal<u32>,
-    pub objects: Signal<Vec<SceneObjectInfo>>,
-    pub selected_entity: Signal<Option<uuid::Uuid>>,
-}
+use ui::store::EditorStore;
+use ui::LayoutRoot;
 
 /// Wrapper for the engine command sender, stored in rinch context.
 #[derive(Clone)]
@@ -33,13 +22,8 @@ fn main() -> anyhow::Result<()> {
     let surface_handle = create_render_surface();
     let surface_writer = surface_handle.writer();
 
-    // 2. Create signals for engine→UI communication.
-    let signals = EngineSignals {
-        fps: Signal::new(0.0),
-        gpu_object_count: Signal::new(0),
-        objects: Signal::new(Vec::new()),
-        selected_entity: Signal::new(None),
-    };
+    // 2. Create the central editor store.
+    let store = EditorStore::new();
 
     // 3. Start the engine.
     let engine = rkp_engine::RkpEngine::spawn(
@@ -51,15 +35,15 @@ fn main() -> anyhow::Result<()> {
         Box::new(move |pixels, w, h| {
             surface_writer.submit_frame(pixels, w, h);
         }),
-        // State callback: push engine state to UI signals (cross-thread via send()).
+        // State callback: push engine state to EditorStore signals (cross-thread).
         {
-            let signals = signals;
+            let store = store;
             Box::new(move |update: &rkp_engine::StateUpdate| {
-                signals.fps.send(update.fps);
-                signals.gpu_object_count.send(update.gpu_object_count);
-                signals.selected_entity.send(update.selected_entity);
+                store.fps.send(update.fps);
+                store.gpu_object_count.send(update.gpu_object_count);
+                store.selected_entity.send(update.selected_entity);
                 if let Some(objects) = &update.objects {
-                    signals.objects.send(objects.clone());
+                    store.objects.send(objects.clone());
                 }
             })
         },
@@ -91,9 +75,9 @@ fn main() -> anyhow::Result<()> {
     rinch::shell::run_with_window_props(
         move |__scope| {
             create_context(surface_handle.clone());
-            create_context(signals);
+            create_context(store);
             create_context(CommandSender(cmd_tx.clone()));
-            rsx! { EditorUi {} }
+            rsx! { LayoutRoot {} }
         },
         props,
         theme,

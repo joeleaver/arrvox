@@ -1,31 +1,21 @@
 //! Scene tree panel — hierarchical view of scene objects.
-//!
-//! Reads the objects list from EngineSignals. Supports expand/collapse
-//! and click-to-select.
 
 use rinch::prelude::*;
 
-use crate::{CommandSender, EngineSignals};
+use crate::CommandSender;
+use crate::ui::store::EditorStore;
 use rkp_engine::SceneObjectInfo;
 
 #[component]
 pub fn SceneTree() -> NodeHandle {
-    let signals = use_context::<EngineSignals>();
+    let store = use_context::<EditorStore>();
 
     rsx! {
         div {
-            style: "display:flex;flex-direction:column;height:100%;overflow-y:auto;\
-                    background:#252526;",
-            // Header
+            style: "display:flex;flex-direction:column;height:100%;overflow-y:auto;",
             div {
-                style: "padding:8px 12px;font-size:11px;font-weight:600;color:#bbb;\
-                        text-transform:uppercase;letter-spacing:0.5px;",
-                "Scene"
-            }
-            // Tree content
-            div {
-                style: "flex:1;padding:0 4px;",
-                for obj in signals.objects.get() {
+                style: "flex:1;padding:4px;",
+                for obj in store.objects.get() {
                     SceneTreeItem {
                         key: obj.id.to_string(),
                         object: obj.clone(),
@@ -38,25 +28,20 @@ pub fn SceneTree() -> NodeHandle {
 
 #[component]
 fn SceneTreeItem(object: SceneObjectInfo) -> NodeHandle {
-    let signals = use_context::<EngineSignals>();
+    let store = use_context::<EditorStore>();
     let cmd = use_context::<CommandSender>();
     let id = object.id;
     let name = object.name.clone();
 
-    let icon = if object.is_camera {
-        "\u{f03d}" // camera icon (tabler)
-    } else if object.is_light {
-        "\u{f4e2}" // bulb icon
-    } else {
-        "\u{f1fc}" // cube icon
-    };
+    let icon = if object.is_camera { "\u{f03d}" }
+        else if object.is_light { "\u{f4e2}" }
+        else { "\u{f1fc}" };
 
     rsx! {
         div {
             style: {
-                let signals = signals;
                 move || {
-                    let selected = signals.selected_entity.get() == Some(id);
+                    let selected = store.selected_entity.get() == Some(id);
                     if selected {
                         "display:flex;align-items:center;padding:2px 8px;cursor:pointer;\
                          border-radius:3px;background:#37373d;color:#fff;font-size:12px;"
