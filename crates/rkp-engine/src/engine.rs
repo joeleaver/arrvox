@@ -171,6 +171,9 @@ struct EngineState {
     uuid_to_entity: std::collections::HashMap<uuid::Uuid, hecs::Entity>,
     /// UUID counter for generating stable IDs.
     next_entity_uuid: u64,
+    /// Stable scene object IDs for face emission (entity → scene_obj_id).
+    entity_scene_ids: std::collections::HashMap<hecs::Entity, u32>,
+    next_scene_id: u32,
     /// Currently selected entity.
     selected_entity: Option<hecs::Entity>,
 
@@ -180,6 +183,8 @@ struct EngineState {
     gpu_to_entity: Vec<hecs::Entity>,
     /// Maps hecs Entity → gpu_object index.
     entity_to_gpu: std::collections::HashMap<hecs::Entity, usize>,
+    /// Maps scene_id (from face emission) → gpu object index (this frame).
+    scene_id_to_gpu: std::collections::HashMap<u32, u32>,
 
     // Project state
     project_loaded: bool,
@@ -311,10 +316,13 @@ impl EngineState {
             entity_uuids: std::collections::HashMap::new(),
             uuid_to_entity: std::collections::HashMap::new(),
             next_entity_uuid: 1,
+            entity_scene_ids: std::collections::HashMap::new(),
+            next_scene_id: 0,
             selected_entity: None,
             gpu_objects: Vec::new(),
             gpu_to_entity: Vec::new(),
             entity_to_gpu: std::collections::HashMap::new(),
+            scene_id_to_gpu: std::collections::HashMap::new(),
             project_loaded: false,
             project_name: String::new(),
             project_dir: None,
@@ -374,8 +382,13 @@ impl EngineState {
         };
         self.renderer.upload_frame(&self.queue, &frame);
 
-        // 3. Upload face instances.
-        let faces = self.scene_mgr.pending_faces().to_vec();
+        // 3. Upload face instances with remapped object indices.
+        let mut faces = self.scene_mgr.pending_faces().to_vec();
+        for face in &mut faces {
+            let scene_id = (face.packed >> 3) & 0xFFFFF;
+            let gpu_idx = self.scene_id_to_gpu.get(&scene_id).copied().unwrap_or(0);
+            face.packed = (face.packed & 0x7) | ((gpu_idx & 0xFFFFF) << 3);
+        }
         self.renderer.upload_faces(&mut encoder, &faces);
 
         // 4. Render: raster → shadow/AO → shade.
@@ -604,9 +617,10 @@ impl EngineState {
                 let primitive = rkf_core::scene_node::SdfPrimitive::Box {
                     half_extents: glam::Vec3::splat(0.5),
                 };
-                // Use a temporary gpu index (0) — update_scene_gpu will assign real ones.
+                let scene_id = self.next_scene_id;
+                self.next_scene_id += 1;
                 let result = self.scene_mgr.voxelize_primitive(
-                    &primitive, 0, 0.05, glam::Vec3::ONE, 0,
+                    &primitive, 0, 0.05, glam::Vec3::ONE, scene_id,
                 );
                 if let Some(result) = result {
                     let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
@@ -621,15 +635,18 @@ impl EngineState {
                         },
                     ));
                     self.assign_entity_uuid(entity);
+                    self.entity_scene_ids.insert(entity, scene_id);
                     self.geometry_dirty = true;
                     self.scene_dirty = true;
-                    eprintln!("[RkpEngine] spawned primitive '{name}': {} voxels, entity {:?}", result.voxel_count, entity);
+                    eprintln!("[RkpEngine] spawned primitive '{name}': {} voxels, entity {:?}, scene_id={}", result.voxel_count, entity, scene_id);
                 }
             }
 
             EngineCommand::LoadAsset { path, .. } => {
                 use crate::components::*;
-                match self.scene_mgr.load_rkp(&path, 0) {
+                let scene_id = self.next_scene_id;
+                self.next_scene_id += 1;
+                match self.scene_mgr.load_rkp(&path, scene_id) {
                     Ok(result) => {
                         let name = std::path::Path::new(&path)
                             .file_stem()
@@ -647,9 +664,10 @@ impl EngineState {
                             },
                         ));
                         self.assign_entity_uuid(entity);
+                        self.entity_scene_ids.insert(entity, scene_id);
                         self.geometry_dirty = true;
                         self.scene_dirty = true;
-                        eprintln!("[RkpEngine] loaded asset '{name}': {} voxels, entity {:?}", result.voxel_count, entity);
+                        eprintln!("[RkpEngine] loaded asset '{name}': {} voxels, entity {:?}, scene_id={}", result.voxel_count, entity, scene_id);
                     }
                     Err(e) => {
                         eprintln!("[RkpEngine] failed to load '{path}': {e}");
@@ -1031,6 +1049,18 @@ impl EngineState {
             .unwrap_or_else(uuid::Uuid::nil)
     }
 
+    /// Get or assign a stable scene object ID for face emission.
+    fn get_scene_id(&mut self, entity: hecs::Entity) -> u32 {
+        if let Some(&id) = self.entity_scene_ids.get(&entity) {
+            id
+        } else {
+            let id = self.next_scene_id;
+            self.next_scene_id += 1;
+            self.entity_scene_ids.insert(entity, id);
+            id
+        }
+    }
+
     /// Assign a stable UUID to an entity.
     fn assign_entity_uuid(&mut self, entity: hecs::Entity) -> uuid::Uuid {
         let uuid = uuid::Uuid::new_v4();
@@ -1046,6 +1076,7 @@ impl EngineState {
         self.gpu_objects.clear();
         self.gpu_to_entity.clear();
         self.entity_to_gpu.clear();
+        self.scene_id_to_gpu.clear();
 
         for (entity, (transform, renderable)) in self.world.query::<(&Transform, &Renderable)>().iter() {
             if let Some(ref spatial) = renderable.spatial {
@@ -1074,6 +1105,10 @@ impl EngineState {
                     renderable.material_id,
                     gpu_idx,
                 );
+                // Map scene_id → gpu_index for face remapping.
+                if let Some(&scene_id) = self.entity_scene_ids.get(&entity) {
+                    self.scene_id_to_gpu.insert(scene_id, gpu_idx);
+                }
                 self.entity_to_gpu.insert(entity, self.gpu_objects.len());
                 self.gpu_to_entity.push(entity);
                 self.gpu_objects.push(gpu_obj);
@@ -1150,7 +1185,9 @@ impl EngineState {
                         let full_path = self.project_dir.as_ref()
                             .map(|d| d.join("assets").join(asset_path))
                             .unwrap_or_else(|| std::path::PathBuf::from(asset_path));
-                        if let Ok(result) = self.scene_mgr.load_rkp(&full_path.to_string_lossy(), 0) {
+                        let sid = self.next_scene_id;
+                        self.next_scene_id += 1;
+                        if let Ok(result) = self.scene_mgr.load_rkp(&full_path.to_string_lossy(), sid) {
                             let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
                             let e = self.world.spawn((transform, meta, Renderable {
                                 asset_path: Some(asset_path.clone()),
@@ -1160,6 +1197,7 @@ impl EngineState {
                                 ..Default::default()
                             }));
                             self.assign_entity_uuid(e);
+                            self.entity_scene_ids.insert(e, sid);
                             self.geometry_dirty = true;
                         }
                     } else if let Some(ref prim_name) = obj.primitive {
@@ -1172,8 +1210,10 @@ impl EngineState {
                             },
                             _ => continue,
                         };
+                        let sid2 = self.next_scene_id;
+                        self.next_scene_id += 1;
                         if let Some(result) = self.scene_mgr.voxelize_primitive(
-                            &primitive, obj.material_id, 0.05, glam::Vec3::ONE, 0,
+                            &primitive, obj.material_id, 0.05, glam::Vec3::ONE, sid2,
                         ) {
                             let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
                             let e = self.world.spawn((transform, meta, Renderable {
@@ -1184,6 +1224,7 @@ impl EngineState {
                                 ..Default::default()
                             }));
                             self.assign_entity_uuid(e);
+                            self.entity_scene_ids.insert(e, sid2);
                             self.geometry_dirty = true;
                         }
                     }
