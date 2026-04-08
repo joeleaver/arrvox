@@ -54,8 +54,22 @@ pub fn Viewport() -> NodeHandle {
     let last_my = std::cell::Cell::new(0.0f32);
 
     let cmd_tx = cmd.0.clone();
+    let surface_for_handler = surface.clone();
     surface.set_event_handler(move |event| {
         use SurfaceEvent::*;
+
+        // Check if surface size changed — send Resize to engine.
+        {
+            let (w, h) = surface_for_handler.layout_size();
+            let w = w.max(64);
+            let h = h.max(64);
+            // Only send resize occasionally — every mouse event is fine,
+            // the engine no-ops if the size hasn't changed.
+            let _ = cmd_tx.send(rkp_engine::EngineCommand::Resize {
+                width: w, height: h,
+            });
+        }
+
         match event {
             MouseMove { x, y } => {
                 let dx = x - last_mx.get();

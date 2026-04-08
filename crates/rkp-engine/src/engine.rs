@@ -305,6 +305,30 @@ impl EngineState {
         let shadow_params = rkp_render::rkp_shadow_ao::ShadowAoParams::default();
         self.renderer.render(&mut encoder, &self.gbuffer, &self.queue, &shadow_params);
 
+        // 4b. Pick: copy position texture (hit_t in W tells us if geometry was hit).
+        let pick_issued = self.pending_pick.is_some();
+        if let Some((px, py)) = self.pending_pick.take() {
+            if px < self.width && py < self.height {
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.gbuffer.position_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: px, y: py, z: 0 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &self.pick_readback_buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(256),
+                            rows_per_image: Some(1),
+                        },
+                    },
+                    wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                );
+            }
+        }
+
         // 5. Tone mapping: HDR → LDR (Rgba8Unorm).
         self.tone_map.dispatch(&mut encoder);
 
@@ -368,30 +392,6 @@ impl EngineState {
                 depth_or_array_layers: 1,
             },
         );
-
-        // 7. If a pick is pending, copy that pixel from material texture.
-        let pick_issued = self.pending_pick.is_some();
-        if let Some((px, py)) = self.pending_pick.take() {
-            if px < self.width && py < self.height {
-                encoder.copy_texture_to_buffer(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &self.gbuffer.material_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d { x: px, y: py, z: 0 },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: &self.pick_readback_buffer,
-                        layout: wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(256),
-                            rows_per_image: Some(1),
-                        },
-                    },
-                    wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-                );
-            }
-        }
 
         // 8. Submit GPU work.
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -505,6 +505,20 @@ impl EngineState {
                         height,
                     );
                     self.readback_buffer = Self::create_readback_buffer(&self.device, width, height);
+                    self.composite_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("rkp composite"),
+                        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: rkf_render::LDR_FORMAT,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::COPY_SRC
+                            | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    self.composite_view = self.composite_texture.create_view(&Default::default());
+                    eprintln!("[RkpEngine] resized to {}x{}", width, height);
                 }
             }
 
@@ -734,7 +748,7 @@ impl EngineState {
     }
 
     fn process_pick_result(&mut self) {
-        let slice = self.pick_readback_buffer.slice(..8);
+        let slice = self.pick_readback_buffer.slice(..256);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
@@ -743,18 +757,33 @@ impl EngineState {
 
         if let Ok(Ok(())) = rx.recv() {
             let data = slice.get_mapped_range();
-            if data.len() >= 8 {
-                let g_channel = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-                let object_id = (g_channel >> 8) & 0xFF;
+            if data.len() >= 16 {
+                // Position texture (Rgba32Float): xyz = world pos, w = hit_t.
+                let x = f32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                let y = f32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                let z = f32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+                let hit_t = f32::from_le_bytes([data[12], data[13], data[14], data[15]]);
 
-                if object_id > 0 && (object_id as usize) <= self.object_names.len() {
-                    // object_id in shader is the gpu_object index.
-                    let idx = object_id as usize;
-                    let entity_id = uuid::Uuid::from_u128(idx as u128);
-                    self.selected_entity = Some(entity_id);
-                    eprintln!("[RkpEngine] picked object_id={} → {:?}", object_id, self.object_names.get(idx));
+                if hit_t > 0.0 && hit_t < 9999.0 {
+                    let hit_pos = glam::Vec3::new(x, y, z);
+                    // Find closest object to the hit position.
+                    let mut best_idx = None;
+                    let mut best_dist = f32::MAX;
+                    for (i, obj) in self.gpu_objects.iter().enumerate() {
+                        let obj_center = glam::Vec3::new(
+                            obj.world[3][0], obj.world[3][1], obj.world[3][2],
+                        );
+                        let d = (hit_pos - obj_center).length();
+                        if d < best_dist {
+                            best_dist = d;
+                            best_idx = Some(i);
+                        }
+                    }
+                    if let Some(idx) = best_idx {
+                        let entity_id = uuid::Uuid::from_u128(idx as u128);
+                        self.selected_entity = Some(entity_id);
+                    }
                 } else {
-                    // Clicked sky or empty space.
                     self.selected_entity = None;
                 }
             }
