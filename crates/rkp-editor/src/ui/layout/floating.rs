@@ -64,7 +64,7 @@ fn FloatingPanelWindow(index: usize) -> NodeHandle {
                 style: "height:28px;display:flex;align-items:center;padding:0 8px;\
                         background:#2d2d2d;cursor:grab;flex-shrink:0;\
                         border-bottom:1px solid #3c3c3c;justify-content:space-between;",
-                onclick: {
+                onmousedown: {
                     let panel_id = panel_id;
                     move || {
                         let ctx = get_click_context();
@@ -89,41 +89,42 @@ fn FloatingPanelWindow(index: usize) -> NodeHandle {
                             })
                             .on_end(move |_mx, _my| {
                                 let drop = store.drop_target.get();
-                                let drag = store.tab_drag.get();
 
-                                // Clear drag state first.
+                                // Clear drag state.
                                 store.tab_drag.set(None);
                                 store.drop_target.set(None);
 
-                                // If dropped on a zone, dock it there.
-                                if let (Some(_data), Some(dt)) = (drag, drop) {
-                                    store.layout.update(|layout| {
-                                        match dt {
-                                            DropTarget::Zone { container, zone_idx } => {
-                                                layout.dock_panel(index, container, zone_idx);
-                                            }
-                                            DropTarget::Split { container, zone_idx, edge } => {
-                                                // Remove from floating, split-dock.
-                                                if index < layout.floating.len() {
-                                                    let fp = layout.floating.remove(index);
-                                                    let before = matches!(edge,
-                                                        crate::ui::store::SplitEdge::Top |
-                                                        crate::ui::store::SplitEdge::Left
-                                                    );
-                                                    layout.split_zone(fp.panel, container, zone_idx, before);
+                                // Defer the layout mutation to avoid re-entrant borrow.
+                                // Use run_on_main_thread to schedule after the current event.
+                                let store = store;
+                                rinch::shell::rinch_runtime::run_on_main_thread(move || {
+                                    if let Some(dt) = drop {
+                                        store.layout.update(|layout| {
+                                            match dt {
+                                                DropTarget::Zone { container, zone_idx } => {
+                                                    layout.dock_panel(index, container, zone_idx);
+                                                }
+                                                DropTarget::Split { container, zone_idx, edge } => {
+                                                    if index < layout.floating.len() {
+                                                        let fp = layout.floating.remove(index);
+                                                        let before = matches!(edge,
+                                                            crate::ui::store::SplitEdge::Top |
+                                                            crate::ui::store::SplitEdge::Left
+                                                        );
+                                                        layout.split_zone(fp.panel, container, zone_idx, before);
+                                                    }
                                                 }
                                             }
-                                        }
-                                    });
-                                } else {
-                                    // Stayed floating — update stored position.
-                                    store.layout.update(|layout| {
-                                        if index < layout.floating.len() {
-                                            layout.floating[index].x = x.get();
-                                            layout.floating[index].y = y.get();
-                                        }
-                                    });
-                                }
+                                        });
+                                    } else {
+                                        store.layout.update(|layout| {
+                                            if index < layout.floating.len() {
+                                                layout.floating[index].x = x.get();
+                                                layout.floating[index].y = y.get();
+                                            }
+                                        });
+                                    }
+                                });
                             })
                             .start();
                     }
@@ -134,10 +135,12 @@ fn FloatingPanelWindow(index: usize) -> NodeHandle {
                     style: "cursor:pointer;font-size:14px;color:#888;padding:0 4px;\
                             border-radius:2px;line-height:1;",
                     onclick: move || {
-                        store.layout.update(|layout| {
-                            if index < layout.floating.len() {
-                                layout.floating.remove(index);
-                            }
+                        rinch::shell::rinch_runtime::run_on_main_thread(move || {
+                            store.layout.update(|layout| {
+                                if index < layout.floating.len() {
+                                    layout.floating.remove(index);
+                                }
+                            });
                         });
                     },
                     {"\u{00d7}"} // ×

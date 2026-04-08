@@ -41,7 +41,7 @@ pub fn ContainerSplitter(direction: SplitDirection, target: SplitTarget) -> Node
     rsx! {
         div {
             style: style,
-            onclick: move || {
+            onmousedown: move || {
                 let ctx = get_click_context();
                 let is_horizontal = matches!(direction, SplitDirection::Horizontal);
                 let start_mouse = if is_horizontal { ctx.mouse_y } else { ctx.mouse_x };
