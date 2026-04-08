@@ -4,7 +4,7 @@ use rinch::prelude::*;
 
 use super::{ContainerKind, PanelId};
 use super::tab_bar::TabBar;
-use crate::ui::store::EditorStore;
+use crate::ui::store::{EditorStore, TabDragData};
 use crate::ui::panels::*;
 
 #[component]
@@ -32,7 +32,45 @@ pub fn ZoneComponent(container: ContainerKind, zone_idx: usize) -> NodeHandle {
             }
             // Panel content — one `if` per panel type. Only the matching one renders.
             div {
-                style: "flex:1;min-height:0;min-width:0;overflow:hidden;",
+                style: {
+                    move || {
+                        let is_drop = store.drop_target.get() == Some(
+                            crate::ui::store::DropTarget::Zone { container, zone_idx }
+                        );
+                        if is_drop {
+                            "flex:1;min-height:0;min-width:0;overflow:hidden;\
+                             outline:2px solid #007acc;outline-offset:-2px;"
+                        } else {
+                            "flex:1;min-height:0;min-width:0;overflow:hidden;"
+                        }
+                    }
+                },
+                ondragenter: move || {
+                    if store.tab_drag.get().is_some() {
+                        store.drop_target.set(Some(crate::ui::store::DropTarget::Zone {
+                            container,
+                            zone_idx,
+                        }));
+                    }
+                },
+                ondragleave: move || {
+                    if store.drop_target.get() == Some(crate::ui::store::DropTarget::Zone { container, zone_idx }) {
+                        store.drop_target.set(None);
+                    }
+                },
+                ondrop: move || {
+                    if let Some(data) = store.tab_drag.get() {
+                        store.layout.update(|layout| {
+                            let tab_idx = data.tab_index(layout);
+                            layout.move_tab(
+                                data.source_container, data.source_zone, tab_idx,
+                                container, zone_idx,
+                            );
+                        });
+                    }
+                    store.tab_drag.set(None);
+                    store.drop_target.set(None);
+                },
                 if active_panel.get() == Some(PanelId::SceneTree) {
                     SceneTree {}
                 }

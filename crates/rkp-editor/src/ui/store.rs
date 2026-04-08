@@ -10,7 +10,7 @@ use uuid::Uuid;
 use rkp_engine::SceneObjectInfo;
 use rkp_engine::gizmo::GizmoMode;
 
-use crate::ui::layout::{LayoutConfig, default_layout};
+use crate::ui::layout::{ContainerKind, LayoutConfig, PanelId, default_layout};
 
 /// Editor interaction mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +60,38 @@ pub struct EditorStore {
     pub sculpt_radius: Signal<f32>,
     pub sculpt_strength: Signal<f32>,
     pub paint_color: Signal<[f32; 3]>,
+
+    // ── Drag state (tab dragging) ────────────────────────────────
+
+    /// Currently dragged tab (None = no drag in progress).
+    pub tab_drag: Signal<Option<TabDragData>>,
+    /// Where the dragged tab will drop if released now.
+    pub drop_target: Signal<Option<DropTarget>>,
+}
+
+/// Data about the tab being dragged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabDragData {
+    pub panel: PanelId,
+    pub source_container: ContainerKind,
+    pub source_zone: usize,
+}
+
+impl TabDragData {
+    /// Find the tab index of this panel in its source zone.
+    pub fn tab_index(&self, layout: &LayoutConfig) -> usize {
+        layout.container(self.source_container)
+            .zones.get(self.source_zone)
+            .and_then(|z| z.tabs.iter().position(|&p| p == self.panel))
+            .unwrap_or(0)
+    }
+}
+
+/// Where a tab can be dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropTarget {
+    /// Drop into an existing zone (adds as a new tab).
+    Zone { container: ContainerKind, zone_idx: usize },
 }
 
 impl EditorStore {
@@ -86,6 +118,10 @@ impl EditorStore {
             sculpt_radius: Signal::new(1.0),
             sculpt_strength: Signal::new(0.5),
             paint_color: Signal::new([0.8, 0.2, 0.2]),
+
+            // Drag state.
+            tab_drag: Signal::new(None),
+            drop_target: Signal::new(None),
         }
     }
 }

@@ -4,6 +4,7 @@ use rinch::prelude::*;
 
 use super::ContainerKind;
 use super::container::ContainerComponent;
+use super::floating::FloatingPanelHost;
 use super::splitter::{ContainerSplitter, SplitDirection, SplitTarget};
 use crate::ui::store::EditorStore;
 use crate::ui::panels::StatusBar;
@@ -14,7 +15,8 @@ pub fn LayoutRoot() -> NodeHandle {
 
     rsx! {
         div {
-            style: "display:flex;flex-direction:column;width:100%;height:100%;background:#1e1e1e;",
+            style: "display:flex;flex-direction:column;width:100%;height:100%;background:#1e1e1e;\
+                    position:relative;",
 
             // Titlebar
             div {
@@ -92,6 +94,9 @@ pub fn LayoutRoot() -> NodeHandle {
                     ContainerComponent { kind: ContainerKind::Right }
                 }
             }
+
+            // Floating panels (absolutely positioned over everything)
+            FloatingPanelHost {}
 
             // Status bar
             StatusBar {}

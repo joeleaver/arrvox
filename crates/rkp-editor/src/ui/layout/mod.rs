@@ -1,6 +1,7 @@
 //! Layout data model — containers, zones, tabs, panel IDs.
 
 pub mod container;
+pub mod floating;
 pub mod layout_root;
 pub mod panel_registry;
 pub mod splitter;
