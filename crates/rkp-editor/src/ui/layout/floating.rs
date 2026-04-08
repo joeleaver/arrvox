@@ -41,6 +41,7 @@ fn FloatingPanelWindow(index: usize) -> NodeHandle {
     let x = Signal::new(panel_info.get().map(|f| f.x).unwrap_or(200.0));
     let y = Signal::new(panel_info.get().map(|f| f.y).unwrap_or(200.0));
     let panel_id = panel_info.get().map(|f| f.panel);
+    let is_being_dragged = Signal::new(false);
 
     let name = panel_id.map(|p| panel_registry::panel_name(p)).unwrap_or("Panel");
 
@@ -52,11 +53,12 @@ fn FloatingPanelWindow(index: usize) -> NodeHandle {
                     let fp = pi.get();
                     let (px, py) = (x.get(), y.get());
                     let (w, h) = fp.map(|f| (f.width, f.height)).unwrap_or((400.0, 300.0));
+                    let pe = if is_being_dragged.get() { "pointer-events:none;" } else { "" };
                     format!(
                         "position:absolute;left:{:.0}px;top:{:.0}px;width:{:.0}px;height:{:.0}px;\
                          z-index:200;background:#252526;border:1px solid #3c3c3c;\
                          border-radius:4px;box-shadow:0 4px 16px rgba(0,0,0,0.4);\
-                         display:flex;flex-direction:column;overflow:hidden;",
+                         display:flex;flex-direction:column;overflow:hidden;{pe}",
                         px, py, w, h
                     )
                 }
@@ -65,16 +67,18 @@ fn FloatingPanelWindow(index: usize) -> NodeHandle {
             div {
                 style: "height:28px;display:flex;align-items:center;padding:0 8px;\
                         background:#2d2d2d;cursor:grab;flex-shrink:0;\
-                        border-bottom:1px solid #3c3c3c;justify-content:space-between;",
+                        border-bottom:1px solid #3c3c3c;justify-content:space-between;\
+                        pointer-events:auto;",
                 draggable: "true",
                 ondragstart: {
                     let panel_id = panel_id;
                     move || {
                         suppress_drag_ghost();
+                        is_being_dragged.set(true);
                         if let Some(pid) = panel_id {
                             store.tab_drag.set(Some(TabDragData {
                                 panel: pid,
-                                source_container: ContainerKind::Left, // dummy for floating
+                                source_container: ContainerKind::Left,
                                 source_zone: 0,
                             }));
                         }
@@ -89,6 +93,7 @@ fn FloatingPanelWindow(index: usize) -> NodeHandle {
                 },
                 ondragend: move || {
                     restore_drag_ghost();
+                    is_being_dragged.set(false);
                     let drop = store.drop_target.get();
 
                     store.tab_drag.set(None);
@@ -125,8 +130,9 @@ fn FloatingPanelWindow(index: usize) -> NodeHandle {
                 span { style: "font-size:11px;color:#ccc;user-select:none;", {name} }
                 // Close button (stop propagation so click doesn't start a drag)
                 div {
-                    style: "cursor:pointer;color:#888;padding:2px;\
-                            border-radius:2px;width:14px;height:14px;",
+                    style: "cursor:pointer;color:#999;padding:2px;\
+                            border-radius:2px;width:16px;height:16px;\
+                            display:inline-flex;align-items:center;justify-content:center;",
                     onclick: move || {
                         store.update_layout(|layout| {
                             if index < layout.floating.len() {

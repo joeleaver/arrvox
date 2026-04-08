@@ -55,7 +55,9 @@ fn SceneTreeItem(object: SceneObjectInfo) -> NodeHandle {
             onclick: move || {
                 cmd.0.send(rkp_engine::EngineCommand::SelectEntity { entity_id: id }).ok();
             },
-            div { style: "flex-shrink:0;opacity:0.6;width:14px;height:14px;",
+            span {
+                style: "width:16px;height:16px;display:inline-flex;align-items:center;\
+                        justify-content:center;flex-shrink:0;color:#999;",
                 {render_tabler_icon(__scope, icon, TablerIconStyle::Outline)}
             }
             span { {name} }
