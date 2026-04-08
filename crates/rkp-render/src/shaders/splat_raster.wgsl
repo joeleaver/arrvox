@@ -443,7 +443,8 @@ fn fs_main(in: VsOutput) -> GBufferOutput {
     }
 
     let packed_r = (mat_id & 0xFFFFu) | ((sec_mat & 0xFFFFu) << 16u);
-    let packed_g = (blend & 0xFFu) | ((obj.object_id & 0xFFu) << 8u) | (color_rgb565 << 16u);
+    // object_id + 1 so that 0 means "no geometry" (distinguishes object 0 from empty).
+    let packed_g = (blend & 0xFFu) | (((obj.object_id + 1u) & 0xFFu) << 8u) | (color_rgb565 << 16u);
 
     // Hit distance from camera.
     let hit_t = length(in.world_pos - camera.position.xyz);

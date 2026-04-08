@@ -305,13 +305,13 @@ impl EngineState {
         let shadow_params = rkp_render::rkp_shadow_ao::ShadowAoParams::default();
         self.renderer.render(&mut encoder, &self.gbuffer, &self.queue, &shadow_params);
 
-        // 4b. Pick: copy position texture (hit_t in W tells us if geometry was hit).
+        // 4b. Pick: copy material texture (object_id+1 in G bits 8-15, 0 = no hit).
         let pick_issued = self.pending_pick.is_some();
         if let Some((px, py)) = self.pending_pick.take() {
             if px < self.width && py < self.height {
                 encoder.copy_texture_to_buffer(
                     wgpu::TexelCopyTextureInfo {
-                        texture: &self.gbuffer.position_texture,
+                        texture: &self.gbuffer.material_texture,
                         mip_level: 0,
                         origin: wgpu::Origin3d { x: px, y: py, z: 0 },
                         aspect: wgpu::TextureAspect::All,
@@ -757,30 +757,16 @@ impl EngineState {
 
         if let Ok(Ok(())) = rx.recv() {
             let data = slice.get_mapped_range();
-            if data.len() >= 16 {
-                // Position texture (Rgba32Float): xyz = world pos, w = hit_t.
-                let x = f32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                let y = f32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-                let z = f32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-                let hit_t = f32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+            if data.len() >= 8 {
+                // Material texture (Rg32Uint): R = material ids, G = blend|object_id+1|color.
+                let g_channel = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                // object_id+1 in bits 8-15. 0 means no geometry.
+                let raw_id = (g_channel >> 8) & 0xFF;
 
-                if hit_t > 0.0 && hit_t < 9999.0 {
-                    let hit_pos = glam::Vec3::new(x, y, z);
-                    // Find closest object to the hit position.
-                    let mut best_idx = None;
-                    let mut best_dist = f32::MAX;
-                    for (i, obj) in self.gpu_objects.iter().enumerate() {
-                        let obj_center = glam::Vec3::new(
-                            obj.world[3][0], obj.world[3][1], obj.world[3][2],
-                        );
-                        let d = (hit_pos - obj_center).length();
-                        if d < best_dist {
-                            best_dist = d;
-                            best_idx = Some(i);
-                        }
-                    }
-                    if let Some(idx) = best_idx {
-                        let entity_id = uuid::Uuid::from_u128(idx as u128);
+                if raw_id > 0 {
+                    let object_id = (raw_id - 1) as usize;
+                    if object_id < self.gpu_objects.len() {
+                        let entity_id = uuid::Uuid::from_u128(object_id as u128);
                         self.selected_entity = Some(entity_id);
                     }
                 } else {
