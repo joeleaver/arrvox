@@ -53,6 +53,21 @@ fn build_menus(
             }
         }))
         .separator()
+        .item(MenuItem::new("Import Asset...").on_click({
+            let tx = tx.clone();
+            move || {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Import Mesh Asset")
+                    .add_filter("3D Models", &["glb", "gltf", "obj", "fbx"])
+                    .pick_file()
+                {
+                    let _ = tx.send(rkp_engine::EngineCommand::ImportAsset {
+                        source_path: path.to_string_lossy().into_owned(),
+                    });
+                }
+            }
+        }))
+        .separator()
         .item(MenuItem::new("Save").shortcut("Ctrl+S").on_click({
             let tx = tx.clone();
             move || {

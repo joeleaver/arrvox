@@ -13,6 +13,7 @@
 pub mod camera;
 pub mod command;
 pub mod file_watcher;
+pub mod import_worker;
 pub mod gizmo;
 pub mod project;
 pub mod scene_io;

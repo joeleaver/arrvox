@@ -11,6 +11,7 @@ rkp-core = { workspace = true }
 rkp-render = { workspace = true }
 rkf-core = { workspace = true }
 rkf-render = { workspace = true }
+rkf-import = { workspace = true }
 rkf-runtime = { workspace = true }
 glam = { workspace = true }
 wgpu = { workspace = true }

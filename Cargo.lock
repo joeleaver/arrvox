@@ -4851,6 +4851,7 @@ dependencies = [
  "log",
  "notify",
  "rkf-core",
+ "rkf-import",
  "rkf-render",
  "rkf-runtime",
  "rkp-core",

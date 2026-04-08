@@ -156,6 +156,8 @@ struct EngineState {
 
     /// File watcher for hot-reload (watches project assets/ directory).
     file_watcher: Option<crate::file_watcher::RkpFileWatcher>,
+    /// Background import worker for mesh → .rkp conversion.
+    import_worker: crate::import_worker::ImportWorker,
 
     // Geometry dirty flag
     geometry_dirty: bool,
@@ -274,6 +276,7 @@ impl EngineState {
             available_models: Vec::new(),
             models_dirty: false,
             file_watcher: None,
+            import_worker: crate::import_worker::ImportWorker::new(),
             geometry_dirty: false,
             scene_dirty: false,
             frame_index: 0,
@@ -606,6 +609,16 @@ impl EngineState {
                 }
             }
 
+            EngineCommand::ImportAsset { source_path } => {
+                let source = std::path::PathBuf::from(&source_path);
+                let output = crate::import_worker::rkp_output_path(&source);
+                self.import_worker.submit(crate::import_worker::ImportRequest {
+                    source_path: source,
+                    output_path: output,
+                    config: crate::import_worker::default_import_config(),
+                });
+            }
+
             EngineCommand::SelectEntity { entity_id } => {
                 self.selected_entity = Some(entity_id);
             }
@@ -628,6 +641,7 @@ impl EngineState {
                         self.scene_dirty = true;
                         self.scan_models();
                         self.init_file_watcher();
+                        self.auto_import_meshes();
                     }
                     Err(e) => eprintln!("[RkpEngine] new project failed: {e}"),
                 }
@@ -650,6 +664,7 @@ impl EngineState {
                         self.project_dirty = true;
                         self.scan_models();
                         self.init_file_watcher();
+                        self.auto_import_meshes();
                     }
                     Err(e) => eprintln!("[RkpEngine] open project failed: {e}"),
                 }
@@ -706,6 +721,59 @@ impl EngineState {
         true
     }
 
+    /// Scan for importable mesh files and auto-import any that don't have .rkp outputs.
+    fn auto_import_meshes(&mut self) {
+        if let Some(ref project_dir) = self.project_dir {
+            let assets_dir = project_dir.join("assets");
+            if !assets_dir.exists() { return; }
+
+            // Scan recursively for mesh files.
+            let mut meshes = Vec::new();
+            Self::scan_meshes_recursive(&assets_dir, &mut meshes);
+
+            for source in meshes {
+                let output = crate::import_worker::rkp_output_path(&source);
+                // Only import if .rkp doesn't exist or is older than source.
+                let needs_import = if output.exists() {
+                    let src_mod = std::fs::metadata(&source)
+                        .and_then(|m| m.modified()).ok();
+                    let out_mod = std::fs::metadata(&output)
+                        .and_then(|m| m.modified()).ok();
+                    match (src_mod, out_mod) {
+                        (Some(s), Some(o)) => s > o,
+                        _ => true,
+                    }
+                } else {
+                    true
+                };
+
+                if needs_import {
+                    eprintln!("[RkpEngine] auto-importing: {}", source.display());
+                    self.import_worker.submit(crate::import_worker::ImportRequest {
+                        source_path: source,
+                        output_path: output,
+                        config: crate::import_worker::default_import_config(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn scan_meshes_recursive(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                Self::scan_meshes_recursive(&path, out);
+            } else {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if matches!(ext, "glb" | "gltf" | "obj" | "fbx") {
+                    out.push(path);
+                }
+            }
+        }
+    }
+
     fn init_file_watcher(&mut self) {
         if let Some(ref project_dir) = self.project_dir {
             let assets_dir = project_dir.join("assets");
@@ -746,7 +814,36 @@ impl EngineState {
                 }
                 FileEvent::MeshSourceChanged(path) => {
                     eprintln!("[RkpEngine] mesh source changed: {}", path.display());
-                    // TODO: auto-reimport mesh → .rkp
+                    let output = crate::import_worker::rkp_output_path(&path);
+                    self.import_worker.submit(crate::import_worker::ImportRequest {
+                        source_path: path,
+                        output_path: output,
+                        config: crate::import_worker::default_import_config(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn poll_import_completions(&mut self) {
+        let completions = self.import_worker.poll_completions();
+        for completion in completions {
+            match completion.result {
+                Ok(result) => {
+                    eprintln!(
+                        "[RkpEngine] import complete: {} → {} ({} voxels)",
+                        completion.source_path.display(),
+                        completion.output_path.display(),
+                        result.total_bricks,
+                    );
+                    // Rescan models so the new .rkp shows up in the panel.
+                    self.scan_models();
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[RkpEngine] import failed: {} → {e}",
+                        completion.source_path.display(),
+                    );
                 }
             }
         }
@@ -1162,8 +1259,9 @@ fn tick_loop(
             }
         }
 
-        // 1b. Process file watcher events.
+        // 1b. Process file watcher events + import completions.
         state.process_file_events();
+        state.poll_import_completions();
 
         // 2. Update input system + camera.
         let dt = 1.0 / 60.0; // TODO: use actual delta time
