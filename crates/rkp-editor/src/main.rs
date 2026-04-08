@@ -152,6 +152,9 @@ fn main() -> anyhow::Result<()> {
                     store.available_models.send(models.clone());
                 }
                 store.inspector.send(update.inspector.clone());
+                if let Some(ref ac) = update.available_components {
+                    store.available_components.send(ac.clone());
+                }
             })
         },
     );

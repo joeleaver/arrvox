@@ -63,7 +63,7 @@ pub struct FieldSnapshot {
 }
 
 /// Snapshot of a single component on an entity.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ComponentSnapshot {
     pub name: String,
     pub fields: Vec<FieldSnapshot>,

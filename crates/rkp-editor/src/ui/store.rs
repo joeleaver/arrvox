@@ -79,6 +79,8 @@ pub struct EditorStore {
     pub model_drag: Signal<Option<String>>,
     /// Inspector data for the selected entity.
     pub inspector: Signal<Option<InspectorSnapshot>>,
+    /// Components available to add to the selected entity.
+    pub available_components: Signal<Vec<String>>,
 
     // ── Drag state (tab dragging) ────────────────────────────────
 
@@ -156,6 +158,7 @@ impl EditorStore {
             available_models: Signal::new(Vec::new()),
             model_drag: Signal::new(None),
             inspector: Signal::new(None),
+            available_components: Signal::new(Vec::new()),
 
             // Drag state.
             tab_drag: Signal::new(None),

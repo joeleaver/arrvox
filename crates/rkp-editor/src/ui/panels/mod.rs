@@ -7,6 +7,7 @@ pub mod object_properties;
 pub mod materials_panel;
 pub mod console_panel;
 pub mod profiling_panel;
+pub mod field_editors;
 pub mod models_panel;
 pub mod welcome_screen;
 
