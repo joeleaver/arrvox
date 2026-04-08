@@ -12,6 +12,7 @@
 
 pub mod camera;
 pub mod command;
+pub mod components;
 pub mod file_watcher;
 pub mod import_worker;
 pub mod gizmo;

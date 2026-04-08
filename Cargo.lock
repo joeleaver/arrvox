@@ -4849,6 +4849,7 @@ dependencies = [
  "bytemuck",
  "crossbeam",
  "glam 0.29.3",
+ "hecs",
  "log",
  "notify",
  "rkf-core",

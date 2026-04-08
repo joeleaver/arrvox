@@ -17,6 +17,7 @@ glam = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }
 uuid = { version = "1", features = ["v4", "serde"] }
+hecs = { workspace = true }
 crossbeam = "0.8"
 notify = "7"
 serde = { workspace = true }

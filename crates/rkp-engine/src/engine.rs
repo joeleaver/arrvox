@@ -16,7 +16,34 @@ use rkp_render::rkp_scene_manager::RkpSceneManager;
 
 use crate::camera::CameraControlState;
 use crate::command::EngineCommand;
+use crate::components::SpatialData;
 use crate::snapshot::StateUpdate;
+
+/// Convert a SpatialHandle from rkp_render into our SpatialData component.
+fn spatial_from_handle(
+    handle: &rkf_core::scene_node::SpatialHandle,
+    voxel_size: f32,
+    aabb: &rkf_core::Aabb,
+) -> SpatialData {
+    if let rkf_core::scene_node::SpatialHandle::Octree {
+        root_offset, len, depth, base_voxel_size,
+    } = handle
+    {
+        SpatialData {
+            root_offset: *root_offset,
+            len: *len,
+            depth: *depth,
+            base_voxel_size: *base_voxel_size,
+            aabb: *aabb,
+            voxel_size,
+        }
+    } else {
+        SpatialData {
+            root_offset: 0, len: 0, depth: 0, base_voxel_size: voxel_size,
+            aabb: *aabb, voxel_size,
+        }
+    }
+}
 
 /// Frame delivery callback — called each tick with RGBA8 pixels.
 pub type FrameCallback = Box<dyn Fn(&[u8], u32, u32) + Send>;
@@ -136,12 +163,22 @@ struct EngineState {
     camera_control: CameraControlState,
     camera: CameraState,
 
-    // GPU objects (built from scene each frame)
-    gpu_objects: Vec<RkpGpuObject>,
-    /// Object names for UI display (parallel to gpu_objects).
-    object_names: Vec<String>,
+    // ECS — the source of truth for scene state.
+    world: hecs::World,
+    /// Stable UUID ↔ hecs Entity mapping.
+    entity_uuids: std::collections::HashMap<hecs::Entity, uuid::Uuid>,
+    uuid_to_entity: std::collections::HashMap<uuid::Uuid, hecs::Entity>,
+    /// UUID counter for generating stable IDs.
+    next_entity_uuid: u64,
     /// Currently selected entity.
-    selected_entity: Option<uuid::Uuid>,
+    selected_entity: Option<hecs::Entity>,
+
+    // Derived GPU data — rebuilt from world each frame.
+    gpu_objects: Vec<RkpGpuObject>,
+    /// Maps gpu_object index → hecs Entity (for pick resolution).
+    gpu_to_entity: Vec<hecs::Entity>,
+    /// Maps hecs Entity → gpu_object index.
+    entity_to_gpu: std::collections::HashMap<hecs::Entity, usize>,
 
     // Project state
     project_loaded: bool,
@@ -264,9 +301,14 @@ impl EngineState {
             input_system,
             camera_control,
             camera: CameraState::default(),
-            gpu_objects: Vec::new(),
-            object_names: Vec::new(),
+            world: hecs::World::new(),
+            entity_uuids: std::collections::HashMap::new(),
+            uuid_to_entity: std::collections::HashMap::new(),
+            next_entity_uuid: 1,
             selected_entity: None,
+            gpu_objects: Vec::new(),
+            gpu_to_entity: Vec::new(),
+            entity_to_gpu: std::collections::HashMap::new(),
             project_loaded: false,
             project_name: String::new(),
             project_dir: None,
@@ -304,6 +346,9 @@ impl EngineState {
     }
 
     fn render_frame(&mut self) -> (Vec<u8>, u32, u32) {
+        // 0. Rebuild GPU objects from ECS world.
+        self.update_scene_gpu();
+
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("rkp frame"),
         });
@@ -549,52 +594,56 @@ impl EngineState {
             }
 
             EngineCommand::SpawnPrimitive { name } => {
+                use crate::components::*;
                 let primitive = rkf_core::scene_node::SdfPrimitive::Box {
                     half_extents: glam::Vec3::splat(0.5),
                 };
-                let obj_id = self.gpu_objects.len() as u32;
+                // Use a temporary gpu index (0) — update_scene_gpu will assign real ones.
                 let result = self.scene_mgr.voxelize_primitive(
-                    &primitive, 0, 0.05, glam::Vec3::ONE, obj_id,
+                    &primitive, 0, 0.05, glam::Vec3::ONE, 0,
                 );
                 if let Some(result) = result {
-                    let gpu_obj = crate::scene_sync::build_gpu_object(
-                        &glam::Mat4::IDENTITY,
-                        &result.aabb,
-                        &result.spatial,
-                        result.voxel_size,
-                        0,
-                        obj_id,
-                    );
-                    self.gpu_objects.push(gpu_obj);
-                    self.object_names.push(name.clone());
+                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
+                    let entity = self.world.spawn((
+                        Transform::default(),
+                        EditorMetadata { name: name.clone() },
+                        Renderable {
+                            primitive: Some("box".to_string()),
+                            voxel_count: result.voxel_count,
+                            spatial: Some(spatial),
+                            ..Default::default()
+                        },
+                    ));
+                    self.assign_entity_uuid(entity);
                     self.geometry_dirty = true;
                     self.scene_dirty = true;
-                    eprintln!("[RkpEngine] spawned primitive '{name}': {} voxels", result.voxel_count);
+                    eprintln!("[RkpEngine] spawned primitive '{name}': {} voxels, entity {:?}", result.voxel_count, entity);
                 }
             }
 
             EngineCommand::LoadAsset { path, .. } => {
-                let object_id = self.gpu_objects.len() as u32;
-                match self.scene_mgr.load_rkp(&path, object_id) {
+                use crate::components::*;
+                match self.scene_mgr.load_rkp(&path, 0) {
                     Ok(result) => {
-                        let gpu_obj = crate::scene_sync::build_gpu_object(
-                            &glam::Mat4::IDENTITY,
-                            &result.aabb,
-                            &result.spatial,
-                            result.voxel_size,
-                            0,
-                            object_id,
-                        );
-                        // Use filename as display name.
                         let name = std::path::Path::new(&path)
                             .file_stem()
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_else(|| path.clone());
-                        self.gpu_objects.push(gpu_obj);
-                        self.object_names.push(name);
+                        let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
+                        let entity = self.world.spawn((
+                            Transform::default(),
+                            EditorMetadata { name: name.clone() },
+                            Renderable {
+                                asset_path: Some(path.clone()),
+                                voxel_count: result.voxel_count,
+                                spatial: Some(spatial),
+                                ..Default::default()
+                            },
+                        ));
+                        self.assign_entity_uuid(entity);
                         self.geometry_dirty = true;
                         self.scene_dirty = true;
-                        eprintln!("[RkpEngine] loaded asset '{path}': {} voxels", result.voxel_count);
+                        eprintln!("[RkpEngine] loaded asset '{name}': {} voxels, entity {:?}", result.voxel_count, entity);
                     }
                     Err(e) => {
                         eprintln!("[RkpEngine] failed to load '{path}': {e}");
@@ -620,24 +669,31 @@ impl EngineState {
             }
 
             EngineCommand::SetObjectPosition { entity_id, position } => {
-                let idx = entity_id.as_u128() as usize;
-                if idx < self.gpu_objects.len() {
-                    self.gpu_objects[idx].world[3][0] = position.x;
-                    self.gpu_objects[idx].world[3][1] = position.y;
-                    self.gpu_objects[idx].world[3][2] = position.z;
+                if let Some(entity) = self.resolve_entity(&entity_id) {
+                    if let Ok(mut t) = self.world.get::<&mut crate::components::Transform>(entity) {
+                        t.position = position;
+                    }
                 }
             }
 
             EngineCommand::SetObjectRotation { entity_id, rotation } => {
-                let _ = (entity_id, rotation); // TODO: apply rotation to world matrix
+                if let Some(entity) = self.resolve_entity(&entity_id) {
+                    if let Ok(mut t) = self.world.get::<&mut crate::components::Transform>(entity) {
+                        t.rotation = rotation;
+                    }
+                }
             }
 
             EngineCommand::SetObjectScale { entity_id, scale } => {
-                let _ = (entity_id, scale); // TODO: apply scale to world matrix
+                if let Some(entity) = self.resolve_entity(&entity_id) {
+                    if let Ok(mut t) = self.world.get::<&mut crate::components::Transform>(entity) {
+                        t.scale = scale;
+                    }
+                }
             }
 
             EngineCommand::SelectEntity { entity_id } => {
-                self.selected_entity = Some(entity_id);
+                self.selected_entity = self.resolve_entity(&entity_id);
             }
 
             EngineCommand::NewProject { path } => {
@@ -844,18 +900,19 @@ impl EngineState {
 
     fn build_inspector_snapshot(&self) -> Option<crate::inspector::InspectorSnapshot> {
         let selected = self.selected_entity?;
-        let idx = selected.as_u128() as usize;
-        if idx >= self.gpu_objects.len() {
+        if !self.world.contains(selected) {
             return None;
         }
 
-        let obj = &self.gpu_objects[idx];
-        let name = self.object_names.get(idx).cloned().unwrap_or_default();
-        let pos = [obj.world[3][0], obj.world[3][1], obj.world[3][2]];
+        let name = self.world.get::<&crate::components::EditorMetadata>(selected)
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
+        let transform = self.world.get::<&crate::components::Transform>(selected).ok()?;
+        let pos = transform.position.to_array();
 
         use crate::inspector::*;
 
-        let transform = ComponentSnapshot {
+        let transform_snapshot = ComponentSnapshot {
             name: "Transform".to_string(),
             fields: vec![
                 FieldSnapshot {
@@ -867,13 +924,13 @@ impl EngineState {
                 FieldSnapshot {
                     name: "Rotation".to_string(),
                     field_type: FieldType::Vec3,
-                    value: FieldValue::Vec3([0.0; 3]),
+                    value: FieldValue::Vec3(transform.rotation.to_array()),
                     range: Some((-180.0, 180.0)),
                 },
                 FieldSnapshot {
                     name: "Scale".to_string(),
                     field_type: FieldType::Vec3,
-                    value: FieldValue::Vec3([1.0; 3]),
+                    value: FieldValue::Vec3(transform.scale.to_array()),
                     range: Some((0.01, 100.0)),
                 },
             ],
@@ -882,11 +939,11 @@ impl EngineState {
 
         Some(InspectorSnapshot {
             entity_name: name,
-            entity_id: format!("{}", selected.as_simple()),
+            entity_id: format!("{}", self.get_entity_uuid(selected).as_simple()),
             position: pos,
-            rotation: [0.0; 3],
-            scale: [1.0; 3],
-            components: vec![transform],
+            rotation: transform.rotation.to_array(),
+            scale: transform.scale.to_array(),
+            components: vec![transform_snapshot],
         })
     }
 
@@ -920,6 +977,68 @@ impl EngineState {
         eprintln!("[RkpEngine] hot-reload asset: {path}");
         // TODO: remove old GPU objects for this asset, re-load from file,
         // rebuild faces, re-upload geometry.
+    }
+
+    /// Resolve a Uuid (from UI) to an hecs::Entity.
+    fn resolve_entity(&self, uuid: &uuid::Uuid) -> Option<hecs::Entity> {
+        self.uuid_to_entity.get(uuid).copied()
+    }
+
+    /// Get the stable UUID for an hecs Entity.
+    fn get_entity_uuid(&self, entity: hecs::Entity) -> uuid::Uuid {
+        self.entity_uuids.get(&entity).copied()
+            .unwrap_or_else(uuid::Uuid::nil)
+    }
+
+    /// Assign a stable UUID to an entity.
+    fn assign_entity_uuid(&mut self, entity: hecs::Entity) -> uuid::Uuid {
+        let uuid = uuid::Uuid::from_u128(self.next_entity_uuid as u128);
+        self.next_entity_uuid += 1;
+        self.entity_uuids.insert(entity, uuid);
+        self.uuid_to_entity.insert(uuid, entity);
+        uuid
+    }
+
+    /// Rebuild GPU objects from the hecs world.
+    fn update_scene_gpu(&mut self) {
+        use crate::components::*;
+
+        self.gpu_objects.clear();
+        self.gpu_to_entity.clear();
+        self.entity_to_gpu.clear();
+
+        for (entity, (transform, renderable)) in self.world.query::<(&Transform, &Renderable)>().iter() {
+            if let Some(ref spatial) = renderable.spatial {
+                let world_matrix = glam::Mat4::from_scale_rotation_translation(
+                    transform.scale,
+                    glam::Quat::from_euler(
+                        glam::EulerRot::XYZ,
+                        transform.rotation.x.to_radians(),
+                        transform.rotation.y.to_radians(),
+                        transform.rotation.z.to_radians(),
+                    ),
+                    transform.position,
+                );
+                let gpu_idx = self.gpu_objects.len() as u32;
+                let spatial_handle = rkf_core::scene_node::SpatialHandle::Octree {
+                    root_offset: spatial.root_offset,
+                    len: spatial.len,
+                    depth: spatial.depth,
+                    base_voxel_size: spatial.base_voxel_size,
+                };
+                let gpu_obj = crate::scene_sync::build_gpu_object(
+                    &world_matrix,
+                    &spatial.aabb,
+                    &spatial_handle,
+                    spatial.voxel_size,
+                    renderable.material_id,
+                    gpu_idx,
+                );
+                self.entity_to_gpu.insert(entity, self.gpu_objects.len());
+                self.gpu_to_entity.push(entity);
+                self.gpu_objects.push(gpu_obj);
+            }
+        }
     }
 
     fn scan_models(&mut self) {
@@ -956,8 +1075,12 @@ impl EngineState {
     }
 
     fn clear_scene(&mut self) {
+        self.world.clear();
+        self.entity_uuids.clear();
+        self.uuid_to_entity.clear();
+        self.next_entity_uuid = 1;
         self.gpu_objects.clear();
-        self.object_names.clear();
+        self.gpu_to_entity.clear();
         self.scene_mgr = RkpSceneManager::new(1_000_000);
         self.selected_entity = None;
         self.geometry_dirty = true;
@@ -973,27 +1096,33 @@ impl EngineState {
                 self.camera.pitch = scene.camera.pitch;
                 self.camera.fov = scene.camera.fov;
 
-                // Load objects.
+                // Load objects as hecs entities.
+                use crate::components::*;
                 for obj in &scene.objects {
+                    let transform = Transform {
+                        position: glam::Vec3::from_array(obj.position),
+                        rotation: glam::Vec3::from_array(obj.rotation),
+                        scale: glam::Vec3::from_array(obj.scale),
+                    };
+                    let meta = EditorMetadata { name: obj.name.clone() };
+
                     if let Some(ref asset_path) = obj.asset_path {
-                        // Resolve relative to project assets dir.
                         let full_path = self.project_dir.as_ref()
                             .map(|d| d.join("assets").join(asset_path))
                             .unwrap_or_else(|| std::path::PathBuf::from(asset_path));
-                        let object_id = self.gpu_objects.len() as u32;
-                        if let Ok(result) = self.scene_mgr.load_rkp(&full_path.to_string_lossy(), object_id) {
-                            let pos = glam::Vec3::from_array(obj.position);
-                            let transform = glam::Mat4::from_translation(pos);
-                            let gpu_obj = crate::scene_sync::build_gpu_object(
-                                &transform, &result.aabb, &result.spatial,
-                                result.voxel_size, obj.material_id, object_id,
-                            );
-                            self.gpu_objects.push(gpu_obj);
-                            self.object_names.push(obj.name.clone());
+                        if let Ok(result) = self.scene_mgr.load_rkp(&full_path.to_string_lossy(), 0) {
+                            let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
+                            let e = self.world.spawn((transform, meta, Renderable {
+                                asset_path: Some(asset_path.clone()),
+                                material_id: obj.material_id,
+                                voxel_count: result.voxel_count,
+                                spatial: Some(spatial),
+                                ..Default::default()
+                            }));
+                            self.assign_entity_uuid(e);
                             self.geometry_dirty = true;
                         }
                     } else if let Some(ref prim_name) = obj.primitive {
-                        // Spawn primitive.
                         let primitive = match prim_name.as_str() {
                             "box" => rkf_core::scene_node::SdfPrimitive::Box {
                                 half_extents: glam::Vec3::from_array(obj.scale) * 0.5,
@@ -1003,18 +1132,18 @@ impl EngineState {
                             },
                             _ => continue,
                         };
-                        let object_id = self.gpu_objects.len() as u32;
                         if let Some(result) = self.scene_mgr.voxelize_primitive(
-                            &primitive, obj.material_id, 0.05, glam::Vec3::ONE, object_id,
+                            &primitive, obj.material_id, 0.05, glam::Vec3::ONE, 0,
                         ) {
-                            let pos = glam::Vec3::from_array(obj.position);
-                            let transform = glam::Mat4::from_translation(pos);
-                            let gpu_obj = crate::scene_sync::build_gpu_object(
-                                &transform, &result.aabb, &result.spatial,
-                                result.voxel_size, obj.material_id, object_id,
-                            );
-                            self.gpu_objects.push(gpu_obj);
-                            self.object_names.push(obj.name.clone());
+                            let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
+                            let e = self.world.spawn((transform, meta, Renderable {
+                                primitive: Some(prim_name.clone()),
+                                material_id: obj.material_id,
+                                voxel_count: result.voxel_count,
+                                spatial: Some(spatial),
+                                ..Default::default()
+                            }));
+                            self.assign_entity_uuid(e);
                             self.geometry_dirty = true;
                         }
                     }
@@ -1026,25 +1155,22 @@ impl EngineState {
     }
 
     fn build_scene_file(&self) -> crate::scene_io::SceneFile {
-        let objects = self.object_names.iter().enumerate().map(|(i, name)| {
-            let pos = if i < self.gpu_objects.len() {
-                let o = &self.gpu_objects[i];
-                [o.world[3][0], o.world[3][1], o.world[3][2]]
-            } else {
-                [0.0; 3]
-            };
-            crate::scene_io::SceneObject {
-                id: uuid::Uuid::from_u128(i as u128),
-                name: name.clone(),
-                position: pos,
-                rotation: [0.0; 3],
-                scale: [1.0; 3],
+        use crate::components::*;
+        let mut objects = Vec::new();
+        for (entity, (transform, meta)) in self.world.query::<(&Transform, &EditorMetadata)>().iter() {
+            let renderable = self.world.get::<&Renderable>(entity).ok();
+            objects.push(crate::scene_io::SceneObject {
+                id: self.get_entity_uuid(entity),
+                name: meta.name.clone(),
+                position: transform.position.to_array(),
+                rotation: transform.rotation.to_array(),
+                scale: transform.scale.to_array(),
                 parent_id: None,
-                asset_path: None,
-                primitive: Some("box".to_string()),
-                material_id: 0,
-            }
-        }).collect();
+                asset_path: renderable.as_ref().and_then(|r| r.asset_path.clone()),
+                primitive: renderable.as_ref().and_then(|r| r.primitive.clone()),
+                material_id: renderable.map(|r| r.material_id).unwrap_or(0),
+            });
+        }
 
         crate::scene_io::SceneFile {
             objects,
@@ -1059,7 +1185,7 @@ impl EngineState {
     }
 
     fn update_gizmo(&mut self) {
-        let Some(selected_id) = self.selected_entity else {
+        let Some(selected) = self.selected_entity else {
             self.gizmo.hovered_axis = crate::gizmo::GizmoAxis::None;
             if self.gizmo.dragging {
                 self.gizmo.end_drag();
@@ -1067,13 +1193,10 @@ impl EngineState {
             return;
         };
 
-        let idx = selected_id.as_u128() as usize;
-        if idx >= self.gpu_objects.len() {
-            return;
-        }
-
-        let obj = &self.gpu_objects[idx];
-        let center = glam::Vec3::new(obj.world[3][0], obj.world[3][1], obj.world[3][2]);
+        let center = match self.world.get::<&crate::components::Transform>(selected) {
+            Ok(t) => t.position,
+            Err(_) => return,
+        };
         let cam_dist = (center - self.camera.position).length().max(0.1);
         let gizmo_size = cam_dist * 0.15;
 
@@ -1087,11 +1210,8 @@ impl EngineState {
                 crate::gizmo::GizmoMode::Translate => {
                     let delta = crate::gizmo::compute_translate_delta(&self.gizmo, ray_o, ray_d);
                     let new_pos = self.gizmo.initial_position + delta;
-                    // Apply to GPU object directly.
-                    if idx < self.gpu_objects.len() {
-                        self.gpu_objects[idx].world[3][0] = new_pos.x;
-                        self.gpu_objects[idx].world[3][1] = new_pos.y;
-                        self.gpu_objects[idx].world[3][2] = new_pos.z;
+                    if let Ok(mut t) = self.world.get::<&mut crate::components::Transform>(selected) {
+                        t.position = new_pos;
                     }
                 }
                 crate::gizmo::GizmoMode::Rotate => {
@@ -1140,19 +1260,14 @@ impl EngineState {
     }
 
     fn build_gizmo_wireframe(&self) -> Vec<rkf_render::LineVertex> {
-        // Only show gizmo when an object is selected.
-        let Some(selected_id) = self.selected_entity else {
+        let Some(selected) = self.selected_entity else {
             return Vec::new();
         };
 
-        // Find the selected object's position (simple: use GPU object position).
-        let idx = selected_id.as_u128() as usize;
-        if idx >= self.gpu_objects.len() {
-            return Vec::new();
-        }
-
-        let obj = &self.gpu_objects[idx];
-        let center = glam::Vec3::new(obj.world[3][0], obj.world[3][1], obj.world[3][2]);
+        let center = match self.world.get::<&crate::components::Transform>(selected) {
+            Ok(t) => t.position,
+            Err(_) => return Vec::new(),
+        };
 
         // Scale gizmo size proportional to camera distance for consistent screen size.
         let cam_dist = (center - self.camera.position).length().max(0.1);
@@ -1209,10 +1324,9 @@ impl EngineState {
                 let raw_id = (g_channel >> 8) & 0xFF;
 
                 if raw_id > 0 {
-                    let object_id = (raw_id - 1) as usize;
-                    if object_id < self.gpu_objects.len() {
-                        let entity_id = uuid::Uuid::from_u128(object_id as u128);
-                        self.selected_entity = Some(entity_id);
+                    let gpu_idx = (raw_id - 1) as usize;
+                    if gpu_idx < self.gpu_to_entity.len() {
+                        self.selected_entity = Some(self.gpu_to_entity[gpu_idx]);
                     }
                 } else {
                     self.selected_entity = None;
@@ -1232,19 +1346,19 @@ impl EngineState {
 
         let objects = if self.scene_dirty {
             self.scene_dirty = false;
-            Some(
-                self.object_names
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| crate::snapshot::SceneObjectInfo {
-                        id: uuid::Uuid::from_u128(i as u128),
-                        name: name.clone(),
-                        parent_id: None,
-                        is_camera: false,
-                        is_light: false,
-                    })
-                    .collect(),
-            )
+            let mut objs = Vec::new();
+            for (entity, meta) in self.world.query::<&crate::components::EditorMetadata>().iter() {
+                let is_light = self.world.get::<&crate::components::PointLight>(entity).is_ok();
+                let is_camera = self.world.get::<&crate::components::Camera>(entity).is_ok();
+                objs.push(crate::snapshot::SceneObjectInfo {
+                    id: self.get_entity_uuid(entity),
+                    name: meta.name.clone(),
+                    parent_id: None,
+                    is_camera,
+                    is_light,
+                });
+            }
+            Some(objs)
         } else {
             None
         };
@@ -1274,7 +1388,7 @@ impl EngineState {
             gpu_object_count: self.gpu_objects.len() as u32,
             camera_position: self.camera.position,
             play_mode: false,
-            selected_entity: self.selected_entity,
+            selected_entity: self.selected_entity.map(|e| self.get_entity_uuid(e)),
             objects,
             project_loaded: project,
             project_name,
