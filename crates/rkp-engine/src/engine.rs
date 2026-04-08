@@ -1033,8 +1033,7 @@ impl EngineState {
 
     /// Assign a stable UUID to an entity.
     fn assign_entity_uuid(&mut self, entity: hecs::Entity) -> uuid::Uuid {
-        let uuid = uuid::Uuid::from_u128(self.next_entity_uuid as u128);
-        self.next_entity_uuid += 1;
+        let uuid = uuid::Uuid::new_v4();
         self.entity_uuids.insert(entity, uuid);
         self.uuid_to_entity.insert(uuid, entity);
         uuid
@@ -1391,10 +1390,13 @@ impl EngineState {
             for (entity, meta) in self.world.query::<&crate::components::EditorMetadata>().iter() {
                 let is_light = self.world.get::<&crate::components::PointLight>(entity).is_ok();
                 let is_camera = self.world.get::<&crate::components::Camera>(entity).is_ok();
+                let parent_id = self.world.get::<&crate::components::Parent>(entity)
+                    .ok()
+                    .map(|p| p.parent_id);
                 objs.push(crate::snapshot::SceneObjectInfo {
                     id: self.get_entity_uuid(entity),
                     name: meta.name.clone(),
-                    parent_id: None,
+                    parent_id,
                     is_camera,
                     is_light,
                 });

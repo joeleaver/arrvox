@@ -76,6 +76,13 @@ impl Default for PointLight {
     }
 }
 
+/// Parent-child relationship — references a parent entity by UUID.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Parent {
+    /// UUID of the parent entity (matches the UUID in entity_uuids map).
+    pub parent_id: uuid::Uuid,
+}
+
 /// Camera entity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Camera {
