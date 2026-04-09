@@ -4,30 +4,25 @@
 //! 1. Build RkpGpuObjects from ECS/scene state
 //! 2. Call `upload_frame(objects, camera)` — cheap, every frame
 //! 3. Call `upload_geometry(...)` — only when geometry changes
-//! 4. Call `render(encoder, gbuffer)` — raster + shadow/AO + shade
-//!
-//! No MarchPass trait. No callbacks. No incremental caching.
+//! 4. Call `render(encoder, width, height, ...)` — march + shadow/AO + shade
 
 use crate::rkp_scene::{RkpScene, GeometryUpload, FrameUpload, CameraUniforms};
 use crate::rkp_shadow_ao::{RkpShadowAoPass, ShadowAoParams};
 use crate::rkp_shade::{RkpShadePass, ShadeParams, GpuLight, GpuMaterial};
 use crate::rkp_gpu_object::RkpGpuObject;
-use crate::splat_raster::SplatRasterPipeline;
-use crate::splat_emit::SplatEmitPass;
+use crate::octree_march::OctreeMarchPass;
 
 /// The complete RKIPatch renderer.
 pub struct RkpRenderer {
     /// Scene GPU buffers.
     pub scene: RkpScene,
-    /// Face emit pass (CPU-driven, writes face instance buffer).
-    pub emit: SplatEmitPass,
-    /// Rasterization pipeline (vertex/fragment, writes G-buffer).
-    pub raster: SplatRasterPipeline,
+    /// Octree ray march compute pass — primary visibility.
+    pub march: OctreeMarchPass,
     /// Half-res shadow + AO compute pass.
     pub shadow_ao: RkpShadowAoPass,
     /// Deferred PBR shading compute pass.
     pub shade: RkpShadePass,
-    /// Default light/material buffers (created at init, updated later).
+    /// Default light/material buffers.
     shade_params_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
     materials_buffer: wgpu::Buffer,
@@ -38,12 +33,10 @@ pub struct RkpRenderer {
 impl RkpRenderer {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let scene = RkpScene::new(device);
-        let emit = SplatEmitPass::new(device, &scene.bind_group_layout);
-        let raster = SplatRasterPipeline::new(device, &scene.bind_group_layout, &emit);
+        let march = OctreeMarchPass::new(device, &scene.bind_group_layout);
         let shadow_ao = RkpShadowAoPass::new(device, &scene, width, height);
         let mut shade = RkpShadePass::new(device, width, height);
 
-        // Create default light + material buffers.
         let default_params = ShadeParams { num_lights: 1, ..ShadeParams::default() };
         let default_light = GpuLight {
             position: [0.0, 0.0, 0.0, 0.0],
@@ -73,18 +66,16 @@ impl RkpRenderer {
         shade.set_camera(device, &scene.camera_buffer);
 
         Self {
-            scene, emit, raster, shadow_ao, shade,
+            scene, march, shadow_ao, shade,
             shade_params_buffer, lights_buffer, materials_buffer,
             device: device.clone(),
         }
     }
 
-    /// Upload geometry data. Call only when geometry changes.
     pub fn upload_geometry(&mut self, queue: &wgpu::Queue, data: &GeometryUpload) {
         self.scene.upload_geometry(&self.device, queue, data);
     }
 
-    /// Upload per-frame data. Call every frame.
     pub fn upload_frame(&mut self, queue: &wgpu::Queue, data: &FrameUpload) {
         self.scene.upload_frame(&self.device, queue, data);
     }
@@ -96,87 +87,28 @@ impl RkpRenderer {
         normal_view: &wgpu::TextureView,
         material_view: &wgpu::TextureView,
     ) {
+        self.march.set_gbuffer(&self.device, position_view, normal_view, material_view);
         self.shadow_ao.set_gbuffer(&self.device, position_view, normal_view);
         self.shade.set_gbuffer(&self.device, position_view, normal_view, material_view);
         self.shade.set_shadow_ao(&self.device, &self.shadow_ao.output_view);
     }
 
-    /// Point the shade pass at an external HDR output texture (e.g., engine's shading HDR).
     pub fn set_hdr_output(&mut self, view: &wgpu::TextureView) {
         self.shade.set_output_view(&self.device, view);
     }
 
-    /// Upload face instances and indirect draw args.
-    pub fn upload_faces(&self, encoder: &mut wgpu::CommandEncoder, faces: &[crate::splat_emit::FaceInstance]) {
-        if faces.is_empty() {
-            return;
-        }
-        let face_bytes: &[u8] = bytemuck::cast_slice(faces);
-
-        // Grow face buffer if needed.
-        {
-            let buf = self.emit.face_buffer.borrow();
-            if face_bytes.len() as u64 > buf.size() {
-                let new_size = (face_bytes.len() as u64).max(buf.size() * 2);
-                drop(buf);
-                let new_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("emit face instances"),
-                    size: new_size,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                *self.raster.face_bind_group.borrow_mut() = self.device.create_bind_group(
-                    &wgpu::BindGroupDescriptor {
-                        label: Some("raster face bind group"),
-                        layout: &self.raster.face_bind_group_layout,
-                        entries: &[wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: new_buf.as_entire_binding(),
-                        }],
-                    },
-                );
-                *self.emit.face_buffer.borrow_mut() = new_buf;
-            }
-        }
-
-        // Upload via staging.
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("face staging"),
-            size: face_bytes.len() as u64,
-            usage: wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: true,
-        });
-        staging.slice(..).get_mapped_range_mut().copy_from_slice(face_bytes);
-        staging.unmap();
-        encoder.copy_buffer_to_buffer(&staging, 0, &self.emit.face_buffer.borrow(), 0, face_bytes.len() as u64);
-
-        // Set indirect draw args.
-        let draw_args: [u32; 4] = [6, faces.len() as u32, 0, 0];
-        let args_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("indirect args staging"),
-            size: 16,
-            usage: wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: true,
-        });
-        args_staging.slice(..).get_mapped_range_mut().copy_from_slice(bytemuck::cast_slice(&draw_args));
-        args_staging.unmap();
-        encoder.copy_buffer_to_buffer(&args_staging, 0, &self.emit.indirect_buffer, 0, 16);
-    }
-
-    /// Render: raster G-buffer + shadow/AO + shade.
-    /// Faces must have been uploaded via upload_faces() before this call.
+    /// Render: march → shadow/AO → shade.
     pub fn render(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        gbuffer: &rkf_render::GBuffer,
         queue: &wgpu::Queue,
+        object_count: u32,
+        width: u32,
+        height: u32,
         shadow_ao_params: &ShadowAoParams,
     ) {
-        // 1. Raster: face quads → G-buffer.
-        {
-            let mut render_pass = SplatRasterPipeline::begin_render_pass(encoder, gbuffer);
-            self.raster.draw(&mut render_pass, &self.scene.bind_group, &self.emit.indirect_buffer);
-        }
+        // 1. Octree ray march → G-buffer.
+        self.march.dispatch(encoder, queue, &self.scene.bind_group, object_count, width, height);
 
         // 2. Shadow + AO at half resolution.
         self.shadow_ao.update_params(queue, shadow_ao_params);
@@ -186,7 +118,28 @@ impl RkpRenderer {
         self.shade.dispatch(encoder);
     }
 
-    /// Resize resolution-dependent resources.
+    pub fn update_materials(&mut self, queue: &wgpu::Queue, materials: &[GpuMaterial]) {
+        let data: &[u8] = bytemuck::cast_slice(materials);
+        let needed = data.len() as u64;
+
+        if needed > self.materials_buffer.size() {
+            self.materials_buffer = Self::create_init_buffer(
+                &self.device,
+                "rkp_shade_materials",
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                data,
+            );
+            self.shade.set_shade_data(
+                &self.device,
+                &self.shade_params_buffer,
+                &self.lights_buffer,
+                &self.materials_buffer,
+            );
+        } else {
+            queue.write_buffer(&self.materials_buffer, 0, data);
+        }
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         self.shadow_ao.resize(&self.device, width, height);
         self.shade.resize(&self.device, width, height);

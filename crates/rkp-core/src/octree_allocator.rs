@@ -273,6 +273,97 @@ mod tests {
         }
     }
 
+    /// GPU-style position lookup on the packed (rebased) allocator buffer.
+    fn gpu_lookup_packed(buf: &[u32], root: u32, depth: u8, extent: f32, vs: f32, pos: glam::Vec3) -> u32 {
+        use crate::sparse_octree::{EMPTY_NODE, INTERIOR_NODE, is_leaf, leaf_slot};
+        let mut offset = root as usize;
+        let mut half = extent * 0.5;
+        let mut center = glam::Vec3::splat(half);
+
+        for _ in 0..depth {
+            let node = buf[offset];
+            if node == EMPTY_NODE { return EMPTY_NODE; }
+            if node == INTERIOR_NODE { return INTERIOR_NODE; }
+            if is_leaf(node) { return leaf_slot(node); }
+
+            let gx = if pos.x >= center.x { 1u32 } else { 0 };
+            let gy = if pos.y >= center.y { 1u32 } else { 0 };
+            let gz = if pos.z >= center.z { 1u32 } else { 0 };
+            let child = (gx + gy * 2 + gz * 4) as usize;
+            offset = node as usize + child; // absolute offset (rebased)
+
+            half *= 0.5;
+            center.x += if pos.x >= center.x { half } else { -half };
+            center.y += if pos.y >= center.y { half } else { -half };
+            center.z += if pos.z >= center.z { half } else { -half };
+        }
+
+        let node = buf[offset];
+        if is_leaf(node) { return leaf_slot(node); }
+        if node == INTERIOR_NODE { return INTERIOR_NODE; }
+        EMPTY_NODE
+    }
+
+    #[test]
+    fn gpu_lookup_on_packed_rkp() {
+        // Load bunny .rkp, allocate into packed buffer (with a dummy before it to
+        // force non-zero offset), verify GPU-style position lookups match.
+        let path = "/home/joe/dev/rkifield_game/splat5/assets/models/bunny_pbr/scene.rkp";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("Skipping packed .rkp test — file not found");
+            return;
+        }
+
+        use crate::sparse_octree::SparseOctree;
+
+        let mut file = std::fs::File::open(path).unwrap();
+        let mut reader = std::io::BufReader::new(&mut file);
+        let header = crate::asset_file::read_rkp_header(&mut reader).unwrap();
+        let octree_nodes = crate::asset_file::read_rkp_octree(&mut reader, &header).unwrap();
+        let depth = header.octree_depth as u8;
+        let vs = header.base_voxel_size;
+
+        // Allocate a dummy first to push the bunny to a non-zero offset.
+        let mut alloc = OctreeAllocator::new();
+        let dummy = SparseOctree::new(1, 0.1);
+        let _h_dummy = alloc.allocate(&dummy);
+
+        let tree = SparseOctree::from_raw(&octree_nodes, depth, vs);
+        let handle = alloc.allocate(&tree);
+
+        let extent = tree.extent() as f32 * vs;
+        let buf = alloc.as_slice();
+        let mut mismatches = 0u32;
+        let mut total = 0u32;
+
+        for (coord, slot, leaf_depth) in tree.iter_leaves() {
+            total += 1;
+            let depth_diff = tree.depth() - leaf_depth;
+            let leaf_vs = vs * (1u32 << depth_diff) as f32;
+            let pos = glam::Vec3::new(
+                coord.x as f32 * vs + leaf_vs * 0.5,
+                coord.y as f32 * vs + leaf_vs * 0.5,
+                coord.z as f32 * vs + leaf_vs * 0.5,
+            );
+
+            let gpu_slot = gpu_lookup_packed(buf, handle.root_offset, depth, extent, vs, pos);
+            // Note: slot is the ORIGINAL (0-based) pool slot from the tree.
+            // The packed buffer has the same leaf slot values (they're not rebased).
+            if gpu_slot != slot {
+                if mismatches < 10 {
+                    eprintln!(
+                        "PACKED MISMATCH coord={:?} pos={:.4?}: expected slot={} got gpu_slot={} (root_offset={})",
+                        coord, pos, slot, gpu_slot, handle.root_offset
+                    );
+                }
+                mismatches += 1;
+            }
+        }
+
+        eprintln!("Packed GPU lookup: {total} leaves, {mismatches} mismatches (root_offset={}, extent={extent})", handle.root_offset);
+        assert_eq!(mismatches, 0, "{mismatches}/{total} leaves unreachable in packed buffer");
+    }
+
     #[test]
     fn empty_allocator() {
         let alloc = OctreeAllocator::new();

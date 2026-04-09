@@ -13,7 +13,18 @@ use rkp_core::{OctreeHandle, SparseOctree, SplatVoxel, VoxelPool};
 
 use crate::octree_gpu::OctreeGpu;
 use crate::rkp_scene::GeometryUpload;
-use crate::splat_emit::FaceInstance;
+
+/// Face instance for CPU-side face emission (legacy — kept for scene loading compatibility).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct FaceInstance {
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub pos_z: f32,
+    pub voxel_size: f32,
+    pub voxel_slot: u32,
+    pub packed: u32,
+}
 
 /// Result of loading an .rkp asset.
 pub struct AssetLoadResult {
@@ -381,7 +392,7 @@ impl RkpSceneManager {
             }
         }
 
-        let fade_inner = voxel_size;
+        let fade_inner = voxel_size * 1.0;
         let fade_outer = voxel_size * 3.0;
 
         let half_extents = primitive_half_extents(primitive) * bake_scale;

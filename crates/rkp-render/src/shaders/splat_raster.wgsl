@@ -1,17 +1,13 @@
-// Rasterization vertex + fragment shader for surface voxel face quads.
+// Splat rasterization — camera-facing billboards with gradient normals.
 //
-// The vertex shader expands face instances (from the emit pass) into world-space
-// quads. The fragment shader does trilinear refinement + gradient normal +
-// material reads and writes the final G-buffer via MRT.
-//
-// This replaces the compute ray march for primary visibility.
+// Single pass: closest billboard wins (depth test). Gradient normal from
+// trilinear opacity field gives smooth shading. Circular discard gives
+// round silhouettes.
 
 // --- Constants ---
-const OPACITY_THRESHOLD: f32 = 0.5;
 const OCTREE_EMPTY: u32 = 0xFFFFFFFFu;
 const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
 const OCTREE_LEAF_BIT: u32 = 0x80000000u;
-const EMPTY_SLOT: u32 = 0xFFFFFFFFu;
 
 // --- Structs ---
 
@@ -29,29 +25,27 @@ struct VoxelSample {
     word1: u32,
 }
 
-// RkpGpuObject — 192 bytes. Matches rkp-render's RkpGpuObject layout.
-// No inverse_world — world transform is at offset 0.
 struct RkpObject {
-    world: mat4x4<f32>,             // offset 0, 64 bytes — local→world
-    aabb_min: vec3<f32>,            // offset 64
-    octree_root: u32,               // offset 76
-    aabb_max: vec3<f32>,            // offset 80
-    octree_depth: u32,              // offset 92
-    octree_extent_bits: u32,        // offset 96
-    voxel_size: f32,                // offset 100
-    material_id: u32,               // offset 104
-    object_id: u32,                 // offset 108
-    geom_type: u32,                 // offset 112
-    is_skinned: u32,                // offset 116
-    bone_count: u32,                // offset 120
-    bone_buffer_offset: u32,        // offset 124
-    rest_octree_root: u32,          // offset 128
-    rest_octree_depth: u32,         // offset 132
-    rest_octree_extent_bits: u32,   // offset 136
-    deformed_pool_offset: u32,      // offset 140
-    _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32,     // offset 144-159
-    _pad4: u32, _pad5: u32, _pad6: u32, _pad7: u32,     // offset 160-175
-    _pad8: u32, _pad9: u32, _pad10: u32, _pad11: u32,   // offset 176-191
+    world: mat4x4<f32>,
+    aabb_min: vec3<f32>,
+    octree_root: u32,
+    aabb_max: vec3<f32>,
+    octree_depth: u32,
+    octree_extent_bits: u32,
+    voxel_size: f32,
+    material_id: u32,
+    object_id: u32,
+    geom_type: u32,
+    is_skinned: u32,
+    bone_count: u32,
+    bone_buffer_offset: u32,
+    rest_octree_root: u32,
+    rest_octree_depth: u32,
+    rest_octree_extent_bits: u32,
+    deformed_pool_offset: u32,
+    _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32,
+    _pad4: u32, _pad5: u32, _pad6: u32, _pad7: u32,
+    _pad8: u32, _pad9: u32, _pad10: u32, _pad11: u32,
 }
 
 struct CameraUniforms {
@@ -67,33 +61,18 @@ struct CameraUniforms {
 
 // --- Bindings ---
 
-// Group 0: RkpScene data
 @group(0) @binding(0) var<storage, read> voxel_pool: array<VoxelSample>;
 @group(0) @binding(1) var<storage, read> octree_nodes: array<u32>;
 @group(0) @binding(2) var<storage, read> objects: array<RkpObject>;
 @group(0) @binding(3) var<uniform> camera: CameraUniforms;
 @group(0) @binding(4) var<storage, read> color_pool_data: array<u32>;
-@group(0) @binding(5) var<storage, read> bone_matrices: array<mat4x4<f32>>;
-@group(0) @binding(6) var<storage, read> bone_weights: array<u32>;
-@group(0) @binding(7) var<storage, read> deformed_pool: array<VoxelSample>;
 
-// Group 1: face instances (from emit pass)
 @group(1) @binding(0) var<storage, read> face_instances: array<FaceInstance>;
 
 // --- Helpers ---
 
-fn unpack_face_id(packed: u32) -> u32 { return packed & 0x7u; }
 fn unpack_obj_idx(packed: u32) -> u32 { return (packed >> 3u) & 0xFFFFFu; }
 
-fn extract_opacity(word0: u32) -> f32 {
-    return clamp(unpack2x16float(word0 & 0xFFFFu).x, 0.0, 1.0);
-}
-
-fn extract_material_id(word1: u32) -> u32 { return word1 & 0xFFFFu; }
-fn extract_secondary_material_id(word1: u32) -> u32 { return (word1 >> 16u) & 0xFFFFu; }
-fn extract_blend_weight(word0: u32) -> u32 { return (word0 >> 16u) & 0xFFu; }
-
-// Face normal directions: 0=-X, 1=+X, 2=-Y, 3=+Y, 4=-Z, 5=+Z
 fn face_normal(face_id: u32) -> vec3<f32> {
     switch face_id {
         case 0u: { return vec3<f32>(-1.0, 0.0, 0.0); }
@@ -106,20 +85,25 @@ fn face_normal(face_id: u32) -> vec3<f32> {
     }
 }
 
-// Get two tangent axes for a face (perpendicular to the face normal).
 fn face_tangents(face_id: u32) -> mat2x3<f32> {
-    // Tangent order is swapped for negative-direction faces (0, 2, 4)
-    // to flip triangle winding so the geometric normal matches the face direction.
     switch face_id {
-        case 0u: { return mat2x3<f32>(vec3(0.0, 0.0, 1.0), vec3(0.0, 1.0, 0.0)); } // -X: swapped
-        case 1u: { return mat2x3<f32>(vec3(0.0, 1.0, 0.0), vec3(0.0, 0.0, 1.0)); } // +X
-        case 2u: { return mat2x3<f32>(vec3(0.0, 0.0, 1.0), vec3(1.0, 0.0, 0.0)); } // -Y: swapped
-        case 3u: { return mat2x3<f32>(vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, 1.0)); } // +Y
-        case 4u: { return mat2x3<f32>(vec3(0.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0)); } // -Z: swapped
-        case 5u: { return mat2x3<f32>(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0)); } // +Z
+        case 0u: { return mat2x3<f32>(vec3(0.0, 0.0, 1.0), vec3(0.0, 1.0, 0.0)); }
+        case 1u: { return mat2x3<f32>(vec3(0.0, 1.0, 0.0), vec3(0.0, 0.0, 1.0)); }
+        case 2u: { return mat2x3<f32>(vec3(0.0, 0.0, 1.0), vec3(1.0, 0.0, 0.0)); }
+        case 3u: { return mat2x3<f32>(vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, 1.0)); }
+        case 4u: { return mat2x3<f32>(vec3(0.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0)); }
+        case 5u: { return mat2x3<f32>(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0)); }
         default: { return mat2x3<f32>(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0)); }
     }
 }
+
+fn extract_opacity(word0: u32) -> f32 {
+    return clamp(unpack2x16float(word0 & 0xFFFFu).x, 0.0, 1.0);
+}
+
+fn extract_material_id(word1: u32) -> u32 { return word1 & 0xFFFFu; }
+fn extract_secondary_material_id(word1: u32) -> u32 { return (word1 >> 16u) & 0xFFFFu; }
+fn extract_blend_weight(word0: u32) -> u32 { return (word0 >> 16u) & 0xFFu; }
 
 fn transform_local_to_world(local_pos: vec3<f32>, world: mat4x4<f32>) -> vec3<f32> {
     return (world * vec4<f32>(local_pos, 1.0)).xyz;
@@ -129,118 +113,6 @@ fn transform_dir_to_world(local_dir: vec3<f32>, world: mat4x4<f32>) -> vec3<f32>
     return (world * vec4<f32>(local_dir, 0.0)).xyz;
 }
 
-// --- Skinning helpers ---
-
-/// Read bone data from the deformed pool at a voxel coordinate.
-fn raster_read_bone_field(vc: vec3<i32>, dims: vec3<u32>, total_voxels: vec3<i32>, pool_offset: u32) -> vec2<u32> {
-    let c = clamp(vc, vec3<i32>(0), total_voxels - vec3<i32>(1));
-    let brick = vec3<u32>(c) / vec3<u32>(8u);
-    let local = vec3<u32>(c) % vec3<u32>(8u);
-    let flat_brick = brick.x + brick.y * dims.x + brick.z * dims.x * dims.y;
-    let vi = local.x + local.y * 8u + local.z * 64u;
-    let idx = pool_offset + flat_brick * 512u + vi;
-    let s = deformed_pool[idx];
-    return vec2<u32>(s.word0, s.word1);
-}
-
-/// Inverse-skin a deformed position to rest-pose.
-fn raster_inverse_skin_pos(pos: vec3<f32>, packed_indices: u32, packed_weights: u32, obj: RkpObject) -> vec3<f32> {
-    var result = vec3<f32>(0.0);
-    var total_w = 0.0;
-    for (var i = 0u; i < 4u; i++) {
-        let bone_idx = (packed_indices >> (i * 8u)) & 0xFFu;
-        let w = f32((packed_weights >> (i * 8u)) & 0xFFu);
-        if w < 1.0 { continue; }
-        let inv_mat = bone_matrices[obj.bone_buffer_offset + obj.bone_count + bone_idx];
-        let rp = (inv_mat * vec4<f32>(pos, 1.0)).xyz;
-        result += rp * w;
-        total_w += w;
-    }
-    if total_w > 0.0 { return result / total_w; }
-    return pos;
-}
-
-/// Forward-skin a position from rest-pose to posed space.
-fn raster_forward_skin_pos(pos: vec3<f32>, packed_indices: u32, packed_weights: u32, obj: RkpObject) -> vec3<f32> {
-    var result = vec3<f32>(0.0);
-    var total_w = 0.0;
-    for (var i = 0u; i < 4u; i++) {
-        let bone_idx = (packed_indices >> (i * 8u)) & 0xFFu;
-        let w = f32((packed_weights >> (i * 8u)) & 0xFFu);
-        if w < 1.0 { continue; }
-        let fwd_mat = bone_matrices[obj.bone_buffer_offset + bone_idx];
-        let fp = (fwd_mat * vec4<f32>(pos, 1.0)).xyz;
-        result += fp * w;
-        total_w += w;
-    }
-    if total_w > 0.0 { return result / total_w; }
-    return pos;
-}
-
-/// Forward-skin a direction vector from rest-pose to posed space.
-fn raster_forward_skin_dir(dir: vec3<f32>, packed_indices: u32, packed_weights: u32, obj: RkpObject) -> vec3<f32> {
-    var result = vec3<f32>(0.0);
-    var total_w = 0.0;
-    for (var i = 0u; i < 4u; i++) {
-        let bone_idx = (packed_indices >> (i * 8u)) & 0xFFu;
-        let w = f32((packed_weights >> (i * 8u)) & 0xFFu);
-        if w < 1.0 { continue; }
-        let fwd_mat = bone_matrices[obj.bone_buffer_offset + bone_idx];
-        let td = (fwd_mat * vec4<f32>(dir, 0.0)).xyz;
-        result += td * w;
-        total_w += w;
-    }
-    if total_w > 0.0 { return result / total_w; }
-    return dir;
-}
-
-/// Read bone data at a local-space position, with 6-neighbor fallback.
-fn raster_lookup_bone_data(local_pos: vec3<f32>, obj: RkpObject) -> vec2<u32> {
-    // For skinned objects, the emit pass emits from the rest-pose octree.
-    // The deformed pool contains bone weights in posed-space grid layout.
-    // We use octree_depth/extent as the rest-pose dims (reinterpreted).
-    let vs = obj.voxel_size;
-    let depth = obj.octree_depth;
-    let extent = bitcast<f32>(obj.octree_extent_bits);
-    let grid_size = extent;
-    let grid_pos = local_pos; // local_pos is already in object's local space
-
-    let dims_bricks = 1u << depth;
-    let dims = vec3<u32>(dims_bricks);
-    let total_v = vec3<i32>(dims) * 8;
-
-    let voxel_coord = grid_pos / vs;
-    let vc = vec3<i32>(floor(voxel_coord));
-
-    var bone_data = raster_read_bone_field(vc, dims, total_v, obj.deformed_pool_offset);
-    if bone_data.x == 0u && bone_data.y == 0u {
-        let offsets = array<vec3<i32>, 6>(
-            vec3<i32>(-1,0,0), vec3<i32>(1,0,0),
-            vec3<i32>(0,-1,0), vec3<i32>(0,1,0),
-            vec3<i32>(0,0,-1), vec3<i32>(0,0,1),
-        );
-        for (var ni = 0u; ni < 6u; ni++) {
-            let nb = raster_read_bone_field(vc + offsets[ni], dims, total_v, obj.deformed_pool_offset);
-            if nb.x != 0u || nb.y != 0u {
-                bone_data = nb;
-                break;
-            }
-        }
-    }
-    return bone_data;
-}
-
-/// Sample rest-pose opacity using the rest octree.
-fn raster_sample_rest_opacity(rest_pos: vec3<f32>, obj: RkpObject) -> f32 {
-    let rest_root = obj.rest_octree_root;
-    let rest_depth = obj.rest_octree_depth;
-    let rest_extent = bitcast<f32>(obj.rest_octree_extent_bits);
-    return octree_trilinear(rest_pos, rest_root, rest_depth, rest_extent, obj.voxel_size);
-}
-
-// --- Octree point query (inline, uses octree_nodes binding) ---
-
-// Per-voxel octree: each leaf IS a single voxel. No brick math needed.
 fn octree_sample_opacity(local_pos: vec3<f32>, root: u32, depth: u32, extent: f32, vs: f32) -> f32 {
     var offset = root;
     var half = extent * 0.5;
@@ -251,7 +123,6 @@ fn octree_sample_opacity(local_pos: vec3<f32>, root: u32, depth: u32, extent: f3
         if node == OCTREE_EMPTY { return 0.0; }
         if node == OCTREE_INTERIOR { return 1.0; }
         if (node & OCTREE_LEAF_BIT) != 0u {
-            // Leaf: direct voxel read.
             let slot = node & ~OCTREE_LEAF_BIT;
             return extract_opacity(voxel_pool[slot].word0);
         }
@@ -276,25 +147,46 @@ fn octree_sample_opacity(local_pos: vec3<f32>, root: u32, depth: u32, extent: f3
     return 0.0;
 }
 
-fn octree_trilinear(local_pos: vec3<f32>, root: u32, depth: u32, extent: f32, vs: f32) -> f32 {
-    let h = vs * 0.5;
-    let s000 = octree_sample_opacity(local_pos + vec3(-h, -h, -h), root, depth, extent, vs);
-    let s100 = octree_sample_opacity(local_pos + vec3( h, -h, -h), root, depth, extent, vs);
-    let s010 = octree_sample_opacity(local_pos + vec3(-h,  h, -h), root, depth, extent, vs);
-    let s110 = octree_sample_opacity(local_pos + vec3( h,  h, -h), root, depth, extent, vs);
-    let s001 = octree_sample_opacity(local_pos + vec3(-h, -h,  h), root, depth, extent, vs);
-    let s101 = octree_sample_opacity(local_pos + vec3( h, -h,  h), root, depth, extent, vs);
-    let s011 = octree_sample_opacity(local_pos + vec3(-h,  h,  h), root, depth, extent, vs);
-    let s111 = octree_sample_opacity(local_pos + vec3( h,  h,  h), root, depth, extent, vs);
+fn trilinear_grad_uvw(c: array<f32, 8>, u: f32, v: f32, w: f32) -> vec3<f32> {
+    return vec3<f32>(
+        c[1] + c[4]*v + c[5]*w + c[7]*v*w,
+        c[2] + c[4]*u + c[6]*w + c[7]*u*w,
+        c[3] + c[5]*u + c[6]*v + c[7]*u*v,
+    );
+}
 
-    let f = fract(local_pos / vs + 0.5);
-    let x0 = mix(s000, s100, f.x);
-    let x1 = mix(s010, s110, f.x);
-    let x2 = mix(s001, s101, f.x);
-    let x3 = mix(s011, s111, f.x);
-    let y0 = mix(x0, x1, f.y);
-    let y1 = mix(x2, x3, f.y);
-    return mix(y0, y1, f.z);
+fn compute_gradient_normal(
+    p: vec3<f32>, root: u32, depth: u32, extent: f32, vs: f32, world: mat4x4<f32>, fallback: vec3<f32>
+) -> vec3<f32> {
+    let h = vs * 0.5;
+    let s000 = octree_sample_opacity(p + vec3(-h, -h, -h), root, depth, extent, vs);
+    let s100 = octree_sample_opacity(p + vec3( h, -h, -h), root, depth, extent, vs);
+    let s010 = octree_sample_opacity(p + vec3(-h,  h, -h), root, depth, extent, vs);
+    let s110 = octree_sample_opacity(p + vec3( h,  h, -h), root, depth, extent, vs);
+    let s001 = octree_sample_opacity(p + vec3(-h, -h,  h), root, depth, extent, vs);
+    let s101 = octree_sample_opacity(p + vec3( h, -h,  h), root, depth, extent, vs);
+    let s011 = octree_sample_opacity(p + vec3(-h,  h,  h), root, depth, extent, vs);
+    let s111 = octree_sample_opacity(p + vec3( h,  h,  h), root, depth, extent, vs);
+
+    var c: array<f32, 8>;
+    c[0] = s000;
+    c[1] = s100 - s000;
+    c[2] = s010 - s000;
+    c[3] = s001 - s000;
+    c[4] = s110 - s100 - s010 + s000;
+    c[5] = s101 - s100 - s001 + s000;
+    c[6] = s011 - s010 - s001 + s000;
+    c[7] = s111 - s110 - s101 - s011 + s100 + s010 + s001 - s000;
+
+    let uvw = fract(p / vs + 0.5);
+    let grad_uvw = trilinear_grad_uvw(c, uvw.x, uvw.y, uvw.z);
+    let local_grad = -grad_uvw;
+    let grad_len = length(local_grad);
+    if grad_len > 0.01 {
+        let world_grad = transform_dir_to_world(local_grad, world);
+        return normalize(world_grad);
+    }
+    return fallback;
 }
 
 // --- Vertex Shader ---
@@ -302,10 +194,11 @@ fn octree_trilinear(local_pos: vec3<f32>, root: u32, depth: u32, extent: f32, vs
 struct VsOutput {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) world_pos: vec3<f32>,
-    @location(1) octree_pos: vec3<f32>,  // position in octree space [0, extent] for sampling
-    @location(2) @interpolate(flat) voxel_slot: u32,
-    @location(3) @interpolate(flat) packed: u32,
-    @location(4) @interpolate(flat) voxel_size: f32,
+    @location(1) octree_pos: vec3<f32>,
+    @location(2) billboard_uv: vec2<f32>,
+    @location(3) @interpolate(flat) voxel_slot: u32,
+    @location(4) @interpolate(flat) packed: u32,
+    @location(5) @interpolate(flat) voxel_size: f32,
 }
 
 @vertex
@@ -313,140 +206,80 @@ fn vs_main(
     @builtin(vertex_index) vertex_id: u32,
     @builtin(instance_index) instance_id: u32,
 ) -> VsOutput {
-    let face = face_instances[instance_id];
-    let face_id = unpack_face_id(face.packed);
-    let obj_idx = unpack_obj_idx(face.packed);
+    let splat = face_instances[instance_id];
+    let obj_idx = unpack_obj_idx(splat.packed);
     let obj = objects[obj_idx];
 
-    // Face positions are in octree space (0-based). Convert to object-local space
-    // by subtracting extent/2 (octree is centered on the object's local origin).
-    let octree_center = vec3<f32>(face.pos_x, face.pos_y, face.pos_z);
+    let octree_center = vec3<f32>(splat.pos_x, splat.pos_y, splat.pos_z);
     let extent = bitcast<f32>(obj.octree_extent_bits);
     let grid_offset = vec3<f32>(-extent * 0.5);
-
-    let vs = face.voxel_size;
+    let vs = splat.voxel_size;
+    let face_id = splat.packed & 0x7u;
     let half = vs * 0.5;
 
-    // Expand vertex_id (0-5) into quad corner.
-    // Triangle list: 0,1,2, 2,1,3 → forms a quad.
+    // Face-oriented quad (fixed in world space — no camera rotation flicker).
     let quad_idx = array<u32, 6>(0u, 1u, 2u, 2u, 1u, 3u);
     let corner = quad_idx[vertex_id];
-    let cu = f32(corner & 1u) * 2.0 - 1.0; // -1 or +1
+    let cu = f32(corner & 1u) * 2.0 - 1.0;
     let cv = f32((corner >> 1u) & 1u) * 2.0 - 1.0;
 
-    let tangents = face_tangents(face_id);
     let fn_dir = face_normal(face_id);
+    let tangents = face_tangents(face_id);
 
-    // Quad corners in octree space, then convert to object-local space.
     let octree_pos = octree_center + fn_dir * half + tangents[0] * cu * half + tangents[1] * cv * half;
     let local_pos = octree_pos + grid_offset;
-
-    // For skinned objects: forward-skin the local (rest-pose) position through
-    // bone matrices to get posed-space position, then transform to world space.
-    var world_pos: vec3<f32>;
-    if obj.is_skinned != 0u && obj.bone_count > 0u {
-        // Look up bone weights at the voxel center (not corner — bones are per-voxel).
-        let bone_data = raster_lookup_bone_data(octree_center, obj);
-        if bone_data.x != 0u || bone_data.y != 0u {
-            let posed_pos = raster_forward_skin_pos(local_pos, bone_data.x, bone_data.y, obj);
-            world_pos = transform_local_to_world(posed_pos, obj.world);
-        } else {
-            world_pos = transform_local_to_world(local_pos, obj.world);
-        }
-    } else {
-        world_pos = transform_local_to_world(local_pos, obj.world);
-    }
-
+    let world_pos = transform_local_to_world(local_pos, obj.world);
     let clip_pos = camera.view_proj * vec4<f32>(world_pos, 1.0);
 
     return VsOutput(
-        clip_pos,
-        world_pos,
-        octree_pos,
-        face.voxel_slot,
-        face.packed,
-        vs,
+        clip_pos, world_pos, octree_center,
+        vec2<f32>(cu, cv),
+        splat.voxel_slot, splat.packed, vs,
     );
 }
 
 // --- Fragment Shader ---
 
 struct GBufferOutput {
-    @location(0) position: vec4<f32>,   // Rgba32Float: xyz + hit_distance
-    @location(1) normal: vec4<f32>,     // Rgba16Float: xyz + 0
-    @location(2) material: vec4<u32>,   // Rg32Uint: packed_r, packed_g, 0, 0
-    // Motion vectors omitted from MRT (32 byte/sample limit).
+    @location(0) position: vec4<f32>,
+    @location(1) normal: vec4<f32>,
+    @location(2) material: vec4<u32>,
 }
 
 @fragment
 fn fs_main(in: VsOutput) -> GBufferOutput {
     let obj_idx = unpack_obj_idx(in.packed);
     let obj = objects[obj_idx];
+    let vs = in.voxel_size;
     let root = obj.octree_root;
     let depth = obj.octree_depth;
     let extent = bitcast<f32>(obj.octree_extent_bits);
-    let vs = in.voxel_size;
 
-    // Trilinear refinement: check if there's actually a surface at this position.
-    // The rasterized face is a proxy — the true isosurface may be slightly offset.
-    // octree_pos is in octree space [0, extent] — correct for octree sampling.
-    let octree_pos = in.octree_pos;
-    // DEBUG: flat red color to verify geometry position.
-    // Uncomment return below to bypass all shading and see raw geometry placement.
-    // return GBufferOutput(
-    //     vec4<f32>(in.world_pos, 1.0),
-    //     vec4<f32>(0.0, 1.0, 0.0, 0.0),
-    //     vec4<u32>(0u, 0u, 0u, 0u),
-    // );
-
-    // Gradient normal via per-tap octree traversal. Each tap does a full octree
-    // lookup, correctly crossing brick boundaries. Falls back to flat face normal
-    // at object edges where gradient is too weak.
-    let face_id = unpack_face_id(in.packed);
+    // Gradient normal from trilinear opacity field.
+    let face_id = in.packed & 0x7u;
     let flat_fn = face_normal(face_id);
     let world_face_normal = normalize(transform_dir_to_world(flat_fn, obj.world));
+    let normal = compute_gradient_normal(
+        in.octree_pos, root, depth, extent, vs, obj.world, world_face_normal,
+    );
 
-    var normal = world_face_normal;
-
-    if obj.is_skinned == 0u || obj.bone_count == 0u {
-        let eps = vs * 2.0;
-        let gx = octree_sample_opacity(octree_pos + vec3(eps, 0.0, 0.0), root, depth, extent, vs)
-               - octree_sample_opacity(octree_pos - vec3(eps, 0.0, 0.0), root, depth, extent, vs);
-        let gy = octree_sample_opacity(octree_pos + vec3(0.0, eps, 0.0), root, depth, extent, vs)
-               - octree_sample_opacity(octree_pos - vec3(0.0, eps, 0.0), root, depth, extent, vs);
-        let gz = octree_sample_opacity(octree_pos + vec3(0.0, 0.0, eps), root, depth, extent, vs)
-               - octree_sample_opacity(octree_pos - vec3(0.0, 0.0, eps), root, depth, extent, vs);
-        let local_grad = -vec3<f32>(gx, gy, gz);
-        let grad_len = length(local_grad);
-        if grad_len > 0.01 {
-            let world_grad = transform_dir_to_world(local_grad, obj.world);
-            normal = normalize(world_grad);
-        }
-    }
-
-    // Material read — per-voxel octree: direct slot, no brick math.
+    // Material + color.
     let voxel = voxel_pool[in.voxel_slot];
     let mat_id = extract_material_id(voxel.word1);
     let sec_mat = extract_secondary_material_id(voxel.word1);
     let blend = extract_blend_weight(voxel.word0);
 
-    // Read per-voxel color directly (parallel array, same index as voxel pool).
-    // Pack as RGB565 into bits 16-31 of packed_g so the shading pass can use it
-    // without re-traversing the octree.
     let color_packed = color_pool_data[in.voxel_slot];
     var color_rgb565 = 0u;
     if color_packed != 0u {
-        let cr = (color_packed & 0xFFu) >> 3u;        // 5 bits red
-        let cg = ((color_packed >> 8u) & 0xFFu) >> 2u; // 6 bits green
-        let cb = ((color_packed >> 16u) & 0xFFu) >> 3u; // 5 bits blue
+        let cr = (color_packed & 0xFFu) >> 3u;
+        let cg = ((color_packed >> 8u) & 0xFFu) >> 2u;
+        let cb = ((color_packed >> 16u) & 0xFFu) >> 3u;
         color_rgb565 = cr | (cg << 5u) | (cb << 11u);
     }
 
     let packed_r = (mat_id & 0xFFFFu) | ((sec_mat & 0xFFFFu) << 16u);
-    // object_id + 1 so that 0 means "no geometry" (distinguishes object 0 from empty).
     let packed_g = (blend & 0xFFu) | (((obj.object_id + 1u) & 0xFFu) << 8u) | (color_rgb565 << 16u);
-
-    // Hit distance from camera.
     let hit_t = length(in.world_pos - camera.position.xyz);
 
     return GBufferOutput(

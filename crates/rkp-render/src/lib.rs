@@ -8,10 +8,8 @@
 pub mod voxelize_opacity;
 /// GPU octree buffer management and GpuObject field reinterpretation.
 pub mod octree_gpu;
-/// Emit compute pass — traverses octrees, emits transition face quads.
-pub mod splat_emit;
-/// Rasterization render pipeline — draws face quads into G-buffer via MRT.
-pub mod splat_raster;
+/// Octree-accelerated compute ray marcher — primary visibility pass.
+pub mod octree_march;
 /// Per-object GPU struct — forward world transform, octree params, no inverse_world.
 pub mod rkp_gpu_object;
 /// Scene GPU buffer management — single upload path for all data.
@@ -28,5 +26,4 @@ pub mod rkp_scene_manager;
 pub use voxelize_opacity::import_mesh_to_opacity_rkf;
 pub use voxelize_opacity::import_mesh_to_opacity_rkp;
 pub use octree_gpu::OctreeGpu;
-pub use splat_emit::SplatEmitPass;
 pub use rkp_scene_manager::RkpSceneManager;

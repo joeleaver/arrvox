@@ -560,6 +560,133 @@ mod tests {
         assert_eq!(depth, 0);
     }
 
+    /// GPU-style position-based lookup (mirrors octree_lookup in WGSL).
+    /// Uses floating-point comparisons instead of integer bit tests.
+    fn gpu_style_lookup(tree: &SparseOctree, pos: glam::Vec3) -> (u32, u8) {
+        let extent = tree.extent() as f32 * tree.base_voxel_size();
+        let mut offset = 0usize;
+        let mut half = extent * 0.5;
+        let mut center = glam::Vec3::splat(half);
+
+        for level in 0..tree.depth() {
+            let node = tree.as_slice()[offset];
+            if node == EMPTY_NODE { return (EMPTY_NODE, level); }
+            if node == INTERIOR_NODE { return (INTERIOR_NODE, level); }
+            if is_leaf(node) { return (leaf_slot(node), level); }
+
+            // Branch — same logic as GPU shader
+            let gx = if pos.x >= center.x { 1u32 } else { 0 };
+            let gy = if pos.y >= center.y { 1u32 } else { 0 };
+            let gz = if pos.z >= center.z { 1u32 } else { 0 };
+            let child = (gx + gy * 2 + gz * 4) as usize;
+            offset = node as usize + child;
+
+            half *= 0.5;
+            center.x += if pos.x >= center.x { half } else { -half };
+            center.y += if pos.y >= center.y { half } else { -half };
+            center.z += if pos.z >= center.z { half } else { -half };
+        }
+
+        let node = tree.as_slice()[offset];
+        if node == EMPTY_NODE { return (EMPTY_NODE, tree.depth()); }
+        if node == INTERIOR_NODE { return (INTERIOR_NODE, tree.depth()); }
+        if is_leaf(node) { return (leaf_slot(node), tree.depth()); }
+        (EMPTY_NODE, tree.depth())
+    }
+
+    #[test]
+    fn gpu_lookup_matches_coord_lookup() {
+        // Build a sphere octree and verify every leaf is reachable by position.
+        let mut pool = crate::VoxelPool::new(100_000);
+        let (tree, voxel_count, _) = crate::voxelize_octree::voxelize_opacity_sphere_octree(
+            glam::Vec3::ZERO, 0.5, 0, 0.05, &mut pool,
+        ).unwrap();
+
+        let vs = tree.base_voxel_size();
+        let extent = tree.extent() as f32 * vs;
+        let mut mismatches = 0u32;
+        let mut total = 0u32;
+
+        for (coord, slot, leaf_depth) in tree.iter_leaves() {
+            total += 1;
+            let depth_diff = tree.depth() - leaf_depth;
+            let leaf_vs = vs * (1u32 << depth_diff) as f32;
+            // Position at center of the leaf voxel
+            let pos = glam::Vec3::new(
+                coord.x as f32 * vs + leaf_vs * 0.5,
+                coord.y as f32 * vs + leaf_vs * 0.5,
+                coord.z as f32 * vs + leaf_vs * 0.5,
+            );
+
+            let (gpu_slot, gpu_depth) = gpu_style_lookup(&tree, pos);
+            let (coord_node, _) = tree.lookup_with_depth(coord).unwrap();
+            let coord_slot = if is_leaf(coord_node) { leaf_slot(coord_node) } else { coord_node };
+
+            if gpu_slot != slot {
+                if mismatches < 5 {
+                    eprintln!(
+                        "MISMATCH at coord={:?} pos={:?}: coord_lookup_slot={} gpu_slot={} (expected {})",
+                        coord, pos, coord_slot, gpu_slot, slot
+                    );
+                }
+                mismatches += 1;
+            }
+        }
+
+        eprintln!("GPU lookup test: {total} leaves, {mismatches} mismatches");
+        assert_eq!(mismatches, 0, "{mismatches}/{total} leaves unreachable by GPU-style position lookup");
+    }
+
+    #[test]
+    fn gpu_lookup_matches_rkp_file() {
+        // Test with an actual .rkp file if available.
+        let path = "/home/joe/dev/rkifield_game/splat5/assets/models/bunny_pbr/scene.rkp";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("Skipping .rkp test — file not found: {path}");
+            return;
+        }
+
+        let mut file = std::fs::File::open(path).unwrap();
+        let mut reader = std::io::BufReader::new(&mut file);
+        let header = crate::asset_file::read_rkp_header(&mut reader).unwrap();
+        let octree_nodes = crate::asset_file::read_rkp_octree(&mut reader, &header).unwrap();
+
+        let depth = header.octree_depth as u8;
+        let vs = header.base_voxel_size;
+        let tree = SparseOctree::from_raw(&octree_nodes, depth, vs);
+
+        let voxel_data = crate::asset_file::read_rkp_voxels(&mut reader, &header).unwrap();
+
+        let extent = tree.extent() as f32 * vs;
+        let mut mismatches = 0u32;
+        let mut total = 0u32;
+
+        for (coord, slot, leaf_depth) in tree.iter_leaves() {
+            total += 1;
+            let depth_diff = tree.depth() - leaf_depth;
+            let leaf_vs = vs * (1u32 << depth_diff) as f32;
+            let pos = glam::Vec3::new(
+                coord.x as f32 * vs + leaf_vs * 0.5,
+                coord.y as f32 * vs + leaf_vs * 0.5,
+                coord.z as f32 * vs + leaf_vs * 0.5,
+            );
+
+            let (gpu_slot, _) = gpu_style_lookup(&tree, pos);
+            if gpu_slot != slot {
+                if mismatches < 10 {
+                    eprintln!(
+                        "MISMATCH coord={:?} pos={:?}: expected slot={} got gpu_slot={}",
+                        coord, pos, slot, gpu_slot
+                    );
+                }
+                mismatches += 1;
+            }
+        }
+
+        eprintln!("GPU lookup .rkp test: {total} leaves, {mismatches} mismatches (extent={extent}, depth={depth}, vs={vs})");
+        assert_eq!(mismatches, 0, "{mismatches}/{total} leaves unreachable by GPU-style lookup");
+    }
+
     #[test]
     fn iter_leaves_empty() {
         let tree = SparseOctree::new(3, 0.1);

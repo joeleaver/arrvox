@@ -31,7 +31,7 @@ pub struct FaceInstance {
 pub struct EmitParams {
     pub max_faces: u32,
     pub object_count: u32,
-    pub _pad0: u32,
+    pub max_depth: u32,
     pub _pad1: u32,
 }
 
@@ -59,7 +59,7 @@ pub struct SplatEmitPass {
 }
 
 /// Default initial capacity for face instances.
-const DEFAULT_MAX_FACES: u32 = 1_000_000;
+const DEFAULT_MAX_FACES: u32 = 256_000;
 
 /// Size of one FaceInstance in bytes.
 const FACE_INSTANCE_SIZE: u64 = std::mem::size_of::<FaceInstance>() as u64;
@@ -226,12 +226,61 @@ impl SplatEmitPass {
         }
     }
 
+    /// Ensure the face buffer can hold at least `needed` face instances.
+    /// Grows the buffer and rebuilds bind groups if needed.
+    /// Returns true if the buffer was resized.
+    pub fn ensure_capacity(&mut self, device: &wgpu::Device, needed: u32, raster: &crate::splat_raster::SplatRasterPipeline) -> bool {
+        if needed <= self.max_faces {
+            return false;
+        }
+        let new_max = needed.max(self.max_faces * 2);
+        eprintln!("[SplatEmitPass] growing face buffer: {} → {} faces ({:.1} MB)",
+            self.max_faces, new_max, new_max as f64 * FACE_INSTANCE_SIZE as f64 / 1_048_576.0);
+
+        let new_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("emit face instances"),
+            size: new_max as u64 * FACE_INSTANCE_SIZE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Rebuild emit output bind group.
+        self.output_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("emit output bind group"),
+            layout: &self.output_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: new_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.indirect_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Rebuild raster face bind group.
+        *raster.face_bind_group.borrow_mut() = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("raster face bind group"),
+            layout: &raster.face_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: new_buf.as_entire_binding(),
+            }],
+        });
+
+        *self.face_buffer.borrow_mut() = new_buf;
+        self.max_faces = new_max;
+        true
+    }
+
     /// Update the object count uniform. Call when the scene changes.
-    pub fn update_params(&self, queue: &wgpu::Queue, object_count: u32) {
+    pub fn update_params(&self, queue: &wgpu::Queue, object_count: u32, max_depth: u32) {
         let params = EmitParams {
             max_faces: self.max_faces,
             object_count,
-            _pad0: 0,
+            max_depth,
             _pad1: 0,
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
@@ -240,12 +289,16 @@ impl SplatEmitPass {
     /// Record the emit compute dispatch into the command encoder.
     ///
     /// Resets the indirect draw args (via staging copy) then dispatches the emit
-    /// compute shader. `update_params()` should be called when object count changes.
+    /// compute shader with one thread per potential leaf path.
+    ///
+    /// Dispatch: (ceil(8^max_depth / 256), object_count, 1)
+    /// X = path index, Y = object index.
     pub fn dispatch(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         scene_bind_group: &wgpu::BindGroup,
         object_count: u32,
+        max_depth: u32,
     ) {
         // Reset indirect args: copy from staging buffer (vertex_count=6, instance_count=0).
         encoder.copy_buffer_to_buffer(
@@ -256,6 +309,13 @@ impl SplatEmitPass {
             DRAW_INDIRECT_SIZE,
         );
 
+        // 8^depth total paths, ceil-divided by workgroup size (256).
+        // Split across X and Z dimensions to stay within 65535 limit per dimension.
+        let total_paths = 8u64.saturating_pow(max_depth);
+        let total_workgroups = (total_paths + 255) / 256;
+        let workgroups_x = (total_workgroups).min(65535) as u32;
+        let workgroups_z = ((total_workgroups + 65534) / 65535).min(65535) as u32;
+
         // Dispatch emit.
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("splat_emit"),
@@ -265,7 +325,7 @@ impl SplatEmitPass {
         pass.set_bind_group(0, scene_bind_group, &[]);
         pass.set_bind_group(1, &self.output_bind_group, &[]);
         pass.set_bind_group(2, &self.params_bind_group, &[]);
-        pass.dispatch_workgroups(object_count, 1, 1);
+        pass.dispatch_workgroups(workgroups_x, object_count, workgroups_z);
     }
 
     /// Maximum face instances the buffer can hold.

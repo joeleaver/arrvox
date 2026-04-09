@@ -19,6 +19,31 @@ use crate::command::EngineCommand;
 use crate::components::SpatialData;
 use crate::snapshot::StateUpdate;
 
+/// Collect all leaf voxel-pool slots from an octree in the packed node buffer.
+///
+/// Branch offsets in the packed buffer are ABSOLUTE indices. This function
+/// traverses from `node_idx` directly in `all_nodes` without sub-slicing,
+/// avoiding the offset-rebasing problem that `SparseOctree::from_raw` has
+/// when given a sub-slice.
+fn collect_leaf_slots(all_nodes: &[u32], node_idx: usize, out: &mut Vec<u32>) {
+    if node_idx >= all_nodes.len() {
+        return;
+    }
+    let node = all_nodes[node_idx];
+    if node == rkp_core::sparse_octree::EMPTY_NODE || node == rkp_core::sparse_octree::INTERIOR_NODE {
+        return;
+    }
+    if rkp_core::sparse_octree::is_leaf(node) {
+        out.push(rkp_core::sparse_octree::leaf_slot(node));
+        return;
+    }
+    // Branch — value is absolute offset to 8 contiguous children.
+    let children_offset = node as usize;
+    for octant in 0..8 {
+        collect_leaf_slots(all_nodes, children_offset + octant, out);
+    }
+}
+
 /// Convert a SpatialHandle from rkp_render into our SpatialData component.
 fn spatial_from_handle(
     handle: &rkf_core::scene_node::SpatialHandle,
@@ -197,6 +222,13 @@ struct EngineState {
     available_models: Vec<crate::snapshot::ModelInfo>,
     models_dirty: bool,
 
+    /// Material library — manages .rkmat files and runtime palette.
+    material_lib: crate::material_library::MaterialLibrary,
+    /// Currently selected material in the materials panel.
+    selected_material: Option<u16>,
+    /// Currently selected model path (source mesh) for Asset Properties.
+    selected_model: Option<String>,
+
     /// File watcher for hot-reload (watches project assets/ directory).
     file_watcher: Option<crate::file_watcher::RkpFileWatcher>,
     /// Background import worker for mesh → .rkp conversion.
@@ -206,6 +238,8 @@ struct EngineState {
     geometry_dirty: bool,
     /// Scene structure changed — push objects list to UI.
     scene_dirty: bool,
+    /// GPU objects / transforms changed — rebuild gpu_objects + re-upload.
+    gpu_objects_dirty: bool,
 
     // Frame counter
     frame_index: u64,
@@ -331,10 +365,14 @@ impl EngineState {
             project_dirty: true, // push initial state
             available_models: Vec::new(),
             models_dirty: false,
+            material_lib: crate::material_library::MaterialLibrary::new(),
+            selected_material: None,
+            selected_model: None,
             file_watcher: None,
             import_worker: crate::import_worker::ImportWorker::new(),
             geometry_dirty: false,
             scene_dirty: false,
+            gpu_objects_dirty: true,
             frame_index: 0,
             width,
             height,
@@ -360,8 +398,18 @@ impl EngineState {
     }
 
     fn render_frame(&mut self) -> (Vec<u8>, u32, u32) {
-        // 0. Rebuild GPU objects from ECS world.
-        self.update_scene_gpu();
+        // 0a. Upload material palette if dirty.
+        if self.material_lib.is_dirty() {
+            let palette = self.material_lib.build_palette();
+            self.renderer.update_materials(&self.queue, &palette);
+            self.material_lib.clear_dirty();
+        }
+
+        // 0b. Rebuild GPU objects from ECS world only when transforms/objects changed.
+        if self.gpu_objects_dirty {
+            self.update_scene_gpu();
+            self.gpu_objects_dirty = false;
+        }
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("rkp frame"),
@@ -382,18 +430,10 @@ impl EngineState {
         };
         self.renderer.upload_frame(&self.queue, &frame);
 
-        // 3. Upload face instances with remapped object indices.
-        let mut faces = self.scene_mgr.pending_faces().to_vec();
-        for face in &mut faces {
-            let scene_id = (face.packed >> 3) & 0xFFFFF;
-            let gpu_idx = self.scene_id_to_gpu.get(&scene_id).copied().unwrap_or(0);
-            face.packed = (face.packed & 0x7) | ((gpu_idx & 0xFFFFF) << 3);
-        }
-        self.renderer.upload_faces(&mut encoder, &faces);
-
-        // 4. Render: raster → shadow/AO → shade.
+        // 3. Render: march → shadow/AO → shade.
+        let object_count = self.gpu_objects.len() as u32;
         let shadow_params = rkp_render::rkp_shadow_ao::ShadowAoParams::default();
-        self.renderer.render(&mut encoder, &self.gbuffer, &self.queue, &shadow_params);
+        self.renderer.render(&mut encoder, &self.queue, object_count, self.width, self.height, &shadow_params);
 
         // 4b. Pick: copy material texture (object_id+1 in G bits 8-15, 0 = no hit).
         let pick_issued = self.pending_pick.is_some();
@@ -639,6 +679,7 @@ impl EngineState {
                     self.entity_scene_ids.insert(entity, scene_id);
                     self.geometry_dirty = true;
                     self.scene_dirty = true;
+                    self.gpu_objects_dirty = true;
                     eprintln!("[RkpEngine] spawned primitive '{name}': {} voxels, entity {:?}, scene_id={}", result.voxel_count, entity, scene_id);
                 }
             }
@@ -666,6 +707,7 @@ impl EngineState {
                         self.entity_scene_ids.insert(entity, scene_id);
                         self.geometry_dirty = true;
                         self.scene_dirty = true;
+                        self.gpu_objects_dirty = true;
                         eprintln!("[RkpEngine] loaded asset '{name}': {} voxels, entity {:?}, scene_id={}", result.voxel_count, entity, scene_id);
                     }
                     Err(e) => {
@@ -735,7 +777,15 @@ impl EngineState {
                         self.project_loaded = true;
                         self.project_dirty = true;
                         self.scene_dirty = true;
+                        self.gpu_objects_dirty = true;
                         self.scan_models();
+                        if let Some(ref dir) = self.project_dir {
+                            // Write starter materials before scanning.
+                            crate::material_library::write_starter_materials(
+                                &dir.join("assets/materials"),
+                            );
+                            self.material_lib.scan(&dir.join("assets/materials"));
+                        }
                         self.init_file_watcher();
                         self.auto_import_meshes();
                         if let Some(ref pp) = self.project_path {
@@ -762,6 +812,9 @@ impl EngineState {
                         self.project_loaded = true;
                         self.project_dirty = true;
                         self.scan_models();
+                        if let Some(ref dir) = self.project_dir {
+                            self.material_lib.scan(&dir.join("assets/materials"));
+                        }
                         self.init_file_watcher();
                         self.auto_import_meshes();
                         if let Some(ref pp) = self.project_path {
@@ -821,6 +874,8 @@ impl EngineState {
                         if let Ok(fv) = serde_json::from_str::<crate::inspector::FieldValue>(&value) {
                             if let Err(e) = (entry.set_field)(&mut self.world, entity, &field_name, fv) {
                                 eprintln!("[RkpEngine] set_field failed: {e}");
+                            } else if component_name == "Transform" {
+                                self.gpu_objects_dirty = true;
                             }
                         }
                     }
@@ -834,6 +889,7 @@ impl EngineState {
                             eprintln!("[RkpEngine] add component failed: {e}");
                         }
                         self.scene_dirty = true;
+                        self.gpu_objects_dirty = true;
                     }
                 }
             }
@@ -845,8 +901,150 @@ impl EngineState {
                             eprintln!("[RkpEngine] remove component failed: {e}");
                         }
                         self.scene_dirty = true;
+                        self.gpu_objects_dirty = true;
                     }
                 }
+            }
+
+            EngineCommand::CreateMaterial { name } => {
+                match self.material_lib.create(&name) {
+                    Ok(id) => {
+                        eprintln!("[RkpEngine] created material '{name}' as id {id}");
+                        self.selected_material = Some(id);
+                    }
+                    Err(e) => eprintln!("[RkpEngine] create material failed: {e}"),
+                }
+            }
+
+            EngineCommand::UpdateMaterialField { material_id, field, value } => {
+                if let Some(def) = self.material_lib.get_def_mut(material_id) {
+                    match field.as_str() {
+                        "name" => { def.name = value; }
+                        "base_color" => {
+                            if let Ok(v) = serde_json::from_str::<[f32; 4]>(&value) {
+                                def.base_color = v;
+                            }
+                        }
+                        "roughness" => {
+                            if let Ok(v) = value.parse::<f32>() { def.roughness = v; }
+                        }
+                        "metallic" => {
+                            if let Ok(v) = value.parse::<f32>() { def.metallic = v; }
+                        }
+                        "emission_strength" => {
+                            if let Ok(v) = value.parse::<f32>() { def.emission_strength = v; }
+                        }
+                        "opacity" => {
+                            if let Ok(v) = value.parse::<f32>() { def.opacity = v; }
+                        }
+                        _ => { eprintln!("[RkpEngine] unknown material field: {field}"); }
+                    }
+                    let _ = self.material_lib.save(material_id);
+                }
+            }
+
+            EngineCommand::DeleteMaterial { material_id } => {
+                if let Some(path) = self.material_lib.path_for_id(material_id).map(|p| p.to_owned()) {
+                    let _ = std::fs::remove_file(&path);
+                    self.material_lib.remove(&path);
+                    if self.selected_material == Some(material_id) {
+                        self.selected_material = None;
+                    }
+                }
+            }
+
+            EngineCommand::AssignMaterial { entity_id, material_id } => {
+                if let Some(entity) = self.resolve_entity(&entity_id) {
+                    if let Ok(mut r) = self.world.get::<&mut crate::components::Renderable>(entity) {
+                        r.material_id = material_id;
+                        self.gpu_objects_dirty = true;
+                    }
+                }
+            }
+
+            EngineCommand::SelectMaterial { material_id } => {
+                self.selected_material = material_id;
+            }
+
+            EngineCommand::RemapMaterial { object_id, from_material, to_material } => {
+                if let Some(entity) = self.resolve_entity(&object_id) {
+                    let count = self.remap_entity_material(entity, from_material, to_material);
+                    if count > 0 {
+                        eprintln!("[RkpEngine] remapped {count} voxels from material {from_material} to {to_material}");
+                        self.geometry_dirty = true;
+                    }
+                }
+            }
+
+            EngineCommand::SetPrimitiveMaterial { object_id, material_id } => {
+                if let Some(entity) = self.resolve_entity(&object_id) {
+                    if let Ok(mut r) = self.world.get::<&mut crate::components::Renderable>(entity) {
+                        r.material_id = material_id;
+                        self.gpu_objects_dirty = true;
+                    }
+                }
+            }
+
+            EngineCommand::SelectModel { path } => {
+                self.selected_model = path;
+            }
+
+            EngineCommand::UpdateImportField { source_path, field, value } => {
+                // Find the model info, update its import profile, save sidecar.
+                let source = std::path::PathBuf::from(&source_path);
+                let mut profile = crate::import_profile::ImportProfile::load_or_default(&source);
+                match field.as_str() {
+                    "display_name" => {
+                        profile.display_name = if value.is_empty() { None } else { Some(value) };
+                    }
+                    "voxel_size" => {
+                        profile.voxel_size = value.parse::<f32>().ok().filter(|&v| v > 0.0);
+                    }
+                    "target_size" => {
+                        if let Ok(v) = value.parse::<f32>() { profile.target_size = v; }
+                    }
+                    "no_normalize" => {
+                        profile.no_normalize = value == "true";
+                    }
+                    "import_colors" => {
+                        profile.import_colors = value == "true";
+                    }
+                    "rotation_x" => {
+                        if let Ok(v) = value.parse::<f32>() { profile.rotation_offset[0] = v; }
+                    }
+                    "rotation_y" => {
+                        if let Ok(v) = value.parse::<f32>() { profile.rotation_offset[1] = v; }
+                    }
+                    "rotation_z" => {
+                        if let Ok(v) = value.parse::<f32>() { profile.rotation_offset[2] = v; }
+                    }
+                    _ => {
+                        eprintln!("[RkpEngine] unknown import field: {field}");
+                    }
+                }
+                if let Err(e) = profile.save_for(&source) {
+                    eprintln!("[RkpEngine] save import profile failed: {e}");
+                }
+                // Update the in-memory model info.
+                if let Some(mi) = self.available_models.iter_mut().find(|m| m.source_path == source_path) {
+                    if let Some(ref name) = profile.display_name {
+                        mi.name = name.clone();
+                    }
+                    mi.import_profile = Some(profile);
+                }
+                self.models_dirty = true;
+            }
+
+            EngineCommand::ReimportModel { source_path } => {
+                let source = std::path::PathBuf::from(&source_path);
+                let profile = crate::import_profile::ImportProfile::load_or_default(&source);
+                let output = crate::import_worker::rkp_output_path(&source);
+                eprintln!("[RkpEngine] re-importing {} → {}", source.display(), output.display());
+                self.import_worker.submit(crate::import_worker::ImportRequest {
+                    source_path: source,
+                    output_path: output,
+                    config: profile.to_import_config(),
+                });
             }
 
             _ => {
@@ -946,7 +1144,7 @@ impl EngineState {
                 }
                 FileEvent::MaterialChanged(path) => {
                     eprintln!("[RkpEngine] material changed: {}", path.display());
-                    // TODO: reload material properties
+                    self.material_lib.reload(&path);
                 }
                 FileEvent::MeshSourceChanged(path) => {
                     eprintln!("[RkpEngine] mesh source changed: {}", path.display());
@@ -1001,6 +1199,9 @@ impl EngineState {
         let rot = transform.as_ref().map(|t| t.rotation.to_array()).unwrap_or([0.0; 3]);
         let scl = transform.as_ref().map(|t| t.scale.to_array()).unwrap_or([1.0; 3]);
 
+        // Count per-material voxel usage if entity has spatial data.
+        let material_usage = self.count_material_usage(selected);
+
         Some(InspectorSnapshot {
             entity_name: name,
             entity_id: format!("{}", self.get_entity_uuid(selected).as_simple()),
@@ -1008,7 +1209,95 @@ impl EngineState {
             rotation: rot,
             scale: scl,
             components,
+            material_usage,
         })
+    }
+
+    /// Count per-material voxel usage for an entity's octree.
+    fn count_material_usage(&self, entity: hecs::Entity) -> Vec<crate::inspector::MaterialUsage> {
+        let renderable = match self.world.get::<&crate::components::Renderable>(entity) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let spatial = match &renderable.spatial {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+
+        // Collect leaf voxel slots from the packed octree buffer.
+        // Branch offsets in the packed buffer are ABSOLUTE, so we traverse
+        // the full buffer starting at root_offset (not a sub-slice).
+        let all_nodes = self.scene_mgr.octree.data();
+        let mut leaf_slots = Vec::new();
+        collect_leaf_slots(all_nodes, spatial.root_offset as usize, &mut leaf_slots);
+
+        // Count material IDs across all leaf voxels.
+        let mut counts: std::collections::HashMap<u16, u32> = std::collections::HashMap::new();
+        for slot in leaf_slots {
+            let voxel = self.scene_mgr.voxel_pool.get(slot);
+            if voxel.opacity_f32() > 0.01 {
+                *counts.entry(voxel.material_id()).or_insert(0) += 1;
+            }
+        }
+
+        // Sort by voxel count descending.
+        let mut usage: Vec<crate::inspector::MaterialUsage> = counts
+            .into_iter()
+            .map(|(material_id, voxel_count)| crate::inspector::MaterialUsage {
+                material_id,
+                voxel_count,
+            })
+            .collect();
+        usage.sort_by(|a, b| b.voxel_count.cmp(&a.voxel_count));
+        usage
+    }
+
+    /// Remap all voxels on an entity from one material to another.
+    /// Returns the number of voxels changed.
+    fn remap_entity_material(
+        &mut self,
+        entity: hecs::Entity,
+        from_material: u16,
+        to_material: u16,
+    ) -> u32 {
+        let renderable = match self.world.get::<&crate::components::Renderable>(entity) {
+            Ok(r) => r.clone(),
+            Err(_) => return 0,
+        };
+        let spatial = match &renderable.spatial {
+            Some(s) => s.clone(),
+            None => return 0,
+        };
+
+        // Collect leaf slots using absolute offsets in the packed buffer.
+        let all_nodes = self.scene_mgr.octree.data();
+        let mut leaf_slots = Vec::new();
+        collect_leaf_slots(all_nodes, spatial.root_offset as usize, &mut leaf_slots);
+
+        let mut count = 0u32;
+        for slot in leaf_slots {
+            let voxel = self.scene_mgr.voxel_pool.get(slot);
+            let primary = voxel.material_id();
+            let secondary = voxel.secondary_material_id();
+            let mut changed = false;
+
+            if primary == from_material {
+                let mut v = *voxel;
+                v.set_material_id(to_material);
+                *self.scene_mgr.voxel_pool.get_mut(slot) = v;
+                changed = true;
+            }
+            if secondary == from_material {
+                let mut v = *self.scene_mgr.voxel_pool.get(slot);
+                v.set_secondary_material_id(to_material);
+                *self.scene_mgr.voxel_pool.get_mut(slot) = v;
+                changed = true;
+            }
+            if changed {
+                count += 1;
+            }
+        }
+        count
     }
 
     fn poll_import_completions(&mut self) {
@@ -1184,17 +1473,49 @@ impl EngineState {
             if path.is_dir() {
                 Self::scan_rkp_recursive(&path, out);
             } else if path.extension().map(|e| e == "rkp").unwrap_or(false) {
-                let name = path.file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let rkp_path = path.to_string_lossy().into_owned();
+
+                // Try to find the source mesh file (the .rkp was generated from it).
+                // Convention: source.glb → source.rkp, so source = rkp with mesh extension.
+                let source_path = Self::find_source_for_rkp(&path);
+                let profile = source_path.as_ref().map(|sp| {
+                    crate::import_profile::ImportProfile::load_or_default(sp)
+                });
+
+                // Display name: profile override → filename stem.
+                let name = profile.as_ref()
+                    .and_then(|p| p.display_name.clone())
+                    .unwrap_or_else(|| {
+                        path.file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    });
+
                 out.push(crate::snapshot::ModelInfo {
                     name,
-                    path: path.to_string_lossy().into_owned(),
+                    path: rkp_path,
+                    source_path: source_path
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
                     size,
+                    import_profile: profile,
                 });
             }
         }
+    }
+
+    /// Find the source mesh file for a .rkp output.
+    /// Convention: bunny.rkp was generated from bunny.glb (or .gltf, .obj, .fbx).
+    fn find_source_for_rkp(rkp_path: &std::path::Path) -> Option<std::path::PathBuf> {
+        let stem = rkp_path.with_extension("");
+        for ext in &["glb", "gltf", "obj", "fbx"] {
+            let candidate = stem.with_extension(ext);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        None
     }
 
     fn clear_scene(&mut self) {
@@ -1208,6 +1529,7 @@ impl EngineState {
         self.selected_entity = None;
         self.geometry_dirty = true;
         self.scene_dirty = true;
+        self.gpu_objects_dirty = true;
     }
 
     fn load_scene_from_file(&mut self, path: &std::path::Path) {
@@ -1278,6 +1600,7 @@ impl EngineState {
                     }
                 }
                 self.scene_dirty = true;
+                self.gpu_objects_dirty = true;
             }
             Err(e) => eprintln!("[RkpEngine] load scene failed: {e}"),
         }
@@ -1341,6 +1664,7 @@ impl EngineState {
                     let new_pos = self.gizmo.initial_position + delta;
                     if let Ok(mut t) = self.world.get::<&mut crate::components::Transform>(selected) {
                         t.position = new_pos;
+                        self.gpu_objects_dirty = true;
                     }
                 }
                 crate::gizmo::GizmoMode::Rotate => {
@@ -1537,6 +1861,14 @@ impl EngineState {
                     .map(|e| e.name.to_string())
                     .collect()
             }),
+            materials: if self.material_lib.is_ui_dirty() {
+                self.material_lib.clear_ui_dirty();
+                Some(self.material_lib.build_info())
+            } else {
+                None
+            },
+            selected_material: self.selected_material,
+            selected_model: self.selected_model.clone(),
         }
     }
 }
