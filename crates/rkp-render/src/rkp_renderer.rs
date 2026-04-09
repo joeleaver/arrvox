@@ -33,7 +33,7 @@ pub struct RkpRenderer {
 impl RkpRenderer {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let scene = RkpScene::new(device);
-        let march = OctreeMarchPass::new(device, &scene.bind_group_layout);
+        let mut march = OctreeMarchPass::new(device, &scene.bind_group_layout);
         let shadow_ao = RkpShadowAoPass::new(device, &scene, width, height);
         let mut shade = RkpShadePass::new(device, width, height);
 
@@ -64,6 +64,7 @@ impl RkpRenderer {
 
         shade.set_shade_data(device, &shade_params_buffer, &lights_buffer, &materials_buffer);
         shade.set_camera(device, &scene.camera_buffer);
+        march.set_materials(device, &materials_buffer);
 
         Self {
             scene, march, shadow_ao, shade,
@@ -135,6 +136,7 @@ impl RkpRenderer {
                 &self.lights_buffer,
                 &self.materials_buffer,
             );
+            self.march.set_materials(&self.device, &self.materials_buffer);
         } else {
             queue.write_buffer(&self.materials_buffer, 0, data);
         }

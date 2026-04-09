@@ -37,6 +37,14 @@ struct CameraUniforms {
 
 struct MarchParams { object_count: u32, _pad0: u32, _pad1: u32, _pad2: u32, }
 
+struct GpuMaterial {
+    base_color: vec4<f32>,
+    metallic: f32,
+    roughness: f32,
+    emission_strength: f32,
+    opacity: f32,
+}
+
 struct OctreeResult { slot: u32, depth: u32, }
 
 // --- Bindings ---
@@ -52,6 +60,7 @@ struct OctreeResult { slot: u32, depth: u32, }
 @group(1) @binding(2) var gbuf_material: texture_storage_2d<rg32uint, write>;
 
 @group(2) @binding(0) var<uniform> march_params: MarchParams;
+@group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
 
 // --- Helpers ---
 
@@ -220,19 +229,26 @@ fn march_object(
             continue;
         }
 
-        var sample_opacity = 0.0;
+        var voxel_opacity = 0.0;
         var slot = 0u;
+        var mat_opacity = 1.0;
         if r.slot == OCTREE_INTERIOR {
-            sample_opacity = 1.0;
+            voxel_opacity = 1.0;
         } else {
             slot = r.slot;
-            sample_opacity = extract_opacity(voxel_pool[slot].word0);
+            voxel_opacity = extract_opacity(voxel_pool[slot].word0);
+            let mid = extract_material_id(voxel_pool[slot].word1);
+            mat_opacity = materials[mid].opacity;
         }
 
-        if sample_opacity < OPACITY_THRESHOLD {
+        // Threshold on raw voxel opacity (is this voxel occupied?).
+        // Material opacity only affects accumulation weight, not occupancy.
+        if voxel_opacity < OPACITY_THRESHOLD {
             t += vs * 0.5;
             continue;
         }
+
+        let sample_opacity = voxel_opacity * mat_opacity;
 
         // Front-to-back compositing.
         let remaining = 1.0 - result.alpha;
@@ -282,72 +298,111 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
     let ray_origin = camera.position.xyz;
     let ray_dir = normalize(camera.forward.xyz + ndc.x * camera.right.xyz + ndc.y * camera.up.xyz);
 
-    // March each object independently, pick closest.
-    var best_t = 1e20;
-    var best_result = MarchResult(vec3<f32>(0.0), vec3<f32>(0.0), 0.0, 0.0, 0u, false);
-    var best_obj_idx = 0u;
+    // March all objects, collect results.
+    var results: array<MarchResult, MAX_OBJECTS>;
+    var obj_indices: array<u32, MAX_OBJECTS>;
+    var result_count = 0u;
 
     let num_objects = march_params.object_count;
     for (var i = 0u; i < num_objects && i < MAX_OBJECTS; i++) {
         let obj = objects[i];
         if obj.geom_type == 0u { continue; }
-        let r = march_object(ray_origin, ray_dir, obj, best_t);
-        if r.valid && r.t < best_t {
-            best_t = r.t;
-            best_result = r;
-            best_obj_idx = i;
+        let r = march_object(ray_origin, ray_dir, obj, 1e20);
+        if r.valid {
+            results[result_count] = r;
+            obj_indices[result_count] = i;
+            result_count += 1u;
         }
     }
 
-    if !best_result.valid {
+    if result_count == 0u {
         textureStore(gbuf_position, coord, vec4<f32>(0.0, 0.0, 0.0, 1e10));
         textureStore(gbuf_normal, coord, vec4<f32>(0.0, 0.0, 0.0, 0.0));
         textureStore(gbuf_material, coord, vec4<u32>(0u, 0u, 0u, 0u));
         return;
     }
 
-    let obj = objects[best_obj_idx];
-    let extent = bitcast<f32>(obj.octree_extent_bits);
-    let vs = obj.voxel_size;
-
-    // Normalize accumulated position and color.
-    let inv_alpha = 1.0 / max(best_result.alpha, 0.001);
-    let final_oc_pos = best_result.oc_pos * inv_alpha;
-    let final_color = best_result.color * inv_alpha;
-
-    // World position from accumulated octree position.
-    let local_hit = final_oc_pos - vec3<f32>(extent * 0.5);
-    let world_hit = (obj.world * vec4<f32>(local_hit, 1.0)).xyz;
-    let hit_dist = length(world_hit - ray_origin);
-
-    // Gradient normal — computed ONCE at the final accumulated position.
-    let local_normal = compute_normal(final_oc_pos, obj.octree_root, obj.octree_depth, extent, vs);
-    let world_normal = normalize((obj.world * vec4<f32>(local_normal, 0.0)).xyz);
-
-    // Material from first hit.
-    var mat_id = obj.material_id;
-    var sec_mat = 0u;
-    var blend_w = 0u;
-    if best_result.first_slot != 0u {
-        let voxel = voxel_pool[best_result.first_slot];
-        mat_id = extract_material_id(voxel.word1);
-        sec_mat = extract_secondary_material_id(voxel.word1);
-        blend_w = extract_blend_weight(voxel.word0);
+    // Sort results front-to-back by entry t (insertion sort — few objects).
+    for (var i = 1u; i < result_count; i++) {
+        var j = i;
+        while j > 0u && results[j - 1u].t > results[j].t {
+            let tmp_r = results[j - 1u]; results[j - 1u] = results[j]; results[j] = tmp_r;
+            let tmp_i = obj_indices[j - 1u]; obj_indices[j - 1u] = obj_indices[j]; obj_indices[j] = tmp_i;
+            j -= 1u;
+        }
     }
 
-    // Pack color.
+    // Front-to-back composite across objects.
+    var accum_pos = vec3<f32>(0.0);
+    var accum_normal = vec3<f32>(0.0);
+    var accum_color = vec3<f32>(0.0);
+    var accum_alpha = 0.0;
+    var first_dist = 0.0;
+    var first_mat_id = 0u;
+    var first_sec_mat = 0u;
+    var first_blend = 0u;
+    var first_obj_id = 0u;
+    var have_first = false;
+
+    for (var i = 0u; i < result_count; i++) {
+        if accum_alpha > 0.99 { break; }
+
+        let r = results[i];
+        let oi = obj_indices[i];
+        let obj = objects[oi];
+        let extent = bitcast<f32>(obj.octree_extent_bits);
+        let vs = obj.voxel_size;
+
+        // Normalize this object's accumulated values.
+        let inv_a = 1.0 / max(r.alpha, 0.001);
+        let oc_pos = r.oc_pos * inv_a;
+        let color = r.color * inv_a;
+
+        // World position + normal for this object's contribution.
+        let local_hit = oc_pos - vec3<f32>(extent * 0.5);
+        let world_pos = (obj.world * vec4<f32>(local_hit, 1.0)).xyz;
+        let local_normal = compute_normal(oc_pos, obj.octree_root, obj.octree_depth, extent, vs);
+        let world_normal = normalize((obj.world * vec4<f32>(local_normal, 0.0)).xyz);
+
+        // Composite this object's contribution.
+        let remaining = 1.0 - accum_alpha;
+        let weight = r.alpha * remaining;
+        accum_pos += world_pos * weight;
+        accum_normal += world_normal * weight;
+        accum_color += color * weight;
+        accum_alpha += weight;
+
+        if !have_first {
+            first_dist = length(world_pos - ray_origin);
+            first_obj_id = obj.object_id;
+            if r.first_slot != 0u {
+                let voxel = voxel_pool[r.first_slot];
+                first_mat_id = extract_material_id(voxel.word1);
+                first_sec_mat = extract_secondary_material_id(voxel.word1);
+                first_blend = extract_blend_weight(voxel.word0);
+            } else {
+                first_mat_id = obj.material_id;
+            }
+            have_first = true;
+        }
+    }
+
+    let inv_alpha = 1.0 / max(accum_alpha, 0.001);
+    let final_pos = accum_pos * inv_alpha;
+    let final_normal = normalize(accum_normal);
+    let final_color = accum_color * inv_alpha;
+
     let cr = u32(clamp(final_color.r, 0.0, 1.0) * 31.0);
     let cg = u32(clamp(final_color.g, 0.0, 1.0) * 63.0);
     let cb = u32(clamp(final_color.b, 0.0, 1.0) * 31.0);
     let color_rgb565 = cr | (cg << 5u) | (cb << 11u);
 
-    let packed_r = (mat_id & 0xFFFFu) | ((sec_mat & 0xFFFFu) << 16u);
-    let packed_g = (blend_w & 0xFFu)
-                 | (((obj.object_id + 1u) & 0xFFu) << 8u)
+    let packed_r = (first_mat_id & 0xFFFFu) | ((first_sec_mat & 0xFFFFu) << 16u);
+    let packed_g = (first_blend & 0xFFu)
+                 | (((first_obj_id + 1u) & 0xFFu) << 8u)
                  | (color_rgb565 << 16u);
 
-    // Alpha in normal.w for soft silhouette compositing.
-    textureStore(gbuf_position, coord, vec4<f32>(world_hit, hit_dist));
-    textureStore(gbuf_normal, coord, vec4<f32>(world_normal, best_result.alpha));
+    textureStore(gbuf_position, coord, vec4<f32>(final_pos, first_dist));
+    textureStore(gbuf_normal, coord, vec4<f32>(final_normal, accum_alpha));
     textureStore(gbuf_material, coord, vec4<u32>(packed_r, packed_g, 0u, 0u));
 }

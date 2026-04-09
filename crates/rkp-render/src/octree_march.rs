@@ -21,12 +21,12 @@ pub struct OctreeMarchPass {
     gbuffer_bind_group_layout: wgpu::BindGroupLayout,
     /// G-buffer bind group. Rebuilt on resize.
     gbuffer_bind_group: Option<wgpu::BindGroup>,
-    /// Params bind group layout (group 2).
+    /// Params bind group layout (group 2: params uniform + materials storage).
     params_bind_group_layout: wgpu::BindGroupLayout,
     /// Params uniform buffer.
     params_buffer: wgpu::Buffer,
-    /// Params bind group.
-    params_bind_group: wgpu::BindGroup,
+    /// Params + materials bind group. Rebuilt when materials buffer changes.
+    params_bind_group: Option<wgpu::BindGroup>,
 }
 
 impl OctreeMarchPass {
@@ -48,20 +48,32 @@ impl OctreeMarchPass {
                 ],
             });
 
-        // Group 2: march params.
+        // Group 2: march params + materials palette.
         let params_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("march params layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
             });
 
         let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -69,15 +81,6 @@ impl OctreeMarchPass {
             size: std::mem::size_of::<MarchParams>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
-
-        let params_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("march params bind group"),
-            layout: &params_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: params_buffer.as_entire_binding(),
-            }],
         });
 
         // Pipeline.
@@ -112,8 +115,26 @@ impl OctreeMarchPass {
             gbuffer_bind_group: None,
             params_bind_group_layout,
             params_buffer,
-            params_bind_group,
+            params_bind_group: None,
         }
+    }
+
+    /// Set the materials buffer. Call after materials are uploaded/resized.
+    pub fn set_materials(&mut self, device: &wgpu::Device, materials_buffer: &wgpu::Buffer) {
+        self.params_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("march params+materials bind group"),
+            layout: &self.params_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: materials_buffer.as_entire_binding(),
+                },
+            ],
+        }));
     }
 
     /// Set the G-buffer textures. Call on init and after resize.
@@ -155,7 +176,7 @@ impl OctreeMarchPass {
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
 
         // Dispatch.
-        if let Some(ref gbuffer_bg) = self.gbuffer_bind_group {
+        if let (Some(gbuffer_bg), Some(params_bg)) = (&self.gbuffer_bind_group, &self.params_bind_group) {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("octree_march"),
                 timestamp_writes: None,
@@ -163,7 +184,7 @@ impl OctreeMarchPass {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, scene_bind_group, &[]);
             pass.set_bind_group(1, gbuffer_bg, &[]);
-            pass.set_bind_group(2, &self.params_bind_group, &[]);
+            pass.set_bind_group(2, params_bg, &[]);
             pass.dispatch_workgroups(
                 (width + 7) / 8,
                 (height + 7) / 8,
