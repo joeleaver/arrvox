@@ -164,11 +164,25 @@ fn compute_normal(pos: vec3<f32>, root: u32, depth: u32, extent: f32, vs: f32) -
     return -grad / len;
 }
 
-// --- March ---
+// --- Accumulating march (per object) ---
+//
+// Front-to-back opacity accumulation within a single object. Accumulates
+// position and color (cheap). Normal computed ONCE at the end (expensive).
 
-struct MarchHit { t: f32, oc_pos: vec3<f32>, slot: u32, valid: bool, }
+struct MarchResult {
+    oc_pos: vec3<f32>,       // weighted average octree-space position
+    color: vec3<f32>,        // weighted average color
+    alpha: f32,              // total accumulated opacity
+    t: f32,                  // parameter of first contribution
+    first_slot: u32,         // voxel slot of first hit (for material)
+    valid: bool,
+}
 
-fn march_object(world_origin: vec3<f32>, world_dir: vec3<f32>, obj: RkpObject, max_t: f32) -> MarchHit {
+fn march_object(
+    world_origin: vec3<f32>, world_dir: vec3<f32>, obj: RkpObject, max_t: f32,
+) -> MarchResult {
+    var result = MarchResult(vec3<f32>(0.0), vec3<f32>(0.0), 0.0, 0.0, 0u, false);
+
     let inv_world = invert_rigid(obj.world);
     let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
     let local_dir = normalize((inv_world * vec4<f32>(world_dir, 0.0)).xyz);
@@ -180,46 +194,79 @@ fn march_object(world_origin: vec3<f32>, world_dir: vec3<f32>, obj: RkpObject, m
     let half_ext = extent * 0.5;
 
     let oc_origin = local_origin + vec3<f32>(half_ext);
-    let oc_dir = local_dir;
     let safe_dir = vec3<f32>(
-        select(oc_dir.x, select(-1e-10, 1e-10, oc_dir.x >= 0.0), abs(oc_dir.x) < 1e-10),
-        select(oc_dir.y, select(-1e-10, 1e-10, oc_dir.y >= 0.0), abs(oc_dir.y) < 1e-10),
-        select(oc_dir.z, select(-1e-10, 1e-10, oc_dir.z >= 0.0), abs(oc_dir.z) < 1e-10),
+        select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),
+        select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),
+        select(local_dir.z, select(-1e-10, 1e-10, local_dir.z >= 0.0), abs(local_dir.z) < 1e-10),
     );
     let inv_dir = 1.0 / safe_dir;
 
     let t_range = intersect_aabb(oc_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(extent));
-    if t_range.x > t_range.y { return MarchHit(0.0, vec3<f32>(0.0), 0u, false); }
+    if t_range.x > t_range.y || t_range.x > max_t {
+        return result;
+    }
 
     var t = t_range.x;
 
     for (var step = 0u; step < MAX_STEPS; step++) {
         if t > t_range.y || t > max_t { break; }
+        if result.alpha > 0.99 { break; }
 
         let pos = clamp(oc_origin + safe_dir * t, vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
-        let result = octree_lookup(root, max_depth, extent, pos);
+        let r = octree_lookup(root, max_depth, extent, pos);
 
-        if result.slot == OCTREE_EMPTY {
-            t += skip_node(pos, safe_dir, inv_dir, result.depth, extent, vs);
+        if r.slot == OCTREE_EMPTY {
+            t += skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs);
             continue;
         }
 
-        if result.slot == OCTREE_INTERIOR {
-            // Fully opaque — surface at this point.
-            return MarchHit(t, pos, 0u, true);
+        var sample_opacity = 0.0;
+        var slot = 0u;
+        if r.slot == OCTREE_INTERIOR {
+            sample_opacity = 1.0;
+        } else {
+            slot = r.slot;
+            sample_opacity = extract_opacity(voxel_pool[slot].word0);
         }
 
-        // Leaf — check opacity.
-        let opacity = extract_opacity(voxel_pool[result.slot].word0);
-        if opacity > OPACITY_THRESHOLD {
-            return MarchHit(t, pos, result.slot, true);
+        if sample_opacity < OPACITY_THRESHOLD {
+            t += vs * 0.5;
+            continue;
         }
 
-        // Low-opacity leaf — step through it.
+        // Front-to-back compositing.
+        let remaining = 1.0 - result.alpha;
+        let weight = sample_opacity * remaining;
+
+        // Accumulate position (octree space — cheap, no transform).
+        result.oc_pos += pos * weight;
+
+        // Accumulate per-voxel color.
+        var color = vec3<f32>(0.5);
+        if slot != 0u {
+            let cp = color_pool_data[slot];
+            if cp != 0u {
+                color = vec3<f32>(
+                    f32(cp & 0xFFu) / 255.0,
+                    f32((cp >> 8u) & 0xFFu) / 255.0,
+                    f32((cp >> 16u) & 0xFFu) / 255.0,
+                );
+            }
+        }
+        result.color += color * weight;
+        result.alpha += weight;
+
+        // First hit — record for depth and material.
+        if !result.valid {
+            result.t = t;
+            result.first_slot = slot;
+            result.valid = true;
+        }
+
         t += vs * 0.5;
     }
 
-    return MarchHit(0.0, vec3<f32>(0.0), 0u, false);
+    return result;
 }
 
 // --- Main ---
@@ -235,23 +282,24 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
     let ray_origin = camera.position.xyz;
     let ray_dir = normalize(camera.forward.xyz + ndc.x * camera.right.xyz + ndc.y * camera.up.xyz);
 
+    // March each object independently, pick closest.
     var best_t = 1e20;
-    var best_hit = MarchHit(0.0, vec3<f32>(0.0), 0u, false);
+    var best_result = MarchResult(vec3<f32>(0.0), vec3<f32>(0.0), 0.0, 0.0, 0u, false);
     var best_obj_idx = 0u;
 
     let num_objects = march_params.object_count;
     for (var i = 0u; i < num_objects && i < MAX_OBJECTS; i++) {
         let obj = objects[i];
         if obj.geom_type == 0u { continue; }
-        let hit = march_object(ray_origin, ray_dir, obj, best_t);
-        if hit.valid && hit.t < best_t {
-            best_t = hit.t;
-            best_hit = hit;
+        let r = march_object(ray_origin, ray_dir, obj, best_t);
+        if r.valid && r.t < best_t {
+            best_t = r.t;
+            best_result = r;
             best_obj_idx = i;
         }
     }
 
-    if !best_hit.valid {
+    if !best_result.valid {
         textureStore(gbuf_position, coord, vec4<f32>(0.0, 0.0, 0.0, 1e10));
         textureStore(gbuf_normal, coord, vec4<f32>(0.0, 0.0, 0.0, 0.0));
         textureStore(gbuf_material, coord, vec4<u32>(0u, 0u, 0u, 0u));
@@ -260,38 +308,46 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
 
     let obj = objects[best_obj_idx];
     let extent = bitcast<f32>(obj.octree_extent_bits);
-    let local_hit = best_hit.oc_pos - vec3<f32>(extent * 0.5);
+    let vs = obj.voxel_size;
+
+    // Normalize accumulated position and color.
+    let inv_alpha = 1.0 / max(best_result.alpha, 0.001);
+    let final_oc_pos = best_result.oc_pos * inv_alpha;
+    let final_color = best_result.color * inv_alpha;
+
+    // World position from accumulated octree position.
+    let local_hit = final_oc_pos - vec3<f32>(extent * 0.5);
     let world_hit = (obj.world * vec4<f32>(local_hit, 1.0)).xyz;
     let hit_dist = length(world_hit - ray_origin);
 
-    let local_normal = compute_normal(
-        best_hit.oc_pos, obj.octree_root, obj.octree_depth, extent, obj.voxel_size,
-    );
+    // Gradient normal — computed ONCE at the final accumulated position.
+    let local_normal = compute_normal(final_oc_pos, obj.octree_root, obj.octree_depth, extent, vs);
     let world_normal = normalize((obj.world * vec4<f32>(local_normal, 0.0)).xyz);
 
+    // Material from first hit.
     var mat_id = obj.material_id;
     var sec_mat = 0u;
-    var blend = 0u;
-    var color_rgb565 = 0u;
-
-    if best_hit.slot != 0u {
-        let voxel = voxel_pool[best_hit.slot];
+    var blend_w = 0u;
+    if best_result.first_slot != 0u {
+        let voxel = voxel_pool[best_result.first_slot];
         mat_id = extract_material_id(voxel.word1);
         sec_mat = extract_secondary_material_id(voxel.word1);
-        blend = extract_blend_weight(voxel.word0);
-        let color_packed = color_pool_data[best_hit.slot];
-        if color_packed != 0u {
-            let cr = (color_packed & 0xFFu) >> 3u;
-            let cg = ((color_packed >> 8u) & 0xFFu) >> 2u;
-            let cb = ((color_packed >> 16u) & 0xFFu) >> 3u;
-            color_rgb565 = cr | (cg << 5u) | (cb << 11u);
-        }
+        blend_w = extract_blend_weight(voxel.word0);
     }
 
-    let packed_r = (mat_id & 0xFFFFu) | ((sec_mat & 0xFFFFu) << 16u);
-    let packed_g = (blend & 0xFFu) | (((obj.object_id + 1u) & 0xFFu) << 8u) | (color_rgb565 << 16u);
+    // Pack color.
+    let cr = u32(clamp(final_color.r, 0.0, 1.0) * 31.0);
+    let cg = u32(clamp(final_color.g, 0.0, 1.0) * 63.0);
+    let cb = u32(clamp(final_color.b, 0.0, 1.0) * 31.0);
+    let color_rgb565 = cr | (cg << 5u) | (cb << 11u);
 
+    let packed_r = (mat_id & 0xFFFFu) | ((sec_mat & 0xFFFFu) << 16u);
+    let packed_g = (blend_w & 0xFFu)
+                 | (((obj.object_id + 1u) & 0xFFu) << 8u)
+                 | (color_rgb565 << 16u);
+
+    // Alpha in normal.w for soft silhouette compositing.
     textureStore(gbuf_position, coord, vec4<f32>(world_hit, hit_dist));
-    textureStore(gbuf_normal, coord, vec4<f32>(world_normal, 0.0));
+    textureStore(gbuf_normal, coord, vec4<f32>(world_normal, best_result.alpha));
     textureStore(gbuf_material, coord, vec4<u32>(packed_r, packed_g, 0u, 0u));
 }
