@@ -149,6 +149,22 @@ fn octree_sample_opacity(local_pos: vec3<f32>, root: u32, depth: u32, extent: f3
     return 0.0;
 }
 
+fn sample_trilinear(pos: vec3<f32>, root: u32, depth: u32, extent: f32, vs: f32) -> f32 {
+    let h = vs * 0.5;
+    let s000 = octree_sample_opacity(pos + vec3(-h,-h,-h), root, depth, extent);
+    let s100 = octree_sample_opacity(pos + vec3( h,-h,-h), root, depth, extent);
+    let s010 = octree_sample_opacity(pos + vec3(-h, h,-h), root, depth, extent);
+    let s110 = octree_sample_opacity(pos + vec3( h, h,-h), root, depth, extent);
+    let s001 = octree_sample_opacity(pos + vec3(-h,-h, h), root, depth, extent);
+    let s101 = octree_sample_opacity(pos + vec3( h,-h, h), root, depth, extent);
+    let s011 = octree_sample_opacity(pos + vec3(-h, h, h), root, depth, extent);
+    let s111 = octree_sample_opacity(pos + vec3( h, h, h), root, depth, extent);
+    let f = fract(pos / vs + 0.5);
+    let x0 = mix(s000, s100, f.x); let x1 = mix(s010, s110, f.x);
+    let x2 = mix(s001, s101, f.x); let x3 = mix(s011, s111, f.x);
+    return mix(mix(x0, x1, f.y), mix(x2, x3, f.y), f.z);
+}
+
 // --- Shadow ray ---
 
 /// March a ray through the opacity field accumulating transmittance.

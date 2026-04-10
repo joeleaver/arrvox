@@ -171,33 +171,16 @@ fn sample_trilinear(pos: vec3<f32>, root: u32, depth: u32, extent: f32, vs: f32)
     return mix(mix(x0, x1, f.y), mix(x2, x3, f.y), f.z);
 }
 
-// Analytical gradient from 8-corner trilinear — only 8 octree lookups (vs 48 for finite differences).
+// Gradient normal via 6-tap central differences of the smooth trilinear field.
 fn compute_normal(pos: vec3<f32>, root: u32, depth: u32, extent: f32, vs: f32) -> vec3<f32> {
-    let h = vs * 0.5;
-    let s000 = sample_opacity(pos + vec3(-h,-h,-h), root, depth, extent);
-    let s100 = sample_opacity(pos + vec3( h,-h,-h), root, depth, extent);
-    let s010 = sample_opacity(pos + vec3(-h, h,-h), root, depth, extent);
-    let s110 = sample_opacity(pos + vec3( h, h,-h), root, depth, extent);
-    let s001 = sample_opacity(pos + vec3(-h,-h, h), root, depth, extent);
-    let s101 = sample_opacity(pos + vec3( h,-h, h), root, depth, extent);
-    let s011 = sample_opacity(pos + vec3(-h, h, h), root, depth, extent);
-    let s111 = sample_opacity(pos + vec3( h, h, h), root, depth, extent);
-
-    // Trilinear polynomial coefficients.
-    let c1 = s100 - s000;
-    let c2 = s010 - s000;
-    let c3 = s001 - s000;
-    let c4 = s110 - s100 - s010 + s000;
-    let c5 = s101 - s100 - s001 + s000;
-    let c6 = s011 - s010 - s001 + s000;
-    let c7 = s111 - s110 - s101 - s011 + s100 + s010 + s001 - s000;
-
-    let f = fract(pos / vs + 0.5);
-    let grad = vec3<f32>(
-        c1 + c4 * f.y + c5 * f.z + c7 * f.y * f.z,
-        c2 + c4 * f.x + c6 * f.z + c7 * f.x * f.z,
-        c3 + c5 * f.x + c6 * f.y + c7 * f.x * f.y,
-    );
+    let eps = vs * 0.5;
+    let gx = sample_trilinear(pos + vec3(eps,0.0,0.0), root, depth, extent, vs)
+           - sample_trilinear(pos - vec3(eps,0.0,0.0), root, depth, extent, vs);
+    let gy = sample_trilinear(pos + vec3(0.0,eps,0.0), root, depth, extent, vs)
+           - sample_trilinear(pos - vec3(0.0,eps,0.0), root, depth, extent, vs);
+    let gz = sample_trilinear(pos + vec3(0.0,0.0,eps), root, depth, extent, vs)
+           - sample_trilinear(pos - vec3(0.0,0.0,eps), root, depth, extent, vs);
+    let grad = vec3<f32>(gx, gy, gz);
     let len = length(grad);
     if len < 1e-8 { return vec3<f32>(0.0, 1.0, 0.0); }
     return -grad / len;

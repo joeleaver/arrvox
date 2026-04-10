@@ -103,6 +103,12 @@ pub fn Viewport() -> NodeHandle {
                 let _ = cmd_tx.send(rkp_engine::EngineCommand::Scroll { delta: delta_y });
             }
             KeyDown(key_data) => {
+                // Delete key → delete selected entity.
+                if key_data.code == "Delete" || key_data.code == "Backspace" {
+                    if let Some(entity_id) = store.selected_entity.get() {
+                        let _ = cmd_tx.send(rkp_engine::EngineCommand::DeleteObject { entity_id });
+                    }
+                }
                 if let Some(key) = map_key(&key_data.code) {
                     let _ = cmd_tx.send(rkp_engine::EngineCommand::KeyDown { key });
                 }

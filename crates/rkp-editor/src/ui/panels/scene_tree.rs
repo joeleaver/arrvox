@@ -1,7 +1,7 @@
 //! Scene tree panel — hierarchical view of scene objects.
 //!
 //! Renders root objects (no parent) at the top level, with children
-//! nested below their parents. Supports click-to-select.
+//! nested below their parents. Right-click for context menu.
 
 use rinch::prelude::*;
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
@@ -13,8 +13,9 @@ use rkp_engine::SceneObjectInfo;
 #[component]
 pub fn SceneTree() -> NodeHandle {
     let store = use_context::<EditorStore>();
+    // Context menu: which entity UUID to show actions for (None = closed).
+    let ctx_entity = Signal::new(None::<uuid::Uuid>);
 
-    // Only show root objects (no parent) at top level.
     let roots = Memo::new(move || {
         store.objects.get().into_iter()
             .filter(|o| o.parent_id.is_none())
@@ -23,47 +24,52 @@ pub fn SceneTree() -> NodeHandle {
 
     rsx! {
         div {
-            style: "display:flex;flex-direction:column;height:100%;overflow-y:auto;",
+            style: "display:flex;flex-direction:column;height:100%;overflow-y:auto;position:relative;",
+            // Close context menu on left-click background.
+            onclick: move || ctx_entity.set(None),
             div {
                 style: "flex:1;padding:4px;",
                 for obj in roots.get() {
-                    SceneTreeNode {
-                        key: obj.id.to_string(),
-                        object: obj.clone(),
-                        depth: "0".to_string(),
-                    }
+                    {tree_node(__scope, &obj, 0, store, ctx_entity)}
                 }
+            }
+
+            // Context menu overlay
+            if ctx_entity.get().is_some() {
+                {context_menu_overlay(__scope, ctx_entity)}
             }
         }
     }
 }
 
-#[component]
-fn SceneTreeNode(object: SceneObjectInfo, depth: String) -> NodeHandle {
-    let store = use_context::<EditorStore>();
-    let cmd = use_context::<CommandSender>();
+/// Render a single tree node + its children recursively.
+fn tree_node(
+    __scope: &mut rinch::core::dom::RenderScope,
+    object: &SceneObjectInfo,
+    depth: u32,
+    store: EditorStore,
+    ctx_entity: Signal<Option<uuid::Uuid>>,
+) -> rinch::core::dom::NodeHandle {
+    let cmd_tx = Signal::new(use_context::<CommandSender>().0);
     let id = object.id;
     let name = object.name.clone();
     let collapsed = Signal::new(false);
+    let indent = depth as f32 * 16.0;
 
     let icon = if object.is_camera { TablerIcon::Camera }
         else if object.is_light { TablerIcon::Bulb }
         else { TablerIcon::Cube };
 
-    // Find children of this object.
     let children = Memo::new(move || {
         store.objects.get().into_iter()
             .filter(|o| o.parent_id == Some(id))
             .collect::<Vec<_>>()
     });
-
     let has_children = Memo::new(move || !children.get().is_empty());
-    let depth_val: u32 = depth.parse().unwrap_or(0);
-    let indent = depth_val as f32 * 16.0;
 
     rsx! {
         div {
-            // This node
+            // Node row
             div {
                 style: {
                     move || {
@@ -77,10 +83,14 @@ fn SceneTreeNode(object: SceneObjectInfo, depth: String) -> NodeHandle {
                     }
                 },
                 onclick: move || {
-                    cmd.0.send(rkp_engine::EngineCommand::SelectEntity { entity_id: id }).ok();
+                    let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SelectEntity { entity_id: id });
+                },
+                oncontextmenu: move || {
+                    let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SelectEntity { entity_id: id });
+                    ctx_entity.set(Some(id));
                 },
 
-                // Expand/collapse chevron (only if has children)
+                // Chevron
                 if has_children.get() {
                     span {
                         style: {move || {
@@ -111,14 +121,66 @@ fn SceneTreeNode(object: SceneObjectInfo, depth: String) -> NodeHandle {
                 span { style: "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;", {name} }
             }
 
-            // Children (hidden when collapsed)
+            // Children
             if !collapsed.get() {
                 for child in children.get() {
-                    SceneTreeNode {
-                        key: child.id.to_string(),
-                        object: child.clone(),
-                        depth: (depth_val + 1).to_string(),
-                    }
+                    {tree_node(__scope, &child, depth + 1, store, ctx_entity)}
+                }
+            }
+        }
+    }
+}
+
+/// Context menu overlay: backdrop + menu items.
+fn context_menu_overlay(
+    __scope: &mut rinch::core::dom::RenderScope,
+    ctx_entity: Signal<Option<uuid::Uuid>>,
+) -> rinch::core::dom::NodeHandle {
+    let cmd_tx = Signal::new(use_context::<CommandSender>().0);
+
+    rsx! {
+        div {
+            // Backdrop
+            div {
+                style: "position:absolute;inset:0;z-index:999;",
+                onclick: move || ctx_entity.set(None),
+            }
+            // Menu
+            div {
+                style: "position:absolute;right:8px;top:40px;z-index:1000;\
+                        background:#2d2d2d;border:1px solid #3c3c3c;border-radius:4px;\
+                        box-shadow:0 4px 12px rgba(0,0,0,0.5);min-width:140px;\
+                        padding:4px 0;",
+
+                // Duplicate
+                div {
+                    style: "padding:6px 16px;cursor:pointer;font-size:12px;color:#ccc;",
+                    onclick: move || {
+                        if let Some(eid) = ctx_entity.get() {
+                            let _ = cmd_tx.get().send(rkp_engine::EngineCommand::DuplicateObject {
+                                entity_id: eid,
+                            });
+                        }
+                        ctx_entity.set(None);
+                    },
+                    {"Duplicate"}
+                }
+
+                // Separator
+                div { style: "height:1px;background:#3c3c3c;margin:4px 0;" }
+
+                // Delete
+                div {
+                    style: "padding:6px 16px;cursor:pointer;font-size:12px;color:#ef5350;",
+                    onclick: move || {
+                        if let Some(eid) = ctx_entity.get() {
+                            let _ = cmd_tx.get().send(rkp_engine::EngineCommand::DeleteObject {
+                                entity_id: eid,
+                            });
+                        }
+                        ctx_entity.set(None);
+                    },
+                    {"Delete"}
                 }
             }
         }

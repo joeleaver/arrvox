@@ -805,6 +805,18 @@ impl EngineState {
                 self.selected_entity = self.resolve_entity(&entity_id);
             }
 
+            EngineCommand::DeleteObject { entity_id } => {
+                if let Some(entity) = self.resolve_entity(&entity_id) {
+                    self.delete_entity(entity);
+                }
+            }
+
+            EngineCommand::DuplicateObject { entity_id } => {
+                if let Some(entity) = self.resolve_entity(&entity_id) {
+                    self.duplicate_entity(entity);
+                }
+            }
+
             EngineCommand::NewProject { path } => {
                 let path = std::path::PathBuf::from(&path);
                 match crate::project::create_project(&path) {
@@ -1601,6 +1613,123 @@ impl EngineState {
             }
         }
         None
+    }
+
+    /// Delete an entity and clean up all associated data.
+    fn delete_entity(&mut self, entity: hecs::Entity) {
+        // Get name for logging.
+        let name = self.world.get::<&crate::components::EditorMetadata>(entity)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|_| "unknown".into());
+
+        // Deallocate octree if entity has spatial data.
+        if let Ok(renderable) = self.world.get::<&crate::components::Renderable>(entity) {
+            if let Some(ref spatial) = renderable.spatial {
+                let handle = rkp_core::OctreeHandle {
+                    root_offset: spatial.root_offset,
+                    len: spatial.len,
+                    depth: spatial.depth,
+                    base_voxel_size: spatial.base_voxel_size,
+                };
+                self.scene_mgr.octree.deallocate(handle);
+            }
+        }
+
+        // Clear selection if this was selected.
+        if self.selected_entity == Some(entity) {
+            self.selected_entity = None;
+        }
+
+        // Reparent children to root (remove Parent component).
+        let entity_uuid = self.entity_uuids.get(&entity).copied();
+        if let Some(uuid) = entity_uuid {
+            let children: Vec<hecs::Entity> = self.world
+                .query::<&crate::components::Parent>()
+                .iter()
+                .filter(|(_, p)| p.parent_id == uuid)
+                .map(|(e, _)| e)
+                .collect();
+            for child in children {
+                let _ = self.world.remove_one::<crate::components::Parent>(child);
+            }
+        }
+
+        // Remove UUID mappings.
+        if let Some(uuid) = self.entity_uuids.remove(&entity) {
+            self.uuid_to_entity.remove(&uuid);
+        }
+        self.entity_scene_ids.remove(&entity);
+
+        // Despawn from ECS.
+        let _ = self.world.despawn(entity);
+
+        self.console.info(format!("Deleted '{name}'"));
+        self.geometry_dirty = true;
+        self.scene_dirty = true;
+        self.gpu_objects_dirty = true;
+    }
+
+    /// Duplicate an entity (deep copy of all components).
+    fn duplicate_entity(&mut self, source: hecs::Entity) {
+        use crate::components::*;
+
+        let name = self.world.get::<&EditorMetadata>(source)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|_| "unknown".into());
+        let new_name = self.unique_name(&name);
+
+        // Read components from source.
+        let transform = self.world.get::<&Transform>(source)
+            .map(|t| (*t).clone())
+            .unwrap_or_else(|_| Transform::default());
+        let renderable = self.world.get::<&Renderable>(source)
+            .map(|r| (*r).clone())
+            .ok();
+        let point_light = self.world.get::<&PointLight>(source)
+            .map(|l| (*l).clone())
+            .ok();
+        let camera = self.world.get::<&Camera>(source)
+            .map(|c| (*c).clone())
+            .ok();
+        let parent = self.world.get::<&Parent>(source)
+            .map(|p| (*p).clone())
+            .ok();
+
+        // Offset the duplicate slightly so it's visible.
+        let mut new_transform = transform;
+        new_transform.position += glam::Vec3::new(0.5, 0.0, 0.5);
+
+        // Spawn the new entity with the same components.
+        let entity = self.world.spawn((
+            new_transform,
+            EditorMetadata { name: new_name.clone() },
+        ));
+
+        if let Some(r) = renderable {
+            // Sharing the spatial data is fine — voxels are immutable once created.
+            // The duplicate gets its own scene_id for face emission.
+            let scene_id = self.next_scene_id;
+            self.next_scene_id += 1;
+            self.entity_scene_ids.insert(entity, scene_id);
+            let _ = self.world.insert_one(entity, r);
+        }
+        if let Some(l) = point_light {
+            let _ = self.world.insert_one(entity, l);
+        }
+        if let Some(c) = camera {
+            let _ = self.world.insert_one(entity, c);
+        }
+        if let Some(p) = parent {
+            let _ = self.world.insert_one(entity, p);
+        }
+
+        self.assign_entity_uuid(entity);
+        self.selected_entity = Some(entity);
+
+        self.console.info(format!("Duplicated '{name}' → '{new_name}'"));
+        self.geometry_dirty = true;
+        self.scene_dirty = true;
+        self.gpu_objects_dirty = true;
     }
 
     fn clear_scene(&mut self) {
