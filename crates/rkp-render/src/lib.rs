@@ -16,8 +16,8 @@ pub mod gpu_profiler;
 pub mod rkp_gpu_object;
 /// Scene GPU buffer management — single upload path for all data.
 pub mod rkp_scene;
-/// Shadow + AO compute pass — half-res octree tracing.
-pub mod rkp_shadow_ao;
+/// Screen-space ambient occlusion compute pass — half-res.
+pub mod rkp_ssao;
 /// Deferred PBR shading compute pass.
 pub mod rkp_shade;
 /// Frame renderer — orchestrates the full pipeline.
@@ -29,3 +29,23 @@ pub use voxelize_opacity::import_mesh_to_opacity_rkf;
 pub use voxelize_opacity::import_mesh_to_opacity_rkp;
 pub use octree_gpu::OctreeGpu;
 pub use rkp_scene_manager::RkpSceneManager;
+
+/// Validate WGSL source with naga at startup. Panics with a clear error message
+/// on shader bugs instead of producing cryptic "pipeline invalid" GPU errors.
+pub fn validate_wgsl(source: &str, label: &str) {
+    match naga::front::wgsl::parse_str(source) {
+        Ok(module) => {
+            let mut validator = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            );
+            if let Err(e) = validator.validate(&module) {
+                eprintln!("[{label}] WGSL validation error: {e}");
+            }
+        }
+        Err(e) => {
+            let msg = e.emit_to_string(source);
+            eprintln!("[{label}] WGSL parse error:\n{msg}");
+        }
+    }
+}

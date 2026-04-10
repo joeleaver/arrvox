@@ -4992,6 +4992,8 @@ dependencies = [
  "dirs",
  "glam 0.29.3",
  "hecs",
+ "inventory",
+ "libloading",
  "log",
  "notify",
  "rkf-core",
@@ -4999,11 +5001,34 @@ dependencies = [
  "rkf-render",
  "rkf-runtime",
  "rkp-core",
+ "rkp-macros",
  "rkp-render",
  "serde",
  "serde_json",
  "uuid",
  "wgpu 29.0.1",
+]
+
+[[package]]
+name = "rkp-gameplay"
+version = "0.1.0"
+dependencies = [
+ "glam 0.29.3",
+ "hecs",
+ "inventory",
+ "rkp-engine",
+ "rkp-macros",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rkp-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5015,6 +5040,7 @@ dependencies = [
  "glam 0.29.3",
  "half",
  "log",
+ "naga 29.0.1",
  "pollster",
  "rayon",
  "rkf-animation",

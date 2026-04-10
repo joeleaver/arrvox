@@ -14,6 +14,8 @@ pub struct SceneFile {
     pub camera: CameraState,
     #[serde(default)]
     pub lights: Vec<SceneLight>,
+    #[serde(default)]
+    pub environment: Option<EnvironmentState>,
 }
 
 /// An object in the scene.
@@ -24,12 +26,44 @@ pub struct SceneObject {
     pub position: [f32; 3],
     pub rotation: [f32; 3],
     pub scale: [f32; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<Uuid>,
     /// Path to the .rkp asset file (relative to project assets/).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset_path: Option<String>,
     /// Primitive type if this is an analytical object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primitive: Option<String>,
+    #[serde(default)]
     pub material_id: u16,
+    /// PointLight component data (if entity has one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_light: Option<ScenePointLight>,
+    /// Camera component data (if entity has one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<SceneCamera>,
+    /// Generic component data — maps component name → JSON string.
+    /// Used for gameplay components and any components not covered by
+    /// the hardcoded fields above.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub components: std::collections::HashMap<String, String>,
+}
+
+/// Saved PointLight component.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScenePointLight {
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub range: f32,
+}
+
+/// Saved Camera component.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SceneCamera {
+    pub fov: f32,
+    pub near: f32,
+    pub far: f32,
+    pub active: bool,
 }
 
 /// Camera state stored in a scene.
@@ -52,15 +86,31 @@ impl Default for CameraState {
     }
 }
 
-/// A light in the scene.
+/// A light in the scene (legacy format — new scenes use components on SceneObject).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SceneLight {
     pub id: Uuid,
     pub name: String,
-    pub light_type: String, // "point" or "spot"
+    pub light_type: String,
     pub position: [f32; 3],
     pub intensity: f32,
     pub range: f32,
+}
+
+/// Saved environment settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvironmentState {
+    pub sky_color_top: [f32; 3],
+    pub sky_color_horizon: [f32; 3],
+    pub ambient_intensity: f32,
+    pub sun_azimuth: f32,
+    pub sun_elevation: f32,
+    pub sun_color: [f32; 3],
+    pub sun_intensity: f32,
+    pub shadow_steps: u32,
+    pub ao_radius: f32,
+    pub ao_steps: u32,
+    pub exposure: f32,
 }
 
 impl SceneFile {
@@ -69,6 +119,41 @@ impl SceneFile {
             objects: Vec::new(),
             camera: CameraState::default(),
             lights: Vec::new(),
+            environment: None,
+        }
+    }
+}
+
+impl EnvironmentState {
+    pub fn from_settings(env: &crate::environment::EnvironmentSettings) -> Self {
+        Self {
+            sky_color_top: env.sky_color_top,
+            sky_color_horizon: env.sky_color_horizon,
+            ambient_intensity: env.ambient_intensity,
+            sun_azimuth: env.sun_azimuth,
+            sun_elevation: env.sun_elevation,
+            sun_color: env.sun_color,
+            sun_intensity: env.sun_intensity,
+            shadow_steps: env.shadow_steps,
+            ao_radius: env.ao_radius,
+            ao_steps: env.ao_steps,
+            exposure: env.exposure,
+        }
+    }
+
+    pub fn to_settings(&self) -> crate::environment::EnvironmentSettings {
+        crate::environment::EnvironmentSettings {
+            sky_color_top: self.sky_color_top,
+            sky_color_horizon: self.sky_color_horizon,
+            ambient_intensity: self.ambient_intensity,
+            sun_azimuth: self.sun_azimuth,
+            sun_elevation: self.sun_elevation,
+            sun_color: self.sun_color,
+            sun_intensity: self.sun_intensity,
+            shadow_steps: self.shadow_steps,
+            ao_radius: self.ao_radius,
+            ao_steps: self.ao_steps,
+            exposure: self.exposure,
         }
     }
 }

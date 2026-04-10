@@ -236,6 +236,8 @@ struct EngineState {
 
     /// Console log buffer.
     console: crate::console::ConsoleLog,
+    /// Gameplay dylib loader (hot-reload).
+    gameplay_loader: crate::gameplay_loader::GameplayLoader,
 
     /// File watcher for hot-reload (watches project assets/ directory).
     file_watcher: Option<crate::file_watcher::RkpFileWatcher>,
@@ -375,6 +377,7 @@ impl EngineState {
             environment: crate::environment::EnvironmentSettings::default(),
             environment_dirty: true, // upload on first frame
             console: crate::console::ConsoleLog::new(),
+            gameplay_loader: crate::gameplay_loader::GameplayLoader::new(),
             file_watcher: None,
             import_worker: crate::import_worker::ImportWorker::new(),
             geometry_dirty: false,
@@ -453,10 +456,16 @@ impl EngineState {
 
         let t_upload = frame_start.elapsed();
 
-        // 3. Render: march → shadow/AO → shade.
+        // 3. Render: march (+ shadow) → SSAO → shade.
         let object_count = self.gpu_objects.len() as u32;
-        let shadow_params = self.environment.to_shadow_ao_params(object_count);
-        self.renderer.render(&mut encoder, &self.queue, object_count, self.width, self.height, &shadow_params);
+        let light_dir = self.environment.light_dir_normalized();
+        let shadow_steps = self.environment.shadow_steps;
+        let vp = glam::Mat4::from_cols_array_2d(&cam_uniforms.view_proj);
+        let screen_aabbs = crate::scene_sync::compute_screen_aabbs(
+            &self.gpu_objects, &vp, self.width as f32, self.height as f32,
+        );
+        let screen_aabbs_bytes: &[u8] = bytemuck::cast_slice(&screen_aabbs);
+        self.renderer.render(&mut encoder, &self.queue, object_count, self.width, self.height, light_dir, shadow_steps, screen_aabbs_bytes);
 
         let t_encode = frame_start.elapsed();
 
@@ -811,8 +820,20 @@ impl EngineState {
                 }
             }
 
+            EngineCommand::DeleteSelected => {
+                if let Some(entity) = self.selected_entity {
+                    self.delete_entity(entity);
+                }
+            }
+
             EngineCommand::DuplicateObject { entity_id } => {
                 if let Some(entity) = self.resolve_entity(&entity_id) {
+                    self.duplicate_entity(entity);
+                }
+            }
+
+            EngineCommand::DuplicateSelected => {
+                if let Some(entity) = self.selected_entity {
                     self.duplicate_entity(entity);
                 }
             }
@@ -1119,8 +1140,11 @@ impl EngineState {
                     "ambient_intensity" => {
                         if let Ok(v) = value.parse::<f32>() { env.ambient_intensity = v; }
                     }
-                    "sun_direction" => {
-                        if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) { env.sun_direction = v; }
+                    "sun_azimuth" => {
+                        if let Ok(v) = value.parse::<f32>() { env.sun_azimuth = v; }
+                    }
+                    "sun_elevation" => {
+                        if let Ok(v) = value.parse::<f32>() { env.sun_elevation = v; }
                     }
                     "sun_color" => {
                         if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) { env.sun_color = v; }
@@ -1219,6 +1243,104 @@ impl EngineState {
                 }
             }
         }
+    }
+
+    /// Try to find and load the gameplay dylib from the workspace target directory.
+    fn try_load_gameplay_dylib(&mut self) {
+        // Look for the cdylib in the standard cargo output locations.
+        let candidates = [
+            // Release build (most common for the editor)
+            std::path::PathBuf::from("target/release/librkp_gameplay.so"),
+            std::path::PathBuf::from("target/release/librkp_gameplay.dylib"),
+            std::path::PathBuf::from("target/release/rkp_gameplay.dll"),
+            // Debug build
+            std::path::PathBuf::from("target/debug/librkp_gameplay.so"),
+            std::path::PathBuf::from("target/debug/librkp_gameplay.dylib"),
+            std::path::PathBuf::from("target/debug/rkp_gameplay.dll"),
+        ];
+
+        for path in &candidates {
+            if path.exists() {
+                match self.gameplay_loader.load(path) {
+                    Ok(entries) => {
+                        let names: Vec<&str> = entries.iter().map(|e| e.name).collect();
+                        self.console.info(format!(
+                            "Loaded gameplay dylib: {} components ({})",
+                            entries.len(),
+                            names.join(", "),
+                        ));
+                        // Register gameplay entries in the component registry.
+                        for &entry in entries {
+                            self.registry.register_gameplay(entry);
+                        }
+                        self.scene_dirty = true;
+                        return;
+                    }
+                    Err(e) => {
+                        self.console.error(format!("Failed to load gameplay dylib: {e}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check if the gameplay dylib needs hot-reloading.
+    fn check_gameplay_reload(&mut self) {
+        if !self.gameplay_loader.needs_reload() {
+            return;
+        }
+
+        self.console.info("Hot-reloading gameplay dylib...");
+
+        // 1. Serialize all gameplay component data.
+        let saved = self.gameplay_loader.serialize_all(&self.world, &self.entity_uuids);
+        self.console.info(format!("Serialized {} gameplay component instances", saved.len()));
+
+        // 2. Remove all gameplay components from entities.
+        self.gameplay_loader.remove_all_gameplay_components(&mut self.world, &self.entity_uuids);
+
+        // 3. Clear gameplay entries from registry.
+        self.registry.clear_gameplay();
+
+        // 4. Unload old dylib.
+        let dylib_path = self.gameplay_loader.dylib_path().map(|p| p.to_owned());
+        self.gameplay_loader.unload();
+
+        // 5. Load new dylib.
+        if let Some(path) = dylib_path {
+            // Small delay to ensure the file is fully written.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            match self.gameplay_loader.load(&path) {
+                Ok(entries) => {
+                    let names: Vec<&str> = entries.iter().map(|e| e.name).collect();
+                    self.console.info(format!(
+                        "Reloaded: {} components ({})",
+                        entries.len(),
+                        names.join(", "),
+                    ));
+
+                    // 6. Re-register gameplay entries.
+                    for &entry in entries {
+                        self.registry.register_gameplay(entry);
+                    }
+
+                    // 7. Deserialize component data back.
+                    let restored = self.gameplay_loader.deserialize_all(
+                        &mut self.world,
+                        &self.uuid_to_entity,
+                        &saved,
+                    );
+                    self.console.info(format!("Restored {restored}/{} component instances", saved.len()));
+                }
+                Err(e) => {
+                    self.console.error(format!("Hot-reload failed: {e}"));
+                }
+            }
+        }
+
+        self.scene_dirty = true;
+        self.gpu_objects_dirty = true;
     }
 
     fn process_file_events(&mut self) {
@@ -1755,8 +1877,18 @@ impl EngineState {
                 self.camera.pitch = scene.camera.pitch;
                 self.camera.fov = scene.camera.fov;
 
+                // Restore environment.
+                if let Some(ref env_state) = scene.environment {
+                    self.environment = env_state.to_settings();
+                    self.environment_dirty = true;
+                }
+
                 // Load objects as hecs entities.
+                // First pass: create entities + map scene UUID → hecs entity.
                 use crate::components::*;
+                let mut uuid_to_hecs: std::collections::HashMap<uuid::Uuid, hecs::Entity> =
+                    std::collections::HashMap::new();
+
                 for obj in &scene.objects {
                     let transform = Transform {
                         position: glam::Vec3::from_array(obj.position),
@@ -1765,24 +1897,27 @@ impl EngineState {
                     };
                     let meta = EditorMetadata { name: obj.name.clone() };
 
-                    if let Some(ref asset_path) = obj.asset_path {
+                    let entity = if let Some(ref asset_path) = obj.asset_path {
                         let full_path = self.project_dir.as_ref()
                             .map(|d| d.join("assets").join(asset_path))
                             .unwrap_or_else(|| std::path::PathBuf::from(asset_path));
                         let sid = self.next_scene_id;
                         self.next_scene_id += 1;
-                        if let Ok(result) = self.scene_mgr.load_rkp(&full_path.to_string_lossy(), sid) {
-                            let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
-                            let e = self.world.spawn((transform, meta, Renderable {
-                                asset_path: Some(asset_path.clone()),
-                                material_id: obj.material_id,
-                                voxel_count: result.voxel_count,
-                                spatial: Some(spatial),
-                                ..Default::default()
-                            }));
-                            self.assign_entity_uuid(e);
-                            self.entity_scene_ids.insert(e, sid);
-                            self.geometry_dirty = true;
+                        match self.scene_mgr.load_rkp(&full_path.to_string_lossy(), sid) {
+                            Ok(result) => {
+                                let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
+                                let e = self.world.spawn((transform, meta, Renderable {
+                                    asset_path: Some(asset_path.clone()),
+                                    material_id: obj.material_id,
+                                    voxel_count: result.voxel_count,
+                                    spatial: Some(spatial),
+                                    ..Default::default()
+                                }));
+                                self.entity_scene_ids.insert(e, sid);
+                                self.geometry_dirty = true;
+                                Some(e)
+                            }
+                            Err(_) => None,
                         }
                     } else if let Some(ref prim_name) = obj.primitive {
                         let primitive = match prim_name.as_str() {
@@ -1794,11 +1929,11 @@ impl EngineState {
                             },
                             _ => continue,
                         };
-                        let sid2 = self.next_scene_id;
+                        let sid = self.next_scene_id;
                         self.next_scene_id += 1;
-                        if let Some(result) = self.scene_mgr.voxelize_primitive(
-                            &primitive, obj.material_id, 0.05, glam::Vec3::ONE, sid2,
-                        ) {
+                        self.scene_mgr.voxelize_primitive(
+                            &primitive, obj.material_id, 0.05, glam::Vec3::ONE, sid,
+                        ).map(|result| {
                             let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
                             let e = self.world.spawn((transform, meta, Renderable {
                                 primitive: Some(prim_name.clone()),
@@ -1807,16 +1942,76 @@ impl EngineState {
                                 spatial: Some(spatial),
                                 ..Default::default()
                             }));
-                            self.assign_entity_uuid(e);
-                            self.entity_scene_ids.insert(e, sid2);
+                            self.entity_scene_ids.insert(e, sid);
                             self.geometry_dirty = true;
+                            e
+                        })
+                    } else {
+                        // Entity with no renderable (e.g. empty transform node).
+                        Some(self.world.spawn((transform, meta)))
+                    };
+
+                    if let Some(e) = entity {
+                        self.assign_entity_uuid(e);
+                        uuid_to_hecs.insert(obj.id, e);
+
+                        // Restore PointLight component.
+                        if let Some(ref pl) = obj.point_light {
+                            let _ = self.world.insert_one(e, PointLight {
+                                color: pl.color,
+                                intensity: pl.intensity,
+                                range: pl.range,
+                            });
+                        }
+
+                        // Restore Camera component.
+                        if let Some(ref cam) = obj.camera {
+                            let _ = self.world.insert_one(e, Camera {
+                                fov: cam.fov,
+                                near: cam.near,
+                                far: cam.far,
+                                active: cam.active,
+                            });
                         }
                     }
                 }
+
+                // Second pass: restore parent-child relationships.
+                for obj in &scene.objects {
+                    if let Some(parent_uuid) = obj.parent_id {
+                        if let Some(&entity) = uuid_to_hecs.get(&obj.id) {
+                            let _ = self.world.insert_one(entity, Parent { parent_id: parent_uuid });
+                        }
+                    }
+                }
+
+                // Third pass: restore generic components via registry.
+                for obj in &scene.objects {
+                    if obj.components.is_empty() {
+                        continue;
+                    }
+                    let Some(&entity) = uuid_to_hecs.get(&obj.id) else { continue };
+                    for (comp_name, json) in &obj.components {
+                        if let Some(entry) = self.registry.get(comp_name) {
+                            if let Err(e) = (entry.deserialize_insert)(&mut self.world, entity, json) {
+                                self.console.warn(format!(
+                                    "Failed to restore component '{comp_name}' on '{}': {e}",
+                                    obj.name,
+                                ));
+                            }
+                        } else {
+                            self.console.warn(format!(
+                                "Unknown component '{comp_name}' on '{}' — skipped (gameplay dylib not loaded?)",
+                                obj.name,
+                            ));
+                        }
+                    }
+                }
+
                 self.scene_dirty = true;
                 self.gpu_objects_dirty = true;
             }
-            Err(e) => eprintln!("[RkpEngine] load scene failed: {e}"),
+            Err(e) => self.console.error(format!("Load scene failed: {e}")),
         }
     }
 
@@ -1825,16 +2020,44 @@ impl EngineState {
         let mut objects = Vec::new();
         for (entity, (transform, meta)) in self.world.query::<(&Transform, &EditorMetadata)>().iter() {
             let renderable = self.world.get::<&Renderable>(entity).ok();
+            let parent = self.world.get::<&Parent>(entity).ok();
+            let point_light = self.world.get::<&PointLight>(entity).ok();
+            let camera = self.world.get::<&Camera>(entity).ok();
+
+            // Serialize extra components (gameplay + any non-hardcoded) via registry.
+            let hardcoded = ["Transform", "EditorMetadata", "Renderable", "PointLight", "Camera", "Parent"];
+            let mut components = std::collections::HashMap::new();
+            for entry in self.registry.components_on(&self.world, entity) {
+                if hardcoded.contains(&entry.name) {
+                    continue;
+                }
+                if let Some(json) = (entry.serialize)(&self.world, entity) {
+                    components.insert(entry.name.to_string(), json);
+                }
+            }
+
             objects.push(crate::scene_io::SceneObject {
                 id: self.get_entity_uuid(entity),
                 name: meta.name.clone(),
                 position: transform.position.to_array(),
                 rotation: transform.rotation.to_array(),
                 scale: transform.scale.to_array(),
-                parent_id: None,
+                parent_id: parent.map(|p| p.parent_id),
                 asset_path: renderable.as_ref().and_then(|r| r.asset_path.clone()),
                 primitive: renderable.as_ref().and_then(|r| r.primitive.clone()),
                 material_id: renderable.map(|r| r.material_id).unwrap_or(0),
+                point_light: point_light.map(|l| crate::scene_io::ScenePointLight {
+                    color: l.color,
+                    intensity: l.intensity,
+                    range: l.range,
+                }),
+                camera: camera.map(|c| crate::scene_io::SceneCamera {
+                    fov: c.fov,
+                    near: c.near,
+                    far: c.far,
+                    active: c.active,
+                }),
+                components,
             });
         }
 
@@ -1847,6 +2070,7 @@ impl EngineState {
                 fov: self.camera.fov,
             },
             lights: Vec::new(),
+            environment: Some(crate::scene_io::EnvironmentState::from_settings(&self.environment)),
         }
     }
 
@@ -2104,6 +2328,9 @@ fn tick_loop(
     let mut state = EngineState::new(&config);
     state.console.info(format!("Engine started ({}x{})", config.width, config.height));
 
+    // Try to load gameplay dylib from the standard build output.
+    state.try_load_gameplay_dylib();
+
     loop {
         let frame_start = Instant::now();
 
@@ -2115,9 +2342,10 @@ fn tick_loop(
             }
         }
 
-        // 1b. Process file watcher events + import completions.
+        // 1b. Process file watcher events + import completions + gameplay reload.
         state.process_file_events();
         state.poll_import_completions();
+        state.check_gameplay_reload();
 
         // 2. Update input system + camera.
         let dt = 1.0 / 60.0; // TODO: use actual delta time

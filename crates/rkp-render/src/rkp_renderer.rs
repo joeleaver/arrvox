@@ -4,10 +4,10 @@
 //! 1. Build RkpGpuObjects from ECS/scene state
 //! 2. Call `upload_frame(objects, camera)` — cheap, every frame
 //! 3. Call `upload_geometry(...)` — only when geometry changes
-//! 4. Call `render(encoder, width, height, ...)` — march + shadow/AO + shade
+//! 4. Call `render(encoder, width, height, ...)` — march (+ shadow) + SSAO + shade
 
 use crate::rkp_scene::{RkpScene, GeometryUpload, FrameUpload, CameraUniforms};
-use crate::rkp_shadow_ao::{RkpShadowAoPass, ShadowAoParams};
+use crate::rkp_ssao::RkpSsaoPass;
 use crate::rkp_shade::{RkpShadePass, ShadeParams, GpuLight, GpuMaterial};
 use crate::rkp_gpu_object::RkpGpuObject;
 use crate::octree_march::OctreeMarchPass;
@@ -17,10 +17,10 @@ use wgpu_profiler::GpuProfiler;
 pub struct RkpRenderer {
     /// Scene GPU buffers.
     pub scene: RkpScene,
-    /// Octree ray march compute pass — primary visibility.
+    /// Octree ray march compute pass — primary visibility + shadow.
     pub march: OctreeMarchPass,
-    /// Half-res shadow + AO compute pass.
-    pub shadow_ao: RkpShadowAoPass,
+    /// Half-res screen-space ambient occlusion compute pass.
+    pub ssao: RkpSsaoPass,
     /// Deferred PBR shading compute pass.
     pub shade: RkpShadePass,
     /// Default light/material buffers.
@@ -45,7 +45,7 @@ impl RkpRenderer {
             max_num_pending_frames: 4,
         }).expect("failed to create GPU profiler");
         let timestamp_period = queue.get_timestamp_period();
-        let shadow_ao = RkpShadowAoPass::new(device, &scene, width, height);
+        let ssao = RkpSsaoPass::new(device, queue, width, height);
         let mut shade = RkpShadePass::new(device, width, height);
 
         let default_params = ShadeParams { num_lights: 1, ..ShadeParams::default() };
@@ -78,7 +78,7 @@ impl RkpRenderer {
         march.set_materials(device, &materials_buffer);
 
         Self {
-            scene, march, shadow_ao, shade,
+            scene, march, ssao, shade,
             shade_params_buffer, lights_buffer, materials_buffer,
             device: device.clone(),
             profiler, timestamp_period,
@@ -99,16 +99,16 @@ impl RkpRenderer {
         gbuffer: &rkf_render::GBuffer,
     ) {
         self.march.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view);
-        self.shadow_ao.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view);
+        self.ssao.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view);
         self.shade.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view);
-        self.shade.set_shadow_ao(&self.device, &self.shadow_ao.output_view);
+        self.shade.set_ssao(&self.device, &self.ssao.output_view);
     }
 
     pub fn set_hdr_output(&mut self, view: &wgpu::TextureView) {
         self.shade.set_output_view(&self.device, view);
     }
 
-    /// Render: march → shadow/AO → shade.
+    /// Render: march (+ shadow) → SSAO → shade.
     pub fn render(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -116,25 +116,30 @@ impl RkpRenderer {
         object_count: u32,
         width: u32,
         height: u32,
-        shadow_ao_params: &ShadowAoParams,
+        light_dir: [f32; 3],
+        shadow_steps: u32,
+        screen_aabbs: &[u8],
     ) {
-        // 1. Octree ray march → G-buffer.
+        // Upload screen-space AABBs for tile culling.
+        self.march.upload_screen_aabbs(queue, screen_aabbs);
+
+        // 1. Octree ray march → G-buffer (includes shadow ray in normal.w).
         self.march.clear_stats(encoder);
         {
             let q = self.profiler.begin_query("march", encoder);
             self.march.dispatch(
                 encoder, queue, &self.scene.bind_group,
-                object_count, width, height, 0, None,
+                object_count, width, height, 0,
+                light_dir, shadow_steps, None,
             );
             self.profiler.end_query(encoder, q);
         }
         self.march.copy_stats(encoder);
 
-        // 2. Shadow + AO at half resolution.
-        self.shadow_ao.update_params(queue, shadow_ao_params);
+        // 2. SSAO at half resolution.
         {
-            let q = self.profiler.begin_query("shadow_ao", encoder);
-            self.shadow_ao.dispatch(encoder, &self.scene);
+            let q = self.profiler.begin_query("ssao", encoder);
+            self.ssao.dispatch(encoder);
             self.profiler.end_query(encoder, q);
         }
 
@@ -205,7 +210,7 @@ impl RkpRenderer {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
-        self.shadow_ao.resize(&self.device, width, height);
+        self.ssao.resize(&self.device, width, height);
         self.shade.resize(&self.device, width, height);
     }
 

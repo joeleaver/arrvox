@@ -1,6 +1,6 @@
 // RKIPatch deferred PBR shading compute shader.
 //
-// Reads G-buffer (position, normal, material) + shadow/AO texture.
+// Reads G-buffer (position, normal+shadow, material) + SSAO texture.
 // Evaluates PBR Cook-Torrance BRDF with direct lighting.
 // Writes final HDR color to output texture.
 
@@ -52,8 +52,8 @@ struct Material {
 @group(0) @binding(1) var gbuf_normal: texture_2d<f32>;
 @group(0) @binding(2) var gbuf_material: texture_2d<u32>;
 
-// Group 1: shadow+AO texture (read, half-res)
-@group(1) @binding(0) var shadow_ao_tex: texture_2d<f32>;
+// Group 1: SSAO texture (read, half-res)
+@group(1) @binding(0) var ssao_tex: texture_2d<f32>;
 
 // Group 2: output HDR color (write, full-res)
 @group(2) @binding(0) var output: texture_storage_2d<rgba16float, write>;
@@ -144,11 +144,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // F0 for dielectrics vs metals.
     let f0 = mix(vec3<f32>(0.04), albedo, metallic);
 
-    // Read shadow + AO from half-res texture.
+    // Shadow from G-buffer normal.w (written by march pass).
+    let shadow = textureLoad(gbuf_normal, coord, 0).w;
+
+    // AO from half-res SSAO texture.
     let half_coord = vec2<i32>(gid.xy) / 2;
-    let shadow_ao = textureLoad(shadow_ao_tex, half_coord, 0);
-    let shadow = shadow_ao.r;
-    let ao = shadow_ao.g;
+    let ao = textureLoad(ssao_tex, half_coord, 0).r;
 
     // Accumulate direct lighting.
     var lo = vec3<f32>(0.0);

@@ -4,14 +4,18 @@
 //! a camera ray, traverses the octree hierarchy for each object, and writes
 //! the closest hit to the G-buffer.
 
+use crate::validate_wgsl;
+
 /// Uniform parameters for the march shader.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MarchParams {
     pub object_count: u32,
     pub mode: u32,     // 0 = full (hit + normal), 1 = normal-only (reads position from G-buffer)
-    pub _pad1: u32,
-    pub _pad2: u32,
+    pub shadow_max_steps: u32,
+    pub _pad: u32,
+    pub light_dir: [f32; 3],
+    pub _pad2: f32,
 }
 
 /// The octree ray march compute pass.
@@ -25,6 +29,8 @@ pub struct OctreeMarchPass {
     /// Stats buffer for profiling (4 atomic u32s).
     stats_buffer: wgpu::Buffer,
     stats_readback: wgpu::Buffer,
+    /// Screen-space AABB buffer for tile culling.
+    screen_aabbs_buffer: wgpu::Buffer,
 }
 
 impl OctreeMarchPass {
@@ -81,6 +87,16 @@ impl OctreeMarchPass {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -93,6 +109,7 @@ impl OctreeMarchPass {
 
         // Pipeline.
         let shader_src = include_str!("shaders/octree_march.wgsl");
+        validate_wgsl(shader_src, "octree_march");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("octree_march"),
             source: wgpu::ShaderSource::Wgsl(shader_src.into()),
@@ -136,11 +153,21 @@ impl OctreeMarchPass {
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             }),
+            screen_aabbs_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("march screen_aabbs"),
+                size: 16 * 32, // 32 objects × vec4<f32>
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
         }
     }
 
     /// Set the materials buffer. Call after materials are uploaded/resized.
     pub fn set_materials(&mut self, device: &wgpu::Device, materials_buffer: &wgpu::Buffer) {
+        self.rebuild_params_bind_group(device, materials_buffer);
+    }
+
+    fn rebuild_params_bind_group(&mut self, device: &wgpu::Device, materials_buffer: &wgpu::Buffer) {
         self.params_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("march params+materials bind group"),
             layout: &self.params_bind_group_layout,
@@ -157,8 +184,17 @@ impl OctreeMarchPass {
                     binding: 2,
                     resource: self.stats_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.screen_aabbs_buffer.as_entire_binding(),
+                },
             ],
         }));
+    }
+
+    /// Upload screen-space AABBs for tile culling. Call each frame before dispatch.
+    pub fn upload_screen_aabbs(&self, queue: &wgpu::Queue, data: &[u8]) {
+        queue.write_buffer(&self.screen_aabbs_buffer, 0, data);
     }
 
     /// Set the G-buffer textures. Call on init and after resize.
@@ -226,14 +262,18 @@ impl OctreeMarchPass {
         width: u32,
         height: u32,
         mode: u32,
+        light_dir: [f32; 3],
+        shadow_max_steps: u32,
         timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) {
         // Update params.
         let params = MarchParams {
             object_count,
             mode,
-            _pad1: 0,
-            _pad2: 0,
+            shadow_max_steps,
+            _pad: 0,
+            light_dir,
+            _pad2: 0.0,
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
 

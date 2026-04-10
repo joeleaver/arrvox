@@ -21,3 +21,4 @@ thiserror = { workspace = true }
 pollster = { workspace = true }
 rayon = { workspace = true }
 wgpu-profiler = { workspace = true }
+naga = { workspace = true }

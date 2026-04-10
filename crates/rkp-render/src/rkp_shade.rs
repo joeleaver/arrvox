@@ -7,7 +7,7 @@
 pub struct RkpShadePass {
     pipeline: wgpu::ComputePipeline,
     pub gbuffer_bind_group_layout: wgpu::BindGroupLayout,
-    pub shadow_ao_bind_group_layout: wgpu::BindGroupLayout,
+    pub ssao_bind_group_layout: wgpu::BindGroupLayout,
     pub output_bind_group_layout: wgpu::BindGroupLayout,
     pub shade_bind_group_layout: wgpu::BindGroupLayout,
     pub camera_bind_group_layout: wgpu::BindGroupLayout,
@@ -16,7 +16,7 @@ pub struct RkpShadePass {
     pub output_view: wgpu::TextureView,
     output_bind_group: wgpu::BindGroup,
     gbuffer_bind_group: Option<wgpu::BindGroup>,
-    shadow_ao_bind_group: Option<wgpu::BindGroup>,
+    ssao_bind_group: Option<wgpu::BindGroup>,
     shade_bind_group: Option<wgpu::BindGroup>,
     camera_bind_group: Option<wgpu::BindGroup>,
     width: u32,
@@ -102,9 +102,9 @@ impl RkpShadePass {
             });
 
         // Group 1: shadow+AO texture
-        let shadow_ao_bind_group_layout =
+        let ssao_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("rkp_shade shadow_ao"),
+                label: Some("rkp_shade ssao"),
                 entries: &[texture_entry(0)],
             });
 
@@ -192,7 +192,7 @@ impl RkpShadePass {
             label: Some("rkp_shade pipeline"),
             bind_group_layouts: &[
                 Some(&gbuffer_bind_group_layout),
-                Some(&shadow_ao_bind_group_layout),
+                Some(&ssao_bind_group_layout),
                 Some(&output_bind_group_layout),
                 Some(&shade_bind_group_layout),
                 Some(&camera_bind_group_layout),
@@ -212,7 +212,7 @@ impl RkpShadePass {
         Self {
             pipeline,
             gbuffer_bind_group_layout,
-            shadow_ao_bind_group_layout,
+            ssao_bind_group_layout,
             output_bind_group_layout,
             shade_bind_group_layout,
             camera_bind_group_layout,
@@ -220,7 +220,7 @@ impl RkpShadePass {
             output_view,
             output_bind_group,
             gbuffer_bind_group: None,
-            shadow_ao_bind_group: None,
+            ssao_bind_group: None,
             shade_bind_group: None,
             camera_bind_group: None,
             width,
@@ -248,13 +248,13 @@ impl RkpShadePass {
     }
 
     /// Set shadow/AO texture view.
-    pub fn set_shadow_ao(&mut self, device: &wgpu::Device, shadow_ao_view: &wgpu::TextureView) {
-        self.shadow_ao_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rkp_shade shadow_ao bg"),
-            layout: &self.shadow_ao_bind_group_layout,
+    pub fn set_ssao(&mut self, device: &wgpu::Device, ssao_view: &wgpu::TextureView) {
+        self.ssao_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rkp_shade ssao bg"),
+            layout: &self.ssao_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(shadow_ao_view),
+                resource: wgpu::BindingResource::TextureView(ssao_view),
             }],
         }));
     }
@@ -297,7 +297,7 @@ impl RkpShadePass {
 
     pub fn dispatch_with_timestamps(&self, encoder: &mut wgpu::CommandEncoder, timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>) {
         let gbuf = match &self.gbuffer_bind_group { Some(bg) => bg, None => return };
-        let sao = match &self.shadow_ao_bind_group { Some(bg) => bg, None => return };
+        let sao = match &self.ssao_bind_group { Some(bg) => bg, None => return };
         let shade = match &self.shade_bind_group { Some(bg) => bg, None => return };
         let cam = match &self.camera_bind_group { Some(bg) => bg, None => return };
 
