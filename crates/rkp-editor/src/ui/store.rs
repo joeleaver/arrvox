@@ -12,6 +12,7 @@ use uuid::Uuid;
 use rkp_engine::{SceneObjectInfo, ModelInfo};
 use rkp_engine::gizmo::GizmoMode;
 use rkp_engine::inspector::InspectorSnapshot;
+use rkp_engine::console::LogEntry;
 use rkp_engine::environment::EnvironmentSettings;
 use rkp_engine::material_library::MaterialInfo;
 use rkp_engine::recent_projects::RecentProject;
@@ -99,6 +100,8 @@ pub struct EditorStore {
     pub selected_model: Signal<Option<String>>,
     /// Environment settings (sky, lighting, shadows, tone mapping).
     pub environment: Signal<EnvironmentSettings>,
+    /// Console log entries.
+    pub console_entries: Signal<Vec<LogEntry>>,
 
     // ── Drag state (tab dragging) ────────────────────────────────
 
@@ -185,6 +188,7 @@ impl EditorStore {
             material_drag: Signal::new(None),
             selected_model: Signal::new(None),
             environment: Signal::new(EnvironmentSettings::default()),
+            console_entries: Signal::new(Vec::new()),
 
             // Drag state.
             tab_drag: Signal::new(None),

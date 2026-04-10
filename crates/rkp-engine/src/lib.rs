@@ -13,6 +13,7 @@
 pub mod camera;
 pub mod command;
 pub mod components;
+pub mod console;
 pub mod environment;
 pub mod component_registry;
 pub mod file_watcher;

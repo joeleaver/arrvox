@@ -141,6 +141,9 @@ pub enum EngineCommand {
         source_path: String,
     },
 
+    /// Clear the console log.
+    ClearConsole,
+
     /// Update an environment setting.
     UpdateEnvironment {
         field: String,

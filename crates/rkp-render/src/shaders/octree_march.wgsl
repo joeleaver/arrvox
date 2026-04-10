@@ -9,7 +9,7 @@ const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
 const OCTREE_LEAF_BIT: u32 = 0x80000000u;
 const OPACITY_THRESHOLD: f32 = 0.05;
 const MAX_STEPS: u32 = 256u;
-const MAX_OBJECTS: u32 = 16u;
+const MAX_OBJECTS: u32 = 32u;
 
 struct VoxelSample { word0: u32, word1: u32, }
 
@@ -348,97 +348,15 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
     if pixel.x >= dims.x || pixel.y >= dims.y { return; }
 
     let coord = vec2<i32>(pixel.xy);
-    let skip_normals = march_params.mode == 1u;
-
     let uv = (vec2<f32>(pixel.xy) + 0.5 + camera.jitter) / camera.resolution;
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     let ray_origin = camera.position.xyz;
     let ray_dir = normalize(camera.forward.xyz + ndc.x * camera.right.xyz + ndc.y * camera.up.xyz);
 
-    var max_t = 1e20;
-    var results: array<MarchResult, MAX_OBJECTS>;
-    var obj_indices: array<u32, MAX_OBJECTS>;
-    var result_count = 0u;
+    // Stream-composite: march objects one at a time, composite into running accumulator.
+    // No per-object arrays — constant register usage regardless of object count.
+    // Selection sort: repeatedly find the nearest un-marched AABB and process it.
 
-    // Pre-pass: AABB-test all objects and sort by entry distance (cheap, no octree).
-    var obj_order: array<u32, MAX_OBJECTS>;
-    var obj_t_near: array<f32, MAX_OBJECTS>;
-    var obj_count = 0u;
-
-    let num_objects = march_params.object_count;
-    for (var i = 0u; i < num_objects && i < MAX_OBJECTS; i++) {
-        let obj = objects[i];
-        if obj.geom_type == 0u { continue; }
-
-        let inv_world = obj.inverse_world;
-        let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
-        let local_dir = normalize((inv_world * vec4<f32>(ray_dir, 0.0)).xyz);
-        let extent = bitcast<f32>(obj.octree_extent_bits);
-        let half_ext = extent * 0.5;
-        let oc_origin = local_origin + vec3<f32>(half_ext);
-        let safe_d = vec3<f32>(
-            select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),
-            select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),
-            select(local_dir.z, select(-1e-10, 1e-10, local_dir.z >= 0.0), abs(local_dir.z) < 1e-10),
-        );
-        let t_range = intersect_aabb(oc_origin, 1.0 / safe_d, vec3<f32>(0.0), vec3<f32>(extent));
-        if t_range.x <= t_range.y {
-            obj_order[obj_count] = i;
-            obj_t_near[obj_count] = t_range.x;
-            obj_count += 1u;
-        }
-    }
-
-    // Sort by t_near (insertion sort, few objects).
-    for (var i = 1u; i < obj_count; i++) {
-        var j = i;
-        while j > 0u && obj_t_near[j - 1u] > obj_t_near[j] {
-            let tmp_o = obj_order[j - 1u]; obj_order[j - 1u] = obj_order[j]; obj_order[j] = tmp_o;
-            let tmp_t = obj_t_near[j - 1u]; obj_t_near[j - 1u] = obj_t_near[j]; obj_t_near[j] = tmp_t;
-            j -= 1u;
-        }
-    }
-
-    // March objects front-to-back. Opaque hits set max_t to skip objects behind.
-    for (var i = 0u; i < obj_count; i++) {
-        if max_t < obj_t_near[i] { break; } // everything remaining is behind an opaque hit
-        let oi = obj_order[i];
-        let r = march_object(ray_origin, ray_dir, objects[oi], max_t);
-        if r.valid {
-            results[result_count] = r;
-            obj_indices[result_count] = oi;
-            result_count += 1u;
-            if r.alpha > 0.99 && r.t < max_t {
-                max_t = r.t;
-            }
-        }
-    }
-
-    // Write per-pixel stats.
-    var total_steps = 0u;
-    for (var s = 0u; s < result_count; s++) {
-        total_steps += results[s].steps;
-    }
-    atomicAdd(&stats[0], total_steps);
-    atomicMax(&stats[3], total_steps);
-
-    if result_count == 0u {
-        // Skip background writes — G-buffer is cleared before the march.
-        // Saves 3 storage texture writes per miss pixel.
-        return;
-    }
-
-    // Sort results front-to-back by entry t (insertion sort — few objects).
-    for (var i = 1u; i < result_count; i++) {
-        var j = i;
-        while j > 0u && results[j - 1u].t > results[j].t {
-            let tmp_r = results[j - 1u]; results[j - 1u] = results[j]; results[j] = tmp_r;
-            let tmp_i = obj_indices[j - 1u]; obj_indices[j - 1u] = obj_indices[j]; obj_indices[j] = tmp_i;
-            j -= 1u;
-        }
-    }
-
-    // Front-to-back composite across objects.
     var accum_pos = vec3<f32>(0.0);
     var accum_normal = vec3<f32>(0.0);
     var accum_color = vec3<f32>(0.0);
@@ -449,31 +367,77 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
     var first_blend = 0u;
     var first_obj_id = 0u;
     var have_first = false;
+    var max_t = 1e20;
+    var total_steps = 0u;
 
-    for (var i = 0u; i < result_count; i++) {
+    let num_objects = march_params.object_count;
+
+    // Track which objects have been processed with a bitmask (supports up to 32 objects).
+    // For >32 objects, the outer loop naturally handles it — unprocessed objects
+    // beyond 32 are picked up in subsequent iterations.
+    var processed = 0u;
+
+    for (var obj_pass = 0u; obj_pass < num_objects && obj_pass < MAX_OBJECTS; obj_pass++) {
         if accum_alpha > 0.99 { break; }
 
-        let r = results[i];
-        let oi = obj_indices[i];
-        let obj = objects[oi];
+        // Find the nearest un-processed object whose AABB the ray hits.
+        var best_idx = 0xFFFFFFFFu;
+        var best_t_near = max_t;
+
+        for (var i = 0u; i < num_objects && i < MAX_OBJECTS; i++) {
+            // Bitmask for first 32 objects; always process objects 32+.
+            if i < 32u && (processed & (1u << i)) != 0u { continue; }
+            let obj = objects[i];
+            if obj.geom_type == 0u { continue; }
+
+            let inv_world = obj.inverse_world;
+            let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
+            let local_dir = normalize((inv_world * vec4<f32>(ray_dir, 0.0)).xyz);
+            let extent = bitcast<f32>(obj.octree_extent_bits);
+            let half_ext = extent * 0.5;
+            let oc_origin = local_origin + vec3<f32>(half_ext);
+            let safe_d = vec3<f32>(
+                select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),
+                select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),
+                select(local_dir.z, select(-1e-10, 1e-10, local_dir.z >= 0.0), abs(local_dir.z) < 1e-10),
+            );
+            let t_range = intersect_aabb(oc_origin, 1.0 / safe_d, vec3<f32>(0.0), vec3<f32>(extent));
+            if t_range.x <= t_range.y && t_range.x < best_t_near {
+                best_idx = i;
+                best_t_near = t_range.x;
+            }
+        }
+
+        if best_idx == 0xFFFFFFFFu { break; } // no more visible objects
+        if best_idx < 32u {
+            processed |= (1u << best_idx);
+        }
+
+        // March this object.
+        let r = march_object(ray_origin, ray_dir, objects[best_idx], max_t);
+        total_steps += r.steps;
+
+        if !r.valid { continue; }
+
+        // Opaque early-out.
+        if r.alpha > 0.99 && r.t < max_t {
+            max_t = r.t;
+        }
+
+        // Composite this object's result into the accumulator.
+        let obj = objects[best_idx];
         let extent = bitcast<f32>(obj.octree_extent_bits);
         let vs = obj.voxel_size;
 
-        // Normalize this object's accumulated values.
         let inv_a = 1.0 / max(r.alpha, 0.001);
         let oc_pos = r.oc_pos * inv_a;
         let color = r.color * inv_a;
 
-        // World position + normal for this object's contribution.
         let local_hit = oc_pos - vec3<f32>(extent * 0.5);
         let world_pos = (obj.world * vec4<f32>(local_hit, 1.0)).xyz;
-        var world_normal = vec3<f32>(0.0, 1.0, 0.0);
-        {
-            let local_normal = compute_normal(oc_pos, obj.octree_root, obj.octree_depth, extent, vs);
-            world_normal = normalize((obj.world * vec4<f32>(local_normal, 0.0)).xyz);
-        }
+        let local_normal = compute_normal(oc_pos, obj.octree_root, obj.octree_depth, extent, vs);
+        let world_normal = normalize((obj.world * vec4<f32>(local_normal, 0.0)).xyz);
 
-        // Composite this object's contribution.
         let remaining = 1.0 - accum_alpha;
         let weight = r.alpha * remaining;
         accum_pos += world_pos * weight;
@@ -496,6 +460,17 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
         }
     }
 
+    // Stats.
+    atomicAdd(&stats[0], total_steps);
+    atomicMax(&stats[3], total_steps);
+
+    if !have_first {
+        textureStore(gbuf_position, coord, vec4<f32>(0.0, 0.0, 0.0, 1e10));
+        textureStore(gbuf_normal, coord, vec4<f32>(0.0, 0.0, 0.0, 0.0));
+        textureStore(gbuf_material, coord, vec4<u32>(0u, 0u, 0u, 0u));
+        return;
+    }
+
     let inv_alpha = 1.0 / max(accum_alpha, 0.001);
     let final_pos = accum_pos * inv_alpha;
     let final_color = accum_color * inv_alpha;
@@ -510,7 +485,7 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
                  | (((first_obj_id + 1u) & 0xFFu) << 8u)
                  | (color_rgb565 << 16u);
 
-    atomicAdd(&stats[2], 1u); // count hit pixels
+    atomicAdd(&stats[2], 1u);
     textureStore(gbuf_position, coord, vec4<f32>(final_pos, first_dist));
     let final_normal = normalize(accum_normal);
     textureStore(gbuf_normal, coord, vec4<f32>(final_normal, accum_alpha));

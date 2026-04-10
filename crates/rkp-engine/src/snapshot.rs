@@ -52,6 +52,8 @@ pub struct StateUpdate {
     pub selected_model: Option<String>,
     /// Environment settings (sent when changed or on first frame).
     pub environment: Option<crate::environment::EnvironmentSettings>,
+    /// New console log entries since last tick.
+    pub console_entries: Vec<crate::console::LogEntry>,
 }
 
 /// Info about an available model file.

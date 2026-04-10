@@ -170,6 +170,17 @@ fn main() -> anyhow::Result<()> {
                 if let Some(ref env) = update.environment {
                     store.environment.send(env.clone());
                 }
+                if !update.console_entries.is_empty() {
+                    let new_entries = update.console_entries.clone();
+                    store.console_entries.update_send(move |entries| {
+                        entries.extend(new_entries);
+                        // Cap at 1000 entries in the UI.
+                        if entries.len() > 1000 {
+                            let excess = entries.len() - 1000;
+                            entries.drain(..excess);
+                        }
+                    });
+                }
             })
         },
     );

@@ -234,6 +234,9 @@ struct EngineState {
     /// Whether environment settings changed and need GPU update.
     environment_dirty: bool,
 
+    /// Console log buffer.
+    console: crate::console::ConsoleLog,
+
     /// File watcher for hot-reload (watches project assets/ directory).
     file_watcher: Option<crate::file_watcher::RkpFileWatcher>,
     /// Background import worker for mesh → .rkp conversion.
@@ -371,6 +374,7 @@ impl EngineState {
             selected_model: None,
             environment: crate::environment::EnvironmentSettings::default(),
             environment_dirty: true, // upload on first frame
+            console: crate::console::ConsoleLog::new(),
             file_watcher: None,
             import_worker: crate::import_worker::ImportWorker::new(),
             geometry_dirty: false,
@@ -720,7 +724,7 @@ impl EngineState {
                     self.geometry_dirty = true;
                     self.scene_dirty = true;
                     self.gpu_objects_dirty = true;
-                    eprintln!("[RkpEngine] spawned primitive '{name}': {} voxels, entity {:?}, scene_id={}", result.voxel_count, entity, scene_id);
+                    self.console.info(format!("Spawned '{name}': {} voxels", result.voxel_count));
                 }
             }
 
@@ -748,10 +752,10 @@ impl EngineState {
                         self.geometry_dirty = true;
                         self.scene_dirty = true;
                         self.gpu_objects_dirty = true;
-                        eprintln!("[RkpEngine] loaded asset '{name}': {} voxels, entity {:?}, scene_id={}", result.voxel_count, entity, scene_id);
+                    self.console.info(format!("Loaded '{name}': {} voxels", result.voxel_count));
                     }
                     Err(e) => {
-                        eprintln!("[RkpEngine] failed to load '{path}': {e}");
+                    self.console.error(format!("Failed to load '{path}': {e}"));
                     }
                 }
             }
@@ -1087,6 +1091,10 @@ impl EngineState {
                 });
             }
 
+            EngineCommand::ClearConsole => {
+                self.console.clear();
+            }
+
             EngineCommand::UpdateEnvironment { field, value } => {
                 let env = &mut self.environment;
                 match field.as_str() {
@@ -1383,20 +1391,20 @@ impl EngineState {
         for completion in completions {
             match completion.result {
                 Ok(result) => {
-                    eprintln!(
-                        "[RkpEngine] import complete: {} → {} ({} voxels)",
-                        completion.source_path.display(),
-                        completion.output_path.display(),
+                    let name = completion.source_path.file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.console.info(format!(
+                        "Import complete: {name} ({} voxels)",
                         result.total_bricks,
-                    );
-                    // Rescan models so the new .rkp shows up in the panel.
+                    ));
                     self.scan_models();
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[RkpEngine] import failed: {} → {e}",
-                        completion.source_path.display(),
-                    );
+                    let name = completion.source_path.file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.console.error(format!("Import failed: {name} — {e}"));
                 }
             }
         }
@@ -1951,6 +1959,7 @@ impl EngineState {
             } else {
                 None
             },
+            console_entries: self.console.drain_new(),
         }
     }
 }
@@ -1963,9 +1972,8 @@ fn tick_loop(
     state_callback: StateCallback,
     config: EngineConfig,
 ) {
-    eprintln!("[RkpEngine] starting tick loop ({}x{})", config.width, config.height);
-
     let mut state = EngineState::new(&config);
+    state.console.info(format!("Engine started ({}x{})", config.width, config.height));
 
     loop {
         let frame_start = Instant::now();
