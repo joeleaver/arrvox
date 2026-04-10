@@ -292,6 +292,10 @@ impl RkpShadePass {
 
     /// Dispatch the shading pass.
     pub fn dispatch(&self, encoder: &mut wgpu::CommandEncoder) {
+        self.dispatch_with_timestamps(encoder, None);
+    }
+
+    pub fn dispatch_with_timestamps(&self, encoder: &mut wgpu::CommandEncoder, timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>) {
         let gbuf = match &self.gbuffer_bind_group { Some(bg) => bg, None => return };
         let sao = match &self.shadow_ao_bind_group { Some(bg) => bg, None => return };
         let shade = match &self.shade_bind_group { Some(bg) => bg, None => return };
@@ -302,7 +306,7 @@ impl RkpShadePass {
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("rkp_shade"),
-            timestamp_writes: None,
+            timestamp_writes: timestamp_writes,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, gbuf, &[]);

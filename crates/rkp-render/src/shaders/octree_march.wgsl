@@ -35,7 +35,12 @@ struct CameraUniforms {
     prev_vp: mat4x4<f32>, view_proj: mat4x4<f32>,
 }
 
-struct MarchParams { object_count: u32, _pad0: u32, _pad1: u32, _pad2: u32, }
+struct MarchParams {
+    object_count: u32,
+    mode: u32,     // 0 = hit-finding (march + write pos/mat), 1 = normal-only (read pos, write normal)
+    _pad1: u32,
+    _pad2: u32,
+}
 
 struct GpuMaterial {
     base_color: vec4<f32>,
@@ -159,15 +164,33 @@ fn sample_trilinear(pos: vec3<f32>, root: u32, depth: u32, extent: f32, vs: f32)
     return mix(mix(x0, x1, f.y), mix(x2, x3, f.y), f.z);
 }
 
+// Analytical gradient from 8-corner trilinear — only 8 octree lookups (vs 48 for finite differences).
 fn compute_normal(pos: vec3<f32>, root: u32, depth: u32, extent: f32, vs: f32) -> vec3<f32> {
-    let eps = vs * 0.5;
-    let gx = sample_trilinear(pos + vec3(eps,0.0,0.0), root, depth, extent, vs)
-           - sample_trilinear(pos - vec3(eps,0.0,0.0), root, depth, extent, vs);
-    let gy = sample_trilinear(pos + vec3(0.0,eps,0.0), root, depth, extent, vs)
-           - sample_trilinear(pos - vec3(0.0,eps,0.0), root, depth, extent, vs);
-    let gz = sample_trilinear(pos + vec3(0.0,0.0,eps), root, depth, extent, vs)
-           - sample_trilinear(pos - vec3(0.0,0.0,eps), root, depth, extent, vs);
-    let grad = vec3<f32>(gx, gy, gz);
+    let h = vs * 0.5;
+    let s000 = sample_opacity(pos + vec3(-h,-h,-h), root, depth, extent);
+    let s100 = sample_opacity(pos + vec3( h,-h,-h), root, depth, extent);
+    let s010 = sample_opacity(pos + vec3(-h, h,-h), root, depth, extent);
+    let s110 = sample_opacity(pos + vec3( h, h,-h), root, depth, extent);
+    let s001 = sample_opacity(pos + vec3(-h,-h, h), root, depth, extent);
+    let s101 = sample_opacity(pos + vec3( h,-h, h), root, depth, extent);
+    let s011 = sample_opacity(pos + vec3(-h, h, h), root, depth, extent);
+    let s111 = sample_opacity(pos + vec3( h, h, h), root, depth, extent);
+
+    // Trilinear polynomial coefficients.
+    let c1 = s100 - s000;
+    let c2 = s010 - s000;
+    let c3 = s001 - s000;
+    let c4 = s110 - s100 - s010 + s000;
+    let c5 = s101 - s100 - s001 + s000;
+    let c6 = s011 - s010 - s001 + s000;
+    let c7 = s111 - s110 - s101 - s011 + s100 + s010 + s001 - s000;
+
+    let f = fract(pos / vs + 0.5);
+    let grad = vec3<f32>(
+        c1 + c4 * f.y + c5 * f.z + c7 * f.y * f.z,
+        c2 + c4 * f.x + c6 * f.z + c7 * f.x * f.z,
+        c3 + c5 * f.x + c6 * f.y + c7 * f.x * f.y,
+    );
     let len = length(grad);
     if len < 1e-8 { return vec3<f32>(0.0, 1.0, 0.0); }
     return -grad / len;
@@ -293,12 +316,13 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
     if pixel.x >= dims.x || pixel.y >= dims.y { return; }
 
     let coord = vec2<i32>(pixel.xy);
+    let skip_normals = march_params.mode == 1u; // mode 1 = skip normals (for profiling)
     let uv = (vec2<f32>(pixel.xy) + 0.5 + camera.jitter) / camera.resolution;
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     let ray_origin = camera.position.xyz;
     let ray_dir = normalize(camera.forward.xyz + ndc.x * camera.right.xyz + ndc.y * camera.up.xyz);
 
-    // March all objects, collect results.
+    var max_t = 1e20;
     var results: array<MarchResult, MAX_OBJECTS>;
     var obj_indices: array<u32, MAX_OBJECTS>;
     var result_count = 0u;
@@ -307,11 +331,15 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
     for (var i = 0u; i < num_objects && i < MAX_OBJECTS; i++) {
         let obj = objects[i];
         if obj.geom_type == 0u { continue; }
-        let r = march_object(ray_origin, ray_dir, obj, 1e20);
+        let r = march_object(ray_origin, ray_dir, obj, max_t);
         if r.valid {
             results[result_count] = r;
             obj_indices[result_count] = i;
             result_count += 1u;
+            // If this object is fully opaque, nothing behind it is visible.
+            if r.alpha > 0.99 && r.t < max_t {
+                max_t = r.t;
+            }
         }
     }
 
@@ -361,8 +389,11 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
         // World position + normal for this object's contribution.
         let local_hit = oc_pos - vec3<f32>(extent * 0.5);
         let world_pos = (obj.world * vec4<f32>(local_hit, 1.0)).xyz;
-        let local_normal = compute_normal(oc_pos, obj.octree_root, obj.octree_depth, extent, vs);
-        let world_normal = normalize((obj.world * vec4<f32>(local_normal, 0.0)).xyz);
+        var world_normal = vec3<f32>(0.0, 1.0, 0.0);
+        if !skip_normals {
+            let local_normal = compute_normal(oc_pos, obj.octree_root, obj.octree_depth, extent, vs);
+            world_normal = normalize((obj.world * vec4<f32>(local_normal, 0.0)).xyz);
+        }
 
         // Composite this object's contribution.
         let remaining = 1.0 - accum_alpha;
@@ -389,7 +420,6 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
 
     let inv_alpha = 1.0 / max(accum_alpha, 0.001);
     let final_pos = accum_pos * inv_alpha;
-    let final_normal = normalize(accum_normal);
     let final_color = accum_color * inv_alpha;
 
     let cr = u32(clamp(final_color.r, 0.0, 1.0) * 31.0);
@@ -403,6 +433,7 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
                  | (color_rgb565 << 16u);
 
     textureStore(gbuf_position, coord, vec4<f32>(final_pos, first_dist));
+    let final_normal = normalize(accum_normal);
     textureStore(gbuf_normal, coord, vec4<f32>(final_normal, accum_alpha));
     textureStore(gbuf_material, coord, vec4<u32>(packed_r, packed_g, 0u, 0u));
 }

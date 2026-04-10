@@ -9,7 +9,7 @@
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MarchParams {
     pub object_count: u32,
-    pub _pad0: u32,
+    pub mode: u32,     // 0 = full (hit + normal), 1 = normal-only (reads position from G-buffer)
     pub _pad1: u32,
     pub _pad2: u32,
 }
@@ -42,9 +42,9 @@ impl OctreeMarchPass {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("march gbuffer layout"),
                 entries: &[
-                    bgl_storage_tex(0, wgpu::TextureFormat::Rgba32Float),  // position
-                    bgl_storage_tex(1, wgpu::TextureFormat::Rgba16Float),  // normal
-                    bgl_storage_tex(2, wgpu::TextureFormat::Rg32Uint),     // material
+                    bgl_storage_tex(0, wgpu::TextureFormat::Rgba32Float),
+                    bgl_storage_tex(1, wgpu::TextureFormat::Rgba16Float),
+                    bgl_storage_tex(2, wgpu::TextureFormat::Rg32Uint),
                 ],
             });
 
@@ -165,11 +165,13 @@ impl OctreeMarchPass {
         object_count: u32,
         width: u32,
         height: u32,
+        mode: u32,
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) {
         // Update params.
         let params = MarchParams {
             object_count,
-            _pad0: 0,
+            mode,
             _pad1: 0,
             _pad2: 0,
         };
@@ -179,7 +181,7 @@ impl OctreeMarchPass {
         if let (Some(gbuffer_bg), Some(params_bg)) = (&self.gbuffer_bind_group, &self.params_bind_group) {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("octree_march"),
-                timestamp_writes: None,
+                timestamp_writes: timestamp_writes,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, scene_bind_group, &[]);
@@ -191,6 +193,19 @@ impl OctreeMarchPass {
                 1,
             );
         }
+    }
+}
+
+fn bgl_storage_tex_rw(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::ReadWrite,
+            format,
+            view_dimension: wgpu::TextureViewDimension::D2,
+        },
+        count: None,
     }
 }
 

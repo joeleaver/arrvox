@@ -11,6 +11,7 @@ use crate::rkp_shadow_ao::{RkpShadowAoPass, ShadowAoParams};
 use crate::rkp_shade::{RkpShadePass, ShadeParams, GpuLight, GpuMaterial};
 use crate::rkp_gpu_object::RkpGpuObject;
 use crate::octree_march::OctreeMarchPass;
+use crate::gpu_profiler::GpuProfiler;
 
 /// The complete RKIPatch renderer.
 pub struct RkpRenderer {
@@ -28,12 +29,25 @@ pub struct RkpRenderer {
     materials_buffer: wgpu::Buffer,
     /// Device for buffer operations.
     device: wgpu::Device,
+    /// GPU timestamp profiler.
+    pub profiler: GpuProfiler,
+    /// Pass slot indices.
+    slot_march: u32,
+    slot_normal: u32,
+    slot_shadow: u32,
+    slot_shade: u32,
 }
 
 impl RkpRenderer {
-    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) -> Self {
         let scene = RkpScene::new(device);
         let mut march = OctreeMarchPass::new(device, &scene.bind_group_layout);
+
+        let mut profiler = GpuProfiler::new(device, 0.0); // disabled for now
+        let slot_march = profiler.register_pass("march_hit");
+        let slot_normal = profiler.register_pass("march_nrm");
+        let slot_shadow = profiler.register_pass("shadow");
+        let slot_shade = profiler.register_pass("shade");
         let shadow_ao = RkpShadowAoPass::new(device, &scene, width, height);
         let mut shade = RkpShadePass::new(device, width, height);
 
@@ -70,6 +84,7 @@ impl RkpRenderer {
             scene, march, shadow_ao, shade,
             shade_params_buffer, lights_buffer, materials_buffer,
             device: device.clone(),
+            profiler, slot_march, slot_normal, slot_shadow, slot_shade,
         }
     }
 
@@ -84,13 +99,11 @@ impl RkpRenderer {
     /// Set G-buffer views. Call after G-buffer creation or resize.
     pub fn set_gbuffer(
         &mut self,
-        position_view: &wgpu::TextureView,
-        normal_view: &wgpu::TextureView,
-        material_view: &wgpu::TextureView,
+        gbuffer: &rkf_render::GBuffer,
     ) {
-        self.march.set_gbuffer(&self.device, position_view, normal_view, material_view);
-        self.shadow_ao.set_gbuffer(&self.device, position_view, normal_view);
-        self.shade.set_gbuffer(&self.device, position_view, normal_view, material_view);
+        self.march.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view);
+        self.shadow_ao.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view);
+        self.shade.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view);
         self.shade.set_shadow_ao(&self.device, &self.shadow_ao.output_view);
     }
 
@@ -109,14 +122,28 @@ impl RkpRenderer {
         shadow_ao_params: &ShadowAoParams,
     ) {
         // 1. Octree ray march → G-buffer.
-        self.march.dispatch(encoder, queue, &self.scene.bind_group, object_count, width, height);
+        self.march.dispatch(
+            encoder, queue, &self.scene.bind_group,
+            object_count, width, height, 0,
+            self.profiler.compute_timestamps(self.slot_march),
+        );
 
         // 2. Shadow + AO at half resolution.
         self.shadow_ao.update_params(queue, shadow_ao_params);
-        self.shadow_ao.dispatch(encoder, &self.scene);
+        self.shadow_ao.dispatch_with_timestamps(encoder, &self.scene,
+            self.profiler.compute_timestamps(self.slot_shadow));
 
         // 3. Deferred PBR shading.
-        self.shade.dispatch(encoder);
+        self.shade.dispatch_with_timestamps(encoder,
+            self.profiler.compute_timestamps(self.slot_shade));
+
+        // 4. Resolve profiler timestamps.
+        self.profiler.resolve(encoder);
+    }
+
+    /// Read and log GPU profiler results. Call after submit + poll.
+    pub fn log_profiler(&mut self) {
+        self.profiler.read_and_log(&self.device, 60);
     }
 
     pub fn update_materials(&mut self, queue: &wgpu::Queue, materials: &[GpuMaterial]) {

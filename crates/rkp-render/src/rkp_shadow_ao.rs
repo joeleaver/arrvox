@@ -215,9 +215,19 @@ impl RkpShadowAoPass {
         encoder: &mut wgpu::CommandEncoder,
         scene: &RkpScene,
     ) {
+        self.dispatch_with_timestamps(encoder, scene, None);
+    }
+
+    /// Dispatch with optional GPU timestamp writes.
+    pub fn dispatch_with_timestamps(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &RkpScene,
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
+    ) {
         let gbuf_bg = match &self.gbuffer_bind_group {
             Some(bg) => bg,
-            None => return, // G-buffer not set yet.
+            None => return,
         };
 
         let wg_x = (self.half_width + 7) / 8;
@@ -225,7 +235,7 @@ impl RkpShadowAoPass {
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("rkp_shadow_ao"),
-            timestamp_writes: None,
+            timestamp_writes: timestamp_writes,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &scene.bind_group, &[]);

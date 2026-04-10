@@ -277,14 +277,10 @@ impl EngineState {
         let height = config.height;
 
         let gbuffer = rkf_render::GBuffer::new(&device, width, height);
-        let mut renderer = RkpRenderer::new(&device, width, height);
+        let mut renderer = RkpRenderer::new(&device, &queue, width, height);
 
         // Wire G-buffer into renderer.
-        renderer.set_gbuffer(
-            &gbuffer.position_view,
-            &gbuffer.normal_view,
-            &gbuffer.material_view,
-        );
+        renderer.set_gbuffer(&gbuffer);
 
         // Tone mapping: HDR shade output → LDR (Rgba8Unorm).
         let tone_map = rkf_render::ToneMapPass::new(
@@ -398,6 +394,8 @@ impl EngineState {
     }
 
     fn render_frame(&mut self) -> (Vec<u8>, u32, u32) {
+        let frame_start = std::time::Instant::now();
+
         // 0a. Upload material palette if dirty.
         if self.material_lib.is_dirty() {
             let palette = self.material_lib.build_palette();
@@ -410,6 +408,8 @@ impl EngineState {
             self.update_scene_gpu();
             self.gpu_objects_dirty = false;
         }
+
+        let t_cpu_setup = frame_start.elapsed();
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("rkp frame"),
@@ -430,10 +430,14 @@ impl EngineState {
         };
         self.renderer.upload_frame(&self.queue, &frame);
 
+        let t_upload = frame_start.elapsed();
+
         // 3. Render: march → shadow/AO → shade.
         let object_count = self.gpu_objects.len() as u32;
         let shadow_params = rkp_render::rkp_shadow_ao::ShadowAoParams::default();
         self.renderer.render(&mut encoder, &self.queue, object_count, self.width, self.height, &shadow_params);
+
+        let t_encode = frame_start.elapsed();
 
         // 4b. Pick: copy material texture (object_id+1 in G bits 8-15, 0 = no hit).
         let pick_issued = self.pending_pick.is_some();
@@ -523,8 +527,12 @@ impl EngineState {
             },
         );
 
+        let t_post = frame_start.elapsed();
+
         // 8. Submit GPU work.
         self.queue.submit(std::iter::once(encoder.finish()));
+
+        let t_submit = frame_start.elapsed();
 
         // 9. Process pick readback if we just issued one.
         if pick_issued {
@@ -533,6 +541,25 @@ impl EngineState {
 
         // 10. Map readback buffer and extract pixels.
         let pixels = self.map_readback();
+
+        // 11. GPU profiler — read timestamps (logs every 60 frames).
+        self.renderer.log_profiler();
+
+        let t_readback = frame_start.elapsed();
+
+        // Log timing every 60 frames.
+        if self.frame_index % 60 == 0 && self.frame_index > 0 {
+            eprintln!(
+                "[perf] cpu_setup={:.1}ms upload={:.1}ms encode={:.1}ms post={:.1}ms submit={:.1}ms readback={:.1}ms total={:.1}ms",
+                t_cpu_setup.as_secs_f64() * 1000.0,
+                (t_upload - t_cpu_setup).as_secs_f64() * 1000.0,
+                (t_encode - t_upload).as_secs_f64() * 1000.0,
+                (t_post - t_encode).as_secs_f64() * 1000.0,
+                (t_submit - t_post).as_secs_f64() * 1000.0,
+                (t_readback - t_submit).as_secs_f64() * 1000.0,
+                t_readback.as_secs_f64() * 1000.0,
+            );
+        }
 
         self.frame_index += 1;
 
@@ -623,11 +650,7 @@ impl EngineState {
                     self.height = height;
                     self.gbuffer = rkf_render::GBuffer::new(&self.device, width, height);
                     self.renderer.resize(width, height);
-                    self.renderer.set_gbuffer(
-                        &self.gbuffer.position_view,
-                        &self.gbuffer.normal_view,
-                        &self.gbuffer.material_view,
-                    );
+                    self.renderer.set_gbuffer(&self.gbuffer);
                     self.tone_map = rkf_render::ToneMapPass::new(
                         &self.device,
                         &self.renderer.shade.output_view,
@@ -1442,7 +1465,6 @@ impl EngineState {
                     renderable.material_id,
                     gpu_idx,
                 );
-                // Map scene_id → gpu_index for face remapping.
                 if let Some(&scene_id) = self.entity_scene_ids.get(&entity) {
                     self.scene_id_to_gpu.insert(scene_id, gpu_idx);
                 }
@@ -1935,4 +1957,36 @@ fn tick_loop(
             std::thread::sleep(target - elapsed);
         }
     }
+}
+
+/// Extract 6 frustum planes from a view-projection matrix.
+/// Each plane is (nx, ny, nz, d) where nx*x + ny*y + nz*z + d >= 0 means inside.
+fn extract_frustum_planes(vp: &glam::Mat4) -> [glam::Vec4; 6] {
+    let r0 = vp.row(0);
+    let r1 = vp.row(1);
+    let r2 = vp.row(2);
+    let r3 = vp.row(3);
+    [
+        r3 + r0, // left
+        r3 - r0, // right
+        r3 + r1, // bottom
+        r3 - r1, // top
+        r3 + r2, // near
+        r3 - r2, // far
+    ]
+}
+
+/// Test if an AABB (center + half-extents) is inside or intersects the frustum.
+fn aabb_in_frustum(planes: &[glam::Vec4; 6], center: glam::Vec3, half: glam::Vec3) -> bool {
+    for plane in planes {
+        let n = glam::Vec3::new(plane.x, plane.y, plane.z);
+        let d = plane.w;
+        // Effective radius: project half-extents onto the plane normal.
+        let r = half.x * n.x.abs() + half.y * n.y.abs() + half.z * n.z.abs();
+        // If the center is further than r behind the plane, the AABB is fully outside.
+        if n.dot(center) + d + r < 0.0 {
+            return false;
+        }
+    }
+    true
 }
