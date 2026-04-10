@@ -9,7 +9,7 @@ const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
 const OCTREE_LEAF_BIT: u32 = 0x80000000u;
 const OPACITY_THRESHOLD: f32 = 0.05;
 const MAX_STEPS: u32 = 256u;
-const MAX_OBJECTS: u32 = 64u;
+const MAX_OBJECTS: u32 = 16u;
 
 struct VoxelSample { word0: u32, word1: u32, }
 
@@ -26,6 +26,7 @@ struct RkpObject {
     _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32,
     _pad4: u32, _pad5: u32, _pad6: u32, _pad7: u32,
     _pad8: u32, _pad9: u32, _pad10: u32, _pad11: u32,
+    inverse_world: mat4x4<f32>,
 }
 
 struct CameraUniforms {
@@ -66,6 +67,11 @@ struct OctreeResult { slot: u32, depth: u32, }
 
 @group(2) @binding(0) var<uniform> march_params: MarchParams;
 @group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
+@group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 4>;
+// stats[0] = total steps across all pixels
+// stats[1] = total octree lookups across all pixels
+// stats[2] = pixels that found a hit
+// stats[3] = max steps for any single pixel
 
 // --- Helpers ---
 
@@ -100,6 +106,7 @@ fn intersect_aabb(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box
 }
 
 fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>) -> OctreeResult {
+    atomicAdd(&stats[1], 1u); // count every octree lookup
     var offset = root;
     var half = extent * 0.5;
     var center = vec3<f32>(half);
@@ -216,7 +223,7 @@ fn march_object(
 ) -> MarchResult {
     var result = MarchResult(vec3<f32>(0.0), vec3<f32>(0.0), 0.0, 0.0, 0u, false, 0u);
 
-    let inv_world = invert_rigid(obj.world);
+    let inv_world = obj.inverse_world;
     let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
     let local_dir = normalize((inv_world * vec4<f32>(world_dir, 0.0)).xyz);
 
@@ -363,7 +370,7 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
         let obj = objects[i];
         if obj.geom_type == 0u { continue; }
 
-        let inv_world = invert_rigid(obj.world);
+        let inv_world = obj.inverse_world;
         let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
         let local_dir = normalize((inv_world * vec4<f32>(ray_dir, 0.0)).xyz);
         let extent = bitcast<f32>(obj.octree_extent_bits);
@@ -407,10 +414,17 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
         }
     }
 
+    // Write per-pixel stats.
+    var total_steps = 0u;
+    for (var s = 0u; s < result_count; s++) {
+        total_steps += results[s].steps;
+    }
+    atomicAdd(&stats[0], total_steps);
+    atomicMax(&stats[3], total_steps);
+
     if result_count == 0u {
-        textureStore(gbuf_position, coord, vec4<f32>(0.0, 0.0, 0.0, 1e10));
-        textureStore(gbuf_normal, coord, vec4<f32>(0.0, 0.0, 0.0, 0.0));
-        textureStore(gbuf_material, coord, vec4<u32>(0u, 0u, 0u, 0u));
+        // Skip background writes — G-buffer is cleared before the march.
+        // Saves 3 storage texture writes per miss pixel.
         return;
     }
 
@@ -496,6 +510,7 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
                  | (((first_obj_id + 1u) & 0xFFu) << 8u)
                  | (color_rgb565 << 16u);
 
+    atomicAdd(&stats[2], 1u); // count hit pixels
     textureStore(gbuf_position, coord, vec4<f32>(final_pos, first_dist));
     let final_normal = normalize(accum_normal);
     textureStore(gbuf_normal, coord, vec4<f32>(final_normal, accum_alpha));

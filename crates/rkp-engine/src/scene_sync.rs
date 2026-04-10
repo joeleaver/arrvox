@@ -14,6 +14,7 @@ pub fn build_gpu_object(
 ) -> RkpGpuObject {
     let mut gpu = RkpGpuObject::zeroed();
     gpu.world = world_matrix.to_cols_array_2d();
+    gpu.inverse_world = world_matrix.inverse().to_cols_array_2d();
     gpu.aabb_min = aabb.min.into();
     gpu.aabb_max = aabb.max.into();
     gpu.voxel_size = voxel_size;

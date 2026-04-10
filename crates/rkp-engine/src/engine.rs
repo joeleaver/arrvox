@@ -560,7 +560,7 @@ impl EngineState {
         let pixels = self.map_readback();
 
         // 11. GPU profiler — process finished frames (logs every 60 frames).
-        self.renderer.end_profiler_frame(self.frame_index);
+        self.renderer.end_profiler_frame(self.frame_index, self.width, self.height);
 
         let t_readback = frame_start.elapsed();
 

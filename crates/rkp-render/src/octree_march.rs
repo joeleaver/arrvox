@@ -22,6 +22,9 @@ pub struct OctreeMarchPass {
     params_bind_group_layout: wgpu::BindGroupLayout,
     params_buffer: wgpu::Buffer,
     params_bind_group: Option<wgpu::BindGroup>,
+    /// Stats buffer for profiling (4 atomic u32s).
+    stats_buffer: wgpu::Buffer,
+    stats_readback: wgpu::Buffer,
 }
 
 impl OctreeMarchPass {
@@ -63,6 +66,16 @@ impl OctreeMarchPass {
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -111,6 +124,18 @@ impl OctreeMarchPass {
             params_bind_group_layout,
             params_buffer,
             params_bind_group: None,
+            stats_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("march stats"),
+                size: 16, // 4 × u32
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            stats_readback: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("march stats readback"),
+                size: 16,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }),
         }
     }
 
@@ -127,6 +152,10 @@ impl OctreeMarchPass {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: materials_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.stats_buffer.as_entire_binding(),
                 },
             ],
         }));
@@ -149,6 +178,42 @@ impl OctreeMarchPass {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(material_view) },
             ],
         }));
+    }
+
+    /// Clear stats buffer before dispatch.
+    pub fn clear_stats(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.clear_buffer(&self.stats_buffer, 0, None);
+    }
+
+    /// Copy stats to readback buffer after dispatch.
+    pub fn copy_stats(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.copy_buffer_to_buffer(&self.stats_buffer, 0, &self.stats_readback, 0, 16);
+    }
+
+    /// Read stats from readback buffer. Call after device.poll().
+    pub fn read_stats(&self, device: &wgpu::Device, total_pixels: u32, frame_idx: u64) {
+        if frame_idx % 60 != 0 || frame_idx == 0 { return; }
+        let slice = self.stats_readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let _ = device.poll(wgpu::PollType::Poll);
+        if let Ok(Ok(())) = rx.try_recv() {
+            let data = slice.get_mapped_range();
+            let vals: &[u32] = bytemuck::cast_slice(&data);
+            let total_steps = vals[0];
+            let total_lookups = vals[1];
+            let hit_pixels = vals[2];
+            let max_steps = vals[3];
+            let avg_steps = if total_pixels > 0 { total_steps as f32 / total_pixels as f32 } else { 0.0 };
+            let avg_lookups = if total_pixels > 0 { total_lookups as f32 / total_pixels as f32 } else { 0.0 };
+            eprintln!(
+                "[march stats] avg_steps={:.1} avg_lookups={:.1} max_steps={} hit_pixels={}/{} total_lookups={}M",
+                avg_steps, avg_lookups, max_steps, hit_pixels, total_pixels,
+                total_lookups / 1_000_000,
+            );
+            drop(data);
+            self.stats_readback.unmap();
+        }
     }
 
     /// Update params and dispatch the march.

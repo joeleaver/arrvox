@@ -7,12 +7,11 @@
 
 use bytemuck::{Pod, Zeroable};
 
-/// Per-object GPU data (192 bytes, bytemuck Pod).
+/// Per-object GPU data (256 bytes, bytemuck Pod).
 ///
 /// Uploaded to a storage buffer and read by all RKIPatch shaders.
-/// Only stores the forward `world` transform — no `inverse_world`.
 ///
-/// # Layout (192 bytes)
+/// # Layout (256 bytes)
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
@@ -34,6 +33,7 @@ use bytemuck::{Pod, Zeroable};
 /// | 136    | 4    | rest_octree_extent_bits (u32) |
 /// | 140    | 4    | deformed_pool_offset (u32) |
 /// | 144    | 48   | _padding |
+/// | 192    | 64   | inverse_world (mat4x4<f32>) — world→local |
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
 pub struct RkpGpuObject {
@@ -77,8 +77,11 @@ pub struct RkpGpuObject {
     /// Offset into deformed bone-field pool.
     pub deformed_pool_offset: u32,
 
-    /// Padding to 192 bytes.
+    /// Padding.
     pub _padding: [u32; 12],
+
+    /// Inverse world transform (world→local). Precomputed on CPU.
+    pub inverse_world: [[f32; 4]; 4],
 }
 
 /// Geometry type constants.

@@ -119,6 +119,7 @@ impl RkpRenderer {
         shadow_ao_params: &ShadowAoParams,
     ) {
         // 1. Octree ray march → G-buffer.
+        self.march.clear_stats(encoder);
         {
             let q = self.profiler.begin_query("march", encoder);
             self.march.dispatch(
@@ -127,6 +128,7 @@ impl RkpRenderer {
             );
             self.profiler.end_query(encoder, q);
         }
+        self.march.copy_stats(encoder);
 
         // 2. Shadow + AO at half resolution.
         self.shadow_ao.update_params(queue, shadow_ao_params);
@@ -148,7 +150,8 @@ impl RkpRenderer {
     }
 
     /// End frame + process profiler results. Call after submit.
-    pub fn end_profiler_frame(&mut self, frame_idx: u64) {
+    pub fn end_profiler_frame(&mut self, frame_idx: u64, width: u32, height: u32) {
+        self.march.read_stats(&self.device, width * height, frame_idx);
         if let Err(e) = self.profiler.end_frame() {
             if frame_idx > 10 {
                 eprintln!("[profiler] end_frame: {e}");
