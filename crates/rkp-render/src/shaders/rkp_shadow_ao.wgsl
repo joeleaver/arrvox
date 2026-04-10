@@ -21,18 +21,18 @@ struct VoxelSample {
 
 struct RkpGpuObject {
     world: mat4x4<f32>,
-    aabb_min: vec3<f32>,
-    octree_root: u32,
-    aabb_max: vec3<f32>,
-    octree_depth: u32,
-    octree_extent_bits: u32,
-    voxel_size: f32,
-    material_id: u32,
-    object_id: u32,
-    geom_type: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    aabb_min: vec3<f32>, octree_root: u32,
+    aabb_max: vec3<f32>, octree_depth: u32,
+    octree_extent_bits: u32, voxel_size: f32,
+    material_id: u32, object_id: u32,
+    geom_type: u32, is_skinned: u32,
+    bone_count: u32, bone_buffer_offset: u32,
+    rest_octree_root: u32, rest_octree_depth: u32,
+    rest_octree_extent_bits: u32, deformed_pool_offset: u32,
+    _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32,
+    _pad4: u32, _pad5: u32, _pad6: u32, _pad7: u32,
+    _pad8: u32, _pad9: u32, _pad10: u32, _pad11: u32,
+    inverse_world: mat4x4<f32>,
 }
 
 struct CameraUniforms {
@@ -254,7 +254,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let obj = objects[oi];
         if obj.geom_type == 0u { continue; }
 
-        let inv_world = mat4_inverse(obj.world);
+        let inv_world = obj.inverse_world;
 
         // Shadow: trace toward light.
         let obj_shadow = trace_shadow(world_pos, light_dir, inv_world, obj);
