@@ -15,6 +15,8 @@ pub enum PanelId {
     SceneTree,
     SceneView,
     ObjectProperties,
+    AssetProperties,
+    Environment,
     Materials,
     Console,
     Profiling,
@@ -244,17 +246,24 @@ pub fn default_layout() -> LayoutConfig {
         },
         right: Container {
             kind: ContainerKind::Right,
-            zones: vec![Zone {
-                tabs: vec![PanelId::ObjectProperties, PanelId::Materials],
-                active_tab: 0,
-                fraction: 1.0,
-            }],
+            zones: vec![
+                Zone {
+                    tabs: vec![PanelId::ObjectProperties],
+                    active_tab: 0,
+                    fraction: 0.5,
+                },
+                Zone {
+                    tabs: vec![PanelId::AssetProperties, PanelId::Environment],
+                    active_tab: 0,
+                    fraction: 0.5,
+                },
+            ],
             visible: true,
         },
         bottom: Container {
             kind: ContainerKind::Bottom,
             zones: vec![Zone {
-                tabs: vec![PanelId::Models, PanelId::Console, PanelId::Profiling],
+                tabs: vec![PanelId::Materials, PanelId::Models, PanelId::Console, PanelId::Profiling],
                 active_tab: 0,
                 fraction: 1.0,
             }],

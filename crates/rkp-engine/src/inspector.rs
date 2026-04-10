@@ -71,6 +71,15 @@ pub struct ComponentSnapshot {
     pub removable: bool,
 }
 
+/// Per-material voxel usage for a renderable entity.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MaterialUsage {
+    /// Material runtime ID.
+    pub material_id: u16,
+    /// How many voxels use this as their primary material.
+    pub voxel_count: u32,
+}
+
 /// Full inspector snapshot for a selected entity.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct InspectorSnapshot {
@@ -80,4 +89,6 @@ pub struct InspectorSnapshot {
     pub rotation: [f32; 3],
     pub scale: [f32; 3],
     pub components: Vec<ComponentSnapshot>,
+    /// Per-material voxel usage (only for entities with Renderable + spatial data).
+    pub material_usage: Vec<MaterialUsage>,
 }

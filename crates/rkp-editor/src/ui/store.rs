@@ -12,6 +12,8 @@ use uuid::Uuid;
 use rkp_engine::{SceneObjectInfo, ModelInfo};
 use rkp_engine::gizmo::GizmoMode;
 use rkp_engine::inspector::InspectorSnapshot;
+use rkp_engine::environment::EnvironmentSettings;
+use rkp_engine::material_library::MaterialInfo;
 use rkp_engine::recent_projects::RecentProject;
 
 use crate::ui::layout::{ContainerKind, LayoutConfig, PanelId, default_layout};
@@ -84,6 +86,19 @@ pub struct EditorStore {
     pub inspector: Signal<Option<InspectorSnapshot>>,
     /// Components available to add to the selected entity.
     pub available_components: Signal<Vec<String>>,
+
+    // ── Material state (written by engine) ──────────────────────
+
+    /// Available materials in the project.
+    pub materials: Signal<Vec<MaterialInfo>>,
+    /// Currently selected material in the materials panel.
+    pub selected_material: Signal<Option<u16>>,
+    /// Material being dragged onto viewport (None = no drag).
+    pub material_drag: Signal<Option<u16>>,
+    /// Currently selected model source path (for Asset Properties).
+    pub selected_model: Signal<Option<String>>,
+    /// Environment settings (sky, lighting, shadows, tone mapping).
+    pub environment: Signal<EnvironmentSettings>,
 
     // ── Drag state (tab dragging) ────────────────────────────────
 
@@ -163,6 +178,13 @@ impl EditorStore {
             model_drag: Signal::new(None),
             inspector: Signal::new(None),
             available_components: Signal::new(Vec::new()),
+
+            // Material state.
+            materials: Signal::new(Vec::new()),
+            selected_material: Signal::new(None),
+            material_drag: Signal::new(None),
+            selected_model: Signal::new(None),
+            environment: Signal::new(EnvironmentSettings::default()),
 
             // Drag state.
             tab_drag: Signal::new(None),

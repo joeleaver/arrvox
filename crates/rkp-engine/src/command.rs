@@ -93,6 +93,60 @@ pub enum EngineCommand {
         material_id: u16,
     },
 
+    // ── Materials ────────────────────────────────────────────────────
+
+    /// Create a new material with the given name.
+    CreateMaterial {
+        name: String,
+    },
+
+    /// Update a field on a material definition.
+    UpdateMaterialField {
+        material_id: u16,
+        field: String,
+        value: String,
+    },
+
+    /// Delete a material by its runtime ID.
+    DeleteMaterial {
+        material_id: u16,
+    },
+
+    /// Assign a material to an entity (sets Renderable.material_id).
+    AssignMaterial {
+        entity_id: Uuid,
+        material_id: u16,
+    },
+
+    /// Select a material in the materials panel.
+    SelectMaterial {
+        material_id: Option<u16>,
+    },
+
+    /// Select a model in the models panel (for Asset Properties).
+    SelectModel {
+        path: Option<String>,
+    },
+
+    /// Update a field on a model's import profile.
+    UpdateImportField {
+        /// Source mesh path (identifies which model).
+        source_path: String,
+        field: String,
+        value: String,
+    },
+
+    /// Save the import profile and re-import the model.
+    ReimportModel {
+        source_path: String,
+    },
+
+    /// Update an environment setting.
+    UpdateEnvironment {
+        field: String,
+        value: String,
+    },
+
     // ── Sculpt / Paint ───────────────────────────────────────────────
 
     /// Apply a sculpt brush stroke.

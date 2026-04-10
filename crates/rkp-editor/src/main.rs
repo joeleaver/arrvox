@@ -158,6 +158,18 @@ fn main() -> anyhow::Result<()> {
                 if let Some(ref rp) = update.recent_projects {
                     store.recent_projects.send(rp.clone());
                 }
+                if let Some(ref mats) = update.materials {
+                    store.materials.send(mats.clone());
+                }
+                if let Some(sel) = update.selected_material {
+                    store.selected_material.send(Some(sel));
+                }
+                if let Some(ref path) = update.selected_model {
+                    store.selected_model.send(Some(path.clone()));
+                }
+                if let Some(ref env) = update.environment {
+                    store.environment.send(env.clone());
+                }
             })
         },
     );

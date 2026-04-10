@@ -11,7 +11,7 @@ use crate::rkp_shadow_ao::{RkpShadowAoPass, ShadowAoParams};
 use crate::rkp_shade::{RkpShadePass, ShadeParams, GpuLight, GpuMaterial};
 use crate::rkp_gpu_object::RkpGpuObject;
 use crate::octree_march::OctreeMarchPass;
-use crate::gpu_profiler::GpuProfiler;
+use wgpu_profiler::GpuProfiler;
 
 /// The complete RKIPatch renderer.
 pub struct RkpRenderer {
@@ -29,13 +29,9 @@ pub struct RkpRenderer {
     materials_buffer: wgpu::Buffer,
     /// Device for buffer operations.
     device: wgpu::Device,
-    /// GPU timestamp profiler.
+    /// GPU profiler (wgpu-profiler).
     pub profiler: GpuProfiler,
-    /// Pass slot indices.
-    slot_march: u32,
-    slot_normal: u32,
-    slot_shadow: u32,
-    slot_shade: u32,
+    timestamp_period: f32,
 }
 
 impl RkpRenderer {
@@ -43,11 +39,12 @@ impl RkpRenderer {
         let scene = RkpScene::new(device);
         let mut march = OctreeMarchPass::new(device, &scene.bind_group_layout);
 
-        let mut profiler = GpuProfiler::new(device, 0.0); // disabled for now
-        let slot_march = profiler.register_pass("march_hit");
-        let slot_normal = profiler.register_pass("march_nrm");
-        let slot_shadow = profiler.register_pass("shadow");
-        let slot_shade = profiler.register_pass("shade");
+        let profiler = GpuProfiler::new(device, wgpu_profiler::GpuProfilerSettings {
+            enable_timer_queries: true,
+            enable_debug_groups: true,
+            max_num_pending_frames: 4,
+        }).expect("failed to create GPU profiler");
+        let timestamp_period = queue.get_timestamp_period();
         let shadow_ao = RkpShadowAoPass::new(device, &scene, width, height);
         let mut shade = RkpShadePass::new(device, width, height);
 
@@ -84,7 +81,7 @@ impl RkpRenderer {
             scene, march, shadow_ao, shade,
             shade_params_buffer, lights_buffer, materials_buffer,
             device: device.clone(),
-            profiler, slot_march, slot_normal, slot_shadow, slot_shade,
+            profiler, timestamp_period,
         }
     }
 
@@ -113,7 +110,7 @@ impl RkpRenderer {
 
     /// Render: march → shadow/AO → shade.
     pub fn render(
-        &self,
+        &mut self,
         encoder: &mut wgpu::CommandEncoder,
         queue: &wgpu::Queue,
         object_count: u32,
@@ -122,30 +119,65 @@ impl RkpRenderer {
         shadow_ao_params: &ShadowAoParams,
     ) {
         // 1. Octree ray march → G-buffer.
-        self.march.dispatch(
-            encoder, queue, &self.scene.bind_group,
-            object_count, width, height, 0,
-            self.profiler.compute_timestamps(self.slot_march),
-        );
+        {
+            let q = self.profiler.begin_query("march", encoder);
+            self.march.dispatch(
+                encoder, queue, &self.scene.bind_group,
+                object_count, width, height, 0, None,
+            );
+            self.profiler.end_query(encoder, q);
+        }
 
         // 2. Shadow + AO at half resolution.
         self.shadow_ao.update_params(queue, shadow_ao_params);
-        self.shadow_ao.dispatch_with_timestamps(encoder, &self.scene,
-            self.profiler.compute_timestamps(self.slot_shadow));
+        {
+            let q = self.profiler.begin_query("shadow_ao", encoder);
+            self.shadow_ao.dispatch(encoder, &self.scene);
+            self.profiler.end_query(encoder, q);
+        }
 
         // 3. Deferred PBR shading.
-        self.shade.dispatch_with_timestamps(encoder,
-            self.profiler.compute_timestamps(self.slot_shade));
+        {
+            let q = self.profiler.begin_query("shade", encoder);
+            self.shade.dispatch(encoder);
+            self.profiler.end_query(encoder, q);
+        }
 
-        // 4. Resolve profiler timestamps.
-        self.profiler.resolve(encoder);
+        // 4. Resolve profiler queries.
+        self.profiler.resolve_queries(encoder);
     }
 
-    /// Read and log GPU profiler results. Call after submit + poll.
-    pub fn log_profiler(&mut self) {
-        self.profiler.read_and_log(&self.device, 60);
+    /// End frame + process profiler results. Call after submit.
+    pub fn end_profiler_frame(&mut self, frame_idx: u64) {
+        if let Err(e) = self.profiler.end_frame() {
+            if frame_idx > 10 {
+                eprintln!("[profiler] end_frame: {e}");
+            }
+        }
+        if let Some(results) = self.profiler.process_finished_frame(self.timestamp_period) {
+            if frame_idx % 60 == 0 && frame_idx > 0 {
+                eprint!("[gpu]");
+                for r in &results {
+                    let ms = r.time.as_ref().map(|t| (t.end - t.start) * 1000.0).unwrap_or(0.0);
+                    eprint!(" {}={:.2}ms", r.label, ms);
+                }
+                eprintln!();
+            }
+        }
     }
 
+    /// Update shade params (sky colors, ambient intensity).
+    pub fn update_shade_params(&self, queue: &wgpu::Queue, params: &ShadeParams) {
+        queue.write_buffer(&self.shade_params_buffer, 0, bytemuck::bytes_of(params));
+    }
+
+    /// Update the lights buffer (directional/point lights).
+    pub fn update_lights(&self, queue: &wgpu::Queue, lights: &[GpuLight]) {
+        let data: &[u8] = bytemuck::cast_slice(lights);
+        queue.write_buffer(&self.lights_buffer, 0, data);
+    }
+
+    /// Replace the GPU materials palette.
     pub fn update_materials(&mut self, queue: &wgpu::Queue, materials: &[GpuMaterial]) {
         let data: &[u8] = bytemuck::cast_slice(materials);
         let needed = data.len() as u64;

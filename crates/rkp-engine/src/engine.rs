@@ -229,6 +229,11 @@ struct EngineState {
     /// Currently selected model path (source mesh) for Asset Properties.
     selected_model: Option<String>,
 
+    /// Environment settings (sky, lighting, shadows, tone mapping).
+    environment: crate::environment::EnvironmentSettings,
+    /// Whether environment settings changed and need GPU update.
+    environment_dirty: bool,
+
     /// File watcher for hot-reload (watches project assets/ directory).
     file_watcher: Option<crate::file_watcher::RkpFileWatcher>,
     /// Background import worker for mesh → .rkp conversion.
@@ -364,6 +369,8 @@ impl EngineState {
             material_lib: crate::material_library::MaterialLibrary::new(),
             selected_material: None,
             selected_model: None,
+            environment: crate::environment::EnvironmentSettings::default(),
+            environment_dirty: true, // upload on first frame
             file_watcher: None,
             import_worker: crate::import_worker::ImportWorker::new(),
             geometry_dirty: false,
@@ -403,7 +410,17 @@ impl EngineState {
             self.material_lib.clear_dirty();
         }
 
-        // 0b. Rebuild GPU objects from ECS world only when transforms/objects changed.
+        // 0b. Upload environment settings if dirty.
+        if self.environment_dirty {
+            let shade_params = self.environment.to_shade_params();
+            self.renderer.update_shade_params(&self.queue, &shade_params);
+            let light = self.environment.to_gpu_light();
+            self.renderer.update_lights(&self.queue, &[light]);
+            self.tone_map.set_exposure(&self.queue, self.environment.exposure);
+            self.environment_dirty = false;
+        }
+
+        // 0c. Rebuild GPU objects from ECS world only when transforms/objects changed.
         if self.gpu_objects_dirty {
             self.update_scene_gpu();
             self.gpu_objects_dirty = false;
@@ -434,7 +451,7 @@ impl EngineState {
 
         // 3. Render: march → shadow/AO → shade.
         let object_count = self.gpu_objects.len() as u32;
-        let shadow_params = rkp_render::rkp_shadow_ao::ShadowAoParams::default();
+        let shadow_params = self.environment.to_shadow_ao_params(object_count);
         self.renderer.render(&mut encoder, &self.queue, object_count, self.width, self.height, &shadow_params);
 
         let t_encode = frame_start.elapsed();
@@ -542,8 +559,8 @@ impl EngineState {
         // 10. Map readback buffer and extract pixels.
         let pixels = self.map_readback();
 
-        // 11. GPU profiler — read timestamps (logs every 60 frames).
-        self.renderer.log_profiler();
+        // 11. GPU profiler — process finished frames (logs every 60 frames).
+        self.renderer.end_profiler_frame(self.frame_index);
 
         let t_readback = frame_start.elapsed();
 
@@ -1068,6 +1085,44 @@ impl EngineState {
                     output_path: output,
                     config: profile.to_import_config(),
                 });
+            }
+
+            EngineCommand::UpdateEnvironment { field, value } => {
+                let env = &mut self.environment;
+                match field.as_str() {
+                    "sky_color_top" => {
+                        if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) { env.sky_color_top = v; }
+                    }
+                    "sky_color_horizon" => {
+                        if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) { env.sky_color_horizon = v; }
+                    }
+                    "ambient_intensity" => {
+                        if let Ok(v) = value.parse::<f32>() { env.ambient_intensity = v; }
+                    }
+                    "sun_direction" => {
+                        if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) { env.sun_direction = v; }
+                    }
+                    "sun_color" => {
+                        if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) { env.sun_color = v; }
+                    }
+                    "sun_intensity" => {
+                        if let Ok(v) = value.parse::<f32>() { env.sun_intensity = v; }
+                    }
+                    "shadow_steps" => {
+                        if let Ok(v) = value.parse::<u32>() { env.shadow_steps = v; }
+                    }
+                    "ao_radius" => {
+                        if let Ok(v) = value.parse::<f32>() { env.ao_radius = v; }
+                    }
+                    "ao_steps" => {
+                        if let Ok(v) = value.parse::<u32>() { env.ao_steps = v; }
+                    }
+                    "exposure" => {
+                        if let Ok(v) = value.parse::<f32>() { env.exposure = v; }
+                    }
+                    _ => { eprintln!("[RkpEngine] unknown environment field: {field}"); }
+                }
+                self.environment_dirty = true;
             }
 
             _ => {
@@ -1891,6 +1946,11 @@ impl EngineState {
             },
             selected_material: self.selected_material,
             selected_model: self.selected_model.clone(),
+            environment: if self.frame_index <= 1 || self.environment_dirty {
+                Some(self.environment.clone())
+            } else {
+                None
+            },
         }
     }
 }

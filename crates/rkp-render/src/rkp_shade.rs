@@ -191,13 +191,13 @@ impl RkpShadePass {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("rkp_shade pipeline"),
             bind_group_layouts: &[
-                &gbuffer_bind_group_layout,
-                &shadow_ao_bind_group_layout,
-                &output_bind_group_layout,
-                &shade_bind_group_layout,
-                &camera_bind_group_layout,
+                Some(&gbuffer_bind_group_layout),
+                Some(&shadow_ao_bind_group_layout),
+                Some(&output_bind_group_layout),
+                Some(&shade_bind_group_layout),
+                Some(&camera_bind_group_layout),
             ],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

@@ -44,15 +44,27 @@ pub struct StateUpdate {
     pub available_components: Option<Vec<String>>,
     /// Recent projects list (sent once on startup).
     pub recent_projects: Option<Vec<crate::recent_projects::RecentProject>>,
+    /// Available materials — sent when the material list changes.
+    pub materials: Option<Vec<crate::material_library::MaterialInfo>>,
+    /// Currently selected material in the materials panel.
+    pub selected_material: Option<u16>,
+    /// Currently selected model path (for Asset Properties).
+    pub selected_model: Option<String>,
+    /// Environment settings (sent when changed or on first frame).
+    pub environment: Option<crate::environment::EnvironmentSettings>,
 }
 
 /// Info about an available model file.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelInfo {
-    /// Display name (filename without extension).
+    /// Display name (from import profile, or filename without extension).
     pub name: String,
     /// Full path to the .rkp file.
     pub path: String,
+    /// Source mesh path (.glb/.obj/.fbx) if this was auto-imported.
+    pub source_path: String,
     /// File size in bytes.
     pub size: u64,
+    /// Import profile (for editing in Asset Properties).
+    pub import_profile: Option<crate::import_profile::ImportProfile>,
 }

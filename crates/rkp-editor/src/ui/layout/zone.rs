@@ -67,6 +67,8 @@ pub fn ZoneComponent(container: ContainerKind, zone_idx: usize) -> NodeHandle {
                 if active_panel.get() == Some(PanelId::SceneTree) { SceneTree {} }
                 if active_panel.get() == Some(PanelId::SceneView) { Viewport {} }
                 if active_panel.get() == Some(PanelId::ObjectProperties) { ObjectProperties {} }
+                if active_panel.get() == Some(PanelId::AssetProperties) { AssetProperties {} }
+                if active_panel.get() == Some(PanelId::Environment) { EnvironmentPanel {} }
                 if active_panel.get() == Some(PanelId::Materials) { MaterialsPanel {} }
                 if active_panel.get() == Some(PanelId::Console) { ConsolePanel {} }
                 if active_panel.get() == Some(PanelId::Profiling) { ProfilingPanel {} }

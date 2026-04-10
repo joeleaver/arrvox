@@ -18,6 +18,8 @@ pub struct GpuProfiler {
     pass_names: Vec<&'static str>,
     /// Whether profiling is active.
     enabled: bool,
+    /// Whether this frame had active dispatches.
+    active: bool,
     /// Frame counter for periodic logging.
     frame_count: u64,
 }
@@ -51,6 +53,7 @@ impl GpuProfiler {
             timestamp_period,
             pass_names: Vec::new(),
             enabled: timestamp_period > 0.0,
+            active: false,
             frame_count: 0,
         }
     }
@@ -75,8 +78,10 @@ impl GpuProfiler {
 
     /// Resolve timestamps and copy to readback buffer.
     /// Call after all passes are recorded, before submit.
-    pub fn resolve(&self, encoder: &mut wgpu::CommandEncoder) {
-        if !self.enabled { return; }
+    /// `active` should be true only if compute passes actually dispatched.
+    pub fn resolve(&mut self, encoder: &mut wgpu::CommandEncoder, active: bool) {
+        self.active = active;
+        if !self.enabled || !active { return; }
         let count = (self.pass_names.len() as u32 * 2).min(MAX_QUERIES);
         encoder.resolve_query_set(&self.query_set, 0..count, &self.resolve_buffer, 0);
         encoder.copy_buffer_to_buffer(
@@ -86,21 +91,29 @@ impl GpuProfiler {
         );
     }
 
-    /// Read back timestamps and log results. Call after submit + poll.
-    /// Logs every `interval` frames.
+    /// Read back timestamps and log results. Call AFTER device.poll() has completed
+    /// (e.g., after the frame readback poll). Logs every `interval` frames.
     pub fn read_and_log(&mut self, device: &wgpu::Device, interval: u64) {
         self.frame_count += 1;
-        if !self.enabled || self.frame_count % interval != 0 { return; }
+        // Skip first 2 frames (resolve buffer not yet written) and non-interval frames.
+        if !self.enabled || !self.active || self.frame_count < 3 || self.frame_count % interval != 0 { return; }
 
         let count = self.pass_names.len();
         if count == 0 { return; }
 
+        // Map the readback buffer. Don't block — if not ready, skip.
         let slice = self.readback_buffer.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let mapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mapped_clone = mapped.clone();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            if r.is_ok() { mapped_clone.store(true, std::sync::atomic::Ordering::SeqCst); }
+        });
+        // Non-blocking poll — just process pending callbacks.
+        let _ = device.poll(wgpu::PollType::Poll);
 
-        if rx.recv().ok().and_then(|r| r.ok()).is_none() { return; }
+        if !mapped.load(std::sync::atomic::Ordering::SeqCst) {
+            return; // not ready — try next interval
+        }
 
         let data = slice.get_mapped_range();
         let timestamps: &[u64] = bytemuck::cast_slice(&data);

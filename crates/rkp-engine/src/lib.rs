@@ -13,11 +13,14 @@
 pub mod camera;
 pub mod command;
 pub mod components;
+pub mod environment;
 pub mod component_registry;
 pub mod file_watcher;
+pub mod import_profile;
 pub mod import_worker;
 pub mod gizmo;
 pub mod inspector;
+pub mod material_library;
 pub mod project;
 pub mod recent_projects;
 pub mod scene_io;
@@ -28,4 +31,5 @@ pub mod wireframe_builders;
 
 pub use command::EngineCommand;
 pub use snapshot::{StateUpdate, SceneObjectInfo, ModelInfo};
+pub use material_library::MaterialInfo;
 pub use engine::RkpEngine;

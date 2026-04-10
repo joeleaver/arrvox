@@ -90,6 +90,12 @@ impl SplatVoxel {
         self.0.secondary_material_id()
     }
 
+    /// Replace the secondary material ID (bits 16–31 of word1), preserving primary.
+    #[inline]
+    pub fn set_secondary_material_id(&mut self, id: u16) {
+        self.0.word1 = (self.0.word1 & 0x0000_FFFF) | ((id as u32) << 16);
+    }
+
     /// Extract the blend weight from bits 16–23 of word0.
     /// 0 = primary only, 255 = fully secondary.
     #[inline]

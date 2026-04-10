@@ -197,10 +197,10 @@ impl SplatEmitPass {
             label: Some("splat_emit pipeline layout"),
             bind_group_layouts: &[
                 scene_bind_group_layout,     // group 0: octree_nodes + objects
-                &output_bind_group_layout,   // group 1: face_instances + draw_args
-                &params_bind_group_layout,   // group 2: emit_params
+                Some(&output_bind_group_layout),   // group 1: face_instances + draw_args
+                Some(&params_bind_group_layout),   // group 2: emit_params
             ],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

@@ -148,12 +148,12 @@ impl RkpShadowAoPass {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("rkp_shadow_ao pipeline"),
             bind_group_layouts: &[
-                &scene.bind_group_layout,    // group 0: scene
-                &gbuffer_bind_group_layout,  // group 1: g-buffer
-                &output_bind_group_layout,   // group 2: output
-                &params_bind_group_layout,   // group 3: params
+                Some(&scene.bind_group_layout),    // group 0: scene
+                Some(&gbuffer_bind_group_layout),  // group 1: g-buffer
+                Some(&output_bind_group_layout),   // group 2: output
+                Some(&params_bind_group_layout),   // group 3: params
             ],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

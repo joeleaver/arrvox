@@ -17,15 +17,10 @@ pub struct MarchParams {
 /// The octree ray march compute pass.
 pub struct OctreeMarchPass {
     pipeline: wgpu::ComputePipeline,
-    /// Bind group layout for G-buffer outputs (group 1).
     gbuffer_bind_group_layout: wgpu::BindGroupLayout,
-    /// G-buffer bind group. Rebuilt on resize.
     gbuffer_bind_group: Option<wgpu::BindGroup>,
-    /// Params bind group layout (group 2: params uniform + materials storage).
     params_bind_group_layout: wgpu::BindGroupLayout,
-    /// Params uniform buffer.
     params_buffer: wgpu::Buffer,
-    /// Params + materials bind group. Rebuilt when materials buffer changes.
     params_bind_group: Option<wgpu::BindGroup>,
 }
 
@@ -93,11 +88,11 @@ impl OctreeMarchPass {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("octree_march pipeline layout"),
             bind_group_layouts: &[
-                scene_bind_group_layout,         // group 0
-                &gbuffer_bind_group_layout,      // group 1
-                &params_bind_group_layout,       // group 2
+                Some(scene_bind_group_layout),         // group 0
+                Some(&gbuffer_bind_group_layout),      // group 1
+                Some(&params_bind_group_layout),       // group 2
             ],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -196,6 +191,31 @@ impl OctreeMarchPass {
                 1,
             );
         }
+    }
+}
+
+fn create_prev_texture(device: &wgpu::Device, label: &str, w: u32, h: u32, format: wgpu::TextureFormat) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1, sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+fn bgl_texture(binding: u32, sample_type: wgpu::TextureSampleType) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
     }
 }
 

@@ -7,13 +7,15 @@
 use std::rc::Rc;
 
 use rinch::prelude::*;
-use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 
 use crate::CommandSender;
 use crate::ui::store::EditorStore;
 use rkp_engine::inspector::*;
 
 use super::field_editors;
+use super::prop_controls::*;
+
+type CmdSignal = Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>;
 
 #[component]
 pub fn ObjectProperties() -> NodeHandle {
@@ -39,7 +41,6 @@ pub fn ObjectProperties() -> NodeHandle {
 #[component]
 fn InspectorContent() -> NodeHandle {
     let store = use_context::<EditorStore>();
-    let cmd = use_context::<CommandSender>();
 
     let components = Memo::new(move || {
         store.inspector.get()
@@ -80,6 +81,9 @@ fn InspectorContent() -> NodeHandle {
                 }
             }
 
+            // Material usage section (for entities with voxel data)
+            MaterialUsageSection {}
+
             // Add Component button
             AddComponentButton {}
         }
@@ -90,74 +94,41 @@ fn InspectorContent() -> NodeHandle {
 #[component]
 fn ComponentSection(snapshot: ComponentSnapshot) -> NodeHandle {
     let store = use_context::<EditorStore>();
-    let cmd = use_context::<CommandSender>();
+    let cmd_tx: CmdSignal = Signal::new(use_context::<CommandSender>().0);
     let collapsed = Signal::new(false);
     let comp_name = Signal::new(snapshot.name.clone());
     let fields = Signal::new(snapshot.fields.clone());
-    let removable = snapshot.removable;
 
     // Hide EditorMetadata — it's shown in the header.
     if snapshot.name == "EditorMetadata" {
         return rsx! { span {} };
     }
 
-    rsx! {
-        div {
-            style: "border-bottom:1px solid #3c3c3c;",
-
-            // Section header
-            div {
-                style: "display:flex;align-items:center;padding:6px 12px;cursor:pointer;\
-                        background:#2a2a2a;gap:6px;",
-                onclick: move || collapsed.update(|c| *c = !*c),
-
-                // Collapse chevron
-                span {
-                    style: {move || {
-                        if collapsed.get() {
-                            "font-size:10px;color:#666;transform:rotate(-90deg);transition:transform 0.15s;"
-                        } else {
-                            "font-size:10px;color:#666;transition:transform 0.15s;"
-                        }
-                    }},
-                    {"\u{25BC}"} // ▼
-                }
-
-                // Component name
-                span {
-                    style: "flex:1;font-size:11px;font-weight:600;color:#bbb;\
-                            text-transform:uppercase;letter-spacing:0.3px;",
-                    {move || comp_name.get()}
-                }
-
-                // Remove button (only for non-mandatory components)
-                if removable {
-                    div {
-                        style: "cursor:pointer;color:#666;width:14px;height:14px;\
-                                display:flex;align-items:center;justify-content:center;",
-                        onclick: {
-                            let cmd = cmd.clone();
-                            move || {
-                                let cn = comp_name.get();
-                                if let Some(snap) = store.inspector.get() {
-                                    if let Ok(eid) = uuid::Uuid::parse_str(&snap.entity_id) {
-                                        let _ = cmd.0.send(rkp_engine::EngineCommand::RemoveComponent {
-                                            entity_id: eid,
-                                            component_name: cn,
-                                        });
-                                    }
-                                }
-                            }
-                        },
-                        {render_tabler_icon(__scope, TablerIcon::X, TablerIconStyle::Outline)}
-                    }
+    // Build the remove callback for non-mandatory components.
+    let on_remove = if snapshot.removable {
+        Some(Rc::new(move || {
+            let cn = comp_name.get();
+            if let Some(snap) = store.inspector.get() {
+                if let Ok(eid) = uuid::Uuid::parse_str(&snap.entity_id) {
+                    let _ = cmd_tx.get().send(rkp_engine::EngineCommand::RemoveComponent {
+                        entity_id: eid,
+                        component_name: cn,
+                    });
                 }
             }
+        }) as Rc<dyn Fn()>)
+    } else {
+        None
+    };
+
+    rsx! {
+        div {
+            {prop_section_header(__scope, &snapshot.name, collapsed, on_remove)}
 
             // Fields (hidden when collapsed)
             if !collapsed.get() {
                 div {
-                    style: "padding:6px 12px;",
+                    style: "padding:6px 12px;display:flex;flex-direction:column;gap:2px;",
                     for field in fields.get() {
                         FieldRow {
                             key: field.name.clone(),
@@ -171,18 +142,15 @@ fn ComponentSection(snapshot: ComponentSnapshot) -> NodeHandle {
     }
 }
 
-/// A single field row — label + type-appropriate editor.
+/// A single field row — delegates to field_editors which uses prop_controls.
 #[component]
 fn FieldRow(snapshot: FieldSnapshot, component_name: String) -> NodeHandle {
     let store = use_context::<EditorStore>();
     let cmd = use_context::<CommandSender>();
-    let field_name = snapshot.name.clone();
-    let is_transient = snapshot.transient;
 
-    // Callback for when the field value changes.
     let on_change: Rc<dyn Fn(FieldValue)> = {
         let comp = component_name.clone();
-        let fname = field_name.clone();
+        let fname = snapshot.name.clone();
         let cmd = cmd.clone();
         Rc::new(move |value: FieldValue| {
             if let Some(snap) = store.inspector.get() {
@@ -200,25 +168,144 @@ fn FieldRow(snapshot: FieldSnapshot, component_name: String) -> NodeHandle {
     };
 
     rsx! {
-        div {
-            style: "display:flex;align-items:center;margin-bottom:4px;gap:4px;",
-            // Label
+        {field_editors::field_editor(__scope, &snapshot, on_change)}
+    }
+}
+
+/// Material usage section — which materials are used and how many voxels of each.
+#[component]
+fn MaterialUsageSection() -> NodeHandle {
+    let store = use_context::<EditorStore>();
+    let cmd_tx: CmdSignal = Signal::new(use_context::<CommandSender>().0);
+    let collapsed = Signal::new(false);
+
+    let usage = Memo::new(move || {
+        store.inspector.get()
+            .map(|snap| snap.material_usage.clone())
+            .unwrap_or_default()
+    });
+
+    rsx! {
+        if !usage.get().is_empty() {
             div {
-                style: {|| {
-                    if is_transient {
-                        "width:80px;flex-shrink:0;color:#555;font-size:11px;font-style:italic;"
-                    } else {
-                        "width:80px;flex-shrink:0;color:#888;font-size:11px;"
+                {prop_section_header(__scope, "Materials", collapsed, None)}
+
+                if !collapsed.get() {
+                    div {
+                        style: "padding:6px 12px;display:flex;flex-direction:column;gap:2px;",
+                        for mu in usage.get() {
+                            {material_usage_row(
+                                __scope,
+                                mu.material_id,
+                                mu.voxel_count,
+                                store,
+                                cmd_tx,
+                            )}
+                        }
                     }
-                }},
-                {field_name}
-            }
-            // Editor
-            div {
-                style: "flex:1;min-width:0;",
-                {field_editors::field_editor(__scope, &snapshot, on_change)}
+                }
             }
         }
+    }
+}
+
+/// A single material usage row with swatch, name, count, and drag-drop remap.
+fn material_usage_row(
+    __scope: &mut rinch::core::dom::RenderScope,
+    material_id: u16,
+    voxel_count: u32,
+    store: EditorStore,
+    cmd_tx: CmdSignal,
+) -> rinch::core::dom::NodeHandle {
+    let mat_name = Signal::new({
+        store.materials.get()
+            .iter()
+            .find(|m| m.id == material_id)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| format!("Material {material_id}"))
+    });
+    let mat_color = Signal::new({
+        store.materials.get()
+            .iter()
+            .find(|m| m.id == material_id)
+            .map(|m| m.base_color)
+            .unwrap_or([0.5, 0.5, 0.5, 1.0])
+    });
+
+    let is_drop_target = Signal::new(false);
+    let count_str = format_voxel_count(voxel_count);
+
+    rsx! {
+        div {
+            style: {move || {
+                if is_drop_target.get() {
+                    "display:flex;align-items:center;gap:6px;padding:3px 4px;\
+                     border-radius:3px;border:1px dashed #4fc3f7;background:#1a2a3a;"
+                } else {
+                    "display:flex;align-items:center;gap:6px;padding:3px 4px;\
+                     border-radius:3px;border:1px solid transparent;"
+                }
+            }},
+            ondragenter: move || {
+                if store.material_drag.get().is_some() {
+                    is_drop_target.set(true);
+                }
+            },
+            ondragleave: move || {
+                is_drop_target.set(false);
+            },
+            ondrop: move || {
+                is_drop_target.set(false);
+                if let Some(new_mat_id) = store.material_drag.get() {
+                    if let Some(snap) = store.inspector.get() {
+                        if let Ok(eid) = uuid::Uuid::parse_str(&snap.entity_id) {
+                            let _ = cmd_tx.get().send(rkp_engine::EngineCommand::RemapMaterial {
+                                object_id: eid,
+                                from_material: material_id,
+                                to_material: new_mat_id,
+                            });
+                        }
+                    }
+                    store.material_drag.set(None);
+                }
+            },
+
+            // Color swatch
+            div {
+                style: {move || {
+                    let [r, g, b, _] = mat_color.get();
+                    format!(
+                        "width:14px;height:14px;border-radius:3px;flex-shrink:0;\
+                         border:1px solid #3c3c3c;\
+                         background:rgb({},{},{});",
+                        (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8,
+                    )
+                }},
+            }
+
+            // Material name
+            div {
+                style: "flex:1;font-size:11px;color:#ccc;\
+                        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
+                {move || mat_name.get()}
+            }
+
+            // Voxel count
+            div {
+                style: "font-size:10px;color:#666;flex-shrink:0;font-family:monospace;",
+                {count_str}
+            }
+        }
+    }
+}
+
+fn format_voxel_count(count: u32) -> String {
+    if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else if count >= 1_000 {
+        format!("{:.1}K", count as f64 / 1_000.0)
+    } else {
+        format!("{count}")
     }
 }
 
@@ -226,26 +313,15 @@ fn FieldRow(snapshot: FieldSnapshot, component_name: String) -> NodeHandle {
 #[component]
 fn AddComponentButton() -> NodeHandle {
     let store = use_context::<EditorStore>();
-    // Store the sender in a Signal so it's Copy and can be used in for-loop closures.
-    let cmd_tx = Signal::new(use_context::<CommandSender>().0);
+    let cmd_tx: CmdSignal = Signal::new(use_context::<CommandSender>().0);
     let open = Signal::new(false);
 
     rsx! {
         div {
             style: "padding:8px 12px;",
-            // Button
-            div {
-                style: "display:flex;align-items:center;justify-content:center;gap:4px;\
-                        padding:6px 12px;background:#2d2d2d;border:1px solid #3c3c3c;\
-                        border-radius:4px;cursor:pointer;color:#888;font-size:11px;",
-                onclick: move || open.update(|o| *o = !*o),
-                span {
-                    style: "width:12px;height:12px;display:inline-flex;\
-                            align-items:center;justify-content:center;",
-                    {render_tabler_icon(__scope, TablerIcon::Plus, TablerIconStyle::Outline)}
-                }
-                {"Add Component"}
-            }
+            {prop_button(__scope, "Add Component", "#2d2d2d", Rc::new(move || {
+                open.update(|o| *o = !*o);
+            }))}
             // Dropdown
             if open.get() {
                 div {

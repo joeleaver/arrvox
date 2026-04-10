@@ -121,6 +121,16 @@ pub fn Viewport() -> NodeHandle {
                     });
                     store.model_drag.set(None);
                 }
+                // Material drag-and-drop: assign to selected entity.
+                if let Some(mat_id) = store.material_drag.get() {
+                    if let Some(entity_id) = store.selected_entity.get() {
+                        let _ = cmd_tx.send(rkp_engine::EngineCommand::AssignMaterial {
+                            entity_id,
+                            material_id: mat_id,
+                        });
+                    }
+                    store.material_drag.set(None);
+                }
             }
             DragEnter { .. } | DragOver { .. } | DragLeave => {
                 // Accept model drags silently.

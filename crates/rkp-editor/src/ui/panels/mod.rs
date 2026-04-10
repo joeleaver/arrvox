@@ -1,5 +1,8 @@
 //! Editor panel components.
 
+pub mod asset_properties;
+pub mod environment_panel;
+pub mod prop_controls;
 pub mod scene_tree;
 pub mod viewport;
 pub mod status_bar;
@@ -11,6 +14,8 @@ pub mod field_editors;
 pub mod models_panel;
 pub mod welcome_screen;
 
+pub use asset_properties::AssetProperties;
+pub use environment_panel::EnvironmentPanel;
 pub use scene_tree::SceneTree;
 pub use viewport::Viewport;
 pub use status_bar::StatusBar;

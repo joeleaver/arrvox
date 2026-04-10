@@ -341,7 +341,8 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
     if pixel.x >= dims.x || pixel.y >= dims.y { return; }
 
     let coord = vec2<i32>(pixel.xy);
-    let skip_normals = march_params.mode == 1u; // mode 1 = skip normals (for profiling)
+    let skip_normals = march_params.mode == 1u;
+
     let uv = (vec2<f32>(pixel.xy) + 0.5 + camera.jitter) / camera.resolution;
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     let ray_origin = camera.position.xyz;

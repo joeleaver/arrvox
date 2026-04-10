@@ -11,6 +11,8 @@ pub fn panel_name(id: PanelId) -> &'static str {
         PanelId::SceneTree => "Scene",
         PanelId::SceneView => "Viewport",
         PanelId::ObjectProperties => "Properties",
+        PanelId::AssetProperties => "Asset",
+        PanelId::Environment => "Environment",
         PanelId::Materials => "Materials",
         PanelId::Console => "Console",
         PanelId::Profiling => "Profiling",

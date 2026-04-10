@@ -5,6 +5,7 @@
 use rinch::prelude::*;
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 
+use crate::CommandSender;
 use crate::ui::store::EditorStore;
 use rkp_engine::ModelInfo;
 
@@ -34,17 +35,40 @@ pub fn ModelsPanel() -> NodeHandle {
 #[component]
 fn ModelItem(model: ModelInfo) -> NodeHandle {
     let store = use_context::<EditorStore>();
-    let path = model.path.clone();
+    let cmd = use_context::<CommandSender>();
+    let rkp_path = model.path.clone();
+    let source_path = Signal::new(model.source_path.clone());
     let name = model.name.clone();
     let size_str = format_size(model.size);
+    let has_source = !model.source_path.is_empty();
 
     rsx! {
         div {
-            style: "display:flex;align-items:center;gap:8px;padding:4px 8px;\
-                    cursor:grab;font-size:12px;color:#ccc;",
+            style: {move || {
+                let sp = source_path.get();
+                let selected = store.selected_model.get().as_deref() == Some(sp.as_str());
+                if selected && has_source {
+                    "display:flex;align-items:center;gap:8px;padding:4px 8px;\
+                     cursor:grab;font-size:12px;color:#ccc;background:#37373d;"
+                } else {
+                    "display:flex;align-items:center;gap:8px;padding:4px 8px;\
+                     cursor:grab;font-size:12px;color:#ccc;"
+                }
+            }},
+            onclick: {
+                let cmd = cmd.clone();
+                move || {
+                    let sp = source_path.get();
+                    if !sp.is_empty() {
+                        let _ = cmd.0.send(rkp_engine::EngineCommand::SelectModel {
+                            path: Some(sp),
+                        });
+                    }
+                }
+            },
             draggable: "true",
             ondragstart: {
-                let path = path.clone();
+                let path = rkp_path.clone();
                 move || {
                     store.model_drag.set(Some(path.clone()));
                 }

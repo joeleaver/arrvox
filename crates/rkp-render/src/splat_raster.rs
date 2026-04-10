@@ -53,10 +53,10 @@ impl SplatRasterPipeline {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("splat_raster pipeline layout"),
             bind_group_layouts: &[
-                scene_bind_group_layout,
-                &face_bind_group_layout,
+                Some(scene_bind_group_layout),
+                Some(&face_bind_group_layout),
             ],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -103,7 +103,7 @@ impl SplatRasterPipeline {
                 ],
                 compilation_options: Default::default(),
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -179,6 +179,7 @@ impl SplatRasterPipeline {
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         })
     }
 }
