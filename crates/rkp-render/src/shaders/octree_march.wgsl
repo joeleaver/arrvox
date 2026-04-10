@@ -202,18 +202,19 @@ fn compute_normal(pos: vec3<f32>, root: u32, depth: u32, extent: f32, vs: f32) -
 // position and color (cheap). Normal computed ONCE at the end (expensive).
 
 struct MarchResult {
-    oc_pos: vec3<f32>,       // weighted average octree-space position
-    color: vec3<f32>,        // weighted average color
-    alpha: f32,              // total accumulated opacity
-    t: f32,                  // parameter of first contribution
-    first_slot: u32,         // voxel slot of first hit (for material)
+    oc_pos: vec3<f32>,
+    color: vec3<f32>,
+    alpha: f32,
+    t: f32,
+    first_slot: u32,
     valid: bool,
+    steps: u32,             // total steps taken (for profiling)
 }
 
 fn march_object(
     world_origin: vec3<f32>, world_dir: vec3<f32>, obj: RkpObject, max_t: f32,
 ) -> MarchResult {
-    var result = MarchResult(vec3<f32>(0.0), vec3<f32>(0.0), 0.0, 0.0, 0u, false);
+    var result = MarchResult(vec3<f32>(0.0), vec3<f32>(0.0), 0.0, 0.0, 0u, false, 0u);
 
     let inv_world = invert_rigid(obj.world);
     let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
@@ -239,8 +240,10 @@ fn march_object(
     }
 
     var t = t_range.x;
+    var step_count = 0u;
 
     for (var step = 0u; step < MAX_STEPS; step++) {
+        step_count += 1u;
         if t > t_range.y || t > max_t { break; }
         if result.alpha > 0.99 { break; }
 
@@ -273,14 +276,35 @@ fn march_object(
 
         let sample_opacity = voxel_opacity * mat_opacity;
 
-        // Front-to-back compositing.
+        // Opaque material: first hit wins — no accumulation needed.
+        if mat_opacity >= 0.99 {
+            result.oc_pos = pos;
+            result.alpha = 1.0;
+            result.t = t;
+            result.first_slot = slot;
+            result.valid = true;
+            var color = vec3<f32>(0.5);
+            if slot != 0u {
+                let cp = color_pool_data[slot];
+                if cp != 0u {
+                    color = vec3<f32>(
+                        f32(cp & 0xFFu) / 255.0,
+                        f32((cp >> 8u) & 0xFFu) / 255.0,
+                        f32((cp >> 16u) & 0xFFu) / 255.0,
+                    );
+                }
+            }
+            result.color = color;
+            result.steps = step_count;
+            break; // done — opaque hit
+        }
+
+        // Transparent material: front-to-back compositing.
         let remaining = 1.0 - result.alpha;
         let weight = sample_opacity * remaining;
 
-        // Accumulate position (octree space — cheap, no transform).
         result.oc_pos += pos * weight;
 
-        // Accumulate per-voxel color.
         var color = vec3<f32>(0.5);
         if slot != 0u {
             let cp = color_pool_data[slot];
@@ -305,6 +329,7 @@ fn march_object(
         t += vs * 0.5;
     }
 
+    result.steps = step_count;
     return result;
 }
 
@@ -327,16 +352,54 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
     var obj_indices: array<u32, MAX_OBJECTS>;
     var result_count = 0u;
 
+    // Pre-pass: AABB-test all objects and sort by entry distance (cheap, no octree).
+    var obj_order: array<u32, MAX_OBJECTS>;
+    var obj_t_near: array<f32, MAX_OBJECTS>;
+    var obj_count = 0u;
+
     let num_objects = march_params.object_count;
     for (var i = 0u; i < num_objects && i < MAX_OBJECTS; i++) {
         let obj = objects[i];
         if obj.geom_type == 0u { continue; }
-        let r = march_object(ray_origin, ray_dir, obj, max_t);
+
+        let inv_world = invert_rigid(obj.world);
+        let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
+        let local_dir = normalize((inv_world * vec4<f32>(ray_dir, 0.0)).xyz);
+        let extent = bitcast<f32>(obj.octree_extent_bits);
+        let half_ext = extent * 0.5;
+        let oc_origin = local_origin + vec3<f32>(half_ext);
+        let safe_d = vec3<f32>(
+            select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),
+            select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),
+            select(local_dir.z, select(-1e-10, 1e-10, local_dir.z >= 0.0), abs(local_dir.z) < 1e-10),
+        );
+        let t_range = intersect_aabb(oc_origin, 1.0 / safe_d, vec3<f32>(0.0), vec3<f32>(extent));
+        if t_range.x <= t_range.y {
+            obj_order[obj_count] = i;
+            obj_t_near[obj_count] = t_range.x;
+            obj_count += 1u;
+        }
+    }
+
+    // Sort by t_near (insertion sort, few objects).
+    for (var i = 1u; i < obj_count; i++) {
+        var j = i;
+        while j > 0u && obj_t_near[j - 1u] > obj_t_near[j] {
+            let tmp_o = obj_order[j - 1u]; obj_order[j - 1u] = obj_order[j]; obj_order[j] = tmp_o;
+            let tmp_t = obj_t_near[j - 1u]; obj_t_near[j - 1u] = obj_t_near[j]; obj_t_near[j] = tmp_t;
+            j -= 1u;
+        }
+    }
+
+    // March objects front-to-back. Opaque hits set max_t to skip objects behind.
+    for (var i = 0u; i < obj_count; i++) {
+        if max_t < obj_t_near[i] { break; } // everything remaining is behind an opaque hit
+        let oi = obj_order[i];
+        let r = march_object(ray_origin, ray_dir, objects[oi], max_t);
         if r.valid {
             results[result_count] = r;
-            obj_indices[result_count] = i;
+            obj_indices[result_count] = oi;
             result_count += 1u;
-            // If this object is fully opaque, nothing behind it is visible.
             if r.alpha > 0.99 && r.t < max_t {
                 max_t = r.t;
             }
@@ -390,7 +453,7 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
         let local_hit = oc_pos - vec3<f32>(extent * 0.5);
         let world_pos = (obj.world * vec4<f32>(local_hit, 1.0)).xyz;
         var world_normal = vec3<f32>(0.0, 1.0, 0.0);
-        if !skip_normals {
+        {
             let local_normal = compute_normal(oc_pos, obj.octree_root, obj.octree_depth, extent, vs);
             world_normal = normalize((obj.world * vec4<f32>(local_normal, 0.0)).xyz);
         }

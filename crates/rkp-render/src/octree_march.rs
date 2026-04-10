@@ -178,6 +178,9 @@ impl OctreeMarchPass {
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
 
         // Dispatch.
+        if self.gbuffer_bind_group.is_none() || self.params_bind_group.is_none() {
+            eprintln!("[OctreeMarch] SKIP: gbuf={} params={}", self.gbuffer_bind_group.is_some(), self.params_bind_group.is_some());
+        }
         if let (Some(gbuffer_bg), Some(params_bg)) = (&self.gbuffer_bind_group, &self.params_bind_group) {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("octree_march"),
