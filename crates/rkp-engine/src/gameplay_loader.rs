@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::behavior::SystemEntry;
 use crate::component_registry::{ComponentEntry, ComponentRegistry};
 
 /// Manages the gameplay dylib lifecycle.
@@ -24,6 +25,8 @@ pub struct GameplayLoader {
     lib: Option<libloading::Library>,
     /// Component entries from the current dylib (borrowed from the lib's static memory).
     gameplay_entries: Vec<&'static ComponentEntry>,
+    /// System entries from the current dylib.
+    system_entries: Vec<&'static SystemEntry>,
     /// Last modification time of the dylib file.
     last_modified: Option<std::time::SystemTime>,
 }
@@ -37,6 +40,7 @@ impl GameplayLoader {
             dylib_path: None,
             lib: None,
             gameplay_entries: Vec::new(),
+            system_entries: Vec::new(),
             last_modified: None,
         }
     }
@@ -76,6 +80,27 @@ impl GameplayLoader {
         );
 
         self.gameplay_entries = entries;
+
+        // Also discover system entries (optional — older dylibs may not export this).
+        type SystemsFn = extern "C" fn() -> GameplaySystems;
+        let systems: Vec<&'static SystemEntry> = unsafe {
+            if let Ok(systems_fn) = lib.get::<SystemsFn>(b"rkp_gameplay_systems") {
+                let result = systems_fn();
+                std::slice::from_raw_parts(result.ptr, result.len).to_vec()
+            } else {
+                Vec::new()
+            }
+        };
+
+        if !systems.is_empty() {
+            eprintln!(
+                "[GameplayLoader] discovered {} gameplay systems: {}",
+                systems.len(),
+                systems.iter().map(|e| e.name).collect::<Vec<_>>().join(", "),
+            );
+        }
+
+        self.system_entries = systems;
         self.lib = Some(lib);
 
         Ok(&self.gameplay_entries)
@@ -93,6 +118,11 @@ impl GameplayLoader {
     /// Get the currently loaded gameplay component entries.
     pub fn entries(&self) -> &[&'static ComponentEntry] {
         &self.gameplay_entries
+    }
+
+    /// Get the currently loaded gameplay system entries.
+    pub fn system_entries(&self) -> &[&'static SystemEntry] {
+        &self.system_entries
     }
 
     /// Whether a component name belongs to the gameplay dylib.
@@ -160,6 +190,7 @@ impl GameplayLoader {
     /// Unload the current dylib. Must be called AFTER serializing and removing components.
     pub fn unload(&mut self) {
         self.gameplay_entries.clear();
+        self.system_entries.clear();
         self.lib = None;
         eprintln!("[GameplayLoader] unloaded gameplay dylib");
     }
@@ -175,11 +206,18 @@ impl GameplayLoader {
     }
 }
 
-/// FFI-safe container returned by the gameplay dylib.
+/// FFI-safe container for component entries returned by the gameplay dylib.
 #[repr(C)]
 pub struct GameplayEntries {
     pub ptr: *const &'static ComponentEntry,
     pub len: usize,
-    // The Vec keeps the data alive on the dylib side.
     _storage: Vec<&'static ComponentEntry>,
+}
+
+/// FFI-safe container for system entries returned by the gameplay dylib.
+#[repr(C)]
+pub struct GameplaySystems {
+    pub ptr: *const &'static SystemEntry,
+    pub len: usize,
+    _storage: Vec<&'static SystemEntry>,
 }

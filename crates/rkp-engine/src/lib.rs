@@ -10,6 +10,7 @@
 //!
 //! The engine never calls back into the client via traits. Callbacks are plain `Fn`.
 
+pub mod behavior;
 pub mod camera;
 pub mod command;
 pub mod components;
@@ -37,5 +38,6 @@ pub use snapshot::{StateUpdate, SceneObjectInfo, ModelInfo};
 pub use material_library::MaterialInfo;
 pub use engine::RkpEngine;
 
-// Re-export the proc macro for use by gameplay crates.
+// Re-export the proc macros for use by gameplay crates.
 pub use rkp_macros::rkp_component;
+pub use rkp_macros::rkp_system;

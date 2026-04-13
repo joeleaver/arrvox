@@ -15,7 +15,7 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, DeriveInput, Data, Fields, Lit, Meta, Expr};
+use syn::{parse_macro_input, DeriveInput, Data, Fields, Lit, Meta, Expr, ItemFn};
 
 /// Classify a Rust type to a FieldType variant name.
 fn classify_type(ty: &syn::Type) -> &'static str {
@@ -293,9 +293,104 @@ pub fn rkp_component(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let c: #struct_name = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
                     world.insert_one(entity, c).map_err(|e| format!("{e}"))
                 },
+                on_add: None,
+                on_remove: None,
             }
         }
     };
 
     output.into()
+}
+
+/// Register a gameplay system for automatic discovery and execution.
+///
+/// # Usage
+///
+/// ```ignore
+/// use rkp_engine::rkp_system;
+/// use rkp_engine::behavior::SystemContext;
+///
+/// #[rkp_system(phase = Update)]
+/// fn spin_system(ctx: &mut SystemContext) {
+///     // ...
+/// }
+///
+/// #[rkp_system(phase = LateUpdate, after = ["movement_system"])]
+/// fn camera_follow(ctx: &mut SystemContext) {
+///     // ...
+/// }
+/// ```
+///
+/// # Attributes
+///
+/// - `phase = Update|FixedUpdate|LateUpdate` — which phase to run in (required)
+/// - `after = ["name", ...]` — systems that must run before this one
+/// - `before = ["name", ...]` — systems that must run after this one
+#[proc_macro_attribute]
+pub fn rkp_system(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input_fn = parse_macro_input!(item as ItemFn);
+    let fn_name = &input_fn.sig.ident;
+    let fn_name_str = fn_name.to_string();
+
+    // Parse attributes: phase = Ident, after = [...], before = [...]
+    let attr_str = attr.to_string();
+    let phase = extract_phase(&attr_str)
+        .unwrap_or_else(|| panic!("#[rkp_system] requires `phase = Update|FixedUpdate|LateUpdate`"));
+    let after = extract_string_list(&attr_str, "after");
+    let before = extract_string_list(&attr_str, "before");
+
+    let phase_ident = format_ident!("{}", phase);
+
+    let after_tokens: Vec<_> = after.iter().map(|s| quote! { #s }).collect();
+    let before_tokens: Vec<_> = before.iter().map(|s| quote! { #s }).collect();
+
+    let output = quote! {
+        #input_fn
+
+        inventory::submit! {
+            rkp_engine::behavior::SystemEntry {
+                name: #fn_name_str,
+                module_path: module_path!(),
+                phase: rkp_engine::behavior::Phase::#phase_ident,
+                after: &[#(#after_tokens),*],
+                before: &[#(#before_tokens),*],
+                fn_ptr: #fn_name as fn(&mut rkp_engine::behavior::SystemContext) as *const (),
+            }
+        }
+    };
+
+    output.into()
+}
+
+/// Extract `phase = Ident` from attribute string.
+fn extract_phase(attr: &str) -> Option<String> {
+    // Look for "phase = Ident" pattern.
+    for part in attr.split(',') {
+        let part = part.trim();
+        if let Some(rest) = part.strip_prefix("phase") {
+            let rest = rest.trim().strip_prefix('=')?.trim();
+            // Take first word (ident).
+            let ident: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            if !ident.is_empty() {
+                return Some(ident);
+            }
+        }
+    }
+    None
+}
+
+/// Extract a string list like `after = ["a", "b"]` from attribute string.
+fn extract_string_list(attr: &str, key: &str) -> Vec<String> {
+    // Find key = [...] pattern.
+    let Some(start) = attr.find(key) else { return Vec::new() };
+    let rest = &attr[start + key.len()..];
+    let rest = rest.trim().strip_prefix('=').unwrap_or(rest).trim();
+    let Some(bracket_start) = rest.find('[') else { return Vec::new() };
+    let Some(bracket_end) = rest.find(']') else { return Vec::new() };
+    let inner = &rest[bracket_start + 1..bracket_end];
+
+    inner.split(',')
+        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }

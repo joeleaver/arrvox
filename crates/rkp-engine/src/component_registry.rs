@@ -48,6 +48,11 @@ pub struct ComponentEntry {
     pub serialize: fn(&hecs::World, hecs::Entity) -> Option<String>,
     /// Deserialize JSON and insert onto entity.
     pub deserialize_insert: fn(&mut hecs::World, hecs::Entity, &str) -> Result<(), String>,
+
+    /// Called when this component is added to an entity (during command flush).
+    pub on_add: Option<fn(&mut hecs::World, hecs::Entity)>,
+    /// Called when this component is about to be removed from an entity (during command flush).
+    pub on_remove: Option<fn(&mut hecs::World, hecs::Entity)>,
 }
 
 inventory::collect!(ComponentEntry);
@@ -179,6 +184,8 @@ fn transform_entry() -> ComponentEntry {
             let c: Transform = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
             world.insert_one(entity, c).map_err(|e| format!("{e}"))
         },
+        on_add: None,
+        on_remove: None,
     }
 }
 
@@ -224,6 +231,8 @@ fn editor_metadata_entry() -> ComponentEntry {
             let c: EditorMetadata = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
             world.insert_one(entity, c).map_err(|e| format!("{e}"))
         },
+        on_add: None,
+        on_remove: None,
     }
 }
 
@@ -285,6 +294,8 @@ fn renderable_entry() -> ComponentEntry {
             let c: Renderable = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
             world.insert_one(entity, c).map_err(|e| format!("{e}"))
         },
+        on_add: None,
+        on_remove: None,
     }
 }
 
@@ -350,6 +361,8 @@ fn point_light_entry() -> ComponentEntry {
             let c: PointLight = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
             world.insert_one(entity, c).map_err(|e| format!("{e}"))
         },
+        on_add: None,
+        on_remove: None,
     }
 }
 
@@ -433,6 +446,8 @@ fn spot_light_entry() -> ComponentEntry {
             let c: SpotLight = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
             world.insert_one(entity, c).map_err(|e| format!("{e}"))
         },
+        on_add: None,
+        on_remove: None,
     }
 }
 
@@ -486,6 +501,8 @@ fn camera_entry() -> ComponentEntry {
             let c: Camera = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
             world.insert_one(entity, c).map_err(|e| format!("{e}"))
         },
+        on_add: None,
+        on_remove: None,
     }
 }
 
@@ -579,5 +596,7 @@ fn rigid_body_entry() -> ComponentEntry {
             let c: RigidBody = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
             world.insert_one(entity, c).map_err(|e| format!("{e}"))
         },
+        on_add: None,
+        on_remove: None,
     }
 }

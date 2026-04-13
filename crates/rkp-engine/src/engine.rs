@@ -178,6 +178,8 @@ struct EngineState {
     // Rendering pipeline
     renderer: RkpRenderer,
     gbuffer: rkf_render::GBuffer,
+    bloom: rkf_render::BloomPass,
+    bloom_composite: rkf_render::BloomCompositePass,
     tone_map: rkf_render::ToneMapPass,
 
     // Scene management (CPU)
@@ -238,6 +240,18 @@ struct EngineState {
     console: crate::console::ConsoleLog,
     /// Gameplay dylib loader (hot-reload).
     gameplay_loader: crate::gameplay_loader::GameplayLoader,
+    /// Behavior system executor (created when play starts).
+    behavior_executor: Option<crate::behavior::BehaviorExecutor>,
+    /// Command queue for deferred ECS mutations from gameplay systems.
+    behavior_commands: crate::behavior::CommandQueue,
+    /// Key-value game state store + event bus.
+    game_store: crate::behavior::GameStore,
+    /// System entries from the gameplay dylib.
+    gameplay_systems: Vec<&'static crate::behavior::SystemEntry>,
+    /// Monotonic total play time.
+    play_total_time: f64,
+    /// Monotonic play frame counter.
+    play_frame_count: u64,
     /// Play mode state (None = edit mode).
     play_state: Option<crate::play_mode::PlayModeState>,
     /// View options.
@@ -303,10 +317,25 @@ impl EngineState {
         // Wire G-buffer into renderer.
         renderer.set_gbuffer(&gbuffer);
 
-        // Tone mapping: HDR volumetric output → LDR (Rgba8Unorm).
-        let tone_map = rkf_render::ToneMapPass::new(
+        // Bloom: extract bright pixels from volumetric HDR output, blur, composite.
+        let bloom = rkf_render::BloomPass::new(
             &device,
             &renderer.volumetric.output_view,
+            width,
+            height,
+        );
+        let bloom_composite = rkf_render::BloomCompositePass::new(
+            &device,
+            &renderer.volumetric.output_view,
+            bloom.mip_views(),
+            width,
+            height,
+        );
+
+        // Tone mapping: bloom composite HDR → LDR (Rgba8Unorm).
+        let tone_map = rkf_render::ToneMapPass::new(
+            &device,
+            &bloom_composite.output_view,
             width,
             height,
         );
@@ -356,6 +385,8 @@ impl EngineState {
             queue,
             renderer,
             gbuffer,
+            bloom,
+            bloom_composite,
             tone_map,
             scene_mgr,
             input_system,
@@ -392,6 +423,12 @@ impl EngineState {
             environment_dirty: true, // upload on first frame
             console: crate::console::ConsoleLog::new(),
             gameplay_loader: crate::gameplay_loader::GameplayLoader::new(),
+            behavior_executor: None,
+            behavior_commands: crate::behavior::CommandQueue::new(),
+            game_store: crate::behavior::GameStore::new(),
+            gameplay_systems: Vec::new(),
+            play_total_time: 0.0,
+            play_frame_count: 0,
             play_state: None,
             show_colliders: false,
             collider_caches_dirty: true,
@@ -470,6 +507,8 @@ impl EngineState {
 
             if self.environment_dirty {
                 self.tone_map.set_exposure(&self.queue, self.environment.exposure);
+                self.bloom.set_threshold(&self.queue, self.environment.bloom_threshold, self.environment.bloom_knee);
+                self.bloom_composite.set_intensity(&self.queue, self.environment.bloom_intensity);
                 self.environment_dirty = false;
             }
         }
@@ -528,7 +567,24 @@ impl EngineState {
         let cloud_params = self.environment.to_cloud_params(self.frame_index as f32 / 60.0);
         self.renderer.update_cloud_params(&self.queue, &cloud_params);
 
-        self.renderer.render(&mut encoder, &self.queue, object_count, self.width, self.height, shadow_steps, num_lights, screen_aabbs_bytes);
+        // Atmosphere per-frame params.
+        let sun_d = self.environment.sun_direction();
+        let atmo_frame = rkp_render::rkp_atmosphere::AtmosphereFrameParams {
+            sun_dir: [-sun_d[0], -sun_d[1], -sun_d[2]],
+            sun_intensity: self.environment.sun_intensity,
+            camera_altitude: self.environment.camera_altitude,
+            _pad: [0.0; 3],
+            cam_pos: [cam_uniforms.position[0], cam_uniforms.position[1], cam_uniforms.position[2]],
+            _pad1b: 0.0,
+            cam_forward: [cam_uniforms.forward[0], cam_uniforms.forward[1], cam_uniforms.forward[2]],
+            _pad2: 0.0,
+            cam_right: [cam_uniforms.right[0], cam_uniforms.right[1], cam_uniforms.right[2]],
+            _pad3: 0.0,
+            cam_up: [cam_uniforms.up[0], cam_uniforms.up[1], cam_uniforms.up[2]],
+            _pad4: 0.0,
+        };
+
+        self.renderer.render(&mut encoder, &self.queue, object_count, self.width, self.height, shadow_steps, num_lights, screen_aabbs_bytes, &atmo_frame);
 
         let t_encode = frame_start.elapsed();
 
@@ -556,7 +612,13 @@ impl EngineState {
             }
         }
 
-        // 5. Tone mapping: HDR → LDR (Rgba8Unorm).
+        // 5a. Bloom: extract bright pixels + multi-level blur.
+        self.bloom.dispatch(&mut encoder);
+
+        // 5b. Bloom composite: blend blurred bloom back onto HDR.
+        self.bloom_composite.dispatch(&mut encoder);
+
+        // 5c. Tone mapping: bloom composite HDR → LDR (Rgba8Unorm).
         self.tone_map.dispatch(&mut encoder);
 
         // 6. Copy LDR to composite texture, draw gizmo wireframes, readback.
@@ -756,9 +818,22 @@ impl EngineState {
                     self.gbuffer = rkf_render::GBuffer::new(&self.device, width, height);
                     self.renderer.resize(width, height);
                     self.renderer.set_gbuffer(&self.gbuffer);
-                    self.tone_map = rkf_render::ToneMapPass::new(
+                    self.bloom = rkf_render::BloomPass::new(
                         &self.device,
                         &self.renderer.volumetric.output_view,
+                        width,
+                        height,
+                    );
+                    self.bloom_composite = rkf_render::BloomCompositePass::new(
+                        &self.device,
+                        &self.renderer.volumetric.output_view,
+                        self.bloom.mip_views(),
+                        width,
+                        height,
+                    );
+                    self.tone_map = rkf_render::ToneMapPass::new(
+                        &self.device,
+                        &self.bloom_composite.output_view,
                         width,
                         height,
                     );
@@ -1306,6 +1381,15 @@ impl EngineState {
                     "exposure" => {
                         if let Ok(v) = value.parse::<f32>() { env.exposure = v; }
                     }
+                    "bloom_threshold" => {
+                        if let Ok(v) = value.parse::<f32>() { env.bloom_threshold = v; }
+                    }
+                    "bloom_knee" => {
+                        if let Ok(v) = value.parse::<f32>() { env.bloom_knee = v; }
+                    }
+                    "bloom_intensity" => {
+                        if let Ok(v) = value.parse::<f32>() { env.bloom_intensity = v; }
+                    }
                     "camera_altitude" => {
                         if let Ok(v) = value.parse::<f32>() { env.camera_altitude = v; }
                     }
@@ -1377,13 +1461,30 @@ impl EngineState {
                     }
                     let play = crate::play_mode::PlayModeState::start(&mut self.world);
                     self.play_state = Some(play);
-                    self.console.info("Play mode started");
+                    // Build behavior executor from gameplay systems.
+                    match crate::behavior::BehaviorExecutor::new(&self.gameplay_systems) {
+                        Ok(executor) => {
+                            self.behavior_executor = Some(executor);
+                            self.console.info(format!(
+                                "Play mode started ({} systems)",
+                                self.gameplay_systems.len(),
+                            ));
+                        }
+                        Err(e) => {
+                            self.behavior_executor = None;
+                            self.console.error(format!("Failed to build system schedule: {e}"));
+                            self.console.info("Play mode started (no systems)");
+                        }
+                    }
+                    self.play_total_time = 0.0;
+                    self.play_frame_count = 0;
                 }
             }
 
             EngineCommand::PlayStop => {
                 if let Some(play) = self.play_state.take() {
                     play.stop(&mut self.world);
+                    self.behavior_executor = None;
                     self.gpu_objects_dirty = true;
                     self.console.info("Play mode stopped — transforms restored");
                 }
@@ -1493,6 +1594,14 @@ impl EngineState {
                         for &entry in entries {
                             self.registry.register_gameplay(entry);
                         }
+                        // Store system entries for the behavior executor.
+                        self.gameplay_systems = self.gameplay_loader.system_entries().to_vec();
+                        if !self.gameplay_systems.is_empty() {
+                            self.console.info(format!(
+                                "Loaded {} gameplay systems",
+                                self.gameplay_systems.len(),
+                            ));
+                        }
                         self.scene_dirty = true;
                         return;
                     }
@@ -1552,6 +1661,19 @@ impl EngineState {
                         &saved,
                     );
                     self.console.info(format!("Restored {restored}/{} component instances", saved.len()));
+
+                    // 8. Reload system entries and rebuild executor.
+                    self.gameplay_systems = self.gameplay_loader.system_entries().to_vec();
+                    if let Some(ref mut executor) = self.behavior_executor {
+                        if let Err(e) = executor.rebuild(&self.gameplay_systems) {
+                            self.console.error(format!("Failed to rebuild system schedule: {e}"));
+                        } else {
+                            self.console.info(format!(
+                                "Rebuilt schedule: {} systems",
+                                self.gameplay_systems.len(),
+                            ));
+                        }
+                    }
                 }
                 Err(e) => {
                     self.console.error(format!("Hot-reload failed: {e}"));
@@ -2805,11 +2927,51 @@ fn tick_loop(
         state.poll_import_completions();
         state.check_gameplay_reload();
 
-        // 1c. Step physics if in play mode.
-        if let Some(ref mut play) = state.play_state {
-            let physics_dt = 1.0 / 60.0;
-            if play.step(physics_dt, &mut state.world) {
+        // 1c. Step gameplay systems + physics if in play mode.
+        //
+        // Frame order: Update → flush → FixedUpdate → flush → Physics → LateUpdate → flush
+        //
+        // Gameplay runs before physics so scripts can set transforms on kinematic
+        // bodies before physics reads them. Dynamic bodies have their transforms
+        // overwritten by physics afterward (physics owns dynamic bodies).
+        if state.play_state.is_some() {
+            let dt = 1.0 / 60.0;
+            let fixed_dt = 1.0 / 60.0;
+            state.play_total_time += dt as f64;
+            state.play_frame_count += 1;
+
+            // Update + FixedUpdate phases
+            if let Some(ref mut executor) = state.behavior_executor {
+                executor.tick(
+                    &state.gameplay_systems,
+                    &mut state.world,
+                    &mut state.behavior_commands,
+                    &mut state.game_store,
+                    dt, fixed_dt,
+                    state.play_total_time,
+                    state.play_frame_count,
+                );
                 state.gpu_objects_dirty = true;
+            }
+
+            // Physics step (between FixedUpdate and LateUpdate)
+            if let Some(ref mut play) = state.play_state {
+                if play.step(dt, &mut state.world) {
+                    state.gpu_objects_dirty = true;
+                }
+            }
+
+            // LateUpdate phase
+            if let Some(ref mut executor) = state.behavior_executor {
+                executor.tick_late(
+                    &state.gameplay_systems,
+                    &mut state.world,
+                    &mut state.behavior_commands,
+                    &mut state.game_store,
+                    dt,
+                    state.play_total_time,
+                    state.play_frame_count,
+                );
             }
         }
 
