@@ -19,6 +19,8 @@ pub enum FileEvent {
     MaterialChanged(PathBuf),
     /// An importable mesh (.glb, .gltf, .obj, .fbx) was created or modified.
     MeshSourceChanged(PathBuf),
+    /// A .rs script file was created or modified.
+    ScriptChanged(PathBuf),
 }
 
 /// Watches project directories for asset changes.
@@ -51,6 +53,7 @@ impl RkpFileWatcher {
                     "wgsl" => Some(FileEvent::ShaderChanged(path.clone())),
                     "rkmat" => Some(FileEvent::MaterialChanged(path.clone())),
                     "glb" | "gltf" | "obj" | "fbx" => Some(FileEvent::MeshSourceChanged(path.clone())),
+                    "rs" => Some(FileEvent::ScriptChanged(path.clone())),
                     _ => None,
                 };
                 if let Some(fe) = file_event {
@@ -78,6 +81,7 @@ impl RkpFileWatcher {
                 (FileEvent::ShaderChanged(a), FileEvent::ShaderChanged(b)) => a == b,
                 (FileEvent::MaterialChanged(a), FileEvent::MaterialChanged(b)) => a == b,
                 (FileEvent::MeshSourceChanged(a), FileEvent::MeshSourceChanged(b)) => a == b,
+                (FileEvent::ScriptChanged(a), FileEvent::ScriptChanged(b)) => a == b,
                 _ => false,
             });
             if !dominated {

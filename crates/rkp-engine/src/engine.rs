@@ -1092,6 +1092,7 @@ impl EngineState {
                             self.material_lib.scan(&dir.join("assets/materials"));
                         }
                         self.init_file_watcher();
+                        self.scaffold_and_build_gameplay();
                         self.auto_import_meshes();
                         if let Some(ref pp) = self.project_path {
                             crate::recent_projects::add_recent(&self.project_name, &pp.to_string_lossy());
@@ -1566,50 +1567,93 @@ impl EngineState {
         }
     }
 
-    /// Try to find and load the gameplay dylib from the workspace target directory.
-    fn try_load_gameplay_dylib(&mut self) {
-        // Look for the cdylib in the standard cargo output locations.
-        let candidates = [
-            // Release build (most common for the editor)
-            std::path::PathBuf::from("target/release/librkp_gameplay.so"),
-            std::path::PathBuf::from("target/release/librkp_gameplay.dylib"),
-            std::path::PathBuf::from("target/release/rkp_gameplay.dll"),
-            // Debug build
-            std::path::PathBuf::from("target/debug/librkp_gameplay.so"),
-            std::path::PathBuf::from("target/debug/librkp_gameplay.dylib"),
-            std::path::PathBuf::from("target/debug/rkp_gameplay.dll"),
-        ];
+    /// Scaffold the gameplay crate from project scripts and trigger a build.
+    fn scaffold_and_build_gameplay(&mut self) {
+        let Some(ref project_dir) = self.project_dir else { return };
 
-        for path in &candidates {
-            if path.exists() {
-                match self.gameplay_loader.load(path) {
-                    Ok(entries) => {
-                        let names: Vec<&str> = entries.iter().map(|e| e.name).collect();
-                        self.console.info(format!(
-                            "Loaded gameplay dylib: {} components ({})",
-                            entries.len(),
-                            names.join(", "),
-                        ));
-                        // Register gameplay entries in the component registry.
-                        for &entry in entries {
-                            self.registry.register_gameplay(entry);
-                        }
-                        // Store system entries for the behavior executor.
-                        self.gameplay_systems = self.gameplay_loader.system_entries().to_vec();
-                        if !self.gameplay_systems.is_empty() {
-                            self.console.info(format!(
-                                "Loaded {} gameplay systems",
-                                self.gameplay_systems.len(),
-                            ));
-                        }
-                        self.scene_dirty = true;
-                        return;
-                    }
-                    Err(e) => {
-                        self.console.error(format!("Failed to load gameplay dylib: {e}"));
-                    }
+        // Create assets/scripts directories if they don't exist (new projects).
+        let scripts_dir = project_dir.join("assets/scripts");
+        let _ = std::fs::create_dir_all(scripts_dir.join("components"));
+        let _ = std::fs::create_dir_all(scripts_dir.join("systems"));
+
+        // Generate the gameplay crate.
+        match crate::scaffold::generate_gameplay_crate(project_dir) {
+            Ok(crate_dir) => {
+                self.console.info("Scaffolded gameplay crate");
+                // Build the dylib.
+                self.build_gameplay_crate(&crate_dir);
+            }
+            Err(e) => {
+                self.console.error(format!("Scaffold failed: {e}"));
+            }
+        }
+    }
+
+    /// Build the scaffolded gameplay crate and load the resulting dylib.
+    fn build_gameplay_crate(&mut self, crate_dir: &std::path::Path) {
+        self.console.info("Building gameplay scripts...");
+        let output = std::process::Command::new("cargo")
+            .arg("build")
+            .arg("--release")
+            .arg("--manifest-path")
+            .arg(crate_dir.join("Cargo.toml"))
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                self.console.info("Gameplay scripts compiled");
+                // Load the built dylib.
+                if let Some(ref project_dir) = self.project_dir {
+                    let dylib_path = crate::scaffold::gameplay_dylib_path(project_dir);
+                    self.load_gameplay_dylib(&dylib_path);
                 }
             }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                self.console.error(format!("Gameplay build failed:\n{stderr}"));
+            }
+            Err(e) => {
+                self.console.error(format!("Failed to run cargo: {e}"));
+            }
+        }
+    }
+
+    /// Load a gameplay dylib and register its components + systems.
+    fn load_gameplay_dylib(&mut self, path: &std::path::Path) {
+        if !path.exists() {
+            return;
+        }
+        match self.gameplay_loader.load(path) {
+            Ok(entries) => {
+                let names: Vec<&str> = entries.iter().map(|e| e.name).collect();
+                self.console.info(format!(
+                    "Loaded gameplay: {} components ({})",
+                    entries.len(),
+                    names.join(", "),
+                ));
+                for &entry in entries {
+                    self.registry.register_gameplay(entry);
+                }
+                self.gameplay_systems = self.gameplay_loader.system_entries().to_vec();
+                if !self.gameplay_systems.is_empty() {
+                    self.console.info(format!(
+                        "Loaded {} gameplay systems",
+                        self.gameplay_systems.len(),
+                    ));
+                }
+                self.scene_dirty = true;
+            }
+            Err(e) => {
+                self.console.error(format!("Failed to load gameplay dylib: {e}"));
+            }
+        }
+    }
+
+    /// Try to load an already-built gameplay dylib for the current project.
+    fn try_load_gameplay_dylib(&mut self) {
+        if let Some(ref project_dir) = self.project_dir {
+            let dylib_path = crate::scaffold::gameplay_dylib_path(project_dir);
+            self.load_gameplay_dylib(&dylib_path);
         }
     }
 
@@ -1716,6 +1760,10 @@ impl EngineState {
                         output_path: output,
                         config: crate::import_worker::default_import_config(),
                     });
+                }
+                FileEvent::ScriptChanged(path) => {
+                    eprintln!("[RkpEngine] script changed: {}", path.display());
+                    self.scaffold_and_build_gameplay();
                 }
             }
         }
@@ -2908,7 +2956,8 @@ fn tick_loop(
     let mut state = EngineState::new(&config);
     state.console.info(format!("Engine started ({}x{})", config.width, config.height));
 
-    // Try to load gameplay dylib from the standard build output.
+    // Try to load a pre-built gameplay dylib (if project is already set).
+    // Normally the dylib is scaffolded + built when a project is opened.
     state.try_load_gameplay_dylib();
 
     loop {

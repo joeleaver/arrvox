@@ -27,6 +27,7 @@ pub mod inspector;
 pub mod material_library;
 pub mod project;
 pub mod recent_projects;
+pub mod scaffold;
 pub mod scene_io;
 pub mod snapshot;
 pub mod engine;
