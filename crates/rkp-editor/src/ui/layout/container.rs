@@ -3,6 +3,7 @@
 use rinch::prelude::*;
 
 use super::ContainerKind;
+use super::splitter::ZoneSplitter;
 use super::zone::ZoneComponent;
 use crate::ui::store::EditorStore;
 
@@ -27,13 +28,18 @@ pub fn ContainerComponent(kind: ContainerKind) -> NodeHandle {
                  background:#1e1e1e;overflow:hidden;",
                 flex_dir
             )},
-            // For now, render zones with simple flex sizing.
-            // TODO: ZoneSplitters between zones when zone_count > 1.
             for i in 0..zone_count.get() {
                 ZoneComponent {
-                    key: i.to_string(),
+                    key: format!("zone-{i}"),
                     container: kind,
                     zone_idx: i,
+                }
+                if i + 1 < zone_count.get() {
+                    ZoneSplitter {
+                        key: format!("split-{i}"),
+                        container: kind,
+                        zone_idx: i,
+                    }
                 }
             }
         }

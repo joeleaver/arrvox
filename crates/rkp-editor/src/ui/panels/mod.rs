@@ -12,6 +12,7 @@ pub mod console_panel;
 pub mod profiling_panel;
 pub mod field_editors;
 pub mod models_panel;
+pub mod viewport_toolbar;
 pub mod welcome_screen;
 
 pub use asset_properties::AssetProperties;

@@ -2369,8 +2369,19 @@ impl EngineState {
 
             // Start drag if left mouse is pressed on a gizmo handle.
             if left_pressed && self.gizmo.hovered_axis != crate::gizmo::GizmoAxis::None {
-                let start_point = match self.gizmo.hovered_axis {
-                    crate::gizmo::GizmoAxis::X | crate::gizmo::GizmoAxis::Y | crate::gizmo::GizmoAxis::Z => {
+                let start_point = match (self.gizmo.mode, self.gizmo.hovered_axis) {
+                    // Rotation: project onto the plane perpendicular to the rotation axis.
+                    (crate::gizmo::GizmoMode::Rotate, crate::gizmo::GizmoAxis::X | crate::gizmo::GizmoAxis::Y | crate::gizmo::GizmoAxis::Z) => {
+                        let axis_dir = self.gizmo.hovered_axis.direction();
+                        crate::gizmo::project_to_plane(ray_o, ray_d, center, axis_dir).unwrap_or(center)
+                    }
+                    // Plane handles (XY/XZ/YZ): project onto the constraint plane.
+                    (_, crate::gizmo::GizmoAxis::XY | crate::gizmo::GizmoAxis::XZ | crate::gizmo::GizmoAxis::YZ) => {
+                        let normal = self.gizmo.hovered_axis.plane_normal();
+                        crate::gizmo::project_to_plane(ray_o, ray_d, center, normal).unwrap_or(center)
+                    }
+                    // Single-axis translate / scale: closest point on the axis line.
+                    (_, crate::gizmo::GizmoAxis::X | crate::gizmo::GizmoAxis::Y | crate::gizmo::GizmoAxis::Z) => {
                         let axis_dir = self.gizmo.hovered_axis.direction();
                         let t = crate::gizmo::ray_axis_closest_point(ray_o, ray_d, center, axis_dir);
                         center + axis_dir * t

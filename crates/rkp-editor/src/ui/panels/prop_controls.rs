@@ -144,6 +144,7 @@ pub fn prop_scrub(
 ) -> Node {
     let label = label.to_string();
     let editing = Signal::new(false);
+    let edit_text = Signal::new(String::new());
     let drag_start = Signal::new(0.0f32);
     let drag_started_pos = Signal::new(0.0f32);
     let did_drag = Signal::new(false);
@@ -156,13 +157,16 @@ pub fn prop_scrub(
 
             if editing.get() {
                 // Text edit mode.
+                // edit_text holds the user's raw typed string so the input doesn't
+                // get overwritten with a reformatted number on every keystroke.
                 input {
                     r#type: "number",
                     style: "flex:1;min-width:0;background:#1a1a2e;border:1px solid #4fc3f7;\
                             border-radius:3px;color:#ccc;font-size:11px;padding:3px 6px;\
                             outline:none;font-family:monospace;",
-                    value: {move || format!("{:.3}", value.get())},
+                    value: {move || edit_text.get()},
                     oninput: move |v: String| {
+                        edit_text.set(v.clone());
                         if let Ok(f) = v.parse::<f32>() {
                             let clamped = f.clamp(min, max);
                             value.set(clamped);
@@ -208,6 +212,7 @@ pub fn prop_scrub(
                             })
                             .on_end(move |_, _| {
                                 if !did_drag.get() {
+                                    edit_text.set(format!("{:.3}", value.get()));
                                     editing.set(true);
                                 }
                             })

@@ -221,6 +221,11 @@ pub enum EngineCommand {
 
     // ── Play mode ────────────────────────────────────────────────────
 
+    /// Set the gizmo mode (translate/rotate/scale).
+    SetGizmoMode {
+        mode: crate::gizmo::GizmoMode,
+    },
+
     /// Enter play mode — start physics + behaviors.
     PlayStart,
 

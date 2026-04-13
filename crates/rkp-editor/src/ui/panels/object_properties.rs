@@ -74,9 +74,12 @@ fn InspectorContent() -> NodeHandle {
             }
 
             // Component sections
+            // Key includes entity_id so components remount when selection changes.
+            // Without this, keying by name alone would reuse stale Signals when
+            // both the old and new entity have the same component (e.g. Transform).
             for comp in components.get() {
                 ComponentSection {
-                    key: comp.name.clone(),
+                    key: format!("{}-{}", entity_id.get(), comp.name),
                     snapshot: comp.clone(),
                 }
             }
@@ -179,6 +182,10 @@ fn MaterialUsageSection() -> NodeHandle {
     let cmd_tx: CmdSignal = Signal::new(use_context::<CommandSender>().0);
     let collapsed = Signal::new(false);
 
+    let entity_id = Memo::new(move || {
+        store.inspector.get().map(|s| s.entity_id.clone()).unwrap_or_default()
+    });
+
     let usage = Memo::new(move || {
         store.inspector.get()
             .map(|snap| snap.material_usage.clone())
@@ -194,13 +201,16 @@ fn MaterialUsageSection() -> NodeHandle {
                     div {
                         style: "padding:6px 12px;display:flex;flex-direction:column;gap:2px;",
                         for mu in usage.get() {
-                            {material_usage_row(
-                                __scope,
-                                mu.material_id,
-                                mu.voxel_count,
-                                store,
-                                cmd_tx,
-                            )}
+                            div {
+                                key: format!("{}-{}", entity_id.get(), mu.material_id),
+                                {material_usage_row(
+                                    __scope,
+                                    mu.material_id,
+                                    mu.voxel_count,
+                                    store,
+                                    cmd_tx,
+                                )}
+                            }
                         }
                     }
                 }

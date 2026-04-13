@@ -5,6 +5,7 @@ use rinch::render_surface::{RenderSurface, SurfaceEvent, SurfaceMouseButton};
 
 use crate::CommandSender;
 use crate::ui::store::EditorStore;
+use super::viewport_toolbar::{ViewportHeaderBar, EditModeToolbar};
 
 /// Map rinch SurfaceMouseButton to rkf_runtime InputMouseButton.
 fn map_button(btn: SurfaceMouseButton) -> rkf_runtime::input::InputMouseButton {
@@ -152,6 +153,16 @@ pub fn Viewport() -> NodeHandle {
     });
 
     rsx! {
-        RenderSurface { surface: Some(surface.clone()) }
+        div {
+            style: "display:flex;flex-direction:column;width:100%;height:100%;",
+            // Fixed header — viewport-wide controls (play/stop, etc.)
+            ViewportHeaderBar {}
+            // Render area with floating gizmo overlay
+            div {
+                style: "flex:1;min-height:0;position:relative;",
+                RenderSurface { surface: Some(surface.clone()) }
+                EditModeToolbar {}
+            }
+        }
     }
 }

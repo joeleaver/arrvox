@@ -26,9 +26,19 @@ pub fn ZoneComponent(container: ContainerKind, zone_idx: usize) -> NodeHandle {
 
     let is_dragging = Memo::new(move || store.tab_drag.get().is_some());
 
+    let fraction = Memo::new(move || {
+        store.layout.get().container(container)
+            .zones.get(zone_idx)
+            .map(|z| z.fraction)
+            .unwrap_or(1.0)
+    });
+
     rsx! {
         div {
-            style: "display:flex;flex-direction:column;flex:1;min-height:0;min-width:0;",
+            style: {move || format!(
+                "display:flex;flex-direction:column;flex:{};min-height:0;min-width:0;",
+                fraction.get()
+            )},
             TabBar { container: container, zone_idx: zone_idx }
             // Content area with edge drop targets overlaid.
             div {

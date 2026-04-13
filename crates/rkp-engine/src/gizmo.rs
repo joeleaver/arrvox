@@ -273,14 +273,36 @@ pub fn pick_gizmo_axis_for_mode(
         }
     }
 
+    // Translate/Scale: test plane handles (small quads between axis pairs) first,
+    // since they overlap the axis lines and should take priority when the cursor
+    // is inside the quad.
+    if mode == GizmoMode::Translate || mode == GizmoMode::Scale {
+        let quad_offset = gizmo_size * 0.3;
+        let quad_size = gizmo_size * 0.12;
+        let planes = [
+            (GizmoAxis::XY, Vec3::X, Vec3::Y, Vec3::Z),
+            (GizmoAxis::XZ, Vec3::X, Vec3::Z, Vec3::Y),
+            (GizmoAxis::YZ, Vec3::Y, Vec3::Z, Vec3::X),
+        ];
+        for (plane_axis, a, b, normal) in &planes {
+            if let Some(d) = quad_pick_distance(
+                ray_origin, ray_dir, gizmo_center, *a, *b, *normal,
+                quad_offset, quad_size,
+            ) {
+                if d < threshold && d < best_dist {
+                    best_dist = d;
+                    best_axis = *plane_axis;
+                }
+            }
+        }
+    }
+
     for (axis_id, axis_dir) in &axes {
         let dist = match mode {
             GizmoMode::Rotate => {
-                // Test against a ring: intersect ray with the plane, check distance to circle
                 ring_pick_distance(ray_origin, ray_dir, gizmo_center, *axis_dir, gizmo_size)
             }
             _ => {
-                // Test against axis line segment [0, gizmo_size]
                 line_pick_distance(ray_origin, ray_dir, gizmo_center, *axis_dir, gizmo_size)
             }
         };
@@ -375,6 +397,42 @@ fn ring_pick_distance(
 
     // Distance from hit point to the ring circumference
     Some((dist_from_center - radius).abs())
+}
+
+/// Distance from a ray to a small quad (plane handle) between two axes.
+///
+/// The quad spans from `(offset, offset)` to `(offset + size, offset + size)` in the
+/// plane defined by `axis_a` and `axis_b`, centered at `center`. Returns `Some(0.0)`
+/// if the ray hits inside the quad, or `None` if it misses or is behind the camera.
+fn quad_pick_distance(
+    ray_origin: Vec3,
+    ray_dir: Vec3,
+    center: Vec3,
+    axis_a: Vec3,
+    axis_b: Vec3,
+    normal: Vec3,
+    offset: f32,
+    size: f32,
+) -> Option<f32> {
+    let denom = ray_dir.dot(normal);
+    if denom.abs() < 1e-6 {
+        return None; // Ray parallel to plane
+    }
+    let t = (center - ray_origin).dot(normal) / denom;
+    if t < 0.0 {
+        return None; // Behind camera
+    }
+    let hit = ray_origin + ray_dir * t;
+    let local = hit - center;
+    let a_coord = local.dot(axis_a);
+    let b_coord = local.dot(axis_b);
+    if a_coord >= offset && a_coord <= offset + size
+        && b_coord >= offset && b_coord <= offset + size
+    {
+        Some(0.0) // Inside quad — highest priority
+    } else {
+        None
+    }
 }
 
 /// Compute the translation delta constrained to the active axis.

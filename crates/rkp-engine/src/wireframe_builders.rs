@@ -26,18 +26,22 @@ fn gizmo_axis_color(axis_idx: usize, hovered: GizmoAxis) -> [f32; 4] {
     let bright = [GIZMO_X_HOVER, GIZMO_Y_HOVER, GIZMO_Z_HOVER];
     let dim = [GIZMO_X_DIM, GIZMO_Y_DIM, GIZMO_Z_DIM];
 
-    let hovered_idx = match hovered {
-        GizmoAxis::X => Some(0),
-        GizmoAxis::Y => Some(1),
-        GizmoAxis::Z => Some(2),
-        GizmoAxis::None => None,
-        _ => None,
+    // Which axes are highlighted — single axis or both axes of a plane handle.
+    let highlighted = match hovered {
+        GizmoAxis::X => [true, false, false],
+        GizmoAxis::Y => [false, true, false],
+        GizmoAxis::Z => [false, false, true],
+        GizmoAxis::XY => [true, true, false],
+        GizmoAxis::XZ => [true, false, true],
+        GizmoAxis::YZ => [false, true, true],
+        GizmoAxis::None => return normal[axis_idx],
+        _ => return normal[axis_idx],
     };
 
-    match hovered_idx {
-        None => normal[axis_idx],
-        Some(hi) if hi == axis_idx => bright[axis_idx],
-        Some(_) => dim[axis_idx],
+    if highlighted[axis_idx] {
+        bright[axis_idx]
+    } else {
+        dim[axis_idx]
     }
 }
 
@@ -87,7 +91,61 @@ pub fn translate_gizmo_wireframe(
             verts.push(LineVertex { position: p.to_array(), color });
         }
     }
+
+    // Plane handles — small quads between each pair of axes.
+    let quad_offset = size * 0.3;
+    let quad_size = size * 0.12;
+    let planes: [(GizmoAxis, Vec3, Vec3); 3] = [
+        (GizmoAxis::XY, Vec3::X, Vec3::Y),
+        (GizmoAxis::XZ, Vec3::X, Vec3::Z),
+        (GizmoAxis::YZ, Vec3::Y, Vec3::Z),
+    ];
+
+    for (plane_axis, a, b) in &planes {
+        let is_plane_hovered = hovered == *plane_axis;
+        // Blend the two axis colors; brighten on hover.
+        let color = if is_plane_hovered {
+            let ac = gizmo_axis_color(axis_index(*a), GizmoAxis::None);
+            let bc = gizmo_axis_color(axis_index(*b), GizmoAxis::None);
+            blend_colors(ac, bc, 1.0)
+        } else {
+            let ac = gizmo_axis_color(axis_index(*a), hovered);
+            let bc = gizmo_axis_color(axis_index(*b), hovered);
+            blend_colors(ac, bc, 0.5)
+        };
+
+        // Four corners of the quad.
+        let p00 = center + *a * quad_offset + *b * quad_offset;
+        let p10 = center + *a * (quad_offset + quad_size) + *b * quad_offset;
+        let p11 = center + *a * (quad_offset + quad_size) + *b * (quad_offset + quad_size);
+        let p01 = center + *a * quad_offset + *b * (quad_offset + quad_size);
+
+        // Draw the quad outline.
+        for &(from, to) in &[(p00, p10), (p10, p11), (p11, p01), (p01, p00)] {
+            verts.push(LineVertex { position: from.to_array(), color });
+            verts.push(LineVertex { position: to.to_array(), color });
+        }
+        // Draw a cross fill for visibility.
+        verts.push(LineVertex { position: p00.to_array(), color });
+        verts.push(LineVertex { position: p11.to_array(), color });
+        verts.push(LineVertex { position: p10.to_array(), color });
+        verts.push(LineVertex { position: p01.to_array(), color });
+    }
+
     verts
+}
+
+fn axis_index(dir: Vec3) -> usize {
+    if dir.x > 0.5 { 0 } else if dir.y > 0.5 { 1 } else { 2 }
+}
+
+fn blend_colors(a: [f32; 4], b: [f32; 4], alpha: f32) -> [f32; 4] {
+    [
+        (a[0] + b[0]) * 0.5,
+        (a[1] + b[1]) * 0.5,
+        (a[2] + b[2]) * 0.5,
+        alpha,
+    ]
 }
 
 /// Build a rotate gizmo: 3 axis rings at `center` with radius `size`.
