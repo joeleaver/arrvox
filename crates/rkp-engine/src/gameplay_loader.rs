@@ -214,10 +214,32 @@ pub struct GameplayEntries {
     _storage: Vec<&'static ComponentEntry>,
 }
 
+impl GameplayEntries {
+    /// Construct from a collected inventory iterator.
+    pub fn from_iter(entries: Vec<&'static ComponentEntry>) -> Self {
+        Self {
+            ptr: entries.as_ptr(),
+            len: entries.len(),
+            _storage: entries,
+        }
+    }
+}
+
 /// FFI-safe container for system entries returned by the gameplay dylib.
 #[repr(C)]
 pub struct GameplaySystems {
     pub ptr: *const &'static SystemEntry,
     pub len: usize,
     _storage: Vec<&'static SystemEntry>,
+}
+
+impl GameplaySystems {
+    /// Construct from a collected inventory iterator.
+    pub fn from_iter(entries: Vec<&'static SystemEntry>) -> Self {
+        Self {
+            ptr: entries.as_ptr(),
+            len: entries.len(),
+            _storage: entries,
+        }
+    }
 }

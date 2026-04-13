@@ -232,11 +232,7 @@ fn gen_lib_rs(components: &[String], systems: &[String]) -> String {
     s.push_str("pub extern \"C\" fn rkp_gameplay_entries() -> rkp_engine::gameplay_loader::GameplayEntries {\n");
     s.push_str("    let entries: Vec<&'static ComponentEntry> =\n");
     s.push_str("        inventory::iter::<ComponentEntry>.into_iter().collect();\n");
-    s.push_str("    rkp_engine::gameplay_loader::GameplayEntries {\n");
-    s.push_str("        ptr: entries.as_ptr(),\n");
-    s.push_str("        len: entries.len(),\n");
-    s.push_str("        _storage: entries,\n");
-    s.push_str("    }\n");
+    s.push_str("    rkp_engine::gameplay_loader::GameplayEntries::from_iter(entries)\n");
     s.push_str("}\n\n");
 
     // System FFI export.
@@ -244,11 +240,7 @@ fn gen_lib_rs(components: &[String], systems: &[String]) -> String {
     s.push_str("pub extern \"C\" fn rkp_gameplay_systems() -> rkp_engine::gameplay_loader::GameplaySystems {\n");
     s.push_str("    let entries: Vec<&'static SystemEntry> =\n");
     s.push_str("        inventory::iter::<SystemEntry>.into_iter().collect();\n");
-    s.push_str("    rkp_engine::gameplay_loader::GameplaySystems {\n");
-    s.push_str("        ptr: entries.as_ptr(),\n");
-    s.push_str("        len: entries.len(),\n");
-    s.push_str("        _storage: entries,\n");
-    s.push_str("    }\n");
+    s.push_str("    rkp_engine::gameplay_loader::GameplaySystems::from_iter(entries)\n");
     s.push_str("}\n");
 
     s
