@@ -29,11 +29,16 @@ pub struct RkpShadePass {
 pub struct ShadeParams {
     pub num_lights: u32,
     pub ambient_intensity: f32,
-    pub _pad_align: [f32; 2],          // align sky_color_top to 16 bytes
+    pub camera_altitude: f32,
+    pub sun_intensity: f32,
     pub sky_color_top: [f32; 3],
     pub _pad0: f32,
     pub sky_color_horizon: [f32; 3],
     pub _pad1: f32,
+    pub sun_dir: [f32; 3],
+    pub _pad2: f32,
+    pub ambient_color: [f32; 3],
+    pub _pad3: f32,
 }
 
 impl Default for ShadeParams {
@@ -41,11 +46,16 @@ impl Default for ShadeParams {
         Self {
             num_lights: 0,
             ambient_intensity: 0.3,
-            _pad_align: [0.0; 2],
+            camera_altitude: 100.0,
+            sun_intensity: 20.0,
             sky_color_top: [0.4, 0.6, 1.0],
             _pad0: 0.0,
             sky_color_horizon: [0.8, 0.85, 0.9],
             _pad1: 0.0,
+            sun_dir: [0.5, 0.7, 0.5],
+            _pad2: 0.0,
+            ambient_color: [0.1, 0.15, 0.25],
+            _pad3: 0.0,
         }
     }
 }
@@ -101,11 +111,11 @@ impl RkpShadePass {
                 entries: &[texture_entry(0), texture_entry(1), uint_texture_entry(2)],
             });
 
-        // Group 1: shadow+AO texture
+        // Group 1: shadow texture + SSAO texture
         let ssao_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("rkp_shade ssao"),
-                entries: &[texture_entry(0)],
+                label: Some("rkp_shade shadow+ssao"),
+                entries: &[texture_entry(0), texture_entry(1)],
             });
 
         // Group 2: output HDR texture
@@ -183,9 +193,11 @@ impl RkpShadePass {
         let output_bind_group = Self::create_output_bind_group(device, &output_bind_group_layout, &output_view);
 
         // Pipeline.
+        let shade_src = include_str!("shaders/rkp_shade.wgsl");
+        crate::validate_wgsl(shade_src, "rkp_shade");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rkp_shade"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/rkp_shade.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shade_src.into()),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -247,15 +259,26 @@ impl RkpShadePass {
         }));
     }
 
-    /// Set shadow/AO texture view.
-    pub fn set_ssao(&mut self, device: &wgpu::Device, ssao_view: &wgpu::TextureView) {
+    /// Set shadow texture + SSAO texture views.
+    pub fn set_shadow_and_ssao(
+        &mut self,
+        device: &wgpu::Device,
+        shadow_view: &wgpu::TextureView,
+        ssao_view: &wgpu::TextureView,
+    ) {
         self.ssao_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rkp_shade ssao bg"),
+            label: Some("rkp_shade shadow+ssao bg"),
             layout: &self.ssao_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(ssao_view),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(ssao_view),
+                },
+            ],
         }));
     }
 

@@ -9,6 +9,7 @@
 use crate::rkp_scene::{RkpScene, GeometryUpload, FrameUpload, CameraUniforms};
 use crate::rkp_ssao::RkpSsaoPass;
 use crate::rkp_shade::{RkpShadePass, ShadeParams, GpuLight, GpuMaterial};
+use crate::rkp_volumetric::{RkpVolumetricPass, VolumetricParams, CloudParams};
 use crate::rkp_gpu_object::RkpGpuObject;
 use crate::octree_march::OctreeMarchPass;
 use wgpu_profiler::GpuProfiler;
@@ -27,11 +28,18 @@ pub struct RkpRenderer {
     shade_params_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
     materials_buffer: wgpu::Buffer,
+    /// Volumetric rendering pass (fog + dust + clouds).
+    pub volumetric: RkpVolumetricPass,
+    /// Per-light shadow texture (Rgba8Unorm, up to 4 shadow-casting lights).
+    shadow_texture: wgpu::Texture,
+    shadow_view: wgpu::TextureView,
     /// Device for buffer operations.
     device: wgpu::Device,
     /// GPU profiler (wgpu-profiler).
     pub profiler: GpuProfiler,
     timestamp_period: f32,
+    width: u32,
+    height: u32,
 }
 
 impl RkpRenderer {
@@ -76,12 +84,18 @@ impl RkpRenderer {
         shade.set_shade_data(device, &shade_params_buffer, &lights_buffer, &materials_buffer);
         shade.set_camera(device, &scene.camera_buffer);
         march.set_materials(device, &materials_buffer);
+        march.set_lights(device, &lights_buffer);
+
+        let (shadow_texture, shadow_view) = Self::create_shadow_texture(device, width, height);
+        let volumetric = RkpVolumetricPass::new(device, width, height);
 
         Self {
-            scene, march, ssao, shade,
+            scene, march, ssao, shade, volumetric,
             shade_params_buffer, lights_buffer, materials_buffer,
+            shadow_texture, shadow_view,
             device: device.clone(),
             profiler, timestamp_period,
+            width, height,
         }
     }
 
@@ -98,17 +112,19 @@ impl RkpRenderer {
         &mut self,
         gbuffer: &rkf_render::GBuffer,
     ) {
-        self.march.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view);
+        self.march.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &self.shadow_view);
         self.ssao.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view);
         self.shade.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view);
-        self.shade.set_ssao(&self.device, &self.ssao.output_view);
+        self.shade.set_shadow_and_ssao(&self.device, &self.shadow_view, &self.ssao.output_view);
+        self.volumetric.set_depth_view(&self.device, &gbuffer.position_view);
+        self.volumetric.set_scene_hdr_view(&self.device, &self.shade.output_view);
     }
 
     pub fn set_hdr_output(&mut self, view: &wgpu::TextureView) {
         self.shade.set_output_view(&self.device, view);
     }
 
-    /// Render: march (+ shadow) → SSAO → shade.
+    /// Render: march (+ per-light shadow) → SSAO → shade.
     pub fn render(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -116,21 +132,21 @@ impl RkpRenderer {
         object_count: u32,
         width: u32,
         height: u32,
-        light_dir: [f32; 3],
         shadow_steps: u32,
+        num_lights: u32,
         screen_aabbs: &[u8],
     ) {
         // Upload screen-space AABBs for tile culling.
         self.march.upload_screen_aabbs(queue, screen_aabbs);
 
-        // 1. Octree ray march → G-buffer (includes shadow ray in normal.w).
+        // 1. Octree ray march → G-buffer + per-light shadow texture.
         self.march.clear_stats(encoder);
         {
             let q = self.profiler.begin_query("march", encoder);
             self.march.dispatch(
                 encoder, queue, &self.scene.bind_group,
                 object_count, width, height, 0,
-                light_dir, shadow_steps, None,
+                shadow_steps, num_lights, None,
             );
             self.profiler.end_query(encoder, q);
         }
@@ -150,7 +166,15 @@ impl RkpRenderer {
             self.profiler.end_query(encoder, q);
         }
 
-        // 4. Resolve profiler queries.
+        // 4. Volumetric march (half-res) + composite (full-res).
+        {
+            let q = self.profiler.begin_query("vol", encoder);
+            self.volumetric.dispatch_march(encoder);
+            self.volumetric.dispatch_composite(encoder);
+            self.profiler.end_query(encoder, q);
+        }
+
+        // 5. Resolve profiler queries.
         self.profiler.resolve_queries(encoder);
     }
 
@@ -180,9 +204,26 @@ impl RkpRenderer {
     }
 
     /// Update the lights buffer (directional/point lights).
-    pub fn update_lights(&self, queue: &wgpu::Queue, lights: &[GpuLight]) {
+    pub fn update_lights(&mut self, queue: &wgpu::Queue, lights: &[GpuLight]) {
         let data: &[u8] = bytemuck::cast_slice(lights);
-        queue.write_buffer(&self.lights_buffer, 0, data);
+        let needed = data.len() as u64;
+        if needed > self.lights_buffer.size() {
+            self.lights_buffer = Self::create_init_buffer(
+                &self.device,
+                "rkp_shade_lights",
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                data,
+            );
+            self.shade.set_shade_data(
+                &self.device,
+                &self.shade_params_buffer,
+                &self.lights_buffer,
+                &self.materials_buffer,
+            );
+            self.march.set_lights(&self.device, &self.lights_buffer);
+        } else {
+            queue.write_buffer(&self.lights_buffer, 0, data);
+        }
     }
 
     /// Replace the GPU materials palette.
@@ -210,8 +251,41 @@ impl RkpRenderer {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
+        if width != self.width || height != self.height {
+            self.width = width;
+            self.height = height;
+            let (tex, view) = Self::create_shadow_texture(&self.device, width, height);
+            self.shadow_texture = tex;
+            self.shadow_view = view;
+        }
         self.ssao.resize(&self.device, width, height);
         self.shade.resize(&self.device, width, height);
+        self.volumetric.resize(&self.device, width, height);
+    }
+
+    /// Update volumetric parameters (fog, dust, march settings).
+    pub fn update_volumetric_params(&self, queue: &wgpu::Queue, params: &VolumetricParams) {
+        self.volumetric.update_params(queue, params);
+    }
+
+    /// Update cloud parameters.
+    pub fn update_cloud_params(&self, queue: &wgpu::Queue, cloud: &CloudParams) {
+        self.volumetric.update_cloud_params(queue, cloud);
+    }
+
+    fn create_shadow_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rkp_shadow"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        (tex, view)
     }
 
     fn create_init_buffer(device: &wgpu::Device, label: &str, usage: wgpu::BufferUsages, data: &[u8]) -> wgpu::Buffer {

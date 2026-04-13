@@ -20,6 +20,8 @@ pub mod rkp_scene;
 pub mod rkp_ssao;
 /// Deferred PBR shading compute pass.
 pub mod rkp_shade;
+/// Volumetric rendering — fog, dust, procedural clouds.
+pub mod rkp_volumetric;
 /// Frame renderer — orchestrates the full pipeline.
 pub mod rkp_renderer;
 /// Scene management — voxel pool, octree, face emission, asset loading.

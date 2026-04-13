@@ -55,7 +55,11 @@ pub struct ScenePointLight {
     pub color: [f32; 3],
     pub intensity: f32,
     pub range: f32,
+    #[serde(default = "default_true")]
+    pub cast_shadow: bool,
 }
+
+fn default_true() -> bool { true }
 
 /// Saved Camera component.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +115,19 @@ pub struct EnvironmentState {
     pub ao_radius: f32,
     pub ao_steps: u32,
     pub exposure: f32,
+    // Volumetric fog (optional for backward compat with old scene files).
+    #[serde(default)]
+    pub fog_color: Option<[f32; 3]>,
+    #[serde(default)]
+    pub height_fog_density: Option<f32>,
+    #[serde(default)]
+    pub dust_density: Option<f32>,
+    #[serde(default)]
+    pub clouds_enabled: Option<bool>,
+    #[serde(default)]
+    pub cloud_altitude_min: Option<f32>,
+    #[serde(default)]
+    pub cloud_altitude_max: Option<f32>,
 }
 
 impl SceneFile {
@@ -138,10 +155,17 @@ impl EnvironmentState {
             ao_radius: env.ao_radius,
             ao_steps: env.ao_steps,
             exposure: env.exposure,
+            fog_color: Some(env.fog_color),
+            height_fog_density: Some(env.height_fog_density),
+            dust_density: Some(env.dust_density),
+            clouds_enabled: Some(env.clouds_enabled),
+            cloud_altitude_min: Some(env.cloud_altitude_min),
+            cloud_altitude_max: Some(env.cloud_altitude_max),
         }
     }
 
     pub fn to_settings(&self) -> crate::environment::EnvironmentSettings {
+        let defaults = crate::environment::EnvironmentSettings::default();
         crate::environment::EnvironmentSettings {
             sky_color_top: self.sky_color_top,
             sky_color_horizon: self.sky_color_horizon,
@@ -154,6 +178,13 @@ impl EnvironmentState {
             ao_radius: self.ao_radius,
             ao_steps: self.ao_steps,
             exposure: self.exposure,
+            fog_color: self.fog_color.unwrap_or(defaults.fog_color),
+            height_fog_density: self.height_fog_density.unwrap_or(defaults.height_fog_density),
+            dust_density: self.dust_density.unwrap_or(defaults.dust_density),
+            clouds_enabled: self.clouds_enabled.unwrap_or(defaults.clouds_enabled),
+            cloud_altitude_min: self.cloud_altitude_min.unwrap_or(defaults.cloud_altitude_min),
+            cloud_altitude_max: self.cloud_altitude_max.unwrap_or(defaults.cloud_altitude_max),
+            ..defaults
         }
     }
 }

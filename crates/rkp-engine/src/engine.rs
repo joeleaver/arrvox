@@ -238,6 +238,12 @@ struct EngineState {
     console: crate::console::ConsoleLog,
     /// Gameplay dylib loader (hot-reload).
     gameplay_loader: crate::gameplay_loader::GameplayLoader,
+    /// Play mode state (None = edit mode).
+    play_state: Option<crate::play_mode::PlayModeState>,
+    /// View options.
+    show_colliders: bool,
+    /// Collider caches need rebuild.
+    collider_caches_dirty: bool,
 
     /// File watcher for hot-reload (watches project assets/ directory).
     file_watcher: Option<crate::file_watcher::RkpFileWatcher>,
@@ -258,8 +264,11 @@ struct EngineState {
     width: u32,
     height: u32,
 
-    // Readback buffer (reads from tone_map.ldr_texture, Rgba8Unorm)
-    readback_buffer: wgpu::Buffer,
+    // Double-buffered readback: copy to one buffer this frame, read from the other
+    // (which completed last frame). Avoids blocking CPU waiting for GPU.
+    readback_buffers: [wgpu::Buffer; 2],
+    readback_index: usize, // which buffer to copy INTO this frame
+    readback_ready: bool,  // false on first frame (no previous data yet)
 
     // Wireframe overlay
     wireframe_pass: rkf_render::WireframePass,
@@ -292,10 +301,10 @@ impl EngineState {
         // Wire G-buffer into renderer.
         renderer.set_gbuffer(&gbuffer);
 
-        // Tone mapping: HDR shade output → LDR (Rgba8Unorm).
+        // Tone mapping: HDR volumetric output → LDR (Rgba8Unorm).
         let tone_map = rkf_render::ToneMapPass::new(
             &device,
-            &renderer.shade.output_view,
+            &renderer.volumetric.output_view,
             width,
             height,
         );
@@ -308,8 +317,11 @@ impl EngineState {
         input_system.set_active_map("editor");
         let camera_control = CameraControlState::default();
 
-        // Readback buffer — reads from tone_map.ldr_texture (Rgba8Unorm).
-        let readback_buffer = Self::create_readback_buffer(&device, width, height);
+        // Double-buffered readback — avoids blocking CPU for GPU completion.
+        let readback_buffers = [
+            Self::create_readback_buffer(&device, width, height),
+            Self::create_readback_buffer(&device, width, height),
+        ];
 
         // Wireframe pass for gizmo overlay.
         let wireframe_pass = rkf_render::WireframePass::new(&device, rkf_render::LDR_FORMAT);
@@ -378,6 +390,9 @@ impl EngineState {
             environment_dirty: true, // upload on first frame
             console: crate::console::ConsoleLog::new(),
             gameplay_loader: crate::gameplay_loader::GameplayLoader::new(),
+            play_state: None,
+            show_colliders: false,
+            collider_caches_dirty: true,
             file_watcher: None,
             import_worker: crate::import_worker::ImportWorker::new(),
             geometry_dirty: false,
@@ -386,7 +401,9 @@ impl EngineState {
             frame_index: 0,
             width,
             height,
-            readback_buffer,
+            readback_buffers,
+            readback_index: 0,
+            readback_ready: false,
             wireframe_pass,
             composite_texture,
             composite_view,
@@ -417,14 +434,40 @@ impl EngineState {
             self.material_lib.clear_dirty();
         }
 
-        // 0b. Upload environment settings if dirty.
-        if self.environment_dirty {
-            let shade_params = self.environment.to_shade_params();
+        // 0b. Upload environment + lights.
+        // Always rebuild lights array (entity lights may have moved).
+        {
+            let mut gpu_lights = vec![self.environment.to_gpu_light()]; // [0] = sun
+
+            // Collect point lights from entities.
+            for (_entity, (transform, pl)) in self.world.query::<(&crate::components::Transform, &crate::components::PointLight)>().iter() {
+                gpu_lights.push(rkp_render::rkp_shade::GpuLight {
+                    position: [transform.position.x, transform.position.y, transform.position.z, 1.0], // w=1 = point
+                    color: [pl.color[0], pl.color[1], pl.color[2], pl.intensity],
+                    direction: [0.0, 0.0, 0.0, 0.0],
+                    params: [pl.range, 0.0, 0.0, if pl.cast_shadow { 1.0 } else { 0.0 }],
+                });
+            }
+
+            // Collect spot lights from entities.
+            for (_entity, (transform, sl)) in self.world.query::<(&crate::components::Transform, &crate::components::SpotLight)>().iter() {
+                gpu_lights.push(rkp_render::rkp_shade::GpuLight {
+                    position: [transform.position.x, transform.position.y, transform.position.z, 2.0], // w=2 = spot
+                    color: [sl.color[0], sl.color[1], sl.color[2], sl.intensity],
+                    direction: [sl.direction.x, sl.direction.y, sl.direction.z, sl.outer_angle.to_radians()],
+                    params: [sl.range, sl.inner_angle.to_radians(), 0.0, if sl.cast_shadow { 1.0 } else { 0.0 }],
+                });
+            }
+
+            let mut shade_params = self.environment.to_shade_params();
+            shade_params.num_lights = gpu_lights.len() as u32;
             self.renderer.update_shade_params(&self.queue, &shade_params);
-            let light = self.environment.to_gpu_light();
-            self.renderer.update_lights(&self.queue, &[light]);
-            self.tone_map.set_exposure(&self.queue, self.environment.exposure);
-            self.environment_dirty = false;
+            self.renderer.update_lights(&self.queue, &gpu_lights);
+
+            if self.environment_dirty {
+                self.tone_map.set_exposure(&self.queue, self.environment.exposure);
+                self.environment_dirty = false;
+            }
         }
 
         // 0c. Rebuild GPU objects from ECS world only when transforms/objects changed.
@@ -444,6 +487,13 @@ impl EngineState {
             let geo = self.scene_mgr.geometry_upload();
             self.renderer.upload_geometry(&self.queue, &geo);
             self.geometry_dirty = false;
+            self.collider_caches_dirty = true;
+        }
+
+        // 1e. Rebuild collider caches if needed.
+        if self.collider_caches_dirty {
+            self.rebuild_collider_caches();
+            self.collider_caches_dirty = false;
         }
 
         // 2. Upload per-frame data (objects + camera).
@@ -456,16 +506,25 @@ impl EngineState {
 
         let t_upload = frame_start.elapsed();
 
-        // 3. Render: march (+ shadow) → SSAO → shade.
+        // 3. Render: march (+ per-light shadow) → SSAO → shade → volumetrics.
         let object_count = self.gpu_objects.len() as u32;
-        let light_dir = self.environment.light_dir_normalized();
         let shadow_steps = self.environment.shadow_steps;
+        let num_lights = 1u32; // TODO: support multiple lights from scene
         let vp = glam::Mat4::from_cols_array_2d(&cam_uniforms.view_proj);
         let screen_aabbs = crate::scene_sync::compute_screen_aabbs(
             &self.gpu_objects, &vp, self.width as f32, self.height as f32,
         );
         let screen_aabbs_bytes: &[u8] = bytemuck::cast_slice(&screen_aabbs);
-        self.renderer.render(&mut encoder, &self.queue, object_count, self.width, self.height, light_dir, shadow_steps, screen_aabbs_bytes);
+
+        // Upload volumetric params.
+        let vol_params = self.environment.to_volumetric_params(
+            &cam_uniforms, self.width, self.height, self.frame_index as u32,
+        );
+        self.renderer.update_volumetric_params(&self.queue, &vol_params);
+        let cloud_params = self.environment.to_cloud_params(self.frame_index as f32 / 60.0);
+        self.renderer.update_cloud_params(&self.queue, &cloud_params);
+
+        self.renderer.render(&mut encoder, &self.queue, object_count, self.width, self.height, shadow_steps, num_lights, screen_aabbs_bytes);
 
         let t_encode = frame_start.elapsed();
 
@@ -543,7 +602,7 @@ impl EngineState {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
-                buffer: &self.readback_buffer,
+                buffer: &self.readback_buffers[self.readback_index],
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_row),
@@ -569,8 +628,18 @@ impl EngineState {
             self.process_pick_result();
         }
 
-        // 10. Map readback buffer and extract pixels.
-        let pixels = self.map_readback();
+        // 10. Read from the OTHER buffer (completed last frame).
+        // Double-buffered: we read last frame's data while this frame's copy runs.
+        // wait_indefinitely returns near-instantly since last frame's GPU work is done.
+        let read_index = 1 - self.readback_index;
+        let pixels = if self.readback_ready {
+            self.map_readback(read_index)
+        } else {
+            // First frame: no previous data, read current (blocking).
+            self.readback_ready = true;
+            self.map_readback(self.readback_index)
+        };
+        self.readback_index = read_index; // swap for next frame
 
         // 11. GPU profiler — process finished frames (logs every 60 frames).
         self.renderer.end_profiler_frame(self.frame_index, self.width, self.height);
@@ -596,12 +665,14 @@ impl EngineState {
         (pixels, self.width, self.height)
     }
 
-    fn map_readback(&self) -> Vec<u8> {
+    /// Read from a readback buffer. With double-buffering we read last frame's
+    /// buffer, so the GPU work is already complete and wait returns near-instantly.
+    fn map_readback(&self, index: usize) -> Vec<u8> {
         let w = self.width;
         let h = self.height;
         let padded_row = (w * 4 + 255) & !255;
 
-        let buffer_slice = self.readback_buffer.slice(..);
+        let buffer_slice = self.readback_buffers[index].slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
@@ -623,7 +694,7 @@ impl EngineState {
                 }
             }
             drop(data);
-            self.readback_buffer.unmap();
+            self.readback_buffers[index].unmap();
         }
 
         rgba8
@@ -683,11 +754,15 @@ impl EngineState {
                     self.renderer.set_gbuffer(&self.gbuffer);
                     self.tone_map = rkf_render::ToneMapPass::new(
                         &self.device,
-                        &self.renderer.shade.output_view,
+                        &self.renderer.volumetric.output_view,
                         width,
                         height,
                     );
-                    self.readback_buffer = Self::create_readback_buffer(&self.device, width, height);
+                    self.readback_buffers = [
+                        Self::create_readback_buffer(&self.device, width, height),
+                        Self::create_readback_buffer(&self.device, width, height),
+                    ];
+                    self.readback_ready = false;
                     self.composite_texture = self.device.create_texture(&wgpu::TextureDescriptor {
                         label: Some("rkp composite"),
                         size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -735,6 +810,51 @@ impl EngineState {
                     self.gpu_objects_dirty = true;
                     self.console.info(format!("Spawned '{name}': {} voxels", result.voxel_count));
                 }
+            }
+
+            EngineCommand::SpawnPointLight => {
+                use crate::components::*;
+                let name = self.unique_name("Point Light");
+                let mut transform = Transform::default();
+                transform.position = self.camera.position + glam::Vec3::new(0.0, 2.0, 0.0);
+                let entity = self.world.spawn((
+                    transform,
+                    EditorMetadata { name: name.clone() },
+                    PointLight::default(),
+                ));
+                self.assign_entity_uuid(entity);
+                self.scene_dirty = true;
+                self.console.info(format!("Spawned '{name}'"));
+            }
+
+            EngineCommand::SpawnSpotLight => {
+                use crate::components::*;
+                let name = self.unique_name("Spot Light");
+                let mut transform = Transform::default();
+                transform.position = self.camera.position + glam::Vec3::new(0.0, 3.0, 0.0);
+                let entity = self.world.spawn((
+                    transform,
+                    EditorMetadata { name: name.clone() },
+                    SpotLight::default(),
+                ));
+                self.assign_entity_uuid(entity);
+                self.scene_dirty = true;
+                self.console.info(format!("Spawned '{name}'"));
+            }
+
+            EngineCommand::SpawnCamera => {
+                use crate::components::*;
+                let name = self.unique_name("Camera");
+                let mut transform = Transform::default();
+                transform.position = self.camera.position;
+                let entity = self.world.spawn((
+                    transform,
+                    EditorMetadata { name: name.clone() },
+                    Camera::default(),
+                ));
+                self.assign_entity_uuid(entity);
+                self.scene_dirty = true;
+                self.console.info(format!("Spawned '{name}'"));
             }
 
             EngineCommand::LoadAsset { path, .. } => {
@@ -951,8 +1071,13 @@ impl EngineState {
                         if let Ok(fv) = serde_json::from_str::<crate::inspector::FieldValue>(&value) {
                             if let Err(e) = (entry.set_field)(&mut self.world, entity, &field_name, fv) {
                                 eprintln!("[RkpEngine] set_field failed: {e}");
-                            } else if component_name == "Transform" {
-                                self.gpu_objects_dirty = true;
+                            } else {
+                                if component_name == "Transform" {
+                                    self.gpu_objects_dirty = true;
+                                }
+                                if component_name == "RigidBody" {
+                                    self.collider_caches_dirty = true;
+                                }
                             }
                         }
                     }
@@ -967,6 +1092,9 @@ impl EngineState {
                         }
                         self.scene_dirty = true;
                         self.gpu_objects_dirty = true;
+                        if component_name == "RigidBody" {
+                            self.collider_caches_dirty = true;
+                        }
                     }
                 }
             }
@@ -979,6 +1107,9 @@ impl EngineState {
                         }
                         self.scene_dirty = true;
                         self.gpu_objects_dirty = true;
+                        if component_name == "RigidBody" {
+                            self.collider_caches_dirty = true;
+                        }
                     }
                 }
             }
@@ -1124,6 +1255,13 @@ impl EngineState {
                 });
             }
 
+            EngineCommand::SetViewOption { option, enabled } => {
+                match option.as_str() {
+                    "show_colliders" => self.show_colliders = enabled,
+                    _ => eprintln!("[RkpEngine] unknown view option: {option}"),
+                }
+            }
+
             EngineCommand::ClearConsole => {
                 self.console.clear();
             }
@@ -1164,9 +1302,83 @@ impl EngineState {
                     "exposure" => {
                         if let Ok(v) = value.parse::<f32>() { env.exposure = v; }
                     }
+                    "camera_altitude" => {
+                        if let Ok(v) = value.parse::<f32>() { env.camera_altitude = v; }
+                    }
+                    // Fog
+                    "fog_color" => {
+                        if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) { env.fog_color = v; }
+                    }
+                    "height_fog_density" => {
+                        if let Ok(v) = value.parse::<f32>() { env.height_fog_density = v; }
+                    }
+                    "fog_base_height" => {
+                        if let Ok(v) = value.parse::<f32>() { env.fog_base_height = v; }
+                    }
+                    "fog_height_falloff" => {
+                        if let Ok(v) = value.parse::<f32>() { env.fog_height_falloff = v; }
+                    }
+                    "distance_fog_density" => {
+                        if let Ok(v) = value.parse::<f32>() { env.distance_fog_density = v; }
+                    }
+                    "distance_fog_falloff" => {
+                        if let Ok(v) = value.parse::<f32>() { env.distance_fog_falloff = v; }
+                    }
+                    "dust_density" => {
+                        if let Ok(v) = value.parse::<f32>() { env.dust_density = v; }
+                    }
+                    "dust_asymmetry" => {
+                        if let Ok(v) = value.parse::<f32>() { env.dust_asymmetry = v; }
+                    }
+                    "vol_far" => {
+                        if let Ok(v) = value.parse::<f32>() { env.vol_far = v; }
+                    }
+                    // Clouds
+                    "clouds_enabled" => {
+                        env.clouds_enabled = value == "true" || value == "1";
+                    }
+                    "cloud_altitude_min" => {
+                        if let Ok(v) = value.parse::<f32>() { env.cloud_altitude_min = v; }
+                    }
+                    "cloud_altitude_max" => {
+                        if let Ok(v) = value.parse::<f32>() { env.cloud_altitude_max = v; }
+                    }
+                    "cloud_coverage" => {
+                        if let Ok(v) = value.parse::<f32>() { env.cloud_coverage = v; }
+                    }
+                    "cloud_density_scale" => {
+                        if let Ok(v) = value.parse::<f32>() { env.cloud_density_scale = v; }
+                    }
+                    "cloud_wind_speed" => {
+                        if let Ok(v) = value.parse::<f32>() { env.cloud_wind_speed = v; }
+                    }
+                    "cloud_wind_dir" => {
+                        if let Ok(v) = value.parse::<f32>() { env.cloud_wind_dir = v; }
+                    }
                     _ => { eprintln!("[RkpEngine] unknown environment field: {field}"); }
                 }
                 self.environment_dirty = true;
+            }
+
+            EngineCommand::PlayStart => {
+                if self.play_state.is_none() {
+                    // Ensure collider caches are up to date before entering play mode.
+                    if self.collider_caches_dirty {
+                        self.rebuild_collider_caches();
+                        self.collider_caches_dirty = false;
+                    }
+                    let play = crate::play_mode::PlayModeState::start(&mut self.world);
+                    self.play_state = Some(play);
+                    self.console.info("Play mode started");
+                }
+            }
+
+            EngineCommand::PlayStop => {
+                if let Some(play) = self.play_state.take() {
+                    play.stop(&mut self.world);
+                    self.gpu_objects_dirty = true;
+                    self.console.info("Play mode stopped — transforms restored");
+                }
             }
 
             _ => {
@@ -1403,6 +1615,10 @@ impl EngineState {
                     value,
                     range: meta.range,
                     transient: meta.transient,
+                    enum_options: meta.enum_options
+                        .map(|opts| opts.iter().map(|(v, l)| (v.to_string(), l.to_string())).collect())
+                        .unwrap_or_default(),
+                    scrub: meta.scrub,
                     ..Default::default()
                 }
             }).collect();
@@ -1451,9 +1667,13 @@ impl EngineState {
         let mut leaf_slots = Vec::new();
         collect_leaf_slots(all_nodes, spatial.root_offset as usize, &mut leaf_slots);
 
-        // Count material IDs across all leaf voxels.
+        // Count material IDs across all leaf voxels (with bounds check).
+        let pool_size = self.scene_mgr.voxel_pool.allocated_count();
         let mut counts: std::collections::HashMap<u16, u32> = std::collections::HashMap::new();
         for slot in leaf_slots {
+            if slot >= pool_size {
+                continue; // stale or invalid slot — skip
+            }
             let voxel = self.scene_mgr.voxel_pool.get(slot);
             if voxel.opacity_f32() > 0.01 {
                 *counts.entry(voxel.material_id()).or_insert(0) += 1;
@@ -1494,8 +1714,10 @@ impl EngineState {
         let mut leaf_slots = Vec::new();
         collect_leaf_slots(all_nodes, spatial.root_offset as usize, &mut leaf_slots);
 
+        let pool_size = self.scene_mgr.voxel_pool.allocated_count();
         let mut count = 0u32;
         for slot in leaf_slots {
+            if slot >= pool_size { continue; }
             let voxel = self.scene_mgr.voxel_pool.get(slot);
             let primary = voxel.material_id();
             let secondary = voxel.secondary_material_id();
@@ -1961,6 +2183,7 @@ impl EngineState {
                                 color: pl.color,
                                 intensity: pl.intensity,
                                 range: pl.range,
+                                cast_shadow: pl.cast_shadow,
                             });
                         }
 
@@ -2050,6 +2273,7 @@ impl EngineState {
                     color: l.color,
                     intensity: l.intensity,
                     range: l.range,
+                    cast_shadow: l.cast_shadow,
                 }),
                 camera: camera.map(|c| crate::scene_io::SceneCamera {
                     fov: c.fov,
@@ -2151,20 +2375,56 @@ impl EngineState {
     }
 
     fn build_gizmo_wireframe(&self) -> Vec<rkf_render::LineVertex> {
+        let mut verts = Vec::new();
+
+        // Light gizmos — always visible for all light entities.
+        let light_color = [1.0, 0.9, 0.5, 0.5]; // warm yellow, semi-transparent
+        let selected_light_color = [1.0, 0.9, 0.5, 1.0]; // bright when selected
+
+        for (entity, (transform, pl)) in self.world.query::<(&crate::components::Transform, &crate::components::PointLight)>().iter() {
+            let selected = self.selected_entity == Some(entity);
+            // Always show crosshair icon.
+            let icon_color = if selected { selected_light_color } else { light_color };
+            verts.extend(rkf_render::wireframe::crosshair(transform.position, 0.2, icon_color));
+            // Range sphere only when selected.
+            if selected {
+                verts.extend(rkf_render::wireframe::point_light_wireframe(
+                    transform.position, pl.range, selected_light_color,
+                ));
+            }
+        }
+
+        for (entity, (transform, sl)) in self.world.query::<(&crate::components::Transform, &crate::components::SpotLight)>().iter() {
+            let selected = self.selected_entity == Some(entity);
+            let icon_color = if selected { selected_light_color } else { light_color };
+            verts.extend(rkf_render::wireframe::crosshair(transform.position, 0.2, icon_color));
+            // Cone only when selected.
+            if selected {
+                verts.extend(rkf_render::wireframe::spot_light_wireframe(
+                    transform.position, sl.direction, sl.range, sl.outer_angle.to_radians(), selected_light_color,
+                ));
+            }
+        }
+
+        // Physics collider wireframes.
+        if self.show_colliders {
+            verts.extend(self.build_collider_wireframes());
+        }
+
+        // Transform gizmo — only for the selected entity.
         let Some(selected) = self.selected_entity else {
-            return Vec::new();
+            return verts;
         };
 
         let center = match self.world.get::<&crate::components::Transform>(selected) {
             Ok(t) => t.position,
-            Err(_) => return Vec::new(),
+            Err(_) => return verts,
         };
 
-        // Scale gizmo size proportional to camera distance for consistent screen size.
         let cam_dist = (center - self.camera.position).length().max(0.1);
         let gizmo_size = cam_dist * 0.15;
 
-        match self.gizmo.mode {
+        let gizmo_verts = match self.gizmo.mode {
             crate::gizmo::GizmoMode::Translate => {
                 crate::wireframe_builders::translate_gizmo_wireframe(
                     center, gizmo_size, self.gizmo.hovered_axis, self.camera.position,
@@ -2180,7 +2440,144 @@ impl EngineState {
                     center, gizmo_size, self.gizmo.hovered_axis, self.camera.position,
                 )
             }
+        };
+        verts.extend(gizmo_verts);
+        verts
+    }
+
+    /// Rebuild collider caches for all entities with RigidBody.
+    /// Called when geometry changes, RigidBody is added/modified, etc.
+    fn rebuild_collider_caches(&mut self) {
+        use crate::components::*;
+
+        // Collect entities that need cache rebuild.
+        let entities: Vec<(hecs::Entity, RigidBody, Option<SpatialData>, glam::Vec3)> = self.world
+            .query::<(&RigidBody, Option<&Renderable>, &Transform)>()
+            .iter()
+            .map(|(e, (rb, r, t))| {
+                (e, rb.clone(), r.and_then(|r| r.spatial.clone()), t.scale)
+            })
+            .collect();
+
+        let all_nodes = self.scene_mgr.octree.data();
+
+        for (entity, rb, spatial, scale) in entities {
+            let aabb_half = spatial.as_ref()
+                .map(|s| s.aabb.half_extents() * scale)
+                .unwrap_or(glam::Vec3::splat(0.5));
+
+            let (resolved_shape, voxel_coords, voxel_size) = match rb.collider_shape {
+                rkf_physics::rigid_body::ColliderShape::Auto => {
+                    if let Some(ref sp) = spatial {
+                        let coords = crate::play_mode::extract_voxel_coords(
+                            all_nodes,
+                            &self.scene_mgr.voxel_pool,
+                            sp.root_offset as usize,
+                            rb.physics_resolution,
+                        );
+                        if coords.is_empty() {
+                            (rkf_physics::rigid_body::ColliderShape::Box, Vec::new(), 0.0)
+                        } else {
+                            (rkf_physics::rigid_body::ColliderShape::Auto, coords, sp.voxel_size)
+                        }
+                    } else {
+                        (rkf_physics::rigid_body::ColliderShape::Box, Vec::new(), 0.0)
+                    }
+                }
+                other => (other.clone(), Vec::new(), 0.0),
+            };
+
+            let cache = ColliderCache {
+                shape: resolved_shape,
+                voxel_coords,
+                voxel_size,
+                aabb_half,
+            };
+
+            // Insert or replace the cache component.
+            if self.world.get::<&ColliderCache>(entity).is_ok() {
+                let _ = self.world.remove_one::<ColliderCache>(entity);
+            }
+            let _ = self.world.insert_one(entity, cache);
         }
+    }
+
+    /// Build wireframe visualization for all physics colliders from cached data.
+    fn build_collider_wireframes(&self) -> Vec<rkf_render::LineVertex> {
+        use rkf_physics::rigid_body::{BodyType, ColliderShape};
+        let mut verts = Vec::new();
+
+        for (_entity, (transform, rb, cache)) in self.world.query::<(
+            &crate::components::Transform,
+            &crate::components::RigidBody,
+            &crate::components::ColliderCache,
+        )>().iter() {
+            let color = match rb.body_type {
+                BodyType::Dynamic => [0.2, 0.8, 0.2, 0.6],
+                BodyType::Static => [0.5, 0.5, 0.8, 0.6],
+                BodyType::KinematicPosition | BodyType::KinematicVelocity => [0.9, 0.6, 0.2, 0.6],
+            };
+
+            match cache.shape {
+                ColliderShape::Box => {
+                    let min = transform.position - cache.aabb_half;
+                    let max = transform.position + cache.aabb_half;
+                    verts.extend(rkf_render::wireframe::aabb_wireframe(min, max, color));
+                }
+                ColliderShape::Sphere => {
+                    let r = cache.aabb_half.max_element();
+                    verts.extend(rkf_render::wireframe::sphere_wireframe(transform.position, r, color));
+                }
+                ColliderShape::Capsule => {
+                    let r = cache.aabb_half.x.max(cache.aabb_half.z).max(0.01);
+                    let hh = (cache.aabb_half.y - r).max(0.01);
+                    let top = transform.position + glam::Vec3::new(0.0, hh, 0.0);
+                    let bot = transform.position - glam::Vec3::new(0.0, hh, 0.0);
+                    verts.extend(rkf_render::wireframe::sphere_wireframe(top, r, color));
+                    verts.extend(rkf_render::wireframe::sphere_wireframe(bot, r, color));
+                    for angle in [0.0f32, std::f32::consts::FRAC_PI_2, std::f32::consts::PI, 3.0 * std::f32::consts::FRAC_PI_2] {
+                        let offset = glam::Vec3::new(angle.cos() * r, 0.0, angle.sin() * r);
+                        verts.push(rkf_render::LineVertex { position: (top + offset).to_array(), color });
+                        verts.push(rkf_render::LineVertex { position: (bot + offset).to_array(), color });
+                    }
+                }
+                ColliderShape::Auto => {
+                    // Voxel collider from cache — subsample for viz (every Nth).
+                    if !cache.voxel_coords.is_empty() {
+                        let vs = cache.voxel_size;
+                        let half = vs * transform.scale.x * 0.5;
+                        let depth = self.world.get::<&crate::components::Renderable>(_entity)
+                            .ok()
+                            .and_then(|r| r.spatial.as_ref().map(|s| s.depth))
+                            .unwrap_or(8);
+                        let grid_size = (1u32 << depth) as f32;
+                        let grid_offset = glam::Vec3::splat(grid_size * 0.5 * vs);
+
+                        // Subsample for viz: cap at 500 boxes regardless of physics_resolution.
+                        let skip = (cache.voxel_coords.len() / 500).max(1);
+                        for (i, coord) in cache.voxel_coords.iter().enumerate() {
+                            if i % skip != 0 { continue; }
+                            let world_pos = transform.position
+                                + glam::Vec3::new(
+                                    coord.x as f32 * vs,
+                                    coord.y as f32 * vs,
+                                    coord.z as f32 * vs,
+                                ) * transform.scale
+                                - grid_offset * transform.scale;
+                            let min = world_pos - glam::Vec3::splat(half);
+                            let max = world_pos + glam::Vec3::splat(half);
+                            verts.extend(rkf_render::wireframe::aabb_wireframe(min, max, color));
+                        }
+                    } else {
+                        let min = transform.position - cache.aabb_half;
+                        let max = transform.position + cache.aabb_half;
+                        verts.extend(rkf_render::wireframe::aabb_wireframe(min, max, color));
+                    }
+                }
+            }
+        }
+
+        verts
     }
 
     /// Screen-space ray from pixel coordinates.
@@ -2239,7 +2636,8 @@ impl EngineState {
             self.scene_dirty = false;
             let mut objs = Vec::new();
             for (entity, meta) in self.world.query::<&crate::components::EditorMetadata>().iter() {
-                let is_light = self.world.get::<&crate::components::PointLight>(entity).is_ok();
+                let is_light = self.world.get::<&crate::components::PointLight>(entity).is_ok()
+                    || self.world.get::<&crate::components::SpotLight>(entity).is_ok();
                 let is_camera = self.world.get::<&crate::components::Camera>(entity).is_ok();
                 let parent_id = self.world.get::<&crate::components::Parent>(entity)
                     .ok()
@@ -2281,7 +2679,7 @@ impl EngineState {
             fps,
             gpu_object_count: self.gpu_objects.len() as u32,
             camera_position: self.camera.position,
-            play_mode: false,
+            play_mode: self.play_state.is_some(),
             selected_entity: self.selected_entity.map(|e| self.get_entity_uuid(e)),
             objects,
             project_loaded: project,
@@ -2346,6 +2744,14 @@ fn tick_loop(
         state.process_file_events();
         state.poll_import_completions();
         state.check_gameplay_reload();
+
+        // 1c. Step physics if in play mode.
+        if let Some(ref mut play) = state.play_state {
+            let physics_dt = 1.0 / 60.0;
+            if play.step(physics_dt, &mut state.world) {
+                state.gpu_objects_dirty = true;
+            }
+        }
 
         // 2. Update input system + camera.
         let dt = 1.0 / 60.0; // TODO: use actual delta time

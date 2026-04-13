@@ -11,11 +11,9 @@ use crate::validate_wgsl;
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MarchParams {
     pub object_count: u32,
-    pub mode: u32,     // 0 = full (hit + normal), 1 = normal-only (reads position from G-buffer)
+    pub mode: u32,
     pub shadow_max_steps: u32,
-    pub _pad: u32,
-    pub light_dir: [f32; 3],
-    pub _pad2: f32,
+    pub num_lights: u32,
 }
 
 /// The octree ray march compute pass.
@@ -31,6 +29,10 @@ pub struct OctreeMarchPass {
     stats_readback: wgpu::Buffer,
     /// Screen-space AABB buffer for tile culling.
     screen_aabbs_buffer: wgpu::Buffer,
+    /// Lights buffer (shared with shade pass).
+    lights_buffer: Option<wgpu::Buffer>,
+    /// Materials buffer reference for bind group rebuild.
+    materials_buffer: Option<wgpu::Buffer>,
 }
 
 impl OctreeMarchPass {
@@ -41,7 +43,7 @@ impl OctreeMarchPass {
         device: &wgpu::Device,
         scene_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> Self {
-        // Group 1: G-buffer storage textures (write-only).
+        // Group 1: G-buffer storage textures (write-only) + shadow output.
         let gbuffer_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("march gbuffer layout"),
@@ -49,6 +51,7 @@ impl OctreeMarchPass {
                     bgl_storage_tex(0, wgpu::TextureFormat::Rgba32Float),
                     bgl_storage_tex(1, wgpu::TextureFormat::Rgba16Float),
                     bgl_storage_tex(2, wgpu::TextureFormat::Rg32Uint),
+                    bgl_storage_tex(3, wgpu::TextureFormat::Rgba8Unorm),
                 ],
             });
 
@@ -89,6 +92,16 @@ impl OctreeMarchPass {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -159,15 +172,26 @@ impl OctreeMarchPass {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
+            lights_buffer: None,
+            materials_buffer: None,
         }
     }
 
     /// Set the materials buffer. Call after materials are uploaded/resized.
     pub fn set_materials(&mut self, device: &wgpu::Device, materials_buffer: &wgpu::Buffer) {
-        self.rebuild_params_bind_group(device, materials_buffer);
+        self.materials_buffer = Some(materials_buffer.clone());
+        self.try_rebuild_params_bind_group(device);
     }
 
-    fn rebuild_params_bind_group(&mut self, device: &wgpu::Device, materials_buffer: &wgpu::Buffer) {
+    /// Set the lights buffer. Call after lights are uploaded/resized.
+    pub fn set_lights(&mut self, device: &wgpu::Device, lights_buffer: &wgpu::Buffer) {
+        self.lights_buffer = Some(lights_buffer.clone());
+        self.try_rebuild_params_bind_group(device);
+    }
+
+    fn try_rebuild_params_bind_group(&mut self, device: &wgpu::Device) {
+        let (Some(materials_buffer), Some(lights_buffer)) =
+            (&self.materials_buffer, &self.lights_buffer) else { return };
         self.params_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("march params+materials bind group"),
             layout: &self.params_bind_group_layout,
@@ -188,6 +212,10 @@ impl OctreeMarchPass {
                     binding: 3,
                     resource: self.screen_aabbs_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: lights_buffer.as_entire_binding(),
+                },
             ],
         }));
     }
@@ -197,13 +225,14 @@ impl OctreeMarchPass {
         queue.write_buffer(&self.screen_aabbs_buffer, 0, data);
     }
 
-    /// Set the G-buffer textures. Call on init and after resize.
+    /// Set the G-buffer textures + shadow output. Call on init and after resize.
     pub fn set_gbuffer(
         &mut self,
         device: &wgpu::Device,
         position_view: &wgpu::TextureView,
         normal_view: &wgpu::TextureView,
         material_view: &wgpu::TextureView,
+        shadow_view: &wgpu::TextureView,
     ) {
         self.gbuffer_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("march gbuffer bind group"),
@@ -212,6 +241,7 @@ impl OctreeMarchPass {
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(position_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(normal_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(material_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(shadow_view) },
             ],
         }));
     }
@@ -232,8 +262,8 @@ impl OctreeMarchPass {
         let slice = self.stats_readback.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        let _ = device.poll(wgpu::PollType::Poll);
-        if let Ok(Ok(())) = rx.try_recv() {
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        if let Ok(Ok(())) = rx.recv() {
             let data = slice.get_mapped_range();
             let vals: &[u32] = bytemuck::cast_slice(&data);
             let total_steps = vals[0];
@@ -262,8 +292,8 @@ impl OctreeMarchPass {
         width: u32,
         height: u32,
         mode: u32,
-        light_dir: [f32; 3],
         shadow_max_steps: u32,
+        num_lights: u32,
         timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) {
         // Update params.
@@ -271,9 +301,7 @@ impl OctreeMarchPass {
             object_count,
             mode,
             shadow_max_steps,
-            _pad: 0,
-            light_dir,
-            _pad2: 0.0,
+            num_lights,
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
 
