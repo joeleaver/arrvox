@@ -5007,21 +5007,9 @@ dependencies = [
  "rkp-render",
  "serde",
  "serde_json",
+ "tempfile",
  "uuid",
  "wgpu 29.0.1",
-]
-
-[[package]]
-name = "rkp-gameplay"
-version = "0.1.0"
-dependencies = [
- "glam 0.29.3",
- "hecs",
- "inventory",
- "rkp-engine",
- "rkp-macros",
- "serde",
- "serde_json",
 ]
 
 [[package]]
