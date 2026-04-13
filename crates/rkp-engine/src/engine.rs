@@ -933,8 +933,7 @@ impl EngineState {
                 self.next_scene_id += 1;
 
                 // Compute bounds and voxelize the procedural tree.
-                let aabb = rkp_procedural::compute_bounds(&proc_geo.tree);
-                let voxel_size = 0.05;
+                let (aabb, voxel_size) = procedural_voxel_params(&proc_geo.tree, proc_geo.voxel_size);
                 let tree_ref = &proc_geo.tree;
                 let opacity_fn = |pos: glam::Vec3| -> (f32, u16) {
                     let sample = rkp_procedural::sample_tree(tree_ref, pos);
@@ -968,6 +967,15 @@ impl EngineState {
 
             EngineCommand::SelectProceduralNode { node_id } => {
                 self.selected_procedural_node = node_id;
+            }
+
+            EngineCommand::SetProceduralVoxelSize { voxel_size } => {
+                if let Some(entity) = self.selected_entity {
+                    if let Ok(mut proc_geo) = self.world.get::<&mut crate::components::ProceduralGeometry>(entity) {
+                        proc_geo.voxel_size = voxel_size.clamp(0.005, 1.0);
+                        proc_geo.dirty = true;
+                    }
+                }
             }
 
             EngineCommand::AddProceduralNode { parent_node_id, kind } => {
@@ -2183,15 +2191,14 @@ impl EngineState {
         }
 
         for (entity, scene_id) in to_update {
-            // Read the procedural tree and current scale.
-            let (tree_clone, scale) = {
+            // Read the procedural tree, voxel size, and current scale.
+            let (tree_clone, base_voxel_size, scale) = {
                 let proc_geo = self.world.get::<&ProceduralGeometry>(entity).unwrap();
                 let transform = self.world.get::<&Transform>(entity).unwrap();
-                (proc_geo.tree.clone(), transform.scale)
+                (proc_geo.tree.clone(), proc_geo.voxel_size, transform.scale)
             };
 
-            let aabb = rkp_procedural::compute_bounds(&tree_clone);
-            let voxel_size = 0.05;
+            let (aabb, voxel_size) = procedural_voxel_params(&tree_clone, base_voxel_size);
             let opacity_fn = |pos: glam::Vec3| -> (f32, u16) {
                 let sample = rkp_procedural::sample_tree(&tree_clone, pos);
                 (sample.opacity, sample.material_id)
@@ -3140,15 +3147,42 @@ impl EngineState {
         let entity = self.selected_entity?;
         let proc_geo = self.world.get::<&crate::components::ProceduralGeometry>(entity).ok()?;
         let uuid = self.get_entity_uuid(entity);
+        let vs = proc_geo.voxel_size;
         Some(crate::procedural_snapshot::build_procedural_snapshot(
             uuid,
             &proc_geo,
             self.selected_procedural_node,
+            vs,
         ))
     }
 }
 
 // ── Procedural helpers ───────────────────────────────────────────────
+
+/// Compute a safe AABB and voxel size for procedural voxelization.
+///
+/// Adds margin around the tight bounds and ensures the octree depth won't
+/// exceed MAX_DEPTH (11). If the object is too large for the requested voxel
+/// size, the voxel size is increased to fit.
+fn procedural_voxel_params(tree: &rkp_procedural::ProceduralObject, base_voxel_size: f32) -> (rkf_core::Aabb, f32) {
+    let tight = rkp_procedural::compute_bounds(tree);
+
+    // Add margin for boundary sampling (same approach as voxelize_primitive).
+    let margin = base_voxel_size * 8.0 * 1.8 + base_voxel_size;
+    let aabb = rkf_core::Aabb {
+        min: tight.min - glam::Vec3::splat(margin),
+        max: tight.max + glam::Vec3::splat(margin),
+    };
+
+    // Ensure depth won't exceed MAX_DEPTH (11). Max voxels per axis = 2^11 = 2048.
+    let extent = aabb.max - aabb.min;
+    let max_dim = extent.x.max(extent.y).max(extent.z);
+    let max_voxels = 2048.0_f32; // 2^11
+    let min_voxel_size = max_dim / max_voxels;
+    let voxel_size = base_voxel_size.max(min_voxel_size);
+
+    (aabb, voxel_size)
+}
 
 /// Parse a node kind name into a `NodeKind`.
 fn parse_node_kind(kind: &str) -> rkp_procedural::NodeKind {

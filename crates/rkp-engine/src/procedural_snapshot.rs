@@ -17,6 +17,8 @@ pub struct ProceduralSnapshot {
     pub root: u32,
     /// Currently selected node (for param editing). None = no node selected.
     pub selected_node: Option<u32>,
+    /// Render voxel size.
+    pub voxel_size: f32,
 }
 
 /// Snapshot of a single node in the procedural tree.
@@ -88,6 +90,7 @@ pub fn build_procedural_snapshot(
     entity_id: uuid::Uuid,
     proc_geo: &crate::components::ProceduralGeometry,
     selected_node: Option<u32>,
+    voxel_size: f32,
 ) -> ProceduralSnapshot {
     use rkp_procedural::node_kind::*;
     use rkp_procedural::NodeKind;
@@ -160,6 +163,7 @@ pub fn build_procedural_snapshot(
         nodes,
         root: tree.root().0,
         selected_node,
+        voxel_size,
     }
 }
 

@@ -186,6 +186,8 @@ pub struct RigidBodyRuntime {
 pub struct ProceduralGeometry {
     /// The procedural node tree (arena-based).
     pub tree: rkp_procedural::ProceduralObject,
+    /// Voxel size for rendering. Smaller = more detail, more voxels.
+    pub voxel_size: f32,
     /// Voxel size for the physics collider grid.
     pub collider_resolution: f32,
     /// Whether the tree needs re-evaluation.
@@ -207,6 +209,7 @@ impl ProceduralGeometry {
         );
         Self {
             tree,
+            voxel_size: 0.05,
             collider_resolution: 0.1,
             dirty: true,
             last_evaluated_scale: glam::Vec3::ONE,

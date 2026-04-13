@@ -474,13 +474,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var final_color = lo + ambient + emission;
 
     // Aerial perspective: apply atmospheric haze to distant geometry.
-    let depth_km = hit_t / 1000.0;
-    if depth_km > 0.01 {
-        let ap_w = min(depth_km / AP_DISTANCE_PER_SLICE, AP_SLICE_COUNT - 1.0) / AP_SLICE_COUNT;
-        let screen_uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims);
-        let ap = textureSampleLevel(aerial_perspective_lut, atmo_sampler, vec3<f32>(screen_uv, ap_w), 0.0);
-        final_color = final_color * ap.a + ap.rgb;
-    }
+    // Aerial perspective disabled — the LUT resolution (4km/slice) is too coarse
+    // for voxel scenes at 5-50m scale. Causes visible discoloration on nearby objects.
+    // TODO: re-enable with non-linear depth mapping if large outdoor scenes need it.
 
     textureStore(output, coord, vec4<f32>(final_color, 1.0));
 }

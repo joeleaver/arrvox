@@ -75,6 +75,11 @@ pub enum EngineCommand {
         node_id: u32,
     },
 
+    /// Set the render voxel size on the selected procedural object.
+    SetProceduralVoxelSize {
+        voxel_size: f32,
+    },
+
     /// Set a parameter on a procedural node.
     SetProceduralNodeParam {
         node_id: u32,
