@@ -144,8 +144,8 @@ impl SceneFile {
 impl EnvironmentState {
     pub fn from_settings(env: &crate::environment::EnvironmentSettings) -> Self {
         Self {
-            sky_color_top: env.sky_color_top,
-            sky_color_horizon: env.sky_color_horizon,
+            sky_color_top: env.sky_color_top_override.unwrap_or([0.4, 0.6, 1.0]),
+            sky_color_horizon: env.sky_color_horizon_override.unwrap_or([0.8, 0.85, 0.9]),
             ambient_intensity: env.ambient_intensity,
             sun_azimuth: env.sun_azimuth,
             sun_elevation: env.sun_elevation,
@@ -167,8 +167,9 @@ impl EnvironmentState {
     pub fn to_settings(&self) -> crate::environment::EnvironmentSettings {
         let defaults = crate::environment::EnvironmentSettings::default();
         crate::environment::EnvironmentSettings {
-            sky_color_top: self.sky_color_top,
-            sky_color_horizon: self.sky_color_horizon,
+            sky_color_top_override: Some(self.sky_color_top),
+            sky_color_horizon_override: Some(self.sky_color_horizon),
+            sun_color_override: None,
             ambient_intensity: self.ambient_intensity,
             sun_azimuth: self.sun_azimuth,
             sun_elevation: self.sun_elevation,

@@ -1480,11 +1480,23 @@ impl EngineState {
             EngineCommand::UpdateEnvironment { field, value } => {
                 let env = &mut self.environment;
                 match field.as_str() {
-                    "sky_color_top" => {
-                        if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) { env.sky_color_top = v; }
+                    "sky_color_top_override" => {
+                        if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) { env.sky_color_top_override = Some(v); }
                     }
-                    "sky_color_horizon" => {
-                        if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) { env.sky_color_horizon = v; }
+                    "sky_color_top_override_enabled" => {
+                        if value == "false" { env.sky_color_top_override = None; }
+                    }
+                    "sky_color_horizon_override" => {
+                        if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) { env.sky_color_horizon_override = Some(v); }
+                    }
+                    "sky_color_horizon_override_enabled" => {
+                        if value == "false" { env.sky_color_horizon_override = None; }
+                    }
+                    "sun_color_override" => {
+                        if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) { env.sun_color_override = Some(v); }
+                    }
+                    "sun_color_override_enabled" => {
+                        if value == "false" { env.sun_color_override = None; }
                     }
                     "ambient_intensity" => {
                         if let Ok(v) = value.parse::<f32>() { env.ambient_intensity = v; }
@@ -2204,23 +2216,36 @@ impl EngineState {
                 (sample.opacity, sample.material_id)
             };
 
-            if let Some(result) = self.scene_mgr.voxelize_opacity_fn(
+            match self.scene_mgr.voxelize_opacity_fn(
                 opacity_fn, &aabb, voxel_size, scene_id,
             ) {
-                let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
+                Some(result) => {
+                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
 
-                // Update the entity's Renderable and ProceduralGeometry.
-                if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
-                    renderable.voxel_count = result.voxel_count;
-                    renderable.spatial = Some(spatial);
-                }
-                if let Ok(mut proc_geo) = self.world.get::<&mut ProceduralGeometry>(entity) {
-                    proc_geo.dirty = false;
-                    proc_geo.last_evaluated_scale = scale;
-                }
+                    if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
+                        renderable.voxel_count = result.voxel_count;
+                        renderable.spatial = Some(spatial);
+                    }
+                    if let Ok(mut proc_geo) = self.world.get::<&mut ProceduralGeometry>(entity) {
+                        proc_geo.dirty = false;
+                        proc_geo.last_evaluated_scale = scale;
+                    }
 
-                self.geometry_dirty = true;
-                self.gpu_objects_dirty = true;
+                    self.geometry_dirty = true;
+                    self.gpu_objects_dirty = true;
+                }
+                None => {
+                    // Voxelization failed (pool full, empty result, etc.).
+                    // Clear dirty to avoid retrying every frame.
+                    if let Ok(mut proc_geo) = self.world.get::<&mut ProceduralGeometry>(entity) {
+                        proc_geo.dirty = false;
+                    }
+                    self.console.warn(format!(
+                        "Procedural voxelization failed (AABB too large or pool full). \
+                         Voxel size: {voxel_size:.4}, AABB extent: {:.1}",
+                        (aabb.max - aabb.min).length()
+                    ));
+                }
             }
         }
     }

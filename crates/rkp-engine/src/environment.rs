@@ -6,17 +6,20 @@
 /// All editable environment settings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnvironmentSettings {
-    // ── Sky ──────────────────────────────────────────────────────────
-    pub sky_color_top: [f32; 3],
-    pub sky_color_horizon: [f32; 3],
+    // ── Sky / Atmosphere ──────────────────────────────────────────────
+    /// Override sky top color (None = computed from atmosphere model).
+    pub sky_color_top_override: Option<[f32; 3]>,
+    /// Override sky horizon color (None = computed from atmosphere model).
+    pub sky_color_horizon_override: Option<[f32; 3]>,
     pub ambient_intensity: f32,
 
     // ── Sun / directional light ─────────────────────────────────────
-    /// Sun azimuth in degrees (0 = North, 90 = East, 180 = South, 270 = West).
     pub sun_azimuth: f32,
-    /// Sun elevation in degrees (0 = horizon, 90 = directly overhead, negative = below).
     pub sun_elevation: f32,
+    /// Base sun color. Atmosphere applies transmittance extinction on top.
     pub sun_color: [f32; 3],
+    /// Override sun surface color after extinction (None = atmosphere-computed).
+    pub sun_color_override: Option<[f32; 3]>,
     pub sun_intensity: f32,
 
     // ── Shadows ─────────────────────────────────────────────────────
@@ -74,13 +77,14 @@ pub struct EnvironmentSettings {
 impl Default for EnvironmentSettings {
     fn default() -> Self {
         Self {
-            sky_color_top: [0.4, 0.6, 1.0],
-            sky_color_horizon: [0.8, 0.85, 0.9],
+            sky_color_top_override: None,
+            sky_color_horizon_override: None,
             ambient_intensity: 1.0,
             sun_azimuth: 210.0,   // southwest
             sun_elevation: 45.0,  // mid-afternoon
             sun_color: [1.0, 0.95, 0.9],
-            sun_intensity: 110_000.0,  // lux, clear day direct sun
+            sun_color_override: None,
+            sun_intensity: 110_000.0,
             shadow_steps: 32,
             ao_radius: 0.1,
             ao_steps: 5,
@@ -307,11 +311,9 @@ impl EnvironmentSettings {
             ambient_intensity: self.ambient_intensity,
             camera_altitude: self.camera_altitude,
             sun_intensity: self.sun_intensity,
-            sky_color_top: sky_top,
-            sky_color_horizon: sky_horizon,
+            sky_color_top: self.sky_color_top_override.unwrap_or(sky_top),
+            sky_color_horizon: self.sky_color_horizon_override.unwrap_or(sky_horizon),
             sun_dir: sun_toward,
-            // ambient_color no longer used by shade (LUT-based ambient instead).
-            // Kept for volumetric fog ambient.
             ambient_color: {
                 let amb = atmo::ambient(sun_toward, self.sun_intensity, self.camera_altitude);
                 [amb[0] * self.ambient_intensity, amb[1] * self.ambient_intensity, amb[2] * self.ambient_intensity]
@@ -413,14 +415,14 @@ impl EnvironmentSettings {
         let d = self.sun_direction();
         let sun_toward = [-d[0], -d[1], -d[2]];
         let trans = atmo::sun_transmittance(sun_toward, self.camera_altitude);
+        let effective_color = self.sun_color_override.unwrap_or([
+            self.sun_color[0] * trans[0],
+            self.sun_color[1] * trans[1],
+            self.sun_color[2] * trans[2],
+        ]);
         rkp_render::rkp_shade::GpuLight {
             position: [0.0, 0.0, 0.0, 0.0],
-            color: [
-                self.sun_color[0] * trans[0],
-                self.sun_color[1] * trans[1],
-                self.sun_color[2] * trans[2],
-                self.sun_intensity,
-            ],
+            color: [effective_color[0], effective_color[1], effective_color[2], self.sun_intensity],
             direction: [d[0], d[1], d[2], 0.0],
             params: [0.0, 0.0, 0.0, 1.0], // w = cast_shadow
         }
