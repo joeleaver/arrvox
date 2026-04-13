@@ -17,9 +17,8 @@ pub fn EnvironmentPanel() -> NodeHandle {
 
     let env = store.environment.get();
 
-    let sky_top = Signal::new([env.sky_color_top[0], env.sky_color_top[1], env.sky_color_top[2], 1.0]);
-    let sky_horizon = Signal::new([env.sky_color_horizon[0], env.sky_color_horizon[1], env.sky_color_horizon[2], 1.0]);
     let ambient = Signal::new(env.ambient_intensity);
+    let camera_altitude = Signal::new(env.camera_altitude);
 
     let sun_azimuth = Signal::new(env.sun_azimuth);
     let sun_elevation = Signal::new(env.sun_elevation);
@@ -86,14 +85,13 @@ pub fn EnvironmentPanel() -> NodeHandle {
             style: "display:flex;flex-direction:column;height:100%;overflow-y:auto;\
                     color:#ccc;font-size:12px;",
 
-            // ── Sky section ──────────────────────────────────────────
-            {prop_section_header(__scope, "Sky", sky_collapsed, None)}
+            // ── Atmosphere section ────────────────────────────────────
+            {prop_section_header(__scope, "Atmosphere", sky_collapsed, None)}
             if !sky_collapsed.get() {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
-                    {prop_color(__scope, "Top", sky_top, env_color3("sky_color_top"))}
-                    {prop_color(__scope, "Horizon", sky_horizon, env_color3("sky_color_horizon"))}
-                    {prop_slider(__scope, "Ambient", ambient, 0.0, 2.0, 0.01, env_f32("ambient_intensity"))}
+                    {prop_slider(__scope, "Ambient", ambient, 0.0, 5.0, 0.1, env_f32("ambient_intensity"))}
+                    {prop_slider(__scope, "Camera Altitude (m)", camera_altitude, 0.0, 5000.0, 10.0, env_f32("camera_altitude"))}
                 }
             }
 

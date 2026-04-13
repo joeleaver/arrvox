@@ -219,11 +219,11 @@ fn main(
 
     // Thread 0 writes the final result.
     if local_idx == 0u {
-        // Multiply by isotropic phase and divide by number of samples (uniform sphere).
-        // Each sample covers solid angle 4π/64.
-        let sphere_weight = 4.0 * PI / 64.0;
-        let l_2nd = shared_l[0] * sphere_weight;
-        let f_ms = shared_fms[0] * sphere_weight;
+        // Monte Carlo sphere average: integral of f(ω)×(1/4π) dω ≈ (1/N)×Σf(ωi).
+        // Each thread contributes one direction; the mean gives the sphere average.
+        let inv_n = 1.0 / f32(SQRT_SAMPLES * SQRT_SAMPLES); // 1/64
+        let l_2nd = shared_l[0] * inv_n;
+        let f_ms = shared_fms[0] * inv_n;
 
         // Geometric series: Psi_ms = L_2nd / (1 - f_ms)
         let psi_ms = l_2nd / max(vec3<f32>(1.0) - f_ms, vec3<f32>(0.001));

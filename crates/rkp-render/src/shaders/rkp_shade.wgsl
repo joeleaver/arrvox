@@ -389,11 +389,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         lo += (diffuse + specular) * radiance * n_dot_l * light_shadow;
     }
 
-    // Ambient from multi-scattering LUT — replaces crude CPU 6-direction sampling.
-    // The LUT gives isotropic scattered luminance per unit sun illuminance at
-    // (camera_height, sun_zenith). This captures all scattering orders.
+    // Ambient from multi-scattering LUT — isotropic scattered luminance at camera position.
     let cam_height = EARTH_RADIUS + shade_params.camera_altitude;
-    let sun_cos_z = shade_params.sun_dir.y; // sun_dir is toward-sun, .y = cos(zenith)
+    let sun_cos_z = shade_params.sun_dir.y;
     let ms_irradiance = lookup_multiscatter(cam_height, sun_cos_z)
                       * shade_params.sun_intensity
                       * shade_params.ambient_intensity;
