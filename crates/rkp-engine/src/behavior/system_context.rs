@@ -51,6 +51,26 @@ impl<'a> SystemContext<'a> {
     // ── World queries (read-only) ───────────────────────────────────
 
     /// Query the world for entities matching a component tuple.
+    ///
+    /// The returned `QueryBorrow` holds an immutable borrow on the world for
+    /// its lifetime. If you need to call mutable methods on `ctx` (like
+    /// `set_rotation`, `despawn`, etc.) inside the loop, collect first:
+    ///
+    /// ```ignore
+    /// // Won't compile — query borrows ctx immutably, set_rotation borrows mutably
+    /// for (entity, spin) in ctx.query::<&Spin>().iter() {
+    ///     ctx.set_rotation(entity, new_rot);  // ERROR: mutable borrow
+    /// }
+    ///
+    /// // Collect first to release the borrow, then mutate
+    /// let spins: Vec<_> = ctx.query::<&Spin>()
+    ///     .iter()
+    ///     .map(|(entity, spin)| (entity, spin.speed, spin.axis))
+    ///     .collect();
+    /// for (entity, speed, axis) in spins {
+    ///     ctx.set_rotation(entity, new_rot);  // OK
+    /// }
+    /// ```
     pub fn query<Q: hecs::Query>(&self) -> hecs::QueryBorrow<'_, Q> {
         self.world.query::<Q>()
     }
