@@ -54,9 +54,10 @@ pub fn ConsolePanel() -> NodeHandle {
                 }
             }
 
-            // Log entries
+            // Log entries — user-select: text enables cross-message text selection + copy.
             div {
-                style: "flex:1;overflow-y:auto;font-family:monospace;font-size:11px;",
+                style: "flex:1;overflow-y:auto;font-family:monospace;font-size:11px;\
+                        user-select:text;cursor:text;",
                 for entry in store.console_entries.get() {
                     {log_entry_row(
                         __scope,

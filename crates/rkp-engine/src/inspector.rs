@@ -60,6 +60,10 @@ pub struct FieldSnapshot {
     pub transient: bool,
     /// For AssetRef fields — file extension filter.
     pub asset_filter: Option<String>,
+    /// For enum-like String fields — valid (value, label) pairs for a dropdown.
+    pub enum_options: Vec<(String, String)>,
+    /// Use scrub input instead of slider for ranged floats.
+    pub scrub: bool,
 }
 
 /// Snapshot of a single component on an entity.

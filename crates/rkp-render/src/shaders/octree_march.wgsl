@@ -210,6 +210,7 @@ fn trace_shadow_ray(
     world_dir: vec3<f32>,
     num_objects: u32,
     max_steps: u32,
+    max_world_dist: f32,  // max trace distance (light distance for point/spot, 1e20 for directional)
 ) -> f32 {
     var transmittance = 1.0;
 
@@ -219,14 +220,16 @@ fn trace_shadow_ray(
 
         let inv_world = obj.inverse_world;
         let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
-        let local_dir = normalize((inv_world * vec4<f32>(world_dir, 0.0)).xyz);
+        let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
+        let local_dir = normalize(local_dir_unnorm);
+        // Convert world-space max distance to local-space t.
+        let local_scale = length(local_dir_unnorm);
+        let local_max_t = max_world_dist * local_scale;
 
         let root = obj.octree_root;
         let max_depth = obj.octree_depth;
         let extent = bitcast<f32>(obj.octree_extent_bits);
         let vs = obj.voxel_size;
-        // Minimum step: 2*vs avoids burning steps on leaf-level near-surface nodes.
-        // DDA still gives big skips for coarse empty regions.
         let min_step = vs * 2.0;
 
         let oc_origin = local_origin + vec3<f32>(extent * 0.5);
@@ -237,14 +240,15 @@ fn trace_shadow_ray(
         );
         let inv_dir = 1.0 / safe_dir;
 
-        // Offset origin to avoid self-shadowing.
         let shadow_origin = oc_origin + safe_dir * vs * 4.0;
         let t_range = intersect_aabb(shadow_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(extent));
         if t_range.x > t_range.y { continue; }
 
+        // Clamp trace to light distance (avoids finding occluders behind point lights).
+        let t_limit = min(t_range.y, local_max_t);
         var t = max(t_range.x, 0.0);
         for (var step = 0u; step < max_steps; step++) {
-            if t > t_range.y { break; }
+            if t > t_limit { break; }
 
             let pos = clamp(shadow_origin + safe_dir * t, vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
             let r = octree_lookup(root, max_depth, extent, pos);
@@ -604,6 +608,7 @@ fn main(
 
             let light_type = u32(light.position.w);
             var shadow_dir: vec3<f32>;
+            var shadow_max_dist = 1e20; // directional: infinite
 
             if light_type == 0u {
                 // Directional light: shadow direction = toward light source.
@@ -620,6 +625,8 @@ fn main(
                     continue;
                 }
                 shadow_dir = to_light / max(dist_to_light, 0.001);
+                // Only trace up to the light — occluders behind it don't block.
+                shadow_max_dist = dist_to_light;
 
                 // Spot light cone check.
                 if light_type == 2u {
@@ -646,6 +653,7 @@ fn main(
                 shadow_dir,
                 num_objects,
                 march_params.shadow_max_steps,
+                shadow_max_dist,
             );
             shadow_idx++;
         }

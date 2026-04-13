@@ -60,10 +60,12 @@ pub struct SpatialData {
 
 /// Point light source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PointLight {
     pub color: [f32; 3],
     pub intensity: f32,
     pub range: f32,
+    pub cast_shadow: bool,
 }
 
 impl Default for PointLight {
@@ -72,6 +74,37 @@ impl Default for PointLight {
             color: [1.0, 1.0, 1.0],
             intensity: 1.0,
             range: 10.0,
+            cast_shadow: true,
+        }
+    }
+}
+
+/// Spot light source — like a point light but with a cone direction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpotLight {
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub range: f32,
+    /// Direction the spot light points (normalized).
+    pub direction: glam::Vec3,
+    /// Outer cone angle in degrees.
+    pub outer_angle: f32,
+    /// Inner cone angle in degrees (full intensity within this cone).
+    pub inner_angle: f32,
+    pub cast_shadow: bool,
+}
+
+impl Default for SpotLight {
+    fn default() -> Self {
+        Self {
+            color: [1.0, 1.0, 1.0],
+            intensity: 2.0,
+            range: 15.0,
+            direction: glam::Vec3::new(0.0, -1.0, 0.0),
+            outer_angle: 45.0,
+            inner_angle: 30.0,
+            cast_shadow: true,
         }
     }
 }
@@ -81,6 +114,67 @@ impl Default for PointLight {
 pub struct Parent {
     /// UUID of the parent entity (matches the UUID in entity_uuids map).
     pub parent_id: uuid::Uuid,
+}
+
+/// Rigid body physics component — configures physics behavior for play mode.
+///
+/// The physics system reads this at play start to create a Rapier rigid body
+/// with the appropriate collider. Not a runtime component — `RigidBodyRuntime`
+/// (containing the Rapier handle) is added transiently during play.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RigidBody {
+    /// Body type: Dynamic (gravity+forces), Static (immovable), Kinematic.
+    pub body_type: rkf_physics::rigid_body::BodyType,
+    /// Collision shape. Auto = voxel collider for voxelized, box for analytical.
+    pub collider_shape: rkf_physics::rigid_body::ColliderShape,
+    /// Mass in kg (dynamic bodies only).
+    pub mass: f32,
+    /// Friction coefficient.
+    pub friction: f32,
+    /// Restitution (bounciness).
+    pub restitution: f32,
+    /// Voxel size for the physics collider grid (Auto mode only).
+    /// Larger = coarser but faster. Default 0.1m.
+    pub collider_cell_size: f32,
+}
+
+impl Default for RigidBody {
+    fn default() -> Self {
+        Self {
+            body_type: rkf_physics::rigid_body::BodyType::Dynamic,
+            collider_shape: rkf_physics::rigid_body::ColliderShape::Auto,
+            mass: 1.0,
+            friction: 0.5,
+            restitution: 0.3,
+            collider_cell_size: 0.1,
+        }
+    }
+}
+
+/// Precomputed collider data — cached on the entity, rebuilt when RigidBody
+/// settings or geometry change. PlayStart reads this instead of computing on the fly.
+#[derive(Debug, Clone)]
+pub struct ColliderCache {
+    /// The resolved collider shape type.
+    pub shape: rkf_physics::rigid_body::ColliderShape,
+    /// For voxel colliders: the coarse grid cell coordinates.
+    pub voxel_coords: Vec<glam::IVec3>,
+    /// Coarse cell size for the collider grid.
+    pub collider_cell_size: f32,
+    /// AABB half-extents (used for box/sphere/capsule).
+    pub aabb_half: glam::Vec3,
+    /// Grid origin offset in local space (aabb_center - extent/2).
+    /// Used to convert voxel coords to world positions.
+    pub grid_origin: glam::Vec3,
+    /// Octree depth (for computing grid extent).
+    pub tree_depth: u8,
+}
+
+/// Runtime Rapier handle — transient, exists only during play mode.
+#[derive(Debug, Clone)]
+pub struct RigidBodyRuntime {
+    pub handle: rapier3d::prelude::RigidBodyHandle,
 }
 
 /// Camera entity.

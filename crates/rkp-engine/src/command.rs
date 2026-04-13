@@ -41,10 +41,16 @@ pub enum EngineCommand {
         entity_id: Uuid,
     },
 
+    /// Delete the currently selected object.
+    DeleteSelected,
+
     /// Duplicate an object by entity ID.
     DuplicateObject {
         entity_id: Uuid,
     },
+
+    /// Duplicate the currently selected object.
+    DuplicateSelected,
 
     // ── Transforms ───────────────────────────────────────────────────
 
@@ -139,6 +145,12 @@ pub enum EngineCommand {
     /// Save the import profile and re-import the model.
     ReimportModel {
         source_path: String,
+    },
+
+    /// Set a view option (e.g., show_colliders).
+    SetViewOption {
+        option: String,
+        enabled: bool,
     },
 
     /// Clear the console log.

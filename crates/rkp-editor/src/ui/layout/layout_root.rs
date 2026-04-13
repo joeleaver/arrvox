@@ -33,6 +33,44 @@ pub fn LayoutRoot() -> NodeHandle {
             on_close: close_current_window,
             left_section: Some(title_section),
 
+            // Dark theme CSS overrides for rinch components.
+            style {
+                {"
+                    :root {
+                        --rinch-color-default-border: #3c3c3c;
+                        --rinch-color-surface: #2d2d2d;
+                        --rinch-color-text: #ccc;
+                        --rinch-color-dimmed: #888;
+                    }
+                    .rinch-color-input__input {
+                        color: #ccc !important;
+                        font-size: 11px !important;
+                        height: 26px !important;
+                    }
+                    .rinch-color-input__input-group {
+                        border-color: #3c3c3c !important;
+                        background-color: #1e1e1e !important;
+                    }
+                    .rinch-color-input__dropdown {
+                        background-color: #2d2d2d !important;
+                        border-color: #3c3c3c !important;
+                    }
+                    .rinch-dropdown-menu__dropdown-inner {
+                        background-color: #2d2d2d !important;
+                        border-color: #3c3c3c !important;
+                    }
+                    .rinch-dropdown-menu__item {
+                        color: #ccc !important;
+                    }
+                    .rinch-dropdown-menu__item:hover {
+                        background-color: #37373d !important;
+                    }
+                    .rinch-context-menu__dropdown-inner {
+                        background-color: #2d2d2d !important;
+                        border-color: #3c3c3c !important;
+                    }
+                "}
+            }
             div {
                 style: "display:flex;flex-direction:column;width:100%;height:100%;\
                         position:relative;overflow:hidden;\

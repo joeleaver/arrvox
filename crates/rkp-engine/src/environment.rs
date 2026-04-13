@@ -73,7 +73,7 @@ impl Default for EnvironmentSettings {
             shadow_steps: 32,
             ao_radius: 0.1,
             ao_steps: 5,
-            exposure: 1.0,
+            exposure: 0.15,
 
             camera_altitude: 100.0,
 
@@ -272,7 +272,6 @@ impl EnvironmentSettings {
         let d = self.sun_direction();
         let sun_toward = [-d[0], -d[1], -d[2]];
         let amb = atmo::ambient(sun_toward, self.sun_intensity, self.camera_altitude);
-        // Compute sky gradient for volumetric fog compatibility.
         let sky_top = atmo::sky([0.0, 1.0, 0.0], sun_toward, self.sun_intensity, self.camera_altitude);
         let horizon_dir = {
             let el = 10.0f32.to_radians();
@@ -315,6 +314,7 @@ impl EnvironmentSettings {
             sun_dir: [sun_toward[0], sun_toward[1], sun_toward[2], 0.0],
             sun_color: {
                 let trans = atmo::sun_transmittance(sun_toward, self.camera_altitude);
+                // Use PBR sun intensity for fog/cloud lighting (not atmosphere scale).
                 [
                     self.sun_color[0] * trans[0] * self.sun_intensity,
                     self.sun_color[1] * trans[1] * self.sun_intensity,

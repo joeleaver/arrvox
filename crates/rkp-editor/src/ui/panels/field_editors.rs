@@ -33,6 +33,22 @@ fn float_editor(
 ) -> rinch::core::dom::NodeHandle {
     let val = match &field.value { FieldValue::Float(v) => *v, _ => 0.0 };
 
+    if field.scrub {
+        if let Some((min, max)) = field.range {
+            let value = Signal::new(val as f32);
+            let step = ((max - min) / 200.0) as f32;
+            return prop_controls::prop_scrub(
+                __scope,
+                &field.name,
+                value,
+                min as f32,
+                max as f32,
+                step,
+                Rc::new(move |v| on_change(FieldValue::Float(v as f64))),
+            );
+        }
+    }
+
     if let Some((min, max)) = field.range {
         let value = Signal::new(val);
         let step = (max - min) / 200.0;
@@ -93,12 +109,27 @@ fn string_editor(
 ) -> rinch::core::dom::NodeHandle {
     let val = match &field.value { FieldValue::String(v) => v.clone(), _ => String::new() };
     let value = Signal::new(val);
-    prop_controls::prop_text(
-        __scope,
-        &field.name,
-        value,
-        Rc::new(move |v| on_change(FieldValue::String(v))),
-    )
+
+    // If this field has enum options, render as a dropdown select.
+    if !field.enum_options.is_empty() {
+        let options: Vec<(&str, &str)> = field.enum_options.iter()
+            .map(|(v, l)| (v.as_str(), l.as_str()))
+            .collect();
+        prop_controls::prop_select(
+            __scope,
+            &field.name,
+            value,
+            &options,
+            Rc::new(move |v| on_change(FieldValue::String(v))),
+        )
+    } else {
+        prop_controls::prop_text(
+            __scope,
+            &field.name,
+            value,
+            Rc::new(move |v| on_change(FieldValue::String(v))),
+        )
+    }
 }
 
 fn vec3_editor(

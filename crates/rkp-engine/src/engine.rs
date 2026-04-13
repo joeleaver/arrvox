@@ -284,6 +284,8 @@ struct EngineState {
     // Pick readback (8 bytes for 1 pixel of Rg32Uint material texture)
     pick_readback_buffer: wgpu::Buffer,
     pending_pick: Option<(u32, u32)>,
+    /// Cached light count for march pass (set in light upload block, used in render).
+    num_lights_cache: u32,
 }
 
 impl EngineState {
@@ -411,6 +413,7 @@ impl EngineState {
             mouse_pos: glam::Vec2::ZERO,
             pick_readback_buffer,
             pending_pick: None,
+            num_lights_cache: 1,
         }
     }
 
@@ -463,6 +466,7 @@ impl EngineState {
             shade_params.num_lights = gpu_lights.len() as u32;
             self.renderer.update_shade_params(&self.queue, &shade_params);
             self.renderer.update_lights(&self.queue, &gpu_lights);
+            self.num_lights_cache = shade_params.num_lights;
 
             if self.environment_dirty {
                 self.tone_map.set_exposure(&self.queue, self.environment.exposure);
@@ -509,7 +513,7 @@ impl EngineState {
         // 3. Render: march (+ per-light shadow) → SSAO → shade → volumetrics.
         let object_count = self.gpu_objects.len() as u32;
         let shadow_steps = self.environment.shadow_steps;
-        let num_lights = 1u32; // TODO: support multiple lights from scene
+        let num_lights = self.num_lights_cache;
         let vp = glam::Mat4::from_cols_array_2d(&cam_uniforms.view_proj);
         let screen_aabbs = crate::scene_sync::compute_screen_aabbs(
             &self.gpu_objects, &vp, self.width as f32, self.height as f32,
@@ -2462,23 +2466,37 @@ impl EngineState {
         let all_nodes = self.scene_mgr.octree.data();
 
         for (entity, rb, spatial, scale) in entities {
+            let name = self.world.get::<&EditorMetadata>(entity)
+                .map(|m| m.name.clone()).unwrap_or_default();
+            let pos = self.world.get::<&Transform>(entity)
+                .map(|t| t.position).unwrap_or_default();
+
             let aabb_half = spatial.as_ref()
                 .map(|s| s.aabb.half_extents() * scale)
                 .unwrap_or(glam::Vec3::splat(0.5));
 
+            if let Some(ref sp) = spatial {
+                let extent = (1u32 << sp.depth) as f32 * sp.base_voxel_size;
+                eprintln!("[ColliderCache] '{name}' pos={pos:?} scale={scale:?} aabb={:?}..{:?} aabb_half={aabb_half:?} extent={extent}",
+                    sp.aabb.min, sp.aabb.max);
+            }
+
             let (resolved_shape, voxel_coords, voxel_size) = match rb.collider_shape {
                 rkf_physics::rigid_body::ColliderShape::Auto => {
                     if let Some(ref sp) = spatial {
-                        let coords = crate::play_mode::extract_voxel_coords(
+                        let (coords, cell_size) = crate::play_mode::build_coarse_collider(
                             all_nodes,
                             &self.scene_mgr.voxel_pool,
                             sp.root_offset as usize,
-                            rb.physics_resolution,
+                            sp.depth,
+                            sp.len,
+                            sp.base_voxel_size,
+                            rb.collider_cell_size,
                         );
                         if coords.is_empty() {
                             (rkf_physics::rigid_body::ColliderShape::Box, Vec::new(), 0.0)
                         } else {
-                            (rkf_physics::rigid_body::ColliderShape::Auto, coords, sp.voxel_size)
+                            (rkf_physics::rigid_body::ColliderShape::Auto, coords, cell_size)
                         }
                     } else {
                         (rkf_physics::rigid_body::ColliderShape::Box, Vec::new(), 0.0)
@@ -2487,11 +2505,22 @@ impl EngineState {
                 other => (other.clone(), Vec::new(), 0.0),
             };
 
+            // Compute grid origin: aabb_center - extent/2 (same as voxelization).
+            let (grid_origin, tree_depth) = if let Some(ref sp) = spatial {
+                let aabb_center = (sp.aabb.min + sp.aabb.max) * 0.5;
+                let extent = (1u32 << sp.depth) as f32 * sp.voxel_size;
+                (aabb_center - glam::Vec3::splat(extent * 0.5), sp.depth)
+            } else {
+                (glam::Vec3::ZERO, 0)
+            };
+
             let cache = ColliderCache {
                 shape: resolved_shape,
                 voxel_coords,
-                voxel_size,
+                collider_cell_size: voxel_size, // actually the coarse cell size from build_coarse_collider
                 aabb_half,
+                grid_origin,
+                tree_depth,
             };
 
             // Insert or replace the cache component.
@@ -2542,31 +2571,26 @@ impl EngineState {
                     }
                 }
                 ColliderShape::Auto => {
-                    // Voxel collider from cache — subsample for viz (every Nth).
                     if !cache.voxel_coords.is_empty() {
-                        let vs = cache.voxel_size;
-                        let half = vs * transform.scale.x * 0.5;
-                        let depth = self.world.get::<&crate::components::Renderable>(_entity)
-                            .ok()
-                            .and_then(|r| r.spatial.as_ref().map(|s| s.depth))
-                            .unwrap_or(8);
-                        let grid_size = (1u32 << depth) as f32;
-                        let grid_offset = glam::Vec3::splat(grid_size * 0.5 * vs);
+                        let cs = cache.collider_cell_size;
 
-                        // Subsample for viz: cap at 500 boxes regardless of physics_resolution.
-                        let skip = (cache.voxel_coords.len() / 500).max(1);
-                        for (i, coord) in cache.voxel_coords.iter().enumerate() {
-                            if i % skip != 0 { continue; }
-                            let world_pos = transform.position
-                                + glam::Vec3::new(
-                                    coord.x as f32 * vs,
-                                    coord.y as f32 * vs,
-                                    coord.z as f32 * vs,
-                                ) * transform.scale
-                                - grid_offset * transform.scale;
-                            let min = world_pos - glam::Vec3::splat(half);
-                            let max = world_pos + glam::Vec3::splat(half);
-                            verts.extend(rkf_render::wireframe::aabb_wireframe(min, max, color));
+                        let offset = cache.grid_origin * transform.scale;
+                        for coord in &cache.voxel_coords {
+                            // Match Rapier: min = coord * cell_size, max = (coord+1) * cell_size,
+                            // plus grid_origin offset to align with rendered geometry.
+                            let local_min = glam::Vec3::new(
+                                coord.x as f32 * cs,
+                                coord.y as f32 * cs,
+                                coord.z as f32 * cs,
+                            );
+                            let local_max = glam::Vec3::new(
+                                (coord.x + 1) as f32 * cs,
+                                (coord.y + 1) as f32 * cs,
+                                (coord.z + 1) as f32 * cs,
+                            );
+                            let world_min = transform.position + offset + local_min * transform.scale;
+                            let world_max = transform.position + offset + local_max * transform.scale;
+                            verts.extend(rkf_render::wireframe::aabb_wireframe(world_min, world_max, color));
                         }
                     } else {
                         let min = transform.position - cache.aabb_half;

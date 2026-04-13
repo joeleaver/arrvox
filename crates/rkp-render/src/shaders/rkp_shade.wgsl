@@ -313,6 +313,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
 
+        // Read per-light shadow BEFORE the n_dot_l skip — must stay in sync
+        // with the march pass which always writes shadow for every shadow-casting light.
+        var light_shadow = 1.0;
+        let cast_shadow = light.params.w;
+        if cast_shadow >= 0.5 && shadow_idx < 4u {
+            light_shadow = shadow_data[shadow_idx];
+            shadow_idx++;
+        }
+
         let n_dot_l = max(dot(N, L), 0.0);
         if n_dot_l <= 0.0 { continue; }
 
@@ -331,22 +340,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let radiance = light.color.rgb * light.color.w * attenuation;
 
-        // Per-light shadow from shadow texture. Shadow channels are written
-        // in light order for shadow-casting lights (matching march pass).
-        var light_shadow = 1.0;
-        let cast_shadow = light.params.w;
-        if cast_shadow >= 0.5 && shadow_idx < 4u {
-            light_shadow = shadow_data[shadow_idx];
-            shadow_idx++;
-        }
-
         lo += (diffuse + specular) * radiance * n_dot_l * light_shadow;
     }
 
-    // Ambient: atmosphere-derived hemisphere irradiance + AO.
-    let hemisphere = shade_params.ambient_color
-                   * mix(0.5, 1.0, dot(N, vec3<f32>(0.0, 1.0, 0.0)) * 0.5 + 0.5);
-    let ambient = hemisphere * albedo * (1.0 - metallic) * ao;
+    // Ambient diffuse: atmosphere-derived hemisphere irradiance + AO.
+    let ambient_diffuse = shade_params.ambient_color * albedo * (1.0 - metallic) * ao;
+
+    // Ambient specular: approximate sky reflection for energy conservation.
+    // Without this, fresnel at grazing angles removes diffuse energy with
+    // nowhere for the specular to go (no environment map), causing dark edges.
+    let F_env = fresnel_schlick(n_dot_v, f0);
+    let ambient_specular = shade_params.ambient_color * F_env * ao;
+    let ambient = ambient_diffuse + ambient_specular;
 
     // Emission.
     let emission = mat.base_color.rgb * mat.emission_strength;

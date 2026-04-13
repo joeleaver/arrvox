@@ -17,8 +17,10 @@ pub mod console;
 pub mod environment;
 pub mod component_registry;
 pub mod file_watcher;
+pub mod gameplay_loader;
 pub mod import_profile;
 pub mod import_worker;
+pub mod play_mode;
 pub mod gizmo;
 pub mod inspector;
 pub mod material_library;
@@ -34,3 +36,6 @@ pub use command::EngineCommand;
 pub use snapshot::{StateUpdate, SceneObjectInfo, ModelInfo};
 pub use material_library::MaterialInfo;
 pub use engine::RkpEngine;
+
+// Re-export the proc macro for use by gameplay crates.
+pub use rkp_macros::rkp_component;

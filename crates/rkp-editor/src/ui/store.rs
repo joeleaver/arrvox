@@ -102,6 +102,12 @@ pub struct EditorStore {
     pub environment: Signal<EnvironmentSettings>,
     /// Console log entries.
     pub console_entries: Signal<Vec<LogEntry>>,
+    /// Whether the engine is in play mode.
+    pub play_mode: Signal<bool>,
+
+    // ── View settings ────────────────────────────────────────────
+    /// Show physics collider wireframes in the viewport.
+    pub show_colliders: Signal<bool>,
 
     // ── Drag state (tab dragging) ────────────────────────────────
 
@@ -189,6 +195,8 @@ impl EditorStore {
             selected_model: Signal::new(None),
             environment: Signal::new(EnvironmentSettings::default()),
             console_entries: Signal::new(Vec::new()),
+            play_mode: Signal::new(false),
+            show_colliders: Signal::new(false),
 
             // Drag state.
             tab_drag: Signal::new(None),

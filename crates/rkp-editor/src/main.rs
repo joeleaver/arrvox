@@ -103,12 +103,56 @@ fn build_menus(
         }));
     }
 
+    spawn_menu = spawn_menu
+        .separator()
+        .item(MenuItem::new("Point Light").on_click({
+            let tx = tx.clone();
+            move || { let _ = tx.send(rkp_engine::EngineCommand::SpawnPointLight); }
+        }))
+        .item(MenuItem::new("Spot Light").on_click({
+            let tx = tx.clone();
+            move || { let _ = tx.send(rkp_engine::EngineCommand::SpawnSpotLight); }
+        }))
+        .separator()
+        .item(MenuItem::new("Camera").on_click({
+            let tx = tx.clone();
+            move || { let _ = tx.send(rkp_engine::EngineCommand::SpawnCamera); }
+        }));
+
     let edit_menu = Menu::new()
-        .submenu("Spawn", spawn_menu);
+        .submenu("Spawn", spawn_menu)
+        .separator()
+        .item(MenuItem::new("Duplicate").shortcut("Ctrl+D").on_click({
+            let tx = tx.clone();
+            move || {
+                let _ = tx.send(rkp_engine::EngineCommand::DuplicateSelected);
+            }
+        }))
+        .item(MenuItem::new("Delete").shortcut("Delete").on_click({
+            let tx = tx.clone();
+            move || {
+                let _ = tx.send(rkp_engine::EngineCommand::DeleteSelected);
+            }
+        }));
+
+    let view_menu = Menu::new()
+        .item(MenuItem::new("Show Colliders").on_click({
+            let tx = tx.clone();
+            let toggle = std::cell::Cell::new(false);
+            move || {
+                let new_val = !toggle.get();
+                toggle.set(new_val);
+                let _ = tx.send(rkp_engine::EngineCommand::SetViewOption {
+                    option: "show_colliders".into(),
+                    enabled: new_val,
+                });
+            }
+        }));
 
     vec![
         ("File", file_menu),
         ("Edit", edit_menu),
+        ("View", view_menu),
     ]
 }
 
@@ -167,6 +211,7 @@ fn main() -> anyhow::Result<()> {
                 if let Some(ref path) = update.selected_model {
                     store.selected_model.send(Some(path.clone()));
                 }
+                store.play_mode.send(update.play_mode);
                 if let Some(ref env) = update.environment {
                     store.environment.send(env.clone());
                 }

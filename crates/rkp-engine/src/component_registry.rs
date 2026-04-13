@@ -16,16 +16,23 @@ pub struct FieldMeta {
     pub struct_fields: Option<&'static [FieldMeta]>,
     /// For FieldType::AssetRef — file extension filter (e.g., "rkp").
     pub asset_filter: Option<&'static str>,
+    /// For enum-like String fields — list of valid values for a dropdown.
+    /// Each entry is (value, display_label). Empty = free-form text.
+    pub enum_options: Option<&'static [(&'static str, &'static str)]>,
+    /// Use a scrub input (drag-to-change number) instead of a slider.
+    pub scrub: bool,
 }
 
 /// Type-erased component operations.
 ///
 /// Each registered component provides function pointers for:
 /// - Checking if an entity has this component
-/// - Reading a field by name (supports dot-notation for nested structs)
-/// - Writing a field by name
-/// - Adding a default instance to an entity
-/// - Removing from an entity
+/// - Reading/writing a field by name
+/// - Adding a default instance / removing from an entity
+/// - Serializing to / deserializing from JSON
+///
+/// Components are auto-registered via `inventory::submit!` from the
+/// `#[rkp_component]` proc macro.
 pub struct ComponentEntry {
     pub name: &'static str,
     pub meta: &'static [FieldMeta],
@@ -37,41 +44,71 @@ pub struct ComponentEntry {
     pub set_field: fn(&mut hecs::World, hecs::Entity, &str, FieldValue) -> Result<(), String>,
     pub add_default: fn(&mut hecs::World, hecs::Entity) -> Result<(), String>,
     pub remove: fn(&mut hecs::World, hecs::Entity) -> Result<(), String>,
+    /// Serialize component data to JSON. Returns None if entity doesn't have this component.
+    pub serialize: fn(&hecs::World, hecs::Entity) -> Option<String>,
+    /// Deserialize JSON and insert onto entity.
+    pub deserialize_insert: fn(&mut hecs::World, hecs::Entity, &str) -> Result<(), String>,
 }
+
+inventory::collect!(ComponentEntry);
 
 /// Registry of all known component types.
 pub struct ComponentRegistry {
-    entries: Vec<ComponentEntry>,
+    /// Auto-discovered via inventory (same binary).
+    entries: Vec<&'static ComponentEntry>,
+    /// Manually registered built-in components.
+    manual_entries: Vec<ComponentEntry>,
+    /// Gameplay components from hot-reloaded dylib.
+    gameplay_entries: Vec<&'static ComponentEntry>,
 }
 
 impl ComponentRegistry {
+    /// Create and populate from inventory (auto-registered components).
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        let entries: Vec<&'static ComponentEntry> = inventory::iter::<ComponentEntry>.into_iter().collect();
+        Self { entries, manual_entries: Vec::new(), gameplay_entries: Vec::new() }
     }
 
-    /// Register a component type.
+    /// Manually register a component (for built-in components not using the macro).
     pub fn register(&mut self, entry: ComponentEntry) {
-        self.entries.push(entry);
+        self.manual_entries.push(entry);
+    }
+
+    /// Register a gameplay component entry (from hot-reloaded dylib).
+    pub fn register_gameplay(&mut self, entry: &'static ComponentEntry) {
+        // Avoid duplicates.
+        if !self.gameplay_entries.iter().any(|e| e.name == entry.name) {
+            self.gameplay_entries.push(entry);
+        }
+    }
+
+    /// Remove all gameplay component entries (before dylib unload).
+    pub fn clear_gameplay(&mut self) {
+        self.gameplay_entries.clear();
     }
 
     /// Get a component entry by name.
     pub fn get(&self, name: &str) -> Option<&ComponentEntry> {
-        self.entries.iter().find(|e| e.name == name)
+        self.entries.iter().find(|e| e.name == name).map(|e| *e)
+            .or_else(|| self.manual_entries.iter().find(|e| e.name == name))
+            .or_else(|| self.gameplay_entries.iter().find(|e| e.name == name).map(|e| *e))
     }
 
-    /// List all registered component types.
-    pub fn all(&self) -> &[ComponentEntry] {
-        &self.entries
+    /// Iterate all registered component entries.
+    fn all_entries(&self) -> impl Iterator<Item = &ComponentEntry> {
+        self.entries.iter().map(|e| *e)
+            .chain(self.manual_entries.iter())
+            .chain(self.gameplay_entries.iter().map(|e| *e))
     }
 
     /// List components that are present on the given entity.
     pub fn components_on(&self, world: &hecs::World, entity: hecs::Entity) -> Vec<&ComponentEntry> {
-        self.entries.iter().filter(|e| (e.has)(world, entity)).collect()
+        self.all_entries().filter(|e| (e.has)(world, entity)).collect()
     }
 
     /// List components that are NOT present on the given entity (for "Add Component").
     pub fn available_for(&self, world: &hecs::World, entity: hecs::Entity) -> Vec<&ComponentEntry> {
-        self.entries.iter().filter(|e| !(e.has)(world, entity)).collect()
+        self.all_entries().filter(|e| !(e.has)(world, entity)).collect()
     }
 }
 
@@ -84,14 +121,16 @@ pub fn register_builtins(registry: &mut ComponentRegistry) {
     registry.register(renderable_entry());
     registry.register(point_light_entry());
     registry.register(camera_entry());
+    registry.register(spot_light_entry());
+    registry.register(rigid_body_entry());
 }
 
 // ── Transform ────────────────────────────────────────────────────────
 
 static TRANSFORM_FIELDS: [FieldMeta; 3] = [
-    FieldMeta { name: "position", field_type: FieldType::Vec3, range: None, transient: false, struct_fields: None, asset_filter: None },
-    FieldMeta { name: "rotation", field_type: FieldType::Vec3, range: Some((-180.0, 180.0)), transient: false, struct_fields: None, asset_filter: None },
-    FieldMeta { name: "scale", field_type: FieldType::Vec3, range: Some((0.01, 100.0)), transient: false, struct_fields: None, asset_filter: None },
+    FieldMeta { name: "position", field_type: FieldType::Vec3, range: None, transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
+    FieldMeta { name: "rotation", field_type: FieldType::Vec3, range: Some((-180.0, 180.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
+    FieldMeta { name: "scale", field_type: FieldType::Vec3, range: Some((0.01, 100.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
 ];
 
 fn transform_entry() -> ComponentEntry {
@@ -132,13 +171,21 @@ fn transform_entry() -> ComponentEntry {
             world.insert_one(entity, Transform::default()).map_err(|e| format!("{e}"))
         },
         remove: |_, _| Err("Transform is mandatory".into()),
+        serialize: |world, entity| {
+            let c = world.get::<&Transform>(entity).ok()?;
+            serde_json::to_string(&*c).ok()
+        },
+        deserialize_insert: |world, entity, json| {
+            let c: Transform = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
+            world.insert_one(entity, c).map_err(|e| format!("{e}"))
+        },
     }
 }
 
 // ── EditorMetadata ───────────────────────────────────────────────────
 
 static EDITOR_METADATA_FIELDS: [FieldMeta; 1] = [
-    FieldMeta { name: "name", field_type: FieldType::String, range: None, transient: false, struct_fields: None, asset_filter: None },
+    FieldMeta { name: "name", field_type: FieldType::String, range: None, transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
 ];
 
 fn editor_metadata_entry() -> ComponentEntry {
@@ -169,16 +216,24 @@ fn editor_metadata_entry() -> ComponentEntry {
             world.insert_one(entity, EditorMetadata::default()).map_err(|e| format!("{e}"))
         },
         remove: |_, _| Err("EditorMetadata is mandatory".into()),
+        serialize: |world, entity| {
+            let c = world.get::<&EditorMetadata>(entity).ok()?;
+            serde_json::to_string(&*c).ok()
+        },
+        deserialize_insert: |world, entity, json| {
+            let c: EditorMetadata = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
+            world.insert_one(entity, c).map_err(|e| format!("{e}"))
+        },
     }
 }
 
 // ── Renderable ───────────────────────────────────────────────────────
 
 static RENDERABLE_FIELDS: [FieldMeta; 4] = [
-    FieldMeta { name: "asset_path", field_type: FieldType::String, range: None, transient: false, struct_fields: None, asset_filter: Some("rkp") },
-    FieldMeta { name: "primitive", field_type: FieldType::String, range: None, transient: false, struct_fields: None, asset_filter: None },
-    FieldMeta { name: "material_id", field_type: FieldType::Int, range: Some((0.0, 65535.0)), transient: false, struct_fields: None, asset_filter: None },
-    FieldMeta { name: "voxel_count", field_type: FieldType::Int, range: None, transient: true, struct_fields: None, asset_filter: None },
+    FieldMeta { name: "asset_path", field_type: FieldType::String, range: None, transient: false, struct_fields: None, asset_filter: Some("rkp"), enum_options: None, scrub: false },
+    FieldMeta { name: "primitive", field_type: FieldType::String, range: None, transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
+    FieldMeta { name: "material_id", field_type: FieldType::Int, range: Some((0.0, 65535.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
+    FieldMeta { name: "voxel_count", field_type: FieldType::Int, range: None, transient: true, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
 ];
 
 fn renderable_entry() -> ComponentEntry {
@@ -222,15 +277,24 @@ fn renderable_entry() -> ComponentEntry {
         remove: |world, entity| {
             world.remove_one::<Renderable>(entity).map(|_| ()).map_err(|e| format!("{e}"))
         },
+        serialize: |world, entity| {
+            let c = world.get::<&Renderable>(entity).ok()?;
+            serde_json::to_string(&*c).ok()
+        },
+        deserialize_insert: |world, entity, json| {
+            let c: Renderable = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
+            world.insert_one(entity, c).map_err(|e| format!("{e}"))
+        },
     }
 }
 
 // ── PointLight ────────────────────────────────────────────────────────
 
-static POINT_LIGHT_FIELDS: [FieldMeta; 3] = [
-    FieldMeta { name: "color", field_type: FieldType::Color, range: None, transient: false, struct_fields: None, asset_filter: None },
-    FieldMeta { name: "intensity", field_type: FieldType::Float, range: Some((0.0, 100.0)), transient: false, struct_fields: None, asset_filter: None },
-    FieldMeta { name: "range", field_type: FieldType::Float, range: Some((0.1, 500.0)), transient: false, struct_fields: None, asset_filter: None },
+static POINT_LIGHT_FIELDS: [FieldMeta; 4] = [
+    FieldMeta { name: "color", field_type: FieldType::Color, range: None, transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
+    FieldMeta { name: "intensity", field_type: FieldType::Float, range: Some((0.0, 100.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
+    FieldMeta { name: "range", field_type: FieldType::Float, range: Some((0.1, 500.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
+    FieldMeta { name: "cast_shadow", field_type: FieldType::Bool, range: None, transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
 ];
 
 fn point_light_entry() -> ComponentEntry {
@@ -246,6 +310,7 @@ fn point_light_entry() -> ComponentEntry {
                 "color" => Ok(FieldValue::Color([c.color[0], c.color[1], c.color[2], 1.0])),
                 "intensity" => Ok(FieldValue::Float(c.intensity as f64)),
                 "range" => Ok(FieldValue::Float(c.range as f64)),
+                "cast_shadow" => Ok(FieldValue::Bool(c.cast_shadow)),
                 _ => Err(format!("unknown field '{field}'")),
             }
         },
@@ -264,6 +329,10 @@ fn point_light_entry() -> ComponentEntry {
                     if let FieldValue::Float(v) = value { c.range = v as f32; Ok(()) }
                     else { Err("type mismatch".into()) }
                 }
+                "cast_shadow" => {
+                    if let FieldValue::Bool(v) = value { c.cast_shadow = v; Ok(()) }
+                    else { Err("type mismatch".into()) }
+                }
                 _ => Err(format!("unknown field '{field}'")),
             }
         },
@@ -273,16 +342,107 @@ fn point_light_entry() -> ComponentEntry {
         remove: |world, entity| {
             world.remove_one::<PointLight>(entity).map(|_| ()).map_err(|e| format!("{e}"))
         },
+        serialize: |world, entity| {
+            let c = world.get::<&PointLight>(entity).ok()?;
+            serde_json::to_string(&*c).ok()
+        },
+        deserialize_insert: |world, entity, json| {
+            let c: PointLight = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
+            world.insert_one(entity, c).map_err(|e| format!("{e}"))
+        },
+    }
+}
+
+// ── SpotLight ────────────────────────────────────────────────────
+
+static SPOT_LIGHT_FIELDS: [FieldMeta; 7] = [
+    FieldMeta { name: "color", field_type: FieldType::Color, range: None, transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
+    FieldMeta { name: "intensity", field_type: FieldType::Float, range: Some((0.0, 100.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
+    FieldMeta { name: "range", field_type: FieldType::Float, range: Some((0.1, 500.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
+    FieldMeta { name: "outer_angle", field_type: FieldType::Float, range: Some((1.0, 179.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
+    FieldMeta { name: "inner_angle", field_type: FieldType::Float, range: Some((0.0, 178.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
+    FieldMeta { name: "direction", field_type: FieldType::Vec3, range: None, transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
+    FieldMeta { name: "cast_shadow", field_type: FieldType::Bool, range: None, transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
+];
+
+fn spot_light_entry() -> ComponentEntry {
+    use crate::components::SpotLight;
+    ComponentEntry {
+        name: "SpotLight",
+        meta: &SPOT_LIGHT_FIELDS,
+        mandatory: false,
+        has: |world, entity| world.get::<&SpotLight>(entity).is_ok(),
+        get_field: |world, entity, field| {
+            let c = world.get::<&SpotLight>(entity).map_err(|_| "no SpotLight".to_string())?;
+            match field {
+                "color" => Ok(FieldValue::Color([c.color[0], c.color[1], c.color[2], 1.0])),
+                "intensity" => Ok(FieldValue::Float(c.intensity as f64)),
+                "range" => Ok(FieldValue::Float(c.range as f64)),
+                "outer_angle" => Ok(FieldValue::Float(c.outer_angle as f64)),
+                "inner_angle" => Ok(FieldValue::Float(c.inner_angle as f64)),
+                "direction" => Ok(FieldValue::Vec3(c.direction.to_array())),
+                "cast_shadow" => Ok(FieldValue::Bool(c.cast_shadow)),
+                _ => Err(format!("unknown field '{field}'")),
+            }
+        },
+        set_field: |world, entity, field, value| {
+            let mut c = world.get::<&mut SpotLight>(entity).map_err(|_| "no SpotLight".to_string())?;
+            match field {
+                "color" => {
+                    if let FieldValue::Color(v) = value { c.color = [v[0], v[1], v[2]]; Ok(()) }
+                    else { Err("type mismatch".into()) }
+                }
+                "intensity" => {
+                    if let FieldValue::Float(v) = value { c.intensity = v as f32; Ok(()) }
+                    else { Err("type mismatch".into()) }
+                }
+                "range" => {
+                    if let FieldValue::Float(v) = value { c.range = v as f32; Ok(()) }
+                    else { Err("type mismatch".into()) }
+                }
+                "outer_angle" => {
+                    if let FieldValue::Float(v) = value { c.outer_angle = v as f32; Ok(()) }
+                    else { Err("type mismatch".into()) }
+                }
+                "inner_angle" => {
+                    if let FieldValue::Float(v) = value { c.inner_angle = v as f32; Ok(()) }
+                    else { Err("type mismatch".into()) }
+                }
+                "direction" => {
+                    if let FieldValue::Vec3(v) = value { c.direction = glam::Vec3::from_array(v); Ok(()) }
+                    else { Err("type mismatch".into()) }
+                }
+                "cast_shadow" => {
+                    if let FieldValue::Bool(v) = value { c.cast_shadow = v; Ok(()) }
+                    else { Err("type mismatch".into()) }
+                }
+                _ => Err(format!("unknown field '{field}'")),
+            }
+        },
+        add_default: |world, entity| {
+            world.insert_one(entity, SpotLight::default()).map_err(|e| format!("{e}"))
+        },
+        remove: |world, entity| {
+            world.remove_one::<SpotLight>(entity).map(|_| ()).map_err(|e| format!("{e}"))
+        },
+        serialize: |world, entity| {
+            let c = world.get::<&SpotLight>(entity).ok()?;
+            serde_json::to_string(&*c).ok()
+        },
+        deserialize_insert: |world, entity, json| {
+            let c: SpotLight = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
+            world.insert_one(entity, c).map_err(|e| format!("{e}"))
+        },
     }
 }
 
 // ── Camera ───────────────────────────────────────────────────────────
 
 static CAMERA_FIELDS: [FieldMeta; 4] = [
-    FieldMeta { name: "fov", field_type: FieldType::Float, range: Some((10.0, 170.0)), transient: false, struct_fields: None, asset_filter: None },
-    FieldMeta { name: "near", field_type: FieldType::Float, range: Some((0.001, 10.0)), transient: false, struct_fields: None, asset_filter: None },
-    FieldMeta { name: "far", field_type: FieldType::Float, range: Some((10.0, 100000.0)), transient: false, struct_fields: None, asset_filter: None },
-    FieldMeta { name: "active", field_type: FieldType::Bool, range: None, transient: false, struct_fields: None, asset_filter: None },
+    FieldMeta { name: "fov", field_type: FieldType::Float, range: Some((10.0, 170.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
+    FieldMeta { name: "near", field_type: FieldType::Float, range: Some((0.001, 10.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
+    FieldMeta { name: "far", field_type: FieldType::Float, range: Some((10.0, 100000.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
+    FieldMeta { name: "active", field_type: FieldType::Bool, range: None, transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
 ];
 
 fn camera_entry() -> ComponentEntry {
@@ -317,6 +477,107 @@ fn camera_entry() -> ComponentEntry {
         },
         remove: |world, entity| {
             world.remove_one::<Camera>(entity).map(|_| ()).map_err(|e| format!("{e}"))
+        },
+        serialize: |world, entity| {
+            let c = world.get::<&Camera>(entity).ok()?;
+            serde_json::to_string(&*c).ok()
+        },
+        deserialize_insert: |world, entity, json| {
+            let c: Camera = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
+            world.insert_one(entity, c).map_err(|e| format!("{e}"))
+        },
+    }
+}
+
+// ── RigidBody ───────────────────────────────────────────────────────
+
+static RIGID_BODY_FIELDS: [FieldMeta; 6] = [
+    FieldMeta { name: "body_type", field_type: FieldType::String, range: None, transient: false, struct_fields: None, asset_filter: None,
+        enum_options: Some(&[("Dynamic", "Dynamic"), ("Static", "Static"), ("KinematicPosition", "Kinematic Pos"), ("KinematicVelocity", "Kinematic Vel")]), scrub: false },
+    FieldMeta { name: "collider_shape", field_type: FieldType::String, range: None, transient: false, struct_fields: None, asset_filter: None,
+        enum_options: Some(&[("Auto", "Auto (Voxel)"), ("Box", "Box"), ("Sphere", "Sphere"), ("Capsule", "Capsule")]), scrub: false },
+    FieldMeta { name: "mass", field_type: FieldType::Float, range: Some((0.01, 1000.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
+    FieldMeta { name: "friction", field_type: FieldType::Float, range: Some((0.0, 2.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
+    FieldMeta { name: "restitution", field_type: FieldType::Float, range: Some((0.0, 1.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
+    FieldMeta { name: "collider_cell_size", field_type: FieldType::Float, range: Some((0.01, 1.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
+];
+
+fn rigid_body_entry() -> ComponentEntry {
+    use crate::components::RigidBody;
+    ComponentEntry {
+        name: "RigidBody",
+        meta: &RIGID_BODY_FIELDS,
+        mandatory: false,
+        has: |world, entity| world.get::<&RigidBody>(entity).is_ok(),
+        get_field: |world, entity, field| {
+            let c = world.get::<&RigidBody>(entity).map_err(|_| "no RigidBody".to_string())?;
+            match field {
+                "body_type" => Ok(FieldValue::String(format!("{:?}", c.body_type))),
+                "collider_shape" => Ok(FieldValue::String(format!("{:?}", c.collider_shape))),
+                "mass" => Ok(FieldValue::Float(c.mass as f64)),
+                "friction" => Ok(FieldValue::Float(c.friction as f64)),
+                "restitution" => Ok(FieldValue::Float(c.restitution as f64)),
+                "collider_cell_size" => Ok(FieldValue::Float(c.collider_cell_size as f64)),
+                _ => Err(format!("unknown field '{field}'")),
+            }
+        },
+        set_field: |world, entity, field, value| {
+            let mut c = world.get::<&mut RigidBody>(entity).map_err(|_| "no RigidBody".to_string())?;
+            match field {
+                "body_type" => {
+                    if let FieldValue::String(v) = value {
+                        c.body_type = match v.as_str() {
+                            "Static" => rkf_physics::rigid_body::BodyType::Static,
+                            "KinematicPosition" => rkf_physics::rigid_body::BodyType::KinematicPosition,
+                            "KinematicVelocity" => rkf_physics::rigid_body::BodyType::KinematicVelocity,
+                            _ => rkf_physics::rigid_body::BodyType::Dynamic,
+                        };
+                        Ok(())
+                    } else { Err("type mismatch".into()) }
+                }
+                "collider_shape" => {
+                    if let FieldValue::String(v) = value {
+                        c.collider_shape = match v.as_str() {
+                            "Box" => rkf_physics::rigid_body::ColliderShape::Box,
+                            "Sphere" => rkf_physics::rigid_body::ColliderShape::Sphere,
+                            "Capsule" => rkf_physics::rigid_body::ColliderShape::Capsule,
+                            _ => rkf_physics::rigid_body::ColliderShape::Auto,
+                        };
+                        Ok(())
+                    } else { Err("type mismatch".into()) }
+                }
+                "mass" => {
+                    if let FieldValue::Float(v) = value { c.mass = v as f32; Ok(()) }
+                    else { Err("type mismatch".into()) }
+                }
+                "friction" => {
+                    if let FieldValue::Float(v) = value { c.friction = v as f32; Ok(()) }
+                    else { Err("type mismatch".into()) }
+                }
+                "restitution" => {
+                    if let FieldValue::Float(v) = value { c.restitution = v as f32; Ok(()) }
+                    else { Err("type mismatch".into()) }
+                }
+                "collider_cell_size" => {
+                    if let FieldValue::Float(v) = value { c.collider_cell_size = v as f32; Ok(()) }
+                    else { Err("type mismatch".into()) }
+                }
+                _ => Err(format!("unknown field '{field}'")),
+            }
+        },
+        add_default: |world, entity| {
+            world.insert_one(entity, RigidBody::default()).map_err(|e| format!("{e}"))
+        },
+        remove: |world, entity| {
+            world.remove_one::<RigidBody>(entity).map(|_| ()).map_err(|e| format!("{e}"))
+        },
+        serialize: |world, entity| {
+            let c = world.get::<&RigidBody>(entity).ok()?;
+            serde_json::to_string(&*c).ok()
+        },
+        deserialize_insert: |world, entity, json| {
+            let c: RigidBody = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
+            world.insert_one(entity, c).map_err(|e| format!("{e}"))
         },
     }
 }
