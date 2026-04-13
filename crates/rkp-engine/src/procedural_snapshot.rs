@@ -34,6 +34,10 @@ pub struct ProceduralNodeInfo {
     pub children: Vec<u32>,
     /// Whether this node is a leaf (can't have children).
     pub is_leaf: bool,
+    /// Whether this is the root node.
+    pub is_root: bool,
+    /// Local translation (from node transform).
+    pub position: [f32; 3],
     /// Editable parameters for this node.
     pub params: Vec<ProceduralParam>,
 }
@@ -148,12 +152,15 @@ pub fn build_procedural_snapshot(
             ),
         };
 
+        let translation = node.transform.translation;
         nodes.push(ProceduralNodeInfo {
             id: id.0,
             name,
             kind,
             children: node.children.iter().map(|c| c.0).collect(),
             is_leaf: node.kind.is_leaf(),
+            is_root: id == tree.root(),
+            position: [translation.x, translation.y, translation.z],
             params,
         });
     }

@@ -75,9 +75,31 @@ pub enum EngineCommand {
         node_id: u32,
     },
 
+    /// Move a procedural node earlier among its siblings.
+    MoveProceduralNodeUp {
+        node_id: u32,
+    },
+
+    /// Move a procedural node later among its siblings.
+    MoveProceduralNodeDown {
+        node_id: u32,
+    },
+
+    /// Reparent a procedural node to a different combinator.
+    ReparentProceduralNode {
+        node_id: u32,
+        new_parent_id: u32,
+    },
+
     /// Set the render voxel size on the selected procedural object.
     SetProceduralVoxelSize {
         voxel_size: f32,
+    },
+
+    /// Set the local position of a procedural node.
+    SetProceduralNodePosition {
+        node_id: u32,
+        position: Vec3,
     },
 
     /// Set a parameter on a procedural node.

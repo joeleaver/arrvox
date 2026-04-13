@@ -1004,6 +1004,51 @@ impl EngineState {
                 }
             }
 
+            EngineCommand::MoveProceduralNodeUp { node_id } => {
+                if let Some(entity) = self.selected_entity {
+                    if let Ok(mut proc_geo) = self.world.get::<&mut crate::components::ProceduralGeometry>(entity) {
+                        if proc_geo.tree.move_up(rkp_procedural::NodeId(node_id)) {
+                            proc_geo.dirty = true;
+                        }
+                    }
+                }
+            }
+
+            EngineCommand::MoveProceduralNodeDown { node_id } => {
+                if let Some(entity) = self.selected_entity {
+                    if let Ok(mut proc_geo) = self.world.get::<&mut crate::components::ProceduralGeometry>(entity) {
+                        if proc_geo.tree.move_down(rkp_procedural::NodeId(node_id)) {
+                            proc_geo.dirty = true;
+                        }
+                    }
+                }
+            }
+
+            EngineCommand::ReparentProceduralNode { node_id, new_parent_id } => {
+                if let Some(entity) = self.selected_entity {
+                    if let Ok(mut proc_geo) = self.world.get::<&mut crate::components::ProceduralGeometry>(entity) {
+                        if proc_geo.tree.reparent(
+                            rkp_procedural::NodeId(node_id),
+                            rkp_procedural::NodeId(new_parent_id),
+                        ) {
+                            proc_geo.dirty = true;
+                        }
+                    }
+                }
+            }
+
+            EngineCommand::SetProceduralNodePosition { node_id, position } => {
+                if let Some(entity) = self.selected_entity {
+                    if let Ok(mut proc_geo) = self.world.get::<&mut crate::components::ProceduralGeometry>(entity) {
+                        proc_geo.tree.set_transform(
+                            rkp_procedural::NodeId(node_id),
+                            glam::Affine3A::from_translation(position),
+                        );
+                        proc_geo.dirty = true;
+                    }
+                }
+            }
+
             EngineCommand::SetProceduralNodeParam { node_id, param_name, value } => {
                 if let Some(entity) = self.selected_entity {
                     if let Ok(mut proc_geo) = self.world.get::<&mut crate::components::ProceduralGeometry>(entity) {
@@ -1492,11 +1537,8 @@ impl EngineState {
                     "sky_color_horizon_override_enabled" => {
                         if value == "false" { env.sky_color_horizon_override = None; }
                     }
-                    "sun_color_override" => {
-                        if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) { env.sun_color_override = Some(v); }
-                    }
-                    "sun_color_override_enabled" => {
-                        if value == "false" { env.sun_color_override = None; }
+                    "skip_sun_extinction" => {
+                        env.skip_sun_extinction = value == "true" || value == "1";
                     }
                     "ambient_intensity" => {
                         if let Ok(v) = value.parse::<f32>() { env.ambient_intensity = v; }

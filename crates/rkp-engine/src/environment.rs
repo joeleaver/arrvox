@@ -16,10 +16,10 @@ pub struct EnvironmentSettings {
     // ── Sun / directional light ─────────────────────────────────────
     pub sun_azimuth: f32,
     pub sun_elevation: f32,
-    /// Base sun color. Atmosphere applies transmittance extinction on top.
+    /// Sun color. When `skip_sun_extinction` is false, atmosphere applies
+    /// transmittance on top (orange at sunset). When true, used directly.
     pub sun_color: [f32; 3],
-    /// Override sun surface color after extinction (None = atmosphere-computed).
-    pub sun_color_override: Option<[f32; 3]>,
+    pub skip_sun_extinction: bool,
     pub sun_intensity: f32,
 
     // ── Shadows ─────────────────────────────────────────────────────
@@ -83,7 +83,7 @@ impl Default for EnvironmentSettings {
             sun_azimuth: 210.0,   // southwest
             sun_elevation: 45.0,  // mid-afternoon
             sun_color: [1.0, 0.95, 0.9],
-            sun_color_override: None,
+            skip_sun_extinction: false,
             sun_intensity: 110_000.0,
             shadow_steps: 32,
             ao_radius: 0.1,
@@ -415,11 +415,11 @@ impl EnvironmentSettings {
         let d = self.sun_direction();
         let sun_toward = [-d[0], -d[1], -d[2]];
         let trans = atmo::sun_transmittance(sun_toward, self.camera_altitude);
-        let effective_color = self.sun_color_override.unwrap_or([
-            self.sun_color[0] * trans[0],
-            self.sun_color[1] * trans[1],
-            self.sun_color[2] * trans[2],
-        ]);
+        let effective_color = if self.skip_sun_extinction {
+            self.sun_color
+        } else {
+            [self.sun_color[0] * trans[0], self.sun_color[1] * trans[1], self.sun_color[2] * trans[2]]
+        };
         rkp_render::rkp_shade::GpuLight {
             position: [0.0, 0.0, 0.0, 0.0],
             color: [effective_color[0], effective_color[1], effective_color[2], self.sun_intensity],

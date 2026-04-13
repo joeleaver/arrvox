@@ -209,6 +209,54 @@ impl ProceduralObject {
         true
     }
 
+    /// Move a node earlier among its siblings (swap with previous sibling).
+    /// Returns `true` if the node was moved.
+    pub fn move_up(&mut self, id: NodeId) -> bool {
+        let parent_id = match self.nodes[id.0 as usize].as_ref() {
+            Some(n) => match n.parent {
+                Some(p) => p,
+                None => return false, // root
+            },
+            None => return false,
+        };
+
+        let parent = self.nodes[parent_id.0 as usize].as_mut().unwrap();
+        let pos = match parent.children.iter().position(|c| *c == id) {
+            Some(p) => p,
+            None => return false,
+        };
+        if pos == 0 {
+            return false; // already first
+        }
+        parent.children.swap(pos, pos - 1);
+        self.propagate_version(parent_id);
+        true
+    }
+
+    /// Move a node later among its siblings (swap with next sibling).
+    /// Returns `true` if the node was moved.
+    pub fn move_down(&mut self, id: NodeId) -> bool {
+        let parent_id = match self.nodes[id.0 as usize].as_ref() {
+            Some(n) => match n.parent {
+                Some(p) => p,
+                None => return false,
+            },
+            None => return false,
+        };
+
+        let parent = self.nodes[parent_id.0 as usize].as_mut().unwrap();
+        let pos = match parent.children.iter().position(|c| *c == id) {
+            Some(p) => p,
+            None => return false,
+        };
+        if pos + 1 >= parent.children.len() {
+            return false; // already last
+        }
+        parent.children.swap(pos, pos + 1);
+        self.propagate_version(parent_id);
+        true
+    }
+
     /// Bump a node's version after a parameter change, propagating up to root.
     ///
     /// Call this after modifying a node's `NodeKind` parameters directly.

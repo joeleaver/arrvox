@@ -169,7 +169,7 @@ impl EnvironmentState {
         crate::environment::EnvironmentSettings {
             sky_color_top_override: Some(self.sky_color_top),
             sky_color_horizon_override: Some(self.sky_color_horizon),
-            sun_color_override: None,
+            skip_sun_extinction: false,
             ambient_intensity: self.ambient_intensity,
             sun_azimuth: self.sun_azimuth,
             sun_elevation: self.sun_elevation,

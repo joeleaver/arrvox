@@ -247,7 +247,8 @@ fn render_node_params(
     let node_id = Memo::new(move || node_info.get().map(|n| n.id).unwrap_or(0));
     let node_name = Memo::new(move || node_info.get().map(|n| n.name.clone()).unwrap_or_default());
     let params = Memo::new(move || node_info.get().map(|n| n.params.clone()).unwrap_or_default());
-    let is_root = Memo::new(move || node_info.get().map(|n| n.id == 0).unwrap_or(true));
+    let is_root = Memo::new(move || node_info.get().map(|n| n.is_root).unwrap_or(true));
+    let position = Memo::new(move || node_info.get().map(|n| n.position).unwrap_or([0.0; 3]));
 
     let collapsed = Signal::new(false);
 
@@ -261,12 +262,30 @@ fn render_node_params(
         None
     };
 
+    // Position control — prop_vec3 needs a Signal, bridge from snapshot.
+    let pos_signal = Signal::new(position.get());
+    // Build the position control eagerly (before rsx) to avoid Rc move issues.
+    let pos_control = {
+        let on_change: Rc<dyn Fn([f32; 3])> = Rc::new(move |val: [f32; 3]| {
+            let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralNodePosition {
+                node_id: node_id.get(),
+                position: glam::Vec3::from(val),
+            });
+        });
+        prop_vec3(__scope, "Position", pos_signal, on_change)
+    };
+
     rsx! {
         div {
             {prop_section_header(__scope, &node_name.get(), collapsed, on_remove)}
+            // Position always visible (not inside collapsible)
+            div {
+                style: "padding:4px 0;",
+                {pos_control}
+            }
             if !collapsed.get() {
                 div {
-                    style: "padding:4px 0;display:flex;flex-direction:column;gap:2px;",
+                    style: "display:flex;flex-direction:column;gap:2px;",
                     for param in params.get() {
                         {render_param_field(__scope, node_id, param.clone(), cmd_tx)}
                     }
