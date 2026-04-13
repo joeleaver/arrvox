@@ -203,6 +203,8 @@ struct EngineState {
     next_scene_id: u32,
     /// Currently selected entity.
     selected_entity: Option<hecs::Entity>,
+    /// Currently selected procedural node (within the selected entity's ProceduralGeometry).
+    selected_procedural_node: Option<u32>,
 
     // Derived GPU data — rebuilt from world each frame.
     gpu_objects: Vec<RkpGpuObject>,
@@ -320,13 +322,13 @@ impl EngineState {
         // Bloom: extract bright pixels from volumetric HDR output, blur, composite.
         let bloom = rkf_render::BloomPass::new(
             &device,
-            &renderer.volumetric.output_view,
+            &renderer.god_rays.output_view,
             width,
             height,
         );
         let bloom_composite = rkf_render::BloomCompositePass::new(
             &device,
-            &renderer.volumetric.output_view,
+            &renderer.god_rays.output_view,
             bloom.mip_views(),
             width,
             height,
@@ -404,6 +406,7 @@ impl EngineState {
             entity_scene_ids: std::collections::HashMap::new(),
             next_scene_id: 0,
             selected_entity: None,
+            selected_procedural_node: None,
             gpu_objects: Vec::new(),
             gpu_to_entity: Vec::new(),
             entity_to_gpu: std::collections::HashMap::new(),
@@ -583,6 +586,37 @@ impl EngineState {
             cam_up: [cam_uniforms.up[0], cam_uniforms.up[1], cam_uniforms.up[2]],
             _pad4: 0.0,
         };
+
+        // God ray params: project sun position to screen space.
+        {
+            let sun_toward = [-sun_d[0], -sun_d[1], -sun_d[2]];
+            // Sun is infinitely far — project direction as a point far along sun_dir.
+            let sun_world = glam::Vec3::new(
+                cam_uniforms.position[0] + sun_toward[0] * 1000.0,
+                cam_uniforms.position[1] + sun_toward[1] * 1000.0,
+                cam_uniforms.position[2] + sun_toward[2] * 1000.0,
+            );
+            let vp = glam::Mat4::from_cols_array_2d(&cam_uniforms.view_proj);
+            let clip = vp * glam::Vec4::new(sun_world.x, sun_world.y, sun_world.z, 1.0);
+            let sun_on_screen = if clip.w > 0.0 { 1.0 } else { 0.0 };
+            let ndc = if clip.w > 0.0 {
+                glam::Vec2::new(clip.x / clip.w, clip.y / clip.w)
+            } else {
+                glam::Vec2::ZERO
+            };
+            let sun_uv = [ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5];
+
+            let god_ray_params = rkp_render::rkp_god_rays::GodRayParams {
+                sun_screen_pos: sun_uv,
+                sun_on_screen,
+                density: self.environment.god_ray_density,
+                weight: self.environment.god_ray_weight,
+                decay: self.environment.god_ray_decay,
+                exposure: self.environment.god_ray_exposure,
+                num_samples: 64,
+            };
+            self.renderer.god_rays.update_params(&self.queue, &god_ray_params);
+        }
 
         self.renderer.render(&mut encoder, &self.queue, object_count, self.width, self.height, shadow_steps, num_lights, screen_aabbs_bytes, &atmo_frame);
 
@@ -820,13 +854,13 @@ impl EngineState {
                     self.renderer.set_gbuffer(&self.gbuffer);
                     self.bloom = rkf_render::BloomPass::new(
                         &self.device,
-                        &self.renderer.volumetric.output_view,
+                        &self.renderer.god_rays.output_view,
                         width,
                         height,
                     );
                     self.bloom_composite = rkf_render::BloomCompositePass::new(
                         &self.device,
-                        &self.renderer.volumetric.output_view,
+                        &self.renderer.god_rays.output_view,
                         self.bloom.mip_views(),
                         width,
                         height,
@@ -888,6 +922,88 @@ impl EngineState {
                     self.scene_dirty = true;
                     self.gpu_objects_dirty = true;
                     self.console.info(format!("Spawned '{name}': {} voxels", result.voxel_count));
+                }
+            }
+
+            EngineCommand::SpawnProceduralObject { name } => {
+                use crate::components::*;
+                let name = self.unique_name(&name);
+                let proc_geo = ProceduralGeometry::default_sphere();
+                let scene_id = self.next_scene_id;
+                self.next_scene_id += 1;
+
+                // Compute bounds and voxelize the procedural tree.
+                let aabb = rkp_procedural::compute_bounds(&proc_geo.tree);
+                let voxel_size = 0.05;
+                let tree_ref = &proc_geo.tree;
+                let opacity_fn = |pos: glam::Vec3| -> (f32, u16) {
+                    let sample = rkp_procedural::sample_tree(tree_ref, pos);
+                    (sample.opacity, sample.material_id)
+                };
+
+                let result = self.scene_mgr.voxelize_opacity_fn(
+                    opacity_fn, &aabb, voxel_size, scene_id,
+                );
+                if let Some(result) = result {
+                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
+                    let entity = self.world.spawn((
+                        Transform::default(),
+                        EditorMetadata { name: name.clone() },
+                        Renderable {
+                            primitive: Some("procedural".to_string()),
+                            voxel_count: result.voxel_count,
+                            spatial: Some(spatial),
+                            ..Default::default()
+                        },
+                        proc_geo,
+                    ));
+                    self.assign_entity_uuid(entity);
+                    self.entity_scene_ids.insert(entity, scene_id);
+                    self.geometry_dirty = true;
+                    self.scene_dirty = true;
+                    self.gpu_objects_dirty = true;
+                    self.console.info(format!("Spawned procedural '{name}': {} voxels", result.voxel_count));
+                }
+            }
+
+            EngineCommand::SelectProceduralNode { node_id } => {
+                self.selected_procedural_node = node_id;
+            }
+
+            EngineCommand::AddProceduralNode { parent_node_id, kind } => {
+                if let Some(entity) = self.selected_entity {
+                    if let Ok(mut proc_geo) = self.world.get::<&mut crate::components::ProceduralGeometry>(entity) {
+                        let parent = rkp_procedural::NodeId(parent_node_id);
+                        let node_kind = parse_node_kind(&kind);
+                        let new_id = proc_geo.tree.add_child(parent, node_kind);
+                        proc_geo.dirty = true;
+                        self.selected_procedural_node = Some(new_id.0);
+                    }
+                }
+            }
+
+            EngineCommand::RemoveProceduralNode { node_id } => {
+                if let Some(entity) = self.selected_entity {
+                    if let Ok(mut proc_geo) = self.world.get::<&mut crate::components::ProceduralGeometry>(entity) {
+                        let id = rkp_procedural::NodeId(node_id);
+                        if proc_geo.tree.remove(id) {
+                            proc_geo.dirty = true;
+                            if self.selected_procedural_node == Some(node_id) {
+                                self.selected_procedural_node = None;
+                            }
+                        }
+                    }
+                }
+            }
+
+            EngineCommand::SetProceduralNodeParam { node_id, param_name, value } => {
+                if let Some(entity) = self.selected_entity {
+                    if let Ok(mut proc_geo) = self.world.get::<&mut crate::components::ProceduralGeometry>(entity) {
+                        let id = rkp_procedural::NodeId(node_id);
+                        if apply_procedural_param(&mut proc_geo.tree, id, &param_name, &value) {
+                            proc_geo.dirty = true;
+                        }
+                    }
                 }
             }
 
@@ -1397,6 +1513,18 @@ impl EngineState {
                     }
                     "bloom_intensity" => {
                         if let Ok(v) = value.parse::<f32>() { env.bloom_intensity = v; }
+                    }
+                    "god_ray_density" => {
+                        if let Ok(v) = value.parse::<f32>() { env.god_ray_density = v; }
+                    }
+                    "god_ray_weight" => {
+                        if let Ok(v) = value.parse::<f32>() { env.god_ray_weight = v; }
+                    }
+                    "god_ray_decay" => {
+                        if let Ok(v) = value.parse::<f32>() { env.god_ray_decay = v; }
+                    }
+                    "god_ray_exposure" => {
+                        if let Ok(v) = value.parse::<f32>() { env.god_ray_exposure = v; }
                     }
                     "camera_altitude" => {
                         if let Ok(v) = value.parse::<f32>() { env.camera_altitude = v; }
@@ -2034,6 +2162,62 @@ impl EngineState {
     }
 
     /// Rebuild GPU objects from the hecs world.
+    /// Re-voxelize any procedural objects that are dirty or whose entity scale changed.
+    fn update_dirty_procedurals(&mut self) {
+        use crate::components::*;
+
+        // Collect entities that need re-evaluation. We can't mutate world + scene_mgr
+        // simultaneously in the query, so collect first.
+        let mut to_update: Vec<(hecs::Entity, u32)> = Vec::new();
+
+        for (entity, (transform, proc_geo)) in self
+            .world
+            .query::<(&Transform, &ProceduralGeometry)>()
+            .iter()
+        {
+            let scale_changed = (transform.scale - proc_geo.last_evaluated_scale).length() > 1e-5;
+            if proc_geo.dirty || scale_changed {
+                let scene_id = self.entity_scene_ids.get(&entity).copied().unwrap_or(0);
+                to_update.push((entity, scene_id));
+            }
+        }
+
+        for (entity, scene_id) in to_update {
+            // Read the procedural tree and current scale.
+            let (tree_clone, scale) = {
+                let proc_geo = self.world.get::<&ProceduralGeometry>(entity).unwrap();
+                let transform = self.world.get::<&Transform>(entity).unwrap();
+                (proc_geo.tree.clone(), transform.scale)
+            };
+
+            let aabb = rkp_procedural::compute_bounds(&tree_clone);
+            let voxel_size = 0.05;
+            let opacity_fn = |pos: glam::Vec3| -> (f32, u16) {
+                let sample = rkp_procedural::sample_tree(&tree_clone, pos);
+                (sample.opacity, sample.material_id)
+            };
+
+            if let Some(result) = self.scene_mgr.voxelize_opacity_fn(
+                opacity_fn, &aabb, voxel_size, scene_id,
+            ) {
+                let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
+
+                // Update the entity's Renderable and ProceduralGeometry.
+                if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
+                    renderable.voxel_count = result.voxel_count;
+                    renderable.spatial = Some(spatial);
+                }
+                if let Ok(mut proc_geo) = self.world.get::<&mut ProceduralGeometry>(entity) {
+                    proc_geo.dirty = false;
+                    proc_geo.last_evaluated_scale = scale;
+                }
+
+                self.geometry_dirty = true;
+                self.gpu_objects_dirty = true;
+            }
+        }
+    }
+
     fn update_scene_gpu(&mut self) {
         use crate::components::*;
 
@@ -2947,8 +3131,128 @@ impl EngineState {
             } else {
                 None
             },
+            procedural: self.build_procedural_snapshot(),
             console_entries: self.console.drain_new(),
         }
+    }
+
+    fn build_procedural_snapshot(&self) -> Option<crate::procedural_snapshot::ProceduralSnapshot> {
+        let entity = self.selected_entity?;
+        let proc_geo = self.world.get::<&crate::components::ProceduralGeometry>(entity).ok()?;
+        let uuid = self.get_entity_uuid(entity);
+        Some(crate::procedural_snapshot::build_procedural_snapshot(
+            uuid,
+            &proc_geo,
+            self.selected_procedural_node,
+        ))
+    }
+}
+
+// ── Procedural helpers ───────────────────────────────────────────────
+
+/// Parse a node kind name into a `NodeKind`.
+fn parse_node_kind(kind: &str) -> rkp_procedural::NodeKind {
+    use rkp_procedural::node_kind::*;
+    match kind {
+        "Sphere" => rkp_procedural::NodeKind::Sphere(SphereParams::default()),
+        "Box" => rkp_procedural::NodeKind::Box(BoxParams::default()),
+        "Capsule" => rkp_procedural::NodeKind::Capsule(CapsuleParams::default()),
+        "Cylinder" => rkp_procedural::NodeKind::Cylinder(CylinderParams::default()),
+        "Torus" => rkp_procedural::NodeKind::Torus(TorusParams::default()),
+        "Plane" => rkp_procedural::NodeKind::Plane(PlaneParams::default()),
+        "Union" => rkp_procedural::NodeKind::Union {
+            material_combine: rkp_procedural::MaterialCombine::Winner,
+        },
+        "Intersect" => rkp_procedural::NodeKind::Intersect {
+            material_combine: rkp_procedural::MaterialCombine::Winner,
+        },
+        "Subtract" => rkp_procedural::NodeKind::Subtract,
+        _ => rkp_procedural::NodeKind::Sphere(SphereParams::default()),
+    }
+}
+
+/// Apply a parameter value to a procedural node. Returns true if the param was found.
+fn apply_procedural_param(
+    tree: &mut rkp_procedural::ProceduralObject,
+    id: rkp_procedural::NodeId,
+    param_name: &str,
+    value: &str,
+) -> bool {
+    use rkp_procedural::NodeKind;
+
+    let node = match tree.get_mut(id) {
+        Some(n) => n,
+        None => return false,
+    };
+
+    match &mut node.kind {
+        NodeKind::Sphere(p) => match param_name {
+            "radius" => { p.radius = value.parse().unwrap_or(p.radius); true }
+            "falloff" => { p.falloff = value.parse().unwrap_or(p.falloff); true }
+            "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
+            "color" => { if let Some(v) = parse_vec3(value) { p.color = v; } true }
+            _ => false,
+        },
+        NodeKind::Box(p) => match param_name {
+            "half_extents" => { if let Some(v) = parse_vec3(value) { p.half_extents = v; } true }
+            "rounding" => { p.rounding = value.parse().unwrap_or(p.rounding); true }
+            "falloff" => { p.falloff = value.parse().unwrap_or(p.falloff); true }
+            "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
+            "color" => { if let Some(v) = parse_vec3(value) { p.color = v; } true }
+            _ => false,
+        },
+        NodeKind::Capsule(p) => match param_name {
+            "half_height" => { p.half_height = value.parse().unwrap_or(p.half_height); true }
+            "radius" => { p.radius = value.parse().unwrap_or(p.radius); true }
+            "falloff" => { p.falloff = value.parse().unwrap_or(p.falloff); true }
+            "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
+            _ => false,
+        },
+        NodeKind::Cylinder(p) => match param_name {
+            "half_height" => { p.half_height = value.parse().unwrap_or(p.half_height); true }
+            "radius" => { p.radius = value.parse().unwrap_or(p.radius); true }
+            "falloff" => { p.falloff = value.parse().unwrap_or(p.falloff); true }
+            "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
+            _ => false,
+        },
+        NodeKind::Torus(p) => match param_name {
+            "major_radius" => { p.major_radius = value.parse().unwrap_or(p.major_radius); true }
+            "minor_radius" => { p.minor_radius = value.parse().unwrap_or(p.minor_radius); true }
+            "falloff" => { p.falloff = value.parse().unwrap_or(p.falloff); true }
+            "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
+            _ => false,
+        },
+        NodeKind::Plane(p) => match param_name {
+            "falloff" => { p.falloff = value.parse().unwrap_or(p.falloff); true }
+            "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
+            _ => false,
+        },
+        NodeKind::Union { material_combine } | NodeKind::Intersect { material_combine } => {
+            if param_name == "material_combine" {
+                *material_combine = match value {
+                    "Layered" => rkp_procedural::MaterialCombine::Layered,
+                    "Blend" => rkp_procedural::MaterialCombine::Blend { radius: 0.1 },
+                    _ => rkp_procedural::MaterialCombine::Winner,
+                };
+                true
+            } else {
+                false
+            }
+        }
+        NodeKind::Subtract => false,
+    }
+}
+
+fn parse_vec3(value: &str) -> Option<glam::Vec3> {
+    // Accept "x,y,z" or "[x,y,z]"
+    let cleaned = value.trim_matches(|c| c == '[' || c == ']' || c == ' ');
+    let parts: Vec<f32> = cleaned.split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    if parts.len() == 3 {
+        Some(glam::Vec3::new(parts[0], parts[1], parts[2]))
+    } else {
+        None
     }
 }
 
@@ -2982,6 +3286,9 @@ fn tick_loop(
         state.process_file_events();
         state.poll_import_completions();
         state.check_gameplay_reload();
+
+        // 1b2. Re-evaluate dirty procedural objects.
+        state.update_dirty_procedurals();
 
         // 1c. Step gameplay systems + physics if in play mode.
         //

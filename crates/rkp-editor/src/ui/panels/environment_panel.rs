@@ -31,6 +31,14 @@ pub fn EnvironmentPanel() -> NodeHandle {
 
     let exposure = Signal::new(env.exposure);
 
+    let bloom_threshold = Signal::new(env.bloom_threshold);
+    let bloom_knee = Signal::new(env.bloom_knee);
+    let bloom_intensity = Signal::new(env.bloom_intensity);
+
+    let god_ray_density = Signal::new(env.god_ray_density);
+    let god_ray_exposure = Signal::new(env.god_ray_exposure);
+    let god_ray_decay = Signal::new(env.god_ray_decay);
+
     let dust_density = Signal::new(env.dust_density);
     let dust_asymmetry = Signal::new(env.dust_asymmetry);
     let height_fog_density = Signal::new(env.height_fog_density);
@@ -52,6 +60,8 @@ pub fn EnvironmentPanel() -> NodeHandle {
     let light_collapsed = Signal::new(false);
     let shadow_collapsed = Signal::new(false);
     let tone_collapsed = Signal::new(false);
+    let bloom_collapsed = Signal::new(false);
+    let god_ray_collapsed = Signal::new(false);
     let fog_collapsed = Signal::new(false);
     let cloud_collapsed = Signal::new(true);
 
@@ -125,6 +135,28 @@ pub fn EnvironmentPanel() -> NodeHandle {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
                     {prop_scrub(__scope, "Exposure", exposure, 0.000001, 0.01, 0.000001, env_f32("exposure"))}
+                }
+            }
+
+            // ── Bloom section ────────────────────────────────────────────
+            {prop_section_header(__scope, "Bloom", bloom_collapsed, None)}
+            if !bloom_collapsed.get() {
+                div {
+                    style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
+                    {prop_slider(__scope, "Threshold", bloom_threshold, 0.0, 5.0, 0.1, env_f32("bloom_threshold"))}
+                    {prop_slider(__scope, "Knee", bloom_knee, 0.0, 1.0, 0.01, env_f32("bloom_knee"))}
+                    {prop_slider(__scope, "Intensity", bloom_intensity, 0.0, 2.0, 0.01, env_f32("bloom_intensity"))}
+                }
+            }
+
+            // ── God Rays section ─────────────────────────────────────────
+            {prop_section_header(__scope, "God Rays", god_ray_collapsed, None)}
+            if !god_ray_collapsed.get() {
+                div {
+                    style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
+                    {prop_slider(__scope, "Density", god_ray_density, 0.0, 3.0, 0.1, env_f32("god_ray_density"))}
+                    {prop_slider(__scope, "Exposure", god_ray_exposure, 0.0, 1.0, 0.01, env_f32("god_ray_exposure"))}
+                    {prop_slider(__scope, "Decay", god_ray_decay, 0.9, 1.0, 0.005, env_f32("god_ray_decay"))}
                 }
             }
 

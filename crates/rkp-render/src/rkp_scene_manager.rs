@@ -454,4 +454,43 @@ impl RkpSceneManager {
             voxel_count,
         })
     }
+
+    /// Voxelize an arbitrary opacity function into the octree.
+    ///
+    /// Generic entry point — the caller provides the opacity closure and bounding
+    /// box. Used by the procedural object system and any other source of opacity
+    /// fields.
+    pub fn voxelize_opacity_fn<F>(
+        &mut self,
+        opacity_fn: F,
+        aabb: &rkf_core::Aabb,
+        voxel_size: f32,
+        object_id: u32,
+    ) -> Option<VoxelizeResult>
+    where
+        F: Fn(glam::Vec3) -> (f32, u16),
+    {
+        let (octree, voxel_count, _grid_origin) =
+            rkp_core::voxelize_octree::voxelize_opacity_octree(
+                opacity_fn, aabb, voxel_size, &mut self.voxel_pool,
+            )?;
+
+        emit_faces(&octree, &self.voxel_pool, object_id, &mut self.pending_faces);
+        self.faces_dirty = true;
+
+        let handle = self.octree.allocate(&octree);
+        let spatial = rkf_core::scene_node::SpatialHandle::Octree {
+            root_offset: handle.root_offset,
+            len: handle.len,
+            depth: handle.depth,
+            base_voxel_size: handle.base_voxel_size,
+        };
+
+        Some(VoxelizeResult {
+            spatial,
+            voxel_size,
+            aabb: *aabb,
+            voxel_count,
+        })
+    }
 }

@@ -29,6 +29,17 @@ pub struct EnvironmentSettings {
     // ── Tone mapping ────────────────────────────────────────────────
     pub exposure: f32,
 
+    // ── Bloom ───────────────────────────────────────────────────────
+    pub bloom_threshold: f32,
+    pub bloom_knee: f32,
+    pub bloom_intensity: f32,
+
+    // ── God Rays ────────────────────────────────────────────────────
+    pub god_ray_density: f32,
+    pub god_ray_weight: f32,
+    pub god_ray_decay: f32,
+    pub god_ray_exposure: f32,
+
     // ── Atmosphere ─────────────────────────────────────────────────
     pub camera_altitude: f32,
 
@@ -74,6 +85,15 @@ impl Default for EnvironmentSettings {
             ao_radius: 0.1,
             ao_steps: 5,
             exposure: 0.0000254, // EV100=15 (sunny-16 rule): 1/(1.2 × 2^15)
+
+            bloom_threshold: 1.0,
+            bloom_knee: 0.5,
+            bloom_intensity: 0.5,
+
+            god_ray_density: 1.0,
+            god_ray_weight: 0.01,
+            god_ray_decay: 0.97,
+            god_ray_exposure: 0.3,
 
             camera_altitude: 100.0,
 

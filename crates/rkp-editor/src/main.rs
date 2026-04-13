@@ -105,6 +105,15 @@ fn build_menus(
 
     spawn_menu = spawn_menu
         .separator()
+        .item(MenuItem::new("Procedural Object").on_click({
+            let tx = tx.clone();
+            move || {
+                let _ = tx.send(rkp_engine::EngineCommand::SpawnProceduralObject {
+                    name: "Procedural".to_string(),
+                });
+            }
+        }))
+        .separator()
         .item(MenuItem::new("Point Light").on_click({
             let tx = tx.clone();
             move || { let _ = tx.send(rkp_engine::EngineCommand::SpawnPointLight); }
@@ -196,6 +205,7 @@ fn main() -> anyhow::Result<()> {
                     store.available_models.send(models.clone());
                 }
                 store.inspector.send(update.inspector.clone());
+                store.procedural.send(update.procedural.clone());
                 if let Some(ref ac) = update.available_components {
                     store.available_components.send(ac.clone());
                 }

@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 rkp-core = { workspace = true }
+rkp-procedural = { workspace = true }
 rkp-render = { workspace = true }
 rkf-core = { workspace = true }
 rkf-render = { workspace = true }

@@ -46,6 +46,47 @@ struct CloudParams {
 @group(0) @binding(2) var output_scatter: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(3) var<uniform> cloud_params: CloudParams;
 
+// --- Cloud shadow ---
+
+/// Trace from a fog position toward the sun through the cloud layer.
+/// Returns transmittance (1=lit, 0=fully shadowed by clouds).
+fn sample_cloud_shadow(pos: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
+    if cloud_params.flags.x < 0.5 { return 1.0; } // clouds disabled
+
+    let cloud_min = cloud_params.altitude.x;
+    let cloud_max = cloud_params.altitude.y;
+
+    // Skip if already above clouds.
+    if pos.y >= cloud_max { return 1.0; }
+
+    // Find where the sun ray enters the cloud layer.
+    let sun_y = sun_dir.y;
+    if sun_y <= 0.001 { return 1.0; } // sun below horizon
+
+    let t_enter = (cloud_min - pos.y) / sun_y;
+    let t_exit = (cloud_max - pos.y) / sun_y;
+    if t_enter < 0.0 && t_exit < 0.0 { return 1.0; }
+
+    // Sample cloud density at a few points through the slab.
+    let t_start = max(t_enter, 0.0);
+    let t_end = max(t_exit, 0.0);
+    if t_start >= t_end { return 1.0; }
+
+    let cloud_steps = 4u;
+    let dt = (t_end - t_start) / f32(cloud_steps);
+    var optical_depth = 0.0;
+
+    for (var i = 0u; i < cloud_steps; i++) {
+        let t = t_start + (f32(i) + 0.5) * dt;
+        let sample_pos = pos + sun_dir * t;
+        let cd = cloud_density(sample_pos);
+        optical_depth += cd * dt;
+    }
+
+    // Convert to transmittance with extinction coefficient.
+    return exp(-optical_depth * 0.005);
+}
+
 // --- Helpers ---
 
 fn interleaved_gradient_noise(pixel: vec2<f32>, frame: u32) -> f32 {
@@ -220,8 +261,10 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let step_trans = exp(-total * params.step_size);
 
+        let sun_vis = sample_cloud_shadow(pos, params.sun_dir.xyz);
+
         // Fog/dust in-scattering.
-        let fog_sun = fog_dens * henyey_greenstein(cos_sun, dust_g)
+        let fog_sun = fog_dens * sun_vis * henyey_greenstein(cos_sun, dust_g)
                     * params.sun_color.xyz * scatter_albedo;
         let fog_sky = fog_dens * sky_ambient * scatter_albedo;
 
@@ -231,7 +274,7 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             henyey_greenstein(cos_sun, cloud_g_forward),
             cloud_forward_weight,
         );
-        let cloud_sun = cloud_dens * cloud_phase * params.sun_color.xyz * cloud_albedo;
+        let cloud_sun = cloud_dens * sun_vis * cloud_phase * params.sun_color.xyz * cloud_albedo;
         let cloud_sky = cloud_dens * sky_ambient * cloud_albedo;
 
         scatter += (fog_sun + fog_sky + cloud_sun + cloud_sky) * transmittance * params.step_size;

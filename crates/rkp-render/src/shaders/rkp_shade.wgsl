@@ -75,6 +75,11 @@ struct Material {
 @group(5) @binding(0) var transmittance_lut: texture_2d<f32>;
 @group(5) @binding(1) var multiscatter_lut: texture_2d<f32>;
 @group(5) @binding(2) var atmo_sampler: sampler;
+@group(5) @binding(3) var sky_view_lut: texture_2d<f32>;
+@group(5) @binding(4) var aerial_perspective_lut: texture_3d<f32>;
+
+const AP_DISTANCE_PER_SLICE: f32 = 4000.0;
+const AP_SLICE_COUNT: f32 = 32.0;
 
 // --- Atmospheric scattering ---
 
@@ -157,6 +162,45 @@ fn lookup_multiscatter(view_height: f32, sun_cos_zenith: f32) -> vec3<f32> {
     return textureSampleLevel(multiscatter_lut, atmo_sampler, vec2<f32>(u, v), 0.0).rgb;
 }
 
+/// Map a view ray direction to Sky View LUT UV coordinates.
+/// Inverse of the parameterization in rkp_sky_view_lut.wgsl.
+fn ray_dir_to_sky_view_uv(ray_dir: vec3<f32>, sun_dir: vec3<f32>, cam_height: f32) -> vec2<f32> {
+    let view_zenith_cos = ray_dir.y;
+
+    let horizon_cos = -sqrt(max(1.0 - (EARTH_RADIUS * EARTH_RADIUS) / (cam_height * cam_height), 0.0));
+    let horizon_angle = acos(horizon_cos);
+
+    let view_angle = acos(clamp(view_zenith_cos, -1.0, 1.0));
+
+    // V: non-linear mapping with horizon at v=0.5.
+    var v: f32;
+    if view_angle <= horizon_angle {
+        // Above horizon: angle goes from horizon_angle (v=0.5) to 0 (v=1.0).
+        // coord = 1 - angle/horizon_angle. Invert: coord = (2v-1)² → v = 0.5 + 0.5*sqrt(coord)
+        let coord = 1.0 - view_angle / max(horizon_angle, 1e-6);
+        v = 0.5 + 0.5 * sqrt(max(coord, 0.0));
+    } else {
+        // Below horizon: angle goes from horizon_angle (v=0.5) to PI (v=0.0).
+        // coord = (angle - horizon) / (PI - horizon). Invert: coord = (1-2v)² → v = 0.5 - 0.5*sqrt(coord)
+        let beta = PI - horizon_angle;
+        let coord = (view_angle - horizon_angle) / max(beta, 1e-6);
+        v = 0.5 - 0.5 * sqrt(max(coord, 0.0));
+    }
+
+    // U: view-sun azimuth via horizontal projection.
+    let sun_horiz_len = length(vec2<f32>(sun_dir.x, sun_dir.z));
+    let view_horiz_len = length(vec2<f32>(ray_dir.x, ray_dir.z));
+    var light_view_cos = 0.0;
+    if sun_horiz_len > 0.001 && view_horiz_len > 0.001 {
+        let sun_h = vec2<f32>(sun_dir.x, sun_dir.z) / sun_horiz_len;
+        let view_h = vec2<f32>(ray_dir.x, ray_dir.z) / view_horiz_len;
+        light_view_cos = dot(sun_h, view_h);
+    }
+    let u = sqrt(max((light_view_cos + 1.0) * 0.5, 0.0));
+
+    return clamp(vec2<f32>(u, v), vec2<f32>(0.001), vec2<f32>(0.999));
+}
+
 /// Atmosphere sky radiance using precomputed LUTs.
 fn atmosphere(ray_dir: vec3<f32>, sun_dir: vec3<f32>, sun_intensity: f32, camera_alt: f32) -> vec3<f32> {
     let origin = vec3<f32>(0.0, EARTH_RADIUS + camera_alt, 0.0);
@@ -220,26 +264,45 @@ fn atmosphere(ray_dir: vec3<f32>, sun_dir: vec3<f32>, sun_intensity: f32, camera
     return scatter;
 }
 
-/// Sun disc with atmospheric extinction from LUT.
+/// Sun disc with atmospheric extinction from LUT + aureole glow.
 fn sun_disc(ray_dir: vec3<f32>, sun_dir: vec3<f32>, sun_intensity: f32, camera_alt: f32) -> vec3<f32> {
     let cos_angle = dot(ray_dir, sun_dir);
-    if cos_angle < cos(SUN_ANGULAR_RADIUS * 3.0) { return vec3<f32>(0.0); }
+    let glow_radius = SUN_ANGULAR_RADIUS * 10.0;
+    if cos_angle < cos(glow_radius) { return vec3<f32>(0.0); }
 
-    // Sun transmittance from LUT (single texture sample).
+    // Clip sun disc/glow below the horizon — the view ray must be above the
+    // geometric horizon for the sun to be visible at that pixel.
     let view_height = EARTH_RADIUS + camera_alt;
+    let horizon_cos = -sqrt(max(1.0 - (EARTH_RADIUS * EARTH_RADIUS) / (view_height * view_height), 0.0));
+    if ray_dir.y < horizon_cos { return vec3<f32>(0.0); }
     let sun_cos = dot(vec3<f32>(0.0, 1.0, 0.0), sun_dir);
     let sun_transmittance = lookup_transmittance(view_height, sun_cos);
 
-    // Sun disc with soft edge.
+    // Sun disc luminance = illuminance / solid_angle (Filament reference).
+    let sun_solid_angle = 2.0 * PI * (1.0 - cos(SUN_ANGULAR_RADIUS));
+    let sun_luminance = sun_intensity / sun_solid_angle;
+
     let sun_cos_r = cos(SUN_ANGULAR_RADIUS);
-    let glow_cos = cos(SUN_ANGULAR_RADIUS * 3.0);
+    let glow_cos = cos(glow_radius);
+
+    var result = vec3<f32>(0.0);
     if cos_angle > sun_cos_r {
-        let limb = 1.0 - 0.3 * (1.0 - (cos_angle - sun_cos_r) / (1.0 - sun_cos_r));
-        return sun_transmittance * sun_intensity * limb;
-    } else {
-        let t = (cos_angle - glow_cos) / (sun_cos_r - glow_cos);
-        return sun_transmittance * sun_intensity * t * t * 0.15;
+        // Hard disc — clips to white after tone mapping.
+        let center_dist = (cos_angle - sun_cos_r) / (1.0 - sun_cos_r);
+        let limb = 1.0 - 0.3 * (1.0 - center_dist);
+        result = sun_transmittance * sun_luminance * limb;
     }
+
+    // Aureole glow — bright near the disc, fading outward.
+    // Uses sun_luminance scaled down so the inner glow is bright enough
+    // to show transmittance color (orange at sunset) after tone mapping.
+    let t = (cos_angle - glow_cos) / (sun_cos_r - glow_cos);
+    if t > 0.0 {
+        let glow_luminance = sun_luminance * 0.002; // ~0.2% of disc brightness
+        result += sun_transmittance * glow_luminance * pow(t, 2.0);
+    }
+
+    return result;
 }
 
 // --- PBR helpers ---
@@ -279,14 +342,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let world_pos = pos_data.xyz;
     let hit_t = pos_data.w;
 
-    // No geometry → physically-based sky via atmospheric scattering.
+    // No geometry → sky from Sky View LUT + sun disc.
     if hit_t >= 9999.0 || hit_t <= 0.0 {
-        let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims);
-        let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+        let uv_screen = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims);
+        let ndc = vec2<f32>(uv_screen.x * 2.0 - 1.0, 1.0 - uv_screen.y * 2.0);
         let ray_dir = normalize(camera.forward.xyz + ndc.x * camera.right.xyz + ndc.y * camera.up.xyz);
-
         let s_dir = normalize(shade_params.sun_dir);
-        var sky = atmosphere(ray_dir, s_dir, shade_params.sun_intensity, shade_params.camera_altitude);
+
+        // Look up precomputed sky radiance from Sky View LUT.
+        let sky_uv = ray_dir_to_sky_view_uv(ray_dir, s_dir, EARTH_RADIUS + shade_params.camera_altitude);
+        var sky = textureSampleLevel(sky_view_lut, atmo_sampler, sky_uv, 0.0).rgb;
         sky += sun_disc(ray_dir, s_dir, shade_params.sun_intensity, shade_params.camera_altitude);
 
         textureStore(output, coord, vec4<f32>(sky, 1.0));
@@ -406,6 +471,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Emission.
     let emission = mat.base_color.rgb * mat.emission_strength;
 
-    let final_color = lo + ambient + emission;
+    var final_color = lo + ambient + emission;
+
+    // Aerial perspective: apply atmospheric haze to distant geometry.
+    let depth_km = hit_t / 1000.0;
+    if depth_km > 0.01 {
+        let ap_w = min(depth_km / AP_DISTANCE_PER_SLICE, AP_SLICE_COUNT - 1.0) / AP_SLICE_COUNT;
+        let screen_uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims);
+        let ap = textureSampleLevel(aerial_perspective_lut, atmo_sampler, vec3<f32>(screen_uv, ap_w), 0.0);
+        final_color = final_color * ap.a + ap.rgb;
+    }
+
     textureStore(output, coord, vec4<f32>(final_color, 1.0));
 }

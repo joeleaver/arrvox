@@ -22,6 +22,8 @@ pub mod rkp_ssao;
 pub mod rkp_shade;
 /// Atmosphere LUT computation — transmittance and multi-scattering.
 pub mod rkp_atmosphere;
+/// Screen-space god rays — radial blur from sun position.
+pub mod rkp_god_rays;
 /// Volumetric rendering — fog, dust, procedural clouds.
 pub mod rkp_volumetric;
 /// Frame renderer — orchestrates the full pipeline.

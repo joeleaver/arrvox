@@ -8,6 +8,7 @@ members = [
     "crates/rkp-editor",
     "crates/rkp-testbed", "crates/rkp-engine",
     "crates/rkp-macros",
+    "crates/rkp-procedural",
 ]
 
 [workspace.package]
@@ -25,6 +26,7 @@ rkp-convert = { path = "crates/rkp-convert" }
 rkp-runtime = { path = "crates/rkp-runtime" }
 rkp-engine = { path = "crates/rkp-engine" }
 rkp-macros = { path = "crates/rkp-macros" }
+rkp-procedural = { path = "crates/rkp-procedural" }
 
 # Shared crates from RKIField
 rkf-core = { path = "../rkifield/crates/rkf-core" }

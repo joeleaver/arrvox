@@ -83,6 +83,7 @@ pub fn ZoneComponent(container: ContainerKind, zone_idx: usize) -> NodeHandle {
                 if active_panel.get() == Some(PanelId::Console) { ConsolePanel {} }
                 if active_panel.get() == Some(PanelId::Profiling) { ProfilingPanel {} }
                 if active_panel.get() == Some(PanelId::Models) { ModelsPanel {} }
+                if active_panel.get() == Some(PanelId::Build) { BuildPanel {} }
 
                 // Edge drop zones (only visible during drag).
                 if is_dragging.get() {

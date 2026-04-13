@@ -52,6 +52,8 @@ pub struct StateUpdate {
     pub selected_model: Option<String>,
     /// Environment settings (sent when changed or on first frame).
     pub environment: Option<crate::environment::EnvironmentSettings>,
+    /// Procedural object snapshot for the selected entity (if it has ProceduralGeometry).
+    pub procedural: Option<crate::procedural_snapshot::ProceduralSnapshot>,
     /// New console log entries since last tick.
     pub console_entries: Vec<crate::console::LogEntry>,
 }

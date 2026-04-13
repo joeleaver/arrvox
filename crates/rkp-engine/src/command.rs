@@ -22,6 +22,11 @@ pub enum EngineCommand {
         name: String,
     },
 
+    /// Spawn a procedural object (default: union with one sphere).
+    SpawnProceduralObject {
+        name: String,
+    },
+
     /// Spawn a camera entity.
     SpawnCamera,
 
@@ -51,6 +56,31 @@ pub enum EngineCommand {
 
     /// Duplicate the currently selected object.
     DuplicateSelected,
+
+    // ── Procedural editing ────────────────────────────────────────────
+
+    /// Select a node within the currently selected procedural object.
+    SelectProceduralNode {
+        node_id: Option<u32>,
+    },
+
+    /// Add a child node to the selected procedural object.
+    AddProceduralNode {
+        parent_node_id: u32,
+        kind: String,
+    },
+
+    /// Remove a node from the selected procedural object.
+    RemoveProceduralNode {
+        node_id: u32,
+    },
+
+    /// Set a parameter on a procedural node.
+    SetProceduralNodeParam {
+        node_id: u32,
+        param_name: String,
+        value: String,
+    },
 
     // ── Transforms ───────────────────────────────────────────────────
 

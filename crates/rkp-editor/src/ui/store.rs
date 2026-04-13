@@ -15,6 +15,7 @@ use rkp_engine::inspector::InspectorSnapshot;
 use rkp_engine::console::LogEntry;
 use rkp_engine::environment::EnvironmentSettings;
 use rkp_engine::material_library::MaterialInfo;
+use rkp_engine::procedural_snapshot::ProceduralSnapshot;
 use rkp_engine::recent_projects::RecentProject;
 
 use crate::ui::layout::{ContainerKind, LayoutConfig, PanelId, default_layout};
@@ -85,6 +86,8 @@ pub struct EditorStore {
     pub model_drag: Signal<Option<String>>,
     /// Inspector data for the selected entity.
     pub inspector: Signal<Option<InspectorSnapshot>>,
+    /// Procedural object snapshot for the selected entity (if it has ProceduralGeometry).
+    pub procedural: Signal<Option<ProceduralSnapshot>>,
     /// Components available to add to the selected entity.
     pub available_components: Signal<Vec<String>>,
 
@@ -186,6 +189,7 @@ impl EditorStore {
             available_models: Signal::new(Vec::new()),
             model_drag: Signal::new(None),
             inspector: Signal::new(None),
+            procedural: Signal::new(None),
             available_components: Signal::new(Vec::new()),
 
             // Material state.

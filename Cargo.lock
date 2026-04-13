@@ -5004,6 +5004,7 @@ dependencies = [
  "rkf-runtime",
  "rkp-core",
  "rkp-macros",
+ "rkp-procedural",
  "rkp-render",
  "serde",
  "serde_json",
@@ -5019,6 +5020,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "rkp-procedural"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "glam 0.29.3",
+ "rkf-core",
+ "serde",
+ "smallvec",
 ]
 
 [[package]]

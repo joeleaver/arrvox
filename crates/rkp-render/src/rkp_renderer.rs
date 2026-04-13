@@ -11,6 +11,7 @@ use crate::rkp_ssao::RkpSsaoPass;
 use crate::rkp_shade::{RkpShadePass, ShadeParams, GpuLight, GpuMaterial};
 use crate::rkp_volumetric::{RkpVolumetricPass, VolumetricParams, CloudParams};
 use crate::rkp_atmosphere::RkpAtmospherePass;
+use crate::rkp_god_rays::RkpGodRayPass;
 use crate::rkp_gpu_object::RkpGpuObject;
 use crate::octree_march::OctreeMarchPass;
 use wgpu_profiler::GpuProfiler;
@@ -33,6 +34,8 @@ pub struct RkpRenderer {
     pub atmosphere: RkpAtmospherePass,
     /// Volumetric rendering pass (fog + dust + clouds).
     pub volumetric: RkpVolumetricPass,
+    /// Screen-space god rays.
+    pub god_rays: RkpGodRayPass,
     /// Per-light shadow texture (Rgba8Unorm, up to 4 shadow-casting lights).
     shadow_texture: wgpu::Texture,
     shadow_view: wgpu::TextureView,
@@ -88,15 +91,17 @@ impl RkpRenderer {
 
         shade.set_shade_data(device, &shade_params_buffer, &lights_buffer, &materials_buffer);
         shade.set_camera(device, &scene.camera_buffer);
-        shade.set_atmosphere_luts(device, &atmosphere.transmittance_view, &atmosphere.multiscatter_view, &atmosphere.lut_sampler);
+        shade.set_atmosphere_luts(device, &atmosphere.transmittance_view, &atmosphere.multiscatter_view, &atmosphere.lut_sampler, &atmosphere.sky_view_view, &atmosphere.ap_view);
         march.set_materials(device, &materials_buffer);
         march.set_lights(device, &lights_buffer);
 
         let (shadow_texture, shadow_view) = Self::create_shadow_texture(device, width, height);
         let volumetric = RkpVolumetricPass::new(device, width, height);
+        let mut god_rays = RkpGodRayPass::new(device, width, height);
+        god_rays.set_input(device, &volumetric.output_view);
 
         Self {
-            scene, march, ssao, shade, atmosphere, volumetric,
+            scene, march, ssao, shade, atmosphere, volumetric, god_rays,
             shade_params_buffer, lights_buffer, materials_buffer,
             shadow_texture, shadow_view,
             device: device.clone(),
@@ -124,6 +129,7 @@ impl RkpRenderer {
         self.shade.set_shadow_and_ssao(&self.device, &self.shadow_view, &self.ssao.output_view);
         self.volumetric.set_depth_view(&self.device, &gbuffer.position_view);
         self.volumetric.set_scene_hdr_view(&self.device, &self.shade.output_view);
+        self.god_rays.set_input(&self.device, &self.volumetric.output_view);
     }
 
     pub fn set_hdr_output(&mut self, view: &wgpu::TextureView) {
@@ -141,12 +147,14 @@ impl RkpRenderer {
         shadow_steps: u32,
         num_lights: u32,
         screen_aabbs: &[u8],
+        atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
     ) {
         // Upload screen-space AABBs for tile culling.
         self.march.upload_screen_aabbs(queue, screen_aabbs);
 
-        // 0. Atmosphere LUTs (precomputed, only dispatched when dirty).
+        // 0. Atmosphere LUTs (precomputed + per-frame).
         self.atmosphere.dispatch_if_dirty(encoder);
+        self.atmosphere.dispatch_per_frame(encoder, queue, atmo_frame_params);
 
         // 1. Octree ray march → G-buffer + per-light shadow texture.
         self.march.clear_stats(encoder);
@@ -181,6 +189,11 @@ impl RkpRenderer {
             self.volumetric.dispatch_march(encoder);
             self.volumetric.dispatch_composite(encoder);
             self.profiler.end_query(encoder, q);
+        }
+
+        // 4b. Screen-space god rays.
+        {
+            self.god_rays.dispatch(encoder);
         }
 
         // 5. Resolve profiler queries.
@@ -270,6 +283,7 @@ impl RkpRenderer {
         self.ssao.resize(&self.device, width, height);
         self.shade.resize(&self.device, width, height);
         self.volumetric.resize(&self.device, width, height);
+        self.god_rays.resize(&self.device, width, height);
     }
 
     /// Update volumetric parameters (fog, dust, march settings).

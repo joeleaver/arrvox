@@ -22,6 +22,7 @@ pub mod gameplay_loader;
 pub mod import_profile;
 pub mod import_worker;
 pub mod play_mode;
+pub mod procedural_snapshot;
 pub mod gizmo;
 pub mod inspector;
 pub mod material_library;

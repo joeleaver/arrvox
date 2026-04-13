@@ -195,33 +195,17 @@ impl RkpShadePass {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("rkp_shade atmo"),
                 entries: &[
-                    // Atmosphere LUTs need filtering for textureSampleLevel.
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
+                    // Atmosphere LUTs — all filterable.
+                    Self::filterable_tex_2d(0),  // transmittance LUT
+                    Self::filterable_tex_2d(1),  // multi-scatter LUT
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    Self::filterable_tex_2d(3),  // sky view LUT
+                    Self::filterable_tex_3d(4),  // aerial perspective LUT
                 ],
             });
 
@@ -342,13 +326,15 @@ impl RkpShadePass {
     }
 
     /// Set camera uniform buffer.
-    /// Set atmosphere LUT textures.
+    /// Set atmosphere LUT textures (all 4 LUTs + sampler).
     pub fn set_atmosphere_luts(
         &mut self,
         device: &wgpu::Device,
         transmittance_view: &wgpu::TextureView,
         multiscatter_view: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
+        sky_view_view: &wgpu::TextureView,
+        ap_view: &wgpu::TextureView,
     ) {
         self.atmo_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rkp_shade atmo bg"),
@@ -357,6 +343,8 @@ impl RkpShadePass {
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(transmittance_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(multiscatter_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(sky_view_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(ap_view) },
             ],
         }));
     }
@@ -420,6 +408,26 @@ impl RkpShadePass {
         self.output_view = view;
         self.output_bind_group =
             Self::create_output_bind_group(device, &self.output_bind_group_layout, &self.output_view);
+    }
+
+    fn filterable_tex_2d(binding: u32) -> wgpu::BindGroupLayoutEntry {
+        wgpu::BindGroupLayoutEntry {
+            binding, visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2, multisampled: false,
+            }, count: None,
+        }
+    }
+
+    fn filterable_tex_3d(binding: u32) -> wgpu::BindGroupLayoutEntry {
+        wgpu::BindGroupLayoutEntry {
+            binding, visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D3, multisampled: false,
+            }, count: None,
+        }
     }
 
     fn create_output(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {

@@ -80,7 +80,6 @@ pub struct RkpVolumetricPass {
     width: u32,
     height: u32,
 
-    /// Cached depth view for bind group rebuild.
     depth_view_set: bool,
 }
 
@@ -265,6 +264,7 @@ impl RkpVolumetricPass {
         }
     }
 
+    /// Set the shadow map texture for volumetric shadow sampling.
     /// Set the depth view (G-buffer position texture). Rebuilds march bind group.
     pub fn set_depth_view(&mut self, device: &wgpu::Device, depth_view: &wgpu::TextureView) {
         self.march_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {

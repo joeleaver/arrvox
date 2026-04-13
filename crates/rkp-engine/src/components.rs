@@ -177,6 +177,43 @@ pub struct RigidBodyRuntime {
     pub handle: rapier3d::prelude::RigidBodyHandle,
 }
 
+/// Procedural geometry — an entity whose voxels are generated from a node tree.
+///
+/// The tree is the source of truth. When dirty, the engine re-evaluates the tree
+/// into the voxel pool via octree voxelization. The resulting SpatialData is
+/// stored on the sibling `Renderable` component.
+#[derive(Debug, Clone)]
+pub struct ProceduralGeometry {
+    /// The procedural node tree (arena-based).
+    pub tree: rkp_procedural::ProceduralObject,
+    /// Voxel size for the physics collider grid.
+    pub collider_resolution: f32,
+    /// Whether the tree needs re-evaluation.
+    pub dirty: bool,
+    /// Scale at last evaluation — re-evaluate if scale changes.
+    pub last_evaluated_scale: glam::Vec3,
+}
+
+impl ProceduralGeometry {
+    /// Create a default procedural object: a union root with one sphere child.
+    pub fn default_sphere() -> Self {
+        use rkp_procedural::*;
+        let mut tree = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        tree.add_child(
+            tree.root(),
+            NodeKind::Sphere(rkp_procedural::node_kind::SphereParams::default()),
+        );
+        Self {
+            tree,
+            collider_resolution: 0.1,
+            dirty: true,
+            last_evaluated_scale: glam::Vec3::ONE,
+        }
+    }
+}
+
 /// Camera entity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Camera {

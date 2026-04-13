@@ -21,6 +21,7 @@ pub enum PanelId {
     Console,
     Profiling,
     Models,
+    Build,
 }
 
 /// Which container a panel lives in.
@@ -248,7 +249,7 @@ pub fn default_layout() -> LayoutConfig {
             kind: ContainerKind::Right,
             zones: vec![
                 Zone {
-                    tabs: vec![PanelId::ObjectProperties],
+                    tabs: vec![PanelId::ObjectProperties, PanelId::Build],
                     active_tab: 0,
                     fraction: 0.5,
                 },
