@@ -1537,8 +1537,11 @@ impl EngineState {
                     "sky_color_horizon_override_enabled" => {
                         if value == "false" { env.sky_color_horizon_override = None; }
                     }
-                    "skip_sun_extinction" => {
-                        env.skip_sun_extinction = value == "true" || value == "1";
+                    "sun_color_override" => {
+                        if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) { env.sun_color_override = Some(v); }
+                    }
+                    "sun_color_override_enabled" => {
+                        if value == "false" { env.sun_color_override = None; }
                     }
                     "ambient_intensity" => {
                         if let Ok(v) = value.parse::<f32>() { env.ambient_intensity = v; }
@@ -1548,9 +1551,6 @@ impl EngineState {
                     }
                     "sun_elevation" => {
                         if let Ok(v) = value.parse::<f32>() { env.sun_elevation = v; }
-                    }
-                    "sun_color" => {
-                        if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) { env.sun_color = v; }
                     }
                     "sun_intensity" => {
                         if let Ok(v) = value.parse::<f32>() { env.sun_intensity = v; }

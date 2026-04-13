@@ -33,8 +33,11 @@ pub fn EnvironmentPanel() -> NodeHandle {
 
     let sun_azimuth = Signal::new(env.sun_azimuth);
     let sun_elevation = Signal::new(env.sun_elevation);
-    let sun_color = Signal::new([env.sun_color[0], env.sun_color[1], env.sun_color[2], 1.0]);
-    let skip_sun_extinction = Signal::new(env.skip_sun_extinction);
+    let sun_color_override_on = Signal::new(env.sun_color_override.is_some());
+    let sun_color_override = Signal::new({
+        let c = env.sun_color_override.unwrap_or([1.0, 0.95, 0.9]);
+        [c[0], c[1], c[2], 1.0]
+    });
     let sun_intensity = Signal::new(env.sun_intensity);
 
     let shadow_steps = Signal::new(env.shadow_steps as f32);
@@ -152,9 +155,22 @@ pub fn EnvironmentPanel() -> NodeHandle {
             if !light_collapsed.get() {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
-                    {prop_color(__scope, "Color", sun_color, env_color3("sun_color"))}
                     {prop_slider(__scope, "Intensity (lux)", sun_intensity, 0.0, 200000.0, 1000.0, env_f32("sun_intensity"))}
-                    {prop_checkbox(__scope, "Skip Extinction", skip_sun_extinction, env_bool("skip_sun_extinction"))}
+
+                    // Override: sun color (bypasses atmosphere extinction)
+                    {prop_checkbox(__scope, "Override Sun Color", sun_color_override_on, {
+                        let tx = cmd_tx;
+                        Rc::new(move |v: bool| {
+                            if !v {
+                                let _ = tx.get().send(rkp_engine::EngineCommand::UpdateEnvironment {
+                                    field: "sun_color_override_enabled".into(), value: "false".into(),
+                                });
+                            }
+                        })
+                    })}
+                    if sun_color_override_on.get() {
+                        {prop_color(__scope, "Sun Color", sun_color_override, env_color3("sun_color_override"))}
+                    }
 
                     // Sun direction widget: azimuth + elevation
                     {sun_direction_widget(__scope, sun_azimuth, sun_elevation, cmd_tx)}
