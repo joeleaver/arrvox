@@ -10,6 +10,7 @@ use crate::rkp_scene::{RkpScene, GeometryUpload, FrameUpload, CameraUniforms};
 use crate::rkp_ssao::RkpSsaoPass;
 use crate::rkp_shade::{RkpShadePass, ShadeParams, GpuLight, GpuMaterial};
 use crate::rkp_volumetric::{RkpVolumetricPass, VolumetricParams, CloudParams};
+use crate::rkp_atmosphere::RkpAtmospherePass;
 use crate::rkp_gpu_object::RkpGpuObject;
 use crate::octree_march::OctreeMarchPass;
 use wgpu_profiler::GpuProfiler;
@@ -28,6 +29,8 @@ pub struct RkpRenderer {
     shade_params_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
     materials_buffer: wgpu::Buffer,
+    /// Atmosphere LUTs (transmittance + multi-scattering).
+    pub atmosphere: RkpAtmospherePass,
     /// Volumetric rendering pass (fog + dust + clouds).
     pub volumetric: RkpVolumetricPass,
     /// Per-light shadow texture (Rgba8Unorm, up to 4 shadow-casting lights).
@@ -81,8 +84,11 @@ impl RkpRenderer {
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             bytemuck::bytes_of(&default_material));
 
+        let atmosphere = RkpAtmospherePass::new(device);
+
         shade.set_shade_data(device, &shade_params_buffer, &lights_buffer, &materials_buffer);
         shade.set_camera(device, &scene.camera_buffer);
+        shade.set_atmosphere_luts(device, &atmosphere.transmittance_view, &atmosphere.multiscatter_view, &atmosphere.lut_sampler);
         march.set_materials(device, &materials_buffer);
         march.set_lights(device, &lights_buffer);
 
@@ -90,7 +96,7 @@ impl RkpRenderer {
         let volumetric = RkpVolumetricPass::new(device, width, height);
 
         Self {
-            scene, march, ssao, shade, volumetric,
+            scene, march, ssao, shade, atmosphere, volumetric,
             shade_params_buffer, lights_buffer, materials_buffer,
             shadow_texture, shadow_view,
             device: device.clone(),
@@ -138,6 +144,9 @@ impl RkpRenderer {
     ) {
         // Upload screen-space AABBs for tile culling.
         self.march.upload_screen_aabbs(queue, screen_aabbs);
+
+        // 0. Atmosphere LUTs (precomputed, only dispatched when dirty).
+        self.atmosphere.dispatch_if_dirty(encoder);
 
         // 1. Octree ray march → G-buffer + per-light shadow texture.
         self.march.clear_stats(encoder);

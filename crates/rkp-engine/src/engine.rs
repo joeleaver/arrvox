@@ -1364,6 +1364,10 @@ impl EngineState {
                 self.environment_dirty = true;
             }
 
+            EngineCommand::SetGizmoMode { mode } => {
+                self.gizmo.mode = mode;
+            }
+
             EngineCommand::PlayStart => {
                 if self.play_state.is_none() {
                     // Ensure collider caches are up to date before entering play mode.
@@ -2334,12 +2338,23 @@ impl EngineState {
                     }
                 }
                 crate::gizmo::GizmoMode::Rotate => {
-                    let _delta = crate::gizmo::compute_rotate_delta(&self.gizmo, ray_o, ray_d, center);
-                    // TODO: apply rotation
+                    let delta = crate::gizmo::compute_rotate_delta(&self.gizmo, ray_o, ray_d, center);
+                    let new_rot = delta * self.gizmo.initial_rotation;
+                    // Convert quaternion back to Euler degrees for storage.
+                    let (y, x, z) = new_rot.to_euler(glam::EulerRot::YXZ);
+                    let euler_deg = glam::Vec3::new(x.to_degrees(), y.to_degrees(), z.to_degrees());
+                    if let Ok(mut t) = self.world.get::<&mut crate::components::Transform>(selected) {
+                        t.rotation = euler_deg;
+                        self.gpu_objects_dirty = true;
+                    }
                 }
                 crate::gizmo::GizmoMode::Scale => {
-                    let _delta = crate::gizmo::compute_scale_delta(&self.gizmo, ray_o, ray_d);
-                    // TODO: apply scale
+                    let delta = crate::gizmo::compute_scale_delta(&self.gizmo, ray_o, ray_d);
+                    let new_scale = self.gizmo.initial_scale * delta;
+                    if let Ok(mut t) = self.world.get::<&mut crate::components::Transform>(selected) {
+                        t.scale = new_scale;
+                        self.gpu_objects_dirty = true;
+                    }
                 }
             }
 
@@ -2365,13 +2380,23 @@ impl EngineState {
                     }
                 };
                 let forward = (center - self.camera.position).normalize();
+                let (rotation, scale) = self.world.get::<&crate::components::Transform>(selected)
+                    .map(|t| {
+                        let r = t.rotation;
+                        let q = glam::Quat::from_euler(
+                            glam::EulerRot::YXZ,
+                            r.y.to_radians(), r.x.to_radians(), r.z.to_radians(),
+                        );
+                        (q, t.scale)
+                    })
+                    .unwrap_or((glam::Quat::IDENTITY, glam::Vec3::ONE));
                 self.gizmo.pivot = center;
                 self.gizmo.begin_drag(
                     self.gizmo.hovered_axis,
                     start_point,
                     center,
-                    glam::Quat::IDENTITY,
-                    glam::Vec3::ONE,
+                    rotation,
+                    scale,
                     forward,
                 );
             }

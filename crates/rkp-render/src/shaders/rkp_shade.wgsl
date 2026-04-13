@@ -71,16 +71,24 @@ struct Material {
 // Group 4: camera
 @group(4) @binding(0) var<uniform> camera: CameraUniforms;
 
+// Group 5: atmosphere LUTs
+@group(5) @binding(0) var transmittance_lut: texture_2d<f32>;
+@group(5) @binding(1) var multiscatter_lut: texture_2d<f32>;
+@group(5) @binding(2) var atmo_sampler: sampler;
+
 // --- Atmospheric scattering ---
 
-const EARTH_RADIUS: f32 = 6371000.0;
-const ATMO_RADIUS: f32 = 6471000.0;
+// Atmosphere constants — Bruneton 2017 / Hillaire 2020 reference values.
+const EARTH_RADIUS: f32 = 6360000.0;
+const ATMO_RADIUS: f32 = 6460000.0;      // Earth + 100km
 const RAYLEIGH_SCALE_H: f32 = 8000.0;
 const MIE_SCALE_H: f32 = 1200.0;
-const BETA_R: vec3<f32> = vec3<f32>(5.8e-6, 13.5e-6, 33.1e-6);
-const BETA_M: vec3<f32> = vec3<f32>(21e-6, 21e-6, 21e-6);
-const MIE_G: f32 = 0.76;
-const SUN_ANGULAR_RADIUS: f32 = 0.00465; // ~0.267 degrees
+const BETA_R: vec3<f32> = vec3<f32>(5.802e-6, 13.558e-6, 33.1e-6);
+const BETA_M_SCAT: vec3<f32> = vec3<f32>(3.996e-6, 3.996e-6, 3.996e-6);
+const BETA_M_EXT: vec3<f32> = vec3<f32>(4.44e-6, 4.44e-6, 4.44e-6);
+const BETA_OZONE: vec3<f32> = vec3<f32>(0.650e-6, 1.881e-6, 0.085e-6);
+const MIE_G: f32 = 0.8;
+const SUN_ANGULAR_RADIUS: f32 = 0.004675;
 
 fn ray_sphere(origin: vec3<f32>, dir: vec3<f32>, radius: f32) -> vec2<f32> {
     let b = dot(origin, dir);
@@ -95,12 +103,61 @@ fn rayleigh_phase(cos_theta: f32) -> f32 {
     return (3.0 / (16.0 * PI)) * (1.0 + cos_theta * cos_theta);
 }
 
-fn henyey_greenstein(cos_theta: f32, g: f32) -> f32 {
-    let g2 = g * g;
-    let denom = 1.0 + g2 - 2.0 * g * cos_theta;
-    return (1.0 - g2) / (4.0 * PI * pow(max(denom, 1e-6), 1.5));
+/// Cornette-Shanks phase function (Hillaire 2020 reference).
+/// More accurate than Henyey-Greenstein for Mie scattering.
+fn cornette_shanks(cos_theta: f32, g: f32) -> f32 {
+    let k = (3.0 / (8.0 * PI)) * (1.0 - g * g) / (2.0 + g * g);
+    return k * (1.0 + cos_theta * cos_theta) / pow(max(1.0 + g * g - 2.0 * g * cos_theta, 1e-6), 1.5);
 }
 
+/// Sample atmospheric extinction at a given altitude (Rayleigh + Mie + Ozone).
+fn sample_extinction(altitude: f32) -> vec3<f32> {
+    let density_r = exp(-altitude / RAYLEIGH_SCALE_H);
+    let density_m = exp(-altitude / MIE_SCALE_H);
+    let h_km = altitude / 1000.0;
+    var density_o = 0.0;
+    if h_km < 25.0 {
+        density_o = max(h_km / 15.0 - 2.0 / 3.0, 0.0);
+    } else {
+        density_o = max(-h_km / 15.0 + 8.0 / 3.0, 0.0);
+    }
+    return density_r * BETA_R + density_m * BETA_M_EXT + density_o * BETA_OZONE;
+}
+
+fn sample_scattering(altitude: f32) -> vec2<f32> {
+    let density_r = exp(-altitude / RAYLEIGH_SCALE_H);
+    let density_m = exp(-altitude / MIE_SCALE_H);
+    return vec2<f32>(density_r, density_m);
+}
+
+/// UV mapping for transmittance LUT lookup (Bruneton 2017).
+fn transmittance_params_to_uv(view_height: f32, cos_zenith: f32) -> vec2<f32> {
+    let H = sqrt(ATMO_RADIUS * ATMO_RADIUS - EARTH_RADIUS * EARTH_RADIUS);
+    let rho = sqrt(max(view_height * view_height - EARTH_RADIUS * EARTH_RADIUS, 0.0));
+    let d_min = ATMO_RADIUS - view_height;
+    let d_max = rho + H;
+    let disc = view_height * view_height * (cos_zenith * cos_zenith - 1.0)
+             + ATMO_RADIUS * ATMO_RADIUS;
+    let d = max(-view_height * cos_zenith + sqrt(max(disc, 0.0)), 0.0);
+    let u = clamp((d - d_min) / max(d_max - d_min, 1e-6), 0.0, 1.0);
+    let v = clamp(rho / max(H, 1e-6), 0.0, 1.0);
+    return vec2<f32>(u, v);
+}
+
+/// Look up transmittance from the precomputed LUT.
+fn lookup_transmittance(view_height: f32, cos_zenith: f32) -> vec3<f32> {
+    let uv = transmittance_params_to_uv(view_height, cos_zenith);
+    return textureSampleLevel(transmittance_lut, atmo_sampler, uv, 0.0).rgb;
+}
+
+/// Look up multi-scattered luminance from the precomputed LUT.
+fn lookup_multiscatter(view_height: f32, sun_cos_zenith: f32) -> vec3<f32> {
+    let v = clamp((view_height - EARTH_RADIUS) / (ATMO_RADIUS - EARTH_RADIUS), 0.0, 1.0);
+    let u = clamp(sun_cos_zenith * 0.5 + 0.5, 0.0, 1.0);
+    return textureSampleLevel(multiscatter_lut, atmo_sampler, vec2<f32>(u, v), 0.0).rgb;
+}
+
+/// Atmosphere sky radiance using precomputed LUTs.
 fn atmosphere(ray_dir: vec3<f32>, sun_dir: vec3<f32>, sun_intensity: f32, camera_alt: f32) -> vec3<f32> {
     let origin = vec3<f32>(0.0, EARTH_RADIUS + camera_alt, 0.0);
     let atmo_hit = ray_sphere(origin, ray_dir, ATMO_RADIUS);
@@ -115,83 +172,72 @@ fn atmosphere(ray_dir: vec3<f32>, sun_dir: vec3<f32>, sun_intensity: f32, camera
 
     let cos_sun = dot(ray_dir, sun_dir);
     let phase_r = rayleigh_phase(cos_sun);
-    let phase_m = henyey_greenstein(cos_sun, MIE_G);
+    let phase_m = cornette_shanks(cos_sun, MIE_G);
 
-    let steps = 16u;
+    let steps = 32u;
     let step_len = (t_end - t_start) / f32(steps);
-    var od_r = vec3<f32>(0.0); // optical depth Rayleigh (camera → sample)
-    var od_m = vec3<f32>(0.0); // optical depth Mie
+    var throughput = vec3<f32>(1.0);
     var scatter = vec3<f32>(0.0);
 
     for (var i = 0u; i < steps; i++) {
         let t = t_start + (f32(i) + 0.5) * step_len;
         let pos = origin + ray_dir * t;
-        let alt = length(pos) - EARTH_RADIUS;
+        let altitude = length(pos) - EARTH_RADIUS;
+        if altitude < 0.0 { break; }
 
-        let density_r = exp(-alt / RAYLEIGH_SCALE_H) * step_len;
-        let density_m = exp(-alt / MIE_SCALE_H) * step_len;
-        od_r += BETA_R * density_r;
-        od_m += BETA_M * density_m;
+        let extinction = sample_extinction(altitude);
+        let densities = sample_scattering(altitude);
+        let density_r = densities.x;
+        let density_m = densities.y;
+        let scattering = density_r * BETA_R + density_m * BETA_M_SCAT;
 
-        // Secondary ray: optical depth from sample to sun (atmosphere exit).
-        let sun_hit = ray_sphere(pos, sun_dir, ATMO_RADIUS);
-        let sun_steps = 4u;
-        let sun_step_len = sun_hit.y / f32(sun_steps);
-        var od_sun_r = vec3<f32>(0.0);
-        var od_sun_m = vec3<f32>(0.0);
-        var in_shadow = false;
-        for (var j = 0u; j < sun_steps; j++) {
-            let st = (f32(j) + 0.5) * sun_step_len;
-            let sun_pos = pos + sun_dir * st;
-            let sun_alt = length(sun_pos) - EARTH_RADIUS;
-            if sun_alt < 0.0 { in_shadow = true; break; }
-            let sd_r = exp(-sun_alt / RAYLEIGH_SCALE_H) * sun_step_len;
-            let sd_m = exp(-sun_alt / MIE_SCALE_H) * sun_step_len;
-            od_sun_r += BETA_R * sd_r;
-            od_sun_m += BETA_M * sd_m;
-        }
-        if in_shadow { continue; }
+        let sample_transmittance = exp(-extinction * step_len);
 
-        let transmittance = exp(-(od_r + od_m + od_sun_r + od_sun_m));
-        scatter += (density_r * BETA_R * phase_r + density_m * BETA_M * phase_m)
-                 * transmittance * sun_intensity;
+        // Sun transmittance from LUT (replaces per-pixel secondary march).
+        let up = pos / length(pos);
+        let sun_cos = dot(up, sun_dir);
+        let sun_trans = lookup_transmittance(length(pos), sun_cos);
+
+        // Earth shadow check.
+        let earth_shadow = select(0.0, 1.0, sun_cos > -sqrt(max(1.0 - (EARTH_RADIUS * EARTH_RADIUS) / (length(pos) * length(pos)), 0.0)));
+
+        // Single-scattering: phase-weighted.
+        let ss = (density_r * BETA_R * phase_r + density_m * BETA_M_SCAT * phase_m)
+               * earth_shadow * sun_trans * sun_intensity;
+
+        // Multi-scattering from LUT (replaces inline fms hack).
+        let ms = lookup_multiscatter(length(pos), sun_cos) * scattering * sun_intensity;
+
+        // Integrate analytically within step (more accurate than Euler).
+        let s_total = ss + ms;
+        let s_int = (s_total - s_total * sample_transmittance) / max(extinction, vec3<f32>(1e-10));
+        scatter += throughput * s_int;
+
+        throughput *= sample_transmittance;
+        if all(throughput < vec3<f32>(0.001)) { break; }
     }
 
     return scatter;
 }
 
+/// Sun disc with atmospheric extinction from LUT.
 fn sun_disc(ray_dir: vec3<f32>, sun_dir: vec3<f32>, sun_intensity: f32, camera_alt: f32) -> vec3<f32> {
     let cos_angle = dot(ray_dir, sun_dir);
     if cos_angle < cos(SUN_ANGULAR_RADIUS * 3.0) { return vec3<f32>(0.0); }
 
-    // Compute sun transmittance (atmospheric extinction along sun direction).
-    let origin = vec3<f32>(0.0, EARTH_RADIUS + camera_alt, 0.0);
-    let sun_hit = ray_sphere(origin, sun_dir, ATMO_RADIUS);
-    if sun_hit.y < 0.0 { return vec3<f32>(0.0); }
-    let sun_steps = 8u;
-    let sun_step_len = sun_hit.y / f32(sun_steps);
-    var od_r = vec3<f32>(0.0);
-    var od_m = vec3<f32>(0.0);
-    for (var j = 0u; j < sun_steps; j++) {
-        let st = (f32(j) + 0.5) * sun_step_len;
-        let pos = origin + sun_dir * st;
-        let alt = length(pos) - EARTH_RADIUS;
-        if alt < 0.0 { return vec3<f32>(0.0); }
-        od_r += BETA_R * exp(-alt / RAYLEIGH_SCALE_H) * sun_step_len;
-        od_m += BETA_M * exp(-alt / MIE_SCALE_H) * sun_step_len;
-    }
-    let sun_transmittance = exp(-(od_r + od_m));
+    // Sun transmittance from LUT (single texture sample).
+    let view_height = EARTH_RADIUS + camera_alt;
+    let sun_cos = dot(vec3<f32>(0.0, 1.0, 0.0), sun_dir);
+    let sun_transmittance = lookup_transmittance(view_height, sun_cos);
 
     // Sun disc with soft edge.
-    let sun_cos = cos(SUN_ANGULAR_RADIUS);
+    let sun_cos_r = cos(SUN_ANGULAR_RADIUS);
     let glow_cos = cos(SUN_ANGULAR_RADIUS * 3.0);
-    if cos_angle > sun_cos {
-        // Hard disc with limb darkening.
-        let limb = 1.0 - 0.3 * (1.0 - (cos_angle - sun_cos) / (1.0 - sun_cos));
+    if cos_angle > sun_cos_r {
+        let limb = 1.0 - 0.3 * (1.0 - (cos_angle - sun_cos_r) / (1.0 - sun_cos_r));
         return sun_transmittance * sun_intensity * limb;
     } else {
-        // Soft glow.
-        let t = (cos_angle - glow_cos) / (sun_cos - glow_cos);
+        let t = (cos_angle - glow_cos) / (sun_cos_r - glow_cos);
         return sun_transmittance * sun_intensity * t * t * 0.15;
     }
 }
@@ -343,14 +389,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         lo += (diffuse + specular) * radiance * n_dot_l * light_shadow;
     }
 
-    // Ambient diffuse: atmosphere-derived hemisphere irradiance + AO.
-    let ambient_diffuse = shade_params.ambient_color * albedo * (1.0 - metallic) * ao;
+    // Ambient from multi-scattering LUT — replaces crude CPU 6-direction sampling.
+    // The LUT gives isotropic scattered luminance per unit sun illuminance at
+    // (camera_height, sun_zenith). This captures all scattering orders.
+    let cam_height = EARTH_RADIUS + shade_params.camera_altitude;
+    let sun_cos_z = shade_params.sun_dir.y; // sun_dir is toward-sun, .y = cos(zenith)
+    let ms_irradiance = lookup_multiscatter(cam_height, sun_cos_z)
+                      * shade_params.sun_intensity
+                      * shade_params.ambient_intensity;
+
+    let ambient_diffuse = ms_irradiance * albedo * (1.0 - metallic) * ao;
 
     // Ambient specular: approximate sky reflection for energy conservation.
-    // Without this, fresnel at grazing angles removes diffuse energy with
-    // nowhere for the specular to go (no environment map), causing dark edges.
     let F_env = fresnel_schlick(n_dot_v, f0);
-    let ambient_specular = shade_params.ambient_color * F_env * ao;
+    let ambient_specular = ms_irradiance * F_env * ao;
     let ambient = ambient_diffuse + ambient_specular;
 
     // Emission.

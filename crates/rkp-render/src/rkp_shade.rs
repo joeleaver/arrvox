@@ -11,6 +11,7 @@ pub struct RkpShadePass {
     pub output_bind_group_layout: wgpu::BindGroupLayout,
     pub shade_bind_group_layout: wgpu::BindGroupLayout,
     pub camera_bind_group_layout: wgpu::BindGroupLayout,
+    pub atmo_bind_group_layout: wgpu::BindGroupLayout,
     /// HDR output texture (full-res, Rgba16Float).
     pub output_texture: wgpu::Texture,
     pub output_view: wgpu::TextureView,
@@ -19,6 +20,7 @@ pub struct RkpShadePass {
     ssao_bind_group: Option<wgpu::BindGroup>,
     shade_bind_group: Option<wgpu::BindGroup>,
     camera_bind_group: Option<wgpu::BindGroup>,
+    atmo_bind_group: Option<wgpu::BindGroup>,
     width: u32,
     height: u32,
 }
@@ -188,6 +190,41 @@ impl RkpShadePass {
                 }],
             });
 
+        // Group 5: atmosphere LUTs
+        let atmo_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("rkp_shade atmo"),
+                entries: &[
+                    // Atmosphere LUTs need filtering for textureSampleLevel.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
         // Output texture.
         let (output_texture, output_view) = Self::create_output(device, width, height);
         let output_bind_group = Self::create_output_bind_group(device, &output_bind_group_layout, &output_view);
@@ -208,6 +245,7 @@ impl RkpShadePass {
                 Some(&output_bind_group_layout),
                 Some(&shade_bind_group_layout),
                 Some(&camera_bind_group_layout),
+                Some(&atmo_bind_group_layout),
             ],
             immediate_size: 0,
         });
@@ -228,6 +266,7 @@ impl RkpShadePass {
             output_bind_group_layout,
             shade_bind_group_layout,
             camera_bind_group_layout,
+            atmo_bind_group_layout,
             output_texture,
             output_view,
             output_bind_group,
@@ -235,6 +274,7 @@ impl RkpShadePass {
             ssao_bind_group: None,
             shade_bind_group: None,
             camera_bind_group: None,
+            atmo_bind_group: None,
             width,
             height,
         }
@@ -302,6 +342,25 @@ impl RkpShadePass {
     }
 
     /// Set camera uniform buffer.
+    /// Set atmosphere LUT textures.
+    pub fn set_atmosphere_luts(
+        &mut self,
+        device: &wgpu::Device,
+        transmittance_view: &wgpu::TextureView,
+        multiscatter_view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) {
+        self.atmo_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rkp_shade atmo bg"),
+            layout: &self.atmo_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(transmittance_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(multiscatter_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+            ],
+        }));
+    }
+
     pub fn set_camera(&mut self, device: &wgpu::Device, camera_buffer: &wgpu::Buffer) {
         self.camera_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rkp_shade camera bg"),
@@ -323,6 +382,7 @@ impl RkpShadePass {
         let sao = match &self.ssao_bind_group { Some(bg) => bg, None => return };
         let shade = match &self.shade_bind_group { Some(bg) => bg, None => return };
         let cam = match &self.camera_bind_group { Some(bg) => bg, None => return };
+        let atmo = match &self.atmo_bind_group { Some(bg) => bg, None => return };
 
         let wg_x = (self.width + 7) / 8;
         let wg_y = (self.height + 7) / 8;
@@ -337,6 +397,7 @@ impl RkpShadePass {
         pass.set_bind_group(2, &self.output_bind_group, &[]);
         pass.set_bind_group(3, shade, &[]);
         pass.set_bind_group(4, cam, &[]);
+        pass.set_bind_group(5, atmo, &[]);
         pass.dispatch_workgroups(wg_x, wg_y, 1);
     }
 

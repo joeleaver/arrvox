@@ -103,7 +103,7 @@ pub fn EnvironmentPanel() -> NodeHandle {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
                     {prop_color(__scope, "Color", sun_color, env_color3("sun_color"))}
-                    {prop_slider(__scope, "Intensity", sun_intensity, 0.0, 50.0, 0.5, env_f32("sun_intensity"))}
+                    {prop_slider(__scope, "Intensity (lux)", sun_intensity, 0.0, 200000.0, 1000.0, env_f32("sun_intensity"))}
 
                     // Sun direction widget: azimuth + elevation
                     {sun_direction_widget(__scope, sun_azimuth, sun_elevation, cmd_tx)}
@@ -126,7 +126,7 @@ pub fn EnvironmentPanel() -> NodeHandle {
             if !tone_collapsed.get() {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
-                    {prop_slider(__scope, "Exposure", exposure, 0.1, 10.0, 0.1, env_f32("exposure"))}
+                    {prop_scrub(__scope, "Exposure", exposure, 0.000001, 0.01, 0.000001, env_f32("exposure"))}
                 }
             }
 

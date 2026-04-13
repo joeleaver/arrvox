@@ -69,11 +69,11 @@ impl Default for EnvironmentSettings {
             sun_azimuth: 210.0,   // southwest
             sun_elevation: 45.0,  // mid-afternoon
             sun_color: [1.0, 0.95, 0.9],
-            sun_intensity: 22.0,
+            sun_intensity: 110_000.0,  // lux, clear day direct sun
             shadow_steps: 32,
             ao_radius: 0.1,
             ao_steps: 5,
-            exposure: 0.15,
+            exposure: 0.0000254, // EV100=15 (sunny-16 rule): 1/(1.2 × 2^15)
 
             camera_altitude: 100.0,
 
@@ -107,12 +107,13 @@ impl Default for EnvironmentSettings {
 // --- CPU-side atmospheric scattering (mirrors the GPU shader) ---
 
 mod atmo {
-    const EARTH_R: f32 = 6_371_000.0;
-    const ATMO_R: f32 = 6_471_000.0;
+    // Must match constants in rkp_shade.wgsl (Bruneton 2017 / Hillaire 2020).
+    const EARTH_R: f32 = 6_360_000.0;
+    const ATMO_R: f32 = 6_460_000.0;
     const RAYLEIGH_H: f32 = 8_000.0;
     const MIE_H: f32 = 1_200.0;
-    const BETA_R: [f32; 3] = [5.8e-6, 13.5e-6, 33.1e-6];
-    const BETA_M: f32 = 21e-6;
+    const BETA_R: [f32; 3] = [5.802e-6, 13.558e-6, 33.1e-6];
+    const BETA_M: f32 = 3.996e-6;
 
     fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 { a[0]*b[0] + a[1]*b[1] + a[2]*b[2] }
     fn len3(a: [f32; 3]) -> f32 { dot3(a, a).sqrt() }
@@ -144,7 +145,7 @@ mod atmo {
 
         let cos_sun = dot3(ray_dir, sun_dir);
         let phase_r = (3.0 / (16.0 * std::f32::consts::PI)) * (1.0 + cos_sun * cos_sun);
-        let g = 0.76f32;
+        let g = 0.8f32;
         let g2 = g * g;
         let denom = 1.0 + g2 - 2.0 * g * cos_sun;
         let phase_m = (1.0 - g2) / (4.0 * std::f32::consts::PI * denom.max(1e-6).powf(1.5));
@@ -268,10 +269,12 @@ impl EnvironmentSettings {
 
     /// Build GPU shade params from these settings.
     /// Sky colors and ambient are computed from the atmosphere model.
+    /// Fixed atmosphere radiance (matches GPU ATMO_SUN_RADIANCE constant).
+    /// Multi-scattering boost — must match MULTI_SCATTER_BOOST in rkp_shade.wgsl.
     pub fn to_shade_params(&self) -> rkp_render::rkp_shade::ShadeParams {
         let d = self.sun_direction();
         let sun_toward = [-d[0], -d[1], -d[2]];
-        let amb = atmo::ambient(sun_toward, self.sun_intensity, self.camera_altitude);
+        // Sky colors for volumetric fog compatibility (GPU ambient uses LUT directly).
         let sky_top = atmo::sky([0.0, 1.0, 0.0], sun_toward, self.sun_intensity, self.camera_altitude);
         let horizon_dir = {
             let el = 10.0f32.to_radians();
@@ -287,11 +290,12 @@ impl EnvironmentSettings {
             sky_color_top: sky_top,
             sky_color_horizon: sky_horizon,
             sun_dir: sun_toward,
-            ambient_color: [
-                amb[0] * self.ambient_intensity,
-                amb[1] * self.ambient_intensity,
-                amb[2] * self.ambient_intensity,
-            ],
+            // ambient_color no longer used by shade (LUT-based ambient instead).
+            // Kept for volumetric fog ambient.
+            ambient_color: {
+                let amb = atmo::ambient(sun_toward, self.sun_intensity, self.camera_altitude);
+                [amb[0] * self.ambient_intensity, amb[1] * self.ambient_intensity, amb[2] * self.ambient_intensity]
+            },
             ..Default::default()
         }
     }
@@ -344,16 +348,16 @@ impl EnvironmentSettings {
             ],
             frame_index,
             vol_ambient_r: {
-                let amb = atmo::ambient(sun_toward, self.sun_intensity, self.camera_altitude);
-                amb[0] * self.ambient_intensity
+                let a = atmo::ambient(sun_toward, self.sun_intensity, self.camera_altitude);
+                a[0] * self.ambient_intensity
             },
             vol_ambient_g: {
-                let amb = atmo::ambient(sun_toward, self.sun_intensity, self.camera_altitude);
-                amb[1] * self.ambient_intensity
+                let a = atmo::ambient(sun_toward, self.sun_intensity, self.camera_altitude);
+                a[1] * self.ambient_intensity
             },
             vol_ambient_b: {
-                let amb = atmo::ambient(sun_toward, self.sun_intensity, self.camera_altitude);
-                amb[2] * self.ambient_intensity
+                let a = atmo::ambient(sun_toward, self.sun_intensity, self.camera_altitude);
+                a[2] * self.ambient_intensity
             },
         }
     }
