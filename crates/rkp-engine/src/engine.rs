@@ -1063,6 +1063,7 @@ impl EngineState {
                             self.material_lib.scan(&dir.join("assets/materials"));
                         }
                         self.init_file_watcher();
+                        self.scaffold_and_build_gameplay();
                         self.auto_import_meshes();
                         if let Some(ref pp) = self.project_path {
                             crate::recent_projects::add_recent(&self.project_name, &pp.to_string_lossy());
@@ -1077,22 +1078,28 @@ impl EngineState {
                 match crate::project::load_project(&path) {
                     Ok((project, project_dir)) => {
                         self.clear_scene();
+                        self.project_dir = Some(project_dir.clone());
+                        self.project_path = Some(path);
+                        self.project_name = project.name;
+                        self.project_loaded = true;
+                        self.project_dirty = true;
+
+                        // Scaffold + build gameplay BEFORE loading the scene,
+                        // so gameplay components (Spin, Health, etc.) are registered
+                        // and can be deserialized from the scene file.
+                        self.scaffold_and_build_gameplay();
+
                         let scene_path = project_dir.join(format!("scenes/{}.rkscene", project.default_scene));
                         if scene_path.exists() {
                             self.load_scene_from_file(&scene_path);
                         }
-                        self.project_dir = Some(project_dir);
-                        self.project_path = Some(path);
                         self.scene_path = Some(scene_path);
-                        self.project_name = project.name;
-                        self.project_loaded = true;
-                        self.project_dirty = true;
+
                         self.scan_models();
                         if let Some(ref dir) = self.project_dir {
                             self.material_lib.scan(&dir.join("assets/materials"));
                         }
                         self.init_file_watcher();
-                        self.scaffold_and_build_gameplay();
                         self.auto_import_meshes();
                         if let Some(ref pp) = self.project_path {
                             crate::recent_projects::add_recent(&self.project_name, &pp.to_string_lossy());
