@@ -363,8 +363,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let packed_r = mat_data.r;
     let packed_g = mat_data.g;
 
-    // Unpack material IDs.
+    // Unpack material IDs + blend.
     let primary_mat_id = packed_r & 0xFFFFu;
+    let secondary_mat_id = (packed_r >> 16u) & 0xFFFFu;
     let blend_weight = f32(packed_g & 0xFFu) / 255.0;
 
     // Resolve material — metallic/roughness/emission always come from the
@@ -372,17 +373,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // When the voxel carries a color, it REPLACES the material's base_color
     // rather than modulating it — otherwise any non-white material tint dims
     // textured surfaces on every pixel.
-    let mat = materials[primary_mat_id];
+    //
+    // Dual-material blending: when blend_weight > 0 we mix the primary and
+    // secondary materials' physical parameters (base_color, metallic,
+    // roughness). Collapses to primary-only when blend_weight == 0 or
+    // secondary_mat_id == 0.
+    let mat_a = materials[primary_mat_id];
+    let bw = select(0.0, blend_weight, secondary_mat_id != 0u);
+    let mat_b = materials[secondary_mat_id];
+    let base_color = mix(mat_a.base_color.rgb, mat_b.base_color.rgb, bw);
+    let metallic = mix(mat_a.metallic, mat_b.metallic, bw);
+    let roughness = max(mix(mat_a.roughness, mat_b.roughness, bw), 0.04);
+
     let color_rgb565 = (packed_g >> 16u) & 0xFFFFu;
-    var albedo = mat.base_color.rgb;
+    var albedo = base_color;
     if color_rgb565 != 0u {
         let cr5 = color_rgb565 & 0x1Fu;
         let cg6 = (color_rgb565 >> 5u) & 0x3Fu;
         let cb5 = (color_rgb565 >> 11u) & 0x1Fu;
         albedo = vec3<f32>(f32(cr5) / 31.0, f32(cg6) / 63.0, f32(cb5) / 31.0);
     }
-    let metallic = mat.metallic;
-    let roughness = max(mat.roughness, 0.04);
 
     // View direction.
     let V = normalize(camera.position.xyz - world_pos);
@@ -469,8 +479,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ambient_specular = ms_irradiance * F_env * ao;
     let ambient = ambient_diffuse + ambient_specular;
 
-    // Emission.
-    let emission = mat.base_color.rgb * mat.emission_strength;
+    // Emission — use the albedo (which already reflects voxel color /
+    // material base_color) scaled by the primary/secondary blended emission.
+    let emission_strength = mix(mat_a.emission_strength, mat_b.emission_strength, bw);
+    let emission = albedo * emission_strength;
 
     var final_color = lo + ambient + emission;
 

@@ -52,10 +52,11 @@ struct RkpGpuObject {
 @group(0) @binding(3) var<uniform> camera: CameraUniforms;
 
 struct VertexIn {
-    @location(0) position:    vec3<f32>,
-    @location(1) normal:      vec3<f32>,
-    @location(2) color:       u32,
-    @location(3) material_id: u32,
+    @location(0) position:      vec3<f32>,
+    @location(1) normal:        vec3<f32>,
+    @location(2) color:         u32,
+    @location(3) material_pack: u32,  // primary(lo16) | secondary(hi16)
+    @location(4) blend_weight:  u32,  // 0..=255 in low byte
 }
 
 struct VertexOut {
@@ -63,9 +64,10 @@ struct VertexOut {
     @location(0) world_pos:     vec3<f32>,
     @location(1) world_normal:  vec3<f32>,
     @location(2) color:         vec3<f32>,
-    @location(3) @interpolate(flat) material_id:     u32,
-    @location(4) @interpolate(flat) object_id:       u32,
-    @location(5) @interpolate(flat) obj_material_id: u32,
+    @location(3) @interpolate(flat) material_pack:   u32,  // primary | secondary << 16
+    @location(4) @interpolate(flat) blend_weight:    u32,
+    @location(5) @interpolate(flat) object_id:       u32,
+    @location(6) @interpolate(flat) obj_material_id: u32,
 }
 
 // ----- Vertex -----
@@ -75,10 +77,10 @@ struct VertexOut {
 fn vs_main(v: VertexIn, @builtin(instance_index) inst: u32) -> VertexOut {
     let obj = objects[inst];
     let world_pos4 = obj.world * vec4<f32>(v.position, 1.0);
-    // Upper-left 3x3 for normal transform — uniform scale is assumed for
-    // Phase 1 so this is correct. Non-uniform scale will need the transposed
-    // inverse (we already store `inverse_world` on the object; Phase 2 tweak).
-    let world_n = normalize((obj.world * vec4<f32>(v.normal, 0.0)).xyz);
+    // Normals transform by the transposed inverse of the world matrix —
+    // correct even under non-uniform scale. `obj.inverse_world` is already
+    // precomputed on CPU for the raymarch, we reuse it here.
+    let world_n = normalize((transpose(obj.inverse_world) * vec4<f32>(v.normal, 0.0)).xyz);
 
     var out: VertexOut;
     out.clip_pos     = camera.view_proj * world_pos4;
@@ -89,7 +91,8 @@ fn vs_main(v: VertexIn, @builtin(instance_index) inst: u32) -> VertexOut {
         f32((v.color >> 8u) & 0xFFu) / 255.0,
         f32((v.color >> 16u) & 0xFFu) / 255.0,
     );
-    out.material_id     = v.material_id & 0xFFFFu;
+    out.material_pack   = v.material_pack;
+    out.blend_weight    = v.blend_weight & 0xFFu;
     out.object_id       = obj.object_id;
     out.obj_material_id = obj.material_id & 0xFFFFu;
     return out;
@@ -121,16 +124,18 @@ fn fs_main(in: VertexOut) -> FragOut {
     //   r: primary_id(lo16) | secondary_id(hi16)
     //   g: blend(lo8) | (object_id+1)(bits 8-15) | color_rgb565(hi16)
     //
-    // If the voxel's baked material is 0, fall back to the object's override
-    // material_id — this matches the compute march's behavior and makes the
-    // editor's AssignMaterial command work for mesh-backed objects without
-    // re-voxelizing.
+    // If the voxel's baked primary material is 0, fall back to the object's
+    // override material_id — this matches the compute march's behavior and
+    // makes the editor's AssignMaterial command work for mesh-backed objects
+    // without re-voxelizing.
     //
     // Note the `+ 1` on object_id — 0 means "no hit" in the picker / shade
     // pass, so objects are offset by one.
-    let effective_mat_id = select(in.obj_material_id, in.material_id, in.material_id != 0u);
-    let packed_r = effective_mat_id & 0xFFFFu; // no secondary in Phase 3 simple
-    let packed_g = 0u                                         // blend = 0
+    let primary_in = in.material_pack & 0xFFFFu;
+    let secondary_in = (in.material_pack >> 16u) & 0xFFFFu;
+    let effective_primary = select(in.obj_material_id, primary_in, primary_in != 0u);
+    let packed_r = effective_primary | (secondary_in << 16u);
+    let packed_g = (in.blend_weight & 0xFFu)                  // blend weight
                  | (((in.object_id + 1u) & 0xFFu) << 8u)      // object_id+1
                  | (color_rgb565 << 16u);                     // RGB565 color
 

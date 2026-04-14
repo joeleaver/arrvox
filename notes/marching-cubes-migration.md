@@ -311,19 +311,23 @@ Single mat per vertex.
 `(primary_mat, secondary_mat, blend_weight)`. Fragment shader looks up both,
 blends. Adds 6 bytes per vertex.
 
-### Glass / transparent rendering
+### Glass / transparent rendering — DEFERRED
 
-Add a second draw call after opaque triangles:
-- Sort transparent meshes back-to-front per-frame
-- Render with `BlendState::ALPHA_BLENDING`
-- Reads same shading inputs but writes to a transparent overlay
+Proper forward transparency in a deferred pipeline is significant work
+(separate pass, back-to-front sort, HDR scene-color readback, fragment
+does PBR inline) for rendering a single rare material (`glass.rkmat`,
+opacity 0.3 — per CLAUDE.md, "the march's accumulation code path is
+essentially dead code"). The current shade pass doesn't reference
+`mat.opacity` at all, so even the march renders glass as opaque today.
+Revisit only when an actual glass scene surfaces.
 
 ### Phase 3 acceptance
 
-- Voxel colors visible on triangle surface
-- Materials look correct (PBR shading with right roughness/metallic)
-- Glass renders as semi-transparent
-- Visual parity with the old march in test scenes
+- Voxel colors visible on triangle surface ✓
+- Materials look correct (PBR shading with right roughness/metallic) ✓
+- Dual-material blending between primary + secondary materials ✓
+- Glass renders as semi-transparent — DEFERRED (see above)
+- Visual parity with the old march in test scenes ✓
 
 ---
 

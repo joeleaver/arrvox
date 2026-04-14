@@ -16,15 +16,16 @@ use bytemuck::{Pod, Zeroable};
 use rkp_core::ExtractedMesh;
 use std::collections::HashMap;
 
-/// Vertex layout for the triangle G-buffer pass. 32 bytes.
+/// Vertex layout for the triangle G-buffer pass. 36 bytes.
 ///
 /// Layout mirrored in `shaders/triangle_gbuffer.wgsl`:
 /// ```wgsl
 /// struct VertexIn {
-///   @location(0) position:    vec3<f32>,
-///   @location(1) normal:      vec3<f32>,
-///   @location(2) color:       u32,
-///   @location(3) material_id: u32,
+///   @location(0) position:      vec3<f32>,
+///   @location(1) normal:        vec3<f32>,
+///   @location(2) color:         u32,
+///   @location(3) material_pack: u32,  // primary(lo16) | secondary(hi16)
+///   @location(4) blend_weight:  u32,  // 0..=255 in low byte (0=primary only)
 /// }
 /// ```
 #[repr(C)]
@@ -34,18 +35,21 @@ pub struct MeshVertex {
     pub normal: [f32; 3],
     /// Packed R8G8B8 | intensity (same format as `VoxelPool::color`).
     pub color: u32,
-    /// Material palette id. u32 for shader alignment; upper 16 bits are zero.
-    pub material_id: u32,
+    /// Primary material id in low 16 bits, secondary in high 16 bits.
+    pub material_pack: u32,
+    /// Blend weight in low 8 bits (0 = primary only, 255 = pure secondary).
+    pub blend_weight: u32,
 }
 
 impl MeshVertex {
     /// `wgpu::VertexBufferLayout` for creating the render pipeline.
     pub fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
-        static ATTRS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+        static ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
             0 => Float32x3,  // position
             1 => Float32x3,  // normal
             2 => Uint32,     // color
-            3 => Uint32,     // material_id
+            3 => Uint32,     // material_pack (primary | secondary << 16)
+            4 => Uint32,     // blend_weight (0..255 in low byte)
         ];
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<MeshVertex>() as u64,
@@ -155,17 +159,19 @@ impl MeshPool {
 
         // Copy vertex data into the allocated range.
         let vbase = vertex_start as usize;
-        for (i, (&pos, (&nrm, (&col, &mat)))) in mesh
-            .positions
-            .iter()
-            .zip(mesh.normals.iter().zip(mesh.colors.iter().zip(mesh.material_ids.iter())))
-            .enumerate()
-        {
+        for i in 0..vertex_count as usize {
+            let pos = mesh.positions[i];
+            let nrm = mesh.normals[i];
+            let col = mesh.colors[i];
+            let primary = mesh.material_ids[i] as u32 & 0xFFFF;
+            let secondary = mesh.secondary_material_ids[i] as u32 & 0xFFFF;
+            let blend = mesh.blend_weights[i] as u32;
             self.vertices[vbase + i] = MeshVertex {
                 position: pos.into(),
                 normal: nrm.into(),
                 color: col,
-                material_id: mat as u32,
+                material_pack: primary | (secondary << 16),
+                blend_weight: blend,
             };
         }
 
@@ -360,14 +366,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mesh_vertex_is_32_bytes() {
-        assert_eq!(std::mem::size_of::<MeshVertex>(), 32);
+    fn mesh_vertex_is_36_bytes() {
+        assert_eq!(std::mem::size_of::<MeshVertex>(), 36);
     }
 
     #[test]
-    fn vertex_layout_has_four_attrs() {
+    fn vertex_layout_has_five_attrs() {
         let layout = MeshVertex::vertex_layout();
-        assert_eq!(layout.array_stride, 32);
-        assert_eq!(layout.attributes.len(), 4);
+        assert_eq!(layout.array_stride, 36);
+        assert_eq!(layout.attributes.len(), 5);
     }
 }

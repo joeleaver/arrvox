@@ -3,15 +3,18 @@
 //! Produces a standard indexed triangle mesh from the trilinearly-interpolated
 //! opacity field. The surface is where opacity crosses [`THRESHOLD`].
 //!
-//! This is the Phase 1-3 implementation per `notes/marching-cubes-migration.md`:
+//! This is the Phase 1-3.5 implementation per `notes/marching-cubes-migration.md`:
 //! - No vertex sharing — 3 unique verts per triangle (Phase 5 optimization).
 //! - Normals derived from a 6-tap central difference of the trilinearly-
 //!   interpolated opacity field at each MC vertex (Phase 2).
 //! - Colors lerped along the MC edge with the same `t` used to place the
 //!   vertex — `color = lerp(color_A, color_B, t)` in linear RGB (Phase 3).
-//! - Materials picked from the "inside" (above-threshold) corner (Phase 3
-//!   simple; Phase 3.5 adds dual-material blending with per-vertex (primary,
-//!   secondary, blend_weight)).
+//! - Dual-material blending (Phase 3.5): each vertex carries (primary_mat,
+//!   secondary_mat, blend_weight). Primary/secondary ids pick from the
+//!   inside (above-threshold) corner; the per-voxel blend_weight is lerped
+//!   along the edge so seams between distinctly-blended voxels get a smooth
+//!   material transition. Falls back cleanly to single-material rendering
+//!   when secondary == 0 and blend_weight == 0.
 //! - Active cells found by expanding each leaf's lower corner into its 8 adjacent
 //!   cells — correct for depth-`max_depth` leaves. Coarse (LOD) leaves miss their
 //!   far-face boundaries (Phase 5 LOD expansion).
@@ -49,6 +52,10 @@ pub struct ExtractedMesh {
     pub colors: Vec<u32>,
     /// Primary material id per vertex.
     pub material_ids: Vec<u16>,
+    /// Secondary material id per vertex (0 when unused).
+    pub secondary_material_ids: Vec<u16>,
+    /// Per-vertex blend weight: 0 = pure primary, 255 = pure secondary.
+    pub blend_weights: Vec<u8>,
     pub indices: Vec<u32>,
 }
 
@@ -166,50 +173,72 @@ pub fn extract_mesh(octree: &SparseOctree, pool: &VoxelPool) -> ExtractedMesh {
 
     // 3. Process each active cell through MC.
     for cell in active_cells {
-        let (corners, mats, colors) = sample_cell(octree, pool, cell);
+        let sample = sample_cell(octree, pool, cell);
         emit_cell_triangles(
-            cell, &corners, &mats, &colors, base_vs, half_extent, octree, pool, &mut mesh,
+            cell, &sample, base_vs, half_extent, octree, pool, &mut mesh,
         );
     }
 
     mesh
 }
 
-/// Sample the 8 corners of a cell. Returns (opacity, material_id, packed_color)
-/// per corner.
-fn sample_cell(
-    octree: &SparseOctree,
-    pool: &VoxelPool,
-    cell: UVec3,
-) -> ([f32; 8], [u16; 8], [u32; 8]) {
-    let mut opacity = [0.0f32; 8];
-    let mut mats = [0u16; 8];
-    let mut colors = [0u32; 8];
+/// Per-cell corner samples. Each array is indexed 0..8 by Paul-Bourke corner.
+struct CellSample {
+    opacity: [f32; 8],
+    primary_mat: [u16; 8],
+    secondary_mat: [u16; 8],
+    /// 0..=255, meaning 0.0..=1.0 blend toward secondary.
+    blend_weight: [u8; 8],
+    color: [u32; 8],
+}
+
+/// Sample the 8 corners of a cell.
+fn sample_cell(octree: &SparseOctree, pool: &VoxelPool, cell: UVec3) -> CellSample {
+    let mut s = CellSample {
+        opacity: [0.0; 8],
+        primary_mat: [0; 8],
+        secondary_mat: [0; 8],
+        blend_weight: [0; 8],
+        color: [0; 8],
+    };
     for i in 0..8 {
         let off = CORNER_OFFSETS[i];
         let c = UVec3::new(cell.x + off[0], cell.y + off[1], cell.z + off[2]);
-        let (op, mat, col) = sample_corner(octree, pool, c);
-        opacity[i] = op;
-        mats[i] = mat;
-        colors[i] = col;
+        let (op, pm, sm, bw, col) = sample_corner(octree, pool, c);
+        s.opacity[i] = op;
+        s.primary_mat[i] = pm;
+        s.secondary_mat[i] = sm;
+        s.blend_weight[i] = bw;
+        s.color[i] = col;
     }
-    (opacity, mats, colors)
+    s
 }
 
-/// Resolve (opacity, material_id, color) at a voxel coordinate. OOB / EMPTY
-/// gives zero; INTERIOR gives 1.0 opacity with material 0.
+/// Resolve all material/color data at a voxel coordinate. OOB / EMPTY / INTERIOR
+/// have no associated voxel data — they return zero for everything except
+/// opacity (INTERIOR is 1.0).
 #[inline]
-fn sample_corner(octree: &SparseOctree, pool: &VoxelPool, coord: UVec3) -> (f32, u16, u32) {
+fn sample_corner(
+    octree: &SparseOctree,
+    pool: &VoxelPool,
+    coord: UVec3,
+) -> (f32, u16, u16, u8, u32) {
     match octree.lookup(coord) {
-        None => (0.0, 0, 0),
-        Some(EMPTY_NODE) => (0.0, 0, 0),
-        Some(INTERIOR_NODE) => (1.0, 0, 0),
+        None => (0.0, 0, 0, 0, 0),
+        Some(EMPTY_NODE) => (0.0, 0, 0, 0, 0),
+        Some(INTERIOR_NODE) => (1.0, 0, 0, 0, 0),
         Some(node) if is_leaf(node) => {
             let slot = leaf_slot(node);
             let v = pool.get(slot);
-            (v.opacity_f32(), v.material_id(), pool.color(slot))
+            (
+                v.opacity_f32(),
+                v.material_id(),
+                v.secondary_material_id(),
+                v.blend_weight(),
+                pool.color(slot),
+            )
         }
-        _ => (0.0, 0, 0),
+        _ => (0.0, 0, 0, 0, 0),
     }
 }
 
@@ -218,12 +247,9 @@ fn sample_corner(octree: &SparseOctree, pool: &VoxelPool, coord: UVec3) -> (f32,
 /// `base_vs` and `half_extent` convert octree voxel-coord space to object-
 /// local world units: `local = coord * base_vs − half_extent`. `octree` and
 /// `pool` are passed through so we can compute per-vertex gradient normals.
-#[allow(clippy::too_many_arguments)]
 fn emit_cell_triangles(
     cell: UVec3,
-    opacity: &[f32; 8],
-    mats: &[u16; 8],
-    colors: &[u32; 8],
+    s: &CellSample,
     base_vs: f32,
     half_extent: f32,
     octree: &SparseOctree,
@@ -234,7 +260,7 @@ fn emit_cell_triangles(
     // (opacity >= THRESHOLD).
     let mut cube_index = 0u8;
     for i in 0..8 {
-        if opacity[i] >= THRESHOLD {
+        if s.opacity[i] >= THRESHOLD {
             cube_index |= 1 << i;
         }
     }
@@ -251,14 +277,16 @@ fn emit_cell_triangles(
     let cell_vox = Vec3::new(cell.x as f32, cell.y as f32, cell.z as f32);
     let mut edge_verts_vox = [Vec3::ZERO; 12];
     let mut edge_normals = [Vec3::Y; 12];
-    let mut edge_mats = [0u16; 12];
+    let mut edge_primary_mats = [0u16; 12];
+    let mut edge_secondary_mats = [0u16; 12];
+    let mut edge_blend_weights = [0u8; 12];
     let mut edge_colors = [0u32; 12];
     for e in 0..12 {
         if edge_mask & (1 << e) == 0 {
             continue;
         }
         let [a, b] = EDGE_ENDPOINTS[e];
-        let t = interp_t(opacity[a], opacity[b]);
+        let t = interp_t(s.opacity[a], s.opacity[b]);
         let pa = cell_vox
             + Vec3::new(
                 CORNER_OFFSETS[a][0] as f32,
@@ -273,13 +301,23 @@ fn emit_cell_triangles(
             );
         edge_verts_vox[e] = pa + (pb - pa) * t;
         edge_normals[e] = gradient_normal(edge_verts_vox[e], octree, pool);
-        // Material: pick from the inside (above-threshold) corner (Phase 3
-        // simple — Phase 3.5 adds dual-material blending).
-        let inside = if opacity[a] >= THRESHOLD { a } else { b };
-        edge_mats[e] = mats[inside];
+        // Material ids: pick the pair from the inside (above-threshold)
+        // corner. Phase 3.5 treats the pair as fixed per voxel and only
+        // lerps the blend weight along the MC edge. Hard transitions in
+        // mat pairs only occur between neighboring voxels with different
+        // pairs — Phase 5 dual contouring can soften that.
+        let inside = if s.opacity[a] >= THRESHOLD { a } else { b };
+        edge_primary_mats[e] = s.primary_mat[inside];
+        edge_secondary_mats[e] = s.secondary_mat[inside];
+        // Blend weight: lerp the two per-voxel blends so a surface between
+        // voxels with authored-different blends transitions smoothly.
+        let bw_a = s.blend_weight[a] as f32;
+        let bw_b = s.blend_weight[b] as f32;
+        let bw = (bw_a * (1.0 - t) + bw_b * t).round().clamp(0.0, 255.0) as u8;
+        edge_blend_weights[e] = bw;
         // Color: lerp both endpoints in linear RGB. Matches the t used to
         // place the vertex, so a textured surface transitions smoothly.
-        edge_colors[e] = lerp_packed_color(colors[a], colors[b], t);
+        edge_colors[e] = lerp_packed_color(s.color[a], s.color[b], t);
     }
 
     // Emit triangles from MC_TRI_TABLE. Each entry is a list of edge indices,
@@ -298,7 +336,9 @@ fn emit_cell_triangles(
             mesh.positions.push(local_pos);
             mesh.normals.push(edge_normals[e]);
             mesh.colors.push(edge_colors[e]);
-            mesh.material_ids.push(edge_mats[e]);
+            mesh.material_ids.push(edge_primary_mats[e]);
+            mesh.secondary_material_ids.push(edge_secondary_mats[e]);
+            mesh.blend_weights.push(edge_blend_weights[e]);
         }
         mesh.indices.push(base);
         mesh.indices.push(base + 1);
@@ -983,6 +1023,40 @@ mod tests {
         assert!(!mesh.is_empty());
         for &c in &mesh.colors {
             assert_eq!(c & 0xFF, 0xFF, "expected R=255 on every vertex, got {c:#x}");
+        }
+    }
+
+    #[test]
+    fn mc_vertex_carries_secondary_and_blend() {
+        // A voxel with dual-material blending should carry primary, secondary,
+        // and blend_weight through extraction onto every MC vertex it
+        // generates (material pair is taken from the inside corner).
+        let mut octree = SparseOctree::new(3, 1.0);
+        let mut pool = VoxelPool::new(16);
+        let slot = pool.allocate().unwrap();
+        *pool.get_mut(slot) = SplatVoxel::new_blended(1.0, 10, 20, 128);
+        octree.insert(UVec3::new(2, 2, 2), slot);
+
+        let mesh = extract_mesh(&octree, &pool);
+        assert!(!mesh.is_empty());
+        assert_eq!(mesh.material_ids.len(), mesh.positions.len());
+        assert_eq!(mesh.secondary_material_ids.len(), mesh.positions.len());
+        assert_eq!(mesh.blend_weights.len(), mesh.positions.len());
+
+        // Every vertex should carry material pair (10, 20) since the inside
+        // corner for every active cell is voxel (2,2,2). Blend weights lerp
+        // between that voxel's 128 and neighbor 0, so they'll be 0..128.
+        for (i, (&p, &s)) in mesh
+            .material_ids
+            .iter()
+            .zip(mesh.secondary_material_ids.iter())
+            .enumerate()
+        {
+            assert_eq!(p, 10, "primary mismatch at vertex {i}");
+            assert_eq!(s, 20, "secondary mismatch at vertex {i}");
+        }
+        for (i, &bw) in mesh.blend_weights.iter().enumerate() {
+            assert!(bw <= 128, "blend_weight[{i}] = {bw} above max seed 128");
         }
     }
 
