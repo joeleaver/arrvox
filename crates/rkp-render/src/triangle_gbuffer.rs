@@ -133,10 +133,14 @@ impl TriangleGBufferPass {
 
     /// Record a render pass writing the G-buffer for all supplied draws.
     ///
-    /// The depth attachment is cleared to 1.0 before any draw — subsequent
-    /// frames don't inherit stale depth. The color attachments use `Load`
-    /// because the compute march has already written the rest of the scene;
-    /// triangles override only their own pixels.
+    /// The depth attachment is always cleared to 1.0 at the start — depth
+    /// doesn't persist across frames.
+    ///
+    /// `clear_gbuffer` controls the color attachment load op: `true` clears
+    /// (used when no other pass writes the G-buffer — e.g. `mesh_only_mode`
+    /// skipping the compute march), `false` loads (the default during the
+    /// A/B transition when the march writes first and triangles overwrite).
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -144,11 +148,17 @@ impl TriangleGBufferPass {
         gbuffer: &rkf_render::GBuffer,
         mesh_pool: &MeshPool,
         draws: &[MeshDraw],
+        clear_gbuffer: bool,
     ) {
-        if draws.is_empty() {
+        if draws.is_empty() && !clear_gbuffer {
             return;
         }
 
+        let color_load = if clear_gbuffer {
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+        } else {
+            wgpu::LoadOp::Load
+        };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("triangle_gbuffer"),
             color_attachments: &[
@@ -157,7 +167,7 @@ impl TriangleGBufferPass {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
+                        load: color_load,
                         store: wgpu::StoreOp::Store,
                     },
                 }),
@@ -166,7 +176,7 @@ impl TriangleGBufferPass {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
+                        load: color_load,
                         store: wgpu::StoreOp::Store,
                     },
                 }),
@@ -175,7 +185,10 @@ impl TriangleGBufferPass {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
+                        // Material is Rg32Uint — wgpu's Color::TRANSPARENT
+                        // (zeroes) maps to (0,0) uint, which is correct for
+                        // "no hit" (object_id offset by +1 in shading).
+                        load: color_load,
                         store: wgpu::StoreOp::Store,
                     },
                 }),

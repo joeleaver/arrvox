@@ -28,6 +28,11 @@ pub struct RkpRenderer {
     pub triangle: TriangleGBufferPass,
     /// GPU vertex/index storage for extracted marching-cubes meshes.
     pub mesh_pool: MeshPool,
+    /// Debug toggle: when true, skip the compute march entirely and render
+    /// ONLY from the triangle pass. Default: `true` iff `RKP_MESH_ONLY=1` was
+    /// set in the environment at startup. Useful for A/B comparison during
+    /// the Phase-4 cut-over.
+    pub mesh_only_mode: bool,
     /// Half-res screen-space ambient occlusion compute pass.
     pub ssao: RkpSsaoPass,
     /// Deferred PBR shading compute pass.
@@ -108,6 +113,13 @@ impl RkpRenderer {
         let mut god_rays = RkpGodRayPass::new(device, width, height);
         god_rays.set_input(device, &volumetric.output_view);
 
+        let mesh_only_mode = std::env::var("RKP_MESH_ONLY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if mesh_only_mode {
+            eprintln!("[rkp-renderer] RKP_MESH_ONLY=1 — compute march disabled, rendering triangle pass only");
+        }
+
         Self {
             scene, march, triangle, mesh_pool, ssao, shade, atmosphere, volumetric, god_rays,
             shade_params_buffer, lights_buffer, materials_buffer,
@@ -115,6 +127,7 @@ impl RkpRenderer {
             device: device.clone(),
             profiler, timestamp_period,
             width, height,
+            mesh_only_mode,
         }
     }
 
@@ -177,22 +190,28 @@ impl RkpRenderer {
         }
 
         // 1. Octree ray march → G-buffer + per-light shadow texture.
-        self.march.clear_stats(encoder);
-        {
-            let q = self.profiler.begin_query("march", encoder);
-            self.march.dispatch(
-                encoder, queue, &self.scene.bind_group,
-                object_count, width, height, 0,
-                shadow_steps, num_lights, None,
-            );
-            self.profiler.end_query(encoder, q);
+        //    Skipped in mesh-only debug mode — the triangle pass below
+        //    clears the G-buffer itself in that case.
+        if !self.mesh_only_mode {
+            self.march.clear_stats(encoder);
+            {
+                let q = self.profiler.begin_query("march", encoder);
+                self.march.dispatch(
+                    encoder, queue, &self.scene.bind_group,
+                    object_count, width, height, 0,
+                    shadow_steps, num_lights, None,
+                );
+                self.profiler.end_query(encoder, q);
+            }
+            self.march.copy_stats(encoder);
         }
-        self.march.copy_stats(encoder);
 
-        // 1b. Triangle G-buffer pass — rasterize mesh-backed objects. Runs
-        //     after the march so mesh pixels overwrite march pixels via
-        //     depth test. No-ops if no objects have extracted meshes yet.
-        if !mesh_draws.is_empty() {
+        // 1b. Triangle G-buffer pass — rasterize mesh-backed objects. In
+        //     the default (A/B) mode this overwrites march pixels via depth
+        //     test. In mesh-only mode this pass OWNS the G-buffer: it
+        //     clears before drawing, and always runs (even with no draws)
+        //     so downstream passes see a clean surface.
+        if self.mesh_only_mode || !mesh_draws.is_empty() {
             let q = self.profiler.begin_query("triangle", encoder);
             self.triangle.dispatch(
                 encoder,
@@ -200,6 +219,7 @@ impl RkpRenderer {
                 gbuffer,
                 &self.mesh_pool,
                 mesh_draws,
+                self.mesh_only_mode,
             );
             self.profiler.end_query(encoder, q);
         }

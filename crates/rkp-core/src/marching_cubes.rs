@@ -3,9 +3,10 @@
 //! Produces a standard indexed triangle mesh from the trilinearly-interpolated
 //! opacity field. The surface is where opacity crosses [`THRESHOLD`].
 //!
-//! This is the naive Phase 1 implementation per `notes/marching-cubes-migration.md`:
+//! This is the Phase 1+2 implementation per `notes/marching-cubes-migration.md`:
 //! - No vertex sharing — 3 unique verts per triangle (Phase 5 optimization).
-//! - Normals are placeholder `Vec3::Y` (Phase 2 fills them from opacity gradient).
+//! - Normals derived from a 6-tap central difference of the trilinearly-
+//!   interpolated opacity field at each MC vertex (Phase 2, landed).
 //! - Colors / materials from nearest inside corner (Phase 3 upgrades to lerp + blend).
 //! - Active cells found by expanding each leaf's lower corner into its 8 adjacent
 //!   cells — correct for depth-`max_depth` leaves. Coarse (LOD) leaves miss their
@@ -162,7 +163,9 @@ pub fn extract_mesh(octree: &SparseOctree, pool: &VoxelPool) -> ExtractedMesh {
     // 3. Process each active cell through MC.
     for cell in active_cells {
         let (corners, mats, colors) = sample_cell(octree, pool, cell);
-        emit_cell_triangles(cell, &corners, &mats, &colors, base_vs, half_extent, &mut mesh);
+        emit_cell_triangles(
+            cell, &corners, &mats, &colors, base_vs, half_extent, octree, pool, &mut mesh,
+        );
     }
 
     mesh
@@ -209,7 +212,9 @@ fn sample_corner(octree: &SparseOctree, pool: &VoxelPool, coord: UVec3) -> (f32,
 /// Run MC on one cell, append triangles to `mesh`.
 ///
 /// `base_vs` and `half_extent` convert octree voxel-coord space to object-
-/// local world units: `local = coord * base_vs − half_extent`.
+/// local world units: `local = coord * base_vs − half_extent`. `octree` and
+/// `pool` are passed through so we can compute per-vertex gradient normals.
+#[allow(clippy::too_many_arguments)]
 fn emit_cell_triangles(
     cell: UVec3,
     opacity: &[f32; 8],
@@ -217,6 +222,8 @@ fn emit_cell_triangles(
     colors: &[u32; 8],
     base_vs: f32,
     half_extent: f32,
+    octree: &SparseOctree,
+    pool: &VoxelPool,
     mesh: &mut ExtractedMesh,
 ) {
     // Build the 8-bit cube index: bit i set iff corner i is "inside"
@@ -234,12 +241,12 @@ fn emit_cell_triangles(
     }
 
     // Compute vertex positions on the 12 edges (only those with crossings).
-    // Positions are produced directly in object-local world units via the
-    // `coord * base_vs − half_extent` transform applied to every corner.
+    // We keep them in octree voxel-index space through gradient sampling
+    // and convert to object-local world units only at emit time.
     let offset = Vec3::splat(half_extent);
-    let cell_f = Vec3::new(cell.x as f32, cell.y as f32, cell.z as f32) * base_vs - offset;
-    let step = base_vs;
-    let mut edge_verts = [Vec3::ZERO; 12];
+    let cell_vox = Vec3::new(cell.x as f32, cell.y as f32, cell.z as f32);
+    let mut edge_verts_vox = [Vec3::ZERO; 12];
+    let mut edge_normals = [Vec3::Y; 12];
     let mut edge_mats = [0u16; 12];
     let mut edge_colors = [0u32; 12];
     for e in 0..12 {
@@ -248,19 +255,20 @@ fn emit_cell_triangles(
         }
         let [a, b] = EDGE_ENDPOINTS[e];
         let t = interp_t(opacity[a], opacity[b]);
-        let pa = cell_f
+        let pa = cell_vox
             + Vec3::new(
                 CORNER_OFFSETS[a][0] as f32,
                 CORNER_OFFSETS[a][1] as f32,
                 CORNER_OFFSETS[a][2] as f32,
-            ) * step;
-        let pb = cell_f
+            );
+        let pb = cell_vox
             + Vec3::new(
                 CORNER_OFFSETS[b][0] as f32,
                 CORNER_OFFSETS[b][1] as f32,
                 CORNER_OFFSETS[b][2] as f32,
-            ) * step;
-        edge_verts[e] = pa + (pb - pa) * t;
+            );
+        edge_verts_vox[e] = pa + (pb - pa) * t;
+        edge_normals[e] = gradient_normal(edge_verts_vox[e], octree, pool);
         // Pick attributes from the inside corner (Phase 3 will lerp both).
         let inside = if opacity[a] >= THRESHOLD { a } else { b };
         edge_mats[e] = mats[inside];
@@ -278,8 +286,10 @@ fn emit_cell_triangles(
         let base = mesh.positions.len() as u32;
 
         for &e in &[e0, e1, e2] {
-            mesh.positions.push(edge_verts[e]);
-            mesh.normals.push(Vec3::Y); // Phase 1 placeholder
+            // voxel-index → object-local world units.
+            let local_pos = edge_verts_vox[e] * base_vs - offset;
+            mesh.positions.push(local_pos);
+            mesh.normals.push(edge_normals[e]);
             mesh.colors.push(edge_colors[e]);
             mesh.material_ids.push(edge_mats[e]);
         }
@@ -288,6 +298,69 @@ fn emit_cell_triangles(
         mesh.indices.push(base + 2);
         i += 3;
     }
+}
+
+/// Trilinear interpolation of the opacity field at a voxel-index-space
+/// position. Samples the 8 surrounding integer voxel corners via
+/// [`sample_corner`] and blends by fractional offset.
+///
+/// Negative coordinates are treated as opacity 0 (outside the octree grid).
+fn sample_opacity_at(pos: Vec3, octree: &SparseOctree, pool: &VoxelPool) -> f32 {
+    let fx = pos.x.floor();
+    let fy = pos.y.floor();
+    let fz = pos.z.floor();
+    let tx = pos.x - fx;
+    let ty = pos.y - fy;
+    let tz = pos.z - fz;
+    let bx = fx as i64;
+    let by = fy as i64;
+    let bz = fz as i64;
+
+    let mut sum = 0.0f32;
+    for dz in 0..2i64 {
+        let wz = if dz == 0 { 1.0 - tz } else { tz };
+        for dy in 0..2i64 {
+            let wy = if dy == 0 { 1.0 - ty } else { ty };
+            for dx in 0..2i64 {
+                let wx = if dx == 0 { 1.0 - tx } else { tx };
+                let cx = bx + dx;
+                let cy = by + dy;
+                let cz = bz + dz;
+                let opacity = if cx < 0 || cy < 0 || cz < 0 {
+                    0.0
+                } else {
+                    sample_corner(octree, pool, UVec3::new(cx as u32, cy as u32, cz as u32)).0
+                };
+                sum += opacity * wx * wy * wz;
+            }
+        }
+    }
+    sum
+}
+
+/// Compute the outward surface normal at `pos` (voxel-index space) as the
+/// negated unit gradient of the trilinear opacity field, using a 6-tap
+/// central difference with step = half a voxel.
+///
+/// Returns `Vec3::Y` for degenerate cases where the gradient magnitude is
+/// effectively zero — rare, only hits on perfectly uniform neighborhoods
+/// where the MC vertex shouldn't have been emitted anyway.
+fn gradient_normal(pos: Vec3, octree: &SparseOctree, pool: &VoxelPool) -> Vec3 {
+    let h = 0.5;
+    let gx = sample_opacity_at(pos + Vec3::new(h, 0.0, 0.0), octree, pool)
+        - sample_opacity_at(pos - Vec3::new(h, 0.0, 0.0), octree, pool);
+    let gy = sample_opacity_at(pos + Vec3::new(0.0, h, 0.0), octree, pool)
+        - sample_opacity_at(pos - Vec3::new(0.0, h, 0.0), octree, pool);
+    let gz = sample_opacity_at(pos + Vec3::new(0.0, 0.0, h), octree, pool)
+        - sample_opacity_at(pos - Vec3::new(0.0, 0.0, h), octree, pool);
+    let grad = Vec3::new(gx, gy, gz);
+    let len2 = grad.length_squared();
+    if len2 < 1e-16 {
+        return Vec3::Y;
+    }
+    // Gradient points from low to high opacity (outside → inside).
+    // Outward surface normal is the opposite.
+    -grad / len2.sqrt()
 }
 
 /// Linear interpolation parameter on an edge. Given corner opacities `oa` and
@@ -740,6 +813,85 @@ mod tests {
         let mesh = extract_mesh(&octree, &pool);
         assert_eq!(mesh.indices.len() % 3, 0);
         assert_eq!(mesh.triangle_count(), mesh.indices.len() / 3);
+    }
+
+    #[test]
+    fn single_voxel_normals_point_outward() {
+        // Octree voxels are POINT SAMPLES at integer coords, not unit cubes.
+        // The sample at (2,2,2) with base_vs=1 sits at local (2,2,2)·1 −
+        // half_extent(4) = (−2,−2,−2). A lone opacity=1 sample creates a
+        // 6-faced isosurface whose vertices are at sample ± 0.5 along each
+        // axis. Every normal should point outward from the sample point.
+        let (octree, pool) = single_voxel(3, UVec3::new(2, 2, 2));
+        let mesh = extract_mesh(&octree, &pool);
+        let sample_local = Vec3::new(-2.0, -2.0, -2.0);
+
+        assert!(!mesh.is_empty());
+        for (i, (&pos, &nrm)) in mesh.positions.iter().zip(mesh.normals.iter()).enumerate() {
+            let len = nrm.length();
+            assert!(
+                (len - 1.0).abs() < 1e-3,
+                "normal[{i}] = {nrm:?} is not unit length (len={len})",
+            );
+            let radial = pos - sample_local;
+            if radial.length_squared() < 1e-8 {
+                continue; // shouldn't happen, but guard against div-by-zero.
+            }
+            let out = radial.normalize();
+            let dot = nrm.dot(out);
+            assert!(
+                dot > 0.1,
+                "normal[{i}] at {pos:?} points inward: nrm={nrm:?}, out={out:?}, dot={dot}",
+            );
+        }
+    }
+
+    #[test]
+    fn sphere_normals_point_outward_from_center() {
+        let depth = 3u8;
+        let extent = 1u32 << depth;
+        let center_vox = Vec3::splat((extent as f32) / 2.0 - 0.5);
+        let radius = 3.0f32;
+        let base_vs = 1.0f32;
+        let half_extent = (extent as f32) * base_vs * 0.5;
+        let center_local = center_vox * base_vs - Vec3::splat(half_extent);
+
+        let mut octree = SparseOctree::new(depth, base_vs);
+        let mut pool = VoxelPool::new(extent.pow(3));
+        for z in 0..extent {
+            for y in 0..extent {
+                for x in 0..extent {
+                    let p = Vec3::new(x as f32, y as f32, z as f32);
+                    if p.distance(center_vox) <= radius {
+                        let slot = pool.allocate().unwrap();
+                        *pool.get_mut(slot) = SplatVoxel::new(1.0, 0);
+                        octree.insert(UVec3::new(x, y, z), slot);
+                    }
+                }
+            }
+        }
+
+        let mesh = extract_mesh(&octree, &pool);
+        assert!(!mesh.is_empty());
+
+        // Majority of normals should point roughly outward from the sphere
+        // center — MC produces discrete-step surface faces, so individual
+        // vertices can deviate (e.g., on a facet edge), but the average dot
+        // product against the radial direction should be strongly positive.
+        let mut dot_sum = 0.0f32;
+        let mut n = 0usize;
+        for (&pos, &nrm) in mesh.positions.iter().zip(mesh.normals.iter()) {
+            assert!(nrm.is_finite());
+            let len = nrm.length();
+            assert!((len - 1.0).abs() < 1e-3 || len == 0.0);
+            let radial = pos - center_local;
+            if radial.length_squared() > 1e-8 {
+                dot_sum += nrm.dot(radial.normalize());
+                n += 1;
+            }
+        }
+        let mean = dot_sum / n as f32;
+        assert!(mean > 0.7, "mean outward dot {mean} too low — normals inverted?");
     }
 
     #[test]
