@@ -9,9 +9,10 @@
 
 use std::collections::HashMap;
 
-use rkp_core::{ExtractedMesh, OctreeHandle, SparseOctree, SplatVoxel, VoxelPool};
+use rkp_core::{OctreeHandle, SparseOctree, SplatVoxel, VoxelPool};
 
 use crate::octree_gpu::OctreeGpu;
+use crate::rkp_scene::GeometryUpload;
 
 /// Face instance for CPU-side face emission (legacy — kept for scene loading compatibility).
 #[repr(C)]
@@ -37,10 +38,6 @@ pub struct AssetLoadResult {
     /// Number of slots actually allocated. May be less than `voxel_count` when
     /// identical (voxel, color) pairs share a slot via dedup.
     pub voxel_slot_count: u32,
-    /// Triangle mesh extracted from the opacity field via marching cubes.
-    /// The caller uploads this to [`MeshPool`](crate::MeshPool) keyed by
-    /// its `object_id` so the triangle raster pass can draw it.
-    pub extracted_mesh: ExtractedMesh,
 }
 
 /// Result of voxelizing a primitive.
@@ -55,10 +52,6 @@ pub struct VoxelizeResult {
     /// Number of slots actually allocated — use this (not `voxel_count`) for
     /// deallocation, since the two can diverge when slots are shared.
     pub voxel_slot_count: u32,
-    /// Triangle mesh extracted from the opacity field via marching cubes.
-    /// The caller uploads this to [`MeshPool`](crate::MeshPool) keyed by
-    /// its `object_id` so the triangle raster pass can draw it.
-    pub extracted_mesh: ExtractedMesh,
 }
 
 /// Emit face instances from an octree into the given buffer.
@@ -202,6 +195,18 @@ impl RkpSceneManager {
     pub fn clear_faces(&mut self) {
         self.pending_faces.clear();
         self.faces_dirty = true;
+    }
+
+    // ── Geometry upload snapshot ──────────────────────────────────────
+
+    /// Build a GeometryUpload snapshot for RkpRenderer.
+    pub fn geometry_upload(&self) -> GeometryUpload<'_> {
+        let octree_data = self.octree.data();
+        GeometryUpload {
+            voxel_pool: self.voxel_pool.as_bytes(),
+            octree_nodes: bytemuck::cast_slice(octree_data),
+            color_pool: self.voxel_pool.color_bytes(),
+        }
     }
 
     // ── Spatial deallocation ─────────────────────────────────────────
@@ -382,29 +387,6 @@ impl RkpSceneManager {
             self.faces_dirty = true;
         }
 
-        // Extract a marching-cubes mesh for the triangle raster pass.
-        let extracted_mesh = rkp_core::extract_mesh(&tree, &self.voxel_pool);
-        let nonzero_colors = extracted_mesh.colors.iter().filter(|&&c| c != 0).count();
-        let nonzero_mats = extracted_mesh.material_ids.iter().filter(|&&m| m != 0).count();
-        let tris = extracted_mesh.triangle_count();
-        let verts = extracted_mesh.vertex_count();
-        let sharing_ratio = if verts > 0 {
-            (tris * 3) as f32 / verts as f32
-        } else {
-            0.0
-        };
-        eprintln!(
-            "[RkpSceneManager] load_rkp extracted mesh: {} tris, {} verts \
-             (sharing {:.2}×, naive would be {}), \
-             {} nonzero colors, {} nonzero materials",
-            tris,
-            verts,
-            sharing_ratio,
-            tris * 3,
-            nonzero_colors,
-            nonzero_mats,
-        );
-
         let spatial = rkf_core::scene_node::SpatialHandle::Octree {
             root_offset: handle.root_offset,
             len: handle.len,
@@ -427,7 +409,6 @@ impl RkpSceneManager {
         Ok(AssetLoadResult {
             spatial, voxel_size, aabb, voxel_count, voxel_slot_start,
             voxel_slot_count: unique_count,
-            extracted_mesh,
         })
     }
 
@@ -511,9 +492,6 @@ impl RkpSceneManager {
         emit_faces(&r.octree, &self.voxel_pool, object_id, &mut self.pending_faces);
         self.faces_dirty = true;
 
-        // Extract MC mesh for the triangle raster pass.
-        let extracted_mesh = rkp_core::extract_mesh(&r.octree, &self.voxel_pool);
-
         // Allocate octree into the GPU allocator.
         let handle = self.octree.allocate(&r.octree);
         let spatial = rkf_core::scene_node::SpatialHandle::Octree {
@@ -531,7 +509,6 @@ impl RkpSceneManager {
             voxel_count: r.voxel_count,
             voxel_slot_start: r.slot_start,
             voxel_slot_count: r.unique_count,
-            extracted_mesh,
         })
     }
 
@@ -557,9 +534,6 @@ impl RkpSceneManager {
         emit_faces(&r.octree, &self.voxel_pool, object_id, &mut self.pending_faces);
         self.faces_dirty = true;
 
-        // Extract MC mesh for the triangle raster pass.
-        let extracted_mesh = rkp_core::extract_mesh(&r.octree, &self.voxel_pool);
-
         let handle = self.octree.allocate(&r.octree);
         let spatial = rkf_core::scene_node::SpatialHandle::Octree {
             root_offset: handle.root_offset,
@@ -575,7 +549,6 @@ impl RkpSceneManager {
             voxel_count: r.voxel_count,
             voxel_slot_start: r.slot_start,
             voxel_slot_count: r.unique_count,
-            extracted_mesh,
         })
     }
 

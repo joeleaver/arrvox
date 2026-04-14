@@ -536,11 +536,10 @@ impl EngineState {
             label: Some("rkp frame"),
         });
 
-        // 1. Geometry-dirty handling. Post-Phase-4 the renderer has no GPU
-        //    voxel/octree buffers — mesh uploads happen via the mesh pool
-        //    at voxelize/load time. We still clear the flag and rebuild
-        //    collider caches when set.
+        // 1. Upload geometry if dirty.
         if self.geometry_dirty {
+            let geo = self.scene_mgr.geometry_upload();
+            self.renderer.upload_geometry(&self.queue, &geo);
             self.geometry_dirty = false;
             self.collider_caches_dirty = true;
         }
@@ -561,7 +560,15 @@ impl EngineState {
 
         let t_upload = frame_start.elapsed();
 
-        // 3. Render: triangle G-buffer → SSAO → shade → volumetrics.
+        // 3. Render: march (+ per-light shadow) → SSAO → shade → volumetrics.
+        let object_count = self.gpu_objects.len() as u32;
+        let shadow_steps = self.environment.shadow_steps;
+        let num_lights = self.num_lights_cache;
+        let vp = glam::Mat4::from_cols_array_2d(&cam_uniforms.view_proj);
+        let screen_aabbs = crate::scene_sync::compute_screen_aabbs(
+            &self.gpu_objects, &vp, self.width as f32, self.height as f32,
+        );
+        let screen_aabbs_bytes: &[u8] = bytemuck::cast_slice(&screen_aabbs);
 
         // Upload volumetric params.
         let vol_params = self.environment.to_volumetric_params(
@@ -619,65 +626,7 @@ impl EngineState {
             self.renderer.god_rays.update_params(&self.queue, &god_ray_params);
         }
 
-        // Flush any pending marching-cubes mesh uploads (CPU mirror → GPU).
-        self.renderer.mesh_pool.flush(&self.device, &self.queue);
-
-        // Build per-frame triangle-draw list with CPU frustum culling.
-        // For every gpu object with an extracted mesh, transform its local-
-        // space AABB to world space and AABB-test against the camera
-        // frustum. Offscreen objects skip the draw entirely, saving the
-        // rasterizer the per-triangle setup cost for invisible geometry.
-        let vp = glam::Mat4::from_cols_array_2d(&cam_uniforms.view_proj);
-        let frustum = extract_frustum_planes(&vp);
-        let mut mesh_draws: Vec<rkp_render::MeshDraw> = Vec::new();
-        let mut culled = 0u32;
-        let mut submitted = 0u32;
-        for (&scene_id, &gpu_idx) in &self.scene_id_to_gpu {
-            let Some(alloc) = self.renderer.mesh_pool.get(scene_id) else {
-                continue;
-            };
-            let obj = &self.gpu_objects[gpu_idx as usize];
-            let world = glam::Mat4::from_cols_array_2d(&obj.world);
-            let aabb_min = glam::Vec3::from_array(obj.aabb_min);
-            let aabb_max = glam::Vec3::from_array(obj.aabb_max);
-
-            // Transform 8 corners of the local AABB, rebound in world space.
-            let mut wmin = glam::Vec3::splat(f32::INFINITY);
-            let mut wmax = glam::Vec3::splat(f32::NEG_INFINITY);
-            for i in 0..8 {
-                let corner = glam::Vec3::new(
-                    if i & 1 != 0 { aabb_max.x } else { aabb_min.x },
-                    if i & 2 != 0 { aabb_max.y } else { aabb_min.y },
-                    if i & 4 != 0 { aabb_max.z } else { aabb_min.z },
-                );
-                let wc = world.transform_point3(corner);
-                wmin = wmin.min(wc);
-                wmax = wmax.max(wc);
-            }
-            let center = (wmin + wmax) * 0.5;
-            let half = (wmax - wmin) * 0.5;
-
-            if aabb_in_frustum(&frustum, center, half) {
-                mesh_draws.push(rkp_render::MeshDraw {
-                    gpu_object_index: gpu_idx,
-                    allocation: alloc,
-                });
-                submitted += 1;
-            } else {
-                culled += 1;
-            }
-        }
-        if self.frame_index % 60 == 0 && self.frame_index > 0 && (submitted + culled) > 0 {
-            eprintln!("[cull] submitted={submitted} culled={culled}");
-        }
-
-        self.renderer.render(
-            &mut encoder,
-            &self.queue,
-            &self.gbuffer,
-            &mesh_draws,
-            &atmo_frame,
-        );
+        self.renderer.render(&mut encoder, &self.queue, object_count, self.width, self.height, shadow_steps, num_lights, screen_aabbs_bytes, &atmo_frame);
 
         let t_encode = frame_start.elapsed();
 
@@ -822,12 +771,10 @@ impl EngineState {
 
         let t_readback = frame_start.elapsed();
 
-        // Log timing every 60 frames. `gpu_wait` is the fence — time between
-        // submitting the frame and the readback completing. Dominated by
-        // GPU frame execution; NOT the readback copy itself.
+        // Log timing every 60 frames.
         if self.frame_index % 60 == 0 && self.frame_index > 0 {
             eprintln!(
-                "[perf] cpu_setup={:.1}ms upload={:.1}ms encode={:.1}ms post={:.1}ms submit={:.1}ms gpu_wait={:.1}ms total={:.1}ms",
+                "[perf] cpu_setup={:.1}ms upload={:.1}ms encode={:.1}ms post={:.1}ms submit={:.1}ms readback={:.1}ms total={:.1}ms",
                 t_cpu_setup.as_secs_f64() * 1000.0,
                 (t_upload - t_cpu_setup).as_secs_f64() * 1000.0,
                 (t_encode - t_upload).as_secs_f64() * 1000.0,
@@ -899,7 +846,6 @@ impl EngineState {
         let view = glam::Mat4::look_to_rh(self.camera.position, forward, glam::Vec3::Y);
         let proj = glam::Mat4::perspective_rh(fov_rad, aspect, self.camera.near, self.camera.far);
         let view_proj = proj * view;
-        let inverse_view_proj = view_proj.inverse();
 
         rkp_render::rkp_scene::CameraUniforms {
             position: [self.camera.position.x, self.camera.position.y, self.camera.position.z, 1.0],
@@ -910,7 +856,6 @@ impl EngineState {
             jitter: [0.0, 0.0],
             prev_vp: view_proj.to_cols_array_2d(),
             view_proj: view_proj.to_cols_array_2d(),
-            inverse_view_proj: inverse_view_proj.to_cols_array_2d(),
         }
     }
 
@@ -1000,7 +945,6 @@ impl EngineState {
                     ));
                     self.assign_entity_uuid(entity);
                     self.entity_scene_ids.insert(entity, scene_id);
-                    self.renderer.mesh_pool.upload_mesh(scene_id, &result.extracted_mesh);
                     self.geometry_dirty = true;
                     self.scene_dirty = true;
                     self.gpu_objects_dirty = true;
@@ -1041,7 +985,6 @@ impl EngineState {
                     ));
                     self.assign_entity_uuid(entity);
                     self.entity_scene_ids.insert(entity, scene_id);
-                    self.renderer.mesh_pool.upload_mesh(scene_id, &result.extracted_mesh);
                     self.geometry_dirty = true;
                     self.scene_dirty = true;
                     self.gpu_objects_dirty = true;
@@ -1217,7 +1160,6 @@ impl EngineState {
                         ));
                         self.assign_entity_uuid(entity);
                         self.entity_scene_ids.insert(entity, scene_id);
-                        self.renderer.mesh_pool.upload_mesh(scene_id, &result.extracted_mesh);
                         self.geometry_dirty = true;
                         self.scene_dirty = true;
                         self.gpu_objects_dirty = true;
@@ -2384,7 +2326,6 @@ impl EngineState {
                         proc_geo.last_evaluated_scale = scale;
                     }
 
-                    self.renderer.mesh_pool.upload_mesh(scene_id, &result.extracted_mesh);
                     self.geometry_dirty = true;
                     self.gpu_objects_dirty = true;
                 }
@@ -2557,9 +2498,7 @@ impl EngineState {
         if let Some(uuid) = self.entity_uuids.remove(&entity) {
             self.uuid_to_entity.remove(&uuid);
         }
-        if let Some(sid) = self.entity_scene_ids.remove(&entity) {
-            self.renderer.mesh_pool.deallocate(sid);
-        }
+        self.entity_scene_ids.remove(&entity);
 
         // Despawn from ECS.
         let _ = self.world.despawn(entity);
@@ -2694,7 +2633,6 @@ impl EngineState {
                                     ..Default::default()
                                 }));
                                 self.entity_scene_ids.insert(e, sid);
-                                self.renderer.mesh_pool.upload_mesh(sid, &result.extracted_mesh);
                                 self.geometry_dirty = true;
                                 Some(e)
                             }
@@ -2724,7 +2662,6 @@ impl EngineState {
                                 ..Default::default()
                             }));
                             self.entity_scene_ids.insert(e, sid);
-                            self.renderer.mesh_pool.upload_mesh(sid, &result.extracted_mesh);
                             self.geometry_dirty = true;
                             e
                         })

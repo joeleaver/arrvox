@@ -17,17 +17,6 @@ struct CameraUniforms {
     jitter: vec2<f32>,
     prev_vp: mat4x4<f32>,
     view_proj: mat4x4<f32>,
-    inverse_view_proj: mat4x4<f32>,
-}
-
-// Reconstruct world-space position from screen-space integer pixel coord
-// and a non-linear depth value (NDC z in [0, 1]). Returns Vec3(inf) if the
-// depth is at the far plane (sky pixel).
-fn reconstruct_world_pos(coord: vec2<i32>, depth: f32, resolution: vec2<f32>, inv_vp: mat4x4<f32>) -> vec3<f32> {
-    let uv = (vec2<f32>(coord) + 0.5) / resolution;
-    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
-    let world_h = inv_vp * ndc;
-    return world_h.xyz / world_h.w;
 }
 
 struct Light {
@@ -62,19 +51,14 @@ struct Material {
 
 // --- Bindings ---
 
-// Group 0: G-buffer (read).
-// World position is reconstructed from depth via `reconstruct_world_pos` —
-// see the CameraUniforms.inverse_view_proj docs. This saves a full-fat
-// Rgba32Float target + 16 B per fragment of write bandwidth.
-@group(0) @binding(0) var gbuf_depth: texture_depth_2d;
+// Group 0: G-buffer (read)
+@group(0) @binding(0) var gbuf_position: texture_2d<f32>;
 @group(0) @binding(1) var gbuf_normal: texture_2d<f32>;
 @group(0) @binding(2) var gbuf_material: texture_2d<u32>;
 
 // Group 1: shadow texture (read, full-res) + SSAO texture (read, half-res)
-// Phase 4: shadow texture removed with the compute march. A future shadow
-// pass (cascaded shadow maps from triangle geometry) will reintroduce it.
-// Until then every light contributes fully.
-@group(1) @binding(0) var ssao_tex: texture_2d<f32>;
+@group(1) @binding(0) var shadow_tex: texture_2d<f32>;
+@group(1) @binding(1) var ssao_tex: texture_2d<f32>;
 
 // Group 2: output HDR color (write, full-res)
 @group(2) @binding(0) var output: texture_storage_2d<rgba16float, write>;
@@ -348,20 +332,18 @@ fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = textureDimensions(gbuf_depth);
+    let dims = textureDimensions(gbuf_position);
     if gid.x >= dims.x || gid.y >= dims.y {
         return;
     }
 
     let coord = vec2<i32>(gid.xy);
-    // Depth = 1.0 at the far plane → sky / no geometry. Triangle pass
-    // clears depth to 1.0, so unhit pixels come through as sky.
-    let depth = textureLoad(gbuf_depth, coord, 0);
-    let is_sky = depth >= 1.0;
-    let world_pos = reconstruct_world_pos(coord, depth, vec2<f32>(dims), camera.inverse_view_proj);
-    let hit_t = length(world_pos - camera.position.xyz);
+    let pos_data = textureLoad(gbuf_position, coord, 0);
+    let world_pos = pos_data.xyz;
+    let hit_t = pos_data.w;
 
-    if is_sky {
+    // No geometry → sky from Sky View LUT + sun disc.
+    if hit_t >= 9999.0 || hit_t <= 0.0 {
         let uv_screen = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims);
         let ndc = vec2<f32>(uv_screen.x * 2.0 - 1.0, 1.0 - uv_screen.y * 2.0);
         let ray_dir = normalize(camera.forward.xyz + ndc.x * camera.right.xyz + ndc.y * camera.up.xyz);
@@ -381,36 +363,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let packed_r = mat_data.r;
     let packed_g = mat_data.g;
 
-    // Unpack material IDs + blend.
+    // Unpack material IDs.
     let primary_mat_id = packed_r & 0xFFFFu;
-    let secondary_mat_id = (packed_r >> 16u) & 0xFFFFu;
     let blend_weight = f32(packed_g & 0xFFu) / 255.0;
 
-    // Resolve material — metallic/roughness/emission always come from the
-    // palette; base_color is only used when the voxel has no per-voxel color.
-    // When the voxel carries a color, it REPLACES the material's base_color
-    // rather than modulating it — otherwise any non-white material tint dims
-    // textured surfaces on every pixel.
-    //
-    // Dual-material blending: when blend_weight > 0 we mix the primary and
-    // secondary materials' physical parameters (base_color, metallic,
-    // roughness). Collapses to primary-only when blend_weight == 0 or
-    // secondary_mat_id == 0.
-    let mat_a = materials[primary_mat_id];
-    let bw = select(0.0, blend_weight, secondary_mat_id != 0u);
-    let mat_b = materials[secondary_mat_id];
-    let base_color = mix(mat_a.base_color.rgb, mat_b.base_color.rgb, bw);
-    let metallic = mix(mat_a.metallic, mat_b.metallic, bw);
-    let roughness = max(mix(mat_a.roughness, mat_b.roughness, bw), 0.04);
-
+    // Unpack RGB565 color from bits 16-31 of packed_g.
     let color_rgb565 = (packed_g >> 16u) & 0xFFFFu;
-    var albedo = base_color;
+    var voxel_color = vec3<f32>(1.0); // default white (material color only)
     if color_rgb565 != 0u {
         let cr5 = color_rgb565 & 0x1Fu;
         let cg6 = (color_rgb565 >> 5u) & 0x3Fu;
         let cb5 = (color_rgb565 >> 11u) & 0x1Fu;
-        albedo = vec3<f32>(f32(cr5) / 31.0, f32(cg6) / 63.0, f32(cb5) / 31.0);
+        voxel_color = vec3<f32>(f32(cr5) / 31.0, f32(cg6) / 63.0, f32(cb5) / 31.0);
     }
+
+    // Resolve material.
+    let mat = materials[primary_mat_id];
+    let albedo = mat.base_color.rgb * voxel_color;
+    let metallic = mat.metallic;
+    let roughness = max(mat.roughness, 0.04);
 
     // View direction.
     let V = normalize(camera.position.xyz - world_pos);
@@ -420,12 +391,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // F0 for dielectrics vs metals.
     let f0 = mix(vec3<f32>(0.04), albedo, metallic);
 
+    // Per-light shadow from shadow texture (written by march pass).
+    let shadow_data = textureLoad(shadow_tex, coord, 0);
+
     // AO from half-res SSAO texture.
     let half_coord = vec2<i32>(gid.xy) / 2;
     let ao = textureLoad(ssao_tex, half_coord, 0).r;
 
     // Accumulate direct lighting.
     var lo = vec3<f32>(0.0);
+    var shadow_idx = 0u; // tracks which shadow channel to read
 
     for (var li = 0u; li < shade_params.num_lights; li++) {
         let light = lights[li];
@@ -449,9 +424,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
 
-        // Shadow contribution stubbed at 1.0 until a triangle-based shadow
-        // pass lands (Phase 4 dropped the compute-march-era shadow texture).
-        let light_shadow = 1.0;
+        // Read per-light shadow BEFORE the n_dot_l skip — must stay in sync
+        // with the march pass which always writes shadow for every shadow-casting light.
+        var light_shadow = 1.0;
+        let cast_shadow = light.params.w;
+        if cast_shadow >= 0.5 && shadow_idx < 4u {
+            light_shadow = shadow_data[shadow_idx];
+            shadow_idx++;
+        }
 
         let n_dot_l = max(dot(N, L), 0.0);
         if n_dot_l <= 0.0 { continue; }
@@ -488,10 +468,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ambient_specular = ms_irradiance * F_env * ao;
     let ambient = ambient_diffuse + ambient_specular;
 
-    // Emission — use the albedo (which already reflects voxel color /
-    // material base_color) scaled by the primary/secondary blended emission.
-    let emission_strength = mix(mat_a.emission_strength, mat_b.emission_strength, bw);
-    let emission = albedo * emission_strength;
+    // Emission.
+    let emission = mat.base_color.rgb * mat.emission_strength;
 
     var final_color = lo + ambient + emission;
 

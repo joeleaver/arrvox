@@ -8,10 +8,8 @@
 pub mod voxelize_opacity;
 /// GPU octree buffer management and GpuObject field reinterpretation.
 pub mod octree_gpu;
-/// GPU vertex/index buffer pool holding extracted marching-cubes meshes.
-pub mod mesh_pool;
-/// Triangle rasterization pass writing the G-buffer from mesh geometry.
-pub mod triangle_gbuffer;
+/// Octree-accelerated compute ray marcher — primary visibility pass.
+pub mod octree_march;
 /// GPU timestamp profiler for per-pass timing.
 pub mod gpu_profiler;
 /// Per-object GPU struct — forward world transform, octree params, no inverse_world.
@@ -37,8 +35,6 @@ pub use voxelize_opacity::import_mesh_to_opacity_rkf;
 pub use voxelize_opacity::import_mesh_to_opacity_rkp;
 pub use octree_gpu::OctreeGpu;
 pub use rkp_scene_manager::RkpSceneManager;
-pub use mesh_pool::{MeshAllocation, MeshPool, MeshVertex};
-pub use triangle_gbuffer::{MeshDraw, TriangleGBufferPass};
 
 /// Validate WGSL source with naga at startup. Panics with a clear error message
 /// on shader bugs instead of producing cryptic "pipeline invalid" GPU errors.

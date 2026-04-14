@@ -379,7 +379,6 @@ impl EnvironmentSettings {
                 let a = atmo::ambient(sun_toward, self.sun_intensity, self.camera_altitude);
                 a[2] * self.ambient_intensity
             },
-            inverse_view_proj: cam.inverse_view_proj,
         }
     }
 
