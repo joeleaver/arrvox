@@ -6,6 +6,11 @@
 
 use crate::validate_wgsl;
 
+/// Stats buffer size in bytes (44 × u32). See the `stats` binding in
+/// `shaders/octree_march.wgsl` for the layout.
+const STATS_U32_COUNT: usize = 44;
+const STATS_BYTES: u64 = (STATS_U32_COUNT * 4) as u64;
+
 /// Uniform parameters for the march shader.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -24,7 +29,7 @@ pub struct OctreeMarchPass {
     params_bind_group_layout: wgpu::BindGroupLayout,
     params_buffer: wgpu::Buffer,
     params_bind_group: Option<wgpu::BindGroup>,
-    /// Stats buffer for profiling (4 atomic u32s).
+    /// Stats buffer for profiling (44 atomic u32s — see shader comment at stats binding).
     stats_buffer: wgpu::Buffer,
     stats_readback: wgpu::Buffer,
     /// Screen-space AABB buffer for tile culling.
@@ -156,13 +161,13 @@ impl OctreeMarchPass {
             params_bind_group: None,
             stats_buffer: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("march stats"),
-                size: 16, // 4 × u32
+                size: STATS_BYTES,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
             stats_readback: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("march stats readback"),
-                size: 16,
+                size: STATS_BYTES,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             }),
@@ -253,10 +258,14 @@ impl OctreeMarchPass {
 
     /// Copy stats to readback buffer after dispatch.
     pub fn copy_stats(&self, encoder: &mut wgpu::CommandEncoder) {
-        encoder.copy_buffer_to_buffer(&self.stats_buffer, 0, &self.stats_readback, 0, 16);
+        encoder.copy_buffer_to_buffer(&self.stats_buffer, 0, &self.stats_readback, 0, STATS_BYTES);
     }
 
     /// Read stats from readback buffer. Call after device.poll().
+    ///
+    /// Prints once per second (assuming 60fps) with per-phase depth histograms
+    /// and a hit-footprint histogram. This is intentionally verbose — the goal
+    /// is to drive the mipped-octree / LOD-cutoff decision, not light telemetry.
     pub fn read_stats(&self, device: &wgpu::Device, total_pixels: u32, frame_idx: u64) {
         if frame_idx % 60 != 0 || frame_idx == 0 { return; }
         let slice = self.stats_readback.slice(..);
@@ -267,15 +276,48 @@ impl OctreeMarchPass {
             let data = slice.get_mapped_range();
             let vals: &[u32] = bytemuck::cast_slice(&data);
             let total_steps = vals[0];
-            let total_lookups = vals[1];
             let hit_pixels = vals[2];
             let max_steps = vals[3];
+
+            let surface: &[u32] = &vals[4..16];
+            let normal:  &[u32] = &vals[16..28];
+            let shadow:  &[u32] = &vals[28..40];
+            let foot:    &[u32] = &vals[40..44];
+
+            let sum = |h: &[u32]| -> u64 { h.iter().map(|&x| x as u64).sum() };
+            let weighted = |h: &[u32]| -> f64 {
+                let s = sum(h);
+                if s == 0 { return 0.0; }
+                let w: u64 = h.iter().enumerate().map(|(i, &c)| i as u64 * c as u64).sum();
+                w as f64 / s as f64
+            };
+
+            let total_lookups = sum(surface) + sum(normal) + sum(shadow);
             let avg_steps = if total_pixels > 0 { total_steps as f32 / total_pixels as f32 } else { 0.0 };
-            let avg_lookups = if total_pixels > 0 { total_lookups as f32 / total_pixels as f32 } else { 0.0 };
+
             eprintln!(
-                "[march stats] avg_steps={:.1} avg_lookups={:.1} max_steps={} hit_pixels={}/{} total_lookups={}M",
-                avg_steps, avg_lookups, max_steps, hit_pixels, total_pixels,
-                total_lookups / 1_000_000,
+                "[march] hits {}/{}  avg_steps {:.1}  max_steps {}  total_lookups {}M",
+                hit_pixels, total_pixels, avg_steps, max_steps, total_lookups / 1_000_000,
+            );
+            eprintln!(
+                "[descents surface] avg_depth {:.2}  {}",
+                weighted(surface), format_histogram(surface),
+            );
+            eprintln!(
+                "[descents normal ] avg_depth {:.2}  {}",
+                weighted(normal), format_histogram(normal),
+            );
+            eprintln!(
+                "[descents shadow ] avg_depth {:.2}  {}",
+                weighted(shadow), format_histogram(shadow),
+            );
+            let foot_total: u64 = foot.iter().map(|&x| x as u64).sum();
+            let pct = |n: u32| -> f32 {
+                if foot_total == 0 { 0.0 } else { 100.0 * n as f32 / foot_total as f32 }
+            };
+            eprintln!(
+                "[footprint] <1px:{:.0}%  1-2px:{:.0}%  2-4px:{:.0}%  >=4px:{:.0}%  (n={})",
+                pct(foot[0]), pct(foot[1]), pct(foot[2]), pct(foot[3]), foot_total,
             );
             drop(data);
             self.stats_readback.unmap();
@@ -363,6 +405,38 @@ fn bgl_storage_tex_rw(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGr
         },
         count: None,
     }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn octree_march_shader_is_valid_wgsl() {
+        let src = include_str!("shaders/octree_march.wgsl");
+        let module = naga::front::wgsl::parse_str(src)
+            .unwrap_or_else(|e| panic!("parse error:\n{}", e.emit_to_string(src)));
+        let mut v = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        v.validate(&module).unwrap_or_else(|e| panic!("validation error: {e:?}"));
+    }
+}
+
+/// Render a 12-bucket histogram as "L0:N L1:N ... L11:N", skipping empty tail buckets.
+fn format_histogram(h: &[u32]) -> String {
+    let last_nonzero = h.iter().rposition(|&x| x > 0).unwrap_or(0);
+    let mut s = String::new();
+    for (i, &v) in h.iter().take(last_nonzero + 1).enumerate() {
+        if !s.is_empty() { s.push(' '); }
+        if v >= 1_000_000 {
+            s.push_str(&format!("L{}:{:.1}M", i, v as f32 / 1_000_000.0));
+        } else if v >= 1_000 {
+            s.push_str(&format!("L{}:{}k", i, v / 1_000));
+        } else {
+            s.push_str(&format!("L{}:{}", i, v));
+        }
+    }
+    s
 }
 
 fn bgl_storage_tex(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGroupLayoutEntry {

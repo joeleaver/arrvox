@@ -67,6 +67,12 @@ struct OctreeResult { slot: u32, depth: u32, }
 @group(0) @binding(2) var<storage, read> objects: array<RkpObject>;
 @group(0) @binding(3) var<uniform> camera: CameraUniforms;
 @group(0) @binding(4) var<storage, read> color_pool_data: array<u32>;
+// leaf_attr[leaf_id] = { voxel_slot: u32, normal_oct: u32 }
+// Octree leaf values encode leaf_id (not voxel_slot). One indirection via
+// leaf_attr yields the voxel_slot (for opacity/material/color) AND a packed
+// surface normal — no gradient reconstruction needed at shade time.
+struct LeafAttr { voxel_slot: u32, normal_oct: u32, }
+@group(0) @binding(8) var<storage, read> leaf_attr_pool: array<LeafAttr>;
 
 @group(1) @binding(0) var gbuf_position: texture_storage_2d<rgba32float, write>;
 @group(1) @binding(1) var gbuf_normal: texture_storage_2d<rgba16float, write>;
@@ -75,11 +81,18 @@ struct OctreeResult { slot: u32, depth: u32, }
 
 @group(2) @binding(0) var<uniform> march_params: MarchParams;
 @group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
-@group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 4>;
-// stats[0] = total steps across all pixels
-// stats[1] = total octree lookups across all pixels
-// stats[2] = pixels that found a hit
-// stats[3] = max steps for any single pixel
+@group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 44>;
+// stats[0]       = total steps across all pixels
+// stats[1]       = (reserved — was total_lookups; retained slot for layout stability)
+// stats[2]       = pixels that found a hit
+// stats[3]       = max steps for any single pixel
+// stats[4..16]   = descent depth histogram, surface march (buckets L0..L11)
+// stats[16..28]  = descent depth histogram, normal        (buckets L0..L11)
+// stats[28..40]  = descent depth histogram, shadow        (buckets L0..L11)
+// stats[40..44]  = hit footprint: <1px, [1,2), [2,4), >=4px
+const PHASE_MARCH: u32 = 0u;
+const PHASE_NORMAL: u32 = 1u;
+const PHASE_SHADOW: u32 = 2u;
 @group(2) @binding(3) var<storage, read> screen_aabbs: array<vec4<f32>>;
 // Per-object screen-space AABB: (min_x, min_y, max_x, max_y) in pixels.
 @group(2) @binding(4) var<storage, read> lights: array<GpuLight>;
@@ -118,16 +131,22 @@ fn intersect_aabb(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box
                      min(min(tmax.x, tmax.y), tmax.z));
 }
 
-fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>) -> OctreeResult {
-    atomicAdd(&stats[1], 1u); // count every octree lookup
+fn bucket_depth(phase: u32, level: u32) {
+    // 12 buckets per phase starting at stats[4]. Levels beyond 11 clamp to 11.
+    let base = 4u + phase * 12u;
+    atomicAdd(&stats[base + min(level, 11u)], 1u);
+}
+
+fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: u32) -> OctreeResult {
     var offset = root;
     var half = extent * 0.5;
     var center = vec3<f32>(half);
     for (var level = 0u; level < max_depth; level++) {
         let node = octree_nodes[offset];
-        if node == OCTREE_EMPTY { return OctreeResult(OCTREE_EMPTY, level); }
-        if node == OCTREE_INTERIOR { return OctreeResult(OCTREE_INTERIOR, level); }
+        if node == OCTREE_EMPTY { bucket_depth(phase, level); return OctreeResult(OCTREE_EMPTY, level); }
+        if node == OCTREE_INTERIOR { bucket_depth(phase, level); return OctreeResult(OCTREE_INTERIOR, level); }
         if (node & OCTREE_LEAF_BIT) != 0u {
+            bucket_depth(phase, level);
             return OctreeResult(node & ~OCTREE_LEAF_BIT, level);
         }
         let gt = vec3<u32>(pos >= center);
@@ -139,6 +158,7 @@ fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>) -> Octr
             select(-half, half, pos.z >= center.z),
         );
     }
+    bucket_depth(phase, max_depth);
     let node = octree_nodes[offset];
     if node == OCTREE_EMPTY { return OctreeResult(OCTREE_EMPTY, max_depth); }
     if node == OCTREE_INTERIOR { return OctreeResult(OCTREE_INTERIOR, max_depth); }
@@ -161,42 +181,24 @@ fn skip_node(pos: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, node_depth: u32
     return min(min(t_pos.x, t_pos.y), t_pos.z) + vs * 0.01;
 }
 
-fn sample_opacity(pos: vec3<f32>, root: u32, depth: u32, extent: f32) -> f32 {
-    let r = octree_lookup(root, depth, extent, pos);
-    if r.slot == OCTREE_EMPTY { return 0.0; }
-    if r.slot == OCTREE_INTERIOR { return 1.0; }
-    return extract_opacity(voxel_pool[r.slot].word0);
-}
-
-fn sample_trilinear(pos: vec3<f32>, root: u32, depth: u32, extent: f32, vs: f32) -> f32 {
-    let h = vs * 0.5;
-    let s000 = sample_opacity(pos + vec3(-h,-h,-h), root, depth, extent);
-    let s100 = sample_opacity(pos + vec3( h,-h,-h), root, depth, extent);
-    let s010 = sample_opacity(pos + vec3(-h, h,-h), root, depth, extent);
-    let s110 = sample_opacity(pos + vec3( h, h,-h), root, depth, extent);
-    let s001 = sample_opacity(pos + vec3(-h,-h, h), root, depth, extent);
-    let s101 = sample_opacity(pos + vec3( h,-h, h), root, depth, extent);
-    let s011 = sample_opacity(pos + vec3(-h, h, h), root, depth, extent);
-    let s111 = sample_opacity(pos + vec3( h, h, h), root, depth, extent);
-    let f = fract(pos / vs + 0.5);
-    let x0 = mix(s000, s100, f.x); let x1 = mix(s010, s110, f.x);
-    let x2 = mix(s001, s101, f.x); let x3 = mix(s011, s111, f.x);
-    return mix(mix(x0, x1, f.y), mix(x2, x3, f.y), f.z);
-}
-
-// Gradient normal via 6-tap central differences of the smooth trilinear field.
-fn compute_normal(pos: vec3<f32>, root: u32, depth: u32, extent: f32, vs: f32) -> vec3<f32> {
-    let eps = vs * 0.5;
-    let gx = sample_trilinear(pos + vec3(eps,0.0,0.0), root, depth, extent, vs)
-           - sample_trilinear(pos - vec3(eps,0.0,0.0), root, depth, extent, vs);
-    let gy = sample_trilinear(pos + vec3(0.0,eps,0.0), root, depth, extent, vs)
-           - sample_trilinear(pos - vec3(0.0,eps,0.0), root, depth, extent, vs);
-    let gz = sample_trilinear(pos + vec3(0.0,0.0,eps), root, depth, extent, vs)
-           - sample_trilinear(pos - vec3(0.0,0.0,eps), root, depth, extent, vs);
-    let grad = vec3<f32>(gx, gy, gz);
-    let len = length(grad);
+// Decode a packed 2× snorm16 octahedral normal. Mirror of rkp_core::unpack_oct.
+fn unpack_oct_normal(packed: u32) -> vec3<f32> {
+    let ui_raw = i32(packed & 0xFFFFu);
+    let vi_raw = i32((packed >> 16u) & 0xFFFFu);
+    // snorm16: interpret as i16 (sign-extend the 16-bit value).
+    let ui = select(ui_raw, ui_raw - 65536, ui_raw >= 32768);
+    let vi = select(vi_raw, vi_raw - 65536, vi_raw >= 32768);
+    let u = clamp(f32(ui) / 32767.0, -1.0, 1.0);
+    let v = clamp(f32(vi) / 32767.0, -1.0, 1.0);
+    var n = vec3<f32>(u, v, 1.0 - abs(u) - abs(v));
+    if n.z < 0.0 {
+        let nx0 = n.x;
+        n.x = (1.0 - abs(n.y)) * select(-1.0, 1.0, nx0 >= 0.0);
+        n.y = (1.0 - abs(nx0)) * select(-1.0, 1.0, n.y >= 0.0);
+    }
+    let len = length(n);
     if len < 1e-8 { return vec3<f32>(0.0, 1.0, 0.0); }
-    return -grad / len;
+    return n / len;
 }
 
 // --- Shadow ray ---
@@ -251,7 +253,7 @@ fn trace_shadow_ray(
             if t > t_limit { break; }
 
             let pos = clamp(shadow_origin + safe_dir * t, vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
-            let r = octree_lookup(root, max_depth, extent, pos);
+            let r = octree_lookup(root, max_depth, extent, pos, PHASE_SHADOW);
 
             if r.slot == OCTREE_EMPTY {
                 t += max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);
@@ -263,8 +265,10 @@ fn trace_shadow_ray(
             if r.slot == OCTREE_INTERIOR {
                 voxel_opacity = 1.0;
             } else {
-                voxel_opacity = extract_opacity(voxel_pool[r.slot].word0);
-                let mid = extract_material_id(voxel_pool[r.slot].word1);
+                // r.slot is a leaf_attr_id — deref to get voxel_slot.
+                let voxel_slot = leaf_attr_pool[r.slot].voxel_slot;
+                voxel_opacity = extract_opacity(voxel_pool[voxel_slot].word0);
+                let mid = extract_material_id(voxel_pool[voxel_slot].word1);
                 mat_opacity = materials[mid].opacity;
             }
 
@@ -300,9 +304,13 @@ fn trace_shadow_ray(
 struct MarchResult {
     oc_pos: vec3<f32>,
     color: vec3<f32>,
+    // Accumulated local-space normal — weighted by sample contribution the
+    // same way color and position are. Pulled from the leaf_attr payload
+    // rather than reconstructed from the opacity-field gradient.
+    normal: vec3<f32>,
     alpha: f32,
     t: f32,
-    first_slot: u32,
+    first_slot: u32,        // voxel_pool slot (already dereferenced from leaf_attr)
     valid: bool,
     steps: u32,             // total steps taken (for profiling)
 }
@@ -310,7 +318,7 @@ struct MarchResult {
 fn march_object(
     world_origin: vec3<f32>, world_dir: vec3<f32>, obj: RkpObject,
 ) -> MarchResult {
-    var result = MarchResult(vec3<f32>(0.0), vec3<f32>(0.0), 0.0, 0.0, 0u, false, 0u);
+    var result = MarchResult(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0.0, 0.0, 0u, false, 0u);
 
     let inv_world = obj.inverse_world;
     let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
@@ -344,7 +352,7 @@ fn march_object(
         if result.alpha > 0.99 { break; }
 
         let pos = clamp(oc_origin + safe_dir * t, vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
-        let r = octree_lookup(root, max_depth, extent, pos);
+        let r = octree_lookup(root, max_depth, extent, pos, PHASE_MARCH);
 
         if r.slot == OCTREE_EMPTY {
             t += skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs);
@@ -352,14 +360,21 @@ fn march_object(
         }
 
         var voxel_opacity = 0.0;
-        var slot = 0u;
+        var voxel_slot = 0u;
         var mat_opacity = 1.0;
+        // For INTERIOR (fully opaque bulk region), we have no per-leaf normal
+        // — fall back to the ray direction's opposite as a cheap safe default.
+        // Surface hits almost always land on LEAF, not INTERIOR.
+        var sample_normal = -safe_dir;
         if r.slot == OCTREE_INTERIOR {
             voxel_opacity = 1.0;
         } else {
-            slot = r.slot;
-            voxel_opacity = extract_opacity(voxel_pool[slot].word0);
-            let mid = extract_material_id(voxel_pool[slot].word1);
+            // r.slot is a leaf_attr_id. Dereference for voxel_slot + normal.
+            let attr = leaf_attr_pool[r.slot];
+            voxel_slot = attr.voxel_slot;
+            sample_normal = unpack_oct_normal(attr.normal_oct);
+            voxel_opacity = extract_opacity(voxel_pool[voxel_slot].word0);
+            let mid = extract_material_id(voxel_pool[voxel_slot].word1);
             mat_opacity = materials[mid].opacity;
         }
 
@@ -381,13 +396,14 @@ fn march_object(
         // Opaque material: first hit wins — no accumulation needed.
         if mat_opacity >= 0.99 {
             result.oc_pos = pos;
+            result.normal = sample_normal;
             result.alpha = 1.0;
             result.t = t;
-            result.first_slot = slot;
+            result.first_slot = voxel_slot;
             result.valid = true;
             var color = vec3<f32>(0.5);
-            if slot != 0u {
-                let cp = color_pool_data[slot];
+            if voxel_slot != 0u {
+                let cp = color_pool_data[voxel_slot];
                 if cp != 0u {
                     color = vec3<f32>(
                         f32(cp & 0xFFu) / 255.0,
@@ -406,10 +422,11 @@ fn march_object(
         let weight = sample_opacity * remaining;
 
         result.oc_pos += pos * weight;
+        result.normal += sample_normal * weight;
 
         var color = vec3<f32>(0.5);
-        if slot != 0u {
-            let cp = color_pool_data[slot];
+        if voxel_slot != 0u {
+            let cp = color_pool_data[voxel_slot];
             if cp != 0u {
                 color = vec3<f32>(
                     f32(cp & 0xFFu) / 255.0,
@@ -424,7 +441,7 @@ fn march_object(
         // First hit — record for depth and material.
         if !result.valid {
             result.t = t;
-            result.first_slot = slot;
+            result.first_slot = voxel_slot;
             result.valid = true;
         }
 
@@ -529,6 +546,12 @@ fn main(
         let inv_a = 1.0 / max(r.alpha, 0.001);
         let oc_pos = r.oc_pos * inv_a;
         let color = r.color * inv_a;
+        // Normal accumulated in march_object from per-leaf stored normals,
+        // weighted by the same coverage that weights position/color. Single
+        // normalize here replaces the old 48-tap trilinear gradient — this
+        // is where the perf cliff used to sit.
+        let local_normal_raw = r.normal * inv_a;
+        let local_normal = normalize(local_normal_raw);
 
         let local_hit = oc_pos - vec3<f32>(extent * 0.5);
         let world_pos = (obj.world * vec4<f32>(local_hit, 1.0)).xyz;
@@ -537,7 +560,6 @@ fn main(
         // Skip hits beyond the closest opaque surface.
         if hit_dist > max_world_dist { continue; }
 
-        let local_normal = compute_normal(oc_pos, obj.octree_root, obj.octree_depth, extent, obj.voxel_size);
         let world_normal = normalize((obj.world * vec4<f32>(local_normal, 0.0)).xyz);
 
         // Opaque hit closer than current best: replace the accumulator entirely.
@@ -589,6 +611,20 @@ fn main(
     // Stats.
     atomicAdd(&stats[0], total_steps);
     atomicMax(&stats[3], total_steps);
+
+    // Footprint histogram: size in pixels of the finest voxel at the hit point.
+    // <1px means we walked to a mip level finer than the screen can resolve.
+    // camera.up.xyz encodes tan(half_fov_y), so focal_px_y = 0.5 * H / |up|.
+    if have_first && closest_obj_idx != 0xFFFFFFFFu {
+        let focal_px_y = 0.5 * camera.resolution.y / max(length(camera.up.xyz), 1e-6);
+        let hit_vs = objects[closest_obj_idx].voxel_size;
+        let footprint = hit_vs * focal_px_y / max(first_dist, 1e-3);
+        var bucket = 3u;
+        if footprint < 1.0 { bucket = 0u; }
+        else if footprint < 2.0 { bucket = 1u; }
+        else if footprint < 4.0 { bucket = 2u; }
+        atomicAdd(&stats[40u + bucket], 1u);
+    }
 
     if !have_first {
         textureStore(gbuf_position, coord, vec4<f32>(0.0, 0.0, 0.0, 1e10));

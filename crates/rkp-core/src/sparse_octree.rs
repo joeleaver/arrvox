@@ -1005,8 +1005,9 @@ mod tests {
     fn gpu_lookup_matches_coord_lookup() {
         // Build a sphere octree and verify every leaf is reachable by position.
         let mut pool = crate::VoxelPool::new(100_000);
+        let mut attrs = crate::LeafAttrPool::new(100_000);
         let r = crate::voxelize_octree::voxelize_opacity_sphere_octree(
-            glam::Vec3::ZERO, 0.5, 0, 0.05, &mut pool,
+            glam::Vec3::ZERO, 0.5, 0, 0.05, &mut pool, &mut attrs,
         ).unwrap();
         let tree = &r.octree;
         let _voxel_count = r.voxel_count;

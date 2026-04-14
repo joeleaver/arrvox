@@ -31,6 +31,9 @@ pub struct GeometryUpload<'a> {
     pub octree_nodes: &'a [u8],
     /// Per-voxel color (parallel array, same index as voxel_pool).
     pub color_pool: &'a [u8],
+    /// Per-leaf attributes: `LeafAttr { voxel_slot, normal_oct }`, 8 B each.
+    /// Indexed by the leaf_attr_id stored in octree leaf nodes.
+    pub leaf_attr_pool: &'a [u8],
 }
 
 /// Per-frame data — uploaded every frame (cheap: objects + camera).
@@ -52,6 +55,7 @@ pub struct FrameUpload<'a> {
 ///   5: bone_matrices (storage, read)
 ///   6: bone_weights (storage, read)
 ///   7: deformed_pool (storage, read)
+///   8: leaf_attr_pool (storage, read) — `LeafAttr { voxel_slot, normal_oct }`
 pub struct RkpScene {
     pub voxel_pool_buffer: wgpu::Buffer,
     pub octree_nodes_buffer: wgpu::Buffer,
@@ -61,6 +65,7 @@ pub struct RkpScene {
     pub bone_matrices_buffer: wgpu::Buffer,
     pub bone_weights_buffer: wgpu::Buffer,
     pub deformed_pool_buffer: wgpu::Buffer,
+    pub leaf_attr_pool_buffer: wgpu::Buffer,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub bind_group: wgpu::BindGroup,
 }
@@ -80,18 +85,19 @@ impl RkpScene {
         let bone_matrices_buffer = Self::create_storage(device, "rkp_bone_matrices", 64);
         let bone_weights_buffer = Self::create_storage(device, "rkp_bone_weights", 4);
         let deformed_pool_buffer = Self::create_storage(device, "rkp_deformed_pool", 8);
+        let leaf_attr_pool_buffer = Self::create_storage(device, "rkp_leaf_attr_pool", 8);
 
         let bind_group_layout = Self::create_layout(device);
         let bind_group = Self::create_bind_group(device, &bind_group_layout,
             &voxel_pool_buffer, &octree_nodes_buffer, &objects_buffer,
             &camera_buffer, &color_pool_buffer, &bone_matrices_buffer,
-            &bone_weights_buffer, &deformed_pool_buffer,
+            &bone_weights_buffer, &deformed_pool_buffer, &leaf_attr_pool_buffer,
         );
 
         Self {
             voxel_pool_buffer, octree_nodes_buffer, objects_buffer,
             camera_buffer, color_pool_buffer, bone_matrices_buffer,
-            bone_weights_buffer, deformed_pool_buffer,
+            bone_weights_buffer, deformed_pool_buffer, leaf_attr_pool_buffer,
             bind_group_layout, bind_group,
         }
     }
@@ -103,14 +109,16 @@ impl RkpScene {
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.voxel_pool_buffer, "rkp_voxel_pool", data.voxel_pool);
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.octree_nodes_buffer, "rkp_octree_nodes", data.octree_nodes);
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.color_pool_buffer, "rkp_color_pool", data.color_pool);
+        needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.leaf_attr_pool_buffer, "rkp_leaf_attr_pool", data.leaf_attr_pool);
 
         let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
         eprintln!(
-            "[rkp_scene] upload_geometry: voxel_pool={:.2} MiB  octree_nodes={:.2} MiB  color_pool={:.2} MiB  total={:.2} MiB",
+            "[rkp_scene] upload_geometry: voxel_pool={:.2} MiB  octree_nodes={:.2} MiB  color_pool={:.2} MiB  leaf_attr={:.2} MiB  total={:.2} MiB",
             mib(data.voxel_pool.len()),
             mib(data.octree_nodes.len()),
             mib(data.color_pool.len()),
-            mib(data.voxel_pool.len() + data.octree_nodes.len() + data.color_pool.len()),
+            mib(data.leaf_attr_pool.len()),
+            mib(data.voxel_pool.len() + data.octree_nodes.len() + data.color_pool.len() + data.leaf_attr_pool.len()),
         );
 
 
@@ -148,7 +156,7 @@ impl RkpScene {
         self.bind_group = Self::create_bind_group(device, &self.bind_group_layout,
             &self.voxel_pool_buffer, &self.octree_nodes_buffer, buffer,
             &self.camera_buffer, &self.color_pool_buffer, &self.bone_matrices_buffer,
-            &self.bone_weights_buffer, &self.deformed_pool_buffer,
+            &self.bone_weights_buffer, &self.deformed_pool_buffer, &self.leaf_attr_pool_buffer,
         );
     }
 
@@ -182,7 +190,7 @@ impl RkpScene {
         self.bind_group = Self::create_bind_group(device, &self.bind_group_layout,
             &self.voxel_pool_buffer, &self.octree_nodes_buffer, &self.objects_buffer,
             &self.camera_buffer, &self.color_pool_buffer, &self.bone_matrices_buffer,
-            &self.bone_weights_buffer, &self.deformed_pool_buffer,
+            &self.bone_weights_buffer, &self.deformed_pool_buffer, &self.leaf_attr_pool_buffer,
         );
     }
 
@@ -227,6 +235,7 @@ impl RkpScene {
                 storage_ro(5), // bone_matrices
                 storage_ro(6), // bone_weights
                 storage_ro(7), // deformed_pool
+                storage_ro(8), // leaf_attr_pool
             ],
         })
     }
@@ -242,6 +251,7 @@ impl RkpScene {
         bone_matrices: &wgpu::Buffer,
         bone_weights: &wgpu::Buffer,
         deformed_pool: &wgpu::Buffer,
+        leaf_attr_pool: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rkp_scene_bind_group"),
@@ -255,6 +265,7 @@ impl RkpScene {
                 wgpu::BindGroupEntry { binding: 5, resource: bone_matrices.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: bone_weights.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: deformed_pool.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: leaf_attr_pool.as_entire_binding() },
             ],
         })
     }
