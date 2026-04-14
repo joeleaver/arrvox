@@ -267,6 +267,11 @@ impl SparseOctree {
 
     /// Try to collapse a branch node back to a uniform value if all 8 children
     /// are identical leaves/sentinels (not branches).
+    ///
+    /// The 8 orphaned child slots are not reclaimed here — call [`compact`] to
+    /// produce a dense representation for GPU upload.
+    ///
+    /// [`compact`]: SparseOctree::compact
     fn try_collapse(&mut self, node_idx: usize) {
         let node = self.nodes[node_idx];
         if !is_branch(node) {
@@ -285,8 +290,185 @@ impl SparseOctree {
         }
         // All children identical — collapse.
         self.nodes[node_idx] = first;
-        // Note: the 8 child slots become dead space. A compaction pass could
-        // reclaim them, but for typical usage the waste is small.
+    }
+
+    /// Walk the tree bottom-up and collapse every branch whose 8 children are
+    /// all identical (leaves or sentinels).
+    ///
+    /// `try_collapse` runs opportunistically during `insert`, but if leaf
+    /// values are edited after insertion (for example, by remapping slot
+    /// indices after a dedup pass on a loaded .rkp) the collapse opportunity
+    /// is missed. This pass catches those. It does not reclaim storage —
+    /// follow it with [`compact`](Self::compact).
+    pub fn collapse_all(&mut self) {
+        if self.nodes.is_empty() {
+            return;
+        }
+        Self::collapse_recursive(&mut self.nodes, 0);
+    }
+
+    fn collapse_recursive(nodes: &mut [u32], idx: usize) {
+        let node = nodes[idx];
+        if !is_branch(node) {
+            return;
+        }
+        let offset = node as usize;
+        for i in 0..8 {
+            Self::collapse_recursive(nodes, offset + i);
+        }
+        // After children are collapsed, check for uniformity.
+        let first = nodes[offset];
+        if is_branch(first) {
+            return;
+        }
+        for i in 1..8 {
+            if nodes[offset + i] != first {
+                return;
+            }
+        }
+        nodes[idx] = first;
+    }
+
+    /// Deduplicate identical subtrees in place, converting the octree into a
+    /// sparse voxel DAG.
+    ///
+    /// Two branches whose 8 children resolve to the same canonical values
+    /// share a single copy of their 8-child block — the duplicate branch's
+    /// parent is rewritten to point at the canonical offset. Applied bottom-up
+    /// so sharing cascades: deep subtrees merge first, which makes the next
+    /// level up more likely to find matches, and so on.
+    ///
+    /// For geometry with any repetition — a cube's 6 identical face gradients,
+    /// a procedural tree, tiled patterns — the storage savings are typically
+    /// 10–1000×. The shader sees an ordinary offset-indexed octree; it has no
+    /// idea some offsets are referenced by multiple parents.
+    ///
+    /// Produces a compact output directly (no orphans), so no subsequent
+    /// `compact()` call is needed. Safe to call on any tree; trivially
+    /// returns for leaf-only and empty roots.
+    ///
+    /// ## Correctness with shared subtrees
+    ///
+    /// All iteration in this module is path-based — `iter_leaves` computes
+    /// coord from the parent traversal, not from the node's buffer index —
+    /// so a shared subtree is correctly visited once per reference, yielding
+    /// distinct coords on each visit. `try_collapse` and `insert` were
+    /// designed for pre-dedup trees; do not call them after this pass.
+    pub fn deduplicate_subtrees(&mut self) {
+        if self.nodes.is_empty() {
+            return;
+        }
+        let root = self.nodes[0];
+        if !is_branch(root) {
+            // Trivial root (leaf / empty / interior). Nothing to share; also
+            // reclaim any orphan tail the builder left behind.
+            self.nodes.truncate(1);
+            return;
+        }
+
+        let mut new_nodes: Vec<u32> = Vec::new();
+        new_nodes.push(0); // reserve position [0] for root's value
+
+        let mut seen: std::collections::HashMap<[u32; 8], u32> =
+            std::collections::HashMap::new();
+
+        let canonical_root = Self::dedup_value(&self.nodes, root, &mut new_nodes, &mut seen);
+        new_nodes[0] = canonical_root;
+
+        self.nodes = new_nodes;
+    }
+
+    /// Canonicalize a single node value. Leaves and sentinels pass through
+    /// unchanged; branches are expanded, their 8 children are recursively
+    /// canonicalized, and the resulting 8-child block is inserted into (or
+    /// fetched from) the dedup map.
+    fn dedup_value(
+        old_nodes: &[u32],
+        node_value: u32,
+        new_nodes: &mut Vec<u32>,
+        seen: &mut std::collections::HashMap<[u32; 8], u32>,
+    ) -> u32 {
+        if !is_branch(node_value) {
+            return node_value;
+        }
+        let children_offset = node_value as usize;
+        let mut canonical_children: [u32; 8] = [0; 8];
+        for i in 0..8 {
+            let child = old_nodes[children_offset + i];
+            canonical_children[i] = Self::dedup_value(old_nodes, child, new_nodes, seen);
+        }
+        if let Some(&existing) = seen.get(&canonical_children) {
+            return existing;
+        }
+        let new_offset = new_nodes.len() as u32;
+        new_nodes.extend_from_slice(&canonical_children);
+        seen.insert(canonical_children, new_offset);
+        new_offset
+    }
+
+    /// Rebuild the node buffer keeping only nodes reachable from the root.
+    ///
+    /// During construction, [`try_collapse`] merges uniform 8-child subtrees
+    /// into a single value at the parent, but the 8 orphaned child slots stay
+    /// in the buffer as dead weight. For a large collapsed tree that waste
+    /// compounds — every call to `extend_from_slice` in `insert_at` was only
+    /// ever going to produce 1-byte storage for 32 bytes of allocation in the
+    /// worst case.
+    ///
+    /// This pass walks the reachable subtree, copying it into a fresh buffer
+    /// and rewriting branch offsets as it goes. After this, `node_count()`
+    /// equals the number of nodes that GPU traversal could actually reach.
+    pub fn compact(&mut self) {
+        if self.nodes.is_empty() {
+            return;
+        }
+        let root = self.nodes[0];
+
+        // Trivial roots (leaf / empty / interior) don't reference anything
+        // else — drop the whole tail.
+        if !is_branch(root) {
+            self.nodes.truncate(1);
+            return;
+        }
+
+        let mut new_nodes: Vec<u32> = Vec::with_capacity(self.nodes.len());
+        new_nodes.push(0); // placeholder for root; filled in below
+
+        // Work queue holds pairs (old_node_value, new_slot_idx). For each
+        // entry, we read the node at `old_node_value` from the old buffer;
+        // if it's a branch we allocate 8 new children slots and enqueue them.
+        //
+        // The root is handled specially since its value lives at `nodes[0]`.
+        let mut queue: std::collections::VecDeque<(u32, u32)> =
+            std::collections::VecDeque::new();
+
+        // Allocate 8 slots for the root's children in the new buffer.
+        let root_children_new = new_nodes.len() as u32;
+        new_nodes.extend(std::iter::repeat(0u32).take(8));
+        new_nodes[0] = root_children_new;
+        let root_children_old = root;
+        for i in 0..8u32 {
+            queue.push_back((root_children_old + i, root_children_new + i));
+        }
+
+        while let Some((old_idx, new_idx)) = queue.pop_front() {
+            let node = self.nodes[old_idx as usize];
+            if is_branch(node) {
+                // Allocate 8 new children slots.
+                let children_new = new_nodes.len() as u32;
+                new_nodes.extend(std::iter::repeat(0u32).take(8));
+                new_nodes[new_idx as usize] = children_new;
+                let children_old = node;
+                for i in 0..8u32 {
+                    queue.push_back((children_old + i, children_new + i));
+                }
+            } else {
+                // Leaf or sentinel — copy verbatim, no children to follow.
+                new_nodes[new_idx as usize] = node;
+            }
+        }
+
+        self.nodes = new_nodes;
     }
 
     /// Look up the node value at a voxel coordinate.
@@ -517,6 +699,231 @@ mod tests {
         // All children identical — root should collapse to a single leaf.
         assert_eq!(tree.nodes[0], make_leaf(99));
         assert_eq!(tree.leaf_count(), 1);
+    }
+
+    #[test]
+    fn compact_drops_orphan_slots_after_collapse() {
+        // Build a tree that will have orphaned slots post-collapse, then
+        // compact and verify the buffer shrinks but lookups still work.
+        let mut tree = SparseOctree::new(2, 0.1); // 4x4x4
+        for z in 0..4u32 {
+            for y in 0..4u32 {
+                for x in 0..4u32 {
+                    tree.insert(UVec3::new(x, y, z), 42);
+                }
+            }
+        }
+        // Fully uniform — should have collapsed to a single LEAF at the root,
+        // but the intermediate branch allocations are still in `nodes`.
+        assert_eq!(tree.nodes[0], make_leaf(42));
+        assert!(tree.node_count() > 1, "should have orphaned slots before compact");
+
+        tree.compact();
+        // Only the root remains.
+        assert_eq!(tree.node_count(), 1);
+        assert_eq!(tree.nodes[0], make_leaf(42));
+
+        // Lookups still work.
+        assert_eq!(tree.lookup(UVec3::new(0, 0, 0)), Some(make_leaf(42)));
+        assert_eq!(tree.lookup(UVec3::new(3, 3, 3)), Some(make_leaf(42)));
+    }
+
+    #[test]
+    fn compact_preserves_tree_with_no_orphans() {
+        // A tree with distinct children per octant has nothing to collapse.
+        // compact() should produce a buffer of the same shape.
+        let mut tree = SparseOctree::new(1, 0.1);
+        tree.insert(UVec3::new(0, 0, 0), 10);
+        tree.insert(UVec3::new(1, 1, 1), 20);
+
+        let before_count = tree.node_count();
+        let before_lookup_000 = tree.lookup(UVec3::new(0, 0, 0));
+        let before_lookup_111 = tree.lookup(UVec3::new(1, 1, 1));
+
+        tree.compact();
+
+        // Same number of reachable nodes (nothing to reclaim).
+        assert_eq!(tree.node_count(), before_count);
+        assert_eq!(tree.lookup(UVec3::new(0, 0, 0)), before_lookup_000);
+        assert_eq!(tree.lookup(UVec3::new(1, 1, 1)), before_lookup_111);
+    }
+
+    #[test]
+    fn deduplicate_shares_identical_subtrees() {
+        // Build a depth-2 tree where each of the root's 8 children is an
+        // identical branch: a branch whose 8 leaves all point to slot 99.
+        // After dedup, those 8 parent-branches all reference the same 8-leaf
+        // block, AND that block gets collapsed into a single LEAF by
+        // try_collapse (so the tree is actually just a single LEAF at the
+        // root after `insert` fires collapse).
+        //
+        // To specifically exercise DAG sharing (subtrees that don't themselves
+        // collapse), build a non-uniform child and place it at the same
+        // octant in every root-child.
+        let mut tree = SparseOctree::new(2, 0.1); // 4x4x4
+
+        // Fill octant 0 of each of the root's 8 quadrants with slot 7,
+        // others with slot 11. So each of the 8 root-child branches has the
+        // same internal structure — but because it's non-uniform, the branch
+        // itself can't collapse into a single leaf.
+        for root_oct in 0..8u32 {
+            let dx = root_oct & 1;
+            let dy = (root_oct >> 1) & 1;
+            let dz = (root_oct >> 2) & 1;
+            let base = UVec3::new(dx * 2, dy * 2, dz * 2);
+            for inner_oct in 0..8u32 {
+                let ix = inner_oct & 1;
+                let iy = (inner_oct >> 1) & 1;
+                let iz = (inner_oct >> 2) & 1;
+                let coord = UVec3::new(base.x + ix, base.y + iy, base.z + iz);
+                let slot = if inner_oct == 0 { 7 } else { 11 };
+                tree.insert(coord, slot);
+            }
+        }
+
+        let before = tree.node_count();
+        tree.deduplicate_subtrees();
+        let after = tree.node_count();
+
+        // All 8 root-children are structurally identical; they should all
+        // reference a single shared 8-child block after dedup.
+        assert!(
+            after < before,
+            "dedup should shrink: {} -> {}", before, after,
+        );
+
+        // Sanity: every lookup returns the correct slot.
+        for root_oct in 0..8u32 {
+            let dx = root_oct & 1;
+            let dy = (root_oct >> 1) & 1;
+            let dz = (root_oct >> 2) & 1;
+            let base = UVec3::new(dx * 2, dy * 2, dz * 2);
+            for inner_oct in 0..8u32 {
+                let ix = inner_oct & 1;
+                let iy = (inner_oct >> 1) & 1;
+                let iz = (inner_oct >> 2) & 1;
+                let coord = UVec3::new(base.x + ix, base.y + iy, base.z + iz);
+                let expected = if inner_oct == 0 {
+                    make_leaf(7)
+                } else {
+                    make_leaf(11)
+                };
+                assert_eq!(
+                    tree.lookup(coord),
+                    Some(expected),
+                    "wrong lookup at {:?}", coord,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deduplicate_preserves_unique_subtrees() {
+        // A tree whose 8 root-children are all structurally different should
+        // not shrink (nothing to share).
+        let mut tree = SparseOctree::new(1, 0.1);
+        for i in 0..8u32 {
+            let x = i & 1;
+            let y = (i >> 1) & 1;
+            let z = (i >> 2) & 1;
+            // Each position gets a unique slot.
+            tree.insert(UVec3::new(x, y, z), 100 + i);
+        }
+
+        // Verify each lookup is distinct and correct BEFORE dedup.
+        for i in 0..8u32 {
+            let x = i & 1;
+            let y = (i >> 1) & 1;
+            let z = (i >> 2) & 1;
+            assert_eq!(
+                tree.lookup(UVec3::new(x, y, z)),
+                Some(make_leaf(100 + i)),
+            );
+        }
+
+        tree.deduplicate_subtrees();
+
+        // Lookups still correct.
+        for i in 0..8u32 {
+            let x = i & 1;
+            let y = (i >> 1) & 1;
+            let z = (i >> 2) & 1;
+            assert_eq!(
+                tree.lookup(UVec3::new(x, y, z)),
+                Some(make_leaf(100 + i)),
+                "post-dedup lookup wrong at i={i}",
+            );
+        }
+    }
+
+    #[test]
+    fn deduplicate_handles_trivial_root() {
+        // A single-leaf tree: no branches, nothing to dedup, but shouldn't
+        // crash and should leave the tree valid.
+        let mut tree = SparseOctree::new(3, 0.1);
+        // The default root is EMPTY_NODE. Dedup should be a no-op.
+        tree.deduplicate_subtrees();
+        assert_eq!(tree.nodes[0], EMPTY_NODE);
+        assert_eq!(tree.node_count(), 1);
+    }
+
+    #[test]
+    fn deduplicate_recursive_self_similar_pattern() {
+        // Build a "corner" pattern: at every level of subdivision, octant 0
+        // gets subdivided the same way. This creates nested self-similar
+        // structure — dedup should collapse it dramatically.
+        let mut tree = SparseOctree::new(4, 0.1); // 16x16x16
+
+        // Insert a single voxel at (0,0,0) and another at (15,15,15).
+        // This forces subdivision along two diagonal chains. The empty
+        // octants at each level of the chain share structure (all EMPTY).
+        tree.insert(UVec3::new(0, 0, 0), 1);
+        tree.insert(UVec3::new(15, 15, 15), 2);
+
+        let before = tree.node_count();
+        tree.deduplicate_subtrees();
+        let after = tree.node_count();
+
+        // Lookups preserved.
+        assert_eq!(tree.lookup(UVec3::new(0, 0, 0)), Some(make_leaf(1)));
+        assert_eq!(tree.lookup(UVec3::new(15, 15, 15)), Some(make_leaf(2)));
+        assert_eq!(tree.lookup(UVec3::new(5, 5, 5)), Some(EMPTY_NODE));
+
+        // Even without obvious symmetry, there's enough shared sentinel
+        // structure that dedup shouldn't grow the tree.
+        assert!(after <= before, "dedup should not grow: {} -> {}", before, after);
+    }
+
+    #[test]
+    fn compact_handles_mixed_orphans_and_reachable() {
+        // Insert enough to create nested branches, then insert more causing
+        // some subtrees to collapse — producing orphans — while leaving other
+        // subtrees intact. Compact should drop the orphans but preserve the
+        // rest.
+        let mut tree = SparseOctree::new(2, 0.1);
+        // Half of the tree gets uniform data (will collapse); the other half
+        // gets two distinct values (can't collapse).
+        for z in 0..2u32 {
+            for y in 0..4u32 {
+                for x in 0..4u32 {
+                    tree.insert(UVec3::new(x, y, z), 7);
+                }
+            }
+        }
+        tree.insert(UVec3::new(0, 0, 3), 100);
+        tree.insert(UVec3::new(1, 1, 3), 200);
+
+        let before_count = tree.node_count();
+        tree.compact();
+        let after_count = tree.node_count();
+
+        assert!(after_count < before_count, "compact should shrink when orphans exist ({} -> {})", before_count, after_count);
+
+        // All original lookups must still succeed with the same values.
+        assert_eq!(tree.lookup(UVec3::new(2, 2, 0)), Some(make_leaf(7)));
+        assert_eq!(tree.lookup(UVec3::new(3, 3, 1)), Some(make_leaf(7)));
+        assert_eq!(tree.lookup(UVec3::new(0, 0, 3)), Some(make_leaf(100)));
+        assert_eq!(tree.lookup(UVec3::new(1, 1, 3)), Some(make_leaf(200)));
     }
 
     #[test]

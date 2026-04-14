@@ -359,14 +359,31 @@ impl RkpSceneManager {
             }
         }
 
+        // After dedup-remap, many leaves that used to have distinct slot
+        // indices now share the same slot. Three passes in order:
+        //   collapse_all()         — merge uniform 8-child subtrees into a
+        //                            single leaf (try_collapse didn't fire
+        //                            during the post-load remap).
+        //   compact()              — reclaim orphan storage from the collapse.
+        //   deduplicate_subtrees() — share identical 8-child blocks as DAG
+        //                            references. Massive reduction for
+        //                            geometry with any repetition.
         let octree_depth = header.octree_depth as u8;
-        let handle = self.octree.allocate_raw(&remapped_nodes, octree_depth, voxel_size);
+        let mut tree = SparseOctree::from_raw(&remapped_nodes, octree_depth, voxel_size);
+        let raw_count = tree.node_count();
+        tree.collapse_all();
+        tree.compact();
+        let compact_count = tree.node_count();
+        tree.deduplicate_subtrees();
+        let dedup_count = tree.node_count();
+        let compact_nodes = tree.as_slice().to_vec();
+
+        let handle = self.octree.allocate_raw(&compact_nodes, octree_depth, voxel_size);
 
         // Emit faces via octree-based neighbor lookup.
         eprintln!("[RkpSceneManager] emitting faces with object_id={}", object_id);
         {
-            let octree = SparseOctree::from_raw(&remapped_nodes, octree_depth, voxel_size);
-            emit_faces(&octree, &self.voxel_pool, object_id, &mut self.pending_faces);
+            emit_faces(&tree, &self.voxel_pool, object_id, &mut self.pending_faces);
             self.faces_dirty = true;
         }
 
@@ -378,12 +395,15 @@ impl RkpSceneManager {
         };
 
         eprintln!(
-            "[RkpSceneManager] loaded .rkp: {} voxels → {} unique pool slots ({:.1}×), {} faces, {} octree nodes",
+            "[RkpSceneManager] loaded .rkp: {} voxels → {} unique pool slots ({:.1}×), {} faces, octree {} → compact {} → dedup {} ({:.1}× total)",
             voxel_count,
             unique_count,
             if unique_count > 0 { voxel_count as f64 / unique_count as f64 } else { 0.0 },
             self.pending_faces.len(),
-            remapped_nodes.len(),
+            raw_count,
+            compact_count,
+            dedup_count,
+            if dedup_count > 0 { raw_count as f64 / dedup_count as f64 } else { 0.0 },
         );
 
         Ok(AssetLoadResult {

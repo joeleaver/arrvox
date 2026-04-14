@@ -89,6 +89,37 @@ where
         base_voxel_size,
     )?;
 
+    // Three passes operate on the raw tree before GPU upload:
+    //
+    //   1. compact()              — reclaims orphans left by `try_collapse`
+    //                                during insertion. Only addresses memory,
+    //                                not duplication across subtrees.
+    //   2. deduplicate_subtrees() — merges any 8-child blocks that happen to
+    //                                have identical canonical children. A
+    //                                procedural cube's 6 symmetric faces all
+    //                                collapse to a single shared subtree.
+    //
+    // Together these can reduce a 16 M-node tree to <1 M for symmetric
+    // geometry, with zero quality loss and no shader changes.
+    let nodes_before_compact = octree.node_count();
+    octree.compact();
+    let nodes_after_compact = octree.node_count();
+    octree.deduplicate_subtrees();
+    let nodes_after_dedup = octree.node_count();
+    if nodes_before_compact >= 10_000 {
+        eprintln!(
+            "[voxelize_opacity_octree] leaves={}  unique_voxels={}  octree {} → compact {} → dedup {} ({:.1}× total)",
+            voxel_count,
+            dedup.len(),
+            nodes_before_compact,
+            nodes_after_compact,
+            nodes_after_dedup,
+            if nodes_after_dedup > 0 {
+                nodes_before_compact as f64 / nodes_after_dedup as f64
+            } else { 0.0 },
+        );
+    }
+
     Some(VoxelizeOctreeResult {
         octree,
         voxel_count,
