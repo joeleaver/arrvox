@@ -113,11 +113,12 @@ impl RkpShadePass {
                 entries: &[texture_entry(0), texture_entry(1), uint_texture_entry(2)],
             });
 
-        // Group 1: shadow texture + SSAO texture
+        // Group 1: SSAO texture (shadow was removed alongside the compute
+        // march; a future triangle-based shadow pass will reintroduce it).
         let ssao_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("rkp_shade shadow+ssao"),
-                entries: &[texture_entry(0), texture_entry(1)],
+                label: Some("rkp_shade ssao"),
+                entries: &[texture_entry(0)],
             });
 
         // Group 2: output HDR texture
@@ -283,26 +284,15 @@ impl RkpShadePass {
         }));
     }
 
-    /// Set shadow texture + SSAO texture views.
-    pub fn set_shadow_and_ssao(
-        &mut self,
-        device: &wgpu::Device,
-        shadow_view: &wgpu::TextureView,
-        ssao_view: &wgpu::TextureView,
-    ) {
+    /// Set the SSAO texture view.
+    pub fn set_ssao(&mut self, device: &wgpu::Device, ssao_view: &wgpu::TextureView) {
         self.ssao_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rkp_shade shadow+ssao bg"),
+            label: Some("rkp_shade ssao bg"),
             layout: &self.ssao_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(shadow_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(ssao_view),
-                },
-            ],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(ssao_view),
+            }],
         }));
     }
 

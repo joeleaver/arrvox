@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use rkp_core::{ExtractedMesh, OctreeHandle, SparseOctree, SplatVoxel, VoxelPool};
 
 use crate::octree_gpu::OctreeGpu;
-use crate::rkp_scene::GeometryUpload;
 
 /// Face instance for CPU-side face emission (legacy — kept for scene loading compatibility).
 #[repr(C)]
@@ -203,18 +202,6 @@ impl RkpSceneManager {
     pub fn clear_faces(&mut self) {
         self.pending_faces.clear();
         self.faces_dirty = true;
-    }
-
-    // ── Geometry upload snapshot ──────────────────────────────────────
-
-    /// Build a GeometryUpload snapshot for RkpRenderer.
-    pub fn geometry_upload(&self) -> GeometryUpload<'_> {
-        let octree_data = self.octree.data();
-        GeometryUpload {
-            voxel_pool: self.voxel_pool.as_bytes(),
-            octree_nodes: bytemuck::cast_slice(octree_data),
-            color_pool: self.voxel_pool.color_bytes(),
-        }
     }
 
     // ── Spatial deallocation ─────────────────────────────────────────

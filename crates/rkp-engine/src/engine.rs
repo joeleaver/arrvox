@@ -536,10 +536,11 @@ impl EngineState {
             label: Some("rkp frame"),
         });
 
-        // 1. Upload geometry if dirty.
+        // 1. Geometry-dirty handling. Post-Phase-4 the renderer has no GPU
+        //    voxel/octree buffers — mesh uploads happen via the mesh pool
+        //    at voxelize/load time. We still clear the flag and rebuild
+        //    collider caches when set.
         if self.geometry_dirty {
-            let geo = self.scene_mgr.geometry_upload();
-            self.renderer.upload_geometry(&self.queue, &geo);
             self.geometry_dirty = false;
             self.collider_caches_dirty = true;
         }
@@ -560,15 +561,7 @@ impl EngineState {
 
         let t_upload = frame_start.elapsed();
 
-        // 3. Render: march (+ per-light shadow) → SSAO → shade → volumetrics.
-        let object_count = self.gpu_objects.len() as u32;
-        let shadow_steps = self.environment.shadow_steps;
-        let num_lights = self.num_lights_cache;
-        let vp = glam::Mat4::from_cols_array_2d(&cam_uniforms.view_proj);
-        let screen_aabbs = crate::scene_sync::compute_screen_aabbs(
-            &self.gpu_objects, &vp, self.width as f32, self.height as f32,
-        );
-        let screen_aabbs_bytes: &[u8] = bytemuck::cast_slice(&screen_aabbs);
+        // 3. Render: triangle G-buffer → SSAO → shade → volumetrics.
 
         // Upload volumetric params.
         let vol_params = self.environment.to_volumetric_params(
@@ -641,7 +634,13 @@ impl EngineState {
             }
         }
 
-        self.renderer.render(&mut encoder, &self.queue, &self.gbuffer, &mesh_draws, object_count, self.width, self.height, shadow_steps, num_lights, screen_aabbs_bytes, &atmo_frame);
+        self.renderer.render(
+            &mut encoder,
+            &self.queue,
+            &self.gbuffer,
+            &mesh_draws,
+            &atmo_frame,
+        );
 
         let t_encode = frame_start.elapsed();
 

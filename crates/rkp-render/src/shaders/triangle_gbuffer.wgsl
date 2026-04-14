@@ -11,9 +11,9 @@
 //   1: normal.xyz + blend_weight     Rgba16Float  ( 8 B)
 //   2: material_ids + blend+object_id Rg32Uint    ( 8 B)  — total 32 B ✓
 //
-// Scene bind group (group 0) matches rkp_scene:
-//   2: objects (storage, read) — RkpGpuObject array
-//   3: camera  (uniform)       — CameraUniforms
+// Scene bind group (group 0) matches rkp_scene (Phase 4 minimal layout):
+//   0: objects (storage, read) — RkpGpuObject array
+//   1: camera  (uniform)       — CameraUniforms
 
 struct CameraUniforms {
     position:   vec4<f32>,
@@ -48,8 +48,8 @@ struct RkpGpuObject {
     inverse_world:             mat4x4<f32>,  // 192 (64 B)
 }
 
-@group(0) @binding(2) var<storage, read> objects: array<RkpGpuObject>;
-@group(0) @binding(3) var<uniform> camera: CameraUniforms;
+@group(0) @binding(0) var<storage, read> objects: array<RkpGpuObject>;
+@group(0) @binding(1) var<uniform> camera: CameraUniforms;
 
 struct VertexIn {
     @location(0) position:      vec3<f32>,

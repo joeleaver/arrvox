@@ -98,8 +98,8 @@ mod tests {
     use std::mem;
 
     #[test]
-    fn size_is_192_bytes() {
-        assert_eq!(mem::size_of::<RkpGpuObject>(), 192);
+    fn size_is_256_bytes() {
+        assert_eq!(mem::size_of::<RkpGpuObject>(), 256);
     }
 
     #[test]

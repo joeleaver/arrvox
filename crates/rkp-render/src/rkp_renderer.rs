@@ -1,38 +1,33 @@
 //! RKIPatch renderer — owns the GPU scene and all render passes.
 //!
-//! The caller (rkp-editor) drives the renderer each frame:
-//! 1. Build RkpGpuObjects from ECS/scene state
-//! 2. Call `upload_frame(objects, camera)` — cheap, every frame
-//! 3. Call `upload_geometry(...)` — only when geometry changes
-//! 4. Call `render(encoder, width, height, ...)` — march (+ shadow) + SSAO + shade
+//! Phase 4 pipeline: triangle raster → SSAO → shade → volumetric → god rays.
+//! The compute-era ray march is gone; every renderable object comes from the
+//! mesh pool.
+//!
+//! Caller (rkp-editor) drives the renderer each frame:
+//! 1. Build `RkpGpuObject`s from ECS/scene state
+//! 2. Upload extracted meshes via `renderer.mesh_pool.upload_mesh` / `.flush`
+//! 3. Call `upload_frame(objects, camera)` every frame (cheap)
+//! 4. Call `render(encoder, gbuffer, mesh_draws, ...)`
 
-use crate::rkp_scene::{RkpScene, GeometryUpload, FrameUpload, CameraUniforms};
+use crate::rkp_scene::{RkpScene, FrameUpload};
 use crate::rkp_ssao::RkpSsaoPass;
 use crate::rkp_shade::{RkpShadePass, ShadeParams, GpuLight, GpuMaterial};
 use crate::rkp_volumetric::{RkpVolumetricPass, VolumetricParams, CloudParams};
 use crate::rkp_atmosphere::RkpAtmospherePass;
 use crate::rkp_god_rays::RkpGodRayPass;
-use crate::rkp_gpu_object::RkpGpuObject;
-use crate::octree_march::OctreeMarchPass;
 use crate::mesh_pool::MeshPool;
 use crate::triangle_gbuffer::{MeshDraw, TriangleGBufferPass};
 use wgpu_profiler::GpuProfiler;
 
 /// The complete RKIPatch renderer.
 pub struct RkpRenderer {
-    /// Scene GPU buffers.
+    /// Scene GPU buffers (objects + camera).
     pub scene: RkpScene,
-    /// Octree ray march compute pass — primary visibility + shadow.
-    pub march: OctreeMarchPass,
-    /// Triangle rasterization pass writing the same G-buffer for mesh objects.
+    /// Triangle rasterization pass — primary visibility for mesh objects.
     pub triangle: TriangleGBufferPass,
     /// GPU vertex/index storage for extracted marching-cubes meshes.
     pub mesh_pool: MeshPool,
-    /// Debug toggle: when true, skip the compute march entirely and render
-    /// ONLY from the triangle pass. Default: `true` iff `RKP_MESH_ONLY=1` was
-    /// set in the environment at startup. Useful for A/B comparison during
-    /// the Phase-4 cut-over.
-    pub mesh_only_mode: bool,
     /// Half-res screen-space ambient occlusion compute pass.
     pub ssao: RkpSsaoPass,
     /// Deferred PBR shading compute pass.
@@ -47,9 +42,6 @@ pub struct RkpRenderer {
     pub volumetric: RkpVolumetricPass,
     /// Screen-space god rays.
     pub god_rays: RkpGodRayPass,
-    /// Per-light shadow texture (Rgba8Unorm, up to 4 shadow-casting lights).
-    shadow_texture: wgpu::Texture,
-    shadow_view: wgpu::TextureView,
     /// Device for buffer operations.
     device: wgpu::Device,
     /// GPU profiler (wgpu-profiler).
@@ -62,7 +54,6 @@ pub struct RkpRenderer {
 impl RkpRenderer {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) -> Self {
         let scene = RkpScene::new(device);
-        let mut march = OctreeMarchPass::new(device, &scene.bind_group_layout);
         let triangle = TriangleGBufferPass::new(device, &scene.bind_group_layout);
         let mesh_pool = MeshPool::new(device);
 
@@ -105,34 +96,18 @@ impl RkpRenderer {
         shade.set_shade_data(device, &shade_params_buffer, &lights_buffer, &materials_buffer);
         shade.set_camera(device, &scene.camera_buffer);
         shade.set_atmosphere_luts(device, &atmosphere.transmittance_view, &atmosphere.multiscatter_view, &atmosphere.lut_sampler, &atmosphere.sky_view_view, &atmosphere.ap_view);
-        march.set_materials(device, &materials_buffer);
-        march.set_lights(device, &lights_buffer);
 
-        let (shadow_texture, shadow_view) = Self::create_shadow_texture(device, width, height);
         let volumetric = RkpVolumetricPass::new(device, width, height);
         let mut god_rays = RkpGodRayPass::new(device, width, height);
         god_rays.set_input(device, &volumetric.output_view);
 
-        let mesh_only_mode = std::env::var("RKP_MESH_ONLY")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if mesh_only_mode {
-            eprintln!("[rkp-renderer] RKP_MESH_ONLY=1 — compute march disabled, rendering triangle pass only");
-        }
-
         Self {
-            scene, march, triangle, mesh_pool, ssao, shade, atmosphere, volumetric, god_rays,
+            scene, triangle, mesh_pool, ssao, shade, atmosphere, volumetric, god_rays,
             shade_params_buffer, lights_buffer, materials_buffer,
-            shadow_texture, shadow_view,
             device: device.clone(),
             profiler, timestamp_period,
             width, height,
-            mesh_only_mode,
         }
-    }
-
-    pub fn upload_geometry(&mut self, queue: &wgpu::Queue, data: &GeometryUpload) {
-        self.scene.upload_geometry(&self.device, queue, data);
     }
 
     pub fn upload_frame(&mut self, queue: &wgpu::Queue, data: &FrameUpload) {
@@ -140,14 +115,10 @@ impl RkpRenderer {
     }
 
     /// Set G-buffer views. Call after G-buffer creation or resize.
-    pub fn set_gbuffer(
-        &mut self,
-        gbuffer: &rkf_render::GBuffer,
-    ) {
-        self.march.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &self.shadow_view);
+    pub fn set_gbuffer(&mut self, gbuffer: &rkf_render::GBuffer) {
         self.ssao.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view);
         self.shade.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view);
-        self.shade.set_shadow_and_ssao(&self.device, &self.shadow_view, &self.ssao.output_view);
+        self.shade.set_ssao(&self.device, &self.ssao.output_view);
         self.volumetric.set_depth_view(&self.device, &gbuffer.position_view);
         self.volumetric.set_scene_hdr_view(&self.device, &self.shade.output_view);
         self.god_rays.set_input(&self.device, &self.volumetric.output_view);
@@ -157,30 +128,20 @@ impl RkpRenderer {
         self.shade.set_output_view(&self.device, view);
     }
 
-    /// Render: march (+ per-light shadow) → triangle raster (for mesh objects)
-    /// → SSAO → shade.
+    /// Render: atmosphere LUTs → triangle G-buffer → SSAO → shade → volumetric → god rays.
     ///
     /// `mesh_draws` is an ordered list of `(gpu_object_index, allocation)` for
     /// every object whose geometry has been extracted into the mesh pool.
-    /// An empty list skips the triangle pass entirely.
-    #[allow(clippy::too_many_arguments)]
+    /// The triangle pass always runs (clearing the G-buffer) so downstream
+    /// passes see a defined surface.
     pub fn render(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         queue: &wgpu::Queue,
         gbuffer: &rkf_render::GBuffer,
         mesh_draws: &[MeshDraw],
-        object_count: u32,
-        width: u32,
-        height: u32,
-        shadow_steps: u32,
-        num_lights: u32,
-        screen_aabbs: &[u8],
         atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
     ) {
-        // Upload screen-space AABBs for tile culling.
-        self.march.upload_screen_aabbs(queue, screen_aabbs);
-
         // 0. Atmosphere LUTs (precomputed + per-frame).
         self.atmosphere.dispatch_if_dirty(encoder);
         {
@@ -189,29 +150,10 @@ impl RkpRenderer {
             self.profiler.end_query(encoder, q);
         }
 
-        // 1. Octree ray march → G-buffer + per-light shadow texture.
-        //    Skipped in mesh-only debug mode — the triangle pass below
-        //    clears the G-buffer itself in that case.
-        if !self.mesh_only_mode {
-            self.march.clear_stats(encoder);
-            {
-                let q = self.profiler.begin_query("march", encoder);
-                self.march.dispatch(
-                    encoder, queue, &self.scene.bind_group,
-                    object_count, width, height, 0,
-                    shadow_steps, num_lights, None,
-                );
-                self.profiler.end_query(encoder, q);
-            }
-            self.march.copy_stats(encoder);
-        }
-
-        // 1b. Triangle G-buffer pass — rasterize mesh-backed objects. In
-        //     the default (A/B) mode this overwrites march pixels via depth
-        //     test. In mesh-only mode this pass OWNS the G-buffer: it
-        //     clears before drawing, and always runs (even with no draws)
-        //     so downstream passes see a clean surface.
-        if self.mesh_only_mode || !mesh_draws.is_empty() {
+        // 1. Triangle G-buffer pass — owns the G-buffer (clears + draws).
+        //    Always runs even with zero mesh draws so the cleared surface
+        //    propagates to SSAO / shade as "sky" (hit_dist = 0).
+        {
             let q = self.profiler.begin_query("triangle", encoder);
             self.triangle.dispatch(
                 encoder,
@@ -219,7 +161,7 @@ impl RkpRenderer {
                 gbuffer,
                 &self.mesh_pool,
                 mesh_draws,
-                self.mesh_only_mode,
+                true, // always clear — triangle pass owns the G-buffer post-Phase-4
             );
             self.profiler.end_query(encoder, q);
         }
@@ -253,8 +195,8 @@ impl RkpRenderer {
             self.profiler.end_query(encoder, q);
         }
 
-        // Note: profiler queries are resolved by `resolve_profiler_queries` —
-        // the caller runs extra passes after this (bloom/tone/composite) and
+        // Profiler queries are resolved by `resolve_profiler_queries` — the
+        // caller runs extra passes after this (bloom/tone/composite) and
         // wants them profiled too, so the resolve happens once at the end.
     }
 
@@ -265,8 +207,7 @@ impl RkpRenderer {
     }
 
     /// End frame + process profiler results. Call after submit.
-    pub fn end_profiler_frame(&mut self, frame_idx: u64, width: u32, height: u32) {
-        self.march.read_stats(&self.device, width * height, frame_idx);
+    pub fn end_profiler_frame(&mut self, frame_idx: u64, _width: u32, _height: u32) {
         if let Err(e) = self.profiler.end_frame() {
             if frame_idx > 10 {
                 eprintln!("[profiler] end_frame: {e}");
@@ -306,7 +247,6 @@ impl RkpRenderer {
                 &self.lights_buffer,
                 &self.materials_buffer,
             );
-            self.march.set_lights(&self.device, &self.lights_buffer);
         } else {
             queue.write_buffer(&self.lights_buffer, 0, data);
         }
@@ -330,7 +270,6 @@ impl RkpRenderer {
                 &self.lights_buffer,
                 &self.materials_buffer,
             );
-            self.march.set_materials(&self.device, &self.materials_buffer);
         } else {
             queue.write_buffer(&self.materials_buffer, 0, data);
         }
@@ -340,9 +279,6 @@ impl RkpRenderer {
         if width != self.width || height != self.height {
             self.width = width;
             self.height = height;
-            let (tex, view) = Self::create_shadow_texture(&self.device, width, height);
-            self.shadow_texture = tex;
-            self.shadow_view = view;
         }
         self.ssao.resize(&self.device, width, height);
         self.shade.resize(&self.device, width, height);
@@ -358,21 +294,6 @@ impl RkpRenderer {
     /// Update cloud parameters.
     pub fn update_cloud_params(&self, queue: &wgpu::Queue, cloud: &CloudParams) {
         self.volumetric.update_cloud_params(queue, cloud);
-    }
-
-    fn create_shadow_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
-        let tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("rkp_shadow"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        (tex, view)
     }
 
     fn create_init_buffer(device: &wgpu::Device, label: &str, usage: wgpu::BufferUsages, data: &[u8]) -> wgpu::Buffer {

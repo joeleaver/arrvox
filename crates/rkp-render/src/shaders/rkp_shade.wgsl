@@ -57,8 +57,10 @@ struct Material {
 @group(0) @binding(2) var gbuf_material: texture_2d<u32>;
 
 // Group 1: shadow texture (read, full-res) + SSAO texture (read, half-res)
-@group(1) @binding(0) var shadow_tex: texture_2d<f32>;
-@group(1) @binding(1) var ssao_tex: texture_2d<f32>;
+// Phase 4: shadow texture removed with the compute march. A future shadow
+// pass (cascaded shadow maps from triangle geometry) will reintroduce it.
+// Until then every light contributes fully.
+@group(1) @binding(0) var ssao_tex: texture_2d<f32>;
 
 // Group 2: output HDR color (write, full-res)
 @group(2) @binding(0) var output: texture_storage_2d<rgba16float, write>;
@@ -402,16 +404,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // F0 for dielectrics vs metals.
     let f0 = mix(vec3<f32>(0.04), albedo, metallic);
 
-    // Per-light shadow from shadow texture (written by march pass).
-    let shadow_data = textureLoad(shadow_tex, coord, 0);
-
     // AO from half-res SSAO texture.
     let half_coord = vec2<i32>(gid.xy) / 2;
     let ao = textureLoad(ssao_tex, half_coord, 0).r;
 
     // Accumulate direct lighting.
     var lo = vec3<f32>(0.0);
-    var shadow_idx = 0u; // tracks which shadow channel to read
 
     for (var li = 0u; li < shade_params.num_lights; li++) {
         let light = lights[li];
@@ -435,14 +433,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
 
-        // Read per-light shadow BEFORE the n_dot_l skip — must stay in sync
-        // with the march pass which always writes shadow for every shadow-casting light.
-        var light_shadow = 1.0;
-        let cast_shadow = light.params.w;
-        if cast_shadow >= 0.5 && shadow_idx < 4u {
-            light_shadow = shadow_data[shadow_idx];
-            shadow_idx++;
-        }
+        // Shadow contribution stubbed at 1.0 until a triangle-based shadow
+        // pass lands (Phase 4 dropped the compute-march-era shadow texture).
+        let light_shadow = 1.0;
 
         let n_dot_l = max(dot(N, L), 0.0);
         if n_dot_l <= 0.0 { continue; }
