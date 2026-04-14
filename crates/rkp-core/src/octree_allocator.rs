@@ -82,15 +82,52 @@ impl OctreeAllocator {
     }
 
     /// Deallocate an octree region, adding it to the free list.
+    ///
+    /// Coalesces adjacent free regions and shrinks the backing buffer if the
+    /// coalesced tail reaches `data.len()`. Without this, repeated re-voxelize
+    /// of procedural objects whose new allocation is even slightly larger than
+    /// any single freed region causes the buffer to grow monotonically.
     pub fn deallocate(&mut self, handle: OctreeHandle) {
         let start = handle.root_offset as usize;
         let end = start + handle.len as usize;
-        if end <= self.data.len() {
-            // Clear to EMPTY to avoid stale data.
-            for entry in &mut self.data[start..end] {
-                *entry = crate::sparse_octree::EMPTY_NODE;
+        if end > self.data.len() {
+            return;
+        }
+        // Clear to EMPTY so stale branch offsets can't be misread.
+        for entry in &mut self.data[start..end] {
+            *entry = crate::sparse_octree::EMPTY_NODE;
+        }
+        self.free_list.push((handle.root_offset, handle.len));
+        self.coalesce_and_shrink();
+    }
+
+    /// Merge adjacent regions in the free list, then truncate `data` if the
+    /// merged tail ends at the current buffer length.
+    fn coalesce_and_shrink(&mut self) {
+        if self.free_list.is_empty() {
+            return;
+        }
+        // Sort by offset so adjacency can be detected in one pass.
+        self.free_list.sort_unstable_by_key(|&(off, _)| off);
+
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(self.free_list.len());
+        for &(off, len) in &self.free_list {
+            match merged.last_mut() {
+                Some(last) if last.0 + last.1 == off => last.1 += len,
+                _ => merged.push((off, len)),
             }
-            self.free_list.push((handle.root_offset, handle.len));
+        }
+        self.free_list = merged;
+
+        // If the last free region now ends at the buffer tail, drop it from
+        // both the free list and the backing vec — truly reclaiming space.
+        while let Some(&(off, len)) = self.free_list.last() {
+            if (off + len) as usize == self.data.len() {
+                self.data.truncate(off as usize);
+                self.free_list.pop();
+            } else {
+                break;
+            }
         }
     }
 
@@ -241,34 +278,44 @@ mod tests {
 
     #[test]
     fn deallocate_and_reuse() {
+        // Freeing a non-tail region leaves a gap that the next small
+        // allocation should reuse. Set up A, B; free A (middle); alloc small
+        // into A's old slot. B pins the tail so coalesce-and-shrink can't
+        // reclaim the region yet.
         let mut alloc = OctreeAllocator::new();
 
         let tree1 = make_test_octree();
-        let h1 = alloc.allocate(&tree1);
-        let buf_len_after_first = alloc.buffer_len();
+        let h_a = alloc.allocate(&tree1);
+        let _h_b = alloc.allocate(&tree1);
+        let buf_len_with_both = alloc.buffer_len();
 
-        alloc.deallocate(h1);
+        alloc.deallocate(h_a);
+        // A is a non-tail region — can't shrink, stays on free list.
         assert_eq!(alloc.free_region_count(), 1);
+        assert_eq!(alloc.buffer_len(), buf_len_with_both);
 
-        // Allocate a small tree — should reuse the freed region.
+        // Allocate a small tree — should reuse the freed region at offset 0.
         let small = SparseOctree::new(1, 0.1);
-        let h2 = alloc.allocate(&small);
-        assert_eq!(h2.root_offset, 0, "should reuse freed region at offset 0");
+        let h_c = alloc.allocate(&small);
+        assert_eq!(h_c.root_offset, 0, "should reuse freed region at offset 0");
 
-        // Buffer shouldn't have grown (reused space).
-        assert_eq!(alloc.buffer_len(), buf_len_after_first);
+        // Buffer didn't grow (reused space, B still pins the tail).
+        assert_eq!(alloc.buffer_len(), buf_len_with_both);
     }
 
     #[test]
     fn deallocate_clears_to_empty() {
+        // A non-tail region's slots must be cleared to EMPTY_NODE so stale
+        // branch pointers can't be followed by accident. Pin the tail with B
+        // so A's dealloc doesn't get truncated away.
         let mut alloc = OctreeAllocator::new();
         let tree = make_test_octree();
-        let handle = alloc.allocate(&tree);
+        let h_a = alloc.allocate(&tree);
+        let _h_b = alloc.allocate(&tree);
 
-        alloc.deallocate(handle);
+        alloc.deallocate(h_a);
 
-        // All entries in the deallocated region should be EMPTY_NODE.
-        for i in 0..handle.len as usize {
+        for i in 0..h_a.len as usize {
             assert_eq!(alloc.as_slice()[i], EMPTY_NODE);
         }
     }
@@ -376,5 +423,73 @@ mod tests {
     fn with_capacity() {
         let alloc = OctreeAllocator::with_capacity(1024);
         assert_eq!(alloc.buffer_len(), 0);
+    }
+
+    #[test]
+    fn coalesces_adjacent_free_regions() {
+        // Allocate A, B, C sequentially. Freeing A and B should coalesce their
+        // free regions into one, enabling a later allocation larger than either
+        // individual freed region to fit without bumping the tail.
+        let mut alloc = OctreeAllocator::new();
+        let t_a = { let mut t = SparseOctree::new(1, 0.1); t.insert(UVec3::new(0,0,0), 1); t };
+        let t_b = { let mut t = SparseOctree::new(1, 0.1); t.insert(UVec3::new(0,0,0), 2); t };
+        let t_c = { let mut t = SparseOctree::new(1, 0.1); t.insert(UVec3::new(0,0,0), 3); t };
+        let h_a = alloc.allocate(&t_a);
+        let h_b = alloc.allocate(&t_b);
+        let _h_c = alloc.allocate(&t_c);
+        assert!(h_a.len > 0 && h_b.len > 0);
+
+        alloc.deallocate(h_a);
+        alloc.deallocate(h_b);
+        // A + B are contiguous and C is still at the tail, so the free list
+        // should contain exactly one coalesced entry covering both.
+        assert_eq!(alloc.free_region_count(), 1);
+        assert_eq!(alloc.total_free_entries(), h_a.len + h_b.len);
+    }
+
+    #[test]
+    fn shrinks_buffer_when_tail_freed() {
+        // Deallocating the tail region should shrink `data` — otherwise the
+        // GPU upload size never decreases even when content drops.
+        let mut alloc = OctreeAllocator::new();
+        let t1 = make_test_octree();
+        let h1 = alloc.allocate(&t1);
+        let len_after_first = alloc.buffer_len();
+
+        let t2 = make_test_octree();
+        let h2 = alloc.allocate(&t2);
+        let len_after_second = alloc.buffer_len();
+        assert!(len_after_second > len_after_first);
+
+        alloc.deallocate(h2);
+        // Tail freed and coalesced — buffer should shrink back to h1's extent.
+        assert_eq!(alloc.buffer_len(), len_after_first);
+        assert_eq!(alloc.free_region_count(), 0);
+
+        alloc.deallocate(h1);
+        // Now everything is freed and was at the tail — buffer empty.
+        assert_eq!(alloc.buffer_len(), 0);
+        assert_eq!(alloc.free_region_count(), 0);
+    }
+
+    #[test]
+    fn non_tail_dealloc_keeps_buffer_len_but_coalesces_later() {
+        // Free a middle region — buffer can't shrink yet. Then free the tail;
+        // coalescing should now drop the whole thing.
+        let mut alloc = OctreeAllocator::new();
+        let t = make_test_octree();
+        let h1 = alloc.allocate(&t);
+        let h2 = alloc.allocate(&t);
+        let h3 = alloc.allocate(&t);
+        let peak = alloc.buffer_len();
+
+        alloc.deallocate(h2);
+        assert_eq!(alloc.buffer_len(), peak);
+        assert_eq!(alloc.free_region_count(), 1);
+
+        alloc.deallocate(h3);
+        // h2 + h3 now adjacent and at the tail — both should be reclaimed.
+        assert_eq!(alloc.buffer_len(), h1.len as usize);
+        assert_eq!(alloc.free_region_count(), 0);
     }
 }

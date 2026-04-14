@@ -49,6 +49,8 @@ fn spatial_from_handle(
     handle: &rkf_core::scene_node::SpatialHandle,
     voxel_size: f32,
     aabb: &rkf_core::Aabb,
+    voxel_slot_start: u32,
+    voxel_slot_count: u32,
 ) -> SpatialData {
     if let rkf_core::scene_node::SpatialHandle::Octree {
         root_offset, len, depth, base_voxel_size,
@@ -61,11 +63,14 @@ fn spatial_from_handle(
             base_voxel_size: *base_voxel_size,
             aabb: *aabb,
             voxel_size,
+            voxel_slot_start,
+            voxel_slot_count,
         }
     } else {
         SpatialData {
             root_offset: 0, len: 0, depth: 0, base_voxel_size: voxel_size,
             aabb: *aabb, voxel_size,
+            voxel_slot_start, voxel_slot_count,
         }
     }
 }
@@ -237,6 +242,8 @@ struct EngineState {
     environment: crate::environment::EnvironmentSettings,
     /// Whether environment settings changed and need GPU update.
     environment_dirty: bool,
+    /// Whether the editor UI needs the latest environment (cleared by build_state_update).
+    environment_ui_dirty: bool,
 
     /// Console log buffer.
     console: crate::console::ConsoleLog,
@@ -424,6 +431,7 @@ impl EngineState {
             selected_model: None,
             environment: crate::environment::EnvironmentSettings::default(),
             environment_dirty: true, // upload on first frame
+            environment_ui_dirty: true,
             console: crate::console::ConsoleLog::new(),
             gameplay_loader: crate::gameplay_loader::GameplayLoader::new(),
             behavior_executor: None,
@@ -647,15 +655,28 @@ impl EngineState {
         }
 
         // 5a. Bloom: extract bright pixels + multi-level blur.
-        self.bloom.dispatch(&mut encoder);
+        {
+            let q = self.renderer.profiler.begin_query("bloom", &mut encoder);
+            self.bloom.dispatch(&mut encoder);
+            self.renderer.profiler.end_query(&mut encoder, q);
+        }
 
         // 5b. Bloom composite: blend blurred bloom back onto HDR.
-        self.bloom_composite.dispatch(&mut encoder);
+        {
+            let q = self.renderer.profiler.begin_query("bloom_composite", &mut encoder);
+            self.bloom_composite.dispatch(&mut encoder);
+            self.renderer.profiler.end_query(&mut encoder, q);
+        }
 
         // 5c. Tone mapping: bloom composite HDR → LDR (Rgba8Unorm).
-        self.tone_map.dispatch(&mut encoder);
+        {
+            let q = self.renderer.profiler.begin_query("tone_map", &mut encoder);
+            self.tone_map.dispatch(&mut encoder);
+            self.renderer.profiler.end_query(&mut encoder, q);
+        }
 
         // 6. Copy LDR to composite texture, draw gizmo wireframes, readback.
+        let q_post = self.renderer.profiler.begin_query("post", &mut encoder);
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: self.tone_map.ldr_texture(),
@@ -715,6 +736,10 @@ impl EngineState {
                 depth_or_array_layers: 1,
             },
         );
+        self.renderer.profiler.end_query(&mut encoder, q_post);
+
+        // 7b. Resolve all profiler queries now that every pass has been encoded.
+        self.renderer.resolve_profiler_queries(&mut encoder);
 
         let t_post = frame_start.elapsed();
 
@@ -889,6 +914,8 @@ impl EngineState {
                         view_formats: &[],
                     });
                     self.composite_view = self.composite_texture.create_view(&Default::default());
+                    self.environment_dirty = true;
+                    self.environment_ui_dirty = true;
                     eprintln!("[RkpEngine] resized to {}x{}", width, height);
                 }
             }
@@ -905,7 +932,7 @@ impl EngineState {
                     &primitive, 0, 0.05, glam::Vec3::ONE, scene_id,
                 );
                 if let Some(result) = result {
-                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
+                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.voxel_slot_start, result.voxel_slot_count);
                     let entity = self.world.spawn((
                         Transform::default(),
                         EditorMetadata { name: name.clone() },
@@ -936,7 +963,7 @@ impl EngineState {
                 let (aabb, voxel_size) = procedural_voxel_params(&proc_geo.tree, proc_geo.voxel_size);
                 let tree_ref = &proc_geo.tree;
                 let opacity_fn = |pos: glam::Vec3| -> (f32, u16) {
-                    let sample = rkp_procedural::sample_tree(tree_ref, pos);
+                    let sample = rkp_procedural::sample_tree(tree_ref, pos, voxel_size);
                     (sample.opacity, sample.material_id)
                 };
 
@@ -944,7 +971,7 @@ impl EngineState {
                     opacity_fn, &aabb, voxel_size, scene_id,
                 );
                 if let Some(result) = result {
-                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
+                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.voxel_slot_start, result.voxel_slot_count);
                     let entity = self.world.spawn((
                         Transform::default(),
                         EditorMetadata { name: name.clone() },
@@ -969,11 +996,18 @@ impl EngineState {
                 self.selected_procedural_node = node_id;
             }
 
-            EngineCommand::SetProceduralVoxelSize { voxel_size } => {
+            EngineCommand::SetProceduralVoxelSize { tier } => {
+                const VOXEL_TIERS: [f32; 4] = [0.005, 0.02, 0.08, 0.32];
                 if let Some(entity) = self.selected_entity {
                     if let Ok(mut proc_geo) = self.world.get::<&mut crate::components::ProceduralGeometry>(entity) {
-                        proc_geo.voxel_size = voxel_size.clamp(0.005, 1.0);
-                        proc_geo.dirty = true;
+                        if let Ok(vs) = tier.parse::<f32>() {
+                            let snapped = VOXEL_TIERS.iter()
+                                .min_by(|a, b| ((**a) - vs).abs().partial_cmp(&((**b) - vs).abs()).unwrap())
+                                .copied()
+                                .unwrap_or(0.02);
+                            proc_geo.voxel_size = snapped;
+                            proc_geo.dirty = true;
+                        }
                     }
                 }
             }
@@ -1113,7 +1147,7 @@ impl EngineState {
                     Ok(result) => {
                         let raw_name = Self::display_name_from_path(&path);
                         let name = self.unique_name(&raw_name);
-                        let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
+                        let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.voxel_slot_start, result.voxel_slot_count);
                         let entity = self.world.spawn((
                             Transform::default(),
                             EditorMetadata { name: name.clone() },
@@ -1644,6 +1678,7 @@ impl EngineState {
                     _ => { eprintln!("[RkpEngine] unknown environment field: {field}"); }
                 }
                 self.environment_dirty = true;
+                self.environment_ui_dirty = true;
             }
 
             EngineCommand::SetGizmoMode { mode } => {
@@ -2252,9 +2287,27 @@ impl EngineState {
                 (proc_geo.tree.clone(), proc_geo.voxel_size, transform.scale)
             };
 
+            // Free previous geometry allocation (if any) before re-voxelizing.
+            // Without this, every re-voxelization leaks voxel slots and octree
+            // entries until the pool is exhausted.
+            let prev_spatial = self
+                .world
+                .get::<&Renderable>(entity)
+                .ok()
+                .and_then(|r| r.spatial.clone());
+            if let Some(prev) = prev_spatial {
+                let handle = rkp_core::OctreeHandle {
+                    root_offset: prev.root_offset,
+                    len: prev.len,
+                    depth: prev.depth,
+                    base_voxel_size: prev.base_voxel_size,
+                };
+                self.scene_mgr.deallocate_geometry(&handle, prev.voxel_slot_start, prev.voxel_slot_count);
+            }
+
             let (aabb, voxel_size) = procedural_voxel_params(&tree_clone, base_voxel_size);
             let opacity_fn = |pos: glam::Vec3| -> (f32, u16) {
-                let sample = rkp_procedural::sample_tree(&tree_clone, pos);
+                let sample = rkp_procedural::sample_tree(&tree_clone, pos, voxel_size);
                 (sample.opacity, sample.material_id)
             };
 
@@ -2262,7 +2315,7 @@ impl EngineState {
                 opacity_fn, &aabb, voxel_size, scene_id,
             ) {
                 Some(result) => {
-                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
+                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.voxel_slot_start, result.voxel_slot_count);
 
                     if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
                         renderable.voxel_count = result.voxel_count;
@@ -2283,7 +2336,7 @@ impl EngineState {
                         proc_geo.dirty = false;
                     }
                     self.console.warn(format!(
-                        "Procedural voxelization failed (AABB too large or pool full). \
+                        "Procedural voxelization failed. \
                          Voxel size: {voxel_size:.4}, AABB extent: {:.1}",
                         (aabb.max - aabb.min).length()
                     ));
@@ -2543,9 +2596,10 @@ impl EngineState {
                 self.camera.fov = scene.camera.fov;
 
                 // Restore environment.
-                if let Some(ref env_state) = scene.environment {
-                    self.environment = env_state.to_settings();
+                if let Some(ref env) = scene.environment {
+                    self.environment = env.clone();
                     self.environment_dirty = true;
+                    self.environment_ui_dirty = true;
                 }
 
                 // Load objects as hecs entities.
@@ -2570,7 +2624,7 @@ impl EngineState {
                         self.next_scene_id += 1;
                         match self.scene_mgr.load_rkp(&full_path.to_string_lossy(), sid) {
                             Ok(result) => {
-                                let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
+                                let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.voxel_slot_start, result.voxel_slot_count);
                                 let e = self.world.spawn((transform, meta, Renderable {
                                     asset_path: Some(asset_path.clone()),
                                     material_id: obj.material_id,
@@ -2599,7 +2653,7 @@ impl EngineState {
                         self.scene_mgr.voxelize_primitive(
                             &primitive, obj.material_id, 0.05, glam::Vec3::ONE, sid,
                         ).map(|result| {
-                            let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb);
+                            let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.voxel_slot_start, result.voxel_slot_count);
                             let e = self.world.spawn((transform, meta, Renderable {
                                 primitive: Some(prim_name.clone()),
                                 material_id: obj.material_id,
@@ -2737,7 +2791,7 @@ impl EngineState {
                 fov: self.camera.fov,
             },
             lights: Vec::new(),
-            environment: Some(crate::scene_io::EnvironmentState::from_settings(&self.environment)),
+            environment: Some(self.environment.clone()),
         }
     }
 
@@ -3200,7 +3254,8 @@ impl EngineState {
             },
             selected_material: self.selected_material,
             selected_model: self.selected_model.clone(),
-            environment: if self.frame_index <= 1 || self.environment_dirty {
+            environment: if self.frame_index <= 1 || self.environment_ui_dirty {
+                self.environment_ui_dirty = false;
                 Some(self.environment.clone())
             } else {
                 None
@@ -3289,7 +3344,6 @@ fn apply_procedural_param(
     match &mut node.kind {
         NodeKind::Sphere(p) => match param_name {
             "radius" => { p.radius = value.parse().unwrap_or(p.radius); true }
-            "falloff" => { p.falloff = value.parse().unwrap_or(p.falloff); true }
             "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
             "color" => { if let Some(v) = parse_vec3(value) { p.color = v; } true }
             _ => false,
@@ -3297,7 +3351,6 @@ fn apply_procedural_param(
         NodeKind::Box(p) => match param_name {
             "half_extents" => { if let Some(v) = parse_vec3(value) { p.half_extents = v; } true }
             "rounding" => { p.rounding = value.parse().unwrap_or(p.rounding); true }
-            "falloff" => { p.falloff = value.parse().unwrap_or(p.falloff); true }
             "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
             "color" => { if let Some(v) = parse_vec3(value) { p.color = v; } true }
             _ => false,
@@ -3305,26 +3358,22 @@ fn apply_procedural_param(
         NodeKind::Capsule(p) => match param_name {
             "half_height" => { p.half_height = value.parse().unwrap_or(p.half_height); true }
             "radius" => { p.radius = value.parse().unwrap_or(p.radius); true }
-            "falloff" => { p.falloff = value.parse().unwrap_or(p.falloff); true }
             "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
             _ => false,
         },
         NodeKind::Cylinder(p) => match param_name {
             "half_height" => { p.half_height = value.parse().unwrap_or(p.half_height); true }
             "radius" => { p.radius = value.parse().unwrap_or(p.radius); true }
-            "falloff" => { p.falloff = value.parse().unwrap_or(p.falloff); true }
             "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
             _ => false,
         },
         NodeKind::Torus(p) => match param_name {
             "major_radius" => { p.major_radius = value.parse().unwrap_or(p.major_radius); true }
             "minor_radius" => { p.minor_radius = value.parse().unwrap_or(p.minor_radius); true }
-            "falloff" => { p.falloff = value.parse().unwrap_or(p.falloff); true }
             "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
             _ => false,
         },
         NodeKind::Plane(p) => match param_name {
-            "falloff" => { p.falloff = value.parse().unwrap_or(p.falloff); true }
             "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
             _ => false,
         },

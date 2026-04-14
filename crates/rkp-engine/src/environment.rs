@@ -4,7 +4,13 @@
 //! Also pushed to the UI via StateUpdate for the environment panel.
 
 /// All editable environment settings.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Directly serialized into scene files. `#[serde(default)]` means any field
+/// missing from an older scene file takes its `Default` value, so adding new
+/// fields here is forward-compatible and every existing field is saved without
+/// an extra DTO to keep in sync.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct EnvironmentSettings {
     // ── Sky / Atmosphere ──────────────────────────────────────────────
     /// Override sky top color (None = computed from atmosphere model).

@@ -21,6 +21,20 @@ const EMPTY_THRESHOLD: f32 = 0.001;
 /// Threshold above which a sample is considered fully opaque.
 const OPAQUE_THRESHOLD: f32 = 0.999;
 
+/// Result of voxelizing an opacity function.
+pub struct VoxelizeOctreeResult {
+    pub octree: SparseOctree,
+    /// Logical voxel count (octree leaves).
+    pub voxel_count: u32,
+    /// Number of pool slots actually allocated — may be less than `voxel_count`
+    /// when identical voxels share a slot via dedup.
+    pub unique_count: u32,
+    /// First pool slot used. Together with `unique_count`, forms the
+    /// contiguous range to free on deallocation.
+    pub slot_start: u32,
+    pub grid_origin: Vec3,
+}
+
 /// Voxelize an opacity function into a sparse octree with adaptive subdivision.
 ///
 /// `opacity_fn`: returns `(opacity, material_id)` at a world-space position.
@@ -28,16 +42,15 @@ const OPAQUE_THRESHOLD: f32 = 0.999;
 /// `base_voxel_size`: voxel size at the finest level.
 ///
 /// The octree depth is computed automatically from the AABB and voxel size.
-/// Each leaf is a single voxel in the pool.
-///
-/// Returns `Some((octree, voxel_count, grid_origin))` on success, `None` if pool
-/// allocation fails.
+/// Each *unique* (opacity, material) combination gets one pool slot — identical
+/// voxels share a slot, so dense regions with only a handful of distinct values
+/// don't blow up the voxel buffer.
 pub fn voxelize_opacity_octree<F>(
     opacity_fn: F,
     aabb: &Aabb,
     base_voxel_size: f32,
     pool: &mut VoxelPool,
-) -> Option<(SparseOctree, u32, Vec3)>
+) -> Option<VoxelizeOctreeResult>
 where
     F: Fn(Vec3) -> (f32, u16),
 {
@@ -54,6 +67,8 @@ where
 
     let mut octree = SparseOctree::new(depth, base_voxel_size);
     let mut voxel_count = 0u32;
+    let mut dedup: std::collections::HashMap<SplatVoxel, u32> = std::collections::HashMap::new();
+    let slot_start = pool.allocated_count();
 
     // Center the octree on the AABB.
     let extent = octree.extent_world();
@@ -65,6 +80,7 @@ where
         &mut octree,
         pool,
         &mut voxel_count,
+        &mut dedup,
         UVec3::ZERO,
         0,
         depth,
@@ -73,7 +89,13 @@ where
         base_voxel_size,
     )?;
 
-    Some((octree, voxel_count, grid_origin))
+    Some(VoxelizeOctreeResult {
+        octree,
+        voxel_count,
+        unique_count: dedup.len() as u32,
+        slot_start,
+        grid_origin,
+    })
 }
 
 /// Recursive subdivision.
@@ -88,6 +110,7 @@ fn subdivide_node<F>(
     octree: &mut SparseOctree,
     pool: &mut VoxelPool,
     voxel_count: &mut u32,
+    dedup: &mut std::collections::HashMap<SplatVoxel, u32>,
     coord: UVec3,
     level: u8,
     max_depth: u8,
@@ -115,8 +138,17 @@ where
                 let voxel_center = world_min + Vec3::splat(base_voxel_size * 0.5);
                 let (opacity, material_id) = opacity_fn(voxel_center);
                 let sv = SplatVoxel::new(opacity.clamp(0.0, 1.0), material_id);
-                let slot = pool.allocate()?;
-                *pool.get_mut(slot) = sv;
+                // Dedup: if we've already allocated a slot for this exact voxel
+                // value, reuse it. Typical scenes have thousands of identical
+                // voxels per unique (opacity, material) pair.
+                let slot = if let Some(&existing) = dedup.get(&sv) {
+                    existing
+                } else {
+                    let slot = pool.allocate()?;
+                    *pool.get_mut(slot) = sv;
+                    dedup.insert(sv, slot);
+                    slot
+                };
                 octree.set_at_level(coord, level, crate::sparse_octree::make_leaf(slot));
                 *voxel_count += 1;
             } else {
@@ -142,6 +174,7 @@ where
                         octree,
                         pool,
                         voxel_count,
+                        dedup,
                         child_coord,
                         level + 1,
                         max_depth,
@@ -219,7 +252,7 @@ pub fn voxelize_opacity_sphere_octree(
     material_id: u16,
     voxel_size: f32,
     pool: &mut VoxelPool,
-) -> Option<(SparseOctree, u32, Vec3)> {
+) -> Option<VoxelizeOctreeResult> {
     let padding = voxel_size * 2.0;
     let aabb = Aabb {
         min: center - Vec3::splat(radius + padding),
@@ -243,25 +276,23 @@ mod tests {
     #[test]
     fn sphere_produces_leaves() {
         let mut pool = VoxelPool::new(1_000_000);
-        let (octree, voxel_count, _) =
-            voxelize_opacity_sphere_octree(Vec3::ZERO, 0.5, 0, 0.1, &mut pool).unwrap();
+        let r = voxelize_opacity_sphere_octree(Vec3::ZERO, 0.5, 0, 0.1, &mut pool).unwrap();
 
-        assert!(voxel_count > 0, "should allocate voxels for sphere surface");
-        assert_eq!(octree.leaf_count(), voxel_count as usize);
+        assert!(r.voxel_count > 0, "should allocate voxels for sphere surface");
+        assert_eq!(r.octree.leaf_count(), r.voxel_count as usize);
     }
 
     #[test]
     fn sphere_has_interior_nodes() {
         let mut pool = VoxelPool::new(1_000_000);
-        let (octree, _, _) =
-            voxelize_opacity_sphere_octree(Vec3::ZERO, 3.0, 0, 0.1, &mut pool).unwrap();
+        let r = voxelize_opacity_sphere_octree(Vec3::ZERO, 3.0, 0, 0.1, &mut pool).unwrap();
 
         // The interior of a sphere should produce INTERIOR nodes at coarse levels.
         let mut found_interior = false;
-        let ext = octree.extent();
+        let ext = r.octree.extent();
         // Don't iterate all voxels (could be millions) — sample a known-interior coord.
         let mid = ext / 2;
-        if let Some(val) = octree.lookup(glam::UVec3::new(mid, mid, mid)) {
+        if let Some(val) = r.octree.lookup(glam::UVec3::new(mid, mid, mid)) {
             if val == INTERIOR_NODE {
                 found_interior = true;
             }
@@ -276,11 +307,10 @@ mod tests {
             min: Vec3::ZERO,
             max: Vec3::splat(1.0),
         };
-        let (octree, voxel_count, _) =
-            voxelize_opacity_octree(|_| (0.0, 0), &aabb, 0.1, &mut pool).unwrap();
+        let r = voxelize_opacity_octree(|_| (0.0, 0), &aabb, 0.1, &mut pool).unwrap();
 
-        assert_eq!(voxel_count, 0);
-        assert_eq!(octree.leaf_count(), 0);
+        assert_eq!(r.voxel_count, 0);
+        assert_eq!(r.octree.leaf_count(), 0);
     }
 
     #[test]
@@ -290,21 +320,19 @@ mod tests {
             min: Vec3::ZERO,
             max: Vec3::splat(0.05),
         };
-        let (octree, voxel_count, _) =
-            voxelize_opacity_octree(|_| (1.0, 0), &aabb, 0.1, &mut pool).unwrap();
+        let r = voxelize_opacity_octree(|_| (1.0, 0), &aabb, 0.1, &mut pool).unwrap();
 
-        assert_eq!(voxel_count, 0, "fully opaque should be INTERIOR, not voxels");
-        assert_eq!(octree.as_slice()[0], INTERIOR_NODE);
+        assert_eq!(r.voxel_count, 0, "fully opaque should be INTERIOR, not voxels");
+        assert_eq!(r.octree.as_slice()[0], INTERIOR_NODE);
     }
 
     #[test]
     fn leaf_voxels_have_correct_opacity() {
         let mut pool = VoxelPool::new(1_000_000);
-        let (octree, _, _) =
-            voxelize_opacity_sphere_octree(Vec3::ZERO, 0.3, 42, 0.1, &mut pool).unwrap();
+        let r = voxelize_opacity_sphere_octree(Vec3::ZERO, 0.3, 42, 0.1, &mut pool).unwrap();
 
         let mut found_opaque = false;
-        for (_, slot, _) in octree.iter_leaves() {
+        for (_, slot, _) in r.octree.iter_leaves() {
             let sv = pool.get(slot);
             if sv.opacity_f32() > 0.5 {
                 found_opaque = true;

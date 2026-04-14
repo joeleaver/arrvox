@@ -365,8 +365,14 @@ fn march_object(
 
         // Threshold on raw voxel opacity (is this voxel occupied?).
         // Material opacity only affects accumulation weight, not occupancy.
+        //
+        // A LEAF node has one opacity value for its entire region, so if that
+        // value is below threshold the whole node contributes nothing — skip
+        // past the node's extent instead of inching forward by half a voxel.
+        // This keeps march steps proportional to surface complexity rather
+        // than to the depth of the finest voxel grid.
         if voxel_opacity < OPACITY_THRESHOLD {
-            t += vs * 0.5;
+            t += skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs);
             continue;
         }
 

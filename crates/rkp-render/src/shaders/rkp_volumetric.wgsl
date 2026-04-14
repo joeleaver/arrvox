@@ -251,25 +251,44 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let cloud_max = cloud_params.altitude.y;
         let cam_y = params.cam_pos.y;
 
+        // Max march distance — large enough to reach the flat-slab horizon at
+        // grazing angles for any reasonable cloud altitude.
+        let MAX_CLOUD_DIST = 100000.0;
+
         var hit_slab = false;
         var slab_near = 0.0;
         var slab_far = 0.0;
 
-        if abs(ray_dir.y) > 0.001 {
+        if abs(ray_dir.y) > 0.0001 {
+            // Non-horizontal ray: standard ray-slab intersection.
             let t_min = (cloud_min - cam_y) / ray_dir.y;
             let t_max = (cloud_max - cam_y) / ray_dir.y;
             slab_near = max(min(t_min, t_max), max_t);
-            slab_far = min(max(t_min, t_max), 6000.0);
+            slab_far = min(max(t_min, t_max), MAX_CLOUD_DIST);
             hit_slab = slab_far > slab_near && slab_far > 0.0;
+        } else if cam_y >= cloud_min && cam_y <= cloud_max {
+            // Near-horizontal ray while camera sits inside the cloud layer —
+            // the ray stays in the slab for its entire length.
+            slab_near = max_t;
+            slab_far = MAX_CLOUD_DIST;
+            hit_slab = slab_far > slab_near;
         }
 
         if hit_slab {
-            let cloud_steps = 48u;
-            let cloud_step_size = (slab_far - slab_near) / f32(cloud_steps);
+            // Quadratic step distribution: dense sampling near the camera,
+            // progressively coarser toward the horizon. This keeps detail for
+            // close clouds while letting the march reach tens of kilometers.
+            let cloud_steps = 64u;
             let cloud_jitter = interleaved_gradient_noise(vec2<f32>(gid.xy), 0u);
+            let slab_len = slab_far - slab_near;
 
             for (var i = 0u; i < cloud_steps; i++) {
-                let t = slab_near + (f32(i) + cloud_jitter) * cloud_step_size;
+                let u_a = f32(i) / f32(cloud_steps);
+                let u_b = f32(i + 1u) / f32(cloud_steps);
+                let t_a = slab_near + u_a * u_a * slab_len;
+                let t_b = slab_near + u_b * u_b * slab_len;
+                let cloud_step_size = t_b - t_a;
+                let t = mix(t_a, t_b, cloud_jitter);
                 let pos = params.cam_pos.xyz + ray_dir * t;
                 let cd = cloud_density(pos);
                 if cd <= 0.001 { continue; }

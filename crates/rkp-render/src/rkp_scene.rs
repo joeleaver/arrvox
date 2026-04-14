@@ -104,6 +104,16 @@ impl RkpScene {
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.octree_nodes_buffer, "rkp_octree_nodes", data.octree_nodes);
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.color_pool_buffer, "rkp_color_pool", data.color_pool);
 
+        let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "[rkp_scene] upload_geometry: voxel_pool={:.2} MiB  octree_nodes={:.2} MiB  color_pool={:.2} MiB  total={:.2} MiB",
+            mib(data.voxel_pool.len()),
+            mib(data.octree_nodes.len()),
+            mib(data.color_pool.len()),
+            mib(data.voxel_pool.len() + data.octree_nodes.len() + data.color_pool.len()),
+        );
+
+
         if needs_rebuild {
             self.rebuild_bind_group(device);
         }

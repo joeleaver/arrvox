@@ -154,7 +154,11 @@ impl RkpRenderer {
 
         // 0. Atmosphere LUTs (precomputed + per-frame).
         self.atmosphere.dispatch_if_dirty(encoder);
-        self.atmosphere.dispatch_per_frame(encoder, queue, atmo_frame_params);
+        {
+            let q = self.profiler.begin_query("atmo", encoder);
+            self.atmosphere.dispatch_per_frame(encoder, queue, atmo_frame_params);
+            self.profiler.end_query(encoder, q);
+        }
 
         // 1. Octree ray march → G-buffer + per-light shadow texture.
         self.march.clear_stats(encoder);
@@ -193,10 +197,19 @@ impl RkpRenderer {
 
         // 4b. Screen-space god rays.
         {
+            let q = self.profiler.begin_query("god_rays", encoder);
             self.god_rays.dispatch(encoder);
+            self.profiler.end_query(encoder, q);
         }
 
-        // 5. Resolve profiler queries.
+        // Note: profiler queries are resolved by `resolve_profiler_queries` —
+        // the caller runs extra passes after this (bloom/tone/composite) and
+        // wants them profiled too, so the resolve happens once at the end.
+    }
+
+    /// Resolve all profiler queries issued this frame. Call after *all* passes
+    /// (including any issued by the caller after `render`) are encoded.
+    pub fn resolve_profiler_queries(&mut self, encoder: &mut wgpu::CommandEncoder) {
         self.profiler.resolve_queries(encoder);
     }
 

@@ -15,7 +15,7 @@ pub struct SceneFile {
     #[serde(default)]
     pub lights: Vec<SceneLight>,
     #[serde(default)]
-    pub environment: Option<EnvironmentState>,
+    pub environment: Option<crate::environment::EnvironmentSettings>,
 }
 
 /// An object in the scene.
@@ -101,35 +101,6 @@ pub struct SceneLight {
     pub range: f32,
 }
 
-/// Saved environment settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnvironmentState {
-    pub sky_color_top: [f32; 3],
-    pub sky_color_horizon: [f32; 3],
-    pub ambient_intensity: f32,
-    pub sun_azimuth: f32,
-    pub sun_elevation: f32,
-    pub sun_color: [f32; 3],
-    pub sun_intensity: f32,
-    pub shadow_steps: u32,
-    pub ao_radius: f32,
-    pub ao_steps: u32,
-    pub exposure: f32,
-    // Volumetric fog (optional for backward compat with old scene files).
-    #[serde(default)]
-    pub fog_color: Option<[f32; 3]>,
-    #[serde(default)]
-    pub height_fog_density: Option<f32>,
-    #[serde(default)]
-    pub dust_density: Option<f32>,
-    #[serde(default)]
-    pub clouds_enabled: Option<bool>,
-    #[serde(default)]
-    pub cloud_altitude_min: Option<f32>,
-    #[serde(default)]
-    pub cloud_altitude_max: Option<f32>,
-}
-
 impl SceneFile {
     pub fn new() -> Self {
         Self {
@@ -137,54 +108,6 @@ impl SceneFile {
             camera: CameraState::default(),
             lights: Vec::new(),
             environment: None,
-        }
-    }
-}
-
-impl EnvironmentState {
-    pub fn from_settings(env: &crate::environment::EnvironmentSettings) -> Self {
-        Self {
-            sky_color_top: env.sky_color_top_override.unwrap_or([0.4, 0.6, 1.0]),
-            sky_color_horizon: env.sky_color_horizon_override.unwrap_or([0.8, 0.85, 0.9]),
-            ambient_intensity: env.ambient_intensity,
-            sun_azimuth: env.sun_azimuth,
-            sun_elevation: env.sun_elevation,
-            sun_color: env.sun_color_override.unwrap_or([1.0, 0.95, 0.9]),
-            sun_intensity: env.sun_intensity,
-            shadow_steps: env.shadow_steps,
-            ao_radius: env.ao_radius,
-            ao_steps: env.ao_steps,
-            exposure: env.exposure,
-            fog_color: Some(env.fog_color),
-            height_fog_density: Some(env.height_fog_density),
-            dust_density: Some(env.dust_density),
-            clouds_enabled: Some(env.clouds_enabled),
-            cloud_altitude_min: Some(env.cloud_altitude_min),
-            cloud_altitude_max: Some(env.cloud_altitude_max),
-        }
-    }
-
-    pub fn to_settings(&self) -> crate::environment::EnvironmentSettings {
-        let defaults = crate::environment::EnvironmentSettings::default();
-        crate::environment::EnvironmentSettings {
-            sky_color_top_override: Some(self.sky_color_top),
-            sky_color_horizon_override: Some(self.sky_color_horizon),
-            sun_color_override: Some(self.sun_color),
-            ambient_intensity: self.ambient_intensity,
-            sun_azimuth: self.sun_azimuth,
-            sun_elevation: self.sun_elevation,
-            sun_intensity: self.sun_intensity,
-            shadow_steps: self.shadow_steps,
-            ao_radius: self.ao_radius,
-            ao_steps: self.ao_steps,
-            exposure: self.exposure,
-            fog_color: self.fog_color.unwrap_or(defaults.fog_color),
-            height_fog_density: self.height_fog_density.unwrap_or(defaults.height_fog_density),
-            dust_density: self.dust_density.unwrap_or(defaults.dust_density),
-            clouds_enabled: self.clouds_enabled.unwrap_or(defaults.clouds_enabled),
-            cloud_altitude_min: self.cloud_altitude_min.unwrap_or(defaults.cloud_altitude_min),
-            cloud_altitude_max: self.cloud_altitude_max.unwrap_or(defaults.cloud_altitude_max),
-            ..defaults
         }
     }
 }

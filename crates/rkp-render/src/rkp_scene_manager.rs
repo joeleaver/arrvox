@@ -31,7 +31,13 @@ pub struct AssetLoadResult {
     pub spatial: rkf_core::scene_node::SpatialHandle,
     pub voxel_size: f32,
     pub aabb: rkf_core::Aabb,
+    /// Logical voxel count (octree leaves) — for display / stats.
     pub voxel_count: u32,
+    /// First voxel pool slot used by this allocation.
+    pub voxel_slot_start: u32,
+    /// Number of slots actually allocated. May be less than `voxel_count` when
+    /// identical (voxel, color) pairs share a slot via dedup.
+    pub voxel_slot_count: u32,
 }
 
 /// Result of voxelizing a primitive.
@@ -39,7 +45,13 @@ pub struct VoxelizeResult {
     pub spatial: rkf_core::scene_node::SpatialHandle,
     pub voxel_size: f32,
     pub aabb: rkf_core::Aabb,
+    /// Logical voxel count (octree leaves).
     pub voxel_count: u32,
+    /// First voxel pool slot used by this allocation.
+    pub voxel_slot_start: u32,
+    /// Number of slots actually allocated — use this (not `voxel_count`) for
+    /// deallocation, since the two can diverge when slots are shared.
+    pub voxel_slot_count: u32,
 }
 
 /// Emit face instances from an octree into the given buffer.
@@ -269,37 +281,80 @@ impl RkpSceneManager {
             glam::Vec3::from(header.aabb_max),
         );
 
-        // Allocate voxels in pool.
-        if self.voxel_pool.free_count() < voxel_count {
-            let new_cap = (self.voxel_pool.capacity() * 2)
-                .max(self.voxel_pool.capacity() + voxel_count);
-            self.voxel_pool.grow(new_cap);
-        }
-        let slots = self.voxel_pool.allocate_range(voxel_count)
-            .ok_or_else(|| "failed to allocate voxel pool slots".to_string())?;
+        // Read per-voxel color data up front — needed so dedup can key on
+        // (voxel, color) pairs, not just voxel contents.
+        let has_color = header.flags & rkp_core::asset_file::FLAG_HAS_COLOR != 0;
+        let color_bytes = if has_color {
+            rkp_core::asset_file::read_rkp_color(&mut reader, &header).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let color_u32s: &[u32] = if color_bytes.len() >= 4 {
+            bytemuck::cast_slice(&color_bytes)
+        } else {
+            &[]
+        };
 
-        // Copy voxel data into pool.
+        // Deduplicate (voxel, color) pairs. Meshes typically have huge
+        // redundancy — a textured surface often has only thousands of unique
+        // (opacity, material, color) combinations across millions of voxels.
+        // Sharing slots cuts voxel_pool + color_pool upload size dramatically
+        // and keeps the working set inside the GPU cache.
         let bytes_per_voxel = std::mem::size_of::<VoxelSample>();
-        for (i, &slot) in slots.iter().enumerate() {
+        let mut dedup: std::collections::HashMap<(SplatVoxel, u32), u32> =
+            std::collections::HashMap::new();
+        let mut unique: Vec<(SplatVoxel, u32)> = Vec::new();
+        let mut file_to_unique: Vec<u32> = Vec::with_capacity(voxel_count as usize);
+        for i in 0..voxel_count as usize {
             let src_offset = i * bytes_per_voxel;
             if src_offset + bytes_per_voxel > voxel_data.len() {
                 break;
             }
             let vs: &VoxelSample =
                 bytemuck::from_bytes(&voxel_data[src_offset..src_offset + bytes_per_voxel]);
-            *self.voxel_pool.get_mut(slot) = SplatVoxel::from(*vs);
+            let splat = SplatVoxel::from(*vs);
+            let color = color_u32s.get(i).copied().unwrap_or(0);
+            let key = (splat, color);
+            let idx = *dedup.entry(key).or_insert_with(|| {
+                let new_idx = unique.len() as u32;
+                unique.push(key);
+                new_idx
+            });
+            file_to_unique.push(idx);
+        }
+        let unique_count = unique.len() as u32;
+
+        // Allocate one pool slot per UNIQUE (voxel, color) — not per file
+        // voxel. A typical mesh shrinks by 100×+ here.
+        if self.voxel_pool.free_count() < unique_count {
+            let new_cap = (self.voxel_pool.capacity() * 2)
+                .max(self.voxel_pool.capacity() + unique_count);
+            self.voxel_pool.grow(new_cap);
+        }
+        let slots = self.voxel_pool.allocate_range(unique_count)
+            .ok_or_else(|| "failed to allocate voxel pool slots".to_string())?;
+        let voxel_slot_start = slots.first().copied().unwrap_or(0);
+
+        // Write unique voxels + colors into their pool slots.
+        for (i, &(splat, color)) in unique.iter().enumerate() {
+            let slot = slots[i];
+            *self.voxel_pool.get_mut(slot) = splat;
+            if has_color {
+                self.voxel_pool.set_color(slot, color);
+            }
         }
 
-        // Remap octree leaf slots to newly allocated pool slots.
+        // Remap octree leaf slots: file voxel index → dedup index → pool slot.
         let mut remapped_nodes = octree_nodes.clone();
         for node in &mut remapped_nodes {
             if *node != rkp_core::sparse_octree::EMPTY_NODE
                 && *node != rkp_core::sparse_octree::INTERIOR_NODE
                 && (*node & rkp_core::sparse_octree::LEAF_BIT) != 0
             {
-                let old_slot = *node & !rkp_core::sparse_octree::LEAF_BIT;
-                if (old_slot as usize) < slots.len() {
-                    *node = rkp_core::sparse_octree::make_leaf(slots[old_slot as usize]);
+                let file_idx = (*node & !rkp_core::sparse_octree::LEAF_BIT) as usize;
+                if file_idx < file_to_unique.len() {
+                    let dedup_idx = file_to_unique[file_idx] as usize;
+                    *node = rkp_core::sparse_octree::make_leaf(slots[dedup_idx]);
                 }
             }
         }
@@ -322,38 +377,19 @@ impl RkpSceneManager {
             base_voxel_size: handle.base_voxel_size,
         };
 
-        // Load per-voxel color data.
-        let has_color = header.flags & rkp_core::asset_file::FLAG_HAS_COLOR != 0;
-        if has_color {
-            let color_bytes = rkp_core::asset_file::read_rkp_color(&mut reader, &header)
-                .unwrap_or_default();
-            let color_u32s: &[u32] = if color_bytes.len() >= 4 {
-                bytemuck::cast_slice(&color_bytes)
-            } else {
-                &[]
-            };
-            let mut nonzero = 0u32;
-            for (i, &slot) in slots.iter().enumerate() {
-                if i < color_u32s.len() {
-                    let packed = color_u32s[i];
-                    self.voxel_pool.set_color(slot, packed);
-                    if packed != 0 {
-                        nonzero += 1;
-                    }
-                }
-            }
-            eprintln!(
-                "[RkpSceneManager] loaded color: {} u32s, {} nonzero",
-                color_u32s.len(), nonzero,
-            );
-        }
-
         eprintln!(
-            "[RkpSceneManager] loaded .rkp: {} voxels, {} faces, {} octree nodes",
-            voxel_count, self.pending_faces.len(), remapped_nodes.len(),
+            "[RkpSceneManager] loaded .rkp: {} voxels → {} unique pool slots ({:.1}×), {} faces, {} octree nodes",
+            voxel_count,
+            unique_count,
+            if unique_count > 0 { voxel_count as f64 / unique_count as f64 } else { 0.0 },
+            self.pending_faces.len(),
+            remapped_nodes.len(),
         );
 
-        Ok(AssetLoadResult { spatial, voxel_size, aabb, voxel_count })
+        Ok(AssetLoadResult {
+            spatial, voxel_size, aabb, voxel_count, voxel_slot_start,
+            voxel_slot_count: unique_count,
+        })
     }
 
     // ── Primitive voxelization ───────────────────────────────────────
@@ -428,17 +464,16 @@ impl RkpSceneManager {
         };
 
         // Per-voxel octree voxelization.
-        let (octree, voxel_count, _grid_origin) =
-            rkp_core::voxelize_octree::voxelize_opacity_octree(
-                opacity_fn, &aabb, voxel_size, &mut self.voxel_pool,
-            )?;
+        let r = rkp_core::voxelize_octree::voxelize_opacity_octree(
+            opacity_fn, &aabb, voxel_size, &mut self.voxel_pool,
+        )?;
 
         // Emit face instances.
-        emit_faces(&octree, &self.voxel_pool, object_id, &mut self.pending_faces);
+        emit_faces(&r.octree, &self.voxel_pool, object_id, &mut self.pending_faces);
         self.faces_dirty = true;
 
         // Allocate octree into the GPU allocator.
-        let handle = self.octree.allocate(&octree);
+        let handle = self.octree.allocate(&r.octree);
         let spatial = rkf_core::scene_node::SpatialHandle::Octree {
             root_offset: handle.root_offset,
             len: handle.len,
@@ -451,7 +486,9 @@ impl RkpSceneManager {
             spatial,
             voxel_size,
             aabb: geometry_aabb,
-            voxel_count,
+            voxel_count: r.voxel_count,
+            voxel_slot_start: r.slot_start,
+            voxel_slot_count: r.unique_count,
         })
     }
 
@@ -470,15 +507,14 @@ impl RkpSceneManager {
     where
         F: Fn(glam::Vec3) -> (f32, u16),
     {
-        let (octree, voxel_count, _grid_origin) =
-            rkp_core::voxelize_octree::voxelize_opacity_octree(
-                opacity_fn, aabb, voxel_size, &mut self.voxel_pool,
-            )?;
+        let r = rkp_core::voxelize_octree::voxelize_opacity_octree(
+            opacity_fn, aabb, voxel_size, &mut self.voxel_pool,
+        )?;
 
-        emit_faces(&octree, &self.voxel_pool, object_id, &mut self.pending_faces);
+        emit_faces(&r.octree, &self.voxel_pool, object_id, &mut self.pending_faces);
         self.faces_dirty = true;
 
-        let handle = self.octree.allocate(&octree);
+        let handle = self.octree.allocate(&r.octree);
         let spatial = rkf_core::scene_node::SpatialHandle::Octree {
             root_offset: handle.root_offset,
             len: handle.len,
@@ -490,7 +526,19 @@ impl RkpSceneManager {
             spatial,
             voxel_size,
             aabb: *aabb,
-            voxel_count,
+            voxel_count: r.voxel_count,
+            voxel_slot_start: r.slot_start,
+            voxel_slot_count: r.unique_count,
         })
+    }
+
+    /// Deallocate geometry previously produced by voxelize_*.
+    ///
+    /// Frees both the octree region (returned to the octree allocator's free
+    /// list) and the voxel pool slots (returned to the voxel pool's free list
+    /// or bump-shrunk if contiguous).
+    pub fn deallocate_geometry(&mut self, spatial: &rkp_core::OctreeHandle, voxel_slot_start: u32, voxel_slot_count: u32) {
+        self.octree.deallocate(*spatial);
+        self.voxel_pool.deallocate_range(voxel_slot_start, voxel_slot_count);
     }
 }
