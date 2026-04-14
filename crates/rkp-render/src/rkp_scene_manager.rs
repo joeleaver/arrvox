@@ -397,10 +397,15 @@ impl RkpSceneManager {
 
         // Extract a marching-cubes mesh for the triangle raster pass.
         let extracted_mesh = rkp_core::extract_mesh(&tree, &self.voxel_pool);
+        let nonzero_colors = extracted_mesh.colors.iter().filter(|&&c| c != 0).count();
+        let nonzero_mats = extracted_mesh.material_ids.iter().filter(|&&m| m != 0).count();
         eprintln!(
-            "[RkpSceneManager] load_rkp extracted mesh: {} tris, {} verts",
+            "[RkpSceneManager] load_rkp extracted mesh: {} tris, {} verts, \
+             {} nonzero colors, {} nonzero materials",
             extracted_mesh.triangle_count(),
             extracted_mesh.vertex_count(),
+            nonzero_colors,
+            nonzero_mats,
         );
 
         let spatial = rkf_core::scene_node::SpatialHandle::Octree {

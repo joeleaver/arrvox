@@ -80,7 +80,10 @@ impl TriangleGBufferPass {
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
+                // Paul-Bourke MC tables give vertex order such that the
+                // triangle's right-hand-rule normal points INWARD — to cull
+                // back faces correctly we treat Cw winding as the front face.
+                front_face: wgpu::FrontFace::Cw,
                 cull_mode: Some(wgpu::Face::Back),
                 unclipped_depth: false,
                 polygon_mode: wgpu::PolygonMode::Fill,

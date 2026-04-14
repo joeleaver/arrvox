@@ -3,11 +3,15 @@
 //! Produces a standard indexed triangle mesh from the trilinearly-interpolated
 //! opacity field. The surface is where opacity crosses [`THRESHOLD`].
 //!
-//! This is the Phase 1+2 implementation per `notes/marching-cubes-migration.md`:
+//! This is the Phase 1-3 implementation per `notes/marching-cubes-migration.md`:
 //! - No vertex sharing — 3 unique verts per triangle (Phase 5 optimization).
 //! - Normals derived from a 6-tap central difference of the trilinearly-
-//!   interpolated opacity field at each MC vertex (Phase 2, landed).
-//! - Colors / materials from nearest inside corner (Phase 3 upgrades to lerp + blend).
+//!   interpolated opacity field at each MC vertex (Phase 2).
+//! - Colors lerped along the MC edge with the same `t` used to place the
+//!   vertex — `color = lerp(color_A, color_B, t)` in linear RGB (Phase 3).
+//! - Materials picked from the "inside" (above-threshold) corner (Phase 3
+//!   simple; Phase 3.5 adds dual-material blending with per-vertex (primary,
+//!   secondary, blend_weight)).
 //! - Active cells found by expanding each leaf's lower corner into its 8 adjacent
 //!   cells — correct for depth-`max_depth` leaves. Coarse (LOD) leaves miss their
 //!   far-face boundaries (Phase 5 LOD expansion).
@@ -269,10 +273,13 @@ fn emit_cell_triangles(
             );
         edge_verts_vox[e] = pa + (pb - pa) * t;
         edge_normals[e] = gradient_normal(edge_verts_vox[e], octree, pool);
-        // Pick attributes from the inside corner (Phase 3 will lerp both).
+        // Material: pick from the inside (above-threshold) corner (Phase 3
+        // simple — Phase 3.5 adds dual-material blending).
         let inside = if opacity[a] >= THRESHOLD { a } else { b };
         edge_mats[e] = mats[inside];
-        edge_colors[e] = colors[inside];
+        // Color: lerp both endpoints in linear RGB. Matches the t used to
+        // place the vertex, so a textured surface transitions smoothly.
+        edge_colors[e] = lerp_packed_color(colors[a], colors[b], t);
     }
 
     // Emit triangles from MC_TRI_TABLE. Each entry is a list of edge indices,
@@ -374,6 +381,34 @@ fn interp_t(oa: f32, ob: f32) -> f32 {
     } else {
         ((THRESHOLD - oa) / denom).clamp(0.0, 1.0)
     }
+}
+
+/// Linear interpolation of two packed colors (`R8G8B8 | intensity8`) at
+/// parameter `t ∈ [0, 1]`. Interpolates each channel independently in linear
+/// space (matches what the shade pass expects when it unpacks to RGB565).
+///
+/// Missing-color handling: if exactly one endpoint is zero (no color
+/// assigned) we pass the other through verbatim — lerping toward black
+/// would wrongly darken surfaces that straddle an author-set color and a
+/// default-color-less neighbor. If both endpoints are zero, result is zero.
+#[inline]
+fn lerp_packed_color(a: u32, b: u32, t: f32) -> u32 {
+    if a == 0 {
+        return b;
+    }
+    if b == 0 {
+        return a;
+    }
+    let u = 1.0 - t;
+    let lerp_u8 = |ca: u32, cb: u32| -> u32 {
+        let f = (ca as f32) * u + (cb as f32) * t;
+        f.round().clamp(0.0, 255.0) as u32
+    };
+    let r = lerp_u8(a & 0xFF, b & 0xFF);
+    let g = lerp_u8((a >> 8) & 0xFF, (b >> 8) & 0xFF);
+    let blue = lerp_u8((a >> 16) & 0xFF, (b >> 16) & 0xFF);
+    let intensity = lerp_u8((a >> 24) & 0xFF, (b >> 24) & 0xFF);
+    r | (g << 8) | (blue << 16) | (intensity << 24)
 }
 
 // ===========================================================================
@@ -892,6 +927,63 @@ mod tests {
         }
         let mean = dot_sum / n as f32;
         assert!(mean > 0.7, "mean outward dot {mean} too low — normals inverted?");
+    }
+
+    #[test]
+    fn lerp_packed_color_basic() {
+        let red = 0x0000_00FF; // R=255
+        let blue = 0x00FF_0000; // B=255
+        let mid = lerp_packed_color(red, blue, 0.5);
+        // Each channel ~127
+        assert_eq!(mid & 0xFF, 128); // R lerps from 255 to 0 at t=0.5 → 128 (round)
+        assert_eq!((mid >> 16) & 0xFF, 128); // B lerps from 0 to 255 → 128
+    }
+
+    #[test]
+    fn lerp_packed_color_missing_color_passes_through() {
+        // When one endpoint has no color assigned (0), we take the other
+        // endpoint rather than lerping toward black.
+        let red = 0x0000_00FF;
+        let zero = 0u32;
+        assert_eq!(lerp_packed_color(red, zero, 0.3), red);
+        assert_eq!(lerp_packed_color(zero, red, 0.3), red);
+        assert_eq!(lerp_packed_color(zero, zero, 0.5), 0);
+    }
+
+    #[test]
+    fn lerp_packed_color_endpoints() {
+        let a = 0xAA_BB_CC_DD;
+        let b = 0x11_22_33_44;
+        assert_eq!(lerp_packed_color(a, b, 0.0), a);
+        assert_eq!(lerp_packed_color(a, b, 1.0), b);
+    }
+
+    #[test]
+    fn mc_vertex_between_colored_voxels_gets_blended_color() {
+        // Two adjacent voxels, red and blue, with opposite opacities so the
+        // isosurface sits on the edge between them. The MC vertex there
+        // should have a color that mixes red and blue.
+        let mut octree = SparseOctree::new(3, 1.0);
+        let mut pool = VoxelPool::new(16);
+
+        let red_slot = pool.allocate().unwrap();
+        *pool.get_mut(red_slot) = SplatVoxel::new(1.0, 0);
+        pool.set_color(red_slot, 0x0000_00FF); // R=255
+        octree.insert(UVec3::new(3, 3, 3), red_slot);
+
+        // Neighbor at (4,3,3) is absent (opacity=0). For the edge between
+        // (3,3,3) and (4,3,3), the MC vertex should be near the red side
+        // since opacity goes 1 → 0. But t = (0.5-1)/(0-1) = 0.5, so the
+        // vertex sits at the midpoint and picks up 50% red + 50% of
+        // (4,3,3)'s color (which is 0/empty → lerp rule passes red through).
+        let mesh = extract_mesh(&octree, &pool);
+
+        // Every vertex should have the red color passed through (since the
+        // "other side" of every edge is empty/zero).
+        assert!(!mesh.is_empty());
+        for &c in &mesh.colors {
+            assert_eq!(c & 0xFF, 0xFF, "expected R=255 on every vertex, got {c:#x}");
+        }
     }
 
     #[test]

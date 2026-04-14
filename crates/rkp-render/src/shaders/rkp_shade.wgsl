@@ -367,19 +367,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let primary_mat_id = packed_r & 0xFFFFu;
     let blend_weight = f32(packed_g & 0xFFu) / 255.0;
 
-    // Unpack RGB565 color from bits 16-31 of packed_g.
+    // Resolve material — metallic/roughness/emission always come from the
+    // palette; base_color is only used when the voxel has no per-voxel color.
+    // When the voxel carries a color, it REPLACES the material's base_color
+    // rather than modulating it — otherwise any non-white material tint dims
+    // textured surfaces on every pixel.
+    let mat = materials[primary_mat_id];
     let color_rgb565 = (packed_g >> 16u) & 0xFFFFu;
-    var voxel_color = vec3<f32>(1.0); // default white (material color only)
+    var albedo = mat.base_color.rgb;
     if color_rgb565 != 0u {
         let cr5 = color_rgb565 & 0x1Fu;
         let cg6 = (color_rgb565 >> 5u) & 0x3Fu;
         let cb5 = (color_rgb565 >> 11u) & 0x1Fu;
-        voxel_color = vec3<f32>(f32(cr5) / 31.0, f32(cg6) / 63.0, f32(cb5) / 31.0);
+        albedo = vec3<f32>(f32(cr5) / 31.0, f32(cg6) / 63.0, f32(cb5) / 31.0);
     }
-
-    // Resolve material.
-    let mat = materials[primary_mat_id];
-    let albedo = mat.base_color.rgb * voxel_color;
     let metallic = mat.metallic;
     let roughness = max(mat.roughness, 0.04);
 

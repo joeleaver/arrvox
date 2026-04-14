@@ -63,8 +63,9 @@ struct VertexOut {
     @location(0) world_pos:     vec3<f32>,
     @location(1) world_normal:  vec3<f32>,
     @location(2) color:         vec3<f32>,
-    @location(3) @interpolate(flat) material_id: u32,
-    @location(4) @interpolate(flat) object_id:   u32,
+    @location(3) @interpolate(flat) material_id:     u32,
+    @location(4) @interpolate(flat) object_id:       u32,
+    @location(5) @interpolate(flat) obj_material_id: u32,
 }
 
 // ----- Vertex -----
@@ -83,13 +84,14 @@ fn vs_main(v: VertexIn, @builtin(instance_index) inst: u32) -> VertexOut {
     out.clip_pos     = camera.view_proj * world_pos4;
     out.world_pos    = world_pos4.xyz;
     out.world_normal = world_n;
-    out.color        = vec3<f32>(
+    out.color = vec3<f32>(
         f32((v.color >> 0u) & 0xFFu) / 255.0,
         f32((v.color >> 8u) & 0xFFu) / 255.0,
         f32((v.color >> 16u) & 0xFFu) / 255.0,
     );
-    out.material_id = v.material_id & 0xFFFFu;
-    out.object_id   = obj.object_id;
+    out.material_id     = v.material_id & 0xFFFFu;
+    out.object_id       = obj.object_id;
+    out.obj_material_id = obj.material_id & 0xFFFFu;
     return out;
 }
 
@@ -119,9 +121,15 @@ fn fs_main(in: VertexOut) -> FragOut {
     //   r: primary_id(lo16) | secondary_id(hi16)
     //   g: blend(lo8) | (object_id+1)(bits 8-15) | color_rgb565(hi16)
     //
+    // If the voxel's baked material is 0, fall back to the object's override
+    // material_id — this matches the compute march's behavior and makes the
+    // editor's AssignMaterial command work for mesh-backed objects without
+    // re-voxelizing.
+    //
     // Note the `+ 1` on object_id — 0 means "no hit" in the picker / shade
     // pass, so objects are offset by one.
-    let packed_r = in.material_id & 0xFFFFu; // no secondary in Phase 1
+    let effective_mat_id = select(in.obj_material_id, in.material_id, in.material_id != 0u);
+    let packed_r = effective_mat_id & 0xFFFFu; // no secondary in Phase 3 simple
     let packed_g = 0u                                         // blend = 0
                  | (((in.object_id + 1u) & 0xFFu) << 8u)      // object_id+1
                  | (color_rgb565 << 16u);                     // RGB565 color
