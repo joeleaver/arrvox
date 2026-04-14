@@ -626,7 +626,22 @@ impl EngineState {
             self.renderer.god_rays.update_params(&self.queue, &god_ray_params);
         }
 
-        self.renderer.render(&mut encoder, &self.queue, object_count, self.width, self.height, shadow_steps, num_lights, screen_aabbs_bytes, &atmo_frame);
+        // Flush any pending marching-cubes mesh uploads (CPU mirror → GPU).
+        self.renderer.mesh_pool.flush(&self.device, &self.queue);
+
+        // Build per-frame triangle-draw list: for every gpu object that has
+        // an extracted mesh, emit one indexed draw bound to that instance.
+        let mut mesh_draws: Vec<rkp_render::MeshDraw> = Vec::new();
+        for (&scene_id, &gpu_idx) in &self.scene_id_to_gpu {
+            if let Some(alloc) = self.renderer.mesh_pool.get(scene_id) {
+                mesh_draws.push(rkp_render::MeshDraw {
+                    gpu_object_index: gpu_idx,
+                    allocation: alloc,
+                });
+            }
+        }
+
+        self.renderer.render(&mut encoder, &self.queue, &self.gbuffer, &mesh_draws, object_count, self.width, self.height, shadow_steps, num_lights, screen_aabbs_bytes, &atmo_frame);
 
         let t_encode = frame_start.elapsed();
 
@@ -945,6 +960,7 @@ impl EngineState {
                     ));
                     self.assign_entity_uuid(entity);
                     self.entity_scene_ids.insert(entity, scene_id);
+                    self.renderer.mesh_pool.upload_mesh(scene_id, &result.extracted_mesh);
                     self.geometry_dirty = true;
                     self.scene_dirty = true;
                     self.gpu_objects_dirty = true;
@@ -985,6 +1001,7 @@ impl EngineState {
                     ));
                     self.assign_entity_uuid(entity);
                     self.entity_scene_ids.insert(entity, scene_id);
+                    self.renderer.mesh_pool.upload_mesh(scene_id, &result.extracted_mesh);
                     self.geometry_dirty = true;
                     self.scene_dirty = true;
                     self.gpu_objects_dirty = true;
@@ -1160,6 +1177,7 @@ impl EngineState {
                         ));
                         self.assign_entity_uuid(entity);
                         self.entity_scene_ids.insert(entity, scene_id);
+                        self.renderer.mesh_pool.upload_mesh(scene_id, &result.extracted_mesh);
                         self.geometry_dirty = true;
                         self.scene_dirty = true;
                         self.gpu_objects_dirty = true;
@@ -2326,6 +2344,7 @@ impl EngineState {
                         proc_geo.last_evaluated_scale = scale;
                     }
 
+                    self.renderer.mesh_pool.upload_mesh(scene_id, &result.extracted_mesh);
                     self.geometry_dirty = true;
                     self.gpu_objects_dirty = true;
                 }
@@ -2498,7 +2517,9 @@ impl EngineState {
         if let Some(uuid) = self.entity_uuids.remove(&entity) {
             self.uuid_to_entity.remove(&uuid);
         }
-        self.entity_scene_ids.remove(&entity);
+        if let Some(sid) = self.entity_scene_ids.remove(&entity) {
+            self.renderer.mesh_pool.deallocate(sid);
+        }
 
         // Despawn from ECS.
         let _ = self.world.despawn(entity);
@@ -2633,6 +2654,7 @@ impl EngineState {
                                     ..Default::default()
                                 }));
                                 self.entity_scene_ids.insert(e, sid);
+                                self.renderer.mesh_pool.upload_mesh(sid, &result.extracted_mesh);
                                 self.geometry_dirty = true;
                                 Some(e)
                             }
@@ -2662,6 +2684,7 @@ impl EngineState {
                                 ..Default::default()
                             }));
                             self.entity_scene_ids.insert(e, sid);
+                            self.renderer.mesh_pool.upload_mesh(sid, &result.extracted_mesh);
                             self.geometry_dirty = true;
                             e
                         })
@@ -3316,6 +3339,7 @@ fn parse_node_kind(kind: &str) -> rkp_procedural::NodeKind {
         "Cylinder" => rkp_procedural::NodeKind::Cylinder(CylinderParams::default()),
         "Torus" => rkp_procedural::NodeKind::Torus(TorusParams::default()),
         "Plane" => rkp_procedural::NodeKind::Plane(PlaneParams::default()),
+        "Ramp" => rkp_procedural::NodeKind::Ramp(RampParams::default()),
         "Union" => rkp_procedural::NodeKind::Union {
             material_combine: rkp_procedural::MaterialCombine::Winner,
         },
@@ -3375,6 +3399,14 @@ fn apply_procedural_param(
         },
         NodeKind::Plane(p) => match param_name {
             "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
+            _ => false,
+        },
+        NodeKind::Ramp(p) => match param_name {
+            "half_length" => { p.half_length = value.parse().unwrap_or(p.half_length); true }
+            "half_height" => { p.half_height = value.parse().unwrap_or(p.half_height); true }
+            "half_width" => { p.half_width = value.parse().unwrap_or(p.half_width); true }
+            "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
+            "color" => { if let Some(v) = parse_vec3(value) { p.color = v; } true }
             _ => false,
         },
         NodeKind::Union { material_combine } | NodeKind::Intersect { material_combine } => {

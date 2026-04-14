@@ -14,6 +14,8 @@ use crate::rkp_atmosphere::RkpAtmospherePass;
 use crate::rkp_god_rays::RkpGodRayPass;
 use crate::rkp_gpu_object::RkpGpuObject;
 use crate::octree_march::OctreeMarchPass;
+use crate::mesh_pool::MeshPool;
+use crate::triangle_gbuffer::{MeshDraw, TriangleGBufferPass};
 use wgpu_profiler::GpuProfiler;
 
 /// The complete RKIPatch renderer.
@@ -22,6 +24,10 @@ pub struct RkpRenderer {
     pub scene: RkpScene,
     /// Octree ray march compute pass — primary visibility + shadow.
     pub march: OctreeMarchPass,
+    /// Triangle rasterization pass writing the same G-buffer for mesh objects.
+    pub triangle: TriangleGBufferPass,
+    /// GPU vertex/index storage for extracted marching-cubes meshes.
+    pub mesh_pool: MeshPool,
     /// Half-res screen-space ambient occlusion compute pass.
     pub ssao: RkpSsaoPass,
     /// Deferred PBR shading compute pass.
@@ -52,6 +58,8 @@ impl RkpRenderer {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) -> Self {
         let scene = RkpScene::new(device);
         let mut march = OctreeMarchPass::new(device, &scene.bind_group_layout);
+        let triangle = TriangleGBufferPass::new(device, &scene.bind_group_layout);
+        let mesh_pool = MeshPool::new(device);
 
         let profiler = GpuProfiler::new(device, wgpu_profiler::GpuProfilerSettings {
             enable_timer_queries: true,
@@ -101,7 +109,7 @@ impl RkpRenderer {
         god_rays.set_input(device, &volumetric.output_view);
 
         Self {
-            scene, march, ssao, shade, atmosphere, volumetric, god_rays,
+            scene, march, triangle, mesh_pool, ssao, shade, atmosphere, volumetric, god_rays,
             shade_params_buffer, lights_buffer, materials_buffer,
             shadow_texture, shadow_view,
             device: device.clone(),
@@ -136,11 +144,19 @@ impl RkpRenderer {
         self.shade.set_output_view(&self.device, view);
     }
 
-    /// Render: march (+ per-light shadow) → SSAO → shade.
+    /// Render: march (+ per-light shadow) → triangle raster (for mesh objects)
+    /// → SSAO → shade.
+    ///
+    /// `mesh_draws` is an ordered list of `(gpu_object_index, allocation)` for
+    /// every object whose geometry has been extracted into the mesh pool.
+    /// An empty list skips the triangle pass entirely.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         queue: &wgpu::Queue,
+        gbuffer: &rkf_render::GBuffer,
+        mesh_draws: &[MeshDraw],
         object_count: u32,
         width: u32,
         height: u32,
@@ -172,6 +188,21 @@ impl RkpRenderer {
             self.profiler.end_query(encoder, q);
         }
         self.march.copy_stats(encoder);
+
+        // 1b. Triangle G-buffer pass — rasterize mesh-backed objects. Runs
+        //     after the march so mesh pixels overwrite march pixels via
+        //     depth test. No-ops if no objects have extracted meshes yet.
+        if !mesh_draws.is_empty() {
+            let q = self.profiler.begin_query("triangle", encoder);
+            self.triangle.dispatch(
+                encoder,
+                &self.scene.bind_group,
+                gbuffer,
+                &self.mesh_pool,
+                mesh_draws,
+            );
+            self.profiler.end_query(encoder, q);
+        }
 
         // 2. SSAO at half resolution.
         {
