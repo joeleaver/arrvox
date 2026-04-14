@@ -30,6 +30,7 @@ struct VolumetricParams {
     vol_ambient_r: f32,
     vol_ambient_g: f32,
     vol_ambient_b: f32,
+    inverse_view_proj: mat4x4<f32>,
 }
 
 struct CloudParams {
@@ -42,7 +43,7 @@ struct CloudParams {
 // --- Bindings ---
 
 @group(0) @binding(0) var<uniform> params: VolumetricParams;
-@group(0) @binding(1) var depth_buffer: texture_2d<f32>;
+@group(0) @binding(1) var gbuf_depth: texture_depth_2d;
 @group(0) @binding(2) var output_scatter: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(3) var<uniform> cloud_params: CloudParams;
 
@@ -186,10 +187,19 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Scene depth from G-buffer (sample center of 2x2 block).
     let full_coord = vec2<i32>(gid.xy) * 2 + vec2<i32>(1, 1);
-    let depth_data = textureLoad(depth_buffer, full_coord, 0);
-    var max_t = min(depth_data.w, params.far);
-    if depth_data.w >= 9999.0 || depth_data.w <= 0.0 {
+    let depth = textureLoad(gbuf_depth, full_coord, 0);
+    var max_t: f32;
+    if depth >= 1.0 {
         max_t = params.far;
+    } else {
+        // Reconstruct world hit point from depth, take distance from camera.
+        let full_dims = vec2<f32>(f32(params.full_width), f32(params.full_height));
+        let uv_hit = (vec2<f32>(full_coord) + 0.5) / full_dims;
+        let ndc_hit = vec4<f32>(uv_hit.x * 2.0 - 1.0, 1.0 - uv_hit.y * 2.0, depth, 1.0);
+        let world_h = params.inverse_view_proj * ndc_hit;
+        let world_hit = world_h.xyz / world_h.w;
+        let hit_t = length(world_hit - params.cam_pos.xyz);
+        max_t = min(hit_t, params.far);
     }
 
     let jitter = interleaved_gradient_noise(vec2<f32>(gid.xy), params.frame_index);
@@ -245,7 +255,7 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // High-altitude cloud march (ray-slab intersection).
     // Only for sky pixels — clouds behind opaque geometry are occluded.
-    let is_sky = depth_data.w >= 9999.0 || depth_data.w <= 0.0;
+    let is_sky = depth >= 1.0;
     if cloud_params.flags.x > 0.5 && transmittance > 0.01 && is_sky {
         let cloud_min = cloud_params.altitude.x;
         let cloud_max = cloud_params.altitude.y;

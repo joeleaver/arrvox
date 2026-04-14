@@ -58,8 +58,10 @@ pub struct RkpSsaoPass {
     gbuffer_bind_group_layout: wgpu::BindGroupLayout,
     output_bind_group_layout: wgpu::BindGroupLayout,
     params_bind_group_layout: wgpu::BindGroupLayout,
+    camera_bind_group_layout: wgpu::BindGroupLayout,
     params_buffer: wgpu::Buffer,
     params_bind_group: wgpu::BindGroup,
+    camera_bind_group: Option<wgpu::BindGroup>,
     /// 4x4 noise texture for random rotation.
     noise_texture: wgpu::Texture,
     noise_view: wgpu::TextureView,
@@ -77,12 +79,14 @@ impl RkpSsaoPass {
         let half_width = (width / 2).max(1);
         let half_height = (height / 2).max(1);
 
-        // Group 0: G-buffer (position + normal textures, read).
+        // Group 0: G-buffer (depth + normal, read). World position is
+        // reconstructed from depth in the shader, saving 16 B/fragment of
+        // write bandwidth on the triangle pass.
         let gbuffer_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("rkp_ssao gbuf layout"),
                 entries: &[
-                    bgl_texture(0),
+                    bgl_depth_texture(0),
                     bgl_texture(1),
                 ],
             });
@@ -161,12 +165,29 @@ impl RkpSsaoPass {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/rkp_ssao.wgsl").into()),
         });
 
+        // Group 3: camera uniform (for inverse_view_proj).
+        let camera_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("rkp_ssao camera layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("rkp_ssao pipeline"),
             bind_group_layouts: &[
                 Some(&gbuffer_bind_group_layout), // group 0
                 Some(&output_bind_group_layout),  // group 1
                 Some(&params_bind_group_layout),  // group 2
+                Some(&camera_bind_group_layout),  // group 3
             ],
             immediate_size: 0,
         });
@@ -185,8 +206,10 @@ impl RkpSsaoPass {
             gbuffer_bind_group_layout,
             output_bind_group_layout,
             params_bind_group_layout,
+            camera_bind_group_layout,
             params_buffer,
             params_bind_group,
+            camera_bind_group: None,
             noise_texture,
             noise_view,
             output_texture,
@@ -202,7 +225,7 @@ impl RkpSsaoPass {
     pub fn set_gbuffer(
         &mut self,
         device: &wgpu::Device,
-        position_view: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
         normal_view: &wgpu::TextureView,
     ) {
         self.gbuffer_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -211,13 +234,25 @@ impl RkpSsaoPass {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(position_view),
+                    resource: wgpu::BindingResource::TextureView(depth_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(normal_view),
                 },
             ],
+        }));
+    }
+
+    /// Bind the camera uniform buffer.
+    pub fn set_camera(&mut self, device: &wgpu::Device, camera_buffer: &wgpu::Buffer) {
+        self.camera_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rkp_ssao camera bg"),
+            layout: &self.camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
         }));
     }
 
@@ -229,6 +264,10 @@ impl RkpSsaoPass {
     /// Dispatch the SSAO compute pass.
     pub fn dispatch(&self, encoder: &mut wgpu::CommandEncoder) {
         let gbuf_bg = match &self.gbuffer_bind_group {
+            Some(bg) => bg,
+            None => return,
+        };
+        let camera_bg = match &self.camera_bind_group {
             Some(bg) => bg,
             None => return,
         };
@@ -244,6 +283,7 @@ impl RkpSsaoPass {
         pass.set_bind_group(0, gbuf_bg, &[]);
         pass.set_bind_group(1, &self.output_bind_group, &[]);
         pass.set_bind_group(2, &self.params_bind_group, &[]);
+        pass.set_bind_group(3, camera_bg, &[]);
         pass.dispatch_workgroups(wg_x, wg_y, 1);
     }
 
@@ -346,6 +386,19 @@ fn bgl_texture(binding: u32) -> wgpu::BindGroupLayoutEntry {
         visibility: wgpu::ShaderStages::COMPUTE,
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn bgl_depth_texture(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Depth,
             view_dimension: wgpu::TextureViewDimension::D2,
             multisampled: false,
         },

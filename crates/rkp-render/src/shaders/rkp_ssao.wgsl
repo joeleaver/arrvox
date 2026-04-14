@@ -17,10 +17,23 @@ struct SsaoParams {
     kernel: array<vec4<f32>, 16>,  // hemisphere samples (xyz = direction, w = unused)
 }
 
+struct CameraUniforms {
+    position: vec4<f32>,
+    forward: vec4<f32>,
+    right: vec4<f32>,
+    up: vec4<f32>,
+    resolution: vec2<f32>,
+    jitter: vec2<f32>,
+    prev_vp: mat4x4<f32>,
+    view_proj: mat4x4<f32>,
+    inverse_view_proj: mat4x4<f32>,
+}
+
 // --- Bindings ---
 
-// Group 0: G-buffer (read, full-res)
-@group(0) @binding(0) var gbuf_position: texture_2d<f32>;
+// Group 0: G-buffer (depth + normal, read, full-res). World position is
+// reconstructed from depth so the triangle pass can skip a position target.
+@group(0) @binding(0) var gbuf_depth: texture_depth_2d;
 @group(0) @binding(1) var gbuf_normal: texture_2d<f32>;
 
 // Group 1: output AO texture (write, half-res)
@@ -29,6 +42,16 @@ struct SsaoParams {
 // Group 2: SSAO params + noise
 @group(2) @binding(0) var<uniform> params: SsaoParams;
 @group(2) @binding(1) var noise_tex: texture_2d<f32>;
+
+// Group 3: camera (for inverse_view_proj).
+@group(3) @binding(0) var<uniform> camera: CameraUniforms;
+
+fn reconstruct_world_pos(coord: vec2<i32>, depth: f32, resolution: vec2<f32>, inv_vp: mat4x4<f32>) -> vec3<f32> {
+    let uv = (vec2<f32>(coord) + 0.5) / resolution;
+    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    let world_h = inv_vp * ndc;
+    return world_h.xyz / world_h.w;
+}
 
 // --- Helpers ---
 
@@ -51,16 +74,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Half-res → full-res pixel (sample center of 2x2 block).
     let full_coord = vec2<i32>(gid.xy) * 2 + vec2<i32>(1, 1);
-    let full_dims = vec2<i32>(textureDimensions(gbuf_position));
-    let pos_data = textureLoad(gbuf_position, full_coord, 0);
-    let world_pos = pos_data.xyz;
-    let hit_t = pos_data.w;
+    let full_dims = vec2<i32>(textureDimensions(gbuf_depth));
+    let full_dims_f = vec2<f32>(full_dims);
+    let depth = textureLoad(gbuf_depth, full_coord, 0);
 
     // No geometry hit → no occlusion.
-    if hit_t >= 9999.0 || hit_t <= 0.0 {
+    if depth >= 1.0 {
         textureStore(ao_out, vec2<i32>(gid.xy), vec4<f32>(1.0, 0.0, 0.0, 0.0));
         return;
     }
+
+    let world_pos = reconstruct_world_pos(full_coord, depth, full_dims_f, camera.inverse_view_proj);
 
     let normal = normalize(textureLoad(gbuf_normal, full_coord, 0).xyz);
 
@@ -91,14 +115,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             full_dims - vec2<i32>(1),
         );
 
-        let sample_data = textureLoad(gbuf_position, sample_coord, 0);
-        let sample_pos = sample_data.xyz;
-        let sample_t = sample_data.w;
+        let sample_depth = textureLoad(gbuf_depth, sample_coord, 0);
 
         // No geometry at sample → not occluded by this sample.
-        if sample_t >= 9999.0 || sample_t <= 0.0 {
+        if sample_depth >= 1.0 {
             continue;
         }
+        let sample_pos = reconstruct_world_pos(sample_coord, sample_depth, full_dims_f, camera.inverse_view_proj);
 
         // Check if the geometry at the sample pixel is closer to the original
         // surface than our hemisphere sample point — if so, it occludes.

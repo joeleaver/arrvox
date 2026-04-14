@@ -17,6 +17,17 @@ struct CameraUniforms {
     jitter: vec2<f32>,
     prev_vp: mat4x4<f32>,
     view_proj: mat4x4<f32>,
+    inverse_view_proj: mat4x4<f32>,
+}
+
+// Reconstruct world-space position from screen-space integer pixel coord
+// and a non-linear depth value (NDC z in [0, 1]). Returns Vec3(inf) if the
+// depth is at the far plane (sky pixel).
+fn reconstruct_world_pos(coord: vec2<i32>, depth: f32, resolution: vec2<f32>, inv_vp: mat4x4<f32>) -> vec3<f32> {
+    let uv = (vec2<f32>(coord) + 0.5) / resolution;
+    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    let world_h = inv_vp * ndc;
+    return world_h.xyz / world_h.w;
 }
 
 struct Light {
@@ -51,8 +62,11 @@ struct Material {
 
 // --- Bindings ---
 
-// Group 0: G-buffer (read)
-@group(0) @binding(0) var gbuf_position: texture_2d<f32>;
+// Group 0: G-buffer (read).
+// World position is reconstructed from depth via `reconstruct_world_pos` —
+// see the CameraUniforms.inverse_view_proj docs. This saves a full-fat
+// Rgba32Float target + 16 B per fragment of write bandwidth.
+@group(0) @binding(0) var gbuf_depth: texture_depth_2d;
 @group(0) @binding(1) var gbuf_normal: texture_2d<f32>;
 @group(0) @binding(2) var gbuf_material: texture_2d<u32>;
 
@@ -334,18 +348,20 @@ fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = textureDimensions(gbuf_position);
+    let dims = textureDimensions(gbuf_depth);
     if gid.x >= dims.x || gid.y >= dims.y {
         return;
     }
 
     let coord = vec2<i32>(gid.xy);
-    let pos_data = textureLoad(gbuf_position, coord, 0);
-    let world_pos = pos_data.xyz;
-    let hit_t = pos_data.w;
+    // Depth = 1.0 at the far plane → sky / no geometry. Triangle pass
+    // clears depth to 1.0, so unhit pixels come through as sky.
+    let depth = textureLoad(gbuf_depth, coord, 0);
+    let is_sky = depth >= 1.0;
+    let world_pos = reconstruct_world_pos(coord, depth, vec2<f32>(dims), camera.inverse_view_proj);
+    let hit_t = length(world_pos - camera.position.xyz);
 
-    // No geometry → sky from Sky View LUT + sun disc.
-    if hit_t >= 9999.0 || hit_t <= 0.0 {
+    if is_sky {
         let uv_screen = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims);
         let ndc = vec2<f32>(uv_screen.x * 2.0 - 1.0, 1.0 - uv_screen.y * 2.0);
         let ray_dir = normalize(camera.forward.xyz + ndc.x * camera.right.xyz + ndc.y * camera.up.xyz);

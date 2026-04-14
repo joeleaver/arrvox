@@ -31,6 +31,9 @@ pub struct VolumetricParams {
     pub vol_ambient_r: f32,
     pub vol_ambient_g: f32,
     pub vol_ambient_b: f32,
+    /// Inverse view-projection — lets the shader reconstruct world-space
+    /// hit distance from the depth buffer (no dedicated position target).
+    pub inverse_view_proj: [[f32; 4]; 4],
 }
 
 /// Cloud parameters.
@@ -104,12 +107,13 @@ impl RkpVolumetricPass {
                         },
                         count: None,
                     },
-                    // 1: depth buffer (G-buffer position texture, read)
+                    // 1: G-buffer depth texture (read). World hit point
+                    // reconstructed in-shader from depth + inverse_view_proj.
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            sample_type: wgpu::TextureSampleType::Depth,
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
@@ -204,6 +208,7 @@ impl RkpVolumetricPass {
         // March pipeline.
         let march_src = include_str!("shaders/rkp_volumetric.wgsl");
         validate_wgsl(march_src, "rkp_volumetric");
+        let err_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let march_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rkp_volumetric"),
             source: wgpu::ShaderSource::Wgsl(march_src.into()),
@@ -221,6 +226,9 @@ impl RkpVolumetricPass {
             compilation_options: Default::default(),
             cache: None,
         });
+        if let Some(err) = pollster::block_on(err_scope.pop()) {
+            panic!("vol march pipeline creation failed: {err}");
+        }
 
         // Composite pipeline.
         let composite_src = include_str!("shaders/rkp_vol_composite.wgsl");

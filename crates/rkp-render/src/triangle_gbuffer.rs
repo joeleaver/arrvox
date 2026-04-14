@@ -29,7 +29,7 @@ mod tests {
     }
 }
 use rkf_render::gbuffer::{
-    GBUFFER_DEPTH_FORMAT, GBUFFER_MATERIAL_FORMAT, GBUFFER_NORMAL_FORMAT, GBUFFER_POSITION_FORMAT,
+    GBUFFER_DEPTH_FORMAT, GBUFFER_MATERIAL_FORMAT, GBUFFER_NORMAL_FORMAT,
 };
 
 /// A single triangle-mesh draw call for this frame. Built by the engine each
@@ -102,11 +102,9 @@ impl TriangleGBufferPass {
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[
-                    Some(wgpu::ColorTargetState {
-                        format: GBUFFER_POSITION_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
+                    // Position target dropped — world position reconstructed
+                    // in downstream passes from depth + inverse_view_proj.
+                    // This saves 16 B/fragment of ROP write bandwidth.
                     Some(wgpu::ColorTargetState {
                         format: GBUFFER_NORMAL_FORMAT,
                         blend: None,
@@ -117,10 +115,6 @@ impl TriangleGBufferPass {
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
-                    // Motion target omitted: 4-way 48 B/sample exceeds the
-                    // default 32 B/sample wgpu limit. Phase 1 leaves motion
-                    // to whatever the march wrote (TAA ghosts on mesh
-                    // pixels are acceptable for the initial cut-over).
                 ],
             }),
             multiview_mask: None,
@@ -165,15 +159,6 @@ impl TriangleGBufferPass {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("triangle_gbuffer"),
             color_attachments: &[
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &gbuffer.position_view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: color_load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                }),
                 Some(wgpu::RenderPassColorAttachment {
                     view: &gbuffer.normal_view,
                     resolve_target: None,

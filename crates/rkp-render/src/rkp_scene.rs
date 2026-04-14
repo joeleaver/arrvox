@@ -13,6 +13,11 @@
 use crate::rkp_gpu_object::RkpGpuObject;
 
 /// Camera uniforms matching the WGSL CameraUniforms struct.
+///
+/// `inverse_view_proj` is used by shade/SSAO/volumetric to reconstruct
+/// world-space position from the depth buffer — this lets us skip writing
+/// a dedicated position G-buffer target, saving 16 B/fragment of write
+/// bandwidth.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraUniforms {
@@ -24,6 +29,7 @@ pub struct CameraUniforms {
     pub jitter: [f32; 2],
     pub prev_vp: [[f32; 4]; 4],
     pub view_proj: [[f32; 4]; 4],
+    pub inverse_view_proj: [[f32; 4]; 4],
 }
 
 /// Per-frame data uploaded every frame. Cheap — a few hundred KB for a

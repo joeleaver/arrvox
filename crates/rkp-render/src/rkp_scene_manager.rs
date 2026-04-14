@@ -386,11 +386,21 @@ impl RkpSceneManager {
         let extracted_mesh = rkp_core::extract_mesh(&tree, &self.voxel_pool);
         let nonzero_colors = extracted_mesh.colors.iter().filter(|&&c| c != 0).count();
         let nonzero_mats = extracted_mesh.material_ids.iter().filter(|&&m| m != 0).count();
+        let tris = extracted_mesh.triangle_count();
+        let verts = extracted_mesh.vertex_count();
+        let sharing_ratio = if verts > 0 {
+            (tris * 3) as f32 / verts as f32
+        } else {
+            0.0
+        };
         eprintln!(
-            "[RkpSceneManager] load_rkp extracted mesh: {} tris, {} verts, \
+            "[RkpSceneManager] load_rkp extracted mesh: {} tris, {} verts \
+             (sharing {:.2}×, naive would be {}), \
              {} nonzero colors, {} nonzero materials",
-            extracted_mesh.triangle_count(),
-            extracted_mesh.vertex_count(),
+            tris,
+            verts,
+            sharing_ratio,
+            tris * 3,
             nonzero_colors,
             nonzero_mats,
         );

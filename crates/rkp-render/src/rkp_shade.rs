@@ -105,12 +105,23 @@ impl RkpShadePass {
             },
             count: None,
         };
+        let depth_texture_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Depth,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
 
-        // Group 0: G-buffer (position, normal, material)
+        // Group 0: G-buffer (depth, normal, material). World position is
+        // reconstructed from depth in the shader.
         let gbuffer_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("rkp_shade gbuf"),
-                entries: &[texture_entry(0), texture_entry(1), uint_texture_entry(2)],
+                entries: &[depth_texture_entry(0), texture_entry(1), uint_texture_entry(2)],
             });
 
         // Group 1: SSAO texture (shadow was removed alongside the compute
@@ -265,11 +276,12 @@ impl RkpShadePass {
         }
     }
 
-    /// Set G-buffer views.
+    /// Set G-buffer views. `depth_view` replaces the old position view —
+    /// world position is reconstructed from depth + inverse_view_proj.
     pub fn set_gbuffer(
         &mut self,
         device: &wgpu::Device,
-        position_view: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
         normal_view: &wgpu::TextureView,
         material_view: &wgpu::TextureView,
     ) {
@@ -277,7 +289,7 @@ impl RkpShadePass {
             label: Some("rkp_shade gbuf bg"),
             layout: &self.gbuffer_bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(position_view) },
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(normal_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(material_view) },
             ],

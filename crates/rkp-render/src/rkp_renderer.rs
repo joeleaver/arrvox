@@ -116,10 +116,11 @@ impl RkpRenderer {
 
     /// Set G-buffer views. Call after G-buffer creation or resize.
     pub fn set_gbuffer(&mut self, gbuffer: &rkf_render::GBuffer) {
-        self.ssao.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view);
-        self.shade.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view);
+        self.ssao.set_gbuffer(&self.device, &gbuffer.depth_view, &gbuffer.normal_view);
+        self.ssao.set_camera(&self.device, &self.scene.camera_buffer);
+        self.shade.set_gbuffer(&self.device, &gbuffer.depth_view, &gbuffer.normal_view, &gbuffer.material_view);
         self.shade.set_ssao(&self.device, &self.ssao.output_view);
-        self.volumetric.set_depth_view(&self.device, &gbuffer.position_view);
+        self.volumetric.set_depth_view(&self.device, &gbuffer.depth_view);
         self.volumetric.set_scene_hdr_view(&self.device, &self.shade.output_view);
         self.god_rays.set_input(&self.device, &self.volumetric.output_view);
     }

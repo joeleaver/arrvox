@@ -3,8 +3,11 @@
 //! Produces a standard indexed triangle mesh from the trilinearly-interpolated
 //! opacity field. The surface is where opacity crosses [`THRESHOLD`].
 //!
-//! This is the Phase 1-3.5 implementation per `notes/marching-cubes-migration.md`:
-//! - No vertex sharing — 3 unique verts per triangle (Phase 5 optimization).
+//! This is the Phase 1-5 implementation per `notes/marching-cubes-migration.md`:
+//! - Vertex sharing by edge identity — every MC vertex sits on a cube edge
+//!   uniquely identified by (lower_voxel_coord, axis). Cells sharing the
+//!   same edge point at the same vertex index, so the vertex buffer shrinks
+//!   ~3-5× vs the naïve "3 unique verts per triangle" approach (Phase 5).
 //! - Normals derived from a 6-tap central difference of the trilinearly-
 //!   interpolated opacity field at each MC vertex (Phase 2).
 //! - Colors lerped along the MC edge with the same `t` used to place the
@@ -17,7 +20,7 @@
 //!   when secondary == 0 and blend_weight == 0.
 //! - Active cells found by expanding each leaf's lower corner into its 8 adjacent
 //!   cells — correct for depth-`max_depth` leaves. Coarse (LOD) leaves miss their
-//!   far-face boundaries (Phase 5 LOD expansion).
+//!   far-face boundaries (future LOD expansion).
 //!
 //! Positions are in **object-local world-units**, centered on the origin —
 //! the same convention the GPU octree march uses. An octree voxel coord
@@ -171,15 +174,60 @@ pub fn extract_mesh(octree: &SparseOctree, pool: &VoxelPool) -> ExtractedMesh {
         }
     }
 
-    // 3. Process each active cell through MC.
+    // 3. Process each active cell through MC. A shared `edge_cache` keeps
+    //    one vertex per unique octree edge — cells that touch the same edge
+    //    reuse the same vertex index, cutting the vertex buffer by the
+    //    typical 3-5× seen in MC.
+    let mut edge_cache: HashMap<EdgeKey, u32> = HashMap::new();
     for cell in active_cells {
         let sample = sample_cell(octree, pool, cell);
         emit_cell_triangles(
-            cell, &sample, base_vs, half_extent, octree, pool, &mut mesh,
+            cell,
+            &sample,
+            base_vs,
+            half_extent,
+            octree,
+            pool,
+            &mut edge_cache,
+            &mut mesh,
         );
     }
 
     mesh
+}
+
+/// Canonical identifier for a cube edge in octree voxel-index space.
+/// Edges along +X at (x,y,z) → (x+1,y,z) key as `(UVec3(x,y,z), 0)`;
+/// +Y is axis 1, +Z is axis 2. Any two MC cells sharing that edge produce
+/// the same key and thus a single shared vertex.
+type EdgeKey = (UVec3, u8);
+
+/// Build the canonical edge key for edge `e` of a cell at `cell`. The
+/// 12 cube edges each align with one of the 3 axes; we take the smaller
+/// endpoint voxel coord and tag it with the axis direction.
+#[inline]
+fn edge_key(cell: UVec3, e: usize) -> EdgeKey {
+    let [a, b] = EDGE_ENDPOINTS[e];
+    let ca = UVec3::new(
+        cell.x + CORNER_OFFSETS[a][0],
+        cell.y + CORNER_OFFSETS[a][1],
+        cell.z + CORNER_OFFSETS[a][2],
+    );
+    let cb = UVec3::new(
+        cell.x + CORNER_OFFSETS[b][0],
+        cell.y + CORNER_OFFSETS[b][1],
+        cell.z + CORNER_OFFSETS[b][2],
+    );
+    let lower = ca.min(cb);
+    // Exactly one axis differs between endpoints of a cube edge.
+    let axis = if ca.x != cb.x {
+        0
+    } else if ca.y != cb.y {
+        1
+    } else {
+        2
+    };
+    (lower, axis)
 }
 
 /// Per-cell corner samples. Each array is indexed 0..8 by Paul-Bourke corner.
@@ -247,6 +295,9 @@ fn sample_corner(
 /// `base_vs` and `half_extent` convert octree voxel-coord space to object-
 /// local world units: `local = coord * base_vs − half_extent`. `octree` and
 /// `pool` are passed through so we can compute per-vertex gradient normals.
+/// `edge_cache` holds one vertex index per unique octree edge so cells
+/// sharing an edge reference the same vertex.
+#[allow(clippy::too_many_arguments)]
 fn emit_cell_triangles(
     cell: UVec3,
     s: &CellSample,
@@ -254,6 +305,7 @@ fn emit_cell_triangles(
     half_extent: f32,
     octree: &SparseOctree,
     pool: &VoxelPool,
+    edge_cache: &mut HashMap<EdgeKey, u32>,
     mesh: &mut ExtractedMesh,
 ) {
     // Build the 8-bit cube index: bit i set iff corner i is "inside"
@@ -270,79 +322,68 @@ fn emit_cell_triangles(
         return; // cell fully inside or fully outside — no surface
     }
 
-    // Compute vertex positions on the 12 edges (only those with crossings).
-    // We keep them in octree voxel-index space through gradient sampling
-    // and convert to object-local world units only at emit time.
     let offset = Vec3::splat(half_extent);
     let cell_vox = Vec3::new(cell.x as f32, cell.y as f32, cell.z as f32);
-    let mut edge_verts_vox = [Vec3::ZERO; 12];
-    let mut edge_normals = [Vec3::Y; 12];
-    let mut edge_primary_mats = [0u16; 12];
-    let mut edge_secondary_mats = [0u16; 12];
-    let mut edge_blend_weights = [0u8; 12];
-    let mut edge_colors = [0u32; 12];
+
+    // Resolve each active edge to a (possibly shared) vertex index. Missing
+    // entries are emitted into the mesh on demand.
+    let mut edge_vertex_idx = [u32::MAX; 12];
     for e in 0..12 {
         if edge_mask & (1 << e) == 0 {
             continue;
         }
-        let [a, b] = EDGE_ENDPOINTS[e];
-        let t = interp_t(s.opacity[a], s.opacity[b]);
-        let pa = cell_vox
-            + Vec3::new(
-                CORNER_OFFSETS[a][0] as f32,
-                CORNER_OFFSETS[a][1] as f32,
-                CORNER_OFFSETS[a][2] as f32,
-            );
-        let pb = cell_vox
-            + Vec3::new(
-                CORNER_OFFSETS[b][0] as f32,
-                CORNER_OFFSETS[b][1] as f32,
-                CORNER_OFFSETS[b][2] as f32,
-            );
-        edge_verts_vox[e] = pa + (pb - pa) * t;
-        edge_normals[e] = gradient_normal(edge_verts_vox[e], octree, pool);
-        // Material ids: pick the pair from the inside (above-threshold)
-        // corner. Phase 3.5 treats the pair as fixed per voxel and only
-        // lerps the blend weight along the MC edge. Hard transitions in
-        // mat pairs only occur between neighboring voxels with different
-        // pairs — Phase 5 dual contouring can soften that.
-        let inside = if s.opacity[a] >= THRESHOLD { a } else { b };
-        edge_primary_mats[e] = s.primary_mat[inside];
-        edge_secondary_mats[e] = s.secondary_mat[inside];
-        // Blend weight: lerp the two per-voxel blends so a surface between
-        // voxels with authored-different blends transitions smoothly.
-        let bw_a = s.blend_weight[a] as f32;
-        let bw_b = s.blend_weight[b] as f32;
-        let bw = (bw_a * (1.0 - t) + bw_b * t).round().clamp(0.0, 255.0) as u8;
-        edge_blend_weights[e] = bw;
-        // Color: lerp both endpoints in linear RGB. Matches the t used to
-        // place the vertex, so a textured surface transitions smoothly.
-        edge_colors[e] = lerp_packed_color(s.color[a], s.color[b], t);
+        let key = edge_key(cell, e);
+        edge_vertex_idx[e] = if let Some(&idx) = edge_cache.get(&key) {
+            idx
+        } else {
+            let [a, b] = EDGE_ENDPOINTS[e];
+            let t = interp_t(s.opacity[a], s.opacity[b]);
+            let pa = cell_vox
+                + Vec3::new(
+                    CORNER_OFFSETS[a][0] as f32,
+                    CORNER_OFFSETS[a][1] as f32,
+                    CORNER_OFFSETS[a][2] as f32,
+                );
+            let pb = cell_vox
+                + Vec3::new(
+                    CORNER_OFFSETS[b][0] as f32,
+                    CORNER_OFFSETS[b][1] as f32,
+                    CORNER_OFFSETS[b][2] as f32,
+                );
+            let vert_vox = pa + (pb - pa) * t;
+            let normal = gradient_normal(vert_vox, octree, pool);
+            // Material ids: pick the pair from the inside (above-threshold)
+            // corner. Phase 3.5 treats the pair as fixed per voxel.
+            let inside = if s.opacity[a] >= THRESHOLD { a } else { b };
+            let primary = s.primary_mat[inside];
+            let secondary = s.secondary_mat[inside];
+            // Blend weight: lerp the two per-voxel blends so a surface
+            // between voxels with authored-different blends transitions
+            // smoothly.
+            let bw_a = s.blend_weight[a] as f32;
+            let bw_b = s.blend_weight[b] as f32;
+            let blend = (bw_a * (1.0 - t) + bw_b * t).round().clamp(0.0, 255.0) as u8;
+            let color = lerp_packed_color(s.color[a], s.color[b], t);
+
+            let idx = mesh.positions.len() as u32;
+            mesh.positions.push(vert_vox * base_vs - offset);
+            mesh.normals.push(normal);
+            mesh.colors.push(color);
+            mesh.material_ids.push(primary);
+            mesh.secondary_material_ids.push(secondary);
+            mesh.blend_weights.push(blend);
+            edge_cache.insert(key, idx);
+            idx
+        };
     }
 
-    // Emit triangles from MC_TRI_TABLE. Each entry is a list of edge indices,
-    // terminated by -1. Triangles come in groups of 3.
+    // Emit triangles from MC_TRI_TABLE using the shared vertex indices.
     let tris = &MC_TRI_TABLE[cube_index as usize];
     let mut i = 0;
     while i < tris.len() && tris[i] != -1 {
-        let e0 = tris[i] as usize;
-        let e1 = tris[i + 1] as usize;
-        let e2 = tris[i + 2] as usize;
-        let base = mesh.positions.len() as u32;
-
-        for &e in &[e0, e1, e2] {
-            // voxel-index → object-local world units.
-            let local_pos = edge_verts_vox[e] * base_vs - offset;
-            mesh.positions.push(local_pos);
-            mesh.normals.push(edge_normals[e]);
-            mesh.colors.push(edge_colors[e]);
-            mesh.material_ids.push(edge_primary_mats[e]);
-            mesh.secondary_material_ids.push(edge_secondary_mats[e]);
-            mesh.blend_weights.push(edge_blend_weights[e]);
-        }
-        mesh.indices.push(base);
-        mesh.indices.push(base + 1);
-        mesh.indices.push(base + 2);
+        mesh.indices.push(edge_vertex_idx[tris[i] as usize]);
+        mesh.indices.push(edge_vertex_idx[tris[i + 1] as usize]);
+        mesh.indices.push(edge_vertex_idx[tris[i + 2] as usize]);
         i += 3;
     }
 }
@@ -789,15 +830,20 @@ mod tests {
         let mesh = extract_mesh(&octree, &pool);
 
         // A lone opacity=1 voxel surrounded by empty (opacity=0) creates
-        // an isosurface on all 6 of its faces. With our naive non-shared
-        // emission, every cell touching this voxel contributes triangles.
+        // an isosurface on all 6 of its faces.
         assert!(!mesh.is_empty(), "expected some geometry");
-        assert_eq!(
-            mesh.positions.len(),
-            mesh.indices.len(),
-            "non-shared verts: one per index",
-        );
         assert_eq!(mesh.indices.len() % 3, 0, "indices must be multiples of 3");
+        // With vertex sharing, a closed manifold has roughly `tris * 0.5`
+        // vertices (each vert touches ~6 tris by Euler). Upper bound:
+        // vertex_count <= index_count (pre-sharing parity).
+        assert!(
+            mesh.vertex_count() <= mesh.indices.len(),
+            "sharing shouldn't grow the vertex buffer beyond the pre-sharing upper bound",
+        );
+        assert!(
+            mesh.vertex_count() < mesh.indices.len(),
+            "at least some edges should be shared across cells (sharing is working)",
+        );
 
         // Object-local coords: extent=8 vs vs=1.0 → half_extent=4. The cells
         // touching voxel (2,2,2) span voxel indices [1,4] in each axis,
@@ -809,6 +855,35 @@ mod tests {
             );
             assert!(p.is_finite(), "vertex has NaN/inf: {p:?}");
         }
+    }
+
+    #[test]
+    fn vertex_sharing_reduces_count() {
+        // For a solid 4x4x4 block of voxels, MC produces a closed shell.
+        // Without sharing we'd get ~3 verts per triangle; with sharing each
+        // vertex touches multiple triangles, so vertex_count << indices.
+        let depth = 3u8;
+        let mut octree = SparseOctree::new(depth, 1.0);
+        let mut pool = VoxelPool::new(128);
+        for z in 2..6u32 {
+            for y in 2..6u32 {
+                for x in 2..6u32 {
+                    let slot = pool.allocate().unwrap();
+                    *pool.get_mut(slot) = SplatVoxel::new(1.0, 0);
+                    octree.insert(UVec3::new(x, y, z), slot);
+                }
+            }
+        }
+        let mesh = extract_mesh(&octree, &pool);
+        assert!(!mesh.is_empty());
+        // Should see at least ~2x compression (tris / verts >= 2).
+        let ratio = mesh.indices.len() as f32 / mesh.vertex_count() as f32;
+        assert!(
+            ratio >= 2.0,
+            "expected index/vertex ratio >= 2 (sharing), got {ratio:.2} ({} idx / {} vert)",
+            mesh.indices.len(),
+            mesh.vertex_count(),
+        );
     }
 
     #[test]

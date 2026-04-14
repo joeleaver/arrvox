@@ -59,15 +59,17 @@ struct VertexIn {
     @location(4) blend_weight:  u32,  // 0..=255 in low byte
 }
 
+// world_pos is no longer interpolated — the fragment reconstructs it from
+// depth when needed (it doesn't here; shade/SSAO/volumetric do). Saves one
+// interpolator slot.
 struct VertexOut {
     @builtin(position) clip_pos: vec4<f32>,
-    @location(0) world_pos:     vec3<f32>,
-    @location(1) world_normal:  vec3<f32>,
-    @location(2) color:         vec3<f32>,
-    @location(3) @interpolate(flat) material_pack:   u32,  // primary | secondary << 16
-    @location(4) @interpolate(flat) blend_weight:    u32,
-    @location(5) @interpolate(flat) object_id:       u32,
-    @location(6) @interpolate(flat) obj_material_id: u32,
+    @location(0) world_normal:  vec3<f32>,
+    @location(1) color:         vec3<f32>,
+    @location(2) @interpolate(flat) material_pack:   u32,  // primary | secondary << 16
+    @location(3) @interpolate(flat) blend_weight:    u32,
+    @location(4) @interpolate(flat) object_id:       u32,
+    @location(5) @interpolate(flat) obj_material_id: u32,
 }
 
 // ----- Vertex -----
@@ -84,7 +86,6 @@ fn vs_main(v: VertexIn, @builtin(instance_index) inst: u32) -> VertexOut {
 
     var out: VertexOut;
     out.clip_pos     = camera.view_proj * world_pos4;
-    out.world_pos    = world_pos4.xyz;
     out.world_normal = world_n;
     out.color = vec3<f32>(
         f32((v.color >> 0u) & 0xFFu) / 255.0,
@@ -103,46 +104,37 @@ fn vs_main(v: VertexIn, @builtin(instance_index) inst: u32) -> VertexOut {
 // so downstream passes (SSAO, shade) don't care whether a pixel came from
 // march or raster.
 
+// Two render targets post-Phase-5 — position is dropped, shade/ssao/volumetric
+// reconstruct world_pos from depth + camera.inverse_view_proj.
 struct FragOut {
-    @location(0) position: vec4<f32>,
-    @location(1) normal:   vec4<f32>,
-    @location(2) material: vec2<u32>,
+    @location(0) normal:   vec4<f32>,
+    @location(1) material: vec2<u32>,
 }
 
 @fragment
 fn fs_main(in: VertexOut) -> FragOut {
-    let cam_to_p = in.world_pos - camera.position.xyz;
-    let hit_dist = length(cam_to_p);
-
     // Pack per-vertex color into RGB565 to match octree_march.wgsl's layout.
     let cr = u32(clamp(in.color.r, 0.0, 1.0) * 31.0);
     let cg = u32(clamp(in.color.g, 0.0, 1.0) * 63.0);
     let cb = u32(clamp(in.color.b, 0.0, 1.0) * 31.0);
     let color_rgb565 = cr | (cg << 5u) | (cb << 11u);
 
-    // Material channel packing — identical bit layout to octree_march.wgsl:
+    // Material channel packing — identical bit layout to the old march:
     //   r: primary_id(lo16) | secondary_id(hi16)
     //   g: blend(lo8) | (object_id+1)(bits 8-15) | color_rgb565(hi16)
     //
     // If the voxel's baked primary material is 0, fall back to the object's
-    // override material_id — this matches the compute march's behavior and
-    // makes the editor's AssignMaterial command work for mesh-backed objects
-    // without re-voxelizing.
-    //
-    // Note the `+ 1` on object_id — 0 means "no hit" in the picker / shade
-    // pass, so objects are offset by one.
+    // override material_id so editor AssignMaterial works without re-voxelizing.
+    // `+1` on object_id: 0 means "no hit" to the picker and shade pass.
     let primary_in = in.material_pack & 0xFFFFu;
     let secondary_in = (in.material_pack >> 16u) & 0xFFFFu;
     let effective_primary = select(in.obj_material_id, primary_in, primary_in != 0u);
     let packed_r = effective_primary | (secondary_in << 16u);
-    let packed_g = (in.blend_weight & 0xFFu)                  // blend weight
-                 | (((in.object_id + 1u) & 0xFFu) << 8u)      // object_id+1
-                 | (color_rgb565 << 16u);                     // RGB565 color
+    let packed_g = (in.blend_weight & 0xFFu)
+                 | (((in.object_id + 1u) & 0xFFu) << 8u)
+                 | (color_rgb565 << 16u);
 
     var out: FragOut;
-    out.position = vec4<f32>(in.world_pos, hit_dist);
-    // .w carries accum_alpha in the march's format — use 1.0 for fully
-    // opaque mesh pixels.
     out.normal   = vec4<f32>(normalize(in.world_normal), 1.0);
     out.material = vec2<u32>(packed_r, packed_g);
     return out;
