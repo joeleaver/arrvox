@@ -487,10 +487,21 @@ pub fn prop_color(
                     format: "hex",
                     alpha: false,
                     onchange: move |v: String| {
-                        if let Some(rgba) = hex_to_rgba(&v) {
-                            value.set(rgba);
-                            on_change(rgba);
-                        }
+                        // ColorPicker invokes onchange from inside its own
+                        // reactive effect, so any signal reads here would
+                        // attach that effect as a subscriber. When we then
+                        // value.set(rgba), the coord effect would be
+                        // re-queued while still borrowed → RefCell panic.
+                        // Run the whole callback untracked to sever that.
+                        untracked(|| {
+                            if let Some(rgba) = hex_to_rgba(&v) {
+                                if rgba_to_hex(rgba) == rgba_to_hex(value.get()) {
+                                    return;
+                                }
+                                value.set(rgba);
+                                on_change(rgba);
+                            }
+                        });
                     },
                 }
             }

@@ -38,13 +38,35 @@ pub fn ObjectProperties() -> NodeHandle {
     }
 }
 
+#[derive(Clone, PartialEq)]
+struct KeyedComponent {
+    entity_id: String,
+    component: ComponentSnapshot,
+}
+
+fn flatten_keyed(keyed: (String, Vec<ComponentSnapshot>)) -> Vec<KeyedComponent> {
+    let (entity_id, comps) = keyed;
+    comps
+        .into_iter()
+        .map(|component| KeyedComponent {
+            entity_id: entity_id.clone(),
+            component,
+        })
+        .collect()
+}
+
 #[component]
 fn InspectorContent() -> NodeHandle {
     let store = use_context::<EditorStore>();
 
-    let components = Memo::new(move || {
+    // Combine entity_id + components into a single memo so the for-loop's
+    // effect subscribes to only one source. Subscribing to both memos caused
+    // the for-loop effect to be re-queued while still running: whichever
+    // memo's marker hadn't fired yet would queue the loop effect again,
+    // leading to a RefCell re-entrancy panic on the trailing flush.
+    let keyed_components = Memo::new(move || {
         store.inspector.get()
-            .map(|snap| snap.components.clone())
+            .map(|snap| (snap.entity_id.clone(), snap.components.clone()))
             .unwrap_or_default()
     });
 
@@ -73,14 +95,16 @@ fn InspectorContent() -> NodeHandle {
                 }
             }
 
-            // Component sections
-            // Key includes entity_id so components remount when selection changes.
-            // Without this, keying by name alone would reuse stale Signals when
-            // both the old and new entity have the same component (e.g. Transform).
-            for comp in components.get() {
+            // Component sections.
+            // Key includes entity_id so components remount when selection
+            // changes. Reading entity_id + components from a single memo
+            // (above) means this for-loop's effect only subscribes to that
+            // one source — avoiding a re-entrancy crash when multiple memo
+            // markers would each re-queue this effect.
+            for keyed in flatten_keyed(keyed_components.get()) {
                 ComponentSection {
-                    key: format!("{}-{}", entity_id.get(), comp.name),
-                    snapshot: comp.clone(),
+                    key: format!("{}-{}", keyed.entity_id, keyed.component.name),
+                    snapshot: keyed.component,
                 }
             }
 
