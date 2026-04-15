@@ -247,10 +247,23 @@ impl RkpRenderer {
         screen_aabbs: &[u8],
         atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
     ) {
-        // Point shade's camera binding at THIS viewport's camera buffer.
-        // Single-viewport case this is redundant (already wired at VR
-        // construction), but with multiple visible viewports each pass
-        // of render_to must re-aim shade at the current target.
+        // Re-aim the shared renderer passes (shade/ssao/shadow_trace/
+        // volumetric/god_rays) at THIS viewport's target before dispatching:
+        //
+        //   1. Resize the passes' intermediate textures if this viewport is
+        //      a different size from the last one we rendered. `resize` is
+        //      a fast no-op when sizes match, so single-viewport steady
+        //      state pays nothing here.
+        //   2. Rebind the gbuffer + internal output chain (shade→vol→god_rays)
+        //      against this viewport's gbuffer. A handful of create_bind_group
+        //      calls — ~5µs total per frame.
+        //   3. Point shade's dedicated camera binding at this VR's camera.
+        //
+        // Two different-size viewports render this still thrashes texture
+        // allocations each frame; the proper pass-internal split (shared
+        // pipelines + per-VR output state) lands when that cost shows up.
+        self.resize(viewport.width, viewport.height);
+        self.set_gbuffer(&viewport.gbuffer);
         self.shade.set_camera(&self.device, &viewport.camera_buffer);
 
         // Renderer-internal pipeline (march, shadow, ssao, shade, vol, god_rays).
