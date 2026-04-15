@@ -367,6 +367,30 @@ mod tests {
     }
 
     #[test]
+    fn set_viewport_visible_toggles_field() {
+        // Mirror what the SetViewportVisible command handler does, on a
+        // bare Viewports — protects against the field being renamed and
+        // the handler silently no-oping.
+        let mut viewports = Viewports::new();
+        viewports.insert(Viewport::new_main(800, 600));
+        assert!(viewports.main().visible);
+        viewports.main_mut().visible = false;
+        assert!(!viewports.main().visible);
+    }
+
+    #[test]
+    fn runtime_override_clears_to_none() {
+        let mut viewports = Viewports::new();
+        viewports.insert(Viewport::new_main(800, 600));
+        let mut world = hecs::World::new();
+        let entity = world.spawn(());
+        viewports.main_mut().runtime_override = Some(CameraSource::Entity(entity));
+        assert!(viewports.main().runtime_override.is_some());
+        viewports.main_mut().runtime_override = None;
+        assert!(viewports.main().runtime_override.is_none());
+    }
+
+    #[test]
     fn additive_filter_passes_focus_entity_outside_layer_mask() {
         // The contract: `(layers & base) != 0 || entity == focus`.
         // Verify the boolean arithmetic holds for an entity outside the

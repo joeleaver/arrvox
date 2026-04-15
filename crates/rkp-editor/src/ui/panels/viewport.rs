@@ -3,9 +3,15 @@
 use rinch::prelude::*;
 use rinch::render_surface::{RenderSurface, SurfaceEvent, SurfaceMouseButton};
 
+use rkp_engine::viewport::ViewportId;
+
 use crate::CommandSender;
 use crate::ui::store::EditorStore;
 use super::viewport_toolbar::{ViewportHeaderBar, EditModeToolbar};
+
+/// The viewport id this panel renders. Phase 3: only the MAIN viewport has
+/// a UI panel; the build viewport gets its own component in Phase 6.
+const PANEL_VIEWPORT: ViewportId = ViewportId::MAIN;
 
 /// Map rinch SurfaceMouseButton to rkf_runtime InputMouseButton.
 fn map_button(btn: SurfaceMouseButton) -> rkf_runtime::input::InputMouseButton {
@@ -69,7 +75,7 @@ pub fn Viewport() -> NodeHandle {
             // Only send resize occasionally — every mouse event is fine,
             // the engine no-ops if the size hasn't changed.
             let _ = cmd_tx.send(rkp_engine::EngineCommand::Resize {
-                width: w, height: h,
+                id: PANEL_VIEWPORT, width: w, height: h,
             });
         }
 
@@ -79,16 +85,20 @@ pub fn Viewport() -> NodeHandle {
                 let dy = y - last_my.get();
                 last_mx.set(x);
                 last_my.set(y);
-                let _ = cmd_tx.send(rkp_engine::EngineCommand::MouseMove { x, y, dx, dy });
+                let _ = cmd_tx.send(rkp_engine::EngineCommand::MouseMove {
+                    id: PANEL_VIEWPORT, x, y, dx, dy,
+                });
             }
             MouseDown { button, x, y } => {
                 let _ = cmd_tx.send(rkp_engine::EngineCommand::MouseButton {
+                    id: PANEL_VIEWPORT,
                     button: map_button(button),
                     pressed: true,
                 });
                 // Left click → pick object at this pixel.
                 if button == SurfaceMouseButton::Left {
                     let _ = cmd_tx.send(rkp_engine::EngineCommand::Pick {
+                        id: PANEL_VIEWPORT,
                         x: x as u32,
                         y: y as u32,
                     });
@@ -96,12 +106,15 @@ pub fn Viewport() -> NodeHandle {
             }
             MouseUp { button, .. } => {
                 let _ = cmd_tx.send(rkp_engine::EngineCommand::MouseButton {
+                    id: PANEL_VIEWPORT,
                     button: map_button(button),
                     pressed: false,
                 });
             }
             MouseWheel { delta_y, .. } => {
-                let _ = cmd_tx.send(rkp_engine::EngineCommand::Scroll { delta: delta_y });
+                let _ = cmd_tx.send(rkp_engine::EngineCommand::Scroll {
+                    id: PANEL_VIEWPORT, delta: delta_y,
+                });
             }
             KeyDown(key_data) => {
                 // Delete key → delete selected entity.

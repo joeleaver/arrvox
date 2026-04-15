@@ -820,31 +820,83 @@ impl EngineState {
         match cmd {
             EngineCommand::Shutdown => return false,
 
-            EngineCommand::SetCamera { position, yaw, pitch, fov } => {
-                self.camera.position = position;
-                self.camera.yaw = yaw;
-                self.camera.pitch = pitch;
-                self.camera.fov = fov;
-                self.sync_main_viewport_from_legacy_camera();
+            EngineCommand::SetCamera { id, position, yaw, pitch, fov } => {
+                // Phase 3: only MAIN is wired to the legacy `self.camera`.
+                // Non-MAIN viewports update their own editor_camera once
+                // multi-viewport rendering lands (Phase 4+).
+                if id == crate::viewport::ViewportId::MAIN {
+                    self.camera.position = position;
+                    self.camera.yaw = yaw;
+                    self.camera.pitch = pitch;
+                    self.camera.fov = fov;
+                    self.sync_main_viewport_from_legacy_camera();
+                } else if let Some(vp) = self.viewports.get_mut(id) {
+                    use crate::viewport::{EditorCamera, FlyCameraState};
+                    vp.editor_camera = EditorCamera::Fly(FlyCameraState {
+                        position, yaw, pitch, fov,
+                        near: 0.01, far: 1000.0,
+                    });
+                }
             }
 
-            EngineCommand::Resize { width, height } => {
-                if width != self.width || height != self.height {
-                    self.width = width;
-                    self.height = height;
-                    self.renderer.resize(width, height);
-                    if let Some(main_vr) = self.viewport_renderers
-                        .get_mut(&crate::viewport::ViewportId::MAIN)
-                    {
-                        main_vr.resize(&self.device, &mut self.renderer, width, height);
+            EngineCommand::Resize { id, width, height } => {
+                // Resize the targeted viewport's render-target. MAIN also
+                // updates the legacy width/height on EngineState because
+                // some hot paths still read them.
+                if let Some(viewport) = self.viewports.get_mut(id) {
+                    viewport.width = width;
+                    viewport.height = height;
+                }
+                if id == crate::viewport::ViewportId::MAIN {
+                    if width != self.width || height != self.height {
+                        self.width = width;
+                        self.height = height;
+                        self.renderer.resize(width, height);
+                        if let Some(main_vr) = self.viewport_renderers.get_mut(&id) {
+                            main_vr.resize(&self.device, &mut self.renderer, width, height);
+                        }
+                        self.environment_dirty = true;
+                        self.environment_ui_dirty = true;
+                        eprintln!("[RkpEngine] resized to {}x{}", width, height);
                     }
-                    self.environment_dirty = true;
-                    self.environment_ui_dirty = true;
-                    if let Some(main) = self.viewports.get_mut(crate::viewport::ViewportId::MAIN) {
-                        main.width = width;
-                        main.height = height;
+                } else if let Some(vr) = self.viewport_renderers.get_mut(&id) {
+                    // Non-MAIN viewports get their VR resized too. With
+                    // shared per-resolution passes (deferred to Phase 4),
+                    // mismatched sizes mean re-resizing the renderer per
+                    // render_to call — out of scope for Phase 3.
+                    vr.resize(&self.device, &mut self.renderer, width, height);
+                }
+            }
+
+            EngineCommand::SetViewportVisible { id, visible } => {
+                if let Some(vp) = self.viewports.get_mut(id) {
+                    vp.visible = visible;
+                }
+            }
+
+            EngineCommand::SetViewportFilter { id, base_layers, focus_entity_id } => {
+                let focus_entity = focus_entity_id
+                    .and_then(|uuid| self.uuid_to_entity.get(&uuid).copied());
+                if let Some(vp) = self.viewports.get_mut(id) {
+                    vp.filter = crate::viewport::SceneFilter {
+                        base_layers,
+                        focus_entity,
+                    };
+                }
+            }
+
+            EngineCommand::SetViewportCamera { id, entity_id } => {
+                if let Some(entity) = self.uuid_to_entity.get(&entity_id).copied() {
+                    if let Some(vp) = self.viewports.get_mut(id) {
+                        vp.runtime_override =
+                            Some(crate::viewport::CameraSource::Entity(entity));
                     }
-                    eprintln!("[RkpEngine] resized to {}x{}", width, height);
+                }
+            }
+
+            EngineCommand::ClearViewportCamera { id } => {
+                if let Some(vp) = self.viewports.get_mut(id) {
+                    vp.runtime_override = None;
                 }
             }
 
@@ -1103,9 +1155,13 @@ impl EngineState {
                 }
             }
 
-            EngineCommand::Pick { x, y } => {
-                // Don't pick if clicking on a gizmo handle — let the drag start instead.
-                if self.gizmo.hovered_axis == crate::gizmo::GizmoAxis::None {
+            EngineCommand::Pick { id, x, y } => {
+                // Phase 3: only MAIN's gbuffer is wired into picking. Other
+                // viewports get their own pick path when multi-viewport
+                // rendering lands.
+                if id == crate::viewport::ViewportId::MAIN
+                    && self.gizmo.hovered_axis == crate::gizmo::GizmoAxis::None
+                {
                     self.pending_pick = Some((x, y));
                 }
             }
@@ -1270,15 +1326,23 @@ impl EngineState {
             }
 
             // ── Raw input → feed to InputSystem ──────────────────────
-            EngineCommand::MouseMove { x, y, dx, dy } => {
-                self.mouse_pos = glam::Vec2::new(x, y);
-                self.input_system.feed_mouse_delta(glam::Vec2::new(dx, dy));
+            // Phase 3: only MAIN viewport input drives the camera-controller
+            // input system. Build viewport / PiP wiring lands in Phase 6.
+            EngineCommand::MouseMove { id, x, y, dx, dy } => {
+                if id == crate::viewport::ViewportId::MAIN {
+                    self.mouse_pos = glam::Vec2::new(x, y);
+                    self.input_system.feed_mouse_delta(glam::Vec2::new(dx, dy));
+                }
             }
-            EngineCommand::MouseButton { button, pressed } => {
-                self.input_system.feed_mouse_button(button, pressed);
+            EngineCommand::MouseButton { id, button, pressed } => {
+                if id == crate::viewport::ViewportId::MAIN {
+                    self.input_system.feed_mouse_button(button, pressed);
+                }
             }
-            EngineCommand::Scroll { delta } => {
-                self.input_system.feed_scroll(delta);
+            EngineCommand::Scroll { id, delta } => {
+                if id == crate::viewport::ViewportId::MAIN {
+                    self.input_system.feed_scroll(delta);
+                }
             }
             EngineCommand::KeyDown { key } => {
                 self.input_system.feed_key_down(key);

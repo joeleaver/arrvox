@@ -9,6 +9,8 @@ use glam::Vec3;
 use rkf_runtime::input::{InputKeyCode, InputMouseButton};
 use uuid::Uuid;
 
+use crate::viewport::ViewportId;
+
 /// A command sent to the engine from the editor or any other client.
 ///
 /// The engine drains these once per tick. Commands are cheap to clone and safe
@@ -314,8 +316,11 @@ pub enum EngineCommand {
 
     // ── Camera ───────────────────────────────────────────────────────
 
-    /// Set the engine camera position/rotation directly (from editor camera controls).
+    /// Set the editor camera state on the given viewport. The viewport's
+    /// `editor_camera` is updated regardless of whether a runtime override
+    /// is active — so on play-stop the camera lands where edit-mode left it.
     SetCamera {
+        id: ViewportId,
         position: Vec3,
         yaw: f32,
         pitch: f32,
@@ -324,10 +329,40 @@ pub enum EngineCommand {
 
     // ── Viewport ─────────────────────────────────────────────────────
 
-    /// Resize the render viewport.
+    /// Resize a viewport's render target.
     Resize {
+        id: ViewportId,
         width: u32,
         height: u32,
+    },
+
+    /// Toggle whether a viewport renders this frame. Hidden viewports skip
+    /// the render pipeline entirely.
+    SetViewportVisible {
+        id: ViewportId,
+        visible: bool,
+    },
+
+    /// Replace a viewport's `SceneFilter` — the layer mask it sees plus an
+    /// optional always-included focus entity (matched by stable UUID).
+    SetViewportFilter {
+        id: ViewportId,
+        base_layers: u32,
+        focus_entity_id: Option<Uuid>,
+    },
+
+    /// Set a runtime camera override on a viewport — the viewport renders
+    /// from `entity_id`'s Camera/Transform until the override is cleared.
+    /// The viewport's `editor_camera` is preserved untouched.
+    SetViewportCamera {
+        id: ViewportId,
+        entity_id: Uuid,
+    },
+
+    /// Clear a viewport's runtime override; rendering falls back to the
+    /// persistent `editor_camera`.
+    ClearViewportCamera {
+        id: ViewportId,
     },
 
     /// Select an entity (for UI highlight and inspector).
@@ -337,40 +372,44 @@ pub enum EngineCommand {
 
     // ── Picking ───────────────────────────────────────────────────
 
-    /// Pick the object at viewport pixel (x, y).
-    /// Engine reads the G-buffer and updates selection.
+    /// Pick the object at the given viewport's pixel (x, y).
+    /// Engine reads that viewport's G-buffer and updates selection.
     Pick {
+        id: ViewportId,
         x: u32,
         y: u32,
     },
 
     // ── Raw input (fed from surface events) ────────────────────────
 
-    /// Mouse moved — absolute position + delta in pixels.
+    /// Mouse moved over a viewport — absolute position + delta in pixels.
     MouseMove {
+        id: ViewportId,
         x: f32,
         y: f32,
         dx: f32,
         dy: f32,
     },
 
-    /// Mouse button pressed/released.
+    /// Mouse button pressed/released over a viewport.
     MouseButton {
+        id: ViewportId,
         button: InputMouseButton,
         pressed: bool,
     },
 
-    /// Scroll wheel.
+    /// Scroll wheel over a viewport.
     Scroll {
+        id: ViewportId,
         delta: f32,
     },
 
-    /// Key pressed.
+    /// Key pressed (global — keys aren't viewport-scoped).
     KeyDown {
         key: InputKeyCode,
     },
 
-    /// Key released.
+    /// Key released (global).
     KeyUp {
         key: InputKeyCode,
     },
