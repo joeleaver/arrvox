@@ -538,12 +538,38 @@ impl RkpSceneManager {
         tree.deduplicate_subtrees();
         let dedup_count = tree.node_count();
         tree.morton_reorder();
-        let compact_nodes = tree.as_slice().to_vec();
 
-        let handle = self.octree.allocate_raw(&compact_nodes, octree_depth, voxel_size);
+        // Run the prefilter pass on-load so v4 assets (no baked internal
+        // attrs) still benefit from the GPU's LOD early-exit. Phase 4
+        // bumps the .rkp format to v5 which bakes these at conversion
+        // time — this is the fallback until then.
+        //
+        // The prefilter appends new attrs at the tail of the asset's
+        // contiguous leaf_attr range via allocate_contiguous_bump(1), so
+        // the `leaf_attr_slot_count` grows to cover them and the
+        // existing deallocate_range releases everything on asset drop.
+        let mut attr_dedup: HashMap<LeafAttr, u32> = HashMap::new();
+        for i in 0..leaf_attr_slot_count {
+            let slot = leaf_attr_slot_start + i;
+            attr_dedup.insert(*self.leaf_attr_pool.get(slot), slot);
+        }
+        rkp_core::prefilter::prefilter_octree_internals(
+            &mut tree,
+            &mut self.leaf_attr_pool,
+            &self.brick_pool,
+            &mut attr_dedup,
+        );
+        let final_leaf_attr_slot_count =
+            self.leaf_attr_pool.allocated_count() - leaf_attr_slot_start;
+
+        // Allocate the octree with its now-populated internal_attr_index
+        // intact. `allocate(&tree)` preserves both buffers; the legacy
+        // `allocate_raw(nodes, …)` would have dropped the prefilter ids
+        // by round-tripping through `SparseOctree::from_raw`.
+        let handle = self.octree.allocate(&tree);
 
         eprintln!(
-            "[RkpSceneManager] loaded {}: {} voxels, {} bricks, octree {} → compact {} → dedup {} ({:.1}× total)",
+            "[RkpSceneManager] loaded {}: {} voxels, {} bricks, octree {} → compact {} → dedup {} ({:.1}× total), +{} prefilter attrs",
             rkp_path.display(),
             voxel_count,
             file_brick_count,
@@ -551,6 +577,7 @@ impl RkpSceneManager {
             compact_count,
             dedup_count,
             if dedup_count > 0 { raw_count as f64 / dedup_count as f64 } else { 0.0 },
+            final_leaf_attr_slot_count - leaf_attr_slot_count,
         );
 
         Ok(AssetEntry {
@@ -561,7 +588,7 @@ impl RkpSceneManager {
             aabb,
             voxel_count,
             leaf_attr_slot_start,
-            leaf_attr_slot_count,
+            leaf_attr_slot_count: final_leaf_attr_slot_count,
             brick_start: scene_brick_offset,
             brick_count: file_brick_count,
         })
