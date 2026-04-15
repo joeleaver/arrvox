@@ -800,6 +800,23 @@ impl EngineState {
         }
     }
 
+    /// Apply a scripted viewport request (from the behavior system).
+    /// Currently all requests target MAIN; per-viewport routing would use
+    /// a `ViewportId` payload on the request enum.
+    fn apply_viewport_request(&mut self, req: crate::behavior::ViewportRequest) {
+        use crate::behavior::ViewportRequest;
+        use crate::viewport::{CameraSource, ViewportId};
+        let Some(main) = self.viewports.get_mut(ViewportId::MAIN) else { return };
+        match req {
+            ViewportRequest::SetActiveCamera(entity) => {
+                main.runtime_override = Some(CameraSource::Entity(entity));
+            }
+            ViewportRequest::ClearActiveCamera => {
+                main.runtime_override = None;
+            }
+        }
+    }
+
     /// On PlayStop: clear the runtime override and restore the editor
     /// layer mask. The editor camera state was untouched throughout play
     /// mode, so the user lands exactly where they left off.
@@ -3629,6 +3646,14 @@ fn tick_loop(
                     state.play_total_time,
                     state.play_frame_count,
                 );
+            }
+
+            // Drain viewport requests from behaviors (e.g. set_active_camera).
+            // The executor only touches the ECS world; viewport state lives
+            // on EngineState so we apply these after the phases complete.
+            let requests = state.behavior_commands.take_viewport_requests();
+            for req in requests {
+                state.apply_viewport_request(req);
             }
         }
 

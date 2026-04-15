@@ -41,6 +41,21 @@ struct PendingSpawn {
     builder: hecs::EntityBuilder,
 }
 
+/// A request from a gameplay system targeting viewport state rather than
+/// the ECS world — e.g., swapping the play-mode camera mid-session. The
+/// engine drains these after systems tick (the executor itself never
+/// touches viewports).
+#[derive(Debug, Clone, Copy)]
+pub enum ViewportRequest {
+    /// Set MAIN's runtime_override to this entity. Expects the entity to
+    /// carry a `Camera` + `Transform` component; if either is missing, the
+    /// override resolves to the editor camera as usual.
+    SetActiveCamera(hecs::Entity),
+    /// Clear MAIN's runtime_override so rendering falls back to the
+    /// editor camera (or the behavior's next `set_active_camera` call).
+    ClearActiveCamera,
+}
+
 /// Deferred ECS mutation queue.
 ///
 /// Systems push commands; the executor flushes between phases.
@@ -50,6 +65,9 @@ pub struct CommandQueue {
     entity_inserts: Vec<(hecs::Entity, PendingInsert)>,
     despawns: Vec<hecs::Entity>,
     removes: Vec<(hecs::Entity, PendingRemove)>,
+    /// Viewport-scoped requests. Drained by the engine after systems tick
+    /// — not by `flush()`, since flushing only reaches the ECS world.
+    viewport_requests: Vec<ViewportRequest>,
     /// Entities that were spawned during the most recent flush.
     spawned: Vec<hecs::Entity>,
 }
@@ -62,8 +80,22 @@ impl CommandQueue {
             entity_inserts: Vec::new(),
             despawns: Vec::new(),
             removes: Vec::new(),
+            viewport_requests: Vec::new(),
             spawned: Vec::new(),
         }
+    }
+
+    /// Push a viewport-level request (e.g. camera swap). Drained by the
+    /// engine after the system tick finishes — `flush()` ignores these.
+    pub fn push_viewport_request(&mut self, request: ViewportRequest) {
+        self.viewport_requests.push(request);
+    }
+
+    /// Drain pending viewport requests. The engine calls this after
+    /// systems tick; within gameplay code use the
+    /// `SystemContext::set_active_camera` / `clear_active_camera` helpers.
+    pub fn take_viewport_requests(&mut self) -> Vec<ViewportRequest> {
+        std::mem::take(&mut self.viewport_requests)
     }
 
     /// Queue a new entity spawn. Returns a `TempEntity` handle for queuing
@@ -178,6 +210,7 @@ impl CommandQueue {
             && self.entity_inserts.is_empty()
             && self.despawns.is_empty()
             && self.removes.is_empty()
+            && self.viewport_requests.is_empty()
     }
 }
 

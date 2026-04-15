@@ -10,7 +10,7 @@
 
 use glam::Vec3;
 
-use super::command_queue::{CommandQueue, TempEntity};
+use super::command_queue::{CommandQueue, TempEntity, ViewportRequest};
 use super::engine_access::{EngineAccess, TransformUpdate};
 use super::game_store::GameStore;
 
@@ -181,6 +181,23 @@ impl<'a> SystemContext<'a> {
     /// Drain and return buffered transform updates. Called by the executor.
     pub fn take_transform_updates(&mut self) -> Vec<TransformUpdate> {
         std::mem::take(&mut self.transform_updates)
+    }
+
+    // ── Viewport control ────────────────────────────────────────────
+
+    /// Hand the MAIN viewport over to `entity`'s Camera + Transform.
+    /// Takes effect after this system returns, when the engine drains
+    /// pending viewport requests. The entity must carry both components
+    /// for the swap to have a visible effect — otherwise rendering falls
+    /// back to the editor camera as usual.
+    pub fn set_active_camera(&mut self, entity: hecs::Entity) {
+        self.commands.push_viewport_request(ViewportRequest::SetActiveCamera(entity));
+    }
+
+    /// Clear the MAIN viewport's runtime-camera override. Rendering
+    /// returns to the editor camera on the next frame.
+    pub fn clear_active_camera(&mut self) {
+        self.commands.push_viewport_request(ViewportRequest::ClearActiveCamera);
     }
 
     // ── Lifecycle ───────────────────────────────────────────────────

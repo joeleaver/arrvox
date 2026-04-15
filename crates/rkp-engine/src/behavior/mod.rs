@@ -26,7 +26,7 @@ pub mod executor;
 pub use phase::Phase;
 pub use system_entry::SystemEntry;
 pub use system_context::SystemContext;
-pub use command_queue::{CommandQueue, TempEntity};
+pub use command_queue::{CommandQueue, TempEntity, ViewportRequest};
 pub use game_store::{GameStore, GameValue, StoreEvent};
 pub use engine_access::{EngineAccess, TransformUpdate};
 pub use executor::BehaviorExecutor;
