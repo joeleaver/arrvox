@@ -7,11 +7,20 @@
 const OCTREE_EMPTY: u32 = 0xFFFFFFFFu;
 const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
 const OCTREE_LEAF_BIT: u32 = 0x80000000u;
+const OCTREE_BRICK_BIT: u32 = 0x40000000u;
+const OCTREE_PAYLOAD_MASK: u32 = 0x3FFFFFFFu;
 const OPACITY_THRESHOLD: f32 = 0.05;
 const MAX_STEPS: u32 = 256u;
 const MAX_OBJECTS: u32 = 32u;
-
-struct VoxelSample { word0: u32, word1: u32, }
+// Brick layout — must match rkp_core::brick_pool constants.
+const BRICK_DIM: u32 = 4u;
+const BRICK_DIM_F: f32 = 4.0;
+const BRICK_CELLS: u32 = 64u; // 4³
+const BRICK_CELL_EMPTY: u32 = 0xFFFFFFFFu;
+// A 4³ brick has at most ~12 cells along the longest diagonal traversal,
+// so capping inner-DDA at 16 keeps a misbehaving loop from melting the
+// frame. Real traversals never come close to this cap.
+const BRICK_MAX_STEPS: u32 = 16u;
 
 struct RkpObject {
     world: mat4x4<f32>,
@@ -58,21 +67,54 @@ struct GpuMaterial {
     opacity: f32,
 }
 
-struct OctreeResult { slot: u32, depth: u32, }
+struct OctreeResult {
+    slot: u32,
+    depth: u32,
+    // Spatial bounds of the terminating cell (in object-local oc-space).
+    // For BRICK results these are the brick's bounds; the brick DDA loop
+    // uses them to compute local cell coords without re-descending.
+    cell_center: vec3<f32>,
+    cell_half: f32,
+}
 
 // --- Bindings ---
 
-@group(0) @binding(0) var<storage, read> voxel_pool: array<VoxelSample>;
+// Brick storage at binding 0 — flat array of u32 cells, indexed by
+// `brick_id * BRICK_CELLS + flat_cell_index`. Each cell is either
+// BRICK_CELL_EMPTY or a leaf_attr_id. (Binding 0 was a dummy voxel_pool
+// before bricks landed; we reused the slot to stay under the 12
+// storage-buffer limit per shader stage.)
+@group(0) @binding(0) var<storage, read> brick_pool: array<u32>;
 @group(0) @binding(1) var<storage, read> octree_nodes: array<u32>;
 @group(0) @binding(2) var<storage, read> objects: array<RkpObject>;
 @group(0) @binding(3) var<uniform> camera: CameraUniforms;
+// color_pool[leaf_attr_id] → packed R|G|B|A u32, 0 = no override (use
+// material base_color). Parallel to leaf_attr_pool.
 @group(0) @binding(4) var<storage, read> color_pool_data: array<u32>;
-// leaf_attr[leaf_id] = { voxel_slot: u32, normal_oct: u32 }
-// Octree leaf values encode leaf_id (not voxel_slot). One indirection via
-// leaf_attr yields the voxel_slot (for opacity/material/color) AND a packed
-// surface normal — no gradient reconstruction needed at shade time.
-struct LeafAttr { voxel_slot: u32, normal_oct: u32, }
+// leaf_attr[leaf_id] carries normal + material IDs. One 8-byte read per
+// hit; everything needed to shade the leaf.
+struct LeafAttr {
+    normal_oct: u32,                 // 2× snorm16 octahedral
+    material_packed: u32,            // low 16: material_primary
+                                     // mid 12:  material_secondary (shifted 16)
+                                     // high 4:  blend_weight (shifted 28)
+}
 @group(0) @binding(8) var<storage, read> leaf_attr_pool: array<LeafAttr>;
+
+fn leaf_attr_material_primary(a: LeafAttr) -> u32 { return a.material_packed & 0xFFFFu; }
+fn leaf_attr_material_secondary(a: LeafAttr) -> u32 { return (a.material_packed >> 16u) & 0x0FFFu; }
+fn leaf_attr_blend_weight(a: LeafAttr) -> u32 { return (a.material_packed >> 28u) & 0x0Fu; }
+
+fn is_brick_node(node: u32) -> bool {
+    return (node & OCTREE_LEAF_BIT) != 0u
+        && (node & OCTREE_BRICK_BIT) != 0u
+        && node != OCTREE_EMPTY
+        && node != OCTREE_INTERIOR;
+}
+
+fn brick_id_of(node: u32) -> u32 {
+    return node & OCTREE_PAYLOAD_MASK;
+}
 
 @group(1) @binding(0) var gbuf_position: texture_storage_2d<rgba32float, write>;
 @group(1) @binding(1) var gbuf_normal: texture_storage_2d<rgba16float, write>;
@@ -81,7 +123,7 @@ struct LeafAttr { voxel_slot: u32, normal_oct: u32, }
 
 @group(2) @binding(0) var<uniform> march_params: MarchParams;
 @group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
-@group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 44>;
+@group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 52>;
 // stats[0]       = total steps across all pixels
 // stats[1]       = (reserved — was total_lookups; retained slot for layout stability)
 // stats[2]       = pixels that found a hit
@@ -90,6 +132,14 @@ struct LeafAttr { voxel_slot: u32, normal_oct: u32, }
 // stats[16..28]  = descent depth histogram, normal        (buckets L0..L11)
 // stats[28..40]  = descent depth histogram, shadow        (buckets L0..L11)
 // stats[40..44]  = hit footprint: <1px, [1,2), [2,4), >=4px
+// stats[44]      = leaf_attr_pool reads   (8 B each)
+// stats[45]      = voxel_pool reads       (8 B each; word0+word1 same cache line)
+// stats[46]      = color_pool_data reads  (4 B each)
+// stats[47]      = materials reads        (32 B each — WGSL storage layout)
+// stats[48..52]  = reserved
+//
+// octree_nodes reads are derived CPU-side from the per-phase depth histograms:
+// sum(bucket[i] * (i + 1)) since each lookup descends `depth+1` nodes.
 const PHASE_MARCH: u32 = 0u;
 const PHASE_NORMAL: u32 = 1u;
 const PHASE_SHADOW: u32 = 2u;
@@ -101,12 +151,9 @@ var<workgroup> tile_mask: u32;
 
 // --- Helpers ---
 
-fn extract_opacity(word0: u32) -> f32 {
-    return clamp(unpack2x16float(word0 & 0xFFFFu).x, 0.0, 1.0);
-}
-fn extract_material_id(word1: u32) -> u32 { return word1 & 0xFFFFu; }
-fn extract_secondary_material_id(word1: u32) -> u32 { return (word1 >> 16u) & 0xFFFFu; }
-fn extract_blend_weight(word0: u32) -> u32 { return (word0 >> 16u) & 0xFFu; }
+// (Removed legacy `extract_opacity` / `extract_*_id` / `extract_blend_weight`
+// helpers — they unpacked the old 8-byte VoxelSample. The active path reads
+// material data directly from LeafAttr via `leaf_attr_material_*` instead.)
 
 fn invert_rigid(m: mat4x4<f32>) -> mat4x4<f32> {
     let s2 = dot(m[0].xyz, m[0].xyz);
@@ -143,11 +190,21 @@ fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: 
     var center = vec3<f32>(half);
     for (var level = 0u; level < max_depth; level++) {
         let node = octree_nodes[offset];
-        if node == OCTREE_EMPTY { bucket_depth(phase, level); return OctreeResult(OCTREE_EMPTY, level); }
-        if node == OCTREE_INTERIOR { bucket_depth(phase, level); return OctreeResult(OCTREE_INTERIOR, level); }
+        if node == OCTREE_EMPTY {
+            bucket_depth(phase, level);
+            return OctreeResult(OCTREE_EMPTY, level, center, half);
+        }
+        if node == OCTREE_INTERIOR {
+            bucket_depth(phase, level);
+            return OctreeResult(OCTREE_INTERIOR, level, center, half);
+        }
         if (node & OCTREE_LEAF_BIT) != 0u {
             bucket_depth(phase, level);
-            return OctreeResult(node & ~OCTREE_LEAF_BIT, level);
+            // Preserve BRICK_BIT in the returned slot so the caller can
+            // distinguish a regular leaf from a brick (both arrive via the
+            // same code path; only their payload-mask interpretation
+            // differs).
+            return OctreeResult(node & OCTREE_PAYLOAD_MASK | (node & OCTREE_BRICK_BIT), level, center, half);
         }
         let gt = vec3<u32>(pos >= center);
         offset = node + gt.x + gt.y * 2u + gt.z * 4u;
@@ -160,12 +217,24 @@ fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: 
     }
     bucket_depth(phase, max_depth);
     let node = octree_nodes[offset];
-    if node == OCTREE_EMPTY { return OctreeResult(OCTREE_EMPTY, max_depth); }
-    if node == OCTREE_INTERIOR { return OctreeResult(OCTREE_INTERIOR, max_depth); }
+    if node == OCTREE_EMPTY { return OctreeResult(OCTREE_EMPTY, max_depth, center, half); }
+    if node == OCTREE_INTERIOR { return OctreeResult(OCTREE_INTERIOR, max_depth, center, half); }
     if (node & OCTREE_LEAF_BIT) != 0u {
-        return OctreeResult(node & ~OCTREE_LEAF_BIT, max_depth);
+        return OctreeResult(node & OCTREE_PAYLOAD_MASK | (node & OCTREE_BRICK_BIT), max_depth, center, half);
     }
-    return OctreeResult(OCTREE_EMPTY, max_depth);
+    return OctreeResult(OCTREE_EMPTY, max_depth, center, half);
+}
+
+/// Detect a BRICK result from `octree_lookup`: BRICK_BIT preserved in slot.
+fn slot_is_brick(slot: u32) -> bool {
+    return (slot & OCTREE_BRICK_BIT) != 0u
+        && slot != OCTREE_EMPTY
+        && slot != OCTREE_INTERIOR;
+}
+
+/// Strip the BRICK_BIT marker from a slot to get the actual brick_id.
+fn slot_brick_id(slot: u32) -> u32 {
+    return slot & OCTREE_PAYLOAD_MASK;
 }
 
 // Skip past an empty/interior node's region along the ray.
@@ -260,31 +329,71 @@ fn trace_shadow_ray(
                 continue;
             }
 
-            var voxel_opacity = 0.0;
-            var mat_opacity = 1.0;
-            if r.slot == OCTREE_INTERIOR {
-                voxel_opacity = 1.0;
-            } else {
-                // r.slot is a leaf_attr_id — deref to get voxel_slot.
-                let voxel_slot = leaf_attr_pool[r.slot].voxel_slot;
-                voxel_opacity = extract_opacity(voxel_pool[voxel_slot].word0);
-                let mid = extract_material_id(voxel_pool[voxel_slot].word1);
-                mat_opacity = materials[mid].opacity;
-            }
-
-            if voxel_opacity <= OPACITY_THRESHOLD {
-                // Below threshold: skip with minimum step to avoid burning budget
-                // on leaf-level near-surface nodes.
-                t += max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);
+            // BRICK: do a small DDA inside the brick. Same logic as the
+            // surface march's brick path, but only opacity matters (no
+            // normal / color recovery for shadow rays).
+            if slot_is_brick(r.slot) {
+                let brick_id = slot_brick_id(r.slot);
+                let cell_size = (r.cell_half * 2.0) / BRICK_DIM_F;
+                let inv_cell_size = 1.0 / cell_size;
+                let brick_origin = r.cell_center - vec3<f32>(r.cell_half);
+                let brick_base = brick_id * BRICK_CELLS;
+                let min_advance = cell_size * 1.0e-3;
+                var blocked = false;
+                for (var bs = 0u; bs < BRICK_MAX_STEPS; bs++) {
+                    if t > t_limit { break; }
+                    let p = shadow_origin + safe_dir * t;
+                    let local = (p - brick_origin) * inv_cell_size;
+                    let lx = floor(local.x);
+                    let ly = floor(local.y);
+                    let lz = floor(local.z);
+                    if lx < 0.0 || ly < 0.0 || lz < 0.0
+                        || lx >= BRICK_DIM_F || ly >= BRICK_DIM_F || lz >= BRICK_DIM_F {
+                        break;
+                    }
+                    let cx = u32(lx);
+                    let cy = u32(ly);
+                    let cz = u32(lz);
+                    let flat = cx + cy * BRICK_DIM + cz * BRICK_DIM * BRICK_DIM;
+                    let cell = brick_pool[brick_base + flat];
+                    if cell != BRICK_CELL_EMPTY {
+                        let attr = leaf_attr_pool[cell];
+                        let mid = leaf_attr_material_primary(attr);
+                        let m_op = materials[mid].opacity;
+                        if m_op >= 0.99 { blocked = true; break; }
+                        transmittance *= (1.0 - m_op);
+                        if transmittance < 0.01 { blocked = true; break; }
+                        t = max(t + cell_size * 0.5, t + min_advance);
+                        continue;
+                    }
+                    let cell_min_pt = brick_origin
+                        + vec3<f32>(lx, ly, lz) * cell_size;
+                    let cell_max_pt = cell_min_pt + vec3<f32>(cell_size);
+                    let cell_exit = intersect_aabb(p, inv_dir, cell_min_pt, cell_max_pt).y;
+                    let new_t = t + max(cell_exit, 0.0) + min_advance;
+                    t = max(new_t, t + min_advance);
+                }
+                if blocked { return 0.0; }
                 continue;
             }
 
-            // Opaque material: hard block (matches march single-hit break).
+            // Any non-empty leaf (or INTERIOR) is 100% surface coverage.
+            // Transparency is a per-material property now.
+            var mat_opacity = 1.0;
+            if r.slot != OCTREE_INTERIOR {
+                atomicAdd(&stats[44], 1u); // leaf_attr read
+                let attr = leaf_attr_pool[r.slot];
+                let mid = leaf_attr_material_primary(attr);
+                atomicAdd(&stats[47], 1u); // materials read
+                mat_opacity = materials[mid].opacity;
+            }
+
+            // Opaque material: hard block.
             if mat_opacity >= 0.99 {
                 return 0.0;
             }
             // Transparent material: accumulate transmittance.
-            transmittance *= (1.0 - voxel_opacity * mat_opacity);
+            transmittance *= (1.0 - mat_opacity);
             if transmittance < 0.01 {
                 return 0.0;
             }
@@ -359,39 +468,146 @@ fn march_object(
             continue;
         }
 
-        var voxel_opacity = 0.0;
-        var voxel_slot = 0u;
-        var mat_opacity = 1.0;
-        // For INTERIOR (fully opaque bulk region), we have no per-leaf normal
-        // — fall back to the ray direction's opposite as a cheap safe default.
-        // Surface hits almost always land on LEAF, not INTERIOR.
-        var sample_normal = -safe_dir;
-        if r.slot == OCTREE_INTERIOR {
-            voxel_opacity = 1.0;
-        } else {
-            // r.slot is a leaf_attr_id. Dereference for voxel_slot + normal.
-            let attr = leaf_attr_pool[r.slot];
-            voxel_slot = attr.voxel_slot;
-            sample_normal = unpack_oct_normal(attr.normal_oct);
-            voxel_opacity = extract_opacity(voxel_pool[voxel_slot].word0);
-            let mid = extract_material_id(voxel_pool[voxel_slot].word1);
-            mat_opacity = materials[mid].opacity;
-        }
+        // BRICK: descend into a flat 4³ cell array. The DDA below stays in
+        // this brick until the ray exits its bounds or the accumulator
+        // saturates. Each step inside the brick is one flat read — no more
+        // octree descent until we leave the brick.
+        if slot_is_brick(r.slot) {
+            let brick_id = slot_brick_id(r.slot);
+            let cell_size = (r.cell_half * 2.0) / BRICK_DIM_F;
+            let inv_cell_size = 1.0 / cell_size;
+            let brick_origin = r.cell_center - vec3<f32>(r.cell_half);
+            let brick_base = brick_id * BRICK_CELLS;
+            // Force monotonic t advance — the smallest step we'll take per
+            // inner iteration. Guards against a degenerate `intersect_aabb`
+            // exit time that doesn't move past the current cell.
+            let min_advance = cell_size * 1.0e-3;
+            var brick_done = false;
+            for (var bs = 0u; bs < BRICK_MAX_STEPS; bs++) {
+                step_count += 1u;
+                if t > t_range.y { brick_done = true; break; }
+                if result.alpha > 0.99 { brick_done = true; break; }
 
-        // Threshold on raw voxel opacity (is this voxel occupied?).
-        // Material opacity only affects accumulation weight, not occupancy.
-        //
-        // A LEAF node has one opacity value for its entire region, so if that
-        // value is below threshold the whole node contributes nothing — skip
-        // past the node's extent instead of inching forward by half a voxel.
-        // This keeps march steps proportional to surface complexity rather
-        // than to the depth of the finest voxel grid.
-        if voxel_opacity < OPACITY_THRESHOLD {
-            t += skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs);
+                let p = oc_origin + safe_dir * t;
+                let local = (p - brick_origin) * inv_cell_size;
+                let lx = floor(local.x);
+                let ly = floor(local.y);
+                let lz = floor(local.z);
+                // Exit-the-brick test on integer cell coords (more robust
+                // than float-comparison on world bounds).
+                if lx < 0.0 || ly < 0.0 || lz < 0.0
+                    || lx >= BRICK_DIM_F || ly >= BRICK_DIM_F || lz >= BRICK_DIM_F {
+                    break;
+                }
+                let cx = u32(lx);
+                let cy = u32(ly);
+                let cz = u32(lz);
+                let flat = cx + cy * BRICK_DIM + cz * BRICK_DIM * BRICK_DIM;
+                let cell = brick_pool[brick_base + flat];
+
+                if cell != BRICK_CELL_EMPTY {
+                    // Cell occupied — process as a leaf hit.
+                    atomicAdd(&stats[44], 1u); // leaf_attr read
+                    let attr = leaf_attr_pool[cell];
+                    let cell_normal = unpack_oct_normal(attr.normal_oct);
+                    let mid = leaf_attr_material_primary(attr);
+                    atomicAdd(&stats[47], 1u); // materials read
+                    let m_opacity = materials[mid].opacity;
+
+                    if m_opacity >= 0.99 {
+                        // Opaque hit — finalize result and exit both loops.
+                        result.oc_pos = p;
+                        result.normal = cell_normal;
+                        result.alpha = 1.0;
+                        result.t = t;
+                        result.first_slot = cell;
+                        result.valid = true;
+                        var color = vec3<f32>(0.5);
+                        if cell != 0u {
+                            atomicAdd(&stats[46], 1u); // color_pool read
+                            let cp = color_pool_data[cell];
+                            if cp != 0u {
+                                color = vec3<f32>(
+                                    f32(cp & 0xFFu) / 255.0,
+                                    f32((cp >> 8u) & 0xFFu) / 255.0,
+                                    f32((cp >> 16u) & 0xFFu) / 255.0,
+                                );
+                            }
+                        }
+                        result.color = color;
+                        result.steps = step_count;
+                        brick_done = true;
+                        break;
+                    }
+
+                    // Transparent: accumulate.
+                    let remaining = 1.0 - result.alpha;
+                    let weight = m_opacity * remaining;
+                    result.oc_pos += p * weight;
+                    result.normal += cell_normal * weight;
+                    var color = vec3<f32>(0.5);
+                    if cell != 0u {
+                        atomicAdd(&stats[46], 1u);
+                        let cp = color_pool_data[cell];
+                        if cp != 0u {
+                            color = vec3<f32>(
+                                f32(cp & 0xFFu) / 255.0,
+                                f32((cp >> 8u) & 0xFFu) / 255.0,
+                                f32((cp >> 16u) & 0xFFu) / 255.0,
+                            );
+                        }
+                    }
+                    result.color += color * weight;
+                    result.alpha += weight;
+                    if !result.valid {
+                        result.t = t;
+                        result.first_slot = cell;
+                        result.valid = true;
+                    }
+                    // Force a forward step even if cell_size * 0.5 is
+                    // somehow swallowed by float precision.
+                    t = max(t + cell_size * 0.5, t + min_advance);
+                    continue;
+                }
+
+                // Empty cell — DDA to the next cell boundary. Use
+                // current p as the ray origin for the AABB test so
+                // exit_t is unambiguously positive (the previous version
+                // used oc_origin, which was correct in principle but
+                // less defensive against precision wobble).
+                let cell_min_pt = brick_origin
+                    + vec3<f32>(lx, ly, lz) * cell_size;
+                let cell_max_pt = cell_min_pt + vec3<f32>(cell_size);
+                let cell_exit = intersect_aabb(p, inv_dir, cell_min_pt, cell_max_pt).y;
+                // cell_exit is relative to p; absolute t becomes t + cell_exit.
+                let new_t = t + max(cell_exit, 0.0) + min_advance;
+                // Monotonic progress guard.
+                t = max(new_t, t + min_advance);
+            }
+            if brick_done { break; }
             continue;
         }
 
-        let sample_opacity = voxel_opacity * mat_opacity;
+        // Every leaf is a surface voxel. Material drives coverage for the
+        // transparency compositing path; opacity-as-geometry is gone.
+        var leaf_id = 0u;                  // leaf_attr_id for this hit (for main())
+        var mat_opacity = 1.0;
+        var first_mat = 0u;
+        // For INTERIOR (fully opaque bulk region) we have no stored normal —
+        // the ray-opposite is a cheap safe default. Surface hits land on
+        // LEAF, not INTERIOR, so this rarely governs shading.
+        var sample_normal = -safe_dir;
+        if r.slot != OCTREE_INTERIOR {
+            atomicAdd(&stats[44], 1u); // leaf_attr read
+            let attr = leaf_attr_pool[r.slot];
+            leaf_id = r.slot;
+            sample_normal = unpack_oct_normal(attr.normal_oct);
+            first_mat = leaf_attr_material_primary(attr);
+            atomicAdd(&stats[47], 1u); // materials read
+            mat_opacity = materials[first_mat].opacity;
+        }
+
+        let sample_opacity = mat_opacity;
 
         // Opaque material: first hit wins — no accumulation needed.
         if mat_opacity >= 0.99 {
@@ -399,11 +615,12 @@ fn march_object(
             result.normal = sample_normal;
             result.alpha = 1.0;
             result.t = t;
-            result.first_slot = voxel_slot;
+            result.first_slot = leaf_id;
             result.valid = true;
             var color = vec3<f32>(0.5);
-            if voxel_slot != 0u {
-                let cp = color_pool_data[voxel_slot];
+            if leaf_id != 0u {
+                atomicAdd(&stats[46], 1u); // color_pool read
+                let cp = color_pool_data[leaf_id];
                 if cp != 0u {
                     color = vec3<f32>(
                         f32(cp & 0xFFu) / 255.0,
@@ -425,8 +642,9 @@ fn march_object(
         result.normal += sample_normal * weight;
 
         var color = vec3<f32>(0.5);
-        if voxel_slot != 0u {
-            let cp = color_pool_data[voxel_slot];
+        if leaf_id != 0u {
+            atomicAdd(&stats[46], 1u); // color_pool read
+            let cp = color_pool_data[leaf_id];
             if cp != 0u {
                 color = vec3<f32>(
                     f32(cp & 0xFFu) / 255.0,
@@ -441,7 +659,7 @@ fn march_object(
         // First hit — record for depth and material.
         if !result.valid {
             result.t = t;
-            result.first_slot = voxel_slot;
+            result.first_slot = leaf_id;
             result.valid = true;
         }
 
@@ -571,10 +789,10 @@ fn main(
             first_dist = hit_dist;
             first_obj_id = obj.object_id;
             if r.first_slot != 0u {
-                let voxel = voxel_pool[r.first_slot];
-                first_mat_id = extract_material_id(voxel.word1);
-                first_sec_mat = extract_secondary_material_id(voxel.word1);
-                first_blend = extract_blend_weight(voxel.word0);
+                let attr = leaf_attr_pool[r.first_slot];
+                first_mat_id = leaf_attr_material_primary(attr);
+                first_sec_mat = leaf_attr_material_secondary(attr);
+                first_blend = leaf_attr_blend_weight(attr);
             } else {
                 first_mat_id = obj.material_id;
             }
@@ -597,10 +815,10 @@ fn main(
             first_obj_id = obj.object_id;
             closest_obj_idx = i;
             if r.first_slot != 0u {
-                let voxel = voxel_pool[r.first_slot];
-                first_mat_id = extract_material_id(voxel.word1);
-                first_sec_mat = extract_secondary_material_id(voxel.word1);
-                first_blend = extract_blend_weight(voxel.word0);
+                let attr = leaf_attr_pool[r.first_slot];
+                first_mat_id = leaf_attr_material_primary(attr);
+                first_sec_mat = leaf_attr_material_secondary(attr);
+                first_blend = leaf_attr_blend_weight(attr);
             } else {
                 first_mat_id = obj.material_id;
             }

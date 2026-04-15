@@ -932,7 +932,7 @@ impl EngineState {
                     &primitive, 0, 0.05, glam::Vec3::ONE, scene_id,
                 );
                 if let Some(result) = result {
-                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.voxel_slot_start, result.voxel_slot_count);
+                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count);
                     let entity = self.world.spawn((
                         Transform::default(),
                         EditorMetadata { name: name.clone() },
@@ -962,16 +962,16 @@ impl EngineState {
                 // Compute bounds and voxelize the procedural tree.
                 let (aabb, voxel_size) = procedural_voxel_params(&proc_geo.tree, proc_geo.voxel_size);
                 let tree_ref = &proc_geo.tree;
-                let opacity_fn = |pos: glam::Vec3| -> (f32, u16) {
+                let sdf_fn = |pos: glam::Vec3| -> (f32, u16) {
                     let sample = rkp_procedural::sample_tree(tree_ref, pos, voxel_size);
-                    (sample.opacity, sample.material_id)
+                    (sample.distance, sample.material_id)
                 };
 
-                let result = self.scene_mgr.voxelize_opacity_fn(
-                    opacity_fn, &aabb, voxel_size, scene_id,
+                let result = self.scene_mgr.voxelize_sdf_fn(
+                    sdf_fn, &aabb, voxel_size, scene_id,
                 );
                 if let Some(result) = result {
-                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.voxel_slot_start, result.voxel_slot_count);
+                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count);
                     let entity = self.world.spawn((
                         Transform::default(),
                         EditorMetadata { name: name.clone() },
@@ -1147,7 +1147,7 @@ impl EngineState {
                     Ok(result) => {
                         let raw_name = Self::display_name_from_path(&path);
                         let name = self.unique_name(&raw_name);
-                        let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.voxel_slot_start, result.voxel_slot_count);
+                        let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count);
                         let entity = self.world.spawn((
                             Transform::default(),
                             EditorMetadata { name: name.clone() },
@@ -2077,17 +2077,16 @@ impl EngineState {
         let mut leaf_slots = Vec::new();
         collect_leaf_slots(all_nodes, spatial.root_offset as usize, &mut leaf_slots);
 
-        // Count material IDs across all leaf voxels (with bounds check).
-        let pool_size = self.scene_mgr.voxel_pool.allocated_count();
+        // Count material IDs across all leaf slots. Every leaf is a surface
+        // voxel now — no opacity gate.
+        let pool_size = self.scene_mgr.leaf_attr_pool.allocated_count();
         let mut counts: std::collections::HashMap<u16, u32> = std::collections::HashMap::new();
         for slot in leaf_slots {
             if slot >= pool_size {
                 continue; // stale or invalid slot — skip
             }
-            let voxel = self.scene_mgr.voxel_pool.get(slot);
-            if voxel.opacity_f32() > 0.01 {
-                *counts.entry(voxel.material_id()).or_insert(0) += 1;
-            }
+            let attr = self.scene_mgr.leaf_attr_pool.get(slot);
+            *counts.entry(attr.material_primary).or_insert(0) += 1;
         }
 
         // Sort by voxel count descending.
@@ -2124,25 +2123,28 @@ impl EngineState {
         let mut leaf_slots = Vec::new();
         collect_leaf_slots(all_nodes, spatial.root_offset as usize, &mut leaf_slots);
 
-        let pool_size = self.scene_mgr.voxel_pool.allocated_count();
+        let pool_size = self.scene_mgr.leaf_attr_pool.allocated_count();
         let mut count = 0u32;
         for slot in leaf_slots {
             if slot >= pool_size { continue; }
-            let voxel = self.scene_mgr.voxel_pool.get(slot);
-            let primary = voxel.material_id();
-            let secondary = voxel.secondary_material_id();
+            let attr = self.scene_mgr.leaf_attr_pool.get(slot);
+            let primary = attr.material_primary;
+            let secondary = attr.material_secondary();
             let mut changed = false;
 
             if primary == from_material {
-                let mut v = *voxel;
-                v.set_material_id(to_material);
-                *self.scene_mgr.voxel_pool.get_mut(slot) = v;
+                let m = self.scene_mgr.leaf_attr_pool.get_mut(slot);
+                m.material_primary = to_material;
                 changed = true;
             }
             if secondary == from_material {
-                let mut v = *self.scene_mgr.voxel_pool.get(slot);
-                v.set_secondary_material_id(to_material);
-                *self.scene_mgr.voxel_pool.get_mut(slot) = v;
+                // Re-pack secondary + blend, since both share material_secondary_blend.
+                let attr = *self.scene_mgr.leaf_attr_pool.get(slot);
+                let blend = attr.blend_weight();
+                let m = self.scene_mgr.leaf_attr_pool.get_mut(slot);
+                let secondary_bits = (to_material & 0x0FFF) as u16;
+                let blend_bits = ((blend as u16) & 0x0F) << 12;
+                m.material_secondary_blend = secondary_bits | blend_bits;
                 changed = true;
             }
             if changed {
@@ -2306,16 +2308,16 @@ impl EngineState {
             }
 
             let (aabb, voxel_size) = procedural_voxel_params(&tree_clone, base_voxel_size);
-            let opacity_fn = |pos: glam::Vec3| -> (f32, u16) {
+            let sdf_fn = |pos: glam::Vec3| -> (f32, u16) {
                 let sample = rkp_procedural::sample_tree(&tree_clone, pos, voxel_size);
-                (sample.opacity, sample.material_id)
+                (sample.distance, sample.material_id)
             };
 
-            match self.scene_mgr.voxelize_opacity_fn(
-                opacity_fn, &aabb, voxel_size, scene_id,
+            match self.scene_mgr.voxelize_sdf_fn(
+                sdf_fn, &aabb, voxel_size, scene_id,
             ) {
                 Some(result) => {
-                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.voxel_slot_start, result.voxel_slot_count);
+                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count);
 
                     if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
                         renderable.voxel_count = result.voxel_count;
@@ -2624,7 +2626,7 @@ impl EngineState {
                         self.next_scene_id += 1;
                         match self.scene_mgr.load_rkp(&full_path.to_string_lossy(), sid) {
                             Ok(result) => {
-                                let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.voxel_slot_start, result.voxel_slot_count);
+                                let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count);
                                 let e = self.world.spawn((transform, meta, Renderable {
                                     asset_path: Some(asset_path.clone()),
                                     material_id: obj.material_id,
@@ -2653,7 +2655,7 @@ impl EngineState {
                         self.scene_mgr.voxelize_primitive(
                             &primitive, obj.material_id, 0.05, glam::Vec3::ONE, sid,
                         ).map(|result| {
-                            let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.voxel_slot_start, result.voxel_slot_count);
+                            let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count);
                             let e = self.world.spawn((transform, meta, Renderable {
                                 primitive: Some(prim_name.clone()),
                                 material_id: obj.material_id,
@@ -3011,7 +3013,6 @@ impl EngineState {
                     if let Some(ref sp) = spatial {
                         let (coords, cell_size) = crate::play_mode::build_coarse_collider(
                             all_nodes,
-                            &self.scene_mgr.voxel_pool,
                             sp.root_offset as usize,
                             sp.depth,
                             sp.len,

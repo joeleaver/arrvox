@@ -13,33 +13,30 @@ use crate::sample::Sample;
 ///
 /// Evaluates the full tree from the root, transforming the position into each
 /// node's local space and combining results according to combinator rules.
-pub fn sample_tree(obj: &ProceduralObject, pos: Vec3) -> Sample {
-    sample_node(obj, obj.root(), pos)
+///
+/// `voxel_size` is used by leaf shapes to size their fade band — matches the
+/// voxelizer's grid resolution so the fade is exactly a few voxels wide.
+pub fn sample_tree(obj: &ProceduralObject, pos: Vec3, voxel_size: f32) -> Sample {
+    sample_node(obj, obj.root(), pos, voxel_size)
 }
 
 /// Recursively evaluate a single node and its subtree.
-///
-/// `pos` is in the **parent's** local space. This function applies the node's
-/// own transform (inverse) to get into the node's local space before evaluating.
-fn sample_node(obj: &ProceduralObject, id: NodeId, pos: Vec3) -> Sample {
+fn sample_node(obj: &ProceduralObject, id: NodeId, pos: Vec3, voxel_size: f32) -> Sample {
     let node = match obj.get(id) {
         Some(n) => n,
         None => return Sample::EMPTY,
     };
 
-    // Transform position into this node's local space.
     let local_pos = node.transform.inverse().transform_point3(pos);
 
     match &node.kind {
-        // Leaves: evaluate the shape directly.
-        kind if kind.is_leaf() => eval_leaf(local_pos, kind),
+        kind if kind.is_leaf() => eval_leaf(local_pos, kind, voxel_size),
 
-        // Union: combine all children.
         NodeKind::Union { material_combine } => {
             let mode = *material_combine;
             let mut result = Sample::EMPTY;
             for &child_id in &node.children {
-                let child_sample = sample_node(obj, child_id, local_pos);
+                let child_sample = sample_node(obj, child_id, local_pos, voxel_size);
                 if child_sample.is_empty() {
                     continue;
                 }
@@ -52,36 +49,34 @@ fn sample_node(obj: &ProceduralObject, id: NodeId, pos: Vec3) -> Sample {
             result
         }
 
-        // Intersect: combine all children.
         NodeKind::Intersect { material_combine } => {
             let mode = *material_combine;
             let children = &node.children;
             if children.is_empty() {
                 return Sample::EMPTY;
             }
-            let mut result = sample_node(obj, children[0], local_pos);
+            let mut result = sample_node(obj, children[0], local_pos, voxel_size);
             for &child_id in &children[1..] {
                 if result.is_empty() {
                     return Sample::EMPTY;
                 }
-                let child_sample = sample_node(obj, child_id, local_pos);
+                let child_sample = sample_node(obj, child_id, local_pos, voxel_size);
                 result = combine_intersect(&result, &child_sample, mode);
             }
             result
         }
 
-        // Subtract: first child is base, remaining are cutters.
         NodeKind::Subtract => {
             let children = &node.children;
             if children.is_empty() {
                 return Sample::EMPTY;
             }
-            let mut result = sample_node(obj, children[0], local_pos);
+            let mut result = sample_node(obj, children[0], local_pos, voxel_size);
             for &cutter_id in &children[1..] {
                 if result.is_empty() {
                     return Sample::EMPTY;
                 }
-                let cutter_sample = sample_node(obj, cutter_id, local_pos);
+                let cutter_sample = sample_node(obj, cutter_id, local_pos, voxel_size);
                 result = combine_subtract(&result, &cutter_sample);
             }
             result
@@ -98,11 +93,11 @@ mod tests {
     use glam::Affine3A;
 
     const EPS: f32 = 1e-3;
+    const VS: f32 = 0.02;
 
     fn sphere(radius: f32, material_id: u16) -> NodeKind {
         NodeKind::Sphere(SphereParams {
             radius,
-            falloff: 0.05,
             material_id,
             ..Default::default()
         })
@@ -117,12 +112,12 @@ mod tests {
         obj.add_child(obj.root(), sphere(1.0, 0));
 
         // Center should be opaque.
-        let s = sample_tree(&obj, Vec3::ZERO);
-        assert!((s.opacity - 1.0).abs() < EPS);
+        let s = sample_tree(&obj, Vec3::ZERO, VS);
+        assert!(s.is_inside(), "expected inside, dist={}", s.distance);
 
         // Far away should be empty.
-        let s = sample_tree(&obj, Vec3::new(10.0, 0.0, 0.0));
-        assert!(s.opacity < EPS);
+        let s = sample_tree(&obj, Vec3::new(10.0, 0.0, 0.0), VS);
+        assert!(!s.is_inside(), "expected outside, dist={}", s.distance);
     }
 
     /// Union of two overlapping spheres.
@@ -139,17 +134,17 @@ mod tests {
         obj.set_transform(b, Affine3A::from_translation(Vec3::new(0.3, 0.0, 0.0)));
 
         // Center (overlap region) should be opaque.
-        let s = sample_tree(&obj, Vec3::ZERO);
-        assert!(s.opacity > 0.5);
+        let s = sample_tree(&obj, Vec3::ZERO, VS);
+        assert!(s.is_inside(), "expected inside, dist={}", s.distance);
 
         // Deep inside A should have material 1.
-        let s = sample_tree(&obj, Vec3::new(-0.3, 0.0, 0.0));
-        assert!((s.opacity - 1.0).abs() < EPS);
+        let s = sample_tree(&obj, Vec3::new(-0.3, 0.0, 0.0), VS);
+        assert!(s.is_inside(), "expected inside, dist={}", s.distance);
         assert_eq!(s.material_id, 1);
 
         // Deep inside B should have material 2.
-        let s = sample_tree(&obj, Vec3::new(0.3, 0.0, 0.0));
-        assert!((s.opacity - 1.0).abs() < EPS);
+        let s = sample_tree(&obj, Vec3::new(0.3, 0.0, 0.0), VS);
+        assert!(s.is_inside(), "expected inside, dist={}", s.distance);
         assert_eq!(s.material_id, 2);
     }
 
@@ -161,12 +156,12 @@ mod tests {
         obj.add_child(obj.root(), sphere(0.5, 2)); // cutter
 
         // Center should be empty (cutter removes it).
-        let s = sample_tree(&obj, Vec3::ZERO);
-        assert!(s.opacity < EPS);
+        let s = sample_tree(&obj, Vec3::ZERO, VS);
+        assert!(!s.is_inside(), "expected outside, dist={}", s.distance);
 
         // Edge of base (outside cutter) should still be opaque.
-        let s = sample_tree(&obj, Vec3::new(0.8, 0.0, 0.0));
-        assert!(s.opacity > 0.5);
+        let s = sample_tree(&obj, Vec3::new(0.8, 0.0, 0.0), VS);
+        assert!(s.is_inside(), "expected inside, dist={}", s.distance);
         assert_eq!(s.material_id, 1); // base material preserved
     }
 
@@ -183,12 +178,12 @@ mod tests {
         obj.set_transform(b, Affine3A::from_translation(Vec3::new(0.2, 0.0, 0.0)));
 
         // Center (overlap) should be opaque.
-        let s = sample_tree(&obj, Vec3::ZERO);
-        assert!(s.opacity > 0.5);
+        let s = sample_tree(&obj, Vec3::ZERO, VS);
+        assert!(s.is_inside(), "expected inside, dist={}", s.distance);
 
         // Far inside A but outside B should be empty.
-        let s = sample_tree(&obj, Vec3::new(-0.4, 0.0, 0.0));
-        assert!(s.opacity < 0.5);
+        let s = sample_tree(&obj, Vec3::new(-0.4, 0.0, 0.0), VS);
+        assert!(!s.is_inside(), "expected outside, dist={}", s.distance);
     }
 
     /// Nested combinators: union of (sphere) and (subtract of two spheres).
@@ -209,17 +204,17 @@ mod tests {
         obj.add_child(sub, sphere(0.3, 3)); // cutter
 
         // Left sphere center.
-        let s = sample_tree(&obj, Vec3::new(-2.0, 0.0, 0.0));
-        assert!((s.opacity - 1.0).abs() < EPS);
+        let s = sample_tree(&obj, Vec3::new(-2.0, 0.0, 0.0), VS);
+        assert!(s.is_inside(), "expected inside, dist={}", s.distance);
         assert_eq!(s.material_id, 1);
 
         // Right subtract: center should be empty (cut away).
-        let s = sample_tree(&obj, Vec3::new(2.0, 0.0, 0.0));
-        assert!(s.opacity < EPS);
+        let s = sample_tree(&obj, Vec3::new(2.0, 0.0, 0.0), VS);
+        assert!(!s.is_inside(), "expected outside, dist={}", s.distance);
 
         // Right subtract: shell region should be opaque.
-        let s = sample_tree(&obj, Vec3::new(2.4, 0.0, 0.0));
-        assert!(s.opacity > 0.5);
+        let s = sample_tree(&obj, Vec3::new(2.4, 0.0, 0.0), VS);
+        assert!(s.is_inside(), "expected inside, dist={}", s.distance);
         assert_eq!(s.material_id, 2);
     }
 
@@ -235,11 +230,11 @@ mod tests {
         obj.set_transform(obj.root(), Affine3A::from_translation(Vec3::new(5.0, 0.0, 0.0)));
 
         // The sphere center is now at (5, 0, 0).
-        let s = sample_tree(&obj, Vec3::new(5.0, 0.0, 0.0));
-        assert!((s.opacity - 1.0).abs() < EPS);
+        let s = sample_tree(&obj, Vec3::new(5.0, 0.0, 0.0), VS);
+        assert!(s.is_inside(), "expected inside, dist={}", s.distance);
 
         // Origin should be empty.
-        let s = sample_tree(&obj, Vec3::ZERO);
-        assert!(s.opacity < EPS);
+        let s = sample_tree(&obj, Vec3::ZERO, VS);
+        assert!(!s.is_inside(), "expected outside, dist={}", s.distance);
     }
 }

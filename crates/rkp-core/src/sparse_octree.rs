@@ -32,17 +32,37 @@ pub const EMPTY_NODE: u32 = 0xFFFF_FFFF;
 /// Sentinel: entire subtree is fully opaque interior.
 pub const INTERIOR_NODE: u32 = 0xFFFF_FFFE;
 
-/// Bit flag indicating a leaf node (voxel pool slot in lower 31 bits).
+/// Bit flag indicating a leaf-like node (LEAF or BRICK; not a branch and not
+/// a sentinel). Both LEAF_BIT and the sentinels share bit 31.
 pub const LEAF_BIT: u32 = 0x8000_0000;
+
+/// Bit flag distinguishing BRICK from LEAF (only meaningful when LEAF_BIT is
+/// also set). LEAF: `LEAF_BIT | leaf_attr_id`. BRICK: `LEAF_BIT | BRICK_BIT |
+/// brick_id`. Sentinels also have both bits set, so brick/sentinel distinction
+/// requires checking the sentinel values too.
+pub const BRICK_BIT: u32 = 0x4000_0000;
 
 /// Maximum supported octree depth (2^11 = 2048 voxels per axis).
 pub const MAX_DEPTH: u8 = 11;
 
-/// Returns `true` if the node value represents a leaf (has `LEAF_BIT` set and is
-/// not one of the sentinel values).
+/// Returns `true` if the node value represents a regular leaf — leaf_attr_id
+/// in the low 30 bits. Excludes BRICK references and sentinels.
 #[inline]
 pub fn is_leaf(node: u32) -> bool {
-    (node & LEAF_BIT) != 0 && node != EMPTY_NODE && node != INTERIOR_NODE
+    (node & LEAF_BIT) != 0
+        && (node & BRICK_BIT) == 0
+        && node != EMPTY_NODE
+        && node != INTERIOR_NODE
+}
+
+/// Returns `true` if the node value represents a brick reference — brick_id
+/// in the low 30 bits, with BRICK_BIT set.
+#[inline]
+pub fn is_brick(node: u32) -> bool {
+    (node & LEAF_BIT) != 0
+        && (node & BRICK_BIT) != 0
+        && node != EMPTY_NODE
+        && node != INTERIOR_NODE
 }
 
 /// Returns `true` if the node value represents a branch (offset to children).
@@ -51,18 +71,42 @@ pub fn is_branch(node: u32) -> bool {
     (node & LEAF_BIT) == 0 && node != EMPTY_NODE && node != INTERIOR_NODE
 }
 
-/// Extract the voxel pool slot from a leaf node.
+/// Returns `true` if the node value is leaf-like (LEAF or BRICK or sentinel)
+/// — i.e. a non-branch terminator that traversal stops at.
+#[inline]
+pub fn is_terminator(node: u32) -> bool {
+    !is_branch(node)
+}
+
+/// Extract the leaf_attr_id from a regular LEAF node.
 #[inline]
 pub fn leaf_slot(node: u32) -> u32 {
     debug_assert!(is_leaf(node));
-    node & !LEAF_BIT
+    node & !(LEAF_BIT | BRICK_BIT)
 }
 
-/// Encode a voxel pool slot as a leaf node.
+/// Extract the brick_id from a BRICK node.
+#[inline]
+pub fn brick_id(node: u32) -> u32 {
+    debug_assert!(is_brick(node));
+    node & !(LEAF_BIT | BRICK_BIT)
+}
+
+/// Encode a leaf_attr_id as a LEAF node.
 #[inline]
 pub fn make_leaf(slot: u32) -> u32 {
-    debug_assert!(slot < LEAF_BIT, "voxel pool slot too large for leaf encoding");
+    debug_assert!(slot < BRICK_BIT, "leaf_attr_id too large for 30-bit leaf encoding");
     slot | LEAF_BIT
+}
+
+/// Encode a brick_id as a BRICK node.
+#[inline]
+pub fn make_brick(id: u32) -> u32 {
+    debug_assert!(id < BRICK_BIT, "brick_id too large for 30-bit brick encoding");
+    let v = id | LEAF_BIT | BRICK_BIT;
+    debug_assert!(v != EMPTY_NODE && v != INTERIOR_NODE,
+        "brick_id collides with sentinel encoding");
+    v
 }
 
 /// Compute the octant index (0–7) for a voxel coordinate at a given level.
@@ -378,6 +422,84 @@ impl SparseOctree {
         self.nodes = new_nodes;
     }
 
+    /// Reorder nodes into BFS/Morton order so that cousins of the same depth
+    /// sit contiguously in memory. Within a level, children of sibling
+    /// branches are placed next to each other — a depth-N descent across a
+    /// warp of pixels lands in a compact byte range instead of scattered
+    /// blocks left behind by the depth-first builder.
+    ///
+    /// DAG sharing from `deduplicate_subtrees` is preserved: if two parents
+    /// reference the same old children block, they keep referencing the same
+    /// new block after reorder. This is tracked by a map from
+    /// `old_children_offset → new_children_offset`.
+    ///
+    /// Typical effect: for a sphere with ~7.8M reachable nodes, warp-level
+    /// cache hit rate at mid-depths improves because sibling subtrees share
+    /// cache lines instead of straddling thousands of nodes apart.
+    ///
+    /// Must be called after `compact` and `deduplicate_subtrees`. Does not
+    /// change the set of reachable nodes, only their buffer positions.
+    pub fn morton_reorder(&mut self) {
+        if self.nodes.is_empty() {
+            return;
+        }
+        let root = self.nodes[0];
+        if !is_branch(root) {
+            // Trivial root (leaf / empty / interior) — nothing to reorder.
+            self.nodes.truncate(1);
+            return;
+        }
+
+        let old = std::mem::take(&mut self.nodes);
+        let mut new_nodes: Vec<u32> = Vec::with_capacity(old.len());
+
+        // Root lives at new offset 0. Reserve its slot; the branch loop below
+        // will write the correct offset to its 8 children.
+        new_nodes.push(0);
+
+        // Map: old children-block offset → new children-block offset. Ensures
+        // DAG-shared subtrees remain shared after reorder.
+        let mut branch_map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+
+        // Queue entries are (old_offset, new_offset) of a single node that
+        // needs its value written into `new_nodes[new_offset]`. The BFS order
+        // of queue processing is what gives us Morton-like contiguity.
+        let mut queue: std::collections::VecDeque<(u32, u32)> = std::collections::VecDeque::new();
+        queue.push_back((0u32, 0u32));
+
+        while let Some((old_off, new_off)) = queue.pop_front() {
+            let node = old[old_off as usize];
+
+            if !is_branch(node) {
+                new_nodes[new_off as usize] = node;
+                continue;
+            }
+
+            let old_children = node;
+            let new_children = if let Some(&existing) = branch_map.get(&old_children) {
+                // This children block was already allocated by an earlier
+                // parent (DAG share). Reuse the same target block — the
+                // child nodes inside it are (being) filled in by that
+                // earlier traversal, nothing more to do here.
+                existing
+            } else {
+                let start = new_nodes.len() as u32;
+                // Reserve 8 slots contiguously; children enqueue below will
+                // fill them.
+                new_nodes.extend(std::iter::repeat(0u32).take(8));
+                branch_map.insert(old_children, start);
+                for i in 0..8u32 {
+                    queue.push_back((old_children + i, start + i));
+                }
+                start
+            };
+
+            new_nodes[new_off as usize] = new_children;
+        }
+
+        self.nodes = new_nodes;
+    }
+
     /// Canonicalize a single node value. Leaves and sentinels pass through
     /// unchanged; branches are expanded, their 8 children are recursively
     /// canonicalized, and the resulting 8-child block is inserted into (or
@@ -544,6 +666,13 @@ impl SparseOctree {
         }
         if is_leaf(node) {
             out.push((origin, leaf_slot(node), level));
+            return;
+        }
+        if is_brick(node) {
+            // BRICKs hold a flat array of leaf_attr_ids covering several
+            // voxels at once; iter_leaves can't expand them without
+            // BrickPool access. Callers that need to enumerate brick
+            // contents should iterate the BrickPool directly. Skip here.
             return;
         }
         // Branch — recurse into children.
@@ -1003,11 +1132,13 @@ mod tests {
 
     #[test]
     fn gpu_lookup_matches_coord_lookup() {
-        // Build a sphere octree and verify every leaf is reachable by position.
-        let mut pool = crate::VoxelPool::new(100_000);
+        // Build a small sphere octree (depth low enough that bricks don't
+        // activate) and verify every leaf is reachable by position. Brick
+        // path is exercised by tests in voxelize_octree.
         let mut attrs = crate::LeafAttrPool::new(100_000);
-        let r = crate::voxelize_octree::voxelize_opacity_sphere_octree(
-            glam::Vec3::ZERO, 0.5, 0, 0.05, &mut pool, &mut attrs,
+        let mut bricks = crate::BrickPool::new(64);
+        let r = crate::voxelize_octree::voxelize_sphere_octree(
+            glam::Vec3::ZERO, 0.4, 0, 0.4, &mut attrs, &mut bricks,
         ).unwrap();
         let tree = &r.octree;
         let _voxel_count = r.voxel_count;
@@ -1170,21 +1301,42 @@ mod tests {
     fn leaf_and_branch_encoding() {
         assert!(is_leaf(make_leaf(0)));
         assert!(is_leaf(make_leaf(42)));
-        assert!(is_leaf(make_leaf(0x7FFF_FFFD)));
+        assert!(is_leaf(make_leaf(0x3FFF_FFFD))); // max leaf_attr_id (30 bits - 2 reserved)
         assert!(!is_leaf(EMPTY_NODE));
         assert!(!is_leaf(INTERIOR_NODE));
+        assert!(!is_leaf(make_brick(0)));
+        assert!(!is_leaf(make_brick(42)));
 
         assert!(is_branch(0)); // offset 0 is a valid branch
         assert!(is_branch(100));
         assert!(!is_branch(EMPTY_NODE));
         assert!(!is_branch(INTERIOR_NODE));
         assert!(!is_branch(make_leaf(0)));
+        assert!(!is_branch(make_brick(0)));
+    }
+
+    #[test]
+    fn brick_encoding() {
+        assert!(is_brick(make_brick(0)));
+        assert!(is_brick(make_brick(42)));
+        assert!(is_brick(make_brick(0x3FFF_FFFD)));
+        assert!(!is_brick(EMPTY_NODE));
+        assert!(!is_brick(INTERIOR_NODE));
+        assert!(!is_brick(make_leaf(0)));
+        assert!(!is_brick(0)); // branch
     }
 
     #[test]
     fn leaf_slot_roundtrip() {
-        for slot in [0, 1, 42, 1000, 0x7FFF_FFFD] {
+        for slot in [0u32, 1, 42, 1000, 0x3FFF_FFFD] {
             assert_eq!(leaf_slot(make_leaf(slot)), slot);
+        }
+    }
+
+    #[test]
+    fn brick_id_roundtrip() {
+        for id in [0u32, 1, 42, 1000, 0x3FFF_FFFD] {
+            assert_eq!(brick_id(make_brick(id)), id);
         }
     }
 

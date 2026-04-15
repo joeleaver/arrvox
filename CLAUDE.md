@@ -1,20 +1,25 @@
-# RKIPatch — Gaussian Splat Graphics Engine
+# RKIPatch — Sparse Surface Voxel Graphics Engine
 
 ## What This Is
 
-A real-time graphics engine where **gaussian splats are the primary geometry representation**. Every object is a voxel grid of opacity data — the opacity field defines the geometry, and surface normals are derived from the field gradient at shade time. No signed distance fields, no mesh rasterization, no UV mapping.
+A real-time graphics engine where **every object is a sparse octree of surface voxels**. A leaf in the tree IS a point on the surface; the tree's existence defines the geometry. Each leaf carries a prefiltered surface normal (octahedrally packed) and material references — everything needed to shade it in a single 8-byte read.
+
+There is no per-voxel opacity field. Transparency is a per-material property. Surfaces are defined by leaf existence in the octree, not by an isosurface of a scalar field.
 
 This is a sibling project to [RKIField](../rkifield/) (SDF engine). Both share core infrastructure (editor UI, ECS, MCP, physics, animation) but have fundamentally different rendering pipelines.
 
-## Origin
+## Origin and where we are now
 
-RKIPatch grew out of a proof-of-concept in RKIField that replaced SDF ray marching with gaussian splat accumulation. Key findings from the POC (reference code at `../rkipatch-poc-reference/`):
+RKIPatch began as a splat-accumulation rendering experiment. Over time the design converged:
 
-- **Opacity field as geometry.** Each voxel stores an f16 opacity value. The surface is where opacity crosses a threshold. Normals are derived from the gradient of the trilinearly-interpolated opacity field at shade time (6 taps).
-- **Surface-finding march** through trilinear opacity field. Step through voxels, find where opacity crosses a threshold. Shade once at that point. No iterative SDF convergence.
-- **Deferred rendering** — splat march writes to G-buffer (position, gradient normal, material). Shading is a separate pass, reusing rkf-render's full PBR shading stack.
-- **VoxelSample reuse** — splat data reuses RKIField's VoxelSample format (8 bytes/voxel), reinterpreting the distance field as opacity. Same 4KB bricks, same streaming infrastructure, same dual-material system (2×u16 material IDs + u8 blend weight).
-- **TAA opportunity** — splat accumulation is inherently low-frequency (weighted average). Per-frame jitter variation is much smaller than SDF ray marching. Temporal upscaling that failed for SDFs may work here.
+- **Surface defined by sparse octree leaves.** The octree-build classifier uses the 1-Lipschitz property of a signed distance function (sampled from the primitive / mesh) to decide Empty / Interior / Mixed at each octree level. No opacity values are stored per voxel; leaf existence IS the occupancy bit.
+- **Prefiltered per-leaf normals.** The SDF gradient at each voxel center is computed once during voxelization, octahedrally packed (2× snorm16 in a u32, <0.05° worst-case roundtrip error), and stored in `LeafAttr`. The shader reads one 8-byte `LeafAttr` per hit to get both normal and material — no gradient reconstruction at shade time, no voxel_pool indirection.
+- **Surface-finding march.** Compute ray marcher descends the octree per pixel, finds the first leaf, reads its `LeafAttr`, writes G-buffer. One read per hit for material + normal.
+- **Deferred rendering.** March writes G-buffer (position, normal, material). Shading is a separate pass reusing rkf-render's PBR stack, shadows, GI, volumetrics.
+- **Dual-material blending.** `LeafAttr` carries primary material (u16), secondary material (u12), and blend weight (u4) — per-leaf material variation without per-voxel opacity.
+- **Procedural primitives are SDFs.** Sphere/box/capsule/etc. evaluate to signed distance directly; combinators (union/intersect/subtract) use standard SDF algebra (min/max).
+
+The project name still says "patch" from the original splat framing; the rendering approach is closer to classical sparse-voxel ray marching with prefiltered surface attributes.
 
 ## Architecture Goals
 

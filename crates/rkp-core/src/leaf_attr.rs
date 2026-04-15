@@ -1,41 +1,99 @@
-//! Per-octree-leaf attribute payload.
+//! Per-octree-leaf payload.
 //!
-//! Every unique (opacity, material, normal) tuple in the scene gets one
-//! [`LeafAttr`] entry. The octree leaf encoding stores a `leaf_attr_id`
-//! pointing into a [`LeafAttrPool`](crate::leaf_attr_pool::LeafAttrPool) —
-//! replacing the previous scheme where the leaf pointed directly at a
-//! [`VoxelPool`](crate::voxel_pool::VoxelPool) slot.
+//! Every unique (material, normal) tuple in an object gets one [`LeafAttr`]
+//! entry. The octree leaf encoding stores a `leaf_attr_id` pointing into a
+//! [`LeafAttrPool`](crate::leaf_attr_pool::LeafAttrPool).
 //!
-//! Why the indirection: the `voxel_pool` dedups by (opacity, material) value
-//! across the whole object. Two spatial leaves with identical voxel values
-//! share a pool slot. Surface normals vary *per-spatial-position*, so they
-//! can't live alongside the voxel without breaking that dedup. `LeafAttr`
-//! carries the per-position normal next to a back-reference to the voxel.
+//! # Memory layout (8 bytes per entry)
 //!
-//! Dedup applies at the leaf-attr level too: leaves with identical
-//! (voxel_slot, normal) share a leaf_attr_id. Flat surfaces collapse
-//! naturally; curved surfaces like spheres get one entry per leaf.
+//! ```text
+//! word0: normal_oct                 (u32 = 2× snorm16 octahedral)
+//! word1: material_primary           (u16)  | material_secondary_blend (u16)
+//!          └── low 12 bits = material_secondary_id
+//!          └── high 4 bits = blend_weight (0-15)
+//! ```
+//!
+//! Removing opacity from the voxel payload collapsed two indirections. The
+//! leaf node directly names its material, its blend partner, and its normal;
+//! the shader reads one 8-byte entry and has everything it needs to shade.
+//!
+//! Transparency is now a per-material property (`mat_opacity`), not a
+//! per-voxel one. Spatially-varying transparency is achieved by assigning
+//! different material IDs — the palette gives 65k slots, well beyond any
+//! real authoring need. If a future volumetric material needs smooth
+//! per-position density, it can carry a density field on its own rather
+//! than forcing every opaque voxel in the scene to store a redundant f16.
 
 use glam::Vec3;
 
-/// Per-leaf attribute: a back-reference to the voxel data plus a packed
-/// surface normal. 8 bytes, Pod.
+/// Per-leaf payload — 8 bytes, Pod, GPU-uploadable.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct LeafAttr {
-    /// Slot in the object's VoxelPool that holds this leaf's opacity+material.
-    pub voxel_slot: u32,
-    /// Octahedral-packed unit normal (2× snorm16 in a u32). See [`pack_oct`].
+    /// Octahedrally-packed unit normal (2× snorm16 in a u32).
     pub normal_oct: u32,
+    /// Primary material palette ID.
+    pub material_primary: u16,
+    /// Packed `(secondary_material_id & 0x0FFF) | (blend_weight << 12)`.
+    /// 12 bits = 4096 secondary materials, 4 bits = 16 blend levels.
+    pub material_secondary_blend: u16,
 }
 
-impl LeafAttr {
-    /// Empty — used for unpopulated slots.
-    pub const EMPTY: Self = Self { voxel_slot: 0, normal_oct: 0 };
+const SECONDARY_MASK: u16 = 0x0FFF;
+const BLEND_SHIFT: u16 = 12;
 
-    /// Construct from a voxel slot and a world-space unit normal.
-    pub fn new(voxel_slot: u32, normal: Vec3) -> Self {
-        Self { voxel_slot, normal_oct: pack_oct(normal) }
+impl LeafAttr {
+    /// Empty — all fields zero. Used for unpopulated pool slots.
+    pub const EMPTY: Self = Self {
+        normal_oct: 0,
+        material_primary: 0,
+        material_secondary_blend: 0,
+    };
+
+    /// Construct with a single material (no secondary blend).
+    pub fn new(normal: Vec3, material_primary: u16) -> Self {
+        Self {
+            normal_oct: pack_oct(normal),
+            material_primary,
+            material_secondary_blend: 0,
+        }
+    }
+
+    /// Construct with primary + secondary material + blend weight.
+    ///
+    /// `material_secondary` is clamped to 12 bits; `blend_weight` is clamped
+    /// to 4 bits. Call sites that need the full u16 secondary or u8 blend
+    /// precision should reconsider whether they truly need >4096 palette
+    /// entries or >16 blend levels — the original u16/u8 was overkill.
+    pub fn new_blended(
+        normal: Vec3,
+        material_primary: u16,
+        material_secondary: u16,
+        blend_weight: u8,
+    ) -> Self {
+        let secondary_bits = material_secondary & SECONDARY_MASK;
+        let blend_bits = ((blend_weight as u16) & 0x0F) << BLEND_SHIFT;
+        Self {
+            normal_oct: pack_oct(normal),
+            material_primary,
+            material_secondary_blend: secondary_bits | blend_bits,
+        }
+    }
+
+    /// Decode the normal back into a unit vector.
+    #[inline]
+    pub fn normal(self) -> Vec3 { unpack_oct(self.normal_oct) }
+
+    /// Secondary material ID (0..4095).
+    #[inline]
+    pub fn material_secondary(self) -> u16 {
+        self.material_secondary_blend & SECONDARY_MASK
+    }
+
+    /// Blend weight (0..15). 0 = primary only, 15 = fully secondary.
+    #[inline]
+    pub fn blend_weight(self) -> u8 {
+        ((self.material_secondary_blend >> BLEND_SHIFT) & 0x0F) as u8
     }
 }
 
@@ -43,45 +101,47 @@ impl Default for LeafAttr {
     fn default() -> Self { Self::EMPTY }
 }
 
-/// Pack a unit normal as octahedral 2× snorm16 in a single u32.
-///
-/// Octahedral mapping preserves great-circle uniformity far better than naive
-/// spherical coordinates and survives a 16-bit-per-axis quantization with
-/// worst-case angular error well under 0.1°. Reference: Meyer et al. 2010,
-/// "On Floating-Point Normal Vectors", and Cigolle et al. 2014, "A Survey of
-/// Efficient Representations for Independent Unit Vectors".
+// Octahedral packing -----------------------------------------------------------
+//
+// 16-bit-per-axis snorm, packed into a single u32. Worst-case angular
+// roundtrip error <0.05°, which is imperceptible in shading.
+
+/// Pack a unit normal as octahedral 2× snorm16 in a u32.
 pub fn pack_oct(n: Vec3) -> u32 {
-    // Safeguard against a zero vector — return up.
+    let (u, v) = oct_project(n);
+    let ui = quantize_snorm(u, 16);
+    let vi = quantize_snorm(v, 16);
+    (ui as u32 & 0xFFFF) | ((vi as u32 & 0xFFFF) << 16)
+}
+
+/// Unpack a u32 that was produced by [`pack_oct`].
+pub fn unpack_oct(packed: u32) -> Vec3 {
+    let ui_raw = (packed & 0xFFFF) as i16;
+    let vi_raw = ((packed >> 16) & 0xFFFF) as i16;
+    let u = (ui_raw as f32 / 32767.0).clamp(-1.0, 1.0);
+    let v = (vi_raw as f32 / 32767.0).clamp(-1.0, 1.0);
+    oct_reconstruct(u, v)
+}
+
+#[inline]
+fn oct_project(n: Vec3) -> (f32, f32) {
     let len = n.length();
     let n = if len > 1e-8 { n / len } else { Vec3::Y };
 
-    // Project onto the octahedron (manhattan normalize).
     let abs_sum = n.x.abs() + n.y.abs() + n.z.abs();
     let inv = if abs_sum > 1e-8 { 1.0 / abs_sum } else { 0.0 };
     let mut u = n.x * inv;
     let mut v = n.y * inv;
-
-    // If the original normal was on the lower hemisphere (z < 0), fold the
-    // octahedron's lower half onto its upper half via a sign-dependent flip.
     if n.z < 0.0 {
         let u0 = u;
         u = (1.0 - v.abs()) * sign_nonzero(u0);
         v = (1.0 - u0.abs()) * sign_nonzero(v);
     }
-
-    // snorm16 quantization: map [-1, 1] to [-32767, 32767], store as u16.
-    let ui = quantize_snorm16(u);
-    let vi = quantize_snorm16(v);
-    (ui as u32) | ((vi as u32) << 16)
+    (u, v)
 }
 
-/// Unpack an octahedrally-encoded normal back into a unit vector.
-pub fn unpack_oct(packed: u32) -> Vec3 {
-    let ui = (packed & 0xFFFF) as i16;
-    let vi = ((packed >> 16) & 0xFFFF) as i16;
-    let u = (ui as f32 / 32767.0).clamp(-1.0, 1.0);
-    let v = (vi as f32 / 32767.0).clamp(-1.0, 1.0);
-
+#[inline]
+fn oct_reconstruct(u: f32, v: f32) -> Vec3 {
     let mut n = Vec3::new(u, v, 1.0 - u.abs() - v.abs());
     if n.z < 0.0 {
         let nx0 = n.x;
@@ -98,10 +158,9 @@ fn sign_nonzero(x: f32) -> f32 {
 }
 
 #[inline]
-fn quantize_snorm16(x: f32) -> u16 {
-    let clamped = x.clamp(-1.0, 1.0);
-    let scaled = (clamped * 32767.0).round();
-    (scaled as i32 as i16) as u16
+fn quantize_snorm(x: f32, bits: u32) -> i32 {
+    let max = ((1i32 << (bits - 1)) - 1) as f32;
+    (x.clamp(-1.0, 1.0) * max).round() as i32
 }
 
 #[cfg(test)]
@@ -110,52 +169,52 @@ mod tests {
 
     fn check_roundtrip(n: Vec3, tol_deg: f32) {
         let n = n.normalize();
-        let packed = pack_oct(n);
-        let unpacked = unpack_oct(packed);
-        let dot = n.dot(unpacked).clamp(-1.0, 1.0);
-        let angle_deg = dot.acos().to_degrees();
-        assert!(
-            angle_deg < tol_deg,
-            "normal {n:?} roundtripped to {unpacked:?}, error {angle_deg:.4}° (tol {tol_deg}°)",
-        );
+        let back = unpack_oct(pack_oct(n));
+        let dot = n.dot(back).clamp(-1.0, 1.0);
+        let err = dot.acos().to_degrees();
+        assert!(err < tol_deg, "normal {n:?} → {back:?}, err {err:.4}° (tol {tol_deg}°)");
     }
 
     #[test]
-    fn layout_is_8_bytes() {
+    fn leaf_attr_is_8_bytes() {
         assert_eq!(std::mem::size_of::<LeafAttr>(), 8);
         assert_eq!(std::mem::align_of::<LeafAttr>(), 4);
     }
 
     #[test]
+    fn new_stores_material_and_normal() {
+        let a = LeafAttr::new(Vec3::Y, 42);
+        assert_eq!(a.material_primary, 42);
+        assert_eq!(a.material_secondary(), 0);
+        assert_eq!(a.blend_weight(), 0);
+        assert!(a.normal().dot(Vec3::Y) > 0.9999);
+    }
+
+    #[test]
+    fn new_blended_packs_secondary_and_weight() {
+        let a = LeafAttr::new_blended(Vec3::X, 7, 1234, 9);
+        assert_eq!(a.material_primary, 7);
+        assert_eq!(a.material_secondary(), 1234);
+        assert_eq!(a.blend_weight(), 9);
+    }
+
+    #[test]
+    fn new_blended_clamps_to_12_bits_and_4_bits() {
+        // Secondary > 4095 is clamped to 12 bits; blend > 15 is clamped to 4.
+        let a = LeafAttr::new_blended(Vec3::X, 0, 0xFFFF, 0xFF);
+        assert_eq!(a.material_secondary(), 0xFFF);
+        assert_eq!(a.blend_weight(), 0x0F);
+    }
+
+    #[test]
     fn axis_aligned_normals_roundtrip() {
-        // Axis-aligned sit on quantization grid points; accuracy is near-exact.
-        for n in [
-            Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z,
-        ] {
+        for n in [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z] {
             check_roundtrip(n, 0.01);
         }
     }
 
     #[test]
-    fn diagonal_normals_roundtrip() {
-        // Worst-case accuracy sits at octahedral edges/corners where the
-        // manhattan-distance projection crowds samples; snorm16 gives us
-        // ≤0.05° residual there.
-        for n in [
-            Vec3::new( 1.0,  1.0,  1.0),
-            Vec3::new(-1.0,  1.0,  1.0),
-            Vec3::new( 1.0, -1.0,  1.0),
-            Vec3::new( 1.0,  1.0, -1.0),
-            Vec3::new(-1.0, -1.0, -1.0),
-        ] {
-            check_roundtrip(n, 0.05);
-        }
-    }
-
-    #[test]
     fn spherical_sweep_error_bounded() {
-        // Sweep a hemisphere at 10° increments. Worst-case angular error on
-        // octahedral-snorm16 should sit well under 0.01°; pick 0.05° for slack.
         let mut worst = 0.0_f32;
         for theta_deg in (0..=180).step_by(10) {
             for phi_deg in (0..=360).step_by(10) {
@@ -172,29 +231,19 @@ mod tests {
                 if err > worst { worst = err; }
             }
         }
-        assert!(worst < 0.05, "worst-case octahedral roundtrip error was {worst:.4}°");
+        assert!(worst < 0.05, "worst roundtrip was {worst:.4}°");
+    }
+
+    #[test]
+    fn empty_is_zero() {
+        assert_eq!(LeafAttr::EMPTY.normal_oct, 0);
+        assert_eq!(LeafAttr::EMPTY.material_primary, 0);
+        assert_eq!(LeafAttr::EMPTY.material_secondary_blend, 0);
     }
 
     #[test]
     fn zero_vector_is_safe() {
-        let n = Vec3::ZERO;
-        let packed = pack_oct(n);
-        let unpacked = unpack_oct(packed);
-        assert!(unpacked.length() > 0.5, "fallback should produce a unit vector, got {unpacked:?}");
-    }
-
-    #[test]
-    fn leaf_attr_new_packs_normal() {
-        let a = LeafAttr::new(42, Vec3::Y);
-        assert_eq!(a.voxel_slot, 42);
-        let back = unpack_oct(a.normal_oct);
-        assert!(back.dot(Vec3::Y) > 0.9999, "Y roundtrip lost precision: {back:?}");
-    }
-
-    #[test]
-    fn leaf_attr_is_pod_zero_inited() {
-        let z = LeafAttr::default();
-        assert_eq!(z.voxel_slot, 0);
-        assert_eq!(z.normal_oct, 0);
+        let a = LeafAttr::new(Vec3::ZERO, 0);
+        assert!(a.normal().length() > 0.5);
     }
 }

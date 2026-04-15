@@ -6,9 +6,9 @@
 
 use crate::validate_wgsl;
 
-/// Stats buffer size in bytes (44 × u32). See the `stats` binding in
+/// Stats buffer size in bytes (52 × u32). See the `stats` binding in
 /// `shaders/octree_march.wgsl` for the layout.
-const STATS_U32_COUNT: usize = 44;
+const STATS_U32_COUNT: usize = 52;
 const STATS_BYTES: u64 = (STATS_U32_COUNT * 4) as u64;
 
 /// Uniform parameters for the march shader.
@@ -283,6 +283,10 @@ impl OctreeMarchPass {
             let normal:  &[u32] = &vals[16..28];
             let shadow:  &[u32] = &vals[28..40];
             let foot:    &[u32] = &vals[40..44];
+            let leaf_attr_reads = vals[44] as u64;
+            let voxel_pool_reads = vals[45] as u64;
+            let color_pool_reads = vals[46] as u64;
+            let materials_reads = vals[47] as u64;
 
             let sum = |h: &[u32]| -> u64 { h.iter().map(|&x| x as u64).sum() };
             let weighted = |h: &[u32]| -> f64 {
@@ -290,6 +294,11 @@ impl OctreeMarchPass {
                 if s == 0 { return 0.0; }
                 let w: u64 = h.iter().enumerate().map(|(i, &c)| i as u64 * c as u64).sum();
                 w as f64 / s as f64
+            };
+            // Total node reads for a phase: sum over buckets of (level+1)*count.
+            // (Each octree_lookup that terminates at level L reads L+1 nodes.)
+            let phase_node_reads = |h: &[u32]| -> u64 {
+                h.iter().enumerate().map(|(i, &c)| (i as u64 + 1) * c as u64).sum()
             };
 
             let total_lookups = sum(surface) + sum(normal) + sum(shadow);
@@ -318,6 +327,29 @@ impl OctreeMarchPass {
             eprintln!(
                 "[footprint] <1px:{:.0}%  1-2px:{:.0}%  2-4px:{:.0}%  >=4px:{:.0}%  (n={})",
                 pct(foot[0]), pct(foot[1]), pct(foot[2]), pct(foot[3]), foot_total,
+            );
+
+            // Per-buffer byte traffic per frame. Octree reads come from the
+            // depth histograms; other buffers have direct atomic counters.
+            let octree_reads = phase_node_reads(surface) + phase_node_reads(normal) + phase_node_reads(shadow);
+            let mb = |bytes: u64| -> f64 { bytes as f64 / (1024.0 * 1024.0) };
+            let octree_bytes     = octree_reads       * 4;  // 4 B per node
+            let leaf_attr_bytes  = leaf_attr_reads    * 8;  // LeafAttr = 8 B
+            let voxel_bytes      = voxel_pool_reads   * 8;  // VoxelSample = 8 B
+            let color_bytes      = color_pool_reads   * 4;  // packed color u32
+            let materials_bytes  = materials_reads    * 32; // GpuMaterial ~32 B
+            let total_bytes      = octree_bytes + leaf_attr_bytes + voxel_bytes + color_bytes + materials_bytes;
+            eprintln!(
+                "[bandwidth/frame] octree {:>6.1}M reads {:>6.1} MiB  leaf_attr {:>6.1}M {:>6.1} MiB  voxel {:>6.1}M {:>6.1} MiB  color {:>6.1}M {:>5.1} MiB  mat {:>6.1}M {:>6.1} MiB",
+                octree_reads as f64 / 1e6, mb(octree_bytes),
+                leaf_attr_reads as f64 / 1e6, mb(leaf_attr_bytes),
+                voxel_pool_reads as f64 / 1e6, mb(voxel_bytes),
+                color_pool_reads as f64 / 1e6, mb(color_bytes),
+                materials_reads as f64 / 1e6, mb(materials_bytes),
+            );
+            eprintln!(
+                "[bandwidth/frame] total {:.1} MiB (at 60 fps → {:.1} GB/s if uncached)",
+                mb(total_bytes), (total_bytes as f64 * 60.0) / 1e9,
             );
             drop(data);
             self.stats_readback.unmap();

@@ -1,20 +1,19 @@
-//! Scene management for RKIPatch — owns voxel data, octrees, and face instances.
+//! Scene management for RKIPatch — owns the leaf_attr pool, octrees, and
+//! face instances.
 //!
-//! This is the CPU-side scene representation. It manages the VoxelPool (opacity +
-//! color per voxel), the OctreeGpu allocator (spatial structure), and the face
-//! instance list (surface shell for rasterization).
+//! This is the CPU-side scene representation. It manages the LeafAttrPool
+//! (material + normal + color per leaf), the OctreeGpu allocator, and the
+//! face instance list (legacy, unused by the active pipeline).
 //!
-//! The RkpSceneManager is GPU-agnostic: it produces data that RkpRenderer uploads.
-//! No wgpu types, no GPU buffers, no rendering logic.
+//! No wgpu types, no GPU buffers here — RkpRenderer consumes the snapshot.
 
-use std::collections::HashMap;
-
-use rkp_core::{LeafAttr, LeafAttrPool, OctreeHandle, SparseOctree, SplatVoxel, VoxelPool};
+use rkp_core::{BrickPool, LeafAttr, LeafAttrPool, OctreeHandle, SparseOctree};
 
 use crate::octree_gpu::OctreeGpu;
 use crate::rkp_scene::GeometryUpload;
 
-/// Face instance for CPU-side face emission (legacy — kept for scene loading compatibility).
+/// Face instance for CPU-side face emission (legacy — kept for scene loading
+/// compatibility; the splat raster pipeline it fed is not dispatched).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct FaceInstance {
@@ -33,14 +32,9 @@ pub struct AssetLoadResult {
     pub aabb: rkf_core::Aabb,
     /// Logical voxel count (octree leaves) — for display / stats.
     pub voxel_count: u32,
-    /// First voxel pool slot used by this allocation.
-    pub voxel_slot_start: u32,
-    /// Number of slots actually allocated. May be less than `voxel_count` when
-    /// identical (voxel, color) pairs share a slot via dedup.
-    pub voxel_slot_count: u32,
     /// First leaf_attr pool slot used by this allocation.
     pub leaf_attr_slot_start: u32,
-    /// Number of leaf_attr slots allocated (distinct (voxel, normal) tuples).
+    /// Number of leaf_attr slots allocated (distinct (material, normal) tuples).
     pub leaf_attr_slot_count: u32,
 }
 
@@ -51,41 +45,24 @@ pub struct VoxelizeResult {
     pub aabb: rkf_core::Aabb,
     /// Logical voxel count (octree leaves).
     pub voxel_count: u32,
-    /// First voxel pool slot used by this allocation.
-    pub voxel_slot_start: u32,
-    /// Number of slots actually allocated — use this (not `voxel_count`) for
-    /// deallocation, since the two can diverge when slots are shared.
-    pub voxel_slot_count: u32,
     /// First leaf_attr pool slot used by this allocation.
     pub leaf_attr_slot_start: u32,
     /// Number of leaf_attr slots allocated.
     pub leaf_attr_slot_count: u32,
 }
 
-/// Emit face instances from an octree into the given buffer.
-///
-/// Kept for scene-loading compatibility; the splat raster pipeline it feeds
-/// is not dispatched in the active octree-march path. Updated here only
-/// enough to compile against the new `leaf_id` encoding — each leaf value
-/// is a `leaf_attr_id`, which we indirect through the leaf_attr pool to
-/// recover the voxel slot.
+/// Emit face instances from an octree into the given buffer. Legacy —
+/// splat raster is not dispatched in the active pipeline. Kept for
+/// scene-loading compatibility: every leaf is a surface voxel now, so the
+/// output just enumerates leaf centers with exposed-face flags.
 fn emit_faces(
     octree: &SparseOctree,
-    pool: &VoxelPool,
-    attrs: &LeafAttrPool,
     obj_idx: u32,
     faces: &mut Vec<FaceInstance>,
 ) {
     let base_vs = octree.base_voxel_size();
 
     for (coord, leaf_id, leaf_depth) in octree.iter_leaves() {
-        let attr = attrs.get(leaf_id);
-        let voxel_slot = attr.voxel_slot;
-        let sv = pool.get(voxel_slot);
-        if sv.opacity_f32() <= 0.01 {
-            continue;
-        }
-
         let depth_diff = octree.depth() - leaf_depth;
         let leaf_vs = base_vs * (1u32 << depth_diff) as f32;
 
@@ -114,11 +91,7 @@ fn emit_faces(
                     None => true,
                     Some(node) if node == rkp_core::sparse_octree::EMPTY_NODE => true,
                     Some(node) if node == rkp_core::sparse_octree::INTERIOR_NODE => false,
-                    Some(node) if rkp_core::sparse_octree::is_leaf(node) => {
-                        let nb_leaf_id = rkp_core::sparse_octree::leaf_slot(node);
-                        let nb_voxel_slot = attrs.get(nb_leaf_id).voxel_slot;
-                        pool.get(nb_voxel_slot).opacity_f32() <= 0.01
-                    }
+                    Some(node) if rkp_core::sparse_octree::is_leaf(node) => false,
                     _ => true,
                 }
             };
@@ -130,7 +103,7 @@ fn emit_faces(
                     pos_y: center.y,
                     pos_z: center.z,
                     voxel_size: leaf_vs,
-                    voxel_slot,
+                    voxel_slot: leaf_id,
                     packed: (face & 0x7) | ((obj_idx & 0xFFFFF) << 3),
                 });
             }
@@ -138,13 +111,16 @@ fn emit_faces(
     }
 }
 
-/// CPU-side scene manager — voxel data, octrees, face instances.
+/// CPU-side scene manager — leaf_attr data, bricks, octrees, face instances.
 pub struct RkpSceneManager {
-    /// Per-voxel opacity + material + color storage (dedupped by value).
-    pub voxel_pool: VoxelPool,
-    /// Per-leaf attributes: (voxel_slot, normal) entries. Populated at
-    /// voxelize time; consumed by the march shader on a leaf hit.
+    /// Per-leaf attributes: {material_primary, material_secondary+blend,
+    /// normal} + parallel per-leaf color. The sole per-voxel payload now
+    /// that opacity has been removed.
     pub leaf_attr_pool: LeafAttrPool,
+    /// Pool of fixed-size bricks (4³ flat cells each). The octree's deepest
+    /// branches point at bricks; the shader does flat brick lookups instead
+    /// of descending the final two octree levels per step.
+    pub brick_pool: BrickPool,
     /// GPU octree allocator (packs all octrees into one buffer).
     pub octree: OctreeGpu,
     /// Face instances for rasterization (surface shell).
@@ -155,10 +131,10 @@ pub struct RkpSceneManager {
 
 impl RkpSceneManager {
     /// Create with default capacity.
-    pub fn new(voxel_capacity: u32) -> Self {
+    pub fn new(capacity: u32) -> Self {
         Self {
-            voxel_pool: VoxelPool::new(voxel_capacity),
-            leaf_attr_pool: LeafAttrPool::new(voxel_capacity),
+            leaf_attr_pool: LeafAttrPool::new(capacity),
+            brick_pool: BrickPool::new((capacity / 16).max(64)),
             octree: OctreeGpu::new(),
             pending_faces: Vec::new(),
             faces_dirty: false,
@@ -167,73 +143,49 @@ impl RkpSceneManager {
 
     // ── Face emission ────────────────────────────────────────────────
 
-    /// Emit face instances from a per-voxel octree.
-    ///
-    /// Traverses leaves. For each non-empty leaf, checks 6 neighbors and emits
-    /// exposed faces. Each leaf IS a single voxel (no bricks).
     pub fn emit_faces_from_octree(
         &mut self,
         octree: &SparseOctree,
-        pool: &VoxelPool,
-        attrs: &LeafAttrPool,
         obj_idx: u32,
     ) {
-        emit_faces(octree, pool, attrs, obj_idx, &mut self.pending_faces);
+        emit_faces(octree, obj_idx, &mut self.pending_faces);
         self.faces_dirty = true;
     }
 
-    /// Emit faces from raw octree node data (for file loading).
     pub fn emit_faces_from_raw_octree(
         &mut self,
         nodes: &[u32],
         depth: u8,
         base_vs: f32,
-        pool: &VoxelPool,
-        attrs: &LeafAttrPool,
         obj_idx: u32,
     ) {
         let octree = SparseOctree::from_raw(nodes, depth, base_vs);
-        emit_faces(&octree, pool, attrs, obj_idx, &mut self.pending_faces);
+        emit_faces(&octree, obj_idx, &mut self.pending_faces);
         self.faces_dirty = true;
     }
 
-    /// Access pending face instances.
-    pub fn pending_faces(&self) -> &[FaceInstance] {
-        &self.pending_faces
-    }
-
-    /// Whether face data has changed since last upload.
-    pub fn faces_dirty(&self) -> bool {
-        self.faces_dirty
-    }
-
-    /// Mark faces as clean (after GPU upload).
-    pub fn mark_faces_clean(&mut self) {
-        self.faces_dirty = false;
-    }
-
-    /// Clear all face instances.
+    pub fn pending_faces(&self) -> &[FaceInstance] { &self.pending_faces }
+    pub fn faces_dirty(&self) -> bool { self.faces_dirty }
+    pub fn mark_faces_clean(&mut self) { self.faces_dirty = false; }
     pub fn clear_faces(&mut self) {
         self.pending_faces.clear();
         self.faces_dirty = true;
     }
 
-    // ── Geometry upload snapshot ──────────────────────────────────────
+    // ── Geometry upload snapshot ─────────────────────────────────────
 
-    /// Build a GeometryUpload snapshot for RkpRenderer.
     pub fn geometry_upload(&self) -> GeometryUpload<'_> {
         let octree_data = self.octree.data();
         GeometryUpload {
-            voxel_pool: self.voxel_pool.as_bytes(),
             octree_nodes: bytemuck::cast_slice(octree_data),
-            color_pool: self.voxel_pool.color_bytes(),
             leaf_attr_pool: self.leaf_attr_pool.as_bytes(),
+            color_pool: self.leaf_attr_pool.color_bytes(),
+            brick_pool: self.brick_pool.as_bytes(),
         }
     }
 
     // ── Spatial deallocation ─────────────────────────────────────────
 
-    /// Deallocate an octree spatial handle.
     pub fn deallocate_spatial(&mut self, handle: &rkf_core::scene_node::SpatialHandle) {
         if let rkf_core::scene_node::SpatialHandle::Octree {
             root_offset, len, depth, base_voxel_size,
@@ -252,13 +204,14 @@ impl RkpSceneManager {
 
     /// Load an .rkp asset file into the scene.
     ///
-    /// Allocates voxels in the pool, remaps octree leaf slots, emits faces,
-    /// loads per-voxel color data. Returns the spatial handle and metadata
-    /// needed to create a scene object.
+    /// Reads the legacy per-voxel format (opacity + material + color), then
+    /// collapses each leaf's material + computed normal into a single
+    /// LeafAttr entry. Opacity values from the file are discarded — the
+    /// file-format version is unchanged for now, migration at load time is
+    /// cheap enough that a full format bump can wait.
     pub fn load_rkp(&mut self, path: &str, object_id: u32) -> Result<AssetLoadResult, String> {
         use rkf_core::voxel::VoxelSample;
 
-        // Find the .rkp file.
         let rkp_path = if path.ends_with(".rkp") {
             std::path::PathBuf::from(path)
         } else {
@@ -303,8 +256,6 @@ impl RkpSceneManager {
             glam::Vec3::from(header.aabb_max),
         );
 
-        // Read per-voxel color data up front — needed so dedup can key on
-        // (voxel, color) pairs, not just voxel contents.
         let has_color = header.flags & rkp_core::asset_file::FLAG_HAS_COLOR != 0;
         let color_bytes = if has_color {
             rkp_core::asset_file::read_rkp_color(&mut reader, &header).unwrap_or_default()
@@ -317,16 +268,12 @@ impl RkpSceneManager {
             &[]
         };
 
-        // Deduplicate (voxel, color) pairs. Meshes typically have huge
-        // redundancy — a textured surface often has only thousands of unique
-        // (opacity, material, color) combinations across millions of voxels.
-        // Sharing slots cuts voxel_pool + color_pool upload size dramatically
-        // and keeps the working set inside the GPU cache.
+        // Build a per-file-voxel table of (material_primary, material_secondary,
+        // blend_weight, color) without allocating a voxel_pool. Opacity values
+        // in the file are read but discarded — they are no longer part of the
+        // on-GPU representation.
         let bytes_per_voxel = std::mem::size_of::<VoxelSample>();
-        let mut dedup: std::collections::HashMap<(SplatVoxel, u32), u32> =
-            std::collections::HashMap::new();
-        let mut unique: Vec<(SplatVoxel, u32)> = Vec::new();
-        let mut file_to_unique: Vec<u32> = Vec::with_capacity(voxel_count as usize);
+        let mut file_voxel_mat: Vec<(u16, u16, u8, u32)> = Vec::with_capacity(voxel_count as usize);
         for i in 0..voxel_count as usize {
             let src_offset = i * bytes_per_voxel;
             if src_offset + bytes_per_voxel > voxel_data.len() {
@@ -334,120 +281,64 @@ impl RkpSceneManager {
             }
             let vs: &VoxelSample =
                 bytemuck::from_bytes(&voxel_data[src_offset..src_offset + bytes_per_voxel]);
-            let splat = SplatVoxel::from(*vs);
             let color = color_u32s.get(i).copied().unwrap_or(0);
-            let key = (splat, color);
-            let idx = *dedup.entry(key).or_insert_with(|| {
-                let new_idx = unique.len() as u32;
-                unique.push(key);
-                new_idx
-            });
-            file_to_unique.push(idx);
-        }
-        let unique_count = unique.len() as u32;
-
-        // Allocate one pool slot per UNIQUE (voxel, color) — not per file
-        // voxel. A typical mesh shrinks by 100×+ here.
-        if self.voxel_pool.free_count() < unique_count {
-            let new_cap = (self.voxel_pool.capacity() * 2)
-                .max(self.voxel_pool.capacity() + unique_count);
-            self.voxel_pool.grow(new_cap);
-        }
-        let slots = self.voxel_pool.allocate_range(unique_count)
-            .ok_or_else(|| "failed to allocate voxel pool slots".to_string())?;
-        let voxel_slot_start = slots.first().copied().unwrap_or(0);
-
-        // Write unique voxels + colors into their pool slots.
-        for (i, &(splat, color)) in unique.iter().enumerate() {
-            let slot = slots[i];
-            *self.voxel_pool.get_mut(slot) = splat;
-            if has_color {
-                self.voxel_pool.set_color(slot, color);
-            }
+            file_voxel_mat.push((vs.material_id(), vs.secondary_material_id(), vs.blend_weight(), color));
         }
 
-        // Remap octree leaf slots: file voxel index → dedup index → pool slot.
-        let mut remapped_nodes = octree_nodes.clone();
-        for node in &mut remapped_nodes {
-            if *node != rkp_core::sparse_octree::EMPTY_NODE
-                && *node != rkp_core::sparse_octree::INTERIOR_NODE
-                && (*node & rkp_core::sparse_octree::LEAF_BIT) != 0
-            {
-                let file_idx = (*node & !rkp_core::sparse_octree::LEAF_BIT) as usize;
-                if file_idx < file_to_unique.len() {
-                    let dedup_idx = file_to_unique[file_idx] as usize;
-                    *node = rkp_core::sparse_octree::make_leaf(slots[dedup_idx]);
-                }
-            }
-        }
-
-        // Migrate leaves from `voxel_slot` encoding to `leaf_attr_id` encoding.
-        // Leaves in a freshly-loaded file point directly at voxel pool slots,
-        // but the GPU march now expects them to point into the leaf_attr pool
-        // (which carries voxel_slot + per-leaf normal). Compute a normal at
-        // each leaf from the opacity-field gradient across neighbor leaves,
-        // dedup by (voxel_slot, normal_oct), and rewrite.
-        //
-        // This runs BEFORE `collapse_all` so that leaves differing only by
-        // normal (same voxel_slot, different normal) don't over-collapse.
+        // Build a temporary tree from the raw file nodes. Leaves there
+        // encode a file-voxel index; we walk the tree to pick up each
+        // leaf's spatial coordinate, compute the normal from neighboring
+        // file-voxel occupancy, then rewrite the leaf to a leaf_attr_id.
         let octree_depth = header.octree_depth as u8;
         let leaf_attr_slot_start = self.leaf_attr_pool.allocated_count();
-        let mut tree = SparseOctree::from_raw(&remapped_nodes, octree_depth, voxel_size);
-        {
-            // Two-pass migration: pass 1 reads the tree (still voxel_slot-
-            // encoded) to compute normals; pass 2 rewrites leaves to
-            // leaf_attr_id. Interleaving the two would read neighbor leaves
-            // that had already been rewritten — their "voxel_slot" would
-            // actually be a leaf_attr_id and indexing voxel_pool with it
-            // panics as soon as the id exceeds the pool size.
-            let leaves: Vec<(glam::UVec3, u32, u8)> = tree.iter_leaves().collect();
-            let mut attr_dedup: std::collections::HashMap<(u32, u32), u32> =
-                std::collections::HashMap::new();
-            let mut rewrites: Vec<(glam::UVec3, u8, u32)> = Vec::with_capacity(leaves.len());
-            for (coord, voxel_slot, leaf_depth) in &leaves {
-                let normal = compute_leaf_normal_from_tree(&tree, &self.voxel_pool, *coord);
-                let normal_oct = rkp_core::pack_oct(normal);
-                let leaf_attr_id = *attr_dedup.entry((*voxel_slot, normal_oct)).or_insert_with(|| {
-                    let id = self.leaf_attr_pool.allocate()
-                        .expect("leaf_attr_pool.allocate failed");
-                    *self.leaf_attr_pool.get_mut(id) = LeafAttr { voxel_slot: *voxel_slot, normal_oct };
-                    id
-                });
-                rewrites.push((*coord, *leaf_depth, rkp_core::sparse_octree::make_leaf(leaf_attr_id)));
-            }
-            for (coord, leaf_depth, new_value) in rewrites {
-                tree.set_at_level(coord, leaf_depth, new_value);
-            }
+        let mut tree = SparseOctree::from_raw(&octree_nodes, octree_depth, voxel_size);
+
+        // Normal computation uses neighbor presence in the file-voxel tree
+        // (before any leaf rewrite), which is effectively the binary
+        // occupancy field. Gradient points outward — same as an SDF.
+        let leaves: Vec<(glam::UVec3, u32, u8)> = tree.iter_leaves().collect();
+        let mut attr_dedup: std::collections::HashMap<(LeafAttr, u32), u32> =
+            std::collections::HashMap::new();
+        let mut rewrites: Vec<(glam::UVec3, u8, u32)> = Vec::with_capacity(leaves.len());
+
+        for (coord, file_idx, leaf_depth) in &leaves {
+            let (mat_p, mat_s, blend, color) = file_voxel_mat
+                .get(*file_idx as usize)
+                .copied()
+                .unwrap_or((0, 0, 0, 0));
+
+            let normal = compute_leaf_normal_from_binary_tree(&tree, *coord);
+            let attr = LeafAttr::new_blended(normal, mat_p, mat_s, blend);
+            let key = (attr, color);
+            let leaf_attr_id = *attr_dedup.entry(key).or_insert_with(|| {
+                let id = self.leaf_attr_pool.allocate()
+                    .expect("leaf_attr_pool.allocate failed");
+                *self.leaf_attr_pool.get_mut(id) = attr;
+                if color != 0 {
+                    self.leaf_attr_pool.set_color(id, color);
+                }
+                id
+            });
+            rewrites.push((*coord, *leaf_depth, rkp_core::sparse_octree::make_leaf(leaf_attr_id)));
+        }
+        for (coord, leaf_depth, new_value) in rewrites {
+            tree.set_at_level(coord, leaf_depth, new_value);
         }
         let leaf_attr_slot_count = self.leaf_attr_pool.allocated_count() - leaf_attr_slot_start;
 
-        // After migration + dedup-remap: collapse, compact, subtree-dedup.
-        //   collapse_all()         — merge uniform 8-child subtrees into a
-        //                            single leaf (try_collapse didn't fire
-        //                            during the post-load remap).
-        //   compact()              — reclaim orphan storage from the collapse.
-        //   deduplicate_subtrees() — share identical 8-child blocks as DAG
-        //                            references. Subtree dedup now operates
-        //                            on leaf_attr_ids, so it still collapses
-        //                            flat surfaces (same voxel+normal) but
-        //                            preserves per-position normals on
-        //                            curved surfaces.
         let raw_count = tree.node_count();
         tree.collapse_all();
         tree.compact();
         let compact_count = tree.node_count();
         tree.deduplicate_subtrees();
         let dedup_count = tree.node_count();
+        tree.morton_reorder();
         let compact_nodes = tree.as_slice().to_vec();
 
         let handle = self.octree.allocate_raw(&compact_nodes, octree_depth, voxel_size);
 
-        // Emit faces via octree-based neighbor lookup.
-        eprintln!("[RkpSceneManager] emitting faces with object_id={}", object_id);
-        {
-            emit_faces(&tree, &self.voxel_pool, &self.leaf_attr_pool, object_id, &mut self.pending_faces);
-            self.faces_dirty = true;
-        }
+        emit_faces(&tree, object_id, &mut self.pending_faces);
+        self.faces_dirty = true;
 
         let spatial = rkf_core::scene_node::SpatialHandle::Octree {
             root_offset: handle.root_offset,
@@ -457,10 +348,10 @@ impl RkpSceneManager {
         };
 
         eprintln!(
-            "[RkpSceneManager] loaded .rkp: {} voxels → {} unique pool slots ({:.1}×), {} faces, octree {} → compact {} → dedup {} ({:.1}× total)",
+            "[RkpSceneManager] loaded .rkp: {} voxels → {} unique leaf_attrs ({:.1}×), {} faces, octree {} → compact {} → dedup {} ({:.1}× total)",
             voxel_count,
-            unique_count,
-            if unique_count > 0 { voxel_count as f64 / unique_count as f64 } else { 0.0 },
+            leaf_attr_slot_count,
+            if leaf_attr_slot_count > 0 { voxel_count as f64 / leaf_attr_slot_count as f64 } else { 0.0 },
             self.pending_faces.len(),
             raw_count,
             compact_count,
@@ -469,8 +360,7 @@ impl RkpSceneManager {
         );
 
         Ok(AssetLoadResult {
-            spatial, voxel_size, aabb, voxel_count, voxel_slot_start,
-            voxel_slot_count: unique_count,
+            spatial, voxel_size, aabb, voxel_count,
             leaf_attr_slot_start,
             leaf_attr_slot_count,
         })
@@ -478,7 +368,7 @@ impl RkpSceneManager {
 
     // ── Primitive voxelization ───────────────────────────────────────
 
-    /// Voxelize an SDF primitive into the octree as an opacity field.
+    /// Voxelize an SDF primitive into the octree.
     pub fn voxelize_primitive(
         &mut self,
         primitive: &rkf_core::scene_node::SdfPrimitive,
@@ -488,11 +378,6 @@ impl RkpSceneManager {
         object_id: u32,
     ) -> Option<VoxelizeResult> {
         use rkf_core::scene_node::SdfPrimitive;
-
-        fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
-            let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
-            t * t * (3.0 - 2.0 * t)
-        }
 
         fn primitive_half_extents(prim: &SdfPrimitive) -> glam::Vec3 {
             match *prim {
@@ -512,9 +397,6 @@ impl RkpSceneManager {
             }
         }
 
-        let fade_inner = voxel_size * 1.0;
-        let fade_outer = voxel_size * 3.0;
-
         let half_extents = primitive_half_extents(primitive) * bake_scale;
         let margin = voxel_size * 8.0 * 1.8 + voxel_size;
         let aabb = rkf_core::Aabb::new(
@@ -522,7 +404,7 @@ impl RkpSceneManager {
             half_extents + glam::Vec3::splat(margin),
         );
 
-        // Build SDF closure.
+        // SDF closure passed directly to the voxelizer. Negative = inside.
         let sdf_fn: Box<dyn Fn(glam::Vec3) -> f32> = match primitive {
             SdfPrimitive::Box { half_extents: he } => {
                 let scaled = SdfPrimitive::Box { half_extents: *he * bake_scale };
@@ -540,23 +422,17 @@ impl RkpSceneManager {
             }
         };
 
-        // Convert SDF to opacity closure.
-        let opacity_fn = |pos: glam::Vec3| -> (f32, u16) {
-            let d = sdf_fn(pos);
-            let opacity = 1.0 - smoothstep(-fade_inner, fade_outer, d);
-            (opacity.clamp(0.0, 1.0), material_id)
+        let sdf_with_material = |pos: glam::Vec3| -> (f32, u16) {
+            (sdf_fn(pos), material_id)
         };
 
-        // Per-voxel octree voxelization.
-        let r = rkp_core::voxelize_octree::voxelize_opacity_octree(
-            opacity_fn, &aabb, voxel_size, &mut self.voxel_pool, &mut self.leaf_attr_pool,
+        let r = rkp_core::voxelize_octree::voxelize_octree(
+            sdf_with_material, &aabb, voxel_size, &mut self.leaf_attr_pool, &mut self.brick_pool,
         )?;
 
-        // Emit face instances.
-        emit_faces(&r.octree, &self.voxel_pool, &self.leaf_attr_pool, object_id, &mut self.pending_faces);
+        emit_faces(&r.octree, object_id, &mut self.pending_faces);
         self.faces_dirty = true;
 
-        // Allocate octree into the GPU allocator.
         let handle = self.octree.allocate(&r.octree);
         let spatial = rkf_core::scene_node::SpatialHandle::Octree {
             root_offset: handle.root_offset,
@@ -571,21 +447,17 @@ impl RkpSceneManager {
             voxel_size,
             aabb: geometry_aabb,
             voxel_count: r.voxel_count,
-            voxel_slot_start: r.slot_start,
-            voxel_slot_count: r.unique_count,
             leaf_attr_slot_start: r.leaf_attr_slot_start,
             leaf_attr_slot_count: r.leaf_attr_unique_count,
         })
     }
 
-    /// Voxelize an arbitrary opacity function into the octree.
+    /// Voxelize an arbitrary SDF function into the octree.
     ///
-    /// Generic entry point — the caller provides the opacity closure and bounding
-    /// box. Used by the procedural object system and any other source of opacity
-    /// fields.
-    pub fn voxelize_opacity_fn<F>(
+    /// The closure returns `(signed_distance, material_id)`. Negative = inside.
+    pub fn voxelize_sdf_fn<F>(
         &mut self,
-        opacity_fn: F,
+        sdf_fn: F,
         aabb: &rkf_core::Aabb,
         voxel_size: f32,
         object_id: u32,
@@ -593,11 +465,11 @@ impl RkpSceneManager {
     where
         F: Fn(glam::Vec3) -> (f32, u16),
     {
-        let r = rkp_core::voxelize_octree::voxelize_opacity_octree(
-            opacity_fn, aabb, voxel_size, &mut self.voxel_pool, &mut self.leaf_attr_pool,
+        let r = rkp_core::voxelize_octree::voxelize_octree(
+            sdf_fn, aabb, voxel_size, &mut self.leaf_attr_pool, &mut self.brick_pool,
         )?;
 
-        emit_faces(&r.octree, &self.voxel_pool, &self.leaf_attr_pool, object_id, &mut self.pending_faces);
+        emit_faces(&r.octree, object_id, &mut self.pending_faces);
         self.faces_dirty = true;
 
         let handle = self.octree.allocate(&r.octree);
@@ -613,44 +485,34 @@ impl RkpSceneManager {
             voxel_size,
             aabb: *aabb,
             voxel_count: r.voxel_count,
-            voxel_slot_start: r.slot_start,
-            voxel_slot_count: r.unique_count,
             leaf_attr_slot_start: r.leaf_attr_slot_start,
             leaf_attr_slot_count: r.leaf_attr_unique_count,
         })
     }
 
     /// Deallocate geometry previously produced by voxelize_*.
-    ///
-    /// Frees both the octree region (returned to the octree allocator's free
-    /// list) and the voxel pool slots (returned to the voxel pool's free list
-    /// or bump-shrunk if contiguous).
-    pub fn deallocate_geometry(&mut self, spatial: &rkp_core::OctreeHandle, voxel_slot_start: u32, voxel_slot_count: u32) {
+    pub fn deallocate_geometry(&mut self, spatial: &rkp_core::OctreeHandle, leaf_attr_slot_start: u32, leaf_attr_slot_count: u32) {
         self.octree.deallocate(*spatial);
-        self.voxel_pool.deallocate_range(voxel_slot_start, voxel_slot_count);
+        self.leaf_attr_pool.deallocate_range(leaf_attr_slot_start, leaf_attr_slot_count);
     }
 }
 
-/// Compute a leaf's surface normal from the opacity field gradient across
-/// its immediate neighbors in the tree. Used at load time to migrate old
-/// (voxel_slot-encoded) .rkp files into the per-leaf normal payload.
-///
-/// This mirrors the shader's 6-tap central difference, but CPU-side and
-/// using the tree's per-voxel opacity values directly.
-fn compute_leaf_normal_from_tree(
+/// Binary-occupancy gradient: 0 if the coord maps to EMPTY, 1 if a leaf or
+/// INTERIOR. Used at .rkp load time to estimate the surface normal from the
+/// legacy opacity-field file format without reading back the discarded
+/// opacity values. For a smooth surface, the 6-tap central difference of
+/// binary occupancy is a decent normal approximation; load-time-computed
+/// normals were always going to be noisier than authoring-time SDF gradients,
+/// but this is a transitional path.
+fn compute_leaf_normal_from_binary_tree(
     tree: &SparseOctree,
-    pool: &VoxelPool,
     coord: glam::UVec3,
 ) -> glam::Vec3 {
     let sample_at = |c: glam::UVec3| -> f32 {
         match tree.lookup(c) {
             Some(n) if n == rkp_core::sparse_octree::INTERIOR_NODE => 1.0,
             Some(n) if n == rkp_core::sparse_octree::EMPTY_NODE => 0.0,
-            Some(n) if rkp_core::sparse_octree::is_leaf(n) => {
-                // Leaves here still encode voxel_slot — this helper runs
-                // BEFORE the leaf_attr migration rewrites them.
-                pool.get(rkp_core::sparse_octree::leaf_slot(n)).opacity_f32()
-            }
+            Some(n) if rkp_core::sparse_octree::is_leaf(n) => 1.0,
             _ => 0.0,
         }
     };
@@ -669,6 +531,8 @@ fn compute_leaf_normal_from_tree(
         sample(0, 1, 0) - sample(0, -1, 0),
         sample(0, 0, 1) - sample(0, 0, -1),
     );
+    // Gradient points INTO occupied space (away from empty neighbors), so
+    // negate for outward normal.
     if grad.length_squared() > 1e-12 {
         -grad.normalize()
     } else {

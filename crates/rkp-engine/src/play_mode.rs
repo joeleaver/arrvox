@@ -210,7 +210,6 @@ fn build_collider_from_cache(
 /// position: `grid_origin + coord * collider_cell_size`.
 pub fn build_coarse_collider(
     octree_data: &[u32],
-    voxel_pool: &rkp_core::VoxelPool,
     root_offset: usize,
     tree_depth: u8,
     len: u32,
@@ -235,19 +234,13 @@ pub fn build_coarse_collider(
         }
     }
     let octree = rkp_core::SparseOctree::from_raw(&local_nodes, tree_depth, base_voxel_size);
-    let pool_size = voxel_pool.allocated_count();
 
     // How many fine voxels fit in one coarse cell?
     let ratio = (collider_cell_size / base_voxel_size).max(1.0);
 
-    // Bucket fine voxel coords into coarse grid cells.
+    // Every leaf in the tree is surface now — no opacity threshold to check.
     let mut occupied = std::collections::HashSet::new();
-    for (coord, slot, _depth) in octree.iter_leaves() {
-        if slot >= pool_size { continue; }
-        let voxel = voxel_pool.get(slot);
-        if voxel.opacity_f32() <= 0.01 { continue; }
-
-        // Map fine coord → coarse coord by dividing by ratio.
+    for (coord, _leaf_id, _depth) in octree.iter_leaves() {
         let coarse = IVec3::new(
             (coord.x as f32 / ratio).floor() as i32,
             (coord.y as f32 / ratio).floor() as i32,
