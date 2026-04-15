@@ -1534,7 +1534,14 @@ impl EngineState {
             }
 
             EngineCommand::SelectMaterial { material_id } => {
+                // The Asset Properties panel inspects one thing at a time —
+                // picking a material drops any prior model selection so the
+                // panel swaps over instead of staying stuck on the model (or
+                // vice versa).
                 self.selected_material = material_id;
+                if material_id.is_some() {
+                    self.selected_model = None;
+                }
             }
 
             EngineCommand::RemapMaterial { object_id, from_material, to_material } => {
@@ -1558,6 +1565,9 @@ impl EngineState {
 
             EngineCommand::SelectModel { path } => {
                 self.selected_model = path;
+                if self.selected_model.is_some() {
+                    self.selected_material = None;
+                }
             }
 
             EngineCommand::UpdateImportField { source_path, field, value } => {

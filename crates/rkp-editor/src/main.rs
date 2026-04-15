@@ -259,12 +259,13 @@ fn main() -> anyhow::Result<()> {
                 if let Some(ref mats) = update.materials {
                     store.materials.send(mats.clone());
                 }
-                if let Some(sel) = update.selected_material {
-                    store.selected_material.send(Some(sel));
-                }
-                if let Some(ref path) = update.selected_model {
-                    store.selected_model.send(Some(path.clone()));
-                }
+                // Mirror the Option as-is — a None from the engine means
+                // "nothing selected", and ignoring it (old behavior) left
+                // the Asset Properties panel stuck on the previous pick
+                // after the engine swapped selection from material→model
+                // or vice versa.
+                store.selected_material.send(update.selected_material);
+                store.selected_model.send(update.selected_model.clone());
                 store.play_mode.send(update.play_mode);
                 if let Some(ref env) = update.environment {
                     store.environment.send(env.clone());
