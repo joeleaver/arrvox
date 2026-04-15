@@ -204,6 +204,9 @@ fn main() -> anyhow::Result<()> {
                 if let Some(models) = &update.available_models {
                     store.available_models.send(models.clone());
                 }
+                if let Some(importing) = &update.importing_models {
+                    store.importing_models.send(importing.clone());
+                }
                 store.inspector.send(update.inspector.clone());
                 store.procedural.send(update.procedural.clone());
                 if let Some(ref ac) = update.available_components {

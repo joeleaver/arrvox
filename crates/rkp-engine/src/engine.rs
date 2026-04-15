@@ -233,6 +233,12 @@ struct EngineState {
     /// Available .rkp model files in the project.
     available_models: Vec<crate::snapshot::ModelInfo>,
     models_dirty: bool,
+    /// Source paths currently being re-imported. The UI consults this set
+    /// to show a progress indicator in place of the Re-import button.
+    /// Populated on `ReimportModel` submission, drained on completion.
+    importing_sources: std::collections::HashSet<String>,
+    /// Publish `importing_sources` to the UI on the next snapshot.
+    importing_dirty: bool,
 
     /// Material library — manages .rkmat files and runtime palette.
     material_lib: crate::material_library::MaterialLibrary,
@@ -459,6 +465,8 @@ impl EngineState {
             project_dirty: true, // push initial state
             available_models: Vec::new(),
             models_dirty: false,
+            importing_sources: std::collections::HashSet::new(),
+            importing_dirty: false,
             material_lib: crate::material_library::MaterialLibrary::new(),
             selected_material: None,
             selected_model: None,
@@ -1582,13 +1590,38 @@ impl EngineState {
 
             EngineCommand::ReimportModel { source_path } => {
                 let source = std::path::PathBuf::from(&source_path);
+                let source_key = source.to_string_lossy().into_owned();
+                // Drop the request if this source already has an import
+                // in flight. Without the guard a double-click would queue
+                // two identical jobs, and the spinner would clear halfway
+                // through while the second still ran in the background.
+                if self.importing_sources.contains(&source_key) {
+                    eprintln!(
+                        "[RkpEngine] re-import already in flight for {} — ignoring",
+                        source.display(),
+                    );
+                    return true;
+                }
                 let profile = crate::import_profile::ImportProfile::load_or_default(&source);
+                let config = profile.to_import_config();
                 let output = crate::import_worker::rkp_output_path(&source);
-                eprintln!("[RkpEngine] re-importing {} → {}", source.display(), output.display());
+                eprintln!(
+                    "[RkpEngine] re-importing {} → {} \
+                     (target_size={}, voxel_size={:?}, rotation={:?}, import_colors={})",
+                    source.display(), output.display(),
+                    config.target_size, config.voxel_size,
+                    config.rotation_offset, config.import_colors,
+                );
+                let name = source.file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.console.info(format!("Re-importing '{name}'…"));
+                self.importing_sources.insert(source_key);
+                self.importing_dirty = true;
                 self.import_worker.submit(crate::import_worker::ImportRequest {
                     source_path: source,
                     output_path: output,
-                    config: profile.to_import_config(),
+                    config,
                 });
             }
 
@@ -2204,6 +2237,10 @@ impl EngineState {
     fn poll_import_completions(&mut self) {
         let completions = self.import_worker.poll_completions();
         for completion in completions {
+            let source_key = completion.source_path.to_string_lossy().into_owned();
+            if self.importing_sources.remove(&source_key) {
+                self.importing_dirty = true;
+            }
             match completion.result {
                 Ok(result) => {
                     let name = completion.source_path.file_stem()
@@ -2213,6 +2250,7 @@ impl EngineState {
                         "Import complete: {name} ({} voxels)",
                         result.total_bricks,
                     ));
+                    self.refresh_reimported_asset(&completion.output_path);
                     self.scan_models();
                 }
                 Err(e) => {
@@ -2231,6 +2269,67 @@ impl EngineState {
         eprintln!("[RkpEngine] hot-reload asset: {path}");
         // TODO: remove old GPU objects for this asset, re-load from file,
         // rebuild faces, re-upload geometry.
+    }
+
+    /// After a re-import has rewritten the `.rkp` on disk, refresh the
+    /// scene manager's cached copy and point any entities that were
+    /// referencing it at the new geometry. No-op when the asset isn't
+    /// currently loaded into the scene.
+    fn refresh_reimported_asset(&mut self, output_path: &std::path::Path) {
+        let path_str = output_path.to_string_lossy().into_owned();
+        let reload = match self.scene_mgr.reload_asset(&path_str) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                eprintln!(
+                    "[RkpEngine] refresh_reimported_asset: {} not in asset cache — \
+                     no scene entities to refresh",
+                    output_path.display(),
+                );
+                return;
+            }
+            Err(e) => {
+                self.console.error(format!("Reload after import failed: {e}"));
+                return;
+            }
+        };
+
+        let entities_to_update: Vec<hecs::Entity> = self.world
+            .query::<&crate::components::Renderable>()
+            .iter()
+            .filter_map(|(e, r)| (r.asset_handle == Some(reload.old_handle)).then_some(e))
+            .collect();
+
+        eprintln!(
+            "[RkpEngine] refresh_reimported_asset: {} → {} entities to update \
+             (old_handle={:?}, new_handle={:?}, voxels={})",
+            output_path.display(),
+            entities_to_update.len(),
+            reload.old_handle,
+            reload.new_handle,
+            reload.info.voxel_count,
+        );
+
+        for entity in entities_to_update {
+            if let Ok(mut r) = self.world.get::<&mut crate::components::Renderable>(entity) {
+                let spatial = spatial_from_handle(
+                    &reload.info.spatial,
+                    reload.info.voxel_size,
+                    &reload.info.aabb,
+                    reload.info.leaf_attr_slot_start,
+                    reload.info.leaf_attr_slot_count,
+                    Vec::new(),
+                );
+                r.asset_handle = Some(reload.new_handle);
+                r.spatial = Some(spatial);
+                r.voxel_count = reload.info.voxel_count;
+            }
+        }
+        // geometry_dirty: re-upload pools. gpu_objects_dirty: rebuild the
+        // per-entity GpuObject list so the new AABB / octree offsets land
+        // on the GPU (target_size, rotation offsets, etc. only show up in
+        // the render once this runs).
+        self.geometry_dirty = true;
+        self.gpu_objects_dirty = true;
     }
 
     /// Resolve a Uuid (from UI) to an hecs::Entity.
@@ -3284,6 +3383,12 @@ impl EngineState {
         } else {
             None
         };
+        let importing = if self.importing_dirty {
+            self.importing_dirty = false;
+            Some(self.importing_sources.iter().cloned().collect())
+        } else {
+            None
+        };
 
         StateUpdate {
             fps,
@@ -3295,6 +3400,7 @@ impl EngineState {
             project_loaded: project,
             project_name,
             available_models: models,
+            importing_models: importing,
             inspector: self.build_inspector_snapshot(),
             recent_projects: if self.frame_index == 1 {
                 Some(crate::recent_projects::load_recent())

@@ -134,6 +134,17 @@ impl AssetCache {
     }
 }
 
+/// Result of [`RkpSceneManager::reload_asset`]. `old_handle` is the handle
+/// that was invalidated (so callers can find entities still holding it);
+/// `new_handle` points at the freshly-loaded entry. They may be equal when
+/// the cache reuses the vacated slot, but callers must not rely on that.
+#[derive(Debug, Clone, Copy)]
+pub struct ReloadResult {
+    pub old_handle: AssetHandle,
+    pub new_handle: AssetHandle,
+    pub info: AssetInfo,
+}
+
 /// Result of voxelizing a primitive.
 pub struct VoxelizeResult {
     pub spatial: rkf_core::scene_node::SpatialHandle,
@@ -391,6 +402,37 @@ impl RkpSceneManager {
         let info = entry.info();
         let handle = self.asset_cache.insert(entry);
         Ok((handle, info))
+    }
+
+    /// Force a reload of a cached asset from disk. Used after re-import
+    /// rewrites the `.rkp` file so existing scene instances pick up the
+    /// new geometry. Frees the previous pool allocations, loads the fresh
+    /// file, and preserves the refcount so outstanding instances remain
+    /// valid once they've been updated to the returned handle.
+    ///
+    /// Returns `Ok(None)` when the asset isn't currently cached (nothing
+    /// to refresh — the next `acquire_asset` will read the new file).
+    pub fn reload_asset(&mut self, path: &str) -> Result<Option<ReloadResult>, String> {
+        let canonical = Self::resolve_rkp_path(path)?;
+        let Some(old_handle) = self.asset_cache.lookup_path(&canonical) else {
+            return Ok(None);
+        };
+
+        let old_refcount = self.asset_cache.get(old_handle)
+            .map(|e| e.refcount).unwrap_or(0);
+
+        let entry = self.asset_cache.remove(old_handle).expect("just looked up");
+        self.octree.deallocate(entry.spatial_handle);
+        self.leaf_attr_pool.deallocate_range(entry.leaf_attr_slot_start, entry.leaf_attr_slot_count);
+        for id in entry.brick_start..(entry.brick_start + entry.brick_count) {
+            self.brick_pool.deallocate(id);
+        }
+
+        let mut fresh = self.load_asset_from_disk(&canonical)?;
+        fresh.refcount = old_refcount;
+        let info = fresh.info();
+        let new_handle = self.asset_cache.insert(fresh);
+        Ok(Some(ReloadResult { old_handle, new_handle, info }))
     }
 
     /// Release an instance's claim on a cached asset. When the last

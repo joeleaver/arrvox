@@ -82,6 +82,10 @@ pub struct EditorStore {
     pub project_name: Signal<String>,
     /// Available .rkp model files.
     pub available_models: Signal<Vec<ModelInfo>>,
+    /// Source paths currently being re-imported on the engine thread.
+    /// The Asset Properties panel uses this to swap the Re-import button
+    /// for a progress indicator while a given model's import is running.
+    pub importing_models: Signal<Vec<String>>,
     /// Model path being dragged onto viewport (None = no drag).
     pub model_drag: Signal<Option<String>>,
     /// Inspector data for the selected entity.
@@ -187,6 +191,7 @@ impl EditorStore {
             recent_projects: Signal::new(Vec::new()),
             project_name: Signal::new(String::new()),
             available_models: Signal::new(Vec::new()),
+            importing_models: Signal::new(Vec::new()),
             model_drag: Signal::new(None),
             inspector: Signal::new(None),
             procedural: Signal::new(None),

@@ -7,7 +7,7 @@
 //! (INTERIOR_NODE). No per-voxel opacity field is produced or stored; the
 //! runtime reads the baked normal + color and shades directly.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use glam::Vec3;
 use rayon::prelude::*;
@@ -25,6 +25,16 @@ use rkf_import::skeleton_extract::{self, VertexSkinning};
 /// Flat voxel index within a brick (matches rkf-core convention).
 fn voxel_index(x: u8, y: u8, z: u8) -> u32 {
     x as u32 + y as u32 * 8 + z as u32 * 64
+}
+
+/// Sidecar path used for atomic writes — same dir + stem as `final_path`
+/// with `.inprogress` appended so a failed import never truncates the
+/// live file. Must append (not swap extensions) to preserve the `.rkp` /
+/// `.rkskel` suffix the scanner keys off.
+fn staging_path(final_path: &Path) -> PathBuf {
+    let mut s = final_path.as_os_str().to_owned();
+    s.push(".inprogress");
+    PathBuf::from(s)
 }
 
 /// Result of processing a single brick — signed distance, material, and
@@ -622,36 +632,63 @@ pub fn import_mesh_to_opacity_rkp(
     // TODO: Per-voxel bone data (bone weights per leaf voxel, not per brick)
     let bone_data: Option<&[u8]> = None;
 
-    let file = std::fs::File::create(output_path)
-        .map_err(|e| format!("create output: {e}"))?;
-    let mut writer = std::io::BufWriter::new(file);
+    // Atomic write: stage both artifacts to sibling `.inprogress` paths,
+    // then rename on success. A mid-write failure (disk full, panic, user
+    // kill) leaves the old `.rkp` / `.rkskel` on disk untouched so the
+    // next `acquire_asset` keeps working. Clean up any leftovers from a
+    // previously-crashed run first.
+    let rkp_tmp = staging_path(output_path);
+    let skel_final = output_path.with_extension("rkskel");
+    let skel_tmp = staging_path(&skel_final);
+    let _ = std::fs::remove_file(&rkp_tmp);
 
-    // Expand AABB by one voxel so the outer shell voxels (one voxel beyond
-    // the mesh surface on the outside) fall inside the geometry bounds.
-    let shell_margin = Vec3::splat(voxel_size);
-    let geometry_aabb = Aabb::new(aabb.min - shell_margin, aabb.max + shell_margin);
-    rkp_core::asset_file::write_rkp(
-        &mut writer,
-        octree.as_slice(),
-        depth,
-        voxel_size,
-        voxel_count,
-        geometry_aabb.min.to_array(),
-        geometry_aabb.max.to_array(),
-        &material_ids,
-        &voxel_bytes,
-        normals_data,
-        bricks_data,
-        color_data.as_deref(),
-        bone_data,
-    )
-    .map_err(|e| format!("write .rkp: {e}"))?;
+    // Cleanup helper: on any write error below, drop both temps so we
+    // don't leave half-written files sitting around.
+    let cleanup = |rkp_tmp: &Path, skel_tmp: &Path| {
+        let _ = std::fs::remove_file(rkp_tmp);
+        let _ = std::fs::remove_file(skel_tmp);
+    };
 
-    let file_size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+    let write_rkp_result = (|| -> Result<(), String> {
+        let file = std::fs::File::create(&rkp_tmp)
+            .map_err(|e| format!("create output: {e}"))?;
+        let mut writer = std::io::BufWriter::new(file);
 
-    // 6. Save skeleton sidecar
-    let skeleton_path = if let Some(ref extraction) = skinning {
-        let skel_path = output_path.with_extension("rkskel");
+        // Expand AABB by one voxel so the outer shell voxels (one voxel
+        // beyond the mesh surface on the outside) fall inside the
+        // geometry bounds.
+        let shell_margin = Vec3::splat(voxel_size);
+        let geometry_aabb = Aabb::new(aabb.min - shell_margin, aabb.max + shell_margin);
+        rkp_core::asset_file::write_rkp(
+            &mut writer,
+            octree.as_slice(),
+            depth,
+            voxel_size,
+            voxel_count,
+            geometry_aabb.min.to_array(),
+            geometry_aabb.max.to_array(),
+            &material_ids,
+            &voxel_bytes,
+            normals_data,
+            bricks_data,
+            color_data.as_deref(),
+            bone_data,
+        )
+        .map_err(|e| format!("write .rkp: {e}"))?;
+
+        Ok(())
+    })();
+    if let Err(e) = write_rkp_result {
+        cleanup(&rkp_tmp, &skel_tmp);
+        return Err(e);
+    }
+
+    let file_size = std::fs::metadata(&rkp_tmp).map(|m| m.len()).unwrap_or(0);
+
+    // 6. Save skeleton sidecar to its own staging path. A failure here is
+    // soft — we log it and drop the skel, same as before atomic writes.
+    let wrote_skel = if let Some(ref extraction) = skinning {
+        let _ = std::fs::remove_file(&skel_tmp);
         let asset = rkf_animation::skeleton_asset::SkeletonAsset::with_normalization(
             extraction.skeleton.clone(),
             extraction.clips.clone(),
@@ -660,13 +697,39 @@ pub fn import_mesh_to_opacity_rkp(
             norm.rotation_offset,
             norm.rotation_center.to_array(),
         );
-        match rkf_animation::skeleton_asset::save_rkskel(&asset, &skel_path) {
+        match rkf_animation::skeleton_asset::save_rkskel(&asset, &skel_tmp) {
             Ok(()) => {
-                eprintln!("Saved skeleton: {} bones → {}", extraction.skeleton.bones.len(), skel_path.display());
-                Some(skel_path)
+                eprintln!(
+                    "Saved skeleton: {} bones → {}",
+                    extraction.skeleton.bones.len(), skel_final.display(),
+                );
+                true
             }
             Err(e) => {
                 eprintln!("Failed to save .rkskel: {e}");
+                let _ = std::fs::remove_file(&skel_tmp);
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    // Commit: rename `.rkp` first (the primary artifact). Do the skel
+    // second so a rename failure on the skel doesn't leave the user
+    // with a new skeleton sidecar pointing at stale geometry.
+    if let Err(e) = std::fs::rename(&rkp_tmp, output_path) {
+        cleanup(&rkp_tmp, &skel_tmp);
+        return Err(format!("rename .rkp: {e}"));
+    }
+    let skeleton_path = if wrote_skel {
+        match std::fs::rename(&skel_tmp, &skel_final) {
+            Ok(()) => Some(skel_final),
+            Err(e) => {
+                eprintln!(
+                    "Failed to swap .rkskel into place: {e} — keeping previous skeleton"
+                );
+                let _ = std::fs::remove_file(&skel_tmp);
                 None
             }
         }
