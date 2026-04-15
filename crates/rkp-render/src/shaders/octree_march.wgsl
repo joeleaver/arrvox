@@ -50,7 +50,22 @@ struct MarchParams {
     mode: u32,
     shadow_max_steps: u32,
     num_lights: u32,
+    // Prefiltered-LOD early-exit gate. `1` → check each branch's `.y`
+    // (prefilter attr id) plus a screen-footprint threshold and
+    // terminate descent when the node would occupy <1 pixel. `0` →
+    // always descend to a terminator (pre-LOD behavior).
+    lod_enabled: u32,
+    _pad: vec3<u32>,
 }
+
+const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;
+// Footprint threshold below which we treat a branch as small enough to
+// represent with its prefilter attr. Strict `<` (not `<=`) so the
+// fallback path still runs for exactly-1px nodes. See the LOD plan for
+// hysteresis discussion: at depth N+1 the footprint is half of N's, so
+// the sharp cutoff produces a monotonic "descend/terminate" decision
+// per ray with no ping-pong under camera motion at the sub-pixel scale.
+const LOD_CUTOFF_PX: f32 = 0.9;
 
 struct GpuLight {
     position: vec4<f32>,   // xyz = position, w = type (0=dir, 1=point, 2=spot)
@@ -85,7 +100,12 @@ struct OctreeResult {
 // before bricks landed; we reused the slot to stay under the 12
 // storage-buffer limit per shader stage.)
 @group(0) @binding(0) var<storage, read> brick_pool: array<u32>;
-@group(0) @binding(1) var<storage, read> octree_nodes: array<u32>;
+// Each slot is (node_value, prefilter_attr_id). `.x` holds the existing
+// node encoding (EMPTY / INTERIOR / BRANCH offset / LEAF id / BRICK id);
+// `.y` holds a prefiltered leaf_attr_id for LOD-cutoff early-exit, or
+// INTERNAL_ATTR_NONE (0xFFFFFFFF) when unavailable. Interleaved into a
+// single `vec2<u32>` binding to stay under the 12-storage-buffer limit.
+@group(0) @binding(1) var<storage, read> octree_nodes: array<vec2<u32>>;
 @group(0) @binding(2) var<storage, read> objects: array<RkpObject>;
 @group(0) @binding(3) var<uniform> camera: CameraUniforms;
 // color_pool[leaf_attr_id] → packed R|G|B|A u32, 0 = no override (use
@@ -135,7 +155,7 @@ fn brick_id_of(node: u32) -> u32 {
 // stats[45]      = voxel_pool reads       (8 B each; word0+word1 same cache line)
 // stats[46]      = color_pool_data reads  (4 B each)
 // stats[47]      = materials reads        (32 B each — WGSL storage layout)
-// stats[48..52]  = reserved
+// stats[48..52]  = LOD early-exit depth histogram (levels 0-2, 3-5, 6-8, 9+)
 //
 // octree_nodes reads are derived CPU-side from the per-phase depth histograms:
 // sum(bucket[i] * (i + 1)) since each lookup descends `depth+1` nodes.
@@ -183,12 +203,52 @@ fn bucket_depth(phase: u32, level: u32) {
     atomicAdd(&stats[base + min(level, 11u)], 1u);
 }
 
-fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: u32) -> OctreeResult {
+fn bucket_lod_exit(level: u32) {
+    // 4 buckets: 0-2, 3-5, 6-8, 9+.
+    var b = 3u;
+    if level <= 2u { b = 0u; }
+    else if level <= 5u { b = 1u; }
+    else if level <= 8u { b = 2u; }
+    atomicAdd(&stats[48u + b], 1u);
+}
+
+/// Descend the octree from `root` toward `pos` (in oc-space) and return
+/// the terminating node.
+///
+/// Prefiltered-LOD early exit: if `lod_enabled` is on and the current
+/// branch's projected screen footprint drops below [`LOD_CUTOFF_PX`],
+/// we stop descending and return the branch's prefilter attr id (a
+/// `leaf_attr_id` into `leaf_attr_pool`) as if it were a LEAF at the
+/// current level. The caller shades it with exactly the same path as a
+/// regular leaf hit — the prefiltered attr is by construction a valid
+/// `LeafAttr` pointing at an averaged (normal, material, color) for
+/// the subtree.
+///
+/// Parameters:
+/// * `t_current` — ray parameter at the descent entry in oc-space
+///   units (same units as `extent`). Used to compute distance.
+/// * `local_to_world_scale` — multiplier converting oc-space length to
+///   world units. Same scalar for both `node_size` and `dist` so it
+///   cancels at the threshold — but we keep it explicit because the
+///   footprint histogram in the caller already works in world units.
+/// * `focal_px_y` — vertical pixels per world unit at unit depth. Read
+///   once in the caller from `camera`.
+fn octree_lookup(
+    root: u32,
+    max_depth: u32,
+    extent: f32,
+    pos: vec3<f32>,
+    phase: u32,
+    t_current: f32,
+    local_to_world_scale: f32,
+    focal_px_y: f32,
+) -> OctreeResult {
     var offset = root;
     var half = extent * 0.5;
     var center = vec3<f32>(half);
     for (var level = 0u; level < max_depth; level++) {
-        let node = octree_nodes[offset];
+        let packed = octree_nodes[offset];
+        let node = packed.x;
         if node == OCTREE_EMPTY {
             bucket_depth(phase, level);
             return OctreeResult(OCTREE_EMPTY, level, center, half);
@@ -205,6 +265,32 @@ fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: 
             // differs).
             return OctreeResult(node & OCTREE_PAYLOAD_MASK | (node & OCTREE_BRICK_BIT), level, center, half);
         }
+
+        // Branch — check the prefiltered-LOD cutoff before descending.
+        // Gated on `phase == PHASE_MARCH`: the shadow path uses a cone-
+        // footprint LOD (Phase 3) and must not pixel-footprint-exit;
+        // the normal path doesn't need LOD (normals baked into leaves).
+        // The node's side in world units is `(half * 2.0) * scale`; the
+        // distance from the ray origin is `t * scale`. Both pull from the
+        // same `scale`, so the ratio matches the existing world-space
+        // footprint histogram's formula (`vs * focal_px_y / dist`).
+        if march_params.lod_enabled != 0u
+            && phase == PHASE_MARCH
+            && packed.y != INTERNAL_ATTR_NONE
+        {
+            let node_size_world = (half * 2.0) * local_to_world_scale;
+            let dist_world = max(t_current * local_to_world_scale, 1e-3);
+            let footprint_px = node_size_world * focal_px_y / dist_world;
+            if footprint_px < LOD_CUTOFF_PX {
+                bucket_depth(phase, level);
+                bucket_lod_exit(level);
+                // `packed.y` is a `leaf_attr_id` (< BRICK_BIT). Return it
+                // as a regular leaf — no BRICK_BIT, callers shade it via
+                // the standard leaf-hit path.
+                return OctreeResult(packed.y, level, center, half);
+            }
+        }
+
         let gt = vec3<u32>(pos >= center);
         offset = node + gt.x + gt.y * 2u + gt.z * 4u;
         half *= 0.5;
@@ -215,7 +301,7 @@ fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: 
         );
     }
     bucket_depth(phase, max_depth);
-    let node = octree_nodes[offset];
+    let node = octree_nodes[offset].x;
     if node == OCTREE_EMPTY { return OctreeResult(OCTREE_EMPTY, max_depth, center, half); }
     if node == OCTREE_INTERIOR { return OctreeResult(OCTREE_INTERIOR, max_depth, center, half); }
     if (node & OCTREE_LEAF_BIT) != 0u {
@@ -321,7 +407,8 @@ fn trace_shadow_ray(
             if t > t_limit { break; }
 
             let pos = clamp(shadow_origin + safe_dir * t, vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
-            let r = octree_lookup(root, max_depth, extent, pos, PHASE_SHADOW);
+            // LOD skipped (phase != PHASE_MARCH) — placeholder args.
+            let r = octree_lookup(root, max_depth, extent, pos, PHASE_SHADOW, 0.0, 0.0, 0.0);
 
             if r.slot == OCTREE_EMPTY {
                 t += max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);
@@ -430,7 +517,15 @@ fn march_object(
 
     let inv_world = obj.inverse_world;
     let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
-    let local_dir = normalize((inv_world * vec4<f32>(world_dir, 0.0)).xyz);
+    let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
+    let local_dir = normalize(local_dir_unnorm);
+    // Conversion from oc-space (where `t` marches) to world units.
+    // `length(local_dir_unnorm) = 1/S` for uniform scale S, so the
+    // reciprocal gives world_distance = oc_distance * local_to_world.
+    let local_to_world = 1.0 / max(length(local_dir_unnorm), 1e-8);
+    // camera.up.xyz encodes tan(half_fov_y) — same decoding as the
+    // post-hit footprint histogram.
+    let focal_px_y = 0.5 * camera.resolution.y / max(length(camera.up.xyz), 1e-6);
 
     let root = obj.octree_root;
     let max_depth = obj.octree_depth;
@@ -460,7 +555,7 @@ fn march_object(
         if result.alpha > 0.99 { break; }
 
         let pos = clamp(oc_origin + safe_dir * t, vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
-        let r = octree_lookup(root, max_depth, extent, pos, PHASE_MARCH);
+        let r = octree_lookup(root, max_depth, extent, pos, PHASE_MARCH, t, local_to_world, focal_px_y);
 
         if r.slot == OCTREE_EMPTY {
             t += skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs);

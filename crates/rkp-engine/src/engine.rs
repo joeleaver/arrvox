@@ -312,9 +312,23 @@ struct EngineState {
     pending_pick: Option<(u32, u32)>,
     /// Cached light count for march pass (set in light upload block, used in render).
     num_lights_cache: u32,
+    /// Prefiltered-LOD early-exit toggle. On by default; flipped off for
+    /// A/B correctness comparison against the pre-LOD descent behavior.
+    lod_enabled: bool,
 }
 
 impl EngineState {
+    /// Flip the prefiltered-LOD march early-exit on or off. Public API
+    /// exists mainly for A/B correctness tests and debugging.
+    pub fn set_lod_enabled(&mut self, enabled: bool) {
+        self.lod_enabled = enabled;
+    }
+
+    /// Current LOD toggle state.
+    pub fn lod_enabled(&self) -> bool {
+        self.lod_enabled
+    }
+
     fn new(config: &EngineConfig) -> Self {
         let ctx = rkf_render::RenderContext::new_headless();
         let device = ctx.device;
@@ -465,6 +479,7 @@ impl EngineState {
             pick_readback_buffer,
             pending_pick: None,
             num_lights_cache: 1,
+            lod_enabled: true,
         }
     }
 
@@ -629,7 +644,7 @@ impl EngineState {
             self.renderer.god_rays.update_params(&self.queue, &god_ray_params);
         }
 
-        self.renderer.render(&mut encoder, &self.queue, object_count, self.width, self.height, shadow_steps, num_lights, screen_aabbs_bytes, &atmo_frame);
+        self.renderer.render(&mut encoder, &self.queue, object_count, self.width, self.height, shadow_steps, num_lights, self.lod_enabled, screen_aabbs_bytes, &atmo_frame);
 
         let t_encode = frame_start.elapsed();
 
