@@ -18,7 +18,6 @@
 
 use crate::rkp_scene::{RkpScene, GeometryUpload, FrameUpload};
 use crate::rkp_shade::{ShadeParams, GpuLight, GpuMaterial};
-use crate::rkp_volumetric::{VolumetricParams, CloudParams};
 use crate::rkp_atmosphere::RkpAtmospherePass;
 use wgpu_profiler::GpuProfiler;
 
@@ -109,10 +108,9 @@ impl RkpRenderer {
     }
 
     /// Render one frame into `viewport`. Dispatches into the VR's own
-    /// per-resolution passes (march → shadow → ssao → shade → vol →
-    /// god_rays → bloom → bloom_composite → tone_map) + copies tone_map's
-    /// LDR output into the VR's composite texture. Caller still owns the
-    /// optional wireframe overlay + readback copy + submit.
+    /// per-resolution passes; in `Isolation` mode the atmosphere /
+    /// shadow_trace / volumetric / god_rays / bloom passes are skipped
+    /// to give a clean studio look.
     #[allow(clippy::too_many_arguments)]
     pub fn render_to(
         &mut self,
@@ -124,14 +122,16 @@ impl RkpRenderer {
         num_lights: u32,
         screen_aabbs: &[u8],
         atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
+        mode: crate::RenderMode,
     ) {
+        let in_situ = matches!(mode, crate::RenderMode::InSitu);
+
         // Upload per-viewport tile-cull screen-space AABBs into the VR's march.
         viewport.march.upload_screen_aabbs(queue, screen_aabbs);
 
-        // 0. Atmosphere LUTs (precomputed + per-frame, shared — happens once
-        // per viewport because the sun/camera change per render).
-        self.atmosphere.dispatch_if_dirty(encoder);
-        {
+        // 0. Atmosphere LUTs (in-situ only — isolation uses a flat sky).
+        if in_situ {
+            self.atmosphere.dispatch_if_dirty(encoder);
             let q = self.profiler.begin_query("atmo", encoder);
             self.atmosphere.dispatch_per_frame(encoder, queue, atmo_frame_params);
             self.profiler.end_query(encoder, q);
@@ -149,45 +149,94 @@ impl RkpRenderer {
             self.profiler.end_query(encoder, q);
         }
 
-        // 1b. Half-res shadow trace. Uses march's params bind group.
-        if let Some(params_bg) = viewport.march.params_bind_group() {
-            let q = self.profiler.begin_query("shadow", encoder);
-            viewport.shadow_trace.dispatch(encoder, &viewport.scene_bind_group, params_bg);
-            self.profiler.end_query(encoder, q);
+        // 1b. Half-res shadow trace. Skipped in isolation — the shade
+        // pass forces shadow=1.0 there. Uses march's params bind group.
+        if in_situ {
+            if let Some(params_bg) = viewport.march.params_bind_group() {
+                let q = self.profiler.begin_query("shadow", encoder);
+                viewport.shadow_trace.dispatch(encoder, &viewport.scene_bind_group, params_bg);
+                self.profiler.end_query(encoder, q);
+            }
         }
         viewport.march.copy_stats(encoder);
 
-        // 2. SSAO (half-res).
+        // 2. SSAO (half-res). Kept in isolation — it's the only grounding cue.
         {
             let q = self.profiler.begin_query("ssao", encoder);
             viewport.ssao.dispatch(encoder);
             self.profiler.end_query(encoder, q);
         }
 
-        // 3. Deferred PBR shading.
+        // 3. Deferred PBR shading. ShadeParams.isolation drives the
+        // isolation-mode behavior inside the shader (flat sky, fixed
+        // ambient, shadow=1).
         {
             let q = self.profiler.begin_query("shade", encoder);
             viewport.shade.dispatch(encoder);
             self.profiler.end_query(encoder, q);
         }
 
-        // 4. Volumetric march (half-res) + composite (full-res).
-        {
+        // 4. Volumetric march + composite (in-situ only).
+        if in_situ {
             let q = self.profiler.begin_query("vol", encoder);
             viewport.volumetric.dispatch_march(encoder);
             viewport.volumetric.dispatch_composite(encoder);
             self.profiler.end_query(encoder, q);
+        } else {
+            // Isolation: keep the texture chain valid by copying shade
+            // output forward into volumetric.output (the texture
+            // god_rays' input view is bound to). Cheaper than rebuilding
+            // god_rays' bind group on every mode flip.
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &viewport.shade.output_texture,
+                    mip_level: 0, origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &viewport.volumetric.output_texture,
+                    mip_level: 0, origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: viewport.width, height: viewport.height,
+                    depth_or_array_layers: 1,
+                },
+            );
         }
 
-        // 4b. Screen-space god rays.
-        {
+        // 4b. God rays (in-situ only). Isolation copies the volumetric
+        // output forward into god_rays.output so bloom_composite's HDR
+        // input is correct.
+        if in_situ {
             let q = self.profiler.begin_query("god_rays", encoder);
             viewport.god_rays.dispatch(encoder);
             self.profiler.end_query(encoder, q);
+        } else {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &viewport.volumetric.output_texture,
+                    mip_level: 0, origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &viewport.god_rays.output_texture,
+                    mip_level: 0, origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: viewport.width, height: viewport.height,
+                    depth_or_array_layers: 1,
+                },
+            );
         }
 
-        // 5. Bloom + bloom composite + tone_map (VR-level).
-        {
+        // 5. Bloom (in-situ only). bloom_composite + tone_map always run
+        // because tone_map is the only HDR→LDR step. In isolation the
+        // engine writes bloom_intensity=0 per-VR so bloom_composite's
+        // mip read is zero-weighted — the pass becomes a copy from its
+        // HDR input (which we just populated with shade output above).
+        if in_situ {
             let q = self.profiler.begin_query("bloom", encoder);
             viewport.bloom.dispatch(encoder);
             self.profiler.end_query(encoder, q);
@@ -223,6 +272,15 @@ impl RkpRenderer {
                 depth_or_array_layers: 1,
             },
         );
+
+        // Isolation: paint the infinite grid over the composite. Done
+        // after the LDR copy so the grid blends in display-space rather
+        // than competing with HDR scene radiance.
+        if !in_situ {
+            let q = self.profiler.begin_query("grid", encoder);
+            viewport.grid.draw(encoder, &viewport.composite_view);
+            self.profiler.end_query(encoder, q);
+        }
     }
 
     pub fn resolve_profiler_queries(&mut self, encoder: &mut wgpu::CommandEncoder) {

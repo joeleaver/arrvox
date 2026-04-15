@@ -207,6 +207,12 @@ pub struct Viewport {
     pub filter: SceneFilter,
     pub background: BackgroundMode,
 
+    /// Render-pipeline shape — `InSitu` (full PBR stack matching the
+    /// main edit viewport) or `Isolation` (neutral background + grid,
+    /// no atmosphere/clouds/volumetrics/god-rays/shadow/bloom). Drives
+    /// pass gating in `RkpRenderer::render_to`.
+    pub mode: rkp_render::RenderMode,
+
     /// Whether to overlay editor gizmos. Gated to "no runtime override
     /// active" in higher layers.
     pub show_gizmos: bool,
@@ -229,6 +235,7 @@ impl Viewport {
                 focus_entity: None,
             },
             background: BackgroundMode::Environment,
+            mode: rkp_render::RenderMode::InSitu,
             show_gizmos: true,
         }
     }
@@ -250,6 +257,7 @@ impl Viewport {
                 focus_entity: None,
             },
             background: BackgroundMode::Neutral,
+            mode: rkp_render::RenderMode::Isolation,
             show_gizmos: false,
         }
     }

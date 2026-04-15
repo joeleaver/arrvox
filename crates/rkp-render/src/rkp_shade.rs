@@ -40,7 +40,11 @@ pub struct ShadeParams {
     pub sun_dir: [f32; 3],
     pub _pad2: f32,
     pub ambient_color: [f32; 3],
-    pub _pad3: f32,
+    /// 0 = full PBR + atmosphere + shadows, 1 = isolation studio (neutral
+    /// gray sky, fixed ambient, shadows forced 1.0). Per-VR — written
+    /// just before the VR's submit, same channel as the other per-VR
+    /// frame params.
+    pub isolation: u32,
 }
 
 impl Default for ShadeParams {
@@ -57,7 +61,7 @@ impl Default for ShadeParams {
             sun_dir: [0.5, 0.7, 0.5],
             _pad2: 0.0,
             ambient_color: [0.1, 0.15, 0.25],
-            _pad3: 0.0,
+            isolation: 0,
         }
     }
 }
@@ -438,7 +442,9 @@ impl RkpShadePass {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                 | wgpu::TextureUsages::TEXTURE_BINDING
+                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());

@@ -42,8 +42,13 @@ struct ShadeParams {
     sun_dir: vec3<f32>,
     _pad2: f32,
     ambient_color: vec3<f32>,
-    _pad3: f32,
+    isolation: u32,
 }
+
+// Neutral gray for isolation-mode sky + ambient — chosen to match a
+// typical 18% middle-gray studio backdrop in linear light.
+const ISOLATION_BG: vec3<f32> = vec3<f32>(0.18, 0.18, 0.18);
+const ISOLATION_AMBIENT: vec3<f32> = vec3<f32>(0.4, 0.4, 0.4);
 
 struct Material {
     base_color: vec4<f32>,
@@ -348,8 +353,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let world_pos = pos_data.xyz;
     let hit_t = pos_data.w;
 
-    // No geometry → sky from Sky View LUT + sun disc.
+    // No geometry → sky.
     if hit_t >= 9999.0 || hit_t <= 0.0 {
+        if shade_params.isolation != 0u {
+            // Isolation: flat neutral background, no sun disc, no sky LUT.
+            // The grid pass paints over this for floor pixels.
+            textureStore(output, coord, vec4<f32>(ISOLATION_BG, 1.0));
+            return;
+        }
         let uv_screen = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims);
         let ndc = vec2<f32>(uv_screen.x * 2.0 - 1.0, 1.0 - uv_screen.y * 2.0);
         let ray_dir = normalize(camera.forward.xyz + ndc.x * camera.right.xyz + ndc.y * camera.up.xyz);
@@ -420,6 +431,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var shadow_data = vec4<f32>(0.0);
     var w_sum = 0.0;
     var bilinear_data = vec4<f32>(0.0);
+    // Isolation: shadow_trace pass is skipped, so shadow_tex contains
+    // stale data. Force fully-lit and bypass the bilateral gather.
+    if shade_params.isolation != 0u {
+        shadow_data = vec4<f32>(1.0);
+        w_sum = 1.0;
+    } else {
     // Position sigma — in world units. The shadow trace samples one full
     // surface per 2-pixel block, so neighbors straddling a depth
     // discontinuity should get ~zero weight. 5 cm is tight enough to
@@ -463,6 +480,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         shadow_data /= w_sum;
     }
+    } // end !isolation block
 
     // AO from half-res SSAO texture.
     let half_coord = vec2<i32>(gid.xy) / 2;
@@ -524,12 +542,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         lo += (diffuse + specular) * radiance * n_dot_l * light_shadow;
     }
 
-    // Ambient from multi-scattering LUT — isotropic scattered luminance at camera position.
-    let cam_height = EARTH_RADIUS + shade_params.camera_altitude;
-    let sun_cos_z = shade_params.sun_dir.y;
-    let ms_irradiance = lookup_multiscatter(cam_height, sun_cos_z)
+    // Ambient: in-situ uses multi-scattering LUT for sky irradiance; in
+    // isolation we substitute a flat neutral irradiance so the result is
+    // independent of sun direction / atmosphere state.
+    var ms_irradiance: vec3<f32>;
+    if shade_params.isolation != 0u {
+        ms_irradiance = ISOLATION_AMBIENT;
+    } else {
+        let cam_height = EARTH_RADIUS + shade_params.camera_altitude;
+        let sun_cos_z = shade_params.sun_dir.y;
+        ms_irradiance = lookup_multiscatter(cam_height, sun_cos_z)
                       * shade_params.sun_intensity
                       * shade_params.ambient_intensity;
+    }
 
     let ambient_diffuse = ms_irradiance * albedo * (1.0 - metallic) * ao;
 

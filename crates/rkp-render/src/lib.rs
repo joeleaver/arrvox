@@ -27,6 +27,8 @@ pub mod rkp_atmosphere;
 pub mod rkp_god_rays;
 /// Volumetric rendering — fog, dust, procedural clouds.
 pub mod rkp_volumetric;
+/// Infinite world-space grid overlay (isolation-mode build viewport).
+pub mod rkp_grid;
 /// Frame renderer — orchestrates the full pipeline.
 pub mod rkp_renderer;
 /// Scene management — voxel pool, octree, face emission, asset loading.
@@ -38,6 +40,22 @@ pub use voxelize_opacity::import_mesh_to_opacity_rkp;
 pub use octree_gpu::OctreeGpu;
 pub use rkp_scene_manager::{AssetHandle, AssetInfo, RkpSceneManager};
 pub use viewport_renderer::ViewportRenderer;
+
+/// What a viewport's render pipeline should look like.
+///
+/// `InSitu` is the full deferred PBR stack with atmosphere, clouds,
+/// volumetrics, god rays, shadows, and bloom — same look as the main
+/// edit viewport.
+///
+/// `Isolation` strips the scene context: neutral gray sky, no clouds /
+/// volumetrics / god rays / atmosphere, no sun shadow (SSAO carries
+/// grounding), no bloom. An infinite world-space grid composites over
+/// the result. Used by the build viewport for clean preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderMode {
+    InSitu,
+    Isolation,
+}
 
 /// Validate WGSL source with naga at startup. Panics with a clear error message
 /// on shader bugs instead of producing cryptic "pipeline invalid" GPU errors.

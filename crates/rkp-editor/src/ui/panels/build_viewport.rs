@@ -14,19 +14,21 @@ use rinch::prelude::*;
 use rinch::render_surface::{RenderSurface, SurfaceEvent, SurfaceMouseButton};
 
 use rkp_engine::viewport::ViewportId;
+use rkp_render::RenderMode;
 
 use crate::{BuildSurface, CommandSender};
 use crate::ui::store::EditorStore;
+use super::viewport_toolbar::EditModeToolbar;
 
 const PANEL_VIEWPORT: ViewportId = ViewportId::BUILD;
 
 /// Turntable camera state — orbit about a target at a given distance.
-/// Converted to `SetCamera { position, yaw, pitch, fov }` every time the
-/// user drags or scrolls; the engine stores that as the viewport's
-/// `editor_camera` and renders from it on the next tick.
+/// The target is NOT a field here: it's pulled live from the selected
+/// entity's Transform position each frame so the preview auto-tracks
+/// when the procedural is moved in the scene. `eye(target)` computes
+/// the orbit eye relative to whatever world target the caller resolved.
 #[derive(Clone, Copy)]
 struct Turntable {
-    target: glam::Vec3,
     yaw: f32,
     pitch: f32,
     distance: f32,
@@ -36,7 +38,6 @@ struct Turntable {
 impl Default for Turntable {
     fn default() -> Self {
         Self {
-            target: glam::Vec3::ZERO,
             yaw: 0.7,
             pitch: -0.3,
             distance: 4.0,
@@ -46,14 +47,14 @@ impl Default for Turntable {
 }
 
 impl Turntable {
-    /// Current orbit position, derived from yaw/pitch + distance.
-    fn eye(&self) -> glam::Vec3 {
+    /// Orbit eye for the given target, derived from yaw/pitch/distance.
+    fn eye(&self, target: glam::Vec3) -> glam::Vec3 {
         let dir = glam::Vec3::new(
             -self.yaw.sin() * self.pitch.cos(),
             self.pitch.sin(),
             -self.yaw.cos() * self.pitch.cos(),
         );
-        self.target - dir * self.distance
+        target - dir * self.distance
     }
 }
 
@@ -64,9 +65,29 @@ pub fn BuildViewport() -> NodeHandle {
     let store = use_context::<EditorStore>();
 
     let turntable = Signal::new(Turntable::default());
+    let mode = Signal::new(RenderMode::Isolation);
     let last_mx = std::cell::Cell::new(0.0f32);
     let last_my = std::cell::Cell::new(0.0f32);
     let orbiting = std::cell::Cell::new(false);
+
+    // Push the mode to the engine whenever it changes. Edge-only via
+    // a non-reactive Cell — same pattern as the visibility effect to
+    // avoid re-queueing into a flush already in progress.
+    {
+        let prev_mode = std::cell::Cell::new(None::<RenderMode>);
+        let cmd_tx = cmd.0.clone();
+        __scope.create_effect(move || {
+            let m = mode.get();
+            if prev_mode.get() == Some(m) {
+                return;
+            }
+            prev_mode.set(Some(m));
+            let _ = cmd_tx.send(rkp_engine::EngineCommand::SetViewportMode {
+                id: PANEL_VIEWPORT,
+                mode: m,
+            });
+        });
+    }
 
     // Whenever `procedural` flips between Some and None, drive the
     // viewport's visibility. `__scope.create_effect` ties the effect's
@@ -127,14 +148,24 @@ pub fn BuildViewport() -> NodeHandle {
         });
     }
 
-    // Push the current turntable pose to the engine whenever it changes.
-    // The engine stores it on the BUILD viewport's editor_camera and
-    // render_frame reads from there next tick.
+    // Push the current turntable pose to the engine whenever the orbit
+    // parameters change OR the selected entity's world position changes.
+    // Target tracks the inspector's `position` so gizmo-translating the
+    // procedural in the main viewport re-centers the build preview in
+    // lock-step — no manual "re-frame" button needed.
+    //
+    // Effect reads: `turntable`, `store.inspector`. Writes: SetCamera only.
+    // Does NOT write into `turntable` (that would re-queue this effect
+    // against the state-tick's signal flush — see the RefCell panic
+    // note further up).
     {
         let cmd_tx = cmd.0.clone();
         __scope.create_effect(move || {
             let t = turntable.get();
-            let eye = t.eye();
+            let target = store.inspector.get()
+                .map(|i| glam::Vec3::from(i.position))
+                .unwrap_or(glam::Vec3::ZERO);
+            let eye = t.eye(target);
             let _ = cmd_tx.send(rkp_engine::EngineCommand::SetCamera {
                 id: PANEL_VIEWPORT,
                 position: eye,
@@ -150,8 +181,22 @@ pub fn BuildViewport() -> NodeHandle {
     // Track the last dispatched size so we only fire Resize on actual
     // changes (every event fires the handler; don't spam the channel).
     let last_size = std::cell::Cell::new((0u32, 0u32));
+    // Remember the last mouse position so we can compute deltas for
+    // MouseMove commands (the panel already tracks `last_mx`/`last_my`
+    // for orbit math but those would leak across left/middle/right).
     surface.set_event_handler(move |event| {
         use SurfaceEvent::*;
+        use rkf_runtime::input::InputMouseButton;
+
+        // Map a rinch button to the runtime enum the engine expects.
+        fn map_btn(b: SurfaceMouseButton) -> InputMouseButton {
+            match b {
+                SurfaceMouseButton::Left => InputMouseButton::Left,
+                SurfaceMouseButton::Right => InputMouseButton::Right,
+                SurfaceMouseButton::Middle => InputMouseButton::Middle,
+                _ => InputMouseButton::Left,
+            }
+        }
 
         // Relay panel size to the engine so BUILD's VR renders at the
         // panel's native resolution. Each VR has its own pass chain
@@ -173,14 +218,27 @@ pub fn BuildViewport() -> NodeHandle {
             MouseDown { button, x, y } => {
                 last_mx.set(x);
                 last_my.set(y);
-                if button == SurfaceMouseButton::Left
+                // Right-drag (and middle) orbits, matching the main
+                // viewport's right-drag-to-look convention. Left-click
+                // is forwarded to the engine for gizmo picking.
+                if button == SurfaceMouseButton::Right
                     || button == SurfaceMouseButton::Middle
                 {
                     orbiting.set(true);
                 }
+                let _ = cmd_tx.send(rkp_engine::EngineCommand::MouseButton {
+                    id: PANEL_VIEWPORT,
+                    button: map_btn(button),
+                    pressed: true,
+                });
             }
-            MouseUp { .. } => {
+            MouseUp { button, .. } => {
                 orbiting.set(false);
+                let _ = cmd_tx.send(rkp_engine::EngineCommand::MouseButton {
+                    id: PANEL_VIEWPORT,
+                    button: map_btn(button),
+                    pressed: false,
+                });
             }
             MouseMove { x, y } => {
                 let dx = x - last_mx.get();
@@ -194,6 +252,12 @@ pub fn BuildViewport() -> NodeHandle {
                             .clamp(-1.5, 1.5); // stop at +/- ~85°
                     });
                 }
+                // Always forward movement — the engine needs live
+                // cursor position for gizmo hover + drag, independent
+                // of the local orbit state.
+                let _ = cmd_tx.send(rkp_engine::EngineCommand::MouseMove {
+                    id: PANEL_VIEWPORT, x, y, dx, dy,
+                });
             }
             MouseWheel { delta_y, .. } => {
                 // Scroll zooms in/out of the target.
@@ -216,9 +280,27 @@ pub fn BuildViewport() -> NodeHandle {
         div {
             style: "display:flex;flex-direction:column;width:100%;height:100%;\
                     background:#1a1a1a;",
+            // Header row with isolation/in-situ toggle. Sized to match
+            // the main viewport's ViewportHeaderBar so panels align.
+            div {
+                style: "height:32px;display:flex;align-items:center;\
+                        padding:0 6px;background:#252526;\
+                        border-bottom:1px solid #3c3c3c;flex-shrink:0;gap:4px;",
+                {mode_toggle(__scope, mode, RenderMode::Isolation, "Isolation",
+                             "Studio backdrop with grid")}
+                {mode_toggle(__scope, mode, RenderMode::InSitu, "In-Situ",
+                             "Match scene environment")}
+            }
             div {
                 style: "flex:1;min-height:0;position:relative;",
                 RenderSurface { surface: Some(surface.clone()) }
+                // Floating gizmo-mode toolbar. Shares gizmo_mode state
+                // with MAIN's EditModeToolbar — toggling here flips
+                // both viewports' gizmos. Only meaningful while a
+                // procedural is open.
+                if has_procedural.get() {
+                    EditModeToolbar {}
+                }
                 if !has_procedural.get() {
                     div {
                         style: "position:absolute;inset:0;display:flex;\
@@ -229,6 +311,38 @@ pub fn BuildViewport() -> NodeHandle {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Segmented-button entry. `current` is the live mode signal; clicking
+/// sets it to `value`. The active variant gets a brighter background.
+fn mode_toggle(
+    __scope: &mut rinch::core::dom::RenderScope,
+    current: Signal<RenderMode>,
+    value: RenderMode,
+    label: &'static str,
+    title: &'static str,
+) -> rinch::core::dom::NodeHandle {
+    rsx! {
+        div {
+            style: {move || {
+                if current.get() == value {
+                    "padding:2px 10px;background:#3c5a8a;border:1px solid #4a78b0;\
+                     border-radius:4px;cursor:pointer;color:#dde7f5;font-size:11px;\
+                     font-weight:600;"
+                } else {
+                    "padding:2px 10px;background:#2a2a2a;border:1px solid #3c3c3c;\
+                     border-radius:4px;cursor:pointer;color:#a0a0a0;font-size:11px;"
+                }
+            }},
+            title: title,
+            onclick: move || {
+                if current.get() != value {
+                    current.set(value);
+                }
+            },
+            {label}
         }
     }
 }

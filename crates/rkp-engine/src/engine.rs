@@ -303,6 +303,31 @@ struct EngineState {
 
     // Gizmo state
     gizmo: crate::gizmo::GizmoState,
+    /// Gizmo state for the BUILD viewport — targets the selected
+    /// procedural node's transform rather than an entity Transform.
+    /// Separate from `gizmo` so a drag on BUILD doesn't fight a hover
+    /// on MAIN (or vice versa).
+    proc_gizmo: crate::gizmo::GizmoState,
+    /// BUILD viewport cursor position (in BUILD's local pixel space).
+    build_mouse_pos: glam::Vec2,
+    /// BUILD viewport left-button pressed state. Tracked directly
+    /// (rather than feeding `input_system`) so BUILD input doesn't
+    /// fight MAIN's WASD/fly camera input.
+    build_mouse_left: bool,
+    /// Previous tick's value of `build_mouse_left` — used for edge
+    /// detection so picking fires once per click rather than every
+    /// frame the button is held.
+    build_mouse_left_prev: bool,
+    /// Parent-world transform of the procedural node at drag start —
+    /// used to project world-space gizmo deltas back into the node's
+    /// local (parent-relative) transform on each frame. Identity when
+    /// no drag is active.
+    proc_gizmo_parent_world: glam::Affine3A,
+    /// Node's local SRT components at drag start. Held separately from
+    /// `proc_gizmo.initial_*` (which track world-space) so we can
+    /// rebuild the node's Affine3A correctly without redoing the
+    /// decompose per frame.
+    proc_gizmo_initial_local: (glam::Vec3, glam::Quat, glam::Vec3),
     /// Mouse position in viewport pixels (for gizmo hover).
     mouse_pos: glam::Vec2,
 
@@ -311,6 +336,11 @@ struct EngineState {
     pending_pick: Option<(u32, u32)>,
     /// Cached light count for march pass (set in light upload block, used in render).
     num_lights_cache: u32,
+    /// Base ShadeParams (recomputed once per frame from environment +
+    /// light list). The per-viewport loop writes this into the shared
+    /// shade_params buffer with the VR's `isolation` flag overlaid,
+    /// just before that VR's submit.
+    shade_params_base: rkp_render::rkp_shade::ShadeParams,
 }
 
 impl EngineState {
@@ -428,10 +458,17 @@ impl EngineState {
             width,
             height,
             gizmo: crate::gizmo::GizmoState::new(),
+            proc_gizmo: crate::gizmo::GizmoState::new(),
+            build_mouse_pos: glam::Vec2::ZERO,
+            build_mouse_left: false,
+            build_mouse_left_prev: false,
+            proc_gizmo_parent_world: glam::Affine3A::IDENTITY,
+            proc_gizmo_initial_local: (glam::Vec3::ZERO, glam::Quat::IDENTITY, glam::Vec3::ONE),
             mouse_pos: glam::Vec2::ZERO,
             pick_readback_buffer,
             pending_pick: None,
             num_lights_cache: 1,
+            shade_params_base: rkp_render::rkp_shade::ShadeParams::default(),
         }
     }
 
@@ -485,7 +522,11 @@ impl EngineState {
 
             let mut shade_params = self.environment.to_shade_params();
             shade_params.num_lights = gpu_lights.len() as u32;
-            self.renderer.update_shade_params(&self.queue, &shade_params);
+            // Stash the base shade_params; the per-viewport loop below
+            // writes it (with the per-VR `isolation` flag set) into the
+            // shared shade_params buffer just before each VR's submit.
+            // Same shared-buffer-per-VR-submit pattern as vol/cloud/atmo.
+            self.shade_params_base = shade_params;
             self.renderer.update_lights(&self.queue, &gpu_lights);
             self.num_lights_cache = shade_params.num_lights;
 
@@ -649,6 +690,46 @@ impl EngineState {
                 vr.god_rays.update_params(&self.queue, &god_ray_params);
             }
 
+            // Per-VR shade params: same scene-wide values, isolation bit
+            // set per the viewport's mode. Written into the shared
+            // shade_params buffer right before this VR's submit so the
+            // shade pass reads this VR's flag, not another's.
+            let vp_mode = self.viewports
+                .get(viewport_id)
+                .map(|v| v.mode)
+                .unwrap_or(rkp_render::RenderMode::InSitu);
+            let isolation = matches!(vp_mode, rkp_render::RenderMode::Isolation);
+            {
+                let mut sp = self.shade_params_base;
+                sp.isolation = isolation as u32;
+                self.renderer.update_shade_params(&self.queue, &sp);
+            }
+            // Per-VR bloom intensity. In isolation we run bloom_composite
+            // as a passthrough (intensity = 0) since the bloom mips are
+            // not refreshed; in-situ uses the env-configured intensity.
+            {
+                let vr = self.viewport_renderers
+                    .get(&viewport_id)
+                    .expect("viewport renderer must exist");
+                let intensity = if isolation { 0.0 } else { self.environment.bloom_intensity };
+                vr.bloom_composite.set_intensity(&self.queue, intensity);
+            }
+
+            // Compute the procedural-node gizmo wireframe before we
+            // take the mutable VR borrow below — build_procedural_
+            // gizmo_wireframe reads from `self.world`, which shares
+            // scope with `viewport_renderers`.
+            let proc_gizmo_verts = if viewport_id == ViewportId::BUILD {
+                let build_cam_pos = glam::Vec3::new(
+                    cam_uniforms.position[0],
+                    cam_uniforms.position[1],
+                    cam_uniforms.position[2],
+                );
+                self.build_procedural_gizmo_wireframe(build_cam_pos)
+            } else {
+                Vec::new()
+            };
+
             // Per-viewport encoder.
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("rkp viewport"),
@@ -660,6 +741,7 @@ impl EngineState {
             self.renderer.render_to(
                 &mut encoder, &self.queue, vr,
                 object_count, shadow_steps, num_lights, screen_aabbs_bytes, &atmo_frame,
+                vp_mode,
             );
 
             if viewport_id == ViewportId::MAIN {
@@ -703,6 +785,25 @@ impl EngineState {
                         &gizmo_verts,
                     );
                 }
+            }
+
+            // BUILD viewport: procedural-node gizmo overlay. Separate
+            // wireframe from the entity gizmo on MAIN — same wireframe
+            // pass, different source geometry (the selected procedural
+            // node's transform, not the entity's).
+            if viewport_id == ViewportId::BUILD && !proc_gizmo_verts.is_empty() {
+                let composite_view = &vr.composite_view;
+                let vw = vr.width as f32;
+                let vh = vr.height as f32;
+                vr.wireframe_pass.draw(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    composite_view,
+                    vp_matrix,
+                    (0.0, 0.0, vw, vh),
+                    &proc_gizmo_verts,
+                );
             }
 
             vr.copy_composite_to_readback(&mut encoder);
@@ -980,6 +1081,55 @@ impl EngineState {
         }
     }
 
+    /// Read-modify-write a procedural node's local `Affine3A`.
+    ///
+    /// The stored transform is a full SRT compose, not just a
+    /// translation — so each of the three `SetProceduralNode*` commands
+    /// must preserve the two components it doesn't own. `f` takes
+    /// `(scale, rotation, translation)` as decomposed from the current
+    /// transform and returns the new triple.
+    fn update_procedural_node_transform(
+        &mut self,
+        node_id: u32,
+        f: impl FnOnce(glam::Vec3, glam::Quat, glam::Vec3) -> (glam::Vec3, glam::Quat, glam::Vec3),
+    ) {
+        let entity = match self.selected_entity {
+            Some(e) => e,
+            None => return,
+        };
+        let Ok(mut proc_geo) = self
+            .world
+            .get::<&mut crate::components::ProceduralGeometry>(entity)
+        else {
+            return;
+        };
+        let id = rkp_procedural::NodeId(node_id);
+        let current = match proc_geo.tree.get(id) {
+            Some(n) => n.transform,
+            None => return,
+        };
+
+        // Decompose current transform.
+        let t = current.translation.into();
+        let m = current.matrix3;
+        let sx = glam::Vec3::from(m.x_axis).length();
+        let sy = glam::Vec3::from(m.y_axis).length();
+        let sz = glam::Vec3::from(m.z_axis).length();
+        let scale = glam::Vec3::new(sx.max(1e-8), sy.max(1e-8), sz.max(1e-8));
+        let rot_mat = glam::Mat3::from_cols(
+            (glam::Vec3::from(m.x_axis) / scale.x).into(),
+            (glam::Vec3::from(m.y_axis) / scale.y).into(),
+            (glam::Vec3::from(m.z_axis) / scale.z).into(),
+        );
+        let rotation = glam::Quat::from_mat3(&rot_mat);
+
+        let (new_scale, new_rot, new_t) = f(scale, rotation, t);
+        let new_affine =
+            glam::Affine3A::from_scale_rotation_translation(new_scale, new_rot, new_t);
+        proc_geo.tree.set_transform(id, new_affine);
+        proc_geo.dirty = true;
+    }
+
     fn process_command(&mut self, cmd: EngineCommand) -> bool {
         match cmd {
             EngineCommand::Shutdown => return false,
@@ -1054,6 +1204,12 @@ impl EngineState {
             EngineCommand::ClearViewportCamera { id } => {
                 if let Some(vp) = self.viewports.get_mut(id) {
                     vp.runtime_override = None;
+                }
+            }
+
+            EngineCommand::SetViewportMode { id, mode } => {
+                if let Some(vp) = self.viewports.get_mut(id) {
+                    vp.mode = mode;
                 }
             }
 
@@ -1209,15 +1365,21 @@ impl EngineState {
             }
 
             EngineCommand::SetProceduralNodePosition { node_id, position } => {
-                if let Some(entity) = self.selected_entity {
-                    if let Ok(mut proc_geo) = self.world.get::<&mut crate::components::ProceduralGeometry>(entity) {
-                        proc_geo.tree.set_transform(
-                            rkp_procedural::NodeId(node_id),
-                            glam::Affine3A::from_translation(position),
-                        );
-                        proc_geo.dirty = true;
-                    }
-                }
+                self.update_procedural_node_transform(node_id, |s, r, _| (s, r, position));
+            }
+
+            EngineCommand::SetProceduralNodeRotation { node_id, rotation_deg } => {
+                let rot = glam::Quat::from_euler(
+                    glam::EulerRot::XYZ,
+                    rotation_deg.x.to_radians(),
+                    rotation_deg.y.to_radians(),
+                    rotation_deg.z.to_radians(),
+                );
+                self.update_procedural_node_transform(node_id, |s, _, t| (s, rot, t));
+            }
+
+            EngineCommand::SetProceduralNodeScale { node_id, scale } => {
+                self.update_procedural_node_transform(node_id, |_, r, t| (scale, r, t));
             }
 
             EngineCommand::SetProceduralNodeParam { node_id, param_name, value } => {
@@ -1489,11 +1651,18 @@ impl EngineState {
                 if id == crate::viewport::ViewportId::MAIN {
                     self.mouse_pos = glam::Vec2::new(x, y);
                     self.input_system.feed_mouse_delta(glam::Vec2::new(dx, dy));
+                } else if id == crate::viewport::ViewportId::BUILD {
+                    self.build_mouse_pos = glam::Vec2::new(x, y);
+                    let _ = (dx, dy);
                 }
             }
             EngineCommand::MouseButton { id, button, pressed } => {
                 if id == crate::viewport::ViewportId::MAIN {
                     self.input_system.feed_mouse_button(button, pressed);
+                } else if id == crate::viewport::ViewportId::BUILD {
+                    if button == rkf_runtime::input::InputMouseButton::Left {
+                        self.build_mouse_left = pressed;
+                    }
                 }
             }
             EngineCommand::Scroll { id, delta } => {
@@ -3152,6 +3321,406 @@ impl EngineState {
         verts
     }
 
+    /// BUILD-viewport node picker. On a fresh left-press that isn't
+    /// grabbing a gizmo handle, sphere-trace through the procedural's
+    /// SDF, then walk the tree for the leaf node whose local SDF is
+    /// smallest at the hit point.
+    ///
+    /// Runs AFTER `update_procedural_gizmo` so a click on a handle
+    /// (which begins a drag) sets `proc_gizmo.dragging = true`, which
+    /// this function treats as its "skip" signal. Clicks in empty
+    /// world space clear the node selection.
+    fn maybe_pick_procedural_node(&mut self) {
+        let just_pressed = self.build_mouse_left && !self.build_mouse_left_prev;
+        self.build_mouse_left_prev = self.build_mouse_left;
+        if !just_pressed {
+            return;
+        }
+        // A gizmo-drag starting on this same click wins over picking.
+        if self.proc_gizmo.dragging || self.proc_gizmo.hovered_axis
+            != crate::gizmo::GizmoAxis::None
+        {
+            return;
+        }
+
+        let Some(entity) = self.selected_entity else { return };
+
+        // Clone the tree + voxel size + entity transform so we can drop
+        // the ECS borrows before publishing the new `selected_procedural_node`.
+        let (tree, voxel_size, entity_world) = {
+            let Ok(proc_geo) = self
+                .world
+                .get::<&crate::components::ProceduralGeometry>(entity)
+            else {
+                return;
+            };
+            let Ok(xf) = self
+                .world
+                .get::<&crate::components::Transform>(entity)
+            else {
+                return;
+            };
+            let entity_world = glam::Affine3A::from_scale_rotation_translation(
+                xf.scale,
+                glam::Quat::from_euler(
+                    glam::EulerRot::XYZ,
+                    xf.rotation.x.to_radians(),
+                    xf.rotation.y.to_radians(),
+                    xf.rotation.z.to_radians(),
+                ),
+                xf.position,
+            );
+            (proc_geo.tree.clone(), proc_geo.voxel_size, entity_world)
+        };
+
+        let (ray_o_world, ray_d_world) = self.screen_to_ray_for_viewport(
+            crate::viewport::ViewportId::BUILD,
+            self.build_mouse_pos.x,
+            self.build_mouse_pos.y,
+        );
+
+        // Transform the ray into procedural-local space so we can
+        // sphere-trace against the tree's SDF (which assumes its root
+        // is at the entity's origin).
+        let inv_entity = entity_world.inverse();
+        let ray_o = inv_entity.transform_point3(ray_o_world);
+        let ray_d = inv_entity
+            .transform_vector3(ray_d_world)
+            .normalize_or_zero();
+        if ray_d.length_squared() < 1e-6 {
+            return;
+        }
+
+        // Sphere-trace. Fine tolerance so we land on the true surface
+        // rather than in the fade band; step limit chosen to cover
+        // scenes up to ~100 m across.
+        let mut t = 0.0_f32;
+        let mut hit: Option<glam::Vec3> = None;
+        for _ in 0..128 {
+            let p = ray_o + ray_d * t;
+            let sample = rkp_procedural::sample_tree(&tree, p, voxel_size);
+            if sample.distance < 1e-3 {
+                hit = Some(p);
+                break;
+            }
+            // Guard against tiny/negative steps that would stall the trace.
+            let step = sample.distance.max(voxel_size * 0.5);
+            t += step;
+            if t > 200.0 {
+                break;
+            }
+        }
+
+        let new_selection = hit.and_then(|p| nearest_leaf_at(&tree, p, voxel_size));
+
+        if new_selection != self.selected_procedural_node {
+            self.selected_procedural_node = new_selection;
+        }
+    }
+
+    /// BUILD-viewport gizmo: hover + drag for the selected procedural
+    /// node's transform. Mirrors `update_gizmo` but reads BUILD mouse
+    /// state, casts rays through BUILD's camera, and writes to the
+    /// node's Affine3A instead of an entity Transform.
+    fn update_procedural_gizmo(&mut self) {
+        let (node_id, entity) = match (self.selected_procedural_node, self.selected_entity) {
+            (Some(n), Some(e)) => (n, e),
+            _ => {
+                self.proc_gizmo.hovered_axis = crate::gizmo::GizmoAxis::None;
+                if self.proc_gizmo.dragging {
+                    self.proc_gizmo.end_drag();
+                }
+                return;
+            }
+        };
+
+        // Resolve parent-world and current local transform from the tree.
+        let (parent_world, current_local) = {
+            let Ok(proc_geo) =
+                self.world.get::<&crate::components::ProceduralGeometry>(entity)
+            else {
+                return;
+            };
+            let Ok(entity_xform) =
+                self.world.get::<&crate::components::Transform>(entity)
+            else {
+                return;
+            };
+            let target = rkp_procedural::NodeId(node_id);
+            let mut path = Vec::new();
+            if !find_path(&proc_geo.tree, proc_geo.tree.root(), target, &mut path) {
+                return;
+            }
+            let entity_world = glam::Affine3A::from_scale_rotation_translation(
+                entity_xform.scale,
+                glam::Quat::from_euler(
+                    glam::EulerRot::XYZ,
+                    entity_xform.rotation.x.to_radians(),
+                    entity_xform.rotation.y.to_radians(),
+                    entity_xform.rotation.z.to_radians(),
+                ),
+                entity_xform.position,
+            );
+            let mut parent_world = entity_world;
+            for id in &path[..path.len() - 1] {
+                if let Some(n) = proc_geo.tree.get(*id) {
+                    parent_world = parent_world * n.transform;
+                }
+            }
+            let current_local = proc_geo
+                .tree
+                .get(target)
+                .map(|n| n.transform)
+                .unwrap_or(glam::Affine3A::IDENTITY);
+            (parent_world, current_local)
+        };
+
+        let world_transform = parent_world * current_local;
+        let center = world_transform.transform_point3(glam::Vec3::ZERO);
+
+        let cam_uniforms =
+            self.build_camera_uniforms(crate::viewport::ViewportId::BUILD);
+        let cam_pos = glam::Vec3::new(
+            cam_uniforms.position[0],
+            cam_uniforms.position[1],
+            cam_uniforms.position[2],
+        );
+        let cam_dist = (center - cam_pos).length().max(0.1);
+        let gizmo_size = cam_dist * 0.15;
+
+        let (ray_o, ray_d) = self.screen_to_ray_for_viewport(
+            crate::viewport::ViewportId::BUILD,
+            self.build_mouse_pos.x,
+            self.build_mouse_pos.y,
+        );
+
+        if self.proc_gizmo.dragging {
+            // Apply deltas relative to the drag-start SRT, then write
+            // back to the node's local transform in parent-relative
+            // space. `parent_world.inverse()` handles the conversion
+            // back from world deltas.
+            let (init_local_t, init_local_r, init_local_s) = self.proc_gizmo_initial_local;
+            let parent_inv = self.proc_gizmo_parent_world.inverse();
+            let parent_rot = decompose_affine_rotation(&self.proc_gizmo_parent_world);
+
+            let new_local = match self.gizmo.mode {
+                crate::gizmo::GizmoMode::Translate => {
+                    let world_delta = crate::gizmo::compute_translate_delta(
+                        &self.proc_gizmo, ray_o, ray_d,
+                    );
+                    let new_world_pos = self.proc_gizmo.initial_position + world_delta;
+                    let new_local_t = parent_inv.transform_point3(new_world_pos);
+                    glam::Affine3A::from_scale_rotation_translation(
+                        init_local_s, init_local_r, new_local_t,
+                    )
+                }
+                crate::gizmo::GizmoMode::Rotate => {
+                    let world_delta = crate::gizmo::compute_rotate_delta(
+                        &self.proc_gizmo, ray_o, ray_d, center,
+                    );
+                    let new_world_rot = world_delta * self.proc_gizmo.initial_rotation;
+                    let new_local_r = parent_rot.inverse() * new_world_rot;
+                    glam::Affine3A::from_scale_rotation_translation(
+                        init_local_s, new_local_r, init_local_t,
+                    )
+                }
+                crate::gizmo::GizmoMode::Scale => {
+                    let delta = crate::gizmo::compute_scale_delta(
+                        &self.proc_gizmo, ray_o, ray_d,
+                    );
+                    let new_local_s = init_local_s * delta;
+                    glam::Affine3A::from_scale_rotation_translation(
+                        new_local_s, init_local_r, init_local_t,
+                    )
+                }
+            };
+
+            if let Ok(mut proc_geo) =
+                self.world.get::<&mut crate::components::ProceduralGeometry>(entity)
+            {
+                proc_geo.tree.set_transform(
+                    rkp_procedural::NodeId(node_id),
+                    new_local,
+                );
+                proc_geo.dirty = true;
+            }
+
+            if !self.build_mouse_left {
+                self.proc_gizmo.end_drag();
+            }
+        } else {
+            self.proc_gizmo.hovered_axis = crate::gizmo::pick_gizmo_axis_for_mode(
+                ray_o, ray_d, center, gizmo_size, self.gizmo.mode,
+            );
+
+            if self.build_mouse_left
+                && self.proc_gizmo.hovered_axis != crate::gizmo::GizmoAxis::None
+            {
+                // Capture starting state. Same branching as the entity
+                // gizmo — the start point depends on which handle was
+                // grabbed so drag math projects from the right origin.
+                let start_point = match (self.gizmo.mode, self.proc_gizmo.hovered_axis) {
+                    (crate::gizmo::GizmoMode::Rotate,
+                     crate::gizmo::GizmoAxis::X
+                     | crate::gizmo::GizmoAxis::Y
+                     | crate::gizmo::GizmoAxis::Z) => {
+                        let axis_dir = self.proc_gizmo.hovered_axis.direction();
+                        crate::gizmo::project_to_plane(ray_o, ray_d, center, axis_dir)
+                            .unwrap_or(center)
+                    }
+                    (_,
+                     crate::gizmo::GizmoAxis::XY
+                     | crate::gizmo::GizmoAxis::XZ
+                     | crate::gizmo::GizmoAxis::YZ) => {
+                        let normal = self.proc_gizmo.hovered_axis.plane_normal();
+                        crate::gizmo::project_to_plane(ray_o, ray_d, center, normal)
+                            .unwrap_or(center)
+                    }
+                    (_,
+                     crate::gizmo::GizmoAxis::X
+                     | crate::gizmo::GizmoAxis::Y
+                     | crate::gizmo::GizmoAxis::Z) => {
+                        let axis_dir = self.proc_gizmo.hovered_axis.direction();
+                        let t = crate::gizmo::ray_axis_closest_point(
+                            ray_o, ray_d, center, axis_dir,
+                        );
+                        center + axis_dir * t
+                    }
+                    _ => crate::gizmo::project_to_plane(ray_o, ray_d, center, -ray_d)
+                        .unwrap_or(center),
+                };
+
+                // Decompose current LOCAL transform once for later
+                // reconstruction during drag.
+                let local_t = current_local.translation.into();
+                let m = current_local.matrix3;
+                let sx = glam::Vec3::from(m.x_axis).length();
+                let sy = glam::Vec3::from(m.y_axis).length();
+                let sz = glam::Vec3::from(m.z_axis).length();
+                let local_s = glam::Vec3::new(sx.max(1e-8), sy.max(1e-8), sz.max(1e-8));
+                let rot_mat = glam::Mat3::from_cols(
+                    (glam::Vec3::from(m.x_axis) / local_s.x).into(),
+                    (glam::Vec3::from(m.y_axis) / local_s.y).into(),
+                    (glam::Vec3::from(m.z_axis) / local_s.z).into(),
+                );
+                let local_r = glam::Quat::from_mat3(&rot_mat);
+
+                let parent_rot = decompose_affine_rotation(&parent_world);
+                let world_rot = parent_rot * local_r;
+                let forward = (center - cam_pos).normalize();
+
+                self.proc_gizmo_parent_world = parent_world;
+                self.proc_gizmo_initial_local = (local_t, local_r, local_s);
+                self.proc_gizmo.pivot = center;
+                self.proc_gizmo.begin_drag(
+                    self.proc_gizmo.hovered_axis,
+                    start_point,
+                    center,
+                    world_rot,
+                    local_s,
+                    forward,
+                );
+            }
+        }
+    }
+
+    /// Wireframe for the procedural-node gizmo drawn on the BUILD viewport.
+    ///
+    /// Returns an empty vec when:
+    /// - no entity selected,
+    /// - the selected entity has no `ProceduralGeometry`,
+    /// - no procedural node is selected,
+    /// - the selected node can't be reached from the root (stale snapshot).
+    ///
+    /// The gizmo sits at the node's origin in world space — entity world
+    /// transform × accumulated parent transforms × the node's own
+    /// transform, all applied to (0,0,0). Axes stay world-aligned
+    /// (matches the entity gizmo's convention).
+    fn build_procedural_gizmo_wireframe(
+        &self,
+        cam_pos: glam::Vec3,
+    ) -> Vec<rkf_render::LineVertex> {
+        let node_id = match self.selected_procedural_node {
+            Some(id) => id,
+            None => return Vec::new(),
+        };
+        let entity = match self.selected_entity {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+
+        let Ok(proc_geo) = self
+            .world
+            .get::<&crate::components::ProceduralGeometry>(entity)
+        else {
+            return Vec::new();
+        };
+        let Ok(entity_xform) = self
+            .world
+            .get::<&crate::components::Transform>(entity)
+        else {
+            return Vec::new();
+        };
+
+        // Walk root → selected node, accumulating parent transforms.
+        let tree = &proc_geo.tree;
+        let target = rkp_procedural::NodeId(node_id);
+        let mut path: Vec<rkp_procedural::NodeId> = Vec::new();
+        if !find_path(tree, tree.root(), target, &mut path) {
+            return Vec::new();
+        }
+
+        // Compose entity world × each transform on the path. Path is
+        // root-first and includes the target node, so the last multiply
+        // pulls in the target's own local transform — which is what we
+        // want: gizmo sits at the node's rotated/scaled/translated origin.
+        let entity_world = glam::Affine3A::from_scale_rotation_translation(
+            entity_xform.scale,
+            glam::Quat::from_euler(
+                glam::EulerRot::XYZ,
+                entity_xform.rotation.x.to_radians(),
+                entity_xform.rotation.y.to_radians(),
+                entity_xform.rotation.z.to_radians(),
+            ),
+            entity_xform.position,
+        );
+        let mut accum = entity_world;
+        for id in &path {
+            if let Some(n) = tree.get(*id) {
+                accum = accum * n.transform;
+            }
+        }
+        let center = accum.transform_point3(glam::Vec3::ZERO);
+
+        let cam_dist = (center - cam_pos).length().max(0.1);
+        let gizmo_size = cam_dist * 0.15;
+        // Use proc_gizmo's hover/drag axis so the handle highlights
+        // correctly while the user is interacting with BUILD — gizmo
+        // mode itself is shared with MAIN's toolbar.
+        let hovered = if self.proc_gizmo.dragging {
+            self.proc_gizmo.active_axis
+        } else {
+            self.proc_gizmo.hovered_axis
+        };
+        match self.gizmo.mode {
+            crate::gizmo::GizmoMode::Translate => {
+                crate::wireframe_builders::translate_gizmo_wireframe(
+                    center, gizmo_size, hovered, cam_pos,
+                )
+            }
+            crate::gizmo::GizmoMode::Rotate => {
+                crate::wireframe_builders::rotate_gizmo_wireframe(
+                    center, gizmo_size, hovered, cam_pos,
+                )
+            }
+            crate::gizmo::GizmoMode::Scale => {
+                crate::wireframe_builders::scale_gizmo_wireframe(
+                    center, gizmo_size, hovered, cam_pos,
+                )
+            }
+        }
+    }
+
     /// Rebuild collider caches for all entities with RigidBody.
     /// Called when geometry changes, RigidBody is added/modified, etc.
     fn rebuild_collider_caches(&mut self) {
@@ -3310,17 +3879,37 @@ impl EngineState {
     /// Phase 4: rays come from MAIN's camera — sculpt/paint/picking are
     /// MAIN-only operations.
     fn screen_to_ray(&self, px: f32, py: f32) -> (glam::Vec3, glam::Vec3) {
-        let cam = self.build_camera_uniforms(crate::viewport::ViewportId::MAIN);
+        self.screen_to_ray_for_viewport(crate::viewport::ViewportId::MAIN, px, py)
+    }
+
+    /// Unproject a pixel position to a world-space ray through the
+    /// given viewport's camera. Each viewport has its own camera +
+    /// resolution — BUILD's turntable ray lands on the procedural's
+    /// gizmo handles, not on MAIN's fly-cam scene.
+    fn screen_to_ray_for_viewport(
+        &self,
+        viewport_id: crate::viewport::ViewportId,
+        px: f32,
+        py: f32,
+    ) -> (glam::Vec3, glam::Vec3) {
+        let cam = self.build_camera_uniforms(viewport_id);
+        let (vw, vh) = self
+            .viewports
+            .get(viewport_id)
+            .map(|v| (v.width as f32, v.height as f32))
+            .unwrap_or((self.width as f32, self.height as f32));
+
         let vp = glam::Mat4::from_cols_array_2d(&cam.view_proj);
         let inv_vp = vp.inverse();
 
-        let ndc_x = (px / self.width as f32) * 2.0 - 1.0;
-        let ndc_y = 1.0 - (py / self.height as f32) * 2.0;
+        let ndc_x = (px / vw) * 2.0 - 1.0;
+        let ndc_y = 1.0 - (py / vh) * 2.0;
 
         let near = inv_vp.project_point3(glam::Vec3::new(ndc_x, ndc_y, -1.0));
         let far = inv_vp.project_point3(glam::Vec3::new(ndc_x, ndc_y, 1.0));
         let dir = (far - near).normalize();
-        (self.camera.position, dir)
+        let origin = glam::Vec3::new(cam.position[0], cam.position[1], cam.position[2]);
+        (origin, dir)
     }
 
     fn process_pick_result(&mut self) {
@@ -3465,6 +4054,92 @@ impl EngineState {
 /// Adds margin around the tight bounds and ensures the octree depth won't
 /// exceed MAX_DEPTH (11). If the object is too large for the requested voxel
 /// size, the voxel size is increased to fit.
+/// Walk the procedural tree to find the path from `start` to `target`.
+///
+/// Writes the sequence of node IDs (including both endpoints) into
+/// `out_path` when a match is found and returns `true`. Returns `false`
+/// (and leaves `out_path` empty) if `target` isn't reachable from
+/// `start` — a possible state if the snapshot a caller is holding has
+/// drifted from the current tree.
+fn find_path(
+    tree: &rkp_procedural::ProceduralObject,
+    start: rkp_procedural::NodeId,
+    target: rkp_procedural::NodeId,
+    out_path: &mut Vec<rkp_procedural::NodeId>,
+) -> bool {
+    out_path.push(start);
+    if start == target {
+        return true;
+    }
+    if let Some(node) = tree.get(start) {
+        for &child in &node.children {
+            if find_path(tree, child, target, out_path) {
+                return true;
+            }
+        }
+    }
+    out_path.pop();
+    false
+}
+
+/// Find the leaf node whose local SDF is closest to zero at the given
+/// procedural-local world position `p`.
+///
+/// Used by BUILD picking to map a click-ray hit back onto a specific
+/// sub-shape. Walks the tree recursively, transforming `p` into each
+/// node's local space as we descend; at every leaf, evaluates the
+/// leaf's SDF and tracks the minimum absolute distance. Combinator
+/// rules (intersect/subtract) are intentionally ignored — we want
+/// "which leaf surface did the click land on?", not "which combinator
+/// shape dominates here?"
+fn nearest_leaf_at(
+    tree: &rkp_procedural::ProceduralObject,
+    p: glam::Vec3,
+    voxel_size: f32,
+) -> Option<u32> {
+    fn walk(
+        tree: &rkp_procedural::ProceduralObject,
+        id: rkp_procedural::NodeId,
+        pos: glam::Vec3,
+        voxel_size: f32,
+        best: &mut Option<(u32, f32)>,
+    ) {
+        let Some(node) = tree.get(id) else { return };
+        let local = node.transform.inverse().transform_point3(pos);
+        if node.kind.is_leaf() {
+            let sample = rkp_procedural::eval_leaf(local, &node.kind, voxel_size);
+            let d = sample.distance.abs();
+            match best {
+                Some((_, best_d)) if *best_d <= d => {}
+                _ => *best = Some((id.0, d)),
+            }
+        } else {
+            for &child in &node.children {
+                walk(tree, child, local, voxel_size, best);
+            }
+        }
+    }
+    let mut best = None;
+    walk(tree, tree.root(), p, voxel_size, &mut best);
+    best.map(|(id, _)| id)
+}
+
+/// Extract the rotation component from an `Affine3A` by normalizing
+/// the 3×3 matrix's columns to remove per-axis scale. Matches the
+/// decomposition used in `procedural_snapshot::decompose_affine`.
+fn decompose_affine_rotation(t: &glam::Affine3A) -> glam::Quat {
+    let m = t.matrix3;
+    let sx = glam::Vec3::from(m.x_axis).length().max(1e-8);
+    let sy = glam::Vec3::from(m.y_axis).length().max(1e-8);
+    let sz = glam::Vec3::from(m.z_axis).length().max(1e-8);
+    let rot_mat = glam::Mat3::from_cols(
+        (glam::Vec3::from(m.x_axis) / sx).into(),
+        (glam::Vec3::from(m.y_axis) / sy).into(),
+        (glam::Vec3::from(m.z_axis) / sz).into(),
+    );
+    glam::Quat::from_mat3(&rot_mat)
+}
+
 fn procedural_voxel_params(tree: &rkp_procedural::ProceduralObject, base_voxel_size: f32) -> (rkf_core::Aabb, f32) {
     let tight = rkp_procedural::compute_bounds(tree);
 
@@ -3696,8 +4371,14 @@ fn tick_loop(
         );
         state.sync_main_viewport_from_legacy_camera();
 
-        // 3. Update gizmo hover + drag.
+        // 3. Update gizmo hover + drag — MAIN targets the entity
+        // transform, BUILD targets the selected procedural node.
         state.update_gizmo();
+        state.update_procedural_gizmo();
+        // 3b. BUILD left-click picking — runs after the gizmo so a
+        // click grabbing a handle begins a drag here rather than
+        // re-selecting the node underneath.
+        state.maybe_pick_procedural_node();
 
         // 4. Render frame — fires `frame_callback` once per visible viewport.
         state.render_frame(&frame_callback);

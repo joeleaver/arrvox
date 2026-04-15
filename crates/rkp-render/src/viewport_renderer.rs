@@ -21,6 +21,7 @@ use crate::rkp_ssao::RkpSsaoPass;
 use crate::rkp_shade::RkpShadePass;
 use crate::rkp_volumetric::RkpVolumetricPass;
 use crate::rkp_god_rays::RkpGodRayPass;
+use crate::rkp_grid::RkpGridPass;
 
 pub struct ViewportRenderer {
     // ── Per-VR scene binding ────────────────────────────────────────
@@ -52,6 +53,9 @@ pub struct ViewportRenderer {
     pub readback_index: usize,
     pub readback_ready: bool,
     pub wireframe_pass: rkf_render::WireframePass,
+    /// Isolation-mode infinite grid overlay. Always constructed; the
+    /// host only dispatches it when the viewport's mode is `Isolation`.
+    pub grid: RkpGridPass,
     pub width: u32,
     pub height: u32,
 }
@@ -142,6 +146,10 @@ impl ViewportRenderer {
 
         let wireframe_pass = rkf_render::WireframePass::new(device, rkf_render::LDR_FORMAT);
 
+        let mut grid = RkpGridPass::new(device, rkf_render::LDR_FORMAT);
+        grid.set_bindings(device, &camera_buffer, &gbuffer.position_view);
+        grid.update_params(queue, &crate::rkp_grid::GridParams::default());
+
         let composite_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("rkp composite"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -164,7 +172,7 @@ impl ViewportRenderer {
             gbuffer, bloom, bloom_composite, tone_map,
             composite_texture, composite_view,
             readback_buffers, readback_index: 0, readback_ready: false,
-            wireframe_pass, width, height,
+            wireframe_pass, grid, width, height,
         }
     }
 
@@ -261,6 +269,10 @@ impl ViewportRenderer {
             view_formats: &[],
         });
         self.composite_view = self.composite_texture.create_view(&Default::default());
+
+        // Grid: rebind to the new gbuffer position view (camera buffer
+        // is stable across resize so it doesn't need re-wiring).
+        self.grid.set_bindings(device, &self.camera_buffer, &self.gbuffer.position_view);
 
         // Env-dirty path applies bloom/tonemap params — the engine re-fires it
         // after a resize so VRs rebuilt their bloom/tonemap from defaults here

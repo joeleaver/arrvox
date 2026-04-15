@@ -38,6 +38,11 @@ pub struct ProceduralNodeInfo {
     pub is_root: bool,
     /// Local translation (from node transform).
     pub position: [f32; 3],
+    /// Local rotation, Euler degrees (XYZ order) — decomposed from the
+    /// node's `Affine3A`. Matches the entity Transform convention.
+    pub rotation: [f32; 3],
+    /// Local scale factor per axis.
+    pub scale: [f32; 3],
     /// Editable parameters for this node.
     pub params: Vec<ProceduralParam>,
 }
@@ -159,7 +164,7 @@ pub fn build_procedural_snapshot(
             ),
         };
 
-        let translation = node.transform.translation;
+        let (position, rotation_deg, scale) = decompose_affine(&node.transform);
         nodes.push(ProceduralNodeInfo {
             id: id.0,
             name,
@@ -167,7 +172,9 @@ pub fn build_procedural_snapshot(
             children: node.children.iter().map(|c| c.0).collect(),
             is_leaf: node.kind.is_leaf(),
             is_root: id == tree.root(),
-            position: [translation.x, translation.y, translation.z],
+            position,
+            rotation: rotation_deg,
+            scale,
             params,
         });
     }
@@ -179,6 +186,36 @@ pub fn build_procedural_snapshot(
         selected_node,
         voxel_size,
     }
+}
+
+/// Split a node's local `Affine3A` into translation, Euler rotation
+/// (degrees, XYZ order), and per-axis scale.
+///
+/// The node transforms stored on the tree are always rigid-uniform +
+/// non-uniform scale composed by the builder (`from_scale_rotation_
+/// translation`). Decomposition therefore does NOT need to handle
+/// shear — we extract per-axis scale as column lengths of the upper
+/// 3×3, strip it out to get the pure rotation matrix, then convert to
+/// a quaternion and into XYZ Euler degrees.
+fn decompose_affine(t: &glam::Affine3A) -> ([f32; 3], [f32; 3], [f32; 3]) {
+    let translation = t.translation;
+    let m = t.matrix3;
+    let sx = Vec3::from(m.x_axis).length();
+    let sy = Vec3::from(m.y_axis).length();
+    let sz = Vec3::from(m.z_axis).length();
+    let safe = |v: f32| if v.abs() < 1e-8 { 1.0 } else { v };
+    let rot_mat = glam::Mat3::from_cols(
+        (Vec3::from(m.x_axis) / safe(sx)).into(),
+        (Vec3::from(m.y_axis) / safe(sy)).into(),
+        (Vec3::from(m.z_axis) / safe(sz)).into(),
+    );
+    let quat = glam::Quat::from_mat3(&rot_mat);
+    let (x, y, z) = quat.to_euler(glam::EulerRot::XYZ);
+    (
+        [translation.x, translation.y, translation.z],
+        [x.to_degrees(), y.to_degrees(), z.to_degrees()],
+        [sx, sy, sz],
+    )
 }
 
 fn sphere_params(p: &rkp_procedural::node_kind::SphereParams) -> Vec<ProceduralParam> {

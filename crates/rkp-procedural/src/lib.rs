@@ -19,6 +19,7 @@ pub use arena::{Node, NodeId, ProceduralObject};
 pub use bounds::compute_bounds;
 pub use combine::{combine_intersect, combine_subtract, combine_union};
 pub use evaluate::sample_tree;
+pub use leaves::eval_leaf;
 pub use node_kind::{MaterialCombine, NodeKind};
 pub use sample::Sample;
 pub use version::{bump_node_version, is_stale, subtree_version};

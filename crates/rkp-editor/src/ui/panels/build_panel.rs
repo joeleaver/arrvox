@@ -251,6 +251,8 @@ fn render_node_params(
     let params = Memo::new(move || node_info.get().map(|n| n.params.clone()).unwrap_or_default());
     let is_root = Memo::new(move || node_info.get().map(|n| n.is_root).unwrap_or(true));
     let position = Memo::new(move || node_info.get().map(|n| n.position).unwrap_or([0.0; 3]));
+    let rotation = Memo::new(move || node_info.get().map(|n| n.rotation).unwrap_or([0.0; 3]));
+    let scale = Memo::new(move || node_info.get().map(|n| n.scale).unwrap_or([1.0; 3]));
 
     let collapsed = Signal::new(false);
 
@@ -264,9 +266,15 @@ fn render_node_params(
         None
     };
 
-    // Position control — prop_vec3 needs a Signal, bridge from snapshot.
+    // Transform controls. Each `prop_vec3` wants a Signal; we bridge
+    // from the snapshot Memos. The signals are local to this render —
+    // prop_vec3 reads the initial value on mount and only fires
+    // on_change on user edit, so missing back-propagation from the
+    // Memo is not a correctness issue for text-entry/drag interactions.
     let pos_signal = Signal::new(position.get());
-    // Build the position control eagerly (before rsx) to avoid Rc move issues.
+    let rot_signal = Signal::new(rotation.get());
+    let scale_signal = Signal::new(scale.get());
+
     let pos_control = {
         let on_change: Rc<dyn Fn([f32; 3])> = Rc::new(move |val: [f32; 3]| {
             let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralNodePosition {
@@ -276,14 +284,35 @@ fn render_node_params(
         });
         prop_vec3(__scope, "Position", pos_signal, on_change)
     };
+    let rot_control = {
+        let on_change: Rc<dyn Fn([f32; 3])> = Rc::new(move |val: [f32; 3]| {
+            let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralNodeRotation {
+                node_id: node_id.get(),
+                rotation_deg: glam::Vec3::from(val),
+            });
+        });
+        prop_vec3(__scope, "Rotation", rot_signal, on_change)
+    };
+    let scale_control = {
+        let on_change: Rc<dyn Fn([f32; 3])> = Rc::new(move |val: [f32; 3]| {
+            let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralNodeScale {
+                node_id: node_id.get(),
+                scale: glam::Vec3::from(val),
+            });
+        });
+        prop_vec3(__scope, "Scale", scale_signal, on_change)
+    };
 
     rsx! {
         div {
             {prop_section_header(__scope, &node_name.get(), collapsed, on_remove)}
-            // Position always visible (not inside collapsible)
+            // Transform block — always visible (not inside the collapsible
+            // params section) since it's the primary handle for any node.
             div {
-                style: "padding:4px 0;",
+                style: "padding:4px 0;display:flex;flex-direction:column;gap:2px;",
                 {pos_control}
+                {rot_control}
+                {scale_control}
             }
             if !collapsed.get() {
                 div {

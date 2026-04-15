@@ -99,10 +99,25 @@ pub enum EngineCommand {
         tier: String,
     },
 
-    /// Set the local position of a procedural node.
+    /// Set the local position of a procedural node. Rotation + scale
+    /// on the node are preserved.
     SetProceduralNodePosition {
         node_id: u32,
         position: Vec3,
+    },
+
+    /// Set the local rotation of a procedural node (Euler degrees,
+    /// XYZ order). Position + scale are preserved.
+    SetProceduralNodeRotation {
+        node_id: u32,
+        rotation_deg: Vec3,
+    },
+
+    /// Set the local scale factor of a procedural node. Position +
+    /// rotation are preserved.
+    SetProceduralNodeScale {
+        node_id: u32,
+        scale: Vec3,
     },
 
     /// Set a parameter on a procedural node.
@@ -363,6 +378,13 @@ pub enum EngineCommand {
     /// persistent `editor_camera`.
     ClearViewportCamera {
         id: ViewportId,
+    },
+
+    /// Switch a viewport between full-pipeline (`InSitu`) and stripped
+    /// preview (`Isolation`) rendering. Drives pass gating + grid overlay.
+    SetViewportMode {
+        id: ViewportId,
+        mode: rkp_render::RenderMode,
     },
 
     /// Select an entity (for UI highlight and inspector).
