@@ -146,15 +146,28 @@ pub fn BuildViewport() -> NodeHandle {
     }
 
     let cmd_tx = cmd.0.clone();
+    let surface_for_handler = surface.clone();
+    // Track the last dispatched size so we only fire Resize on actual
+    // changes (every event fires the handler; don't spam the channel).
+    let last_size = std::cell::Cell::new((0u32, 0u32));
     surface.set_event_handler(move |event| {
         use SurfaceEvent::*;
 
-        // We deliberately do NOT send Resize here. All VRs share the
-        // renderer's resolution (driven by MAIN) and the BuildSurface
-        // panel scales the received image via CSS. Sending a BUILD
-        // Resize would either desync the shared pass outputs (if the
-        // engine honored it) or be a no-op (it does today). Explicit
-        // comment in case the panel layout tempts someone to re-add it.
+        // Relay panel size to the engine so BUILD's VR renders at the
+        // panel's native resolution. Each VR has its own pass chain
+        // now (Phase 6 pass-internal split), so this doesn't clobber
+        // MAIN's resources.
+        {
+            let (w, h) = surface_for_handler.layout_size();
+            let w = w.max(64);
+            let h = h.max(64);
+            if last_size.get() != (w, h) {
+                last_size.set((w, h));
+                let _ = cmd_tx.send(rkp_engine::EngineCommand::Resize {
+                    id: PANEL_VIEWPORT, width: w, height: h,
+                });
+            }
+        }
 
         match event {
             MouseDown { button, x, y } => {
