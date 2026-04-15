@@ -379,6 +379,19 @@ mod tests {
     }
 
     #[test]
+    fn play_mode_mask_includes_ui_excludes_editor_only() {
+        // Locks the convention used by EngineState's
+        // enter_play_mode_viewports: play-mode shows HUD, hides editor
+        // gizmos. If someone reshuffles the layer bits this fires.
+        let play = layer::DEFAULT | layer::UI;
+        let edit = layer::DEFAULT | layer::EDITOR_ONLY;
+        assert_ne!(play & layer::UI, 0);
+        assert_eq!(play & layer::EDITOR_ONLY, 0);
+        assert_ne!(edit & layer::EDITOR_ONLY, 0);
+        assert_eq!(edit & layer::UI, 0);
+    }
+
+    #[test]
     fn runtime_override_clears_to_none() {
         let mut viewports = Viewports::new();
         viewports.insert(Viewport::new_main(800, 600));

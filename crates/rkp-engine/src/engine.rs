@@ -767,6 +767,67 @@ impl EngineState {
         rgba8
     }
 
+    /// On PlayStart: hand the MAIN viewport over to the active scene
+    /// camera (if one exists) and flip its layer mask so editor-only
+    /// helpers vanish and HUD becomes visible.
+    fn enter_play_mode_viewports(&mut self) {
+        use crate::components::Camera;
+        use crate::viewport::{layer, CameraSource, SceneFilter, ViewportId};
+
+        // Find the scene camera flagged active. If multiple are flagged,
+        // pick the first the iteration yields — scene authoring should
+        // ensure exactly one.
+        let scene_cam = self.world.query::<&Camera>().iter()
+            .find(|(_, c)| c.active)
+            .map(|(e, _)| e);
+
+        if let Some(main) = self.viewports.get_mut(ViewportId::MAIN) {
+            if let Some(entity) = scene_cam {
+                main.runtime_override = Some(CameraSource::Entity(entity));
+            } else {
+                self.console.warn("Play mode: no active scene camera found, \
+                                   keeping editor camera");
+            }
+            main.filter = SceneFilter {
+                base_layers: layer::DEFAULT | layer::UI,
+                focus_entity: None,
+            };
+        }
+    }
+
+    /// On PlayStop: clear the runtime override and restore the editor
+    /// layer mask. The editor camera state was untouched throughout play
+    /// mode, so the user lands exactly where they left off.
+    fn exit_play_mode_viewports(&mut self) {
+        use crate::viewport::{layer, SceneFilter, ViewportId};
+        if let Some(main) = self.viewports.get_mut(ViewportId::MAIN) {
+            main.runtime_override = None;
+            main.filter = SceneFilter {
+                base_layers: layer::DEFAULT | layer::EDITOR_ONLY,
+                focus_entity: None,
+            };
+        }
+    }
+
+    /// Read the `(position, yaw, pitch, fov, near, far)` 6-tuple from a
+    /// scene-camera entity. Returns `None` if the entity is missing
+    /// either a `Transform` or `Camera` component, or has been despawned —
+    /// callers fall back to the editor camera in that case.
+    ///
+    /// Yaw/pitch derive from the Transform's Euler rotation: yaw is Y in
+    /// radians, pitch is X in radians (matching the editor's fly-camera
+    /// convention so play-mode → edit-mode "Look Through" stays continuous).
+    fn read_entity_camera(&self, entity: hecs::Entity)
+        -> Option<(glam::Vec3, f32, f32, f32, f32, f32)>
+    {
+        use crate::components::{Camera, Transform};
+        let transform = self.world.get::<&Transform>(entity).ok()?;
+        let cam = self.world.get::<&Camera>(entity).ok()?;
+        let yaw = transform.rotation.y.to_radians();
+        let pitch = transform.rotation.x.to_radians();
+        Some((transform.position, yaw, pitch, cam.fov, cam.near, cam.far))
+    }
+
     /// Mirror the legacy `self.camera` state into `viewports[MAIN].editor_camera`.
     /// Phase 1 keeps the legacy field as the source of truth; the viewport copy
     /// is kept in sync so later phases can flip the dependency direction
@@ -788,16 +849,22 @@ impl EngineState {
     fn build_camera_uniforms(&self, viewport_id: crate::viewport::ViewportId)
         -> rkp_render::rkp_scene::CameraUniforms
     {
-        use crate::viewport::{EditorCamera, ViewportId};
+        use crate::viewport::{CameraSource, EditorCamera, ViewportId};
         let viewport = self.viewports
             .get(viewport_id)
             .expect("build_camera_uniforms: viewport must exist");
 
-        // MAIN's camera state still lives on the legacy `self.camera` field
-        // (Phase 1 syncs it into `viewport.editor_camera` for forward-compat).
-        // Other viewports read directly from their own `editor_camera`.
-        // `runtime_override` resolution lands in Phase 5.
-        let (position, yaw, pitch, fov, near, far) = if viewport_id == ViewportId::MAIN {
+        // Camera resolution priority (Phase 5):
+        //   1. runtime_override → entity's Transform + Camera components
+        //   2. MAIN: legacy `self.camera` (still source of truth, synced
+        //      into editor_camera by sync_main_viewport_from_legacy_camera)
+        //   3. Other viewports: their own editor_camera
+        let from_entity = viewport.runtime_override.and_then(|src| match src {
+            CameraSource::Entity(entity) => self.read_entity_camera(entity),
+        });
+        let (position, yaw, pitch, fov, near, far) = if let Some(c) = from_entity {
+            c
+        } else if viewport_id == ViewportId::MAIN {
             (self.camera.position, self.camera.yaw, self.camera.pitch,
              self.camera.fov, self.camera.near, self.camera.far)
         } else {
@@ -1748,6 +1815,7 @@ impl EngineState {
                     }
                     self.play_total_time = 0.0;
                     self.play_frame_count = 0;
+                    self.enter_play_mode_viewports();
                 }
             }
 
@@ -1757,6 +1825,7 @@ impl EngineState {
                     self.behavior_executor = None;
                     self.gpu_objects_dirty = true;
                     self.console.info("Play mode stopped — transforms restored");
+                    self.exit_play_mode_viewports();
                 }
             }
 
