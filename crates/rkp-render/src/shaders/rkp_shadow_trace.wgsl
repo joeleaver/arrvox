@@ -103,7 +103,7 @@ struct OctreeResult {
 // Group 2: march params + materials + stats + lights (shared with march).
 @group(2) @binding(0) var<uniform> march_params: MarchParams;
 @group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
-@group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 52>;
+@group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 64>;
 @group(2) @binding(3) var<storage, read> screen_aabbs: array<vec4<f32>>;
 @group(2) @binding(4) var<storage, read> lights: array<GpuLight>;
 
