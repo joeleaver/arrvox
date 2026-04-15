@@ -32,7 +32,7 @@ struct VoxelSample {
     word1: u32,
 }
 
-// Must match RkpGpuObject layout (192 bytes).
+// Must match RkpGpuObject layout (256 bytes).
 struct RkpObject {
     world: mat4x4<f32>,
     aabb_min: vec3<f32>,
@@ -51,9 +51,10 @@ struct RkpObject {
     rest_octree_depth: u32,
     rest_octree_extent_bits: u32,
     deformed_pool_offset: u32,
+    layer_mask: u32,
     _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32,
     _pad4: u32, _pad5: u32, _pad6: u32, _pad7: u32,
-    _pad8: u32, _pad9: u32, _pad10: u32, _pad11: u32,
+    _pad8: u32, _pad9: u32, _pad10: u32,
 }
 
 struct EmitParams {

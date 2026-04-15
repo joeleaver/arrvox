@@ -33,9 +33,10 @@ struct RkpObject {
     bone_count: u32, bone_buffer_offset: u32,
     rest_octree_root: u32, rest_octree_depth: u32,
     rest_octree_extent_bits: u32, deformed_pool_offset: u32,
+    layer_mask: u32,
     _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32,
     _pad4: u32, _pad5: u32, _pad6: u32, _pad7: u32,
-    _pad8: u32, _pad9: u32, _pad10: u32, _pad11: u32,
+    _pad8: u32, _pad9: u32, _pad10: u32,
     inverse_world: mat4x4<f32>,
 }
 
@@ -43,6 +44,8 @@ struct CameraUniforms {
     position: vec4<f32>, forward: vec4<f32>,
     right: vec4<f32>, up: vec4<f32>,
     resolution: vec2<f32>, jitter: vec2<f32>,
+    layer_mask: u32, focus_object_id: u32,
+    _cam_pad0: u32, _cam_pad1: u32,
     prev_vp: mat4x4<f32>, view_proj: mat4x4<f32>,
 }
 
@@ -187,6 +190,10 @@ fn trace_shadow_ray(
     for (var oi = 0u; oi < num_objects && oi < MAX_OBJECTS; oi++) {
         let obj = objects[oi];
         if obj.geom_type == 0u { continue; }
+        // Same gate as primary visibility (Phase 2). SHADOW_ONLY semantics
+        // come later — they need a separate camera shadow_layer_mask.
+        if (obj.layer_mask & camera.layer_mask) == 0u
+            && obj.object_id != camera.focus_object_id { continue; }
 
         let inv_world = obj.inverse_world;
         let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;

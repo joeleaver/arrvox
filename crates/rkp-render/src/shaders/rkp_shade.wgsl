@@ -15,6 +15,10 @@ struct CameraUniforms {
     up: vec4<f32>,
     resolution: vec2<f32>,
     jitter: vec2<f32>,
+    layer_mask: u32,
+    focus_object_id: u32,
+    _cam_pad0: u32,
+    _cam_pad1: u32,
     prev_vp: mat4x4<f32>,
     view_proj: mat4x4<f32>,
 }

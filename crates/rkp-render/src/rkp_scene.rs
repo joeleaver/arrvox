@@ -9,7 +9,18 @@
 
 use crate::rkp_gpu_object::RkpGpuObject;
 
-/// Camera uniforms matching the WGSL CameraUniforms struct.
+/// Camera uniforms matching the WGSL `CameraUniforms` struct.
+///
+/// Layout (208 + 16 = 224 bytes):
+/// - 4×vec4<f32> camera basis (position, forward, right, up) — 64 B
+/// - resolution + jitter — 16 B
+/// - layer_mask + focus_object_id + 8 B padding — 16 B
+/// - prev_vp + view_proj — 128 B
+///
+/// `layer_mask`/`focus_object_id` come from the rendering viewport's
+/// `SceneFilter` (see `rkp_engine::viewport`). Defaults of `u32::MAX` for
+/// both keep all objects visible (mask matches everything; focus matches
+/// no real `object_id`, which are sequential from 0).
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraUniforms {
@@ -19,6 +30,9 @@ pub struct CameraUniforms {
     pub up: [f32; 4],
     pub resolution: [f32; 2],
     pub jitter: [f32; 2],
+    pub layer_mask: u32,
+    pub focus_object_id: u32,
+    pub _pad: [u32; 2],
     pub prev_vp: [[f32; 4]; 4],
     pub view_proj: [[f32; 4]; 4],
 }

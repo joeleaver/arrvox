@@ -881,6 +881,22 @@ impl EngineState {
         let proj = glam::Mat4::perspective_rh(fov_rad, aspect, self.camera.near, self.camera.far);
         let view_proj = proj * view;
 
+        // Render-layer + focus filter from the main viewport. u32::MAX
+        // defaults pass everything (no real object_id is u32::MAX since IDs
+        // are sequential from 0). Phase 1's `Viewports` always carries a
+        // MAIN entry, so the unwrap_or is purely belt-and-suspenders for
+        // the unreachable branch.
+        let (layer_mask, focus_object_id) = self.viewports
+            .get(crate::viewport::ViewportId::MAIN)
+            .map(|v| {
+                let focus_obj = v.filter.focus_entity
+                    .and_then(|e| self.entity_to_gpu.get(&e).copied())
+                    .map(|idx| idx as u32)
+                    .unwrap_or(u32::MAX);
+                (v.filter.base_layers, focus_obj)
+            })
+            .unwrap_or((u32::MAX, u32::MAX));
+
         rkp_render::rkp_scene::CameraUniforms {
             position: [self.camera.position.x, self.camera.position.y, self.camera.position.z, 1.0],
             forward: [forward.x, forward.y, forward.z, 0.0],
@@ -888,6 +904,9 @@ impl EngineState {
             up: [up.x * half_fov_tan, up.y * half_fov_tan, up.z * half_fov_tan, 0.0],
             resolution: [self.width as f32, self.height as f32],
             jitter: [0.0, 0.0],
+            layer_mask,
+            focus_object_id,
+            _pad: [0; 2],
             prev_vp: view_proj.to_cols_array_2d(),
             view_proj: view_proj.to_cols_array_2d(),
         }
@@ -2419,7 +2438,7 @@ impl EngineState {
                     depth: spatial.depth,
                     base_voxel_size: spatial.base_voxel_size,
                 };
-                let gpu_obj = crate::scene_sync::build_gpu_object(
+                let mut gpu_obj = crate::scene_sync::build_gpu_object(
                     &world_matrix,
                     &spatial.aabb,
                     &spatial_handle,
@@ -2427,6 +2446,13 @@ impl EngineState {
                     renderable.material_id,
                     gpu_idx,
                 );
+                // Render-layer mask — entity opt-in via RenderLayer
+                // component, otherwise the system DEFAULT bit.
+                gpu_obj.layer_mask = self
+                    .world
+                    .get::<&crate::viewport::RenderLayer>(entity)
+                    .map(|l| l.mask)
+                    .unwrap_or(crate::viewport::layer::DEFAULT);
                 if let Some(&scene_id) = self.entity_scene_ids.get(&entity) {
                     self.scene_id_to_gpu.insert(scene_id, gpu_idx);
                 }

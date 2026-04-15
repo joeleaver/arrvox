@@ -32,7 +32,8 @@ use bytemuck::{Pod, Zeroable};
 /// | 132    | 4    | rest_octree_depth (u32) |
 /// | 136    | 4    | rest_octree_extent_bits (u32) |
 /// | 140    | 4    | deformed_pool_offset (u32) |
-/// | 144    | 48   | _padding |
+/// | 144    | 4    | layer_mask (u32) — render-layer mask, gated against camera mask |
+/// | 148    | 44   | _padding |
 /// | 192    | 64   | inverse_world (mat4x4<f32>) — world→local |
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
@@ -77,8 +78,13 @@ pub struct RkpGpuObject {
     /// Offset into deformed bone-field pool.
     pub deformed_pool_offset: u32,
 
+    /// 32-bit render-layer mask. Visible to a viewport iff
+    /// `(layer_mask & camera.layer_mask) != 0  ||  object_id == camera.focus_object_id`.
+    /// Default per-entity is `viewport::layer::DEFAULT` (bit 0).
+    pub layer_mask: u32,
+
     /// Padding.
-    pub _padding: [u32; 12],
+    pub _padding: [u32; 11],
 
     /// Inverse world transform (world→local). Precomputed on CPU.
     pub inverse_world: [[f32; 4]; 4],
@@ -98,8 +104,21 @@ mod tests {
     use std::mem;
 
     #[test]
-    fn size_is_192_bytes() {
-        assert_eq!(mem::size_of::<RkpGpuObject>(), 192);
+    fn size_is_256_bytes() {
+        // The struct's WGSL twin sits at exactly this size; the layout doc
+        // comment above this struct lists every field offset. If this fires,
+        // the WGSL `RkpObject` declarations need matching adjustments.
+        assert_eq!(mem::size_of::<RkpGpuObject>(), 256);
+    }
+
+    #[test]
+    fn layer_mask_at_offset_144() {
+        // Verified by hand against the layout doc comment so the WGSL gate
+        // (`obj.layer_mask & camera.layer_mask`) reads the correct bytes.
+        let obj = RkpGpuObject::zeroed();
+        let base = &obj as *const _ as usize;
+        let field = &obj.layer_mask as *const _ as usize;
+        assert_eq!(field - base, 144);
     }
 
     #[test]
