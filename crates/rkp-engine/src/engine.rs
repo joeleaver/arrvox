@@ -51,6 +51,7 @@ fn spatial_from_handle(
     aabb: &rkf_core::Aabb,
     voxel_slot_start: u32,
     voxel_slot_count: u32,
+    brick_ids: Vec<u32>,
 ) -> SpatialData {
     if let rkf_core::scene_node::SpatialHandle::Octree {
         root_offset, len, depth, base_voxel_size,
@@ -65,12 +66,14 @@ fn spatial_from_handle(
             voxel_size,
             voxel_slot_start,
             voxel_slot_count,
+            brick_ids,
         }
     } else {
         SpatialData {
             root_offset: 0, len: 0, depth: 0, base_voxel_size: voxel_size,
             aabb: *aabb, voxel_size,
             voxel_slot_start, voxel_slot_count,
+            brick_ids,
         }
     }
 }
@@ -932,7 +935,7 @@ impl EngineState {
                     &primitive, 0, 0.05, glam::Vec3::ONE, scene_id,
                 );
                 if let Some(result) = result {
-                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count);
+                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
                     let entity = self.world.spawn((
                         Transform::default(),
                         EditorMetadata { name: name.clone() },
@@ -971,7 +974,7 @@ impl EngineState {
                     sdf_fn, &aabb, voxel_size, scene_id,
                 );
                 if let Some(result) = result {
-                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count);
+                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
                     let entity = self.world.spawn((
                         Transform::default(),
                         EditorMetadata { name: name.clone() },
@@ -1147,7 +1150,10 @@ impl EngineState {
                     Ok((handle, info)) => {
                         let raw_name = Self::display_name_from_path(&path);
                         let name = self.unique_name(&raw_name);
-                        let spatial = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.leaf_attr_slot_start, info.leaf_attr_slot_count);
+                        // Asset-backed entity — brick_ids stays empty.
+                        // Asset cache owns the shared brick range and frees
+                        // it on the final release_asset.
+                        let spatial = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.leaf_attr_slot_start, info.leaf_attr_slot_count, Vec::new());
                         let entity = self.world.spawn((
                             Transform::default(),
                             EditorMetadata { name: name.clone() },
@@ -2305,7 +2311,9 @@ impl EngineState {
                     depth: prev.depth,
                     base_voxel_size: prev.base_voxel_size,
                 };
-                self.scene_mgr.deallocate_geometry(&handle, prev.voxel_slot_start, prev.voxel_slot_count);
+                self.scene_mgr.deallocate_geometry(
+                    &handle, prev.voxel_slot_start, prev.voxel_slot_count, &prev.brick_ids,
+                );
             }
 
             let (aabb, voxel_size) = procedural_voxel_params(&tree_clone, base_voxel_size);
@@ -2318,7 +2326,7 @@ impl EngineState {
                 sdf_fn, &aabb, voxel_size, scene_id,
             ) {
                 Some(result) => {
-                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count);
+                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
 
                     if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
                         renderable.voxel_count = result.voxel_count;
@@ -2467,12 +2475,11 @@ impl EngineState {
 
         // Release geometry. Asset-backed entities go through the cache so
         // their leaf_attr/brick/octree ranges only free on the last instance
-        // release. Procedural entities (no asset_handle) directly deallocate
-        // their octree — their pool ranges are managed by
-        // deallocate_geometry at re-voxelize time, not here, which matches
-        // the existing behavior.
+        // release. Procedural entities (no asset_handle) free their own
+        // octree + leaf_attr range + brick ids via `deallocate_geometry`.
         if let Ok(renderable) = self.world.get::<&crate::components::Renderable>(entity) {
             if let Some(handle) = renderable.asset_handle {
+                drop(renderable);
                 self.scene_mgr.release_asset(handle);
             } else if let Some(ref spatial) = renderable.spatial {
                 let handle = rkp_core::OctreeHandle {
@@ -2481,7 +2488,11 @@ impl EngineState {
                     depth: spatial.depth,
                     base_voxel_size: spatial.base_voxel_size,
                 };
-                self.scene_mgr.octree.deallocate(handle);
+                let slot_start = spatial.voxel_slot_start;
+                let slot_count = spatial.voxel_slot_count;
+                let brick_ids = spatial.brick_ids.clone();
+                drop(renderable);
+                self.scene_mgr.deallocate_geometry(&handle, slot_start, slot_count, &brick_ids);
             }
         }
 
@@ -2634,7 +2645,7 @@ impl EngineState {
                         self.next_scene_id += 1;
                         match self.scene_mgr.acquire_asset(&full_path.to_string_lossy()) {
                             Ok((handle, info)) => {
-                                let spatial = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.leaf_attr_slot_start, info.leaf_attr_slot_count);
+                                let spatial = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.leaf_attr_slot_start, info.leaf_attr_slot_count, Vec::new());
                                 let e = self.world.spawn((transform, meta, Renderable {
                                     asset_path: Some(asset_path.clone()),
                                     material_id: obj.material_id,
@@ -2664,7 +2675,7 @@ impl EngineState {
                         self.scene_mgr.voxelize_primitive(
                             &primitive, obj.material_id, 0.05, glam::Vec3::ONE, sid,
                         ).map(|result| {
-                            let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count);
+                            let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
                             let e = self.world.spawn((transform, meta, Renderable {
                                 primitive: Some(prim_name.clone()),
                                 material_id: obj.material_id,

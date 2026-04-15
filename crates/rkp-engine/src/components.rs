@@ -67,6 +67,10 @@ pub struct SpatialData {
     /// Used to free the allocation when geometry is replaced.
     pub voxel_slot_start: u32,
     pub voxel_slot_count: u32,
+    /// Brick ids owned by this procedural allocation (empty for .rkp-backed
+    /// entities — those are managed by the asset cache). Used to free bricks
+    /// on re-voxelize or entity delete.
+    pub brick_ids: Vec<u32>,
 }
 
 /// Point light source.

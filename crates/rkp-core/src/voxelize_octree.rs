@@ -48,10 +48,11 @@ pub struct VoxelizeOctreeResult {
     /// First leaf_attr_pool slot used. Together with
     /// `leaf_attr_unique_count` this is the contiguous range to free.
     pub leaf_attr_slot_start: u32,
-    /// Number of bricks allocated by this voxelization.
-    pub brick_count: u32,
-    /// First brick id used.
-    pub brick_start: u32,
+    /// Every brick id allocated during this voxelization. `BrickPool::allocate`
+    /// may return ids reclaimed from the free list (e.g. from a prior asset
+    /// release), so the set isn't a contiguous range — track each id
+    /// explicitly so `deallocate_geometry` can free them later.
+    pub brick_ids: Vec<u32>,
     pub grid_origin: Vec3,
 }
 
@@ -95,7 +96,7 @@ where
     let mut attr_dedup: std::collections::HashMap<LeafAttr, u32> =
         std::collections::HashMap::new();
     let leaf_attr_slot_start = leaf_attr_pool.allocated_count();
-    let brick_start = brick_pool.allocated_count();
+    let mut brick_ids: Vec<u32> = Vec::new();
 
     // Center the octree on the AABB.
     let extent = octree.extent_world();
@@ -118,6 +119,7 @@ where
         brick_pool,
         &mut voxel_count,
         &mut attr_dedup,
+        &mut brick_ids,
         UVec3::ZERO,
         0,
         depth,
@@ -155,15 +157,12 @@ where
         );
     }
 
-    let brick_count = brick_pool.allocated_count() - brick_start;
-
     Some(VoxelizeOctreeResult {
         octree,
         voxel_count,
         leaf_attr_unique_count: attr_dedup.len() as u32,
         leaf_attr_slot_start,
-        brick_count,
-        brick_start,
+        brick_ids,
         grid_origin,
     })
 }
@@ -176,6 +175,7 @@ fn subdivide_node<F>(
     brick_pool: &mut BrickPool,
     voxel_count: &mut u32,
     attr_dedup: &mut std::collections::HashMap<LeafAttr, u32>,
+    brick_ids: &mut Vec<u32>,
     coord: UVec3,
     level: u8,
     max_depth: u8,
@@ -204,6 +204,7 @@ where
             // levels of tree descent with a single flat array lookup.
             if brick_depth == Some(level) {
                 let brick_id = brick_pool.allocate()?;
+                brick_ids.push(brick_id);
                 let cell_size = base_voxel_size;
                 for cz in 0..BRICK_DIM {
                     for cy in 0..BRICK_DIM {
@@ -321,6 +322,7 @@ where
                         brick_pool,
                         voxel_count,
                         attr_dedup,
+                        brick_ids,
                         child_coord,
                         level + 1,
                         max_depth,
@@ -424,7 +426,7 @@ mod tests {
         let r = voxelize_sphere_octree(Vec3::ZERO, 0.5, 0, 0.1, &mut attrs, &mut bricks).unwrap();
 
         assert!(r.voxel_count > 0, "should populate cells for the sphere surface");
-        assert!(r.brick_count > 0, "surface should be encoded as bricks at brick_depth");
+        assert!(!r.brick_ids.is_empty(), "surface should be encoded as bricks at brick_depth");
     }
 
     #[test]
@@ -447,7 +449,7 @@ mod tests {
         let r = voxelize_octree(|_| (1000.0, 0), &aabb, 0.1, &mut attrs, &mut bricks).unwrap();
 
         assert_eq!(r.voxel_count, 0);
-        assert_eq!(r.brick_count, 0);
+        assert_eq!(r.brick_ids.len(), 0);
         assert_eq!(r.octree.leaf_count(), 0);
     }
 
@@ -459,7 +461,7 @@ mod tests {
         let r = voxelize_octree(|_| (-1000.0, 0), &aabb, 0.1, &mut attrs, &mut bricks).unwrap();
 
         assert_eq!(r.voxel_count, 0, "fully inside should collapse to INTERIOR");
-        assert_eq!(r.brick_count, 0);
+        assert_eq!(r.brick_ids.len(), 0);
         assert_eq!(r.octree.as_slice()[0], INTERIOR_NODE);
     }
 

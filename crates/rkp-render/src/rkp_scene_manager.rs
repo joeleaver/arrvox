@@ -145,6 +145,10 @@ pub struct VoxelizeResult {
     pub leaf_attr_slot_start: u32,
     /// Number of leaf_attr slots allocated.
     pub leaf_attr_slot_count: u32,
+    /// Brick ids owned by this allocation — `deallocate_geometry` frees
+    /// them one at a time so procedurals don't leak bricks on
+    /// re-voxelize / delete.
+    pub brick_ids: Vec<u32>,
 }
 
 /// Emit face instances from an octree into the given buffer. Legacy —
@@ -646,6 +650,7 @@ impl RkpSceneManager {
             voxel_count: r.voxel_count,
             leaf_attr_slot_start: r.leaf_attr_slot_start,
             leaf_attr_slot_count: r.leaf_attr_unique_count,
+            brick_ids: r.brick_ids,
         })
     }
 
@@ -684,13 +689,27 @@ impl RkpSceneManager {
             voxel_count: r.voxel_count,
             leaf_attr_slot_start: r.leaf_attr_slot_start,
             leaf_attr_slot_count: r.leaf_attr_unique_count,
+            brick_ids: r.brick_ids,
         })
     }
 
-    /// Deallocate geometry previously produced by voxelize_*.
-    pub fn deallocate_geometry(&mut self, spatial: &rkp_core::OctreeHandle, leaf_attr_slot_start: u32, leaf_attr_slot_count: u32) {
+    /// Deallocate geometry previously produced by voxelize_*. Frees the
+    /// octree, the leaf_attr range, and every brick that voxelization
+    /// allocated. Bricks are freed one at a time via `BrickPool::deallocate`
+    /// (no contiguous range guarantee — `voxelize_octree` may reuse freed
+    /// brick ids from the pool's free list on the way down the tree).
+    pub fn deallocate_geometry(
+        &mut self,
+        spatial: &rkp_core::OctreeHandle,
+        leaf_attr_slot_start: u32,
+        leaf_attr_slot_count: u32,
+        brick_ids: &[u32],
+    ) {
         self.octree.deallocate(*spatial);
         self.leaf_attr_pool.deallocate_range(leaf_attr_slot_start, leaf_attr_slot_count);
+        for &id in brick_ids {
+            self.brick_pool.deallocate(id);
+        }
     }
 }
 
