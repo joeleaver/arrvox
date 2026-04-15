@@ -137,17 +137,32 @@ where
     //                            children adjacently. Pure data-layout pass;
     //                            same tree semantics, just better L2 hit
     //                            rate on warp-coherent ray descents.
+    //   prefilter_internals()  — bottom-up walk that emits a prefiltered
+    //                            LeafAttr for each branch node, enabling
+    //                            the GPU march's screen-footprint early
+    //                            exit. Shares attr_dedup with the leaf
+    //                            allocations above, so any new attrs bump
+    //                            the existing contiguous pool range.
     let nodes_before_compact = octree.node_count();
     octree.compact();
     let nodes_after_compact = octree.node_count();
     octree.deduplicate_subtrees();
     let nodes_after_dedup = octree.node_count();
     octree.morton_reorder();
+    let attrs_before_prefilter = attr_dedup.len();
+    crate::prefilter::prefilter_octree_internals(
+        &mut octree,
+        leaf_attr_pool,
+        brick_pool,
+        &mut attr_dedup,
+    );
+    let attrs_after_prefilter = attr_dedup.len();
     if nodes_before_compact >= 10_000 {
         eprintln!(
-            "[voxelize_octree] leaves={}  unique_attrs={}  octree {} → compact {} → dedup {} ({:.1}× total)",
+            "[voxelize_octree] leaves={}  unique_attrs={}(+{} prefilter)  octree {} → compact {} → dedup {} ({:.1}× total)",
             voxel_count,
-            attr_dedup.len(),
+            attrs_before_prefilter,
+            attrs_after_prefilter - attrs_before_prefilter,
             nodes_before_compact,
             nodes_after_compact,
             nodes_after_dedup,
@@ -242,7 +257,14 @@ where
                             let leaf_attr_id = if let Some(&existing) = attr_dedup.get(&attr) {
                                 existing
                             } else {
-                                let id = leaf_attr_pool.allocate()?;
+                                // Bump-only allocate — the asset's full attr
+                                // range must stay contiguous so the scene
+                                // manager's release (deallocate_range) frees
+                                // exactly what we allocated. A plain
+                                // `allocate()` would dip into the free list
+                                // and break that invariant when other
+                                // assets have been released concurrently.
+                                let id = leaf_attr_pool.allocate_contiguous_bump(1)?;
                                 *leaf_attr_pool.get_mut(id) = attr;
                                 attr_dedup.insert(attr, id);
                                 id

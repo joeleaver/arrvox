@@ -13,6 +13,7 @@ pub mod brick_pool;
 pub mod leaf_attr;
 pub mod leaf_attr_pool;
 pub mod octree_allocator;
+pub mod prefilter;
 pub mod sparse_octree;
 pub mod voxelize_octree;
 
