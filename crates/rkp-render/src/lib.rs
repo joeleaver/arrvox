@@ -31,10 +31,13 @@ pub mod rkp_volumetric;
 pub mod rkp_renderer;
 /// Scene management — voxel pool, octree, face emission, asset loading.
 pub mod rkp_scene_manager;
+/// Per-viewport render targets and post-process state.
+pub mod viewport_renderer;
 
 pub use voxelize_opacity::import_mesh_to_opacity_rkp;
 pub use octree_gpu::OctreeGpu;
 pub use rkp_scene_manager::{AssetHandle, AssetInfo, RkpSceneManager};
+pub use viewport_renderer::ViewportRenderer;
 
 /// Validate WGSL source with naga at startup. Panics with a clear error message
 /// on shader bugs instead of producing cryptic "pipeline invalid" GPU errors.

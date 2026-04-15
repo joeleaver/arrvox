@@ -185,10 +185,10 @@ struct EngineState {
 
     // Rendering pipeline
     renderer: RkpRenderer,
-    gbuffer: rkf_render::GBuffer,
-    bloom: rkf_render::BloomPass,
-    bloom_composite: rkf_render::BloomCompositePass,
-    tone_map: rkf_render::ToneMapPass,
+    /// Per-viewport render targets + post-process state. Single MAIN entry
+    /// in Phase 2; later phases will key BUILD / PiP / minimap viewports
+    /// alongside.
+    viewport_renderers: std::collections::HashMap<crate::viewport::ViewportId, rkp_render::ViewportRenderer>,
 
     // Scene management (CPU)
     scene_mgr: RkpSceneManager,
@@ -295,17 +295,8 @@ struct EngineState {
     width: u32,
     height: u32,
 
-    // Double-buffered readback: copy to one buffer this frame, read from the other
-    // (which completed last frame). Avoids blocking CPU waiting for GPU.
-    readback_buffers: [wgpu::Buffer; 2],
-    readback_index: usize, // which buffer to copy INTO this frame
-    readback_ready: bool,  // false on first frame (no previous data yet)
-
-    // Wireframe overlay
-    wireframe_pass: rkf_render::WireframePass,
-    /// Composite texture — LDR + wireframe overlay. Rgba8Unorm with RENDER_ATTACHMENT.
-    composite_texture: wgpu::Texture,
-    composite_view: wgpu::TextureView,
+    // (Per-viewport readback / composite / wireframe live in
+    // `viewport_renderers[MAIN]` — see `rkp_render::ViewportRenderer`.)
 
     // Gizmo state
     gizmo: crate::gizmo::GizmoState,
@@ -328,34 +319,16 @@ impl EngineState {
         let width = config.width;
         let height = config.height;
 
-        let gbuffer = rkf_render::GBuffer::new(&device, width, height);
         let mut renderer = RkpRenderer::new(&device, &queue, width, height);
 
-        // Wire G-buffer into renderer.
-        renderer.set_gbuffer(&gbuffer);
-
-        // Bloom: extract bright pixels from volumetric HDR output, blur, composite.
-        let bloom = rkf_render::BloomPass::new(
-            &device,
-            &renderer.god_rays.output_view,
-            width,
-            height,
+        // Build the main viewport renderer — owns the gbuffer, bloom chain,
+        // tone-map, composite, readback, wireframe-overlay state. Wires its
+        // gbuffer into `renderer`'s shared bind groups.
+        let main_viewport_renderer = rkp_render::ViewportRenderer::new(
+            &device, &mut renderer, width, height,
         );
-        let bloom_composite = rkf_render::BloomCompositePass::new(
-            &device,
-            &renderer.god_rays.output_view,
-            bloom.mip_views(),
-            width,
-            height,
-        );
-
-        // Tone mapping: bloom composite HDR → LDR (Rgba8Unorm).
-        let tone_map = rkf_render::ToneMapPass::new(
-            &device,
-            &bloom_composite.output_view,
-            width,
-            height,
-        );
+        let mut viewport_renderers = std::collections::HashMap::new();
+        viewport_renderers.insert(crate::viewport::ViewportId::MAIN, main_viewport_renderer);
 
         let scene_mgr = RkpSceneManager::new(1_000_000);
 
@@ -364,30 +337,6 @@ impl EngineState {
         input_system.add_map(crate::camera::default_action_map());
         input_system.set_active_map("editor");
         let camera_control = CameraControlState::default();
-
-        // Double-buffered readback — avoids blocking CPU for GPU completion.
-        let readback_buffers = [
-            Self::create_readback_buffer(&device, width, height),
-            Self::create_readback_buffer(&device, width, height),
-        ];
-
-        // Wireframe pass for gizmo overlay.
-        let wireframe_pass = rkf_render::WireframePass::new(&device, rkf_render::LDR_FORMAT);
-
-        // Composite texture: LDR + wireframes. Needs RENDER_ATTACHMENT for wireframe draw.
-        let composite_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("rkp composite"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: rkf_render::LDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let composite_view = composite_texture.create_view(&Default::default());
 
         // Pick readback buffer — 1 pixel of Rg32Uint (8 bytes), 256-byte aligned.
         let pick_readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -401,10 +350,7 @@ impl EngineState {
             device,
             queue,
             renderer,
-            gbuffer,
-            bloom,
-            bloom_composite,
-            tone_map,
+            viewport_renderers,
             scene_mgr,
             input_system,
             camera_control,
@@ -464,28 +410,12 @@ impl EngineState {
             frame_index: 0,
             width,
             height,
-            readback_buffers,
-            readback_index: 0,
-            readback_ready: false,
-            wireframe_pass,
-            composite_texture,
-            composite_view,
             gizmo: crate::gizmo::GizmoState::new(),
             mouse_pos: glam::Vec2::ZERO,
             pick_readback_buffer,
             pending_pick: None,
             num_lights_cache: 1,
         }
-    }
-
-    fn create_readback_buffer(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Buffer {
-        let padded_row = (width * 4 + 255) & !255;
-        device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rkp readback"),
-            size: (padded_row * height) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        })
     }
 
     fn render_frame(&mut self) -> (Vec<u8>, u32, u32) {
@@ -530,9 +460,14 @@ impl EngineState {
             self.num_lights_cache = shade_params.num_lights;
 
             if self.environment_dirty {
-                self.tone_map.set_exposure(&self.queue, self.environment.exposure);
-                self.bloom.set_threshold(&self.queue, self.environment.bloom_threshold, self.environment.bloom_knee);
-                self.bloom_composite.set_intensity(&self.queue, self.environment.bloom_intensity);
+                let env = &self.environment;
+                let queue = &self.queue;
+                let main = self.viewport_renderers
+                    .get_mut(&crate::viewport::ViewportId::MAIN)
+                    .expect("main viewport renderer must exist");
+                main.tone_map.set_exposure(queue, env.exposure);
+                main.bloom.set_threshold(queue, env.bloom_threshold, env.bloom_knee);
+                main.bloom_composite.set_intensity(queue, env.bloom_intensity);
                 self.environment_dirty = false;
             }
         }
@@ -639,7 +574,22 @@ impl EngineState {
             self.renderer.god_rays.update_params(&self.queue, &god_ray_params);
         }
 
-        self.renderer.render(&mut encoder, &self.queue, object_count, self.width, self.height, shadow_steps, num_lights, screen_aabbs_bytes, &atmo_frame);
+        // Pre-compute gizmo wireframe verts before we take a mutable borrow
+        // of the main viewport renderer (build_gizmo_wireframe needs &self,
+        // which would conflict with &mut self.viewport_renderers).
+        let gizmo_verts = self.build_gizmo_wireframe();
+
+        // 3b. Renderer pipeline + per-viewport post-process (bloom →
+        // bloom_composite → tone_map → composite copy). Engine still owns
+        // pick + wireframe overlay + readback below since those need
+        // engine-specific state.
+        let main_vr = self.viewport_renderers
+            .get_mut(&crate::viewport::ViewportId::MAIN)
+            .expect("main viewport renderer must exist");
+        self.renderer.render_to(
+            &mut encoder, &self.queue, main_vr,
+            object_count, shadow_steps, num_lights, screen_aabbs_bytes, &atmo_frame,
+        );
 
         let t_encode = frame_start.elapsed();
 
@@ -649,7 +599,7 @@ impl EngineState {
             if px < self.width && py < self.height {
                 encoder.copy_texture_to_buffer(
                     wgpu::TexelCopyTextureInfo {
-                        texture: &self.gbuffer.material_texture,
+                        texture: &main_vr.gbuffer.material_texture,
                         mip_level: 0,
                         origin: wgpu::Origin3d { x: px, y: py, z: 0 },
                         aspect: wgpu::TextureAspect::All,
@@ -667,88 +617,31 @@ impl EngineState {
             }
         }
 
-        // 5a. Bloom: extract bright pixels + multi-level blur.
-        {
-            let q = self.renderer.profiler.begin_query("bloom", &mut encoder);
-            self.bloom.dispatch(&mut encoder);
-            self.renderer.profiler.end_query(&mut encoder, q);
-        }
-
-        // 5b. Bloom composite: blend blurred bloom back onto HDR.
-        {
-            let q = self.renderer.profiler.begin_query("bloom_composite", &mut encoder);
-            self.bloom_composite.dispatch(&mut encoder);
-            self.renderer.profiler.end_query(&mut encoder, q);
-        }
-
-        // 5c. Tone mapping: bloom composite HDR → LDR (Rgba8Unorm).
-        {
-            let q = self.renderer.profiler.begin_query("tone_map", &mut encoder);
-            self.tone_map.dispatch(&mut encoder);
-            self.renderer.profiler.end_query(&mut encoder, q);
-        }
-
-        // 6. Copy LDR to composite texture, draw gizmo wireframes, readback.
+        // 6. Wireframe overlay + readback copy (engine-specific because the
+        // wireframe geometry comes from gizmo state).
         let q_post = self.renderer.profiler.begin_query("post", &mut encoder);
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: self.tone_map.ldr_texture(),
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.composite_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
-        );
 
         // 6b. Draw gizmo wireframe if an object is selected.
-        let gizmo_verts = self.build_gizmo_wireframe();
         if !gizmo_verts.is_empty() {
-            let cam_uniforms = self.build_camera_uniforms();
             let vp_matrix = glam::Mat4::from_cols_array_2d(&cam_uniforms.view_proj);
-            self.wireframe_pass.draw(
+            // Split borrow: wireframe_pass is mutable, composite_view + width/height
+            // are immutable, all on disjoint fields of main_vr.
+            let composite_view = &main_vr.composite_view;
+            let vw = main_vr.width as f32;
+            let vh = main_vr.height as f32;
+            main_vr.wireframe_pass.draw(
                 &self.device,
                 &self.queue,
                 &mut encoder,
-                &self.composite_view,
+                composite_view,
                 vp_matrix,
-                (0.0, 0.0, self.width as f32, self.height as f32),
+                (0.0, 0.0, vw, vh),
                 &gizmo_verts,
             );
         }
 
         // 6c. Copy composite to readback buffer.
-        let padded_row = (self.width * 4 + 255) & !255;
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.composite_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &self.readback_buffers[self.readback_index],
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_row),
-                    rows_per_image: Some(self.height),
-                },
-            },
-            wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
-        );
+        main_vr.copy_composite_to_readback(&mut encoder);
         self.renderer.profiler.end_query(&mut encoder, q_post);
 
         // 7b. Resolve all profiler queries now that every pass has been encoded.
@@ -769,15 +662,22 @@ impl EngineState {
         // 10. Read from the OTHER buffer (completed last frame).
         // Double-buffered: we read last frame's data while this frame's copy runs.
         // wait_indefinitely returns near-instantly since last frame's GPU work is done.
-        let read_index = 1 - self.readback_index;
-        let pixels = if self.readback_ready {
+        let pixels = {
+            let main_vr = self.viewport_renderers
+                .get(&crate::viewport::ViewportId::MAIN)
+                .expect("main viewport renderer must exist");
+            let read_index = if main_vr.readback_ready {
+                1 - main_vr.readback_index
+            } else {
+                // First frame: no previous data, read current (blocking).
+                main_vr.readback_index
+            };
             self.map_readback(read_index)
-        } else {
-            // First frame: no previous data, read current (blocking).
-            self.readback_ready = true;
-            self.map_readback(self.readback_index)
         };
-        self.readback_index = read_index; // swap for next frame
+        self.viewport_renderers
+            .get_mut(&crate::viewport::ViewportId::MAIN)
+            .expect("main viewport renderer must exist")
+            .advance_readback();
 
         // 11. GPU profiler — process finished frames (logs every 60 frames).
         self.renderer.end_profiler_frame(self.frame_index, self.width, self.height);
@@ -806,14 +706,18 @@ impl EngineState {
         (pixels, self.width, self.height)
     }
 
-    /// Read from a readback buffer. With double-buffering we read last frame's
-    /// buffer, so the GPU work is already complete and wait returns near-instantly.
+    /// Read from the main viewport's readback buffer. With double-buffering
+    /// we read last frame's buffer, so the GPU work is already complete and
+    /// `wait_indefinitely` returns near-instantly.
     fn map_readback(&self, index: usize) -> Vec<u8> {
-        let w = self.width;
-        let h = self.height;
-        let padded_row = (w * 4 + 255) & !255;
+        let main_vr = self.viewport_renderers
+            .get(&crate::viewport::ViewportId::MAIN)
+            .expect("main viewport renderer must exist");
+        let w = main_vr.width;
+        let h = main_vr.height;
+        let padded_row = main_vr.readback_padded_row();
 
-        let buffer_slice = self.readback_buffers[index].slice(..);
+        let buffer_slice = main_vr.readback_buffers[index].slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
@@ -835,7 +739,7 @@ impl EngineState {
                 }
             }
             drop(data);
-            self.readback_buffers[index].unmap();
+            main_vr.readback_buffers[index].unmap();
         }
 
         rgba8
@@ -928,46 +832,12 @@ impl EngineState {
                 if width != self.width || height != self.height {
                     self.width = width;
                     self.height = height;
-                    self.gbuffer = rkf_render::GBuffer::new(&self.device, width, height);
                     self.renderer.resize(width, height);
-                    self.renderer.set_gbuffer(&self.gbuffer);
-                    self.bloom = rkf_render::BloomPass::new(
-                        &self.device,
-                        &self.renderer.god_rays.output_view,
-                        width,
-                        height,
-                    );
-                    self.bloom_composite = rkf_render::BloomCompositePass::new(
-                        &self.device,
-                        &self.renderer.god_rays.output_view,
-                        self.bloom.mip_views(),
-                        width,
-                        height,
-                    );
-                    self.tone_map = rkf_render::ToneMapPass::new(
-                        &self.device,
-                        &self.bloom_composite.output_view,
-                        width,
-                        height,
-                    );
-                    self.readback_buffers = [
-                        Self::create_readback_buffer(&self.device, width, height),
-                        Self::create_readback_buffer(&self.device, width, height),
-                    ];
-                    self.readback_ready = false;
-                    self.composite_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("rkp composite"),
-                        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: rkf_render::LDR_FORMAT,
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                            | wgpu::TextureUsages::COPY_SRC
-                            | wgpu::TextureUsages::COPY_DST,
-                        view_formats: &[],
-                    });
-                    self.composite_view = self.composite_texture.create_view(&Default::default());
+                    if let Some(main_vr) = self.viewport_renderers
+                        .get_mut(&crate::viewport::ViewportId::MAIN)
+                    {
+                        main_vr.resize(&self.device, &mut self.renderer, width, height);
+                    }
                     self.environment_dirty = true;
                     self.environment_ui_dirty = true;
                     if let Some(main) = self.viewports.get_mut(crate::viewport::ViewportId::MAIN) {

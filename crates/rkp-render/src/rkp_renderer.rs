@@ -221,6 +221,73 @@ impl RkpRenderer {
         // wants them profiled too, so the resolve happens once at the end.
     }
 
+    /// Render one frame for the given viewport. Encodes the entire renderer
+    /// pipeline (march → shadow → ssao → shade → volumetric → god_rays →
+    /// bloom → bloom_composite → tone_map → composite copy) into `encoder`.
+    /// The caller still owns the wireframe overlay + readback copy +
+    /// submit so engine-specific concerns stay engine-side.
+    ///
+    /// In Phase 2 there's only one viewport so the renderer's internal
+    /// resolution is always in step with `viewport.width/height`. Multi-
+    /// viewport phases will need to resize the renderer in here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_to(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        viewport: &mut crate::viewport_renderer::ViewportRenderer,
+        object_count: u32,
+        shadow_steps: u32,
+        num_lights: u32,
+        screen_aabbs: &[u8],
+        atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
+    ) {
+        // Renderer-internal pipeline (march, shadow, ssao, shade, vol, god_rays).
+        self.render(
+            encoder, queue, object_count, viewport.width, viewport.height,
+            shadow_steps, num_lights, screen_aabbs, atmo_frame_params,
+        );
+
+        // Per-viewport bloom + tonemap chain.
+        {
+            let q = self.profiler.begin_query("bloom", encoder);
+            viewport.bloom.dispatch(encoder);
+            self.profiler.end_query(encoder, q);
+        }
+        {
+            let q = self.profiler.begin_query("bloom_composite", encoder);
+            viewport.bloom_composite.dispatch(encoder);
+            self.profiler.end_query(encoder, q);
+        }
+        {
+            let q = self.profiler.begin_query("tone_map", encoder);
+            viewport.tone_map.dispatch(encoder);
+            self.profiler.end_query(encoder, q);
+        }
+
+        // Copy LDR into the composite texture so the caller can overlay
+        // wireframes on it before the readback copy.
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: viewport.tone_map.ldr_texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &viewport.composite_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: viewport.width,
+                height: viewport.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     /// Resolve all profiler queries issued this frame. Call after *all* passes
     /// (including any issued by the caller after `render`) are encoded.
     pub fn resolve_profiler_queries(&mut self, encoder: &mut wgpu::CommandEncoder) {
