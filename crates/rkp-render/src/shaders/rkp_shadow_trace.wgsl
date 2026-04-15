@@ -51,6 +51,11 @@ struct MarchParams {
     mode: u32,
     shadow_max_steps: u32,
     num_lights: u32,
+    // Must match octree_march.wgsl: same uniform buffer binding.
+    lod_enabled: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 struct GpuLight {

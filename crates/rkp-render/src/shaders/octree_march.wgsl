@@ -55,7 +55,14 @@ struct MarchParams {
     // terminate descent when the node would occupy <1 pixel. `0` →
     // always descend to a terminator (pre-LOD behavior).
     lod_enabled: u32,
-    _pad: vec3<u32>,
+    // Pad to 32 bytes (uniform buffer size must be a multiple of 16).
+    // Three u32s — NOT a vec3<u32> — to stay on 4-byte alignment so the
+    // Rust-side `[u32; 3]` and this match byte-for-byte. A vec3 would
+    // promote struct alignment to 16 and inflate the size to 48 bytes,
+    // failing the binding-size check against the 32-byte Rust struct.
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;
@@ -65,7 +72,19 @@ const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;
 // hysteresis discussion: at depth N+1 the footprint is half of N's, so
 // the sharp cutoff produces a monotonic "descend/terminate" decision
 // per ray with no ping-pong under camera motion at the sub-pixel scale.
-const LOD_CUTOFF_PX: f32 = 0.9;
+// Terminate descent when the *child* we'd descend into would be smaller
+// than a pixel. Since a child's footprint is half the current node's,
+// the cutoff on the current node is 2.0 px — at 2.0 the child is at 1.0.
+// Rationale: "one sample per screen pixel" is the right mip cutoff;
+// below that the per-pixel value is an aliased pick from one of 8
+// children. The prefiltered attr (bottom-up average) is the correct
+// low-pass reconstruction, so using it when the child would be
+// sub-pixel is strictly better than descending.
+//
+// Note: an earlier 0.9-px draft was too conservative — at typical
+// viewing distances for meter-scale assets with mm-scale voxels, every
+// branch was several px on screen so LOD never fired.
+const LOD_CUTOFF_PX: f32 = 2.0;
 
 struct GpuLight {
     position: vec4<f32>,   // xyz = position, w = type (0=dir, 1=point, 2=spot)

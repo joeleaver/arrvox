@@ -146,6 +146,17 @@ impl RkpScene {
         }
         let interleaved_bytes: &[u8] = bytemuck::cast_slice(&interleaved);
 
+        // Diagnostic: how many prefilter attrs are populated in the upload?
+        // Zero means prefilter didn't emit anything for this scene — LOD
+        // won't fire in the shader no matter what the uniform says.
+        let populated = data.octree_internal_attrs.iter()
+            .filter(|&&v| v != 0xFFFF_FFFF).count();
+        let total = data.octree_internal_attrs.len();
+        let pct = if total > 0 { 100.0 * populated as f32 / total as f32 } else { 0.0 };
+        eprintln!(
+            "[rkp_scene] prefilter attrs: {populated}/{total} ({pct:.1}%) populated",
+        );
+
         let mut needs_rebuild = false;
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.brick_pool_buffer, "rkp_brick_pool", data.brick_pool);
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.octree_nodes_buffer, "rkp_octree_nodes", interleaved_bytes);

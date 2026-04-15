@@ -306,6 +306,7 @@ impl OctreeMarchPass {
             let voxel_pool_reads = vals[45] as u64;
             let color_pool_reads = vals[46] as u64;
             let materials_reads = vals[47] as u64;
+            let lod_exits: &[u32] = &vals[48..52]; // L0-2, L3-5, L6-8, L9+
 
             let sum = |h: &[u32]| -> u64 { h.iter().map(|&x| x as u64).sum() };
             let weighted = |h: &[u32]| -> f64 {
@@ -347,12 +348,24 @@ impl OctreeMarchPass {
                 "[footprint] <1px:{:.0}%  1-2px:{:.0}%  2-4px:{:.0}%  >=4px:{:.0}%  (n={})",
                 pct(foot[0]), pct(foot[1]), pct(foot[2]), pct(foot[3]), foot_total,
             );
+            let lod_total: u64 = lod_exits.iter().map(|&x| x as u64).sum();
+            if lod_total > 0 {
+                eprintln!(
+                    "[lod exits] {}  L0-2:{}  L3-5:{}  L6-8:{}  L9+:{}",
+                    lod_total, lod_exits[0], lod_exits[1], lod_exits[2], lod_exits[3],
+                );
+            } else {
+                eprintln!("[lod exits] 0  — LOD disabled, or no branches had prefilter attrs at cutoff levels");
+            }
 
             // Per-buffer byte traffic per frame. Octree reads come from the
             // depth histograms; other buffers have direct atomic counters.
             let octree_reads = phase_node_reads(surface) + phase_node_reads(normal) + phase_node_reads(shadow);
             let mb = |bytes: u64| -> f64 { bytes as f64 / (1024.0 * 1024.0) };
-            let octree_bytes     = octree_reads       * 4;  // 4 B per node
+            // Each octree slot now holds `vec2<u32>` (node value + prefilter id)
+            // → 8 B per slot. Even when LOD is off, the `.y` lane ends up in the
+            // same cache line, so we count the full 8 B per read.
+            let octree_bytes     = octree_reads       * 8;  // 8 B per node (vec2<u32>)
             let leaf_attr_bytes  = leaf_attr_reads    * 8;  // LeafAttr = 8 B
             let voxel_bytes      = voxel_pool_reads   * 8;  // VoxelSample = 8 B
             let color_bytes      = color_pool_reads   * 4;  // packed color u32
