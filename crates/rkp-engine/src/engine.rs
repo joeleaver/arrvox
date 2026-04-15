@@ -324,12 +324,12 @@ impl EngineState {
 
         let mut renderer = RkpRenderer::new(&device, &queue, width, height);
 
-        // Build the main viewport renderer — owns the gbuffer, bloom chain,
-        // tone-map, composite, readback, wireframe-overlay state, plus its
-        // own camera buffer + scene bind group. Wires its gbuffer into the
-        // shared renderer's bind groups.
+        // Build the main viewport renderer — owns its full per-resolution
+        // pass chain (march/shade/ssao/etc.), gbuffer, bloom chain,
+        // tone-map, composite, readback, wireframe-overlay state, plus
+        // its own camera buffer + scene bind group.
         let main_viewport_renderer = rkp_render::ViewportRenderer::new(
-            &device, &mut renderer, width, height,
+            &device, &queue, &mut renderer, width, height,
         );
         // Pre-create the BUILD viewport renderer at its default size. It
         // starts invisible (Viewport::new_build) so render_to skips it
@@ -337,7 +337,7 @@ impl EngineState {
         // up-front (~20 MiB) is cheaper than the latency hit of creating
         // it when the user opens the build surface mid-session.
         let build_viewport_renderer = rkp_render::ViewportRenderer::new(
-            &device, &mut renderer, 800, 600,
+            &device, &queue, &mut renderer, 800, 600,
         );
         let mut viewport_renderers = std::collections::HashMap::new();
         viewport_renderers.insert(crate::viewport::ViewportId::MAIN, main_viewport_renderer);
@@ -583,24 +583,22 @@ impl EngineState {
                 vr.upload_camera(&self.queue, &cam_uniforms);
             }
 
-            // Rebuild this VR's scene bind group if the scene epoch moved
-            // (geometry or objects buffer reallocated).
+            // Refresh this VR's scene + lights/materials bind groups if
+            // the corresponding shared buffers reallocated. No-op when
+            // epochs match.
             {
                 let vr = self.viewport_renderers
                     .get_mut(&viewport_id)
                     .expect("viewport renderer must exist");
-                vr.refresh_scene_bind_group(&self.device, &self.renderer.scene);
+                vr.refresh_bindings(&self.device, &self.renderer);
             }
 
-            // Per-viewport vol/cloud/atmo/god-ray params. These go into
-            // shared buffers — safe because we submit below before the
-            // next iteration overwrites them.
+            // Per-viewport vol/cloud/god-ray params — written directly
+            // to this VR's own pass buffers. No shared-state race now.
             let vol_params = self.environment.to_volumetric_params(
                 &cam_uniforms, vp_w, vp_h, self.frame_index as u32,
             );
-            self.renderer.update_volumetric_params(&self.queue, &vol_params);
             let cloud_params = self.environment.to_cloud_params(self.frame_index as f32 / 60.0);
-            self.renderer.update_cloud_params(&self.queue, &cloud_params);
 
             let sun_d = self.environment.sun_direction();
             let atmo_frame = rkp_render::rkp_atmosphere::AtmosphereFrameParams {
@@ -617,7 +615,7 @@ impl EngineState {
                 cam_up: [cam_uniforms.up[0], cam_uniforms.up[1], cam_uniforms.up[2]],
                 _pad4: 0.0,
             };
-            {
+            let god_ray_params = {
                 let sun_toward = [-sun_d[0], -sun_d[1], -sun_d[2]];
                 let sun_world = glam::Vec3::new(
                     cam_uniforms.position[0] + sun_toward[0] * 1000.0,
@@ -632,7 +630,7 @@ impl EngineState {
                     glam::Vec2::ZERO
                 };
                 let sun_uv = [ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5];
-                let god_ray_params = rkp_render::rkp_god_rays::GodRayParams {
+                rkp_render::rkp_god_rays::GodRayParams {
                     sun_screen_pos: sun_uv,
                     sun_on_screen,
                     density: self.environment.god_ray_density,
@@ -640,8 +638,15 @@ impl EngineState {
                     decay: self.environment.god_ray_decay,
                     exposure: self.environment.god_ray_exposure,
                     num_samples: 64,
-                };
-                self.renderer.god_rays.update_params(&self.queue, &god_ray_params);
+                }
+            };
+            {
+                let vr = self.viewport_renderers
+                    .get_mut(&viewport_id)
+                    .expect("viewport renderer must exist");
+                vr.volumetric.update_params(&self.queue, &vol_params);
+                vr.volumetric.update_cloud_params(&self.queue, &cloud_params);
+                vr.god_rays.update_params(&self.queue, &god_ray_params);
             }
 
             // Per-viewport encoder.
@@ -999,37 +1004,25 @@ impl EngineState {
             }
 
             EngineCommand::Resize { id, width, height } => {
-                // Only MAIN's Resize drives the actual render resolution.
-                // All VRs share the renderer's shared pass outputs today,
-                // so every VR must stay at MAIN's size — resizing BUILD
-                // independently would desync its gbuffer from the shared
-                // shade/god_rays/etc. outputs and MAIN's bloom pass would
-                // sample orphaned views. Non-MAIN Resize commands are
-                // ignored; their RenderSurface panels scale via CSS.
-                // When a pass-internal split lands this becomes per-VR.
-                if id != crate::viewport::ViewportId::MAIN {
-                    return true;
+                // Each VR has its own per-resolution pass chain now, so
+                // Resize is per-viewport. Resizing BUILD doesn't affect
+                // MAIN (and vice versa).
+                if let Some(vr) = self.viewport_renderers.get_mut(&id) {
+                    vr.resize(&self.device, &mut self.renderer, width, height);
                 }
-                if width == self.width && height == self.height {
-                    return true;
+                if let Some(vp) = self.viewports.get_mut(id) {
+                    vp.width = width;
+                    vp.height = height;
                 }
-                self.width = width;
-                self.height = height;
-                self.renderer.resize(width, height);
-                // Every VR resizes in lockstep with MAIN.
-                let vr_ids: Vec<_> = self.viewport_renderers.keys().copied().collect();
-                for vr_id in vr_ids {
-                    if let Some(vr) = self.viewport_renderers.get_mut(&vr_id) {
-                        vr.resize(&self.device, &mut self.renderer, width, height);
-                    }
-                    if let Some(vp) = self.viewports.get_mut(vr_id) {
-                        vp.width = width;
-                        vp.height = height;
-                    }
+                // MAIN drives the legacy width/height on EngineState for
+                // hot paths that haven't migrated (sculpt/paint ray math).
+                if id == crate::viewport::ViewportId::MAIN {
+                    self.width = width;
+                    self.height = height;
+                    self.environment_dirty = true;
+                    self.environment_ui_dirty = true;
+                    eprintln!("[RkpEngine] MAIN resized to {}x{}", width, height);
                 }
-                self.environment_dirty = true;
-                self.environment_ui_dirty = true;
-                eprintln!("[RkpEngine] resized to {}x{}", width, height);
             }
 
             EngineCommand::SetViewportVisible { id, visible } => {
