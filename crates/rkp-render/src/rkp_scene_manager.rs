@@ -256,6 +256,36 @@ impl RkpSceneManager {
             glam::Vec3::from(header.aabb_max),
         );
 
+        // Pre-baked octahedrally-packed normals per slot. One u32 per shell
+        // voxel, written at import time from the mesh SDF gradient — the
+        // runtime never sees an SDF.
+        let has_normals = header.flags & rkp_core::asset_file::FLAG_HAS_NORMALS != 0;
+        let normals_bytes = if has_normals {
+            rkp_core::asset_file::read_rkp_normals(&mut reader, &header).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let normals_u32s: &[u32] = if normals_bytes.len() >= 4 {
+            bytemuck::cast_slice(&normals_bytes)
+        } else {
+            &[]
+        };
+
+        // Brick-terminated octree (v4). Each brick is a flat run of
+        // BRICK_CELLS u32s; cell value is either BRICK_EMPTY or a slot
+        // index into the parallel voxel arrays.
+        let has_bricks = header.flags & rkp_core::asset_file::FLAG_HAS_BRICKS != 0;
+        let bricks_bytes = if has_bricks {
+            rkp_core::asset_file::read_rkp_bricks(&mut reader, &header).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let file_brick_cells: &[u32] = if !bricks_bytes.is_empty() {
+            bytemuck::cast_slice(&bricks_bytes)
+        } else {
+            &[]
+        };
+
         let has_color = header.flags & rkp_core::asset_file::FLAG_HAS_COLOR != 0;
         let color_bytes = if has_color {
             rkp_core::asset_file::read_rkp_color(&mut reader, &header).unwrap_or_default()
@@ -268,12 +298,8 @@ impl RkpSceneManager {
             &[]
         };
 
-        // Build a per-file-voxel table of (material_primary, material_secondary,
-        // blend_weight, color) without allocating a voxel_pool. Opacity values
-        // in the file are read but discarded — they are no longer part of the
-        // on-GPU representation.
         let bytes_per_voxel = std::mem::size_of::<VoxelSample>();
-        let mut file_voxel_mat: Vec<(u16, u16, u8, u32)> = Vec::with_capacity(voxel_count as usize);
+        let mut file_voxel_mat: Vec<(u16, u16, u8, u32, u32)> = Vec::with_capacity(voxel_count as usize);
         for i in 0..voxel_count as usize {
             let src_offset = i * bytes_per_voxel;
             if src_offset + bytes_per_voxel > voxel_data.len() {
@@ -282,47 +308,116 @@ impl RkpSceneManager {
             let vs: &VoxelSample =
                 bytemuck::from_bytes(&voxel_data[src_offset..src_offset + bytes_per_voxel]);
             let color = color_u32s.get(i).copied().unwrap_or(0);
-            file_voxel_mat.push((vs.material_id(), vs.secondary_material_id(), vs.blend_weight(), color));
+            let normal_oct = normals_u32s.get(i).copied().unwrap_or(0);
+            file_voxel_mat.push((
+                vs.material_id(), vs.secondary_material_id(), vs.blend_weight(), color, normal_oct,
+            ));
         }
 
-        // Build a temporary tree from the raw file nodes. Leaves there
-        // encode a file-voxel index; we walk the tree to pick up each
-        // leaf's spatial coordinate, compute the normal from neighboring
-        // file-voxel occupancy, then rewrite the leaf to a leaf_attr_id.
         let octree_depth = header.octree_depth as u8;
         let leaf_attr_slot_start = self.leaf_attr_pool.allocated_count();
         let mut tree = SparseOctree::from_raw(&octree_nodes, octree_depth, voxel_size);
 
-        // Normal computation uses neighbor presence in the file-voxel tree
-        // (before any leaf rewrite), which is effectively the binary
-        // occupancy field. Gradient points outward — same as an SDF.
-        let leaves: Vec<(glam::UVec3, u32, u8)> = tree.iter_leaves().collect();
         let mut attr_dedup: std::collections::HashMap<(LeafAttr, u32), u32> =
             std::collections::HashMap::new();
-        let mut rewrites: Vec<(glam::UVec3, u8, u32)> = Vec::with_capacity(leaves.len());
 
-        for (coord, file_idx, leaf_depth) in &leaves {
-            let (mat_p, mat_s, blend, color) = file_voxel_mat
-                .get(*file_idx as usize)
+        // Closure: resolve a file slot to a leaf_attr_pool id, deduping on
+        // (LeafAttr, color). Used by both the BRICK path (v4) and the
+        // legacy LEAF path (v2/v3).
+        let resolve_slot = |slot: u32,
+                            attr_dedup: &mut std::collections::HashMap<(LeafAttr, u32), u32>,
+                            pool: &mut LeafAttrPool|
+         -> u32 {
+            let (mat_p, mat_s, blend, color, normal_oct) = file_voxel_mat
+                .get(slot as usize)
                 .copied()
-                .unwrap_or((0, 0, 0, 0));
-
-            let normal = compute_leaf_normal_from_binary_tree(&tree, *coord);
-            let attr = LeafAttr::new_blended(normal, mat_p, mat_s, blend);
+                .unwrap_or((0, 0, 0, 0, 0));
+            let mut attr = LeafAttr::new_blended(glam::Vec3::Y, mat_p, mat_s, blend);
+            if normal_oct != 0 {
+                attr.normal_oct = normal_oct;
+            }
             let key = (attr, color);
-            let leaf_attr_id = *attr_dedup.entry(key).or_insert_with(|| {
-                let id = self.leaf_attr_pool.allocate()
-                    .expect("leaf_attr_pool.allocate failed");
-                *self.leaf_attr_pool.get_mut(id) = attr;
+            *attr_dedup.entry(key).or_insert_with(|| {
+                let id = pool.allocate().expect("leaf_attr_pool.allocate failed");
+                *pool.get_mut(id) = attr;
                 if color != 0 {
-                    self.leaf_attr_pool.set_color(id, color);
+                    pool.set_color(id, color);
                 }
                 id
-            });
-            rewrites.push((*coord, *leaf_depth, rkp_core::sparse_octree::make_leaf(leaf_attr_id)));
+            })
+        };
+
+        // v4: walk BRICK nodes, allocate a scene brick for each, fill its
+        // cells from the file brick after dedup'ing slot indices into
+        // leaf_attr_pool ids.
+        let file_brick_count = file_brick_cells.len() / rkp_core::brick_pool::BRICK_CELLS as usize;
+        let scene_brick_offset = self.brick_pool.allocated_count();
+        for _ in 0..file_brick_count {
+            self.brick_pool.allocate().expect("brick_pool.allocate failed");
         }
-        for (coord, leaf_depth, new_value) in rewrites {
-            tree.set_at_level(coord, leaf_depth, new_value);
+        // Remap every BRICK node in the flat nodes array: shift its brick_id
+        // by the scene offset. This rewrites nodes in place — no tree walk
+        // needed because BRICK encoding is distinguishable from every other
+        // node type by is_brick.
+        {
+            let nodes = tree.as_slice_mut();
+            for n in nodes.iter_mut() {
+                if rkp_core::sparse_octree::is_brick(*n) {
+                    let file_id = rkp_core::sparse_octree::brick_id(*n);
+                    *n = rkp_core::sparse_octree::make_brick(scene_brick_offset + file_id);
+                }
+            }
+        }
+        let brick_cells = rkp_core::brick_pool::BRICK_CELLS as usize;
+        for file_id in 0..file_brick_count as u32 {
+            let scene_id = scene_brick_offset + file_id;
+            let src = &file_brick_cells[file_id as usize * brick_cells..(file_id as usize + 1) * brick_cells];
+            for (i, &slot_or_empty) in src.iter().enumerate() {
+                if slot_or_empty == rkp_core::brick_pool::BRICK_EMPTY {
+                    continue;
+                }
+                let leaf_attr_id = resolve_slot(slot_or_empty, &mut attr_dedup, &mut self.leaf_attr_pool);
+                let x = (i as u32) % rkp_core::brick_pool::BRICK_DIM;
+                let y = ((i as u32) / rkp_core::brick_pool::BRICK_DIM) % rkp_core::brick_pool::BRICK_DIM;
+                let z = (i as u32) / (rkp_core::brick_pool::BRICK_DIM * rkp_core::brick_pool::BRICK_DIM);
+                self.brick_pool.set_cell(scene_id, x, y, z, leaf_attr_id);
+            }
+        }
+
+        // Legacy LEAF path (v2/v3 files, no bricks): walk leaves, dedup,
+        // rewrite node. 26-neighborhood kernel falls back when no baked
+        // normal is present.
+        if !has_bricks {
+            let leaves: Vec<(glam::UVec3, u32, u8)> = tree.iter_leaves().collect();
+            let mut rewrites: Vec<(glam::UVec3, u8, u32)> = Vec::with_capacity(leaves.len());
+            for (coord, file_idx, leaf_depth) in &leaves {
+                let (mat_p, mat_s, blend, color, normal_oct) = file_voxel_mat
+                    .get(*file_idx as usize)
+                    .copied()
+                    .unwrap_or((0, 0, 0, 0, 0));
+                let attr = if has_normals && normal_oct != 0 {
+                    let mut a = LeafAttr::new_blended(glam::Vec3::Y, mat_p, mat_s, blend);
+                    a.normal_oct = normal_oct;
+                    a
+                } else {
+                    let normal = compute_leaf_normal_neighborhood26(&tree, *coord);
+                    LeafAttr::new_blended(normal, mat_p, mat_s, blend)
+                };
+                let key = (attr, color);
+                let leaf_attr_id = *attr_dedup.entry(key).or_insert_with(|| {
+                    let id = self.leaf_attr_pool.allocate()
+                        .expect("leaf_attr_pool.allocate failed");
+                    *self.leaf_attr_pool.get_mut(id) = attr;
+                    if color != 0 {
+                        self.leaf_attr_pool.set_color(id, color);
+                    }
+                    id
+                });
+                rewrites.push((*coord, *leaf_depth, rkp_core::sparse_octree::make_leaf(leaf_attr_id)));
+            }
+            for (coord, leaf_depth, new_value) in rewrites {
+                tree.set_at_level(coord, leaf_depth, new_value);
+            }
         }
         let leaf_attr_slot_count = self.leaf_attr_pool.allocated_count() - leaf_attr_slot_start;
 
@@ -497,44 +592,51 @@ impl RkpSceneManager {
     }
 }
 
-/// Binary-occupancy gradient: 0 if the coord maps to EMPTY, 1 if a leaf or
-/// INTERIOR. Used at .rkp load time to estimate the surface normal from the
-/// legacy opacity-field file format without reading back the discarded
-/// opacity values. For a smooth surface, the 6-tap central difference of
-/// binary occupancy is a decent normal approximation; load-time-computed
-/// normals were always going to be noisier than authoring-time SDF gradients,
-/// but this is a transitional path.
-fn compute_leaf_normal_from_binary_tree(
+/// 26-neighborhood centroid kernel. For each of the 26 surrounding cells,
+/// if the neighbor is occupied (leaf or interior), accumulate its offset
+/// vector; the mean points toward the centroid of occupied mass, so the
+/// outward normal is its negation. Uses all 26 neighbors instead of just
+/// the 6 axis-aligned ones, yielding ~direction-quantized-to-sphere output
+/// instead of being pinned to ~26 discrete axial directions.
+fn compute_leaf_normal_neighborhood26(
     tree: &SparseOctree,
     coord: glam::UVec3,
 ) -> glam::Vec3 {
-    let sample_at = |c: glam::UVec3| -> f32 {
+    let occupied_at = |c: glam::UVec3| -> bool {
         match tree.lookup(c) {
-            Some(n) if n == rkp_core::sparse_octree::INTERIOR_NODE => 1.0,
-            Some(n) if n == rkp_core::sparse_octree::EMPTY_NODE => 0.0,
-            Some(n) if rkp_core::sparse_octree::is_leaf(n) => 1.0,
-            _ => 0.0,
+            Some(n) if n == rkp_core::sparse_octree::INTERIOR_NODE => true,
+            Some(n) if rkp_core::sparse_octree::is_leaf(n) => true,
+            _ => false,
         }
     };
-    let sample = |dx: i32, dy: i32, dz: i32| -> f32 {
-        let x = coord.x as i64 + dx as i64;
-        let y = coord.y as i64 + dy as i64;
-        let z = coord.z as i64 + dz as i64;
-        if x < 0 || y < 0 || z < 0 {
-            0.0
-        } else {
-            sample_at(glam::UVec3::new(x as u32, y as u32, z as u32))
+    let mut sum = glam::Vec3::ZERO;
+    let mut count = 0.0f32;
+    for dz in -1i32..=1 {
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx == 0 && dy == 0 && dz == 0 {
+                    continue;
+                }
+                let x = coord.x as i64 + dx as i64;
+                let y = coord.y as i64 + dy as i64;
+                let z = coord.z as i64 + dz as i64;
+                if x < 0 || y < 0 || z < 0 {
+                    continue;
+                }
+                let nb = glam::UVec3::new(x as u32, y as u32, z as u32);
+                if occupied_at(nb) {
+                    sum += glam::Vec3::new(dx as f32, dy as f32, dz as f32);
+                    count += 1.0;
+                }
+            }
         }
-    };
-    let grad = glam::Vec3::new(
-        sample(1, 0, 0) - sample(-1, 0, 0),
-        sample(0, 1, 0) - sample(0, -1, 0),
-        sample(0, 0, 1) - sample(0, 0, -1),
-    );
-    // Gradient points INTO occupied space (away from empty neighbors), so
-    // negate for outward normal.
-    if grad.length_squared() > 1e-12 {
-        -grad.normalize()
+    }
+    if count == 0.0 {
+        return glam::Vec3::Y;
+    }
+    let centroid = sum / count;
+    if centroid.length_squared() > 1e-12 {
+        -centroid.normalize()
     } else {
         glam::Vec3::Y
     }

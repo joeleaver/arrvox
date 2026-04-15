@@ -1,18 +1,27 @@
-//! .rkp v2 file format — per-voxel octree asset serialization.
+//! .rkp v4 file format — brick-terminated sparse octree asset.
 //!
-//! The .rkp format stores a sparse octree where each leaf is a single voxel
-//! (no bricks). The octree IS the LOD hierarchy — no separate LOD levels.
-//! Coarser leaves at shallower depths represent lower detail.
+//! The octree terminates at `depth - BRICK_LEVELS`; leaf regions are packed
+//! as 4³ bricks of flat cells. Each cell stores a slot index (into the
+//! parallel per-voxel arrays) or `BRICK_CELL_EMPTY`. Deeper (4-voxel)
+//! subregions that are uniformly interior collapse to `INTERIOR_NODE`;
+//! uniformly exterior regions stay `EMPTY`. The octree IS the LOD.
 //!
-//! # File layout (v2)
+//! # File layout (v4)
 //!
 //! ```text
 //! [RkpHeader]                 128 bytes, fixed
-//! [octree nodes]              LZ4 compressed, u32 per node
-//! [voxel data]                LZ4 compressed, per leaf: 1 VoxelSample (8 bytes)
-//! [color data (optional)]     LZ4 compressed, per leaf: 1 ColorVoxel (4 bytes)
-//! [bone data (optional)]      LZ4 compressed, per leaf: 1 BoneVoxel (8 bytes)
+//! [octree nodes]              LZ4 compressed, u32 per node (BRICK refs)
+//! [voxel data]                LZ4 compressed, per slot: 1 VoxelSample (8 bytes)
+//! [normals (optional)]        LZ4 compressed, per slot: 1 u32 (octahedrally-packed normal)
+//! [bricks (optional)]         LZ4 compressed, BRICK_CELLS u32s per brick
+//! [color data (optional)]     LZ4 compressed, per slot: 1 ColorVoxel (4 bytes)
+//! [bone data (optional)]      LZ4 compressed, per slot: 1 BoneVoxel (8 bytes)
 //! ```
+//!
+//! v4 replaces v3's per-voxel LEAF encoding with BRICK-terminated octrees,
+//! matching the procedural voxelizer's on-GPU representation. Rays can now
+//! take a flat DDA through 4³ cells instead of descending the final two
+//! octree levels per step.
 //!
 //! Leaf voxels are stored in slot order. The slot-to-leaf mapping is implicit:
 //! iterate the octree's leaves to recover which slot corresponds to which spatial
@@ -26,11 +35,13 @@ use bytemuck::{Pod, Zeroable};
 pub const RKP_MAGIC: [u8; 4] = [b'R', b'K', b'P', 0x01];
 
 /// Current format version.
-pub const RKP_VERSION: u32 = 2;
+pub const RKP_VERSION: u32 = 4;
 
 /// Flags for optional sections.
 pub const FLAG_HAS_COLOR: u32 = 1 << 0;
 pub const FLAG_HAS_BONES: u32 = 1 << 1;
+pub const FLAG_HAS_NORMALS: u32 = 1 << 2;
+pub const FLAG_HAS_BRICKS: u32 = 1 << 3;
 
 /// .rkp file header (128 bytes).
 #[repr(C)]
@@ -63,14 +74,14 @@ pub struct RkpHeader {
     pub octree_compressed_size: u32,
     /// Compressed size of voxel data section.
     pub voxel_compressed_size: u32,
-    /// Reserved (was geometry_compressed_size in v1).
-    pub _reserved_geo: u32,
+    /// Compressed size of normals section (0 if no normals). v3+.
+    pub normals_compressed_size: u32,
     /// Compressed size of color section (0 if no color).
     pub color_compressed_size: u32,
     /// Compressed size of bone section (0 if no bones).
     pub bone_compressed_size: u32,
-    /// Reserved for future use.
-    pub _reserved: [u8; 4],
+    /// Compressed size of bricks section (0 if no bricks). v4+.
+    pub bricks_compressed_size: u32,
 }
 
 /// Error type for .rkp file operations.
@@ -86,10 +97,11 @@ pub enum RkpFileError {
     Decompress(String),
 }
 
-/// Write a .rkp v2 file (per-voxel format).
+/// Write a .rkp v3 file (per-voxel format).
 ///
 /// `octree_nodes`: packed node buffer from `SparseOctree::as_slice()`.
 /// `voxel_data`: raw VoxelSample data, 1 entry per leaf voxel, in slot order.
+/// `normals_data`: optional per-voxel octahedrally-packed normal (u32 each).
 /// `color_data`: optional per-voxel ColorVoxel data (4 bytes per leaf).
 /// `bone_data`: optional per-voxel BoneVoxel data.
 pub fn write_rkp<W: Write + Seek>(
@@ -102,23 +114,24 @@ pub fn write_rkp<W: Write + Seek>(
     aabb_max: [f32; 3],
     material_ids: &[u16],
     voxel_data: &[u8],
+    normals_data: Option<&[u8]>,
+    bricks_data: Option<&[u8]>,
     color_data: Option<&[u8]>,
     bone_data: Option<&[u8]>,
 ) -> Result<(), RkpFileError> {
-    // Compress sections.
     let octree_bytes: &[u8] = bytemuck::cast_slice(octree_nodes);
     let octree_compressed = lz4_flex::compress_prepend_size(octree_bytes);
     let voxel_compressed = lz4_flex::compress_prepend_size(voxel_data);
+    let normals_compressed = normals_data.map(|d| lz4_flex::compress_prepend_size(d));
+    let bricks_compressed = bricks_data.map(|d| lz4_flex::compress_prepend_size(d));
     let color_compressed = color_data.map(|d| lz4_flex::compress_prepend_size(d));
     let bone_compressed = bone_data.map(|d| lz4_flex::compress_prepend_size(d));
 
     let mut flags = 0u32;
-    if color_data.is_some() {
-        flags |= FLAG_HAS_COLOR;
-    }
-    if bone_data.is_some() {
-        flags |= FLAG_HAS_BONES;
-    }
+    if color_data.is_some()   { flags |= FLAG_HAS_COLOR; }
+    if bone_data.is_some()    { flags |= FLAG_HAS_BONES; }
+    if normals_data.is_some() { flags |= FLAG_HAS_NORMALS; }
+    if bricks_data.is_some()  { flags |= FLAG_HAS_BRICKS; }
 
     let mut mat_ids = [0u16; 16];
     for (i, &id) in material_ids.iter().take(16).enumerate() {
@@ -140,15 +153,21 @@ pub fn write_rkp<W: Write + Seek>(
         analytical_params: [0.0; 4],
         octree_compressed_size: octree_compressed.len() as u32,
         voxel_compressed_size: voxel_compressed.len() as u32,
-        _reserved_geo: 0,
+        normals_compressed_size: normals_compressed.as_ref().map(|d| d.len() as u32).unwrap_or(0),
         color_compressed_size: color_compressed.as_ref().map(|d| d.len() as u32).unwrap_or(0),
         bone_compressed_size: bone_compressed.as_ref().map(|d| d.len() as u32).unwrap_or(0),
-        _reserved: [0; 4],
+        bricks_compressed_size: bricks_compressed.as_ref().map(|d| d.len() as u32).unwrap_or(0),
     };
 
     writer.write_all(bytemuck::bytes_of(&header))?;
     writer.write_all(&octree_compressed)?;
     writer.write_all(&voxel_compressed)?;
+    if let Some(ref data) = normals_compressed {
+        writer.write_all(data)?;
+    }
+    if let Some(ref data) = bricks_compressed {
+        writer.write_all(data)?;
+    }
     if let Some(ref data) = color_compressed {
         writer.write_all(data)?;
     }
@@ -193,6 +212,36 @@ pub fn read_rkp_voxels<R: Read>(
     header: &RkpHeader,
 ) -> Result<Vec<u8>, RkpFileError> {
     let mut compressed = vec![0u8; header.voxel_compressed_size as usize];
+    reader.read_exact(&mut compressed)?;
+    lz4_flex::decompress_size_prepended(&compressed)
+        .map_err(|e| RkpFileError::Decompress(e.to_string()))
+}
+
+/// Read and decompress the normals section (if present). One u32 per leaf
+/// voxel, in slot order, octahedrally packed (see `rkp_core::leaf_attr::pack_oct`).
+pub fn read_rkp_normals<R: Read>(
+    reader: &mut R,
+    header: &RkpHeader,
+) -> Result<Vec<u8>, RkpFileError> {
+    if header.normals_compressed_size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut compressed = vec![0u8; header.normals_compressed_size as usize];
+    reader.read_exact(&mut compressed)?;
+    lz4_flex::decompress_size_prepended(&compressed)
+        .map_err(|e| RkpFileError::Decompress(e.to_string()))
+}
+
+/// Read and decompress the bricks section (if present). Flat u32 cells,
+/// `BRICK_CELLS` per brick in brick-id order.
+pub fn read_rkp_bricks<R: Read>(
+    reader: &mut R,
+    header: &RkpHeader,
+) -> Result<Vec<u8>, RkpFileError> {
+    if header.bricks_compressed_size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut compressed = vec![0u8; header.bricks_compressed_size as usize];
     reader.read_exact(&mut compressed)?;
     lz4_flex::decompress_size_prepended(&compressed)
         .map_err(|e| RkpFileError::Decompress(e.to_string()))
@@ -256,6 +305,8 @@ mod tests {
             &voxel_data,
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -293,6 +344,8 @@ mod tests {
             [1.0; 3],
             &[],
             &[0u8; 8], // one voxel = 1 VoxelSample * 8 bytes
+            None,
+            None,
             None,
             None,
         )

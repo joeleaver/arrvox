@@ -1,28 +1,20 @@
-//! Direct mesh-to-opacity voxelization — bypasses SDF for smooth splat fields.
+//! Mesh-to-.rkp voxelization — thin surface shell, no opacity anywhere.
 //!
-//! Computes per-voxel opacity from unsigned distance to the nearest triangle
-//! surface, with inside/outside determined by generalized winding number.
-//! Produces a smooth opacity field whose gradient gives clean surface normals.
-//!
-//! Full feature parity with rkf-import's SDF pipeline:
-//! - Per-triangle material IDs
-//! - Per-voxel color from mesh textures
-//! - Per-voxel bone weights for skeletal animation
-//! - Multi-LOD generation
-//! - Skeleton extraction (.rkskel sidecar)
+//! For each brick in the narrow band around the mesh, samples signed distance
+//! (unsigned distance to the nearest triangle + winding-number sign) per
+//! voxel. The importer then classifies voxels into a 1-voxel-thick outer
+//! shell (leaves with baked SDF-gradient normals) and solid interior
+//! (INTERIOR_NODE). No per-voxel opacity field is produced or stored; the
+//! runtime reads the baked normal + color and shades directly.
 
 use std::path::Path;
 
 use glam::Vec3;
-use half::f16;
 use rayon::prelude::*;
 
 use rkf_core::Aabb;
-use rkf_core::brick::Brick;
-use rkf_core::brick_map::BrickMap;
 use rkf_core::companion::{BoneBrick, BoneVoxel, ColorBrick, ColorVoxel};
 use rkf_core::constants::BRICK_DIM;
-use rkf_core::sdf_cache::SdfCache;
 use rkf_core::voxel::VoxelSample;
 use rkf_import::bvh::TriangleBvh;
 use rkf_import::material_transfer::{sample_texture_at_triangle, sample_bone_weights_at_triangle};
@@ -30,53 +22,46 @@ use rkf_import::mesh::MeshData;
 use rkf_import::pipeline::{ImportConfig, ImportResult};
 use rkf_import::skeleton_extract::{self, VertexSkinning};
 
-/// Smooth Hermite interpolation (matches WGSL smoothstep).
-fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
-    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
 /// Flat voxel index within a brick (matches rkf-core convention).
 fn voxel_index(x: u8, y: u8, z: u8) -> u32 {
     x as u32 + y as u32 * 8 + z as u32 * 64
 }
 
-/// Result of processing a single brick.
+/// Result of processing a single brick — signed distance, material, and
+/// (optional) color and bone weights for every voxel in the 8×8×8 grid.
 struct BrickResult {
-    sdf_cache: SdfCache,
     color_brick: ColorBrick,
     bone_brick: Option<BoneBrick>,
-    /// Per-voxel opacity (used to build BrickGeometry and VoxelSample).
-    opacities: [f32; 512],
+    /// Per-voxel signed distance (negative = inside mesh).
+    signed_distances: [f32; 512],
     /// Per-voxel material ID from nearest triangle.
     material_ids: [u16; 512],
-    /// Whether any voxel has non-zero opacity.
-    has_surface: bool,
-    /// Whether all voxels are fully opaque.
-    is_fully_solid: bool,
+    /// True if at least one voxel is inside the mesh (d ≤ 0).
+    any_inside: bool,
+    /// True if every voxel is inside the mesh (d ≤ 0 for all 512).
+    all_inside: bool,
 }
 
-/// Process a single brick: compute per-voxel opacity, material, color, and bone weights.
+/// Process a single brick: sample signed distance, material, color, and
+/// bone weights at every voxel center. The brick is in the narrow band
+/// around the surface (the caller already filtered on `bvh.nearest`
+/// distance), so every voxel is worth sampling — no per-voxel gate.
 fn process_brick(
     mesh: &MeshData,
     bvh: &TriangleBvh,
     brick_min: Vec3,
     voxel_size: f32,
-    fade_inner: f32,
-    fade_outer: f32,
     material_id_override: Option<u16>,
     import_colors: bool,
     skinning: Option<&VertexSkinning>,
 ) -> BrickResult {
     let half_voxel = voxel_size * 0.5;
-    let mut sdf_cache = SdfCache::default();
     let mut color_brick = ColorBrick::default();
-    let mut opacities = [0.0f32; 512];
+    let mut signed_distances = [f32::INFINITY; 512];
     let mut material_ids = [0u16; 512];
-    let mut any_nonzero = false;
-    let mut all_solid = true;
+    let mut any_inside = false;
+    let mut all_inside = true;
 
-    // Bone brick — only allocated if skinning data exists
     let mut bone_brick = if skinning.is_some() {
         Some(BoneBrick { data: [BoneVoxel::default(); 512] })
     } else {
@@ -97,21 +82,16 @@ fn process_brick(
                 let nearest = bvh.nearest(pos);
                 let d = nearest.distance;
                 let w = bvh.winding_number(pos);
-                let is_inside = w > 0.5;
+                // Winding-convention-agnostic: closed manifolds give |w|≈1
+                // inside, |w|≈0 outside. Some exported glTF assets have
+                // reversed triangle winding and return w≈−1 inside.
+                let is_inside = w.abs() > 0.5;
                 let signed_d = if is_inside { -d } else { d };
-                let opacity = 1.0 - smoothstep(-fade_inner, fade_outer, signed_d);
 
                 let flat = voxel_index(vx as u8, vy as u8, vz as u8) as usize;
-                opacities[flat] = opacity;
+                signed_distances[flat] = signed_d;
+                if signed_d <= 0.0 { any_inside = true; } else { all_inside = false; }
 
-                if opacity > 0.001 {
-                    any_nonzero = true;
-                }
-                if opacity < 0.999 {
-                    all_solid = false;
-                }
-
-                // Per-triangle material ID
                 let mat_id = if let Some(override_id) = material_id_override {
                     override_id
                 } else {
@@ -124,11 +104,7 @@ fn process_brick(
                 };
                 material_ids[flat] = mat_id;
 
-                // SDF cache stores opacity for .rkf compatibility
-                sdf_cache.set_distance(vx as u8, vy as u8, vz as u8, f16::from_f32(opacity).to_f32());
-
-                // Per-voxel color from mesh texture
-                if import_colors && opacity > 0.01 {
+                if import_colors {
                     if let Some(color) = sample_texture_at_triangle(
                         mesh,
                         nearest.triangle_index,
@@ -138,37 +114,30 @@ fn process_brick(
                     }
                 }
 
-                // Bone weights for any voxel with non-zero opacity
-                // (the skin deform pass needs weights for all deformed voxels,
-                // including those in the opacity transition zone)
                 if let (Some(skin), Some(bb)) = (skinning, bone_brick.as_mut()) {
-                    if opacity > 0.01 {
-                        let bv = sample_bone_weights_at_triangle(
-                            mesh, skin, nearest.triangle_index, &nearest.barycentric,
-                        );
-                        if bv.weights != 0 {
-                            has_any_bone = true;
-                        }
-                        bb.data[flat] = bv;
+                    let bv = sample_bone_weights_at_triangle(
+                        mesh, skin, nearest.triangle_index, &nearest.barycentric,
+                    );
+                    if bv.weights != 0 {
+                        has_any_bone = true;
                     }
+                    bb.data[flat] = bv;
                 }
             }
         }
     }
 
-    // Only keep bone brick if any voxel actually has bone weights
     if !has_any_bone {
         bone_brick = None;
     }
 
     BrickResult {
-        sdf_cache,
         color_brick,
         bone_brick,
-        opacities,
+        signed_distances,
         material_ids,
-        has_surface: any_nonzero,
-        is_fully_solid: all_solid,
+        any_inside,
+        all_inside,
     }
 }
 
@@ -187,316 +156,13 @@ fn auto_voxel_size(aabb: &Aabb) -> f32 {
     tiers[0]
 }
 
-/// Generate a single LOD at the given voxel size.
-fn generate_lod(
-    mesh: &MeshData,
-    bvh: &TriangleBvh,
-    voxel_size: f32,
-    aabb: &Aabb,
-    config: &ImportConfig,
-    skinning: Option<&VertexSkinning>,
-) -> rkf_core::asset_file_v5::SaveLodV5 {
-    use rkf_core::asset_file_v5::SaveLodV5;
-    use rkf_core::brick_geometry::BrickGeometry;
-    use rkf_core::brick_map::{EMPTY_SLOT, INTERIOR_SLOT};
-
-    let brick_world_size = voxel_size * BRICK_DIM as f32;
-    let aabb_size = aabb.max - aabb.min;
-    let padding = voxel_size * 4.0;
-    let dims = glam::UVec3::new(
-        (((aabb_size.x + padding * 2.0) / brick_world_size).ceil() as u32).max(1),
-        (((aabb_size.y + padding * 2.0) / brick_world_size).ceil() as u32).max(1),
-        (((aabb_size.z + padding * 2.0) / brick_world_size).ceil() as u32).max(1),
-    );
-
-    let grid_origin = -Vec3::new(
-        dims.x as f32 * brick_world_size * 0.5,
-        dims.y as f32 * brick_world_size * 0.5,
-        dims.z as f32 * brick_world_size * 0.5,
-    );
-
-    let fade_inner = voxel_size * 1.0;
-    let fade_outer = voxel_size * 3.0;
-
-    // Pass 1: narrow-band culling
-    let narrow_band = brick_world_size * 1.8;
-    let total_brick_count = (dims.x * dims.y * dims.z) as usize;
-    let mut brick_needs_alloc = vec![false; total_brick_count];
-    let mut interior_bricks = vec![false; total_brick_count];
-
-    for bz in 0..dims.z {
-        for by in 0..dims.y {
-            for bx in 0..dims.x {
-                let brick_min = grid_origin
-                    + Vec3::new(
-                        bx as f32 * brick_world_size,
-                        by as f32 * brick_world_size,
-                        bz as f32 * brick_world_size,
-                    );
-                let brick_center = brick_min + Vec3::splat(brick_world_size * 0.5);
-                let nearest = bvh.nearest(brick_center);
-                let bi = (bx + by * dims.x + bz * dims.x * dims.y) as usize;
-
-                if nearest.distance < narrow_band {
-                    brick_needs_alloc[bi] = true;
-                } else {
-                    let w = bvh.winding_number(brick_center);
-                    if w > 0.5 {
-                        interior_bricks[bi] = true;
-                    }
-                }
-            }
-        }
-    }
-
-    // Pass 2: process bricks in parallel
-    struct BrickWork {
-        bx: u32,
-        by: u32,
-        bz: u32,
-        brick_min: Vec3,
-    }
-
-    let mut work_items = Vec::new();
-    for bz in 0..dims.z {
-        for by in 0..dims.y {
-            for bx in 0..dims.x {
-                let bi = (bx + by * dims.x + bz * dims.x * dims.y) as usize;
-                if brick_needs_alloc[bi] {
-                    let brick_min = grid_origin
-                        + Vec3::new(
-                            bx as f32 * brick_world_size,
-                            by as f32 * brick_world_size,
-                            bz as f32 * brick_world_size,
-                        );
-                    work_items.push(BrickWork { bx, by, bz, brick_min });
-                }
-            }
-        }
-    }
-
-    let results: Vec<(BrickWork, BrickResult)> = work_items
-        .into_par_iter()
-        .map(|w| {
-            let result = process_brick(
-                mesh, bvh, w.brick_min, voxel_size, fade_inner, fade_outer,
-                config.material_id_override, config.import_colors, skinning,
-            );
-            (w, result)
-        })
-        .collect();
-
-    // Build brick map and collect data
-    let mut brick_map = BrickMap::new(dims);
-    let mut geometries = Vec::new();
-    let mut sdf_caches = Vec::new();
-    let mut color_bricks = Vec::new();
-    let mut bone_bricks: Vec<BoneBrick> = Vec::new();
-    let mut allocated_count = 0u32;
-    let mut has_any_bones = false;
-
-    // Mark interior bricks
-    for bz in 0..dims.z {
-        for by in 0..dims.y {
-            for bx in 0..dims.x {
-                let bi = (bx + by * dims.x + bz * dims.x * dims.y) as usize;
-                if interior_bricks[bi] {
-                    brick_map.set(bx, by, bz, INTERIOR_SLOT);
-                }
-            }
-        }
-    }
-
-    for (w, result) in results {
-        if !result.has_surface {
-            if result.is_fully_solid {
-                brick_map.set(w.bx, w.by, w.bz, INTERIOR_SLOT);
-            }
-            continue;
-        }
-
-        let slot = allocated_count;
-        brick_map.set(w.bx, w.by, w.bz, slot);
-        allocated_count += 1;
-
-        // Build BrickGeometry from opacity data
-        let mut geo = BrickGeometry::new();
-        for vz in 0..8u8 {
-            for vy in 0..8u8 {
-                for vx in 0..8u8 {
-                    let flat = voxel_index(vx, vy, vz) as usize;
-                    // Mark any voxel with non-trivial opacity as solid.
-                    // This ensures bone weights cover the full transition zone.
-                    if result.opacities[flat] > 0.01 {
-                        geo.set_solid(vx, vy, vz, true);
-                    }
-                }
-            }
-        }
-        geo.rebuild_surface_list();
-
-        // Assign per-triangle material IDs to surface voxels
-        for sv in &mut geo.surface_voxels {
-            sv.material_id = result.material_ids[sv.index() as usize];
-        }
-
-        // Build VoxelSample brick with opacity + material
-        let mut brick = Brick::default();
-        for i in 0..512 {
-            let opacity_f16 = f16::from_f32(result.opacities[i]);
-            brick.voxels[i] = VoxelSample::new(opacity_f16.to_f32(), result.material_ids[i], 0);
-        }
-
-        geometries.push(geo);
-        sdf_caches.push(result.sdf_cache);
-        color_bricks.push(result.color_brick);
-
-        if let Some(bb) = result.bone_brick {
-            has_any_bones = true;
-            bone_bricks.push(bb);
-        } else {
-            bone_bricks.push(BoneBrick { data: [BoneVoxel::default(); 512] });
-        }
-    }
-
-    let has_color = color_bricks.iter().any(|cb| cb.data.iter().any(|cv| cv.intensity() > 0));
-
-    SaveLodV5 {
-        voxel_size,
-        brick_map,
-        geometry: geometries,
-        sdf_cache: Some(sdf_caches),
-        color_bricks: if has_color { Some(color_bricks) } else { None },
-        bone_bricks: if has_any_bones { Some(bone_bricks) } else { None },
-    }
-}
-
-/// Import a mesh file and produce an opacity-voxelized .rkf file.
+/// Import a mesh and produce an octree-native .rkp asset.
 ///
-/// Full feature parity with `rkf_import::pipeline::import_mesh_to_rkf`:
-/// per-triangle materials, per-voxel color, bone weights, multi-LOD, skeleton.
-pub fn import_mesh_to_opacity_rkf(
-    input_path: &Path,
-    output_path: &Path,
-    config: &ImportConfig,
-) -> Result<ImportResult, String> {
-    use rkf_core::asset_file_v5::save_object_v5;
-    use rkf_core::SdfPrimitive;
-    use rkf_import::mesh::load_mesh;
-
-    log::info!("Splat import: loading {}", input_path.display());
-
-    // 1. Load and prepare mesh
-    let input_str = input_path.to_string_lossy();
-    let mut mesh = load_mesh(&input_str).map_err(|e| format!("load mesh: {e}"))?;
-    let norm = rkf_import::pipeline::prepare_mesh(&mut mesh, config);
-
-    let aabb = Aabb::new(mesh.bounds_min, mesh.bounds_max);
-    let has_textures = mesh.materials.iter().any(|m| m.albedo_texture.is_some());
-
-    // 2. Determine finest voxel size
-    let finest_voxel_size = config.voxel_size.unwrap_or_else(|| auto_voxel_size(&aabb));
-
-    // 3. Build BVH
-    log::info!("Splat import: building BVH ({} triangles)", mesh.triangle_count());
-    let bvh = TriangleBvh::build(&mesh);
-
-    // 4. Extract skinning data (if mesh has bones)
-    let skinning = {
-        let input_str_ref = input_path.to_str().unwrap_or("");
-        match skeleton_extract::extract_skeleton(input_str_ref) {
-            Ok(Some(extraction)) => {
-                log::info!("Skeleton found: {} bones", extraction.skeleton.bones.len());
-                Some(extraction)
-            }
-            _ => None,
-        }
-    };
-    let skinning_data = skinning.as_ref().map(|s| &s.skinning);
-
-    // 5. Generate LODs
-    let lod_count = config.lod_levels.max(1);
-    log::info!("Splat import: generating {} LOD level(s), finest voxel_size={}", lod_count, finest_voxel_size);
-
-    let mut lods = Vec::with_capacity(lod_count);
-    let mut total_bricks = 0u32;
-
-    for level in 0..lod_count {
-        let vs = finest_voxel_size * (1u32 << level) as f32;
-        log::info!("Splat import: LOD {} — voxel_size={}", level, vs);
-        let lod = generate_lod(&mesh, &bvh, vs, &aabb, config, skinning_data);
-        total_bricks += lod.brick_map.allocated_count() as u32;
-        lods.push(lod);
-    }
-
-    // 6. Build metadata
-    let center = aabb.center();
-    let bounding_radius = (aabb.max - center).length();
-    let analytical_bound = SdfPrimitive::Sphere { radius: bounding_radius };
-
-    let material_ids: Vec<u16> = if let Some(id) = config.material_id_override {
-        vec![id]
-    } else {
-        (0..mesh.materials.len().min(65536) as u16).collect()
-    };
-
-    // 7. Write .rkf v5 file
-    let file = std::fs::File::create(output_path)
-        .map_err(|e| format!("create output: {e}"))?;
-    let mut writer = std::io::BufWriter::new(file);
-    save_object_v5(&mut writer, &aabb, Some(&analytical_bound), &material_ids, &lods)
-        .map_err(|e| format!("write .rkf: {e}"))?;
-
-    let file_size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
-
-    // 8. Extract and save skeleton sidecar
-    let skeleton_path = if let Some(ref extraction) = skinning {
-        let skel_path = output_path.with_extension("rkskel");
-        let asset = rkf_animation::skeleton_asset::SkeletonAsset::with_normalization(
-            extraction.skeleton.clone(),
-            extraction.clips.clone(),
-            norm.center.to_array(),
-            norm.scale,
-            norm.rotation_offset,
-            norm.rotation_center.to_array(),
-        );
-        match rkf_animation::skeleton_asset::save_rkskel(&asset, &skel_path) {
-            Ok(()) => {
-                log::info!("Saved skeleton: {} bones → {}", extraction.skeleton.bones.len(), skel_path.display());
-                Some(skel_path)
-            }
-            Err(e) => {
-                log::error!("Failed to save .rkskel: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    log::info!(
-        "Splat import: wrote {} ({} bricks across {} LODs, {:.1} KiB)",
-        output_path.display(), total_bricks, lod_count, file_size as f64 / 1024.0,
-    );
-
-    Ok(ImportResult {
-        aabb,
-        total_bricks,
-        lod_count,
-        finest_voxel_size,
-        file_size,
-        skeleton_path,
-    })
-}
-
-// ── Octree-native mesh import (.rkp) ─────────────────────────────────────
-
-/// Import a mesh file and produce an octree-native .rkp file.
-///
-/// Uses the same BVH-based opacity sampling as `import_mesh_to_opacity_rkf`,
-/// but builds a sparse octree instead of a flat BrickMap. The octree provides
-/// built-in LOD (coarser leaves at shallower depths for uniform regions).
-/// No separate LOD levels — the tree IS the hierarchy.
+/// Classifies bricks into narrow-band (surface) vs all-interior (by winding),
+/// samples signed distance per voxel inside surface bricks, then emits a thin
+/// 1-voxel-thick outer shell of leaves with INTERIOR fill behind it. Each
+/// shell leaf carries a pre-baked SDF-gradient normal and a per-voxel albedo
+/// sampled from the mesh texture.
 pub fn import_mesh_to_opacity_rkp(
     input_path: &Path,
     output_path: &Path,
@@ -564,8 +230,6 @@ pub fn import_mesh_to_opacity_rkp(
         depth, voxel_size, 1u32 << depth,
     );
 
-    let fade_inner = voxel_size * 1.0;
-    let fade_outer = voxel_size * 3.0;
     let narrow_band = brick_world_size * 1.8;
 
     // Classify brick-sized regions using BVH narrow-band culling.
@@ -595,7 +259,7 @@ pub fn import_mesh_to_opacity_rkp(
                     surface_work.push(BrickWork { bx, by, bz, brick_min });
                 } else {
                     let w = bvh.winding_number(brick_center);
-                    if w > 0.5 {
+                    if w.abs() > 0.5 {
                         interior_brick_coords.push((bx, by, bz));
                     }
                 }
@@ -613,7 +277,7 @@ pub fn import_mesh_to_opacity_rkp(
         .into_par_iter()
         .map(|w| {
             let result = process_brick(
-                &mesh, &bvh, w.brick_min, voxel_size, fade_inner, fade_outer,
+                &mesh, &bvh, w.brick_min, voxel_size,
                 config.material_id_override, config.import_colors, skinning_data,
             );
             (w, result)
@@ -624,6 +288,10 @@ pub fn import_mesh_to_opacity_rkp(
     let mut octree = rkp_core::SparseOctree::new(depth, voxel_size);
     let mut voxel_data: Vec<VoxelSample> = Vec::new();
     let mut color_voxels: Vec<ColorVoxel> = Vec::new();
+    // Pre-baked SDF-gradient normals per shell leaf, octahedrally packed.
+    // Computed at import time so the runtime never sees an SDF — the load
+    // path just reads these verbatim into LeafAttr.normal_oct.
+    let mut normals_packed: Vec<u32> = Vec::new();
     let mut has_color = false;
     let mut voxel_count = 0u32;
 
@@ -637,48 +305,204 @@ pub fn import_mesh_to_opacity_rkp(
         octree.set_at_level(voxel_coord, brick_depth, rkp_core::sparse_octree::INTERIOR_NODE);
     }
 
-    // Insert individual surface voxels as octree leaves.
-    for (w, result) in results {
-        if !result.has_surface {
-            if result.is_fully_solid {
-                let voxel_coord = glam::UVec3::new(w.bx * 8, w.by * 8, w.bz * 8);
-                octree.set_at_level(voxel_coord, brick_depth, rkp_core::sparse_octree::INTERIOR_NODE);
-            }
+    // Classify voxels into thin outer shell (leaves) and interior. A voxel
+    // becomes a shell leaf iff its signed distance is positive AND at least
+    // one of its 6 face-neighbors is inside (d ≤ 0). Voxels with d ≤ 0 are
+    // interior; outer voxels with all-positive neighbors are empty. This
+    // yields a ~1-voxel-thick surface shell which the load-time
+    // 26-neighborhood normal kernel can resolve cleanly.
+    //
+    // Lookups span bricks, so build an index: surface bricks -> their
+    // per-voxel signed distance grid; plus a set of all-interior bricks.
+    use std::collections::{HashMap, HashSet};
+    let mut brick_result_index: HashMap<(u32, u32, u32), usize> =
+        HashMap::with_capacity(results.len());
+    let mut interior_brick_set: HashSet<(u32, u32, u32)> =
+        interior_brick_coords.iter().copied().collect();
+    for (i, (w, result)) in results.iter().enumerate() {
+        if result.all_inside {
+            // Every voxel in this surface-band brick is inside the mesh —
+            // collapse the whole brick to INTERIOR rather than emitting
+            // 512 individual INTERIOR_NODE insertions.
+            interior_brick_set.insert((w.bx, w.by, w.bz));
+        } else {
+            // Brick straddles the surface (or is fully outside but in the
+            // narrow band). Either way we need per-voxel signed distances
+            // available for shell classification and SDF-gradient lookups.
+            brick_result_index.insert((w.bx, w.by, w.bz), i);
+        }
+    }
+
+    let sdf_at = |gx: i64, gy: i64, gz: i64| -> f32 {
+        if gx < 0 || gy < 0 || gz < 0 {
+            return f32::INFINITY;
+        }
+        let (gx, gy, gz) = (gx as u32, gy as u32, gz as u32);
+        let bx = gx / 8;
+        let by = gy / 8;
+        let bz = gz / 8;
+        if bx >= octree_bricks || by >= octree_bricks || bz >= octree_bricks {
+            return f32::INFINITY;
+        }
+        if let Some(&idx) = brick_result_index.get(&(bx, by, bz)) {
+            let lx = gx % 8;
+            let ly = gy % 8;
+            let lz = gz % 8;
+            results[idx].1.signed_distances[(lx + ly * 8 + lz * 64) as usize]
+        } else if interior_brick_set.contains(&(bx, by, bz)) {
+            f32::NEG_INFINITY
+        } else {
+            f32::INFINITY
+        }
+    };
+
+    // Emit shell leaves as bricks at the octree's brick level. Each brick
+    // covers BRICK_DIM³ voxels (currently 4³ = 64 cells). An 8³ importer
+    // region therefore contains (8/BRICK_DIM)³ = 2³ = 8 octree bricks when
+    // BRICK_DIM=4; the loop below handles the general case so the two are
+    // decoupled.
+    //
+    // Each 4³ subregion is classified as:
+    //   - all-interior        → INTERIOR_NODE at octree_brick_depth
+    //   - all-exterior        → EMPTY (no insertion)
+    //   - mixed (has a shell) → allocate brick; cells = slot for shell,
+    //                           BRICK_CELL_EMPTY for interior/exterior
+    let octree_brick_dim = rkp_core::brick_pool::BRICK_DIM as u32;
+    let octree_brick_levels = rkp_core::brick_pool::BRICK_LEVELS;
+    assert!(
+        depth > octree_brick_levels,
+        "octree depth ({depth}) must exceed BRICK_LEVELS ({octree_brick_levels}) to host bricks",
+    );
+    let octree_brick_depth = depth - octree_brick_levels;
+    let subbricks_per_axis = 8 / octree_brick_dim; // 2 for BRICK_DIM=4
+    let mut file_bricks: Vec<u32> = Vec::new(); // flat cell storage
+    let brick_cells_u32 = (octree_brick_dim * octree_brick_dim * octree_brick_dim) as usize;
+
+    for (w, result) in &results {
+        if result.all_inside {
+            let voxel_coord = glam::UVec3::new(w.bx * 8, w.by * 8, w.bz * 8);
+            octree.set_at_level(voxel_coord, brick_depth, rkp_core::sparse_octree::INTERIOR_NODE);
             continue;
         }
 
-        for vz in 0..8u32 {
-            for vy in 0..8u32 {
-                for vx in 0..8u32 {
-                    let flat = (vx + vy * 8 + vz * 64) as usize;
-                    let opacity = result.opacities[flat];
-                    if opacity <= 0.001 {
-                        continue; // empty voxel — octree default
+        for sbz in 0..subbricks_per_axis {
+            for sby in 0..subbricks_per_axis {
+                for sbx in 0..subbricks_per_axis {
+                    let sub_origin_x = sbx * octree_brick_dim;
+                    let sub_origin_y = sby * octree_brick_dim;
+                    let sub_origin_z = sbz * octree_brick_dim;
+
+                    // Classify the 4³ subregion and collect shell data in
+                    // one pass. Records are (cell_flat, slot_contents).
+                    struct ShellEntry {
+                        cell_flat: u32,
+                        vx: u32, vy: u32, vz: u32, // local in 8³
+                        gx: u32, gy: u32, gz: u32, // global
+                    }
+                    let mut all_interior = true;
+                    let mut any_shell = false;
+                    let mut shell_entries: Vec<ShellEntry> = Vec::new();
+
+                    for cz in 0..octree_brick_dim {
+                        for cy in 0..octree_brick_dim {
+                            for cx in 0..octree_brick_dim {
+                                let vx = sub_origin_x + cx;
+                                let vy = sub_origin_y + cy;
+                                let vz = sub_origin_z + cz;
+                                let flat8 = (vx + vy * 8 + vz * 64) as usize;
+                                let d = result.signed_distances[flat8];
+                                if d > 0.0 {
+                                    all_interior = false;
+                                    let gx = w.bx * 8 + vx;
+                                    let gy = w.by * 8 + vy;
+                                    let gz = w.bz * 8 + vz;
+
+                                    // 26-neighbor sign-change test (cross-brick
+                                    // via sdf_at).
+                                    let mut has_inside = false;
+                                    'shell: for dz in -1i64..=1 {
+                                        for dy in -1i64..=1 {
+                                            for dx in -1i64..=1 {
+                                                if dx == 0 && dy == 0 && dz == 0 { continue; }
+                                                if sdf_at(gx as i64 + dx, gy as i64 + dy, gz as i64 + dz) <= 0.0 {
+                                                    has_inside = true;
+                                                    break 'shell;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if has_inside {
+                                        any_shell = true;
+                                        let cell_flat = cx + cy * octree_brick_dim + cz * octree_brick_dim * octree_brick_dim;
+                                        shell_entries.push(ShellEntry {
+                                            cell_flat, vx, vy, vz, gx, gy, gz,
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
 
-                    let slot = voxel_count;
-                    let voxel_coord = glam::UVec3::new(
-                        w.bx * 8 + vx,
-                        w.by * 8 + vy,
-                        w.bz * 8 + vz,
+                    let sub_origin_coord = glam::UVec3::new(
+                        w.bx * 8 + sub_origin_x,
+                        w.by * 8 + sub_origin_y,
+                        w.bz * 8 + sub_origin_z,
                     );
 
-                    if opacity >= 0.999 {
-                        octree.insert_interior(voxel_coord);
-                    } else {
-                        octree.insert(voxel_coord, slot);
-                        let mat_id = result.material_ids[flat];
-                        voxel_data.push(VoxelSample::new(opacity, mat_id, 0));
+                    if all_interior {
+                        octree.set_at_level(
+                            sub_origin_coord, octree_brick_depth,
+                            rkp_core::sparse_octree::INTERIOR_NODE,
+                        );
+                        continue;
+                    }
+                    if !any_shell {
+                        // No shell cells in this subregion — leave as EMPTY.
+                        continue;
+                    }
 
-                        // Per-voxel color
-                        let cv = result.color_brick.data[flat];
+                    // Allocate a brick in the file-local pool, populate cells.
+                    let brick_id = (file_bricks.len() / brick_cells_u32) as u32;
+                    file_bricks.extend(std::iter::repeat(rkp_core::brick_pool::BRICK_EMPTY).take(brick_cells_u32));
+                    let brick_base = brick_id as usize * brick_cells_u32;
+
+                    for e in &shell_entries {
+                        // SDF-gradient normal (6-tap central differences).
+                        let grad = glam::Vec3::new(
+                            sdf_at(e.gx as i64 + 1, e.gy as i64, e.gz as i64)
+                                - sdf_at(e.gx as i64 - 1, e.gy as i64, e.gz as i64),
+                            sdf_at(e.gx as i64, e.gy as i64 + 1, e.gz as i64)
+                                - sdf_at(e.gx as i64, e.gy as i64 - 1, e.gz as i64),
+                            sdf_at(e.gx as i64, e.gy as i64, e.gz as i64 + 1)
+                                - sdf_at(e.gx as i64, e.gy as i64, e.gz as i64 - 1),
+                        );
+                        let normal = if grad.length_squared() > 1e-12 {
+                            grad.normalize()
+                        } else {
+                            glam::Vec3::Y
+                        };
+                        let normal_oct = rkp_core::leaf_attr::pack_oct(normal);
+
+                        let flat8 = (e.vx + e.vy * 8 + e.vz * 64) as usize;
+                        let mat_id = result.material_ids[flat8];
+                        let cv = result.color_brick.data[flat8];
                         if cv.intensity() > 0 {
                             has_color = true;
                         }
-                        color_voxels.push(cv);
 
+                        let slot = voxel_count;
+                        voxel_data.push(VoxelSample::new(0.0, mat_id, 0));
+                        normals_packed.push(normal_oct);
+                        color_voxels.push(cv);
                         voxel_count += 1;
+
+                        file_bricks[brick_base + e.cell_flat as usize] = slot;
                     }
+
+                    octree.set_at_level(
+                        sub_origin_coord, octree_brick_depth,
+                        rkp_core::sparse_octree::make_brick(brick_id),
+                    );
                 }
             }
         }
@@ -695,12 +519,14 @@ pub fn import_mesh_to_opacity_rkp(
             ));
         }
     }
+    let file_brick_count = file_bricks.len() / brick_cells_u32;
     eprintln!(
-        "Splat import (per-voxel octree): {} leaf voxels, {} octree nodes, {} colored (has_color={}), samples: [{}]",
-        voxel_count, octree.node_count(), colored_count, has_color, sample_colors.join(", "),
+        "Splat import (brick octree): {} shell voxels, {} bricks, {} octree nodes, {} colored",
+        voxel_count, file_brick_count, octree.node_count(), colored_count,
     );
+    let _ = sample_colors;
 
-    // 5. Serialize to .rkp v2 (per-voxel format)
+    // 5. Serialize to .rkp v4 (brick-terminated octree).
     let material_ids: Vec<u16> = if let Some(id) = config.material_id_override {
         vec![id]
     } else {
@@ -725,6 +551,28 @@ pub fn import_mesh_to_opacity_rkp(
         None
     };
 
+    let normals_bytes: Vec<u8> = normals_packed
+        .iter()
+        .flat_map(|n| bytemuck::bytes_of(n))
+        .copied()
+        .collect();
+    let normals_data: Option<&[u8]> = if !normals_bytes.is_empty() {
+        Some(&normals_bytes)
+    } else {
+        None
+    };
+
+    let bricks_bytes: Vec<u8> = file_bricks
+        .iter()
+        .flat_map(|c| bytemuck::bytes_of(c))
+        .copied()
+        .collect();
+    let bricks_data: Option<&[u8]> = if !bricks_bytes.is_empty() {
+        Some(&bricks_bytes)
+    } else {
+        None
+    };
+
     // TODO: Per-voxel bone data (bone weights per leaf voxel, not per brick)
     let bone_data: Option<&[u8]> = None;
 
@@ -732,9 +580,10 @@ pub fn import_mesh_to_opacity_rkp(
         .map_err(|e| format!("create output: {e}"))?;
     let mut writer = std::io::BufWriter::new(file);
 
-    // Expand AABB by the fade zone so it encompasses all voxels with nonzero opacity.
-    let fade_margin = Vec3::splat(fade_outer + voxel_size);
-    let geometry_aabb = Aabb::new(aabb.min - fade_margin, aabb.max + fade_margin);
+    // Expand AABB by one voxel so the outer shell voxels (one voxel beyond
+    // the mesh surface on the outside) fall inside the geometry bounds.
+    let shell_margin = Vec3::splat(voxel_size);
+    let geometry_aabb = Aabb::new(aabb.min - shell_margin, aabb.max + shell_margin);
     rkp_core::asset_file::write_rkp(
         &mut writer,
         octree.as_slice(),
@@ -745,6 +594,8 @@ pub fn import_mesh_to_opacity_rkp(
         geometry_aabb.max.to_array(),
         &material_ids,
         &voxel_bytes,
+        normals_data,
+        bricks_data,
         color_data.as_deref(),
         bone_data,
     )

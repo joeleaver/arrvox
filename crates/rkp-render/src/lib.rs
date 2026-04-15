@@ -31,7 +31,6 @@ pub mod rkp_renderer;
 /// Scene management — voxel pool, octree, face emission, asset loading.
 pub mod rkp_scene_manager;
 
-pub use voxelize_opacity::import_mesh_to_opacity_rkf;
 pub use voxelize_opacity::import_mesh_to_opacity_rkp;
 pub use octree_gpu::OctreeGpu;
 pub use rkp_scene_manager::RkpSceneManager;

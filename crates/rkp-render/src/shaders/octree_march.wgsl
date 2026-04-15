@@ -522,17 +522,18 @@ fn march_object(
                         result.t = t;
                         result.first_slot = cell;
                         result.valid = true;
+                        // Cell already passed != BRICK_CELL_EMPTY; it's a
+                        // valid leaf_attr_id (possibly 0), so always read
+                        // the color pool. Inner cp != 0 falls back to gray.
                         var color = vec3<f32>(0.5);
-                        if cell != 0u {
-                            atomicAdd(&stats[46], 1u); // color_pool read
-                            let cp = color_pool_data[cell];
-                            if cp != 0u {
-                                color = vec3<f32>(
-                                    f32(cp & 0xFFu) / 255.0,
-                                    f32((cp >> 8u) & 0xFFu) / 255.0,
-                                    f32((cp >> 16u) & 0xFFu) / 255.0,
-                                );
-                            }
+                        atomicAdd(&stats[46], 1u); // color_pool read
+                        let cp = color_pool_data[cell];
+                        if cp != 0u {
+                            color = vec3<f32>(
+                                f32(cp & 0xFFu) / 255.0,
+                                f32((cp >> 8u) & 0xFFu) / 255.0,
+                                f32((cp >> 16u) & 0xFFu) / 255.0,
+                            );
                         }
                         result.color = color;
                         result.steps = step_count;
@@ -546,16 +547,14 @@ fn march_object(
                     result.oc_pos += p * weight;
                     result.normal += cell_normal * weight;
                     var color = vec3<f32>(0.5);
-                    if cell != 0u {
-                        atomicAdd(&stats[46], 1u);
-                        let cp = color_pool_data[cell];
-                        if cp != 0u {
-                            color = vec3<f32>(
-                                f32(cp & 0xFFu) / 255.0,
-                                f32((cp >> 8u) & 0xFFu) / 255.0,
-                                f32((cp >> 16u) & 0xFFu) / 255.0,
-                            );
-                        }
+                    atomicAdd(&stats[46], 1u);
+                    let cp_t = color_pool_data[cell];
+                    if cp_t != 0u {
+                        color = vec3<f32>(
+                            f32(cp_t & 0xFFu) / 255.0,
+                            f32((cp_t >> 8u) & 0xFFu) / 255.0,
+                            f32((cp_t >> 16u) & 0xFFu) / 255.0,
+                        );
                     }
                     result.color += color * weight;
                     result.alpha += weight;
@@ -618,7 +617,10 @@ fn march_object(
             result.first_slot = leaf_id;
             result.valid = true;
             var color = vec3<f32>(0.5);
-            if leaf_id != 0u {
+            // Only LEAF hits have a color; INTERIOR hits keep the gray default.
+            // We can't key off leaf_id == 0 because slot 0 is a valid pool
+            // allocation — that would mis-render the first-allocated leaf.
+            if r.slot != OCTREE_INTERIOR {
                 atomicAdd(&stats[46], 1u); // color_pool read
                 let cp = color_pool_data[leaf_id];
                 if cp != 0u {
@@ -642,7 +644,7 @@ fn march_object(
         result.normal += sample_normal * weight;
 
         var color = vec3<f32>(0.5);
-        if leaf_id != 0u {
+        if r.slot != OCTREE_INTERIOR {
             atomicAdd(&stats[46], 1u); // color_pool read
             let cp = color_pool_data[leaf_id];
             if cp != 0u {
