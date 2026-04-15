@@ -59,7 +59,7 @@ use std::collections::HashMap;
 
 use glam::Vec3;
 
-use crate::brick_pool::{BrickPool, BRICK_CELLS, BRICK_DIM, BRICK_EMPTY};
+use crate::brick_pool::{BrickPool, BRICK_CELLS, BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR};
 use crate::leaf_attr::LeafAttr;
 use crate::leaf_attr_pool::LeafAttrPool;
 use crate::sparse_octree::{
@@ -304,7 +304,12 @@ fn aggregate_brick(
         for y in 0..BRICK_DIM {
             for x in 0..BRICK_DIM {
                 let cell = brick_pool.get_cell(brick_id, x, y, z);
-                if cell == BRICK_EMPTY {
+                // Skip empty air and skip interior-bulk markers — the
+                // latter have no per-cell LeafAttr (they're a sentinel,
+                // not a pool index) and carry no shading info beyond
+                // "occupied". LOD prefilter averages visible surface
+                // contributions only.
+                if cell == BRICK_EMPTY || cell == BRICK_INTERIOR {
                     continue;
                 }
                 let leaf_attr = *leaf_attr_pool.get(cell);

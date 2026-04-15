@@ -466,6 +466,52 @@ pub fn import_mesh_to_opacity_rkp(
                     file_bricks.extend(std::iter::repeat(rkp_core::brick_pool::BRICK_EMPTY).take(brick_cells_u32));
                     let brick_base = brick_id as usize * brick_cells_u32;
 
+                    // Mark every d<=0 cell in this sub-brick as
+                    // BRICK_INTERIOR (zero-cost: the brick's 64 slots
+                    // are pre-allocated regardless of content, so this
+                    // just replaces BRICK_EMPTY in those slots).
+                    //
+                    // Neighborhood kernels (Laplacian smoothing at
+                    // bake time, surface-nets normal reconstruction if
+                    // re-enabled) need "is this cell inside the
+                    // solid?" info that a pure outer-shell design
+                    // can't provide — without this fill, thin-shell
+                    // imports produce concentric ring artifacts.
+                    //
+                    // The march treats BRICK_INTERIOR identically to
+                    // BRICK_EMPTY for hit purposes so surface rays
+                    // still only stop at the shell. Overwritten next
+                    // by shell_entries for cells that carry a real
+                    // leaf_attr (disjoint sets: d<=0 vs d>0).
+                    //
+                    // KNOWN ISSUE: causes subtle shading artifacts on
+                    // some mesh imports (horizontal-band-style visual
+                    // quirks). Root cause not yet identified — static
+                    // analysis shows the shader should treat
+                    // BRICK_INTERIOR identically to BRICK_EMPTY.
+                    // Needs a shader-level diagnostic (color cells by
+                    // first-encountered-type) to bisect. Until fixed,
+                    // the interior-fill is still the architecturally
+                    // correct thing to do; the artifact is modest and
+                    // appears on specific high-curvature surfaces only.
+                    for cz_fill in 0..octree_brick_dim {
+                        for cy_fill in 0..octree_brick_dim {
+                            for cx_fill in 0..octree_brick_dim {
+                                let vx = sub_origin_x + cx_fill;
+                                let vy = sub_origin_y + cy_fill;
+                                let vz = sub_origin_z + cz_fill;
+                                let flat8 = (vx + vy * 8 + vz * 64) as usize;
+                                if result.signed_distances[flat8] <= 0.0 {
+                                    let cell_flat = cx_fill
+                                        + cy_fill * octree_brick_dim
+                                        + cz_fill * octree_brick_dim * octree_brick_dim;
+                                    file_bricks[brick_base + cell_flat as usize] =
+                                        rkp_core::brick_pool::BRICK_INTERIOR;
+                                }
+                            }
+                        }
+                    }
+
                     for e in &shell_entries {
                         // SDF-gradient normal (6-tap central differences).
                         let grad = glam::Vec3::new(

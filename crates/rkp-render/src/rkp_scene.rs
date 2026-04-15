@@ -45,6 +45,12 @@ pub struct GeometryUpload<'a> {
     /// Indexed by `brick_id * 64 + flat_cell_index`. A cell's value is either
     /// 0xFFFFFFFF (empty) or a leaf_attr_id.
     pub brick_pool: &'a [u8],
+    /// Brick face-adjacency links — 6 u32 per brick in the order
+    /// `(−X, +X, −Y, +Y, −Z, +Z)`, byte-cast. Each entry is a
+    /// neighboring brick_id or a FACE_EMPTY/FACE_INTERIOR sentinel.
+    /// Used by the Surface-Nets reconstruction shader to traverse into
+    /// adjacent bricks for cross-boundary neighbor reads.
+    pub brick_face_links: &'a [u8],
 }
 
 /// Per-frame data — uploaded every frame (cheap: objects + camera).
@@ -71,7 +77,10 @@ pub struct FrameUpload<'a> {
 ///   4: color_pool (storage, read) — parallel to leaf_attr_pool
 ///   5: bone_matrices (storage, read)
 ///   6: bone_weights (storage, read)
-///   7: deformed_pool (storage, read)
+///   7: brick_face_links (storage, read) — 6 u32 per brick giving
+///       adjacent brick ids / FACE_{EMPTY,INTERIOR} sentinels. (This
+///       slot was `deformed_pool` pre-Surface-Nets; deformed_pool
+///       wasn't wired into the active pipeline so the slot was free.)
 ///   8: leaf_attr_pool (storage, read) — `LeafAttr { normal_oct, material_primary, material_secondary_blend }`
 ///
 /// 8 storage buffers + 1 uniform in group 0; group 2 holds 4 more storage
@@ -85,7 +94,7 @@ pub struct RkpScene {
     pub color_pool_buffer: wgpu::Buffer,
     pub bone_matrices_buffer: wgpu::Buffer,
     pub bone_weights_buffer: wgpu::Buffer,
-    pub deformed_pool_buffer: wgpu::Buffer,
+    pub brick_face_links_buffer: wgpu::Buffer,
     pub leaf_attr_pool_buffer: wgpu::Buffer,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub bind_group: wgpu::BindGroup,
@@ -106,20 +115,20 @@ impl RkpScene {
         let color_pool_buffer = Self::create_storage(device, "rkp_color_pool", 4);
         let bone_matrices_buffer = Self::create_storage(device, "rkp_bone_matrices", 64);
         let bone_weights_buffer = Self::create_storage(device, "rkp_bone_weights", 4);
-        let deformed_pool_buffer = Self::create_storage(device, "rkp_deformed_pool", 8);
+        let brick_face_links_buffer = Self::create_storage(device, "rkp_brick_face_links", 24);
         let leaf_attr_pool_buffer = Self::create_storage(device, "rkp_leaf_attr_pool", 8);
 
         let bind_group_layout = Self::create_layout(device);
         let bind_group = Self::create_bind_group(device, &bind_group_layout,
             &brick_pool_buffer, &octree_nodes_buffer, &objects_buffer,
             &camera_buffer, &color_pool_buffer, &bone_matrices_buffer,
-            &bone_weights_buffer, &deformed_pool_buffer, &leaf_attr_pool_buffer,
+            &bone_weights_buffer, &brick_face_links_buffer, &leaf_attr_pool_buffer,
         );
 
         Self {
             brick_pool_buffer, octree_nodes_buffer, objects_buffer,
             camera_buffer, color_pool_buffer, bone_matrices_buffer,
-            bone_weights_buffer, deformed_pool_buffer, leaf_attr_pool_buffer,
+            bone_weights_buffer, brick_face_links_buffer, leaf_attr_pool_buffer,
             bind_group_layout, bind_group,
         }
     }
@@ -162,6 +171,7 @@ impl RkpScene {
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.octree_nodes_buffer, "rkp_octree_nodes", interleaved_bytes);
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.leaf_attr_pool_buffer, "rkp_leaf_attr_pool", data.leaf_attr_pool);
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.color_pool_buffer, "rkp_color_pool", data.color_pool);
+        needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.brick_face_links_buffer, "rkp_brick_face_links", data.brick_face_links);
 
         let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
         eprintln!(
@@ -203,7 +213,7 @@ impl RkpScene {
         self.bind_group = Self::create_bind_group(device, &self.bind_group_layout,
             &self.brick_pool_buffer, &self.octree_nodes_buffer, buffer,
             &self.camera_buffer, &self.color_pool_buffer, &self.bone_matrices_buffer,
-            &self.bone_weights_buffer, &self.deformed_pool_buffer, &self.leaf_attr_pool_buffer,
+            &self.bone_weights_buffer, &self.brick_face_links_buffer, &self.leaf_attr_pool_buffer,
         );
     }
 
@@ -237,7 +247,7 @@ impl RkpScene {
         self.bind_group = Self::create_bind_group(device, &self.bind_group_layout,
             &self.brick_pool_buffer, &self.octree_nodes_buffer, &self.objects_buffer,
             &self.camera_buffer, &self.color_pool_buffer, &self.bone_matrices_buffer,
-            &self.bone_weights_buffer, &self.deformed_pool_buffer, &self.leaf_attr_pool_buffer,
+            &self.bone_weights_buffer, &self.brick_face_links_buffer, &self.leaf_attr_pool_buffer,
         );
     }
 
@@ -281,7 +291,7 @@ impl RkpScene {
                 storage_ro(4), // color_pool
                 storage_ro(5), // bone_matrices
                 storage_ro(6), // bone_weights
-                storage_ro(7), // deformed_pool
+                storage_ro(7), // brick_face_links (was deformed_pool)
                 storage_ro(8), // leaf_attr_pool
             ],
         })
@@ -297,7 +307,7 @@ impl RkpScene {
         color_pool: &wgpu::Buffer,
         bone_matrices: &wgpu::Buffer,
         bone_weights: &wgpu::Buffer,
-        deformed_pool: &wgpu::Buffer,
+        brick_face_links: &wgpu::Buffer,
         leaf_attr_pool: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -311,7 +321,7 @@ impl RkpScene {
                 wgpu::BindGroupEntry { binding: 4, resource: color_pool.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: bone_matrices.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: bone_weights.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: deformed_pool.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: brick_face_links.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: leaf_attr_pool.as_entire_binding() },
             ],
         })
