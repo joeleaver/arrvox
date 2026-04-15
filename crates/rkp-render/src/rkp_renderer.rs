@@ -91,7 +91,9 @@ impl RkpRenderer {
         let atmosphere = RkpAtmospherePass::new(device);
 
         shade.set_shade_data(device, &shade_params_buffer, &lights_buffer, &materials_buffer);
-        shade.set_camera(device, &scene.camera_buffer);
+        // Camera is per-viewport now; ViewportRenderer::new re-points
+        // shade's camera binding at its own `camera_buffer`. We leave it
+        // uninitialized here — a renderer without a VR doesn't render.
         shade.set_atmosphere_luts(device, &atmosphere.transmittance_view, &atmosphere.multiscatter_view, &atmosphere.lut_sampler, &atmosphere.sky_view_view, &atmosphere.ap_view);
         march.set_materials(device, &materials_buffer);
         march.set_lights(device, &lights_buffer);
@@ -142,10 +144,13 @@ impl RkpRenderer {
     }
 
     /// Render: march (+ per-light shadow) → SSAO → shade.
+    /// `scene_bind_group` comes from the calling viewport (each VR owns
+    /// its own, tying the shared scene buffers to its own camera).
     pub fn render(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         queue: &wgpu::Queue,
+        scene_bind_group: &wgpu::BindGroup,
         object_count: u32,
         width: u32,
         height: u32,
@@ -170,7 +175,7 @@ impl RkpRenderer {
         {
             let q = self.profiler.begin_query("march", encoder);
             self.march.dispatch(
-                encoder, queue, &self.scene.bind_group,
+                encoder, queue, scene_bind_group,
                 object_count, width, height, 0,
                 shadow_steps, num_lights, None,
             );
@@ -182,7 +187,7 @@ impl RkpRenderer {
         // upsample happens inline in the shade pass.
         if let Some(params_bg) = self.march.params_bind_group() {
             let q = self.profiler.begin_query("shadow", encoder);
-            self.shadow_trace.dispatch(encoder, &self.scene.bind_group, params_bg);
+            self.shadow_trace.dispatch(encoder, scene_bind_group, params_bg);
             self.profiler.end_query(encoder, q);
         }
         self.march.copy_stats(encoder);
@@ -242,9 +247,16 @@ impl RkpRenderer {
         screen_aabbs: &[u8],
         atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
     ) {
+        // Point shade's camera binding at THIS viewport's camera buffer.
+        // Single-viewport case this is redundant (already wired at VR
+        // construction), but with multiple visible viewports each pass
+        // of render_to must re-aim shade at the current target.
+        self.shade.set_camera(&self.device, &viewport.camera_buffer);
+
         // Renderer-internal pipeline (march, shadow, ssao, shade, vol, god_rays).
         self.render(
-            encoder, queue, object_count, viewport.width, viewport.height,
+            encoder, queue, &viewport.scene_bind_group,
+            object_count, viewport.width, viewport.height,
             shadow_steps, num_lights, screen_aabbs, atmo_frame_params,
         );
 

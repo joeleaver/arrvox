@@ -13,8 +13,16 @@
 //! composite chain that lives here.
 
 use crate::rkp_renderer::RkpRenderer;
+use crate::rkp_scene::{CameraUniforms, RkpScene};
 
-/// Per-viewport render targets and post-process passes.
+/// Per-viewport render targets, post-process passes, and camera binding.
+///
+/// Each VR owns its own `camera_buffer` + `scene_bind_group` so that two
+/// viewports of different cameras can render into one encoder without
+/// racing on the camera uniform. The bind group re-references the
+/// scene's shared buffers (objects, octree, leaf_attr, etc.) — when any
+/// of those reallocates (`RkpScene::buffers_epoch` bumps), VRs rebuild
+/// via `refresh_scene_bind_group`.
 pub struct ViewportRenderer {
     pub gbuffer: rkf_render::GBuffer,
     pub bloom: rkf_render::BloomPass,
@@ -34,6 +42,15 @@ pub struct ViewportRenderer {
     pub readback_ready: bool,
     /// Wireframe overlay pass (gizmos drawn over the composite).
     pub wireframe_pass: rkf_render::WireframePass,
+    /// This viewport's camera uniform. Bound at slot 3 of `scene_bind_group`.
+    pub camera_buffer: wgpu::Buffer,
+    /// Bind group re-used by march / shadow_trace for this viewport — ties
+    /// the shared scene buffers to this VR's camera. Rebuilt when the scene
+    /// epoch advances (see `refresh_scene_bind_group`).
+    pub scene_bind_group: wgpu::BindGroup,
+    /// Epoch at which `scene_bind_group` was last built. Compared to
+    /// `RkpScene::buffers_epoch()` to detect stale group references.
+    scene_epoch: u64,
     pub width: u32,
     pub height: u32,
 }
@@ -42,16 +59,32 @@ impl ViewportRenderer {
     /// Build a viewport renderer at the given size. Wires the supplied
     /// `RkpRenderer`'s march/shade/etc. bind groups to this G-buffer, and
     /// chains bloom from the renderer's god-ray output. The renderer must
-    /// already be sized to `(width, height)`; in Phase 2 the engine only
-    /// has one viewport so this is automatic.
+    /// already be sized to `(width, height)`; with a single viewport the
+    /// engine keeps them in step automatically.
     pub fn new(
         device: &wgpu::Device,
         renderer: &mut RkpRenderer,
         width: u32,
         height: u32,
     ) -> Self {
+        let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rkp_vr_camera"),
+            size: std::mem::size_of::<CameraUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Scene bind group + epoch: borrow scene immutably, release before
+        // touching &mut renderer below. Split-borrow via explicit scope.
+        let (scene_bind_group, scene_epoch) = {
+            let scene: &RkpScene = &renderer.scene;
+            (scene.build_bind_group(device, &camera_buffer), scene.buffers_epoch())
+        };
+
         let gbuffer = rkf_render::GBuffer::new(device, width, height);
         renderer.set_gbuffer(&gbuffer);
+        // Point shade's separate camera binding at this VR's camera. Later
+        // render_to calls refresh this per-viewport.
+        renderer.shade.set_camera(device, &camera_buffer);
 
         let bloom = rkf_render::BloomPass::new(
             device,
@@ -105,8 +138,28 @@ impl ViewportRenderer {
             readback_index: 0,
             readback_ready: false,
             wireframe_pass,
+            camera_buffer,
+            scene_bind_group,
+            scene_epoch,
             width,
             height,
+        }
+    }
+
+    /// Upload this viewport's camera uniform. Cheap — a single 208-byte
+    /// `queue.write_buffer`.
+    pub fn upload_camera(&self, queue: &wgpu::Queue, camera: &CameraUniforms) {
+        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+    }
+
+    /// Rebuild `scene_bind_group` if the scene's buffers epoch has moved
+    /// past ours. Call once per frame per VR before `render_to`. Cheap
+    /// when epochs match (no-op); one `create_bind_group` when they don't.
+    pub fn refresh_scene_bind_group(&mut self, device: &wgpu::Device, scene: &RkpScene) {
+        let current = scene.buffers_epoch();
+        if current != self.scene_epoch {
+            self.scene_bind_group = scene.build_bind_group(device, &self.camera_buffer);
+            self.scene_epoch = current;
         }
     }
 
@@ -129,6 +182,10 @@ impl ViewportRenderer {
 
         self.gbuffer = rkf_render::GBuffer::new(device, width, height);
         renderer.set_gbuffer(&self.gbuffer);
+        // shade's camera binding is stable across resizes (the buffer
+        // doesn't change), but the renderer's gbuffer wiring does and
+        // `set_gbuffer` also refreshes shade's gbuffer bind group.
+        renderer.shade.set_camera(device, &self.camera_buffer);
 
         self.bloom = rkf_render::BloomPass::new(
             device,

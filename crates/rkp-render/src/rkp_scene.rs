@@ -54,12 +54,11 @@ pub struct GeometryUpload<'a> {
     pub brick_pool: &'a [u8],
 }
 
-/// Per-frame data — uploaded every frame (cheap: objects + camera).
+/// Per-frame data — objects only. Camera uniforms are per-viewport and
+/// uploaded separately via `ViewportRenderer::upload_camera`.
 pub struct FrameUpload<'a> {
     /// Per-object metadata, built from scene/ECS state.
     pub objects: &'a [RkpGpuObject],
-    /// Camera uniforms.
-    pub camera: &'a CameraUniforms,
 }
 
 /// GPU scene buffer manager for RKIPatch.
@@ -80,18 +79,25 @@ pub struct FrameUpload<'a> {
 /// 9 storage buffers + 1 uniform in group 0; group 2 holds 3 more storage
 /// buffers + 2 uniforms — total 12 storage buffers per stage, exactly at
 /// the rkf-render device limit.
+/// Shared scene GPU buffers. The camera uniform is **not** here — it's
+/// per-viewport (`ViewportRenderer::camera_buffer`) so that two viewports
+/// can render different cameras inside one encoder without racing.
+/// `build_bind_group` stamps out a bind group pairing these shared buffers
+/// with the caller's camera buffer; each VR owns its own group.
 pub struct RkpScene {
     pub brick_pool_buffer: wgpu::Buffer,
     pub octree_nodes_buffer: wgpu::Buffer,
     pub objects_buffer: wgpu::Buffer,
-    pub camera_buffer: wgpu::Buffer,
     pub color_pool_buffer: wgpu::Buffer,
     pub bone_matrices_buffer: wgpu::Buffer,
     pub bone_weights_buffer: wgpu::Buffer,
     pub deformed_pool_buffer: wgpu::Buffer,
     pub leaf_attr_pool_buffer: wgpu::Buffer,
     pub bind_group_layout: wgpu::BindGroupLayout,
-    pub bind_group: wgpu::BindGroup,
+    /// Incremented whenever a shared buffer reallocates. Each VR caches
+    /// the epoch it built its bind group at; rebuilds when the scene's
+    /// epoch moves ahead.
+    buffers_epoch: u64,
 }
 
 impl RkpScene {
@@ -99,12 +105,6 @@ impl RkpScene {
         let brick_pool_buffer = Self::create_storage(device, "rkp_brick_pool", 256);
         let octree_nodes_buffer = Self::create_storage(device, "rkp_octree_nodes", 4);
         let objects_buffer = Self::create_storage(device, "rkp_objects", std::mem::size_of::<RkpGpuObject>() as u64);
-        let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rkp_camera"),
-            size: std::mem::size_of::<CameraUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let color_pool_buffer = Self::create_storage(device, "rkp_color_pool", 4);
         let bone_matrices_buffer = Self::create_storage(device, "rkp_bone_matrices", 64);
         let bone_weights_buffer = Self::create_storage(device, "rkp_bone_weights", 4);
@@ -112,22 +112,41 @@ impl RkpScene {
         let leaf_attr_pool_buffer = Self::create_storage(device, "rkp_leaf_attr_pool", 8);
 
         let bind_group_layout = Self::create_layout(device);
-        let bind_group = Self::create_bind_group(device, &bind_group_layout,
-            &brick_pool_buffer, &octree_nodes_buffer, &objects_buffer,
-            &camera_buffer, &color_pool_buffer, &bone_matrices_buffer,
-            &bone_weights_buffer, &deformed_pool_buffer, &leaf_attr_pool_buffer,
-        );
 
         Self {
             brick_pool_buffer, octree_nodes_buffer, objects_buffer,
-            camera_buffer, color_pool_buffer, bone_matrices_buffer,
+            color_pool_buffer, bone_matrices_buffer,
             bone_weights_buffer, deformed_pool_buffer, leaf_attr_pool_buffer,
-            bind_group_layout, bind_group,
+            bind_group_layout,
+            buffers_epoch: 0,
         }
     }
 
+    /// Current buffers epoch. `ViewportRenderer` compares against this on
+    /// every frame and rebuilds its bind group when the scene moves ahead.
+    pub fn buffers_epoch(&self) -> u64 {
+        self.buffers_epoch
+    }
+
+    /// Build a scene bind group using the caller-owned `camera_buffer` at
+    /// binding 3 and the scene's shared buffers everywhere else. Called by
+    /// `ViewportRenderer` at construction and after every buffer-epoch bump.
+    pub fn build_bind_group(
+        &self,
+        device: &wgpu::Device,
+        camera_buffer: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        Self::create_bind_group(
+            device, &self.bind_group_layout,
+            &self.brick_pool_buffer, &self.octree_nodes_buffer, &self.objects_buffer,
+            camera_buffer, &self.color_pool_buffer, &self.bone_matrices_buffer,
+            &self.bone_weights_buffer, &self.deformed_pool_buffer, &self.leaf_attr_pool_buffer,
+        )
+    }
+
     /// Upload geometry data. Call only when geometry changes (load, sculpt, voxelize).
-    /// Grows buffers and rebuilds bind group as needed.
+    /// Grows buffers as needed; bumps the epoch on reallocation so `ViewportRenderer`
+    /// rebuilds its cached bind group.
     pub fn upload_geometry(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &GeometryUpload) {
         let mut needs_rebuild = false;
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.brick_pool_buffer, "rkp_brick_pool", data.brick_pool);
@@ -146,43 +165,19 @@ impl RkpScene {
         );
 
         if needs_rebuild {
-            self.rebuild_bind_group(device);
+            self.buffers_epoch += 1;
         }
     }
 
-    /// Upload per-frame data. Call every frame. Cheap (~200 KB for 1000 objects).
-    /// Grows the objects buffer and rebuilds bind group if needed.
+    /// Upload per-frame object data. Bumps the epoch when the objects
+    /// buffer reallocates so VRs rebuild their bind groups.
     pub fn upload_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &FrameUpload) {
         let obj_bytes: &[u8] = bytemuck::cast_slice(data.objects);
         let needs_rebuild = Self::ensure_and_write(device, queue, &mut self.objects_buffer, "rkp_objects", obj_bytes);
-        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(data.camera));
 
         if needs_rebuild {
-            self.rebuild_bind_group(device);
+            self.buffers_epoch += 1;
         }
-    }
-
-    /// Use an external objects buffer (e.g., the engine's GpuObject buffer).
-    /// Rebuilds the bind group to reference it. Call each frame if the external
-    /// buffer may have been replaced.
-    pub fn set_external_objects_buffer(&mut self, device: &wgpu::Device, buffer: &wgpu::Buffer) {
-        self.objects_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rkp_objects_proxy"),
-            size: 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.bind_group = Self::create_bind_group(device, &self.bind_group_layout,
-            &self.brick_pool_buffer, &self.octree_nodes_buffer, buffer,
-            &self.camera_buffer, &self.color_pool_buffer, &self.bone_matrices_buffer,
-            &self.bone_weights_buffer, &self.deformed_pool_buffer, &self.leaf_attr_pool_buffer,
-        );
-    }
-
-    /// Copy camera data from an external buffer (GPU→GPU) into our camera buffer.
-    pub fn copy_camera_from(&self, encoder: &mut wgpu::CommandEncoder, src: &wgpu::Buffer) {
-        let size = self.camera_buffer.size().min(src.size());
-        encoder.copy_buffer_to_buffer(src, 0, &self.camera_buffer, 0, size);
     }
 
     fn ensure_and_write(
@@ -203,14 +198,6 @@ impl RkpScene {
             queue.write_buffer(buffer, 0, data);
             false
         }
-    }
-
-    fn rebuild_bind_group(&mut self, device: &wgpu::Device) {
-        self.bind_group = Self::create_bind_group(device, &self.bind_group_layout,
-            &self.brick_pool_buffer, &self.octree_nodes_buffer, &self.objects_buffer,
-            &self.camera_buffer, &self.color_pool_buffer, &self.bone_matrices_buffer,
-            &self.bone_weights_buffer, &self.deformed_pool_buffer, &self.leaf_attr_pool_buffer,
-        );
     }
 
     fn create_storage(device: &wgpu::Device, label: &str, min_size: u64) -> wgpu::Buffer {

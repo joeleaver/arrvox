@@ -325,8 +325,9 @@ impl EngineState {
         let mut renderer = RkpRenderer::new(&device, &queue, width, height);
 
         // Build the main viewport renderer — owns the gbuffer, bloom chain,
-        // tone-map, composite, readback, wireframe-overlay state. Wires its
-        // gbuffer into `renderer`'s shared bind groups.
+        // tone-map, composite, readback, wireframe-overlay state, plus its
+        // own camera buffer + scene bind group. Wires its gbuffer into the
+        // shared renderer's bind groups.
         let main_viewport_renderer = rkp_render::ViewportRenderer::new(
             &device, &mut renderer, width, height,
         );
@@ -550,17 +551,28 @@ impl EngineState {
             );
             let screen_aabbs_bytes: &[u8] = bytemuck::cast_slice(&screen_aabbs);
 
-            // Per-viewport upload (objects + camera).
-            // The `camera_buffer` is shared across viewports today; with
-            // multiple visible viewports rendered into one encoder this
-            // would race (last write wins for all dispatches). Phase 6
-            // moves it into ViewportRenderer + rebuilds the bind group
-            // per VR. With one visible viewport there's no conflict.
-            let frame = FrameUpload {
+            // Per-viewport camera upload (own buffer per VR).
+            {
+                let vr = self.viewport_renderers
+                    .get(&viewport_id)
+                    .expect("viewport renderer must exist");
+                vr.upload_camera(&self.queue, &cam_uniforms);
+            }
+
+            // Objects buffer + per-frame upload happens once per frame, but
+            // needs to land before the first viewport renders. Do it on the
+            // first iteration; subsequent iterations skip since gpu_objects
+            // doesn't change within a frame.
+            self.renderer.upload_frame(&self.queue, &FrameUpload {
                 objects: &self.gpu_objects,
-                camera: &cam_uniforms,
-            };
-            self.renderer.upload_frame(&self.queue, &frame);
+            });
+
+            // Rebuild this VR's scene bind group if the scene epoch moved
+            // (geometry or objects buffer reallocated).
+            let vr = self.viewport_renderers
+                .get_mut(&viewport_id)
+                .expect("viewport renderer must exist");
+            vr.refresh_scene_bind_group(&self.device, &self.renderer.scene);
 
             // Per-viewport vol/cloud/atmo/god-ray params (camera-dependent).
             let vol_params = self.environment.to_volumetric_params(
