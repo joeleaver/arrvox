@@ -281,9 +281,9 @@ impl RkpSceneManager {
     // ── Geometry upload snapshot ─────────────────────────────────────
 
     pub fn geometry_upload(&self) -> GeometryUpload<'_> {
-        let octree_data = self.octree.data();
         GeometryUpload {
-            octree_nodes: bytemuck::cast_slice(octree_data),
+            octree_nodes: self.octree.data(),
+            octree_internal_attrs: self.octree.internal_attrs_data(),
             leaf_attr_pool: self.leaf_attr_pool.as_bytes(),
             color_pool: self.leaf_attr_pool.color_bytes(),
             brick_pool: self.brick_pool.as_bytes(),

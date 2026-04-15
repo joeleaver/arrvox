@@ -76,6 +76,13 @@ impl OctreeGpu {
         self.allocator.as_slice()
     }
 
+    /// Parallel slice of prefiltered-LOD attr ids, one per node slot.
+    /// The GPU binding (see [`RkpScene`]) interleaves these with the node
+    /// values into a single `array<vec2<u32>>` storage buffer.
+    pub fn internal_attrs_data(&self) -> &[u32] {
+        self.allocator.internal_attrs_slice()
+    }
+
     /// Total buffer length in u32 entries.
     pub fn buffer_len(&self) -> usize {
         self.allocator.buffer_len()

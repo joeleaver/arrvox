@@ -25,8 +25,15 @@ pub struct CameraUniforms {
 
 /// Geometry data — uploaded once when geometry changes (load, sculpt, voxelize).
 pub struct GeometryUpload<'a> {
-    /// Octree node buffer (packed u32s).
-    pub octree_nodes: &'a [u8],
+    /// Octree node values (packed u32s), one per node slot.
+    pub octree_nodes: &'a [u32],
+    /// Parallel prefiltered-LOD attr ids (u32s), one per node slot. Same
+    /// length as `octree_nodes`. Entry is `INTERNAL_ATTR_NONE` for non-
+    /// branches and for branches without a prefilter. The scene buffer
+    /// interleaves these with `octree_nodes` into a single
+    /// `array<vec2<u32>>` binding so we stay under the 12-storage-buffer
+    /// per-stage limit.
+    pub octree_internal_attrs: &'a [u32],
     /// Per-leaf attributes: `LeafAttr { normal_oct, material_primary,
     /// material_secondary_blend }`, 8 B each. Indexed by the leaf_attr_id
     /// stored in octree leaf nodes.
@@ -54,7 +61,11 @@ pub struct FrameUpload<'a> {
 ///   0: brick_pool (storage, read) — flat array of u32 cells, `brick_id * 64 + idx` indexes into it.
 ///       (Was a dummy voxel_pool slot pre-bricks; repurposed because we
 ///       were one storage-buffer over the per-stage limit.)
-///   1: octree_nodes (storage, read)
+///   1: octree_nodes (storage, read) — `array<vec2<u32>>`: `.x` = node
+///       value (EMPTY / INTERIOR / BRANCH offset / LEAF id / BRICK id),
+///       `.y` = prefiltered-LOD attr id (INTERNAL_ATTR_NONE when absent).
+///       Interleaved to stay under the 12-storage-buffer-per-stage limit
+///       — a separate buffer would have pushed us over.
 ///   2: objects (storage, read)
 ///   3: camera (uniform)
 ///   4: color_pool (storage, read) — parallel to leaf_attr_pool
@@ -63,8 +74,8 @@ pub struct FrameUpload<'a> {
 ///   7: deformed_pool (storage, read)
 ///   8: leaf_attr_pool (storage, read) — `LeafAttr { normal_oct, material_primary, material_secondary_blend }`
 ///
-/// 9 storage buffers + 1 uniform in group 0; group 2 holds 3 more storage
-/// buffers + 2 uniforms — total 12 storage buffers per stage, exactly at
+/// 8 storage buffers + 1 uniform in group 0; group 2 holds 4 more storage
+/// buffers + 1 uniform — total 12 storage buffers per stage, exactly at
 /// the rkf-render device limit.
 pub struct RkpScene {
     pub brick_pool_buffer: wgpu::Buffer,
@@ -83,7 +94,8 @@ pub struct RkpScene {
 impl RkpScene {
     pub fn new(device: &wgpu::Device) -> Self {
         let brick_pool_buffer = Self::create_storage(device, "rkp_brick_pool", 256);
-        let octree_nodes_buffer = Self::create_storage(device, "rkp_octree_nodes", 4);
+        // 8-byte stride: each slot is `vec2<u32>` (value, prefilter-id).
+        let octree_nodes_buffer = Self::create_storage(device, "rkp_octree_nodes", 8);
         let objects_buffer = Self::create_storage(device, "rkp_objects", std::mem::size_of::<RkpGpuObject>() as u64);
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rkp_camera"),
@@ -115,20 +127,39 @@ impl RkpScene {
     /// Upload geometry data. Call only when geometry changes (load, sculpt, voxelize).
     /// Grows buffers and rebuilds bind group as needed.
     pub fn upload_geometry(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &GeometryUpload) {
+        assert_eq!(
+            data.octree_nodes.len(),
+            data.octree_internal_attrs.len(),
+            "octree_nodes and octree_internal_attrs must have matching length",
+        );
+
+        // Interleave (value, prefilter_id) into a `vec2<u32>`-layout buffer
+        // so a single binding slot carries both. Two separate bindings
+        // would have pushed us over the 12-storage-buffer-per-stage limit.
+        // One allocation per upload; octree_nodes uploads are rare
+        // (voxelize, load) so the cost is amortized.
+        let interleaved_u32_count = data.octree_nodes.len() * 2;
+        let mut interleaved: Vec<u32> = Vec::with_capacity(interleaved_u32_count);
+        for (i, &node) in data.octree_nodes.iter().enumerate() {
+            interleaved.push(node);
+            interleaved.push(data.octree_internal_attrs[i]);
+        }
+        let interleaved_bytes: &[u8] = bytemuck::cast_slice(&interleaved);
+
         let mut needs_rebuild = false;
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.brick_pool_buffer, "rkp_brick_pool", data.brick_pool);
-        needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.octree_nodes_buffer, "rkp_octree_nodes", data.octree_nodes);
+        needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.octree_nodes_buffer, "rkp_octree_nodes", interleaved_bytes);
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.leaf_attr_pool_buffer, "rkp_leaf_attr_pool", data.leaf_attr_pool);
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.color_pool_buffer, "rkp_color_pool", data.color_pool);
 
         let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
         eprintln!(
-            "[rkp_scene] upload_geometry: octree_nodes={:.2} MiB  leaf_attr={:.2} MiB  color_pool={:.2} MiB  bricks={:.2} MiB  total={:.2} MiB",
-            mib(data.octree_nodes.len()),
+            "[rkp_scene] upload_geometry: octree_nodes={:.2} MiB (incl. prefilter ids)  leaf_attr={:.2} MiB  color_pool={:.2} MiB  bricks={:.2} MiB  total={:.2} MiB",
+            mib(interleaved_bytes.len()),
             mib(data.leaf_attr_pool.len()),
             mib(data.color_pool.len()),
             mib(data.brick_pool.len()),
-            mib(data.octree_nodes.len() + data.leaf_attr_pool.len() + data.color_pool.len() + data.brick_pool.len()),
+            mib(interleaved_bytes.len() + data.leaf_attr_pool.len() + data.color_pool.len() + data.brick_pool.len()),
         );
 
         if needs_rebuild {

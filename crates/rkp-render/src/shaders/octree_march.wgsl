@@ -85,7 +85,12 @@ struct OctreeResult {
 // before bricks landed; we reused the slot to stay under the 12
 // storage-buffer limit per shader stage.)
 @group(0) @binding(0) var<storage, read> brick_pool: array<u32>;
-@group(0) @binding(1) var<storage, read> octree_nodes: array<u32>;
+// Each slot is (node_value, prefilter_attr_id). `.x` holds the existing
+// node encoding (EMPTY / INTERIOR / BRANCH offset / LEAF id / BRICK id);
+// `.y` holds a prefiltered leaf_attr_id for LOD-cutoff early-exit, or
+// INTERNAL_ATTR_NONE (0xFFFFFFFF) when unavailable. Interleaved into a
+// single `vec2<u32>` binding to stay under the 12-storage-buffer limit.
+@group(0) @binding(1) var<storage, read> octree_nodes: array<vec2<u32>>;
 @group(0) @binding(2) var<storage, read> objects: array<RkpObject>;
 @group(0) @binding(3) var<uniform> camera: CameraUniforms;
 // color_pool[leaf_attr_id] → packed R|G|B|A u32, 0 = no override (use
@@ -188,7 +193,10 @@ fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: 
     var half = extent * 0.5;
     var center = vec3<f32>(half);
     for (var level = 0u; level < max_depth; level++) {
-        let node = octree_nodes[offset];
+        // `.x` = node value (EMPTY / INTERIOR / BRANCH offset / LEAF / BRICK).
+        // `.y` (prefilter attr id) is consumed by the LOD cutoff added in
+        // the follow-up commit; today we only read `.x`.
+        let node = octree_nodes[offset].x;
         if node == OCTREE_EMPTY {
             bucket_depth(phase, level);
             return OctreeResult(OCTREE_EMPTY, level, center, half);
@@ -215,7 +223,7 @@ fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: 
         );
     }
     bucket_depth(phase, max_depth);
-    let node = octree_nodes[offset];
+    let node = octree_nodes[offset].x;
     if node == OCTREE_EMPTY { return OctreeResult(OCTREE_EMPTY, max_depth, center, half); }
     if node == OCTREE_INTERIOR { return OctreeResult(OCTREE_INTERIOR, max_depth, center, half); }
     if (node & OCTREE_LEAF_BIT) != 0u {
