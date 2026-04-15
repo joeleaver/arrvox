@@ -19,6 +19,13 @@ pub struct MarchParams {
     pub mode: u32,
     pub shadow_max_steps: u32,
     pub num_lights: u32,
+    /// LOD gate: `1` → read `.y` from `octree_nodes` at branches and
+    /// early-exit when the node's projected screen footprint falls
+    /// below ~1 pixel. `0` → descend every branch to a terminal node
+    /// (pre-LOD behavior, kept as an A/B lever for correctness tests
+    /// and as a runtime kill-switch).
+    pub lod_enabled: u32,
+    pub _pad: [u32; 3],
 }
 
 /// The octree ray march compute pass.
@@ -380,6 +387,7 @@ impl OctreeMarchPass {
         mode: u32,
         shadow_max_steps: u32,
         num_lights: u32,
+        lod_enabled: bool,
         timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) {
         // Update params.
@@ -388,6 +396,8 @@ impl OctreeMarchPass {
             mode,
             shadow_max_steps,
             num_lights,
+            lod_enabled: if lod_enabled { 1 } else { 0 },
+            _pad: [0; 3],
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
 

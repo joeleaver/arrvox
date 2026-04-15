@@ -142,6 +142,9 @@ impl RkpRenderer {
     }
 
     /// Render: march (+ per-light shadow) → SSAO → shade.
+    ///
+    /// `lod_enabled` gates the prefiltered-LOD early-exit in the march;
+    /// turn it off for A/B correctness comparison.
     pub fn render(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -151,6 +154,7 @@ impl RkpRenderer {
         height: u32,
         shadow_steps: u32,
         num_lights: u32,
+        lod_enabled: bool,
         screen_aabbs: &[u8],
         atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
     ) {
@@ -172,7 +176,7 @@ impl RkpRenderer {
             self.march.dispatch(
                 encoder, queue, &self.scene.bind_group,
                 object_count, width, height, 0,
-                shadow_steps, num_lights, None,
+                shadow_steps, num_lights, lod_enabled, None,
             );
             self.profiler.end_query(encoder, q);
         }
