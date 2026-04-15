@@ -47,6 +47,7 @@ fn compute_node_bounds(obj: &ProceduralObject, id: NodeId) -> Aabb {
         NodeKind::Cylinder(p) => leaf_cylinder_bounds(p),
         NodeKind::Torus(p) => leaf_torus_bounds(p),
         NodeKind::Plane(p) => leaf_plane_bounds(p),
+        NodeKind::Ramp(p) => leaf_ramp_bounds(p),
 
         // Combinators: union of children's bounds (works for all combinator types
         // because intersect/subtract can only shrink, so the union is conservative).
@@ -72,55 +73,56 @@ fn compute_node_bounds(obj: &ProceduralObject, id: NodeId) -> Aabb {
 // ── Leaf bounds ─────────────────────────────────────────────────────────────
 
 fn leaf_sphere_bounds(p: &SphereParams) -> Aabb {
-    let extent = p.radius + p.falloff;
     Aabb {
-        min: Vec3::splat(-extent),
-        max: Vec3::splat(extent),
+        min: Vec3::splat(-p.radius),
+        max: Vec3::splat(p.radius),
     }
 }
 
 fn leaf_box_bounds(p: &BoxParams) -> Aabb {
-    let extent = p.half_extents + Vec3::splat(p.falloff);
     Aabb {
-        min: -extent,
-        max: extent,
+        min: -p.half_extents,
+        max: p.half_extents,
     }
 }
 
 fn leaf_capsule_bounds(p: &CapsuleParams) -> Aabb {
-    let r = p.radius + p.falloff;
-    let h = p.half_height + r;
+    let h = p.half_height + p.radius;
     Aabb {
-        min: Vec3::new(-r, -h, -r),
-        max: Vec3::new(r, h, r),
+        min: Vec3::new(-p.radius, -h, -p.radius),
+        max: Vec3::new(p.radius, h, p.radius),
     }
 }
 
 fn leaf_cylinder_bounds(p: &CylinderParams) -> Aabb {
-    let r = p.radius + p.falloff;
-    let h = p.half_height + p.falloff;
     Aabb {
-        min: Vec3::new(-r, -h, -r),
-        max: Vec3::new(r, h, r),
+        min: Vec3::new(-p.radius, -p.half_height, -p.radius),
+        max: Vec3::new(p.radius, p.half_height, p.radius),
     }
 }
 
 fn leaf_torus_bounds(p: &TorusParams) -> Aabb {
-    let r = p.major_radius + p.minor_radius + p.falloff;
-    let h = p.minor_radius + p.falloff;
+    let r = p.major_radius + p.minor_radius;
     Aabb {
-        min: Vec3::new(-r, -h, -r),
-        max: Vec3::new(r, h, r),
+        min: Vec3::new(-r, -p.minor_radius, -r),
+        max: Vec3::new(r, p.minor_radius, r),
     }
 }
 
-fn leaf_plane_bounds(p: &PlaneParams) -> Aabb {
+fn leaf_ramp_bounds(p: &RampParams) -> Aabb {
+    Aabb {
+        min: Vec3::new(-p.half_length, -p.half_height, -p.half_width),
+        max: Vec3::new(p.half_length, p.half_height, p.half_width),
+    }
+}
+
+fn leaf_plane_bounds(_p: &PlaneParams) -> Aabb {
     // Planes are infinite — use a large but finite bound.
-    // The falloff defines how far above the plane opacity extends.
+    // Occupied below y=0, empty above.
     let extent = 1000.0;
     Aabb {
         min: Vec3::new(-extent, -extent, -extent),
-        max: Vec3::new(extent, p.falloff, extent),
+        max: Vec3::new(extent, 0.0, extent),
     }
 }
 
@@ -183,14 +185,13 @@ mod tests {
             obj.root(),
             NodeKind::Sphere(SphereParams {
                 radius: 1.0,
-                falloff: 0.1,
                 ..Default::default()
             }),
         );
 
         let aabb = compute_bounds(&obj);
-        assert!((aabb.min.x - (-1.1)).abs() < EPS);
-        assert!((aabb.max.x - 1.1).abs() < EPS);
+        assert!((aabb.min.x - (-1.0)).abs() < EPS);
+        assert!((aabb.max.x - 1.0).abs() < EPS);
     }
 
     #[test]
@@ -202,14 +203,13 @@ mod tests {
             obj.root(),
             NodeKind::Box(BoxParams {
                 half_extents: Vec3::new(1.0, 2.0, 3.0),
-                falloff: 0.1,
                 ..Default::default()
             }),
         );
 
         let aabb = compute_bounds(&obj);
-        assert!((aabb.min.y - (-2.1)).abs() < EPS);
-        assert!((aabb.max.z - 3.1).abs() < EPS);
+        assert!((aabb.min.y - (-2.0)).abs() < EPS);
+        assert!((aabb.max.z - 3.0).abs() < EPS);
     }
 
     #[test]
@@ -221,7 +221,6 @@ mod tests {
             obj.root(),
             NodeKind::Sphere(SphereParams {
                 radius: 0.5,
-                falloff: 0.1,
                 ..Default::default()
             }),
         );
@@ -241,7 +240,6 @@ mod tests {
             obj.root(),
             NodeKind::Sphere(SphereParams {
                 radius: 0.5,
-                falloff: 0.1,
                 ..Default::default()
             }),
         );
@@ -249,7 +247,6 @@ mod tests {
             obj.root(),
             NodeKind::Sphere(SphereParams {
                 radius: 0.5,
-                falloff: 0.1,
                 ..Default::default()
             }),
         );
@@ -282,7 +279,6 @@ mod tests {
             NodeKind::Torus(TorusParams {
                 major_radius: 1.0,
                 minor_radius: 0.2,
-                falloff: 0.1,
                 ..Default::default()
             }),
         );

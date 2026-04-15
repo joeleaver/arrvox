@@ -13,6 +13,7 @@ pub enum NodeKind {
     Cylinder(CylinderParams),
     Torus(TorusParams),
     Plane(PlaneParams),
+    Ramp(RampParams),
 
     // ── Combinators (boolean ops on children) ───────────────────────
     Union {
@@ -37,6 +38,7 @@ impl NodeKind {
                 | NodeKind::Cylinder(_)
                 | NodeKind::Torus(_)
                 | NodeKind::Plane(_)
+                | NodeKind::Ramp(_)
         )
     }
 
@@ -74,9 +76,6 @@ impl Default for MaterialCombine {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SphereParams {
     pub radius: f32,
-    /// Falloff distance: how far outside the surface opacity transitions from
-    /// 1.0 to 0.0. Controls surface softness.
-    pub falloff: f32,
     pub material_id: u16,
     pub color: Vec3,
 }
@@ -85,7 +84,6 @@ impl Default for SphereParams {
     fn default() -> Self {
         Self {
             radius: 0.5,
-            falloff: 0.1,
             material_id: 0,
             color: Vec3::ONE,
         }
@@ -99,7 +97,6 @@ pub struct BoxParams {
     pub half_extents: Vec3,
     /// Edge rounding radius (0 = sharp edges).
     pub rounding: f32,
-    pub falloff: f32,
     pub material_id: u16,
     pub color: Vec3,
 }
@@ -109,7 +106,6 @@ impl Default for BoxParams {
         Self {
             half_extents: Vec3::splat(0.5),
             rounding: 0.0,
-            falloff: 0.1,
             material_id: 0,
             color: Vec3::ONE,
         }
@@ -122,7 +118,6 @@ pub struct CapsuleParams {
     /// Half-height of the line segment (total height = 2 * half_height + 2 * radius).
     pub half_height: f32,
     pub radius: f32,
-    pub falloff: f32,
     pub material_id: u16,
     pub color: Vec3,
 }
@@ -132,7 +127,6 @@ impl Default for CapsuleParams {
         Self {
             half_height: 0.5,
             radius: 0.25,
-            falloff: 0.1,
             material_id: 0,
             color: Vec3::ONE,
         }
@@ -144,7 +138,6 @@ impl Default for CapsuleParams {
 pub struct CylinderParams {
     pub half_height: f32,
     pub radius: f32,
-    pub falloff: f32,
     pub material_id: u16,
     pub color: Vec3,
 }
@@ -154,7 +147,6 @@ impl Default for CylinderParams {
         Self {
             half_height: 0.5,
             radius: 0.25,
-            falloff: 0.1,
             material_id: 0,
             color: Vec3::ONE,
         }
@@ -168,7 +160,6 @@ pub struct TorusParams {
     pub major_radius: f32,
     /// Radius of the tube.
     pub minor_radius: f32,
-    pub falloff: f32,
     pub material_id: u16,
     pub color: Vec3,
 }
@@ -178,18 +169,16 @@ impl Default for TorusParams {
         Self {
             major_radius: 0.5,
             minor_radius: 0.15,
-            falloff: 0.1,
             material_id: 0,
             color: Vec3::ONE,
         }
     }
 }
 
-/// Infinite plane with Y-up normal at local origin. Opacity is 1.0 below,
-/// falls off above.
+/// Infinite plane with Y-up normal at local origin. Occupied below y=0,
+/// empty above.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaneParams {
-    pub falloff: f32,
     pub material_id: u16,
     pub color: Vec3,
 }
@@ -197,7 +186,33 @@ pub struct PlaneParams {
 impl Default for PlaneParams {
     fn default() -> Self {
         Self {
-            falloff: 0.1,
+            material_id: 0,
+            color: Vec3::ONE,
+        }
+    }
+}
+
+/// Ramp: triangular prism centered at local origin. The cross-section is a
+/// right triangle in the XY plane with the right-angle at the tall corner
+/// (+X, +Y). The slope rises from (-X, -Y) to (+X, +Y), extruded along Z.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RampParams {
+    /// Half-extent along X (length of the base).
+    pub half_length: f32,
+    /// Half-extent along Y (height at the tall end).
+    pub half_height: f32,
+    /// Half-extent along Z (width of the prism).
+    pub half_width: f32,
+    pub material_id: u16,
+    pub color: Vec3,
+}
+
+impl Default for RampParams {
+    fn default() -> Self {
+        Self {
+            half_length: 0.5,
+            half_height: 0.25,
+            half_width: 0.5,
             material_id: 0,
             color: Vec3::ONE,
         }

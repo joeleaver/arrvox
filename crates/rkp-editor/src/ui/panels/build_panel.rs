@@ -75,17 +75,29 @@ fn render_resolution(
     snapshot: Memo<ProceduralSnapshot>,
     cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
 ) -> Node {
-    let voxel_size = Signal::new(snapshot.get().voxel_size);
-    let on_change: Rc<dyn Fn(f32)> = Rc::new(move |v: f32| {
+    let vs = snapshot.get().voxel_size;
+    let current = Signal::new(format!("{vs}"));
+    let on_change: Rc<dyn Fn(String)> = Rc::new(move |v: String| {
         let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralVoxelSize {
-            voxel_size: v,
+            tier: v,
         });
     });
 
     rsx! {
         div {
             style: "padding:4px 8px;border-bottom:1px solid #333;",
-            {prop_scrub(__scope, "Voxel Size", voxel_size, 0.005, 0.5, 0.001, on_change)}
+            {prop_select(
+                __scope,
+                "Resolution",
+                current,
+                &[
+                    ("0.005", "5mm (finest)"),
+                    ("0.02", "2cm"),
+                    ("0.08", "8cm"),
+                    ("0.32", "32cm (coarsest)"),
+                ],
+                on_change,
+            )}
         }
     }
 }
@@ -184,19 +196,9 @@ fn render_tree_node(
                     {|| name.get()}
                 }
 
-                // Add child button (only for combinators)
+                // Add child button (only for combinators) — opens a shape picker.
                 if !is_leaf.get() {
-                    span {
-                        style: "margin-left:auto;color:#666;cursor:pointer;font-size:14px;\
-                                padding:0 2px;",
-                        onclick: move || {
-                            let _ = cmd_tx.get().send(rkp_engine::EngineCommand::AddProceduralNode {
-                                parent_node_id: node_id,
-                                kind: "Sphere".to_string(),
-                            });
-                        },
-                        "+"
-                    }
+                    {render_add_child_menu(__scope, node_id, cmd_tx)}
                 }
             }
 
@@ -360,6 +362,75 @@ fn render_param_field(
     }
 }
 
+// ── Add-child menu ──────────────────────────────────────────────────────
+
+/// Renders the "+" button on combinator rows, opening a popover with a
+/// shape/combinator picker. Selected kind is sent as AddProceduralNode.
+fn render_add_child_menu(
+    __scope: &mut Scope,
+    parent_id: u32,
+    cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
+) -> Node {
+    let opened = Signal::new(false);
+
+    rsx! {
+        div {
+            style: "margin-left:auto;",
+            // Stop the row's onclick (node selection) from firing on these events.
+            onclick: move || {},
+
+            Popover {
+                opened: {move || opened.get()},
+                position: "bottom",
+                PopoverTarget {
+                    span {
+                        style: "color:#666;cursor:pointer;font-size:14px;padding:0 4px;\
+                                user-select:none;",
+                        onclick: move || opened.update(|v| *v = !*v),
+                        "+"
+                    }
+                }
+                PopoverDropdown {
+                    {add_menu_item(__scope, "Sphere", TablerIcon::Sphere, parent_id, opened, cmd_tx)}
+                    {add_menu_item(__scope, "Box", TablerIcon::Box, parent_id, opened, cmd_tx)}
+                    {add_menu_item(__scope, "Capsule", TablerIcon::Capsule, parent_id, opened, cmd_tx)}
+                    {add_menu_item(__scope, "Cylinder", TablerIcon::Cylinder, parent_id, opened, cmd_tx)}
+                    {add_menu_item(__scope, "Torus", TablerIcon::CircleDotted, parent_id, opened, cmd_tx)}
+                    {add_menu_item(__scope, "Plane", TablerIcon::LayoutBoard, parent_id, opened, cmd_tx)}
+                    {add_menu_item(__scope, "Ramp", TablerIcon::Triangle, parent_id, opened, cmd_tx)}
+                    DropdownMenuDivider {}
+                    {add_menu_item(__scope, "Union", TablerIcon::CirclePlus, parent_id, opened, cmd_tx)}
+                    {add_menu_item(__scope, "Intersect", TablerIcon::CircleDot, parent_id, opened, cmd_tx)}
+                    {add_menu_item(__scope, "Subtract", TablerIcon::CircleMinus, parent_id, opened, cmd_tx)}
+                }
+            }
+        }
+    }
+}
+
+fn add_menu_item(
+    __scope: &mut Scope,
+    kind: &'static str,
+    icon: TablerIcon,
+    parent_id: u32,
+    opened: Signal<bool>,
+    cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
+) -> Node {
+    rsx! {
+        DropdownMenuItem {
+            left_section: icon,
+            onclick: move || {
+                let _ = cmd_tx.get().send(rkp_engine::EngineCommand::AddProceduralNode {
+                    parent_node_id: parent_id,
+                    kind: kind.to_string(),
+                });
+                opened.set(false);
+            },
+            {kind}
+        }
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 fn node_icon(kind: ProceduralNodeKind) -> TablerIcon {
@@ -370,6 +441,7 @@ fn node_icon(kind: ProceduralNodeKind) -> TablerIcon {
         ProceduralNodeKind::Cylinder => TablerIcon::Cylinder,
         ProceduralNodeKind::Torus => TablerIcon::CircleDotted,
         ProceduralNodeKind::Plane => TablerIcon::LayoutBoard,
+        ProceduralNodeKind::Ramp => TablerIcon::Triangle,
         ProceduralNodeKind::Union => TablerIcon::CirclePlus,
         ProceduralNodeKind::Intersect => TablerIcon::CircleDot,
         ProceduralNodeKind::Subtract => TablerIcon::CircleMinus,

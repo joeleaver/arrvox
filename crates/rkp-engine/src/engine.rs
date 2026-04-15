@@ -772,19 +772,22 @@ impl EngineState {
         // 11. GPU profiler — process finished frames (logs every 60 frames).
         self.renderer.end_profiler_frame(self.frame_index, self.width, self.height);
 
-        let t_readback = frame_start.elapsed();
+        let t_frame_end = frame_start.elapsed();
 
         // Log timing every 60 frames.
+        // gpu_wait = CPU blocking on last frame's GPU work to finish so we can
+        // map the composite buffer for the editor. The copy itself is cheap;
+        // the cost is the sync.
         if self.frame_index % 60 == 0 && self.frame_index > 0 {
             eprintln!(
-                "[perf] cpu_setup={:.1}ms upload={:.1}ms encode={:.1}ms post={:.1}ms submit={:.1}ms readback={:.1}ms total={:.1}ms",
+                "[perf] cpu_setup={:.1}ms upload={:.1}ms encode={:.1}ms post={:.1}ms submit={:.1}ms gpu_wait={:.1}ms total={:.1}ms",
                 t_cpu_setup.as_secs_f64() * 1000.0,
                 (t_upload - t_cpu_setup).as_secs_f64() * 1000.0,
                 (t_encode - t_upload).as_secs_f64() * 1000.0,
                 (t_post - t_encode).as_secs_f64() * 1000.0,
                 (t_submit - t_post).as_secs_f64() * 1000.0,
-                (t_readback - t_submit).as_secs_f64() * 1000.0,
-                t_readback.as_secs_f64() * 1000.0,
+                (t_frame_end - t_submit).as_secs_f64() * 1000.0,
+                t_frame_end.as_secs_f64() * 1000.0,
             );
         }
 

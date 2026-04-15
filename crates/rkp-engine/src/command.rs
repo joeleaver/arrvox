@@ -91,9 +91,10 @@ pub enum EngineCommand {
         new_parent_id: u32,
     },
 
-    /// Set the render voxel size on the selected procedural object.
+    /// Set the render voxel size tier on the selected procedural object.
+    /// Value must be one of: "0.005", "0.02", "0.08", "0.32".
     SetProceduralVoxelSize {
-        voxel_size: f32,
+        tier: String,
     },
 
     /// Set the local position of a procedural node.
