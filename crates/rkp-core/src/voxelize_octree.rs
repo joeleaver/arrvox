@@ -53,6 +53,10 @@ pub struct VoxelizeOctreeResult {
     /// release), so the set isn't a contiguous range — track each id
     /// explicitly so `deallocate_geometry` can free them later.
     pub brick_ids: Vec<u32>,
+    /// 6 face-adjacent brick ids per brick (or FACE_EMPTY / FACE_INTERIOR
+    /// sentinel) indexed by `brick_id`. See `brick_face_links.rs`.
+    /// Length is `max_brick_id + 1`. Empty if the tree has no bricks.
+    pub brick_face_links: Vec<[u32; 6]>,
     pub grid_origin: Vec3,
 }
 
@@ -157,9 +161,19 @@ where
         &mut attr_dedup,
     );
     let attrs_after_prefilter = attr_dedup.len();
+
+    // Compute the face-adjacency links for this voxelization's bricks.
+    // The table spans 0..=max_brick_id so the GPU can index it by the
+    // brick_id stored in octree BRICK nodes without any remapping.
+    let brick_face_links = if let Some(&max_brick) = brick_ids.iter().max() {
+        crate::brick_face_links::compute_brick_face_links(&octree, max_brick)
+    } else {
+        Vec::new()
+    };
+
     if nodes_before_compact >= 10_000 {
         eprintln!(
-            "[voxelize_octree] leaves={}  unique_attrs={}(+{} prefilter)  octree {} → compact {} → dedup {} ({:.1}× total)",
+            "[voxelize_octree] leaves={}  unique_attrs={}(+{} prefilter)  octree {} → compact {} → dedup {} ({:.1}× total)  face_links={} bricks",
             voxel_count,
             attrs_before_prefilter,
             attrs_after_prefilter - attrs_before_prefilter,
@@ -169,6 +183,7 @@ where
             if nodes_after_dedup > 0 {
                 nodes_before_compact as f64 / nodes_after_dedup as f64
             } else { 0.0 },
+            brick_face_links.len(),
         );
     }
 
@@ -178,6 +193,7 @@ where
         leaf_attr_unique_count: attr_dedup.len() as u32,
         leaf_attr_slot_start,
         brick_ids,
+        brick_face_links,
         grid_origin,
     })
 }

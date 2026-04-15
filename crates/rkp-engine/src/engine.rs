@@ -315,6 +315,9 @@ struct EngineState {
     /// Prefiltered-LOD early-exit toggle. On by default; flipped off for
     /// A/B correctness comparison against the pre-LOD descent behavior.
     lod_enabled: bool,
+    /// Surface-Nets render-time normal reconstruction (POC). Off by
+    /// default — flip on via `set_surfacenet_enabled` for A/B.
+    surfacenet_enabled: bool,
 }
 
 impl EngineState {
@@ -327,6 +330,19 @@ impl EngineState {
     /// Current LOD toggle state.
     pub fn lod_enabled(&self) -> bool {
         self.lod_enabled
+    }
+
+    /// Flip the Surface-Nets normal reconstruction on or off. When on,
+    /// the march computes per-voxel normals from the 3³ in-brick
+    /// occupancy neighborhood instead of reading the baked octahedral
+    /// `LeafAttr.normal_oct`. POC — see the `[surfnet]` log lines for
+    /// coverage metrics.
+    pub fn set_surfacenet_enabled(&mut self, enabled: bool) {
+        self.surfacenet_enabled = enabled;
+    }
+
+    pub fn surfacenet_enabled(&self) -> bool {
+        self.surfacenet_enabled
     }
 
     fn new(config: &EngineConfig) -> Self {
@@ -480,6 +496,12 @@ impl EngineState {
             pending_pick: None,
             num_lights_cache: 1,
             lod_enabled: true,
+            // Bake-time Laplacian smoothing of stored normals (see
+            // `load_asset` → `smooth_shell_normals`) makes the shader-
+            // time centroid reconstruction redundant. Default OFF so
+            // the shader uses the smoothed baked normal via its
+            // existing 1-fetch path.
+            surfacenet_enabled: false,
         }
     }
 
@@ -644,7 +666,7 @@ impl EngineState {
             self.renderer.god_rays.update_params(&self.queue, &god_ray_params);
         }
 
-        self.renderer.render(&mut encoder, &self.queue, object_count, self.width, self.height, shadow_steps, num_lights, self.lod_enabled, screen_aabbs_bytes, &atmo_frame);
+        self.renderer.render(&mut encoder, &self.queue, object_count, self.width, self.height, shadow_steps, num_lights, self.lod_enabled, self.surfacenet_enabled, screen_aabbs_bytes, &atmo_frame);
 
         let t_encode = frame_start.elapsed();
 

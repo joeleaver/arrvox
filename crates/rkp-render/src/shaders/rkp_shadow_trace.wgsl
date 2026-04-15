@@ -21,6 +21,7 @@ const BRICK_DIM: u32 = 4u;
 const BRICK_DIM_F: f32 = 4.0;
 const BRICK_CELLS: u32 = 64u;
 const BRICK_CELL_EMPTY: u32 = 0xFFFFFFFFu;
+const BRICK_CELL_INTERIOR: u32 = 0xFFFFFFFDu;
 const BRICK_MAX_STEPS: u32 = 16u;
 
 struct RkpObject {
@@ -256,7 +257,10 @@ fn trace_shadow_ray(
                     let cz = u32(lz);
                     let flat = cx + cy * BRICK_DIM + cz * BRICK_DIM * BRICK_DIM;
                     let cell = brick_pool[brick_base + flat];
-                    if cell != BRICK_CELL_EMPTY {
+                    // BRICK_CELL_INTERIOR is solid-bulk-marker from
+                    // mesh imports; treat as empty for shadow (the
+                    // shell in front casts the shadow).
+                    if cell != BRICK_CELL_EMPTY && cell != BRICK_CELL_INTERIOR {
                         let attr = leaf_attr_pool[cell];
                         let mid = leaf_attr_material_primary(attr);
                         let m_op = materials[mid].opacity;

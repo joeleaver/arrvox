@@ -145,6 +145,9 @@ impl RkpRenderer {
     ///
     /// `lod_enabled` gates the prefiltered-LOD early-exit in the march;
     /// turn it off for A/B correctness comparison.
+    /// `surfacenet_enabled` gates render-time normal reconstruction from
+    /// the 3³ in-brick occupancy neighborhood — an A/B toggle for the
+    /// Surface-Nets normal POC.
     pub fn render(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -155,6 +158,7 @@ impl RkpRenderer {
         shadow_steps: u32,
         num_lights: u32,
         lod_enabled: bool,
+        surfacenet_enabled: bool,
         screen_aabbs: &[u8],
         atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
     ) {
@@ -176,7 +180,7 @@ impl RkpRenderer {
             self.march.dispatch(
                 encoder, queue, &self.scene.bind_group,
                 object_count, width, height, 0,
-                shadow_steps, num_lights, lod_enabled, None,
+                shadow_steps, num_lights, lod_enabled, surfacenet_enabled, None,
             );
             self.profiler.end_query(encoder, q);
         }

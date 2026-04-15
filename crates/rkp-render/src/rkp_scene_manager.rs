@@ -221,6 +221,13 @@ pub struct RkpSceneManager {
     /// branches point at bricks; the shader does flat brick lookups instead
     /// of descending the final two octree levels per step.
     pub brick_pool: BrickPool,
+    /// Face-adjacency links for every allocated brick — indexed by
+    /// `brick_id`, 6 u32 per entry (−X, +X, −Y, +Y, −Z, +Z). Each entry
+    /// is either a neighboring brick_id or a FACE_EMPTY / FACE_INTERIOR
+    /// sentinel (see `rkp_core::brick_face_links`). Sized to cover
+    /// `brick_pool.allocated_count()`; newly-allocated bricks append
+    /// sentinel rows until voxelize / load_asset fills them in.
+    pub brick_face_links: Vec<[u32; 6]>,
     /// GPU octree allocator (packs all octrees into one buffer).
     pub octree: OctreeGpu,
     /// Cache of loaded .rkp assets keyed by canonical file path. Instances
@@ -240,10 +247,36 @@ impl RkpSceneManager {
         Self {
             leaf_attr_pool: LeafAttrPool::new(capacity),
             brick_pool: BrickPool::new((capacity / 16).max(64)),
+            brick_face_links: Vec::new(),
             octree: OctreeGpu::new(),
             asset_cache: AssetCache::default(),
             pending_faces: Vec::new(),
             faces_dirty: false,
+        }
+    }
+
+    /// Splice one asset's computed face-link rows into the scene-wide
+    /// table. The rows are indexed by global brick_id (the asset's
+    /// voxelize/load produced them that way), so we copy in place.
+    fn merge_face_links(&mut self, rows: &[[u32; 6]]) {
+        if rows.is_empty() {
+            return;
+        }
+        if self.brick_face_links.len() < rows.len() {
+            self.brick_face_links.resize(
+                rows.len(),
+                [rkp_core::brick_face_links::FACE_EMPTY; 6],
+            );
+        }
+        // Copy only rows that correspond to bricks the asset actually owns
+        // (identified by a non-all-empty row — unused slots stay at the
+        // default FACE_EMPTY sentinel). This is equivalent to looping
+        // over the asset's brick_ids, but avoids threading that list
+        // through every call site.
+        for (i, row) in rows.iter().enumerate() {
+            if row.iter().any(|&v| v != rkp_core::brick_face_links::FACE_EMPTY) {
+                self.brick_face_links[i] = *row;
+            }
         }
     }
 
@@ -287,6 +320,7 @@ impl RkpSceneManager {
             leaf_attr_pool: self.leaf_attr_pool.as_bytes(),
             color_pool: self.leaf_attr_pool.color_bytes(),
             brick_pool: self.brick_pool.as_bytes(),
+            brick_face_links: rkp_core::brick_face_links::as_bytes(&self.brick_face_links),
         }
     }
 
@@ -514,13 +548,22 @@ impl RkpSceneManager {
                 if cell == rkp_core::brick_pool::BRICK_EMPTY {
                     continue;
                 }
-                // cell is a file-local slot index; shift by our leaf_attr
-                // allocation offset to get the scene-global leaf_attr_id.
-                let leaf_attr_id = leaf_attr_slot_start + cell;
+                // BRICK_INTERIOR is a scene-global sentinel (0xFFFFFFFD),
+                // not a file-local slot index — pass it through without
+                // the leaf_attr_slot_start offset, which would overflow
+                // and corrupt the slot into a bogus leaf_attr_id.
+                let remapped = if cell == rkp_core::brick_pool::BRICK_INTERIOR {
+                    rkp_core::brick_pool::BRICK_INTERIOR
+                } else {
+                    // Real leaf: cell is a file-local slot index; shift
+                    // by our leaf_attr allocation offset to get the
+                    // scene-global leaf_attr_id.
+                    leaf_attr_slot_start + cell
+                };
                 let x = (i as u32) % rkp_core::brick_pool::BRICK_DIM;
                 let y = ((i as u32) / rkp_core::brick_pool::BRICK_DIM) % rkp_core::brick_pool::BRICK_DIM;
                 let z = (i as u32) / (rkp_core::brick_pool::BRICK_DIM * rkp_core::brick_pool::BRICK_DIM);
-                self.brick_pool.set_cell(scene_id, x, y, z, leaf_attr_id);
+                self.brick_pool.set_cell(scene_id, x, y, z, remapped);
             }
         }
 
@@ -538,6 +581,20 @@ impl RkpSceneManager {
         tree.deduplicate_subtrees();
         let dedup_count = tree.node_count();
         tree.morton_reorder();
+
+        // Bake-time Laplacian relaxation of shell-voxel normals.
+        // Converts per-voxel SDF-gradient samples (which alias into
+        // discrete directions at voxel scale) into locally-averaged
+        // smooth normals. Runs once per asset load; each asset's
+        // leaf_attrs are 1:1 with voxels (no dedup), which is the
+        // invariant the smoother requires.
+        let smoothed_count = rkp_core::laplacian_smooth::smooth_shell_normals(
+            &tree, &self.brick_pool, &mut self.leaf_attr_pool, 3,
+        );
+        eprintln!(
+            "[RkpSceneManager]   smoothed {} shell normals (3 Laplacian iterations)",
+            smoothed_count,
+        );
 
         // Run the prefilter pass on-load so v4 assets (no baked internal
         // attrs) still benefit from the GPU's LOD early-exit. Phase 4
@@ -561,6 +618,16 @@ impl RkpSceneManager {
         );
         let final_leaf_attr_slot_count =
             self.leaf_attr_pool.allocated_count() - leaf_attr_slot_start;
+
+        // Compute brick face-links for this asset. The tree's brick ids
+        // have already been remapped to global ids above, so the rows
+        // produced are scene-global and ready to merge. When the file
+        // had zero bricks there's nothing to compute.
+        if file_brick_count > 0 {
+            let max_brick = scene_brick_offset + file_brick_count - 1;
+            let face_links = rkp_core::brick_face_links::compute_brick_face_links(&tree, max_brick);
+            self.merge_face_links(&face_links);
+        }
 
         // Allocate the octree with its now-populated internal_attr_index
         // intact. `allocate(&tree)` preserves both buffers; the legacy
@@ -661,6 +728,7 @@ impl RkpSceneManager {
         emit_faces(&r.octree, object_id, &mut self.pending_faces);
         self.faces_dirty = true;
 
+        self.merge_face_links(&r.brick_face_links);
         let handle = self.octree.allocate(&r.octree);
         let spatial = rkf_core::scene_node::SpatialHandle::Octree {
             root_offset: handle.root_offset,
@@ -701,6 +769,7 @@ impl RkpSceneManager {
         emit_faces(&r.octree, object_id, &mut self.pending_faces);
         self.faces_dirty = true;
 
+        self.merge_face_links(&r.brick_face_links);
         let handle = self.octree.allocate(&r.octree);
         let spatial = rkf_core::scene_node::SpatialHandle::Octree {
             root_offset: handle.root_offset,

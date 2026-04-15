@@ -6,9 +6,11 @@
 
 use crate::validate_wgsl;
 
-/// Stats buffer size in bytes (52 × u32). See the `stats` binding in
-/// `shaders/octree_march.wgsl` for the layout.
-const STATS_U32_COUNT: usize = 52;
+/// Stats buffer size in bytes (64 × u32). See the `stats` binding in
+/// `shaders/octree_march.wgsl` for the layout. Expanded from 52 when
+/// the Surface-Nets normal-reconstruction POC added counters at
+/// stats[52..55].
+const STATS_U32_COUNT: usize = 64;
 const STATS_BYTES: u64 = (STATS_U32_COUNT * 4) as u64;
 
 /// Uniform parameters for the march shader.
@@ -25,7 +27,12 @@ pub struct MarchParams {
     /// (pre-LOD behavior, kept as an A/B lever for correctness tests
     /// and as a runtime kill-switch).
     pub lod_enabled: u32,
-    pub _pad: [u32; 3],
+    /// Surface-Nets normal gate: `1` → reconstruct per-voxel normal at
+    /// render time from the 3³ in-brick occupancy neighborhood. `0` →
+    /// use the baked octahedral normal from `LeafAttr`. A/B toggle for
+    /// the POC.
+    pub surfacenet_enabled: u32,
+    pub _pad: [u32; 2],
 }
 
 /// The octree ray march compute pass.
@@ -307,6 +314,9 @@ impl OctreeMarchPass {
             let color_pool_reads = vals[46] as u64;
             let materials_reads = vals[47] as u64;
             let lod_exits: &[u32] = &vals[48..52]; // L0-2, L3-5, L6-8, L9+
+            let surfnet_reconstructions = vals[52] as u64;
+            let surfnet_boundary_clips = vals[53] as u64;
+            let surfnet_degenerate = vals[54] as u64;
 
             let sum = |h: &[u32]| -> u64 { h.iter().map(|&x| x as u64).sum() };
             let weighted = |h: &[u32]| -> f64 {
@@ -357,6 +367,16 @@ impl OctreeMarchPass {
             } else {
                 eprintln!("[lod exits] 0  — LOD disabled, or no branches had prefilter attrs at cutoff levels");
             }
+            if surfnet_reconstructions > 0 {
+                let pct_boundary = 100.0 * surfnet_boundary_clips as f64
+                    / surfnet_reconstructions as f64;
+                let pct_degen = 100.0 * surfnet_degenerate as f64
+                    / surfnet_reconstructions as f64;
+                eprintln!(
+                    "[surfnet] {} recon  {:.0}% at brick boundary  {:.1}% degenerate → baked fallback",
+                    surfnet_reconstructions, pct_boundary, pct_degen,
+                );
+            }
 
             // Per-buffer byte traffic per frame. Octree reads come from the
             // depth histograms; other buffers have direct atomic counters.
@@ -401,6 +421,7 @@ impl OctreeMarchPass {
         shadow_max_steps: u32,
         num_lights: u32,
         lod_enabled: bool,
+        surfacenet_enabled: bool,
         timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) {
         // Update params.
@@ -410,7 +431,8 @@ impl OctreeMarchPass {
             shadow_max_steps,
             num_lights,
             lod_enabled: if lod_enabled { 1 } else { 0 },
-            _pad: [0; 3],
+            surfacenet_enabled: if surfacenet_enabled { 1 } else { 0 },
+            _pad: [0; 2],
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
 
