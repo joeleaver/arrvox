@@ -771,7 +771,7 @@ impl EngineState {
     /// camera (if one exists) and flip its layer mask so editor-only
     /// helpers vanish and HUD becomes visible.
     fn enter_play_mode_viewports(&mut self) {
-        use crate::components::Camera;
+        use crate::components::{Camera, EditorMetadata};
         use crate::viewport::{layer, CameraSource, SceneFilter, ViewportId};
 
         // Find the scene camera flagged active. If multiple are flagged,
@@ -783,6 +783,11 @@ impl EngineState {
 
         if let Some(main) = self.viewports.get_mut(ViewportId::MAIN) {
             if let Some(entity) = scene_cam {
+                let name = self.world
+                    .get::<&EditorMetadata>(entity)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|_| format!("{entity:?}"));
+                self.console.info(format!("Play mode: camera → '{name}'"));
                 main.runtime_override = Some(CameraSource::Entity(entity));
             } else {
                 self.console.warn("Play mode: no active scene camera found, \
