@@ -197,6 +197,11 @@ struct EngineState {
     input_system: rkf_runtime::input::InputSystem,
     camera_control: CameraControlState,
     camera: CameraState,
+    /// Viewport scaffolding (Phase 1). Populated with one entry for
+    /// `ViewportId::MAIN` and kept in step with `camera` field on writes,
+    /// but rendering still consults `camera` directly. Future phases route
+    /// reads through here as the renderer is split per-viewport.
+    viewports: crate::viewport::Viewports,
 
     // ECS — the source of truth for scene state.
     world: hecs::World,
@@ -404,6 +409,11 @@ impl EngineState {
             input_system,
             camera_control,
             camera: CameraState::default(),
+            viewports: {
+                let mut v = crate::viewport::Viewports::new();
+                v.insert(crate::viewport::Viewport::new_main(width, height));
+                v
+            },
             world: hecs::World::new(),
             registry: {
                 let mut r = crate::component_registry::ComponentRegistry::new();
@@ -831,6 +841,24 @@ impl EngineState {
         rgba8
     }
 
+    /// Mirror the legacy `self.camera` state into `viewports[MAIN].editor_camera`.
+    /// Phase 1 keeps the legacy field as the source of truth; the viewport copy
+    /// is kept in sync so later phases can flip the dependency direction
+    /// without surprises.
+    fn sync_main_viewport_from_legacy_camera(&mut self) {
+        use crate::viewport::{EditorCamera, FlyCameraState, ViewportId};
+        if let Some(main) = self.viewports.get_mut(ViewportId::MAIN) {
+            main.editor_camera = EditorCamera::Fly(FlyCameraState {
+                position: self.camera.position,
+                yaw: self.camera.yaw,
+                pitch: self.camera.pitch,
+                fov: self.camera.fov,
+                near: self.camera.near,
+                far: self.camera.far,
+            });
+        }
+    }
+
     fn build_camera_uniforms(&self) -> rkp_render::rkp_scene::CameraUniforms {
         // yaw/pitch are in radians (set by camera controller).
         let yaw = self.camera.yaw;
@@ -874,6 +902,7 @@ impl EngineState {
                 self.camera.yaw = yaw;
                 self.camera.pitch = pitch;
                 self.camera.fov = fov;
+                self.sync_main_viewport_from_legacy_camera();
             }
 
             EngineCommand::Resize { width, height } => {
@@ -922,6 +951,10 @@ impl EngineState {
                     self.composite_view = self.composite_texture.create_view(&Default::default());
                     self.environment_dirty = true;
                     self.environment_ui_dirty = true;
+                    if let Some(main) = self.viewports.get_mut(crate::viewport::ViewportId::MAIN) {
+                        main.width = width;
+                        main.height = height;
+                    }
                     eprintln!("[RkpEngine] resized to {}x{}", width, height);
                 }
             }
@@ -2618,6 +2651,7 @@ impl EngineState {
                 self.camera.yaw = scene.camera.yaw;
                 self.camera.pitch = scene.camera.pitch;
                 self.camera.fov = scene.camera.fov;
+                self.sync_main_viewport_from_legacy_camera();
 
                 // Restore environment.
                 if let Some(ref env) = scene.environment {
@@ -3531,6 +3565,7 @@ fn tick_loop(
             &mut state.camera.yaw,
             &mut state.camera.pitch,
         );
+        state.sync_main_viewport_from_legacy_camera();
 
         // 3. Update gizmo hover + drag.
         state.update_gizmo();
