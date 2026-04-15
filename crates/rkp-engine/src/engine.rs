@@ -647,7 +647,14 @@ impl EngineState {
                         );
                     }
                 }
-                if !gizmo_verts.is_empty() {
+                // Gizmo overlay draws only when EDITOR_ONLY is in the
+                // viewport's mask. Play mode flips MAIN to DEFAULT|UI,
+                // which hides gizmos + selection wireframe. Phase 5d.
+                let show_editor_overlays = self.viewports
+                    .get(ViewportId::MAIN)
+                    .map(|v| v.filter.base_layers & crate::viewport::layer::EDITOR_ONLY != 0)
+                    .unwrap_or(false);
+                if show_editor_overlays && !gizmo_verts.is_empty() {
                     // Split borrow: wireframe_pass is &mut, composite_view + dims are &.
                     let composite_view = &vr.composite_view;
                     let vw = vr.width as f32;
