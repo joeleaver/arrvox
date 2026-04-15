@@ -247,22 +247,22 @@ impl RkpRenderer {
         screen_aabbs: &[u8],
         atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
     ) {
-        // Re-aim the shared renderer passes (shade/ssao/shadow_trace/
-        // volumetric/god_rays) at THIS viewport's target before dispatching:
+        // Re-aim the shared renderer passes at THIS viewport's target.
         //
-        //   1. Resize the passes' intermediate textures if this viewport is
-        //      a different size from the last one we rendered. `resize` is
-        //      a fast no-op when sizes match, so single-viewport steady
-        //      state pays nothing here.
-        //   2. Rebind the gbuffer + internal output chain (shade→vol→god_rays)
-        //      against this viewport's gbuffer. A handful of create_bind_group
-        //      calls — ~5µs total per frame.
-        //   3. Point shade's dedicated camera binding at this VR's camera.
+        // We intentionally DON'T resize per viewport — the shared pass
+        // outputs (shade.output, god_rays.output, ssao.output, etc.)
+        // stay at whatever size the engine's Resize(MAIN) handler set.
+        // All ViewportRenderers' gbuffers are kept in step with that
+        // same resolution, so calling set_gbuffer(vr.gbuffer) here is
+        // safe. Resizing between viewports would reallocate these
+        // shared textures every frame AND invalidate downstream
+        // references — e.g., the other VR's bloom pass still holds the
+        // old god_rays.output_view and would sample orphaned memory.
         //
-        // Two different-size viewports render this still thrashes texture
-        // allocations each frame; the proper pass-internal split (shared
-        // pipelines + per-VR output state) lands when that cost shows up.
-        self.resize(viewport.width, viewport.height);
+        // The proper fix — a per-VR pass-internal split — is deferred
+        // until there's performance pressure. Until then, all VRs
+        // render at MAIN's resolution and their surface panels scale
+        // the image via CSS.
         self.set_gbuffer(&viewport.gbuffer);
         self.shade.set_camera(&self.device, &viewport.camera_buffer);
 

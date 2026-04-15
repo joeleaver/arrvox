@@ -490,18 +490,24 @@ impl EngineState {
             self.num_lights_cache = shade_params.num_lights;
 
             if self.environment_dirty {
-                // Phase 4: bloom/tonemap params apply equally to every
-                // viewport (they're per-viewport state but all share the
-                // same env settings today). Push into MAIN here; widening
-                // to per-viewport overrides is a Phase 6+ concern.
+                // Bloom/tonemap params apply to every viewport (each VR
+                // owns its own bloom + tonemap pass; no per-viewport
+                // overrides today, everybody shares the scene's env).
+                // If we skip non-MAIN here, BUILD falls back to default
+                // bloom intensity/exposure and the preview looks
+                // massively over-bloomed — same shared-state bug class
+                // as Phase 6a's camera buffer.
                 let env = &self.environment;
                 let queue = &self.queue;
-                let main = self.viewport_renderers
-                    .get_mut(&ViewportId::MAIN)
-                    .expect("main viewport renderer must exist");
-                main.tone_map.set_exposure(queue, env.exposure);
-                main.bloom.set_threshold(queue, env.bloom_threshold, env.bloom_knee);
-                main.bloom_composite.set_intensity(queue, env.bloom_intensity);
+                let vr_ids: Vec<_> = self.viewport_renderers.keys().copied().collect();
+                for vr_id in vr_ids {
+                    let vr = self.viewport_renderers
+                        .get_mut(&vr_id)
+                        .expect("viewport renderer must exist");
+                    vr.tone_map.set_exposure(queue, env.exposure);
+                    vr.bloom.set_threshold(queue, env.bloom_threshold, env.bloom_knee);
+                    vr.bloom_composite.set_intensity(queue, env.bloom_intensity);
+                }
                 self.environment_dirty = false;
             }
         }
@@ -514,29 +520,34 @@ impl EngineState {
 
         let t_cpu_setup = frame_start.elapsed();
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("rkp frame"),
-        });
-
-        // 1. Upload geometry if dirty.
+        // 1. Upload geometry + per-frame objects once (queue-side, no
+        // encoder). Before any submit so all viewports see the same
+        // scene data.
         if self.geometry_dirty {
             let geo = self.scene_mgr.geometry_upload();
             self.renderer.upload_geometry(&self.queue, &geo);
             self.geometry_dirty = false;
             self.collider_caches_dirty = true;
         }
-
-        // 1e. Rebuild collider caches if needed.
         if self.collider_caches_dirty {
             self.rebuild_collider_caches();
             self.collider_caches_dirty = false;
         }
+        self.renderer.upload_frame(&self.queue, &FrameUpload {
+            objects: &self.gpu_objects,
+        });
 
         let t_upload = frame_start.elapsed();
 
-        // ── Per-viewport rendering ──────────────────────────────────────
-        // Snapshot the visible set first so the iteration can take mutable
-        // borrows of viewport_renderers entries inside.
+        // ── Per-viewport rendering with one submit per viewport ─────────
+        // `queue.write_buffer` is queue-global — only the last write
+        // before a submit is visible. Per-frame params (vol/cloud/
+        // god_ray/atmo) are a shared buffer that each viewport writes
+        // its own values to. Without a per-viewport submit boundary,
+        // MAIN's dispatches would read BUILD's params (or vice versa)
+        // and both viewports would render wrong. One submit per
+        // viewport keeps each VR's `queue.write_buffer` correctly
+        // paired with its own encoded dispatches.
         let visible_ids: Vec<ViewportId> = self.viewports
             .iter()
             .filter(|(_, v)| v.visible)
@@ -572,22 +583,18 @@ impl EngineState {
                 vr.upload_camera(&self.queue, &cam_uniforms);
             }
 
-            // Objects buffer + per-frame upload happens once per frame, but
-            // needs to land before the first viewport renders. Do it on the
-            // first iteration; subsequent iterations skip since gpu_objects
-            // doesn't change within a frame.
-            self.renderer.upload_frame(&self.queue, &FrameUpload {
-                objects: &self.gpu_objects,
-            });
-
             // Rebuild this VR's scene bind group if the scene epoch moved
             // (geometry or objects buffer reallocated).
-            let vr = self.viewport_renderers
-                .get_mut(&viewport_id)
-                .expect("viewport renderer must exist");
-            vr.refresh_scene_bind_group(&self.device, &self.renderer.scene);
+            {
+                let vr = self.viewport_renderers
+                    .get_mut(&viewport_id)
+                    .expect("viewport renderer must exist");
+                vr.refresh_scene_bind_group(&self.device, &self.renderer.scene);
+            }
 
-            // Per-viewport vol/cloud/atmo/god-ray params (camera-dependent).
+            // Per-viewport vol/cloud/atmo/god-ray params. These go into
+            // shared buffers — safe because we submit below before the
+            // next iteration overwrites them.
             let vol_params = self.environment.to_volumetric_params(
                 &cam_uniforms, vp_w, vp_h, self.frame_index as u32,
             );
@@ -612,7 +619,6 @@ impl EngineState {
             };
             {
                 let sun_toward = [-sun_d[0], -sun_d[1], -sun_d[2]];
-                // Sun is infinitely far — project direction as a point far along sun_dir.
                 let sun_world = glam::Vec3::new(
                     cam_uniforms.position[0] + sun_toward[0] * 1000.0,
                     cam_uniforms.position[1] + sun_toward[1] * 1000.0,
@@ -638,7 +644,11 @@ impl EngineState {
                 self.renderer.god_rays.update_params(&self.queue, &god_ray_params);
             }
 
-            // Render this viewport — march → … → composite copy.
+            // Per-viewport encoder.
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rkp viewport"),
+            });
+
             let vr = self.viewport_renderers
                 .get_mut(&viewport_id)
                 .expect("viewport renderer must exist");
@@ -647,8 +657,6 @@ impl EngineState {
                 object_count, shadow_steps, num_lights, screen_aabbs_bytes, &atmo_frame,
             );
 
-            // Pick + wireframe overlay are MAIN-only (gizmo + selection
-            // are global state today).
             if viewport_id == ViewportId::MAIN {
                 if let Some((px, py)) = self.pending_pick.take() {
                     pick_issued = true;
@@ -672,15 +680,11 @@ impl EngineState {
                         );
                     }
                 }
-                // Gizmo overlay draws only when EDITOR_ONLY is in the
-                // viewport's mask. Play mode flips MAIN to DEFAULT|UI,
-                // which hides gizmos + selection wireframe. Phase 5d.
                 let show_editor_overlays = self.viewports
                     .get(ViewportId::MAIN)
                     .map(|v| v.filter.base_layers & crate::viewport::layer::EDITOR_ONLY != 0)
                     .unwrap_or(false);
                 if show_editor_overlays && !gizmo_verts.is_empty() {
-                    // Split borrow: wireframe_pass is &mut, composite_view + dims are &.
                     let composite_view = &vr.composite_view;
                     let vw = vr.width as f32;
                     let vh = vr.height as f32;
@@ -697,20 +701,13 @@ impl EngineState {
             }
 
             vr.copy_composite_to_readback(&mut encoder);
+            self.renderer.resolve_profiler_queries(&mut encoder);
+            self.queue.submit(std::iter::once(encoder.finish()));
         }
 
         let t_encode = frame_start.elapsed();
-
-        // ── Once per frame: profiler "post" wrap + resolve + submit ──
-        let q_post = self.renderer.profiler.begin_query("post", &mut encoder);
-        self.renderer.profiler.end_query(&mut encoder, q_post);
-        self.renderer.resolve_profiler_queries(&mut encoder);
-
-        let t_post = frame_start.elapsed();
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-
-        let t_submit = frame_start.elapsed();
+        let t_post = t_encode;
+        let t_submit = t_encode;
 
         // Pick result process — depends on this frame's pick copy completing.
         if pick_issued {
@@ -1002,32 +999,37 @@ impl EngineState {
             }
 
             EngineCommand::Resize { id, width, height } => {
-                // Resize the targeted viewport's render-target. MAIN also
-                // updates the legacy width/height on EngineState because
-                // some hot paths still read them.
-                if let Some(viewport) = self.viewports.get_mut(id) {
-                    viewport.width = width;
-                    viewport.height = height;
+                // Only MAIN's Resize drives the actual render resolution.
+                // All VRs share the renderer's shared pass outputs today,
+                // so every VR must stay at MAIN's size — resizing BUILD
+                // independently would desync its gbuffer from the shared
+                // shade/god_rays/etc. outputs and MAIN's bloom pass would
+                // sample orphaned views. Non-MAIN Resize commands are
+                // ignored; their RenderSurface panels scale via CSS.
+                // When a pass-internal split lands this becomes per-VR.
+                if id != crate::viewport::ViewportId::MAIN {
+                    return true;
                 }
-                if id == crate::viewport::ViewportId::MAIN {
-                    if width != self.width || height != self.height {
-                        self.width = width;
-                        self.height = height;
-                        self.renderer.resize(width, height);
-                        if let Some(main_vr) = self.viewport_renderers.get_mut(&id) {
-                            main_vr.resize(&self.device, &mut self.renderer, width, height);
-                        }
-                        self.environment_dirty = true;
-                        self.environment_ui_dirty = true;
-                        eprintln!("[RkpEngine] resized to {}x{}", width, height);
+                if width == self.width && height == self.height {
+                    return true;
+                }
+                self.width = width;
+                self.height = height;
+                self.renderer.resize(width, height);
+                // Every VR resizes in lockstep with MAIN.
+                let vr_ids: Vec<_> = self.viewport_renderers.keys().copied().collect();
+                for vr_id in vr_ids {
+                    if let Some(vr) = self.viewport_renderers.get_mut(&vr_id) {
+                        vr.resize(&self.device, &mut self.renderer, width, height);
                     }
-                } else if let Some(vr) = self.viewport_renderers.get_mut(&id) {
-                    // Non-MAIN viewports get their VR resized too. With
-                    // shared per-resolution passes (deferred to Phase 4),
-                    // mismatched sizes mean re-resizing the renderer per
-                    // render_to call — out of scope for Phase 3.
-                    vr.resize(&self.device, &mut self.renderer, width, height);
+                    if let Some(vp) = self.viewports.get_mut(vr_id) {
+                        vp.width = width;
+                        vp.height = height;
+                    }
                 }
+                self.environment_dirty = true;
+                self.environment_ui_dirty = true;
+                eprintln!("[RkpEngine] resized to {}x{}", width, height);
             }
 
             EngineCommand::SetViewportVisible { id, visible } => {

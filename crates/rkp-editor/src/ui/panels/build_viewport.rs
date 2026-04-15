@@ -11,9 +11,6 @@
 //! the rest of the panel.
 
 use rinch::prelude::*;
-// Effect isn't in the prelude — it's reserved for sync with external
-// systems (command channel, here). DOM reactivity uses {|| expr}.
-use rinch::core::Effect;
 use rinch::render_surface::{RenderSurface, SurfaceEvent, SurfaceMouseButton};
 
 use rkp_engine::viewport::ViewportId;
@@ -72,22 +69,61 @@ pub fn BuildViewport() -> NodeHandle {
     let orbiting = std::cell::Cell::new(false);
 
     // Whenever `procedural` flips between Some and None, drive the
-    // viewport's visibility. Use a Memo so the effect only fires on the
-    // actual transition, not every unrelated store update.
+    // viewport's visibility. `__scope.create_effect` ties the effect's
+    // lifetime to the component — it gets disposed on unmount rather
+    // than leaking past tab switches.
+    //
+    // Critical: effects must NEVER write to signals that any co-running
+    // effect on the same dep chain reads. store.procedural's state-tick
+    // updates push all subscribers into the flush queue; if we wrote to
+    // `turntable` here, the nested flush would pop the has_procedural
+    // memo marker and re-queue this effect while it's still borrowed —
+    // that's the RefCell-already-borrowed panic we've chased twice now.
+    // Hence: no turntable mutation in this effect. If the user wants a
+    // re-frame, they can trigger it from a button or a drag-to-refocus.
     let has_procedural = Memo::new(move || store.procedural.get().is_some());
     {
+        // `store.procedural.send` is called unconditionally on every
+        // state-tick from the engine thread, so this effect fires once
+        // per frame even when visibility hasn't actually changed. Track
+        // the previous value in a non-reactive Cell (a Signal here would
+        // re-queue this effect, see the panic note above) and only send
+        // on the actual edge.
+        let prev_visible = std::cell::Cell::new(None::<bool>);
         let cmd_tx = cmd.0.clone();
-        Effect::new(move || {
+        __scope.create_effect(move || {
             let visible = has_procedural.get();
+            if prev_visible.get() == Some(visible) {
+                return;
+            }
+            prev_visible.set(Some(visible));
             let _ = cmd_tx.send(rkp_engine::EngineCommand::SetViewportVisible {
                 id: PANEL_VIEWPORT,
                 visible,
             });
-            // Re-seed the turntable target on each open. Phase 7 can
-            // center on the procedural's actual AABB; MVP uses origin.
-            if visible {
-                turntable.update(|t| *t = Turntable::default());
+        });
+    }
+
+    // Focus the viewport on whichever procedural entity is currently
+    // selected. The build viewport's default filter is `BUILD_PREVIEW`
+    // which excludes the `DEFAULT` bit all normal entities carry —
+    // focus_entity is the additive escape hatch that lets the selected
+    // procedural through the visibility gate regardless of its layer.
+    // Without this, the build viewport renders an empty sky.
+    {
+        let prev_focus = std::cell::Cell::new(None::<Option<uuid::Uuid>>);
+        let cmd_tx = cmd.0.clone();
+        __scope.create_effect(move || {
+            let focus = store.selected_entity.get();
+            if prev_focus.get() == Some(focus) {
+                return;
             }
+            prev_focus.set(Some(focus));
+            let _ = cmd_tx.send(rkp_engine::EngineCommand::SetViewportFilter {
+                id: PANEL_VIEWPORT,
+                base_layers: rkp_engine::viewport::layer::BUILD_PREVIEW,
+                focus_entity_id: focus,
+            });
         });
     }
 
@@ -96,7 +132,7 @@ pub fn BuildViewport() -> NodeHandle {
     // render_frame reads from there next tick.
     {
         let cmd_tx = cmd.0.clone();
-        Effect::new(move || {
+        __scope.create_effect(move || {
             let t = turntable.get();
             let eye = t.eye();
             let _ = cmd_tx.send(rkp_engine::EngineCommand::SetCamera {
@@ -110,20 +146,15 @@ pub fn BuildViewport() -> NodeHandle {
     }
 
     let cmd_tx = cmd.0.clone();
-    let surface_for_handler = surface.clone();
     surface.set_event_handler(move |event| {
         use SurfaceEvent::*;
 
-        // Relay size changes to the engine so the VR resizes its
-        // gbuffer + bloom chain to match.
-        {
-            let (w, h) = surface_for_handler.layout_size();
-            let w = w.max(64);
-            let h = h.max(64);
-            let _ = cmd_tx.send(rkp_engine::EngineCommand::Resize {
-                id: PANEL_VIEWPORT, width: w, height: h,
-            });
-        }
+        // We deliberately do NOT send Resize here. All VRs share the
+        // renderer's resolution (driven by MAIN) and the BuildSurface
+        // panel scales the received image via CSS. Sending a BUILD
+        // Resize would either desync the shared pass outputs (if the
+        // engine honored it) or be a no-op (it does today). Explicit
+        // comment in case the panel layout tempts someone to re-add it.
 
         match event {
             MouseDown { button, x, y } => {
@@ -162,21 +193,28 @@ pub fn BuildViewport() -> NodeHandle {
         }
     });
 
+    // Layout mirrors the main Viewport panel: flex-column with a
+    // flex:1+min-height:0+position:relative content area so the
+    // RenderSurface can size to the container. The placeholder is an
+    // absolute overlay instead of a conditional mount — re-mounting
+    // `RenderSurface` each time `has_procedural` flips would reset the
+    // panel's surface attachment on every selection change.
     rsx! {
         div {
-            style: "position:relative;width:100%;height:100%;background:#1a1a1a;",
-            // No procedural selected → placeholder text. The viewport
-            // itself is hidden engine-side via SetViewportVisible, so
-            // the surface doesn't get frames.
-            if !has_procedural.get() {
-                div {
-                    style: "display:flex;align-items:center;justify-content:center;\
-                            height:100%;color:#666;font-style:italic;font-size:12px;",
-                    "Select a procedural object to build"
-                }
-            }
-            if has_procedural.get() {
+            style: "display:flex;flex-direction:column;width:100%;height:100%;\
+                    background:#1a1a1a;",
+            div {
+                style: "flex:1;min-height:0;position:relative;",
                 RenderSurface { surface: Some(surface.clone()) }
+                if !has_procedural.get() {
+                    div {
+                        style: "position:absolute;inset:0;display:flex;\
+                                align-items:center;justify-content:center;\
+                                background:#1a1a1a;color:#666;font-style:italic;\
+                                font-size:12px;",
+                        "Select a procedural object to build"
+                    }
+                }
             }
         }
     }

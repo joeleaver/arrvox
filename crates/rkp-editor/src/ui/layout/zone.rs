@@ -84,17 +84,22 @@ pub fn ZoneComponent(container: ContainerKind, zone_idx: usize) -> NodeHandle {
                 if active_panel.get() == Some(PanelId::Profiling) { ProfilingPanel {} }
                 if active_panel.get() == Some(PanelId::Models) { ModelsPanel {} }
                 if active_panel.get() == Some(PanelId::Build) {
-                    // Build pane: 3D preview with tree + params overlaid
-                    // as a sidebar strip. BuildViewport owns the turntable
-                    // camera + RenderSurface wiring; BuildPanel hosts the
-                    // node tree + param controls from the original panel.
+                    // Build pane: 3D preview on the left (turntable +
+                    // RenderSurface) with node-tree + params sidebar on
+                    // the right. Flex-row, not an overlay — the preview
+                    // and the sidebar occupy disjoint space so the
+                    // RenderSurface has a clean container for sizing.
                     div {
-                        style: "position:relative;width:100%;height:100%;",
-                        BuildViewport {}
+                        style: "display:flex;flex-direction:row;width:100%;height:100%;\
+                                min-height:0;",
                         div {
-                            style: "position:absolute;top:0;right:0;width:320px;height:100%;\
-                                    background:rgba(30,30,30,0.9);\
-                                    border-left:1px solid #3c3c3c;overflow:hidden;",
+                            style: "flex:1;min-width:0;min-height:0;",
+                            BuildViewport {}
+                        }
+                        div {
+                            style: "width:320px;flex-shrink:0;height:100%;\
+                                    background:#252525;border-left:1px solid #3c3c3c;\
+                                    overflow:hidden;",
                             BuildPanel {}
                         }
                     }

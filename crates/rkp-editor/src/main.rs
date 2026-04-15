@@ -178,9 +178,15 @@ fn main() -> anyhow::Result<()> {
     // 1. Create render surfaces — one per viewport. MAIN renders the
     //    scene; BUILD renders the selected procedural object in its own
     //    panel.
+    // Both surfaces go through rinch's inline-paint path (via the
+    // `RenderSurface` component's `data-render-surface` attribute).
+    // `create_render_surface_with_name` is for video/compositor
+    // hole-punch and was the wrong pick — it would route BUILD's pixels
+    // to a different path that needs a `data-viewport` DOM attribute we
+    // don't emit, so BUILD would never actually paint.
     let main_surface_handle = create_render_surface();
     let main_surface_writer = main_surface_handle.writer();
-    let build_surface_handle = rinch::render_surface::create_render_surface_with_name("build");
+    let build_surface_handle = create_render_surface();
     let build_surface_writer = build_surface_handle.writer();
 
     // 2. Create the central editor store. Surface handles travel via
