@@ -78,8 +78,11 @@ fn spatial_from_handle(
     }
 }
 
-/// Frame delivery callback — called each tick with RGBA8 pixels.
-pub type FrameCallback = Box<dyn Fn(&[u8], u32, u32) + Send>;
+/// Frame delivery callback — called once per visible viewport each tick.
+/// `id` identifies which viewport this frame belongs to (the editor maps
+/// each `ViewportId` to its own `RenderSurface`). RGBA8 pixels, length
+/// `width * height * 4`.
+pub type FrameCallback = Box<dyn Fn(crate::viewport::ViewportId, &[u8], u32, u32) + Send>;
 
 /// State update callback — called each tick with engine state.
 pub type StateCallback = Box<dyn Fn(&StateUpdate) + Send>;
@@ -418,7 +421,20 @@ impl EngineState {
         }
     }
 
-    fn render_frame(&mut self) -> (Vec<u8>, u32, u32) {
+    /// Render every visible viewport this tick. Once-per-frame work (light
+    /// upload, geometry upload, env params) happens once at the top; the
+    /// per-viewport block (camera build, screen-aabbs, frame upload, render,
+    /// pick/wireframe on MAIN, readback copy) iterates the visible set. One
+    /// encoder + one submit covers the whole frame; readback is then mapped
+    /// per viewport and delivered via `frame_callback`.
+    ///
+    /// Phase 4 caveat: only MAIN is visible by default and the renderer's
+    /// internal pass resources stay sized to MAIN. A second visible viewport
+    /// at a different resolution would need either a per-renderer-resize per
+    /// iteration or a pass-internal split — both deferred to Phase 6 since
+    /// no UI surfaces a second viewport yet.
+    fn render_frame(&mut self, frame_callback: &FrameCallback) {
+        use crate::viewport::ViewportId;
         let frame_start = std::time::Instant::now();
 
         // 0a. Upload material palette if dirty.
@@ -460,10 +476,14 @@ impl EngineState {
             self.num_lights_cache = shade_params.num_lights;
 
             if self.environment_dirty {
+                // Phase 4: bloom/tonemap params apply equally to every
+                // viewport (they're per-viewport state but all share the
+                // same env settings today). Push into MAIN here; widening
+                // to per-viewport overrides is a Phase 6+ concern.
                 let env = &self.environment;
                 let queue = &self.queue;
                 let main = self.viewport_renderers
-                    .get_mut(&crate::viewport::ViewportId::MAIN)
+                    .get_mut(&ViewportId::MAIN)
                     .expect("main viewport renderer must exist");
                 main.tone_map.set_exposure(queue, env.exposure);
                 main.bloom.set_threshold(queue, env.bloom_threshold, env.bloom_knee);
@@ -498,196 +518,200 @@ impl EngineState {
             self.collider_caches_dirty = false;
         }
 
-        // 2. Upload per-frame data (objects + camera).
-        let cam_uniforms = self.build_camera_uniforms();
-        let frame = FrameUpload {
-            objects: &self.gpu_objects,
-            camera: &cam_uniforms,
-        };
-        self.renderer.upload_frame(&self.queue, &frame);
-
         let t_upload = frame_start.elapsed();
 
-        // 3. Render: march (+ per-light shadow) → SSAO → shade → volumetrics.
+        // ── Per-viewport rendering ──────────────────────────────────────
+        // Snapshot the visible set first so the iteration can take mutable
+        // borrows of viewport_renderers entries inside.
+        let visible_ids: Vec<ViewportId> = self.viewports
+            .iter()
+            .filter(|(_, v)| v.visible)
+            .map(|(id, _)| *id)
+            .collect();
+
         let object_count = self.gpu_objects.len() as u32;
         let shadow_steps = self.environment.shadow_steps;
         let num_lights = self.num_lights_cache;
-        let vp = glam::Mat4::from_cols_array_2d(&cam_uniforms.view_proj);
-        let screen_aabbs = crate::scene_sync::compute_screen_aabbs(
-            &self.gpu_objects, &vp, self.width as f32, self.height as f32,
-        );
-        let screen_aabbs_bytes: &[u8] = bytemuck::cast_slice(&screen_aabbs);
-
-        // Upload volumetric params.
-        let vol_params = self.environment.to_volumetric_params(
-            &cam_uniforms, self.width, self.height, self.frame_index as u32,
-        );
-        self.renderer.update_volumetric_params(&self.queue, &vol_params);
-        let cloud_params = self.environment.to_cloud_params(self.frame_index as f32 / 60.0);
-        self.renderer.update_cloud_params(&self.queue, &cloud_params);
-
-        // Atmosphere per-frame params.
-        let sun_d = self.environment.sun_direction();
-        let atmo_frame = rkp_render::rkp_atmosphere::AtmosphereFrameParams {
-            sun_dir: [-sun_d[0], -sun_d[1], -sun_d[2]],
-            sun_intensity: self.environment.sun_intensity,
-            camera_altitude: self.environment.camera_altitude,
-            _pad: [0.0; 3],
-            cam_pos: [cam_uniforms.position[0], cam_uniforms.position[1], cam_uniforms.position[2]],
-            _pad1b: 0.0,
-            cam_forward: [cam_uniforms.forward[0], cam_uniforms.forward[1], cam_uniforms.forward[2]],
-            _pad2: 0.0,
-            cam_right: [cam_uniforms.right[0], cam_uniforms.right[1], cam_uniforms.right[2]],
-            _pad3: 0.0,
-            cam_up: [cam_uniforms.up[0], cam_uniforms.up[1], cam_uniforms.up[2]],
-            _pad4: 0.0,
-        };
-
-        // God ray params: project sun position to screen space.
-        {
-            let sun_toward = [-sun_d[0], -sun_d[1], -sun_d[2]];
-            // Sun is infinitely far — project direction as a point far along sun_dir.
-            let sun_world = glam::Vec3::new(
-                cam_uniforms.position[0] + sun_toward[0] * 1000.0,
-                cam_uniforms.position[1] + sun_toward[1] * 1000.0,
-                cam_uniforms.position[2] + sun_toward[2] * 1000.0,
-            );
-            let vp = glam::Mat4::from_cols_array_2d(&cam_uniforms.view_proj);
-            let clip = vp * glam::Vec4::new(sun_world.x, sun_world.y, sun_world.z, 1.0);
-            let sun_on_screen = if clip.w > 0.0 { 1.0 } else { 0.0 };
-            let ndc = if clip.w > 0.0 {
-                glam::Vec2::new(clip.x / clip.w, clip.y / clip.w)
-            } else {
-                glam::Vec2::ZERO
-            };
-            let sun_uv = [ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5];
-
-            let god_ray_params = rkp_render::rkp_god_rays::GodRayParams {
-                sun_screen_pos: sun_uv,
-                sun_on_screen,
-                density: self.environment.god_ray_density,
-                weight: self.environment.god_ray_weight,
-                decay: self.environment.god_ray_decay,
-                exposure: self.environment.god_ray_exposure,
-                num_samples: 64,
-            };
-            self.renderer.god_rays.update_params(&self.queue, &god_ray_params);
-        }
-
-        // Pre-compute gizmo wireframe verts before we take a mutable borrow
-        // of the main viewport renderer (build_gizmo_wireframe needs &self,
-        // which would conflict with &mut self.viewport_renderers).
+        // Gizmo overlay is drawn on MAIN only — selection state is global.
         let gizmo_verts = self.build_gizmo_wireframe();
+        let mut pick_issued = false;
 
-        // 3b. Renderer pipeline + per-viewport post-process (bloom →
-        // bloom_composite → tone_map → composite copy). Engine still owns
-        // pick + wireframe overlay + readback below since those need
-        // engine-specific state.
-        let main_vr = self.viewport_renderers
-            .get_mut(&crate::viewport::ViewportId::MAIN)
-            .expect("main viewport renderer must exist");
-        self.renderer.render_to(
-            &mut encoder, &self.queue, main_vr,
-            object_count, shadow_steps, num_lights, screen_aabbs_bytes, &atmo_frame,
-        );
+        for &viewport_id in &visible_ids {
+            let cam_uniforms = self.build_camera_uniforms(viewport_id);
+            let (vp_w, vp_h) = self.viewports
+                .get(viewport_id)
+                .map(|v| (v.width, v.height))
+                .expect("viewport must exist");
+
+            // Per-viewport screen-AABBs (camera-dependent).
+            let vp_matrix = glam::Mat4::from_cols_array_2d(&cam_uniforms.view_proj);
+            let screen_aabbs = crate::scene_sync::compute_screen_aabbs(
+                &self.gpu_objects, &vp_matrix, vp_w as f32, vp_h as f32,
+            );
+            let screen_aabbs_bytes: &[u8] = bytemuck::cast_slice(&screen_aabbs);
+
+            // Per-viewport upload (objects + camera).
+            // The `camera_buffer` is shared across viewports today; with
+            // multiple visible viewports rendered into one encoder this
+            // would race (last write wins for all dispatches). Phase 6
+            // moves it into ViewportRenderer + rebuilds the bind group
+            // per VR. With one visible viewport there's no conflict.
+            let frame = FrameUpload {
+                objects: &self.gpu_objects,
+                camera: &cam_uniforms,
+            };
+            self.renderer.upload_frame(&self.queue, &frame);
+
+            // Per-viewport vol/cloud/atmo/god-ray params (camera-dependent).
+            let vol_params = self.environment.to_volumetric_params(
+                &cam_uniforms, vp_w, vp_h, self.frame_index as u32,
+            );
+            self.renderer.update_volumetric_params(&self.queue, &vol_params);
+            let cloud_params = self.environment.to_cloud_params(self.frame_index as f32 / 60.0);
+            self.renderer.update_cloud_params(&self.queue, &cloud_params);
+
+            let sun_d = self.environment.sun_direction();
+            let atmo_frame = rkp_render::rkp_atmosphere::AtmosphereFrameParams {
+                sun_dir: [-sun_d[0], -sun_d[1], -sun_d[2]],
+                sun_intensity: self.environment.sun_intensity,
+                camera_altitude: self.environment.camera_altitude,
+                _pad: [0.0; 3],
+                cam_pos: [cam_uniforms.position[0], cam_uniforms.position[1], cam_uniforms.position[2]],
+                _pad1b: 0.0,
+                cam_forward: [cam_uniforms.forward[0], cam_uniforms.forward[1], cam_uniforms.forward[2]],
+                _pad2: 0.0,
+                cam_right: [cam_uniforms.right[0], cam_uniforms.right[1], cam_uniforms.right[2]],
+                _pad3: 0.0,
+                cam_up: [cam_uniforms.up[0], cam_uniforms.up[1], cam_uniforms.up[2]],
+                _pad4: 0.0,
+            };
+            {
+                let sun_toward = [-sun_d[0], -sun_d[1], -sun_d[2]];
+                // Sun is infinitely far — project direction as a point far along sun_dir.
+                let sun_world = glam::Vec3::new(
+                    cam_uniforms.position[0] + sun_toward[0] * 1000.0,
+                    cam_uniforms.position[1] + sun_toward[1] * 1000.0,
+                    cam_uniforms.position[2] + sun_toward[2] * 1000.0,
+                );
+                let clip = vp_matrix * glam::Vec4::new(sun_world.x, sun_world.y, sun_world.z, 1.0);
+                let sun_on_screen = if clip.w > 0.0 { 1.0 } else { 0.0 };
+                let ndc = if clip.w > 0.0 {
+                    glam::Vec2::new(clip.x / clip.w, clip.y / clip.w)
+                } else {
+                    glam::Vec2::ZERO
+                };
+                let sun_uv = [ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5];
+                let god_ray_params = rkp_render::rkp_god_rays::GodRayParams {
+                    sun_screen_pos: sun_uv,
+                    sun_on_screen,
+                    density: self.environment.god_ray_density,
+                    weight: self.environment.god_ray_weight,
+                    decay: self.environment.god_ray_decay,
+                    exposure: self.environment.god_ray_exposure,
+                    num_samples: 64,
+                };
+                self.renderer.god_rays.update_params(&self.queue, &god_ray_params);
+            }
+
+            // Render this viewport — march → … → composite copy.
+            let vr = self.viewport_renderers
+                .get_mut(&viewport_id)
+                .expect("viewport renderer must exist");
+            self.renderer.render_to(
+                &mut encoder, &self.queue, vr,
+                object_count, shadow_steps, num_lights, screen_aabbs_bytes, &atmo_frame,
+            );
+
+            // Pick + wireframe overlay are MAIN-only (gizmo + selection
+            // are global state today).
+            if viewport_id == ViewportId::MAIN {
+                if let Some((px, py)) = self.pending_pick.take() {
+                    pick_issued = true;
+                    if px < vr.width && py < vr.height {
+                        encoder.copy_texture_to_buffer(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &vr.gbuffer.material_texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d { x: px, y: py, z: 0 },
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::TexelCopyBufferInfo {
+                                buffer: &self.pick_readback_buffer,
+                                layout: wgpu::TexelCopyBufferLayout {
+                                    offset: 0,
+                                    bytes_per_row: Some(256),
+                                    rows_per_image: Some(1),
+                                },
+                            },
+                            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                        );
+                    }
+                }
+                if !gizmo_verts.is_empty() {
+                    // Split borrow: wireframe_pass is &mut, composite_view + dims are &.
+                    let composite_view = &vr.composite_view;
+                    let vw = vr.width as f32;
+                    let vh = vr.height as f32;
+                    vr.wireframe_pass.draw(
+                        &self.device,
+                        &self.queue,
+                        &mut encoder,
+                        composite_view,
+                        vp_matrix,
+                        (0.0, 0.0, vw, vh),
+                        &gizmo_verts,
+                    );
+                }
+            }
+
+            vr.copy_composite_to_readback(&mut encoder);
+        }
 
         let t_encode = frame_start.elapsed();
 
-        // 4b. Pick: copy material texture (object_id+1 in G bits 8-15, 0 = no hit).
-        let pick_issued = self.pending_pick.is_some();
-        if let Some((px, py)) = self.pending_pick.take() {
-            if px < self.width && py < self.height {
-                encoder.copy_texture_to_buffer(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &main_vr.gbuffer.material_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d { x: px, y: py, z: 0 },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: &self.pick_readback_buffer,
-                        layout: wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(256),
-                            rows_per_image: Some(1),
-                        },
-                    },
-                    wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-                );
-            }
-        }
-
-        // 6. Wireframe overlay + readback copy (engine-specific because the
-        // wireframe geometry comes from gizmo state).
+        // ── Once per frame: profiler "post" wrap + resolve + submit ──
         let q_post = self.renderer.profiler.begin_query("post", &mut encoder);
-
-        // 6b. Draw gizmo wireframe if an object is selected.
-        if !gizmo_verts.is_empty() {
-            let vp_matrix = glam::Mat4::from_cols_array_2d(&cam_uniforms.view_proj);
-            // Split borrow: wireframe_pass is mutable, composite_view + width/height
-            // are immutable, all on disjoint fields of main_vr.
-            let composite_view = &main_vr.composite_view;
-            let vw = main_vr.width as f32;
-            let vh = main_vr.height as f32;
-            main_vr.wireframe_pass.draw(
-                &self.device,
-                &self.queue,
-                &mut encoder,
-                composite_view,
-                vp_matrix,
-                (0.0, 0.0, vw, vh),
-                &gizmo_verts,
-            );
-        }
-
-        // 6c. Copy composite to readback buffer.
-        main_vr.copy_composite_to_readback(&mut encoder);
         self.renderer.profiler.end_query(&mut encoder, q_post);
-
-        // 7b. Resolve all profiler queries now that every pass has been encoded.
         self.renderer.resolve_profiler_queries(&mut encoder);
 
         let t_post = frame_start.elapsed();
 
-        // 8. Submit GPU work.
         self.queue.submit(std::iter::once(encoder.finish()));
 
         let t_submit = frame_start.elapsed();
 
-        // 9. Process pick readback if we just issued one.
+        // Pick result process — depends on this frame's pick copy completing.
         if pick_issued {
             self.process_pick_result();
         }
 
-        // 10. Read from the OTHER buffer (completed last frame).
-        // Double-buffered: we read last frame's data while this frame's copy runs.
-        // wait_indefinitely returns near-instantly since last frame's GPU work is done.
-        let pixels = {
-            let main_vr = self.viewport_renderers
-                .get(&crate::viewport::ViewportId::MAIN)
-                .expect("main viewport renderer must exist");
-            let read_index = if main_vr.readback_ready {
-                1 - main_vr.readback_index
-            } else {
-                // First frame: no previous data, read current (blocking).
-                main_vr.readback_index
+        // ── Per-viewport readback + delivery ────────────────────────────
+        for &viewport_id in &visible_ids {
+            let (read_index, w, h) = {
+                let vr = self.viewport_renderers
+                    .get(&viewport_id)
+                    .expect("viewport renderer must exist");
+                let read_index = if vr.readback_ready {
+                    1 - vr.readback_index
+                } else {
+                    // First frame: no previous data, read current (blocking).
+                    vr.readback_index
+                };
+                (read_index, vr.width, vr.height)
             };
-            self.map_readback(read_index)
-        };
-        self.viewport_renderers
-            .get_mut(&crate::viewport::ViewportId::MAIN)
-            .expect("main viewport renderer must exist")
-            .advance_readback();
+            let pixels = self.map_readback(viewport_id, read_index);
+            frame_callback(viewport_id, &pixels, w, h);
+            self.viewport_renderers
+                .get_mut(&viewport_id)
+                .expect("viewport renderer must exist")
+                .advance_readback();
+        }
 
-        // 11. GPU profiler — process finished frames (logs every 60 frames).
+        // GPU profiler — process finished frames (logs every 60 frames).
         self.renderer.end_profiler_frame(self.frame_index, self.width, self.height);
 
         let t_frame_end = frame_start.elapsed();
 
-        // Log timing every 60 frames.
-        // gpu_wait = CPU blocking on last frame's GPU work to finish so we can
-        // map the composite buffer for the editor. The copy itself is cheap;
-        // the cost is the sync.
         if self.frame_index % 60 == 0 && self.frame_index > 0 {
             eprintln!(
                 "[perf] cpu_setup={:.1}ms upload={:.1}ms encode={:.1}ms post={:.1}ms submit={:.1}ms gpu_wait={:.1}ms total={:.1}ms",
@@ -702,22 +726,20 @@ impl EngineState {
         }
 
         self.frame_index += 1;
-
-        (pixels, self.width, self.height)
     }
 
-    /// Read from the main viewport's readback buffer. With double-buffering
-    /// we read last frame's buffer, so the GPU work is already complete and
-    /// `wait_indefinitely` returns near-instantly.
-    fn map_readback(&self, index: usize) -> Vec<u8> {
-        let main_vr = self.viewport_renderers
-            .get(&crate::viewport::ViewportId::MAIN)
-            .expect("main viewport renderer must exist");
-        let w = main_vr.width;
-        let h = main_vr.height;
-        let padded_row = main_vr.readback_padded_row();
+    /// Read from a viewport's readback buffer. With double-buffering we
+    /// read the previous frame's buffer, so the GPU work is already
+    /// complete and `wait_indefinitely` returns near-instantly.
+    fn map_readback(&self, viewport_id: crate::viewport::ViewportId, index: usize) -> Vec<u8> {
+        let vr = self.viewport_renderers
+            .get(&viewport_id)
+            .expect("viewport renderer must exist");
+        let w = vr.width;
+        let h = vr.height;
+        let padded_row = vr.readback_padded_row();
 
-        let buffer_slice = main_vr.readback_buffers[index].slice(..);
+        let buffer_slice = vr.readback_buffers[index].slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
@@ -739,7 +761,7 @@ impl EngineState {
                 }
             }
             drop(data);
-            main_vr.readback_buffers[index].unmap();
+            vr.readback_buffers[index].unmap();
         }
 
         rgba8
@@ -763,12 +785,38 @@ impl EngineState {
         }
     }
 
-    fn build_camera_uniforms(&self) -> rkp_render::rkp_scene::CameraUniforms {
-        // yaw/pitch are in radians (set by camera controller).
-        let yaw = self.camera.yaw;
-        let pitch = self.camera.pitch;
+    fn build_camera_uniforms(&self, viewport_id: crate::viewport::ViewportId)
+        -> rkp_render::rkp_scene::CameraUniforms
+    {
+        use crate::viewport::{EditorCamera, ViewportId};
+        let viewport = self.viewports
+            .get(viewport_id)
+            .expect("build_camera_uniforms: viewport must exist");
 
-        // Same fly_direction formula as the camera controller.
+        // MAIN's camera state still lives on the legacy `self.camera` field
+        // (Phase 1 syncs it into `viewport.editor_camera` for forward-compat).
+        // Other viewports read directly from their own `editor_camera`.
+        // `runtime_override` resolution lands in Phase 5.
+        let (position, yaw, pitch, fov, near, far) = if viewport_id == ViewportId::MAIN {
+            (self.camera.position, self.camera.yaw, self.camera.pitch,
+             self.camera.fov, self.camera.near, self.camera.far)
+        } else {
+            match viewport.editor_camera {
+                EditorCamera::Fly(s) => (s.position, s.yaw, s.pitch, s.fov, s.near, s.far),
+                EditorCamera::Turntable(t) => {
+                    // Convert orbit (yaw/pitch + distance about target) to
+                    // equivalent eye-position + look direction.
+                    let dir = glam::Vec3::new(
+                        -t.yaw.sin() * t.pitch.cos(),
+                        t.pitch.sin(),
+                        -t.yaw.cos() * t.pitch.cos(),
+                    );
+                    let position = t.target - dir * t.distance;
+                    (position, t.yaw, t.pitch, t.fov, t.near, t.far)
+                }
+            }
+        };
+
         let forward = glam::Vec3::new(
             -yaw.sin() * pitch.cos(),
             pitch.sin(),
@@ -777,36 +825,29 @@ impl EngineState {
         let right = forward.cross(glam::Vec3::Y).normalize();
         let up = right.cross(forward).normalize();
 
-        let fov_rad = self.camera.fov.to_radians();
+        let fov_rad = fov.to_radians();
         let half_fov_tan = (fov_rad * 0.5).tan();
-        let aspect = self.width as f32 / self.height.max(1) as f32;
+        let aspect = viewport.width as f32 / viewport.height.max(1) as f32;
 
-        let view = glam::Mat4::look_to_rh(self.camera.position, forward, glam::Vec3::Y);
-        let proj = glam::Mat4::perspective_rh(fov_rad, aspect, self.camera.near, self.camera.far);
+        let view = glam::Mat4::look_to_rh(position, forward, glam::Vec3::Y);
+        let proj = glam::Mat4::perspective_rh(fov_rad, aspect, near, far);
         let view_proj = proj * view;
 
-        // Render-layer + focus filter from the main viewport. u32::MAX
-        // defaults pass everything (no real object_id is u32::MAX since IDs
-        // are sequential from 0). Phase 1's `Viewports` always carries a
-        // MAIN entry, so the unwrap_or is purely belt-and-suspenders for
-        // the unreachable branch.
-        let (layer_mask, focus_object_id) = self.viewports
-            .get(crate::viewport::ViewportId::MAIN)
-            .map(|v| {
-                let focus_obj = v.filter.focus_entity
-                    .and_then(|e| self.entity_to_gpu.get(&e).copied())
-                    .map(|idx| idx as u32)
-                    .unwrap_or(u32::MAX);
-                (v.filter.base_layers, focus_obj)
-            })
-            .unwrap_or((u32::MAX, u32::MAX));
+        // Render-layer + focus filter from this viewport's SceneFilter.
+        // u32::MAX defaults pass everything (no real object_id is u32::MAX
+        // since they're sequential from 0).
+        let focus_object_id = viewport.filter.focus_entity
+            .and_then(|e| self.entity_to_gpu.get(&e).copied())
+            .map(|idx| idx as u32)
+            .unwrap_or(u32::MAX);
+        let layer_mask = viewport.filter.base_layers;
 
         rkp_render::rkp_scene::CameraUniforms {
-            position: [self.camera.position.x, self.camera.position.y, self.camera.position.z, 1.0],
+            position: [position.x, position.y, position.z, 1.0],
             forward: [forward.x, forward.y, forward.z, 0.0],
             right: [right.x * half_fov_tan * aspect, right.y * half_fov_tan * aspect, right.z * half_fov_tan * aspect, 0.0],
             up: [up.x * half_fov_tan, up.y * half_fov_tan, up.z * half_fov_tan, 0.0],
-            resolution: [self.width as f32, self.height as f32],
+            resolution: [viewport.width as f32, viewport.height as f32],
             jitter: [0.0, 0.0],
             layer_mask,
             focus_object_id,
@@ -3148,8 +3189,10 @@ impl EngineState {
     }
 
     /// Screen-space ray from pixel coordinates.
+    /// Phase 4: rays come from MAIN's camera — sculpt/paint/picking are
+    /// MAIN-only operations.
     fn screen_to_ray(&self, px: f32, py: f32) -> (glam::Vec3, glam::Vec3) {
-        let cam = self.build_camera_uniforms();
+        let cam = self.build_camera_uniforms(crate::viewport::ViewportId::MAIN);
         let vp = glam::Mat4::from_cols_array_2d(&cam.view_proj);
         let inv_vp = vp.inverse();
 
@@ -3530,11 +3573,8 @@ fn tick_loop(
         // 3. Update gizmo hover + drag.
         state.update_gizmo();
 
-        // 4. Render frame.
-        let (pixels, w, h) = state.render_frame();
-
-        // 5. Deliver frame to client.
-        frame_callback(&pixels, w, h);
+        // 4. Render frame — fires `frame_callback` once per visible viewport.
+        state.render_frame(&frame_callback);
 
         // 6. Push state to client.
         let frame_time = frame_start.elapsed();

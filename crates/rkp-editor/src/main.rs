@@ -181,9 +181,14 @@ fn main() -> anyhow::Result<()> {
             width: 1920,
             height: 1080,
         },
-        // Frame callback: deliver pixels to rinch surface.
-        Box::new(move |pixels, w, h| {
-            surface_writer.submit_frame(pixels, w, h);
+        // Frame callback: route pixels to the matching viewport surface.
+        // Phase 4: only MAIN has a surface; non-MAIN viewports are silently
+        // dropped here. Phase 6's build viewport will register a second
+        // writer and dispatch on `viewport_id`.
+        Box::new(move |viewport_id, pixels, w, h| {
+            if viewport_id == rkp_engine::viewport::ViewportId::MAIN {
+                surface_writer.submit_frame(pixels, w, h);
+            }
         }),
         // State callback: push engine state to EditorStore signals (cross-thread).
         {
