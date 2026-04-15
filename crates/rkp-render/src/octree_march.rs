@@ -48,7 +48,8 @@ impl OctreeMarchPass {
         device: &wgpu::Device,
         scene_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> Self {
-        // Group 1: G-buffer storage textures (write-only) + shadow output.
+        // Group 1: G-buffer storage textures (write-only). Shadow output
+        // moved to the rkp_shadow_trace pass (half-res).
         let gbuffer_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("march gbuffer layout"),
@@ -56,7 +57,6 @@ impl OctreeMarchPass {
                     bgl_storage_tex(0, wgpu::TextureFormat::Rgba32Float),
                     bgl_storage_tex(1, wgpu::TextureFormat::Rgba16Float),
                     bgl_storage_tex(2, wgpu::TextureFormat::Rg32Uint),
-                    bgl_storage_tex(3, wgpu::TextureFormat::Rgba8Unorm),
                 ],
             });
 
@@ -230,14 +230,27 @@ impl OctreeMarchPass {
         queue.write_buffer(&self.screen_aabbs_buffer, 0, data);
     }
 
-    /// Set the G-buffer textures + shadow output. Call on init and after resize.
+    /// Expose the params bind group layout so the shadow_trace pass can
+    /// share the march's params + materials + stats + lights bindings.
+    pub fn params_bind_group_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.params_bind_group_layout
+    }
+
+    /// The params bind group itself, for external passes that dispatch
+    /// with the same layout (currently rkp_shadow_trace).
+    pub fn params_bind_group(&self) -> Option<&wgpu::BindGroup> {
+        self.params_bind_group.as_ref()
+    }
+
+    /// Set the G-buffer textures. Call on init and after resize. Shadows are
+    /// traced in a separate half-res pass (`rkp_shadow_trace`) that no longer
+    /// lives in this pipeline.
     pub fn set_gbuffer(
         &mut self,
         device: &wgpu::Device,
         position_view: &wgpu::TextureView,
         normal_view: &wgpu::TextureView,
         material_view: &wgpu::TextureView,
-        shadow_view: &wgpu::TextureView,
     ) {
         self.gbuffer_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("march gbuffer bind group"),
@@ -246,7 +259,6 @@ impl OctreeMarchPass {
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(position_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(normal_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(material_view) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(shadow_view) },
             ],
         }));
     }

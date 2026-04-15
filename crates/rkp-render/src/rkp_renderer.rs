@@ -14,14 +14,18 @@ use crate::rkp_atmosphere::RkpAtmospherePass;
 use crate::rkp_god_rays::RkpGodRayPass;
 use crate::rkp_gpu_object::RkpGpuObject;
 use crate::octree_march::OctreeMarchPass;
+use crate::rkp_shadow_trace::ShadowTracePass;
 use wgpu_profiler::GpuProfiler;
 
 /// The complete RKIPatch renderer.
 pub struct RkpRenderer {
     /// Scene GPU buffers.
     pub scene: RkpScene,
-    /// Octree ray march compute pass — primary visibility + shadow.
+    /// Octree ray march compute pass — primary visibility only; shadows
+    /// run in `shadow_trace`.
     pub march: OctreeMarchPass,
+    /// Half-resolution shadow trace (up to 4 shadow-casting lights).
+    pub shadow_trace: ShadowTracePass,
     /// Half-res screen-space ambient occlusion compute pass.
     pub ssao: RkpSsaoPass,
     /// Deferred PBR shading compute pass.
@@ -36,9 +40,6 @@ pub struct RkpRenderer {
     pub volumetric: RkpVolumetricPass,
     /// Screen-space god rays.
     pub god_rays: RkpGodRayPass,
-    /// Per-light shadow texture (Rgba8Unorm, up to 4 shadow-casting lights).
-    shadow_texture: wgpu::Texture,
-    shadow_view: wgpu::TextureView,
     /// Device for buffer operations.
     device: wgpu::Device,
     /// GPU profiler (wgpu-profiler).
@@ -95,15 +96,18 @@ impl RkpRenderer {
         march.set_materials(device, &materials_buffer);
         march.set_lights(device, &lights_buffer);
 
-        let (shadow_texture, shadow_view) = Self::create_shadow_texture(device, width, height);
+        let shadow_trace = ShadowTracePass::new(
+            device, width, height,
+            &scene.bind_group_layout,
+            march.params_bind_group_layout(),
+        );
         let volumetric = RkpVolumetricPass::new(device, width, height);
         let mut god_rays = RkpGodRayPass::new(device, width, height);
         god_rays.set_input(device, &volumetric.output_view);
 
         Self {
-            scene, march, ssao, shade, atmosphere, volumetric, god_rays,
+            scene, march, shadow_trace, ssao, shade, atmosphere, volumetric, god_rays,
             shade_params_buffer, lights_buffer, materials_buffer,
-            shadow_texture, shadow_view,
             device: device.clone(),
             profiler, timestamp_period,
             width, height,
@@ -123,10 +127,11 @@ impl RkpRenderer {
         &mut self,
         gbuffer: &rkf_render::GBuffer,
     ) {
-        self.march.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &self.shadow_view);
+        self.march.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view);
+        self.shadow_trace.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view);
         self.ssao.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view);
         self.shade.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view);
-        self.shade.set_shadow_and_ssao(&self.device, &self.shadow_view, &self.ssao.output_view);
+        self.shade.set_shadow_and_ssao(&self.device, &self.shadow_trace.output_view, &self.ssao.output_view);
         self.volumetric.set_depth_view(&self.device, &gbuffer.position_view);
         self.volumetric.set_scene_hdr_view(&self.device, &self.shade.output_view);
         self.god_rays.set_input(&self.device, &self.volumetric.output_view);
@@ -160,7 +165,7 @@ impl RkpRenderer {
             self.profiler.end_query(encoder, q);
         }
 
-        // 1. Octree ray march → G-buffer + per-light shadow texture.
+        // 1. Octree ray march → G-buffer (surface only; shadow is its own pass).
         self.march.clear_stats(encoder);
         {
             let q = self.profiler.begin_query("march", encoder);
@@ -169,6 +174,15 @@ impl RkpRenderer {
                 object_count, width, height, 0,
                 shadow_steps, num_lights, None,
             );
+            self.profiler.end_query(encoder, q);
+        }
+
+        // 1b. Half-res shadow trace: reads gbuf, writes half-res shadow.
+        // Runs at 1/4 the thread count of primary march — bilateral
+        // upsample happens inline in the shade pass.
+        if let Some(params_bg) = self.march.params_bind_group() {
+            let q = self.profiler.begin_query("shadow", encoder);
+            self.shadow_trace.dispatch(encoder, &self.scene.bind_group, params_bg);
             self.profiler.end_query(encoder, q);
         }
         self.march.copy_stats(encoder);
@@ -289,10 +303,8 @@ impl RkpRenderer {
         if width != self.width || height != self.height {
             self.width = width;
             self.height = height;
-            let (tex, view) = Self::create_shadow_texture(&self.device, width, height);
-            self.shadow_texture = tex;
-            self.shadow_view = view;
         }
+        self.shadow_trace.resize(&self.device, width, height);
         self.ssao.resize(&self.device, width, height);
         self.shade.resize(&self.device, width, height);
         self.volumetric.resize(&self.device, width, height);
@@ -307,21 +319,6 @@ impl RkpRenderer {
     /// Update cloud parameters.
     pub fn update_cloud_params(&self, queue: &wgpu::Queue, cloud: &CloudParams) {
         self.volumetric.update_cloud_params(queue, cloud);
-    }
-
-    fn create_shadow_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
-        let tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("rkp_shadow"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        (tex, view)
     }
 
     fn create_init_buffer(device: &wgpu::Device, label: &str, usage: wgpu::BufferUsages, data: &[u8]) -> wgpu::Buffer {

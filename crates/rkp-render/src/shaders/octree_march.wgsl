@@ -119,7 +119,6 @@ fn brick_id_of(node: u32) -> u32 {
 @group(1) @binding(0) var gbuf_position: texture_storage_2d<rgba32float, write>;
 @group(1) @binding(1) var gbuf_normal: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(2) var gbuf_material: texture_storage_2d<rg32uint, write>;
-@group(1) @binding(3) var shadow_out: texture_storage_2d<rgba8unorm, write>;
 
 @group(2) @binding(0) var<uniform> march_params: MarchParams;
 @group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
@@ -704,7 +703,6 @@ fn main(
         textureStore(gbuf_position, coord, vec4<f32>(0.0, 0.0, 0.0, 1e10));
         textureStore(gbuf_normal, coord, vec4<f32>(0.0, 0.0, 0.0, 0.0));
         textureStore(gbuf_material, coord, vec4<u32>(0u, 0u, 0u, 0u));
-        textureStore(shadow_out, coord, vec4<f32>(1.0));
         return;
     }
 
@@ -850,7 +848,6 @@ fn main(
         textureStore(gbuf_position, coord, vec4<f32>(0.0, 0.0, 0.0, 1e10));
         textureStore(gbuf_normal, coord, vec4<f32>(0.0, 0.0, 0.0, 0.0));
         textureStore(gbuf_material, coord, vec4<u32>(0u, 0u, 0u, 0u));
-        textureStore(shadow_out, coord, vec4<f32>(1.0));
         return;
     }
 
@@ -858,68 +855,8 @@ fn main(
     let final_pos = accum_pos * inv_alpha;
     let final_color = accum_color * inv_alpha;
 
-    // Per-light shadow: trace shadow ray for each shadow-casting light (up to 4).
-    var shadow_values = vec4<f32>(1.0);
+    // Shadow tracing moved to rkp_shadow_trace.wgsl (half-res pass).
     let final_normal_n = normalize(accum_normal);
-    if march_params.shadow_max_steps > 0u {
-        var shadow_idx = 0u;
-        for (var li = 0u; li < march_params.num_lights && shadow_idx < 4u; li++) {
-            let light = lights[li];
-            let cast_shadow = light.params.w;
-            if cast_shadow < 0.5 { continue; }
-
-            let light_type = u32(light.position.w);
-            var shadow_dir: vec3<f32>;
-            var shadow_max_dist = 1e20; // directional: infinite
-
-            if light_type == 0u {
-                // Directional light: shadow direction = toward light source.
-                shadow_dir = normalize(-light.direction.xyz);
-            } else {
-                // Point/spot light: shadow direction = toward light position.
-                let to_light = light.position.xyz - final_pos;
-                let dist_to_light = length(to_light);
-                let range = light.params.x;
-                // Skip if surface is beyond light's range.
-                if range > 0.0 && dist_to_light > range {
-                    shadow_values[shadow_idx] = 1.0;
-                    shadow_idx++;
-                    continue;
-                }
-                shadow_dir = to_light / max(dist_to_light, 0.001);
-                // Only trace up to the light — occluders behind it don't block.
-                shadow_max_dist = dist_to_light;
-
-                // Spot light cone check.
-                if light_type == 2u {
-                    let spot_cos = dot(-shadow_dir, normalize(light.direction.xyz));
-                    let spot_angle_cos = cos(light.params.y); // inner angle
-                    if spot_cos < spot_angle_cos {
-                        shadow_values[shadow_idx] = 1.0;
-                        shadow_idx++;
-                        continue;
-                    }
-                }
-            }
-
-            // Back-face skip: surface faces away from light → no direct light anyway.
-            let n_dot_l = dot(final_normal_n, shadow_dir);
-            if n_dot_l <= 0.0 {
-                shadow_values[shadow_idx] = 0.0;
-                shadow_idx++;
-                continue;
-            }
-
-            shadow_values[shadow_idx] = trace_shadow_ray(
-                final_pos,
-                shadow_dir,
-                num_objects,
-                march_params.shadow_max_steps,
-                shadow_max_dist,
-            );
-            shadow_idx++;
-        }
-    }
 
     let cr = u32(clamp(final_color.r, 0.0, 1.0) * 31.0);
     let cg = u32(clamp(final_color.g, 0.0, 1.0) * 63.0);
@@ -935,5 +872,4 @@ fn main(
     textureStore(gbuf_position, coord, vec4<f32>(final_pos, first_dist));
     textureStore(gbuf_normal, coord, vec4<f32>(final_normal_n, accum_alpha));
     textureStore(gbuf_material, coord, vec4<u32>(packed_r, packed_g, 0u, 0u));
-    textureStore(shadow_out, coord, shadow_values);
 }

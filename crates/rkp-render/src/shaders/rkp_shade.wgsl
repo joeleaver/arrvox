@@ -56,7 +56,9 @@ struct Material {
 @group(0) @binding(1) var gbuf_normal: texture_2d<f32>;
 @group(0) @binding(2) var gbuf_material: texture_2d<u32>;
 
-// Group 1: shadow texture (read, full-res) + SSAO texture (read, half-res)
+// Group 1: shadow texture (read, half-res) + SSAO texture (read, half-res)
+// shadow_tex is written by rkp_shadow_trace at half-res; we upsample it
+// per-pixel with a bilateral gather guided by position + normal deltas.
 @group(1) @binding(0) var shadow_tex: texture_2d<f32>;
 @group(1) @binding(1) var ssao_tex: texture_2d<f32>;
 
@@ -392,8 +394,71 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // F0 for dielectrics vs metals.
     let f0 = mix(vec3<f32>(0.04), albedo, metallic);
 
-    // Per-light shadow from shadow texture (written by march pass).
-    let shadow_data = textureLoad(shadow_tex, coord, 0);
+    // Per-light shadow: bilateral upsample from the half-res shadow texture
+    // written by rkp_shadow_trace. Each half-res sample's "reference
+    // surface" is the full-res gbuf pixel at (half_coord * 2); compare
+    // that against our pixel's surface to weight the 4 nearest samples
+    // and reject neighbors on different surfaces.
+    let shadow_dims = textureDimensions(shadow_tex);
+    let gbuf_dims = textureDimensions(gbuf_position);
+    // Continuous half-res coord: our full-res pixel center in half-res UVs.
+    // Full-res pixel (x, y) maps to half-res sample at (x/2, y/2); the
+    // 4 nearest integer half-res coords straddle that point.
+    let half_coord_f = (vec2<f32>(coord) + 0.5) * 0.5 - 0.5;
+    let base_half = vec2<i32>(floor(half_coord_f));
+    let frac = half_coord_f - vec2<f32>(base_half);
+    let spatial_w = vec4<f32>(
+        (1.0 - frac.x) * (1.0 - frac.y),
+        frac.x * (1.0 - frac.y),
+        (1.0 - frac.x) * frac.y,
+        frac.x * frac.y,
+    );
+    var shadow_data = vec4<f32>(0.0);
+    var w_sum = 0.0;
+    var bilinear_data = vec4<f32>(0.0);
+    // Position sigma — in world units. The shadow trace samples one full
+    // surface per 2-pixel block, so neighbors straddling a depth
+    // discontinuity should get ~zero weight. 5 cm is tight enough to
+    // prevent bleed across surface edges at the elephant's scale.
+    let sigma_pos = 0.05;
+    let inv_sigma2 = 1.0 / (sigma_pos * sigma_pos);
+    for (var k = 0u; k < 4u; k++) {
+        let dx = i32(k & 1u);
+        let dy = i32((k >> 1u) & 1u);
+        let half_c = base_half + vec2<i32>(dx, dy);
+        if half_c.x < 0 || half_c.y < 0
+            || u32(half_c.x) >= shadow_dims.x || u32(half_c.y) >= shadow_dims.y {
+            continue;
+        }
+        // Reference surface for this half-res sample = gbuf at half_c * 2.
+        let ref_full = half_c * 2;
+        if ref_full.x < 0 || ref_full.y < 0
+            || u32(ref_full.x) >= gbuf_dims.x || u32(ref_full.y) >= gbuf_dims.y {
+            continue;
+        }
+        let ref_pos = textureLoad(gbuf_position, ref_full, 0);
+        let ref_normal = textureLoad(gbuf_normal, ref_full, 0).xyz;
+        // Sky/miss neighbor: skip — no surface to compare against.
+        if ref_pos.w >= 1e9 { continue; }
+
+        let s = textureLoad(shadow_tex, half_c, 0);
+        bilinear_data += s * spatial_w[k];
+
+        let d_pos = ref_pos.xyz - world_pos;
+        let pos_term = exp(-dot(d_pos, d_pos) * inv_sigma2);
+        let n_dot = clamp(dot(ref_normal, N), 0.0, 1.0);
+        let normal_term = n_dot * n_dot * n_dot * n_dot * n_dot * n_dot * n_dot * n_dot; // ^8
+        let w = spatial_w[k] * pos_term * normal_term;
+        shadow_data += s * w;
+        w_sum += w;
+    }
+    // Fallback: if bilateral weights all rejected, fall back to plain
+    // bilinear so we never return zero from this gather on valid surfaces.
+    if w_sum < 1e-5 {
+        shadow_data = bilinear_data;
+    } else {
+        shadow_data /= w_sum;
+    }
 
     // AO from half-res SSAO texture.
     let half_coord = vec2<i32>(gid.xy) / 2;

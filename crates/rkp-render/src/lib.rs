@@ -10,6 +10,7 @@ pub mod voxelize_opacity;
 pub mod octree_gpu;
 /// Octree-accelerated compute ray marcher — primary visibility pass.
 pub mod octree_march;
+pub mod rkp_shadow_trace;
 /// GPU timestamp profiler for per-pass timing.
 pub mod gpu_profiler;
 /// Per-object GPU struct — forward world transform, octree params, no inverse_world.
