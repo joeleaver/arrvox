@@ -87,7 +87,7 @@ impl Default for PointLight {
     fn default() -> Self {
         Self {
             color: [1.0, 1.0, 1.0],
-            intensity: 1.0,
+            intensity: 5000.0,
             range: 10.0,
             cast_shadow: true,
         }
@@ -114,7 +114,7 @@ impl Default for SpotLight {
     fn default() -> Self {
         Self {
             color: [1.0, 1.0, 1.0],
-            intensity: 2.0,
+            intensity: 10000.0,
             range: 15.0,
             direction: glam::Vec3::new(0.0, -1.0, 0.0),
             outer_angle: 45.0,

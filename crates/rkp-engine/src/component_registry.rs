@@ -303,7 +303,7 @@ fn renderable_entry() -> ComponentEntry {
 
 static POINT_LIGHT_FIELDS: [FieldMeta; 4] = [
     FieldMeta { name: "color", field_type: FieldType::Color, range: None, transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
-    FieldMeta { name: "intensity", field_type: FieldType::Float, range: Some((0.0, 100.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
+    FieldMeta { name: "intensity", field_type: FieldType::Float, range: Some((0.0, 100_000.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
     FieldMeta { name: "range", field_type: FieldType::Float, range: Some((0.1, 500.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
     FieldMeta { name: "cast_shadow", field_type: FieldType::Bool, range: None, transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
 ];
@@ -370,7 +370,7 @@ fn point_light_entry() -> ComponentEntry {
 
 static SPOT_LIGHT_FIELDS: [FieldMeta; 7] = [
     FieldMeta { name: "color", field_type: FieldType::Color, range: None, transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
-    FieldMeta { name: "intensity", field_type: FieldType::Float, range: Some((0.0, 100.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
+    FieldMeta { name: "intensity", field_type: FieldType::Float, range: Some((0.0, 200_000.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
     FieldMeta { name: "range", field_type: FieldType::Float, range: Some((0.1, 500.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
     FieldMeta { name: "outer_angle", field_type: FieldType::Float, range: Some((1.0, 179.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
     FieldMeta { name: "inner_angle", field_type: FieldType::Float, range: Some((0.0, 178.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
