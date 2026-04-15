@@ -331,8 +331,17 @@ impl EngineState {
         let main_viewport_renderer = rkp_render::ViewportRenderer::new(
             &device, &mut renderer, width, height,
         );
+        // Pre-create the BUILD viewport renderer at its default size. It
+        // starts invisible (Viewport::new_build) so render_to skips it
+        // until the editor enables it via SetViewportVisible. Allocating
+        // up-front (~20 MiB) is cheaper than the latency hit of creating
+        // it when the user opens the build surface mid-session.
+        let build_viewport_renderer = rkp_render::ViewportRenderer::new(
+            &device, &mut renderer, 800, 600,
+        );
         let mut viewport_renderers = std::collections::HashMap::new();
         viewport_renderers.insert(crate::viewport::ViewportId::MAIN, main_viewport_renderer);
+        viewport_renderers.insert(crate::viewport::ViewportId::BUILD, build_viewport_renderer);
 
         let scene_mgr = RkpSceneManager::new(1_000_000);
 
@@ -362,6 +371,10 @@ impl EngineState {
             viewports: {
                 let mut v = crate::viewport::Viewports::new();
                 v.insert(crate::viewport::Viewport::new_main(width, height));
+                // BUILD starts hidden (new_build sets visible: false) and
+                // the editor flips it via SetViewportVisible when the user
+                // opens the procedural preview.
+                v.insert(crate::viewport::Viewport::new_build(800, 600));
                 v
             },
             world: hecs::World::new(),

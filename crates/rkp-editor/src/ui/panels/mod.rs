@@ -2,6 +2,7 @@
 
 pub mod asset_properties;
 pub mod build_panel;
+pub mod build_viewport;
 pub mod environment_panel;
 pub mod prop_controls;
 pub mod scene_tree;
@@ -18,6 +19,7 @@ pub mod welcome_screen;
 
 pub use asset_properties::AssetProperties;
 pub use build_panel::BuildPanel;
+pub use build_viewport::BuildViewport;
 pub use environment_panel::EnvironmentPanel;
 pub use scene_tree::SceneTree;
 pub use viewport::Viewport;

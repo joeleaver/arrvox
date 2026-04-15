@@ -83,7 +83,22 @@ pub fn ZoneComponent(container: ContainerKind, zone_idx: usize) -> NodeHandle {
                 if active_panel.get() == Some(PanelId::Console) { ConsolePanel {} }
                 if active_panel.get() == Some(PanelId::Profiling) { ProfilingPanel {} }
                 if active_panel.get() == Some(PanelId::Models) { ModelsPanel {} }
-                if active_panel.get() == Some(PanelId::Build) { BuildPanel {} }
+                if active_panel.get() == Some(PanelId::Build) {
+                    // Build pane: 3D preview with tree + params overlaid
+                    // as a sidebar strip. BuildViewport owns the turntable
+                    // camera + RenderSurface wiring; BuildPanel hosts the
+                    // node tree + param controls from the original panel.
+                    div {
+                        style: "position:relative;width:100%;height:100%;",
+                        BuildViewport {}
+                        div {
+                            style: "position:absolute;top:0;right:0;width:320px;height:100%;\
+                                    background:rgba(30,30,30,0.9);\
+                                    border-left:1px solid #3c3c3c;overflow:hidden;",
+                            BuildPanel {}
+                        }
+                    }
+                }
 
                 // Edge drop zones (only visible during drag).
                 if is_dragging.get() {

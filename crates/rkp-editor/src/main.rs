@@ -15,6 +15,13 @@ use ui::LayoutRoot;
 #[derive(Clone)]
 pub struct CommandSender(pub crossbeam::channel::Sender<rkp_engine::EngineCommand>);
 
+/// Context newtype for the build viewport's render surface handle. The
+/// bare `RenderSurfaceHandle` context slot is already taken by the main
+/// viewport; distinguishing via newtype lets components ask for exactly
+/// the surface they care about.
+#[derive(Clone)]
+pub struct BuildSurface(pub rinch::render_surface::RenderSurfaceHandle);
+
 fn build_menus(
     cmd_tx: crossbeam::channel::Sender<rkp_engine::EngineCommand>,
 ) -> Vec<(&'static str, rinch::menu::Menu)> {
@@ -168,11 +175,17 @@ fn build_menus(
 fn main() -> anyhow::Result<()> {
     env_logger::init();
 
-    // 1. Create render surface.
-    let surface_handle = create_render_surface();
-    let surface_writer = surface_handle.writer();
+    // 1. Create render surfaces — one per viewport. MAIN renders the
+    //    scene; BUILD renders the selected procedural object in its own
+    //    panel.
+    let main_surface_handle = create_render_surface();
+    let main_surface_writer = main_surface_handle.writer();
+    let build_surface_handle = rinch::render_surface::create_render_surface_with_name("build");
+    let build_surface_writer = build_surface_handle.writer();
 
-    // 2. Create the central editor store.
+    // 2. Create the central editor store. Surface handles travel via
+    //    rinch context, not EditorStore (EditorStore is Copy; handles
+    //    aren't).
     let store = EditorStore::new();
 
     // 3. Start the engine.
@@ -181,13 +194,15 @@ fn main() -> anyhow::Result<()> {
             width: 1920,
             height: 1080,
         },
-        // Frame callback: route pixels to the matching viewport surface.
-        // Phase 4: only MAIN has a surface; non-MAIN viewports are silently
-        // dropped here. Phase 6's build viewport will register a second
-        // writer and dispatch on `viewport_id`.
+        // Frame callback: route each viewport's pixels to its writer.
+        // Unknown viewport ids are silently dropped (defensive — the
+        // engine only emits MAIN/BUILD today).
         Box::new(move |viewport_id, pixels, w, h| {
-            if viewport_id == rkp_engine::viewport::ViewportId::MAIN {
-                surface_writer.submit_frame(pixels, w, h);
+            use rkp_engine::viewport::ViewportId;
+            if viewport_id == ViewportId::MAIN {
+                main_surface_writer.submit_frame(pixels, w, h);
+            } else if viewport_id == ViewportId::BUILD {
+                build_surface_writer.submit_frame(pixels, w, h);
             }
         }),
         // State callback: push engine state to EditorStore signals (cross-thread).
@@ -270,7 +285,8 @@ fn main() -> anyhow::Result<()> {
 
     rinch::shell::run_with_window_props_and_menu(
         move |__scope| {
-            create_context(surface_handle.clone());
+            create_context(main_surface_handle.clone());
+            create_context(BuildSurface(build_surface_handle.clone()));
             create_context(store);
             create_context(CommandSender(cmd_tx.clone()));
             rsx! { LayoutRoot {} }
