@@ -61,6 +61,23 @@ impl LeafAttrPool {
         Some((start..end).collect())
     }
 
+    /// Reserve `count` contiguous slots by bumping past any current
+    /// free-list entries. Returns the start index. Never reuses freed
+    /// ranges, which keeps the returned range contiguous regardless of
+    /// prior deallocations — important for asset loaders that need
+    /// `(start, count)` to describe the range for later release.
+    pub fn allocate_contiguous_bump(&mut self, count: u32) -> Option<u32> {
+        if count == 0 { return Some(self.next_free); }
+        let start = self.next_free;
+        let end = start.checked_add(count)?;
+        if end as usize > self.data.len() {
+            let new_cap = (self.data.len() as u32 * 2).max(end);
+            self.grow(new_cap);
+        }
+        self.next_free = end;
+        Some(start)
+    }
+
     /// Allocate a single slot.
     pub fn allocate(&mut self) -> Option<u32> {
         if let Some(idx) = self.free_list.iter().position(|(_, c)| *c >= 1) {

@@ -7,6 +7,9 @@
 //!
 //! No wgpu types, no GPU buffers here — RkpRenderer consumes the snapshot.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use rkp_core::{BrickPool, LeafAttr, LeafAttrPool, OctreeHandle, SparseOctree};
 
 use crate::octree_gpu::OctreeGpu;
@@ -25,17 +28,110 @@ pub struct FaceInstance {
     pub packed: u32,
 }
 
-/// Result of loading an .rkp asset.
-pub struct AssetLoadResult {
+/// Opaque handle into the scene's asset cache. Obtained via
+/// [`RkpSceneManager::acquire_asset`] and released with
+/// [`RkpSceneManager::release_asset`]. Callers must pair acquires with
+/// releases — when the last instance drops, the cache deallocates the
+/// shared leaf_attr / brick / octree ranges. Not persistable (an index
+/// into an in-memory cache).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AssetHandle(u32);
+
+impl AssetHandle {
+    pub fn raw(self) -> u32 { self.0 }
+}
+
+/// Everything a scene instance needs to render an asset. Returned from
+/// both `acquire_asset` (.rkp) and the procedural voxelize_* paths so
+/// instance spawning can share one code path downstream.
+#[derive(Debug, Clone, Copy)]
+pub struct AssetInfo {
     pub spatial: rkf_core::scene_node::SpatialHandle,
     pub voxel_size: f32,
     pub aabb: rkf_core::Aabb,
-    /// Logical voxel count (octree leaves) — for display / stats.
     pub voxel_count: u32,
-    /// First leaf_attr pool slot used by this allocation.
     pub leaf_attr_slot_start: u32,
-    /// Number of leaf_attr slots allocated (distinct (material, normal) tuples).
     pub leaf_attr_slot_count: u32,
+}
+
+/// One entry in the asset cache: the shared geometry allocations plus
+/// a refcount. When `refcount` hits zero, `release_asset` frees the
+/// octree / leaf_attr / brick ranges.
+struct AssetEntry {
+    path: PathBuf,
+    refcount: u32,
+    spatial_handle: OctreeHandle,
+    voxel_size: f32,
+    aabb: rkf_core::Aabb,
+    voxel_count: u32,
+    leaf_attr_slot_start: u32,
+    leaf_attr_slot_count: u32,
+    brick_start: u32,
+    brick_count: u32,
+}
+
+impl AssetEntry {
+    fn info(&self) -> AssetInfo {
+        AssetInfo {
+            spatial: rkf_core::scene_node::SpatialHandle::Octree {
+                root_offset: self.spatial_handle.root_offset,
+                len: self.spatial_handle.len,
+                depth: self.spatial_handle.depth,
+                base_voxel_size: self.spatial_handle.base_voxel_size,
+            },
+            voxel_size: self.voxel_size,
+            aabb: self.aabb,
+            voxel_count: self.voxel_count,
+            leaf_attr_slot_start: self.leaf_attr_slot_start,
+            leaf_attr_slot_count: self.leaf_attr_slot_count,
+        }
+    }
+}
+
+/// Maps file paths to cached asset entries. Keyed on the canonical path
+/// that was resolved against the `.rkp` extension, so two different
+/// inputs that normalize to the same file share a handle.
+#[derive(Default)]
+struct AssetCache {
+    entries: Vec<Option<AssetEntry>>,
+    path_to_handle: HashMap<PathBuf, AssetHandle>,
+    free_slots: Vec<u32>,
+}
+
+impl AssetCache {
+    fn insert(&mut self, entry: AssetEntry) -> AssetHandle {
+        let handle = if let Some(slot) = self.free_slots.pop() {
+            self.entries[slot as usize] = Some(entry);
+            AssetHandle(slot)
+        } else {
+            let idx = self.entries.len() as u32;
+            self.entries.push(Some(entry));
+            AssetHandle(idx)
+        };
+        self.path_to_handle
+            .insert(self.entries[handle.0 as usize].as_ref().unwrap().path.clone(), handle);
+        handle
+    }
+
+    fn lookup_path(&self, path: &std::path::Path) -> Option<AssetHandle> {
+        self.path_to_handle.get(path).copied()
+    }
+
+    fn get(&self, handle: AssetHandle) -> Option<&AssetEntry> {
+        self.entries.get(handle.0 as usize).and_then(|e| e.as_ref())
+    }
+
+    fn get_mut(&mut self, handle: AssetHandle) -> Option<&mut AssetEntry> {
+        self.entries.get_mut(handle.0 as usize).and_then(|e| e.as_mut())
+    }
+
+    fn remove(&mut self, handle: AssetHandle) -> Option<AssetEntry> {
+        let slot = handle.0 as usize;
+        let taken = self.entries.get_mut(slot)?.take()?;
+        self.path_to_handle.remove(&taken.path);
+        self.free_slots.push(handle.0);
+        Some(taken)
+    }
 }
 
 /// Result of voxelizing a primitive.
@@ -123,6 +219,11 @@ pub struct RkpSceneManager {
     pub brick_pool: BrickPool,
     /// GPU octree allocator (packs all octrees into one buffer).
     pub octree: OctreeGpu,
+    /// Cache of loaded .rkp assets keyed by canonical file path. Instances
+    /// of the same asset share one octree + one leaf_attr range + one brick
+    /// range via refcounting — release_asset frees them when the last
+    /// instance goes away.
+    asset_cache: AssetCache,
     /// Face instances for rasterization (surface shell).
     pending_faces: Vec<FaceInstance>,
     /// Whether face data needs re-upload to GPU.
@@ -136,6 +237,7 @@ impl RkpSceneManager {
             leaf_attr_pool: LeafAttrPool::new(capacity),
             brick_pool: BrickPool::new((capacity / 16).max(64)),
             octree: OctreeGpu::new(),
+            asset_cache: AssetCache::default(),
             pending_faces: Vec::new(),
             faces_dirty: false,
         }
@@ -202,18 +304,11 @@ impl RkpSceneManager {
 
     // ── Asset loading (.rkp files) ───────────────────────────────────
 
-    /// Load an .rkp asset file into the scene.
-    ///
-    /// Reads the legacy per-voxel format (opacity + material + color), then
-    /// collapses each leaf's material + computed normal into a single
-    /// LeafAttr entry. Opacity values from the file are discarded — the
-    /// file-format version is unchanged for now, migration at load time is
-    /// cheap enough that a full format bump can wait.
-    pub fn load_rkp(&mut self, path: &str, object_id: u32) -> Result<AssetLoadResult, String> {
-        use rkf_core::voxel::VoxelSample;
-
+    /// Resolve a user-supplied path (with or without `.rkp` extension)
+    /// into a canonical file path we can use as a cache key.
+    fn resolve_rkp_path(path: &str) -> Result<PathBuf, String> {
         let rkp_path = if path.ends_with(".rkp") {
-            std::path::PathBuf::from(path)
+            PathBuf::from(path)
         } else {
             let p = std::path::Path::new(path);
             let appended = p.with_file_name(format!(
@@ -231,12 +326,60 @@ impl RkpSceneManager {
                 }
             }
         };
-
         if !rkp_path.exists() {
             return Err(format!("{} does not exist", rkp_path.display()));
         }
+        rkp_path.canonicalize().map_err(|e| format!("canonicalize {}: {e}", rkp_path.display()))
+    }
 
-        let mut file = std::fs::File::open(&rkp_path)
+    /// Acquire a shared asset. First call for a given path allocates the
+    /// octree / leaf_attr / brick ranges and caches them. Subsequent calls
+    /// return the cached handle and bump its refcount. Every successful
+    /// `acquire_asset` must be paired with a `release_asset` when the
+    /// instance goes away.
+    pub fn acquire_asset(
+        &mut self,
+        path: &str,
+    ) -> Result<(AssetHandle, AssetInfo), String> {
+        let canonical = Self::resolve_rkp_path(path)?;
+
+        if let Some(handle) = self.asset_cache.lookup_path(&canonical) {
+            let entry = self.asset_cache.get_mut(handle).expect("cache/handle mismatch");
+            entry.refcount += 1;
+            return Ok((handle, entry.info()));
+        }
+
+        let entry = self.load_asset_from_disk(&canonical)?;
+        let info = entry.info();
+        let handle = self.asset_cache.insert(entry);
+        Ok((handle, info))
+    }
+
+    /// Release an instance's claim on a cached asset. When the last
+    /// outstanding reference drops, we deallocate the shared ranges from
+    /// the scene pools.
+    pub fn release_asset(&mut self, handle: AssetHandle) {
+        let Some(entry) = self.asset_cache.get_mut(handle) else { return; };
+        if entry.refcount == 0 { return; }
+        entry.refcount -= 1;
+        if entry.refcount > 0 { return; }
+
+        // Last reference — free the pool ranges and drop the cache slot.
+        let entry = self.asset_cache.remove(handle).expect("just looked up");
+        self.octree.deallocate(entry.spatial_handle);
+        self.leaf_attr_pool.deallocate_range(entry.leaf_attr_slot_start, entry.leaf_attr_slot_count);
+        for id in entry.brick_start..(entry.brick_start + entry.brick_count) {
+            self.brick_pool.deallocate(id);
+        }
+    }
+
+    /// Disk read + pool allocation for one .rkp file. Called exactly once
+    /// per unique path — repeated acquisitions share the returned entry
+    /// via the cache.
+    fn load_asset_from_disk(&mut self, rkp_path: &std::path::Path) -> Result<AssetEntry, String> {
+        use rkf_core::voxel::VoxelSample;
+
+        let mut file = std::fs::File::open(rkp_path)
             .map_err(|e| format!("open {}: {e}", rkp_path.display()))?;
         let mut reader = std::io::BufReader::new(&mut file);
 
@@ -315,68 +458,61 @@ impl RkpSceneManager {
         }
 
         let octree_depth = header.octree_depth as u8;
-        let leaf_attr_slot_start = self.leaf_attr_pool.allocated_count();
         let mut tree = SparseOctree::from_raw(&octree_nodes, octree_depth, voxel_size);
 
-        let mut attr_dedup: std::collections::HashMap<(LeafAttr, u32), u32> =
-            std::collections::HashMap::new();
+        // 1:1 leaf_attr allocation. We don't dedup file slots → leaf_attrs
+        // because texture-sampled colors vary per voxel (measured dedup
+        // ratio ≈1.0× on mesh imports — HashMap overhead costs more than
+        // the trivial savings). Each file slot maps directly to
+        // `leaf_attr_slot_start + file_slot`.
+        let leaf_attr_slot_count = voxel_count;
+        let leaf_attr_slot_start = self.leaf_attr_pool
+            .allocate_contiguous_bump(leaf_attr_slot_count)
+            .expect("leaf_attr_pool.allocate_contiguous_bump failed");
 
-        // Closure: resolve a file slot to a leaf_attr_pool id, deduping on
-        // (LeafAttr, color). Used by both the BRICK path (v4) and the
-        // legacy LEAF path (v2/v3).
-        let resolve_slot = |slot: u32,
-                            attr_dedup: &mut std::collections::HashMap<(LeafAttr, u32), u32>,
-                            pool: &mut LeafAttrPool|
-         -> u32 {
-            let (mat_p, mat_s, blend, color, normal_oct) = file_voxel_mat
-                .get(slot as usize)
-                .copied()
-                .unwrap_or((0, 0, 0, 0, 0));
+        for (i, &(mat_p, mat_s, blend, color, normal_oct)) in file_voxel_mat.iter().enumerate() {
             let mut attr = LeafAttr::new_blended(glam::Vec3::Y, mat_p, mat_s, blend);
             if normal_oct != 0 {
                 attr.normal_oct = normal_oct;
             }
-            let key = (attr, color);
-            *attr_dedup.entry(key).or_insert_with(|| {
-                let id = pool.allocate().expect("leaf_attr_pool.allocate failed");
-                *pool.get_mut(id) = attr;
-                if color != 0 {
-                    pool.set_color(id, color);
-                }
-                id
-            })
-        };
-
-        // v4: walk BRICK nodes, allocate a scene brick for each, fill its
-        // cells from the file brick after dedup'ing slot indices into
-        // leaf_attr_pool ids.
-        let file_brick_count = file_brick_cells.len() / rkp_core::brick_pool::BRICK_CELLS as usize;
-        let scene_brick_offset = self.brick_pool.allocated_count();
-        for _ in 0..file_brick_count {
-            self.brick_pool.allocate().expect("brick_pool.allocate failed");
-        }
-        // Remap every BRICK node in the flat nodes array: shift its brick_id
-        // by the scene offset. This rewrites nodes in place — no tree walk
-        // needed because BRICK encoding is distinguishable from every other
-        // node type by is_brick.
-        {
-            let nodes = tree.as_slice_mut();
-            for n in nodes.iter_mut() {
-                if rkp_core::sparse_octree::is_brick(*n) {
-                    let file_id = rkp_core::sparse_octree::brick_id(*n);
-                    *n = rkp_core::sparse_octree::make_brick(scene_brick_offset + file_id);
-                }
+            let slot = leaf_attr_slot_start + i as u32;
+            *self.leaf_attr_pool.get_mut(slot) = attr;
+            if color != 0 {
+                self.leaf_attr_pool.set_color(slot, color);
             }
         }
+
+        // v4: copy file brick pool into the scene brick pool. Each file
+        // cell holds a file-local slot index; we shift both brick-ids
+        // (in the octree nodes) and slot indices (in the cells) by our
+        // contiguous allocation offsets.
+        let file_brick_count = (file_brick_cells.len() / rkp_core::brick_pool::BRICK_CELLS as usize) as u32;
+        let scene_brick_offset = self.brick_pool
+            .allocate_contiguous_bump(file_brick_count)
+            .expect("brick_pool.allocate_contiguous_bump failed");
+
+        // Remap BRICK node ids in the flat nodes array.
+        let nodes = tree.as_slice_mut();
+        for n in nodes.iter_mut() {
+            if rkp_core::sparse_octree::is_brick(*n) {
+                let file_id = rkp_core::sparse_octree::brick_id(*n);
+                *n = rkp_core::sparse_octree::make_brick(scene_brick_offset + file_id);
+            }
+        }
+
         let brick_cells = rkp_core::brick_pool::BRICK_CELLS as usize;
-        for file_id in 0..file_brick_count as u32 {
+        for file_id in 0..file_brick_count {
             let scene_id = scene_brick_offset + file_id;
-            let src = &file_brick_cells[file_id as usize * brick_cells..(file_id as usize + 1) * brick_cells];
-            for (i, &slot_or_empty) in src.iter().enumerate() {
-                if slot_or_empty == rkp_core::brick_pool::BRICK_EMPTY {
+            let src = &file_brick_cells[
+                file_id as usize * brick_cells..(file_id as usize + 1) * brick_cells
+            ];
+            for (i, &cell) in src.iter().enumerate() {
+                if cell == rkp_core::brick_pool::BRICK_EMPTY {
                     continue;
                 }
-                let leaf_attr_id = resolve_slot(slot_or_empty, &mut attr_dedup, &mut self.leaf_attr_pool);
+                // cell is a file-local slot index; shift by our leaf_attr
+                // allocation offset to get the scene-global leaf_attr_id.
+                let leaf_attr_id = leaf_attr_slot_start + cell;
                 let x = (i as u32) % rkp_core::brick_pool::BRICK_DIM;
                 let y = ((i as u32) / rkp_core::brick_pool::BRICK_DIM) % rkp_core::brick_pool::BRICK_DIM;
                 let z = (i as u32) / (rkp_core::brick_pool::BRICK_DIM * rkp_core::brick_pool::BRICK_DIM);
@@ -384,42 +520,12 @@ impl RkpSceneManager {
             }
         }
 
-        // Legacy LEAF path (v2/v3 files, no bricks): walk leaves, dedup,
-        // rewrite node. 26-neighborhood kernel falls back when no baked
-        // normal is present.
         if !has_bricks {
-            let leaves: Vec<(glam::UVec3, u32, u8)> = tree.iter_leaves().collect();
-            let mut rewrites: Vec<(glam::UVec3, u8, u32)> = Vec::with_capacity(leaves.len());
-            for (coord, file_idx, leaf_depth) in &leaves {
-                let (mat_p, mat_s, blend, color, normal_oct) = file_voxel_mat
-                    .get(*file_idx as usize)
-                    .copied()
-                    .unwrap_or((0, 0, 0, 0, 0));
-                let attr = if has_normals && normal_oct != 0 {
-                    let mut a = LeafAttr::new_blended(glam::Vec3::Y, mat_p, mat_s, blend);
-                    a.normal_oct = normal_oct;
-                    a
-                } else {
-                    let normal = compute_leaf_normal_neighborhood26(&tree, *coord);
-                    LeafAttr::new_blended(normal, mat_p, mat_s, blend)
-                };
-                let key = (attr, color);
-                let leaf_attr_id = *attr_dedup.entry(key).or_insert_with(|| {
-                    let id = self.leaf_attr_pool.allocate()
-                        .expect("leaf_attr_pool.allocate failed");
-                    *self.leaf_attr_pool.get_mut(id) = attr;
-                    if color != 0 {
-                        self.leaf_attr_pool.set_color(id, color);
-                    }
-                    id
-                });
-                rewrites.push((*coord, *leaf_depth, rkp_core::sparse_octree::make_leaf(leaf_attr_id)));
-            }
-            for (coord, leaf_depth, new_value) in rewrites {
-                tree.set_at_level(coord, leaf_depth, new_value);
-            }
+            return Err(format!(
+                "{}: v4 format requires a bricks section (FLAG_HAS_BRICKS); older files are not supported",
+                rkp_path.display(),
+            ));
         }
-        let leaf_attr_slot_count = self.leaf_attr_pool.allocated_count() - leaf_attr_slot_start;
 
         let raw_count = tree.node_count();
         tree.collapse_all();
@@ -432,32 +538,28 @@ impl RkpSceneManager {
 
         let handle = self.octree.allocate_raw(&compact_nodes, octree_depth, voxel_size);
 
-        emit_faces(&tree, object_id, &mut self.pending_faces);
-        self.faces_dirty = true;
-
-        let spatial = rkf_core::scene_node::SpatialHandle::Octree {
-            root_offset: handle.root_offset,
-            len: handle.len,
-            depth: handle.depth,
-            base_voxel_size: handle.base_voxel_size,
-        };
-
         eprintln!(
-            "[RkpSceneManager] loaded .rkp: {} voxels → {} unique leaf_attrs ({:.1}×), {} faces, octree {} → compact {} → dedup {} ({:.1}× total)",
+            "[RkpSceneManager] loaded {}: {} voxels, {} bricks, octree {} → compact {} → dedup {} ({:.1}× total)",
+            rkp_path.display(),
             voxel_count,
-            leaf_attr_slot_count,
-            if leaf_attr_slot_count > 0 { voxel_count as f64 / leaf_attr_slot_count as f64 } else { 0.0 },
-            self.pending_faces.len(),
+            file_brick_count,
             raw_count,
             compact_count,
             dedup_count,
             if dedup_count > 0 { raw_count as f64 / dedup_count as f64 } else { 0.0 },
         );
 
-        Ok(AssetLoadResult {
-            spatial, voxel_size, aabb, voxel_count,
+        Ok(AssetEntry {
+            path: rkp_path.to_path_buf(),
+            refcount: 1,
+            spatial_handle: handle,
+            voxel_size,
+            aabb,
+            voxel_count,
             leaf_attr_slot_start,
             leaf_attr_slot_count,
+            brick_start: scene_brick_offset,
+            brick_count: file_brick_count,
         })
     }
 
@@ -592,52 +694,5 @@ impl RkpSceneManager {
     }
 }
 
-/// 26-neighborhood centroid kernel. For each of the 26 surrounding cells,
-/// if the neighbor is occupied (leaf or interior), accumulate its offset
-/// vector; the mean points toward the centroid of occupied mass, so the
-/// outward normal is its negation. Uses all 26 neighbors instead of just
-/// the 6 axis-aligned ones, yielding ~direction-quantized-to-sphere output
-/// instead of being pinned to ~26 discrete axial directions.
-fn compute_leaf_normal_neighborhood26(
-    tree: &SparseOctree,
-    coord: glam::UVec3,
-) -> glam::Vec3 {
-    let occupied_at = |c: glam::UVec3| -> bool {
-        match tree.lookup(c) {
-            Some(n) if n == rkp_core::sparse_octree::INTERIOR_NODE => true,
-            Some(n) if rkp_core::sparse_octree::is_leaf(n) => true,
-            _ => false,
-        }
-    };
-    let mut sum = glam::Vec3::ZERO;
-    let mut count = 0.0f32;
-    for dz in -1i32..=1 {
-        for dy in -1i32..=1 {
-            for dx in -1i32..=1 {
-                if dx == 0 && dy == 0 && dz == 0 {
-                    continue;
-                }
-                let x = coord.x as i64 + dx as i64;
-                let y = coord.y as i64 + dy as i64;
-                let z = coord.z as i64 + dz as i64;
-                if x < 0 || y < 0 || z < 0 {
-                    continue;
-                }
-                let nb = glam::UVec3::new(x as u32, y as u32, z as u32);
-                if occupied_at(nb) {
-                    sum += glam::Vec3::new(dx as f32, dy as f32, dz as f32);
-                    count += 1.0;
-                }
-            }
-        }
-    }
-    if count == 0.0 {
-        return glam::Vec3::Y;
-    }
-    let centroid = sum / count;
-    if centroid.length_squared() > 1e-12 {
-        -centroid.normalize()
-    } else {
-        glam::Vec3::Y
-    }
-}
+// `compute_leaf_normal_neighborhood26` used to live here for the legacy
+// v2/v3 LEAF-path fallback; removed with the switch to v4-only loading.

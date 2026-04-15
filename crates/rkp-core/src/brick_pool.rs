@@ -70,6 +70,22 @@ impl BrickPool {
         }
     }
 
+    /// Reserve `count` contiguous bricks by bumping past any freed entries.
+    /// Returns the starting brick_id. Used by asset loaders that need a
+    /// contiguous range so the octree's BRICK nodes can be remapped by a
+    /// single offset add.
+    pub fn allocate_contiguous_bump(&mut self, count: u32) -> Option<u32> {
+        if count == 0 { return Some(self.next_free_brick); }
+        let start = self.next_free_brick;
+        let end = start.checked_add(count)?;
+        if end as usize > self.capacity_bricks() as usize {
+            let new_cap = (self.capacity_bricks() as u32 * 2).max(end).max(64);
+            self.grow(new_cap);
+        }
+        self.next_free_brick = end;
+        Some(start)
+    }
+
     /// Allocate one brick and return its id (0-based). Initial contents are
     /// all-EMPTY. Panics if the pool can't grow further (would require
     /// allocating >2^31 cells).

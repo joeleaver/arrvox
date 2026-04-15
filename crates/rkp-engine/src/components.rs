@@ -45,6 +45,13 @@ pub struct Renderable {
     /// Octree spatial reference (populated after voxelization/loading).
     #[serde(skip)]
     pub spatial: Option<SpatialData>,
+    /// Handle into the scene manager's asset cache for .rkp-backed
+    /// entities. Present when this entity shares an octree with other
+    /// instances; the cache refcounts these and frees the underlying
+    /// pool ranges when the last instance releases. Procedural geometry
+    /// doesn't use this (it owns its octree exclusively).
+    #[serde(skip)]
+    pub asset_handle: Option<rkp_render::AssetHandle>,
 }
 
 /// Octree spatial data for a renderable entity. Not serialized — rebuilt on load.
@@ -56,6 +63,10 @@ pub struct SpatialData {
     pub base_voxel_size: f32,
     pub aabb: rkf_core::Aabb,
     pub voxel_size: f32,
+    /// First voxel pool slot used by this allocation, and the count.
+    /// Used to free the allocation when geometry is replaced.
+    pub voxel_slot_start: u32,
+    pub voxel_slot_count: u32,
 }
 
 /// Point light source.

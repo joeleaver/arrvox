@@ -33,7 +33,7 @@ pub mod rkp_scene_manager;
 
 pub use voxelize_opacity::import_mesh_to_opacity_rkp;
 pub use octree_gpu::OctreeGpu;
-pub use rkp_scene_manager::RkpSceneManager;
+pub use rkp_scene_manager::{AssetHandle, AssetInfo, RkpSceneManager};
 
 /// Validate WGSL source with naga at startup. Panics with a clear error message
 /// on shader bugs instead of producing cryptic "pipeline invalid" GPU errors.

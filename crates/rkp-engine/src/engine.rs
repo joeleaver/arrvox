@@ -1143,18 +1143,19 @@ impl EngineState {
                 use crate::components::*;
                 let scene_id = self.next_scene_id;
                 self.next_scene_id += 1;
-                match self.scene_mgr.load_rkp(&path, scene_id) {
-                    Ok(result) => {
+                match self.scene_mgr.acquire_asset(&path) {
+                    Ok((handle, info)) => {
                         let raw_name = Self::display_name_from_path(&path);
                         let name = self.unique_name(&raw_name);
-                        let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count);
+                        let spatial = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.leaf_attr_slot_start, info.leaf_attr_slot_count);
                         let entity = self.world.spawn((
                             Transform::default(),
                             EditorMetadata { name: name.clone() },
                             Renderable {
                                 asset_path: Some(path.clone()),
-                                voxel_count: result.voxel_count,
+                                voxel_count: info.voxel_count,
                                 spatial: Some(spatial),
+                                asset_handle: Some(handle),
                                 ..Default::default()
                             },
                         ));
@@ -1163,10 +1164,10 @@ impl EngineState {
                         self.geometry_dirty = true;
                         self.scene_dirty = true;
                         self.gpu_objects_dirty = true;
-                    self.console.info(format!("Loaded '{name}': {} voxels", result.voxel_count));
+                        self.console.info(format!("Loaded '{name}': {} voxels", info.voxel_count));
                     }
                     Err(e) => {
-                    self.console.error(format!("Failed to load '{path}': {e}"));
+                        self.console.error(format!("Failed to load '{path}': {e}"));
                     }
                 }
             }
@@ -2464,9 +2465,16 @@ impl EngineState {
             .map(|m| m.name.clone())
             .unwrap_or_else(|_| "unknown".into());
 
-        // Deallocate octree if entity has spatial data.
+        // Release geometry. Asset-backed entities go through the cache so
+        // their leaf_attr/brick/octree ranges only free on the last instance
+        // release. Procedural entities (no asset_handle) directly deallocate
+        // their octree — their pool ranges are managed by
+        // deallocate_geometry at re-voxelize time, not here, which matches
+        // the existing behavior.
         if let Ok(renderable) = self.world.get::<&crate::components::Renderable>(entity) {
-            if let Some(ref spatial) = renderable.spatial {
+            if let Some(handle) = renderable.asset_handle {
+                self.scene_mgr.release_asset(handle);
+            } else if let Some(ref spatial) = renderable.spatial {
                 let handle = rkp_core::OctreeHandle {
                     root_offset: spatial.root_offset,
                     len: spatial.len,
@@ -2624,14 +2632,15 @@ impl EngineState {
                             .unwrap_or_else(|| std::path::PathBuf::from(asset_path));
                         let sid = self.next_scene_id;
                         self.next_scene_id += 1;
-                        match self.scene_mgr.load_rkp(&full_path.to_string_lossy(), sid) {
-                            Ok(result) => {
-                                let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count);
+                        match self.scene_mgr.acquire_asset(&full_path.to_string_lossy()) {
+                            Ok((handle, info)) => {
+                                let spatial = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.leaf_attr_slot_start, info.leaf_attr_slot_count);
                                 let e = self.world.spawn((transform, meta, Renderable {
                                     asset_path: Some(asset_path.clone()),
                                     material_id: obj.material_id,
-                                    voxel_count: result.voxel_count,
+                                    voxel_count: info.voxel_count,
                                     spatial: Some(spatial),
+                                    asset_handle: Some(handle),
                                     ..Default::default()
                                 }));
                                 self.entity_scene_ids.insert(e, sid);
