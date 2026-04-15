@@ -277,6 +277,14 @@ pub enum EngineCommand {
     /// Save the project metadata (.rkproject file).
     SaveProject,
 
+    /// Cache editor-side layout state (docking, splitter sizes, etc.).
+    /// Engine treats the payload as opaque JSON — the editor is the only
+    /// code that understands it. Persisted to `.rkproject` on save and
+    /// echoed back through `StateUpdate.editor_layout` on project open.
+    SetEditorLayout {
+        json: String,
+    },
+
     // ── Play mode ────────────────────────────────────────────────────
 
     /// Set the gizmo mode (translate/rotate/scale).

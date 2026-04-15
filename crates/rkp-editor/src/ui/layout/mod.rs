@@ -3,13 +3,16 @@
 pub mod container;
 pub mod layout_root;
 pub mod panel_registry;
+pub mod persist;
 pub mod splitter;
 pub mod tab_bar;
 pub mod zone;
 
+use serde::{Deserialize, Serialize};
+
 /// Identifies a panel type. Add new panels by adding a variant here
 /// and a match arm in `panel_registry::render_panel()`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum PanelId {
     #[default]
     SceneTree,
@@ -25,7 +28,7 @@ pub enum PanelId {
 }
 
 /// Which container a panel lives in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ContainerKind {
     #[default]
     Left,
@@ -35,7 +38,7 @@ pub enum ContainerKind {
 }
 
 /// A zone holds tabs and an active tab index.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Zone {
     pub tabs: Vec<PanelId>,
     pub active_tab: usize,
@@ -44,7 +47,7 @@ pub struct Zone {
 }
 
 /// A container holds one or more zones.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Container {
     pub kind: ContainerKind,
     pub zones: Vec<Zone>,
@@ -52,7 +55,7 @@ pub struct Container {
 }
 
 /// A floating (detached) panel.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FloatingPanel {
     pub panel: PanelId,
     pub x: f32,
@@ -62,7 +65,7 @@ pub struct FloatingPanel {
 }
 
 /// Complete layout configuration.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LayoutConfig {
     pub left: Container,
     pub center: Container,

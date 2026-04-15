@@ -239,6 +239,13 @@ struct EngineState {
     importing_sources: std::collections::HashSet<String>,
     /// Publish `importing_sources` to the UI on the next snapshot.
     importing_dirty: bool,
+    /// Latest editor layout JSON pushed up from the editor. Opaque to
+    /// the engine — it just round-trips this through `.rkproject`.
+    editor_layout_json: Option<String>,
+    /// Ship `editor_layout_json` to the editor on the next snapshot.
+    /// Set on project load so the editor can hydrate its signals; never
+    /// set for echoes from the editor itself (no feedback loop).
+    editor_layout_pending: bool,
 
     /// Material library — manages .rkmat files and runtime palette.
     material_lib: crate::material_library::MaterialLibrary,
@@ -467,6 +474,8 @@ impl EngineState {
             models_dirty: false,
             importing_sources: std::collections::HashSet::new(),
             importing_dirty: false,
+            editor_layout_json: None,
+            editor_layout_pending: false,
             material_lib: crate::material_library::MaterialLibrary::new(),
             selected_material: None,
             selected_model: None,
@@ -1341,6 +1350,12 @@ impl EngineState {
                         self.project_name = project.name;
                         self.project_loaded = true;
                         self.project_dirty = true;
+                        // Cache + flag the editor layout so the editor
+                        // hydrates its docking state on the next tick.
+                        // `None` is meaningful — it means "reset to
+                        // default" for projects saved pre-persistence.
+                        self.editor_layout_json = project.editor_layout;
+                        self.editor_layout_pending = true;
 
                         // Scaffold + build gameplay BEFORE loading the scene,
                         // so gameplay components (Spin, Health, etc.) are registered
@@ -1377,19 +1392,22 @@ impl EngineState {
                     }
                     self.scene_path = Some(save_path);
                 }
+                // Persist the project descriptor alongside the scene so
+                // the cached editor layout (and anything else on
+                // ProjectFile) actually hits disk on Ctrl+S. Without
+                // this, layout state would only be written by explicit
+                // SaveProject, which the UI doesn't wire up.
+                self.save_project_file();
             }
 
             EngineCommand::SaveProject => {
-                if let (Some(project_path), Some(_project_dir)) = (&self.project_path, &self.project_dir) {
-                    let project = crate::project::ProjectFile {
-                        name: self.project_name.clone(),
-                        default_scene: "default".to_string(),
-                        recent_scenes: Vec::new(),
-                    };
-                    if let Err(e) = crate::project::save_project(&project, project_path) {
-                        eprintln!("[RkpEngine] save project failed: {e}");
-                    }
-                }
+                self.save_project_file();
+            }
+
+            EngineCommand::SetEditorLayout { json } => {
+                // Cache only — actual write happens on save. Don't echo
+                // back to the editor; it's the source of truth for this.
+                self.editor_layout_json = Some(json);
             }
 
             // ── Raw input → feed to InputSystem ──────────────────────
@@ -2896,6 +2914,24 @@ impl EngineState {
         }
     }
 
+    /// Write the current project descriptor to disk, folding in the
+    /// latest editor layout blob. No-op when no project is loaded
+    /// (prevents the unnamed-scratch-session case from spraying files).
+    fn save_project_file(&self) {
+        let (Some(project_path), Some(_)) = (&self.project_path, &self.project_dir) else {
+            return;
+        };
+        let project = crate::project::ProjectFile {
+            name: self.project_name.clone(),
+            default_scene: "default".to_string(),
+            recent_scenes: Vec::new(),
+            editor_layout: self.editor_layout_json.clone(),
+        };
+        if let Err(e) = crate::project::save_project(&project, project_path) {
+            eprintln!("[RkpEngine] save project failed: {e}");
+        }
+    }
+
     fn build_scene_file(&self) -> crate::scene_io::SceneFile {
         use crate::components::*;
         let mut objects = Vec::new();
@@ -3389,6 +3425,12 @@ impl EngineState {
         } else {
             None
         };
+        let editor_layout = if self.editor_layout_pending {
+            self.editor_layout_pending = false;
+            Some(self.editor_layout_json.clone())
+        } else {
+            None
+        };
 
         StateUpdate {
             fps,
@@ -3401,6 +3443,7 @@ impl EngineState {
             project_name,
             available_models: models,
             importing_models: importing,
+            editor_layout,
             inspector: self.build_inspector_snapshot(),
             recent_projects: if self.frame_index == 1 {
                 Some(crate::recent_projects::load_recent())

@@ -4,7 +4,7 @@
 //! The engine pushes updates via `send()`. UI interactions mutate via `set()`.
 //! The `EditorStore` is `Copy` (all Signals are Copy) — no Rc, no RefCell.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use rinch::prelude::*;
 use uuid::Uuid;
@@ -47,11 +47,12 @@ pub struct EditorStore {
 
     // ── Layout state (written by UI) ─────────────────────────────
 
-    /// Layout config wrapped in Rc for cheap cloning.
-    /// Read: `store.layout.get()` returns `Rc<LayoutConfig>`.
+    /// Layout config wrapped in Arc for cheap cloning + cross-thread
+    /// Signal::send (the engine thread hydrates this on project open).
+    /// Read: `store.layout.get()` returns `Arc<LayoutConfig>`.
     /// Write: clone out, mutate, set back: `store.update_layout(|cfg| { ... })`.
     /// This avoids re-entrant borrow — we clone before mutating, set after.
-    pub layout: Signal<Rc<LayoutConfig>>,
+    pub layout: Signal<Arc<LayoutConfig>>,
     /// Left container width in pixels (driven by splitter drag).
     pub left_width_px: Signal<f32>,
     /// Right container width in pixels.
@@ -172,7 +173,7 @@ impl EditorStore {
             selected_entity: Signal::new(None),
 
             // Layout.
-            layout: Signal::new(Rc::new(default_layout())),
+            layout: Signal::new(Arc::new(default_layout())),
             left_width_px: Signal::new(250.0),
             right_width_px: Signal::new(300.0),
             bottom_height_px: Signal::new(200.0),
@@ -214,11 +215,11 @@ impl EditorStore {
     }
 
     /// Mutate the layout config. Clones out, mutates, sets back.
-    /// This avoids re-entrant borrow on the Signal — the old Rc is
+    /// This avoids re-entrant borrow on the Signal — the old Arc is
     /// dropped before reactive effects fire.
     pub fn update_layout(&self, f: impl FnOnce(&mut LayoutConfig)) {
         let mut cfg = (*self.layout.get()).clone();
         f(&mut cfg);
-        self.layout.set(Rc::new(cfg));
+        self.layout.set(Arc::new(cfg));
     }
 }
