@@ -22,6 +22,11 @@ pub struct ProceduralSnapshot {
     /// Tree has been edited since the last voxel bake — the "Bake" button
     /// should show as enabled/highlighted when this is true.
     pub dirty: bool,
+    /// Voxel count from the last successful bake (zero pre-bake). Read
+    /// from the entity's `Renderable` component so the build overlay
+    /// can show a live count next to the Bake button without a second
+    /// snapshot hop.
+    pub voxel_count: u32,
 }
 
 /// Snapshot of a single node in the procedural tree.
@@ -111,6 +116,7 @@ pub fn build_procedural_snapshot(
     proc_geo: &crate::components::ProceduralGeometry,
     selected_node: Option<u32>,
     voxel_size: f32,
+    voxel_count: u32,
 ) -> ProceduralSnapshot {
     use rkp_procedural::node_kind::*;
     use rkp_procedural::NodeKind;
@@ -195,6 +201,7 @@ pub fn build_procedural_snapshot(
         selected_node,
         voxel_size,
         dirty: proc_geo.dirty,
+        voxel_count,
     }
 }
 

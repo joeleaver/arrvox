@@ -53,50 +53,14 @@ fn build_content(__scope: &mut Scope, store: EditorStore) -> Node {
     rsx! {
         div {
             style: "display:flex;flex-direction:column;height:100%;",
-            // ── Resolution ────────────────────────────────────────────
-            {render_resolution(__scope, snapshot, cmd_tx)}
-            // ── Node params ───────────────────────────────────────────
-            // Tree widget and Preview/Bake controls both live on the
-            // build viewport as floating overlays; this panel is just
-            // resolution + the currently-selected node's parameters.
+            // The tree, preview toggle, bake button, resolution picker,
+            // and voxel-count readout all live as floating overlays on
+            // the build viewport — this panel is now only the selected
+            // node's parameters.
             div {
                 style: "flex:1;min-height:0;overflow-y:auto;padding:4px 8px;",
                 {render_params(__scope, store.clone(), snapshot, selected_node, cmd_tx)}
             }
-        }
-    }
-}
-
-// ── Resolution control ──────────────────────────────────────────────────
-
-fn render_resolution(
-    __scope: &mut Scope,
-    snapshot: Memo<ProceduralSnapshot>,
-    cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
-) -> Node {
-    let vs = snapshot.get().voxel_size;
-    let current = Signal::new(format!("{vs}"));
-    let on_change: Rc<dyn Fn(String)> = Rc::new(move |v: String| {
-        let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralVoxelSize {
-            tier: v,
-        });
-    });
-
-    rsx! {
-        div {
-            style: "padding:4px 8px;border-bottom:1px solid #333;",
-            {prop_select(
-                __scope,
-                "Resolution",
-                current,
-                &[
-                    ("0.005", "5mm (finest)"),
-                    ("0.02", "2cm"),
-                    ("0.08", "8cm"),
-                    ("0.32", "32cm (coarsest)"),
-                ],
-                on_change,
-            )}
         }
     }
 }

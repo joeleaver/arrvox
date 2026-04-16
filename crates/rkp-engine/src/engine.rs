@@ -4873,11 +4873,21 @@ impl EngineState {
         let proc_geo = self.world.get::<&crate::components::ProceduralGeometry>(entity).ok()?;
         let uuid = self.get_entity_uuid(entity);
         let vs = proc_geo.voxel_size;
+        // Renderable carries the post-bake voxel count. Procedurals
+        // always have one paired with their ProceduralGeometry, but
+        // defend with 0 rather than panic if something gets out of
+        // sync mid-edit.
+        let voxel_count = self
+            .world
+            .get::<&crate::components::Renderable>(entity)
+            .map(|r| r.voxel_count)
+            .unwrap_or(0);
         Some(crate::procedural_snapshot::build_procedural_snapshot(
             uuid,
             &proc_geo,
             self.selected_procedural_node,
             vs,
+            voxel_count,
         ))
     }
 }

@@ -359,9 +359,9 @@ pub fn BuildViewport() -> NodeHandle {
                         )}
                     }
                 }
-                // Top-right: preview-mode toggle + Bake action. Floats as
-                // a single compact overlay over the 3D view so the tools
-                // live next to the thing they modify. Gated on
+                // Top-right: preview-mode toggle + Bake action + resolution.
+                // Floats as a single compact overlay over the 3D view so
+                // the tools live next to the thing they modify. Gated on
                 // `has_procedural` — same as the tree panel.
                 if has_procedural.get() {
                     div {
@@ -371,8 +371,9 @@ pub fn BuildViewport() -> NodeHandle {
                                 color:#ccc;font-size:12px;padding:6px;\
                                 backdrop-filter:blur(4px);z-index:15;\
                                 display:flex;flex-direction:column;gap:6px;\
-                                min-width:220px;",
+                                min-width:240px;",
                         {render_preview_toggle(__scope, store.clone(), tree_cmd_tx)}
+                        {render_resolution(__scope, tree_snapshot, tree_cmd_tx)}
                         {render_bake_action(__scope, tree_snapshot, tree_cmd_tx)}
                     }
                 }
@@ -480,15 +481,19 @@ fn render_preview_toggle(
     }
 }
 
-/// Bake button + dirty indicator. Interactive edits mark the tree dirty
-/// but don't rebake — this button pays the voxelization cost on demand.
-/// Highlights blue when there are unbaked changes.
+/// Bake button + voxel-count readout + dirty indicator. Interactive
+/// edits mark the tree dirty but don't rebake — this button pays the
+/// voxelization cost on demand. Highlights blue when there are unbaked
+/// changes. The readout shows the last bake's voxel count, which is
+/// always worth eyeballing: resolution changes can easily 100× the
+/// output without the user noticing until stepping through perf.
 fn render_bake_action(
     __scope: &mut rinch::core::dom::RenderScope,
     snapshot: Memo<ProceduralSnapshot>,
     cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
 ) -> rinch::core::dom::NodeHandle {
     let dirty = Memo::new(move || snapshot.get().dirty);
+    let voxel_count = Memo::new(move || snapshot.get().voxel_count);
     let entity_id = Memo::new(move || snapshot.get().entity_id);
 
     let on_click = move || {
@@ -513,14 +518,70 @@ fn render_bake_action(
                 onclick: on_click,
                 "Bake"
             }
-            span {
-                style: {move || if dirty.get() {
-                    "color:#f0a04b;font-size:11px;"
-                } else {
-                    "color:#666;font-size:11px;"
-                }},
-                {move || if dirty.get() { "unbaked changes" } else { "up to date" }}
+            div {
+                style: "display:flex;flex-direction:column;align-items:flex-end;\
+                        line-height:1.2;",
+                span {
+                    style: "font-size:11px;color:#999;font-family:monospace;",
+                    {move || format_voxel_count_readout(voxel_count.get())}
+                }
+                span {
+                    style: {move || if dirty.get() {
+                        "font-size:10px;color:#f0a04b;"
+                    } else {
+                        "font-size:10px;color:#555;"
+                    }},
+                    {move || if dirty.get() { "unbaked" } else { "up to date" }}
+                }
             }
         }
+    }
+}
+
+/// Resolution picker — tier buffer size for the voxelizer. Same dropdown
+/// that used to live in the right panel; moved into the viewport overlay
+/// so the Bake / Voxel-count / Resolution controls all sit together,
+/// since they form one logical workflow (pick resolution → bake → glance
+/// at count → adjust).
+fn render_resolution(
+    __scope: &mut rinch::core::dom::RenderScope,
+    snapshot: Memo<ProceduralSnapshot>,
+    cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
+) -> rinch::core::dom::NodeHandle {
+    // Track the current voxel_size so the select reflects engine changes
+    // (e.g., safe-voxel-size auto-bumps on large AABBs). `prop_select`
+    // reads its initial value from the Signal at mount; a Memo keeps us
+    // in sync on future snapshots without remounting the whole select.
+    let current = Signal::new(format!("{}", snapshot.get().voxel_size));
+    let on_change: std::rc::Rc<dyn Fn(String)> = std::rc::Rc::new(move |v: String| {
+        let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralVoxelSize {
+            tier: v,
+        });
+    });
+    super::prop_controls::prop_select(
+        __scope,
+        "Res",
+        current,
+        &[
+            ("0.005", "5mm (finest)"),
+            ("0.02", "2cm"),
+            ("0.08", "8cm"),
+            ("0.32", "32cm (coarsest)"),
+        ],
+        on_change,
+    )
+}
+
+/// Format a voxel count for the single-line readout. "—" when the tree
+/// hasn't been baked yet (count=0), compact SI-ish suffixes otherwise.
+fn format_voxel_count_readout(count: u32) -> String {
+    if count == 0 {
+        "— voxels".to_string()
+    } else if count >= 1_000_000 {
+        format!("{:.1}M voxels", count as f64 / 1_000_000.0)
+    } else if count >= 1_000 {
+        format!("{:.1}K voxels", count as f64 / 1_000.0)
+    } else {
+        format!("{count} voxels")
     }
 }

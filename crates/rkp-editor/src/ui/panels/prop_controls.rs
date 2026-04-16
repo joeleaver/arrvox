@@ -475,20 +475,20 @@ pub fn prop_color(
 ) -> Node {
     let label = label.to_string();
     // One-shot seed read, untracked so the caller's render effect
-    // doesn't subscribe to `value` (a subscription turns `value.set`
-    // inside onchange into a synchronous parent re-render, re-entering
-    // an in-flight effect at rinch effect.rs:144 → RefCell panic).
-    //
-    // NOTE: deliberately not using `value_fn` here. ColorInput's
-    // internal binding effect (color_input.rs:221 on `main`) races
-    // with the user-edit onchange and clobbers the new value before
-    // external state can propagate — see rinch issue
-    // https://github.com/joeleaver/rinch/issues/22. The caller's
-    // `value` Signal is effectively a write-only bridge anyway (no
-    // one in the editor mutates it externally after mount; fresh
-    // engine snapshots remount the param field with a new Signal),
-    // so losing reactive external → picker sync doesn't affect us.
-    // Revisit this once the rinch fix lands.
+    // doesn't subscribe to `value`. Deliberately NOT using `value_fn`:
+    // even after rinch's upstream fix for issue #22 (value_fn
+    // self-subscription) a separate re-entrancy still fires during
+    // re-mount. ColorPicker's coordinating effect runs its initial
+    // fire inside Effect::new → run_effect, synchronously invokes our
+    // onchange wrapper, which `current_value.set`s, triggering a
+    // nested flush. If *anything* is pending in that flush (the
+    // parent for_each_dom that's re-rendering us is one candidate),
+    // run_effect re-enters a borrow_mut-held closure and panics at
+    // effect.rs:144. Skipping value_fn means ColorInput never
+    // subscribes an effect to our caller Signal, which is enough to
+    // avoid the trigger in practice. The Signal becomes a write-only
+    // bridge — fine here, since fresh engine snapshots remount the
+    // whole param field with a new Signal anyway.
     let initial_hex = untracked(|| rgba_to_hex(value.get()));
 
     rsx! {
@@ -502,14 +502,11 @@ pub fn prop_color(
                     format: "hex",
                     alpha: false,
                     onchange: move |v: String| {
-                        // Whole body runs untracked. ColorPicker invokes
-                        // onchange from inside its own "coordinating"
-                        // effect (color_picker.rs:365), so any naked
-                        // `value.get()` here — including the guard
-                        // below — would subscribe *that* effect to our
-                        // Signal. `value.set(rgba)` a few lines later
-                        // would then notify and re-enter the still-
-                        // borrowed coordinating effect at effect.rs:144.
+                        // Whole body untracked so the guard's `value.get()`
+                        // doesn't subscribe ColorPicker's currently-
+                        // running coordinating effect to our Signal —
+                        // otherwise `value.set(rgba)` below would queue
+                        // the very effect that invoked us.
                         untracked(|| {
                             if let Some(rgba) = hex_to_rgba(&v) {
                                 if rgba_to_hex(rgba) == rgba_to_hex(value.get()) {
