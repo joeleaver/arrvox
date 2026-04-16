@@ -260,6 +260,16 @@ fn main() -> anyhow::Result<()> {
                 if let Some(importing) = &update.importing_models {
                     store.importing_models.send(importing.clone());
                 }
+                if let Some(progress) = &update.import_progress {
+                    store.import_progress.send(progress.clone());
+                }
+                // No explicit clear on idle — `get()` isn't allowed off
+                // the main thread, and the UI gates progress-bar display
+                // on `importing_models` anyway, so stale `import_progress`
+                // entries sit harmlessly until the next import replaces
+                // them. (If we ever need a clean-up, do it on the engine
+                // side with a dirty flag and send `Some(Vec::new())` on
+                // the empty→empty transition.)
                 // Hydrate layout on project open. Outer Some = "this
                 // tick carries a layout update"; inner None = "project
                 // had none stored, reset to defaults". The engine only

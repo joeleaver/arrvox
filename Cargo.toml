@@ -9,6 +9,7 @@ members = [
     "crates/rkp-testbed", "crates/rkp-engine",
     "crates/rkp-macros",
     "crates/rkp-procedural",
+    "crates/rkp-import",
 ]
 
 [workspace.package]
@@ -27,12 +28,12 @@ rkp-runtime = { path = "crates/rkp-runtime" }
 rkp-engine = { path = "crates/rkp-engine" }
 rkp-macros = { path = "crates/rkp-macros" }
 rkp-procedural = { path = "crates/rkp-procedural" }
+rkp-import = { path = "crates/rkp-import" }
 
 # Shared crates from RKIField
 rkf-core = { path = "../rkifield/crates/rkf-core" }
 rkf-render = { path = "../rkifield/crates/rkf-render" }
 rkf-editor = { path = "../rkifield/crates/rkf-editor" }
-rkf-import = { path = "../rkifield/crates/rkf-import" }
 rkf-animation = { path = "../rkifield/crates/rkf-animation" }
 rkf-runtime = { path = "../rkifield/crates/rkf-runtime" }
 rkf-physics = { path = "../rkifield/crates/rkf-physics" }
@@ -60,6 +61,9 @@ image = "0.25"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
 pollster = "0.4"
+gltf = { version = "1", features = ["KHR_texture_transform"] }
+tobj = "4"
+ufbx = "0.10"
 crossbeam = "0.8"
 inventory = "0.3"
 rapier3d = "0.32"

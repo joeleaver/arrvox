@@ -1,12 +1,13 @@
 //! Import worker — background thread for mesh-to-.rkp conversion.
 //!
-//! Accepts import requests via channel, runs `import_mesh_to_opacity_rkp`
-//! on a background thread, returns results via another channel.
+//! Accepts import requests via channel, runs `import_mesh_to_opacity_rkp_with`
+//! on a background thread, and streams structured progress events back to the
+//! main thread via a second channel so the UI can render a live status bar.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use rkf_import::pipeline::{ImportConfig, ImportResult};
+use rkp_import::{ImportConfig, ImportEvent, ImportResult, ProgressReporter};
 
 /// An import request.
 pub struct ImportRequest {
@@ -22,10 +23,47 @@ pub struct ImportCompletion {
     pub result: Result<ImportResult, String>,
 }
 
+/// A progress event tagged with the source path it belongs to, so
+/// the engine can multiplex events from multiple concurrent imports
+/// (currently the worker only runs one at a time, but the tagging
+/// keeps that option open).
+pub struct TaggedEvent {
+    pub source_path: PathBuf,
+    pub event: ImportEvent,
+}
+
 /// Background import worker.
 pub struct ImportWorker {
     request_tx: mpsc::Sender<ImportRequest>,
     result_rx: mpsc::Receiver<ImportCompletion>,
+    event_rx: mpsc::Receiver<TaggedEvent>,
+}
+
+/// `ProgressReporter` that forwards events onto an `mpsc::Sender`,
+/// tagged with the source path the worker is currently processing.
+/// Cheap to construct per-import so the worker can create a fresh
+/// one each request.
+struct MpscReporter {
+    source: PathBuf,
+    tx: mpsc::Sender<TaggedEvent>,
+}
+
+impl ProgressReporter for MpscReporter {
+    fn report(&self, event: ImportEvent) {
+        // Also echo to stderr so console logs still capture the
+        // stage timeline — useful when the UI isn't visible
+        // (CLI tools, headless tests). Cheap; stages fire <1 per ms.
+        match &event {
+            ImportEvent::StageStart { message, .. } => eprintln!("[import] {message}"),
+            ImportEvent::Warn { message } => eprintln!("[import] WARN: {message}"),
+            ImportEvent::Error { message } => eprintln!("[import] ERROR: {message}"),
+            _ => {}
+        }
+        let _ = self.tx.send(TaggedEvent {
+            source_path: self.source.clone(),
+            event,
+        });
+    }
 }
 
 impl ImportWorker {
@@ -33,6 +71,7 @@ impl ImportWorker {
     pub fn new() -> Self {
         let (request_tx, request_rx) = mpsc::channel::<ImportRequest>();
         let (result_tx, result_rx) = mpsc::channel::<ImportCompletion>();
+        let (event_tx, event_rx) = mpsc::channel::<TaggedEvent>();
 
         std::thread::Builder::new()
             .name("rkp-import".into())
@@ -43,20 +82,34 @@ impl ImportWorker {
                         req.source_path.display(),
                         req.output_path.display(),
                     );
-                    // Catch panics from the importer so the main thread
-                    // always gets a completion — otherwise a panic (OOM,
-                    // glTF parser assertion, etc.) would leave the UI
-                    // spinner hanging forever with no error surfaced.
                     let source = req.source_path.clone();
                     let output = req.output_path.clone();
                     let config = req.config.clone();
+                    let reporter = MpscReporter {
+                        source: source.clone(),
+                        tx: event_tx.clone(),
+                    };
+                    // Panic catch keeps the worker alive across a
+                    // malformed-input crash so the UI always gets a
+                    // completion instead of a stuck spinner.
                     let result = std::panic::catch_unwind(
                         std::panic::AssertUnwindSafe(|| {
-                            rkp_render::import_mesh_to_opacity_rkp(&source, &output, &config)
+                            rkp_import::import_mesh_to_opacity_rkp_with(
+                                &source,
+                                &output,
+                                &config,
+                                &reporter,
+                            )
                         }),
                     );
-                    let result = match result {
-                        Ok(r) => r,
+                    // Flatten the typed `ImportError` to a `String`
+                    // for `ImportCompletion` — the UI doesn't
+                    // distinguish error variants, just shows the
+                    // message. Callers that want structure can
+                    // import `rkp_import::ImportError` directly.
+                    let result: Result<ImportResult, String> = match result {
+                        Ok(Ok(r)) => Ok(r),
+                        Ok(Err(e)) => Err(e.to_string()),
                         Err(payload) => {
                             let msg = panic_message(&payload);
                             eprintln!("[ImportWorker] panic: {msg}");
@@ -66,7 +119,7 @@ impl ImportWorker {
                     match &result {
                         Ok(r) => eprintln!(
                             "[ImportWorker] done: {} voxels, {:.1} KB",
-                            r.total_bricks,
+                            r.shell_voxels,
                             r.file_size as f64 / 1024.0,
                         ),
                         Err(e) => eprintln!("[ImportWorker] failed: {e}"),
@@ -80,7 +133,7 @@ impl ImportWorker {
             })
             .expect("failed to spawn import worker");
 
-        Self { request_tx, result_rx }
+        Self { request_tx, result_rx, event_rx }
     }
 
     /// Submit an import request (non-blocking).
@@ -96,22 +149,22 @@ impl ImportWorker {
         }
         completions
     }
+
+    /// Poll for queued progress events (non-blocking). Returns all
+    /// events that have accumulated since the last call, in FIFO
+    /// order. Engine reduces these into per-source progress state.
+    pub fn poll_events(&self) -> Vec<TaggedEvent> {
+        let mut events = Vec::new();
+        while let Ok(e) = self.event_rx.try_recv() {
+            events.push(e);
+        }
+        events
+    }
 }
 
 /// Build a default ImportConfig for a mesh file.
 pub fn default_import_config() -> ImportConfig {
-    ImportConfig {
-        voxel_size: None, // auto-detect
-        lod_levels: 1,
-        target_size: 1.0,
-        no_normalize: false,
-        material_id_override: None,
-        import_colors: true,
-        rotation_offset: [0.0; 3],
-        scale_override: None,
-        pool_size: 65536,
-        verbose: true,
-    }
+    ImportConfig::default()
 }
 
 /// Compute the .rkp output path for a source mesh file.

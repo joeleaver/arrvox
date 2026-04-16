@@ -4,8 +4,6 @@
 //! deferred shadow/AO and PBR shading. Post-processing (tone mapping, bloom,
 //! etc.) is handled by the caller (RkpEngine) using rkf-render passes.
 
-/// Direct mesh-to-opacity voxelization — bypasses SDF for smooth splat fields.
-pub mod voxelize_opacity;
 /// GPU octree buffer management and GpuObject field reinterpretation.
 pub mod octree_gpu;
 /// Octree-accelerated compute ray marcher — primary visibility pass.
@@ -42,7 +40,6 @@ pub mod proc_outline;
 /// Ghost-cutter overlay for Subtract/Intersect preview visualization.
 pub mod proc_ghost;
 
-pub use voxelize_opacity::import_mesh_to_opacity_rkp;
 pub use octree_gpu::OctreeGpu;
 pub use rkp_scene_manager::{AssetHandle, AssetInfo, ReloadResult, RkpSceneManager};
 pub use viewport_renderer::ViewportRenderer;

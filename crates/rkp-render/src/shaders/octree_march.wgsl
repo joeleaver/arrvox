@@ -10,7 +10,20 @@ const OCTREE_LEAF_BIT: u32 = 0x80000000u;
 const OCTREE_BRICK_BIT: u32 = 0x40000000u;
 const OCTREE_PAYLOAD_MASK: u32 = 0x3FFFFFFFu;
 const OPACITY_THRESHOLD: f32 = 0.05;
-const MAX_STEPS: u32 = 256u;
+// Safety-net ceiling for the outer ray-march loop. The ray already
+// terminates naturally when `t > t_range.y` (exits the octree); this
+// cap exists only to avoid a GPU hang if FP precision or a brick-
+// chain bug ever prevented `t` from advancing.
+//
+// Sized for the largest octree we expect (depth 12 = 4096 voxels
+// per axis = 512 bricks). Worst-case diagonal is ~1775 nodes.
+// 4096 leaves plenty of headroom and is still negligible vs the
+// GPU watchdog timeout.
+//
+// TODO: replace with an adaptive limit derived from each object's
+// uploaded octree depth — `MAX_STEPS_PER_OBJ = 8 * bricks_per_axis`
+// would be exact. Requires adding a field to `RkpGpuObject`.
+const MAX_STEPS: u32 = 4096u;
 const MAX_OBJECTS: u32 = 32u;
 // Brick layout — must match rkp_core::brick_pool constants.
 const BRICK_DIM: u32 = 4u;
@@ -27,7 +40,14 @@ const BRICK_CELL_INTERIOR: u32 = 0xFFFFFFFDu;
 // A 4³ brick has at most ~12 cells along the longest diagonal traversal,
 // so capping inner-DDA at 16 keeps a misbehaving loop from melting the
 // frame. Real traversals never come close to this cap.
-const BRICK_MAX_STEPS: u32 = 16u;
+// Raised from 16 to 128: the inner DDA chains across adjacent bricks
+// via brick_face_links, so a single inner loop can traverse many bricks
+// before the outer loop needs to run again.
+// Inner brick-chain limit — the DDA walks from cell to cell, chaining
+// across brick boundaries via `brick_face_links`. Sized the same as
+// `MAX_STEPS` since the inner chain can cover the full octree diagonal
+// in pathological cases.
+const BRICK_MAX_STEPS: u32 = 4096u;
 
 struct RkpObject {
     world: mat4x4<f32>,
@@ -535,152 +555,6 @@ fn unpack_oct_normal(packed: u32) -> vec3<f32> {
     return n / len;
 }
 
-// --- Shadow ray ---
-//
-// Trace a shadow ray from a surface hit point through all objects using
-// octree_lookup + skip_node (DDA-based). No fixed-stride stepping, so
-// no voxel-grid-aligned banding.
-
-fn trace_shadow_ray(
-    world_origin: vec3<f32>,
-    world_dir: vec3<f32>,
-    num_objects: u32,
-    max_steps: u32,
-    max_world_dist: f32,  // max trace distance (light distance for point/spot, 1e20 for directional)
-) -> f32 {
-    var transmittance = 1.0;
-
-    for (var oi = 0u; oi < num_objects && oi < MAX_OBJECTS; oi++) {
-        let obj = objects[oi];
-        if obj.geom_type == 0u { continue; }
-        // Phase 2: shadow rays use the same gate as primary visibility.
-        // SHADOW_ONLY semantics (cast shadow but invisible to camera) need
-        // a distinct shadow mask and will land in a later phase.
-        if !rkp_object_visible(obj) { continue; }
-
-        let inv_world = obj.inverse_world;
-        let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
-        let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
-        let local_dir = normalize(local_dir_unnorm);
-        // Convert world-space max distance to local-space t.
-        let local_scale = length(local_dir_unnorm);
-        let local_max_t = max_world_dist * local_scale;
-
-        let root = obj.octree_root;
-        let max_depth = obj.octree_depth;
-        let extent = bitcast<f32>(obj.octree_extent_bits);
-        let vs = obj.voxel_size;
-        let min_step = vs * 2.0;
-
-        // Convert entity-local position into octree-local `[0, extent]`
-        // space. `grid_origin` is where the voxel grid starts in the
-        // entity frame; subtracting it lands us at the octree corner.
-        let oc_origin = local_origin - obj.grid_origin;
-        let safe_dir = vec3<f32>(
-            select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),
-            select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),
-            select(local_dir.z, select(-1e-10, 1e-10, local_dir.z >= 0.0), abs(local_dir.z) < 1e-10),
-        );
-        let inv_dir = 1.0 / safe_dir;
-
-        let shadow_origin = oc_origin + safe_dir * vs * 4.0;
-        let t_range = intersect_aabb(shadow_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(extent));
-        if t_range.x > t_range.y { continue; }
-
-        // Clamp trace to light distance (avoids finding occluders behind point lights).
-        let t_limit = min(t_range.y, local_max_t);
-        var t = max(t_range.x, 0.0);
-        for (var step = 0u; step < max_steps; step++) {
-            if t > t_limit { break; }
-
-            let pos = clamp(shadow_origin + safe_dir * t, vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
-            // LOD skipped (phase != PHASE_MARCH) — placeholder args.
-            let r = octree_lookup(root, max_depth, extent, pos, PHASE_SHADOW, 0.0, 0.0, 0.0);
-
-            if r.slot == OCTREE_EMPTY {
-                t += max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);
-                continue;
-            }
-
-            // BRICK: do a small DDA inside the brick. Same logic as the
-            // surface march's brick path, but only opacity matters (no
-            // normal / color recovery for shadow rays).
-            if slot_is_brick(r.slot) {
-                let brick_id = slot_brick_id(r.slot);
-                let cell_size = (r.cell_half * 2.0) / BRICK_DIM_F;
-                let inv_cell_size = 1.0 / cell_size;
-                let brick_origin = r.cell_center - vec3<f32>(r.cell_half);
-                let brick_base = brick_id * BRICK_CELLS;
-                let min_advance = cell_size * 1.0e-3;
-                var blocked = false;
-                for (var bs = 0u; bs < BRICK_MAX_STEPS; bs++) {
-                    if t > t_limit { break; }
-                    let p = shadow_origin + safe_dir * t;
-                    let local = (p - brick_origin) * inv_cell_size;
-                    let lx = floor(local.x);
-                    let ly = floor(local.y);
-                    let lz = floor(local.z);
-                    if lx < 0.0 || ly < 0.0 || lz < 0.0
-                        || lx >= BRICK_DIM_F || ly >= BRICK_DIM_F || lz >= BRICK_DIM_F {
-                        break;
-                    }
-                    let cx = u32(lx);
-                    let cy = u32(ly);
-                    let cz = u32(lz);
-                    let flat = cx + cy * BRICK_DIM + cz * BRICK_DIM * BRICK_DIM;
-                    let cell = brick_pool[brick_base + flat];
-                    // BRICK_CELL_INTERIOR is solid-bulk-marker: skip like
-                    // EMPTY for shadow tracing (the shell in front of it
-                    // already gave us the occluder we needed).
-                    if cell != BRICK_CELL_EMPTY && cell != BRICK_CELL_INTERIOR {
-                        let attr = leaf_attr_pool[cell];
-                        let mid = leaf_attr_material_primary(attr);
-                        let m_op = materials[mid].opacity;
-                        if m_op >= 0.99 { blocked = true; break; }
-                        transmittance *= (1.0 - m_op);
-                        if transmittance < 0.01 { blocked = true; break; }
-                        t = max(t + cell_size * 0.5, t + min_advance);
-                        continue;
-                    }
-                    let cell_min_pt = brick_origin
-                        + vec3<f32>(lx, ly, lz) * cell_size;
-                    let cell_max_pt = cell_min_pt + vec3<f32>(cell_size);
-                    let cell_exit = intersect_aabb(p, inv_dir, cell_min_pt, cell_max_pt).y;
-                    let new_t = t + max(cell_exit, 0.0) + min_advance;
-                    t = max(new_t, t + min_advance);
-                }
-                if blocked { return 0.0; }
-                continue;
-            }
-
-            // Any non-empty leaf (or INTERIOR) is 100% surface coverage.
-            // Transparency is a per-material property now.
-            var mat_opacity = 1.0;
-            if r.slot != OCTREE_INTERIOR {
-                atomicAdd(&stats[44], 1u); // leaf_attr read
-                let attr = leaf_attr_pool[r.slot];
-                let mid = leaf_attr_material_primary(attr);
-                atomicAdd(&stats[47], 1u); // materials read
-                mat_opacity = materials[mid].opacity;
-            }
-
-            // Opaque material: hard block.
-            if mat_opacity >= 0.99 {
-                return 0.0;
-            }
-            // Transparent material: accumulate transmittance.
-            transmittance *= (1.0 - mat_opacity);
-            if transmittance < 0.01 {
-                return 0.0;
-            }
-
-            t += min_step;
-        }
-    }
-
-    return transmittance;
-}
-
 // --- Accumulating march (per object) ---
 //
 // Front-to-back opacity accumulation within a single object. Accumulates
@@ -738,13 +612,18 @@ fn march_object(
 
     var t = t_range.x;
     var step_count = 0u;
+    // Forward bias for octree_lookup / skip_node — disambiguates the
+    // pos-on-exact-boundary case where `pos >= center` would otherwise
+    // round into an EMPTY sibling subtree and miss the brick we're
+    // entering. See rkp_shadow_trace.wgsl.
+    let lookup_bias = vs * 1.0e-3;
 
     for (var step = 0u; step < MAX_STEPS; step++) {
         step_count += 1u;
         if t > t_range.y { break; }
         if result.alpha > 0.99 { break; }
 
-        let pos = clamp(oc_origin + safe_dir * t, vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
+        let pos = clamp(oc_origin + safe_dir * (t + lookup_bias), vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
         let r = octree_lookup(root, max_depth, extent, pos, PHASE_MARCH, t, local_to_world, focal_px_y);
 
         if r.slot == OCTREE_EMPTY {
@@ -757,47 +636,116 @@ fn march_object(
         // saturates. Each step inside the brick is one flat read — no more
         // octree descent until we leave the brick.
         if slot_is_brick(r.slot) {
-            let brick_id = slot_brick_id(r.slot);
+            var brick_id = slot_brick_id(r.slot);
             let cell_size = (r.cell_half * 2.0) / BRICK_DIM_F;
             let inv_cell_size = 1.0 / cell_size;
-            let brick_origin = r.cell_center - vec3<f32>(r.cell_half);
-            let brick_base = brick_id * BRICK_CELLS;
-            // Force monotonic t advance — the smallest step we'll take per
-            // inner iteration. Guards against a degenerate `intersect_aabb`
-            // exit time that doesn't move past the current cell.
-            let min_advance = cell_size * 1.0e-3;
+            var brick_origin = r.cell_center - vec3<f32>(r.cell_half);
+            var brick_base = brick_id * BRICK_CELLS;
+
+            // Amanatides-Woo DDA + brick_face_links chaining. When the
+            // ray exits a brick face, we consult the face-link table in
+            // one indirect read rather than re-querying the octree,
+            // bypassing the FP-ambiguous `pos >= center` comparisons at
+            // brick boundaries that produced visible seams.
+            let p0 = oc_origin + safe_dir * t;
+            let local0 = (p0 - brick_origin) * inv_cell_size;
+            var cell = clamp(
+                vec3<i32>(floor(local0)),
+                vec3<i32>(0),
+                vec3<i32>(3),
+            );
+            let step_i = vec3<i32>(
+                select(-1, 1, safe_dir.x >= 0.0),
+                select(-1, 1, safe_dir.y >= 0.0),
+                select(-1, 1, safe_dir.z >= 0.0),
+            );
+            let step_gt = vec3<f32>(
+                select(0.0, 1.0, safe_dir.x >= 0.0),
+                select(0.0, 1.0, safe_dir.y >= 0.0),
+                select(0.0, 1.0, safe_dir.z >= 0.0),
+            );
+            let next_b = brick_origin + (vec3<f32>(cell) + step_gt) * cell_size;
+            var t_max = t + (next_b - p0) * inv_dir;
+            let t_delta = abs(vec3<f32>(cell_size) * inv_dir);
+            let dda_eps = cell_size * 1.0e-3;
+
             var brick_done = false;
             for (var bs = 0u; bs < BRICK_MAX_STEPS; bs++) {
                 step_count += 1u;
                 if t > t_range.y { brick_done = true; break; }
                 if result.alpha > 0.99 { brick_done = true; break; }
 
-                let p = oc_origin + safe_dir * t;
-                let local = (p - brick_origin) * inv_cell_size;
-                let lx = floor(local.x);
-                let ly = floor(local.y);
-                let lz = floor(local.z);
-                // Exit-the-brick test on integer cell coords (more robust
-                // than float-comparison on world bounds).
-                if lx < 0.0 || ly < 0.0 || lz < 0.0
-                    || lx >= BRICK_DIM_F || ly >= BRICK_DIM_F || lz >= BRICK_DIM_F {
-                    break;
+                if cell.x < 0 || cell.x >= 4
+                    || cell.y < 0 || cell.y >= 4
+                    || cell.z < 0 || cell.z >= 4 {
+                    var face_idx: u32;
+                    if cell.x < 0 { face_idx = FACE_NX; }
+                    else if cell.x >= 4 { face_idx = FACE_PX; }
+                    else if cell.y < 0 { face_idx = FACE_NY; }
+                    else if cell.y >= 4 { face_idx = FACE_PY; }
+                    else if cell.z < 0 { face_idx = FACE_NZ; }
+                    else { face_idx = FACE_PZ; }
+                    let link = brick_face_links[brick_id * 6u + face_idx];
+                    if link == FACE_INTERIOR {
+                        // Ray entered solid-bulk: opaque hit with a
+                        // face-aligned normal (toward the ray) and
+                        // material default (no per-cell attrs here).
+                        let p = oc_origin + safe_dir * t;
+                        result.oc_pos = p;
+                        result.normal = -safe_dir;
+                        result.alpha = 1.0;
+                        result.t = t;
+                        result.first_slot = 0u;
+                        result.valid = true;
+                        result.color = vec3<f32>(0.5);
+                        result.steps = step_count;
+                        brick_done = true;
+                        break;
+                    }
+                    if link == FACE_EMPTY_LINK {
+                        // No same-depth brick adjacent — fall back to
+                        // the outer loop's skip_node.
+                        break;
+                    }
+                    brick_id = link;
+                    brick_base = link * BRICK_CELLS;
+                    // Shift brick_origin to the neighbor brick's world-space
+                    // corner and reset the crossed-axis cell coord to its
+                    // entry edge in the new brick.
+                    let brick_extent = BRICK_DIM_F * cell_size;
+                    if face_idx == FACE_NX { cell.x = 3; brick_origin.x -= brick_extent; }
+                    else if face_idx == FACE_PX { cell.x = 0; brick_origin.x += brick_extent; }
+                    else if face_idx == FACE_NY { cell.y = 3; brick_origin.y -= brick_extent; }
+                    else if face_idx == FACE_PY { cell.y = 0; brick_origin.y += brick_extent; }
+                    else if face_idx == FACE_NZ { cell.z = 3; brick_origin.z -= brick_extent; }
+                    else { cell.z = 0; brick_origin.z += brick_extent; }
+                    // Re-anchor `t_max` from the current ray position to
+                    // the new brick's cell boundaries. The incremental
+                    // `t_max += t_delta` updates accumulate FP rounding
+                    // over many iterations; letting that drift carry across
+                    // brick chains at large octree extents eventually
+                    // causes `t_max.x < t_max.y` to pick the wrong axis,
+                    // producing grid-aligned cell skips (visible as the
+                    // scale-dependent voxel-hole artifact). Re-anchoring
+                    // at every face-link crossing caps the drift to one
+                    // brick's worth of steps.
+                    let p_now = oc_origin + safe_dir * t;
+                    let next_b = brick_origin + (vec3<f32>(cell) + step_gt) * cell_size;
+                    t_max = t + (next_b - p_now) * inv_dir;
                 }
-                let cx = u32(lx);
-                let cy = u32(ly);
-                let cz = u32(lz);
+
+                let cx = u32(cell.x);
+                let cy = u32(cell.y);
+                let cz = u32(cell.z);
                 let flat = cx + cy * BRICK_DIM + cz * BRICK_DIM * BRICK_DIM;
-                let cell = brick_pool[brick_base + flat];
+                let c = brick_pool[brick_base + flat];
 
                 // BRICK_CELL_INTERIOR cells are solid-bulk markers set
                 // by mesh imports; skip them identically to empty air
                 // so the march only ever stops on the visible shell.
-                // The surface-nets kernel above reads them as occupied
-                // for centroid purposes via `resolve_neighbor_cell`.
-                if cell != BRICK_CELL_EMPTY && cell != BRICK_CELL_INTERIOR {
-                    // Cell occupied — process as a leaf hit.
+                if c != BRICK_CELL_EMPTY && c != BRICK_CELL_INTERIOR {
                     atomicAdd(&stats[44], 1u); // leaf_attr read
-                    let attr = leaf_attr_pool[cell];
+                    let attr = leaf_attr_pool[c];
                     let baked_normal = unpack_oct_normal(attr.normal_oct);
                     var cell_normal: vec3<f32>;
                     if march_params.surfacenet_enabled != 0u {
@@ -811,6 +759,7 @@ fn march_object(
                     let mid = leaf_attr_material_primary(attr);
                     atomicAdd(&stats[47], 1u); // materials read
                     let m_opacity = materials[mid].opacity;
+                    let p = oc_origin + safe_dir * t;
 
                     if m_opacity >= 0.99 {
                         // Opaque hit — finalize result and exit both loops.
@@ -818,14 +767,11 @@ fn march_object(
                         result.normal = cell_normal;
                         result.alpha = 1.0;
                         result.t = t;
-                        result.first_slot = cell;
+                        result.first_slot = c;
                         result.valid = true;
-                        // Cell already passed != BRICK_CELL_EMPTY; it's a
-                        // valid leaf_attr_id (possibly 0), so always read
-                        // the color pool. Inner cp != 0 falls back to gray.
                         var color = vec3<f32>(0.5);
                         atomicAdd(&stats[46], 1u); // color_pool read
-                        let cp = color_pool_data[cell];
+                        let cp = color_pool_data[c];
                         if cp != 0u {
                             color = vec3<f32>(
                                 f32(cp & 0xFFu) / 255.0,
@@ -839,14 +785,16 @@ fn march_object(
                         break;
                     }
 
-                    // Transparent: accumulate.
+                    // Transparent: accumulate with this cell's weight.
+                    // DDA step below advances exactly one cell — each
+                    // cell contributes once per ray traversal.
                     let remaining = 1.0 - result.alpha;
                     let weight = m_opacity * remaining;
                     result.oc_pos += p * weight;
                     result.normal += cell_normal * weight;
                     var color = vec3<f32>(0.5);
                     atomicAdd(&stats[46], 1u);
-                    let cp_t = color_pool_data[cell];
+                    let cp_t = color_pool_data[c];
                     if cp_t != 0u {
                         color = vec3<f32>(
                             f32(cp_t & 0xFFu) / 255.0,
@@ -858,28 +806,25 @@ fn march_object(
                     result.alpha += weight;
                     if !result.valid {
                         result.t = t;
-                        result.first_slot = cell;
+                        result.first_slot = c;
                         result.valid = true;
                     }
-                    // Force a forward step even if cell_size * 0.5 is
-                    // somehow swallowed by float precision.
-                    t = max(t + cell_size * 0.5, t + min_advance);
-                    continue;
                 }
 
-                // Empty cell — DDA to the next cell boundary. Use
-                // current p as the ray origin for the AABB test so
-                // exit_t is unambiguously positive (the previous version
-                // used oc_origin, which was correct in principle but
-                // less defensive against precision wobble).
-                let cell_min_pt = brick_origin
-                    + vec3<f32>(lx, ly, lz) * cell_size;
-                let cell_max_pt = cell_min_pt + vec3<f32>(cell_size);
-                let cell_exit = intersect_aabb(p, inv_dir, cell_min_pt, cell_max_pt).y;
-                // cell_exit is relative to p; absolute t becomes t + cell_exit.
-                let new_t = t + max(cell_exit, 0.0) + min_advance;
-                // Monotonic progress guard.
-                t = max(new_t, t + min_advance);
+                // DDA step to next cell along axis with smallest t_max.
+                if t_max.x < t_max.y && t_max.x < t_max.z {
+                    t = t_max.x + dda_eps;
+                    cell.x += step_i.x;
+                    t_max.x += t_delta.x;
+                } else if t_max.y < t_max.z {
+                    t = t_max.y + dda_eps;
+                    cell.y += step_i.y;
+                    t_max.y += t_delta.y;
+                } else {
+                    t = t_max.z + dda_eps;
+                    cell.z += step_i.z;
+                    t_max.z += t_delta.z;
+                }
             }
             if brick_done { break; }
             continue;

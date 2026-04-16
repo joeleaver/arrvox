@@ -22,7 +22,20 @@ const BRICK_DIM_F: f32 = 4.0;
 const BRICK_CELLS: u32 = 64u;
 const BRICK_CELL_EMPTY: u32 = 0xFFFFFFFFu;
 const BRICK_CELL_INTERIOR: u32 = 0xFFFFFFFDu;
-const BRICK_MAX_STEPS: u32 = 16u;
+// Raised from 16 to 128: the inner DDA now chains across adjacent
+// bricks via brick_face_links, so a single inner loop can traverse
+// many bricks before the outer loop needs to intervene.
+const BRICK_MAX_STEPS: u32 = 4096u;
+
+// Face-link sentinels — must match rkp_core::brick_face_links.
+const FACE_INTERIOR: u32 = 0xFFFFFFFEu;
+const FACE_EMPTY_LINK: u32 = 0xFFFFFFFFu;
+const FACE_NX: u32 = 0u;
+const FACE_PX: u32 = 1u;
+const FACE_NY: u32 = 2u;
+const FACE_PY: u32 = 3u;
+const FACE_NZ: u32 = 4u;
+const FACE_PZ: u32 = 5u;
 
 struct RkpObject {
     world: mat4x4<f32>,
@@ -97,6 +110,9 @@ struct OctreeResult {
 @group(0) @binding(2) var<storage, read> objects: array<RkpObject>;
 @group(0) @binding(3) var<uniform> camera: CameraUniforms;
 @group(0) @binding(4) var<storage, read> color_pool_data: array<u32>;
+// brick_face_links[brick_id * 6 + face] → neighbor brick_id, or one of
+// FACE_EMPTY_LINK / FACE_INTERIOR. See rkp_core::brick_face_links.
+@group(0) @binding(7) var<storage, read> brick_face_links: array<u32>;
 @group(0) @binding(8) var<storage, read> leaf_attr_pool: array<LeafAttr>;
 
 // Group 1: gbuf inputs (full-res, read) + half-res shadow output (write).
@@ -230,10 +246,17 @@ fn trace_shadow_ray(
 
         let t_limit = min(t_range.y, local_max_t);
         var t = max(t_range.x, 0.0);
+        // Tiny forward-bias used only for octree_lookup / skip_node. At
+        // brick-split boundaries `pos.x == center.x` is FP-ambiguous in
+        // `pos >= center`; biasing forward disambiguates toward the cell
+        // the ray is actually entering, eliminating the dashed-seam
+        // pattern caused by rounding into an EMPTY sibling subtree.
+        let lookup_bias = vs * 1.0e-3;
+
         for (var step = 0u; step < max_steps; step++) {
             if t > t_limit { break; }
 
-            let pos = clamp(shadow_origin + safe_dir * t, vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
+            let pos = clamp(shadow_origin + safe_dir * (t + lookup_bias), vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
             let r = octree_lookup(root, max_depth, extent, pos, PHASE_SHADOW);
 
             if r.slot == OCTREE_EMPTY {
@@ -242,48 +265,110 @@ fn trace_shadow_ray(
             }
 
             if slot_is_brick(r.slot) {
-                let brick_id = slot_brick_id(r.slot);
+                var brick_id = slot_brick_id(r.slot);
                 let cell_size = (r.cell_half * 2.0) / BRICK_DIM_F;
                 let inv_cell_size = 1.0 / cell_size;
-                let brick_origin = r.cell_center - vec3<f32>(r.cell_half);
-                let brick_base = brick_id * BRICK_CELLS;
-                let min_advance = cell_size * 1.0e-3;
+                var brick_origin = r.cell_center - vec3<f32>(r.cell_half);
+                var brick_base = brick_id * BRICK_CELLS;
+
+                // Amanatides-Woo 3D DDA with brick_face_links chaining.
+                // On exit through a face, consult the face-link table
+                // instead of re-querying the octree — bypasses the
+                // FP-ambiguity at brick boundaries that produces seams.
+                let p0 = shadow_origin + safe_dir * t;
+                let local0 = (p0 - brick_origin) * inv_cell_size;
+                var cell = clamp(
+                    vec3<i32>(floor(local0)),
+                    vec3<i32>(0),
+                    vec3<i32>(3),
+                );
+                let step_i = vec3<i32>(
+                    select(-1, 1, safe_dir.x >= 0.0),
+                    select(-1, 1, safe_dir.y >= 0.0),
+                    select(-1, 1, safe_dir.z >= 0.0),
+                );
+                let step_gt = vec3<f32>(
+                    select(0.0, 1.0, safe_dir.x >= 0.0),
+                    select(0.0, 1.0, safe_dir.y >= 0.0),
+                    select(0.0, 1.0, safe_dir.z >= 0.0),
+                );
+                let next_b = brick_origin + (vec3<f32>(cell) + step_gt) * cell_size;
+                var t_max = t + (next_b - p0) * inv_dir;
+                let t_delta = abs(vec3<f32>(cell_size) * inv_dir);
+                // Nudge past cell boundaries for FP robustness when we
+                // do fall through to the outer loop (FACE_EMPTY_LINK case).
+                let dda_eps = cell_size * 1.0e-3;
+
                 var blocked = false;
                 for (var bs = 0u; bs < BRICK_MAX_STEPS; bs++) {
                     if t > t_limit { break; }
-                    let p = shadow_origin + safe_dir * t;
-                    let local = (p - brick_origin) * inv_cell_size;
-                    let lx = floor(local.x);
-                    let ly = floor(local.y);
-                    let lz = floor(local.z);
-                    if lx < 0.0 || ly < 0.0 || lz < 0.0
-                        || lx >= BRICK_DIM_F || ly >= BRICK_DIM_F || lz >= BRICK_DIM_F {
-                        break;
+
+                    // Out-of-brick → follow face link to neighbor brick.
+                    if cell.x < 0 || cell.x >= 4
+                        || cell.y < 0 || cell.y >= 4
+                        || cell.z < 0 || cell.z >= 4 {
+                        var face_idx: u32;
+                        if cell.x < 0 { face_idx = FACE_NX; }
+                        else if cell.x >= 4 { face_idx = FACE_PX; }
+                        else if cell.y < 0 { face_idx = FACE_NY; }
+                        else if cell.y >= 4 { face_idx = FACE_PY; }
+                        else if cell.z < 0 { face_idx = FACE_NZ; }
+                        else { face_idx = FACE_PZ; }
+                        let link = brick_face_links[brick_id * 6u + face_idx];
+                        if link == FACE_INTERIOR {
+                            blocked = true;
+                            break;
+                        }
+                        if link == FACE_EMPTY_LINK {
+                            // Fall back to outer loop's skip_node.
+                            break;
+                        }
+                        // Neighbor brick — swap brick state, re-enter at
+                        // the opposite face's cell column. `t_max` and
+                        // `t_delta` are mathematically ray-invariant, but
+                        // FP error from incremental `t_max += t_delta`
+                        // accumulates across long chains. Re-anchor
+                        // `t_max` from the current ray position at every
+                        // face-link crossing — see the matching comment
+                        // in octree_march.wgsl for the full rationale.
+                        brick_id = link;
+                        brick_base = link * BRICK_CELLS;
+                        let brick_extent = BRICK_DIM_F * cell_size;
+                        if face_idx == FACE_NX { cell.x = 3; brick_origin.x -= brick_extent; }
+                        else if face_idx == FACE_PX { cell.x = 0; brick_origin.x += brick_extent; }
+                        else if face_idx == FACE_NY { cell.y = 3; brick_origin.y -= brick_extent; }
+                        else if face_idx == FACE_PY { cell.y = 0; brick_origin.y += brick_extent; }
+                        else if face_idx == FACE_NZ { cell.z = 3; brick_origin.z -= brick_extent; }
+                        else { cell.z = 0; brick_origin.z += brick_extent; }
+                        let p_now = shadow_origin + safe_dir * t;
+                        let next_b = brick_origin + (vec3<f32>(cell) + step_gt) * cell_size;
+                        t_max = t + (next_b - p_now) * inv_dir;
                     }
-                    let cx = u32(lx);
-                    let cy = u32(ly);
-                    let cz = u32(lz);
-                    let flat = cx + cy * BRICK_DIM + cz * BRICK_DIM * BRICK_DIM;
-                    let cell = brick_pool[brick_base + flat];
-                    // BRICK_CELL_INTERIOR is solid-bulk-marker from
-                    // mesh imports; treat as empty for shadow (the
-                    // shell in front casts the shadow).
-                    if cell != BRICK_CELL_EMPTY && cell != BRICK_CELL_INTERIOR {
-                        let attr = leaf_attr_pool[cell];
+
+                    let flat = u32(cell.x) + u32(cell.y) * BRICK_DIM + u32(cell.z) * BRICK_DIM * BRICK_DIM;
+                    let c = brick_pool[brick_base + flat];
+                    if c != BRICK_CELL_EMPTY && c != BRICK_CELL_INTERIOR {
+                        let attr = leaf_attr_pool[c];
                         let mid = leaf_attr_material_primary(attr);
                         let m_op = materials[mid].opacity;
                         if m_op >= 0.99 { blocked = true; break; }
                         transmittance *= (1.0 - m_op);
                         if transmittance < 0.01 { blocked = true; break; }
-                        t = max(t + cell_size * 0.5, t + min_advance);
-                        continue;
                     }
-                    let cell_min_pt = brick_origin
-                        + vec3<f32>(lx, ly, lz) * cell_size;
-                    let cell_max_pt = cell_min_pt + vec3<f32>(cell_size);
-                    let cell_exit = intersect_aabb(p, inv_dir, cell_min_pt, cell_max_pt).y;
-                    let new_t = t + max(cell_exit, 0.0) + min_advance;
-                    t = max(new_t, t + min_advance);
+
+                    if t_max.x < t_max.y && t_max.x < t_max.z {
+                        t = t_max.x + dda_eps;
+                        cell.x += step_i.x;
+                        t_max.x += t_delta.x;
+                    } else if t_max.y < t_max.z {
+                        t = t_max.y + dda_eps;
+                        cell.y += step_i.y;
+                        t_max.y += t_delta.y;
+                    } else {
+                        t = t_max.z + dda_eps;
+                        cell.z += step_i.z;
+                        t_max.z += t_delta.z;
+                    }
                 }
                 if blocked { return 0.0; }
                 continue;

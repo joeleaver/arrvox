@@ -271,6 +271,11 @@ struct EngineState {
     importing_sources: std::collections::HashSet<String>,
     /// Publish `importing_sources` to the UI on the next snapshot.
     importing_dirty: bool,
+    /// Live per-import progress state keyed by source path string —
+    /// reduced from the `ImportEvent` stream each tick, published to
+    /// the UI through `StateUpdate.import_progress`. Entries are
+    /// removed when the matching completion lands.
+    importing_progress: std::collections::HashMap<String, crate::snapshot::ImportProgressInfo>,
     /// Latest editor layout JSON pushed up from the editor. Opaque to
     /// the engine — it just round-trips this through `.rkproject`.
     editor_layout_json: Option<String>,
@@ -506,6 +511,7 @@ impl EngineState {
             available_models: Vec::new(),
             models_dirty: false,
             importing_sources: std::collections::HashSet::new(),
+            importing_progress: std::collections::HashMap::new(),
             importing_dirty: false,
             editor_layout_json: None,
             editor_layout_pending: false,
@@ -2859,6 +2865,56 @@ impl EngineState {
         count
     }
 
+    /// Drain queued `ImportEvent`s from the worker and reduce them
+    /// into `importing_progress`. Called each tick before
+    /// `poll_import_completions` so a completion's final
+    /// `StageEnd` / `Error` event lands in `importing_progress`
+    /// before the entry is removed on completion.
+    fn pump_import_events(&mut self) {
+        use crate::snapshot::ImportProgressInfo;
+        use rkp_import::ImportEvent;
+
+        let events = self.import_worker.poll_events();
+        for tagged in events {
+            let source_key = tagged.source_path.to_string_lossy().into_owned();
+            let entry = self
+                .importing_progress
+                .entry(source_key.clone())
+                .or_insert_with(|| ImportProgressInfo {
+                    source_path: source_key,
+                    ..Default::default()
+                });
+            match tagged.event {
+                ImportEvent::StageStart { stage, message } => {
+                    entry.stage = stage.to_string();
+                    entry.message = message;
+                    entry.done = 0;
+                    entry.total = 0;
+                }
+                ImportEvent::StageProgress { stage, done, total } => {
+                    // Ignore stale progress events from a stage that
+                    // already ended (shouldn't happen given the
+                    // worker is single-threaded, but cheap to guard).
+                    if entry.stage == stage {
+                        entry.done = done;
+                        entry.total = total;
+                    }
+                }
+                ImportEvent::StageEnd { stage } => {
+                    if entry.stage == stage && entry.total > 0 {
+                        entry.done = entry.total;
+                    }
+                }
+                ImportEvent::Warn { message } => {
+                    entry.warnings.push(message);
+                }
+                ImportEvent::Error { message } => {
+                    entry.error = Some(message);
+                }
+            }
+        }
+    }
+
     fn poll_import_completions(&mut self) {
         let completions = self.import_worker.poll_completions();
         for completion in completions {
@@ -2866,6 +2922,7 @@ impl EngineState {
             if self.importing_sources.remove(&source_key) {
                 self.importing_dirty = true;
             }
+            self.importing_progress.remove(&source_key);
             match completion.result {
                 Ok(result) => {
                     let name = completion.source_path.file_stem()
@@ -2873,7 +2930,7 @@ impl EngineState {
                         .unwrap_or_default();
                     self.console.info(format!(
                         "Import complete: {name} ({} voxels)",
-                        result.total_bricks,
+                        result.shell_voxels,
                     ));
                     self.refresh_reimported_asset(&completion.output_path);
                     self.scan_models();
@@ -4612,6 +4669,14 @@ impl EngineState {
         } else {
             None
         };
+        // Send live progress every tick while any import is in flight.
+        // Outside an active import this is `None` so the UI skips
+        // re-rendering the panel.
+        let import_progress = if self.importing_progress.is_empty() {
+            None
+        } else {
+            Some(self.importing_progress.values().cloned().collect())
+        };
         let editor_layout = if self.editor_layout_pending {
             self.editor_layout_pending = false;
             Some(self.editor_layout_json.clone())
@@ -4630,6 +4695,7 @@ impl EngineState {
             project_name,
             available_models: models,
             importing_models: importing,
+            import_progress,
             editor_layout,
             inspector: self.build_inspector_snapshot(),
             recent_projects: if self.frame_index == 1 {
@@ -5118,8 +5184,9 @@ fn tick_loop(
             }
         }
 
-        // 1b. Process file watcher events + import completions + gameplay reload.
+        // 1b. Process file watcher events + import events/completions + gameplay reload.
         state.process_file_events();
+        state.pump_import_events();
         state.poll_import_completions();
         state.check_gameplay_reload();
 

@@ -104,6 +104,24 @@ pub enum RkpFileError {
 /// `normals_data`: optional per-voxel octahedrally-packed normal (u32 each).
 /// `color_data`: optional per-voxel ColorVoxel data (4 bytes per leaf).
 /// `bone_data`: optional per-voxel BoneVoxel data.
+/// Sub-stage labels emitted by [`write_rkp_with_progress`] through its
+/// progress callback. Exposed so `rkp-import` can forward them onto
+/// its own `ImportEvent::StageStart` pipeline with matching
+/// `&'static str` names.
+pub mod write_stage {
+    pub const COMPRESS_OCTREE: &str = "compress_octree";
+    pub const COMPRESS_VOXELS: &str = "compress_voxels";
+    pub const COMPRESS_NORMALS: &str = "compress_normals";
+    pub const COMPRESS_BRICKS: &str = "compress_bricks";
+    pub const COMPRESS_COLORS: &str = "compress_colors";
+    pub const COMPRESS_BONES: &str = "compress_bones";
+    pub const WRITE_FILE: &str = "write_file";
+}
+
+/// Thin wrapper that delegates to [`write_rkp_with_progress`] without
+/// emitting any progress. Kept for callers (including the rkp-core
+/// tests) that don't want progress reporting.
+#[allow(clippy::too_many_arguments)]
 pub fn write_rkp<W: Write + Seek>(
     writer: &mut W,
     octree_nodes: &[u32],
@@ -119,13 +137,75 @@ pub fn write_rkp<W: Write + Seek>(
     color_data: Option<&[u8]>,
     bone_data: Option<&[u8]>,
 ) -> Result<(), RkpFileError> {
+    write_rkp_with_progress(
+        writer,
+        octree_nodes,
+        octree_depth,
+        base_voxel_size,
+        voxel_count,
+        aabb_min,
+        aabb_max,
+        material_ids,
+        voxel_data,
+        normals_data,
+        bricks_data,
+        color_data,
+        bone_data,
+        None,
+    )
+}
+
+/// Like [`write_rkp`] but fires the optional `progress` callback with
+/// [`write_stage`] labels as each LZ4 compression section begins and
+/// again when the final file write starts. Lets callers render a
+/// live per-section progress indicator during large writes (an
+/// elephant-scale voxel bake can spend 30+ seconds here, almost
+/// entirely inside single-threaded LZ4 calls).
+#[allow(clippy::too_many_arguments)]
+pub fn write_rkp_with_progress<W: Write + Seek>(
+    writer: &mut W,
+    octree_nodes: &[u32],
+    octree_depth: u8,
+    base_voxel_size: f32,
+    voxel_count: u32,
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
+    material_ids: &[u16],
+    voxel_data: &[u8],
+    normals_data: Option<&[u8]>,
+    bricks_data: Option<&[u8]>,
+    color_data: Option<&[u8]>,
+    bone_data: Option<&[u8]>,
+    progress: Option<&dyn Fn(&'static str)>,
+) -> Result<(), RkpFileError> {
+    let tick = |label: &'static str| {
+        if let Some(cb) = progress {
+            cb(label);
+        }
+    };
+
+    tick(write_stage::COMPRESS_OCTREE);
     let octree_bytes: &[u8] = bytemuck::cast_slice(octree_nodes);
     let octree_compressed = lz4_flex::compress_prepend_size(octree_bytes);
+    tick(write_stage::COMPRESS_VOXELS);
     let voxel_compressed = lz4_flex::compress_prepend_size(voxel_data);
-    let normals_compressed = normals_data.map(|d| lz4_flex::compress_prepend_size(d));
-    let bricks_compressed = bricks_data.map(|d| lz4_flex::compress_prepend_size(d));
-    let color_compressed = color_data.map(|d| lz4_flex::compress_prepend_size(d));
-    let bone_compressed = bone_data.map(|d| lz4_flex::compress_prepend_size(d));
+    let normals_compressed = normals_data.map(|d| {
+        tick(write_stage::COMPRESS_NORMALS);
+        lz4_flex::compress_prepend_size(d)
+    });
+    let bricks_compressed = bricks_data.map(|d| {
+        tick(write_stage::COMPRESS_BRICKS);
+        lz4_flex::compress_prepend_size(d)
+    });
+    let color_compressed = color_data.map(|d| {
+        tick(write_stage::COMPRESS_COLORS);
+        lz4_flex::compress_prepend_size(d)
+    });
+    let bone_compressed = bone_data.map(|d| {
+        tick(write_stage::COMPRESS_BONES);
+        lz4_flex::compress_prepend_size(d)
+    });
+    tick(write_stage::WRITE_FILE);
 
     let mut flags = 0u32;
     if color_data.is_some()   { flags |= FLAG_HAS_COLOR; }

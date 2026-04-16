@@ -1,4 +1,4 @@
-//! Bake-time Laplacian smoothing of shell-voxel normals.
+//! Laplacian smoothing of shell-voxel normals.
 //!
 //! For each shell voxel (an occupied brick cell carrying a `LeafAttr`),
 //! replace its stored normal with the normalized average of its own
@@ -7,10 +7,23 @@
 //! simply don't contribute.
 //!
 //! Converts render-time binary-centroid reconstruction noise into
-//! bake-time smoothing. Produces the per-voxel normal as a few
-//! iterations of Laplacian relaxation — equivalent to the limit
-//! behavior of naive-surface-nets vertex smoothing, applied to the
-//! normal field rather than the position field.
+//! pre-smoothed normals. Equivalent to the limit behavior of
+//! naive-surface-nets vertex smoothing, applied to the normal field
+//! rather than the position field.
+//!
+//! # Entry points
+//!
+//! * [`smooth_shell_normals_raw`] — operates on the flat buffers
+//!   produced at import time (`file_bricks: &[u32]`,
+//!   `normals_packed: &mut [u32]`). Called by `rkp-import` so the
+//!   `.rkp` file carries pre-smoothed normals.
+//! * [`smooth_shell_normals`] — operates on the runtime
+//!   [`BrickPool`] / [`LeafAttrPool`] pair. Kept for completeness; the
+//!   load-time smoothing pass in the scene manager has been retired in
+//!   favour of the import-time variant above.
+//!
+//! Both entry points share a single generic implementation so the
+//! algorithm lives in one place.
 //!
 //! # Requirements
 //!
@@ -23,9 +36,7 @@
 //!
 //! # Cost
 //!
-//! O(shell_count × iterations × 6) lookups and writes. On an asset
-//! of ~100k shell voxels with 3 iterations → ~1.8M lookups, runs in
-//! milliseconds at bake time.
+//! O(shell_count × iterations × 6) lookups and writes.
 //!
 //! # Non-goals
 //!
@@ -37,36 +48,94 @@ use std::collections::HashMap;
 
 use glam::{UVec3, Vec3};
 
-use crate::brick_pool::{BrickPool, BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR, BRICK_LEVELS};
+use crate::brick_pool::{BrickPool, BRICK_CELLS, BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR, BRICK_LEVELS};
 use crate::leaf_attr::{pack_oct, unpack_oct};
 use crate::leaf_attr_pool::LeafAttrPool;
 use crate::sparse_octree::{brick_id, is_brick, SparseOctree};
 
-/// Run `iterations` passes of Laplacian smoothing over every shell
-/// voxel's stored normal. Returns the number of shell voxels smoothed.
+/// Smooth shell-voxel normals using the import-time flat buffers.
+///
+/// `file_bricks` is the brick-cell array as it's written into the
+/// `.rkp` file (`BRICK_CELLS` u32 cells per brick, contiguous).
+/// `normals_packed` is the octahedrally-packed normals array — one
+/// entry per shell voxel, indexed by the `slot` values stored inside
+/// shell cells.
+///
+/// Mutates `normals_packed` in place and returns the number of shell
+/// voxels smoothed.
+pub fn smooth_shell_normals_raw(
+    octree: &SparseOctree,
+    file_bricks: &[u32],
+    normals_packed: &mut [u32],
+    iterations: u32,
+) -> usize {
+    let cells_per_brick = BRICK_CELLS as usize;
+    let smoothed = {
+        let get_cell = |bid: u32, x: u32, y: u32, z: u32| -> u32 {
+            let base = bid as usize * cells_per_brick;
+            let idx = (x + y * BRICK_DIM + z * BRICK_DIM * BRICK_DIM) as usize;
+            file_bricks[base + idx]
+        };
+        let read_initial = |slot: u32| -> u32 { normals_packed[slot as usize] };
+        smooth_shell_normals_inner(octree, iterations, get_cell, read_initial)
+    };
+    let count = smoothed.len();
+    for (slot, packed) in smoothed {
+        normals_packed[slot as usize] = packed;
+    }
+    count
+}
+
+/// Smooth shell-voxel normals using the runtime pool types.
+/// Provided for API completeness; prefer [`smooth_shell_normals_raw`]
+/// for import-time work so the cost doesn't repeat each asset load.
 pub fn smooth_shell_normals(
     octree: &SparseOctree,
     brick_pool: &BrickPool,
     leaf_attr_pool: &mut LeafAttrPool,
     iterations: u32,
 ) -> usize {
+    let smoothed = {
+        let get_cell = |bid, x, y, z| brick_pool.get_cell(bid, x, y, z);
+        let read_initial = |slot: u32| leaf_attr_pool.get(slot).normal_oct;
+        smooth_shell_normals_inner(octree, iterations, get_cell, read_initial)
+    };
+    let count = smoothed.len();
+    for (slot, packed) in smoothed {
+        leaf_attr_pool.get_mut(slot).normal_oct = packed;
+    }
+    count
+}
+
+/// Storage-agnostic smoother. Enumerates the shell, runs the Laplacian
+/// iterations, and returns `Vec<(slot_id, packed_normal)>` for the
+/// caller to write back however it owns the target buffer. Returning
+/// the pairs (rather than writing via a closure) avoids an `&`/`&mut`
+/// overlap when the read and write closures would both capture the
+/// same buffer.
+fn smooth_shell_normals_inner<GetCell, ReadNormal>(
+    octree: &SparseOctree,
+    iterations: u32,
+    get_cell: GetCell,
+    read_initial: ReadNormal,
+) -> Vec<(u32, u32)>
+where
+    GetCell: Fn(u32, u32, u32, u32) -> u32,
+    ReadNormal: Fn(u32) -> u32,
+{
     if iterations == 0 {
-        return 0;
+        return Vec::new();
     }
 
     // Pass 1: enumerate shell voxels.
     let mut shell: Vec<(UVec3, u32)> = Vec::new();
     let depth = octree.depth();
-    collect_shell_voxels(octree, brick_pool, 0, UVec3::ZERO, 0, depth, &mut shell);
-
+    collect_shell_voxels(octree, &get_cell, 0, UVec3::ZERO, 0, depth, &mut shell);
     if shell.is_empty() {
-        return 0;
+        return Vec::new();
     }
 
     // Pass 2: leaf_attr_id → shell-index map for O(1) neighbor lookup.
-    // Requires each id to map to exactly one shell voxel (1:1 layout).
-    // If we ever call this on a deduped tree we'll silently lose
-    // per-voxel fidelity — debug_assert catches the bug.
     let mut id_to_index: HashMap<u32, usize> = HashMap::with_capacity(shell.len());
     for (i, (_, id)) in shell.iter().enumerate() {
         let prev = id_to_index.insert(*id, i);
@@ -76,10 +145,10 @@ pub fn smooth_shell_normals(
         );
     }
 
-    // Pass 3: double-buffered iteration.
+    // Pass 3: double-buffered Laplacian iterations.
     let mut current: Vec<Vec3> = shell
         .iter()
-        .map(|(_, id)| unpack_oct(leaf_attr_pool.get(*id).normal_oct))
+        .map(|(_, id)| unpack_oct(read_initial(*id)))
         .collect();
     let mut next: Vec<Vec3> = current.clone();
 
@@ -88,7 +157,6 @@ pub fn smooth_shell_normals(
         (0, -1, 0), (0, 1, 0),
         (0, 0, -1), (0, 0, 1),
     ];
-
     let extent = octree.extent() as i64;
 
     for _ in 0..iterations {
@@ -102,7 +170,7 @@ pub fn smooth_shell_normals(
                     continue;
                 }
                 let nc = UVec3::new(nx as u32, ny as u32, nz as u32);
-                if let Some(n) = neighbor_shell_normal(octree, brick_pool, nc, &id_to_index, &current) {
+                if let Some(n) = neighbor_shell_normal(octree, &get_cell, nc, &id_to_index, &current) {
                     sum += n;
                 }
             }
@@ -116,20 +184,16 @@ pub fn smooth_shell_normals(
         std::mem::swap(&mut current, &mut next);
     }
 
-    // Pass 4: write back smoothed normals.
-    for (i, (_, id)) in shell.iter().enumerate() {
-        let attr = leaf_attr_pool.get_mut(*id);
-        attr.normal_oct = pack_oct(current[i]);
-    }
-
-    shell.len()
+    shell
+        .iter()
+        .enumerate()
+        .map(|(i, (_, id))| (*id, pack_oct(current[i])))
+        .collect()
 }
 
-/// Look up the current-iteration normal for the shell voxel at
-/// `coord`, if one exists. O(1) via the id_to_index map.
 fn neighbor_shell_normal(
     octree: &SparseOctree,
-    brick_pool: &BrickPool,
+    get_cell: &impl Fn(u32, u32, u32, u32) -> u32,
     coord: UVec3,
     id_to_index: &HashMap<u32, usize>,
     current: &[Vec3],
@@ -148,7 +212,7 @@ fn neighbor_shell_normal(
         let cx = coord.x & (brick_voxels - 1);
         let cy = coord.y & (brick_voxels - 1);
         let cz = coord.z & (brick_voxels - 1);
-        let cell = brick_pool.get_cell(bid, cx % BRICK_DIM, cy % BRICK_DIM, cz % BRICK_DIM);
+        let cell = get_cell(bid, cx % BRICK_DIM, cy % BRICK_DIM, cz % BRICK_DIM);
         if cell == BRICK_EMPTY || cell == BRICK_INTERIOR {
             return None;
         }
@@ -160,12 +224,9 @@ fn neighbor_shell_normal(
     Some(current[idx])
 }
 
-/// Walk the octree, emit every (voxel_coord, leaf_attr_id) for shell
-/// cells. Shell cells have real leaf_attr_ids (not EMPTY / INTERIOR
-/// sentinels).
 fn collect_shell_voxels(
     octree: &SparseOctree,
-    brick_pool: &BrickPool,
+    get_cell: &impl Fn(u32, u32, u32, u32) -> u32,
     node_idx: usize,
     voxel_coord: UVec3,
     level: u8,
@@ -188,7 +249,7 @@ fn collect_shell_voxels(
         for z in 0..BRICK_DIM {
             for y in 0..BRICK_DIM {
                 for x in 0..BRICK_DIM {
-                    let cell = brick_pool.get_cell(bid, x, y, z);
+                    let cell = get_cell(bid, x, y, z);
                     if cell == BRICK_EMPTY || cell == BRICK_INTERIOR {
                         continue;
                     }
@@ -214,7 +275,7 @@ fn collect_shell_voxels(
         );
         collect_shell_voxels(
             octree,
-            brick_pool,
+            get_cell,
             children_offset + octant as usize,
             child_coord,
             level + 1,
@@ -241,7 +302,6 @@ mod tests {
         let mut bricks = BrickPool::new(4);
         let bid = bricks.allocate().unwrap();
 
-        // Fill the brick with 1:1 leaf_attr ids, same normal everywhere.
         let normal = Vec3::Z;
         for z in 0..BRICK_DIM {
             for y in 0..BRICK_DIM {
@@ -253,10 +313,7 @@ mod tests {
             }
         }
 
-        // Tree with brick_depth=0 (tree depth = BRICK_LEVELS), so the
-        // root node IS the brick. Start from_raw with that single node.
-        let mut octree = SparseOctree::from_raw(&[make_brick(bid)], BRICK_LEVELS, 0.05);
-        let _ = &mut octree;
+        let octree = SparseOctree::from_raw(&[make_brick(bid)], BRICK_LEVELS, 0.05);
         let count = smooth_shell_normals(&octree, &bricks, &mut pool, 3);
 
         assert_eq!(count, (BRICK_DIM * BRICK_DIM * BRICK_DIM) as usize);
@@ -266,6 +323,63 @@ mod tests {
                     let cell = bricks.get_cell(bid, x, y, z);
                     let back = unpack_oct(pool.get(cell).normal_oct);
                     assert!(back.dot(normal) > 0.999, "got {back:?}");
+                }
+            }
+        }
+    }
+
+    /// Same mesh, but now call the raw-buffer entry point directly.
+    /// Verifies the import-time variant produces identical results.
+    #[test]
+    fn raw_entry_point_matches_pool_based() {
+        let normal = Vec3::new(0.6, 0.0, 0.8).normalize();
+
+        // Build parallel representations: pool (runtime) + raw buffers (import).
+        let mut pool = LeafAttrPool::new(512);
+        let mut bricks = BrickPool::new(4);
+        let bid = bricks.allocate().unwrap();
+        let mut file_bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
+        let mut normals_packed: Vec<u32> = Vec::new();
+
+        let mut slot_counter: u32 = 0;
+        for z in 0..BRICK_DIM {
+            for y in 0..BRICK_DIM {
+                for x in 0..BRICK_DIM {
+                    let id = pool.allocate_contiguous_bump(1).unwrap();
+                    *pool.get_mut(id) = LeafAttr::new(normal, 0);
+                    bricks.set_cell(bid, x, y, z, id);
+
+                    // Raw buffers use their own slot numbering — start
+                    // from 0 and assign sequentially.
+                    let raw_slot = slot_counter;
+                    slot_counter += 1;
+                    normals_packed.push(pack_oct(normal));
+                    let cell_flat = (x + y * BRICK_DIM + z * BRICK_DIM * BRICK_DIM) as usize;
+                    file_bricks[cell_flat] = raw_slot;
+                }
+            }
+        }
+
+        // Pool variant.
+        let octree = SparseOctree::from_raw(&[make_brick(bid)], BRICK_LEVELS, 0.05);
+        smooth_shell_normals(&octree, &bricks, &mut pool, 3);
+
+        // Raw variant (note: needs an octree whose bricks reference the
+        // raw-brick's id, which happens to be 0 in both cases).
+        let mut normals_after = normals_packed.clone();
+        smooth_shell_normals_raw(&octree, &file_bricks, &mut normals_after, 3);
+
+        // Results should agree cell-by-cell (compare unpacked normals to
+        // tolerate octahedral rounding).
+        for z in 0..BRICK_DIM {
+            for y in 0..BRICK_DIM {
+                for x in 0..BRICK_DIM {
+                    let cell_flat = (x + y * BRICK_DIM + z * BRICK_DIM * BRICK_DIM) as usize;
+                    let raw_slot = file_bricks[cell_flat] as usize;
+                    let pool_cell = bricks.get_cell(bid, x, y, z);
+                    let pool_n = unpack_oct(pool.get(pool_cell).normal_oct);
+                    let raw_n = unpack_oct(normals_after[raw_slot]);
+                    assert!(pool_n.dot(raw_n) > 0.999, "mismatch at ({x},{y},{z}): pool={pool_n:?} raw={raw_n:?}");
                 }
             }
         }

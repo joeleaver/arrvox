@@ -4818,27 +4818,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rkf-import"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "glam 0.29.3",
- "gltf",
- "image",
- "log",
- "lz4_flex",
- "rayon",
- "rkf-animation",
- "rkf-core",
- "ron",
- "serde",
- "thiserror 2.0.18",
- "tobj",
- "ufbx",
-]
-
-[[package]]
 name = "rkf-macros"
 version = "0.1.0"
 dependencies = [
@@ -4936,17 +4915,8 @@ dependencies = [
 name = "rkp-convert"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "clap",
- "env_logger",
- "glam 0.29.3",
- "half",
- "log",
- "lz4_flex",
- "rayon",
- "rkf-core",
- "rkf-import",
- "rkp-core",
+ "rkp-import",
 ]
 
 [[package]]
@@ -4999,11 +4969,11 @@ dependencies = [
  "notify",
  "rapier3d",
  "rkf-core",
- "rkf-import",
  "rkf-physics",
  "rkf-render",
  "rkf-runtime",
  "rkp-core",
+ "rkp-import",
  "rkp-macros",
  "rkp-procedural",
  "rkp-render",
@@ -5012,6 +4982,24 @@ dependencies = [
  "tempfile",
  "uuid",
  "wgpu 29.0.1",
+]
+
+[[package]]
+name = "rkp-import"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam 0.29.3",
+ "gltf",
+ "image",
+ "rayon",
+ "rkf-animation",
+ "rkf-core",
+ "rkp-core",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tobj",
+ "ufbx",
 ]
 
 [[package]]
@@ -5050,7 +5038,6 @@ dependencies = [
  "rayon",
  "rkf-animation",
  "rkf-core",
- "rkf-import",
  "rkf-render",
  "rkp-core",
  "rkp-procedural",

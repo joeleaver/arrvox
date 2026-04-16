@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rkf_import::pipeline::ImportConfig;
+use rkp_import::ImportConfig;
 use serde::{Deserialize, Serialize};
 
 /// Per-asset import profile — serialized to `.rkimport` JSON sidecar.
@@ -57,19 +57,16 @@ impl Default for ImportProfile {
 }
 
 impl ImportProfile {
-    /// Convert to the rkf-import ImportConfig used by the import pipeline.
+    /// Convert to the rkp-import ImportConfig used by the import pipeline.
     pub fn to_import_config(&self) -> ImportConfig {
         ImportConfig {
             voxel_size: self.voxel_size,
-            lod_levels: 1,
             target_size: self.target_size,
             no_normalize: self.no_normalize,
             material_id_override: None,
             import_colors: self.import_colors,
             rotation_offset: self.rotation_offset,
             scale_override: self.scale_override,
-            pool_size: 65536,
-            verbose: true,
         }
     }
 

@@ -641,19 +641,13 @@ impl RkpSceneManager {
         let dedup_count = tree.node_count();
         tree.morton_reorder();
 
-        // Bake-time Laplacian relaxation of shell-voxel normals.
-        // Converts per-voxel SDF-gradient samples (which alias into
-        // discrete directions at voxel scale) into locally-averaged
-        // smooth normals. Runs once per asset load; each asset's
-        // leaf_attrs are 1:1 with voxels (no dedup), which is the
-        // invariant the smoother requires.
-        let smoothed_count = rkp_core::laplacian_smooth::smooth_shell_normals(
-            &tree, &self.brick_pool, &mut self.leaf_attr_pool, 3,
-        );
-        eprintln!(
-            "[RkpSceneManager]   smoothed {} shell normals (3 Laplacian iterations)",
-            smoothed_count,
-        );
+        // Note: Laplacian shell-normal smoothing used to run here.
+        // It's now performed at asset-bake time inside `rkp-import`'s
+        // `smooth_normals` stage so each asset pays the cost once
+        // instead of on every load. Older `.rkp` files written before
+        // that change will have un-smoothed SDF-gradient normals
+        // (noisier but still correct); re-import to pick up the
+        // pre-smoothed variant.
 
         // Run the prefilter pass on-load so v4 assets (no baked internal
         // attrs) still benefit from the GPU's LOD early-exit. Phase 4
@@ -869,6 +863,3 @@ impl RkpSceneManager {
         }
     }
 }
-
-// `compute_leaf_normal_neighborhood26` used to live here for the legacy
-// v2/v3 LEAF-path fallback; removed with the switch to v4-only loading.

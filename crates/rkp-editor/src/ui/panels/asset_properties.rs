@@ -204,7 +204,6 @@ fn material_fields(
 #[component]
 fn ModelPropertiesSection() -> NodeHandle {
     let store = use_context::<EditorStore>();
-    let cmd_tx: CmdSignal = Signal::new(use_context::<CommandSender>().0);
 
     let model_info = Memo::new(move || {
         let sel_path = store.selected_model.get()?;
@@ -217,43 +216,65 @@ fn ModelPropertiesSection() -> NodeHandle {
         div {
             style: "display:flex;flex-direction:column;height:100%;",
 
-            if let Some(info) = model_info.get() {
-                div {
-                    style: "display:flex;flex-direction:column;gap:0;height:100%;",
-
-                    // Header
-                    div {
-                        style: "display:flex;align-items:center;padding:6px 8px;\
-                                border-bottom:1px solid #333;gap:6px;flex-shrink:0;",
-                        span {
-                            style: "width:20px;height:20px;display:inline-flex;\
-                                    align-items:center;justify-content:center;\
-                                    flex-shrink:0;color:#999;",
-                            {render_tabler_icon(__scope, TablerIcon::Cube, TablerIconStyle::Outline)}
-                        }
-                        div {
-                            style: "flex:1;min-width:0;",
-                            div {
-                                style: "font-size:12px;font-weight:600;color:#ddd;\
-                                        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
-                                {|| model_info.get().map(|m| m.name.clone()).unwrap_or_default()}
-                            }
-                            div {
-                                style: "font-size:10px;color:#666;overflow:hidden;\
-                                        text-overflow:ellipsis;white-space:nowrap;",
-                                {|| model_info.get().map(|m| m.source_path.clone()).unwrap_or_default()}
-                            }
-                        }
-                        div {
-                            style: "font-size:10px;color:#666;flex-shrink:0;",
-                            {format_size(info.size)}
-                        }
-                    }
-
-                    // Import fields
-                    {model_import_fields(__scope, info.source_path.clone(), info.import_profile.clone(), cmd_tx)}
+            // Remount the form on selection change by keying a
+            // single-element `for` loop on the source path. Without
+            // this, `if let Some(info)` keeps the form's inner
+            // Signals alive across selection switches and the form
+            // stays pinned to the first-selected model's values —
+            // same pattern used by `ComponentSection` in
+            // `object_properties.rs` to remount component editors
+            // when the selected entity changes.
+            for info in model_info.get().into_iter() {
+                ModelPropertiesForm {
+                    key: info.source_path.clone(),
+                    info: info,
                 }
             }
+        }
+    }
+}
+
+#[component]
+fn ModelPropertiesForm(info: rkp_engine::ModelInfo) -> NodeHandle {
+    let cmd_tx: CmdSignal = Signal::new(use_context::<CommandSender>().0);
+
+    rsx! {
+        div {
+            style: "display:flex;flex-direction:column;gap:0;height:100%;",
+
+            // Header — fields are the initial values from `info`;
+            // they never stale out because the parent remounts this
+            // whole component on selection change.
+            div {
+                style: "display:flex;align-items:center;padding:6px 8px;\
+                        border-bottom:1px solid #333;gap:6px;flex-shrink:0;",
+                span {
+                    style: "width:20px;height:20px;display:inline-flex;\
+                            align-items:center;justify-content:center;\
+                            flex-shrink:0;color:#999;",
+                    {render_tabler_icon(__scope, TablerIcon::Cube, TablerIconStyle::Outline)}
+                }
+                div {
+                    style: "flex:1;min-width:0;",
+                    div {
+                        style: "font-size:12px;font-weight:600;color:#ddd;\
+                                overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
+                        {info.name.clone()}
+                    }
+                    div {
+                        style: "font-size:10px;color:#666;overflow:hidden;\
+                                text-overflow:ellipsis;white-space:nowrap;",
+                        {info.source_path.clone()}
+                    }
+                }
+                div {
+                    style: "font-size:10px;color:#666;flex-shrink:0;",
+                    {format_size(info.size)}
+                }
+            }
+
+            // Import fields
+            {model_import_fields(__scope, info.source_path.clone(), info.import_profile.clone(), cmd_tx)}
         }
     }
 }
@@ -275,6 +296,18 @@ fn model_import_fields(
     let is_importing = Memo::new(move || {
         let s = src.get();
         store.importing_models.get().iter().any(|p| *p == s)
+    });
+    // Look up the matching live-progress record. Returns None when
+    // no import is in flight for this source (button mode) or when
+    // the import just started and no events have landed yet.
+    let progress = Memo::new(move || {
+        let s = src.get();
+        store
+            .import_progress
+            .get()
+            .iter()
+            .find(|p| p.source_path == s)
+            .cloned()
     });
 
     let display_name = Signal::new(profile.display_name.unwrap_or_default());
@@ -349,19 +382,12 @@ fn model_import_fields(
             {prop_checkbox(__scope, "Import Colors", import_colors, import_cb_bool("import_colors"))}
             {prop_checkbox(__scope, "Keep Original Scale", no_normalize, import_cb_bool("no_normalize"))}
 
-            // Re-import button — replaced by a progress indicator while
-            // the engine is voxelizing this source.
+            // Re-import button — replaced by a live stage + progress
+            // bar while the engine is voxelizing this source.
             div {
                 style: "margin-top:4px;",
                 if is_importing.get() {
-                    div {
-                        style: "display:flex;align-items:center;justify-content:center;\
-                                gap:8px;padding:6px 12px;background:#2d2d2d;\
-                                border:1px solid #3c3c3c;border-radius:4px;\
-                                color:#bbb;font-size:11px;",
-                        Loader { r#type: "oval", size: "xs", color: "blue" }
-                        {"Importing…"}
-                    }
+                    {render_import_progress(__scope, progress)}
                 } else {
                     {prop_button(__scope, "Re-import", "#2d5a2d", Rc::new(move || {
                         let _ = cmd_tx.get().send(rkp_engine::EngineCommand::ReimportModel {
@@ -369,6 +395,69 @@ fn model_import_fields(
                         });
                     }))}
                 }
+            }
+        }
+    }
+}
+
+/// Render the live import progress indicator: spinner + stage
+/// message + a filled bar when the stage reports a `done/total`.
+/// Falls back to an indeterminate spinner when the stage is running
+/// but total isn't known (e.g. during `load_mesh`).
+fn render_import_progress(
+    __scope: &mut rinch::core::dom::RenderScope,
+    progress: Memo<Option<rkp_engine::snapshot::ImportProgressInfo>>,
+) -> rinch::core::dom::NodeHandle {
+    let p = progress.get();
+    let message = p
+        .as_ref()
+        .map(|p| p.message.clone())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "Starting…".into());
+    let (done, total) = p.as_ref().map(|p| (p.done, p.total)).unwrap_or((0, 0));
+    let warn_count = p.as_ref().map(|p| p.warnings.len()).unwrap_or(0);
+
+    let pct = if total > 0 {
+        (done as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    let bar_style = format!(
+        "height:100%;width:{pct:.1}%;background:#4a90e2;transition:width 120ms ease-out;"
+    );
+    let bar_outer_style = if total > 0 {
+        "width:100%;height:4px;background:#1e1e1e;border-radius:2px;overflow:hidden;".to_string()
+    } else {
+        "display:none;".to_string()
+    };
+    let warn_style = if warn_count > 0 {
+        "color:#e2a04a;font-size:10px;".to_string()
+    } else {
+        "display:none;".to_string()
+    };
+    let warn_text = if warn_count > 0 {
+        format!("{warn_count} warning{}", if warn_count == 1 { "" } else { "s" })
+    } else {
+        String::new()
+    };
+
+    rsx! {
+        div {
+            style: "display:flex;flex-direction:column;gap:4px;padding:6px 12px;\
+                    background:#2d2d2d;border:1px solid #3c3c3c;border-radius:4px;\
+                    color:#bbb;font-size:11px;",
+            div {
+                style: "display:flex;align-items:center;gap:8px;",
+                Loader { r#type: "oval", size: "xs", color: "blue" }
+                {message}
+            }
+            div {
+                style: bar_outer_style,
+                div { style: bar_style }
+            }
+            div {
+                style: warn_style,
+                {warn_text}
             }
         }
     }

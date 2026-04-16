@@ -10,7 +10,6 @@ rkp-core = { workspace = true }
 rkp-procedural = { workspace = true }
 rkf-core = { workspace = true }
 rkf-render = { workspace = true }
-rkf-import = { workspace = true }
 rkf-animation = { workspace = true }
 wgpu = { workspace = true }
 glam = { workspace = true }
