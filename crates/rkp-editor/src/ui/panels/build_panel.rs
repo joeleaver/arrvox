@@ -110,11 +110,18 @@ fn render_tree(
     selected_node: Memo<Option<u32>>,
     cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
 ) -> Node {
-    let root_id = Memo::new(move || snapshot.get().root);
+    // Wrap the root id in a single-element Vec memo so the `for` loop
+    // reactively re-renders whenever the snapshot's root changes —
+    // auto-promotion (wrap_in_union) moves the root to a new NodeId,
+    // and a bare `root_id.get()` in rsx! would not refresh on that
+    // change (same pattern as the children loop below).
+    let root_ids = Memo::new(move || vec![snapshot.get().root]);
 
     rsx! {
         div {
-            {render_tree_node(__scope, snapshot, root_id.get(), 0, selected_node, cmd_tx)}
+            for id in root_ids.get() {
+                {render_tree_node(__scope, snapshot, id, 0, selected_node, cmd_tx)}
+            }
         }
     }
 }
@@ -145,6 +152,8 @@ fn render_tree_node(
     });
     let has_children = Memo::new(move || !children.get().is_empty());
     let is_leaf = Memo::new(move || node_info.get().map(|n| n.is_leaf).unwrap_or(true));
+    let is_root_here = Memo::new(move || node_info.get().map(|n| n.is_root).unwrap_or(false));
+    let node_kind = Memo::new(move || node_info.get().map(|n| n.kind).unwrap_or(ProceduralNodeKind::Union));
 
     rsx! {
         div {
@@ -196,9 +205,12 @@ fn render_tree_node(
                     {|| name.get()}
                 }
 
-                // Add child button (only for combinators) — opens a shape picker.
-                if !is_leaf.get() {
-                    {render_add_child_menu(__scope, node_id, cmd_tx)}
+                // Add child button. Combinators always show it; a leaf
+                // root also shows it — clicking promotes the leaf into
+                // a new Union (engine-side auto-promote) so you can
+                // attach siblings without manually wrapping first.
+                if !is_leaf.get() || is_root_here.get() {
+                    {render_add_child_menu(__scope, node_id, node_kind.get(), cmd_tx)}
                 }
             }
 
@@ -395,12 +407,22 @@ fn render_param_field(
 
 /// Renders the "+" button on combinator rows, opening a popover with a
 /// shape/combinator picker. Selected kind is sent as AddProceduralNode.
+///
+/// `parent_kind` gates context-sensitive entries: `Plane` is an infinite
+/// half-space, only useful as a cutter inside Intersect/Subtract — it's
+/// hidden from Union children and from leaf roots (which auto-promote
+/// to Union on add).
 fn render_add_child_menu(
     __scope: &mut Scope,
     parent_id: u32,
+    parent_kind: ProceduralNodeKind,
     cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
 ) -> Node {
     let opened = Signal::new(false);
+    let allow_plane = matches!(
+        parent_kind,
+        ProceduralNodeKind::Intersect | ProceduralNodeKind::Subtract
+    );
 
     rsx! {
         div {
@@ -410,7 +432,12 @@ fn render_add_child_menu(
 
             Popover {
                 opened: {move || opened.get()},
-                position: "bottom",
+                // bottom_end anchors the dropdown's right edge to the +
+                // button's right edge so the menu grows leftward. The
+                // + sits at the row's right margin; anchoring "bottom"
+                // (centered) pushes the menu past the panel edge and
+                // clips it.
+                position: "bottom_end",
                 PopoverTarget {
                     span {
                         style: "color:#666;cursor:pointer;font-size:14px;padding:0 4px;\
@@ -425,7 +452,9 @@ fn render_add_child_menu(
                     {add_menu_item(__scope, "Capsule", TablerIcon::Capsule, parent_id, opened, cmd_tx)}
                     {add_menu_item(__scope, "Cylinder", TablerIcon::Cylinder, parent_id, opened, cmd_tx)}
                     {add_menu_item(__scope, "Torus", TablerIcon::CircleDotted, parent_id, opened, cmd_tx)}
-                    {add_menu_item(__scope, "Plane", TablerIcon::LayoutBoard, parent_id, opened, cmd_tx)}
+                    if allow_plane {
+                        {add_menu_item(__scope, "Plane", TablerIcon::LayoutBoard, parent_id, opened, cmd_tx)}
+                    }
                     {add_menu_item(__scope, "Ramp", TablerIcon::Triangle, parent_id, opened, cmd_tx)}
                     DropdownMenuDivider {}
                     {add_menu_item(__scope, "Union", TablerIcon::CirclePlus, parent_id, opened, cmd_tx)}

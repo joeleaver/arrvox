@@ -223,13 +223,13 @@ impl ProceduralGeometry {
     /// Create a default procedural object: a union root with one sphere child.
     pub fn default_sphere() -> Self {
         use rkp_procedural::*;
-        let mut tree = ProceduralObject::new(NodeKind::Union {
-            material_combine: MaterialCombine::Winner,
-        });
-        tree.add_child(
-            tree.root(),
-            NodeKind::Sphere(rkp_procedural::node_kind::SphereParams::default()),
-        );
+        // Single-shape default: the root IS the sphere. When the user
+        // adds a second shape, the AddProceduralNode handler auto-
+        // promotes this leaf root to a Union with the old sphere +
+        // the new node as siblings.
+        let tree = ProceduralObject::new(NodeKind::Sphere(
+            rkp_procedural::node_kind::SphereParams::default(),
+        ));
         Self {
             tree,
             voxel_size: 0.02,

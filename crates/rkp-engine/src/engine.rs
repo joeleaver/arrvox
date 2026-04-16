@@ -1313,7 +1313,21 @@ impl EngineState {
                     if let Ok(mut proc_geo) = self.world.get::<&mut crate::components::ProceduralGeometry>(entity) {
                         let parent = rkp_procedural::NodeId(parent_node_id);
                         let node_kind = parse_node_kind(&kind);
-                        let new_id = proc_geo.tree.add_child(parent, node_kind);
+                        // Leaves can't have children. Auto-promote: wrap
+                        // the leaf in a new Union, then add the new node
+                        // as a sibling. Matches the "add a second shape
+                        // to a lone-sphere procedural" flow.
+                        let parent_is_leaf = proc_geo
+                            .tree
+                            .get(parent)
+                            .map(|n| n.kind.is_leaf())
+                            .unwrap_or(false);
+                        let effective_parent = if parent_is_leaf {
+                            proc_geo.tree.wrap_in_union(parent)
+                        } else {
+                            parent
+                        };
+                        let new_id = proc_geo.tree.add_child(effective_parent, node_kind);
                         proc_geo.dirty = true;
                         self.selected_procedural_node = Some(new_id.0);
                     }

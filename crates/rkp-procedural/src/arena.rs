@@ -119,6 +119,72 @@ impl ProceduralObject {
         id
     }
 
+    /// Insert a new `Union` parent between `id` and its current parent.
+    ///
+    /// - If `id` is the root, the new Union takes over the root slot and
+    ///   `id` becomes its only child.
+    /// - Otherwise, the new Union is inserted at `id`'s position in its
+    ///   parent's children list, and `id` is reparented under the Union.
+    ///
+    /// Returns the new Union's `NodeId`. Versions propagate so any
+    /// cached subtree_version above the insertion point invalidates.
+    ///
+    /// Used by the editor to "add a sibling" to a leaf — promote the
+    /// leaf to a Union child, then append the requested new node as a
+    /// second Union child.
+    pub fn wrap_in_union(&mut self, id: NodeId) -> NodeId {
+        use crate::node_kind::MaterialCombine;
+
+        // Build the new Union node.
+        let union_id = NodeId(self.nodes.len() as u32);
+        let mut union_node = Node::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        union_node.own_version = self.next_version;
+        union_node.subtree_version = self.next_version;
+        self.next_version += 1;
+
+        // Find the existing node's parent (if any) and index under it.
+        let old_parent = self.nodes[id.0 as usize]
+            .as_ref()
+            .expect("node must exist to wrap")
+            .parent;
+
+        // Place the Union node into the arena first so NodeId is stable.
+        union_node.parent = old_parent;
+        union_node.children.push(id);
+        self.nodes.push(Some(union_node));
+
+        // Reparent id under the new Union.
+        self.nodes[id.0 as usize]
+            .as_mut()
+            .expect("node must exist after push")
+            .parent = Some(union_id);
+
+        match old_parent {
+            None => {
+                // id was the root — Union becomes the new root.
+                self.root = union_id;
+            }
+            Some(p) => {
+                // Swap id → union_id in the old parent's children vec.
+                let parent_children = &mut self.nodes[p.0 as usize]
+                    .as_mut()
+                    .expect("old parent must exist")
+                    .children;
+                for c in parent_children.iter_mut() {
+                    if *c == id {
+                        *c = union_id;
+                        break;
+                    }
+                }
+                self.propagate_version(p);
+            }
+        }
+
+        union_id
+    }
+
     /// Remove a node and its entire subtree. Cannot remove the root.
     ///
     /// Returns `true` if the node was removed, `false` if it was the root or didn't exist.
