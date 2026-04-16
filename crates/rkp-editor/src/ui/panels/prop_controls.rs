@@ -474,7 +474,22 @@ pub fn prop_color(
     on_change: Rc<dyn Fn([f32; 4])>,
 ) -> Node {
     let label = label.to_string();
-    let initial_hex = rgba_to_hex(value.get());
+    // One-shot seed read, untracked so the caller's render effect
+    // doesn't subscribe to `value` (a subscription turns `value.set`
+    // inside onchange into a synchronous parent re-render, re-entering
+    // an in-flight effect at rinch effect.rs:144 → RefCell panic).
+    //
+    // NOTE: deliberately not using `value_fn` here. ColorInput's
+    // internal binding effect (color_input.rs:221 on `main`) races
+    // with the user-edit onchange and clobbers the new value before
+    // external state can propagate — see rinch issue
+    // https://github.com/joeleaver/rinch/issues/22. The caller's
+    // `value` Signal is effectively a write-only bridge anyway (no
+    // one in the editor mutates it externally after mount; fresh
+    // engine snapshots remount the param field with a new Signal),
+    // so losing reactive external → picker sync doesn't affect us.
+    // Revisit this once the rinch fix lands.
+    let initial_hex = untracked(|| rgba_to_hex(value.get()));
 
     rsx! {
         div {
@@ -487,12 +502,14 @@ pub fn prop_color(
                     format: "hex",
                     alpha: false,
                     onchange: move |v: String| {
-                        // ColorPicker invokes onchange from inside its own
-                        // reactive effect, so any signal reads here would
-                        // attach that effect as a subscriber. When we then
-                        // value.set(rgba), the coord effect would be
-                        // re-queued while still borrowed → RefCell panic.
-                        // Run the whole callback untracked to sever that.
+                        // Whole body runs untracked. ColorPicker invokes
+                        // onchange from inside its own "coordinating"
+                        // effect (color_picker.rs:365), so any naked
+                        // `value.get()` here — including the guard
+                        // below — would subscribe *that* effect to our
+                        // Signal. `value.set(rgba)` a few lines later
+                        // would then notify and re-enter the still-
+                        // borrowed coordinating effect at effect.rs:144.
                         untracked(|| {
                             if let Some(rgba) = hex_to_rgba(&v) {
                                 if rgba_to_hex(rgba) == rgba_to_hex(value.get()) {
