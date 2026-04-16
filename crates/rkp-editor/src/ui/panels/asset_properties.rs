@@ -276,8 +276,10 @@ fn ModelPropertiesForm(info: rkp_engine::ModelInfo) -> NodeHandle {
                     }
                 }
                 div {
-                    style: "font-size:10px;color:#666;flex-shrink:0;",
-                    {format_size(info.size)}
+                    style: "font-size:10px;color:#666;flex-shrink:0;\
+                            display:flex;flex-direction:column;align-items:flex-end;",
+                    div { {format_size(info.size)} }
+                    div { {format_voxel_count(info.voxel_count)} }
                 }
             }
 
@@ -532,5 +534,21 @@ fn format_size(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// Pretty-print a shell voxel count for the model header. Zero
+/// renders as a blank string so legacy `.rkp` files whose header
+/// couldn't be read don't display "0 voxels".
+fn format_voxel_count(count: u32) -> String {
+    if count == 0 {
+        return String::new();
+    }
+    if count < 1_000 {
+        format!("{count} voxels")
+    } else if count < 1_000_000 {
+        format!("{:.1}K voxels", count as f64 / 1_000.0)
+    } else {
+        format!("{:.2}M voxels", count as f64 / 1_000_000.0)
     }
 }

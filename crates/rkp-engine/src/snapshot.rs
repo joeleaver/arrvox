@@ -113,6 +113,10 @@ pub struct ModelInfo {
     pub source_path: String,
     /// File size in bytes.
     pub size: u64,
+    /// Total shell voxel count read from the .rkp header. Displayed
+    /// in the Asset Properties panel so users can judge LOD / storage
+    /// tradeoffs at a glance. Zero if the header couldn't be read.
+    pub voxel_count: u32,
     /// Import profile (for editing in Asset Properties).
     pub import_profile: Option<crate::import_profile::ImportProfile>,
 }

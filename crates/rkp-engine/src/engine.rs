@@ -2664,6 +2664,12 @@ impl EngineState {
                             .unwrap_or_default()
                     });
 
+                // Read just the header to surface the voxel count in
+                // the Asset Properties panel. Header is the first
+                // bytes of the file — one small seek per asset during
+                // the scan, negligible vs the full .rkp load.
+                let voxel_count = read_rkp_voxel_count(&path).unwrap_or(0);
+
                 out.push(crate::snapshot::ModelInfo {
                     name,
                     path: rkp_path,
@@ -2671,6 +2677,7 @@ impl EngineState {
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default(),
                     size,
+                    voxel_count,
                     import_profile: profile,
                 });
             }
@@ -3864,4 +3871,15 @@ fn aabb_in_frustum(planes: &[glam::Vec4; 6], center: glam::Vec3, half: glam::Vec
         }
     }
     true
+}
+
+/// Read just the voxel count from a `.rkp` header. Opens the file,
+/// parses the header (cheap — header carries `voxel_count` directly
+/// near the start), then drops the reader. None on any I/O or format
+/// error; callers fall back to 0 (unknown).
+fn read_rkp_voxel_count(path: &std::path::Path) -> Option<u32> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let header = rkp_core::asset_file::read_rkp_header(&mut reader).ok()?;
+    Some(header.voxel_count)
 }
