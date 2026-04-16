@@ -1466,6 +1466,30 @@ impl EngineState {
                 }
             }
 
+            EngineCommand::BakeProceduralEntity { entity_id } => {
+                let entity = self
+                    .entity_uuids
+                    .iter()
+                    .find_map(|(e, u)| (*u == entity_id).then_some(*e));
+                if let Some(entity) = entity {
+                    self.bake_procedural_entity(entity);
+                }
+            }
+
+            EngineCommand::BakeAllDirtyProcedurals => {
+                use crate::components::*;
+                let dirty: Vec<hecs::Entity> = self
+                    .world
+                    .query::<&ProceduralGeometry>()
+                    .iter()
+                    .filter(|(_, p)| p.dirty)
+                    .map(|(e, _)| e)
+                    .collect();
+                for entity in dirty {
+                    self.bake_procedural_entity(entity);
+                }
+            }
+
             EngineCommand::SpawnPointLight => {
                 use crate::components::*;
                 let name = self.unique_name("Point Light");
@@ -2770,111 +2794,135 @@ impl EngineState {
 
     /// Rebuild GPU objects from the hecs world.
     /// Re-voxelize any procedural objects that are dirty or whose entity scale changed.
+    /// Per-tick procedural maintenance. Does *not* consume the `dirty`
+    /// flag for edits — that happens only via explicit `BakeProceduralEntity`
+    /// / `BakeAllDirtyProcedurals` commands. The loop here only bakes
+    /// entities that have never been baked (spatial == None) so a freshly
+    /// spawned procedural isn't invisible, and entities whose transform
+    /// scale has changed (scale is not tracked through the tree, so it
+    /// effectively invalidates the whole bake — treated like an initial
+    /// bake). Interactive param edits mark dirty but sit until the user
+    /// clicks "Bake."
     fn update_dirty_procedurals(&mut self) {
         use crate::components::*;
 
-        // Collect entities that need re-evaluation. We can't mutate world + scene_mgr
-        // simultaneously in the query, so collect first.
-        let mut to_update: Vec<(hecs::Entity, u32)> = Vec::new();
+        let mut to_update: Vec<hecs::Entity> = Vec::new();
 
-        for (entity, (transform, proc_geo)) in self
+        for (entity, (transform, renderable, proc_geo)) in self
             .world
-            .query::<(&Transform, &ProceduralGeometry)>()
+            .query::<(&Transform, &Renderable, &ProceduralGeometry)>()
             .iter()
         {
-            let scale_changed = (transform.scale - proc_geo.last_evaluated_scale).length() > 1e-5;
-            if proc_geo.dirty || scale_changed {
-                let scene_id = self.entity_scene_ids.get(&entity).copied().unwrap_or(0);
-                to_update.push((entity, scene_id));
+            let scale_changed =
+                (transform.scale - proc_geo.last_evaluated_scale).length() > 1e-5;
+            let needs_initial_bake = renderable.spatial.is_none() && proc_geo.dirty;
+            if scale_changed || needs_initial_bake {
+                to_update.push(entity);
             }
         }
 
-        for (entity, scene_id) in to_update {
-            let t_entity_start = std::time::Instant::now();
-            // Read the procedural tree, voxel size, and current scale.
-            let (tree_clone, base_voxel_size, scale) = {
-                let proc_geo = self.world.get::<&ProceduralGeometry>(entity).unwrap();
-                let transform = self.world.get::<&Transform>(entity).unwrap();
-                (proc_geo.tree.clone(), proc_geo.voxel_size, transform.scale)
-            };
-            let tree_node_count = tree_clone.node_count();
+        for entity in to_update {
+            self.bake_procedural_entity(entity);
+        }
+    }
 
-            // Free previous geometry allocation (if any) before re-voxelizing.
-            // Without this, every re-voxelization leaks voxel slots and octree
-            // entries until the pool is exhausted.
-            let prev_spatial = self
-                .world
-                .get::<&Renderable>(entity)
-                .ok()
-                .and_then(|r| r.spatial.clone());
-            if let Some(prev) = prev_spatial {
-                let handle = rkp_core::OctreeHandle {
-                    root_offset: prev.root_offset,
-                    len: prev.len,
-                    depth: prev.depth,
-                    base_voxel_size: prev.base_voxel_size,
-                };
-                self.scene_mgr.deallocate_geometry(
-                    &handle, prev.voxel_slot_start, prev.voxel_slot_count, &prev.brick_ids,
-                );
+    /// Voxelize one procedural entity right now. Callers: the per-tick
+    /// initial-bake/scale-change loop in `update_dirty_procedurals`, and
+    /// the `BakeProceduralEntity` command handler. Always runs — does not
+    /// consult the `dirty` flag itself; the caller is responsible for
+    /// deciding whether to invoke.
+    fn bake_procedural_entity(&mut self, entity: hecs::Entity) {
+        use crate::components::*;
+
+        let scene_id = self.entity_scene_ids.get(&entity).copied().unwrap_or(0);
+        let t_entity_start = std::time::Instant::now();
+
+        let (tree_clone, base_voxel_size, scale) = {
+            let Ok(proc_geo) = self.world.get::<&ProceduralGeometry>(entity) else {
+                return;
+            };
+            let Ok(transform) = self.world.get::<&Transform>(entity) else {
+                return;
+            };
+            (proc_geo.tree.clone(), proc_geo.voxel_size, transform.scale)
+        };
+        let tree_node_count = tree_clone.node_count();
+
+        // Free previous geometry allocation (if any) before re-voxelizing.
+        // Without this, every re-voxelization leaks voxel slots and octree
+        // entries until the pool is exhausted.
+        let prev_spatial = self
+            .world
+            .get::<&Renderable>(entity)
+            .ok()
+            .and_then(|r| r.spatial.clone());
+        if let Some(prev) = prev_spatial {
+            let handle = rkp_core::OctreeHandle {
+                root_offset: prev.root_offset,
+                len: prev.len,
+                depth: prev.depth,
+                base_voxel_size: prev.base_voxel_size,
+            };
+            self.scene_mgr.deallocate_geometry(
+                &handle, prev.voxel_slot_start, prev.voxel_slot_count, &prev.brick_ids,
+            );
+        }
+        let t_after_dealloc = t_entity_start.elapsed();
+
+        let (aabb, voxel_size) = procedural_voxel_params(&tree_clone, base_voxel_size);
+        // Precompute per-node world-space AABBs once per bake; the sdf_fn
+        // closure consults this to skip Union children whose AABB is
+        // farther than the running-min distance at a sample point.
+        let aabb_cache = rkp_procedural::compute_all_bounds(&tree_clone);
+        let sdf_fn = |pos: glam::Vec3| -> (f32, u16) {
+            let sample = rkp_procedural::sample_tree_cached(
+                &tree_clone, pos, voxel_size, &aabb_cache,
+            );
+            (sample.distance, sample.material_id)
+        };
+        let t_after_bounds = t_entity_start.elapsed();
+
+        let vx_result = self.scene_mgr.voxelize_sdf_fn(
+            sdf_fn, &aabb, voxel_size, scene_id,
+        );
+        let t_total = t_entity_start.elapsed();
+        let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
+        eprintln!(
+            "[proc_bake] tree_nodes={} dealloc={:.2}ms bounds={:.2}ms voxelize_sdf_fn={:.2}ms total={:.2}ms",
+            tree_node_count,
+            ms(t_after_dealloc),
+            ms(t_after_bounds - t_after_dealloc),
+            ms(t_total - t_after_bounds),
+            ms(t_total),
+        );
+
+        match vx_result {
+            Some(result) => {
+                let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.grid_origin, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
+
+                if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
+                    renderable.voxel_count = result.voxel_count;
+                    renderable.spatial = Some(spatial);
+                }
+                if let Ok(mut proc_geo) = self.world.get::<&mut ProceduralGeometry>(entity) {
+                    proc_geo.dirty = false;
+                    proc_geo.last_evaluated_scale = scale;
+                }
+
+                self.geometry_dirty = true;
+                self.gpu_objects_dirty = true;
             }
-            let t_after_dealloc = t_entity_start.elapsed();
-
-            let (aabb, voxel_size) = procedural_voxel_params(&tree_clone, base_voxel_size);
-            // Precompute per-node world-space AABBs once per bake; the sdf_fn
-            // closure consults this to skip Union children whose AABB is
-            // farther than the running-min distance at a sample point.
-            let aabb_cache = rkp_procedural::compute_all_bounds(&tree_clone);
-            let sdf_fn = |pos: glam::Vec3| -> (f32, u16) {
-                let sample = rkp_procedural::sample_tree_cached(
-                    &tree_clone, pos, voxel_size, &aabb_cache,
-                );
-                (sample.distance, sample.material_id)
-            };
-            let t_after_bounds = t_entity_start.elapsed();
-
-            let vx_result = self.scene_mgr.voxelize_sdf_fn(
-                sdf_fn, &aabb, voxel_size, scene_id,
-            );
-            let t_total = t_entity_start.elapsed();
-            let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
-            eprintln!(
-                "[proc_bake] tree_nodes={} dealloc={:.2}ms bounds={:.2}ms voxelize_sdf_fn={:.2}ms total={:.2}ms",
-                tree_node_count,
-                ms(t_after_dealloc),
-                ms(t_after_bounds - t_after_dealloc),
-                ms(t_total - t_after_bounds),
-                ms(t_total),
-            );
-
-            match vx_result {
-                Some(result) => {
-                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.grid_origin, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
-
-                    if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
-                        renderable.voxel_count = result.voxel_count;
-                        renderable.spatial = Some(spatial);
-                    }
-                    if let Ok(mut proc_geo) = self.world.get::<&mut ProceduralGeometry>(entity) {
-                        proc_geo.dirty = false;
-                        proc_geo.last_evaluated_scale = scale;
-                    }
-
-                    self.geometry_dirty = true;
-                    self.gpu_objects_dirty = true;
+            None => {
+                // Voxelization failed (pool full, empty result, etc.).
+                // Clear dirty to avoid retrying every frame.
+                if let Ok(mut proc_geo) = self.world.get::<&mut ProceduralGeometry>(entity) {
+                    proc_geo.dirty = false;
                 }
-                None => {
-                    // Voxelization failed (pool full, empty result, etc.).
-                    // Clear dirty to avoid retrying every frame.
-                    if let Ok(mut proc_geo) = self.world.get::<&mut ProceduralGeometry>(entity) {
-                        proc_geo.dirty = false;
-                    }
-                    self.console.warn(format!(
-                        "Procedural voxelization failed. \
-                         Voxel size: {voxel_size:.4}, AABB extent: {:.1}",
-                        (aabb.max - aabb.min).length()
-                    ));
-                }
+                self.console.warn(format!(
+                    "Procedural voxelization failed. \
+                     Voxel size: {voxel_size:.4}, AABB extent: {:.1}",
+                    (aabb.max - aabb.min).length()
+                ));
             }
         }
     }

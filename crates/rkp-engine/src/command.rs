@@ -127,6 +127,19 @@ pub enum EngineCommand {
         value: String,
     },
 
+    /// Voxelize the given procedural entity now, regardless of the
+    /// auto-bake policy. Called by the "Bake" action in the build panel
+    /// (or any other explicit request). Interactive edits mark the tree
+    /// dirty but do not themselves trigger a bake — the user decides when
+    /// to pay the voxelization cost.
+    BakeProceduralEntity {
+        entity_id: Uuid,
+    },
+
+    /// Voxelize every procedural entity whose tree is currently dirty.
+    /// Convenience for "bake everything I've changed."
+    BakeAllDirtyProcedurals,
+
     // ── Transforms ───────────────────────────────────────────────────
 
     /// Set an object's local position.

@@ -51,6 +51,8 @@ fn build_content(__scope: &mut Scope, store: EditorStore) -> Node {
     rsx! {
         div {
             style: "display:flex;flex-direction:column;height:100%;",
+            // ── Bake action ───────────────────────────────────────────
+            {render_bake_action(__scope, snapshot, cmd_tx)}
             // ── Resolution ────────────────────────────────────────────
             {render_resolution(__scope, snapshot, cmd_tx)}
             // ── Node tree ─────────────────────────────────────────────
@@ -63,6 +65,54 @@ fn build_content(__scope: &mut Scope, store: EditorStore) -> Node {
             div {
                 style: "flex:1;min-height:0;overflow-y:auto;padding:4px 8px;",
                 {render_params(__scope, snapshot, selected_node, cmd_tx)}
+            }
+        }
+    }
+}
+
+/// Bake button + dirty indicator. Interactive edits mark the tree dirty
+/// but don't rebake — the user clicks this to pay the voxelization cost
+/// on demand. The button highlights when there are unbaked changes.
+fn render_bake_action(
+    __scope: &mut Scope,
+    snapshot: Memo<ProceduralSnapshot>,
+    cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
+) -> Node {
+    let dirty = Memo::new(move || snapshot.get().dirty);
+    let entity_id = Memo::new(move || snapshot.get().entity_id);
+
+    let on_click = move || {
+        let _ = cmd_tx.get().send(rkp_engine::EngineCommand::BakeProceduralEntity {
+            entity_id: entity_id.get(),
+        });
+    };
+
+    rsx! {
+        div {
+            style: "display:flex;align-items:center;gap:8px;padding:6px 8px;\
+                    border-bottom:1px solid #333;",
+            button {
+                // Highlighted blue when dirty, neutral gray when clean. Clicking
+                // when clean is a no-op cost-wise (full rebake runs anyway) so
+                // don't disable — just de-emphasize.
+                style: {move || if dirty.get() {
+                    "flex:1;padding:6px 10px;background:#2a4e7a;color:#fff;\
+                     border:1px solid #3a6ea6;border-radius:3px;cursor:pointer;\
+                     font-weight:600;"
+                } else {
+                    "flex:1;padding:6px 10px;background:#2a2a2a;color:#888;\
+                     border:1px solid #444;border-radius:3px;cursor:pointer;"
+                }},
+                onclick: on_click,
+                "Bake"
+            }
+            span {
+                style: {move || if dirty.get() {
+                    "color:#f0a04b;font-size:11px;"
+                } else {
+                    "color:#666;font-size:11px;"
+                }},
+                {move || if dirty.get() { "unbaked changes" } else { "up to date" }}
             }
         }
     }

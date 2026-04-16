@@ -19,6 +19,9 @@ pub struct ProceduralSnapshot {
     pub selected_node: Option<u32>,
     /// Render voxel size.
     pub voxel_size: f32,
+    /// Tree has been edited since the last voxel bake — the "Bake" button
+    /// should show as enabled/highlighted when this is true.
+    pub dirty: bool,
 }
 
 /// Snapshot of a single node in the procedural tree.
@@ -185,6 +188,7 @@ pub fn build_procedural_snapshot(
         root: tree.root().0,
         selected_node,
         voxel_size,
+        dirty: proc_geo.dirty,
     }
 }
 
