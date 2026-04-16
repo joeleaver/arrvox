@@ -125,24 +125,32 @@ pub fn BuildViewport() -> NodeHandle {
         });
     }
 
-    // Focus the viewport on whichever procedural entity is currently
-    // selected. The build viewport's default filter is `BUILD_PREVIEW`
-    // which excludes the `DEFAULT` bit all normal entities carry —
-    // focus_entity is the additive escape hatch that lets the selected
-    // procedural through the visibility gate regardless of its layer.
-    // Without this, the build viewport renders an empty sky.
+    // Drive the viewport's visibility filter from (selected_entity, mode).
+    //
+    // - Isolation: `BUILD_PREVIEW` base — excludes normal scene objects.
+    //   focus_entity is the additive escape hatch that lets the selected
+    //   procedural through regardless of its (DEFAULT) layer bit.
+    // - In-Situ: `DEFAULT` base — the build preview sees whatever the
+    //   main scene contains, so the procedural is rendered in context.
+    //   focus_entity stays set so the selection remains visible even if
+    //   somebody tagged it out of DEFAULT.
     {
-        let prev_focus = std::cell::Cell::new(None::<Option<uuid::Uuid>>);
+        let prev = std::cell::Cell::new(None::<(Option<uuid::Uuid>, RenderMode)>);
         let cmd_tx = cmd.0.clone();
         __scope.create_effect(move || {
             let focus = store.selected_entity.get();
-            if prev_focus.get() == Some(focus) {
+            let m = mode.get();
+            if prev.get() == Some((focus, m)) {
                 return;
             }
-            prev_focus.set(Some(focus));
+            prev.set(Some((focus, m)));
+            let base_layers = match m {
+                RenderMode::Isolation => rkp_engine::viewport::layer::BUILD_PREVIEW,
+                RenderMode::InSitu => rkp_engine::viewport::layer::DEFAULT,
+            };
             let _ = cmd_tx.send(rkp_engine::EngineCommand::SetViewportFilter {
                 id: PANEL_VIEWPORT,
-                base_layers: rkp_engine::viewport::layer::BUILD_PREVIEW,
+                base_layers,
                 focus_entity_id: focus,
             });
         });
