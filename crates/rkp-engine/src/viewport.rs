@@ -213,6 +213,15 @@ pub struct Viewport {
     /// pass gating in `RkpRenderer::render_to`.
     pub mode: rkp_render::RenderMode,
 
+    /// Primary-visibility source for this viewport — voxel octree march
+    /// (default, what every viewport except the build one uses) or the
+    /// procedural CSG raymarcher (live preview of the tree without a
+    /// voxel bake). Only the build viewport should ever flip this to
+    /// `Raymarch`; main and any play-mode viewport stay on `Voxel`.
+    /// The procedural entity being previewed is pulled from the engine's
+    /// current selection at render time — nothing to track here.
+    pub preview_mode: rkp_render::BuildPreviewMode,
+
     /// Whether to overlay editor gizmos. Gated to "no runtime override
     /// active" in higher layers.
     pub show_gizmos: bool,
@@ -236,6 +245,7 @@ impl Viewport {
             },
             background: BackgroundMode::Environment,
             mode: rkp_render::RenderMode::InSitu,
+            preview_mode: rkp_render::BuildPreviewMode::Voxel,
             show_gizmos: true,
         }
     }
@@ -258,6 +268,7 @@ impl Viewport {
             },
             background: BackgroundMode::Neutral,
             mode: rkp_render::RenderMode::Isolation,
+            preview_mode: rkp_render::BuildPreviewMode::Voxel,
             show_gizmos: false,
         }
     }

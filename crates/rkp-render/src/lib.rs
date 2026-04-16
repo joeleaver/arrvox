@@ -35,6 +35,8 @@ pub mod rkp_renderer;
 pub mod rkp_scene_manager;
 /// Per-viewport render targets and post-process state.
 pub mod viewport_renderer;
+/// Procedural CSG raymarch — live preview pass for the build viewport.
+pub mod proc_raymarch;
 
 pub use voxelize_opacity::import_mesh_to_opacity_rkp;
 pub use octree_gpu::OctreeGpu;
@@ -55,6 +57,31 @@ pub use viewport_renderer::ViewportRenderer;
 pub enum RenderMode {
     InSitu,
     Isolation,
+}
+
+/// What primary-visibility pass runs for the build viewport. Orthogonal
+/// to `RenderMode` (Isolation/InSitu) — lighting look is separate from
+/// "what geometry are we showing."
+///
+/// * `Voxel` — the usual octree ray march, same path every other
+///   viewport uses. Shows whatever's baked into the voxel pool; may be
+///   stale relative to the current procedural tree.
+/// * `Raymarch` — the procedural CSG raymarcher. Evaluates the tree
+///   analytically per pixel, so edits are live — no bake required.
+///   Cheap (microseconds per frame for small trees) because there's no
+///   voxelization and no brick bookkeeping.
+///
+/// The main viewport and play mode are always `Voxel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildPreviewMode {
+    Voxel,
+    Raymarch,
+}
+
+impl Default for BuildPreviewMode {
+    fn default() -> Self {
+        Self::Voxel
+    }
 }
 
 /// Validate WGSL source with naga at startup. Panics with a clear error message

@@ -751,10 +751,29 @@ impl EngineState {
             // set per the viewport's mode. Written into the shared
             // shade_params buffer right before this VR's submit so the
             // shade pass reads this VR's flag, not another's.
-            let vp_mode = self.viewports
+            let (vp_mode, vp_preview_mode) = self
+                .viewports
                 .get(viewport_id)
-                .map(|v| v.mode)
-                .unwrap_or(rkp_render::RenderMode::InSitu);
+                .map(|v| (v.mode, v.preview_mode))
+                .unwrap_or((
+                    rkp_render::RenderMode::InSitu,
+                    rkp_render::BuildPreviewMode::Voxel,
+                ));
+            // The procedural being previewed in raymarch mode is always
+            // the currently-selected entity — the same thing the build
+            // viewport's focus filter already tracks. Keeps the preview
+            // follow selection automatically with no extra UI state.
+            let vp_preview_entity = self.selected_entity.and_then(|entity| {
+                if self
+                    .world
+                    .get::<&crate::components::ProceduralGeometry>(entity)
+                    .is_ok()
+                {
+                    self.entity_uuids.get(&entity).copied()
+                } else {
+                    None
+                }
+            });
             let isolation = matches!(vp_mode, rkp_render::RenderMode::Isolation);
             {
                 let mut sp = self.shade_params_base;
@@ -792,15 +811,58 @@ impl EngineState {
                 label: Some("rkp viewport"),
             });
 
+            // When this viewport is in procedural raymarch preview mode,
+            // flatten the selected procedural's tree into an RPN stream
+            // and push it to the VR's raymarch pass before dispatch. We
+            // flatten every frame the mode is active — the cost is O(tree
+            // nodes), microseconds, and sidesteps having to track dirty
+            // state through another layer. Skip entirely when the mode is
+            // Voxel so we don't touch the raymarch pass's buffers.
+            let proc_instructions: Vec<rkp_procedural::ProcInstruction> =
+                if matches!(vp_preview_mode, rkp_render::BuildPreviewMode::Raymarch) {
+                    vp_preview_entity
+                        .and_then(|uuid| {
+                            self.entity_uuids
+                                .iter()
+                                .find_map(|(e, u)| (*u == uuid).then_some(*e))
+                        })
+                        .and_then(|entity| {
+                            self.world
+                                .get::<&crate::components::ProceduralGeometry>(entity)
+                                .ok()
+                                .map(|pg| rkp_procedural::flatten_tree(&pg.tree))
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+            let proc_object_id = vp_preview_entity
+                .and_then(|uuid| {
+                    self.entity_uuids
+                        .iter()
+                        .find_map(|(e, u)| (*u == uuid).then_some(*e))
+                })
+                .and_then(|entity| self.entity_scene_ids.get(&entity).copied())
+                .unwrap_or(0);
+
             let vr = self.viewport_renderers
                 .get_mut(&viewport_id)
                 .expect("viewport renderer must exist");
+            if matches!(vp_preview_mode, rkp_render::BuildPreviewMode::Raymarch) {
+                vr.proc_raymarch.upload_instructions(&self.device, &self.queue, &proc_instructions);
+                vr.proc_raymarch.set_params(
+                    &self.queue,
+                    proc_instructions.len() as u32,
+                    proc_object_id + 1,
+                );
+            }
             self.renderer.render_to(
                 &mut encoder, &self.queue, vr,
                 object_count, shadow_steps, num_lights,
                 self.lod_enabled, self.surfacenet_enabled,
                 screen_aabbs_bytes, &atmo_frame,
                 vp_mode,
+                vp_preview_mode,
             );
 
             if viewport_id == ViewportId::MAIN {
@@ -1487,6 +1549,12 @@ impl EngineState {
                     .collect();
                 for entity in dirty {
                     self.bake_procedural_entity(entity);
+                }
+            }
+
+            EngineCommand::SetBuildPreviewMode { mode } => {
+                if let Some(vp) = self.viewports.get_mut(crate::viewport::ViewportId::BUILD) {
+                    vp.preview_mode = mode;
                 }
             }
 

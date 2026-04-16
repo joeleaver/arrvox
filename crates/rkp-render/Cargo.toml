@@ -7,6 +7,7 @@ description = "Splat rendering pipeline: opacity-field march to G-buffer, orches
 
 [dependencies]
 rkp-core = { workspace = true }
+rkp-procedural = { workspace = true }
 rkf-core = { workspace = true }
 rkf-render = { workspace = true }
 rkf-import = { workspace = true }

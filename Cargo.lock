@@ -5028,6 +5028,7 @@ name = "rkp-procedural"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "bytemuck",
  "glam 0.29.3",
  "rkf-core",
  "serde",
@@ -5051,6 +5052,7 @@ dependencies = [
  "rkf-import",
  "rkf-render",
  "rkp-core",
+ "rkp-procedural",
  "thiserror 2.0.18",
  "wgpu 29.0.1",
  "wgpu-profiler",

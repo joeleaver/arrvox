@@ -16,6 +16,7 @@
 use crate::rkp_renderer::RkpRenderer;
 use crate::rkp_scene::{CameraUniforms, RkpScene};
 use crate::octree_march::OctreeMarchPass;
+use crate::proc_raymarch::ProcRaymarchPass;
 use crate::rkp_shadow_trace::ShadowTracePass;
 use crate::rkp_ssao::RkpSsaoPass;
 use crate::rkp_shade::RkpShadePass;
@@ -36,6 +37,11 @@ pub struct ViewportRenderer {
 
     // ── Per-VR resolution-coupled passes ───────────────────────────
     pub march: OctreeMarchPass,
+    /// Live CSG preview for the build viewport. Writes the same G-buffer
+    /// as `march`, so downstream passes don't care which one ran — only
+    /// one of the two executes per frame, chosen by the host via
+    /// `render_to`'s `preview_mode` parameter.
+    pub proc_raymarch: ProcRaymarchPass,
     pub shadow_trace: ShadowTracePass,
     pub ssao: RkpSsaoPass,
     pub shade: RkpShadePass,
@@ -95,6 +101,14 @@ impl ViewportRenderer {
         march.set_materials(device, &renderer.materials_buffer);
         march.set_lights(device, &renderer.lights_buffer);
         march.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view);
+
+        // Procedural CSG raymarch — alternative primary-visibility pass
+        // for the build viewport. Wired to the same per-VR camera + gbuffer
+        // so the host can flip between voxel and raymarch without touching
+        // the rest of the chain.
+        let mut proc_raymarch = ProcRaymarchPass::new(device);
+        proc_raymarch.set_camera(device, &camera_buffer);
+        proc_raymarch.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view);
 
         let mut ssao = RkpSsaoPass::new(device, queue, width, height);
         ssao.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view);
@@ -168,7 +182,7 @@ impl ViewportRenderer {
 
         Self {
             camera_buffer, scene_bind_group, scene_epoch, lights_materials_epoch,
-            march, shadow_trace, ssao, shade, volumetric, god_rays,
+            march, proc_raymarch, shadow_trace, ssao, shade, volumetric, god_rays,
             gbuffer, bloom, bloom_composite, tone_map,
             composite_texture, composite_view,
             readback_buffers, readback_index: 0, readback_ready: false,
@@ -225,6 +239,7 @@ impl ViewportRenderer {
 
         // Per-VR passes — resize internal textures + re-wire gbuffer bindings.
         self.march.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view);
+        self.proc_raymarch.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view);
 
         self.ssao.resize(device, width, height);
         self.ssao.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view);

@@ -51,6 +51,8 @@ fn build_content(__scope: &mut Scope, store: EditorStore) -> Node {
     rsx! {
         div {
             style: "display:flex;flex-direction:column;height:100%;",
+            // ── Preview mode toggle (voxel vs live CSG raymarch) ──────
+            {render_preview_toggle(__scope, store, cmd_tx)}
             // ── Bake action ───────────────────────────────────────────
             {render_bake_action(__scope, snapshot, cmd_tx)}
             // ── Resolution ────────────────────────────────────────────
@@ -65,6 +67,70 @@ fn build_content(__scope: &mut Scope, store: EditorStore) -> Node {
             div {
                 style: "flex:1;min-height:0;overflow-y:auto;padding:4px 8px;",
                 {render_params(__scope, snapshot, selected_node, cmd_tx)}
+            }
+        }
+    }
+}
+
+/// Two-button segmented control for the build viewport's primary-
+/// visibility source. `Voxel` shows the baked octree result — the
+/// same thing the main viewport sees; becomes stale the moment the
+/// user edits the tree. `Raymarch` evaluates the tree analytically
+/// per pixel, so it's always in sync with the current parameters but
+/// doesn't reflect material/lighting quality exactly. The pair is
+/// the expected editing loop: edit with Raymarch, Bake, confirm with
+/// Voxel.
+fn render_preview_toggle(
+    __scope: &mut Scope,
+    store: EditorStore,
+    cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
+) -> Node {
+    // Mirror the engine's current preview mode in a local signal so the
+    // buttons re-highlight when the engine reports a change. This also
+    // gives us an easy place to flip the mode without touching the
+    // engine on every render.
+    let mode = store.build_preview_mode;
+
+    let set_voxel = move || {
+        mode.set(rkp_render::BuildPreviewMode::Voxel);
+        let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetBuildPreviewMode {
+            mode: rkp_render::BuildPreviewMode::Voxel,
+        });
+    };
+    let set_raymarch = move || {
+        mode.set(rkp_render::BuildPreviewMode::Raymarch);
+        let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetBuildPreviewMode {
+            mode: rkp_render::BuildPreviewMode::Raymarch,
+        });
+    };
+
+    let btn_style = |active: bool| -> &'static str {
+        if active {
+            "flex:1;padding:4px 8px;background:#2a4e7a;color:#fff;\
+             border:1px solid #3a6ea6;cursor:pointer;"
+        } else {
+            "flex:1;padding:4px 8px;background:#2a2a2a;color:#aaa;\
+             border:1px solid #333;cursor:pointer;"
+        }
+    };
+
+    rsx! {
+        div {
+            style: "display:flex;align-items:center;gap:8px;padding:6px 8px;\
+                    border-bottom:1px solid #333;",
+            span { style: "color:#888;font-size:11px;", "Preview:" }
+            div {
+                style: "display:flex;flex:1;gap:0;",
+                button {
+                    style: {move || btn_style(matches!(mode.get(), rkp_render::BuildPreviewMode::Voxel))},
+                    onclick: set_voxel,
+                    "Voxel"
+                }
+                button {
+                    style: {move || btn_style(matches!(mode.get(), rkp_render::BuildPreviewMode::Raymarch))},
+                    onclick: set_raymarch,
+                    "Live (raymarch)"
+                }
             }
         }
     }

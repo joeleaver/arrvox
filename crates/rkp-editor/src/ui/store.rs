@@ -116,6 +116,12 @@ pub struct EditorStore {
     // ── View settings ────────────────────────────────────────────
     /// Show physics collider wireframes in the viewport.
     pub show_colliders: Signal<bool>,
+    /// Which primary-visibility pass the build viewport dispatches —
+    /// `Voxel` (default, shows the baked octree) or `Raymarch` (live CSG
+    /// preview of the procedural tree, no bake required). Updated by the
+    /// build panel's preview toggle and echoed back to the engine via
+    /// `EngineCommand::SetBuildPreviewMode`.
+    pub build_preview_mode: Signal<rkp_render::BuildPreviewMode>,
 
     // ── Drag state (tab dragging) ────────────────────────────────
 
@@ -207,6 +213,7 @@ impl EditorStore {
             console_entries: Signal::new(Vec::new()),
             play_mode: Signal::new(false),
             show_colliders: Signal::new(false),
+            build_preview_mode: Signal::new(rkp_render::BuildPreviewMode::Voxel),
 
             // Drag state.
             tab_drag: Signal::new(None),

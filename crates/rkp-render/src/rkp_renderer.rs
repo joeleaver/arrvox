@@ -117,6 +117,10 @@ impl RkpRenderer {
     /// `surfacenet_enabled` gates render-time normal reconstruction from
     /// the 3³ in-brick occupancy neighborhood — an A/B toggle for the
     /// Surface-Nets normal POC.
+    /// `preview_mode` selects the primary-visibility pass: `Voxel` runs
+    /// the usual octree march; `Raymarch` runs the procedural CSG
+    /// raymarcher instead. Only the build viewport uses `Raymarch`;
+    /// everywhere else passes `Voxel` (the default).
     #[allow(clippy::too_many_arguments)]
     pub fn render_to(
         &mut self,
@@ -131,8 +135,10 @@ impl RkpRenderer {
         screen_aabbs: &[u8],
         atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
         mode: crate::RenderMode,
+        preview_mode: crate::BuildPreviewMode,
     ) {
         let in_situ = matches!(mode, crate::RenderMode::InSitu);
+        let raymarch = matches!(preview_mode, crate::BuildPreviewMode::Raymarch);
 
         // Upload per-viewport tile-cull screen-space AABBs into the VR's march.
         viewport.march.upload_screen_aabbs(queue, screen_aabbs);
@@ -145,9 +151,22 @@ impl RkpRenderer {
             self.profiler.end_query(encoder, q);
         }
 
-        // 1. Octree ray march → G-buffer (primary visibility only).
-        viewport.march.clear_stats(encoder);
-        {
+        // 1. Primary visibility → G-buffer. Voxel march *or* procedural
+        //    raymarch, never both — each fully populates the G-buffer
+        //    (including writing "miss" at non-hit pixels), so the one
+        //    that doesn't run would just be overwriting. Shadow_trace
+        //    is skipped in raymarch mode because the procedural preview
+        //    doesn't have the world-space voxel grid that pass needs;
+        //    isolation mode already forces shadow=1.0 inside shade,
+        //    which is what we want for the clean preview look anyway.
+        if raymarch {
+            let q = self.profiler.begin_query("proc_raymarch", encoder);
+            viewport.proc_raymarch.dispatch(
+                encoder, viewport.width, viewport.height, None,
+            );
+            self.profiler.end_query(encoder, q);
+        } else {
+            viewport.march.clear_stats(encoder);
             let q = self.profiler.begin_query("march", encoder);
             viewport.march.dispatch(
                 encoder, queue, &viewport.scene_bind_group,
@@ -159,14 +178,16 @@ impl RkpRenderer {
 
         // 1b. Half-res shadow trace. Skipped in isolation — the shade
         // pass forces shadow=1.0 there. Uses march's params bind group.
-        if in_situ {
+        if in_situ && !raymarch {
             if let Some(params_bg) = viewport.march.params_bind_group() {
                 let q = self.profiler.begin_query("shadow", encoder);
                 viewport.shadow_trace.dispatch(encoder, &viewport.scene_bind_group, params_bg);
                 self.profiler.end_query(encoder, q);
             }
         }
-        viewport.march.copy_stats(encoder);
+        if !raymarch {
+            viewport.march.copy_stats(encoder);
+        }
 
         // 2. SSAO (half-res). Kept in isolation — it's the only grounding cue.
         {
