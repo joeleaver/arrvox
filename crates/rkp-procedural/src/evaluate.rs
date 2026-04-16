@@ -4,6 +4,7 @@
 use glam::Vec3;
 
 use crate::arena::{NodeId, ProceduralObject};
+use crate::bounds::AabbCache;
 use crate::combine::{combine_intersect, combine_subtract, combine_union};
 use crate::leaves::eval_leaf;
 use crate::node_kind::NodeKind;
@@ -16,12 +17,65 @@ use crate::sample::Sample;
 ///
 /// `voxel_size` is used by leaf shapes to size their fade band — matches the
 /// voxelizer's grid resolution so the fade is exactly a few voxels wide.
+///
+/// Slow path — for hot usage inside the voxelizer, prefer
+/// `sample_tree_cached` which accepts a precomputed per-node AABB cache
+/// and uses it to prune Union children that provably can't contribute at
+/// the given sample point.
 pub fn sample_tree(obj: &ProceduralObject, pos: Vec3, voxel_size: f32) -> Sample {
-    sample_node(obj, obj.root(), pos, voxel_size)
+    sample_node(obj, obj.root(), pos, voxel_size, None)
+}
+
+/// Culled sample path. `cache` must have been built by
+/// `compute_all_bounds(obj)` from the same tree state. For Union nodes,
+/// children whose world-space AABB distance exceeds the running-minimum
+/// distance found so far are skipped — their SDF is provably ≥ that
+/// distance (AABB-distance is a lower bound on any bounded primitive's
+/// SDF), so they can't lower the min. Leaves and non-Union combinators
+/// are evaluated as before; the first Union child is always evaluated
+/// (no running min to compare against yet).
+///
+/// Correctness: skipping never changes the returned distance vs. the
+/// uncached path, so the voxelizer's classifier sees identical SDF
+/// values. Big speedup for large Unions where most children are
+/// spatially distant from a given sample point.
+pub fn sample_tree_cached(
+    obj: &ProceduralObject,
+    pos: Vec3,
+    voxel_size: f32,
+    cache: &AabbCache,
+) -> Sample {
+    sample_node(obj, obj.root(), pos, voxel_size, Some(cache))
+}
+
+/// Signed distance from a point to an AABB. Negative inside (nearest-face
+/// penetration), positive outside (euclidean), zero on the boundary.
+/// Matches the standard SDF semantics the procedural leaves use, so it
+/// can be compared directly against any bounded primitive's SDF.
+fn sdist_point_aabb(p: Vec3, aabb: &rkf_core::Aabb) -> f32 {
+    let center = (aabb.min + aabb.max) * 0.5;
+    let half = (aabb.max - aabb.min) * 0.5;
+    let q = (p - center).abs() - half;
+    let outside = q.max(Vec3::ZERO).length();
+    let inside = q.x.max(q.y).max(q.z).min(0.0);
+    outside + inside
 }
 
 /// Recursively evaluate a single node and its subtree.
-fn sample_node(obj: &ProceduralObject, id: NodeId, pos: Vec3, voxel_size: f32) -> Sample {
+///
+/// `pos` is expressed in this node's *parent* frame — the same frame
+/// the AABB cache entry for this node was stored in (cache entries
+/// include each node's own transform but no ancestor transforms). For
+/// the Union cull test we compare `local_pos` (this node's local frame
+/// = its children's parent frame) against each child's cache entry —
+/// both are in the same frame, no additional transform needed.
+fn sample_node(
+    obj: &ProceduralObject,
+    id: NodeId,
+    pos: Vec3,
+    voxel_size: f32,
+    cache: Option<&AabbCache>,
+) -> Sample {
     let node = match obj.get(id) {
         Some(n) => n,
         None => return Sample::EMPTY,
@@ -35,10 +89,31 @@ fn sample_node(obj: &ProceduralObject, id: NodeId, pos: Vec3, voxel_size: f32) -
         NodeKind::Union { material_combine } => {
             let mode = *material_combine;
             let mut result = Sample::EMPTY;
+            // Running minimum signed distance across already-evaluated
+            // children. Starts at +∞; the first child's AABB-cull test
+            // can't fire because every `sdist_point_aabb` value is ≤ +∞.
+            // After one child produces a finite sample, subsequent
+            // children with AABB distance ≥ running_min are skipped —
+            // their true SDF is ≥ AABB distance, so they can't lower
+            // the min.
+            let mut running_min = f32::INFINITY;
             for &child_id in &node.children {
-                let child_sample = sample_node(obj, child_id, local_pos, voxel_size);
+                if let Some(c) = cache {
+                    if running_min.is_finite() {
+                        if let Some(Some(child_aabb)) = c.get(child_id.0 as usize) {
+                            let d_lo = sdist_point_aabb(local_pos, child_aabb);
+                            if d_lo >= running_min {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let child_sample = sample_node(obj, child_id, local_pos, voxel_size, cache);
                 if child_sample.is_empty() {
                     continue;
+                }
+                if child_sample.distance < running_min {
+                    running_min = child_sample.distance;
                 }
                 if result.is_empty() {
                     result = child_sample;
@@ -55,12 +130,12 @@ fn sample_node(obj: &ProceduralObject, id: NodeId, pos: Vec3, voxel_size: f32) -
             if children.is_empty() {
                 return Sample::EMPTY;
             }
-            let mut result = sample_node(obj, children[0], local_pos, voxel_size);
+            let mut result = sample_node(obj, children[0], local_pos, voxel_size, cache);
             for &child_id in &children[1..] {
                 if result.is_empty() {
                     return Sample::EMPTY;
                 }
-                let child_sample = sample_node(obj, child_id, local_pos, voxel_size);
+                let child_sample = sample_node(obj, child_id, local_pos, voxel_size, cache);
                 result = combine_intersect(&result, &child_sample, mode);
             }
             result
@@ -71,12 +146,12 @@ fn sample_node(obj: &ProceduralObject, id: NodeId, pos: Vec3, voxel_size: f32) -
             if children.is_empty() {
                 return Sample::EMPTY;
             }
-            let mut result = sample_node(obj, children[0], local_pos, voxel_size);
+            let mut result = sample_node(obj, children[0], local_pos, voxel_size, cache);
             for &cutter_id in &children[1..] {
                 if result.is_empty() {
                     return Sample::EMPTY;
                 }
-                let cutter_sample = sample_node(obj, cutter_id, local_pos, voxel_size);
+                let cutter_sample = sample_node(obj, cutter_id, local_pos, voxel_size, cache);
                 result = combine_subtract(&result, &cutter_sample);
             }
             result
@@ -216,6 +291,62 @@ mod tests {
         let s = sample_tree(&obj, Vec3::new(2.4, 0.0, 0.0), VS);
         assert!(s.is_inside(), "expected inside, dist={}", s.distance);
         assert_eq!(s.material_id, 2);
+    }
+
+    /// The cached sample path must produce byte-identical SDF values to
+    /// the uncached path for the same tree. Any divergence is a cull bug.
+    #[test]
+    fn cached_matches_uncached_dense_grid() {
+        use crate::bounds::compute_all_bounds;
+        use crate::node_kind::*;
+
+        // Tree: Union of several spheres and boxes at scattered positions
+        // + a Subtract node, so every combinator type runs.
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        for i in 0..5 {
+            let s = obj.add_child(obj.root(), sphere(0.4 + 0.05 * i as f32, i as u16));
+            obj.set_transform(
+                s,
+                Affine3A::from_translation(Vec3::new(i as f32 * 1.5 - 3.0, 0.0, 0.0)),
+            );
+        }
+        let sub = obj.add_child(obj.root(), NodeKind::Subtract);
+        obj.set_transform(sub, Affine3A::from_translation(Vec3::new(0.0, 1.5, 0.0)));
+        obj.add_child(sub, sphere(0.8, 10));
+        obj.add_child(sub, sphere(0.3, 11));
+
+        let cache = compute_all_bounds(&obj);
+
+        // Sweep a 3D grid across the whole scene including plenty of empty
+        // space — cull decisions at "far from everything" points are
+        // where frame-mismatch bugs would show up.
+        let mut disagree = 0usize;
+        for ix in -20..=20 {
+            for iy in -10..=10 {
+                for iz in -10..=10 {
+                    let p = Vec3::new(
+                        ix as f32 * 0.25,
+                        iy as f32 * 0.25,
+                        iz as f32 * 0.25,
+                    );
+                    let s_uncached = sample_tree(&obj, p, VS);
+                    let s_cached = sample_tree_cached(&obj, p, VS, &cache);
+                    let diff = (s_uncached.distance - s_cached.distance).abs();
+                    if diff > 1e-5 {
+                        disagree += 1;
+                        if disagree <= 5 {
+                            eprintln!(
+                                "cull mismatch at {p:?}: uncached={} cached={}",
+                                s_uncached.distance, s_cached.distance,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(disagree, 0, "cached path diverged at {disagree} grid points");
     }
 
     /// Transform on a parent combinator affects all children.

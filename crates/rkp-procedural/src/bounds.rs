@@ -33,6 +33,68 @@ pub fn compute_bounds(obj: &ProceduralObject) -> Aabb {
     }
 }
 
+/// World-space AABB per node, indexed by `NodeId.0 as usize`. `None`
+/// entries correspond to tombstoned ids, empty combinators, or the
+/// unbounded-but-in-practice-large Plane case. Built once per bake by
+/// `compute_all_bounds` and consumed by the culled sample path
+/// (`sample_tree_cached`) to skip Union children whose AABB distance
+/// provably exceeds the running min at a sample point.
+pub type AabbCache = Vec<Option<Aabb>>;
+
+/// Compute a world-space AABB for every node in the tree in a single
+/// bottom-up pass. Each entry is the same AABB `compute_bounds` would
+/// produce for that subtree considered as a whole — including the
+/// transforms from the node down to its leaves, but *not* the
+/// transforms of any ancestors above it. That matches the position
+/// frame `sample_tree_cached` uses for the AABB test (see evaluate.rs).
+pub fn compute_all_bounds(obj: &ProceduralObject) -> AabbCache {
+    let mut cache: AabbCache = vec![None; obj.arena_len()];
+    compute_all_bounds_rec(obj, obj.root(), &mut cache);
+    cache
+}
+
+fn compute_all_bounds_rec(
+    obj: &ProceduralObject,
+    id: NodeId,
+    cache: &mut AabbCache,
+) -> Aabb {
+    let node = match obj.get(id) {
+        Some(n) => n,
+        None => return EMPTY_AABB,
+    };
+
+    let local_aabb = match &node.kind {
+        NodeKind::Sphere(p) => leaf_sphere_bounds(p),
+        NodeKind::Box(p) => leaf_box_bounds(p),
+        NodeKind::Capsule(p) => leaf_capsule_bounds(p),
+        NodeKind::Cylinder(p) => leaf_cylinder_bounds(p),
+        NodeKind::Torus(p) => leaf_torus_bounds(p),
+        NodeKind::Plane(p) => leaf_plane_bounds(p),
+        NodeKind::Ramp(p) => leaf_ramp_bounds(p),
+
+        NodeKind::Union { .. } | NodeKind::Intersect { .. } | NodeKind::Subtract => {
+            let mut combined = EMPTY_AABB;
+            for &child_id in &node.children {
+                let child_aabb = compute_all_bounds_rec(obj, child_id, cache);
+                combined = aabb_union(&combined, &child_aabb);
+            }
+            combined
+        }
+    };
+
+    let world_aabb = if is_empty_aabb(&local_aabb) {
+        EMPTY_AABB
+    } else {
+        transform_aabb(&local_aabb, &node.transform)
+    };
+
+    let slot = id.0 as usize;
+    if slot < cache.len() {
+        cache[slot] = if is_empty_aabb(&world_aabb) { None } else { Some(world_aabb) };
+    }
+    world_aabb
+}
+
 /// Compute the world-space AABB for a node and its subtree.
 fn compute_node_bounds(obj: &ProceduralObject, id: NodeId) -> Aabb {
     let node = match obj.get(id) {

@@ -2790,12 +2790,14 @@ impl EngineState {
         }
 
         for (entity, scene_id) in to_update {
+            let t_entity_start = std::time::Instant::now();
             // Read the procedural tree, voxel size, and current scale.
             let (tree_clone, base_voxel_size, scale) = {
                 let proc_geo = self.world.get::<&ProceduralGeometry>(entity).unwrap();
                 let transform = self.world.get::<&Transform>(entity).unwrap();
                 (proc_geo.tree.clone(), proc_geo.voxel_size, transform.scale)
             };
+            let tree_node_count = tree_clone.node_count();
 
             // Free previous geometry allocation (if any) before re-voxelizing.
             // Without this, every re-voxelization leaks voxel slots and octree
@@ -2816,16 +2818,36 @@ impl EngineState {
                     &handle, prev.voxel_slot_start, prev.voxel_slot_count, &prev.brick_ids,
                 );
             }
+            let t_after_dealloc = t_entity_start.elapsed();
 
             let (aabb, voxel_size) = procedural_voxel_params(&tree_clone, base_voxel_size);
+            // Precompute per-node world-space AABBs once per bake; the sdf_fn
+            // closure consults this to skip Union children whose AABB is
+            // farther than the running-min distance at a sample point.
+            let aabb_cache = rkp_procedural::compute_all_bounds(&tree_clone);
             let sdf_fn = |pos: glam::Vec3| -> (f32, u16) {
-                let sample = rkp_procedural::sample_tree(&tree_clone, pos, voxel_size);
+                let sample = rkp_procedural::sample_tree_cached(
+                    &tree_clone, pos, voxel_size, &aabb_cache,
+                );
                 (sample.distance, sample.material_id)
             };
+            let t_after_bounds = t_entity_start.elapsed();
 
-            match self.scene_mgr.voxelize_sdf_fn(
+            let vx_result = self.scene_mgr.voxelize_sdf_fn(
                 sdf_fn, &aabb, voxel_size, scene_id,
-            ) {
+            );
+            let t_total = t_entity_start.elapsed();
+            let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
+            eprintln!(
+                "[proc_bake] tree_nodes={} dealloc={:.2}ms bounds={:.2}ms voxelize_sdf_fn={:.2}ms total={:.2}ms",
+                tree_node_count,
+                ms(t_after_dealloc),
+                ms(t_after_bounds - t_after_dealloc),
+                ms(t_total - t_after_bounds),
+                ms(t_total),
+            );
+
+            match vx_result {
                 Some(result) => {
                     let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.grid_origin, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
 

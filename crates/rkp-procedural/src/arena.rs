@@ -85,6 +85,12 @@ impl ProceduralObject {
         self.nodes.iter().filter(|n| n.is_some()).count()
     }
 
+    /// Arena capacity — highest-possible `NodeId.0 + 1`. Useful for sizing
+    /// per-node side tables (e.g. bounds caches). Includes tombstones.
+    pub fn arena_len(&self) -> usize {
+        self.nodes.len()
+    }
+
     /// Add a child node under the given parent. Returns the new node's ID.
     ///
     /// Panics if `parent` doesn't exist or is a leaf shape (leaves can't have children).

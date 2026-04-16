@@ -91,6 +91,7 @@ where
         (32 - (voxels_needed - 1).leading_zeros()) as u8
     };
 
+    let t_start = std::time::Instant::now();
     let mut octree = SparseOctree::new(depth, base_voxel_size);
     let mut voxel_count = 0u32;
     // Dedup keyed on the full LeafAttr value. Two spatial leaves with the
@@ -132,6 +133,7 @@ where
         extent,
         base_voxel_size,
     )?;
+    let t_after_subdivide = t_start.elapsed();
 
     // Post-passes, in order:
     //   compact()              — reclaim orphan storage from try_collapse.
@@ -153,6 +155,7 @@ where
     octree.deduplicate_subtrees();
     let nodes_after_dedup = octree.node_count();
     octree.morton_reorder();
+    let t_after_structure = t_start.elapsed();
     let attrs_before_prefilter = attr_dedup.len();
     crate::prefilter::prefilter_octree_internals(
         &mut octree,
@@ -161,6 +164,7 @@ where
         &mut attr_dedup,
     );
     let attrs_after_prefilter = attr_dedup.len();
+    let t_after_prefilter = t_start.elapsed();
 
     // Compute the face-adjacency links for this voxelization's bricks.
     // The table spans 0..=max_brick_id so the GPU can index it by the
@@ -170,22 +174,22 @@ where
     } else {
         Vec::new()
     };
+    let t_total = t_start.elapsed();
 
-    if nodes_before_compact >= 10_000 {
-        eprintln!(
-            "[voxelize_octree] leaves={}  unique_attrs={}(+{} prefilter)  octree {} → compact {} → dedup {} ({:.1}× total)  face_links={} bricks",
-            voxel_count,
-            attrs_before_prefilter,
-            attrs_after_prefilter - attrs_before_prefilter,
-            nodes_before_compact,
-            nodes_after_compact,
-            nodes_after_dedup,
-            if nodes_after_dedup > 0 {
-                nodes_before_compact as f64 / nodes_after_dedup as f64
-            } else { 0.0 },
-            brick_face_links.len(),
-        );
-    }
+    let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
+    eprintln!(
+        "[voxelize_octree] depth={} voxels={} nodes {}→{}→{}  attrs={}(+{} prefilter)  face_links={}  \
+         subdivide={:.2}ms structure={:.2}ms prefilter={:.2}ms face_links={:.2}ms total={:.2}ms",
+        depth, voxel_count,
+        nodes_before_compact, nodes_after_compact, nodes_after_dedup,
+        attrs_before_prefilter, attrs_after_prefilter - attrs_before_prefilter,
+        brick_face_links.len(),
+        ms(t_after_subdivide),
+        ms(t_after_structure - t_after_subdivide),
+        ms(t_after_prefilter - t_after_structure),
+        ms(t_total - t_after_prefilter),
+        ms(t_total),
+    );
 
     Some(VoxelizeOctreeResult {
         octree,

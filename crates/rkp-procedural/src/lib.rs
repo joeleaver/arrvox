@@ -16,9 +16,9 @@ mod sample;
 mod version;
 
 pub use arena::{Node, NodeId, ProceduralObject};
-pub use bounds::compute_bounds;
+pub use bounds::{compute_all_bounds, compute_bounds, AabbCache};
 pub use combine::{combine_intersect, combine_subtract, combine_union};
-pub use evaluate::sample_tree;
+pub use evaluate::{sample_tree, sample_tree_cached};
 pub use leaves::eval_leaf;
 pub use node_kind::{MaterialCombine, NodeKind};
 pub use sample::Sample;
