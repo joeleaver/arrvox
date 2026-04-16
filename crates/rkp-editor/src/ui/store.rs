@@ -213,7 +213,7 @@ impl EditorStore {
             console_entries: Signal::new(Vec::new()),
             play_mode: Signal::new(false),
             show_colliders: Signal::new(false),
-            build_preview_mode: Signal::new(rkp_render::BuildPreviewMode::Voxel),
+            build_preview_mode: Signal::new(rkp_render::BuildPreviewMode::Raymarch),
 
             // Drag state.
             tab_drag: Signal::new(None),

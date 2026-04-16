@@ -268,7 +268,12 @@ impl Viewport {
             },
             background: BackgroundMode::Neutral,
             mode: rkp_render::RenderMode::Isolation,
-            preview_mode: rkp_render::BuildPreviewMode::Voxel,
+            // Live CSG raymarch is the authoring default — the build
+            // viewport exists for interactive tree editing and the
+            // raymarch is what makes edits visible without a bake.
+            // Users can flip to Voxel from the panel toggle to inspect
+            // the last-baked result.
+            preview_mode: rkp_render::BuildPreviewMode::Raymarch,
             show_gizmos: false,
         }
     }
