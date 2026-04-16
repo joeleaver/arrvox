@@ -26,8 +26,16 @@ const OP_SUBTRACT:  u32 = 102u;
 
 const MAT_COMBINE_WINNER:  u32 = 0u;
 // `Layered` is represented but the shader treats it as Winner for now —
-// see the `combine_*` helpers.
+// the dual-material G-buffer isn't wired through the raymarch path, so
+// there's no place to land the secondary material even if we computed
+// it here. See `combine_*`.
 const MAT_COMBINE_LAYERED: u32 = 1u;
+// `Blend { radius }` — smooth color interpolation inside a narrow band
+// where both surfaces are equally close. Geometry distance is still the
+// sharp min/max; we only lerp color between the two samples so the seam
+// looks soft instead of a hard material edge. The radius rides along
+// in each combinator instruction's `params_lo.x`.
+const MAT_COMBINE_BLEND:   u32 = 2u;
 
 // Max RPN stack depth. Tree depth is bounded by however many nested
 // combinators the user builds; 16 accommodates pathological cases while
@@ -182,7 +190,38 @@ fn eval_primitive(ins: ProcInstruction, world_pos: vec3<f32>) -> TreeSample {
 // signed distance "wins" the material + color. `Layered` collapses to
 // Winner for now (see MAT_COMBINE_LAYERED comment).
 
-fn combine_union(a: TreeSample, b: TreeSample) -> TreeSample {
+// In Blend mode, smooth the material/color transition across a band of
+// width `radius` centered where the two samples have equal distance.
+// Outside the band we fall back to Winner. Keeps the geometry's sharp
+// min/max (matching the CPU path) but gives a visually soft seam.
+fn blended_union_sample(a: TreeSample, b: TreeSample, radius: f32) -> TreeSample {
+    let distance = min(a.distance, b.distance);
+    let diff = abs(a.distance - b.distance);
+    let r = max(radius, 1e-6);
+    if (diff >= r) {
+        if (a.distance <= b.distance) {
+            var s: TreeSample;
+            s.distance = distance; s.material_id = a.material_id; s.color = a.color;
+            return s;
+        }
+        var s: TreeSample;
+        s.distance = distance; s.material_id = b.material_id; s.color = b.color;
+        return s;
+    }
+    // t=0 → fully b, t=1 → fully a (matches combine.rs's convention).
+    let t = 0.5 + 0.5 * (b.distance - a.distance) / r;
+    let winner_is_a = a.distance <= b.distance;
+    var s: TreeSample;
+    s.distance = distance;
+    s.material_id = select(b.material_id, a.material_id, winner_is_a);
+    s.color = mix(b.color, a.color, t);
+    return s;
+}
+
+fn combine_union(a: TreeSample, b: TreeSample, mat_mode: u32, radius: f32) -> TreeSample {
+    if (mat_mode == MAT_COMBINE_BLEND) {
+        return blended_union_sample(a, b, radius);
+    }
     if (a.distance <= b.distance) { return a; }
     return b;
 }
@@ -191,7 +230,9 @@ fn combine_intersect(a: TreeSample, b: TreeSample) -> TreeSample {
     // Max of distances; material from the loser (the one with the
     // larger, i.e. more-outside, distance) — that's the boundary that
     // defines the intersect surface. Matches `combine::combine_intersect`
-    // winner semantics.
+    // winner semantics. Blend radius intentionally unused here —
+    // intersect blends are rare and the visual seam is already soft
+    // by virtue of being the max-of-two surface.
     if (a.distance >= b.distance) { return a; }
     return b;
 }
@@ -236,10 +277,11 @@ fn eval_tree(world_pos: vec3<f32>) -> TreeSample {
             }
             let base = sp - arity;
             var acc = stack[base];
+            let blend_radius = ins.params_lo.x;
             for (var k: u32 = 1u; k < arity; k = k + 1u) {
                 let rhs = stack[base + k];
                 switch ins.op {
-                    case 100u: { acc = combine_union(acc, rhs); }
+                    case 100u: { acc = combine_union(acc, rhs, ins.material_combine, blend_radius); }
                     case 101u: { acc = combine_intersect(acc, rhs); }
                     case 102u: { acc = combine_subtract(acc, rhs); }
                     default: {}

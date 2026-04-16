@@ -94,15 +94,21 @@ pub struct ProcInstruction {
 }
 
 /// Encode a `MaterialCombine` as a u32 for the GPU. Values match the
-/// WGSL `MAT_COMBINE_*` constants. `Blend`'s radius is not currently
-/// plumbed through — the shader uses `Winner` behavior in that case
-/// (same material selection, no smooth band). If/when we wire in the
-/// radius, add it as a second u32 field on `ProcInstruction`.
+/// WGSL `MAT_COMBINE_*` constants.
 fn material_combine_bits(m: MaterialCombine) -> u32 {
     match m {
         MaterialCombine::Winner => 0,
         MaterialCombine::Layered => 1,
-        MaterialCombine::Blend { .. } => 0,
+        MaterialCombine::Blend { .. } => 2,
+    }
+}
+
+/// For `Blend{radius}`, the radius rides along in combinator instructions'
+/// `params[0]` — unused on the Winner/Layered paths and zero there.
+fn combinator_radius(m: MaterialCombine) -> f32 {
+    match m {
+        MaterialCombine::Blend { radius } => radius.max(1e-6),
+        _ => 0.0,
     }
 }
 
@@ -210,12 +216,14 @@ fn emit(
                 NodeKind::Intersect { .. } => OpKind::Intersect,
                 _ => unreachable!(),
             };
+            let mut params = [0.0f32; 8];
+            params[0] = combinator_radius(*material_combine);
             out.push(ProcInstruction {
                 op: op as u32,
                 arity: emitted,
                 material_combine: material_combine_bits(*material_combine),
                 material_id: 0,
-                params: [0.0; 8],
+                params,
                 color: [0.0; 4],
                 inverse_world: Mat4::IDENTITY.to_cols_array_2d(),
             });
