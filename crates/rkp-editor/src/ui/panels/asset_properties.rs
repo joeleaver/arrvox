@@ -264,13 +264,27 @@ fn model_import_fields(
     profile: Option<rkp_engine::import_profile::ImportProfile>,
     cmd_tx: CmdSignal,
 ) -> rinch::core::dom::NodeHandle {
+    let store = use_context::<EditorStore>();
     let profile = profile.unwrap_or_default();
     let src = Signal::new(source_path);
 
+    // Track whether this source is currently being re-imported on the
+    // engine thread. Used below to swap the Re-import button for a
+    // progress indicator — voxelizing a high-poly mesh at a fine tier
+    // can take minutes, and the button gave no feedback otherwise.
+    let is_importing = Memo::new(move || {
+        let s = src.get();
+        store.importing_models.get().iter().any(|p| *p == s)
+    });
+
     let display_name = Signal::new(profile.display_name.unwrap_or_default());
+    // Voxel size is chosen from the four standard tiers (matches the
+    // procedural build panel + mesh-import auto-detect tiers in
+    // voxelize_opacity::auto_voxel_size). "auto" means pick the coarsest
+    // tier that still gives ≥8 bricks on the longest mesh axis.
     let voxel_size_str = Signal::new(
         profile.voxel_size
-            .map(|v| format!("{v:.4}"))
+            .map(format_voxel_tier)
             .unwrap_or_else(|| "auto".into()),
     );
     let target_size = Signal::new(profile.target_size);
@@ -315,7 +329,19 @@ fn model_import_fields(
                     overflow-y:auto;flex:1;",
 
             {prop_text(__scope, "Name", display_name, import_cb("display_name"))}
-            {prop_text(__scope, "Voxel Size", voxel_size_str, import_cb("voxel_size"))}
+            {prop_select(
+                __scope,
+                "Voxel Size",
+                voxel_size_str,
+                &[
+                    ("auto", "Auto"),
+                    ("0.005", "5mm (finest)"),
+                    ("0.02", "2cm"),
+                    ("0.08", "8cm"),
+                    ("0.32", "32cm (coarsest)"),
+                ],
+                import_cb("voxel_size"),
+            )}
             {prop_slider(__scope, "Target Size", target_size, 0.1, 10.0, 0.1, import_cb_f32("target_size"))}
             {prop_slider(__scope, "Rotate X", rot_x, -180.0, 180.0, 1.0, import_cb_f32("rotation_x"))}
             {prop_slider(__scope, "Rotate Y", rot_y, -180.0, 180.0, 1.0, import_cb_f32("rotation_y"))}
@@ -323,17 +349,46 @@ fn model_import_fields(
             {prop_checkbox(__scope, "Import Colors", import_colors, import_cb_bool("import_colors"))}
             {prop_checkbox(__scope, "Keep Original Scale", no_normalize, import_cb_bool("no_normalize"))}
 
-            // Re-import button
+            // Re-import button — replaced by a progress indicator while
+            // the engine is voxelizing this source.
             div {
                 style: "margin-top:4px;",
-                {prop_button(__scope, "Re-import", "#2d5a2d", Rc::new(move || {
-                    let _ = cmd_tx.get().send(rkp_engine::EngineCommand::ReimportModel {
-                        source_path: src.get(),
-                    });
-                }))}
+                if is_importing.get() {
+                    div {
+                        style: "display:flex;align-items:center;justify-content:center;\
+                                gap:8px;padding:6px 12px;background:#2d2d2d;\
+                                border:1px solid #3c3c3c;border-radius:4px;\
+                                color:#bbb;font-size:11px;",
+                        Loader { r#type: "oval", size: "xs", color: "blue" }
+                        {"Importing…"}
+                    }
+                } else {
+                    {prop_button(__scope, "Re-import", "#2d5a2d", Rc::new(move || {
+                        let _ = cmd_tx.get().send(rkp_engine::EngineCommand::ReimportModel {
+                            source_path: src.get(),
+                        });
+                    }))}
+                }
             }
         }
     }
+}
+
+/// Snap a stored voxel size to the nearest standard tier string so the
+/// dropdown always shows a value it offers. Out-of-tier values (legacy
+/// profiles, hand-edited sidecars) get the nearest match.
+fn format_voxel_tier(v: f32) -> String {
+    const TIERS: [f32; 4] = [0.005, 0.02, 0.08, 0.32];
+    let mut best = TIERS[0];
+    let mut best_err = (v - best).abs();
+    for &t in &TIERS[1..] {
+        let err = (v - t).abs();
+        if err < best_err {
+            best = t;
+            best_err = err;
+        }
+    }
+    format!("{best}")
 }
 
 fn format_size(bytes: u64) -> String {

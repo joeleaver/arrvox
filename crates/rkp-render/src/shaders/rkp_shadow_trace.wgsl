@@ -21,6 +21,7 @@ const BRICK_DIM: u32 = 4u;
 const BRICK_DIM_F: f32 = 4.0;
 const BRICK_CELLS: u32 = 64u;
 const BRICK_CELL_EMPTY: u32 = 0xFFFFFFFFu;
+const BRICK_CELL_INTERIOR: u32 = 0xFFFFFFFDu;
 const BRICK_MAX_STEPS: u32 = 16u;
 
 struct RkpObject {
@@ -55,6 +56,11 @@ struct MarchParams {
     mode: u32,
     shadow_max_steps: u32,
     num_lights: u32,
+    // Must match octree_march.wgsl: same uniform buffer binding.
+    lod_enabled: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 struct GpuLight {
@@ -86,7 +92,8 @@ struct OctreeResult {
 
 // Group 0: scene data (shared with march).
 @group(0) @binding(0) var<storage, read> brick_pool: array<u32>;
-@group(0) @binding(1) var<storage, read> octree_nodes: array<u32>;
+// Interleaved (node_value, prefilter_attr_id) — see octree_march.wgsl.
+@group(0) @binding(1) var<storage, read> octree_nodes: array<vec2<u32>>;
 @group(0) @binding(2) var<storage, read> objects: array<RkpObject>;
 @group(0) @binding(3) var<uniform> camera: CameraUniforms;
 @group(0) @binding(4) var<storage, read> color_pool_data: array<u32>;
@@ -100,7 +107,7 @@ struct OctreeResult {
 // Group 2: march params + materials + stats + lights (shared with march).
 @group(2) @binding(0) var<uniform> march_params: MarchParams;
 @group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
-@group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 52>;
+@group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 64>;
 @group(2) @binding(3) var<storage, read> screen_aabbs: array<vec4<f32>>;
 @group(2) @binding(4) var<storage, read> lights: array<GpuLight>;
 
@@ -127,7 +134,7 @@ fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: 
     var half = extent * 0.5;
     var center = vec3<f32>(half);
     for (var level = 0u; level < max_depth; level++) {
-        let node = octree_nodes[offset];
+        let node = octree_nodes[offset].x;
         if node == OCTREE_EMPTY {
             bucket_depth(phase, level);
             return OctreeResult(OCTREE_EMPTY, level, center, half);
@@ -150,7 +157,7 @@ fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: 
         );
     }
     bucket_depth(phase, max_depth);
-    let node = octree_nodes[offset];
+    let node = octree_nodes[offset].x;
     if node == OCTREE_EMPTY { return OctreeResult(OCTREE_EMPTY, max_depth, center, half); }
     if node == OCTREE_INTERIOR { return OctreeResult(OCTREE_INTERIOR, max_depth, center, half); }
     if (node & OCTREE_LEAF_BIT) != 0u {
@@ -258,7 +265,10 @@ fn trace_shadow_ray(
                     let cz = u32(lz);
                     let flat = cx + cy * BRICK_DIM + cz * BRICK_DIM * BRICK_DIM;
                     let cell = brick_pool[brick_base + flat];
-                    if cell != BRICK_CELL_EMPTY {
+                    // BRICK_CELL_INTERIOR is solid-bulk-marker from
+                    // mesh imports; treat as empty for shadow (the
+                    // shell in front casts the shadow).
+                    if cell != BRICK_CELL_EMPTY && cell != BRICK_CELL_INTERIOR {
                         let attr = leaf_attr_pool[cell];
                         let mid = leaf_attr_material_primary(attr);
                         let m_op = materials[mid].opacity;

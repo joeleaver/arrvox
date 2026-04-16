@@ -5,7 +5,7 @@
 //! a contiguous region tracked by an [`OctreeHandle`]. Deallocated regions go
 //! onto a free list for reuse.
 
-use crate::sparse_octree::SparseOctree;
+use crate::sparse_octree::{SparseOctree, INTERNAL_ATTR_NONE};
 
 /// Handle to an allocated octree region in the packed buffer.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -20,10 +20,21 @@ pub struct OctreeHandle {
     pub base_voxel_size: f32,
 }
 
-/// Packs multiple octrees into a single `Vec<u32>` for GPU upload.
+/// Packs multiple octrees into a single `Vec<u32>` for GPU upload, plus a
+/// parallel `Vec<u32>` of prefiltered-LOD attr ids (one per node slot).
+///
+/// The GPU side interleaves the two as `array<vec2<u32>>` — see
+/// `RkpScene::upload_geometry`. Keeping them as two separate Vecs on the
+/// CPU side lets the rest of rkp-core treat them as independent buffers;
+/// the interleave happens at upload time.
 #[derive(Debug)]
 pub struct OctreeAllocator {
     data: Vec<u32>,
+    /// Parallel prefiltered-LOD attr ids, same length as `data`. Unlike
+    /// `data`, entries here are never rebased — each entry is a global
+    /// `leaf_attr_id` from the shared `LeafAttrPool`, or
+    /// [`INTERNAL_ATTR_NONE`] when no prefilter is available for that slot.
+    internal_attrs: Vec<u32>,
     free_list: Vec<(u32, u32)>, // (offset, length)
 }
 
@@ -32,6 +43,7 @@ impl OctreeAllocator {
     pub fn new() -> Self {
         Self {
             data: Vec::new(),
+            internal_attrs: Vec::new(),
             free_list: Vec::new(),
         }
     }
@@ -40,6 +52,7 @@ impl OctreeAllocator {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             data: Vec::with_capacity(capacity),
+            internal_attrs: Vec::with_capacity(capacity),
             free_list: Vec::new(),
         }
     }
@@ -48,14 +61,19 @@ impl OctreeAllocator {
     ///
     /// The octree's internal node offsets are rebased to be absolute within the
     /// packed buffer (by adding the allocation offset to all branch pointers).
+    /// The parallel `internal_attrs` are copied verbatim (no rebasing — the
+    /// ids they carry are global `leaf_attr_pool` slots, already absolute).
     pub fn allocate(&mut self, octree: &SparseOctree) -> OctreeHandle {
         let nodes = octree.as_slice();
+        let attrs = octree.internal_attr_slice();
+        debug_assert_eq!(nodes.len(), attrs.len());
         let len = nodes.len() as u32;
 
         let offset = if let Some(idx) = self.find_free_region(len) {
             let (free_offset, free_len) = self.free_list[idx];
             let start = free_offset as usize;
             self.data[start..start + len as usize].copy_from_slice(nodes);
+            self.internal_attrs[start..start + len as usize].copy_from_slice(attrs);
             if free_len > len {
                 self.free_list[idx] = (free_offset + len, free_len - len);
             } else {
@@ -65,6 +83,7 @@ impl OctreeAllocator {
         } else {
             let offset = self.data.len() as u32;
             self.data.extend_from_slice(nodes);
+            self.internal_attrs.extend_from_slice(attrs);
             offset
         };
 
@@ -97,6 +116,12 @@ impl OctreeAllocator {
         for entry in &mut self.data[start..end] {
             *entry = crate::sparse_octree::EMPTY_NODE;
         }
+        // Clear the parallel prefilter ids too — a stale id could otherwise
+        // point at a leaf_attr slot now owned by another asset after a
+        // reallocation overwrites this region.
+        for entry in &mut self.internal_attrs[start..end] {
+            *entry = INTERNAL_ATTR_NONE;
+        }
         self.free_list.push((handle.root_offset, handle.len));
         self.coalesce_and_shrink();
     }
@@ -124,6 +149,7 @@ impl OctreeAllocator {
         while let Some(&(off, len)) = self.free_list.last() {
             if (off + len) as usize == self.data.len() {
                 self.data.truncate(off as usize);
+                self.internal_attrs.truncate(off as usize);
                 self.free_list.pop();
             } else {
                 break;
@@ -141,6 +167,14 @@ impl OctreeAllocator {
     #[inline]
     pub fn as_slice(&self) -> &[u32] {
         &self.data
+    }
+
+    /// Parallel prefilter-attr slice, same length as [`as_slice`](Self::as_slice).
+    /// The GPU upload interleaves these with the node values into a
+    /// single `array<vec2<u32>>` binding.
+    #[inline]
+    pub fn internal_attrs_slice(&self) -> &[u32] {
+        &self.internal_attrs
     }
 
     /// Number of free-list regions.
@@ -494,5 +528,66 @@ mod tests {
         // h2 + h3 now adjacent and at the tail — both should be reclaimed.
         assert_eq!(alloc.buffer_len(), h1.len as usize);
         assert_eq!(alloc.free_region_count(), 0);
+    }
+
+    #[test]
+    fn internal_attrs_slice_mirrors_data_slice() {
+        let mut alloc = OctreeAllocator::new();
+        let t = make_test_octree();
+        alloc.allocate(&t);
+        assert_eq!(alloc.as_slice().len(), alloc.internal_attrs_slice().len());
+        // Post-allocate: all sentinel (prefilter hasn't run on the test tree).
+        assert!(alloc.internal_attrs_slice().iter().all(|&x| x == INTERNAL_ATTR_NONE));
+    }
+
+    #[test]
+    fn allocator_preserves_per_slot_internal_attrs() {
+        // Hand-populate a tree's internal_attr_index, then allocate —
+        // the allocator should copy the values through to its parallel
+        // buffer at the corresponding offsets.
+        let mut alloc = OctreeAllocator::new();
+        let mut t = make_test_octree();
+        // Pick the first branch and seed a cookie there. Lookup scans until
+        // hitting a branch to avoid hard-coding index 0's type.
+        let mut seeded = None;
+        for i in 0..t.node_count() {
+            if crate::sparse_octree::is_branch(t.as_slice()[i]) {
+                t.set_internal_attr(i as u32, 0xCAFEBABE);
+                seeded = Some(i);
+                break;
+            }
+        }
+        let seed_idx = seeded.expect("test tree should have a branch");
+        let h = alloc.allocate(&t);
+
+        assert_eq!(
+            alloc.internal_attrs_slice()[h.root_offset as usize + seed_idx],
+            0xCAFEBABE,
+        );
+    }
+
+    #[test]
+    fn deallocate_clears_internal_attrs() {
+        let mut alloc = OctreeAllocator::new();
+        let mut t = make_test_octree();
+        for i in 0..t.node_count() {
+            if crate::sparse_octree::is_branch(t.as_slice()[i]) {
+                t.set_internal_attr(i as u32, 0xAABBCCDD);
+                break;
+            }
+        }
+        let h = alloc.allocate(&t);
+        // Before dealloc: at least one non-sentinel somewhere in our region.
+        let region_range = h.root_offset as usize..(h.root_offset + h.len) as usize;
+        assert!(
+            alloc.internal_attrs_slice()[region_range.clone()]
+                .iter()
+                .any(|&x| x != INTERNAL_ATTR_NONE),
+        );
+
+        alloc.deallocate(h);
+        // After dealloc (tail-reclaim truncates both vecs): nothing remains.
+        assert_eq!(alloc.as_slice().len(), 0);
+        assert_eq!(alloc.internal_attrs_slice().len(), 0);
     }
 }

@@ -38,6 +38,16 @@ pub struct StateUpdate {
     pub project_name: Option<String>,
     /// Available model files — only sent when the list changes.
     pub available_models: Option<Vec<ModelInfo>>,
+    /// Source paths currently being re-imported. Sent whenever the set
+    /// changes — on submit (grows) or completion (shrinks). The UI uses
+    /// this to show a progress indicator in place of the Re-import button.
+    pub importing_models: Option<Vec<String>>,
+    /// Editor layout blob round-tripped from `.rkproject`. Sent once on
+    /// project open so the editor can hydrate its docking state; the
+    /// outer `Option` is "is this tick carrying a layout update?", the
+    /// inner `Option` is "was one stored?" (None = pre-persistence
+    /// project, editor should reset to its default layout).
+    pub editor_layout: Option<Option<String>>,
     /// Inspector data for the selected entity — sent when selection changes.
     pub inspector: Option<crate::inspector::InspectorSnapshot>,
     /// Component names that can be added to the selected entity.

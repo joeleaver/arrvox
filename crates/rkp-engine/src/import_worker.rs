@@ -43,11 +43,26 @@ impl ImportWorker {
                         req.source_path.display(),
                         req.output_path.display(),
                     );
-                    let result = rkp_render::import_mesh_to_opacity_rkp(
-                        &req.source_path,
-                        &req.output_path,
-                        &req.config,
+                    // Catch panics from the importer so the main thread
+                    // always gets a completion — otherwise a panic (OOM,
+                    // glTF parser assertion, etc.) would leave the UI
+                    // spinner hanging forever with no error surfaced.
+                    let source = req.source_path.clone();
+                    let output = req.output_path.clone();
+                    let config = req.config.clone();
+                    let result = std::panic::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| {
+                            rkp_render::import_mesh_to_opacity_rkp(&source, &output, &config)
+                        }),
                     );
+                    let result = match result {
+                        Ok(r) => r,
+                        Err(payload) => {
+                            let msg = panic_message(&payload);
+                            eprintln!("[ImportWorker] panic: {msg}");
+                            Err(format!("importer panicked: {msg}"))
+                        }
+                    };
                     match &result {
                         Ok(r) => eprintln!(
                             "[ImportWorker] done: {} voxels, {:.1} KB",
@@ -103,4 +118,17 @@ pub fn default_import_config() -> ImportConfig {
 /// e.g., `assets/objects/bunny.glb` → `assets/objects/bunny.rkp`
 pub fn rkp_output_path(source: &Path) -> PathBuf {
     source.with_extension("rkp")
+}
+
+/// Extract a human-readable message from a `catch_unwind` payload.
+/// Panics carry either `&'static str` or `String` in the common cases;
+/// fall back to an opaque label for anything exotic.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }

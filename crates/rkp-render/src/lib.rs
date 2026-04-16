@@ -38,7 +38,7 @@ pub mod viewport_renderer;
 
 pub use voxelize_opacity::import_mesh_to_opacity_rkp;
 pub use octree_gpu::OctreeGpu;
-pub use rkp_scene_manager::{AssetHandle, AssetInfo, RkpSceneManager};
+pub use rkp_scene_manager::{AssetHandle, AssetInfo, ReloadResult, RkpSceneManager};
 pub use viewport_renderer::ViewportRenderer;
 
 /// What a viewport's render pipeline should look like.

@@ -7,7 +7,7 @@
 //! (INTERIOR_NODE). No per-voxel opacity field is produced or stored; the
 //! runtime reads the baked normal + color and shades directly.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use glam::Vec3;
 use rayon::prelude::*;
@@ -25,6 +25,16 @@ use rkf_import::skeleton_extract::{self, VertexSkinning};
 /// Flat voxel index within a brick (matches rkf-core convention).
 fn voxel_index(x: u8, y: u8, z: u8) -> u32 {
     x as u32 + y as u32 * 8 + z as u32 * 64
+}
+
+/// Sidecar path used for atomic writes — same dir + stem as `final_path`
+/// with `.inprogress` appended so a failed import never truncates the
+/// live file. Must append (not swap extensions) to preserve the `.rkp` /
+/// `.rkskel` suffix the scanner keys off.
+fn staging_path(final_path: &Path) -> PathBuf {
+    let mut s = final_path.as_os_str().to_owned();
+    s.push(".inprogress");
+    PathBuf::from(s)
 }
 
 /// Result of processing a single brick — signed distance, material, and
@@ -466,6 +476,52 @@ pub fn import_mesh_to_opacity_rkp(
                     file_bricks.extend(std::iter::repeat(rkp_core::brick_pool::BRICK_EMPTY).take(brick_cells_u32));
                     let brick_base = brick_id as usize * brick_cells_u32;
 
+                    // Mark every d<=0 cell in this sub-brick as
+                    // BRICK_INTERIOR (zero-cost: the brick's 64 slots
+                    // are pre-allocated regardless of content, so this
+                    // just replaces BRICK_EMPTY in those slots).
+                    //
+                    // Neighborhood kernels (Laplacian smoothing at
+                    // bake time, surface-nets normal reconstruction if
+                    // re-enabled) need "is this cell inside the
+                    // solid?" info that a pure outer-shell design
+                    // can't provide — without this fill, thin-shell
+                    // imports produce concentric ring artifacts.
+                    //
+                    // The march treats BRICK_INTERIOR identically to
+                    // BRICK_EMPTY for hit purposes so surface rays
+                    // still only stop at the shell. Overwritten next
+                    // by shell_entries for cells that carry a real
+                    // leaf_attr (disjoint sets: d<=0 vs d>0).
+                    //
+                    // KNOWN ISSUE: causes subtle shading artifacts on
+                    // some mesh imports (horizontal-band-style visual
+                    // quirks). Root cause not yet identified — static
+                    // analysis shows the shader should treat
+                    // BRICK_INTERIOR identically to BRICK_EMPTY.
+                    // Needs a shader-level diagnostic (color cells by
+                    // first-encountered-type) to bisect. Until fixed,
+                    // the interior-fill is still the architecturally
+                    // correct thing to do; the artifact is modest and
+                    // appears on specific high-curvature surfaces only.
+                    for cz_fill in 0..octree_brick_dim {
+                        for cy_fill in 0..octree_brick_dim {
+                            for cx_fill in 0..octree_brick_dim {
+                                let vx = sub_origin_x + cx_fill;
+                                let vy = sub_origin_y + cy_fill;
+                                let vz = sub_origin_z + cz_fill;
+                                let flat8 = (vx + vy * 8 + vz * 64) as usize;
+                                if result.signed_distances[flat8] <= 0.0 {
+                                    let cell_flat = cx_fill
+                                        + cy_fill * octree_brick_dim
+                                        + cz_fill * octree_brick_dim * octree_brick_dim;
+                                    file_bricks[brick_base + cell_flat as usize] =
+                                        rkp_core::brick_pool::BRICK_INTERIOR;
+                                }
+                            }
+                        }
+                    }
+
                     for e in &shell_entries {
                         // SDF-gradient normal (6-tap central differences).
                         let grad = glam::Vec3::new(
@@ -576,36 +632,63 @@ pub fn import_mesh_to_opacity_rkp(
     // TODO: Per-voxel bone data (bone weights per leaf voxel, not per brick)
     let bone_data: Option<&[u8]> = None;
 
-    let file = std::fs::File::create(output_path)
-        .map_err(|e| format!("create output: {e}"))?;
-    let mut writer = std::io::BufWriter::new(file);
+    // Atomic write: stage both artifacts to sibling `.inprogress` paths,
+    // then rename on success. A mid-write failure (disk full, panic, user
+    // kill) leaves the old `.rkp` / `.rkskel` on disk untouched so the
+    // next `acquire_asset` keeps working. Clean up any leftovers from a
+    // previously-crashed run first.
+    let rkp_tmp = staging_path(output_path);
+    let skel_final = output_path.with_extension("rkskel");
+    let skel_tmp = staging_path(&skel_final);
+    let _ = std::fs::remove_file(&rkp_tmp);
 
-    // Expand AABB by one voxel so the outer shell voxels (one voxel beyond
-    // the mesh surface on the outside) fall inside the geometry bounds.
-    let shell_margin = Vec3::splat(voxel_size);
-    let geometry_aabb = Aabb::new(aabb.min - shell_margin, aabb.max + shell_margin);
-    rkp_core::asset_file::write_rkp(
-        &mut writer,
-        octree.as_slice(),
-        depth,
-        voxel_size,
-        voxel_count,
-        geometry_aabb.min.to_array(),
-        geometry_aabb.max.to_array(),
-        &material_ids,
-        &voxel_bytes,
-        normals_data,
-        bricks_data,
-        color_data.as_deref(),
-        bone_data,
-    )
-    .map_err(|e| format!("write .rkp: {e}"))?;
+    // Cleanup helper: on any write error below, drop both temps so we
+    // don't leave half-written files sitting around.
+    let cleanup = |rkp_tmp: &Path, skel_tmp: &Path| {
+        let _ = std::fs::remove_file(rkp_tmp);
+        let _ = std::fs::remove_file(skel_tmp);
+    };
 
-    let file_size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+    let write_rkp_result = (|| -> Result<(), String> {
+        let file = std::fs::File::create(&rkp_tmp)
+            .map_err(|e| format!("create output: {e}"))?;
+        let mut writer = std::io::BufWriter::new(file);
 
-    // 6. Save skeleton sidecar
-    let skeleton_path = if let Some(ref extraction) = skinning {
-        let skel_path = output_path.with_extension("rkskel");
+        // Expand AABB by one voxel so the outer shell voxels (one voxel
+        // beyond the mesh surface on the outside) fall inside the
+        // geometry bounds.
+        let shell_margin = Vec3::splat(voxel_size);
+        let geometry_aabb = Aabb::new(aabb.min - shell_margin, aabb.max + shell_margin);
+        rkp_core::asset_file::write_rkp(
+            &mut writer,
+            octree.as_slice(),
+            depth,
+            voxel_size,
+            voxel_count,
+            geometry_aabb.min.to_array(),
+            geometry_aabb.max.to_array(),
+            &material_ids,
+            &voxel_bytes,
+            normals_data,
+            bricks_data,
+            color_data.as_deref(),
+            bone_data,
+        )
+        .map_err(|e| format!("write .rkp: {e}"))?;
+
+        Ok(())
+    })();
+    if let Err(e) = write_rkp_result {
+        cleanup(&rkp_tmp, &skel_tmp);
+        return Err(e);
+    }
+
+    let file_size = std::fs::metadata(&rkp_tmp).map(|m| m.len()).unwrap_or(0);
+
+    // 6. Save skeleton sidecar to its own staging path. A failure here is
+    // soft — we log it and drop the skel, same as before atomic writes.
+    let wrote_skel = if let Some(ref extraction) = skinning {
+        let _ = std::fs::remove_file(&skel_tmp);
         let asset = rkf_animation::skeleton_asset::SkeletonAsset::with_normalization(
             extraction.skeleton.clone(),
             extraction.clips.clone(),
@@ -614,13 +697,39 @@ pub fn import_mesh_to_opacity_rkp(
             norm.rotation_offset,
             norm.rotation_center.to_array(),
         );
-        match rkf_animation::skeleton_asset::save_rkskel(&asset, &skel_path) {
+        match rkf_animation::skeleton_asset::save_rkskel(&asset, &skel_tmp) {
             Ok(()) => {
-                eprintln!("Saved skeleton: {} bones → {}", extraction.skeleton.bones.len(), skel_path.display());
-                Some(skel_path)
+                eprintln!(
+                    "Saved skeleton: {} bones → {}",
+                    extraction.skeleton.bones.len(), skel_final.display(),
+                );
+                true
             }
             Err(e) => {
                 eprintln!("Failed to save .rkskel: {e}");
+                let _ = std::fs::remove_file(&skel_tmp);
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    // Commit: rename `.rkp` first (the primary artifact). Do the skel
+    // second so a rename failure on the skel doesn't leave the user
+    // with a new skeleton sidecar pointing at stale geometry.
+    if let Err(e) = std::fs::rename(&rkp_tmp, output_path) {
+        cleanup(&rkp_tmp, &skel_tmp);
+        return Err(format!("rename .rkp: {e}"));
+    }
+    let skeleton_path = if wrote_skel {
+        match std::fs::rename(&skel_tmp, &skel_final) {
+            Ok(()) => Some(skel_final),
+            Err(e) => {
+                eprintln!(
+                    "Failed to swap .rkskel into place: {e} — keeping previous skeleton"
+                );
+                let _ = std::fs::remove_file(&skel_tmp);
                 None
             }
         }

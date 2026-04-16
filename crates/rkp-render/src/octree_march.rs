@@ -6,9 +6,11 @@
 
 use crate::validate_wgsl;
 
-/// Stats buffer size in bytes (52 × u32). See the `stats` binding in
-/// `shaders/octree_march.wgsl` for the layout.
-const STATS_U32_COUNT: usize = 52;
+/// Stats buffer size in bytes (64 × u32). See the `stats` binding in
+/// `shaders/octree_march.wgsl` for the layout. Expanded from 52 when
+/// the Surface-Nets normal-reconstruction POC added counters at
+/// stats[52..55].
+const STATS_U32_COUNT: usize = 64;
 const STATS_BYTES: u64 = (STATS_U32_COUNT * 4) as u64;
 
 /// Uniform parameters for the march shader.
@@ -19,6 +21,18 @@ pub struct MarchParams {
     pub mode: u32,
     pub shadow_max_steps: u32,
     pub num_lights: u32,
+    /// LOD gate: `1` → read `.y` from `octree_nodes` at branches and
+    /// early-exit when the node's projected screen footprint falls
+    /// below ~1 pixel. `0` → descend every branch to a terminal node
+    /// (pre-LOD behavior, kept as an A/B lever for correctness tests
+    /// and as a runtime kill-switch).
+    pub lod_enabled: u32,
+    /// Surface-Nets normal gate: `1` → reconstruct per-voxel normal at
+    /// render time from the 3³ in-brick occupancy neighborhood. `0` →
+    /// use the baked octahedral normal from `LeafAttr`. A/B toggle for
+    /// the POC.
+    pub surfacenet_enabled: u32,
+    pub _pad: [u32; 2],
 }
 
 /// The octree ray march compute pass.
@@ -299,6 +313,10 @@ impl OctreeMarchPass {
             let voxel_pool_reads = vals[45] as u64;
             let color_pool_reads = vals[46] as u64;
             let materials_reads = vals[47] as u64;
+            let lod_exits: &[u32] = &vals[48..52]; // L0-2, L3-5, L6-8, L9+
+            let surfnet_reconstructions = vals[52] as u64;
+            let surfnet_boundary_clips = vals[53] as u64;
+            let surfnet_degenerate = vals[54] as u64;
 
             let sum = |h: &[u32]| -> u64 { h.iter().map(|&x| x as u64).sum() };
             let weighted = |h: &[u32]| -> f64 {
@@ -340,12 +358,34 @@ impl OctreeMarchPass {
                 "[footprint] <1px:{:.0}%  1-2px:{:.0}%  2-4px:{:.0}%  >=4px:{:.0}%  (n={})",
                 pct(foot[0]), pct(foot[1]), pct(foot[2]), pct(foot[3]), foot_total,
             );
+            let lod_total: u64 = lod_exits.iter().map(|&x| x as u64).sum();
+            if lod_total > 0 {
+                eprintln!(
+                    "[lod exits] {}  L0-2:{}  L3-5:{}  L6-8:{}  L9+:{}",
+                    lod_total, lod_exits[0], lod_exits[1], lod_exits[2], lod_exits[3],
+                );
+            } else {
+                eprintln!("[lod exits] 0  — LOD disabled, or no branches had prefilter attrs at cutoff levels");
+            }
+            if surfnet_reconstructions > 0 {
+                let pct_boundary = 100.0 * surfnet_boundary_clips as f64
+                    / surfnet_reconstructions as f64;
+                let pct_degen = 100.0 * surfnet_degenerate as f64
+                    / surfnet_reconstructions as f64;
+                eprintln!(
+                    "[surfnet] {} recon  {:.0}% at brick boundary  {:.1}% degenerate → baked fallback",
+                    surfnet_reconstructions, pct_boundary, pct_degen,
+                );
+            }
 
             // Per-buffer byte traffic per frame. Octree reads come from the
             // depth histograms; other buffers have direct atomic counters.
             let octree_reads = phase_node_reads(surface) + phase_node_reads(normal) + phase_node_reads(shadow);
             let mb = |bytes: u64| -> f64 { bytes as f64 / (1024.0 * 1024.0) };
-            let octree_bytes     = octree_reads       * 4;  // 4 B per node
+            // Each octree slot now holds `vec2<u32>` (node value + prefilter id)
+            // → 8 B per slot. Even when LOD is off, the `.y` lane ends up in the
+            // same cache line, so we count the full 8 B per read.
+            let octree_bytes     = octree_reads       * 8;  // 8 B per node (vec2<u32>)
             let leaf_attr_bytes  = leaf_attr_reads    * 8;  // LeafAttr = 8 B
             let voxel_bytes      = voxel_pool_reads   * 8;  // VoxelSample = 8 B
             let color_bytes      = color_pool_reads   * 4;  // packed color u32
@@ -380,6 +420,8 @@ impl OctreeMarchPass {
         mode: u32,
         shadow_max_steps: u32,
         num_lights: u32,
+        lod_enabled: bool,
+        surfacenet_enabled: bool,
         timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) {
         // Update params.
@@ -388,6 +430,9 @@ impl OctreeMarchPass {
             mode,
             shadow_max_steps,
             num_lights,
+            lod_enabled: if lod_enabled { 1 } else { 0 },
+            surfacenet_enabled: if surfacenet_enabled { 1 } else { 0 },
+            _pad: [0; 2],
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
 

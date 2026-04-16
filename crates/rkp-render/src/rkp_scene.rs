@@ -39,8 +39,15 @@ pub struct CameraUniforms {
 
 /// Geometry data — uploaded once when geometry changes (load, sculpt, voxelize).
 pub struct GeometryUpload<'a> {
-    /// Octree node buffer (packed u32s).
-    pub octree_nodes: &'a [u8],
+    /// Octree node values (packed u32s), one per node slot.
+    pub octree_nodes: &'a [u32],
+    /// Parallel prefiltered-LOD attr ids (u32s), one per node slot. Same
+    /// length as `octree_nodes`. Entry is `INTERNAL_ATTR_NONE` for non-
+    /// branches and for branches without a prefilter. The scene buffer
+    /// interleaves these with `octree_nodes` into a single
+    /// `array<vec2<u32>>` binding so we stay under the 12-storage-buffer
+    /// per-stage limit.
+    pub octree_internal_attrs: &'a [u32],
     /// Per-leaf attributes: `LeafAttr { normal_oct, material_primary,
     /// material_secondary_blend }`, 8 B each. Indexed by the leaf_attr_id
     /// stored in octree leaf nodes.
@@ -52,6 +59,12 @@ pub struct GeometryUpload<'a> {
     /// Indexed by `brick_id * 64 + flat_cell_index`. A cell's value is either
     /// 0xFFFFFFFF (empty) or a leaf_attr_id.
     pub brick_pool: &'a [u8],
+    /// Brick face-adjacency links — 6 u32 per brick in the order
+    /// `(−X, +X, −Y, +Y, −Z, +Z)`, byte-cast. Each entry is a
+    /// neighboring brick_id or a FACE_EMPTY/FACE_INTERIOR sentinel.
+    /// Used by the Surface-Nets reconstruction shader to traverse into
+    /// adjacent bricks for cross-boundary neighbor reads.
+    pub brick_face_links: &'a [u8],
 }
 
 /// Per-frame data — objects only. Camera uniforms are per-viewport and
@@ -67,17 +80,24 @@ pub struct FrameUpload<'a> {
 ///   0: brick_pool (storage, read) — flat array of u32 cells, `brick_id * 64 + idx` indexes into it.
 ///       (Was a dummy voxel_pool slot pre-bricks; repurposed because we
 ///       were one storage-buffer over the per-stage limit.)
-///   1: octree_nodes (storage, read)
+///   1: octree_nodes (storage, read) — `array<vec2<u32>>`: `.x` = node
+///       value (EMPTY / INTERIOR / BRANCH offset / LEAF id / BRICK id),
+///       `.y` = prefiltered-LOD attr id (INTERNAL_ATTR_NONE when absent).
+///       Interleaved to stay under the 12-storage-buffer-per-stage limit
+///       — a separate buffer would have pushed us over.
 ///   2: objects (storage, read)
 ///   3: camera (uniform)
 ///   4: color_pool (storage, read) — parallel to leaf_attr_pool
 ///   5: bone_matrices (storage, read)
 ///   6: bone_weights (storage, read)
-///   7: deformed_pool (storage, read)
+///   7: brick_face_links (storage, read) — 6 u32 per brick giving
+///       adjacent brick ids / FACE_{EMPTY,INTERIOR} sentinels. (This
+///       slot was `deformed_pool` pre-Surface-Nets; deformed_pool
+///       wasn't wired into the active pipeline so the slot was free.)
 ///   8: leaf_attr_pool (storage, read) — `LeafAttr { normal_oct, material_primary, material_secondary_blend }`
 ///
-/// 9 storage buffers + 1 uniform in group 0; group 2 holds 3 more storage
-/// buffers + 2 uniforms — total 12 storage buffers per stage, exactly at
+/// 8 storage buffers + 1 uniform in group 0; group 2 holds 4 more storage
+/// buffers + 1 uniform — total 12 storage buffers per stage, exactly at
 /// the rkf-render device limit.
 /// Shared scene GPU buffers. The camera uniform is **not** here — it's
 /// per-viewport (`ViewportRenderer::camera_buffer`) so that two viewports
@@ -91,7 +111,7 @@ pub struct RkpScene {
     pub color_pool_buffer: wgpu::Buffer,
     pub bone_matrices_buffer: wgpu::Buffer,
     pub bone_weights_buffer: wgpu::Buffer,
-    pub deformed_pool_buffer: wgpu::Buffer,
+    pub brick_face_links_buffer: wgpu::Buffer,
     pub leaf_attr_pool_buffer: wgpu::Buffer,
     pub bind_group_layout: wgpu::BindGroupLayout,
     /// Incremented whenever a shared buffer reallocates. Each VR caches
@@ -103,12 +123,13 @@ pub struct RkpScene {
 impl RkpScene {
     pub fn new(device: &wgpu::Device) -> Self {
         let brick_pool_buffer = Self::create_storage(device, "rkp_brick_pool", 256);
-        let octree_nodes_buffer = Self::create_storage(device, "rkp_octree_nodes", 4);
+        // 8-byte stride: each slot is `vec2<u32>` (value, prefilter-id).
+        let octree_nodes_buffer = Self::create_storage(device, "rkp_octree_nodes", 8);
         let objects_buffer = Self::create_storage(device, "rkp_objects", std::mem::size_of::<RkpGpuObject>() as u64);
         let color_pool_buffer = Self::create_storage(device, "rkp_color_pool", 4);
         let bone_matrices_buffer = Self::create_storage(device, "rkp_bone_matrices", 64);
         let bone_weights_buffer = Self::create_storage(device, "rkp_bone_weights", 4);
-        let deformed_pool_buffer = Self::create_storage(device, "rkp_deformed_pool", 8);
+        let brick_face_links_buffer = Self::create_storage(device, "rkp_brick_face_links", 24);
         let leaf_attr_pool_buffer = Self::create_storage(device, "rkp_leaf_attr_pool", 8);
 
         let bind_group_layout = Self::create_layout(device);
@@ -116,7 +137,7 @@ impl RkpScene {
         Self {
             brick_pool_buffer, octree_nodes_buffer, objects_buffer,
             color_pool_buffer, bone_matrices_buffer,
-            bone_weights_buffer, deformed_pool_buffer, leaf_attr_pool_buffer,
+            bone_weights_buffer, brick_face_links_buffer, leaf_attr_pool_buffer,
             bind_group_layout,
             buffers_epoch: 0,
         }
@@ -140,7 +161,7 @@ impl RkpScene {
             device, &self.bind_group_layout,
             &self.brick_pool_buffer, &self.octree_nodes_buffer, &self.objects_buffer,
             camera_buffer, &self.color_pool_buffer, &self.bone_matrices_buffer,
-            &self.bone_weights_buffer, &self.deformed_pool_buffer, &self.leaf_attr_pool_buffer,
+            &self.bone_weights_buffer, &self.brick_face_links_buffer, &self.leaf_attr_pool_buffer,
         )
     }
 
@@ -148,20 +169,51 @@ impl RkpScene {
     /// Grows buffers as needed; bumps the epoch on reallocation so `ViewportRenderer`
     /// rebuilds its cached bind group.
     pub fn upload_geometry(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &GeometryUpload) {
+        assert_eq!(
+            data.octree_nodes.len(),
+            data.octree_internal_attrs.len(),
+            "octree_nodes and octree_internal_attrs must have matching length",
+        );
+
+        // Interleave (value, prefilter_id) into a `vec2<u32>`-layout buffer
+        // so a single binding slot carries both. Two separate bindings
+        // would have pushed us over the 12-storage-buffer-per-stage limit.
+        // One allocation per upload; octree_nodes uploads are rare
+        // (voxelize, load) so the cost is amortized.
+        let interleaved_u32_count = data.octree_nodes.len() * 2;
+        let mut interleaved: Vec<u32> = Vec::with_capacity(interleaved_u32_count);
+        for (i, &node) in data.octree_nodes.iter().enumerate() {
+            interleaved.push(node);
+            interleaved.push(data.octree_internal_attrs[i]);
+        }
+        let interleaved_bytes: &[u8] = bytemuck::cast_slice(&interleaved);
+
+        // Diagnostic: how many prefilter attrs are populated in the upload?
+        // Zero means prefilter didn't emit anything for this scene — LOD
+        // won't fire in the shader no matter what the uniform says.
+        let populated = data.octree_internal_attrs.iter()
+            .filter(|&&v| v != 0xFFFF_FFFF).count();
+        let total = data.octree_internal_attrs.len();
+        let pct = if total > 0 { 100.0 * populated as f32 / total as f32 } else { 0.0 };
+        eprintln!(
+            "[rkp_scene] prefilter attrs: {populated}/{total} ({pct:.1}%) populated",
+        );
+
         let mut needs_rebuild = false;
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.brick_pool_buffer, "rkp_brick_pool", data.brick_pool);
-        needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.octree_nodes_buffer, "rkp_octree_nodes", data.octree_nodes);
+        needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.octree_nodes_buffer, "rkp_octree_nodes", interleaved_bytes);
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.leaf_attr_pool_buffer, "rkp_leaf_attr_pool", data.leaf_attr_pool);
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.color_pool_buffer, "rkp_color_pool", data.color_pool);
+        needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.brick_face_links_buffer, "rkp_brick_face_links", data.brick_face_links);
 
         let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
         eprintln!(
-            "[rkp_scene] upload_geometry: octree_nodes={:.2} MiB  leaf_attr={:.2} MiB  color_pool={:.2} MiB  bricks={:.2} MiB  total={:.2} MiB",
-            mib(data.octree_nodes.len()),
+            "[rkp_scene] upload_geometry: octree_nodes={:.2} MiB (incl. prefilter ids)  leaf_attr={:.2} MiB  color_pool={:.2} MiB  bricks={:.2} MiB  total={:.2} MiB",
+            mib(interleaved_bytes.len()),
             mib(data.leaf_attr_pool.len()),
             mib(data.color_pool.len()),
             mib(data.brick_pool.len()),
-            mib(data.octree_nodes.len() + data.leaf_attr_pool.len() + data.color_pool.len() + data.brick_pool.len()),
+            mib(interleaved_bytes.len() + data.leaf_attr_pool.len() + data.color_pool.len() + data.brick_pool.len()),
         );
 
         if needs_rebuild {
@@ -240,7 +292,7 @@ impl RkpScene {
                 storage_ro(4), // color_pool
                 storage_ro(5), // bone_matrices
                 storage_ro(6), // bone_weights
-                storage_ro(7), // deformed_pool
+                storage_ro(7), // brick_face_links (was deformed_pool)
                 storage_ro(8), // leaf_attr_pool
             ],
         })
@@ -256,7 +308,7 @@ impl RkpScene {
         color_pool: &wgpu::Buffer,
         bone_matrices: &wgpu::Buffer,
         bone_weights: &wgpu::Buffer,
-        deformed_pool: &wgpu::Buffer,
+        brick_face_links: &wgpu::Buffer,
         leaf_attr_pool: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -270,7 +322,7 @@ impl RkpScene {
                 wgpu::BindGroupEntry { binding: 4, resource: color_pool.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: bone_matrices.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: bone_weights.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: deformed_pool.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: brick_face_links.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: leaf_attr_pool.as_entire_binding() },
             ],
         })

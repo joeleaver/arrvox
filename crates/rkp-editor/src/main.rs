@@ -8,8 +8,28 @@ mod ui;
 
 use rinch::prelude::*;
 
+use ui::layout::persist::PersistedEditorState;
 use ui::store::EditorStore;
 use ui::LayoutRoot;
+
+/// Snapshot the store's layout + widths and send them to the engine.
+/// Called just before any Save command so the cached JSON on the
+/// engine-side matches what the user sees when the project file is
+/// written. Short-circuits if serialization fails (can't happen with
+/// the current layout types, but we don't want a panic in the Save
+/// hotkey path even in theory).
+fn push_editor_layout(
+    tx: &crossbeam::channel::Sender<rkp_engine::EngineCommand>,
+    store: EditorStore,
+) {
+    let state = PersistedEditorState::capture(store);
+    match serde_json::to_string(&state) {
+        Ok(json) => {
+            let _ = tx.send(rkp_engine::EngineCommand::SetEditorLayout { json });
+        }
+        Err(e) => eprintln!("[rkp-editor] failed to serialize editor layout: {e}"),
+    }
+}
 
 /// Wrapper for the engine command sender, stored in rinch context.
 #[derive(Clone)]
@@ -24,6 +44,7 @@ pub struct BuildSurface(pub rinch::render_surface::RenderSurfaceHandle);
 
 fn build_menus(
     cmd_tx: crossbeam::channel::Sender<rkp_engine::EngineCommand>,
+    store: EditorStore,
 ) -> Vec<(&'static str, rinch::menu::Menu)> {
     use rinch::menu::{Menu, MenuItem};
 
@@ -78,6 +99,11 @@ fn build_menus(
         .item(MenuItem::new("Save").shortcut("Ctrl+S").on_click({
             let tx = tx.clone();
             move || {
+                // Push the layout FIRST so the engine's cached blob is
+                // fresh when the SaveScene handler folds it into the
+                // project file. Commands are FIFO on the channel, so
+                // ordering here is the ordering the engine sees.
+                push_editor_layout(&tx, store);
                 let _ = tx.send(rkp_engine::EngineCommand::SaveScene { path: None });
             }
         }))
@@ -89,6 +115,7 @@ fn build_menus(
                     .add_filter("RKIPatch Scene", &["rkscene"])
                     .save_file()
                 {
+                    push_editor_layout(&tx, store);
                     let _ = tx.send(rkp_engine::EngineCommand::SaveScene {
                         path: Some(path.to_string_lossy().into_owned()),
                     });
@@ -230,6 +257,23 @@ fn main() -> anyhow::Result<()> {
                 if let Some(models) = &update.available_models {
                     store.available_models.send(models.clone());
                 }
+                if let Some(importing) = &update.importing_models {
+                    store.importing_models.send(importing.clone());
+                }
+                // Hydrate layout on project open. Outer Some = "this
+                // tick carries a layout update"; inner None = "project
+                // had none stored, reset to defaults". The engine only
+                // sets this once per load; layouts edited in-session
+                // live entirely on the editor side until the next save.
+                if let Some(layout_payload) = &update.editor_layout {
+                    let state = layout_payload
+                        .as_deref()
+                        .map(PersistedEditorState::from_json_or_default)
+                        .unwrap_or_default();
+                    // apply() uses Signal::send internally, which hops
+                    // to the UI thread on its own.
+                    state.apply(store);
+                }
                 store.inspector.send(update.inspector.clone());
                 store.procedural.send(update.procedural.clone());
                 if let Some(ref ac) = update.available_components {
@@ -241,12 +285,13 @@ fn main() -> anyhow::Result<()> {
                 if let Some(ref mats) = update.materials {
                     store.materials.send(mats.clone());
                 }
-                if let Some(sel) = update.selected_material {
-                    store.selected_material.send(Some(sel));
-                }
-                if let Some(ref path) = update.selected_model {
-                    store.selected_model.send(Some(path.clone()));
-                }
+                // Mirror the Option as-is — a None from the engine means
+                // "nothing selected", and ignoring it (old behavior) left
+                // the Asset Properties panel stuck on the previous pick
+                // after the engine swapped selection from material→model
+                // or vice versa.
+                store.selected_material.send(update.selected_material);
+                store.selected_model.send(update.selected_model.clone());
                 store.play_mode.send(update.play_mode);
                 if let Some(ref env) = update.environment {
                     store.environment.send(env.clone());
@@ -267,7 +312,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     // 5. Build menus.
-    let menus = build_menus(engine.cmd_tx.clone());
+    let menus = build_menus(engine.cmd_tx.clone(), store);
 
     // 6. Run rinch UI.
     let cmd_tx = engine.cmd_tx.clone();

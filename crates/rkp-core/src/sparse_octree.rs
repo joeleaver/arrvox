@@ -45,6 +45,12 @@ pub const BRICK_BIT: u32 = 0x4000_0000;
 /// Maximum supported octree depth (2^11 = 2048 voxels per axis).
 pub const MAX_DEPTH: u8 = 11;
 
+/// Sentinel for [`SparseOctree::internal_attr_index`]: "no prefiltered
+/// LOD attr for this node." Meaningful only at slots whose `nodes` value
+/// is a branch; for leaf / empty / interior slots the parallel entry is
+/// always this sentinel (never read by the shader).
+pub const INTERNAL_ATTR_NONE: u32 = 0xFFFF_FFFF;
+
 /// Returns `true` if the node value represents a regular leaf — leaf_attr_id
 /// in the low 30 bits. Excludes BRICK references and sentinels.
 #[inline]
@@ -131,6 +137,13 @@ fn octant_for_coord(coord: UVec3, level: u8, depth: u8) -> u32 {
 pub struct SparseOctree {
     /// Packed node buffer. The root is at index 0.
     nodes: Vec<u32>,
+    /// Parallel prefiltered-LOD attr index, same length as `nodes`.
+    /// Entry `i` is a `leaf_attr_id` for the prefiltered surface of the
+    /// subtree rooted at branch node `i`, or [`INTERNAL_ATTR_NONE`] when
+    /// node `i` isn't a branch (or the prefilter pass hasn't run yet).
+    /// See the LOD plan: the GPU march uses this to early-exit descent
+    /// once the node's projected screen footprint drops below 1 pixel.
+    internal_attr_index: Vec<u32>,
     /// Maximum depth (0 = single root node, 8 = 256³ voxels per axis).
     depth: u8,
     /// Voxel size at the finest (deepest) level.
@@ -146,6 +159,7 @@ impl SparseOctree {
         assert!(depth <= MAX_DEPTH, "depth {depth} exceeds MAX_DEPTH {MAX_DEPTH}");
         Self {
             nodes: vec![EMPTY_NODE],
+            internal_attr_index: vec![INTERNAL_ATTR_NONE],
             depth,
             base_voxel_size,
         }
@@ -154,9 +168,12 @@ impl SparseOctree {
     /// Create from raw node data (for file loading).
     ///
     /// The nodes must have valid internal structure (branch offsets are 0-based
-    /// within the node array).
+    /// within the node array). `internal_attr_index` is initialized to
+    /// sentinels — callers that load a prefiltered asset (e.g. .rkp v5+)
+    /// should follow with [`set_internal_attr_index`](Self::set_internal_attr_index).
     pub fn from_raw(nodes: &[u32], depth: u8, base_voxel_size: f32) -> Self {
         Self {
+            internal_attr_index: vec![INTERNAL_ATTR_NONE; nodes.len()],
             nodes: nodes.to_vec(),
             depth,
             base_voxel_size,
@@ -203,6 +220,42 @@ impl SparseOctree {
     /// rewrite BRICK node ids in place after allocating scene-local bricks.
     pub fn as_slice_mut(&mut self) -> &mut [u32] {
         &mut self.nodes
+    }
+
+    /// Slice of prefiltered-LOD attr ids, one per node slot (for GPU upload).
+    /// Length matches [`as_slice`](Self::as_slice). Entry is [`INTERNAL_ATTR_NONE`]
+    /// at slots that aren't branches or haven't been populated by the prefilter.
+    #[inline]
+    pub fn internal_attr_slice(&self) -> &[u32] {
+        &self.internal_attr_index
+    }
+
+    /// Get the prefiltered-LOD attr id at `node_idx`. Returns
+    /// [`INTERNAL_ATTR_NONE`] when no prefilter is available for that slot.
+    #[inline]
+    pub fn internal_attr(&self, node_idx: u32) -> u32 {
+        self.internal_attr_index[node_idx as usize]
+    }
+
+    /// Set the prefiltered-LOD attr id at `node_idx`. Call during the
+    /// bottom-up prefilter pass after `compact`/`deduplicate_subtrees`
+    /// have stabilized the node buffer — or before any rewriting pass if
+    /// you want it to ride along through those passes.
+    #[inline]
+    pub fn set_internal_attr(&mut self, node_idx: u32, attr_id: u32) {
+        self.internal_attr_index[node_idx as usize] = attr_id;
+    }
+
+    /// Replace the entire prefilter index buffer. Must have length equal to
+    /// [`node_count`](Self::node_count). Used when loading a .rkp asset that
+    /// already has prefiltered LOD baked in.
+    pub fn set_internal_attr_index(&mut self, index: Vec<u32>) {
+        assert_eq!(
+            index.len(),
+            self.nodes.len(),
+            "internal_attr_index length must match nodes length"
+        );
+        self.internal_attr_index = index;
     }
 
     /// Check if a voxel coordinate is in bounds for this tree.
@@ -269,6 +322,7 @@ impl SparseOctree {
         // Need to subdivide to reach target level.
         let children_offset = self.nodes.len();
         self.nodes.extend_from_slice(&[current; 8]);
+        self.internal_attr_index.extend_from_slice(&[INTERNAL_ATTR_NONE; 8]);
         self.nodes[node_idx] = children_offset as u32;
 
         let octant = octant_for_coord(coord, level, self.depth) as usize;
@@ -307,6 +361,7 @@ impl SparseOctree {
         // (preserving the existing uniform content).
         let children_offset = self.nodes.len();
         self.nodes.extend_from_slice(&[current; 8]);
+        self.internal_attr_index.extend_from_slice(&[INTERNAL_ATTR_NONE; 8]);
         self.nodes[node_idx] = children_offset as u32;
 
         // Now descend into the correct child.
@@ -413,19 +468,35 @@ impl SparseOctree {
             // Trivial root (leaf / empty / interior). Nothing to share; also
             // reclaim any orphan tail the builder left behind.
             self.nodes.truncate(1);
+            self.internal_attr_index.truncate(1);
             return;
         }
 
         let mut new_nodes: Vec<u32> = Vec::new();
         new_nodes.push(0); // reserve position [0] for root's value
 
+        // Parallel prefilter buffer for the rewrite. Root's entry is a
+        // direct copy from the old buffer; internal branch slots carry
+        // their prefilter-id through the recursion (see dedup_value).
+        let mut new_prefilter: Vec<u32> = Vec::with_capacity(self.internal_attr_index.len());
+        new_prefilter.push(self.internal_attr_index[0]);
+
         let mut seen: std::collections::HashMap<[u32; 8], u32> =
             std::collections::HashMap::new();
 
-        let canonical_root = Self::dedup_value(&self.nodes, root, &mut new_nodes, &mut seen);
+        let canonical_root = Self::dedup_value(
+            &self.nodes,
+            &self.internal_attr_index,
+            0,
+            &mut new_nodes,
+            &mut new_prefilter,
+            &mut seen,
+        );
         new_nodes[0] = canonical_root;
 
+        debug_assert_eq!(new_nodes.len(), new_prefilter.len());
         self.nodes = new_nodes;
+        self.internal_attr_index = new_prefilter;
     }
 
     /// Reorder nodes into BFS/Morton order so that cousins of the same depth
@@ -453,15 +524,19 @@ impl SparseOctree {
         if !is_branch(root) {
             // Trivial root (leaf / empty / interior) — nothing to reorder.
             self.nodes.truncate(1);
+            self.internal_attr_index.truncate(1);
             return;
         }
 
         let old = std::mem::take(&mut self.nodes);
+        let old_prefilter = std::mem::take(&mut self.internal_attr_index);
         let mut new_nodes: Vec<u32> = Vec::with_capacity(old.len());
+        let mut new_prefilter: Vec<u32> = Vec::with_capacity(old.len());
 
         // Root lives at new offset 0. Reserve its slot; the branch loop below
         // will write the correct offset to its 8 children.
         new_nodes.push(0);
+        new_prefilter.push(INTERNAL_ATTR_NONE);
 
         // Map: old children-block offset → new children-block offset. Ensures
         // DAG-shared subtrees remain shared after reorder.
@@ -475,6 +550,14 @@ impl SparseOctree {
 
         while let Some((old_off, new_off)) = queue.pop_front() {
             let node = old[old_off as usize];
+
+            // Every visited slot — branch or not — copies its prefilter-id
+            // from old_prefilter[old_off] to new_prefilter[new_off]. DAG
+            // sharing is honored because two different parent slots pointing
+            // to the same old children-block end up writing into the same
+            // new children-block slots; the prefilter values at those slots
+            // are identical (prefilter is a pure function of the subtree).
+            new_prefilter[new_off as usize] = old_prefilter[old_off as usize];
 
             if !is_branch(node) {
                 new_nodes[new_off as usize] = node;
@@ -493,6 +576,7 @@ impl SparseOctree {
                 // Reserve 8 slots contiguously; children enqueue below will
                 // fill them.
                 new_nodes.extend(std::iter::repeat(0u32).take(8));
+                new_prefilter.extend(std::iter::repeat(INTERNAL_ATTR_NONE).take(8));
                 branch_map.insert(old_children, start);
                 for i in 0..8u32 {
                     queue.push_back((old_children + i, start + i));
@@ -503,33 +587,55 @@ impl SparseOctree {
             new_nodes[new_off as usize] = new_children;
         }
 
+        debug_assert_eq!(new_nodes.len(), new_prefilter.len());
         self.nodes = new_nodes;
+        self.internal_attr_index = new_prefilter;
     }
 
-    /// Canonicalize a single node value. Leaves and sentinels pass through
-    /// unchanged; branches are expanded, their 8 children are recursively
-    /// canonicalized, and the resulting 8-child block is inserted into (or
-    /// fetched from) the dedup map.
+    /// Canonicalize the node value at `slot_in_old`. Leaves and sentinels
+    /// pass through unchanged; branches expand, their 8 children are
+    /// recursively canonicalized, and the resulting 8-child block is
+    /// inserted into (or fetched from) the dedup map.
+    ///
+    /// Prefilter-ids ride along through the parallel `old_prefilter` array:
+    /// when we emit a fresh 8-child block to `new_nodes`, we also write the
+    /// 8 per-slot prefilter-ids from the old buffer into `new_prefilter`.
+    /// The function does *not* write into `new_nodes[slot_in_old]` or the
+    /// corresponding new_prefilter slot — that's the caller's responsibility
+    /// (the parent's 8-tuple write, or the outer deduplicate_subtrees for
+    /// the root).
     fn dedup_value(
         old_nodes: &[u32],
-        node_value: u32,
+        old_prefilter: &[u32],
+        slot_in_old: u32,
         new_nodes: &mut Vec<u32>,
+        new_prefilter: &mut Vec<u32>,
         seen: &mut std::collections::HashMap<[u32; 8], u32>,
     ) -> u32 {
+        let node_value = old_nodes[slot_in_old as usize];
         if !is_branch(node_value) {
             return node_value;
         }
         let children_offset = node_value as usize;
         let mut canonical_children: [u32; 8] = [0; 8];
+        let mut child_prefilters: [u32; 8] = [INTERNAL_ATTR_NONE; 8];
         for i in 0..8 {
-            let child = old_nodes[children_offset + i];
-            canonical_children[i] = Self::dedup_value(old_nodes, child, new_nodes, seen);
+            canonical_children[i] = Self::dedup_value(
+                old_nodes,
+                old_prefilter,
+                (children_offset + i) as u32,
+                new_nodes,
+                new_prefilter,
+                seen,
+            );
+            child_prefilters[i] = old_prefilter[children_offset + i];
         }
         if let Some(&existing) = seen.get(&canonical_children) {
             return existing;
         }
         let new_offset = new_nodes.len() as u32;
         new_nodes.extend_from_slice(&canonical_children);
+        new_prefilter.extend_from_slice(&child_prefilters);
         seen.insert(canonical_children, new_offset);
         new_offset
     }
@@ -556,14 +662,17 @@ impl SparseOctree {
         // else — drop the whole tail.
         if !is_branch(root) {
             self.nodes.truncate(1);
+            self.internal_attr_index.truncate(1);
             return;
         }
 
         let mut new_nodes: Vec<u32> = Vec::with_capacity(self.nodes.len());
+        let mut new_prefilter: Vec<u32> = Vec::with_capacity(self.nodes.len());
         new_nodes.push(0); // placeholder for root; filled in below
+        new_prefilter.push(self.internal_attr_index[0]);
 
-        // Work queue holds pairs (old_node_value, new_slot_idx). For each
-        // entry, we read the node at `old_node_value` from the old buffer;
+        // Work queue holds pairs (old_node_idx, new_slot_idx). For each
+        // entry, we read the node at `old_node_idx` from the old buffer;
         // if it's a branch we allocate 8 new children slots and enqueue them.
         //
         // The root is handled specially since its value lives at `nodes[0]`.
@@ -573,6 +682,7 @@ impl SparseOctree {
         // Allocate 8 slots for the root's children in the new buffer.
         let root_children_new = new_nodes.len() as u32;
         new_nodes.extend(std::iter::repeat(0u32).take(8));
+        new_prefilter.extend(std::iter::repeat(INTERNAL_ATTR_NONE).take(8));
         new_nodes[0] = root_children_new;
         let root_children_old = root;
         for i in 0..8u32 {
@@ -580,11 +690,17 @@ impl SparseOctree {
         }
 
         while let Some((old_idx, new_idx)) = queue.pop_front() {
+            // Every visited slot copies its prefilter-id. Non-branch slots
+            // carry INTERNAL_ATTR_NONE (harmless); branch slots carry their
+            // prefiltered LeafAttr id.
+            new_prefilter[new_idx as usize] = self.internal_attr_index[old_idx as usize];
+
             let node = self.nodes[old_idx as usize];
             if is_branch(node) {
                 // Allocate 8 new children slots.
                 let children_new = new_nodes.len() as u32;
                 new_nodes.extend(std::iter::repeat(0u32).take(8));
+                new_prefilter.extend(std::iter::repeat(INTERNAL_ATTR_NONE).take(8));
                 new_nodes[new_idx as usize] = children_new;
                 let children_old = node;
                 for i in 0..8u32 {
@@ -596,7 +712,9 @@ impl SparseOctree {
             }
         }
 
+        debug_assert_eq!(new_nodes.len(), new_prefilter.len());
         self.nodes = new_nodes;
+        self.internal_attr_index = new_prefilter;
     }
 
     /// Look up the node value at a voxel coordinate.
@@ -1424,5 +1542,235 @@ mod tests {
         let tree = SparseOctree::from_brick_map(&map, 0.1);
         assert_eq!(tree.nodes[0], EMPTY_NODE);
         assert_eq!(tree.node_count(), 1);
+    }
+
+    // ── internal_attr_index (prefiltered LOD) scaffolding tests ───────────
+    //
+    // These tests exercise only the parallel-buffer maintenance. No real
+    // prefilter pass populates these ids yet (Phase 1). The property
+    // we verify here is: *whatever* we write into `internal_attr_index`
+    // at a branch slot survives the rewriting passes (compact, dedup,
+    // morton) and ends up at the corresponding branch slot in the new
+    // buffer. The prefilter pass in Phase 1 will rely on this invariant
+    // (it'll seed values then run the passes).
+
+    /// Seed every branch slot in the tree with a cookie value; leave
+    /// non-branch slots untouched.
+    fn seed_branch_prefilters(tree: &mut SparseOctree, cookie: u32) {
+        for i in 0..tree.node_count() {
+            let node = tree.as_slice()[i];
+            if is_branch(node) {
+                tree.set_internal_attr(i as u32, cookie);
+            }
+        }
+    }
+
+    /// Assert that every branch slot in the tree carries the given cookie.
+    fn assert_branch_prefilters_match(tree: &SparseOctree, cookie: u32) {
+        let mut checked = 0usize;
+        for i in 0..tree.node_count() {
+            let node = tree.as_slice()[i];
+            if is_branch(node) {
+                assert_eq!(
+                    tree.internal_attr(i as u32),
+                    cookie,
+                    "branch at slot {i} lost prefilter-id (got {:#x}, expected {cookie:#x})",
+                    tree.internal_attr(i as u32),
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "test is vacuous — tree has no branches");
+    }
+
+    #[test]
+    fn new_tree_has_sentinel_filled_internal_attr() {
+        let tree = SparseOctree::new(3, 0.1);
+        assert_eq!(tree.internal_attr_slice().len(), tree.node_count());
+        assert_eq!(tree.internal_attr(0), INTERNAL_ATTR_NONE);
+    }
+
+    #[test]
+    fn from_raw_fills_internal_attr_sentinels() {
+        let raw = vec![make_leaf(1), EMPTY_NODE, INTERIOR_NODE];
+        let tree = SparseOctree::from_raw(&raw, 2, 0.1);
+        assert_eq!(tree.internal_attr_slice().len(), 3);
+        for &a in tree.internal_attr_slice() {
+            assert_eq!(a, INTERNAL_ATTR_NONE);
+        }
+    }
+
+    #[test]
+    fn insert_grows_internal_attr_in_lockstep() {
+        let mut tree = SparseOctree::new(3, 0.1);
+        tree.insert(UVec3::new(0, 0, 0), 10);
+        tree.insert(UVec3::new(7, 7, 7), 20);
+        tree.insert(UVec3::new(3, 4, 5), 30);
+
+        // Lockstep length invariant.
+        assert_eq!(tree.internal_attr_slice().len(), tree.node_count());
+        // Freshly-allocated slots default to sentinel.
+        for &a in tree.internal_attr_slice() {
+            assert_eq!(a, INTERNAL_ATTR_NONE);
+        }
+    }
+
+    #[test]
+    fn internal_attr_set_get_roundtrip() {
+        let mut tree = SparseOctree::new(2, 0.1);
+        tree.insert(UVec3::new(0, 0, 0), 1);
+        tree.insert(UVec3::new(3, 3, 3), 2);
+
+        // Find one branch slot and set/get.
+        let branch_idx = (0..tree.node_count())
+            .find(|&i| is_branch(tree.as_slice()[i]))
+            .expect("should have at least one branch");
+        tree.set_internal_attr(branch_idx as u32, 0xDEAD_BEEF);
+        assert_eq!(tree.internal_attr(branch_idx as u32), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn compact_preserves_internal_attr_at_branches() {
+        let mut tree = SparseOctree::new(3, 0.1);
+        // Distinct-leaf inserts so the tree has real branches at multiple
+        // levels (not a uniform-collapse case).
+        tree.insert(UVec3::new(0, 0, 0), 1);
+        tree.insert(UVec3::new(7, 0, 0), 2);
+        tree.insert(UVec3::new(0, 7, 0), 3);
+        tree.insert(UVec3::new(0, 0, 7), 4);
+        tree.insert(UVec3::new(7, 7, 7), 5);
+
+        seed_branch_prefilters(&mut tree, 0xCAFEBABE);
+        tree.compact();
+
+        assert_eq!(tree.internal_attr_slice().len(), tree.node_count());
+        assert_branch_prefilters_match(&tree, 0xCAFEBABE);
+    }
+
+    #[test]
+    fn dedup_preserves_internal_attr_at_branches() {
+        // Same shape as compact test — plus dedup pass.
+        let mut tree = SparseOctree::new(3, 0.1);
+        tree.insert(UVec3::new(0, 0, 0), 1);
+        tree.insert(UVec3::new(7, 0, 0), 2);
+        tree.insert(UVec3::new(0, 7, 0), 3);
+        tree.insert(UVec3::new(0, 0, 7), 4);
+        tree.insert(UVec3::new(7, 7, 7), 5);
+
+        tree.compact();
+        seed_branch_prefilters(&mut tree, 0xABCD_0001);
+        tree.deduplicate_subtrees();
+
+        assert_eq!(tree.internal_attr_slice().len(), tree.node_count());
+        assert_branch_prefilters_match(&tree, 0xABCD_0001);
+    }
+
+    #[test]
+    fn morton_preserves_internal_attr_at_branches() {
+        let mut tree = SparseOctree::new(3, 0.1);
+        tree.insert(UVec3::new(0, 0, 0), 1);
+        tree.insert(UVec3::new(7, 7, 7), 2);
+        tree.insert(UVec3::new(3, 4, 5), 3);
+
+        tree.compact();
+        tree.deduplicate_subtrees();
+        seed_branch_prefilters(&mut tree, 0x12345678);
+        tree.morton_reorder();
+
+        assert_eq!(tree.internal_attr_slice().len(), tree.node_count());
+        assert_branch_prefilters_match(&tree, 0x12345678);
+    }
+
+    #[test]
+    fn full_pipeline_preserves_internal_attr() {
+        let mut tree = SparseOctree::new(4, 0.1); // 16³
+        // Several widely-separated leaves to force branches at multiple depths.
+        for (x, y, z) in [
+            (0, 0, 0), (15, 15, 15), (0, 15, 0), (15, 0, 15),
+            (7, 7, 7), (8, 8, 8), (3, 4, 5), (12, 11, 10),
+        ] {
+            tree.insert(UVec3::new(x, y, z), (x * 100 + y * 10 + z + 1) as u32);
+        }
+
+        // Seed *after* insert (when buffer is stable) and *before* the
+        // rewriting passes — this is the exact order the prefilter pass
+        // will use in Phase 1.
+        seed_branch_prefilters(&mut tree, 0xF00D_F00D);
+
+        tree.compact();
+        tree.deduplicate_subtrees();
+        tree.morton_reorder();
+
+        assert_eq!(tree.internal_attr_slice().len(), tree.node_count());
+        assert_branch_prefilters_match(&tree, 0xF00D_F00D);
+    }
+
+    #[test]
+    fn dag_shared_subtrees_share_internal_attr() {
+        // After dedup, two parent branches can reference the same 8-child
+        // block. Verify that block's prefilter-ids survive the share.
+        // Uniform-subtree pattern: every root octant contains the same
+        // 8-leaf block → dedup collapses them to one.
+        let mut tree = SparseOctree::new(2, 0.1); // 4³
+        // Leaf=99 at every (x,y,z) where x+y+z is even; empty otherwise.
+        // This gives each root octant an identical 8-child sub-block.
+        for z in 0..4u32 {
+            for y in 0..4u32 {
+                for x in 0..4u32 {
+                    if (x + y + z) % 2 == 0 {
+                        tree.insert(UVec3::new(x, y, z), 99);
+                    }
+                }
+            }
+        }
+
+        tree.compact();
+        seed_branch_prefilters(&mut tree, 0xAAAA_5555);
+        tree.deduplicate_subtrees();
+        tree.morton_reorder();
+
+        assert_eq!(tree.internal_attr_slice().len(), tree.node_count());
+        // Every surviving branch in the DAG carries the seeded cookie.
+        // (If a branch got dropped by DAG collapse, the remaining branches
+        // still hold a valid cookie — which is what the shader needs.)
+        assert_branch_prefilters_match(&tree, 0xAAAA_5555);
+    }
+
+    #[test]
+    fn trivial_root_rewrites_keep_parallel_buffer_consistent() {
+        // Fully uniform insert → try_collapse reduces to single leaf at
+        // root. compact/dedup/morton all take the trivial-root fast path;
+        // internal_attr_index should also truncate to 1.
+        let mut tree = SparseOctree::new(2, 0.1);
+        for z in 0..4u32 {
+            for y in 0..4u32 {
+                for x in 0..4u32 {
+                    tree.insert(UVec3::new(x, y, z), 42);
+                }
+            }
+        }
+        assert!(tree.node_count() > 1, "precondition: has orphan tail");
+
+        tree.compact();
+        assert_eq!(tree.internal_attr_slice().len(), tree.node_count());
+        assert_eq!(tree.node_count(), 1);
+
+        tree.deduplicate_subtrees();
+        assert_eq!(tree.internal_attr_slice().len(), tree.node_count());
+        assert_eq!(tree.node_count(), 1);
+
+        tree.morton_reorder();
+        assert_eq!(tree.internal_attr_slice().len(), tree.node_count());
+        assert_eq!(tree.node_count(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "internal_attr_index length must match nodes length")]
+    fn set_internal_attr_index_length_mismatch_panics() {
+        let mut tree = SparseOctree::new(2, 0.1);
+        tree.insert(UVec3::new(0, 0, 0), 1);
+        tree.insert(UVec3::new(3, 3, 3), 2);
+        // Deliberately wrong length.
+        tree.set_internal_attr_index(vec![INTERNAL_ATTR_NONE; 1]);
     }
 }

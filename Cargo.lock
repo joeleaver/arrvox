@@ -4979,6 +4979,7 @@ dependencies = [
  "rkf-runtime",
  "rkp-engine",
  "rkp-render",
+ "serde",
  "serde_json",
  "uuid",
 ]

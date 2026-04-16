@@ -39,8 +39,21 @@ pub const BRICK_BYTES: u32 = BRICK_CELLS * 4;
 /// Number of octree levels a brick replaces. log2(BRICK_DIM).
 pub const BRICK_LEVELS: u8 = 2;
 
-/// Cell sentinel: no voxel at this cell.
+/// Cell sentinel: no voxel at this cell (empty air).
 pub const BRICK_EMPTY: u32 = 0xFFFF_FFFFu32;
+
+/// Cell sentinel: the cell sits inside the solid of a mesh-imported
+/// asset — there's no visible surface here (the march skips past it
+/// identically to `BRICK_EMPTY`), but it counts as *occupied mass* for
+/// any neighborhood-averaging pass that needs volumetric information
+/// (see `rkp-render/src/shaders/octree_march.wgsl::reconstruct_normal_surfacenet`).
+///
+/// Costs zero memory: occupies one of the 64 pre-allocated u32 slots in
+/// a brick that was already allocated for its shell cells. Distinct
+/// from `BRICK_EMPTY` purely so neighborhood kernels can distinguish
+/// "inside bulk" from "exterior air" without needing the SDF at render
+/// time.
+pub const BRICK_INTERIOR: u32 = 0xFFFF_FFFDu32;
 
 /// Convert (x, y, z) within a brick to its flat cell index.
 #[inline]

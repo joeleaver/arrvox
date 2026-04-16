@@ -146,6 +146,17 @@ impl AssetCache {
     }
 }
 
+/// Result of [`RkpSceneManager::reload_asset`]. `old_handle` is the handle
+/// that was invalidated (so callers can find entities still holding it);
+/// `new_handle` points at the freshly-loaded entry. They may be equal when
+/// the cache reuses the vacated slot, but callers must not rely on that.
+#[derive(Debug, Clone, Copy)]
+pub struct ReloadResult {
+    pub old_handle: AssetHandle,
+    pub new_handle: AssetHandle,
+    pub info: AssetInfo,
+}
+
 /// Result of voxelizing a primitive.
 pub struct VoxelizeResult {
     pub spatial: rkf_core::scene_node::SpatialHandle,
@@ -238,6 +249,13 @@ pub struct RkpSceneManager {
     /// branches point at bricks; the shader does flat brick lookups instead
     /// of descending the final two octree levels per step.
     pub brick_pool: BrickPool,
+    /// Face-adjacency links for every allocated brick — indexed by
+    /// `brick_id`, 6 u32 per entry (−X, +X, −Y, +Y, −Z, +Z). Each entry
+    /// is either a neighboring brick_id or a FACE_EMPTY / FACE_INTERIOR
+    /// sentinel (see `rkp_core::brick_face_links`). Sized to cover
+    /// `brick_pool.allocated_count()`; newly-allocated bricks append
+    /// sentinel rows until voxelize / load_asset fills them in.
+    pub brick_face_links: Vec<[u32; 6]>,
     /// GPU octree allocator (packs all octrees into one buffer).
     pub octree: OctreeGpu,
     /// Cache of loaded .rkp assets keyed by canonical file path. Instances
@@ -257,10 +275,36 @@ impl RkpSceneManager {
         Self {
             leaf_attr_pool: LeafAttrPool::new(capacity),
             brick_pool: BrickPool::new((capacity / 16).max(64)),
+            brick_face_links: Vec::new(),
             octree: OctreeGpu::new(),
             asset_cache: AssetCache::default(),
             pending_faces: Vec::new(),
             faces_dirty: false,
+        }
+    }
+
+    /// Splice one asset's computed face-link rows into the scene-wide
+    /// table. The rows are indexed by global brick_id (the asset's
+    /// voxelize/load produced them that way), so we copy in place.
+    fn merge_face_links(&mut self, rows: &[[u32; 6]]) {
+        if rows.is_empty() {
+            return;
+        }
+        if self.brick_face_links.len() < rows.len() {
+            self.brick_face_links.resize(
+                rows.len(),
+                [rkp_core::brick_face_links::FACE_EMPTY; 6],
+            );
+        }
+        // Copy only rows that correspond to bricks the asset actually owns
+        // (identified by a non-all-empty row — unused slots stay at the
+        // default FACE_EMPTY sentinel). This is equivalent to looping
+        // over the asset's brick_ids, but avoids threading that list
+        // through every call site.
+        for (i, row) in rows.iter().enumerate() {
+            if row.iter().any(|&v| v != rkp_core::brick_face_links::FACE_EMPTY) {
+                self.brick_face_links[i] = *row;
+            }
         }
     }
 
@@ -298,12 +342,13 @@ impl RkpSceneManager {
     // ── Geometry upload snapshot ─────────────────────────────────────
 
     pub fn geometry_upload(&self) -> GeometryUpload<'_> {
-        let octree_data = self.octree.data();
         GeometryUpload {
-            octree_nodes: bytemuck::cast_slice(octree_data),
+            octree_nodes: self.octree.data(),
+            octree_internal_attrs: self.octree.internal_attrs_data(),
             leaf_attr_pool: self.leaf_attr_pool.as_bytes(),
             color_pool: self.leaf_attr_pool.color_bytes(),
             brick_pool: self.brick_pool.as_bytes(),
+            brick_face_links: rkp_core::brick_face_links::as_bytes(&self.brick_face_links),
         }
     }
 
@@ -374,6 +419,37 @@ impl RkpSceneManager {
         let info = entry.info();
         let handle = self.asset_cache.insert(entry);
         Ok((handle, info))
+    }
+
+    /// Force a reload of a cached asset from disk. Used after re-import
+    /// rewrites the `.rkp` file so existing scene instances pick up the
+    /// new geometry. Frees the previous pool allocations, loads the fresh
+    /// file, and preserves the refcount so outstanding instances remain
+    /// valid once they've been updated to the returned handle.
+    ///
+    /// Returns `Ok(None)` when the asset isn't currently cached (nothing
+    /// to refresh — the next `acquire_asset` will read the new file).
+    pub fn reload_asset(&mut self, path: &str) -> Result<Option<ReloadResult>, String> {
+        let canonical = Self::resolve_rkp_path(path)?;
+        let Some(old_handle) = self.asset_cache.lookup_path(&canonical) else {
+            return Ok(None);
+        };
+
+        let old_refcount = self.asset_cache.get(old_handle)
+            .map(|e| e.refcount).unwrap_or(0);
+
+        let entry = self.asset_cache.remove(old_handle).expect("just looked up");
+        self.octree.deallocate(entry.spatial_handle);
+        self.leaf_attr_pool.deallocate_range(entry.leaf_attr_slot_start, entry.leaf_attr_slot_count);
+        for id in entry.brick_start..(entry.brick_start + entry.brick_count) {
+            self.brick_pool.deallocate(id);
+        }
+
+        let mut fresh = self.load_asset_from_disk(&canonical)?;
+        fresh.refcount = old_refcount;
+        let info = fresh.info();
+        let new_handle = self.asset_cache.insert(fresh);
+        Ok(Some(ReloadResult { old_handle, new_handle, info }))
     }
 
     /// Release an instance's claim on a cached asset. When the last
@@ -531,13 +607,22 @@ impl RkpSceneManager {
                 if cell == rkp_core::brick_pool::BRICK_EMPTY {
                     continue;
                 }
-                // cell is a file-local slot index; shift by our leaf_attr
-                // allocation offset to get the scene-global leaf_attr_id.
-                let leaf_attr_id = leaf_attr_slot_start + cell;
+                // BRICK_INTERIOR is a scene-global sentinel (0xFFFFFFFD),
+                // not a file-local slot index — pass it through without
+                // the leaf_attr_slot_start offset, which would overflow
+                // and corrupt the slot into a bogus leaf_attr_id.
+                let remapped = if cell == rkp_core::brick_pool::BRICK_INTERIOR {
+                    rkp_core::brick_pool::BRICK_INTERIOR
+                } else {
+                    // Real leaf: cell is a file-local slot index; shift
+                    // by our leaf_attr allocation offset to get the
+                    // scene-global leaf_attr_id.
+                    leaf_attr_slot_start + cell
+                };
                 let x = (i as u32) % rkp_core::brick_pool::BRICK_DIM;
                 let y = ((i as u32) / rkp_core::brick_pool::BRICK_DIM) % rkp_core::brick_pool::BRICK_DIM;
                 let z = (i as u32) / (rkp_core::brick_pool::BRICK_DIM * rkp_core::brick_pool::BRICK_DIM);
-                self.brick_pool.set_cell(scene_id, x, y, z, leaf_attr_id);
+                self.brick_pool.set_cell(scene_id, x, y, z, remapped);
             }
         }
 
@@ -555,12 +640,62 @@ impl RkpSceneManager {
         tree.deduplicate_subtrees();
         let dedup_count = tree.node_count();
         tree.morton_reorder();
-        let compact_nodes = tree.as_slice().to_vec();
 
-        let handle = self.octree.allocate_raw(&compact_nodes, octree_depth, voxel_size);
+        // Bake-time Laplacian relaxation of shell-voxel normals.
+        // Converts per-voxel SDF-gradient samples (which alias into
+        // discrete directions at voxel scale) into locally-averaged
+        // smooth normals. Runs once per asset load; each asset's
+        // leaf_attrs are 1:1 with voxels (no dedup), which is the
+        // invariant the smoother requires.
+        let smoothed_count = rkp_core::laplacian_smooth::smooth_shell_normals(
+            &tree, &self.brick_pool, &mut self.leaf_attr_pool, 3,
+        );
+        eprintln!(
+            "[RkpSceneManager]   smoothed {} shell normals (3 Laplacian iterations)",
+            smoothed_count,
+        );
+
+        // Run the prefilter pass on-load so v4 assets (no baked internal
+        // attrs) still benefit from the GPU's LOD early-exit. Phase 4
+        // bumps the .rkp format to v5 which bakes these at conversion
+        // time — this is the fallback until then.
+        //
+        // The prefilter appends new attrs at the tail of the asset's
+        // contiguous leaf_attr range via allocate_contiguous_bump(1), so
+        // the `leaf_attr_slot_count` grows to cover them and the
+        // existing deallocate_range releases everything on asset drop.
+        let mut attr_dedup: HashMap<LeafAttr, u32> = HashMap::new();
+        for i in 0..leaf_attr_slot_count {
+            let slot = leaf_attr_slot_start + i;
+            attr_dedup.insert(*self.leaf_attr_pool.get(slot), slot);
+        }
+        rkp_core::prefilter::prefilter_octree_internals(
+            &mut tree,
+            &mut self.leaf_attr_pool,
+            &self.brick_pool,
+            &mut attr_dedup,
+        );
+        let final_leaf_attr_slot_count =
+            self.leaf_attr_pool.allocated_count() - leaf_attr_slot_start;
+
+        // Compute brick face-links for this asset. The tree's brick ids
+        // have already been remapped to global ids above, so the rows
+        // produced are scene-global and ready to merge. When the file
+        // had zero bricks there's nothing to compute.
+        if file_brick_count > 0 {
+            let max_brick = scene_brick_offset + file_brick_count - 1;
+            let face_links = rkp_core::brick_face_links::compute_brick_face_links(&tree, max_brick);
+            self.merge_face_links(&face_links);
+        }
+
+        // Allocate the octree with its now-populated internal_attr_index
+        // intact. `allocate(&tree)` preserves both buffers; the legacy
+        // `allocate_raw(nodes, …)` would have dropped the prefilter ids
+        // by round-tripping through `SparseOctree::from_raw`.
+        let handle = self.octree.allocate(&tree);
 
         eprintln!(
-            "[RkpSceneManager] loaded {}: {} voxels, {} bricks, octree {} → compact {} → dedup {} ({:.1}× total)",
+            "[RkpSceneManager] loaded {}: {} voxels, {} bricks, octree {} → compact {} → dedup {} ({:.1}× total), +{} prefilter attrs",
             rkp_path.display(),
             voxel_count,
             file_brick_count,
@@ -568,6 +703,7 @@ impl RkpSceneManager {
             compact_count,
             dedup_count,
             if dedup_count > 0 { raw_count as f64 / dedup_count as f64 } else { 0.0 },
+            final_leaf_attr_slot_count - leaf_attr_slot_count,
         );
 
         Ok(AssetEntry {
@@ -578,7 +714,7 @@ impl RkpSceneManager {
             aabb,
             voxel_count,
             leaf_attr_slot_start,
-            leaf_attr_slot_count,
+            leaf_attr_slot_count: final_leaf_attr_slot_count,
             brick_start: scene_brick_offset,
             brick_count: file_brick_count,
         })
@@ -651,6 +787,7 @@ impl RkpSceneManager {
         emit_faces(&r.octree, object_id, &mut self.pending_faces);
         self.faces_dirty = true;
 
+        self.merge_face_links(&r.brick_face_links);
         let handle = self.octree.allocate(&r.octree);
         let spatial = rkf_core::scene_node::SpatialHandle::Octree {
             root_offset: handle.root_offset,
@@ -692,6 +829,7 @@ impl RkpSceneManager {
         emit_faces(&r.octree, object_id, &mut self.pending_faces);
         self.faces_dirty = true;
 
+        self.merge_face_links(&r.brick_face_links);
         let handle = self.octree.allocate(&r.octree);
         let spatial = rkf_core::scene_node::SpatialHandle::Octree {
             root_offset: handle.root_offset,

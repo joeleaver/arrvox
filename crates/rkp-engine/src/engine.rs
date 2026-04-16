@@ -244,6 +244,19 @@ struct EngineState {
     /// Available .rkp model files in the project.
     available_models: Vec<crate::snapshot::ModelInfo>,
     models_dirty: bool,
+    /// Source paths currently being re-imported. The UI consults this set
+    /// to show a progress indicator in place of the Re-import button.
+    /// Populated on `ReimportModel` submission, drained on completion.
+    importing_sources: std::collections::HashSet<String>,
+    /// Publish `importing_sources` to the UI on the next snapshot.
+    importing_dirty: bool,
+    /// Latest editor layout JSON pushed up from the editor. Opaque to
+    /// the engine — it just round-trips this through `.rkproject`.
+    editor_layout_json: Option<String>,
+    /// Ship `editor_layout_json` to the editor on the next snapshot.
+    /// Set on project load so the editor can hydrate its signals; never
+    /// set for echoes from the editor itself (no feedback loop).
+    editor_layout_pending: bool,
 
     /// Material library — manages .rkmat files and runtime palette.
     material_lib: crate::material_library::MaterialLibrary,
@@ -344,9 +357,39 @@ struct EngineState {
     /// shade_params buffer with the VR's `isolation` flag overlaid,
     /// just before that VR's submit.
     shade_params_base: rkp_render::rkp_shade::ShadeParams,
+    /// Prefiltered-LOD early-exit toggle. On by default; flipped off for
+    /// A/B correctness comparison against the pre-LOD descent behavior.
+    lod_enabled: bool,
+    /// Surface-Nets render-time normal reconstruction (POC). Off by
+    /// default — flip on via `set_surfacenet_enabled` for A/B.
+    surfacenet_enabled: bool,
 }
 
 impl EngineState {
+    /// Flip the prefiltered-LOD march early-exit on or off. Public API
+    /// exists mainly for A/B correctness tests and debugging.
+    pub fn set_lod_enabled(&mut self, enabled: bool) {
+        self.lod_enabled = enabled;
+    }
+
+    /// Current LOD toggle state.
+    pub fn lod_enabled(&self) -> bool {
+        self.lod_enabled
+    }
+
+    /// Flip the Surface-Nets normal reconstruction on or off. When on,
+    /// the march computes per-voxel normals from the 3³ in-brick
+    /// occupancy neighborhood instead of reading the baked octahedral
+    /// `LeafAttr.normal_oct`. POC — see the `[surfnet]` log lines for
+    /// coverage metrics.
+    pub fn set_surfacenet_enabled(&mut self, enabled: bool) {
+        self.surfacenet_enabled = enabled;
+    }
+
+    pub fn surfacenet_enabled(&self) -> bool {
+        self.surfacenet_enabled
+    }
+
     fn new(config: &EngineConfig) -> Self {
         let ctx = rkf_render::RenderContext::new_headless();
         let device = ctx.device;
@@ -435,6 +478,10 @@ impl EngineState {
             project_dirty: true, // push initial state
             available_models: Vec::new(),
             models_dirty: false,
+            importing_sources: std::collections::HashSet::new(),
+            importing_dirty: false,
+            editor_layout_json: None,
+            editor_layout_pending: false,
             material_lib: crate::material_library::MaterialLibrary::new(),
             selected_material: None,
             selected_model: None,
@@ -472,6 +519,13 @@ impl EngineState {
             pending_pick: None,
             num_lights_cache: 1,
             shade_params_base: rkp_render::rkp_shade::ShadeParams::default(),
+            lod_enabled: true,
+            // Bake-time Laplacian smoothing of stored normals (see
+            // `load_asset` → `smooth_shell_normals`) makes the shader-
+            // time centroid reconstruction redundant. Default OFF so
+            // the shader uses the smoothed baked normal via its
+            // existing 1-fetch path.
+            surfacenet_enabled: false,
         }
     }
 
@@ -743,7 +797,9 @@ impl EngineState {
                 .expect("viewport renderer must exist");
             self.renderer.render_to(
                 &mut encoder, &self.queue, vr,
-                object_count, shadow_steps, num_lights, screen_aabbs_bytes, &atmo_frame,
+                object_count, shadow_steps, num_lights,
+                self.lod_enabled, self.surfacenet_enabled,
+                screen_aabbs_bytes, &atmo_frame,
                 vp_mode,
             );
 
@@ -1610,6 +1666,12 @@ impl EngineState {
                         self.project_name = project.name;
                         self.project_loaded = true;
                         self.project_dirty = true;
+                        // Cache + flag the editor layout so the editor
+                        // hydrates its docking state on the next tick.
+                        // `None` is meaningful — it means "reset to
+                        // default" for projects saved pre-persistence.
+                        self.editor_layout_json = project.editor_layout;
+                        self.editor_layout_pending = true;
 
                         // Scaffold + build gameplay BEFORE loading the scene,
                         // so gameplay components (Spin, Health, etc.) are registered
@@ -1646,19 +1708,22 @@ impl EngineState {
                     }
                     self.scene_path = Some(save_path);
                 }
+                // Persist the project descriptor alongside the scene so
+                // the cached editor layout (and anything else on
+                // ProjectFile) actually hits disk on Ctrl+S. Without
+                // this, layout state would only be written by explicit
+                // SaveProject, which the UI doesn't wire up.
+                self.save_project_file();
             }
 
             EngineCommand::SaveProject => {
-                if let (Some(project_path), Some(_project_dir)) = (&self.project_path, &self.project_dir) {
-                    let project = crate::project::ProjectFile {
-                        name: self.project_name.clone(),
-                        default_scene: "default".to_string(),
-                        recent_scenes: Vec::new(),
-                    };
-                    if let Err(e) = crate::project::save_project(&project, project_path) {
-                        eprintln!("[RkpEngine] save project failed: {e}");
-                    }
-                }
+                self.save_project_file();
+            }
+
+            EngineCommand::SetEditorLayout { json } => {
+                // Cache only — actual write happens on save. Don't echo
+                // back to the editor; it's the source of truth for this.
+                self.editor_layout_json = Some(json);
             }
 
             // ── Raw input → feed to InputSystem ──────────────────────
@@ -1800,7 +1865,14 @@ impl EngineState {
             }
 
             EngineCommand::SelectMaterial { material_id } => {
+                // The Asset Properties panel inspects one thing at a time —
+                // picking a material drops any prior model selection so the
+                // panel swaps over instead of staying stuck on the model (or
+                // vice versa).
                 self.selected_material = material_id;
+                if material_id.is_some() {
+                    self.selected_model = None;
+                }
             }
 
             EngineCommand::RemapMaterial { object_id, from_material, to_material } => {
@@ -1824,6 +1896,9 @@ impl EngineState {
 
             EngineCommand::SelectModel { path } => {
                 self.selected_model = path;
+                if self.selected_model.is_some() {
+                    self.selected_material = None;
+                }
             }
 
             EngineCommand::UpdateImportField { source_path, field, value } => {
@@ -1874,13 +1949,38 @@ impl EngineState {
 
             EngineCommand::ReimportModel { source_path } => {
                 let source = std::path::PathBuf::from(&source_path);
+                let source_key = source.to_string_lossy().into_owned();
+                // Drop the request if this source already has an import
+                // in flight. Without the guard a double-click would queue
+                // two identical jobs, and the spinner would clear halfway
+                // through while the second still ran in the background.
+                if self.importing_sources.contains(&source_key) {
+                    eprintln!(
+                        "[RkpEngine] re-import already in flight for {} — ignoring",
+                        source.display(),
+                    );
+                    return true;
+                }
                 let profile = crate::import_profile::ImportProfile::load_or_default(&source);
+                let config = profile.to_import_config();
                 let output = crate::import_worker::rkp_output_path(&source);
-                eprintln!("[RkpEngine] re-importing {} → {}", source.display(), output.display());
+                eprintln!(
+                    "[RkpEngine] re-importing {} → {} \
+                     (target_size={}, voxel_size={:?}, rotation={:?}, import_colors={})",
+                    source.display(), output.display(),
+                    config.target_size, config.voxel_size,
+                    config.rotation_offset, config.import_colors,
+                );
+                let name = source.file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.console.info(format!("Re-importing '{name}'…"));
+                self.importing_sources.insert(source_key);
+                self.importing_dirty = true;
                 self.import_worker.submit(crate::import_worker::ImportRequest {
                     source_path: source,
                     output_path: output,
-                    config: profile.to_import_config(),
+                    config,
                 });
             }
 
@@ -2498,6 +2598,10 @@ impl EngineState {
     fn poll_import_completions(&mut self) {
         let completions = self.import_worker.poll_completions();
         for completion in completions {
+            let source_key = completion.source_path.to_string_lossy().into_owned();
+            if self.importing_sources.remove(&source_key) {
+                self.importing_dirty = true;
+            }
             match completion.result {
                 Ok(result) => {
                     let name = completion.source_path.file_stem()
@@ -2507,6 +2611,7 @@ impl EngineState {
                         "Import complete: {name} ({} voxels)",
                         result.total_bricks,
                     ));
+                    self.refresh_reimported_asset(&completion.output_path);
                     self.scan_models();
                 }
                 Err(e) => {
@@ -2525,6 +2630,68 @@ impl EngineState {
         eprintln!("[RkpEngine] hot-reload asset: {path}");
         // TODO: remove old GPU objects for this asset, re-load from file,
         // rebuild faces, re-upload geometry.
+    }
+
+    /// After a re-import has rewritten the `.rkp` on disk, refresh the
+    /// scene manager's cached copy and point any entities that were
+    /// referencing it at the new geometry. No-op when the asset isn't
+    /// currently loaded into the scene.
+    fn refresh_reimported_asset(&mut self, output_path: &std::path::Path) {
+        let path_str = output_path.to_string_lossy().into_owned();
+        let reload = match self.scene_mgr.reload_asset(&path_str) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                eprintln!(
+                    "[RkpEngine] refresh_reimported_asset: {} not in asset cache — \
+                     no scene entities to refresh",
+                    output_path.display(),
+                );
+                return;
+            }
+            Err(e) => {
+                self.console.error(format!("Reload after import failed: {e}"));
+                return;
+            }
+        };
+
+        let entities_to_update: Vec<hecs::Entity> = self.world
+            .query::<&crate::components::Renderable>()
+            .iter()
+            .filter_map(|(e, r)| (r.asset_handle == Some(reload.old_handle)).then_some(e))
+            .collect();
+
+        eprintln!(
+            "[RkpEngine] refresh_reimported_asset: {} → {} entities to update \
+             (old_handle={:?}, new_handle={:?}, voxels={})",
+            output_path.display(),
+            entities_to_update.len(),
+            reload.old_handle,
+            reload.new_handle,
+            reload.info.voxel_count,
+        );
+
+        for entity in entities_to_update {
+            if let Ok(mut r) = self.world.get::<&mut crate::components::Renderable>(entity) {
+                let spatial = spatial_from_handle(
+                    &reload.info.spatial,
+                    reload.info.voxel_size,
+                    &reload.info.aabb,
+                    reload.info.grid_origin,
+                    reload.info.leaf_attr_slot_start,
+                    reload.info.leaf_attr_slot_count,
+                    Vec::new(),
+                );
+                r.asset_handle = Some(reload.new_handle);
+                r.spatial = Some(spatial);
+                r.voxel_count = reload.info.voxel_count;
+            }
+        }
+        // geometry_dirty: re-upload pools. gpu_objects_dirty: rebuild the
+        // per-entity GpuObject list so the new AABB / octree offsets land
+        // on the GPU (target_size, rotation offsets, etc. only show up in
+        // the render once this runs).
+        self.geometry_dirty = true;
+        self.gpu_objects_dirty = true;
     }
 
     /// Resolve a Uuid (from UI) to an hecs::Entity.
@@ -3097,6 +3264,24 @@ impl EngineState {
                 self.gpu_objects_dirty = true;
             }
             Err(e) => self.console.error(format!("Load scene failed: {e}")),
+        }
+    }
+
+    /// Write the current project descriptor to disk, folding in the
+    /// latest editor layout blob. No-op when no project is loaded
+    /// (prevents the unnamed-scratch-session case from spraying files).
+    fn save_project_file(&self) {
+        let (Some(project_path), Some(_)) = (&self.project_path, &self.project_dir) else {
+            return;
+        };
+        let project = crate::project::ProjectFile {
+            name: self.project_name.clone(),
+            default_scene: "default".to_string(),
+            recent_scenes: Vec::new(),
+            editor_layout: self.editor_layout_json.clone(),
+        };
+        if let Err(e) = crate::project::save_project(&project, project_path) {
+            eprintln!("[RkpEngine] save project failed: {e}");
         }
     }
 
@@ -4009,6 +4194,18 @@ impl EngineState {
         } else {
             None
         };
+        let importing = if self.importing_dirty {
+            self.importing_dirty = false;
+            Some(self.importing_sources.iter().cloned().collect())
+        } else {
+            None
+        };
+        let editor_layout = if self.editor_layout_pending {
+            self.editor_layout_pending = false;
+            Some(self.editor_layout_json.clone())
+        } else {
+            None
+        };
 
         StateUpdate {
             fps,
@@ -4020,6 +4217,8 @@ impl EngineState {
             project_loaded: project,
             project_name,
             available_models: models,
+            importing_models: importing,
+            editor_layout,
             inspector: self.build_inspector_snapshot(),
             recent_projects: if self.frame_index == 1 {
                 Some(crate::recent_projects::load_recent())

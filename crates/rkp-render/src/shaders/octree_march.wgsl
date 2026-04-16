@@ -17,6 +17,13 @@ const BRICK_DIM: u32 = 4u;
 const BRICK_DIM_F: f32 = 4.0;
 const BRICK_CELLS: u32 = 64u; // 4³
 const BRICK_CELL_EMPTY: u32 = 0xFFFFFFFFu;
+// Interior-of-solid sentinel (see rkp_core::brick_pool::BRICK_INTERIOR).
+// Stored by the mesh import for cells that are inside the solid but
+// aren't the visible shell. The march skips past these identically to
+// BRICK_CELL_EMPTY (rays hit the shell first, never see the interior);
+// neighborhood kernels count them as occupied mass so centroid-based
+// normal reconstruction has something to bias against.
+const BRICK_CELL_INTERIOR: u32 = 0xFFFFFFFDu;
 // A 4³ brick has at most ~12 cells along the longest diagonal traversal,
 // so capping inner-DDA at 16 keeps a misbehaving loop from melting the
 // frame. Real traversals never come close to this cap.
@@ -62,7 +69,45 @@ struct MarchParams {
     mode: u32,
     shadow_max_steps: u32,
     num_lights: u32,
+    // Prefiltered-LOD early-exit gate. `1` → check each branch's `.y`
+    // (prefilter attr id) plus a screen-footprint threshold and
+    // terminate descent when the node would occupy <1 pixel. `0` →
+    // always descend to a terminator (pre-LOD behavior).
+    lod_enabled: u32,
+    // Surface-Nets normal reconstruction gate. `1` → at each brick-cell
+    // hit, replace the baked octahedral normal with one reconstructed
+    // from the 3³ in-brick occupancy neighborhood (centroid-outward).
+    // Proof-of-concept: brick boundaries fall back to baked; isolated
+    // or fully-surrounded voxels fall back to baked too.
+    surfacenet_enabled: u32,
+    // Pad to 32 bytes (uniform size must be a multiple of 16). Plain
+    // u32s, not a vec3<u32> — vec3 would promote struct alignment to 16
+    // and inflate the total to 48 bytes, breaking the binding-size
+    // check against the 32-byte Rust struct.
+    _pad0: u32,
+    _pad1: u32,
 }
+
+const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;
+// Footprint threshold below which we treat a branch as small enough to
+// represent with its prefilter attr. Strict `<` (not `<=`) so the
+// fallback path still runs for exactly-1px nodes. See the LOD plan for
+// hysteresis discussion: at depth N+1 the footprint is half of N's, so
+// the sharp cutoff produces a monotonic "descend/terminate" decision
+// per ray with no ping-pong under camera motion at the sub-pixel scale.
+// Terminate descent when the *child* we'd descend into would be smaller
+// than a pixel. Since a child's footprint is half the current node's,
+// the cutoff on the current node is 2.0 px — at 2.0 the child is at 1.0.
+// Rationale: "one sample per screen pixel" is the right mip cutoff;
+// below that the per-pixel value is an aliased pick from one of 8
+// children. The prefiltered attr (bottom-up average) is the correct
+// low-pass reconstruction, so using it when the child would be
+// sub-pixel is strictly better than descending.
+//
+// Note: an earlier 0.9-px draft was too conservative — at typical
+// viewing distances for meter-scale assets with mm-scale voxels, every
+// branch was several px on screen so LOD never fired.
+const LOD_CUTOFF_PX: f32 = 2.0;
 
 struct GpuLight {
     position: vec4<f32>,   // xyz = position, w = type (0=dir, 1=point, 2=spot)
@@ -97,7 +142,12 @@ struct OctreeResult {
 // before bricks landed; we reused the slot to stay under the 12
 // storage-buffer limit per shader stage.)
 @group(0) @binding(0) var<storage, read> brick_pool: array<u32>;
-@group(0) @binding(1) var<storage, read> octree_nodes: array<u32>;
+// Each slot is (node_value, prefilter_attr_id). `.x` holds the existing
+// node encoding (EMPTY / INTERIOR / BRANCH offset / LEAF id / BRICK id);
+// `.y` holds a prefiltered leaf_attr_id for LOD-cutoff early-exit, or
+// INTERNAL_ATTR_NONE (0xFFFFFFFF) when unavailable. Interleaved into a
+// single `vec2<u32>` binding to stay under the 12-storage-buffer limit.
+@group(0) @binding(1) var<storage, read> octree_nodes: array<vec2<u32>>;
 @group(0) @binding(2) var<storage, read> objects: array<RkpObject>;
 @group(0) @binding(3) var<uniform> camera: CameraUniforms;
 // color_pool[leaf_attr_id] → packed R|G|B|A u32, 0 = no override (use
@@ -111,7 +161,20 @@ struct LeafAttr {
                                      // mid 12:  material_secondary (shifted 16)
                                      // high 4:  blend_weight (shifted 28)
 }
+// brick_face_links[brick_id * 6 + face] → adjacent brick_id, or one of
+// FACE_EMPTY / FACE_INTERIOR. Face order: −X, +X, −Y, +Y, −Z, +Z.
+// Populated by `rkp_core::brick_face_links::compute_brick_face_links`.
+@group(0) @binding(7) var<storage, read> brick_face_links: array<u32>;
 @group(0) @binding(8) var<storage, read> leaf_attr_pool: array<LeafAttr>;
+
+const FACE_INTERIOR: u32 = 0xFFFFFFFEu;
+const FACE_EMPTY_LINK: u32 = 0xFFFFFFFFu;
+const FACE_NX: u32 = 0u;
+const FACE_PX: u32 = 1u;
+const FACE_NY: u32 = 2u;
+const FACE_PY: u32 = 3u;
+const FACE_NZ: u32 = 4u;
+const FACE_PZ: u32 = 5u;
 
 fn leaf_attr_material_primary(a: LeafAttr) -> u32 { return a.material_packed & 0xFFFFu; }
 fn leaf_attr_material_secondary(a: LeafAttr) -> u32 { return (a.material_packed >> 16u) & 0x0FFFu; }
@@ -134,7 +197,7 @@ fn brick_id_of(node: u32) -> u32 {
 
 @group(2) @binding(0) var<uniform> march_params: MarchParams;
 @group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
-@group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 52>;
+@group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 64>;
 // stats[0]       = total steps across all pixels
 // stats[1]       = (reserved — was total_lookups; retained slot for layout stability)
 // stats[2]       = pixels that found a hit
@@ -147,7 +210,11 @@ fn brick_id_of(node: u32) -> u32 {
 // stats[45]      = voxel_pool reads       (8 B each; word0+word1 same cache line)
 // stats[46]      = color_pool_data reads  (4 B each)
 // stats[47]      = materials reads        (32 B each — WGSL storage layout)
-// stats[48..52]  = reserved
+// stats[48..52]  = LOD early-exit depth histogram (levels 0-2, 3-5, 6-8, 9+)
+// stats[52]      = surfacenet normal reconstructions (brick-hit path)
+// stats[53]      = (unused — was brick-boundary fallback pre-face-links)
+// stats[54]      = surfacenet degenerate fallbacks (isolated or surrounded)
+// stats[55..64]  = reserved
 //
 // octree_nodes reads are derived CPU-side from the per-phase depth histograms:
 // sum(bucket[i] * (i + 1)) since each lookup descends `depth+1` nodes.
@@ -195,12 +262,173 @@ fn bucket_depth(phase: u32, level: u32) {
     atomicAdd(&stats[base + min(level, 11u)], 1u);
 }
 
-fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: u32) -> OctreeResult {
+/// Look up a single neighbor cell's occupancy state given an offset
+/// from the hit cell. Resolves cross-brick reads by chaining 1–3
+/// face-link hops (one per axis that crosses a brick boundary). Pure
+/// indirect memory reads — no octree descent.
+///
+/// Returns one of:
+/// - `BRICK_CELL_EMPTY` — neighbor is empty (not occupied).
+/// - Any other value — neighbor is occupied. For cells in a real
+///   brick this is the neighbor's `leaf_attr_id`; for cells in an
+///   INTERIOR bulk region we return a non-EMPTY sentinel
+///   (`FACE_INTERIOR`) since "there's solid there" is all the
+///   centroid needs to know.
+fn resolve_neighbor_cell(
+    start_brick: u32, cx: u32, cy: u32, cz: u32,
+    dx: i32, dy: i32, dz: i32,
+) -> u32 {
+    var current = start_brick;
+    var wx: i32 = i32(cx) + dx;
+    var wy: i32 = i32(cy) + dy;
+    var wz: i32 = i32(cz) + dz;
+
+    // For each axis the neighbor wants to step outside the brick, walk
+    // one face link. If that link is FACE_EMPTY, the whole direction is
+    // empty air — neighbor is empty. If FACE_INTERIOR, the whole region
+    // is solid — report occupied with a sentinel. Otherwise hop into
+    // the adjacent brick and wrap the coordinate.
+    if wx < 0 {
+        let f = brick_face_links[current * 6u + FACE_NX];
+        if f == FACE_EMPTY_LINK { return BRICK_CELL_EMPTY; }
+        if f == FACE_INTERIOR { return FACE_INTERIOR; }
+        current = f;
+        wx = wx + i32(BRICK_DIM);
+    } else if wx >= i32(BRICK_DIM) {
+        let f = brick_face_links[current * 6u + FACE_PX];
+        if f == FACE_EMPTY_LINK { return BRICK_CELL_EMPTY; }
+        if f == FACE_INTERIOR { return FACE_INTERIOR; }
+        current = f;
+        wx = wx - i32(BRICK_DIM);
+    }
+    if wy < 0 {
+        let f = brick_face_links[current * 6u + FACE_NY];
+        if f == FACE_EMPTY_LINK { return BRICK_CELL_EMPTY; }
+        if f == FACE_INTERIOR { return FACE_INTERIOR; }
+        current = f;
+        wy = wy + i32(BRICK_DIM);
+    } else if wy >= i32(BRICK_DIM) {
+        let f = brick_face_links[current * 6u + FACE_PY];
+        if f == FACE_EMPTY_LINK { return BRICK_CELL_EMPTY; }
+        if f == FACE_INTERIOR { return FACE_INTERIOR; }
+        current = f;
+        wy = wy - i32(BRICK_DIM);
+    }
+    if wz < 0 {
+        let f = brick_face_links[current * 6u + FACE_NZ];
+        if f == FACE_EMPTY_LINK { return BRICK_CELL_EMPTY; }
+        if f == FACE_INTERIOR { return FACE_INTERIOR; }
+        current = f;
+        wz = wz + i32(BRICK_DIM);
+    } else if wz >= i32(BRICK_DIM) {
+        let f = brick_face_links[current * 6u + FACE_PZ];
+        if f == FACE_EMPTY_LINK { return BRICK_CELL_EMPTY; }
+        if f == FACE_INTERIOR { return FACE_INTERIOR; }
+        current = f;
+        wz = wz - i32(BRICK_DIM);
+    }
+    let flat = u32(wx) + u32(wy) * BRICK_DIM + u32(wz) * BRICK_DIM * BRICK_DIM;
+    return brick_pool[current * BRICK_CELLS + flat];
+}
+
+/// Reconstruct a surface normal at the given brick cell from the 3³
+/// centroid of occupied neighbors. Cross-brick neighbors are resolved
+/// via chained face-link hops — no octree descent. The resulting
+/// normal is the direction away from the centroid of occupied mass.
+///
+/// `fallback` is the baked octahedral normal, returned when the
+/// neighborhood is uninformative (isolated voxel, fully surrounded).
+fn reconstruct_normal_surfacenet(
+    brick_id: u32,
+    cx: u32, cy: u32, cz: u32,
+    fallback: vec3<f32>,
+) -> vec3<f32> {
+    // 3³ kernel (26 neighbors) with inverse-distance weighting via
+    // unit-vector accumulation. Each occupied neighbor contributes a
+    // unit vector pointing from the hit cell toward it — so face,
+    // edge, and corner neighbors all contribute the same magnitude of
+    // "direction evidence", but farther cells' offsets are normalized
+    // to 1 before summing. Equivalent to `w_i = 1/|offset_i|` in a
+    // weighted centroid.
+    //
+    // Rationale vs. uniform-weighted larger kernels: fewer samples (26
+    // vs 124 for 5³) and the outer ring of samples isn't
+    // over-contributing just because they happen to span more cells at
+    // the same distance band.
+    var direction_sum = vec3<f32>(0.0);
+    var count = 0.0;
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                if dx == 0 && dy == 0 && dz == 0 { continue; }
+                let ncell = resolve_neighbor_cell(brick_id, cx, cy, cz, dx, dy, dz);
+                if ncell == BRICK_CELL_EMPTY { continue; }
+                let offset = vec3<f32>(f32(dx), f32(dy), f32(dz));
+                let inv_len = inverseSqrt(f32(dx * dx + dy * dy + dz * dz));
+                direction_sum = direction_sum + offset * inv_len;
+                count = count + 1.0;
+            }
+        }
+    }
+
+    if count < 0.5 {
+        atomicAdd(&stats[54], 1u);
+        return fallback;
+    }
+    let len = length(direction_sum);
+    if len < 1e-3 {
+        atomicAdd(&stats[54], 1u);
+        return fallback;
+    }
+    return -direction_sum / len;
+}
+
+fn bucket_lod_exit(level: u32) {
+    // 4 buckets: 0-2, 3-5, 6-8, 9+.
+    var b = 3u;
+    if level <= 2u { b = 0u; }
+    else if level <= 5u { b = 1u; }
+    else if level <= 8u { b = 2u; }
+    atomicAdd(&stats[48u + b], 1u);
+}
+
+/// Descend the octree from `root` toward `pos` (in oc-space) and return
+/// the terminating node.
+///
+/// Prefiltered-LOD early exit: if `lod_enabled` is on and the current
+/// branch's projected screen footprint drops below [`LOD_CUTOFF_PX`],
+/// we stop descending and return the branch's prefilter attr id (a
+/// `leaf_attr_id` into `leaf_attr_pool`) as if it were a LEAF at the
+/// current level. The caller shades it with exactly the same path as a
+/// regular leaf hit — the prefiltered attr is by construction a valid
+/// `LeafAttr` pointing at an averaged (normal, material, color) for
+/// the subtree.
+///
+/// Parameters:
+/// * `t_current` — ray parameter at the descent entry in oc-space
+///   units (same units as `extent`). Used to compute distance.
+/// * `local_to_world_scale` — multiplier converting oc-space length to
+///   world units. Same scalar for both `node_size` and `dist` so it
+///   cancels at the threshold — but we keep it explicit because the
+///   footprint histogram in the caller already works in world units.
+/// * `focal_px_y` — vertical pixels per world unit at unit depth. Read
+///   once in the caller from `camera`.
+fn octree_lookup(
+    root: u32,
+    max_depth: u32,
+    extent: f32,
+    pos: vec3<f32>,
+    phase: u32,
+    t_current: f32,
+    local_to_world_scale: f32,
+    focal_px_y: f32,
+) -> OctreeResult {
     var offset = root;
     var half = extent * 0.5;
     var center = vec3<f32>(half);
     for (var level = 0u; level < max_depth; level++) {
-        let node = octree_nodes[offset];
+        let packed = octree_nodes[offset];
+        let node = packed.x;
         if node == OCTREE_EMPTY {
             bucket_depth(phase, level);
             return OctreeResult(OCTREE_EMPTY, level, center, half);
@@ -217,6 +445,32 @@ fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: 
             // differs).
             return OctreeResult(node & OCTREE_PAYLOAD_MASK | (node & OCTREE_BRICK_BIT), level, center, half);
         }
+
+        // Branch — check the prefiltered-LOD cutoff before descending.
+        // Gated on `phase == PHASE_MARCH`: the shadow path uses a cone-
+        // footprint LOD (Phase 3) and must not pixel-footprint-exit;
+        // the normal path doesn't need LOD (normals baked into leaves).
+        // The node's side in world units is `(half * 2.0) * scale`; the
+        // distance from the ray origin is `t * scale`. Both pull from the
+        // same `scale`, so the ratio matches the existing world-space
+        // footprint histogram's formula (`vs * focal_px_y / dist`).
+        if march_params.lod_enabled != 0u
+            && phase == PHASE_MARCH
+            && packed.y != INTERNAL_ATTR_NONE
+        {
+            let node_size_world = (half * 2.0) * local_to_world_scale;
+            let dist_world = max(t_current * local_to_world_scale, 1e-3);
+            let footprint_px = node_size_world * focal_px_y / dist_world;
+            if footprint_px < LOD_CUTOFF_PX {
+                bucket_depth(phase, level);
+                bucket_lod_exit(level);
+                // `packed.y` is a `leaf_attr_id` (< BRICK_BIT). Return it
+                // as a regular leaf — no BRICK_BIT, callers shade it via
+                // the standard leaf-hit path.
+                return OctreeResult(packed.y, level, center, half);
+            }
+        }
+
         let gt = vec3<u32>(pos >= center);
         offset = node + gt.x + gt.y * 2u + gt.z * 4u;
         half *= 0.5;
@@ -227,7 +481,7 @@ fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: 
         );
     }
     bucket_depth(phase, max_depth);
-    let node = octree_nodes[offset];
+    let node = octree_nodes[offset].x;
     if node == OCTREE_EMPTY { return OctreeResult(OCTREE_EMPTY, max_depth, center, half); }
     if node == OCTREE_INTERIOR { return OctreeResult(OCTREE_INTERIOR, max_depth, center, half); }
     if (node & OCTREE_LEAF_BIT) != 0u {
@@ -340,7 +594,8 @@ fn trace_shadow_ray(
             if t > t_limit { break; }
 
             let pos = clamp(shadow_origin + safe_dir * t, vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
-            let r = octree_lookup(root, max_depth, extent, pos, PHASE_SHADOW);
+            // LOD skipped (phase != PHASE_MARCH) — placeholder args.
+            let r = octree_lookup(root, max_depth, extent, pos, PHASE_SHADOW, 0.0, 0.0, 0.0);
 
             if r.slot == OCTREE_EMPTY {
                 t += max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);
@@ -374,7 +629,10 @@ fn trace_shadow_ray(
                     let cz = u32(lz);
                     let flat = cx + cy * BRICK_DIM + cz * BRICK_DIM * BRICK_DIM;
                     let cell = brick_pool[brick_base + flat];
-                    if cell != BRICK_CELL_EMPTY {
+                    // BRICK_CELL_INTERIOR is solid-bulk-marker: skip like
+                    // EMPTY for shadow tracing (the shell in front of it
+                    // already gave us the occluder we needed).
+                    if cell != BRICK_CELL_EMPTY && cell != BRICK_CELL_INTERIOR {
                         let attr = leaf_attr_pool[cell];
                         let mid = leaf_attr_material_primary(attr);
                         let m_op = materials[mid].opacity;
@@ -449,7 +707,15 @@ fn march_object(
 
     let inv_world = obj.inverse_world;
     let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
-    let local_dir = normalize((inv_world * vec4<f32>(world_dir, 0.0)).xyz);
+    let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
+    let local_dir = normalize(local_dir_unnorm);
+    // Conversion from oc-space (where `t` marches) to world units.
+    // `length(local_dir_unnorm) = 1/S` for uniform scale S, so the
+    // reciprocal gives world_distance = oc_distance * local_to_world.
+    let local_to_world = 1.0 / max(length(local_dir_unnorm), 1e-8);
+    // camera.up.xyz encodes tan(half_fov_y) — same decoding as the
+    // post-hit footprint histogram.
+    let focal_px_y = 0.5 * camera.resolution.y / max(length(camera.up.xyz), 1e-6);
 
     let root = obj.octree_root;
     let max_depth = obj.octree_depth;
@@ -479,7 +745,7 @@ fn march_object(
         if result.alpha > 0.99 { break; }
 
         let pos = clamp(oc_origin + safe_dir * t, vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
-        let r = octree_lookup(root, max_depth, extent, pos, PHASE_MARCH);
+        let r = octree_lookup(root, max_depth, extent, pos, PHASE_MARCH, t, local_to_world, focal_px_y);
 
         if r.slot == OCTREE_EMPTY {
             t += skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs);
@@ -523,11 +789,25 @@ fn march_object(
                 let flat = cx + cy * BRICK_DIM + cz * BRICK_DIM * BRICK_DIM;
                 let cell = brick_pool[brick_base + flat];
 
-                if cell != BRICK_CELL_EMPTY {
+                // BRICK_CELL_INTERIOR cells are solid-bulk markers set
+                // by mesh imports; skip them identically to empty air
+                // so the march only ever stops on the visible shell.
+                // The surface-nets kernel above reads them as occupied
+                // for centroid purposes via `resolve_neighbor_cell`.
+                if cell != BRICK_CELL_EMPTY && cell != BRICK_CELL_INTERIOR {
                     // Cell occupied — process as a leaf hit.
                     atomicAdd(&stats[44], 1u); // leaf_attr read
                     let attr = leaf_attr_pool[cell];
-                    let cell_normal = unpack_oct_normal(attr.normal_oct);
+                    let baked_normal = unpack_oct_normal(attr.normal_oct);
+                    var cell_normal: vec3<f32>;
+                    if march_params.surfacenet_enabled != 0u {
+                        cell_normal = reconstruct_normal_surfacenet(
+                            brick_id, cx, cy, cz, baked_normal,
+                        );
+                        atomicAdd(&stats[52], 1u);
+                    } else {
+                        cell_normal = baked_normal;
+                    }
                     let mid = leaf_attr_material_primary(attr);
                     atomicAdd(&stats[47], 1u); // materials read
                     let m_opacity = materials[mid].opacity;

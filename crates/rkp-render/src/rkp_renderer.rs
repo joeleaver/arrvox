@@ -111,6 +111,12 @@ impl RkpRenderer {
     /// per-resolution passes; in `Isolation` mode the atmosphere /
     /// shadow_trace / volumetric / god_rays / bloom passes are skipped
     /// to give a clean studio look.
+    ///
+    /// `lod_enabled` gates the prefiltered-LOD early-exit in the march;
+    /// turn it off for A/B correctness comparison.
+    /// `surfacenet_enabled` gates render-time normal reconstruction from
+    /// the 3³ in-brick occupancy neighborhood — an A/B toggle for the
+    /// Surface-Nets normal POC.
     #[allow(clippy::too_many_arguments)]
     pub fn render_to(
         &mut self,
@@ -120,6 +126,8 @@ impl RkpRenderer {
         object_count: u32,
         shadow_steps: u32,
         num_lights: u32,
+        lod_enabled: bool,
+        surfacenet_enabled: bool,
         screen_aabbs: &[u8],
         atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
         mode: crate::RenderMode,
@@ -144,7 +152,7 @@ impl RkpRenderer {
             viewport.march.dispatch(
                 encoder, queue, &viewport.scene_bind_group,
                 object_count, viewport.width, viewport.height, 0,
-                shadow_steps, num_lights, None,
+                shadow_steps, num_lights, lod_enabled, surfacenet_enabled, None,
             );
             self.profiler.end_query(encoder, q);
         }

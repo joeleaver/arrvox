@@ -9,14 +9,17 @@
 //! Transparency is expressed per-material, not per-voxel.
 
 pub mod asset_file;
+pub mod brick_face_links;
 pub mod brick_pool;
+pub mod laplacian_smooth;
 pub mod leaf_attr;
 pub mod leaf_attr_pool;
 pub mod octree_allocator;
+pub mod prefilter;
 pub mod sparse_octree;
 pub mod voxelize_octree;
 
-pub use brick_pool::{BrickPool, BRICK_BYTES, BRICK_CELLS, BRICK_DIM, BRICK_EMPTY, BRICK_LEVELS};
+pub use brick_pool::{BrickPool, BRICK_BYTES, BRICK_CELLS, BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR, BRICK_LEVELS};
 pub use leaf_attr::{pack_oct, unpack_oct, LeafAttr};
 pub use leaf_attr_pool::LeafAttrPool;
 pub use octree_allocator::{OctreeAllocator, OctreeHandle};

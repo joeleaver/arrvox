@@ -14,6 +14,12 @@ pub struct ProjectFile {
     pub default_scene: String,
     #[serde(default)]
     pub recent_scenes: Vec<String>,
+    /// Opaque editor layout blob (rinch docking + splitter sizes). The
+    /// engine never inspects it — the editor produces and consumes this
+    /// string through `SetEditorLayout` / `StateUpdate.editor_layout`.
+    /// Absent on projects saved before layout persistence landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_layout: Option<String>,
 }
 
 impl ProjectFile {
@@ -23,6 +29,7 @@ impl ProjectFile {
             name: name.to_string(),
             default_scene: "default".to_string(),
             recent_scenes: Vec::new(),
+            editor_layout: None,
         }
     }
 }
