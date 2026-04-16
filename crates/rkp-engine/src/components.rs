@@ -203,7 +203,8 @@ pub struct RigidBodyRuntime {
 /// The tree is the source of truth. When dirty, the engine re-evaluates the tree
 /// into the voxel pool via octree voxelization. The resulting SpatialData is
 /// stored on the sibling `Renderable` component.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProceduralGeometry {
     /// The procedural node tree (arena-based).
     pub tree: rkp_procedural::ProceduralObject,
@@ -213,11 +214,27 @@ pub struct ProceduralGeometry {
 
     /// Voxel size for the physics collider grid.
     pub collider_resolution: f32,
-    /// Whether the tree needs re-evaluation.
+    /// Whether the tree needs re-evaluation. On load we force this to
+    /// `true` so the per-tick `update_dirty_procedurals` loop bakes the
+    /// tree once on first frame after open — the `Renderable.spatial`
+    /// is never persisted, so without this flag the entity would load
+    /// invisible until the user clicked Bake.
+    #[serde(default = "default_dirty_true", skip_serializing)]
     pub dirty: bool,
-    /// Scale at last evaluation — re-evaluate if scale changes.
+    /// Scale at last evaluation — re-evaluate if scale changes. Set to
+    /// a sentinel on load so the first-frame bake also resets this.
+    #[serde(default = "default_last_scale", skip_serializing)]
     pub last_evaluated_scale: glam::Vec3,
 }
+
+impl Default for ProceduralGeometry {
+    fn default() -> Self {
+        Self::default_sphere()
+    }
+}
+
+fn default_dirty_true() -> bool { true }
+fn default_last_scale() -> glam::Vec3 { glam::Vec3::ONE }
 
 impl ProceduralGeometry {
     /// Create a default procedural object: a union root with one sphere child.

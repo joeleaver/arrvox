@@ -128,6 +128,68 @@ pub fn register_builtins(registry: &mut ComponentRegistry) {
     registry.register(camera_entry());
     registry.register(spot_light_entry());
     registry.register(rigid_body_entry());
+    registry.register(procedural_geometry_entry());
+}
+
+// ── ProceduralGeometry ───────────────────────────────────────────────
+
+/// Small surface: the tree itself is edited via the build panel, not the
+/// inspector. We expose only the two scalars that make sense to tweak
+/// without going through the build panel (voxel size tier, collider
+/// resolution). Registration exists primarily so `ProceduralGeometry`
+/// participates in `.rkproject` save / load — without it, procedurals
+/// silently lose their tree on reopen.
+static PROCEDURAL_FIELDS: [FieldMeta; 2] = [
+    FieldMeta { name: "voxel_size", field_type: FieldType::Float, range: Some((0.005, 0.32)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
+    FieldMeta { name: "collider_resolution", field_type: FieldType::Float, range: Some((0.05, 1.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
+];
+
+fn procedural_geometry_entry() -> ComponentEntry {
+    use crate::components::ProceduralGeometry;
+    ComponentEntry {
+        name: "ProceduralGeometry",
+        meta: &PROCEDURAL_FIELDS,
+        mandatory: false,
+        has: |world, entity| world.get::<&ProceduralGeometry>(entity).is_ok(),
+        get_field: |world, entity, field| {
+            let c = world.get::<&ProceduralGeometry>(entity).map_err(|_| "no ProceduralGeometry".to_string())?;
+            match field {
+                "voxel_size" => Ok(FieldValue::Float(c.voxel_size as f64)),
+                "collider_resolution" => Ok(FieldValue::Float(c.collider_resolution as f64)),
+                _ => Err(format!("unknown field '{field}'")),
+            }
+        },
+        set_field: |world, entity, field, value| {
+            let mut c = world.get::<&mut ProceduralGeometry>(entity).map_err(|_| "no ProceduralGeometry".to_string())?;
+            match field {
+                "voxel_size" => {
+                    if let FieldValue::Float(v) = value { c.voxel_size = v as f32; c.dirty = true; Ok(()) }
+                    else { Err("type mismatch".into()) }
+                }
+                "collider_resolution" => {
+                    if let FieldValue::Float(v) = value { c.collider_resolution = v as f32; Ok(()) }
+                    else { Err("type mismatch".into()) }
+                }
+                _ => Err(format!("unknown field '{field}'")),
+            }
+        },
+        add_default: |world, entity| {
+            world.insert_one(entity, ProceduralGeometry::default_sphere()).map_err(|e| format!("{e}"))
+        },
+        remove: |world, entity| {
+            world.remove_one::<ProceduralGeometry>(entity).map(|_| ()).map_err(|e| format!("{e}"))
+        },
+        serialize: |world, entity| {
+            let c = world.get::<&ProceduralGeometry>(entity).ok()?;
+            serde_json::to_string(&*c).ok()
+        },
+        deserialize_insert: |world, entity, json| {
+            let c: ProceduralGeometry = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
+            world.insert_one(entity, c).map_err(|e| format!("{e}"))
+        },
+        on_add: None,
+        on_remove: None,
+    }
 }
 
 // ── Transform ────────────────────────────────────────────────────────

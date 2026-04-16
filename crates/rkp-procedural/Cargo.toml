@@ -9,10 +9,11 @@ description = "Procedural object system: arena-based node trees, evaluation, ada
 rkf-core = { workspace = true }
 glam = { workspace = true }
 serde = { workspace = true }
-smallvec = "1"
+smallvec = { version = "1", features = ["serde"] }
 # `flatten.rs` emits `ProcInstruction` as a `Pod`/`Zeroable` struct for
 # zero-copy upload to the GPU raymarch pass.
 bytemuck = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 approx = "0.5"
+serde_json = { workspace = true }

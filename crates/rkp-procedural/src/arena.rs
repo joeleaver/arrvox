@@ -5,27 +5,37 @@
 //! by walking the parent chain.
 
 use glam::Affine3A;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::node_kind::NodeKind;
 
 /// Index into the node arena.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u32);
 
 /// A single node in the procedural tree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     pub kind: NodeKind,
     pub parent: Option<NodeId>,
     pub children: SmallVec<[NodeId; 2]>,
     /// Local transform (relative to parent).
     pub transform: Affine3A,
-    /// Bumped when this node's own parameters change.
+    /// Bumped when this node's own parameters change. Not persisted —
+    /// versions are runtime cache-invalidation state, not scene data.
+    /// On load we re-seed to 1 (same as a freshly constructed node);
+    /// any external cache keyed on versions will re-prime naturally.
+    #[serde(skip, default = "default_version")]
     pub own_version: u64,
-    /// Max of own_version and all descendants' subtree_versions.
-    /// Used to detect whether cached data is stale.
+    /// Max of own_version and all descendants' subtree_versions. Also
+    /// skipped for the same reason.
+    #[serde(skip, default = "default_version")]
     pub subtree_version: u64,
+}
+
+fn default_version() -> u64 {
+    1
 }
 
 impl Node {
@@ -46,12 +56,75 @@ impl Node {
 /// The tree has a single root. Nodes are addressed by [`NodeId`] which indexes
 /// into the arena. Removed nodes leave tombstones (the slot is not reused) to
 /// keep existing NodeIds stable.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProceduralObject {
     nodes: Vec<Option<Node>>,
     root: NodeId,
-    /// Global version counter — incremented on every mutation.
+    /// Global version counter — incremented on every mutation. Not
+    /// persisted; re-seeded to 2 (matches `new`) on load so any future
+    /// mutation starts fresh without colliding with cached state.
+    #[serde(skip, default = "default_next_version")]
     next_version: u64,
+}
+
+fn default_next_version() -> u64 {
+    2
+}
+
+#[cfg(test)]
+mod serde_tests {
+    use super::*;
+    use crate::node_kind::*;
+    use glam::{Affine3A, Vec3};
+
+    /// A tree with primitives + a combinator + transforms must round-trip
+    /// through serde unchanged (structurally) — this is the guarantee
+    /// `.rkproject` save/load relies on.
+    #[test]
+    fn procedural_object_json_roundtrip() {
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        let a = obj.add_child(obj.root(), NodeKind::Sphere(SphereParams {
+            radius: 0.7, material_id: 3, color: Vec3::new(0.9, 0.2, 0.1),
+        }));
+        obj.set_transform(a, Affine3A::from_translation(Vec3::new(1.5, 0.0, 0.0)));
+        let b = obj.add_child(obj.root(), NodeKind::Box(BoxParams {
+            half_extents: Vec3::new(0.4, 0.5, 0.6), rounding: 0.05,
+            material_id: 7, color: Vec3::new(0.1, 0.9, 0.3),
+        }));
+        obj.set_transform(b, Affine3A::from_rotation_y(0.5));
+
+        let json = serde_json::to_string(&obj).expect("serialize");
+        let back: ProceduralObject = serde_json::from_str(&json).expect("deserialize");
+
+        // Structural equality: same node count, same root, same
+        // kinds at each slot.
+        assert_eq!(back.arena_len(), obj.arena_len());
+        assert_eq!(back.root(), obj.root());
+        for id in obj.iter_ids() {
+            let orig = obj.get(id).unwrap();
+            let round = back.get(id).unwrap();
+            // Approximate-equal is overkill for a JSON roundtrip —
+            // f32 serialization is lossless here — so strict `==` is
+            // appropriate via bitwise-identical f32 literals.
+            match (&orig.kind, &round.kind) {
+                (NodeKind::Sphere(a), NodeKind::Sphere(b)) => {
+                    assert_eq!(a.radius, b.radius);
+                    assert_eq!(a.material_id, b.material_id);
+                }
+                (NodeKind::Box(a), NodeKind::Box(b)) => {
+                    assert_eq!(a.half_extents, b.half_extents);
+                    assert_eq!(a.rounding, b.rounding);
+                }
+                (NodeKind::Union { .. }, NodeKind::Union { .. }) => {}
+                other => panic!("kind mismatch: {other:?}"),
+            }
+            assert_eq!(orig.parent, round.parent);
+            assert_eq!(orig.children.as_slice(), round.children.as_slice());
+            assert_eq!(orig.transform, round.transform);
+        }
+    }
 }
 
 impl ProceduralObject {
