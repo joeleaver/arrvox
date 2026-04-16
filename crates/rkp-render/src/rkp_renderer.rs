@@ -310,6 +310,17 @@ impl RkpRenderer {
             viewport.grid.draw(encoder, &viewport.composite_view);
             self.profiler.end_query(encoder, q);
         }
+
+        // Raymarch preview: stamp the selected-primitive outline on top
+        // of the composite (and on top of the grid, so the outline
+        // wins visually when a primitive sits against the floor).
+        // Self-discarding when no node is selected, so this is cheap
+        // whether or not the user is currently pointing at something.
+        if raymarch {
+            let q = self.profiler.begin_query("proc_outline", encoder);
+            viewport.proc_outline.draw(encoder, &viewport.composite_view);
+            self.profiler.end_query(encoder, q);
+        }
     }
 
     pub fn resolve_profiler_queries(&mut self, encoder: &mut wgpu::CommandEncoder) {

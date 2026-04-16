@@ -37,6 +37,8 @@ pub mod rkp_scene_manager;
 pub mod viewport_renderer;
 /// Procedural CSG raymarch — live preview pass for the build viewport.
 pub mod proc_raymarch;
+/// Selected-primitive outline overlay for the raymarch preview.
+pub mod proc_outline;
 
 pub use voxelize_opacity::import_mesh_to_opacity_rkp;
 pub use octree_gpu::OctreeGpu;

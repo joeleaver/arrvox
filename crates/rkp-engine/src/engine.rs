@@ -893,6 +893,22 @@ impl EngineState {
                     proc_instructions.len() as u32,
                     proc_object_id + 1,
                 );
+                // Push the currently-selected procedural NodeId to the
+                // outline overlay. Sentinel (`u32::MAX`) when nothing
+                // is selected — the shader early-discards on that and
+                // the pass becomes free.
+                let outline_params = match self.selected_procedural_node {
+                    Some(n) => rkp_render::proc_outline::OutlineParams::new(
+                        n,
+                        // Warm orange highlight, fully opaque. Alpha
+                        // is shader-premultiplied into the emitted
+                        // color so the pipeline's One/OneMinusSrcAlpha
+                        // blend gives the right "over" composite.
+                        [1.0, 0.55, 0.15, 1.0],
+                    ),
+                    None => rkp_render::proc_outline::OutlineParams::NONE,
+                };
+                vr.proc_outline.update_params(&self.queue, &outline_params);
             }
             self.renderer.render_to(
                 &mut encoder, &self.queue, vr,
