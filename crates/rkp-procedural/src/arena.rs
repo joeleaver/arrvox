@@ -354,6 +354,165 @@ impl ProceduralObject {
         true
     }
 
+    /// Move a node to a new parent, inserting at a specific child index.
+    ///
+    /// Unifies reparent + reorder: the new parent can be the node's
+    /// current parent (pure reorder) or a different combinator (reparent
+    /// with ordering). `index` is clamped to `[0, children.len()]` of
+    /// the new parent *after the node is removed from its old parent* —
+    /// so the editor can just pass the visual insertion position it
+    /// computed, without having to reason about whether the source and
+    /// target are the same parent.
+    ///
+    /// Returns `true` on success. Fails if the move would create a
+    /// cycle (new_parent is a descendant of `id`), if `id` is the root,
+    /// or if the new parent is a leaf / missing.
+    pub fn move_to(&mut self, id: NodeId, new_parent: NodeId, index: usize) -> bool {
+        if id == self.root {
+            return false;
+        }
+
+        // Cycle check: walk new_parent's ancestor chain; fail if we hit id.
+        let mut cursor = Some(new_parent);
+        while let Some(c) = cursor {
+            if c == id {
+                return false;
+            }
+            cursor = self.nodes[c.0 as usize].as_ref().and_then(|n| n.parent);
+        }
+
+        // New parent must exist and be a combinator.
+        match &self.nodes[new_parent.0 as usize] {
+            Some(n) if n.kind.is_leaf() => return false,
+            None => return false,
+            _ => {}
+        }
+
+        let old_parent = match self.nodes[id.0 as usize].as_ref() {
+            Some(n) => match n.parent {
+                Some(p) => p,
+                None => return false, // root sanity (already checked above)
+            },
+            None => return false,
+        };
+
+        // Remove from old parent.
+        if let Some(old_parent_node) = &mut self.nodes[old_parent.0 as usize] {
+            old_parent_node.children.retain(|c| *c != id);
+        }
+
+        // Insert into new parent's children at the clamped index.
+        let new_parent_node = self.nodes[new_parent.0 as usize].as_mut().unwrap();
+        let clamped = index.min(new_parent_node.children.len());
+        new_parent_node.children.insert(clamped, id);
+
+        // Update the moved node's parent pointer.
+        self.nodes[id.0 as usize].as_mut().unwrap().parent = Some(new_parent);
+
+        // Propagate versions from both sides so any cached subtree_version
+        // above either mount point is invalidated — old_parent's subtree
+        // shrunk, new_parent's grew.
+        self.propagate_version(old_parent);
+        if old_parent != new_parent {
+            self.propagate_version(new_parent);
+        }
+
+        true
+    }
+
+    /// Deep-clone a node and its entire subtree, inserting the copy as
+    /// the next sibling of `id`. Returns the new subtree's root id, or
+    /// `None` if `id` is the arena root (root-duplication is ambiguous
+    /// — the tree has exactly one root and the copy would need to go
+    /// somewhere) or if `id` is missing.
+    ///
+    /// Used by the "Duplicate" context-menu action; the resulting id
+    /// is what the editor selects after the op.
+    pub fn duplicate(&mut self, id: NodeId) -> Option<NodeId> {
+        if id == self.root {
+            return None;
+        }
+
+        // Capture parent + original sibling index so the clone drops in
+        // right after `id` — preferred visual placement for "duplicate
+        // this node."
+        let parent_id = self.nodes[id.0 as usize].as_ref()?.parent?;
+        let insert_at = self.nodes[parent_id.0 as usize]
+            .as_ref()
+            .and_then(|p| p.children.iter().position(|c| *c == id))
+            .map(|i| i + 1)
+            .unwrap_or_else(|| {
+                self.nodes[parent_id.0 as usize]
+                    .as_ref()
+                    .map(|p| p.children.len())
+                    .unwrap_or(0)
+            });
+
+        // BFS-clone the subtree. Walk the original ids in BFS order;
+        // as each is cloned, stash its new id in `id_map` so later
+        // children can rebuild their `children` vecs with the new ids.
+        let mut id_map: std::collections::HashMap<NodeId, NodeId> =
+            std::collections::HashMap::new();
+
+        // Collect source ids in BFS order rooted at `id`.
+        let mut bfs: Vec<NodeId> = vec![id];
+        let mut cursor = 0;
+        while cursor < bfs.len() {
+            let current = bfs[cursor];
+            if let Some(node) = &self.nodes[current.0 as usize] {
+                bfs.extend_from_slice(&node.children);
+            }
+            cursor += 1;
+        }
+
+        // Allocate new slots and build id_map.
+        for &src in &bfs {
+            let new_id = NodeId(self.nodes.len() as u32);
+            id_map.insert(src, new_id);
+            // Push a placeholder; we'll fix up fields immediately after.
+            let src_node = self.nodes[src.0 as usize].as_ref().unwrap().clone();
+            self.nodes.push(Some(src_node));
+        }
+
+        // Fix up each cloned node: rewrite parent + children via id_map,
+        // fresh own/subtree versions.
+        for &src in &bfs {
+            let new_id = *id_map.get(&src).unwrap();
+            let own_version = self.next_version;
+            self.next_version += 1;
+
+            let node = self.nodes[new_id.0 as usize].as_mut().unwrap();
+            node.own_version = own_version;
+            node.subtree_version = own_version;
+            // Clone-root's parent is the original's parent (set below);
+            // descendants' parent is their mapped-to cloned parent.
+            node.parent = if src == id {
+                Some(parent_id)
+            } else {
+                node.parent.and_then(|p| id_map.get(&p).copied())
+            };
+            // Children always remap — every child of a cloned node was
+            // itself part of the BFS so it has a mapping.
+            let remapped: SmallVec<[NodeId; 2]> = node
+                .children
+                .iter()
+                .map(|c| *id_map.get(c).unwrap_or(c))
+                .collect();
+            node.children = remapped;
+        }
+
+        // Insert the clone-root into the parent's children list right
+        // after the original.
+        let new_root = *id_map.get(&id).unwrap();
+        if let Some(parent_node) = &mut self.nodes[parent_id.0 as usize] {
+            let clamped = insert_at.min(parent_node.children.len());
+            parent_node.children.insert(clamped, new_root);
+        }
+        self.propagate_version(parent_id);
+
+        Some(new_root)
+    }
+
     /// Move a node earlier among its siblings (swap with previous sibling).
     /// Returns `true` if the node was moved.
     pub fn move_up(&mut self, id: NodeId) -> bool {
@@ -578,6 +737,120 @@ mod tests {
         obj.set_transform(a, Affine3A::from_translation(glam::Vec3::X));
         let v_after = obj.get(obj.root()).unwrap().subtree_version;
         assert!(v_after > v_before);
+    }
+
+    #[test]
+    fn move_to_reorders_within_same_parent() {
+        let mut obj = ProceduralObject::new(union_kind());
+        let a = obj.add_child(obj.root(), sphere_kind());
+        let b = obj.add_child(obj.root(), sphere_kind());
+        let c = obj.add_child(obj.root(), sphere_kind());
+        // Move c to front: [a, b, c] → [c, a, b]
+        assert!(obj.move_to(c, obj.root(), 0));
+        assert_eq!(
+            obj.get(obj.root()).unwrap().children.as_slice(),
+            &[c, a, b]
+        );
+    }
+
+    #[test]
+    fn move_to_mid_position_same_parent() {
+        let mut obj = ProceduralObject::new(union_kind());
+        let a = obj.add_child(obj.root(), sphere_kind());
+        let b = obj.add_child(obj.root(), sphere_kind());
+        let c = obj.add_child(obj.root(), sphere_kind());
+        // Move a between b and c: [a, b, c] → [b, a, c]
+        assert!(obj.move_to(a, obj.root(), 1));
+        assert_eq!(
+            obj.get(obj.root()).unwrap().children.as_slice(),
+            &[b, a, c]
+        );
+    }
+
+    #[test]
+    fn move_to_across_parents() {
+        let mut obj = ProceduralObject::new(union_kind());
+        let p1 = obj.add_child(obj.root(), union_kind());
+        let p2 = obj.add_child(obj.root(), union_kind());
+        let leaf = obj.add_child(p1, sphere_kind());
+        assert!(obj.move_to(leaf, p2, 0));
+        assert_eq!(obj.get(p1).unwrap().children.len(), 0);
+        assert_eq!(obj.get(p2).unwrap().children.as_slice(), &[leaf]);
+        assert_eq!(obj.get(leaf).unwrap().parent, Some(p2));
+    }
+
+    #[test]
+    fn move_to_clamps_overflow_index() {
+        let mut obj = ProceduralObject::new(union_kind());
+        let _a = obj.add_child(obj.root(), sphere_kind());
+        let b = obj.add_child(obj.root(), sphere_kind());
+        // index=99 → clamp to end
+        assert!(obj.move_to(b, obj.root(), 99));
+        assert_eq!(obj.get(obj.root()).unwrap().children.last().copied(), Some(b));
+    }
+
+    #[test]
+    fn move_to_rejects_root() {
+        let mut obj = ProceduralObject::new(union_kind());
+        let a = obj.add_child(obj.root(), union_kind());
+        assert!(!obj.move_to(obj.root(), a, 0));
+    }
+
+    #[test]
+    fn move_to_rejects_cycle() {
+        let mut obj = ProceduralObject::new(union_kind());
+        let a = obj.add_child(obj.root(), union_kind());
+        let b = obj.add_child(a, union_kind());
+        // Moving a into b would make b its own ancestor.
+        assert!(!obj.move_to(a, b, 0));
+    }
+
+    #[test]
+    fn move_to_rejects_leaf_parent() {
+        let mut obj = ProceduralObject::new(union_kind());
+        let a = obj.add_child(obj.root(), union_kind());
+        let leaf = obj.add_child(obj.root(), sphere_kind());
+        assert!(!obj.move_to(a, leaf, 0));
+    }
+
+    #[test]
+    fn duplicate_leaf() {
+        let mut obj = ProceduralObject::new(union_kind());
+        let a = obj.add_child(obj.root(), sphere_kind());
+        let dup = obj.duplicate(a).expect("leaf duplicates");
+        assert_ne!(dup, a);
+        let kids = obj.get(obj.root()).unwrap().children.clone();
+        // Original followed by clone.
+        assert_eq!(kids.as_slice(), &[a, dup]);
+        assert_eq!(obj.get(dup).unwrap().parent, Some(obj.root()));
+    }
+
+    #[test]
+    fn duplicate_subtree_deep_copy() {
+        let mut obj = ProceduralObject::new(union_kind());
+        let sub = obj.add_child(obj.root(), union_kind());
+        let leaf_a = obj.add_child(sub, sphere_kind());
+        let leaf_b = obj.add_child(sub, sphere_kind());
+
+        let dup = obj.duplicate(sub).expect("subtree duplicates");
+        // Dup is a new node.
+        assert_ne!(dup, sub);
+        // Root now has two combinator children.
+        assert_eq!(obj.get(obj.root()).unwrap().children.as_slice(), &[sub, dup]);
+        // Dup has two children that are NEW ids (not the original leaves).
+        let dup_kids = obj.get(dup).unwrap().children.clone();
+        assert_eq!(dup_kids.len(), 2);
+        for &c in dup_kids.iter() {
+            assert_ne!(c, leaf_a);
+            assert_ne!(c, leaf_b);
+            assert_eq!(obj.get(c).unwrap().parent, Some(dup));
+        }
+    }
+
+    #[test]
+    fn duplicate_rejects_root() {
+        let mut obj = ProceduralObject::new(union_kind());
+        assert!(obj.duplicate(obj.root()).is_none());
     }
 
     #[test]

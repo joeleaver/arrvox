@@ -1634,6 +1634,95 @@ impl EngineState {
                 }
             }
 
+            EngineCommand::MoveProceduralNode { node_id, new_parent_id, index } => {
+                if let Some(entity) = self.selected_entity {
+                    if let Ok(mut proc_geo) = self.world.get::<&mut crate::components::ProceduralGeometry>(entity) {
+                        if proc_geo.tree.move_to(
+                            rkp_procedural::NodeId(node_id),
+                            rkp_procedural::NodeId(new_parent_id),
+                            index as usize,
+                        ) {
+                            proc_geo.dirty = true;
+                        }
+                    }
+                }
+            }
+
+            EngineCommand::DuplicateProceduralNode { node_id } => {
+                if let Some(entity) = self.selected_entity {
+                    if let Ok(mut proc_geo) = self.world.get::<&mut crate::components::ProceduralGeometry>(entity) {
+                        if let Some(new_id) = proc_geo.tree.duplicate(rkp_procedural::NodeId(node_id)) {
+                            proc_geo.dirty = true;
+                            self.selected_procedural_node = Some(new_id.0);
+                        }
+                    }
+                }
+            }
+
+            EngineCommand::SetProceduralNodeCombinator { node_id, kind } => {
+                // Local helper — returns true when a kind change was
+                // actually applied. Early-returns via `?` / plain
+                // `return None` keep the body flat and side-step the
+                // `continue` footgun (there's no outer loop here,
+                // this is a one-off match arm).
+                fn swap_kind(
+                    proc_geo: &mut crate::components::ProceduralGeometry,
+                    id: rkp_procedural::NodeId,
+                    kind: &str,
+                ) -> bool {
+                    let node = match proc_geo.tree.get_mut(id) {
+                        Some(n) => n,
+                        None => return false,
+                    };
+                    // Only swap between combinators; silently ignore on
+                    // leaves (UI should hide the menu there anyway, but
+                    // defend at the boundary).
+                    let current_mc = match &node.kind {
+                        rkp_procedural::NodeKind::Union { material_combine }
+                        | rkp_procedural::NodeKind::Intersect { material_combine } => {
+                            Some(*material_combine)
+                        }
+                        rkp_procedural::NodeKind::Subtract => None,
+                        _ => return false, // leaf
+                    };
+                    let new_kind = match kind {
+                        "Union" => rkp_procedural::NodeKind::Union {
+                            material_combine: current_mc
+                                .unwrap_or(rkp_procedural::MaterialCombine::Winner),
+                        },
+                        "Intersect" => rkp_procedural::NodeKind::Intersect {
+                            material_combine: current_mc
+                                .unwrap_or(rkp_procedural::MaterialCombine::Winner),
+                        },
+                        "Subtract" => rkp_procedural::NodeKind::Subtract,
+                        _ => return false,
+                    };
+                    // No-op when the user re-picks the current kind —
+                    // without this the version bump would force a rebake.
+                    let same_kind = matches!(
+                        (&node.kind, &new_kind),
+                        (rkp_procedural::NodeKind::Union { .. }, rkp_procedural::NodeKind::Union { .. })
+                            | (rkp_procedural::NodeKind::Intersect { .. }, rkp_procedural::NodeKind::Intersect { .. })
+                            | (rkp_procedural::NodeKind::Subtract, rkp_procedural::NodeKind::Subtract)
+                    );
+                    if same_kind {
+                        return false;
+                    }
+                    node.kind = new_kind;
+                    true
+                }
+
+                if let Some(entity) = self.selected_entity {
+                    if let Ok(mut proc_geo) = self.world.get::<&mut crate::components::ProceduralGeometry>(entity) {
+                        let id = rkp_procedural::NodeId(node_id);
+                        if swap_kind(&mut proc_geo, id, &kind) {
+                            proc_geo.tree.bump_version(id);
+                            proc_geo.dirty = true;
+                        }
+                    }
+                }
+            }
+
             EngineCommand::SetProceduralNodePosition { node_id, position } => {
                 self.update_procedural_node_transform(node_id, |s, r, _| (s, r, position));
             }

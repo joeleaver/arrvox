@@ -93,6 +93,32 @@ pub enum EngineCommand {
         new_parent_id: u32,
     },
 
+    /// Move a procedural node to a new parent at a specific child index.
+    /// Supersedes the reparent/move-up/move-down triad for drag-and-drop:
+    /// one command encodes both the destination parent and the visual
+    /// insertion position. Same parent + different index = pure reorder.
+    MoveProceduralNode {
+        node_id: u32,
+        new_parent_id: u32,
+        index: u32,
+    },
+
+    /// Deep-clone a procedural node and its subtree, inserting the copy
+    /// as the next sibling of the source. Selection moves to the clone.
+    DuplicateProceduralNode {
+        node_id: u32,
+    },
+
+    /// Change a combinator node's kind (Union / Intersect / Subtract)
+    /// in place. Children, transform, and position in the tree are
+    /// preserved; `material_combine` is carried across Union↔Intersect
+    /// and defaulted to Winner when moving into Subtract (which has
+    /// no material_combine). Ignored for leaf nodes / unknown kinds.
+    SetProceduralNodeCombinator {
+        node_id: u32,
+        kind: String,
+    },
+
     /// Set the render voxel size tier on the selected procedural object.
     /// Value must be one of: "0.005", "0.02", "0.08", "0.32".
     SetProceduralVoxelSize {
