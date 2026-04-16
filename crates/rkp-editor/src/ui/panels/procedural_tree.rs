@@ -210,13 +210,18 @@ fn add_menu_item(
     opened: Signal<bool>,
     cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
 ) -> Node {
-    // Note: `{kind}` (plain variable in expression position) doesn't
-    // render as visible text in a `DropdownMenuItem` child — only
-    // literal string children or closures take the text-node codegen
-    // path. Using `{move || kind}` forces the closure path.
+    // Plain-HTML menu row instead of `DropdownMenuItem` — the
+    // component's child-handling collapses variable-expression text
+    // nodes to a 0x0 size under the Taffy measurer (confirmed by
+    // the rinch inspector). Inlining the row as a simple div gives
+    // us a known-good layout path: flex + gap to mirror
+    // DropdownMenuItem's visual.
     rsx! {
-        DropdownMenuItem {
-            left_section: icon,
+        div {
+            style: "display:flex;align-items:center;gap:8px;\
+                    padding:6px 10px;cursor:pointer;color:#e0e0e0;\
+                    font-size:12px;border-radius:3px;\
+                    user-select:none;",
             onclick: move || {
                 let _ = cmd_tx.get().send(rkp_engine::EngineCommand::AddProceduralNode {
                     parent_node_id: parent_id,
@@ -224,7 +229,29 @@ fn add_menu_item(
                 });
                 opened.set(false);
             },
-            {move || kind}
+            span {
+                style: "width:14px;height:14px;display:inline-flex;\
+                        align-items:center;justify-content:center;\
+                        flex-shrink:0;color:#bbb;",
+                {render_tabler_icon(__scope, icon, TablerIconStyle::Outline)}
+            }
+            span {
+                // Workaround for a rinch bug: when an element is
+                // mounted inside an ancestor that starts
+                // `visibility:hidden` (like `.rinch-popover__dropdown`,
+                // which the popover keeps hidden until opened), text-
+                // node layout measurement yields 0 size and is never
+                // recomputed after the ancestor becomes visible.
+                // Giving the span explicit `width` and `height` bypasses
+                // the text-run measurement path entirely, so it
+                // survives the hidden→visible transition. When the
+                // upstream bug is fixed, these dimensions can go away
+                // in favor of intrinsic sizing.
+                style: "width:80px;height:16px;line-height:16px;\
+                        overflow:hidden;text-overflow:ellipsis;\
+                        white-space:nowrap;",
+                {kind}
+            }
         }
     }
 }
