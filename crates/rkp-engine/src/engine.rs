@@ -849,6 +849,26 @@ impl EngineState {
                 .get_mut(&viewport_id)
                 .expect("viewport renderer must exist");
             if matches!(vp_preview_mode, rkp_render::BuildPreviewMode::Raymarch) {
+                // Log on transitions / interesting changes so we can
+                // tell from stderr whether the pass is wired up
+                // without flooding on every frame. Key = (viewport,
+                // instruction_count, entity presence).
+                static LAST_LOG: std::sync::Mutex<Option<(u32, bool)>> =
+                    std::sync::Mutex::new(None);
+                let key = (
+                    proc_instructions.len() as u32,
+                    vp_preview_entity.is_some(),
+                );
+                let mut guard = LAST_LOG.lock().unwrap();
+                if guard.as_ref() != Some(&key) {
+                    *guard = Some(key);
+                    eprintln!(
+                        "[preview] raymarch dispatch viewport={:?} instructions={} entity_present={}",
+                        viewport_id,
+                        proc_instructions.len(),
+                        vp_preview_entity.is_some(),
+                    );
+                }
                 vr.proc_raymarch.upload_instructions(&self.device, &self.queue, &proc_instructions);
                 vr.proc_raymarch.set_params(
                     &self.queue,
@@ -1555,6 +1575,9 @@ impl EngineState {
             EngineCommand::SetBuildPreviewMode { mode } => {
                 if let Some(vp) = self.viewports.get_mut(crate::viewport::ViewportId::BUILD) {
                     vp.preview_mode = mode;
+                    eprintln!("[preview] build viewport preview_mode -> {mode:?}");
+                } else {
+                    eprintln!("[preview] SetBuildPreviewMode but no BUILD viewport registered");
                 }
             }
 
