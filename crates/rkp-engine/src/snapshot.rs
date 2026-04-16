@@ -7,6 +7,28 @@
 use glam::Vec3;
 use uuid::Uuid;
 
+/// Live progress of one in-flight mesh import. Reduced by the
+/// engine from the raw `ImportEvent` stream emitted by `rkp-import`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ImportProgressInfo {
+    /// Source path as a string (matches `importing_models` entries).
+    pub source_path: String,
+    /// Machine-friendly name of the most recently started stage
+    /// (`load_mesh`, `build_bvh`, `voxelize_surface`, ...).
+    pub stage: String,
+    /// Human-readable status line to display alongside the progress bar.
+    pub message: String,
+    /// Work units completed within the current stage.
+    pub done: u64,
+    /// Total work units for the current stage, or 0 if indeterminate.
+    pub total: u64,
+    /// Warning messages accumulated so far. Surfaced in the console panel.
+    pub warnings: Vec<String>,
+    /// Set once [`ImportEvent::Error`] arrives — the import has failed
+    /// but the completion message may not have been delivered yet.
+    pub error: Option<String>,
+}
+
 /// Lightweight scene object info for UI display.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SceneObjectInfo {
@@ -42,6 +64,11 @@ pub struct StateUpdate {
     /// changes — on submit (grows) or completion (shrinks). The UI uses
     /// this to show a progress indicator in place of the Re-import button.
     pub importing_models: Option<Vec<String>>,
+    /// Live per-source import progress — sent every tick while any
+    /// import is in flight, so the UI can render a real stage/progress
+    /// bar instead of a spinner. `None` means "no imports active this
+    /// tick, don't re-render".
+    pub import_progress: Option<Vec<ImportProgressInfo>>,
     /// Editor layout blob round-tripped from `.rkproject`. Sent once on
     /// project open so the editor can hydrate its docking state; the
     /// outer `Option` is "is this tick carrying a layout update?", the

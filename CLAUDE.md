@@ -42,7 +42,7 @@ The project name still says "patch" from the original splat framing; the renderi
 | ECS | **hecs** | From RKIField (shared crate) |
 | Physics | **Rapier** | From RKIField (shared crate) |
 | Editor UI | **rinch** | From RKIField (shared crate) |
-| Mesh Import | **rkf-import** | From RKIField (shared crate) |
+| Mesh Import | **rkp-import** | Own crate (`crates/rkp-import`), opacity-octree-native |
 | Compression | **lz4_flex** | Brick data in .rkp files |
 
 ## Shared Crates (from RKIField)
@@ -52,9 +52,8 @@ These live in `../rkifield/crates/` and are referenced as path dependencies:
 | Crate | What we reuse |
 |-------|---------------|
 | `rkf-core` | WorldPosition, brick pool, brick maps, spatial index, Aabb, BVH, material types, constants |
-| `rkf-import` | Mesh loading (.glb/.gltf/.obj), BVH nearest-triangle, winding number, material transfer |
 | `rkf-physics` | Rapier integration, collision adapter |
-| `rkf-animation` | Skeletal animation, blend shapes |
+| `rkf-animation` | Skeletal animation, blend shapes, `SkeletonAsset` + `save_rkskel` (used by `rkp-import` for the `.rkskel` sidecar) |
 | `rkf-mcp` | MCP server, tool registry, IPC bridge |
 
 ## New Crates (RKIPatch-specific)
@@ -64,10 +63,15 @@ rkipatch/
   crates/
     rkp-core/        — SplatVoxel wrapper over VoxelSample, opacity accessors, splat brick format
     rkp-render/      — Splat march pass (opacity field → G-buffer), pipeline orchestration using rkf-render
-    rkp-convert/     — Mesh-to-.rkp CLI (BVH + opacity baking + color transfer)
+    rkp-import/      — Mesh → .rkp import pipeline: mesh loaders (glTF/OBJ/FBX),
+                       triangle BVH + winding number, opacity-octree voxelization,
+                       skeleton extraction + .rkskel sidecar, structured progress events
+                       (ProgressReporter / ImportEvent). Replaces the old rkf-import dep.
+    rkp-convert/     — Thin CLI over rkp-import for headless / CI asset bakes
     rkp-runtime/     — Frame scheduling, ECS glue, streaming
     rkp-editor/      — Editor binary (reuses rinch UI from rkifield)
-    rkp-testbed/     — (removed — all visual work done in rkp-editor)
+    rkp-engine/      — Engine-side state, command handling, import worker thread
+    rkp-procedural/  — Procedural object nodes (sphere/box/union/etc.)
 ```
 
 ## Key Data Types

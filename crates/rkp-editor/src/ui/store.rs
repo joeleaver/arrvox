@@ -87,6 +87,10 @@ pub struct EditorStore {
     /// The Asset Properties panel uses this to swap the Re-import button
     /// for a progress indicator while a given model's import is running.
     pub importing_models: Signal<Vec<String>>,
+    /// Live per-import progress reduced from the engine's `ImportEvent`
+    /// stream. Empty when no imports are in flight. Surfaced alongside
+    /// the Re-import spinner as a real stage/progress bar.
+    pub import_progress: Signal<Vec<rkp_engine::snapshot::ImportProgressInfo>>,
     /// Model path being dragged onto viewport (None = no drag).
     pub model_drag: Signal<Option<String>>,
     /// Inspector data for the selected entity.
@@ -193,6 +197,7 @@ impl EditorStore {
             project_name: Signal::new(String::new()),
             available_models: Signal::new(Vec::new()),
             importing_models: Signal::new(Vec::new()),
+            import_progress: Signal::new(Vec::new()),
             model_drag: Signal::new(None),
             inspector: Signal::new(None),
             procedural: Signal::new(None),

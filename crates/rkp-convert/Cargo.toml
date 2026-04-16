@@ -3,17 +3,8 @@ name = "rkp-convert"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Mesh-to-.rkp CLI: BVH + SH baking + color transfer"
+description = "Mesh-to-.rkp CLI: runs the rkp-import pipeline from the command line"
 
 [dependencies]
-rkp-core = { workspace = true }
-rkf-core = { workspace = true }
-rkf-import = { workspace = true }
-glam = { workspace = true }
-half = { workspace = true }
-log = { workspace = true }
-env_logger = { workspace = true }
-anyhow = { workspace = true }
+rkp-import = { workspace = true }
 clap = { workspace = true }
-rayon = { workspace = true }
-lz4_flex = { workspace = true }
