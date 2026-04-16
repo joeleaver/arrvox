@@ -63,6 +63,12 @@ pub struct SpatialData {
     pub base_voxel_size: f32,
     pub aabb: rkf_core::Aabb,
     pub voxel_size: f32,
+    /// Entity-local position where the octree grid starts — the
+    /// `aabb_center - extent/2` corner from voxelization. The shader
+    /// subtracts this from the entity-local sample position to get an
+    /// octree-local coord in `[0, extent]`. Stored so re-voxelizations
+    /// with asymmetric AABBs render at their true world placement.
+    pub grid_origin: glam::Vec3,
     /// First voxel pool slot used by this allocation, and the count.
     /// Used to free the allocation when geometry is replaced.
     pub voxel_slot_start: u32,

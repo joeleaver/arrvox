@@ -49,6 +49,10 @@ pub struct AssetInfo {
     pub spatial: rkf_core::scene_node::SpatialHandle,
     pub voxel_size: f32,
     pub aabb: rkf_core::Aabb,
+    /// Entity-local grid origin (`aabb_center - extent/2`). Derived at
+    /// load time — .rkp files voxelized before this field existed used
+    /// the same formula, so re-deriving reproduces the exact bake.
+    pub grid_origin: glam::Vec3,
     pub voxel_count: u32,
     pub leaf_attr_slot_start: u32,
     pub leaf_attr_slot_count: u32,
@@ -72,6 +76,13 @@ struct AssetEntry {
 
 impl AssetEntry {
     fn info(&self) -> AssetInfo {
+        // Reconstruct grid origin the same way voxelize_octree does:
+        // `aabb_center - extent/2`. Matches the bake-time geometry, so
+        // existing .rkp files render identically.
+        let extent = (1u32 << self.spatial_handle.depth) as f32
+            * self.spatial_handle.base_voxel_size;
+        let aabb_center = (self.aabb.min + self.aabb.max) * 0.5;
+        let grid_origin = aabb_center - glam::Vec3::splat(extent * 0.5);
         AssetInfo {
             spatial: rkf_core::scene_node::SpatialHandle::Octree {
                 root_offset: self.spatial_handle.root_offset,
@@ -81,6 +92,7 @@ impl AssetEntry {
             },
             voxel_size: self.voxel_size,
             aabb: self.aabb,
+            grid_origin,
             voxel_count: self.voxel_count,
             leaf_attr_slot_start: self.leaf_attr_slot_start,
             leaf_attr_slot_count: self.leaf_attr_slot_count,
@@ -139,6 +151,11 @@ pub struct VoxelizeResult {
     pub spatial: rkf_core::scene_node::SpatialHandle,
     pub voxel_size: f32,
     pub aabb: rkf_core::Aabb,
+    /// Entity-local position where the octree grid starts (the
+    /// `aabb_center - extent/2` corner). The shader uses this to
+    /// convert world→octree coords, so it must be stored and
+    /// propagated all the way to the GPU object.
+    pub grid_origin: glam::Vec3,
     /// Logical voxel count (octree leaves).
     pub voxel_count: u32,
     /// First leaf_attr pool slot used by this allocation.
@@ -647,6 +664,7 @@ impl RkpSceneManager {
             spatial,
             voxel_size,
             aabb: geometry_aabb,
+            grid_origin: r.grid_origin,
             voxel_count: r.voxel_count,
             leaf_attr_slot_start: r.leaf_attr_slot_start,
             leaf_attr_slot_count: r.leaf_attr_unique_count,
@@ -686,6 +704,7 @@ impl RkpSceneManager {
             spatial,
             voxel_size,
             aabb: *aabb,
+            grid_origin: r.grid_origin,
             voxel_count: r.voxel_count,
             leaf_attr_slot_start: r.leaf_attr_slot_start,
             leaf_attr_slot_count: r.leaf_attr_unique_count,

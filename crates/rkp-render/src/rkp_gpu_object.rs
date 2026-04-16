@@ -33,7 +33,10 @@ use bytemuck::{Pod, Zeroable};
 /// | 136    | 4    | rest_octree_extent_bits (u32) |
 /// | 140    | 4    | deformed_pool_offset (u32) |
 /// | 144    | 4    | layer_mask (u32) — render-layer mask, gated against camera mask |
-/// | 148    | 44   | _padding |
+/// | 148    | 12   | _pre_grid_pad — align grid_origin to 16 for WGSL vec3 |
+/// | 160    | 12   | grid_origin (vec3<f32>) — entity-local start of the voxel grid |
+/// | 172    | 4    | _post_grid_pad |
+/// | 176    | 16   | _padding |
 /// | 192    | 64   | inverse_world (mat4x4<f32>) — world→local |
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
@@ -83,8 +86,23 @@ pub struct RkpGpuObject {
     /// Default per-entity is `viewport::layer::DEFAULT` (bit 0).
     pub layer_mask: u32,
 
+    /// Padding to land `grid_origin` on a 16-byte boundary — WGSL
+    /// `vec3<f32>` struct fields require that alignment.
+    pub _pre_grid_pad: [u32; 3],
+
+    /// Entity-local start of the voxel grid, i.e. `aabb_center - extent/2`
+    /// at voxelization time. Shaders convert world→local via
+    /// `inverse_world`, then compute octree coords as
+    /// `local_pos - grid_origin` (which lands in `[0, extent]`).
+    /// Previously the shader hardcoded `local_pos + extent/2`, which
+    /// only matched when the AABB was symmetric around the origin.
+    pub grid_origin: [f32; 3],
+
+    /// Stride pad after `grid_origin` (WGSL treats vec3 as 16-byte sized).
+    pub _post_grid_pad: u32,
+
     /// Padding.
-    pub _padding: [u32; 11],
+    pub _padding: [u32; 4],
 
     /// Inverse world transform (world→local). Precomputed on CPU.
     pub inverse_world: [[f32; 4]; 4],
@@ -119,6 +137,17 @@ mod tests {
         let base = &obj as *const _ as usize;
         let field = &obj.layer_mask as *const _ as usize;
         assert_eq!(field - base, 144);
+    }
+
+    #[test]
+    fn grid_origin_at_offset_160() {
+        // vec3<f32> fields in WGSL structs require 16-byte alignment.
+        // The `_pre_grid_pad` array above pushes grid_origin to offset
+        // 160 — verify so the shader and CPU agree on byte layout.
+        let obj = RkpGpuObject::zeroed();
+        let base = &obj as *const _ as usize;
+        let field = &obj.grid_origin as *const _ as usize;
+        assert_eq!(field - base, 160);
     }
 
     #[test]

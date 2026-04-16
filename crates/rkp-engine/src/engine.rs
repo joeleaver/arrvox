@@ -49,6 +49,7 @@ fn spatial_from_handle(
     handle: &rkf_core::scene_node::SpatialHandle,
     voxel_size: f32,
     aabb: &rkf_core::Aabb,
+    grid_origin: glam::Vec3,
     voxel_slot_start: u32,
     voxel_slot_count: u32,
     brick_ids: Vec<u32>,
@@ -64,6 +65,7 @@ fn spatial_from_handle(
             base_voxel_size: *base_voxel_size,
             aabb: *aabb,
             voxel_size,
+            grid_origin,
             voxel_slot_start,
             voxel_slot_count,
             brick_ids,
@@ -72,6 +74,7 @@ fn spatial_from_handle(
         SpatialData {
             root_offset: 0, len: 0, depth: 0, base_voxel_size: voxel_size,
             aabb: *aabb, voxel_size,
+            grid_origin,
             voxel_slot_start, voxel_slot_count,
             brick_ids,
         }
@@ -1225,7 +1228,7 @@ impl EngineState {
                     &primitive, 0, 0.05, glam::Vec3::ONE, scene_id,
                 );
                 if let Some(result) = result {
-                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
+                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.grid_origin, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
                     let entity = self.world.spawn((
                         Transform::default(),
                         EditorMetadata { name: name.clone() },
@@ -1264,7 +1267,7 @@ impl EngineState {
                     sdf_fn, &aabb, voxel_size, scene_id,
                 );
                 if let Some(result) = result {
-                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
+                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.grid_origin, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
                     let entity = self.world.spawn((
                         Transform::default(),
                         EditorMetadata { name: name.clone() },
@@ -1449,7 +1452,7 @@ impl EngineState {
                         // Asset-backed entity — brick_ids stays empty.
                         // Asset cache owns the shared brick range and frees
                         // it on the final release_asset.
-                        let spatial = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.leaf_attr_slot_start, info.leaf_attr_slot_count, Vec::new());
+                        let spatial = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.grid_origin, info.leaf_attr_slot_start, info.leaf_attr_slot_count, Vec::new());
                         let entity = self.world.spawn((
                             Transform::default(),
                             EditorMetadata { name: name.clone() },
@@ -2643,7 +2646,7 @@ impl EngineState {
                 sdf_fn, &aabb, voxel_size, scene_id,
             ) {
                 Some(result) => {
-                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
+                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.grid_origin, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
 
                     if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
                         renderable.voxel_count = result.voxel_count;
@@ -2703,6 +2706,7 @@ impl EngineState {
                 let mut gpu_obj = crate::scene_sync::build_gpu_object(
                     &world_matrix,
                     &spatial.aabb,
+                    spatial.grid_origin,
                     &spatial_handle,
                     spatial.voxel_size,
                     renderable.material_id,
@@ -2970,7 +2974,7 @@ impl EngineState {
                         self.next_scene_id += 1;
                         match self.scene_mgr.acquire_asset(&full_path.to_string_lossy()) {
                             Ok((handle, info)) => {
-                                let spatial = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.leaf_attr_slot_start, info.leaf_attr_slot_count, Vec::new());
+                                let spatial = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.grid_origin, info.leaf_attr_slot_start, info.leaf_attr_slot_count, Vec::new());
                                 let e = self.world.spawn((transform, meta, Renderable {
                                     asset_path: Some(asset_path.clone()),
                                     material_id: obj.material_id,
@@ -3000,7 +3004,7 @@ impl EngineState {
                         self.scene_mgr.voxelize_primitive(
                             &primitive, obj.material_id, 0.05, glam::Vec3::ONE, sid,
                         ).map(|result| {
-                            let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
+                            let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.grid_origin, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
                             let e = self.world.spawn((transform, meta, Renderable {
                                 primitive: Some(prim_name.clone()),
                                 material_id: obj.material_id,
@@ -4144,6 +4148,10 @@ fn procedural_voxel_params(tree: &rkp_procedural::ProceduralObject, base_voxel_s
     let tight = rkp_procedural::compute_bounds(tree);
 
     // Add margin for boundary sampling (same approach as voxelize_primitive).
+    // Grid placement is handled by threading `grid_origin` through to the
+    // shader (`local_origin - grid_origin` replaces the old
+    // `local_origin + extent/2`), so we can return a tight AABB here
+    // without wasting voxel budget on symmetric padding around the origin.
     let margin = base_voxel_size * 8.0 * 1.8 + base_voxel_size;
     let aabb = rkf_core::Aabb {
         min: tight.min - glam::Vec3::splat(margin),

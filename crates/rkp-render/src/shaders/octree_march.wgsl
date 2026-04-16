@@ -33,9 +33,10 @@ struct RkpObject {
     rest_octree_root: u32, rest_octree_depth: u32,
     rest_octree_extent_bits: u32, deformed_pool_offset: u32,
     layer_mask: u32,
+    _pre_grid0: u32, _pre_grid1: u32, _pre_grid2: u32,
+    grid_origin: vec3<f32>,
+    _post_grid: u32,
     _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32,
-    _pad4: u32, _pad5: u32, _pad6: u32, _pad7: u32,
-    _pad8: u32, _pad9: u32, _pad10: u32,
     inverse_world: mat4x4<f32>,
 }
 
@@ -317,7 +318,10 @@ fn trace_shadow_ray(
         let vs = obj.voxel_size;
         let min_step = vs * 2.0;
 
-        let oc_origin = local_origin + vec3<f32>(extent * 0.5);
+        // Convert entity-local position into octree-local `[0, extent]`
+        // space. `grid_origin` is where the voxel grid starts in the
+        // entity frame; subtracting it lands us at the octree corner.
+        let oc_origin = local_origin - obj.grid_origin;
         let safe_dir = vec3<f32>(
             select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),
             select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),
@@ -453,7 +457,7 @@ fn march_object(
     let vs = obj.voxel_size;
     let half_ext = extent * 0.5;
 
-    let oc_origin = local_origin + vec3<f32>(half_ext);
+    let oc_origin = local_origin - obj.grid_origin;
     let safe_dir = vec3<f32>(
         select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),
         select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),
@@ -761,7 +765,7 @@ fn main(
         let local_dir = normalize(local_dir_unnorm);
         let extent = bitcast<f32>(obj.octree_extent_bits);
         let half_ext = extent * 0.5;
-        let oc_origin = local_origin + vec3<f32>(half_ext);
+        let oc_origin = local_origin - obj.grid_origin;
         let safe_d = vec3<f32>(
             select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),
             select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),
@@ -789,7 +793,8 @@ fn main(
         let local_normal_raw = r.normal * inv_a;
         let local_normal = normalize(local_normal_raw);
 
-        let local_hit = oc_pos - vec3<f32>(extent * 0.5);
+        // Convert octree-local hit back to entity-local, then world.
+        let local_hit = oc_pos + obj.grid_origin;
         let world_pos = (obj.world * vec4<f32>(local_hit, 1.0)).xyz;
         let hit_dist = length(world_pos - ray_origin);
 
