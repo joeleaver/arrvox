@@ -822,7 +822,16 @@ impl EngineState {
             // take the mutable VR borrow below — build_procedural_
             // gizmo_wireframe reads from `self.world`, which shares
             // scope with `viewport_renderers`.
-            let proc_gizmo_verts = if viewport_id == ViewportId::BUILD {
+            // The procedural-node gizmo is only meaningful when the
+            // viewport shows the live tree (raymarch). In voxel mode
+            // the user sees the baked result and any gizmo drag would
+            // silently edit the tree without visual feedback — drawing
+            // the gizmo there invites the user to interact with
+            // something that does nothing they can see until they
+            // re-bake, which is worse than not showing it at all.
+            let proc_gizmo_verts = if viewport_id == ViewportId::BUILD
+                && matches!(vp_preview_mode, rkp_render::BuildPreviewMode::Raymarch)
+            {
                 let build_cam_pos = glam::Vec3::new(
                     cam_uniforms.position[0],
                     cam_uniforms.position[1],
@@ -1743,6 +1752,23 @@ impl EngineState {
             }
 
             EngineCommand::Pick { id, x, y } => {
+                // BUILD + Voxel: picking doesn't make sense. The G-buffer
+                // slot the raymarch uses for NodeId is occupied by
+                // secondary_material_id in voxel mode, so decoding
+                // would return arbitrary node ids. Skip entirely —
+                // the user selects tree nodes via the build panel
+                // in voxel mode.
+                if id == crate::viewport::ViewportId::BUILD {
+                    let is_raymarch = self
+                        .viewports
+                        .get(crate::viewport::ViewportId::BUILD)
+                        .map(|v| matches!(v.preview_mode, rkp_render::BuildPreviewMode::Raymarch))
+                        .unwrap_or(false);
+                    if !is_raymarch {
+                        return true;
+                    }
+                }
+
                 // Route the pick by viewport — MAIN picks scene entities
                 // (old path), BUILD picks procedural primitives when in
                 // raymarch preview. Either way, a click landing on a
@@ -3890,6 +3916,22 @@ impl EngineState {
     /// state, casts rays through BUILD's camera, and writes to the
     /// node's Affine3A instead of an entity Transform.
     fn update_procedural_gizmo(&mut self) {
+        // Voxel preview mode: the gizmo would edit the tree without
+        // any live visual update in the build viewport, so disable
+        // it entirely. Clear any in-flight drag and reset hover so a
+        // mode flip mid-interaction doesn't leave stale state.
+        let raymarch = self.viewports
+            .get(crate::viewport::ViewportId::BUILD)
+            .map(|v| matches!(v.preview_mode, rkp_render::BuildPreviewMode::Raymarch))
+            .unwrap_or(false);
+        if !raymarch {
+            self.proc_gizmo.hovered_axis = crate::gizmo::GizmoAxis::None;
+            if self.proc_gizmo.dragging {
+                self.proc_gizmo.end_drag();
+            }
+            return;
+        }
+
         let (node_id, entity) = match (self.selected_procedural_node, self.selected_entity) {
             (Some(n), Some(e)) => (n, e),
             _ => {
