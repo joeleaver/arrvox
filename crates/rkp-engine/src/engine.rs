@@ -189,11 +189,20 @@ impl Default for CameraState {
 /// resolves to a procedural NodeId (when the build viewport is in
 /// raymarch preview mode — the shader packs the hit primitive's
 /// NodeId into the material G-buffer).
+///
+/// `ghost_pick_node_id` holds the result of a synchronous CPU raycast
+/// performed at click time against the tree's ghost-role primitives
+/// (cutters, Intersect operands). When `Some`, it overrides the
+/// G-buffer decode — the visual rule is "if a ghost silhouette is
+/// drawn at the click pixel, clicking picks it" even when a solid
+/// surface is closer along the ray, because the ghost pass renders
+/// depth-free on top of everything.
 #[derive(Debug, Clone, Copy)]
 struct PendingPick {
     viewport: crate::viewport::ViewportId,
     x: u32,
     y: u32,
+    ghost_pick_node_id: Option<u32>,
 }
 
 struct EngineState {
@@ -910,22 +919,18 @@ impl EngineState {
                 };
                 vr.proc_outline.update_params(&self.queue, &outline_params);
 
-                // Ghost overlay: when the selected node is a Subtract/
-                // Intersect combinator or an operand of one, filter the
-                // already-flattened instruction stream down to the
-                // ghost-candidate primitives and upload them. When
-                // there's no CSG context to visualize, pushes a zero-
-                // length stream which the ghost shader early-outs on.
+                // Ghost overlay: every cutter-role primitive in the
+                // tree, regardless of selection. Filters the already-
+                // flattened instruction stream so ghost renders use the
+                // same composed transforms the main raymarch does.
+                // Ghost pass early-outs on zero-length upload.
                 let ghost_ids = vp_preview_entity.and_then(|uuid| {
                     let entity = self.entity_uuids.iter().find_map(
                         |(e, u)| (*u == uuid).then_some(*e),
                     )?;
                     let proc_geo = self.world
                         .get::<&crate::components::ProceduralGeometry>(entity).ok()?;
-                    let sel = self.selected_procedural_node?;
-                    Some(collect_ghost_primitives(
-                        &proc_geo.tree, rkp_procedural::NodeId(sel),
-                    ))
+                    Some(collect_ghost_primitives(&proc_geo.tree))
                 }).unwrap_or_default();
                 let ghost_set: std::collections::HashSet<u32> = ghost_ids.into_iter().collect();
                 let ghost_instructions: Vec<rkp_procedural::ProcInstruction> =
@@ -1757,7 +1762,17 @@ impl EngineState {
                     _ => false,
                 };
                 if !gizmo_blocking {
-                    self.pending_pick = Some(PendingPick { viewport: id, x, y });
+                    // Ghost-priority pick: on BUILD in raymarch mode,
+                    // CPU-raycast the tree's ghost-role primitives at
+                    // the click ray. If any hits, remember which one —
+                    // it takes priority over the G-buffer decode
+                    // (matches the visual rule that a ghost painted
+                    // on the pixel owns the click).
+                    let ghost_pick_node_id = self
+                        .compute_ghost_pick(id, x, y);
+                    self.pending_pick = Some(PendingPick {
+                        viewport: id, x, y, ghost_pick_node_id,
+                    });
                 }
             }
 
@@ -4364,6 +4379,56 @@ impl EngineState {
         (origin, dir)
     }
 
+    /// CPU raycast against tree-wide ghost primitives at a BUILD-viewport
+    /// click pixel. Returns the nearest ghost hit's NodeId (or `None`
+    /// if no ghost is on the ray, the viewport isn't in raymarch
+    /// mode, or the click isn't on BUILD). The ghost pass renders
+    /// depth-free, so "nearest ghost along the ray" matches "ghost
+    /// silhouette visible at this pixel."
+    fn compute_ghost_pick(
+        &self,
+        viewport_id: crate::viewport::ViewportId,
+        x: u32,
+        y: u32,
+    ) -> Option<u32> {
+        if viewport_id != crate::viewport::ViewportId::BUILD {
+            return None;
+        }
+        let build_vp = self.viewports.get(viewport_id)?;
+        if !matches!(build_vp.preview_mode, rkp_render::BuildPreviewMode::Raymarch) {
+            return None;
+        }
+
+        // Resolve the procedural entity: either the viewport's focus
+        // target (the build viewport pins focus to whatever procedural
+        // is under edit) or fall back to the editor's global selection.
+        let entity = build_vp.filter.focus_entity.or(self.selected_entity)?;
+
+        let proc_geo = self.world
+            .get::<&crate::components::ProceduralGeometry>(entity).ok()?;
+        let transform = self.world
+            .get::<&crate::components::Transform>(entity).ok()?;
+
+        let entity_world = glam::Affine3A::from_scale_rotation_translation(
+            transform.scale,
+            glam::Quat::from_euler(
+                glam::EulerRot::XYZ,
+                transform.rotation.x.to_radians(),
+                transform.rotation.y.to_radians(),
+                transform.rotation.z.to_radians(),
+            ),
+            transform.position,
+        );
+
+        let (ray_o, ray_d) = self
+            .screen_to_ray_for_viewport(viewport_id, x as f32, y as f32);
+
+        nearest_ghost_hit(
+            &proc_geo.tree, entity_world, ray_o, ray_d, proc_geo.voxel_size,
+        )
+        .map(|(id, _t)| id)
+    }
+
     fn process_pick_result(&mut self) {
         let pending = self.pending_pick.take();
         let slice = self.pick_readback_buffer.slice(..256);
@@ -4396,16 +4461,25 @@ impl EngineState {
                         .unwrap_or(false);
 
                 if is_build_raymarch {
-                    let node_id_16 = (r_channel >> 16) & 0xFFFFu32;
-                    // Shader packs `u32::MAX` for misses/combinators
-                    // as `0xFFFFu` in 16 bits — treat as "no selection"
-                    // and clear any previously-selected node so click-
-                    // on-empty deselects (matches entity-pick behavior
-                    // on MAIN).
-                    if obj_raw > 0 && node_id_16 != 0xFFFFu32 {
-                        self.selected_procedural_node = Some(node_id_16);
+                    // Ghost priority: if the CPU raycast at click time
+                    // found a ghost primitive on the ray, that wins —
+                    // matches the "translucent overlay on top owns the
+                    // click" rule, and catches cutters fully carved
+                    // away by their parent (no visible surface, so the
+                    // G-buffer has nothing for them).
+                    if let Some(ghost_id) = pending.and_then(|pp| pp.ghost_pick_node_id) {
+                        self.selected_procedural_node = Some(ghost_id);
                     } else {
-                        self.selected_procedural_node = None;
+                        let node_id_16 = (r_channel >> 16) & 0xFFFFu32;
+                        // Shader packs `u32::MAX` for misses/combinators
+                        // as `0xFFFFu` in 16 bits — treat as "no
+                        // selection" and clear any previously-selected
+                        // node so click-on-empty deselects.
+                        if obj_raw > 0 && node_id_16 != 0xFFFFu32 {
+                            self.selected_procedural_node = Some(node_id_16);
+                        } else {
+                            self.selected_procedural_node = None;
+                        }
                     }
                 } else if obj_raw > 0 {
                     let gpu_idx = (obj_raw - 1) as usize;
@@ -4554,87 +4628,191 @@ impl EngineState {
 /// (and leaves `out_path` empty) if `target` isn't reachable from
 /// `start` — a possible state if the snapshot a caller is holding has
 /// drifted from the current tree.
-/// Which primitive NodeIds to ghost-render given the currently-selected
-/// tree node. Returns primitive (leaf) NodeIds only — combinators
-/// collapse to their descendant primitives. Empty return = no ghost
-/// overlay this frame.
+/// Every leaf NodeId in the tree that plays a "ghost" role — a primitive
+/// whose surface can go invisible in the final CSG output, specifically:
+///   - non-primary children of a `Subtract` (the cutters) and everything
+///     beneath them,
+///   - every child of an `Intersect` and everything beneath it,
+///   - transitively: once a subtree is in a ghost role, all its leaves
+///     inherit the role regardless of further combinators below.
+/// Primary children of `Subtract` and all children of `Union` are fully
+/// visible in the main raymarch and aren't ghosted.
 ///
-/// Rules (matches the design call-out in the UI discussion):
-///   - Selected = `Subtract` combinator → ghost every child except
-///     the first. The first child is the minuend; subsequent children
-///     are the cutters. Users want to see cutters, not the subject.
-///   - Selected = `Intersect` combinator → ghost every child. All
-///     operands constrain each other equally; seeing them all is
-///     what makes "where does the intersection live" legible.
-///   - Selected = non-primary child of a `Subtract` → ghost just the
-///     selected subtree. The user is probably editing a cutter;
-///     keeping other cutters visible would be noisy.
-///   - Selected = any child of an `Intersect` → ghost just the
-///     selected subtree, for the same reason.
-///   - Anything else (primary child of Subtract, child of Union, a
-///     combinator's leaf primitive in a Union chain) → no ghosts.
-///     The shape is already fully visible in the main raymarch.
-fn collect_ghost_primitives(
-    tree: &rkp_procedural::ProceduralObject,
-    selected: rkp_procedural::NodeId,
-) -> Vec<u32> {
-    use rkp_procedural::NodeKind;
-
-    let Some(node) = tree.get(selected) else { return Vec::new() };
-
+/// Computed tree-wide (not per-selection) so ghosts act like a constant
+/// editing aid — you can see every cutter in the scene at all times
+/// and click on one to pick it even when it's fully carved away.
+fn collect_ghost_primitives(tree: &rkp_procedural::ProceduralObject) -> Vec<u32> {
     let mut out = Vec::new();
-    let mut emit_subtree = |root, out: &mut Vec<u32>| {
-        collect_primitive_ids_rec(tree, root, out);
-    };
-
-    match &node.kind {
-        NodeKind::Subtract => {
-            // Skip the first (minuend), ghost all cutters.
-            for &c in node.children.iter().skip(1) {
-                emit_subtree(c, &mut out);
-            }
-        }
-        NodeKind::Intersect { .. } => {
-            for &c in node.children.iter() {
-                emit_subtree(c, &mut out);
-            }
-        }
-        _ => {
-            // Selected is a non-combinator (or a non-cutter-role
-            // combinator like Union). Ghost only if the parent is
-            // Subtract/Intersect and we're in a cutter/operand role.
-            let Some(parent_id) = node.parent else { return Vec::new() };
-            let Some(parent) = tree.get(parent_id) else { return Vec::new() };
-            match &parent.kind {
-                NodeKind::Subtract => {
-                    let is_primary = parent.children.first() == Some(&selected);
-                    if !is_primary {
-                        emit_subtree(selected, &mut out);
-                    }
-                }
-                NodeKind::Intersect { .. } => {
-                    emit_subtree(selected, &mut out);
-                }
-                _ => {}
-            }
-        }
-    }
-
+    collect_ghosts_rec(tree, tree.root(), false, &mut out);
     out
 }
 
-fn collect_primitive_ids_rec(
+/// CPU sphere-trace against a single procedural primitive's SDF.
+///
+/// Evaluates one leaf (analytical SDF) against a world-space ray by
+/// transforming the ray into the primitive's local frame via the
+/// composed ancestor transform, then sphere-tracing up to `MAX_STEPS`
+/// iterations. Returns the nearest positive-t hit or `None`.
+///
+/// Used by the click-to-pick-ghost path. The GPU raymarch shader does
+/// the same thing for every primitive in parallel; on CPU we only
+/// need the ghost subset at the click pixel, which is cheap enough
+/// that reusing `sample_tree`'s evaluator would be overkill (we'd
+/// pull in combinator logic we don't want applied here).
+fn raycast_leaf_primitive(
+    tree: &rkp_procedural::ProceduralObject,
+    leaf_id: rkp_procedural::NodeId,
+    ancestor_world: glam::Affine3A,
+    ray_origin: glam::Vec3,
+    ray_dir: glam::Vec3,
+    voxel_size: f32,
+) -> Option<f32> {
+    const MAX_STEPS: u32 = 64;
+    const MAX_DIST: f32 = 500.0;
+    const SURFACE_EPS: f32 = 0.001;
+
+    let node = tree.get(leaf_id)?;
+    if !node.kind.is_leaf() { return None; }
+
+    // Local-frame ray. Non-uniform scale on the transform chain would
+    // make `ray_d_local` non-unit; for the current editor workflow
+    // transforms are uniform-scale-only from the gizmo, so this is
+    // fine. If that ever changes, normalize and scale `t` back out.
+    let world = ancestor_world * node.transform;
+    let inv = world.inverse();
+    let ro = inv.transform_point3(ray_origin);
+    let rd = inv.transform_vector3(ray_dir);
+
+    let mut t: f32 = 0.0;
+    for _ in 0..MAX_STEPS {
+        let p = ro + rd * t;
+        let s = rkp_procedural::eval_leaf(p, &node.kind, voxel_size);
+        if s.distance < SURFACE_EPS { return Some(t); }
+        t += s.distance.max(SURFACE_EPS);
+        if t > MAX_DIST { return None; }
+    }
+    None
+}
+
+/// Find the closest ghost-role primitive along a world-space ray.
+/// Returns `Some((node_id, t))` for the nearest hit, or `None` if no
+/// ghost is on the ray. Composed-transform walk mirrors
+/// `collect_ghost_primitives` so the same inheritance rules apply.
+fn nearest_ghost_hit(
+    tree: &rkp_procedural::ProceduralObject,
+    entity_world: glam::Affine3A,
+    ray_origin: glam::Vec3,
+    ray_dir: glam::Vec3,
+    voxel_size: f32,
+) -> Option<(u32, f32)> {
+    let mut best: Option<(u32, f32)> = None;
+    nearest_ghost_hit_rec(
+        tree, tree.root(), false, entity_world,
+        ray_origin, ray_dir, voxel_size, &mut best,
+    );
+    best
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nearest_ghost_hit_rec(
     tree: &rkp_procedural::ProceduralObject,
     id: rkp_procedural::NodeId,
-    out: &mut Vec<u32>,
+    is_ghost: bool,
+    ancestor_world: glam::Affine3A,
+    ray_origin: glam::Vec3,
+    ray_dir: glam::Vec3,
+    voxel_size: f32,
+    best: &mut Option<(u32, f32)>,
 ) {
+    use rkp_procedural::NodeKind;
     let Some(node) = tree.get(id) else { return };
+    let this_world = ancestor_world * node.transform;
+
     if node.kind.is_leaf() {
-        out.push(id.0);
+        if is_ghost {
+            // Raycast in the LEAF's frame — its own transform is
+            // already composed into `this_world`, so the caller of
+            // raycast_leaf_primitive passes `ancestor_world` = the
+            // parent's world (i.e. without leaf.transform) and the
+            // function re-composes. To avoid double-applying, use
+            // the ancestor_world we were called with, not this_world.
+            if let Some(t) = raycast_leaf_primitive(
+                tree, id, ancestor_world, ray_origin, ray_dir, voxel_size,
+            ) {
+                match *best {
+                    None => *best = Some((id.0, t)),
+                    Some((_, bt)) if t < bt => *best = Some((id.0, t)),
+                    _ => {}
+                }
+            }
+        }
         return;
     }
-    for &c in &node.children {
-        collect_primitive_ids_rec(tree, c, out);
+    match &node.kind {
+        NodeKind::Union { .. } => {
+            for &c in &node.children {
+                nearest_ghost_hit_rec(
+                    tree, c, is_ghost, this_world,
+                    ray_origin, ray_dir, voxel_size, best,
+                );
+            }
+        }
+        NodeKind::Intersect { .. } => {
+            for &c in &node.children {
+                nearest_ghost_hit_rec(
+                    tree, c, true, this_world,
+                    ray_origin, ray_dir, voxel_size, best,
+                );
+            }
+        }
+        NodeKind::Subtract => {
+            for (i, &c) in node.children.iter().enumerate() {
+                let child_ghost = is_ghost || i > 0;
+                nearest_ghost_hit_rec(
+                    tree, c, child_ghost, this_world,
+                    ray_origin, ray_dir, voxel_size, best,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_ghosts_rec(
+    tree: &rkp_procedural::ProceduralObject,
+    id: rkp_procedural::NodeId,
+    is_ghost: bool,
+    out: &mut Vec<u32>,
+) {
+    use rkp_procedural::NodeKind;
+    let Some(node) = tree.get(id) else { return };
+    if node.kind.is_leaf() {
+        if is_ghost { out.push(id.0); }
+        return;
+    }
+    match &node.kind {
+        NodeKind::Union { .. } => {
+            for &c in &node.children {
+                collect_ghosts_rec(tree, c, is_ghost, out);
+            }
+        }
+        NodeKind::Intersect { .. } => {
+            // All children of an Intersect are "operands that can go
+            // invisible where the others aren't." Flip on the ghost
+            // flag for every descendant branch.
+            for &c in &node.children {
+                collect_ghosts_rec(tree, c, true, out);
+            }
+        }
+        NodeKind::Subtract => {
+            // First child (minuend) stays whatever its ancestor context
+            // made it. Later children (cutters) become ghosts.
+            for (i, &c) in node.children.iter().enumerate() {
+                let child_ghost = is_ghost || i > 0;
+                collect_ghosts_rec(tree, c, child_ghost, out);
+            }
+        }
+        _ => {}
     }
 }
 
