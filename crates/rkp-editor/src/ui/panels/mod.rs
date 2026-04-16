@@ -3,6 +3,7 @@
 pub mod asset_properties;
 pub mod build_panel;
 pub mod build_viewport;
+pub mod procedural_tree;
 pub mod environment_panel;
 pub mod prop_controls;
 pub mod scene_tree;

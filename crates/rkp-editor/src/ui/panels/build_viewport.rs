@@ -18,6 +18,7 @@ use rkp_render::RenderMode;
 
 use crate::{BuildSurface, CommandSender};
 use crate::ui::store::EditorStore;
+use super::procedural_tree;
 use super::viewport_toolbar::EditModeToolbar;
 
 const PANEL_VIEWPORT: ViewportId = ViewportId::BUILD;
@@ -103,6 +104,14 @@ pub fn BuildViewport() -> NodeHandle {
     // Hence: no turntable mutation in this effect. If the user wants a
     // re-frame, they can trigger it from a button or a drag-to-refocus.
     let has_procedural = Memo::new(move || store.procedural.get().is_some());
+
+    // Signals for the floating procedural-tree overlay rendered on
+    // top of the viewport surface. Mirrors the Memos the build panel
+    // used when the tree lived there — the widget itself is
+    // self-contained in `procedural_tree::render_tree`.
+    let tree_cmd_tx = Signal::new(cmd.0.clone());
+    let tree_snapshot = Memo::new(move || store.procedural.get().unwrap_or_default());
+    let tree_selected_node = Memo::new(move || tree_snapshot.get().selected_node);
     {
         // `store.procedural.send` is called unconditionally on every
         // state-tick from the engine thread, so this effect fires once
@@ -322,6 +331,26 @@ pub fn BuildViewport() -> NodeHandle {
                 // procedural is open.
                 if has_procedural.get() {
                     EditModeToolbar {}
+                }
+                // Floating procedural-tree overlay on the left side,
+                // below the toolbar. Translucent backdrop + subtle
+                // border so it sits clearly "on top of" the preview
+                // without fighting for attention with the geometry.
+                // Width tuned against typical node-name lengths;
+                // max-height caps to leave viewport space underneath
+                // and scrolls for deep trees.
+                if has_procedural.get() {
+                    div {
+                        style: "position:absolute;top:8px;left:8px;width:260px;\
+                                max-height:calc(100% - 16px);overflow-y:auto;\
+                                background:rgba(30,30,30,0.88);\
+                                border:1px solid #3c3c3c;border-radius:4px;\
+                                color:#ccc;font-size:12px;padding:4px;\
+                                backdrop-filter:blur(4px);z-index:5;",
+                        {procedural_tree::render_tree(
+                            __scope, tree_snapshot, tree_selected_node, tree_cmd_tx,
+                        )}
+                    }
                 }
                 if !has_procedural.get() {
                     div {
