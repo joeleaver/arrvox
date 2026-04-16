@@ -41,7 +41,7 @@ pub mod classify;
 pub mod shell;
 pub mod write;
 
-use classify::{auto_voxel_size, classify_bricks, detect_winding_sign, process_brick};
+use classify::{auto_voxel_size, classify_bricks, process_brick};
 use shell::emit_shell_leaves;
 
 /// Convenience wrapper for callers that don't care about progress
@@ -106,10 +106,6 @@ pub fn import_mesh_to_opacity_rkp_with(
         format!("Building BVH ({} triangles)", mesh.triangle_count()),
     );
     let bvh = TriangleBvh::build(&mesh);
-    // Detect winding convention once, used by every per-voxel
-    // face-normal sign test downstream. Cheap relative to the BVH
-    // build (27 winding-number queries).
-    let winding_sign = detect_winding_sign(&bvh, &aabb);
     stage_end(reporter, "build_bvh");
     check_cancel!();
 
@@ -195,7 +191,7 @@ pub fn import_mesh_to_opacity_rkp_with(
         .into_par_iter()
         .map(|w| {
             let result = process_brick(
-                &mesh, &bvh, w.brick_min, voxel_size, config, winding_sign,
+                &mesh, &bvh, w.brick_min, voxel_size, config,
             );
             let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
             if done % progress_step == 0 || done == total_surface {

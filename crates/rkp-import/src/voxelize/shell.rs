@@ -58,7 +58,7 @@ pub struct ShellOutput {
 pub fn emit_shell_leaves(
     octree: &mut SparseOctree,
     results: Vec<(BrickWork, BrickResult)>,
-    interior_brick_set: HashSet<(u32, u32, u32)>,
+    mut interior_brick_set: HashSet<(u32, u32, u32)>,
     brick_depth: u8,
     octree_bricks: u32,
     depth: u8,
@@ -74,22 +74,24 @@ pub fn emit_shell_leaves(
     let brick_cells_u32 =
         (octree_brick_dim * octree_brick_dim * octree_brick_dim) as usize;
 
-    // Build lookup tables: every surface brick we sampled goes in the
-    // index so shell-emission can read its per-voxel inside/outside.
+    // Build lookup tables: surface bricks → per-voxel inside/outside,
+    // plus the set of solid-interior bricks (including any surface
+    // bricks that turned out all-inside after per-voxel sampling).
     //
-    // The old `all_inside`-promotion shortcut (push the brick into
-    // interior_brick_set and skip shell emission) has been removed:
-    // `process_brick`'s per-voxel sign test is fragile at concavities
-    // and thin features, and a single false-positive flip on every
-    // voxel of an 8³ brick silently discards 512 shell voxels and
-    // produces a brick-sized INTERIOR-node cube in the render.
-    // classify_bricks' brick-center winding test is still trusted to
-    // populate interior_brick_set — that's robust; per-voxel
-    // aggregation-to-interior is not.
+    // The all_inside promotion is safe now that `process_brick` uses
+    // ray-cast parity for inside/outside — a whole 8³ brick landing
+    // all-inside corresponds to a brick entirely inside the mesh,
+    // not to a classifier flip, so promoting it to an octree-level
+    // INTERIOR node is both correct and saves emitting 512 wasted
+    // shell slots.
     let mut brick_result_index: HashMap<(u32, u32, u32), usize> =
         HashMap::with_capacity(results.len());
-    for (i, (w, _result)) in results.iter().enumerate() {
-        brick_result_index.insert((w.bx, w.by, w.bz), i);
+    for (i, (w, result)) in results.iter().enumerate() {
+        if result.all_inside {
+            interior_brick_set.insert((w.bx, w.by, w.bz));
+        } else {
+            brick_result_index.insert((w.bx, w.by, w.bz), i);
+        }
     }
 
     // Inside/outside lookup across brick boundaries. Surface bricks
@@ -225,7 +227,7 @@ fn emit_subbrick(
                     let gx = w.bx * 8 + vx;
                     let gy = w.by * 8 + vy;
                     let gz = w.bz * 8 + vz;
-                    if any_inside_within(inside_at, gx, gy, gz, 2) {
+                    if any_inside_26_neighbor(inside_at, gx, gy, gz) {
                         let cell_flat = cx
                             + cy * octree_brick_dim
                             + cz * octree_brick_dim * octree_brick_dim;
@@ -243,15 +245,7 @@ fn emit_subbrick(
     );
 
     if all_interior {
-        // Previously: `set_at_level(..., INTERIOR_NODE)` — promoted any
-        // 4³ subbrick whose per-voxel is_inside flags were all true to
-        // an INTERIOR node. Removed for the same reason as the brick-
-        // level all_inside promotion: process_brick's sign test is
-        // fragile near concavities and a whole-subbrick flip turns
-        // into a rendered cube. Leaving the subbrick EMPTY is safe:
-        // genuinely-interior subbricks sit behind the shell voxels of
-        // an exterior-facing subbrick, so ray coverage is preserved.
-        let _ = (sub_origin_coord, octree_brick_depth);
+        octree.set_at_level(sub_origin_coord, octree_brick_depth, sparse_octree::INTERIOR_NODE);
         return;
     }
     if shell_entries.is_empty() {
@@ -310,27 +304,17 @@ fn emit_subbrick(
     octree.set_at_level(sub_origin_coord, octree_brick_depth, sparse_octree::make_brick(brick_id));
 }
 
-/// `true` iff any voxel within Chebyshev distance `radius` of
-/// `(gx, gy, gz)` is inside the mesh. `radius = 1` gives the 26-
-/// neighbourhood used for a 1-voxel-thick shell; `radius = 2` gives
-/// the 5³-1 = 124-neighbourhood used for a 2-voxel-thick shell.
-///
-/// A thicker shell closes the glancing-ray leaks where the march can
-/// slip between 1-cell-thick shell voxels and reach an INTERIOR
-/// neighbour face (rendered by the shader as a flat-gray cube). With
-/// 2-voxel thickness every ray crossing the surface at any angle is
-/// guaranteed to traverse at least one shell cell before reaching
-/// interior bulk.
-fn any_inside_within(
+/// `true` iff any of the 26 neighbours of `(gx, gy, gz)` is inside
+/// the mesh. Used to identify the 1-voxel-thick outer shell.
+fn any_inside_26_neighbor(
     inside_at: &impl Fn(i64, i64, i64) -> bool,
     gx: u32,
     gy: u32,
     gz: u32,
-    radius: i64,
 ) -> bool {
-    for dz in -radius..=radius {
-        for dy in -radius..=radius {
-            for dx in -radius..=radius {
+    for dz in -1i64..=1 {
+        for dy in -1i64..=1 {
+            for dx in -1i64..=1 {
                 if dx == 0 && dy == 0 && dz == 0 {
                     continue;
                 }

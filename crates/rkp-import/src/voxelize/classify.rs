@@ -24,40 +24,6 @@ use crate::config::ImportConfig;
 use crate::mesh::MeshData;
 use crate::sample::texture::sample_texture_at_triangle;
 
-/// Detect the mesh's winding convention once per import. Samples
-/// winding-number at a 3³ grid of points inside the AABB and returns
-/// `+1.0` or `-1.0` based on the sign of the strongest winding
-/// measurement — `+1` for CCW-wound meshes (standard glTF),
-/// `-1` for CW / reversed-wound meshes (some FBX exports, some glTFs).
-/// Falls back to `+1.0` if no point reads as clearly inside.
-pub fn detect_winding_sign(bvh: &TriangleBvh, aabb: &Aabb) -> f32 {
-    let mut best_abs: f32 = 0.0;
-    let mut best_sign: f32 = 1.0;
-    let extent = aabb.max - aabb.min;
-    for iz in 0..3 {
-        for iy in 0..3 {
-            for ix in 0..3 {
-                let t = Vec3::new(
-                    (ix as f32 + 0.5) / 3.0,
-                    (iy as f32 + 0.5) / 3.0,
-                    (iz as f32 + 0.5) / 3.0,
-                );
-                let p = aabb.min + extent * t;
-                let w = bvh.winding_number(p);
-                if w.abs() > best_abs {
-                    best_abs = w.abs();
-                    best_sign = w.signum();
-                }
-            }
-        }
-    }
-    if best_abs > 0.5 {
-        best_sign
-    } else {
-        1.0
-    }
-}
-
 /// Tier-based auto voxel-size picker. Chooses the coarsest tier that
 /// still resolves the longest axis with at least 8 bricks. Matches
 /// the editor's tier table so auto + manual imports stay in sync.
@@ -127,21 +93,20 @@ pub fn voxel_index(x: u8, y: u8, z: u8) -> u32 {
     x as u32 + y as u32 * 8 + z as u32 * 64
 }
 
-/// Sample signed distance, material, and (optional) colour at every
+/// Sample material, colour, face-normal, and inside/outside at every
 /// voxel of one 8³ brick. Caller is expected to have already
 /// narrow-band-filtered this brick (every voxel is worth sampling).
 ///
-/// `winding_sign` is `+1` for CCW-wound meshes and `-1` for CW /
-/// reversed-wound meshes (some glTF/FBX assets ship with reversed
-/// winding). Detected once per import by [`detect_winding_sign`] —
-/// used here to interpret the per-triangle face-normal orientation.
+/// Inside/outside uses axis-aligned ray-cast parity
+/// ([`TriangleBvh::is_inside_raycast`]): 3-ray majority vote,
+/// topologically robust to self-intersections / duplicated triangles
+/// / non-manifold patches in real scan and CAD meshes.
 pub fn process_brick(
     mesh: &MeshData,
     bvh: &TriangleBvh,
     brick_min: Vec3,
     voxel_size: f32,
     config: &ImportConfig,
-    winding_sign: f32,
 ) -> BrickResult {
     let half_voxel = voxel_size * 0.5;
     let mut color_brick = ColorBrick::default();
@@ -149,18 +114,6 @@ pub fn process_brick(
     let mut is_inside_buf = [false; 512];
     let mut face_normals = [0u32; 512];
     let mut all_inside = true;
-
-    // Inside/outside by axis-aligned ray casting (3-ray majority
-    // vote). Replaced generalized winding number because scan/CAD
-    // meshes (including the Stanford bunny) contain self-
-    // intersections and duplicated triangles that make winding
-    // produce `|w| > 0.5` pockets outside the topological surface
-    // and inverted-sign whole bricks on layered regions. Ray parity
-    // contributes 0 or 1 per triangle regardless of layering, so
-    // those failure modes go away. `winding_sign` is kept in the
-    // signature (see `detect_winding_sign`) but is unused on this
-    // path — ray-cast is symmetric under winding reversal.
-    let _ = winding_sign;
 
     for vz in 0..BRICK_DIM {
         for vy in 0..BRICK_DIM {
