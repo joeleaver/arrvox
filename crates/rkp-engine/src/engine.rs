@@ -805,6 +805,17 @@ impl EngineState {
             {
                 let mut sp = self.shade_params_base;
                 sp.isolation = isolation as u32;
+                // The lights buffer is scene-wide (one buffer, shared by
+                // every VR), and the shade shader walks the first
+                // `num_lights` entries regardless of `isolation`. Entry 0
+                // is the sun; 1..N are scene point/spot lights. In
+                // isolation we want a neutral studio, so clamp to just
+                // the sun — otherwise the main scene's point lights
+                // light up the build-viewport preview, which visually
+                // contradicts "isolation."
+                if isolation {
+                    sp.num_lights = sp.num_lights.min(1);
+                }
                 self.renderer.update_shade_params(&self.queue, &sp);
             }
             // Per-VR bloom intensity. In isolation we run bloom_composite
@@ -1394,12 +1405,21 @@ impl EngineState {
                     vp.width = width;
                     vp.height = height;
                 }
-                // MAIN drives the legacy width/height on EngineState for
-                // hot paths that haven't migrated (sculpt/paint ray math).
+                // `vr.resize` reconstructs the bloom + tonemap passes with
+                // their hard-coded defaults, so the scene's exposure and
+                // bloom knobs have to be re-uploaded afterwards on EVERY
+                // resize — not just MAIN. Previously this was gated to
+                // MAIN and BUILD's first Resize (sent by the editor when
+                // the build panel sizes up) left it running with default
+                // exposure → blown-out preview until something else
+                // flipped environment_dirty back on.
+                self.environment_dirty = true;
                 if id == crate::viewport::ViewportId::MAIN {
+                    // MAIN drives the legacy width/height on EngineState
+                    // for hot paths that haven't migrated (sculpt/paint
+                    // ray math).
                     self.width = width;
                     self.height = height;
-                    self.environment_dirty = true;
                     self.environment_ui_dirty = true;
                     eprintln!("[RkpEngine] MAIN resized to {}x{}", width, height);
                 }
