@@ -1740,10 +1740,23 @@ impl EngineState {
             EngineCommand::Pick { id, x, y } => {
                 // Route the pick by viewport — MAIN picks scene entities
                 // (old path), BUILD picks procedural primitives when in
-                // raymarch preview. Either way, don't start a pick while
-                // a transform gizmo is being dragged (the axis would
-                // consume the click first).
-                if self.gizmo.hovered_axis == crate::gizmo::GizmoAxis::None {
+                // raymarch preview. Either way, a click landing on a
+                // gizmo axis should NOT fall through to pick — that
+                // deselects the currently-manipulated object and
+                // prevents the drag from starting. Each viewport has
+                // its own gizmo state; pick the right one.
+                let gizmo_blocking = match id {
+                    crate::viewport::ViewportId::MAIN => {
+                        self.gizmo.hovered_axis != crate::gizmo::GizmoAxis::None
+                            || self.gizmo.dragging
+                    }
+                    crate::viewport::ViewportId::BUILD => {
+                        self.proc_gizmo.hovered_axis != crate::gizmo::GizmoAxis::None
+                            || self.proc_gizmo.dragging
+                    }
+                    _ => false,
+                };
+                if !gizmo_blocking {
                     self.pending_pick = Some(PendingPick { viewport: id, x, y });
                 }
             }
