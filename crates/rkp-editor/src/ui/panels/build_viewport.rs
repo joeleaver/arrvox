@@ -13,8 +13,9 @@
 use rinch::prelude::*;
 use rinch::render_surface::{RenderSurface, SurfaceEvent, SurfaceMouseButton};
 
+use rkp_engine::procedural_snapshot::ProceduralSnapshot;
 use rkp_engine::viewport::ViewportId;
-use rkp_render::RenderMode;
+use rkp_render::{BuildPreviewMode, RenderMode};
 
 use crate::{BuildSurface, CommandSender};
 use crate::ui::store::EditorStore;
@@ -358,6 +359,23 @@ pub fn BuildViewport() -> NodeHandle {
                         )}
                     }
                 }
+                // Top-right: preview-mode toggle + Bake action. Floats as
+                // a single compact overlay over the 3D view so the tools
+                // live next to the thing they modify. Gated on
+                // `has_procedural` — same as the tree panel.
+                if has_procedural.get() {
+                    div {
+                        style: "position:absolute;top:8px;right:8px;\
+                                background:rgba(30,30,30,0.88);\
+                                border:1px solid #3c3c3c;border-radius:4px;\
+                                color:#ccc;font-size:12px;padding:6px;\
+                                backdrop-filter:blur(4px);z-index:15;\
+                                display:flex;flex-direction:column;gap:6px;\
+                                min-width:220px;",
+                        {render_preview_toggle(__scope, store.clone(), tree_cmd_tx)}
+                        {render_bake_action(__scope, tree_snapshot, tree_cmd_tx)}
+                    }
+                }
                 if !has_procedural.get() {
                     div {
                         style: "position:absolute;inset:0;display:flex;\
@@ -400,6 +418,109 @@ fn mode_toggle(
                 }
             },
             {label}
+        }
+    }
+}
+
+/// Two-button segmented control for the build viewport's primary-
+/// visibility source. `Voxel` shows the baked octree result; `Procedural`
+/// evaluates the analytical CSG tree per pixel so edits are live. The
+/// pair is the expected editing loop: edit with Procedural, Bake, confirm
+/// with Voxel. Rendered as the left half of the top-right overlay.
+fn render_preview_toggle(
+    __scope: &mut rinch::core::dom::RenderScope,
+    store: EditorStore,
+    cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
+) -> rinch::core::dom::NodeHandle {
+    let mode = store.build_preview_mode;
+
+    let set_voxel = move || {
+        mode.set(BuildPreviewMode::Voxel);
+        let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetBuildPreviewMode {
+            mode: BuildPreviewMode::Voxel,
+        });
+    };
+    let set_raymarch = move || {
+        mode.set(BuildPreviewMode::Raymarch);
+        let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetBuildPreviewMode {
+            mode: BuildPreviewMode::Raymarch,
+        });
+    };
+
+    let btn_style = |active: bool| -> &'static str {
+        if active {
+            "flex:1;padding:3px 10px;background:#3c5a8a;color:#dde7f5;\
+             border:1px solid #4a78b0;border-radius:3px;cursor:pointer;\
+             font-size:11px;font-weight:600;"
+        } else {
+            "flex:1;padding:3px 10px;background:#2a2a2a;color:#a0a0a0;\
+             border:1px solid #3c3c3c;border-radius:3px;cursor:pointer;\
+             font-size:11px;"
+        }
+    };
+
+    rsx! {
+        div {
+            style: "display:flex;align-items:center;gap:6px;",
+            span { style: "color:#888;font-size:11px;", "Preview:" }
+            div {
+                style: "display:flex;flex:1;gap:4px;",
+                button {
+                    style: {move || btn_style(matches!(mode.get(), BuildPreviewMode::Raymarch))},
+                    onclick: set_raymarch,
+                    "Procedural"
+                }
+                button {
+                    style: {move || btn_style(matches!(mode.get(), BuildPreviewMode::Voxel))},
+                    onclick: set_voxel,
+                    "Voxel"
+                }
+            }
+        }
+    }
+}
+
+/// Bake button + dirty indicator. Interactive edits mark the tree dirty
+/// but don't rebake — this button pays the voxelization cost on demand.
+/// Highlights blue when there are unbaked changes.
+fn render_bake_action(
+    __scope: &mut rinch::core::dom::RenderScope,
+    snapshot: Memo<ProceduralSnapshot>,
+    cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
+) -> rinch::core::dom::NodeHandle {
+    let dirty = Memo::new(move || snapshot.get().dirty);
+    let entity_id = Memo::new(move || snapshot.get().entity_id);
+
+    let on_click = move || {
+        let _ = cmd_tx.get().send(rkp_engine::EngineCommand::BakeProceduralEntity {
+            entity_id: entity_id.get(),
+        });
+    };
+
+    rsx! {
+        div {
+            style: "display:flex;align-items:center;gap:8px;",
+            button {
+                style: {move || if dirty.get() {
+                    "flex:1;padding:4px 10px;background:#2a4e7a;color:#fff;\
+                     border:1px solid #3a6ea6;border-radius:3px;cursor:pointer;\
+                     font-weight:600;font-size:11px;"
+                } else {
+                    "flex:1;padding:4px 10px;background:#2a2a2a;color:#888;\
+                     border:1px solid #444;border-radius:3px;cursor:pointer;\
+                     font-size:11px;"
+                }},
+                onclick: on_click,
+                "Bake"
+            }
+            span {
+                style: {move || if dirty.get() {
+                    "color:#f0a04b;font-size:11px;"
+                } else {
+                    "color:#666;font-size:11px;"
+                }},
+                {move || if dirty.get() { "unbaked changes" } else { "up to date" }}
+            }
         }
     }
 }

@@ -5020,44 +5020,46 @@ fn apply_procedural_param(
     match &mut node.kind {
         NodeKind::Sphere(p) => match param_name {
             "radius" => { p.radius = value.parse().unwrap_or(p.radius); true }
-            "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
+            "material_id" | "material" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
             "color" => { if let Some(v) = parse_vec3(value) { p.color = v; } true }
             _ => false,
         },
         NodeKind::Box(p) => match param_name {
             "half_extents" => { if let Some(v) = parse_vec3(value) { p.half_extents = v; } true }
             "rounding" => { p.rounding = value.parse().unwrap_or(p.rounding); true }
-            "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
+            "material_id" | "material" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
             "color" => { if let Some(v) = parse_vec3(value) { p.color = v; } true }
             _ => false,
         },
         NodeKind::Capsule(p) => match param_name {
             "half_height" => { p.half_height = value.parse().unwrap_or(p.half_height); true }
             "radius" => { p.radius = value.parse().unwrap_or(p.radius); true }
-            "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
+            "material_id" | "material" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
             _ => false,
         },
         NodeKind::Cylinder(p) => match param_name {
             "half_height" => { p.half_height = value.parse().unwrap_or(p.half_height); true }
             "radius" => { p.radius = value.parse().unwrap_or(p.radius); true }
-            "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
+            "material_id" | "material" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
             _ => false,
         },
         NodeKind::Torus(p) => match param_name {
             "major_radius" => { p.major_radius = value.parse().unwrap_or(p.major_radius); true }
-            "minor_radius" => { p.minor_radius = value.parse().unwrap_or(p.minor_radius); true }
-            "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
+            // `tube_radius` is the UI-visible name; `minor_radius` is kept
+            // as an alias so the raw field name still works from MCP/scripts.
+            "minor_radius" | "tube_radius" => { p.minor_radius = value.parse().unwrap_or(p.minor_radius); true }
+            "material_id" | "material" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
             _ => false,
         },
         NodeKind::Plane(p) => match param_name {
-            "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
+            "material_id" | "material" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
             _ => false,
         },
         NodeKind::Ramp(p) => match param_name {
             "half_length" => { p.half_length = value.parse().unwrap_or(p.half_length); true }
             "half_height" => { p.half_height = value.parse().unwrap_or(p.half_height); true }
             "half_width" => { p.half_width = value.parse().unwrap_or(p.half_width); true }
-            "material_id" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
+            "material_id" | "material" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
             "color" => { if let Some(v) = parse_vec3(value) { p.color = v; } true }
             _ => false,
         },

@@ -94,8 +94,14 @@ pub struct ProceduralParam {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProceduralParamValue {
     Float(f32),
-    Vec3([f32; 3]),
-    U16(u16),
+    /// RGBA color. Alpha is tracked for the color-picker control even
+    /// though leaf params today only store RGB — the picker round-trips
+    /// through hex strings that would otherwise require re-emitting an
+    /// alpha channel anyway.
+    Color([f32; 4]),
+    /// Material-palette reference. Rendered as a drag-drop slot (swatch +
+    /// name) that accepts materials from the materials panel.
+    Material(u16),
     MaterialCombine(String),
 }
 
@@ -222,60 +228,67 @@ fn decompose_affine(t: &glam::Affine3A) -> ([f32; 3], [f32; 3], [f32; 3]) {
     )
 }
 
+// Dimension-like params (radius, half_extents, half_height, ...) are
+// intentionally omitted from the UI: the Scale transform on the node
+// covers the same space (and gives non-uniform scaling / ellipsoids /
+// scalene cylinders for free). The defaults are canonical unit shapes —
+// sphere r=0.5, unit cube, unit-ish capsule/cylinder/ramp — so the
+// transform's scale factor reads as "size in world units."
+//
+// Torus is the one exception: `minor_radius` (tube thickness) is
+// independent of the ring radius and can't be expressed through a
+// Vec3 scale, so it stays visible.
+
+fn rgba_from_color(c: glam::Vec3) -> [f32; 4] {
+    [c.x, c.y, c.z, 1.0]
+}
+
 fn sphere_params(p: &rkp_procedural::node_kind::SphereParams) -> Vec<ProceduralParam> {
     vec![
-        ProceduralParam { name: "radius".into(), value: ProceduralParamValue::Float(p.radius), range: Some((0.01, 100.0)) },
-        ProceduralParam { name: "material_id".into(), value: ProceduralParamValue::U16(p.material_id), range: None },
-        ProceduralParam { name: "color".into(), value: ProceduralParamValue::Vec3(p.color.to_array()), range: None },
+        ProceduralParam { name: "material".into(), value: ProceduralParamValue::Material(p.material_id), range: None },
+        ProceduralParam { name: "color".into(), value: ProceduralParamValue::Color(rgba_from_color(p.color)), range: None },
     ]
 }
 
 fn box_params(p: &rkp_procedural::node_kind::BoxParams) -> Vec<ProceduralParam> {
     vec![
-        ProceduralParam { name: "half_extents".into(), value: ProceduralParamValue::Vec3(p.half_extents.to_array()), range: None },
         ProceduralParam { name: "rounding".into(), value: ProceduralParamValue::Float(p.rounding), range: Some((0.0, 10.0)) },
-        ProceduralParam { name: "material_id".into(), value: ProceduralParamValue::U16(p.material_id), range: None },
-        ProceduralParam { name: "color".into(), value: ProceduralParamValue::Vec3(p.color.to_array()), range: None },
+        ProceduralParam { name: "material".into(), value: ProceduralParamValue::Material(p.material_id), range: None },
+        ProceduralParam { name: "color".into(), value: ProceduralParamValue::Color(rgba_from_color(p.color)), range: None },
     ]
 }
 
 fn capsule_params(p: &rkp_procedural::node_kind::CapsuleParams) -> Vec<ProceduralParam> {
     vec![
-        ProceduralParam { name: "half_height".into(), value: ProceduralParamValue::Float(p.half_height), range: Some((0.01, 100.0)) },
-        ProceduralParam { name: "radius".into(), value: ProceduralParamValue::Float(p.radius), range: Some((0.01, 100.0)) },
-        ProceduralParam { name: "material_id".into(), value: ProceduralParamValue::U16(p.material_id), range: None },
+        ProceduralParam { name: "material".into(), value: ProceduralParamValue::Material(p.material_id), range: None },
     ]
 }
 
 fn cylinder_params(p: &rkp_procedural::node_kind::CylinderParams) -> Vec<ProceduralParam> {
     vec![
-        ProceduralParam { name: "half_height".into(), value: ProceduralParamValue::Float(p.half_height), range: Some((0.01, 100.0)) },
-        ProceduralParam { name: "radius".into(), value: ProceduralParamValue::Float(p.radius), range: Some((0.01, 100.0)) },
-        ProceduralParam { name: "material_id".into(), value: ProceduralParamValue::U16(p.material_id), range: None },
+        ProceduralParam { name: "material".into(), value: ProceduralParamValue::Material(p.material_id), range: None },
     ]
 }
 
 fn torus_params(p: &rkp_procedural::node_kind::TorusParams) -> Vec<ProceduralParam> {
     vec![
-        ProceduralParam { name: "major_radius".into(), value: ProceduralParamValue::Float(p.major_radius), range: Some((0.01, 100.0)) },
-        ProceduralParam { name: "minor_radius".into(), value: ProceduralParamValue::Float(p.minor_radius), range: Some((0.01, 50.0)) },
-        ProceduralParam { name: "material_id".into(), value: ProceduralParamValue::U16(p.material_id), range: None },
+        // Exposed as `tube_radius` in the UI — the TorusParams field is
+        // still `minor_radius` underneath. Setter accepts both names.
+        ProceduralParam { name: "tube_radius".into(), value: ProceduralParamValue::Float(p.minor_radius), range: Some((0.01, 50.0)) },
+        ProceduralParam { name: "material".into(), value: ProceduralParamValue::Material(p.material_id), range: None },
     ]
 }
 
 fn plane_params(p: &rkp_procedural::node_kind::PlaneParams) -> Vec<ProceduralParam> {
     vec![
-        ProceduralParam { name: "material_id".into(), value: ProceduralParamValue::U16(p.material_id), range: None },
+        ProceduralParam { name: "material".into(), value: ProceduralParamValue::Material(p.material_id), range: None },
     ]
 }
 
 fn ramp_params(p: &rkp_procedural::node_kind::RampParams) -> Vec<ProceduralParam> {
     vec![
-        ProceduralParam { name: "half_length".into(), value: ProceduralParamValue::Float(p.half_length), range: Some((0.01, 100.0)) },
-        ProceduralParam { name: "half_height".into(), value: ProceduralParamValue::Float(p.half_height), range: Some((0.01, 100.0)) },
-        ProceduralParam { name: "half_width".into(), value: ProceduralParamValue::Float(p.half_width), range: Some((0.01, 100.0)) },
-        ProceduralParam { name: "material_id".into(), value: ProceduralParamValue::U16(p.material_id), range: None },
-        ProceduralParam { name: "color".into(), value: ProceduralParamValue::Vec3(p.color.to_array()), range: None },
+        ProceduralParam { name: "material".into(), value: ProceduralParamValue::Material(p.material_id), range: None },
+        ProceduralParam { name: "color".into(), value: ProceduralParamValue::Color(rgba_from_color(p.color)), range: None },
     ]
 }
 

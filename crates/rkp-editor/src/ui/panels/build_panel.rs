@@ -1,11 +1,11 @@
-//! Build panel — preview controls + parameter editor for the selected
+//! Build panel — parameter editor + resolution picker for the selected
 //! procedural node.
 //!
-//! The node tree itself lives in `procedural_tree.rs` and is embedded
-//! by the build viewport as a floating overlay; this panel is now
-//! specifically the right-hand companion showing Preview toggle, Bake
-//! button, Resolution picker, and parameter fields for whatever node
-//! the tree has selected. Only active when the selected entity has a
+//! The node tree and the Preview / Bake controls both live as floating
+//! overlays on the build viewport now (see `procedural_tree.rs` and
+//! `build_viewport.rs`). This panel is the right-hand companion showing
+//! the Resolution picker and the parameter fields for whatever node the
+//! tree has selected. Only active when the selected entity has a
 //! ProceduralGeometry component.
 
 use std::rc::Rc;
@@ -53,131 +53,15 @@ fn build_content(__scope: &mut Scope, store: EditorStore) -> Node {
     rsx! {
         div {
             style: "display:flex;flex-direction:column;height:100%;",
-            // ── Preview mode toggle (voxel vs live CSG raymarch) ──────
-            {render_preview_toggle(__scope, store, cmd_tx)}
-            // ── Bake action ───────────────────────────────────────────
-            {render_bake_action(__scope, snapshot, cmd_tx)}
             // ── Resolution ────────────────────────────────────────────
             {render_resolution(__scope, snapshot, cmd_tx)}
             // ── Node params ───────────────────────────────────────────
-            // The tree widget lives on the build viewport as a floating
-            // overlay now; this panel is just preview controls + the
-            // currently-selected node's parameters.
+            // Tree widget and Preview/Bake controls both live on the
+            // build viewport as floating overlays; this panel is just
+            // resolution + the currently-selected node's parameters.
             div {
                 style: "flex:1;min-height:0;overflow-y:auto;padding:4px 8px;",
-                {render_params(__scope, snapshot, selected_node, cmd_tx)}
-            }
-        }
-    }
-}
-
-/// Two-button segmented control for the build viewport's primary-
-/// visibility source. `Voxel` shows the baked octree result — the
-/// same thing the main viewport sees; becomes stale the moment the
-/// user edits the tree. `Raymarch` evaluates the tree analytically
-/// per pixel, so it's always in sync with the current parameters but
-/// doesn't reflect material/lighting quality exactly. The pair is
-/// the expected editing loop: edit with Raymarch, Bake, confirm with
-/// Voxel.
-fn render_preview_toggle(
-    __scope: &mut Scope,
-    store: EditorStore,
-    cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
-) -> Node {
-    // Mirror the engine's current preview mode in a local signal so the
-    // buttons re-highlight when the engine reports a change. This also
-    // gives us an easy place to flip the mode without touching the
-    // engine on every render.
-    let mode = store.build_preview_mode;
-
-    let set_voxel = move || {
-        mode.set(rkp_render::BuildPreviewMode::Voxel);
-        let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetBuildPreviewMode {
-            mode: rkp_render::BuildPreviewMode::Voxel,
-        });
-    };
-    let set_raymarch = move || {
-        mode.set(rkp_render::BuildPreviewMode::Raymarch);
-        let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetBuildPreviewMode {
-            mode: rkp_render::BuildPreviewMode::Raymarch,
-        });
-    };
-
-    let btn_style = |active: bool| -> &'static str {
-        if active {
-            "flex:1;padding:4px 8px;background:#2a4e7a;color:#fff;\
-             border:1px solid #3a6ea6;cursor:pointer;"
-        } else {
-            "flex:1;padding:4px 8px;background:#2a2a2a;color:#aaa;\
-             border:1px solid #333;cursor:pointer;"
-        }
-    };
-
-    rsx! {
-        div {
-            style: "display:flex;align-items:center;gap:8px;padding:6px 8px;\
-                    border-bottom:1px solid #333;",
-            span { style: "color:#888;font-size:11px;", "Preview:" }
-            div {
-                style: "display:flex;flex:1;gap:0;",
-                button {
-                    style: {move || btn_style(matches!(mode.get(), rkp_render::BuildPreviewMode::Voxel))},
-                    onclick: set_voxel,
-                    "Voxel"
-                }
-                button {
-                    style: {move || btn_style(matches!(mode.get(), rkp_render::BuildPreviewMode::Raymarch))},
-                    onclick: set_raymarch,
-                    "Live (raymarch)"
-                }
-            }
-        }
-    }
-}
-
-/// Bake button + dirty indicator. Interactive edits mark the tree dirty
-/// but don't rebake — the user clicks this to pay the voxelization cost
-/// on demand. The button highlights when there are unbaked changes.
-fn render_bake_action(
-    __scope: &mut Scope,
-    snapshot: Memo<ProceduralSnapshot>,
-    cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
-) -> Node {
-    let dirty = Memo::new(move || snapshot.get().dirty);
-    let entity_id = Memo::new(move || snapshot.get().entity_id);
-
-    let on_click = move || {
-        let _ = cmd_tx.get().send(rkp_engine::EngineCommand::BakeProceduralEntity {
-            entity_id: entity_id.get(),
-        });
-    };
-
-    rsx! {
-        div {
-            style: "display:flex;align-items:center;gap:8px;padding:6px 8px;\
-                    border-bottom:1px solid #333;",
-            button {
-                // Highlighted blue when dirty, neutral gray when clean. Clicking
-                // when clean is a no-op cost-wise (full rebake runs anyway) so
-                // don't disable — just de-emphasize.
-                style: {move || if dirty.get() {
-                    "flex:1;padding:6px 10px;background:#2a4e7a;color:#fff;\
-                     border:1px solid #3a6ea6;border-radius:3px;cursor:pointer;\
-                     font-weight:600;"
-                } else {
-                    "flex:1;padding:6px 10px;background:#2a2a2a;color:#888;\
-                     border:1px solid #444;border-radius:3px;cursor:pointer;"
-                }},
-                onclick: on_click,
-                "Bake"
-            }
-            span {
-                style: {move || if dirty.get() {
-                    "color:#f0a04b;font-size:11px;"
-                } else {
-                    "color:#666;font-size:11px;"
-                }},
-                {move || if dirty.get() { "unbaked changes" } else { "up to date" }}
+                {render_params(__scope, store.clone(), snapshot, selected_node, cmd_tx)}
             }
         }
     }
@@ -221,6 +105,7 @@ fn render_resolution(
 
 fn render_params(
     __scope: &mut Scope,
+    store: EditorStore,
     snapshot: Memo<ProceduralSnapshot>,
     selected_node: Memo<Option<u32>>,
     cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
@@ -240,7 +125,7 @@ fn render_params(
                 }
             }
             if node_info.get().is_some() {
-                {render_node_params(__scope, node_info, cmd_tx)}
+                {render_node_params(__scope, store.clone(), node_info, cmd_tx)}
             }
         }
     }
@@ -248,6 +133,7 @@ fn render_params(
 
 fn render_node_params(
     __scope: &mut Scope,
+    store: EditorStore,
     node_info: Memo<Option<ProceduralNodeInfo>>,
     cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
 ) -> Node {
@@ -323,7 +209,7 @@ fn render_node_params(
                 div {
                     style: "display:flex;flex-direction:column;gap:2px;",
                     for param in params.get() {
-                        {render_param_field(__scope, node_id, param.clone(), cmd_tx)}
+                        {render_param_field(__scope, store.clone(), node_id, param.clone(), cmd_tx)}
                     }
                 }
             }
@@ -333,6 +219,7 @@ fn render_node_params(
 
 fn render_param_field(
     __scope: &mut Scope,
+    store: EditorStore,
     node_id: Memo<u32>,
     param: ProceduralParam,
     cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
@@ -351,29 +238,24 @@ fn render_param_field(
             });
             prop_scrub(__scope, &param.name, signal, min, max, 0.01, on_change)
         }
-        ProceduralParamValue::Vec3(v) => {
+        ProceduralParamValue::Color(v) => {
             let signal = Signal::new(v);
             let name = param.name.clone();
-            let on_change: Rc<dyn Fn([f32; 3])> = Rc::new(move |val: [f32; 3]| {
+            // Engine-side parser is `parse_vec3` → "r,g,b", so drop
+            // alpha in the wire format. Color params today are pure RGB
+            // under the hood (glam::Vec3); the picker carries alpha for
+            // symmetry with material colors but nobody reads it.
+            let on_change: Rc<dyn Fn([f32; 4])> = Rc::new(move |val: [f32; 4]| {
                 let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralNodeParam {
                     node_id: node_id.get(),
                     param_name: name.clone(),
                     value: format!("{},{},{}", val[0], val[1], val[2]),
                 });
             });
-            prop_vec3(__scope, &param.name, signal, on_change)
+            prop_color(__scope, &param.name, signal, on_change)
         }
-        ProceduralParamValue::U16(v) => {
-            let signal = Signal::new(v as i64);
-            let name = param.name.clone();
-            let on_change: Rc<dyn Fn(i64)> = Rc::new(move |val: i64| {
-                let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralNodeParam {
-                    node_id: node_id.get(),
-                    param_name: name.clone(),
-                    value: format!("{val}"),
-                });
-            });
-            prop_number_i64(__scope, &param.name, signal, on_change)
+        ProceduralParamValue::Material(mat_id) => {
+            material_slot_row(__scope, store, node_id, &param.name, mat_id, cmd_tx)
         }
         ProceduralParamValue::MaterialCombine(ref v) => {
             let signal = Signal::new(v.clone());
@@ -392,6 +274,104 @@ fn render_param_field(
                 &[("Winner", "Winner"), ("Layered", "Layered"), ("Blend", "Blend")],
                 on_change,
             )
+        }
+    }
+}
+
+/// Material slot: swatch + name, accepts a drag from the materials panel
+/// (via `store.material_drag`). Drop fires a SetProceduralNodeParam with
+/// the dropped material id. Mirrors the drop pattern in
+/// `object_properties::material_usage_row` so the two panels feel the
+/// same to the user.
+fn material_slot_row(
+    __scope: &mut Scope,
+    store: EditorStore,
+    node_id: Memo<u32>,
+    param_name: &str,
+    mat_id: u16,
+    cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
+) -> Node {
+    let param_name_owned = param_name.to_string();
+    let label_text = param_name.to_string();
+
+    // Current material name + swatch color, looked up against the
+    // scene's material library. Memos so a material-palette edit or
+    // tombstone refreshes the display without a param round-trip.
+    let mat_name = Memo::new(move || {
+        store.materials.get()
+            .iter()
+            .find(|m| m.id == mat_id)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| format!("Material {mat_id}"))
+    });
+    let mat_color = Memo::new(move || {
+        store.materials.get()
+            .iter()
+            .find(|m| m.id == mat_id)
+            .map(|m| m.base_color)
+            .unwrap_or([0.5, 0.5, 0.5, 1.0])
+    });
+
+    let is_drop_target = Signal::new(false);
+
+    rsx! {
+        div {
+            style: "display:flex;align-items:center;gap:6px;min-height:22px;",
+            div { style: "width:72px;flex-shrink:0;font-size:11px;color:#999;\
+                          overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
+                {label_text}
+            }
+            div {
+                style: {move || {
+                    if is_drop_target.get() {
+                        "flex:1;min-width:0;display:flex;align-items:center;gap:6px;\
+                         padding:3px 4px;border-radius:3px;\
+                         border:1px dashed #4fc3f7;background:#1a2a3a;"
+                    } else {
+                        "flex:1;min-width:0;display:flex;align-items:center;gap:6px;\
+                         padding:3px 4px;border-radius:3px;\
+                         border:1px solid #3c3c3c;background:#1e1e1e;"
+                    }
+                }},
+                ondragenter: move || {
+                    if store.material_drag.get().is_some() {
+                        is_drop_target.set(true);
+                    }
+                },
+                ondragleave: move || {
+                    is_drop_target.set(false);
+                },
+                ondrop: move || {
+                    is_drop_target.set(false);
+                    if let Some(new_mat_id) = store.material_drag.get() {
+                        let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralNodeParam {
+                            node_id: node_id.get(),
+                            param_name: param_name_owned.clone(),
+                            value: format!("{new_mat_id}"),
+                        });
+                        store.material_drag.set(None);
+                    }
+                },
+
+                // Color swatch from material base_color.
+                div {
+                    style: {move || {
+                        let [r, g, b, _] = mat_color.get();
+                        format!(
+                            "width:14px;height:14px;border-radius:3px;flex-shrink:0;\
+                             border:1px solid #3c3c3c;\
+                             background:rgb({},{},{});",
+                            (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8,
+                        )
+                    }},
+                }
+                // Material name.
+                div {
+                    style: "flex:1;font-size:11px;color:#ccc;\
+                            overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
+                    {move || mat_name.get()}
+                }
+            }
         }
     }
 }
