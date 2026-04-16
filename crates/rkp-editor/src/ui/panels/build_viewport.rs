@@ -332,21 +332,27 @@ pub fn BuildViewport() -> NodeHandle {
                 if has_procedural.get() {
                     EditModeToolbar {}
                 }
-                // Floating procedural-tree overlay on the left side,
-                // below the toolbar. Translucent backdrop + subtle
-                // border so it sits clearly "on top of" the preview
-                // without fighting for attention with the geometry.
-                // Width tuned against typical node-name lengths;
-                // max-height caps to leave viewport space underneath
-                // and scrolls for deep trees.
+                // Floating procedural-tree overlay, anchored right of
+                // the vertical gizmo-mode toolbar so they don't overlap
+                // (toolbar is at top:8;left:8;z-index:20 — tree starts
+                // at left:52 to clear a ~40px icon column with a bit
+                // of breathing room).
+                //
+                // No `overflow` here: the add-child "+" popover
+                // dropdown is an absolute-positioned descendant that
+                // extends outside the tree's bounds; any overflow
+                // setting on this container clips the dropdown and
+                // it becomes invisible. If trees grow deep enough to
+                // need scrolling we'll add an inner scroll container
+                // that lives under the popover's own stacking, but
+                // for now unbounded-height is fine.
                 if has_procedural.get() {
                     div {
-                        style: "position:absolute;top:8px;left:8px;width:260px;\
-                                max-height:calc(100% - 16px);overflow-y:auto;\
+                        style: "position:absolute;top:8px;left:52px;width:240px;\
                                 background:rgba(30,30,30,0.88);\
                                 border:1px solid #3c3c3c;border-radius:4px;\
                                 color:#ccc;font-size:12px;padding:4px;\
-                                backdrop-filter:blur(4px);z-index:5;",
+                                backdrop-filter:blur(4px);z-index:15;",
                         {procedural_tree::render_tree(
                             __scope, tree_snapshot, tree_selected_node, tree_cmd_tx,
                         )}
