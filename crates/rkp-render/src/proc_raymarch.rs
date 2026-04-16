@@ -33,6 +33,13 @@ use rkp_procedural::flatten::ProcInstruction;
 /// `object_id` is packed into the G-buffer material channel's pick
 /// byte so this procedural's hits show up like any other entity when
 /// the pick shader reads back.
+///
+/// `entity_world` / `entity_inverse_world` carry the owning entity's
+/// world transform (and its inverse) so the shader can march the ray
+/// in the entity's local frame and then convert the hit back to world
+/// for the G-buffer. Without this, moving the entity in world space
+/// shifts the procedural preview out from under the camera — the tree
+/// primitives' own `inverse_world` only encodes intra-tree hierarchy.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct ProcRaymarchParams {
@@ -40,6 +47,8 @@ pub struct ProcRaymarchParams {
     pub object_id: u32,
     pub _pad0: u32,
     pub _pad1: u32,
+    pub entity_world: [[f32; 4]; 4],
+    pub entity_inverse_world: [[f32; 4]; 4],
 }
 
 /// Procedural CSG raymarch compute pass.
@@ -254,12 +263,29 @@ impl ProcRaymarchPass {
     }
 
     /// Update the params uniform.
-    pub fn set_params(&self, queue: &wgpu::Queue, instruction_count: u32, object_id: u32) {
+    ///
+    /// `entity_world` is the owning entity's world transform; the
+    /// shader uses its inverse to pull the camera ray into the entity's
+    /// local frame before marching, and the forward transform to push
+    /// the hit position + normal back to world space for the G-buffer.
+    /// Pass [`glam::Affine3A::IDENTITY`] for entities that live at the
+    /// world origin — the math still works, just with no shift.
+    pub fn set_params(
+        &self,
+        queue: &wgpu::Queue,
+        instruction_count: u32,
+        object_id: u32,
+        entity_world: glam::Affine3A,
+    ) {
+        let world = glam::Mat4::from(entity_world);
+        let inverse = world.inverse();
         let p = ProcRaymarchParams {
             instruction_count,
             object_id,
             _pad0: 0,
             _pad1: 0,
+            entity_world: world.to_cols_array_2d(),
+            entity_inverse_world: inverse.to_cols_array_2d(),
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&p));
     }

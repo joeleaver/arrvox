@@ -74,6 +74,12 @@ struct RaymarchParams {
     object_id: u32,
     _pad0: u32,
     _pad1: u32,
+    // Owning entity's world transform and its inverse. The shader
+    // marches in entity-local space so the preview stays pinned
+    // wherever the entity is in the world; at hit, the local position
+    // and normal get transformed back to world for the G-buffer.
+    entity_world: mat4x4<f32>,
+    entity_inverse_world: mat4x4<f32>,
 }
 
 // One flattened instruction. Layout MUST match
@@ -366,16 +372,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let ray = make_ray(coord);
 
+    // Transform the camera ray into the entity's local frame so we can
+    // march the procedural tree (which is authored in local space) as
+    // if the entity were at origin. This mirrors octree_march's
+    // per-object trace, and matters whenever the entity's world
+    // transform has any translation/rotation/scale — without it the
+    // build-viewport preview drifts every time the user gizmos the
+    // entity in the main viewport. `local_scale` converts between the
+    // two t-parameters so distance checks stay in local units.
+    let local_origin_h = params.entity_inverse_world * vec4<f32>(ray.origin, 1.0);
+    let local_dir_h = params.entity_inverse_world * vec4<f32>(ray.dir, 0.0);
+    let local_origin = local_origin_h.xyz;
+    let local_dir_unnorm = local_dir_h.xyz;
+    let local_dir = normalize(local_dir_unnorm);
+    let local_scale = length(local_dir_unnorm);
+    let local_max_dist = MAX_DIST * local_scale;
+
     var t: f32 = 0.0;
     var hit: bool = false;
-    var hit_pos: vec3<f32> = vec3<f32>(0.0);
+    var hit_local: vec3<f32> = vec3<f32>(0.0);
     var hit_sample: TreeSample;
     for (var step: u32 = 0u; step < MAX_STEPS; step = step + 1u) {
-        let p = ray.origin + ray.dir * t;
+        let p = local_origin + local_dir * t;
         let s = eval_tree(p);
         if (s.distance < SURFACE_EPS) {
             hit = true;
-            hit_pos = p;
+            hit_local = p;
             hit_sample = s;
             break;
         }
@@ -384,7 +406,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // happen after over-march; clamp to `SURFACE_EPS` so we don't
         // walk backwards.
         t = t + max(s.distance, SURFACE_EPS);
-        if (t > MAX_DIST) { break; }
+        if (t > local_max_dist) { break; }
     }
 
     if (!hit) {
@@ -394,7 +416,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let normal = gradient_normal(hit_pos);
+    // Back to world space for the G-buffer. Downstream shade / shadow
+    // / post passes all read world-space positions; normals are used
+    // for lighting which also happens in world. For uniform or rigid
+    // transforms the naive matrix-mul for the normal is correct; with
+    // non-uniform scale the strictly-right thing is inverse-transpose,
+    // but the build-viewport preview is an editing tool so we live
+    // with the mild lighting error until it actually bites.
+    let hit_pos = (params.entity_world * vec4<f32>(hit_local, 1.0)).xyz;
+    let local_normal = gradient_normal(hit_local);
+    let normal = normalize((params.entity_world * vec4<f32>(local_normal, 0.0)).xyz);
 
     // Pack material/color into the same G-buffer format octree_march
     // uses — see that shader for the layout. Secondary material is
@@ -422,7 +453,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                  | ((params.object_id & 0xFFu) << 8u)
                  | (color_rgb565 << 16u);
 
-    textureStore(gbuf_position, coord, vec4<f32>(hit_pos, t));
+    // `t` is in local-space units; the G-buffer's depth slot expects
+    // a world-space distance along the ray so downstream passes (fog,
+    // SSAO, etc.) stay comparable with voxel hits. Dividing by
+    // `local_scale` undoes the inverse_world's scale contribution.
+    let world_t = select(t / local_scale, t, local_scale < 1e-8);
+    textureStore(gbuf_position, coord, vec4<f32>(hit_pos, world_t));
     textureStore(gbuf_normal,   coord, vec4<f32>(normal, 1.0));
     textureStore(gbuf_material, coord, vec4<u32>(packed_r, packed_g, 0u, 0u));
 }

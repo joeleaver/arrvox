@@ -898,9 +898,59 @@ impl EngineState {
                 .and_then(|entity| self.entity_scene_ids.get(&entity).copied())
                 .unwrap_or(0);
 
+            // World transform of the previewed procedural entity. The
+            // raymarch shader uses this to pin the tree at the entity's
+            // world position (matching what the voxel path does via the
+            // octree's per-object inverse_world); without it, moving the
+            // entity with the MAIN gizmo shifts the BUILD preview off
+            // the camera.
+            let proc_entity_world = vp_preview_entity
+                .and_then(|uuid| {
+                    self.entity_uuids
+                        .iter()
+                        .find_map(|(e, u)| (*u == uuid).then_some(*e))
+                })
+                .and_then(|entity| {
+                    self.world
+                        .get::<&crate::components::Transform>(entity)
+                        .ok()
+                        .map(|xf| {
+                            glam::Affine3A::from_scale_rotation_translation(
+                                xf.scale,
+                                glam::Quat::from_euler(
+                                    glam::EulerRot::XYZ,
+                                    xf.rotation.x.to_radians(),
+                                    xf.rotation.y.to_radians(),
+                                    xf.rotation.z.to_radians(),
+                                ),
+                                xf.position,
+                            )
+                        })
+                })
+                .unwrap_or(glam::Affine3A::IDENTITY);
+
             let vr = self.viewport_renderers
                 .get_mut(&viewport_id)
                 .expect("viewport renderer must exist");
+
+            // Pin the BUILD grid under the previewed entity. Without
+            // this, moving the entity in world-space Y (or X/Z, though
+            // that was less obvious thanks to the camera-follow) leaves
+            // the grid at world y=0 while the camera orbits around the
+            // entity's actual position — the object ends up floating
+            // relative to the grid. The grid plane following the entity
+            // keeps the "studio floor" always under the object. MAIN
+            // stays at its default (world origin) so scene-wide layout
+            // stays legible there.
+            if viewport_id == crate::viewport::ViewportId::BUILD {
+                let p = proc_entity_world.translation;
+                let grid_params = rkp_render::rkp_grid::GridParams {
+                    plane_origin: [p.x, p.y, p.z, 0.0],
+                    ..Default::default()
+                };
+                vr.grid.update_params(&self.queue, &grid_params);
+            }
+
             if matches!(vp_preview_mode, rkp_render::BuildPreviewMode::Raymarch) {
                 // Log on transitions / interesting changes so we can
                 // tell from stderr whether the pass is wired up
@@ -927,6 +977,7 @@ impl EngineState {
                     &self.queue,
                     proc_instructions.len() as u32,
                     proc_object_id + 1,
+                    proc_entity_world,
                 );
                 // Push the currently-selected procedural NodeId to the
                 // outline overlay. Sentinel (`u32::MAX`) when nothing

@@ -19,6 +19,15 @@ pub struct GridParams {
     /// the host can share one bind group across both modes if needed.
     pub enabled: u32,
     pub _pad0: [u32; 2],
+    /// World-space origin for the grid plane. `xyz` = (x, y, z) of
+    /// the grid's "zero" point; lines are drawn at `hit.xz - plane.xz`
+    /// on the plane `y = plane.y`. Default `(0, 0, 0)` keeps the
+    /// classic world-origin grid; the build viewport overrides this
+    /// with the previewed entity's world position so the grid always
+    /// sits under the object and the red/blue origin axes cross
+    /// through it, no matter where the object has been moved in the
+    /// scene. `w` is padding (vec4 alignment).
+    pub plane_origin: [f32; 4],
 }
 
 impl Default for GridParams {
@@ -27,6 +36,7 @@ impl Default for GridParams {
             fade_distance: 50.0,
             enabled: 1,
             _pad0: [0; 2],
+            plane_origin: [0.0; 4],
         }
     }
 }

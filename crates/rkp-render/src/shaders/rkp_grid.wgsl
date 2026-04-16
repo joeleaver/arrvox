@@ -24,6 +24,11 @@ struct GridParams {
     fade_distance: f32,
     enabled: u32,
     _pad0: vec2<u32>,
+    /// World-space origin for the grid. Plane sits at `y = plane_origin.y`;
+    /// X/Z grid lines and origin axes are measured relative to
+    /// `plane_origin.xz`. Default `(0, 0, 0)` = classic world-axis grid.
+    /// The build viewport sets this to the previewed entity's position.
+    plane_origin: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
@@ -81,12 +86,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if abs(denom) < 1e-4 {
         return vec4<f32>(0.0);
     }
-    let t = -ray_origin.y / denom;
+    let plane_y = params.plane_origin.y;
+    let t = (plane_y - ray_origin.y) / denom;
     if t <= 0.0 {
         return vec4<f32>(0.0);
     }
 
     let hit = ray_origin + ray_dir * t;
+    // Grid coords relative to `plane_origin` so the lines (and the
+    // red/blue origin axes) always run under the origin, no matter
+    // where the build viewport has placed it.
+    let rel_x = hit.x - params.plane_origin.x;
+    let rel_z = hit.z - params.plane_origin.z;
 
     // Z-test: only paint where the floor-plane hit is closer than the
     // gbuffer surface distance. `pos.w` is the surface t; >= 9999 = miss.
@@ -100,19 +111,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let view_dist = length(hit - ray_origin);
     let pixel_size = view_dist * 2.0 * length(camera.up.xyz) / camera.resolution.y;
 
-    let major_x = grid_line(hit.x, MAJOR_SPACING, pixel_size, 1.5);
-    let major_z = grid_line(hit.z, MAJOR_SPACING, pixel_size, 1.5);
-    let minor_x = grid_line(hit.x, MINOR_SPACING, pixel_size, 1.0);
-    let minor_z = grid_line(hit.z, MINOR_SPACING, pixel_size, 1.0);
+    let major_x = grid_line(rel_x, MAJOR_SPACING, pixel_size, 1.5);
+    let major_z = grid_line(rel_z, MAJOR_SPACING, pixel_size, 1.5);
+    let minor_x = grid_line(rel_x, MINOR_SPACING, pixel_size, 1.0);
+    let minor_z = grid_line(rel_z, MINOR_SPACING, pixel_size, 1.0);
 
     let major = max(major_x, major_z);
     let minor = max(minor_x, minor_z);
     let minor_only = minor * (1.0 - major);
 
     // Origin axes — wider, colored. `1e9` spacing collapses to "any
-    // distance from 0", giving a single line at z=0 (axis_x) and x=0.
-    let axis_x = grid_line(hit.z, 1e9, pixel_size, 2.0);
-    let axis_z = grid_line(hit.x, 1e9, pixel_size, 2.0);
+    // distance from 0", giving a single line at rel_z=0 (axis_x) and
+    // rel_x=0 — relative to `plane_origin`.
+    let axis_x = grid_line(rel_z, 1e9, pixel_size, 2.0);
+    let axis_z = grid_line(rel_x, 1e9, pixel_size, 2.0);
 
     let fade = 1.0 - smoothstep(params.fade_distance * 0.6,
                                 params.fade_distance, view_dist);
