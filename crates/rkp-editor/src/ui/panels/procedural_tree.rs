@@ -210,6 +210,10 @@ fn add_menu_item(
     opened: Signal<bool>,
     cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
 ) -> Node {
+    // Note: `{kind}` (plain variable in expression position) doesn't
+    // render as visible text in a `DropdownMenuItem` child — only
+    // literal string children or closures take the text-node codegen
+    // path. Using `{move || kind}` forces the closure path.
     rsx! {
         DropdownMenuItem {
             left_section: icon,
@@ -220,7 +224,7 @@ fn add_menu_item(
                 });
                 opened.set(false);
             },
-            {kind}
+            {move || kind}
         }
     }
 }
