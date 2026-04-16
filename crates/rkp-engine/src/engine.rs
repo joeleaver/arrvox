@@ -909,6 +909,43 @@ impl EngineState {
                     None => rkp_render::proc_outline::OutlineParams::NONE,
                 };
                 vr.proc_outline.update_params(&self.queue, &outline_params);
+
+                // Ghost overlay: when the selected node is a Subtract/
+                // Intersect combinator or an operand of one, filter the
+                // already-flattened instruction stream down to the
+                // ghost-candidate primitives and upload them. When
+                // there's no CSG context to visualize, pushes a zero-
+                // length stream which the ghost shader early-outs on.
+                let ghost_ids = vp_preview_entity.and_then(|uuid| {
+                    let entity = self.entity_uuids.iter().find_map(
+                        |(e, u)| (*u == uuid).then_some(*e),
+                    )?;
+                    let proc_geo = self.world
+                        .get::<&crate::components::ProceduralGeometry>(entity).ok()?;
+                    let sel = self.selected_procedural_node?;
+                    Some(collect_ghost_primitives(
+                        &proc_geo.tree, rkp_procedural::NodeId(sel),
+                    ))
+                }).unwrap_or_default();
+                let ghost_set: std::collections::HashSet<u32> = ghost_ids.into_iter().collect();
+                let ghost_instructions: Vec<rkp_procedural::ProcInstruction> =
+                    proc_instructions.iter()
+                        .filter(|ins| ghost_set.contains(&ins.node_id))
+                        .copied()
+                        .collect();
+                vr.proc_ghost.upload_instructions(
+                    &self.device, &self.queue, &ghost_instructions,
+                );
+                vr.proc_ghost.update_params(
+                    &self.queue,
+                    &rkp_render::proc_ghost::GhostParams::new(
+                        ghost_instructions.len() as u32,
+                        // Cool translucent cyan — distinct from the
+                        // outline's warm orange so combined visuals
+                        // don't muddle when a ghost is also selected.
+                        [0.25, 0.7, 1.0, 0.35],
+                    ),
+                );
             }
             self.renderer.render_to(
                 &mut encoder, &self.queue, vr,
@@ -4504,6 +4541,90 @@ impl EngineState {
 /// (and leaves `out_path` empty) if `target` isn't reachable from
 /// `start` — a possible state if the snapshot a caller is holding has
 /// drifted from the current tree.
+/// Which primitive NodeIds to ghost-render given the currently-selected
+/// tree node. Returns primitive (leaf) NodeIds only — combinators
+/// collapse to their descendant primitives. Empty return = no ghost
+/// overlay this frame.
+///
+/// Rules (matches the design call-out in the UI discussion):
+///   - Selected = `Subtract` combinator → ghost every child except
+///     the first. The first child is the minuend; subsequent children
+///     are the cutters. Users want to see cutters, not the subject.
+///   - Selected = `Intersect` combinator → ghost every child. All
+///     operands constrain each other equally; seeing them all is
+///     what makes "where does the intersection live" legible.
+///   - Selected = non-primary child of a `Subtract` → ghost just the
+///     selected subtree. The user is probably editing a cutter;
+///     keeping other cutters visible would be noisy.
+///   - Selected = any child of an `Intersect` → ghost just the
+///     selected subtree, for the same reason.
+///   - Anything else (primary child of Subtract, child of Union, a
+///     combinator's leaf primitive in a Union chain) → no ghosts.
+///     The shape is already fully visible in the main raymarch.
+fn collect_ghost_primitives(
+    tree: &rkp_procedural::ProceduralObject,
+    selected: rkp_procedural::NodeId,
+) -> Vec<u32> {
+    use rkp_procedural::NodeKind;
+
+    let Some(node) = tree.get(selected) else { return Vec::new() };
+
+    let mut out = Vec::new();
+    let mut emit_subtree = |root, out: &mut Vec<u32>| {
+        collect_primitive_ids_rec(tree, root, out);
+    };
+
+    match &node.kind {
+        NodeKind::Subtract => {
+            // Skip the first (minuend), ghost all cutters.
+            for &c in node.children.iter().skip(1) {
+                emit_subtree(c, &mut out);
+            }
+        }
+        NodeKind::Intersect { .. } => {
+            for &c in node.children.iter() {
+                emit_subtree(c, &mut out);
+            }
+        }
+        _ => {
+            // Selected is a non-combinator (or a non-cutter-role
+            // combinator like Union). Ghost only if the parent is
+            // Subtract/Intersect and we're in a cutter/operand role.
+            let Some(parent_id) = node.parent else { return Vec::new() };
+            let Some(parent) = tree.get(parent_id) else { return Vec::new() };
+            match &parent.kind {
+                NodeKind::Subtract => {
+                    let is_primary = parent.children.first() == Some(&selected);
+                    if !is_primary {
+                        emit_subtree(selected, &mut out);
+                    }
+                }
+                NodeKind::Intersect { .. } => {
+                    emit_subtree(selected, &mut out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    out
+}
+
+fn collect_primitive_ids_rec(
+    tree: &rkp_procedural::ProceduralObject,
+    id: rkp_procedural::NodeId,
+    out: &mut Vec<u32>,
+) {
+    let Some(node) = tree.get(id) else { return };
+    if node.kind.is_leaf() {
+        out.push(id.0);
+        return;
+    }
+    for &c in &node.children {
+        collect_primitive_ids_rec(tree, c, out);
+    }
+}
+
 fn find_path(
     tree: &rkp_procedural::ProceduralObject,
     start: rkp_procedural::NodeId,

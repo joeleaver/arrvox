@@ -39,6 +39,8 @@ pub mod viewport_renderer;
 pub mod proc_raymarch;
 /// Selected-primitive outline overlay for the raymarch preview.
 pub mod proc_outline;
+/// Ghost-cutter overlay for Subtract/Intersect preview visualization.
+pub mod proc_ghost;
 
 pub use voxelize_opacity::import_mesh_to_opacity_rkp;
 pub use octree_gpu::OctreeGpu;

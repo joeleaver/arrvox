@@ -18,6 +18,7 @@ use crate::rkp_scene::{CameraUniforms, RkpScene};
 use crate::octree_march::OctreeMarchPass;
 use crate::proc_raymarch::ProcRaymarchPass;
 use crate::proc_outline::ProcOutlinePass;
+use crate::proc_ghost::ProcGhostPass;
 use crate::rkp_shadow_trace::ShadowTracePass;
 use crate::rkp_ssao::RkpSsaoPass;
 use crate::rkp_shade::RkpShadePass;
@@ -49,6 +50,11 @@ pub struct ViewportRenderer {
     /// when the viewport is in raymarch mode — voxel mode doesn't
     /// carry per-primitive NodeIds in the same G-buffer slot.
     pub proc_outline: ProcOutlinePass,
+    /// Ghost-cutter overlay — shows Subtract/Intersect operands even
+    /// where they've been carved away. No G-buffer input; runs its
+    /// own small raymarch over a filtered subset of primitives the
+    /// host selects based on the current tree selection.
+    pub proc_ghost: ProcGhostPass,
     pub shadow_trace: ShadowTracePass,
     pub ssao: RkpSsaoPass,
     pub shade: RkpShadePass,
@@ -120,6 +126,9 @@ impl ViewportRenderer {
         // Outline overlay — rebind the material gbuffer view on resize.
         let mut proc_outline = ProcOutlinePass::new(device, rkf_render::LDR_FORMAT);
         proc_outline.set_gbuffer(device, &gbuffer.material_view);
+
+        let mut proc_ghost = ProcGhostPass::new(device, rkf_render::LDR_FORMAT);
+        proc_ghost.set_camera(device, &camera_buffer);
 
         let mut ssao = RkpSsaoPass::new(device, queue, width, height);
         ssao.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view);
@@ -193,7 +202,7 @@ impl ViewportRenderer {
 
         Self {
             camera_buffer, scene_bind_group, scene_epoch, lights_materials_epoch,
-            march, proc_raymarch, proc_outline,
+            march, proc_raymarch, proc_outline, proc_ghost,
             shadow_trace, ssao, shade, volumetric, god_rays,
             gbuffer, bloom, bloom_composite, tone_map,
             composite_texture, composite_view,

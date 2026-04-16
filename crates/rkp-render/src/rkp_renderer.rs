@@ -320,6 +320,13 @@ impl RkpRenderer {
             let q = self.profiler.begin_query("proc_outline", encoder);
             viewport.proc_outline.draw(encoder, &viewport.composite_view);
             self.profiler.end_query(encoder, q);
+
+            // Ghost cutters, drawn after the outline so the outline's
+            // thin opaque band still wins at the silhouette; ghosts
+            // fill-in the carved-away volume behind it.
+            let q = self.profiler.begin_query("proc_ghost", encoder);
+            viewport.proc_ghost.draw(encoder, &viewport.composite_view);
+            self.profiler.end_query(encoder, q);
         }
     }
 
