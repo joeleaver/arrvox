@@ -237,6 +237,14 @@ fn ModelPropertiesSection() -> NodeHandle {
 #[component]
 fn ModelPropertiesForm(info: rkp_engine::ModelInfo) -> NodeHandle {
     let cmd_tx: CmdSignal = Signal::new(use_context::<CommandSender>().0);
+    let store = use_context::<EditorStore>();
+    // Project-relative source path for the header subtitle. Kept as
+    // a Memo so it updates when the project root signal changes on
+    // project load/switch.
+    let display_source_path = Memo::new({
+        let sp = info.source_path.clone();
+        move || crate::ui::path_display::display_rel_path(&sp, &store.project_dir.get())
+    });
 
     rsx! {
         div {
@@ -264,7 +272,7 @@ fn ModelPropertiesForm(info: rkp_engine::ModelInfo) -> NodeHandle {
                     div {
                         style: "font-size:10px;color:#666;overflow:hidden;\
                                 text-overflow:ellipsis;white-space:nowrap;",
-                        {info.source_path.clone()}
+                        {|| display_source_path.get()}
                     }
                 }
                 div {
@@ -404,43 +412,17 @@ fn model_import_fields(
 /// message + a filled bar when the stage reports a `done/total`.
 /// Falls back to an indeterminate spinner when the stage is running
 /// but total isn't known (e.g. during `load_mesh`).
+///
+/// Every dynamic value is read inside a `{|| ...}` closure so rinch
+/// registers a reactive dependency on `progress` — without that wrap
+/// the node's text/width freeze on the value present at first render
+/// (which for the common "Starting…" case means the user sees the
+/// placeholder for the entire import). Rule 2 in the rinch guide.
 fn render_import_progress(
     __scope: &mut rinch::core::dom::RenderScope,
     progress: Memo<Option<rkp_engine::snapshot::ImportProgressInfo>>,
 ) -> rinch::core::dom::NodeHandle {
-    let p = progress.get();
-    let message = p
-        .as_ref()
-        .map(|p| p.message.clone())
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| "Starting…".into());
-    let (done, total) = p.as_ref().map(|p| (p.done, p.total)).unwrap_or((0, 0));
-    let warn_count = p.as_ref().map(|p| p.warnings.len()).unwrap_or(0);
-
-    let pct = if total > 0 {
-        (done as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
-    } else {
-        0.0
-    };
-    let bar_style = format!(
-        "height:100%;width:{pct:.1}%;background:#4a90e2;transition:width 120ms ease-out;"
-    );
-    let bar_outer_style = if total > 0 {
-        "width:100%;height:4px;background:#1e1e1e;border-radius:2px;overflow:hidden;".to_string()
-    } else {
-        "display:none;".to_string()
-    };
-    let warn_style = if warn_count > 0 {
-        "color:#e2a04a;font-size:10px;".to_string()
-    } else {
-        "display:none;".to_string()
-    };
-    let warn_text = if warn_count > 0 {
-        format!("{warn_count} warning{}", if warn_count == 1 { "" } else { "s" })
-    } else {
-        String::new()
-    };
-
+    let store = use_context::<EditorStore>();
     rsx! {
         div {
             style: "display:flex;flex-direction:column;gap:4px;padding:6px 12px;\
@@ -449,15 +431,78 @@ fn render_import_progress(
             div {
                 style: "display:flex;align-items:center;gap:8px;",
                 Loader { r#type: "oval", size: "xs", color: "blue" }
-                {message}
+                {|| {
+                    // Strip the project-root prefix from any absolute
+                    // path the `rkp-import` stage message embeds
+                    // (e.g. `Loading mesh: /.../assets/bunny.obj`).
+                    // Done at render time because project_dir is a
+                    // main-thread signal.
+                    let root = store.project_dir.get();
+                    progress
+                        .get()
+                        .as_ref()
+                        .map(|p| crate::ui::path_display::relativize_paths_in_text(&p.message, &root))
+                        .filter(|m| !m.is_empty())
+                        .unwrap_or_else(|| "Starting…".into())
+                }}
             }
             div {
-                style: bar_outer_style,
-                div { style: bar_style }
+                style: {|| {
+                    let total = progress.get().as_ref().map(|p| p.total).unwrap_or(0);
+                    if total > 0 {
+                        "width:100%;height:4px;background:#1e1e1e;\
+                         border-radius:2px;overflow:hidden;".to_string()
+                    } else {
+                        "display:none;".to_string()
+                    }
+                }},
+                div {
+                    style: {|| {
+                        let (done, total) = progress
+                            .get()
+                            .as_ref()
+                            .map(|p| (p.done, p.total))
+                            .unwrap_or((0, 0));
+                        let pct = if total > 0 {
+                            (done as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
+                        } else {
+                            0.0
+                        };
+                        format!(
+                            "height:100%;width:{pct:.1}%;background:#4a90e2;\
+                             transition:width 120ms ease-out;"
+                        )
+                    }}
+                }
             }
             div {
-                style: warn_style,
-                {warn_text}
+                style: {|| {
+                    let warn_count = progress
+                        .get()
+                        .as_ref()
+                        .map(|p| p.warnings.len())
+                        .unwrap_or(0);
+                    if warn_count > 0 {
+                        "color:#e2a04a;font-size:10px;".to_string()
+                    } else {
+                        "display:none;".to_string()
+                    }
+                }},
+                {|| {
+                    let warn_count = progress
+                        .get()
+                        .as_ref()
+                        .map(|p| p.warnings.len())
+                        .unwrap_or(0);
+                    if warn_count > 0 {
+                        format!(
+                            "{warn_count} warning{}",
+                            if warn_count == 1 { "" } else { "s" }
+                        )
+                    } else {
+                        String::new()
+                    }
+                }}
             }
         }
     }

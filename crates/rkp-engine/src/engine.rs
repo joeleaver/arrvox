@@ -3480,6 +3480,18 @@ impl EngineState {
             None
         };
 
+        // Ride the same `project_dirty` flag — project_dir changes
+        // exactly when project_loaded / project_name do.
+        let project_dir = if project.is_some() {
+            Some(
+                self.project_dir
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+            )
+        } else {
+            None
+        };
+
         let models = if self.models_dirty {
             self.models_dirty = false;
             Some(self.available_models.clone())
@@ -3516,6 +3528,7 @@ impl EngineState {
             objects,
             project_loaded: project,
             project_name,
+            project_dir,
             available_models: models,
             importing_models: importing,
             import_progress,

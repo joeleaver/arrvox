@@ -58,6 +58,13 @@ pub struct StateUpdate {
     pub project_loaded: Option<bool>,
     /// Project name — only sent when it changes.
     pub project_name: Option<String>,
+    /// Project root directory as an absolute path string — only sent
+    /// when it changes (project open / close). The UI uses this to
+    /// strip the prefix from displayed paths so users see
+    /// `assets/bunny.obj` instead of `/home/joe/dev/rkipatch/assets/bunny.obj`.
+    /// Outer `Option` = "this tick carries a project_dir update";
+    /// inner `Option` = "is a project loaded" (None on close).
+    pub project_dir: Option<Option<String>>,
     /// Available model files — only sent when the list changes.
     pub available_models: Option<Vec<ModelInfo>>,
     /// Source paths currently being re-imported. Sent whenever the set

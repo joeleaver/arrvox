@@ -81,6 +81,11 @@ pub struct EditorStore {
     pub recent_projects: Signal<Vec<RecentProject>>,
     /// Current project name.
     pub project_name: Signal<String>,
+    /// Absolute path of the current project root, used by UI display
+    /// helpers to strip the prefix from absolute paths shown in the
+    /// UI (so users see `assets/bunny.obj` not the full system path).
+    /// Empty when no project is loaded.
+    pub project_dir: Signal<String>,
     /// Available .rkp model files.
     pub available_models: Signal<Vec<ModelInfo>>,
     /// Source paths currently being re-imported on the engine thread.
@@ -195,6 +200,7 @@ impl EditorStore {
             project_loaded: Signal::new(false),
             recent_projects: Signal::new(Vec::new()),
             project_name: Signal::new(String::new()),
+            project_dir: Signal::new(String::new()),
             available_models: Signal::new(Vec::new()),
             importing_models: Signal::new(Vec::new()),
             import_progress: Signal::new(Vec::new()),

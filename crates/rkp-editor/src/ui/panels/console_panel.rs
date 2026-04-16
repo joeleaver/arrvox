@@ -107,11 +107,22 @@ fn log_entry_row(
     show_warn: Signal<bool>,
     show_error: Signal<bool>,
 ) -> rinch::core::dom::NodeHandle {
+    let store = use_context::<crate::ui::store::EditorStore>();
     // Filter check — use initial values since entry is static once created.
     let level = entry.level;
     let visible = Signal::new(true);
     let timestamp = entry.timestamp;
     let message = entry.message.clone();
+    // Stripped-for-display version — recomputes when `project_dir`
+    // changes (e.g. opening a different project) without re-running
+    // the whole row.
+    let display_message = Memo::new({
+        let message = message.clone();
+        move || crate::ui::path_display::relativize_paths_in_text(
+            &message,
+            &store.project_dir.get(),
+        )
+    });
 
     let (dot_color, text_color) = match level {
         LogLevel::Info => ("#4fc3f7", "#bbb"),
@@ -155,10 +166,12 @@ fn log_entry_row(
                 )},
             }
 
-            // Message
+            // Message — strip the project-root prefix from any
+            // absolute paths embedded in the log line so users see
+            // `assets/bunny.obj` not `/home/joe/.../assets/bunny.obj`.
             span {
                 style: "flex:1;white-space:pre-wrap;word-break:break-word;",
-                {message}
+                {|| display_message.get()}
             }
         }
     }
