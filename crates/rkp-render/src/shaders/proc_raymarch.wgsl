@@ -83,6 +83,13 @@ struct ProcInstruction {
     arity: u32,
     material_combine: u32,
     material_id: u32,
+    // `node_id` is the source NodeId the primitive came from, used for
+    // per-primitive picking; `u32::MAX` on combinators. The three
+    // `_pad` fields keep the CPU struct 16-byte aligned for vec4 loads.
+    node_id: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
     // vec4s chosen for WGSL alignment (8 floats → two vec4s).
     params_lo: vec4<f32>,
     params_hi: vec4<f32>,
@@ -99,6 +106,10 @@ struct TreeSample {
     distance: f32,
     material_id: u32,
     color: vec3<f32>,
+    // Source primitive's NodeId — used so the G-buffer can tell the
+    // pick path "which primitive was hit." Propagated through
+    // combinators by picking the winner's id (same rule as material).
+    node_id: u32,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
@@ -182,6 +193,7 @@ fn eval_primitive(ins: ProcInstruction, world_pos: vec3<f32>) -> TreeSample {
     s.distance = d;
     s.material_id = ins.material_id;
     s.color = ins.color.xyz;
+    s.node_id = ins.node_id;
     return s;
 }
 
@@ -199,14 +211,8 @@ fn blended_union_sample(a: TreeSample, b: TreeSample, radius: f32) -> TreeSample
     let diff = abs(a.distance - b.distance);
     let r = max(radius, 1e-6);
     if (diff >= r) {
-        if (a.distance <= b.distance) {
-            var s: TreeSample;
-            s.distance = distance; s.material_id = a.material_id; s.color = a.color;
-            return s;
-        }
-        var s: TreeSample;
-        s.distance = distance; s.material_id = b.material_id; s.color = b.color;
-        return s;
+        if (a.distance <= b.distance) { return a; }
+        return b;
     }
     // t=0 → fully b, t=1 → fully a (matches combine.rs's convention).
     let t = 0.5 + 0.5 * (b.distance - a.distance) / r;
@@ -215,6 +221,7 @@ fn blended_union_sample(a: TreeSample, b: TreeSample, radius: f32) -> TreeSample
     s.distance = distance;
     s.material_id = select(b.material_id, a.material_id, winner_is_a);
     s.color = mix(b.color, a.color, t);
+    s.node_id = select(b.node_id, a.node_id, winner_is_a);
     return s;
 }
 
@@ -238,8 +245,8 @@ fn combine_intersect(a: TreeSample, b: TreeSample) -> TreeSample {
 }
 
 fn combine_subtract(a: TreeSample, b: TreeSample) -> TreeSample {
-    // Subtract: max(a, -b). Material from `a` (the minuend) always —
-    // cutters don't contribute material. Matches `combine_subtract`.
+    // Subtract: max(a, -b). Material (and picking source) always from
+    // `a` — cutters don't contribute geometry you can click on.
     let neg_b = -b.distance;
     if (a.distance >= neg_b) {
         return a;
@@ -248,6 +255,7 @@ fn combine_subtract(a: TreeSample, b: TreeSample) -> TreeSample {
     r.distance = neg_b;
     r.material_id = a.material_id;
     r.color = a.color;
+    r.node_id = a.node_id;
     return r;
 }
 
@@ -297,6 +305,7 @@ fn eval_tree(world_pos: vec3<f32>) -> TreeSample {
         miss.distance = 1e30;
         miss.material_id = 0u;
         miss.color = vec3<f32>(0.0);
+        miss.node_id = 0xFFFFFFFFu;
         return miss;
     }
     return stack[sp - 1u];
@@ -388,17 +397,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let normal = gradient_normal(hit_pos);
 
     // Pack material/color into the same G-buffer format octree_march
-    // uses — see that shader for the layout. Blend is always 0 here
-    // (we don't produce secondary materials in this preview path).
+    // uses — see that shader for the layout. Secondary material is
+    // repurposed in this shader to carry the hit primitive's NodeId
+    // (capped at 16 bits, same field width secondary_material normally
+    // occupies): shade doesn't read the secondary slot, and the pick
+    // readback wants a stable place to land. Combinators keep
+    // `u32::MAX`, which fits in 16 bits as `0xFFFFu` — the pick path
+    // treats that sentinel as "no primitive."
+    //
+    // Blend is always 0 here (dual-material output isn't wired through
+    // the raymarch path); object_id byte is the owning entity's
+    // scene_id so it still resolves via the same pick-readback table
+    // on MAIN if we ever enable this on that viewport.
     let primary = hit_sample.material_id & 0xFFFFu;
-    let secondary = 0u;
+    let primitive_node_id = hit_sample.node_id & 0xFFFFu;
     let blend = 0u;
     let cr = u32(clamp(hit_sample.color.r, 0.0, 1.0) * 31.0);
     let cg = u32(clamp(hit_sample.color.g, 0.0, 1.0) * 63.0);
     let cb = u32(clamp(hit_sample.color.b, 0.0, 1.0) * 31.0);
     let color_rgb565 = cr | (cg << 5u) | (cb << 11u);
 
-    let packed_r = primary | (secondary << 16u);
+    let packed_r = primary | (primitive_node_id << 16u);
     let packed_g = (blend & 0xFFu)
                  | ((params.object_id & 0xFFu) << 8u)
                  | (color_rgb565 << 16u);

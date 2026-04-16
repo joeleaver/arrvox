@@ -239,6 +239,20 @@ pub fn BuildViewport() -> NodeHandle {
                     button: map_btn(button),
                     pressed: true,
                 });
+                // Left click → pick. In raymarch preview mode the
+                // engine decodes the hit pixel as a procedural
+                // NodeId; in voxel mode the pick is a no-op on the
+                // build viewport (there's only the one selected
+                // procedural entity to "pick" and it's already
+                // selected). Sent unconditionally to keep the event
+                // path simple; the engine filters on preview_mode.
+                if button == SurfaceMouseButton::Left {
+                    let _ = cmd_tx.send(rkp_engine::EngineCommand::Pick {
+                        id: PANEL_VIEWPORT,
+                        x: x as u32,
+                        y: y as u32,
+                    });
+                }
             }
             MouseUp { button, .. } => {
                 orbiting.set(false);

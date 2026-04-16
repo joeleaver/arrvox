@@ -68,6 +68,17 @@ pub struct ProcInstruction {
     /// Primitive material id (16-bit); padded to u32.
     pub material_id: u32,
 
+    /// Source tree NodeId for this primitive, used by the build
+    /// viewport's pick path to translate a hit pixel back to the
+    /// clicked primitive. `u32::MAX` for combinators. Capped to 16
+    /// bits when packed into the G-buffer (see `proc_raymarch.wgsl`);
+    /// that supports 65k distinct primitives per procedural, well
+    /// past where the raymarch is cost-effective.
+    pub node_id: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+
     /// Primitive local-space params, unioned across shapes. Layout per
     /// opcode (components noted; unused entries are zero):
     ///
@@ -140,6 +151,7 @@ fn emit(
     match &node.kind {
         NodeKind::Sphere(p) => emit_primitive(
             OpKind::Sphere,
+            id,
             [p.radius, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             p.material_id,
             p.color,
@@ -148,6 +160,7 @@ fn emit(
         ),
         NodeKind::Box(p) => emit_primitive(
             OpKind::Box,
+            id,
             [p.half_extents.x, p.half_extents.y, p.half_extents.z, p.rounding, 0.0, 0.0, 0.0, 0.0],
             p.material_id,
             p.color,
@@ -156,6 +169,7 @@ fn emit(
         ),
         NodeKind::Capsule(p) => emit_primitive(
             OpKind::Capsule,
+            id,
             [p.radius, p.half_height, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             p.material_id,
             p.color,
@@ -164,6 +178,7 @@ fn emit(
         ),
         NodeKind::Cylinder(p) => emit_primitive(
             OpKind::Cylinder,
+            id,
             [p.radius, p.half_height, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             p.material_id,
             p.color,
@@ -172,6 +187,7 @@ fn emit(
         ),
         NodeKind::Torus(p) => emit_primitive(
             OpKind::Torus,
+            id,
             [p.major_radius, p.minor_radius, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             p.material_id,
             p.color,
@@ -180,6 +196,7 @@ fn emit(
         ),
         NodeKind::Plane(p) => emit_primitive(
             OpKind::Plane,
+            id,
             [0.0; 8],
             p.material_id,
             p.color,
@@ -188,6 +205,7 @@ fn emit(
         ),
         NodeKind::Ramp(p) => emit_primitive(
             OpKind::Ramp,
+            id,
             [p.half_length, p.half_height, p.half_width, 0.0, 0.0, 0.0, 0.0, 0.0],
             p.material_id,
             p.color,
@@ -223,6 +241,8 @@ fn emit(
                 arity: emitted,
                 material_combine: material_combine_bits(*material_combine),
                 material_id: 0,
+                node_id: u32::MAX,
+                _pad0: 0, _pad1: 0, _pad2: 0,
                 params,
                 color: [0.0; 4],
                 inverse_world: Mat4::IDENTITY.to_cols_array_2d(),
@@ -252,6 +272,8 @@ fn emit(
                     arity: emitted,
                     material_combine: 0,
                     material_id: 0,
+                    node_id: u32::MAX,
+                    _pad0: 0, _pad1: 0, _pad2: 0,
                     params: [0.0; 8],
                     color: [0.0; 4],
                     inverse_world: Mat4::IDENTITY.to_cols_array_2d(),
@@ -268,6 +290,7 @@ fn emit(
 
 fn emit_primitive(
     op: OpKind,
+    node_id: NodeId,
     params: [f32; 8],
     material_id: u16,
     color: glam::Vec3,
@@ -280,6 +303,10 @@ fn emit_primitive(
         arity: 0,
         material_combine: 0,
         material_id: material_id as u32,
+        node_id: node_id.0,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
         params,
         color: [color.x, color.y, color.z, 0.0],
         inverse_world,

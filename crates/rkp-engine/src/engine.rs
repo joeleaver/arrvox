@@ -184,6 +184,18 @@ impl Default for CameraState {
 
 // ── Internal: engine state ───────────────────────────────────────────
 
+/// A click-pick awaiting a G-buffer readback. The viewport tag
+/// determines interpretation: MAIN resolves to a scene entity; BUILD
+/// resolves to a procedural NodeId (when the build viewport is in
+/// raymarch preview mode — the shader packs the hit primitive's
+/// NodeId into the material G-buffer).
+#[derive(Debug, Clone, Copy)]
+struct PendingPick {
+    viewport: crate::viewport::ViewportId,
+    x: u32,
+    y: u32,
+}
+
 struct EngineState {
     // GPU
     device: wgpu::Device,
@@ -349,7 +361,13 @@ struct EngineState {
 
     // Pick readback (8 bytes for 1 pixel of Rg32Uint material texture)
     pick_readback_buffer: wgpu::Buffer,
-    pending_pick: Option<(u32, u32)>,
+    /// Pending pixel-pick: a (viewport, x, y) issued by a click in the
+    /// corresponding viewport, awaiting a G-buffer readback. The
+    /// viewport tag chooses how to interpret the readback — MAIN
+    /// decodes entity scene_id (old path), BUILD decodes per-primitive
+    /// NodeId when in raymarch mode (new path, enables
+    /// click-to-select-primitive in the build viewport).
+    pending_pick: Option<PendingPick>,
     /// Cached light count for march pass (set in light upload block, used in render).
     num_lights_cache: u32,
     /// Base ShadeParams (recomputed once per frame from environment +
@@ -885,29 +903,33 @@ impl EngineState {
                 vp_preview_mode,
             );
 
-            if viewport_id == ViewportId::MAIN {
-                if let Some((px, py)) = self.pending_pick.take() {
+            // Issue the G-buffer readback from whichever viewport the
+            // pending pick targets. Only one pick is in flight at a time;
+            // the viewport tag + raymarch/voxel mode drives decoding
+            // inside `process_pick_result`.
+            if let Some(pp) = self.pending_pick {
+                if pp.viewport == viewport_id && pp.x < vr.width && pp.y < vr.height {
                     pick_issued = true;
-                    if px < vr.width && py < vr.height {
-                        encoder.copy_texture_to_buffer(
-                            wgpu::TexelCopyTextureInfo {
-                                texture: &vr.gbuffer.material_texture,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d { x: px, y: py, z: 0 },
-                                aspect: wgpu::TextureAspect::All,
+                    encoder.copy_texture_to_buffer(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &vr.gbuffer.material_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d { x: pp.x, y: pp.y, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: &self.pick_readback_buffer,
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(256),
+                                rows_per_image: Some(1),
                             },
-                            wgpu::TexelCopyBufferInfo {
-                                buffer: &self.pick_readback_buffer,
-                                layout: wgpu::TexelCopyBufferLayout {
-                                    offset: 0,
-                                    bytes_per_row: Some(256),
-                                    rows_per_image: Some(1),
-                                },
-                            },
-                            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-                        );
-                    }
+                        },
+                        wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                    );
                 }
+            }
+            if viewport_id == ViewportId::MAIN {
                 let show_editor_overlays = self.viewports
                     .get(ViewportId::MAIN)
                     .map(|v| v.filter.base_layers & crate::viewport::layer::EDITOR_ONLY != 0)
@@ -1663,13 +1685,13 @@ impl EngineState {
             }
 
             EngineCommand::Pick { id, x, y } => {
-                // Phase 3: only MAIN's gbuffer is wired into picking. Other
-                // viewports get their own pick path when multi-viewport
-                // rendering lands.
-                if id == crate::viewport::ViewportId::MAIN
-                    && self.gizmo.hovered_axis == crate::gizmo::GizmoAxis::None
-                {
-                    self.pending_pick = Some((x, y));
+                // Route the pick by viewport — MAIN picks scene entities
+                // (old path), BUILD picks procedural primitives when in
+                // raymarch preview. Either way, don't start a pick while
+                // a transform gizmo is being dragged (the axis would
+                // consume the click first).
+                if self.gizmo.hovered_axis == crate::gizmo::GizmoAxis::None {
+                    self.pending_pick = Some(PendingPick { viewport: id, x, y });
                 }
             }
 
@@ -4277,6 +4299,7 @@ impl EngineState {
     }
 
     fn process_pick_result(&mut self) {
+        let pending = self.pending_pick.take();
         let slice = self.pick_readback_buffer.slice(..256);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -4287,13 +4310,39 @@ impl EngineState {
         if let Ok(Ok(())) = rx.recv() {
             let data = slice.get_mapped_range();
             if data.len() >= 8 {
-                // Material texture (Rg32Uint): R = material ids, G = blend|object_id+1|color.
+                // Material G-buffer (Rg32Uint): R = material ids (+ NodeId in raymarch),
+                //                                G = blend | object_id+1 | color_rgb565.
+                let r_channel = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                 let g_channel = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-                // object_id+1 in bits 8-15. 0 means no geometry.
-                let raw_id = (g_channel >> 8) & 0xFF;
+                let obj_raw = (g_channel >> 8) & 0xFF;
 
-                if raw_id > 0 {
-                    let gpu_idx = (raw_id - 1) as usize;
+                // Dispatch by viewport. BUILD + raymarch decodes the
+                // NodeId from `packed_r`'s upper 16 bits (where the
+                // shader packed it — see proc_raymarch.wgsl). Any
+                // other combination picks a scene entity via the same
+                // scene_id table MAIN has always used.
+                let is_build_raymarch = pending.map(|pp| {
+                    pp.viewport == crate::viewport::ViewportId::BUILD
+                }).unwrap_or(false)
+                    && self.viewports
+                        .get(crate::viewport::ViewportId::BUILD)
+                        .map(|v| matches!(v.preview_mode, rkp_render::BuildPreviewMode::Raymarch))
+                        .unwrap_or(false);
+
+                if is_build_raymarch {
+                    let node_id_16 = (r_channel >> 16) & 0xFFFFu32;
+                    // Shader packs `u32::MAX` for misses/combinators
+                    // as `0xFFFFu` in 16 bits — treat as "no selection"
+                    // and clear any previously-selected node so click-
+                    // on-empty deselects (matches entity-pick behavior
+                    // on MAIN).
+                    if obj_raw > 0 && node_id_16 != 0xFFFFu32 {
+                        self.selected_procedural_node = Some(node_id_16);
+                    } else {
+                        self.selected_procedural_node = None;
+                    }
+                } else if obj_raw > 0 {
+                    let gpu_idx = (obj_raw - 1) as usize;
                     if gpu_idx < self.gpu_to_entity.len() {
                         self.selected_entity = Some(self.gpu_to_entity[gpu_idx]);
                     }
