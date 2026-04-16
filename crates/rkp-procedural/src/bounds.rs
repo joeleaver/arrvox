@@ -72,13 +72,49 @@ fn compute_all_bounds_rec(
         NodeKind::Plane(p) => leaf_plane_bounds(p),
         NodeKind::Ramp(p) => leaf_ramp_bounds(p),
 
-        NodeKind::Union { .. } | NodeKind::Intersect { .. } | NodeKind::Subtract => {
+        NodeKind::Union { .. } => {
             let mut combined = EMPTY_AABB;
             for &child_id in &node.children {
                 let child_aabb = compute_all_bounds_rec(obj, child_id, cache);
                 combined = aabb_union(&combined, &child_aabb);
             }
             combined
+        }
+        NodeKind::Intersect { .. } => {
+            // Intersect's result ⊆ the intersection of its operands,
+            // so use the axis-aligned intersection. Without this, a
+            // Plane inside an Intersect (its AABB spans ±1000m by
+            // default) would balloon the tree bounds, push the
+            // voxelizer to a ~1 m voxel size to fit the 2048-voxel
+            // cap, and subsample the actual geometry to nothing.
+            let mut iter = node.children.iter();
+            let mut combined = match iter.next() {
+                Some(&first) => compute_all_bounds_rec(obj, first, cache),
+                None => EMPTY_AABB,
+            };
+            for &child_id in iter {
+                let child_aabb = compute_all_bounds_rec(obj, child_id, cache);
+                combined = aabb_intersection(&combined, &child_aabb);
+            }
+            // Keep computing (for cache side-effects) over remaining
+            // children even after combined goes empty — above loop
+            // handles that naturally: `aabb_intersection(empty, x) =
+            // empty` and we still recurse into `x` above.
+            combined
+        }
+        NodeKind::Subtract => {
+            // Subtract's result ⊆ the minuend (first child). Cutters
+            // can only carve; their AABBs don't expand the bound.
+            // Still recurse into every child so the per-node cache
+            // is populated — just don't union the cutters in.
+            let mut first_aabb = EMPTY_AABB;
+            for (i, &child_id) in node.children.iter().enumerate() {
+                let child_aabb = compute_all_bounds_rec(obj, child_id, cache);
+                if i == 0 {
+                    first_aabb = child_aabb;
+                }
+            }
+            first_aabb
         }
     };
 
@@ -111,15 +147,35 @@ fn compute_node_bounds(obj: &ProceduralObject, id: NodeId) -> Aabb {
         NodeKind::Plane(p) => leaf_plane_bounds(p),
         NodeKind::Ramp(p) => leaf_ramp_bounds(p),
 
-        // Combinators: union of children's bounds (works for all combinator types
-        // because intersect/subtract can only shrink, so the union is conservative).
-        NodeKind::Union { .. } | NodeKind::Intersect { .. } | NodeKind::Subtract => {
+        NodeKind::Union { .. } => {
             let mut combined = EMPTY_AABB;
             for &child_id in &node.children {
                 let child_aabb = compute_node_bounds(obj, child_id);
                 combined = aabb_union(&combined, &child_aabb);
             }
             combined
+        }
+        NodeKind::Intersect { .. } => {
+            // Axis-aligned intersection of operand AABBs — tighter
+            // than a union, and the key fix for Plane-in-Intersect
+            // trees (see compute_all_bounds_rec for the full why).
+            let mut iter = node.children.iter();
+            let mut combined = match iter.next() {
+                Some(&first) => compute_node_bounds(obj, first),
+                None => EMPTY_AABB,
+            };
+            for &child_id in iter {
+                let child_aabb = compute_node_bounds(obj, child_id);
+                combined = aabb_intersection(&combined, &child_aabb);
+            }
+            combined
+        }
+        NodeKind::Subtract => {
+            // Minuend bounds only; cutters carve but don't expand.
+            node.children
+                .first()
+                .map(|&first| compute_node_bounds(obj, first))
+                .unwrap_or(EMPTY_AABB)
         }
     };
 
@@ -201,6 +257,22 @@ fn aabb_union(a: &Aabb, b: &Aabb) -> Aabb {
         min: a.min.min(b.min),
         max: a.max.max(b.max),
     }
+}
+
+/// Axis-aligned intersection of two AABBs. Returns `EMPTY_AABB` if
+/// they don't overlap (min > max on any axis). An empty input flows
+/// through as empty — intersecting anything with "nothing" gives
+/// nothing.
+fn aabb_intersection(a: &Aabb, b: &Aabb) -> Aabb {
+    if is_empty_aabb(a) || is_empty_aabb(b) {
+        return EMPTY_AABB;
+    }
+    let min = a.min.max(b.min);
+    let max = a.max.min(b.max);
+    if min.x > max.x || min.y > max.y || min.z > max.z {
+        return EMPTY_AABB;
+    }
+    Aabb { min, max }
 }
 
 /// Transform an AABB by an affine transform, producing a new (potentially larger)
@@ -329,6 +401,54 @@ mod tests {
         let aabb = compute_bounds(&obj);
         assert_eq!(aabb.min, Vec3::ZERO);
         assert_eq!(aabb.max, Vec3::ZERO);
+    }
+
+    /// Intersect with a Plane child should produce bounds no larger
+    /// than the tightest non-Plane operand — Plane's raw AABB spans
+    /// ±1000 m but the intersection can't extend past whatever bounds
+    /// the other children impose. This is the fix for a user-visible
+    /// bug where baking an Intersect-with-Plane tree produced nothing
+    /// because the ballooned AABB drove voxel size up past the
+    /// primitives' actual scale.
+    #[test]
+    fn intersect_with_plane_uses_other_operand_bounds() {
+        let mut obj = ProceduralObject::new(NodeKind::Intersect {
+            material_combine: MaterialCombine::Winner,
+        });
+        obj.add_child(
+            obj.root(),
+            NodeKind::Sphere(SphereParams { radius: 1.0, ..Default::default() }),
+        );
+        obj.add_child(obj.root(), NodeKind::Plane(PlaneParams::default()));
+
+        let aabb = compute_bounds(&obj);
+
+        // Max extent along any axis should be bounded by the sphere —
+        // not the plane's 2000-m span. Give 10 m of slack for any
+        // margining the shader/voxelizer might layer on top later.
+        let extent = aabb.max - aabb.min;
+        let max_axis = extent.x.max(extent.y).max(extent.z);
+        assert!(
+            max_axis < 10.0,
+            "Intersect-with-Plane AABB ballooned: extent={extent:?}",
+        );
+    }
+
+    /// Subtract shouldn't expand beyond the minuend — even if a
+    /// cutter's unbounded-ish AABB (Plane) would union past it.
+    #[test]
+    fn subtract_with_plane_cutter_stays_bounded() {
+        let mut obj = ProceduralObject::new(NodeKind::Subtract);
+        obj.add_child(
+            obj.root(),
+            NodeKind::Sphere(SphereParams { radius: 1.0, ..Default::default() }),
+        );
+        obj.add_child(obj.root(), NodeKind::Plane(PlaneParams::default()));
+
+        let aabb = compute_bounds(&obj);
+        let extent = aabb.max - aabb.min;
+        let max_axis = extent.x.max(extent.y).max(extent.z);
+        assert!(max_axis < 10.0, "Subtract-with-Plane ballooned: extent={extent:?}");
     }
 
     #[test]
