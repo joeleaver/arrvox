@@ -236,18 +236,19 @@ fn add_menu_item(
                 {render_tabler_icon(__scope, icon, TablerIconStyle::Outline)}
             }
             span {
-                // Workaround for a rinch bug: when an element is
-                // mounted inside an ancestor that starts
-                // `visibility:hidden` (like `.rinch-popover__dropdown`,
-                // which the popover keeps hidden until opened), text-
-                // node layout measurement yields 0 size and is never
-                // recomputed after the ancestor becomes visible.
-                // Giving the span explicit `width` and `height` bypasses
-                // the text-run measurement path entirely, so it
-                // survives the hidden→visible transition. When the
-                // upstream bug is fixed, these dimensions can go away
-                // in favor of intrinsic sizing.
-                style: "width:80px;height:16px;line-height:16px;\
+                // Workaround for a rinch text-measurement bug
+                // specific to mounting inside a `visibility:hidden`
+                // ancestor (the popover's dropdown wrapper before
+                // it's opened). Confirmed by experiment:
+                //   - Padding-only span: box measures from padding,
+                //     but the text child contributes 0 to content
+                //     size and doesn't paint — shrink-to-fit + text
+                //     measurement is broken in this subtree.
+                //   - Explicit `width` / `height`: text renders.
+                // 80px fits the longest kind name (Intersect, 9 chars
+                // @ 12px). 20px height gives a comfortable click
+                // target and vertically centers the line box.
+                style: "width:80px;height:20px;line-height:20px;\
                         overflow:hidden;text-overflow:ellipsis;\
                         white-space:nowrap;",
                 {kind}
