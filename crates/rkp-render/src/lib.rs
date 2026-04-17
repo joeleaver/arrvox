@@ -39,6 +39,9 @@ pub mod proc_raymarch;
 pub mod proc_outline;
 /// Ghost-cutter overlay for Subtract/Intersect preview visualization.
 pub mod proc_ghost;
+/// GPU evaluator — "sample N positions" compute pipeline shared with the
+/// (Phase 3+) voxel bake path.
+pub mod proc_sample;
 
 pub use octree_gpu::OctreeGpu;
 pub use rkp_scene_manager::{AssetHandle, AssetInfo, ReloadResult, RkpSceneManager};

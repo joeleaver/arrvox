@@ -770,14 +770,22 @@ impl RkpSceneManager {
             }
         };
 
-        let sdf_with_material = |pos: glam::Vec3| -> (f32, u16, u16, u8) {
+        // Batched callback: primitive SDF is CPU-only, so just loop.
+        // `voxelize_octree`'s BFS hands us one call per level plus one
+        // per terminal-geometry phase — the extra Vec allocations are
+        // negligible next to the primitive evaluation cost.
+        let sdf_batch = |positions: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
             // Single-material import path — secondary/blend left at 0,
             // so the shader's dual-material guard short-circuits.
-            (sdf_fn(pos), material_id, 0, 0)
+            // Color = 0 = "no override, use material base color".
+            positions
+                .iter()
+                .map(|p| (sdf_fn(*p), material_id, 0u16, 0u8, 0u32))
+                .collect()
         };
 
         let r = rkp_core::voxelize_octree::voxelize_octree(
-            sdf_with_material, &aabb, voxel_size, &mut self.leaf_attr_pool, &mut self.brick_pool,
+            sdf_batch, &aabb, voxel_size, &mut self.leaf_attr_pool, &mut self.brick_pool,
         )?;
 
         emit_faces(&r.octree, object_id, &mut self.pending_faces);
@@ -807,12 +815,14 @@ impl RkpSceneManager {
 
     /// Voxelize an arbitrary SDF function into the octree.
     ///
-    /// The closure returns `(signed_distance, primary_material,
-    /// secondary_material, blend_weight_u4)`. Negative distance =
-    /// inside. Pass `(secondary = primary, blend = 0)` for single-
-    /// material voxelization; the shader's dual-material lerp is
-    /// guarded behind `blend_weight > 0` so zero-blend voxels render
-    /// identically to the old single-material path.
+    /// The closure takes a batch of positions and returns a parallel
+    /// vec of `(signed_distance, primary_material, secondary_material,
+    /// blend_weight_u4)` — one entry per input. Negative distance =
+    /// inside. Pass `(secondary = 0, blend = 0)` for single-material
+    /// voxelization; the shader's dual-material lerp is guarded behind
+    /// `blend_weight > 0` so zero-blend voxels render identically to
+    /// the old single-material path. The batched shape lets GPU-
+    /// backed evaluators dispatch one compute pass per octree level.
     pub fn voxelize_sdf_fn<F>(
         &mut self,
         sdf_fn: F,
@@ -821,7 +831,7 @@ impl RkpSceneManager {
         object_id: u32,
     ) -> Option<VoxelizeResult>
     where
-        F: Fn(glam::Vec3) -> (f32, u16, u16, u8),
+        F: FnMut(&[glam::Vec3]) -> Vec<(f32, u16, u16, u8, u32)>,
     {
         let r = rkp_core::voxelize_octree::voxelize_octree(
             sdf_fn, aabb, voxel_size, &mut self.leaf_attr_pool, &mut self.brick_pool,

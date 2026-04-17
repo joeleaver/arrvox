@@ -1,37 +1,38 @@
 //! Octree-based surface voxelization from a signed distance field.
 //!
-//! Top-down recursive: at each octree node, sample an SDF at 8 corners +
-//! center to classify the region.
+//! Level-by-level BFS: at each octree depth we classify every active
+//! node's region against the SDF (9 samples — 8 corners + center),
+//! then march the Mixed nodes' children into the next level. Terminal
+//! levels (brick_depth if bricks are enabled, else max_depth) emit
+//! geometry — per-cell center + 6 gradient taps for normals.
+//!
+//! All SDF queries at a given level batch into one call to the
+//! caller's `sdf_fn`, so a GPU-backed callback can dispatch the whole
+//! level in a single compute pass. The algorithm was recursive
+//! previously; the BFS restructure was motivated by eliminating the
+//! dual CPU/GPU procedural math implementation (see the Phase 3
+//! rework: the `sdf_fn` is now the GPU evaluator for procedurals, and
+//! per-point dispatches would have destroyed bake throughput).
 //!
 //! * **EMPTY** if every sample's distance is greater than `extent / 2` —
 //!   the surface can't be inside this node (SDFs are 1-Lipschitz).
 //! * **INTERIOR** if every sample's distance is less than `-extent / 2` —
 //!   the node is strictly inside the solid.
-//! * **MIXED** otherwise. Subdivide until the finest level, then create
-//!   a leaf if the node center lies inside the surface.
+//! * **MIXED** otherwise. Descend, or at the terminal level emit bricks
+//!   / leaves.
 //!
-//! Produces a [`SparseOctree`] with variable-depth leaves. Each leaf carries
-//! a single [`LeafAttr`] directly: a prefiltered surface normal (SDF
-//! gradient) and a material reference. No per-voxel opacity, no voxel_pool
-//! indirection.
+//! Produces a [`SparseOctree`] with variable-depth leaves. Each leaf
+//! carries a single [`LeafAttr`] directly: a prefiltered surface
+//! normal (SDF gradient) and a material reference. No per-voxel
+//! opacity, no voxel_pool indirection.
 //!
 //! The SDF convention matches rkf-core: negative = inside the surface,
 //! positive = outside, zero = on the surface.
-//!
-//! # Relationship to the old opacity pipeline
-//!
-//! Before this refactor the builder took an opacity function and stored a
-//! per-voxel f16 between 0 and 1. The shader skipped anything below 0.05
-//! and broke on the first above-threshold hit for opaque materials, so the
-//! f16 value itself was only used for transparent-material compositing —
-//! which we've now made a per-material property. The opacity field was
-//! vestigial and its fade band generated leaves the shader would then
-//! throw away. This module is the replacement.
 
 use glam::{UVec3, Vec3};
 use rkf_core::Aabb;
 
-use crate::brick_pool::{BrickPool, BRICK_DIM, BRICK_EMPTY, BRICK_LEVELS};
+use crate::brick_pool::{BrickPool, BRICK_DIM, BRICK_LEVELS};
 use crate::leaf_attr::LeafAttr;
 use crate::leaf_attr_pool::LeafAttrPool;
 use crate::sparse_octree::SparseOctree;
@@ -62,12 +63,19 @@ pub struct VoxelizeOctreeResult {
 
 /// Voxelize a signed distance function into a sparse octree.
 ///
-/// `sdf_fn`: returns `(signed_distance, primary_material, secondary_material,
-/// blend_weight_u4)` at a world-space position. Negative distance =
-/// inside the surface. The 1-Lipschitz property of an SDF is what makes
-/// the coarse-level Empty/Interior classifier provably correct — the
+/// `sdf_fn` takes a batch of world-space positions and returns
+/// `(signed_distance, primary_material, secondary_material,
+/// blend_weight_u4)` per position. Negative distance = inside the
+/// surface. The 1-Lipschitz property of an SDF is what makes the
+/// coarse-level Empty/Interior classifier provably correct — the
 /// input should be a true signed distance, not an arbitrary scalar
 /// field that's merely sign-correct.
+///
+/// The batched signature lets GPU-backed evaluators dispatch one
+/// compute pass per octree level (O(depth) dispatches total). A CPU
+/// caller can implement the callback by looping and calling a per-
+/// point function — the overhead from the extra Vec allocation is
+/// negligible next to the SDF evaluation itself.
 ///
 /// `blend_weight_u4` is in `[0, 15]` (the 4-bit range `LeafAttr` can
 /// store). Pass `0` for single-material voxelization — the secondary
@@ -79,14 +87,14 @@ pub struct VoxelizeOctreeResult {
 /// `aabb`: world-space bounding box of the object.
 /// `base_voxel_size`: voxel size at the finest level.
 pub fn voxelize_octree<F>(
-    sdf_fn: F,
+    mut sdf_fn: F,
     aabb: &Aabb,
     base_voxel_size: f32,
     leaf_attr_pool: &mut LeafAttrPool,
     brick_pool: &mut BrickPool,
 ) -> Option<VoxelizeOctreeResult>
 where
-    F: Fn(Vec3) -> (f32, u16, u16, u8),
+    F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32)>,
 {
     let aabb_size = aabb.max - aabb.min;
     let max_dim = aabb_size.x.max(aabb_size.y).max(aabb_size.z);
@@ -102,10 +110,10 @@ where
     let t_start = std::time::Instant::now();
     let mut octree = SparseOctree::new(depth, base_voxel_size);
     let mut voxel_count = 0u32;
-    // Dedup keyed on the full LeafAttr value. Two spatial leaves with the
-    // same packed (material + normal) share an entry, so flat-shaded
-    // regions collapse via subtree dedup; curved surfaces pay one entry
-    // per unique (material, normal) tuple.
+    // Dedup keyed on the full LeafAttr value. Two spatial leaves with
+    // the same packed (material + normal) share an entry, so flat-
+    // shaded regions collapse via subtree dedup; curved surfaces pay
+    // one entry per unique (material, normal) tuple.
     let mut attr_dedup: std::collections::HashMap<LeafAttr, u32> =
         std::collections::HashMap::new();
     let leaf_attr_slot_start = leaf_attr_pool.allocated_count();
@@ -116,29 +124,27 @@ where
     let aabb_center = (aabb.min + aabb.max) * 0.5;
     let grid_origin = aabb_center - Vec3::splat(extent * 0.5);
 
-    // Bricks terminate the octree `BRICK_LEVELS` levels above max_depth.
-    // For a tree at or below that depth, the entire octree would degenerate
-    // to a single brick — disable bricking and fall back to per-leaf.
+    // Bricks terminate the octree `BRICK_LEVELS` levels above
+    // max_depth. For a tree at or below that depth, the entire octree
+    // would degenerate to a single brick — disable bricking and fall
+    // back to per-leaf.
     let brick_depth: Option<u8> = if depth > BRICK_LEVELS {
         Some(depth - BRICK_LEVELS)
     } else {
         None
     };
 
-    subdivide_node(
-        &sdf_fn,
+    subdivide_bfs(
+        &mut sdf_fn,
         &mut octree,
         leaf_attr_pool,
         brick_pool,
         &mut voxel_count,
         &mut attr_dedup,
         &mut brick_ids,
-        UVec3::ZERO,
-        0,
+        grid_origin,
         depth,
         brick_depth,
-        grid_origin,
-        extent,
         base_voxel_size,
     )?;
     let t_after_subdivide = t_start.elapsed();
@@ -210,185 +216,8 @@ where
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn subdivide_node<F>(
-    sdf_fn: &F,
-    octree: &mut SparseOctree,
-    leaf_attr_pool: &mut LeafAttrPool,
-    brick_pool: &mut BrickPool,
-    voxel_count: &mut u32,
-    attr_dedup: &mut std::collections::HashMap<LeafAttr, u32>,
-    brick_ids: &mut Vec<u32>,
-    coord: UVec3,
-    level: u8,
-    max_depth: u8,
-    brick_depth: Option<u8>,
-    world_min: Vec3,
-    node_extent: f32,
-    base_voxel_size: f32,
-) -> Option<()>
-where
-    F: Fn(Vec3) -> (f32, u16, u16, u8),
-{
-    let classification = classify_region(sdf_fn, world_min, node_extent);
-
-    match classification {
-        RegionClass::Empty => {
-            // Root is EMPTY by default; nothing to write at other levels
-            // either because the parent will collapse the 8 EMPTY children.
-        }
-        RegionClass::Interior => {
-            octree.set_at_level(coord, level, crate::sparse_octree::INTERIOR_NODE);
-        }
-        RegionClass::Mixed => {
-            // At brick_depth, terminate the tree with a brick instead of
-            // continuing to subdivide. The brick's BRICK_DIM³ cells cover
-            // exactly the leaves at max_depth — replacing BRICK_LEVELS
-            // levels of tree descent with a single flat array lookup.
-            if brick_depth == Some(level) {
-                let brick_id = brick_pool.allocate()?;
-                brick_ids.push(brick_id);
-                let cell_size = base_voxel_size;
-                for cz in 0..BRICK_DIM {
-                    for cy in 0..BRICK_DIM {
-                        for cx in 0..BRICK_DIM {
-                            let cell_min = world_min + Vec3::new(
-                                cx as f32 * cell_size,
-                                cy as f32 * cell_size,
-                                cz as f32 * cell_size,
-                            );
-                            let cell_center = cell_min + Vec3::splat(cell_size * 0.5);
-                            let (d_center, primary, secondary, blend) = sdf_fn(cell_center);
-                            if d_center > 0.0 {
-                                // Cell outside the surface — leave as EMPTY.
-                                continue;
-                            }
-                            // Cell inside: compute SDF-gradient normal.
-                            let eps = cell_size * 0.5;
-                            let (d_xp, _, _, _) = sdf_fn(cell_center + Vec3::new(eps, 0.0, 0.0));
-                            let (d_xm, _, _, _) = sdf_fn(cell_center - Vec3::new(eps, 0.0, 0.0));
-                            let (d_yp, _, _, _) = sdf_fn(cell_center + Vec3::new(0.0, eps, 0.0));
-                            let (d_ym, _, _, _) = sdf_fn(cell_center - Vec3::new(0.0, eps, 0.0));
-                            let (d_zp, _, _, _) = sdf_fn(cell_center + Vec3::new(0.0, 0.0, eps));
-                            let (d_zm, _, _, _) = sdf_fn(cell_center - Vec3::new(0.0, 0.0, eps));
-                            let grad = Vec3::new(
-                                d_xp - d_xm,
-                                d_yp - d_ym,
-                                d_zp - d_zm,
-                            );
-                            let normal = if grad.length_squared() > 1e-12 {
-                                grad.normalize()
-                            } else {
-                                Vec3::Y
-                            };
-                            let attr = LeafAttr::new_blended(normal, primary, secondary, blend);
-                            let leaf_attr_id = if let Some(&existing) = attr_dedup.get(&attr) {
-                                existing
-                            } else {
-                                // Bump-only allocate — the asset's full attr
-                                // range must stay contiguous so the scene
-                                // manager's release (deallocate_range) frees
-                                // exactly what we allocated. A plain
-                                // `allocate()` would dip into the free list
-                                // and break that invariant when other
-                                // assets have been released concurrently.
-                                let id = leaf_attr_pool.allocate_contiguous_bump(1)?;
-                                *leaf_attr_pool.get_mut(id) = attr;
-                                attr_dedup.insert(attr, id);
-                                id
-                            };
-                            brick_pool.set_cell(brick_id, cx, cy, cz, leaf_attr_id);
-                            *voxel_count += 1;
-                        }
-                    }
-                }
-                octree.set_at_level(coord, level, crate::sparse_octree::make_brick(brick_id));
-                return Some(());
-            }
-
-            if level == max_depth {
-                // At the finest level: sample the center. If it's inside
-                // the surface, create a leaf with its SDF-gradient normal.
-                let voxel_center = world_min + Vec3::splat(base_voxel_size * 0.5);
-                let (d_center, primary, secondary, blend) = sdf_fn(voxel_center);
-                if d_center > 0.0 {
-                    // Center is outside — this corner of a Mixed region is
-                    // not itself solid. Leave it EMPTY.
-                    return Some(());
-                }
-
-                // Surface normal from SDF gradient via 6-tap central
-                // differences. SDF gradient points OUTWARD (toward
-                // increasing distance), which is exactly the surface
-                // normal we want — no sign flip.
-                let eps = base_voxel_size * 0.5;
-                let (d_xp, _, _, _) = sdf_fn(voxel_center + Vec3::new(eps, 0.0, 0.0));
-                let (d_xm, _, _, _) = sdf_fn(voxel_center - Vec3::new(eps, 0.0, 0.0));
-                let (d_yp, _, _, _) = sdf_fn(voxel_center + Vec3::new(0.0, eps, 0.0));
-                let (d_ym, _, _, _) = sdf_fn(voxel_center - Vec3::new(0.0, eps, 0.0));
-                let (d_zp, _, _, _) = sdf_fn(voxel_center + Vec3::new(0.0, 0.0, eps));
-                let (d_zm, _, _, _) = sdf_fn(voxel_center - Vec3::new(0.0, 0.0, eps));
-                let grad = Vec3::new(d_xp - d_xm, d_yp - d_ym, d_zp - d_zm);
-                let normal = if grad.length_squared() > 1e-12 {
-                    grad.normalize()
-                } else {
-                    // Deep interior: gradient vanishes; the normal won't
-                    // be visible there anyway, so +Y is a safe fallback.
-                    Vec3::Y
-                };
-
-                let attr = LeafAttr::new_blended(normal, primary, secondary, blend);
-                let leaf_attr_id = if let Some(&existing) = attr_dedup.get(&attr) {
-                    existing
-                } else {
-                    let id = leaf_attr_pool.allocate()?;
-                    *leaf_attr_pool.get_mut(id) = attr;
-                    attr_dedup.insert(attr, id);
-                    id
-                };
-                octree.set_at_level(coord, level, crate::sparse_octree::make_leaf(leaf_attr_id));
-                *voxel_count += 1;
-            } else {
-                let half = node_extent * 0.5;
-                let child_voxels = 1u32 << (max_depth - level - 1);
-
-                for octant in 0u32..8 {
-                    let dx = octant & 1;
-                    let dy = (octant >> 1) & 1;
-                    let dz = (octant >> 2) & 1;
-
-                    let child_min = world_min
-                        + Vec3::new(dx as f32 * half, dy as f32 * half, dz as f32 * half);
-                    let child_coord = UVec3::new(
-                        coord.x + dx * child_voxels,
-                        coord.y + dy * child_voxels,
-                        coord.z + dz * child_voxels,
-                    );
-
-                    subdivide_node(
-                        sdf_fn,
-                        octree,
-                        leaf_attr_pool,
-                        brick_pool,
-                        voxel_count,
-                        attr_dedup,
-                        brick_ids,
-                        child_coord,
-                        level + 1,
-                        max_depth,
-                        brick_depth,
-                        child_min,
-                        half,
-                        base_voxel_size,
-                    )?;
-                }
-            }
-        }
-    }
-
-    Some(())
-}
-
+/// Classification of one octree node's cubic region. Used in both
+/// coarse-descent and leaf-emission paths.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum RegionClass {
     Empty,
@@ -396,42 +225,24 @@ enum RegionClass {
     Mixed,
 }
 
-/// Classify a cubic region by sampling the SDF at 9 points (8 corners +
-/// center). A 1-Lipschitz SDF means the surface can be at most `d` away
-/// from any sample, so:
-///
-/// * `min(|d|) > extent / 2` and all samples outside (d > 0) → Empty.
-/// * `min(|d|) > extent / 2` and all samples inside (d < 0) → Interior.
-/// * Otherwise the surface may intersect the node → Mixed.
-fn classify_region<F>(sdf_fn: &F, world_min: Vec3, extent: f32) -> RegionClass
-where
-    F: Fn(Vec3) -> (f32, u16, u16, u8),
-{
+/// Classify a region from its 9-sample slice (8 corners in xyz-minor
+/// order, then center). Same semantics as the old per-node
+/// `classify_region` — a 1-Lipschitz SDF means the surface can be at
+/// most `|d|` away from a sample, so if every `|d| > extent / 2` the
+/// node is definitively empty-or-interior depending on sign.
+fn classify_from_samples(samples: &[(f32, u16, u16, u8, u32)], extent: f32) -> RegionClass {
+    debug_assert_eq!(samples.len(), 9);
     let threshold = extent * 0.5;
     let mut all_outside = true;
     let mut all_inside = true;
-
-    for cz in 0..2u32 {
-        for cy in 0..2u32 {
-            for cx in 0..2u32 {
-                let pos = world_min
-                    + Vec3::new(
-                        cx as f32 * extent,
-                        cy as f32 * extent,
-                        cz as f32 * extent,
-                    );
-                let (d, _, _, _) = sdf_fn(pos);
-                if d <= threshold { all_outside = false; }
-                if d >= -threshold { all_inside = false; }
-            }
+    for &(d, _, _, _, _) in samples {
+        if d <= threshold {
+            all_outside = false;
+        }
+        if d >= -threshold {
+            all_inside = false;
         }
     }
-
-    let center = world_min + Vec3::splat(extent * 0.5);
-    let (d_center, _, _, _) = sdf_fn(center);
-    if d_center <= threshold { all_outside = false; }
-    if d_center >= -threshold { all_inside = false; }
-
     if all_outside {
         RegionClass::Empty
     } else if all_inside {
@@ -441,7 +252,418 @@ where
     }
 }
 
-/// Convenience: voxelize a sphere into a sparse octree.
+/// Push 9 classify samples (8 corners + center) for the node at
+/// `world_min` with side length `extent` into `out`. Corner order is
+/// `(cx, cy, cz)` with `cx` varying fastest, matching the loop order in
+/// `classify_from_samples`'s implicit convention.
+fn push_classify_positions(out: &mut Vec<Vec3>, world_min: Vec3, extent: f32) {
+    for cz in 0..2u32 {
+        for cy in 0..2u32 {
+            for cx in 0..2u32 {
+                out.push(
+                    world_min
+                        + Vec3::new(
+                            cx as f32 * extent,
+                            cy as f32 * extent,
+                            cz as f32 * extent,
+                        ),
+                );
+            }
+        }
+    }
+    out.push(world_min + Vec3::splat(extent * 0.5));
+}
+
+/// Build-time descriptor for a Mixed brick-level node awaiting cell
+/// processing. We collect these across the BFS pass and resolve them
+/// in one batched `sdf_fn` call afterwards.
+struct BrickJob {
+    coord: UVec3,
+    /// World-space origin of the brick — the `world_min` of the
+    /// brick-depth node.
+    world_min: Vec3,
+}
+
+/// Same idea as `BrickJob` but for the non-brick path: shallow trees
+/// where every Mixed finest-level node becomes a single leaf rather
+/// than a brick.
+struct LeafJob {
+    coord: UVec3,
+    world_min: Vec3,
+}
+
+/// BFS octree classification + terminal-level emission.
+///
+/// Iterates from level 0 down to the terminal level (brick_depth if
+/// bricks are enabled, else max_depth). At each level, batches the
+/// classify samples for every active node into one `sdf_fn` call.
+/// Mixed nodes feed the next level (as 8 children) or are queued for
+/// terminal-level geometry emission. After the BFS loop, two more
+/// batched calls emit bricks (all in one dispatch) and finest-level
+/// leaves (all in one dispatch).
+#[allow(clippy::too_many_arguments)]
+fn subdivide_bfs<F>(
+    sdf_fn: &mut F,
+    octree: &mut SparseOctree,
+    leaf_attr_pool: &mut LeafAttrPool,
+    brick_pool: &mut BrickPool,
+    voxel_count: &mut u32,
+    attr_dedup: &mut std::collections::HashMap<LeafAttr, u32>,
+    brick_ids: &mut Vec<u32>,
+    grid_origin: Vec3,
+    max_depth: u8,
+    brick_depth: Option<u8>,
+    base_voxel_size: f32,
+) -> Option<()>
+where
+    F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32)>,
+{
+    // The octree's root spans `2^max_depth * base_voxel_size` on a side.
+    let root_extent = (1u64 << max_depth) as f32 * base_voxel_size;
+
+    // Active set for the current level. Holds coord in finest-level
+    // units — multiplying by `base_voxel_size` and adding
+    // `grid_origin` gives the node's world_min. Size: octree integer
+    // coords fit in u32 because `depth <= 30` in practice.
+    let mut active: Vec<UVec3> = vec![UVec3::ZERO];
+
+    // Queues populated at the terminal level during BFS, drained in a
+    // single batched pass after classification finishes.
+    let mut brick_queue: Vec<BrickJob> = Vec::new();
+    let mut leaf_queue: Vec<LeafJob> = Vec::new();
+
+    // Classify level-by-level. We always visit level 0 (root) even if
+    // the tree is trivial; beyond that, the loop body early-exits
+    // when `active` becomes empty.
+    let terminal_level = brick_depth.unwrap_or(max_depth);
+    for level in 0..=terminal_level {
+        if active.is_empty() {
+            break;
+        }
+
+        // Extent of a node at this level, in world units.
+        let level_extent = (1u64 << (max_depth - level)) as f32 * base_voxel_size;
+
+        // Generate 9 classify samples per node. The layout assumes
+        // `classify_from_samples`'s corner + center order.
+        let mut samples: Vec<Vec3> = Vec::with_capacity(active.len() * 9);
+        for &coord in &active {
+            let world_min =
+                grid_origin + Vec3::new(coord.x as f32, coord.y as f32, coord.z as f32)
+                    * base_voxel_size;
+            push_classify_positions(&mut samples, world_min, level_extent);
+        }
+
+        let results = sdf_fn(&samples);
+        debug_assert_eq!(results.len(), samples.len());
+
+        // Process each node's classification. Mixed nodes either
+        // recurse (schedule 8 children for the next level) or are
+        // queued for terminal-level geometry emission.
+        let mut next_active: Vec<UVec3> = Vec::new();
+        let child_voxels = if level < max_depth {
+            1u32 << (max_depth - level - 1)
+        } else {
+            0
+        };
+
+        for (i, &coord) in active.iter().enumerate() {
+            let slice = &results[i * 9..i * 9 + 9];
+            let class = classify_from_samples(slice, level_extent);
+
+            match class {
+                RegionClass::Empty => {
+                    // Default octree state is EMPTY — no write needed.
+                }
+                RegionClass::Interior => {
+                    octree.set_at_level(coord, level, crate::sparse_octree::INTERIOR_NODE);
+                }
+                RegionClass::Mixed => {
+                    if brick_depth == Some(level) {
+                        // Terminal: emit a brick for this node after the
+                        // BFS classification loop.
+                        let world_min = grid_origin
+                            + Vec3::new(coord.x as f32, coord.y as f32, coord.z as f32)
+                                * base_voxel_size;
+                        brick_queue.push(BrickJob { coord, world_min });
+                    } else if level == max_depth {
+                        // Terminal: emit a finest-level leaf after the
+                        // BFS classification loop. Only fires for
+                        // shallow trees (depth ≤ BRICK_LEVELS) where
+                        // bricking is disabled.
+                        let world_min = grid_origin
+                            + Vec3::new(coord.x as f32, coord.y as f32, coord.z as f32)
+                                * base_voxel_size;
+                        leaf_queue.push(LeafJob { coord, world_min });
+                    } else {
+                        // Descend: schedule 8 children for the next
+                        // level. octant xyz-minor ordering matches the
+                        // old recursive path.
+                        for octant in 0u32..8 {
+                            let dx = octant & 1;
+                            let dy = (octant >> 1) & 1;
+                            let dz = (octant >> 2) & 1;
+                            next_active.push(UVec3::new(
+                                coord.x + dx * child_voxels,
+                                coord.y + dy * child_voxels,
+                                coord.z + dz * child_voxels,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        active = next_active;
+    }
+
+    // ── Terminal-level geometry: bricks ──
+    if !brick_queue.is_empty() {
+        emit_bricks_batched(
+            &mut *sdf_fn,
+            octree,
+            leaf_attr_pool,
+            brick_pool,
+            voxel_count,
+            attr_dedup,
+            brick_ids,
+            &brick_queue,
+            brick_depth.expect("brick_queue non-empty ⇒ brick_depth set"),
+            base_voxel_size,
+        )?;
+    }
+
+    // ── Terminal-level geometry: finest-level leaves (shallow tree) ──
+    if !leaf_queue.is_empty() {
+        emit_leaves_batched(
+            &mut *sdf_fn,
+            octree,
+            leaf_attr_pool,
+            voxel_count,
+            attr_dedup,
+            &leaf_queue,
+            max_depth,
+            base_voxel_size,
+        )?;
+    }
+
+    let _ = root_extent; // kept for future diagnostics / overflow guard
+    Some(())
+}
+
+/// Shared layout for a brick cell's 7-sample block: center + 6 axis-
+/// aligned gradient taps at `±eps` along each axis. Gradient kernel
+/// matches the old recursive path exactly so bake output is bit-stable
+/// up to leaf_attr_pool allocation ordering.
+///
+/// Offsets in the returned slice (after the cell_center at index 0):
+///   1 = +x, 2 = -x, 3 = +y, 4 = -y, 5 = +z, 6 = -z
+fn push_cell_samples(out: &mut Vec<Vec3>, cell_center: Vec3, eps: f32) {
+    out.push(cell_center);
+    out.push(cell_center + Vec3::new(eps, 0.0, 0.0));
+    out.push(cell_center - Vec3::new(eps, 0.0, 0.0));
+    out.push(cell_center + Vec3::new(0.0, eps, 0.0));
+    out.push(cell_center - Vec3::new(0.0, eps, 0.0));
+    out.push(cell_center + Vec3::new(0.0, 0.0, eps));
+    out.push(cell_center - Vec3::new(0.0, 0.0, eps));
+}
+
+/// Emit all bricks' cell data in one batched `sdf_fn` dispatch.
+///
+/// Sample layout: for each brick in `brick_queue`, iterate BRICK_DIM³
+/// cells in (cz, cy, cx) order; each cell contributes 7 samples per
+/// `push_cell_samples`. Readback walks the same order to unpack.
+#[allow(clippy::too_many_arguments)]
+fn emit_bricks_batched<F>(
+    sdf_fn: &mut F,
+    octree: &mut SparseOctree,
+    leaf_attr_pool: &mut LeafAttrPool,
+    brick_pool: &mut BrickPool,
+    voxel_count: &mut u32,
+    attr_dedup: &mut std::collections::HashMap<LeafAttr, u32>,
+    brick_ids: &mut Vec<u32>,
+    brick_queue: &[BrickJob],
+    brick_depth: u8,
+    base_voxel_size: f32,
+) -> Option<()>
+where
+    F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32)>,
+{
+    let cell_size = base_voxel_size;
+    let eps = cell_size * 0.5;
+    let cells_per_brick = (BRICK_DIM * BRICK_DIM * BRICK_DIM) as usize;
+    let samples_per_cell = 7usize;
+    let total_samples = brick_queue.len() * cells_per_brick * samples_per_cell;
+
+    let mut samples: Vec<Vec3> = Vec::with_capacity(total_samples);
+    for job in brick_queue {
+        for cz in 0..BRICK_DIM {
+            for cy in 0..BRICK_DIM {
+                for cx in 0..BRICK_DIM {
+                    let cell_min = job.world_min
+                        + Vec3::new(
+                            cx as f32 * cell_size,
+                            cy as f32 * cell_size,
+                            cz as f32 * cell_size,
+                        );
+                    let cell_center = cell_min + Vec3::splat(cell_size * 0.5);
+                    push_cell_samples(&mut samples, cell_center, eps);
+                }
+            }
+        }
+    }
+
+    let results = sdf_fn(&samples);
+    debug_assert_eq!(results.len(), total_samples);
+
+    // Walk the same order and build each cell's LeafAttr.
+    for (brick_idx, job) in brick_queue.iter().enumerate() {
+        let brick_id = brick_pool.allocate()?;
+        brick_ids.push(brick_id);
+        let brick_base = brick_idx * cells_per_brick * samples_per_cell;
+
+        for cz in 0..BRICK_DIM {
+            for cy in 0..BRICK_DIM {
+                for cx in 0..BRICK_DIM {
+                    let cell_idx = (cz * BRICK_DIM * BRICK_DIM + cy * BRICK_DIM + cx) as usize;
+                    let cell_base = brick_base + cell_idx * samples_per_cell;
+                    let (d_center, primary, secondary, blend, color) = results[cell_base];
+                    if d_center > 0.0 {
+                        // Cell outside the surface — leave as EMPTY.
+                        continue;
+                    }
+
+                    let d_xp = results[cell_base + 1].0;
+                    let d_xm = results[cell_base + 2].0;
+                    let d_yp = results[cell_base + 3].0;
+                    let d_ym = results[cell_base + 4].0;
+                    let d_zp = results[cell_base + 5].0;
+                    let d_zm = results[cell_base + 6].0;
+                    let grad = Vec3::new(d_xp - d_xm, d_yp - d_ym, d_zp - d_zm);
+                    let normal = if grad.length_squared() > 1e-12 {
+                        grad.normalize()
+                    } else {
+                        Vec3::Y
+                    };
+                    let attr = LeafAttr::new_blended(normal, primary, secondary, blend);
+                    let leaf_attr_id = if let Some(&existing) = attr_dedup.get(&attr) {
+                        existing
+                    } else {
+                        // Bump-only allocate — the asset's full attr
+                        // range must stay contiguous so the scene
+                        // manager's release (deallocate_range) frees
+                        // exactly what we allocated. A plain
+                        // `allocate()` would dip into the free list and
+                        // break that invariant when other assets have
+                        // been released concurrently.
+                        let id = leaf_attr_pool.allocate_contiguous_bump(1)?;
+                        *leaf_attr_pool.get_mut(id) = attr;
+                        attr_dedup.insert(attr, id);
+                        id
+                    };
+                    // Per-voxel color override lives in the color_pool
+                    // keyed by leaf_attr_id. A nonzero value shadows
+                    // the material's base color; 0 means "no override".
+                    // Writing here (not on allocate) lets two leaves
+                    // that share a LeafAttr still end up with different
+                    // colors — they'd dedup to the same slot, so we
+                    // accept a "last writer wins" policy rather than
+                    // over-specializing the dedup key.
+                    if color != 0 {
+                        leaf_attr_pool.set_color(leaf_attr_id, color);
+                    }
+                    brick_pool.set_cell(brick_id, cx, cy, cz, leaf_attr_id);
+                    *voxel_count += 1;
+                }
+            }
+        }
+
+        octree.set_at_level(
+            job.coord,
+            brick_depth,
+            crate::sparse_octree::make_brick(brick_id),
+        );
+    }
+
+    Some(())
+}
+
+/// Emit finest-level single-cell leaves for shallow trees (depth ≤
+/// BRICK_LEVELS, where bricks are disabled). Same 7-sample layout
+/// per cell as the brick path.
+#[allow(clippy::too_many_arguments)]
+fn emit_leaves_batched<F>(
+    sdf_fn: &mut F,
+    octree: &mut SparseOctree,
+    leaf_attr_pool: &mut LeafAttrPool,
+    voxel_count: &mut u32,
+    attr_dedup: &mut std::collections::HashMap<LeafAttr, u32>,
+    leaf_queue: &[LeafJob],
+    max_depth: u8,
+    base_voxel_size: f32,
+) -> Option<()>
+where
+    F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32)>,
+{
+    let eps = base_voxel_size * 0.5;
+    let samples_per_leaf = 7usize;
+    let total_samples = leaf_queue.len() * samples_per_leaf;
+
+    let mut samples: Vec<Vec3> = Vec::with_capacity(total_samples);
+    for job in leaf_queue {
+        let voxel_center = job.world_min + Vec3::splat(base_voxel_size * 0.5);
+        push_cell_samples(&mut samples, voxel_center, eps);
+    }
+
+    let results = sdf_fn(&samples);
+    debug_assert_eq!(results.len(), total_samples);
+
+    for (leaf_idx, job) in leaf_queue.iter().enumerate() {
+        let cell_base = leaf_idx * samples_per_leaf;
+        let (d_center, primary, secondary, blend, color) = results[cell_base];
+        if d_center > 0.0 {
+            // Center is outside — this corner of a Mixed region is
+            // not itself solid. Leave it EMPTY.
+            continue;
+        }
+        let d_xp = results[cell_base + 1].0;
+        let d_xm = results[cell_base + 2].0;
+        let d_yp = results[cell_base + 3].0;
+        let d_ym = results[cell_base + 4].0;
+        let d_zp = results[cell_base + 5].0;
+        let d_zm = results[cell_base + 6].0;
+        let grad = Vec3::new(d_xp - d_xm, d_yp - d_ym, d_zp - d_zm);
+        let normal = if grad.length_squared() > 1e-12 {
+            grad.normalize()
+        } else {
+            Vec3::Y
+        };
+        let attr = LeafAttr::new_blended(normal, primary, secondary, blend);
+        let leaf_attr_id = if let Some(&existing) = attr_dedup.get(&attr) {
+            existing
+        } else {
+            let id = leaf_attr_pool.allocate()?;
+            *leaf_attr_pool.get_mut(id) = attr;
+            attr_dedup.insert(attr, id);
+            id
+        };
+        if color != 0 {
+            leaf_attr_pool.set_color(leaf_attr_id, color);
+        }
+        octree.set_at_level(
+            job.coord,
+            max_depth,
+            crate::sparse_octree::make_leaf(leaf_attr_id),
+        );
+        *voxel_count += 1;
+    }
+
+    Some(())
+}
+
+/// Convenience: voxelize a sphere into a sparse octree. Wraps the
+/// per-point SDF in a trivial batching adapter so we keep the one
+/// canonical voxelize_octree signature.
 pub fn voxelize_sphere_octree(
     center: Vec3,
     radius: f32,
@@ -456,9 +678,18 @@ pub fn voxelize_sphere_octree(
         max: center + Vec3::splat(radius + padding),
     };
 
-    let sdf_fn = |pos: Vec3| -> (f32, u16, u16, u8) {
-        let d = (pos - center).length() - radius;
-        (d, material_id, 0, 0)
+    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+        positions
+            .iter()
+            .map(|pos| {
+                let d = (*pos - center).length() - radius;
+                // No per-voxel color on the sphere helper — the
+                // color_pool's `0` sentinel means the voxel shader
+                // falls back to the material's base color, which is
+                // what we want for an untextured primitive.
+                (d, material_id, 0, 0, 0u32)
+            })
+            .collect()
     };
 
     voxelize_octree(sdf_fn, &aabb, voxel_size, leaf_attr_pool, brick_pool)
@@ -468,6 +699,14 @@ pub fn voxelize_sphere_octree(
 mod tests {
     use super::*;
     use crate::sparse_octree::INTERIOR_NODE;
+
+    /// Wrap a per-point SDF as a batched callback for the tests.
+    fn batched<Fp>(f: Fp) -> impl Fn(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32)>
+    where
+        Fp: Fn(Vec3) -> (f32, u16, u16, u8, u32),
+    {
+        move |positions: &[Vec3]| positions.iter().map(|p| f(*p)).collect()
+    }
 
     #[test]
     fn sphere_produces_brick_cells() {
@@ -496,7 +735,7 @@ mod tests {
         let mut attrs = LeafAttrPool::new(256);
         let mut bricks = BrickPool::new(64);
         let aabb = Aabb { min: Vec3::ZERO, max: Vec3::splat(1.0) };
-        let r = voxelize_octree(|_| (1000.0, 0, 0, 0), &aabb, 0.1, &mut attrs, &mut bricks).unwrap();
+        let r = voxelize_octree(batched(|_| (1000.0, 0, 0, 0, 0)), &aabb, 0.1, &mut attrs, &mut bricks).unwrap();
 
         assert_eq!(r.voxel_count, 0);
         assert_eq!(r.brick_ids.len(), 0);
@@ -508,7 +747,7 @@ mod tests {
         let mut attrs = LeafAttrPool::new(256);
         let mut bricks = BrickPool::new(64);
         let aabb = Aabb { min: Vec3::ZERO, max: Vec3::splat(0.05) };
-        let r = voxelize_octree(|_| (-1000.0, 0, 0, 0), &aabb, 0.1, &mut attrs, &mut bricks).unwrap();
+        let r = voxelize_octree(batched(|_| (-1000.0, 0, 0, 0, 0)), &aabb, 0.1, &mut attrs, &mut bricks).unwrap();
 
         assert_eq!(r.voxel_count, 0, "fully inside should collapse to INTERIOR");
         assert_eq!(r.brick_ids.len(), 0);
@@ -532,7 +771,7 @@ mod tests {
     fn sphere_normals_point_outward() {
         // Walk the brick nodes in the octree, expand each brick's 64 cells,
         // verify cell normals point outward from the sphere center.
-        use crate::sparse_octree::{is_brick, brick_id as get_brick_id};
+        use crate::sparse_octree::{brick_id as get_brick_id, is_brick};
 
         let center = Vec3::ZERO;
         let radius = 0.5;
@@ -549,62 +788,109 @@ mod tests {
         // Visit nodes recursively from root, tracking origin coord at each level.
         fn walk(
             nodes: &[u32],
-            idx: usize,
-            origin: glam::UVec3,
+            node_idx: usize,
+            coord: UVec3,
             level: u8,
             brick_depth: u8,
-            visit: &mut impl FnMut(glam::UVec3, u32),
+            max_depth: u8,
+            vs: f32,
+            center: Vec3,
+            radius: f32,
+            bricks: &BrickPool,
+            attrs: &LeafAttrPool,
+            grid_origin: Vec3,
+            checked: &mut u32,
         ) {
-            let node = nodes[idx];
-            if is_brick(node) {
-                visit(origin, get_brick_id(node));
+            use crate::sparse_octree::{
+                brick_id as get_brick_id, is_brick, is_leaf, INTERIOR_NODE,
+            };
+            let node = nodes[node_idx];
+            if is_brick(node) && level == brick_depth {
+                let brick_id = get_brick_id(node);
+                let brick_world_min = grid_origin
+                    + Vec3::new(coord.x as f32, coord.y as f32, coord.z as f32) * vs;
+                for cz in 0..BRICK_DIM {
+                    for cy in 0..BRICK_DIM {
+                        for cx in 0..BRICK_DIM {
+                            let cell = bricks.get_cell(brick_id, cx, cy, cz);
+                            if cell == crate::brick_pool::BRICK_EMPTY {
+                                continue;
+                            }
+                            let attr = *attrs.get(cell);
+                            let normal = attr.normal();
+                            let cell_min = brick_world_min
+                                + Vec3::new(cx as f32 * vs, cy as f32 * vs, cz as f32 * vs);
+                            let cell_center = cell_min + Vec3::splat(vs * 0.5);
+                            let radial = (cell_center - center).normalize();
+                            // Normal should point outward (same half-space
+                            // as the radial direction from the sphere
+                            // center). Stricter than "> 0" because we're
+                            // well outside the origin.
+                            let dot = normal.dot(radial);
+                            assert!(
+                                dot > 0.0,
+                                "cell normal {normal:?} at {cell_center:?} should point outward from sphere center (dot={dot})",
+                            );
+                            *checked += 1;
+                        }
+                    }
+                }
                 return;
             }
-            if !crate::sparse_octree::is_branch(node) { return; }
-            let children = node as usize;
-            let cells_per_child = 1u32 << ((brick_depth + BRICK_LEVELS) - level - 1);
+            if node == INTERIOR_NODE || is_leaf(node) {
+                return;
+            }
+            // Otherwise it's an internal node — descend.
+            if level >= brick_depth {
+                return;
+            }
+            let first_child = node as usize;
+            if first_child == 0 || first_child + 8 > nodes.len() {
+                return;
+            }
+            let child_voxels = 1u32 << (max_depth - level - 1);
             for octant in 0u32..8 {
                 let dx = octant & 1;
                 let dy = (octant >> 1) & 1;
                 let dz = (octant >> 2) & 1;
-                let child_origin = glam::UVec3::new(
-                    origin.x + dx * cells_per_child,
-                    origin.y + dy * cells_per_child,
-                    origin.z + dz * cells_per_child,
+                let child_coord = UVec3::new(
+                    coord.x + dx * child_voxels,
+                    coord.y + dy * child_voxels,
+                    coord.z + dz * child_voxels,
                 );
-                walk(nodes, children + octant as usize, child_origin, level + 1, brick_depth, visit);
+                walk(
+                    nodes,
+                    first_child + octant as usize,
+                    child_coord,
+                    level + 1,
+                    brick_depth,
+                    max_depth,
+                    vs,
+                    center,
+                    radius,
+                    bricks,
+                    attrs,
+                    grid_origin,
+                    checked,
+                );
             }
         }
-
-        walk(&nodes, 0, glam::UVec3::ZERO, 0, brick_depth, &mut |brick_origin, bid| {
-            for cz in 0..BRICK_DIM {
-                for cy in 0..BRICK_DIM {
-                    for cx in 0..BRICK_DIM {
-                        let cell = bricks.get_cell(bid, cx, cy, cz);
-                        if cell == BRICK_EMPTY { continue; }
-                        let coord = glam::UVec3::new(
-                            brick_origin.x + cx,
-                            brick_origin.y + cy,
-                            brick_origin.z + cz,
-                        );
-                        let cell_center = r.grid_origin + Vec3::new(
-                            coord.x as f32 * vs + vs * 0.5,
-                            coord.y as f32 * vs + vs * 0.5,
-                            coord.z as f32 * vs + vs * 0.5,
-                        );
-                        let to_sphere_center = center - cell_center;
-                        if to_sphere_center.length() < radius * 0.5 { continue; }
-                        let expected = (cell_center - center).normalize();
-                        let actual = attrs.get(cell).normal();
-                        let dot = expected.dot(actual);
-                        assert!(dot > 0.8,
-                            "normal at {cell_center:?} should point outward: expected {expected:?}, got {actual:?}, dot={dot}",
-                        );
-                        checked += 1;
-                    }
-                }
-            }
-        });
-        assert!(checked > 0, "should have checked at least one surface cell");
+        walk(
+            &nodes,
+            0,
+            UVec3::ZERO,
+            0,
+            brick_depth,
+            max_depth,
+            vs,
+            center,
+            radius,
+            &bricks,
+            &attrs,
+            r.grid_origin,
+            &mut checked,
+        );
+        assert!(checked > 0, "should have checked at least one cell normal");
+        let _ = get_brick_id; let _ = is_brick; // silence unused-import warnings
     }
 }

@@ -220,6 +220,12 @@ struct EngineState {
     // Scene management (CPU)
     scene_mgr: RkpSceneManager,
 
+    /// GPU-backed evaluator for procedural trees. Lazy-initialized on
+    /// the first procedural bake. All procedural voxelization (spawn,
+    /// explicit bake, transform-scale re-bake) flows through this —
+    /// the CPU tree evaluator was removed; the GPU is the only path.
+    gpu_evaluator: Option<rkp_render::proc_sample::GpuEvaluator>,
+
     // Input + Camera
     input_system: rkf_runtime::input::InputSystem,
     camera_control: CameraControlState,
@@ -359,7 +365,6 @@ struct EngineState {
     /// Previous tick's value of `build_mouse_left` — used for edge
     /// detection so picking fires once per click rather than every
     /// frame the button is held.
-    build_mouse_left_prev: bool,
     /// Parent-world transform of the procedural node at drag start —
     /// used to project world-space gizmo deltas back into the node's
     /// local (parent-relative) transform on each frame. Identity when
@@ -477,6 +482,7 @@ impl EngineState {
             renderer,
             viewport_renderers,
             scene_mgr,
+            gpu_evaluator: None,
             input_system,
             camera_control,
             camera: CameraState::default(),
@@ -548,7 +554,6 @@ impl EngineState {
             proc_gizmo: crate::gizmo::GizmoState::new(),
             build_mouse_pos: glam::Vec2::ZERO,
             build_mouse_left: false,
-            build_mouse_left_prev: false,
             proc_gizmo_parent_world: glam::Affine3A::IDENTITY,
             proc_gizmo_initial_local: (glam::Vec3::ZERO, glam::Quat::IDENTITY, glam::Vec3::ONE),
             mouse_pos: glam::Vec2::ZERO,
@@ -875,24 +880,35 @@ impl EngineState {
             // nodes), microseconds, and sidesteps having to track dirty
             // state through another layer. Skip entirely when the mode is
             // Voxel so we don't touch the raymarch pass's buffers.
-            let proc_instructions: Vec<rkp_procedural::ProcInstruction> =
-                if matches!(vp_preview_mode, rkp_render::BuildPreviewMode::Raymarch) {
-                    vp_preview_entity
-                        .and_then(|uuid| {
-                            self.entity_uuids
-                                .iter()
-                                .find_map(|(e, u)| (*u == uuid).then_some(*e))
-                        })
-                        .and_then(|entity| {
-                            self.world
-                                .get::<&crate::components::ProceduralGeometry>(entity)
-                                .ok()
-                                .map(|pg| rkp_procedural::flatten_tree(&pg.tree))
-                        })
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+            // Capture the tree's entity-local AABB alongside the
+            // flattened instruction stream — the raymarch shader
+            // uses it to reject rays that can't possibly hit before
+            // paying the sphere-trace loop.
+            let (proc_instructions, proc_aabb): (
+                Vec<rkp_procedural::ProcInstruction>,
+                Option<rkf_core::Aabb>,
+            ) = if matches!(vp_preview_mode, rkp_render::BuildPreviewMode::Raymarch) {
+                vp_preview_entity
+                    .and_then(|uuid| {
+                        self.entity_uuids
+                            .iter()
+                            .find_map(|(e, u)| (*u == uuid).then_some(*e))
+                    })
+                    .and_then(|entity| {
+                        self.world
+                            .get::<&crate::components::ProceduralGeometry>(entity)
+                            .ok()
+                            .map(|pg| {
+                                (
+                                    rkp_procedural::flatten_tree(&pg.tree),
+                                    Some(rkp_procedural::compute_bounds(&pg.tree)),
+                                )
+                            })
+                    })
+                    .unwrap_or_default()
+            } else {
+                (Vec::new(), None)
+            };
             let proc_object_id = vp_preview_entity
                 .and_then(|uuid| {
                     self.entity_uuids
@@ -977,11 +993,21 @@ impl EngineState {
                     );
                 }
                 vr.proc_raymarch.upload_instructions(&self.device, &self.queue, &proc_instructions);
+                // Empty-AABB sentinel: -1..+1 degenerate box that
+                // any sane ray-AABB slab test fails. Covers the
+                // "raymarch pass enabled but no procedural entity
+                // is selected" transient — avoids a bogus hit.
+                let (aabb_min, aabb_max) = match proc_aabb {
+                    Some(a) => (a.min, a.max),
+                    None => (glam::Vec3::splat(1.0), glam::Vec3::splat(-1.0)),
+                };
                 vr.proc_raymarch.set_params(
                     &self.queue,
                     proc_instructions.len() as u32,
                     proc_object_id + 1,
                     proc_entity_world,
+                    aabb_min,
+                    aabb_max,
                 );
                 // Push the currently-selected procedural NodeId to the
                 // outline overlay. Sentinel (`u32::MAX`) when nothing
@@ -1588,17 +1614,24 @@ impl EngineState {
                 let scene_id = self.next_scene_id;
                 self.next_scene_id += 1;
 
-                // Compute bounds and voxelize the procedural tree.
+                // Compute bounds and voxelize the procedural tree via the
+                // GPU evaluator — same path as explicit bakes, so spawning
+                // a new procedural and re-baking later are byte-stable.
                 let (aabb, voxel_size) = procedural_voxel_params(&proc_geo.tree, proc_geo.voxel_size);
-                let tree_ref = &proc_geo.tree;
-                let sdf_fn = |pos: glam::Vec3| -> (f32, u16, u16, u8) {
-                    let sample = rkp_procedural::sample_tree(tree_ref, pos, voxel_size);
-                    let blend_u4 = (sample.blend_weight * 15.0).round().clamp(0.0, 15.0) as u8;
-                    (sample.distance, sample.material_id, sample.secondary_material_id, blend_u4)
-                };
+                let instructions = rkp_procedural::flatten_tree(&proc_geo.tree);
 
-                let result = self.scene_mgr.voxelize_sdf_fn(
-                    sdf_fn, &aabb, voxel_size, scene_id,
+                let Self { device, queue, gpu_evaluator, scene_mgr, .. } = self;
+                let evaluator = gpu_evaluator
+                    .get_or_insert_with(|| rkp_render::proc_sample::GpuEvaluator::new(device));
+                let sdf_batch = |positions: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+                    evaluator
+                        .evaluate(device, queue, positions, &instructions)
+                        .into_iter()
+                        .map(|r| r.into_tuple())
+                        .collect()
+                };
+                let result = scene_mgr.voxelize_sdf_fn(
+                    sdf_batch, &aabb, voxel_size, scene_id,
                 );
                 if let Some(result) = result {
                     let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.grid_origin, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
@@ -3337,27 +3370,31 @@ impl EngineState {
         let t_after_dealloc = t_entity_start.elapsed();
 
         let (aabb, voxel_size) = procedural_voxel_params(&tree_clone, base_voxel_size);
-        // Precompute per-node world-space AABBs once per bake; the sdf_fn
-        // closure consults this to skip Union children whose AABB is
-        // farther than the running-min distance at a sample point.
-        let aabb_cache = rkp_procedural::compute_all_bounds(&tree_clone);
-        let sdf_fn = |pos: glam::Vec3| -> (f32, u16, u16, u8) {
-            let sample = rkp_procedural::sample_tree_cached(
-                &tree_clone, pos, voxel_size, &aabb_cache,
-            );
-            // Quantize the evaluator's 0..1 blend_weight into the 4-bit
-            // (0..15) range LeafAttr packs. The voxelizer forwards this
-            // straight into LeafAttr::new_blended so MaterialByHeight
-            // / MaterialByNoise transition zones land in the bake's
-            // secondary + blend fields, unblocking rkp_shade's PBR
-            // lerp on the MAIN viewport.
-            let blend_u4 = (sample.blend_weight * 15.0).round().clamp(0.0, 15.0) as u8;
-            (sample.distance, sample.material_id, sample.secondary_material_id, blend_u4)
-        };
+        // Flatten the tree once; the GPU evaluator reuses the same
+        // instruction stream across every dispatch in this bake.
+        let instructions = rkp_procedural::flatten_tree(&tree_clone);
         let t_after_bounds = t_entity_start.elapsed();
 
-        let vx_result = self.scene_mgr.voxelize_sdf_fn(
-            sdf_fn, &aabb, voxel_size, scene_id,
+        // Split-borrow fields so the closure can capture a `&mut
+        // GpuEvaluator` while `scene_mgr` is mutably borrowed by
+        // `voxelize_sdf_fn` below.
+        let Self { device, queue, gpu_evaluator, scene_mgr, .. } = self;
+        let evaluator = gpu_evaluator
+            .get_or_insert_with(|| rkp_render::proc_sample::GpuEvaluator::new(device));
+
+        // Batched callback: dispatch one compute pass per octree
+        // level / terminal-geometry phase. The BFS structure of
+        // `voxelize_octree` keeps the dispatch count to ~O(depth).
+        let sdf_batch = |positions: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+            evaluator
+                .evaluate(device, queue, positions, &instructions)
+                .into_iter()
+                .map(|r| r.into_tuple())
+                .collect()
+        };
+
+        let vx_result = scene_mgr.voxelize_sdf_fn(
+            sdf_batch, &aabb, voxel_size, scene_id,
         );
         let t_total = t_entity_start.elapsed();
         let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
@@ -4066,103 +4103,6 @@ impl EngineState {
         };
         verts.extend(gizmo_verts);
         verts
-    }
-
-    /// BUILD-viewport node picker. On a fresh left-press that isn't
-    /// grabbing a gizmo handle, sphere-trace through the procedural's
-    /// SDF, then walk the tree for the leaf node whose local SDF is
-    /// smallest at the hit point.
-    ///
-    /// Runs AFTER `update_procedural_gizmo` so a click on a handle
-    /// (which begins a drag) sets `proc_gizmo.dragging = true`, which
-    /// this function treats as its "skip" signal. Clicks in empty
-    /// world space clear the node selection.
-    fn maybe_pick_procedural_node(&mut self) {
-        let just_pressed = self.build_mouse_left && !self.build_mouse_left_prev;
-        self.build_mouse_left_prev = self.build_mouse_left;
-        if !just_pressed {
-            return;
-        }
-        // A gizmo-drag starting on this same click wins over picking.
-        if self.proc_gizmo.dragging || self.proc_gizmo.hovered_axis
-            != crate::gizmo::GizmoAxis::None
-        {
-            return;
-        }
-
-        let Some(entity) = self.selected_entity else { return };
-
-        // Clone the tree + voxel size + entity transform so we can drop
-        // the ECS borrows before publishing the new `selected_procedural_node`.
-        let (tree, voxel_size, entity_world) = {
-            let Ok(proc_geo) = self
-                .world
-                .get::<&crate::components::ProceduralGeometry>(entity)
-            else {
-                return;
-            };
-            let Ok(xf) = self
-                .world
-                .get::<&crate::components::Transform>(entity)
-            else {
-                return;
-            };
-            let entity_world = glam::Affine3A::from_scale_rotation_translation(
-                xf.scale,
-                glam::Quat::from_euler(
-                    glam::EulerRot::XYZ,
-                    xf.rotation.x.to_radians(),
-                    xf.rotation.y.to_radians(),
-                    xf.rotation.z.to_radians(),
-                ),
-                xf.position,
-            );
-            (proc_geo.tree.clone(), proc_geo.voxel_size, entity_world)
-        };
-
-        let (ray_o_world, ray_d_world) = self.screen_to_ray_for_viewport(
-            crate::viewport::ViewportId::BUILD,
-            self.build_mouse_pos.x,
-            self.build_mouse_pos.y,
-        );
-
-        // Transform the ray into procedural-local space so we can
-        // sphere-trace against the tree's SDF (which assumes its root
-        // is at the entity's origin).
-        let inv_entity = entity_world.inverse();
-        let ray_o = inv_entity.transform_point3(ray_o_world);
-        let ray_d = inv_entity
-            .transform_vector3(ray_d_world)
-            .normalize_or_zero();
-        if ray_d.length_squared() < 1e-6 {
-            return;
-        }
-
-        // Sphere-trace. Fine tolerance so we land on the true surface
-        // rather than in the fade band; step limit chosen to cover
-        // scenes up to ~100 m across.
-        let mut t = 0.0_f32;
-        let mut hit: Option<glam::Vec3> = None;
-        for _ in 0..128 {
-            let p = ray_o + ray_d * t;
-            let sample = rkp_procedural::sample_tree(&tree, p, voxel_size);
-            if sample.distance < 1e-3 {
-                hit = Some(p);
-                break;
-            }
-            // Guard against tiny/negative steps that would stall the trace.
-            let step = sample.distance.max(voxel_size * 0.5);
-            t += step;
-            if t > 200.0 {
-                break;
-            }
-        }
-
-        let new_selection = hit.and_then(|p| nearest_leaf_at(&tree, p, voxel_size));
-
-        if new_selection != self.selected_procedural_node {
-            self.selected_procedural_node = new_selection;
-        }
     }
 
     /// BUILD-viewport gizmo: hover + drag for the selected procedural
@@ -4974,18 +4914,16 @@ fn collect_ghost_primitives(tree: &rkp_procedural::ProceduralObject) -> Vec<u32>
 /// composed ancestor transform, then sphere-tracing up to `MAX_STEPS`
 /// iterations. Returns the nearest positive-t hit or `None`.
 ///
-/// Used by the click-to-pick-ghost path. The GPU raymarch shader does
-/// the same thing for every primitive in parallel; on CPU we only
-/// need the ghost subset at the click pixel, which is cheap enough
-/// that reusing `sample_tree`'s evaluator would be overkill (we'd
-/// pull in combinator logic we don't want applied here).
+/// Used by the click-to-pick-ghost path. The GPU raymarch shader
+/// handles the common case (pixel hits a visible primitive) via
+/// `gbuf_pick`; this CPU walk is only for fully-carved cutters whose
+/// silhouette has no surface in the G-buffer.
 fn raycast_leaf_primitive(
     tree: &rkp_procedural::ProceduralObject,
     leaf_id: rkp_procedural::NodeId,
     ancestor_world: glam::Affine3A,
     ray_origin: glam::Vec3,
     ray_dir: glam::Vec3,
-    voxel_size: f32,
 ) -> Option<f32> {
     const MAX_STEPS: u32 = 64;
     const MAX_DIST: f32 = 500.0;
@@ -5006,9 +4944,9 @@ fn raycast_leaf_primitive(
     let mut t: f32 = 0.0;
     for _ in 0..MAX_STEPS {
         let p = ro + rd * t;
-        let s = rkp_procedural::eval_leaf(p, &node.kind, voxel_size);
-        if s.distance < SURFACE_EPS { return Some(t); }
-        t += s.distance.max(SURFACE_EPS);
+        let d = rkp_procedural::eval_leaf_distance(p, &node.kind);
+        if d < SURFACE_EPS { return Some(t); }
+        t += d.max(SURFACE_EPS);
         if t > MAX_DIST { return None; }
     }
     None
@@ -5057,7 +4995,7 @@ fn nearest_ghost_hit_rec(
             // function re-composes. To avoid double-applying, use
             // the ancestor_world we were called with, not this_world.
             if let Some(t) = raycast_leaf_primitive(
-                tree, id, ancestor_world, ray_origin, ray_dir, voxel_size,
+                tree, id, ancestor_world, ray_origin, ray_dir,
             ) {
                 match *best {
                     None => *best = Some((id.0, t)),
@@ -5155,48 +5093,6 @@ fn find_path(
     }
     out_path.pop();
     false
-}
-
-/// Find the leaf node whose local SDF is closest to zero at the given
-/// procedural-local world position `p`.
-///
-/// Used by BUILD picking to map a click-ray hit back onto a specific
-/// sub-shape. Walks the tree recursively, transforming `p` into each
-/// node's local space as we descend; at every leaf, evaluates the
-/// leaf's SDF and tracks the minimum absolute distance. Combinator
-/// rules (intersect/subtract) are intentionally ignored — we want
-/// "which leaf surface did the click land on?", not "which combinator
-/// shape dominates here?"
-fn nearest_leaf_at(
-    tree: &rkp_procedural::ProceduralObject,
-    p: glam::Vec3,
-    voxel_size: f32,
-) -> Option<u32> {
-    fn walk(
-        tree: &rkp_procedural::ProceduralObject,
-        id: rkp_procedural::NodeId,
-        pos: glam::Vec3,
-        voxel_size: f32,
-        best: &mut Option<(u32, f32)>,
-    ) {
-        let Some(node) = tree.get(id) else { return };
-        let local = node.transform.inverse().transform_point3(pos);
-        if node.kind.is_leaf() {
-            let sample = rkp_procedural::eval_leaf(local, &node.kind, voxel_size);
-            let d = sample.distance.abs();
-            match best {
-                Some((_, best_d)) if *best_d <= d => {}
-                _ => *best = Some((id.0, d)),
-            }
-        } else {
-            for &child in &node.children {
-                walk(tree, child, local, voxel_size, best);
-            }
-        }
-    }
-    let mut best = None;
-    walk(tree, tree.root(), p, voxel_size, &mut best);
-    best.map(|(id, _)| id)
 }
 
 /// Extract the rotation component from an `Affine3A` by normalizing
@@ -5574,10 +5470,10 @@ fn tick_loop(
         // transform, BUILD targets the selected procedural node.
         state.update_gizmo();
         state.update_procedural_gizmo();
-        // 3b. BUILD left-click picking — runs after the gizmo so a
-        // click grabbing a handle begins a drag here rather than
-        // re-selecting the node underneath.
-        state.maybe_pick_procedural_node();
+        // BUILD left-click picking is handled by `process_pick_result`
+        // reading the GPU `gbuf_pick` texture (written every frame by
+        // `proc_raymarch.wgsl`). Ghost-pick priority is applied there
+        // too — see the BUILD+Raymarch branch in process_pick_result.
 
         // 4. Render frame — fires `frame_callback` once per visible viewport.
         state.render_frame(&frame_callback);

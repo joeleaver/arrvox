@@ -390,18 +390,6 @@ impl Default for MirrorParams {
     }
 }
 
-/// Apply the mirror fold to a local-frame position: the single
-/// component named by `axis` is replaced with its absolute value.
-/// Must stay byte-identical to the WGSL implementation in
-/// `proc_raymarch.wgsl` and the CPU RPN exec in the flatten tests.
-pub fn mirror_fold(pos: Vec3, axis: MirrorAxis) -> Vec3 {
-    match axis {
-        MirrorAxis::X => Vec3::new(pos.x.abs(), pos.y, pos.z),
-        MirrorAxis::Y => Vec3::new(pos.x, pos.y.abs(), pos.z),
-        MirrorAxis::Z => Vec3::new(pos.x, pos.y, pos.z.abs()),
-    }
-}
-
 /// Material-by-height effect params. Three bands along the effect's
 /// local Y axis, separated by `low_to_mid` and `mid_to_high`
 /// thresholds. `transition_width` widens each threshold into a
@@ -537,57 +525,6 @@ impl Default for ColorByNoiseParams {
             octaves: 3,
         }
     }
-}
-
-/// Classifier output for a by-* effect at a given scalar value.
-/// `lower` / `upper` are band indices (0=low, 1=mid, 2=high). `alpha`
-/// is the blend weight between them: 0 = fully lower, 1 = fully upper.
-/// Used by both the CPU evaluator and the CPU RPN exec in flatten
-/// tests so they agree with the WGSL implementation.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct BandClassify {
-    pub lower: u32,
-    pub upper: u32,
-    pub alpha: f32,
-}
-
-/// Classify a scalar into one of three bands with smooth transitions
-/// around the thresholds. `transition_width` is the total width of
-/// each transition zone (smoothstep is applied over
-/// `threshold - w/2 .. threshold + w/2`). A width of zero (or near
-/// zero) degenerates cleanly into hard bands.
-///
-/// Used by both by-height (feeding local Y) and by-noise (feeding an
-/// FBM sample). The math is identical — it's pure scalar
-/// classification — so both effects can share the same helper and
-/// WGSL port (`classify_bands` in `shaders/proc_raymarch.wgsl`).
-pub fn classify_bands(
-    value: f32,
-    low_to_mid: f32,
-    mid_to_high: f32,
-    transition_width: f32,
-) -> BandClassify {
-    let w_half = (transition_width * 0.5).max(1e-6);
-    if value < low_to_mid - w_half {
-        BandClassify { lower: 0, upper: 0, alpha: 0.0 }
-    } else if value < low_to_mid + w_half {
-        let t = ((value - (low_to_mid - w_half)) / (2.0 * w_half)).clamp(0.0, 1.0);
-        BandClassify { lower: 0, upper: 1, alpha: smoothstep01(t) }
-    } else if value < mid_to_high - w_half {
-        BandClassify { lower: 1, upper: 1, alpha: 0.0 }
-    } else if value < mid_to_high + w_half {
-        let t = ((value - (mid_to_high - w_half)) / (2.0 * w_half)).clamp(0.0, 1.0);
-        BandClassify { lower: 1, upper: 2, alpha: smoothstep01(t) }
-    } else {
-        BandClassify { lower: 2, upper: 2, alpha: 0.0 }
-    }
-}
-
-/// Standard Hermite smoothstep for t ∈ [0, 1]. Matches WGSL's
-/// `smoothstep(0, 1, t)` exactly.
-fn smoothstep01(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
 }
 
 #[cfg(test)]

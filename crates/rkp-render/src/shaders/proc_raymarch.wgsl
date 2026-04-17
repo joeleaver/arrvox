@@ -4,90 +4,24 @@
 // and writes the same G-buffer layout as `octree_march.wgsl` so the
 // downstream shadow / SSAO / shade / post passes see identical inputs.
 //
-// This is NOT a replacement for voxel rendering — it exists so that
-// interactive tree edits (slider drags, transform moves) can update at
-// 60 Hz without paying the ~700 ms voxelization cost per change. The
-// baked voxels remain the truth everywhere else (main viewport, play
-// mode, final shading quality).
+// Shared with the (Phase 2+) GPU bake compute: all math — primitive
+// SDFs, combinators, effects, noise, RPN interpretation — lives in
+// `proc_eval.wgsl`. This shader owns only the bindings and the
+// sphere-trace loop.
+//
+// Loader wraps this file between `proc_eval_types.wgsl` (types +
+// opcode constants) and `proc_eval.wgsl` (function bodies) at
+// shader-module creation. See `proc_raymarch.rs::new`. The shared
+// `eval_tree` reads the `instructions` binding declared below.
 
-// ── Opcodes ────────────────────────────────────────────────────────────
-// Match `flatten::OpKind` — values are u32-compared inline below, keep
-// in sync.
-const OP_SPHERE:    u32 = 0u;
-const OP_BOX:       u32 = 1u;
-const OP_CAPSULE:   u32 = 2u;
-const OP_CYLINDER:  u32 = 3u;
-const OP_TORUS:     u32 = 4u;
-const OP_PLANE:     u32 = 5u;
-const OP_RAMP:      u32 = 6u;
-const OP_UNION:     u32 = 100u;
-const OP_INTERSECT: u32 = 101u;
-const OP_SUBTRACT:  u32 = 102u;
-
-// Position-warp effects bracket a subtree with PUSH/POP.
-// PUSH reads params from the instruction and shoves `cur + warp` onto
-// the position stack so every primitive inside the bracket evaluates
-// at the warped position. POP undoes the push and shrinks the top
-// sample's distance by a conservative envelope (amp * sqrt(3) for
-// NoiseDisplace) so the sphere tracer stays 1-Lipschitz-safe.
-const OP_PUSH_NOISE_DISPLACE: u32 = 200u;
-const OP_POP_NOISE_DISPLACE:  u32 = 201u;
-// Mirror — world-space reflection across a plane derived from the
-// Mirror node's world transform (flatten bakes the plane from axis +
-// transform). `params_lo.xyz` = plane origin, `params_hi.xyz` = plane
-// normal (unit length). Fold is length-preserving so POP is a no-op
-// on the sample stack.
-const OP_PUSH_MIRROR: u32 = 202u;
-const OP_POP_MIRROR:  u32 = 203u;
-
-// Attribute-rewrite post-ops — no PUSH/POP pair, a single opcode
-// fires after the child's sample is on the stack and mutates the top
-// sample's material / color fields. `inverse_world` carries the
-// effect's world-to-local transform so the height read runs in the
-// effect's local frame.
-const OP_APPLY_MATERIAL_BY_HEIGHT: u32 = 300u;
-const OP_APPLY_COLOR_BY_HEIGHT:    u32 = 301u;
-// By-noise siblings — same post-op family, classifier input is an
-// FBM sample at the effect-local position instead of `local.y`.
-// ColorByNoise packs three RGB colors into u24-in-f32 via
-// `bitcast<u32>(f32)` + byte masking; the CPU side mirrors with
-// `f32::to_bits()`.
-const OP_APPLY_MATERIAL_BY_NOISE:  u32 = 302u;
-const OP_APPLY_COLOR_BY_NOISE:     u32 = 303u;
-
-const MAT_COMBINE_WINNER:  u32 = 0u;
-// `Layered` is represented but the shader treats it as Winner for now —
-// the dual-material G-buffer isn't wired through the raymarch path, so
-// there's no place to land the secondary material even if we computed
-// it here. See `combine_*`.
-const MAT_COMBINE_LAYERED: u32 = 1u;
-// `Blend { radius }` — smooth color interpolation inside a narrow band
-// where both surfaces are equally close. Geometry distance is still the
-// sharp min/max; we only lerp color between the two samples so the seam
-// looks soft instead of a hard material edge. The radius rides along
-// in each combinator instruction's `params_lo.x`.
-const MAT_COMBINE_BLEND:   u32 = 2u;
-
-// Max RPN stack depth. Tree depth is bounded by however many nested
-// combinators the user builds; 16 accommodates pathological cases while
-// keeping on-register use small. If the stream overflows we cap at the
-// top (behavior degrades to "drop extra children") rather than wedging
-// the shader.
-const STACK_CAP: u32 = 16u;
-
-// Max position-stack depth for nested position-warp effects. 8 allows
-// a reasonably deep chain (NoiseDisplace inside Mirror inside Twist…)
-// without eating too many vector registers. Overflow clamps — the
-// outermost push stops pushing new values; children of the dropped
-// effect evaluate at whatever position was last valid.
-const POS_STACK_CAP: u32 = 8u;
-
-// March parameters. Kept conservative to converge around typical
-// procedural geometry (primitives are 1-Lipschitz so classical sphere
-// tracing applies). Tuned by eye — feel free to adjust if you hit
-// over-/under-march artifacts on new shape combinations.
-const MAX_STEPS:    u32 = 128u;
-const MAX_DIST:     f32 = 500.0;
+// March parameters. Tight by design — the build viewport is an
+// editor preview, not a final renderer, and the user's procedural
+// objects sit in the 0.1 m – 10 m range. `MAX_DIST` is in entity-
+// local units; it scales with the entity's transform so a 10× larger
+// object still fits. `MAX_STEPS` = 64 converges on every 1-Lipschitz
+// primitive we ship and even leaves headroom for chains of combinators.
+const MAX_STEPS:    u32 = 64u;
+const MAX_DIST:     f32 = 30.0;
 const SURFACE_EPS:  f32 = 0.001;
 
 // ── Bindings ───────────────────────────────────────────────────────────
@@ -114,56 +48,14 @@ struct RaymarchParams {
     _pad1: u32,
     // Owning entity's world transform and its inverse. The shader
     // marches in entity-local space so the preview stays pinned
-    // wherever the entity is in the world; at hit, the local position
-    // and normal get transformed back to world for the G-buffer.
+    // wherever the entity is in the world.
     entity_world: mat4x4<f32>,
     entity_inverse_world: mat4x4<f32>,
-}
-
-// One flattened instruction. Layout MUST match
-// `rkp_procedural::flatten::ProcInstruction` byte-for-byte.
-struct ProcInstruction {
-    op: u32,
-    arity: u32,
-    material_combine: u32,
-    material_id: u32,
-    // `node_id` is the source NodeId the primitive came from, used for
-    // per-primitive picking; `u32::MAX` on combinators. The three
-    // `_pad` fields keep the CPU struct 16-byte aligned for vec4 loads.
-    node_id: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
-    // vec4s chosen for WGSL alignment (8 floats → two vec4s).
-    params_lo: vec4<f32>,
-    params_hi: vec4<f32>,
-    color: vec4<f32>,
-    inverse_world: mat4x4<f32>,
-}
-
-// A sample at one point: distance + material payload. Mirrors the CPU
-// `Sample` loosely — we drop fields (secondary/blend/color) that the
-// current shade pass pipeline doesn't need from this preview path.
-// Winner-mode CSG is enough for the preview; `Layered` falls through
-// to Winner here.
-struct TreeSample {
-    distance: f32,
-    material_id: u32,
-    /// Secondary material id for dual-material transitions (smooth
-    /// seams from MaterialByHeight / MaterialByNoise). Equal to
-    /// `material_id` outside transition zones. Combinators don't
-    /// propagate secondary/blend — only the post-op effects write
-    /// them, and the winner of any downstream combinator carries
-    /// the values forward.
-    secondary_material_id: u32,
-    /// Blend weight, 0..1. 0 means "pure primary," 1 means "pure
-    /// secondary." Post-ops set this in the transition zones.
-    blend_weight: f32,
-    color: vec3<f32>,
-    // Source primitive's NodeId — used so the G-buffer can tell the
-    // pick path "which primitive was hit." Propagated through
-    // combinators by picking the winner's id (same rule as material).
-    node_id: u32,
+    // Tree bounding box in entity-local space. Used to reject rays
+    // that can't possibly hit before we pay the sphere-trace loop,
+    // and to fast-forward hit-pixel rays to the AABB entry point.
+    aabb_min: vec4<f32>,
+    aabb_max: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
@@ -172,538 +64,11 @@ struct TreeSample {
 @group(1) @binding(1) var gbuf_normal:   texture_storage_2d<rgba16float, write>;
 @group(1) @binding(2) var gbuf_material: texture_storage_2d<rg32uint, write>;
 // rkp-side pick texture — R32Uint. Holds the hit primitive's NodeId
-// for per-primitive selection / outline. Moved out of packed_r's high
-// 16 bits so that slot can carry `secondary_material_id` (consumed
-// by rkp_shade for dual-material lerp).
+// for per-primitive selection / outline.
 @group(1) @binding(3) var gbuf_pick:     texture_storage_2d<r32uint, write>;
 
 @group(2) @binding(0) var<uniform> params: RaymarchParams;
 @group(2) @binding(1) var<storage, read> instructions: array<ProcInstruction>;
-
-// ── Primitive SDFs ─────────────────────────────────────────────────────
-// Each mirrors its CPU counterpart in `rkp_procedural::leaves`; keep
-// these in sync with that file if the Rust side ever changes.
-
-fn sdf_sphere(p: vec3<f32>, radius: f32) -> f32 {
-    return length(p) - radius;
-}
-
-fn sdf_box(p: vec3<f32>, half_extents: vec3<f32>, rounding: f32) -> f32 {
-    let q = abs(p) - half_extents + vec3<f32>(rounding);
-    let outside = length(max(q, vec3<f32>(0.0)));
-    let inside = min(max(q.x, max(q.y, q.z)), 0.0);
-    return outside + inside - rounding;
-}
-
-fn sdf_capsule(p: vec3<f32>, radius: f32, half_height: f32) -> f32 {
-    let t = clamp(p.y, -half_height, half_height);
-    let closest = vec3<f32>(0.0, t, 0.0);
-    return length(p - closest) - radius;
-}
-
-fn sdf_cylinder(p: vec3<f32>, radius: f32, half_height: f32) -> f32 {
-    let radial = length(vec3<f32>(p.x, 0.0, p.z)) - radius;
-    let axial = abs(p.y) - half_height;
-    // Keep the CPU branching exactly (`leaves::eval_cylinder`): when the
-    // point is outside both cylinder and caps, distance is the diagonal
-    // length; otherwise it's `max` of the signed axes (standard SDF
-    // boolean). Matching semantics avoids classifier disagreement.
-    if (radial > 0.0 && axial > 0.0) {
-        return sqrt(radial * radial + axial * axial);
-    }
-    return max(radial, axial);
-}
-
-fn sdf_torus(p: vec3<f32>, major_radius: f32, minor_radius: f32) -> f32 {
-    let xz_len = length(vec3<f32>(p.x, 0.0, p.z));
-    let q = vec3<f32>(xz_len - major_radius, p.y, 0.0);
-    return length(q) - minor_radius;
-}
-
-fn sdf_plane(p: vec3<f32>) -> f32 {
-    return p.y;
-}
-
-fn sdf_ramp(p: vec3<f32>, half_length: f32, half_height: f32, half_width: f32) -> f32 {
-    let q = abs(p) - vec3<f32>(half_length, half_height, half_width);
-    let outside = length(max(q, vec3<f32>(0.0)));
-    let inside = min(max(q.x, max(q.y, q.z)), 0.0);
-    let box_dist = outside + inside;
-    let hyp = max(sqrt(half_length * half_length + half_height * half_height), 1e-6);
-    let plane_dist = (half_length * p.y - half_height * p.x) / hyp;
-    return max(box_dist, plane_dist);
-}
-
-fn eval_primitive(ins: ProcInstruction, world_pos: vec3<f32>) -> TreeSample {
-    let local4 = ins.inverse_world * vec4<f32>(world_pos, 1.0);
-    let local = local4.xyz;
-    var d: f32 = 1e30;
-    switch ins.op {
-        case 0u: { d = sdf_sphere(local, ins.params_lo.x); }
-        case 1u: { d = sdf_box(local, ins.params_lo.xyz, ins.params_lo.w); }
-        case 2u: { d = sdf_capsule(local, ins.params_lo.x, ins.params_lo.y); }
-        case 3u: { d = sdf_cylinder(local, ins.params_lo.x, ins.params_lo.y); }
-        case 4u: { d = sdf_torus(local, ins.params_lo.x, ins.params_lo.y); }
-        case 5u: { d = sdf_plane(local); }
-        case 6u: { d = sdf_ramp(local, ins.params_lo.x, ins.params_lo.y, ins.params_lo.z); }
-        default: { d = 1e30; }
-    }
-    var s: TreeSample;
-    s.distance = d;
-    s.material_id = ins.material_id;
-    s.secondary_material_id = ins.material_id;
-    s.blend_weight = 0.0;
-    s.color = ins.color.xyz;
-    s.node_id = ins.node_id;
-    return s;
-}
-
-// ── Combinators ────────────────────────────────────────────────────────
-// Winner-mode material selection: whichever sample has the smaller
-// signed distance "wins" the material + color. `Layered` collapses to
-// Winner for now (see MAT_COMBINE_LAYERED comment).
-
-// In Blend mode, smooth the material/color transition across a band of
-// width `radius` centered where the two samples have equal distance.
-// Outside the band we fall back to Winner. Keeps the geometry's sharp
-// min/max (matching the CPU path) but gives a visually soft seam.
-fn blended_union_sample(a: TreeSample, b: TreeSample, radius: f32) -> TreeSample {
-    let distance = min(a.distance, b.distance);
-    let diff = abs(a.distance - b.distance);
-    let r = max(radius, 1e-6);
-    if (diff >= r) {
-        if (a.distance <= b.distance) { return a; }
-        return b;
-    }
-    // t=0 → fully b, t=1 → fully a (matches combine.rs's convention).
-    let t = 0.5 + 0.5 * (b.distance - a.distance) / r;
-    let winner_is_a = a.distance <= b.distance;
-    var s: TreeSample;
-    s.distance = distance;
-    s.material_id = select(b.material_id, a.material_id, winner_is_a);
-    // Secondary / blend come along with the winner — combinators don't
-    // blend materials across their children, only within the winner's
-    // own transition zone from a post-op.
-    s.secondary_material_id = select(b.secondary_material_id, a.secondary_material_id, winner_is_a);
-    s.blend_weight = select(b.blend_weight, a.blend_weight, winner_is_a);
-    s.color = mix(b.color, a.color, t);
-    s.node_id = select(b.node_id, a.node_id, winner_is_a);
-    return s;
-}
-
-fn combine_union(a: TreeSample, b: TreeSample, mat_mode: u32, radius: f32) -> TreeSample {
-    if (mat_mode == MAT_COMBINE_BLEND) {
-        return blended_union_sample(a, b, radius);
-    }
-    if (a.distance <= b.distance) { return a; }
-    return b;
-}
-
-fn combine_intersect(a: TreeSample, b: TreeSample) -> TreeSample {
-    // Max of distances; material from the loser (the one with the
-    // larger, i.e. more-outside, distance) — that's the boundary that
-    // defines the intersect surface. Matches `combine::combine_intersect`
-    // winner semantics. Blend radius intentionally unused here —
-    // intersect blends are rare and the visual seam is already soft
-    // by virtue of being the max-of-two surface.
-    if (a.distance >= b.distance) { return a; }
-    return b;
-}
-
-fn combine_subtract(a: TreeSample, b: TreeSample) -> TreeSample {
-    // Subtract: max(a, -b). Material (and picking source) always from
-    // `a` — cutters don't contribute geometry you can click on.
-    let neg_b = -b.distance;
-    if (a.distance >= neg_b) {
-        return a;
-    }
-    var r: TreeSample;
-    r.distance = neg_b;
-    r.material_id = a.material_id;
-    r.secondary_material_id = a.secondary_material_id;
-    r.blend_weight = a.blend_weight;
-    r.color = a.color;
-    r.node_id = a.node_id;
-    return r;
-}
-
-// ── RPN execution ──────────────────────────────────────────────────────
-
-fn eval_tree(world_pos: vec3<f32>) -> TreeSample {
-    var stack: array<TreeSample, STACK_CAP>;
-    var sp: u32 = 0u;
-
-    // Position stack. `pos_top` indexes the current sample position;
-    // `pos_stack[0]` is the outer world_pos. PUSH increments pos_top
-    // and writes the warped position; POP decrements pos_top. All
-    // primitive evaluations read from `pos_stack[pos_top]` so any
-    // bracketed subtree samples at the warped position transparently.
-    var pos_stack: array<vec3<f32>, POS_STACK_CAP>;
-    var pos_top: u32 = 0u;
-    pos_stack[0u] = world_pos;
-
-    let count = params.instruction_count;
-    for (var i: u32 = 0u; i < count; i = i + 1u) {
-        let ins = instructions[i];
-        let op = ins.op;
-
-        // ── Position-warp effects ──────────────────────────────────
-        if (op == OP_PUSH_NOISE_DISPLACE) {
-            let cur = pos_stack[pos_top];
-            let amp  = ins.params_lo.x;
-            let freq = ins.params_lo.y;
-            let seed = u32(ins.params_lo.z);
-            let oct  = u32(ins.params_lo.w);
-            let warped = cur + rkp_fbm_3d_vec(cur, freq, seed, oct) * amp;
-            // Overflow clamp: drop the push silently rather than stomp
-            // the last slot — behavior matches the arena-side cap on
-            // how deep effects can nest.
-            if (pos_top + 1u < POS_STACK_CAP) {
-                pos_top = pos_top + 1u;
-                pos_stack[pos_top] = warped;
-            }
-            continue;
-        }
-        if (op == OP_POP_NOISE_DISPLACE) {
-            if (pos_top > 0u) {
-                pos_top = pos_top - 1u;
-            }
-            // Shrink the top sample's distance by the conservative
-            // envelope so sphere tracing stays safe — mirror of the
-            // CPU evaluator's `child.distance - amp * sqrt(3)` at the
-            // end of its NoiseDisplace arm.
-            if (sp > 0u) {
-                let amp = ins.params_lo.x;
-                stack[sp - 1u].distance = stack[sp - 1u].distance - amp * 1.7320508;
-            }
-            continue;
-        }
-        if (op == OP_PUSH_MIRROR) {
-            let cur = pos_stack[pos_top];
-            let origin = ins.params_lo.xyz;
-            let normal = ins.params_hi.xyz;
-            // Reflect across the plane if `cur` is on the normal's
-            // negative side; otherwise leave as-is. Equivalent to the
-            // CPU evaluator's local-frame `p[axis] -> abs(p[axis])`
-            // after the (A*M) transform absorbs into primitive
-            // inverse_worlds below.
-            let d = dot(cur - origin, normal);
-            let folded = cur - 2.0 * min(d, 0.0) * normal;
-            if (pos_top + 1u < POS_STACK_CAP) {
-                pos_top = pos_top + 1u;
-                pos_stack[pos_top] = folded;
-            }
-            continue;
-        }
-        if (op == OP_POP_MIRROR) {
-            if (pos_top > 0u) {
-                pos_top = pos_top - 1u;
-            }
-            // No distance adjustment — reflection is an isometry.
-            continue;
-        }
-
-        // ── Attribute-rewrite post-ops ──────────────────────────────
-        if (op == OP_APPLY_MATERIAL_BY_HEIGHT) {
-            if (sp > 0u) {
-                let cur = pos_stack[pos_top];
-                let local = (ins.inverse_world * vec4<f32>(cur, 1.0)).xyz;
-                let c = classify_bands(
-                    local.y, ins.params_lo.x, ins.params_lo.y, ins.params_lo.z,
-                );
-                var mats: array<u32, 3>;
-                mats[0] = u32(ins.params_lo.w);
-                mats[1] = u32(ins.params_hi.x);
-                mats[2] = u32(ins.params_hi.y);
-                // Dual-material writeback — rkp_shade lerps PBR props
-                // using blend_weight. Primary = lower band, secondary
-                // = upper band; in "pure" zones lower == upper and
-                // alpha == 0 so the lerp is a no-op.
-                stack[sp - 1u].material_id = mats[c.lower];
-                stack[sp - 1u].secondary_material_id = mats[c.upper];
-                stack[sp - 1u].blend_weight = c.alpha;
-            }
-            continue;
-        }
-        if (op == OP_APPLY_COLOR_BY_HEIGHT) {
-            if (sp > 0u) {
-                let cur = pos_stack[pos_top];
-                let local = (ins.inverse_world * vec4<f32>(cur, 1.0)).xyz;
-                let low_to_mid     = ins.params_lo.x;
-                let low_color      = ins.params_lo.yzw;
-                let mid_to_high    = ins.params_hi.x;
-                let mid_color      = ins.params_hi.yzw;
-                let high_color     = ins.color.xyz;
-                let transition_w   = ins.color.w;
-                let c = classify_bands(
-                    local.y, low_to_mid, mid_to_high, transition_w,
-                );
-                var colors: array<vec3<f32>, 3>;
-                colors[0] = low_color;
-                colors[1] = mid_color;
-                colors[2] = high_color;
-                stack[sp - 1u].color = mix(colors[c.lower], colors[c.upper], c.alpha);
-            }
-            continue;
-        }
-        if (op == OP_APPLY_MATERIAL_BY_NOISE) {
-            if (sp > 0u) {
-                let cur = pos_stack[pos_top];
-                let local = (ins.inverse_world * vec4<f32>(cur, 1.0)).xyz;
-                // Layout: params_lo = [t1, t2, width, freq],
-                //         params_hi = [seed, oct, low_mat, mid_mat],
-                //         color.x = high_mat.
-                let freq = ins.params_lo.w;
-                let seed = u32(ins.params_hi.x);
-                let oct  = u32(ins.params_hi.y);
-                let n = rkp_fbm_3d_scalar(local, freq, seed, oct);
-                let c = classify_bands(
-                    n, ins.params_lo.x, ins.params_lo.y, ins.params_lo.z,
-                );
-                var mats: array<u32, 3>;
-                mats[0] = u32(ins.params_hi.z);
-                mats[1] = u32(ins.params_hi.w);
-                mats[2] = u32(ins.color.x);
-                // Dual-material writeback, same as MaterialByHeight.
-                stack[sp - 1u].material_id = mats[c.lower];
-                stack[sp - 1u].secondary_material_id = mats[c.upper];
-                stack[sp - 1u].blend_weight = c.alpha;
-            }
-            continue;
-        }
-        if (op == OP_APPLY_COLOR_BY_NOISE) {
-            if (sp > 0u) {
-                let cur = pos_stack[pos_top];
-                let local = (ins.inverse_world * vec4<f32>(cur, 1.0)).xyz;
-                // Layout: params_lo = [t1, t2, width, freq],
-                //         params_hi = [seed, oct, low_rgb_u24, mid_rgb_u24],
-                //         color.x = high_rgb_u24.
-                let freq = ins.params_lo.w;
-                let seed = u32(ins.params_hi.x);
-                let oct  = u32(ins.params_hi.y);
-                let n = rkp_fbm_3d_scalar(local, freq, seed, oct);
-                let c = classify_bands(
-                    n, ins.params_lo.x, ins.params_lo.y, ins.params_lo.z,
-                );
-                var colors: array<vec3<f32>, 3>;
-                colors[0] = unpack_rgb_u24(ins.params_hi.z);
-                colors[1] = unpack_rgb_u24(ins.params_hi.w);
-                colors[2] = unpack_rgb_u24(ins.color.x);
-                stack[sp - 1u].color = mix(
-                    colors[c.lower], colors[c.upper], c.alpha,
-                );
-            }
-            continue;
-        }
-
-        if (op < 100u) {
-            // Primitive — evaluates at the top of the position stack.
-            let s = eval_primitive(ins, pos_stack[pos_top]);
-            if (sp < STACK_CAP) {
-                stack[sp] = s;
-                sp = sp + 1u;
-            }
-        } else {
-            // Combinator. Pop `arity`, combine, push one.
-            let arity = ins.arity;
-            if (arity == 0u || arity > sp) {
-                // Malformed stream: treat as no-op. Keeps the shader
-                // safe when the CPU emits a combinator with nothing to
-                // consume (e.g. empty Subtract).
-                continue;
-            }
-            let base = sp - arity;
-            var acc = stack[base];
-            let blend_radius = ins.params_lo.x;
-            for (var k: u32 = 1u; k < arity; k = k + 1u) {
-                let rhs = stack[base + k];
-                switch op {
-                    case 100u: { acc = combine_union(acc, rhs, ins.material_combine, blend_radius); }
-                    case 101u: { acc = combine_intersect(acc, rhs); }
-                    case 102u: { acc = combine_subtract(acc, rhs); }
-                    default: {}
-                }
-            }
-            stack[base] = acc;
-            sp = base + 1u;
-        }
-    }
-
-    if (sp == 0u) {
-        var miss: TreeSample;
-        miss.distance = 1e30;
-        miss.material_id = 0u;
-        miss.secondary_material_id = 0u;
-        miss.blend_weight = 0.0;
-        miss.color = vec3<f32>(0.0);
-        miss.node_id = 0xFFFFFFFFu;
-        return miss;
-    }
-    return stack[sp - 1u];
-}
-
-// ── Gradient normal ────────────────────────────────────────────────────
-// Standard 6-tap central-difference gradient. Step size tuned against
-// SURFACE_EPS so we're sampling a neighborhood wider than the hit
-// epsilon — keeps the normal stable on slightly-over-marched hits.
-
-fn gradient_normal(p: vec3<f32>) -> vec3<f32> {
-    let h = SURFACE_EPS * 4.0;
-    let dx = eval_tree(p + vec3<f32>(h, 0.0, 0.0)).distance
-           - eval_tree(p - vec3<f32>(h, 0.0, 0.0)).distance;
-    let dy = eval_tree(p + vec3<f32>(0.0, h, 0.0)).distance
-           - eval_tree(p - vec3<f32>(0.0, h, 0.0)).distance;
-    let dz = eval_tree(p + vec3<f32>(0.0, 0.0, h)).distance
-           - eval_tree(p - vec3<f32>(0.0, 0.0, h)).distance;
-    let g = vec3<f32>(dx, dy, dz);
-    // Degenerate fallback (shouldn't fire in practice — every primitive
-    // has a well-defined gradient everywhere on its surface).
-    let len = length(g);
-    if (len < 1e-8) { return vec3<f32>(0.0, 1.0, 0.0); }
-    return g / len;
-}
-
-// ── Height-band classifier ─────────────────────────────────────────────
-// Mirror of `rkp_procedural::node_kind::classify_bands`. Returns the
-// two adjacent band indices and the smoothstep blend alpha between
-// them (alpha=0 → fully `lower`; alpha=1 → fully `upper`). Outside a
-// transition zone, lower == upper and alpha is 0.
-
-struct HeightClassify {
-    lower: u32,
-    upper: u32,
-    alpha: f32,
-}
-
-fn classify_bands(
-    y: f32,
-    low_to_mid: f32,
-    mid_to_high: f32,
-    transition_width: f32,
-) -> HeightClassify {
-    let w_half = max(transition_width * 0.5, 1e-6);
-    if (y < low_to_mid - w_half) {
-        return HeightClassify(0u, 0u, 0.0);
-    }
-    if (y < low_to_mid + w_half) {
-        let t = clamp((y - (low_to_mid - w_half)) / (2.0 * w_half), 0.0, 1.0);
-        return HeightClassify(0u, 1u, t * t * (3.0 - 2.0 * t));
-    }
-    if (y < mid_to_high - w_half) {
-        return HeightClassify(1u, 1u, 0.0);
-    }
-    if (y < mid_to_high + w_half) {
-        let t = clamp((y - (mid_to_high - w_half)) / (2.0 * w_half), 0.0, 1.0);
-        return HeightClassify(1u, 2u, t * t * (3.0 - 2.0 * t));
-    }
-    return HeightClassify(2u, 2u, 0.0);
-}
-
-// ── Noise (port of `crates/rkp-procedural/src/noise.rs`) ──────────────
-// Keep this byte-for-byte equivalent to the CPU side so a bake run
-// (CPU) and a live preview (this shader) produce identical displaced
-// geometry. WGSL u32 ops wrap by default — same semantics as Rust's
-// `wrapping_mul` / `wrapping_add`.
-
-fn rkp_hash_f32(x: u32) -> f32 {
-    var n = x;
-    n = (n ^ 61u) ^ (n >> 16u);
-    n = n * 9u;
-    n = n ^ (n >> 4u);
-    n = n * 0x27d4eb2du;
-    n = n ^ (n >> 15u);
-    return f32(n & 0x00ffffffu) * (1.0 / 16777216.0) * 2.0 - 1.0;
-}
-
-fn rkp_hash_3i(ix: i32, iy: i32, iz: i32, seed: u32) -> f32 {
-    let k = u32(ix) * 0x9e3779b9u
-          + u32(iy) * 0x7ed55d16u
-          + u32(iz) * 0xa3a52d49u
-          + seed;
-    return rkp_hash_f32(k);
-}
-
-fn rkp_smootherstep(t: f32) -> f32 {
-    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
-}
-
-fn rkp_noise_3d(pos: vec3<f32>, seed: u32) -> f32 {
-    let xf = floor(pos.x);
-    let yf = floor(pos.y);
-    let zf = floor(pos.z);
-    let ix = i32(xf);
-    let iy = i32(yf);
-    let iz = i32(zf);
-    let tx = rkp_smootherstep(pos.x - xf);
-    let ty = rkp_smootherstep(pos.y - yf);
-    let tz = rkp_smootherstep(pos.z - zf);
-    let c000 = rkp_hash_3i(ix,       iy,       iz,       seed);
-    let c100 = rkp_hash_3i(ix + 1,   iy,       iz,       seed);
-    let c010 = rkp_hash_3i(ix,       iy + 1,   iz,       seed);
-    let c110 = rkp_hash_3i(ix + 1,   iy + 1,   iz,       seed);
-    let c001 = rkp_hash_3i(ix,       iy,       iz + 1,   seed);
-    let c101 = rkp_hash_3i(ix + 1,   iy,       iz + 1,   seed);
-    let c011 = rkp_hash_3i(ix,       iy + 1,   iz + 1,   seed);
-    let c111 = rkp_hash_3i(ix + 1,   iy + 1,   iz + 1,   seed);
-    let x00 = c000 + (c100 - c000) * tx;
-    let x10 = c010 + (c110 - c010) * tx;
-    let x01 = c001 + (c101 - c001) * tx;
-    let x11 = c011 + (c111 - c011) * tx;
-    let y0 = x00 + (x10 - x00) * ty;
-    let y1 = x01 + (x11 - x01) * ty;
-    return y0 + (y1 - y0) * tz;
-}
-
-fn rkp_noise_3d_vec(pos: vec3<f32>, seed: u32) -> vec3<f32> {
-    return vec3<f32>(
-        rkp_noise_3d(pos, seed),
-        rkp_noise_3d(pos, seed + 0x9e3779b1u),
-        rkp_noise_3d(pos, seed + 0xb74684abu),
-    );
-}
-
-fn rkp_fbm_3d_vec(pos: vec3<f32>, frequency: f32, seed: u32, octaves_in: u32) -> vec3<f32> {
-    let octaves = clamp(octaves_in, 1u, 8u);
-    var sum = vec3<f32>(0.0);
-    var amp = 1.0;
-    var freq = max(frequency, 1e-6);
-    var total_amp = 0.0;
-    for (var k: u32 = 0u; k < octaves; k = k + 1u) {
-        sum = sum + rkp_noise_3d_vec(pos * freq, seed + k * 131u) * amp;
-        total_amp = total_amp + amp;
-        amp = amp * 0.5;
-        freq = freq * 2.0;
-    }
-    return sum / max(total_amp, 1e-6);
-}
-
-// Scalar FBM — port of `rkp_procedural::noise::fbm_3d_scalar`. One
-// channel, used by the by-noise post-ops to feed `classify_bands`.
-fn rkp_fbm_3d_scalar(pos: vec3<f32>, frequency: f32, seed: u32, octaves_in: u32) -> f32 {
-    let octaves = clamp(octaves_in, 1u, 8u);
-    var sum = 0.0;
-    var amp = 1.0;
-    var freq = max(frequency, 1e-6);
-    var total_amp = 0.0;
-    for (var k: u32 = 0u; k < octaves; k = k + 1u) {
-        sum = sum + rkp_noise_3d(pos * freq, seed + k * 131u) * amp;
-        total_amp = total_amp + amp;
-        amp = amp * 0.5;
-        freq = freq * 2.0;
-    }
-    return sum / max(total_amp, 1e-6);
-}
-
-// Unpack an RGB color from a u24-bit-laid f32 — mirror of the CPU
-// `unpack_rgb_u24` in `flatten.rs`. `bitcast<u32>(f32)` preserves
-// the exact bit pattern of the 24-bit packed color.
-fn unpack_rgb_u24(packed: f32) -> vec3<f32> {
-    let bits = bitcast<u32>(packed);
-    let r = f32(bits & 0xFFu) / 255.0;
-    let g = f32((bits >> 8u) & 0xFFu) / 255.0;
-    let b = f32((bits >> 16u) & 0xFFu) / 255.0;
-    return vec3<f32>(r, g, b);
-}
 
 // ── Ray construction ───────────────────────────────────────────────────
 
@@ -712,9 +77,7 @@ struct Ray { origin: vec3<f32>, dir: vec3<f32> };
 fn make_ray(coord: vec2<i32>) -> Ray {
     // Match `octree_march.wgsl:main`: the camera's `right` and `up`
     // basis vectors are already pre-scaled by aspect and tan(fov/2), so
-    // the ray is just `forward + ndc.x * right + ndc.y * up`. We do not
-    // touch view_proj here — the forward/right/up triplet is the
-    // caller-side source of truth and keeps both marchers consistent.
+    // the ray is just `forward + ndc.x * right + ndc.y * up`.
     let uv = (vec2<f32>(coord) + vec2<f32>(0.5) + camera.jitter) / camera.resolution;
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     var r: Ray;
@@ -740,13 +103,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ray = make_ray(coord);
 
     // Transform the camera ray into the entity's local frame so we can
-    // march the procedural tree (which is authored in local space) as
-    // if the entity were at origin. This mirrors octree_march's
-    // per-object trace, and matters whenever the entity's world
-    // transform has any translation/rotation/scale — without it the
-    // build-viewport preview drifts every time the user gizmos the
-    // entity in the main viewport. `local_scale` converts between the
-    // two t-parameters so distance checks stay in local units.
+    // march the procedural tree (authored in local space) as if the
+    // entity were at origin. Mirrors octree_march's per-object trace.
     let local_origin_h = params.entity_inverse_world * vec4<f32>(ray.origin, 1.0);
     let local_dir_h = params.entity_inverse_world * vec4<f32>(ray.dir, 0.0);
     let local_origin = local_origin_h.xyz;
@@ -755,46 +113,87 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let local_scale = length(local_dir_unnorm);
     let local_max_dist = MAX_DIST * local_scale;
 
-    var t: f32 = 0.0;
+    // ── AABB cull ─────────────────────────────────────────────────────
+    // Ray/AABB slab test in entity-local space. Rays that miss the
+    // tree's bounding box skip the sphere trace entirely (the vast
+    // majority of pixels on a small object in a big viewport). For
+    // rays that hit, `t_enter` fast-forwards the trace to the AABB
+    // entry so we don't waste steps marching through empty space
+    // outside the bounds.
+    //
+    // Division-by-zero on axis-aligned rays gives `inf` which the
+    // min/max chain collapses to ignore that axis — standard slab
+    // trick, no explicit epsilon needed.
+    let inv_dir = vec3<f32>(1.0, 1.0, 1.0) / local_dir;
+    let t0 = (params.aabb_min.xyz - local_origin) * inv_dir;
+    let t1 = (params.aabb_max.xyz - local_origin) * inv_dir;
+    let t_min = min(t0, t1);
+    let t_max = max(t0, t1);
+    let t_enter = max(max(t_min.x, t_min.y), t_min.z);
+    let t_exit  = min(min(t_max.x, t_max.y), t_max.z);
+
+    // Miss: the ray never enters the AABB (or exits behind the
+    // camera). Write the miss G-buffer and bail — the sphere trace
+    // would return the same answer at a much higher cost.
+    if (t_exit < 0.0 || t_enter > t_exit || t_enter > local_max_dist) {
+        textureStore(gbuf_position, coord, vec4<f32>(0.0, 0.0, 0.0, 1e10));
+        textureStore(gbuf_normal,   coord, vec4<f32>(0.0, 0.0, 0.0, 0.0));
+        textureStore(gbuf_material, coord, vec4<u32>(0u, 0u, 0u, 0u));
+        textureStore(gbuf_pick,     coord, vec4<u32>(0xFFFFu, 0u, 0u, 0u));
+        return;
+    }
+
+    let count = params.instruction_count;
+
+    // Sphere trace runs the distance-only fast path — a 64-byte
+    // `array<f32, STACK_CAP>` fits in registers where the 512-byte
+    // `array<TreeSample, STACK_CAP>` would spill to global memory.
+    // Full `eval_tree` runs once below at the hit point so the
+    // G-buffer sample still carries material + color + node_id.
+    //
+    // Start at the AABB entry (or origin if camera is inside the
+    // box). The cap at `t_exit` lets trace-ending run short when
+    // the ray leaves the box without hitting the surface.
+    var t: f32 = max(t_enter, 0.0);
+    let t_cap = min(t_exit, local_max_dist);
     var hit: bool = false;
     var hit_local: vec3<f32> = vec3<f32>(0.0);
-    var hit_sample: TreeSample;
     for (var step: u32 = 0u; step < MAX_STEPS; step = step + 1u) {
         let p = local_origin + local_dir * t;
-        let s = eval_tree(p);
-        if (s.distance < SURFACE_EPS) {
+        let d = eval_tree_distance(p, count);
+        if (d < SURFACE_EPS) {
             hit = true;
             hit_local = p;
-            hit_sample = s;
             break;
         }
-        // Sphere trace: step by the signed distance (which is, for a
-        // 1-Lipschitz SDF, the max safe step). Negative distances can
-        // happen after over-march; clamp to `SURFACE_EPS` so we don't
-        // walk backwards.
-        t = t + max(s.distance, SURFACE_EPS);
-        if (t > local_max_dist) { break; }
+        // Sphere trace: step by the signed distance (max safe step
+        // for a 1-Lipschitz SDF). Clamp to `SURFACE_EPS` on negative
+        // distances so we don't walk backwards after over-march.
+        t = t + max(d, SURFACE_EPS);
+        if (t > t_cap) { break; }
     }
 
     if (!hit) {
         textureStore(gbuf_position, coord, vec4<f32>(0.0, 0.0, 0.0, 1e10));
         textureStore(gbuf_normal,   coord, vec4<f32>(0.0, 0.0, 0.0, 0.0));
         textureStore(gbuf_material, coord, vec4<u32>(0u, 0u, 0u, 0u));
-        // 0xFFFF = "no primitive" sentinel the outline + pick paths
-        // treat as a miss.
+        // 0xFFFF = "no primitive" sentinel that outline + pick treat
+        // as a miss.
         textureStore(gbuf_pick,     coord, vec4<u32>(0xFFFFu, 0u, 0u, 0u));
         return;
     }
 
     // Back to world space for the G-buffer. Downstream shade / shadow
-    // / post passes all read world-space positions; normals are used
-    // for lighting which also happens in world. For uniform or rigid
-    // transforms the naive matrix-mul for the normal is correct; with
-    // non-uniform scale the strictly-right thing is inverse-transpose,
-    // but the build-viewport preview is an editing tool so we live
-    // with the mild lighting error until it actually bites.
+    // / post passes all read world-space positions. For uniform or
+    // rigid transforms the naive matrix-mul for the normal is correct;
+    // with non-uniform scale the strictly-right thing is inverse-
+    // transpose, but the build-viewport preview is an editing tool so
+    // we live with the mild lighting error until it actually bites.
+    // One full-sample call at the hit to pull material + color +
+    // node_id for the G-buffer. Gradient uses the distance-only path.
+    let hit_sample = eval_tree(hit_local, count);
     let hit_pos = (params.entity_world * vec4<f32>(hit_local, 1.0)).xyz;
-    let local_normal = gradient_normal(hit_local);
+    let local_normal = gradient_normal(hit_local, count, SURFACE_EPS * 4.0);
     let normal = normalize((params.entity_world * vec4<f32>(local_normal, 0.0)).xyz);
 
     // Pack material/color into the same G-buffer format octree_march
@@ -803,9 +202,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     //   packed_r = primary (low 16) | secondary (high 16)
     //   packed_g = blend_u8 | object_id_u8 << 8 | color_rgb565 << 16
     //
-    // `rkp_shade` now lerps PBR properties between primary/secondary
-    // using blend_weight, so by-height / by-noise transition zones
-    // render with smooth seams both here and in the voxel path.
+    // `rkp_shade` lerps PBR properties between primary/secondary using
+    // blend_weight, so by-height / by-noise transition zones render
+    // with smooth seams both here and in the voxel path.
     //
     // The hit primitive's NodeId lives in `gbuf_pick` instead of the
     // old packed_r high-16 slot. `0xFFFF` is the "no primitive"
@@ -824,8 +223,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                  | ((params.object_id & 0xFFu) << 8u)
                  | (color_rgb565 << 16u);
 
-    // `t` is in local-space units; the G-buffer's depth slot expects
-    // a world-space distance along the ray so downstream passes (fog,
+    // `t` is in local-space units; the G-buffer's depth slot expects a
+    // world-space distance along the ray so downstream passes (fog,
     // SSAO, etc.) stay comparable with voxel hits. Dividing by
     // `local_scale` undoes the inverse_world's scale contribution.
     let world_t = select(t / local_scale, t, local_scale < 1e-8);

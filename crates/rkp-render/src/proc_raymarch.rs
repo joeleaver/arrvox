@@ -49,11 +49,33 @@ pub struct ProcRaymarchParams {
     pub _pad1: u32,
     pub entity_world: [[f32; 4]; 4],
     pub entity_inverse_world: [[f32; 4]; 4],
+    /// Tree bounding box in *entity-local* space (the frame the shader
+    /// marches in). The shader does a cheap ray/AABB slab test before
+    /// sphere-tracing; any pixel whose ray misses the AABB entirely
+    /// is guaranteed to miss the geometry and can write the G-buffer
+    /// "miss" state and bail. For a small procedural in a big
+    /// viewport that skips the vast majority of pixels.
+    ///
+    /// Padded to `vec4` so the WGSL struct layout matches (vec3's
+    /// natural alignment is 16 B in uniform storage).
+    pub aabb_min: [f32; 4],
+    pub aabb_max: [f32; 4],
 }
 
 /// Procedural CSG raymarch compute pass.
 pub struct ProcRaymarchPass {
-    pipeline: wgpu::ComputePipeline,
+    /// Pipeline variants keyed on the `HAS_POS_WARPS` shader override.
+    /// `pipeline_simple` compiles with the override set to `false`,
+    /// which lets the compiler dead-strip the entire `pos_stack` +
+    /// all PUSH/POP branches — a measurable win in the common case
+    /// where the user's tree is primitives + combinators + post-op
+    /// effects only. `pipeline_warps` keeps the full logic for trees
+    /// that use NoiseDisplace or Mirror. `upload_instructions` flips
+    /// `has_warps` based on the flattened tree's opcodes; `dispatch`
+    /// picks the matching pipeline.
+    pipeline_simple: wgpu::ComputePipeline,
+    pipeline_warps: wgpu::ComputePipeline,
+    has_warps: bool,
 
     camera_bind_group_layout: wgpu::BindGroupLayout,
     camera_bind_group: Option<wgpu::BindGroup>,
@@ -158,8 +180,18 @@ impl ProcRaymarchPass {
             mapped_at_creation: false,
         });
 
-        let shader_src = include_str!("shaders/proc_raymarch.wgsl");
-        validate_wgsl(shader_src, "proc_raymarch");
+        // Concat order: shared types → this shader's bindings + entry
+        // → shared function bodies. The types file defines
+        // `ProcInstruction` so the binding declaration below can name
+        // it; the function bodies reference the `instructions` binding
+        // as a module-scope global. WGSL resolves functions across the
+        // whole module regardless of declaration order, so `main`
+        // calling `eval_tree` before it's defined works.
+        let types_src = include_str!("shaders/proc_eval_types.wgsl");
+        let raymarch_src = include_str!("shaders/proc_raymarch.wgsl");
+        let eval_src = include_str!("shaders/proc_eval.wgsl");
+        let shader_src = format!("{types_src}\n{raymarch_src}\n{eval_src}");
+        validate_wgsl(&shader_src, "proc_raymarch");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("proc_raymarch"),
             source: wgpu::ShaderSource::Wgsl(shader_src.into()),
@@ -175,17 +207,32 @@ impl ProcRaymarchPass {
             immediate_size: 0,
         });
 
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("proc_raymarch"),
-            layout: Some(&pipeline_layout),
-            module: &module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let make_pipeline = |label: &str, has_warps: bool| -> wgpu::ComputePipeline {
+            let overrides: &[(&str, f64)] = if has_warps {
+                &[("HAS_POS_WARPS", 1.0)]
+            } else {
+                &[("HAS_POS_WARPS", 0.0)]
+            };
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: overrides,
+                    zero_initialize_workgroup_memory: false,
+                },
+                cache: None,
+            })
+        };
+
+        let pipeline_simple = make_pipeline("proc_raymarch (simple)", false);
+        let pipeline_warps = make_pipeline("proc_raymarch (warps)", true);
 
         Self {
-            pipeline,
+            pipeline_simple,
+            pipeline_warps,
+            has_warps: false,
             camera_bind_group_layout,
             camera_bind_group: None,
             gbuffer_bind_group_layout,
@@ -269,6 +316,15 @@ impl ProcRaymarchPass {
             self.instructions_capacity = new_cap;
             self.rebuild_params_bind_group(device);
         }
+        // Pipeline variant selection: only trees with at least one
+        // PUSH opcode (NoiseDisplace or Mirror) need the pos_stack.
+        // Everything else — primitives, combinators, post-op
+        // attribute rewrites — uses the simple pipeline so the
+        // shader compiler can eliminate the stack entirely.
+        self.has_warps = instructions.iter().any(|ins| {
+            ins.op == rkp_procedural::OpKind::PushNoiseDisplace as u32
+                || ins.op == rkp_procedural::OpKind::PushMirror as u32
+        });
         if !instructions.is_empty() {
             queue.write_buffer(&self.instructions_buffer, 0, bytemuck::cast_slice(instructions));
         }
@@ -288,6 +344,8 @@ impl ProcRaymarchPass {
         instruction_count: u32,
         object_id: u32,
         entity_world: glam::Affine3A,
+        aabb_min: glam::Vec3,
+        aabb_max: glam::Vec3,
     ) {
         let world = glam::Mat4::from(entity_world);
         let inverse = world.inverse();
@@ -298,6 +356,8 @@ impl ProcRaymarchPass {
             _pad1: 0,
             entity_world: world.to_cols_array_2d(),
             entity_inverse_world: inverse.to_cols_array_2d(),
+            aabb_min: [aabb_min.x, aabb_min.y, aabb_min.z, 0.0],
+            aabb_max: [aabb_max.x, aabb_max.y, aabb_max.z, 0.0],
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&p));
     }
@@ -341,7 +401,12 @@ impl ProcRaymarchPass {
             label: Some("proc_raymarch"),
             timestamp_writes,
         });
-        pass.set_pipeline(&self.pipeline);
+        let pipeline = if self.has_warps {
+            &self.pipeline_warps
+        } else {
+            &self.pipeline_simple
+        };
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, cam, &[]);
         pass.set_bind_group(1, gbuf, &[]);
         pass.set_bind_group(2, params, &[]);

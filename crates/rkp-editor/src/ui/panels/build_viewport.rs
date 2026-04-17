@@ -15,7 +15,7 @@ use rinch::render_surface::{RenderSurface, SurfaceEvent, SurfaceMouseButton};
 
 use rkp_engine::procedural_snapshot::ProceduralSnapshot;
 use rkp_engine::viewport::ViewportId;
-use rkp_render::{BuildPreviewMode, RenderMode};
+use rkp_render::BuildPreviewMode;
 
 use crate::{BuildSurface, CommandSender};
 use crate::ui::store::EditorStore;
@@ -67,29 +67,15 @@ pub fn BuildViewport() -> NodeHandle {
     let store = use_context::<EditorStore>();
 
     let turntable = Signal::new(Turntable::default());
-    let mode = Signal::new(RenderMode::Isolation);
     let last_mx = std::cell::Cell::new(0.0f32);
     let last_my = std::cell::Cell::new(0.0f32);
     let orbiting = std::cell::Cell::new(false);
 
-    // Push the mode to the engine whenever it changes. Edge-only via
-    // a non-reactive Cell — same pattern as the visibility effect to
-    // avoid re-queueing into a flush already in progress.
-    {
-        let prev_mode = std::cell::Cell::new(None::<RenderMode>);
-        let cmd_tx = cmd.0.clone();
-        __scope.create_effect(move || {
-            let m = mode.get();
-            if prev_mode.get() == Some(m) {
-                return;
-            }
-            prev_mode.set(Some(m));
-            let _ = cmd_tx.send(rkp_engine::EngineCommand::SetViewportMode {
-                id: PANEL_VIEWPORT,
-                mode: m,
-            });
-        });
-    }
+    // BUILD always uses Isolation rendering (studio backdrop + grid).
+    // The mode is set once at viewport creation in `viewport.rs`; no
+    // toggle exists here because the old In-Situ option added a lot
+    // of pass-chain complexity for almost no editing benefit — the
+    // MAIN viewport already shows the in-scene look.
 
     // Whenever `procedural` flips between Some and None, drive the
     // viewport's visibility. `__scope.create_effect` ties the effect's
@@ -135,32 +121,22 @@ pub fn BuildViewport() -> NodeHandle {
         });
     }
 
-    // Drive the viewport's visibility filter from (selected_entity, mode).
-    //
-    // - Isolation: `BUILD_PREVIEW` base — excludes normal scene objects.
-    //   focus_entity is the additive escape hatch that lets the selected
-    //   procedural through regardless of its (DEFAULT) layer bit.
-    // - In-Situ: `DEFAULT` base — the build preview sees whatever the
-    //   main scene contains, so the procedural is rendered in context.
-    //   focus_entity stays set so the selection remains visible even if
-    //   somebody tagged it out of DEFAULT.
+    // Drive the viewport's visibility filter from the selected entity.
+    // Always `BUILD_PREVIEW` base — excludes normal scene objects;
+    // `focus_entity` is the additive escape hatch that lets the
+    // selected procedural through regardless of its layer bit.
     {
-        let prev = std::cell::Cell::new(None::<(Option<uuid::Uuid>, RenderMode)>);
+        let prev = std::cell::Cell::new(None::<Option<uuid::Uuid>>);
         let cmd_tx = cmd.0.clone();
         __scope.create_effect(move || {
             let focus = store.selected_entity.get();
-            let m = mode.get();
-            if prev.get() == Some((focus, m)) {
+            if prev.get() == Some(focus) {
                 return;
             }
-            prev.set(Some((focus, m)));
-            let base_layers = match m {
-                RenderMode::Isolation => rkp_engine::viewport::layer::BUILD_PREVIEW,
-                RenderMode::InSitu => rkp_engine::viewport::layer::DEFAULT,
-            };
+            prev.set(Some(focus));
             let _ = cmd_tx.send(rkp_engine::EngineCommand::SetViewportFilter {
                 id: PANEL_VIEWPORT,
-                base_layers,
+                base_layers: rkp_engine::viewport::layer::BUILD_PREVIEW,
                 focus_entity_id: focus,
             });
         });
@@ -312,17 +288,6 @@ pub fn BuildViewport() -> NodeHandle {
         div {
             style: "display:flex;flex-direction:column;width:100%;height:100%;\
                     background:#1a1a1a;",
-            // Header row with isolation/in-situ toggle. Sized to match
-            // the main viewport's ViewportHeaderBar so panels align.
-            div {
-                style: "height:32px;display:flex;align-items:center;\
-                        padding:0 6px;background:#252526;\
-                        border-bottom:1px solid #3c3c3c;flex-shrink:0;gap:4px;",
-                {mode_toggle(__scope, mode, RenderMode::Isolation, "Isolation",
-                             "Studio backdrop with grid")}
-                {mode_toggle(__scope, mode, RenderMode::InSitu, "In-Situ",
-                             "Match scene environment")}
-            }
             div {
                 style: "flex:1;min-height:0;position:relative;",
                 RenderSurface { surface: Some(surface.clone()) }
@@ -387,38 +352,6 @@ pub fn BuildViewport() -> NodeHandle {
                     }
                 }
             }
-        }
-    }
-}
-
-/// Segmented-button entry. `current` is the live mode signal; clicking
-/// sets it to `value`. The active variant gets a brighter background.
-fn mode_toggle(
-    __scope: &mut rinch::core::dom::RenderScope,
-    current: Signal<RenderMode>,
-    value: RenderMode,
-    label: &'static str,
-    title: &'static str,
-) -> rinch::core::dom::NodeHandle {
-    rsx! {
-        div {
-            style: {move || {
-                if current.get() == value {
-                    "padding:2px 10px;background:#3c5a8a;border:1px solid #4a78b0;\
-                     border-radius:4px;cursor:pointer;color:#dde7f5;font-size:11px;\
-                     font-weight:600;"
-                } else {
-                    "padding:2px 10px;background:#2a2a2a;border:1px solid #3c3c3c;\
-                     border-radius:4px;cursor:pointer;color:#a0a0a0;font-size:11px;"
-                }
-            }},
-            title: title,
-            onclick: move || {
-                if current.get() != value {
-                    current.set(value);
-                }
-            },
-            {label}
         }
     }
 }
