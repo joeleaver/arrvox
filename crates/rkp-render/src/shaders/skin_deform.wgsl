@@ -57,6 +57,16 @@ struct LeafAttr {
 // skip empty bricks with one lookup instead of 64 cell reads. Same
 // buffer is bound read-only into the main bind group as binding 10.
 @group(0) @binding(10) var<storage, read_write> bone_field_occ: array<atomic<u32>>;
+// Precomputed forward-pose dual quaternions — one 32-byte DualQuat
+// per bone across every skinned entity. Indexed by
+// `bone_dq_offset + bone_idx`. See `BoneMatrixAllocator` on the CPU
+// side; DQS reads straight from here instead of reconstructing DQs
+// from the matrix palette.
+struct DualQuat {
+    r: vec4<f32>,
+    d: vec4<f32>,
+}
+@group(0) @binding(11) var<storage, read> bone_dual_quats: array<DualQuat>;
 
 // ---- Per-dispatch bindings (one dispatch per skinned entity) --------
 
@@ -81,8 +91,12 @@ struct SkinUniforms {
     // Offset into `bone_field_occ` (in u32 words) where this entity's
     // packed brick bitmap begins. Brick dims = ceil(cell_dims / 4).
     bone_field_occ_offset: u32,
-    // 5 × u32 pad → 64 B total (Rust struct kept matching).
-    _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32, _pad4: u32,
+    // `0` = LBS, `1` = DQS. See the Rust `SkinUniforms` doc.
+    skinning_mode: u32,
+    // Offset into `bone_dual_quats` in DualQuat (32-byte) units.
+    bone_dq_offset: u32,
+    // 3 × u32 pad → 64 B total (Rust struct kept matching).
+    _pad0: u32, _pad1: u32, _pad2: u32,
 }
 
 struct SkinBrickEntry {
@@ -131,6 +145,122 @@ fn forward_skin(
     }
     if total_w > 0.0 { return acc / total_w; }
     return rest_pos;
+}
+
+// ── Dual-Quaternion Skinning ─────────────────────────────────────────
+//
+// Why DQS exists: LBS averages matrices linearly, which does not yield
+// a valid rigid transform in between — the intermediate matrix has
+// "less rotation" in its upper 3×3, which shrinks the mesh toward the
+// joint centre. That's the candy-wrapper twist and the joint-volume
+// collapse.
+//
+// DQS interpolates in the dual-quaternion manifold: linear blend of
+// per-bone DQs, then normalise by real-part magnitude. Intermediate
+// blends remain rigid transforms, so mesh thickness is preserved
+// through any joint angle.
+//
+// The per-bone dual quaternions are precomputed on the CPU once per
+// frame (see `BoneMatrixAllocator` / `mat_to_dual_quat` in
+// scene_sync.rs) and uploaded in `bone_dual_quats` — scatter just
+// reads them directly. This replaces an in-shader matrix→quat
+// extraction that used Shepperd's method and cost ~60 ALU per
+// influence × 4 influences per voxel × many voxels, which was the
+// dominant source of the DQS scatter overhead.
+//
+// Quaternions here are `vec4(x, y, z, w)` with `w` as the scalar.
+
+fn quat_rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
+    let t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
+fn dual_quat_transform_pos(dq: DualQuat, p: vec3<f32>) -> vec3<f32> {
+    // Standard DQS position: rotate p by r, then add the translation
+    // 2 * (r.w * d.xyz - d.w * r.xyz + cross(r.xyz, d.xyz)).
+    let rotated = quat_rotate(dq.r, p);
+    let translation = 2.0 * (dq.r.w * dq.d.xyz - dq.d.w * dq.r.xyz + cross(dq.r.xyz, dq.d.xyz));
+    return rotated + translation;
+}
+
+fn dual_quat_transform_dir(dq: DualQuat, n: vec3<f32>) -> vec3<f32> {
+    // Directions (normals) only care about the real/rotation part.
+    return quat_rotate(dq.r, n);
+}
+
+// Build the blended dual quaternion for a vertex's 4 bone influences.
+// Antipodality fix: dual quats `dq` and `-dq` represent the same
+// transform, but blending across the double-cover boundary cancels
+// the rotation. Flip each influence so its real part lies in the same
+// hemisphere as the first influence's. Without this fix DQS produces
+// catastrophic flips at bones whose quaternions happen to straddle.
+fn blend_dual_quat(
+    packed_indices: u32,
+    packed_weights: u32,
+    bone_dq_offset: u32,
+) -> DualQuat {
+    var acc_r = vec4<f32>(0.0);
+    var acc_d = vec4<f32>(0.0);
+    var total_w = 0.0;
+    var base_r = vec4<f32>(0.0);
+    var have_base = false;
+
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let bone_idx = (packed_indices >> (i * 8u)) & 0xFFu;
+        let w_u = (packed_weights >> (i * 8u)) & 0xFFu;
+        if w_u == 0u { continue; }
+        let w = f32(w_u);
+        let dq = bone_dual_quats[bone_dq_offset + bone_idx];
+        var r = dq.r;
+        var d = dq.d;
+        if !have_base {
+            base_r = r;
+            have_base = true;
+        } else if dot(base_r, r) < 0.0 {
+            r = -r;
+            d = -d;
+        }
+        acc_r = acc_r + w * r;
+        acc_d = acc_d + w * d;
+        total_w = total_w + w;
+    }
+
+    if total_w <= 0.0 {
+        return DualQuat(vec4<f32>(0.0, 0.0, 0.0, 1.0), vec4<f32>(0.0));
+    }
+    // Normalise by real-part magnitude — this is what keeps the blend
+    // on the rigid-transform manifold.
+    let len_r = length(acc_r);
+    if len_r < 1e-6 {
+        return DualQuat(vec4<f32>(0.0, 0.0, 0.0, 1.0), vec4<f32>(0.0));
+    }
+    let inv_len = 1.0 / len_r;
+    return DualQuat(acc_r * inv_len, acc_d * inv_len);
+}
+
+fn forward_skin_dqs(
+    rest_pos: vec3<f32>,
+    packed_indices: u32,
+    packed_weights: u32,
+    bone_dq_offset: u32,
+) -> vec3<f32> {
+    if packed_weights == 0u { return rest_pos; }
+    let dq = blend_dual_quat(packed_indices, packed_weights, bone_dq_offset);
+    return dual_quat_transform_pos(dq, rest_pos);
+}
+
+fn forward_rotate_normal_dqs(
+    rest_normal: vec3<f32>,
+    packed_indices: u32,
+    packed_weights: u32,
+    bone_dq_offset: u32,
+) -> vec3<f32> {
+    if packed_weights == 0u { return rest_normal; }
+    let dq = blend_dual_quat(packed_indices, packed_weights, bone_dq_offset);
+    let out = dual_quat_transform_dir(dq, rest_normal);
+    let l = length(out);
+    if l > 1e-6 { return out / l; }
+    return rest_normal;
 }
 
 // Rotate a rest-pose normal by the weighted LBS blend (upper-3×3 of
@@ -220,13 +350,21 @@ fn main(
         f32(info.origin_z + cz),
     ) + vec3<f32>(0.5)) * skin.voxel_size;
 
-    let deformed_pos = forward_skin(rest_pos, packed_indices, packed_weights, skin.bone_buffer_offset);
-
-    // Fetch the leaf's rest-pose normal and rotate it into deformed
-    // space once. The march reads this pre-rotated value directly so
-    // it never has to touch `rotate_rest_normal` at shade time.
+    var deformed_pos: vec3<f32>;
+    var deformed_normal: vec3<f32>;
+    // Fetch the leaf's rest-pose normal so we can rotate it into
+    // deformed space once; the march reads this pre-rotated value
+    // directly so it never has to touch `rotate_rest_normal` at
+    // shade time.
     let rest_normal = unpack_oct_normal(leaf_attr_pool[slot].normal_oct);
-    let deformed_normal = forward_rotate_normal(rest_normal, packed_indices, packed_weights, skin.bone_buffer_offset);
+    if skin.skinning_mode == 1u {
+        deformed_pos = forward_skin_dqs(rest_pos, packed_indices, packed_weights, skin.bone_dq_offset);
+        deformed_normal = forward_rotate_normal_dqs(rest_normal, packed_indices, packed_weights, skin.bone_dq_offset);
+    } else {
+        deformed_pos = forward_skin(rest_pos, packed_indices, packed_weights, skin.bone_buffer_offset);
+        deformed_normal = forward_rotate_normal(rest_normal, packed_indices, packed_weights, skin.bone_buffer_offset);
+    }
+
     let normal_packed = pack_oct_normal(deformed_normal);
 
     // Cell payload — (leaf_slot, deformed_normal_oct). The march

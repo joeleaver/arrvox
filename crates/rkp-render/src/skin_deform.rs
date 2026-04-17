@@ -35,11 +35,17 @@ pub struct SkinUniforms {
     /// Offset into the scene-wide bone-field occupancy bitmap in u32
     /// words. Each bit covers one 4³-cell brick of this entity's slice.
     pub bone_field_occ_offset: u32,
+    /// `0` = Linear Blend Skinning (4-bone weighted matrix sum);
+    /// `1` = Dual-Quaternion Skinning (rigid interpolation through
+    /// the dual-quat manifold — preserves joint volume, no "candy
+    /// wrapper" on axial twists).
+    pub skinning_mode: u32,
+    /// Offset into the scene-wide `bone_dual_quats` buffer in DualQuat
+    /// (32-byte) units. One DQ per bone, forward-pose-only.
+    pub bone_dq_offset: u32,
     pub _pad0: u32,
     pub _pad1: u32,
     pub _pad2: u32,
-    pub _pad3: u32,
-    pub _pad4: u32,
 }
 
 /// One entry in the scene-wide `brick_list` storage buffer. Each
@@ -171,6 +177,7 @@ impl SkinDeformPass {
                     },
                     count: None,
                 },
+                scene_ro(11), // bone_dual_quats (DQS precomputed palette)
             ],
         });
 
@@ -272,6 +279,7 @@ impl SkinDeformPass {
                 wgpu::BindGroupEntry { binding: 8, resource: scene.leaf_attr_pool_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: scene.bone_field_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: scene.bone_field_occ_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: scene.bone_dual_quats_buffer.as_entire_binding() },
             ],
         })
     }

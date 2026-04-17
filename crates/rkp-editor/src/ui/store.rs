@@ -129,6 +129,12 @@ pub struct EditorStore {
     /// skipped and the march shader falls back to rigid-mesh rendering
     /// for every skinned entity. Defaults `true`.
     pub skinning_enabled: Signal<bool>,
+    /// `true` → Dual-Quaternion Skinning (preserves joint volume);
+    /// `false` → Linear Blend Skinning (classic candy-wrapper pinching
+    /// at twist joints, volume loss at sharp bends). Defaults `false`
+    /// to match the engine's default — DQS has a ~+13% scatter cost
+    /// and the visible payoff only matters on extreme poses.
+    pub dqs_enabled: Signal<bool>,
 
     // ── Drag state (tab dragging) ────────────────────────────────
 
@@ -223,6 +229,7 @@ impl EditorStore {
             play_mode: Signal::new(false),
             show_colliders: Signal::new(false),
             skinning_enabled: Signal::new(true),
+            dqs_enabled: Signal::new(false),
 
             // Drag state.
             tab_drag: Signal::new(None),

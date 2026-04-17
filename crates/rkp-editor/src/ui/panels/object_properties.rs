@@ -574,9 +574,17 @@ fn animation_controls(
     // rest pose. Defaults on.
     let store_for_skin = use_context::<EditorStore>();
     let skinning_signal = store_for_skin.skinning_enabled;
+    let dqs_signal = store_for_skin.dqs_enabled;
+    let cmd_tx_skin = cmd_tx.clone();
     let on_skinning = Rc::new(move |enabled: bool| {
-        let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetViewOption {
+        let _ = cmd_tx_skin.get().send(rkp_engine::EngineCommand::SetViewOption {
             option: "skinning".into(),
+            enabled,
+        });
+    }) as Rc<dyn Fn(bool)>;
+    let on_dqs = Rc::new(move |enabled: bool| {
+        let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetViewOption {
+            option: "dqs".into(),
             enabled,
         });
     }) as Rc<dyn Fn(bool)>;
@@ -609,6 +617,8 @@ fn animation_controls(
             {prop_select(__scope, "Loop", loop_signal, &loop_options, on_loop)}
             // Master skinning toggle (off = rigid render).
             {prop_checkbox(__scope, "Skinning", skinning_signal, on_skinning)}
+            // LBS vs DQS. On = DQS (preserves joint volume).
+            {prop_checkbox(__scope, "DQS", dqs_signal, on_dqs)}
         }
     }
 }

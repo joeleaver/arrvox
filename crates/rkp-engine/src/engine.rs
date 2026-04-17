@@ -276,6 +276,13 @@ struct EngineState {
     /// Master toggle — when false, skip scatter + fall the march back
     /// to its rigid path. Driven by the AnimationPanel checkbox.
     skinning_enabled: bool,
+    /// `true` → Dual-Quaternion Skinning in the scatter pass; `false`
+    /// → Linear Blend Skinning. DQS preserves joint volume and fixes
+    /// axial-twist candy-wrapper at ~+13% scatter cost. The visible
+    /// payoff on gentle clips (Mixamo walks) is subtle; defaults off
+    /// so the fast path is the common path. Flip on for extreme
+    /// poses (crouch, acrobatic, twist-heavy clips) or to A/B compare.
+    dqs_enabled: bool,
 
     /// Material library — manages .rkmat files and runtime palette.
     material_lib: crate::material_library::MaterialLibrary,
@@ -514,6 +521,7 @@ impl EngineState {
             skin_bone_field_bytes: 0,
             skin_bone_field_occ_bytes: 0,
             skinning_enabled: true,
+            dqs_enabled: false,
             material_lib: crate::material_library::MaterialLibrary::new(),
             selected_material: None,
             selected_model: None,
@@ -651,6 +659,7 @@ impl EngineState {
             objects: &self.gpu_objects,
             camera: &cam_uniforms,
             bone_matrices: self.bone_matrix_allocator.bytes(),
+            bone_dual_quats: self.bone_matrix_allocator.bytes_dq(),
         };
         self.renderer.upload_frame(&self.queue, &frame);
 
@@ -1735,6 +1744,7 @@ impl EngineState {
                 match option.as_str() {
                     "show_colliders" => self.show_colliders = enabled,
                     "skinning" => self.skinning_enabled = enabled,
+                    "dqs" => self.dqs_enabled = enabled,
                     _ => eprintln!("[RkpEngine] unknown view option: {option}"),
                 }
             }
@@ -2790,6 +2800,8 @@ impl EngineState {
                                 spatial.voxel_size,
                                 &mut running_bone_field_cells,
                                 &mut running_bone_field_occ_u32s,
+                                if self.dqs_enabled { 1 } else { 0 },
+                                bind.bone_dq_offset,
                             ) {
                                 // Copy the plan's bone-field geometry
                                 // into the SkinnedBinding so the GPU
@@ -2813,6 +2825,7 @@ impl EngineState {
                                         plan.uniforms.grid_origin_z,
                                     ],
                                     bone_field_occ_offset: plan.uniforms.bone_field_occ_offset,
+                                    bone_dq_offset: bind.bone_dq_offset,
                                 });
                                 self.skin_dispatches.push(plan);
                             } else {

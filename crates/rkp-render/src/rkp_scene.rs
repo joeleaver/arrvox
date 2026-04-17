@@ -71,6 +71,11 @@ pub struct FrameUpload<'a> {
     /// are loaded (in which case the bone buffer keeps its dummy
     /// placeholder size so the shader bind still validates).
     pub bone_matrices: &'a [u8],
+    /// Concatenated forward-pose dual quaternions — one 32-byte
+    /// `DualQuat` per bone, parallel to the forward half of
+    /// `bone_matrices`. Scatter's DQS branch reads directly from here,
+    /// skipping the ~60-ALU per-influence matrix→quat extraction.
+    pub bone_dual_quats: &'a [u8],
 }
 
 /// GPU scene buffer manager for RKIPatch.
@@ -124,6 +129,11 @@ pub struct RkpScene {
     pub bone_field_occ_buffer: wgpu::Buffer,
     /// Current byte size of `bone_field_occ_buffer`.
     pub bone_field_occ_capacity: u64,
+    /// Per-frame precomputed forward dual quaternions — one 32-byte
+    /// `DualQuat` per bone across every skinned entity, in
+    /// `SkinnedBinding.bone_dq_offset` order. The scatter's DQS branch
+    /// reads this directly; the matrix palette is only used by LBS.
+    pub bone_dual_quats_buffer: wgpu::Buffer,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub bind_group: wgpu::BindGroup,
 }
@@ -162,13 +172,16 @@ impl RkpScene {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Start with a 32-byte placeholder so the binding validates
+        // even before any skinned entity is loaded.
+        let bone_dual_quats_buffer = Self::create_storage(device, "rkp_bone_dual_quats", 32);
 
         let bind_group_layout = Self::create_layout(device);
         let bind_group = Self::create_bind_group(device, &bind_group_layout,
             &brick_pool_buffer, &octree_nodes_buffer, &objects_buffer,
             &camera_buffer, &color_pool_buffer, &bone_matrices_buffer,
             &bone_weights_buffer, &brick_face_links_buffer, &leaf_attr_pool_buffer,
-            &bone_field_buffer, &bone_field_occ_buffer,
+            &bone_field_buffer, &bone_field_occ_buffer, &bone_dual_quats_buffer,
         );
 
         Self {
@@ -177,6 +190,7 @@ impl RkpScene {
             bone_weights_buffer, brick_face_links_buffer, leaf_attr_pool_buffer,
             bone_field_buffer, bone_field_capacity,
             bone_field_occ_buffer, bone_field_occ_capacity,
+            bone_dual_quats_buffer,
             bind_group_layout, bind_group,
         }
     }
@@ -304,6 +318,12 @@ impl RkpScene {
                 "rkp_bone_matrices", data.bone_matrices,
             );
         }
+        if !data.bone_dual_quats.is_empty() {
+            needs_rebuild |= Self::ensure_and_write(
+                device, queue, &mut self.bone_dual_quats_buffer,
+                "rkp_bone_dual_quats", data.bone_dual_quats,
+            );
+        }
 
         if needs_rebuild {
             self.rebuild_bind_group(device);
@@ -324,7 +344,7 @@ impl RkpScene {
             &self.brick_pool_buffer, &self.octree_nodes_buffer, buffer,
             &self.camera_buffer, &self.color_pool_buffer, &self.bone_matrices_buffer,
             &self.bone_weights_buffer, &self.brick_face_links_buffer, &self.leaf_attr_pool_buffer,
-            &self.bone_field_buffer, &self.bone_field_occ_buffer,
+            &self.bone_field_buffer, &self.bone_field_occ_buffer, &self.bone_dual_quats_buffer,
         );
     }
 
@@ -359,7 +379,7 @@ impl RkpScene {
             &self.brick_pool_buffer, &self.octree_nodes_buffer, &self.objects_buffer,
             &self.camera_buffer, &self.color_pool_buffer, &self.bone_matrices_buffer,
             &self.bone_weights_buffer, &self.brick_face_links_buffer, &self.leaf_attr_pool_buffer,
-            &self.bone_field_buffer, &self.bone_field_occ_buffer,
+            &self.bone_field_buffer, &self.bone_field_occ_buffer, &self.bone_dual_quats_buffer,
         );
     }
 
@@ -407,6 +427,7 @@ impl RkpScene {
                 storage_ro(8), // leaf_attr_pool
                 storage_ro(9), // bone_field (Phase 3b skinned march reads this)
                 storage_ro(10), // bone_field_occ (Phase 3c brick-level empty-space skip)
+                storage_ro(11), // bone_dual_quats (DQS precomputed palette)
             ],
         })
     }
@@ -426,6 +447,7 @@ impl RkpScene {
         leaf_attr_pool: &wgpu::Buffer,
         bone_field: &wgpu::Buffer,
         bone_field_occ: &wgpu::Buffer,
+        bone_dual_quats: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rkp_scene_bind_group"),
@@ -442,6 +464,7 @@ impl RkpScene {
                 wgpu::BindGroupEntry { binding: 8, resource: leaf_attr_pool.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: bone_field.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: bone_field_occ.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: bone_dual_quats.as_entire_binding() },
             ],
         })
     }

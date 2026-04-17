@@ -88,6 +88,10 @@ pub struct SkinnedBinding {
     /// Offset into the scene-wide occupancy bitmap in u32 words. Each
     /// bit covers one 4³ brick of this object's bone_field.
     pub bone_field_occ_offset: u32,
+    /// Offset into the scene-wide precomputed dual-quat buffer, in
+    /// `DualQuat` (32-byte) units. DQs are forward-pose-only — the
+    /// scatter's DQS branch never needs inverse dual quats.
+    pub bone_dq_offset: u32,
 }
 
 /// Build an RkpGpuObject from a scene object's transform, spatial handle,
@@ -157,11 +161,41 @@ pub fn build_gpu_object(
 ///
 /// Called once per frame after [`crate::animation::tick`] has refreshed
 /// each skeleton's `current_pose` + `inverse_pose`.
+/// Pair of `vec4<f32>` (real + dual) = 32 bytes, matching the shader's
+/// `DualQuat` struct in `skin_deform.wgsl`.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct DualQuat {
+    real: [f32; 4],
+    dual: [f32; 4],
+}
+
+/// Extract a forward-pose dual quaternion from a bone matrix.
+/// Assumes the matrix is (close to) a pure rigid transform — any scale
+/// is dropped. For rkipatch this holds when `normalize_mesh` is a
+/// uniform-scale + translation, which is the case for Mixamo rigs
+/// through the animation::tick conjugation.
+fn mat_to_dual_quat(mat: Mat4) -> DualQuat {
+    let (_scale, rot, trans) = mat.to_scale_rotation_translation();
+    // Dual part = 0.5 * (t_quat * r)  where  t_quat = (t.xyz, 0).
+    let t_quat = glam::Quat::from_xyzw(trans.x, trans.y, trans.z, 0.0);
+    let d = (t_quat * rot) * 0.5;
+    DualQuat {
+        real: [rot.x, rot.y, rot.z, rot.w],
+        dual: [d.x, d.y, d.z, d.w],
+    }
+}
+
 #[derive(Default)]
 pub struct BoneMatrixAllocator {
     /// Concatenated palettes: per entity, `mat4x4<f32>` forward-then-
     /// inverse, entities in iteration order.
     bytes: Vec<u8>,
+    /// Concatenated forward dual quats — one `DualQuat` per bone per
+    /// entity. Parallel to the forward half of `bytes` (same entity
+    /// order, same bone order), but independent byte layout because
+    /// DualQuat (32 B) doesn't stride the same as mat4 (64 B).
+    bytes_dq: Vec<u8>,
     /// Entity → `SkinnedBinding` for the current frame.
     bindings: std::collections::HashMap<hecs::Entity, SkinnedBinding>,
 }
@@ -170,15 +204,21 @@ impl BoneMatrixAllocator {
     pub fn new() -> Self { Self::default() }
 
     /// Reset and re-pack every skinned entity's forward + inverse
-    /// palettes into the flat byte buffer. Offsets are in
-    /// `mat4x4<f32>` units — shader reads
-    /// `bone_matrices[offset + i]` for the forward matrix and
-    /// `bone_matrices[offset + bone_count + i]` for the inverse.
+    /// palettes into the flat byte buffer, plus a parallel buffer of
+    /// forward-pose dual quaternions (the DQS fast path).
+    ///
+    /// Offsets:
+    /// * `bone_buffer_offset` indexes `bone_matrices` in mat4 units —
+    ///   forward slot at `[off + i]`, inverse at `[off + bone_count + i]`.
+    /// * `bone_dq_offset` indexes `bone_dual_quats` in DualQuat units —
+    ///   forward slot at `[off + i]`. No inverse palette in this buffer.
     pub fn rebuild(&mut self, world: &hecs::World) {
         self.bytes.clear();
+        self.bytes_dq.clear();
         self.bindings.clear();
 
         let mut running_mat_offset: u32 = 0;
+        let mut running_dq_offset: u32 = 0;
         for (entity, skel) in world.query::<&crate::components::Skeleton>().iter() {
             let bone_count = skel.current_pose.len() as u32;
             if bone_count == 0 {
@@ -190,6 +230,14 @@ impl BoneMatrixAllocator {
             let inv: &[u8] = bytemuck::cast_slice(&skel.inverse_pose);
             self.bytes.extend_from_slice(fwd);
             self.bytes.extend_from_slice(inv);
+
+            // Precomputed forward dual quats for the DQS scatter branch.
+            // One DQ per bone — scatter doesn't need inverse dual quats.
+            let dqs: Vec<DualQuat> = skel.current_pose.iter()
+                .map(|m| mat_to_dual_quat(*m))
+                .collect();
+            self.bytes_dq.extend_from_slice(bytemuck::cast_slice(&dqs));
+
             self.bindings.insert(entity, SkinnedBinding {
                 bone_count,
                 bone_buffer_offset: running_mat_offset,
@@ -200,14 +248,20 @@ impl BoneMatrixAllocator {
                 bone_field_dims: [0, 0, 0],
                 bone_field_origin: [0.0, 0.0, 0.0],
                 bone_field_occ_offset: 0,
+                bone_dq_offset: running_dq_offset,
             });
             // Advance past both palettes.
             running_mat_offset += bone_count * 2;
+            running_dq_offset += bone_count;
         }
     }
 
     /// Flat byte buffer ready to ship in `FrameUpload.bone_matrices`.
     pub fn bytes(&self) -> &[u8] { &self.bytes }
+
+    /// Flat byte buffer of forward-pose dual quaternions, ready to
+    /// ship in `FrameUpload.bone_dual_quats`. 32 B per bone per entity.
+    pub fn bytes_dq(&self) -> &[u8] { &self.bytes_dq }
 
     /// Lookup a skinning binding for an entity, or `None` if unskinned.
     pub fn binding(&self, entity: hecs::Entity) -> Option<SkinnedBinding> {
@@ -258,6 +312,8 @@ pub fn plan_skin_dispatch(
     voxel_size: f32,
     running_bone_field_cells: &mut u32,
     running_bone_field_occ_u32s: &mut u32,
+    skinning_mode: u32,
+    bone_dq_offset: u32,
 ) -> Option<PlannedSkinDispatch> {
     // Deformed AABB = union(current_pose[i] × rest_bone_aabbs[i])
     // over every bone that has a non-empty rest AABB. Rest AABBs in
@@ -345,7 +401,9 @@ pub fn plan_skin_dispatch(
         grid_origin_z: grid_origin.z,
         voxel_size,
         bone_field_occ_offset: *running_bone_field_occ_u32s,
-        _pad0: 0, _pad1: 0, _pad2: 0, _pad3: 0, _pad4: 0,
+        skinning_mode,
+        bone_dq_offset,
+        _pad0: 0, _pad1: 0, _pad2: 0,
     };
     *running_bone_field_cells = running_bone_field_cells.saturating_add(cell_count);
     *running_bone_field_occ_u32s = running_bone_field_occ_u32s.saturating_add(occ_u32_count);
