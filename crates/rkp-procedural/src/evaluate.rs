@@ -157,6 +157,21 @@ fn sample_node(
             result
         }
 
+        NodeKind::Mirror(params) => {
+            // Single-child effect. Position fold along the chosen axis
+            // reflects the child's +axis-side geometry onto the -axis
+            // side. The fold is length-preserving (1-Lipschitz) — a
+            // single reflection is a pure isometry — so the child's
+            // distance passes through unchanged. No conservative shrink
+            // like NoiseDisplace needs.
+            let children = &node.children;
+            let Some(&child_id) = children.first() else {
+                return Sample::EMPTY;
+            };
+            let folded = crate::node_kind::mirror_fold(local_pos, params.axis);
+            sample_node(obj, child_id, folded, voxel_size, cache)
+        }
+
         NodeKind::NoiseDisplace(params) => {
             // Single-child effect. Additional children are ignored —
             // the add-child UI treats this as a combinator so users can
@@ -450,6 +465,84 @@ mod tests {
             let r = sample_tree(&plain, p, VS).distance;
             assert!((d - r).abs() < 1e-5, "mismatch at {p:?}: {d} vs {r}");
         }
+    }
+
+    /// Mirror reflects child geometry across the configured plane:
+    /// a sphere sitting on the +X side should register inside at the
+    /// mirrored -X point too. Also checks distance: the fold is an
+    /// isometry, so the child sample's distance reads the same at
+    /// symmetric points.
+    #[test]
+    fn mirror_reflects_sphere_across_x() {
+        use crate::node_kind::{MirrorAxis, MirrorParams};
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        let mir = obj.add_child(
+            obj.root(),
+            NodeKind::Mirror(MirrorParams { axis: MirrorAxis::X }),
+        );
+        // Sphere placed at +x — the -x side is purely the reflection.
+        let s = obj.add_child(mir, sphere(0.5, 1));
+        obj.set_transform(s, Affine3A::from_translation(Vec3::new(2.0, 0.0, 0.0)));
+
+        let s_pos = sample_tree(&obj, Vec3::new(2.0, 0.0, 0.0), VS);
+        let s_neg = sample_tree(&obj, Vec3::new(-2.0, 0.0, 0.0), VS);
+        assert!(s_pos.is_inside(), "+x center not inside: {}", s_pos.distance);
+        assert!(s_neg.is_inside(), "-x mirror center not inside: {}", s_neg.distance);
+        // Length-preserving fold: distances must be bit-identical.
+        assert!(
+            (s_pos.distance - s_neg.distance).abs() < 1e-5,
+            "mirrored distances diverge: {} vs {}", s_pos.distance, s_neg.distance,
+        );
+    }
+
+    /// Empty Mirror (no child) must not inject phantom geometry.
+    #[test]
+    fn mirror_without_child_is_empty() {
+        use crate::node_kind::{MirrorAxis, MirrorParams};
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        obj.add_child(
+            obj.root(),
+            NodeKind::Mirror(MirrorParams { axis: MirrorAxis::Y }),
+        );
+        let s = sample_tree(&obj, Vec3::ZERO, VS);
+        assert!(!s.is_inside(), "unexpected inside at origin, dist={}", s.distance);
+    }
+
+    /// Moving the Mirror node via its transform shifts the mirror
+    /// plane in world space. Mirror at x=2 with a sphere at local
+    /// x=1 (world x=3) should reflect to world x=1, not x=-3.
+    #[test]
+    fn mirror_transform_shifts_plane() {
+        use crate::node_kind::{MirrorAxis, MirrorParams};
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        let mir = obj.add_child(
+            obj.root(),
+            NodeKind::Mirror(MirrorParams { axis: MirrorAxis::X }),
+        );
+        // Mirror plane in world at x=2.
+        obj.set_transform(mir, Affine3A::from_translation(Vec3::new(2.0, 0.0, 0.0)));
+        // Sphere at mirror-local x=1 → world x=3.
+        let s = obj.add_child(mir, sphere(0.25, 1));
+        obj.set_transform(s, Affine3A::from_translation(Vec3::new(1.0, 0.0, 0.0)));
+
+        // Original side.
+        let s_orig = sample_tree(&obj, Vec3::new(3.0, 0.0, 0.0), VS);
+        assert!(s_orig.is_inside(), "original not inside: {}", s_orig.distance);
+
+        // Reflection: plane at x=2, source at x=3, mirror to x=1.
+        let s_ref = sample_tree(&obj, Vec3::new(1.0, 0.0, 0.0), VS);
+        assert!(s_ref.is_inside(), "reflection not inside: {}", s_ref.distance);
+
+        // The naive mirror-across-origin reflection at x=-3 must NOT
+        // be inside — the plane moved with the node transform.
+        let s_wrong = sample_tree(&obj, Vec3::new(-3.0, 0.0, 0.0), VS);
+        assert!(!s_wrong.is_inside(), "wrong side flagged inside: {}", s_wrong.distance);
     }
 
     /// Transform on a parent combinator affects all children.

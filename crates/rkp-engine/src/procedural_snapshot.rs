@@ -77,6 +77,7 @@ pub enum ProceduralNodeKind {
     Intersect,
     Subtract,
     NoiseDisplace,
+    Mirror,
 }
 
 impl ProceduralNodeKind {
@@ -93,6 +94,7 @@ impl ProceduralNodeKind {
             Self::Intersect => "Intersect",
             Self::Subtract => "Subtract",
             Self::NoiseDisplace => "Noise Displace",
+            Self::Mirror => "Mirror",
         }
     }
 }
@@ -118,6 +120,14 @@ pub enum ProceduralParamValue {
     /// name) that accepts materials from the materials panel.
     Material(u16),
     MaterialCombine(String),
+    /// Generic string-enumerated picker. `value` is the current choice;
+    /// `options` is a list of `(value, label)` pairs the UI renders as a
+    /// dropdown. Added for `Mirror`'s `axis` param but intended to serve
+    /// any future effect that needs a small fixed set of choices.
+    Select {
+        value: String,
+        options: Vec<(String, String)>,
+    },
 }
 
 /// Build a `ProceduralSnapshot` from a `ProceduralGeometry` component.
@@ -191,6 +201,11 @@ pub fn build_procedural_snapshot(
                 ProceduralNodeKind::NoiseDisplace,
                 "Noise Displace".to_string(),
                 noise_displace_params(p),
+            ),
+            NodeKind::Mirror(p) => (
+                ProceduralNodeKind::Mirror,
+                "Mirror".to_string(),
+                mirror_params(p),
             ),
         };
 
@@ -335,6 +350,33 @@ fn noise_displace_params(
         ProceduralParam { name: "octaves".into(), value: ProceduralParamValue::Float(p.octaves as f32), range: Some((1.0, 8.0)) },
         ProceduralParam { name: "seed".into(), value: ProceduralParamValue::Float(p.seed as f32), range: Some((0.0, 1024.0)) },
     ]
+}
+
+fn mirror_params(
+    p: &rkp_procedural::node_kind::MirrorParams,
+) -> Vec<ProceduralParam> {
+    use rkp_procedural::node_kind::MirrorAxis;
+    let axis_value = match p.axis {
+        MirrorAxis::X => "X",
+        MirrorAxis::Y => "Y",
+        MirrorAxis::Z => "Z",
+    };
+    // The mirror plane passes through the Mirror node's local origin
+    // — move / rotate the node's transform to position it in world
+    // space. No per-params position field, consistent with leaves
+    // (their centers come from the transform too).
+    vec![ProceduralParam {
+        name: "axis".into(),
+        value: ProceduralParamValue::Select {
+            value: axis_value.into(),
+            options: vec![
+                ("X".into(), "X".into()),
+                ("Y".into(), "Y".into()),
+                ("Z".into(), "Z".into()),
+            ],
+        },
+        range: None,
+    }]
 }
 
 fn combinator_params(mc: &rkp_procedural::MaterialCombine) -> Vec<ProceduralParam> {

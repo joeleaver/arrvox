@@ -239,6 +239,24 @@ fn render_param_field(
                 on_change,
             )
         }
+        ProceduralParamValue::Select { ref value, ref options } => {
+            let signal = Signal::new(value.clone());
+            let name = param.name.clone();
+            let on_change: Rc<dyn Fn(String)> = Rc::new(move |val: String| {
+                let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralNodeParam {
+                    node_id: node_id.get(),
+                    param_name: name.clone(),
+                    value: val,
+                });
+            });
+            // prop_select wants `&[(&str, &str)]` so project the owned
+            // Vec into a scratch borrow list for the call.
+            let opt_refs: Vec<(&str, &str)> = options
+                .iter()
+                .map(|(v, l)| (v.as_str(), l.as_str()))
+                .collect();
+            prop_select(__scope, &param.name, signal, &opt_refs, on_change)
+        }
     }
 }
 

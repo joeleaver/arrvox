@@ -60,6 +60,17 @@ pub enum OpKind {
     /// by a conservative envelope (max axial warp = amplitude * √3).
     /// `params[0]` = amplitude; the rest ignored.
     PopNoiseDisplace = 201,
+    /// Push a mirror-folded position onto the shader's position stack.
+    /// Unlike `PushNoiseDisplace` which carries scalar warp params,
+    /// Mirror's PUSH carries the derived world-space plane:
+    /// `params[0..3]` = plane origin (world), `params[4..7]` = plane
+    /// normal (world, unit-length). The fold is a world-space
+    /// reflection across that plane — length-preserving, so `PopMirror`
+    /// does **not** shrink the top sample's distance.
+    PushMirror = 202,
+    /// Pop the position stack after a mirror PUSH. No distance
+    /// adjustment — a reflection is a pure isometry.
+    PopMirror = 203,
 }
 
 /// A single instruction in the flattened tree stream.
@@ -301,6 +312,62 @@ fn emit(
             // with only the minuend equals the minuend.
         }
 
+        NodeKind::Mirror(p) => {
+            // PUSH/POP brackets around the single child's stream. The
+            // fold runs in world space using the plane derived from
+            // this Mirror's world transform (`this_world = A*M`):
+            //
+            //   origin = (A*M).translation
+            //   normal = normalize(inverse_transpose((A*M).linear) · axis)
+            //
+            // The inverse-transpose is the right transformation for a
+            // plane normal — it handles non-uniform scale correctly by
+            // producing the direction perpendicular to the transformed
+            // plane, not to the scaled axis vector. Primitives below
+            // still carry `inverse_world = (A*M*C).inverse()` that
+            // undoes the composed transform, so a world-space reflection
+            // at the Mirror plane yields the same primitive-local
+            // position as the CPU evaluator's local-frame fold.
+            let Some(&child_id) = node.children.first() else {
+                return;
+            };
+            let axis_unit = match p.axis {
+                crate::node_kind::MirrorAxis::X => glam::Vec3::X,
+                crate::node_kind::MirrorAxis::Y => glam::Vec3::Y,
+                crate::node_kind::MirrorAxis::Z => glam::Vec3::Z,
+            };
+            let origin = glam::Vec3::from(this_world.translation);
+            let linear_inv_t = glam::Mat3::from(this_world.matrix3).inverse().transpose();
+            let normal = (linear_inv_t * axis_unit).normalize_or_zero();
+            let params_push = [
+                origin.x, origin.y, origin.z, 0.0,
+                normal.x, normal.y, normal.z, 0.0,
+            ];
+            out.push(ProcInstruction {
+                op: OpKind::PushMirror as u32,
+                arity: 0,
+                material_combine: 0,
+                material_id: 0,
+                node_id: id.0,
+                _pad0: 0, _pad1: 0, _pad2: 0,
+                params: params_push,
+                color: [0.0; 4],
+                inverse_world: Mat4::IDENTITY.to_cols_array_2d(),
+            });
+            emit(obj, child_id, this_world, out);
+            out.push(ProcInstruction {
+                op: OpKind::PopMirror as u32,
+                arity: 0,
+                material_combine: 0,
+                material_id: 0,
+                node_id: u32::MAX,
+                _pad0: 0, _pad1: 0, _pad2: 0,
+                params: [0.0; 8],
+                color: [0.0; 4],
+                inverse_world: Mat4::IDENTITY.to_cols_array_2d(),
+            });
+        }
+
         NodeKind::NoiseDisplace(p) => {
             // PUSH/POP brackets around the child stream. Position-warp
             // params ride along in `params` so the shader can execute
@@ -425,6 +492,22 @@ mod tests {
                 if let Some(top) = stack.last_mut() {
                     top.distance -= amp * (3.0f32).sqrt();
                 }
+                continue;
+            }
+            if ins.op == OpKind::PushMirror as u32 {
+                let cur = *pos_stack.last().unwrap();
+                let origin = Vec3::new(ins.params[0], ins.params[1], ins.params[2]);
+                let normal = Vec3::new(ins.params[4], ins.params[5], ins.params[6]);
+                // Reflect `cur` across the plane iff it lies on the
+                // negative side of the normal. Matches the WGSL.
+                let d = (cur - origin).dot(normal);
+                let folded = cur - 2.0 * d.min(0.0) * normal;
+                pos_stack.push(folded);
+                continue;
+            }
+            if ins.op == OpKind::PopMirror as u32 {
+                pos_stack.pop();
+                // No distance adjustment — reflection is an isometry.
                 continue;
             }
 
@@ -580,5 +663,65 @@ mod tests {
             }
         }
         assert_eq!(disagree, 0, "flatten+exec diverged with NoiseDisplace at {disagree} points");
+    }
+
+    /// Trees containing a Mirror must also round-trip through
+    /// flatten + RPN exec with bit-exact distances vs `sample_tree`.
+    /// Mirror has no distance shrink (reflection is an isometry), so
+    /// any mismatch points at a plane-derivation bug (world origin +
+    /// normal computed from the Mirror's world transform) or at a
+    /// missing position-stack pop.
+    #[test]
+    fn flatten_mirror_matches_sample_tree() {
+        use crate::node_kind::{MirrorAxis, MirrorParams};
+        use glam::Affine3A;
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        // Mirror across Y with a non-identity transform — this is the
+        // stress case for the world-plane derivation. Translation +
+        // Z-rotation: the plane normal is no longer axis-aligned in
+        // world space, so flatten must use inverse-transpose on the
+        // linear part to get the correct normal.
+        let mir = obj.add_child(
+            obj.root(),
+            NodeKind::Mirror(MirrorParams { axis: MirrorAxis::Y }),
+        );
+        obj.set_transform(
+            mir,
+            Affine3A::from_rotation_translation(
+                glam::Quat::from_rotation_z(0.4),
+                Vec3::new(0.3, 0.5, 0.0),
+            ),
+        );
+        let inner = obj.add_child(mir, NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        let a = obj.add_child(inner, sphere(0.3, 1));
+        let b = obj.add_child(inner, sphere(0.2, 2));
+        obj.set_transform(a, Affine3A::from_translation(Vec3::new(0.4, 1.0, 0.0)));
+        obj.set_transform(b, Affine3A::from_translation(Vec3::new(-0.4, 1.0, 0.0)));
+
+        let instructions = flatten_tree(&obj);
+
+        let mut disagree = 0usize;
+        for ix in -6..=6 {
+            for iy in -5..=5 {
+                for iz in -3..=3 {
+                    let p = Vec3::new(ix as f32 * 0.25, iy as f32 * 0.3, iz as f32 * 0.25);
+                    let ref_s = sample_tree(&obj, p, VS).distance;
+                    let flat_s = exec(&instructions, p).distance;
+                    if (ref_s - flat_s).abs() > 1e-4 {
+                        disagree += 1;
+                        if disagree <= 3 {
+                            eprintln!(
+                                "mirror flatten mismatch at {p:?}: ref={ref_s} flat={flat_s}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(disagree, 0, "flatten+exec diverged with Mirror at {disagree} points");
     }
 }

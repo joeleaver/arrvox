@@ -5218,6 +5218,7 @@ fn parse_node_kind(kind: &str) -> rkp_procedural::NodeKind {
         "NoiseDisplace" => {
             rkp_procedural::NodeKind::NoiseDisplace(NoiseDisplaceParams::default())
         }
+        "Mirror" => rkp_procedural::NodeKind::Mirror(MirrorParams::default()),
         _ => rkp_procedural::NodeKind::Sphere(SphereParams::default()),
     }
 }
@@ -5310,6 +5311,18 @@ fn apply_procedural_param(
             "seed" => {
                 let f: f32 = value.parse().unwrap_or(p.seed as f32);
                 p.seed = f.max(0.0) as u32;
+                true
+            }
+            _ => false,
+        },
+        NodeKind::Mirror(p) => match param_name {
+            "axis" => {
+                use rkp_procedural::node_kind::MirrorAxis;
+                p.axis = match value {
+                    "Y" => MirrorAxis::Y,
+                    "Z" => MirrorAxis::Z,
+                    _ => MirrorAxis::X,
+                };
                 true
             }
             _ => false,

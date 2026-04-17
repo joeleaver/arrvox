@@ -32,6 +32,13 @@ const OP_SUBTRACT:  u32 = 102u;
 // NoiseDisplace) so the sphere tracer stays 1-Lipschitz-safe.
 const OP_PUSH_NOISE_DISPLACE: u32 = 200u;
 const OP_POP_NOISE_DISPLACE:  u32 = 201u;
+// Mirror — world-space reflection across a plane derived from the
+// Mirror node's world transform (flatten bakes the plane from axis +
+// transform). `params_lo.xyz` = plane origin, `params_hi.xyz` = plane
+// normal (unit length). Fold is length-preserving so POP is a no-op
+// on the sample stack.
+const OP_PUSH_MIRROR: u32 = 202u;
+const OP_POP_MIRROR:  u32 = 203u;
 
 const MAT_COMBINE_WINNER:  u32 = 0u;
 // `Layered` is represented but the shader treats it as Winner for now —
@@ -330,6 +337,30 @@ fn eval_tree(world_pos: vec3<f32>) -> TreeSample {
                 let amp = ins.params_lo.x;
                 stack[sp - 1u].distance = stack[sp - 1u].distance - amp * 1.7320508;
             }
+            continue;
+        }
+        if (op == OP_PUSH_MIRROR) {
+            let cur = pos_stack[pos_top];
+            let origin = ins.params_lo.xyz;
+            let normal = ins.params_hi.xyz;
+            // Reflect across the plane if `cur` is on the normal's
+            // negative side; otherwise leave as-is. Equivalent to the
+            // CPU evaluator's local-frame `p[axis] -> abs(p[axis])`
+            // after the (A*M) transform absorbs into primitive
+            // inverse_worlds below.
+            let d = dot(cur - origin, normal);
+            let folded = cur - 2.0 * min(d, 0.0) * normal;
+            if (pos_top + 1u < POS_STACK_CAP) {
+                pos_top = pos_top + 1u;
+                pos_stack[pos_top] = folded;
+            }
+            continue;
+        }
+        if (op == OP_POP_MIRROR) {
+            if (pos_top > 0u) {
+                pos_top = pos_top - 1u;
+            }
+            // No distance adjustment — reflection is an isometry.
             continue;
         }
 

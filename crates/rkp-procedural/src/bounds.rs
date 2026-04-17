@@ -140,6 +140,26 @@ fn compute_all_bounds_rec(
                 }
             }
         }
+        NodeKind::Mirror(p) => {
+            // Mirror creates geometry on the reflected side of the
+            // plane, so the effect's AABB is the union of the child's
+            // AABB and its reflection. Same single-child rule as
+            // NoiseDisplace — extra children populate the cache but
+            // don't feed into the result.
+            let Some(&child_id) = node.children.first() else {
+                return EMPTY_AABB;
+            };
+            let child_aabb = compute_all_bounds_rec(obj, child_id, cache);
+            for &sibling_id in node.children.iter().skip(1) {
+                let _ = compute_all_bounds_rec(obj, sibling_id, cache);
+            }
+            if is_empty_aabb(&child_aabb) {
+                EMPTY_AABB
+            } else {
+                let reflected = reflect_aabb(&child_aabb, p.axis);
+                aabb_union(&child_aabb, &reflected)
+            }
+        }
     };
 
     let world_aabb = if is_empty_aabb(&local_aabb) {
@@ -216,6 +236,21 @@ fn compute_node_bounds(obj: &ProceduralObject, id: NodeId) -> Aabb {
                     min: child_aabb.min - Vec3::splat(p.amplitude),
                     max: child_aabb.max + Vec3::splat(p.amplitude),
                 }
+            }
+        }
+        NodeKind::Mirror(p) => {
+            // Union of child AABB with its reflection across the
+            // mirror plane. Mirror of compute_all_bounds_rec.
+            let child_aabb = node
+                .children
+                .first()
+                .map(|&first| compute_node_bounds(obj, first))
+                .unwrap_or(EMPTY_AABB);
+            if is_empty_aabb(&child_aabb) {
+                EMPTY_AABB
+            } else {
+                let reflected = reflect_aabb(&child_aabb, p.axis);
+                aabb_union(&child_aabb, &reflected)
             }
         }
     };
@@ -297,6 +332,27 @@ fn aabb_union(a: &Aabb, b: &Aabb) -> Aabb {
     Aabb {
         min: a.min.min(b.min),
         max: a.max.max(b.max),
+    }
+}
+
+/// Reflect an AABB across the axis-aligned plane through the local
+/// origin (the Mirror effect's fold plane). Used by the `Mirror` arm
+/// of the bounds computation to cover the reflected side of the
+/// child.
+fn reflect_aabb(aabb: &Aabb, axis: MirrorAxis) -> Aabb {
+    match axis {
+        MirrorAxis::X => Aabb {
+            min: Vec3::new(-aabb.max.x, aabb.min.y, aabb.min.z),
+            max: Vec3::new(-aabb.min.x, aabb.max.y, aabb.max.z),
+        },
+        MirrorAxis::Y => Aabb {
+            min: Vec3::new(aabb.min.x, -aabb.max.y, aabb.min.z),
+            max: Vec3::new(aabb.max.x, -aabb.min.y, aabb.max.z),
+        },
+        MirrorAxis::Z => Aabb {
+            min: Vec3::new(aabb.min.x, aabb.min.y, -aabb.max.z),
+            max: Vec3::new(aabb.max.x, aabb.max.y, -aabb.min.z),
+        },
     }
 }
 
@@ -520,6 +576,34 @@ mod tests {
         assert!((aabb.max.x - 1.25).abs() < EPS, "max.x = {}", aabb.max.x);
         assert!((aabb.min.y - (-1.25)).abs() < EPS, "min.y = {}", aabb.min.y);
         assert!((aabb.max.y - 1.25).abs() < EPS, "max.y = {}", aabb.max.y);
+    }
+
+    /// Mirror widens its child's AABB to cover the reflected side.
+    /// Sphere at x=2 mirrored across X=0 should produce bounds spanning
+    /// from roughly x=-2.5 to x=+2.5 (sphere radius 0.5).
+    #[test]
+    fn mirror_covers_reflected_side() {
+        use crate::node_kind::{MirrorAxis, MirrorParams};
+        use glam::Affine3A;
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        let mir = obj.add_child(
+            obj.root(),
+            NodeKind::Mirror(MirrorParams { axis: MirrorAxis::X }),
+        );
+        let s = obj.add_child(
+            mir,
+            NodeKind::Sphere(SphereParams { radius: 0.5, ..Default::default() }),
+        );
+        obj.set_transform(s, Affine3A::from_translation(Vec3::new(2.0, 0.0, 0.0)));
+
+        let aabb = compute_bounds(&obj);
+        assert!(aabb.min.x < -1.9, "min.x should cover reflection, got {}", aabb.min.x);
+        assert!(aabb.max.x > 1.9, "max.x should cover original, got {}", aabb.max.x);
+        // Non-mirrored axes pass through unchanged.
+        assert!((aabb.min.y - (-0.5)).abs() < EPS, "min.y = {}", aabb.min.y);
+        assert!((aabb.max.y - 0.5).abs() < EPS, "max.y = {}", aabb.max.y);
     }
 
     #[test]

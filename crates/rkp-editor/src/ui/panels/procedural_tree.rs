@@ -483,10 +483,11 @@ fn render_add_child_menu(
                     {add_menu_item(__scope, "Intersect", TablerIcon::CircleDot, parent_id, opened, cmd_tx)}
                     {add_menu_item(__scope, "Subtract", TablerIcon::CircleMinus, parent_id, opened, cmd_tx)}
                     DropdownMenuDivider {}
-                    // Effects — single-child modifiers. V1 has just
-                    // NoiseDisplace; more land in subsequent passes
-                    // (Mirror, Erode, material effects, etc.).
+                    // Effects — single-child modifiers. Each wraps one
+                    // subtree and applies a transform (position warp,
+                    // material rewrite, neighborhood op, …).
                     {add_menu_item(__scope, "NoiseDisplace", TablerIcon::Ripple, parent_id, opened, cmd_tx)}
+                    {add_menu_item(__scope, "Mirror", TablerIcon::FlipHorizontal, parent_id, opened, cmd_tx)}
                 }
             }
         }
@@ -533,5 +534,6 @@ fn node_icon(kind: ProceduralNodeKind) -> TablerIcon {
         ProceduralNodeKind::Intersect => TablerIcon::CircleDot,
         ProceduralNodeKind::Subtract => TablerIcon::CircleMinus,
         ProceduralNodeKind::NoiseDisplace => TablerIcon::Ripple,
+        ProceduralNodeKind::Mirror => TablerIcon::FlipHorizontal,
     }
 }

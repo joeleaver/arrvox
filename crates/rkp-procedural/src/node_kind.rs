@@ -34,6 +34,14 @@ pub enum NodeKind {
     /// `is_combinator()` returns true so it shares the add-child-menu
     /// affordance and tree-widget handling.
     NoiseDisplace(NoiseDisplaceParams),
+    /// Mirror the child subtree across an axis-aligned plane. Pointwise
+    /// position fold `p -> abs(p[axis] - offset) + offset` — so the
+    /// child's geometry on the +axis side is reflected to the -axis
+    /// side for free. The fold is length-preserving (1-Lipschitz) so
+    /// the child's SDF remains a valid distance; no conservative shrink
+    /// needed. First child is the operand; additional children are
+    /// ignored (same single-child effect cap as `NoiseDisplace`).
+    Mirror(MirrorParams),
 }
 
 impl NodeKind {
@@ -65,6 +73,7 @@ impl NodeKind {
                 | NodeKind::Intersect { .. }
                 | NodeKind::Subtract
                 | NodeKind::NoiseDisplace(_)
+                | NodeKind::Mirror(_)
         )
     }
 
@@ -78,7 +87,7 @@ impl NodeKind {
     pub fn max_children(&self) -> Option<usize> {
         if self.is_leaf() {
             Some(0)
-        } else if matches!(self, NodeKind::NoiseDisplace(_)) {
+        } else if matches!(self, NodeKind::NoiseDisplace(_) | NodeKind::Mirror(_)) {
             Some(1)
         } else {
             None
@@ -290,6 +299,71 @@ impl Default for NoiseDisplaceParams {
             octaves: 3,
             seed: 0,
         }
+    }
+}
+
+/// Axis-aligned mirror plane, named by the axis it is perpendicular to.
+/// Mirror across X flips along X and leaves Y/Z untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MirrorAxis {
+    X,
+    Y,
+    Z,
+}
+
+impl MirrorAxis {
+    /// GPU/flatten encoding: 0=X, 1=Y, 2=Z. Kept in sync with the
+    /// shader's `OP_PUSH_MIRROR` axis decode.
+    pub fn to_u32(self) -> u32 {
+        match self {
+            MirrorAxis::X => 0,
+            MirrorAxis::Y => 1,
+            MirrorAxis::Z => 2,
+        }
+    }
+
+    /// Inverse of `to_u32`. Any out-of-range value clamps to X so the
+    /// decoder never panics on a malformed instruction stream.
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            1 => MirrorAxis::Y,
+            2 => MirrorAxis::Z,
+            _ => MirrorAxis::X,
+        }
+    }
+}
+
+/// Mirror effect params. Applies the fold `p[axis] -> abs(p[axis])`
+/// in the effect's local frame before evaluating the child — so the
+/// +axis-side child geometry is reflected onto the -axis side across
+/// the plane through the node's local origin. To position the mirror
+/// plane in world space, move/rotate the Mirror node itself via its
+/// transform (same pattern as leaves: a sphere's center, a torus's
+/// ring center, etc., all come from the node transform rather than
+/// a dedicated position field on the params).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MirrorParams {
+    /// Which axis to mirror across.
+    pub axis: MirrorAxis,
+}
+
+impl Default for MirrorParams {
+    fn default() -> Self {
+        Self {
+            axis: MirrorAxis::X,
+        }
+    }
+}
+
+/// Apply the mirror fold to a local-frame position: the single
+/// component named by `axis` is replaced with its absolute value.
+/// Must stay byte-identical to the WGSL implementation in
+/// `proc_raymarch.wgsl` and the CPU RPN exec in the flatten tests.
+pub fn mirror_fold(pos: Vec3, axis: MirrorAxis) -> Vec3 {
+    match axis {
+        MirrorAxis::X => Vec3::new(pos.x.abs(), pos.y, pos.z),
+        MirrorAxis::Y => Vec3::new(pos.x, pos.y.abs(), pos.z),
+        MirrorAxis::Z => Vec3::new(pos.x, pos.y, pos.z.abs()),
     }
 }
 
