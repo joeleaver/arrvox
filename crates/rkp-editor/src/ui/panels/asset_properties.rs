@@ -184,7 +184,7 @@ fn material_fields(
         div {
             style: "padding:8px;display:flex;flex-direction:column;gap:6px;\
                     overflow-y:auto;flex:1;",
-            {prop_color(__scope, "Base Color", color_val, Rc::new(move |v: [f32; 4]| {
+            {prop_color(__scope, "Base Color", Memo::new(move || color_val.get()), Rc::new(move |v: [f32; 4]| {
                 let _ = cmd_tx.get().send(rkp_engine::EngineCommand::UpdateMaterialField {
                     material_id: mat_id,
                     field: "base_color".into(),
@@ -365,7 +365,7 @@ fn model_import_fields(
             {prop_select(
                 __scope,
                 "Voxel Size",
-                voxel_size_str,
+                Memo::new(move || voxel_size_str.get()),
                 &[
                     ("auto", "Auto"),
                     ("0.005", "5mm (finest)"),

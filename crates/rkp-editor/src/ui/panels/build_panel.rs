@@ -66,18 +66,37 @@ fn build_content(__scope: &mut Scope, store: EditorStore) -> Node {
 }
 
 // ── Node params ─────────────────────────────────────────────────────────
+//
+// All local Signals bound to the selected node's state (transform
+// fields, param values, title) are created once when the component
+// mounts. That's correct as long as we REMOUNT the section whenever
+// the selected node changes — otherwise the signals stay pinned to
+// the previous selection and the UI shows stale title + stale field
+// values. We get remount-on-selection by iterating a 1-element Vec
+// keyed on the node id: when the id changes the previous subtree
+// unmounts and a fresh `NodeParamsSection` mounts. Same pattern
+// `object_properties.rs` uses for its ComponentSection, and the one
+// called out in `feedback_rinch_ui.md` as the canonical fix for
+// stale-form-on-selection.
 
 fn render_params(
     __scope: &mut Scope,
-    store: EditorStore,
+    _store: EditorStore,
     snapshot: Memo<ProceduralSnapshot>,
     selected_node: Memo<Option<u32>>,
-    cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
+    _cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
 ) -> Node {
     let node_info = Memo::new(move || {
         let snap = snapshot.get();
         let sel = selected_node.get()?;
         snap.nodes.iter().find(|n| n.id == sel).cloned()
+    });
+
+    // Wrap in a Vec so we can drive a keyed `for` loop — the Vec has
+    // 0 or 1 items; changing the selected node id changes the key,
+    // which unmounts the old section and mounts a fresh one.
+    let selected_list = Memo::new(move || {
+        node_info.get().into_iter().collect::<Vec<ProceduralNodeInfo>>()
     });
 
     rsx! {
@@ -88,79 +107,135 @@ fn render_params(
                     "Select a node to edit"
                 }
             }
-            if node_info.get().is_some() {
-                {render_node_params(__scope, store.clone(), node_info, cmd_tx)}
+            for info in selected_list.get() {
+                NodeParamsSection {
+                    key: info.id.to_string(),
+                    node_info: info,
+                }
             }
         }
     }
 }
 
-fn render_node_params(
-    __scope: &mut Scope,
-    store: EditorStore,
-    node_info: Memo<Option<ProceduralNodeInfo>>,
-    cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
-) -> Node {
-    let node_id = Memo::new(move || node_info.get().map(|n| n.id).unwrap_or(0));
-    let node_name = Memo::new(move || node_info.get().map(|n| n.name.clone()).unwrap_or_default());
-    let params = Memo::new(move || node_info.get().map(|n| n.params.clone()).unwrap_or_default());
-    let is_root = Memo::new(move || node_info.get().map(|n| n.is_root).unwrap_or(true));
-    let position = Memo::new(move || node_info.get().map(|n| n.position).unwrap_or([0.0; 3]));
-    let rotation = Memo::new(move || node_info.get().map(|n| n.rotation).unwrap_or([0.0; 3]));
-    let scale = Memo::new(move || node_info.get().map(|n| n.scale).unwrap_or([1.0; 3]));
+#[component]
+fn NodeParamsSection(node_info: ProceduralNodeInfo) -> NodeHandle {
+    let store = use_context::<EditorStore>();
+    let cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>> =
+        Signal::new(use_context::<CommandSender>().0);
+
+    // node_id and is_root are stable for a given selection — captured
+    // from the mount-time snapshot. Everything else is read from the
+    // live snapshot via a Memo below, so external updates flow in.
+    let node_id = node_info.id;
+    let node_id_memo = Memo::new(move || node_id);
+    let is_root = node_info.is_root;
+
+    // Every dynamic field (name, transform components, the per-param
+    // list) is read reactively from `store.procedural` via a Memo.
+    // When the engine pushes a new snapshot (viewport drag, MCP,
+    // undo/redo, material-by-height param change, etc.), the Memo
+    // re-fires and the control reflects it — without any signal-sync
+    // Effect. Writes still go through `cmd_tx` so the engine stays
+    // authoritative.
+    let lookup_node = move || -> Option<ProceduralNodeInfo> {
+        store.procedural.get()?
+            .nodes
+            .iter()
+            .find(|n| n.id == node_id)
+            .cloned()
+    };
+    let pos_memo = Memo::new(move || lookup_node().map(|n| n.position).unwrap_or([0.0; 3]));
+    let rot_memo = Memo::new(move || lookup_node().map(|n| n.rotation).unwrap_or([0.0; 3]));
+    let scale_memo = Memo::new(move || lookup_node().map(|n| n.scale).unwrap_or([1.0; 3]));
+    let params_memo = Memo::new(move || lookup_node().map(|n| n.params).unwrap_or_default());
+    let name_memo = Memo::new(move || lookup_node().map(|n| n.name).unwrap_or_default());
 
     let collapsed = Signal::new(false);
 
-    let on_remove: Option<Rc<dyn Fn()>> = if !is_root.get() {
+    let on_remove: Option<Rc<dyn Fn()>> = if !is_root {
         Some(Rc::new(move || {
             let _ = cmd_tx.get().send(rkp_engine::EngineCommand::RemoveProceduralNode {
-                node_id: node_id.get(),
+                node_id,
             });
         }))
     } else {
         None
     };
 
-    // Transform controls. Each `prop_vec3` wants a Signal; we bridge
-    // from the snapshot Memos. The signals are local to this render —
-    // prop_vec3 reads the initial value on mount and only fires
-    // on_change on user edit, so missing back-propagation from the
-    // Memo is not a correctness issue for text-entry/drag interactions.
-    let pos_signal = Signal::new(position.get());
-    let rot_signal = Signal::new(rotation.get());
-    let scale_signal = Signal::new(scale.get());
-
     let pos_control = {
         let on_change: Rc<dyn Fn([f32; 3])> = Rc::new(move |val: [f32; 3]| {
             let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralNodePosition {
-                node_id: node_id.get(),
+                node_id,
                 position: glam::Vec3::from(val),
             });
         });
-        prop_vec3(__scope, "Position", pos_signal, on_change)
+        prop_vec3(__scope, "Position", pos_memo, on_change)
     };
     let rot_control = {
         let on_change: Rc<dyn Fn([f32; 3])> = Rc::new(move |val: [f32; 3]| {
             let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralNodeRotation {
-                node_id: node_id.get(),
+                node_id,
                 rotation_deg: glam::Vec3::from(val),
             });
         });
-        prop_vec3(__scope, "Rotation", rot_signal, on_change)
+        prop_vec3(__scope, "Rotation", rot_memo, on_change)
     };
     let scale_control = {
         let on_change: Rc<dyn Fn([f32; 3])> = Rc::new(move |val: [f32; 3]| {
             let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralNodeScale {
-                node_id: node_id.get(),
+                node_id,
                 scale: glam::Vec3::from(val),
             });
         });
-        prop_vec3(__scope, "Scale", scale_signal, on_change)
+        prop_vec3(__scope, "Scale", scale_memo, on_change)
     };
+
+    // Inline the section header here so the title can read from
+    // `name_memo` reactively — `prop_section_header` takes a `&str`
+    // and is used by many other panels with static titles, so instead
+    // of changing its signature we replicate its layout once (it's
+    // just the chevron + title + optional remove button).
+    let removable = on_remove.is_some();
+    let on_remove_sig: Signal<Option<Rc<dyn Fn()>>> = Signal::new(on_remove);
 
     rsx! {
         div {
-            {prop_section_header(__scope, &node_name.get(), collapsed, on_remove)}
+            // Header.
+            div {
+                style: "display:flex;align-items:center;padding:6px 12px;cursor:pointer;\
+                        background:#2a2a2a;gap:6px;border-bottom:1px solid #3c3c3c;",
+                onclick: move || collapsed.update(|c| *c = !*c),
+                span {
+                    style: {move || {
+                        if collapsed.get() {
+                            "font-size:10px;color:#666;transform:rotate(-90deg);\
+                             transition:transform 0.15s;display:inline-block;"
+                        } else {
+                            "font-size:10px;color:#666;transition:transform 0.15s;\
+                             display:inline-block;"
+                        }
+                    }},
+                    {"\u{25BC}"}
+                }
+                span {
+                    style: "flex:1;font-size:11px;font-weight:600;color:#bbb;\
+                            text-transform:uppercase;letter-spacing:0.3px;",
+                    {move || name_memo.get()}
+                }
+                if removable {
+                    div {
+                        style: "cursor:pointer;color:#666;width:14px;height:14px;\
+                                display:flex;align-items:center;justify-content:center;\
+                                border-radius:2px;flex-shrink:0;",
+                        onclick: move || {
+                            if let Some(ref cb) = on_remove_sig.get() {
+                                cb();
+                            }
+                        },
+                        {"\u{2715}"}
+                    }
+                }
+            }
             // Transform block — always visible (not inside the collapsible
             // params section) since it's the primary handle for any node.
             div {
@@ -172,8 +247,8 @@ fn render_node_params(
             if !collapsed.get() {
                 div {
                     style: "display:flex;flex-direction:column;gap:2px;",
-                    for param in params.get() {
-                        {render_param_field(__scope, store.clone(), node_id, param.clone(), cmd_tx)}
+                    for param in params_memo.get() {
+                        {render_param_field(__scope, store.clone(), node_id_memo, param, cmd_tx)}
                     }
                 }
             }
@@ -188,11 +263,30 @@ fn render_param_field(
     param: ProceduralParam,
     cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
 ) -> Node {
+    // Each param's current value is looked up reactively from the
+    // snapshot (by node id + param name) instead of being captured
+    // one-shot from `param.value` at mount — so an external change
+    // (viewport drag, MCP, undo) flowing through the snapshot shows
+    // up in the field without a rebuild. `param.value` still carries
+    // the param's TYPE and bounds (the discriminant at mount time
+    // tells us which control to render); the numeric / string /
+    // color payload is re-read from the Memo each fire.
+    let name_for_memo = param.name.clone();
+    let lookup_param = move || -> Option<ProceduralParamValue> {
+        let snap = store.procedural.get()?;
+        let nid = node_id.get();
+        let n = snap.nodes.iter().find(|n| n.id == nid)?;
+        n.params.iter().find(|p| p.name == name_for_memo).map(|p| p.value.clone())
+    };
+
     match param.value {
         ProceduralParamValue::Float(v) => {
             let (min, max) = param.range.unwrap_or((0.0, 100.0));
-            let signal = Signal::new(v);
             let name = param.name.clone();
+            let value_memo = Memo::new(move || match lookup_param() {
+                Some(ProceduralParamValue::Float(f)) => f,
+                _ => v,
+            });
             let on_change: Rc<dyn Fn(f32)> = Rc::new(move |val: f32| {
                 let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralNodeParam {
                     node_id: node_id.get(),
@@ -200,15 +294,15 @@ fn render_param_field(
                     value: format!("{val}"),
                 });
             });
-            prop_scrub(__scope, &param.name, signal, min, max, 0.01, on_change)
+            prop_scrub(__scope, &param.name, value_memo, min, max, 0.01, on_change)
         }
         ProceduralParamValue::Color(v) => {
-            let signal = Signal::new(v);
+            let default = v;
+            let value_memo = Memo::new(move || match lookup_param() {
+                Some(ProceduralParamValue::Color(c)) => c,
+                _ => default,
+            });
             let name = param.name.clone();
-            // Engine-side parser is `parse_vec3` → "r,g,b", so drop
-            // alpha in the wire format. Color params today are pure RGB
-            // under the hood (glam::Vec3); the picker carries alpha for
-            // symmetry with material colors but nobody reads it.
             let on_change: Rc<dyn Fn([f32; 4])> = Rc::new(move |val: [f32; 4]| {
                 let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralNodeParam {
                     node_id: node_id.get(),
@@ -216,13 +310,21 @@ fn render_param_field(
                     value: format!("{},{},{}", val[0], val[1], val[2]),
                 });
             });
-            prop_color(__scope, &param.name, signal, on_change)
+            prop_color(__scope, &param.name, value_memo, on_change)
         }
-        ProceduralParamValue::Material(mat_id) => {
-            material_slot_row(__scope, store, node_id, &param.name, mat_id, cmd_tx)
+        ProceduralParamValue::Material(_mat_id) => {
+            let mat_memo = Memo::new(move || match lookup_param() {
+                Some(ProceduralParamValue::Material(m)) => m,
+                _ => _mat_id,
+            });
+            material_slot_row(__scope, store, node_id, &param.name, mat_memo, cmd_tx)
         }
         ProceduralParamValue::MaterialCombine(ref v) => {
-            let signal = Signal::new(v.clone());
+            let default = v.clone();
+            let value_memo = Memo::new(move || match lookup_param() {
+                Some(ProceduralParamValue::MaterialCombine(s)) => s,
+                _ => default.clone(),
+            });
             let name = param.name.clone();
             let on_change: Rc<dyn Fn(String)> = Rc::new(move |val: String| {
                 let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralNodeParam {
@@ -234,13 +336,17 @@ fn render_param_field(
             prop_select(
                 __scope,
                 &param.name,
-                signal,
+                value_memo,
                 &[("Winner", "Winner"), ("Layered", "Layered"), ("Blend", "Blend")],
                 on_change,
             )
         }
         ProceduralParamValue::Select { ref value, ref options } => {
-            let signal = Signal::new(value.clone());
+            let default = value.clone();
+            let value_memo = Memo::new(move || match lookup_param() {
+                Some(ProceduralParamValue::Select { value, .. }) => value,
+                _ => default.clone(),
+            });
             let name = param.name.clone();
             let on_change: Rc<dyn Fn(String)> = Rc::new(move |val: String| {
                 let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralNodeParam {
@@ -249,13 +355,11 @@ fn render_param_field(
                     value: val,
                 });
             });
-            // prop_select wants `&[(&str, &str)]` so project the owned
-            // Vec into a scratch borrow list for the call.
             let opt_refs: Vec<(&str, &str)> = options
                 .iter()
                 .map(|(v, l)| (v.as_str(), l.as_str()))
                 .collect();
-            prop_select(__scope, &param.name, signal, &opt_refs, on_change)
+            prop_select(__scope, &param.name, value_memo, &opt_refs, on_change)
         }
     }
 }
@@ -270,26 +374,29 @@ fn material_slot_row(
     store: EditorStore,
     node_id: Memo<u32>,
     param_name: &str,
-    mat_id: u16,
+    mat_id: Memo<u16>,
     cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
 ) -> Node {
     let param_name_owned = param_name.to_string();
     let label_text = param_name.to_string();
 
     // Current material name + swatch color, looked up against the
-    // scene's material library. Memos so a material-palette edit or
-    // tombstone refreshes the display without a param round-trip.
+    // scene's material library. Memos so a palette edit OR a param
+    // change that flips this slot to a new material (viewport drag,
+    // MCP, undo) refreshes the display.
     let mat_name = Memo::new(move || {
+        let id = mat_id.get();
         store.materials.get()
             .iter()
-            .find(|m| m.id == mat_id)
+            .find(|m| m.id == id)
             .map(|m| m.name.clone())
-            .unwrap_or_else(|| format!("Material {mat_id}"))
+            .unwrap_or_else(|| format!("Material {id}"))
     });
     let mat_color = Memo::new(move || {
+        let id = mat_id.get();
         store.materials.get()
             .iter()
-            .find(|m| m.id == mat_id)
+            .find(|m| m.id == id)
             .map(|m| m.base_color)
             .unwrap_or([0.5, 0.5, 0.5, 1.0])
     });

@@ -40,6 +40,14 @@ const OP_POP_NOISE_DISPLACE:  u32 = 201u;
 const OP_PUSH_MIRROR: u32 = 202u;
 const OP_POP_MIRROR:  u32 = 203u;
 
+// Attribute-rewrite post-ops — no PUSH/POP pair, a single opcode
+// fires after the child's sample is on the stack and mutates the top
+// sample's material / color fields. `inverse_world` carries the
+// effect's world-to-local transform so the height read runs in the
+// effect's local frame.
+const OP_APPLY_MATERIAL_BY_HEIGHT: u32 = 300u;
+const OP_APPLY_COLOR_BY_HEIGHT:    u32 = 301u;
+
 const MAT_COMBINE_WINNER:  u32 = 0u;
 // `Layered` is represented but the shader treats it as Winner for now —
 // the dual-material G-buffer isn't wired through the raymarch path, so
@@ -364,6 +372,53 @@ fn eval_tree(world_pos: vec3<f32>) -> TreeSample {
             continue;
         }
 
+        // ── Attribute-rewrite post-ops ──────────────────────────────
+        if (op == OP_APPLY_MATERIAL_BY_HEIGHT) {
+            if (sp > 0u) {
+                let cur = pos_stack[pos_top];
+                let local = (ins.inverse_world * vec4<f32>(cur, 1.0)).xyz;
+                // Raymarch's TreeSample is primary-only — the G-buffer
+                // path can't carry secondary material yet (see known
+                // limitation in project_procedural_effects_v1). We
+                // still compute the blend alpha and pick the closer
+                // band: below the midpoint of a transition zone, use
+                // `lower`; otherwise `upper`. CPU bake + deferred
+                // shading renders the smooth transition from the
+                // dual-material fields the CPU evaluator writes.
+                let c = classify_height_bands(
+                    local.y, ins.params_lo.x, ins.params_lo.y, ins.params_lo.z,
+                );
+                var mats: array<u32, 3>;
+                mats[0] = u32(ins.params_lo.w);
+                mats[1] = u32(ins.params_hi.x);
+                mats[2] = u32(ins.params_hi.y);
+                let picked = select(mats[c.lower], mats[c.upper], c.alpha >= 0.5);
+                stack[sp - 1u].material_id = picked;
+            }
+            continue;
+        }
+        if (op == OP_APPLY_COLOR_BY_HEIGHT) {
+            if (sp > 0u) {
+                let cur = pos_stack[pos_top];
+                let local = (ins.inverse_world * vec4<f32>(cur, 1.0)).xyz;
+                let low_to_mid     = ins.params_lo.x;
+                let low_color      = ins.params_lo.yzw;
+                let mid_to_high    = ins.params_hi.x;
+                let mid_color      = ins.params_hi.yzw;
+                let high_color     = ins.color.xyz;
+                let transition_w   = ins.color.w;
+                let c = classify_height_bands(
+                    local.y, low_to_mid, mid_to_high, transition_w,
+                );
+                var colors: array<vec3<f32>, 3>;
+                colors[0] = low_color;
+                colors[1] = mid_color;
+                colors[2] = high_color;
+                stack[sp - 1u].color = mix(colors[c.lower], colors[c.upper], c.alpha);
+            }
+            continue;
+        }
+
         if (op < 100u) {
             // Primitive — evaluates at the top of the position stack.
             let s = eval_primitive(ins, pos_stack[pos_top]);
@@ -427,6 +482,42 @@ fn gradient_normal(p: vec3<f32>) -> vec3<f32> {
     let len = length(g);
     if (len < 1e-8) { return vec3<f32>(0.0, 1.0, 0.0); }
     return g / len;
+}
+
+// ── Height-band classifier ─────────────────────────────────────────────
+// Mirror of `rkp_procedural::node_kind::classify_height`. Returns the
+// two adjacent band indices and the smoothstep blend alpha between
+// them (alpha=0 → fully `lower`; alpha=1 → fully `upper`). Outside a
+// transition zone, lower == upper and alpha is 0.
+
+struct HeightClassify {
+    lower: u32,
+    upper: u32,
+    alpha: f32,
+}
+
+fn classify_height_bands(
+    y: f32,
+    low_to_mid: f32,
+    mid_to_high: f32,
+    transition_width: f32,
+) -> HeightClassify {
+    let w_half = max(transition_width * 0.5, 1e-6);
+    if (y < low_to_mid - w_half) {
+        return HeightClassify(0u, 0u, 0.0);
+    }
+    if (y < low_to_mid + w_half) {
+        let t = clamp((y - (low_to_mid - w_half)) / (2.0 * w_half), 0.0, 1.0);
+        return HeightClassify(0u, 1u, t * t * (3.0 - 2.0 * t));
+    }
+    if (y < mid_to_high - w_half) {
+        return HeightClassify(1u, 1u, 0.0);
+    }
+    if (y < mid_to_high + w_half) {
+        let t = clamp((y - (mid_to_high - w_half)) / (2.0 * w_half), 0.0, 1.0);
+        return HeightClassify(1u, 2u, t * t * (3.0 - 2.0 * t));
+    }
+    return HeightClassify(2u, 2u, 0.0);
 }
 
 // ── Noise (port of `crates/rkp-procedural/src/noise.rs`) ──────────────

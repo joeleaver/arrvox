@@ -160,6 +160,19 @@ fn compute_all_bounds_rec(
                 aabb_union(&child_aabb, &reflected)
             }
         }
+        NodeKind::MaterialByHeight(_) | NodeKind::ColorByHeight(_) => {
+            // Attribute rewrite — geometry is unchanged, so the AABB
+            // is just the child's. Single-child cap; extras populate
+            // the cache for UI visibility but don't contribute.
+            let Some(&child_id) = node.children.first() else {
+                return EMPTY_AABB;
+            };
+            let child_aabb = compute_all_bounds_rec(obj, child_id, cache);
+            for &sibling_id in node.children.iter().skip(1) {
+                let _ = compute_all_bounds_rec(obj, sibling_id, cache);
+            }
+            child_aabb
+        }
     };
 
     let world_aabb = if is_empty_aabb(&local_aabb) {
@@ -252,6 +265,14 @@ fn compute_node_bounds(obj: &ProceduralObject, id: NodeId) -> Aabb {
                 let reflected = reflect_aabb(&child_aabb, p.axis);
                 aabb_union(&child_aabb, &reflected)
             }
+        }
+        NodeKind::MaterialByHeight(_) | NodeKind::ColorByHeight(_) => {
+            // Attribute rewrite — bounds pass through unchanged.
+            node
+                .children
+                .first()
+                .map(|&first| compute_node_bounds(obj, first))
+                .unwrap_or(EMPTY_AABB)
         }
     };
 

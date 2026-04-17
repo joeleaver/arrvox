@@ -71,6 +71,15 @@ pub enum OpKind {
     /// Pop the position stack after a mirror PUSH. No distance
     /// adjustment — a reflection is a pure isometry.
     PopMirror = 203,
+    /// Post-op: rewrite the top sample's `material_id` /
+    /// `secondary_material_id` / `blend_weight` from a 3-band rule on
+    /// the effect's local Y. Doesn't touch the position stack. Layout
+    /// is described in `emit_material_by_height_post_op`.
+    ApplyMaterialByHeight = 300,
+    /// Post-op: rewrite the top sample's `color` from a 3-band rule
+    /// on the effect's local Y. Layout is described in
+    /// `emit_color_by_height_post_op`.
+    ApplyColorByHeight = 301,
 }
 
 /// A single instruction in the flattened tree stream.
@@ -368,6 +377,72 @@ fn emit(
             });
         }
 
+        NodeKind::MaterialByHeight(p) => {
+            let Some(&child_id) = node.children.first() else {
+                return;
+            };
+            emit(obj, child_id, this_world, out);
+            // Post-op instruction. `inverse_world` = (A*M).inverse()
+            // so the shader can transform pos_stack[pos_top] into the
+            // effect's local frame and read `local.y`. Band/threshold
+            // data packed into the `params` array.
+            let inverse_world = Mat4::from(this_world).inverse().to_cols_array_2d();
+            let params_post = [
+                p.low_to_mid,
+                p.mid_to_high,
+                p.transition_width,
+                p.low_material as f32,
+                p.mid_material as f32,
+                p.high_material as f32,
+                0.0, 0.0,
+            ];
+            out.push(ProcInstruction {
+                op: OpKind::ApplyMaterialByHeight as u32,
+                arity: 0,
+                material_combine: 0,
+                material_id: 0,
+                node_id: id.0,
+                _pad0: 0, _pad1: 0, _pad2: 0,
+                params: params_post,
+                color: [0.0; 4],
+                inverse_world,
+            });
+        }
+
+        NodeKind::ColorByHeight(p) => {
+            let Some(&child_id) = node.children.first() else {
+                return;
+            };
+            emit(obj, child_id, this_world, out);
+            let inverse_world = Mat4::from(this_world).inverse().to_cols_array_2d();
+            // Each color rides in the last 3 slots of its band's
+            // vec4 (params_lo for low, params_hi for mid, color for
+            // high); thresholds/width occupy the respective `.x` slots
+            // of `params_lo` and `params_hi`, and the `color` field's
+            // `.w` slot carries `transition_width`.
+            //
+            // Layout:
+            //   params_lo = [low_to_mid,   low.r,  low.g,  low.b]
+            //   params_hi = [mid_to_high,  mid.r,  mid.g,  mid.b]
+            //   color     = [high.r,       high.g, high.b, transition_width]
+            let params_post = [
+                p.low_to_mid, p.low_color.x, p.low_color.y, p.low_color.z,
+                p.mid_to_high, p.mid_color.x, p.mid_color.y, p.mid_color.z,
+            ];
+            let color_post = [p.high_color.x, p.high_color.y, p.high_color.z, p.transition_width];
+            out.push(ProcInstruction {
+                op: OpKind::ApplyColorByHeight as u32,
+                arity: 0,
+                material_combine: 0,
+                material_id: 0,
+                node_id: id.0,
+                _pad0: 0, _pad1: 0, _pad2: 0,
+                params: params_post,
+                color: color_post,
+                inverse_world,
+            });
+        }
+
         NodeKind::NoiseDisplace(p) => {
             // PUSH/POP brackets around the child stream. Position-warp
             // params ride along in `params` so the shader can execute
@@ -508,6 +583,50 @@ mod tests {
             if ins.op == OpKind::PopMirror as u32 {
                 pos_stack.pop();
                 // No distance adjustment — reflection is an isometry.
+                continue;
+            }
+            if ins.op == OpKind::ApplyMaterialByHeight as u32 {
+                if let Some(top) = stack.last_mut() {
+                    if !top.is_empty() {
+                        let inv = Mat4::from_cols_array_2d(&ins.inverse_world);
+                        let cur_world = *pos_stack.last().unwrap();
+                        let local_y = inv.transform_point3(cur_world).y;
+                        let c = crate::node_kind::classify_height(
+                            local_y, ins.params[0], ins.params[1], ins.params[2],
+                        );
+                        let mats = [
+                            ins.params[3] as u16,
+                            ins.params[4] as u16,
+                            ins.params[5] as u16,
+                        ];
+                        top.material_id = mats[c.lower as usize];
+                        top.secondary_material_id = mats[c.upper as usize];
+                        top.blend_weight = c.alpha;
+                    }
+                }
+                continue;
+            }
+            if ins.op == OpKind::ApplyColorByHeight as u32 {
+                if let Some(top) = stack.last_mut() {
+                    if !top.is_empty() {
+                        let inv = Mat4::from_cols_array_2d(&ins.inverse_world);
+                        let cur_world = *pos_stack.last().unwrap();
+                        let local_y = inv.transform_point3(cur_world).y;
+                        let low_to_mid = ins.params[0];
+                        let mid_to_high = ins.params[4];
+                        let transition_width = ins.color[3];
+                        let c = crate::node_kind::classify_height(
+                            local_y, low_to_mid, mid_to_high, transition_width,
+                        );
+                        let low_c = Vec3::new(ins.params[1], ins.params[2], ins.params[3]);
+                        let mid_c = Vec3::new(ins.params[5], ins.params[6], ins.params[7]);
+                        let high_c = Vec3::new(ins.color[0], ins.color[1], ins.color[2]);
+                        let colors = [low_c, mid_c, high_c];
+                        let a = colors[c.lower as usize];
+                        let b = colors[c.upper as usize];
+                        top.color = a.lerp(b, c.alpha);
+                    }
+                }
                 continue;
             }
 
@@ -723,5 +842,81 @@ mod tests {
             }
         }
         assert_eq!(disagree, 0, "flatten+exec diverged with Mirror at {disagree} points");
+    }
+
+    /// Trees containing a MaterialByHeight (with a non-identity
+    /// transform so the `inverse_world` payload is exercised) must
+    /// round-trip through flatten + RPN exec with bit-exact
+    /// material_id / secondary / blend_weight vs `sample_tree`. Plus
+    /// a nested ColorByHeight to verify the same flow for colors.
+    #[test]
+    fn flatten_by_height_post_ops_match_sample_tree() {
+        use crate::node_kind::{ColorByHeightParams, MaterialByHeightParams};
+        use glam::Affine3A;
+
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        // MaterialByHeight(ColorByHeight(Capsule)). Effects nested
+        // this way means material and color both rewrite, each in
+        // their own effect-local frame.
+        let mbh = obj.add_child(
+            obj.root(),
+            NodeKind::MaterialByHeight(MaterialByHeightParams {
+                low_material: 5,
+                low_to_mid: 0.0,
+                mid_material: 15,
+                mid_to_high: 3.0,
+                high_material: 25,
+                transition_width: 0.6,
+            }),
+        );
+        // Translate the MaterialByHeight so its local Y != world Y.
+        obj.set_transform(mbh, Affine3A::from_translation(Vec3::new(0.0, 1.0, 0.0)));
+        let cbh = obj.add_child(
+            mbh,
+            NodeKind::ColorByHeight(ColorByHeightParams {
+                low_color: Vec3::new(0.2, 0.1, 0.05),
+                low_to_mid: -1.0,
+                mid_color: Vec3::new(0.1, 0.6, 0.2),
+                mid_to_high: 2.0,
+                high_color: Vec3::new(0.95, 0.95, 0.95),
+                transition_width: 0.4,
+            }),
+        );
+        obj.add_child(cbh, NodeKind::Capsule(CapsuleParams {
+            half_height: 6.0,
+            radius: 0.5,
+            material_id: 0,
+            color: Vec3::ZERO,
+        }));
+
+        let instructions = flatten_tree(&obj);
+
+        let mut disagree = 0usize;
+        for ix in -3..=3 {
+            for iy in -8..=8 {
+                let p = Vec3::new(ix as f32 * 0.3, iy as f32 * 0.5, 0.0);
+                let r = sample_tree(&obj, p, VS);
+                let f = exec(&instructions, p);
+                if r.is_empty() != f.is_empty() { continue; }
+                let mat_match = r.material_id == f.material_id as u16
+                    && r.secondary_material_id == f.secondary_material_id as u16
+                    && (r.blend_weight - f.blend_weight).abs() < 1e-4;
+                let color_match = (r.color - f.color).length() < 1e-4;
+                if !mat_match || !color_match {
+                    disagree += 1;
+                    if disagree <= 3 {
+                        eprintln!(
+                            "by-height flatten mismatch at {p:?}: \
+                             ref mat={}/{}/{} color={:?}; flat mat={}/{}/{} color={:?}",
+                            r.material_id, r.secondary_material_id, r.blend_weight, r.color,
+                            f.material_id as u16, f.secondary_material_id as u16, f.blend_weight, f.color,
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(disagree, 0, "flatten+exec diverged on by-height at {disagree} points");
     }
 }

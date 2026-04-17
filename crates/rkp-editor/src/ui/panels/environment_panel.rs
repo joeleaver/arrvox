@@ -130,7 +130,7 @@ pub fn EnvironmentPanel() -> NodeHandle {
                         })
                     })}
                     if sky_top_override_on.get() {
-                        {prop_color(__scope, "Sky Top", sky_top_color, env_color3("sky_color_top_override"))}
+                        {prop_color(__scope, "Sky Top", Memo::new(move || sky_top_color.get()), env_color3("sky_color_top_override"))}
                     }
 
                     // Override: sky horizon color
@@ -145,7 +145,7 @@ pub fn EnvironmentPanel() -> NodeHandle {
                         })
                     })}
                     if sky_horizon_override_on.get() {
-                        {prop_color(__scope, "Sky Horizon", sky_horizon_color, env_color3("sky_color_horizon_override"))}
+                        {prop_color(__scope, "Sky Horizon", Memo::new(move || sky_horizon_color.get()), env_color3("sky_color_horizon_override"))}
                     }
                 }
             }
@@ -169,7 +169,7 @@ pub fn EnvironmentPanel() -> NodeHandle {
                         })
                     })}
                     if sun_color_override_on.get() {
-                        {prop_color(__scope, "Sun Color", sun_color_override, env_color3("sun_color_override"))}
+                        {prop_color(__scope, "Sun Color", Memo::new(move || sun_color_override.get()), env_color3("sun_color_override"))}
                     }
 
                     // Sun direction widget: azimuth + elevation
@@ -193,7 +193,7 @@ pub fn EnvironmentPanel() -> NodeHandle {
             if !tone_collapsed.get() {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
-                    {prop_scrub(__scope, "Exposure", exposure, 0.000001, 0.01, 0.000001, env_f32("exposure"))}
+                    {prop_scrub(__scope, "Exposure", Memo::new(move || exposure.get()), 0.000001, 0.01, 0.000001, env_f32("exposure"))}
                 }
             }
 
@@ -224,7 +224,7 @@ pub fn EnvironmentPanel() -> NodeHandle {
             if !fog_collapsed.get() {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
-                    {prop_color(__scope, "Fog Color", fog_color, env_color3("fog_color"))}
+                    {prop_color(__scope, "Fog Color", Memo::new(move || fog_color.get()), env_color3("fog_color"))}
                     {prop_slider(__scope, "Dust", dust_density, 0.0, 0.05, 0.001, env_f32("dust_density"))}
                     {prop_slider(__scope, "Dust Asymmetry", dust_asymmetry, 0.0, 1.0, 0.01, env_f32("dust_asymmetry"))}
                     {prop_slider(__scope, "Height Fog", height_fog_density, 0.0, 0.5, 0.01, env_f32("height_fog_density"))}

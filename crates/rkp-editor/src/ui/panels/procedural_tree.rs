@@ -488,6 +488,8 @@ fn render_add_child_menu(
                     // material rewrite, neighborhood op, …).
                     {add_menu_item(__scope, "NoiseDisplace", TablerIcon::Ripple, parent_id, opened, cmd_tx)}
                     {add_menu_item(__scope, "Mirror", TablerIcon::FlipHorizontal, parent_id, opened, cmd_tx)}
+                    {add_menu_item(__scope, "MaterialByHeight", TablerIcon::Stack2, parent_id, opened, cmd_tx)}
+                    {add_menu_item(__scope, "ColorByHeight", TablerIcon::Palette, parent_id, opened, cmd_tx)}
                 }
             }
         }
@@ -535,5 +537,7 @@ fn node_icon(kind: ProceduralNodeKind) -> TablerIcon {
         ProceduralNodeKind::Subtract => TablerIcon::CircleMinus,
         ProceduralNodeKind::NoiseDisplace => TablerIcon::Ripple,
         ProceduralNodeKind::Mirror => TablerIcon::FlipHorizontal,
+        ProceduralNodeKind::MaterialByHeight => TablerIcon::Stack2,
+        ProceduralNodeKind::ColorByHeight => TablerIcon::Palette,
     }
 }

@@ -133,10 +133,20 @@ pub fn prop_slider_f64(
 /// Shows the current value as text. Drag left/right on the field to scrub.
 /// Click without dragging to enter text edit mode. Optional range clamping.
 /// A subtle fill bar behind the text shows position within the range.
+/// Draggable scrub bar + click-to-edit numeric input.
+///
+/// `value` is a `Memo<f32>` — the control reads the current value
+/// reactively from whatever source the caller wires up (e.g. a store-
+/// backed Memo that re-fires when the underlying data changes). User
+/// interactions route through `on_change`; the caller is responsible
+/// for updating the source so the Memo fires back. That gives "store
+/// is source of truth" semantics: external updates from the engine
+/// / gizmo / MCP flow through the Memo and the control reflects them
+/// without a signal-sync Effect.
 pub fn prop_scrub(
     __scope: &mut Scope,
     label: &str,
-    value: Signal<f32>,
+    value: Memo<f32>,
     min: f32,
     max: f32,
     step: f32,
@@ -169,7 +179,6 @@ pub fn prop_scrub(
                         edit_text.set(v.clone());
                         if let Ok(f) = v.parse::<f32>() {
                             let clamped = f.clamp(min, max);
-                            value.set(clamped);
                             (oc_drag.get())(clamped);
                         }
                     },
@@ -207,7 +216,6 @@ pub fn prop_scrub(
                                     did_drag.set(true);
                                 }
                                 let new_val = (drag_start.get() + delta * step).clamp(min, max);
-                                value.set(new_val);
                                 (oc_drag.get())(new_val);
                             })
                             .on_end(move |_, _| {
@@ -375,10 +383,17 @@ pub fn prop_checkbox(
 // ── Vec3 input ───────────────────────────────────────────────────────────
 
 /// Three color-coded axis inputs (X=red, Y=green, Z=blue).
+/// Three color-coded axis inputs (X=red, Y=green, Z=blue) for a
+/// `[f32; 3]` value.
+///
+/// `value` is a `Memo` — the display tracks whatever source the caller
+/// points it at (typically a store-backed reactive projection).
+/// Writes happen through `on_change`; the Memo reflects the updated
+/// source on the next tick. See `prop_scrub` for the rationale.
 pub fn prop_vec3(
     __scope: &mut Scope,
     label: &str,
-    value: Signal<[f32; 3]>,
+    value: Memo<[f32; 3]>,
     on_change: Rc<dyn Fn([f32; 3])>,
 ) -> Node {
     let label = label.to_string();
@@ -408,7 +423,7 @@ fn vec3_axis(
     __scope: &mut Scope,
     color: &'static str,
     label: &'static str,
-    value: Signal<[f32; 3]>,
+    value: Memo<[f32; 3]>,
     idx: usize,
     on_change: Rc<dyn Fn([f32; 3])>,
 ) -> Node {
@@ -435,9 +450,11 @@ fn vec3_axis(
                         .on_move(move |mouse_x, _mouse_y| {
                             let delta = mouse_x - start_x;
                             let new_val = drag_start_val.get() + delta * 0.02;
+                            // Other components come straight from the Memo —
+                            // the source of truth — so if something external
+                            // updated them mid-drag they pass through intact.
                             let mut vec = value.get();
                             vec[idx] = new_val;
-                            value.set(vec);
                             (oc_drag.get())(vec);
                         })
                         .start();
@@ -454,7 +471,6 @@ fn vec3_axis(
                     if let Ok(f) = v.parse::<f32>() {
                         let mut vec = value.get();
                         vec[idx] = f;
-                        value.set(vec);
                         on_change(vec);
                     }
                 },
@@ -465,31 +481,20 @@ fn vec3_axis(
 
 // ── Color picker ─────────────────────────────────────────────────────────
 
-/// Color picker using rinch's ColorInput component.
-/// Works with [f32; 4] RGBA (alpha always 1.0 for now).
+/// Color picker using rinch's ColorInput component. `value` is a
+/// `Memo<[f32; 4]>`; the picker tracks its source reactively via
+/// `value_fn`, and writes route through `on_change`. Rinch >=
+/// `2f4945c3` added a first-run guard on ColorPicker's coordinating
+/// effect and a set-if-changed check in the `value_fn` binding, so
+/// this can use the ordinary controlled-input pattern without the
+/// earlier write-only-bridge workaround.
 pub fn prop_color(
     __scope: &mut Scope,
     label: &str,
-    value: Signal<[f32; 4]>,
+    value: Memo<[f32; 4]>,
     on_change: Rc<dyn Fn([f32; 4])>,
 ) -> Node {
     let label = label.to_string();
-    // One-shot seed read, untracked so the caller's render effect
-    // doesn't subscribe to `value`. Deliberately NOT using `value_fn`:
-    // even after rinch's upstream fix for issue #22 (value_fn
-    // self-subscription) a separate re-entrancy still fires during
-    // re-mount. ColorPicker's coordinating effect runs its initial
-    // fire inside Effect::new → run_effect, synchronously invokes our
-    // onchange wrapper, which `current_value.set`s, triggering a
-    // nested flush. If *anything* is pending in that flush (the
-    // parent for_each_dom that's re-rendering us is one candidate),
-    // run_effect re-enters a borrow_mut-held closure and panics at
-    // effect.rs:144. Skipping value_fn means ColorInput never
-    // subscribes an effect to our caller Signal, which is enough to
-    // avoid the trigger in practice. The Signal becomes a write-only
-    // bridge — fine here, since fresh engine snapshots remount the
-    // whole param field with a new Signal anyway.
-    let initial_hex = untracked(|| rgba_to_hex(value.get()));
 
     rsx! {
         div {
@@ -498,21 +503,27 @@ pub fn prop_color(
             div {
                 style: "flex:1;min-width:0;",
                 ColorInput {
-                    value: {initial_hex},
+                    value_fn: move || rgba_to_hex(value.get()),
                     format: "hex",
                     alpha: false,
                     onchange: move |v: String| {
-                        // Whole body untracked so the guard's `value.get()`
-                        // doesn't subscribe ColorPicker's currently-
-                        // running coordinating effect to our Signal —
-                        // otherwise `value.set(rgba)` below would queue
-                        // the very effect that invoked us.
+                        // Skip if the incoming color is effectively the
+                        // current stored one (within hex quantization).
+                        // Avoids redundant engine commands when the
+                        // picker echoes an external-value update.
+                        // Body untracked so the guard's `value.get()`
+                        // doesn't subscribe ColorPicker's coordinating
+                        // effect to our upstream source.
                         untracked(|| {
                             if let Some(rgba) = hex_to_rgba(&v) {
-                                if rgba_to_hex(rgba) == rgba_to_hex(value.get()) {
+                                let cur = value.get();
+                                let eps = 1.01 / 255.0;
+                                if (rgba[0] - cur[0]).abs() < eps
+                                    && (rgba[1] - cur[1]).abs() < eps
+                                    && (rgba[2] - cur[2]).abs() < eps
+                                {
                                     return;
                                 }
-                                value.set(rgba);
                                 on_change(rgba);
                             }
                         });
@@ -529,10 +540,12 @@ pub fn prop_color(
 ///
 /// `options` is a list of `(value, label)` pairs. `value` is the internal
 /// string, `label` is what's displayed. If label is empty, value is shown.
+/// Dropdown select. `value` is a `Memo<String>`; display tracks its
+/// source reactively, writes route through `on_change`.
 pub fn prop_select(
     __scope: &mut Scope,
     label: &str,
-    value: Signal<String>,
+    value: Memo<String>,
     options: &[(&str, &str)],
     on_change: Rc<dyn Fn(String)>,
 ) -> Node {
@@ -549,11 +562,10 @@ pub fn prop_select(
             div {
                 style: "flex:1;min-width:0;",
                 Select {
-                    value: {value.get()},
+                    value_fn: move || value.get(),
                     size: "xs",
                     data: data,
                     onchange: move |v: String| {
-                        value.set(v.clone());
                         on_change(v);
                     },
                 }

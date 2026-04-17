@@ -157,6 +157,48 @@ fn sample_node(
             result
         }
 
+        NodeKind::MaterialByHeight(params) => {
+            let Some(&child_id) = node.children.first() else {
+                return Sample::EMPTY;
+            };
+            let mut s = sample_node(obj, child_id, local_pos, voxel_size, cache);
+            if s.is_empty() {
+                return s;
+            }
+            let c = crate::node_kind::classify_height(
+                local_pos.y,
+                params.low_to_mid,
+                params.mid_to_high,
+                params.transition_width,
+            );
+            let mats = [params.low_material, params.mid_material, params.high_material];
+            s.material_id = mats[c.lower as usize];
+            s.secondary_material_id = mats[c.upper as usize];
+            s.blend_weight = c.alpha;
+            s
+        }
+
+        NodeKind::ColorByHeight(params) => {
+            let Some(&child_id) = node.children.first() else {
+                return Sample::EMPTY;
+            };
+            let mut s = sample_node(obj, child_id, local_pos, voxel_size, cache);
+            if s.is_empty() {
+                return s;
+            }
+            let c = crate::node_kind::classify_height(
+                local_pos.y,
+                params.low_to_mid,
+                params.mid_to_high,
+                params.transition_width,
+            );
+            let colors = [params.low_color, params.mid_color, params.high_color];
+            let a = colors[c.lower as usize];
+            let b = colors[c.upper as usize];
+            s.color = a.lerp(b, c.alpha);
+            s
+        }
+
         NodeKind::Mirror(params) => {
             // Single-child effect. Position fold along the chosen axis
             // reflects the child's +axis-side geometry onto the -axis
@@ -543,6 +585,171 @@ mod tests {
         // be inside — the plane moved with the node transform.
         let s_wrong = sample_tree(&obj, Vec3::new(-3.0, 0.0, 0.0), VS);
         assert!(!s_wrong.is_inside(), "wrong side flagged inside: {}", s_wrong.distance);
+    }
+
+    /// MaterialByHeight rewrites a sphere's material purely based on
+    /// local Y — low below the first threshold, high above the second.
+    /// Orthogonal: color must pass through unchanged.
+    #[test]
+    fn material_by_height_picks_band_and_preserves_color() {
+        use crate::node_kind::MaterialByHeightParams;
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        let mbh = obj.add_child(
+            obj.root(),
+            NodeKind::MaterialByHeight(MaterialByHeightParams {
+                low_material: 10,
+                low_to_mid: 0.0,
+                mid_material: 20,
+                mid_to_high: 5.0,
+                high_material: 30,
+                transition_width: 0.0,
+            }),
+        );
+        // Tall capsule centered at origin so we can sample at multiple
+        // y's while staying inside. Distinct color so we can verify
+        // it passes through.
+        let cap = obj.add_child(mbh, NodeKind::Capsule(CapsuleParams {
+            half_height: 8.0,
+            radius: 0.5,
+            material_id: 99, // should be overwritten
+            color: Vec3::new(0.7, 0.2, 0.1),
+        }));
+        let _ = cap;
+
+        let s_low = sample_tree(&obj, Vec3::new(0.0, -3.0, 0.0), VS);
+        let s_mid = sample_tree(&obj, Vec3::new(0.0, 2.0, 0.0), VS);
+        let s_high = sample_tree(&obj, Vec3::new(0.0, 7.0, 0.0), VS);
+        assert_eq!(s_low.material_id, 10);
+        assert_eq!(s_mid.material_id, 20);
+        assert_eq!(s_high.material_id, 30);
+        // Color pass-through on every band.
+        let eps = 1e-5;
+        assert!((s_low.color - Vec3::new(0.7, 0.2, 0.1)).length() < eps);
+        assert!((s_mid.color - Vec3::new(0.7, 0.2, 0.1)).length() < eps);
+        assert!((s_high.color - Vec3::new(0.7, 0.2, 0.1)).length() < eps);
+    }
+
+    /// Non-zero transition_width puts the sample in dual-material mode
+    /// across the threshold: primary=lower, secondary=upper, blend
+    /// ramps smoothly via smoothstep. At the threshold center, alpha
+    /// is 0.5.
+    #[test]
+    fn material_by_height_transition_writes_dual_material() {
+        use crate::node_kind::MaterialByHeightParams;
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        let mbh = obj.add_child(
+            obj.root(),
+            NodeKind::MaterialByHeight(MaterialByHeightParams {
+                low_material: 10,
+                low_to_mid: 0.0,
+                mid_material: 20,
+                mid_to_high: 5.0,
+                high_material: 30,
+                transition_width: 0.4, // ±0.2 around 0.0
+            }),
+        );
+        obj.add_child(mbh, NodeKind::Capsule(CapsuleParams {
+            half_height: 8.0,
+            radius: 0.5,
+            material_id: 0,
+            color: Vec3::ONE,
+        }));
+
+        // Exactly at the low_to_mid threshold: alpha should be 0.5.
+        let s = sample_tree(&obj, Vec3::new(0.0, 0.0, 0.0), VS);
+        assert_eq!(s.material_id, 10);
+        assert_eq!(s.secondary_material_id, 20);
+        assert!((s.blend_weight - 0.5).abs() < 1e-4, "alpha = {}", s.blend_weight);
+
+        // Well below the transition zone: pure low, no blend.
+        let s = sample_tree(&obj, Vec3::new(0.0, -1.0, 0.0), VS);
+        assert_eq!(s.material_id, 10);
+        assert_eq!(s.blend_weight, 0.0);
+    }
+
+    /// ColorByHeight rewrites a sphere's color purely based on local
+    /// Y. Orthogonal: material must pass through unchanged.
+    #[test]
+    fn color_by_height_picks_band_and_preserves_material() {
+        use crate::node_kind::ColorByHeightParams;
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        let cbh = obj.add_child(
+            obj.root(),
+            NodeKind::ColorByHeight(ColorByHeightParams {
+                low_color: Vec3::new(1.0, 0.0, 0.0),
+                low_to_mid: 0.0,
+                mid_color: Vec3::new(0.0, 1.0, 0.0),
+                mid_to_high: 5.0,
+                high_color: Vec3::new(0.0, 0.0, 1.0),
+                transition_width: 0.0,
+            }),
+        );
+        obj.add_child(cbh, NodeKind::Capsule(CapsuleParams {
+            half_height: 8.0,
+            radius: 0.5,
+            material_id: 42, // should pass through
+            color: Vec3::ZERO, // ignored — ColorByHeight overwrites
+        }));
+
+        let s_low = sample_tree(&obj, Vec3::new(0.0, -3.0, 0.0), VS);
+        let s_mid = sample_tree(&obj, Vec3::new(0.0, 2.0, 0.0), VS);
+        let s_high = sample_tree(&obj, Vec3::new(0.0, 7.0, 0.0), VS);
+        let eps = 1e-5;
+        assert!((s_low.color - Vec3::new(1.0, 0.0, 0.0)).length() < eps);
+        assert!((s_mid.color - Vec3::new(0.0, 1.0, 0.0)).length() < eps);
+        assert!((s_high.color - Vec3::new(0.0, 0.0, 1.0)).length() < eps);
+        // Material untouched on every band.
+        assert_eq!(s_low.material_id, 42);
+        assert_eq!(s_mid.material_id, 42);
+        assert_eq!(s_high.material_id, 42);
+    }
+
+    /// Rotating the effect flips the banding direction — here 90° on
+    /// Z makes "height" go along -X in world space. A point at world
+    /// x=3 (which maps to local y=-3 after the Z-rotation's inverse)
+    /// should read the LOW band.
+    #[test]
+    fn material_by_height_follows_node_transform() {
+        use crate::node_kind::MaterialByHeightParams;
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        let mbh = obj.add_child(
+            obj.root(),
+            NodeKind::MaterialByHeight(MaterialByHeightParams {
+                low_material: 10,
+                low_to_mid: 0.0,
+                mid_material: 20,
+                mid_to_high: 5.0,
+                high_material: 30,
+                transition_width: 0.0,
+            }),
+        );
+        // 90° around Z maps world X → local -Y (rotate axes CCW).
+        obj.set_transform(
+            mbh,
+            Affine3A::from_rotation_z(std::f32::consts::FRAC_PI_2),
+        );
+        obj.add_child(mbh, NodeKind::Capsule(CapsuleParams {
+            half_height: 8.0,
+            radius: 0.5,
+            material_id: 0,
+            color: Vec3::ONE,
+        }));
+
+        // World x=3 → local y=-3 → LOW band.
+        let s = sample_tree(&obj, Vec3::new(3.0, 0.0, 0.0), VS);
+        assert_eq!(s.material_id, 10, "rotated MaterialByHeight: expected low at world x=+3");
+
+        // World x=-7 → local y=+7 → HIGH band.
+        let s = sample_tree(&obj, Vec3::new(-7.0, 0.0, 0.0), VS);
+        assert_eq!(s.material_id, 30, "rotated MaterialByHeight: expected high at world x=-7");
     }
 
     /// Transform on a parent combinator affects all children.

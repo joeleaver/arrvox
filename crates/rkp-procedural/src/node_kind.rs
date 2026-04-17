@@ -42,6 +42,18 @@ pub enum NodeKind {
     /// needed. First child is the operand; additional children are
     /// ignored (same single-child effect cap as `NoiseDisplace`).
     Mirror(MirrorParams),
+    /// Rewrite the child sample's primary material according to a
+    /// 3-band rule on the sample point's local Y. Geometry is
+    /// untouched. Within a `transition_width` zone around each
+    /// threshold, the engine's dual-material path carries both
+    /// adjacent bands for smooth seams (primary=below,
+    /// secondary=above, blend=smoothstep alpha). Single-child effect.
+    MaterialByHeight(MaterialByHeightParams),
+    /// Rewrite the child sample's per-voxel color according to a
+    /// 3-band rule on the sample point's local Y. Geometry and
+    /// material are untouched. Adjacent band colors lerp across a
+    /// `transition_width` zone. Single-child effect.
+    ColorByHeight(ColorByHeightParams),
 }
 
 impl NodeKind {
@@ -74,6 +86,8 @@ impl NodeKind {
                 | NodeKind::Subtract
                 | NodeKind::NoiseDisplace(_)
                 | NodeKind::Mirror(_)
+                | NodeKind::MaterialByHeight(_)
+                | NodeKind::ColorByHeight(_)
         )
     }
 
@@ -87,7 +101,13 @@ impl NodeKind {
     pub fn max_children(&self) -> Option<usize> {
         if self.is_leaf() {
             Some(0)
-        } else if matches!(self, NodeKind::NoiseDisplace(_) | NodeKind::Mirror(_)) {
+        } else if matches!(
+            self,
+            NodeKind::NoiseDisplace(_)
+                | NodeKind::Mirror(_)
+                | NodeKind::MaterialByHeight(_)
+                | NodeKind::ColorByHeight(_)
+        ) {
             Some(1)
         } else {
             None
@@ -365,6 +385,113 @@ pub fn mirror_fold(pos: Vec3, axis: MirrorAxis) -> Vec3 {
         MirrorAxis::Y => Vec3::new(pos.x, pos.y.abs(), pos.z),
         MirrorAxis::Z => Vec3::new(pos.x, pos.y, pos.z.abs()),
     }
+}
+
+/// Material-by-height effect params. Three bands along the effect's
+/// local Y axis, separated by `low_to_mid` and `mid_to_high`
+/// thresholds. `transition_width` widens each threshold into a
+/// smooth-blend zone (`± width / 2` around each) that the engine
+/// renders via its dual-material path. `transition_width = 0` gives
+/// hard band edges.
+///
+/// To rotate the banding direction (e.g. horizontal stratification)
+/// or shift the thresholds in world space, use the node transform —
+/// the height test runs in the effect's local frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterialByHeightParams {
+    pub low_material: u16,
+    pub low_to_mid: f32,
+    pub mid_material: u16,
+    pub mid_to_high: f32,
+    pub high_material: u16,
+    pub transition_width: f32,
+}
+
+impl Default for MaterialByHeightParams {
+    fn default() -> Self {
+        Self {
+            low_material: 0,
+            low_to_mid: 0.0,
+            mid_material: 0,
+            mid_to_high: 1.0,
+            high_material: 0,
+            transition_width: 0.0,
+        }
+    }
+}
+
+/// Color-by-height effect params. Same band structure as
+/// `MaterialByHeightParams`, but rewrites `Sample::color` — the
+/// per-voxel RGB tint — leaving `material_id` alone. Adjacent band
+/// colors lerp in linear RGB across the `transition_width` zone
+/// around each threshold.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColorByHeightParams {
+    pub low_color: Vec3,
+    pub low_to_mid: f32,
+    pub mid_color: Vec3,
+    pub mid_to_high: f32,
+    pub high_color: Vec3,
+    pub transition_width: f32,
+}
+
+impl Default for ColorByHeightParams {
+    fn default() -> Self {
+        Self {
+            low_color: Vec3::new(0.4, 0.3, 0.2),
+            low_to_mid: 0.0,
+            mid_color: Vec3::new(0.3, 0.6, 0.2),
+            mid_to_high: 1.0,
+            high_color: Vec3::new(0.95, 0.95, 0.95),
+            transition_width: 0.0,
+        }
+    }
+}
+
+/// Classifier output for a by-height effect at a given local Y.
+/// `lower` / `upper` are band indices (0=low, 1=mid, 2=high). `alpha`
+/// is the blend weight between them: 0 = fully lower, 1 = fully upper.
+/// Used by both the CPU evaluator and the CPU RPN exec in flatten
+/// tests so they agree with the WGSL implementation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeightBandClassify {
+    pub lower: u32,
+    pub upper: u32,
+    pub alpha: f32,
+}
+
+/// Classify a local-Y value into one of three bands with smooth
+/// transitions around the thresholds. `transition_width` is the
+/// total width of each transition zone (smoothstep is applied over
+/// `threshold - w/2 .. threshold + w/2`). A width of zero (or near
+/// zero) degenerates cleanly into hard bands.
+pub fn classify_height(
+    y: f32,
+    low_to_mid: f32,
+    mid_to_high: f32,
+    transition_width: f32,
+) -> HeightBandClassify {
+    let w_half = (transition_width * 0.5).max(1e-6);
+    if y < low_to_mid - w_half {
+        HeightBandClassify { lower: 0, upper: 0, alpha: 0.0 }
+    } else if y < low_to_mid + w_half {
+        let t = ((y - (low_to_mid - w_half)) / (2.0 * w_half)).clamp(0.0, 1.0);
+        HeightBandClassify { lower: 0, upper: 1, alpha: smoothstep01(t) }
+    } else if y < mid_to_high - w_half {
+        HeightBandClassify { lower: 1, upper: 1, alpha: 0.0 }
+    } else if y < mid_to_high + w_half {
+        let t = ((y - (mid_to_high - w_half)) / (2.0 * w_half)).clamp(0.0, 1.0);
+        HeightBandClassify { lower: 1, upper: 2, alpha: smoothstep01(t) }
+    } else {
+        HeightBandClassify { lower: 2, upper: 2, alpha: 0.0 }
+    }
+}
+
+/// Standard Hermite smoothstep for t ∈ [0, 1]. Matches WGSL's
+/// `smoothstep(0, 1, t)` exactly.
+fn smoothstep01(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 #[cfg(test)]

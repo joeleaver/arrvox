@@ -35,16 +35,25 @@ fn float_editor(
 
     if field.scrub {
         if let Some((min, max)) = field.range {
+            // Local Signal seeded from the captured value for display
+            // feedback on edit; wrap it in a Memo so `prop_scrub`'s new
+            // reactive-value API still works. Future step would be to
+            // read from a store Memo directly for true external-change
+            // reactivity on inspector fields — out of scope here.
             let value = Signal::new(val as f32);
+            let value_memo = Memo::new(move || value.get());
             let step = ((max - min) / 200.0) as f32;
             return prop_controls::prop_scrub(
                 __scope,
                 &field.name,
-                value,
+                value_memo,
                 min as f32,
                 max as f32,
                 step,
-                Rc::new(move |v| on_change(FieldValue::Float(v as f64))),
+                Rc::new(move |v| {
+                    value.set(v);
+                    on_change(FieldValue::Float(v as f64));
+                }),
             );
         }
     }
@@ -115,12 +124,16 @@ fn string_editor(
         let options: Vec<(&str, &str)> = field.enum_options.iter()
             .map(|(v, l)| (v.as_str(), l.as_str()))
             .collect();
+        let value_memo = Memo::new(move || value.get());
         prop_controls::prop_select(
             __scope,
             &field.name,
-            value,
+            value_memo,
             &options,
-            Rc::new(move |v| on_change(FieldValue::String(v))),
+            Rc::new(move |v| {
+                value.set(v.clone());
+                on_change(FieldValue::String(v));
+            }),
         )
     } else {
         prop_controls::prop_text(
@@ -139,11 +152,15 @@ fn vec3_editor(
 ) -> rinch::core::dom::NodeHandle {
     let val = match &field.value { FieldValue::Vec3(v) => *v, _ => [0.0; 3] };
     let value = Signal::new(val);
+    let value_memo = Memo::new(move || value.get());
     prop_controls::prop_vec3(
         __scope,
         &field.name,
-        value,
-        Rc::new(move |v| on_change(FieldValue::Vec3(v))),
+        value_memo,
+        Rc::new(move |v| {
+            value.set(v);
+            on_change(FieldValue::Vec3(v));
+        }),
     )
 }
 
@@ -154,10 +171,14 @@ fn color_editor(
 ) -> rinch::core::dom::NodeHandle {
     let val = match &field.value { FieldValue::Color(v) => *v, _ => [1.0, 1.0, 1.0, 1.0] };
     let value = Signal::new(val);
+    let value_memo = Memo::new(move || value.get());
     prop_controls::prop_color(
         __scope,
         &field.name,
-        value,
-        Rc::new(move |v| on_change(FieldValue::Color(v))),
+        value_memo,
+        Rc::new(move |v| {
+            value.set(v);
+            on_change(FieldValue::Color(v));
+        }),
     )
 }

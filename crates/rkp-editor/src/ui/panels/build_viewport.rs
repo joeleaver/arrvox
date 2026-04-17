@@ -561,7 +561,7 @@ fn render_resolution(
     super::prop_controls::prop_select(
         __scope,
         "Res",
-        current,
+        Memo::new(move || current.get()),
         &[
             ("0.005", "5mm (finest)"),
             ("0.02", "2cm"),
