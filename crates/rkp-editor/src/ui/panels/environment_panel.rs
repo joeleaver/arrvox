@@ -193,7 +193,19 @@ pub fn EnvironmentPanel() -> NodeHandle {
             if !tone_collapsed.get() {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
-                    {prop_scrub(__scope, "Exposure", exposure, 0.000001, 0.01, 0.000001, env_f32("exposure"))}
+                    {prop_scrub(
+                        __scope,
+                        "Exposure",
+                        Memo::new(move || exposure.get()),
+                        0.000001, 0.01, 0.000001,
+                        {
+                            let base = env_f32("exposure");
+                            Rc::new(move |v: f32| {
+                                exposure.set(v);
+                                base(v);
+                            })
+                        },
+                    )}
                 }
             }
 

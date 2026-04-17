@@ -108,6 +108,18 @@ fn InspectorContent() -> NodeHandle {
         store.inspector.get().map(|s| s.entity_id.clone()).unwrap_or_default()
     });
 
+    // Entity id when the current selection has a skeleton, else empty.
+    // Returned as a Vec so we can drive `AnimationSection` via a
+    // single-element `for` loop: `if { ... key: ... }` doesn't remount
+    // on key change in rinch, but a keyed `for` does. Same trick the
+    // Asset Properties panel uses for `ModelPropertiesForm`.
+    let animated_entity_key = Memo::new(move || {
+        store.inspector.get()
+            .filter(|s| s.skeleton.is_some())
+            .map(|s| vec![s.entity_id.clone()])
+            .unwrap_or_default()
+    });
+
     rsx! {
         div {
             style: "display:flex;flex-direction:column;",
@@ -128,10 +140,14 @@ fn InspectorContent() -> NodeHandle {
             // Dedicated Animation panel — renders when the entity has a
             // loaded skeleton. Hides the generic Skeleton + AnimationPlayer
             // sections below (they'd just duplicate these controls with
-            // uglier ergonomics — text input for clip name etc.).
-            if store.inspector.get().as_ref().is_some_and(|s| s.skeleton.is_some()) {
+            // uglier ergonomics — text input for clip name etc.). Driven
+            // by a keyed `for` so switching between animated entities
+            // remounts the form (clip dropdown, transport, bone tree all
+            // re-seed with the new entity's state instead of sticking on
+            // the first-selected's values).
+            for key in animated_entity_key.get().into_iter() {
                 AnimationSection {
-                    key: entity_id.get(),
+                    key: key,
                 }
             }
 
@@ -497,22 +513,35 @@ fn animation_controls(
         Some(FieldValue::String(s)) => s.clone(),
         _ => String::new(),
     };
-    let time = match player_field(&snap.components, "time") {
-        Some(FieldValue::Float(v)) => *v as f32,
-        _ => 0.0,
-    };
-    let speed = match player_field(&snap.components, "speed") {
-        Some(FieldValue::Float(v)) => *v as f32,
-        _ => 1.0,
-    };
-    let playing = match player_field(&snap.components, "playing") {
-        Some(FieldValue::Bool(b)) => *b,
-        _ => false,
-    };
     let loop_mode = match player_field(&snap.components, "loop_mode") {
         Some(FieldValue::String(s)) => s.clone(),
         _ => "Loop".into(),
     };
+
+    // Reactive reads off the inspector — the engine advances `time`
+    // every frame and flips `playing` on pause, so the transport
+    // controls have to follow inspector state rather than a value
+    // captured at render time. Same story for `speed` if another
+    // system ever writes to it (e.g. slow-mo).
+    let store_react = use_context::<EditorStore>();
+    let playing_memo = Memo::new(move || {
+        store_react.inspector.get().as_ref()
+            .and_then(|s| player_field(&s.components, "playing").cloned())
+            .map(|v| matches!(v, FieldValue::Bool(true)))
+            .unwrap_or(false)
+    });
+    let time_memo = Memo::new(move || {
+        store_react.inspector.get().as_ref()
+            .and_then(|s| player_field(&s.components, "time").cloned())
+            .and_then(|v| if let FieldValue::Float(f) = v { Some(f as f32) } else { None })
+            .unwrap_or(0.0)
+    });
+    let speed_memo = Memo::new(move || {
+        store_react.inspector.get().as_ref()
+            .and_then(|s| player_field(&s.components, "speed").cloned())
+            .and_then(|v| if let FieldValue::Float(f) = v { Some(f as f32) } else { None })
+            .unwrap_or(1.0)
+    });
 
     // Clip dropdown options — built from the loaded asset's clip list.
     // Empty fallback shows "(no clip)" as the single option.
@@ -537,8 +566,6 @@ fn animation_controls(
     let entity_id = Signal::new(snap.entity_id.clone());
 
     let clip_signal = Signal::new(clip_name.clone());
-    let time_signal = Signal::new(time);
-    let speed_signal = Signal::new(speed);
     let loop_signal = Signal::new(loop_mode.clone());
 
     let on_clip = Rc::new(move |v: String| {
@@ -554,9 +581,9 @@ fn animation_controls(
         send_field_edit(cmd_tx.get(), &entity_id.get(), "AnimationPlayer", "loop_mode", FieldValue::String(v));
     }) as Rc<dyn Fn(String)>;
 
-    let play_accent = if playing { "#2e5a2e" } else { "#2d2d2d" };
     let on_play = Rc::new(move || {
-        send_field_edit(cmd_tx.get(), &entity_id.get(), "AnimationPlayer", "playing", FieldValue::Bool(!playing));
+        let current = playing_memo.get();
+        send_field_edit(cmd_tx.get(), &entity_id.get(), "AnimationPlayer", "playing", FieldValue::Bool(!current));
     }) as Rc<dyn Fn()>;
     let on_stop = Rc::new(move || {
         send_field_edit(cmd_tx.get(), &entity_id.get(), "AnimationPlayer", "playing", FieldValue::Bool(false));
@@ -598,11 +625,24 @@ fn animation_controls(
             // Clip dropdown.
             {prop_select(__scope, "Clip", clip_signal, &clip_options_refs, on_clip)}
             // Transport row — Play/Pause and Stop side-by-side.
+            // Play/Pause is rendered inline so its label and accent
+            // update reactively with `playing_memo` (prop_button takes
+            // static &str — can't track the signal).
             div {
                 style: "display:flex;gap:6px;padding:4px 0;",
                 div {
                     style: "flex:1;",
-                    {prop_button(__scope, if playing { "Pause" } else { "Play" }, play_accent, on_play)}
+                    div {
+                        style: {move || format!(
+                            "display:flex;align-items:center;justify-content:center;gap:4px;\
+                             padding:6px 12px;background:{c};border:1px solid {c};\
+                             border-radius:4px;cursor:pointer;color:#ddd;font-size:11px;\
+                             font-weight:500;",
+                            c = if playing_memo.get() { "#2e5a2e" } else { "#2d2d2d" },
+                        )},
+                        onclick: move || on_play(),
+                        {move || if playing_memo.get() { "Pause" } else { "Play" }}
+                    }
                 }
                 div {
                     style: "flex:1;",
@@ -610,9 +650,9 @@ fn animation_controls(
                 }
             }
             // Time scrubber (range = clip duration).
-            {prop_scrub(__scope, "Time", time_signal, 0.0, duration, 0.01, on_time)}
+            {prop_scrub(__scope, "Time", time_memo, 0.0, duration, 0.01, on_time)}
             // Speed scrub.
-            {prop_scrub(__scope, "Speed", speed_signal, -4.0, 4.0, 0.01, on_speed)}
+            {prop_scrub(__scope, "Speed", speed_memo, -4.0, 4.0, 0.01, on_speed)}
             // Loop mode.
             {prop_select(__scope, "Loop", loop_signal, &loop_options, on_loop)}
             // Master skinning toggle (off = rigid render).

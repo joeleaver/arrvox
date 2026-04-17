@@ -36,15 +36,19 @@ fn float_editor(
     if field.scrub {
         if let Some((min, max)) = field.range {
             let value = Signal::new(val as f32);
+            let display = Memo::new(move || value.get());
             let step = ((max - min) / 200.0) as f32;
             return prop_controls::prop_scrub(
                 __scope,
                 &field.name,
-                value,
+                display,
                 min as f32,
                 max as f32,
                 step,
-                Rc::new(move |v| on_change(FieldValue::Float(v as f64))),
+                Rc::new(move |v| {
+                    value.set(v);
+                    on_change(FieldValue::Float(v as f64));
+                }),
             );
         }
     }

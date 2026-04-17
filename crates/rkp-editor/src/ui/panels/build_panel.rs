@@ -307,15 +307,17 @@ fn render_param_field(
         ProceduralParamValue::Float(v) => {
             let (min, max) = param.range.unwrap_or((0.0, 100.0));
             let signal = Signal::new(v);
+            let display = Memo::new(move || signal.get());
             let name = param.name.clone();
             let on_change: Rc<dyn Fn(f32)> = Rc::new(move |val: f32| {
+                signal.set(val);
                 let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralNodeParam {
                     node_id: node_id.get(),
                     param_name: name.clone(),
                     value: format!("{val}"),
                 });
             });
-            prop_scrub(__scope, &param.name, signal, min, max, 0.01, on_change)
+            prop_scrub(__scope, &param.name, display, min, max, 0.01, on_change)
         }
         ProceduralParamValue::Vec3(v) => {
             let signal = Signal::new(v);
