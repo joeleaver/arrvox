@@ -11,6 +11,7 @@ members = [
     "crates/rkp-procedural",
     "crates/rkp-import",
     "crates/rkp-animation",
+    "crates/rkp-physics",
 ]
 
 [workspace.package]
@@ -31,13 +32,13 @@ rkp-macros = { path = "crates/rkp-macros" }
 rkp-procedural = { path = "crates/rkp-procedural" }
 rkp-import = { path = "crates/rkp-import" }
 rkp-animation = { path = "crates/rkp-animation" }
+rkp-physics = { path = "crates/rkp-physics" }
 
 # Shared crates from RKIField
 rkf-core = { path = "../rkifield/crates/rkf-core" }
 rkf-render = { path = "../rkifield/crates/rkf-render" }
 rkf-editor = { path = "../rkifield/crates/rkf-editor" }
 rkf-runtime = { path = "../rkifield/crates/rkf-runtime" }
-rkf-physics = { path = "../rkifield/crates/rkf-physics" }
 rkf-mcp = { path = "../rkifield/crates/rkf-mcp" }
 
 # External dependencies (versions match RKIField)

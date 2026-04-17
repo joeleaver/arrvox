@@ -140,9 +140,9 @@ pub struct Parent {
 #[serde(default)]
 pub struct RigidBody {
     /// Body type: Dynamic (gravity+forces), Static (immovable), Kinematic.
-    pub body_type: rkf_physics::rigid_body::BodyType,
+    pub body_type: rkp_physics::rigid_body::BodyType,
     /// Collision shape. Auto = voxel collider for voxelized, box for analytical.
-    pub collider_shape: rkf_physics::rigid_body::ColliderShape,
+    pub collider_shape: rkp_physics::rigid_body::ColliderShape,
     /// Mass in kg (dynamic bodies only).
     pub mass: f32,
     /// Friction coefficient.
@@ -157,8 +157,8 @@ pub struct RigidBody {
 impl Default for RigidBody {
     fn default() -> Self {
         Self {
-            body_type: rkf_physics::rigid_body::BodyType::Dynamic,
-            collider_shape: rkf_physics::rigid_body::ColliderShape::Auto,
+            body_type: rkp_physics::rigid_body::BodyType::Dynamic,
+            collider_shape: rkp_physics::rigid_body::ColliderShape::Auto,
             mass: 1.0,
             friction: 0.5,
             restitution: 0.3,
@@ -172,7 +172,7 @@ impl Default for RigidBody {
 #[derive(Debug, Clone)]
 pub struct ColliderCache {
     /// The resolved collider shape type.
-    pub shape: rkf_physics::rigid_body::ColliderShape,
+    pub shape: rkp_physics::rigid_body::ColliderShape,
     /// For voxel colliders: the coarse grid cell coordinates.
     pub voxel_coords: Vec<glam::IVec3>,
     /// Coarse cell size for the collider grid.

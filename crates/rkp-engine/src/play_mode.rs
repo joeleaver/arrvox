@@ -8,8 +8,8 @@ use std::collections::HashMap;
 
 use glam::{IVec3, Vec3};
 use rapier3d::prelude::*;
-use rkf_physics::rapier_world::{PhysicsConfig, PhysicsWorld, to_rapier_vec3, from_rapier_vec3, from_rapier_quat};
-use rkf_physics::rigid_body::BodyType;
+use rkp_physics::rapier_world::{PhysicsConfig, PhysicsWorld, to_rapier_vec3, from_rapier_vec3, from_rapier_quat};
+use rkp_physics::rigid_body::BodyType;
 
 use crate::components::{RigidBody, RigidBodyRuntime, Transform};
 
@@ -151,8 +151,8 @@ fn build_collider_from_cache(
     cache: &crate::components::ColliderCache,
     scale: Vec3,
 ) -> Collider {
-    use rkf_physics::rapier_world::to_rapier_vec3 as to_rv;
-    use rkf_physics::rigid_body::ColliderShape;
+    use rkp_physics::rapier_world::to_rapier_vec3 as to_rv;
+    use rkp_physics::rigid_body::ColliderShape;
 
     eprintln!("[build_collider] cache.shape={:?} aabb_half={:?} grid_origin={:?} voxel_coords={} scale={:?}",
         cache.shape, cache.aabb_half, cache.grid_origin, cache.voxel_coords.len(), scale);

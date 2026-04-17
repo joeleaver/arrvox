@@ -3606,7 +3606,7 @@ impl EngineState {
             }
 
             let (resolved_shape, voxel_coords, voxel_size) = match rb.collider_shape {
-                rkf_physics::rigid_body::ColliderShape::Auto => {
+                rkp_physics::rigid_body::ColliderShape::Auto => {
                     if let Some(ref sp) = spatial {
                         let (coords, cell_size) = crate::play_mode::build_coarse_collider(
                             all_nodes,
@@ -3617,12 +3617,12 @@ impl EngineState {
                             rb.collider_cell_size,
                         );
                         if coords.is_empty() {
-                            (rkf_physics::rigid_body::ColliderShape::Box, Vec::new(), 0.0)
+                            (rkp_physics::rigid_body::ColliderShape::Box, Vec::new(), 0.0)
                         } else {
-                            (rkf_physics::rigid_body::ColliderShape::Auto, coords, cell_size)
+                            (rkp_physics::rigid_body::ColliderShape::Auto, coords, cell_size)
                         }
                     } else {
-                        (rkf_physics::rigid_body::ColliderShape::Box, Vec::new(), 0.0)
+                        (rkp_physics::rigid_body::ColliderShape::Box, Vec::new(), 0.0)
                     }
                 }
                 other => (other.clone(), Vec::new(), 0.0),
@@ -3656,7 +3656,7 @@ impl EngineState {
 
     /// Build wireframe visualization for all physics colliders from cached data.
     fn build_collider_wireframes(&self) -> Vec<rkf_render::LineVertex> {
-        use rkf_physics::rigid_body::{BodyType, ColliderShape};
+        use rkp_physics::rigid_body::{BodyType, ColliderShape};
         let mut verts = Vec::new();
 
         for (_entity, (transform, rb, cache)) in self.world.query::<(

@@ -546,10 +546,10 @@ fn rigid_body_entry() -> ComponentEntry {
                 "body_type" => {
                     if let FieldValue::String(v) = value {
                         c.body_type = match v.as_str() {
-                            "Static" => rkf_physics::rigid_body::BodyType::Static,
-                            "KinematicPosition" => rkf_physics::rigid_body::BodyType::KinematicPosition,
-                            "KinematicVelocity" => rkf_physics::rigid_body::BodyType::KinematicVelocity,
-                            _ => rkf_physics::rigid_body::BodyType::Dynamic,
+                            "Static" => rkp_physics::rigid_body::BodyType::Static,
+                            "KinematicPosition" => rkp_physics::rigid_body::BodyType::KinematicPosition,
+                            "KinematicVelocity" => rkp_physics::rigid_body::BodyType::KinematicVelocity,
+                            _ => rkp_physics::rigid_body::BodyType::Dynamic,
                         };
                         Ok(())
                     } else { Err("type mismatch".into()) }
@@ -557,10 +557,10 @@ fn rigid_body_entry() -> ComponentEntry {
                 "collider_shape" => {
                     if let FieldValue::String(v) = value {
                         c.collider_shape = match v.as_str() {
-                            "Box" => rkf_physics::rigid_body::ColliderShape::Box,
-                            "Sphere" => rkf_physics::rigid_body::ColliderShape::Sphere,
-                            "Capsule" => rkf_physics::rigid_body::ColliderShape::Capsule,
-                            _ => rkf_physics::rigid_body::ColliderShape::Auto,
+                            "Box" => rkp_physics::rigid_body::ColliderShape::Box,
+                            "Sphere" => rkp_physics::rigid_body::ColliderShape::Sphere,
+                            "Capsule" => rkp_physics::rigid_body::ColliderShape::Capsule,
+                            _ => rkp_physics::rigid_body::ColliderShape::Auto,
                         };
                         Ok(())
                     } else { Err("type mismatch".into()) }

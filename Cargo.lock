@@ -4982,13 +4982,13 @@ dependencies = [
  "log",
  "notify",
  "rapier3d",
- "rkf-physics",
  "rkf-render",
  "rkf-runtime",
  "rkp-animation",
  "rkp-core",
  "rkp-import",
  "rkp-macros",
+ "rkp-physics",
  "rkp-procedural",
  "rkp-render",
  "serde",
@@ -5022,6 +5022,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "rkp-physics"
+version = "0.1.0"
+dependencies = [
+ "glam 0.29.3",
+ "log",
+ "rapier3d",
+ "rkp-core",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -5065,9 +5077,9 @@ dependencies = [
  "log",
  "pollster",
  "rkf-mcp",
- "rkf-physics",
  "rkp-animation",
  "rkp-core",
+ "rkp-physics",
  "rkp-render",
  "wgpu 29.0.1",
  "winit",

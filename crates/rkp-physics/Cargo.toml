@@ -1,0 +1,14 @@
+[package]
+name = "rkp-physics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Physics integration and SDF collision for the RKIPatch engine"
+
+[dependencies]
+rkp-core = { workspace = true }
+glam = { workspace = true }
+rapier3d = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
