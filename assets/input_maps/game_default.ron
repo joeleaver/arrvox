@@ -1,0 +1,162 @@
+[
+    (
+        name: "gameplay",
+        actions: [
+            (
+                name: "move",
+                control_type: Axis2D,
+                bindings: [
+                    Composite2D(
+                        up: Key(W),
+                        down: Key(S),
+                        left: Key(A),
+                        right: Key(D),
+                    ),
+                    Composite2D(
+                        up: Key(ArrowUp),
+                        down: Key(ArrowDown),
+                        left: Key(ArrowLeft),
+                        right: Key(ArrowRight),
+                    ),
+                    Simple(input: GamepadStick(Left), modifiers: (ctrl: None, shift: None, alt: None)),
+                    Composite2D(
+                        up: GamepadButton(DPadUp),
+                        down: GamepadButton(DPadDown),
+                        left: GamepadButton(DPadLeft),
+                        right: GamepadButton(DPadRight),
+                    ),
+                ],
+                dead_zone: 0.15,
+            ),
+            (
+                name: "look",
+                control_type: Axis2D,
+                bindings: [
+                    Simple(input: MouseDelta, modifiers: (ctrl: None, shift: None, alt: None)),
+                    Simple(input: GamepadStick(Right), modifiers: (ctrl: None, shift: None, alt: None)),
+                ],
+                dead_zone: 0.1,
+            ),
+            (
+                name: "jump",
+                control_type: Digital,
+                bindings: [
+                    Simple(input: Key(Space), modifiers: (ctrl: None, shift: None, alt: None)),
+                    Simple(input: GamepadButton(South), modifiers: (ctrl: None, shift: None, alt: None)),
+                ],
+                dead_zone: 0.1,
+            ),
+            (
+                name: "sprint",
+                control_type: Digital,
+                bindings: [
+                    Simple(input: Key(ShiftLeft), modifiers: (ctrl: None, shift: None, alt: None)),
+                    Simple(input: GamepadButton(LeftStick), modifiers: (ctrl: None, shift: None, alt: None)),
+                ],
+                dead_zone: 0.1,
+            ),
+            (
+                name: "crouch",
+                control_type: Digital,
+                bindings: [
+                    Simple(input: Key(C), modifiers: (ctrl: None, shift: None, alt: None)),
+                    Simple(input: GamepadButton(East), modifiers: (ctrl: None, shift: None, alt: None)),
+                ],
+                dead_zone: 0.1,
+            ),
+            (
+                name: "interact",
+                control_type: Digital,
+                bindings: [
+                    Simple(input: Key(E), modifiers: (ctrl: None, shift: None, alt: None)),
+                    Simple(input: GamepadButton(West), modifiers: (ctrl: None, shift: None, alt: None)),
+                ],
+                dead_zone: 0.1,
+            ),
+            (
+                name: "primary_action",
+                control_type: Digital,
+                bindings: [
+                    Simple(input: MouseButton(Left), modifiers: (ctrl: None, shift: None, alt: None)),
+                    Simple(input: GamepadAxis(RightTrigger), modifiers: (ctrl: None, shift: None, alt: None)),
+                ],
+                dead_zone: 0.1,
+            ),
+            (
+                name: "secondary_action",
+                control_type: Digital,
+                bindings: [
+                    Simple(input: MouseButton(Right), modifiers: (ctrl: None, shift: None, alt: None)),
+                    Simple(input: GamepadAxis(LeftTrigger), modifiers: (ctrl: None, shift: None, alt: None)),
+                ],
+                dead_zone: 0.1,
+            ),
+            (
+                name: "zoom",
+                control_type: Axis1D,
+                bindings: [
+                    Simple(input: ScrollWheel, modifiers: (ctrl: None, shift: None, alt: None)),
+                ],
+                dead_zone: 0.05,
+            ),
+            (
+                name: "pause",
+                control_type: Digital,
+                bindings: [
+                    Simple(input: Key(Escape), modifiers: (ctrl: None, shift: None, alt: None)),
+                    Simple(input: GamepadButton(Start), modifiers: (ctrl: None, shift: None, alt: None)),
+                ],
+                dead_zone: 0.1,
+            ),
+        ],
+    ),
+    (
+        name: "menu",
+        actions: [
+            (
+                name: "navigate",
+                control_type: Axis2D,
+                bindings: [
+                    Composite2D(
+                        up: Key(W),
+                        down: Key(S),
+                        left: Key(A),
+                        right: Key(D),
+                    ),
+                    Composite2D(
+                        up: Key(ArrowUp),
+                        down: Key(ArrowDown),
+                        left: Key(ArrowLeft),
+                        right: Key(ArrowRight),
+                    ),
+                    Composite2D(
+                        up: GamepadButton(DPadUp),
+                        down: GamepadButton(DPadDown),
+                        left: GamepadButton(DPadLeft),
+                        right: GamepadButton(DPadRight),
+                    ),
+                ],
+                dead_zone: 0.2,
+            ),
+            (
+                name: "confirm",
+                control_type: Digital,
+                bindings: [
+                    Simple(input: Key(Enter), modifiers: (ctrl: None, shift: None, alt: None)),
+                    Simple(input: Key(Space), modifiers: (ctrl: None, shift: None, alt: None)),
+                    Simple(input: GamepadButton(South), modifiers: (ctrl: None, shift: None, alt: None)),
+                ],
+                dead_zone: 0.1,
+            ),
+            (
+                name: "cancel",
+                control_type: Digital,
+                bindings: [
+                    Simple(input: Key(Escape), modifiers: (ctrl: None, shift: None, alt: None)),
+                    Simple(input: GamepadButton(East), modifiers: (ctrl: None, shift: None, alt: None)),
+                ],
+                dead_zone: 0.1,
+            ),
+        ],
+    ),
+]

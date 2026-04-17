@@ -12,7 +12,7 @@ rkp-procedural = { workspace = true }
 rkp-render = { workspace = true }
 rkp-import = { workspace = true }
 rkf-render = { workspace = true }
-rkf-runtime = { workspace = true }
+rkp-runtime = { workspace = true }
 rkp-physics = { workspace = true }
 rkp-animation = { workspace = true }
 rapier3d = { workspace = true }

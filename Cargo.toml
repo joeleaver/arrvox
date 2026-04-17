@@ -38,7 +38,6 @@ rkp-physics = { path = "crates/rkp-physics" }
 rkf-core = { path = "../rkifield/crates/rkf-core" }
 rkf-render = { path = "../rkifield/crates/rkf-render" }
 rkf-editor = { path = "../rkifield/crates/rkf-editor" }
-rkf-runtime = { path = "../rkifield/crates/rkf-runtime" }
 rkf-mcp = { path = "../rkifield/crates/rkf-mcp" }
 
 # External dependencies (versions match RKIField)
@@ -63,6 +62,8 @@ image = "0.25"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
 pollster = "0.4"
+ron = "0.8"
+gilrs = "0.11"
 gltf = { version = "1", features = ["KHR_texture_transform"] }
 tobj = "4"
 ufbx = "0.10"

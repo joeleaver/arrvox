@@ -194,7 +194,7 @@ struct EngineState {
     scene_mgr: RkpSceneManager,
 
     // Input + Camera
-    input_system: rkf_runtime::input::InputSystem,
+    input_system: rkp_runtime::input::InputSystem,
     camera_control: CameraControlState,
     camera: CameraState,
 
@@ -424,7 +424,7 @@ impl EngineState {
         let scene_mgr = RkpSceneManager::new(1_000_000);
 
         // Input system with default action map.
-        let mut input_system = rkf_runtime::input::InputSystem::new();
+        let mut input_system = rkp_runtime::input::InputSystem::new();
         input_system.add_map(crate::camera::default_action_map());
         input_system.set_active_map("editor");
         let camera_control = CameraControlState::default();
@@ -3325,7 +3325,7 @@ impl EngineState {
 
         let (ray_o, ray_d) = self.screen_to_ray(self.mouse_pos.x, self.mouse_pos.y);
 
-        let left_pressed = self.input_system.raw_state().is_mouse_button_pressed(rkf_runtime::input::InputMouseButton::Left);
+        let left_pressed = self.input_system.raw_state().is_mouse_button_pressed(rkp_runtime::input::InputMouseButton::Left);
 
         if self.gizmo.dragging {
             // Update drag.

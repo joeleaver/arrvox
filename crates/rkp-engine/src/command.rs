@@ -6,7 +6,7 @@
 //! mode, debug views, tool settings) is NOT here — it stays in the editor client.
 
 use glam::Vec3;
-use rkf_runtime::input::{InputKeyCode, InputMouseButton};
+use rkp_runtime::input::{InputKeyCode, InputMouseButton};
 use uuid::Uuid;
 
 /// A command sent to the engine from the editor or any other client.
