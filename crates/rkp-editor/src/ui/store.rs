@@ -125,6 +125,10 @@ pub struct EditorStore {
     // ── View settings ────────────────────────────────────────────
     /// Show physics collider wireframes in the viewport.
     pub show_colliders: Signal<bool>,
+    /// Skeletal skinning master switch. `false` → the scatter pass is
+    /// skipped and the march shader falls back to rigid-mesh rendering
+    /// for every skinned entity. Defaults `true`.
+    pub skinning_enabled: Signal<bool>,
 
     // ── Drag state (tab dragging) ────────────────────────────────
 
@@ -218,6 +222,7 @@ impl EditorStore {
             console_entries: Signal::new(Vec::new()),
             play_mode: Signal::new(false),
             show_colliders: Signal::new(false),
+            skinning_enabled: Signal::new(true),
 
             // Drag state.
             tab_drag: Signal::new(None),

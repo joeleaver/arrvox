@@ -52,6 +52,34 @@ pub struct AssetInfo {
     pub voxel_count: u32,
     pub leaf_attr_slot_start: u32,
     pub leaf_attr_slot_count: u32,
+    /// `true` if this asset has skinning data (bone weights + SkinBricks
+    /// + rest bone AABBs) baked in. Caller fetches the full data via
+    /// [`RkpSceneManager::skinning_data`].
+    pub has_skinning: bool,
+}
+
+/// One populated octree brick, with its scene-global id and its origin
+/// in finest-voxel grid units. Produced at load time by shifting each
+/// baked file-local origin's id by the asset's `scene_brick_offset`.
+#[derive(Debug, Clone, Copy)]
+pub struct SkinBrick {
+    /// Scene-global brick id (matches the ids stored in octree nodes).
+    pub brick_id: u32,
+    /// Brick corner in finest-voxel grid units.
+    pub origin: [u32; 3],
+}
+
+/// Per-asset skinning metadata read from the `.rkp`'s skin-meta
+/// section. Phase-3 scatter pass consumes this to size + populate the
+/// deformed bone field each frame.
+#[derive(Debug, Clone, Default)]
+pub struct SkinningAssetData {
+    /// One entry per populated brick in the asset's octree.
+    pub bricks: Vec<SkinBrick>,
+    /// Per-bone rest-pose AABB, in object-local voxel space. Index is
+    /// the bone id (as stored in per-leaf `BoneVoxel.bone_index`).
+    /// Empty AABBs (zero-extent) are sentinels for unused bone slots.
+    pub rest_bone_aabbs: Vec<[f32; 6]>,
 }
 
 /// One entry in the asset cache: the shared geometry allocations plus
@@ -68,6 +96,10 @@ struct AssetEntry {
     leaf_attr_slot_count: u32,
     brick_start: u32,
     brick_count: u32,
+    /// Populated only when the asset has a `FLAG_HAS_BONES` skin-meta
+    /// section. Phase-3 scatter pass reads this to drive the per-frame
+    /// bone-field write.
+    skinning: Option<SkinningAssetData>,
 }
 
 impl AssetEntry {
@@ -84,6 +116,7 @@ impl AssetEntry {
             voxel_count: self.voxel_count,
             leaf_attr_slot_start: self.leaf_attr_slot_start,
             leaf_attr_slot_count: self.leaf_attr_slot_count,
+            has_skinning: self.skinning.is_some(),
         }
     }
 }
@@ -330,6 +363,7 @@ impl RkpSceneManager {
             octree_internal_attrs: self.octree.internal_attrs_data(),
             leaf_attr_pool: self.leaf_attr_pool.as_bytes(),
             color_pool: self.leaf_attr_pool.color_bytes(),
+            bone_weights: self.leaf_attr_pool.bone_bytes(),
             brick_pool: self.brick_pool.as_bytes(),
             brick_face_links: rkp_core::brick_face_links::as_bytes(&self.brick_face_links),
         }
@@ -521,6 +555,46 @@ impl RkpSceneManager {
             &[]
         };
 
+        // Skin-meta section — structured payload carrying per-leaf bone
+        // weights, per-brick origins, and per-bone rest AABBs. Only
+        // present when rkp-import resolved a skinned skeleton.
+        let has_bones = header.flags & rkp_core::asset_file::FLAG_HAS_BONES != 0;
+        let skin_meta = if has_bones {
+            match rkp_core::asset_file::read_rkp_skin_meta(&mut reader, &header) {
+                Ok(m) => {
+                    eprintln!(
+                        "[RkpSceneManager] {}: skin-meta loaded ({} bone voxels, {} bricks, {} bone AABBs)",
+                        rkp_path.display(),
+                        m.bone_voxels.len() / 8,
+                        m.brick_origins.len(),
+                        m.rest_bone_aabbs.len(),
+                    );
+                    m
+                }
+                Err(e) => {
+                    // Old Phase-2 file format wrote the bones section
+                    // as a raw `BoneVoxel` array; the new structured
+                    // blob fails to decode that. Warn loudly so a
+                    // stale `.rkp` on disk doesn't silently mask the
+                    // whole skinning pipeline as "nothing broken, no
+                    // deformation".
+                    eprintln!(
+                        "[RkpSceneManager] {}: FLAG_HAS_BONES set but skin-meta decode failed ({e}). \
+                         Re-import the asset to write the new wire format.",
+                        rkp_path.display(),
+                    );
+                    rkp_core::asset_file::SkinMetaOut::default()
+                }
+            }
+        } else {
+            rkp_core::asset_file::SkinMetaOut::default()
+        };
+        let file_bones: &[rkf_core::companion::BoneVoxel] = if skin_meta.bone_voxels.len() >= std::mem::size_of::<rkf_core::companion::BoneVoxel>() {
+            bytemuck::cast_slice(&skin_meta.bone_voxels)
+        } else {
+            &[]
+        };
+
         let bytes_per_voxel = std::mem::size_of::<VoxelSample>();
         let mut file_voxel_mat: Vec<(u16, u16, u8, u32, u32)> = Vec::with_capacity(voxel_count as usize);
         for i in 0..voxel_count as usize {
@@ -559,6 +633,12 @@ impl RkpSceneManager {
             *self.leaf_attr_pool.get_mut(slot) = attr;
             if color != 0 {
                 self.leaf_attr_pool.set_color(slot, color);
+            }
+            // File-local bone slot i → scene-global leaf_attr slot. The
+            // `file_bones` slice is empty for unskinned assets, in which
+            // case the pool's zero-default BoneVoxel stands.
+            if let Some(&bv) = file_bones.get(i) {
+                self.leaf_attr_pool.set_bone(slot, bv);
             }
         }
 
@@ -683,6 +763,24 @@ impl RkpSceneManager {
             final_leaf_attr_slot_count - leaf_attr_slot_count,
         );
 
+        // Promote the baked skin-meta (file-local brick ids) into
+        // scene-global SkinBrick entries. Rest bone AABBs are already
+        // in object-local voxel space — no transform needed.
+        let skinning = if has_bones {
+            let bricks: Vec<SkinBrick> = skin_meta.brick_origins.iter().enumerate()
+                .map(|(file_id, &origin)| SkinBrick {
+                    brick_id: scene_brick_offset + file_id as u32,
+                    origin,
+                })
+                .collect();
+            Some(SkinningAssetData {
+                bricks,
+                rest_bone_aabbs: skin_meta.rest_bone_aabbs,
+            })
+        } else {
+            None
+        };
+
         Ok(AssetEntry {
             path: rkp_path.to_path_buf(),
             refcount: 1,
@@ -694,7 +792,14 @@ impl RkpSceneManager {
             leaf_attr_slot_count: final_leaf_attr_slot_count,
             brick_start: scene_brick_offset,
             brick_count: file_brick_count,
+            skinning,
         })
+    }
+
+    /// Peek at an asset's skinning metadata. Returns `None` when the
+    /// asset was imported without bone weights.
+    pub fn skinning_data(&self, handle: AssetHandle) -> Option<&SkinningAssetData> {
+        self.asset_cache.get(handle)?.skinning.as_ref()
     }
 
     // ── Primitive voxelization ───────────────────────────────────────

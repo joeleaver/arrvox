@@ -31,8 +31,14 @@ use bytemuck::{Pod, Zeroable};
 /// | 128    | 4    | rest_octree_root (u32) |
 /// | 132    | 4    | rest_octree_depth (u32) |
 /// | 136    | 4    | rest_octree_extent_bits (u32) |
-/// | 140    | 4    | deformed_pool_offset (u32) |
-/// | 144    | 48   | _padding |
+/// | 140    | 4    | bone_field_offset (u32) — in vec2<u32> cells |
+/// | 144    | 4    | bone_field_dim_x (u32) |
+/// | 148    | 4    | bone_field_dim_y (u32) |
+/// | 152    | 4    | bone_field_dim_z (u32) |
+/// | 156    | 4    | bone_field_origin_x (f32 bits) |
+/// | 160    | 4    | bone_field_origin_y (f32 bits) |
+/// | 164    | 4    | bone_field_origin_z (f32 bits) |
+/// | 168    | 24   | _padding |
 /// | 192    | 64   | inverse_world (mat4x4<f32>) — world→local |
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
@@ -74,11 +80,22 @@ pub struct RkpGpuObject {
     pub rest_octree_depth: u32,
     /// Rest-pose octree extent bits.
     pub rest_octree_extent_bits: u32,
-    /// Offset into deformed bone-field pool.
-    pub deformed_pool_offset: u32,
+    /// Offset into the scene-wide bone_field buffer (in `vec2<u32>`
+    /// cells, not bytes). Skin-deform scatters this object's entries
+    /// starting here; the march's skinned branch reads from here.
+    pub bone_field_offset: u32,
 
-    /// Padding.
-    pub _padding: [u32; 12],
+    /// Bone-field grid dimensions (voxel cells).
+    pub bone_field_dim_x: u32,
+    pub bone_field_dim_y: u32,
+    pub bone_field_dim_z: u32,
+    /// Bone-field grid origin in object-local space (f32 packed as bits).
+    pub bone_field_origin_x: f32,
+    pub bone_field_origin_y: f32,
+    pub bone_field_origin_z: f32,
+
+    /// Padding (6 u32 = 24 B).
+    pub _padding: [u32; 6],
 
     /// Inverse world transform (world→local). Precomputed on CPU.
     pub inverse_world: [[f32; 4]; 4],
@@ -98,8 +115,13 @@ mod tests {
     use std::mem;
 
     #[test]
-    fn size_is_192_bytes() {
-        assert_eq!(mem::size_of::<RkpGpuObject>(), 192);
+    fn size_matches_layout() {
+        // The doc comment above `RkpGpuObject` spells the layout out in
+        // full: 192 B of forward-transform / octree / skinning data,
+        // then 64 B `inverse_world` at offset 192 → 256 B total. Asserts
+        // the struct stays in sync with the documented layout and with
+        // the shader-side struct (which is also 256 B).
+        assert_eq!(mem::size_of::<RkpGpuObject>(), 256);
     }
 
     #[test]

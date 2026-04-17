@@ -773,6 +773,50 @@ impl SparseOctree {
         results.into_iter()
     }
 
+    /// Walk the tree and emit every BRICK node as `(brick_origin, brick_id)`.
+    /// `brick_origin` is in finest-voxel grid units — divide by
+    /// `BRICK_DIM` (=8) to get brick-grid units. Used by the
+    /// skin-deform scatter pass, which needs each brick's object-local
+    /// position to forward-skin the voxels it contains.
+    pub fn iter_bricks(&self) -> impl Iterator<Item = (UVec3, u32)> + '_ {
+        let mut results = Vec::new();
+        self.collect_bricks(0, UVec3::ZERO, 0, &mut results);
+        results.into_iter()
+    }
+
+    fn collect_bricks(
+        &self,
+        node_idx: usize,
+        origin: UVec3,
+        level: u8,
+        out: &mut Vec<(UVec3, u32)>,
+    ) {
+        let node = self.nodes[node_idx];
+        if node == EMPTY_NODE || node == INTERIOR_NODE {
+            return;
+        }
+        if is_leaf(node) {
+            return;
+        }
+        if is_brick(node) {
+            out.push((origin, brick_id(node)));
+            return;
+        }
+        let children_offset = node as usize;
+        let half = 1u32 << (self.depth - level - 1);
+        for octant in 0u32..8 {
+            let dx = octant & 1;
+            let dy = (octant >> 1) & 1;
+            let dz = (octant >> 2) & 1;
+            let child_origin = UVec3::new(
+                origin.x + dx * half,
+                origin.y + dy * half,
+                origin.z + dz * half,
+            );
+            self.collect_bricks(children_offset + octant as usize, child_origin, level + 1, out);
+        }
+    }
+
     fn collect_leaves(
         &self,
         node_idx: usize,

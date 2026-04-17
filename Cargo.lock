@@ -4968,6 +4968,7 @@ dependencies = [
  "log",
  "notify",
  "rapier3d",
+ "rkf-animation",
  "rkf-core",
  "rkf-physics",
  "rkf-render",

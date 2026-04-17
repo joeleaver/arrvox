@@ -15,6 +15,7 @@ rkf-core = { workspace = true }
 rkf-render = { workspace = true }
 rkf-runtime = { workspace = true }
 rkf-physics = { workspace = true }
+rkf-animation = { workspace = true }
 rapier3d = { workspace = true }
 glam = { workspace = true }
 wgpu = { workspace = true }

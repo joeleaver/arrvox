@@ -58,10 +58,12 @@ struct RkpObject {
     geom_type: u32, is_skinned: u32,
     bone_count: u32, bone_buffer_offset: u32,
     rest_octree_root: u32, rest_octree_depth: u32,
-    rest_octree_extent_bits: u32, deformed_pool_offset: u32,
+    rest_octree_extent_bits: u32, bone_field_offset: u32,
+    bone_field_dim_x: u32, bone_field_dim_y: u32,
+    bone_field_dim_z: u32, bone_field_origin_x: f32,
+    bone_field_origin_y: f32, bone_field_origin_z: f32,
     _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32,
-    _pad4: u32, _pad5: u32, _pad6: u32, _pad7: u32,
-    _pad8: u32, _pad9: u32, _pad10: u32, _pad11: u32,
+    _pad4: u32, _pad5: u32,
     inverse_world: mat4x4<f32>,
 }
 
@@ -169,11 +171,24 @@ struct LeafAttr {
                                      // mid 12:  material_secondary (shifted 16)
                                      // high 4:  blend_weight (shifted 28)
 }
+// bone_matrices[offset + i] = forward skinning palette (world × inv_bind).
+// bone_matrices[offset + bone_count + i] = inverse skinning palette
+// used by the Phase-3b skinned march to invert deformed samples back
+// to rest space. Packed by rkp-engine::scene_sync::BoneMatrixAllocator.
+@group(0) @binding(5) var<storage, read> bone_matrices: array<mat4x4<f32>>;
+// bone_weights[leaf_attr_id * 2 + 0] = packed bone indices (4 × u8)
+// bone_weights[leaf_attr_id * 2 + 1] = packed bone weights (4 × u8)
+// Baked at import, uploaded via LeafAttrPool::bone_bytes.
+@group(0) @binding(6) var<storage, read> bone_weights: array<u32>;
 // brick_face_links[brick_id * 6 + face] → adjacent brick_id, or one of
 // FACE_EMPTY / FACE_INTERIOR. Face order: −X, +X, −Y, +Y, −Z, +Z.
 // Populated by `rkp_core::brick_face_links::compute_brick_face_links`.
 @group(0) @binding(7) var<storage, read> brick_face_links: array<u32>;
 @group(0) @binding(8) var<storage, read> leaf_attr_pool: array<LeafAttr>;
+// Deformed-space bone field — vec2<u32> (indices, weights) per voxel
+// cell. Scatter pass writes; the skinned march branch reads. Empty
+// cells are (0, 0) (zero-cleared each frame before scatter).
+@group(0) @binding(9) var<storage, read> bone_field: array<vec2<u32>>;
 
 const FACE_INTERIOR: u32 = 0xFFFFFFFEu;
 const FACE_EMPTY_LINK: u32 = 0xFFFFFFFFu;
@@ -222,7 +237,10 @@ fn brick_id_of(node: u32) -> u32 {
 // stats[52]      = surfacenet normal reconstructions (brick-hit path)
 // stats[53]      = (unused — was brick-boundary fallback pre-face-links)
 // stats[54]      = surfacenet degenerate fallbacks (isolated or surrounded)
-// stats[55..64]  = reserved
+// stats[55]      = skinned march entries (object-level — per skinned obj per pixel)
+// stats[56]      = skinned march hits (pixel produced a deformed G-buffer write)
+// stats[57]      = skinned march bone-field populated-cell reads
+// stats[58..64]  = reserved
 //
 // octree_nodes reads are derived CPU-side from the per-phase depth histograms:
 // sum(bucket[i] * (i + 1)) since each lookup descends `depth+1` nodes.
@@ -562,9 +580,145 @@ struct MarchResult {
     steps: u32,             // total steps taken (for profiling)
 }
 
+// ── Phase-3b: skinned march — deformed-field lookup ──────────────────
+//
+// The scatter pass has pre-rotated each surface voxel's normal into
+// deformed space and written `(leaf_slot, normal_oct)` into the bone
+// field at the forward-skinned cell (plus a 2×2×2 splat to close
+// sparse-scatter gaps). The march's job is a plain walk of deformed
+// space: step voxel-by-voxel; first populated cell is the hit.
+//
+// No inverse skinning, no rest-octree descent. LBS is non-invertible
+// at joints — descending the rest octree at the (imperfect) inverse-
+// skinned position was picking neighbouring leaves' data or empty
+// cells, producing the "tears" + wrong-looking normals the user was
+// seeing. Forward splat dodges the whole class of issues.
+
+const SKINNED_MAX_STEPS: u32 = 512u;
+
+/// Look up the bone field at a deformed-cell coordinate. Returns
+/// `(0u, 0u)` when out of bounds or unpopulated.
+fn sample_bone_field(cell: vec3<i32>, dims: vec3<i32>, offset: u32) -> vec2<u32> {
+    if any(cell < vec3<i32>(0)) || any(cell >= dims) {
+        return vec2<u32>(0u);
+    }
+    let ux = u32(cell.x);
+    let uy = u32(cell.y);
+    let uz = u32(cell.z);
+    let idx = ux + uy * u32(dims.x) + uz * u32(dims.x) * u32(dims.y);
+    return bone_field[offset + idx];
+}
+
+/// Skinned march — direct deformed-field lookup. See the helper
+/// doc-block above for the architecture rationale.
+fn march_object_skinned(
+    world_origin: vec3<f32>, world_dir: vec3<f32>, obj: RkpObject,
+) -> MarchResult {
+    var result = MarchResult(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0.0, 0.0, 0u, false, 0u);
+
+    let inv_world = obj.inverse_world;
+    let local_origin_mesh = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
+    let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
+    let local_dir = normalize(local_dir_unnorm);
+    let vs = obj.voxel_size;
+
+    let rest_extent = bitcast<f32>(obj.rest_octree_extent_bits);
+    // Scatter + bone field all live in grid frame (origin at octree
+    // corner, range [0, extent]); the ray enters in mesh frame from
+    // `inverse_world`. Shift once up front.
+    let half_rest_ext = rest_extent * 0.5;
+    let local_origin = local_origin_mesh + vec3<f32>(half_rest_ext);
+
+    let grid_dim = vec3<i32>(
+        i32(obj.bone_field_dim_x),
+        i32(obj.bone_field_dim_y),
+        i32(obj.bone_field_dim_z),
+    );
+    if grid_dim.x <= 0 || grid_dim.y <= 0 || grid_dim.z <= 0 {
+        return result; // no scatter this frame; caller falls back to rigid path
+    }
+    atomicAdd(&stats[55], 1u); // skinned-branch entry
+
+    let grid_origin = vec3<f32>(
+        obj.bone_field_origin_x,
+        obj.bone_field_origin_y,
+        obj.bone_field_origin_z,
+    );
+    let grid_max = grid_origin + vec3<f32>(grid_dim) * vs;
+
+    let safe_dir = vec3<f32>(
+        select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),
+        select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),
+        select(local_dir.z, select(-1e-10, 1e-10, local_dir.z >= 0.0), abs(local_dir.z) < 1e-10),
+    );
+    let inv_dir = 1.0 / safe_dir;
+
+    let t_range = intersect_aabb(local_origin, inv_dir, grid_origin, grid_max);
+    if t_range.x > t_range.y { return result; }
+
+    var t = max(t_range.x, 0.0) + vs * 0.001;
+    var step_count = 0u;
+
+    for (var step = 0u; step < SKINNED_MAX_STEPS; step++) {
+        step_count += 1u;
+        if t > t_range.y { break; }
+
+        let p_local = local_origin + safe_dir * t;
+        let cell_f = (p_local - grid_origin) / vs;
+        let cell_i = vec3<i32>(floor(cell_f));
+        let cell = sample_bone_field(cell_i, grid_dim, obj.bone_field_offset);
+
+        let leaf_slot = cell.x;
+        let normal_oct = cell.y;
+        if leaf_slot == 0u {
+            // Empty cell — advance one voxel. Scatter's 2×2×2 splat
+            // keeps rigid regions covered; joints survive because
+            // each joint voxel writes its own splat too.
+            t += vs;
+            continue;
+        }
+        atomicAdd(&stats[57], 1u); // populated cell read
+        atomicAdd(&stats[56], 1u); // hit
+
+        let deformed_normal = unpack_oct_normal(normal_oct);
+
+        // Per-voxel color — mirror the rigid path's lookup. Indexed
+        // by the scatter-time leaf_slot so we get the right voxel's
+        // albedo regardless of LBS skew.
+        atomicAdd(&stats[46], 1u);
+        let cp = color_pool_data[leaf_slot];
+        var color = vec3<f32>(0.5);
+        if cp != 0u {
+            color = vec3<f32>(
+                f32(cp & 0xFFu) / 255.0,
+                f32((cp >> 8u) & 0xFFu) / 255.0,
+                f32((cp >> 16u) & 0xFFu) / 255.0,
+            );
+        }
+
+        result.oc_pos = p_local;
+        result.normal = deformed_normal;
+        result.color = color;
+        result.alpha = 1.0;
+        result.t = t;
+        result.first_slot = leaf_slot;
+        result.valid = true;
+        result.steps = step_count;
+        return result;
+    }
+
+    result.steps = step_count;
+    return result;
+}
+
 fn march_object(
     world_origin: vec3<f32>, world_dir: vec3<f32>, obj: RkpObject,
 ) -> MarchResult {
+    // Phase-3b: skinned objects inverse-skin at march time. Unskinned
+    // objects fall through to the existing rest-octree DDA.
+    if obj.is_skinned != 0u && obj.bone_count > 0u && obj.bone_field_dim_x > 0u {
+        return march_object_skinned(world_origin, world_dir, obj);
+    }
     var result = MarchResult(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0.0, 0.0, 0u, false, 0u);
 
     let inv_world = obj.inverse_world;

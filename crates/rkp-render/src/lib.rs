@@ -29,9 +29,12 @@ pub mod rkp_volumetric;
 pub mod rkp_renderer;
 /// Scene management — voxel pool, octree, face emission, asset loading.
 pub mod rkp_scene_manager;
+/// Skeletal skin-deform scatter pass — per-frame bone-field writer.
+pub mod skin_deform;
 
 pub use octree_gpu::OctreeGpu;
-pub use rkp_scene_manager::{AssetHandle, AssetInfo, ReloadResult, RkpSceneManager};
+pub use rkp_scene_manager::{AssetHandle, AssetInfo, ReloadResult, RkpSceneManager, SkinBrick, SkinningAssetData};
+pub use skin_deform::{SkinBatchScratch, SkinBrickEntry, SkinDeformPass, SkinDispatch, SkinUniforms};
 
 /// Validate WGSL source with naga at startup. Panics with a clear error message
 /// on shader bugs instead of producing cryptic "pipeline invalid" GPU errors.

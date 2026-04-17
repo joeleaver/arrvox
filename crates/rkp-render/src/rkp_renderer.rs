@@ -40,6 +40,9 @@ pub struct RkpRenderer {
     pub volumetric: RkpVolumetricPass,
     /// Screen-space god rays.
     pub god_rays: RkpGodRayPass,
+    /// Skeletal skin-deform scatter pass — writes the per-frame
+    /// deformed-space bone field (Phase 3a). See `skin_deform.rs`.
+    pub skin_deform: crate::skin_deform::SkinDeformPass,
     /// Device for buffer operations.
     device: wgpu::Device,
     /// GPU profiler (wgpu-profiler).
@@ -105,8 +108,11 @@ impl RkpRenderer {
         let mut god_rays = RkpGodRayPass::new(device, width, height);
         god_rays.set_input(device, &volumetric.output_view);
 
+        let skin_deform = crate::skin_deform::SkinDeformPass::new(device, &scene);
+
         Self {
             scene, march, shadow_trace, ssao, shade, atmosphere, volumetric, god_rays,
+            skin_deform,
             shade_params_buffer, lights_buffer, materials_buffer,
             device: device.clone(),
             profiler, timestamp_period,
@@ -114,8 +120,50 @@ impl RkpRenderer {
         }
     }
 
+    /// Grow `scene.bone_field_buffer` to at least `bytes` and clear it.
+    /// Call once per frame before any `scatter_skin_entity` dispatches.
+    pub fn prepare_bone_field(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        bytes: u64,
+    ) {
+        let bytes = bytes.max(16); // keep a non-zero placeholder so the
+                                   // read-side binding stays valid
+        let _ = queue; // unused but matches other pass signatures
+        let grew = self.scene.ensure_bone_field_capacity(&self.device, bytes);
+        if grew {
+            // New bone_field buffer handle — rebuild the scatter's
+            // scene bind group (the scene's main bind group was
+            // already rebuilt by ensure_bone_field_capacity).
+            self.skin_deform.refresh_scene_bind_group(&self.device, &self.scene);
+        }
+        // Clear the entire allocated range — scattering leaves gaps by
+        // design, so stale data from last frame must be wiped.
+        encoder.clear_buffer(&self.scene.bone_field_buffer, 0, None);
+    }
+
+    /// Run the batched skin-deform scatter. `batch` must have every
+    /// skinned entity's dispatch folded in via `SkinBatchScratch::push`.
+    /// Call once per frame after [`prepare_bone_field`]; fires a single
+    /// compute dispatch, so there's no ordering problem with
+    /// `queue.write_buffer` across entities.
+    pub fn scatter_skin_batch(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        batch: &crate::skin_deform::SkinBatchScratch,
+    ) {
+        self.skin_deform.run(&self.device, queue, encoder, &self.scene, batch);
+    }
+
     pub fn upload_geometry(&mut self, queue: &wgpu::Queue, data: &GeometryUpload) {
         self.scene.upload_geometry(&self.device, queue, data);
+        // upload_geometry may have grown brick_pool / bone_weights /
+        // bone_matrices; the scatter pass's scene bind group caches
+        // those resource references and needs a rebuild to pick up any
+        // new buffer handles. Cheap: one bind group alloc.
+        self.skin_deform.refresh_scene_bind_group(&self.device, &self.scene);
     }
 
     pub fn upload_frame(&mut self, queue: &wgpu::Queue, data: &FrameUpload) {

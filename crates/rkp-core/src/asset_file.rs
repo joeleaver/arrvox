@@ -15,8 +15,23 @@
 //! [normals (optional)]        LZ4 compressed, per slot: 1 u32 (octahedrally-packed normal)
 //! [bricks (optional)]         LZ4 compressed, BRICK_CELLS u32s per brick
 //! [color data (optional)]     LZ4 compressed, per slot: 1 ColorVoxel (4 bytes)
-//! [bone data (optional)]      LZ4 compressed, per slot: 1 BoneVoxel (8 bytes)
+//! [skin meta (optional)]      LZ4 compressed, self-describing:
+//!                               u32 bone_voxel_byte_len,
+//!                               BoneVoxel × voxel_count,
+//!                               u32 brick_origin_count,
+//!                               [u32; 3] × brick_origin_count,
+//!                               u32 rest_aabb_count,
+//!                               [f32; 6] × rest_aabb_count
 //! ```
+//!
+//! The skin-meta section consolidates everything the Phase-3 scatter
+//! pass needs: per-leaf bone influences (weights + indices), per-brick
+//! origins (for deriving rest voxel centres without walking the octree
+//! at load), and per-bone rest-pose AABBs (for sizing the deformed
+//! bone field each frame). All three are deterministic from the
+//! voxelization, so they ship pre-computed rather than being rebuilt
+//! on every load. Carried in the pre-existing `bone_compressed_size`
+//! header slot — no header version bump.
 //!
 //! v4 replaces v3's per-voxel LEAF encoding with BRICK-terminated octrees,
 //! matching the procedural voxelizer's on-GPU representation. Rays can now
@@ -84,6 +99,34 @@ pub struct RkpHeader {
     pub bricks_compressed_size: u32,
 }
 
+/// Per-write skin-meta input. Fed into [`write_rkp_with_progress`]'s
+/// `skin_meta` parameter; serialised into the single LZ4 blob that the
+/// file-format-level `bone` section carries.
+///
+/// All three slices must be populated together — missing any of them
+/// means "this asset has no skinning data; write `None`".
+#[derive(Debug, Clone, Copy)]
+pub struct SkinMetaIn<'a> {
+    /// `BoneVoxel` bytes, one entry per leaf slot.
+    /// `.len() == voxel_count * sizeof::<BoneVoxel>()`.
+    pub bone_voxels: &'a [u8],
+    /// Brick origins in finest-voxel units, `[u32; 3]` per entry.
+    /// Indexed by file-local brick id (pre-`scene_brick_offset` shift).
+    pub brick_origins: &'a [[u32; 3]],
+    /// Per-bone rest-pose AABB: `[min_x, min_y, min_z, max_x, max_y, max_z]`.
+    /// Length `= 1 + max_bone_index_seen` (empty-AABB sentinels for
+    /// unused slots).
+    pub rest_bone_aabbs: &'a [[f32; 6]],
+}
+
+/// Decoded skin-meta payload produced by [`read_rkp_skin_meta`].
+#[derive(Debug, Clone, Default)]
+pub struct SkinMetaOut {
+    pub bone_voxels: Vec<u8>,
+    pub brick_origins: Vec<[u32; 3]>,
+    pub rest_bone_aabbs: Vec<[f32; 6]>,
+}
+
 /// Error type for .rkp file operations.
 #[derive(Debug, thiserror::Error)]
 pub enum RkpFileError {
@@ -95,6 +138,74 @@ pub enum RkpFileError {
     UnsupportedVersion(u32),
     #[error("Decompression error: {0}")]
     Decompress(String),
+    #[error("Malformed skin-meta section: {0}")]
+    SkinMeta(&'static str),
+}
+
+/// Serialise the three skin-meta arrays into a single byte buffer that
+/// will be LZ4-compressed as the file's bones section. Wire format:
+///
+/// ```text
+/// u32                    bone_voxel_byte_len
+/// [bone_voxel_byte_len]  bone voxel bytes (BoneVoxel × voxel_count)
+/// u32                    brick_origin_count
+/// [[u32; 3]]             brick_origins (12 B each)
+/// u32                    rest_aabb_count
+/// [[f32; 6]]             rest_bone_aabbs (24 B each)
+/// ```
+fn encode_skin_meta(meta: &SkinMetaIn<'_>) -> Vec<u8> {
+    let bv_len = meta.bone_voxels.len();
+    let bo_bytes: &[u8] = bytemuck::cast_slice(meta.brick_origins);
+    let aabb_bytes: &[u8] = bytemuck::cast_slice(meta.rest_bone_aabbs);
+    let mut buf = Vec::with_capacity(4 + bv_len + 4 + bo_bytes.len() + 4 + aabb_bytes.len());
+    buf.extend_from_slice(&(bv_len as u32).to_le_bytes());
+    buf.extend_from_slice(meta.bone_voxels);
+    buf.extend_from_slice(&(meta.brick_origins.len() as u32).to_le_bytes());
+    buf.extend_from_slice(bo_bytes);
+    buf.extend_from_slice(&(meta.rest_bone_aabbs.len() as u32).to_le_bytes());
+    buf.extend_from_slice(aabb_bytes);
+    buf
+}
+
+fn decode_skin_meta(raw: &[u8]) -> Result<SkinMetaOut, RkpFileError> {
+    let read_u32 = |raw: &[u8], pos: &mut usize| -> Result<u32, RkpFileError> {
+        if *pos + 4 > raw.len() {
+            return Err(RkpFileError::SkinMeta("truncated u32"));
+        }
+        let v = u32::from_le_bytes(raw[*pos..*pos + 4].try_into().unwrap());
+        *pos += 4;
+        Ok(v)
+    };
+
+    let mut pos = 0usize;
+    let bv_len = read_u32(raw, &mut pos)? as usize;
+    if pos + bv_len > raw.len() {
+        return Err(RkpFileError::SkinMeta("truncated bone voxels"));
+    }
+    let bone_voxels = raw[pos..pos + bv_len].to_vec();
+    pos += bv_len;
+
+    let bo_count = read_u32(raw, &mut pos)? as usize;
+    let bo_bytes = bo_count.checked_mul(12).ok_or(RkpFileError::SkinMeta("brick origin overflow"))?;
+    if pos + bo_bytes > raw.len() {
+        return Err(RkpFileError::SkinMeta("truncated brick origins"));
+    }
+    let brick_origins: Vec<[u32; 3]> = bytemuck::cast_slice(&raw[pos..pos + bo_bytes]).to_vec();
+    pos += bo_bytes;
+
+    let aabb_count = read_u32(raw, &mut pos)? as usize;
+    let aabb_bytes = aabb_count.checked_mul(24).ok_or(RkpFileError::SkinMeta("rest aabb overflow"))?;
+    if pos + aabb_bytes > raw.len() {
+        return Err(RkpFileError::SkinMeta("truncated rest aabbs"));
+    }
+    let rest_bone_aabbs: Vec<[f32; 6]> = bytemuck::cast_slice(&raw[pos..pos + aabb_bytes]).to_vec();
+    pos += aabb_bytes;
+
+    if pos != raw.len() {
+        return Err(RkpFileError::SkinMeta("trailing bytes in skin meta section"));
+    }
+
+    Ok(SkinMetaOut { bone_voxels, brick_origins, rest_bone_aabbs })
 }
 
 /// Write a .rkp v3 file (per-voxel format).
@@ -103,7 +214,8 @@ pub enum RkpFileError {
 /// `voxel_data`: raw VoxelSample data, 1 entry per leaf voxel, in slot order.
 /// `normals_data`: optional per-voxel octahedrally-packed normal (u32 each).
 /// `color_data`: optional per-voxel ColorVoxel data (4 bytes per leaf).
-/// `bone_data`: optional per-voxel BoneVoxel data.
+/// `skin_meta`: optional skinning metadata (bone weights, brick origins,
+/// rest-pose bone AABBs) — see [`SkinMetaIn`].
 /// Sub-stage labels emitted by [`write_rkp_with_progress`] through its
 /// progress callback. Exposed so `rkp-import` can forward them onto
 /// its own `ImportEvent::StageStart` pipeline with matching
@@ -135,7 +247,7 @@ pub fn write_rkp<W: Write + Seek>(
     normals_data: Option<&[u8]>,
     bricks_data: Option<&[u8]>,
     color_data: Option<&[u8]>,
-    bone_data: Option<&[u8]>,
+    skin_meta: Option<SkinMetaIn<'_>>,
 ) -> Result<(), RkpFileError> {
     write_rkp_with_progress(
         writer,
@@ -150,7 +262,7 @@ pub fn write_rkp<W: Write + Seek>(
         normals_data,
         bricks_data,
         color_data,
-        bone_data,
+        skin_meta,
         None,
     )
 }
@@ -175,7 +287,7 @@ pub fn write_rkp_with_progress<W: Write + Seek>(
     normals_data: Option<&[u8]>,
     bricks_data: Option<&[u8]>,
     color_data: Option<&[u8]>,
-    bone_data: Option<&[u8]>,
+    skin_meta: Option<SkinMetaIn<'_>>,
     progress: Option<&dyn Fn(&'static str)>,
 ) -> Result<(), RkpFileError> {
     let tick = |label: &'static str| {
@@ -201,7 +313,11 @@ pub fn write_rkp_with_progress<W: Write + Seek>(
         tick(write_stage::COMPRESS_COLORS);
         lz4_flex::compress_prepend_size(d)
     });
-    let bone_compressed = bone_data.map(|d| {
+    // Skin meta is encoded structurally (bone weights + brick origins
+    // + rest-bone AABBs) then LZ4'd as one blob. The header's
+    // `bone_compressed_size` measures that whole blob.
+    let skin_meta_blob: Option<Vec<u8>> = skin_meta.as_ref().map(encode_skin_meta);
+    let bone_compressed = skin_meta_blob.as_deref().map(|d| {
         tick(write_stage::COMPRESS_BONES);
         lz4_flex::compress_prepend_size(d)
     });
@@ -209,7 +325,7 @@ pub fn write_rkp_with_progress<W: Write + Seek>(
 
     let mut flags = 0u32;
     if color_data.is_some()   { flags |= FLAG_HAS_COLOR; }
-    if bone_data.is_some()    { flags |= FLAG_HAS_BONES; }
+    if skin_meta.is_some()    { flags |= FLAG_HAS_BONES; }
     if normals_data.is_some() { flags |= FLAG_HAS_NORMALS; }
     if bricks_data.is_some()  { flags |= FLAG_HAS_BRICKS; }
 
@@ -342,17 +458,21 @@ pub fn read_rkp_color<R: Read>(
 }
 
 /// Read and decompress the bone data section (if present).
-pub fn read_rkp_bones<R: Read>(
+/// Read and decode the optional skin-meta section. Returns an empty
+/// `SkinMetaOut` (all three vectors empty) when the asset has no skin
+/// data.
+pub fn read_rkp_skin_meta<R: Read>(
     reader: &mut R,
     header: &RkpHeader,
-) -> Result<Vec<u8>, RkpFileError> {
+) -> Result<SkinMetaOut, RkpFileError> {
     if header.bone_compressed_size == 0 {
-        return Ok(Vec::new());
+        return Ok(SkinMetaOut::default());
     }
     let mut compressed = vec![0u8; header.bone_compressed_size as usize];
     reader.read_exact(&mut compressed)?;
-    lz4_flex::decompress_size_prepended(&compressed)
-        .map_err(|e| RkpFileError::Decompress(e.to_string()))
+    let raw = lz4_flex::decompress_size_prepended(&compressed)
+        .map_err(|e| RkpFileError::Decompress(e.to_string()))?;
+    decode_skin_meta(&raw)
 }
 
 #[cfg(test)]
@@ -386,7 +506,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            None, // skin_meta
         )
         .unwrap();
 
@@ -403,6 +523,71 @@ mod tests {
         assert_eq!(header.material_ids[1], 1);
         assert_eq!(header.flags & FLAG_HAS_COLOR, 0);
         assert_eq!(header.flags & FLAG_HAS_BONES, 0);
+    }
+
+    #[test]
+    fn write_and_read_skin_meta_roundtrip() {
+        // Three voxels, two bricks, two bones — exercises every part
+        // of the structured skin-meta payload: weights, origins, and
+        // rest AABBs all survive the LZ4 + length-prefix round trip.
+        use rkf_core::companion::BoneVoxel;
+
+        let bones: Vec<BoneVoxel> = vec![
+            BoneVoxel::new([0, 1, 2, 3], [64, 64, 64, 63]),
+            BoneVoxel::new([4, 0, 0, 0], [255, 0, 0, 0]),
+            BoneVoxel::new([7, 3, 0, 0], [200, 55, 0, 0]),
+        ];
+        let bone_bytes: &[u8] = bytemuck::cast_slice(&bones);
+        let brick_origins: Vec<[u32; 3]> = vec![[0, 0, 0], [8, 0, 0]];
+        let rest_aabbs: Vec<[f32; 6]> = vec![
+            [0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            [-1.0, -2.0, -3.0, 2.0, 3.0, 4.0],
+        ];
+        let voxel_bytes = vec![0u8; 3 * std::mem::size_of::<rkf_core::voxel::VoxelSample>()];
+
+        let mut buf = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        write_rkp(
+            &mut cursor,
+            &[0xFFFF_FFFF],   // single EMPTY root octree
+            1,
+            0.1,
+            3,                // voxel_count
+            [-1.0; 3], [1.0; 3],
+            &[0],
+            &voxel_bytes,
+            None, None, None,
+            Some(SkinMetaIn {
+                bone_voxels: bone_bytes,
+                brick_origins: &brick_origins,
+                rest_bone_aabbs: &rest_aabbs,
+            }),
+        )
+        .unwrap();
+
+        cursor.seek(SeekFrom::Start(0)).unwrap();
+        let header = read_rkp_header(&mut cursor).unwrap();
+        assert!(header.flags & FLAG_HAS_BONES != 0, "FLAG_HAS_BONES must be set");
+        assert!(header.bone_compressed_size > 0, "skin-meta section must be non-empty");
+
+        let _ = read_rkp_octree(&mut cursor, &header).unwrap();
+        let _ = read_rkp_voxels(&mut cursor, &header).unwrap();
+        let back = read_rkp_skin_meta(&mut cursor, &header).unwrap();
+
+        assert_eq!(back.bone_voxels, bone_bytes, "bone-voxel bytes must roundtrip");
+        assert_eq!(back.brick_origins, brick_origins, "brick origins must roundtrip");
+        assert_eq!(back.rest_bone_aabbs, rest_aabbs, "rest bone AABBs must roundtrip");
+
+        // Decode bone voxels + weight-sum invariant.
+        let decoded: &[BoneVoxel] = bytemuck::cast_slice(&back.bone_voxels);
+        for (i, (bv_in, bv_out)) in bones.iter().zip(decoded).enumerate() {
+            for slot in 0..4 {
+                assert_eq!(bv_in.bone_index(slot), bv_out.bone_index(slot), "bone_index mismatch at voxel {i} slot {slot}");
+                assert_eq!(bv_in.bone_weight(slot), bv_out.bone_weight(slot), "bone_weight mismatch at voxel {i} slot {slot}");
+            }
+            let sum: u16 = (0..4).map(|s| bv_out.bone_weight(s) as u16).sum();
+            assert_eq!(sum, 255, "voxel {i} weights must sum to 255");
+        }
     }
 
     #[test]
@@ -427,7 +612,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            None, // skin_meta
         )
         .unwrap();
 

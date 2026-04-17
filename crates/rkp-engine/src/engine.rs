@@ -252,6 +252,27 @@ struct EngineState {
     /// set for echoes from the editor itself (no feedback loop).
     editor_layout_pending: bool,
 
+    /// Shared cache of loaded `.rkskel` skeleton assets. Multiple
+    /// entities loaded from the same `.rkp` share a single `Arc`.
+    animation_cache: crate::animation::AnimationAssetCache,
+    /// Per-frame allocator that packs every skinned entity's
+    /// `Skeleton.current_pose` into one contiguous byte buffer for GPU
+    /// upload. Rebuilt whenever `update_scene_gpu` runs.
+    bone_matrix_allocator: crate::scene_sync::BoneMatrixAllocator,
+    /// Per-frame scatter dispatches — one per skinned entity with a
+    /// resolved skinning asset. Rebuilt in `update_scene_gpu`.
+    skin_dispatches: Vec<crate::scene_sync::PlannedSkinDispatch>,
+    /// Reusable per-frame scratch that concatenates every
+    /// `skin_dispatches` entry into the single batched compute
+    /// dispatch `scatter_skin_batch` fires.
+    skin_batch: rkp_render::SkinBatchScratch,
+    /// Total bytes required in `scene.bone_field_buffer` this frame;
+    /// drives the per-frame grow+clear.
+    skin_bone_field_bytes: u64,
+    /// Master toggle — when false, skip scatter + fall the march back
+    /// to its rigid path. Driven by the AnimationPanel checkbox.
+    skinning_enabled: bool,
+
     /// Material library — manages .rkmat files and runtime palette.
     material_lib: crate::material_library::MaterialLibrary,
     /// Currently selected material in the materials panel.
@@ -482,6 +503,12 @@ impl EngineState {
             importing_dirty: false,
             editor_layout_json: None,
             editor_layout_pending: false,
+            animation_cache: crate::animation::AnimationAssetCache::new(),
+            bone_matrix_allocator: crate::scene_sync::BoneMatrixAllocator::new(),
+            skin_dispatches: Vec::new(),
+            skin_batch: rkp_render::SkinBatchScratch::default(),
+            skin_bone_field_bytes: 0,
+            skinning_enabled: true,
             material_lib: crate::material_library::MaterialLibrary::new(),
             selected_material: None,
             selected_model: None,
@@ -613,13 +640,47 @@ impl EngineState {
             self.collider_caches_dirty = false;
         }
 
-        // 2. Upload per-frame data (objects + camera).
+        // 2. Upload per-frame data (objects + camera + bone matrices).
         let cam_uniforms = self.build_camera_uniforms();
         let frame = FrameUpload {
             objects: &self.gpu_objects,
             camera: &cam_uniforms,
+            bone_matrices: self.bone_matrix_allocator.bytes(),
         };
         self.renderer.upload_frame(&self.queue, &frame);
+
+        // 2b. Skeletal skin-deform scatter. Folds every skinned
+        // entity into one batched compute dispatch so we fire exactly
+        // one `write_buffer` per input — side-stepping the write-
+        // ordering pitfall of multiple per-entity dispatches sharing
+        // a single uniform/brick buffer inside one submission.
+        if self.skinning_enabled && !self.skin_dispatches.is_empty() {
+            let q = self.renderer.profiler.begin_query("skin_deform", &mut encoder);
+            self.renderer.prepare_bone_field(&self.queue, &mut encoder, self.skin_bone_field_bytes);
+            self.skin_batch.clear();
+            for plan in &self.skin_dispatches {
+                let d = rkp_render::SkinDispatch {
+                    uniforms: plan.uniforms,
+                    bricks: &plan.bricks,
+                };
+                self.skin_batch.push(&d);
+            }
+            self.renderer.scatter_skin_batch(&self.queue, &mut encoder, &self.skin_batch);
+            self.renderer.profiler.end_query(&mut encoder, q);
+        } else if self.skinning_enabled && self.frame_index % 60 == 0 {
+            // Once a second, log why scatter isn't running when the
+            // user has the toggle on — most common reason is a stale
+            // `.rkp` without the new skin-meta section, or no skinned
+            // entities in the scene.
+            let skinned_entities = self.world.query::<&crate::components::Skeleton>().iter().count();
+            if skinned_entities > 0 {
+                eprintln!(
+                    "[RkpEngine] skinning enabled, {} skinned entities, but 0 scatter dispatches this frame. \
+                     Likely cause: stale .rkp without skin-meta section — re-import the asset.",
+                    skinned_entities,
+                );
+            }
+        }
 
         let t_upload = frame_start.elapsed();
 
@@ -1230,6 +1291,7 @@ impl EngineState {
                         ));
                         self.assign_entity_uuid(entity);
                         self.entity_scene_ids.insert(entity, scene_id);
+                        self.try_attach_skeleton(entity, std::path::Path::new(&path));
                         self.geometry_dirty = true;
                         self.scene_dirty = true;
                         self.gpu_objects_dirty = true;
@@ -1662,6 +1724,7 @@ impl EngineState {
             EngineCommand::SetViewOption { option, enabled } => {
                 match option.as_str() {
                     "show_colliders" => self.show_colliders = enabled,
+                    "skinning" => self.skinning_enabled = enabled,
                     _ => eprintln!("[RkpEngine] unknown view option: {option}"),
                 }
             }
@@ -2162,6 +2225,24 @@ impl EngineState {
         // Count per-material voxel usage if entity has spatial data.
         let material_usage = self.count_material_usage(selected);
 
+        // Skeleton sidecar — clip + bone metadata for the dedicated
+        // animation panel. Skipped when the entity has no skeleton.
+        let skeleton = self.world.get::<&crate::components::Skeleton>(selected).ok()
+            .map(|skel| {
+                let bone_names: Vec<String> = skel.asset.skeleton.bones.iter().map(|b| b.name.clone()).collect();
+                let bone_parents: Vec<i32> = skel.asset.skeleton.hierarchy.clone();
+                let clips: Vec<ClipInfo> = skel.asset.clips.iter().map(|c| ClipInfo {
+                    name: c.name.clone(),
+                    duration: c.duration,
+                }).collect();
+                SkeletonInspector {
+                    path: skel.path.to_string_lossy().into_owned(),
+                    bone_names,
+                    bone_parents,
+                    clips,
+                }
+            });
+
         Some(InspectorSnapshot {
             entity_name: name,
             entity_id: format!("{}", self.get_entity_uuid(selected).as_simple()),
@@ -2170,6 +2251,7 @@ impl EngineState {
             scale: scl,
             components,
             material_usage,
+            skeleton,
         })
     }
 
@@ -2471,6 +2553,70 @@ impl EngineState {
         stem
     }
 
+    /// If a sibling `.rkskel` exists alongside the `.rkp` path, load it
+    /// into the animation cache and attach `Skeleton` + a default
+    /// paused `AnimationPlayer` to the entity. Missing sidecar is not
+    /// an error — static meshes are expected.
+    fn try_attach_skeleton(&mut self, entity: hecs::Entity, rkp_path: &std::path::Path) {
+        let rkskel_path = rkp_path.with_extension("rkskel");
+        if !rkskel_path.exists() {
+            return;
+        }
+        match self.animation_cache.get_or_load(&rkskel_path) {
+            Ok(asset) => {
+                // Skeleton is transient — always attach/replace with the
+                // freshly-loaded asset so the `current_pose` matches the
+                // current bone count.
+                //
+                // Fold the grid-frame offset into the skeleton's
+                // glTF→local transform: `rest_bone_aabbs` and the
+                // scatter's `rest_pos` live in grid frame (octree
+                // corner at 0, range [0, extent]), so the pose
+                // produced by `animation::tick` must operate on grid-
+                // frame positions too. The offset is
+                // `half_extent = base_voxel_size × 2^depth / 2`,
+                // available from the entity's spatial data (present
+                // because `LoadAsset` populated `Renderable` before
+                // this function runs).
+                let grid_offset = self.world
+                    .get::<&crate::components::Renderable>(entity)
+                    .ok()
+                    .and_then(|r| r.spatial.as_ref().map(|s| {
+                        let he = 0.5 * s.base_voxel_size * (1u32 << s.depth) as f32;
+                        glam::Vec3::splat(he)
+                    }))
+                    .unwrap_or(glam::Vec3::ZERO);
+                let skeleton = crate::animation::skeleton_component(
+                    asset.clone(), rkskel_path.clone(), grid_offset,
+                );
+                if let Err(e) = self.world.insert_one(entity, skeleton) {
+                    eprintln!("[RkpEngine] attach Skeleton: world.insert_one failed: {e}");
+                    return;
+                }
+                // Only attach a default `AnimationPlayer` if the entity
+                // doesn't already have one — scene load may have
+                // deserialized a persisted player with user-chosen clip
+                // / time / loop mode.
+                let has_player = self.world.get::<&crate::components::AnimationPlayer>(entity).is_ok();
+                if !has_player {
+                    let player = crate::animation::default_player(&asset);
+                    if let Err(e) = self.world.insert_one(entity, player) {
+                        eprintln!("[RkpEngine] attach AnimationPlayer: world.insert_one failed: {e}");
+                    }
+                }
+                eprintln!(
+                    "[RkpEngine] attached skeleton ({} bones, {} clips) from {}",
+                    asset.skeleton.bones.len(),
+                    asset.clips.len(),
+                    rkskel_path.display(),
+                );
+            }
+            Err(e) => {
+                self.console.warn(format!("load .rkskel failed: {e}"));
+            }
+        }
+    }
+
     /// Get or assign a stable scene object ID for face emission.
     fn get_scene_id(&mut self, entity: hecs::Entity) -> u32 {
         if let Some(&id) = self.entity_scene_ids.get(&entity) {
@@ -2583,6 +2729,15 @@ impl EngineState {
     fn update_scene_gpu(&mut self) {
         use crate::components::*;
 
+        // Re-pack every skinned entity's current pose into the scene
+        // bone buffer. Empty when no animated entities are loaded.
+        self.bone_matrix_allocator.rebuild(&self.world);
+        // Wipe last frame's scatter plan — rebuilt below per skinned
+        // entity. Bone-field cells are u64s of offset; cells × 8 B =
+        // total bone-field bytes.
+        self.skin_dispatches.clear();
+        let mut running_bone_field_cells: u32 = 0;
+
         self.gpu_objects.clear();
         self.gpu_to_entity.clear();
         self.entity_to_gpu.clear();
@@ -2607,6 +2762,56 @@ impl EngineState {
                     depth: spatial.depth,
                     base_voxel_size: spatial.base_voxel_size,
                 };
+                let mut skinning = self.bone_matrix_allocator.binding(entity);
+                // Plan the skin-deform scatter for this entity if it's
+                // animated AND the asset has baked skinning metadata.
+                if self.skinning_enabled {
+                    if let (Some(bind), Some(handle)) = (skinning, renderable.asset_handle) {
+                        if let (Some(skel), Some(skin_data)) = (
+                            self.world.get::<&crate::components::Skeleton>(entity).ok(),
+                            self.scene_mgr.skinning_data(handle),
+                        ) {
+                            if let Some(plan) = crate::scene_sync::plan_skin_dispatch(
+                                bind.bone_buffer_offset,
+                                bind.bone_count,
+                                &skel.current_pose,
+                                skin_data,
+                                spatial.voxel_size,
+                                &mut running_bone_field_cells,
+                            ) {
+                                // Copy the plan's bone-field geometry
+                                // into the SkinnedBinding so the GPU
+                                // object carries the same coords the
+                                // scatter wrote to. Without this the
+                                // march would descend a bone field
+                                // sized in one frame and origin'd from
+                                // another.
+                                skinning = Some(crate::scene_sync::SkinnedBinding {
+                                    bone_count: bind.bone_count,
+                                    bone_buffer_offset: bind.bone_buffer_offset,
+                                    bone_field_offset: plan.uniforms.bone_field_offset,
+                                    bone_field_dims: [
+                                        plan.uniforms.bone_field_dim_x,
+                                        plan.uniforms.bone_field_dim_y,
+                                        plan.uniforms.bone_field_dim_z,
+                                    ],
+                                    bone_field_origin: [
+                                        plan.uniforms.grid_origin_x,
+                                        plan.uniforms.grid_origin_y,
+                                        plan.uniforms.grid_origin_z,
+                                    ],
+                                });
+                                self.skin_dispatches.push(plan);
+                            } else {
+                                // Plan bailed (no extent, or dims > cap).
+                                // Leave skinning = None so march falls
+                                // back to the rigid path for this
+                                // entity.
+                                skinning = None;
+                            }
+                        }
+                    }
+                }
                 let gpu_obj = crate::scene_sync::build_gpu_object(
                     &world_matrix,
                     &spatial.aabb,
@@ -2614,6 +2819,7 @@ impl EngineState {
                     spatial.voxel_size,
                     renderable.material_id,
                     gpu_idx,
+                    skinning,
                 );
                 if let Some(&scene_id) = self.entity_scene_ids.get(&entity) {
                     self.scene_id_to_gpu.insert(scene_id, gpu_idx);
@@ -2622,6 +2828,40 @@ impl EngineState {
                 self.gpu_to_entity.push(entity);
                 self.gpu_objects.push(gpu_obj);
             }
+        }
+
+        // Each bone-field cell is a `vec2<u32>` (packed bone indices +
+        // weights) = 8 bytes. Used by the render loop to size the
+        // scene's bone_field_buffer before the scatter dispatch.
+        self.skin_bone_field_bytes = (running_bone_field_cells as u64).saturating_mul(8);
+
+        // One-second heartbeat so we can tell whether the GPU object
+        // the march shader sees actually carries skinning fields.
+        // Diagnoses: "scatter dispatched but march renders rigid" —
+        // if `is_skinned=1 count < skin_dispatches.len()` or
+        // `dim_x>0 count < dispatches`, the GPU object didn't get
+        // populated even though the plan succeeded.
+        if self.frame_index % 60 == 0 && !self.skin_dispatches.is_empty() {
+            let (mut skinned, mut with_dims) = (0u32, 0u32);
+            let mut first_dims = [0u32; 3];
+            for obj in &self.gpu_objects {
+                if obj.is_skinned != 0 { skinned += 1; }
+                if obj.bone_field_dim_x > 0 {
+                    if with_dims == 0 {
+                        first_dims = [obj.bone_field_dim_x, obj.bone_field_dim_y, obj.bone_field_dim_z];
+                    }
+                    with_dims += 1;
+                }
+            }
+            eprintln!(
+                "[skin] plans={} gpu_objs={} is_skinned={} with_dims={} first_dims={:?} bone_field_bytes={}",
+                self.skin_dispatches.len(),
+                self.gpu_objects.len(),
+                skinned,
+                with_dims,
+                first_dims,
+                self.skin_bone_field_bytes,
+            );
         }
     }
 
@@ -2886,6 +3126,7 @@ impl EngineState {
                                     ..Default::default()
                                 }));
                                 self.entity_scene_ids.insert(e, sid);
+                                self.try_attach_skeleton(e, &full_path);
                                 self.geometry_dirty = true;
                                 Some(e)
                             }
@@ -3174,6 +3415,87 @@ impl EngineState {
         }
     }
 
+    /// Emit one line segment per parent→child bone pair for each
+    /// animated entity. The skinning palette already encodes
+    /// `current_world * inverse_bind`, so premultiplying by the
+    /// bone's bind-pose local origin cancels the inverse-bind and
+    /// gives us the animated world origin directly. Cheap (one mat4
+    /// × vec3 per bone) and stateless — runs in the same pass as
+    /// selection/light gizmos.
+    fn build_bone_wireframes(&self) -> Vec<rkf_render::LineVertex> {
+        use glam::{Mat4, Vec3, Vec4};
+        let mut verts = Vec::new();
+        let dim = [0.3, 0.7, 1.0, 0.45];
+        let bright = [0.5, 0.9, 1.0, 1.0];
+        for (entity, (transform, skeleton)) in self.world.query::<(&crate::components::Transform, &crate::components::Skeleton)>().iter() {
+            let selected = self.selected_entity == Some(entity);
+            let color = if selected { bright } else { dim };
+
+            // Entity's root world transform (same one the renderer uses
+            // for this entity). Bone origins are in object-local space;
+            // multiply by this to lift them into world space.
+            let root_world = Mat4::from_scale_rotation_translation(
+                transform.scale,
+                glam::Quat::from_euler(
+                    glam::EulerRot::XYZ,
+                    transform.rotation.x.to_radians(),
+                    transform.rotation.y.to_radians(),
+                    transform.rotation.z.to_radians(),
+                ),
+                transform.position,
+            );
+
+            let bones = &skeleton.asset.skeleton;
+            let pose = &skeleton.current_pose;
+            let bind_origins = &skeleton.bind_world_origins;
+            // Defensive: if evaluate() hasn't run yet (pose is all
+            // identity) or the pose is the wrong size, fall back to
+            // bind-pose origins so the bones still render at rest.
+            let use_pose = pose.len() == bones.bones.len();
+            // `current_pose` + `bind_world_origins` are in grid frame
+            // (origin at octree corner). Undo the grid offset before
+            // handing the position to `root_world`, which expects
+            // mesh-frame (origin at object centre).
+            let grid_offset = skeleton.grid_offset;
+
+            let animated_origin = |i: usize| -> Vec3 {
+                let bind = bind_origins.get(i).copied().unwrap_or(Vec3::ZERO);
+                let animated_grid = if use_pose {
+                    let p = Vec4::new(bind.x, bind.y, bind.z, 1.0);
+                    let v = pose[i] * p;
+                    Vec3::new(v.x, v.y, v.z)
+                } else {
+                    bind
+                };
+                let animated_mesh = animated_grid - grid_offset;
+                root_world.transform_point3(animated_mesh)
+            };
+
+            // Parent→child line per bone. Root bones get a tiny
+            // crosshair so isolated roots (skeleton with 1 bone, or
+            // detached rigs) still render something.
+            for (i, &parent) in bones.hierarchy.iter().enumerate() {
+                let child = animated_origin(i);
+                if parent >= 0 && (parent as usize) < bones.bones.len() {
+                    let parent_pos = animated_origin(parent as usize);
+                    verts.push(rkf_render::LineVertex {
+                        position: parent_pos.to_array(),
+                        color,
+                    });
+                    verts.push(rkf_render::LineVertex {
+                        position: child.to_array(),
+                        color,
+                    });
+                } else {
+                    // Root bone — little crosshair so it's visible even
+                    // with no child.
+                    verts.extend(rkf_render::wireframe::crosshair(child, 0.05, color));
+                }
+            }
+        }
+        verts
+    }
+
     fn build_gizmo_wireframe(&self) -> Vec<rkf_render::LineVertex> {
         let mut verts = Vec::new();
 
@@ -3210,6 +3532,12 @@ impl EngineState {
         if self.show_colliders {
             verts.extend(self.build_collider_wireframes());
         }
+
+        // Bone gizmo — one set of line segments per skinned entity,
+        // drawn from animated bone origins. Selected entity gets a
+        // brighter palette so it pops against a scene with multiple
+        // animated characters.
+        verts.extend(self.build_bone_wireframes());
 
         // Transform gizmo — only for the selected entity.
         let Some(selected) = self.selected_entity else {
@@ -3802,6 +4130,14 @@ fn tick_loop(
                     state.play_frame_count,
                 );
             }
+        }
+
+        // 1d. Advance skeletal animations. Runs every frame in both edit
+        // and play modes so animated characters preview correctly in the
+        // editor. Uses the same fixed 60 Hz step as gameplay for now.
+        let anim_dt = 1.0 / 60.0;
+        if crate::animation::tick(&mut state.world, anim_dt) {
+            state.gpu_objects_dirty = true;
         }
 
         // 2. Update input system + camera.

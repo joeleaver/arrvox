@@ -234,6 +234,151 @@ impl ProceduralGeometry {
     }
 }
 
+/// Skeletal skeleton attached to a voxelized asset.
+///
+/// Attached automatically by the engine when a `.rkp` load finds a sibling
+/// `.rkskel`. Not serialized through the scene file — rebuilt on load from
+/// the asset cache, same as `SpatialData`.
+///
+/// `current_pose` holds the evaluated skinning palette (`world × inverse_bind`
+/// per bone), rewritten in place by the animation system each frame.
+///
+/// `bind_world_origins[i]` is the bone's rest-pose origin in object-local
+/// space (= translation component of the accumulated bind transform).
+/// Multiplying by `current_pose[i]` cancels the inverse-bind and lands
+/// us at the bone's *animated* origin — cheap way to draw a bone gizmo
+/// without recomputing world transforms from the hierarchy each frame.
+///
+/// `inverse_pose[i] = current_pose[i].inverse()` — the matrix that takes
+/// a deformed object-local position back to the rest-pose position of
+/// the bone's influence region. Phase-3 skin-deform uses it as the
+/// inverse LBS basis: the march shader blends `inverse_pose` by the
+/// weights in the scattered bone field to invert the deformation.
+///
+/// `normalize` / `normalize_inverse` encode the mesh-normalisation
+/// transform (rotation offset, centre translation, uniform scale)
+/// that rkp-import applied to the voxel data but *not* to the
+/// skeleton. Bone matrices from `Skeleton::evaluate` are in glTF
+/// space; voxel data is in normalised "rkp-local" space. The pose
+/// written to `current_pose` / `inverse_pose` is conjugated
+/// `N * M * N⁻¹` so both palettes land in the same frame as the
+/// voxel data. Computed once at load from the asset's
+/// `SkeletonAsset` fields.
+#[derive(Clone)]
+pub struct Skeleton {
+    pub asset: std::sync::Arc<rkf_animation::skeleton_asset::SkeletonAsset>,
+    pub path: std::path::PathBuf,
+    pub current_pose: Vec<glam::Mat4>,
+    pub inverse_pose: Vec<glam::Mat4>,
+    pub bind_world_origins: Vec<glam::Vec3>,
+    pub normalize: glam::Mat4,
+    pub normalize_inverse: glam::Mat4,
+    /// Translation that takes a mesh-frame position (origin at object
+    /// centre) to a grid-frame position (origin at octree corner).
+    /// Equals `half_extent * Vec3::ONE` for a cubic octree. The
+    /// gizmo overlay unwinds this to put bones back in mesh frame
+    /// before applying the entity's world transform.
+    pub grid_offset: glam::Vec3,
+}
+
+impl std::fmt::Debug for Skeleton {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Skeleton")
+            .field("path", &self.path)
+            .field("bones", &self.asset.skeleton.bones.len())
+            .field("clips", &self.asset.clips.len())
+            .field("pose_len", &self.current_pose.len())
+            .finish()
+    }
+}
+
+impl Skeleton {
+    /// Walk the skeleton hierarchy once to accumulate each bone's
+    /// bind-pose origin in object-local space. Called at component
+    /// construction and again if the skeleton asset is ever hot-swapped.
+    pub fn compute_bind_world_origins(
+        asset: &rkf_animation::skeleton_asset::SkeletonAsset,
+    ) -> Vec<glam::Vec3> {
+        let skel = &asset.skeleton;
+        let n = skel.bones.len();
+        let mut bind_world = vec![glam::Mat4::IDENTITY; n];
+        for i in 0..n {
+            let local = skel.bones[i].bind_transform;
+            let parent = skel.hierarchy.get(i).copied().unwrap_or(-1);
+            bind_world[i] = if parent >= 0 && (parent as usize) < n {
+                bind_world[parent as usize] * local
+            } else {
+                local
+            };
+        }
+        bind_world.iter().map(|m| m.transform_point3(glam::Vec3::ZERO)).collect()
+    }
+
+    /// Build the glTF→rkp-voxel-space transform from the asset's
+    /// normalization parameters. Mirrors the mesh preparation that
+    /// `rkp-import::normalize::prepare_mesh` applies:
+    /// `v = mesh_scale × (R·(g − rot_center) + rot_center − mesh_center)`
+    /// expressed as one `Mat4`:
+    /// `Scale(s) · T(rc − mc) · R · T(−rc)`.
+    pub fn compute_normalization(
+        asset: &rkf_animation::skeleton_asset::SkeletonAsset,
+    ) -> glam::Mat4 {
+        use glam::{EulerRot, Mat4, Quat, Vec3};
+        let mesh_center = Vec3::from_array(asset.mesh_center);
+        let mesh_scale = asset.mesh_scale;
+        let rotation_center = Vec3::from_array(asset.rotation_center);
+        let [rx, ry, rz] = asset.rotation_offset;
+        let rot = Quat::from_euler(
+            EulerRot::XYZ,
+            rx.to_radians(),
+            ry.to_radians(),
+            rz.to_radians(),
+        );
+        let t_neg_rc = Mat4::from_translation(-rotation_center);
+        let r = Mat4::from_quat(rot);
+        let t_rc_minus_mc = Mat4::from_translation(rotation_center - mesh_center);
+        let s = Mat4::from_scale(Vec3::splat(mesh_scale));
+        s * t_rc_minus_mc * r * t_neg_rc
+    }
+}
+
+/// Animation playback state for a skinned entity.
+///
+/// References a clip in the sibling [`Skeleton`]'s asset by name — the clip
+/// itself stays on the asset, so many instances can share clip data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnimationPlayer {
+    /// Active clip name (empty = no clip selected).
+    pub clip_name: String,
+    /// Current playback time in seconds.
+    pub time: f32,
+    /// Playback speed multiplier.
+    pub speed: f32,
+    /// Whether the player is advancing.
+    pub playing: bool,
+    /// Loop mode (Once / Loop / PingPong).
+    pub loop_mode: rkf_animation::player::LoopMode,
+    /// PingPong direction (true = forward). Not user-facing; kept as state
+    /// so a scrub-backwards PingPong keeps its direction across frames.
+    #[serde(default = "player_default_forward")]
+    pub forward: bool,
+}
+
+fn player_default_forward() -> bool { true }
+
+impl Default for AnimationPlayer {
+    fn default() -> Self {
+        Self {
+            clip_name: String::new(),
+            time: 0.0,
+            speed: 1.0,
+            playing: false,
+            loop_mode: rkf_animation::player::LoopMode::Loop,
+            forward: true,
+        }
+    }
+}
+
 /// Camera entity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Camera {

@@ -317,6 +317,9 @@ impl OctreeMarchPass {
             let surfnet_reconstructions = vals[52] as u64;
             let surfnet_boundary_clips = vals[53] as u64;
             let surfnet_degenerate = vals[54] as u64;
+            let skin_entries = vals[55] as u64;
+            let skin_hits    = vals[56] as u64;
+            let skin_cell_reads = vals[57] as u64;
 
             let sum = |h: &[u32]| -> u64 { h.iter().map(|&x| x as u64).sum() };
             let weighted = |h: &[u32]| -> f64 {
@@ -377,6 +380,15 @@ impl OctreeMarchPass {
                     surfnet_reconstructions, pct_boundary, pct_degen,
                 );
             }
+            // skin_entries counts `march_object_skinned` calls (one
+            // per skinned object per pixel that passes AABB cull).
+            // skin_hits is how many of those landed a leaf; the ratio
+            // tells us whether the bone field is covering the mesh or
+            // whether we're sampling empty cells.
+            eprintln!(
+                "[skin march] entries={}  hits={}  bone-field pop reads={}",
+                skin_entries, skin_hits, skin_cell_reads,
+            );
 
             // Per-buffer byte traffic per frame. Octree reads come from the
             // depth histograms; other buffers have direct atomic counters.
