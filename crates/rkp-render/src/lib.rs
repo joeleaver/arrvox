@@ -2,7 +2,27 @@
 //!
 //! Forward rasterization of surface-shell voxels into a G-buffer, followed by
 //! deferred shadow/AO and PBR shading. Post-processing (tone mapping, bloom,
-//! etc.) is handled by the caller (RkpEngine) using rkf-render passes.
+//! wireframe overlay) is handled by passes in this crate.
+
+/// GPU device/queue wrapper.
+pub mod context;
+/// G-buffer textures for deferred shading.
+pub mod gbuffer;
+/// Bloom compute pass (pre-upscale).
+pub mod bloom;
+/// Bloom composite compute pass (post-upscale).
+pub mod bloom_composite;
+/// Tone mapping compute pass (HDR → LDR).
+pub mod tone_map;
+/// Wireframe line rendering pass.
+pub mod wireframe;
+
+pub use context::RenderContext;
+pub use gbuffer::GBuffer;
+pub use bloom::{BloomPass, BloomParams, BLOOM_MIP_LEVELS, DEFAULT_BLOOM_THRESHOLD, DEFAULT_BLOOM_KNEE};
+pub use bloom_composite::{BloomCompositePass, BloomCompositeParams, DEFAULT_BLOOM_INTENSITY};
+pub use tone_map::{ToneMapPass, ToneMapMode, ToneMapParams, DEFAULT_EXPOSURE, LDR_FORMAT};
+pub use wireframe::{WireframePass, LineVertex};
 
 /// GPU octree buffer management and GpuObject field reinterpretation.
 pub mod octree_gpu;

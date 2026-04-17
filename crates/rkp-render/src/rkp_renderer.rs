@@ -173,7 +173,7 @@ impl RkpRenderer {
     /// Set G-buffer views. Call after G-buffer creation or resize.
     pub fn set_gbuffer(
         &mut self,
-        gbuffer: &rkf_render::GBuffer,
+        gbuffer: &crate::GBuffer,
     ) {
         self.march.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view);
         self.shadow_trace.set_gbuffer(&self.device, &gbuffer.position_view, &gbuffer.normal_view);

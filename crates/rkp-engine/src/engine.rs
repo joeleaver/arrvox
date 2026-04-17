@@ -185,10 +185,10 @@ struct EngineState {
 
     // Rendering pipeline
     renderer: RkpRenderer,
-    gbuffer: rkf_render::GBuffer,
-    bloom: rkf_render::BloomPass,
-    bloom_composite: rkf_render::BloomCompositePass,
-    tone_map: rkf_render::ToneMapPass,
+    gbuffer: rkp_render::GBuffer,
+    bloom: rkp_render::BloomPass,
+    bloom_composite: rkp_render::BloomCompositePass,
+    tone_map: rkp_render::ToneMapPass,
 
     // Scene management (CPU)
     scene_mgr: RkpSceneManager,
@@ -336,7 +336,7 @@ struct EngineState {
     readback_ready: bool,  // false on first frame (no previous data yet)
 
     // Wireframe overlay
-    wireframe_pass: rkf_render::WireframePass,
+    wireframe_pass: rkp_render::WireframePass,
     /// Composite texture — LDR + wireframe overlay. Rgba8Unorm with RENDER_ATTACHMENT.
     composite_texture: wgpu::Texture,
     composite_view: wgpu::TextureView,
@@ -385,27 +385,27 @@ impl EngineState {
     }
 
     fn new(config: &EngineConfig) -> Self {
-        let ctx = rkf_render::RenderContext::new_headless();
+        let ctx = rkp_render::RenderContext::new_headless();
         let device = ctx.device;
         let queue = ctx.queue;
 
         let width = config.width;
         let height = config.height;
 
-        let gbuffer = rkf_render::GBuffer::new(&device, width, height);
+        let gbuffer = rkp_render::GBuffer::new(&device, width, height);
         let mut renderer = RkpRenderer::new(&device, &queue, width, height);
 
         // Wire G-buffer into renderer.
         renderer.set_gbuffer(&gbuffer);
 
         // Bloom: extract bright pixels from volumetric HDR output, blur, composite.
-        let bloom = rkf_render::BloomPass::new(
+        let bloom = rkp_render::BloomPass::new(
             &device,
             &renderer.god_rays.output_view,
             width,
             height,
         );
-        let bloom_composite = rkf_render::BloomCompositePass::new(
+        let bloom_composite = rkp_render::BloomCompositePass::new(
             &device,
             &renderer.god_rays.output_view,
             bloom.mip_views(),
@@ -414,7 +414,7 @@ impl EngineState {
         );
 
         // Tone mapping: bloom composite HDR → LDR (Rgba8Unorm).
-        let tone_map = rkf_render::ToneMapPass::new(
+        let tone_map = rkp_render::ToneMapPass::new(
             &device,
             &bloom_composite.output_view,
             width,
@@ -436,7 +436,7 @@ impl EngineState {
         ];
 
         // Wireframe pass for gizmo overlay.
-        let wireframe_pass = rkf_render::WireframePass::new(&device, rkf_render::LDR_FORMAT);
+        let wireframe_pass = rkp_render::WireframePass::new(&device, rkp_render::LDR_FORMAT);
 
         // Composite texture: LDR + wireframes. Needs RENDER_ATTACHMENT for wireframe draw.
         let composite_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -445,7 +445,7 @@ impl EngineState {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: rkf_render::LDR_FORMAT,
+            format: rkp_render::LDR_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::COPY_DST,
@@ -1001,23 +1001,23 @@ impl EngineState {
                 if width != self.width || height != self.height {
                     self.width = width;
                     self.height = height;
-                    self.gbuffer = rkf_render::GBuffer::new(&self.device, width, height);
+                    self.gbuffer = rkp_render::GBuffer::new(&self.device, width, height);
                     self.renderer.resize(width, height);
                     self.renderer.set_gbuffer(&self.gbuffer);
-                    self.bloom = rkf_render::BloomPass::new(
+                    self.bloom = rkp_render::BloomPass::new(
                         &self.device,
                         &self.renderer.god_rays.output_view,
                         width,
                         height,
                     );
-                    self.bloom_composite = rkf_render::BloomCompositePass::new(
+                    self.bloom_composite = rkp_render::BloomCompositePass::new(
                         &self.device,
                         &self.renderer.god_rays.output_view,
                         self.bloom.mip_views(),
                         width,
                         height,
                     );
-                    self.tone_map = rkf_render::ToneMapPass::new(
+                    self.tone_map = rkp_render::ToneMapPass::new(
                         &self.device,
                         &self.bloom_composite.output_view,
                         width,
@@ -1034,7 +1034,7 @@ impl EngineState {
                         mip_level_count: 1,
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
-                        format: rkf_render::LDR_FORMAT,
+                        format: rkp_render::LDR_FORMAT,
                         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                             | wgpu::TextureUsages::COPY_SRC
                             | wgpu::TextureUsages::COPY_DST,
@@ -3422,7 +3422,7 @@ impl EngineState {
     /// gives us the animated world origin directly. Cheap (one mat4
     /// × vec3 per bone) and stateless — runs in the same pass as
     /// selection/light gizmos.
-    fn build_bone_wireframes(&self) -> Vec<rkf_render::LineVertex> {
+    fn build_bone_wireframes(&self) -> Vec<rkp_render::LineVertex> {
         use glam::{Mat4, Vec3, Vec4};
         let mut verts = Vec::new();
         let dim = [0.3, 0.7, 1.0, 0.45];
@@ -3478,25 +3478,25 @@ impl EngineState {
                 let child = animated_origin(i);
                 if parent >= 0 && (parent as usize) < bones.bones.len() {
                     let parent_pos = animated_origin(parent as usize);
-                    verts.push(rkf_render::LineVertex {
+                    verts.push(rkp_render::LineVertex {
                         position: parent_pos.to_array(),
                         color,
                     });
-                    verts.push(rkf_render::LineVertex {
+                    verts.push(rkp_render::LineVertex {
                         position: child.to_array(),
                         color,
                     });
                 } else {
                     // Root bone — little crosshair so it's visible even
                     // with no child.
-                    verts.extend(rkf_render::wireframe::crosshair(child, 0.05, color));
+                    verts.extend(rkp_render::wireframe::crosshair(child, 0.05, color));
                 }
             }
         }
         verts
     }
 
-    fn build_gizmo_wireframe(&self) -> Vec<rkf_render::LineVertex> {
+    fn build_gizmo_wireframe(&self) -> Vec<rkp_render::LineVertex> {
         let mut verts = Vec::new();
 
         // Light gizmos — always visible for all light entities.
@@ -3507,10 +3507,10 @@ impl EngineState {
             let selected = self.selected_entity == Some(entity);
             // Always show crosshair icon.
             let icon_color = if selected { selected_light_color } else { light_color };
-            verts.extend(rkf_render::wireframe::crosshair(transform.position, 0.2, icon_color));
+            verts.extend(rkp_render::wireframe::crosshair(transform.position, 0.2, icon_color));
             // Range sphere only when selected.
             if selected {
-                verts.extend(rkf_render::wireframe::point_light_wireframe(
+                verts.extend(rkp_render::wireframe::point_light_wireframe(
                     transform.position, pl.range, selected_light_color,
                 ));
             }
@@ -3519,10 +3519,10 @@ impl EngineState {
         for (entity, (transform, sl)) in self.world.query::<(&crate::components::Transform, &crate::components::SpotLight)>().iter() {
             let selected = self.selected_entity == Some(entity);
             let icon_color = if selected { selected_light_color } else { light_color };
-            verts.extend(rkf_render::wireframe::crosshair(transform.position, 0.2, icon_color));
+            verts.extend(rkp_render::wireframe::crosshair(transform.position, 0.2, icon_color));
             // Cone only when selected.
             if selected {
-                verts.extend(rkf_render::wireframe::spot_light_wireframe(
+                verts.extend(rkp_render::wireframe::spot_light_wireframe(
                     transform.position, sl.direction, sl.range, sl.outer_angle.to_radians(), selected_light_color,
                 ));
             }
@@ -3655,7 +3655,7 @@ impl EngineState {
     }
 
     /// Build wireframe visualization for all physics colliders from cached data.
-    fn build_collider_wireframes(&self) -> Vec<rkf_render::LineVertex> {
+    fn build_collider_wireframes(&self) -> Vec<rkp_render::LineVertex> {
         use rkp_physics::rigid_body::{BodyType, ColliderShape};
         let mut verts = Vec::new();
 
@@ -3674,23 +3674,23 @@ impl EngineState {
                 ColliderShape::Box => {
                     let min = transform.position - cache.aabb_half;
                     let max = transform.position + cache.aabb_half;
-                    verts.extend(rkf_render::wireframe::aabb_wireframe(min, max, color));
+                    verts.extend(rkp_render::wireframe::aabb_wireframe(min, max, color));
                 }
                 ColliderShape::Sphere => {
                     let r = cache.aabb_half.max_element();
-                    verts.extend(rkf_render::wireframe::sphere_wireframe(transform.position, r, color));
+                    verts.extend(rkp_render::wireframe::sphere_wireframe(transform.position, r, color));
                 }
                 ColliderShape::Capsule => {
                     let r = cache.aabb_half.x.max(cache.aabb_half.z).max(0.01);
                     let hh = (cache.aabb_half.y - r).max(0.01);
                     let top = transform.position + glam::Vec3::new(0.0, hh, 0.0);
                     let bot = transform.position - glam::Vec3::new(0.0, hh, 0.0);
-                    verts.extend(rkf_render::wireframe::sphere_wireframe(top, r, color));
-                    verts.extend(rkf_render::wireframe::sphere_wireframe(bot, r, color));
+                    verts.extend(rkp_render::wireframe::sphere_wireframe(top, r, color));
+                    verts.extend(rkp_render::wireframe::sphere_wireframe(bot, r, color));
                     for angle in [0.0f32, std::f32::consts::FRAC_PI_2, std::f32::consts::PI, 3.0 * std::f32::consts::FRAC_PI_2] {
                         let offset = glam::Vec3::new(angle.cos() * r, 0.0, angle.sin() * r);
-                        verts.push(rkf_render::LineVertex { position: (top + offset).to_array(), color });
-                        verts.push(rkf_render::LineVertex { position: (bot + offset).to_array(), color });
+                        verts.push(rkp_render::LineVertex { position: (top + offset).to_array(), color });
+                        verts.push(rkp_render::LineVertex { position: (bot + offset).to_array(), color });
                     }
                 }
                 ColliderShape::Auto => {
@@ -3713,12 +3713,12 @@ impl EngineState {
                             );
                             let world_min = transform.position + offset + local_min * transform.scale;
                             let world_max = transform.position + offset + local_max * transform.scale;
-                            verts.extend(rkf_render::wireframe::aabb_wireframe(world_min, world_max, color));
+                            verts.extend(rkp_render::wireframe::aabb_wireframe(world_min, world_max, color));
                         }
                     } else {
                         let min = transform.position - cache.aabb_half;
                         let max = transform.position + cache.aabb_half;
-                        verts.extend(rkf_render::wireframe::aabb_wireframe(min, max, color));
+                        verts.extend(rkp_render::wireframe::aabb_wireframe(min, max, color));
                     }
                 }
             }

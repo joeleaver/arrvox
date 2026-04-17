@@ -4886,22 +4886,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rkf-render"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "encase",
- "glam 0.29.3",
- "half",
- "image",
- "log",
- "pollster",
- "rkf-core",
- "thiserror 2.0.18",
- "wgpu 29.0.1",
-]
-
-[[package]]
 name = "rkp-animation"
 version = "0.1.0"
 dependencies = [
@@ -4949,7 +4933,6 @@ dependencies = [
  "rfd",
  "rinch",
  "rinch-tabler-icons",
- "rkf-render",
  "rkp-engine",
  "rkp-render",
  "rkp-runtime",
@@ -4972,7 +4955,6 @@ dependencies = [
  "log",
  "notify",
  "rapier3d",
- "rkf-render",
  "rkp-animation",
  "rkp-core",
  "rkp-import",
@@ -5049,7 +5031,6 @@ dependencies = [
  "naga 29.0.1",
  "pollster",
  "rayon",
- "rkf-render",
  "rkp-core",
  "thiserror 2.0.18",
  "wgpu 29.0.1",

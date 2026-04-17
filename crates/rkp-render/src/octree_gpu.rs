@@ -88,31 +88,6 @@ impl OctreeGpu {
         self.allocator.buffer_len()
     }
 
-    /// Write octree handle fields into a GpuObject's brick_map fields.
-    ///
-    /// This reinterprets the flat brick map fields to carry octree metadata.
-    pub fn write_gpu_object_fields(
-        handle: &OctreeHandle,
-        gpu_obj: &mut rkf_render::gpu_object::GpuObject,
-    ) {
-        let extent = (1u32 << handle.depth) as f32 * 8.0 * handle.base_voxel_size;
-        gpu_obj.brick_map_offset = handle.root_offset;
-        gpu_obj.brick_map_dims[0] = handle.depth as u32;
-        gpu_obj.brick_map_dims[1] = extent.to_bits();
-        gpu_obj.brick_map_dims[2] = 0;
-    }
-
-    /// Write octree handle fields into a GpuObject's rest-pose brick map fields
-    /// (for skinned objects).
-    pub fn write_gpu_object_rest_fields(
-        handle: &OctreeHandle,
-        gpu_obj: &mut rkf_render::gpu_object::GpuObject,
-    ) {
-        gpu_obj.rest_brick_map_offset = handle.root_offset;
-        gpu_obj.rest_brick_map_dims[0] = handle.depth as u32;
-        gpu_obj.rest_brick_map_dims[1] = handle.base_voxel_size.to_bits();
-        gpu_obj.rest_brick_map_dims[2] = 0;
-    }
 }
 
 impl Default for OctreeGpu {

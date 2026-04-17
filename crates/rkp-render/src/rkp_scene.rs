@@ -97,7 +97,7 @@ pub struct FrameUpload<'a> {
 ///
 /// 8 storage buffers + 1 uniform in group 0; group 2 holds 4 more storage
 /// buffers + 1 uniform — total 12 storage buffers per stage, exactly at
-/// the rkf-render device limit.
+/// the rkp-render device limit.
 pub struct RkpScene {
     pub brick_pool_buffer: wgpu::Buffer,
     pub octree_nodes_buffer: wgpu::Buffer,
