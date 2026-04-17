@@ -16,9 +16,9 @@
 
 use glam::Vec3;
 
-use rkf_core::Aabb;
-use rkf_core::companion::{BoneVoxel, ColorBrick, ColorVoxel};
-use rkf_core::constants::BRICK_DIM;
+use rkp_core::Aabb;
+use rkp_core::companion::{BoneVoxel, ColorBrick, ColorVoxel};
+use rkp_core::constants::MESH_BRICK_DIM as BRICK_DIM;
 
 use crate::bvh::TriangleBvh;
 use crate::config::ImportConfig;

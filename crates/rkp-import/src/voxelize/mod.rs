@@ -26,8 +26,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use glam::Vec3;
 use rayon::prelude::*;
 
-use rkf_core::Aabb;
-use rkf_core::constants::BRICK_DIM;
+use rkp_core::Aabb;
+use rkp_core::constants::MESH_BRICK_DIM as BRICK_DIM;
 
 use crate::bvh::TriangleBvh;
 use crate::config::{ImportConfig, ImportResult};

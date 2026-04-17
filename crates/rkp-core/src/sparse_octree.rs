@@ -1,6 +1,6 @@
 //! Sparse octree spatial structure for organizing voxels.
 //!
-//! Replaces rkf-core's flat [`BrickMap`](rkf_core::brick_map::BrickMap) with a
+//! Replaces the flat [`BrickMap`](crate::brick_map::BrickMap) with a
 //! compact tree where uniform regions (all-empty or all-solid) collapse to single
 //! nodes. Variable-depth leaves provide built-in LOD — coarser leaves at shallower
 //! depths represent larger spatial extents.
@@ -24,7 +24,7 @@
 //! `children[octant]` is a direct index, no popcount needed.
 
 use glam::UVec3;
-use rkf_core::brick_map::{BrickMap, EMPTY_SLOT, INTERIOR_SLOT};
+use crate::brick_map::{BrickMap, EMPTY_SLOT, INTERIOR_SLOT};
 
 /// Sentinel: entire subtree is empty (no geometry).
 pub const EMPTY_NODE: u32 = 0xFFFF_FFFF;

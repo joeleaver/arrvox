@@ -46,14 +46,14 @@ fn collect_leaf_slots(all_nodes: &[u32], node_idx: usize, out: &mut Vec<u32>) {
 
 /// Convert a SpatialHandle from rkp_render into our SpatialData component.
 fn spatial_from_handle(
-    handle: &rkf_core::scene_node::SpatialHandle,
+    handle: &rkp_core::scene_node::SpatialHandle,
     voxel_size: f32,
-    aabb: &rkf_core::Aabb,
+    aabb: &rkp_core::Aabb,
     voxel_slot_start: u32,
     voxel_slot_count: u32,
     brick_ids: Vec<u32>,
 ) -> SpatialData {
-    if let rkf_core::scene_node::SpatialHandle::Octree {
+    if let rkp_core::scene_node::SpatialHandle::Octree {
         root_offset, len, depth, base_voxel_size,
     } = handle
     {
@@ -1050,7 +1050,7 @@ impl EngineState {
             EngineCommand::SpawnPrimitive { name } => {
                 use crate::components::*;
                 let name = self.unique_name(&name);
-                let primitive = rkf_core::scene_node::SdfPrimitive::Box {
+                let primitive = rkp_core::scene_node::SdfPrimitive::Box {
                     half_extents: glam::Vec3::splat(0.5),
                 };
                 let scene_id = self.next_scene_id;
@@ -2756,7 +2756,7 @@ impl EngineState {
                     transform.position,
                 );
                 let gpu_idx = self.gpu_objects.len() as u32;
-                let spatial_handle = rkf_core::scene_node::SpatialHandle::Octree {
+                let spatial_handle = rkp_core::scene_node::SpatialHandle::Octree {
                     root_offset: spatial.root_offset,
                     len: spatial.len,
                     depth: spatial.depth,
@@ -3134,10 +3134,10 @@ impl EngineState {
                         }
                     } else if let Some(ref prim_name) = obj.primitive {
                         let primitive = match prim_name.as_str() {
-                            "box" => rkf_core::scene_node::SdfPrimitive::Box {
+                            "box" => rkp_core::scene_node::SdfPrimitive::Box {
                                 half_extents: glam::Vec3::from_array(obj.scale) * 0.5,
                             },
-                            "sphere" => rkf_core::scene_node::SdfPrimitive::Sphere {
+                            "sphere" => rkp_core::scene_node::SdfPrimitive::Sphere {
                                 radius: obj.scale[0] * 0.5,
                             },
                             _ => continue,
@@ -3920,12 +3920,12 @@ impl EngineState {
 /// Adds margin around the tight bounds and ensures the octree depth won't
 /// exceed MAX_DEPTH (11). If the object is too large for the requested voxel
 /// size, the voxel size is increased to fit.
-fn procedural_voxel_params(tree: &rkp_procedural::ProceduralObject, base_voxel_size: f32) -> (rkf_core::Aabb, f32) {
+fn procedural_voxel_params(tree: &rkp_procedural::ProceduralObject, base_voxel_size: f32) -> (rkp_core::Aabb, f32) {
     let tight = rkp_procedural::compute_bounds(tree);
 
     // Add margin for boundary sampling (same approach as voxelize_primitive).
     let margin = base_voxel_size * 8.0 * 1.8 + base_voxel_size;
-    let aabb = rkf_core::Aabb {
+    let aabb = rkp_core::Aabb {
         min: tight.min - glam::Vec3::splat(margin),
         max: tight.max + glam::Vec3::splat(margin),
     };

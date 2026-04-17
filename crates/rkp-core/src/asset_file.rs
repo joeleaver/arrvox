@@ -530,7 +530,7 @@ mod tests {
         // Three voxels, two bricks, two bones — exercises every part
         // of the structured skin-meta payload: weights, origins, and
         // rest AABBs all survive the LZ4 + length-prefix round trip.
-        use rkf_core::companion::BoneVoxel;
+        use crate::companion::BoneVoxel;
 
         let bones: Vec<BoneVoxel> = vec![
             BoneVoxel::new([0, 1, 2, 3], [64, 64, 64, 63]),
@@ -543,7 +543,7 @@ mod tests {
             [0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
             [-1.0, -2.0, -3.0, 2.0, 3.0, 4.0],
         ];
-        let voxel_bytes = vec![0u8; 3 * std::mem::size_of::<rkf_core::voxel::VoxelSample>()];
+        let voxel_bytes = vec![0u8; 3 * std::mem::size_of::<crate::voxel::VoxelSample>()];
 
         let mut buf = Vec::new();
         let mut cursor = Cursor::new(&mut buf);

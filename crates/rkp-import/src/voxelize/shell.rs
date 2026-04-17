@@ -22,8 +22,8 @@ use std::collections::{HashMap, HashSet};
 
 use glam::UVec3;
 
-use rkf_core::companion::{BoneVoxel, ColorVoxel};
-use rkf_core::voxel::VoxelSample;
+use rkp_core::companion::{BoneVoxel, ColorVoxel};
+use rkp_core::voxel::VoxelSample;
 use rkp_core::{SparseOctree, brick_pool, sparse_octree};
 
 use super::classify::{BrickResult, BrickWork};

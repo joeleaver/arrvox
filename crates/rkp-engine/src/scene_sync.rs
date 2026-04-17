@@ -93,8 +93,8 @@ pub struct SkinnedBinding {
 /// so shaders can index into the bone-matrix buffer.
 pub fn build_gpu_object(
     world_matrix: &glam::Mat4,
-    aabb: &rkf_core::Aabb,
-    spatial: &rkf_core::scene_node::SpatialHandle,
+    aabb: &rkp_core::Aabb,
+    spatial: &rkp_core::scene_node::SpatialHandle,
     voxel_size: f32,
     material_id: u16,
     object_id: u32,
@@ -110,7 +110,7 @@ pub fn build_gpu_object(
     gpu.object_id = object_id;
     gpu.geom_type = rkp_gpu_object::geom_type::VOXELIZED;
 
-    if let rkf_core::scene_node::SpatialHandle::Octree {
+    if let rkp_core::scene_node::SpatialHandle::Octree {
         root_offset, depth, base_voxel_size, ..
     } = spatial
     {

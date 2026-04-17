@@ -9,7 +9,6 @@ description = "Visual testing harness for the RKIPatch splat engine"
 rkp-core = { workspace = true }
 rkp-render = { workspace = true }
 rkp-runtime = { workspace = true }
-rkf-core = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }
 glam = { workspace = true }

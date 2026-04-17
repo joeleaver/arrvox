@@ -5,7 +5,7 @@
 //! the top 4 by weight, normalizes, and quantizes to `u8` (weights
 //! sum to exactly 255 after a rounding fix-up).
 
-use rkf_core::companion::BoneVoxel;
+use rkp_core::companion::BoneVoxel;
 
 use crate::mesh::MeshData;
 use crate::skeleton::VertexSkinning;

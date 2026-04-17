@@ -6,7 +6,7 @@ rust-version.workspace = true
 description = "Procedural object system: arena-based node trees, evaluation, adaptive voxelization"
 
 [dependencies]
-rkf-core = { workspace = true }
+rkp-core = { workspace = true }
 glam = { workspace = true }
 serde = { workspace = true }
 smallvec = "1"

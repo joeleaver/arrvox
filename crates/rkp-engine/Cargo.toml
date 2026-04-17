@@ -11,7 +11,6 @@ rkp-core = { workspace = true }
 rkp-procedural = { workspace = true }
 rkp-render = { workspace = true }
 rkp-import = { workspace = true }
-rkf-core = { workspace = true }
 rkf-render = { workspace = true }
 rkf-runtime = { workspace = true }
 rkf-physics = { workspace = true }

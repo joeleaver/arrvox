@@ -11,7 +11,7 @@
 //! ranges, opportunistic tail coalescing on deallocate. Procedural
 //! re-voxelization reclaims storage predictably.
 
-use rkf_core::companion::BoneVoxel;
+use crate::companion::BoneVoxel;
 
 use crate::leaf_attr::LeafAttr;
 

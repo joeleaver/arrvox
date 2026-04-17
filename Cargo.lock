@@ -4928,8 +4928,8 @@ dependencies = [
  "half",
  "log",
  "lz4_flex",
- "rkf-core",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -4969,7 +4969,6 @@ dependencies = [
  "notify",
  "rapier3d",
  "rkf-animation",
- "rkf-core",
  "rkf-physics",
  "rkf-render",
  "rkf-runtime",
@@ -4995,7 +4994,6 @@ dependencies = [
  "image",
  "rayon",
  "rkf-animation",
- "rkf-core",
  "rkp-core",
  "tempfile",
  "thiserror 2.0.18",
@@ -5018,7 +5016,7 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "glam 0.29.3",
- "rkf-core",
+ "rkp-core",
  "serde",
  "smallvec",
 ]
@@ -5036,7 +5034,6 @@ dependencies = [
  "pollster",
  "rayon",
  "rkf-animation",
- "rkf-core",
  "rkf-render",
  "rkp-core",
  "thiserror 2.0.18",
@@ -5055,7 +5052,6 @@ dependencies = [
  "log",
  "pollster",
  "rkf-animation",
- "rkf-core",
  "rkf-mcp",
  "rkf-physics",
  "rkp-core",
@@ -5073,7 +5069,6 @@ dependencies = [
  "glam 0.29.3",
  "log",
  "pollster",
- "rkf-core",
  "rkp-core",
  "rkp-render",
  "rkp-runtime",

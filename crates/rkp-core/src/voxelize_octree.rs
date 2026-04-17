@@ -29,7 +29,7 @@
 //! throw away. This module is the replacement.
 
 use glam::{UVec3, Vec3};
-use rkf_core::Aabb;
+use crate::Aabb;
 
 use crate::brick_pool::{BrickPool, BRICK_DIM, BRICK_EMPTY, BRICK_LEVELS};
 use crate::leaf_attr::LeafAttr;

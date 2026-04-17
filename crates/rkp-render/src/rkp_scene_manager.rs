@@ -46,9 +46,9 @@ impl AssetHandle {
 /// instance spawning can share one code path downstream.
 #[derive(Debug, Clone, Copy)]
 pub struct AssetInfo {
-    pub spatial: rkf_core::scene_node::SpatialHandle,
+    pub spatial: rkp_core::scene_node::SpatialHandle,
     pub voxel_size: f32,
-    pub aabb: rkf_core::Aabb,
+    pub aabb: rkp_core::Aabb,
     pub voxel_count: u32,
     pub leaf_attr_slot_start: u32,
     pub leaf_attr_slot_count: u32,
@@ -90,7 +90,7 @@ struct AssetEntry {
     refcount: u32,
     spatial_handle: OctreeHandle,
     voxel_size: f32,
-    aabb: rkf_core::Aabb,
+    aabb: rkp_core::Aabb,
     voxel_count: u32,
     leaf_attr_slot_start: u32,
     leaf_attr_slot_count: u32,
@@ -105,7 +105,7 @@ struct AssetEntry {
 impl AssetEntry {
     fn info(&self) -> AssetInfo {
         AssetInfo {
-            spatial: rkf_core::scene_node::SpatialHandle::Octree {
+            spatial: rkp_core::scene_node::SpatialHandle::Octree {
                 root_offset: self.spatial_handle.root_offset,
                 len: self.spatial_handle.len,
                 depth: self.spatial_handle.depth,
@@ -180,9 +180,9 @@ pub struct ReloadResult {
 
 /// Result of voxelizing a primitive.
 pub struct VoxelizeResult {
-    pub spatial: rkf_core::scene_node::SpatialHandle,
+    pub spatial: rkp_core::scene_node::SpatialHandle,
     pub voxel_size: f32,
-    pub aabb: rkf_core::Aabb,
+    pub aabb: rkp_core::Aabb,
     /// Logical voxel count (octree leaves).
     pub voxel_count: u32,
     /// First leaf_attr pool slot used by this allocation.
@@ -371,8 +371,8 @@ impl RkpSceneManager {
 
     // ── Spatial deallocation ─────────────────────────────────────────
 
-    pub fn deallocate_spatial(&mut self, handle: &rkf_core::scene_node::SpatialHandle) {
-        if let rkf_core::scene_node::SpatialHandle::Octree {
+    pub fn deallocate_spatial(&mut self, handle: &rkp_core::scene_node::SpatialHandle) {
+        if let rkp_core::scene_node::SpatialHandle::Octree {
             root_offset, len, depth, base_voxel_size,
         } = handle
         {
@@ -491,7 +491,7 @@ impl RkpSceneManager {
     /// per unique path — repeated acquisitions share the returned entry
     /// via the cache.
     fn load_asset_from_disk(&mut self, rkp_path: &std::path::Path) -> Result<AssetEntry, String> {
-        use rkf_core::voxel::VoxelSample;
+        use rkp_core::voxel::VoxelSample;
 
         let mut file = std::fs::File::open(rkp_path)
             .map_err(|e| format!("open {}: {e}", rkp_path.display()))?;
@@ -508,7 +508,7 @@ impl RkpSceneManager {
 
         let voxel_size = header.base_voxel_size;
         let voxel_count = header.voxel_count;
-        let aabb = rkf_core::Aabb::new(
+        let aabb = rkp_core::Aabb::new(
             glam::Vec3::from(header.aabb_min),
             glam::Vec3::from(header.aabb_max),
         );
@@ -589,7 +589,7 @@ impl RkpSceneManager {
         } else {
             rkp_core::asset_file::SkinMetaOut::default()
         };
-        let file_bones: &[rkf_core::companion::BoneVoxel] = if skin_meta.bone_voxels.len() >= std::mem::size_of::<rkf_core::companion::BoneVoxel>() {
+        let file_bones: &[rkp_core::companion::BoneVoxel] = if skin_meta.bone_voxels.len() >= std::mem::size_of::<rkp_core::companion::BoneVoxel>() {
             bytemuck::cast_slice(&skin_meta.bone_voxels)
         } else {
             &[]
@@ -807,13 +807,13 @@ impl RkpSceneManager {
     /// Voxelize an SDF primitive into the octree.
     pub fn voxelize_primitive(
         &mut self,
-        primitive: &rkf_core::scene_node::SdfPrimitive,
+        primitive: &rkp_core::scene_node::SdfPrimitive,
         material_id: u16,
         voxel_size: f32,
         bake_scale: glam::Vec3,
         object_id: u32,
     ) -> Option<VoxelizeResult> {
-        use rkf_core::scene_node::SdfPrimitive;
+        use rkp_core::scene_node::SdfPrimitive;
 
         fn primitive_half_extents(prim: &SdfPrimitive) -> glam::Vec3 {
             match *prim {
@@ -835,7 +835,7 @@ impl RkpSceneManager {
 
         let half_extents = primitive_half_extents(primitive) * bake_scale;
         let margin = voxel_size * 8.0 * 1.8 + voxel_size;
-        let aabb = rkf_core::Aabb::new(
+        let aabb = rkp_core::Aabb::new(
             -half_extents - glam::Vec3::splat(margin),
             half_extents + glam::Vec3::splat(margin),
         );
@@ -844,7 +844,7 @@ impl RkpSceneManager {
         let sdf_fn: Box<dyn Fn(glam::Vec3) -> f32> = match primitive {
             SdfPrimitive::Box { half_extents: he } => {
                 let scaled = SdfPrimitive::Box { half_extents: *he * bake_scale };
-                Box::new(move |pos| rkf_core::evaluate_primitive(&scaled, pos))
+                Box::new(move |pos| rkp_core::evaluate_primitive(&scaled, pos))
             }
             _ => {
                 let prim = primitive.clone();
@@ -854,7 +854,7 @@ impl RkpSceneManager {
                     1.0 / bake_scale.y.max(1e-6),
                     1.0 / bake_scale.z.max(1e-6),
                 );
-                Box::new(move |pos| rkf_core::evaluate_primitive(&prim, pos * inv_scale) * min_scale)
+                Box::new(move |pos| rkp_core::evaluate_primitive(&prim, pos * inv_scale) * min_scale)
             }
         };
 
@@ -871,14 +871,14 @@ impl RkpSceneManager {
 
         self.merge_face_links(&r.brick_face_links);
         let handle = self.octree.allocate(&r.octree);
-        let spatial = rkf_core::scene_node::SpatialHandle::Octree {
+        let spatial = rkp_core::scene_node::SpatialHandle::Octree {
             root_offset: handle.root_offset,
             len: handle.len,
             depth: handle.depth,
             base_voxel_size: handle.base_voxel_size,
         };
 
-        let geometry_aabb = rkf_core::Aabb::new(-half_extents, half_extents);
+        let geometry_aabb = rkp_core::Aabb::new(-half_extents, half_extents);
         Some(VoxelizeResult {
             spatial,
             voxel_size,
@@ -896,7 +896,7 @@ impl RkpSceneManager {
     pub fn voxelize_sdf_fn<F>(
         &mut self,
         sdf_fn: F,
-        aabb: &rkf_core::Aabb,
+        aabb: &rkp_core::Aabb,
         voxel_size: f32,
         object_id: u32,
     ) -> Option<VoxelizeResult>
@@ -912,7 +912,7 @@ impl RkpSceneManager {
 
         self.merge_face_links(&r.brick_face_links);
         let handle = self.octree.allocate(&r.octree);
-        let spatial = rkf_core::scene_node::SpatialHandle::Octree {
+        let spatial = rkp_core::scene_node::SpatialHandle::Octree {
             root_offset: handle.root_offset,
             len: handle.len,
             depth: handle.depth,

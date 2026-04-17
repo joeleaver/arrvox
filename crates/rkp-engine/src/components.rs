@@ -61,7 +61,7 @@ pub struct SpatialData {
     pub len: u32,
     pub depth: u8,
     pub base_voxel_size: f32,
-    pub aabb: rkf_core::Aabb,
+    pub aabb: rkp_core::Aabb,
     pub voxel_size: f32,
     /// First voxel pool slot used by this allocation, and the count.
     /// Used to free the allocation when geometry is replaced.
