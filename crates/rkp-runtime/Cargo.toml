@@ -8,7 +8,7 @@ description = "Engine runtime: frame scheduling, ECS glue, streaming, asset mana
 [dependencies]
 rkp-core = { workspace = true }
 rkp-render = { workspace = true }
-rkf-animation = { workspace = true }
+rkp-animation = { workspace = true }
 rkf-physics = { workspace = true }
 rkf-mcp = { workspace = true }
 wgpu = { workspace = true }

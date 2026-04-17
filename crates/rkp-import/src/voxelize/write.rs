@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use glam::Vec3;
 
 use rkp_core::Aabb;
-use rkf_animation::skeleton_asset::{SkeletonAsset, save_rkskel};
+use rkp_animation::skeleton_asset::{SkeletonAsset, save_rkskel};
 use rkp_core::asset_file::write_stage;
 
 use crate::event::{ImportEvent, ProgressReporter};

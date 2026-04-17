@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use glam::Mat4;
-use rkf_animation::player::LoopMode;
-use rkf_animation::skeleton_asset::{load_rkskel, SkeletonAsset};
+use rkp_animation::player::LoopMode;
+use rkp_animation::skeleton_asset::{load_rkskel, SkeletonAsset};
 
 use crate::components::{AnimationPlayer, Skeleton};
 
@@ -109,7 +109,7 @@ pub fn default_player(asset: &SkeletonAsset) -> AnimationPlayer {
 }
 
 /// Advance time on one [`AnimationPlayer`] against a clip of the given
-/// duration. Duplicated from `rkf_animation::AnimationPlayer::advance`
+/// duration. Duplicated from `rkp_animation::AnimationPlayer::advance`
 /// because our ECS player carries `clip_name` rather than owning a
 /// clip; porting the same semantics (Once clamp, Loop wrap, PingPong
 /// fold) verbatim keeps behaviour identical for tests and muscle memory.
@@ -223,9 +223,9 @@ pub fn tick(world: &mut hecs::World, dt: f32) -> bool {
 mod tests {
     use super::*;
     use glam::{Quat, Vec3};
-    use rkf_animation::clip::{AnimationClip, BoneChannel, Keyframe};
-    use rkf_animation::skeleton::{Bone, Skeleton as SkelData};
-    use rkf_animation::skeleton_asset::SkeletonAsset;
+    use rkp_animation::clip::{AnimationClip, BoneChannel, Keyframe};
+    use rkp_animation::skeleton::{Bone, Skeleton as SkelData};
+    use rkp_animation::skeleton_asset::SkeletonAsset;
 
     fn tiny_asset() -> Arc<SkeletonAsset> {
         let bones = vec![

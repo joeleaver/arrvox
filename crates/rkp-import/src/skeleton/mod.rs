@@ -9,8 +9,8 @@
 
 use std::path::Path;
 
-use rkf_animation::clip::AnimationClip;
-use rkf_animation::skeleton::Skeleton;
+use rkp_animation::clip::AnimationClip;
+use rkp_animation::skeleton::Skeleton;
 
 pub mod fbx;
 pub mod gltf;

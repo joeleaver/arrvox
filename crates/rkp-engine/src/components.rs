@@ -266,7 +266,7 @@ impl ProceduralGeometry {
 /// `SkeletonAsset` fields.
 #[derive(Clone)]
 pub struct Skeleton {
-    pub asset: std::sync::Arc<rkf_animation::skeleton_asset::SkeletonAsset>,
+    pub asset: std::sync::Arc<rkp_animation::skeleton_asset::SkeletonAsset>,
     pub path: std::path::PathBuf,
     pub current_pose: Vec<glam::Mat4>,
     pub inverse_pose: Vec<glam::Mat4>,
@@ -297,7 +297,7 @@ impl Skeleton {
     /// bind-pose origin in object-local space. Called at component
     /// construction and again if the skeleton asset is ever hot-swapped.
     pub fn compute_bind_world_origins(
-        asset: &rkf_animation::skeleton_asset::SkeletonAsset,
+        asset: &rkp_animation::skeleton_asset::SkeletonAsset,
     ) -> Vec<glam::Vec3> {
         let skel = &asset.skeleton;
         let n = skel.bones.len();
@@ -321,7 +321,7 @@ impl Skeleton {
     /// expressed as one `Mat4`:
     /// `Scale(s) · T(rc − mc) · R · T(−rc)`.
     pub fn compute_normalization(
-        asset: &rkf_animation::skeleton_asset::SkeletonAsset,
+        asset: &rkp_animation::skeleton_asset::SkeletonAsset,
     ) -> glam::Mat4 {
         use glam::{EulerRot, Mat4, Quat, Vec3};
         let mesh_center = Vec3::from_array(asset.mesh_center);
@@ -357,7 +357,7 @@ pub struct AnimationPlayer {
     /// Whether the player is advancing.
     pub playing: bool,
     /// Loop mode (Once / Loop / PingPong).
-    pub loop_mode: rkf_animation::player::LoopMode,
+    pub loop_mode: rkp_animation::player::LoopMode,
     /// PingPong direction (true = forward). Not user-facing; kept as state
     /// so a scrub-backwards PingPong keeps its direction across frames.
     #[serde(default = "player_default_forward")]
@@ -373,7 +373,7 @@ impl Default for AnimationPlayer {
             time: 0.0,
             speed: 1.0,
             playing: false,
-            loop_mode: rkf_animation::player::LoopMode::Loop,
+            loop_mode: rkp_animation::player::LoopMode::Loop,
             forward: true,
         }
     }

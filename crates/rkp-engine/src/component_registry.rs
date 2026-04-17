@@ -661,7 +661,7 @@ static ANIMATION_PLAYER_FIELDS: [FieldMeta; 5] = [
 
 fn animation_player_entry() -> ComponentEntry {
     use crate::components::AnimationPlayer;
-    use rkf_animation::player::LoopMode;
+    use rkp_animation::player::LoopMode;
     ComponentEntry {
         name: "AnimationPlayer",
         meta: &ANIMATION_PLAYER_FIELDS,

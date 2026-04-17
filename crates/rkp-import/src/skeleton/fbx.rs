@@ -36,8 +36,8 @@ use std::collections::HashMap;
 
 use glam::{Mat4, Quat, Vec3};
 
-use rkf_animation::clip::{AnimationClip, BoneChannel, Keyframe};
-use rkf_animation::skeleton::{Bone, Skeleton};
+use rkp_animation::clip::{AnimationClip, BoneChannel, Keyframe};
+use rkp_animation::skeleton::{Bone, Skeleton};
 
 use crate::mesh::fbx::fbx_load_opts;
 
