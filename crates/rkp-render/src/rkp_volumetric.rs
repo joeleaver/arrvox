@@ -3,6 +3,12 @@
 //! Two compute passes:
 //! 1. Volumetric march (half-res): marches view rays through atmosphere
 //! 2. Volumetric composite (full-res): blends scatter over scene HDR
+//!
+//! Plus a tiny 1-thread compute pass that integrates cloud density along
+//! the camera→sun ray and writes exp(-τ) to a buffer for CPU readback,
+//! so the engine can dim direct sunlight when clouds overhead block the sun.
+
+use std::sync::{Arc, atomic::{AtomicU32, AtomicBool, Ordering}};
 
 use crate::validate_wgsl;
 
@@ -31,6 +37,7 @@ pub struct VolumetricParams {
     pub vol_ambient_r: f32,
     pub vol_ambient_g: f32,
     pub vol_ambient_b: f32,
+    pub prev_view_proj: [[f32; 4]; 4],
 }
 
 /// Cloud parameters.
@@ -71,6 +78,11 @@ pub struct RkpVolumetricPass {
     pub scatter_texture: wgpu::Texture,
     pub scatter_view: wgpu::TextureView,
 
+    /// Previous-frame scatter buffer — sampled in the march for temporal accumulation.
+    history_texture: wgpu::Texture,
+    history_view: wgpu::TextureView,
+    history_sampler: wgpu::Sampler,
+
     /// Full-res composited HDR output (replaces shade output for tone mapping).
     pub output_texture: wgpu::Texture,
     pub output_view: wgpu::TextureView,
@@ -81,6 +93,20 @@ pub struct RkpVolumetricPass {
     height: u32,
 
     depth_view_set: bool,
+
+    // Cloud → sun attenuation: tiny compute pass + async readback.
+    sun_atten_pipeline: wgpu::ComputePipeline,
+    sun_atten_bind_group: wgpu::BindGroup,
+    sun_atten_storage: wgpu::Buffer,  // GPU-only, written by compute
+    sun_atten_staging: wgpu::Buffer,  // MAP_READ copy of storage
+    /// Latest received exp(-τ·k) value as f32-bits. Updated by map_async callback.
+    sun_atten_value: Arc<AtomicU32>,
+    /// Raw τ from last readback, for debugging.
+    sun_atten_tau_bits: Arc<AtomicU32>,
+    /// True while a map_async call is in flight. Blocks re-issuing the readback
+    /// until the previous map completes (single-buffer design, lags 1–2 frames
+    /// under normal GPU pacing).
+    sun_atten_map_pending: Arc<AtomicBool>,
 }
 
 impl RkpVolumetricPass {
@@ -135,6 +161,24 @@ impl RkpVolumetricPass {
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
+                        count: None,
+                    },
+                    // 4: previous-frame scatter history (filterable, sampled)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // 5: history sampler (linear)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
                 ],
@@ -195,9 +239,24 @@ impl RkpVolumetricPass {
             mapped_at_creation: false,
         });
 
-        // Textures.
-        let (scatter_texture, scatter_view) =
-            Self::create_texture(device, "vol scatter", half_width, half_height, wgpu::TextureFormat::Rgba16Float);
+        // Textures. Scatter is COPY_SRC so we can blit it into the history after each
+        // march; history is COPY_DST + sampleable so the next march can read it.
+        let (scatter_texture, scatter_view) = Self::create_scatter_texture(
+            device, "vol scatter", half_width, half_height,
+        );
+        let (history_texture, history_view) = Self::create_history_texture(
+            device, "vol scatter history", half_width, half_height,
+        );
+        let history_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("vol history sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
         let (output_texture, output_view) =
             Self::create_texture(device, "vol output", width, height, wgpu::TextureFormat::Rgba16Float);
 
@@ -243,6 +302,83 @@ impl RkpVolumetricPass {
             cache: None,
         });
 
+        // Sun-atten pipeline — 1-thread compute + storage + readback.
+        let sun_atten_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("vol sun atten layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let sun_atten_storage = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vol sun atten storage"),
+            size: 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let sun_atten_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vol sun atten staging"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sun_atten_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vol sun atten bg"),
+            layout: &sun_atten_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cloud_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: sun_atten_storage.as_entire_binding() },
+            ],
+        });
+        let sun_atten_src = include_str!("shaders/rkp_cloud_sun_atten.wgsl");
+        validate_wgsl(sun_atten_src, "rkp_cloud_sun_atten");
+        let sun_atten_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rkp_cloud_sun_atten"),
+            source: wgpu::ShaderSource::Wgsl(sun_atten_src.into()),
+        });
+        let sun_atten_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("vol sun atten pipeline layout"),
+            bind_group_layouts: &[Some(&sun_atten_layout)],
+            immediate_size: 0,
+        });
+        let sun_atten_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("vol sun atten"),
+            layout: Some(&sun_atten_pipeline_layout),
+            module: &sun_atten_module,
+            entry_point: Some("sun_atten_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         Self {
             march_pipeline,
             march_bind_group_layout,
@@ -254,6 +390,9 @@ impl RkpVolumetricPass {
             cloud_params_buffer,
             scatter_texture,
             scatter_view,
+            history_texture,
+            history_view,
+            history_sampler,
             output_texture,
             output_view,
             half_width,
@@ -261,6 +400,13 @@ impl RkpVolumetricPass {
             width,
             height,
             depth_view_set: false,
+            sun_atten_pipeline,
+            sun_atten_bind_group,
+            sun_atten_storage,
+            sun_atten_staging,
+            sun_atten_value: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
+            sun_atten_tau_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
+            sun_atten_map_pending: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -275,9 +421,30 @@ impl RkpVolumetricPass {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.scatter_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: self.cloud_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.history_view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&self.history_sampler) },
             ],
         }));
         self.depth_view_set = true;
+    }
+
+    /// Copy the current scatter output into the history buffer for next-frame reprojection.
+    pub fn copy_scatter_to_history(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.scatter_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.history_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d { width: self.half_width, height: self.half_height, depth_or_array_layers: 1 },
+        );
     }
 
     /// Set the scene HDR view (shade pass output). Rebuilds composite bind group.
@@ -319,6 +486,60 @@ impl RkpVolumetricPass {
         );
     }
 
+    /// Dispatch the 1-thread sun-attenuation compute pass and queue the GPU→CPU
+    /// copy into the staging buffer. The value becomes readable after the next
+    /// submit completes and the map_async callback fires (see `issue_sun_atten_map`).
+    pub fn dispatch_sun_atten(&self, encoder: &mut wgpu::CommandEncoder) {
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("vol sun atten"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.sun_atten_pipeline);
+            pass.set_bind_group(0, &self.sun_atten_bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&self.sun_atten_storage, 0, &self.sun_atten_staging, 0, 16);
+    }
+
+    /// After submit, issue a non-blocking map on the staging buffer. The callback
+    /// writes the f32 bits into `sun_atten_value` when the GPU catches up. Skipped
+    /// if a prior map is still pending (single-buffer design — one read at a time).
+    pub fn issue_sun_atten_map(&self) {
+        if self.sun_atten_map_pending.load(Ordering::Acquire) {
+            return;
+        }
+        self.sun_atten_map_pending.store(true, Ordering::Release);
+
+        let value = self.sun_atten_value.clone();
+        let tau_bits = self.sun_atten_tau_bits.clone();
+        let pending = self.sun_atten_map_pending.clone();
+        let staging_for_cb = self.sun_atten_staging.clone();
+        self.sun_atten_staging.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            if result.is_ok() {
+                let data = staging_for_cb.slice(..).get_mapped_range();
+                let atten = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                let tau = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                value.store(atten, Ordering::Release);
+                tau_bits.store(tau, Ordering::Release);
+                drop(data);
+                staging_for_cb.unmap();
+            }
+            pending.store(false, Ordering::Release);
+        });
+    }
+
+    /// Latest received exp(-τ) value (updated asynchronously by `issue_sun_atten_map`).
+    pub fn sun_atten_value(&self) -> f32 {
+        f32::from_bits(self.sun_atten_value.load(Ordering::Acquire))
+    }
+
+    /// Raw τ from the last readback, for debugging. Staging buffer holds
+    /// (exp(-τ·k), τ, 0, 0).
+    pub fn sun_atten_tau_debug(&self) -> f32 {
+        f32::from_bits(self.sun_atten_tau_bits.load(Ordering::Acquire))
+    }
+
     /// Dispatch the volumetric composite (full-res).
     pub fn dispatch_composite(&self, encoder: &mut wgpu::CommandEncoder) {
         let bg = match &self.composite_bind_group { Some(bg) => bg, None => return };
@@ -344,9 +565,12 @@ impl RkpVolumetricPass {
         self.half_height = hh;
         self.width = width;
         self.height = height;
-        let (st, sv) = Self::create_texture(device, "vol scatter", hw, hh, wgpu::TextureFormat::Rgba16Float);
+        let (st, sv) = Self::create_scatter_texture(device, "vol scatter", hw, hh);
         self.scatter_texture = st;
         self.scatter_view = sv;
+        let (ht, hv) = Self::create_history_texture(device, "vol scatter history", hw, hh);
+        self.history_texture = ht;
+        self.history_view = hv;
         let (ot, ov) = Self::create_texture(device, "vol output", width, height, wgpu::TextureFormat::Rgba16Float);
         self.output_texture = ot;
         self.output_view = ov;
@@ -368,6 +592,48 @@ impl RkpVolumetricPass {
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        (tex, view)
+    }
+
+    fn create_scatter_texture(
+        device: &wgpu::Device,
+        label: &str,
+        w: u32,
+        h: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        (tex, view)
+    }
+
+    fn create_history_texture(
+        device: &wgpu::Device,
+        label: &str,
+        w: u32,
+        h: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());

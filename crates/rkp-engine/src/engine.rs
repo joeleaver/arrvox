@@ -346,6 +346,15 @@ struct EngineState {
     // Frame counter
     frame_index: u64,
 
+    // Previous frame's view-projection matrix, used for temporal reprojection
+    // (e.g. the volumetric cloud pass). Identity on the first frame.
+    prev_view_proj: [[f32; 4]; 4],
+
+    // Temporally smoothed cloud-sun attenuation (camera→sun ray through the
+    // cloud layer). Lerps toward the target each frame so a single noisy ray
+    // through FBM doesn't flicker sun intensity.
+    cloud_sun_atten: f32,
+
     // Render dimensions
     width: u32,
     height: u32,
@@ -557,6 +566,8 @@ impl EngineState {
             scene_dirty: false,
             gpu_objects_dirty: true,
             frame_index: 0,
+            prev_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            cloud_sun_atten: 1.0,
             width,
             height,
             readback_buffers,
@@ -603,7 +614,21 @@ impl EngineState {
         // 0b. Upload environment + lights.
         // Always rebuild lights array (entity lights may have moved).
         {
-            let mut gpu_lights = vec![self.environment.to_gpu_light()]; // [0] = sun
+            // Cloud → sun attenuation comes from a GPU readback of the dedicated
+            // compute pass. `sun_atten_value()` is the last-received exp(-τ); it
+            // lags 1–2 frames but the temporal lerp hides that.
+            let target_atten = if self.environment.attenuate_sun_by_clouds && self.environment.clouds_enabled {
+                self.renderer.volumetric.sun_atten_value()
+            } else {
+                1.0
+            };
+            self.cloud_sun_atten = self.cloud_sun_atten + (target_atten - self.cloud_sun_atten) * 0.1;
+
+            let mut sun_light = self.environment.to_gpu_light();
+            sun_light.color[0] *= self.cloud_sun_atten;
+            sun_light.color[1] *= self.cloud_sun_atten;
+            sun_light.color[2] *= self.cloud_sun_atten;
+            let mut gpu_lights = vec![sun_light]; // [0] = sun
 
             // Collect point lights from entities.
             for (_entity, (transform, pl)) in self.world.query::<(&crate::components::Transform, &crate::components::PointLight)>().iter() {
@@ -901,6 +926,11 @@ impl EngineState {
         // 8. Submit GPU work.
         self.queue.submit(std::iter::once(encoder.finish()));
 
+        // Kick off the cloud→sun atten readback, then drive a non-blocking poll
+        // so previously-issued map_async callbacks can fire.
+        self.renderer.volumetric.issue_sun_atten_map();
+        let _ = self.device.poll(wgpu::PollType::Poll);
+
         let t_submit = frame_start.elapsed();
 
         // 9. Process pick readback if we just issued one.
@@ -942,6 +972,9 @@ impl EngineState {
                 t_frame_end.as_secs_f64() * 1000.0,
             );
         }
+
+        // Remember this frame's view-projection so next frame can reproject into it.
+        self.prev_view_proj = cam_uniforms.view_proj;
 
         self.frame_index += 1;
 
@@ -1012,7 +1045,7 @@ impl EngineState {
             up: [up.x * half_fov_tan, up.y * half_fov_tan, up.z * half_fov_tan, 0.0],
             resolution: [self.width as f32, self.height as f32],
             jitter: [0.0, 0.0],
-            prev_vp: view_proj.to_cols_array_2d(),
+            prev_vp: self.prev_view_proj,
             view_proj: view_proj.to_cols_array_2d(),
         }
     }
@@ -1898,6 +1931,9 @@ impl EngineState {
                     "clouds_enabled" => {
                         env.clouds_enabled = value == "true" || value == "1";
                     }
+                    "attenuate_sun_by_clouds" => {
+                        env.attenuate_sun_by_clouds = value == "true" || value == "1";
+                    }
                     "cloud_altitude_min" => {
                         if let Ok(v) = value.parse::<f32>() { env.cloud_altitude_min = v; }
                     }
@@ -1919,7 +1955,9 @@ impl EngineState {
                     _ => { eprintln!("[RkpEngine] unknown environment field: {field}"); }
                 }
                 self.environment_dirty = true;
-                self.environment_ui_dirty = true;
+                // Deliberately do NOT set environment_ui_dirty: the UI already holds
+                // the authoritative value (it just sent it). Echoing back would cause
+                // the form to remount mid-drag on every slider tick.
             }
 
             EngineCommand::SetGizmoMode { mode } => {

@@ -10,12 +10,34 @@ use super::prop_controls::*;
 
 type CmdSignal = Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>;
 
+/// Outer wrapper — remounts the inner form whenever the engine pushes an updated
+/// EnvironmentSettings (scene load, startup). The `.get()` must happen inside the
+/// rsx! body so the render subscribes to the signal; calling it at the top of the
+/// function body is a one-shot read that never reacts to later updates.
 #[component]
 pub fn EnvironmentPanel() -> NodeHandle {
     let store = use_context::<EditorStore>();
-    let cmd_tx: CmdSignal = Signal::new(use_context::<CommandSender>().0);
+    rsx! {
+        for e in [store.environment.get()] {
+            EnvironmentForm {
+                key: format!(
+                    "{}-{}-{}-{}-{}-{}",
+                    e.clouds_enabled,
+                    e.sun_azimuth.to_bits(),
+                    e.sun_elevation.to_bits(),
+                    e.cloud_coverage.to_bits(),
+                    e.cloud_density_scale.to_bits(),
+                    e.ambient_intensity.to_bits(),
+                ),
+                env: e.clone(),
+            }
+        }
+    }
+}
 
-    let env = store.environment.get();
+#[component]
+fn EnvironmentForm(env: rkp_engine::environment::EnvironmentSettings) -> NodeHandle {
+    let cmd_tx: CmdSignal = Signal::new(use_context::<CommandSender>().0);
 
     let ambient = Signal::new(env.ambient_intensity);
     let camera_altitude = Signal::new(env.camera_altitude);
@@ -64,6 +86,7 @@ pub fn EnvironmentPanel() -> NodeHandle {
     let vol_far = Signal::new(env.vol_far);
 
     let clouds_enabled = Signal::new(env.clouds_enabled);
+    let attenuate_sun_by_clouds = Signal::new(env.attenuate_sun_by_clouds);
     let cloud_altitude_min = Signal::new(env.cloud_altitude_min);
     let cloud_altitude_max = Signal::new(env.cloud_altitude_max);
     let cloud_coverage = Signal::new(env.cloud_coverage);
@@ -253,10 +276,11 @@ pub fn EnvironmentPanel() -> NodeHandle {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
                     {prop_checkbox(__scope, "Enabled", clouds_enabled, env_bool("clouds_enabled"))}
+                    {prop_checkbox(__scope, "Attenuate Sun Intensity", attenuate_sun_by_clouds, env_bool("attenuate_sun_by_clouds"))}
                     {prop_slider(__scope, "Min Altitude", cloud_altitude_min, 0.0, 5000.0, 50.0, env_f32("cloud_altitude_min"))}
                     {prop_slider(__scope, "Max Altitude", cloud_altitude_max, 0.0, 10000.0, 100.0, env_f32("cloud_altitude_max"))}
                     {prop_slider(__scope, "Coverage", cloud_coverage, 0.0, 1.0, 0.01, env_f32("cloud_coverage"))}
-                    {prop_slider(__scope, "Density", cloud_density_scale, 0.0, 5.0, 0.1, env_f32("cloud_density_scale"))}
+                    {prop_slider(__scope, "Density", cloud_density_scale, 0.0, 1.0, 0.01, env_f32("cloud_density_scale"))}
                     {prop_slider(__scope, "Wind Speed", cloud_wind_speed, 0.0, 20.0, 0.5, env_f32("cloud_wind_speed"))}
                     {prop_slider(__scope, "Wind Dir", cloud_wind_dir, 0.0, 360.0, 1.0, env_f32("cloud_wind_dir"))}
                 }

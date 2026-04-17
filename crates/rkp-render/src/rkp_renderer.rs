@@ -264,6 +264,8 @@ impl RkpRenderer {
         {
             let q = self.profiler.begin_query("vol", encoder);
             self.volumetric.dispatch_march(encoder);
+            self.volumetric.copy_scatter_to_history(encoder);
+            self.volumetric.dispatch_sun_atten(encoder);
             self.volumetric.dispatch_composite(encoder);
             self.profiler.end_query(encoder, q);
         }

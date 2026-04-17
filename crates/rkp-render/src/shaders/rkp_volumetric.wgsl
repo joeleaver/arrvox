@@ -30,6 +30,7 @@ struct VolumetricParams {
     vol_ambient_r: f32,
     vol_ambient_g: f32,
     vol_ambient_b: f32,
+    prev_view_proj: mat4x4<f32>,
 }
 
 struct CloudParams {
@@ -45,6 +46,8 @@ struct CloudParams {
 @group(0) @binding(1) var depth_buffer: texture_2d<f32>;
 @group(0) @binding(2) var output_scatter: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(3) var<uniform> cloud_params: CloudParams;
+@group(0) @binding(4) var history_scatter: texture_2d<f32>;
+@group(0) @binding(5) var history_samp: sampler;
 
 // --- Helpers ---
 
@@ -115,9 +118,29 @@ fn fbm_3d(p: vec3<f32>, octaves: u32) -> f32 {
     return sum;
 }
 
+// FBM with footprint-aware octave LOD. Octaves whose wavelength falls below the
+// sampling footprint are smoothly faded out — prefiltering kills the binary
+// edge aliasing that appears when step size exceeds noise detail scale.
+fn fbm_3d_lod(p: vec3<f32>, max_octaves: u32, base_freq: f32, footprint: f32) -> f32 {
+    var sum = 0.0;
+    var amp = 0.5;
+    var pos = p;
+    for (var i = 0u; i < max_octaves; i++) {
+        let freq = base_freq * pow(2.0, f32(i));
+        let wavelength = 1.0 / max(freq, 1e-8);
+        // Wider fade (0.25×–2×) so octave transitions don't show up as visible
+        // bands at the distances where a given wavelength crosses Nyquist.
+        let lod = 1.0 - smoothstep(0.25 * wavelength, 2.0 * wavelength, footprint);
+        sum += amp * value_noise_3d(pos) * lod;
+        amp *= 0.5;
+        pos *= 2.0;
+    }
+    return sum;
+}
+
 // --- Cloud density ---
 
-fn cloud_density(pos: vec3<f32>) -> f32 {
+fn cloud_density(pos: vec3<f32>, footprint: f32) -> f32 {
     if cloud_params.flags.x < 0.5 { return 0.0; }
 
     let cloud_min = cloud_params.altitude.x;
@@ -140,28 +163,94 @@ fn cloud_density(pos: vec3<f32>) -> f32 {
     let noise_pos = vec3<f32>(pos.x + wind_offset.x, pos.y, pos.z + wind_offset.y)
                   + vec3<f32>(173.5, 247.3, 391.7);
 
-    // Shape FBM (4 octaves).
-    let shape = fbm_3d(noise_pos * cloud_params.noise.x, 4u);
+    // Shape FBM (4 octaves) — fades high octaves once footprint exceeds their wavelength.
+    let shape_freq = cloud_params.noise.x;
+    let shape = fbm_3d_lod(noise_pos * shape_freq, 4u, shape_freq, footprint);
 
     // Weather modulation (2 octaves, coarse scale).
     // At high coverage, blend toward 1.0 to suppress large-scale gaps.
-    let raw_weather = fbm_3d(noise_pos * (1.0 / max(cloud_params.noise.w, 1.0)), 2u);
+    let weather_freq = 1.0 / max(cloud_params.noise.w, 1.0);
+    let raw_weather = fbm_3d_lod(noise_pos * weather_freq, 2u, weather_freq, footprint);
     let coverage = cloud_params.flags.y;
     let weather = mix(raw_weather, 1.0, coverage * coverage);
 
     var base = shape * weather * height_grad;
     base = max(base - threshold, 0.0);
 
-    // Detail erosion (3 octaves).
-    let detail = fbm_3d(noise_pos * cloud_params.noise.y, 3u);
+    // Detail erosion (4 octaves for finer wispy features; the extra octave
+    // fades naturally at distance via the LOD term).
+    let detail_freq = cloud_params.noise.y;
+    let detail = fbm_3d_lod(noise_pos * detail_freq, 4u, detail_freq, footprint);
     base = max(base - detail * cloud_params.noise.z, 0.0);
 
     return base * density_scale;
 }
 
+// --- Cloud phase + scatter constants ---
+const CLOUD_G_FORWARD: f32 = 0.6;
+const CLOUD_G_BACK: f32 = -0.2;
+const CLOUD_FORWARD_WEIGHT: f32 = 0.3;
+const CLOUD_ALBEDO: vec3<f32> = vec3<f32>(1.0);
+
+// Multi-scatter octave parameters (Wrenninge / Hillaire). Each successive octave
+// attenuates extinction (b), phase anisotropy (c), and overall contribution (a).
+const CLOUD_MS_OCTAVES: u32 = 3u;
+const CLOUD_MS_ATTEN: f32 = 0.4;        // b — how much less sunlight is attenuated
+const CLOUD_MS_CONTRIB: f32 = 0.3;      // a — weight of each successive octave (lower = deeper shadows, more visible cloud form)
+const CLOUD_MS_PHASE_ATTEN: f32 = 0.5;  // c — pushes phase toward isotropic
+
+// Atmospheric extinction along a camera→cloud path, used to blend distant cloud
+// scatter toward sky color (aerial perspective). Without this, horizon clouds
+// look too dark because single-scatter never gets the atmospheric wash-out.
+const CLOUD_AP_SIGMA: f32 = 1.0e-4;
+
+fn cloud_phase_at(cos_sun: f32, phase_g_scale: f32) -> f32 {
+    return mix(
+        henyey_greenstein(cos_sun, CLOUD_G_BACK * phase_g_scale),
+        henyey_greenstein(cos_sun, CLOUD_G_FORWARD * phase_g_scale),
+        CLOUD_FORWARD_WEIGHT,
+    );
+}
+
+// --- Cloud self-shadow ---
+// 4 exponentially-spaced samples toward the sun (40 m → 320 m range, ~600 m total).
+// Reduced from 5 — TAA smooths the residual noise, and the last 480 m step was
+// sampling at such a coarse LOD that the detail FBM was already faded out.
+fn cloud_sun_optical_depth(pos: vec3<f32>, jitter: f32) -> f32 {
+    let num_steps = 4u;
+    let base_step = 40.0;
+    var tau = 0.0;
+    var p = pos + params.sun_dir.xyz * (jitter * base_step);
+    var step = base_step;
+    for (var i = 0u; i < num_steps; i++) {
+        let d = cloud_density(p, step);
+        tau += d * step;
+        p += params.sun_dir.xyz * step;
+        step *= 2.0;
+    }
+    return tau;
+}
+
+// Multi-scatter approximation: sum several (phase, Beer) octaves with progressively
+// attenuated extinction and anisotropy. First octave is direct single-scatter
+// (bright edge), later octaves brighten the core where Beer saturates to zero.
+fn cloud_sun_inscatter(tau_sun: f32, cos_sun: f32, sun_col: vec3<f32>) -> vec3<f32> {
+    var sum = vec3<f32>(0.0);
+    var a = 1.0;
+    var b = 1.0;
+    var c = 1.0;
+    for (var n = 0u; n < CLOUD_MS_OCTAVES; n++) {
+        sum += a * cloud_phase_at(cos_sun, c) * exp(-tau_sun * b) * sun_col;
+        a *= CLOUD_MS_CONTRIB;
+        b *= CLOUD_MS_ATTEN;
+        c *= CLOUD_MS_PHASE_ATTEN;
+    }
+    return sum;
+}
+
 // --- Combined density ---
 
-fn sample_density(pos: vec3<f32>, t: f32) -> vec2<f32> {
+fn sample_density(pos: vec3<f32>, t: f32, footprint: f32) -> vec2<f32> {
     var fog = params.fog_distance.z; // ambient dust
     if params.fog_color.w > 0.5 {
         fog += height_fog_density(pos);
@@ -169,7 +258,7 @@ fn sample_density(pos: vec3<f32>, t: f32) -> vec2<f32> {
     if params.fog_height.w > 0.5 {
         fog += distance_fog_density(t);
     }
-    let cloud = cloud_density(pos);
+    let cloud = cloud_density(pos, footprint);
     return vec2<f32>(fog, cloud);
 }
 
@@ -198,11 +287,6 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let scatter_albedo = params.fog_color.xyz;
     let sky_ambient = vec3<f32>(params.vol_ambient_r, params.vol_ambient_g, params.vol_ambient_b);
 
-    let cloud_g_forward = 0.6;
-    let cloud_g_back = -0.2;
-    let cloud_forward_weight = 0.3;
-    let cloud_albedo = vec3<f32>(1.0);
-
     var scatter = vec3<f32>(0.0);
     var transmittance = 1.0;
 
@@ -214,13 +298,11 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let pos = params.cam_pos.xyz + ray_dir * t;
         // Fade out fog near the camera to avoid visible density boundary.
         let near_fade = smoothstep(0.0, 20.0, t);
-        let densities = sample_density(pos, t);
+        let densities = sample_density(pos, t, params.step_size);
         let fog_dens = densities.x * near_fade;
         let cloud_dens = densities.y;
         let total = fog_dens + cloud_dens;
         if total <= 0.001 { continue; }
-
-        let step_trans = exp(-total * params.step_size);
 
         let sun_vis = 1.0;
 
@@ -229,18 +311,22 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     * params.sun_color.xyz * scatter_albedo;
         let fog_sky = fog_dens * sky_ambient * scatter_albedo;
 
-        // Cloud in-scattering.
-        let cloud_phase = mix(
-            henyey_greenstein(cos_sun, cloud_g_back),
-            henyey_greenstein(cos_sun, cloud_g_forward),
-            cloud_forward_weight,
-        );
-        let cloud_sun = cloud_dens * sun_vis * cloud_phase * params.sun_color.xyz * cloud_albedo;
-        let cloud_sky = cloud_dens * sky_ambient * cloud_albedo;
+        // Cloud in-scattering — self-shadow + multi-scatter octaves when cloud is present.
+        var cloud_sun_L = vec3<f32>(0.0);
+        if cloud_dens > 0.001 {
+            let tau_sun = cloud_sun_optical_depth(pos, jitter);
+            cloud_sun_L = cloud_sun_inscatter(tau_sun, cos_sun, params.sun_color.xyz) * CLOUD_ALBEDO;
+        }
+        let cloud_sun = cloud_dens * cloud_sun_L;
+        let cloud_sky = cloud_dens * sky_ambient * CLOUD_ALBEDO;
 
-        scatter += (fog_sun + fog_sky + cloud_sun + cloud_sky) * transmittance * params.step_size;
-        transmittance *= step_trans;
-        if transmittance < 0.01 { break; }
+        // Analytic per-step integration assuming constant density over the step:
+        // ∫₀^dt σ_s·L·exp(-σ_t·s) ds = (σ_s·L / σ_t)·(1-exp(-σ_t·dt)).
+        // σ_s terms (fog_*, cloud_*) already carry their densities, so factor out 1/total.
+        let absorbed = 1.0 - exp(-total * params.step_size);
+        scatter += (fog_sun + fog_sky + cloud_sun + cloud_sky) * transmittance * (absorbed / total);
+        transmittance *= 1.0 - absorbed;
+        if transmittance < 0.03 { break; }
     }
 
     // High-altitude cloud march (ray-slab intersection).
@@ -278,9 +364,17 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // Quadratic step distribution: dense sampling near the camera,
             // progressively coarser toward the horizon. This keeps detail for
             // close clouds while letting the march reach tens of kilometers.
-            let cloud_steps = 64u;
-            let cloud_jitter = interleaved_gradient_noise(vec2<f32>(gid.xy), 0u);
+            let cloud_steps = 32u;
+            // Per-frame jitter — combined with temporal reprojection this averages out
+            // as dither rather than locking a static noise pattern into screen space.
+            let cloud_jitter = interleaved_gradient_noise(vec2<f32>(gid.xy), params.frame_index);
             let slab_len = slab_far - slab_near;
+
+            // Atmospheric in-scatter radiance along the view ray — the color distant
+            // clouds blend toward. Sky shader handles empty-sky aerial perspective
+            // on its own, so we only apply this to cloud samples (not empty steps).
+            let atm_L = henyey_greenstein(cos_sun, dust_g) * params.sun_color.xyz * scatter_albedo
+                      + sky_ambient * scatter_albedo;
 
             for (var i = 0u; i < cloud_steps; i++) {
                 let u_a = f32(i) / f32(cloud_steps);
@@ -290,24 +384,50 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let cloud_step_size = t_b - t_a;
                 let t = mix(t_a, t_b, cloud_jitter);
                 let pos = params.cam_pos.xyz + ray_dir * t;
-                let cd = cloud_density(pos);
+                let cd = cloud_density(pos, cloud_step_size);
                 if cd <= 0.001 { continue; }
 
-                let step_trans = exp(-cd * cloud_step_size);
-                let cloud_phase = mix(
-                    henyey_greenstein(cos_sun, cloud_g_back),
-                    henyey_greenstein(cos_sun, cloud_g_forward),
-                    cloud_forward_weight,
-                );
-                let cloud_sun = cd * cloud_phase * params.sun_color.xyz * cloud_albedo;
-                let cloud_sky = cd * sky_ambient * cloud_albedo;
+                let tau_sun = cloud_sun_optical_depth(pos, cloud_jitter);
+                let sun_L = cloud_sun_inscatter(tau_sun, cos_sun, params.sun_color.xyz) * CLOUD_ALBEDO;
+                let cloud_L = sun_L + sky_ambient * CLOUD_ALBEDO;
 
-                scatter += (cloud_sun + cloud_sky) * transmittance * cloud_step_size;
-                transmittance *= step_trans;
-                if transmittance < 0.01 { break; }
+                // Aerial perspective per cloud sample: the intrinsic cloud radiance
+                // reaches the camera attenuated by exp(-σ_air·t), with the missing
+                // fraction replaced by atmospheric in-scatter along that same path.
+                let ap_T = exp(-CLOUD_AP_SIGMA * t);
+                let displayed_L = cloud_L * ap_T + atm_L * (1.0 - ap_T);
+
+                // Analytic per-step integration (albedo=1: σ_s = σ_t = cd, so cd cancels).
+                let absorbed = 1.0 - exp(-cd * cloud_step_size);
+                scatter += displayed_L * absorbed * transmittance;
+                transmittance *= 1.0 - absorbed;
+                if transmittance < 0.03 { break; }
             }
         }
     }
 
-    textureStore(output_scatter, coord, vec4<f32>(scatter, transmittance));
+    // --- Temporal reprojection ---
+    // Rotation-only reprojection: multiply the world-space ray direction by prev_vp
+    // with w=0. This ignores camera translation entirely (valid for distant sky/cloud
+    // content) and captures camera rotation exactly, which is the main source of
+    // between-frame pixel-to-pixel variation for a sky pass.
+    var final_scatter = scatter;
+    var final_trans = transmittance;
+
+    let prev_clip = params.prev_view_proj * vec4<f32>(ray_dir, 0.0);
+    if prev_clip.w > 0.0 && params.frame_index > 0u {
+        let prev_ndc = prev_clip.xyz / prev_clip.w;
+        let prev_uv = prev_ndc.xy * vec2<f32>(0.5, -0.5) + 0.5;
+        if all(prev_uv >= vec2<f32>(0.0)) && all(prev_uv <= vec2<f32>(1.0)) {
+            let hist = textureSampleLevel(history_scatter, history_samp, prev_uv, 0.0);
+            // Balance between detail (high alpha) and flicker (low alpha). 0.25
+            // keeps visible cloud structure while damping high-freq sample jitter
+            // that the 4th detail octave can produce at high density.
+            let alpha = 0.25;
+            final_scatter = mix(hist.rgb, scatter, alpha);
+            final_trans = mix(hist.a, transmittance, alpha);
+        }
+    }
+
+    textureStore(output_scatter, coord, vec4<f32>(final_scatter, final_trans));
 }

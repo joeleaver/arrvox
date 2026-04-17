@@ -76,6 +76,10 @@ pub struct EnvironmentSettings {
     pub cloud_weather_scale: f32,
     pub cloud_wind_speed: f32,
     pub cloud_wind_dir: f32,
+    /// When true, ray-march camera→sun through the cloud layer and attenuate
+    /// direct sun contribution by the resulting optical depth. Cheap proxy for
+    /// "clouds dim the world" without real cloud shadow maps.
+    pub attenuate_sun_by_clouds: bool,
 }
 
 impl Default for EnvironmentSettings {
@@ -123,13 +127,15 @@ impl Default for EnvironmentSettings {
             cloud_density_scale: 1.0,
             cloud_shape_freq: 0.0003,
             cloud_detail_freq: 0.002,
-            cloud_detail_weight: 0.3,
+            cloud_detail_weight: 0.5,
             cloud_weather_scale: 10000.0,
             cloud_wind_speed: 5.0,
             cloud_wind_dir: 0.0,
+            attenuate_sun_by_clouds: true,
         }
     }
 }
+
 
 // --- CPU-side atmospheric scattering (mirrors the GPU shader) ---
 
@@ -379,6 +385,7 @@ impl EnvironmentSettings {
                 let a = atmo::ambient(sun_toward, self.sun_intensity, self.camera_altitude);
                 a[2] * self.ambient_intensity
             },
+            prev_view_proj: cam.prev_vp,
         }
     }
 
@@ -388,17 +395,21 @@ impl EnvironmentSettings {
         rkp_render::rkp_volumetric::CloudParams {
             altitude: [
                 self.cloud_altitude_min, self.cloud_altitude_max,
-                // Convert coverage (0=clear, 1=overcast) to threshold.
-                // At coverage=0: threshold=0.3 (clips most noise = clear).
-                // At coverage=1: threshold=-0.05 (adds to base = full overcast).
-                0.3 - 0.35 * self.cloud_coverage,
+                // Convert coverage (0=clear, 1=overcast) to threshold. At coverage=0
+                // the threshold sits above the typical peak of shape·weather·height_grad
+                // so the sky genuinely clears; at coverage=1 it drops below so every
+                // sample contributes.
+                0.7 - 0.85 * self.cloud_coverage,
                 self.cloud_density_scale,
             ],
             noise: [
                 self.cloud_shape_freq, self.cloud_detail_freq,
                 self.cloud_detail_weight, self.cloud_weather_scale,
             ],
-            wind: [wind_rad.sin(), wind_rad.cos(), self.cloud_wind_speed, time],
+            // Wind speed slider is in m/s, but the shape-noise wavelength is kilometres
+            // so raw m/s produces imperceptible motion. Scale so a slider value of 1
+            // looks like a gentle breeze over a minute of observation.
+            wind: [wind_rad.sin(), wind_rad.cos(), self.cloud_wind_speed * 20.0, time],
             flags: [
                 if self.clouds_enabled { 1.0 } else { 0.0 },
                 self.cloud_coverage, // passed to shader to suppress weather variation at high coverage
