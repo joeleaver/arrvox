@@ -1,36 +1,29 @@
 //! FBX skeleton + skinning + animation extraction (ufbx).
 //!
-//! Rewritten from `rkf-import::skeleton_extract` with hardened
-//! validation on the per-vertex skin-weight path — the single biggest
-//! source of "FBX bone weights are broken" bug reports.
+//! ## Multi-skin handling
 //!
-//! ## What changed vs. the original
+//! An FBX scene can have more than one skin deformer — for example,
+//! Mixamo characters ship a visible `Beta_Surface` mesh plus a hidden
+//! `Beta_Joints` joint-visualisation mesh, each with its own
+//! `ufbx::SkinDeformer`. The two skins often share most bones but
+//! differ by a cluster or two (Mixamo's joint mesh adds
+//! `HeadTop_End`), which shifts every cluster index from that point on.
 //!
-//! 1. **Vertex-index bounds check before the lookup**, not after — a
-//!    bogus vertex index now reports an error through the event
-//!    stream instead of silently returning zero weights.
-//! 2. **Cluster-index bounds check against the bone count.** ufbx
-//!    occasionally emits malformed `cluster_index` values on files
-//!    with broken skin deformers. Out-of-range entries are dropped
-//!    with a warning — never forwarded as a negative-cast-to-i32 that
-//!    would crash the shader on upload.
-//! 3. **Single-pass top-4 selection.** The original code picked the
-//!    first 4 weights, then — if `num_weights > 4` — re-fetched the
-//!    entire list and re-sorted. That worked but was wasteful and
-//!    subtly inconsistent (ufbx doesn't guarantee weight ordering).
-//!    The rewrite always takes the top 4 by magnitude, once.
-//! 4. **NaN-safe weight comparison.** Sort uses a
-//!    `total_cmp`-equivalent ordering so NaN weights can't scramble
-//!    the top-4 pick; suspicious weights generate warnings.
-//! 5. **Explicit per-corner alignment.** The per-corner emission
-//!    order is encapsulated in [`CornerIter`] so the iteration rule
-//!    is written down in one place; if [`crate::mesh::fbx`] ever
-//!    changes it, the two modules break together instead of silently
-//!    producing skeleton data that doesn't match the mesh.
+//! The extractor therefore treats cluster indices as *per-skin* and
+//! translates them to a *unified* bone index via the cluster's
+//! `bone_node.typed_id`. Using positional cluster indices as bone
+//! indices — the original implementation — silently mis-skinned
+//! everything past the first divergent cluster (the visible symptom
+//! was "upper leg follows lower leg bone" because a Mixamo
+//! `RightUpLeg` cluster index in the joint mesh resolved to
+//! `RightLeg` in the surface-mesh bone table).
 //!
-//! Warnings are emitted via `eprintln!` for now; task #10 threads
-//! them through [`crate::event::ProgressReporter`] so the editor can
-//! surface them.
+//! Bones that only appear in later skins are appended to the unified
+//! table so their weights still have a home. `inverse_bind` for each
+//! bone comes from the first cluster we see targeting that bone —
+//! this is fine as long as every mesh shares the same post-
+//! `ModifyGeometry` space, which is true for Mixamo and any rig whose
+//! meshes sit under a common armature with identity locals.
 
 use std::collections::HashMap;
 
@@ -48,28 +41,36 @@ pub fn extract(path: &str) -> Result<Option<SkeletonExtraction>, String> {
     let scene = ufbx::load_file(path, fbx_load_opts())
         .map_err(|e| format!("Failed to load FBX '{path}': {}", e.description))?;
 
-    let Some(skin) = scene.skin_deformers.iter().next() else {
-        return Ok(None);
-    };
-    if skin.clusters.is_empty() {
+    if scene.skin_deformers.is_empty() {
         return Ok(None);
     }
 
-    // Bone table: cluster → bone. `cluster.bone_node` is the joint the
-    // cluster targets. Clusters with no bone are silently skipped — a
-    // legitimate FBX corner case where the skin deformer references a
-    // missing node. A parallel `bone_nodes` array preserves index
-    // alignment with `skin.clusters` for the bind-transform pass.
+    // Unified bone table across all skin deformers. We add each unique
+    // `bone_node.typed_id` once, in the order first seen — this makes
+    // the first (usually visible) mesh's skin define the canonical bone
+    // ordering, with any extras from later skins appended.
     let mut node_to_bone: HashMap<u32, usize> = HashMap::new();
-    let mut bone_nodes: Vec<&ufbx::Node> = Vec::with_capacity(skin.clusters.len());
-    for cluster in skin.clusters.iter() {
-        if let Some(ref bone_node) = cluster.bone_node {
-            node_to_bone.insert(bone_node.element.typed_id, bone_nodes.len());
+    let mut bone_nodes: Vec<&ufbx::Node> = Vec::new();
+    // `inverse_bind` per bone — populated from the first cluster we see
+    // targeting that bone. Same bone across skins should have the same
+    // `geometry_to_bone` under ModifyGeometry for meshes sharing a common
+    // space; if they ever diverge, a per-mesh fix-up would be needed,
+    // but that's not the case for Mixamo or any standard armature rig.
+    let mut inverse_binds: Vec<Mat4> = Vec::new();
+
+    for skin in scene.skin_deformers.iter() {
+        for cluster in skin.clusters.iter() {
+            let Some(ref bone_node) = cluster.bone_node else {
+                eprintln!("[rkp-import] warn: FBX skin cluster has no bone node, skipping");
+                continue;
+            };
+            let id = bone_node.element.typed_id;
+            if node_to_bone.contains_key(&id) {
+                continue;
+            }
+            node_to_bone.insert(id, bone_nodes.len());
             bone_nodes.push(bone_node);
-        } else {
-            eprintln!(
-                "[rkp-import] warn: FBX skin cluster has no bone node, skipping"
-            );
+            inverse_binds.push(ufbx_matrix_to_mat4(&cluster.geometry_to_bone));
         }
     }
     if bone_nodes.is_empty() {
@@ -80,13 +81,7 @@ pub fn extract(path: &str) -> Result<Option<SkeletonExtraction>, String> {
     let mut bones = Vec::with_capacity(bone_count);
     let mut hierarchy = Vec::with_capacity(bone_count);
 
-    for (bone_idx, cluster) in skin
-        .clusters
-        .iter()
-        .filter(|c| c.bone_node.is_some())
-        .enumerate()
-    {
-        let bone_node = bone_nodes[bone_idx];
+    for (bone_idx, bone_node) in bone_nodes.iter().enumerate() {
         let lt = &bone_node.local_transform;
         let bind_transform = Mat4::from_scale_rotation_translation(
             Vec3::new(lt.scale.x as f32, lt.scale.y as f32, lt.scale.z as f32),
@@ -102,12 +97,11 @@ pub fn extract(path: &str) -> Result<Option<SkeletonExtraction>, String> {
                 lt.translation.z as f32,
             ),
         );
-        let inverse_bind = ufbx_matrix_to_mat4(&cluster.geometry_to_bone);
 
         bones.push(Bone {
             name: bone_node.element.name.to_string(),
             bind_transform,
-            inverse_bind,
+            inverse_bind: inverse_binds[bone_idx],
         });
 
         hierarchy.push(find_parent_bone(bone_node, &node_to_bone));
@@ -116,7 +110,7 @@ pub fn extract(path: &str) -> Result<Option<SkeletonExtraction>, String> {
     let skeleton = Skeleton::new(bones, hierarchy)
         .map_err(|e| format!("Failed to construct skeleton from FBX joints: {e}"))?;
 
-    let skinning = extract_skinning(&scene, bone_count);
+    let skinning = extract_skinning(&scene, &node_to_bone, bone_count);
     let clips = extract_animations(&scene, &node_to_bone);
 
     Ok(Some(SkeletonExtraction { skeleton, skinning, clips }))
@@ -148,7 +142,17 @@ fn find_parent_bone(node: &ufbx::Node, node_to_bone: &HashMap<u32, usize>) -> i3
 /// and emits one skin-weight record per triangle corner. Uses
 /// [`CornerIter`] to encapsulate the iteration so the two paths
 /// stay in lock-step.
-fn extract_skinning(scene: &ufbx::Scene, bone_count: usize) -> VertexSkinning {
+///
+/// For each mesh we build a local `cluster_to_bone` table that maps
+/// *this mesh's skin*'s cluster indices into the unified bone table
+/// shared across all skins. That table is the whole reason the FBX
+/// path survives files with more than one skin deformer whose cluster
+/// orderings disagree (see module-level docs).
+fn extract_skinning(
+    scene: &ufbx::Scene,
+    node_to_bone: &HashMap<u32, usize>,
+    bone_count: usize,
+) -> VertexSkinning {
     let max_face_tris = scene
         .meshes
         .iter()
@@ -162,10 +166,24 @@ fn extract_skinning(scene: &ufbx::Scene, bone_count: usize) -> VertexSkinning {
 
     for mesh in &scene.meshes {
         let mesh_skin = mesh.skin_deformers.iter().next();
+        let cluster_to_bone: Vec<i32> = mesh_skin
+            .map(|s| {
+                s.clusters
+                    .iter()
+                    .map(|c| {
+                        c.bone_node
+                            .as_ref()
+                            .and_then(|n| node_to_bone.get(&n.element.typed_id).copied())
+                            .map(|i| i as i32)
+                            .unwrap_or(-1)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         for corner in CornerIter::new(mesh, &mut tri_indices) {
             let (j, w) = if let Some(skin) = mesh_skin {
-                get_vertex_skin_weights(skin, corner.vertex_idx, bone_count, mesh)
+                get_vertex_skin_weights(skin, corner.vertex_idx, &cluster_to_bone, bone_count, mesh)
             } else {
                 ([-1; 4], [0.0; 4])
             };
@@ -180,11 +198,16 @@ fn extract_skinning(scene: &ufbx::Scene, bone_count: usize) -> VertexSkinning {
 /// Top-4 skin weights for a vertex, with validation.
 ///
 /// Returns zeros on invalid input *and* emits a warning — never
-/// silent. Out-of-range cluster indices are treated as "no influence"
-/// for that slot (dropped from the top-4, not forwarded as garbage).
+/// silent. `cluster_to_bone[cluster_index]` resolves each cluster in
+/// *this skin* to the unified bone index; a `-1` entry means the
+/// cluster has no bone_node (malformed skin) and the influence is
+/// dropped. Cluster indices past the map's length are treated the same
+/// way — ufbx occasionally emits garbage cluster_index values on
+/// broken files.
 fn get_vertex_skin_weights(
     skin: &ufbx::SkinDeformer,
     vertex_idx: usize,
+    cluster_to_bone: &[i32],
     bone_count: usize,
     mesh: &ufbx::Mesh,
 ) -> ([i32; 4], [f32; 4]) {
@@ -208,8 +231,8 @@ fn get_vertex_skin_weights(
         return ([-1; 4], [0.0; 4]);
     }
 
-    // Single pass: collect validated influences (cluster in range,
-    // finite weight), then sort by magnitude and take the top 4.
+    // Single pass: collect validated influences (cluster resolves to a
+    // real bone, finite weight), then sort by magnitude and take top 4.
     let mut all: Vec<(i32, f32)> = Vec::with_capacity(n);
     let mut dropped_clusters = 0u32;
     let mut nan_weights = 0u32;
@@ -221,18 +244,19 @@ fn get_vertex_skin_weights(
             nan_weights += 1;
             continue;
         }
-        if cluster >= bone_count {
+        let bone = cluster_to_bone.get(cluster).copied().unwrap_or(-1);
+        if bone < 0 || (bone as usize) >= bone_count {
             dropped_clusters += 1;
             continue;
         }
         if w <= 0.0 {
             continue;
         }
-        all.push((cluster as i32, w));
+        all.push((bone, w));
     }
     if dropped_clusters > 0 {
         eprintln!(
-            "[rkp-import] warn: FBX vertex {vertex_idx} had {dropped_clusters} out-of-range cluster_index values (bone_count = {bone_count})"
+            "[rkp-import] warn: FBX vertex {vertex_idx} had {dropped_clusters} cluster indices with no bone (bone_count = {bone_count})"
         );
     }
     if nan_weights > 0 {
