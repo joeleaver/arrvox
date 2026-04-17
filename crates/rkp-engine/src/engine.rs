@@ -3297,12 +3297,20 @@ impl EngineState {
                 }
 
                 // Third pass: restore generic components via registry.
+                // Skeleton is deferred to a fourth pass because it
+                // depends on sibling `.rkskel` discovery off the
+                // Renderable's asset path, and on `AnimationPlayer`
+                // already being in place so `try_attach_skeleton`
+                // doesn't overwrite the restored playback state.
                 for obj in &scene.objects {
                     if obj.components.is_empty() {
                         continue;
                     }
                     let Some(&entity) = uuid_to_hecs.get(&obj.id) else { continue };
                     for (comp_name, json) in &obj.components {
+                        if comp_name == "Skeleton" {
+                            continue; // handled in the fourth pass below
+                        }
                         if let Some(entry) = self.registry.get(comp_name) {
                             if let Err(e) = (entry.deserialize_insert)(&mut self.world, entity, json) {
                                 self.console.warn(format!(
@@ -3317,6 +3325,29 @@ impl EngineState {
                             ));
                         }
                     }
+                }
+
+                // Fourth pass: re-attach Skeleton (+ bundled
+                // AnimationPlayer, preserving the restored-from-disk
+                // player state). Uses the same engine-side helper the
+                // AddComponent command routes through, so the asset
+                // cache + grid-offset derivation stay in one place.
+                for obj in &scene.objects {
+                    if !obj.components.iter().any(|(n, _)| n == "Skeleton") {
+                        continue;
+                    }
+                    let Some(&entity) = uuid_to_hecs.get(&obj.id) else { continue };
+                    let Some(ref asset_path) = obj.asset_path else {
+                        self.console.warn(format!(
+                            "Restore Skeleton on '{}': no Renderable asset — skipped",
+                            obj.name,
+                        ));
+                        continue;
+                    };
+                    let full_path = self.project_dir.as_ref()
+                        .map(|d| d.join("assets").join(asset_path))
+                        .unwrap_or_else(|| std::path::PathBuf::from(asset_path));
+                    self.try_attach_skeleton(entity, &full_path);
                 }
 
                 self.scene_dirty = true;
@@ -3522,11 +3553,18 @@ impl EngineState {
     fn build_bone_wireframes(&self) -> Vec<rkp_render::LineVertex> {
         use glam::{Mat4, Vec3, Vec4};
         let mut verts = Vec::new();
-        let dim = [0.3, 0.7, 1.0, 0.45];
         let bright = [0.5, 0.9, 1.0, 1.0];
-        for (entity, (transform, skeleton)) in self.world.query::<(&crate::components::Transform, &crate::components::Skeleton)>().iter() {
-            let selected = self.selected_entity == Some(entity);
-            let color = if selected { bright } else { dim };
+        // Bones are editor chrome for the currently-selected rig.
+        // Play mode has no selection (selection is an edit-mode
+        // concept), and non-selected entities clutter the viewport
+        // when multiple animated characters are on screen — so we
+        // draw bones for the selected entity only.
+        let Some(selected) = self.selected_entity else { return verts };
+        let query_result = self.world.query_one::<(&crate::components::Transform, &crate::components::Skeleton)>(selected);
+        let Ok(mut query) = query_result else { return verts };
+        let Some((transform, skeleton)) = query.get() else { return verts };
+        {
+            let color = bright;
 
             // Entity's root world transform (same one the renderer uses
             // for this entity). Bone origins are in object-local space;

@@ -643,9 +643,22 @@ fn skeleton_entry() -> ComponentEntry {
         remove: |world, entity| {
             world.remove_one::<Skeleton>(entity).map(|_| ()).map_err(|e| format!("{e}"))
         },
-        // Not serialized — rebuilt from the skeleton asset on entity load.
-        serialize: |_, _| None,
-        deserialize_insert: |_, _, _| Err("Skeleton is not serialized".into()),
+        // Serialize only a presence marker — the actual skeleton asset
+        // is rediscovered on load by finding the `.rkskel` sibling of
+        // the Renderable's asset. Emitting the stored path lets humans
+        // inspect the scene file but isn't authoritative.
+        serialize: |world, entity| {
+            let c = world.get::<&Skeleton>(entity).ok()?;
+            Some(serde_json::to_string(&c.path.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "\"\"".to_string()))
+        },
+        // The real attach needs the asset cache + Renderable lookup,
+        // which registry's `(world, entity, &str)` signature can't
+        // reach. Engine handles `"Skeleton"` specially during scene
+        // load (see `load_scene`) and this function is never called.
+        deserialize_insert: |_, _, _| Err(
+            "Skeleton deserialization is special-cased by scene load; this path should be unreachable".into()
+        ),
         on_add: None,
         on_remove: None,
     }
