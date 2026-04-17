@@ -256,6 +256,7 @@ impl GpuEvaluator {
         let has_warps = instructions.iter().any(|ins| {
             ins.op == rkp_procedural::OpKind::PushNoiseDisplace as u32
                 || ins.op == rkp_procedural::OpKind::PushMirror as u32
+                || ins.op == rkp_procedural::OpKind::PushArray as u32
         });
         let instruction_count = instructions.len() as u32;
 

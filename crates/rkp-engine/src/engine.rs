@@ -1680,21 +1680,11 @@ impl EngineState {
                     if let Ok(mut proc_geo) = self.world.get::<&mut crate::components::ProceduralGeometry>(entity) {
                         let parent = rkp_procedural::NodeId(parent_node_id);
                         let node_kind = parse_node_kind(&kind);
-                        // Leaves can't have children. Auto-promote: wrap
-                        // the leaf in a new Union, then add the new node
-                        // as a sibling. Matches the "add a second shape
-                        // to a lone-sphere procedural" flow.
-                        let parent_is_leaf = proc_geo
-                            .tree
-                            .get(parent)
-                            .map(|n| n.kind.is_leaf())
-                            .unwrap_or(false);
-                        let effective_parent = if parent_is_leaf {
-                            proc_geo.tree.wrap_in_union(parent)
-                        } else {
-                            parent
-                        };
-                        let new_id = proc_geo.tree.add_child(effective_parent, node_kind);
+                        // Root accepts children directly — no
+                        // auto-promote, no special cases. Drops onto
+                        // a leaf are rejected by the UI (is_leaf →
+                        // no "+" affordance).
+                        let new_id = proc_geo.tree.add_child(parent, node_kind);
                         proc_geo.dirty = true;
                         self.selected_procedural_node = Some(new_id.0);
                     }
@@ -5169,6 +5159,7 @@ fn parse_node_kind(kind: &str) -> rkp_procedural::NodeKind {
         "ColorByNoise" => {
             rkp_procedural::NodeKind::ColorByNoise(ColorByNoiseParams::default())
         }
+        "Array" => rkp_procedural::NodeKind::Array(ArrayParams::default()),
         _ => rkp_procedural::NodeKind::Sphere(SphereParams::default()),
     }
 }
@@ -5188,6 +5179,9 @@ fn apply_procedural_param(
     };
 
     match &mut node.kind {
+        // Root has no editable params. Present a row with no fields
+        // in the inspector; silently no-op any set attempts.
+        NodeKind::Root => false,
         NodeKind::Sphere(p) => match param_name {
             "radius" => { p.radius = value.parse().unwrap_or(p.radius); true }
             "material_id" | "material" => { p.material_id = value.parse().unwrap_or(p.material_id); true }
@@ -5347,6 +5341,33 @@ fn apply_procedural_param(
             }
             _ => false,
         },
+        NodeKind::Array(p) => {
+            // Counts are per-axis u32s but the UI Float widget hands
+            // us strings — round and clamp to ≥ 1 (0 would divide-by-
+            // zero in the flatten emit).
+            let set_count = |p_slot: &mut u32, v: &str| {
+                let f: f32 = v.parse().unwrap_or(*p_slot as f32);
+                *p_slot = (f.round().max(1.0) as u32).max(1);
+            };
+            match param_name {
+                "count_x" => { set_count(&mut p.counts[0], value); true }
+                "count_y" => { set_count(&mut p.counts[1], value); true }
+                "count_z" => { set_count(&mut p.counts[2], value); true }
+                "spacing_x" => {
+                    p.spacings[0] = value.parse::<f32>().unwrap_or(p.spacings[0]).max(1e-4);
+                    true
+                }
+                "spacing_y" => {
+                    p.spacings[1] = value.parse::<f32>().unwrap_or(p.spacings[1]).max(1e-4);
+                    true
+                }
+                "spacing_z" => {
+                    p.spacings[2] = value.parse::<f32>().unwrap_or(p.spacings[2]).max(1e-4);
+                    true
+                }
+                _ => false,
+            }
+        }
     }
 }
 

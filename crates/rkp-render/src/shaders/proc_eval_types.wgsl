@@ -31,6 +31,10 @@ const OP_PUSH_NOISE_DISPLACE: u32 = 200u;
 const OP_POP_NOISE_DISPLACE:  u32 = 201u;
 const OP_PUSH_MIRROR:         u32 = 202u;
 const OP_POP_MIRROR:          u32 = 203u;
+// Array fold via opRepLim. See `eval_tree` + `eval_tree_distance` for
+// the per-axis math; the packing lives in `flatten::emit_array`.
+const OP_PUSH_ARRAY:          u32 = 204u;
+const OP_POP_ARRAY:           u32 = 205u;
 
 // Attribute-rewrite post-ops — no PUSH/POP pair, a single opcode fires
 // after the child's sample is on the stack and mutates the top sample.

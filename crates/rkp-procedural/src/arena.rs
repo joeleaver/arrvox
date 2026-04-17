@@ -297,6 +297,32 @@ impl ProceduralObject {
     /// Returns the new Union's `NodeId`. Versions propagate so any
     /// cached subtree_version above the insertion point invalidates.
     ///
+    /// Migration-only: wrap a leaf root in a `Root` container so
+    /// legacy saved scenes (pre-Root, where the single-primitive
+    /// default had a Sphere at the root) can still accept children
+    /// in the new model. Returns the new Root's id. Callers should
+    /// only invoke this when `self.root()` is a leaf; calling on an
+    /// already-containerized root will double-wrap.
+    pub fn wrap_in_root(&mut self) -> NodeId {
+        let root_id = self.root;
+
+        let new_root_id = NodeId(self.nodes.len() as u32);
+        let mut new_root_node = Node::new(NodeKind::Root);
+        new_root_node.own_version = self.next_version;
+        new_root_node.subtree_version = self.next_version;
+        self.next_version += 1;
+        new_root_node.children.push(root_id);
+        self.nodes.push(Some(new_root_node));
+
+        // Re-parent the old root leaf under the new Root.
+        self.nodes[root_id.0 as usize]
+            .as_mut()
+            .expect("old root must exist")
+            .parent = Some(new_root_id);
+        self.root = new_root_id;
+        new_root_id
+    }
+
     /// Used by the editor to "add a sibling" to a leaf — promote the
     /// leaf to a Union child, then append the requested new node as a
     /// second Union child.
@@ -950,40 +976,18 @@ mod tests {
         assert!(obj.duplicate(obj.root()).is_none());
     }
 
-    /// Dropping a second child onto a single-child effect evicts the
-    /// existing child to the effect's grandparent — same semantics the
-    /// UI's drop-on-body offers, so "swap the sphere out for a union"
-    /// reads as one natural drag.
+    /// Effects were single-child in the early prototype and
+    /// evicted extras to the grandparent. That capability was
+    /// dropped when effects went multi-child with an implicit
+    /// Union at flatten time — drop N shapes under one NoiseDisplace
+    /// and they all stay, combined into one logical sample before
+    /// the warp applies.
     #[test]
-    fn move_to_evicts_over_cap_on_single_child_effect() {
-        use crate::node_kind::NoiseDisplaceParams;
-        let mut obj = ProceduralObject::new(union_kind());
-        let effect = obj.add_child(
-            obj.root(),
-            NodeKind::NoiseDisplace(NoiseDisplaceParams::default()),
-        );
-        let first = obj.add_child(effect, sphere_kind());
-        // Second child to drop — currently a sibling of the effect.
-        let incoming = obj.add_child(obj.root(), sphere_kind());
-
-        assert!(obj.move_to(incoming, effect, 0));
-
-        // Effect now owns `incoming`, not `first`.
-        let effect_kids = obj.get(effect).unwrap().children.clone();
-        assert_eq!(effect_kids.as_slice(), &[incoming]);
-
-        // `first` got evicted to the grandparent (root), inserted right
-        // after the effect in the root's children.
-        let root_kids = obj.get(obj.root()).unwrap().children.clone();
-        let effect_pos = root_kids.iter().position(|c| *c == effect).unwrap();
-        assert_eq!(root_kids[effect_pos + 1], first);
-        assert_eq!(obj.get(first).unwrap().parent, Some(obj.root()));
-    }
-
-    /// `add_child` on a full single-child effect should also evict,
-    /// not silently accept a second child. (MCP / test paths hit this.)
-    #[test]
-    fn add_child_evicts_over_cap_on_single_child_effect() {
+    fn effects_accept_multiple_children() {
+        // Effects flipped from `max_children = Some(1)` to `None` so
+        // users can drop several shapes under one NoiseDisplace and
+        // have them implicitly unioned before the warp applies. Both
+        // children must stick around (no eviction).
         use crate::node_kind::NoiseDisplaceParams;
         let mut obj = ProceduralObject::new(union_kind());
         let effect = obj.add_child(
@@ -992,11 +996,8 @@ mod tests {
         );
         let first = obj.add_child(effect, sphere_kind());
         let second = obj.add_child(effect, sphere_kind());
-
-        // Effect caps at 1 — `first` got evicted, `second` is the child.
-        let effect_kids = obj.get(effect).unwrap().children.clone();
-        assert_eq!(effect_kids.as_slice(), &[second]);
-        assert_eq!(obj.get(first).unwrap().parent, Some(obj.root()));
+        let kids = obj.get(effect).unwrap().children.clone();
+        assert_eq!(kids.as_slice(), &[first, second]);
     }
 
     /// Over-cap at the root has nowhere to evict to — behavior there is

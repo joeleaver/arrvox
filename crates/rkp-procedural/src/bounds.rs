@@ -64,6 +64,16 @@ fn compute_all_bounds_rec(
     };
 
     let local_aabb = match &node.kind {
+        NodeKind::Root => {
+            // Top-level container — same semantics as an explicit
+            // Union (children are implicitly unioned at flatten time).
+            let mut combined = EMPTY_AABB;
+            for &child_id in &node.children {
+                let child_aabb = compute_all_bounds_rec(obj, child_id, cache);
+                combined = aabb_union(&combined, &child_aabb);
+            }
+            combined
+        }
         NodeKind::Sphere(p) => leaf_sphere_bounds(p),
         NodeKind::Box(p) => leaf_box_bounds(p),
         NodeKind::Capsule(p) => leaf_capsule_bounds(p),
@@ -117,20 +127,10 @@ fn compute_all_bounds_rec(
             first_aabb
         }
         NodeKind::NoiseDisplace(p) => {
-            // Effect widens the child's AABB by its max per-axis
-            // displacement. Additional children are ignored (same
-            // rule as the evaluator). If the first child is missing
-            // the effect contributes nothing — EMPTY_AABB.
-            let Some(&child_id) = node.children.first() else {
-                return EMPTY_AABB;
-            };
-            let child_aabb = compute_all_bounds_rec(obj, child_id, cache);
-            // Keep iterating the ignored siblings to populate their
-            // cache entries (they could still be UI-visible / selected
-            // even though they don't contribute to geometry).
-            for &sibling_id in node.children.iter().skip(1) {
-                let _ = compute_all_bounds_rec(obj, sibling_id, cache);
-            }
+            // Effect widens the (implicit-unioned) children's AABB by
+            // its max per-axis displacement. Empty-child case
+            // short-circuits to EMPTY.
+            let child_aabb = union_children_bounds_cached(obj, &node.children, cache);
             if is_empty_aabb(&child_aabb) {
                 EMPTY_AABB
             } else {
@@ -142,17 +142,9 @@ fn compute_all_bounds_rec(
         }
         NodeKind::Mirror(p) => {
             // Mirror creates geometry on the reflected side of the
-            // plane, so the effect's AABB is the union of the child's
-            // AABB and its reflection. Same single-child rule as
-            // NoiseDisplace — extra children populate the cache but
-            // don't feed into the result.
-            let Some(&child_id) = node.children.first() else {
-                return EMPTY_AABB;
-            };
-            let child_aabb = compute_all_bounds_rec(obj, child_id, cache);
-            for &sibling_id in node.children.iter().skip(1) {
-                let _ = compute_all_bounds_rec(obj, sibling_id, cache);
-            }
+            // plane, so the effect's AABB is the union of the
+            // combined children's AABB and its reflection.
+            let child_aabb = union_children_bounds_cached(obj, &node.children, cache);
             if is_empty_aabb(&child_aabb) {
                 EMPTY_AABB
             } else {
@@ -165,16 +157,21 @@ fn compute_all_bounds_rec(
         | NodeKind::MaterialByNoise(_)
         | NodeKind::ColorByNoise(_) => {
             // Attribute rewrite — geometry is unchanged, so the AABB
-            // is just the child's. Single-child cap; extras populate
-            // the cache for UI visibility but don't contribute.
-            let Some(&child_id) = node.children.first() else {
-                return EMPTY_AABB;
-            };
-            let child_aabb = compute_all_bounds_rec(obj, child_id, cache);
-            for &sibling_id in node.children.iter().skip(1) {
-                let _ = compute_all_bounds_rec(obj, sibling_id, cache);
+            // is the combined children's AABB.
+            union_children_bounds_cached(obj, &node.children, cache)
+        }
+        NodeKind::Array(p) => {
+            // Expand the combined children's AABB by the array
+            // extent. For a count of N along axis A, the array spans
+            // `(N-1) * spacing` centered on the local origin; the
+            // outermost instance reaches `(N-1)/2 * spacing` from the
+            // center.
+            let child_aabb = union_children_bounds_cached(obj, &node.children, cache);
+            if is_empty_aabb(&child_aabb) {
+                EMPTY_AABB
+            } else {
+                expand_aabb_by_array(&child_aabb, p)
             }
-            child_aabb
         }
     };
 
@@ -199,6 +196,14 @@ fn compute_node_bounds(obj: &ProceduralObject, id: NodeId) -> Aabb {
     };
 
     let local_aabb = match &node.kind {
+        NodeKind::Root => {
+            let mut combined = EMPTY_AABB;
+            for &child_id in &node.children {
+                let child_aabb = compute_node_bounds(obj, child_id);
+                combined = aabb_union(&combined, &child_aabb);
+            }
+            combined
+        }
         NodeKind::Sphere(p) => leaf_sphere_bounds(p),
         NodeKind::Box(p) => leaf_box_bounds(p),
         NodeKind::Capsule(p) => leaf_capsule_bounds(p),
@@ -238,13 +243,7 @@ fn compute_node_bounds(obj: &ProceduralObject, id: NodeId) -> Aabb {
                 .unwrap_or(EMPTY_AABB)
         }
         NodeKind::NoiseDisplace(p) => {
-            // Widen the child's AABB by the max per-axis displacement
-            // (mirror of compute_all_bounds_rec's NoiseDisplace arm).
-            let child_aabb = node
-                .children
-                .first()
-                .map(|&first| compute_node_bounds(obj, first))
-                .unwrap_or(EMPTY_AABB);
+            let child_aabb = union_children_bounds(obj, &node.children);
             if is_empty_aabb(&child_aabb) {
                 EMPTY_AABB
             } else {
@@ -255,13 +254,7 @@ fn compute_node_bounds(obj: &ProceduralObject, id: NodeId) -> Aabb {
             }
         }
         NodeKind::Mirror(p) => {
-            // Union of child AABB with its reflection across the
-            // mirror plane. Mirror of compute_all_bounds_rec.
-            let child_aabb = node
-                .children
-                .first()
-                .map(|&first| compute_node_bounds(obj, first))
-                .unwrap_or(EMPTY_AABB);
+            let child_aabb = union_children_bounds(obj, &node.children);
             if is_empty_aabb(&child_aabb) {
                 EMPTY_AABB
             } else {
@@ -273,12 +266,15 @@ fn compute_node_bounds(obj: &ProceduralObject, id: NodeId) -> Aabb {
         | NodeKind::ColorByHeight(_)
         | NodeKind::MaterialByNoise(_)
         | NodeKind::ColorByNoise(_) => {
-            // Attribute rewrite — bounds pass through unchanged.
-            node
-                .children
-                .first()
-                .map(|&first| compute_node_bounds(obj, first))
-                .unwrap_or(EMPTY_AABB)
+            union_children_bounds(obj, &node.children)
+        }
+        NodeKind::Array(p) => {
+            let child_aabb = union_children_bounds(obj, &node.children);
+            if is_empty_aabb(&child_aabb) {
+                EMPTY_AABB
+            } else {
+                expand_aabb_by_array(&child_aabb, p)
+            }
         }
     };
 
@@ -380,6 +376,51 @@ fn reflect_aabb(aabb: &Aabb, axis: MirrorAxis) -> Aabb {
             min: Vec3::new(aabb.min.x, aabb.min.y, -aabb.max.z),
             max: Vec3::new(aabb.max.x, aabb.max.y, -aabb.min.z),
         },
+    }
+}
+
+/// Union the AABBs of every child into one combined AABB. Used by
+/// the cached bounds walk for multi-child effects (Mirror, Array,
+/// by-\*, NoiseDisplace). Every child is recursed into, so the cache
+/// is populated even for children whose AABB was empty.
+fn union_children_bounds_cached(
+    obj: &ProceduralObject,
+    children: &[NodeId],
+    cache: &mut AabbCache,
+) -> Aabb {
+    let mut combined = EMPTY_AABB;
+    for &child_id in children {
+        let child_aabb = compute_all_bounds_rec(obj, child_id, cache);
+        combined = aabb_union(&combined, &child_aabb);
+    }
+    combined
+}
+
+/// Uncached variant of [`union_children_bounds_cached`] — uses the
+/// plain `compute_node_bounds` recursion.
+fn union_children_bounds(obj: &ProceduralObject, children: &[NodeId]) -> Aabb {
+    let mut combined = EMPTY_AABB;
+    for &child_id in children {
+        let child_aabb = compute_node_bounds(obj, child_id);
+        combined = aabb_union(&combined, &child_aabb);
+    }
+    combined
+}
+
+/// Expand an AABB to cover every instance of an Array effect. The
+/// instance at index `i` along axis A sits at `(i - (N-1)/2) * spacing`
+/// from the local origin; the envelope extends from `-(N-1)/2 * s` to
+/// `+(N-1)/2 * s` — add that to both ends of the child's extent on
+/// each axis. An axis with `count == 1` contributes zero expansion.
+fn expand_aabb_by_array(aabb: &Aabb, p: &ArrayParams) -> Aabb {
+    let half_extent = Vec3::new(
+        (p.counts[0].saturating_sub(1)) as f32 * 0.5 * p.spacings[0],
+        (p.counts[1].saturating_sub(1)) as f32 * 0.5 * p.spacings[1],
+        (p.counts[2].saturating_sub(1)) as f32 * 0.5 * p.spacings[2],
+    );
+    Aabb {
+        min: aabb.min - half_extent,
+        max: aabb.max + half_extent,
     }
 }
 

@@ -492,6 +492,7 @@ fn render_add_child_menu(
                     {add_menu_item(__scope, "ColorByHeight", TablerIcon::Palette, parent_id, opened, cmd_tx)}
                     {add_menu_item(__scope, "MaterialByNoise", TablerIcon::Grain, parent_id, opened, cmd_tx)}
                     {add_menu_item(__scope, "ColorByNoise", TablerIcon::Droplet, parent_id, opened, cmd_tx)}
+                    {add_menu_item(__scope, "Array", TablerIcon::GridDots, parent_id, opened, cmd_tx)}
                 }
             }
         }
@@ -527,6 +528,7 @@ fn add_menu_item(
 
 fn node_icon(kind: ProceduralNodeKind) -> TablerIcon {
     match kind {
+        ProceduralNodeKind::Root => TablerIcon::Hierarchy,
         ProceduralNodeKind::Sphere => TablerIcon::Sphere,
         ProceduralNodeKind::Box => TablerIcon::Box,
         ProceduralNodeKind::Capsule => TablerIcon::Capsule,
@@ -543,5 +545,6 @@ fn node_icon(kind: ProceduralNodeKind) -> TablerIcon {
         ProceduralNodeKind::ColorByHeight => TablerIcon::Palette,
         ProceduralNodeKind::MaterialByNoise => TablerIcon::Grain,
         ProceduralNodeKind::ColorByNoise => TablerIcon::Droplet,
+        ProceduralNodeKind::Array => TablerIcon::GridDots,
     }
 }

@@ -324,6 +324,7 @@ impl ProcRaymarchPass {
         self.has_warps = instructions.iter().any(|ins| {
             ins.op == rkp_procedural::OpKind::PushNoiseDisplace as u32
                 || ins.op == rkp_procedural::OpKind::PushMirror as u32
+                || ins.op == rkp_procedural::OpKind::PushArray as u32
         });
         if !instructions.is_empty() {
             queue.write_buffer(&self.instructions_buffer, 0, bytemuck::cast_slice(instructions));

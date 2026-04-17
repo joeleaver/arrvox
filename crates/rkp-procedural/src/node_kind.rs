@@ -6,6 +6,14 @@ use serde::{Deserialize, Serialize};
 /// What a node does. Leaves produce geometry, combinators merge children.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NodeKind {
+    /// Every tree's top-level container. Unbounded children, implicitly
+    /// combined via `MaterialCombine::Winner` — drop shapes directly
+    /// onto the Root and they appear side-by-side with no intermediate
+    /// scaffolding. The flatten layer emits children followed by a
+    /// synthetic `Union(arity = N, Winner)` instruction. Use an
+    /// explicit `Union` node when you need `Layered` / `Blend` material
+    /// handling; otherwise Root is the default container.
+    Root,
     // ── Leaves (analytical shapes) ──────────────────────────────────
     Sphere(SphereParams),
     Box(BoxParams),
@@ -65,6 +73,17 @@ pub enum NodeKind {
     /// their own noise fields (different seeds give independent
     /// patterns). Single-child effect.
     ColorByNoise(ColorByNoiseParams),
+    /// Repeat the child subtree at regular intervals along each axis.
+    /// Unified Grid/Linear: `counts = [N, 1, 1]` is a linear array
+    /// along X; `counts = [A, B, C]` is a 3D grid. Any axis with
+    /// `count = 1` is an identity (no warp on that axis).
+    ///
+    /// Evaluates in O(1) regardless of total instance count — the
+    /// shader uses the `opRepLim` trick: fold the sample position
+    /// into a single canonical cell via modulo-with-limit, then
+    /// evaluate the child once at that folded position. The child
+    /// never materializes N × M × K times.
+    Array(ArrayParams),
 }
 
 impl NodeKind {
@@ -92,7 +111,8 @@ impl NodeKind {
     pub fn is_combinator(&self) -> bool {
         matches!(
             self,
-            NodeKind::Union { .. }
+            NodeKind::Root
+                | NodeKind::Union { .. }
                 | NodeKind::Intersect { .. }
                 | NodeKind::Subtract
                 | NodeKind::NoiseDisplace(_)
@@ -101,29 +121,19 @@ impl NodeKind {
                 | NodeKind::ColorByHeight(_)
                 | NodeKind::MaterialByNoise(_)
                 | NodeKind::ColorByNoise(_)
+                | NodeKind::Array(_)
         )
     }
 
     /// Maximum number of children this node kind accepts, or `None`
-    /// for unbounded. Single-child effects (NoiseDisplace and the
-    /// future warp/mirror family) cap at 1 — the evaluator and flatten
-    /// both ignore extras anyway, so the cap is the source of truth.
-    /// Leaves return `Some(0)`: `add_child` panics on them (preserving
-    /// long-standing behavior), and the cap lets the UI hide the "+"
-    /// without special-casing leaves.
+    /// for unbounded. Leaves return `Some(0)` — `add_child` panics on
+    /// them and the UI hides the "+". Everything else (Root, explicit
+    /// combinators, effects) is unbounded: effects apply to the
+    /// implicit Union of their children, matching the pattern
+    /// Blender's geometry nodes and Houdini SOPs use.
     pub fn max_children(&self) -> Option<usize> {
         if self.is_leaf() {
             Some(0)
-        } else if matches!(
-            self,
-            NodeKind::NoiseDisplace(_)
-                | NodeKind::Mirror(_)
-                | NodeKind::MaterialByHeight(_)
-                | NodeKind::ColorByHeight(_)
-                | NodeKind::MaterialByNoise(_)
-                | NodeKind::ColorByNoise(_)
-        ) {
-            Some(1)
         } else {
             None
         }
@@ -386,6 +396,42 @@ impl Default for MirrorParams {
     fn default() -> Self {
         Self {
             axis: MirrorAxis::X,
+        }
+    }
+}
+
+/// Array effect params. Repeats the child at regular intervals along
+/// each axis in the effect's local frame. Unified Grid/Linear model:
+/// `counts = [N, 1, 1]` is a 1D array along X, `counts = [A, B, C]`
+/// is a 3D grid, `counts = [1, 1, 1]` collapses to identity.
+///
+/// The array is centered on the effect's local origin: for a count
+/// of N, the N cells occupy `[-(N-1)/2, (N-1)/2] * spacing` along
+/// that axis (so an odd N has a cell exactly at the origin). Move
+/// the whole array in world space via the node transform.
+///
+/// Evaluates at constant cost regardless of total instance count —
+/// the shader folds the sample position into the nearest cell via
+/// modulo-with-limit (`opRepLim`), then evaluates the child once at
+/// that folded position. This is O(1) per sample, not O(N × M × K).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ArrayParams {
+    /// Instance counts per axis. Must be ≥ 1; 1 means "no repeat on
+    /// this axis". `counts = [1, 1, 1]` is identity.
+    pub counts: [u32; 3],
+    /// Center-to-center distance between instances along each axis,
+    /// in local units. Ignored on axes where `count == 1`.
+    pub spacings: [f32; 3],
+}
+
+impl Default for ArrayParams {
+    fn default() -> Self {
+        Self {
+            // Linear-along-X array of 4 cells at 1m spacing — easy to
+            // see in the preview and obviously "arrayed" rather than
+            // an identity pass-through.
+            counts: [4, 1, 1],
+            spacings: [1.0, 1.0, 1.0],
         }
     }
 }

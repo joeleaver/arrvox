@@ -237,16 +237,17 @@ fn default_dirty_true() -> bool { true }
 fn default_last_scale() -> glam::Vec3 { glam::Vec3::ONE }
 
 impl ProceduralGeometry {
-    /// Create a default procedural object: a union root with one sphere child.
+    /// Create a default procedural object: a `Root` container with
+    /// one sphere child. Additional shapes dropped onto the Root
+    /// become its siblings — Root's flatten step implicitly unions
+    /// whatever it finds.
     pub fn default_sphere() -> Self {
         use rkp_procedural::*;
-        // Single-shape default: the root IS the sphere. When the user
-        // adds a second shape, the AddProceduralNode handler auto-
-        // promotes this leaf root to a Union with the old sphere +
-        // the new node as siblings.
-        let tree = ProceduralObject::new(NodeKind::Sphere(
-            rkp_procedural::node_kind::SphereParams::default(),
-        ));
+        let mut tree = ProceduralObject::new(NodeKind::Root);
+        tree.add_child(
+            tree.root(),
+            NodeKind::Sphere(rkp_procedural::node_kind::SphereParams::default()),
+        );
         Self {
             tree,
             voxel_size: 0.02,

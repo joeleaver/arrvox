@@ -66,6 +66,8 @@ pub struct ProceduralNodeInfo {
 /// Simplified node kind for UI display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProceduralNodeKind {
+    #[default]
+    Root,
     Sphere,
     Box,
     Capsule,
@@ -73,7 +75,6 @@ pub enum ProceduralNodeKind {
     Torus,
     Plane,
     Ramp,
-    #[default]
     Union,
     Intersect,
     Subtract,
@@ -83,11 +84,13 @@ pub enum ProceduralNodeKind {
     ColorByHeight,
     MaterialByNoise,
     ColorByNoise,
+    Array,
 }
 
 impl ProceduralNodeKind {
     pub fn display_name(&self) -> &'static str {
         match self {
+            Self::Root => "Root",
             Self::Sphere => "Sphere",
             Self::Box => "Box",
             Self::Capsule => "Capsule",
@@ -104,6 +107,7 @@ impl ProceduralNodeKind {
             Self::ColorByHeight => "Color by Height",
             Self::MaterialByNoise => "Material by Noise",
             Self::ColorByNoise => "Color by Noise",
+            Self::Array => "Array",
         }
     }
 }
@@ -156,6 +160,11 @@ pub fn build_procedural_snapshot(
     for id in tree.iter_ids() {
         let node = tree.get(id).unwrap();
         let (kind, name, params) = match &node.kind {
+            NodeKind::Root => (
+                ProceduralNodeKind::Root,
+                "Root".to_string(),
+                vec![],
+            ),
             NodeKind::Sphere(p) => (
                 ProceduralNodeKind::Sphere,
                 "Sphere".to_string(),
@@ -235,6 +244,11 @@ pub fn build_procedural_snapshot(
                 ProceduralNodeKind::ColorByNoise,
                 "Color by Noise".to_string(),
                 color_by_noise_params(p),
+            ),
+            NodeKind::Array(p) => (
+                ProceduralNodeKind::Array,
+                "Array".to_string(),
+                array_params(p),
             ),
         };
 
@@ -512,6 +526,35 @@ fn mirror_params(
         },
         range: None,
     }]
+}
+
+fn array_params(
+    p: &rkp_procedural::node_kind::ArrayParams,
+) -> Vec<ProceduralParam> {
+    // Exposed as six scalars: three counts (rendered as integers via
+    // the Float widget's whole-number range + round-at-apply) and
+    // three per-axis spacings. A future int-param type could group
+    // these into a proper `IntVec3` / `Vec3` pair, but scalar-per-
+    // axis is what the existing prop_controls can render without
+    // new widget work.
+    let count = |label: &str, v: u32| ProceduralParam {
+        name: label.into(),
+        value: ProceduralParamValue::Float(v as f32),
+        range: Some((1.0, 64.0)),
+    };
+    let spacing = |label: &str, v: f32| ProceduralParam {
+        name: label.into(),
+        value: ProceduralParamValue::Float(v),
+        range: Some((0.01, 100.0)),
+    };
+    vec![
+        count("count_x", p.counts[0]),
+        count("count_y", p.counts[1]),
+        count("count_z", p.counts[2]),
+        spacing("spacing_x", p.spacings[0]),
+        spacing("spacing_y", p.spacings[1]),
+        spacing("spacing_z", p.spacings[2]),
+    ]
 }
 
 fn combinator_params(mc: &rkp_procedural::MaterialCombine) -> Vec<ProceduralParam> {

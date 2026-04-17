@@ -15,7 +15,8 @@ use glam::{Affine3A, Vec3};
 use rkp_procedural::{
     flatten_tree,
     node_kind::{
-        BoxParams, MaterialCombine, NodeKind, NoiseDisplaceParams, SphereParams,
+        ArrayParams, BoxParams, MaterialCombine, NodeKind, NoiseDisplaceParams,
+        SphereParams,
     },
     ProceduralObject,
 };
@@ -205,6 +206,147 @@ fn noise_displace_stays_within_envelope() {
         results[1].distance > 0.0,
         "noise-displaced far point distance should be positive: got {}",
         results[1].distance,
+    );
+}
+
+/// Array fold: a sphere of radius r at origin, Array with counts=[N,1,1]
+/// and spacing s, should place identical spheres at
+/// {-(N-1)/2 * s, ..., (N-1)/2 * s} along X. Checked by querying the
+/// distance at each nominal sphere center (expect ~-r, i.e. inside) and
+/// midway between two centers (expect ~s/2 - r outside if s > 2r).
+#[test]
+fn array_places_repeats_along_axis() {
+    let Some((device, queue)) = create_device() else {
+        eprintln!("[array] no wgpu adapter — skipping");
+        return;
+    };
+
+    // Sphere of radius 0.3, linear array of 5 along X with spacing 1.0.
+    // Centers at x = -2, -1, 0, 1, 2.
+    let r = 0.3_f32;
+    let n = 5;
+    let s = 1.0_f32;
+    let mut obj = ProceduralObject::new(NodeKind::Array(ArrayParams {
+        counts: [n, 1, 1],
+        spacings: [s, 1.0, 1.0],
+    }));
+    obj.add_child(
+        obj.root(),
+        NodeKind::Sphere(SphereParams {
+            radius: r,
+            material_id: 7,
+            ..Default::default()
+        }),
+    );
+    let instructions = flatten_tree(&obj);
+    let mut evaluator = GpuEvaluator::new(&device);
+
+    // Nominal centers: d(center_i) should equal -r.
+    let centers: Vec<Vec3> = (0..n as i32)
+        .map(|i| {
+            let x = (i as f32 - (n as f32 - 1.0) * 0.5) * s;
+            Vec3::new(x, 0.0, 0.0)
+        })
+        .collect();
+    // Midpoints between centers: exactly s/2 from each neighbor, so
+    // distance = s/2 - r outside the spheres (positive when s > 2r).
+    let midpoints: Vec<Vec3> = (0..n as i32 - 1)
+        .map(|i| {
+            let x = (i as f32 + 0.5 - (n as f32 - 1.0) * 0.5) * s;
+            Vec3::new(x, 0.0, 0.0)
+        })
+        .collect();
+    // Well past the last center: distance should grow without bound
+    // (fold clamps to the outermost cell, then it's a normal sphere).
+    let far = Vec3::new((n as f32 - 1.0) * 0.5 * s + 3.0, 0.0, 0.0);
+    let expect_far = (far.x - (n as f32 - 1.0) * 0.5 * s) - r;
+
+    let mut points = centers.clone();
+    points.extend(midpoints.iter().copied());
+    points.push(far);
+    let results = evaluator.evaluate(&device, &queue, &points, &instructions);
+
+    for (i, _) in centers.iter().enumerate() {
+        let got = results[i].distance;
+        assert!(
+            (got - -r).abs() < 1e-4,
+            "cell {i} center: expected {}, got {got}",
+            -r,
+        );
+        assert_eq!(results[i].primary, 7, "cell {i} material should propagate");
+    }
+    let mid_base = centers.len();
+    for (i, _) in midpoints.iter().enumerate() {
+        let got = results[mid_base + i].distance;
+        let expect = s * 0.5 - r;
+        assert!(
+            (got - expect).abs() < 1e-4,
+            "midpoint {i}: expected {expect}, got {got}",
+        );
+    }
+    let far_got = results[points.len() - 1].distance;
+    assert!(
+        (far_got - expect_far).abs() < 1e-4,
+        "far point: expected {expect_far}, got {far_got}",
+    );
+}
+
+/// Even-count Array: cell centers should be at half-integer multiples
+/// of spacing, not integer. For N=4 spacing=1 the cells sit at
+/// z ∈ {-1.5, -0.5, 0.5, 1.5}, and the origin should be *outside* any
+/// sphere (it's exactly between cells -0.5 and 0.5, each reporting
+/// distance 0.5 - r). This is the regression the initial implementation
+/// had — `round(t)` + clamp-to-`±1.5` produced cells at integer
+/// positions interior + half-integer at the clamp edges.
+#[test]
+fn array_even_count_cells_are_half_integer() {
+    let Some((device, queue)) = create_device() else {
+        eprintln!("[array_even] no wgpu adapter — skipping");
+        return;
+    };
+
+    let r = 0.3_f32;
+    let n = 4;
+    let s = 1.0_f32;
+    let mut obj = ProceduralObject::new(NodeKind::Array(ArrayParams {
+        counts: [1, 1, n],
+        spacings: [1.0, 1.0, s],
+    }));
+    obj.add_child(
+        obj.root(),
+        NodeKind::Sphere(SphereParams {
+            radius: r,
+            material_id: 3,
+            ..Default::default()
+        }),
+    );
+    let instructions = flatten_tree(&obj);
+    let mut evaluator = GpuEvaluator::new(&device);
+
+    // 4 cells, centered: z = {-1.5, -0.5, 0.5, 1.5}. Origin is midway
+    // between the inner two cells — expect distance s/2 - r.
+    let centers: Vec<Vec3> = [-1.5, -0.5, 0.5, 1.5]
+        .iter()
+        .map(|&z| Vec3::new(0.0, 0.0, z))
+        .collect();
+    let origin = Vec3::ZERO;
+    let mut points = centers.clone();
+    points.push(origin);
+    let results = evaluator.evaluate(&device, &queue, &points, &instructions);
+
+    for (i, _) in centers.iter().enumerate() {
+        let got = results[i].distance;
+        assert!(
+            (got - -r).abs() < 1e-4,
+            "even-count cell {i} center: expected {}, got {got}",
+            -r,
+        );
+    }
+    let origin_got = results[centers.len()].distance;
+    let expect = s * 0.5 - r;
+    assert!(
+        (origin_got - expect).abs() < 1e-4,
+        "origin between inner cells: expected {expect}, got {origin_got}",
     );
 }
 

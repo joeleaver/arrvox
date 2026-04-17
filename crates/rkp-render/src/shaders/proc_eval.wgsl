@@ -352,6 +352,62 @@ fn eval_tree(world_pos: vec3<f32>, count: u32) -> TreeSample {
             // No distance adjustment — reflection is an isometry.
             continue;
         }
+        if (op == OP_PUSH_ARRAY) {
+            let cur = pos_stack[pos_top];
+            let x_axis = vec3<f32>(
+                ins.inverse_world[0][0], ins.inverse_world[0][1], ins.inverse_world[0][2]);
+            let y_axis = vec3<f32>(
+                ins.inverse_world[1][0], ins.inverse_world[1][1], ins.inverse_world[1][2]);
+            let z_axis = vec3<f32>(
+                ins.inverse_world[2][0], ins.inverse_world[2][1], ins.inverse_world[2][2]);
+            let origin = vec3<f32>(
+                ins.inverse_world[3][0], ins.inverse_world[3][1], ins.inverse_world[3][2]);
+            let spacing = ins.params_lo.xyz;
+            let counts  = ins.params_hi.xyz;
+            // `opRepLim` with per-axis centering. Cell centers along
+            // each axis sit at `(i - (N-1)/2) * spacing` for i in
+            // {0..N-1}; for odd N these are integer multiples of
+            // spacing, for even N they're half-integer. Rounding `t`
+            // to the nearest integer and clamping to `±half` works for
+            // odd N but would yield non-uniform cells for even N
+            // (interior round-to-int + edge clamped-to-half-int).
+            // Shift-round-unshift gives the correct centers for any N
+            // in constant time.
+            let rel = cur - origin;
+            var delta = vec3<f32>(0.0);
+            let half_x = (counts.x - 1.0) * 0.5;
+            let half_y = (counts.y - 1.0) * 0.5;
+            let half_z = (counts.z - 1.0) * 0.5;
+            if (spacing.x > 1e-6 && counts.x > 1.0) {
+                let t = dot(rel, x_axis) / spacing.x;
+                let k = clamp(round(t + half_x) - half_x, -half_x, half_x);
+                delta = delta + k * spacing.x * x_axis;
+            }
+            if (spacing.y > 1e-6 && counts.y > 1.0) {
+                let t = dot(rel, y_axis) / spacing.y;
+                let k = clamp(round(t + half_y) - half_y, -half_y, half_y);
+                delta = delta + k * spacing.y * y_axis;
+            }
+            if (spacing.z > 1e-6 && counts.z > 1.0) {
+                let t = dot(rel, z_axis) / spacing.z;
+                let k = clamp(round(t + half_z) - half_z, -half_z, half_z);
+                delta = delta + k * spacing.z * z_axis;
+            }
+            let folded = cur - delta;
+            if (pos_top + 1u < POS_STACK_CAP) {
+                pos_top = pos_top + 1u;
+                pos_stack[pos_top] = folded;
+            }
+            continue;
+        }
+        if (op == OP_POP_ARRAY) {
+            if (pos_top > 0u) {
+                pos_top = pos_top - 1u;
+            }
+            // No distance adjustment — the fold is a translation, so
+            // distances are preserved. Matches Mirror's POP.
+            continue;
+        }
 
         // ── Attribute-rewrite post-ops ──────────────────────────────
         if (op == OP_APPLY_MATERIAL_BY_HEIGHT) {
@@ -575,6 +631,49 @@ fn eval_tree_distance(world_pos: vec3<f32>, count: u32) -> f32 {
                 continue;
             }
             if (op == OP_POP_MIRROR) {
+                if (pos_top > 0u) { pos_top = pos_top - 1u; }
+                continue;
+            }
+            if (op == OP_PUSH_ARRAY) {
+                let cur = pos_stack[pos_top];
+                let x_axis = vec3<f32>(
+                    ins.inverse_world[0][0], ins.inverse_world[0][1], ins.inverse_world[0][2]);
+                let y_axis = vec3<f32>(
+                    ins.inverse_world[1][0], ins.inverse_world[1][1], ins.inverse_world[1][2]);
+                let z_axis = vec3<f32>(
+                    ins.inverse_world[2][0], ins.inverse_world[2][1], ins.inverse_world[2][2]);
+                let origin = vec3<f32>(
+                    ins.inverse_world[3][0], ins.inverse_world[3][1], ins.inverse_world[3][2]);
+                let spacing = ins.params_lo.xyz;
+                let counts  = ins.params_hi.xyz;
+                let rel = cur - origin;
+                var delta = vec3<f32>(0.0);
+                let half_x = (counts.x - 1.0) * 0.5;
+                let half_y = (counts.y - 1.0) * 0.5;
+                let half_z = (counts.z - 1.0) * 0.5;
+                if (spacing.x > 1e-6 && counts.x > 1.0) {
+                    let t = dot(rel, x_axis) / spacing.x;
+                    let k = clamp(round(t + half_x) - half_x, -half_x, half_x);
+                    delta = delta + k * spacing.x * x_axis;
+                }
+                if (spacing.y > 1e-6 && counts.y > 1.0) {
+                    let t = dot(rel, y_axis) / spacing.y;
+                    let k = clamp(round(t + half_y) - half_y, -half_y, half_y);
+                    delta = delta + k * spacing.y * y_axis;
+                }
+                if (spacing.z > 1e-6 && counts.z > 1.0) {
+                    let t = dot(rel, z_axis) / spacing.z;
+                    let k = clamp(round(t + half_z) - half_z, -half_z, half_z);
+                    delta = delta + k * spacing.z * z_axis;
+                }
+                let folded = cur - delta;
+                if (pos_top + 1u < POS_STACK_CAP) {
+                    pos_top = pos_top + 1u;
+                    pos_stack[pos_top] = folded;
+                }
+                continue;
+            }
+            if (op == OP_POP_ARRAY) {
                 if (pos_top > 0u) { pos_top = pos_top - 1u; }
                 continue;
             }

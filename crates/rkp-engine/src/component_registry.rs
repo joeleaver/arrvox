@@ -184,7 +184,22 @@ fn procedural_geometry_entry() -> ComponentEntry {
             serde_json::to_string(&*c).ok()
         },
         deserialize_insert: |world, entity, json| {
-            let c: ProceduralGeometry = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
+            let mut c: ProceduralGeometry = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
+            // Legacy-scene migration: early prototypes stored a bare
+            // leaf (usually Sphere) as the root. The new model makes
+            // the root a `NodeKind::Root` container. Wrap legacy
+            // leaf-roots in a Root so saved scenes keep working.
+            // Union/Intersect/Subtract roots are already valid
+            // containers and pass through untouched.
+            let root_id = c.tree.root();
+            let needs_wrap = c
+                .tree
+                .get(root_id)
+                .map(|n| n.kind.is_leaf())
+                .unwrap_or(false);
+            if needs_wrap {
+                c.tree.wrap_in_root();
+            }
             world.insert_one(entity, c).map_err(|e| format!("{e}"))
         },
         on_add: None,
