@@ -13,7 +13,6 @@ rkp-core = { workspace = true }
 rkp-render = { workspace = true }
 rkp-animation = { workspace = true }
 rkp-physics = { workspace = true }
-rkf-mcp = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }
 hecs = { workspace = true }

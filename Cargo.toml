@@ -34,11 +34,6 @@ rkp-import = { path = "crates/rkp-import" }
 rkp-animation = { path = "crates/rkp-animation" }
 rkp-physics = { path = "crates/rkp-physics" }
 
-# Shared crates from RKIField
-rkf-core = { path = "../rkifield/crates/rkf-core" }
-rkf-editor = { path = "../rkifield/crates/rkf-editor" }
-rkf-mcp = { path = "../rkifield/crates/rkf-mcp" }
-
 # External dependencies (versions match RKIField)
 wgpu = "29"
 naga = { version = "29", features = ["wgsl-in"] }

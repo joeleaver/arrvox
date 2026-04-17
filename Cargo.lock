@@ -4854,38 +4854,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rkf-core"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "glam 0.29.3",
- "half",
- "log",
- "lz4_flex",
- "ron",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "rkf-mcp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "clap",
- "env_logger",
- "glam 0.29.3",
- "log",
- "rkf-core",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
 name = "rkp-animation"
 version = "0.1.0"
 dependencies = [
@@ -5048,7 +5016,6 @@ dependencies = [
  "hecs",
  "log",
  "pollster",
- "rkf-mcp",
  "rkp-animation",
  "rkp-core",
  "rkp-physics",
@@ -5519,16 +5486,6 @@ checksum = "4aaa7368fcf4852a4c2dd92df0cace6a71f2091ca0a23391ce7f3a31833f1523"
 dependencies = [
  "borsh",
  "serde_core",
-]
-
-[[package]]
-name = "socket2"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6080,15 +6037,8 @@ version = "1.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27ad5e34374e03cfffefc301becb44e9dc3c17584f414349ebe29ed26661822d"
 dependencies = [
- "bytes",
- "libc",
- "mio",
- "parking_lot",
  "pin-project-lite",
- "signal-hook-registry",
- "socket2",
  "tokio-macros",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
