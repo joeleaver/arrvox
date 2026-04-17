@@ -1575,42 +1575,13 @@ impl EngineState {
                 }
             }
 
-            EngineCommand::SpawnPrimitive { name } => {
+            EngineCommand::SpawnProceduralObject { name, leaf_kind } => {
                 use crate::components::*;
                 let name = self.unique_name(&name);
-                let primitive = rkf_core::scene_node::SdfPrimitive::Box {
-                    half_extents: glam::Vec3::splat(0.5),
+                let proc_geo = match leaf_kind {
+                    Some(kind) => ProceduralGeometry::with_leaf(parse_node_kind(&kind)),
+                    None => ProceduralGeometry::default_sphere(),
                 };
-                let scene_id = self.next_scene_id;
-                self.next_scene_id += 1;
-                let result = self.scene_mgr.voxelize_primitive(
-                    &primitive, 0, 0.05, glam::Vec3::ONE, scene_id,
-                );
-                if let Some(result) = result {
-                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.grid_origin, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
-                    let entity = self.world.spawn((
-                        Transform::default(),
-                        EditorMetadata { name: name.clone() },
-                        Renderable {
-                            primitive: Some("box".to_string()),
-                            voxel_count: result.voxel_count,
-                            spatial: Some(spatial),
-                            ..Default::default()
-                        },
-                    ));
-                    self.assign_entity_uuid(entity);
-                    self.entity_scene_ids.insert(entity, scene_id);
-                    self.geometry_dirty = true;
-                    self.scene_dirty = true;
-                    self.gpu_objects_dirty = true;
-                    self.console.info(format!("Spawned '{name}': {} voxels", result.voxel_count));
-                }
-            }
-
-            EngineCommand::SpawnProceduralObject { name } => {
-                use crate::components::*;
-                let name = self.unique_name(&name);
-                let proc_geo = ProceduralGeometry::default_sphere();
                 let scene_id = self.next_scene_id;
                 self.next_scene_id += 1;
 

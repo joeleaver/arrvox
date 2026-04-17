@@ -123,30 +123,23 @@ fn build_menus(
             }
         }));
 
-    // Edit menu — spawn primitives
+    // Edit menu — spawn procedural primitives. Each item creates an entity
+    // with a Root → <leaf> tree; shape parameters are editable afterwards
+    // in the build panel.
     let mut spawn_menu = Menu::new();
-    for (label, prim_name) in [("Box", "box"), ("Sphere", "sphere"), ("Capsule", "capsule")] {
-        spawn_menu = spawn_menu.item(MenuItem::new(label).on_click({
+    for leaf in ["Sphere", "Box", "Capsule", "Cylinder", "Torus", "Ramp"] {
+        spawn_menu = spawn_menu.item(MenuItem::new(leaf).on_click({
             let tx = tx.clone();
-            let name = prim_name.to_string();
             move || {
-                let _ = tx.send(rkp_engine::EngineCommand::SpawnPrimitive {
-                    name: name.clone(),
+                let _ = tx.send(rkp_engine::EngineCommand::SpawnProceduralObject {
+                    name: leaf.to_string(),
+                    leaf_kind: Some(leaf.to_string()),
                 });
             }
         }));
     }
 
     spawn_menu = spawn_menu
-        .separator()
-        .item(MenuItem::new("Procedural Object").on_click({
-            let tx = tx.clone();
-            move || {
-                let _ = tx.send(rkp_engine::EngineCommand::SpawnProceduralObject {
-                    name: "Procedural".to_string(),
-                });
-            }
-        }))
         .separator()
         .item(MenuItem::new("Point Light").on_click({
             let tx = tx.clone();

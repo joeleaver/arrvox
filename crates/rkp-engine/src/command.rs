@@ -19,14 +19,12 @@ use crate::viewport::ViewportId;
 pub enum EngineCommand {
     // ── Object lifecycle ─────────────────────────────────────────────
 
-    /// Spawn an analytical primitive (box, sphere, capsule, etc.).
-    SpawnPrimitive {
-        name: String,
-    },
-
-    /// Spawn a procedural object (default: union with one sphere).
+    /// Spawn a procedural object. `leaf_kind` picks the initial child under
+    /// Root — any primitive name accepted by `parse_node_kind` (Sphere, Box,
+    /// Capsule, Cylinder, Torus, Plane, Ramp). `None` defaults to Sphere.
     SpawnProceduralObject {
         name: String,
+        leaf_kind: Option<String>,
     },
 
     /// Spawn a camera entity.

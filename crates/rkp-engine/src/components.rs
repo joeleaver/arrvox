@@ -243,11 +243,16 @@ impl ProceduralGeometry {
     /// whatever it finds.
     pub fn default_sphere() -> Self {
         use rkp_procedural::*;
+        Self::with_leaf(NodeKind::Sphere(
+            rkp_procedural::node_kind::SphereParams::default(),
+        ))
+    }
+
+    /// Create a procedural object with a single-child Root containing `leaf`.
+    pub fn with_leaf(leaf: rkp_procedural::NodeKind) -> Self {
+        use rkp_procedural::*;
         let mut tree = ProceduralObject::new(NodeKind::Root);
-        tree.add_child(
-            tree.root(),
-            NodeKind::Sphere(rkp_procedural::node_kind::SphereParams::default()),
-        );
+        tree.add_child(tree.root(), leaf);
         Self {
             tree,
             voxel_size: 0.02,
