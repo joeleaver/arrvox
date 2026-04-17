@@ -273,6 +273,16 @@ struct EngineState {
     /// frame (packed 1-bit-per-brick occupancy bitmap paired with
     /// `bone_field_buffer`).
     skin_bone_field_occ_bytes: u64,
+    /// Per-skinned-entity cache of last frame's `current_pose`. Used
+    /// by the pause-aware scatter-skip — if every entity's pose is
+    /// byte-identical to last frame and the set of skinned entities
+    /// hasn't changed, the previous frame's `bone_field` buffer is
+    /// still valid, so both the clear and the scatter dispatch get
+    /// skipped. Big win when the user pauses an animation.
+    last_skin_poses: std::collections::HashMap<hecs::Entity, Vec<glam::Mat4>>,
+    /// `true` this frame iff the scatter can be skipped. Computed in
+    /// `update_scene_gpu` after `plan_skin_dispatch` runs.
+    skin_reuse: bool,
     /// Master toggle — when false, skip scatter + fall the march back
     /// to its rigid path. Driven by the AnimationPanel checkbox.
     skinning_enabled: bool,
@@ -520,6 +530,8 @@ impl EngineState {
             skin_batch: rkp_render::SkinBatchScratch::default(),
             skin_bone_field_bytes: 0,
             skin_bone_field_occ_bytes: 0,
+            last_skin_poses: std::collections::HashMap::new(),
+            skin_reuse: false,
             skinning_enabled: true,
             dqs_enabled: false,
             material_lib: crate::material_library::MaterialLibrary::new(),
@@ -668,7 +680,7 @@ impl EngineState {
         // one `write_buffer` per input — side-stepping the write-
         // ordering pitfall of multiple per-entity dispatches sharing
         // a single uniform/brick buffer inside one submission.
-        if self.skinning_enabled && !self.skin_dispatches.is_empty() {
+        if self.skinning_enabled && !self.skin_dispatches.is_empty() && !self.skin_reuse {
             let q = self.renderer.profiler.begin_query("skin_deform", &mut encoder);
             self.renderer.prepare_bone_field(
                 &self.queue,
@@ -2791,6 +2803,12 @@ impl EngineState {
         let mut running_bone_field_cells: u32 = 0;
         let mut running_bone_field_occ_u32s: u32 = 0;
 
+        // Pose cache for the scatter-skip check. Built in lock-step
+        // with the planning loop and swapped with `last_skin_poses`
+        // at the end of this function. Equal maps → skip scatter.
+        let mut this_frame_poses: std::collections::HashMap<hecs::Entity, Vec<glam::Mat4>>
+            = std::collections::HashMap::new();
+
         self.gpu_objects.clear();
         self.gpu_to_entity.clear();
         self.entity_to_gpu.clear();
@@ -2860,6 +2878,14 @@ impl EngineState {
                                     bone_dq_offset: bind.bone_dq_offset,
                                 });
                                 self.skin_dispatches.push(plan);
+                                // Cache this entity's pose for the
+                                // scatter-skip check at the end of the
+                                // function. Only records entities that
+                                // made it to a plan — a plan bail
+                                // below treats this entity as "not
+                                // animated this frame", same as last
+                                // frame's cache if it was also missing.
+                                this_frame_poses.insert(entity, skel.current_pose.clone());
                             } else {
                                 // Plan bailed (no extent, or dims > cap).
                                 // Leave skinning = None so march falls
@@ -2893,6 +2919,19 @@ impl EngineState {
         // scene's bone_field_buffer before the scatter dispatch.
         self.skin_bone_field_bytes = (running_bone_field_cells as u64).saturating_mul(8);
         self.skin_bone_field_occ_bytes = (running_bone_field_occ_u32s as u64).saturating_mul(4);
+
+        // Pause-aware scatter skip: if the set of skinned entities and
+        // their per-bone matrices are byte-identical to last frame,
+        // the `bone_field` buffer still holds valid data — render loop
+        // skips both the clear and the scatter dispatch. Big win when
+        // the user pauses the animation to inspect a frame.
+        //
+        // Empty-to-empty doesn't count as a reuse opportunity: there
+        // was nothing to clear last frame either, so the render loop
+        // already skips via `skin_dispatches.is_empty()`.
+        self.skin_reuse = !this_frame_poses.is_empty()
+            && this_frame_poses == self.last_skin_poses;
+        self.last_skin_poses = this_frame_poses;
 
         // One-second heartbeat so we can tell whether the GPU object
         // the march shader sees actually carries skinning fields.
