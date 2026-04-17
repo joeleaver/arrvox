@@ -1112,7 +1112,14 @@ fn main(
     let color_rgb565 = cr | (cg << 5u) | (cb << 11u);
 
     let packed_r = (first_mat_id & 0xFFFFu) | ((first_sec_mat & 0xFFFFu) << 16u);
-    let packed_g = (first_blend & 0xFFu)
+    // Remap the 4-bit LeafAttr blend (0..15) to the 8-bit G-buffer
+    // channel (0..255) via `b << 4 | b` — hits both endpoints (0 → 0,
+    // 15 → 255) and spaces the intermediate values evenly. Without
+    // this rkp_shade's `blend / 255.0` would cap dual-material lerp
+    // at ~5.9 %, which is what showed up as "still looks hard" on
+    // MAIN even after the shade-pass fix.
+    let first_blend_8 = (first_blend & 0x0Fu) << 4u | (first_blend & 0x0Fu);
+    let packed_g = (first_blend_8 & 0xFFu)
                  | (((first_obj_id + 1u) & 0xFFu) << 8u)
                  | (color_rgb565 << 16u);
 

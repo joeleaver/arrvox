@@ -156,16 +156,19 @@ impl ProcOutlinePass {
         }
     }
 
-    /// Rewire the material G-buffer view. Call after VR construction
-    /// and after every resize.
-    pub fn set_gbuffer(&mut self, device: &wgpu::Device, material_view: &wgpu::TextureView) {
+    /// Rewire the pick G-buffer view. Call after VR construction and
+    /// after every resize. The outline reads `primitive_node_id`
+    /// directly from the rkp-side `R32Uint` pick texture — moving it
+    /// out of the shared material G-buffer freed the secondary-material
+    /// slot for dual-material shading.
+    pub fn set_gbuffer(&mut self, device: &wgpu::Device, pick_view: &wgpu::TextureView) {
         self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("proc_outline bg"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(material_view),
+                    resource: wgpu::BindingResource::TextureView(pick_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,

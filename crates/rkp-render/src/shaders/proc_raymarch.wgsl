@@ -149,6 +149,16 @@ struct ProcInstruction {
 struct TreeSample {
     distance: f32,
     material_id: u32,
+    /// Secondary material id for dual-material transitions (smooth
+    /// seams from MaterialByHeight / MaterialByNoise). Equal to
+    /// `material_id` outside transition zones. Combinators don't
+    /// propagate secondary/blend — only the post-op effects write
+    /// them, and the winner of any downstream combinator carries
+    /// the values forward.
+    secondary_material_id: u32,
+    /// Blend weight, 0..1. 0 means "pure primary," 1 means "pure
+    /// secondary." Post-ops set this in the transition zones.
+    blend_weight: f32,
     color: vec3<f32>,
     // Source primitive's NodeId — used so the G-buffer can tell the
     // pick path "which primitive was hit." Propagated through
@@ -161,6 +171,11 @@ struct TreeSample {
 @group(1) @binding(0) var gbuf_position: texture_storage_2d<rgba32float, write>;
 @group(1) @binding(1) var gbuf_normal:   texture_storage_2d<rgba16float, write>;
 @group(1) @binding(2) var gbuf_material: texture_storage_2d<rg32uint, write>;
+// rkp-side pick texture — R32Uint. Holds the hit primitive's NodeId
+// for per-primitive selection / outline. Moved out of packed_r's high
+// 16 bits so that slot can carry `secondary_material_id` (consumed
+// by rkp_shade for dual-material lerp).
+@group(1) @binding(3) var gbuf_pick:     texture_storage_2d<r32uint, write>;
 
 @group(2) @binding(0) var<uniform> params: RaymarchParams;
 @group(2) @binding(1) var<storage, read> instructions: array<ProcInstruction>;
@@ -236,6 +251,8 @@ fn eval_primitive(ins: ProcInstruction, world_pos: vec3<f32>) -> TreeSample {
     var s: TreeSample;
     s.distance = d;
     s.material_id = ins.material_id;
+    s.secondary_material_id = ins.material_id;
+    s.blend_weight = 0.0;
     s.color = ins.color.xyz;
     s.node_id = ins.node_id;
     return s;
@@ -264,6 +281,11 @@ fn blended_union_sample(a: TreeSample, b: TreeSample, radius: f32) -> TreeSample
     var s: TreeSample;
     s.distance = distance;
     s.material_id = select(b.material_id, a.material_id, winner_is_a);
+    // Secondary / blend come along with the winner — combinators don't
+    // blend materials across their children, only within the winner's
+    // own transition zone from a post-op.
+    s.secondary_material_id = select(b.secondary_material_id, a.secondary_material_id, winner_is_a);
+    s.blend_weight = select(b.blend_weight, a.blend_weight, winner_is_a);
     s.color = mix(b.color, a.color, t);
     s.node_id = select(b.node_id, a.node_id, winner_is_a);
     return s;
@@ -298,6 +320,8 @@ fn combine_subtract(a: TreeSample, b: TreeSample) -> TreeSample {
     var r: TreeSample;
     r.distance = neg_b;
     r.material_id = a.material_id;
+    r.secondary_material_id = a.secondary_material_id;
+    r.blend_weight = a.blend_weight;
     r.color = a.color;
     r.node_id = a.node_id;
     return r;
@@ -384,14 +408,6 @@ fn eval_tree(world_pos: vec3<f32>) -> TreeSample {
             if (sp > 0u) {
                 let cur = pos_stack[pos_top];
                 let local = (ins.inverse_world * vec4<f32>(cur, 1.0)).xyz;
-                // Raymarch's TreeSample is primary-only — the G-buffer
-                // path can't carry secondary material yet (see known
-                // limitation in project_procedural_effects_v1). We
-                // still compute the blend alpha and pick the closer
-                // band: below the midpoint of a transition zone, use
-                // `lower`; otherwise `upper`. CPU bake + deferred
-                // shading renders the smooth transition from the
-                // dual-material fields the CPU evaluator writes.
                 let c = classify_bands(
                     local.y, ins.params_lo.x, ins.params_lo.y, ins.params_lo.z,
                 );
@@ -399,8 +415,13 @@ fn eval_tree(world_pos: vec3<f32>) -> TreeSample {
                 mats[0] = u32(ins.params_lo.w);
                 mats[1] = u32(ins.params_hi.x);
                 mats[2] = u32(ins.params_hi.y);
-                let picked = select(mats[c.lower], mats[c.upper], c.alpha >= 0.5);
-                stack[sp - 1u].material_id = picked;
+                // Dual-material writeback — rkp_shade lerps PBR props
+                // using blend_weight. Primary = lower band, secondary
+                // = upper band; in "pure" zones lower == upper and
+                // alpha == 0 so the lerp is a no-op.
+                stack[sp - 1u].material_id = mats[c.lower];
+                stack[sp - 1u].secondary_material_id = mats[c.upper];
+                stack[sp - 1u].blend_weight = c.alpha;
             }
             continue;
         }
@@ -443,10 +464,10 @@ fn eval_tree(world_pos: vec3<f32>) -> TreeSample {
                 mats[0] = u32(ins.params_hi.z);
                 mats[1] = u32(ins.params_hi.w);
                 mats[2] = u32(ins.color.x);
-                // Primary-only writeback — same limitation as
-                // MaterialByHeight. CPU bake carries dual material.
-                let picked = select(mats[c.lower], mats[c.upper], c.alpha >= 0.5);
-                stack[sp - 1u].material_id = picked;
+                // Dual-material writeback, same as MaterialByHeight.
+                stack[sp - 1u].material_id = mats[c.lower];
+                stack[sp - 1u].secondary_material_id = mats[c.upper];
+                stack[sp - 1u].blend_weight = c.alpha;
             }
             continue;
         }
@@ -512,6 +533,8 @@ fn eval_tree(world_pos: vec3<f32>) -> TreeSample {
         var miss: TreeSample;
         miss.distance = 1e30;
         miss.material_id = 0u;
+        miss.secondary_material_id = 0u;
+        miss.blend_weight = 0.0;
         miss.color = vec3<f32>(0.0);
         miss.node_id = 0xFFFFFFFFu;
         return miss;
@@ -757,6 +780,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(gbuf_position, coord, vec4<f32>(0.0, 0.0, 0.0, 1e10));
         textureStore(gbuf_normal,   coord, vec4<f32>(0.0, 0.0, 0.0, 0.0));
         textureStore(gbuf_material, coord, vec4<u32>(0u, 0u, 0u, 0u));
+        // 0xFFFF = "no primitive" sentinel the outline + pick paths
+        // treat as a miss.
+        textureStore(gbuf_pick,     coord, vec4<u32>(0xFFFFu, 0u, 0u, 0u));
         return;
     }
 
@@ -772,28 +798,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let normal = normalize((params.entity_world * vec4<f32>(local_normal, 0.0)).xyz);
 
     // Pack material/color into the same G-buffer format octree_march
-    // uses — see that shader for the layout. Secondary material is
-    // repurposed in this shader to carry the hit primitive's NodeId
-    // (capped at 16 bits, same field width secondary_material normally
-    // occupies): shade doesn't read the secondary slot, and the pick
-    // readback wants a stable place to land. Combinators keep
-    // `u32::MAX`, which fits in 16 bits as `0xFFFFu` — the pick path
-    // treats that sentinel as "no primitive."
+    // uses — see that shader for the layout. Dual-material:
     //
-    // Blend is always 0 here (dual-material output isn't wired through
-    // the raymarch path); object_id byte is the owning entity's
-    // scene_id so it still resolves via the same pick-readback table
-    // on MAIN if we ever enable this on that viewport.
+    //   packed_r = primary (low 16) | secondary (high 16)
+    //   packed_g = blend_u8 | object_id_u8 << 8 | color_rgb565 << 16
+    //
+    // `rkp_shade` now lerps PBR properties between primary/secondary
+    // using blend_weight, so by-height / by-noise transition zones
+    // render with smooth seams both here and in the voxel path.
+    //
+    // The hit primitive's NodeId lives in `gbuf_pick` instead of the
+    // old packed_r high-16 slot. `0xFFFF` is the "no primitive"
+    // sentinel consumed by proc_outline + the engine's pick readback.
     let primary = hit_sample.material_id & 0xFFFFu;
+    let secondary = hit_sample.secondary_material_id & 0xFFFFu;
+    let blend_u8 = u32(clamp(hit_sample.blend_weight, 0.0, 1.0) * 255.0);
     let primitive_node_id = hit_sample.node_id & 0xFFFFu;
-    let blend = 0u;
     let cr = u32(clamp(hit_sample.color.r, 0.0, 1.0) * 31.0);
     let cg = u32(clamp(hit_sample.color.g, 0.0, 1.0) * 63.0);
     let cb = u32(clamp(hit_sample.color.b, 0.0, 1.0) * 31.0);
     let color_rgb565 = cr | (cg << 5u) | (cb << 11u);
 
-    let packed_r = primary | (primitive_node_id << 16u);
-    let packed_g = (blend & 0xFFu)
+    let packed_r = primary | (secondary << 16u);
+    let packed_g = (blend_u8 & 0xFFu)
                  | ((params.object_id & 0xFFu) << 8u)
                  | (color_rgb565 << 16u);
 
@@ -805,4 +832,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(gbuf_position, coord, vec4<f32>(hit_pos, world_t));
     textureStore(gbuf_normal,   coord, vec4<f32>(normal, 1.0));
     textureStore(gbuf_material, coord, vec4<u32>(packed_r, packed_g, 0u, 0u));
+    textureStore(gbuf_pick,     coord, vec4<u32>(primitive_node_id, 0u, 0u, 0u));
 }

@@ -459,10 +459,14 @@ impl EngineState {
         input_system.set_active_map("editor");
         let camera_control = CameraControlState::default();
 
-        // Pick readback buffer — 1 pixel of Rg32Uint (8 bytes), 256-byte aligned.
+        // Pick readback buffer — two 1-pixel slots packed at 256-byte
+        // aligned offsets: material (Rg32Uint, 8 bytes) at 0..8, pick
+        // (R32Uint, 4 bytes) at 256..260. `process_pick_result` reads
+        // both to resolve voxel / procedural picks cleanly now that
+        // primitive_node_id lives in its own texture.
         let pick_readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rkp pick readback"),
-            size: 256, // wgpu requires COPY_DST alignment
+            size: 512,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1042,6 +1046,14 @@ impl EngineState {
             // pending pick targets. Only one pick is in flight at a time;
             // the viewport tag + raymarch/voxel mode drives decoding
             // inside `process_pick_result`.
+            //
+            // Two copies into the same 256-byte aligned readback buffer:
+            //   offset 0..8   : gbuf_material pixel (packed_r + packed_g)
+            //   offset 128..132: gbuf_pick pixel (primitive_node_id)
+            // The second offset is 128 because wgpu requires each copy's
+            // destination to be 256-byte aligned and bytes_per_row ≥ 256,
+            // which pads each 1×1 region to 256 bytes. Using a second
+            // buffer would also work; packing into one is simpler.
             if let Some(pp) = self.pending_pick {
                 if pp.viewport == viewport_id && pp.x < vr.width && pp.y < vr.height {
                     pick_issued = true;
@@ -1056,6 +1068,23 @@ impl EngineState {
                             buffer: &self.pick_readback_buffer,
                             layout: wgpu::TexelCopyBufferLayout {
                                 offset: 0,
+                                bytes_per_row: Some(256),
+                                rows_per_image: Some(1),
+                            },
+                        },
+                        wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                    );
+                    encoder.copy_texture_to_buffer(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &vr.pick_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d { x: pp.x, y: pp.y, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: &self.pick_readback_buffer,
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: 256,
                                 bytes_per_row: Some(256),
                                 rows_per_image: Some(1),
                             },
@@ -1562,9 +1591,10 @@ impl EngineState {
                 // Compute bounds and voxelize the procedural tree.
                 let (aabb, voxel_size) = procedural_voxel_params(&proc_geo.tree, proc_geo.voxel_size);
                 let tree_ref = &proc_geo.tree;
-                let sdf_fn = |pos: glam::Vec3| -> (f32, u16) {
+                let sdf_fn = |pos: glam::Vec3| -> (f32, u16, u16, u8) {
                     let sample = rkp_procedural::sample_tree(tree_ref, pos, voxel_size);
-                    (sample.distance, sample.material_id)
+                    let blend_u4 = (sample.blend_weight * 15.0).round().clamp(0.0, 15.0) as u8;
+                    (sample.distance, sample.material_id, sample.secondary_material_id, blend_u4)
                 };
 
                 let result = self.scene_mgr.voxelize_sdf_fn(
@@ -3311,11 +3341,18 @@ impl EngineState {
         // closure consults this to skip Union children whose AABB is
         // farther than the running-min distance at a sample point.
         let aabb_cache = rkp_procedural::compute_all_bounds(&tree_clone);
-        let sdf_fn = |pos: glam::Vec3| -> (f32, u16) {
+        let sdf_fn = |pos: glam::Vec3| -> (f32, u16, u16, u8) {
             let sample = rkp_procedural::sample_tree_cached(
                 &tree_clone, pos, voxel_size, &aabb_cache,
             );
-            (sample.distance, sample.material_id)
+            // Quantize the evaluator's 0..1 blend_weight into the 4-bit
+            // (0..15) range LeafAttr packs. The voxelizer forwards this
+            // straight into LeafAttr::new_blended so MaterialByHeight
+            // / MaterialByNoise transition zones land in the bake's
+            // secondary + blend fields, unblocking rkp_shade's PBR
+            // lerp on the MAIN viewport.
+            let blend_u4 = (sample.blend_weight * 15.0).round().clamp(0.0, 15.0) as u8;
+            (sample.distance, sample.material_id, sample.secondary_material_id, blend_u4)
         };
         let t_after_bounds = t_entity_start.elapsed();
 
@@ -4690,7 +4727,7 @@ impl EngineState {
 
     fn process_pick_result(&mut self) {
         let pending = self.pending_pick.take();
-        let slice = self.pick_readback_buffer.slice(..256);
+        let slice = self.pick_readback_buffer.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
@@ -4699,18 +4736,23 @@ impl EngineState {
 
         if let Ok(Ok(())) = rx.recv() {
             let data = slice.get_mapped_range();
-            if data.len() >= 8 {
-                // Material G-buffer (Rg32Uint): R = material ids (+ NodeId in raymarch),
-                //                                G = blend | object_id+1 | color_rgb565.
+            if data.len() >= 260 {
+                // Material G-buffer (Rg32Uint, at offset 0):
+                //   R = primary (low16) | secondary (high16)
+                //   G = blend (lo8) | object_id+1 (8-15) | color_rgb565 (16-31)
+                // Pick G-buffer (R32Uint, at offset 256):
+                //   primitive_node_id (low16 for procedural hits,
+                //   0xFFFF for misses / combinators / voxel hits).
                 let r_channel = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                 let g_channel = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                let pick_channel = u32::from_le_bytes([data[256], data[257], data[258], data[259]]);
+                let _ = r_channel; // primary/secondary material ids not needed for pick
                 let obj_raw = (g_channel >> 8) & 0xFF;
 
-                // Dispatch by viewport. BUILD + raymarch decodes the
-                // NodeId from `packed_r`'s upper 16 bits (where the
-                // shader packed it — see proc_raymarch.wgsl). Any
-                // other combination picks a scene entity via the same
-                // scene_id table MAIN has always used.
+                // Dispatch by viewport. BUILD + raymarch resolves the
+                // NodeId from the dedicated pick texture. Other paths
+                // (MAIN + voxel, or BUILD + voxel) fall back to the
+                // same scene_id table — entity-granularity pick.
                 let is_build_raymarch = pending.map(|pp| {
                     pp.viewport == crate::viewport::ViewportId::BUILD
                 }).unwrap_or(false)
@@ -4729,11 +4771,11 @@ impl EngineState {
                     if let Some(ghost_id) = pending.and_then(|pp| pp.ghost_pick_node_id) {
                         self.selected_procedural_node = Some(ghost_id);
                     } else {
-                        let node_id_16 = (r_channel >> 16) & 0xFFFFu32;
-                        // Shader packs `u32::MAX` for misses/combinators
-                        // as `0xFFFFu` in 16 bits — treat as "no
-                        // selection" and clear any previously-selected
-                        // node so click-on-empty deselects.
+                        let node_id_16 = pick_channel & 0xFFFFu32;
+                        // Shader writes 0xFFFF for misses/combinators;
+                        // treat as "no selection" and clear any
+                        // previously-selected node so click-on-empty
+                        // deselects.
                         if obj_raw > 0 && node_id_16 != 0xFFFFu32 {
                             self.selected_procedural_node = Some(node_id_16);
                         } else {

@@ -22,16 +22,20 @@ struct OutlineParams {
     color_rgba: vec4<f32>,
 }
 
-@group(0) @binding(0) var gbuf_material: texture_2d<u32>;
+@group(0) @binding(0) var gbuf_pick: texture_2d<u32>;
 @group(0) @binding(1) var<uniform> params: OutlineParams;
 
 const INVALID_NODE: u32 = 0xFFFFu;
 
+// Pick texture is `R32Uint` — proc_raymarch writes the hit primitive's
+// NodeId into the low 16 bits (combinators/misses write 0xFFFF as
+// the "no primitive" sentinel). Moved out of the shared material
+// G-buffer to free its high 16 bits for `secondary_material_id`.
 fn node_at(coord: vec2<i32>) -> u32 {
-    let dims = textureDimensions(gbuf_material);
+    let dims = textureDimensions(gbuf_pick);
     let clamped = clamp(coord, vec2<i32>(0), vec2<i32>(dims) - vec2<i32>(1));
-    let packed = textureLoad(gbuf_material, clamped, 0).r;
-    return (packed >> 16u) & 0xFFFFu;
+    let packed = textureLoad(gbuf_pick, clamped, 0).r;
+    return packed & 0xFFFFu;
 }
 
 @vertex

@@ -770,8 +770,10 @@ impl RkpSceneManager {
             }
         };
 
-        let sdf_with_material = |pos: glam::Vec3| -> (f32, u16) {
-            (sdf_fn(pos), material_id)
+        let sdf_with_material = |pos: glam::Vec3| -> (f32, u16, u16, u8) {
+            // Single-material import path — secondary/blend left at 0,
+            // so the shader's dual-material guard short-circuits.
+            (sdf_fn(pos), material_id, 0, 0)
         };
 
         let r = rkp_core::voxelize_octree::voxelize_octree(
@@ -805,7 +807,12 @@ impl RkpSceneManager {
 
     /// Voxelize an arbitrary SDF function into the octree.
     ///
-    /// The closure returns `(signed_distance, material_id)`. Negative = inside.
+    /// The closure returns `(signed_distance, primary_material,
+    /// secondary_material, blend_weight_u4)`. Negative distance =
+    /// inside. Pass `(secondary = primary, blend = 0)` for single-
+    /// material voxelization; the shader's dual-material lerp is
+    /// guarded behind `blend_weight > 0` so zero-blend voxels render
+    /// identically to the old single-material path.
     pub fn voxelize_sdf_fn<F>(
         &mut self,
         sdf_fn: F,
@@ -814,7 +821,7 @@ impl RkpSceneManager {
         object_id: u32,
     ) -> Option<VoxelizeResult>
     where
-        F: Fn(glam::Vec3) -> (f32, u16),
+        F: Fn(glam::Vec3) -> (f32, u16, u16, u8),
     {
         let r = rkp_core::voxelize_octree::voxelize_octree(
             sdf_fn, aabb, voxel_size, &mut self.leaf_attr_pool, &mut self.brick_pool,

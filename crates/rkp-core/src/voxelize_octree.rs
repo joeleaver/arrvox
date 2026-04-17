@@ -62,11 +62,19 @@ pub struct VoxelizeOctreeResult {
 
 /// Voxelize a signed distance function into a sparse octree.
 ///
-/// `sdf_fn`: returns `(signed_distance, material_id)` at a world-space
-/// position. Negative distance = inside the surface. The 1-Lipschitz
-/// property of an SDF is what makes the coarse-level Empty/Interior
-/// classifier provably correct — the input should be a true signed
-/// distance, not an arbitrary scalar field that's merely sign-correct.
+/// `sdf_fn`: returns `(signed_distance, primary_material, secondary_material,
+/// blend_weight_u4)` at a world-space position. Negative distance =
+/// inside the surface. The 1-Lipschitz property of an SDF is what makes
+/// the coarse-level Empty/Interior classifier provably correct — the
+/// input should be a true signed distance, not an arbitrary scalar
+/// field that's merely sign-correct.
+///
+/// `blend_weight_u4` is in `[0, 15]` (the 4-bit range `LeafAttr` can
+/// store). Pass `0` for single-material voxelization — the secondary
+/// material field is then ignored by the shader's dual-material lerp
+/// (which is guarded behind `blend_weight > 0`). Callers coming from
+/// a float blend (`0.0..1.0`) should quantize via
+/// `(b * 15.0).round().clamp(0.0, 15.0) as u8`.
 ///
 /// `aabb`: world-space bounding box of the object.
 /// `base_voxel_size`: voxel size at the finest level.
@@ -78,7 +86,7 @@ pub fn voxelize_octree<F>(
     brick_pool: &mut BrickPool,
 ) -> Option<VoxelizeOctreeResult>
 where
-    F: Fn(Vec3) -> (f32, u16),
+    F: Fn(Vec3) -> (f32, u16, u16, u8),
 {
     let aabb_size = aabb.max - aabb.min;
     let max_dim = aabb_size.x.max(aabb_size.y).max(aabb_size.z);
@@ -220,7 +228,7 @@ fn subdivide_node<F>(
     base_voxel_size: f32,
 ) -> Option<()>
 where
-    F: Fn(Vec3) -> (f32, u16),
+    F: Fn(Vec3) -> (f32, u16, u16, u8),
 {
     let classification = classify_region(sdf_fn, world_min, node_extent);
 
@@ -250,19 +258,19 @@ where
                                 cz as f32 * cell_size,
                             );
                             let cell_center = cell_min + Vec3::splat(cell_size * 0.5);
-                            let (d_center, material_id) = sdf_fn(cell_center);
+                            let (d_center, primary, secondary, blend) = sdf_fn(cell_center);
                             if d_center > 0.0 {
                                 // Cell outside the surface — leave as EMPTY.
                                 continue;
                             }
                             // Cell inside: compute SDF-gradient normal.
                             let eps = cell_size * 0.5;
-                            let (d_xp, _) = sdf_fn(cell_center + Vec3::new(eps, 0.0, 0.0));
-                            let (d_xm, _) = sdf_fn(cell_center - Vec3::new(eps, 0.0, 0.0));
-                            let (d_yp, _) = sdf_fn(cell_center + Vec3::new(0.0, eps, 0.0));
-                            let (d_ym, _) = sdf_fn(cell_center - Vec3::new(0.0, eps, 0.0));
-                            let (d_zp, _) = sdf_fn(cell_center + Vec3::new(0.0, 0.0, eps));
-                            let (d_zm, _) = sdf_fn(cell_center - Vec3::new(0.0, 0.0, eps));
+                            let (d_xp, _, _, _) = sdf_fn(cell_center + Vec3::new(eps, 0.0, 0.0));
+                            let (d_xm, _, _, _) = sdf_fn(cell_center - Vec3::new(eps, 0.0, 0.0));
+                            let (d_yp, _, _, _) = sdf_fn(cell_center + Vec3::new(0.0, eps, 0.0));
+                            let (d_ym, _, _, _) = sdf_fn(cell_center - Vec3::new(0.0, eps, 0.0));
+                            let (d_zp, _, _, _) = sdf_fn(cell_center + Vec3::new(0.0, 0.0, eps));
+                            let (d_zm, _, _, _) = sdf_fn(cell_center - Vec3::new(0.0, 0.0, eps));
                             let grad = Vec3::new(
                                 d_xp - d_xm,
                                 d_yp - d_ym,
@@ -273,7 +281,7 @@ where
                             } else {
                                 Vec3::Y
                             };
-                            let attr = LeafAttr::new(normal, material_id);
+                            let attr = LeafAttr::new_blended(normal, primary, secondary, blend);
                             let leaf_attr_id = if let Some(&existing) = attr_dedup.get(&attr) {
                                 existing
                             } else {
@@ -302,7 +310,7 @@ where
                 // At the finest level: sample the center. If it's inside
                 // the surface, create a leaf with its SDF-gradient normal.
                 let voxel_center = world_min + Vec3::splat(base_voxel_size * 0.5);
-                let (d_center, material_id) = sdf_fn(voxel_center);
+                let (d_center, primary, secondary, blend) = sdf_fn(voxel_center);
                 if d_center > 0.0 {
                     // Center is outside — this corner of a Mixed region is
                     // not itself solid. Leave it EMPTY.
@@ -314,12 +322,12 @@ where
                 // increasing distance), which is exactly the surface
                 // normal we want — no sign flip.
                 let eps = base_voxel_size * 0.5;
-                let (d_xp, _) = sdf_fn(voxel_center + Vec3::new(eps, 0.0, 0.0));
-                let (d_xm, _) = sdf_fn(voxel_center - Vec3::new(eps, 0.0, 0.0));
-                let (d_yp, _) = sdf_fn(voxel_center + Vec3::new(0.0, eps, 0.0));
-                let (d_ym, _) = sdf_fn(voxel_center - Vec3::new(0.0, eps, 0.0));
-                let (d_zp, _) = sdf_fn(voxel_center + Vec3::new(0.0, 0.0, eps));
-                let (d_zm, _) = sdf_fn(voxel_center - Vec3::new(0.0, 0.0, eps));
+                let (d_xp, _, _, _) = sdf_fn(voxel_center + Vec3::new(eps, 0.0, 0.0));
+                let (d_xm, _, _, _) = sdf_fn(voxel_center - Vec3::new(eps, 0.0, 0.0));
+                let (d_yp, _, _, _) = sdf_fn(voxel_center + Vec3::new(0.0, eps, 0.0));
+                let (d_ym, _, _, _) = sdf_fn(voxel_center - Vec3::new(0.0, eps, 0.0));
+                let (d_zp, _, _, _) = sdf_fn(voxel_center + Vec3::new(0.0, 0.0, eps));
+                let (d_zm, _, _, _) = sdf_fn(voxel_center - Vec3::new(0.0, 0.0, eps));
                 let grad = Vec3::new(d_xp - d_xm, d_yp - d_ym, d_zp - d_zm);
                 let normal = if grad.length_squared() > 1e-12 {
                     grad.normalize()
@@ -329,7 +337,7 @@ where
                     Vec3::Y
                 };
 
-                let attr = LeafAttr::new(normal, material_id);
+                let attr = LeafAttr::new_blended(normal, primary, secondary, blend);
                 let leaf_attr_id = if let Some(&existing) = attr_dedup.get(&attr) {
                     existing
                 } else {
@@ -397,7 +405,7 @@ enum RegionClass {
 /// * Otherwise the surface may intersect the node → Mixed.
 fn classify_region<F>(sdf_fn: &F, world_min: Vec3, extent: f32) -> RegionClass
 where
-    F: Fn(Vec3) -> (f32, u16),
+    F: Fn(Vec3) -> (f32, u16, u16, u8),
 {
     let threshold = extent * 0.5;
     let mut all_outside = true;
@@ -412,7 +420,7 @@ where
                         cy as f32 * extent,
                         cz as f32 * extent,
                     );
-                let (d, _) = sdf_fn(pos);
+                let (d, _, _, _) = sdf_fn(pos);
                 if d <= threshold { all_outside = false; }
                 if d >= -threshold { all_inside = false; }
             }
@@ -420,7 +428,7 @@ where
     }
 
     let center = world_min + Vec3::splat(extent * 0.5);
-    let (d_center, _) = sdf_fn(center);
+    let (d_center, _, _, _) = sdf_fn(center);
     if d_center <= threshold { all_outside = false; }
     if d_center >= -threshold { all_inside = false; }
 
@@ -448,9 +456,9 @@ pub fn voxelize_sphere_octree(
         max: center + Vec3::splat(radius + padding),
     };
 
-    let sdf_fn = |pos: Vec3| -> (f32, u16) {
+    let sdf_fn = |pos: Vec3| -> (f32, u16, u16, u8) {
         let d = (pos - center).length() - radius;
-        (d, material_id)
+        (d, material_id, 0, 0)
     };
 
     voxelize_octree(sdf_fn, &aabb, voxel_size, leaf_attr_pool, brick_pool)
@@ -488,7 +496,7 @@ mod tests {
         let mut attrs = LeafAttrPool::new(256);
         let mut bricks = BrickPool::new(64);
         let aabb = Aabb { min: Vec3::ZERO, max: Vec3::splat(1.0) };
-        let r = voxelize_octree(|_| (1000.0, 0), &aabb, 0.1, &mut attrs, &mut bricks).unwrap();
+        let r = voxelize_octree(|_| (1000.0, 0, 0, 0), &aabb, 0.1, &mut attrs, &mut bricks).unwrap();
 
         assert_eq!(r.voxel_count, 0);
         assert_eq!(r.brick_ids.len(), 0);
@@ -500,7 +508,7 @@ mod tests {
         let mut attrs = LeafAttrPool::new(256);
         let mut bricks = BrickPool::new(64);
         let aabb = Aabb { min: Vec3::ZERO, max: Vec3::splat(0.05) };
-        let r = voxelize_octree(|_| (-1000.0, 0), &aabb, 0.1, &mut attrs, &mut bricks).unwrap();
+        let r = voxelize_octree(|_| (-1000.0, 0, 0, 0), &aabb, 0.1, &mut attrs, &mut bricks).unwrap();
 
         assert_eq!(r.voxel_count, 0, "fully inside should collapse to INTERIOR");
         assert_eq!(r.brick_ids.len(), 0);

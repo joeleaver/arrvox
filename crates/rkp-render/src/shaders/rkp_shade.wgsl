@@ -380,26 +380,49 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let packed_r = mat_data.r;
     let packed_g = mat_data.g;
 
-    // Unpack material IDs.
+    // Unpack material IDs + blend.
     let primary_mat_id = packed_r & 0xFFFFu;
+    let secondary_mat_id = (packed_r >> 16u) & 0xFFFFu;
     let blend_weight = f32(packed_g & 0xFFu) / 255.0;
 
-    // Resolve material — metallic/roughness/emission always come from the
-    // palette; base_color is only used when the voxel has no per-voxel color.
-    // When the voxel carries a color, it REPLACES the material's base_color
-    // rather than modulating it — otherwise any non-white material tint dims
-    // textured surfaces on every pixel.
-    let mat = materials[primary_mat_id];
+    // Resolve material. Metallic/roughness/emission come from the
+    // palette; base_color is used for the albedo unless a per-voxel
+    // color override (RGB565 in packed_g high 16) is present.
+    //
+    // Dual-material path: octree_march (voxel) and proc_raymarch
+    // (procedural, eventually) can both write a secondary material +
+    // non-zero blend_weight for smooth seams across MaterialByHeight
+    // / MaterialByNoise transition zones. We lerp every PBR property
+    // in linear space. The secondary palette lookup is guarded behind
+    // `blend_weight > 0` — some paths currently reuse the secondary
+    // slot for pick IDs (see proc_raymarch) and those pixels always
+    // have blend=0, so the guard prevents an out-of-bounds material
+    // read on stale bits. Once pick IDs move to a dedicated texture
+    // the guard is still desirable (free early-out on single-material
+    // pixels, which is the common case).
+    let mat_a = materials[primary_mat_id];
+    var base_color = mat_a.base_color.rgb;
+    var metallic_raw = mat_a.metallic;
+    var roughness_raw = mat_a.roughness;
+    var emission_strength = mat_a.emission_strength;
+    if blend_weight > 0.0 {
+        let mat_b = materials[secondary_mat_id];
+        base_color = mix(base_color, mat_b.base_color.rgb, blend_weight);
+        metallic_raw = mix(metallic_raw, mat_b.metallic, blend_weight);
+        roughness_raw = mix(roughness_raw, mat_b.roughness, blend_weight);
+        emission_strength = mix(emission_strength, mat_b.emission_strength, blend_weight);
+    }
+
     let color_rgb565 = (packed_g >> 16u) & 0xFFFFu;
-    var albedo = mat.base_color.rgb;
+    var albedo = base_color;
     if color_rgb565 != 0u {
         let cr5 = color_rgb565 & 0x1Fu;
         let cg6 = (color_rgb565 >> 5u) & 0x3Fu;
         let cb5 = (color_rgb565 >> 11u) & 0x1Fu;
         albedo = vec3<f32>(f32(cr5) / 31.0, f32(cg6) / 63.0, f32(cb5) / 31.0);
     }
-    let metallic = mat.metallic;
-    let roughness = max(mat.roughness, 0.04);
+    let metallic = metallic_raw;
+    let roughness = max(roughness_raw, 0.04);
 
     // View direction.
     let V = normalize(camera.position.xyz - world_pos);
@@ -563,8 +586,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ambient_specular = ms_irradiance * F_env * ao;
     let ambient = ambient_diffuse + ambient_specular;
 
-    // Emission.
-    let emission = mat.base_color.rgb * mat.emission_strength;
+    // Emission — drive from the (possibly blended) base_color and
+    // emission_strength, so a secondary material emitting in the
+    // transition zone properly shows through.
+    let emission = base_color * emission_strength;
 
     var final_color = lo + ambient + emission;
 

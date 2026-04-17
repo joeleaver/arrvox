@@ -93,8 +93,13 @@ impl ProcRaymarchPass {
                 }],
             });
 
-        // Group 1: G-buffer (same triple as OctreeMarch — position,
-        // normal, material).
+        // Group 1: G-buffer (same triple as OctreeMarch for position,
+        // normal, material) plus a 4th rkp-side pick texture. The pick
+        // slot holds the hit primitive's NodeId so packed_r's high 16
+        // bits on the shared material G-buffer stay available for
+        // `secondary_material_id` — which is what `rkp_shade` reads
+        // for dual-material lerp. Not part of rkf_render::GBuffer
+        // because it's rkp-specific; see `ViewportRenderer::pick_view`.
         let gbuffer_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("proc_raymarch gbuffer layout"),
@@ -102,6 +107,7 @@ impl ProcRaymarchPass {
                     bgl_storage_tex(0, wgpu::TextureFormat::Rgba32Float),
                     bgl_storage_tex(1, wgpu::TextureFormat::Rgba16Float),
                     bgl_storage_tex(2, wgpu::TextureFormat::Rg32Uint),
+                    bgl_storage_tex(3, wgpu::TextureFormat::R32Uint),
                 ],
             });
 
@@ -205,13 +211,15 @@ impl ProcRaymarchPass {
     }
 
     /// Wire the viewport's G-buffer views into this pass. Re-call after
-    /// a G-buffer resize.
+    /// a G-buffer resize. `pick_view` is the rkp-side `R32Uint` pick
+    /// texture that receives the hit primitive's NodeId.
     pub fn set_gbuffer(
         &mut self,
         device: &wgpu::Device,
         position_view: &wgpu::TextureView,
         normal_view: &wgpu::TextureView,
         material_view: &wgpu::TextureView,
+        pick_view: &wgpu::TextureView,
     ) {
         self.gbuffer_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("proc_raymarch gbuffer"),
@@ -228,6 +236,10 @@ impl ProcRaymarchPass {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::TextureView(material_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(pick_view),
                 },
             ],
         }));

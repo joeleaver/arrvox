@@ -63,6 +63,18 @@ pub struct ViewportRenderer {
 
     // ── Per-VR render targets + post-process ───────────────────────
     pub gbuffer: rkf_render::GBuffer,
+    /// rkp-side pick G-buffer — `R32Uint` sibling of the shared
+    /// `rkf_render::GBuffer`'s material texture. Holds `primitive_node_id`
+    /// for procedural raymarch hits so packed_r's high 16 bits in the
+    /// shared material G-buffer can carry `secondary_material_id` for
+    /// dual-material shading. Not part of `rkf_render::GBuffer`
+    /// (sibling-project invariants) and not read by `rkp_shade` —
+    /// only `proc_outline` and the engine's pick-readback path
+    /// consume it. For voxel hits from `octree_march` this slot is
+    /// left unwritten; MAIN viewport resolves picks via `object_id`
+    /// in packed_g, same as before.
+    pub pick_texture: wgpu::Texture,
+    pub pick_view: wgpu::TextureView,
     pub bloom: rkf_render::BloomPass,
     pub bloom_composite: rkf_render::BloomCompositePass,
     pub tone_map: rkf_render::ToneMapPass,
@@ -108,6 +120,10 @@ impl ViewportRenderer {
         // Gbuffer.
         let gbuffer = rkf_render::GBuffer::new(device, width, height);
 
+        // rkp-side pick texture (R32Uint). Written by the procedural
+        // raymarch, read by `proc_outline` and the pick readback.
+        let (pick_texture, pick_view) = create_pick_texture(device, width, height);
+
         // Per-VR passes. Each wired to: (a) its own gbuffer views, (b)
         // the shared scene bind-group layout + shared buffers on renderer.
         let mut march = OctreeMarchPass::new(device, &renderer.scene.bind_group_layout);
@@ -121,11 +137,11 @@ impl ViewportRenderer {
         // the rest of the chain.
         let mut proc_raymarch = ProcRaymarchPass::new(device);
         proc_raymarch.set_camera(device, &camera_buffer);
-        proc_raymarch.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view);
+        proc_raymarch.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view);
 
-        // Outline overlay — rebind the material gbuffer view on resize.
+        // Outline overlay — rebind the pick gbuffer view on resize.
         let mut proc_outline = ProcOutlinePass::new(device, rkf_render::LDR_FORMAT);
-        proc_outline.set_gbuffer(device, &gbuffer.material_view);
+        proc_outline.set_gbuffer(device, &pick_view);
 
         let mut proc_ghost = ProcGhostPass::new(device, rkf_render::LDR_FORMAT);
         proc_ghost.set_camera(device, &camera_buffer);
@@ -204,7 +220,7 @@ impl ViewportRenderer {
             camera_buffer, scene_bind_group, scene_epoch, lights_materials_epoch,
             march, proc_raymarch, proc_outline, proc_ghost,
             shadow_trace, ssao, shade, volumetric, god_rays,
-            gbuffer, bloom, bloom_composite, tone_map,
+            gbuffer, pick_texture, pick_view, bloom, bloom_composite, tone_map,
             composite_texture, composite_view,
             readback_buffers, readback_index: 0, readback_ready: false,
             wireframe_pass, grid, width, height,
@@ -257,11 +273,14 @@ impl ViewportRenderer {
 
         // Gbuffer.
         self.gbuffer = rkf_render::GBuffer::new(device, width, height);
+        let (pick_texture, pick_view) = create_pick_texture(device, width, height);
+        self.pick_texture = pick_texture;
+        self.pick_view = pick_view;
 
         // Per-VR passes — resize internal textures + re-wire gbuffer bindings.
         self.march.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view);
-        self.proc_raymarch.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view);
-        self.proc_outline.set_gbuffer(device, &self.gbuffer.material_view);
+        self.proc_raymarch.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view);
+        self.proc_outline.set_gbuffer(device, &self.pick_view);
 
         self.ssao.resize(device, width, height);
         self.ssao.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view);
@@ -360,4 +379,25 @@ fn create_readback_buffer(device: &wgpu::Device, width: u32, height: u32) -> wgp
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     })
+}
+
+fn create_pick_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("rkp pick"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Uint,
+        usage: wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&Default::default());
+    (tex, view)
 }
