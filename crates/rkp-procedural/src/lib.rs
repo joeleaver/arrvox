@@ -13,6 +13,7 @@ mod evaluate;
 pub mod flatten;
 mod leaves;
 pub mod node_kind;
+pub mod noise;
 mod sample;
 mod version;
 

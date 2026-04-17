@@ -167,6 +167,14 @@ impl ProceduralObject {
     /// Add a child node under the given parent. Returns the new node's ID.
     ///
     /// Panics if `parent` doesn't exist or is a leaf shape (leaves can't have children).
+    ///
+    /// If `parent`'s kind has a child cap (e.g. a single-child effect
+    /// like `NoiseDisplace` that already has one child), the existing
+    /// over-cap children are evicted to `parent`'s grandparent — they
+    /// become siblings of `parent` immediately after it — before the
+    /// new child is appended. Falls back to no eviction if `parent` is
+    /// the root (nowhere to evict to); in that case the cap is relaxed
+    /// for this call and the caller is expected to clean up.
     pub fn add_child(&mut self, parent: NodeId, kind: NodeKind) -> NodeId {
         let parent_node = self.nodes[parent.0 as usize]
             .as_ref()
@@ -175,6 +183,10 @@ impl ProceduralObject {
             !parent_node.kind.is_leaf(),
             "cannot add children to a leaf node"
         );
+
+        // Evict anything that would push the count past the cap. One
+        // incoming child, so we need room for exactly one.
+        self.evict_over_cap(parent, 1);
 
         let id = NodeId(self.nodes.len() as u32);
         let mut node = Node::new(kind);
@@ -196,6 +208,83 @@ impl ProceduralObject {
         self.propagate_version(parent);
 
         id
+    }
+
+    /// If `parent`'s kind has a child cap, evict existing children to
+    /// the grandparent so that after adding `incoming_count` more, the
+    /// cap is respected. Evictees are inserted into the grandparent's
+    /// children list right after `parent` (so the tree reads "effect,
+    /// bumped-out thing" and the user can see what got pushed aside).
+    ///
+    /// `parent` being the root, missing, or having no grandparent is a
+    /// no-op — at that point there's nowhere to evict to, and the
+    /// caller has to live with a transient over-cap state. The UI path
+    /// hides the "+" button on full effects, so this bail-out only
+    /// triggers for edge cases (root-level effects via MCP etc.).
+    fn evict_over_cap(&mut self, parent: NodeId, incoming_count: usize) {
+        let Some(cap) = self
+            .nodes
+            .get(parent.0 as usize)
+            .and_then(|n| n.as_ref())
+            .and_then(|n| n.kind.max_children())
+        else {
+            return;
+        };
+        // Snapshot the current children + grandparent so we can mutate
+        // both without fighting the borrow checker.
+        let (current, grandparent) = {
+            let node = self.nodes[parent.0 as usize].as_ref().unwrap();
+            (node.children.clone(), node.parent)
+        };
+        let total = current.len() + incoming_count;
+        if total <= cap {
+            return;
+        }
+        let Some(grandparent) = grandparent else {
+            // parent is the root — no grandparent to evict into. Leave
+            // the over-cap state alone; evaluator + flatten ignore the
+            // extras and the next drop/move into a non-root parent
+            // will sort itself out.
+            return;
+        };
+        // Number to evict: the oldest children, so the UI's "this is
+        // what got bumped" cursor lands near the top of the list.
+        let evict_count = total - cap;
+        let evict: SmallVec<[NodeId; 2]> = current.iter().take(evict_count).copied().collect();
+
+        // Find `parent`'s position in the grandparent's children so
+        // evictees land right after it.
+        let after_parent = self.nodes[grandparent.0 as usize]
+            .as_ref()
+            .and_then(|gp| gp.children.iter().position(|c| *c == parent))
+            .map(|i| i + 1)
+            .unwrap_or_else(|| {
+                self.nodes[grandparent.0 as usize]
+                    .as_ref()
+                    .map(|gp| gp.children.len())
+                    .unwrap_or(0)
+            });
+
+        // Unhook from parent's children list (in reverse so indices stay valid).
+        {
+            let parent_node = self.nodes[parent.0 as usize].as_mut().unwrap();
+            parent_node.children.retain(|c| !evict.contains(c));
+        }
+
+        // Insert each evictee into the grandparent's children and
+        // repoint its parent pointer.
+        let gp_node = self.nodes[grandparent.0 as usize].as_mut().unwrap();
+        for (i, &victim) in evict.iter().enumerate() {
+            gp_node.children.insert(after_parent + i, victim);
+        }
+        for &victim in evict.iter() {
+            if let Some(v) = self.nodes[victim.0 as usize].as_mut() {
+                v.parent = Some(grandparent);
+            }
+        }
+
+        self.propagate_version(parent);
+        self.propagate_version(grandparent);
     }
 
     /// Insert a new `Union` parent between `id` and its current parent.
@@ -400,6 +489,14 @@ impl ProceduralObject {
         if let Some(old_parent_node) = &mut self.nodes[old_parent.0 as usize] {
             old_parent_node.children.retain(|c| *c != id);
         }
+
+        // Evict existing over-cap children from the new parent before
+        // insertion — single-child effects swap their current child out
+        // to the grandparent on any drop. Runs *after* we've detached
+        // `id` from its old parent so the count math below is clean
+        // (if id was already under new_parent, it no longer appears in
+        // its children list and doesn't double-count against the cap).
+        self.evict_over_cap(new_parent, 1);
 
         // Insert into new parent's children at the clamped index.
         let new_parent_node = self.nodes[new_parent.0 as usize].as_mut().unwrap();
@@ -851,6 +948,72 @@ mod tests {
     fn duplicate_rejects_root() {
         let mut obj = ProceduralObject::new(union_kind());
         assert!(obj.duplicate(obj.root()).is_none());
+    }
+
+    /// Dropping a second child onto a single-child effect evicts the
+    /// existing child to the effect's grandparent — same semantics the
+    /// UI's drop-on-body offers, so "swap the sphere out for a union"
+    /// reads as one natural drag.
+    #[test]
+    fn move_to_evicts_over_cap_on_single_child_effect() {
+        use crate::node_kind::NoiseDisplaceParams;
+        let mut obj = ProceduralObject::new(union_kind());
+        let effect = obj.add_child(
+            obj.root(),
+            NodeKind::NoiseDisplace(NoiseDisplaceParams::default()),
+        );
+        let first = obj.add_child(effect, sphere_kind());
+        // Second child to drop — currently a sibling of the effect.
+        let incoming = obj.add_child(obj.root(), sphere_kind());
+
+        assert!(obj.move_to(incoming, effect, 0));
+
+        // Effect now owns `incoming`, not `first`.
+        let effect_kids = obj.get(effect).unwrap().children.clone();
+        assert_eq!(effect_kids.as_slice(), &[incoming]);
+
+        // `first` got evicted to the grandparent (root), inserted right
+        // after the effect in the root's children.
+        let root_kids = obj.get(obj.root()).unwrap().children.clone();
+        let effect_pos = root_kids.iter().position(|c| *c == effect).unwrap();
+        assert_eq!(root_kids[effect_pos + 1], first);
+        assert_eq!(obj.get(first).unwrap().parent, Some(obj.root()));
+    }
+
+    /// `add_child` on a full single-child effect should also evict,
+    /// not silently accept a second child. (MCP / test paths hit this.)
+    #[test]
+    fn add_child_evicts_over_cap_on_single_child_effect() {
+        use crate::node_kind::NoiseDisplaceParams;
+        let mut obj = ProceduralObject::new(union_kind());
+        let effect = obj.add_child(
+            obj.root(),
+            NodeKind::NoiseDisplace(NoiseDisplaceParams::default()),
+        );
+        let first = obj.add_child(effect, sphere_kind());
+        let second = obj.add_child(effect, sphere_kind());
+
+        // Effect caps at 1 — `first` got evicted, `second` is the child.
+        let effect_kids = obj.get(effect).unwrap().children.clone();
+        assert_eq!(effect_kids.as_slice(), &[second]);
+        assert_eq!(obj.get(first).unwrap().parent, Some(obj.root()));
+    }
+
+    /// Over-cap at the root has nowhere to evict to — behavior there is
+    /// "leave the extra alone" so evaluator's ignore-anything-past-[0]
+    /// rule still holds and nothing panics.
+    #[test]
+    fn over_cap_at_root_is_no_op() {
+        use crate::node_kind::NoiseDisplaceParams;
+        // Start with a NoiseDisplace directly as root (unusual but legal).
+        let mut obj =
+            ProceduralObject::new(NodeKind::NoiseDisplace(NoiseDisplaceParams::default()));
+        let a = obj.add_child(obj.root(), sphere_kind());
+        let b = obj.add_child(obj.root(), sphere_kind());
+
+        // Both hangs off the root because there's no grandparent to evict to.
+        let kids = obj.get(obj.root()).unwrap().children.clone();
+        assert_eq!(kids.as_slice(), &[a, b]);
     }
 
     #[test]

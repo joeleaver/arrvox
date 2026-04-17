@@ -24,6 +24,15 @@ const OP_UNION:     u32 = 100u;
 const OP_INTERSECT: u32 = 101u;
 const OP_SUBTRACT:  u32 = 102u;
 
+// Position-warp effects bracket a subtree with PUSH/POP.
+// PUSH reads params from the instruction and shoves `cur + warp` onto
+// the position stack so every primitive inside the bracket evaluates
+// at the warped position. POP undoes the push and shrinks the top
+// sample's distance by a conservative envelope (amp * sqrt(3) for
+// NoiseDisplace) so the sphere tracer stays 1-Lipschitz-safe.
+const OP_PUSH_NOISE_DISPLACE: u32 = 200u;
+const OP_POP_NOISE_DISPLACE:  u32 = 201u;
+
 const MAT_COMBINE_WINNER:  u32 = 0u;
 // `Layered` is represented but the shader treats it as Winner for now —
 // the dual-material G-buffer isn't wired through the raymarch path, so
@@ -43,6 +52,13 @@ const MAT_COMBINE_BLEND:   u32 = 2u;
 // top (behavior degrades to "drop extra children") rather than wedging
 // the shader.
 const STACK_CAP: u32 = 16u;
+
+// Max position-stack depth for nested position-warp effects. 8 allows
+// a reasonably deep chain (NoiseDisplace inside Mirror inside Twist…)
+// without eating too many vector registers. Overflow clamps — the
+// outermost push stops pushing new values; children of the dropped
+// effect evaluate at whatever position was last valid.
+const POS_STACK_CAP: u32 = 8u;
 
 // March parameters. Kept conservative to converge around typical
 // procedural geometry (primitives are 1-Lipschitz so classical sphere
@@ -271,11 +287,55 @@ fn eval_tree(world_pos: vec3<f32>) -> TreeSample {
     var stack: array<TreeSample, STACK_CAP>;
     var sp: u32 = 0u;
 
+    // Position stack. `pos_top` indexes the current sample position;
+    // `pos_stack[0]` is the outer world_pos. PUSH increments pos_top
+    // and writes the warped position; POP decrements pos_top. All
+    // primitive evaluations read from `pos_stack[pos_top]` so any
+    // bracketed subtree samples at the warped position transparently.
+    var pos_stack: array<vec3<f32>, POS_STACK_CAP>;
+    var pos_top: u32 = 0u;
+    pos_stack[0u] = world_pos;
+
     let count = params.instruction_count;
     for (var i: u32 = 0u; i < count; i = i + 1u) {
         let ins = instructions[i];
-        if (ins.op < 100u) {
-            let s = eval_primitive(ins, world_pos);
+        let op = ins.op;
+
+        // ── Position-warp effects ──────────────────────────────────
+        if (op == OP_PUSH_NOISE_DISPLACE) {
+            let cur = pos_stack[pos_top];
+            let amp  = ins.params_lo.x;
+            let freq = ins.params_lo.y;
+            let seed = u32(ins.params_lo.z);
+            let oct  = u32(ins.params_lo.w);
+            let warped = cur + rkp_fbm_3d_vec(cur, freq, seed, oct) * amp;
+            // Overflow clamp: drop the push silently rather than stomp
+            // the last slot — behavior matches the arena-side cap on
+            // how deep effects can nest.
+            if (pos_top + 1u < POS_STACK_CAP) {
+                pos_top = pos_top + 1u;
+                pos_stack[pos_top] = warped;
+            }
+            continue;
+        }
+        if (op == OP_POP_NOISE_DISPLACE) {
+            if (pos_top > 0u) {
+                pos_top = pos_top - 1u;
+            }
+            // Shrink the top sample's distance by the conservative
+            // envelope so sphere tracing stays safe — mirror of the
+            // CPU evaluator's `child.distance - amp * sqrt(3)` at the
+            // end of its NoiseDisplace arm.
+            if (sp > 0u) {
+                let amp = ins.params_lo.x;
+                stack[sp - 1u].distance = stack[sp - 1u].distance - amp * 1.7320508;
+            }
+            continue;
+        }
+
+        if (op < 100u) {
+            // Primitive — evaluates at the top of the position stack.
+            let s = eval_primitive(ins, pos_stack[pos_top]);
             if (sp < STACK_CAP) {
                 stack[sp] = s;
                 sp = sp + 1u;
@@ -294,7 +354,7 @@ fn eval_tree(world_pos: vec3<f32>) -> TreeSample {
             let blend_radius = ins.params_lo.x;
             for (var k: u32 = 1u; k < arity; k = k + 1u) {
                 let rhs = stack[base + k];
-                switch ins.op {
+                switch op {
                     case 100u: { acc = combine_union(acc, rhs, ins.material_combine, blend_radius); }
                     case 101u: { acc = combine_intersect(acc, rhs); }
                     case 102u: { acc = combine_subtract(acc, rhs); }
@@ -336,6 +396,84 @@ fn gradient_normal(p: vec3<f32>) -> vec3<f32> {
     let len = length(g);
     if (len < 1e-8) { return vec3<f32>(0.0, 1.0, 0.0); }
     return g / len;
+}
+
+// ── Noise (port of `crates/rkp-procedural/src/noise.rs`) ──────────────
+// Keep this byte-for-byte equivalent to the CPU side so a bake run
+// (CPU) and a live preview (this shader) produce identical displaced
+// geometry. WGSL u32 ops wrap by default — same semantics as Rust's
+// `wrapping_mul` / `wrapping_add`.
+
+fn rkp_hash_f32(x: u32) -> f32 {
+    var n = x;
+    n = (n ^ 61u) ^ (n >> 16u);
+    n = n * 9u;
+    n = n ^ (n >> 4u);
+    n = n * 0x27d4eb2du;
+    n = n ^ (n >> 15u);
+    return f32(n & 0x00ffffffu) * (1.0 / 16777216.0) * 2.0 - 1.0;
+}
+
+fn rkp_hash_3i(ix: i32, iy: i32, iz: i32, seed: u32) -> f32 {
+    let k = u32(ix) * 0x9e3779b9u
+          + u32(iy) * 0x7ed55d16u
+          + u32(iz) * 0xa3a52d49u
+          + seed;
+    return rkp_hash_f32(k);
+}
+
+fn rkp_smootherstep(t: f32) -> f32 {
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+fn rkp_noise_3d(pos: vec3<f32>, seed: u32) -> f32 {
+    let xf = floor(pos.x);
+    let yf = floor(pos.y);
+    let zf = floor(pos.z);
+    let ix = i32(xf);
+    let iy = i32(yf);
+    let iz = i32(zf);
+    let tx = rkp_smootherstep(pos.x - xf);
+    let ty = rkp_smootherstep(pos.y - yf);
+    let tz = rkp_smootherstep(pos.z - zf);
+    let c000 = rkp_hash_3i(ix,       iy,       iz,       seed);
+    let c100 = rkp_hash_3i(ix + 1,   iy,       iz,       seed);
+    let c010 = rkp_hash_3i(ix,       iy + 1,   iz,       seed);
+    let c110 = rkp_hash_3i(ix + 1,   iy + 1,   iz,       seed);
+    let c001 = rkp_hash_3i(ix,       iy,       iz + 1,   seed);
+    let c101 = rkp_hash_3i(ix + 1,   iy,       iz + 1,   seed);
+    let c011 = rkp_hash_3i(ix,       iy + 1,   iz + 1,   seed);
+    let c111 = rkp_hash_3i(ix + 1,   iy + 1,   iz + 1,   seed);
+    let x00 = c000 + (c100 - c000) * tx;
+    let x10 = c010 + (c110 - c010) * tx;
+    let x01 = c001 + (c101 - c001) * tx;
+    let x11 = c011 + (c111 - c011) * tx;
+    let y0 = x00 + (x10 - x00) * ty;
+    let y1 = x01 + (x11 - x01) * ty;
+    return y0 + (y1 - y0) * tz;
+}
+
+fn rkp_noise_3d_vec(pos: vec3<f32>, seed: u32) -> vec3<f32> {
+    return vec3<f32>(
+        rkp_noise_3d(pos, seed),
+        rkp_noise_3d(pos, seed + 0x9e3779b1u),
+        rkp_noise_3d(pos, seed + 0xb74684abu),
+    );
+}
+
+fn rkp_fbm_3d_vec(pos: vec3<f32>, frequency: f32, seed: u32, octaves_in: u32) -> vec3<f32> {
+    let octaves = clamp(octaves_in, 1u, 8u);
+    var sum = vec3<f32>(0.0);
+    var amp = 1.0;
+    var freq = max(frequency, 1e-6);
+    var total_amp = 0.0;
+    for (var k: u32 = 0u; k < octaves; k = k + 1u) {
+        sum = sum + rkp_noise_3d_vec(pos * freq, seed + k * 131u) * amp;
+        total_amp = total_amp + amp;
+        amp = amp * 0.5;
+        freq = freq * 2.0;
+    }
+    return sum / max(total_amp, 1e-6);
 }
 
 // ── Ray construction ───────────────────────────────────────────────────

@@ -157,6 +157,47 @@ fn sample_node(
             result
         }
 
+        NodeKind::NoiseDisplace(params) => {
+            // Single-child effect. Additional children are ignored —
+            // the add-child UI treats this as a combinator so users can
+            // attach a subtree, but the semantic is "warp the position
+            // and evaluate the first child at that warped location."
+            let children = &node.children;
+            let Some(&child_id) = children.first() else {
+                return Sample::EMPTY;
+            };
+            let warp = crate::noise::fbm_3d_vec(
+                local_pos,
+                params.frequency,
+                params.seed,
+                params.octaves,
+            ) * params.amplitude;
+            let child_sample = sample_node(
+                obj, child_id, local_pos + warp, voxel_size, cache,
+            );
+            // The child's SDF is evaluated at a point up to `amplitude`
+            // away (in each axis) from where the caller asked. That
+            // breaks 1-Lipschitz: a surface that the displaced sample
+            // places `d` units away could actually be only `d -
+            // amplitude` units from the original point. Report the
+            // conservative lower bound so the voxelizer's classifier
+            // and any sphere-tracer step on top stay safe.
+            //
+            // Material / color / opacity pass through unchanged — they
+            // come from the child's sample at the warped position.
+            let max_axis_warp = params.amplitude * (3.0f32).sqrt();
+            Sample {
+                distance: child_sample.distance - max_axis_warp,
+                ..child_sample
+            }
+        }
+
+        // Never hit — is_leaf() path above captures every leaf kind,
+        // and all non-leaf variants have explicit arms. Left as a
+        // belt-and-braces fallback so a future new NodeKind added
+        // without an evaluate arm fails safe (empty) rather than
+        // compiling to UB via unreachable!(). Intentionally inclusive
+        // of any Sample::EMPTY-valued "no-op" case.
         _ => Sample::EMPTY,
     }
 }
@@ -347,6 +388,68 @@ mod tests {
             }
         }
         assert_eq!(disagree, 0, "cached path diverged at {disagree} grid points");
+    }
+
+    /// NoiseDisplace wrapping a sphere: the center must still read
+    /// inside (warp can't teleport the surface all the way to the
+    /// origin if amplitude is less than the radius), and a point well
+    /// beyond radius + amplitude must still read outside.
+    #[test]
+    fn noise_displace_preserves_center_and_outside() {
+        use crate::node_kind::NoiseDisplaceParams;
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        let nd = obj.add_child(
+            obj.root(),
+            NodeKind::NoiseDisplace(NoiseDisplaceParams {
+                amplitude: 0.15,
+                frequency: 3.0,
+                octaves: 3,
+                seed: 7,
+                ..Default::default()
+            }),
+        );
+        obj.add_child(nd, sphere(0.5, 1));
+
+        let s_center = sample_tree(&obj, Vec3::ZERO, VS);
+        assert!(s_center.is_inside(), "center not inside, dist={}", s_center.distance);
+
+        // Well past the sphere's radius + amplitude: must be empty.
+        let s_far = sample_tree(&obj, Vec3::new(2.0, 0.0, 0.0), VS);
+        assert!(!s_far.is_inside(), "far point not outside, dist={}", s_far.distance);
+    }
+
+    /// Amplitude = 0 collapses to the undisplaced child — distances
+    /// should match a bare sphere to within f32 noise.
+    #[test]
+    fn noise_displace_zero_amplitude_is_identity() {
+        use crate::node_kind::NoiseDisplaceParams;
+        let mut displaced = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        let nd = displaced.add_child(
+            displaced.root(),
+            NodeKind::NoiseDisplace(NoiseDisplaceParams {
+                amplitude: 0.0,
+                frequency: 4.0,
+                octaves: 4,
+                seed: 13,
+            }),
+        );
+        displaced.add_child(nd, sphere(0.5, 0));
+
+        let mut plain = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        plain.add_child(plain.root(), sphere(0.5, 0));
+
+        for i in -5..=5 {
+            let p = Vec3::new(i as f32 * 0.13, i as f32 * -0.09, i as f32 * 0.21);
+            let d = sample_tree(&displaced, p, VS).distance;
+            let r = sample_tree(&plain, p, VS).distance;
+            assert!((d - r).abs() < 1e-5, "mismatch at {p:?}: {d} vs {r}");
+        }
     }
 
     /// Transform on a parent combinator affects all children.

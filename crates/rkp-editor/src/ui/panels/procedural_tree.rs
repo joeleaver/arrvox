@@ -84,6 +84,7 @@ fn render_tree_node(
     let is_leaf = Memo::new(move || node_info.get().map(|n| n.is_leaf).unwrap_or(true));
     let is_root = Memo::new(move || node_info.get().map(|n| n.is_root).unwrap_or(false));
     let node_kind = Memo::new(move || node_info.get().map(|n| n.kind).unwrap_or(ProceduralNodeKind::Union));
+    let can_add_child = Memo::new(move || node_info.get().map(|n| n.can_add_child).unwrap_or(false));
 
     // Strips show only while a drag is in progress. Otherwise they're
     // 0-height and don't steal vertical space or hit-testing.
@@ -209,11 +210,16 @@ fn render_tree_node(
                             {|| name.get()}
                         }
 
-                        // Add child button. Combinators always show it; a leaf
-                        // root also shows it — clicking promotes the leaf into
-                        // a new Union (engine-side auto-promote) so you can
-                        // attach siblings without manually wrapping first.
-                        if !is_leaf.get() || is_root.get() {
+                        // Add child button. Snapshot exposes
+                        // `can_add_child` per-node: true for combinators
+                        // under their child cap (unbounded for Union /
+                        // Intersect / Subtract; 1 for single-child
+                        // effects like NoiseDisplace). A leaf *root*
+                        // also gets the button — clicking promotes it
+                        // to a Union via the engine's auto-promote path
+                        // so the user can attach siblings without
+                        // manually wrapping first.
+                        if can_add_child.get() || (is_leaf.get() && is_root.get()) {
                             {render_add_child_menu(__scope, node_id, node_kind.get(), cmd_tx)}
                         }
                     }
@@ -476,6 +482,11 @@ fn render_add_child_menu(
                     {add_menu_item(__scope, "Union", TablerIcon::CirclePlus, parent_id, opened, cmd_tx)}
                     {add_menu_item(__scope, "Intersect", TablerIcon::CircleDot, parent_id, opened, cmd_tx)}
                     {add_menu_item(__scope, "Subtract", TablerIcon::CircleMinus, parent_id, opened, cmd_tx)}
+                    DropdownMenuDivider {}
+                    // Effects — single-child modifiers. V1 has just
+                    // NoiseDisplace; more land in subsequent passes
+                    // (Mirror, Erode, material effects, etc.).
+                    {add_menu_item(__scope, "NoiseDisplace", TablerIcon::Ripple, parent_id, opened, cmd_tx)}
                 }
             }
         }
@@ -521,5 +532,6 @@ fn node_icon(kind: ProceduralNodeKind) -> TablerIcon {
         ProceduralNodeKind::Union => TablerIcon::CirclePlus,
         ProceduralNodeKind::Intersect => TablerIcon::CircleDot,
         ProceduralNodeKind::Subtract => TablerIcon::CircleMinus,
+        ProceduralNodeKind::NoiseDisplace => TablerIcon::Ripple,
     }
 }

@@ -25,6 +25,15 @@ pub enum NodeKind {
     /// Subtract the second child from the first. Always preserves the
     /// base (first child) material — both primary and secondary.
     Subtract,
+
+    // ── Effects (single-child modifiers) ────────────────────────────
+    /// Domain-warp the child's SDF by a 3D simplex-noise vector field.
+    /// First child is the operand; additional children are ignored.
+    ///
+    /// Not strictly a "combinator" in the boolean-op sense, but
+    /// `is_combinator()` returns true so it shares the add-child-menu
+    /// affordance and tree-widget handling.
+    NoiseDisplace(NoiseDisplaceParams),
 }
 
 impl NodeKind {
@@ -43,11 +52,37 @@ impl NodeKind {
     }
 
     /// Whether this node kind is a combinator (operates on children).
+    ///
+    /// Effects (like `NoiseDisplace`) are included here: they're not
+    /// boolean-op combinators, but they *do* take a child subtree and
+    /// benefit from the same UI affordances (add-child "+" button, drop
+    /// targets). Callers that need the stricter "boolean op" meaning
+    /// should match on the specific variants instead.
     pub fn is_combinator(&self) -> bool {
         matches!(
             self,
-            NodeKind::Union { .. } | NodeKind::Intersect { .. } | NodeKind::Subtract
+            NodeKind::Union { .. }
+                | NodeKind::Intersect { .. }
+                | NodeKind::Subtract
+                | NodeKind::NoiseDisplace(_)
         )
+    }
+
+    /// Maximum number of children this node kind accepts, or `None`
+    /// for unbounded. Single-child effects (NoiseDisplace and the
+    /// future warp/mirror family) cap at 1 — the evaluator and flatten
+    /// both ignore extras anyway, so the cap is the source of truth.
+    /// Leaves return `Some(0)`: `add_child` panics on them (preserving
+    /// long-standing behavior), and the cap lets the UI hide the "+"
+    /// without special-casing leaves.
+    pub fn max_children(&self) -> Option<usize> {
+        if self.is_leaf() {
+            Some(0)
+        } else if matches!(self, NodeKind::NoiseDisplace(_)) {
+            Some(1)
+        } else {
+            None
+        }
     }
 }
 
@@ -215,6 +250,45 @@ impl Default for RampParams {
             half_width: 0.5,
             material_id: 0,
             color: Vec3::ONE,
+        }
+    }
+}
+
+/// Noise-displacement effect. Warps the sample position by a 3D
+/// simplex-noise vector field before recursing into the child
+/// subtree — pointwise (no caching needed), so the cost is one noise
+/// evaluation per sample plus whatever the child costs.
+///
+/// The noise is evaluated in the effect's local frame (post-ancestor-
+/// transform), so dragging the effect around in the scene shifts the
+/// noise pattern with the object rather than sliding surfaces through
+/// a fixed world-space field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoiseDisplaceParams {
+    /// Maximum displacement magnitude along each axis, in local units.
+    /// A sphere of radius 0.5 with amplitude 0.1 becomes a bumpy ball
+    /// with protrusions up to ~10 % its radius.
+    pub amplitude: f32,
+    /// Spatial frequency of the noise, in cycles per local unit.
+    /// Higher = tighter bumps. ~1.0 gives features on the scale of
+    /// the primitive itself; 4.0 gives tight stipple.
+    pub frequency: f32,
+    /// Number of FBM octaves to layer. 1 = plain simplex. 2–4 adds
+    /// detail at progressively smaller scales. Capped at 8 in
+    /// evaluation to keep per-sample cost bounded.
+    pub octaves: u32,
+    /// Seed for the noise permutation. Change to re-roll the pattern
+    /// without changing amplitude / frequency.
+    pub seed: u32,
+}
+
+impl Default for NoiseDisplaceParams {
+    fn default() -> Self {
+        Self {
+            amplitude: 0.1,
+            frequency: 2.0,
+            octaves: 3,
+            seed: 0,
         }
     }
 }

@@ -5215,6 +5215,9 @@ fn parse_node_kind(kind: &str) -> rkp_procedural::NodeKind {
             material_combine: rkp_procedural::MaterialCombine::Winner,
         },
         "Subtract" => rkp_procedural::NodeKind::Subtract,
+        "NoiseDisplace" => {
+            rkp_procedural::NodeKind::NoiseDisplace(NoiseDisplaceParams::default())
+        }
         _ => rkp_procedural::NodeKind::Sphere(SphereParams::default()),
     }
 }
@@ -5292,6 +5295,25 @@ fn apply_procedural_param(
             }
         }
         NodeKind::Subtract => false,
+        NodeKind::NoiseDisplace(p) => match param_name {
+            "amplitude" => { p.amplitude = value.parse().unwrap_or(p.amplitude); true }
+            "frequency" => { p.frequency = value.parse().unwrap_or(p.frequency); true }
+            // Octaves + seed come in as floats via the UI's Float
+            // scrub control — round to u32 and clamp octaves to the
+            // same bound `fbm_3d_vec` enforces so the stored value
+            // matches what the evaluator actually uses.
+            "octaves" => {
+                let f: f32 = value.parse().unwrap_or(p.octaves as f32);
+                p.octaves = (f.max(0.0) as u32).clamp(1, 8);
+                true
+            }
+            "seed" => {
+                let f: f32 = value.parse().unwrap_or(p.seed as f32);
+                p.seed = f.max(0.0) as u32;
+                true
+            }
+            _ => false,
+        },
     }
 }
 

@@ -30,6 +30,14 @@ use crate::node_kind::{MaterialCombine, NodeKind};
 
 /// Opcode tags. Values match the WGSL `OP_*` constants in
 /// `shaders/proc_raymarch.wgsl` — keep in sync.
+///
+/// The `< 100` range is primitives (push one sample onto the stack);
+/// `100..200` is boolean combinators (pop `arity`, push one combined
+/// sample); `200+` is position-warp effects that bracket a subtree
+/// with a matched PUSH/POP pair — PUSH pushes a new sample position
+/// onto the shader's position stack; POP decrements the position stack
+/// and shrinks the distance of the top sample by a conservative
+/// envelope so sphere-tracing stays 1-Lipschitz-safe.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpKind {
@@ -43,6 +51,15 @@ pub enum OpKind {
     Union = 100,
     Intersect = 101,
     Subtract = 102,
+    /// Push a noise-displaced position onto the shader's position
+    /// stack. Children evaluated between this and the matching
+    /// `PopNoiseDisplace` see the warped position. `params[0..4]` =
+    /// `[amplitude, frequency, seed_as_f32, octaves_as_f32]`.
+    PushNoiseDisplace = 200,
+    /// Pop the position stack and shrink the top sample's distance
+    /// by a conservative envelope (max axial warp = amplitude * √3).
+    /// `params[0]` = amplitude; the rest ignored.
+    PopNoiseDisplace = 201,
 }
 
 /// A single instruction in the flattened tree stream.
@@ -283,6 +300,51 @@ fn emit(
             // Subtract with no minuend contributes nothing; a Subtract
             // with only the minuend equals the minuend.
         }
+
+        NodeKind::NoiseDisplace(p) => {
+            // PUSH/POP brackets around the child stream. Position-warp
+            // params ride along in `params` so the shader can execute
+            // the warp without dereferencing this Rust struct. Only
+            // the first child is rendered (same rule as the evaluator);
+            // additional children are silently ignored.
+            let Some(&child_id) = node.children.first() else {
+                return;
+            };
+            let params_push = [
+                p.amplitude,
+                p.frequency,
+                p.seed as f32,
+                p.octaves as f32,
+                0.0, 0.0, 0.0, 0.0,
+            ];
+            let params_pop = [
+                p.amplitude,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ];
+            out.push(ProcInstruction {
+                op: OpKind::PushNoiseDisplace as u32,
+                arity: 0,
+                material_combine: 0,
+                material_id: 0,
+                node_id: id.0,
+                _pad0: 0, _pad1: 0, _pad2: 0,
+                params: params_push,
+                color: [0.0; 4],
+                inverse_world: Mat4::IDENTITY.to_cols_array_2d(),
+            });
+            emit(obj, child_id, this_world, out);
+            out.push(ProcInstruction {
+                op: OpKind::PopNoiseDisplace as u32,
+                arity: 0,
+                material_combine: 0,
+                material_id: 0,
+                node_id: u32::MAX,
+                _pad0: 0, _pad1: 0, _pad2: 0,
+                params: params_pop,
+                color: [0.0; 4],
+                inverse_world: Mat4::IDENTITY.to_cols_array_2d(),
+            });
+        }
     }
 
     let _ = nk::MaterialCombine::Winner; // silence unused-import on macros
@@ -330,16 +392,47 @@ mod tests {
     /// Execute an RPN instruction stream on the CPU — mirrors what the
     /// WGSL shader does. Used by the tests to check that flattening is
     /// semantically equivalent to `sample_tree`.
+    ///
+    /// The shader-side position stack is modeled here as `pos_stack`,
+    /// a Vec treated as LIFO. Primitive evaluation pulls from its top
+    /// so any bracketed warp applies to every primitive emitted inside
+    /// the PUSH/POP pair.
     fn exec(instructions: &[ProcInstruction], world_pos: Vec3) -> Sample {
         use crate::combine::{combine_intersect, combine_subtract, combine_union};
         use crate::leaves::{eval_sphere, eval_box, eval_capsule, eval_cylinder, eval_torus, eval_plane, eval_ramp};
+        use crate::noise::fbm_3d_vec;
 
         let mut stack: Vec<Sample> = Vec::with_capacity(16);
+        let mut pos_stack: Vec<Vec3> = vec![world_pos];
         for ins in instructions {
+            // Position-warp effects: bracket a subtree with a matched
+            // push/pop. PUSH derives a new position for the subtree;
+            // POP restores the outer frame and shrinks the top
+            // sample's distance by the worst-case axial warp.
+            if ins.op == OpKind::PushNoiseDisplace as u32 {
+                let cur = *pos_stack.last().unwrap();
+                let amp = ins.params[0];
+                let freq = ins.params[1];
+                let seed = ins.params[2] as u32;
+                let oct = ins.params[3] as u32;
+                let warp = fbm_3d_vec(cur, freq, seed, oct) * amp;
+                pos_stack.push(cur + warp);
+                continue;
+            }
+            if ins.op == OpKind::PopNoiseDisplace as u32 {
+                pos_stack.pop();
+                let amp = ins.params[0];
+                if let Some(top) = stack.last_mut() {
+                    top.distance -= amp * (3.0f32).sqrt();
+                }
+                continue;
+            }
+
+            let cur_pos = *pos_stack.last().unwrap();
             if ins.op < 100 {
                 // Primitive.
                 let inv = Mat4::from_cols_array_2d(&ins.inverse_world);
-                let local = inv.transform_point3(world_pos);
+                let local = inv.transform_point3(cur_pos);
                 let color = Vec3::new(ins.color[0], ins.color[1], ins.color[2]);
                 let sample = match ins.op {
                     0 => eval_sphere(local, &SphereParams {
@@ -436,5 +529,56 @@ mod tests {
             }
         }
         assert_eq!(disagree, 0, "flatten+exec diverged from sample_tree at {disagree} points");
+    }
+
+    /// Trees containing a NoiseDisplace must also round-trip through
+    /// flatten + RPN exec with bit-exact distances vs `sample_tree`.
+    /// This is the test that guards the PUSH/POP semantics + the
+    /// position-stack + the amp*sqrt(3) conservative shrink.
+    #[test]
+    fn flatten_noise_displace_matches_sample_tree() {
+        use crate::node_kind::NoiseDisplaceParams;
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        // A NoiseDisplace wrapping a Union of two spheres — exercises
+        // the position stack across both primitive children of an
+        // inner combinator (PUSH…primitive,primitive,combinator…POP).
+        let nd = obj.add_child(
+            obj.root(),
+            NodeKind::NoiseDisplace(NoiseDisplaceParams {
+                amplitude: 0.12,
+                frequency: 2.5,
+                octaves: 3,
+                seed: 17,
+            }),
+        );
+        let inner = obj.add_child(nd, NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        obj.add_child(inner, sphere(0.4, 1));
+        obj.add_child(inner, sphere(0.3, 2));
+
+        let instructions = flatten_tree(&obj);
+
+        let mut disagree = 0usize;
+        for ix in -6..=6 {
+            for iy in -3..=3 {
+                for iz in -3..=3 {
+                    let p = Vec3::new(ix as f32 * 0.25, iy as f32 * 0.25, iz as f32 * 0.25);
+                    let ref_s = sample_tree(&obj, p, VS).distance;
+                    let flat_s = exec(&instructions, p).distance;
+                    if (ref_s - flat_s).abs() > 1e-4 {
+                        disagree += 1;
+                        if disagree <= 3 {
+                            eprintln!(
+                                "noise-displace flatten mismatch at {p:?}: ref={ref_s} flat={flat_s}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(disagree, 0, "flatten+exec diverged with NoiseDisplace at {disagree} points");
     }
 }

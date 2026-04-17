@@ -116,6 +116,30 @@ fn compute_all_bounds_rec(
             }
             first_aabb
         }
+        NodeKind::NoiseDisplace(p) => {
+            // Effect widens the child's AABB by its max per-axis
+            // displacement. Additional children are ignored (same
+            // rule as the evaluator). If the first child is missing
+            // the effect contributes nothing — EMPTY_AABB.
+            let Some(&child_id) = node.children.first() else {
+                return EMPTY_AABB;
+            };
+            let child_aabb = compute_all_bounds_rec(obj, child_id, cache);
+            // Keep iterating the ignored siblings to populate their
+            // cache entries (they could still be UI-visible / selected
+            // even though they don't contribute to geometry).
+            for &sibling_id in node.children.iter().skip(1) {
+                let _ = compute_all_bounds_rec(obj, sibling_id, cache);
+            }
+            if is_empty_aabb(&child_aabb) {
+                EMPTY_AABB
+            } else {
+                Aabb {
+                    min: child_aabb.min - Vec3::splat(p.amplitude),
+                    max: child_aabb.max + Vec3::splat(p.amplitude),
+                }
+            }
+        }
     };
 
     let world_aabb = if is_empty_aabb(&local_aabb) {
@@ -176,6 +200,23 @@ fn compute_node_bounds(obj: &ProceduralObject, id: NodeId) -> Aabb {
                 .first()
                 .map(|&first| compute_node_bounds(obj, first))
                 .unwrap_or(EMPTY_AABB)
+        }
+        NodeKind::NoiseDisplace(p) => {
+            // Widen the child's AABB by the max per-axis displacement
+            // (mirror of compute_all_bounds_rec's NoiseDisplace arm).
+            let child_aabb = node
+                .children
+                .first()
+                .map(|&first| compute_node_bounds(obj, first))
+                .unwrap_or(EMPTY_AABB);
+            if is_empty_aabb(&child_aabb) {
+                EMPTY_AABB
+            } else {
+                Aabb {
+                    min: child_aabb.min - Vec3::splat(p.amplitude),
+                    max: child_aabb.max + Vec3::splat(p.amplitude),
+                }
+            }
         }
     };
 
@@ -449,6 +490,36 @@ mod tests {
         let extent = aabb.max - aabb.min;
         let max_axis = extent.x.max(extent.y).max(extent.z);
         assert!(max_axis < 10.0, "Subtract-with-Plane ballooned: extent={extent:?}");
+    }
+
+    /// NoiseDisplace widens its child's AABB by `amplitude` on every
+    /// axis — the voxelizer needs that slack so the classifier doesn't
+    /// clip surface perturbations that escape the tight bounds.
+    #[test]
+    fn noise_displace_widens_child_aabb() {
+        use crate::node_kind::NoiseDisplaceParams;
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        let nd = obj.add_child(
+            obj.root(),
+            NodeKind::NoiseDisplace(NoiseDisplaceParams {
+                amplitude: 0.25,
+                frequency: 2.0,
+                octaves: 2,
+                seed: 0,
+            }),
+        );
+        obj.add_child(
+            nd,
+            NodeKind::Sphere(SphereParams { radius: 1.0, ..Default::default() }),
+        );
+
+        let aabb = compute_bounds(&obj);
+        assert!((aabb.min.x - (-1.25)).abs() < EPS, "min.x = {}", aabb.min.x);
+        assert!((aabb.max.x - 1.25).abs() < EPS, "max.x = {}", aabb.max.x);
+        assert!((aabb.min.y - (-1.25)).abs() < EPS, "min.y = {}", aabb.min.y);
+        assert!((aabb.max.y - 1.25).abs() < EPS, "max.y = {}", aabb.max.y);
     }
 
     #[test]

@@ -53,6 +53,14 @@ pub struct ProceduralNodeInfo {
     pub scale: [f32; 3],
     /// Editable parameters for this node.
     pub params: Vec<ProceduralParam>,
+    /// Whether the "+" add-child affordance should be visible on this
+    /// row. True for combinators under their child cap (unbounded for
+    /// Union/Intersect/Subtract; 1 for single-child effects like
+    /// NoiseDisplace). Leaves default to false — the engine already
+    /// auto-promotes a leaf root to a Union on the first add, so the
+    /// root-leaf case is handled with a separate `is_root` branch in
+    /// the UI rather than this flag.
+    pub can_add_child: bool,
 }
 
 /// Simplified node kind for UI display.
@@ -68,6 +76,7 @@ pub enum ProceduralNodeKind {
     Union,
     Intersect,
     Subtract,
+    NoiseDisplace,
 }
 
 impl ProceduralNodeKind {
@@ -83,6 +92,7 @@ impl ProceduralNodeKind {
             Self::Union => "Union",
             Self::Intersect => "Intersect",
             Self::Subtract => "Subtract",
+            Self::NoiseDisplace => "Noise Displace",
         }
     }
 }
@@ -177,9 +187,25 @@ pub fn build_procedural_snapshot(
                 "Subtract".to_string(),
                 vec![],
             ),
+            NodeKind::NoiseDisplace(p) => (
+                ProceduralNodeKind::NoiseDisplace,
+                "Noise Displace".to_string(),
+                noise_displace_params(p),
+            ),
         };
 
         let (position, rotation_deg, scale) = decompose_affine(&node.transform);
+        // "+" is shown when the kind is a combinator-style container
+        // AND the child count is below its cap. Leaves have `Some(0)`
+        // so `can_add_child` is false; unbounded kinds have `None` and
+        // always return true.
+        let child_count = node.children.len();
+        let at_cap = node
+            .kind
+            .max_children()
+            .is_some_and(|cap| child_count >= cap);
+        let can_add_child = !node.kind.is_leaf() && !at_cap;
+
         nodes.push(ProceduralNodeInfo {
             id: id.0,
             name,
@@ -191,6 +217,7 @@ pub fn build_procedural_snapshot(
             rotation: rotation_deg,
             scale,
             params,
+            can_add_child,
         });
     }
 
@@ -296,6 +323,17 @@ fn ramp_params(p: &rkp_procedural::node_kind::RampParams) -> Vec<ProceduralParam
     vec![
         ProceduralParam { name: "material".into(), value: ProceduralParamValue::Material(p.material_id), range: None },
         ProceduralParam { name: "color".into(), value: ProceduralParamValue::Color(rgba_from_color(p.color)), range: None },
+    ]
+}
+
+fn noise_displace_params(
+    p: &rkp_procedural::node_kind::NoiseDisplaceParams,
+) -> Vec<ProceduralParam> {
+    vec![
+        ProceduralParam { name: "amplitude".into(), value: ProceduralParamValue::Float(p.amplitude), range: Some((0.0, 2.0)) },
+        ProceduralParam { name: "frequency".into(), value: ProceduralParamValue::Float(p.frequency), range: Some((0.05, 32.0)) },
+        ProceduralParam { name: "octaves".into(), value: ProceduralParamValue::Float(p.octaves as f32), range: Some((1.0, 8.0)) },
+        ProceduralParam { name: "seed".into(), value: ProceduralParamValue::Float(p.seed as f32), range: Some((0.0, 1024.0)) },
     ]
 }
 
