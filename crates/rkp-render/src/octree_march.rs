@@ -320,6 +320,8 @@ impl OctreeMarchPass {
             let skin_entries = vals[55] as u64;
             let skin_hits    = vals[56] as u64;
             let skin_cell_reads = vals[57] as u64;
+            let skin_brick_skips = vals[58] as u64;
+            let skin_brick_samples = vals[59] as u64;
 
             let sum = |h: &[u32]| -> u64 { h.iter().map(|&x| x as u64).sum() };
             let weighted = |h: &[u32]| -> f64 {
@@ -385,9 +387,14 @@ impl OctreeMarchPass {
             // skin_hits is how many of those landed a leaf; the ratio
             // tells us whether the bone field is covering the mesh or
             // whether we're sampling empty cells.
+            let skip_total = skin_brick_skips + skin_brick_samples;
+            let skip_pct = if skip_total > 0 {
+                100.0 * skin_brick_skips as f64 / skip_total as f64
+            } else { 0.0 };
             eprintln!(
-                "[skin march] entries={}  hits={}  bone-field pop reads={}",
+                "[skin march] entries={}  hits={}  bone-field pop reads={}  brick skips={} samples={} ({:.1}% skipped)",
                 skin_entries, skin_hits, skin_cell_reads,
+                skin_brick_skips, skin_brick_samples, skip_pct,
             );
 
             // Per-buffer byte traffic per frame. Octree reads come from the

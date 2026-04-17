@@ -62,8 +62,9 @@ struct RkpObject {
     bone_field_dim_x: u32, bone_field_dim_y: u32,
     bone_field_dim_z: u32, bone_field_origin_x: f32,
     bone_field_origin_y: f32, bone_field_origin_z: f32,
+    bone_field_occ_offset: u32,
     _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32,
-    _pad4: u32, _pad5: u32,
+    _pad4: u32,
     inverse_world: mat4x4<f32>,
 }
 
@@ -189,6 +190,12 @@ struct LeafAttr {
 // cell. Scatter pass writes; the skinned march branch reads. Empty
 // cells are (0, 0) (zero-cleared each frame before scatter).
 @group(0) @binding(9) var<storage, read> bone_field: array<vec2<u32>>;
+// Per-brick occupancy bitmap for the bone field — one bit per 4³ cell
+// brick, packed 32 per u32. Same underlying buffer the scatter pass
+// writes via `atomicOr` (declared atomic there); read-only plain u32s
+// here because the main bind group declares this read-only and the
+// scatter's bind group is separate.
+@group(0) @binding(10) var<storage, read> bone_field_occ: array<u32>;
 
 const FACE_INTERIOR: u32 = 0xFFFFFFFEu;
 const FACE_EMPTY_LINK: u32 = 0xFFFFFFFFu;
@@ -595,6 +602,7 @@ struct MarchResult {
 // seeing. Forward splat dodges the whole class of issues.
 
 const SKINNED_MAX_STEPS: u32 = 512u;
+const OCC_BRICK_DIM: i32 = 4;
 
 /// Look up the bone field at a deformed-cell coordinate. Returns
 /// `(0u, 0u)` when out of bounds or unpopulated.
@@ -607,6 +615,48 @@ fn sample_bone_field(cell: vec3<i32>, dims: vec3<i32>, offset: u32) -> vec2<u32>
     let uz = u32(cell.z);
     let idx = ux + uy * u32(dims.x) + uz * u32(dims.x) * u32(dims.y);
     return bone_field[offset + idx];
+}
+
+/// Test whether the 4³-cell brick containing `cell` has any populated
+/// cell (scatter sets the bit via `atomicOr`). Returns `false` for
+/// bricks outside the grid so the march treats them as empty and skips
+/// past.
+fn bone_field_brick_populated(
+    cell: vec3<i32>,
+    cell_dims: vec3<i32>,
+    occ_offset: u32,
+) -> bool {
+    if any(cell < vec3<i32>(0)) || any(cell >= cell_dims) {
+        return false;
+    }
+    let brick = cell / vec3<i32>(OCC_BRICK_DIM);
+    let bx_dim = u32((cell_dims.x + OCC_BRICK_DIM - 1) / OCC_BRICK_DIM);
+    let by_dim = u32((cell_dims.y + OCC_BRICK_DIM - 1) / OCC_BRICK_DIM);
+    let brick_idx = u32(brick.x)
+        + u32(brick.y) * bx_dim
+        + u32(brick.z) * bx_dim * by_dim;
+    let word = bone_field_occ[occ_offset + (brick_idx >> 5u)];
+    return (word & (1u << (brick_idx & 31u))) != 0u;
+}
+
+/// Ray-t at which the ray exits the 4³ brick containing `cell`.
+/// Uses slab intersection against the brick's oc-space bounds. Caller
+/// nudges past the returned t by a small epsilon to land in the next
+/// brick's interior.
+fn skinned_brick_exit_t(
+    origin: vec3<f32>,
+    inv_dir: vec3<f32>,
+    cell: vec3<i32>,
+    grid_origin: vec3<f32>,
+    vs: f32,
+) -> f32 {
+    let brick = cell / vec3<i32>(OCC_BRICK_DIM);
+    let brick_min = grid_origin + vec3<f32>(brick * OCC_BRICK_DIM) * vs;
+    let brick_max = brick_min + vec3<f32>(f32(OCC_BRICK_DIM) * vs);
+    let t0 = (brick_min - origin) * inv_dir;
+    let t1 = (brick_max - origin) * inv_dir;
+    let t_far = max(t0, t1);
+    return min(t_far.x, min(t_far.y, t_far.z));
 }
 
 /// Skinned march — direct deformed-field lookup. See the helper
@@ -666,14 +716,28 @@ fn march_object_skinned(
         let p_local = local_origin + safe_dir * t;
         let cell_f = (p_local - grid_origin) / vs;
         let cell_i = vec3<i32>(floor(cell_f));
+
+        // Brick-level empty-space skip. The scatter pass tags every
+        // 4³ brick that got any cell write; if this brick is clear,
+        // fast-forward `t` to the brick's far-side exit so we skip
+        // up to 64 cell reads with a single bit test. `atomicAdd`s
+        // 58/59 are the telemetry for brick-skip hit rate — read with
+        // the [skin march] stats line in engine.rs.
+        if !bone_field_brick_populated(cell_i, grid_dim, obj.bone_field_occ_offset) {
+            atomicAdd(&stats[58], 1u); // empty-brick skip
+            let t_exit = skinned_brick_exit_t(local_origin, inv_dir, cell_i, grid_origin, vs);
+            t = max(t + vs * 0.01, t_exit + vs * 0.001);
+            continue;
+        }
+        atomicAdd(&stats[59], 1u); // populated-brick sample
+
         let cell = sample_bone_field(cell_i, grid_dim, obj.bone_field_offset);
 
         let leaf_slot = cell.x;
         let normal_oct = cell.y;
         if leaf_slot == 0u {
-            // Empty cell — advance one voxel. Scatter's 2×2×2 splat
-            // keeps rigid regions covered; joints survive because
-            // each joint voxel writes its own splat too.
+            // Empty cell within a populated brick — scatter's 2×2×2
+            // splat keeps rigid regions covered; step one voxel.
             t += vs;
             continue;
         }

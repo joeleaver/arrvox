@@ -269,6 +269,10 @@ struct EngineState {
     /// Total bytes required in `scene.bone_field_buffer` this frame;
     /// drives the per-frame grow+clear.
     skin_bone_field_bytes: u64,
+    /// Total bytes required in `scene.bone_field_occ_buffer` this
+    /// frame (packed 1-bit-per-brick occupancy bitmap paired with
+    /// `bone_field_buffer`).
+    skin_bone_field_occ_bytes: u64,
     /// Master toggle — when false, skip scatter + fall the march back
     /// to its rigid path. Driven by the AnimationPanel checkbox.
     skinning_enabled: bool,
@@ -508,6 +512,7 @@ impl EngineState {
             skin_dispatches: Vec::new(),
             skin_batch: rkp_render::SkinBatchScratch::default(),
             skin_bone_field_bytes: 0,
+            skin_bone_field_occ_bytes: 0,
             skinning_enabled: true,
             material_lib: crate::material_library::MaterialLibrary::new(),
             selected_material: None,
@@ -656,7 +661,12 @@ impl EngineState {
         // a single uniform/brick buffer inside one submission.
         if self.skinning_enabled && !self.skin_dispatches.is_empty() {
             let q = self.renderer.profiler.begin_query("skin_deform", &mut encoder);
-            self.renderer.prepare_bone_field(&self.queue, &mut encoder, self.skin_bone_field_bytes);
+            self.renderer.prepare_bone_field(
+                &self.queue,
+                &mut encoder,
+                self.skin_bone_field_bytes,
+                self.skin_bone_field_occ_bytes,
+            );
             self.skin_batch.clear();
             for plan in &self.skin_dispatches {
                 let d = rkp_render::SkinDispatch {
@@ -2737,6 +2747,7 @@ impl EngineState {
         // total bone-field bytes.
         self.skin_dispatches.clear();
         let mut running_bone_field_cells: u32 = 0;
+        let mut running_bone_field_occ_u32s: u32 = 0;
 
         self.gpu_objects.clear();
         self.gpu_to_entity.clear();
@@ -2778,6 +2789,7 @@ impl EngineState {
                                 skin_data,
                                 spatial.voxel_size,
                                 &mut running_bone_field_cells,
+                                &mut running_bone_field_occ_u32s,
                             ) {
                                 // Copy the plan's bone-field geometry
                                 // into the SkinnedBinding so the GPU
@@ -2800,6 +2812,7 @@ impl EngineState {
                                         plan.uniforms.grid_origin_y,
                                         plan.uniforms.grid_origin_z,
                                     ],
+                                    bone_field_occ_offset: plan.uniforms.bone_field_occ_offset,
                                 });
                                 self.skin_dispatches.push(plan);
                             } else {
@@ -2834,6 +2847,7 @@ impl EngineState {
         // weights) = 8 bytes. Used by the render loop to size the
         // scene's bone_field_buffer before the scatter dispatch.
         self.skin_bone_field_bytes = (running_bone_field_cells as u64).saturating_mul(8);
+        self.skin_bone_field_occ_bytes = (running_bone_field_occ_u32s as u64).saturating_mul(4);
 
         // One-second heartbeat so we can tell whether the GPU object
         // the march shader sees actually carries skinning fields.

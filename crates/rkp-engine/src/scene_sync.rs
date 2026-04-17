@@ -85,6 +85,9 @@ pub struct SkinnedBinding {
     pub bone_field_dims: [u32; 3],
     /// Bone-field grid origin in object-local space.
     pub bone_field_origin: [f32; 3],
+    /// Offset into the scene-wide occupancy bitmap in u32 words. Each
+    /// bit covers one 4³ brick of this object's bone_field.
+    pub bone_field_occ_offset: u32,
 }
 
 /// Build an RkpGpuObject from a scene object's transform, spatial handle,
@@ -137,6 +140,7 @@ pub fn build_gpu_object(
         gpu.bone_field_origin_x = skin.bone_field_origin[0];
         gpu.bone_field_origin_y = skin.bone_field_origin[1];
         gpu.bone_field_origin_z = skin.bone_field_origin[2];
+        gpu.bone_field_occ_offset = skin.bone_field_occ_offset;
     }
 
     gpu
@@ -195,6 +199,7 @@ impl BoneMatrixAllocator {
                 bone_field_offset: 0,
                 bone_field_dims: [0, 0, 0],
                 bone_field_origin: [0.0, 0.0, 0.0],
+                bone_field_occ_offset: 0,
             });
             // Advance past both palettes.
             running_mat_offset += bone_count * 2;
@@ -234,12 +239,17 @@ const MAX_BONE_FIELD_DIM: u32 = 1024;
 /// warning prompting a coarser voxel tier.
 const MAX_BONE_FIELD_CELLS: u64 = 32_000_000;
 
+/// 4³-cell bricks for the deformed bone field's occupancy bitmap.
+/// Matches the scatter shader's 4×4×4 workgroup size.
+pub const OCC_BRICK_DIM: u32 = 4;
+
 /// Build the per-frame scatter plan for one skinned entity.
 ///
 /// Returns `None` when the entity's deformed AABB degenerates to a
 /// single point (no non-trivial bone weights) or exceeds
 /// `MAX_BONE_FIELD_DIM`. The caller advances `running_bone_field_cells`
-/// by the dispatch's cell count on `Some(_)`.
+/// (for the dense field) and `running_bone_field_occ_u32s` (for the
+/// packed brick bitmap) by this dispatch's sizes on `Some(_)`.
 pub fn plan_skin_dispatch(
     bone_buffer_offset: u32,
     bone_count: u32,
@@ -247,6 +257,7 @@ pub fn plan_skin_dispatch(
     skinning_asset: &SkinningAssetData,
     voxel_size: f32,
     running_bone_field_cells: &mut u32,
+    running_bone_field_occ_u32s: &mut u32,
 ) -> Option<PlannedSkinDispatch> {
     // Deformed AABB = union(current_pose[i] × rest_bone_aabbs[i])
     // over every bone that has a non-empty rest AABB. Rest AABBs in
@@ -312,6 +323,16 @@ pub fn plan_skin_dispatch(
         return None;
     }
     let cell_count = cell_count_u64 as u32;
+
+    // Brick-level occupancy bitmap: one bit per 4³ cell brick.
+    let brick_dims = [
+        (dims[0] + OCC_BRICK_DIM - 1) / OCC_BRICK_DIM,
+        (dims[1] + OCC_BRICK_DIM - 1) / OCC_BRICK_DIM,
+        (dims[2] + OCC_BRICK_DIM - 1) / OCC_BRICK_DIM,
+    ];
+    let brick_count = brick_dims[0] as u64 * brick_dims[1] as u64 * brick_dims[2] as u64;
+    let occ_u32_count = ((brick_count + 31) / 32) as u32;
+
     let uniforms = SkinUniforms {
         bone_buffer_offset,
         bone_count,
@@ -323,9 +344,11 @@ pub fn plan_skin_dispatch(
         grid_origin_y: grid_origin.y,
         grid_origin_z: grid_origin.z,
         voxel_size,
-        _pad0: 0, _pad1: 0, _pad2: 0, _pad3: 0, _pad4: 0, _pad5: 0,
+        bone_field_occ_offset: *running_bone_field_occ_u32s,
+        _pad0: 0, _pad1: 0, _pad2: 0, _pad3: 0, _pad4: 0,
     };
     *running_bone_field_cells = running_bone_field_cells.saturating_add(cell_count);
+    *running_bone_field_occ_u32s = running_bone_field_occ_u32s.saturating_add(occ_u32_count);
 
     // `uniform_idx` is filled in by `SkinBatchScratch::push` when the
     // dispatch is folded into the per-frame batch — we can't know it

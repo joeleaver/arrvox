@@ -38,7 +38,8 @@ use bytemuck::{Pod, Zeroable};
 /// | 156    | 4    | bone_field_origin_x (f32 bits) |
 /// | 160    | 4    | bone_field_origin_y (f32 bits) |
 /// | 164    | 4    | bone_field_origin_z (f32 bits) |
-/// | 168    | 24   | _padding |
+/// | 168    | 4    | bone_field_occ_offset (u32) — start in u32 words |
+/// | 172    | 20   | _padding |
 /// | 192    | 64   | inverse_world (mat4x4<f32>) — world→local |
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
@@ -94,8 +95,14 @@ pub struct RkpGpuObject {
     pub bone_field_origin_y: f32,
     pub bone_field_origin_z: f32,
 
-    /// Padding (6 u32 = 24 B).
-    pub _padding: [u32; 6],
+    /// Offset into the scene-wide bone-field occupancy bitmap, measured
+    /// in u32 words. Each bit covers one 4³-cell brick of this object's
+    /// bone_field slice; scatter sets bits with `atomicOr` and the
+    /// skinned march reads them with `atomicLoad` to skip empty bricks.
+    pub bone_field_occ_offset: u32,
+
+    /// Padding (5 u32 = 20 B).
+    pub _padding: [u32; 5],
 
     /// Inverse world transform (world→local). Precomputed on CPU.
     pub inverse_world: [[f32; 4]; 4],

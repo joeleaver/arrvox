@@ -51,6 +51,12 @@ struct LeafAttr {
 // `leaf_slot == 0` = empty (matches the main-shader convention that
 // slot 0 is treated as "no slot").
 @group(0) @binding(9) var<storage, read_write> bone_field: array<vec2<u32>>;
+// Per-brick occupancy bitmap. One bit per 4³ cell brick, packed 32
+// bricks per u32. The scatter `atomicOr`s into this bitmap whenever
+// it writes a cell; the skinned march reads it via `atomicLoad` to
+// skip empty bricks with one lookup instead of 64 cell reads. Same
+// buffer is bound read-only into the main bind group as binding 10.
+@group(0) @binding(10) var<storage, read_write> bone_field_occ: array<atomic<u32>>;
 
 // ---- Per-dispatch bindings (one dispatch per skinned entity) --------
 
@@ -72,8 +78,11 @@ struct SkinUniforms {
     grid_origin_y: f32,
     grid_origin_z: f32,
     voxel_size: f32,
-    // 6 × u32 pad → 64 B total (Rust struct kept matching).
-    _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32, _pad4: u32, _pad5: u32,
+    // Offset into `bone_field_occ` (in u32 words) where this entity's
+    // packed brick bitmap begins. Brick dims = ceil(cell_dims / 4).
+    bone_field_occ_offset: u32,
+    // 5 × u32 pad → 64 B total (Rust struct kept matching).
+    _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32, _pad4: u32,
 }
 
 struct SkinBrickEntry {
@@ -257,6 +266,39 @@ fn main(
                 let cell = ux + uy * skin.bone_field_dim_x
                     + uz * skin.bone_field_dim_x * skin.bone_field_dim_y;
                 bone_field[skin.bone_field_offset + cell] = payload;
+            }
+        }
+    }
+
+    // Flag every 4³-cell brick the splat touched as populated. Doing
+    // this once per thread (instead of once per splat cell) collapses
+    // 8 atomicOrs → 1–8, typically 1 — the 2×2×2 splat almost always
+    // fits inside a single brick (only straddles when base aligns with
+    // the last cell of a brick on some axis).
+    let bx_dim = (skin.bone_field_dim_x + 3u) / 4u;
+    let by_dim = (skin.bone_field_dim_y + 3u) / 4u;
+    let bz_dim = (skin.bone_field_dim_z + 3u) / 4u;
+    if base.x >= 0 && base.y >= 0 && base.z >= 0
+        && base.x < dims.x && base.y < dims.y && base.z < dims.z
+    {
+        let bx_base = u32(base.x) >> 2u;
+        let by_base = u32(base.y) >> 2u;
+        let bz_base = u32(base.z) >> 2u;
+        let straddle_x = select(0u, 1u, (u32(base.x) & 3u) == 3u && (base.x + 1) < dims.x);
+        let straddle_y = select(0u, 1u, (u32(base.y) & 3u) == 3u && (base.y + 1) < dims.y);
+        let straddle_z = select(0u, 1u, (u32(base.z) & 3u) == 3u && (base.z + 1) < dims.z);
+        for (var dz = 0u; dz <= straddle_z; dz = dz + 1u) {
+            for (var dy = 0u; dy <= straddle_y; dy = dy + 1u) {
+                for (var dx = 0u; dx <= straddle_x; dx = dx + 1u) {
+                    let bx = bx_base + dx;
+                    let by = by_base + dy;
+                    let bz = bz_base + dz;
+                    if bx >= bx_dim || by >= by_dim || bz >= bz_dim { continue; }
+                    let brick_idx = bx + by * bx_dim + bz * bx_dim * by_dim;
+                    let occ_word = skin.bone_field_occ_offset + (brick_idx >> 5u);
+                    let occ_bit = 1u << (brick_idx & 31u);
+                    atomicOr(&bone_field_occ[occ_word], occ_bit);
+                }
             }
         }
     }

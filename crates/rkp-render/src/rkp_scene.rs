@@ -111,13 +111,19 @@ pub struct RkpScene {
     /// Scene-wide deformed-space bone field — skin-deform compute
     /// scatters `(packed_bone_indices, packed_bone_weights)` per
     /// deformed-voxel cell; the skinned march branch reads from here.
-    /// Not bound in [`Self::bind_group`] to stay inside the
-    /// 12-storage-buffer-per-stage limit; exposed directly so the
-    /// skin-deform pass can bind it in its own layout.
     pub bone_field_buffer: wgpu::Buffer,
     /// Current byte size of `bone_field_buffer`. Skin-deform grows it
     /// as the per-frame deformed-AABB demand increases.
     pub bone_field_capacity: u64,
+    /// Per-brick occupancy bitmap paired with `bone_field_buffer`. One
+    /// bit per 4³-cell brick — set when scatter writes any cell in
+    /// that brick, read by the skinned march to skip whole empty
+    /// bricks with one atomic load (vs 64 cell reads without). The
+    /// buffer stores `atomic<u32>` so both scatter (atomicOr) and
+    /// march (atomicLoad) can share it without an alias warning.
+    pub bone_field_occ_buffer: wgpu::Buffer,
+    /// Current byte size of `bone_field_occ_buffer`.
+    pub bone_field_occ_capacity: u64,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub bind_group: wgpu::BindGroup,
 }
@@ -139,13 +145,20 @@ impl RkpScene {
         let bone_weights_buffer = Self::create_storage(device, "rkp_bone_weights", 4);
         let brick_face_links_buffer = Self::create_storage(device, "rkp_brick_face_links", 24);
         let leaf_attr_pool_buffer = Self::create_storage(device, "rkp_leaf_attr_pool", 8);
-        // Bone field starts at a 16-byte placeholder (one vec4) — the
-        // skin-deform pass resizes it every frame to fit the union of
-        // skinned objects' deformed AABBs.
+        // Bone field + occupancy bitmap start at tiny placeholders —
+        // the scatter pass resizes both every frame to fit the union
+        // of skinned objects' deformed AABBs.
         let bone_field_capacity: u64 = 16;
         let bone_field_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rkp_bone_field"),
             size: bone_field_capacity,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bone_field_occ_capacity: u64 = 16;
+        let bone_field_occ_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rkp_bone_field_occ"),
+            size: bone_field_occ_capacity,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -155,7 +168,7 @@ impl RkpScene {
             &brick_pool_buffer, &octree_nodes_buffer, &objects_buffer,
             &camera_buffer, &color_pool_buffer, &bone_matrices_buffer,
             &bone_weights_buffer, &brick_face_links_buffer, &leaf_attr_pool_buffer,
-            &bone_field_buffer,
+            &bone_field_buffer, &bone_field_occ_buffer,
         );
 
         Self {
@@ -163,6 +176,7 @@ impl RkpScene {
             camera_buffer, color_pool_buffer, bone_matrices_buffer,
             bone_weights_buffer, brick_face_links_buffer, leaf_attr_pool_buffer,
             bone_field_buffer, bone_field_capacity,
+            bone_field_occ_buffer, bone_field_occ_capacity,
             bind_group_layout, bind_group,
         }
     }
@@ -188,6 +202,29 @@ impl RkpScene {
             mapped_at_creation: false,
         });
         self.bone_field_capacity = new_cap;
+        self.rebuild_bind_group(device);
+        true
+    }
+
+    /// Ensure `bone_field_occ_buffer` has at least `required_bytes`.
+    /// Grows + rebuilds the main bind group on reallocation. Returns
+    /// `true` when a reallocation happened — the scatter pass must
+    /// then refresh its own scene bind group too.
+    pub fn ensure_bone_field_occ_capacity(&mut self, device: &wgpu::Device, required_bytes: u64) -> bool {
+        if required_bytes <= self.bone_field_occ_capacity {
+            return false;
+        }
+        let mut new_cap = self.bone_field_occ_capacity.max(16);
+        while new_cap < required_bytes {
+            new_cap = new_cap.saturating_mul(2);
+        }
+        self.bone_field_occ_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rkp_bone_field_occ"),
+            size: new_cap,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.bone_field_occ_capacity = new_cap;
         self.rebuild_bind_group(device);
         true
     }
@@ -287,7 +324,7 @@ impl RkpScene {
             &self.brick_pool_buffer, &self.octree_nodes_buffer, buffer,
             &self.camera_buffer, &self.color_pool_buffer, &self.bone_matrices_buffer,
             &self.bone_weights_buffer, &self.brick_face_links_buffer, &self.leaf_attr_pool_buffer,
-            &self.bone_field_buffer,
+            &self.bone_field_buffer, &self.bone_field_occ_buffer,
         );
     }
 
@@ -322,7 +359,7 @@ impl RkpScene {
             &self.brick_pool_buffer, &self.octree_nodes_buffer, &self.objects_buffer,
             &self.camera_buffer, &self.color_pool_buffer, &self.bone_matrices_buffer,
             &self.bone_weights_buffer, &self.brick_face_links_buffer, &self.leaf_attr_pool_buffer,
-            &self.bone_field_buffer,
+            &self.bone_field_buffer, &self.bone_field_occ_buffer,
         );
     }
 
@@ -369,6 +406,7 @@ impl RkpScene {
                 storage_ro(7), // brick_face_links (was deformed_pool)
                 storage_ro(8), // leaf_attr_pool
                 storage_ro(9), // bone_field (Phase 3b skinned march reads this)
+                storage_ro(10), // bone_field_occ (Phase 3c brick-level empty-space skip)
             ],
         })
     }
@@ -387,6 +425,7 @@ impl RkpScene {
         brick_face_links: &wgpu::Buffer,
         leaf_attr_pool: &wgpu::Buffer,
         bone_field: &wgpu::Buffer,
+        bone_field_occ: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rkp_scene_bind_group"),
@@ -402,6 +441,7 @@ impl RkpScene {
                 wgpu::BindGroupEntry { binding: 7, resource: brick_face_links.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: leaf_attr_pool.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: bone_field.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: bone_field_occ.as_entire_binding() },
             ],
         })
     }

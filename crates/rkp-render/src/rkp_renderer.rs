@@ -120,27 +120,30 @@ impl RkpRenderer {
         }
     }
 
-    /// Grow `scene.bone_field_buffer` to at least `bytes` and clear it.
-    /// Call once per frame before any `scatter_skin_entity` dispatches.
+    /// Grow `scene.bone_field_buffer` + `scene.bone_field_occ_buffer`
+    /// to at least the requested sizes and clear both. Call once per
+    /// frame before any scatter dispatches.
     pub fn prepare_bone_field(
         &mut self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        bytes: u64,
+        field_bytes: u64,
+        occ_bytes: u64,
     ) {
-        let bytes = bytes.max(16); // keep a non-zero placeholder so the
-                                   // read-side binding stays valid
+        let field_bytes = field_bytes.max(16);
+        let occ_bytes = occ_bytes.max(16);
         let _ = queue; // unused but matches other pass signatures
-        let grew = self.scene.ensure_bone_field_capacity(&self.device, bytes);
-        if grew {
-            // New bone_field buffer handle — rebuild the scatter's
-            // scene bind group (the scene's main bind group was
-            // already rebuilt by ensure_bone_field_capacity).
+        let grew_field = self.scene.ensure_bone_field_capacity(&self.device, field_bytes);
+        let grew_occ = self.scene.ensure_bone_field_occ_capacity(&self.device, occ_bytes);
+        if grew_field || grew_occ {
+            // New buffer handle(s) — rebuild the scatter's scene bind
+            // group (the scene's main bind group was already rebuilt
+            // inside `ensure_*_capacity`).
             self.skin_deform.refresh_scene_bind_group(&self.device, &self.scene);
         }
-        // Clear the entire allocated range — scattering leaves gaps by
-        // design, so stale data from last frame must be wiped.
+        // Clear — scattering leaves gaps by design.
         encoder.clear_buffer(&self.scene.bone_field_buffer, 0, None);
+        encoder.clear_buffer(&self.scene.bone_field_occ_buffer, 0, None);
     }
 
     /// Run the batched skin-deform scatter. `batch` must have every

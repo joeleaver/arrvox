@@ -45,17 +45,17 @@ impl RenderContext {
                     max_bind_groups: 8,
                     max_storage_buffer_binding_size: 1 << 30, // 1 GB
                     max_buffer_size: 1 << 31, // 2 GB
-                    // 13 rather than the wgpu default 8 — the voxel
+                    // 14 rather than the wgpu default 8 — the voxel
                     // march pass hits 12 storage buffers in a single
                     // stage (brick_pool, octree_nodes, objects,
                     // color_pool, bone_matrices, bone_weights,
                     // brick_face_links, leaf_attr_pool in group 0;
                     // materials, stats, screen_aabbs, lights in
-                    // group 2) and rkipatch's Phase-3 skinned march
-                    // adds one more (bone_field). Desktop Vulkan
-                    // supports 24+, Metal/DX12 the same; the raise
-                    // only matters for GLES 3.x / some mobile.
-                    max_storage_buffers_per_shader_stage: 13,
+                    // group 2), plus Phase-3's bone_field and Phase-3c's
+                    // bone_field_occupancy (per-brick empty-space
+                    // skipper). Desktop Vulkan/Metal/DX12 support 24+;
+                    // raise only matters for GLES 3.x / some mobile.
+                    max_storage_buffers_per_shader_stage: 14,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -112,17 +112,17 @@ impl RenderContext {
                     max_bind_groups: 8,
                     max_storage_buffer_binding_size: 1 << 30, // 1 GB
                     max_buffer_size: 1 << 31, // 2 GB
-                    // 13 rather than the wgpu default 8 — the voxel
+                    // 14 rather than the wgpu default 8 — the voxel
                     // march pass hits 12 storage buffers in a single
                     // stage (brick_pool, octree_nodes, objects,
                     // color_pool, bone_matrices, bone_weights,
                     // brick_face_links, leaf_attr_pool in group 0;
                     // materials, stats, screen_aabbs, lights in
-                    // group 2) and rkipatch's Phase-3 skinned march
-                    // adds one more (bone_field). Desktop Vulkan
-                    // supports 24+, Metal/DX12 the same; the raise
-                    // only matters for GLES 3.x / some mobile.
-                    max_storage_buffers_per_shader_stage: 13,
+                    // group 2), plus Phase-3's bone_field and Phase-3c's
+                    // bone_field_occupancy (per-brick empty-space
+                    // skipper). Desktop Vulkan/Metal/DX12 support 24+;
+                    // raise only matters for GLES 3.x / some mobile.
+                    max_storage_buffers_per_shader_stage: 14,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
