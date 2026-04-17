@@ -1310,7 +1310,11 @@ impl EngineState {
                         ));
                         self.assign_entity_uuid(entity);
                         self.entity_scene_ids.insert(entity, scene_id);
-                        self.try_attach_skeleton(entity, std::path::Path::new(&path));
+                        // No auto-attach — the user adds `Skeleton`
+                        // manually via the Add Component menu when they
+                        // want animation. Helper below in
+                        // `try_attach_skeleton` is invoked from the
+                        // AddComponent command handler.
                         self.geometry_dirty = true;
                         self.scene_dirty = true;
                         self.gpu_objects_dirty = true;
@@ -1536,7 +1540,27 @@ impl EngineState {
 
             EngineCommand::AddComponent { entity_id, component_name } => {
                 if let Some(entity) = self.resolve_entity(&entity_id) {
-                    if let Some(entry) = self.registry.get(&component_name) {
+                    // Skeleton needs more context than the registry's
+                    // plain (World, Entity) `add_default` — it has to
+                    // find the sibling `.rkskel` next to the entity's
+                    // Renderable asset and load it. Route here first;
+                    // the attach helper also inserts an
+                    // AnimationPlayer alongside (components are
+                    // bundled — you never want one without the other).
+                    if component_name == "Skeleton" {
+                        let rkp_path = self.world
+                            .get::<&crate::components::Renderable>(entity)
+                            .ok()
+                            .and_then(|r| r.asset_path.clone());
+                        match rkp_path {
+                            Some(p) => self.try_attach_skeleton(entity, std::path::Path::new(&p)),
+                            None => self.console.warn(
+                                "Add Skeleton: entity has no Renderable asset — attach a model first".to_string(),
+                            ),
+                        }
+                        self.scene_dirty = true;
+                        self.gpu_objects_dirty = true;
+                    } else if let Some(entry) = self.registry.get(&component_name) {
                         if let Err(e) = (entry.add_default)(&mut self.world, entity) {
                             eprintln!("[RkpEngine] add component failed: {e}");
                         }
@@ -1554,6 +1578,14 @@ impl EngineState {
                     if let Some(entry) = self.registry.get(&component_name) {
                         if let Err(e) = (entry.remove)(&mut self.world, entity) {
                             eprintln!("[RkpEngine] remove component failed: {e}");
+                        }
+                        // Skeleton + AnimationPlayer are bundled —
+                        // pulling the skeleton also pulls the player
+                        // (ui treats AnimationPlayer as part of the
+                        // Skeleton section, so an orphaned player
+                        // would be invisible and confusing).
+                        if component_name == "Skeleton" {
+                            let _ = self.world.remove_one::<crate::components::AnimationPlayer>(entity);
                         }
                         self.scene_dirty = true;
                         self.gpu_objects_dirty = true;
@@ -3153,7 +3185,6 @@ impl EngineState {
                                     ..Default::default()
                                 }));
                                 self.entity_scene_ids.insert(e, sid);
-                                self.try_attach_skeleton(e, &full_path);
                                 self.geometry_dirty = true;
                                 Some(e)
                             }

@@ -633,8 +633,13 @@ fn skeleton_entry() -> ComponentEntry {
         },
         // Every field is transient; the inspector never writes to a Skeleton.
         set_field: |_, _, field, _| Err(format!("Skeleton field '{field}' is read-only")),
-        // No default — must be attached from a loaded `.rkskel`.
-        add_default: |_, _| Err("Skeleton is attached automatically when a `.rkskel` is present".into()),
+        // `add_default` is a pass-through no-op. `AddComponent` for
+        // "Skeleton" is special-cased by the engine command handler
+        // (see `EngineCommand::AddComponent`) so it can reach the
+        // sibling `.rkskel` and the animation asset cache — the
+        // registry's plain (World, Entity) signature isn't rich enough
+        // to do the real attach here.
+        add_default: |_, _| Ok(()),
         remove: |world, entity| {
             world.remove_one::<Skeleton>(entity).map(|_| ()).map_err(|e| format!("{e}"))
         },

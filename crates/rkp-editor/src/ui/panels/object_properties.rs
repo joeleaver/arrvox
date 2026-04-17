@@ -108,18 +108,6 @@ fn InspectorContent() -> NodeHandle {
         store.inspector.get().map(|s| s.entity_id.clone()).unwrap_or_default()
     });
 
-    // Entity id when the current selection has a skeleton, else empty.
-    // Returned as a Vec so we can drive `AnimationSection` via a
-    // single-element `for` loop: `if { ... key: ... }` doesn't remount
-    // on key change in rinch, but a keyed `for` does. Same trick the
-    // Asset Properties panel uses for `ModelPropertiesForm`.
-    let animated_entity_key = Memo::new(move || {
-        store.inspector.get()
-            .filter(|s| s.skeleton.is_some())
-            .map(|s| vec![s.entity_id.clone()])
-            .unwrap_or_default()
-    });
-
     rsx! {
         div {
             style: "display:flex;flex-direction:column;",
@@ -134,20 +122,6 @@ fn InspectorContent() -> NodeHandle {
                 div {
                     style: "font-size:10px;color:#666;margin-top:2px;font-family:monospace;",
                     {move || entity_id.get().chars().take(8).collect::<String>()}
-                }
-            }
-
-            // Dedicated Animation panel — renders when the entity has a
-            // loaded skeleton. Hides the generic Skeleton + AnimationPlayer
-            // sections below (they'd just duplicate these controls with
-            // uglier ergonomics — text input for clip name etc.). Driven
-            // by a keyed `for` so switching between animated entities
-            // remounts the form (clip dropdown, transport, bone tree all
-            // re-seed with the new entity's state instead of sticking on
-            // the first-selected's values).
-            for key in animated_entity_key.get().into_iter() {
-                AnimationSection {
-                    key: key,
                 }
             }
 
@@ -186,11 +160,16 @@ fn ComponentSection(snapshot: ComponentSnapshot) -> NodeHandle {
     if snapshot.name == "EditorMetadata" {
         return rsx! { span {} };
     }
-    // Hide Skeleton + AnimationPlayer — the dedicated AnimationSection
-    // above renders them more ergonomically (clip dropdown instead of a
-    // free-form text input, per-clip scrubber max, bone tree).
-    if snapshot.name == "Skeleton" || snapshot.name == "AnimationPlayer" {
+    // AnimationPlayer is bundled into the Skeleton section below —
+    // hide its own entry in the list so transport lives in one place.
+    if snapshot.name == "AnimationPlayer" {
         return rsx! { span {} };
+    }
+    // Skeleton gets a rich custom body instead of generic field
+    // reflection — clip dropdown, transport, scrubber, DQS toggle,
+    // bone tree. Delegate to the helper.
+    if snapshot.name == "Skeleton" {
+        return skeleton_component_section(__scope, snapshot);
     }
 
     // Build the remove callback for non-mandatory components.
@@ -450,40 +429,62 @@ fn AddComponentButton() -> NodeHandle {
     }
 }
 
-// ── Animation section (dedicated panel for entities with a Skeleton) ──────
+// ── Skeleton component section — custom body with rich animation UI ──────
 
-/// Rendered at the top of ObjectProperties for animated entities. Hosts
-/// the clip picker, playback transport, and a collapsed bone hierarchy
-/// — anything that depends on the loaded `SkeletonAsset`'s contents
-/// (clips, bones) rather than the generic component-field reflection.
-#[component]
-fn AnimationSection() -> NodeHandle {
+/// Body for a `Skeleton` ComponentSection. Renders the clip picker,
+/// playback transport, scrubber, skinning / DQS toggles, and a
+/// collapsible bone tree in place of the plain field-reflection list
+/// that every other component gets.
+fn skeleton_component_section(
+    __scope: &mut rinch::core::dom::RenderScope,
+    snapshot: ComponentSnapshot,
+) -> rinch::core::dom::NodeHandle {
     let store = use_context::<EditorStore>();
     let cmd_tx: CmdSignal = Signal::new(use_context::<CommandSender>().0);
     let collapsed = Signal::new(false);
     let bones_collapsed = Signal::new(true);
+    let comp_name = Signal::new(snapshot.name.clone());
+    let removable = snapshot.removable;
 
-    let snapshot = Memo::new(move || store.inspector.get());
+    // Remove callback — firing this drops both Skeleton *and*
+    // AnimationPlayer (bundled) via the engine's RemoveComponent
+    // handler.
+    let on_remove: Option<Rc<dyn Fn()>> = if removable {
+        Some(Rc::new(move || {
+            let cn = comp_name.get();
+            if let Some(snap) = store.inspector.get() {
+                if let Ok(eid) = uuid::Uuid::parse_str(&snap.entity_id) {
+                    let _ = cmd_tx.get().send(rkp_engine::EngineCommand::RemoveComponent {
+                        entity_id: eid,
+                        component_name: cn,
+                    });
+                }
+            }
+        }) as Rc<dyn Fn()>)
+    } else {
+        None
+    };
+
+    let snap_memo = Memo::new(move || store.inspector.get());
 
     rsx! {
         div {
-            {prop_section_header(__scope, "Animation", collapsed, None)}
+            {prop_section_header(__scope, "Skeleton", collapsed, on_remove)}
 
             if !collapsed.get() {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
-                    {render_animation_body(__scope, snapshot.get(), bones_collapsed, cmd_tx)}
+                    {render_skeleton_body(__scope, snap_memo.get(), bones_collapsed, cmd_tx)}
                 }
             }
         }
     }
 }
 
-/// Render the inner body of the AnimationSection — splits the `snap` /
-/// `skel` destructure into a plain function so the rsx macro isn't
-/// trying to close over `Option`-moved locals inside its generated
-/// effect.
-fn render_animation_body(
+/// Render the body of the Skeleton section — splits the `snap`/`skel`
+/// destructure into a plain function so the rsx macro isn't trying to
+/// close over `Option`-moved locals inside its generated effect.
+fn render_skeleton_body(
     __scope: &mut rinch::core::dom::RenderScope,
     snap_opt: Option<InspectorSnapshot>,
     bones_collapsed: Signal<bool>,
