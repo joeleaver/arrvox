@@ -490,6 +490,8 @@ fn render_add_child_menu(
                     {add_menu_item(__scope, "Mirror", TablerIcon::FlipHorizontal, parent_id, opened, cmd_tx)}
                     {add_menu_item(__scope, "MaterialByHeight", TablerIcon::Stack2, parent_id, opened, cmd_tx)}
                     {add_menu_item(__scope, "ColorByHeight", TablerIcon::Palette, parent_id, opened, cmd_tx)}
+                    {add_menu_item(__scope, "MaterialByNoise", TablerIcon::Grain, parent_id, opened, cmd_tx)}
+                    {add_menu_item(__scope, "ColorByNoise", TablerIcon::Droplet, parent_id, opened, cmd_tx)}
                 }
             }
         }
@@ -539,5 +541,7 @@ fn node_icon(kind: ProceduralNodeKind) -> TablerIcon {
         ProceduralNodeKind::Mirror => TablerIcon::FlipHorizontal,
         ProceduralNodeKind::MaterialByHeight => TablerIcon::Stack2,
         ProceduralNodeKind::ColorByHeight => TablerIcon::Palette,
+        ProceduralNodeKind::MaterialByNoise => TablerIcon::Grain,
+        ProceduralNodeKind::ColorByNoise => TablerIcon::Droplet,
     }
 }

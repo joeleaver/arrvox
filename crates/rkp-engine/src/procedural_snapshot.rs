@@ -81,6 +81,8 @@ pub enum ProceduralNodeKind {
     Mirror,
     MaterialByHeight,
     ColorByHeight,
+    MaterialByNoise,
+    ColorByNoise,
 }
 
 impl ProceduralNodeKind {
@@ -100,6 +102,8 @@ impl ProceduralNodeKind {
             Self::Mirror => "Mirror",
             Self::MaterialByHeight => "Material by Height",
             Self::ColorByHeight => "Color by Height",
+            Self::MaterialByNoise => "Material by Noise",
+            Self::ColorByNoise => "Color by Noise",
         }
     }
 }
@@ -221,6 +225,16 @@ pub fn build_procedural_snapshot(
                 ProceduralNodeKind::ColorByHeight,
                 "Color by Height".to_string(),
                 color_by_height_params(p),
+            ),
+            NodeKind::MaterialByNoise(p) => (
+                ProceduralNodeKind::MaterialByNoise,
+                "Material by Noise".to_string(),
+                material_by_noise_params(p),
+            ),
+            NodeKind::ColorByNoise(p) => (
+                ProceduralNodeKind::ColorByNoise,
+                "Color by Noise".to_string(),
+                color_by_noise_params(p),
             ),
         };
 
@@ -438,6 +452,38 @@ fn color_by_height_params(
             value: ProceduralParamValue::Float(p.transition_width),
             range: Some((0.0, 10.0)),
         },
+    ]
+}
+
+fn material_by_noise_params(
+    p: &rkp_procedural::node_kind::MaterialByNoiseParams,
+) -> Vec<ProceduralParam> {
+    vec![
+        ProceduralParam { name: "low_material".into(), value: ProceduralParamValue::Material(p.low_material), range: None },
+        ProceduralParam { name: "low_to_mid".into(), value: ProceduralParamValue::Float(p.low_to_mid), range: Some((-2.0, 2.0)) },
+        ProceduralParam { name: "mid_material".into(), value: ProceduralParamValue::Material(p.mid_material), range: None },
+        ProceduralParam { name: "mid_to_high".into(), value: ProceduralParamValue::Float(p.mid_to_high), range: Some((-2.0, 2.0)) },
+        ProceduralParam { name: "high_material".into(), value: ProceduralParamValue::Material(p.high_material), range: None },
+        ProceduralParam { name: "transition_width".into(), value: ProceduralParamValue::Float(p.transition_width), range: Some((0.0, 2.0)) },
+        ProceduralParam { name: "frequency".into(), value: ProceduralParamValue::Float(p.frequency), range: Some((0.05, 32.0)) },
+        ProceduralParam { name: "octaves".into(), value: ProceduralParamValue::Float(p.octaves as f32), range: Some((1.0, 8.0)) },
+        ProceduralParam { name: "seed".into(), value: ProceduralParamValue::Float(p.seed as f32), range: Some((0.0, 1024.0)) },
+    ]
+}
+
+fn color_by_noise_params(
+    p: &rkp_procedural::node_kind::ColorByNoiseParams,
+) -> Vec<ProceduralParam> {
+    vec![
+        ProceduralParam { name: "low_color".into(), value: ProceduralParamValue::Color(rgba_from_color(p.low_color)), range: None },
+        ProceduralParam { name: "low_to_mid".into(), value: ProceduralParamValue::Float(p.low_to_mid), range: Some((-2.0, 2.0)) },
+        ProceduralParam { name: "mid_color".into(), value: ProceduralParamValue::Color(rgba_from_color(p.mid_color)), range: None },
+        ProceduralParam { name: "mid_to_high".into(), value: ProceduralParamValue::Float(p.mid_to_high), range: Some((-2.0, 2.0)) },
+        ProceduralParam { name: "high_color".into(), value: ProceduralParamValue::Color(rgba_from_color(p.high_color)), range: None },
+        ProceduralParam { name: "transition_width".into(), value: ProceduralParamValue::Float(p.transition_width), range: Some((0.0, 2.0)) },
+        ProceduralParam { name: "frequency".into(), value: ProceduralParamValue::Float(p.frequency), range: Some((0.05, 32.0)) },
+        ProceduralParam { name: "octaves".into(), value: ProceduralParamValue::Float(p.octaves as f32), range: Some((1.0, 8.0)) },
+        ProceduralParam { name: "seed".into(), value: ProceduralParamValue::Float(p.seed as f32), range: Some((0.0, 1024.0)) },
     ]
 }
 

@@ -5225,6 +5225,12 @@ fn parse_node_kind(kind: &str) -> rkp_procedural::NodeKind {
         "ColorByHeight" => {
             rkp_procedural::NodeKind::ColorByHeight(ColorByHeightParams::default())
         }
+        "MaterialByNoise" => {
+            rkp_procedural::NodeKind::MaterialByNoise(MaterialByNoiseParams::default())
+        }
+        "ColorByNoise" => {
+            rkp_procedural::NodeKind::ColorByNoise(ColorByNoiseParams::default())
+        }
         _ => rkp_procedural::NodeKind::Sphere(SphereParams::default()),
     }
 }
@@ -5353,6 +5359,52 @@ fn apply_procedural_param(
             "high_color" => { if let Some(v) = parse_vec3(value) { p.high_color = v; } true }
             "transition_width" => {
                 p.transition_width = value.parse::<f32>().unwrap_or(p.transition_width).max(0.0);
+                true
+            }
+            _ => false,
+        },
+        NodeKind::MaterialByNoise(p) => match param_name {
+            "low_material" => { p.low_material = value.parse().unwrap_or(p.low_material); true }
+            "low_to_mid" => { p.low_to_mid = value.parse().unwrap_or(p.low_to_mid); true }
+            "mid_material" => { p.mid_material = value.parse().unwrap_or(p.mid_material); true }
+            "mid_to_high" => { p.mid_to_high = value.parse().unwrap_or(p.mid_to_high); true }
+            "high_material" => { p.high_material = value.parse().unwrap_or(p.high_material); true }
+            "transition_width" => {
+                p.transition_width = value.parse::<f32>().unwrap_or(p.transition_width).max(0.0);
+                true
+            }
+            "frequency" => { p.frequency = value.parse().unwrap_or(p.frequency); true }
+            "octaves" => {
+                let f: f32 = value.parse().unwrap_or(p.octaves as f32);
+                p.octaves = (f.max(0.0) as u32).clamp(1, 8);
+                true
+            }
+            "seed" => {
+                let f: f32 = value.parse().unwrap_or(p.seed as f32);
+                p.seed = f.max(0.0) as u32;
+                true
+            }
+            _ => false,
+        },
+        NodeKind::ColorByNoise(p) => match param_name {
+            "low_color" => { if let Some(v) = parse_vec3(value) { p.low_color = v; } true }
+            "low_to_mid" => { p.low_to_mid = value.parse().unwrap_or(p.low_to_mid); true }
+            "mid_color" => { if let Some(v) = parse_vec3(value) { p.mid_color = v; } true }
+            "mid_to_high" => { p.mid_to_high = value.parse().unwrap_or(p.mid_to_high); true }
+            "high_color" => { if let Some(v) = parse_vec3(value) { p.high_color = v; } true }
+            "transition_width" => {
+                p.transition_width = value.parse::<f32>().unwrap_or(p.transition_width).max(0.0);
+                true
+            }
+            "frequency" => { p.frequency = value.parse().unwrap_or(p.frequency); true }
+            "octaves" => {
+                let f: f32 = value.parse().unwrap_or(p.octaves as f32);
+                p.octaves = (f.max(0.0) as u32).clamp(1, 8);
+                true
+            }
+            "seed" => {
+                let f: f32 = value.parse().unwrap_or(p.seed as f32);
+                p.seed = f.max(0.0) as u32;
                 true
             }
             _ => false,

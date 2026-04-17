@@ -54,6 +54,17 @@ pub enum NodeKind {
     /// material are untouched. Adjacent band colors lerp across a
     /// `transition_width` zone. Single-child effect.
     ColorByHeight(ColorByHeightParams),
+    /// Rewrite primary material from a 3-band rule on an FBM noise
+    /// sample at the effect-local position. Same dual-material
+    /// writeback as `MaterialByHeight`; difference is the classifier
+    /// input (noise scalar vs. local Y). Single-child effect.
+    MaterialByNoise(MaterialByNoiseParams),
+    /// Rewrite per-voxel color from a 3-band rule on an FBM noise
+    /// sample at the effect-local position. Orthogonal to
+    /// `MaterialByNoise` — stacking them rewrites both channels from
+    /// their own noise fields (different seeds give independent
+    /// patterns). Single-child effect.
+    ColorByNoise(ColorByNoiseParams),
 }
 
 impl NodeKind {
@@ -88,6 +99,8 @@ impl NodeKind {
                 | NodeKind::Mirror(_)
                 | NodeKind::MaterialByHeight(_)
                 | NodeKind::ColorByHeight(_)
+                | NodeKind::MaterialByNoise(_)
+                | NodeKind::ColorByNoise(_)
         )
     }
 
@@ -107,6 +120,8 @@ impl NodeKind {
                 | NodeKind::Mirror(_)
                 | NodeKind::MaterialByHeight(_)
                 | NodeKind::ColorByHeight(_)
+                | NodeKind::MaterialByNoise(_)
+                | NodeKind::ColorByNoise(_)
         ) {
             Some(1)
         } else {
@@ -448,42 +463,123 @@ impl Default for ColorByHeightParams {
     }
 }
 
-/// Classifier output for a by-height effect at a given local Y.
+/// Material-by-noise effect params. Classifies an FBM noise sample
+/// at the effect-local position into three bands, same smooth-seam
+/// dual-material writeback as `MaterialByHeightParams`. Noise output
+/// sits in roughly `[-1, 1]`, so thresholds in that range are the
+/// natural setting; `transition_width` lives on the same scale.
+///
+/// The noise is evaluated in the effect's local frame so moving /
+/// rotating the node shifts the pattern with it — consistent with
+/// `NoiseDisplace` once you anchor the field to the local frame via
+/// the `inverse_world` in flatten's post-op emit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterialByNoiseParams {
+    pub low_material: u16,
+    pub low_to_mid: f32,
+    pub mid_material: u16,
+    pub mid_to_high: f32,
+    pub high_material: u16,
+    pub transition_width: f32,
+    /// Spatial frequency of the noise in cycles per local unit —
+    /// larger = tighter speckle.
+    pub frequency: f32,
+    /// Permutation seed; change to re-roll the pattern without
+    /// changing frequency / octaves.
+    pub seed: u32,
+    /// Number of FBM octaves. Clamped to `[1, 8]` in evaluation.
+    pub octaves: u32,
+}
+
+impl Default for MaterialByNoiseParams {
+    fn default() -> Self {
+        Self {
+            low_material: 0,
+            low_to_mid: -0.3,
+            mid_material: 0,
+            mid_to_high: 0.3,
+            high_material: 0,
+            transition_width: 0.1,
+            frequency: 2.0,
+            seed: 0,
+            octaves: 3,
+        }
+    }
+}
+
+/// Color-by-noise effect params. Same band structure as
+/// `ColorByNoiseParams`'s material sibling, but rewrites
+/// `Sample::color` with a Vec3 lerp across transition zones.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColorByNoiseParams {
+    pub low_color: Vec3,
+    pub low_to_mid: f32,
+    pub mid_color: Vec3,
+    pub mid_to_high: f32,
+    pub high_color: Vec3,
+    pub transition_width: f32,
+    pub frequency: f32,
+    pub seed: u32,
+    pub octaves: u32,
+}
+
+impl Default for ColorByNoiseParams {
+    fn default() -> Self {
+        Self {
+            low_color: Vec3::new(0.4, 0.3, 0.2),
+            low_to_mid: -0.3,
+            mid_color: Vec3::new(0.3, 0.6, 0.2),
+            mid_to_high: 0.3,
+            high_color: Vec3::new(0.95, 0.95, 0.95),
+            transition_width: 0.1,
+            frequency: 2.0,
+            seed: 0,
+            octaves: 3,
+        }
+    }
+}
+
+/// Classifier output for a by-* effect at a given scalar value.
 /// `lower` / `upper` are band indices (0=low, 1=mid, 2=high). `alpha`
 /// is the blend weight between them: 0 = fully lower, 1 = fully upper.
 /// Used by both the CPU evaluator and the CPU RPN exec in flatten
 /// tests so they agree with the WGSL implementation.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct HeightBandClassify {
+pub struct BandClassify {
     pub lower: u32,
     pub upper: u32,
     pub alpha: f32,
 }
 
-/// Classify a local-Y value into one of three bands with smooth
-/// transitions around the thresholds. `transition_width` is the
-/// total width of each transition zone (smoothstep is applied over
+/// Classify a scalar into one of three bands with smooth transitions
+/// around the thresholds. `transition_width` is the total width of
+/// each transition zone (smoothstep is applied over
 /// `threshold - w/2 .. threshold + w/2`). A width of zero (or near
 /// zero) degenerates cleanly into hard bands.
-pub fn classify_height(
-    y: f32,
+///
+/// Used by both by-height (feeding local Y) and by-noise (feeding an
+/// FBM sample). The math is identical — it's pure scalar
+/// classification — so both effects can share the same helper and
+/// WGSL port (`classify_bands` in `shaders/proc_raymarch.wgsl`).
+pub fn classify_bands(
+    value: f32,
     low_to_mid: f32,
     mid_to_high: f32,
     transition_width: f32,
-) -> HeightBandClassify {
+) -> BandClassify {
     let w_half = (transition_width * 0.5).max(1e-6);
-    if y < low_to_mid - w_half {
-        HeightBandClassify { lower: 0, upper: 0, alpha: 0.0 }
-    } else if y < low_to_mid + w_half {
-        let t = ((y - (low_to_mid - w_half)) / (2.0 * w_half)).clamp(0.0, 1.0);
-        HeightBandClassify { lower: 0, upper: 1, alpha: smoothstep01(t) }
-    } else if y < mid_to_high - w_half {
-        HeightBandClassify { lower: 1, upper: 1, alpha: 0.0 }
-    } else if y < mid_to_high + w_half {
-        let t = ((y - (mid_to_high - w_half)) / (2.0 * w_half)).clamp(0.0, 1.0);
-        HeightBandClassify { lower: 1, upper: 2, alpha: smoothstep01(t) }
+    if value < low_to_mid - w_half {
+        BandClassify { lower: 0, upper: 0, alpha: 0.0 }
+    } else if value < low_to_mid + w_half {
+        let t = ((value - (low_to_mid - w_half)) / (2.0 * w_half)).clamp(0.0, 1.0);
+        BandClassify { lower: 0, upper: 1, alpha: smoothstep01(t) }
+    } else if value < mid_to_high - w_half {
+        BandClassify { lower: 1, upper: 1, alpha: 0.0 }
+    } else if value < mid_to_high + w_half {
+        let t = ((value - (mid_to_high - w_half)) / (2.0 * w_half)).clamp(0.0, 1.0);
+        BandClassify { lower: 1, upper: 2, alpha: smoothstep01(t) }
     } else {
-        HeightBandClassify { lower: 2, upper: 2, alpha: 0.0 }
+        BandClassify { lower: 2, upper: 2, alpha: 0.0 }
     }
 }
 

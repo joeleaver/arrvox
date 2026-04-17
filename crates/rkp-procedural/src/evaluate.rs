@@ -165,7 +165,7 @@ fn sample_node(
             if s.is_empty() {
                 return s;
             }
-            let c = crate::node_kind::classify_height(
+            let c = crate::node_kind::classify_bands(
                 local_pos.y,
                 params.low_to_mid,
                 params.mid_to_high,
@@ -186,7 +186,7 @@ fn sample_node(
             if s.is_empty() {
                 return s;
             }
-            let c = crate::node_kind::classify_height(
+            let c = crate::node_kind::classify_bands(
                 local_pos.y,
                 params.low_to_mid,
                 params.mid_to_high,
@@ -196,6 +196,46 @@ fn sample_node(
             let a = colors[c.lower as usize];
             let b = colors[c.upper as usize];
             s.color = a.lerp(b, c.alpha);
+            s
+        }
+
+        NodeKind::MaterialByNoise(params) => {
+            let Some(&child_id) = node.children.first() else {
+                return Sample::EMPTY;
+            };
+            let mut s = sample_node(obj, child_id, local_pos, voxel_size, cache);
+            if s.is_empty() {
+                return s;
+            }
+            let n = crate::noise::fbm_3d_scalar(
+                local_pos, params.frequency, params.seed, params.octaves,
+            );
+            let c = crate::node_kind::classify_bands(
+                n, params.low_to_mid, params.mid_to_high, params.transition_width,
+            );
+            let mats = [params.low_material, params.mid_material, params.high_material];
+            s.material_id = mats[c.lower as usize];
+            s.secondary_material_id = mats[c.upper as usize];
+            s.blend_weight = c.alpha;
+            s
+        }
+
+        NodeKind::ColorByNoise(params) => {
+            let Some(&child_id) = node.children.first() else {
+                return Sample::EMPTY;
+            };
+            let mut s = sample_node(obj, child_id, local_pos, voxel_size, cache);
+            if s.is_empty() {
+                return s;
+            }
+            let n = crate::noise::fbm_3d_scalar(
+                local_pos, params.frequency, params.seed, params.octaves,
+            );
+            let c = crate::node_kind::classify_bands(
+                n, params.low_to_mid, params.mid_to_high, params.transition_width,
+            );
+            let colors = [params.low_color, params.mid_color, params.high_color];
+            s.color = colors[c.lower as usize].lerp(colors[c.upper as usize], c.alpha);
             s
         }
 
@@ -750,6 +790,167 @@ mod tests {
         // World x=-7 → local y=+7 → HIGH band.
         let s = sample_tree(&obj, Vec3::new(-7.0, 0.0, 0.0), VS);
         assert_eq!(s.material_id, 30, "rotated MaterialByHeight: expected high at world x=-7");
+    }
+
+    /// MaterialByNoise produces different bands at different sample
+    /// points (otherwise it's not really doing anything) and leaves
+    /// the child's color untouched.
+    #[test]
+    fn material_by_noise_varies_and_preserves_color() {
+        use crate::node_kind::MaterialByNoiseParams;
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        let mbn = obj.add_child(
+            obj.root(),
+            NodeKind::MaterialByNoise(MaterialByNoiseParams {
+                low_material: 10,
+                low_to_mid: -0.3,
+                mid_material: 20,
+                mid_to_high: 0.3,
+                high_material: 30,
+                transition_width: 0.0,
+                frequency: 3.0,
+                seed: 7,
+                octaves: 3,
+            }),
+        );
+        // Big sphere so we can sample many interior points.
+        let s = obj.add_child(mbn, sphere(2.0, 99));
+        let _ = s;
+        // Force a distinct child color so we can verify pass-through.
+        if let Some(n) = obj.get_mut(s) {
+            if let NodeKind::Sphere(p) = &mut n.kind {
+                p.color = Vec3::new(0.7, 0.2, 0.1);
+            }
+        }
+
+        let mut seen_low = false;
+        let mut seen_mid = false;
+        let mut seen_high = false;
+        for ix in -5..=5 {
+            for iy in -5..=5 {
+                for iz in -5..=5 {
+                    let p = Vec3::new(ix as f32 * 0.2, iy as f32 * 0.2, iz as f32 * 0.2);
+                    let s = sample_tree(&obj, p, VS);
+                    if !s.is_inside() { continue; }
+                    match s.material_id {
+                        10 => seen_low = true,
+                        20 => seen_mid = true,
+                        30 => seen_high = true,
+                        _ => {}
+                    }
+                    // Child color must pass through unchanged
+                    // everywhere (orthogonality).
+                    assert!((s.color - Vec3::new(0.7, 0.2, 0.1)).length() < 1e-5,
+                        "color should pass through, got {:?}", s.color);
+                }
+            }
+        }
+        assert!(seen_low && seen_mid && seen_high,
+            "expected all 3 bands to appear, got low={seen_low} mid={seen_mid} high={seen_high}");
+    }
+
+    /// ColorByNoise rewrites color and leaves material untouched —
+    /// mirror test of the MaterialByNoise orthogonality case.
+    #[test]
+    fn color_by_noise_varies_and_preserves_material() {
+        use crate::node_kind::ColorByNoiseParams;
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        let cbn = obj.add_child(
+            obj.root(),
+            NodeKind::ColorByNoise(ColorByNoiseParams {
+                low_color: Vec3::new(1.0, 0.0, 0.0),
+                low_to_mid: -0.3,
+                mid_color: Vec3::new(0.0, 1.0, 0.0),
+                mid_to_high: 0.3,
+                high_color: Vec3::new(0.0, 0.0, 1.0),
+                transition_width: 0.0,
+                frequency: 3.0,
+                seed: 7,
+                octaves: 3,
+            }),
+        );
+        obj.add_child(cbn, sphere(2.0, 42));
+
+        let mut seen_distinct = std::collections::HashSet::new();
+        for ix in -5..=5 {
+            for iy in -5..=5 {
+                for iz in -5..=5 {
+                    let p = Vec3::new(ix as f32 * 0.2, iy as f32 * 0.2, iz as f32 * 0.2);
+                    let s = sample_tree(&obj, p, VS);
+                    if !s.is_inside() { continue; }
+                    // Material never rewritten.
+                    assert_eq!(s.material_id, 42, "material should pass through");
+                    // Bucket color into one of the three band tags.
+                    let tag = if s.color.x > 0.5 { "R" }
+                              else if s.color.y > 0.5 { "G" }
+                              else if s.color.z > 0.5 { "B" }
+                              else { "?" };
+                    seen_distinct.insert(tag);
+                }
+            }
+        }
+        assert!(seen_distinct.contains(&"R") && seen_distinct.contains(&"G") && seen_distinct.contains(&"B"),
+            "expected all 3 color bands to appear, got {seen_distinct:?}");
+    }
+
+    /// Translating the node shifts the noise field with it — a point
+    /// that reads LOW at the origin reads something else after the
+    /// node moves. (Probabilistic: with a non-uniform noise field the
+    /// chance of hitting the same band at two unrelated local coords
+    /// is roughly 1/3; we test a few points so the OR across them is
+    /// effectively 1.)
+    #[test]
+    fn material_by_noise_follows_node_transform() {
+        use crate::node_kind::MaterialByNoiseParams;
+        use glam::Affine3A;
+
+        let make_obj = |translation: Vec3| {
+            let mut obj = ProceduralObject::new(NodeKind::Union {
+                material_combine: MaterialCombine::Winner,
+            });
+            let mbn = obj.add_child(
+                obj.root(),
+                NodeKind::MaterialByNoise(MaterialByNoiseParams {
+                    low_material: 10,
+                    low_to_mid: -0.3,
+                    mid_material: 20,
+                    mid_to_high: 0.3,
+                    high_material: 30,
+                    transition_width: 0.0,
+                    frequency: 3.0,
+                    seed: 7,
+                    octaves: 3,
+                }),
+            );
+            obj.set_transform(mbn, Affine3A::from_translation(translation));
+            obj.add_child(mbn, sphere(2.0, 0));
+            obj
+        };
+
+        let obj_origin = make_obj(Vec3::ZERO);
+        let obj_shifted = make_obj(Vec3::new(1.7, 0.0, 0.0));
+
+        // Collect material ids at a grid of world points; verify at
+        // least one point disagrees between the two transforms.
+        let mut disagreed = false;
+        for ix in -3..=3 {
+            for iy in -3..=3 {
+                let p = Vec3::new(ix as f32 * 0.3, iy as f32 * 0.3, 0.0);
+                let a = sample_tree(&obj_origin, p, VS);
+                let b = sample_tree(&obj_shifted, p, VS);
+                if !a.is_inside() || !b.is_inside() { continue; }
+                if a.material_id != b.material_id {
+                    disagreed = true;
+                    break;
+                }
+            }
+            if disagreed { break; }
+        }
+        assert!(disagreed, "translating MaterialByNoise should shift the noise pattern");
     }
 
     /// Transform on a parent combinator affects all children.

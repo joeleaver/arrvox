@@ -80,6 +80,21 @@ pub enum OpKind {
     /// on the effect's local Y. Layout is described in
     /// `emit_color_by_height_post_op`.
     ApplyColorByHeight = 301,
+    /// Post-op: rewrite the top sample's material fields from a
+    /// 3-band rule on an FBM noise sample at the effect-local
+    /// position. `params[0..6]` = (low_to_mid, mid_to_high,
+    /// transition_width, frequency, seed_as_f32, octaves_as_f32).
+    /// `params[6..8]` = (low_material, mid_material). `color[0]` =
+    /// high_material. `inverse_world` = effect's (A*M).inverse() so
+    /// the shader can transform `pos_stack[pos_top]` into the
+    /// effect's local frame before sampling noise.
+    ApplyMaterialByNoise = 302,
+    /// Post-op: rewrite the top sample's `color` from a 3-band rule
+    /// on an FBM noise sample. `params[0..6]` same as
+    /// `ApplyMaterialByNoise`. `params[6..8]` + `color[0]` = three
+    /// RGB colors packed as u24 (bit-cast into f32). `color[1..4]`
+    /// unused. `inverse_world` = effect's (A*M).inverse().
+    ApplyColorByNoise = 303,
 }
 
 /// A single instruction in the flattened tree stream.
@@ -139,6 +154,30 @@ pub struct ProcInstruction {
     /// per instruction (dwarfed by the 64-byte transform block). Layout
     /// is column-major to match `Mat4::to_cols_array_2d`.
     pub inverse_world: [[f32; 4]; 4],
+}
+
+/// Pack an RGB color (each channel in `[0, 1]`) into a u24 value
+/// bit-laid as `r | (g << 8) | (b << 16)`. Used by the by-noise
+/// color post-op to fit three colors into three f32 slots; the u32
+/// is then bit-cast to f32 (safe since values ≤ 2^24 are exactly
+/// representable as f32). The WGSL side unpacks with
+/// `bitcast<u32>(f32) >> {0, 8, 16} & 0xFF`.
+fn pack_rgb_u24(c: glam::Vec3) -> u32 {
+    let r = (c.x.clamp(0.0, 1.0) * 255.0) as u32;
+    let g = (c.y.clamp(0.0, 1.0) * 255.0) as u32;
+    let b = (c.z.clamp(0.0, 1.0) * 255.0) as u32;
+    r | (g << 8) | (b << 16)
+}
+
+/// Inverse of `pack_rgb_u24` — unpack a u24-bit-laid f32 back into
+/// a Vec3 color. Used only by the CPU RPN exec in flatten tests so
+/// it mirrors the WGSL unpack bit-for-bit.
+fn unpack_rgb_u24(packed: f32) -> glam::Vec3 {
+    let bits = packed.to_bits();
+    let r = (bits & 0xFF) as f32 / 255.0;
+    let g = ((bits >> 8) & 0xFF) as f32 / 255.0;
+    let b = ((bits >> 16) & 0xFF) as f32 / 255.0;
+    glam::Vec3::new(r, g, b)
 }
 
 /// Encode a `MaterialCombine` as a u32 for the GPU. Values match the
@@ -443,6 +482,78 @@ fn emit(
             });
         }
 
+        NodeKind::MaterialByNoise(p) => {
+            let Some(&child_id) = node.children.first() else {
+                return;
+            };
+            emit(obj, child_id, this_world, out);
+            let inverse_world = Mat4::from(this_world).inverse().to_cols_array_2d();
+            // Layout:
+            //   params = [low_to_mid, mid_to_high, transition_width,
+            //             frequency, seed, octaves,
+            //             low_material, mid_material]
+            //   color  = [high_material, 0, 0, 0]
+            // Material ids fit exactly in f32 (u16 max 65535, f32
+            // represents ints up to 2^24 exactly).
+            let params_post = [
+                p.low_to_mid, p.mid_to_high, p.transition_width,
+                p.frequency, p.seed as f32, p.octaves as f32,
+                p.low_material as f32, p.mid_material as f32,
+            ];
+            let color_post = [p.high_material as f32, 0.0, 0.0, 0.0];
+            out.push(ProcInstruction {
+                op: OpKind::ApplyMaterialByNoise as u32,
+                arity: 0,
+                material_combine: 0,
+                material_id: 0,
+                node_id: id.0,
+                _pad0: 0, _pad1: 0, _pad2: 0,
+                params: params_post,
+                color: color_post,
+                inverse_world,
+            });
+        }
+
+        NodeKind::ColorByNoise(p) => {
+            let Some(&child_id) = node.children.first() else {
+                return;
+            };
+            emit(obj, child_id, this_world, out);
+            let inverse_world = Mat4::from(this_world).inverse().to_cols_array_2d();
+            // Layout:
+            //   params = [low_to_mid, mid_to_high, transition_width,
+            //             frequency, seed, octaves,
+            //             low_rgb_packed, mid_rgb_packed]
+            //   color  = [high_rgb_packed, 0, 0, 0]
+            // Each color is RGB quantized to u8 and packed into u24;
+            // the u32 is bit-cast to f32 for storage (values up to
+            // 2^24 are exact in f32). The shader unpacks with a u32
+            // bit-cast + byte masking to reconstruct the Vec3. The
+            // ~1/255 precision matches the raymarch G-buffer's
+            // RGB565 quantization, so no visual loss at the seam.
+            let params_post = [
+                p.low_to_mid, p.mid_to_high, p.transition_width,
+                p.frequency, p.seed as f32, p.octaves as f32,
+                f32::from_bits(pack_rgb_u24(p.low_color)),
+                f32::from_bits(pack_rgb_u24(p.mid_color)),
+            ];
+            let color_post = [
+                f32::from_bits(pack_rgb_u24(p.high_color)),
+                0.0, 0.0, 0.0,
+            ];
+            out.push(ProcInstruction {
+                op: OpKind::ApplyColorByNoise as u32,
+                arity: 0,
+                material_combine: 0,
+                material_id: 0,
+                node_id: id.0,
+                _pad0: 0, _pad1: 0, _pad2: 0,
+                params: params_post,
+                color: color_post,
+                inverse_world,
+            });
+        }
+
         NodeKind::NoiseDisplace(p) => {
             // PUSH/POP brackets around the child stream. Position-warp
             // params ride along in `params` so the shader can execute
@@ -591,7 +702,7 @@ mod tests {
                         let inv = Mat4::from_cols_array_2d(&ins.inverse_world);
                         let cur_world = *pos_stack.last().unwrap();
                         let local_y = inv.transform_point3(cur_world).y;
-                        let c = crate::node_kind::classify_height(
+                        let c = crate::node_kind::classify_bands(
                             local_y, ins.params[0], ins.params[1], ins.params[2],
                         );
                         let mats = [
@@ -615,7 +726,7 @@ mod tests {
                         let low_to_mid = ins.params[0];
                         let mid_to_high = ins.params[4];
                         let transition_width = ins.color[3];
-                        let c = crate::node_kind::classify_height(
+                        let c = crate::node_kind::classify_bands(
                             local_y, low_to_mid, mid_to_high, transition_width,
                         );
                         let low_c = Vec3::new(ins.params[1], ins.params[2], ins.params[3]);
@@ -625,6 +736,59 @@ mod tests {
                         let a = colors[c.lower as usize];
                         let b = colors[c.upper as usize];
                         top.color = a.lerp(b, c.alpha);
+                    }
+                }
+                continue;
+            }
+            if ins.op == OpKind::ApplyMaterialByNoise as u32 {
+                if let Some(top) = stack.last_mut() {
+                    if !top.is_empty() {
+                        let inv = Mat4::from_cols_array_2d(&ins.inverse_world);
+                        let cur_world = *pos_stack.last().unwrap();
+                        let local = inv.transform_point3(cur_world);
+                        let n = crate::noise::fbm_3d_scalar(
+                            local,
+                            ins.params[3],               // frequency
+                            ins.params[4] as u32,        // seed
+                            ins.params[5] as u32,        // octaves
+                        );
+                        let c = crate::node_kind::classify_bands(
+                            n, ins.params[0], ins.params[1], ins.params[2],
+                        );
+                        let mats = [
+                            ins.params[6] as u16,
+                            ins.params[7] as u16,
+                            ins.color[0] as u16,
+                        ];
+                        top.material_id = mats[c.lower as usize];
+                        top.secondary_material_id = mats[c.upper as usize];
+                        top.blend_weight = c.alpha;
+                    }
+                }
+                continue;
+            }
+            if ins.op == OpKind::ApplyColorByNoise as u32 {
+                if let Some(top) = stack.last_mut() {
+                    if !top.is_empty() {
+                        let inv = Mat4::from_cols_array_2d(&ins.inverse_world);
+                        let cur_world = *pos_stack.last().unwrap();
+                        let local = inv.transform_point3(cur_world);
+                        let n = crate::noise::fbm_3d_scalar(
+                            local,
+                            ins.params[3],
+                            ins.params[4] as u32,
+                            ins.params[5] as u32,
+                        );
+                        let c = crate::node_kind::classify_bands(
+                            n, ins.params[0], ins.params[1], ins.params[2],
+                        );
+                        let colors = [
+                            unpack_rgb_u24(ins.params[6]),
+                            unpack_rgb_u24(ins.params[7]),
+                            unpack_rgb_u24(ins.color[0]),
+                        ];
+                        top.color = colors[c.lower as usize]
+                            .lerp(colors[c.upper as usize], c.alpha);
                     }
                 }
                 continue;
@@ -918,5 +1082,86 @@ mod tests {
             }
         }
         assert_eq!(disagree, 0, "flatten+exec diverged on by-height at {disagree} points");
+    }
+
+    /// Parity on the by-noise post-ops — exercises both the noise
+    /// evaluation in effect-local space and, for ColorByNoise, the
+    /// u24-packed color round-trip through `unpack_rgb_u24`.
+    #[test]
+    fn flatten_by_noise_post_ops_match_sample_tree() {
+        use crate::node_kind::{ColorByNoiseParams, MaterialByNoiseParams};
+        use glam::Affine3A;
+
+        let mut obj = ProceduralObject::new(NodeKind::Union {
+            material_combine: MaterialCombine::Winner,
+        });
+        let mbn = obj.add_child(
+            obj.root(),
+            NodeKind::MaterialByNoise(MaterialByNoiseParams {
+                low_material: 5,
+                low_to_mid: -0.3,
+                mid_material: 15,
+                mid_to_high: 0.3,
+                high_material: 25,
+                transition_width: 0.15,
+                frequency: 2.5,
+                seed: 11,
+                octaves: 3,
+            }),
+        );
+        // Nudge the MaterialByNoise so `inverse_world` isn't identity.
+        obj.set_transform(mbn, Affine3A::from_translation(Vec3::new(0.3, 0.0, 0.0)));
+        let cbn = obj.add_child(
+            mbn,
+            NodeKind::ColorByNoise(ColorByNoiseParams {
+                low_color: Vec3::new(0.2, 0.1, 0.05),
+                low_to_mid: -0.3,
+                mid_color: Vec3::new(0.1, 0.6, 0.2),
+                mid_to_high: 0.3,
+                high_color: Vec3::new(0.95, 0.95, 0.95),
+                transition_width: 0.15,
+                frequency: 4.0,
+                seed: 23,
+                octaves: 3,
+            }),
+        );
+        obj.add_child(cbn, sphere(2.0, 0));
+
+        let instructions = flatten_tree(&obj);
+
+        let mut disagree = 0usize;
+        for ix in -4..=4 {
+            for iy in -4..=4 {
+                for iz in -1..=1 {
+                    let p = Vec3::new(ix as f32 * 0.3, iy as f32 * 0.3, iz as f32 * 0.3);
+                    let r = sample_tree(&obj, p, VS);
+                    let f = exec(&instructions, p);
+                    if r.is_empty() != f.is_empty() { continue; }
+                    let mat_match = r.material_id == f.material_id as u16
+                        && r.secondary_material_id == f.secondary_material_id as u16
+                        && (r.blend_weight - f.blend_weight).abs() < 1e-4;
+                    // Color comparison uses the same 1/255 tolerance
+                    // the ColorByNoise pack/unpack quantization
+                    // introduces — the CPU evaluator keeps full
+                    // precision (Vec3), flatten round-trips through
+                    // u24 and loses the LSB.
+                    let color_match = (r.color.x - f.color.x).abs() < 1.01 / 255.0
+                        && (r.color.y - f.color.y).abs() < 1.01 / 255.0
+                        && (r.color.z - f.color.z).abs() < 1.01 / 255.0;
+                    if !mat_match || !color_match {
+                        disagree += 1;
+                        if disagree <= 3 {
+                            eprintln!(
+                                "by-noise flatten mismatch at {p:?}: \
+                                 ref mat={}/{}/{} color={:?}; flat mat={}/{}/{} color={:?}",
+                                r.material_id, r.secondary_material_id, r.blend_weight, r.color,
+                                f.material_id as u16, f.secondary_material_id as u16, f.blend_weight, f.color,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(disagree, 0, "flatten+exec diverged on by-noise at {disagree} points");
     }
 }

@@ -126,6 +126,25 @@ pub fn fbm_3d_vec(pos: Vec3, frequency: f32, seed: u32, octaves: u32) -> Vec3 {
     sum / total_amp.max(1e-6)
 }
 
+/// Scalar FBM — same octave scheme as `fbm_3d_vec` but with a single
+/// channel, so the output is directly usable as a band classifier
+/// input. Stays byte-for-byte in sync with the WGSL port at the top
+/// of `shaders/proc_raymarch.wgsl` (function `rkp_fbm_3d_scalar`).
+pub fn fbm_3d_scalar(pos: Vec3, frequency: f32, seed: u32, octaves: u32) -> f32 {
+    let octaves = octaves.clamp(1, 8) as usize;
+    let mut sum = 0.0f32;
+    let mut amp = 1.0f32;
+    let mut freq = frequency.max(1e-6);
+    let mut total_amp = 0.0f32;
+    for k in 0..octaves {
+        sum += noise_3d(pos * freq, seed.wrapping_add(k as u32 * 131)) * amp;
+        total_amp += amp;
+        amp *= 0.5;
+        freq *= 2.0;
+    }
+    sum / total_amp.max(1e-6)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

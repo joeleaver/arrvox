@@ -160,7 +160,10 @@ fn compute_all_bounds_rec(
                 aabb_union(&child_aabb, &reflected)
             }
         }
-        NodeKind::MaterialByHeight(_) | NodeKind::ColorByHeight(_) => {
+        NodeKind::MaterialByHeight(_)
+        | NodeKind::ColorByHeight(_)
+        | NodeKind::MaterialByNoise(_)
+        | NodeKind::ColorByNoise(_) => {
             // Attribute rewrite — geometry is unchanged, so the AABB
             // is just the child's. Single-child cap; extras populate
             // the cache for UI visibility but don't contribute.
@@ -266,7 +269,10 @@ fn compute_node_bounds(obj: &ProceduralObject, id: NodeId) -> Aabb {
                 aabb_union(&child_aabb, &reflected)
             }
         }
-        NodeKind::MaterialByHeight(_) | NodeKind::ColorByHeight(_) => {
+        NodeKind::MaterialByHeight(_)
+        | NodeKind::ColorByHeight(_)
+        | NodeKind::MaterialByNoise(_)
+        | NodeKind::ColorByNoise(_) => {
             // Attribute rewrite — bounds pass through unchanged.
             node
                 .children

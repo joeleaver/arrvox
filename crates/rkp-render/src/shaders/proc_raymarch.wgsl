@@ -47,6 +47,13 @@ const OP_POP_MIRROR:  u32 = 203u;
 // effect's local frame.
 const OP_APPLY_MATERIAL_BY_HEIGHT: u32 = 300u;
 const OP_APPLY_COLOR_BY_HEIGHT:    u32 = 301u;
+// By-noise siblings — same post-op family, classifier input is an
+// FBM sample at the effect-local position instead of `local.y`.
+// ColorByNoise packs three RGB colors into u24-in-f32 via
+// `bitcast<u32>(f32)` + byte masking; the CPU side mirrors with
+// `f32::to_bits()`.
+const OP_APPLY_MATERIAL_BY_NOISE:  u32 = 302u;
+const OP_APPLY_COLOR_BY_NOISE:     u32 = 303u;
 
 const MAT_COMBINE_WINNER:  u32 = 0u;
 // `Layered` is represented but the shader treats it as Winner for now —
@@ -385,7 +392,7 @@ fn eval_tree(world_pos: vec3<f32>) -> TreeSample {
                 // `lower`; otherwise `upper`. CPU bake + deferred
                 // shading renders the smooth transition from the
                 // dual-material fields the CPU evaluator writes.
-                let c = classify_height_bands(
+                let c = classify_bands(
                     local.y, ins.params_lo.x, ins.params_lo.y, ins.params_lo.z,
                 );
                 var mats: array<u32, 3>;
@@ -407,7 +414,7 @@ fn eval_tree(world_pos: vec3<f32>) -> TreeSample {
                 let mid_color      = ins.params_hi.yzw;
                 let high_color     = ins.color.xyz;
                 let transition_w   = ins.color.w;
-                let c = classify_height_bands(
+                let c = classify_bands(
                     local.y, low_to_mid, mid_to_high, transition_w,
                 );
                 var colors: array<vec3<f32>, 3>;
@@ -415,6 +422,55 @@ fn eval_tree(world_pos: vec3<f32>) -> TreeSample {
                 colors[1] = mid_color;
                 colors[2] = high_color;
                 stack[sp - 1u].color = mix(colors[c.lower], colors[c.upper], c.alpha);
+            }
+            continue;
+        }
+        if (op == OP_APPLY_MATERIAL_BY_NOISE) {
+            if (sp > 0u) {
+                let cur = pos_stack[pos_top];
+                let local = (ins.inverse_world * vec4<f32>(cur, 1.0)).xyz;
+                // Layout: params_lo = [t1, t2, width, freq],
+                //         params_hi = [seed, oct, low_mat, mid_mat],
+                //         color.x = high_mat.
+                let freq = ins.params_lo.w;
+                let seed = u32(ins.params_hi.x);
+                let oct  = u32(ins.params_hi.y);
+                let n = rkp_fbm_3d_scalar(local, freq, seed, oct);
+                let c = classify_bands(
+                    n, ins.params_lo.x, ins.params_lo.y, ins.params_lo.z,
+                );
+                var mats: array<u32, 3>;
+                mats[0] = u32(ins.params_hi.z);
+                mats[1] = u32(ins.params_hi.w);
+                mats[2] = u32(ins.color.x);
+                // Primary-only writeback — same limitation as
+                // MaterialByHeight. CPU bake carries dual material.
+                let picked = select(mats[c.lower], mats[c.upper], c.alpha >= 0.5);
+                stack[sp - 1u].material_id = picked;
+            }
+            continue;
+        }
+        if (op == OP_APPLY_COLOR_BY_NOISE) {
+            if (sp > 0u) {
+                let cur = pos_stack[pos_top];
+                let local = (ins.inverse_world * vec4<f32>(cur, 1.0)).xyz;
+                // Layout: params_lo = [t1, t2, width, freq],
+                //         params_hi = [seed, oct, low_rgb_u24, mid_rgb_u24],
+                //         color.x = high_rgb_u24.
+                let freq = ins.params_lo.w;
+                let seed = u32(ins.params_hi.x);
+                let oct  = u32(ins.params_hi.y);
+                let n = rkp_fbm_3d_scalar(local, freq, seed, oct);
+                let c = classify_bands(
+                    n, ins.params_lo.x, ins.params_lo.y, ins.params_lo.z,
+                );
+                var colors: array<vec3<f32>, 3>;
+                colors[0] = unpack_rgb_u24(ins.params_hi.z);
+                colors[1] = unpack_rgb_u24(ins.params_hi.w);
+                colors[2] = unpack_rgb_u24(ins.color.x);
+                stack[sp - 1u].color = mix(
+                    colors[c.lower], colors[c.upper], c.alpha,
+                );
             }
             continue;
         }
@@ -485,7 +541,7 @@ fn gradient_normal(p: vec3<f32>) -> vec3<f32> {
 }
 
 // ── Height-band classifier ─────────────────────────────────────────────
-// Mirror of `rkp_procedural::node_kind::classify_height`. Returns the
+// Mirror of `rkp_procedural::node_kind::classify_bands`. Returns the
 // two adjacent band indices and the smoothstep blend alpha between
 // them (alpha=0 → fully `lower`; alpha=1 → fully `upper`). Outside a
 // transition zone, lower == upper and alpha is 0.
@@ -496,7 +552,7 @@ struct HeightClassify {
     alpha: f32,
 }
 
-fn classify_height_bands(
+fn classify_bands(
     y: f32,
     low_to_mid: f32,
     mid_to_high: f32,
@@ -596,6 +652,34 @@ fn rkp_fbm_3d_vec(pos: vec3<f32>, frequency: f32, seed: u32, octaves_in: u32) ->
         freq = freq * 2.0;
     }
     return sum / max(total_amp, 1e-6);
+}
+
+// Scalar FBM — port of `rkp_procedural::noise::fbm_3d_scalar`. One
+// channel, used by the by-noise post-ops to feed `classify_bands`.
+fn rkp_fbm_3d_scalar(pos: vec3<f32>, frequency: f32, seed: u32, octaves_in: u32) -> f32 {
+    let octaves = clamp(octaves_in, 1u, 8u);
+    var sum = 0.0;
+    var amp = 1.0;
+    var freq = max(frequency, 1e-6);
+    var total_amp = 0.0;
+    for (var k: u32 = 0u; k < octaves; k = k + 1u) {
+        sum = sum + rkp_noise_3d(pos * freq, seed + k * 131u) * amp;
+        total_amp = total_amp + amp;
+        amp = amp * 0.5;
+        freq = freq * 2.0;
+    }
+    return sum / max(total_amp, 1e-6);
+}
+
+// Unpack an RGB color from a u24-bit-laid f32 — mirror of the CPU
+// `unpack_rgb_u24` in `flatten.rs`. `bitcast<u32>(f32)` preserves
+// the exact bit pattern of the 24-bit packed color.
+fn unpack_rgb_u24(packed: f32) -> vec3<f32> {
+    let bits = bitcast<u32>(packed);
+    let r = f32(bits & 0xFFu) / 255.0;
+    let g = f32((bits >> 8u) & 0xFFu) / 255.0;
+    let b = f32((bits >> 16u) & 0xFFu) / 255.0;
+    return vec3<f32>(r, g, b);
 }
 
 // ── Ray construction ───────────────────────────────────────────────────

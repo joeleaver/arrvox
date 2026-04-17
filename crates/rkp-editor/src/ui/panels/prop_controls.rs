@@ -495,6 +495,15 @@ pub fn prop_color(
     on_change: Rc<dyn Fn([f32; 4])>,
 ) -> Node {
     let label = label.to_string();
+    // Seed `value:` with the current hex so ColorInput's internal
+    // `current_value` starts in sync with what `value_fn:` will
+    // report on its first fire — otherwise the value_fn binding
+    // effect does `set_if_changed("#XXXX" ≠ "#000000")` on initial
+    // run and notifies, triggering a nested flush panic when
+    // mounted mid-flush (same shape as the fixed Select bug, but
+    // distinct trigger — this one is about the seed, not the
+    // binding's first-run guard).
+    let initial_hex = untracked(|| rgba_to_hex(value.get()));
 
     rsx! {
         div {
@@ -503,6 +512,7 @@ pub fn prop_color(
             div {
                 style: "flex:1;min-width:0;",
                 ColorInput {
+                    value: {initial_hex},
                     value_fn: move || rgba_to_hex(value.get()),
                     format: "hex",
                     alpha: false,
