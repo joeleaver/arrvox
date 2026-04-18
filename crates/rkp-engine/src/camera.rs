@@ -1,9 +1,9 @@
 //! Editor camera with orbit and fly modes.
 //!
-//! Pure math — depends only on glam and rkf_runtime::input.
+//! Pure math — depends only on glam and rkp_runtime::input.
 
 use glam::Vec3;
-use rkf_runtime::input::InputSystem;
+use rkp_runtime::input::InputSystem;
 
 /// Camera control state — owns interaction parameters, not the camera transform.
 #[derive(Debug, Clone, Copy)]
@@ -123,8 +123,8 @@ fn fly_direction(yaw: f32, pitch: f32) -> Vec3 {
 }
 
 /// Build the default editor action map with camera + edit bindings.
-pub fn default_action_map() -> rkf_runtime::input::ActionMap {
-    use rkf_runtime::input::*;
+pub fn default_action_map() -> rkp_runtime::input::ActionMap {
+    use rkp_runtime::input::*;
 
     ActionMap::new("editor", vec![
         // Camera movement (WASD)

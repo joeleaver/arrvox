@@ -26,8 +26,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use glam::Vec3;
 use rayon::prelude::*;
 
-use rkf_core::Aabb;
-use rkf_core::constants::BRICK_DIM;
+use rkp_core::Aabb;
+use rkp_core::constants::MESH_BRICK_DIM as BRICK_DIM;
 
 use crate::bvh::TriangleBvh;
 use crate::config::{ImportConfig, ImportResult};
@@ -187,11 +187,12 @@ pub fn import_mesh_to_opacity_rkp_with(
     // events from getting buried under progress spam.
     let progress_step = (total_surface / 200).max(1);
     let counter = AtomicU64::new(0);
+    let vertex_skinning = skinning.as_ref().map(|ex| &ex.skinning);
     let results: Vec<_> = surface_work
         .into_par_iter()
         .map(|w| {
             let result = process_brick(
-                &mesh, &bvh, w.brick_min, voxel_size, config,
+                &mesh, &bvh, w.brick_min, voxel_size, config, vertex_skinning,
             );
             let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
             if done % progress_step == 0 || done == total_surface {
@@ -218,6 +219,7 @@ pub fn import_mesh_to_opacity_rkp_with(
         brick_depth,
         octree_bricks,
         depth,
+        voxel_size,
     );
     reporter.report(ImportEvent::StageProgress {
         stage: "emit_shell_leaves",

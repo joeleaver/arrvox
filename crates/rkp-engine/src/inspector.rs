@@ -84,6 +84,30 @@ pub struct MaterialUsage {
     pub voxel_count: u32,
 }
 
+/// Skeletal-animation sidecar on an inspector snapshot. Populated only
+/// when the selected entity has a `Skeleton` component; carries the
+/// per-asset data the UI needs to render a clip picker and bone tree
+/// (both require knowledge the static component reflection can't
+/// supply — clips and bones are asset data, not component fields).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SkeletonInspector {
+    /// Absolute path of the loaded `.rkskel`.
+    pub path: String,
+    /// Bone names in index order.
+    pub bone_names: Vec<String>,
+    /// Parent index per bone. `-1` means root. Parallel to `bone_names`.
+    pub bone_parents: Vec<i32>,
+    /// Animation clips available on this skeleton asset.
+    pub clips: Vec<ClipInfo>,
+}
+
+/// One animation clip bundled with a skeleton asset.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ClipInfo {
+    pub name: String,
+    pub duration: f32,
+}
+
 /// Full inspector snapshot for a selected entity.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct InspectorSnapshot {
@@ -95,4 +119,6 @@ pub struct InspectorSnapshot {
     pub components: Vec<ComponentSnapshot>,
     /// Per-material voxel usage (only for entities with Renderable + spatial data).
     pub material_usage: Vec<MaterialUsage>,
+    /// Set when the entity has a loaded skeleton.
+    pub skeleton: Option<SkeletonInspector>,
 }

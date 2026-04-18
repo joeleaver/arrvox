@@ -10,6 +10,8 @@ members = [
     "crates/rkp-macros",
     "crates/rkp-procedural",
     "crates/rkp-import",
+    "crates/rkp-animation",
+    "crates/rkp-physics",
 ]
 
 [workspace.package]
@@ -29,15 +31,8 @@ rkp-engine = { path = "crates/rkp-engine" }
 rkp-macros = { path = "crates/rkp-macros" }
 rkp-procedural = { path = "crates/rkp-procedural" }
 rkp-import = { path = "crates/rkp-import" }
-
-# Shared crates from RKIField
-rkf-core = { path = "../rkifield/crates/rkf-core" }
-rkf-render = { path = "../rkifield/crates/rkf-render" }
-rkf-editor = { path = "../rkifield/crates/rkf-editor" }
-rkf-animation = { path = "../rkifield/crates/rkf-animation" }
-rkf-runtime = { path = "../rkifield/crates/rkf-runtime" }
-rkf-physics = { path = "../rkifield/crates/rkf-physics" }
-rkf-mcp = { path = "../rkifield/crates/rkf-mcp" }
+rkp-animation = { path = "crates/rkp-animation" }
+rkp-physics = { path = "crates/rkp-physics" }
 
 # External dependencies (versions match RKIField)
 wgpu = "29"
@@ -61,6 +56,8 @@ image = "0.25"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
 pollster = "0.4"
+ron = "0.8"
+gilrs = "0.11"
 gltf = { version = "1", features = ["KHR_texture_transform"] }
 tobj = "4"
 ufbx = "0.10"

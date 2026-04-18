@@ -46,9 +46,9 @@ impl AssetHandle {
 /// instance spawning can share one code path downstream.
 #[derive(Debug, Clone, Copy)]
 pub struct AssetInfo {
-    pub spatial: rkf_core::scene_node::SpatialHandle,
+    pub spatial: rkp_core::scene_node::SpatialHandle,
     pub voxel_size: f32,
-    pub aabb: rkf_core::Aabb,
+    pub aabb: rkp_core::Aabb,
     /// Entity-local grid origin (`aabb_center - extent/2`). Derived at
     /// load time — .rkp files voxelized before this field existed used
     /// the same formula, so re-deriving reproduces the exact bake.
@@ -56,6 +56,34 @@ pub struct AssetInfo {
     pub voxel_count: u32,
     pub leaf_attr_slot_start: u32,
     pub leaf_attr_slot_count: u32,
+    /// `true` if this asset has skinning data (bone weights + SkinBricks
+    /// + rest bone AABBs) baked in. Caller fetches the full data via
+    /// [`RkpSceneManager::skinning_data`].
+    pub has_skinning: bool,
+}
+
+/// One populated octree brick, with its scene-global id and its origin
+/// in finest-voxel grid units. Produced at load time by shifting each
+/// baked file-local origin's id by the asset's `scene_brick_offset`.
+#[derive(Debug, Clone, Copy)]
+pub struct SkinBrick {
+    /// Scene-global brick id (matches the ids stored in octree nodes).
+    pub brick_id: u32,
+    /// Brick corner in finest-voxel grid units.
+    pub origin: [u32; 3],
+}
+
+/// Per-asset skinning metadata read from the `.rkp`'s skin-meta
+/// section. Phase-3 scatter pass consumes this to size + populate the
+/// deformed bone field each frame.
+#[derive(Debug, Clone, Default)]
+pub struct SkinningAssetData {
+    /// One entry per populated brick in the asset's octree.
+    pub bricks: Vec<SkinBrick>,
+    /// Per-bone rest-pose AABB, in object-local voxel space. Index is
+    /// the bone id (as stored in per-leaf `BoneVoxel.bone_index`).
+    /// Empty AABBs (zero-extent) are sentinels for unused bone slots.
+    pub rest_bone_aabbs: Vec<[f32; 6]>,
 }
 
 /// One entry in the asset cache: the shared geometry allocations plus
@@ -66,12 +94,16 @@ struct AssetEntry {
     refcount: u32,
     spatial_handle: OctreeHandle,
     voxel_size: f32,
-    aabb: rkf_core::Aabb,
+    aabb: rkp_core::Aabb,
     voxel_count: u32,
     leaf_attr_slot_start: u32,
     leaf_attr_slot_count: u32,
     brick_start: u32,
     brick_count: u32,
+    /// Populated only when the asset has a `FLAG_HAS_BONES` skin-meta
+    /// section. Phase-3 scatter pass reads this to drive the per-frame
+    /// bone-field write.
+    skinning: Option<SkinningAssetData>,
 }
 
 impl AssetEntry {
@@ -84,7 +116,7 @@ impl AssetEntry {
         let aabb_center = (self.aabb.min + self.aabb.max) * 0.5;
         let grid_origin = aabb_center - glam::Vec3::splat(extent * 0.5);
         AssetInfo {
-            spatial: rkf_core::scene_node::SpatialHandle::Octree {
+            spatial: rkp_core::scene_node::SpatialHandle::Octree {
                 root_offset: self.spatial_handle.root_offset,
                 len: self.spatial_handle.len,
                 depth: self.spatial_handle.depth,
@@ -96,6 +128,7 @@ impl AssetEntry {
             voxel_count: self.voxel_count,
             leaf_attr_slot_start: self.leaf_attr_slot_start,
             leaf_attr_slot_count: self.leaf_attr_slot_count,
+            has_skinning: self.skinning.is_some(),
         }
     }
 }
@@ -159,9 +192,9 @@ pub struct ReloadResult {
 
 /// Result of voxelizing a primitive.
 pub struct VoxelizeResult {
-    pub spatial: rkf_core::scene_node::SpatialHandle,
+    pub spatial: rkp_core::scene_node::SpatialHandle,
     pub voxel_size: f32,
-    pub aabb: rkf_core::Aabb,
+    pub aabb: rkp_core::Aabb,
     /// Entity-local position where the octree grid starts (the
     /// `aabb_center - extent/2` corner). The shader uses this to
     /// convert world→octree coords, so it must be stored and
@@ -347,6 +380,7 @@ impl RkpSceneManager {
             octree_internal_attrs: self.octree.internal_attrs_data(),
             leaf_attr_pool: self.leaf_attr_pool.as_bytes(),
             color_pool: self.leaf_attr_pool.color_bytes(),
+            bone_weights: self.leaf_attr_pool.bone_bytes(),
             brick_pool: self.brick_pool.as_bytes(),
             brick_face_links: rkp_core::brick_face_links::as_bytes(&self.brick_face_links),
         }
@@ -354,8 +388,8 @@ impl RkpSceneManager {
 
     // ── Spatial deallocation ─────────────────────────────────────────
 
-    pub fn deallocate_spatial(&mut self, handle: &rkf_core::scene_node::SpatialHandle) {
-        if let rkf_core::scene_node::SpatialHandle::Octree {
+    pub fn deallocate_spatial(&mut self, handle: &rkp_core::scene_node::SpatialHandle) {
+        if let rkp_core::scene_node::SpatialHandle::Octree {
             root_offset, len, depth, base_voxel_size,
         } = handle
         {
@@ -474,7 +508,7 @@ impl RkpSceneManager {
     /// per unique path — repeated acquisitions share the returned entry
     /// via the cache.
     fn load_asset_from_disk(&mut self, rkp_path: &std::path::Path) -> Result<AssetEntry, String> {
-        use rkf_core::voxel::VoxelSample;
+        use rkp_core::voxel::VoxelSample;
 
         let mut file = std::fs::File::open(rkp_path)
             .map_err(|e| format!("open {}: {e}", rkp_path.display()))?;
@@ -491,7 +525,7 @@ impl RkpSceneManager {
 
         let voxel_size = header.base_voxel_size;
         let voxel_count = header.voxel_count;
-        let aabb = rkf_core::Aabb::new(
+        let aabb = rkp_core::Aabb::new(
             glam::Vec3::from(header.aabb_min),
             glam::Vec3::from(header.aabb_max),
         );
@@ -538,6 +572,46 @@ impl RkpSceneManager {
             &[]
         };
 
+        // Skin-meta section — structured payload carrying per-leaf bone
+        // weights, per-brick origins, and per-bone rest AABBs. Only
+        // present when rkp-import resolved a skinned skeleton.
+        let has_bones = header.flags & rkp_core::asset_file::FLAG_HAS_BONES != 0;
+        let skin_meta = if has_bones {
+            match rkp_core::asset_file::read_rkp_skin_meta(&mut reader, &header) {
+                Ok(m) => {
+                    eprintln!(
+                        "[RkpSceneManager] {}: skin-meta loaded ({} bone voxels, {} bricks, {} bone AABBs)",
+                        rkp_path.display(),
+                        m.bone_voxels.len() / 8,
+                        m.brick_origins.len(),
+                        m.rest_bone_aabbs.len(),
+                    );
+                    m
+                }
+                Err(e) => {
+                    // Old Phase-2 file format wrote the bones section
+                    // as a raw `BoneVoxel` array; the new structured
+                    // blob fails to decode that. Warn loudly so a
+                    // stale `.rkp` on disk doesn't silently mask the
+                    // whole skinning pipeline as "nothing broken, no
+                    // deformation".
+                    eprintln!(
+                        "[RkpSceneManager] {}: FLAG_HAS_BONES set but skin-meta decode failed ({e}). \
+                         Re-import the asset to write the new wire format.",
+                        rkp_path.display(),
+                    );
+                    rkp_core::asset_file::SkinMetaOut::default()
+                }
+            }
+        } else {
+            rkp_core::asset_file::SkinMetaOut::default()
+        };
+        let file_bones: &[rkp_core::companion::BoneVoxel] = if skin_meta.bone_voxels.len() >= std::mem::size_of::<rkp_core::companion::BoneVoxel>() {
+            bytemuck::cast_slice(&skin_meta.bone_voxels)
+        } else {
+            &[]
+        };
+
         let bytes_per_voxel = std::mem::size_of::<VoxelSample>();
         let mut file_voxel_mat: Vec<(u16, u16, u8, u32, u32)> = Vec::with_capacity(voxel_count as usize);
         for i in 0..voxel_count as usize {
@@ -576,6 +650,12 @@ impl RkpSceneManager {
             *self.leaf_attr_pool.get_mut(slot) = attr;
             if color != 0 {
                 self.leaf_attr_pool.set_color(slot, color);
+            }
+            // File-local bone slot i → scene-global leaf_attr slot. The
+            // `file_bones` slice is empty for unskinned assets, in which
+            // case the pool's zero-default BoneVoxel stands.
+            if let Some(&bv) = file_bones.get(i) {
+                self.leaf_attr_pool.set_bone(slot, bv);
             }
         }
 
@@ -700,6 +780,24 @@ impl RkpSceneManager {
             final_leaf_attr_slot_count - leaf_attr_slot_count,
         );
 
+        // Promote the baked skin-meta (file-local brick ids) into
+        // scene-global SkinBrick entries. Rest bone AABBs are already
+        // in object-local voxel space — no transform needed.
+        let skinning = if has_bones {
+            let bricks: Vec<SkinBrick> = skin_meta.brick_origins.iter().enumerate()
+                .map(|(file_id, &origin)| SkinBrick {
+                    brick_id: scene_brick_offset + file_id as u32,
+                    origin,
+                })
+                .collect();
+            Some(SkinningAssetData {
+                bricks,
+                rest_bone_aabbs: skin_meta.rest_bone_aabbs,
+            })
+        } else {
+            None
+        };
+
         Ok(AssetEntry {
             path: rkp_path.to_path_buf(),
             refcount: 1,
@@ -711,7 +809,14 @@ impl RkpSceneManager {
             leaf_attr_slot_count: final_leaf_attr_slot_count,
             brick_start: scene_brick_offset,
             brick_count: file_brick_count,
+            skinning,
         })
+    }
+
+    /// Peek at an asset's skinning metadata. Returns `None` when the
+    /// asset was imported without bone weights.
+    pub fn skinning_data(&self, handle: AssetHandle) -> Option<&SkinningAssetData> {
+        self.asset_cache.get(handle)?.skinning.as_ref()
     }
 
     // ── Primitive voxelization ───────────────────────────────────────
@@ -719,13 +824,13 @@ impl RkpSceneManager {
     /// Voxelize an SDF primitive into the octree.
     pub fn voxelize_primitive(
         &mut self,
-        primitive: &rkf_core::scene_node::SdfPrimitive,
+        primitive: &rkp_core::scene_node::SdfPrimitive,
         material_id: u16,
         voxel_size: f32,
         bake_scale: glam::Vec3,
         object_id: u32,
     ) -> Option<VoxelizeResult> {
-        use rkf_core::scene_node::SdfPrimitive;
+        use rkp_core::scene_node::SdfPrimitive;
 
         fn primitive_half_extents(prim: &SdfPrimitive) -> glam::Vec3 {
             match *prim {
@@ -747,7 +852,7 @@ impl RkpSceneManager {
 
         let half_extents = primitive_half_extents(primitive) * bake_scale;
         let margin = voxel_size * 8.0 * 1.8 + voxel_size;
-        let aabb = rkf_core::Aabb::new(
+        let aabb = rkp_core::Aabb::new(
             -half_extents - glam::Vec3::splat(margin),
             half_extents + glam::Vec3::splat(margin),
         );
@@ -756,7 +861,7 @@ impl RkpSceneManager {
         let sdf_fn: Box<dyn Fn(glam::Vec3) -> f32> = match primitive {
             SdfPrimitive::Box { half_extents: he } => {
                 let scaled = SdfPrimitive::Box { half_extents: *he * bake_scale };
-                Box::new(move |pos| rkf_core::evaluate_primitive(&scaled, pos))
+                Box::new(move |pos| rkp_core::evaluate_primitive(&scaled, pos))
             }
             _ => {
                 let prim = primitive.clone();
@@ -766,7 +871,7 @@ impl RkpSceneManager {
                     1.0 / bake_scale.y.max(1e-6),
                     1.0 / bake_scale.z.max(1e-6),
                 );
-                Box::new(move |pos| rkf_core::evaluate_primitive(&prim, pos * inv_scale) * min_scale)
+                Box::new(move |pos| rkp_core::evaluate_primitive(&prim, pos * inv_scale) * min_scale)
             }
         };
 
@@ -793,14 +898,14 @@ impl RkpSceneManager {
 
         self.merge_face_links(&r.brick_face_links);
         let handle = self.octree.allocate(&r.octree);
-        let spatial = rkf_core::scene_node::SpatialHandle::Octree {
+        let spatial = rkp_core::scene_node::SpatialHandle::Octree {
             root_offset: handle.root_offset,
             len: handle.len,
             depth: handle.depth,
             base_voxel_size: handle.base_voxel_size,
         };
 
-        let geometry_aabb = rkf_core::Aabb::new(-half_extents, half_extents);
+        let geometry_aabb = rkp_core::Aabb::new(-half_extents, half_extents);
         Some(VoxelizeResult {
             spatial,
             voxel_size,
@@ -826,7 +931,7 @@ impl RkpSceneManager {
     pub fn voxelize_sdf_fn<F>(
         &mut self,
         sdf_fn: F,
-        aabb: &rkf_core::Aabb,
+        aabb: &rkp_core::Aabb,
         voxel_size: f32,
         object_id: u32,
     ) -> Option<VoxelizeResult>
@@ -842,7 +947,7 @@ impl RkpSceneManager {
 
         self.merge_face_links(&r.brick_face_links);
         let handle = self.octree.allocate(&r.octree);
-        let spatial = rkf_core::scene_node::SpatialHandle::Octree {
+        let spatial = rkp_core::scene_node::SpatialHandle::Octree {
             root_offset: handle.root_offset,
             len: handle.len,
             depth: handle.depth,
@@ -870,7 +975,7 @@ impl RkpSceneManager {
     pub fn integrate_artifact(
         &mut self,
         mut artifact: rkp_core::BakeArtifact,
-        aabb: &rkf_core::Aabb,
+        aabb: &rkp_core::Aabb,
         voxel_size: f32,
         object_id: u32,
     ) -> Option<VoxelizeResult> {
@@ -1008,7 +1113,7 @@ impl RkpSceneManager {
             ms(t_octree_alloc - t_face_links),
             ms(t_octree_alloc),
         );
-        let spatial = rkf_core::scene_node::SpatialHandle::Octree {
+        let spatial = rkp_core::scene_node::SpatialHandle::Octree {
             root_offset: handle.root_offset,
             len: handle.len,
             depth: handle.depth,

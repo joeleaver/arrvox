@@ -180,7 +180,7 @@ pub fn BuildViewport() -> NodeHandle {
     // for orbit math but those would leak across left/middle/right).
     surface.set_event_handler(move |event| {
         use SurfaceEvent::*;
-        use rkf_runtime::input::InputMouseButton;
+        use rkp_runtime::input::InputMouseButton;
 
         // Map a rinch button to the runtime enum the engine expects.
         fn map_btn(b: SurfaceMouseButton) -> InputMouseButton {

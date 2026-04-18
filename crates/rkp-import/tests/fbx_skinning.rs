@@ -130,6 +130,63 @@ fn import_at_smallest_voxel_tier_does_not_crash() {
     );
 }
 
+/// Regression: multi-skin files must unify bones across every
+/// `ufbx::SkinDeformer`, and weights must resolve through each skin's
+/// own cluster→bone_node map rather than positional cluster index.
+///
+/// Pre-fix bug: Mixamo's `Walking.fbx` ships two skin deformers
+/// (`Beta_Surface` and `Beta_Joints`) whose cluster orders differ
+/// (`Beta_Joints` adds `HeadTop_End` at index 6, shifting everything
+/// after). We used skin 0's bone table for both meshes, so weights
+/// from skin 1 were one bone off from cluster 6 onward — upper-leg
+/// vertices ended up weighted to the lower-leg bone.
+///
+/// This test asserts:
+/// * Every bone name unique across skins shows up in the final table.
+/// * Cluster indices from skin 1 actually resolve to the correct
+///   bone *name* (not just any valid bone).
+#[test]
+fn multi_skin_unified_bone_table() {
+    let Some(path) = test_fbx_path() else {
+        eprintln!("RKP_TEST_FBX unset — skipping");
+        return;
+    };
+
+    let opts = ufbx::LoadOpts {
+        target_axes: ufbx::CoordinateAxes::right_handed_y_up(),
+        target_unit_meters: 1.0,
+        space_conversion: ufbx::SpaceConversion::ModifyGeometry,
+        ..Default::default()
+    };
+    let scene = ufbx::load_file(path.to_str().unwrap(), opts).expect("load fbx");
+    if scene.skin_deformers.len() < 2 {
+        eprintln!("skipping: RKP_TEST_FBX only has {} skin deformer(s)", scene.skin_deformers.len());
+        return;
+    }
+
+    let ex = extract_skeleton(path.to_str().unwrap())
+        .expect("extract ok")
+        .expect("has skeleton");
+
+    // Every bone referenced by any skin's cluster must exist in the
+    // unified table, resolved by bone-node NAME (not positional index).
+    for (si, skin) in scene.skin_deformers.iter().enumerate() {
+        for (ci, cluster) in skin.clusters.iter().enumerate() {
+            let Some(ref bone_node) = cluster.bone_node else { continue };
+            let expected_name = bone_node.element.name.to_string();
+            let found = ex
+                .skeleton
+                .bones
+                .iter()
+                .any(|b| b.name == expected_name);
+            assert!(
+                found,
+                "skin {si} cluster {ci} targets bone '{expected_name}' but it is missing from the unified bone table",
+            );
+        }
+    }
+}
+
 /// Full round-trip import → .rkp + .rkskel on disk. Verifies the
 /// files land, the skeleton sidecar is non-empty, and no error
 /// events fire during the import.

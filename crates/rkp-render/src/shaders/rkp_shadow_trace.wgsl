@@ -46,12 +46,13 @@ struct RkpObject {
     geom_type: u32, is_skinned: u32,
     bone_count: u32, bone_buffer_offset: u32,
     rest_octree_root: u32, rest_octree_depth: u32,
-    rest_octree_extent_bits: u32, deformed_pool_offset: u32,
+    rest_octree_extent_bits: u32, bone_field_offset: u32,
     layer_mask: u32,
-    _pre_grid0: u32, _pre_grid1: u32, _pre_grid2: u32,
+    bone_field_dim_x: u32, bone_field_dim_y: u32, bone_field_dim_z: u32,
+    bone_field_origin_x: f32, bone_field_origin_y: f32, bone_field_origin_z: f32,
+    bone_field_occ_offset: u32,
     grid_origin: vec3<f32>,
     _post_grid: u32,
-    _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32,
     inverse_world: mat4x4<f32>,
 }
 
@@ -114,6 +115,12 @@ struct OctreeResult {
 // FACE_EMPTY_LINK / FACE_INTERIOR. See rkp_core::brick_face_links.
 @group(0) @binding(7) var<storage, read> brick_face_links: array<u32>;
 @group(0) @binding(8) var<storage, read> leaf_attr_pool: array<LeafAttr>;
+// Deformed-space bone field + 4³ brick occupancy bitmap — same
+// buffers the skin-deform scatter writes and the primary march reads.
+// Shadow only needs to know whether a deformed cell is populated, so
+// it ignores the payload's normal half and just tests `leaf_slot`.
+@group(0) @binding(9) var<storage, read> bone_field: array<vec2<u32>>;
+@group(0) @binding(10) var<storage, read> bone_field_occ: array<u32>;
 
 // Group 1: gbuf inputs (full-res, read) + half-res shadow output (write).
 @group(1) @binding(0) var gbuf_position: texture_2d<f32>;
@@ -201,6 +208,134 @@ fn skip_node(pos: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, node_depth: u32
     return min(min(t_pos.x, t_pos.y), t_pos.z) + vs * 0.01;
 }
 
+// ── Skinned-object shadow branch ────────────────────────────────────
+//
+// Walks the scatter pass's deformed bone field (binding 9) the same
+// way the primary `march_object_skinned` does in `octree_march.wgsl`,
+// with the same 4³-brick occupancy skip (binding 10). On the first
+// populated cell it looks up the leaf's material opacity and either
+// blocks the ray or attenuates transmittance — same semantics as the
+// rigid path below.
+
+const OCC_BRICK_DIM: i32 = 4;
+const SKINNED_SHADOW_MAX_STEPS: u32 = 512u;
+
+fn skinned_shadow_brick_populated(
+    cell: vec3<i32>, cell_dims: vec3<i32>, occ_offset: u32,
+) -> bool {
+    if any(cell < vec3<i32>(0)) || any(cell >= cell_dims) { return false; }
+    let brick = cell / vec3<i32>(OCC_BRICK_DIM);
+    let bx_dim = u32((cell_dims.x + OCC_BRICK_DIM - 1) / OCC_BRICK_DIM);
+    let by_dim = u32((cell_dims.y + OCC_BRICK_DIM - 1) / OCC_BRICK_DIM);
+    let brick_idx = u32(brick.x)
+        + u32(brick.y) * bx_dim
+        + u32(brick.z) * bx_dim * by_dim;
+    let word = bone_field_occ[occ_offset + (brick_idx >> 5u)];
+    return (word & (1u << (brick_idx & 31u))) != 0u;
+}
+
+fn skinned_shadow_brick_exit_t(
+    origin: vec3<f32>, inv_dir: vec3<f32>,
+    cell: vec3<i32>, grid_origin: vec3<f32>, vs: f32,
+) -> f32 {
+    let brick = cell / vec3<i32>(OCC_BRICK_DIM);
+    let brick_min = grid_origin + vec3<f32>(brick * OCC_BRICK_DIM) * vs;
+    let brick_max = brick_min + vec3<f32>(f32(OCC_BRICK_DIM) * vs);
+    let t0 = (brick_min - origin) * inv_dir;
+    let t1 = (brick_max - origin) * inv_dir;
+    let t_far = max(t0, t1);
+    return min(t_far.x, min(t_far.y, t_far.z));
+}
+
+fn skinned_shadow_sample(
+    cell: vec3<i32>, dims: vec3<i32>, offset: u32,
+) -> u32 {
+    if any(cell < vec3<i32>(0)) || any(cell >= dims) { return 0u; }
+    let idx = u32(cell.x)
+        + u32(cell.y) * u32(dims.x)
+        + u32(cell.z) * u32(dims.x) * u32(dims.y);
+    return bone_field[offset + idx].x;
+}
+
+/// Trace a shadow ray through one skinned object. Returns the new
+/// transmittance; caller folds this into its running total.
+fn trace_shadow_skinned(
+    world_origin: vec3<f32>, world_dir: vec3<f32>,
+    obj: RkpObject, max_world_dist: f32, transmittance_in: f32,
+) -> f32 {
+    let inv_world = obj.inverse_world;
+    let local_origin_mesh = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
+    let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
+    let local_dir = normalize(local_dir_unnorm);
+    let local_scale = length(local_dir_unnorm);
+    let local_max_t = max_world_dist * local_scale;
+    let vs = obj.voxel_size;
+
+    let rest_extent = bitcast<f32>(obj.rest_octree_extent_bits);
+    let local_origin = local_origin_mesh + vec3<f32>(rest_extent * 0.5);
+
+    let grid_dim = vec3<i32>(
+        i32(obj.bone_field_dim_x),
+        i32(obj.bone_field_dim_y),
+        i32(obj.bone_field_dim_z),
+    );
+    if grid_dim.x <= 0 || grid_dim.y <= 0 || grid_dim.z <= 0 {
+        return transmittance_in;
+    }
+    let grid_origin = vec3<f32>(
+        obj.bone_field_origin_x,
+        obj.bone_field_origin_y,
+        obj.bone_field_origin_z,
+    );
+    let grid_max = grid_origin + vec3<f32>(grid_dim) * vs;
+
+    let safe_dir = vec3<f32>(
+        select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),
+        select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),
+        select(local_dir.z, select(-1e-10, 1e-10, local_dir.z >= 0.0), abs(local_dir.z) < 1e-10),
+    );
+    let inv_dir = 1.0 / safe_dir;
+
+    // Push the start point forward by a few voxels so self-shadow
+    // from the surface we're shading doesn't block its own light.
+    // Primary shadow path uses a similar `vs * 4` bias.
+    let shadow_origin = local_origin + safe_dir * vs * 4.0;
+    let t_range = intersect_aabb(shadow_origin, inv_dir, grid_origin, grid_max);
+    if t_range.x > t_range.y { return transmittance_in; }
+    let t_limit = min(t_range.y, local_max_t);
+
+    var t = max(t_range.x, 0.0) + vs * 0.001;
+    var transmittance = transmittance_in;
+
+    for (var step = 0u; step < SKINNED_SHADOW_MAX_STEPS; step++) {
+        if t > t_limit { break; }
+        let p_local = shadow_origin + safe_dir * t;
+        let cell_f = (p_local - grid_origin) / vs;
+        let cell_i = vec3<i32>(floor(cell_f));
+
+        if !skinned_shadow_brick_populated(cell_i, grid_dim, obj.bone_field_occ_offset) {
+            let t_exit = skinned_shadow_brick_exit_t(shadow_origin, inv_dir, cell_i, grid_origin, vs);
+            t = max(t + vs * 0.01, t_exit + vs * 0.001);
+            continue;
+        }
+
+        let leaf_slot = skinned_shadow_sample(cell_i, grid_dim, obj.bone_field_offset);
+        if leaf_slot == 0u {
+            t += vs;
+            continue;
+        }
+
+        let attr = leaf_attr_pool[leaf_slot];
+        let mid = leaf_attr_material_primary(attr);
+        let m_op = materials[mid].opacity;
+        if m_op >= 0.99 { return 0.0; }
+        transmittance *= (1.0 - m_op);
+        if transmittance < 0.01 { return 0.0; }
+        t += vs;
+    }
+    return transmittance;
+}
+
 // Shadow ray — returns transmittance in [0, 1]. 0 = fully occluded, 1 = lit.
 fn trace_shadow_ray(
     world_origin: vec3<f32>,
@@ -218,6 +353,17 @@ fn trace_shadow_ray(
         // come later — they need a separate camera shadow_layer_mask.
         if (obj.layer_mask & camera.layer_mask) == 0u
             && obj.object_id != camera.focus_object_id { continue; }
+
+        // Skinned objects walk the per-frame deformed bone field
+        // instead of the rest-pose octree — otherwise the shadow would
+        // track a stale (bind-pose) silhouette.
+        if obj.is_skinned != 0u && obj.bone_field_dim_x > 0u {
+            transmittance = trace_shadow_skinned(
+                world_origin, world_dir, obj, max_world_dist, transmittance,
+            );
+            if transmittance < 0.01 { return 0.0; }
+            continue;
+        }
 
         let inv_world = obj.inverse_world;
         let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;

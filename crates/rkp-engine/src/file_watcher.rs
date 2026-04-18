@@ -1,4 +1,4 @@
-//! File watcher for RKIPatch — extends rkf-runtime's FileWatcher with .rkp support.
+//! File watcher for RKIPatch.
 //!
 //! Watches project assets/ recursively. Classifies events by extension.
 //! Polls non-blocking each tick.

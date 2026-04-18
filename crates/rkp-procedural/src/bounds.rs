@@ -4,7 +4,7 @@
 //! Parent transforms widen the bounds. Combinators merge children's bounds.
 
 use glam::Vec3;
-use rkf_core::Aabb;
+use rkp_core::Aabb;
 
 use crate::arena::{NodeId, ProceduralObject};
 use crate::node_kind::*;

@@ -1895,6 +1895,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "gilrs"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fa85c2e35dc565c90511917897ea4eae16b77f2773d5223536f7b602536d462"
+dependencies = [
+ "fnv",
+ "gilrs-core",
+ "log",
+ "uuid",
+ "vec_map",
+]
+
+[[package]]
+name = "gilrs-core"
+version = "0.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d23f2cc5144060a7f8d9e02d3fce5d06705376568256a509cdbc3c24d47e4f04"
+dependencies = [
+ "inotify 0.11.1",
+ "js-sys",
+ "libc",
+ "libudev-sys",
+ "log",
+ "nix",
+ "objc2-core-foundation",
+ "objc2-io-kit",
+ "uuid",
+ "vec_map",
+ "wasm-bindgen",
+ "web-sys",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "gio"
 version = "0.18.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2703,6 +2737,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "inotify"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd5b3eaf1a28b758ac0faa5a4254e8ab2705605496f1b1f3fbbc3988ad73d199"
+dependencies = [
+ "bitflags 2.11.0",
+ "inotify-sys",
+ "libc",
+]
+
+[[package]]
 name = "inotify-sys"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3009,6 +3054,16 @@ dependencies = [
  "libc",
  "plain",
  "redox_syscall 0.7.3",
+]
+
+[[package]]
+name = "libudev-sys"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c8469b4a23b962c1396b9b451dda50ef5b283e8dd309d69033475fa9b334324"
+dependencies = [
+ "libc",
+ "pkg-config",
 ]
 
 [[package]]
@@ -3367,6 +3422,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags 2.11.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "nom"
 version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3390,7 +3457,7 @@ dependencies = [
  "bitflags 2.11.0",
  "filetime",
  "fsevent-sys",
- "inotify",
+ "inotify 0.10.2",
  "kqueue",
  "libc",
  "log",
@@ -3672,6 +3739,17 @@ dependencies = [
  "bitflags 2.11.0",
  "block2 0.6.2",
  "objc2 0.6.4",
+ "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-io-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
+dependencies = [
+ "bitflags 2.11.0",
+ "libc",
  "objc2-core-foundation",
 ]
 
@@ -4776,139 +4854,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "rkf-animation"
+name = "rkp-animation"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
  "glam 0.29.3",
  "log",
- "rkf-core",
+ "rkp-core",
  "ron",
  "serde",
  "thiserror 2.0.18",
  "wgpu 29.0.1",
-]
-
-[[package]]
-name = "rkf-core"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "glam 0.29.3",
- "half",
- "log",
- "lz4_flex",
- "ron",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "rkf-edit"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "glam 0.29.3",
- "half",
- "log",
- "rkf-core",
- "thiserror 2.0.18",
- "wgpu 29.0.1",
-]
-
-[[package]]
-name = "rkf-macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "rkf-mcp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "clap",
- "env_logger",
- "glam 0.29.3",
- "log",
- "rkf-core",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "rkf-particles"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "glam 0.29.3",
- "half",
- "log",
- "rkf-core",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "rkf-physics"
-version = "0.1.0"
-dependencies = [
- "glam 0.29.3",
- "log",
- "rapier3d",
- "rkf-core",
- "serde",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "rkf-render"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "encase",
- "glam 0.29.3",
- "half",
- "image",
- "log",
- "pollster",
- "rkf-core",
- "thiserror 2.0.18",
- "wgpu 29.0.1",
-]
-
-[[package]]
-name = "rkf-runtime"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "env_logger",
- "glam 0.29.3",
- "hecs",
- "inventory",
- "libloading",
- "log",
- "notify",
- "rkf-animation",
- "rkf-core",
- "rkf-edit",
- "rkf-macros",
- "rkf-particles",
- "rkf-physics",
- "rkf-render",
- "ron",
- "serde",
- "thiserror 2.0.18",
- "uuid",
- "wgpu 29.0.1",
- "winit",
 ]
 
 [[package]]
@@ -4928,8 +4884,8 @@ dependencies = [
  "half",
  "log",
  "lz4_flex",
- "rkf-core",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -4945,10 +4901,9 @@ dependencies = [
  "rfd",
  "rinch",
  "rinch-tabler-icons",
- "rkf-render",
- "rkf-runtime",
  "rkp-engine",
  "rkp-render",
+ "rkp-runtime",
  "serde",
  "serde_json",
  "uuid",
@@ -4968,15 +4923,14 @@ dependencies = [
  "log",
  "notify",
  "rapier3d",
- "rkf-core",
- "rkf-physics",
- "rkf-render",
- "rkf-runtime",
+ "rkp-animation",
  "rkp-core",
  "rkp-import",
  "rkp-macros",
+ "rkp-physics",
  "rkp-procedural",
  "rkp-render",
+ "rkp-runtime",
  "serde",
  "serde_json",
  "tempfile",
@@ -4993,8 +4947,7 @@ dependencies = [
  "gltf",
  "image",
  "rayon",
- "rkf-animation",
- "rkf-core",
+ "rkp-animation",
  "rkp-core",
  "tempfile",
  "thiserror 2.0.18",
@@ -5012,13 +4965,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rkp-physics"
+version = "0.1.0"
+dependencies = [
+ "glam 0.29.3",
+ "log",
+ "rapier3d",
+ "rkp-core",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rkp-procedural"
 version = "0.1.0"
 dependencies = [
  "approx",
  "bytemuck",
  "glam 0.29.3",
- "rkf-core",
+ "rkp-core",
  "serde",
  "serde_json",
  "smallvec",
@@ -5036,9 +5001,6 @@ dependencies = [
  "naga 29.0.1",
  "pollster",
  "rayon",
- "rkf-animation",
- "rkf-core",
- "rkf-render",
  "rkp-core",
  "rkp-procedural",
  "thiserror 2.0.18",
@@ -5052,16 +5014,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossbeam",
+ "gilrs",
  "glam 0.29.3",
  "hecs",
  "log",
  "pollster",
- "rkf-animation",
- "rkf-core",
- "rkf-mcp",
- "rkf-physics",
+ "rkp-animation",
  "rkp-core",
+ "rkp-physics",
  "rkp-render",
+ "ron",
+ "serde",
+ "tempfile",
  "wgpu 29.0.1",
  "winit",
 ]
@@ -5075,7 +5039,6 @@ dependencies = [
  "glam 0.29.3",
  "log",
  "pollster",
- "rkf-core",
  "rkp-core",
  "rkp-render",
  "rkp-runtime",
@@ -5529,16 +5492,6 @@ checksum = "4aaa7368fcf4852a4c2dd92df0cace6a71f2091ca0a23391ce7f3a31833f1523"
 dependencies = [
  "borsh",
  "serde_core",
-]
-
-[[package]]
-name = "socket2"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6090,15 +6043,8 @@ version = "1.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27ad5e34374e03cfffefc301becb44e9dc3c17584f414349ebe29ed26661822d"
 dependencies = [
- "bytes",
- "libc",
- "mio",
- "parking_lot",
  "pin-project-lite",
- "signal-hook-registry",
- "socket2",
  "tokio-macros",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

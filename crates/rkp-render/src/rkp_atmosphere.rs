@@ -24,7 +24,10 @@ pub struct AtmosphereFrameParams {
     pub sun_dir: [f32; 3],
     pub sun_intensity: f32,
     pub camera_altitude: f32,
-    pub _pad: [f32; 3],
+    /// Linear-RGB albedo used for below-horizon ground radiance in the
+    /// sky-view LUT. Lets empty scenes show "ground-through-atmosphere"
+    /// rather than a black void past the geometric horizon.
+    pub ground_albedo: [f32; 3],
     pub cam_pos: [f32; 3],
     pub _pad1b: f32,
     pub cam_forward: [f32; 3],

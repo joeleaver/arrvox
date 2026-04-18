@@ -22,8 +22,8 @@ use std::collections::{HashMap, HashSet};
 
 use glam::UVec3;
 
-use rkf_core::companion::ColorVoxel;
-use rkf_core::voxel::VoxelSample;
+use rkp_core::companion::{BoneVoxel, ColorVoxel};
+use rkp_core::voxel::VoxelSample;
 use rkp_core::{SparseOctree, brick_pool, sparse_octree};
 
 use super::classify::{BrickResult, BrickWork};
@@ -42,9 +42,29 @@ pub struct ShellOutput {
     pub color_voxels: Vec<ColorVoxel>,
     /// Per-leaf octahedrally-packed normals (same order).
     pub normals_packed: Vec<u32>,
+    /// Per-leaf skinning weights (same order). Zero-filled for
+    /// unskinned imports; only emitted to `.rkp` when
+    /// [`Self::has_bones`] is set.
+    pub bone_voxels: Vec<BoneVoxel>,
+    /// File-local brick origin per brick, in finest-voxel grid units.
+    /// `brick_origins.len() == file_bricks.len() / BRICK_CELLS`. Index
+    /// is the brick's file-local id (before any load-time
+    /// `scene_brick_offset` shift). Phase-3 skin-deform reads these to
+    /// forward-skin each brick's voxels without walking the octree.
+    pub brick_origins: Vec<[u32; 3]>,
+    /// Per-bone rest-pose AABB in object-local space (the same
+    /// `(grid_coord * voxel_size)` frame the march shader uses). Index
+    /// is the bone id; length = `1 + max_bone_index_seen`. Empty slots
+    /// are zero-extent sentinels at the origin — harmless when unioned
+    /// with an identity bone matrix during the per-frame deformed-AABB
+    /// computation.
+    pub rest_bone_aabbs: Vec<[f32; 6]>,
     /// `true` if any leaf carries non-black albedo data — signals the
     /// writer to emit the color payload.
     pub has_color: bool,
+    /// `true` if any leaf carries non-zero bone weights — signals the
+    /// writer to emit the bones payload.
+    pub has_bones: bool,
     /// Total number of shell voxels emitted.
     pub voxel_count: u32,
 }
@@ -62,6 +82,7 @@ pub fn emit_shell_leaves(
     brick_depth: u8,
     octree_bricks: u32,
     depth: u8,
+    voxel_size: f32,
 ) -> ShellOutput {
     let octree_brick_dim: u32 = brick_pool::BRICK_DIM;
     let octree_brick_levels = brick_pool::BRICK_LEVELS;
@@ -139,7 +160,15 @@ pub fn emit_shell_leaves(
     let mut voxel_data: Vec<VoxelSample> = Vec::new();
     let mut color_voxels: Vec<ColorVoxel> = Vec::new();
     let mut normals_packed: Vec<u32> = Vec::new();
+    let mut bone_voxels: Vec<BoneVoxel> = Vec::new();
+    let mut brick_origins: Vec<[u32; 3]> = Vec::new();
+    // Per-bone rest AABB accumulator — grown on demand as bone indices
+    // appear in the shell. `[INF, INF, INF, -INF, -INF, -INF]` sentinels
+    // flag "no voxel has claimed this bone yet"; writer collapses those
+    // back to zero-extent before serialising.
+    let mut rest_bone_aabbs: Vec<[f32; 6]> = Vec::new();
     let mut has_color = false;
+    let mut has_bones = false;
     let mut voxel_count = 0u32;
 
     // Emit shell leaves per surface brick, one 4³ sub-brick at a time.
@@ -158,13 +187,18 @@ pub fn emit_shell_leaves(
                         octree_brick_dim,
                         octree_brick_depth,
                         brick_cells_u32,
+                        voxel_size,
                         octree,
                         &inside_at,
                         &mut file_bricks,
                         &mut voxel_data,
                         &mut color_voxels,
                         &mut normals_packed,
+                        &mut bone_voxels,
+                        &mut brick_origins,
+                        &mut rest_bone_aabbs,
                         &mut has_color,
+                        &mut has_bones,
                         &mut voxel_count,
                     );
                 }
@@ -172,12 +206,22 @@ pub fn emit_shell_leaves(
         }
     }
 
+    // Collapse unclaimed bone slots (sentinel +INF/-INF) to zero AABBs
+    // so the on-disk representation is well-formed.
+    for aabb in rest_bone_aabbs.iter_mut() {
+        if aabb[0] > aabb[3] { *aabb = [0.0; 6]; }
+    }
+
     ShellOutput {
         file_bricks,
         voxel_data,
         color_voxels,
         normals_packed,
+        bone_voxels,
+        brick_origins,
+        rest_bone_aabbs,
         has_color,
+        has_bones,
         voxel_count,
     }
 }
@@ -194,13 +238,18 @@ fn emit_subbrick(
     octree_brick_dim: u32,
     octree_brick_depth: u8,
     brick_cells_u32: usize,
+    voxel_size: f32,
     octree: &mut SparseOctree,
     inside_at: &impl Fn(i64, i64, i64) -> bool,
     file_bricks: &mut Vec<u32>,
     voxel_data: &mut Vec<VoxelSample>,
     color_voxels: &mut Vec<ColorVoxel>,
     normals_packed: &mut Vec<u32>,
+    bone_voxels: &mut Vec<BoneVoxel>,
+    brick_origins: &mut Vec<[u32; 3]>,
+    rest_bone_aabbs: &mut Vec<[f32; 6]>,
     has_color: &mut bool,
+    has_bones: &mut bool,
     voxel_count: &mut u32,
 ) {
     let sub_origin_x = sbx * octree_brick_dim;
@@ -256,6 +305,10 @@ fn emit_subbrick(
     let brick_id = (file_bricks.len() / brick_cells_u32) as u32;
     file_bricks.extend(std::iter::repeat_n(brick_pool::BRICK_EMPTY, brick_cells_u32));
     let brick_base = brick_id as usize * brick_cells_u32;
+    // Record the brick's origin in finest-voxel grid units (matches the
+    // octree's finest-level indexing). The scatter pass reads this at
+    // runtime to derive per-cell rest positions.
+    brick_origins.push([sub_origin_coord.x, sub_origin_coord.y, sub_origin_coord.z]);
 
     // Mark inside cells of this sub-brick as `BRICK_INTERIOR`. Zero
     // memory cost (slots are pre-allocated regardless of content).
@@ -288,14 +341,64 @@ fn emit_subbrick(
         let normal_oct = result.face_normals[e.flat8];
         let mat_id = result.material_ids[e.flat8];
         let cv = result.color_brick.data[e.flat8];
+        let bv = result.bone_voxels[e.flat8];
         if cv.intensity() > 0 {
             *has_color = true;
+        }
+        if result.has_bones && (0..4).any(|i| bv.bone_weight(i) > 0) {
+            *has_bones = true;
+
+            // Voxel grid coord inside the mesh brick.
+            let vx = (e.flat8 % 8) as u32;
+            let vy = ((e.flat8 / 8) % 8) as u32;
+            let vz = (e.flat8 / 64) as u32;
+            let gx = w.bx * 8 + vx;
+            let gy = w.by * 8 + vy;
+            let gz = w.bz * 8 + vz;
+            // Center of the voxel in object-local space — matches the
+            // space the scatter shader forward-skins from.
+            let cx = (gx as f32 + 0.5) * voxel_size;
+            let cy = (gy as f32 + 0.5) * voxel_size;
+            let cz = (gz as f32 + 0.5) * voxel_size;
+
+            // Dominant bone = slot with the max weight. Accumulate the
+            // voxel centre into that bone's rest AABB. LBS during the
+            // scatter blends across bones, but the AABB only needs to
+            // contain voxels that predominantly move with each bone —
+            // good enough for sizing the deformed grid with a small
+            // inflation margin at runtime.
+            let mut dom_slot = 0usize;
+            let mut dom_w = bv.bone_weight(0);
+            for s in 1..4 {
+                if bv.bone_weight(s) > dom_w {
+                    dom_w = bv.bone_weight(s);
+                    dom_slot = s;
+                }
+            }
+            let dom_bone = bv.bone_index(dom_slot) as usize;
+            if rest_bone_aabbs.len() <= dom_bone {
+                // Sentinel: +INF min / -INF max flags "not yet
+                // accumulated". Collapsed to zero-extent by the outer
+                // caller before serialise.
+                rest_bone_aabbs.resize(dom_bone + 1, [
+                    f32::INFINITY, f32::INFINITY, f32::INFINITY,
+                    f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY,
+                ]);
+            }
+            let aabb = &mut rest_bone_aabbs[dom_bone];
+            aabb[0] = aabb[0].min(cx);
+            aabb[1] = aabb[1].min(cy);
+            aabb[2] = aabb[2].min(cz);
+            aabb[3] = aabb[3].max(cx);
+            aabb[4] = aabb[4].max(cy);
+            aabb[5] = aabb[5].max(cz);
         }
 
         let slot = *voxel_count;
         voxel_data.push(VoxelSample::new(0.0, mat_id, 0));
         normals_packed.push(normal_oct);
         color_voxels.push(cv);
+        bone_voxels.push(bv);
         *voxel_count += 1;
 
         file_bricks[brick_base + e.cell_flat as usize] = slot;

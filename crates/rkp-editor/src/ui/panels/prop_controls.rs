@@ -54,40 +54,20 @@ pub fn prop_slider(
     step: f32,
     on_change: Rc<dyn Fn(f32)>,
 ) -> Node {
-    let label = label.to_string();
-    // Bridge f32 → f64 for the rinch Slider component.
-    let value_f64 = Signal::new(value.get() as f64);
-
-    rsx! {
-        div {
-            style: ROW_STYLE,
-            div { style: LABEL_STYLE, {label} }
-            div {
-                style: "flex:1;min-width:0;",
-                Slider {
-                    min: min as f64,
-                    max: max as f64,
-                    step: step as f64,
-                    size: "sm",
-                    color: "#4fc3f7",
-                    value_signal: value_f64,
-                    onchange: move |v: f64| {
-                        let f = v as f32;
-                        value.set(f);
-                        value_f64.set(v);
-                        on_change(f);
-                    },
-                }
-            }
-            div {
-                style: VALUE_STYLE,
-                {move || format!("{:.2}", value.get())}
-            }
-        }
-    }
+    // Both "slider" and "scrub" paths use the same gradient-fill
+    // drag-to-change widget; keep the `prop_slider` name for
+    // call-site readability (bounded range + step → `prop_slider`;
+    // write-only field → `prop_scrub`).
+    let display = Memo::new(move || value.get());
+    let on_change_wrap: Rc<dyn Fn(f32)> = Rc::new(move |v: f32| {
+        value.set(v);
+        on_change(v);
+    });
+    prop_scrub(__scope, label, display, min, max, step, on_change_wrap)
 }
 
-/// Slider that operates on f64 (for ECS inspector fields).
+/// Slider that operates on f64 (for ECS inspector fields). Same
+/// widget as [`prop_slider`], rounded through f32 for display.
 pub fn prop_slider_f64(
     __scope: &mut Scope,
     label: &str,
@@ -97,33 +77,21 @@ pub fn prop_slider_f64(
     step: f64,
     on_change: Rc<dyn Fn(f64)>,
 ) -> Node {
-    let label = label.to_string();
-
-    rsx! {
-        div {
-            style: ROW_STYLE,
-            div { style: LABEL_STYLE, {label} }
-            div {
-                style: "flex:1;min-width:0;",
-                Slider {
-                    min: min,
-                    max: max,
-                    step: step,
-                    size: "sm",
-                    color: "#4fc3f7",
-                    value_signal: value,
-                    onchange: move |v: f64| {
-                        value.set(v);
-                        on_change(v);
-                    },
-                }
-            }
-            div {
-                style: VALUE_STYLE,
-                {move || format!("{:.2}", value.get())}
-            }
-        }
-    }
+    let display = Memo::new(move || value.get() as f32);
+    let on_change_wrap: Rc<dyn Fn(f32)> = Rc::new(move |v: f32| {
+        let v64 = v as f64;
+        value.set(v64);
+        on_change(v64);
+    });
+    prop_scrub(
+        __scope,
+        label,
+        display,
+        min as f32,
+        max as f32,
+        step as f32,
+        on_change_wrap,
+    )
 }
 
 // ── Scrub input ──────────────────────────────────────────────────────────
@@ -215,7 +183,17 @@ pub fn prop_scrub(
                                 if delta.abs() > 2.0 {
                                     did_drag.set(true);
                                 }
-                                let new_val = (drag_start.get() + delta * step).clamp(min, max);
+                                // Drag sensitivity is based on the full range, not the step.
+                                // Target ~100 pixels to traverse the range; snap to step.
+                                // This keeps tiny-range sliders (e.g. 1..6) usable.
+                                let range = (max - min).max(1e-6);
+                                let raw = drag_start.get() + delta * range / 100.0;
+                                let snapped = if step > 0.0 {
+                                    (raw / step).round() * step
+                                } else {
+                                    raw
+                                };
+                                let new_val = snapped.clamp(min, max);
                                 (oc_drag.get())(new_val);
                             })
                             .on_end(move |_, _| {

@@ -282,12 +282,14 @@ fn render_param_field(
     match param.value {
         ProceduralParamValue::Float(v) => {
             let (min, max) = param.range.unwrap_or((0.0, 100.0));
+            let signal = Signal::new(v);
             let name = param.name.clone();
             let value_memo = Memo::new(move || match lookup_param() {
                 Some(ProceduralParamValue::Float(f)) => f,
                 _ => v,
             });
             let on_change: Rc<dyn Fn(f32)> = Rc::new(move |val: f32| {
+                signal.set(val);
                 let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralNodeParam {
                     node_id: node_id.get(),
                     param_name: name.clone(),

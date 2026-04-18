@@ -392,7 +392,7 @@ fn voxelize_octree_gpu_runs_end_to_end() {
     );
     obj.set_transform(b, Affine3A::from_translation(Vec3::new(-0.25, 0.0, 0.0)));
 
-    let aabb = rkf_core::Aabb {
+    let aabb = rkp_core::Aabb {
         min: Vec3::splat(-0.8),
         max: Vec3::splat(0.8),
     };
@@ -465,7 +465,7 @@ fn artifact_roundtrip_matches_direct_voxelize() {
         }),
     );
 
-    let aabb = rkf_core::Aabb {
+    let aabb = rkp_core::Aabb {
         min: Vec3::splat(-0.6),
         max: Vec3::splat(0.6),
     };
@@ -551,7 +551,7 @@ fn bake_perf_sweep() {
         }),
     );
 
-    let aabb = rkf_core::Aabb {
+    let aabb = rkp_core::Aabb {
         min: Vec3::splat(-0.7),
         max: Vec3::splat(0.7),
     };

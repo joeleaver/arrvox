@@ -31,12 +31,17 @@ use bytemuck::{Pod, Zeroable};
 /// | 128    | 4    | rest_octree_root (u32) |
 /// | 132    | 4    | rest_octree_depth (u32) |
 /// | 136    | 4    | rest_octree_extent_bits (u32) |
-/// | 140    | 4    | deformed_pool_offset (u32) |
+/// | 140    | 4    | bone_field_offset (u32) — in vec2<u32> cells |
 /// | 144    | 4    | layer_mask (u32) — render-layer mask, gated against camera mask |
-/// | 148    | 12   | _pre_grid_pad — align grid_origin to 16 for WGSL vec3 |
-/// | 160    | 12   | grid_origin (vec3<f32>) — entity-local start of the voxel grid |
-/// | 172    | 4    | _post_grid_pad |
-/// | 176    | 16   | _padding |
+/// | 148    | 4    | bone_field_dim_x (u32) |
+/// | 152    | 4    | bone_field_dim_y (u32) |
+/// | 156    | 4    | bone_field_dim_z (u32) |
+/// | 160    | 4    | bone_field_origin_x (f32 bits) |
+/// | 164    | 4    | bone_field_origin_y (f32 bits) |
+/// | 168    | 4    | bone_field_origin_z (f32 bits) |
+/// | 172    | 4    | bone_field_occ_offset (u32) — start in u32 words |
+/// | 176    | 12   | grid_origin (vec3<f32>) — entity-local start of the voxel grid |
+/// | 188    | 4    | _post_grid_pad |
 /// | 192    | 64   | inverse_world (mat4x4<f32>) — world→local |
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
@@ -78,17 +83,30 @@ pub struct RkpGpuObject {
     pub rest_octree_depth: u32,
     /// Rest-pose octree extent bits.
     pub rest_octree_extent_bits: u32,
-    /// Offset into deformed bone-field pool.
-    pub deformed_pool_offset: u32,
+    /// Offset into the scene-wide bone_field buffer (in `vec2<u32>`
+    /// cells, not bytes). Skin-deform scatters this object's entries
+    /// starting here; the march's skinned branch reads from here.
+    pub bone_field_offset: u32,
 
     /// 32-bit render-layer mask. Visible to a viewport iff
     /// `(layer_mask & camera.layer_mask) != 0  ||  object_id == camera.focus_object_id`.
     /// Default per-entity is `viewport::layer::DEFAULT` (bit 0).
     pub layer_mask: u32,
 
-    /// Padding to land `grid_origin` on a 16-byte boundary — WGSL
-    /// `vec3<f32>` struct fields require that alignment.
-    pub _pre_grid_pad: [u32; 3],
+    /// Bone-field grid dimensions (voxel cells).
+    pub bone_field_dim_x: u32,
+    pub bone_field_dim_y: u32,
+    pub bone_field_dim_z: u32,
+    /// Bone-field grid origin in object-local space (f32 packed as bits).
+    pub bone_field_origin_x: f32,
+    pub bone_field_origin_y: f32,
+    pub bone_field_origin_z: f32,
+
+    /// Offset into the scene-wide bone-field occupancy bitmap, measured
+    /// in u32 words. Each bit covers one 4³-cell brick of this object's
+    /// bone_field slice; scatter sets bits with `atomicOr` and the
+    /// skinned march reads them with `atomicLoad` to skip empty bricks.
+    pub bone_field_occ_offset: u32,
 
     /// Entity-local start of the voxel grid, i.e. `aabb_center - extent/2`
     /// at voxelization time. Shaders convert world→local via
@@ -100,9 +118,6 @@ pub struct RkpGpuObject {
 
     /// Stride pad after `grid_origin` (WGSL treats vec3 as 16-byte sized).
     pub _post_grid_pad: u32,
-
-    /// Padding.
-    pub _padding: [u32; 4],
 
     /// Inverse world transform (world→local). Precomputed on CPU.
     pub inverse_world: [[f32; 4]; 4],
@@ -140,14 +155,14 @@ mod tests {
     }
 
     #[test]
-    fn grid_origin_at_offset_160() {
+    fn grid_origin_at_offset_176() {
         // vec3<f32> fields in WGSL structs require 16-byte alignment.
-        // The `_pre_grid_pad` array above pushes grid_origin to offset
-        // 160 — verify so the shader and CPU agree on byte layout.
+        // With bone_field_* fields at 148..=172 the next 16-byte boundary
+        // is 176 — verify so the shader and CPU agree on byte layout.
         let obj = RkpGpuObject::zeroed();
         let base = &obj as *const _ as usize;
         let field = &obj.grid_origin as *const _ as usize;
-        assert_eq!(field - base, 160);
+        assert_eq!(field - base, 176);
     }
 
     #[test]

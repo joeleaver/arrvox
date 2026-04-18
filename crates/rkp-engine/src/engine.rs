@@ -46,15 +46,15 @@ fn collect_leaf_slots(all_nodes: &[u32], node_idx: usize, out: &mut Vec<u32>) {
 
 /// Convert a SpatialHandle from rkp_render into our SpatialData component.
 fn spatial_from_handle(
-    handle: &rkf_core::scene_node::SpatialHandle,
+    handle: &rkp_core::scene_node::SpatialHandle,
     voxel_size: f32,
-    aabb: &rkf_core::Aabb,
+    aabb: &rkp_core::Aabb,
     grid_origin: glam::Vec3,
     voxel_slot_start: u32,
     voxel_slot_count: u32,
     brick_ids: Vec<u32>,
 ) -> SpatialData {
-    if let rkf_core::scene_node::SpatialHandle::Octree {
+    if let rkp_core::scene_node::SpatialHandle::Octree {
         root_offset, len, depth, base_voxel_size,
     } = handle
     {
@@ -239,7 +239,7 @@ struct EngineState {
     bake_worker: crate::bake_worker::BakeWorker,
 
     // Input + Camera
-    input_system: rkf_runtime::input::InputSystem,
+    input_system: rkp_runtime::input::InputSystem,
     camera_control: CameraControlState,
     camera: CameraState,
     /// Viewport scaffolding (Phase 1). Populated with one entry for
@@ -302,6 +302,48 @@ struct EngineState {
     /// set for echoes from the editor itself (no feedback loop).
     editor_layout_pending: bool,
 
+    /// Shared cache of loaded `.rkskel` skeleton assets. Multiple
+    /// entities loaded from the same `.rkp` share a single `Arc`.
+    animation_cache: crate::animation::AnimationAssetCache,
+    /// Per-frame allocator that packs every skinned entity's
+    /// `Skeleton.current_pose` into one contiguous byte buffer for GPU
+    /// upload. Rebuilt whenever `update_scene_gpu` runs.
+    bone_matrix_allocator: crate::scene_sync::BoneMatrixAllocator,
+    /// Per-frame scatter dispatches — one per skinned entity with a
+    /// resolved skinning asset. Rebuilt in `update_scene_gpu`.
+    skin_dispatches: Vec<crate::scene_sync::PlannedSkinDispatch>,
+    /// Reusable per-frame scratch that concatenates every
+    /// `skin_dispatches` entry into the single batched compute
+    /// dispatch `scatter_skin_batch` fires.
+    skin_batch: rkp_render::SkinBatchScratch,
+    /// Total bytes required in `scene.bone_field_buffer` this frame;
+    /// drives the per-frame grow+clear.
+    skin_bone_field_bytes: u64,
+    /// Total bytes required in `scene.bone_field_occ_buffer` this
+    /// frame (packed 1-bit-per-brick occupancy bitmap paired with
+    /// `bone_field_buffer`).
+    skin_bone_field_occ_bytes: u64,
+    /// Per-skinned-entity cache of last frame's `current_pose`. Used
+    /// by the pause-aware scatter-skip — if every entity's pose is
+    /// byte-identical to last frame and the set of skinned entities
+    /// hasn't changed, the previous frame's `bone_field` buffer is
+    /// still valid, so both the clear and the scatter dispatch get
+    /// skipped. Big win when the user pauses an animation.
+    last_skin_poses: std::collections::HashMap<hecs::Entity, Vec<glam::Mat4>>,
+    /// `true` this frame iff the scatter can be skipped. Computed in
+    /// `update_scene_gpu` after `plan_skin_dispatch` runs.
+    skin_reuse: bool,
+    /// Master toggle — when false, skip scatter + fall the march back
+    /// to its rigid path. Driven by the AnimationPanel checkbox.
+    skinning_enabled: bool,
+    /// `true` → Dual-Quaternion Skinning in the scatter pass; `false`
+    /// → Linear Blend Skinning. DQS preserves joint volume and fixes
+    /// axial-twist candy-wrapper at ~+13% scatter cost. The visible
+    /// payoff on gentle clips (Mixamo walks) is subtle; defaults off
+    /// so the fast path is the common path. Flip on for extreme
+    /// poses (crouch, acrobatic, twist-heavy clips) or to A/B compare.
+    dqs_enabled: bool,
+
     /// Material library — manages .rkmat files and runtime palette.
     material_lib: crate::material_library::MaterialLibrary,
     /// Currently selected material in the materials panel.
@@ -353,6 +395,15 @@ struct EngineState {
 
     // Frame counter
     frame_index: u64,
+
+    // Previous frame's view-projection matrix, used for temporal reprojection
+    // (e.g. the volumetric cloud pass). Identity on the first frame.
+    prev_view_proj: [[f32; 4]; 4],
+
+    // Temporally smoothed cloud-sun attenuation (camera→sun ray through the
+    // cloud layer). Lerps toward the target each frame so a single noisy ray
+    // through FBM doesn't flicker sun intensity.
+    cloud_sun_atten: f32,
 
     // Render dimensions
     width: u32,
@@ -440,7 +491,7 @@ impl EngineState {
     }
 
     fn new(config: &EngineConfig) -> Self {
-        let ctx = rkf_render::RenderContext::new_headless();
+        let ctx = rkp_render::RenderContext::new_headless();
         let device = ctx.device;
         let queue = ctx.queue;
 
@@ -473,7 +524,7 @@ impl EngineState {
         ));
 
         // Input system with default action map.
-        let mut input_system = rkf_runtime::input::InputSystem::new();
+        let mut input_system = rkp_runtime::input::InputSystem::new();
         input_system.add_map(crate::camera::default_action_map());
         input_system.set_active_map("editor");
         let camera_control = CameraControlState::default();
@@ -544,6 +595,16 @@ impl EngineState {
             importing_dirty: false,
             editor_layout_json: None,
             editor_layout_pending: false,
+            animation_cache: crate::animation::AnimationAssetCache::new(),
+            bone_matrix_allocator: crate::scene_sync::BoneMatrixAllocator::new(),
+            skin_dispatches: Vec::new(),
+            skin_batch: rkp_render::SkinBatchScratch::default(),
+            skin_bone_field_bytes: 0,
+            skin_bone_field_occ_bytes: 0,
+            last_skin_poses: std::collections::HashMap::new(),
+            skin_reuse: false,
+            skinning_enabled: true,
+            dqs_enabled: false,
             material_lib: crate::material_library::MaterialLibrary::new(),
             selected_material: None,
             selected_model: None,
@@ -567,6 +628,8 @@ impl EngineState {
             scene_dirty: false,
             gpu_objects_dirty: true,
             frame_index: 0,
+            prev_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            cloud_sun_atten: 1.0,
             width,
             height,
             gizmo: crate::gizmo::GizmoState::new(),
@@ -613,10 +676,39 @@ impl EngineState {
             self.material_lib.clear_dirty();
         }
 
+        // Camera uniforms are needed now for altitude-dependent atmosphere
+        // params (sun transmittance, sky colors). Building them early — the
+        // actual per-frame upload still happens at step 2. Uses MAIN camera
+        // since sun + lights are scene-wide (not per-viewport).
+        let cam_uniforms = self.build_camera_uniforms(crate::viewport::ViewportId::MAIN);
+        let cam_y = cam_uniforms.position[1];
+
         // 0b. Upload environment + lights.
         // Always rebuild lights array (entity lights may have moved).
         {
-            let mut gpu_lights = vec![self.environment.to_gpu_light()]; // [0] = sun
+            // Cloud → sun attenuation comes from a GPU readback of the dedicated
+            // compute pass on MAIN's volumetric. `sun_atten_value()` is the
+            // last-received exp(-τ); it lags 1–2 frames but the temporal
+            // lerp hides that.
+            let target_atten = if self.environment.attenuate_sun_by_clouds && self.environment.clouds_enabled {
+                self.viewport_renderers
+                    .get(&crate::viewport::ViewportId::MAIN)
+                    .map(|vr| vr.volumetric.sun_atten_value())
+                    .unwrap_or(1.0)
+            } else {
+                1.0
+            };
+            // Lerp slowly toward the readback value — the GPU integral can still
+            // swing a bit when a cloud edge crosses the camera→sun ray, and a
+            // multi-frame fade reads as "cloud rolling over the sun" rather than
+            // a per-frame flicker.
+            self.cloud_sun_atten = self.cloud_sun_atten + (target_atten - self.cloud_sun_atten) * 0.04;
+
+            let mut sun_light = self.environment.to_gpu_light(cam_y);
+            sun_light.color[0] *= self.cloud_sun_atten;
+            sun_light.color[1] *= self.cloud_sun_atten;
+            sun_light.color[2] *= self.cloud_sun_atten;
+            let mut gpu_lights = vec![sun_light]; // [0] = sun
 
             // Collect point lights from entities.
             for (_entity, (transform, pl)) in self.world.query::<(&crate::components::Transform, &crate::components::PointLight)>().iter() {
@@ -638,7 +730,7 @@ impl EngineState {
                 });
             }
 
-            let mut shade_params = self.environment.to_shade_params();
+            let mut shade_params = self.environment.to_shade_params(cam_y);
             shade_params.num_lights = gpu_lights.len() as u32;
             // Stash the base shade_params; the per-viewport loop below
             // writes it (with the per-VR `isolation` flag set) into the
@@ -696,7 +788,56 @@ impl EngineState {
         }
         self.renderer.upload_frame(&self.queue, &FrameUpload {
             objects: &self.gpu_objects,
+            bone_matrices: self.bone_matrix_allocator.bytes(),
+            bone_dual_quats: self.bone_matrix_allocator.bytes_dq(),
         });
+
+        // 2b. Skeletal skin-deform scatter. Folds every skinned
+        // entity into one batched compute dispatch so we fire exactly
+        // one `write_buffer` per input — side-stepping the write-
+        // ordering pitfall of multiple per-entity dispatches sharing
+        // a single uniform/brick buffer inside one submission.
+        //
+        // Gets its own encoder + submit because per-VR submits below
+        // each produce their own encoder. Submitting the scatter first
+        // keeps the bone_field / bone_field_occ writes ordered before
+        // any viewport's march dispatch reads them.
+        if self.skinning_enabled && !self.skin_dispatches.is_empty() && !self.skin_reuse {
+            let mut skin_encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rkp_skin_deform_encoder"),
+            });
+            let q = self.renderer.profiler.begin_query("skin_deform", &mut skin_encoder);
+            self.renderer.prepare_bone_field(
+                &self.queue,
+                &mut skin_encoder,
+                self.skin_bone_field_bytes,
+                self.skin_bone_field_occ_bytes,
+            );
+            self.skin_batch.clear();
+            for plan in &self.skin_dispatches {
+                let d = rkp_render::SkinDispatch {
+                    uniforms: plan.uniforms,
+                    bricks: &plan.bricks,
+                };
+                self.skin_batch.push(&d);
+            }
+            self.renderer.scatter_skin_batch(&self.queue, &mut skin_encoder, &self.skin_batch);
+            self.renderer.profiler.end_query(&mut skin_encoder, q);
+            self.queue.submit(std::iter::once(skin_encoder.finish()));
+        } else if self.skinning_enabled && self.frame_index % 60 == 0 {
+            // Once a second, log why scatter isn't running when the
+            // user has the toggle on — most common reason is a stale
+            // `.rkp` without the new skin-meta section, or no skinned
+            // entities in the scene.
+            let skinned_entities = self.world.query::<&crate::components::Skeleton>().iter().count();
+            if skinned_entities > 0 {
+                eprintln!(
+                    "[RkpEngine] skinning enabled, {} skinned entities, but 0 scatter dispatches this frame. \
+                     Likely cause: stale .rkp without skin-meta section — re-import the asset.",
+                    skinned_entities,
+                );
+            }
+        }
 
         let t_upload = frame_start.elapsed();
 
@@ -762,11 +903,12 @@ impl EngineState {
             let cloud_params = self.environment.to_cloud_params(self.frame_index as f32 / 60.0);
 
             let sun_d = self.environment.sun_direction();
+            let cam_y = cam_uniforms.position[1];
             let atmo_frame = rkp_render::rkp_atmosphere::AtmosphereFrameParams {
                 sun_dir: [-sun_d[0], -sun_d[1], -sun_d[2]],
                 sun_intensity: self.environment.sun_intensity,
-                camera_altitude: self.environment.camera_altitude,
-                _pad: [0.0; 3],
+                camera_altitude: self.environment.effective_altitude(cam_y),
+                ground_albedo: self.environment.ground_albedo,
                 cam_pos: [cam_uniforms.position[0], cam_uniforms.position[1], cam_uniforms.position[2]],
                 _pad1b: 0.0,
                 cam_forward: [cam_uniforms.forward[0], cam_uniforms.forward[1], cam_uniforms.forward[2]],
@@ -907,7 +1049,7 @@ impl EngineState {
             // paying the sphere-trace loop.
             let (proc_instructions, proc_aabb): (
                 Vec<rkp_procedural::ProcInstruction>,
-                Option<rkf_core::Aabb>,
+                Option<rkp_core::Aabb>,
             ) = if matches!(vp_preview_mode, rkp_render::BuildPreviewMode::Raymarch) {
                 vp_preview_entity
                     .and_then(|uuid| {
@@ -1189,6 +1331,14 @@ impl EngineState {
         let t_post = t_encode;
         let t_submit = t_encode;
 
+        // Kick off the cloud→sun atten readback on MAIN (scene-wide sun),
+        // then drive a non-blocking poll so previously-issued map_async
+        // callbacks can fire.
+        if let Some(main_vr) = self.viewport_renderers.get(&crate::viewport::ViewportId::MAIN) {
+            main_vr.volumetric.issue_sun_atten_map();
+        }
+        let _ = self.device.poll(wgpu::PollType::Poll);
+
         // Pick result process — depends on this frame's pick copy completing.
         if pick_issued {
             self.process_pick_result();
@@ -1233,6 +1383,9 @@ impl EngineState {
                 t_frame_end.as_secs_f64() * 1000.0,
             );
         }
+
+        // Remember this frame's view-projection so next frame can reproject into it.
+        self.prev_view_proj = cam_uniforms.view_proj;
 
         self.frame_index += 1;
     }
@@ -1566,6 +1719,7 @@ impl EngineState {
                     // ray math).
                     self.width = width;
                     self.height = height;
+                    self.environment_dirty = true;
                     self.environment_ui_dirty = true;
                     eprintln!("[RkpEngine] MAIN resized to {}x{}", width, height);
                 }
@@ -2122,6 +2276,11 @@ impl EngineState {
                         ));
                         self.assign_entity_uuid(entity);
                         self.entity_scene_ids.insert(entity, scene_id);
+                        // No auto-attach — the user adds `Skeleton`
+                        // manually via the Add Component menu when they
+                        // want animation. Helper below in
+                        // `try_attach_skeleton` is invoked from the
+                        // AddComponent command handler.
                         self.geometry_dirty = true;
                         self.scene_dirty = true;
                         self.gpu_objects_dirty = true;
@@ -2368,7 +2527,7 @@ impl EngineState {
                 if id == crate::viewport::ViewportId::MAIN {
                     self.input_system.feed_mouse_button(button, pressed);
                 } else if id == crate::viewport::ViewportId::BUILD {
-                    if button == rkf_runtime::input::InputMouseButton::Left {
+                    if button == rkp_runtime::input::InputMouseButton::Left {
                         self.build_mouse_left = pressed;
                     }
                 }
@@ -2419,7 +2578,27 @@ impl EngineState {
 
             EngineCommand::AddComponent { entity_id, component_name } => {
                 if let Some(entity) = self.resolve_entity(&entity_id) {
-                    if let Some(entry) = self.registry.get(&component_name) {
+                    // Skeleton needs more context than the registry's
+                    // plain (World, Entity) `add_default` — it has to
+                    // find the sibling `.rkskel` next to the entity's
+                    // Renderable asset and load it. Route here first;
+                    // the attach helper also inserts an
+                    // AnimationPlayer alongside (components are
+                    // bundled — you never want one without the other).
+                    if component_name == "Skeleton" {
+                        let rkp_path = self.world
+                            .get::<&crate::components::Renderable>(entity)
+                            .ok()
+                            .and_then(|r| r.asset_path.clone());
+                        match rkp_path {
+                            Some(p) => self.try_attach_skeleton(entity, std::path::Path::new(&p)),
+                            None => self.console.warn(
+                                "Add Skeleton: entity has no Renderable asset — attach a model first".to_string(),
+                            ),
+                        }
+                        self.scene_dirty = true;
+                        self.gpu_objects_dirty = true;
+                    } else if let Some(entry) = self.registry.get(&component_name) {
                         if let Err(e) = (entry.add_default)(&mut self.world, entity) {
                             eprintln!("[RkpEngine] add component failed: {e}");
                         }
@@ -2437,6 +2616,14 @@ impl EngineState {
                     if let Some(entry) = self.registry.get(&component_name) {
                         if let Err(e) = (entry.remove)(&mut self.world, entity) {
                             eprintln!("[RkpEngine] remove component failed: {e}");
+                        }
+                        // Skeleton + AnimationPlayer are bundled —
+                        // pulling the skeleton also pulls the player
+                        // (ui treats AnimationPlayer as part of the
+                        // Skeleton section, so an orphaned player
+                        // would be invisible and confusing).
+                        if component_name == "Skeleton" {
+                            let _ = self.world.remove_one::<crate::components::AnimationPlayer>(entity);
                         }
                         self.scene_dirty = true;
                         self.gpu_objects_dirty = true;
@@ -2626,6 +2813,8 @@ impl EngineState {
             EngineCommand::SetViewOption { option, enabled } => {
                 match option.as_str() {
                     "show_colliders" => self.show_colliders = enabled,
+                    "skinning" => self.skinning_enabled = enabled,
+                    "dqs" => self.dqs_enabled = enabled,
                     _ => eprintln!("[RkpEngine] unknown view option: {option}"),
                 }
             }
@@ -2700,8 +2889,11 @@ impl EngineState {
                     "god_ray_exposure" => {
                         if let Ok(v) = value.parse::<f32>() { env.god_ray_exposure = v; }
                     }
-                    "camera_altitude" => {
-                        if let Ok(v) = value.parse::<f32>() { env.camera_altitude = v; }
+                    "scene_elevation" => {
+                        if let Ok(v) = value.parse::<f32>() { env.scene_elevation = v; }
+                    }
+                    "ground_albedo" => {
+                        if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) { env.ground_albedo = v; }
                     }
                     // Fog
                     "fog_color" => {
@@ -2716,24 +2908,40 @@ impl EngineState {
                     "fog_height_falloff" => {
                         if let Ok(v) = value.parse::<f32>() { env.fog_height_falloff = v; }
                     }
-                    "distance_fog_density" => {
-                        if let Ok(v) = value.parse::<f32>() { env.distance_fog_density = v; }
-                    }
-                    "distance_fog_falloff" => {
-                        if let Ok(v) = value.parse::<f32>() { env.distance_fog_falloff = v; }
-                    }
-                    "dust_density" => {
-                        if let Ok(v) = value.parse::<f32>() { env.dust_density = v; }
-                    }
-                    "dust_asymmetry" => {
-                        if let Ok(v) = value.parse::<f32>() { env.dust_asymmetry = v; }
-                    }
                     "vol_far" => {
                         if let Ok(v) = value.parse::<f32>() { env.vol_far = v; }
                     }
                     // Clouds
                     "clouds_enabled" => {
                         env.clouds_enabled = value == "true" || value == "1";
+                    }
+                    "attenuate_sun_by_clouds" => {
+                        env.attenuate_sun_by_clouds = value == "true" || value == "1";
+                    }
+                    "cloud_slab_steps" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            env.cloud_slab_steps = (v as u32).clamp(8, 128);
+                        }
+                    }
+                    "cloud_shadow_steps" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            env.cloud_shadow_steps = (v as u32).clamp(1, 8);
+                        }
+                    }
+                    "cloud_detail_octaves" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            env.cloud_detail_octaves = (v as u32).clamp(1, 6);
+                        }
+                    }
+                    "cloud_ms_octaves" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            env.cloud_ms_octaves = (v as u32).clamp(1, 5);
+                        }
+                    }
+                    "cloud_taa_alpha" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            env.cloud_taa_alpha = v.clamp(0.05, 0.7);
+                        }
                     }
                     "cloud_altitude_min" => {
                         if let Ok(v) = value.parse::<f32>() { env.cloud_altitude_min = v; }
@@ -2756,7 +2964,9 @@ impl EngineState {
                     _ => { eprintln!("[RkpEngine] unknown environment field: {field}"); }
                 }
                 self.environment_dirty = true;
-                self.environment_ui_dirty = true;
+                // Deliberately do NOT set environment_ui_dirty: the UI already holds
+                // the authoritative value (it just sent it). Echoing back would cause
+                // the form to remount mid-drag on every slider tick.
             }
 
             EngineCommand::SetGizmoMode { mode } => {
@@ -3152,6 +3362,24 @@ impl EngineState {
         // Count per-material voxel usage if entity has spatial data.
         let material_usage = self.count_material_usage(selected);
 
+        // Skeleton sidecar — clip + bone metadata for the dedicated
+        // animation panel. Skipped when the entity has no skeleton.
+        let skeleton = self.world.get::<&crate::components::Skeleton>(selected).ok()
+            .map(|skel| {
+                let bone_names: Vec<String> = skel.asset.skeleton.bones.iter().map(|b| b.name.clone()).collect();
+                let bone_parents: Vec<i32> = skel.asset.skeleton.hierarchy.clone();
+                let clips: Vec<ClipInfo> = skel.asset.clips.iter().map(|c| ClipInfo {
+                    name: c.name.clone(),
+                    duration: c.duration,
+                }).collect();
+                SkeletonInspector {
+                    path: skel.path.to_string_lossy().into_owned(),
+                    bone_names,
+                    bone_parents,
+                    clips,
+                }
+            });
+
         Some(InspectorSnapshot {
             entity_name: name,
             entity_id: format!("{}", self.get_entity_uuid(selected).as_simple()),
@@ -3160,6 +3388,7 @@ impl EngineState {
             scale: scl,
             components,
             material_usage,
+            skeleton,
         })
     }
 
@@ -3462,6 +3691,70 @@ impl EngineState {
             }
         }
         stem
+    }
+
+    /// If a sibling `.rkskel` exists alongside the `.rkp` path, load it
+    /// into the animation cache and attach `Skeleton` + a default
+    /// paused `AnimationPlayer` to the entity. Missing sidecar is not
+    /// an error — static meshes are expected.
+    fn try_attach_skeleton(&mut self, entity: hecs::Entity, rkp_path: &std::path::Path) {
+        let rkskel_path = rkp_path.with_extension("rkskel");
+        if !rkskel_path.exists() {
+            return;
+        }
+        match self.animation_cache.get_or_load(&rkskel_path) {
+            Ok(asset) => {
+                // Skeleton is transient — always attach/replace with the
+                // freshly-loaded asset so the `current_pose` matches the
+                // current bone count.
+                //
+                // Fold the grid-frame offset into the skeleton's
+                // glTF→local transform: `rest_bone_aabbs` and the
+                // scatter's `rest_pos` live in grid frame (octree
+                // corner at 0, range [0, extent]), so the pose
+                // produced by `animation::tick` must operate on grid-
+                // frame positions too. The offset is
+                // `half_extent = base_voxel_size × 2^depth / 2`,
+                // available from the entity's spatial data (present
+                // because `LoadAsset` populated `Renderable` before
+                // this function runs).
+                let grid_offset = self.world
+                    .get::<&crate::components::Renderable>(entity)
+                    .ok()
+                    .and_then(|r| r.spatial.as_ref().map(|s| {
+                        let he = 0.5 * s.base_voxel_size * (1u32 << s.depth) as f32;
+                        glam::Vec3::splat(he)
+                    }))
+                    .unwrap_or(glam::Vec3::ZERO);
+                let skeleton = crate::animation::skeleton_component(
+                    asset.clone(), rkskel_path.clone(), grid_offset,
+                );
+                if let Err(e) = self.world.insert_one(entity, skeleton) {
+                    eprintln!("[RkpEngine] attach Skeleton: world.insert_one failed: {e}");
+                    return;
+                }
+                // Only attach a default `AnimationPlayer` if the entity
+                // doesn't already have one — scene load may have
+                // deserialized a persisted player with user-chosen clip
+                // / time / loop mode.
+                let has_player = self.world.get::<&crate::components::AnimationPlayer>(entity).is_ok();
+                if !has_player {
+                    let player = crate::animation::default_player(&asset);
+                    if let Err(e) = self.world.insert_one(entity, player) {
+                        eprintln!("[RkpEngine] attach AnimationPlayer: world.insert_one failed: {e}");
+                    }
+                }
+                eprintln!(
+                    "[RkpEngine] attached skeleton ({} bones, {} clips) from {}",
+                    asset.skeleton.bones.len(),
+                    asset.clips.len(),
+                    rkskel_path.display(),
+                );
+            }
+            Err(e) => {
+                self.console.warn(format!("load .rkskel failed: {e}"));
+            }
+        }
     }
 
     /// Get or assign a stable scene object ID for face emission.
@@ -3812,6 +4105,22 @@ impl EngineState {
     fn update_scene_gpu(&mut self) {
         use crate::components::*;
 
+        // Re-pack every skinned entity's current pose into the scene
+        // bone buffer. Empty when no animated entities are loaded.
+        self.bone_matrix_allocator.rebuild(&self.world);
+        // Wipe last frame's scatter plan — rebuilt below per skinned
+        // entity. Bone-field cells are u64s of offset; cells × 8 B =
+        // total bone-field bytes.
+        self.skin_dispatches.clear();
+        let mut running_bone_field_cells: u32 = 0;
+        let mut running_bone_field_occ_u32s: u32 = 0;
+
+        // Pose cache for the scatter-skip check. Built in lock-step
+        // with the planning loop and swapped with `last_skin_poses`
+        // at the end of this function. Equal maps → skip scatter.
+        let mut this_frame_poses: std::collections::HashMap<hecs::Entity, Vec<glam::Mat4>>
+            = std::collections::HashMap::new();
+
         self.gpu_objects.clear();
         self.gpu_to_entity.clear();
         self.entity_to_gpu.clear();
@@ -3830,12 +4139,75 @@ impl EngineState {
                     transform.position,
                 );
                 let gpu_idx = self.gpu_objects.len() as u32;
-                let spatial_handle = rkf_core::scene_node::SpatialHandle::Octree {
+                let spatial_handle = rkp_core::scene_node::SpatialHandle::Octree {
                     root_offset: spatial.root_offset,
                     len: spatial.len,
                     depth: spatial.depth,
                     base_voxel_size: spatial.base_voxel_size,
                 };
+                let mut skinning = self.bone_matrix_allocator.binding(entity);
+                // Plan the skin-deform scatter for this entity if it's
+                // animated AND the asset has baked skinning metadata.
+                if self.skinning_enabled {
+                    if let (Some(bind), Some(handle)) = (skinning, renderable.asset_handle) {
+                        if let (Some(skel), Some(skin_data)) = (
+                            self.world.get::<&crate::components::Skeleton>(entity).ok(),
+                            self.scene_mgr.lock().unwrap().skinning_data(handle).cloned(),
+                        ) {
+                            if let Some(plan) = crate::scene_sync::plan_skin_dispatch(
+                                bind.bone_buffer_offset,
+                                bind.bone_count,
+                                &skel.current_pose,
+                                &skin_data,
+                                spatial.voxel_size,
+                                &mut running_bone_field_cells,
+                                &mut running_bone_field_occ_u32s,
+                                if self.dqs_enabled { 1 } else { 0 },
+                                bind.bone_dq_offset,
+                            ) {
+                                // Copy the plan's bone-field geometry
+                                // into the SkinnedBinding so the GPU
+                                // object carries the same coords the
+                                // scatter wrote to. Without this the
+                                // march would descend a bone field
+                                // sized in one frame and origin'd from
+                                // another.
+                                skinning = Some(crate::scene_sync::SkinnedBinding {
+                                    bone_count: bind.bone_count,
+                                    bone_buffer_offset: bind.bone_buffer_offset,
+                                    bone_field_offset: plan.uniforms.bone_field_offset,
+                                    bone_field_dims: [
+                                        plan.uniforms.bone_field_dim_x,
+                                        plan.uniforms.bone_field_dim_y,
+                                        plan.uniforms.bone_field_dim_z,
+                                    ],
+                                    bone_field_origin: [
+                                        plan.uniforms.grid_origin_x,
+                                        plan.uniforms.grid_origin_y,
+                                        plan.uniforms.grid_origin_z,
+                                    ],
+                                    bone_field_occ_offset: plan.uniforms.bone_field_occ_offset,
+                                    bone_dq_offset: bind.bone_dq_offset,
+                                });
+                                self.skin_dispatches.push(plan);
+                                // Cache this entity's pose for the
+                                // scatter-skip check at the end of the
+                                // function. Only records entities that
+                                // made it to a plan — a plan bail
+                                // below treats this entity as "not
+                                // animated this frame", same as last
+                                // frame's cache if it was also missing.
+                                this_frame_poses.insert(entity, skel.current_pose.clone());
+                            } else {
+                                // Plan bailed (no extent, or dims > cap).
+                                // Leave skinning = None so march falls
+                                // back to the rigid path for this
+                                // entity.
+                                skinning = None;
+                            }
+                        }
+                    }
+                }
                 let mut gpu_obj = crate::scene_sync::build_gpu_object(
                     &world_matrix,
                     &spatial.aabb,
@@ -3844,6 +4216,7 @@ impl EngineState {
                     spatial.voxel_size,
                     renderable.material_id,
                     gpu_idx,
+                    skinning,
                 );
                 // Render-layer mask — entity opt-in via RenderLayer
                 // component, otherwise the system DEFAULT bit.
@@ -3859,6 +4232,54 @@ impl EngineState {
                 self.gpu_to_entity.push(entity);
                 self.gpu_objects.push(gpu_obj);
             }
+        }
+
+        // Each bone-field cell is a `vec2<u32>` (packed bone indices +
+        // weights) = 8 bytes. Used by the render loop to size the
+        // scene's bone_field_buffer before the scatter dispatch.
+        self.skin_bone_field_bytes = (running_bone_field_cells as u64).saturating_mul(8);
+        self.skin_bone_field_occ_bytes = (running_bone_field_occ_u32s as u64).saturating_mul(4);
+
+        // Pause-aware scatter skip: if the set of skinned entities and
+        // their per-bone matrices are byte-identical to last frame,
+        // the `bone_field` buffer still holds valid data — render loop
+        // skips both the clear and the scatter dispatch. Big win when
+        // the user pauses the animation to inspect a frame.
+        //
+        // Empty-to-empty doesn't count as a reuse opportunity: there
+        // was nothing to clear last frame either, so the render loop
+        // already skips via `skin_dispatches.is_empty()`.
+        self.skin_reuse = !this_frame_poses.is_empty()
+            && this_frame_poses == self.last_skin_poses;
+        self.last_skin_poses = this_frame_poses;
+
+        // One-second heartbeat so we can tell whether the GPU object
+        // the march shader sees actually carries skinning fields.
+        // Diagnoses: "scatter dispatched but march renders rigid" —
+        // if `is_skinned=1 count < skin_dispatches.len()` or
+        // `dim_x>0 count < dispatches`, the GPU object didn't get
+        // populated even though the plan succeeded.
+        if self.frame_index % 60 == 0 && !self.skin_dispatches.is_empty() {
+            let (mut skinned, mut with_dims) = (0u32, 0u32);
+            let mut first_dims = [0u32; 3];
+            for obj in &self.gpu_objects {
+                if obj.is_skinned != 0 { skinned += 1; }
+                if obj.bone_field_dim_x > 0 {
+                    if with_dims == 0 {
+                        first_dims = [obj.bone_field_dim_x, obj.bone_field_dim_y, obj.bone_field_dim_z];
+                    }
+                    with_dims += 1;
+                }
+            }
+            eprintln!(
+                "[skin] plans={} gpu_objs={} is_skinned={} with_dims={} first_dims={:?} bone_field_bytes={}",
+                self.skin_dispatches.len(),
+                self.gpu_objects.len(),
+                skinned,
+                with_dims,
+                first_dims,
+                self.skin_bone_field_bytes,
+            );
         }
     }
 
@@ -3901,6 +4322,12 @@ impl EngineState {
                             .unwrap_or_default()
                     });
 
+                // Read just the header to surface the voxel count in
+                // the Asset Properties panel. Header is the first
+                // bytes of the file — one small seek per asset during
+                // the scan, negligible vs the full .rkp load.
+                let voxel_count = read_rkp_voxel_count(&path).unwrap_or(0);
+
                 out.push(crate::snapshot::ModelInfo {
                     name,
                     path: rkp_path,
@@ -3908,6 +4335,7 @@ impl EngineState {
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default(),
                     size,
+                    voxel_count,
                     import_profile: profile,
                 });
             }
@@ -4126,10 +4554,10 @@ impl EngineState {
                         }
                     } else if let Some(ref prim_name) = obj.primitive {
                         let primitive = match prim_name.as_str() {
-                            "box" => rkf_core::scene_node::SdfPrimitive::Box {
+                            "box" => rkp_core::scene_node::SdfPrimitive::Box {
                                 half_extents: glam::Vec3::from_array(obj.scale) * 0.5,
                             },
-                            "sphere" => rkf_core::scene_node::SdfPrimitive::Sphere {
+                            "sphere" => rkp_core::scene_node::SdfPrimitive::Sphere {
                                 radius: obj.scale[0] * 0.5,
                             },
                             _ => continue,
@@ -4192,12 +4620,20 @@ impl EngineState {
                 }
 
                 // Third pass: restore generic components via registry.
+                // Skeleton is deferred to a fourth pass because it
+                // depends on sibling `.rkskel` discovery off the
+                // Renderable's asset path, and on `AnimationPlayer`
+                // already being in place so `try_attach_skeleton`
+                // doesn't overwrite the restored playback state.
                 for obj in &scene.objects {
                     if obj.components.is_empty() {
                         continue;
                     }
                     let Some(&entity) = uuid_to_hecs.get(&obj.id) else { continue };
                     for (comp_name, json) in &obj.components {
+                        if comp_name == "Skeleton" {
+                            continue; // handled in the fourth pass below
+                        }
                         if let Some(entry) = self.registry.get(comp_name) {
                             if let Err(e) = (entry.deserialize_insert)(&mut self.world, entity, json) {
                                 self.console.warn(format!(
@@ -4212,6 +4648,29 @@ impl EngineState {
                             ));
                         }
                     }
+                }
+
+                // Fourth pass: re-attach Skeleton (+ bundled
+                // AnimationPlayer, preserving the restored-from-disk
+                // player state). Uses the same engine-side helper the
+                // AddComponent command routes through, so the asset
+                // cache + grid-offset derivation stay in one place.
+                for obj in &scene.objects {
+                    if !obj.components.iter().any(|(n, _)| n == "Skeleton") {
+                        continue;
+                    }
+                    let Some(&entity) = uuid_to_hecs.get(&obj.id) else { continue };
+                    let Some(ref asset_path) = obj.asset_path else {
+                        self.console.warn(format!(
+                            "Restore Skeleton on '{}': no Renderable asset — skipped",
+                            obj.name,
+                        ));
+                        continue;
+                    };
+                    let full_path = self.project_dir.as_ref()
+                        .map(|d| d.join("assets").join(asset_path))
+                        .unwrap_or_else(|| std::path::PathBuf::from(asset_path));
+                    self.try_attach_skeleton(entity, &full_path);
                 }
 
                 self.scene_dirty = true;
@@ -4317,7 +4776,7 @@ impl EngineState {
 
         let (ray_o, ray_d) = self.screen_to_ray(self.mouse_pos.x, self.mouse_pos.y);
 
-        let left_pressed = self.input_system.raw_state().is_mouse_button_pressed(rkf_runtime::input::InputMouseButton::Left);
+        let left_pressed = self.input_system.raw_state().is_mouse_button_pressed(rkp_runtime::input::InputMouseButton::Left);
 
         if self.gizmo.dragging {
             // Update drag.
@@ -4449,7 +4908,95 @@ impl EngineState {
         }
     }
 
-    fn build_gizmo_wireframe(&self) -> Vec<rkf_render::LineVertex> {
+    /// Emit one line segment per parent→child bone pair for each
+    /// animated entity. The skinning palette already encodes
+    /// `current_world * inverse_bind`, so premultiplying by the
+    /// bone's bind-pose local origin cancels the inverse-bind and
+    /// gives us the animated world origin directly. Cheap (one mat4
+    /// × vec3 per bone) and stateless — runs in the same pass as
+    /// selection/light gizmos.
+    fn build_bone_wireframes(&self) -> Vec<rkp_render::LineVertex> {
+        use glam::{Mat4, Vec3, Vec4};
+        let mut verts = Vec::new();
+        let bright = [0.5, 0.9, 1.0, 1.0];
+        // Bones are editor chrome for the currently-selected rig.
+        // Play mode has no selection (selection is an edit-mode
+        // concept), and non-selected entities clutter the viewport
+        // when multiple animated characters are on screen — so we
+        // draw bones for the selected entity only.
+        let Some(selected) = self.selected_entity else { return verts };
+        let query_result = self.world.query_one::<(&crate::components::Transform, &crate::components::Skeleton)>(selected);
+        let Ok(mut query) = query_result else { return verts };
+        let Some((transform, skeleton)) = query.get() else { return verts };
+        {
+            let color = bright;
+
+            // Entity's root world transform (same one the renderer uses
+            // for this entity). Bone origins are in object-local space;
+            // multiply by this to lift them into world space.
+            let root_world = Mat4::from_scale_rotation_translation(
+                transform.scale,
+                glam::Quat::from_euler(
+                    glam::EulerRot::XYZ,
+                    transform.rotation.x.to_radians(),
+                    transform.rotation.y.to_radians(),
+                    transform.rotation.z.to_radians(),
+                ),
+                transform.position,
+            );
+
+            let bones = &skeleton.asset.skeleton;
+            let pose = &skeleton.current_pose;
+            let bind_origins = &skeleton.bind_world_origins;
+            // Defensive: if evaluate() hasn't run yet (pose is all
+            // identity) or the pose is the wrong size, fall back to
+            // bind-pose origins so the bones still render at rest.
+            let use_pose = pose.len() == bones.bones.len();
+            // `current_pose` + `bind_world_origins` are in grid frame
+            // (origin at octree corner). Undo the grid offset before
+            // handing the position to `root_world`, which expects
+            // mesh-frame (origin at object centre).
+            let grid_offset = skeleton.grid_offset;
+
+            let animated_origin = |i: usize| -> Vec3 {
+                let bind = bind_origins.get(i).copied().unwrap_or(Vec3::ZERO);
+                let animated_grid = if use_pose {
+                    let p = Vec4::new(bind.x, bind.y, bind.z, 1.0);
+                    let v = pose[i] * p;
+                    Vec3::new(v.x, v.y, v.z)
+                } else {
+                    bind
+                };
+                let animated_mesh = animated_grid - grid_offset;
+                root_world.transform_point3(animated_mesh)
+            };
+
+            // Parent→child line per bone. Root bones get a tiny
+            // crosshair so isolated roots (skeleton with 1 bone, or
+            // detached rigs) still render something.
+            for (i, &parent) in bones.hierarchy.iter().enumerate() {
+                let child = animated_origin(i);
+                if parent >= 0 && (parent as usize) < bones.bones.len() {
+                    let parent_pos = animated_origin(parent as usize);
+                    verts.push(rkp_render::LineVertex {
+                        position: parent_pos.to_array(),
+                        color,
+                    });
+                    verts.push(rkp_render::LineVertex {
+                        position: child.to_array(),
+                        color,
+                    });
+                } else {
+                    // Root bone — little crosshair so it's visible even
+                    // with no child.
+                    verts.extend(rkp_render::wireframe::crosshair(child, 0.05, color));
+                }
+            }
+        }
+        verts
+    }
+
+    fn build_gizmo_wireframe(&self) -> Vec<rkp_render::LineVertex> {
         let mut verts = Vec::new();
 
         // Light gizmos — always visible for all light entities.
@@ -4460,10 +5007,10 @@ impl EngineState {
             let selected = self.selected_entity == Some(entity);
             // Always show crosshair icon.
             let icon_color = if selected { selected_light_color } else { light_color };
-            verts.extend(rkf_render::wireframe::crosshair(transform.position, 0.2, icon_color));
+            verts.extend(rkp_render::wireframe::crosshair(transform.position, 0.2, icon_color));
             // Range sphere only when selected.
             if selected {
-                verts.extend(rkf_render::wireframe::point_light_wireframe(
+                verts.extend(rkp_render::wireframe::point_light_wireframe(
                     transform.position, pl.range, selected_light_color,
                 ));
             }
@@ -4472,10 +5019,10 @@ impl EngineState {
         for (entity, (transform, sl)) in self.world.query::<(&crate::components::Transform, &crate::components::SpotLight)>().iter() {
             let selected = self.selected_entity == Some(entity);
             let icon_color = if selected { selected_light_color } else { light_color };
-            verts.extend(rkf_render::wireframe::crosshair(transform.position, 0.2, icon_color));
+            verts.extend(rkp_render::wireframe::crosshair(transform.position, 0.2, icon_color));
             // Cone only when selected.
             if selected {
-                verts.extend(rkf_render::wireframe::spot_light_wireframe(
+                verts.extend(rkp_render::wireframe::spot_light_wireframe(
                     transform.position, sl.direction, sl.range, sl.outer_angle.to_radians(), selected_light_color,
                 ));
             }
@@ -4485,6 +5032,12 @@ impl EngineState {
         if self.show_colliders {
             verts.extend(self.build_collider_wireframes());
         }
+
+        // Bone gizmo — one set of line segments per skinned entity,
+        // drawn from animated bone origins. Selected entity gets a
+        // brighter palette so it pops against a scene with multiple
+        // animated characters.
+        verts.extend(self.build_bone_wireframes());
 
         // Transform gizmo — only for the selected entity.
         let Some(selected) = self.selected_entity else {
@@ -4757,7 +5310,7 @@ impl EngineState {
     fn build_procedural_gizmo_wireframe(
         &self,
         cam_pos: glam::Vec3,
-    ) -> Vec<rkf_render::LineVertex> {
+    ) -> Vec<rkp_render::LineVertex> {
         let node_id = match self.selected_procedural_node {
             Some(id) => id,
             None => return Vec::new(),
@@ -4873,7 +5426,7 @@ impl EngineState {
             }
 
             let (resolved_shape, voxel_coords, voxel_size) = match rb.collider_shape {
-                rkf_physics::rigid_body::ColliderShape::Auto => {
+                rkp_physics::rigid_body::ColliderShape::Auto => {
                     if let Some(ref sp) = spatial {
                         let (coords, cell_size) = crate::play_mode::build_coarse_collider(
                             all_nodes,
@@ -4884,12 +5437,12 @@ impl EngineState {
                             rb.collider_cell_size,
                         );
                         if coords.is_empty() {
-                            (rkf_physics::rigid_body::ColliderShape::Box, Vec::new(), 0.0)
+                            (rkp_physics::rigid_body::ColliderShape::Box, Vec::new(), 0.0)
                         } else {
-                            (rkf_physics::rigid_body::ColliderShape::Auto, coords, cell_size)
+                            (rkp_physics::rigid_body::ColliderShape::Auto, coords, cell_size)
                         }
                     } else {
-                        (rkf_physics::rigid_body::ColliderShape::Box, Vec::new(), 0.0)
+                        (rkp_physics::rigid_body::ColliderShape::Box, Vec::new(), 0.0)
                     }
                 }
                 other => (other.clone(), Vec::new(), 0.0),
@@ -4922,8 +5475,8 @@ impl EngineState {
     }
 
     /// Build wireframe visualization for all physics colliders from cached data.
-    fn build_collider_wireframes(&self) -> Vec<rkf_render::LineVertex> {
-        use rkf_physics::rigid_body::{BodyType, ColliderShape};
+    fn build_collider_wireframes(&self) -> Vec<rkp_render::LineVertex> {
+        use rkp_physics::rigid_body::{BodyType, ColliderShape};
         let mut verts = Vec::new();
 
         for (_entity, (transform, rb, cache)) in self.world.query::<(
@@ -4941,23 +5494,23 @@ impl EngineState {
                 ColliderShape::Box => {
                     let min = transform.position - cache.aabb_half;
                     let max = transform.position + cache.aabb_half;
-                    verts.extend(rkf_render::wireframe::aabb_wireframe(min, max, color));
+                    verts.extend(rkp_render::wireframe::aabb_wireframe(min, max, color));
                 }
                 ColliderShape::Sphere => {
                     let r = cache.aabb_half.max_element();
-                    verts.extend(rkf_render::wireframe::sphere_wireframe(transform.position, r, color));
+                    verts.extend(rkp_render::wireframe::sphere_wireframe(transform.position, r, color));
                 }
                 ColliderShape::Capsule => {
                     let r = cache.aabb_half.x.max(cache.aabb_half.z).max(0.01);
                     let hh = (cache.aabb_half.y - r).max(0.01);
                     let top = transform.position + glam::Vec3::new(0.0, hh, 0.0);
                     let bot = transform.position - glam::Vec3::new(0.0, hh, 0.0);
-                    verts.extend(rkf_render::wireframe::sphere_wireframe(top, r, color));
-                    verts.extend(rkf_render::wireframe::sphere_wireframe(bot, r, color));
+                    verts.extend(rkp_render::wireframe::sphere_wireframe(top, r, color));
+                    verts.extend(rkp_render::wireframe::sphere_wireframe(bot, r, color));
                     for angle in [0.0f32, std::f32::consts::FRAC_PI_2, std::f32::consts::PI, 3.0 * std::f32::consts::FRAC_PI_2] {
                         let offset = glam::Vec3::new(angle.cos() * r, 0.0, angle.sin() * r);
-                        verts.push(rkf_render::LineVertex { position: (top + offset).to_array(), color });
-                        verts.push(rkf_render::LineVertex { position: (bot + offset).to_array(), color });
+                        verts.push(rkp_render::LineVertex { position: (top + offset).to_array(), color });
+                        verts.push(rkp_render::LineVertex { position: (bot + offset).to_array(), color });
                     }
                 }
                 ColliderShape::Auto => {
@@ -4980,12 +5533,12 @@ impl EngineState {
                             );
                             let world_min = transform.position + offset + local_min * transform.scale;
                             let world_max = transform.position + offset + local_max * transform.scale;
-                            verts.extend(rkf_render::wireframe::aabb_wireframe(world_min, world_max, color));
+                            verts.extend(rkp_render::wireframe::aabb_wireframe(world_min, world_max, color));
                         }
                     } else {
                         let min = transform.position - cache.aabb_half;
                         let max = transform.position + cache.aabb_half;
-                        verts.extend(rkf_render::wireframe::aabb_wireframe(min, max, color));
+                        verts.extend(rkp_render::wireframe::aabb_wireframe(min, max, color));
                     }
                 }
             }
@@ -5200,6 +5753,18 @@ impl EngineState {
             None
         };
 
+        // Ride the same `project_dirty` flag — project_dir changes
+        // exactly when project_loaded / project_name do.
+        let project_dir = if project.is_some() {
+            Some(
+                self.project_dir
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+            )
+        } else {
+            None
+        };
+
         let models = if self.models_dirty {
             self.models_dirty = false;
             Some(self.available_models.clone())
@@ -5236,6 +5801,7 @@ impl EngineState {
             objects,
             project_loaded: project,
             project_name,
+            project_dir,
             available_models: models,
             importing_models: importing,
             import_progress,
@@ -5532,7 +6098,7 @@ fn decompose_affine_rotation(t: &glam::Affine3A) -> glam::Quat {
     glam::Quat::from_mat3(&rot_mat)
 }
 
-fn procedural_voxel_params(tree: &rkp_procedural::ProceduralObject, base_voxel_size: f32) -> (rkf_core::Aabb, f32) {
+fn procedural_voxel_params(tree: &rkp_procedural::ProceduralObject, base_voxel_size: f32) -> (rkp_core::Aabb, f32) {
     let tight = rkp_procedural::compute_bounds(tree);
 
     // Add margin for boundary sampling (same approach as voxelize_primitive).
@@ -5541,7 +6107,7 @@ fn procedural_voxel_params(tree: &rkp_procedural::ProceduralObject, base_voxel_s
     // `local_origin + extent/2`), so we can return a tight AABB here
     // without wasting voxel budget on symmetric padding around the origin.
     let margin = base_voxel_size * 8.0 * 1.8 + base_voxel_size;
-    let aabb = rkf_core::Aabb {
+    let aabb = rkp_core::Aabb {
         min: tight.min - glam::Vec3::splat(margin),
         max: tight.max + glam::Vec3::splat(margin),
     };
@@ -5910,6 +6476,14 @@ fn tick_loop(
             }
         }
 
+        // 1d. Advance skeletal animations. Runs every frame in both edit
+        // and play modes so animated characters preview correctly in the
+        // editor. Uses the same fixed 60 Hz step as gameplay for now.
+        let anim_dt = 1.0 / 60.0;
+        if crate::animation::tick(&mut state.world, anim_dt) {
+            state.gpu_objects_dirty = true;
+        }
+
         // 2. Update input system + camera.
         let dt = 1.0 / 60.0; // TODO: use actual delta time
         state.input_system.evaluate();
@@ -5981,4 +6555,15 @@ fn aabb_in_frustum(planes: &[glam::Vec4; 6], center: glam::Vec3, half: glam::Vec
         }
     }
     true
+}
+
+/// Read just the voxel count from a `.rkp` header. Opens the file,
+/// parses the header (cheap — header carries `voxel_count` directly
+/// near the start), then drops the reader. None on any I/O or format
+/// error; callers fall back to 0 (unknown).
+fn read_rkp_voxel_count(path: &std::path::Path) -> Option<u32> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let header = rkp_core::asset_file::read_rkp_header(&mut reader).ok()?;
+    Some(header.voxel_count)
 }

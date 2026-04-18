@@ -13,18 +13,18 @@ use super::viewport_toolbar::{ViewportHeaderBar, EditModeToolbar};
 /// a UI panel; the build viewport gets its own component in Phase 6.
 const PANEL_VIEWPORT: ViewportId = ViewportId::MAIN;
 
-/// Map rinch SurfaceMouseButton to rkf_runtime InputMouseButton.
-fn map_button(btn: SurfaceMouseButton) -> rkf_runtime::input::InputMouseButton {
+/// Map rinch SurfaceMouseButton to rkp_runtime InputMouseButton.
+fn map_button(btn: SurfaceMouseButton) -> rkp_runtime::input::InputMouseButton {
     match btn {
-        SurfaceMouseButton::Left => rkf_runtime::input::InputMouseButton::Left,
-        SurfaceMouseButton::Right => rkf_runtime::input::InputMouseButton::Right,
-        SurfaceMouseButton::Middle => rkf_runtime::input::InputMouseButton::Middle,
+        SurfaceMouseButton::Left => rkp_runtime::input::InputMouseButton::Left,
+        SurfaceMouseButton::Right => rkp_runtime::input::InputMouseButton::Right,
+        SurfaceMouseButton::Middle => rkp_runtime::input::InputMouseButton::Middle,
     }
 }
 
 /// Map a rinch key code string to InputKeyCode.
-fn map_key(code: &str) -> Option<rkf_runtime::input::InputKeyCode> {
-    use rkf_runtime::input::InputKeyCode::*;
+fn map_key(code: &str) -> Option<rkp_runtime::input::InputKeyCode> {
+    use rkp_runtime::input::InputKeyCode::*;
     Some(match code {
         "KeyA" => A, "KeyB" => B, "KeyC" => C, "KeyD" => D,
         "KeyE" => E, "KeyF" => F, "KeyG" => G, "KeyH" => H,

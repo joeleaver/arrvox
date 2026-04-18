@@ -24,9 +24,11 @@ pub struct ImportCompletion {
 }
 
 /// A progress event tagged with the source path it belongs to, so
-/// the engine can multiplex events from multiple concurrent imports
-/// (currently the worker only runs one at a time, but the tagging
-/// keeps that option open).
+/// the engine can multiplex events from multiple concurrent imports.
+/// Each import runs on its own dedicated thread (see
+/// [`ImportWorker::new`]), so events from different sources interleave
+/// freely on `event_rx`; the source_path is how the engine sorts them
+/// into the right `ImportProgressInfo` entry.
 pub struct TaggedEvent {
     pub source_path: PathBuf,
     pub event: ImportEvent,
@@ -67,71 +69,47 @@ impl ProgressReporter for MpscReporter {
 }
 
 impl ImportWorker {
-    /// Create and start the import worker thread.
+    /// Create and start the import worker.
+    ///
+    /// Architecture: one long-lived *dispatcher* thread owns
+    /// `request_rx` and spawns a fresh per-import worker thread for
+    /// every request. Imports therefore run concurrently — clicking
+    /// Re-import on two different assets starts two parallel jobs,
+    /// each streaming its own events through `event_tx` tagged by
+    /// source_path. Internally each import still parallelises via
+    /// rayon; the per-import thread just hosts that work and
+    /// forwards progress.
     pub fn new() -> Self {
         let (request_tx, request_rx) = mpsc::channel::<ImportRequest>();
         let (result_tx, result_rx) = mpsc::channel::<ImportCompletion>();
         let (event_tx, event_rx) = mpsc::channel::<TaggedEvent>();
 
         std::thread::Builder::new()
-            .name("rkp-import".into())
+            .name("rkp-import-dispatch".into())
             .spawn(move || {
                 while let Ok(req) = request_rx.recv() {
-                    eprintln!(
-                        "[ImportWorker] importing {} → {}",
-                        req.source_path.display(),
-                        req.output_path.display(),
+                    let result_tx = result_tx.clone();
+                    let event_tx = event_tx.clone();
+                    // Per-import thread name helps panics / perf
+                    // profiles tell concurrent imports apart. The
+                    // thread is detached — we don't need to join it,
+                    // its completion arrives on `result_rx`.
+                    let thread_name = format!(
+                        "rkp-import:{}",
+                        req.source_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "unknown".into())
                     );
-                    let source = req.source_path.clone();
-                    let output = req.output_path.clone();
-                    let config = req.config.clone();
-                    let reporter = MpscReporter {
-                        source: source.clone(),
-                        tx: event_tx.clone(),
-                    };
-                    // Panic catch keeps the worker alive across a
-                    // malformed-input crash so the UI always gets a
-                    // completion instead of a stuck spinner.
-                    let result = std::panic::catch_unwind(
-                        std::panic::AssertUnwindSafe(|| {
-                            rkp_import::import_mesh_to_opacity_rkp_with(
-                                &source,
-                                &output,
-                                &config,
-                                &reporter,
-                            )
-                        }),
-                    );
-                    // Flatten the typed `ImportError` to a `String`
-                    // for `ImportCompletion` — the UI doesn't
-                    // distinguish error variants, just shows the
-                    // message. Callers that want structure can
-                    // import `rkp_import::ImportError` directly.
-                    let result: Result<ImportResult, String> = match result {
-                        Ok(Ok(r)) => Ok(r),
-                        Ok(Err(e)) => Err(e.to_string()),
-                        Err(payload) => {
-                            let msg = panic_message(&payload);
-                            eprintln!("[ImportWorker] panic: {msg}");
-                            Err(format!("importer panicked: {msg}"))
-                        }
-                    };
-                    match &result {
-                        Ok(r) => eprintln!(
-                            "[ImportWorker] done: {} voxels, {:.1} KB",
-                            r.shell_voxels,
-                            r.file_size as f64 / 1024.0,
-                        ),
-                        Err(e) => eprintln!("[ImportWorker] failed: {e}"),
+                    if let Err(e) = std::thread::Builder::new()
+                        .name(thread_name)
+                        .spawn(move || run_import(req, result_tx, event_tx))
+                    {
+                        eprintln!("[ImportWorker] failed to spawn import thread: {e}");
                     }
-                    let _ = result_tx.send(ImportCompletion {
-                        source_path: req.source_path,
-                        output_path: req.output_path,
-                        result,
-                    });
                 }
             })
-            .expect("failed to spawn import worker");
+            .expect("failed to spawn import dispatcher");
 
         Self { request_tx, result_rx, event_rx }
     }
@@ -160,6 +138,61 @@ impl ImportWorker {
         }
         events
     }
+}
+
+/// Run a single import end-to-end. Invoked on a dedicated
+/// per-import thread spawned by the dispatcher in [`ImportWorker::new`].
+/// All failures (including panics) are reported via `result_tx` so the
+/// UI always gets a completion instead of a stuck spinner.
+fn run_import(
+    req: ImportRequest,
+    result_tx: mpsc::Sender<ImportCompletion>,
+    event_tx: mpsc::Sender<TaggedEvent>,
+) {
+    eprintln!(
+        "[ImportWorker] importing {} → {}",
+        req.source_path.display(),
+        req.output_path.display(),
+    );
+    let source = req.source_path.clone();
+    let output = req.output_path.clone();
+    let config = req.config.clone();
+    let reporter = MpscReporter {
+        source: source.clone(),
+        tx: event_tx,
+    };
+    // Panic catch keeps the worker alive across a malformed-input
+    // crash so the UI always gets a completion instead of a stuck
+    // spinner.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rkp_import::import_mesh_to_opacity_rkp_with(&source, &output, &config, &reporter)
+    }));
+    // Flatten the typed `ImportError` to a `String` for
+    // `ImportCompletion` — the UI doesn't distinguish error variants,
+    // just shows the message. Callers that want structure can import
+    // `rkp_import::ImportError` directly.
+    let result: Result<ImportResult, String> = match result {
+        Ok(Ok(r)) => Ok(r),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(payload) => {
+            let msg = panic_message(&payload);
+            eprintln!("[ImportWorker] panic: {msg}");
+            Err(format!("importer panicked: {msg}"))
+        }
+    };
+    match &result {
+        Ok(r) => eprintln!(
+            "[ImportWorker] done: {} voxels, {:.1} KB",
+            r.shell_voxels,
+            r.file_size as f64 / 1024.0,
+        ),
+        Err(e) => eprintln!("[ImportWorker] failed: {e}"),
+    }
+    let _ = result_tx.send(ImportCompletion {
+        source_path: req.source_path,
+        output_path: req.output_path,
+        result,
+    });
 }
 
 /// Build a default ImportConfig for a mesh file.

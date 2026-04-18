@@ -15,13 +15,16 @@ const BETA_M_EXT: vec3<f32> = vec3<f32>(4.44e-6, 4.44e-6, 4.44e-6);
 const BETA_OZONE: vec3<f32> = vec3<f32>(0.650e-6, 1.881e-6, 0.085e-6);
 const MIE_G: f32 = 0.8;
 
+// Layout shared with the CPU-side AtmosphereFrameParams. The three scalars
+// after camera_altitude sit at unaligned offset 20; WGSL can't put a vec3 there
+// (align 16), so keep the albedo as three f32s and recombine in code.
 struct SkyViewParams {
     sun_dir: vec3<f32>,
     sun_intensity: f32,
     camera_altitude: f32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
+    ground_albedo_r: f32,
+    ground_albedo_g: f32,
+    ground_albedo_b: f32,
 }
 
 // --- Bindings ---
@@ -207,6 +210,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         throughput *= sample_transmittance;
         if all(throughput < vec3<f32>(0.001)) { break; }
+    }
+
+    // Ground radiance — below-horizon rays that intersect the Earth sphere get
+    // the light reflected at the hit point (direct sun + multi-scattered sky),
+    // attenuated by the view-ray transmittance. Without this, rays that look
+    // at the Earth surface return pure atmospheric in-scatter and appear as a
+    // dark band past the geometric horizon. Hillaire 2020 §5.5.
+    if earth_hit.x > 0.0 {
+        let p_ground = origin + world_ray * earth_hit.x;
+        let r_ground = length(p_ground);
+        let normal_ground = p_ground / r_ground;
+        let sun_cos_ground = dot(normal_ground, sun_dir);
+        let sun_trans_ground = lookup_transmittance(r_ground, sun_cos_ground);
+        let direct = sun_trans_ground * max(sun_cos_ground, 0.0) * params.sun_intensity;
+        let ambient = lookup_multiscatter(r_ground, sun_cos_ground) * params.sun_intensity;
+        let ground_albedo = vec3<f32>(
+            params.ground_albedo_r, params.ground_albedo_g, params.ground_albedo_b,
+        );
+        let ground_L = (ground_albedo / PI) * (direct + ambient);
+        scatter += throughput * ground_L;
     }
 
     textureStore(sky_view_out, vec2<i32>(gid.xy), vec4<f32>(scatter, 1.0));

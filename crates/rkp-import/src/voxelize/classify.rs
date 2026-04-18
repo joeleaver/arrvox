@@ -8,21 +8,24 @@
 //!
 //! Per-voxel sampling happens in [`process_brick`]: signed distance
 //! (unsigned distance × winding sign), nearest-triangle material,
-//! optional per-voxel albedo. Bone-weight sampling is deliberately
-//! NOT performed here — the `.rkp` v4 file format has no per-voxel
-//! bone slot yet, so the work would be discarded. Skeleton-level
-//! data still ships via the `.rkskel` sidecar.
+//! optional per-voxel albedo, and — when a skeleton is present — the
+//! 4-bone skinning influence interpolated from the nearest triangle's
+//! vertex weights (`sample_bone_weights_at_triangle`). The `.rkp` v4
+//! file format's optional bones section carries the result; the
+//! sidecar `.rkskel` still ships the bone hierarchy and clips.
 
 use glam::Vec3;
 
-use rkf_core::Aabb;
-use rkf_core::companion::{ColorBrick, ColorVoxel};
-use rkf_core::constants::BRICK_DIM;
+use rkp_core::Aabb;
+use rkp_core::companion::{BoneVoxel, ColorBrick, ColorVoxel};
+use rkp_core::constants::MESH_BRICK_DIM as BRICK_DIM;
 
 use crate::bvh::TriangleBvh;
 use crate::config::ImportConfig;
 use crate::mesh::MeshData;
+use crate::sample::bone_weights::sample_bone_weights_at_triangle;
 use crate::sample::texture::sample_texture_at_triangle;
+use crate::skeleton::VertexSkinning;
 
 /// Tier-based auto voxel-size picker. Chooses the coarsest tier that
 /// still resolves the longest axis with at least 8 bricks. Matches
@@ -82,6 +85,15 @@ pub struct BrickResult {
     /// (the shell candidates); stored as `0` for inside voxels where
     /// it's never read.
     pub face_normals: [u32; 512],
+    /// Per-voxel 4-bone skinning weight (top 4 bones by barycentric-
+    /// interpolated weight, u8-quantized summing to 255). Zero-filled
+    /// when no skeleton was supplied to [`process_brick`] — the
+    /// caller keys off [`Self::has_bones`] to decide whether to emit
+    /// the bones section at all.
+    pub bone_voxels: [BoneVoxel; 512],
+    /// `true` if a skeleton was supplied and at least one voxel in
+    /// this brick has non-zero bone weights.
+    pub has_bones: bool,
     /// `true` if *every* voxel in the brick is inside the mesh —
     /// triggers the surface-brick → interior-brick promotion in
     /// [`super::shell`] so we don't emit wasted empty shell data.
@@ -107,12 +119,15 @@ pub fn process_brick(
     brick_min: Vec3,
     voxel_size: f32,
     config: &ImportConfig,
+    skinning: Option<&VertexSkinning>,
 ) -> BrickResult {
     let half_voxel = voxel_size * 0.5;
     let mut color_brick = ColorBrick::default();
     let mut material_ids = [0u16; 512];
     let mut is_inside_buf = [false; 512];
     let mut face_normals = [0u32; 512];
+    let mut bone_voxels = [BoneVoxel::default(); 512];
+    let mut has_bones = false;
     let mut all_inside = true;
 
     for vz in 0..BRICK_DIM {
@@ -206,6 +221,29 @@ pub fn process_brick(
                         Vec3::Y
                     };
                     face_normals[flat] = rkp_core::leaf_attr::pack_oct(normal);
+
+                    // Bone weights — same nearest-triangle barycentric
+                    // as material / color / normal. Only computed for
+                    // shell candidates (inside voxels never emit leaf
+                    // slots, so their bone data would be discarded).
+                    if let Some(skin) = skinning {
+                        let bv = sample_bone_weights_at_triangle(
+                            mesh,
+                            skin,
+                            nearest.triangle_index,
+                            &nearest.barycentric,
+                        );
+                        // `sample_bone_weights_at_triangle` returns a
+                        // zero `BoneVoxel` when the triangle has no
+                        // skinning — treat that the same as "unskinned
+                        // voxel" and don't flag the brick as having
+                        // bones for it alone.
+                        let any_weight = (0..4).any(|i| bv.bone_weight(i) > 0);
+                        if any_weight {
+                            bone_voxels[flat] = bv;
+                            has_bones = true;
+                        }
+                    }
                 }
             }
         }
@@ -216,7 +254,100 @@ pub fn process_brick(
         material_ids,
         is_inside: is_inside_buf,
         face_normals,
+        bone_voxels,
+        has_bones,
         all_inside,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh::{ImportMaterial, MeshData};
+    use crate::skeleton::VertexSkinning;
+
+    /// Single triangle in z=0 plane — corners at (0,0,0)/(1,0,0)/(0,1,0).
+    /// Same vertex layout the other sampler tests in this crate use,
+    /// giving `process_brick` a predictable nearest-triangle to query.
+    fn triangle_mesh() -> MeshData {
+        MeshData {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            normals: vec![Vec3::Z; 3],
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            indices: vec![0, 1, 2],
+            material_indices: vec![0],
+            materials: vec![ImportMaterial::default()],
+            bounds_min: Vec3::ZERO,
+            bounds_max: Vec3::new(1.0, 1.0, 0.0),
+        }
+    }
+
+    fn two_bone_skinning() -> VertexSkinning {
+        VertexSkinning {
+            joints: vec![[0, -1, -1, -1], [1, -1, -1, -1], [1, -1, -1, -1]],
+            weights: vec![
+                [1.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+            ],
+        }
+    }
+
+    /// A brick covering the triangle's Voronoi region gets non-zero
+    /// bone weights at every shell voxel and both bones appear across
+    /// the brick (vertex 0 → bone 0 near (0,0); vertices 1,2 → bone 1
+    /// near (1,0)/(0,1)).
+    #[test]
+    fn process_brick_emits_bone_weights_when_skinning_provided() {
+        let mesh = triangle_mesh();
+        let bvh = crate::bvh::TriangleBvh::build(&mesh);
+        let skin = two_bone_skinning();
+        let config = crate::config::ImportConfig::default();
+
+        // Cover the triangle with a tight brick centered on it.
+        let voxel_size = 0.125; // 8 voxels across ≈ triangle extent
+        let brick_min = Vec3::new(-0.1, -0.1, -0.5);
+        let result = process_brick(&mesh, &bvh, brick_min, voxel_size, &config, Some(&skin));
+
+        assert!(result.has_bones, "skinned brick should flag has_bones");
+
+        // Scan shell voxels; at least one slot must carry non-zero
+        // weight and every weight set must sum to exactly 255.
+        let mut found_any = false;
+        let mut bone_seen = [false; 2];
+        for flat in 0..512 {
+            if result.is_inside[flat] { continue; }
+            let bv = result.bone_voxels[flat];
+            let sum: u16 = (0..4).map(|s| bv.bone_weight(s) as u16).sum();
+            if sum == 0 { continue; }
+            found_any = true;
+            assert_eq!(sum, 255, "voxel {flat} weights must sum to 255");
+            for slot in 0..4 {
+                let idx = bv.bone_index(slot) as usize;
+                if bv.bone_weight(slot) > 0 && idx < 2 {
+                    bone_seen[idx] = true;
+                }
+            }
+        }
+        assert!(found_any, "at least one shell voxel must carry bone weights");
+        assert!(bone_seen[0] && bone_seen[1], "both bones should be referenced across the brick");
+    }
+
+    /// No skinning supplied → no bone weights, has_bones stays false.
+    /// The rest of the brick data still fills in normally.
+    #[test]
+    fn process_brick_no_skinning_no_bones() {
+        let mesh = triangle_mesh();
+        let bvh = crate::bvh::TriangleBvh::build(&mesh);
+        let config = crate::config::ImportConfig::default();
+
+        let result = process_brick(&mesh, &bvh, Vec3::new(-0.1, -0.1, -0.5), 0.125, &config, None);
+        assert!(!result.has_bones);
+        for flat in 0..512 {
+            let bv = result.bone_voxels[flat];
+            let sum: u16 = (0..4).map(|s| bv.bone_weight(s) as u16).sum();
+            assert_eq!(sum, 0, "unskinned voxel {flat} should have zero weights");
+        }
     }
 }
 

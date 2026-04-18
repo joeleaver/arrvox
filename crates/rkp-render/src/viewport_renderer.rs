@@ -62,12 +62,12 @@ pub struct ViewportRenderer {
     pub god_rays: RkpGodRayPass,
 
     // ── Per-VR render targets + post-process ───────────────────────
-    pub gbuffer: rkf_render::GBuffer,
+    pub gbuffer: crate::GBuffer,
     /// rkp-side pick G-buffer — `R32Uint` sibling of the shared
-    /// `rkf_render::GBuffer`'s material texture. Holds `primitive_node_id`
+    /// `crate::GBuffer`'s material texture. Holds `primitive_node_id`
     /// for procedural raymarch hits so packed_r's high 16 bits in the
     /// shared material G-buffer can carry `secondary_material_id` for
-    /// dual-material shading. Not part of `rkf_render::GBuffer`
+    /// dual-material shading. Not part of `crate::GBuffer`
     /// (sibling-project invariants) and not read by `rkp_shade` —
     /// only `proc_outline` and the engine's pick-readback path
     /// consume it. For voxel hits from `octree_march` this slot is
@@ -75,15 +75,15 @@ pub struct ViewportRenderer {
     /// in packed_g, same as before.
     pub pick_texture: wgpu::Texture,
     pub pick_view: wgpu::TextureView,
-    pub bloom: rkf_render::BloomPass,
-    pub bloom_composite: rkf_render::BloomCompositePass,
-    pub tone_map: rkf_render::ToneMapPass,
+    pub bloom: crate::BloomPass,
+    pub bloom_composite: crate::BloomCompositePass,
+    pub tone_map: crate::ToneMapPass,
     pub composite_texture: wgpu::Texture,
     pub composite_view: wgpu::TextureView,
     pub readback_buffers: [wgpu::Buffer; 2],
     pub readback_index: usize,
     pub readback_ready: bool,
-    pub wireframe_pass: rkf_render::WireframePass,
+    pub wireframe_pass: crate::WireframePass,
     /// Isolation-mode infinite grid overlay. Always constructed; the
     /// host only dispatches it when the viewport's mode is `Isolation`.
     pub grid: RkpGridPass,
@@ -118,7 +118,7 @@ impl ViewportRenderer {
         };
 
         // Gbuffer.
-        let gbuffer = rkf_render::GBuffer::new(device, width, height);
+        let gbuffer = crate::GBuffer::new(device, width, height);
 
         // rkp-side pick texture (R32Uint). Written by the procedural
         // raymarch, read by `proc_outline` and the pick readback.
@@ -140,10 +140,10 @@ impl ViewportRenderer {
         proc_raymarch.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view);
 
         // Outline overlay — rebind the pick gbuffer view on resize.
-        let mut proc_outline = ProcOutlinePass::new(device, rkf_render::LDR_FORMAT);
+        let mut proc_outline = ProcOutlinePass::new(device, crate::LDR_FORMAT);
         proc_outline.set_gbuffer(device, &pick_view);
 
-        let mut proc_ghost = ProcGhostPass::new(device, rkf_render::LDR_FORMAT);
+        let mut proc_ghost = ProcGhostPass::new(device, crate::LDR_FORMAT);
         proc_ghost.set_camera(device, &camera_buffer);
 
         let mut ssao = RkpSsaoPass::new(device, queue, width, height);
@@ -183,20 +183,20 @@ impl ViewportRenderer {
         god_rays.set_input(device, &volumetric.output_view);
 
         // VR-owned bloom / tonemap chain reads this VR's god_rays output.
-        let bloom = rkf_render::BloomPass::new(device, &god_rays.output_view, width, height);
-        let bloom_composite = rkf_render::BloomCompositePass::new(
+        let bloom = crate::BloomPass::new(device, &god_rays.output_view, width, height);
+        let bloom_composite = crate::BloomCompositePass::new(
             device, &god_rays.output_view, bloom.mip_views(), width, height,
         );
-        let tone_map = rkf_render::ToneMapPass::new(device, &bloom_composite.output_view, width, height);
+        let tone_map = crate::ToneMapPass::new(device, &bloom_composite.output_view, width, height);
 
         let readback_buffers = [
             create_readback_buffer(device, width, height),
             create_readback_buffer(device, width, height),
         ];
 
-        let wireframe_pass = rkf_render::WireframePass::new(device, rkf_render::LDR_FORMAT);
+        let wireframe_pass = crate::WireframePass::new(device, crate::LDR_FORMAT);
 
-        let mut grid = RkpGridPass::new(device, rkf_render::LDR_FORMAT);
+        let mut grid = RkpGridPass::new(device, crate::LDR_FORMAT);
         grid.set_bindings(device, &camera_buffer, &gbuffer.position_view);
         grid.update_params(queue, &crate::rkp_grid::GridParams::default());
 
@@ -206,7 +206,7 @@ impl ViewportRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: rkf_render::LDR_FORMAT,
+            format: crate::LDR_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::COPY_DST,
@@ -272,7 +272,7 @@ impl ViewportRenderer {
         self.height = height;
 
         // Gbuffer.
-        self.gbuffer = rkf_render::GBuffer::new(device, width, height);
+        self.gbuffer = crate::GBuffer::new(device, width, height);
         let (pick_texture, pick_view) = create_pick_texture(device, width, height);
         self.pick_texture = pick_texture;
         self.pick_view = pick_view;
@@ -300,11 +300,11 @@ impl ViewportRenderer {
         self.god_rays.set_input(device, &self.volumetric.output_view);
 
         // Bloom / tonemap chain — these hold their own output textures.
-        self.bloom = rkf_render::BloomPass::new(device, &self.god_rays.output_view, width, height);
-        self.bloom_composite = rkf_render::BloomCompositePass::new(
+        self.bloom = crate::BloomPass::new(device, &self.god_rays.output_view, width, height);
+        self.bloom_composite = crate::BloomCompositePass::new(
             device, &self.god_rays.output_view, self.bloom.mip_views(), width, height,
         );
-        self.tone_map = rkf_render::ToneMapPass::new(device, &self.bloom_composite.output_view, width, height);
+        self.tone_map = crate::ToneMapPass::new(device, &self.bloom_composite.output_view, width, height);
 
         self.readback_buffers = [
             create_readback_buffer(device, width, height),
@@ -318,7 +318,7 @@ impl ViewportRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: rkf_render::LDR_FORMAT,
+            format: crate::LDR_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::COPY_DST,

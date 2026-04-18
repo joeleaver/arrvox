@@ -41,7 +41,7 @@ pub struct BakeRequest {
     /// Flattened procedural opcode stream. Cheap to clone and tree-free,
     /// so we don't ship the full `ProceduralObject` across threads.
     pub instructions: Vec<rkp_procedural::flatten::ProcInstruction>,
-    pub aabb: rkf_core::Aabb,
+    pub aabb: rkp_core::Aabb,
     pub voxel_size: f32,
     /// Root.transform.scale at the moment this request was captured.
     /// Worker echoes it back in the result so integrate can set
@@ -63,7 +63,7 @@ pub struct BakeResult {
     pub entity: hecs::Entity,
     pub generation: u64,
     pub scene_id: u32,
-    pub aabb: rkf_core::Aabb,
+    pub aabb: rkp_core::Aabb,
     pub voxel_size: f32,
     pub root_scale: glam::Vec3,
     pub outcome: BakeOutcome,
@@ -223,7 +223,7 @@ impl BakeWorker {
 /// this directly after integrate so the engine doesn't need to know
 /// the `SpatialHandle` layout.
 fn spatial_from_voxelize_result(r: &rkp_render::rkp_scene_manager::VoxelizeResult) -> SpatialData {
-    if let rkf_core::scene_node::SpatialHandle::Octree {
+    if let rkp_core::scene_node::SpatialHandle::Octree {
         root_offset, len, depth, base_voxel_size,
     } = r.spatial
     {

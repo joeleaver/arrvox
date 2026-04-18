@@ -3,14 +3,11 @@ name = "rkp-render"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Splat rendering pipeline: opacity-field march to G-buffer, orchestrating rkf-render for shading and post-process"
+description = "Splat rendering pipeline: opacity-field march to G-buffer, deferred shading, post-process"
 
 [dependencies]
 rkp-core = { workspace = true }
 rkp-procedural = { workspace = true }
-rkf-core = { workspace = true }
-rkf-render = { workspace = true }
-rkf-animation = { workspace = true }
 wgpu = { workspace = true }
 glam = { workspace = true }
 bytemuck = { workspace = true }

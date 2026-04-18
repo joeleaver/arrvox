@@ -120,7 +120,7 @@ impl ProcRaymarchPass {
         // slot holds the hit primitive's NodeId so packed_r's high 16
         // bits on the shared material G-buffer stay available for
         // `secondary_material_id` — which is what `rkp_shade` reads
-        // for dual-material lerp. Not part of rkf_render::GBuffer
+        // for dual-material lerp. Not part of the shared GBuffer
         // because it's rkp-specific; see `ViewportRenderer::pick_view`.
         let gbuffer_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

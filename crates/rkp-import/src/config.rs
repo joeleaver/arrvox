@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use rkf_core::Aabb;
+use rkp_core::Aabb;
 
 /// Configuration for a mesh-to-.rkp import.
 ///

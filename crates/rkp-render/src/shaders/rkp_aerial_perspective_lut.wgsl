@@ -1,7 +1,14 @@
 // Aerial Perspective LUT — atmospheric haze for distant geometry.
 //
-// 32×32×32 rgba16float 3D texture. XY = screen UV, Z = depth (4km per slice).
-// RGB = inscattered luminance, A = transmittance.
+// 32×32×32 rgba16float 3D texture. XY = screen UV, Z = distance along view ray
+// under an exponential mapping: slice z stores the camera-to-d(z) integral where
+//   d(z) = AP_NEAR * (AP_FAR/AP_NEAR)^((z+0.5)/N).
+// This packs near-field precision (sub-metre to tens of metres) into the first
+// ~half of the slices and sweeps the remainder out to ~100 km to meet the sky
+// at the horizon. A linear mapping wasted 99% of the LUT on distances beyond
+// the scene; this one actually serves voxel-scale geometry.
+//
+// RGB = inscattered luminance, A = averaged transmittance.
 // Applied to geometry pixels: final = inscattered + surface_color * transmittance.
 
 const PI: f32 = 3.14159265;
@@ -14,16 +21,22 @@ const BETA_M_SCAT: vec3<f32> = vec3<f32>(3.996e-6, 3.996e-6, 3.996e-6);
 const BETA_M_EXT: vec3<f32> = vec3<f32>(4.44e-6, 4.44e-6, 4.44e-6);
 const BETA_OZONE: vec3<f32> = vec3<f32>(0.650e-6, 1.881e-6, 0.085e-6);
 const MIE_G: f32 = 0.8;
-const AP_DISTANCE_PER_SLICE: f32 = 4000.0; // 4km per depth slice
+// Exponential slice parameterization — keep in sync with rkp_shade.wgsl.
+// With (1 m, 128 km) the 32 slices fall at roughly
+// 1.2 m, 1.7 m, 2.5 m, …, 500 m, 10 km, 109 km — one slice per ~1.45× distance.
+const AP_NEAR_DISTANCE: f32 = 1.0;
+const AP_FAR_DISTANCE: f32 = 128000.0;
 const AP_SLICE_COUNT: f32 = 32.0;
 
 struct AerialParams {
     sun_dir: vec3<f32>,
     sun_intensity: f32,
     camera_altitude: f32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
+    // Ground albedo — stored here for layout parity with the sky-view LUT's
+    // uniform buffer; unused by this shader since AP samples geometry pixels.
+    ground_albedo_r: f32,
+    ground_albedo_g: f32,
+    ground_albedo_b: f32,
     cam_forward: vec3<f32>,
     _pad3: f32,
     cam_right: vec3<f32>,
@@ -99,16 +112,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Reconstruct view ray.
     let ray_dir = normalize(params.cam_forward + ndc.x * params.cam_right + ndc.y * params.cam_up);
 
-    // Depth for this slice.
-    let max_dist = (f32(gid.z) + 1.0) * AP_DISTANCE_PER_SLICE;
+    // Distance for this slice — exponential mapping centered on the slice so
+    // that linear trilinear sampling in the shade pass lands on slice centers.
+    let slice_u = (f32(gid.z) + 0.5) / AP_SLICE_COUNT;
+    let max_dist = AP_NEAR_DISTANCE * pow(AP_FAR_DISTANCE / AP_NEAR_DISTANCE, slice_u);
 
     let origin = vec3<f32>(0.0, EARTH_RADIUS + params.camera_altitude, 0.0);
     let cos_sun = dot(ray_dir, params.sun_dir);
     let phase_r = rayleigh_phase(cos_sun);
     let phase_m = cornette_shanks(cos_sun, MIE_G);
 
-    // Number of steps proportional to distance (min 4, max 16).
-    let steps = clamp(u32(4.0 + f32(gid.z) * 0.5), 4u, 16u);
+    // Step count scales with slice index so far slices (tens of km) still
+    // resolve the Mie scale height, while near slices stay cheap.
+    let steps = clamp(u32(4.0 + f32(gid.z)), 4u, 24u);
     let step_len = max_dist / f32(steps);
 
     var throughput = vec3<f32>(1.0);

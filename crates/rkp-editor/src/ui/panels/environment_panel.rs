@@ -4,21 +4,48 @@ use std::rc::Rc;
 
 use rinch::prelude::*;
 
+use rkp_engine::environment::{CloudQualityPreset, cloud_quality_values};
+
 use crate::CommandSender;
 use crate::ui::store::EditorStore;
 use super::prop_controls::*;
 
 type CmdSignal = Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>;
 
+/// Outer wrapper — remounts the inner form whenever the engine pushes an updated
+/// EnvironmentSettings (scene load, startup). The `.get()` must happen inside the
+/// rsx! body so the render subscribes to the signal; calling it at the top of the
+/// function body is a one-shot read that never reacts to later updates.
 #[component]
 pub fn EnvironmentPanel() -> NodeHandle {
     let store = use_context::<EditorStore>();
+    rsx! {
+        for e in [store.environment.get()] {
+            EnvironmentForm {
+                key: format!(
+                    "{}-{}-{}-{}-{}-{}-{}-{}",
+                    e.clouds_enabled,
+                    e.sun_azimuth.to_bits(),
+                    e.sun_elevation.to_bits(),
+                    e.cloud_coverage.to_bits(),
+                    e.cloud_density_scale.to_bits(),
+                    e.ambient_intensity.to_bits(),
+                    e.cloud_slab_steps,
+                    e.cloud_taa_alpha.to_bits(),
+                ),
+                env: e.clone(),
+            }
+        }
+    }
+}
+
+#[component]
+fn EnvironmentForm(env: rkp_engine::environment::EnvironmentSettings) -> NodeHandle {
     let cmd_tx: CmdSignal = Signal::new(use_context::<CommandSender>().0);
 
-    let env = store.environment.get();
-
     let ambient = Signal::new(env.ambient_intensity);
-    let camera_altitude = Signal::new(env.camera_altitude);
+    let scene_elevation = Signal::new(env.scene_elevation);
+    let ground_albedo = Signal::new([env.ground_albedo[0], env.ground_albedo[1], env.ground_albedo[2], 1.0]);
 
     let sky_top_override_on = Signal::new(env.sky_color_top_override.is_some());
     let sky_top_color = Signal::new({
@@ -54,22 +81,26 @@ pub fn EnvironmentPanel() -> NodeHandle {
     let god_ray_exposure = Signal::new(env.god_ray_exposure);
     let god_ray_decay = Signal::new(env.god_ray_decay);
 
-    let dust_density = Signal::new(env.dust_density);
-    let dust_asymmetry = Signal::new(env.dust_asymmetry);
     let height_fog_density = Signal::new(env.height_fog_density);
     let fog_base_height = Signal::new(env.fog_base_height);
     let fog_height_falloff = Signal::new(env.fog_height_falloff);
-    let distance_fog_density = Signal::new(env.distance_fog_density);
     let fog_color = Signal::new([env.fog_color[0], env.fog_color[1], env.fog_color[2], 1.0]);
     let vol_far = Signal::new(env.vol_far);
 
     let clouds_enabled = Signal::new(env.clouds_enabled);
+    let attenuate_sun_by_clouds = Signal::new(env.attenuate_sun_by_clouds);
     let cloud_altitude_min = Signal::new(env.cloud_altitude_min);
     let cloud_altitude_max = Signal::new(env.cloud_altitude_max);
     let cloud_coverage = Signal::new(env.cloud_coverage);
     let cloud_density_scale = Signal::new(env.cloud_density_scale);
     let cloud_wind_speed = Signal::new(env.cloud_wind_speed);
     let cloud_wind_dir = Signal::new(env.cloud_wind_dir);
+
+    let cloud_slab_steps = Signal::new(env.cloud_slab_steps as f32);
+    let cloud_shadow_steps = Signal::new(env.cloud_shadow_steps as f32);
+    let cloud_detail_octaves = Signal::new(env.cloud_detail_octaves as f32);
+    let cloud_ms_octaves = Signal::new(env.cloud_ms_octaves as f32);
+    let cloud_taa_alpha = Signal::new(env.cloud_taa_alpha);
 
     let sky_collapsed = Signal::new(false);
     let light_collapsed = Signal::new(false);
@@ -96,6 +127,55 @@ pub fn EnvironmentPanel() -> NodeHandle {
             });
         })
     };
+    // Applies a named quality preset: snaps all cloud-quality signals to the
+    // preset's values and fires one engine command per field so both the UI
+    // and engine state update together.
+    let apply_preset: Rc<dyn Fn(CloudQualityPreset)> = {
+        let cmd_tx = cmd_tx;
+        Rc::new(move |preset: CloudQualityPreset| {
+            let (slab, shadow, detail, ms, alpha) = cloud_quality_values(preset);
+            cloud_slab_steps.set(slab as f32);
+            cloud_shadow_steps.set(shadow as f32);
+            cloud_detail_octaves.set(detail as f32);
+            cloud_ms_octaves.set(ms as f32);
+            cloud_taa_alpha.set(alpha);
+            let tx = cmd_tx.get();
+            let send = |field: &str, v: String| {
+                let _ = tx.send(rkp_engine::EngineCommand::UpdateEnvironment {
+                    field: field.into(),
+                    value: v,
+                });
+            };
+            send("cloud_slab_steps", (slab as f32).to_string());
+            send("cloud_shadow_steps", (shadow as f32).to_string());
+            send("cloud_detail_octaves", (detail as f32).to_string());
+            send("cloud_ms_octaves", (ms as f32).to_string());
+            send("cloud_taa_alpha", alpha.to_string());
+        })
+    };
+
+    // Which preset (if any) matches the current signal values exactly. Used
+    // to highlight the active preset button; `None` means "Custom".
+    let active_preset = move || -> Option<CloudQualityPreset> {
+        let s = cloud_slab_steps.get() as u32;
+        let sh = cloud_shadow_steps.get() as u32;
+        let d = cloud_detail_octaves.get() as u32;
+        let m = cloud_ms_octaves.get() as u32;
+        let a = cloud_taa_alpha.get();
+        for p in [
+            CloudQualityPreset::Low,
+            CloudQualityPreset::Medium,
+            CloudQualityPreset::High,
+            CloudQualityPreset::Ultra,
+        ] {
+            let (ps, psh, pd, pm, pa) = cloud_quality_values(p);
+            if s == ps && sh == psh && d == pd && m == pm && (a - pa).abs() < 0.001 {
+                return Some(p);
+            }
+        }
+        None
+    };
+
     let env_color3 = move |field: &'static str| -> Rc<dyn Fn([f32; 4])> {
         Rc::new(move |v: [f32; 4]| {
             let _ = cmd_tx.get().send(rkp_engine::EngineCommand::UpdateEnvironment {
@@ -116,7 +196,8 @@ pub fn EnvironmentPanel() -> NodeHandle {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
                     {prop_slider(__scope, "Ambient", ambient, 0.0, 5.0, 0.1, env_f32("ambient_intensity"))}
-                    {prop_slider(__scope, "Camera Altitude (m)", camera_altitude, 0.0, 5000.0, 10.0, env_f32("camera_altitude"))}
+                    {prop_slider(__scope, "Scene Elevation (m)", scene_elevation, 0.0, 9000.0, 10.0, env_f32("scene_elevation"))}
+                    {prop_color(__scope, "Ground Color", Memo::new(move || ground_albedo.get()), env_color3("ground_albedo"))}
 
                     // Override: sky top color
                     {prop_checkbox(__scope, "Override Sky Top", sky_top_override_on, {
@@ -193,7 +274,19 @@ pub fn EnvironmentPanel() -> NodeHandle {
             if !tone_collapsed.get() {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
-                    {prop_scrub(__scope, "Exposure", Memo::new(move || exposure.get()), 0.000001, 0.01, 0.000001, env_f32("exposure"))}
+                    {prop_scrub(
+                        __scope,
+                        "Exposure",
+                        Memo::new(move || exposure.get()),
+                        0.000001, 0.01, 0.000001,
+                        {
+                            let base = env_f32("exposure");
+                            Rc::new(move |v: f32| {
+                                exposure.set(v);
+                                base(v);
+                            })
+                        },
+                    )}
                 }
             }
 
@@ -225,12 +318,9 @@ pub fn EnvironmentPanel() -> NodeHandle {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
                     {prop_color(__scope, "Fog Color", Memo::new(move || fog_color.get()), env_color3("fog_color"))}
-                    {prop_slider(__scope, "Dust", dust_density, 0.0, 0.05, 0.001, env_f32("dust_density"))}
-                    {prop_slider(__scope, "Dust Asymmetry", dust_asymmetry, 0.0, 1.0, 0.01, env_f32("dust_asymmetry"))}
                     {prop_slider(__scope, "Height Fog", height_fog_density, 0.0, 0.5, 0.01, env_f32("height_fog_density"))}
                     {prop_slider(__scope, "Base Height", fog_base_height, -50.0, 100.0, 1.0, env_f32("fog_base_height"))}
                     {prop_slider(__scope, "Height Falloff", fog_height_falloff, 0.01, 1.0, 0.01, env_f32("fog_height_falloff"))}
-                    {prop_slider(__scope, "Distance Fog", distance_fog_density, 0.0, 0.1, 0.001, env_f32("distance_fog_density"))}
                     {prop_slider(__scope, "Far Distance", vol_far, 50.0, 1000.0, 10.0, env_f32("vol_far"))}
                 }
             }
@@ -241,14 +331,63 @@ pub fn EnvironmentPanel() -> NodeHandle {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
                     {prop_checkbox(__scope, "Enabled", clouds_enabled, env_bool("clouds_enabled"))}
+                    {prop_checkbox(__scope, "Attenuate Sun Intensity", attenuate_sun_by_clouds, env_bool("attenuate_sun_by_clouds"))}
                     {prop_slider(__scope, "Min Altitude", cloud_altitude_min, 0.0, 5000.0, 50.0, env_f32("cloud_altitude_min"))}
                     {prop_slider(__scope, "Max Altitude", cloud_altitude_max, 0.0, 10000.0, 100.0, env_f32("cloud_altitude_max"))}
                     {prop_slider(__scope, "Coverage", cloud_coverage, 0.0, 1.0, 0.01, env_f32("cloud_coverage"))}
-                    {prop_slider(__scope, "Density", cloud_density_scale, 0.0, 5.0, 0.1, env_f32("cloud_density_scale"))}
+                    {prop_slider(__scope, "Density", cloud_density_scale, 0.0, 1.0, 0.01, env_f32("cloud_density_scale"))}
                     {prop_slider(__scope, "Wind Speed", cloud_wind_speed, 0.0, 20.0, 0.5, env_f32("cloud_wind_speed"))}
                     {prop_slider(__scope, "Wind Dir", cloud_wind_dir, 0.0, 360.0, 1.0, env_f32("cloud_wind_dir"))}
+
+                    // Quality presets — bundle the render-cost knobs. Individual
+                    // sliders below let users override specific values; the row
+                    // highlights whichever preset the current settings match.
+                    div {
+                        style: "font-size:11px;color:#888;margin-top:8px;",
+                        {"Quality"}
+                    }
+                    div {
+                        style: "display:flex;gap:4px;",
+                        {preset_button(__scope, "Low", CloudQualityPreset::Low, apply_preset.clone(), active_preset)}
+                        {preset_button(__scope, "Medium", CloudQualityPreset::Medium, apply_preset.clone(), active_preset)}
+                        {preset_button(__scope, "High", CloudQualityPreset::High, apply_preset.clone(), active_preset)}
+                        {preset_button(__scope, "Ultra", CloudQualityPreset::Ultra, apply_preset.clone(), active_preset)}
+                    }
+                    {prop_slider(__scope, "Slab Samples", cloud_slab_steps, 8.0, 64.0, 1.0, env_f32("cloud_slab_steps"))}
+                    {prop_slider(__scope, "Shadow Samples", cloud_shadow_steps, 1.0, 6.0, 1.0, env_f32("cloud_shadow_steps"))}
+                    {prop_slider(__scope, "Detail Octaves", cloud_detail_octaves, 1.0, 5.0, 1.0, env_f32("cloud_detail_octaves"))}
+                    {prop_slider(__scope, "Multi-scatter Octaves", cloud_ms_octaves, 1.0, 4.0, 1.0, env_f32("cloud_ms_octaves"))}
+                    {prop_slider(__scope, "TAA Weight", cloud_taa_alpha, 0.05, 0.7, 0.01, env_f32("cloud_taa_alpha"))}
                 }
             }
+        }
+    }
+}
+
+/// One entry in the cloud quality preset row. Highlights itself when the
+/// current render-knob signals match the preset; clicking fires `apply_preset`
+/// which updates both the signals and the engine.
+fn preset_button(
+    __scope: &mut rinch::core::dom::RenderScope,
+    label: &str,
+    preset: CloudQualityPreset,
+    apply: Rc<dyn Fn(CloudQualityPreset)>,
+    active: impl Fn() -> Option<CloudQualityPreset> + Copy + 'static,
+) -> rinch::core::dom::NodeHandle {
+    const BASE: &str = "flex:1;padding:4px 8px;font-size:11px;border-radius:3px;\
+                        cursor:pointer;border:1px solid #333;";
+    let label = label.to_string();
+    rsx! {
+        div {
+            style: {move || {
+                if active() == Some(preset) {
+                    format!("{BASE}background:#3a6a9a;color:#fff;border-color:#4a7aaa;")
+                } else {
+                    format!("{BASE}background:#222;color:#bbb;")
+                }
+            }},
+            onclick: move || apply(preset),
+            {label}
         }
     }
 }

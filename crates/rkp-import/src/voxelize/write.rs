@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use glam::Vec3;
 
-use rkf_core::Aabb;
-use rkf_animation::skeleton_asset::{SkeletonAsset, save_rkskel};
+use rkp_core::Aabb;
+use rkp_animation::skeleton_asset::{SkeletonAsset, save_rkskel};
 use rkp_core::asset_file::write_stage;
 
 use crate::event::{ImportEvent, ProgressReporter};
@@ -92,6 +92,19 @@ pub fn write_rkp(
     } else {
         None
     };
+    // Skin metadata — bone weights + brick origins + per-bone rest
+    // AABBs — only emitted when a skinned skeleton was resolved during
+    // import. The three arrays are shipped together in a structured
+    // LZ4 blob (see `asset_file::SkinMetaIn`).
+    let skin_meta: Option<rkp_core::asset_file::SkinMetaIn<'_>> = if shell.has_bones {
+        Some(rkp_core::asset_file::SkinMetaIn {
+            bone_voxels: bytemuck::cast_slice(&shell.bone_voxels),
+            brick_origins: &shell.brick_origins,
+            rest_bone_aabbs: &shell.rest_bone_aabbs,
+        })
+    } else {
+        None
+    };
 
     // Translate rkp-core's section-boundary ticks into per-stage
     // ImportEvents so the UI shows "Compressing octree" → "Compressing
@@ -128,7 +141,7 @@ pub fn write_rkp(
             if normals_bytes.is_empty() { None } else { Some(normals_bytes) },
             if bricks_bytes.is_empty() { None } else { Some(bricks_bytes) },
             color_bytes,
-            None, // per-voxel bone data — not yet wired into the shader / file format
+            skin_meta,
             Some(&progress_cb),
         )
         .map_err(|e| format!("write .rkp: {e}"))

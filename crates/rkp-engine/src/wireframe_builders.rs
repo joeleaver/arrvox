@@ -4,7 +4,7 @@
 //! Pure data — no GPU, no state.
 
 use glam::Vec3;
-use rkf_render::wireframe::{aabb_wireframe, circle_wireframe, LineVertex};
+use rkp_render::wireframe::{aabb_wireframe, circle_wireframe, LineVertex};
 
 use crate::gizmo::GizmoAxis;
 

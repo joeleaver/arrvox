@@ -41,12 +41,12 @@ fn float_editor(
             // read from a store Memo directly for true external-change
             // reactivity on inspector fields — out of scope here.
             let value = Signal::new(val as f32);
-            let value_memo = Memo::new(move || value.get());
+            let display = Memo::new(move || value.get());
             let step = ((max - min) / 200.0) as f32;
             return prop_controls::prop_scrub(
                 __scope,
                 &field.name,
-                value_memo,
+                display,
                 min as f32,
                 max as f32,
                 step,

@@ -7,8 +7,7 @@ description = "Mesh-to-.rkp import pipeline: load, BVH, bake opacity-octree asse
 
 [dependencies]
 rkp-core = { workspace = true }
-rkf-core = { workspace = true }
-rkf-animation = { workspace = true }
+rkp-animation = { workspace = true }
 glam = { workspace = true }
 bytemuck = { workspace = true }
 rayon = { workspace = true }
@@ -20,3 +19,4 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+ufbx = { workspace = true }

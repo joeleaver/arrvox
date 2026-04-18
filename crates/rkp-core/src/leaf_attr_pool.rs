@@ -1,23 +1,31 @@
-//! Flat pool of [`LeafAttr`] entries with parallel per-leaf color.
+//! Flat pool of [`LeafAttr`] entries with parallel per-leaf color and
+//! per-leaf skinning weights.
 //!
-//! Each pool slot holds a [`LeafAttr`] (material IDs + normal, 8 B) plus a
-//! packed u32 color (4 B), same index on both arrays. Color is 0 for leaves
-//! where the material's own base_color is sufficient (procedural primitives);
-//! mesh imports override with per-voxel texture-baked RGB.
+//! Each pool slot holds a [`LeafAttr`] (material IDs + normal, 8 B), a
+//! packed u32 color (4 B), and a [`BoneVoxel`] (4 bone indices + 4
+//! weights = 8 B), all at the same slot index. Color is 0 for leaves
+//! where the material's own base_color is sufficient; bone weights are
+//! a zeroed `BoneVoxel` for unskinned assets.
 //!
 //! Allocation discipline: bump-allocated with a free list of reclaimed
 //! ranges, opportunistic tail coalescing on deallocate. Procedural
 //! re-voxelization reclaims storage predictably.
 
+use crate::companion::BoneVoxel;
+
 use crate::leaf_attr::LeafAttr;
 
-/// A flat pool of [`LeafAttr`] entries indexed by slot number, with a
-/// parallel color array at the same index.
+/// A flat pool of [`LeafAttr`] entries indexed by slot number, with
+/// parallel color and bone-weight arrays at the same indices.
 pub struct LeafAttrPool {
     data: Vec<LeafAttr>,
     /// Parallel color array: packed R|G|B|A u32 (A reserved / intensity).
     /// 0 = no override, fall back to material base_color.
     colors: Vec<u32>,
+    /// Parallel bone-weight array. Default `BoneVoxel` is zero indices +
+    /// zero weights — shader treats it as "no skinning influence" so
+    /// unskinned assets cost nothing beyond the 8 B per slot.
+    bones: Vec<BoneVoxel>,
     /// Next unallocated slot (bump pointer).
     next_free: u32,
     /// Free list of reclaimed ranges — `(start, count)` pairs.
@@ -30,6 +38,7 @@ impl LeafAttrPool {
         Self {
             data: vec![LeafAttr::EMPTY; capacity as usize],
             colors: vec![0u32; capacity as usize],
+            bones: vec![BoneVoxel::default(); capacity as usize],
             next_free: 0,
             free_list: Vec::new(),
         }
@@ -113,6 +122,7 @@ impl LeafAttrPool {
         for s in start as usize..end {
             self.data[s] = LeafAttr::EMPTY;
             self.colors[s] = 0;
+            self.bones[s] = BoneVoxel::default();
         }
         if start + count == self.next_free {
             self.next_free = start;
@@ -146,6 +156,14 @@ impl LeafAttrPool {
     }
 
     #[inline]
+    pub fn bone(&self, slot: u32) -> BoneVoxel { self.bones[slot as usize] }
+
+    #[inline]
+    pub fn set_bone(&mut self, slot: u32, bv: BoneVoxel) {
+        self.bones[slot as usize] = bv;
+    }
+
+    #[inline]
     pub fn allocated_count(&self) -> u32 { self.next_free }
 
     #[inline]
@@ -157,6 +175,7 @@ impl LeafAttrPool {
         }
         self.data.resize(new_cap as usize, LeafAttr::EMPTY);
         self.colors.resize(new_cap as usize, 0);
+        self.bones.resize(new_cap as usize, BoneVoxel::default());
     }
 
     /// Raw byte slice of the allocated attr region (for GPU upload).
@@ -177,6 +196,17 @@ impl LeafAttrPool {
             return &[];
         }
         bytemuck::cast_slice(&self.colors[..count])
+    }
+
+    /// Raw byte slice of the parallel bone-weight array (for GPU upload).
+    /// Unskinned assets leave this zero-filled; the shader reads the
+    /// per-object `is_skinned` flag to decide whether to consume it.
+    pub fn bone_bytes(&self) -> &[u8] {
+        let count = self.next_free as usize;
+        if count == 0 {
+            return &[];
+        }
+        bytemuck::cast_slice(&self.bones[..count])
     }
 
     /// Raw slice of allocated entries.

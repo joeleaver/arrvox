@@ -30,7 +30,7 @@
 //! positive = outside, zero = on the surface.
 
 use glam::{UVec3, Vec3};
-use rkf_core::Aabb;
+use crate::Aabb;
 
 use crate::brick_pool::{BrickPool, BRICK_CELLS, BRICK_DIM, BRICK_LEVELS};
 use crate::leaf_attr::LeafAttr;
@@ -1101,7 +1101,9 @@ mod tests {
                     for cy in 0..BRICK_DIM {
                         for cx in 0..BRICK_DIM {
                             let cell = bricks.get_cell(brick_id, cx, cy, cz);
-                            if cell == crate::brick_pool::BRICK_EMPTY {
+                            if cell == crate::brick_pool::BRICK_EMPTY
+                                || cell == crate::brick_pool::BRICK_INTERIOR
+                            {
                                 continue;
                             }
                             let attr = *attrs.get(cell);

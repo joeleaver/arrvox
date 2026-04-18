@@ -5,13 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 description = "Engine runtime: frame scheduling, ECS glue, streaming, asset management"
 
+[features]
+gamepad = ["dep:gilrs"]
+
 [dependencies]
 rkp-core = { workspace = true }
 rkp-render = { workspace = true }
-rkf-core = { workspace = true }
-rkf-animation = { workspace = true }
-rkf-physics = { workspace = true }
-rkf-mcp = { workspace = true }
+rkp-animation = { workspace = true }
+rkp-physics = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }
 hecs = { workspace = true }
@@ -20,3 +21,9 @@ log = { workspace = true }
 anyhow = { workspace = true }
 crossbeam = { workspace = true }
 pollster = { workspace = true }
+serde = { workspace = true }
+ron = { workspace = true }
+gilrs = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
