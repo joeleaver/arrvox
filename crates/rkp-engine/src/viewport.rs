@@ -225,6 +225,13 @@ pub struct Viewport {
     /// Whether to overlay editor gizmos. Gated to "no runtime override
     /// active" in higher layers.
     pub show_gizmos: bool,
+
+    /// Previous frame's view-projection matrix for this viewport.
+    /// Consumed by temporal reprojection (cloud TAA, etc.) to match
+    /// history samples to their current-frame screen position. Updated
+    /// after each render. Identity on first frame; callers comparing
+    /// against it should gate on `frame_index > 0`.
+    pub prev_view_proj: [[f32; 4]; 4],
 }
 
 impl Viewport {
@@ -247,6 +254,7 @@ impl Viewport {
             mode: rkp_render::RenderMode::InSitu,
             preview_mode: rkp_render::BuildPreviewMode::Voxel,
             show_gizmos: true,
+            prev_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
         }
     }
 
@@ -275,6 +283,7 @@ impl Viewport {
             // the last-baked result.
             preview_mode: rkp_render::BuildPreviewMode::Raymarch,
             show_gizmos: false,
+            prev_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
         }
     }
 }

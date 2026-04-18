@@ -396,10 +396,6 @@ struct EngineState {
     // Frame counter
     frame_index: u64,
 
-    // Previous frame's view-projection matrix, used for temporal reprojection
-    // (e.g. the volumetric cloud pass). Identity on the first frame.
-    prev_view_proj: [[f32; 4]; 4],
-
     // Temporally smoothed cloud-sun attenuation (camera→sun ray through the
     // cloud layer). Lerps toward the target each frame so a single noisy ray
     // through FBM doesn't flicker sun intensity.
@@ -628,7 +624,6 @@ impl EngineState {
             scene_dirty: false,
             gpu_objects_dirty: true,
             frame_index: 0,
-            prev_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             cloud_sun_atten: 1.0,
             width,
             height,
@@ -1327,6 +1322,13 @@ impl EngineState {
             vr.copy_composite_to_readback(&mut encoder);
             self.renderer.resolve_profiler_queries(&mut encoder);
             self.queue.submit(std::iter::once(encoder.finish()));
+
+            // Stash this frame's VP on the viewport so next frame's cloud
+            // TAA (and any future temporal pass) can reproject history
+            // samples into the right screen position.
+            if let Some(v) = self.viewports.get_mut(viewport_id) {
+                v.prev_view_proj = cam_uniforms.view_proj;
+            }
         }
 
         let t_encode = frame_start.elapsed();
@@ -1385,9 +1387,6 @@ impl EngineState {
                 t_frame_end.as_secs_f64() * 1000.0,
             );
         }
-
-        // Remember this frame's view-projection so next frame can reproject into it.
-        self.prev_view_proj = cam_uniforms.view_proj;
 
         self.frame_index += 1;
     }
@@ -1605,7 +1604,7 @@ impl EngineState {
             layer_mask,
             focus_object_id,
             _pad: [0; 2],
-            prev_vp: view_proj.to_cols_array_2d(),
+            prev_vp: viewport.prev_view_proj,
             view_proj: view_proj.to_cols_array_2d(),
         }
     }
