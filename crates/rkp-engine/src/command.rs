@@ -164,6 +164,26 @@ pub enum EngineCommand {
     /// Convenience for "bake everything I've changed."
     BakeAllDirtyProcedurals,
 
+    /// Convert a procedural entity in place: drop the
+    /// `ProceduralGeometry`, keep the currently-baked voxels. No new
+    /// entity, no extra GPU allocation — just a component removal.
+    /// UI flags this as destructive and confirms with a modal.
+    /// No-op (console warning) if the bake isn't clean.
+    ConvertProceduralToVoxel {
+        entity_id: Uuid,
+    },
+
+    /// Copy a procedural entity's baked voxels into a NEW voxel
+    /// entity. The original stays procedural and editable; the copy
+    /// is a static voxel object spawned next to it. Shares the same
+    /// octree / leaf_attr / brick allocations via `refcount` on the
+    /// asset cache... except this path doesn't go through the asset
+    /// cache — it re-bakes the current tree into a fresh scene
+    /// allocation owned by the new entity. Same gating as convert.
+    CopyProceduralToNewVoxel {
+        entity_id: Uuid,
+    },
+
     /// Switch the build viewport's primary-visibility source between
     /// the voxel march (shows the baked result) and the procedural
     /// CSG raymarcher (shows the live tree, no bake required). The

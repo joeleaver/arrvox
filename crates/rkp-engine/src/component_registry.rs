@@ -139,9 +139,47 @@ pub fn register_builtins(registry: &mut ComponentRegistry) {
 /// resolution). Registration exists primarily so `ProceduralGeometry`
 /// participates in `.rkproject` save / load — without it, procedurals
 /// silently lose their tree on reopen.
-static PROCEDURAL_FIELDS: [FieldMeta; 2] = [
-    FieldMeta { name: "voxel_size", field_type: FieldType::Float, range: Some((0.005, 0.32)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
-    FieldMeta { name: "collider_resolution", field_type: FieldType::Float, range: Some((0.05, 1.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
+/// Pick the closest-matching `PROCEDURAL_VOXEL_TIERS` entry for a
+/// stored voxel_size. Used by `get_field` so the inspector dropdown
+/// shows whichever tier is closest when a save file carries a stray
+/// value (legacy / external edit).
+fn tier_string(voxel_size: f32) -> String {
+    use crate::components::PROCEDURAL_VOXEL_TIERS;
+    PROCEDURAL_VOXEL_TIERS
+        .iter()
+        .min_by(|a, b| {
+            let da = (a.0.parse::<f32>().unwrap_or(f32::NAN) - voxel_size).abs();
+            let db = (b.0.parse::<f32>().unwrap_or(f32::NAN) - voxel_size).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(v, _)| (*v).to_string())
+        .unwrap_or_else(|| "0.02".to_string())
+}
+
+/// Snap a parsed voxel_size to the nearest tier. Mirrors
+/// `SetProceduralVoxelSize`'s logic so either code path produces the
+/// same value on `proc_geo.voxel_size`.
+fn snap_to_tier(voxel_size: f32) -> f32 {
+    use crate::components::PROCEDURAL_VOXEL_TIERS;
+    PROCEDURAL_VOXEL_TIERS
+        .iter()
+        .filter_map(|(v, _)| v.parse::<f32>().ok())
+        .min_by(|a, b| {
+            (a - voxel_size).abs()
+                .partial_cmp(&(b - voxel_size).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(0.02)
+}
+
+static PROCEDURAL_FIELDS: [FieldMeta; 1] = [
+    // Enum picker backed by `PROCEDURAL_VOXEL_TIERS` — same tier
+    // labels the build viewport's resolution dropdown shows. Picking
+    // either surface writes to `proc_geo.voxel_size`; the snap in
+    // `SetProceduralVoxelSize` + the parse here keep both paths in
+    // lockstep.
+    FieldMeta { name: "voxel_size", field_type: FieldType::String, range: None, transient: false, struct_fields: None, asset_filter: None,
+        enum_options: Some(crate::components::PROCEDURAL_VOXEL_TIERS), scrub: false },
 ];
 
 fn procedural_geometry_entry() -> ComponentEntry {
@@ -154,8 +192,9 @@ fn procedural_geometry_entry() -> ComponentEntry {
         get_field: |world, entity, field| {
             let c = world.get::<&ProceduralGeometry>(entity).map_err(|_| "no ProceduralGeometry".to_string())?;
             match field {
-                "voxel_size" => Ok(FieldValue::Float(c.voxel_size as f64)),
-                "collider_resolution" => Ok(FieldValue::Float(c.collider_resolution as f64)),
+                // Return the exact tier string so the enum picker
+                // lines up with the matching `(value, label)` entry.
+                "voxel_size" => Ok(FieldValue::String(tier_string(c.voxel_size))),
                 _ => Err(format!("unknown field '{field}'")),
             }
         },
@@ -163,12 +202,23 @@ fn procedural_geometry_entry() -> ComponentEntry {
             let mut c = world.get::<&mut ProceduralGeometry>(entity).map_err(|_| "no ProceduralGeometry".to_string())?;
             match field {
                 "voxel_size" => {
-                    if let FieldValue::Float(v) = value { c.voxel_size = v as f32; c.dirty = true; Ok(()) }
-                    else { Err("type mismatch".into()) }
-                }
-                "collider_resolution" => {
-                    if let FieldValue::Float(v) = value { c.collider_resolution = v as f32; Ok(()) }
-                    else { Err("type mismatch".into()) }
+                    // Parse + snap to nearest tier so typos / stale
+                    // saved values round to something valid; mirrors
+                    // the logic in `SetProceduralVoxelSize`.
+                    if let FieldValue::String(v) = value {
+                        let Ok(parsed) = v.parse::<f32>() else {
+                            return Err(format!("invalid voxel_size '{v}'"));
+                        };
+                        let snapped = snap_to_tier(parsed);
+                        if (snapped - c.voxel_size).abs() > 1e-6 {
+                            c.voxel_size = snapped;
+                            // Auto-bake on voxel-size change — same
+                            // rationale as `SetProceduralVoxelSize`.
+                            c.pending_bake = true;
+                            c.bake_dirty_at = Some(std::time::Instant::now());
+                        }
+                        Ok(())
+                    } else { Err("type mismatch".into()) }
                 }
                 _ => Err(format!("unknown field '{field}'")),
             }

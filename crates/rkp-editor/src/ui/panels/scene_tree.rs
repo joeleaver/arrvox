@@ -1,7 +1,12 @@
 //! Scene tree panel — hierarchical view of scene objects.
 //!
 //! Renders root objects (no parent) at the top level, with children
-//! nested below their parents. Right-click for context menu (Duplicate, Delete).
+//! nested below their parents. Right-click for context menu:
+//! Duplicate, Delete, and — for procedural objects — "Copy to New
+//! Voxel Object" and "Convert to Voxel Object" (the latter stages
+//! the entity into `store.convert_procedural_target`; the
+//! confirmation modal is mounted by `LayoutRoot` so the dialog can
+//! catch clicks even when the scene-tree panel is narrow).
 
 use rinch::prelude::*;
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
@@ -43,6 +48,7 @@ fn tree_node(
     let cmd_tx = Signal::new(use_context::<CommandSender>().0);
     let id = object.id;
     let name = object.name.clone();
+    let is_procedural = object.is_procedural;
     let collapsed = Signal::new(false);
     let indent = depth as f32 * 16.0;
 
@@ -118,6 +124,35 @@ fn tree_node(
                             let _ = cmd_tx.get().send(rkp_engine::EngineCommand::DuplicateObject { entity_id: id });
                         },
                         "Duplicate"
+                    }
+                    // Procedural-only entries. Grouped together and
+                    // separated from the generic actions with a
+                    // divider so the destructive "Convert" item is
+                    // visually bracketed and less likely to be hit
+                    // by accident on the way to Delete.
+                    if is_procedural {
+                        DropdownMenuDivider {}
+                        DropdownMenuItem {
+                            left_section: TablerIcon::Copy,
+                            onclick: move || {
+                                let _ = cmd_tx.get().send(
+                                    rkp_engine::EngineCommand::CopyProceduralToNewVoxel {
+                                        entity_id: id,
+                                    },
+                                );
+                            },
+                            "Copy to New Voxel Object"
+                        }
+                        DropdownMenuItem {
+                            left_section: TablerIcon::Cube,
+                            onclick: move || {
+                                // Destructive — stage the target
+                                // on the store; `LayoutRoot` mounts
+                                // the confirmation modal.
+                                store.convert_procedural_target.set(Some(id));
+                            },
+                            "Convert to Voxel Object…"
+                        }
                     }
                     DropdownMenuDivider {}
                     DropdownMenuItem {

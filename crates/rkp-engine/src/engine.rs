@@ -1653,8 +1653,17 @@ impl EngineState {
                                 .min_by(|a, b| ((**a) - vs).abs().partial_cmp(&((**b) - vs).abs()).unwrap())
                                 .copied()
                                 .unwrap_or(0.02);
-                            proc_geo.voxel_size = snapped;
-                            proc_geo.dirty = true;
+                            if (snapped - proc_geo.voxel_size).abs() > 1e-6 {
+                                proc_geo.voxel_size = snapped;
+                                // Auto-bake — voxel-size changes are
+                                // single-click tier flips; the debounce
+                                // window absorbs rapid double-clicks but
+                                // otherwise the user expects an immediate
+                                // rebake.
+                                proc_geo.pending_bake = true;
+                                proc_geo.bake_dirty_at =
+                                    Some(std::time::Instant::now());
+                            }
                         }
                     }
                 }
@@ -1863,6 +1872,174 @@ impl EngineState {
                 for entity in dirty {
                     self.enqueue_bake(entity);
                 }
+            }
+
+            EngineCommand::ConvertProceduralToVoxel { entity_id } => {
+                use crate::components::*;
+                let Some(entity) = self
+                    .entity_uuids
+                    .iter()
+                    .find_map(|(e, u)| (*u == entity_id).then_some(*e))
+                else {
+                    self.console.warn("Convert: entity not found".to_string());
+                    return true;
+                };
+                // Gate on a clean bake state — a pending/in-flight
+                // bake means the voxels aren't what the user just
+                // asked for.
+                let can_convert = self
+                    .world
+                    .get::<&ProceduralGeometry>(entity)
+                    .map(|pg| !pg.bake_in_flight && !pg.pending_bake && !pg.dirty)
+                    .unwrap_or(false);
+                if !can_convert {
+                    self.console.warn(
+                        "Convert: bake pending or in flight — let it settle first".to_string(),
+                    );
+                    return true;
+                }
+                let name = self
+                    .world
+                    .get::<&EditorMetadata>(entity)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|_| format!("{entity:?}"));
+                let voxel_count = self
+                    .world
+                    .get::<&Renderable>(entity)
+                    .map(|r| r.voxel_count)
+                    .unwrap_or(0);
+                // Drop the tree. Renderable.spatial keeps pointing at
+                // the same scene-pool allocation, so rendering
+                // continues unchanged — the entity just loses its
+                // editing affordances. Clear the "procedural" tag so
+                // save/load + inspector treat it as a plain voxel.
+                let _ = self.world.remove_one::<ProceduralGeometry>(entity);
+                if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
+                    renderable.primitive = None;
+                }
+                if self.selected_entity == Some(entity) {
+                    self.selected_procedural_node = None;
+                }
+                self.scene_dirty = true;
+                self.console.info(format!(
+                    "Converted '{name}' to voxel object ({voxel_count} voxels).",
+                ));
+            }
+
+            EngineCommand::CopyProceduralToNewVoxel { entity_id } => {
+                use crate::components::*;
+                let Some(src_entity) = self
+                    .entity_uuids
+                    .iter()
+                    .find_map(|(e, u)| (*u == entity_id).then_some(*e))
+                else {
+                    self.console.warn("Copy: entity not found".to_string());
+                    return true;
+                };
+                // Same gate: won't copy a snapshot the user didn't
+                // ask for.
+                let can_copy = self
+                    .world
+                    .get::<&ProceduralGeometry>(src_entity)
+                    .map(|pg| !pg.bake_in_flight && !pg.pending_bake && !pg.dirty)
+                    .unwrap_or(false);
+                if !can_copy {
+                    self.console.warn(
+                        "Copy: bake pending or in flight — let it settle first".to_string(),
+                    );
+                    return true;
+                }
+                // Read what we need from the source entity. The
+                // baked voxels live in shared scene pools, so we
+                // re-voxelize the tree for the new entity rather
+                // than refcounting the source's allocation — two
+                // entities refcounting the same octree isn't what
+                // we've got today (asset_cache is path-keyed, not
+                // generalized). A second bake of the same tree
+                // reuses the GPU evaluator's warmed pipelines and is
+                // fast; we also go through the async path so the
+                // engine tick stays smooth.
+                let (src_name, src_transform, src_scale_for_bake, src_tree, src_voxel_size) = {
+                    let name = self
+                        .world
+                        .get::<&EditorMetadata>(src_entity)
+                        .map(|m| m.name.clone())
+                        .unwrap_or_else(|_| "Procedural".to_string());
+                    let transform = self
+                        .world
+                        .get::<&Transform>(src_entity)
+                        .map(|t| (*t).clone())
+                        .unwrap_or_else(|_| Transform::default());
+                    let proc_geo = match self.world.get::<&ProceduralGeometry>(src_entity) {
+                        Ok(pg) => pg,
+                        Err(_) => {
+                            self.console.warn("Copy: source has no ProceduralGeometry".to_string());
+                            return true;
+                        }
+                    };
+                    let root_scale = proc_geo
+                        .tree
+                        .get(proc_geo.tree.root())
+                        .map(|n| n.transform.to_scale_rotation_translation().0)
+                        .unwrap_or(glam::Vec3::ONE);
+                    (
+                        name,
+                        transform,
+                        root_scale,
+                        proc_geo.tree.clone(),
+                        proc_geo.voxel_size,
+                    )
+                };
+
+                // Spawn the destination entity. No ProceduralGeometry —
+                // this is the static voxel copy. Starts with
+                // spatial=None; the bake we enqueue below fills it.
+                let new_name = self.unique_name(&format!("{src_name} (copy)"));
+                let scene_id = self.next_scene_id;
+                self.next_scene_id += 1;
+                let new_entity = self.world.spawn((
+                    src_transform,
+                    EditorMetadata { name: new_name.clone() },
+                    Renderable {
+                        primitive: None,
+                        voxel_count: 0,
+                        spatial: None,
+                        ..Default::default()
+                    },
+                ));
+                self.assign_entity_uuid(new_entity);
+                self.entity_scene_ids.insert(new_entity, scene_id);
+                self.scene_dirty = true;
+
+                // Enqueue a bake for the copy. We're reusing the
+                // async bake pipeline but the target entity has no
+                // ProceduralGeometry — so `enqueue_bake` won't
+                // accept it. Build the request by hand.
+                let (aabb, voxel_size) = procedural_voxel_params(&src_tree, src_voxel_size);
+                let instructions = rkp_procedural::flatten_tree(&src_tree);
+                // `generation: 0` so the staleness check in
+                // `drain_bake_results` (which reads the target
+                // entity's current generation and defaults to 0 when
+                // the entity has no ProceduralGeometry) matches and
+                // we actually apply the result. Copy targets never
+                // re-bake, so a single-shot value is fine.
+                let req = crate::bake_worker::BakeRequest {
+                    entity: new_entity,
+                    generation: 0,
+                    scene_id,
+                    instructions,
+                    aabb,
+                    voxel_size,
+                    root_scale: src_scale_for_bake,
+                    prev_spatial: None,
+                };
+                if self.bake_worker.tx_request.send(req).is_err() {
+                    self.console.warn("Copy: bake worker channel closed".to_string());
+                    return true;
+                }
+                self.console.info(format!(
+                    "Copied '{src_name}' → '{new_name}' (baking…)",
+                ));
             }
 
             EngineCommand::SetBuildPreviewMode { mode } => {
@@ -4989,6 +5166,10 @@ impl EngineState {
                 let is_light = self.world.get::<&crate::components::PointLight>(entity).is_ok()
                     || self.world.get::<&crate::components::SpotLight>(entity).is_ok();
                 let is_camera = self.world.get::<&crate::components::Camera>(entity).is_ok();
+                let is_procedural = self
+                    .world
+                    .get::<&crate::components::ProceduralGeometry>(entity)
+                    .is_ok();
                 let parent_id = self.world.get::<&crate::components::Parent>(entity)
                     .ok()
                     .map(|p| p.parent_id);
@@ -4998,6 +5179,7 @@ impl EngineState {
                     parent_id,
                     is_camera,
                     is_light,
+                    is_procedural,
                 });
             }
             Some(objs)

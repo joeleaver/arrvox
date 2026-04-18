@@ -133,6 +133,15 @@ pub struct EditorStore {
     pub tab_drag: Signal<Option<TabDragData>>,
     /// Where the dragged tab will drop if released now.
     pub drop_target: Signal<Option<DropTarget>>,
+
+    /// Entity staged for the "Convert to Voxel Object" confirmation
+    /// modal. `Some(id)` opens the modal — it's mounted at
+    /// `LayoutRoot` (not inside the scene-tree panel) because
+    /// rinch's hit-test skips descendants of `overflow: clip/auto`
+    /// containers when the click falls outside the container's
+    /// bounds, and a centered modal inside the narrow scene-tree
+    /// column would never catch a click aimed at its own buttons.
+    pub convert_procedural_target: Signal<Option<uuid::Uuid>>,
 }
 
 /// Data about the tab being dragged.
@@ -223,6 +232,8 @@ impl EditorStore {
             // Drag state.
             tab_drag: Signal::new(None),
             drop_target: Signal::new(None),
+
+            convert_procedural_target: Signal::new(None),
         }
     }
 

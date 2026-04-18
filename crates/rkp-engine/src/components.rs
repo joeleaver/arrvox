@@ -198,6 +198,23 @@ pub struct RigidBodyRuntime {
     pub handle: rapier3d::prelude::RigidBodyHandle,
 }
 
+/// Standard voxel-size tiers for procedural bakes. Kept as
+/// `(value_string, display_label)` tuples so the properties-panel
+/// enum picker (via the component registry's `FieldMeta.enum_options`)
+/// and the build-viewport resolution dropdown (via `prop_select`) can
+/// share one source of truth — changing the tiers in one place now
+/// propagates to both UIs and the engine's `SetProceduralVoxelSize`
+/// snap logic.
+///
+/// The `value_string` is the f32 in decimal form (parseable via
+/// `str::parse`); both UIs and the snap logic rely on that.
+pub const PROCEDURAL_VOXEL_TIERS: &[(&str, &str)] = &[
+    ("0.005", "5mm (finest)"),
+    ("0.02", "2cm"),
+    ("0.08", "8cm"),
+    ("0.32", "32cm (coarsest)"),
+];
+
 /// Procedural geometry — an entity whose voxels are generated from a node tree.
 ///
 /// The tree is the source of truth. When dirty, the engine re-evaluates the tree
@@ -211,9 +228,6 @@ pub struct ProceduralGeometry {
     /// Voxel size tier for rendering. Smaller = more detail, more voxels.
     /// Must be one of the standard tiers: 0.005, 0.02, 0.08, 0.32.
     pub voxel_size: f32,
-
-    /// Voxel size for the physics collider grid.
-    pub collider_resolution: f32,
     /// Whether the tree needs re-evaluation. On load we force this to
     /// `true` so the per-tick `update_dirty_procedurals` loop bakes the
     /// tree once on first frame after open — the `Renderable.spatial`
@@ -289,7 +303,6 @@ impl ProceduralGeometry {
         Self {
             tree,
             voxel_size: 0.02,
-            collider_resolution: 0.1,
             dirty: true,
             pending_bake: false,
             bake_dirty_at: None,

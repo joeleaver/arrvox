@@ -495,12 +495,10 @@ fn render_resolution(
         __scope,
         "Res",
         Memo::new(move || current.get()),
-        &[
-            ("0.005", "5mm (finest)"),
-            ("0.02", "2cm"),
-            ("0.08", "8cm"),
-            ("0.32", "32cm (coarsest)"),
-        ],
+        // Same tuples the ProceduralGeometry `voxel_size` field picker
+        // shows in the properties panel — one `PROCEDURAL_VOXEL_TIERS`
+        // const drives both surfaces.
+        rkp_engine::components::PROCEDURAL_VOXEL_TIERS,
         on_change,
     )
 }

@@ -5,12 +5,38 @@ use rinch::prelude::*;
 use super::ContainerKind;
 use super::container::ContainerComponent;
 use super::splitter::{ContainerSplitter, SplitDirection, SplitTarget};
+use crate::CommandSender;
 use crate::ui::store::EditorStore;
 use crate::ui::panels::{StatusBar, WelcomeScreen};
 
 #[component]
 pub fn LayoutRoot() -> NodeHandle {
     let store = use_context::<EditorStore>();
+    let cmd_tx = Signal::new(use_context::<CommandSender>().0);
+
+    // "Convert to Voxel Object" confirmation. Mounted here (full-
+    // window bounds) rather than inside `SceneTree` because rinch's
+    // hit-test skips descendants of `overflow` containers when the
+    // click lies outside the parent's bounds — a centered modal
+    // inside a narrow panel would never catch its own button
+    // clicks.
+    let convert_target = store.convert_procedural_target;
+    let convert_name = Memo::new(move || {
+        let Some(id) = convert_target.get() else { return String::new() };
+        store.objects.get()
+            .into_iter()
+            .find(|o| o.id == id)
+            .map(|o| o.name)
+            .unwrap_or_default()
+    });
+    let on_confirm = move || {
+        if let Some(id) = convert_target.get() {
+            let _ = cmd_tx.get().send(
+                rkp_engine::EngineCommand::ConvertProceduralToVoxel { entity_id: id },
+            );
+        }
+        convert_target.set(None);
+    };
 
     // Title section for the borderless window titlebar.
     let title_section: std::rc::Rc<dyn Fn(&mut rinch::core::dom::RenderScope) -> rinch::core::dom::NodeHandle> =
@@ -154,6 +180,45 @@ pub fn LayoutRoot() -> NodeHandle {
                 // Welcome screen overlay
                 if !store.project_loaded.get() {
                     WelcomeScreen {}
+                }
+
+                Modal {
+                    opened_fn: move || convert_target.get().is_some(),
+                    onclose: move || { convert_target.set(None); },
+                    title: "Convert to voxel object?",
+                    size: "sm",
+                    centered: true,
+                    with_overlay: true,
+                    close_on_click_outside: true,
+                    close_on_escape: true,
+                    with_close_button: true,
+                    Stack { gap: "md",
+                        Text { size: "sm",
+                            {move || format!(
+                                "Drop the procedural tree on \"{}\" and keep the \
+                                 currently-baked voxels as a plain voxel object. The \
+                                 tree will be lost — you won't be able to tweak its \
+                                 parameters afterwards.",
+                                convert_name.get()
+                            )}
+                        }
+                        Text { size: "xs", color: "dimmed",
+                            "Tip: \"Copy to New Voxel Object\" does the same thing \
+                             without destroying the original."
+                        }
+                        Group { justify: "flex-end", gap: "sm",
+                            Button {
+                                variant: "subtle",
+                                onclick: move || { convert_target.set(None); },
+                                "Cancel"
+                            }
+                            Button {
+                                color: "red",
+                                onclick: on_confirm,
+                                "Convert"
+                            }
+                        }
+                    }
                 }
             }
         }

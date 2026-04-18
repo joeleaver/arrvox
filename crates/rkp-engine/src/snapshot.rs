@@ -37,6 +37,11 @@ pub struct SceneObjectInfo {
     pub parent_id: Option<Uuid>,
     pub is_camera: bool,
     pub is_light: bool,
+    /// Has a `ProceduralGeometry` component — the scene tree uses
+    /// this to show / hide the procedural-specific context menu
+    /// entries ("Convert to Voxel Object", "Copy to New Voxel
+    /// Object"). Other surfaces can read it too.
+    pub is_procedural: bool,
 }
 
 /// State the engine publishes at the end of each tick.
