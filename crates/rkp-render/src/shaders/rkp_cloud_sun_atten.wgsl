@@ -136,11 +136,16 @@ fn sun_atten_main() {
         return;
     }
 
-    // 24 samples with a jitter based on frame_index — combined with the engine-side
-    // temporal lerp, different frames probe slightly different positions, so even if
-    // a cloud feature is thinner than the step spacing, it registers statistically.
-    let num_steps = 24u;
-    let step = (t_exit - t_enter) / f32(num_steps);
+    // Adaptive step count targeting ~100 m per step regardless of sun angle.
+    // At low sun the camera→sun path through the cloud slab stretches to tens
+    // of kilometres; a fixed 24-sample march would space samples hundreds of
+    // metres apart, so a thin cloud flipping in/out of one sample gives a huge
+    // per-frame τ swing. Cap at 128 to bound cost (still negligible for a
+    // single-thread compute).
+    let path = t_exit - t_enter;
+    let target_step = 100.0;
+    let num_steps = clamp(u32(path / target_step), 24u, 128u);
+    let step = path / f32(num_steps);
     let jitter = fract(f32(params.frame_index) * 0.61803398);
     var tau = 0.0;
     for (var i = 0u; i < num_steps; i++) {

@@ -622,7 +622,11 @@ impl EngineState {
             } else {
                 1.0
             };
-            self.cloud_sun_atten = self.cloud_sun_atten + (target_atten - self.cloud_sun_atten) * 0.1;
+            // Lerp slowly toward the readback value — the GPU integral can still
+            // swing a bit when a cloud edge crosses the camera→sun ray, and a
+            // multi-frame fade reads as "cloud rolling over the sun" rather than
+            // a per-frame flicker.
+            self.cloud_sun_atten = self.cloud_sun_atten + (target_atten - self.cloud_sun_atten) * 0.04;
 
             let mut sun_light = self.environment.to_gpu_light();
             sun_light.color[0] *= self.cloud_sun_atten;

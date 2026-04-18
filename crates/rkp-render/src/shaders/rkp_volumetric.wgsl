@@ -44,10 +44,11 @@ struct CloudParams {
 
 @group(0) @binding(0) var<uniform> params: VolumetricParams;
 @group(0) @binding(1) var depth_buffer: texture_2d<f32>;
-@group(0) @binding(2) var output_scatter: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(2) var cloud_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(3) var<uniform> cloud_params: CloudParams;
 @group(0) @binding(4) var history_scatter: texture_2d<f32>;
 @group(0) @binding(5) var history_samp: sampler;
+@group(0) @binding(6) var fog_out: texture_storage_2d<rgba16float, write>;
 
 // --- Helpers ---
 
@@ -273,13 +274,31 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     let ray_dir = normalize(params.cam_forward.xyz + ndc.x * params.cam_right.xyz + ndc.y * params.cam_up.xyz);
 
-    // Scene depth from G-buffer (sample center of 2x2 block).
-    let full_coord = vec2<i32>(gid.xy) * 2 + vec2<i32>(1, 1);
-    let depth_data = textureLoad(depth_buffer, full_coord, 0);
-    var max_t = min(depth_data.w, params.far);
-    if depth_data.w >= 9999.0 || depth_data.w <= 0.0 {
-        max_t = params.far;
-    }
+    // Scene depth from G-buffer — sample all 4 full-res pixels covered by this
+    // half-res workgroup. The half-res pixel is considered sky only if *all*
+    // four are sky; otherwise partial-object edges leak TAA-blended sky values
+    // onto object pixels during nearest-neighbor upsample in the composite.
+    let full_base = vec2<i32>(gid.xy) * 2;
+    let d0 = textureLoad(depth_buffer, full_base, 0).w;
+    let d1 = textureLoad(depth_buffer, full_base + vec2<i32>(1, 0), 0).w;
+    let d2 = textureLoad(depth_buffer, full_base + vec2<i32>(0, 1), 0).w;
+    let d3 = textureLoad(depth_buffer, full_base + vec2<i32>(1, 1), 0).w;
+    let is_sky0 = d0 >= 9999.0 || d0 <= 0.0;
+    let is_sky1 = d1 >= 9999.0 || d1 <= 0.0;
+    let is_sky2 = d2 >= 9999.0 || d2 <= 0.0;
+    let is_sky3 = d3 >= 9999.0 || d3 <= 0.0;
+    let all_sky = is_sky0 && is_sky1 && is_sky2 && is_sky3;
+    // Conservative max_t: closest non-sky depth (so we don't march past any
+    // geometry in the block), fall back to far for all-sky blocks.
+    var min_depth = params.far;
+    if !is_sky0 { min_depth = min(min_depth, d0); }
+    if !is_sky1 { min_depth = min(min_depth, d1); }
+    if !is_sky2 { min_depth = min(min_depth, d2); }
+    if !is_sky3 { min_depth = min(min_depth, d3); }
+    var max_t = min(min_depth, params.far);
+    // Keep a `depth_data` placeholder so later code that only references `.w`
+    // continues to read a representative value (anchor corner).
+    let depth_data = vec4<f32>(0.0, 0.0, 0.0, select(d3, params.far, all_sky));
 
     let jitter = interleaved_gradient_noise(vec2<f32>(gid.xy), params.frame_index);
     let cos_sun = dot(ray_dir, params.sun_dir.xyz);
@@ -287,52 +306,53 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let scatter_albedo = params.fog_color.xyz;
     let sky_ambient = vec3<f32>(params.vol_ambient_r, params.vol_ambient_g, params.vol_ambient_b);
 
-    var scatter = vec3<f32>(0.0);
-    var transmittance = 1.0;
+    // Separate accumulators: fog goes to all pixels (no TAA), cloud goes only
+    // to sky pixels (TAA'd below). Treating them as independent media is a
+    // reasonable approximation because fog is near-field and clouds are at
+    // altitude — they rarely overlap spatially along a ray.
+    var fog_scatter = vec3<f32>(0.0);
+    var fog_trans = 1.0;
+    var cloud_scatter = vec3<f32>(0.0);
+    var cloud_trans = 1.0;
 
-    // Near-field march (fog + dust + low clouds).
+    // Near-field march (fog + dust; can also accumulate low clouds if the
+    // camera sits inside the cloud layer).
     for (var i = 0u; i < params.max_steps; i++) {
         let t = params.near + (f32(i) + jitter) * params.step_size;
         if t >= max_t { break; }
 
         let pos = params.cam_pos.xyz + ray_dir * t;
-        // Fade out fog near the camera to avoid visible density boundary.
         let near_fade = smoothstep(0.0, 20.0, t);
         let densities = sample_density(pos, t, params.step_size);
         let fog_dens = densities.x * near_fade;
         let cloud_dens = densities.y;
-        let total = fog_dens + cloud_dens;
-        if total <= 0.001 { continue; }
 
-        let sun_vis = 1.0;
+        // Fog contribution (analytic integration, all pixels).
+        if fog_dens > 0.001 {
+            let fog_L = henyey_greenstein(cos_sun, dust_g) * params.sun_color.xyz * scatter_albedo
+                      + sky_ambient * scatter_albedo;
+            let fog_absorbed = 1.0 - exp(-fog_dens * params.step_size);
+            fog_scatter += fog_L * fog_absorbed * fog_trans;
+            fog_trans *= 1.0 - fog_absorbed;
+        }
 
-        // Fog/dust in-scattering.
-        let fog_sun = fog_dens * sun_vis * henyey_greenstein(cos_sun, dust_g)
-                    * params.sun_color.xyz * scatter_albedo;
-        let fog_sky = fog_dens * sky_ambient * scatter_albedo;
-
-        // Cloud in-scattering — self-shadow + multi-scatter octaves when cloud is present.
-        var cloud_sun_L = vec3<f32>(0.0);
+        // Near-field cloud contribution (only when camera is in cloud layer).
         if cloud_dens > 0.001 {
             let tau_sun = cloud_sun_optical_depth(pos, jitter);
-            cloud_sun_L = cloud_sun_inscatter(tau_sun, cos_sun, params.sun_color.xyz) * CLOUD_ALBEDO;
+            let sun_L = cloud_sun_inscatter(tau_sun, cos_sun, params.sun_color.xyz) * CLOUD_ALBEDO;
+            let cloud_L = sun_L + sky_ambient * CLOUD_ALBEDO;
+            let cloud_absorbed = 1.0 - exp(-cloud_dens * params.step_size);
+            cloud_scatter += cloud_L * cloud_absorbed * cloud_trans;
+            cloud_trans *= 1.0 - cloud_absorbed;
         }
-        let cloud_sun = cloud_dens * cloud_sun_L;
-        let cloud_sky = cloud_dens * sky_ambient * CLOUD_ALBEDO;
 
-        // Analytic per-step integration assuming constant density over the step:
-        // ∫₀^dt σ_s·L·exp(-σ_t·s) ds = (σ_s·L / σ_t)·(1-exp(-σ_t·dt)).
-        // σ_s terms (fog_*, cloud_*) already carry their densities, so factor out 1/total.
-        let absorbed = 1.0 - exp(-total * params.step_size);
-        scatter += (fog_sun + fog_sky + cloud_sun + cloud_sky) * transmittance * (absorbed / total);
-        transmittance *= 1.0 - absorbed;
-        if transmittance < 0.03 { break; }
+        if fog_trans < 0.03 && cloud_trans < 0.03 { break; }
     }
 
     // High-altitude cloud march (ray-slab intersection).
     // Only for sky pixels — clouds behind opaque geometry are occluded.
-    let is_sky = depth_data.w >= 9999.0 || depth_data.w <= 0.0;
-    if cloud_params.flags.x > 0.5 && transmittance > 0.01 && is_sky {
+    let is_sky = all_sky;
+    if cloud_params.flags.x > 0.5 && cloud_trans > 0.01 && is_sky {
         let cloud_min = cloud_params.altitude.x;
         let cloud_max = cloud_params.altitude.y;
         let cam_y = params.cam_pos.y;
@@ -399,35 +419,47 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
                 // Analytic per-step integration (albedo=1: σ_s = σ_t = cd, so cd cancels).
                 let absorbed = 1.0 - exp(-cd * cloud_step_size);
-                scatter += displayed_L * absorbed * transmittance;
-                transmittance *= 1.0 - absorbed;
-                if transmittance < 0.03 { break; }
+                cloud_scatter += displayed_L * absorbed * cloud_trans;
+                cloud_trans *= 1.0 - absorbed;
+                if cloud_trans < 0.03 { break; }
             }
         }
     }
 
-    // --- Temporal reprojection ---
-    // Rotation-only reprojection: multiply the world-space ray direction by prev_vp
-    // with w=0. This ignores camera translation entirely (valid for distant sky/cloud
-    // content) and captures camera rotation exactly, which is the main source of
-    // between-frame pixel-to-pixel variation for a sky pass.
-    var final_scatter = scatter;
-    var final_trans = transmittance;
+    // --- Temporal reprojection (cloud only) ---
+    // Rotation-only reprojection is valid for sky/cloud content. On non-sky
+    // pixels we write an identity (0,0,0,1) to cloud_out so the composite is a
+    // no-op, and a marker (-1 alpha) to history so that when a pixel becomes
+    // sky again we don't blend in stale cloud from before the occlusion.
+    var final_cloud_scatter = cloud_scatter;
+    var final_cloud_trans = cloud_trans;
 
-    let prev_clip = params.prev_view_proj * vec4<f32>(ray_dir, 0.0);
-    if prev_clip.w > 0.0 && params.frame_index > 0u {
-        let prev_ndc = prev_clip.xyz / prev_clip.w;
-        let prev_uv = prev_ndc.xy * vec2<f32>(0.5, -0.5) + 0.5;
-        if all(prev_uv >= vec2<f32>(0.0)) && all(prev_uv <= vec2<f32>(1.0)) {
-            let hist = textureSampleLevel(history_scatter, history_samp, prev_uv, 0.0);
-            // Balance between detail (high alpha) and flicker (low alpha). 0.25
-            // keeps visible cloud structure while damping high-freq sample jitter
-            // that the 4th detail octave can produce at high density.
-            let alpha = 0.25;
-            final_scatter = mix(hist.rgb, scatter, alpha);
-            final_trans = mix(hist.a, transmittance, alpha);
+    if is_sky {
+        let prev_clip = params.prev_view_proj * vec4<f32>(ray_dir, 0.0);
+        if prev_clip.w > 0.0 && params.frame_index > 0u {
+            let prev_ndc = prev_clip.xyz / prev_clip.w;
+            let prev_uv = prev_ndc.xy * vec2<f32>(0.5, -0.5) + 0.5;
+            if all(prev_uv >= vec2<f32>(0.0)) && all(prev_uv <= vec2<f32>(1.0)) {
+                let hist = textureSampleLevel(history_scatter, history_samp, prev_uv, 0.0);
+                if hist.a >= 0.0 {
+                    let current_uv = (vec2<f32>(gid.xy) + 0.5)
+                                   / vec2<f32>(f32(params.width), f32(params.height));
+                    let motion = length(prev_uv - current_uv);
+                    let validity = 1.0 - smoothstep(0.04, 0.15, motion);
+
+                    let alpha = mix(1.0, 0.25, validity);
+                    final_cloud_scatter = mix(hist.rgb, cloud_scatter, alpha);
+                    final_cloud_trans = mix(hist.a, cloud_trans, alpha);
+                }
+            }
         }
     }
 
-    textureStore(output_scatter, coord, vec4<f32>(final_scatter, final_trans));
+    // Write fog (all pixels) and cloud (identity for non-sky so composite is neutral).
+    textureStore(fog_out, coord, vec4<f32>(fog_scatter, fog_trans));
+    if is_sky {
+        textureStore(cloud_out, coord, vec4<f32>(final_cloud_scatter, final_cloud_trans));
+    } else {
+        textureStore(cloud_out, coord, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+    }
 }

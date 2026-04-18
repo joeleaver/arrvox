@@ -74,11 +74,16 @@ pub struct RkpVolumetricPass {
     params_buffer: wgpu::Buffer,
     cloud_params_buffer: wgpu::Buffer,
 
-    /// Half-res scatter+transmittance output.
-    pub scatter_texture: wgpu::Texture,
-    pub scatter_view: wgpu::TextureView,
+    /// Half-res cloud scatter+transmittance output. Identity (0,0,0,1) on
+    /// non-sky pixels so the cloud composite step is a no-op there.
+    pub cloud_texture: wgpu::Texture,
+    pub cloud_view: wgpu::TextureView,
 
-    /// Previous-frame scatter buffer — sampled in the march for temporal accumulation.
+    /// Half-res fog scatter+transmittance output (all pixels, no TAA).
+    pub fog_texture: wgpu::Texture,
+    pub fog_view: wgpu::TextureView,
+
+    /// Previous-frame cloud buffer — sampled in the march for temporal accumulation.
     history_texture: wgpu::Texture,
     history_view: wgpu::TextureView,
     history_sampler: wgpu::Sampler,
@@ -93,6 +98,13 @@ pub struct RkpVolumetricPass {
     height: u32,
 
     depth_view_set: bool,
+
+    // Selective history update — copies current scatter into history only for
+    // sky pixels, leaving object pixels untouched so their stale values don't
+    // bleed into sky reprojection next frame.
+    history_update_pipeline: wgpu::ComputePipeline,
+    history_update_bind_group: Option<wgpu::BindGroup>,
+    history_update_bind_group_layout: wgpu::BindGroupLayout,
 
     // Cloud → sun attenuation: tiny compute pass + async readback.
     sun_atten_pipeline: wgpu::ComputePipeline,
@@ -181,6 +193,17 @@ impl RkpVolumetricPass {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    // 6: fog scatter output (half-res, write)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::Rgba16Float,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -200,7 +223,7 @@ impl RkpVolumetricPass {
                         },
                         count: None,
                     },
-                    // 1: vol scatter (read)
+                    // 1: cloud scatter (read)
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -222,6 +245,17 @@ impl RkpVolumetricPass {
                         },
                         count: None,
                     },
+                    // 3: fog scatter (read)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -239,13 +273,16 @@ impl RkpVolumetricPass {
             mapped_at_creation: false,
         });
 
-        // Textures. Scatter is COPY_SRC so we can blit it into the history after each
-        // march; history is COPY_DST + sampleable so the next march can read it.
-        let (scatter_texture, scatter_view) = Self::create_scatter_texture(
-            device, "vol scatter", half_width, half_height,
+        // Textures. Cloud + fog are separate half-res buffers; history stores
+        // previous-frame cloud for TAA.
+        let (cloud_texture, cloud_view) = Self::create_march_output_texture(
+            device, "vol cloud", half_width, half_height,
+        );
+        let (fog_texture, fog_view) = Self::create_march_output_texture(
+            device, "vol fog", half_width, half_height,
         );
         let (history_texture, history_view) = Self::create_history_texture(
-            device, "vol scatter history", half_width, half_height,
+            device, "vol cloud history", half_width, half_height,
         );
         let history_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("vol history sampler"),
@@ -298,6 +335,63 @@ impl RkpVolumetricPass {
             layout: Some(&composite_layout),
             module: &composite_module,
             entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // History-update pipeline — per-pixel copy of current scatter into history,
+        // gated by depth so non-sky pixels don't contaminate the history buffer.
+        let history_update_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("vol history update layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let history_update_src = include_str!("shaders/rkp_vol_history_update.wgsl");
+        validate_wgsl(history_update_src, "rkp_vol_history_update");
+        let history_update_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rkp_vol_history_update"),
+            source: wgpu::ShaderSource::Wgsl(history_update_src.into()),
+        });
+        let history_update_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("vol history update pipeline layout"),
+            bind_group_layouts: &[Some(&history_update_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let history_update_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("vol history update"),
+            layout: Some(&history_update_pipeline_layout),
+            module: &history_update_module,
+            entry_point: Some("update_history"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -388,8 +482,10 @@ impl RkpVolumetricPass {
             composite_bind_group: None,
             params_buffer,
             cloud_params_buffer,
-            scatter_texture,
-            scatter_view,
+            cloud_texture,
+            cloud_view,
+            fog_texture,
+            fog_view,
             history_texture,
             history_view,
             history_sampler,
@@ -400,6 +496,9 @@ impl RkpVolumetricPass {
             width,
             height,
             depth_view_set: false,
+            history_update_pipeline,
+            history_update_bind_group: None,
+            history_update_bind_group_layout,
             sun_atten_pipeline,
             sun_atten_bind_group,
             sun_atten_storage,
@@ -419,31 +518,40 @@ impl RkpVolumetricPass {
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: self.params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.scatter_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.cloud_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: self.cloud_params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.history_view) },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&self.history_sampler) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.fog_view) },
+            ],
+        }));
+        self.history_update_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vol history update bg"),
+            layout: &self.history_update_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.cloud_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.history_view) },
             ],
         }));
         self.depth_view_set = true;
     }
 
-    /// Copy the current scatter output into the history buffer for next-frame reprojection.
-    pub fn copy_scatter_to_history(&self, encoder: &mut wgpu::CommandEncoder) {
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.scatter_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.history_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d { width: self.half_width, height: self.half_height, depth_or_array_layers: 1 },
+    /// Copy the current scatter output into the history buffer for next-frame
+    /// reprojection — but only for sky pixels. Object pixels leave history
+    /// untouched so their transient values don't bleed into sky reprojection.
+    pub fn update_history(&self, encoder: &mut wgpu::CommandEncoder) {
+        let Some(bg) = &self.history_update_bind_group else { return };
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("vol history update"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.history_update_pipeline);
+        pass.set_bind_group(0, bg, &[]);
+        pass.dispatch_workgroups(
+            (self.half_width + 7) / 8,
+            (self.half_height + 7) / 8,
+            1,
         );
     }
 
@@ -454,8 +562,9 @@ impl RkpVolumetricPass {
             layout: &self.composite_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(hdr_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.scatter_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.cloud_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.output_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.fog_view) },
             ],
         }));
     }
@@ -565,10 +674,13 @@ impl RkpVolumetricPass {
         self.half_height = hh;
         self.width = width;
         self.height = height;
-        let (st, sv) = Self::create_scatter_texture(device, "vol scatter", hw, hh);
-        self.scatter_texture = st;
-        self.scatter_view = sv;
-        let (ht, hv) = Self::create_history_texture(device, "vol scatter history", hw, hh);
+        let (ct, cv) = Self::create_march_output_texture(device, "vol cloud", hw, hh);
+        self.cloud_texture = ct;
+        self.cloud_view = cv;
+        let (ft, fv) = Self::create_march_output_texture(device, "vol fog", hw, hh);
+        self.fog_texture = ft;
+        self.fog_view = fv;
+        let (ht, hv) = Self::create_history_texture(device, "vol cloud history", hw, hh);
         self.history_texture = ht;
         self.history_view = hv;
         let (ot, ov) = Self::create_texture(device, "vol output", width, height, wgpu::TextureFormat::Rgba16Float);
@@ -598,7 +710,7 @@ impl RkpVolumetricPass {
         (tex, view)
     }
 
-    fn create_scatter_texture(
+    fn create_march_output_texture(
         device: &wgpu::Device,
         label: &str,
         w: u32,
@@ -611,9 +723,7 @@ impl RkpVolumetricPass {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -633,7 +743,7 @@ impl RkpVolumetricPass {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         });
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
