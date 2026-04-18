@@ -32,7 +32,6 @@ pub struct VolumetricParams {
     pub far: f32,
     pub fog_color: [f32; 4],
     pub fog_height: [f32; 4],
-    pub fog_distance: [f32; 4],
     pub frame_index: u32,
     pub vol_ambient_r: f32,
     pub vol_ambient_g: f32,

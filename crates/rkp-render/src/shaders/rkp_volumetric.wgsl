@@ -1,8 +1,13 @@
-// RKIPatch volumetric march — fog, dust, and procedural clouds.
+// RKIPatch volumetric march — height fog + procedural clouds.
 //
 // Half-resolution compute shader. Marches view rays through the atmosphere,
-// evaluating fog + dust + cloud density at each step. Accumulates in-scattered
+// evaluating height-fog + cloud density at each step. Accumulates in-scattered
 // light and transmittance. Output: Rgba16Float (rgb=scatter, a=transmittance).
+//
+// Distance haze is not handled here — the aerial-perspective LUT in the shade
+// pass computes that physically from the same sun/atmosphere parameters that
+// drive the sky, so it stays consistent at the horizon. The only participating
+// medium left in this pass is a height-bounded exponential fog.
 
 const PI: f32 = 3.14159265;
 
@@ -23,9 +28,8 @@ struct VolumetricParams {
     step_size:    f32,
     near:         f32,
     far:          f32,
-    fog_color:    vec4<f32>,   // xyz = scatter albedo, w = height_fog_enable
-    fog_height:   vec4<f32>,   // x = base_density, y = base_height, z = falloff, w = dist_fog_enable
-    fog_distance: vec4<f32>,   // x = dist_density, y = dist_falloff, z = dust_density, w = dust_g
+    fog_color:    vec4<f32>,   // xyz = scatter albedo, w = unused
+    fog_height:   vec4<f32>,   // x = base_density, y = base_height, z = falloff, w = unused
     frame_index:  u32,
     vol_ambient_r: f32,
     vol_ambient_g: f32,
@@ -69,17 +73,15 @@ fn henyey_greenstein(cos_theta: f32, g: f32) -> f32 {
 
 // --- Fog density ---
 
+// Forward-biased Henyey-Greenstein g for water/mist droplets. 0.3 is a broadly
+// accepted default; exposing it as a knob never proved useful in practice.
+const FOG_ASYMMETRY: f32 = 0.3;
+
 fn height_fog_density(pos: vec3<f32>) -> f32 {
     let base_density = params.fog_height.x;
     let base_height = params.fog_height.y;
     let falloff = params.fog_height.z;
     return base_density * exp(-falloff * max(pos.y - base_height, 0.0));
-}
-
-fn distance_fog_density(t: f32) -> f32 {
-    let density = params.fog_distance.x;
-    let falloff = params.fog_distance.y;
-    return density * (1.0 - exp(-falloff * t));
 }
 
 // --- Noise (for clouds) ---
@@ -270,13 +272,7 @@ fn cloud_sun_inscatter(tau_sun: f32, cos_sun: f32, sun_col: vec3<f32>) -> vec3<f
 // --- Combined density ---
 
 fn sample_density(pos: vec3<f32>, t: f32, footprint: f32) -> vec2<f32> {
-    var fog = params.fog_distance.z; // ambient dust
-    if params.fog_color.w > 0.5 {
-        fog += height_fog_density(pos);
-    }
-    if params.fog_height.w > 0.5 {
-        fog += distance_fog_density(t);
-    }
+    let fog = height_fog_density(pos);
     let cloud = cloud_density(pos, footprint);
     return vec2<f32>(fog, cloud);
 }
@@ -320,7 +316,6 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let jitter = interleaved_gradient_noise(vec2<f32>(gid.xy), params.frame_index);
     let cos_sun = dot(ray_dir, params.sun_dir.xyz);
-    let dust_g = params.fog_distance.w;
     let scatter_albedo = params.fog_color.xyz;
     let sky_ambient = vec3<f32>(params.vol_ambient_r, params.vol_ambient_g, params.vol_ambient_b);
 
@@ -347,7 +342,7 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // Fog contribution (analytic integration, all pixels).
         if fog_dens > 0.001 {
-            let fog_L = henyey_greenstein(cos_sun, dust_g) * params.sun_color.xyz * scatter_albedo
+            let fog_L = henyey_greenstein(cos_sun, FOG_ASYMMETRY) * params.sun_color.xyz * scatter_albedo
                       + sky_ambient * scatter_albedo;
             let fog_absorbed = 1.0 - exp(-fog_dens * params.step_size);
             fog_scatter += fog_L * fog_absorbed * fog_trans;
@@ -411,7 +406,7 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // Atmospheric in-scatter radiance along the view ray — the color distant
             // clouds blend toward. Sky shader handles empty-sky aerial perspective
             // on its own, so we only apply this to cloud samples (not empty steps).
-            let atm_L = henyey_greenstein(cos_sun, dust_g) * params.sun_color.xyz * scatter_albedo
+            let atm_L = henyey_greenstein(cos_sun, FOG_ASYMMETRY) * params.sun_color.xyz * scatter_albedo
                       + sky_ambient * scatter_albedo;
 
             for (var i = 0u; i < cloud_steps; i++) {

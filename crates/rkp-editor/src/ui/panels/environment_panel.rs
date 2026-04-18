@@ -44,7 +44,8 @@ fn EnvironmentForm(env: rkp_engine::environment::EnvironmentSettings) -> NodeHan
     let cmd_tx: CmdSignal = Signal::new(use_context::<CommandSender>().0);
 
     let ambient = Signal::new(env.ambient_intensity);
-    let camera_altitude = Signal::new(env.camera_altitude);
+    let scene_elevation = Signal::new(env.scene_elevation);
+    let ground_albedo = Signal::new([env.ground_albedo[0], env.ground_albedo[1], env.ground_albedo[2], 1.0]);
 
     let sky_top_override_on = Signal::new(env.sky_color_top_override.is_some());
     let sky_top_color = Signal::new({
@@ -80,12 +81,9 @@ fn EnvironmentForm(env: rkp_engine::environment::EnvironmentSettings) -> NodeHan
     let god_ray_exposure = Signal::new(env.god_ray_exposure);
     let god_ray_decay = Signal::new(env.god_ray_decay);
 
-    let dust_density = Signal::new(env.dust_density);
-    let dust_asymmetry = Signal::new(env.dust_asymmetry);
     let height_fog_density = Signal::new(env.height_fog_density);
     let fog_base_height = Signal::new(env.fog_base_height);
     let fog_height_falloff = Signal::new(env.fog_height_falloff);
-    let distance_fog_density = Signal::new(env.distance_fog_density);
     let fog_color = Signal::new([env.fog_color[0], env.fog_color[1], env.fog_color[2], 1.0]);
     let vol_far = Signal::new(env.vol_far);
 
@@ -198,7 +196,8 @@ fn EnvironmentForm(env: rkp_engine::environment::EnvironmentSettings) -> NodeHan
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
                     {prop_slider(__scope, "Ambient", ambient, 0.0, 5.0, 0.1, env_f32("ambient_intensity"))}
-                    {prop_slider(__scope, "Camera Altitude (m)", camera_altitude, 0.0, 5000.0, 10.0, env_f32("camera_altitude"))}
+                    {prop_slider(__scope, "Scene Elevation (m)", scene_elevation, 0.0, 9000.0, 10.0, env_f32("scene_elevation"))}
+                    {prop_color(__scope, "Ground Color", ground_albedo, env_color3("ground_albedo"))}
 
                     // Override: sky top color
                     {prop_checkbox(__scope, "Override Sky Top", sky_top_override_on, {
@@ -319,12 +318,9 @@ fn EnvironmentForm(env: rkp_engine::environment::EnvironmentSettings) -> NodeHan
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
                     {prop_color(__scope, "Fog Color", fog_color, env_color3("fog_color"))}
-                    {prop_slider(__scope, "Dust", dust_density, 0.0, 0.05, 0.001, env_f32("dust_density"))}
-                    {prop_slider(__scope, "Dust Asymmetry", dust_asymmetry, 0.0, 1.0, 0.01, env_f32("dust_asymmetry"))}
                     {prop_slider(__scope, "Height Fog", height_fog_density, 0.0, 0.5, 0.01, env_f32("height_fog_density"))}
                     {prop_slider(__scope, "Base Height", fog_base_height, -50.0, 100.0, 1.0, env_f32("fog_base_height"))}
                     {prop_slider(__scope, "Height Falloff", fog_height_falloff, 0.01, 1.0, 0.01, env_f32("fog_height_falloff"))}
-                    {prop_slider(__scope, "Distance Fog", distance_fog_density, 0.0, 0.1, 0.001, env_f32("distance_fog_density"))}
                     {prop_slider(__scope, "Far Distance", vol_far, 50.0, 1000.0, 10.0, env_f32("vol_far"))}
                 }
             }

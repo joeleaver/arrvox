@@ -80,8 +80,11 @@ struct Material {
 @group(5) @binding(3) var sky_view_lut: texture_2d<f32>;
 @group(5) @binding(4) var aerial_perspective_lut: texture_3d<f32>;
 
-const AP_DISTANCE_PER_SLICE: f32 = 4000.0;
-const AP_SLICE_COUNT: f32 = 32.0;
+// Aerial-perspective LUT slice parameterization — must match rkp_aerial_perspective_lut.wgsl.
+// Slice z stores the camera-to-d(z) atmospheric integral under an exponential
+// map d(z) = AP_NEAR * (AP_FAR/AP_NEAR)^((z+0.5)/N); the shade pass inverts this.
+const AP_NEAR_DISTANCE: f32 = 1.0;
+const AP_FAR_DISTANCE: f32 = 128000.0;
 
 // --- Atmospheric scattering ---
 
@@ -305,6 +308,22 @@ fn sun_disc(ray_dir: vec3<f32>, sun_dir: vec3<f32>, sun_intensity: f32, camera_a
     }
 
     return result;
+}
+
+/// Sample the aerial-perspective LUT for a shaded geometry pixel.
+/// Returns (inscatter_rgb, transmittance). Apply as:
+///   final = inscatter + surface_color * transmittance.
+fn sample_aerial_perspective(screen_uv: vec2<f32>, surface_distance: f32) -> vec4<f32> {
+    // Invert the exponential slice map to recover the texture-space Z that
+    // encodes this distance, then let trilinear filtering interpolate between
+    // the two bracketing slices in the LUT.
+    let log_ratio = log(AP_FAR_DISTANCE / AP_NEAR_DISTANCE);
+    let d = max(surface_distance, AP_NEAR_DISTANCE);
+    let slice_u = clamp(log(d / AP_NEAR_DISTANCE) / log_ratio, 0.0, 1.0);
+    return textureSampleLevel(
+        aerial_perspective_lut, atmo_sampler,
+        vec3<f32>(screen_uv, slice_u), 0.0,
+    );
 }
 
 // --- PBR helpers ---
@@ -539,10 +558,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var final_color = lo + ambient + emission;
 
-    // Aerial perspective: apply atmospheric haze to distant geometry.
-    // Aerial perspective disabled — the LUT resolution (4km/slice) is too coarse
-    // for voxel scenes at 5-50m scale. Causes visible discoloration on nearby objects.
-    // TODO: re-enable with non-linear depth mapping if large outdoor scenes need it.
+    // Aerial perspective — atmospheric inscatter + extinction between camera
+    // and the shaded surface. Under an exponential slice map, near-field
+    // precision is fine (slice 0 ≈ 1.2 m) so close voxels receive ≈ 1.0
+    // transmittance and ≈ 0 scatter, no discoloration. Far geometry meets
+    // the sky-view LUT at the horizon because both integrate the same
+    // atmosphere through most of its depth.
+    let dims_f = vec2<f32>(dims);
+    let screen_uv = (vec2<f32>(coord) + 0.5) / dims_f;
+    let surface_dist = length(world_pos - camera.position.xyz);
+    let ap = sample_aerial_perspective(screen_uv, surface_dist);
+    final_color = final_color * ap.a + ap.rgb;
 
     textureStore(output, coord, vec4<f32>(final_color, 1.0));
 }

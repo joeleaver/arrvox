@@ -611,6 +611,12 @@ impl EngineState {
             self.material_lib.clear_dirty();
         }
 
+        // Camera uniforms are needed now for altitude-dependent atmosphere
+        // params (sun transmittance, sky colors). Building them early — the
+        // actual per-frame upload still happens at step 2.
+        let cam_uniforms = self.build_camera_uniforms();
+        let cam_y = cam_uniforms.position[1];
+
         // 0b. Upload environment + lights.
         // Always rebuild lights array (entity lights may have moved).
         {
@@ -628,7 +634,7 @@ impl EngineState {
             // a per-frame flicker.
             self.cloud_sun_atten = self.cloud_sun_atten + (target_atten - self.cloud_sun_atten) * 0.04;
 
-            let mut sun_light = self.environment.to_gpu_light();
+            let mut sun_light = self.environment.to_gpu_light(cam_y);
             sun_light.color[0] *= self.cloud_sun_atten;
             sun_light.color[1] *= self.cloud_sun_atten;
             sun_light.color[2] *= self.cloud_sun_atten;
@@ -654,7 +660,7 @@ impl EngineState {
                 });
             }
 
-            let mut shade_params = self.environment.to_shade_params();
+            let mut shade_params = self.environment.to_shade_params(cam_y);
             shade_params.num_lights = gpu_lights.len() as u32;
             self.renderer.update_shade_params(&self.queue, &shade_params);
             self.renderer.update_lights(&self.queue, &gpu_lights);
@@ -695,7 +701,7 @@ impl EngineState {
         }
 
         // 2. Upload per-frame data (objects + camera + bone matrices).
-        let cam_uniforms = self.build_camera_uniforms();
+        // (cam_uniforms was built above for the altitude-dependent params.)
         let frame = FrameUpload {
             objects: &self.gpu_objects,
             camera: &cam_uniforms,
@@ -767,8 +773,8 @@ impl EngineState {
         let atmo_frame = rkp_render::rkp_atmosphere::AtmosphereFrameParams {
             sun_dir: [-sun_d[0], -sun_d[1], -sun_d[2]],
             sun_intensity: self.environment.sun_intensity,
-            camera_altitude: self.environment.camera_altitude,
-            _pad: [0.0; 3],
+            camera_altitude: self.environment.effective_altitude(cam_y),
+            ground_albedo: self.environment.ground_albedo,
             cam_pos: [cam_uniforms.position[0], cam_uniforms.position[1], cam_uniforms.position[2]],
             _pad1b: 0.0,
             cam_forward: [cam_uniforms.forward[0], cam_uniforms.forward[1], cam_uniforms.forward[2]],
@@ -1900,8 +1906,11 @@ impl EngineState {
                     "god_ray_exposure" => {
                         if let Ok(v) = value.parse::<f32>() { env.god_ray_exposure = v; }
                     }
-                    "camera_altitude" => {
-                        if let Ok(v) = value.parse::<f32>() { env.camera_altitude = v; }
+                    "scene_elevation" => {
+                        if let Ok(v) = value.parse::<f32>() { env.scene_elevation = v; }
+                    }
+                    "ground_albedo" => {
+                        if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) { env.ground_albedo = v; }
                     }
                     // Fog
                     "fog_color" => {
@@ -1915,18 +1924,6 @@ impl EngineState {
                     }
                     "fog_height_falloff" => {
                         if let Ok(v) = value.parse::<f32>() { env.fog_height_falloff = v; }
-                    }
-                    "distance_fog_density" => {
-                        if let Ok(v) = value.parse::<f32>() { env.distance_fog_density = v; }
-                    }
-                    "distance_fog_falloff" => {
-                        if let Ok(v) = value.parse::<f32>() { env.distance_fog_falloff = v; }
-                    }
-                    "dust_density" => {
-                        if let Ok(v) = value.parse::<f32>() { env.dust_density = v; }
-                    }
-                    "dust_asymmetry" => {
-                        if let Ok(v) = value.parse::<f32>() { env.dust_asymmetry = v; }
                     }
                     "vol_far" => {
                         if let Ok(v) = value.parse::<f32>() { env.vol_far = v; }

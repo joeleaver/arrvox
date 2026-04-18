@@ -48,17 +48,26 @@ pub struct EnvironmentSettings {
     pub god_ray_exposure: f32,
 
     // ── Atmosphere ─────────────────────────────────────────────────
-    pub camera_altitude: f32,
+    /// Elevation of the scene origin (Y=0) above sea level, in metres.
+    /// Added to the camera's world Y to get the altitude fed into the
+    /// atmosphere model (transmittance, sky-view, aerial perspective).
+    /// Default 0 assumes Y=0 is ground/sea-level — set higher only for
+    /// mountain scenes where Y=0 is already elevated.
+    pub scene_elevation: f32,
+
+    /// Linear-RGB albedo of the virtual "ground" that fills the sky-view
+    /// LUT below the horizon. Gives empty voxel scenes a smooth
+    /// earth-through-atmosphere fade instead of a black void at the edge
+    /// of the ground plane. 0.3 grey is a reasonable desert/asphalt mix.
+    pub ground_albedo: [f32; 3],
 
     // ── Volumetric fog ─────────────────────────────────────────────
+    // Height-fog is the only participating-medium knob; distance haze is now
+    // handled physically by the aerial-perspective LUT in the shade pass.
     pub fog_color: [f32; 3],
     pub height_fog_density: f32,
     pub fog_base_height: f32,
     pub fog_height_falloff: f32,
-    pub distance_fog_density: f32,
-    pub distance_fog_falloff: f32,
-    pub dust_density: f32,
-    pub dust_asymmetry: f32,
     pub vol_max_steps: u32,
     pub vol_step_size: f32,
     pub vol_far: f32,
@@ -119,16 +128,13 @@ impl Default for EnvironmentSettings {
             god_ray_decay: 0.97,
             god_ray_exposure: 0.3,
 
-            camera_altitude: 100.0,
+            scene_elevation: 0.0,
+            ground_albedo: [0.3, 0.3, 0.3],
 
             fog_color: [0.7, 0.75, 0.8],
             height_fog_density: 0.0,
             fog_base_height: 0.0,
             fog_height_falloff: 0.1,
-            distance_fog_density: 0.0,
-            distance_fog_falloff: 0.005,
-            dust_density: 0.0,
-            dust_asymmetry: 0.3,
             vol_max_steps: 32,
             vol_step_size: 2.0,
             vol_far: 200.0,
@@ -338,31 +344,38 @@ impl EnvironmentSettings {
         ]
     }
 
+    /// Effective altitude of the camera above sea level, in metres.
+    /// Adds the scene's elevation offset to the camera's world-space Y.
+    pub fn effective_altitude(&self, cam_y: f32) -> f32 {
+        self.scene_elevation + cam_y
+    }
+
     /// Build GPU shade params from these settings.
     /// Sky colors and ambient are computed from the atmosphere model.
     /// Fixed atmosphere radiance (matches GPU ATMO_SUN_RADIANCE constant).
     /// Multi-scattering boost — must match MULTI_SCATTER_BOOST in rkp_shade.wgsl.
-    pub fn to_shade_params(&self) -> rkp_render::rkp_shade::ShadeParams {
+    pub fn to_shade_params(&self, cam_y: f32) -> rkp_render::rkp_shade::ShadeParams {
         let d = self.sun_direction();
         let sun_toward = [-d[0], -d[1], -d[2]];
+        let altitude = self.effective_altitude(cam_y);
         // Sky colors for volumetric fog compatibility (GPU ambient uses LUT directly).
-        let sky_top = atmo::sky([0.0, 1.0, 0.0], sun_toward, self.sun_intensity, self.camera_altitude);
+        let sky_top = atmo::sky([0.0, 1.0, 0.0], sun_toward, self.sun_intensity, altitude);
         let horizon_dir = {
             let el = 10.0f32.to_radians();
             [0.0, el.sin(), -el.cos()]
         };
-        let sky_horizon = atmo::sky(horizon_dir, sun_toward, self.sun_intensity, self.camera_altitude);
+        let sky_horizon = atmo::sky(horizon_dir, sun_toward, self.sun_intensity, altitude);
 
         rkp_render::rkp_shade::ShadeParams {
             num_lights: 1,
             ambient_intensity: self.ambient_intensity,
-            camera_altitude: self.camera_altitude,
+            camera_altitude: altitude,
             sun_intensity: self.sun_intensity,
             sky_color_top: self.sky_color_top_override.unwrap_or(sky_top),
             sky_color_horizon: self.sky_color_horizon_override.unwrap_or(sky_horizon),
             sun_dir: sun_toward,
             ambient_color: {
-                let amb = atmo::ambient(sun_toward, self.sun_intensity, self.camera_altitude);
+                let amb = atmo::ambient(sun_toward, self.sun_intensity, altitude);
                 [amb[0] * self.ambient_intensity, amb[1] * self.ambient_intensity, amb[2] * self.ambient_intensity]
             },
             ..Default::default()
@@ -379,6 +392,7 @@ impl EnvironmentSettings {
     ) -> rkp_render::rkp_volumetric::VolumetricParams {
         let d = self.sun_direction();
         let sun_toward = [-d[0], -d[1], -d[2]]; // toward sun (negated)
+        let altitude = self.effective_altitude(cam.position[1]);
         rkp_render::rkp_volumetric::VolumetricParams {
             cam_pos: cam.position,
             cam_forward: cam.forward,
@@ -386,7 +400,7 @@ impl EnvironmentSettings {
             cam_up: cam.up,
             sun_dir: [sun_toward[0], sun_toward[1], sun_toward[2], 0.0],
             sun_color: {
-                let trans = atmo::sun_transmittance(sun_toward, self.camera_altitude);
+                let trans = atmo::sun_transmittance(sun_toward, altitude);
                 let base = self.sun_color_override.unwrap_or([1.0 * trans[0], 0.95 * trans[1], 0.9 * trans[2]]);
                 [base[0] * self.sun_intensity, base[1] * self.sun_intensity, base[2] * self.sun_intensity, 0.0]
             },
@@ -398,29 +412,24 @@ impl EnvironmentSettings {
             step_size: self.vol_step_size,
             near: 0.5,
             far: self.vol_far,
-            fog_color: [
-                self.fog_color[0], self.fog_color[1], self.fog_color[2],
-                if self.height_fog_density > 0.0 { 1.0 } else { 0.0 },
-            ],
+            fog_color: [self.fog_color[0], self.fog_color[1], self.fog_color[2], 0.0],
             fog_height: [
-                self.height_fog_density, self.fog_base_height, self.fog_height_falloff,
-                if self.distance_fog_density > 0.0 { 1.0 } else { 0.0 },
-            ],
-            fog_distance: [
-                self.distance_fog_density, self.distance_fog_falloff,
-                self.dust_density, self.dust_asymmetry,
+                self.height_fog_density,
+                self.fog_base_height,
+                self.fog_height_falloff,
+                0.0,
             ],
             frame_index,
             vol_ambient_r: {
-                let a = atmo::ambient(sun_toward, self.sun_intensity, self.camera_altitude);
+                let a = atmo::ambient(sun_toward, self.sun_intensity, altitude);
                 a[0] * self.ambient_intensity
             },
             vol_ambient_g: {
-                let a = atmo::ambient(sun_toward, self.sun_intensity, self.camera_altitude);
+                let a = atmo::ambient(sun_toward, self.sun_intensity, altitude);
                 a[1] * self.ambient_intensity
             },
             vol_ambient_b: {
-                let a = atmo::ambient(sun_toward, self.sun_intensity, self.camera_altitude);
+                let a = atmo::ambient(sun_toward, self.sun_intensity, altitude);
                 a[2] * self.ambient_intensity
             },
             prev_view_proj: cam.prev_vp,
@@ -465,10 +474,10 @@ impl EnvironmentSettings {
 
     /// Build the default directional light GPU struct from these settings.
     /// Sun color is attenuated by atmospheric extinction (orange at sunset, dark at night).
-    pub fn to_gpu_light(&self) -> rkp_render::rkp_shade::GpuLight {
+    pub fn to_gpu_light(&self, cam_y: f32) -> rkp_render::rkp_shade::GpuLight {
         let d = self.sun_direction();
         let sun_toward = [-d[0], -d[1], -d[2]];
-        let trans = atmo::sun_transmittance(sun_toward, self.camera_altitude);
+        let trans = atmo::sun_transmittance(sun_toward, self.effective_altitude(cam_y));
         let atmo_color = [1.0 * trans[0], 0.95 * trans[1], 0.9 * trans[2]];
         let effective_color = self.sun_color_override.unwrap_or(atmo_color);
         rkp_render::rkp_shade::GpuLight {

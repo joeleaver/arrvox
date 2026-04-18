@@ -20,7 +20,6 @@ struct VolumetricParams {
     far:          f32,
     fog_color:    vec4<f32>,
     fog_height:   vec4<f32>,
-    fog_distance: vec4<f32>,
     frame_index:  u32,
     vol_ambient_r: f32,
     vol_ambient_g: f32,
