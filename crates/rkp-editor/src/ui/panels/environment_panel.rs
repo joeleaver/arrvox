@@ -306,9 +306,9 @@ fn EnvironmentForm(env: rkp_engine::environment::EnvironmentSettings) -> NodeHan
             if !god_ray_collapsed.get() {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
-                    {prop_slider(__scope, "Density", god_ray_density, 0.0, 3.0, 0.1, env_f32("god_ray_density"))}
+                    {prop_slider(__scope, "Density", god_ray_density, 0.0, 1.0, 0.05, env_f32("god_ray_density"))}
                     {prop_slider(__scope, "Exposure", god_ray_exposure, 0.0, 1.0, 0.01, env_f32("god_ray_exposure"))}
-                    {prop_slider(__scope, "Decay", god_ray_decay, 0.9, 1.0, 0.005, env_f32("god_ray_decay"))}
+                    {prop_slider(__scope, "Decay", god_ray_decay, 0.85, 1.0, 0.005, env_f32("god_ray_decay"))}
                 }
             }
 

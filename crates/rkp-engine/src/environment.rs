@@ -125,8 +125,8 @@ impl Default for EnvironmentSettings {
 
             god_ray_density: 1.0,
             god_ray_weight: 0.01,
-            god_ray_decay: 0.97,
-            god_ray_exposure: 0.3,
+            god_ray_decay: 0.95,
+            god_ray_exposure: 0.1,
 
             scene_elevation: 0.0,
             ground_albedo: [0.3, 0.3, 0.3],
@@ -348,6 +348,17 @@ impl EnvironmentSettings {
     /// Adds the scene's elevation offset to the camera's world-space Y.
     pub fn effective_altitude(&self, cam_y: f32) -> f32 {
         self.scene_elevation + cam_y
+    }
+
+    /// Atmospheric-extinction-tinted sun colour (linear RGB), no intensity
+    /// multiplier. Same shape fed to GpuLight / VolumetricParams; reusable
+    /// by any pass that wants to render "sunlight" with a consistent hue.
+    pub fn sun_tint(&self, cam_y: f32) -> [f32; 3] {
+        let d = self.sun_direction();
+        let sun_toward = [-d[0], -d[1], -d[2]];
+        let trans = atmo::sun_transmittance(sun_toward, self.effective_altitude(cam_y));
+        let atmo_color = [trans[0], 0.95 * trans[1], 0.9 * trans[2]];
+        self.sun_color_override.unwrap_or(atmo_color)
     }
 
     /// Build GPU shade params from these settings.

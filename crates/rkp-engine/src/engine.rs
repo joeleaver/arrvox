@@ -804,6 +804,11 @@ impl EngineState {
             };
             let sun_uv = [ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5];
 
+            // Atmospherically-tinted sun colour (plain 0-1 linear RGB). HDR
+            // magnitude comes from reading the composite's sun-disc luminance
+            // inside the shader; the tint here just biases the ray hue.
+            let sun_tint = self.environment.sun_tint(cam_y);
+
             let god_ray_params = rkp_render::rkp_god_rays::GodRayParams {
                 sun_screen_pos: sun_uv,
                 sun_on_screen,
@@ -812,6 +817,8 @@ impl EngineState {
                 decay: self.environment.god_ray_decay,
                 exposure: self.environment.god_ray_exposure,
                 num_samples: 64,
+                sun_color: sun_tint,
+                _pad: 0.0,
             };
             self.renderer.god_rays.update_params(&self.queue, &god_ray_params);
         }

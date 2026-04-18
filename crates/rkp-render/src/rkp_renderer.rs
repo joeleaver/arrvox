@@ -106,7 +106,9 @@ impl RkpRenderer {
         );
         let volumetric = RkpVolumetricPass::new(device, width, height);
         let mut god_rays = RkpGodRayPass::new(device, width, height);
-        god_rays.set_input(device, &volumetric.output_view);
+        // Wired for real in set_gbuffer; the G-buffer views aren't available
+        // yet here. A no-op dispatch is safe until then (bind group is None).
+        let _ = &mut god_rays;
 
         let skin_deform = crate::skin_deform::SkinDeformPass::new(device, &scene);
 
@@ -185,7 +187,12 @@ impl RkpRenderer {
         self.shade.set_shadow_and_ssao(&self.device, &self.shadow_trace.output_view, &self.ssao.output_view);
         self.volumetric.set_depth_view(&self.device, &gbuffer.position_view);
         self.volumetric.set_scene_hdr_view(&self.device, &self.shade.output_view);
-        self.god_rays.set_input(&self.device, &self.volumetric.output_view);
+        self.god_rays.set_inputs(
+            &self.device,
+            &self.volumetric.output_view,
+            &gbuffer.position_view,
+            &self.volumetric.cloud_view,
+        );
     }
 
     pub fn set_hdr_output(&mut self, view: &wgpu::TextureView) {
