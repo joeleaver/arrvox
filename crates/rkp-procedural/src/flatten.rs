@@ -138,7 +138,17 @@ pub struct ProcInstruction {
     /// that supports 65k distinct primitives per procedural, well
     /// past where the raymarch is cost-effective.
     pub node_id: u32,
-    pub _pad0: u32,
+    /// For primitives: scalar converting local SDF distance to world
+    /// distance. Equals the smallest axis scale of the composed
+    /// world transform (safe for 1-Lipschitz under non-uniform
+    /// scale). The shader multiplies each primitive's returned
+    /// distance by this before the classifier / combinator chain
+    /// sees it — without this, a `Root.scale = 20` tree returns
+    /// distances in the compressed local frame and the octree-build
+    /// classifier subdivides everything to MIXED because |d| looks
+    /// tiny everywhere. Combinators / effects set this to `1.0` and
+    /// rely on their children already being in world-space.
+    pub distance_scale: f32,
     pub _pad1: u32,
     pub _pad2: u32,
 
@@ -251,7 +261,7 @@ fn emit_children_with_implicit_union(
             ),
             material_id: 0,
             node_id: u32::MAX,
-            _pad0: 0, _pad1: 0, _pad2: 0,
+            distance_scale: 1.0, _pad1: 0, _pad2: 0,
             params: [0.0; 8],
             color: [0.0; 4],
             inverse_world: Mat4::IDENTITY.to_cols_array_2d(),
@@ -377,7 +387,7 @@ fn emit(
                 material_combine: material_combine_bits(*material_combine),
                 material_id: 0,
                 node_id: u32::MAX,
-                _pad0: 0, _pad1: 0, _pad2: 0,
+                distance_scale: 1.0, _pad1: 0, _pad2: 0,
                 params,
                 color: [0.0; 4],
                 inverse_world: Mat4::IDENTITY.to_cols_array_2d(),
@@ -408,7 +418,7 @@ fn emit(
                     material_combine: 0,
                     material_id: 0,
                     node_id: u32::MAX,
-                    _pad0: 0, _pad1: 0, _pad2: 0,
+                    distance_scale: 1.0, _pad1: 0, _pad2: 0,
                     params: [0.0; 8],
                     color: [0.0; 4],
                     inverse_world: Mat4::IDENTITY.to_cols_array_2d(),
@@ -453,7 +463,7 @@ fn emit(
                 material_combine: 0,
                 material_id: 0,
                 node_id: id.0,
-                _pad0: 0, _pad1: 0, _pad2: 0,
+                distance_scale: 1.0, _pad1: 0, _pad2: 0,
                 params: params_push,
                 color: [0.0; 4],
                 inverse_world: Mat4::IDENTITY.to_cols_array_2d(),
@@ -475,7 +485,7 @@ fn emit(
                 material_combine: 0,
                 material_id: 0,
                 node_id: u32::MAX,
-                _pad0: 0, _pad1: 0, _pad2: 0,
+                distance_scale: 1.0, _pad1: 0, _pad2: 0,
                 params: [0.0; 8],
                 color: [0.0; 4],
                 inverse_world: Mat4::IDENTITY.to_cols_array_2d(),
@@ -512,7 +522,7 @@ fn emit(
                 material_combine: 0,
                 material_id: 0,
                 node_id: id.0,
-                _pad0: 0, _pad1: 0, _pad2: 0,
+                distance_scale: 1.0, _pad1: 0, _pad2: 0,
                 params: params_post,
                 color: [0.0; 4],
                 inverse_world,
@@ -548,7 +558,7 @@ fn emit(
                 material_combine: 0,
                 material_id: 0,
                 node_id: id.0,
-                _pad0: 0, _pad1: 0, _pad2: 0,
+                distance_scale: 1.0, _pad1: 0, _pad2: 0,
                 params: params_post,
                 color: color_post,
                 inverse_world,
@@ -582,7 +592,7 @@ fn emit(
                 material_combine: 0,
                 material_id: 0,
                 node_id: id.0,
-                _pad0: 0, _pad1: 0, _pad2: 0,
+                distance_scale: 1.0, _pad1: 0, _pad2: 0,
                 params: params_post,
                 color: color_post,
                 inverse_world,
@@ -624,7 +634,7 @@ fn emit(
                 material_combine: 0,
                 material_id: 0,
                 node_id: id.0,
-                _pad0: 0, _pad1: 0, _pad2: 0,
+                distance_scale: 1.0, _pad1: 0, _pad2: 0,
                 params: params_post,
                 color: color_post,
                 inverse_world,
@@ -684,7 +694,7 @@ fn emit(
                 material_combine: 0,
                 material_id: 0,
                 node_id: id.0,
-                _pad0: 0, _pad1: 0, _pad2: 0,
+                distance_scale: 1.0, _pad1: 0, _pad2: 0,
                 params: [
                     spacing.x, spacing.y, spacing.z, 0.0,
                     counts_f[0], counts_f[1], counts_f[2], 0.0,
@@ -705,7 +715,7 @@ fn emit(
                 material_combine: 0,
                 material_id: 0,
                 node_id: u32::MAX,
-                _pad0: 0, _pad1: 0, _pad2: 0,
+                distance_scale: 1.0, _pad1: 0, _pad2: 0,
                 params: [0.0; 8],
                 color: [0.0; 4],
                 inverse_world: Mat4::IDENTITY.to_cols_array_2d(),
@@ -737,7 +747,7 @@ fn emit(
                 material_combine: 0,
                 material_id: 0,
                 node_id: id.0,
-                _pad0: 0, _pad1: 0, _pad2: 0,
+                distance_scale: 1.0, _pad1: 0, _pad2: 0,
                 params: params_push,
                 color: [0.0; 4],
                 inverse_world: Mat4::IDENTITY.to_cols_array_2d(),
@@ -755,7 +765,7 @@ fn emit(
                 material_combine: 0,
                 material_id: 0,
                 node_id: u32::MAX,
-                _pad0: 0, _pad1: 0, _pad2: 0,
+                distance_scale: 1.0, _pad1: 0, _pad2: 0,
                 params: params_pop,
                 color: [0.0; 4],
                 inverse_world: Mat4::IDENTITY.to_cols_array_2d(),
@@ -776,13 +786,23 @@ fn emit_primitive(
     out: &mut Vec<ProcInstruction>,
 ) {
     let inverse_world = Mat4::from(this_world).inverse().to_cols_array_2d();
+    // Smallest axis scale of the composed transform. For uniform
+    // scale `S` all three axes have length `S` so this is exact; for
+    // non-uniform scale using min() is a conservative
+    // 1-Lipschitz-safe bound (it underestimates |d_world|, which
+    // just means the classifier subdivides slightly more than
+    // necessary in stretched axes — correct, not over-aggressive).
+    // `.abs()` handles mirror (negative scale) from Mirror effects
+    // or flipped parent transforms.
+    let (scale, _rot, _trans) = this_world.to_scale_rotation_translation();
+    let distance_scale = scale.abs().min_element().max(1e-6);
     out.push(ProcInstruction {
         op: op as u32,
         arity: 0,
         material_combine: 0,
         material_id: material_id as u32,
         node_id: node_id.0,
-        _pad0: 0,
+        distance_scale,
         _pad1: 0,
         _pad2: 0,
         params,

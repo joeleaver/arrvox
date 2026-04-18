@@ -122,6 +122,91 @@ impl BrickPool {
         Some(id)
     }
 
+    /// Free many bricks at once, O(n) in the batch size.
+    ///
+    /// The per-brick [`deallocate`] has a tail-coalescing loop that
+    /// runs `position` scans of the free list. Freeing the last-
+    /// allocated brick of a long contiguous range then pays O(m) per
+    /// brick to walk the free-list, which is O(n²) total for the
+    /// batch. Real-world procedural rebakes hit this every time —
+    /// the batch freed is 100k–1M bricks contiguous from the previous
+    /// bake. This method handles the whole batch in one pass:
+    ///
+    /// 1. Clear every brick's cells (unavoidable memory writes).
+    /// 2. Sort ids, merge into contiguous ranges.
+    /// 3. Either extend `next_free_brick` (ranges at the tail) or
+    ///    push one `(start, count)` entry per disjoint range.
+    /// 4. One coalescing pass to absorb any adjacent free-list
+    ///    entries into `next_free_brick`.
+    pub fn deallocate_batch(&mut self, brick_ids: &[u32]) {
+        if brick_ids.is_empty() {
+            return;
+        }
+
+        // Clear cells first — unordered is fine.
+        for &id in brick_ids {
+            let start = id as usize * BRICK_CELLS as usize;
+            let end = start + BRICK_CELLS as usize;
+            if end > self.data.len() {
+                continue;
+            }
+            for cell in &mut self.data[start..end] {
+                *cell = BRICK_EMPTY;
+            }
+        }
+
+        // Sort + group into (start, count) ranges.
+        let mut sorted: Vec<u32> = brick_ids.to_vec();
+        sorted.sort_unstable();
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        let mut range_start = sorted[0];
+        let mut range_count: u32 = 1;
+        for &id in &sorted[1..] {
+            if id == range_start + range_count {
+                range_count += 1;
+            } else if id == range_start + range_count - 1 {
+                // Duplicate id — ignore. `deallocate` also silently
+                // no-ops on double-free above the data-len check.
+                continue;
+            } else {
+                ranges.push((range_start, range_count));
+                range_start = id;
+                range_count = 1;
+            }
+        }
+        ranges.push((range_start, range_count));
+
+        // Walk the ranges. Any range that butts up against
+        // `next_free_brick` shrinks the tail directly; the rest go on
+        // the free list.
+        for (s, c) in ranges {
+            if s + c == self.next_free_brick {
+                self.next_free_brick = s;
+            } else {
+                self.free_list.push((s, c));
+            }
+        }
+
+        // One-shot tail coalesce: repeatedly absorb any free-list
+        // range whose end meets the current tail. Position-scan is
+        // O(free_list.len()) per iteration, but we stop as soon as
+        // nothing matches, so across all iterations we visit each
+        // entry at most twice.
+        loop {
+            let idx = self
+                .free_list
+                .iter()
+                .position(|&(s, c)| s + c == self.next_free_brick);
+            match idx {
+                Some(i) => {
+                    let (s, _) = self.free_list.swap_remove(i);
+                    self.next_free_brick = s;
+                }
+                None => break,
+            }
+        }
+    }
+
     /// Return a brick to the pool. Its cells are zeroed to EMPTY so no stale
     /// leaf_attr ids leak into a future caller.
     pub fn deallocate(&mut self, brick_id: u32) {

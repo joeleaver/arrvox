@@ -70,6 +70,19 @@ impl SampleResult {
     }
 }
 
+/// Wall-clock breakdown accumulated across every chunk in one `evaluate`
+/// call. `submit_to_map_ready` is the interesting one for the async-bake
+/// decision — it's the portion where the CPU main thread has no work to
+/// do except wait for the GPU to finish.
+#[derive(Default)]
+struct EvalStats {
+    chunks: u32,
+    upload: std::time::Duration,
+    encode: std::time::Duration,
+    submit_to_map_ready: std::time::Duration,
+    readback: std::time::Duration,
+}
+
 pub struct GpuEvaluator {
     /// Pipeline variants keyed on the `HAS_POS_WARPS` shader
     /// override. `evaluate` picks the simple pipeline when the
@@ -96,6 +109,13 @@ pub struct GpuEvaluator {
     /// 8 M entries = 128 MiB) and stays allocated across bakes —
     /// orders of magnitude cheaper than re-allocating per chunk.
     padding_scratch: Vec<[f32; 4]>,
+
+    /// Cap for one dispatch's `positions.len()`, computed at
+    /// construction from the device's storage-buffer binding limit and
+    /// the workgroup-count ceiling. The hosted device may report
+    /// anywhere from 128 MiB (wgpu default) to the adapter's max, so
+    /// this is per-instance, not a const.
+    max_positions_per_dispatch: usize,
 }
 
 impl GpuEvaluator {
@@ -194,6 +214,22 @@ impl GpuEvaluator {
             mapped_at_creation: false,
         });
 
+        // Two ceilings on a single dispatch:
+        //   1. Workgroup-count limit: wgpu caps per-dimension dispatch
+        //      at 65 535. With `@workgroup_size(64)` that's 4 194 240
+        //      invocations (rounded down to a multiple of 64).
+        //   2. Storage-buffer binding limit: the results buffer holds
+        //      `N * sizeof(SampleResult)` bytes and binds in one go.
+        //      `Limits::default()` allows 128 MiB (rinch creates the
+        //      device with defaults today). Cap N to fit.
+        // Round down to a multiple of 64 so the dispatch boundary lines
+        // up with the workgroup edge.
+        let workgroup_cap = 65_535usize * 64;
+        let result_size = std::mem::size_of::<SampleResult>();
+        let binding_cap = (device.limits().max_storage_buffer_binding_size as usize)
+            / result_size;
+        let max_positions_per_dispatch = workgroup_cap.min(binding_cap) & !63;
+
         Self {
             pipeline_simple,
             pipeline_warps,
@@ -207,18 +243,9 @@ impl GpuEvaluator {
             staging_buf: None,
             results_cap: 0,
             padding_scratch: Vec::new(),
+            max_positions_per_dispatch,
         }
     }
-
-    /// Max positions per compute dispatch. The ceiling here is wgpu's
-    /// per-dimension workgroup-count limit (65 535). At
-    /// `@workgroup_size(64)` that caps a 1D dispatch at
-    /// 65 535 × 64 = 4 194 240 invocations. Staying strictly under
-    /// the limit is why the constant isn't rounded to the nearest
-    /// power of two. At 16 B per position and per result that's ~64
-    /// MiB per buffer — cheap on VRAM and leaves plenty of headroom
-    /// under the 2 GiB max-buffer limit.
-    const MAX_POSITIONS_PER_DISPATCH: usize = 65_535 * 64;
 
     /// Evaluate the tree at every position. If the batch exceeds the
     /// per-dispatch cap, splits into chunks transparently — caller
@@ -238,6 +265,7 @@ impl GpuEvaluator {
             return Vec::new();
         }
 
+        let t_start = std::time::Instant::now();
         // Upload instructions once, reuse across every chunk.
         let instructions_pad: Vec<ProcInstruction>;
         let instructions_slice: &[ProcInstruction] = if instructions.is_empty() {
@@ -260,18 +288,34 @@ impl GpuEvaluator {
         });
         let instruction_count = instructions.len() as u32;
 
-        if positions.len() <= Self::MAX_POSITIONS_PER_DISPATCH {
-            return self.evaluate_chunk(
-                device, queue, positions, instruction_count, has_warps,
-            );
-        }
-
-        let mut out: Vec<SampleResult> = Vec::with_capacity(positions.len());
-        for chunk in positions.chunks(Self::MAX_POSITIONS_PER_DISPATCH) {
-            out.extend(self.evaluate_chunk(
-                device, queue, chunk, instruction_count, has_warps,
-            ));
-        }
+        let mut stats = EvalStats::default();
+        let chunk_cap = self.max_positions_per_dispatch;
+        let out = if positions.len() <= chunk_cap {
+            self.evaluate_chunk(
+                device, queue, positions, instruction_count, has_warps, &mut stats,
+            )
+        } else {
+            let mut out: Vec<SampleResult> = Vec::with_capacity(positions.len());
+            for chunk in positions.chunks(chunk_cap) {
+                out.extend(self.evaluate_chunk(
+                    device, queue, chunk, instruction_count, has_warps, &mut stats,
+                ));
+            }
+            out
+        };
+        let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
+        eprintln!(
+            "[gpu_eval] N={} ins={} chunks={} upload={:.2}ms encode={:.2}ms \
+             submit_to_map_ready={:.2}ms readback={:.2}ms total={:.2}ms",
+            positions.len(),
+            instructions.len(),
+            stats.chunks,
+            ms(stats.upload),
+            ms(stats.encode),
+            ms(stats.submit_to_map_ready),
+            ms(stats.readback),
+            ms(t_start.elapsed()),
+        );
         out
     }
 
@@ -285,10 +329,13 @@ impl GpuEvaluator {
         positions: &[Vec3],
         instruction_count: u32,
         has_warps: bool,
+        stats: &mut EvalStats,
     ) -> Vec<SampleResult> {
         debug_assert!(!positions.is_empty());
-        debug_assert!(positions.len() <= Self::MAX_POSITIONS_PER_DISPATCH);
+        debug_assert!(positions.len() <= self.max_positions_per_dispatch);
+        stats.chunks += 1;
 
+        let t_upload_start = std::time::Instant::now();
         self.ensure_positions_capacity(device, positions.len());
         self.ensure_results_capacity(device, positions.len());
 
@@ -313,7 +360,9 @@ impl GpuEvaluator {
             _pad1: 0,
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        stats.upload += t_upload_start.elapsed();
 
+        let t_encode_start = std::time::Instant::now();
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("proc_sample bind group"),
             layout: &self.bind_group_layout,
@@ -368,9 +417,11 @@ impl GpuEvaluator {
         );
 
         queue.submit(Some(encoder.finish()));
+        stats.encode += t_encode_start.elapsed();
 
         // Map staging and read back. `device.poll` drives the async
         // map completion on native; we block until it reports Success.
+        let t_map_start = std::time::Instant::now();
         let staging = self.staging_buf.as_ref().unwrap();
         let slice = staging.slice(0..results_size_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -381,12 +432,15 @@ impl GpuEvaluator {
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("device poll");
         rx.recv().expect("map_async channel").expect("map_async result");
+        stats.submit_to_map_ready += t_map_start.elapsed();
 
+        let t_readback_start = std::time::Instant::now();
         let results: Vec<SampleResult> = {
             let data = slice.get_mapped_range();
             bytemuck::cast_slice::<u8, SampleResult>(&data).to_vec()
         };
         staging.unmap();
+        stats.readback += t_readback_start.elapsed();
         results
     }
 
@@ -407,7 +461,13 @@ impl GpuEvaluator {
 
     fn ensure_positions_capacity(&mut self, device: &wgpu::Device, needed: usize) {
         if self.positions_cap < needed {
-            let new_cap = (needed.max(1024) * 3) / 2;
+            // 1.5× growth amortizes reallocations across the levels of a
+            // single bake (small classify dispatches → big brick batch),
+            // but never grow past the per-dispatch cap — past it the
+            // buffer would exceed the device's storage-binding limit
+            // and `create_bind_group` would refuse it.
+            let new_cap = ((needed.max(1024) * 3) / 2)
+                .min(self.max_positions_per_dispatch);
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("proc_sample positions"),
                 // 16 bytes per padded vec4 position.
@@ -422,7 +482,8 @@ impl GpuEvaluator {
 
     fn ensure_results_capacity(&mut self, device: &wgpu::Device, needed: usize) {
         if self.results_cap < needed {
-            let new_cap = (needed.max(1024) * 3) / 2;
+            let new_cap = ((needed.max(1024) * 3) / 2)
+                .min(self.max_positions_per_dispatch);
             let size = (new_cap * std::mem::size_of::<SampleResult>()) as u64;
             let storage = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("proc_sample results"),

@@ -78,6 +78,14 @@ fn InspectorContent() -> NodeHandle {
         store.inspector.get().map(|s| s.entity_id.clone()).unwrap_or_default()
     });
 
+    // Procedural-only badge in the header. Reads the same
+    // `store.procedural` snapshot that drives the build viewport's
+    // "unbaked / up to date" indicator, so both surfaces always agree.
+    let proc_unbaked = Memo::new(move || {
+        store.procedural.get().is_some_and(|s| s.dirty)
+    });
+    let proc_present = Memo::new(move || store.procedural.get().is_some());
+
     rsx! {
         div {
             style: "display:flex;flex-direction:column;",
@@ -86,8 +94,26 @@ fn InspectorContent() -> NodeHandle {
             div {
                 style: "padding:8px 12px;background:#2d2d2d;border-bottom:1px solid #3c3c3c;",
                 div {
-                    style: "font-weight:600;font-size:13px;",
-                    {move || entity_name.get()}
+                    style: "display:flex;align-items:center;gap:8px;",
+                    div {
+                        style: "font-weight:600;font-size:13px;flex:1;\
+                                overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
+                        {move || entity_name.get()}
+                    }
+                    if proc_present.get() {
+                        span {
+                            style: {move || if proc_unbaked.get() {
+                                "font-size:10px;color:#f0a04b;\
+                                 padding:1px 6px;border:1px solid #6a4520;\
+                                 border-radius:8px;background:#2a1f15;white-space:nowrap;"
+                            } else {
+                                "font-size:10px;color:#666;\
+                                 padding:1px 6px;border:1px solid #3a3a3a;\
+                                 border-radius:8px;background:#252525;white-space:nowrap;"
+                            }},
+                            {move || if proc_unbaked.get() { "● unbaked" } else { "● baked" }}
+                        }
+                    }
                 }
                 div {
                     style: "font-size:10px;color:#666;margin-top:2px;font-family:monospace;",

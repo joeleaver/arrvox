@@ -217,14 +217,26 @@ struct EngineState {
     /// alongside.
     viewport_renderers: std::collections::HashMap<crate::viewport::ViewportId, rkp_render::ViewportRenderer>,
 
-    // Scene management (CPU)
-    scene_mgr: RkpSceneManager,
+    // Scene management (CPU). Wrapped in `Arc<Mutex<>>` so the bake
+    // worker can run the integrate pass (dealloc-prev + memcpy +
+    // remap) against the shared pools directly, without shipping
+    // artifacts back to the main thread for a 75+ ms copy. The lock
+    // is uncontended on most frames — only `render_frame`'s
+    // geometry upload + asset loads touch the scene_mgr, and those
+    // finish in a ms or two. See `bake_worker::run_loop` for the
+    // worker-side lock scope.
+    scene_mgr: std::sync::Arc<std::sync::Mutex<RkpSceneManager>>,
 
     /// GPU-backed evaluator for procedural trees. Lazy-initialized on
     /// the first procedural bake. All procedural voxelization (spawn,
     /// explicit bake, transform-scale re-bake) flows through this —
     /// the CPU tree evaluator was removed; the GPU is the only path.
     gpu_evaluator: Option<rkp_render::proc_sample::GpuEvaluator>,
+
+    /// Async bake pipeline. The worker owns its own GpuEvaluator and
+    /// private pools; the engine sends requests + drains results on
+    /// each tick via `drain_bake_results`.
+    bake_worker: crate::bake_worker::BakeWorker,
 
     // Input + Camera
     input_system: rkf_runtime::input::InputSystem,
@@ -456,7 +468,9 @@ impl EngineState {
         viewport_renderers.insert(crate::viewport::ViewportId::MAIN, main_viewport_renderer);
         viewport_renderers.insert(crate::viewport::ViewportId::BUILD, build_viewport_renderer);
 
-        let scene_mgr = RkpSceneManager::new(1_000_000);
+        let scene_mgr = std::sync::Arc::new(std::sync::Mutex::new(
+            RkpSceneManager::new(1_000_000),
+        ));
 
         // Input system with default action map.
         let mut input_system = rkf_runtime::input::InputSystem::new();
@@ -477,6 +491,11 @@ impl EngineState {
         });
 
         Self {
+            bake_worker: crate::bake_worker::BakeWorker::spawn(
+                device.clone(),
+                queue.clone(),
+                scene_mgr.clone(),
+            ),
             device,
             queue,
             renderer,
@@ -664,8 +683,10 @@ impl EngineState {
         // encoder). Before any submit so all viewports see the same
         // scene data.
         if self.geometry_dirty {
-            let geo = self.scene_mgr.geometry_upload();
+            let sm = self.scene_mgr.lock().unwrap();
+            let geo = sm.geometry_upload();
             self.renderer.upload_geometry(&self.queue, &geo);
+            drop(sm);
             self.geometry_dirty = false;
             self.collider_caches_dirty = true;
         }
@@ -1509,7 +1530,20 @@ impl EngineState {
             EngineCommand::Resize { id, width, height } => {
                 // Each VR has its own per-resolution pass chain now, so
                 // Resize is per-viewport. Resizing BUILD doesn't affect
-                // MAIN (and vice versa).
+                // MAIN (and vice versa). The editor sends Resize on
+                // every event (mouse move etc.) and relies on this
+                // handler to no-op when the size hasn't actually changed
+                // — without that guard `vr.resize` rebuilds bloom /
+                // tonemap each frame and `environment_dirty` ticks every
+                // tick.
+                let unchanged = self
+                    .viewports
+                    .get(id)
+                    .map(|vp| vp.width == width && vp.height == height)
+                    .unwrap_or(false);
+                if unchanged {
+                    return true;
+                }
                 if let Some(vr) = self.viewport_renderers.get_mut(&id) {
                     vr.resize(&self.device, &mut self.renderer, width, height);
                 }
@@ -1582,48 +1616,28 @@ impl EngineState {
                     Some(kind) => ProceduralGeometry::with_leaf(parse_node_kind(&kind)),
                     None => ProceduralGeometry::default_sphere(),
                 };
+                // Spawn the entity with no spatial yet; `dirty = true`
+                // on the fresh `ProceduralGeometry` is what makes
+                // `update_dirty_procedurals` enqueue an initial bake
+                // next tick. Keeps spawn + edit flows on the same
+                // async code path.
                 let scene_id = self.next_scene_id;
                 self.next_scene_id += 1;
-
-                // Compute bounds and voxelize the procedural tree via the
-                // GPU evaluator — same path as explicit bakes, so spawning
-                // a new procedural and re-baking later are byte-stable.
-                let (aabb, voxel_size) = procedural_voxel_params(&proc_geo.tree, proc_geo.voxel_size);
-                let instructions = rkp_procedural::flatten_tree(&proc_geo.tree);
-
-                let Self { device, queue, gpu_evaluator, scene_mgr, .. } = self;
-                let evaluator = gpu_evaluator
-                    .get_or_insert_with(|| rkp_render::proc_sample::GpuEvaluator::new(device));
-                let sdf_batch = |positions: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
-                    evaluator
-                        .evaluate(device, queue, positions, &instructions)
-                        .into_iter()
-                        .map(|r| r.into_tuple())
-                        .collect()
-                };
-                let result = scene_mgr.voxelize_sdf_fn(
-                    sdf_batch, &aabb, voxel_size, scene_id,
-                );
-                if let Some(result) = result {
-                    let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.grid_origin, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
-                    let entity = self.world.spawn((
-                        Transform::default(),
-                        EditorMetadata { name: name.clone() },
-                        Renderable {
-                            primitive: Some("procedural".to_string()),
-                            voxel_count: result.voxel_count,
-                            spatial: Some(spatial),
-                            ..Default::default()
-                        },
-                        proc_geo,
-                    ));
-                    self.assign_entity_uuid(entity);
-                    self.entity_scene_ids.insert(entity, scene_id);
-                    self.geometry_dirty = true;
-                    self.scene_dirty = true;
-                    self.gpu_objects_dirty = true;
-                    self.console.info(format!("Spawned procedural '{name}': {} voxels", result.voxel_count));
-                }
+                let entity = self.world.spawn((
+                    Transform::default(),
+                    EditorMetadata { name: name.clone() },
+                    Renderable {
+                        primitive: Some("procedural".to_string()),
+                        voxel_count: 0,
+                        spatial: None,
+                        ..Default::default()
+                    },
+                    proc_geo,
+                ));
+                self.assign_entity_uuid(entity);
+                self.entity_scene_ids.insert(entity, scene_id);
+                self.scene_dirty = true;
+                self.console.info(format!("Spawned procedural '{name}' (baking…)"));
             }
 
             EngineCommand::SelectProceduralNode { node_id } => {
@@ -1833,7 +1847,7 @@ impl EngineState {
                     .iter()
                     .find_map(|(e, u)| (*u == entity_id).then_some(*e));
                 if let Some(entity) = entity {
-                    self.bake_procedural_entity(entity);
+                    self.enqueue_bake(entity);
                 }
             }
 
@@ -1847,7 +1861,7 @@ impl EngineState {
                     .map(|(e, _)| e)
                     .collect();
                 for entity in dirty {
-                    self.bake_procedural_entity(entity);
+                    self.enqueue_bake(entity);
                 }
             }
 
@@ -1909,7 +1923,8 @@ impl EngineState {
                 use crate::components::*;
                 let scene_id = self.next_scene_id;
                 self.next_scene_id += 1;
-                match self.scene_mgr.acquire_asset(&path) {
+                let acquired = self.scene_mgr.lock().unwrap().acquire_asset(&path);
+                match acquired {
                     Ok((handle, info)) => {
                         let raw_name = Self::display_name_from_path(&path);
                         let name = self.unique_name(&raw_name);
@@ -2201,6 +2216,19 @@ impl EngineState {
                                 eprintln!("[RkpEngine] set_field failed: {e}");
                             } else {
                                 if component_name == "Transform" {
+                                    // Procedural entities treat Transform.scale as
+                                    // an alias for the Root node's scale: bake the
+                                    // value into the tree, reset the entity scale,
+                                    // and queue an auto-bake. Keeps procedural
+                                    // entities at world scale 1 so colliders /
+                                    // gizmos / physics aren't double-scaled, and
+                                    // makes the bake actually produce voxels at
+                                    // the right density (the entity-level scale
+                                    // path was a no-op visually — same voxels,
+                                    // just stretched at render time).
+                                    if field_name == "scale" {
+                                        self.redirect_transform_scale_to_root(entity);
+                                    }
                                     self.gpu_objects_dirty = true;
                                 }
                                 if component_name == "RigidBody" {
@@ -2888,12 +2916,36 @@ impl EngineState {
 
         use crate::inspector::*;
 
+        // For procedural entities, the Transform.scale slider is a
+        // proxy for Root.transform.scale (see
+        // `redirect_transform_scale_to_root`). Pull the displayed value
+        // from the tree so the slider reflects what's actually baked.
+        let proc_root_scale: Option<[f32; 3]> = self
+            .world
+            .get::<&crate::components::ProceduralGeometry>(selected)
+            .ok()
+            .and_then(|pg| {
+                let root = pg.tree.root();
+                pg.tree.get(root).map(|node| {
+                    node.transform
+                        .to_scale_rotation_translation()
+                        .0
+                        .to_array()
+                })
+            });
+
         // Build component snapshots from the registry.
         let mut components = Vec::new();
         for entry in self.registry.components_on(&self.world, selected) {
             let fields: Vec<FieldSnapshot> = entry.meta.iter().map(|meta| {
-                let value = (entry.get_field)(&self.world, selected, meta.name)
+                let mut value = (entry.get_field)(&self.world, selected, meta.name)
                     .unwrap_or(FieldValue::String("<error>".into()));
+                if entry.name == "Transform"
+                    && meta.name == "scale"
+                    && let Some(s) = proc_root_scale
+                {
+                    value = FieldValue::Vec3(s);
+                }
                 FieldSnapshot {
                     name: meta.name.to_string(),
                     field_type: meta.field_type,
@@ -2948,19 +3000,20 @@ impl EngineState {
         // Collect leaf voxel slots from the packed octree buffer.
         // Branch offsets in the packed buffer are ABSOLUTE, so we traverse
         // the full buffer starting at root_offset (not a sub-slice).
-        let all_nodes = self.scene_mgr.octree.data();
+        let sm = self.scene_mgr.lock().unwrap();
+        let all_nodes = sm.octree.data();
         let mut leaf_slots = Vec::new();
         collect_leaf_slots(all_nodes, spatial.root_offset as usize, &mut leaf_slots);
 
         // Count material IDs across all leaf slots. Every leaf is a surface
         // voxel now — no opacity gate.
-        let pool_size = self.scene_mgr.leaf_attr_pool.allocated_count();
+        let pool_size = sm.leaf_attr_pool.allocated_count();
         let mut counts: std::collections::HashMap<u16, u32> = std::collections::HashMap::new();
         for slot in leaf_slots {
             if slot >= pool_size {
                 continue; // stale or invalid slot — skip
             }
-            let attr = self.scene_mgr.leaf_attr_pool.get(slot);
+            let attr = sm.leaf_attr_pool.get(slot);
             *counts.entry(attr.material_primary).or_insert(0) += 1;
         }
 
@@ -2994,29 +3047,30 @@ impl EngineState {
         };
 
         // Collect leaf slots using absolute offsets in the packed buffer.
-        let all_nodes = self.scene_mgr.octree.data();
+        let mut sm = self.scene_mgr.lock().unwrap();
+        let all_nodes = sm.octree.data();
         let mut leaf_slots = Vec::new();
         collect_leaf_slots(all_nodes, spatial.root_offset as usize, &mut leaf_slots);
 
-        let pool_size = self.scene_mgr.leaf_attr_pool.allocated_count();
+        let pool_size = sm.leaf_attr_pool.allocated_count();
         let mut count = 0u32;
         for slot in leaf_slots {
             if slot >= pool_size { continue; }
-            let attr = self.scene_mgr.leaf_attr_pool.get(slot);
+            let attr = sm.leaf_attr_pool.get(slot);
             let primary = attr.material_primary;
             let secondary = attr.material_secondary();
             let mut changed = false;
 
             if primary == from_material {
-                let m = self.scene_mgr.leaf_attr_pool.get_mut(slot);
+                let m = sm.leaf_attr_pool.get_mut(slot);
                 m.material_primary = to_material;
                 changed = true;
             }
             if secondary == from_material {
                 // Re-pack secondary + blend, since both share material_secondary_blend.
-                let attr = *self.scene_mgr.leaf_attr_pool.get(slot);
+                let attr = *sm.leaf_attr_pool.get(slot);
                 let blend = attr.blend_weight();
-                let m = self.scene_mgr.leaf_attr_pool.get_mut(slot);
+                let m = sm.leaf_attr_pool.get_mut(slot);
                 let secondary_bits = (to_material & 0x0FFF) as u16;
                 let blend_bits = ((blend as u16) & 0x0F) << 12;
                 m.material_secondary_blend = secondary_bits | blend_bits;
@@ -3123,7 +3177,7 @@ impl EngineState {
     /// currently loaded into the scene.
     fn refresh_reimported_asset(&mut self, output_path: &std::path::Path) {
         let path_str = output_path.to_string_lossy().into_owned();
-        let reload = match self.scene_mgr.reload_asset(&path_str) {
+        let reload = match self.scene_mgr.lock().unwrap().reload_asset(&path_str) {
             Ok(Some(r)) => r,
             Ok(None) => {
                 eprintln!(
@@ -3254,149 +3308,328 @@ impl EngineState {
     }
 
     /// Rebuild GPU objects from the hecs world.
-    /// Re-voxelize any procedural objects that are dirty or whose entity scale changed.
-    /// Per-tick procedural maintenance. Does *not* consume the `dirty`
-    /// flag for edits — that happens only via explicit `BakeProceduralEntity`
-    /// / `BakeAllDirtyProcedurals` commands. The loop here only bakes
-    /// entities that have never been baked (spatial == None) so a freshly
-    /// spawned procedural isn't invisible, and entities whose transform
-    /// scale has changed (scale is not tracked through the tree, so it
-    /// effectively invalidates the whole bake — treated like an initial
-    /// bake). Interactive param edits mark dirty but sit until the user
-    /// clicks "Bake."
+    /// Per-tick procedural maintenance. Bakes any entity that needs an
+    /// initial bake (freshly spawned, spatial == None) or has a settled
+    /// `pending_bake` (last edit was at least `BAKE_DEBOUNCE` ago).
+    /// Interactive build-panel param edits mark `dirty` but sit until
+    /// the user clicks "Bake" — only the properties-panel scale slider
+    /// (via `redirect_transform_scale_to_root`) currently sets the
+    /// auto-bake flag.
     fn update_dirty_procedurals(&mut self) {
         use crate::components::*;
 
         let mut to_update: Vec<hecs::Entity> = Vec::new();
 
-        for (entity, (transform, renderable, proc_geo)) in self
+        // Debounce window for `pending_bake` — long enough to suppress
+        // bakes mid-scrub on a slider, short enough to feel immediate
+        // when the user releases. Initial bakes don't debounce.
+        const BAKE_DEBOUNCE: std::time::Duration =
+            std::time::Duration::from_millis(150);
+        let now = std::time::Instant::now();
+        // Bakes are sync and can take ~1s on big objects. Firing one
+        // mid-drag freezes the engine tick and the gizmo can't track
+        // the cursor for the duration — looks like the bake "ate" the
+        // drag motion when the queued events finally drain. Defer
+        // until the gizmo is released; the existing debounce timestamp
+        // was bumped by the last drag tick, so this only delays the
+        // bake by however long the user keeps dragging.
+        let drag_active = self.gizmo.dragging || self.proc_gizmo.dragging;
+
+        for (entity, (renderable, proc_geo)) in self
             .world
-            .query::<(&Transform, &Renderable, &ProceduralGeometry)>()
+            .query::<(&Renderable, &ProceduralGeometry)>()
             .iter()
         {
-            let scale_changed =
-                (transform.scale - proc_geo.last_evaluated_scale).length() > 1e-5;
+            // Only one bake per entity in flight at a time — the
+            // worker channel could otherwise bloat with dozens of
+            // requests during a long bake, all destined to be stale.
+            // New edits while a bake runs will queue a fresh request
+            // on the tick after the current one returns, via the
+            // preserved `dirty` / `pending_bake` flags.
+            if proc_geo.bake_in_flight {
+                continue;
+            }
             let needs_initial_bake = renderable.spatial.is_none() && proc_geo.dirty;
-            if scale_changed || needs_initial_bake {
+            let pending_settled = !drag_active
+                && proc_geo.pending_bake
+                && proc_geo
+                    .bake_dirty_at
+                    .map(|t| now.duration_since(t) >= BAKE_DEBOUNCE)
+                    .unwrap_or(true);
+            if needs_initial_bake || pending_settled {
                 to_update.push(entity);
             }
         }
 
         for entity in to_update {
-            self.bake_procedural_entity(entity);
+            self.enqueue_bake(entity);
         }
     }
 
-    /// Voxelize one procedural entity right now. Callers: the per-tick
-    /// initial-bake/scale-change loop in `update_dirty_procedurals`, and
-    /// the `BakeProceduralEntity` command handler. Always runs — does not
-    /// consult the `dirty` flag itself; the caller is responsible for
-    /// deciding whether to invoke.
-    fn bake_procedural_entity(&mut self, entity: hecs::Entity) {
+    /// Move the just-set `Transform.scale` onto the procedural Root
+    /// node (preserving Root's existing rotation / translation), set
+    /// `Transform.scale` to the preview multiplier
+    /// `new_root / last_evaluated_root` so the still-old baked voxels
+    /// stretch to the user's target size during the debounce window,
+    /// and queue an auto-bake. No-op for non-procedural entities.
+    ///
+    /// **Invariant**: after every call, for procedural entities,
+    /// `Transform.scale == Root.scale / last_evaluated_root_scale`. The
+    /// caller is expected to have written the user's intended absolute
+    /// scale into `Transform.scale` first; this method captures it,
+    /// stores it on the tree, and overwrites `Transform.scale` with the
+    /// preview multiplier. Skipping this overwrite — even on a "no
+    /// change" tick — causes a visual jump because the rendered size
+    /// is `Transform.scale × baked_voxels`, and a stale absolute value
+    /// in `Transform.scale` will multiply the already-baked-up voxels
+    /// a second time.
+    fn redirect_transform_scale_to_root(&mut self, entity: hecs::Entity) {
+        use crate::components::*;
+        // Hard cap on Root.scale per axis. The voxel budget scales as
+        // the squared surface area (roughly) and the bake wall time
+        // follows suit, so uncapped scaling blows through GPU memory
+        // and wall-clock quickly. 20× the default primitive's extent
+        // puts a 0.35 m sphere at 7 m radius, well inside the octree's
+        // depth-11 cap and the 4.2 M-per-dispatch GPU chunking. Tune
+        // in one place; the field meta's slider range below is kept
+        // in lockstep.
+        const SCALE_MIN: f32 = 0.01;
+        const SCALE_MAX: f32 = 20.0;
+
+        let user_scale = match self.world.get::<&Transform>(entity) {
+            Ok(t) => t.scale,
+            Err(_) => return,
+        };
+        // Procedurals-only: clamp here so the property slider + gizmo
+        // both hit the same ceiling. Non-procedurals keep whatever
+        // scale they were given.
+        let is_procedural = self.world.get::<&ProceduralGeometry>(entity).is_ok();
+        let user_scale = if is_procedural {
+            glam::Vec3::new(
+                user_scale.x.clamp(SCALE_MIN, SCALE_MAX),
+                user_scale.y.clamp(SCALE_MIN, SCALE_MAX),
+                user_scale.z.clamp(SCALE_MIN, SCALE_MAX),
+            )
+        } else {
+            user_scale
+        };
+        let Ok(mut proc_geo) = self.world.get::<&mut ProceduralGeometry>(entity) else {
+            // Non-procedural entity — leave Transform.scale alone.
+            return;
+        };
+        let root_id = proc_geo.tree.root();
+        let root_xf = proc_geo
+            .tree
+            .get(root_id)
+            .map(|n| n.transform)
+            .unwrap_or(glam::Affine3A::IDENTITY);
+        let (current_root_scale, rot, trans) = root_xf.to_scale_rotation_translation();
+        // Push to Root + queue an auto-bake only when the value
+        // actually changed; spammy slider events that re-write the
+        // same scale shouldn't bump the debounce timestamp.
+        if (user_scale - current_root_scale).length() >= 1e-6 {
+            let new_root =
+                glam::Affine3A::from_scale_rotation_translation(user_scale, rot, trans);
+            proc_geo.tree.set_transform(root_id, new_root);
+            proc_geo.pending_bake = true;
+            proc_geo.bake_dirty_at = Some(std::time::Instant::now());
+        }
+        // Always restore the preview multiplier — see invariant above.
+        let baked = proc_geo.last_evaluated_root_scale;
+        let safe = |a: f32, b: f32| if b.abs() > 1e-6 { a / b } else { 1.0 };
+        let preview = glam::Vec3::new(
+            safe(user_scale.x, baked.x),
+            safe(user_scale.y, baked.y),
+            safe(user_scale.z, baked.z),
+        );
+        drop(proc_geo);
+        if let Ok(mut t) = self.world.get::<&mut Transform>(entity) {
+            t.scale = preview;
+        }
+    }
+
+    /// Enqueue an async bake for a procedural entity. Bumps the
+    /// entity's `bake_generation` and sends a [`BakeRequest`] to the
+    /// worker thread. The result (an integrate-able [`BakeArtifact`])
+    /// is picked up later by `drain_bake_results`. If the user keeps
+    /// editing before the bake finishes, subsequent calls bump the
+    /// generation and the old result gets dropped on arrival.
+    ///
+    /// Returns the generation number assigned, or `None` if the entity
+    /// isn't a procedural.
+    fn enqueue_bake(&mut self, entity: hecs::Entity) -> Option<u64> {
         use crate::components::*;
 
         let scene_id = self.entity_scene_ids.get(&entity).copied().unwrap_or(0);
-        let t_entity_start = std::time::Instant::now();
-
-        let (tree_clone, base_voxel_size, scale) = {
-            let Ok(proc_geo) = self.world.get::<&ProceduralGeometry>(entity) else {
-                return;
-            };
-            let Ok(transform) = self.world.get::<&Transform>(entity) else {
-                return;
-            };
-            (proc_geo.tree.clone(), proc_geo.voxel_size, transform.scale)
+        let (tree_clone, base_voxel_size, generation) = {
+            let mut proc_geo = self.world.get::<&mut ProceduralGeometry>(entity).ok()?;
+            proc_geo.bake_generation = proc_geo.bake_generation.wrapping_add(1);
+            // Clear the edit flags that triggered this bake — the
+            // request captures the current state, so if no new edit
+            // follows, we shouldn't re-fire next tick. A subsequent
+            // edit will set `dirty` / `pending_bake` again, and the
+            // NEXT tick after the bake returns will pick those up.
+            proc_geo.dirty = false;
+            proc_geo.pending_bake = false;
+            proc_geo.bake_dirty_at = None;
+            proc_geo.bake_in_flight = true;
+            (proc_geo.tree.clone(), proc_geo.voxel_size, proc_geo.bake_generation)
         };
-        let tree_node_count = tree_clone.node_count();
-
-        // Free previous geometry allocation (if any) before re-voxelizing.
-        // Without this, every re-voxelization leaks voxel slots and octree
-        // entries until the pool is exhausted.
+        // Worker needs the previous allocation to free it under the
+        // integrate lock — pull it now so the worker doesn't round-
+        // trip through the ECS.
         let prev_spatial = self
             .world
             .get::<&Renderable>(entity)
             .ok()
             .and_then(|r| r.spatial.clone());
-        if let Some(prev) = prev_spatial {
-            let handle = rkp_core::OctreeHandle {
-                root_offset: prev.root_offset,
-                len: prev.len,
-                depth: prev.depth,
-                base_voxel_size: prev.base_voxel_size,
-            };
-            self.scene_mgr.deallocate_geometry(
-                &handle, prev.voxel_slot_start, prev.voxel_slot_count, &prev.brick_ids,
-            );
-        }
-        let t_after_dealloc = t_entity_start.elapsed();
 
         let (aabb, voxel_size) = procedural_voxel_params(&tree_clone, base_voxel_size);
-        // Flatten the tree once; the GPU evaluator reuses the same
-        // instruction stream across every dispatch in this bake.
         let instructions = rkp_procedural::flatten_tree(&tree_clone);
-        let t_after_bounds = t_entity_start.elapsed();
+        let root_scale = tree_clone
+            .get(tree_clone.root())
+            .map(|n| n.transform.to_scale_rotation_translation().0)
+            .unwrap_or(glam::Vec3::ONE);
 
-        // Split-borrow fields so the closure can capture a `&mut
-        // GpuEvaluator` while `scene_mgr` is mutably borrowed by
-        // `voxelize_sdf_fn` below.
-        let Self { device, queue, gpu_evaluator, scene_mgr, .. } = self;
-        let evaluator = gpu_evaluator
-            .get_or_insert_with(|| rkp_render::proc_sample::GpuEvaluator::new(device));
-
-        // Batched callback: dispatch one compute pass per octree
-        // level / terminal-geometry phase. The BFS structure of
-        // `voxelize_octree` keeps the dispatch count to ~O(depth).
-        let sdf_batch = |positions: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
-            evaluator
-                .evaluate(device, queue, positions, &instructions)
-                .into_iter()
-                .map(|r| r.into_tuple())
-                .collect()
+        let req = crate::bake_worker::BakeRequest {
+            entity,
+            generation,
+            scene_id,
+            instructions,
+            aabb,
+            voxel_size,
+            root_scale,
+            prev_spatial,
         };
-
-        let vx_result = scene_mgr.voxelize_sdf_fn(
-            sdf_batch, &aabb, voxel_size, scene_id,
-        );
-        let t_total = t_entity_start.elapsed();
-        let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
-        eprintln!(
-            "[proc_bake] tree_nodes={} dealloc={:.2}ms bounds={:.2}ms voxelize_sdf_fn={:.2}ms total={:.2}ms",
-            tree_node_count,
-            ms(t_after_dealloc),
-            ms(t_after_bounds - t_after_dealloc),
-            ms(t_total - t_after_bounds),
-            ms(t_total),
-        );
-
-        match vx_result {
-            Some(result) => {
-                let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.grid_origin, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
-
-                if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
-                    renderable.voxel_count = result.voxel_count;
-                    renderable.spatial = Some(spatial);
-                }
-                if let Ok(mut proc_geo) = self.world.get::<&mut ProceduralGeometry>(entity) {
-                    proc_geo.dirty = false;
-                    proc_geo.last_evaluated_scale = scale;
-                }
-
-                self.geometry_dirty = true;
-                self.gpu_objects_dirty = true;
+        if self.bake_worker.tx_request.send(req).is_err() {
+            self.console.warn("bake worker channel closed".to_string());
+            // Revert the in-flight flag — otherwise a permanently
+            // dead channel would lock the entity out of future bakes.
+            if let Ok(mut proc_geo) = self.world.get::<&mut ProceduralGeometry>(entity) {
+                proc_geo.bake_in_flight = false;
             }
-            None => {
-                // Voxelization failed (pool full, empty result, etc.).
-                // Clear dirty to avoid retrying every frame.
-                if let Ok(mut proc_geo) = self.world.get::<&mut ProceduralGeometry>(entity) {
-                    proc_geo.dirty = false;
+            return None;
+        }
+        Some(generation)
+    }
+
+    /// Drain any finished bake results from the worker and integrate
+    /// each one whose generation still matches the entity's latest
+    /// request (stale results from superseded edits get silently
+    /// dropped). Called once per tick, before rendering.
+    fn drain_bake_results(&mut self) {
+        use crate::components::*;
+        use crate::bake_worker::BakeOutcome;
+
+        // Drain everything the worker has produced since the last
+        // tick. `try_recv` is non-blocking — we never wait here.
+        while let Ok(result) = self.bake_worker.rx_result.try_recv() {
+            let entity = result.entity;
+            // Entity gone? Discard quietly.
+            if !self.world.contains(entity) {
+                continue;
+            }
+
+            // Every result clears the in-flight gate. If the user
+            // edited after the request was sent, `dirty` /
+            // `pending_bake` will already be set again and the next
+            // tick's `update_dirty_procedurals` will enqueue a fresh
+            // bake. We deliberately do NOT clear those flags here —
+            // that would swallow the new edit.
+            if let Ok(mut proc_geo) = self.world.get::<&mut ProceduralGeometry>(entity) {
+                proc_geo.bake_in_flight = false;
+            }
+
+            // Generation-mismatch = stale, drop.
+            let current_gen = self
+                .world
+                .get::<&ProceduralGeometry>(entity)
+                .map(|pg| pg.bake_generation)
+                .unwrap_or(0);
+            if result.generation != current_gen {
+                continue;
+            }
+
+            match result.outcome {
+                BakeOutcome::Ok { spatial, voxel_count } => {
+                    self.apply_bake_result(
+                        entity,
+                        result.root_scale,
+                        spatial,
+                        voxel_count,
+                    );
                 }
-                self.console.warn(format!(
-                    "Procedural voxelization failed. \
-                     Voxel size: {voxel_size:.4}, AABB extent: {:.1}",
-                    (aabb.max - aabb.min).length()
-                ));
+                BakeOutcome::Failed => {
+                    // Keep `dirty` / `pending_bake` intact so the user
+                    // can retry (via a new edit or the Bake button) —
+                    // clearing them would pretend the bake succeeded.
+                    self.console.warn(format!(
+                        "Procedural voxelization failed (voxel_size={:.4}, extent={:.1}).",
+                        result.voxel_size,
+                        (result.aabb.max - result.aabb.min).length(),
+                    ));
+                }
             }
         }
+    }
+
+    /// Apply a completed (already-integrated) bake's result to the
+    /// ECS. The heavy work — dealloc, artifact remap, pool writes —
+    /// already happened on the bake worker under the `scene_mgr`
+    /// lock; this runs on the engine tick and only touches the ECS,
+    /// so it's microseconds.
+    fn apply_bake_result(
+        &mut self,
+        entity: hecs::Entity,
+        baked_root_scale: glam::Vec3,
+        spatial: crate::components::SpatialData,
+        voxel_count: u32,
+    ) {
+        use crate::components::*;
+
+        if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
+            renderable.voxel_count = voxel_count;
+            renderable.spatial = Some(spatial);
+        }
+
+        // Recompute `Transform.scale` as `current_root / baked_root`
+        // so the visual size stays equal to the user's latest intent
+        // across the integrate:
+        //     visual = Transform.scale × baked_voxels_world_scale
+        //            = (current_root / baked_root) × baked_root
+        //            = current_root
+        // If no mid-bake edit happened, current_root == baked_root
+        // and `Transform.scale` collapses to 1.
+        let current_root_scale = self
+            .world
+            .get::<&ProceduralGeometry>(entity)
+            .ok()
+            .and_then(|pg| {
+                pg.tree
+                    .get(pg.tree.root())
+                    .map(|n| n.transform.to_scale_rotation_translation().0)
+            })
+            .unwrap_or(baked_root_scale);
+        let safe = |a: f32, b: f32| if b.abs() > 1e-6 { a / b } else { 1.0 };
+        let new_transform_scale = glam::Vec3::new(
+            safe(current_root_scale.x, baked_root_scale.x),
+            safe(current_root_scale.y, baked_root_scale.y),
+            safe(current_root_scale.z, baked_root_scale.z),
+        );
+
+        if let Ok(mut proc_geo) = self.world.get::<&mut ProceduralGeometry>(entity) {
+            // `dirty` / `pending_bake` / `bake_dirty_at` were cleared
+            // at enqueue time. If they're set *now*, the user edited
+            // after the request was sent — preserve the new intent so
+            // the next tick re-enqueues.
+            proc_geo.last_evaluated_root_scale = baked_root_scale;
+        }
+        if let Ok(mut t) = self.world.get::<&mut Transform>(entity) {
+            t.scale = new_transform_scale;
+        }
+
+        self.geometry_dirty = true;
+        self.gpu_objects_dirty = true;
     }
 
     fn update_scene_gpu(&mut self) {
@@ -3531,7 +3764,7 @@ impl EngineState {
         if let Ok(renderable) = self.world.get::<&crate::components::Renderable>(entity) {
             if let Some(handle) = renderable.asset_handle {
                 drop(renderable);
-                self.scene_mgr.release_asset(handle);
+                self.scene_mgr.lock().unwrap().release_asset(handle);
             } else if let Some(ref spatial) = renderable.spatial {
                 let handle = rkp_core::OctreeHandle {
                     root_offset: spatial.root_offset,
@@ -3543,7 +3776,9 @@ impl EngineState {
                 let slot_count = spatial.voxel_slot_count;
                 let brick_ids = spatial.brick_ids.clone();
                 drop(renderable);
-                self.scene_mgr.deallocate_geometry(&handle, slot_start, slot_count, &brick_ids);
+                self.scene_mgr.lock().unwrap().deallocate_geometry(
+                    &handle, slot_start, slot_count, &brick_ids,
+                );
             }
         }
 
@@ -3651,7 +3886,7 @@ impl EngineState {
         self.next_entity_uuid = 1;
         self.gpu_objects.clear();
         self.gpu_to_entity.clear();
-        self.scene_mgr = RkpSceneManager::new(1_000_000);
+        *self.scene_mgr.lock().unwrap() = RkpSceneManager::new(1_000_000);
         self.selected_entity = None;
         self.geometry_dirty = true;
         self.scene_dirty = true;
@@ -3695,7 +3930,7 @@ impl EngineState {
                             .unwrap_or_else(|| std::path::PathBuf::from(asset_path));
                         let sid = self.next_scene_id;
                         self.next_scene_id += 1;
-                        match self.scene_mgr.acquire_asset(&full_path.to_string_lossy()) {
+                        match self.scene_mgr.lock().unwrap().acquire_asset(&full_path.to_string_lossy()) {
                             Ok((handle, info)) => {
                                 let spatial = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.grid_origin, info.leaf_attr_slot_start, info.leaf_attr_slot_count, Vec::new());
                                 let e = self.world.spawn((transform, meta, Renderable {
@@ -3724,7 +3959,7 @@ impl EngineState {
                         };
                         let sid = self.next_scene_id;
                         self.next_scene_id += 1;
-                        self.scene_mgr.voxelize_primitive(
+                        self.scene_mgr.lock().unwrap().voxelize_primitive(
                             &primitive, obj.material_id, 0.05, glam::Vec3::ONE, sid,
                         ).map(|result| {
                             let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.grid_origin, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
@@ -3936,10 +4171,31 @@ impl EngineState {
                         t.scale = new_scale;
                         self.gpu_objects_dirty = true;
                     }
+                    // Same path as the properties-panel scale slider:
+                    // route procedural entities' scale onto Root,
+                    // queue a debounced bake, and convert what we just
+                    // wrote into a render-time preview multiplier.
+                    self.redirect_transform_scale_to_root(selected);
                 }
             }
 
             if !left_pressed {
+                // Drag ended this tick. For Scale mode on procedural
+                // entities, clear `bake_dirty_at` so the next tick's
+                // `pending_settled` check fires immediately instead of
+                // waiting out the 150 ms slider debounce — mouse-up is
+                // an unambiguous "done" signal that a slider doesn't
+                // have, no reason to sit on it.
+                if matches!(self.gizmo.mode, crate::gizmo::GizmoMode::Scale) {
+                    if let Ok(mut pg) = self
+                        .world
+                        .get::<&mut crate::components::ProceduralGeometry>(selected)
+                    {
+                        if pg.pending_bake {
+                            pg.bake_dirty_at = None;
+                        }
+                    }
+                }
                 self.gizmo.end_drag();
             }
         } else {
@@ -3972,16 +4228,37 @@ impl EngineState {
                     }
                 };
                 let forward = (center - self.camera.position).normalize();
-                let (rotation, scale) = self.world.get::<&crate::components::Transform>(selected)
+                let rotation = self.world.get::<&crate::components::Transform>(selected)
                     .map(|t| {
                         let r = t.rotation;
-                        let q = glam::Quat::from_euler(
+                        glam::Quat::from_euler(
                             glam::EulerRot::YXZ,
                             r.y.to_radians(), r.x.to_radians(), r.z.to_radians(),
-                        );
-                        (q, t.scale)
+                        )
                     })
-                    .unwrap_or((glam::Quat::IDENTITY, glam::Vec3::ONE));
+                    .unwrap_or(glam::Quat::IDENTITY);
+                // For procedural entities the user-visible scale lives
+                // on Root.transform (Transform.scale stays ~1 between
+                // bakes / momentarily holds the preview multiplier
+                // mid-debounce). Drag math is multiplicative against
+                // `initial_scale`, so capturing Transform.scale would
+                // make the first frame of a drag interpret the object
+                // as scale 1 and snap it back to its baseline size.
+                let scale = self.world.get::<&crate::components::ProceduralGeometry>(selected)
+                    .ok()
+                    .and_then(|pg| {
+                        let root = pg.tree.root();
+                        pg.tree
+                            .get(root)
+                            .map(|n| n.transform.to_scale_rotation_translation().0)
+                    })
+                    .or_else(|| {
+                        self.world
+                            .get::<&crate::components::Transform>(selected)
+                            .ok()
+                            .map(|t| t.scale)
+                    })
+                    .unwrap_or(glam::Vec3::ONE);
                 self.gizmo.pivot = center;
                 self.gizmo.begin_drag(
                     self.gizmo.hovered_axis,
@@ -4399,7 +4676,8 @@ impl EngineState {
             })
             .collect();
 
-        let all_nodes = self.scene_mgr.octree.data();
+        let sm_guard = self.scene_mgr.lock().unwrap();
+        let all_nodes = sm_guard.octree.data();
 
         for (entity, rb, spatial, scale) in entities {
             let name = self.world.get::<&EditorMetadata>(entity)
@@ -5387,7 +5665,11 @@ fn tick_loop(
         state.poll_import_completions();
         state.check_gameplay_reload();
 
-        // 1b2. Re-evaluate dirty procedural objects.
+        // 1b2. Integrate finished async bakes, then enqueue any new
+        // work. Drain first so a bake that just completed gets applied
+        // before its entity's `pending_bake` gets re-queued — avoids
+        // an otherwise-harmless one-tick stale queue entry.
+        state.drain_bake_results();
         state.update_dirty_procedurals();
 
         // 1c. Step gameplay systems + physics if in play mode.

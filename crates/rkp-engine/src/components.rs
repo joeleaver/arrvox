@@ -221,10 +221,43 @@ pub struct ProceduralGeometry {
     /// invisible until the user clicked Bake.
     #[serde(default = "default_dirty_true", skip_serializing)]
     pub dirty: bool,
-    /// Scale at last evaluation — re-evaluate if scale changes. Set to
-    /// a sentinel on load so the first-frame bake also resets this.
-    #[serde(default = "default_last_scale", skip_serializing)]
-    pub last_evaluated_scale: glam::Vec3,
+    /// Set when an edit happens that should auto-bake without going
+    /// through the explicit Bake button — e.g., the properties panel's
+    /// Scale slider redirecting to Root.transform.scale. Distinct from
+    /// `dirty` because most tree edits (build-panel param scrubs,
+    /// gizmo drags) deliberately *don't* auto-bake.
+    #[serde(default, skip_serializing)]
+    pub pending_bake: bool,
+    /// Timestamp of the most recent edit that requested a `pending_bake`.
+    /// `update_dirty_procedurals` waits until this has been still for
+    /// the debounce window (~150 ms) before actually baking, so a
+    /// scale-slider scrub doesn't fire a bake every tick.
+    #[serde(default, skip)]
+    pub bake_dirty_at: Option<std::time::Instant>,
+    /// Root.transform.scale that the most recently committed bake was
+    /// produced from. Used to compute the entity Transform.scale
+    /// "preview multiplier" during the debounce window:
+    /// `Transform.scale = new_root_scale / last_evaluated_root_scale`
+    /// stretches the still-old baked voxels up to the user's intended
+    /// size until the new bake commits. Defaults to ONE so newly loaded
+    /// scenes (where last bake matches Root) start with no preview
+    /// multiplier.
+    #[serde(default = "default_last_scale", skip)]
+    pub last_evaluated_root_scale: glam::Vec3,
+    /// Monotonic counter bumped each time a bake is enqueued to the
+    /// async worker. The returned `BakeResult` carries the generation
+    /// it was requested at — if it doesn't match this field at
+    /// integrate time (user kept dragging, another bake was queued),
+    /// the result is stale and gets dropped. Transient.
+    #[serde(default, skip)]
+    pub bake_generation: u64,
+    /// True between `enqueue_bake` and the matching result arriving
+    /// back from the worker. Prevents `update_dirty_procedurals` from
+    /// firing off a duplicate request every tick while the worker is
+    /// chewing on the previous one, and feeds the UI's "baking…"
+    /// indicator.
+    #[serde(default, skip)]
+    pub bake_in_flight: bool,
 }
 
 impl Default for ProceduralGeometry {
@@ -258,7 +291,11 @@ impl ProceduralGeometry {
             voxel_size: 0.02,
             collider_resolution: 0.1,
             dirty: true,
-            last_evaluated_scale: glam::Vec3::ONE,
+            pending_bake: false,
+            bake_dirty_at: None,
+            last_evaluated_root_scale: glam::Vec3::ONE,
+            bake_generation: 0,
+            bake_in_flight: false,
         }
     }
 }

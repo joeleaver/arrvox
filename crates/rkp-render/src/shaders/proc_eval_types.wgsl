@@ -77,7 +77,15 @@ struct ProcInstruction {
     // `node_id` is the source NodeId the primitive came from, used for
     // per-primitive picking; `u32::MAX` on combinators.
     node_id: u32,
-    _pad0: u32,
+    // Scalar multiplier that converts each primitive's returned
+    // LOCAL distance back into world distance — equals the smallest
+    // axis scale of the composed world transform. Combinators /
+    // effects leave this at 1.0 since their inputs are already in
+    // world space after the primitive multiplies. Without this, any
+    // `Root.scale > 1` tree bakes to pathological voxel counts
+    // because the classifier sees compressed-local distances and
+    // decides the whole volume is "near the surface".
+    distance_scale: f32,
     _pad1: u32,
     _pad2: u32,
     params_lo: vec4<f32>,

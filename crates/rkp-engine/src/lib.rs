@@ -10,6 +10,7 @@
 //!
 //! The engine never calls back into the client via traits. Callbacks are plain `Fn`.
 
+pub mod bake_worker;
 pub mod behavior;
 pub mod camera;
 pub mod command;

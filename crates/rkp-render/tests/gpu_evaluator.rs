@@ -438,3 +438,146 @@ fn voxelize_octree_gpu_runs_end_to_end() {
         );
     }
 }
+
+/// Validates that `voxelize_to_artifact` (worker-path) + scene-side
+/// `integrate_artifact` produce the same voxel / leaf_attr / brick
+/// counts as direct `voxelize_sdf_fn` (sync path). The remap math is
+/// where all the bugs in the async pipeline would live.
+#[test]
+fn artifact_roundtrip_matches_direct_voxelize() {
+    use rkp_core::voxelize_to_artifact;
+    use rkp_render::rkp_scene_manager::RkpSceneManager;
+
+    let Some((device, queue)) = create_device() else {
+        eprintln!("[artifact_roundtrip] no wgpu adapter — skipping");
+        return;
+    };
+
+    let mut obj = ProceduralObject::new(NodeKind::Union {
+        material_combine: MaterialCombine::Winner,
+    });
+    obj.add_child(
+        obj.root(),
+        NodeKind::Sphere(SphereParams {
+            radius: 0.35,
+            material_id: 5,
+            ..Default::default()
+        }),
+    );
+
+    let aabb = rkf_core::Aabb {
+        min: Vec3::splat(-0.6),
+        max: Vec3::splat(0.6),
+    };
+    let voxel_size = 0.04;
+
+    let mut evaluator = GpuEvaluator::new(&device);
+    let instructions = flatten_tree(&obj);
+
+    // ── Path A: artifact → integrate ──
+    let sdf_a = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+        evaluator
+            .evaluate(&device, &queue, positions, &instructions)
+            .into_iter()
+            .map(|r| r.into_tuple())
+            .collect()
+    };
+    let artifact = voxelize_to_artifact(sdf_a, &aabb, voxel_size)
+        .expect("artifact voxelize");
+    let artifact_voxels = artifact.voxel_count;
+    let artifact_attrs = artifact.leaf_attrs.len();
+    let artifact_bricks = artifact.brick_cells.len();
+
+    let mut scene_a = RkpSceneManager::new(1_000_000);
+    let r_a = scene_a
+        .integrate_artifact(artifact, &aabb, voxel_size, 42)
+        .expect("integrate");
+
+    // ── Path B: direct voxelize_sdf_fn on the same scene ──
+    let sdf_b = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+        evaluator
+            .evaluate(&device, &queue, positions, &instructions)
+            .into_iter()
+            .map(|r| r.into_tuple())
+            .collect()
+    };
+    let mut scene_b = RkpSceneManager::new(1_000_000);
+    let r_b = scene_b
+        .voxelize_sdf_fn(sdf_b, &aabb, voxel_size, 42)
+        .expect("direct voxelize");
+
+    assert_eq!(r_a.voxel_count, r_b.voxel_count,
+        "voxel count mismatch: async={}, sync={}", r_a.voxel_count, r_b.voxel_count);
+    assert_eq!(r_a.leaf_attr_slot_count, r_b.leaf_attr_slot_count,
+        "leaf_attr unique count mismatch");
+    assert_eq!(r_a.brick_ids.len(), r_b.brick_ids.len(),
+        "brick count mismatch");
+    assert_eq!(artifact_voxels, r_b.voxel_count,
+        "artifact voxel_count should match before remap");
+    assert_eq!(artifact_attrs as u32, r_b.leaf_attr_slot_count,
+        "artifact leaf_attrs count should match");
+    assert_eq!(artifact_bricks, r_b.brick_ids.len(),
+        "artifact brick count should match");
+
+    eprintln!(
+        "[artifact_roundtrip] voxels={} attrs={} bricks={} — all paths agree",
+        r_a.voxel_count, r_a.leaf_attr_slot_count, r_a.brick_ids.len()
+    );
+}
+
+/// Deliberate perf harness: run a typical-size bake (sphere, 0.5m, no
+/// combinators) at 0.08 / 0.02 / 0.005 voxel sizes — the four standard
+/// tiers with 0.005 = finest the editor exposes. `#[ignore]` because
+/// timing output is informational, not a regression gate.
+#[test]
+#[ignore]
+fn bake_perf_sweep() {
+    use rkp_core::brick_pool::BrickPool;
+    use rkp_core::leaf_attr_pool::LeafAttrPool;
+    use rkp_core::voxelize_octree::voxelize_octree;
+
+    let Some((device, queue)) = create_device() else {
+        eprintln!("[perf_sweep] no wgpu adapter — skipping");
+        return;
+    };
+
+    let mut obj = ProceduralObject::new(NodeKind::Root);
+    obj.add_child(
+        obj.root(),
+        NodeKind::Sphere(SphereParams {
+            radius: 0.5,
+            material_id: 1,
+            ..Default::default()
+        }),
+    );
+
+    let aabb = rkf_core::Aabb {
+        min: Vec3::splat(-0.7),
+        max: Vec3::splat(0.7),
+    };
+
+    let mut evaluator = GpuEvaluator::new(&device);
+    let instructions = flatten_tree(&obj);
+
+    for &voxel_size in &[0.08f32, 0.02, 0.005] {
+        eprintln!("\n[perf_sweep] ===== voxel_size = {} =====", voxel_size);
+        let mut attrs = LeafAttrPool::new(10_000_000);
+        let mut bricks = BrickPool::new(1_000_000);
+        let gpu_sdf = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+            evaluator
+                .evaluate(&device, &queue, positions, &instructions)
+                .into_iter()
+                .map(|r| r.into_tuple())
+                .collect()
+        };
+        let t = std::time::Instant::now();
+        let r = voxelize_octree(gpu_sdf, &aabb, voxel_size, &mut attrs, &mut bricks)
+            .expect("bake");
+        eprintln!(
+            "[perf_sweep] voxel_size={} voxels={} wall={:.2}ms",
+            voxel_size,
+            r.voxel_count,
+            t.elapsed().as_secs_f32() * 1000.0,
+        );
+    }
+}

@@ -212,7 +212,12 @@ fn procedural_geometry_entry() -> ComponentEntry {
 static TRANSFORM_FIELDS: [FieldMeta; 3] = [
     FieldMeta { name: "position", field_type: FieldType::Vec3, range: None, transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
     FieldMeta { name: "rotation", field_type: FieldType::Vec3, range: Some((-180.0, 180.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
-    FieldMeta { name: "scale", field_type: FieldType::Vec3, range: Some((0.01, 100.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
+    // Upper bound matches the per-axis cap enforced in
+    // `redirect_transform_scale_to_root` for procedural entities.
+    // Non-procedurals (lights, cameras, imported meshes) aren't
+    // clamped but this range still makes the slider usable — no
+    // reason to default the UI range to something nobody hits.
+    FieldMeta { name: "scale", field_type: FieldType::Vec3, range: Some((0.01, 20.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
 ];
 
 fn transform_entry() -> ComponentEntry {

@@ -20,7 +20,11 @@ pub struct ProceduralSnapshot {
     /// Render voxel size.
     pub voxel_size: f32,
     /// Tree has been edited since the last voxel bake — the "Bake" button
-    /// should show as enabled/highlighted when this is true.
+    /// should show as enabled/highlighted when this is true. Includes
+    /// both `dirty` (build-panel param edits awaiting an explicit
+    /// bake) and `pending_bake` (auto-bake debouncing or in flight from
+    /// the properties-panel scale slider) so any UI surface that shows
+    /// "baked vs unbaked" gets the same answer.
     pub dirty: bool,
     /// Voxel count from the last successful bake (zero pre-bake). Read
     /// from the entity's `Renderable` component so the build overlay
@@ -285,7 +289,7 @@ pub fn build_procedural_snapshot(
         root: tree.root().0,
         selected_node,
         voxel_size,
-        dirty: proc_geo.dirty,
+        dirty: proc_geo.dirty || proc_geo.pending_bake || proc_geo.bake_in_flight,
         voxel_count,
     }
 }

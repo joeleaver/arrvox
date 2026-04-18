@@ -24,3 +24,4 @@ pub use leaf_attr::{pack_oct, unpack_oct, LeafAttr};
 pub use leaf_attr_pool::LeafAttrPool;
 pub use octree_allocator::{OctreeAllocator, OctreeHandle};
 pub use sparse_octree::SparseOctree;
+pub use voxelize_octree::{voxelize_to_artifact, BakeArtifact};

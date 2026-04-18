@@ -75,6 +75,11 @@ fn eval_primitive(ins: ProcInstruction, world_pos: vec3<f32>) -> TreeSample {
         case 6u: { d = sdf_ramp(local, ins.params_lo.x, ins.params_lo.y, ins.params_lo.z); }
         default: { d = 1e30; }
     }
+    // Convert the primitive's LOCAL distance to WORLD distance. See
+    // `distance_scale` docs in `proc_eval_types.wgsl` /
+    // `ProcInstruction`. All downstream combinators + the classifier
+    // expect world-space distances.
+    d = d * ins.distance_scale;
     var s: TreeSample;
     s.distance = d;
     s.material_id = ins.material_id;
