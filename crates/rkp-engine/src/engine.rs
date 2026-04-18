@@ -941,6 +941,8 @@ impl EngineState {
                     decay: self.environment.god_ray_decay,
                     exposure: self.environment.god_ray_exposure,
                     num_samples: 64,
+                    sun_color: self.environment.sun_tint(cam_y),
+                    _pad: 0.0,
                 }
             };
             {

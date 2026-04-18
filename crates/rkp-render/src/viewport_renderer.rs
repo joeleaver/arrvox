@@ -180,7 +180,7 @@ impl ViewportRenderer {
         volumetric.set_scene_hdr_view(device, &shade.output_view);
 
         let mut god_rays = RkpGodRayPass::new(device, width, height);
-        god_rays.set_input(device, &volumetric.output_view);
+        god_rays.set_inputs(device, &volumetric.output_view, &gbuffer.position_view, &volumetric.cloud_view);
 
         // VR-owned bloom / tonemap chain reads this VR's god_rays output.
         let bloom = crate::BloomPass::new(device, &god_rays.output_view, width, height);
@@ -297,7 +297,7 @@ impl ViewportRenderer {
         self.volumetric.set_scene_hdr_view(device, &self.shade.output_view);
 
         self.god_rays.resize(device, width, height);
-        self.god_rays.set_input(device, &self.volumetric.output_view);
+        self.god_rays.set_inputs(device, &self.volumetric.output_view, &self.gbuffer.position_view, &self.volumetric.cloud_view);
 
         // Bloom / tonemap chain — these hold their own output textures.
         self.bloom = crate::BloomPass::new(device, &self.god_rays.output_view, width, height);
