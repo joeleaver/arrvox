@@ -4,6 +4,8 @@ use std::rc::Rc;
 
 use rinch::prelude::*;
 
+use rkp_engine::environment::{CloudQualityPreset, cloud_quality_values};
+
 use crate::CommandSender;
 use crate::ui::store::EditorStore;
 use super::prop_controls::*;
@@ -21,13 +23,15 @@ pub fn EnvironmentPanel() -> NodeHandle {
         for e in [store.environment.get()] {
             EnvironmentForm {
                 key: format!(
-                    "{}-{}-{}-{}-{}-{}",
+                    "{}-{}-{}-{}-{}-{}-{}-{}",
                     e.clouds_enabled,
                     e.sun_azimuth.to_bits(),
                     e.sun_elevation.to_bits(),
                     e.cloud_coverage.to_bits(),
                     e.cloud_density_scale.to_bits(),
                     e.ambient_intensity.to_bits(),
+                    e.cloud_slab_steps,
+                    e.cloud_taa_alpha.to_bits(),
                 ),
                 env: e.clone(),
             }
@@ -94,6 +98,12 @@ fn EnvironmentForm(env: rkp_engine::environment::EnvironmentSettings) -> NodeHan
     let cloud_wind_speed = Signal::new(env.cloud_wind_speed);
     let cloud_wind_dir = Signal::new(env.cloud_wind_dir);
 
+    let cloud_slab_steps = Signal::new(env.cloud_slab_steps as f32);
+    let cloud_shadow_steps = Signal::new(env.cloud_shadow_steps as f32);
+    let cloud_detail_octaves = Signal::new(env.cloud_detail_octaves as f32);
+    let cloud_ms_octaves = Signal::new(env.cloud_ms_octaves as f32);
+    let cloud_taa_alpha = Signal::new(env.cloud_taa_alpha);
+
     let sky_collapsed = Signal::new(false);
     let light_collapsed = Signal::new(false);
     let shadow_collapsed = Signal::new(false);
@@ -119,6 +129,55 @@ fn EnvironmentForm(env: rkp_engine::environment::EnvironmentSettings) -> NodeHan
             });
         })
     };
+    // Applies a named quality preset: snaps all cloud-quality signals to the
+    // preset's values and fires one engine command per field so both the UI
+    // and engine state update together.
+    let apply_preset: Rc<dyn Fn(CloudQualityPreset)> = {
+        let cmd_tx = cmd_tx;
+        Rc::new(move |preset: CloudQualityPreset| {
+            let (slab, shadow, detail, ms, alpha) = cloud_quality_values(preset);
+            cloud_slab_steps.set(slab as f32);
+            cloud_shadow_steps.set(shadow as f32);
+            cloud_detail_octaves.set(detail as f32);
+            cloud_ms_octaves.set(ms as f32);
+            cloud_taa_alpha.set(alpha);
+            let tx = cmd_tx.get();
+            let send = |field: &str, v: String| {
+                let _ = tx.send(rkp_engine::EngineCommand::UpdateEnvironment {
+                    field: field.into(),
+                    value: v,
+                });
+            };
+            send("cloud_slab_steps", (slab as f32).to_string());
+            send("cloud_shadow_steps", (shadow as f32).to_string());
+            send("cloud_detail_octaves", (detail as f32).to_string());
+            send("cloud_ms_octaves", (ms as f32).to_string());
+            send("cloud_taa_alpha", alpha.to_string());
+        })
+    };
+
+    // Which preset (if any) matches the current signal values exactly. Used
+    // to highlight the active preset button; `None` means "Custom".
+    let active_preset = move || -> Option<CloudQualityPreset> {
+        let s = cloud_slab_steps.get() as u32;
+        let sh = cloud_shadow_steps.get() as u32;
+        let d = cloud_detail_octaves.get() as u32;
+        let m = cloud_ms_octaves.get() as u32;
+        let a = cloud_taa_alpha.get();
+        for p in [
+            CloudQualityPreset::Low,
+            CloudQualityPreset::Medium,
+            CloudQualityPreset::High,
+            CloudQualityPreset::Ultra,
+        ] {
+            let (ps, psh, pd, pm, pa) = cloud_quality_values(p);
+            if s == ps && sh == psh && d == pd && m == pm && (a - pa).abs() < 0.001 {
+                return Some(p);
+            }
+        }
+        None
+    };
+
     let env_color3 = move |field: &'static str| -> Rc<dyn Fn([f32; 4])> {
         Rc::new(move |v: [f32; 4]| {
             let _ = cmd_tx.get().send(rkp_engine::EngineCommand::UpdateEnvironment {
@@ -283,8 +342,56 @@ fn EnvironmentForm(env: rkp_engine::environment::EnvironmentSettings) -> NodeHan
                     {prop_slider(__scope, "Density", cloud_density_scale, 0.0, 1.0, 0.01, env_f32("cloud_density_scale"))}
                     {prop_slider(__scope, "Wind Speed", cloud_wind_speed, 0.0, 20.0, 0.5, env_f32("cloud_wind_speed"))}
                     {prop_slider(__scope, "Wind Dir", cloud_wind_dir, 0.0, 360.0, 1.0, env_f32("cloud_wind_dir"))}
+
+                    // Quality presets — bundle the render-cost knobs. Individual
+                    // sliders below let users override specific values; the row
+                    // highlights whichever preset the current settings match.
+                    div {
+                        style: "font-size:11px;color:#888;margin-top:8px;",
+                        {"Quality"}
+                    }
+                    div {
+                        style: "display:flex;gap:4px;",
+                        {preset_button(__scope, "Low", CloudQualityPreset::Low, apply_preset.clone(), active_preset)}
+                        {preset_button(__scope, "Medium", CloudQualityPreset::Medium, apply_preset.clone(), active_preset)}
+                        {preset_button(__scope, "High", CloudQualityPreset::High, apply_preset.clone(), active_preset)}
+                        {preset_button(__scope, "Ultra", CloudQualityPreset::Ultra, apply_preset.clone(), active_preset)}
+                    }
+                    {prop_slider(__scope, "Slab Samples", cloud_slab_steps, 8.0, 64.0, 1.0, env_f32("cloud_slab_steps"))}
+                    {prop_slider(__scope, "Shadow Samples", cloud_shadow_steps, 1.0, 6.0, 1.0, env_f32("cloud_shadow_steps"))}
+                    {prop_slider(__scope, "Detail Octaves", cloud_detail_octaves, 1.0, 5.0, 1.0, env_f32("cloud_detail_octaves"))}
+                    {prop_slider(__scope, "Multi-scatter Octaves", cloud_ms_octaves, 1.0, 4.0, 1.0, env_f32("cloud_ms_octaves"))}
+                    {prop_slider(__scope, "TAA Weight", cloud_taa_alpha, 0.05, 0.7, 0.01, env_f32("cloud_taa_alpha"))}
                 }
             }
+        }
+    }
+}
+
+/// One entry in the cloud quality preset row. Highlights itself when the
+/// current render-knob signals match the preset; clicking fires `apply_preset`
+/// which updates both the signals and the engine.
+fn preset_button(
+    __scope: &mut rinch::core::dom::RenderScope,
+    label: &str,
+    preset: CloudQualityPreset,
+    apply: Rc<dyn Fn(CloudQualityPreset)>,
+    active: impl Fn() -> Option<CloudQualityPreset> + Copy + 'static,
+) -> rinch::core::dom::NodeHandle {
+    const BASE: &str = "flex:1;padding:4px 8px;font-size:11px;border-radius:3px;\
+                        cursor:pointer;border:1px solid #333;";
+    let label = label.to_string();
+    rsx! {
+        div {
+            style: {move || {
+                if active() == Some(preset) {
+                    format!("{BASE}background:#3a6a9a;color:#fff;border-color:#4a7aaa;")
+                } else {
+                    format!("{BASE}background:#222;color:#bbb;")
+                }
+            }},
+            onclick: move || apply(preset),
+            {label}
         }
     }
 }

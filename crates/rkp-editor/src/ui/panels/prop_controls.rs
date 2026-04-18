@@ -173,7 +173,17 @@ pub fn prop_scrub(
                                 if delta.abs() > 2.0 {
                                     did_drag.set(true);
                                 }
-                                let new_val = (drag_start.get() + delta * step).clamp(min, max);
+                                // Drag sensitivity is based on the full range, not the step.
+                                // Target ~100 pixels to traverse the range; snap to step.
+                                // This keeps tiny-range sliders (e.g. 1..6) usable.
+                                let range = (max - min).max(1e-6);
+                                let raw = drag_start.get() + delta * range / 100.0;
+                                let snapped = if step > 0.0 {
+                                    (raw / step).round() * step
+                                } else {
+                                    raw
+                                };
+                                let new_val = snapped.clamp(min, max);
                                 (oc_drag.get())(new_val);
                             })
                             .on_end(move |_, _| {

@@ -48,6 +48,10 @@ pub struct CloudParams {
     pub noise: [f32; 4],
     pub wind: [f32; 4],
     pub flags: [f32; 4],
+    /// x = slab_steps, y = shadow_steps, z = detail_octaves, w = ms_octaves.
+    pub quality: [f32; 4],
+    /// x = taa_alpha, y..w reserved.
+    pub quality2: [f32; 4],
 }
 
 impl Default for CloudParams {
@@ -57,6 +61,8 @@ impl Default for CloudParams {
             noise: [0.0003, 0.002, 0.3, 10000.0],
             wind: [1.0, 0.0, 5.0, 0.0],
             flags: [0.0, 0.0, 0.0, 0.0], // disabled by default
+            quality: [32.0, 4.0, 4.0, 3.0],
+            quality2: [0.25, 0.0, 0.0, 0.0],
         }
     }
 }

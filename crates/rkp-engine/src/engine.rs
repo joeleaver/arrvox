@@ -1938,6 +1938,31 @@ impl EngineState {
                     "attenuate_sun_by_clouds" => {
                         env.attenuate_sun_by_clouds = value == "true" || value == "1";
                     }
+                    "cloud_slab_steps" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            env.cloud_slab_steps = (v as u32).clamp(8, 128);
+                        }
+                    }
+                    "cloud_shadow_steps" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            env.cloud_shadow_steps = (v as u32).clamp(1, 8);
+                        }
+                    }
+                    "cloud_detail_octaves" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            env.cloud_detail_octaves = (v as u32).clamp(1, 6);
+                        }
+                    }
+                    "cloud_ms_octaves" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            env.cloud_ms_octaves = (v as u32).clamp(1, 5);
+                        }
+                    }
+                    "cloud_taa_alpha" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            env.cloud_taa_alpha = v.clamp(0.05, 0.7);
+                        }
+                    }
                     "cloud_altitude_min" => {
                         if let Ok(v) = value.parse::<f32>() { env.cloud_altitude_min = v; }
                     }

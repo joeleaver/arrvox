@@ -33,6 +33,8 @@ struct CloudParams {
     noise:    vec4<f32>,   // x=shape_freq, y=detail_freq, z=detail_weight, w=weather_scale
     wind:     vec4<f32>,
     flags:    vec4<f32>,   // x=enable, y=coverage
+    quality:  vec4<f32>,   // unused here but must match struct layout
+    quality2: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: VolumetricParams;
@@ -106,8 +108,19 @@ fn cloud_density(pos: vec3<f32>) -> f32 {
     var base = shape * weather * height_grad;
     base = max(base - threshold, 0.0);
 
-    let detail = fbm_3d(noise_pos * cloud_params.noise.y, 3u);
-    base = max(base - detail * cloud_params.noise.z, 0.0);
+    // Match main shader: use the *finest* N octaves of a 4-octave FBM so low
+    // octave counts drop coarse erosion without shrinking clouds.
+    let detail_octaves = u32(clamp(cloud_params.quality.z, 1.0, 4.0));
+    let detail_skip = 4u - detail_octaves;
+    var detail_sum = 0.0;
+    var detail_amp = pow(0.5, f32(detail_skip + 1u));
+    var detail_pos = noise_pos * cloud_params.noise.y * pow(2.0, f32(detail_skip));
+    for (var i = 0u; i < detail_octaves; i++) {
+        detail_sum += detail_amp * value_noise_3d(detail_pos);
+        detail_amp *= 0.5;
+        detail_pos *= 2.0;
+    }
+    base = max(base - detail_sum * cloud_params.noise.z, 0.0);
 
     return base * density_scale;
 }

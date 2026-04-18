@@ -37,7 +37,9 @@ struct CloudParams {
     altitude: vec4<f32>,   // x=cloud_min, y=cloud_max, z=threshold, w=density_scale
     noise:    vec4<f32>,   // x=shape_freq, y=detail_freq, z=detail_weight, w=weather_scale
     wind:     vec4<f32>,   // x=wind_dir.x, y=wind_dir.y, z=wind_speed, w=time
-    flags:    vec4<f32>,   // x=enable (0/1)
+    flags:    vec4<f32>,   // x=enable (0/1), y=coverage
+    quality:  vec4<f32>,   // x=slab_steps, y=shadow_steps, z=detail_octaves, w=ms_octaves
+    quality2: vec4<f32>,   // x=taa_alpha
 }
 
 // --- Bindings ---
@@ -178,11 +180,26 @@ fn cloud_density(pos: vec3<f32>, footprint: f32) -> f32 {
     var base = shape * weather * height_grad;
     base = max(base - threshold, 0.0);
 
-    // Detail erosion (4 octaves for finer wispy features; the extra octave
-    // fades naturally at distance via the LOD term).
+    // Detail erosion — uses the *finest* N octaves of a standard 4-octave FBM.
+    // Lowering the octave count drops the *coarsest* layers (the ones that
+    // carve cloud-sized holes and fragment shapes), keeping only the fine
+    // wisps. So low-octave = less fine detail but same cloud silhouettes, not
+    // smaller clouds.
     let detail_freq = cloud_params.noise.y;
-    let detail = fbm_3d_lod(noise_pos * detail_freq, 4u, detail_freq, footprint);
-    base = max(base - detail * cloud_params.noise.z, 0.0);
+    let detail_octaves = u32(clamp(cloud_params.quality.z, 1.0, 4.0));
+    let detail_skip = 4u - detail_octaves;
+    var detail_sum = 0.0;
+    var detail_amp = pow(0.5, f32(detail_skip + 1u));
+    var detail_pos = noise_pos * detail_freq * pow(2.0, f32(detail_skip));
+    for (var i = 0u; i < detail_octaves; i++) {
+        let freq = detail_freq * pow(2.0, f32(detail_skip + i));
+        let wavelength = 1.0 / max(freq, 1e-8);
+        let lod = 1.0 - smoothstep(0.25 * wavelength, 2.0 * wavelength, footprint);
+        detail_sum += detail_amp * value_noise_3d(detail_pos) * lod;
+        detail_amp *= 0.5;
+        detail_pos *= 2.0;
+    }
+    base = max(base - detail_sum * cloud_params.noise.z, 0.0);
 
     return base * density_scale;
 }
@@ -214,11 +231,11 @@ fn cloud_phase_at(cos_sun: f32, phase_g_scale: f32) -> f32 {
 }
 
 // --- Cloud self-shadow ---
-// 4 exponentially-spaced samples toward the sun (40 m → 320 m range, ~600 m total).
-// Reduced from 5 — TAA smooths the residual noise, and the last 480 m step was
-// sampling at such a coarse LOD that the detail FBM was already faded out.
+// Exponentially-spaced samples toward the sun (base 40 m, doubling). Step count
+// is driven by `cloud_params.quality.y` (2–6 typical). Each extra sample extends
+// the shadow reach and sharpens core/edge contrast at linear cost.
 fn cloud_sun_optical_depth(pos: vec3<f32>, jitter: f32) -> f32 {
-    let num_steps = 4u;
+    let num_steps = u32(max(cloud_params.quality.y, 1.0));
     let base_step = 40.0;
     var tau = 0.0;
     var p = pos + params.sun_dir.xyz * (jitter * base_step);
@@ -240,7 +257,8 @@ fn cloud_sun_inscatter(tau_sun: f32, cos_sun: f32, sun_col: vec3<f32>) -> vec3<f
     var a = 1.0;
     var b = 1.0;
     var c = 1.0;
-    for (var n = 0u; n < CLOUD_MS_OCTAVES; n++) {
+    let num_octaves = u32(max(cloud_params.quality.w, 1.0));
+    for (var n = 0u; n < num_octaves; n++) {
         sum += a * cloud_phase_at(cos_sun, c) * exp(-tau_sun * b) * sun_col;
         a *= CLOUD_MS_CONTRIB;
         b *= CLOUD_MS_ATTEN;
@@ -384,7 +402,7 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // Quadratic step distribution: dense sampling near the camera,
             // progressively coarser toward the horizon. This keeps detail for
             // close clouds while letting the march reach tens of kilometers.
-            let cloud_steps = 32u;
+            let cloud_steps = u32(max(cloud_params.quality.x, 8.0));
             // Per-frame jitter — combined with temporal reprojection this averages out
             // as dither rather than locking a static noise pattern into screen space.
             let cloud_jitter = interleaved_gradient_noise(vec2<f32>(gid.xy), params.frame_index);
@@ -447,7 +465,7 @@ fn march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let motion = length(prev_uv - current_uv);
                     let validity = 1.0 - smoothstep(0.04, 0.15, motion);
 
-                    let alpha = mix(1.0, 0.25, validity);
+                    let alpha = mix(1.0, cloud_params.quality2.x, validity);
                     final_cloud_scatter = mix(hist.rgb, cloud_scatter, alpha);
                     final_cloud_trans = mix(hist.a, cloud_trans, alpha);
                 }

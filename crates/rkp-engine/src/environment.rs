@@ -80,6 +80,19 @@ pub struct EnvironmentSettings {
     /// direct sun contribution by the resulting optical depth. Cheap proxy for
     /// "clouds dim the world" without real cloud shadow maps.
     pub attenuate_sun_by_clouds: bool,
+
+    // ── Cloud quality ──────────────────────────────────────────────
+    /// Slab march sample count (main cost driver: linear in this).
+    pub cloud_slab_steps: u32,
+    /// Sun-shadow march samples per cloud sample (linear in this).
+    pub cloud_shadow_steps: u32,
+    /// Detail FBM octave count (finer cloud features).
+    pub cloud_detail_octaves: u32,
+    /// Multi-scatter octaves used inside clouds.
+    pub cloud_ms_octaves: u32,
+    /// Temporal accumulation weight for the current frame (0.1 = strong history,
+    /// 0.5 = responsive but noisier).
+    pub cloud_taa_alpha: f32,
 }
 
 impl Default for EnvironmentSettings {
@@ -132,7 +145,32 @@ impl Default for EnvironmentSettings {
             cloud_wind_speed: 5.0,
             cloud_wind_dir: 0.0,
             attenuate_sun_by_clouds: true,
+            // Defaults match the "High" preset.
+            cloud_slab_steps: 32,
+            cloud_shadow_steps: 4,
+            cloud_detail_octaves: 4,
+            cloud_ms_octaves: 3,
+            cloud_taa_alpha: 0.25,
         }
+    }
+}
+
+/// Named quality tiers that bundle the individual cloud render knobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudQualityPreset {
+    Low,
+    Medium,
+    High,
+    Ultra,
+}
+
+/// (slab_steps, shadow_steps, detail_octaves, ms_octaves, taa_alpha)
+pub fn cloud_quality_values(preset: CloudQualityPreset) -> (u32, u32, u32, u32, f32) {
+    match preset {
+        CloudQualityPreset::Low    => (16, 2, 2, 2, 0.15),
+        CloudQualityPreset::Medium => (24, 3, 3, 3, 0.25),
+        CloudQualityPreset::High   => (32, 4, 4, 3, 0.25),
+        CloudQualityPreset::Ultra  => (48, 5, 5, 4, 0.35),
     }
 }
 
@@ -415,6 +453,13 @@ impl EnvironmentSettings {
                 self.cloud_coverage, // passed to shader to suppress weather variation at high coverage
                 0.0, 0.0,
             ],
+            quality: [
+                self.cloud_slab_steps as f32,
+                self.cloud_shadow_steps as f32,
+                self.cloud_detail_octaves as f32,
+                self.cloud_ms_octaves as f32,
+            ],
+            quality2: [self.cloud_taa_alpha, 0.0, 0.0, 0.0],
         }
     }
 
