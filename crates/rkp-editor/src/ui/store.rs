@@ -18,6 +18,35 @@ use rkp_engine::material_library::MaterialInfo;
 use rkp_engine::procedural_snapshot::ProceduralSnapshot;
 use rkp_engine::recent_projects::RecentProject;
 
+/// Editor-side view of profiling data used by [`ProfilingPanel`].
+///
+/// The panel reads each field via `{|| …}` reactive closures. The DOM
+/// is built once with fixed slots; every tick only mutates text and
+/// style attributes — no row tear-down, no for-loop diffing on the
+/// hot path.
+///
+/// Values in `latest_cpu` / `latest_gpu` are exponentially smoothed in
+/// the state callback so the readouts don't jitter. `history` stays
+/// raw — the sparkline should show real frame-time variance.
+#[derive(Debug, Clone)]
+pub struct ProfilingWindow {
+    pub frame_idx: u64,
+    pub latest_cpu: rkp_engine::profiling::CpuPhaseTimings,
+    /// GPU pass timings in engine-submit order, already smoothed. The
+    /// label set matches [`gpu_pass_labels`] at the moment the panel
+    /// reads both signals.
+    ///
+    /// [`gpu_pass_labels`]: EditorStore::gpu_pass_labels
+    pub latest_gpu: Vec<(String, f32)>,
+    /// Raw `(frame_idx, total_cpu_ms)` for the last `HISTORY_LEN` frames,
+    /// oldest first. Used for the sparkline.
+    pub history: Vec<(u64, f32)>,
+}
+
+impl ProfilingWindow {
+    pub const HISTORY_LEN: usize = 128;
+}
+
 use crate::ui::layout::{ContainerKind, LayoutConfig, PanelId, default_layout};
 
 /// Editor interaction mode.
@@ -36,10 +65,26 @@ pub enum EditorMode {
 pub struct EditorStore {
     // ── Engine state (written by engine thread via send()) ────────
 
-    /// Frames per second.
+    /// Frames per second (1 / frame work time — render-only, ignores
+    /// pacing sleep). Use `tick_hz` for the user-perceived rate.
     pub fps: Signal<f32>,
+    /// True engine tick rate including pacing sleep.
+    pub tick_hz: Signal<f32>,
+    /// Smoothed physics substeps per second. Stays near 60 when physics
+    /// is meeting its target; drops below when ticks starve the
+    /// fixed-timestep accumulator.
+    pub physics_hz: Signal<f32>,
     /// Number of GPU objects being rendered.
     pub gpu_object_count: Signal<u32>,
+    /// Latest frame's CPU + GPU timings (smoothed), plus a short ring
+    /// of recent frames for the sparkline. `None` until the first GPU
+    /// timestamp has resolved (a few frames after startup). Updated at
+    /// most 60 Hz — the callback throttles and EMA-smooths.
+    pub profiling: Signal<Option<Arc<ProfilingWindow>>>,
+    /// Ordered list of GPU pass labels. Updated only when the label
+    /// set changes (essentially never post-startup), so the panel's
+    /// `for` loop over labels doesn't churn per-tick.
+    pub gpu_pass_labels: Signal<Arc<Vec<String>>>,
     /// Scene objects (flat list, hierarchy via parent_id).
     pub objects: Signal<Vec<SceneObjectInfo>>,
     /// Currently selected entity (None = nothing selected).
@@ -98,6 +143,14 @@ pub struct EditorStore {
     pub import_progress: Signal<Vec<rkp_engine::snapshot::ImportProgressInfo>>,
     /// Model path being dragged onto viewport (None = no drag).
     pub model_drag: Signal<Option<String>>,
+    /// Registered generator names (from the loaded gameplay dylib).
+    /// Sourced from the engine snapshot — empty when no project or no
+    /// generators are registered. Rendered in the models panel.
+    pub available_generators: Signal<Vec<String>>,
+    /// `.rkgen` presets discovered in `assets/generators/`. Rendered
+    /// in the models panel alongside bare generators.
+    pub available_generator_presets:
+        Signal<Vec<rkp_engine::snapshot::GeneratorPresetEntry>>,
     /// Inspector data for the selected entity.
     pub inspector: Signal<Option<InspectorSnapshot>>,
     /// Procedural object snapshot for the selected entity (if it has ProceduralGeometry).
@@ -202,7 +255,11 @@ impl EditorStore {
         Self {
             // Engine state — zeroed, engine will push real values.
             fps: Signal::new(0.0),
+            tick_hz: Signal::new(0.0),
+            physics_hz: Signal::new(0.0),
             gpu_object_count: Signal::new(0),
+            profiling: Signal::new(None),
+            gpu_pass_labels: Signal::new(Arc::new(Vec::new())),
             objects: Signal::new(Vec::new()),
             selected_entity: Signal::new(None),
 
@@ -227,6 +284,8 @@ impl EditorStore {
             project_name: Signal::new(String::new()),
             project_dir: Signal::new(String::new()),
             available_models: Signal::new(Vec::new()),
+            available_generators: Signal::new(Vec::new()),
+            available_generator_presets: Signal::new(Vec::new()),
             importing_models: Signal::new(Vec::new()),
             import_progress: Signal::new(Vec::new()),
             model_drag: Signal::new(None),

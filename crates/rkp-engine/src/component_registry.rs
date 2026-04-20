@@ -131,6 +131,8 @@ pub fn register_builtins(registry: &mut ComponentRegistry) {
     registry.register(procedural_geometry_entry());
     registry.register(skeleton_entry());
     registry.register(animation_player_entry());
+    registry.register(crate::generator::generator_state_entry());
+    registry.register(crate::generator::generator_owned_entry());
 }
 
 // ── ProceduralGeometry ───────────────────────────────────────────────
@@ -650,7 +652,7 @@ static RIGID_BODY_FIELDS: [FieldMeta; 6] = [
     FieldMeta { name: "mass", field_type: FieldType::Float, range: Some((0.01, 1000.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
     FieldMeta { name: "friction", field_type: FieldType::Float, range: Some((0.0, 2.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
     FieldMeta { name: "restitution", field_type: FieldType::Float, range: Some((0.0, 1.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
-    FieldMeta { name: "collider_cell_size", field_type: FieldType::Float, range: Some((0.01, 1.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
+    FieldMeta { name: "collider_cell_size", field_type: FieldType::Float, range: Some((0.05, 1.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: true },
 ];
 
 fn rigid_body_entry() -> ComponentEntry {
@@ -710,8 +712,13 @@ fn rigid_body_entry() -> ComponentEntry {
                     else { Err("type mismatch".into()) }
                 }
                 "collider_cell_size" => {
-                    if let FieldValue::Float(v) = value { c.collider_cell_size = v as f32; Ok(()) }
-                    else { Err("type mismatch".into()) }
+                    if let FieldValue::Float(v) = value {
+                        // Clamp to slider range. The lower bound matters: voxel
+                        // counts grow as 1/cs³, so unbounded values quickly
+                        // exceed the GPU's max_buffer_size for the wireframe.
+                        c.collider_cell_size = (v as f32).clamp(0.05, 1.0);
+                        Ok(())
+                    } else { Err("type mismatch".into()) }
                 }
                 _ => Err(format!("unknown field '{field}'")),
             }

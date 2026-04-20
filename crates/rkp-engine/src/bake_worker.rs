@@ -1,27 +1,34 @@
-//! Async bake worker.
+//! Async bake + generator worker.
 //!
-//! Spawns a single background thread that owns its own GPU evaluator
-//! and chews through [`BakeRequest`]s one at a time. For each job the
-//! worker:
+//! Spawns a single background thread that owns a `GpuEvaluator` and
+//! handles two kinds of work from the engine:
 //!
-//! 1. Runs `voxelize_to_artifact` against its own private pools (no
-//!    shared state, no lock).
-//! 2. Acquires the shared `RkpSceneManager` lock, frees the entity's
-//!    previous geometry allocation if any, then calls
-//!    `integrate_artifact` to splice the new one into the scene
-//!    pools. This is the hot part — ~60-90 ms on a 20 m procedural
-//!    for the 28 M u32 brick-cell remap + octree node/face-link
-//!    remap.
-//! 3. Releases the lock and sends the engine a slim `BakeResult`
-//!    carrying just the freshly allocated `SpatialData` + summary.
+//! **`BakeRequest`** — voxelize (optionally) and integrate into the
+//! scene. Two input modes:
+//!   * `BakeInput::Procedural(tree)` — the worker flattens the tree
+//!     into opcodes, runs `voxelize_to_artifact` against its GPU
+//!     evaluator, then integrates.
+//!   * `BakeInput::Artifact(a)` — the caller already produced voxels
+//!     (e.g. a CPU-sampled SDF or a mesh voxelization). The worker
+//!     skips straight to integrate.
 //!
-//! The engine's `drain_bake_results` tick now does O(1) ECS updates
-//! rather than touching scene pools — the main thread's bake-related
-//! stall drops from "full integrate" to ~microseconds. Lock
-//! contention with `render_frame`'s `geometry_upload` is rare (that
-//! lock is held for ~1 ms per dirty frame) and naturally serialized
-//! by the bake-in-flight flag on the procedural.
+//! Regular procedural edits send `Procedural` with `generator_child =
+//! None`; the result updates the owning entity's `Renderable`.
+//! Generator-emitted children send either variant with a
+//! `GeneratorChildSpec` set, and the engine's `drain_bake_results`
+//! spawns a new child entity for each result.
+//!
+//! **`GeneratorRequest`** — run a user-authored generator function on
+//! the worker thread. The generator body calls `ctx.emit_child(...)`
+//! which enqueues `BakeRequest`s back onto this same worker's queue.
+//! Because the worker is single-threaded, those bakes run after the
+//! generator itself returns — no deadlock possible between the
+//! generator's voxelization and its own emissions.
+//!
+//! Both request kinds share the same `GpuEvaluator`. The worker
+//! multiplexes the two input channels with `crossbeam::select!`.
 
+use std::any::Any;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -30,31 +37,77 @@ use crossbeam::channel::{Receiver, Sender};
 use rkp_render::rkp_scene_manager::RkpSceneManager;
 use rkp_render::proc_sample::GpuEvaluator;
 
-use crate::components::SpatialData;
+use crate::components::{SpatialData, Transform};
+use crate::generator::{GenerateFn, GeneratorError};
 
-/// One bake job. `generation` is compared against the entity's current
-/// generation at result-receive time; stale results get dropped.
+/// What the worker will voxelize into a `BakeArtifact`, or skip past if
+/// already done.
+pub enum BakeInput {
+    /// Flattened procedural opcode stream — the worker voxelizes via
+    /// the GPU evaluator. Cheap to clone, tree-free.
+    Procedural(Vec<rkp_procedural::flatten::ProcInstruction>),
+    /// Pre-voxelized by the caller. Worker skips straight to integrate.
+    /// Used for "other means" generators (CPU-sampled SDFs, mesh
+    /// voxelization, etc.) that don't want to route through the
+    /// procedural evaluator.
+    Artifact(rkp_core::BakeArtifact),
+}
+
+/// If a BakeRequest originated from a generator's `emit_child` call,
+/// the request carries this spec. On successful integrate the engine
+/// spawns a new child entity rather than updating the existing
+/// `request.entity`.
+pub struct GeneratorChildSpec {
+    /// The generator entity that emitted this child. Child's
+    /// `GeneratorOwned.parent` points here.
+    pub parent_entity: hecs::Entity,
+    /// Child-local transform. The engine composes
+    /// `parent.transform × local_transform` at spawn time to get the
+    /// absolute world transform stored on the child.
+    pub local_transform: Transform,
+    /// Optional name hint for `EditorMetadata.name`. Defaults to
+    /// `"<parent>.child"` if None.
+    pub name_hint: Option<String>,
+    /// Generator's current generation counter. Stale results (from a
+    /// regen whose generation has been bumped) can be detected and
+    /// dropped by checking this against the generator's tracker.
+    pub generation: u64,
+    /// `Some(key)` for persistent children — the engine matches by
+    /// (parent, slot_key) and reuses the existing entity (preserving
+    /// any user-attached components like lights or scripts). `None`
+    /// for anonymous children — they're blown away on each regen.
+    pub slot_key: Option<String>,
+}
+
+/// One unit of bake work.
 pub struct BakeRequest {
+    /// For a standard procedural bake: the entity whose `Renderable` to
+    /// update. For a generator-emitted child: the generator entity (the
+    /// actual child is a new entity spawned in `drain_bake_results`).
     pub entity: hecs::Entity,
+    /// For regular bakes: the procedural's `bake_generation` counter.
+    /// For generator-child bakes: unused — `generator_child.generation`
+    /// is the authoritative counter.
     pub generation: u64,
     pub scene_id: u32,
-    /// Flattened procedural opcode stream. Cheap to clone and tree-free,
-    /// so we don't ship the full `ProceduralObject` across threads.
-    pub instructions: Vec<rkp_procedural::flatten::ProcInstruction>,
+    pub input: BakeInput,
     pub aabb: rkp_core::Aabb,
     pub voxel_size: f32,
     /// Root.transform.scale at the moment this request was captured.
-    /// Worker echoes it back in the result so integrate can set
-    /// `last_evaluated_root_scale` to what the voxels *actually*
-    /// represent — not whatever the user has since dragged the tree
-    /// to. Otherwise the preview-multiplier math drifts every time
-    /// the user edits during a bake.
+    /// Worker echoes it back so integrate can set
+    /// `last_evaluated_root_scale` to what the voxels actually
+    /// represent. Only meaningful for procedural-entity bakes; zero
+    /// for generator children.
     pub root_scale: glam::Vec3,
-    /// Previous geometry allocation to free under the same lock as
-    /// the new integrate. The engine reads it off `Renderable` at
-    /// enqueue time; we don't want the worker to round-trip through
-    /// the ECS. `None` on an initial bake.
+    /// Previous geometry allocation to free. Always `None` for
+    /// generator children (each is a new allocation).
     pub prev_spatial: Option<SpatialData>,
+    /// Optional `.rkp` sidecar path to write the artifact to before
+    /// integrating. `None` skips the cache write.
+    pub cache_output_path: Option<std::path::PathBuf>,
+    /// Set → this is a generator-emitted child bake. Drives main-thread
+    /// post-processing (spawn new entity vs. update existing).
+    pub generator_child: Option<GeneratorChildSpec>,
 }
 
 /// Worker → engine handoff. Integrate has already run on the worker
@@ -67,6 +120,9 @@ pub struct BakeResult {
     pub voxel_size: f32,
     pub root_scale: glam::Vec3,
     pub outcome: BakeOutcome,
+    /// Echoed back from the request so main-thread processing knows
+    /// whether to spawn a child or update an existing entity.
+    pub generator_child: Option<GeneratorChildSpec>,
 }
 
 pub enum BakeOutcome {
@@ -82,11 +138,53 @@ pub enum BakeOutcome {
     Failed,
 }
 
+/// A generator run request. Params are type-erased; the generator's
+/// erased wrapper (emitted by `#[rkp_generator]`) downcasts inside the
+/// worker.
+pub struct GeneratorRequest {
+    pub entity: hecs::Entity,
+    /// Bumped by the system each submission. Generator children inherit
+    /// this generation into their `GeneratorChildSpec`.
+    pub generation: u64,
+    pub generator_name: String,
+    /// Hash of params at submission time; used to drop stale results.
+    pub param_hash: u64,
+    pub params: Box<dyn Any + Send>,
+    pub cancel: crate::generator::CancelToken,
+    pub progress: crate::generator::ProgressHandle,
+    pub transform: crate::components::Transform,
+    pub world_position: rkp_core::WorldPosition,
+    pub generate_fn: GenerateFn,
+}
+
+/// Generator lifecycle events. Child emissions do NOT flow through
+/// here — they go out via `BakeResult` instead (unified path).
+pub enum GeneratorWorkerEvent {
+    Completed {
+        generator_entity: hecs::Entity,
+        generation: u64,
+        generator_name: String,
+        param_hash: u64,
+    },
+    Failed {
+        generator_entity: hecs::Entity,
+        generation: u64,
+        generator_name: String,
+        param_hash: u64,
+        error: GeneratorError,
+    },
+}
+
 pub struct BakeWorker {
-    /// Send bake jobs here.
+    /// Send bake jobs here. Both procedural edits and generator-child
+    /// emissions flow through this channel.
     pub tx_request: Sender<BakeRequest>,
-    /// Engine drains this each tick.
+    /// Engine drains bake results each tick.
     pub rx_result: Receiver<BakeResult>,
+    /// Send generator jobs here.
+    pub tx_generator: Sender<GeneratorRequest>,
+    /// Engine drains generator lifecycle events here.
+    pub rx_generator: Receiver<GeneratorWorkerEvent>,
     _handle: JoinHandle<()>,
 }
 
@@ -95,117 +193,60 @@ impl BakeWorker {
         device: wgpu::Device,
         queue: wgpu::Queue,
         scene_mgr: Arc<Mutex<RkpSceneManager>>,
+        next_scene_id: Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
         let (tx_request, rx_request) = crossbeam::channel::unbounded::<BakeRequest>();
         let (tx_result, rx_result) = crossbeam::channel::unbounded::<BakeResult>();
+        let (tx_generator, rx_gen_request) =
+            crossbeam::channel::unbounded::<GeneratorRequest>();
+        let (tx_gen_event, rx_generator) =
+            crossbeam::channel::unbounded::<GeneratorWorkerEvent>();
+
+        // Cloned into the generator context so it can enqueue child
+        // bakes through the same channel the engine uses for ordinary
+        // procedural edits.
+        let tx_request_for_ctx = tx_request.clone();
 
         let handle = std::thread::Builder::new()
             .name("rkp-bake-worker".to_string())
             .spawn(move || {
-                // GpuEvaluator is created on the worker thread so its
-                // buffers + pipelines are owned there. Device/Queue
-                // handles are cheap clones (internally Arc'd).
                 let mut evaluator = GpuEvaluator::new(&device);
 
-                while let Ok(req) = rx_request.recv() {
-                    let t_start = std::time::Instant::now();
-                    let instructions = req.instructions.clone();
-                    let sdf_fn =
-                        |positions: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
-                            evaluator
-                                .evaluate(&device, &queue, positions, &instructions)
-                                .into_iter()
-                                .map(|r| r.into_tuple())
-                                .collect()
-                        };
-
-                    let artifact = rkp_core::voxelize_to_artifact(
-                        sdf_fn,
-                        &req.aabb,
-                        req.voxel_size,
-                    );
-                    let t_after_voxelize = t_start.elapsed();
-                    let outcome = match artifact {
-                        Some(a) => {
-                            let voxel_count = a.voxel_count;
-                            // Integrate under the scene_mgr lock. Lock is
-                            // held briefly (tens of ms on big bakes) —
-                            // render frames that need to upload geometry
-                            // will wait, but that's at most a one-frame
-                            // stall per bake and we explicitly want the
-                            // new voxels committed before anything reads.
-                            let t_lock_start = std::time::Instant::now();
-                            let mut sm = scene_mgr.lock().unwrap();
-                            let t_lock_acquired = t_lock_start.elapsed();
-
-                            // Free the entity's previous allocation so the
-                            // pools don't leak. Happens under the same
-                            // lock so the brick IDs the new integrate
-                            // picks up from the free list are exactly the
-                            // ones we just released.
-                            if let Some(prev) = &req.prev_spatial {
-                                let handle = rkp_core::OctreeHandle {
-                                    root_offset: prev.root_offset,
-                                    len: prev.len,
-                                    depth: prev.depth,
-                                    base_voxel_size: prev.base_voxel_size,
-                                };
-                                sm.deallocate_geometry(
-                                    &handle,
-                                    prev.voxel_slot_start,
-                                    prev.voxel_slot_count,
-                                    &prev.brick_ids,
-                                );
-                            }
-                            let result = sm.integrate_artifact(
-                                a, &req.aabb, req.voxel_size, req.scene_id,
-                            );
-                            drop(sm);
-                            let t_total = t_start.elapsed();
-                            match result {
-                                Some(result) => {
-                                    let spatial = spatial_from_voxelize_result(&result);
-                                    eprintln!(
-                                        "[bake_worker] gen={} scene_id={} voxels={} \
-                                         voxelize={:.1}ms lock_wait={:.2}ms \
-                                         integrate+dealloc={:.1}ms total={:.1}ms",
-                                        req.generation, req.scene_id, voxel_count,
-                                        t_after_voxelize.as_secs_f32() * 1000.0,
-                                        t_lock_acquired.as_secs_f32() * 1000.0,
-                                        (t_total - t_after_voxelize).as_secs_f32() * 1000.0,
-                                        t_total.as_secs_f32() * 1000.0,
-                                    );
-                                    BakeOutcome::Ok {
-                                        spatial,
-                                        voxel_count,
-                                    }
-                                }
-                                None => BakeOutcome::Failed,
-                            }
-                        }
-                        None => {
-                            eprintln!(
-                                "[bake_worker] gen={} scene_id={} voxelize FAILED wall={:.1}ms",
-                                req.generation,
-                                req.scene_id,
-                                t_after_voxelize.as_secs_f32() * 1000.0,
-                            );
-                            BakeOutcome::Failed
-                        }
+                loop {
+                    let req_opt: Option<WorkerJob> = crossbeam::select! {
+                        recv(rx_request) -> msg => msg.ok().map(WorkerJob::Bake),
+                        recv(rx_gen_request) -> msg => msg.ok().map(WorkerJob::Generator),
+                    };
+                    let req = match req_opt {
+                        Some(j) => j,
+                        None => break,
                     };
 
-                    let result = BakeResult {
-                        entity: req.entity,
-                        generation: req.generation,
-                        scene_id: req.scene_id,
-                        aabb: req.aabb,
-                        voxel_size: req.voxel_size,
-                        root_scale: req.root_scale,
-                        outcome,
-                    };
-                    // Send-failed means the engine has shut down — exit.
-                    if tx_result.send(result).is_err() {
-                        break;
+                    match req {
+                        WorkerJob::Generator(g) => {
+                            run_generator(
+                                g,
+                                &device,
+                                &queue,
+                                &mut evaluator,
+                                &scene_mgr,
+                                &next_scene_id,
+                                &tx_request_for_ctx,
+                                &tx_gen_event,
+                            );
+                        }
+                        WorkerJob::Bake(req) => {
+                            let result = run_bake(
+                                req,
+                                &device,
+                                &queue,
+                                &mut evaluator,
+                                &scene_mgr,
+                            );
+                            if tx_result.send(result).is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             })
@@ -214,24 +255,227 @@ impl BakeWorker {
         BakeWorker {
             tx_request,
             rx_result,
+            tx_generator,
+            rx_generator,
             _handle: handle,
         }
     }
 }
 
-/// Build a `SpatialData` from a `VoxelizeResult`. The worker calls
-/// this directly after integrate so the engine doesn't need to know
-/// the `SpatialHandle` layout.
+/// Internal multiplexer discriminant.
+enum WorkerJob {
+    Bake(BakeRequest),
+    Generator(GeneratorRequest),
+}
+
+/// Run one bake job to completion. Accepts both procedural-tree input
+/// and pre-voxelized artifact input. Integrates under the `scene_mgr`
+/// lock and returns a `BakeResult` describing the outcome.
+fn run_bake(
+    req: BakeRequest,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    evaluator: &mut GpuEvaluator,
+    scene_mgr: &Arc<Mutex<RkpSceneManager>>,
+) -> BakeResult {
+    let t_start = std::time::Instant::now();
+
+    // Step 1: get an artifact, either by voxelizing a tree or by
+    // accepting one the caller already built.
+    let artifact = match req.input {
+        BakeInput::Procedural(instructions) => {
+            let sdf_fn = |positions: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+                evaluator
+                    .evaluate(device, queue, positions, &instructions)
+                    .into_iter()
+                    .map(|r| r.into_tuple())
+                    .collect()
+            };
+            rkp_core::voxelize_to_artifact(sdf_fn, &req.aabb, req.voxel_size)
+        }
+        BakeInput::Artifact(a) => Some(a),
+    };
+    let t_after_voxelize = t_start.elapsed();
+
+    let outcome = match artifact {
+        Some(a) => {
+            let voxel_count = a.voxel_count;
+
+            // Cache to sidecar outside the scene_mgr lock.
+            if let Some(ref out_path) = req.cache_output_path {
+                let t_write_start = std::time::Instant::now();
+                match rkp_core::asset_file::write_artifact_rkp(
+                    out_path,
+                    &a,
+                    req.aabb.min.to_array(),
+                    req.aabb.max.to_array(),
+                    req.voxel_size,
+                ) {
+                    Ok(()) => {
+                        eprintln!(
+                            "[bake_worker] wrote cache {} in {:.1}ms",
+                            out_path.display(),
+                            t_write_start.elapsed().as_secs_f32() * 1000.0,
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[bake_worker] cache write failed ({}): {e}",
+                            out_path.display(),
+                        );
+                    }
+                }
+            }
+
+            // Integrate under the scene_mgr lock. `prev_spatial` is
+            // always None for generator children — each is a fresh
+            // allocation.
+            let t_lock_start = std::time::Instant::now();
+            let mut sm = scene_mgr.lock().unwrap();
+            let t_lock_acquired = t_lock_start.elapsed();
+
+            if let Some(prev) = &req.prev_spatial {
+                let handle = rkp_core::OctreeHandle {
+                    root_offset: prev.root_offset,
+                    len: prev.len,
+                    depth: prev.depth,
+                    base_voxel_size: prev.base_voxel_size,
+                };
+                sm.deallocate_geometry(
+                    &handle,
+                    prev.voxel_slot_start,
+                    prev.voxel_slot_count,
+                    &prev.brick_ids,
+                );
+            }
+            let result = sm.integrate_artifact(
+                a, &req.aabb, req.voxel_size, req.scene_id,
+            );
+            drop(sm);
+            let t_total = t_start.elapsed();
+            match result {
+                Some(result) => {
+                    let spatial = spatial_from_voxelize_result(&result);
+                    eprintln!(
+                        "[bake_worker] gen={} scene_id={} voxels={} \
+                         voxelize={:.1}ms lock_wait={:.2}ms \
+                         integrate+dealloc={:.1}ms total={:.1}ms",
+                        req.generation, req.scene_id, voxel_count,
+                        t_after_voxelize.as_secs_f32() * 1000.0,
+                        t_lock_acquired.as_secs_f32() * 1000.0,
+                        (t_total - t_after_voxelize).as_secs_f32() * 1000.0,
+                        t_total.as_secs_f32() * 1000.0,
+                    );
+                    BakeOutcome::Ok { spatial, voxel_count }
+                }
+                None => BakeOutcome::Failed,
+            }
+        }
+        None => {
+            eprintln!(
+                "[bake_worker] gen={} scene_id={} voxelize FAILED wall={:.1}ms",
+                req.generation,
+                req.scene_id,
+                t_after_voxelize.as_secs_f32() * 1000.0,
+            );
+            BakeOutcome::Failed
+        }
+    };
+
+    BakeResult {
+        entity: req.entity,
+        generation: req.generation,
+        scene_id: req.scene_id,
+        aabb: req.aabb,
+        voxel_size: req.voxel_size,
+        root_scale: req.root_scale,
+        outcome,
+        generator_child: req.generator_child,
+    }
+}
+
+/// Run one generator function to completion. The generator body calls
+/// `ctx.emit_child(...)` which enqueues further `BakeRequest`s onto
+/// this same worker's queue — those get processed after the generator
+/// returns, since the worker is single-threaded.
+fn run_generator(
+    g: GeneratorRequest,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    evaluator: &mut GpuEvaluator,
+    scene_mgr: &Arc<Mutex<RkpSceneManager>>,
+    next_scene_id: &Arc<std::sync::atomic::AtomicU32>,
+    tx_request: &Sender<BakeRequest>,
+    tx_gen_event: &Sender<GeneratorWorkerEvent>,
+) {
+    use crate::generator::GeneratorContext;
+
+    let mut ctx = GeneratorContext::new_worker(
+        g.transform.clone(),
+        g.world_position,
+        g.generation,
+        g.cancel.clone(),
+        g.progress.clone(),
+        g.entity,
+        g.generator_name.clone(),
+        g.param_hash,
+        device,
+        queue,
+        evaluator,
+        scene_mgr,
+        next_scene_id,
+        tx_request.clone(),
+    );
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (g.generate_fn)(&*g.params, &mut ctx)
+    }))
+    .unwrap_or_else(|panic_payload| {
+        let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "generator panicked".to_string()
+        };
+        Err(GeneratorError::Failed(format!("panic: {msg}")))
+    });
+
+    let event = match outcome {
+        Ok(()) => GeneratorWorkerEvent::Completed {
+            generator_entity: g.entity,
+            generation: g.generation,
+            generator_name: g.generator_name,
+            param_hash: g.param_hash,
+        },
+        Err(error) => GeneratorWorkerEvent::Failed {
+            generator_entity: g.entity,
+            generation: g.generation,
+            generator_name: g.generator_name,
+            param_hash: g.param_hash,
+            error,
+        },
+    };
+    let _ = tx_gen_event.send(event);
+}
+
+/// Public re-export of the private helper so `GeneratorContext` can
+/// build a `SpatialData` after an immediate emit-artifact integrate.
+/// (Reserved for future uses; the unified bake path does it inside
+/// `run_bake` today.)
+pub(crate) fn spatial_from_voxelize_result_public(
+    r: &rkp_render::rkp_scene_manager::VoxelizeResult,
+) -> SpatialData {
+    spatial_from_voxelize_result(r)
+}
+
 fn spatial_from_voxelize_result(r: &rkp_render::rkp_scene_manager::VoxelizeResult) -> SpatialData {
     if let rkp_core::scene_node::SpatialHandle::Octree {
         root_offset, len, depth, base_voxel_size,
     } = r.spatial
     {
         SpatialData {
-            root_offset,
-            len,
-            depth,
-            base_voxel_size,
+            root_offset, len, depth, base_voxel_size,
             aabb: r.aabb,
             voxel_size: r.voxel_size,
             grid_origin: r.grid_origin,

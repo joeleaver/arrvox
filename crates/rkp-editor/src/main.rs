@@ -154,6 +154,8 @@ fn build_menus(
             let tx = tx.clone();
             move || { let _ = tx.send(rkp_engine::EngineCommand::SpawnCamera); }
         }));
+    // Generators live in the Models panel — they're assets, not spawn-
+    // menu items. See `ui/panels/models_panel.rs`.
 
     let edit_menu = Menu::new()
         .submenu("Spawn", spawn_menu)
@@ -219,6 +221,7 @@ fn main() -> anyhow::Result<()> {
         rkp_engine::engine::EngineConfig {
             width: 1920,
             height: 1080,
+            render_pacing: rkp_engine::engine::RenderPacing::TargetHz(60),
         },
         // Frame callback: route each viewport's pixels to its writer.
         // Unknown viewport ids are silently dropped (defensive — the
@@ -234,9 +237,121 @@ fn main() -> anyhow::Result<()> {
         // State callback: push engine state to EditorStore signals (cross-thread).
         {
             let store = store;
+            // Mutable state for the profiling stream. Captured by the
+            // Fn closure via Arc<Mutex> so the callback signature stays
+            // pure.
+            //
+            // - `history` is the raw `(frame_idx, total_cpu_ms)` ring
+            //   the sparkline reads. 128 entries max.
+            // - `smoothed_cpu` / `smoothed_gpu` hold exponentially
+            //   smoothed readouts (alpha = 0.15) so the panel doesn't
+            //   jitter frame-to-frame.
+            // - `last_push` throttles signal updates to ≤60 Hz — if the
+            //   engine tick rate ever exceeds 60 (unpaced, background
+            //   work, whatever), we skip the signal send and let the
+            //   next tick's sample land instead.
+            // - `known_labels` caches the last GPU label set so we only
+            //   push `gpu_pass_labels` when the set actually changes.
+            struct ProfilingState {
+                history: std::collections::VecDeque<(u64, f32)>,
+                smoothed_cpu: rkp_engine::profiling::CpuPhaseTimings,
+                smoothed_cpu_valid: bool,
+                smoothed_gpu: std::collections::HashMap<String, f32>,
+                last_push: std::time::Instant,
+                known_labels: Vec<String>,
+            }
+            let prof_state = std::sync::Arc::new(std::sync::Mutex::new(ProfilingState {
+                history: std::collections::VecDeque::with_capacity(
+                    ui::store::ProfilingWindow::HISTORY_LEN,
+                ),
+                smoothed_cpu: rkp_engine::profiling::CpuPhaseTimings::default(),
+                smoothed_cpu_valid: false,
+                smoothed_gpu: std::collections::HashMap::new(),
+                last_push: std::time::Instant::now()
+                    - std::time::Duration::from_secs(1),
+                known_labels: Vec::new(),
+            }));
+
+            /// 60 Hz minimum spacing between signal pushes.
+            const PROFILING_MIN_INTERVAL: std::time::Duration =
+                std::time::Duration::from_millis(16);
+            /// EMA weight for new samples. Smaller = more smoothing,
+            /// slower response. 0.15 gives ~40 ms time-constant at
+            /// 60 Hz, which reads steady but tracks regime changes in
+            /// a quarter second or so.
+            const EMA_ALPHA: f32 = 0.15;
+
             Box::new(move |update: &rkp_engine::StateUpdate| {
                 store.fps.send(update.fps);
+                store.tick_hz.send(update.tick_hz);
+                store.physics_hz.send(update.physics_hz);
                 store.gpu_object_count.send(update.gpu_object_count);
+                if let Some(frame) = &update.profiling {
+                    let mut st = prof_state.lock().expect("profiling state poisoned");
+
+                    // 1. Always push into the raw history (cheap, no
+                    //    signal work yet). The sparkline's oldest bar
+                    //    slides off on each push.
+                    if st.history.len() == ui::store::ProfilingWindow::HISTORY_LEN {
+                        st.history.pop_front();
+                    }
+                    st.history.push_back((frame.frame_idx, frame.cpu.total_ms));
+
+                    // 2. Update smoothed CPU phases.
+                    if !st.smoothed_cpu_valid {
+                        st.smoothed_cpu = frame.cpu.clone();
+                        st.smoothed_cpu_valid = true;
+                    } else {
+                        let s = &mut st.smoothed_cpu;
+                        let n = &frame.cpu;
+                        let lerp = |a: f32, b: f32| a + (b - a) * EMA_ALPHA;
+                        s.setup_ms       = lerp(s.setup_ms,       n.setup_ms);
+                        s.upload_ms      = lerp(s.upload_ms,      n.upload_ms);
+                        s.encode_ms      = lerp(s.encode_ms,      n.encode_ms);
+                        s.post_submit_ms = lerp(s.post_submit_ms, n.post_submit_ms);
+                        s.total_ms       = lerp(s.total_ms,       n.total_ms);
+                    }
+
+                    // 3. Update smoothed GPU passes. Any label that
+                    //    hasn't been seen before starts at its raw
+                    //    value (no cold-start overshoot).
+                    for (label, ms) in &frame.gpu_passes {
+                        let entry = st.smoothed_gpu.entry(label.clone()).or_insert(*ms);
+                        *entry += (*ms - *entry) * EMA_ALPHA;
+                    }
+
+                    // 4. Throttle: if it's too soon since the last
+                    //    push, drop this one. The raw history still
+                    //    gets updated above so when we do push, the
+                    //    sparkline reflects all frames seen.
+                    let now = std::time::Instant::now();
+                    if now.duration_since(st.last_push) < PROFILING_MIN_INTERVAL {
+                        return;
+                    }
+                    st.last_push = now;
+
+                    // 5. If the GPU label set changed, push the new
+                    //    ordering so the panel's `for` loop updates.
+                    let current_labels: Vec<String> = frame.gpu_passes
+                        .iter().map(|(l, _)| l.clone()).collect();
+                    if current_labels != st.known_labels {
+                        st.known_labels = current_labels.clone();
+                        store.gpu_pass_labels.send(std::sync::Arc::new(current_labels));
+                    }
+
+                    // 6. Build and send the per-tick window.
+                    let latest_gpu: Vec<(String, f32)> = frame.gpu_passes
+                        .iter()
+                        .map(|(l, _)| (l.clone(), *st.smoothed_gpu.get(l).unwrap_or(&0.0)))
+                        .collect();
+                    let window = ui::store::ProfilingWindow {
+                        frame_idx: frame.frame_idx,
+                        latest_cpu: st.smoothed_cpu.clone(),
+                        latest_gpu,
+                        history: st.history.iter().copied().collect(),
+                    };
+                    store.profiling.send(Some(std::sync::Arc::new(window)));
+                }
                 store.selected_entity.send(update.selected_entity);
                 if let Some(objects) = &update.objects {
                     store.objects.send(objects.clone());
@@ -252,6 +367,12 @@ fn main() -> anyhow::Result<()> {
                 }
                 if let Some(models) = &update.available_models {
                     store.available_models.send(models.clone());
+                }
+                if let Some(gens) = &update.available_generators {
+                    store.available_generators.send(gens.clone());
+                }
+                if let Some(presets) = &update.available_generator_presets {
+                    store.available_generator_presets.send(presets.clone());
                 }
                 if let Some(importing) = &update.importing_models {
                     store.importing_models.send(importing.clone());
@@ -280,8 +401,16 @@ fn main() -> anyhow::Result<()> {
                     // to the UI thread on its own.
                     state.apply(store);
                 }
-                store.inspector.send(update.inspector.clone());
-                store.procedural.send(update.procedural.clone());
+                // Outer Some = "this tick has new inspector data"; inner is
+                // the snapshot or None (deselect). When the engine sees no
+                // change since last tick it sends None here so we don't
+                // burn UI-thread time re-rendering identical fields.
+                if let Some(snap) = update.inspector.clone() {
+                    store.inspector.send(snap);
+                }
+                if let Some(snap) = update.procedural.clone() {
+                    store.procedural.send(snap);
+                }
                 if let Some(ref ac) = update.available_components {
                     store.available_components.send(ac.clone());
                 }

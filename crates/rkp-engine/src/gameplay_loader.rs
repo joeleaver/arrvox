@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use crate::behavior::SystemEntry;
 use crate::component_registry::{ComponentEntry, ComponentRegistry};
+use crate::generator::GeneratorEntry;
 
 /// Manages the gameplay dylib lifecycle.
 pub struct GameplayLoader {
@@ -27,6 +28,8 @@ pub struct GameplayLoader {
     gameplay_entries: Vec<&'static ComponentEntry>,
     /// System entries from the current dylib.
     system_entries: Vec<&'static SystemEntry>,
+    /// Generator entries from the current dylib.
+    generator_entries: Vec<&'static GeneratorEntry>,
     /// Last modification time of the dylib file.
     last_modified: Option<std::time::SystemTime>,
 }
@@ -41,6 +44,7 @@ impl GameplayLoader {
             lib: None,
             gameplay_entries: Vec::new(),
             system_entries: Vec::new(),
+            generator_entries: Vec::new(),
             last_modified: None,
         }
     }
@@ -101,6 +105,27 @@ impl GameplayLoader {
         }
 
         self.system_entries = systems;
+
+        // Generator entries — also optional for older dylibs.
+        type GeneratorsFn = extern "C" fn() -> GameplayGenerators;
+        let generators: Vec<&'static GeneratorEntry> = unsafe {
+            if let Ok(generators_fn) = lib.get::<GeneratorsFn>(b"rkp_gameplay_generators") {
+                let result = generators_fn();
+                std::slice::from_raw_parts(result.ptr, result.len).to_vec()
+            } else {
+                Vec::new()
+            }
+        };
+
+        if !generators.is_empty() {
+            eprintln!(
+                "[GameplayLoader] discovered {} gameplay generators: {}",
+                generators.len(),
+                generators.iter().map(|e| e.name).collect::<Vec<_>>().join(", "),
+            );
+        }
+
+        self.generator_entries = generators;
         self.lib = Some(lib);
 
         Ok(&self.gameplay_entries)
@@ -123,6 +148,11 @@ impl GameplayLoader {
     /// Get the currently loaded gameplay system entries.
     pub fn system_entries(&self) -> &[&'static SystemEntry] {
         &self.system_entries
+    }
+
+    /// Get the currently loaded gameplay generator entries.
+    pub fn generator_entries(&self) -> &[&'static GeneratorEntry] {
+        &self.generator_entries
     }
 
     /// Whether a component name belongs to the gameplay dylib.
@@ -191,6 +221,7 @@ impl GameplayLoader {
     pub fn unload(&mut self) {
         self.gameplay_entries.clear();
         self.system_entries.clear();
+        self.generator_entries.clear();
         self.lib = None;
         eprintln!("[GameplayLoader] unloaded gameplay dylib");
     }
@@ -236,6 +267,25 @@ pub struct GameplaySystems {
 impl GameplaySystems {
     /// Construct from a collected inventory iterator.
     pub fn from_iter(entries: Vec<&'static SystemEntry>) -> Self {
+        Self {
+            ptr: entries.as_ptr(),
+            len: entries.len(),
+            _storage: entries,
+        }
+    }
+}
+
+/// FFI-safe container for generator entries returned by the gameplay dylib.
+#[repr(C)]
+pub struct GameplayGenerators {
+    pub ptr: *const &'static GeneratorEntry,
+    pub len: usize,
+    _storage: Vec<&'static GeneratorEntry>,
+}
+
+impl GameplayGenerators {
+    /// Construct from a collected inventory iterator.
+    pub fn from_iter(entries: Vec<&'static GeneratorEntry>) -> Self {
         Self {
             ptr: entries.as_ptr(),
             len: entries.len(),

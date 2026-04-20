@@ -33,8 +33,15 @@ pub struct RkpRenderer {
     pub shade_params_buffer: wgpu::Buffer,
     /// Scene-wide light list (directional + point + spot).
     pub lights_buffer: wgpu::Buffer,
+    /// Capacity tracking for `lights_buffer`. Avoids using
+    /// `buffer.size()` as the grow check, which can race against
+    /// pending validation when the buffer is recreated.
+    lights_capacity: u64,
     /// Scene-wide material palette.
     pub materials_buffer: wgpu::Buffer,
+    /// Capacity tracking for `materials_buffer`. Same rationale as
+    /// `lights_capacity`.
+    materials_capacity: u64,
     /// Bumps when `lights_buffer` or `materials_buffer` reallocates so
     /// ViewportRenderers know to rebuild their march + shade bindings.
     lights_materials_epoch: u64,
@@ -88,9 +95,13 @@ impl RkpRenderer {
 
         let skin_deform = crate::skin_deform::SkinDeformPass::new(device, &scene);
 
+        let lights_capacity = lights_buffer.size();
+        let materials_capacity = materials_buffer.size();
         Self {
             scene, atmosphere,
-            shade_params_buffer, lights_buffer, materials_buffer,
+            shade_params_buffer,
+            lights_buffer, lights_capacity,
+            materials_buffer, materials_capacity,
             lights_materials_epoch: 0,
             skin_deform,
             device: device.clone(),
@@ -192,7 +203,7 @@ impl RkpRenderer {
         let raymarch = matches!(preview_mode, crate::BuildPreviewMode::Raymarch);
 
         // Upload per-viewport tile-cull screen-space AABBs into the VR's march.
-        viewport.march.upload_screen_aabbs(queue, screen_aabbs);
+        viewport.march.upload_screen_aabbs(&self.device, queue, screen_aabbs);
 
         // 0. Atmosphere LUTs (in-situ only — isolation uses a flat sky).
         if in_situ {
@@ -259,7 +270,14 @@ impl RkpRenderer {
         // 4. Volumetric march + composite (in-situ only).
         if in_situ {
             let q = self.profiler.begin_query("vol", encoder);
-            viewport.volumetric.dispatch_march(encoder);
+            // Fog + cloud are separate passes now. Fog runs over every pixel
+            // with only fog bindings; cloud runs over sky tiles with its own
+            // bindings. Keeping them split avoids the marker-bleed artefact
+            // the old combined shader produced when the hardware bilinear
+            // sampler blended the history validity sentinel across sky/voxel
+            // boundaries.
+            viewport.volumetric.dispatch_fog_march(encoder);
+            viewport.volumetric.dispatch_cloud_march(encoder);
             viewport.volumetric.update_history(encoder);
             viewport.volumetric.dispatch_sun_atten(encoder);
             viewport.volumetric.dispatch_composite(encoder);
@@ -387,25 +405,32 @@ impl RkpRenderer {
         self.profiler.resolve_queries(encoder);
     }
 
-    pub fn end_profiler_frame(&mut self, frame_idx: u64, _width: u32, _height: u32) {
-        // Note: `march.read_stats` used to live here but march is now per-VR.
-        // The editor's profiler panel should query per-VR stats; for now we
-        // just flush the frame without the march-specific stat readback.
+    /// End the GPU profiler frame and drain any finished samples.
+    ///
+    /// Returns `(label, ms)` for each top-level pass that wgpu-profiler
+    /// finished resolving this frame — empty during the first ~3-frame
+    /// warmup and on frames where the query pool isn't ready yet.
+    /// Callers are expected to feed this into `ProfilingHistory`.
+    pub fn end_profiler_frame(&mut self, frame_idx: u64) -> Vec<(String, f32)> {
         if let Err(e) = self.profiler.end_frame() {
             if frame_idx > 10 {
                 eprintln!("[profiler] end_frame: {e}");
             }
         }
-        if let Some(results) = self.profiler.process_finished_frame(self.timestamp_period) {
-            if frame_idx % 60 == 0 && frame_idx > 0 {
-                eprint!("[gpu]");
-                for r in &results {
-                    let ms = r.time.as_ref().map(|t| (t.end - t.start) * 1000.0).unwrap_or(0.0);
-                    eprint!(" {}={:.2}ms", r.label, ms);
-                }
-                eprintln!();
-            }
-        }
+        let Some(results) = self.profiler.process_finished_frame(self.timestamp_period) else {
+            return Vec::new();
+        };
+        results
+            .iter()
+            .map(|r| {
+                let ms = r
+                    .time
+                    .as_ref()
+                    .map(|t| ((t.end - t.start) * 1000.0) as f32)
+                    .unwrap_or(0.0);
+                (r.label.clone(), ms)
+            })
+            .collect()
     }
 
     pub fn update_shade_params(&self, queue: &wgpu::Queue, params: &ShadeParams) {
@@ -415,13 +440,18 @@ impl RkpRenderer {
     pub fn update_lights(&mut self, queue: &wgpu::Queue, lights: &[GpuLight]) {
         let data: &[u8] = bytemuck::cast_slice(lights);
         let needed = data.len() as u64;
-        if needed > self.lights_buffer.size() {
+        // Track our own capacity instead of `buffer.size()`. wgpu's
+        // validator can carry a stale-feeling size into its error path
+        // when the buffer is recreated while bind groups still hold
+        // refs to the old `Arc`. The capacity field sidesteps it.
+        if needed > self.lights_capacity {
             self.lights_buffer = Self::create_init_buffer(
                 &self.device,
                 "rkp_shade_lights",
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 data,
             );
+            self.lights_capacity = self.lights_buffer.size();
             self.lights_materials_epoch += 1;
         } else {
             queue.write_buffer(&self.lights_buffer, 0, data);
@@ -431,14 +461,14 @@ impl RkpRenderer {
     pub fn update_materials(&mut self, queue: &wgpu::Queue, materials: &[GpuMaterial]) {
         let data: &[u8] = bytemuck::cast_slice(materials);
         let needed = data.len() as u64;
-
-        if needed > self.materials_buffer.size() {
+        if needed > self.materials_capacity {
             self.materials_buffer = Self::create_init_buffer(
                 &self.device,
                 "rkp_shade_materials",
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 data,
             );
+            self.materials_capacity = self.materials_buffer.size();
             self.lights_materials_epoch += 1;
         } else {
             queue.write_buffer(&self.materials_buffer, 0, data);

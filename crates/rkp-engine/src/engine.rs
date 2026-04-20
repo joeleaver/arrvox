@@ -25,6 +25,100 @@ use crate::snapshot::StateUpdate;
 /// traverses from `node_idx` directly in `all_nodes` without sub-slicing,
 /// avoiding the offset-rebasing problem that `SparseOctree::from_raw` has
 /// when given a sub-slice.
+/// Coerce a JSON preset value into a `FieldValue` whose variant matches
+/// the field's declared `FieldType`. Returns a descriptive error if the
+/// types don't line up — the caller logs and continues.
+fn json_to_field_value(
+    value: &serde_json::Value,
+    field_name: &str,
+    comp: &crate::component_registry::ComponentEntry,
+) -> Result<crate::inspector::FieldValue, String> {
+    use crate::inspector::{FieldType, FieldValue};
+    let meta = comp
+        .meta
+        .iter()
+        .find(|m| m.name == field_name)
+        .ok_or_else(|| format!("unknown field '{field_name}'"))?;
+    match meta.field_type {
+        FieldType::Float => value
+            .as_f64()
+            .map(FieldValue::Float)
+            .ok_or_else(|| format!("expected number for {field_name}")),
+        FieldType::Int => value
+            .as_i64()
+            .map(FieldValue::Int)
+            .ok_or_else(|| format!("expected integer for {field_name}")),
+        FieldType::Bool => value
+            .as_bool()
+            .map(FieldValue::Bool)
+            .ok_or_else(|| format!("expected boolean for {field_name}")),
+        FieldType::String => value
+            .as_str()
+            .map(|s| FieldValue::String(s.to_string()))
+            .ok_or_else(|| format!("expected string for {field_name}")),
+        FieldType::Vec3 => {
+            let arr = value
+                .as_array()
+                .filter(|a| a.len() == 3)
+                .ok_or_else(|| format!("expected [x,y,z] for {field_name}"))?;
+            let mut out = [0.0f32; 3];
+            for (i, v) in arr.iter().enumerate() {
+                out[i] = v
+                    .as_f64()
+                    .ok_or_else(|| format!("non-number in {field_name}[{i}]"))?
+                    as f32;
+            }
+            Ok(FieldValue::Vec3(out))
+        }
+        FieldType::Color => {
+            let arr = value
+                .as_array()
+                .filter(|a| a.len() == 4)
+                .ok_or_else(|| format!("expected [r,g,b,a] for {field_name}"))?;
+            let mut out = [0.0f32; 4];
+            for (i, v) in arr.iter().enumerate() {
+                out[i] = v
+                    .as_f64()
+                    .ok_or_else(|| format!("non-number in {field_name}[{i}]"))?
+                    as f32;
+            }
+            Ok(FieldValue::Color(out))
+        }
+        // Other variants (Struct, AssetRef, etc.) aren't preset-friendly
+        // yet — surface clearly so the user knows to skip them.
+        other => Err(format!("preset override for {other:?} fields not supported")),
+    }
+}
+
+/// Compose a generator's parent transform with a child's local transform
+/// to produce the child's absolute world transform. `Transform.rotation`
+/// is Euler XYZ degrees (engine convention).
+fn compose_generator_transforms(
+    parent: &crate::components::Transform,
+    child: &crate::components::Transform,
+) -> crate::components::Transform {
+    let parent_rot = glam::Quat::from_euler(
+        glam::EulerRot::XYZ,
+        parent.rotation.x.to_radians(),
+        parent.rotation.y.to_radians(),
+        parent.rotation.z.to_radians(),
+    );
+    let child_rot = glam::Quat::from_euler(
+        glam::EulerRot::XYZ,
+        child.rotation.x.to_radians(),
+        child.rotation.y.to_radians(),
+        child.rotation.z.to_radians(),
+    );
+    let world_rot = parent_rot * child_rot;
+    let (ex, ey, ez) = world_rot.to_euler(glam::EulerRot::XYZ);
+    let scaled_child_pos = parent_rot * (parent.scale * child.position);
+    crate::components::Transform {
+        position: parent.position + scaled_child_pos,
+        rotation: glam::Vec3::new(ex.to_degrees(), ey.to_degrees(), ez.to_degrees()),
+        scale: parent.scale * child.scale,
+    }
+}
+
 fn collect_leaf_slots(all_nodes: &[u32], node_idx: usize, out: &mut Vec<u32>) {
     if node_idx >= all_nodes.len() {
         return;
@@ -90,12 +184,51 @@ pub type FrameCallback = Box<dyn Fn(crate::viewport::ViewportId, &[u8], u32, u32
 /// State update callback — called each tick with engine state.
 pub type StateCallback = Box<dyn Fn(&StateUpdate) + Send>;
 
+/// How aggressively the tick loop should pace itself.
+///
+/// `Uncapped` runs as fast as the CPU/GPU can sustain — appropriate
+/// for game builds shipped to players. `TargetHz(N)` sleeps the
+/// remainder of each tick to hold a soft cap, useful for editor / dev
+/// tooling where unmetered wakeups burn battery and pin a fan for no
+/// visible benefit.
+///
+/// Sim correctness is independent of this knob: physics and behavior
+/// `FixedUpdate` run via accumulators on the real wall-clock dt, so
+/// they tick at the same simulation rate regardless of render rate.
+/// Per-frame systems (animation, camera/input, behavior `Update` /
+/// `LateUpdate`) advance by real_dt and stay frame-rate-correct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderPacing {
+    /// Run as fast as possible. Default for game builds.
+    Uncapped,
+    /// Sleep at the end of each tick so the loop holds at most this
+    /// many ticks per second.
+    TargetHz(u32),
+}
+
+impl RenderPacing {
+    /// Sleep target as a Duration, or None for uncapped.
+    pub fn target_interval(&self) -> Option<Duration> {
+        match *self {
+            RenderPacing::Uncapped => None,
+            RenderPacing::TargetHz(0) => None,
+            RenderPacing::TargetHz(hz) => {
+                Some(Duration::from_nanos(1_000_000_000u64 / hz as u64))
+            }
+        }
+    }
+}
+
 /// Configuration for spawning the engine.
 pub struct EngineConfig {
     /// Initial render width.
     pub width: u32,
     /// Initial render height.
     pub height: u32,
+    /// Tick-loop pacing policy. Editor defaults to a 60 Hz soft cap;
+    /// game builds should set this to `Uncapped` (or whatever target
+    /// the platform/display warrants).
+    pub render_pacing: RenderPacing,
 }
 
 impl Default for EngineConfig {
@@ -103,6 +236,7 @@ impl Default for EngineConfig {
         Self {
             width: 1920,
             height: 1080,
+            render_pacing: RenderPacing::TargetHz(60),
         }
     }
 }
@@ -235,8 +369,15 @@ struct EngineState {
 
     /// Async bake pipeline. The worker owns its own GpuEvaluator and
     /// private pools; the engine sends requests + drains results on
-    /// each tick via `drain_bake_results`.
+    /// each tick via `drain_bake_results`. The same worker also
+    /// handles generator jobs (see `generator_system`).
     bake_worker: crate::bake_worker::BakeWorker,
+
+    /// Generator tick driver. Scans entities with `GeneratorState`,
+    /// hashes params to detect edits, submits stale runs to the
+    /// bake worker's generator channel, and updates the ECS as
+    /// results arrive.
+    generator_system: crate::generator::GeneratorSystem,
 
     // Input + Camera
     input_system: rkp_runtime::input::InputSystem,
@@ -258,7 +399,10 @@ struct EngineState {
     next_entity_uuid: u64,
     /// Stable scene object IDs for face emission (entity → scene_obj_id).
     entity_scene_ids: std::collections::HashMap<hecs::Entity, u32>,
-    next_scene_id: u32,
+    /// Shared with the worker so `ctx.emit_child` allocates ids off
+    /// the engine thread (lock-free fetch_add). Value ordering across
+    /// threads doesn't matter — each id is unique regardless.
+    next_scene_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Currently selected entity.
     selected_entity: Option<hecs::Entity>,
     /// Currently selected procedural node (within the selected entity's ProceduralGeometry).
@@ -283,6 +427,21 @@ struct EngineState {
     /// Available .rkp model files in the project.
     available_models: Vec<crate::snapshot::ModelInfo>,
     models_dirty: bool,
+    /// Set whenever the gameplay dylib load/unload changes the set of
+    /// registered generators. Drives the next snapshot's
+    /// `available_generators` field.
+    generators_dirty: bool,
+    /// Discovered `.rkgen` preset files in the project's
+    /// `assets/generators/` directory. Repopulated on project open.
+    available_generator_presets: Vec<crate::generator::GeneratorPresetInfo>,
+    /// Set when the preset list changed; drives the next snapshot.
+    generator_presets_dirty: bool,
+    /// Per-generator-entity set of slot keys that the *current* run
+    /// has emitted so far. Reset on `WillResubmit`; consulted on
+    /// `Completed` to delete persistent children whose key wasn't
+    /// re-emitted (orphans from the previous generation).
+    pending_generator_slot_keys:
+        std::collections::HashMap<hecs::Entity, std::collections::HashSet<String>>,
     /// Source paths currently being re-imported. The UI consults this set
     /// to show a progress indicator in place of the Re-import button.
     /// Populated on `ReimportModel` submission, drained on completion.
@@ -380,6 +539,26 @@ struct EngineState {
     show_colliders: bool,
     /// Collider caches need rebuild.
     collider_caches_dirty: bool,
+    /// EMA of true tick rate (1 / wall-clock tick interval, including the
+    /// 60-Hz pacing sleep). Distinct from `fps` in the state update, which
+    /// is `1 / frame_work_time` and ignores sleep — useful for profiling but
+    /// not what the user perceives.
+    tick_hz_ema: f32,
+    /// EMA of physics substeps per second across the engine tick. When
+    /// physics is stepping at the target 60 Hz this sits near 60.
+    physics_hz_ema: f32,
+    /// Last inspector snapshot we sent to the editor. Used to skip pushing
+    /// an identical snapshot every tick — without this, the panel re-renders
+    /// 60Hz when physics writes Transform on a selected RigidBody, which
+    /// chunks the UI thread.
+    prev_inspector: Option<crate::inspector::InspectorSnapshot>,
+    /// Same change-detection cache for the procedural snapshot.
+    prev_procedural: Option<crate::procedural_snapshot::ProceduralSnapshot>,
+    /// Last environment we shipped to the editor — diff-suppression
+    /// avoids env-panel churn from any path that pushes env on a
+    /// no-op (and means we no longer need the env_ui_dirty gate's
+    /// "don't echo back during slider drag" workaround).
+    prev_environment: Option<crate::environment::EnvironmentSettings>,
 
     /// File watcher for hot-reload (watches project assets/ directory).
     file_watcher: Option<crate::file_watcher::RkpFileWatcher>,
@@ -395,6 +574,20 @@ struct EngineState {
 
     // Frame counter
     frame_index: u64,
+
+    /// Ring buffer of per-frame CPU + GPU timings. Fed from the frame
+    /// work at the end of `tick`, read by the editor (via `StateUpdate`)
+    /// and by MCP once wired.
+    profiling: crate::profiling::ProfilingHistory,
+
+    /// Behavior `FixedUpdate` accumulator. Mirrors physics' Rapier-side
+    /// accumulator so behavior code that registers in the FixedUpdate
+    /// phase ticks at exactly 60 Hz regardless of render rate. We carry
+    /// it here (not inside the executor) because the executor is
+    /// optional — it doesn't exist before a project loads — and the
+    /// accumulator must persist across executor (re)creation so we
+    /// don't lose simulation time on hot-reload.
+    behavior_fixed_accumulator: f32,
 
     // Temporally smoothed cloud-sun attenuation (camera→sun ray through the
     // cloud layer). Lerps toward the target each frame so a single noisy ray
@@ -446,6 +639,12 @@ struct EngineState {
     /// NodeId when in raymarch mode (new path, enables
     /// click-to-select-primitive in the build viewport).
     pending_pick: Option<PendingPick>,
+    /// In-flight pick map. Set when a pick is encoded + map_async issued
+    /// after submit. Read at the top of the next render_frame via
+    /// `try_recv` — non-blocking; if the map hasn't completed yet the
+    /// pick is processed a frame later. One frame of pick latency is
+    /// invisible and avoids the per-click `device.poll(Wait)` block.
+    pick_in_flight: Option<(PendingPick, std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>)>,
     /// Cached light count for march pass (set in light upload block, used in render).
     num_lights_cache: u32,
     /// Base ShadeParams (recomputed once per frame from environment +
@@ -537,12 +736,23 @@ impl EngineState {
             mapped_at_creation: false,
         });
 
+        let next_scene_id = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let bake_worker = crate::bake_worker::BakeWorker::spawn(
+            device.clone(),
+            queue.clone(),
+            scene_mgr.clone(),
+            next_scene_id.clone(),
+        );
+        let generator_system = crate::generator::GeneratorSystem::new(
+            crate::generator::GeneratorRegistry::new(),
+            bake_worker.tx_generator.clone(),
+            bake_worker.rx_generator.clone(),
+        );
+
         Self {
-            bake_worker: crate::bake_worker::BakeWorker::spawn(
-                device.clone(),
-                queue.clone(),
-                scene_mgr.clone(),
-            ),
+            bake_worker,
+            generator_system,
+            next_scene_id,
             device,
             queue,
             renderer,
@@ -571,7 +781,6 @@ impl EngineState {
             uuid_to_entity: std::collections::HashMap::new(),
             next_entity_uuid: 1,
             entity_scene_ids: std::collections::HashMap::new(),
-            next_scene_id: 0,
             selected_entity: None,
             selected_procedural_node: None,
             gpu_objects: Vec::new(),
@@ -586,6 +795,10 @@ impl EngineState {
             project_dirty: true, // push initial state
             available_models: Vec::new(),
             models_dirty: false,
+            generators_dirty: true,
+            available_generator_presets: Vec::new(),
+            generator_presets_dirty: true,
+            pending_generator_slot_keys: std::collections::HashMap::new(),
             importing_sources: std::collections::HashSet::new(),
             importing_progress: std::collections::HashMap::new(),
             importing_dirty: false,
@@ -618,12 +831,19 @@ impl EngineState {
             play_state: None,
             show_colliders: false,
             collider_caches_dirty: true,
+            tick_hz_ema: 60.0,
+            physics_hz_ema: 0.0,
+            prev_inspector: None,
+            prev_procedural: None,
+            prev_environment: None,
             file_watcher: None,
             import_worker: crate::import_worker::ImportWorker::new(),
             geometry_dirty: false,
             scene_dirty: false,
             gpu_objects_dirty: true,
             frame_index: 0,
+            profiling: crate::profiling::ProfilingHistory::default(),
+            behavior_fixed_accumulator: 0.0,
             cloud_sun_atten: 1.0,
             width,
             height,
@@ -636,6 +856,7 @@ impl EngineState {
             mouse_pos: glam::Vec2::ZERO,
             pick_readback_buffer,
             pending_pick: None,
+            pick_in_flight: None,
             num_lights_cache: 1,
             shade_params_base: rkp_render::rkp_shade::ShadeParams::default(),
             lod_enabled: true,
@@ -663,6 +884,12 @@ impl EngineState {
     fn render_frame(&mut self, frame_callback: &FrameCallback) {
         use crate::viewport::ViewportId;
         let frame_start = std::time::Instant::now();
+
+        // 0. Drive the wgpu async runtime + consume any pick that completed
+        // since the last frame. Both are non-blocking — the pick read just
+        // returns if its async map hasn't fired yet, and runs next frame.
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        self.drain_pick_result();
 
         // 0a. Upload material palette if dirty.
         if self.material_lib.is_dirty() {
@@ -1319,9 +1546,16 @@ impl EngineState {
                 );
             }
 
-            vr.copy_composite_to_readback(&mut encoder);
+            let readback_idx = vr.encode_composite_readback(&mut encoder);
             self.renderer.resolve_profiler_queries(&mut encoder);
             self.queue.submit(std::iter::once(encoder.finish()));
+
+            // Kick off the async map immediately after submit so the GPU
+            // can finish the copy and signal completion in the background
+            // — we never block on it.
+            if let Some(idx) = readback_idx {
+                vr.readback.issue_map_async(idx);
+            }
 
             // Stash this frame's VP on the viewport so next frame's cloud
             // TAA (and any future temporal pass) can reproject history
@@ -1332,8 +1566,6 @@ impl EngineState {
         }
 
         let t_encode = frame_start.elapsed();
-        let t_post = t_encode;
-        let t_submit = t_encode;
 
         // Kick off the cloud→sun atten readback on MAIN (scene-wide sun),
         // then drive a non-blocking poll so previously-issued map_async
@@ -1343,91 +1575,70 @@ impl EngineState {
         }
         let _ = self.device.poll(wgpu::PollType::Poll);
 
-        // Pick result process — depends on this frame's pick copy completing.
+        // If a pick was encoded this frame, kick off the async map. The
+        // result is consumed at the top of a future render_frame via
+        // `drain_pick_result` (one or two frames of latency, invisible
+        // to the user, no `device.poll(Wait)`).
         if pick_issued {
-            self.process_pick_result();
+            if let Some(pp) = self.pending_pick.take() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.pick_readback_buffer
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+                self.pick_in_flight = Some((pp, rx));
+            }
         }
 
         // ── Per-viewport readback + delivery ────────────────────────────
+        //
+        // Non-blocking. Each visible viewport's readback ring already had
+        // `map_async` issued for its current frame's buffer right after
+        // submit. Here we drain any maps that completed (almost always
+        // the previous frame's) and deliver the freshest cached pixels
+        // to the editor. If nothing is ready yet we silently reuse the
+        // last good frame — 1-2 frames of stall on the editor is invisible
+        // and avoids the 8+ ms `device.poll(Wait)` we used to incur per
+        // viewport per frame.
         for &viewport_id in &visible_ids {
-            let (read_index, w, h) = {
-                let vr = self.viewport_renderers
-                    .get(&viewport_id)
-                    .expect("viewport renderer must exist");
-                let read_index = if vr.readback_ready {
-                    1 - vr.readback_index
-                } else {
-                    // First frame: no previous data, read current (blocking).
-                    vr.readback_index
-                };
-                (read_index, vr.width, vr.height)
-            };
-            let pixels = self.map_readback(viewport_id, read_index);
-            frame_callback(viewport_id, &pixels, w, h);
-            self.viewport_renderers
+            let vr = self.viewport_renderers
                 .get_mut(&viewport_id)
-                .expect("viewport renderer must exist")
-                .advance_readback();
+                .expect("viewport renderer must exist");
+            let w = vr.width;
+            let h = vr.height;
+            let padded_row = vr.readback_padded_row();
+            vr.readback.drain_completed(w, h, padded_row);
+            if let Some((pixels, cw, ch)) = vr.readback.cached_pixels() {
+                frame_callback(viewport_id, pixels, cw, ch);
+            }
         }
 
-        // GPU profiler — process finished frames (logs every 60 frames).
-        self.renderer.end_profiler_frame(self.frame_index, self.width, self.height);
+        // GPU profiler — drain any resolved pass timings.
+        let gpu_passes = self.renderer.end_profiler_frame(self.frame_index);
 
         let t_frame_end = frame_start.elapsed();
 
-        if self.frame_index % 60 == 0 && self.frame_index > 0 {
-            eprintln!(
-                "[perf] cpu_setup={:.1}ms upload={:.1}ms encode={:.1}ms post={:.1}ms submit={:.1}ms gpu_wait={:.1}ms total={:.1}ms",
-                t_cpu_setup.as_secs_f64() * 1000.0,
-                (t_upload - t_cpu_setup).as_secs_f64() * 1000.0,
-                (t_encode - t_upload).as_secs_f64() * 1000.0,
-                (t_post - t_encode).as_secs_f64() * 1000.0,
-                (t_submit - t_post).as_secs_f64() * 1000.0,
-                (t_frame_end - t_submit).as_secs_f64() * 1000.0,
-                t_frame_end.as_secs_f64() * 1000.0,
-            );
-        }
+        // The old per-stage timings tracked t_post / t_submit as
+        // separate aliases for t_encode (encode and submit happen in
+        // the same call). Now we report the four phases that actually
+        // take measurable wall-clock time — the post-submit bucket
+        // covers async readback drain, profiler queries, and the
+        // non-blocking device poll.
+        let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
+        let cpu = crate::profiling::CpuPhaseTimings {
+            setup_ms: ms(t_cpu_setup),
+            upload_ms: ms(t_upload - t_cpu_setup),
+            encode_ms: ms(t_encode - t_upload),
+            post_submit_ms: ms(t_frame_end - t_encode),
+            total_ms: ms(t_frame_end),
+        };
+        self.profiling.push(crate::profiling::FrameSample {
+            frame_idx: self.frame_index,
+            cpu,
+            gpu_passes,
+            gpu_object_count: self.gpu_objects.len() as u32,
+        });
 
         self.frame_index += 1;
-    }
-
-    /// Read from a viewport's readback buffer. With double-buffering we
-    /// read the previous frame's buffer, so the GPU work is already
-    /// complete and `wait_indefinitely` returns near-instantly.
-    fn map_readback(&self, viewport_id: crate::viewport::ViewportId, index: usize) -> Vec<u8> {
-        let vr = self.viewport_renderers
-            .get(&viewport_id)
-            .expect("viewport renderer must exist");
-        let w = vr.width;
-        let h = vr.height;
-        let padded_row = vr.readback_padded_row();
-
-        let buffer_slice = vr.readback_buffers[index].slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-
-        let mut rgba8 = vec![0u8; (w * h * 4) as usize];
-        if let Ok(Ok(())) = rx.recv() {
-            let data = buffer_slice.get_mapped_range();
-            for y in 0..h as usize {
-                let src_offset = y * padded_row as usize;
-                let dst_offset = y * w as usize * 4;
-                let row_bytes = w as usize * 4;
-                if src_offset + row_bytes <= data.len()
-                    && dst_offset + row_bytes <= rgba8.len()
-                {
-                    rgba8[dst_offset..dst_offset + row_bytes]
-                        .copy_from_slice(&data[src_offset..src_offset + row_bytes]);
-                }
-            }
-            drop(data);
-            vr.readback_buffers[index].unmap();
-        }
-
-        rgba8
     }
 
     /// On PlayStart: hand the MAIN viewport over to the active scene
@@ -1767,17 +1978,20 @@ impl EngineState {
             EngineCommand::SpawnProceduralObject { name, leaf_kind } => {
                 use crate::components::*;
                 let name = self.unique_name(&name);
-                let proc_geo = match leaf_kind {
+                let mut proc_geo = match leaf_kind {
                     Some(kind) => ProceduralGeometry::with_leaf(parse_node_kind(&kind)),
                     None => ProceduralGeometry::default_sphere(),
                 };
-                // Spawn the entity with no spatial yet; `dirty = true`
-                // on the fresh `ProceduralGeometry` is what makes
-                // `update_dirty_procedurals` enqueue an initial bake
-                // next tick. Keeps spawn + edit flows on the same
-                // async code path.
-                let scene_id = self.next_scene_id;
-                self.next_scene_id += 1;
+                // Freshly-spawned procedurals should bake immediately so
+                // the user sees a visible object. We set `pending_bake`
+                // (not just `dirty`) so the debounced auto-bake path in
+                // `update_dirty_procedurals` picks it up — scene *load*
+                // deliberately never auto-bakes, so riding on `dirty`
+                // alone would leave the spawn invisible.
+                proc_geo.dirty = false;
+                proc_geo.pending_bake = true;
+                proc_geo.bake_dirty_at = Some(std::time::Instant::now());
+                let scene_id = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let entity = self.world.spawn((
                     Transform::default(),
                     EditorMetadata { name: name.clone() },
@@ -2150,8 +2364,7 @@ impl EngineState {
                 // this is the static voxel copy. Starts with
                 // spatial=None; the bake we enqueue below fills it.
                 let new_name = self.unique_name(&format!("{src_name} (copy)"));
-                let scene_id = self.next_scene_id;
-                self.next_scene_id += 1;
+                let scene_id = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let new_entity = self.world.spawn((
                     src_transform,
                     EditorMetadata { name: new_name.clone() },
@@ -2182,11 +2395,15 @@ impl EngineState {
                     entity: new_entity,
                     generation: 0,
                     scene_id,
-                    instructions,
+                    input: crate::bake_worker::BakeInput::Procedural(instructions),
                     aabb,
                     voxel_size,
                     root_scale: src_scale_for_bake,
                     prev_spatial: None,
+                    // Copy targets have no ProceduralGeometry, so no
+                    // scene reload would look for a sidecar here.
+                    cache_output_path: None,
+                    generator_child: None,
                 };
                 if self.bake_worker.tx_request.send(req).is_err() {
                     self.console.warn("Copy: bake worker channel closed".to_string());
@@ -2251,10 +2468,36 @@ impl EngineState {
                 self.console.info(format!("Spawned '{name}'"));
             }
 
+            EngineCommand::SpawnGenerator { generator_name } => {
+                use crate::components::*;
+                if let Some(entry) = self.generator_system.registry().get(&generator_name) {
+                    let name = self.unique_name(&generator_name);
+                    let mut transform = Transform::default();
+                    transform.position = self.camera.position + glam::Vec3::new(0.0, 0.0, -3.0);
+                    let entity = self.world.spawn((
+                        transform,
+                        EditorMetadata { name: name.clone() },
+                        crate::generator::GeneratorState::new(&generator_name),
+                    ));
+                    // Insert the params component via the macro-generated helper.
+                    (entry.insert_default_params)(&mut self.world, entity);
+                    self.assign_entity_uuid(entity);
+                    self.scene_dirty = true;
+                    self.console.info(format!("Spawned generator '{name}'"));
+                } else {
+                    self.console.error(format!(
+                        "Unknown generator '{generator_name}' — not registered in gameplay dylib"
+                    ));
+                }
+            }
+
+            EngineCommand::SpawnGeneratorPreset { path } => {
+                self.spawn_generator_preset(&path);
+            }
+
             EngineCommand::LoadAsset { path, .. } => {
                 use crate::components::*;
-                let scene_id = self.next_scene_id;
-                self.next_scene_id += 1;
+                let scene_id = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let acquired = self.scene_mgr.lock().unwrap().acquire_asset(&path);
                 match acquired {
                     Ok((handle, info)) => {
@@ -2464,11 +2707,15 @@ impl EngineState {
                         // and can be deserialized from the scene file.
                         self.scaffold_and_build_gameplay();
 
+                        // `scene_path` must be set BEFORE loading so
+                        // `load_scene_from_file` can resolve
+                        // procedural bake-cache sidecars relative to
+                        // the scene file's directory.
                         let scene_path = project_dir.join(format!("scenes/{}.rkscene", project.default_scene));
+                        self.scene_path = Some(scene_path.clone());
                         if scene_path.exists() {
                             self.load_scene_from_file(&scene_path);
                         }
-                        self.scene_path = Some(scene_path);
 
                         self.scan_models();
                         if let Some(ref dir) = self.project_dir {
@@ -3000,6 +3247,10 @@ impl EngineState {
                     }
                     self.play_total_time = 0.0;
                     self.play_frame_count = 0;
+                    // Reset FixedUpdate accumulator so play mode
+                    // starts from a clean zero rather than firing a
+                    // burst of catch-up steps.
+                    self.behavior_fixed_accumulator = 0.0;
                     self.enter_play_mode_viewports();
                 }
             }
@@ -3164,6 +3415,16 @@ impl EngineState {
                         self.gameplay_systems.len(),
                     ));
                 }
+                let gen_entries = self.gameplay_loader.generator_entries();
+                if !gen_entries.is_empty() {
+                    self.console.info(format!(
+                        "Loaded {} generators: {}",
+                        gen_entries.len(),
+                        gen_entries.iter().map(|e| e.name).collect::<Vec<_>>().join(", "),
+                    ));
+                }
+                self.generator_system.register_gameplay(gen_entries);
+                self.generators_dirty = true;
                 self.scene_dirty = true;
             }
             Err(e) => {
@@ -3197,6 +3458,8 @@ impl EngineState {
 
         // 3. Clear gameplay entries from registry.
         self.registry.clear_gameplay();
+        self.generator_system.clear_gameplay_generators();
+        self.generators_dirty = true;
 
         // 4. Unload old dylib.
         let dylib_path = self.gameplay_loader.dylib_path().map(|p| p.to_owned());
@@ -3221,6 +3484,25 @@ impl EngineState {
                         self.registry.register_gameplay(entry);
                     }
 
+                    // 6b. Re-register gameplay generators. Without
+                    // this every live generator entity stays Pending
+                    // forever after a reload — `scan_and_submit`
+                    // looks them up by name and finds nothing.
+                    let gen_entries = self.gameplay_loader.generator_entries();
+                    self.generator_system.register_gameplay(gen_entries);
+                    self.generators_dirty = true;
+                    if !gen_entries.is_empty() {
+                        self.console.info(format!(
+                            "Reloaded {} generators: {}",
+                            gen_entries.len(),
+                            gen_entries
+                                .iter()
+                                .map(|e| e.name)
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ));
+                    }
+
                     // 7. Deserialize component data back.
                     let restored = self.gameplay_loader.deserialize_all(
                         &mut self.world,
@@ -3228,6 +3510,19 @@ impl EngineState {
                         &saved,
                     );
                     self.console.info(format!("Restored {restored}/{} component instances", saved.len()));
+
+                    // 7b. Force every live generator to re-run against
+                    // the new code. Param-hash equality wouldn't catch
+                    // a code change, so we explicitly mark stale.
+                    let live_generators: Vec<hecs::Entity> = self
+                        .world
+                        .query::<&crate::generator::GeneratorState>()
+                        .iter()
+                        .map(|(e, _)| e)
+                        .collect();
+                    for entity in live_generators {
+                        self.generator_system.force_regenerate(entity, &mut self.world);
+                    }
 
                     // 8. Reload system entries and rebuild executor.
                     self.gameplay_systems = self.gameplay_loader.system_entries().to_vec();
@@ -3763,8 +4058,7 @@ impl EngineState {
         if let Some(&id) = self.entity_scene_ids.get(&entity) {
             id
         } else {
-            let id = self.next_scene_id;
-            self.next_scene_id += 1;
+            let id = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.entity_scene_ids.insert(entity, id);
             id
         }
@@ -3778,14 +4072,26 @@ impl EngineState {
         uuid
     }
 
+    /// Bind an entity to a specific (pre-existing) UUID. Used by scene
+    /// load so entities keep the ID they had when the scene was saved,
+    /// not a fresh random one. Keeping IDs stable is what lets paths
+    /// derived from UUIDs — like procedural bake sidecars — survive a
+    /// reload.
+    fn set_entity_uuid(&mut self, entity: hecs::Entity, uuid: uuid::Uuid) {
+        self.entity_uuids.insert(entity, uuid);
+        self.uuid_to_entity.insert(uuid, entity);
+    }
+
     /// Rebuild GPU objects from the hecs world.
-    /// Per-tick procedural maintenance. Bakes any entity that needs an
-    /// initial bake (freshly spawned, spatial == None) or has a settled
-    /// `pending_bake` (last edit was at least `BAKE_DEBOUNCE` ago).
-    /// Interactive build-panel param edits mark `dirty` but sit until
-    /// the user clicks "Bake" — only the properties-panel scale slider
-    /// (via `redirect_transform_scale_to_root`) currently sets the
-    /// auto-bake flag.
+    /// Per-tick procedural maintenance. Bakes any entity whose
+    /// `pending_bake` has settled past the debounce window. We
+    /// deliberately do NOT auto-bake on `dirty` alone: scene load
+    /// restores procedurals with a cached spatial and a clean flag,
+    /// but if a rogue edit path left `dirty = true` we'd silently
+    /// re-run a potentially huge bake at startup — historically a
+    /// source of UI freezes and crashes. Manual bakes (the build
+    /// panel's Bake button, `BakeProceduralEntity`, `BakeAllDirty`)
+    /// explicitly set `pending_bake` so they still ride this path.
     fn update_dirty_procedurals(&mut self) {
         use crate::components::*;
 
@@ -3793,7 +4099,7 @@ impl EngineState {
 
         // Debounce window for `pending_bake` — long enough to suppress
         // bakes mid-scrub on a slider, short enough to feel immediate
-        // when the user releases. Initial bakes don't debounce.
+        // when the user releases.
         const BAKE_DEBOUNCE: std::time::Duration =
             std::time::Duration::from_millis(150);
         let now = std::time::Instant::now();
@@ -3806,7 +4112,7 @@ impl EngineState {
         // bake by however long the user keeps dragging.
         let drag_active = self.gizmo.dragging || self.proc_gizmo.dragging;
 
-        for (entity, (renderable, proc_geo)) in self
+        for (entity, (_renderable, proc_geo)) in self
             .world
             .query::<(&Renderable, &ProceduralGeometry)>()
             .iter()
@@ -3820,14 +4126,13 @@ impl EngineState {
             if proc_geo.bake_in_flight {
                 continue;
             }
-            let needs_initial_bake = renderable.spatial.is_none() && proc_geo.dirty;
             let pending_settled = !drag_active
                 && proc_geo.pending_bake
                 && proc_geo
                     .bake_dirty_at
                     .map(|t| now.duration_since(t) >= BAKE_DEBOUNCE)
                     .unwrap_or(true);
-            if needs_initial_bake || pending_settled {
+            if pending_settled {
                 to_update.push(entity);
             }
         }
@@ -3919,6 +4224,23 @@ impl EngineState {
         }
     }
 
+    /// Compute the bake-cache sidecar path for a procedural entity:
+    /// `{scene_dir}/{scene_stem}.bakes/{uuid}.rkp`. Returns `None` when
+    /// the scene has no on-disk path yet (unsaved scratch session) or
+    /// the entity has no UUID. The relative form
+    /// (`{scene_stem}.bakes/{uuid}.rkp`) is what `SceneObject.procedural_cache`
+    /// stores — use [`procedural_cache_relative`] for that.
+    fn procedural_cache_path(&self, entity: hecs::Entity) -> Option<std::path::PathBuf> {
+        let uuid = self.entity_uuids.get(&entity).copied()?;
+        let scene_path = self.scene_path.as_ref()?;
+        let parent = scene_path.parent()?;
+        let stem = scene_path.file_stem()?;
+        let mut dir = parent.to_path_buf();
+        dir.push(format!("{}.bakes", stem.to_string_lossy()));
+        dir.push(format!("{}.rkp", uuid));
+        Some(dir)
+    }
+
     /// Enqueue an async bake for a procedural entity. Bumps the
     /// entity's `bake_generation` and sends a [`BakeRequest`] to the
     /// worker thread. The result (an integrate-able [`BakeArtifact`])
@@ -3962,15 +4284,22 @@ impl EngineState {
             .map(|n| n.transform.to_scale_rotation_translation().0)
             .unwrap_or(glam::Vec3::ONE);
 
+        // Build the sidecar .rkp path: `{scene_dir}/{scene_stem}.bakes/{uuid}.rkp`.
+        // Both the scene path and entity UUID must be known; unsaved
+        // scratch scenes skip caching and just rely on next-spawn re-bake.
+        let cache_output_path = self.procedural_cache_path(entity);
+
         let req = crate::bake_worker::BakeRequest {
             entity,
             generation,
             scene_id,
-            instructions,
+            input: crate::bake_worker::BakeInput::Procedural(instructions),
             aabb,
             voxel_size,
             root_scale,
             prev_spatial,
+            cache_output_path,
+            generator_child: None,
         };
         if self.bake_worker.tx_request.send(req).is_err() {
             self.console.warn("bake worker channel closed".to_string());
@@ -3995,8 +4324,35 @@ impl EngineState {
         // Drain everything the worker has produced since the last
         // tick. `try_recv` is non-blocking — we never wait here.
         while let Ok(result) = self.bake_worker.rx_result.try_recv() {
+            // Generator-emitted child: spawn a new entity (anonymous)
+            // or update an existing entity (persistent slot_key). The
+            // `entity` field on the request is the generator (parent);
+            // the spec carries everything needed downstream.
+            if let Some(spec) = result.generator_child {
+                match result.outcome {
+                    BakeOutcome::Ok { spatial, voxel_count } => {
+                        self.spawn_or_update_generated_child(
+                            spec.parent_entity,
+                            spec.local_transform,
+                            spec.generation,
+                            spec.slot_key,
+                            spatial,
+                            voxel_count,
+                            spec.name_hint,
+                        );
+                    }
+                    BakeOutcome::Failed => {
+                        self.console.warn(format!(
+                            "Generator child voxelization failed (parent={:?}, vs={:.4}).",
+                            spec.parent_entity, result.voxel_size,
+                        ));
+                    }
+                }
+                continue;
+            }
+
+            // Regular procedural-entity bake below.
             let entity = result.entity;
-            // Entity gone? Discard quietly.
             if !self.world.contains(entity) {
                 continue;
             }
@@ -4041,6 +4397,255 @@ impl EngineState {
                     ));
                 }
             }
+        }
+    }
+
+    /// Pump the generator system once per frame.
+    ///
+    /// Surfaces notable lifecycle events (submit / complete / fail /
+    /// cancel) to the console so the user sees them there even when
+    /// the generator panel is hidden. Per-entity status updates land
+    /// on the ECS via `tick()` itself.
+    fn tick_generators(&mut self) {
+        let events = self
+            .generator_system
+            .tick(&mut self.world, &self.registry);
+        for ev in events {
+            use crate::generator::GeneratorEvent;
+            match ev {
+                GeneratorEvent::WillResubmit { entity, name: _ } => {
+                    // Reset slot-key tracking + blow away every
+                    // anonymous child of this generator. Persistent
+                    // children stay; the spawn-or-update path will
+                    // reuse them when their slot_key emits again.
+                    self.pending_generator_slot_keys.remove(&entity);
+                    let anon: Vec<hecs::Entity> = self
+                        .world
+                        .query::<&crate::generator::GeneratorOwned>()
+                        .iter()
+                        .filter(|(_, owned)| {
+                            owned.parent == entity && owned.slot_key.is_none()
+                        })
+                        .map(|(e, _)| e)
+                        .collect();
+                    for child in anon {
+                        self.delete_entity(child);
+                    }
+                }
+                GeneratorEvent::Submitted { entity, name } => {
+                    eprintln!("[gen] submit entity={entity:?} name={name}");
+                }
+                GeneratorEvent::Completed { entity, name } => {
+                    eprintln!("[gen] completed entity={entity:?} name={name}");
+                    // Orphan cleanup: delete persistent children whose
+                    // slot_key wasn't emitted in this generation.
+                    let seen = self
+                        .pending_generator_slot_keys
+                        .remove(&entity)
+                        .unwrap_or_default();
+                    let orphans: Vec<hecs::Entity> = self
+                        .world
+                        .query::<&crate::generator::GeneratorOwned>()
+                        .iter()
+                        .filter(|(_, owned)| {
+                            if owned.parent != entity {
+                                return false;
+                            }
+                            match &owned.slot_key {
+                                Some(k) => !seen.contains(k),
+                                None => false, // anon already blown away
+                            }
+                        })
+                        .map(|(e, _)| e)
+                        .collect();
+                    for child in orphans {
+                        self.delete_entity(child);
+                    }
+                    self.scene_dirty = true;
+                }
+                GeneratorEvent::Failed { entity, name, error } => {
+                    self.console.error(format!(
+                        "Generator '{name}' on {entity:?} failed: {error}"
+                    ));
+                }
+                GeneratorEvent::Cancelled { entity, name } => {
+                    eprintln!("[gen] cancelled entity={entity:?} name={name}");
+                }
+            }
+        }
+    }
+
+    /// Spawn or update a child entity for a generator's emitted bake.
+    ///
+    /// * Anonymous (`slot_key.is_none()`): always spawn a brand-new
+    ///   entity. The previous generation's anonymous children were
+    ///   blown away in `tick_generators`'s `WillResubmit` handler.
+    /// * Persistent (`slot_key.is_some()`): look for an existing
+    ///   `(parent, slot_key)` match. If found, replace its Transform +
+    ///   Renderable.spatial in place — preserves any user-attached
+    ///   components (lights, scripts, colliders). If not, spawn a new
+    ///   entity tagged with the slot key.
+    ///
+    /// Either way, the world transform is composed against the
+    /// parent's *current* transform (not a stale snapshot from the
+    /// worker), so dragging the generator between emit and spawn
+    /// still places the child correctly.
+    fn spawn_or_update_generated_child(
+        &mut self,
+        generator_entity: hecs::Entity,
+        local_transform: crate::components::Transform,
+        generation: u64,
+        slot_key: Option<String>,
+        spatial: crate::components::SpatialData,
+        voxel_count: u32,
+        name_hint: Option<String>,
+    ) {
+        use crate::components::*;
+        if !self.world.contains(generator_entity) {
+            return;
+        }
+
+        let parent_transform = self
+            .world
+            .get::<&Transform>(generator_entity)
+            .map(|t| (*t).clone())
+            .unwrap_or_default();
+        let world_transform = compose_generator_transforms(
+            &parent_transform,
+            &local_transform,
+        );
+
+        // Track that this slot was emitted this generation, so the
+        // Completed handler knows which persistent children survived
+        // (vs. which to despawn as orphans).
+        if let Some(ref key) = slot_key {
+            self.pending_generator_slot_keys
+                .entry(generator_entity)
+                .or_default()
+                .insert(key.clone());
+
+            if let Some(existing) = self.find_persistent_child(generator_entity, key) {
+                // Reuse: free the old geometry, swap the Renderable's
+                // spatial in place, refresh transform + generation.
+                // Other components stay → user-attached lights /
+                // scripts survive across regens.
+                self.release_renderable_geometry(existing);
+                if let Ok(mut t) = self.world.get::<&mut Transform>(existing) {
+                    *t = world_transform;
+                }
+                if let Ok(mut r) = self.world.get::<&mut Renderable>(existing) {
+                    r.spatial = Some(spatial);
+                    r.voxel_count = voxel_count;
+                }
+                if let Ok(mut owned) =
+                    self.world.get::<&mut crate::generator::GeneratorOwned>(existing)
+                {
+                    owned.generation = generation;
+                }
+                self.scene_dirty = true;
+                self.geometry_dirty = true;
+                self.gpu_objects_dirty = true;
+                eprintln!(
+                    "[gen] reused persistent child entity={existing:?} parent={generator_entity:?} \
+                     slot='{key}' voxels={voxel_count} gen={generation}"
+                );
+                return;
+            }
+        }
+
+        let base_name = name_hint.unwrap_or_else(|| {
+            self.world
+                .get::<&EditorMetadata>(generator_entity)
+                .map(|m| format!("{}.child", m.name))
+                .unwrap_or_else(|_| "child".into())
+        });
+        let name = self.unique_name(&base_name);
+        let renderable = Renderable {
+            asset_path: None,
+            primitive: None,
+            material_id: 0,
+            voxel_count,
+            spatial: Some(spatial),
+            ..Default::default()
+        };
+        let parent_uuid = self.entity_uuids.get(&generator_entity).copied();
+        let child = self.world.spawn((
+            world_transform,
+            EditorMetadata { name: name.clone() },
+            renderable,
+            crate::generator::GeneratorOwned {
+                parent: generator_entity,
+                generation,
+                slot_key: slot_key.clone(),
+            },
+        ));
+        // Attach Parent for the scene tree. The transform stored on
+        // `child` is already absolute world — we don't compose on GPU
+        // build — but Parent makes the scene_tree panel show the child
+        // indented under its generator.
+        if let Some(uuid) = parent_uuid {
+            let _ = self.world.insert_one(
+                child,
+                crate::components::Parent { parent_id: uuid },
+            );
+        }
+        self.assign_entity_uuid(child);
+        self.scene_dirty = true;
+        self.geometry_dirty = true;
+        self.gpu_objects_dirty = true;
+        let slot_str = slot_key.as_deref().unwrap_or("-");
+        eprintln!(
+            "[gen] spawned child entity={child:?} parent={generator_entity:?} \
+             name='{name}' slot='{slot_str}' voxels={voxel_count} gen={generation}"
+        );
+    }
+
+    /// Find the existing persistent child of `parent` matching
+    /// `slot_key`, if any.
+    fn find_persistent_child(
+        &self,
+        parent: hecs::Entity,
+        slot_key: &str,
+    ) -> Option<hecs::Entity> {
+        self.world
+            .query::<&crate::generator::GeneratorOwned>()
+            .iter()
+            .find(|(_, owned)| {
+                owned.parent == parent && owned.slot_key.as_deref() == Some(slot_key)
+            })
+            .map(|(e, _)| e)
+    }
+
+    /// Release the GPU pool slots held by `entity`'s `Renderable`,
+    /// without despawning the entity. Used by the persistent-child
+    /// reuse path: the entity stays, only the geometry is swapped.
+    /// Mirrors the asset/spatial branches of `delete_entity`.
+    fn release_renderable_geometry(&mut self, entity: hecs::Entity) {
+        use crate::components::*;
+        if let Ok(renderable) = self.world.get::<&Renderable>(entity) {
+            if let Some(handle) = renderable.asset_handle {
+                drop(renderable);
+                self.scene_mgr.lock().unwrap().release_asset(handle);
+            } else if let Some(ref spatial) = renderable.spatial {
+                let handle = rkp_core::OctreeHandle {
+                    root_offset: spatial.root_offset,
+                    len: spatial.len,
+                    depth: spatial.depth,
+                    base_voxel_size: spatial.base_voxel_size,
+                };
+                let slot_start = spatial.voxel_slot_start;
+                let slot_count = spatial.voxel_slot_count;
+                let brick_ids = spatial.brick_ids.clone();
+                drop(renderable);
+                self.scene_mgr.lock().unwrap().deallocate_geometry(
+                    &handle, slot_start, slot_count, &brick_ids,
+                );
+            }
+        }
+        // Wipe the spatial so the renderer doesn't see stale data
+        // between this point and the caller's swap-in.
+        if let Ok(mut r) = self.world.get::<&mut Renderable>(entity) {
+            r.spatial = None;
         }
     }
 
@@ -4254,34 +4859,6 @@ impl EngineState {
             && this_frame_poses == self.last_skin_poses;
         self.last_skin_poses = this_frame_poses;
 
-        // One-second heartbeat so we can tell whether the GPU object
-        // the march shader sees actually carries skinning fields.
-        // Diagnoses: "scatter dispatched but march renders rigid" —
-        // if `is_skinned=1 count < skin_dispatches.len()` or
-        // `dim_x>0 count < dispatches`, the GPU object didn't get
-        // populated even though the plan succeeded.
-        if self.frame_index % 60 == 0 && !self.skin_dispatches.is_empty() {
-            let (mut skinned, mut with_dims) = (0u32, 0u32);
-            let mut first_dims = [0u32; 3];
-            for obj in &self.gpu_objects {
-                if obj.is_skinned != 0 { skinned += 1; }
-                if obj.bone_field_dim_x > 0 {
-                    if with_dims == 0 {
-                        first_dims = [obj.bone_field_dim_x, obj.bone_field_dim_y, obj.bone_field_dim_z];
-                    }
-                    with_dims += 1;
-                }
-            }
-            eprintln!(
-                "[skin] plans={} gpu_objs={} is_skinned={} with_dims={} first_dims={:?} bone_field_bytes={}",
-                self.skin_dispatches.len(),
-                self.gpu_objects.len(),
-                skinned,
-                with_dims,
-                first_dims,
-                self.skin_bone_field_bytes,
-            );
-        }
     }
 
     fn scan_models(&mut self) {
@@ -4295,6 +4872,116 @@ impl EngineState {
             self.models_dirty = true;
             eprintln!("[RkpEngine] scanned {} models", self.available_models.len());
         }
+        // Same lifecycle — scan presets alongside models so a project
+        // open / model-watcher refresh picks up new `.rkgen` files too.
+        self.scan_generator_presets();
+    }
+
+    /// Load a `.rkgen` preset and spawn the generator entity it
+    /// describes. Param overrides flow through the component
+    /// registry's typed `set_field` so partial preset files work —
+    /// any field absent from `params` keeps its `Default` value.
+    fn spawn_generator_preset(&mut self, path: &str) {
+        use crate::components::*;
+        let preset_path = std::path::PathBuf::from(path);
+        let cfg = match crate::generator::GeneratorAssetConfig::load(&preset_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.console.error(format!("Load preset failed: {e}"));
+                return;
+            }
+        };
+        let Some(entry) = self.generator_system.registry().get(&cfg.generator) else {
+            self.console.error(format!(
+                "Preset '{}' targets unknown generator '{}'",
+                cfg.name, cfg.generator,
+            ));
+            return;
+        };
+        let display_name = self.unique_name(&cfg.name);
+        let mut transform = Transform::default();
+        transform.position = self.camera.position + glam::Vec3::new(0.0, 0.0, -3.0);
+        let entity = self.world.spawn((
+            transform,
+            EditorMetadata { name: display_name.clone() },
+            crate::generator::GeneratorState::new(&cfg.generator),
+        ));
+        (entry.insert_default_params)(&mut self.world, entity);
+        if !cfg.params.is_empty() {
+            if let Some(comp_entry) = self.registry.get(entry.param_component_name) {
+                for (field_name, value) in &cfg.params {
+                    match json_to_field_value(value, field_name, comp_entry) {
+                        Ok(fv) => {
+                            if let Err(e) = (comp_entry.set_field)(
+                                &mut self.world, entity, field_name, fv,
+                            ) {
+                                self.console.warn(format!(
+                                    "Preset '{}': set {field_name} failed: {e}",
+                                    display_name,
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            self.console.warn(format!(
+                                "Preset '{}': skip {field_name}: {e}",
+                                display_name,
+                            ));
+                        }
+                    }
+                }
+            } else {
+                self.console.warn(format!(
+                    "Preset '{}': param component '{}' not registered",
+                    display_name, entry.param_component_name,
+                ));
+            }
+        }
+        self.assign_entity_uuid(entity);
+        self.scene_dirty = true;
+        self.console.info(format!(
+            "Spawned preset '{}' ({}) with {} override(s)",
+            display_name, cfg.generator, cfg.params.len(),
+        ));
+    }
+
+    fn scan_generator_presets(&mut self) {
+        self.available_generator_presets.clear();
+        let Some(ref project_dir) = self.project_dir else { return };
+        let presets_dir = project_dir.join("assets/generators");
+        if !presets_dir.exists() {
+            self.generator_presets_dirty = true;
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(&presets_dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "rkgen").unwrap_or(false) {
+                match crate::generator::GeneratorAssetConfig::load(&path) {
+                    Ok(cfg) => {
+                        self.available_generator_presets.push(
+                            crate::generator::GeneratorPresetInfo {
+                                path: path.clone(),
+                                display_name: cfg.name,
+                                generator_name: cfg.generator,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        self.console.warn(format!(
+                            "Skipping malformed preset {}: {e}",
+                            path.display(),
+                        ));
+                    }
+                }
+            }
+        }
+        self.available_generator_presets
+            .sort_by(|a, b| a.display_name.cmp(&b.display_name));
+        self.generator_presets_dirty = true;
+        eprintln!(
+            "[RkpEngine] scanned {} generator presets",
+            self.available_generator_presets.len(),
+        );
     }
 
     fn scan_rkp_recursive(dir: &std::path::Path, out: &mut Vec<crate::snapshot::ModelInfo>) {
@@ -4363,6 +5050,23 @@ impl EngineState {
             .map(|m| m.name.clone())
             .unwrap_or_else(|_| "unknown".into());
 
+        // If this is a generator entity, cancel any in-flight run and
+        // recursively delete its owned children first. Children hold
+        // their own pool allocations that need the standard cleanup
+        // path, so we route them back through `delete_entity` rather
+        // than raw despawn.
+        let owned_children: Vec<hecs::Entity> = self.world
+            .query::<&crate::generator::GeneratorOwned>()
+            .iter()
+            .filter(|(_, owned)| owned.parent == entity)
+            .map(|(e, _)| e)
+            .collect();
+        self.generator_system.forget(entity);
+        self.pending_generator_slot_keys.remove(&entity);
+        for child in owned_children {
+            self.delete_entity(child);
+        }
+
         // Release geometry. Asset-backed entities go through the cache so
         // their leaf_attr/brick/octree ranges only free on the last instance
         // release. Procedural entities (no asset_handle) free their own
@@ -4422,64 +5126,65 @@ impl EngineState {
         self.gpu_objects_dirty = true;
     }
 
-    /// Duplicate an entity (deep copy of all components).
+    /// Duplicate an entity — copies every registered component via the
+    /// component registry's serialize/deserialize round-trip, so any
+    /// component type the registry knows about (including gameplay
+    /// components from the hot-reloaded dylib) is carried across
+    /// automatically. Replaces the previous hand-maintained whitelist,
+    /// which silently dropped ProceduralGeometry, SpotLight, RigidBody,
+    /// Skeleton, AnimationPlayer, and any user-added gameplay component.
     fn duplicate_entity(&mut self, source: hecs::Entity) {
         use crate::components::*;
 
-        let name = self.world.get::<&EditorMetadata>(source)
+        // Capture the source's name so we can stamp a unique one on the copy.
+        let src_name = self.world.get::<&EditorMetadata>(source)
             .map(|m| m.name.clone())
             .unwrap_or_else(|_| "unknown".into());
-        let new_name = self.unique_name(&name);
+        let new_name = self.unique_name(&src_name);
 
-        // Read components from source.
-        let transform = self.world.get::<&Transform>(source)
-            .map(|t| (*t).clone())
-            .unwrap_or_else(|_| Transform::default());
-        let renderable = self.world.get::<&Renderable>(source)
-            .map(|r| (*r).clone())
-            .ok();
-        let point_light = self.world.get::<&PointLight>(source)
-            .map(|l| (*l).clone())
-            .ok();
-        let camera = self.world.get::<&Camera>(source)
-            .map(|c| (*c).clone())
-            .ok();
-        let parent = self.world.get::<&Parent>(source)
-            .map(|p| (*p).clone())
-            .ok();
+        // Phase 1 (read-only): serialize every present component into JSON.
+        // We materialise an owned (name, json) vec so the registry borrow is
+        // dropped before we take &mut world to spawn/insert.
+        let pairs: Vec<(String, String)> = {
+            let entries = self.registry.components_on(&self.world, source);
+            entries
+                .iter()
+                .filter_map(|e| {
+                    (e.serialize)(&self.world, source).map(|json| (e.name.to_string(), json))
+                })
+                .collect()
+        };
 
-        // Offset the duplicate slightly so it's visible.
-        let mut new_transform = transform;
-        new_transform.position += glam::Vec3::new(0.5, 0.0, 0.5);
+        // Phase 2: spawn empty entity, re-insert each serialized component.
+        let entity = self.world.spawn(());
+        for (name, json) in &pairs {
+            if let Some(entry) = self.registry.get(name) {
+                if let Err(err) = (entry.deserialize_insert)(&mut self.world, entity, json) {
+                    self.console.warn(format!(
+                        "duplicate_entity: component '{name}' failed to clone: {err}"
+                    ));
+                }
+            }
+        }
 
-        // Spawn the new entity with the same components.
-        let entity = self.world.spawn((
-            new_transform,
-            EditorMetadata { name: new_name.clone() },
-        ));
-
-        if let Some(r) = renderable {
-            // Sharing the spatial data is fine — voxels are immutable once created.
-            // The duplicate gets its own scene_id for face emission.
-            let scene_id = self.next_scene_id;
-            self.next_scene_id += 1;
+        // Phase 3: stamp unique identity + offset so the copy is visible.
+        if let Ok(mut md) = self.world.get::<&mut EditorMetadata>(entity) {
+            md.name = new_name.clone();
+        }
+        if let Ok(mut t) = self.world.get::<&mut Transform>(entity) {
+            t.position += glam::Vec3::new(0.5, 0.0, 0.5);
+        }
+        // Renderable carries a scene_id through the external side map, not
+        // the component itself — assign a fresh one for face emission.
+        if self.world.get::<&Renderable>(entity).is_ok() {
+            let scene_id = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.entity_scene_ids.insert(entity, scene_id);
-            let _ = self.world.insert_one(entity, r);
-        }
-        if let Some(l) = point_light {
-            let _ = self.world.insert_one(entity, l);
-        }
-        if let Some(c) = camera {
-            let _ = self.world.insert_one(entity, c);
-        }
-        if let Some(p) = parent {
-            let _ = self.world.insert_one(entity, p);
         }
 
         self.assign_entity_uuid(entity);
         self.selected_entity = Some(entity);
 
-        self.console.info(format!("Duplicated '{name}' → '{new_name}'"));
+        self.console.info(format!("Duplicated '{src_name}' → '{new_name}'"));
         self.geometry_dirty = true;
         self.scene_dirty = true;
         self.gpu_objects_dirty = true;
@@ -4500,6 +5205,12 @@ impl EngineState {
     }
 
     fn load_scene_from_file(&mut self, path: &std::path::Path) {
+        // Resolve the scene directory from the passed-in path rather
+        // than `self.scene_path` — we used to rely on the latter being
+        // set before load, but order-of-operations bugs there silently
+        // broke procedural bake-cache restoration. The path we're
+        // loading is authoritative.
+        let scene_dir = path.parent().map(|p| p.to_path_buf());
         match crate::scene_io::load_scene(path) {
             Ok(scene) => {
                 // Restore camera.
@@ -4534,8 +5245,7 @@ impl EngineState {
                         let full_path = self.project_dir.as_ref()
                             .map(|d| d.join("assets").join(asset_path))
                             .unwrap_or_else(|| std::path::PathBuf::from(asset_path));
-                        let sid = self.next_scene_id;
-                        self.next_scene_id += 1;
+                        let sid = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         match self.scene_mgr.lock().unwrap().acquire_asset(&full_path.to_string_lossy()) {
                             Ok((handle, info)) => {
                                 let spatial = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.grid_origin, info.leaf_attr_slot_start, info.leaf_attr_slot_count, Vec::new());
@@ -4553,6 +5263,55 @@ impl EngineState {
                             }
                             Err(_) => None,
                         }
+                    } else if obj.primitive.as_deref() == Some("procedural") {
+                        // Procedural entity: the tree itself arrives via
+                        // the generic components pass (ProceduralGeometry).
+                        // Here we spawn the matching Renderable and — if a
+                        // `.rkp` sidecar is present — attach the baked
+                        // spatial so the scene renders without an
+                        // auto-bake at startup (a large re-bake on load
+                        // can freeze or crash the UI). Missing sidecar =
+                        // the entity loads empty; the user sees the
+                        // unbaked chip and can click Bake explicitly.
+                        let sid = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let (spatial, asset_handle, voxel_count) = match (&obj.procedural_cache, &scene_dir) {
+                            (Some(rel), Some(dir)) => {
+                                let full = dir.join(rel);
+                                if full.exists() {
+                                    match self.scene_mgr.lock().unwrap().acquire_asset(&full.to_string_lossy()) {
+                                        Ok((handle, info)) => {
+                                            let sp = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.grid_origin, info.leaf_attr_slot_start, info.leaf_attr_slot_count, Vec::new());
+                                            (Some(sp), Some(handle), info.voxel_count)
+                                        }
+                                        Err(e) => {
+                                            self.console.warn(format!(
+                                                "Failed to load procedural cache '{rel}' for '{}': {e}",
+                                                obj.name,
+                                            ));
+                                            (None, None, 0)
+                                        }
+                                    }
+                                } else {
+                                    self.console.warn(format!(
+                                        "Procedural cache '{rel}' referenced by '{}' not found — entity will load unbaked",
+                                        obj.name,
+                                    ));
+                                    (None, None, 0)
+                                }
+                            }
+                            _ => (None, None, 0),
+                        };
+                        let e = self.world.spawn((transform, meta, Renderable {
+                            primitive: Some("procedural".to_string()),
+                            material_id: obj.material_id,
+                            voxel_count,
+                            spatial,
+                            asset_handle,
+                            ..Default::default()
+                        }));
+                        self.entity_scene_ids.insert(e, sid);
+                        self.geometry_dirty = true;
+                        Some(e)
                     } else if let Some(ref prim_name) = obj.primitive {
                         let primitive = match prim_name.as_str() {
                             "box" => rkp_core::scene_node::SdfPrimitive::Box {
@@ -4563,8 +5322,7 @@ impl EngineState {
                             },
                             _ => continue,
                         };
-                        let sid = self.next_scene_id;
-                        self.next_scene_id += 1;
+                        let sid = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.scene_mgr.lock().unwrap().voxelize_primitive(
                             &primitive, obj.material_id, 0.05, glam::Vec3::ONE, sid,
                         ).map(|result| {
@@ -4586,7 +5344,11 @@ impl EngineState {
                     };
 
                     if let Some(e) = entity {
-                        self.assign_entity_uuid(e);
+                        // Keep the UUID from the scene file — freshly
+                        // generating a new one would orphan anything
+                        // keyed off the ID (bake-cache sidecars, MCP
+                        // references, per-entity persisted data).
+                        self.set_entity_uuid(e, obj.id);
                         uuid_to_hecs.insert(obj.id, e);
 
                         // Restore PointLight component.
@@ -4674,6 +5436,37 @@ impl EngineState {
                     self.try_attach_skeleton(entity, &full_path);
                 }
 
+                // Fifth pass: reconcile ProceduralGeometry.dirty with
+                // whether a bake cache actually loaded. Deserialization
+                // defaults `dirty = true` to cover legacy scenes with
+                // no cache concept; after the cache load we flip that
+                // to `false` on entities whose Renderable has a spatial
+                // — otherwise the properties panel would mislead the
+                // user into thinking a freshly-restored procedural
+                // needed rebaking. Entities without a loaded spatial
+                // stay dirty so the UI's unbaked chip is accurate.
+                let proc_entities: Vec<hecs::Entity> = self
+                    .world
+                    .query::<(&ProceduralGeometry, &Renderable)>()
+                    .iter()
+                    .filter(|(_, (_, r))| r.spatial.is_some())
+                    .map(|(e, _)| e)
+                    .collect();
+                for entity in proc_entities {
+                    if let Ok(mut pg) = self.world.get::<&mut ProceduralGeometry>(entity) {
+                        pg.dirty = false;
+                        // Seed `last_evaluated_root_scale` from the
+                        // tree's Root so `redirect_transform_scale_to_root`
+                        // computes a sane preview multiplier on the
+                        // first interaction.
+                        let root_id = pg.tree.root();
+                        if let Some(root) = pg.tree.get(root_id) {
+                            let (s, _, _) = root.transform.to_scale_rotation_translation();
+                            pg.last_evaluated_root_scale = s;
+                        }
+                    }
+                }
+
                 self.scene_dirty = true;
                 self.gpu_objects_dirty = true;
             }
@@ -4702,6 +5495,11 @@ impl EngineState {
     fn build_scene_file(&self) -> crate::scene_io::SceneFile {
         use crate::components::*;
         let mut objects = Vec::new();
+        let scene_dir = self
+            .scene_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf());
         for (entity, (transform, meta)) in self.world.query::<(&Transform, &EditorMetadata)>().iter() {
             let renderable = self.world.get::<&Renderable>(entity).ok();
             let parent = self.world.get::<&Parent>(entity).ok();
@@ -4720,6 +5518,23 @@ impl EngineState {
                 }
             }
 
+            // Procedural bake cache — only emit when the sidecar file
+            // actually exists on disk. The worker writes it during the
+            // bake, but an unsaved scratch scene (no scene_path yet)
+            // or a never-baked procedural won't have one.
+            let procedural_cache = if components.contains_key("ProceduralGeometry") {
+                let abs = self.procedural_cache_path(entity);
+                match (abs, &scene_dir) {
+                    (Some(abs), Some(dir)) if abs.exists() => abs
+                        .strip_prefix(dir)
+                        .ok()
+                        .map(|rel| rel.to_string_lossy().to_string()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
             objects.push(crate::scene_io::SceneObject {
                 id: self.get_entity_uuid(entity),
                 name: meta.name.clone(),
@@ -4729,6 +5544,7 @@ impl EngineState {
                 parent_id: parent.map(|p| p.parent_id),
                 asset_path: renderable.as_ref().and_then(|r| r.asset_path.clone()),
                 primitive: renderable.as_ref().and_then(|r| r.primitive.clone()),
+                procedural_cache,
                 material_id: renderable.map(|r| r.material_id).unwrap_or(0),
                 point_light: point_light.map(|l| crate::scene_io::ScenePointLight {
                     color: l.color,
@@ -5416,14 +6232,34 @@ impl EngineState {
             let pos = self.world.get::<&Transform>(entity)
                 .map(|t| t.position).unwrap_or_default();
 
-            let aabb_half = spatial.as_ref()
-                .map(|s| s.aabb.half_extents() * scale)
-                .unwrap_or(glam::Vec3::splat(0.5));
+            // Derive the fitted-shape bounds from the actually occupied
+            // voxels. The padded `SpatialData.aabb` overshoots by ~14 voxels
+            // per side (boundary-sampling margin) — fine for the renderer,
+            // wrong for Box/Sphere/Capsule sizing.
+            let tight_local = spatial.as_ref().and_then(|sp| {
+                crate::play_mode::compute_tight_local_aabb(
+                    all_nodes,
+                    &sm_guard.brick_pool,
+                    sp.root_offset as usize,
+                    sp.depth,
+                    sp.len,
+                    sp.base_voxel_size,
+                    sp.grid_origin,
+                )
+            });
+
+            let (aabb_half, local_center) = match tight_local {
+                Some(t) => (t.half_extents() * scale, (t.min + t.max) * 0.5 * scale),
+                None => (glam::Vec3::splat(0.5), glam::Vec3::ZERO),
+            };
 
             if let Some(ref sp) = spatial {
-                let extent = (1u32 << sp.depth) as f32 * sp.base_voxel_size;
-                eprintln!("[ColliderCache] '{name}' pos={pos:?} scale={scale:?} aabb={:?}..{:?} aabb_half={aabb_half:?} extent={extent}",
-                    sp.aabb.min, sp.aabb.max);
+                eprintln!(
+                    "[ColliderCache] '{name}' pos={pos:?} scale={scale:?} \
+                     padded_aabb={:?}..{:?} tight_local={tight_local:?} \
+                     aabb_half={aabb_half:?} local_center={local_center:?}",
+                    sp.aabb.min, sp.aabb.max,
+                );
             }
 
             let (resolved_shape, voxel_coords, voxel_size) = match rb.collider_shape {
@@ -5431,6 +6267,7 @@ impl EngineState {
                     if let Some(ref sp) = spatial {
                         let (coords, cell_size) = crate::play_mode::build_coarse_collider(
                             all_nodes,
+                            &sm_guard.brick_pool,
                             sp.root_offset as usize,
                             sp.depth,
                             sp.len,
@@ -5449,13 +6286,9 @@ impl EngineState {
                 other => (other.clone(), Vec::new(), 0.0),
             };
 
-            // Compute grid origin: aabb_center - extent/2 (same as voxelization).
-            let (grid_origin, tree_depth) = if let Some(ref sp) = spatial {
-                let aabb_center = (sp.aabb.min + sp.aabb.max) * 0.5;
-                let extent = (1u32 << sp.depth) as f32 * sp.voxel_size;
-                (aabb_center - glam::Vec3::splat(extent * 0.5), sp.depth)
-            } else {
-                (glam::Vec3::ZERO, 0)
+            let (grid_origin, tree_depth) = match spatial.as_ref() {
+                Some(sp) => (sp.grid_origin, sp.depth),
+                None => (glam::Vec3::ZERO, 0),
             };
 
             let cache = ColliderCache {
@@ -5463,6 +6296,7 @@ impl EngineState {
                 voxel_coords,
                 collider_cell_size: voxel_size, // actually the coarse cell size from build_coarse_collider
                 aabb_half,
+                local_center,
                 grid_origin,
                 tree_depth,
             };
@@ -5491,21 +6325,24 @@ impl EngineState {
                 BodyType::KinematicPosition | BodyType::KinematicVelocity => [0.9, 0.6, 0.2, 0.6],
             };
 
+            // Fitted shapes sit at `transform.position + local_center`, not
+            // at `transform.position`, so they line up with off-center bakes.
+            let center = transform.position + cache.local_center;
             match cache.shape {
                 ColliderShape::Box => {
-                    let min = transform.position - cache.aabb_half;
-                    let max = transform.position + cache.aabb_half;
+                    let min = center - cache.aabb_half;
+                    let max = center + cache.aabb_half;
                     verts.extend(rkp_render::wireframe::aabb_wireframe(min, max, color));
                 }
                 ColliderShape::Sphere => {
                     let r = cache.aabb_half.max_element();
-                    verts.extend(rkp_render::wireframe::sphere_wireframe(transform.position, r, color));
+                    verts.extend(rkp_render::wireframe::sphere_wireframe(center, r, color));
                 }
                 ColliderShape::Capsule => {
                     let r = cache.aabb_half.x.max(cache.aabb_half.z).max(0.01);
                     let hh = (cache.aabb_half.y - r).max(0.01);
-                    let top = transform.position + glam::Vec3::new(0.0, hh, 0.0);
-                    let bot = transform.position - glam::Vec3::new(0.0, hh, 0.0);
+                    let top = center + glam::Vec3::new(0.0, hh, 0.0);
+                    let bot = center - glam::Vec3::new(0.0, hh, 0.0);
                     verts.extend(rkp_render::wireframe::sphere_wireframe(top, r, color));
                     verts.extend(rkp_render::wireframe::sphere_wireframe(bot, r, color));
                     for angle in [0.0f32, std::f32::consts::FRAC_PI_2, std::f32::consts::PI, 3.0 * std::f32::consts::FRAC_PI_2] {
@@ -5515,7 +6352,13 @@ impl EngineState {
                     }
                 }
                 ColliderShape::Auto => {
-                    if !cache.voxel_coords.is_empty() {
+                    // 24 line vertices per coarse cell; cap so the wireframe
+                    // pass never asks for a vertex buffer the GPU can't allocate.
+                    // Above this, fall back to the AABB outline.
+                    const MAX_WIRE_CELLS: usize = 32_768;
+                    if !cache.voxel_coords.is_empty()
+                        && cache.voxel_coords.len() <= MAX_WIRE_CELLS
+                    {
                         let cs = cache.collider_cell_size;
 
                         let offset = cache.grid_origin * transform.scale;
@@ -5635,16 +6478,24 @@ impl EngineState {
         .map(|(id, _t)| id)
     }
 
-    fn process_pick_result(&mut self) {
-        let pending = self.pending_pick.take();
+    /// Non-blocking consumer for `pick_in_flight`. Called at the top of
+    /// each render frame after the routine `device.poll(Poll)` so any
+    /// async map callback that fired in the interim is visible. Returns
+    /// without effect if no pick is pending or the map hasn't completed.
+    fn drain_pick_result(&mut self) {
+        let ready = self
+            .pick_in_flight
+            .as_ref()
+            .map(|(_, rx)| rx.try_recv().is_ok())
+            .unwrap_or(false);
+        if !ready {
+            return;
+        }
+        let (pp, _rx) = self.pick_in_flight.take().expect("ready check passed");
+        let pending = Some(pp);
         let slice = self.pick_readback_buffer.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-
-        if let Ok(Ok(())) = rx.recv() {
+        // Recv was OK — the buffer is mapped; the read below is sync.
+        {
             let data = slice.get_mapped_range();
             if data.len() >= 260 {
                 // Material G-buffer (Rg32Uint, at offset 0):
@@ -5704,6 +6555,12 @@ impl EngineState {
             drop(data);
             self.pick_readback_buffer.unmap();
         }
+    }
+
+    /// Access the profiling ring buffer. Intended for MCP tools and
+    /// any other read-only consumer outside the editor snapshot path.
+    pub fn profiling_history(&self) -> &crate::profiling::ProfilingHistory {
+        &self.profiling
     }
 
     fn build_state_update(&mut self, frame_time: Duration) -> StateUpdate {
@@ -5772,6 +6629,35 @@ impl EngineState {
         } else {
             None
         };
+        let generators = if self.generators_dirty {
+            self.generators_dirty = false;
+            let mut names: Vec<String> = self
+                .generator_system
+                .registry()
+                .names()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+            names.sort();
+            Some(names)
+        } else {
+            None
+        };
+        let generator_presets = if self.generator_presets_dirty {
+            self.generator_presets_dirty = false;
+            Some(
+                self.available_generator_presets
+                    .iter()
+                    .map(|p| crate::snapshot::GeneratorPresetEntry {
+                        path: p.path.to_string_lossy().into_owned(),
+                        display_name: p.display_name.clone(),
+                        generator_name: p.generator_name.clone(),
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
         let importing = if self.importing_dirty {
             self.importing_dirty = false;
             Some(self.importing_sources.iter().cloned().collect())
@@ -5793,8 +6679,29 @@ impl EngineState {
             None
         };
 
+        // Inspector + procedural: send only on change. Both rebuild every
+        // tick (cheap) but the panel re-render they trigger on the editor
+        // thread is not — sending an identical snapshot 60Hz used to chunk
+        // the UI when physics drove a selected RigidBody's Transform.
+        let new_inspector = self.build_inspector_snapshot();
+        let inspector_update = if new_inspector != self.prev_inspector {
+            self.prev_inspector = new_inspector.clone();
+            Some(new_inspector)
+        } else {
+            None
+        };
+        let new_procedural = self.build_procedural_snapshot();
+        let procedural_update = if new_procedural != self.prev_procedural {
+            self.prev_procedural = new_procedural.clone();
+            Some(new_procedural)
+        } else {
+            None
+        };
+
         StateUpdate {
             fps,
+            tick_hz: self.tick_hz_ema,
+            physics_hz: self.physics_hz_ema,
             gpu_object_count: self.gpu_objects.len() as u32,
             camera_position: self.camera.position,
             play_mode: self.play_state.is_some(),
@@ -5804,10 +6711,12 @@ impl EngineState {
             project_name,
             project_dir,
             available_models: models,
+            available_generators: generators,
+            available_generator_presets: generator_presets,
             importing_models: importing,
             import_progress,
             editor_layout,
-            inspector: self.build_inspector_snapshot(),
+            inspector: inspector_update,
             recent_projects: if self.frame_index == 1 {
                 Some(crate::recent_projects::load_recent())
             } else {
@@ -5827,14 +6736,27 @@ impl EngineState {
             },
             selected_material: self.selected_material,
             selected_model: self.selected_model.clone(),
-            environment: if self.frame_index <= 1 || self.environment_ui_dirty {
+            environment: {
+                // Always build, diff-suppress. The old `environment_ui_dirty`
+                // gate explicitly avoided echoing slider edits back to the
+                // editor (it would have remounted the form mid-drag);
+                // diff-suppression makes that hack unnecessary because user
+                // edits round-trip back as exact-match no-ops here. With the
+                // env panel reading per-field Memos against `store.environment`,
+                // these pushes also don't remount anything — only the changed
+                // field's DOM updates.
+                let _ = self.environment_ui_dirty; // legacy flag, no longer gates
                 self.environment_ui_dirty = false;
-                Some(self.environment.clone())
-            } else {
-                None
+                if Some(&self.environment) != self.prev_environment.as_ref() {
+                    self.prev_environment = Some(self.environment.clone());
+                    Some(self.environment.clone())
+                } else {
+                    None
+                }
             },
-            procedural: self.build_procedural_snapshot(),
+            procedural: procedural_update,
             console_entries: self.console.drain_new(),
+            profiling: self.profiling.latest().cloned(),
         }
     }
 
@@ -6397,8 +7319,22 @@ fn tick_loop(
     // Normally the dylib is scaffolded + built when a project is opened.
     state.try_load_gameplay_dylib();
 
+    let mut last_tick_start: Option<Instant> = None;
     loop {
         let frame_start = Instant::now();
+
+        // Real wall-clock time since the previous tick started. Cap at 100ms
+        // so a one-off hitch (e.g. an asset load) doesn't catapult dynamic
+        // bodies; physics will fall behind real time during the hitch and
+        // catch up on the next normal tick. First tick uses the target
+        // pacing interval since there's no prior tick to measure against.
+        let real_dt = match last_tick_start {
+            Some(prev) => frame_start.duration_since(prev).as_secs_f32().min(0.1),
+            None => 1.0 / 60.0,
+        };
+        last_tick_start = Some(frame_start);
+        let inst_tick_hz = if real_dt > 0.0 { 1.0 / real_dt } else { 0.0 };
+        state.tick_hz_ema = state.tick_hz_ema * 0.9 + inst_tick_hz * 0.1;
 
         // 1. Drain command queue.
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -6421,6 +7357,11 @@ fn tick_loop(
         state.drain_bake_results();
         state.update_dirty_procedurals();
 
+        // 1b3. Generator system — poll finished generator jobs,
+        // detect param edits, submit stale jobs. Lives alongside the
+        // bake pump because both flow through the same worker.
+        state.tick_generators();
+
         // 1c. Step gameplay systems + physics if in play mode.
         //
         // Frame order: Update → flush → FixedUpdate → flush → Physics → LateUpdate → flush
@@ -6428,34 +7369,85 @@ fn tick_loop(
         // Gameplay runs before physics so scripts can set transforms on kinematic
         // bodies before physics reads them. Dynamic bodies have their transforms
         // overwritten by physics afterward (physics owns dynamic bodies).
+        if state.play_state.is_none() {
+            // Decay physics readout when not stepping so a stale 60 Hz doesn't
+            // persist in the profiler after Stop.
+            state.physics_hz_ema *= 0.9;
+        }
         if state.play_state.is_some() {
-            let dt = 1.0 / 60.0;
-            let fixed_dt = 1.0 / 60.0;
+            let dt = real_dt;
+            /// Fixed-step duration for behavior FixedUpdate. Kept in
+            /// sync with rkp-physics's default timestep on purpose —
+            /// running them at the same rate means a FixedUpdate
+            /// system that manipulates a kinematic body sees the
+            /// physics world integrated at matching cadence.
+            const FIXED_DT: f32 = 1.0 / 60.0;
+            /// Cap on fixed steps per render frame. Mirrors physics'
+            /// "spiral of death" guard — if we ever fall this far
+            /// behind, drop the residual rather than try to catch up.
+            const MAX_FIXED_STEPS: u32 = 8;
+
             state.play_total_time += dt as f64;
             state.play_frame_count += 1;
 
-            // Update + FixedUpdate phases
+            // Phase 1: Update — runs once per render frame at real_dt.
             if let Some(ref mut executor) = state.behavior_executor {
-                executor.tick(
+                executor.tick_update(
                     &state.gameplay_systems,
                     &mut state.world,
                     &mut state.behavior_commands,
                     &mut state.game_store,
-                    dt, fixed_dt,
+                    dt,
                     state.play_total_time,
                     state.play_frame_count,
                 );
                 state.gpu_objects_dirty = true;
             }
 
-            // Physics step (between FixedUpdate and LateUpdate)
+            // Phase 2: FixedUpdate — accumulator-driven. Runs zero or
+            // more times at exactly FIXED_DT each. A 60 Hz render has
+            // exactly one step per frame in steady state; a 240 Hz
+            // render has a step every ~4 frames; a heavy hitch (say
+            // 100 ms) would fire up to MAX_FIXED_STEPS back-to-back
+            // and then drop the rest.
+            if let Some(ref mut executor) = state.behavior_executor {
+                state.behavior_fixed_accumulator += dt;
+                let mut steps = 0u32;
+                while state.behavior_fixed_accumulator >= FIXED_DT
+                    && steps < MAX_FIXED_STEPS
+                {
+                    executor.tick_fixed_update(
+                        &state.gameplay_systems,
+                        &mut state.world,
+                        &mut state.behavior_commands,
+                        &mut state.game_store,
+                        FIXED_DT,
+                        state.play_total_time,
+                        state.play_frame_count,
+                    );
+                    state.behavior_fixed_accumulator -= FIXED_DT;
+                    steps += 1;
+                }
+                if steps == MAX_FIXED_STEPS {
+                    // Spiral-of-death guard: drop residual so we
+                    // don't keep trying to catch up next frame.
+                    state.behavior_fixed_accumulator = 0.0;
+                }
+            }
+
+            // Physics step (between FixedUpdate and LateUpdate).
+            // Physics has its own Rapier-side accumulator so passing
+            // real_dt is correct regardless of render rate.
             if let Some(ref mut play) = state.play_state {
                 if play.step(dt, &mut state.world) {
                     state.gpu_objects_dirty = true;
                 }
+                let substeps = play.last_step_substeps() as f32;
+                let inst_hz = if dt > 0.0 { substeps / dt } else { 0.0 };
+                state.physics_hz_ema = state.physics_hz_ema * 0.9 + inst_hz * 0.1;
             }
 
-            // LateUpdate phase
+            // Phase 3: LateUpdate — once per render frame at real_dt.
             if let Some(ref mut executor) = state.behavior_executor {
                 executor.tick_late(
                     &state.gameplay_systems,
@@ -6477,20 +7469,22 @@ fn tick_loop(
             }
         }
 
-        // 1d. Advance skeletal animations. Runs every frame in both edit
-        // and play modes so animated characters preview correctly in the
-        // editor. Uses the same fixed 60 Hz step as gameplay for now.
-        let anim_dt = 1.0 / 60.0;
-        if crate::animation::tick(&mut state.world, anim_dt) {
+        // 1d. Advance skeletal animations on real wall-clock dt so
+        // playback rate is independent of render rate. Runs every
+        // frame in both edit and play modes so animated characters
+        // preview correctly in the editor.
+        if crate::animation::tick(&mut state.world, real_dt) {
             state.gpu_objects_dirty = true;
         }
 
-        // 2. Update input system + camera.
-        let dt = 1.0 / 60.0; // TODO: use actual delta time
+        // 2. Update input system + camera with real_dt — fly mode
+        // uses dt to scale velocity, so anything other than real_dt
+        // makes the camera move at the wrong speed when the render
+        // rate diverges from 60 Hz.
         state.input_system.evaluate();
         state.camera_control.update(
             &state.input_system,
-            dt,
+            real_dt,
             &mut state.camera.position,
             &mut state.camera.yaw,
             &mut state.camera.pitch,
@@ -6517,11 +7511,14 @@ fn tick_loop(
         // 7. Clear per-frame input state for next tick.
         state.input_system.begin_frame();
 
-        // 8. Frame pacing — target ~60 FPS.
-        let target = Duration::from_micros(16_667);
-        let elapsed = frame_start.elapsed();
-        if elapsed < target {
-            std::thread::sleep(target - elapsed);
+        // 8. Frame pacing — sleep the remainder of the configured
+        // target interval. `Uncapped` skips the sleep entirely; the
+        // tick rate is then bounded only by GPU queue backpressure.
+        if let Some(target) = config.render_pacing.target_interval() {
+            let elapsed = frame_start.elapsed();
+            if elapsed < target {
+                std::thread::sleep(target - elapsed);
+            }
         }
     }
 }

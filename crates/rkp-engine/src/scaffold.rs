@@ -70,13 +70,16 @@ pub fn generate_gameplay_crate(project_dir: &Path) -> Result<PathBuf, ScaffoldEr
 
     let components = discover_rs_files(&scripts_dir.join("components"));
     let systems = discover_rs_files(&scripts_dir.join("systems"));
+    let generators = discover_rs_files(&scripts_dir.join("generators"));
 
     // Create directory structure.
     let src_dir = crate_dir.join("src");
     let comp_dir = src_dir.join("components");
     let sys_dir = src_dir.join("systems");
+    let gen_dir = src_dir.join("generators");
     fs::create_dir_all(&comp_dir)?;
     fs::create_dir_all(&sys_dir)?;
+    fs::create_dir_all(&gen_dir)?;
 
     // Generate Cargo.toml.
     let engine_path = engine_root().join("crates/rkp-engine");
@@ -89,6 +92,7 @@ pub fn generate_gameplay_crate(project_dir: &Path) -> Result<PathBuf, ScaffoldEr
     // Remove stale source files.
     remove_stale(&comp_dir, &components)?;
     remove_stale(&sys_dir, &systems)?;
+    remove_stale(&gen_dir, &generators)?;
 
     // Copy user source files.
     for name in &components {
@@ -103,13 +107,20 @@ pub fn generate_gameplay_crate(project_dir: &Path) -> Result<PathBuf, ScaffoldEr
             &sys_dir.join(format!("{name}.rs")),
         )?;
     }
+    for name in &generators {
+        copy_if_changed(
+            &scripts_dir.join("generators").join(format!("{name}.rs")),
+            &gen_dir.join(format!("{name}.rs")),
+        )?;
+    }
 
     // Generate mod.rs files.
     write_if_changed(&comp_dir.join("mod.rs"), &gen_mod_rs(&components, true))?;
     write_if_changed(&sys_dir.join("mod.rs"), &gen_mod_rs(&systems, false))?;
+    write_if_changed(&gen_dir.join("mod.rs"), &gen_mod_rs(&generators, false))?;
 
     // Generate lib.rs.
-    write_if_changed(&src_dir.join("lib.rs"), &gen_lib_rs(&components, &systems))?;
+    write_if_changed(&src_dir.join("lib.rs"), &gen_lib_rs(&components, &systems, &generators))?;
 
     Ok(crate_dir)
 }
@@ -185,6 +196,8 @@ fn remove_stale(dir: &Path, expected: &[String]) -> Result<(), ScaffoldError> {
 // ── Template generators ─────────────────────────────────────────────────
 
 fn gen_cargo_toml(engine_path: &str, macros_path: &str) -> String {
+    let engine_root = engine_root();
+    let procedural_path = engine_root.join("crates/rkp-procedural");
     format!(
         r#"[package]
 name = "gameplay"
@@ -197,6 +210,7 @@ crate-type = ["cdylib"]
 [dependencies]
 rkp-engine = {{ path = "{engine_path}" }}
 rkp-macros = {{ path = "{macros_path}" }}
+rkp-procedural = {{ path = "{procedural}" }}
 inventory = "0.3"
 glam = {{ version = "0.29", features = ["serde"] }}
 hecs = "0.10"
@@ -206,15 +220,17 @@ serde_json = "1"
 # Must match editor's release profile — hecs layout changes between debug/release.
 [profile.release]
 opt-level = 1
-"#
+"#,
+        procedural = procedural_path.display(),
     )
 }
 
-fn gen_lib_rs(components: &[String], systems: &[String]) -> String {
+fn gen_lib_rs(components: &[String], systems: &[String], generators: &[String]) -> String {
     let mut s = String::new();
     s.push_str("//! Auto-generated gameplay crate — do not edit.\n");
     s.push_str("//! Write your components in assets/scripts/components/\n");
-    s.push_str("//! Write your systems in assets/scripts/systems/\n\n");
+    s.push_str("//! Write your systems in assets/scripts/systems/\n");
+    s.push_str("//! Write your generators in assets/scripts/generators/\n\n");
 
     if !components.is_empty() {
         s.push_str("pub mod components;\n");
@@ -222,10 +238,14 @@ fn gen_lib_rs(components: &[String], systems: &[String]) -> String {
     if !systems.is_empty() {
         s.push_str("pub mod systems;\n");
     }
+    if !generators.is_empty() {
+        s.push_str("pub mod generators;\n");
+    }
     s.push('\n');
 
     s.push_str("use rkp_engine::component_registry::ComponentEntry;\n");
-    s.push_str("use rkp_engine::behavior::SystemEntry;\n\n");
+    s.push_str("use rkp_engine::behavior::SystemEntry;\n");
+    s.push_str("use rkp_engine::generator::GeneratorEntry;\n\n");
 
     // Component FFI export.
     s.push_str("#[unsafe(no_mangle)]\n");
@@ -241,6 +261,14 @@ fn gen_lib_rs(components: &[String], systems: &[String]) -> String {
     s.push_str("    let entries: Vec<&'static SystemEntry> =\n");
     s.push_str("        inventory::iter::<SystemEntry>.into_iter().collect();\n");
     s.push_str("    rkp_engine::gameplay_loader::GameplaySystems::from_iter(entries)\n");
+    s.push_str("}\n\n");
+
+    // Generator FFI export.
+    s.push_str("#[unsafe(no_mangle)]\n");
+    s.push_str("pub extern \"C\" fn rkp_gameplay_generators() -> rkp_engine::gameplay_loader::GameplayGenerators {\n");
+    s.push_str("    let entries: Vec<&'static GeneratorEntry> =\n");
+    s.push_str("        inventory::iter::<GeneratorEntry>.into_iter().collect();\n");
+    s.push_str("    rkp_engine::gameplay_loader::GameplayGenerators::from_iter(entries)\n");
     s.push_str("}\n");
 
     s
@@ -290,6 +318,8 @@ mod tests {
         assert!(lib_rs.contains("pub mod systems;"));
         assert!(lib_rs.contains("rkp_gameplay_entries"));
         assert!(lib_rs.contains("rkp_gameplay_systems"));
+        // Always emits the generator FFI export, even if no generators found.
+        assert!(lib_rs.contains("rkp_gameplay_generators"));
 
         let comp_mod = fs::read_to_string(crate_dir.join("src/components/mod.rs")).unwrap();
         assert!(comp_mod.contains("pub mod health;"));
@@ -308,6 +338,35 @@ mod tests {
         let lib_rs = fs::read_to_string(crate_dir.join("src/lib.rs")).unwrap();
         assert!(lib_rs.contains("rkp_gameplay_entries"));
         assert!(!lib_rs.contains("pub mod components;"));
+    }
+
+    #[test]
+    fn scaffold_generators_discovered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("with_generators");
+        let gen_dir = project.join("assets/scripts/generators");
+        fs::create_dir_all(&gen_dir).unwrap();
+        fs::create_dir_all(project.join("assets/scripts/components")).unwrap();
+        fs::create_dir_all(project.join("assets/scripts/systems")).unwrap();
+
+        fs::write(gen_dir.join("rock.rs"), "// rock generator").unwrap();
+        fs::write(gen_dir.join("tree.rs"), "// tree generator").unwrap();
+
+        let crate_dir = generate_gameplay_crate(&project).unwrap();
+
+        assert!(crate_dir.join("src/generators/rock.rs").exists());
+        assert!(crate_dir.join("src/generators/tree.rs").exists());
+
+        let gen_mod = fs::read_to_string(crate_dir.join("src/generators/mod.rs")).unwrap();
+        assert!(gen_mod.contains("pub mod rock;"));
+        assert!(gen_mod.contains("pub mod tree;"));
+        // Generators don't glob-reexport (systems don't either — both are
+        // registered via inventory, not name lookup).
+        assert!(!gen_mod.contains("pub use rock::*;"));
+
+        let lib_rs = fs::read_to_string(crate_dir.join("src/lib.rs")).unwrap();
+        assert!(lib_rs.contains("pub mod generators;"));
+        assert!(lib_rs.contains("rkp_gameplay_generators"));
     }
 
     #[test]

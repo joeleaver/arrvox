@@ -92,6 +92,7 @@ pub struct SkinDeformPass {
     scene_bind_group: wgpu::BindGroup,
     dispatch_bind_group_layout: wgpu::BindGroupLayout,
     uniforms_buffer: wgpu::Buffer,
+    uniforms_capacity: u64,
     bricks_capacity: u64,
     bricks_buffer: wgpu::Buffer,
 }
@@ -259,6 +260,7 @@ impl SkinDeformPass {
             scene_bind_group,
             dispatch_bind_group_layout,
             uniforms_buffer,
+            uniforms_capacity: std::mem::size_of::<SkinUniforms>() as u64,
             bricks_capacity,
             bricks_buffer,
         }
@@ -318,9 +320,18 @@ impl SkinDeformPass {
 
         // ── Uniforms array ─────────────────────────────────────────
         let uniforms_bytes: &[u8] = bytemuck::cast_slice(&batch.uniforms);
-        if (uniforms_bytes.len() as u64) > self.uniforms_buffer.size() {
-            let mut new_cap = self.uniforms_buffer.size().max(std::mem::size_of::<SkinUniforms>() as u64);
-            while new_cap < uniforms_bytes.len() as u64 {
+        // Track our own capacity instead of querying `buffer.size()`.
+        // wgpu can report a stale-feeling value when a buffer was
+        // recreated via `*self.foo = device.create_buffer(...)` while
+        // an earlier bind-group still references the old `Arc`-backed
+        // handle, and the validator reports the OLD buffer's size in
+        // its error path. Storing the cap explicitly + rebuilding the
+        // bind group on resize matches the existing `bricks_buffer`
+        // pattern below.
+        let needed = uniforms_bytes.len() as u64;
+        if needed > self.uniforms_capacity {
+            let mut new_cap = self.uniforms_capacity.max(std::mem::size_of::<SkinUniforms>() as u64);
+            while new_cap < needed {
                 new_cap = new_cap.saturating_mul(2);
             }
             self.uniforms_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -329,6 +340,7 @@ impl SkinDeformPass {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+            self.uniforms_capacity = new_cap;
         }
         queue.write_buffer(&self.uniforms_buffer, 0, uniforms_bytes);
 

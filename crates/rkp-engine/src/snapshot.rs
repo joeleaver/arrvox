@@ -29,6 +29,17 @@ pub struct ImportProgressInfo {
     pub error: Option<String>,
 }
 
+/// One generator preset surfaced to the editor's models panel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneratorPresetEntry {
+    /// Absolute path on disk — round-tripped to the engine on spawn.
+    pub path: String,
+    /// Display name from the preset's `name` field.
+    pub display_name: String,
+    /// Generator the preset targets — useful for tooltips.
+    pub generator_name: String,
+}
+
 /// Lightweight scene object info for UI display.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SceneObjectInfo {
@@ -52,6 +63,15 @@ pub struct SceneObjectInfo {
 #[derive(Debug, Clone)]
 pub struct StateUpdate {
     pub fps: f32,
+    /// True engine tick rate (1 / total tick interval, including pacing
+    /// sleep). Reflects what the user actually perceives — distinct from
+    /// `fps`, which is `1 / frame_work_time` and can read 200+ even when
+    /// the loop is paced to 60 Hz.
+    pub tick_hz: f32,
+    /// Smoothed physics substeps per second across the engine tick. Stays
+    /// near 60 when physics is stepping at target; drops below when ticks
+    /// are slow enough to starve the fixed-timestep accumulator.
+    pub physics_hz: f32,
     pub gpu_object_count: u32,
     pub camera_position: Vec3,
     pub play_mode: bool,
@@ -72,6 +92,12 @@ pub struct StateUpdate {
     pub project_dir: Option<Option<String>>,
     /// Available model files — only sent when the list changes.
     pub available_models: Option<Vec<ModelInfo>>,
+    /// Registered generator names — sent whenever the set changes
+    /// (dylib load, hot-reload, unload). None = unchanged this tick.
+    pub available_generators: Option<Vec<String>>,
+    /// Generator presets discovered in `assets/generators/*.rkgen`.
+    /// Sent whenever the project is opened or rescanned.
+    pub available_generator_presets: Option<Vec<GeneratorPresetEntry>>,
     /// Source paths currently being re-imported. Sent whenever the set
     /// changes — on submit (grows) or completion (shrinks). The UI uses
     /// this to show a progress indicator in place of the Re-import button.
@@ -87,8 +113,13 @@ pub struct StateUpdate {
     /// inner `Option` is "was one stored?" (None = pre-persistence
     /// project, editor should reset to its default layout).
     pub editor_layout: Option<Option<String>>,
-    /// Inspector data for the selected entity — sent when selection changes.
-    pub inspector: Option<crate::inspector::InspectorSnapshot>,
+    /// Inspector data for the selected entity. Outer `Option` = "this tick
+    /// carries an inspector update"; inner `Option` = `Some(snap)` for a
+    /// new selection state, or `None` to clear (deselect). When the value
+    /// hasn't changed since last tick the engine sends `None` here so the
+    /// editor doesn't burn UI-thread time re-rendering identical fields —
+    /// physics writes Transform 60Hz which used to chunk the panel.
+    pub inspector: Option<Option<crate::inspector::InspectorSnapshot>>,
     /// Component names that can be added to the selected entity.
     pub available_components: Option<Vec<String>>,
     /// Recent projects list (sent once on startup).
@@ -102,9 +133,17 @@ pub struct StateUpdate {
     /// Environment settings (sent when changed or on first frame).
     pub environment: Option<crate::environment::EnvironmentSettings>,
     /// Procedural object snapshot for the selected entity (if it has ProceduralGeometry).
-    pub procedural: Option<crate::procedural_snapshot::ProceduralSnapshot>,
+    /// Same change-only protocol as `inspector` above — outer `Option` is
+    /// "this tick carries an update".
+    pub procedural: Option<Option<crate::procedural_snapshot::ProceduralSnapshot>>,
     /// New console log entries since last tick.
     pub console_entries: Vec<crate::console::LogEntry>,
+    /// Latest per-frame profiling sample. Sent every tick once the
+    /// first GPU timestamps resolve (~3 frames into the session). The
+    /// editor maintains its own ring of these on the UI side for the
+    /// profiling panel's sparklines — MCP reads the full ring buffer
+    /// directly from the engine via `RkpEngine::profiling_history`.
+    pub profiling: Option<crate::profiling::ProfilingFrame>,
 }
 
 /// Info about an available model file.

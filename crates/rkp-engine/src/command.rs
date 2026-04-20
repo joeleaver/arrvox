@@ -36,6 +36,26 @@ pub enum EngineCommand {
     /// Spawn a spot light.
     SpawnSpotLight,
 
+    /// Spawn a generator-driven entity. `generator_name` must match a
+    /// registered generator from the gameplay dylib. The entity gets a
+    /// Transform, EditorMetadata, GeneratorState, and a default instance
+    /// of the generator's param component — the tick driver picks it up
+    /// next frame and submits the first run.
+    SpawnGenerator {
+        generator_name: String,
+    },
+
+    /// Spawn a generator entity from a `.rkgen` preset on disk. The
+    /// engine loads the preset's generator name + per-field overrides,
+    /// spawns the entity with default params, then applies each
+    /// override via `ComponentEntry::set_field`. Missing fields keep
+    /// their default values.
+    SpawnGeneratorPreset {
+        /// Absolute path to the `.rkgen` file (round-tripped from
+        /// `StateUpdate::available_generator_presets`).
+        path: String,
+    },
+
     /// Place an imported model at the camera position.
     PlaceModel {
         asset_path: String,

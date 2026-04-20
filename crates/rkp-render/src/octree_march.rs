@@ -46,8 +46,17 @@ pub struct OctreeMarchPass {
     /// Stats buffer for profiling (44 atomic u32s — see shader comment at stats binding).
     stats_buffer: wgpu::Buffer,
     stats_readback: wgpu::Buffer,
-    /// Screen-space AABB buffer for tile culling.
+    /// Screen-space AABB buffer for tile culling. Grown on upload to
+    /// fit the scene's current GpuObject count.
     screen_aabbs_buffer: wgpu::Buffer,
+    /// Tracked capacity for `screen_aabbs_buffer` (bytes). Avoids
+    /// querying `buffer.size()` so a stale validation handle can't
+    /// trip a false-overrun error.
+    screen_aabbs_capacity: u64,
+    /// Cached params bind group needs to be invalidated when
+    /// `screen_aabbs_buffer` is recreated since it holds a ref to the
+    /// old handle.
+    screen_aabbs_dirty: bool,
     /// Lights buffer (shared with shade pass).
     lights_buffer: Option<wgpu::Buffer>,
     /// Materials buffer reference for bind group rebuild.
@@ -187,10 +196,14 @@ impl OctreeMarchPass {
             }),
             screen_aabbs_buffer: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("march screen_aabbs"),
-                size: 16 * 32, // 32 objects × vec4<f32>
+                // Initial capacity for 32 objects × vec4<f32>. Grown
+                // by `upload_screen_aabbs` when the scene exceeds it.
+                size: 16 * 32,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
+            screen_aabbs_capacity: 16 * 32,
+            screen_aabbs_dirty: false,
             lights_buffer: None,
             materials_buffer: None,
         }
@@ -239,8 +252,32 @@ impl OctreeMarchPass {
         }));
     }
 
-    /// Upload screen-space AABBs for tile culling. Call each frame before dispatch.
-    pub fn upload_screen_aabbs(&self, queue: &wgpu::Queue, data: &[u8]) {
+    /// Upload screen-space AABBs for tile culling. Call each frame
+    /// before dispatch. Grows the buffer if `data` exceeds the current
+    /// capacity (each new GpuObject = +16 bytes), and rebuilds the
+    /// params bind group so it points at the new handle.
+    pub fn upload_screen_aabbs(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[u8]) {
+        let needed = data.len() as u64;
+        if needed > self.screen_aabbs_capacity {
+            let mut new_cap = self.screen_aabbs_capacity.max(16 * 32);
+            while new_cap < needed {
+                new_cap = new_cap.saturating_mul(2);
+            }
+            self.screen_aabbs_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("march screen_aabbs"),
+                size: new_cap,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.screen_aabbs_capacity = new_cap;
+            self.screen_aabbs_dirty = true;
+            // Cached bind group references the OLD buffer — invalidate
+            // so the next `try_rebuild_params_bind_group` call (via
+            // set_materials / set_lights at frame start, or our own
+            // explicit rebuild below) picks up the new handle.
+            self.params_bind_group = None;
+            self.try_rebuild_params_bind_group(device);
+        }
         queue.write_buffer(&self.screen_aabbs_buffer, 0, data);
     }
 
@@ -287,145 +324,15 @@ impl OctreeMarchPass {
         encoder.copy_buffer_to_buffer(&self.stats_buffer, 0, &self.stats_readback, 0, STATS_BYTES);
     }
 
-    /// Read stats from readback buffer. Call after device.poll().
-    ///
-    /// Prints once per second (assuming 60fps) with per-phase depth histograms
-    /// and a hit-footprint histogram. This is intentionally verbose — the goal
-    /// is to drive the mipped-octree / LOD-cutoff decision, not light telemetry.
-    pub fn read_stats(&self, device: &wgpu::Device, total_pixels: u32, frame_idx: u64) {
-        if frame_idx % 60 != 0 || frame_idx == 0 { return; }
-        let slice = self.stats_readback.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        if let Ok(Ok(())) = rx.recv() {
-            let data = slice.get_mapped_range();
-            let vals: &[u32] = bytemuck::cast_slice(&data);
-            let total_steps = vals[0];
-            let hit_pixels = vals[2];
-            let max_steps = vals[3];
-
-            let surface: &[u32] = &vals[4..16];
-            let normal:  &[u32] = &vals[16..28];
-            let shadow:  &[u32] = &vals[28..40];
-            let foot:    &[u32] = &vals[40..44];
-            let leaf_attr_reads = vals[44] as u64;
-            let voxel_pool_reads = vals[45] as u64;
-            let color_pool_reads = vals[46] as u64;
-            let materials_reads = vals[47] as u64;
-            let lod_exits: &[u32] = &vals[48..52]; // L0-2, L3-5, L6-8, L9+
-            let surfnet_reconstructions = vals[52] as u64;
-            let surfnet_boundary_clips = vals[53] as u64;
-            let surfnet_degenerate = vals[54] as u64;
-            let skin_entries = vals[55] as u64;
-            let skin_hits    = vals[56] as u64;
-            let skin_cell_reads = vals[57] as u64;
-            let skin_brick_skips = vals[58] as u64;
-            let skin_brick_samples = vals[59] as u64;
-
-            let sum = |h: &[u32]| -> u64 { h.iter().map(|&x| x as u64).sum() };
-            let weighted = |h: &[u32]| -> f64 {
-                let s = sum(h);
-                if s == 0 { return 0.0; }
-                let w: u64 = h.iter().enumerate().map(|(i, &c)| i as u64 * c as u64).sum();
-                w as f64 / s as f64
-            };
-            // Total node reads for a phase: sum over buckets of (level+1)*count.
-            // (Each octree_lookup that terminates at level L reads L+1 nodes.)
-            let phase_node_reads = |h: &[u32]| -> u64 {
-                h.iter().enumerate().map(|(i, &c)| (i as u64 + 1) * c as u64).sum()
-            };
-
-            let total_lookups = sum(surface) + sum(normal) + sum(shadow);
-            let avg_steps = if total_pixels > 0 { total_steps as f32 / total_pixels as f32 } else { 0.0 };
-
-            eprintln!(
-                "[march] hits {}/{}  avg_steps {:.1}  max_steps {}  total_lookups {}M",
-                hit_pixels, total_pixels, avg_steps, max_steps, total_lookups / 1_000_000,
-            );
-            eprintln!(
-                "[descents surface] avg_depth {:.2}  {}",
-                weighted(surface), format_histogram(surface),
-            );
-            eprintln!(
-                "[descents normal ] avg_depth {:.2}  {}",
-                weighted(normal), format_histogram(normal),
-            );
-            eprintln!(
-                "[descents shadow ] avg_depth {:.2}  {}",
-                weighted(shadow), format_histogram(shadow),
-            );
-            let foot_total: u64 = foot.iter().map(|&x| x as u64).sum();
-            let pct = |n: u32| -> f32 {
-                if foot_total == 0 { 0.0 } else { 100.0 * n as f32 / foot_total as f32 }
-            };
-            eprintln!(
-                "[footprint] <1px:{:.0}%  1-2px:{:.0}%  2-4px:{:.0}%  >=4px:{:.0}%  (n={})",
-                pct(foot[0]), pct(foot[1]), pct(foot[2]), pct(foot[3]), foot_total,
-            );
-            let lod_total: u64 = lod_exits.iter().map(|&x| x as u64).sum();
-            if lod_total > 0 {
-                eprintln!(
-                    "[lod exits] {}  L0-2:{}  L3-5:{}  L6-8:{}  L9+:{}",
-                    lod_total, lod_exits[0], lod_exits[1], lod_exits[2], lod_exits[3],
-                );
-            } else {
-                eprintln!("[lod exits] 0  — LOD disabled, or no branches had prefilter attrs at cutoff levels");
-            }
-            if surfnet_reconstructions > 0 {
-                let pct_boundary = 100.0 * surfnet_boundary_clips as f64
-                    / surfnet_reconstructions as f64;
-                let pct_degen = 100.0 * surfnet_degenerate as f64
-                    / surfnet_reconstructions as f64;
-                eprintln!(
-                    "[surfnet] {} recon  {:.0}% at brick boundary  {:.1}% degenerate → baked fallback",
-                    surfnet_reconstructions, pct_boundary, pct_degen,
-                );
-            }
-            // skin_entries counts `march_object_skinned` calls (one
-            // per skinned object per pixel that passes AABB cull).
-            // skin_hits is how many of those landed a leaf; the ratio
-            // tells us whether the bone field is covering the mesh or
-            // whether we're sampling empty cells.
-            let skip_total = skin_brick_skips + skin_brick_samples;
-            let skip_pct = if skip_total > 0 {
-                100.0 * skin_brick_skips as f64 / skip_total as f64
-            } else { 0.0 };
-            eprintln!(
-                "[skin march] entries={}  hits={}  bone-field pop reads={}  brick skips={} samples={} ({:.1}% skipped)",
-                skin_entries, skin_hits, skin_cell_reads,
-                skin_brick_skips, skin_brick_samples, skip_pct,
-            );
-
-            // Per-buffer byte traffic per frame. Octree reads come from the
-            // depth histograms; other buffers have direct atomic counters.
-            let octree_reads = phase_node_reads(surface) + phase_node_reads(normal) + phase_node_reads(shadow);
-            let mb = |bytes: u64| -> f64 { bytes as f64 / (1024.0 * 1024.0) };
-            // Each octree slot now holds `vec2<u32>` (node value + prefilter id)
-            // → 8 B per slot. Even when LOD is off, the `.y` lane ends up in the
-            // same cache line, so we count the full 8 B per read.
-            let octree_bytes     = octree_reads       * 8;  // 8 B per node (vec2<u32>)
-            let leaf_attr_bytes  = leaf_attr_reads    * 8;  // LeafAttr = 8 B
-            let voxel_bytes      = voxel_pool_reads   * 8;  // VoxelSample = 8 B
-            let color_bytes      = color_pool_reads   * 4;  // packed color u32
-            let materials_bytes  = materials_reads    * 32; // GpuMaterial ~32 B
-            let total_bytes      = octree_bytes + leaf_attr_bytes + voxel_bytes + color_bytes + materials_bytes;
-            eprintln!(
-                "[bandwidth/frame] octree {:>6.1}M reads {:>6.1} MiB  leaf_attr {:>6.1}M {:>6.1} MiB  voxel {:>6.1}M {:>6.1} MiB  color {:>6.1}M {:>5.1} MiB  mat {:>6.1}M {:>6.1} MiB",
-                octree_reads as f64 / 1e6, mb(octree_bytes),
-                leaf_attr_reads as f64 / 1e6, mb(leaf_attr_bytes),
-                voxel_pool_reads as f64 / 1e6, mb(voxel_bytes),
-                color_pool_reads as f64 / 1e6, mb(color_bytes),
-                materials_reads as f64 / 1e6, mb(materials_bytes),
-            );
-            eprintln!(
-                "[bandwidth/frame] total {:.1} MiB (at 60 fps → {:.1} GB/s if uncached)",
-                mb(total_bytes), (total_bytes as f64 * 60.0) / 1e9,
-            );
-            drop(data);
-            self.stats_readback.unmap();
-        }
-    }
+    // NOTE: the march shader writes verbose per-frame counters
+    // (descent histograms, bandwidth tallies, skin-march probe) into
+    // `stats_buffer`; they used to be blocking-read and eprintln'd
+    // here every 60 frames. That log has been retired in favor of the
+    // engine-side `ProfilingHistory`. The GPU scaffolding (stats
+    // buffer + clear/copy) is still wired so the shader keeps
+    // compiling; a future change will route these counters through
+    // async readback into `ProfilingHistory::counters` for the panel
+    // and MCP.
 
     /// Update params and dispatch the march.
     pub fn dispatch(
@@ -528,23 +435,6 @@ mod tests {
         );
         v.validate(&module).unwrap_or_else(|e| panic!("validation error: {e:?}"));
     }
-}
-
-/// Render a 12-bucket histogram as "L0:N L1:N ... L11:N", skipping empty tail buckets.
-fn format_histogram(h: &[u32]) -> String {
-    let last_nonzero = h.iter().rposition(|&x| x > 0).unwrap_or(0);
-    let mut s = String::new();
-    for (i, &v) in h.iter().take(last_nonzero + 1).enumerate() {
-        if !s.is_empty() { s.push(' '); }
-        if v >= 1_000_000 {
-            s.push_str(&format!("L{}:{:.1}M", i, v as f32 / 1_000_000.0));
-        } else if v >= 1_000 {
-            s.push_str(&format!("L{}:{}k", i, v / 1_000));
-        } else {
-            s.push_str(&format!("L{}:{}", i, v));
-        }
-    }
-    s
 }
 
 fn bgl_storage_tex(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGroupLayoutEntry {

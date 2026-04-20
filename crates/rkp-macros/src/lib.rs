@@ -15,7 +15,10 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, DeriveInput, Data, Fields, Lit, Meta, Expr, ItemFn};
+use syn::{
+    parse::{Parse, ParseStream},
+    parse_macro_input, Data, DeriveInput, Expr, Fields, Ident, ItemFn, Lit, LitStr, Meta, Token,
+};
 
 /// Classify a Rust type to a FieldType variant name.
 fn classify_type(ty: &syn::Type) -> &'static str {
@@ -393,4 +396,157 @@ fn extract_string_list(attr: &str, key: &str) -> Vec<String> {
         .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+// ── #[rkp_generator] ────────────────────────────────────────────────────
+
+/// Register a generator function for automatic discovery.
+///
+/// # Usage
+///
+/// ```ignore
+/// use rkp_engine::{rkp_component, rkp_generator};
+/// use rkp_engine::generator::{GeneratorContext, GeneratorError};
+///
+/// #[rkp_component]
+/// #[derive(Debug, Clone, Serialize, Deserialize)]
+/// pub struct RockParams {
+///     #[range(0.1, 5.0)]
+///     pub radius: f32,
+/// }
+///
+/// impl Default for RockParams {
+///     fn default() -> Self { Self { radius: 1.0 } }
+/// }
+///
+/// #[rkp_generator(name = "rock", params = RockParams)]
+/// fn generate_rock(
+///     params: &RockParams,
+///     ctx: &mut GeneratorContext,
+/// ) -> Result<(), GeneratorError> {
+///     // Build voxels, call ctx.emit_child(...), etc.
+///     Ok(())
+/// }
+/// ```
+///
+/// # Attributes
+///
+/// - `name = "..."` — unique generator name (required)
+/// - `params = XParams` — param component struct (required).
+///   Must be a `#[rkp_component]` with `Default + Clone`.
+struct GeneratorAttrs {
+    name: LitStr,
+    params: Ident,
+}
+
+impl Parse for GeneratorAttrs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut name: Option<LitStr> = None;
+        let mut params: Option<Ident> = None;
+
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "name" => name = Some(input.parse()?),
+                "params" => params = Some(input.parse()?),
+                other => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!("unknown rkp_generator attribute '{other}' — expected `name` or `params`"),
+                    ));
+                }
+            }
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+
+        let name = name.ok_or_else(|| {
+            syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "#[rkp_generator] requires `name = \"...\"`",
+            )
+        })?;
+        let params = params.ok_or_else(|| {
+            syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "#[rkp_generator] requires `params = XParams`",
+            )
+        })?;
+        Ok(GeneratorAttrs { name, params })
+    }
+}
+
+#[proc_macro_attribute]
+pub fn rkp_generator(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attrs = parse_macro_input!(attr as GeneratorAttrs);
+    let func = parse_macro_input!(item as ItemFn);
+
+    let fn_name = &func.sig.ident;
+    let gen_name = &attrs.name;
+    let param_type = &attrs.params;
+    let param_type_str = param_type.to_string();
+
+    let erased_fn_name = format_ident!("__rkp_gen_{}_erased", fn_name);
+    let clone_params_fn_name = format_ident!("__rkp_gen_{}_clone_params", fn_name);
+    let insert_default_fn_name = format_ident!("__rkp_gen_{}_insert_default", fn_name);
+
+    let output = quote! {
+        #func
+
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        fn #erased_fn_name<'w>(
+            params: &dyn ::std::any::Any,
+            ctx: &mut rkp_engine::generator::GeneratorContext<'w>,
+        ) -> ::std::result::Result<
+            (),
+            rkp_engine::generator::GeneratorError,
+        > {
+            let params = params.downcast_ref::<#param_type>().unwrap_or_else(|| {
+                panic!(
+                    "rkp_generator '{}': param type mismatch — expected {}, got {:?}",
+                    #gen_name,
+                    #param_type_str,
+                    params.type_id(),
+                )
+            });
+            #fn_name(params, ctx)
+        }
+
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        fn #clone_params_fn_name(
+            world: &hecs::World,
+            entity: hecs::Entity,
+        ) -> ::std::option::Option<::std::boxed::Box<dyn ::std::any::Any + Send>> {
+            world.get::<&#param_type>(entity)
+                .ok()
+                .map(|p| ::std::boxed::Box::new((*p).clone())
+                    as ::std::boxed::Box<dyn ::std::any::Any + Send>)
+        }
+
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        fn #insert_default_fn_name(
+            world: &mut hecs::World,
+            entity: hecs::Entity,
+        ) {
+            let _ = world.insert_one(entity, <#param_type as ::std::default::Default>::default());
+        }
+
+        inventory::submit! {
+            rkp_engine::generator::GeneratorEntry {
+                name: #gen_name,
+                param_component_name: #param_type_str,
+                param_type_id: ::std::any::TypeId::of::<#param_type>(),
+                generate_fn: #erased_fn_name,
+                clone_params: #clone_params_fn_name,
+                insert_default_params: #insert_default_fn_name,
+            }
+        }
+    };
+
+    output.into()
 }

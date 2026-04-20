@@ -1,6 +1,9 @@
-//! Models panel — lists available .rkp model files.
+//! Models panel — lists available .rkp model files and registered
+//! generators.
 //!
-//! Drag a model from this list onto the viewport to place it in the scene.
+//! Drag a model onto the viewport to place it in the scene. Click a
+//! generator to spawn it. (Drag-preview UX for generators is a future
+//! polish item.)
 
 use rinch::prelude::*;
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
@@ -16,6 +19,8 @@ pub fn ModelsPanel() -> NodeHandle {
     rsx! {
         div {
             style: "display:flex;flex-direction:column;height:100%;overflow-y:auto;",
+
+            // ── Models section ──────────────────────────────────
             for model in store.available_models.get() {
                 ModelItem {
                     key: model.path.clone(),
@@ -26,6 +31,36 @@ pub fn ModelsPanel() -> NodeHandle {
                 div {
                     style: "padding:12px;color:#666;font-size:12px;font-style:italic;",
                     {"No .rkp models found in project assets/"}
+                }
+            }
+
+            // ── Generators section ─────────────────────────────
+            // Only shown when at least one is registered (via the
+            // gameplay dylib). Separator header makes the list scope
+            // obvious in a mixed panel.
+            if !store.available_generators.get().is_empty()
+                || !store.available_generator_presets.get().is_empty()
+            {
+                div {
+                    style: "padding:6px 8px;margin-top:4px;border-top:1px solid #2d2d30;\
+                            color:#888;font-size:10px;text-transform:uppercase;letter-spacing:0.05em;",
+                    {"Generators"}
+                }
+                // Presets first — they're the "ready-to-go" curated
+                // entries; bare generators below are the raw types.
+                for preset in store.available_generator_presets.get() {
+                    GeneratorPresetItem {
+                        key: preset.path.clone(),
+                        path: preset.path.clone(),
+                        display_name: preset.display_name.clone(),
+                        generator_name: preset.generator_name.clone(),
+                    }
+                }
+                for name in store.available_generators.get() {
+                    GeneratorItem {
+                        key: name.clone(),
+                        name: name.clone(),
+                    }
                 }
             }
         }
@@ -86,6 +121,82 @@ fn ModelItem(model: ModelInfo) -> NodeHandle {
             }
             span { style: "color:#666;font-size:10px;flex-shrink:0;",
                 {size_str}
+            }
+        }
+    }
+}
+
+/// A single registered generator. Click to spawn at the default
+/// location (3m in front of the camera). A future polish pass can
+/// wire drag-to-place; for now the click path is enough to exercise
+/// every generator the dylib registers.
+#[component]
+fn GeneratorItem(name: String) -> NodeHandle {
+    let cmd = use_context::<CommandSender>();
+    let click_name = name.clone();
+
+    rsx! {
+        div {
+            style: "display:flex;align-items:center;gap:8px;padding:4px 8px;\
+                    cursor:pointer;font-size:12px;color:#ccc;",
+            onclick: {
+                let cmd = cmd.clone();
+                move || {
+                    let _ = cmd.0.send(rkp_engine::EngineCommand::SpawnGenerator {
+                        generator_name: click_name.clone(),
+                    });
+                }
+            },
+            span {
+                style: "width:16px;height:16px;display:inline-flex;\
+                        align-items:center;justify-content:center;flex-shrink:0;color:#c09060;",
+                {render_tabler_icon(__scope, TablerIcon::Sparkles, TablerIconStyle::Outline)}
+            }
+            span { style: "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
+                {name}
+            }
+            span { style: "color:#666;font-size:10px;flex-shrink:0;",
+                {"generator"}
+            }
+        }
+    }
+}
+
+/// A `.rkgen` preset row. Click spawns the generator with the
+/// preset's overrides applied.
+#[component]
+fn GeneratorPresetItem(
+    path: String,
+    display_name: String,
+    generator_name: String,
+) -> NodeHandle {
+    let cmd = use_context::<CommandSender>();
+    let click_path = path.clone();
+    let label = format!("{display_name}");
+    let type_label = format!("{generator_name} preset");
+
+    rsx! {
+        div {
+            style: "display:flex;align-items:center;gap:8px;padding:4px 8px;\
+                    cursor:pointer;font-size:12px;color:#ccc;",
+            onclick: {
+                let cmd = cmd.clone();
+                move || {
+                    let _ = cmd.0.send(rkp_engine::EngineCommand::SpawnGeneratorPreset {
+                        path: click_path.clone(),
+                    });
+                }
+            },
+            span {
+                style: "width:16px;height:16px;display:inline-flex;\
+                        align-items:center;justify-content:center;flex-shrink:0;color:#80a0c0;",
+                {render_tabler_icon(__scope, TablerIcon::Package, TablerIconStyle::Outline)}
+            }
+            span { style: "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
+                {label}
+            }
+            span { style: "color:#666;font-size:10px;flex-shrink:0;",
+                {type_label}
             }
         }
     }
