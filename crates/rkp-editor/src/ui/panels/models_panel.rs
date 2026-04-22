@@ -126,19 +126,20 @@ fn ModelItem(model: ModelInfo) -> NodeHandle {
     }
 }
 
-/// A single registered generator. Click to spawn at the default
-/// location (3m in front of the camera). A future polish pass can
-/// wire drag-to-place; for now the click path is enough to exercise
-/// every generator the dylib registers.
+/// A single registered generator. Click spawns it 3m in front of the
+/// camera; drag-and-drop starts a live preview (see `viewport.rs`'s
+/// `DragEnter/Over/Drop` handlers and `EngineCommand::DragPreview*`).
 #[component]
 fn GeneratorItem(name: String) -> NodeHandle {
+    let store = use_context::<EditorStore>();
     let cmd = use_context::<CommandSender>();
     let click_name = name.clone();
+    let drag_name = name.clone();
 
     rsx! {
         div {
             style: "display:flex;align-items:center;gap:8px;padding:4px 8px;\
-                    cursor:pointer;font-size:12px;color:#ccc;",
+                    cursor:grab;font-size:12px;color:#ccc;",
             onclick: {
                 let cmd = cmd.clone();
                 move || {
@@ -147,6 +148,12 @@ fn GeneratorItem(name: String) -> NodeHandle {
                     });
                 }
             },
+            draggable: "true",
+            ondragstart: {
+                let n = drag_name.clone();
+                move || { store.generator_drag.set(Some(n.clone())); }
+            },
+            ondragend: move || { store.generator_drag.set(None); },
             span {
                 style: "width:16px;height:16px;display:inline-flex;\
                         align-items:center;justify-content:center;flex-shrink:0;color:#c09060;",
@@ -162,23 +169,26 @@ fn GeneratorItem(name: String) -> NodeHandle {
     }
 }
 
-/// A `.rkgen` preset row. Click spawns the generator with the
-/// preset's overrides applied.
+/// A `.rkgen` preset row. Click spawns the generator (3m in front of
+/// camera) with the preset's overrides applied; drag-and-drop spawns
+/// it at the drop pixel's surface point.
 #[component]
 fn GeneratorPresetItem(
     path: String,
     display_name: String,
     generator_name: String,
 ) -> NodeHandle {
+    let store = use_context::<EditorStore>();
     let cmd = use_context::<CommandSender>();
     let click_path = path.clone();
+    let drag_path = path.clone();
     let label = format!("{display_name}");
     let type_label = format!("{generator_name} preset");
 
     rsx! {
         div {
             style: "display:flex;align-items:center;gap:8px;padding:4px 8px;\
-                    cursor:pointer;font-size:12px;color:#ccc;",
+                    cursor:grab;font-size:12px;color:#ccc;",
             onclick: {
                 let cmd = cmd.clone();
                 move || {
@@ -187,6 +197,12 @@ fn GeneratorPresetItem(
                     });
                 }
             },
+            draggable: "true",
+            ondragstart: {
+                let p = drag_path.clone();
+                move || { store.generator_preset_drag.set(Some(p.clone())); }
+            },
+            ondragend: move || { store.generator_preset_drag.set(None); },
             span {
                 style: "width:16px;height:16px;display:inline-flex;\
                         align-items:center;justify-content:center;flex-shrink:0;color:#80a0c0;",

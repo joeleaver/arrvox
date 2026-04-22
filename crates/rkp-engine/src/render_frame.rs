@@ -297,6 +297,11 @@ pub struct PickResult {
     /// For `Material`: `[packed_r, packed_g]` of the gbuf_material pixel.
     /// For `ProceduralNode`: `[primitive_node_id, 0]`.
     pub raw_payload: [u32; 2],
+    /// World-space surface position sampled from `gbuf_position` at the
+    /// pick pixel. `None` when the ray missed geometry (the shader
+    /// writes `hit_distance = 1e10` for misses, which we filter out
+    /// here). Used by drag-drop to snap spawns onto geometry.
+    pub position: Option<Vec3>,
 }
 
 /// One-time render-thread spawn args.

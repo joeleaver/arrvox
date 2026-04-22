@@ -138,14 +138,20 @@ pub fn Viewport() -> NodeHandle {
                     let _ = cmd_tx.send(rkp_engine::EngineCommand::KeyUp { key });
                 }
             }
-            Drop { x, y } => {
-                // Model drag-and-drop: place model at drop position.
-                if let Some(model_path) = store.model_drag.get() {
-                    let _ = cmd_tx.send(rkp_engine::EngineCommand::LoadAsset {
-                        path: model_path,
-                        position: glam::Vec3::ZERO, // TODO: raycast to ground plane
-                    });
+            Drop { .. } => {
+                // Any of the three drag sources (model / generator /
+                // preset) spawned a live preview on DragEnter and kept
+                // it chasing the cursor. Commit retires the preview so
+                // the entity stops tracking further picks and stays
+                // where it last landed.
+                let had_preview_drag = store.model_drag.get().is_some()
+                    || store.generator_drag.get().is_some()
+                    || store.generator_preset_drag.get().is_some();
+                if had_preview_drag {
+                    let _ = cmd_tx.send(rkp_engine::EngineCommand::DragPreviewCommit);
                     store.model_drag.set(None);
+                    store.generator_drag.set(None);
+                    store.generator_preset_drag.set(None);
                 }
                 // Material drag-and-drop: assign to selected entity.
                 if let Some(mat_id) = store.material_drag.get() {
@@ -158,8 +164,60 @@ pub fn Viewport() -> NodeHandle {
                     store.material_drag.set(None);
                 }
             }
-            DragEnter { .. } | DragOver { .. } | DragLeave => {
-                // Accept model drags silently.
+            DragEnter { x, y } => {
+                let px = (x as i32).max(0) as u32;
+                let py = (y as i32).max(0) as u32;
+                // Pick the first drag source that's active. Only one
+                // of these can be set at a time (ondragstart sets one).
+                let source = if let Some(path) = store.model_drag.get() {
+                    Some(rkp_engine::DragPreviewSource::Asset { path })
+                } else if let Some(name) = store.generator_drag.get() {
+                    Some(rkp_engine::DragPreviewSource::Generator { name })
+                } else if let Some(path) = store.generator_preset_drag.get() {
+                    Some(rkp_engine::DragPreviewSource::GeneratorPreset { path })
+                } else {
+                    None
+                };
+                if let Some(source) = source {
+                    // Hide rinch's built-in HTML drag ghost — the 3D
+                    // preview in the viewport is the authoritative
+                    // visual while the cursor is over this surface.
+                    // Restored on DragLeave (which fires both when the
+                    // cursor exits and after a successful Drop).
+                    rinch::prelude::suppress_drag_ghost();
+                    let _ = cmd_tx.send(rkp_engine::EngineCommand::DragPreviewEnter {
+                        id: PANEL_VIEWPORT,
+                        source,
+                        x: px, y: py,
+                    });
+                }
+            }
+            DragOver { x, y } => {
+                let any_active = store.model_drag.get().is_some()
+                    || store.generator_drag.get().is_some()
+                    || store.generator_preset_drag.get().is_some();
+                if any_active {
+                    let _ = cmd_tx.send(rkp_engine::EngineCommand::DragPreviewOver {
+                        id: PANEL_VIEWPORT,
+                        x: (x as i32).max(0) as u32,
+                        y: (y as i32).max(0) as u32,
+                    });
+                }
+            }
+            DragLeave => {
+                // `DragLeave` also fires after a successful `Drop`. The
+                // Drop handler clears every drag signal, so on a valid
+                // drop none of these checks pass and cancel is skipped.
+                // A true drag-out-without-drop still has the signal set
+                // and aborts the preview.
+                let any_active = store.model_drag.get().is_some()
+                    || store.generator_drag.get().is_some()
+                    || store.generator_preset_drag.get().is_some();
+                if any_active {
+                    let _ = cmd_tx.send(rkp_engine::EngineCommand::DragPreviewCancel);
+                }
+                // Restore the HTML ghost either way (see DragEnter).
+                rinch::prelude::restore_drag_ghost();
             }
             _ => {}
         }

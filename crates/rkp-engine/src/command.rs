@@ -56,6 +56,25 @@ pub enum EngineCommand {
         path: String,
     },
 
+    /// Drop a generator at a viewport pixel. Drag-and-drop variant of
+    /// `SpawnGenerator` — the engine issues a position-readback pick
+    /// and spawns at the hit point (ground-plane fallback on sky).
+    DropGenerator {
+        id: ViewportId,
+        generator_name: String,
+        x: u32,
+        y: u32,
+    },
+
+    /// Drop a `.rkgen` preset at a viewport pixel. Drag-and-drop
+    /// variant of `SpawnGeneratorPreset`.
+    DropGeneratorPreset {
+        id: ViewportId,
+        path: String,
+        x: u32,
+        y: u32,
+    },
+
     /// Place an imported model at the camera position.
     PlaceModel {
         asset_path: String,
@@ -356,6 +375,50 @@ pub enum EngineCommand {
         position: Vec3,
     },
 
+    /// Drop an .rkp asset at a viewport pixel. The engine issues a
+    /// position-readback pick and spawns the asset at the hit point
+    /// (ground plane Y=0 fallback if the ray missed geometry). The
+    /// asset's AABB bottom is snapped onto the surface.
+    DropAsset {
+        id: ViewportId,
+        path: String,
+        x: u32,
+        y: u32,
+    },
+
+    /// Begin a live drag-preview. Spawns the appropriate kind of
+    /// scene object (asset, generator, or preset) as a preview and
+    /// starts position-tracking the cursor via continuous pick
+    /// readbacks. The preview follows the drop pixel's surface snap
+    /// until `DragPreviewCommit` (drop) or `DragPreviewCancel`
+    /// (dragleave). Source identifies what's being dragged; the engine
+    /// dispatches on it to spawn the right entity type.
+    DragPreviewEnter {
+        id: ViewportId,
+        source: DragPreviewSource,
+        x: u32,
+        y: u32,
+    },
+
+    /// Update the drag preview's target pixel. Fires on every `dragover`
+    /// event; the engine coalesces these to one pick readback per frame
+    /// via the existing `pending_pick` → `pick_in_flight` gate.
+    DragPreviewOver {
+        id: ViewportId,
+        x: u32,
+        y: u32,
+    },
+
+    /// Finalize the drag preview in-place — the preview stays wherever
+    /// the last pick result placed it. No-op if no preview is active.
+    DragPreviewCommit,
+
+    /// Abort the drag preview: despawn the preview entity (and any
+    /// generator-owned children) and clear drag state. No-op if no
+    /// preview is active (so the `DragLeave` that fires after every
+    /// `Drop` doesn't resurrect stale state).
+    DragPreviewCancel,
+
     /// Create a new project at the given path.
     NewProject {
         path: String,
@@ -548,4 +611,18 @@ pub enum PaintMode {
     Color,
     Material,
     Erase,
+}
+
+/// What's being dragged into the viewport for a live preview. The
+/// engine picks the spawn + snap rules based on this (models have a
+/// known AABB so we bottom-snap; generators bake asynchronously and
+/// use the raw surface position with child-tracking for self-hit).
+#[derive(Debug, Clone)]
+pub enum DragPreviewSource {
+    /// `.rkp` asset file.
+    Asset { path: String },
+    /// Bare generator registered by the gameplay dylib.
+    Generator { name: String },
+    /// `.rkgen` preset on disk — loads a generator + overrides.
+    GeneratorPreset { path: String },
 }

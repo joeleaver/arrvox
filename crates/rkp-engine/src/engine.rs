@@ -371,6 +371,74 @@ struct PendingPick {
     ghost_pick_node_id: Option<u32>,
 }
 
+/// A queued drag-drop action awaiting the position-readback result from
+/// the pick pipeline. When the matching `PickResult` returns with a
+/// world-space position, `process_pick_result` consumes this instead of
+/// running the usual selection update — the drop spawns the asset /
+/// generator / preset at the hit point (or ground-plane fallback).
+///
+/// We reuse the pick pipeline (instead of adding a separate
+/// position-readback route) because it already handles the
+/// async-one-frame-later readback timing and we only need a single
+/// coordinate query per drop.
+#[derive(Debug, Clone)]
+enum PendingDropAction {
+    Asset { path: String },
+    Generator { name: String },
+    GeneratorPreset { path: String },
+}
+
+#[derive(Debug, Clone)]
+struct PendingDrop {
+    viewport: crate::viewport::ViewportId,
+    /// The screen pixel that was dropped on. Used to cast a ground-plane
+    /// fallback ray when the pick result's `position` is `None` (sky hit).
+    x: u32,
+    y: u32,
+    action: PendingDropAction,
+}
+
+/// A live drag-and-drop preview. While active, each `DragPreviewOver`
+/// (re)sets the pending pick at the cursor pixel. What happens when
+/// the pick result arrives depends on `kind`:
+///
+/// * **Model** — a real asset entity is already spawned; its transform
+///   gets updated to the new surface snap (AABB-bottom-snapped).
+/// * **Generator** — nothing is spawned yet. A wireframe AABB gizmo is
+///   drawn at the cached position every frame; on commit we spawn the
+///   real generator there. Baking a live generator while the user
+///   drags would produce a trail of stale children at each emit
+///   position.
+#[derive(Debug, Clone)]
+struct DragPreviewState {
+    viewport: crate::viewport::ViewportId,
+    kind: DragPreviewKind,
+    /// Most recent valid surface hit. Reused when the next pick returns
+    /// a sky miss or a self-hit to avoid flickering to the ground plane.
+    last_surface_pos: Option<glam::Vec3>,
+    /// Last pixel the editor asked us to preview at. Used to cast the
+    /// ground-plane fallback ray when we never got a valid surface hit.
+    last_cursor: (u32, u32),
+}
+
+#[derive(Debug, Clone)]
+enum DragPreviewKind {
+    /// An .rkp asset — spawned as a real entity on DragEnter that
+    /// tracks the cursor. Surface hits are bottom-snapped by
+    /// subtracting `aabb_min_y` from the hit Y.
+    Model {
+        entity: hecs::Entity,
+        aabb_min_y: f32,
+    },
+    /// A generator or preset — NO entity is spawned during drag. Just
+    /// a gizmo wireframe (half-size `gizmo_half`) centered at
+    /// `last_surface_pos`. On commit we spawn the real source.
+    Generator {
+        source: crate::command::DragPreviewSource,
+        gizmo_half: glam::Vec3,
+    },
+}
+
 struct EngineState {
     /// Render thread handle. Owns the wgpu device/queue/renderer/
     /// viewport renderers; sim communicates only via `render_worker.inbox`
@@ -715,6 +783,15 @@ struct EngineState {
     /// returns the raw payload via `RenderResult::pick_result`; sim
     /// resolves the final entity / NodeId in `process_pick_result`.
     pending_pick: Option<PendingPick>,
+    /// Queued drag-drop. Populated on `DropAsset` / `DropGenerator` /
+    /// `DropGeneratorPreset`; consumed when the paired pick readback
+    /// returns with a world-space position.
+    pending_drop: Option<PendingDrop>,
+    /// Active drag-preview: the preview entity + cached AABB offset +
+    /// last-known-good surface pos. Populated on `DragAssetEnter`, kept
+    /// up-to-date by pick readbacks during `DragAssetOver`, cleared on
+    /// commit or cancel.
+    drag_preview: Option<DragPreviewState>,
     /// Cached light count for march pass (set in light upload block, used in render).
     num_lights_cache: u32,
     /// Base ShadeParams (recomputed once per frame from environment +
@@ -925,6 +1002,8 @@ impl EngineState {
             proc_gizmo_initial_local: (glam::Vec3::ZERO, glam::Quat::IDENTITY, glam::Vec3::ONE),
             mouse_pos: glam::Vec2::ZERO,
             pending_pick: None,
+            pending_drop: None,
+            drag_preview: None,
             num_lights_cache: 1,
             shade_params_base: rkp_render::rkp_shade::ShadeParams::default(),
             lod_enabled: true,
@@ -1637,6 +1716,86 @@ impl EngineState {
         // brand-new click later will set `pending_pick` again.
         self.pending_pick = None;
 
+        // Drop-on-geometry: if a drag-drop is queued for this viewport,
+        // consume it instead of running selection. The pick was issued
+        // purely to get the world-space surface position at the drop
+        // pixel; selection should not change from a drop.
+        if let Some(drop) = self.pending_drop.as_ref() {
+            if drop.viewport == pr.viewport {
+                let drop = self.pending_drop.take().unwrap();
+                self.handle_drop(drop, pr.position);
+                self.in_flight_pick_ghost = None;
+                return;
+            }
+        }
+
+        // Drag-preview: move the preview to the freshest surface snap.
+        // Skip the selection path entirely — picks issued while
+        // dragging are purely for positioning.
+        if let Some(preview) = self.drag_preview.as_ref() {
+            if preview.viewport == pr.viewport {
+                let kind = preview.kind.clone();
+                let (cx, cy) = preview.last_cursor;
+                let vp = preview.viewport;
+
+                // Self-hit detection only matters for the model path —
+                // generators have nothing spawned yet to self-hit. For
+                // models, ignore picks that land on the preview entity.
+                let hit_obj_raw = ((pr.raw_payload[1] >> 8) & 0xFF) as usize;
+                let hit_gpu_idx = if hit_obj_raw > 0 { Some(hit_obj_raw - 1) } else { None };
+                let hit_self = match &kind {
+                    DragPreviewKind::Model { entity, .. } => {
+                        hit_gpu_idx.is_some_and(|idx| {
+                            self.entity_to_gpu.get(entity).copied() == Some(idx)
+                        })
+                    }
+                    DragPreviewKind::Generator { .. } => false,
+                };
+
+                // Resolve target world position:
+                //   1. Valid surface hit (not self) → use it, cache it.
+                //   2. Self-hit or sky miss with a cached pos → keep that.
+                //   3. No cache yet → ground-plane ray at the cursor.
+                let new_pos = if let Some(hit) = pr.position.filter(|_| !hit_self) {
+                    self.drag_preview.as_mut().unwrap().last_surface_pos = Some(hit);
+                    Some(hit)
+                } else if let Some(cached) = self.drag_preview.as_ref()
+                    .and_then(|p| p.last_surface_pos)
+                {
+                    Some(cached)
+                } else {
+                    let (ro, rd) = self.screen_to_ray_for_viewport(vp, cx as f32, cy as f32);
+                    if rd.y.abs() > 1e-6 {
+                        let t = -ro.y / rd.y;
+                        if t > 0.0 { Some(ro + rd * t) } else { None }
+                    } else { None }
+                };
+
+                if let Some(p) = new_pos {
+                    match kind {
+                        DragPreviewKind::Model { entity, aabb_min_y } => {
+                            // Bottom-snap the asset so its feet sit on
+                            // the surface under the cursor.
+                            if let Ok(mut t) = self.world
+                                .get::<&mut crate::components::Transform>(entity)
+                            {
+                                t.position = glam::Vec3::new(p.x, p.y - aabb_min_y, p.z);
+                            }
+                            self.gpu_objects_dirty = true;
+                        }
+                        DragPreviewKind::Generator { .. } => {
+                            // Gizmo-only — `last_surface_pos` is the
+                            // whole state. Update and redraw at frame
+                            // start via `build_gizmo_wireframe`.
+                            self.drag_preview.as_mut().unwrap().last_surface_pos = Some(p);
+                        }
+                    }
+                }
+                self.in_flight_pick_ghost = None;
+                return;
+            }
+        }
+
         match pr.kind {
             PickKind::ProceduralNode => {
                 // Ghost priority: if the CPU raycast at click time
@@ -1674,6 +1833,51 @@ impl EngineState {
                 // never hit ghost-primitive priority.
                 self.in_flight_pick_ghost = None;
                 let _ = ViewportId::MAIN;
+            }
+        }
+    }
+
+    /// Apply a queued drop. `surface_pos` is `Some(hit)` when the pick
+    /// readback sampled valid geometry (hit_distance < 1e9); otherwise
+    /// we cast a ray through the drop pixel and intersect the Y=0
+    /// ground plane as a fallback. If that ray also misses (looking
+    /// up, no floor), log and skip — no silent spawn at the origin.
+    fn handle_drop(&mut self, drop: PendingDrop, surface_pos: Option<glam::Vec3>) {
+        let pos = if let Some(p) = surface_pos {
+            p
+        } else {
+            let (ray_o, ray_d) = self.screen_to_ray_for_viewport(
+                drop.viewport, drop.x as f32, drop.y as f32,
+            );
+            // Ground plane at y=0. `t > 0` means "plane is ahead of
+            // the camera along the ray"; negative t (looking up) is a
+            // miss.
+            if ray_d.y.abs() > 1e-6 {
+                let t = -ray_o.y / ray_d.y;
+                if t > 0.0 {
+                    ray_o + ray_d * t
+                } else {
+                    self.console.warn(format!(
+                        "Drop missed geometry and the ground plane is behind the camera — skipping."
+                    ));
+                    return;
+                }
+            } else {
+                self.console.warn(format!(
+                    "Drop ray parallel to ground plane — skipping."
+                ));
+                return;
+            }
+        };
+        match drop.action {
+            PendingDropAction::Asset { path } => {
+                self.spawn_asset(&path, pos);
+            }
+            PendingDropAction::Generator { name } => {
+                self.spawn_generator(&name, Some(pos));
+            }
+            PendingDropAction::GeneratorPreset { path } => {
+                self.spawn_generator_preset(&path, Some(pos));
             }
         }
     }
@@ -2621,69 +2825,176 @@ impl EngineState {
             }
 
             EngineCommand::SpawnGenerator { generator_name } => {
-                use crate::components::*;
-                if let Some(entry) = self.generator_system.registry().get(&generator_name) {
-                    let name = self.unique_name(&generator_name);
-                    let mut transform = Transform::default();
-                    transform.position = self.camera.position + glam::Vec3::new(0.0, 0.0, -3.0);
-                    let entity = self.world.spawn((
-                        transform,
-                        EditorMetadata { name: name.clone() },
-                        crate::generator::GeneratorState::new(&generator_name),
-                    ));
-                    // Insert the params component via the macro-generated helper.
-                    (entry.insert_default_params)(&mut self.world, entity);
-                    self.assign_entity_uuid(entity);
-                    self.scene_dirty = true;
-                    self.console.info(format!("Spawned generator '{name}'"));
-                } else {
-                    self.console.error(format!(
-                        "Unknown generator '{generator_name}' — not registered in gameplay dylib"
-                    ));
-                }
+                self.spawn_generator(&generator_name, None);
             }
 
             EngineCommand::SpawnGeneratorPreset { path } => {
-                self.spawn_generator_preset(&path);
+                self.spawn_generator_preset(&path, None);
             }
 
-            EngineCommand::LoadAsset { path, .. } => {
-                use crate::components::*;
-                let scene_id = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let acquired = self.scene_mgr.lock().unwrap().acquire_asset(&path);
-                match acquired {
-                    Ok((handle, info)) => {
-                        let raw_name = Self::display_name_from_path(&path);
-                        let name = self.unique_name(&raw_name);
-                        // Asset-backed entity — brick_ids stays empty.
-                        // Asset cache owns the shared brick range and frees
-                        // it on the final release_asset.
-                        let spatial = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.grid_origin, info.leaf_attr_slot_start, info.leaf_attr_slot_count, Vec::new());
-                        let entity = self.world.spawn((
-                            Transform::default(),
-                            EditorMetadata { name: name.clone() },
-                            Renderable {
-                                asset_path: Some(path.clone()),
-                                voxel_count: info.voxel_count,
-                                spatial: Some(spatial),
-                                asset_handle: Some(handle),
-                                ..Default::default()
-                            },
-                        ));
-                        self.assign_entity_uuid(entity);
-                        self.entity_scene_ids.insert(entity, scene_id);
-                        // No auto-attach — the user adds `Skeleton`
-                        // manually via the Add Component menu when they
-                        // want animation. Helper below in
-                        // `try_attach_skeleton` is invoked from the
-                        // AddComponent command handler.
-                        self.geometry_dirty = true;
-                        self.scene_dirty = true;
-                        self.gpu_objects_dirty = true;
-                        self.console.info(format!("Loaded '{name}': {} voxels", info.voxel_count));
+            EngineCommand::DropGenerator { id, generator_name, x, y } => {
+                self.pending_drop = Some(PendingDrop {
+                    viewport: id, x, y,
+                    action: PendingDropAction::Generator { name: generator_name },
+                });
+                self.pending_pick = Some(PendingPick {
+                    viewport: id, x, y, ghost_pick_node_id: None,
+                });
+            }
+
+            EngineCommand::DropGeneratorPreset { id, path, x, y } => {
+                self.pending_drop = Some(PendingDrop {
+                    viewport: id, x, y,
+                    action: PendingDropAction::GeneratorPreset { path },
+                });
+                self.pending_pick = Some(PendingPick {
+                    viewport: id, x, y, ghost_pick_node_id: None,
+                });
+            }
+
+            EngineCommand::LoadAsset { path, position } => {
+                self.spawn_asset(&path, position);
+            }
+
+            EngineCommand::DropAsset { id, path, x, y } => {
+                // Drag-drop placement: issue a position-readback pick at
+                // the drop pixel, queue a pending drop, and spawn when
+                // the pick result arrives (process_pick_result handles
+                // it — see `PendingDrop`).
+                self.pending_drop = Some(PendingDrop {
+                    viewport: id, x, y,
+                    action: PendingDropAction::Asset { path },
+                });
+                self.pending_pick = Some(PendingPick {
+                    viewport: id, x, y,
+                    ghost_pick_node_id: None,
+                });
+            }
+
+            EngineCommand::DragPreviewEnter { id, source, x, y } => {
+                // Clean up any orphaned preview from a previous drag
+                // (two DragEnters with no Cancel / Commit between).
+                if let Some(prev) = self.drag_preview.take() {
+                    if let DragPreviewKind::Model { entity, .. } = prev.kind {
+                        self.delete_entity(entity);
                     }
-                    Err(e) => {
-                        self.console.error(format!("Failed to load '{path}': {e}"));
+                }
+                // Initial position: ground-plane raycast at the cursor
+                // so the preview doesn't flash at the origin before the
+                // first pick readback lands. Falls back to 3m in front
+                // of the camera for rays that miss the plane.
+                let provisional = {
+                    let (ro, rd) = self.screen_to_ray_for_viewport(id, x as f32, y as f32);
+                    if rd.y.abs() > 1e-6 {
+                        let t = -ro.y / rd.y;
+                        if t > 0.0 { ro + rd * t }
+                        else { self.camera.position + glam::Vec3::new(0.0, 0.0, -3.0) }
+                    } else {
+                        self.camera.position + glam::Vec3::new(0.0, 0.0, -3.0)
+                    }
+                };
+                let kind = match source {
+                    crate::command::DragPreviewSource::Asset { path } => {
+                        // Models: spawn the real asset now. The first
+                        // pick readback snaps it to the cursor.
+                        match self.spawn_asset_ex(&path, provisional, false) {
+                            Some((entity, aabb_min_y)) => {
+                                Some(DragPreviewKind::Model { entity, aabb_min_y })
+                            }
+                            None => None,
+                        }
+                    }
+                    src @ (crate::command::DragPreviewSource::Generator { .. }
+                        | crate::command::DragPreviewSource::GeneratorPreset { .. }) => {
+                        // Generators: no spawn yet — the real entity
+                        // only materialises on commit. Meanwhile draw a
+                        // 1 m half-extent wireframe box at the cursor.
+                        // We don't know the baked bounds until after a
+                        // run, so a single conservative default beats
+                        // introspecting parameters per-generator.
+                        Some(DragPreviewKind::Generator {
+                            source: src,
+                            gizmo_half: glam::Vec3::splat(0.5),
+                        })
+                    }
+                };
+                if let Some(kind) = kind {
+                    self.drag_preview = Some(DragPreviewState {
+                        viewport: id,
+                        kind,
+                        last_surface_pos: Some(provisional),
+                        last_cursor: (x, y),
+                    });
+                    self.pending_pick = Some(PendingPick {
+                        viewport: id, x, y, ghost_pick_node_id: None,
+                    });
+                }
+            }
+
+            EngineCommand::DragPreviewOver { id, x, y } => {
+                if let Some(preview) = self.drag_preview.as_mut() {
+                    if preview.viewport == id {
+                        preview.last_cursor = (x, y);
+                        // Overwrite any in-flight request with the
+                        // freshest pixel. Render-side `pick_in_flight`
+                        // gate throttles to one readback per frame, so
+                        // newer coords win naturally.
+                        self.pending_pick = Some(PendingPick {
+                            viewport: id, x, y, ghost_pick_node_id: None,
+                        });
+                    }
+                }
+            }
+
+            EngineCommand::DragPreviewCommit => {
+                if let Some(preview) = self.drag_preview.take() {
+                    match preview.kind {
+                        // Models: entity is already live at the final
+                        // position. Just retire the preview state —
+                        // subsequent pick results won't touch it.
+                        DragPreviewKind::Model { .. } => {}
+                        // Generators: now spawn the real source at the
+                        // last-known surface position. Falls back to a
+                        // ground-plane cast at the final cursor pixel
+                        // if no valid surface hit ever landed.
+                        DragPreviewKind::Generator { source, .. } => {
+                            let pos = preview.last_surface_pos.unwrap_or_else(|| {
+                                let (cx, cy) = preview.last_cursor;
+                                let (ro, rd) = self.screen_to_ray_for_viewport(
+                                    preview.viewport, cx as f32, cy as f32,
+                                );
+                                if rd.y.abs() > 1e-6 {
+                                    let t = -ro.y / rd.y;
+                                    if t > 0.0 { ro + rd * t }
+                                    else { self.camera.position + glam::Vec3::new(0.0, 0.0, -3.0) }
+                                } else {
+                                    self.camera.position + glam::Vec3::new(0.0, 0.0, -3.0)
+                                }
+                            });
+                            match source {
+                                crate::command::DragPreviewSource::Generator { name } => {
+                                    self.spawn_generator(&name, Some(pos));
+                                }
+                                crate::command::DragPreviewSource::GeneratorPreset { path } => {
+                                    self.spawn_generator_preset(&path, Some(pos));
+                                }
+                                crate::command::DragPreviewSource::Asset { .. } => {
+                                    // Unreachable — Asset paths produce
+                                    // `DragPreviewKind::Model`, handled
+                                    // above.
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            EngineCommand::DragPreviewCancel => {
+                if let Some(preview) = self.drag_preview.take() {
+                    // Only the model path has a live entity to delete;
+                    // generators never spawned anything during drag.
+                    if let DragPreviewKind::Model { entity, .. } = preview.kind {
+                        self.delete_entity(entity);
                     }
                 }
             }
@@ -4141,6 +4452,64 @@ impl EngineState {
         stem
     }
 
+    /// Spawn an .rkp asset at a world-space position. The passed `pos`
+    /// is interpreted as the surface point the user wants the asset to
+    /// stand on — the asset's AABB bottom is snapped there (i.e.
+    /// `transform.position.y = pos.y - info.aabb.min.y`), matching
+    /// rkifield's drop-on-geometry behaviour.
+    fn spawn_asset(&mut self, path: &str, pos: glam::Vec3) {
+        let _ = self.spawn_asset_ex(path, pos, true);
+    }
+
+    /// Spawn an .rkp asset and return (entity, aabb_min_y) — the latter
+    /// is cached by the drag-preview so every subsequent pick-result
+    /// update can apply the same AABB-bottom snap without reloading
+    /// the asset info. `verbose` gates the console log; drag-preview
+    /// spawns are noisy without it.
+    fn spawn_asset_ex(&mut self, path: &str, pos: glam::Vec3, verbose: bool)
+        -> Option<(hecs::Entity, f32)>
+    {
+        use crate::components::*;
+        let scene_id = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let acquired = self.scene_mgr.lock().unwrap().acquire_asset(path);
+        match acquired {
+            Ok((handle, info)) => {
+                let raw_name = Self::display_name_from_path(path);
+                let name = self.unique_name(&raw_name);
+                let spatial = spatial_from_handle(
+                    &info.spatial, info.voxel_size, &info.aabb, info.grid_origin,
+                    info.leaf_attr_slot_start, info.leaf_attr_slot_count, Vec::new(),
+                );
+                let mut transform = Transform::default();
+                transform.position = glam::Vec3::new(pos.x, pos.y - info.aabb.min.y, pos.z);
+                let entity = self.world.spawn((
+                    transform,
+                    EditorMetadata { name: name.clone() },
+                    Renderable {
+                        asset_path: Some(path.to_string()),
+                        voxel_count: info.voxel_count,
+                        spatial: Some(spatial),
+                        asset_handle: Some(handle),
+                        ..Default::default()
+                    },
+                ));
+                self.assign_entity_uuid(entity);
+                self.entity_scene_ids.insert(entity, scene_id);
+                self.geometry_dirty = true;
+                self.scene_dirty = true;
+                self.gpu_objects_dirty = true;
+                if verbose {
+                    self.console.info(format!("Loaded '{name}': {} voxels", info.voxel_count));
+                }
+                Some((entity, info.aabb.min.y))
+            }
+            Err(e) => {
+                self.console.error(format!("Failed to load '{path}': {e}"));
+                None
+            }
+        }
+    }
+
     /// If a sibling `.rkskel` exists alongside the `.rkp` path, load it
     /// into the animation cache and attach `Skeleton` + a default
     /// paused `AnimationPlayer` to the entity. Missing sidecar is not
@@ -5102,14 +5471,65 @@ impl EngineState {
     /// describes. Param overrides flow through the component
     /// registry's typed `set_field` so partial preset files work —
     /// any field absent from `params` keeps its `Default` value.
-    fn spawn_generator_preset(&mut self, path: &str) {
+    /// Spawn a bare generator (no preset overrides). `pos = None` uses
+    /// the click-path default of 3m in front of the camera; `Some(p)`
+    /// places the generator's origin at `p` (drop-on-geometry path).
+    fn spawn_generator(&mut self, generator_name: &str, pos: Option<glam::Vec3>) {
+        let _ = self.spawn_generator_ex(generator_name, pos, true);
+    }
+
+    /// Spawn helper that returns the entity so drag-preview can track
+    /// it. `verbose` gates the console log — drag-preview spawns are
+    /// transient and shouldn't spam the log on every cancel/recreate.
+    fn spawn_generator_ex(
+        &mut self,
+        generator_name: &str,
+        pos: Option<glam::Vec3>,
+        verbose: bool,
+    ) -> Option<hecs::Entity> {
+        use crate::components::*;
+        let Some(entry) = self.generator_system.registry().get(generator_name) else {
+            self.console.error(format!(
+                "Unknown generator '{generator_name}' — not registered in gameplay dylib"
+            ));
+            return None;
+        };
+        let name = self.unique_name(generator_name);
+        let mut transform = Transform::default();
+        transform.position = pos.unwrap_or_else(|| {
+            self.camera.position + glam::Vec3::new(0.0, 0.0, -3.0)
+        });
+        let entity = self.world.spawn((
+            transform,
+            EditorMetadata { name: name.clone() },
+            crate::generator::GeneratorState::new(generator_name),
+        ));
+        (entry.insert_default_params)(&mut self.world, entity);
+        self.assign_entity_uuid(entity);
+        self.scene_dirty = true;
+        if verbose {
+            self.console.info(format!("Spawned generator '{name}'"));
+        }
+        Some(entity)
+    }
+
+    fn spawn_generator_preset(&mut self, path: &str, pos: Option<glam::Vec3>) {
+        let _ = self.spawn_generator_preset_ex(path, pos, true);
+    }
+
+    fn spawn_generator_preset_ex(
+        &mut self,
+        path: &str,
+        pos: Option<glam::Vec3>,
+        verbose: bool,
+    ) -> Option<hecs::Entity> {
         use crate::components::*;
         let preset_path = std::path::PathBuf::from(path);
         let cfg = match crate::generator::GeneratorAssetConfig::load(&preset_path) {
             Ok(c) => c,
             Err(e) => {
                 self.console.error(format!("Load preset failed: {e}"));
-                return;
+                return None;
             }
         };
         let Some(entry) = self.generator_system.registry().get(&cfg.generator) else {
@@ -5117,11 +5537,13 @@ impl EngineState {
                 "Preset '{}' targets unknown generator '{}'",
                 cfg.name, cfg.generator,
             ));
-            return;
+            return None;
         };
         let display_name = self.unique_name(&cfg.name);
         let mut transform = Transform::default();
-        transform.position = self.camera.position + glam::Vec3::new(0.0, 0.0, -3.0);
+        transform.position = pos.unwrap_or_else(|| {
+            self.camera.position + glam::Vec3::new(0.0, 0.0, -3.0)
+        });
         let entity = self.world.spawn((
             transform,
             EditorMetadata { name: display_name.clone() },
@@ -5159,10 +5581,13 @@ impl EngineState {
         }
         self.assign_entity_uuid(entity);
         self.scene_dirty = true;
-        self.console.info(format!(
-            "Spawned preset '{}' ({}) with {} override(s)",
-            display_name, cfg.generator, cfg.params.len(),
-        ));
+        if verbose {
+            self.console.info(format!(
+                "Spawned preset '{}' ({}) with {} override(s)",
+                display_name, cfg.generator, cfg.params.len(),
+            ));
+        }
+        Some(entity)
     }
 
     fn scan_generator_presets(&mut self) {
@@ -6199,6 +6624,34 @@ impl EngineState {
         // brighter palette so it pops against a scene with multiple
         // animated characters.
         verts.extend(self.build_bone_wireframes());
+
+        // Drag-preview gizmo for generators — a wireframe AABB sized
+        // by the preview's `gizmo_half`, centered on the cached surface
+        // hit. The generator itself only spawns on commit; this box is
+        // the user's visual anchor while dragging.
+        if let Some(preview) = self.drag_preview.as_ref() {
+            if let DragPreviewKind::Generator { gizmo_half, .. } = &preview.kind {
+                if let Some(center) = preview.last_surface_pos {
+                    // Sit the box on the surface so the bottom face is
+                    // flush with the drop point — matches how model
+                    // previews bottom-snap.
+                    let min = glam::Vec3::new(
+                        center.x - gizmo_half.x,
+                        center.y,
+                        center.z - gizmo_half.z,
+                    );
+                    let max = glam::Vec3::new(
+                        center.x + gizmo_half.x,
+                        center.y + 2.0 * gizmo_half.y,
+                        center.z + gizmo_half.z,
+                    );
+                    // Soft cyan, semi-transparent — the same palette
+                    // the editor uses for "pending" overlays.
+                    let color = [0.4, 0.9, 1.0, 0.7];
+                    verts.extend(rkp_render::wireframe::aabb_wireframe(min, max, color));
+                }
+            }
+        }
 
         // Transform gizmo — only for the selected entity.
         let Some(selected) = self.selected_entity else {

@@ -146,6 +146,10 @@ pub struct EditorStore {
     pub import_progress: Signal<Vec<rkp_engine::snapshot::ImportProgressInfo>>,
     /// Model path being dragged onto viewport (None = no drag).
     pub model_drag: Signal<Option<String>>,
+    /// Generator name being dragged onto viewport (None = no drag).
+    pub generator_drag: Signal<Option<String>>,
+    /// `.rkgen` preset path being dragged onto viewport (None = no drag).
+    pub generator_preset_drag: Signal<Option<String>>,
     /// Registered generator names (from the loaded gameplay dylib).
     /// Sourced from the engine snapshot — empty when no project or no
     /// generators are registered. Rendered in the models panel.
@@ -292,6 +296,8 @@ impl EditorStore {
             importing_models: Signal::new(Vec::new()),
             import_progress: Signal::new(Vec::new()),
             model_drag: Signal::new(None),
+            generator_drag: Signal::new(None),
+            generator_preset_drag: Signal::new(None),
             inspector: Signal::new(None),
             procedural: Signal::new(None),
             available_components: Signal::new(Vec::new()),

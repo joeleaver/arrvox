@@ -315,10 +315,12 @@ impl RenderState {
         viewport_renderers.insert(ViewportId::MAIN, main_vr);
         viewport_renderers.insert(ViewportId::BUILD, build_vr);
 
-        // Pick readback: 512 B = 256 (material slot) + 256 (pick slot).
+        // Pick readback: 768 B = 256 (material slot) + 256 (pick slot)
+        // + 256 (position slot). Each slot is 256-B aligned to satisfy
+        // wgpu's `copy_texture_to_buffer` row-alignment requirement.
         let pick_readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rkp pick readback"),
-            size: 512,
+            size: 768,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -391,15 +393,17 @@ impl RenderState {
         }
         let (pp, _rx) = self.pick_in_flight.take().expect("ready check passed");
         let slice = self.pick_readback_buffer.slice(..);
-        let raw_payload = {
+        let (raw_payload, position) = {
             let data = slice.get_mapped_range();
             // Material gbuffer (Rg32Uint) at offset 0..8:
             //   R = primary_id_lo16 | secondary_id_lo16
             //   G = blend(8) | (object_id+1)(8) | color_rgb565(16)
             // Pick gbuffer (R32Uint) at offset 256..260:
             //   primitive_node_id (low16 for proc hits, 0xFFFF for misses)
+            // Position gbuffer (Rgba32Float) at offset 512..528:
+            //   xyz = world position, w = hit distance (1e10 on miss)
             let mut payload = [0u32; 2];
-            if data.len() >= 260 {
+            if data.len() >= 528 {
                 match pp.kind {
                     PickKind::Material => {
                         let r = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -417,13 +421,29 @@ impl RenderState {
                     }
                 }
             }
-            payload
+            let position = if data.len() >= 528 {
+                let px = f32::from_le_bytes([data[512], data[513], data[514], data[515]]);
+                let py = f32::from_le_bytes([data[516], data[517], data[518], data[519]]);
+                let pz = f32::from_le_bytes([data[520], data[521], data[522], data[523]]);
+                let hit_dist = f32::from_le_bytes([data[524], data[525], data[526], data[527]]);
+                // Shader writes 1e10 for sky-miss; anything larger than
+                // a plausible scene extent means "no geometry here."
+                if hit_dist < 1.0e9 {
+                    Some(glam::Vec3::new(px, py, pz))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            (payload, position)
         };
         self.pick_readback_buffer.unmap();
         Some(PickResult {
             viewport: pp.viewport,
             kind: pp.kind,
             raw_payload,
+            position,
         })
     }
 }
@@ -1040,6 +1060,31 @@ fn render_one_frame(
                         buffer: &state.pick_readback_buffer,
                         layout: wgpu::TexelCopyBufferLayout {
                             offset: 256,
+                            bytes_per_row: Some(256),
+                            rows_per_image: Some(1),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                // Position slot (Rgba32Float, 16 B per texel). The sim
+                // reads xyz + hit_distance; drag-drop uses the xyz as
+                // the surface snap point and the hit_distance (>1e9 →
+                // sky miss) as the "did it hit anything" bit.
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &vr.gbuffer.position_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: pp.x, y: pp.y, z: 0 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &state.pick_readback_buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 512,
                             bytes_per_row: Some(256),
                             rows_per_image: Some(1),
                         },
