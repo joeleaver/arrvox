@@ -1,7 +1,11 @@
 //! Field editors — bridges ECS inspector FieldSnapshot → prop_controls.
 //!
-//! The `field_editor()` function dispatches on `FieldType` and constructs
-//! the appropriate prop_control with the right value Signal and callback.
+//! `field_editor()` dispatches on `FieldType` and constructs the
+//! appropriate prop_control. The static metadata (name, type, range,
+//! enum options, scrub flag) comes from the FieldSnapshot reference;
+//! the live value comes from a `Memo<FieldValue>` so external updates
+//! (engine writes during play, MCP, undo) flow into the input without
+//! remounting the row. User edits go out through `on_change`.
 
 use std::rc::Rc;
 
@@ -14,68 +18,62 @@ use super::prop_controls;
 pub fn field_editor(
     __scope: &mut rinch::core::dom::RenderScope,
     field: &FieldSnapshot,
+    value: Memo<FieldValue>,
     on_change: Rc<dyn Fn(FieldValue)>,
 ) -> rinch::core::dom::NodeHandle {
     match field.field_type {
-        FieldType::Float => float_editor(__scope, field, on_change),
-        FieldType::Int => int_editor(__scope, field, on_change),
-        FieldType::Bool => bool_editor(__scope, field, on_change),
-        FieldType::String => string_editor(__scope, field, on_change),
-        FieldType::Vec3 => vec3_editor(__scope, field, on_change),
-        FieldType::Color => color_editor(__scope, field, on_change),
+        FieldType::Float => float_editor(__scope, field, value, on_change),
+        FieldType::Int => int_editor(__scope, field, value, on_change),
+        FieldType::Bool => bool_editor(__scope, field, value, on_change),
+        FieldType::String => string_editor(__scope, field, value, on_change),
+        FieldType::Vec3 => vec3_editor(__scope, field, value, on_change),
+        FieldType::Color => color_editor(__scope, field, value, on_change),
     }
 }
 
 fn float_editor(
     __scope: &mut rinch::core::dom::RenderScope,
     field: &FieldSnapshot,
+    value: Memo<FieldValue>,
     on_change: Rc<dyn Fn(FieldValue)>,
 ) -> rinch::core::dom::NodeHandle {
-    let val = match &field.value { FieldValue::Float(v) => *v, _ => 0.0 };
+    let value_f64 = Memo::new(move || match value.get() {
+        FieldValue::Float(v) => v,
+        _ => 0.0,
+    });
 
     if field.scrub {
         if let Some((min, max)) = field.range {
-            // Local Signal seeded from the captured value for display
-            // feedback on edit; wrap it in a Memo so `prop_scrub`'s new
-            // reactive-value API still works. Future step would be to
-            // read from a store Memo directly for true external-change
-            // reactivity on inspector fields — out of scope here.
-            let value = Signal::new(val as f32);
-            let display = Memo::new(move || value.get());
+            let value_f32 = Memo::new(move || value_f64.get() as f32);
             let step = ((max - min) / 200.0) as f32;
             return prop_controls::prop_scrub(
                 __scope,
                 &field.name,
-                display,
+                value_f32,
                 min as f32,
                 max as f32,
                 step,
-                Rc::new(move |v| {
-                    value.set(v);
-                    on_change(FieldValue::Float(v as f64));
-                }),
+                Rc::new(move |v| on_change(FieldValue::Float(v as f64))),
             );
         }
     }
 
     if let Some((min, max)) = field.range {
-        let value = Signal::new(val);
         let step = (max - min) / 200.0;
-        prop_controls::prop_slider_f64(
+        prop_controls::prop_slider_f64_memo(
             __scope,
             &field.name,
-            value,
+            value_f64,
             min,
             max,
             step,
             Rc::new(move |v| on_change(FieldValue::Float(v))),
         )
     } else {
-        let value = Signal::new(val);
-        prop_controls::prop_number_f64(
+        prop_controls::prop_number_f64_memo(
             __scope,
             &field.name,
-            value,
+            value_f64,
             Rc::new(move |v| on_change(FieldValue::Float(v))),
         )
     }
@@ -84,14 +82,17 @@ fn float_editor(
 fn int_editor(
     __scope: &mut rinch::core::dom::RenderScope,
     field: &FieldSnapshot,
+    value: Memo<FieldValue>,
     on_change: Rc<dyn Fn(FieldValue)>,
 ) -> rinch::core::dom::NodeHandle {
-    let val = match &field.value { FieldValue::Int(v) => *v, _ => 0 };
-    let value = Signal::new(val);
-    prop_controls::prop_number_i64(
+    let value_i64 = Memo::new(move || match value.get() {
+        FieldValue::Int(v) => v,
+        _ => 0,
+    });
+    prop_controls::prop_number_i64_memo(
         __scope,
         &field.name,
-        value,
+        value_i64,
         Rc::new(move |v| on_change(FieldValue::Int(v))),
     )
 }
@@ -99,14 +100,14 @@ fn int_editor(
 fn bool_editor(
     __scope: &mut rinch::core::dom::RenderScope,
     field: &FieldSnapshot,
+    value: Memo<FieldValue>,
     on_change: Rc<dyn Fn(FieldValue)>,
 ) -> rinch::core::dom::NodeHandle {
-    let val = match &field.value { FieldValue::Bool(v) => *v, _ => false };
-    let value = Signal::new(val);
-    prop_controls::prop_checkbox(
+    let value_b = Memo::new(move || matches!(value.get(), FieldValue::Bool(true)));
+    prop_controls::prop_checkbox_memo(
         __scope,
         &field.name,
-        value,
+        value_b,
         Rc::new(move |v| on_change(FieldValue::Bool(v))),
     )
 }
@@ -114,32 +115,30 @@ fn bool_editor(
 fn string_editor(
     __scope: &mut rinch::core::dom::RenderScope,
     field: &FieldSnapshot,
+    value: Memo<FieldValue>,
     on_change: Rc<dyn Fn(FieldValue)>,
 ) -> rinch::core::dom::NodeHandle {
-    let val = match &field.value { FieldValue::String(v) => v.clone(), _ => String::new() };
-    let value = Signal::new(val);
+    let value_s = Memo::new(move || match value.get() {
+        FieldValue::String(v) => v,
+        _ => String::new(),
+    });
 
-    // If this field has enum options, render as a dropdown select.
     if !field.enum_options.is_empty() {
         let options: Vec<(&str, &str)> = field.enum_options.iter()
             .map(|(v, l)| (v.as_str(), l.as_str()))
             .collect();
-        let value_memo = Memo::new(move || value.get());
         prop_controls::prop_select(
             __scope,
             &field.name,
-            value_memo,
+            value_s,
             &options,
-            Rc::new(move |v| {
-                value.set(v.clone());
-                on_change(FieldValue::String(v));
-            }),
+            Rc::new(move |v| on_change(FieldValue::String(v))),
         )
     } else {
-        prop_controls::prop_text(
+        prop_controls::prop_text_memo(
             __scope,
             &field.name,
-            value,
+            value_s,
             Rc::new(move |v| on_change(FieldValue::String(v))),
         )
     }
@@ -148,37 +147,35 @@ fn string_editor(
 fn vec3_editor(
     __scope: &mut rinch::core::dom::RenderScope,
     field: &FieldSnapshot,
+    value: Memo<FieldValue>,
     on_change: Rc<dyn Fn(FieldValue)>,
 ) -> rinch::core::dom::NodeHandle {
-    let val = match &field.value { FieldValue::Vec3(v) => *v, _ => [0.0; 3] };
-    let value = Signal::new(val);
-    let value_memo = Memo::new(move || value.get());
+    let value_v = Memo::new(move || match value.get() {
+        FieldValue::Vec3(v) => v,
+        _ => [0.0; 3],
+    });
     prop_controls::prop_vec3(
         __scope,
         &field.name,
-        value_memo,
-        Rc::new(move |v| {
-            value.set(v);
-            on_change(FieldValue::Vec3(v));
-        }),
+        value_v,
+        Rc::new(move |v| on_change(FieldValue::Vec3(v))),
     )
 }
 
 fn color_editor(
     __scope: &mut rinch::core::dom::RenderScope,
     field: &FieldSnapshot,
+    value: Memo<FieldValue>,
     on_change: Rc<dyn Fn(FieldValue)>,
 ) -> rinch::core::dom::NodeHandle {
-    let val = match &field.value { FieldValue::Color(v) => *v, _ => [1.0, 1.0, 1.0, 1.0] };
-    let value = Signal::new(val);
-    let value_memo = Memo::new(move || value.get());
+    let value_c = Memo::new(move || match value.get() {
+        FieldValue::Color(v) => v,
+        _ => [1.0, 1.0, 1.0, 1.0],
+    });
     prop_controls::prop_color(
         __scope,
         &field.name,
-        value_memo,
-        Rc::new(move |v| {
-            value.set(v);
-            on_change(FieldValue::Color(v));
-        }),
+        value_c,
+        Rc::new(move |v| on_change(FieldValue::Color(v))),
     )
 }

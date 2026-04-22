@@ -154,14 +154,23 @@ impl GeneratorSystem {
     }
 
     /// Main tick — poll results, then scan for stale entities and submit.
+    ///
+    /// `entity_uuids` lets emitted persistent children compute
+    /// deterministic disk-cache paths keyed by the generator's UUID.
+    /// `child_cache_dir` is the directory under which those caches
+    /// land (typically `{scene}.bakes/`); `None` skips caching, which
+    /// means a save+reload of the scene will trigger a regen instead
+    /// of restoring from disk.
     pub fn tick(
         &mut self,
         world: &mut hecs::World,
         components: &ComponentRegistry,
+        entity_uuids: &std::collections::HashMap<hecs::Entity, uuid::Uuid>,
+        child_cache_dir: Option<&std::path::Path>,
     ) -> Vec<GeneratorEvent> {
         let mut events = Vec::new();
         self.poll_results(world, &mut events);
-        self.scan_and_submit(world, components, &mut events);
+        self.scan_and_submit(world, components, entity_uuids, child_cache_dir, &mut events);
         events
     }
 
@@ -239,6 +248,8 @@ impl GeneratorSystem {
         &mut self,
         world: &mut hecs::World,
         components: &ComponentRegistry,
+        entity_uuids: &std::collections::HashMap<hecs::Entity, uuid::Uuid>,
+        child_cache_dir: Option<&std::path::Path>,
         events: &mut Vec<GeneratorEvent>,
     ) {
         // Collect entities that need submission. Deferred because we need
@@ -252,6 +263,25 @@ impl GeneratorSystem {
             param_hash: u64,
         }
         let mut pending: Vec<Pending> = Vec::new();
+        // Entities whose saved `param_hash != 0` but loaded `status` is
+        // the default Pending. Flip to Ready after the read borrow ends
+        // so the inspector + UI see the correct lifecycle state.
+        let mut pending_status_writes: Vec<hecs::Entity> = Vec::new();
+
+        // For each known generator entity (by UUID), does any
+        // GeneratorOwned child reference it as parent? Used below to
+        // force regen when an entity's saved param_hash claims it
+        // already ran but no children survived save+reload — the
+        // common case being a generator that uses `emit_child`
+        // (anonymous), which we deliberately never save (they're
+        // disposable). Without this force, those generators would
+        // load as a parent with zero children and silently render
+        // nothing.
+        let parents_with_children: std::collections::HashSet<uuid::Uuid> = world
+            .query::<&super::owned::GeneratorOwned>()
+            .iter()
+            .map(|(_, owned)| owned.parent_uuid)
+            .collect();
 
         for (entity, state) in world.query::<&GeneratorState>().iter() {
             if state.generator_name.is_empty() {
@@ -271,12 +301,41 @@ impl GeneratorSystem {
                 None => continue, // params missing — nothing to run against
             };
 
+            // Does this generator have any persistent children that
+            // survived load? If `state.param_hash != 0` claims a prior
+            // run completed but we see zero children, force regen —
+            // either the generator emits only anonymous children
+            // (which we never save) or persistent caches were lost.
+            // Without this, anonymous-only generators would silently
+            // load their parent with no geometry.
+            let has_children = entity_uuids
+                .get(&entity)
+                .map(|u| parents_with_children.contains(u))
+                .unwrap_or(false);
+
+            // First-time-this-session seed for entities loaded from
+            // disk: if we've never seen this entity AND it carries a
+            // non-zero saved `param_hash` AND its persistent children
+            // are present, treat it as already-Ready and seed
+            // `last_submitted_hash` from the saved value. Without
+            // this, every freshly-loaded generator entity arrives
+            // with status=Pending (transient field, defaults on serde)
+            // and last_submitted_hash=0, so every load would force a
+            // regen even when the on-disk bake cache is valid.
+            let was_already_tracked = self.tracked.contains_key(&entity);
             let tracked = self.tracked.entry(entity).or_default();
+            if !was_already_tracked && state.param_hash != 0 && has_children {
+                tracked.last_submitted_hash = state.param_hash;
+                if matches!(state.status, GeneratorStatus::Pending) {
+                    pending_status_writes.push(entity);
+                }
+            }
             let needs_submit = match state.status {
-                GeneratorStatus::Pending => true,
+                GeneratorStatus::Pending if state.param_hash == 0 => true,
+                GeneratorStatus::Pending => tracked.last_submitted_hash != param_hash,
                 GeneratorStatus::Stale => true,
                 _ => tracked.last_submitted_hash != param_hash,
-            };
+            } || (state.param_hash != 0 && !has_children);
             if !needs_submit {
                 continue;
             }
@@ -297,6 +356,14 @@ impl GeneratorSystem {
                 world_position,
                 param_hash,
             });
+        }
+
+        // Apply the post-load Pending → Ready flips now that the
+        // query's read-borrow has been dropped.
+        for entity in pending_status_writes {
+            if let Ok(mut state) = world.get::<&mut GeneratorState>(entity) {
+                state.status = GeneratorStatus::Ready;
+            }
         }
 
         for p in pending {
@@ -349,6 +416,8 @@ impl GeneratorSystem {
                 transform: p.transform,
                 world_position: p.world_position,
                 generate_fn: entry.generate_fn,
+                generator_entity_uuid: entity_uuids.get(&p.entity).copied(),
+                child_cache_dir: child_cache_dir.map(|p| p.to_path_buf()),
             };
             if self.tx.send(req).is_err() {
                 return;
@@ -406,7 +475,8 @@ mod tests {
         let mut world = hecs::World::new();
         let components = ComponentRegistry::new();
 
-        let events = sys.tick(&mut world, &components);
+        let entity_uuids = std::collections::HashMap::new();
+        let events = sys.tick(&mut world, &components, &entity_uuids, None);
         assert!(events.is_empty());
     }
 

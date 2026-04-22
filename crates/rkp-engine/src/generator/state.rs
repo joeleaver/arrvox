@@ -1,8 +1,12 @@
 //! `GeneratorState` — the component that marks an entity as a generator.
 //!
-//! Only `generator_name` is persisted. Everything else (status, param_hash,
-//! code_hash, generation) is transient: it resets to defaults after scene load
-//! so generators re-run on reopen.
+//! `generator_name` and `param_hash` persist. The remaining fields
+//! (status, code_hash, generation) are transient and reset to defaults
+//! after scene load. The persisted `param_hash` is what lets us SKIP
+//! re-running a generator on every scene reopen: when the saved
+//! children + their bake caches load and the freshly-computed param
+//! hash matches the saved one, the system seeds its
+//! `last_submitted_hash` from the saved value and submits nothing.
 
 use serde::{Deserialize, Serialize};
 
@@ -15,14 +19,18 @@ pub struct GeneratorState {
     /// Name of the registered generator (e.g. `"building"`).
     pub generator_name: String,
 
-    /// Current lifecycle status. Transient — resets to `Pending` on load so
-    /// every generator re-runs after scene reopen.
+    /// Current lifecycle status. Transient. The deserialiser
+    /// reconstructs it post-load via [`Self::initial_status_after_load`]
+    /// based on whether `param_hash` is non-zero (i.e. whether this
+    /// entity has ever completed a run before).
     #[serde(skip)]
     pub status: GeneratorStatus,
 
-    /// Hash of the current params. Executor compares against the hash it saw
-    /// at submission time to detect stale results. Transient.
-    #[serde(skip)]
+    /// Hash of the params at the most recent successful run. Persisted
+    /// across scene reload so the generator system can recognise
+    /// "params unchanged since last bake" and skip a redundant run —
+    /// a session that opens a saved scene then immediately closes it
+    /// should cost zero generator CPU.
     pub param_hash: u64,
 
     /// Hash of the gameplay dylib at last successful run. Changes on
@@ -46,6 +54,20 @@ impl Default for GeneratorState {
             param_hash: 0,
             code_hash: 0,
             generation: 0,
+        }
+    }
+}
+
+impl GeneratorState {
+    /// Compute the post-load `status`. `Ready` if we've ever generated
+    /// (saved `param_hash` non-zero); `Pending` otherwise. The system's
+    /// scan_and_submit tick re-derives the actual current `param_hash`
+    /// from the live params and only re-runs if it differs.
+    pub fn initial_status_after_load(&self) -> GeneratorStatus {
+        if self.param_hash != 0 {
+            GeneratorStatus::Ready
+        } else {
+            GeneratorStatus::Pending
         }
     }
 }
@@ -145,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn serde_roundtrip_persists_name_only() {
+    fn serde_roundtrip_persists_name_and_param_hash() {
         let mut s = GeneratorState::new("rock");
         s.status = GeneratorStatus::Ready;
         s.param_hash = 1234;
@@ -156,9 +178,20 @@ mod tests {
         let back: GeneratorState = serde_json::from_str(&json).unwrap();
 
         assert_eq!(back.generator_name, "rock");
+        // status / code_hash / generation reset (transient).
         assert_eq!(back.status, GeneratorStatus::Pending);
-        assert_eq!(back.param_hash, 0);
         assert_eq!(back.code_hash, 0);
         assert_eq!(back.generation, 0);
+        // param_hash persists so the system can detect unchanged params
+        // on reload and skip a redundant regen.
+        assert_eq!(back.param_hash, 1234);
+        assert_eq!(back.initial_status_after_load(), GeneratorStatus::Ready);
+    }
+
+    #[test]
+    fn initial_status_pending_when_never_generated() {
+        let s = GeneratorState::new("never-run");
+        assert_eq!(s.param_hash, 0);
+        assert_eq!(s.initial_status_after_load(), GeneratorStatus::Pending);
     }
 }

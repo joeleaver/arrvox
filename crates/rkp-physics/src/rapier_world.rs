@@ -96,6 +96,10 @@ pub struct PhysicsWorld {
     pub config: PhysicsConfig,
     /// Time accumulator for fixed-timestep stepping.
     accumulator: f32,
+    /// Substeps performed in the most recent `step()` call. Surfaced to
+    /// the editor's profiling readout so users can tell whether physics
+    /// is stepping at the target rate.
+    pub last_step_substeps: u32,
 }
 
 impl PhysicsWorld {
@@ -119,6 +123,7 @@ impl PhysicsWorld {
             ccd_solver: CCDSolver::new(),
             config,
             accumulator: 0.0,
+            last_step_substeps: 0,
         }
     }
 
@@ -156,6 +161,8 @@ impl PhysicsWorld {
         if substeps >= self.config.max_substeps {
             self.accumulator = 0.0;
         }
+
+        self.last_step_substeps = substeps;
 
         // Return interpolation factor
         if self.config.timestep > 0.0 {

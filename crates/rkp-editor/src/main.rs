@@ -221,7 +221,11 @@ fn main() -> anyhow::Result<()> {
         rkp_engine::engine::EngineConfig {
             width: 1920,
             height: 1080,
-            render_pacing: rkp_engine::engine::RenderPacing::TargetHz(60),
+            // Defaults: sim at 60 Hz (matches the fixed-step rate of
+            // physics + behavior FixedUpdate), render uncapped (the
+            // editor surface is a game viewport — let it run as fast
+            // as the GPU can sustain).
+            ..rkp_engine::engine::EngineConfig::default()
         },
         // Frame callback: route each viewport's pixels to its writer.
         // Unknown viewport ids are silently dropped (defensive — the
@@ -272,6 +276,24 @@ fn main() -> anyhow::Result<()> {
                 known_labels: Vec::new(),
             }));
 
+            /// Diff-suppression cache for the always-shipped rate signals.
+            /// EMA-smoothed values change by epsilon every sim tick even
+            /// when displayed values don't, so raw `Signal::send` would
+            /// re-notify subscribers 60 Hz forever — invalidating styles
+            /// + layout on dozens of DOM nodes per second. Round to the
+            /// precision the UI actually displays before comparing.
+            #[derive(Default)]
+            struct LastSent {
+                fps: i32,                      // displayed as {:.0}
+                tick_hz_x10: i32,              // displayed as {:.1}, store *10
+                physics_hz_x10: i32,           // displayed as {:.1}, store *10
+                gpu_object_count: u32,
+                selected_entity: Option<uuid::Uuid>,
+                play_mode: bool,
+                initialized: bool,
+            }
+            let last_sent = std::sync::Arc::new(std::sync::Mutex::new(LastSent::default()));
+
             /// 60 Hz minimum spacing between signal pushes.
             const PROFILING_MIN_INTERVAL: std::time::Duration =
                 std::time::Duration::from_millis(16);
@@ -282,10 +304,32 @@ fn main() -> anyhow::Result<()> {
             const EMA_ALPHA: f32 = 0.15;
 
             Box::new(move |update: &rkp_engine::StateUpdate| {
-                store.fps.send(update.fps);
-                store.tick_hz.send(update.tick_hz);
-                store.physics_hz.send(update.physics_hz);
-                store.gpu_object_count.send(update.gpu_object_count);
+                // Diff-suppress the four always-shipped rate signals. See
+                // `LastSent` for rationale — EMA jitter would otherwise
+                // refire all subscribers 60 Hz.
+                {
+                    let mut ls = last_sent.lock().expect("LastSent poisoned");
+                    let new_fps = update.fps.round() as i32;
+                    let new_tick_x10 = (update.tick_hz * 10.0).round() as i32;
+                    let new_phys_x10 = (update.physics_hz * 10.0).round() as i32;
+                    if !ls.initialized || ls.fps != new_fps {
+                        ls.fps = new_fps;
+                        store.fps.send(update.fps);
+                    }
+                    if !ls.initialized || ls.tick_hz_x10 != new_tick_x10 {
+                        ls.tick_hz_x10 = new_tick_x10;
+                        store.tick_hz.send(update.tick_hz);
+                    }
+                    if !ls.initialized || ls.physics_hz_x10 != new_phys_x10 {
+                        ls.physics_hz_x10 = new_phys_x10;
+                        store.physics_hz.send(update.physics_hz);
+                    }
+                    if !ls.initialized || ls.gpu_object_count != update.gpu_object_count {
+                        ls.gpu_object_count = update.gpu_object_count;
+                        store.gpu_object_count.send(update.gpu_object_count);
+                    }
+                    ls.initialized = true;
+                }
                 if let Some(frame) = &update.profiling {
                     let mut st = prof_state.lock().expect("profiling state poisoned");
 
@@ -295,7 +339,18 @@ fn main() -> anyhow::Result<()> {
                     if st.history.len() == ui::store::ProfilingWindow::HISTORY_LEN {
                         st.history.pop_front();
                     }
-                    st.history.push_back((frame.frame_idx, frame.cpu.total_ms));
+                    // Sparkline tracks **actual frame time** —
+                    // render thread's measured iteration interval —
+                    // not sim CPU work time. Falls back to cpu.total_ms
+                    // for the very first frames before render has
+                    // published a `render_dt_ms` for them (lag of 1-2
+                    // frames behind sim).
+                    let dt_ms = if frame.render_dt_ms > 0.0 {
+                        frame.render_dt_ms
+                    } else {
+                        frame.cpu.total_ms
+                    };
+                    st.history.push_back((frame.frame_idx, dt_ms));
 
                     // 2. Update smoothed CPU phases.
                     if !st.smoothed_cpu_valid {
@@ -306,9 +361,8 @@ fn main() -> anyhow::Result<()> {
                         let n = &frame.cpu;
                         let lerp = |a: f32, b: f32| a + (b - a) * EMA_ALPHA;
                         s.setup_ms       = lerp(s.setup_ms,       n.setup_ms);
-                        s.upload_ms      = lerp(s.upload_ms,      n.upload_ms);
-                        s.encode_ms      = lerp(s.encode_ms,      n.encode_ms);
-                        s.post_submit_ms = lerp(s.post_submit_ms, n.post_submit_ms);
+                        s.snapshot_ms    = lerp(s.snapshot_ms,    n.snapshot_ms);
+                        s.submit_ms      = lerp(s.submit_ms,      n.submit_ms);
                         s.total_ms       = lerp(s.total_ms,       n.total_ms);
                     }
 
@@ -352,7 +406,13 @@ fn main() -> anyhow::Result<()> {
                     };
                     store.profiling.send(Some(std::sync::Arc::new(window)));
                 }
-                store.selected_entity.send(update.selected_entity);
+                {
+                    let mut ls = last_sent.lock().expect("LastSent poisoned");
+                    if ls.selected_entity != update.selected_entity {
+                        ls.selected_entity = update.selected_entity;
+                        store.selected_entity.send(update.selected_entity);
+                    }
+                }
                 if let Some(objects) = &update.objects {
                     store.objects.send(objects.clone());
                 }
@@ -427,7 +487,13 @@ fn main() -> anyhow::Result<()> {
                 // or vice versa.
                 store.selected_material.send(update.selected_material);
                 store.selected_model.send(update.selected_model.clone());
-                store.play_mode.send(update.play_mode);
+                {
+                    let mut ls = last_sent.lock().expect("LastSent poisoned");
+                    if ls.play_mode != update.play_mode {
+                        ls.play_mode = update.play_mode;
+                        store.play_mode.send(update.play_mode);
+                    }
+                }
                 if let Some(ref env) = update.environment {
                     store.environment.send(env.clone());
                 }

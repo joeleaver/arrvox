@@ -300,6 +300,25 @@ pub struct RkpSceneManager {
     pending_faces: Vec<FaceInstance>,
     /// Whether face data needs re-upload to GPU.
     faces_dirty: bool,
+    /// Monotonic counter incremented every time geometry data changes
+    /// (asset load/release/reload, voxelize, integrate_artifact). The
+    /// render thread compares this against its own last-uploaded
+    /// epoch to decide whether to call `geometry_upload` + re-upload
+    /// to the GPU. Survives lost snapshots: if a snapshot carrying
+    /// an epoch bump is dropped by the newest-wins inbox, the next
+    /// snapshot still carries the same (or higher) epoch and render
+    /// catches up.
+    ///
+    /// **Wrapped in `Arc<AtomicU64>`** so sim and render can read the
+    /// epoch lock-free via [`Self::epoch_handle`]. The previous
+    /// design had sim taking the `scene_mgr` Mutex every tick just
+    /// to read this counter — fine when nothing else held the lock,
+    /// but a 50 ms bake_worker integrate would block sim's tick for
+    /// 50 ms, dropping sim from 60 Hz to ~20 Hz with every bake.
+    /// Now sim clones the Arc once at startup and reads the counter
+    /// directly; only the actual geometry-mutation methods need the
+    /// Mutex (which they already hold via `&mut self`).
+    geometry_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl RkpSceneManager {
@@ -313,7 +332,30 @@ impl RkpSceneManager {
             asset_cache: AssetCache::default(),
             pending_faces: Vec::new(),
             faces_dirty: false,
+            geometry_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Reset every pool / cache to empty without breaking the
+    /// shared-epoch handle. Use this for "wipe the scene" scenarios
+    /// (project close, project switch) — replacing the entire
+    /// `RkpSceneManager` instance would create a fresh epoch atomic
+    /// orphaning any handles sim/render are holding (visible bug:
+    /// render stops uploading geometry → everything renders as the
+    /// raw bounding-box cubes). The epoch bumps after the reset so
+    /// any consumer holding the handle sees the change and re-uploads
+    /// the (now-empty) geometry.
+    pub fn clear(&mut self, capacity: u32) {
+        self.leaf_attr_pool = LeafAttrPool::new(capacity);
+        self.brick_pool = BrickPool::new((capacity / 16).max(64));
+        self.brick_face_links.clear();
+        self.octree = OctreeGpu::new();
+        self.asset_cache = AssetCache::default();
+        self.pending_faces.clear();
+        self.faces_dirty = false;
+        // Preserve the Arc identity, but bump the value so the
+        // shared handle observes the wipe.
+        self.bump_geometry_epoch();
     }
 
     /// Splice one asset's computed face-link rows into the scene-wide
@@ -367,6 +409,50 @@ impl RkpSceneManager {
     pub fn pending_faces(&self) -> &[FaceInstance] { &self.pending_faces }
     pub fn faces_dirty(&self) -> bool { self.faces_dirty }
     pub fn mark_faces_clean(&mut self) { self.faces_dirty = false; }
+
+    /// Monotonic counter that ticks every time geometry data
+    /// (octree, leaf attrs, brick pool, brick face links) changes.
+    /// Render compares this to its own last-uploaded epoch each
+    /// frame and re-uploads when behind. Robust to snapshot drops:
+    /// since the next snapshot still carries the latest epoch, a
+    /// dropped intermediate snapshot doesn't lose the upload.
+    ///
+    /// Lock-free read — but the caller still has to dereference
+    /// through the `Arc<Mutex<RkpSceneManager>>`, which means *they
+    /// already hold the Mutex*. For per-tick lock-free reads from
+    /// sim or render, use [`Self::epoch_handle`] to clone the
+    /// underlying `Arc<AtomicU64>` once at startup, then load on it
+    /// directly without ever touching the Mutex.
+    pub fn geometry_epoch(&self) -> u64 {
+        self.geometry_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Clone the geometry-epoch atomic for lock-free reads outside
+    /// the `scene_mgr` Mutex. Hold the returned `Arc` in sim and
+    /// render; load via `handle.load(Ordering::Acquire)` to get the
+    /// current epoch without contending with bake_worker for the
+    /// scene_mgr Mutex.
+    pub fn epoch_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.geometry_epoch.clone()
+    }
+
+    /// Bump the geometry epoch. Called by every method that mutates
+    /// the GPU-uploaded geometry buffers (asset acquire/release,
+    /// voxelize, integrate_artifact, deallocate_geometry, …). External
+    /// callers that mutate scene_mgr through other paths can also
+    /// invoke this manually to force a render-side re-upload.
+    ///
+    /// Takes `&mut self` to keep the API symmetric with the
+    /// mutation methods that wrap it (and to require the caller
+    /// already holds the scene_mgr Mutex), but the counter itself
+    /// is atomic — Release ordering pairs with the Acquire load in
+    /// `geometry_epoch()` so render observes the bump after any
+    /// preceding writes to the geometry data are visible.
+    pub fn bump_geometry_epoch(&mut self) {
+        self.geometry_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
     pub fn clear_faces(&mut self) {
         self.pending_faces.clear();
         self.faces_dirty = true;
@@ -389,6 +475,7 @@ impl RkpSceneManager {
     // ── Spatial deallocation ─────────────────────────────────────────
 
     pub fn deallocate_spatial(&mut self, handle: &rkp_core::scene_node::SpatialHandle) {
+        self.bump_geometry_epoch();
         if let rkp_core::scene_node::SpatialHandle::Octree {
             root_offset, len, depth, base_voxel_size,
         } = handle
@@ -441,6 +528,7 @@ impl RkpSceneManager {
         &mut self,
         path: &str,
     ) -> Result<(AssetHandle, AssetInfo), String> {
+        self.bump_geometry_epoch();
         let canonical = Self::resolve_rkp_path(path)?;
 
         if let Some(handle) = self.asset_cache.lookup_path(&canonical) {
@@ -464,6 +552,7 @@ impl RkpSceneManager {
     /// Returns `Ok(None)` when the asset isn't currently cached (nothing
     /// to refresh — the next `acquire_asset` will read the new file).
     pub fn reload_asset(&mut self, path: &str) -> Result<Option<ReloadResult>, String> {
+        self.bump_geometry_epoch();
         let canonical = Self::resolve_rkp_path(path)?;
         let Some(old_handle) = self.asset_cache.lookup_path(&canonical) else {
             return Ok(None);
@@ -490,6 +579,7 @@ impl RkpSceneManager {
     /// outstanding reference drops, we deallocate the shared ranges from
     /// the scene pools.
     pub fn release_asset(&mut self, handle: AssetHandle) {
+        self.bump_geometry_epoch();
         let Some(entry) = self.asset_cache.get_mut(handle) else { return; };
         if entry.refcount == 0 { return; }
         entry.refcount -= 1;
@@ -738,10 +828,12 @@ impl RkpSceneManager {
         // contiguous leaf_attr range via allocate_contiguous_bump(1), so
         // the `leaf_attr_slot_count` grows to cover them and the
         // existing deallocate_range releases everything on asset drop.
-        let mut attr_dedup: HashMap<LeafAttr, u32> = HashMap::new();
+        let mut attr_dedup: HashMap<(LeafAttr, u32), u32> = HashMap::new();
         for i in 0..leaf_attr_slot_count {
             let slot = leaf_attr_slot_start + i;
-            attr_dedup.insert(*self.leaf_attr_pool.get(slot), slot);
+            let attr = *self.leaf_attr_pool.get(slot);
+            let color = self.leaf_attr_pool.color(slot);
+            attr_dedup.insert((attr, color), slot);
         }
         rkp_core::prefilter::prefilter_octree_internals(
             &mut tree,
@@ -830,6 +922,7 @@ impl RkpSceneManager {
         bake_scale: glam::Vec3,
         object_id: u32,
     ) -> Option<VoxelizeResult> {
+        self.bump_geometry_epoch();
         use rkp_core::scene_node::SdfPrimitive;
 
         fn primitive_half_extents(prim: &SdfPrimitive) -> glam::Vec3 {
@@ -938,6 +1031,7 @@ impl RkpSceneManager {
     where
         F: FnMut(&[glam::Vec3]) -> Vec<(f32, u16, u16, u8, u32)>,
     {
+        self.bump_geometry_epoch();
         let r = rkp_core::voxelize_octree::voxelize_octree(
             sdf_fn, aabb, voxel_size, &mut self.leaf_attr_pool, &mut self.brick_pool,
         )?;
@@ -979,6 +1073,7 @@ impl RkpSceneManager {
         voxel_size: f32,
         object_id: u32,
     ) -> Option<VoxelizeResult> {
+        self.bump_geometry_epoch();
         use rkp_core::brick_face_links::{FACE_EMPTY, FACE_INTERIOR};
         use rkp_core::brick_pool::{BRICK_EMPTY, BRICK_INTERIOR};
         use rkp_core::sparse_octree::{
@@ -1147,6 +1242,7 @@ impl RkpSceneManager {
         leaf_attr_slot_count: u32,
         brick_ids: &[u32],
     ) {
+        self.bump_geometry_epoch();
         self.octree.deallocate(*spatial);
         self.leaf_attr_pool.deallocate_range(leaf_attr_slot_start, leaf_attr_slot_count);
         self.brick_pool.deallocate_batch(brick_ids);

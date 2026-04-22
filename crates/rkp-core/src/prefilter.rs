@@ -193,7 +193,7 @@ pub fn prefilter_octree_internals(
     octree: &mut SparseOctree,
     leaf_attr_pool: &mut LeafAttrPool,
     brick_pool: &BrickPool,
-    attr_dedup: &mut HashMap<LeafAttr, u32>,
+    attr_dedup: &mut HashMap<(LeafAttr, u32), u32>,
 ) {
     if octree.node_count() == 0 {
         return;
@@ -220,7 +220,7 @@ fn walk(
     octree: &mut SparseOctree,
     leaf_attr_pool: &mut LeafAttrPool,
     brick_pool: &BrickPool,
-    attr_dedup: &mut HashMap<LeafAttr, u32>,
+    attr_dedup: &mut HashMap<(LeafAttr, u32), u32>,
     cache: &mut HashMap<u32, NodeAggregate>,
     node_idx: u32,
 ) -> NodeAggregate {
@@ -260,7 +260,13 @@ fn walk(
         // unchanged — we don't want emissions to short-circuit the
         // bottom-up walk.
         if let Some((attr, color)) = agg.emit() {
-            let attr_id = attr_dedup.entry(attr).or_insert_with(|| {
+            // Dedup on `(attr, color)` so a prefilter attr whose
+            // aggregate color differs from an otherwise-identical leaf
+            // (same material + normal) still gets its own slot.
+            // Matches the voxelize path's keying; without it, a
+            // flat-shaded branch could bind to a leaf slot whose color
+            // was set from a different cell's noise sample.
+            let attr_id = *attr_dedup.entry((attr, color)).or_insert_with(|| {
                 // Bump-only allocate to preserve the asset's contiguous
                 // [slot_start, next_free) range invariant that the scene
                 // manager's release relies on. A regular `allocate()`
@@ -270,22 +276,12 @@ fn walk(
                     .allocate_contiguous_bump(1)
                     .expect("LeafAttrPool exhausted during prefilter");
                 *leaf_attr_pool.get_mut(id) = attr;
+                if color != 0 {
+                    leaf_attr_pool.set_color(id, color);
+                }
                 id
             });
-            // Color goes on whichever slot the dedup lookup returned —
-            // if the attr was pre-existing (flat-surface collision), we
-            // leave the existing color unchanged. Two aggregations of
-            // the same LeafAttr tuple represent visually-equivalent
-            // surfaces, so the prior color is a valid stand-in.
-            //
-            // Note: this means the *first* writer wins for color when
-            // a prefilter attr collides with a LEAF attr. That's the
-            // conservative choice — consistent with the existing leaf
-            // allocation path which also uses first-writer-wins.
-            if leaf_attr_pool.color(*attr_id) == 0 {
-                leaf_attr_pool.set_color(*attr_id, color);
-            }
-            octree.set_internal_attr(node_idx, *attr_id);
+            octree.set_internal_attr(node_idx, attr_id);
         }
         agg
     };
@@ -375,7 +371,7 @@ mod tests {
         let mut octree = SparseOctree::new(3, 0.1);
         let mut pool = LeafAttrPool::new(64);
         let bricks = BrickPool::new(8);
-        let mut dedup: HashMap<LeafAttr, u32> = HashMap::new();
+        let mut dedup: HashMap<(LeafAttr, u32), u32> = HashMap::new();
         prefilter_octree_internals(&mut octree, &mut pool, &bricks, &mut dedup);
         // No branches, no attrs allocated, no panic.
         assert_eq!(octree.node_count(), 1);
@@ -391,7 +387,7 @@ mod tests {
         *pool.get_mut(slot) = attr;
         octree.set_internal_attr_index(vec![INTERNAL_ATTR_NONE; 1]);
         let bricks = BrickPool::new(8);
-        let mut dedup: HashMap<LeafAttr, u32> = HashMap::from([(attr, slot)]);
+        let mut dedup: HashMap<(LeafAttr, u32), u32> = HashMap::from([((attr, 0u32), slot)]);
         prefilter_octree_internals(&mut octree, &mut pool, &bricks, &mut dedup);
         // Single-node tree (root is EMPTY here since we didn't insert); nothing
         // to prefilter.
@@ -411,9 +407,9 @@ mod tests {
         // returned a result but not the map. For the test, reconstruct
         // by scanning the populated pool range. (Production code keeps
         // the map alive inside voxelize_octree; see Phase 1 wiring.)
-        let mut dedup: HashMap<LeafAttr, u32> = HashMap::new();
+        let mut dedup: HashMap<(LeafAttr, u32), u32> = HashMap::new();
         for slot in r.leaf_attr_slot_start..(r.leaf_attr_slot_start + r.leaf_attr_unique_count) {
-            dedup.insert(*pool.get(slot), slot);
+            dedup.insert((*pool.get(slot), pool.color(slot)), slot);
         }
         let pool_before = pool.allocated_count();
 
@@ -606,9 +602,9 @@ mod tests {
         let start = r.leaf_attr_slot_start;
         let before = pool.allocated_count();
 
-        let mut dedup: HashMap<LeafAttr, u32> = HashMap::new();
+        let mut dedup: HashMap<(LeafAttr, u32), u32> = HashMap::new();
         for slot in start..before {
-            dedup.insert(*pool.get(slot), slot);
+            dedup.insert((*pool.get(slot), pool.color(slot)), slot);
         }
 
         let mut octree = r.octree;

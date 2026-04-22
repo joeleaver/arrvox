@@ -34,6 +34,13 @@ pub struct SceneObject {
     /// Primitive type if this is an analytical object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primitive: Option<String>,
+    /// Relative path (from the scene file's directory) to a `.rkp`
+    /// sidecar holding the most recent procedural bake for this entity.
+    /// Set when a procedural's bake worker persisted its artifact and
+    /// that file still exists at save time; load uses it to restore
+    /// the voxel data without auto-rebaking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procedural_cache: Option<String>,
     #[serde(default)]
     pub material_id: u16,
     /// PointLight component data (if entity has one).

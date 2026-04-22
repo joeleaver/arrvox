@@ -1,12 +1,30 @@
-//! RKIPatch volumetric rendering — fog, dust, and procedural clouds.
+//! RKIPatch volumetric rendering — fog and procedural clouds, split into
+//! two independent compute passes so sky and non-sky work never mix in a
+//! single shader invocation.
 //!
-//! Two compute passes:
-//! 1. Volumetric march (half-res): marches view rays through atmosphere
-//! 2. Volumetric composite (full-res): blends scatter over scene HDR
+//! Passes (per frame, in order):
+//! 1. Fog march       (half-res, every pixel) — height-fog integration to
+//!                    scene depth. Writes `fog_texture`.
+//! 2. Cloud march     (half-res, sky tiles)    — near-field + slab cloud
+//!                    march with temporal reprojection. Non-sky tiles
+//!                    early-exit with an identity value so the composite
+//!                    becomes a no-op there. Writes `cloud_texture`.
+//! 3. History update  (half-res)               — copies this frame's cloud
+//!                    output into the history buffer, marking non-sky
+//!                    texels with a validity sentinel.
+//! 4. Sun-attenuation (1 thread)               — integrates camera→sun
+//!                    cloud density for readback-driven direct-sun dimming.
+//! 5. Composite       (full-res)               — layers fog, then clouds,
+//!                    over scene HDR into `output_texture`.
 //!
-//! Plus a tiny 1-thread compute pass that integrates cloud density along
-//! the camera→sun ray and writes exp(-τ) to a buffer for CPU readback,
-//! so the engine can dim direct sunlight when clouds overhead block the sun.
+//! Splitting fog from clouds was a deliberate architectural choice: the old
+//! combined shader gated everything on `is_sky`, which meant cloud-specific
+//! bindings (history, cloud params) were bound even for voxel pixels, the
+//! boundary between sky and non-sky was handled by a neutral-marker dance
+//! in a shared buffer, and a hardware bilinear sampler could bleed that
+//! marker across validity edges — producing ghost outlines around voxel
+//! silhouettes in motion. Separate shaders let each pass touch only the
+//! bindings it needs and make the boundary explicit.
 
 use std::sync::{Arc, atomic::{AtomicU32, AtomicBool, Ordering}};
 
@@ -66,11 +84,17 @@ impl Default for CloudParams {
     }
 }
 
-/// Volumetric rendering pass (march + composite).
+/// Volumetric rendering pass (fog + cloud + composite).
 pub struct RkpVolumetricPass {
-    march_pipeline: wgpu::ComputePipeline,
-    march_bind_group_layout: wgpu::BindGroupLayout,
-    march_bind_group: Option<wgpu::BindGroup>,
+    // Fog march — 3 bindings: params, depth, fog_out.
+    fog_march_pipeline: wgpu::ComputePipeline,
+    fog_march_bind_group_layout: wgpu::BindGroupLayout,
+    fog_march_bind_group: Option<wgpu::BindGroup>,
+
+    // Cloud march — 6 bindings: params, depth, cloud_out, cloud_params, history, history sampler.
+    cloud_march_pipeline: wgpu::ComputePipeline,
+    cloud_march_bind_group_layout: wgpu::BindGroupLayout,
+    cloud_march_bind_group: Option<wgpu::BindGroup>,
 
     composite_pipeline: wgpu::ComputePipeline,
     composite_bind_group_layout: wgpu::BindGroupLayout,
@@ -88,10 +112,13 @@ pub struct RkpVolumetricPass {
     pub fog_texture: wgpu::Texture,
     pub fog_view: wgpu::TextureView,
 
-    /// Previous-frame cloud buffer — sampled in the march for temporal accumulation.
+    /// Previous-frame cloud buffer — sampled in the cloud march for temporal
+    /// accumulation via a manual 4-tap bilateral with per-texel validity
+    /// rejection. No hardware sampler is used (would blend across the
+    /// validity boundary and bleed the invalid-pixel marker into valid
+    /// samples, producing ghost outlines around voxel silhouettes).
     history_texture: wgpu::Texture,
     history_view: wgpu::TextureView,
-    history_sampler: wgpu::Sampler,
 
     /// Full-res composited HDR output (replaces shade output for tone mapping).
     pub output_texture: wgpu::Texture,
@@ -131,10 +158,49 @@ impl RkpVolumetricPass {
         let half_width = (width / 2).max(1);
         let half_height = (height / 2).max(1);
 
-        // March bind group layout (group 0).
-        let march_bind_group_layout =
+        // Fog march layout (3 bindings): params, depth, fog_out.
+        let fog_march_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("vol march layout"),
+                label: Some("vol fog march layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::Rgba16Float,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        // Cloud march layout (6 bindings): params, depth, cloud_out, cloud_params,
+        // history, history_sampler.
+        let cloud_march_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("vol cloud march layout"),
                 entries: &[
                     // 0: VolumetricParams uniform
                     wgpu::BindGroupLayoutEntry {
@@ -147,7 +213,7 @@ impl RkpVolumetricPass {
                         },
                         count: None,
                     },
-                    // 1: depth buffer (G-buffer position texture, read)
+                    // 1: depth buffer
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -158,7 +224,7 @@ impl RkpVolumetricPass {
                         },
                         count: None,
                     },
-                    // 2: scatter output (half-res, write)
+                    // 2: cloud output
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -180,32 +246,15 @@ impl RkpVolumetricPass {
                         },
                         count: None,
                     },
-                    // 4: previous-frame scatter history (filterable, sampled)
+                    // 4: history texture — bilateral-gathered manually, so
+                    // filterable=false (the shader uses textureLoad).
                     wgpu::BindGroupLayoutEntry {
                         binding: 4,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
-                        },
-                        count: None,
-                    },
-                    // 5: history sampler (linear)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 5,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    // 6: fog scatter output (half-res, write)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 6,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba16Float,
-                            view_dimension: wgpu::TextureViewDimension::D2,
                         },
                         count: None,
                     },
@@ -289,36 +338,45 @@ impl RkpVolumetricPass {
         let (history_texture, history_view) = Self::create_history_texture(
             device, "vol cloud history", half_width, half_height,
         );
-        let history_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("vol history sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
         let (output_texture, output_view) =
             Self::create_texture(device, "vol output", width, height, wgpu::TextureFormat::Rgba16Float);
 
-        // March pipeline.
-        let march_src = include_str!("shaders/rkp_volumetric.wgsl");
-        validate_wgsl(march_src, "rkp_volumetric");
-        let march_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rkp_volumetric"),
-            source: wgpu::ShaderSource::Wgsl(march_src.into()),
+        // Fog march pipeline.
+        let fog_src = include_str!("shaders/rkp_fog_march.wgsl");
+        validate_wgsl(fog_src, "rkp_fog_march");
+        let fog_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rkp_fog_march"),
+            source: wgpu::ShaderSource::Wgsl(fog_src.into()),
         });
-        let march_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("vol march pipeline"),
-            bind_group_layouts: &[Some(&march_bind_group_layout)],
-            immediate_size: 0,
+        let fog_march_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("vol fog march"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("vol fog march pipeline"),
+                bind_group_layouts: &[Some(&fog_march_bind_group_layout)],
+                immediate_size: 0,
+            })),
+            module: &fog_module,
+            entry_point: Some("fog_march"),
+            compilation_options: Default::default(),
+            cache: None,
         });
-        let march_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("vol march"),
-            layout: Some(&march_layout),
-            module: &march_module,
-            entry_point: Some("march_main"),
+
+        // Cloud march pipeline.
+        let cloud_src = include_str!("shaders/rkp_cloud_march.wgsl");
+        validate_wgsl(cloud_src, "rkp_cloud_march");
+        let cloud_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rkp_cloud_march"),
+            source: wgpu::ShaderSource::Wgsl(cloud_src.into()),
+        });
+        let cloud_march_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("vol cloud march"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("vol cloud march pipeline"),
+                bind_group_layouts: &[Some(&cloud_march_bind_group_layout)],
+                immediate_size: 0,
+            })),
+            module: &cloud_module,
+            entry_point: Some("cloud_march"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -479,9 +537,12 @@ impl RkpVolumetricPass {
         });
 
         Self {
-            march_pipeline,
-            march_bind_group_layout,
-            march_bind_group: None,
+            fog_march_pipeline,
+            fog_march_bind_group_layout,
+            fog_march_bind_group: None,
+            cloud_march_pipeline,
+            cloud_march_bind_group_layout,
+            cloud_march_bind_group: None,
             composite_pipeline,
             composite_bind_group_layout,
             composite_bind_group: None,
@@ -493,7 +554,6 @@ impl RkpVolumetricPass {
             fog_view,
             history_texture,
             history_view,
-            history_sampler,
             output_texture,
             output_view,
             half_width,
@@ -514,20 +574,27 @@ impl RkpVolumetricPass {
         }
     }
 
-    /// Set the shadow map texture for volumetric shadow sampling.
-    /// Set the depth view (G-buffer position texture). Rebuilds march bind group.
+    /// Set the depth view (G-buffer position texture). Rebuilds all bind groups
+    /// that depend on it — fog march, cloud march, and history update.
     pub fn set_depth_view(&mut self, device: &wgpu::Device, depth_view: &wgpu::TextureView) {
-        self.march_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("vol march bg"),
-            layout: &self.march_bind_group_layout,
+        self.fog_march_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vol fog march bg"),
+            layout: &self.fog_march_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.fog_view) },
+            ],
+        }));
+        self.cloud_march_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vol cloud march bg"),
+            layout: &self.cloud_march_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: self.params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.cloud_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: self.cloud_params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.history_view) },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&self.history_sampler) },
-                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.fog_view) },
             ],
         }));
         self.history_update_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -584,14 +651,32 @@ impl RkpVolumetricPass {
         queue.write_buffer(&self.cloud_params_buffer, 0, bytemuck::bytes_of(cloud));
     }
 
-    /// Dispatch the volumetric march (half-res).
-    pub fn dispatch_march(&self, encoder: &mut wgpu::CommandEncoder) {
-        let bg = match &self.march_bind_group { Some(bg) => bg, None => return };
+    /// Dispatch the fog march (half-res, every pixel).
+    pub fn dispatch_fog_march(&self, encoder: &mut wgpu::CommandEncoder) {
+        let bg = match &self.fog_march_bind_group { Some(bg) => bg, None => return };
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("vol march"),
+            label: Some("vol fog march"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&self.march_pipeline);
+        pass.set_pipeline(&self.fog_march_pipeline);
+        pass.set_bind_group(0, bg, &[]);
+        pass.dispatch_workgroups(
+            (self.half_width + 7) / 8,
+            (self.half_height + 7) / 8,
+            1,
+        );
+    }
+
+    /// Dispatch the cloud march (half-res; sky tiles do work, non-sky
+    /// tiles early-return with an identity output). Must run before
+    /// `update_history` — the history copy reads the cloud output this pass writes.
+    pub fn dispatch_cloud_march(&self, encoder: &mut wgpu::CommandEncoder) {
+        let bg = match &self.cloud_march_bind_group { Some(bg) => bg, None => return };
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("vol cloud march"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.cloud_march_pipeline);
         pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(
             (self.half_width + 7) / 8,
@@ -603,6 +688,11 @@ impl RkpVolumetricPass {
     /// Dispatch the 1-thread sun-attenuation compute pass and queue the GPU→CPU
     /// copy into the staging buffer. The value becomes readable after the next
     /// submit completes and the map_async callback fires (see `issue_sun_atten_map`).
+    ///
+    /// **Skips the copy** if a previous frame's map_async hasn't been consumed
+    /// yet — staging is still mapped in that case and writing to it would
+    /// trigger a wgpu validation error. The compute still runs (storage gets
+    /// the fresh value); the next frame's copy will pick it up.
     pub fn dispatch_sun_atten(&self, encoder: &mut wgpu::CommandEncoder) {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -613,7 +703,16 @@ impl RkpVolumetricPass {
             pass.set_bind_group(0, &self.sun_atten_bind_group, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&self.sun_atten_storage, 0, &self.sun_atten_staging, 0, 16);
+        if !self.sun_atten_map_pending.load(Ordering::Acquire) {
+            encoder.copy_buffer_to_buffer(&self.sun_atten_storage, 0, &self.sun_atten_staging, 0, 16);
+        }
+    }
+
+    /// True when a `map_async` is still in flight on the staging buffer
+    /// (its callback hasn't fired yet). The encoder block must avoid
+    /// writing to the staging while this is true.
+    pub fn sun_atten_map_pending(&self) -> bool {
+        self.sun_atten_map_pending.load(Ordering::Acquire)
     }
 
     /// After submit, issue a non-blocking map on the staging buffer. The callback

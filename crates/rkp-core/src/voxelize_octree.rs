@@ -110,11 +110,14 @@ where
     let t_start = std::time::Instant::now();
     let mut octree = SparseOctree::new(depth, base_voxel_size);
     let mut voxel_count = 0u32;
-    // Dedup keyed on the full LeafAttr value. Two spatial leaves with
-    // the same packed (material + normal) share an entry, so flat-
-    // shaded regions collapse via subtree dedup; curved surfaces pay
-    // one entry per unique (material, normal) tuple.
-    let mut attr_dedup: std::collections::HashMap<LeafAttr, u32> =
+    // Dedup keyed on `(LeafAttr, color)` — the attr covers material +
+    // packed normal + blend, but per-voxel color lives in a parallel
+    // pool and isn't part of LeafAttr. Keying on both means two cells
+    // with the same attr but different colors (ColorByNoise on a flat
+    // face, per-vertex imported colors) each get their own pool slot,
+    // instead of collapsing to one slot whose color gets overwritten
+    // by whichever cell finishes last.
+    let mut attr_dedup: std::collections::HashMap<(LeafAttr, u32), u32> =
         std::collections::HashMap::new();
     let leaf_attr_slot_start = leaf_attr_pool.allocated_count();
     let mut brick_ids: Vec<u32> = Vec::new();
@@ -346,7 +349,7 @@ fn subdivide_bfs<F>(
     leaf_attr_pool: &mut LeafAttrPool,
     brick_pool: &mut BrickPool,
     voxel_count: &mut u32,
-    attr_dedup: &mut std::collections::HashMap<LeafAttr, u32>,
+    attr_dedup: &mut std::collections::HashMap<(LeafAttr, u32), u32>,
     brick_ids: &mut Vec<u32>,
     grid_origin: Vec3,
     max_depth: u8,
@@ -547,7 +550,7 @@ fn emit_bricks_batched<F>(
     leaf_attr_pool: &mut LeafAttrPool,
     brick_pool: &mut BrickPool,
     voxel_count: &mut u32,
-    attr_dedup: &mut std::collections::HashMap<LeafAttr, u32>,
+    attr_dedup: &mut std::collections::HashMap<(LeafAttr, u32), u32>,
     brick_ids: &mut Vec<u32>,
     brick_queue: &[BrickJob],
     brick_depth: u8,
@@ -748,19 +751,24 @@ where
                 Vec3::Y
             };
             let attr = LeafAttr::new_blended(normal, sc.primary, sc.secondary, sc.blend);
-            let leaf_attr_id = if let Some(&existing) = attr_dedup.get(&attr) {
+            let key = (attr, sc.color);
+            let leaf_attr_id = if let Some(&existing) = attr_dedup.get(&key) {
                 existing
             } else {
                 // Bump-only allocate — see the allocator's docs for
                 // why we can't reuse freed slots during a single bake.
                 let id = leaf_attr_pool.allocate_contiguous_bump(1)?;
                 *leaf_attr_pool.get_mut(id) = attr;
-                attr_dedup.insert(attr, id);
+                // Set color on the fresh slot. Keying dedup by color
+                // means every distinct color gets its own slot, so
+                // there's no "last writer wins" collision to worry
+                // about here.
+                if sc.color != 0 {
+                    leaf_attr_pool.set_color(id, sc.color);
+                }
+                attr_dedup.insert(key, id);
                 id
             };
-            if sc.color != 0 {
-                leaf_attr_pool.set_color(leaf_attr_id, sc.color);
-            }
             brick_pool.set_cell(sc.brick_slot, sc.cx, sc.cy, sc.cz, leaf_attr_id);
             *voxel_count += 1;
         }
@@ -789,7 +797,7 @@ fn emit_leaves_batched<F>(
     octree: &mut SparseOctree,
     leaf_attr_pool: &mut LeafAttrPool,
     voxel_count: &mut u32,
-    attr_dedup: &mut std::collections::HashMap<LeafAttr, u32>,
+    attr_dedup: &mut std::collections::HashMap<(LeafAttr, u32), u32>,
     leaf_queue: &[LeafJob],
     max_depth: u8,
     base_voxel_size: f32,
@@ -838,17 +846,18 @@ where
             Vec3::Y
         };
         let attr = LeafAttr::new_blended(normal, primary, secondary, blend);
-        let leaf_attr_id = if let Some(&existing) = attr_dedup.get(&attr) {
+        let key = (attr, color);
+        let leaf_attr_id = if let Some(&existing) = attr_dedup.get(&key) {
             existing
         } else {
             let id = leaf_attr_pool.allocate()?;
             *leaf_attr_pool.get_mut(id) = attr;
-            attr_dedup.insert(attr, id);
+            if color != 0 {
+                leaf_attr_pool.set_color(id, color);
+            }
+            attr_dedup.insert(key, id);
             id
         };
-        if color != 0 {
-            leaf_attr_pool.set_color(leaf_attr_id, color);
-        }
         octree.set_at_level(
             job.coord,
             max_depth,

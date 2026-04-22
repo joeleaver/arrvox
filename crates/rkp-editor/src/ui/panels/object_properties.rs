@@ -68,19 +68,28 @@ pub fn ObjectProperties() -> NodeHandle {
     }
 }
 
+/// Structural-only key for the component for-loop. Does NOT include
+/// field values — that's the whole point. The for-loop's reconciler
+/// re-runs ComponentSection only when components are added/removed
+/// or the selection changes, NOT every time a Transform's position
+/// updates. Per-field reactivity happens inside ComponentSection /
+/// FieldRow via Memos that read from `store.inspector` directly and
+/// short-circuit on PartialEq.
 #[derive(Clone, PartialEq)]
 struct KeyedComponent {
     entity_id: String,
-    component: ComponentSnapshot,
+    component_name: String,
+    removable: bool,
 }
 
-fn flatten_keyed(keyed: (String, Vec<ComponentSnapshot>)) -> Vec<KeyedComponent> {
+fn flatten_keyed(keyed: (String, Vec<(String, bool)>)) -> Vec<KeyedComponent> {
     let (entity_id, comps) = keyed;
     comps
         .into_iter()
-        .map(|component| KeyedComponent {
+        .map(|(component_name, removable)| KeyedComponent {
             entity_id: entity_id.clone(),
-            component,
+            component_name,
+            removable,
         })
         .collect()
 }
@@ -89,14 +98,26 @@ fn flatten_keyed(keyed: (String, Vec<ComponentSnapshot>)) -> Vec<KeyedComponent>
 fn InspectorContent() -> NodeHandle {
     let store = use_context::<EditorStore>();
 
-    // Combine entity_id + components into a single memo so the for-loop's
-    // effect subscribes to only one source. Subscribing to both memos caused
-    // the for-loop effect to be re-queued while still running: whichever
-    // memo's marker hadn't fired yet would queue the loop effect again,
-    // leading to a RefCell re-entrancy panic on the trailing flush.
+    // Memo emits ONLY the structural keys: the entity id and the list of
+    // component (name, removable) pairs. Field values are intentionally
+    // excluded — when only `Transform.position` changes, this memo's
+    // value is unchanged (PartialEq), so rinch's for-loop reconciler
+    // doesn't tear down ComponentSection. Per-field reactive updates
+    // happen one level deeper, via Memos that each FieldRow derives
+    // against `store.inspector`.
+    //
+    // Combining entity_id + components into a single memo also keeps the
+    // for-loop effect subscribed to one source — separate memos used to
+    // re-queue the loop effect mid-flush, panicking on the trailing
+    // RefCell borrow.
     let keyed_components = Memo::new(move || {
         store.inspector.get()
-            .map(|snap| (snap.entity_id.clone(), snap.components.clone()))
+            .map(|snap| (
+                snap.entity_id.clone(),
+                snap.components.iter()
+                    .map(|c| (c.name.clone(), c.removable))
+                    .collect::<Vec<_>>(),
+            ))
             .unwrap_or_default()
     });
 
@@ -159,8 +180,10 @@ fn InspectorContent() -> NodeHandle {
             // markers would each re-queue this effect.
             for keyed in flatten_keyed(keyed_components.get()) {
                 ComponentSection {
-                    key: format!("{}-{}", keyed.entity_id, keyed.component.name),
-                    snapshot: keyed.component,
+                    key: format!("{}-{}", keyed.entity_id, keyed.component_name),
+                    entity_id: keyed.entity_id,
+                    component_name: keyed.component_name,
+                    removable: keyed.removable,
                 }
             }
 
@@ -174,41 +197,84 @@ fn InspectorContent() -> NodeHandle {
 }
 
 /// A single component section — collapsible header + field editors.
+///
+/// Takes only `entity_id` + `component_name` + `removable` as props (the
+/// structural keys), NOT the snapshot itself. The component data is
+/// re-read reactively via Memos against `store.inspector`. Result: when
+/// only a field VALUE changes (e.g. physics writing Transform.position),
+/// this component is preserved and only the affected field's DOM
+/// updates via the per-field Memo inside `FieldRow`.
 #[component]
-fn ComponentSection(snapshot: ComponentSnapshot) -> NodeHandle {
+fn ComponentSection(entity_id: String, component_name: String, removable: bool) -> NodeHandle {
     let store = use_context::<EditorStore>();
     let cmd_tx: CmdSignal = Signal::new(use_context::<CommandSender>().0);
     let collapsed = Signal::new(false);
-    let comp_name = Signal::new(snapshot.name.clone());
-    let fields = Signal::new(snapshot.fields.clone());
 
     // Hide EditorMetadata — it's shown in the header.
-    if snapshot.name == "EditorMetadata" {
+    if component_name == "EditorMetadata" {
         return rsx! { span {} };
     }
     // AnimationPlayer is bundled into the Skeleton section below —
     // hide its own entry in the list so transport lives in one place.
-    if snapshot.name == "AnimationPlayer" {
+    if component_name == "AnimationPlayer" {
         return rsx! { span {} };
     }
     // Skeleton gets a rich custom body instead of generic field
     // reflection — clip dropdown, transport, scrubber, DQS toggle,
-    // bone tree. Delegate to the helper.
-    if snapshot.name == "Skeleton" {
-        return skeleton_component_section(__scope, snapshot);
+    // bone tree. The skeleton helper still wants the full snapshot, so
+    // we pull the latest from the store at this point. Skeleton state
+    // doesn't churn at 60Hz so the broader-grained reactivity here is
+    // fine; if it ever does, refactor the same way as the generic path.
+    if component_name == "Skeleton" {
+        let snap = store.inspector.get()
+            .and_then(|s| s.components.iter().find(|c| c.name == "Skeleton").cloned())
+            .unwrap_or_default();
+        return skeleton_component_section(__scope, snap);
     }
 
+    // Reactive list of field rows. The Memo computes each field's STATIC
+    // metadata bundled with the entity/component identifiers (so the
+    // for-body's `Fn` closure doesn't have to borrow them from outer
+    // scope — it owns each item). Only changes when the component's
+    // schema changes, so the for-loop reconciler preserves existing
+    // FieldRows across value updates.
+    let cn_for_fields = component_name.clone();
+    let entity_id_for_fields = entity_id.clone();
+    let field_rows: Memo<Vec<FieldRowProps>> = Memo::new(move || {
+        let cn = cn_for_fields.clone();
+        let eid = entity_id_for_fields.clone();
+        store.inspector.get()
+            .and_then(|s| s.components.iter().find(|c| c.name == cn).cloned())
+            .map(|c| c.fields.iter().map(|f| FieldRowProps {
+                entity_id: eid.clone(),
+                component_name: cn.clone(),
+                meta: FieldSnapshot {
+                    // Strip the live value — flows through a per-field
+                    // Memo inside FieldRow. Keeping value here would
+                    // refire the for-loop on every value change.
+                    name: f.name.clone(),
+                    field_type: f.field_type,
+                    value: FieldValue::default(),
+                    range: f.range,
+                    transient: f.transient,
+                    asset_filter: f.asset_filter.clone(),
+                    enum_options: f.enum_options.clone(),
+                    scrub: f.scrub,
+                },
+            }).collect())
+            .unwrap_or_default()
+    });
+
     // Build the remove callback for non-mandatory components.
-    let on_remove = if snapshot.removable {
+    let entity_id_for_remove = entity_id.clone();
+    let comp_name_for_remove = component_name.clone();
+    let on_remove = if removable {
         Some(Rc::new(move || {
-            let cn = comp_name.get();
-            if let Some(snap) = store.inspector.get() {
-                if let Ok(eid) = uuid::Uuid::parse_str(&snap.entity_id) {
-                    let _ = cmd_tx.get().send(rkp_engine::EngineCommand::RemoveComponent {
-                        entity_id: eid,
-                        component_name: cn,
-                    });
-                }
+            if let Ok(eid) = uuid::Uuid::parse_str(&entity_id_for_remove) {
+                let _ = cmd_tx.get().send(rkp_engine::EngineCommand::RemoveComponent {
+                    entity_id: eid,
+                    component_name: comp_name_for_remove.clone(),
+                });
             }
         }) as Rc<dyn Fn()>)
     } else {
@@ -217,17 +283,18 @@ fn ComponentSection(snapshot: ComponentSnapshot) -> NodeHandle {
 
     rsx! {
         div {
-            {prop_section_header(__scope, &snapshot.name, collapsed, on_remove)}
+            {prop_section_header(__scope, &component_name, collapsed, on_remove)}
 
             // Fields (hidden when collapsed)
             if !collapsed.get() {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:2px;",
-                    for field in fields.get() {
+                    for row in field_rows.get() {
                         FieldRow {
-                            key: field.name.clone(),
-                            snapshot: field.clone(),
-                            component_name: comp_name.get(),
+                            key: row.meta.name.clone(),
+                            entity_id: row.entity_id,
+                            component_name: row.component_name,
+                            meta: row.meta,
                         }
                     }
                 }
@@ -236,33 +303,52 @@ fn ComponentSection(snapshot: ComponentSnapshot) -> NodeHandle {
     }
 }
 
-/// A single field row — delegates to field_editors which uses prop_controls.
+/// Per-field-row payload: structural keys + static metadata. Used as
+/// the for-loop item type so the loop body's `Fn` closure owns each
+/// item rather than borrowing from outer scope.
+#[derive(Clone, PartialEq)]
+struct FieldRowProps {
+    entity_id: String,
+    component_name: String,
+    meta: FieldSnapshot,
+}
+
+/// A single field row. Reads its value reactively via a per-field Memo
+/// against `store.inspector` — when only this field changes, only this
+/// row's DOM updates; sibling fields stay completely quiet.
 #[component]
-fn FieldRow(snapshot: FieldSnapshot, component_name: String) -> NodeHandle {
+fn FieldRow(entity_id: String, component_name: String, meta: FieldSnapshot) -> NodeHandle {
     let store = use_context::<EditorStore>();
     let cmd = use_context::<CommandSender>();
 
-    let on_change: Rc<dyn Fn(FieldValue)> = {
-        let comp = component_name.clone();
-        let fname = snapshot.name.clone();
-        let cmd = cmd.clone();
-        Rc::new(move |value: FieldValue| {
-            if let Some(snap) = store.inspector.get() {
-                if let Ok(eid) = uuid::Uuid::parse_str(&snap.entity_id) {
-                    let serialized = serde_json::to_string(&value).unwrap_or_default();
-                    let _ = cmd.0.send(rkp_engine::EngineCommand::SetComponentField {
-                        entity_id: eid,
-                        component_name: comp.clone(),
-                        field_name: fname.clone(),
-                        value: serialized,
-                    });
-                }
-            }
-        })
-    };
+    // Per-field value Memo — short-circuits on PartialEq so unchanged
+    // fields never push DOM updates.
+    let cn_for_value = component_name.clone();
+    let fname_for_value = meta.name.clone();
+    let value: Memo<FieldValue> = Memo::new(move || {
+        store.inspector.get()
+            .and_then(|s| s.components.iter().find(|c| c.name == cn_for_value).cloned())
+            .and_then(|c| c.fields.iter().find(|f| f.name == fname_for_value).cloned())
+            .map(|f| f.value)
+            .unwrap_or_default()
+    });
+
+    let comp = component_name;
+    let fname = meta.name.clone();
+    let on_change: Rc<dyn Fn(FieldValue)> = Rc::new(move |new_value: FieldValue| {
+        if let Ok(eid) = uuid::Uuid::parse_str(&entity_id) {
+            let serialized = serde_json::to_string(&new_value).unwrap_or_default();
+            let _ = cmd.0.send(rkp_engine::EngineCommand::SetComponentField {
+                entity_id: eid,
+                component_name: comp.clone(),
+                field_name: fname.clone(),
+                value: serialized,
+            });
+        }
+    });
 
     rsx! {
-        {field_editors::field_editor(__scope, &snapshot, on_change)}
+        {field_editors::field_editor(__scope, &meta, value, on_change)}
     }
 }
 

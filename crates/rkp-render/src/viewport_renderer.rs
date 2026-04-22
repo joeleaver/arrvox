@@ -80,9 +80,11 @@ pub struct ViewportRenderer {
     pub tone_map: crate::ToneMapPass,
     pub composite_texture: wgpu::Texture,
     pub composite_view: wgpu::TextureView,
-    pub readback_buffers: [wgpu::Buffer; 2],
-    pub readback_index: usize,
-    pub readback_ready: bool,
+    /// Async readback ring — the engine writes the composite into one of
+    /// the buffers each frame, kicks off `map_async` immediately after
+    /// submit, and reads pixels back **without blocking** on `device.poll`.
+    /// See [`ReadbackRing`] for the state-machine details.
+    pub readback: ReadbackRing,
     pub wireframe_pass: crate::WireframePass,
     /// Isolation-mode infinite grid overlay. Always constructed; the
     /// host only dispatches it when the viewport's mode is `Isolation`.
@@ -189,10 +191,7 @@ impl ViewportRenderer {
         );
         let tone_map = crate::ToneMapPass::new(device, &bloom_composite.output_view, width, height);
 
-        let readback_buffers = [
-            create_readback_buffer(device, width, height),
-            create_readback_buffer(device, width, height),
-        ];
+        let readback = ReadbackRing::new(device, width, height);
 
         let wireframe_pass = crate::WireframePass::new(device, crate::LDR_FORMAT);
 
@@ -222,7 +221,7 @@ impl ViewportRenderer {
             shadow_trace, ssao, shade, volumetric, god_rays,
             gbuffer, pick_texture, pick_view, bloom, bloom_composite, tone_map,
             composite_texture, composite_view,
-            readback_buffers, readback_index: 0, readback_ready: false,
+            readback,
             wireframe_pass, grid, width, height,
         }
     }
@@ -306,11 +305,7 @@ impl ViewportRenderer {
         );
         self.tone_map = crate::ToneMapPass::new(device, &self.bloom_composite.output_view, width, height);
 
-        self.readback_buffers = [
-            create_readback_buffer(device, width, height),
-            create_readback_buffer(device, width, height),
-        ];
-        self.readback_ready = false;
+        self.readback.resize(device, width, height);
 
         self.composite_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("rkp composite"),
@@ -340,7 +335,15 @@ impl ViewportRenderer {
         (self.width * 4 + 255) & !255
     }
 
-    pub fn copy_composite_to_readback(&self, encoder: &mut wgpu::CommandEncoder) {
+    /// Encode a copy of the composite texture into the readback ring's
+    /// next idle buffer. Returns the index that was written, or `None` if
+    /// every buffer is still in flight (caller should skip readback this
+    /// frame and reuse cached pixels).
+    pub fn encode_composite_readback(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Option<usize> {
+        let idx = self.readback.acquire_write_idx()?;
         let padded_row = self.readback_padded_row();
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -350,7 +353,7 @@ impl ViewportRenderer {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
-                buffer: &self.readback_buffers[self.readback_index],
+                buffer: &self.readback.buffers[idx],
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_row),
@@ -363,11 +366,123 @@ impl ViewportRenderer {
                 depth_or_array_layers: 1,
             },
         );
+        Some(idx)
+    }
+}
+
+/// Triple-buffered async readback. The engine writes the composite into
+/// one buffer per frame, immediately issues `map_async` on it, and reads
+/// pixels back the frame (or two) later via [`drain_completed`]. There is
+/// no `device.poll(Wait)` anywhere on the hot path — completion is checked
+/// with `try_recv` after a non-blocking `poll(Poll)`.
+///
+/// Three buffers gives one slot for the in-flight write, one for the
+/// in-flight map, and one always-idle slot, so [`acquire_write_idx`]
+/// effectively never returns `None` when the GPU is keeping up.
+pub struct ReadbackRing {
+    pub buffers: [wgpu::Buffer; 3],
+    pending: [Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>; 3],
+    cached: Vec<u8>,
+    cached_w: u32,
+    cached_h: u32,
+}
+
+impl ReadbackRing {
+    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        Self {
+            buffers: [
+                create_readback_buffer(device, width, height),
+                create_readback_buffer(device, width, height),
+                create_readback_buffer(device, width, height),
+            ],
+            pending: [None, None, None],
+            cached: Vec::new(),
+            cached_w: 0,
+            cached_h: 0,
+        }
     }
 
-    pub fn advance_readback(&mut self) {
-        self.readback_ready = true;
-        self.readback_index = 1 - self.readback_index;
+    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        // Any in-flight maps reference the OLD buffers. Dropping the
+        // receiver is safe — the buffers themselves still exist until
+        // `Drop` runs in the next assignment, and wgpu cancels the maps
+        // when the buffer goes away.
+        self.pending = [None, None, None];
+        self.buffers = [
+            create_readback_buffer(device, width, height),
+            create_readback_buffer(device, width, height),
+            create_readback_buffer(device, width, height),
+        ];
+        self.cached.clear();
+        self.cached_w = 0;
+        self.cached_h = 0;
+    }
+
+    pub fn acquire_write_idx(&self) -> Option<usize> {
+        self.pending.iter().position(|p| p.is_none())
+    }
+
+    /// `true` when at least one readback slot is idle — i.e.
+    /// [`acquire_write_idx`] would return `Some`. Callers use this as a
+    /// GPU-backpressure signal: if every slot is still waiting for a
+    /// previously-submitted `map_async` to complete, the CPU is
+    /// outpacing the GPU and should back off rather than submit more
+    /// work (which would just deepen the queue and delay every pending
+    /// readback even further).
+    pub fn has_idle_slot(&self) -> bool {
+        self.pending.iter().any(|p| p.is_none())
+    }
+
+    /// After submit, kick off `map_async` on the buffer that was just
+    /// written. Buffer state goes from idle → in-flight; later
+    /// `drain_completed` will read it back and return it to idle.
+    pub fn issue_map_async(&mut self, idx: usize) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.buffers[idx].slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.pending[idx] = Some(rx);
+    }
+
+    /// Non-blocking: copy any completed maps' pixels into the cached
+    /// frame. Caller must have already done `device.poll(Poll)` so
+    /// callbacks can fire. Returns `true` when `cached_pixels` was
+    /// updated this call.
+    pub fn drain_completed(&mut self, width: u32, height: u32, padded_row: u32) -> bool {
+        let mut updated = false;
+        for i in 0..self.pending.len() {
+            let done = self.pending[i].as_ref().map(|rx| rx.try_recv().is_ok()).unwrap_or(false);
+            if !done {
+                continue;
+            }
+            self.pending[i] = None;
+            let slice = self.buffers[i].slice(..);
+            let data = slice.get_mapped_range();
+            let mut out = vec![0u8; (width * height * 4) as usize];
+            for y in 0..height as usize {
+                let src = y * padded_row as usize;
+                let dst = y * width as usize * 4;
+                let row = width as usize * 4;
+                if src + row <= data.len() && dst + row <= out.len() {
+                    out[dst..dst + row].copy_from_slice(&data[src..src + row]);
+                }
+            }
+            drop(data);
+            self.buffers[i].unmap();
+            self.cached = out;
+            self.cached_w = width;
+            self.cached_h = height;
+            updated = true;
+        }
+        updated
+    }
+
+    pub fn cached_pixels(&self) -> Option<(&[u8], u32, u32)> {
+        if self.cached.is_empty() {
+            None
+        } else {
+            Some((&self.cached, self.cached_w, self.cached_h))
+        }
     }
 }
 

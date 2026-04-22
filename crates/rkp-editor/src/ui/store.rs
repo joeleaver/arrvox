@@ -38,8 +38,11 @@ pub struct ProfilingWindow {
     ///
     /// [`gpu_pass_labels`]: EditorStore::gpu_pass_labels
     pub latest_gpu: Vec<(String, f32)>,
-    /// Raw `(frame_idx, total_cpu_ms)` for the last `HISTORY_LEN` frames,
-    /// oldest first. Used for the sparkline.
+    /// Raw `(frame_idx, render_dt_ms)` for the last `HISTORY_LEN`
+    /// frames, oldest first. The `render_dt_ms` is the render
+    /// thread's actual iteration interval — actual frame time, what
+    /// the editor surface sees as a frame rate. Used for the
+    /// sparkline.
     pub history: Vec<(u64, f32)>,
 }
 

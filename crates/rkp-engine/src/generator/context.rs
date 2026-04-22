@@ -84,6 +84,14 @@ pub struct GeneratorContext<'w> {
 
     // ── Worker-local — populated only by `new_worker` ──────────────
     generator_entity: Option<hecs::Entity>,
+    /// UUID of the generator entity. Combined with each emit's
+    /// `slot_key` to compute deterministic disk paths for
+    /// persistent-child bake caches.
+    generator_entity_uuid: Option<uuid::Uuid>,
+    /// Directory for persistent-child bake caches (typically
+    /// `{scene}.bakes/`). `None` = no scene path yet (unsaved
+    /// session) → caches not written → save+reload triggers regen.
+    child_cache_dir: Option<std::path::PathBuf>,
     param_hash: u64,
     next_scene_id: Option<&'w Arc<AtomicU32>>,
     tx_request: Option<Sender<BakeRequest>>,
@@ -118,6 +126,8 @@ impl<'w> GeneratorContext<'w> {
             cancel,
             progress,
             generator_entity: None,
+            generator_entity_uuid: None,
+            child_cache_dir: None,
             param_hash: 0,
             next_scene_id: None,
             tx_request: None,
@@ -139,6 +149,8 @@ impl<'w> GeneratorContext<'w> {
         cancel: CancelToken,
         progress: ProgressHandle,
         generator_entity: hecs::Entity,
+        generator_entity_uuid: Option<uuid::Uuid>,
+        child_cache_dir: Option<std::path::PathBuf>,
         _generator_name: String,
         param_hash: u64,
         device: &'w wgpu::Device,
@@ -155,6 +167,8 @@ impl<'w> GeneratorContext<'w> {
             cancel,
             progress,
             generator_entity: Some(generator_entity),
+            generator_entity_uuid,
+            child_cache_dir,
             param_hash,
             next_scene_id: Some(next_scene_id),
             tx_request: Some(tx_request),
@@ -188,55 +202,32 @@ impl<'w> GeneratorContext<'w> {
 
     // ─── Child emission ───────────────────────────────────────────────
 
-    /// Emit a child whose geometry is a procedural tree. The worker
-    /// will flatten, voxelize on its GPU evaluator, and integrate —
-    /// identical to the path a procedural-entity edit takes.
+    /// Emit a child whose geometry is a procedural tree.
+    ///
+    /// `slot_key` is the child's stable identity. On regen the engine
+    /// matches new emits against existing children by
+    /// `(parent, slot_key)`: matched children get reused (Transform +
+    /// geometry are swapped in place; every other component — Light,
+    /// physics colliders, gameplay scripts the user attached — is
+    /// preserved). Children whose key disappears in a later generation
+    /// are despawned. Slot keys also key the on-disk bake cache, so
+    /// they're what makes save+reload work without re-running the
+    /// generator.
+    ///
+    /// For loops emitting many of the same kind, use a positional key
+    /// like `format!("wall_{i}")` — stable as long as the iteration
+    /// order is stable.
     ///
     /// `local_transform` is local to the generator entity. The engine
     /// composes with the generator's snapshot transform at spawn time
     /// so the child ends up at the right world position.
     pub fn emit_child(
         &mut self,
-        tree: &rkp_procedural::ProceduralObject,
-        voxel_size: f32,
-        local_transform: Transform,
-        name_hint: Option<String>,
-    ) -> Result<(), GeneratorError> {
-        self.emit_child_inner(tree, voxel_size, local_transform, name_hint, None)
-    }
-
-    /// Emit a **persistent** child identified by `slot_key`. On regen,
-    /// the engine matches new emits against existing children by
-    /// `(parent, slot_key)`: matched children are reused (Transform +
-    /// geometry are swapped, every other component — Light, scripts,
-    /// physics colliders the user attached — is preserved). Children
-    /// whose key disappears in a later generation are despawned.
-    ///
-    /// Use for semantic carve-ups the user might want to address
-    /// individually (one-key-per-window, one-key-per-floor-slab).
-    /// Use plain `emit_child` for anonymous chunks (a wall sliced into
-    /// 50 blocks for budget reasons) — those carry no identity and
-    /// blow away cleanly on each regen.
-    pub fn emit_persistent_child(
-        &mut self,
         slot_key: impl Into<String>,
         tree: &rkp_procedural::ProceduralObject,
         voxel_size: f32,
         local_transform: Transform,
         name_hint: Option<String>,
-    ) -> Result<(), GeneratorError> {
-        self.emit_child_inner(
-            tree, voxel_size, local_transform, name_hint, Some(slot_key.into()),
-        )
-    }
-
-    fn emit_child_inner(
-        &mut self,
-        tree: &rkp_procedural::ProceduralObject,
-        voxel_size: f32,
-        local_transform: Transform,
-        name_hint: Option<String>,
-        slot_key: Option<String>,
     ) -> Result<(), GeneratorError> {
         self.check_cancelled()?;
         if voxel_size <= 0.0 {
@@ -252,7 +243,7 @@ impl<'w> GeneratorContext<'w> {
             voxel_size,
             local_transform,
             name_hint,
-            slot_key,
+            slot_key.into(),
         )
     }
 
@@ -261,33 +252,9 @@ impl<'w> GeneratorContext<'w> {
     /// anything that produces a `BakeArtifact` outside the procedural
     /// evaluator. The worker skips voxelization and goes straight to
     /// integrate.
+    ///
+    /// See [`emit_child`](Self::emit_child) for `slot_key` semantics.
     pub fn emit_child_artifact(
-        &mut self,
-        artifact: BakeArtifact,
-        aabb: Aabb,
-        voxel_size: f32,
-        local_transform: Transform,
-        name_hint: Option<String>,
-    ) -> Result<(), GeneratorError> {
-        self.check_cancelled()?;
-        if voxel_size <= 0.0 {
-            return Err(GeneratorError::InvalidParams(format!(
-                "voxel_size must be > 0, got {voxel_size}"
-            )));
-        }
-        self.enqueue_child_bake(
-            BakeInput::Artifact(artifact),
-            aabb,
-            voxel_size,
-            local_transform,
-            name_hint,
-            None,
-        )
-    }
-
-    /// Persistent variant of `emit_child_artifact`. See
-    /// `emit_persistent_child` for slot_key semantics.
-    pub fn emit_persistent_child_artifact(
         &mut self,
         slot_key: impl Into<String>,
         artifact: BakeArtifact,
@@ -308,7 +275,7 @@ impl<'w> GeneratorContext<'w> {
             voxel_size,
             local_transform,
             name_hint,
-            Some(slot_key.into()),
+            slot_key.into(),
         )
     }
 
@@ -319,7 +286,7 @@ impl<'w> GeneratorContext<'w> {
         voxel_size: f32,
         local_transform: Transform,
         name_hint: Option<String>,
-        slot_key: Option<String>,
+        slot_key: String,
     ) -> Result<(), GeneratorError> {
         let tx_request = self.tx_request.as_ref().ok_or_else(|| {
             GeneratorError::Failed("emit_child called without worker context".into())
@@ -333,6 +300,19 @@ impl<'w> GeneratorContext<'w> {
 
         let scene_id = next_scene_id.fetch_add(1, Ordering::Relaxed);
         self.emission_counter = self.emission_counter.wrapping_add(1);
+
+        // Deterministic on-disk bake-cache path keyed by
+        // (parent_uuid, slot_key). Same emit from the same generator
+        // always lands on the same file across sessions. `None` only
+        // when there's no scene path yet (unsaved scratch session) or
+        // the generator entity has no UUID — both edge cases that
+        // suppress caching gracefully.
+        let cache_output_path = match (&self.child_cache_dir, self.generator_entity_uuid) {
+            (Some(dir), Some(parent_uuid)) => {
+                Some(child_cache_path(dir, parent_uuid, &slot_key))
+            }
+            _ => None,
+        };
 
         let spec = GeneratorChildSpec {
             parent_entity: generator_entity,
@@ -353,7 +333,7 @@ impl<'w> GeneratorContext<'w> {
             // consult root_scale for this path.
             root_scale: glam::Vec3::ONE,
             prev_spatial: None,
-            cache_output_path: None,
+            cache_output_path,
             generator_child: Some(spec),
         };
         if tx_request.send(req).is_err() {
@@ -364,6 +344,36 @@ impl<'w> GeneratorContext<'w> {
         let _ = self.param_hash;
         Ok(())
     }
+}
+
+/// Compute the on-disk bake-cache path for a persistent generator
+/// child: `{child_cache_dir}/gen_{parent_uuid_short}_{slot_slug}.rkp`.
+///
+/// Same path is used at write time (worker bakes the artifact here)
+/// and at save time (engine references it from the SceneObject's
+/// `procedural_cache` field). Slot keys with non-filename-safe
+/// characters get sanitized to `_`.
+pub fn child_cache_path(
+    child_cache_dir: &std::path::Path,
+    parent_uuid: uuid::Uuid,
+    slot_key: &str,
+) -> std::path::PathBuf {
+    let slot_slug: String = slot_key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // First 8 hex chars of the parent UUID is enough to disambiguate
+    // children across generators within the same scene without making
+    // filenames unwieldy.
+    let parent_prefix = format!("{}", parent_uuid.simple());
+    let parent_prefix = &parent_prefix[..parent_prefix.len().min(8)];
+    child_cache_dir.join(format!("gen_{parent_prefix}_{slot_slug}.rkp"))
 }
 
 #[cfg(test)]

@@ -72,11 +72,13 @@ pub struct GeneratorChildSpec {
     /// regen whose generation has been bumped) can be detected and
     /// dropped by checking this against the generator's tracker.
     pub generation: u64,
-    /// `Some(key)` for persistent children — the engine matches by
-    /// (parent, slot_key) and reuses the existing entity (preserving
-    /// any user-attached components like lights or scripts). `None`
-    /// for anonymous children — they're blown away on each regen.
-    pub slot_key: Option<String>,
+    /// Stable identity assigned by the generator at emit time. The
+    /// engine matches new emits against existing children by
+    /// (parent, slot_key) and reuses the existing entity in place
+    /// (preserving any user-attached components like lights or
+    /// scripts). Children whose key disappears in a later generation
+    /// are despawned. Also keys the on-disk bake cache.
+    pub slot_key: String,
 }
 
 /// One unit of bake work.
@@ -155,6 +157,19 @@ pub struct GeneratorRequest {
     pub transform: crate::components::Transform,
     pub world_position: rkp_core::WorldPosition,
     pub generate_fn: GenerateFn,
+    /// UUID of the generator entity. Used (in concert with each
+    /// emit's slot_key) to compute deterministic disk paths for
+    /// persistent-child bake caches. `None` for entities that
+    /// haven't been UUID-stamped yet (shouldn't happen — every
+    /// generator entity gets one at spawn).
+    pub generator_entity_uuid: Option<uuid::Uuid>,
+    /// Directory under which persistent-child bake caches are
+    /// written by the worker (typically `{scene}.bakes/`). `None`
+    /// when the scene has no on-disk path yet (unsaved scratch
+    /// session) — children will still bake into pool memory but
+    /// won't have a persistent cache, so a save+reload will trigger
+    /// a regen.
+    pub child_cache_dir: Option<std::path::PathBuf>,
 }
 
 /// Generator lifecycle events. Child emissions do NOT flow through
@@ -417,6 +432,8 @@ fn run_generator(
         g.cancel.clone(),
         g.progress.clone(),
         g.entity,
+        g.generator_entity_uuid,
+        g.child_cache_dir.clone(),
         g.generator_name.clone(),
         g.param_hash,
         device,

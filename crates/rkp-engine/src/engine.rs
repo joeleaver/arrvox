@@ -10,8 +10,6 @@ use std::time::{Duration, Instant};
 use crossbeam::channel::Receiver;
 
 use rkp_render::rkp_gpu_object::RkpGpuObject;
-use rkp_render::rkp_renderer::RkpRenderer;
-use rkp_render::rkp_scene::FrameUpload;
 use rkp_render::rkp_scene_manager::RkpSceneManager;
 
 use crate::camera::CameraControlState;
@@ -184,40 +182,55 @@ pub type FrameCallback = Box<dyn Fn(crate::viewport::ViewportId, &[u8], u32, u32
 /// State update callback — called each tick with engine state.
 pub type StateCallback = Box<dyn Fn(&StateUpdate) + Send>;
 
-/// How aggressively the tick loop should pace itself.
+/// How aggressively a thread loop should pace itself.
 ///
-/// `Uncapped` runs as fast as the CPU/GPU can sustain — appropriate
-/// for game builds shipped to players. `TargetHz(N)` sleeps the
-/// remainder of each tick to hold a soft cap, useful for editor / dev
-/// tooling where unmetered wakeups burn battery and pin a fan for no
-/// visible benefit.
+/// Used by both the sim tick loop ([`EngineConfig::sim_pacing`]) and
+/// the render thread loop ([`EngineConfig::render_pacing`]).
 ///
-/// Sim correctness is independent of this knob: physics and behavior
-/// `FixedUpdate` run via accumulators on the real wall-clock dt, so
-/// they tick at the same simulation rate regardless of render rate.
-/// Per-frame systems (animation, camera/input, behavior `Update` /
-/// `LateUpdate`) advance by real_dt and stay frame-rate-correct.
+/// - `Uncapped` runs as fast as the CPU/GPU can sustain. Right for
+///   game builds shipped to players, or whenever you want maximum
+///   throughput at the cost of CPU.
+/// - `TargetHz(N)` sleeps each loop iteration's remainder to hold at
+///   most `N` iterations per second. Right for the editor (60 Hz keeps
+///   battery / fan reasonable), or to cap render at a display refresh
+///   rate.
+///
+/// Sim correctness is independent of these knobs: physics and behavior
+/// `FixedUpdate` run via accumulators on real wall-clock dt and tick
+/// at the same simulation rate regardless of any pacing. Per-frame
+/// systems (animation, camera/input, behavior `Update` / `LateUpdate`)
+/// advance by real_dt and stay frame-rate-correct.
+///
+/// Display-rate vsync is *not* a value in this enum: the engine
+/// renders headless to an offscreen texture and ships pixels to the
+/// editor, where the actual presentation (and any vsync) is owned by
+/// the rinch surface chain. To approximate vsync at the engine level,
+/// set `render_pacing: TargetHz(display_refresh_hz)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RenderPacing {
-    /// Run as fast as possible. Default for game builds.
+pub enum PacingMode {
+    /// Run as fast as possible.
     Uncapped,
-    /// Sleep at the end of each tick so the loop holds at most this
-    /// many ticks per second.
+    /// Sleep at the end of each loop iteration so the loop holds at
+    /// most this many iterations per second.
     TargetHz(u32),
 }
 
-impl RenderPacing {
+impl PacingMode {
     /// Sleep target as a Duration, or None for uncapped.
     pub fn target_interval(&self) -> Option<Duration> {
         match *self {
-            RenderPacing::Uncapped => None,
-            RenderPacing::TargetHz(0) => None,
-            RenderPacing::TargetHz(hz) => {
+            PacingMode::Uncapped => None,
+            PacingMode::TargetHz(0) => None,
+            PacingMode::TargetHz(hz) => {
                 Some(Duration::from_nanos(1_000_000_000u64 / hz as u64))
             }
         }
     }
 }
+
+/// Backwards-compatibility alias. New code should use [`PacingMode`].
+#[deprecated(note = "use `PacingMode` — `RenderPacing` was a misleading name when only the sim loop used it")]
+pub type RenderPacing = PacingMode;
 
 /// Configuration for spawning the engine.
 pub struct EngineConfig {
@@ -225,10 +238,17 @@ pub struct EngineConfig {
     pub width: u32,
     /// Initial render height.
     pub height: u32,
-    /// Tick-loop pacing policy. Editor defaults to a 60 Hz soft cap;
-    /// game builds should set this to `Uncapped` (or whatever target
-    /// the platform/display warrants).
-    pub render_pacing: RenderPacing,
+    /// Sim tick-loop pacing. Drives ECS, physics, behavior, animation,
+    /// snapshot construction. `TargetHz(60)` is the editor default;
+    /// games typically run sim at a fixed step (60 or 120 Hz).
+    pub sim_pacing: PacingMode,
+    /// Render thread pacing. Independent of sim. When `render_pacing`'s
+    /// rate exceeds `sim_pacing`'s, render interpolates between the
+    /// last two snapshots so visuals stay smooth at the higher rate
+    /// instead of strobing the same sim state. `TargetHz(60)` is the
+    /// editor default; games can set `Uncapped` or `TargetHz(144)` /
+    /// `TargetHz(240)` to match a high-refresh display.
+    pub render_pacing: PacingMode,
 }
 
 impl Default for EngineConfig {
@@ -236,7 +256,19 @@ impl Default for EngineConfig {
         Self {
             width: 1920,
             height: 1080,
-            render_pacing: RenderPacing::TargetHz(60),
+            // Sim caps at 60 Hz: physics + behavior FixedUpdate both
+            // accumulate against fixed 1/60 steps, so an uncapped sim
+            // would spin doing zero work most ticks. 60 Hz matches
+            // the fixed-step rate exactly — every tick produces one
+            // physics step on average.
+            sim_pacing: PacingMode::TargetHz(60),
+            // Render is uncapped by default. This is a game engine —
+            // players on 240 Hz monitors should get 240 fps. The
+            // render thread interpolates between sim snapshots so
+            // visuals stay smooth even though sim is locked at 60 Hz.
+            // Editor / dev tooling can override to TargetHz(N) if
+            // they want a softer cap (battery, fans, etc.).
+            render_pacing: PacingMode::Uncapped,
         }
     }
 }
@@ -340,32 +372,55 @@ struct PendingPick {
 }
 
 struct EngineState {
-    // GPU
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-
-    // Rendering pipeline
-    renderer: RkpRenderer,
-    /// Per-viewport render targets + post-process state. Single MAIN entry
-    /// in Phase 2; later phases will key BUILD / PiP / minimap viewports
-    /// alongside.
-    viewport_renderers: std::collections::HashMap<crate::viewport::ViewportId, rkp_render::ViewportRenderer>,
+    /// Render thread handle. Owns the wgpu device/queue/renderer/
+    /// viewport renderers; sim communicates only via `render_worker.inbox`
+    /// (per-frame `RenderFrame` snapshots), `render_worker.outbox`
+    /// (per-frame `RenderResult` returns: pick + atten + GPU timings),
+    /// and `render_worker.commands` (aperiodic events: resize, etc.).
+    /// Dropping this triggers the render thread to shut down.
+    render_worker: crate::render_worker::RenderWorker,
 
     // Scene management (CPU). Wrapped in `Arc<Mutex<>>` so the bake
     // worker can run the integrate pass (dealloc-prev + memcpy +
     // remap) against the shared pools directly, without shipping
     // artifacts back to the main thread for a 75+ ms copy. The lock
-    // is uncontended on most frames — only `render_frame`'s
-    // geometry upload + asset loads touch the scene_mgr, and those
-    // finish in a ms or two. See `bake_worker::run_loop` for the
-    // worker-side lock scope.
+    // is uncontended on most frames — only the render thread's
+    // per-frame geometry upload and the sim thread's asset loads
+    // touch it, and both finish in a ms or two. See
+    // `bake_worker::run_loop` for the worker-side lock scope.
     scene_mgr: std::sync::Arc<std::sync::Mutex<RkpSceneManager>>,
 
-    /// GPU-backed evaluator for procedural trees. Lazy-initialized on
-    /// the first procedural bake. All procedural voxelization (spawn,
-    /// explicit bake, transform-scale re-bake) flows through this —
-    /// the CPU tree evaluator was removed; the GPU is the only path.
-    gpu_evaluator: Option<rkp_render::proc_sample::GpuEvaluator>,
+    /// Lock-free handle on `scene_mgr.geometry_epoch()` so per-tick
+    /// reads (in `submit_render_frame`) don't take the scene_mgr
+    /// Mutex. Without this, every sim tick blocks for the duration
+    /// of any in-progress bake_worker integrate (~50 ms+), dropping
+    /// sim from 60 Hz to ~20 Hz and making animation/camera feel
+    /// like 0.5 fps.
+    geometry_epoch_handle: std::sync::Arc<std::sync::atomic::AtomicU64>,
+
+    /// Sim-side cache of per-asset skinning data. Built lazily under
+    /// the scene_mgr lock only when `skinning_data_cache_epoch` falls
+    /// behind the current `geometry_epoch_handle`, i.e. when a bake
+    /// completes or an asset is (re)loaded. On most ticks there's no
+    /// epoch change, so sim reads the cache directly without touching
+    /// the scene_mgr Mutex — even when bake_worker is mid-integrate
+    /// holding the lock for 100 ms+.
+    ///
+    /// The previous pattern was `scene_mgr.lock().unwrap().skinning_data(...)`
+    /// once per skinned entity inside `update_scene_gpu`, so any bake
+    /// in flight would stall sim for the full duration of the bake's
+    /// `integrate_artifact`. Dropped sim from 60 Hz to ~5 Hz with
+    /// multiple bakes and a few skinned entities — visible as
+    /// "0.5 fps animation and camera" even though render reported
+    /// 170 fps.
+    skinning_data_cache: std::collections::HashMap<
+        rkp_render::AssetHandle,
+        rkp_render::SkinningAssetData,
+    >,
+    /// Last `geometry_epoch` we used to build [`Self::skinning_data_cache`].
+    /// When `geometry_epoch_handle > this`, the cache is stale and
+    /// gets rebuilt next tick.
+    skinning_data_cache_epoch: u64,
 
     /// Async bake pipeline. The worker owns its own GpuEvaluator and
     /// private pools; the engine sends requests + drains results on
@@ -503,6 +558,23 @@ struct EngineState {
     /// poses (crouch, acrobatic, twist-heavy clips) or to A/B compare.
     dqs_enabled: bool,
 
+    /// Latest cloud-sun attenuation read from MAIN's volumetric pass,
+    /// fed back over the render→sim result channel each frame. Sim
+    /// uses it as the *target* of an EMA into [`Self::cloud_sun_atten`]
+    /// (which is what actually scales the sun light on the next
+    /// frame). NaN sentinel = render hasn't published a value yet
+    /// (e.g. during the first frame or while MAIN is hidden); sim
+    /// holds the previous target in that case.
+    last_cloud_sun_atten_raw: f32,
+
+    /// Sim-side stash for the most recently submitted pick's
+    /// CPU-resolved ghost hint. Rendering is GPU-only; the ghost
+    /// priority logic stays sim-side because it depends on the
+    /// procedural tree (sim-owned). When the matching `PickResult`
+    /// arrives back from render, sim consults this to decide whether
+    /// the ghost win overrides the GPU-decoded NodeId.
+    in_flight_pick_ghost: Option<u32>,
+
     /// Material library — manages .rkmat files and runtime palette.
     material_lib: crate::material_library::MaterialLibrary,
     /// Currently selected material in the materials panel.
@@ -547,6 +619,12 @@ struct EngineState {
     /// EMA of physics substeps per second across the engine tick. When
     /// physics is stepping at the target 60 Hz this sits near 60.
     physics_hz_ema: f32,
+    /// EMA of the render thread's actual iteration rate, in Hz. Fed
+    /// from `RenderResult::render_dt_ms` each time sim drains the
+    /// render outbox. This is the "FPS" the editor displays — it
+    /// reflects the on-screen production cadence, not sim CPU
+    /// headroom (which `1 / cpu_total_ms` would be).
+    render_hz_ema: f32,
     /// Last inspector snapshot we sent to the editor. Used to skip pushing
     /// an identical snapshot every tick — without this, the panel re-renders
     /// 60Hz when physics writes Transform on a selected RigidBody, which
@@ -630,21 +708,13 @@ struct EngineState {
     /// Mouse position in viewport pixels (for gizmo hover).
     mouse_pos: glam::Vec2,
 
-    // Pick readback (8 bytes for 1 pixel of Rg32Uint material texture)
-    pick_readback_buffer: wgpu::Buffer,
-    /// Pending pixel-pick: a (viewport, x, y) issued by a click in the
-    /// corresponding viewport, awaiting a G-buffer readback. The
-    /// viewport tag chooses how to interpret the readback — MAIN
-    /// decodes entity scene_id (old path), BUILD decodes per-primitive
-    /// NodeId when in raymarch mode (new path, enables
-    /// click-to-select-primitive in the build viewport).
+    /// Pending pixel-pick: a (viewport, x, y) plus optional CPU-resolved
+    /// ghost-priority hint. Sim populates this on click; it travels in
+    /// the next [`crate::render_frame::RenderFrame`] to the render
+    /// thread, which encodes the G-buffer copy. The render thread
+    /// returns the raw payload via `RenderResult::pick_result`; sim
+    /// resolves the final entity / NodeId in `process_pick_result`.
     pending_pick: Option<PendingPick>,
-    /// In-flight pick map. Set when a pick is encoded + map_async issued
-    /// after submit. Read at the top of the next render_frame via
-    /// `try_recv` — non-blocking; if the map hasn't completed yet the
-    /// pick is processed a frame later. One frame of pick latency is
-    /// invisible and avoids the per-click `device.poll(Wait)` block.
-    pick_in_flight: Option<(PendingPick, std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>)>,
     /// Cached light count for march pass (set in light upload block, used in render).
     num_lights_cache: u32,
     /// Base ShadeParams (recomputed once per frame from environment +
@@ -685,7 +755,7 @@ impl EngineState {
         self.surfacenet_enabled
     }
 
-    fn new(config: &EngineConfig) -> Self {
+    fn new(config: &EngineConfig, frame_callback: FrameCallback) -> Self {
         let ctx = rkp_render::RenderContext::new_headless();
         let device = ctx.device;
         let queue = ctx.queue;
@@ -693,30 +763,16 @@ impl EngineState {
         let width = config.width;
         let height = config.height;
 
-        let mut renderer = RkpRenderer::new(&device, &queue, width, height);
-
-        // Build the main viewport renderer — owns its full per-resolution
-        // pass chain (march/shade/ssao/etc.), gbuffer, bloom chain,
-        // tone-map, composite, readback, wireframe-overlay state, plus
-        // its own camera buffer + scene bind group.
-        let main_viewport_renderer = rkp_render::ViewportRenderer::new(
-            &device, &queue, &mut renderer, width, height,
-        );
-        // Pre-create the BUILD viewport renderer at its default size. It
-        // starts invisible (Viewport::new_build) so render_to skips it
-        // until the editor enables it via SetViewportVisible. Allocating
-        // up-front (~20 MiB) is cheaper than the latency hit of creating
-        // it when the user opens the build surface mid-session.
-        let build_viewport_renderer = rkp_render::ViewportRenderer::new(
-            &device, &queue, &mut renderer, 800, 600,
-        );
-        let mut viewport_renderers = std::collections::HashMap::new();
-        viewport_renderers.insert(crate::viewport::ViewportId::MAIN, main_viewport_renderer);
-        viewport_renderers.insert(crate::viewport::ViewportId::BUILD, build_viewport_renderer);
-
         let scene_mgr = std::sync::Arc::new(std::sync::Mutex::new(
             RkpSceneManager::new(1_000_000),
         ));
+        // Clone the lock-free epoch handle ONCE at startup; sim
+        // reads it every tick to detect geometry changes without
+        // having to take the scene_mgr Mutex.
+        let geometry_epoch_handle = scene_mgr
+            .lock()
+            .expect("scene_mgr poisoned")
+            .epoch_handle();
 
         // Input system with default action map.
         let mut input_system = rkp_runtime::input::InputSystem::new();
@@ -724,18 +780,9 @@ impl EngineState {
         input_system.set_active_map("editor");
         let camera_control = CameraControlState::default();
 
-        // Pick readback buffer — two 1-pixel slots packed at 256-byte
-        // aligned offsets: material (Rg32Uint, 8 bytes) at 0..8, pick
-        // (R32Uint, 4 bytes) at 256..260. `process_pick_result` reads
-        // both to resolve voxel / procedural picks cleanly now that
-        // primitive_node_id lives in its own texture.
-        let pick_readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rkp pick readback"),
-            size: 512,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
+        // Bake worker: shares device/queue clones (cheap — wgpu wraps
+        // the underlying objects in Arcs internally) and the same
+        // scene_mgr we'll hand to the render thread below.
         let next_scene_id = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let bake_worker = crate::bake_worker::BakeWorker::spawn(
             device.clone(),
@@ -749,16 +796,36 @@ impl EngineState {
             bake_worker.rx_generator.clone(),
         );
 
+        // Render worker — takes ownership of `device` + `queue` and
+        // builds the renderer + per-VR pass chains on the render
+        // thread. Sim never touches wgpu after this point; everything
+        // GPU goes through the snapshot/result/command channels on
+        // `render_worker`.
+        let render_init = crate::render_frame::RenderInit {
+            device,
+            queue,
+            initial_width: width,
+            initial_height: height,
+            scene_mgr: scene_mgr.clone(),
+            render_pacing: config.render_pacing,
+        };
+        let render_worker = crate::render_worker::RenderWorker::spawn(
+            render_init,
+            frame_callback,
+        );
+
         Self {
             bake_worker,
             generator_system,
             next_scene_id,
-            device,
-            queue,
-            renderer,
-            viewport_renderers,
+            render_worker,
             scene_mgr,
-            gpu_evaluator: None,
+            geometry_epoch_handle,
+            skinning_data_cache: std::collections::HashMap::new(),
+            // 0 → cache rebuilds the first time epoch > 0 (any
+            // geometry mutation triggers it). Until then the cache
+            // is empty, which matches a freshly-spawned scene.
+            skinning_data_cache_epoch: 0,
             input_system,
             camera_control,
             camera: CameraState::default(),
@@ -814,6 +881,8 @@ impl EngineState {
             skin_reuse: false,
             skinning_enabled: true,
             dqs_enabled: false,
+            last_cloud_sun_atten_raw: f32::NAN,
+            in_flight_pick_ghost: None,
             material_lib: crate::material_library::MaterialLibrary::new(),
             selected_material: None,
             selected_model: None,
@@ -833,6 +902,7 @@ impl EngineState {
             collider_caches_dirty: true,
             tick_hz_ema: 60.0,
             physics_hz_ema: 0.0,
+            render_hz_ema: 0.0,
             prev_inspector: None,
             prev_procedural: None,
             prev_environment: None,
@@ -854,9 +924,7 @@ impl EngineState {
             proc_gizmo_parent_world: glam::Affine3A::IDENTITY,
             proc_gizmo_initial_local: (glam::Vec3::ZERO, glam::Quat::IDENTITY, glam::Vec3::ONE),
             mouse_pos: glam::Vec2::ZERO,
-            pick_readback_buffer,
             pending_pick: None,
-            pick_in_flight: None,
             num_lights_cache: 1,
             shade_params_base: rkp_render::rkp_shade::ShadeParams::default(),
             lod_enabled: true,
@@ -869,123 +937,134 @@ impl EngineState {
         }
     }
 
-    /// Render every visible viewport this tick. Once-per-frame work (light
-    /// upload, geometry upload, env params) happens once at the top; the
-    /// per-viewport block (camera build, screen-aabbs, frame upload, render,
-    /// pick/wireframe on MAIN, readback copy) iterates the visible set. One
-    /// encoder + one submit covers the whole frame; readback is then mapped
-    /// per viewport and delivered via `frame_callback`.
+    /// Build a [`RenderFrame`] snapshot from current ECS / environment
+    /// state and submit it to the render thread.
     ///
-    /// Phase 4 caveat: only MAIN is visible by default and the renderer's
-    /// internal pass resources stay sized to MAIN. A second visible viewport
-    /// at a different resolution would need either a per-renderer-resize per
-    /// iteration or a pass-internal split — both deferred to Phase 6 since
-    /// no UI surfaces a second viewport yet.
-    fn render_frame(&mut self, frame_callback: &FrameCallback) {
+    /// Sim does no GPU work directly anymore — every per-frame thing the
+    /// renderer used to read off `EngineState` is now packaged into a
+    /// snapshot and shipped over `render_worker.inbox`. The render
+    /// thread consumes, encodes, submits, and returns a
+    /// [`RenderResult`] back via `render_worker.outbox` (which we drain
+    /// in [`Self::drain_render_results`] called from the tick loop).
+    ///
+    /// Returns the CPU phases for this submission (setup vs. snapshot
+    /// build vs. submit-handoff). The post-submit bucket reflects the
+    /// time spent waiting for render-thread results, which is also a
+    /// proxy for GPU backpressure.
+    ///
+    /// Originally a 700-line method that owned both the build *and* the
+    /// GPU work. The latter migrated to [`crate::render_worker`]; what
+    /// remains here is purely sim-side data assembly.
+    fn submit_render_frame(&mut self) {
         use crate::viewport::ViewportId;
         let frame_start = std::time::Instant::now();
 
-        // 0. Drive the wgpu async runtime + consume any pick that completed
-        // since the last frame. Both are non-blocking — the pick read just
-        // returns if its async map hasn't fired yet, and runs next frame.
-        let _ = self.device.poll(wgpu::PollType::Poll);
-        self.drain_pick_result();
+        // 0. Drain RenderResults that landed since last submit. The
+        //    render thread runs on its own pace; the latest result it
+        //    finished publishing carries the freshest pick decoding,
+        //    cloud-sun atten, and GPU pass timings for us to fold back
+        //    into sim state before we build the next snapshot.
+        self.drain_render_results();
 
-        // 0a. Upload material palette if dirty.
-        if self.material_lib.is_dirty() {
-            let palette = self.material_lib.build_palette();
-            self.renderer.update_materials(&self.queue, &palette);
-            self.material_lib.clear_dirty();
-        }
+        // 0a. Material palette — built every tick and shipped in the
+        //     snapshot. Render uploads every frame. Cheap (small Vec)
+        //     and robust to snapshot drops; the old "ship only when
+        //     dirty" pattern could lose the upload if its carrying
+        //     snapshot was dropped by the newest-wins inbox before
+        //     render saw it.
+        let materials = self.material_lib.build_palette();
+        // Clear the dirty flag so any other consumers (UI, etc.)
+        // know the palette they observed has been published. We
+        // ship every tick regardless, so the flag is purely for
+        // outside-of-render bookkeeping now.
+        self.material_lib.clear_dirty();
 
-        // Camera uniforms are needed now for altitude-dependent atmosphere
-        // params (sun transmittance, sky colors). Building them early — the
-        // actual per-frame upload still happens at step 2. Uses MAIN camera
-        // since sun + lights are scene-wide (not per-viewport).
-        let cam_uniforms = self.build_camera_uniforms(crate::viewport::ViewportId::MAIN);
-        let cam_y = cam_uniforms.position[1];
+        // MAIN camera first: atmosphere LUTs + sun-light tinting both
+        // depend on its altitude (scene-wide values shared across VRs).
+        let main_cam = self.build_camera_uniforms(ViewportId::MAIN);
+        let cam_y = main_cam.position[1];
 
-        // 0b. Upload environment + lights.
-        // Always rebuild lights array (entity lights may have moved).
+        // Cloud-sun atten: smooth toward the latest render-thread
+        // readback (fed in via `last_cloud_sun_atten_raw` by
+        // `drain_render_results`). NaN sentinel = render hasn't
+        // published one yet (first frame, MAIN hidden), so we hold the
+        // last EMA target.
+        let target_atten = if self.environment.attenuate_sun_by_clouds
+            && self.environment.clouds_enabled
         {
-            // Cloud → sun attenuation comes from a GPU readback of the dedicated
-            // compute pass on MAIN's volumetric. `sun_atten_value()` is the
-            // last-received exp(-τ); it lags 1–2 frames but the temporal
-            // lerp hides that.
-            let target_atten = if self.environment.attenuate_sun_by_clouds && self.environment.clouds_enabled {
-                self.viewport_renderers
-                    .get(&crate::viewport::ViewportId::MAIN)
-                    .map(|vr| vr.volumetric.sun_atten_value())
-                    .unwrap_or(1.0)
+            if self.last_cloud_sun_atten_raw.is_nan() {
+                self.cloud_sun_atten
             } else {
-                1.0
-            };
-            // Lerp slowly toward the readback value — the GPU integral can still
-            // swing a bit when a cloud edge crosses the camera→sun ray, and a
-            // multi-frame fade reads as "cloud rolling over the sun" rather than
-            // a per-frame flicker.
-            self.cloud_sun_atten = self.cloud_sun_atten + (target_atten - self.cloud_sun_atten) * 0.04;
-
-            let mut sun_light = self.environment.to_gpu_light(cam_y);
-            sun_light.color[0] *= self.cloud_sun_atten;
-            sun_light.color[1] *= self.cloud_sun_atten;
-            sun_light.color[2] *= self.cloud_sun_atten;
-            let mut gpu_lights = vec![sun_light]; // [0] = sun
-
-            // Collect point lights from entities.
-            for (_entity, (transform, pl)) in self.world.query::<(&crate::components::Transform, &crate::components::PointLight)>().iter() {
-                gpu_lights.push(rkp_render::rkp_shade::GpuLight {
-                    position: [transform.position.x, transform.position.y, transform.position.z, 1.0], // w=1 = point
-                    color: [pl.color[0], pl.color[1], pl.color[2], pl.intensity],
-                    direction: [0.0, 0.0, 0.0, 0.0],
-                    params: [pl.range, 0.0, 0.0, if pl.cast_shadow { 1.0 } else { 0.0 }],
-                });
+                self.last_cloud_sun_atten_raw
             }
+        } else {
+            1.0
+        };
+        self.cloud_sun_atten += (target_atten - self.cloud_sun_atten) * 0.04;
 
-            // Collect spot lights from entities.
-            for (_entity, (transform, sl)) in self.world.query::<(&crate::components::Transform, &crate::components::SpotLight)>().iter() {
-                gpu_lights.push(rkp_render::rkp_shade::GpuLight {
-                    position: [transform.position.x, transform.position.y, transform.position.z, 2.0], // w=2 = spot
-                    color: [sl.color[0], sl.color[1], sl.color[2], sl.intensity],
-                    direction: [sl.direction.x, sl.direction.y, sl.direction.z, sl.outer_angle.to_radians()],
-                    params: [sl.range, sl.inner_angle.to_radians(), 0.0, if sl.cast_shadow { 1.0 } else { 0.0 }],
-                });
-            }
-
-            let mut shade_params = self.environment.to_shade_params(cam_y);
-            shade_params.num_lights = gpu_lights.len() as u32;
-            // Stash the base shade_params; the per-viewport loop below
-            // writes it (with the per-VR `isolation` flag set) into the
-            // shared shade_params buffer just before each VR's submit.
-            // Same shared-buffer-per-VR-submit pattern as vol/cloud/atmo.
-            self.shade_params_base = shade_params;
-            self.renderer.update_lights(&self.queue, &gpu_lights);
-            self.num_lights_cache = shade_params.num_lights;
-
-            if self.environment_dirty {
-                // Bloom/tonemap params apply to every viewport (each VR
-                // owns its own bloom + tonemap pass; no per-viewport
-                // overrides today, everybody shares the scene's env).
-                // If we skip non-MAIN here, BUILD falls back to default
-                // bloom intensity/exposure and the preview looks
-                // massively over-bloomed — same shared-state bug class
-                // as Phase 6a's camera buffer.
-                let env = &self.environment;
-                let queue = &self.queue;
-                let vr_ids: Vec<_> = self.viewport_renderers.keys().copied().collect();
-                for vr_id in vr_ids {
-                    let vr = self.viewport_renderers
-                        .get_mut(&vr_id)
-                        .expect("viewport renderer must exist");
-                    vr.tone_map.set_exposure(queue, env.exposure);
-                    vr.bloom.set_threshold(queue, env.bloom_threshold, env.bloom_knee);
-                    vr.bloom_composite.set_intensity(queue, env.bloom_intensity);
-                }
-                self.environment_dirty = false;
-            }
+        // Sun + entity-driven point/spot lights, all in the order the
+        // shade shader expects (entry 0 = sun).
+        let mut sun_light = self.environment.to_gpu_light(cam_y);
+        sun_light.color[0] *= self.cloud_sun_atten;
+        sun_light.color[1] *= self.cloud_sun_atten;
+        sun_light.color[2] *= self.cloud_sun_atten;
+        let mut gpu_lights = vec![sun_light];
+        for (_entity, (transform, pl)) in self
+            .world
+            .query::<(&crate::components::Transform, &crate::components::PointLight)>()
+            .iter()
+        {
+            gpu_lights.push(rkp_render::rkp_shade::GpuLight {
+                position: [transform.position.x, transform.position.y, transform.position.z, 1.0],
+                color: [pl.color[0], pl.color[1], pl.color[2], pl.intensity],
+                direction: [0.0, 0.0, 0.0, 0.0],
+                params: [pl.range, 0.0, 0.0, if pl.cast_shadow { 1.0 } else { 0.0 }],
+            });
+        }
+        for (_entity, (transform, sl)) in self
+            .world
+            .query::<(&crate::components::Transform, &crate::components::SpotLight)>()
+            .iter()
+        {
+            gpu_lights.push(rkp_render::rkp_shade::GpuLight {
+                position: [transform.position.x, transform.position.y, transform.position.z, 2.0],
+                color: [sl.color[0], sl.color[1], sl.color[2], sl.intensity],
+                direction: [
+                    sl.direction.x,
+                    sl.direction.y,
+                    sl.direction.z,
+                    sl.outer_angle.to_radians(),
+                ],
+                params: [
+                    sl.range,
+                    sl.inner_angle.to_radians(),
+                    0.0,
+                    if sl.cast_shadow { 1.0 } else { 0.0 },
+                ],
+            });
         }
 
-        // 0c. Rebuild GPU objects from ECS world only when transforms/objects changed.
+        let mut shade_params = self.environment.to_shade_params(cam_y);
+        shade_params.num_lights = gpu_lights.len() as u32;
+        self.shade_params_base = shade_params;
+        self.num_lights_cache = shade_params.num_lights;
+
+        // Env update — shipped every tick (cheap; render writes a few
+        // u32-sized queue.write_buffers). Same drop-safety rationale
+        // as `materials`.
+        let env_update = crate::render_frame::EnvUpdate {
+            exposure: self.environment.exposure,
+            bloom_threshold: self.environment.bloom_threshold,
+            bloom_knee: self.environment.bloom_knee,
+            bloom_intensity: self.environment.bloom_intensity,
+        };
+        // Clear the legacy flag for other consumers; render no longer
+        // gates on it.
+        self.environment_dirty = false;
+
+        // 0c. Rebuild GPU objects from ECS world only when
+        //     transforms/objects/membership changed.
+        let gpu_objects_dirty_this_frame = self.gpu_objects_dirty;
         if self.gpu_objects_dirty {
             self.update_scene_gpu();
             self.gpu_objects_dirty = false;
@@ -993,48 +1072,47 @@ impl EngineState {
 
         let t_cpu_setup = frame_start.elapsed();
 
-        // 1. Upload geometry + per-frame objects once (queue-side, no
-        // encoder). Before any submit so all viewports see the same
-        // scene data.
+        // 1. Geometry epoch — read lock-free via the shared atomic
+        //    handle. Render compares against its own last-uploaded
+        //    epoch and re-uploads when behind. Robust to dropped
+        //    snapshots: the next snapshot still carries the latest
+        //    epoch, so render always catches up.
+        //
+        //    The lock-free read is what keeps sim at 60 Hz while
+        //    bake_worker is busy — taking `scene_mgr.lock()` here
+        //    would block sim for the full duration of any bake
+        //    integrate (50 ms+).
+        //
+        //    The legacy `self.geometry_dirty` flag is kept for collider
+        //    rebuild scheduling (independent of GPU upload). It's set
+        //    by every code path that mutates scene geometry.
+        let geometry_epoch = self
+            .geometry_epoch_handle
+            .load(std::sync::atomic::Ordering::Acquire);
         if self.geometry_dirty {
-            let sm = self.scene_mgr.lock().unwrap();
-            let geo = sm.geometry_upload();
-            self.renderer.upload_geometry(&self.queue, &geo);
-            drop(sm);
-            self.geometry_dirty = false;
             self.collider_caches_dirty = true;
+            self.geometry_dirty = false;
         }
         if self.collider_caches_dirty {
             self.rebuild_collider_caches();
             self.collider_caches_dirty = false;
         }
-        self.renderer.upload_frame(&self.queue, &FrameUpload {
-            objects: &self.gpu_objects,
-            bone_matrices: self.bone_matrix_allocator.bytes(),
-            bone_dual_quats: self.bone_matrix_allocator.bytes_dq(),
-        });
 
-        // 2b. Skeletal skin-deform scatter. Folds every skinned
-        // entity into one batched compute dispatch so we fire exactly
-        // one `write_buffer` per input — side-stepping the write-
-        // ordering pitfall of multiple per-entity dispatches sharing
-        // a single uniform/brick buffer inside one submission.
-        //
-        // Gets its own encoder + submit because per-VR submits below
-        // each produce their own encoder. Submitting the scatter first
-        // keeps the bone_field / bone_field_occ writes ordered before
-        // any viewport's march dispatch reads them.
-        if self.skinning_enabled && !self.skin_dispatches.is_empty() && !self.skin_reuse {
-            let mut skin_encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("rkp_skin_deform_encoder"),
-            });
-            let q = self.renderer.profiler.begin_query("skin_deform", &mut skin_encoder);
-            self.renderer.prepare_bone_field(
-                &self.queue,
-                &mut skin_encoder,
-                self.skin_bone_field_bytes,
-                self.skin_bone_field_occ_bytes,
-            );
+        // 2. Bone matrix bytes for shading (LBS + DQ paths).
+        let bone_matrix_lbs = self.bone_matrix_allocator.bytes().to_vec();
+        let bone_matrix_dqs = self.bone_matrix_allocator.bytes_dq().to_vec();
+
+        // 2b. Skin scatter — fold per-entity dispatches into one
+        //     batched compute dispatch sim-side; render fires the
+        //     batch on its thread. `skin_reuse` short-circuits when
+        //     every skinned pose was byte-identical to the previous
+        //     frame (paused animation), in which case the bone_field
+        //     buffer from last frame is still valid and the scatter
+        //     can skip entirely.
+        let skin = if self.skinning_enabled
+            && !self.skin_dispatches.is_empty()
+            && !self.skin_reuse
+        {
             self.skin_batch.clear();
             for plan in &self.skin_dispatches {
                 let d = rkp_render::SkinDispatch {
@@ -1043,103 +1121,114 @@ impl EngineState {
                 };
                 self.skin_batch.push(&d);
             }
-            self.renderer.scatter_skin_batch(&self.queue, &mut skin_encoder, &self.skin_batch);
-            self.renderer.profiler.end_query(&mut skin_encoder, q);
-            self.queue.submit(std::iter::once(skin_encoder.finish()));
-        } else if self.skinning_enabled && self.frame_index % 60 == 0 {
-            // Once a second, log why scatter isn't running when the
-            // user has the toggle on — most common reason is a stale
-            // `.rkp` without the new skin-meta section, or no skinned
-            // entities in the scene.
-            let skinned_entities = self.world.query::<&crate::components::Skeleton>().iter().count();
-            if skinned_entities > 0 {
-                eprintln!(
-                    "[RkpEngine] skinning enabled, {} skinned entities, but 0 scatter dispatches this frame. \
-                     Likely cause: stale .rkp without skin-meta section — re-import the asset.",
-                    skinned_entities,
-                );
+            Some(crate::render_frame::RenderSkin {
+                bone_field_bytes: self.skin_bone_field_bytes,
+                bone_field_occ_bytes: self.skin_bone_field_occ_bytes,
+                batch: self.skin_batch.clone(),
+            })
+        } else {
+            if self.skinning_enabled && self.frame_index % 60 == 0 {
+                // Once a second, log why scatter isn't running when
+                // the user has the toggle on — most common reason is
+                // a stale `.rkp` without the new skin-meta section.
+                let skinned_entities = self
+                    .world
+                    .query::<&crate::components::Skeleton>()
+                    .iter()
+                    .count();
+                if skinned_entities > 0 {
+                    eprintln!(
+                        "[RkpEngine] skinning enabled, {} skinned entities, but 0 scatter dispatches this frame. \
+                         Likely cause: stale .rkp without skin-meta section — re-import the asset.",
+                        skinned_entities,
+                    );
+                }
             }
-        }
+            None
+        };
 
-        let t_upload = frame_start.elapsed();
-
-        // ── Per-viewport rendering with one submit per viewport ─────────
-        // `queue.write_buffer` is queue-global — only the last write
-        // before a submit is visible. Per-frame params (vol/cloud/
-        // god_ray/atmo) are a shared buffer that each viewport writes
-        // its own values to. Without a per-viewport submit boundary,
-        // MAIN's dispatches would read BUILD's params (or vice versa)
-        // and both viewports would render wrong. One submit per
-        // viewport keeps each VR's `queue.write_buffer` correctly
-        // paired with its own encoded dispatches.
-        let visible_ids: Vec<ViewportId> = self.viewports
+        // 3. Per-viewport snapshot build — derive every per-VR
+        //    parameter the render thread needs from current sim state
+        //    and stash it in `viewports` for the snapshot. No GPU
+        //    calls; the render thread does all the actual encoding
+        //    and submission against this data.
+        let visible_ids: Vec<ViewportId> = self
+            .viewports
             .iter()
             .filter(|(_, v)| v.visible)
             .map(|(id, _)| *id)
             .collect();
 
-        let object_count = self.gpu_objects.len() as u32;
-        let shadow_steps = self.environment.shadow_steps;
-        let num_lights = self.num_lights_cache;
         // Gizmo overlay is drawn on MAIN only — selection state is global.
-        let gizmo_verts = self.build_gizmo_wireframe();
-        let mut pick_issued = false;
+        let gizmo_verts_main = self.build_gizmo_wireframe();
+        let mut vp_list: Vec<crate::render_frame::RenderViewport> =
+            Vec::with_capacity(visible_ids.len());
 
         for &viewport_id in &visible_ids {
             let cam_uniforms = self.build_camera_uniforms(viewport_id);
-            let (vp_w, vp_h) = self.viewports
+            let (vp_w, vp_h) = self
+                .viewports
                 .get(viewport_id)
                 .map(|v| (v.width, v.height))
                 .expect("viewport must exist");
 
-            // Per-viewport screen-AABBs (camera-dependent).
+            // Per-viewport screen-AABBs (camera-dependent) for tile cull.
             let vp_matrix = glam::Mat4::from_cols_array_2d(&cam_uniforms.view_proj);
             let screen_aabbs = crate::scene_sync::compute_screen_aabbs(
-                &self.gpu_objects, &vp_matrix, vp_w as f32, vp_h as f32,
+                &self.gpu_objects,
+                &vp_matrix,
+                vp_w as f32,
+                vp_h as f32,
             );
-            let screen_aabbs_bytes: &[u8] = bytemuck::cast_slice(&screen_aabbs);
+            let screen_aabbs_bytes: Vec<u8> = bytemuck::cast_slice(&screen_aabbs).to_vec();
 
-            // Per-viewport camera upload (own buffer per VR).
-            {
-                let vr = self.viewport_renderers
-                    .get(&viewport_id)
-                    .expect("viewport renderer must exist");
-                vr.upload_camera(&self.queue, &cam_uniforms);
-            }
-
-            // Refresh this VR's scene + lights/materials bind groups if
-            // the corresponding shared buffers reallocated. No-op when
-            // epochs match.
-            {
-                let vr = self.viewport_renderers
-                    .get_mut(&viewport_id)
-                    .expect("viewport renderer must exist");
-                vr.refresh_bindings(&self.device, &self.renderer);
-            }
-
-            // Per-viewport vol/cloud/god-ray params — written directly
-            // to this VR's own pass buffers. No shared-state race now.
+            // Per-VR vol/cloud/atmo/god-ray params — derived from
+            // environment + this VR's camera. Render writes them into
+            // the corresponding per-VR uniform buffers right before
+            // submit (one submit per VR keeps the writes correctly
+            // paired with their dispatches).
             let vol_params = self.environment.to_volumetric_params(
-                &cam_uniforms, vp_w, vp_h, self.frame_index as u32,
+                &cam_uniforms,
+                vp_w,
+                vp_h,
+                self.frame_index as u32,
             );
-            let cloud_params = self.environment.to_cloud_params(self.frame_index as f32 / 60.0);
+            let cloud_params =
+                self.environment.to_cloud_params(self.frame_index as f32 / 60.0);
 
             let sun_d = self.environment.sun_direction();
-            let cam_y = cam_uniforms.position[1];
+            let cam_y_vp = cam_uniforms.position[1];
             let atmo_frame = rkp_render::rkp_atmosphere::AtmosphereFrameParams {
                 sun_dir: [-sun_d[0], -sun_d[1], -sun_d[2]],
                 sun_intensity: self.environment.sun_intensity,
-                camera_altitude: self.environment.effective_altitude(cam_y),
+                camera_altitude: self.environment.effective_altitude(cam_y_vp),
                 ground_albedo: self.environment.ground_albedo,
-                cam_pos: [cam_uniforms.position[0], cam_uniforms.position[1], cam_uniforms.position[2]],
+                cam_pos: [
+                    cam_uniforms.position[0],
+                    cam_uniforms.position[1],
+                    cam_uniforms.position[2],
+                ],
                 _pad1b: 0.0,
-                cam_forward: [cam_uniforms.forward[0], cam_uniforms.forward[1], cam_uniforms.forward[2]],
+                cam_forward: [
+                    cam_uniforms.forward[0],
+                    cam_uniforms.forward[1],
+                    cam_uniforms.forward[2],
+                ],
                 _pad2: 0.0,
-                cam_right: [cam_uniforms.right[0], cam_uniforms.right[1], cam_uniforms.right[2]],
+                cam_right: [
+                    cam_uniforms.right[0],
+                    cam_uniforms.right[1],
+                    cam_uniforms.right[2],
+                ],
                 _pad3: 0.0,
-                cam_up: [cam_uniforms.up[0], cam_uniforms.up[1], cam_uniforms.up[2]],
+                cam_up: [
+                    cam_uniforms.up[0],
+                    cam_uniforms.up[1],
+                    cam_uniforms.up[2],
+                ],
                 _pad4: 0.0,
             };
+
             let god_ray_params = {
                 let sun_toward = [-sun_d[0], -sun_d[1], -sun_d[2]];
                 let sun_world = glam::Vec3::new(
@@ -1163,23 +1252,11 @@ impl EngineState {
                     decay: self.environment.god_ray_decay,
                     exposure: self.environment.god_ray_exposure,
                     num_samples: 64,
-                    sun_color: self.environment.sun_tint(cam_y),
+                    sun_color: self.environment.sun_tint(cam_y_vp),
                     _pad: 0.0,
                 }
             };
-            {
-                let vr = self.viewport_renderers
-                    .get_mut(&viewport_id)
-                    .expect("viewport renderer must exist");
-                vr.volumetric.update_params(&self.queue, &vol_params);
-                vr.volumetric.update_cloud_params(&self.queue, &cloud_params);
-                vr.god_rays.update_params(&self.queue, &god_ray_params);
-            }
 
-            // Per-VR shade params: same scene-wide values, isolation bit
-            // set per the viewport's mode. Written into the shared
-            // shade_params buffer right before this VR's submit so the
-            // shade pass reads this VR's flag, not another's.
             let (vp_mode, vp_preview_mode) = self
                 .viewports
                 .get(viewport_id)
@@ -1188,10 +1265,10 @@ impl EngineState {
                     rkp_render::RenderMode::InSitu,
                     rkp_render::BuildPreviewMode::Voxel,
                 ));
-            // The procedural being previewed in raymarch mode is always
-            // the currently-selected entity — the same thing the build
-            // viewport's focus filter already tracks. Keeps the preview
-            // follow selection automatically with no extra UI state.
+
+            // The procedural being previewed in raymarch mode is
+            // always the currently-selected entity — keeps the
+            // preview following selection automatically.
             let vp_preview_entity = self.selected_entity.and_then(|entity| {
                 if self
                     .world
@@ -1203,442 +1280,402 @@ impl EngineState {
                     None
                 }
             });
-            let isolation = matches!(vp_mode, rkp_render::RenderMode::Isolation);
-            {
-                let mut sp = self.shade_params_base;
-                sp.isolation = isolation as u32;
-                // The lights buffer is scene-wide (one buffer, shared by
-                // every VR), and the shade shader walks the first
-                // `num_lights` entries regardless of `isolation`. Entry 0
-                // is the sun; 1..N are scene point/spot lights. In
-                // isolation we want a neutral studio, so clamp to just
-                // the sun — otherwise the main scene's point lights
-                // light up the build-viewport preview, which visually
-                // contradicts "isolation."
-                if isolation {
-                    sp.num_lights = sp.num_lights.min(1);
-                }
-                self.renderer.update_shade_params(&self.queue, &sp);
-            }
-            // Per-VR bloom intensity. In isolation we run bloom_composite
-            // as a passthrough (intensity = 0) since the bloom mips are
-            // not refreshed; in-situ uses the env-configured intensity.
-            {
-                let vr = self.viewport_renderers
-                    .get(&viewport_id)
-                    .expect("viewport renderer must exist");
-                let intensity = if isolation { 0.0 } else { self.environment.bloom_intensity };
-                vr.bloom_composite.set_intensity(&self.queue, intensity);
-            }
 
-            // Compute the procedural-node gizmo wireframe before we
-            // take the mutable VR borrow below — build_procedural_
-            // gizmo_wireframe reads from `self.world`, which shares
-            // scope with `viewport_renderers`.
-            // The procedural-node gizmo is only meaningful when the
-            // viewport shows the live tree (raymarch). In voxel mode
-            // the user sees the baked result and any gizmo drag would
-            // silently edit the tree without visual feedback — drawing
-            // the gizmo there invites the user to interact with
-            // something that does nothing they can see until they
-            // re-bake, which is worse than not showing it at all.
-            let proc_gizmo_verts = if viewport_id == ViewportId::BUILD
+            // Per-VR shade params: same scene-wide values plus the
+            // per-VR `isolation` flag and a clamp on the light count
+            // when isolated (so the BUILD preview doesn't pick up
+            // the main scene's point lights).
+            let isolation = matches!(vp_mode, rkp_render::RenderMode::Isolation);
+            let mut shade_params_vr = self.shade_params_base;
+            shade_params_vr.isolation = isolation as u32;
+            if isolation {
+                shade_params_vr.num_lights = shade_params_vr.num_lights.min(1);
+            }
+            let bloom_composite_intensity = if isolation {
+                0.0
+            } else {
+                self.environment.bloom_intensity
+            };
+
+            // Procedural raymarch state — only when this VR is in
+            // raymarch preview mode AND a procedural entity is
+            // selected. Sim flattens the tree, builds the AABB, and
+            // pre-filters ghost primitives; render uploads + binds.
+            let proc_raymarch =
+                if matches!(vp_preview_mode, rkp_render::BuildPreviewMode::Raymarch) {
+                    let entity = vp_preview_entity.and_then(|uuid| {
+                        self.entity_uuids
+                            .iter()
+                            .find_map(|(e, u)| (*u == uuid).then_some(*e))
+                    });
+
+                    let (instructions, aabb_min, aabb_max) = entity
+                        .and_then(|e| {
+                            self.world
+                                .get::<&crate::components::ProceduralGeometry>(e)
+                                .ok()
+                                .map(|pg| {
+                                    let ins = rkp_procedural::flatten_tree(&pg.tree);
+                                    let bounds = rkp_procedural::compute_bounds(&pg.tree);
+                                    (ins, bounds.min, bounds.max)
+                                })
+                        })
+                        // Empty-AABB sentinel: -1..+1 degenerate box
+                        // any sane ray-AABB slab test fails. Covers
+                        // "raymarch enabled but no procedural entity
+                        // selected" so we don't get a bogus hit.
+                        .unwrap_or_else(|| {
+                            (Vec::new(), glam::Vec3::splat(1.0), glam::Vec3::splat(-1.0))
+                        });
+
+                    let object_id = entity
+                        .and_then(|e| self.entity_scene_ids.get(&e).copied())
+                        .unwrap_or(0);
+
+                    let entity_world = entity
+                        .and_then(|e| {
+                            self.world
+                                .get::<&crate::components::Transform>(e)
+                                .ok()
+                                .map(|xf| {
+                                    glam::Affine3A::from_scale_rotation_translation(
+                                        xf.scale,
+                                        glam::Quat::from_euler(
+                                            glam::EulerRot::XYZ,
+                                            xf.rotation.x.to_radians(),
+                                            xf.rotation.y.to_radians(),
+                                            xf.rotation.z.to_radians(),
+                                        ),
+                                        xf.position,
+                                    )
+                                })
+                        })
+                        .unwrap_or(glam::Affine3A::IDENTITY);
+
+                    // Ghost overlay: every cutter-role primitive,
+                    // regardless of selection. Filter the flattened
+                    // instruction stream so ghost renders use the
+                    // same composed transforms the main raymarch does.
+                    let ghost_ids = entity
+                        .and_then(|e| {
+                            self.world
+                                .get::<&crate::components::ProceduralGeometry>(e)
+                                .ok()
+                                .map(|pg| collect_ghost_primitives(&pg.tree))
+                        })
+                        .unwrap_or_default();
+                    let ghost_set: std::collections::HashSet<u32> =
+                        ghost_ids.into_iter().collect();
+                    let ghost_instructions: Vec<rkp_procedural::ProcInstruction> = instructions
+                        .iter()
+                        .filter(|ins| ghost_set.contains(&ins.node_id))
+                        .copied()
+                        .collect();
+
+                    Some(crate::render_frame::RenderProcRaymarch {
+                        instructions,
+                        ghost_instructions,
+                        object_id,
+                        entity_world,
+                        aabb_min,
+                        aabb_max,
+                        selected_node: self.selected_procedural_node,
+                    })
+                } else {
+                    None
+                };
+
+            // Wireframe verts: gizmo on MAIN, procedural-node gizmo
+            // on BUILD when in raymarch preview. The procedural-node
+            // gizmo is only meaningful in raymarch mode — in voxel
+            // mode the user sees the baked result and any drag would
+            // silently edit the tree without visual feedback.
+            let wireframe_verts = if viewport_id == ViewportId::MAIN {
+                gizmo_verts_main.clone()
+            } else if viewport_id == ViewportId::BUILD
                 && matches!(vp_preview_mode, rkp_render::BuildPreviewMode::Raymarch)
             {
-                let build_cam_pos = glam::Vec3::new(
+                let cam_pos = glam::Vec3::new(
                     cam_uniforms.position[0],
                     cam_uniforms.position[1],
                     cam_uniforms.position[2],
                 );
-                self.build_procedural_gizmo_wireframe(build_cam_pos)
+                self.build_procedural_gizmo_wireframe(cam_pos)
             } else {
                 Vec::new()
             };
 
-            // Per-viewport encoder.
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("rkp viewport"),
-            });
-
-            // When this viewport is in procedural raymarch preview mode,
-            // flatten the selected procedural's tree into an RPN stream
-            // and push it to the VR's raymarch pass before dispatch. We
-            // flatten every frame the mode is active — the cost is O(tree
-            // nodes), microseconds, and sidesteps having to track dirty
-            // state through another layer. Skip entirely when the mode is
-            // Voxel so we don't touch the raymarch pass's buffers.
-            // Capture the tree's entity-local AABB alongside the
-            // flattened instruction stream — the raymarch shader
-            // uses it to reject rays that can't possibly hit before
-            // paying the sphere-trace loop.
-            let (proc_instructions, proc_aabb): (
-                Vec<rkp_procedural::ProcInstruction>,
-                Option<rkp_core::Aabb>,
-            ) = if matches!(vp_preview_mode, rkp_render::BuildPreviewMode::Raymarch) {
-                vp_preview_entity
-                    .and_then(|uuid| {
-                        self.entity_uuids
-                            .iter()
-                            .find_map(|(e, u)| (*u == uuid).then_some(*e))
-                    })
-                    .and_then(|entity| {
-                        self.world
-                            .get::<&crate::components::ProceduralGeometry>(entity)
-                            .ok()
-                            .map(|pg| {
-                                (
-                                    rkp_procedural::flatten_tree(&pg.tree),
-                                    Some(rkp_procedural::compute_bounds(&pg.tree)),
-                                )
-                            })
-                    })
-                    .unwrap_or_default()
-            } else {
-                (Vec::new(), None)
-            };
-            let proc_object_id = vp_preview_entity
-                .and_then(|uuid| {
-                    self.entity_uuids
-                        .iter()
-                        .find_map(|(e, u)| (*u == uuid).then_some(*e))
-                })
-                .and_then(|entity| self.entity_scene_ids.get(&entity).copied())
-                .unwrap_or(0);
-
-            // World transform of the previewed procedural entity. The
-            // raymarch shader uses this to pin the tree at the entity's
-            // world position (matching what the voxel path does via the
-            // octree's per-object inverse_world); without it, moving the
-            // entity with the MAIN gizmo shifts the BUILD preview off
-            // the camera.
-            let proc_entity_world = vp_preview_entity
-                .and_then(|uuid| {
-                    self.entity_uuids
-                        .iter()
-                        .find_map(|(e, u)| (*u == uuid).then_some(*e))
-                })
-                .and_then(|entity| {
-                    self.world
-                        .get::<&crate::components::Transform>(entity)
-                        .ok()
-                        .map(|xf| {
-                            glam::Affine3A::from_scale_rotation_translation(
-                                xf.scale,
-                                glam::Quat::from_euler(
-                                    glam::EulerRot::XYZ,
-                                    xf.rotation.x.to_radians(),
-                                    xf.rotation.y.to_radians(),
-                                    xf.rotation.z.to_radians(),
-                                ),
-                                xf.position,
-                            )
-                        })
-                })
-                .unwrap_or(glam::Affine3A::IDENTITY);
-
-            let vr = self.viewport_renderers
-                .get_mut(&viewport_id)
-                .expect("viewport renderer must exist");
-
-            // Pin the BUILD grid under the previewed entity. Without
-            // this, moving the entity in world-space Y (or X/Z, though
-            // that was less obvious thanks to the camera-follow) leaves
-            // the grid at world y=0 while the camera orbits around the
-            // entity's actual position — the object ends up floating
-            // relative to the grid. The grid plane following the entity
-            // keeps the "studio floor" always under the object. MAIN
-            // stays at its default (world origin) so scene-wide layout
-            // stays legible there.
-            if viewport_id == crate::viewport::ViewportId::BUILD {
-                let p = proc_entity_world.translation;
-                let grid_params = rkp_render::rkp_grid::GridParams {
-                    plane_origin: [p.x, p.y, p.z, 0.0],
-                    ..Default::default()
-                };
-                vr.grid.update_params(&self.queue, &grid_params);
-            }
-
-            if matches!(vp_preview_mode, rkp_render::BuildPreviewMode::Raymarch) {
-                // Log on transitions / interesting changes so we can
-                // tell from stderr whether the pass is wired up
-                // without flooding on every frame. Key = (viewport,
-                // instruction_count, entity presence).
-                static LAST_LOG: std::sync::Mutex<Option<(u32, bool)>> =
-                    std::sync::Mutex::new(None);
-                let key = (
-                    proc_instructions.len() as u32,
-                    vp_preview_entity.is_some(),
-                );
-                let mut guard = LAST_LOG.lock().unwrap();
-                if guard.as_ref() != Some(&key) {
-                    *guard = Some(key);
-                    eprintln!(
-                        "[preview] raymarch dispatch viewport={:?} instructions={} entity_present={}",
-                        viewport_id,
-                        proc_instructions.len(),
-                        vp_preview_entity.is_some(),
-                    );
-                }
-                vr.proc_raymarch.upload_instructions(&self.device, &self.queue, &proc_instructions);
-                // Empty-AABB sentinel: -1..+1 degenerate box that
-                // any sane ray-AABB slab test fails. Covers the
-                // "raymarch pass enabled but no procedural entity
-                // is selected" transient — avoids a bogus hit.
-                let (aabb_min, aabb_max) = match proc_aabb {
-                    Some(a) => (a.min, a.max),
-                    None => (glam::Vec3::splat(1.0), glam::Vec3::splat(-1.0)),
-                };
-                vr.proc_raymarch.set_params(
-                    &self.queue,
-                    proc_instructions.len() as u32,
-                    proc_object_id + 1,
-                    proc_entity_world,
-                    aabb_min,
-                    aabb_max,
-                );
-                // Push the currently-selected procedural NodeId to the
-                // outline overlay. Sentinel (`u32::MAX`) when nothing
-                // is selected — the shader early-discards on that and
-                // the pass becomes free.
-                let outline_params = match self.selected_procedural_node {
-                    Some(n) => rkp_render::proc_outline::OutlineParams::new(
-                        n,
-                        // Warm orange highlight, fully opaque. Alpha
-                        // is shader-premultiplied into the emitted
-                        // color so the pipeline's One/OneMinusSrcAlpha
-                        // blend gives the right "over" composite.
-                        [1.0, 0.55, 0.15, 1.0],
-                    ),
-                    None => rkp_render::proc_outline::OutlineParams::NONE,
-                };
-                vr.proc_outline.update_params(&self.queue, &outline_params);
-
-                // Ghost overlay: every cutter-role primitive in the
-                // tree, regardless of selection. Filters the already-
-                // flattened instruction stream so ghost renders use the
-                // same composed transforms the main raymarch does.
-                // Ghost pass early-outs on zero-length upload.
-                let ghost_ids = vp_preview_entity.and_then(|uuid| {
-                    let entity = self.entity_uuids.iter().find_map(
-                        |(e, u)| (*u == uuid).then_some(*e),
-                    )?;
-                    let proc_geo = self.world
-                        .get::<&crate::components::ProceduralGeometry>(entity).ok()?;
-                    Some(collect_ghost_primitives(&proc_geo.tree))
-                }).unwrap_or_default();
-                let ghost_set: std::collections::HashSet<u32> = ghost_ids.into_iter().collect();
-                let ghost_instructions: Vec<rkp_procedural::ProcInstruction> =
-                    proc_instructions.iter()
-                        .filter(|ins| ghost_set.contains(&ins.node_id))
-                        .copied()
-                        .collect();
-                vr.proc_ghost.upload_instructions(
-                    &self.device, &self.queue, &ghost_instructions,
-                );
-                vr.proc_ghost.update_params(
-                    &self.queue,
-                    &rkp_render::proc_ghost::GhostParams::new(
-                        ghost_instructions.len() as u32,
-                        // Cool translucent cyan — distinct from the
-                        // outline's warm orange so combined visuals
-                        // don't muddle when a ghost is also selected.
-                        [0.25, 0.7, 1.0, 0.35],
-                    ),
-                );
-            }
-            self.renderer.render_to(
-                &mut encoder, &self.queue, vr,
-                object_count, shadow_steps, num_lights,
-                self.lod_enabled, self.surfacenet_enabled,
-                screen_aabbs_bytes, &atmo_frame,
-                vp_mode,
-                vp_preview_mode,
-            );
-
-            // Issue the G-buffer readback from whichever viewport the
-            // pending pick targets. Only one pick is in flight at a time;
-            // the viewport tag + raymarch/voxel mode drives decoding
-            // inside `process_pick_result`.
-            //
-            // Two copies into the same 256-byte aligned readback buffer:
-            //   offset 0..8   : gbuf_material pixel (packed_r + packed_g)
-            //   offset 128..132: gbuf_pick pixel (primitive_node_id)
-            // The second offset is 128 because wgpu requires each copy's
-            // destination to be 256-byte aligned and bytes_per_row ≥ 256,
-            // which pads each 1×1 region to 256 bytes. Using a second
-            // buffer would also work; packing into one is simpler.
-            if let Some(pp) = self.pending_pick {
-                if pp.viewport == viewport_id && pp.x < vr.width && pp.y < vr.height {
-                    pick_issued = true;
-                    encoder.copy_texture_to_buffer(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &vr.gbuffer.material_texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d { x: pp.x, y: pp.y, z: 0 },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::TexelCopyBufferInfo {
-                            buffer: &self.pick_readback_buffer,
-                            layout: wgpu::TexelCopyBufferLayout {
-                                offset: 0,
-                                bytes_per_row: Some(256),
-                                rows_per_image: Some(1),
-                            },
-                        },
-                        wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-                    );
-                    encoder.copy_texture_to_buffer(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &vr.pick_texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d { x: pp.x, y: pp.y, z: 0 },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::TexelCopyBufferInfo {
-                            buffer: &self.pick_readback_buffer,
-                            layout: wgpu::TexelCopyBufferLayout {
-                                offset: 256,
-                                bytes_per_row: Some(256),
-                                rows_per_image: Some(1),
-                            },
-                        },
-                        wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-                    );
-                }
-            }
-            if viewport_id == ViewportId::MAIN {
-                let show_editor_overlays = self.viewports
+            // Editor-overlay gate. MAIN gates on the EDITOR_ONLY
+            // layer bit (off in play mode); BUILD always shows its
+            // proc-gizmo when one's present.
+            let show_editor_overlays = if viewport_id == ViewportId::MAIN {
+                self.viewports
                     .get(ViewportId::MAIN)
                     .map(|v| v.filter.base_layers & crate::viewport::layer::EDITOR_ONLY != 0)
-                    .unwrap_or(false);
-                if show_editor_overlays && !gizmo_verts.is_empty() {
-                    let composite_view = &vr.composite_view;
-                    let vw = vr.width as f32;
-                    let vh = vr.height as f32;
-                    vr.wireframe_pass.draw(
-                        &self.device,
-                        &self.queue,
-                        &mut encoder,
-                        composite_view,
-                        vp_matrix,
-                        (0.0, 0.0, vw, vh),
-                        &gizmo_verts,
-                    );
-                }
-            }
+                    .unwrap_or(false)
+            } else {
+                true
+            };
 
-            // BUILD viewport: procedural-node gizmo overlay. Separate
-            // wireframe from the entity gizmo on MAIN — same wireframe
-            // pass, different source geometry (the selected procedural
-            // node's transform, not the entity's).
-            if viewport_id == ViewportId::BUILD && !proc_gizmo_verts.is_empty() {
-                let composite_view = &vr.composite_view;
-                let vw = vr.width as f32;
-                let vh = vr.height as f32;
-                vr.wireframe_pass.draw(
-                    &self.device,
-                    &self.queue,
-                    &mut encoder,
-                    composite_view,
-                    vp_matrix,
-                    (0.0, 0.0, vw, vh),
-                    &proc_gizmo_verts,
-                );
-            }
+            // BUILD: pin the studio-floor grid under the previewed
+            // entity instead of world origin. Without this, moving
+            // the entity in world-Y leaves the grid at y=0 while the
+            // camera orbits around the entity, so the object floats
+            // relative to the grid.
+            let grid_override = if viewport_id == ViewportId::BUILD {
+                let p = proc_raymarch
+                    .as_ref()
+                    .map(|p| p.entity_world.translation)
+                    .unwrap_or(glam::Vec3A::ZERO);
+                Some(rkp_render::rkp_grid::GridParams {
+                    plane_origin: [p.x, p.y, p.z, 0.0],
+                    ..Default::default()
+                })
+            } else {
+                None
+            };
 
-            let readback_idx = vr.encode_composite_readback(&mut encoder);
-            self.renderer.resolve_profiler_queries(&mut encoder);
-            self.queue.submit(std::iter::once(encoder.finish()));
+            vp_list.push(crate::render_frame::RenderViewport {
+                id: viewport_id,
+                width: vp_w,
+                height: vp_h,
+                mode: vp_mode,
+                preview_mode: vp_preview_mode,
+                camera: cam_uniforms,
+                screen_aabbs_bytes,
+                vp_matrix,
+                vol_params,
+                cloud_params,
+                atmo_frame,
+                god_ray_params,
+                shade_params: shade_params_vr,
+                bloom_composite_intensity,
+                grid_override,
+                wireframe_verts,
+                show_editor_overlays,
+                proc_raymarch,
+            });
 
-            // Kick off the async map immediately after submit so the GPU
-            // can finish the copy and signal completion in the background
-            // — we never block on it.
-            if let Some(idx) = readback_idx {
-                vr.readback.issue_map_async(idx);
-            }
-
-            // Stash this frame's VP on the viewport so next frame's cloud
-            // TAA (and any future temporal pass) can reproject history
-            // samples into the right screen position.
+            // Update sim-side `prev_view_proj` so next frame's
+            // CameraUniforms carry the right reprojection matrix for
+            // cloud TAA / temporal upscale.
             if let Some(v) = self.viewports.get_mut(viewport_id) {
                 v.prev_view_proj = cam_uniforms.view_proj;
             }
         }
 
-        let t_encode = frame_start.elapsed();
-
-        // Kick off the cloud→sun atten readback on MAIN (scene-wide sun),
-        // then drive a non-blocking poll so previously-issued map_async
-        // callbacks can fire.
-        if let Some(main_vr) = self.viewport_renderers.get(&crate::viewport::ViewportId::MAIN) {
-            main_vr.volumetric.issue_sun_atten_map();
-        }
-        let _ = self.device.poll(wgpu::PollType::Poll);
-
-        // If a pick was encoded this frame, kick off the async map. The
-        // result is consumed at the top of a future render_frame via
-        // `drain_pick_result` (one or two frames of latency, invisible
-        // to the user, no `device.poll(Wait)`).
-        if pick_issued {
-            if let Some(pp) = self.pending_pick.take() {
-                let (tx, rx) = std::sync::mpsc::channel();
-                self.pick_readback_buffer
-                    .slice(..)
-                    .map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-                self.pick_in_flight = Some((pp, rx));
-            }
-        }
-
-        // ── Per-viewport readback + delivery ────────────────────────────
+        // 4. Pending pick — convert sim's `PendingPick` (which carries
+        //    a CPU-resolved ghost hint) to the render-side struct.
+        //    Ghost hint stays sim-side; we'll re-apply it when the
+        //    matching `PickResult` comes back.
         //
-        // Non-blocking. Each visible viewport's readback ring already had
-        // `map_async` issued for its current frame's buffer right after
-        // submit. Here we drain any maps that completed (almost always
-        // the previous frame's) and deliver the freshest cached pixels
-        // to the editor. If nothing is ready yet we silently reuse the
-        // last good frame — 1-2 frames of stall on the editor is invisible
-        // and avoids the 8+ ms `device.poll(Wait)` we used to incur per
-        // viewport per frame.
-        for &viewport_id in &visible_ids {
-            let vr = self.viewport_renderers
-                .get_mut(&viewport_id)
-                .expect("viewport renderer must exist");
-            let w = vr.width;
-            let h = vr.height;
-            let padded_row = vr.readback_padded_row();
-            vr.readback.drain_completed(w, h, padded_row);
-            if let Some((pixels, cw, ch)) = vr.readback.cached_pixels() {
-                frame_callback(viewport_id, pixels, cw, ch);
-            }
-        }
+        //    Re-ship every snapshot until [`process_pick_result`]
+        //    clears `self.pending_pick`. Picks used to be cleared
+        //    eagerly with `take()`, but the GPU-backpressure backoff
+        //    in `render_worker` now causes the inbox (newest-wins) to
+        //    drop a sizeable fraction of snapshots before render sees
+        //    them — eager-clearing meant the click was lost forever
+        //    whenever its carrier snapshot got dropped. Re-shipping
+        //    is safe because render's `pick_in_flight` gate dedupes
+        //    duplicates: at most one map_async is ever in flight per
+        //    pick request.
+        let pending_pick = if let Some(pp) = self.pending_pick.as_ref() {
+            // Map viewport+preview-mode → kind. BUILD raymarch decodes
+            // the gbuf_pick texture for procedural NodeIds; everything
+            // else (MAIN voxel, BUILD voxel) decodes gbuf_material for
+            // the entity scene_id.
+            let kind = if pp.viewport == ViewportId::BUILD
+                && self
+                    .viewports
+                    .get(ViewportId::BUILD)
+                    .map(|v| matches!(v.preview_mode, rkp_render::BuildPreviewMode::Raymarch))
+                    .unwrap_or(false)
+            {
+                crate::render_frame::PickKind::ProceduralNode
+            } else {
+                crate::render_frame::PickKind::Material
+            };
+            self.in_flight_pick_ghost = pp.ghost_pick_node_id;
+            Some(crate::render_frame::PendingPick {
+                viewport: pp.viewport,
+                x: pp.x,
+                y: pp.y,
+                kind,
+            })
+        } else {
+            None
+        };
 
-        // GPU profiler — drain any resolved pass timings.
-        let gpu_passes = self.renderer.end_profiler_frame(self.frame_index);
+        // 5. Build + submit the snapshot. `submit` is non-blocking;
+        //    if render hadn't consumed the previous snapshot yet,
+        //    that one is dropped (newest-wins). Sim never stalls on
+        //    render's GPU rate.
+        let frame = crate::render_frame::RenderFrame {
+            frame_index: self.frame_index,
+            gpu_objects: self.gpu_objects.clone(),
+            gpu_objects_dirty: gpu_objects_dirty_this_frame,
+            geometry_epoch,
+            materials,
+            lights: gpu_lights,
+            shade_params_base: self.shade_params_base,
+            env_update,
+            viewports: vp_list,
+            skin,
+            bone_matrix_lbs,
+            bone_matrix_dqs,
+            pending_pick,
+            cloud_sun_atten: self.cloud_sun_atten,
+            lod_enabled: self.lod_enabled,
+            surfacenet_enabled: self.surfacenet_enabled,
+            shadow_steps: self.environment.shadow_steps,
+        };
 
+        let t_encode = frame_start.elapsed();
+        self.render_worker.inbox.submit(frame);
         let t_frame_end = frame_start.elapsed();
 
-        // The old per-stage timings tracked t_post / t_submit as
-        // separate aliases for t_encode (encode and submit happen in
-        // the same call). Now we report the four phases that actually
-        // take measurable wall-clock time — the post-submit bucket
-        // covers async readback drain, profiler queries, and the
-        // non-blocking device poll.
+        // 6. Push CPU-side timings into profiling history. GPU pass
+        //    timings get stitched into the most-recent sample by
+        //    `drain_render_results` once the render thread publishes
+        //    them (typically 1-2 frames behind sim).
         let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
         let cpu = crate::profiling::CpuPhaseTimings {
             setup_ms: ms(t_cpu_setup),
-            upload_ms: ms(t_upload - t_cpu_setup),
-            encode_ms: ms(t_encode - t_upload),
-            post_submit_ms: ms(t_frame_end - t_encode),
+            snapshot_ms: ms(t_encode - t_cpu_setup),
+            submit_ms: ms(t_frame_end - t_encode),
             total_ms: ms(t_frame_end),
         };
         self.profiling.push(crate::profiling::FrameSample {
             frame_idx: self.frame_index,
             cpu,
-            gpu_passes,
+            // Both filled in by `drain_render_results` once the render
+            // thread publishes the matching frame's `RenderResult`.
+            // Lag is typically 1-2 frames, fine for display.
+            gpu_passes: Vec::new(),
+            render_dt_ms: 0.0,
             gpu_object_count: self.gpu_objects.len() as u32,
         });
 
         self.frame_index += 1;
+    }
+
+    /// Drain every [`RenderResult`] the render thread has published
+    /// since the previous tick. Applies pick decoding, updates the
+    /// smoothed-cloud-sun-atten target, and stitches GPU pass timings
+    /// into the most-recent profiling sample.
+    ///
+    /// Called from the top of [`Self::render_frame`]; safe to call
+    /// when the channel is empty (no-op).
+    fn drain_render_results(&mut self) {
+        // Take a Vec rather than reborrow `self.render_worker` inside
+        // the loop — pick processing wants `&mut self`, which would
+        // otherwise alias the channel borrow.
+        let mut latest_atten: Option<f32> = None;
+        // (frame_idx, gpu_passes, render_dt_ms) — kept together so a
+        // single `attach_render_data` call updates both fields on the
+        // matching ring entry.
+        let mut latest_render_data: Option<(u64, Vec<(String, f32)>, Option<f32>)> = None;
+        let mut pick_results: Vec<crate::render_frame::PickResult> = Vec::new();
+        // EMA alpha for the render-FPS readout. 0.1 = ~25-tick
+        // settling at 60 Hz; same time-constant the tick/physics
+        // EMAs use, keeps the panel readouts feeling consistent.
+        const RENDER_HZ_EMA_ALPHA: f32 = 0.1;
+        while let Ok(result) = self.render_worker.outbox.try_recv() {
+            if !result.cloud_sun_atten_raw.is_nan() {
+                latest_atten = Some(result.cloud_sun_atten_raw);
+            }
+            // Track latest result that carries either GPU passes OR a
+            // render dt — both are stitched onto the matching frame
+            // sample. We always overwrite so the "latest" wins on
+            // multi-result drains; correlation by frame_index keeps
+            // attribution honest even if results arrive out of order
+            // (which they shouldn't, but the API doesn't forbid it).
+            if !result.gpu_passes.is_empty() || result.render_dt_ms.is_some() {
+                latest_render_data = Some((
+                    result.frame_index,
+                    result.gpu_passes,
+                    result.render_dt_ms,
+                ));
+            }
+            if let Some(pr) = result.pick_result {
+                pick_results.push(pr);
+            }
+            // Fold render thread's observed iteration interval into
+            // the FPS EMA. Skip the first iteration (`None`) and
+            // any zero/negative dt (paranoia — clock can rarely tie
+            // on the same nanosecond).
+            if let Some(dt_ms) = result.render_dt_ms {
+                if dt_ms > 0.0 {
+                    let inst_hz = 1000.0 / dt_ms;
+                    self.render_hz_ema = self.render_hz_ema * (1.0 - RENDER_HZ_EMA_ALPHA)
+                        + inst_hz * RENDER_HZ_EMA_ALPHA;
+                }
+            }
+        }
+        if let Some(a) = latest_atten {
+            self.last_cloud_sun_atten_raw = a;
+        }
+        if let Some((frame_idx, passes, dt)) = latest_render_data {
+            self.profiling.attach_render_data(frame_idx, passes, dt);
+        }
+        for pr in pick_results {
+            self.process_pick_result(pr);
+        }
+    }
+
+    /// Apply a [`PickResult`] from the render thread. Mirrors the old
+    /// `drain_pick_result` logic: ghost priority on BUILD raymarch,
+    /// otherwise scene_id → entity for MAIN voxel and `selected_entity` /
+    /// `selected_procedural_node` updates accordingly.
+    fn process_pick_result(&mut self, pr: crate::render_frame::PickResult) {
+        use crate::render_frame::PickKind;
+        use crate::viewport::ViewportId;
+
+        // Acknowledge: this pick request has been served, so stop
+        // re-shipping it in subsequent snapshots. (See the "re-ship
+        // every snapshot" rationale in `submit_render_frame`.) A
+        // brand-new click later will set `pending_pick` again.
+        self.pending_pick = None;
+
+        match pr.kind {
+            PickKind::ProceduralNode => {
+                // Ghost priority: if the CPU raycast at click time
+                // found a ghost primitive on the ray, that wins —
+                // matches "translucent overlay on top owns the click."
+                if let Some(ghost_id) = self.in_flight_pick_ghost.take() {
+                    self.selected_procedural_node = Some(ghost_id);
+                    return;
+                }
+                let pick_channel = pr.raw_payload[0];
+                let g_channel = pr.raw_payload[1];
+                let obj_raw = (g_channel >> 8) & 0xFF;
+                let node_id_16 = pick_channel & 0xFFFFu32;
+                if obj_raw > 0 && node_id_16 != 0xFFFFu32 {
+                    self.selected_procedural_node = Some(node_id_16);
+                } else {
+                    self.selected_procedural_node = None;
+                }
+            }
+            PickKind::Material => {
+                // MAIN voxel + BUILD voxel both decode the entity
+                // scene_id from the gbuf_material G channel's high
+                // byte (`object_id + 1`).
+                let g_channel = pr.raw_payload[1];
+                let obj_raw = (g_channel >> 8) & 0xFF;
+                if obj_raw > 0 {
+                    let gpu_idx = (obj_raw - 1) as usize;
+                    if gpu_idx < self.gpu_to_entity.len() {
+                        self.selected_entity = Some(self.gpu_to_entity[gpu_idx]);
+                    }
+                } else {
+                    self.selected_entity = None;
+                }
+                // Discard the ghost hint either way — Material picks
+                // never hit ghost-primitive priority.
+                self.in_flight_pick_ghost = None;
+                let _ = ViewportId::MAIN;
+            }
+        }
     }
 
     /// On PlayStart: hand the MAIN viewport over to the active scene
@@ -1909,9 +1946,9 @@ impl EngineState {
                 if unchanged {
                     return true;
                 }
-                if let Some(vr) = self.viewport_renderers.get_mut(&id) {
-                    vr.resize(&self.device, &mut self.renderer, width, height);
-                }
+                let _ = self.render_worker.commands.send(
+                    crate::render_frame::RenderCommand::ResizeViewport { id, width, height },
+                );
                 if let Some(vp) = self.viewports.get_mut(id) {
                     vp.width = width;
                     vp.height = height;
@@ -2267,31 +2304,146 @@ impl EngineState {
                     );
                     return true;
                 }
+                // Hard requirements for promoting the procedural to a
+                // first-class asset: an open project (so we have an
+                // assets/ directory to write to) and a saved scene
+                // (so the bake worker has been writing the cache to a
+                // known location). Without either, we can't produce
+                // a persistent on-disk asset for the converted voxels.
+                let Some(project_dir) = self.project_dir.clone() else {
+                    self.console.warn(
+                        "Convert: open or save a project first so the converted asset has somewhere to live.".to_string(),
+                    );
+                    return true;
+                };
+                let Some(cache_path) = self.procedural_cache_path(entity) else {
+                    self.console.warn(
+                        "Convert: save the scene first — the bake cache is keyed off the scene path.".to_string(),
+                    );
+                    return true;
+                };
+                if !cache_path.exists() {
+                    self.console.warn(format!(
+                        "Convert: bake cache '{}' missing — re-bake first.",
+                        cache_path.display(),
+                    ));
+                    return true;
+                }
+
                 let name = self
                     .world
                     .get::<&EditorMetadata>(entity)
                     .map(|m| m.name.clone())
                     .unwrap_or_else(|_| format!("{entity:?}"));
-                let voxel_count = self
-                    .world
-                    .get::<&Renderable>(entity)
-                    .map(|r| r.voxel_count)
-                    .unwrap_or(0);
-                // Drop the tree. Renderable.spatial keeps pointing at
-                // the same scene-pool allocation, so rendering
-                // continues unchanged — the entity just loses its
-                // editing affordances. Clear the "procedural" tag so
-                // save/load + inspector treat it as a plain voxel.
-                let _ = self.world.remove_one::<ProceduralGeometry>(entity);
+
+                // Sanitize the entity name into a filename-safe slug:
+                // lowercase, [a-z0-9_-] only, collapse runs of '_'.
+                let mut slug: String = name
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '-' {
+                            c.to_ascii_lowercase()
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                // Trim leading/trailing underscores; collapse runs.
+                while slug.contains("__") {
+                    slug = slug.replace("__", "_");
+                }
+                let slug = slug.trim_matches('_').to_string();
+                let slug = if slug.is_empty() { "converted".to_string() } else { slug };
+
+                // Drop converted assets under `assets/converted/` so
+                // they're discoverable from the Models panel (which
+                // recursively scans `assets/`) but visually grouped
+                // separately from imported meshes and authored .rkp
+                // files. The directory is created lazily.
+                let target_dir = project_dir.join("assets").join("converted");
+                if let Err(e) = std::fs::create_dir_all(&target_dir) {
+                    self.console.error(format!(
+                        "Convert: failed to create '{}': {e}",
+                        target_dir.display(),
+                    ));
+                    return true;
+                }
+                let mut target = target_dir.join(format!("{slug}.rkp"));
+                let mut suffix = 1u32;
+                while target.exists() {
+                    target = target_dir.join(format!("{slug}_{suffix}.rkp"));
+                    suffix += 1;
+                }
+
+                if let Err(e) = std::fs::copy(&cache_path, &target) {
+                    self.console.error(format!(
+                        "Convert: failed to write asset '{}': {e}",
+                        target.display(),
+                    ));
+                    return true;
+                }
+
+                // Acquire the new file as a regular asset. This
+                // gives us a fresh OctreeHandle living in the asset
+                // cache; the procedural's previous scene-pool
+                // allocation still exists and is now orphaned (a
+                // small bounded leak — bake_worker would have
+                // re-used it on the next bake, but there isn't
+                // going to be a next bake). We accept the leak
+                // rather than risk freeing a slot the renderer or
+                // a stale snapshot is mid-read of.
+                let acquired = self
+                    .scene_mgr
+                    .lock()
+                    .unwrap()
+                    .acquire_asset(&target.to_string_lossy());
+                let (handle, info) = match acquired {
+                    Ok(t) => t,
+                    Err(e) => {
+                        self.console.error(format!(
+                            "Convert: failed to load new asset '{}': {e}",
+                            target.display(),
+                        ));
+                        return true;
+                    }
+                };
+                let new_spatial = spatial_from_handle(
+                    &info.spatial,
+                    info.voxel_size,
+                    &info.aabb,
+                    info.grid_origin,
+                    info.leaf_attr_slot_start,
+                    info.leaf_attr_slot_count,
+                    Vec::new(),
+                );
+                // Path stored in the scene file is relative to the
+                // project's assets/ directory — same convention as
+                // imported meshes. e.g. "converted/sphere_1.rkp".
+                let rel_path = target
+                    .strip_prefix(project_dir.join("assets"))
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| target.to_string_lossy().to_string());
+
                 if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
                     renderable.primitive = None;
+                    renderable.spatial = Some(new_spatial);
+                    renderable.asset_handle = Some(handle);
+                    renderable.asset_path = Some(rel_path.clone());
+                    renderable.voxel_count = info.voxel_count;
                 }
+                let _ = self.world.remove_one::<ProceduralGeometry>(entity);
                 if self.selected_entity == Some(entity) {
                     self.selected_procedural_node = None;
                 }
                 self.scene_dirty = true;
+                self.geometry_dirty = true;
+                self.gpu_objects_dirty = true;
+                // Surface the new asset in the Models panel right
+                // away so it can be re-spawned later.
+                self.scan_models();
                 self.console.info(format!(
-                    "Converted '{name}' to voxel object ({voxel_count} voxels).",
+                    "Converted '{name}' to voxel asset → assets/{rel_path} ({} voxels).",
+                    info.voxel_count,
                 ));
             }
 
@@ -4407,30 +4559,44 @@ impl EngineState {
     /// the generator panel is hidden. Per-entity status updates land
     /// on the ECS via `tick()` itself.
     fn tick_generators(&mut self) {
-        let events = self
-            .generator_system
-            .tick(&mut self.world, &self.registry);
+        // Compute the per-session bake-cache directory for emitted
+        // children: `{scene_dir}/{scene_stem}.bakes/`. Same directory
+        // procedurals use for their per-entity caches — generator
+        // children get filenames keyed by `(parent_uuid, slot_key)` so
+        // the two never collide. `None` here means the scene is
+        // unsaved; persistent emits run but won't write a cache, so a
+        // save+reload of an unsaved-then-saved scene will trigger a
+        // one-time regen until the first bake completes after save.
+        let child_cache_dir = self
+            .scene_path
+            .as_ref()
+            .and_then(|p| {
+                let parent = p.parent()?;
+                let stem = p.file_stem()?;
+                Some(parent.join(format!("{}.bakes", stem.to_string_lossy())))
+            });
+        if let Some(ref dir) = child_cache_dir {
+            // Best-effort create — same lazy create pattern used by
+            // procedural caches.
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let events = self.generator_system.tick(
+            &mut self.world,
+            &self.registry,
+            &self.entity_uuids,
+            child_cache_dir.as_deref(),
+        );
         for ev in events {
             use crate::generator::GeneratorEvent;
             match ev {
                 GeneratorEvent::WillResubmit { entity, name: _ } => {
-                    // Reset slot-key tracking + blow away every
-                    // anonymous child of this generator. Persistent
-                    // children stay; the spawn-or-update path will
-                    // reuse them when their slot_key emits again.
+                    // Reset the per-generation slot-key tracker before
+                    // the new run's emits land. The spawn-or-update
+                    // path repopulates it as each child arrives, and
+                    // the Completed handler diffs the resulting set
+                    // against the existing children to despawn slots
+                    // the generator no longer emits.
                     self.pending_generator_slot_keys.remove(&entity);
-                    let anon: Vec<hecs::Entity> = self
-                        .world
-                        .query::<&crate::generator::GeneratorOwned>()
-                        .iter()
-                        .filter(|(_, owned)| {
-                            owned.parent == entity && owned.slot_key.is_none()
-                        })
-                        .map(|(e, _)| e)
-                        .collect();
-                    for child in anon {
-                        self.delete_entity(child);
-                    }
                 }
                 GeneratorEvent::Submitted { entity, name } => {
                     eprintln!("[gen] submit entity={entity:?} name={name}");
@@ -4443,21 +4609,19 @@ impl EngineState {
                         .pending_generator_slot_keys
                         .remove(&entity)
                         .unwrap_or_default();
-                    let orphans: Vec<hecs::Entity> = self
-                        .world
-                        .query::<&crate::generator::GeneratorOwned>()
-                        .iter()
-                        .filter(|(_, owned)| {
-                            if owned.parent != entity {
-                                return false;
-                            }
-                            match &owned.slot_key {
-                                Some(k) => !seen.contains(k),
-                                None => false, // anon already blown away
-                            }
-                        })
-                        .map(|(e, _)| e)
-                        .collect();
+                    let parent_uuid = self.entity_uuids.get(&entity).copied();
+                    let orphans: Vec<hecs::Entity> = if let Some(pu) = parent_uuid {
+                        self.world
+                            .query::<&crate::generator::GeneratorOwned>()
+                            .iter()
+                            .filter(|(_, owned)| {
+                                owned.parent_uuid == pu && !seen.contains(&owned.slot_key)
+                            })
+                            .map(|(e, _)| e)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     for child in orphans {
                         self.delete_entity(child);
                     }
@@ -4495,7 +4659,7 @@ impl EngineState {
         generator_entity: hecs::Entity,
         local_transform: crate::components::Transform,
         generation: u64,
-        slot_key: Option<String>,
+        slot_key: String,
         spatial: crate::components::SpatialData,
         voxel_count: u32,
         name_hint: Option<String>,
@@ -4516,41 +4680,48 @@ impl EngineState {
         );
 
         // Track that this slot was emitted this generation, so the
-        // Completed handler knows which persistent children survived
-        // (vs. which to despawn as orphans).
-        if let Some(ref key) = slot_key {
-            self.pending_generator_slot_keys
-                .entry(generator_entity)
-                .or_default()
-                .insert(key.clone());
+        // Completed handler knows which children survived (vs. which
+        // to despawn as orphans because the generator stopped emitting
+        // them).
+        self.pending_generator_slot_keys
+            .entry(generator_entity)
+            .or_default()
+            .insert(slot_key.clone());
 
-            if let Some(existing) = self.find_persistent_child(generator_entity, key) {
-                // Reuse: free the old geometry, swap the Renderable's
-                // spatial in place, refresh transform + generation.
-                // Other components stay → user-attached lights /
-                // scripts survive across regens.
-                self.release_renderable_geometry(existing);
-                if let Ok(mut t) = self.world.get::<&mut Transform>(existing) {
-                    *t = world_transform;
-                }
-                if let Ok(mut r) = self.world.get::<&mut Renderable>(existing) {
-                    r.spatial = Some(spatial);
-                    r.voxel_count = voxel_count;
-                }
-                if let Ok(mut owned) =
-                    self.world.get::<&mut crate::generator::GeneratorOwned>(existing)
-                {
-                    owned.generation = generation;
-                }
-                self.scene_dirty = true;
-                self.geometry_dirty = true;
-                self.gpu_objects_dirty = true;
-                eprintln!(
-                    "[gen] reused persistent child entity={existing:?} parent={generator_entity:?} \
-                     slot='{key}' voxels={voxel_count} gen={generation}"
-                );
-                return;
+        if let Some(existing) = self.find_persistent_child(generator_entity, &slot_key) {
+            // Reuse: free the old geometry, swap the Renderable's
+            // spatial in place, refresh transform + generation. Other
+            // components stay → user-attached lights / scripts survive
+            // across regens.
+            self.release_renderable_geometry(existing);
+            if let Ok(mut t) = self.world.get::<&mut Transform>(existing) {
+                *t = world_transform;
             }
+            if let Ok(mut r) = self.world.get::<&mut Renderable>(existing) {
+                r.spatial = Some(spatial);
+                r.voxel_count = voxel_count;
+                // Reload-from-cache populates `asset_handle` (children
+                // round-trip through the asset cache on load). The
+                // fresh bake hands us a raw scene-pool allocation,
+                // not an asset — clear the stale handle so the NEXT
+                // regen's release_renderable_geometry takes the
+                // deallocate-spatial path instead of releasing an
+                // asset that was already released up above.
+                r.asset_handle = None;
+            }
+            if let Ok(mut owned) =
+                self.world.get::<&mut crate::generator::GeneratorOwned>(existing)
+            {
+                owned.generation = generation;
+            }
+            self.scene_dirty = true;
+            self.geometry_dirty = true;
+            self.gpu_objects_dirty = true;
+            eprintln!(
+                "[gen] reused child entity={existing:?} parent={generator_entity:?} \
+                 slot='{slot_key}' voxels={voxel_count} gen={generation}"
+            );
+            return;
         }
 
         let base_name = name_hint.unwrap_or_else(|| {
@@ -4569,12 +4740,25 @@ impl EngineState {
             ..Default::default()
         };
         let parent_uuid = self.entity_uuids.get(&generator_entity).copied();
+        // GeneratorOwned needs the parent's UUID; without it the marker
+        // can't survive a save/load (queries match by UUID, not Entity).
+        // If the generator entity has somehow lost its UUID, fail loud
+        // instead of silently spawning an orphan.
+        let owned_parent_uuid = match parent_uuid {
+            Some(u) => u,
+            None => {
+                eprintln!(
+                    "[gen] spawn_or_update_generated_child: generator entity {generator_entity:?} has no UUID; dropping child",
+                );
+                return;
+            }
+        };
         let child = self.world.spawn((
             world_transform,
             EditorMetadata { name: name.clone() },
             renderable,
             crate::generator::GeneratorOwned {
-                parent: generator_entity,
+                parent_uuid: owned_parent_uuid,
                 generation,
                 slot_key: slot_key.clone(),
             },
@@ -4593,10 +4777,9 @@ impl EngineState {
         self.scene_dirty = true;
         self.geometry_dirty = true;
         self.gpu_objects_dirty = true;
-        let slot_str = slot_key.as_deref().unwrap_or("-");
         eprintln!(
             "[gen] spawned child entity={child:?} parent={generator_entity:?} \
-             name='{name}' slot='{slot_str}' voxels={voxel_count} gen={generation}"
+             name='{name}' slot='{slot_key}' voxels={voxel_count} gen={generation}"
         );
     }
 
@@ -4607,11 +4790,12 @@ impl EngineState {
         parent: hecs::Entity,
         slot_key: &str,
     ) -> Option<hecs::Entity> {
+        let parent_uuid = self.entity_uuids.get(&parent).copied()?;
         self.world
             .query::<&crate::generator::GeneratorOwned>()
             .iter()
             .find(|(_, owned)| {
-                owned.parent == parent && owned.slot_key.as_deref() == Some(slot_key)
+                owned.parent_uuid == parent_uuid && owned.slot_key == slot_key
             })
             .map(|(e, _)| e)
     }
@@ -4732,6 +4916,40 @@ impl EngineState {
         self.entity_to_gpu.clear();
         self.scene_id_to_gpu.clear();
 
+        // Refresh the sim-side skinning_data cache only when a
+        // geometry mutation has happened since we last built it.
+        // Steady-state (no bakes / no asset (un)loads) does ZERO
+        // scene_mgr lock acquisitions per tick — so even a busy
+        // bake_worker holding the Mutex for hundreds of ms can't
+        // stall sim. When the epoch does advance (a bake completed,
+        // an asset was loaded), we lock once to refresh; that one
+        // wait might be long if bake_worker has *already started*
+        // the next bake, but we pay it once per epoch bump rather
+        // than once per skinned entity per tick.
+        if self.skinning_enabled {
+            let current_epoch = self
+                .geometry_epoch_handle
+                .load(std::sync::atomic::Ordering::Acquire);
+            if current_epoch > self.skinning_data_cache_epoch {
+                let asset_handles: std::collections::HashSet<rkp_render::AssetHandle> = self
+                    .world
+                    .query::<&Renderable>()
+                    .iter()
+                    .filter_map(|(_, r)| r.asset_handle)
+                    .collect();
+                self.skinning_data_cache.clear();
+                if !asset_handles.is_empty() {
+                    let sm = self.scene_mgr.lock().unwrap();
+                    for h in asset_handles {
+                        if let Some(data) = sm.skinning_data(h).cloned() {
+                            self.skinning_data_cache.insert(h, data);
+                        }
+                    }
+                }
+                self.skinning_data_cache_epoch = current_epoch;
+            }
+        }
+
         for (entity, (transform, renderable)) in self.world.query::<(&Transform, &Renderable)>().iter() {
             if let Some(ref spatial) = renderable.spatial {
                 let world_matrix = glam::Mat4::from_scale_rotation_translation(
@@ -4756,15 +4974,18 @@ impl EngineState {
                 // animated AND the asset has baked skinning metadata.
                 if self.skinning_enabled {
                     if let (Some(bind), Some(handle)) = (skinning, renderable.asset_handle) {
+                        // Cache lookup — no scene_mgr lock here. The
+                        // cache is refreshed at the top of this fn
+                        // only when geometry epoch advances.
                         if let (Some(skel), Some(skin_data)) = (
                             self.world.get::<&crate::components::Skeleton>(entity).ok(),
-                            self.scene_mgr.lock().unwrap().skinning_data(handle).cloned(),
+                            self.skinning_data_cache.get(&handle),
                         ) {
                             if let Some(plan) = crate::scene_sync::plan_skin_dispatch(
                                 bind.bone_buffer_offset,
                                 bind.bone_count,
                                 &skel.current_pose,
-                                &skin_data,
+                                skin_data,
                                 spatial.voxel_size,
                                 &mut running_bone_field_cells,
                                 &mut running_bone_field_occ_u32s,
@@ -5055,12 +5276,16 @@ impl EngineState {
         // their own pool allocations that need the standard cleanup
         // path, so we route them back through `delete_entity` rather
         // than raw despawn.
-        let owned_children: Vec<hecs::Entity> = self.world
-            .query::<&crate::generator::GeneratorOwned>()
-            .iter()
-            .filter(|(_, owned)| owned.parent == entity)
-            .map(|(e, _)| e)
-            .collect();
+        let owned_children: Vec<hecs::Entity> = if let Some(pu) = self.entity_uuids.get(&entity).copied() {
+            self.world
+                .query::<&crate::generator::GeneratorOwned>()
+                .iter()
+                .filter(|(_, owned)| owned.parent_uuid == pu)
+                .map(|(e, _)| e)
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.generator_system.forget(entity);
         self.pending_generator_slot_keys.remove(&entity);
         for child in owned_children {
@@ -5167,12 +5392,12 @@ impl EngineState {
             }
         }
 
-        // Phase 3: stamp unique identity + offset so the copy is visible.
+        // Phase 3: stamp unique identity. Transform is left exactly
+        // as the source — the copy occupies the same world position
+        // and only becomes visible once the user moves it (this
+        // matches DCC tools like Blender/Maya where Ctrl+D stacks).
         if let Ok(mut md) = self.world.get::<&mut EditorMetadata>(entity) {
             md.name = new_name.clone();
-        }
-        if let Ok(mut t) = self.world.get::<&mut Transform>(entity) {
-            t.position += glam::Vec3::new(0.5, 0.0, 0.5);
         }
         // Renderable carries a scene_id through the external side map, not
         // the component itself — assign a fresh one for face emission.
@@ -5182,6 +5407,69 @@ impl EngineState {
         }
 
         self.assign_entity_uuid(entity);
+
+        // Phase 4: hydrate runtime-only fields the registry's
+        // serialize/deserialize couldn't carry over.
+        //
+        // `Renderable.spatial` and `Renderable.asset_handle` are
+        // `#[serde(skip)]` — they're references into the scene
+        // manager's runtime pools and the asset cache, not data we
+        // store on disk. After serde-deserialize the cloned entity
+        // has `asset_path: Some(...)` but neither a spatial nor a
+        // handle, so it would render as empty space. Re-acquire the
+        // asset to bump its refcount and populate the runtime
+        // fields. Mirrors the load-from-disk path in `load_scene`.
+        let asset_path_to_acquire = self
+            .world
+            .get::<&Renderable>(entity)
+            .ok()
+            .and_then(|r| r.asset_path.clone());
+        if let Some(asset_path) = asset_path_to_acquire {
+            let full_path = self
+                .project_dir
+                .as_ref()
+                .map(|d| d.join("assets").join(&asset_path))
+                .unwrap_or_else(|| std::path::PathBuf::from(&asset_path));
+            let acquired = self
+                .scene_mgr
+                .lock()
+                .unwrap()
+                .acquire_asset(&full_path.to_string_lossy());
+            match acquired {
+                Ok((handle, info)) => {
+                    let new_spatial = spatial_from_handle(
+                        &info.spatial,
+                        info.voxel_size,
+                        &info.aabb,
+                        info.grid_origin,
+                        info.leaf_attr_slot_start,
+                        info.leaf_attr_slot_count,
+                        Vec::new(),
+                    );
+                    if let Ok(mut r) = self.world.get::<&mut Renderable>(entity) {
+                        r.spatial = Some(new_spatial);
+                        r.asset_handle = Some(handle);
+                        r.voxel_count = info.voxel_count;
+                    }
+                }
+                Err(e) => {
+                    self.console.warn(format!(
+                        "Duplicate: couldn't acquire asset '{asset_path}' for clone of '{src_name}': {e}",
+                    ));
+                }
+            }
+        }
+
+        // Procedural duplicates: the source's bake-cache file is
+        // keyed by the SOURCE entity's UUID, not the new one, so
+        // the new entity has no on-disk cache and no runtime
+        // spatial yet. Mark it dirty so the bake_worker schedules
+        // a fresh bake on the next tick — same treatment a brand-
+        // new procedural gets.
+        if let Ok(mut pg) = self.world.get::<&mut ProceduralGeometry>(entity) {
+            pg.dirty = true;
+        }
+
         self.selected_entity = Some(entity);
 
         self.console.info(format!("Duplicated '{src_name}' → '{new_name}'"));
@@ -5197,7 +5485,13 @@ impl EngineState {
         self.next_entity_uuid = 1;
         self.gpu_objects.clear();
         self.gpu_to_entity.clear();
-        *self.scene_mgr.lock().unwrap() = RkpSceneManager::new(1_000_000);
+        // `clear()` wipes every pool but preserves the epoch atomic
+        // identity — replacing the whole manager here would orphan
+        // sim's `geometry_epoch_handle`, breaking the lock-free
+        // epoch read so render never sees future bumps and stops
+        // uploading geometry (everything renders as the raw AABB
+        // cubes after a project close+open).
+        self.scene_mgr.lock().unwrap().clear(1_000_000);
         self.selected_entity = None;
         self.geometry_dirty = true;
         self.scene_dirty = true;
@@ -5263,16 +5557,26 @@ impl EngineState {
                             }
                             Err(_) => None,
                         }
-                    } else if obj.primitive.as_deref() == Some("procedural") {
-                        // Procedural entity: the tree itself arrives via
-                        // the generic components pass (ProceduralGeometry).
-                        // Here we spawn the matching Renderable and — if a
-                        // `.rkp` sidecar is present — attach the baked
-                        // spatial so the scene renders without an
-                        // auto-bake at startup (a large re-bake on load
-                        // can freeze or crash the UI). Missing sidecar =
-                        // the entity loads empty; the user sees the
-                        // unbaked chip and can click Bake explicitly.
+                    } else if obj.procedural_cache.is_some() {
+                        // Two cases land here:
+                        //   - Procedurals (`primitive == Some("procedural")`):
+                        //     the tree component arrives via the generic
+                        //     components pass (ProceduralGeometry). The
+                        //     cache provides the pre-baked voxels so
+                        //     reload is instant.
+                        //   - Persistent generator children (`primitive
+                        //     == None`, GeneratorOwned arrives via the
+                        //     generic components pass): the cache is
+                        //     their only geometry source. Without
+                        //     loading it here the child is invisible
+                        //     until the generator regens.
+                        //
+                        // Either way, attach the baked spatial. Missing
+                        // or unreadable cache leaves the entity empty —
+                        // for procedurals that's recoverable via Bake;
+                        // for generator children the parent generator's
+                        // next tick will detect the missing slot and
+                        // re-emit it.
                         let sid = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let (spatial, asset_handle, voxel_count) = match (&obj.procedural_cache, &scene_dir) {
                             (Some(rel), Some(dir)) => {
@@ -5302,7 +5606,14 @@ impl EngineState {
                             _ => (None, None, 0),
                         };
                         let e = self.world.spawn((transform, meta, Renderable {
-                            primitive: Some("procedural".to_string()),
+                            // Preserve the saved primitive tag —
+                            // `Some("procedural")` for un-converted
+                            // procedurals (so the inspector still
+                            // recognises them and the components pass
+                            // attaches the tree); `None` for generator
+                            // children (no tree, no procedural
+                            // affordances, just baked voxels).
+                            primitive: obj.primitive.clone(),
                             material_id: obj.material_id,
                             voxel_count,
                             spatial,
@@ -5518,12 +5829,47 @@ impl EngineState {
                 }
             }
 
-            // Procedural bake cache — only emit when the sidecar file
-            // actually exists on disk. The worker writes it during the
-            // bake, but an unsaved scratch scene (no scene_path yet)
-            // or a never-baked procedural won't have one.
-            let procedural_cache = if components.contains_key("ProceduralGeometry") {
-                let abs = self.procedural_cache_path(entity);
+            // Procedural bake cache reference — points at the .rkp
+            // sidecar that holds this entity's pre-baked voxels so
+            // load can restore them without re-running anything. Two
+            // sources flow through this same field:
+            //
+            //   1. Procedurals: `procedural_cache_path()` →
+            //      `{scene}.bakes/{uuid}.rkp` written by the bake
+            //      worker on every procedural bake.
+            //   2. Persistent generator children: derived from
+            //      `(parent_uuid, slot_key)` →
+            //      `{scene}.bakes/gen_{parent}_{slot}.rkp` written by
+            //      the bake worker via the `cache_output_path` set on
+            //      the BakeRequest by `enqueue_child_bake`.
+            //
+            // Either way, only emit when the file actually exists. An
+            // unsaved scratch scene (no `scene_path`) or a never-baked
+            // entity won't have one. Converted procedurals took a
+            // different route (`assets/converted/*.rkp` via
+            // `asset_path`) so they don't appear here.
+            let procedural_cache = {
+                let abs = if components.contains_key("ProceduralGeometry") {
+                    self.procedural_cache_path(entity)
+                } else if let Ok(owned) = self.world.get::<&crate::generator::GeneratorOwned>(entity) {
+                    let stem_opt = self
+                        .scene_path
+                        .as_ref()
+                        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
+                    match (&scene_dir, stem_opt) {
+                        (Some(dir), Some(stem)) => {
+                            let bakes = dir.join(format!("{stem}.bakes"));
+                            Some(crate::generator::child_cache_path(
+                                &bakes,
+                                owned.parent_uuid,
+                                &owned.slot_key,
+                            ))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 match (abs, &scene_dir) {
                     (Some(abs), Some(dir)) if abs.exists() => abs
                         .strip_prefix(dir)
@@ -5531,8 +5877,6 @@ impl EngineState {
                         .map(|rel| rel.to_string_lossy().to_string()),
                     _ => None,
                 }
-            } else {
-                None
             };
 
             objects.push(crate::scene_io::SceneObject {
@@ -6478,84 +6822,11 @@ impl EngineState {
         .map(|(id, _t)| id)
     }
 
-    /// Non-blocking consumer for `pick_in_flight`. Called at the top of
-    /// each render frame after the routine `device.poll(Poll)` so any
-    /// async map callback that fired in the interim is visible. Returns
-    /// without effect if no pick is pending or the map hasn't completed.
-    fn drain_pick_result(&mut self) {
-        let ready = self
-            .pick_in_flight
-            .as_ref()
-            .map(|(_, rx)| rx.try_recv().is_ok())
-            .unwrap_or(false);
-        if !ready {
-            return;
-        }
-        let (pp, _rx) = self.pick_in_flight.take().expect("ready check passed");
-        let pending = Some(pp);
-        let slice = self.pick_readback_buffer.slice(..);
-        // Recv was OK — the buffer is mapped; the read below is sync.
-        {
-            let data = slice.get_mapped_range();
-            if data.len() >= 260 {
-                // Material G-buffer (Rg32Uint, at offset 0):
-                //   R = primary (low16) | secondary (high16)
-                //   G = blend (lo8) | object_id+1 (8-15) | color_rgb565 (16-31)
-                // Pick G-buffer (R32Uint, at offset 256):
-                //   primitive_node_id (low16 for procedural hits,
-                //   0xFFFF for misses / combinators / voxel hits).
-                let r_channel = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                let g_channel = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-                let pick_channel = u32::from_le_bytes([data[256], data[257], data[258], data[259]]);
-                let _ = r_channel; // primary/secondary material ids not needed for pick
-                let obj_raw = (g_channel >> 8) & 0xFF;
-
-                // Dispatch by viewport. BUILD + raymarch resolves the
-                // NodeId from the dedicated pick texture. Other paths
-                // (MAIN + voxel, or BUILD + voxel) fall back to the
-                // same scene_id table — entity-granularity pick.
-                let is_build_raymarch = pending.map(|pp| {
-                    pp.viewport == crate::viewport::ViewportId::BUILD
-                }).unwrap_or(false)
-                    && self.viewports
-                        .get(crate::viewport::ViewportId::BUILD)
-                        .map(|v| matches!(v.preview_mode, rkp_render::BuildPreviewMode::Raymarch))
-                        .unwrap_or(false);
-
-                if is_build_raymarch {
-                    // Ghost priority: if the CPU raycast at click time
-                    // found a ghost primitive on the ray, that wins —
-                    // matches the "translucent overlay on top owns the
-                    // click" rule, and catches cutters fully carved
-                    // away by their parent (no visible surface, so the
-                    // G-buffer has nothing for them).
-                    if let Some(ghost_id) = pending.and_then(|pp| pp.ghost_pick_node_id) {
-                        self.selected_procedural_node = Some(ghost_id);
-                    } else {
-                        let node_id_16 = pick_channel & 0xFFFFu32;
-                        // Shader writes 0xFFFF for misses/combinators;
-                        // treat as "no selection" and clear any
-                        // previously-selected node so click-on-empty
-                        // deselects.
-                        if obj_raw > 0 && node_id_16 != 0xFFFFu32 {
-                            self.selected_procedural_node = Some(node_id_16);
-                        } else {
-                            self.selected_procedural_node = None;
-                        }
-                    }
-                } else if obj_raw > 0 {
-                    let gpu_idx = (obj_raw - 1) as usize;
-                    if gpu_idx < self.gpu_to_entity.len() {
-                        self.selected_entity = Some(self.gpu_to_entity[gpu_idx]);
-                    }
-                } else {
-                    self.selected_entity = None;
-                }
-            }
-            drop(data);
-            self.pick_readback_buffer.unmap();
-        }
-    }
+    // `drain_pick_result` was retired — pick decoding now lives in
+    // `process_pick_result`, called from `drain_render_results` when
+    // the render thread publishes a `PickResult`. The CPU-resolved
+    // ghost hint is stashed in `in_flight_pick_ghost` between submit
+    // and result.
 
     /// Access the profiling ring buffer. Intended for MCP tools and
     /// any other read-only consumer outside the editor snapshot path.
@@ -6563,12 +6834,14 @@ impl EngineState {
         &self.profiling
     }
 
-    fn build_state_update(&mut self, frame_time: Duration) -> StateUpdate {
-        let fps = if frame_time.as_secs_f32() > 0.0 {
-            1.0 / frame_time.as_secs_f32()
-        } else {
-            0.0
-        };
+    fn build_state_update(&mut self, _sim_frame_time: Duration) -> StateUpdate {
+        // FPS = render thread's actual iteration rate, EMA-smoothed.
+        // The previous formula was `1 / sim_cpu_work_time`, which
+        // measured sim CPU headroom rather than what's on screen.
+        // After the sim/render thread split they're independent
+        // numbers — sim might be at 600 Hz "could do" while render
+        // is paced to 60 Hz. The user-visible FPS is the render rate.
+        let fps = self.render_hz_ema;
 
         let objects = if self.scene_dirty {
             self.scene_dirty = false;
@@ -6756,7 +7029,17 @@ impl EngineState {
             },
             procedural: procedural_update,
             console_entries: self.console.drain_new(),
-            profiling: self.profiling.latest().cloned(),
+            // Pull the most recent sample whose render-thread data
+            // has been stitched in. Render publishes 1-2 frames
+            // behind sim — `latest()` would return a still-empty
+            // sample sim just pushed and the panel would show no GPU
+            // / frame-time data. Falls back to `latest()` during the
+            // first few frames before any render results land.
+            profiling: self
+                .profiling
+                .latest_with_render_data()
+                .or_else(|| self.profiling.latest())
+                .cloned(),
         }
     }
 
@@ -7312,7 +7595,12 @@ fn tick_loop(
     state_callback: StateCallback,
     config: EngineConfig,
 ) {
-    let mut state = EngineState::new(&config);
+    // Hand the frame_callback to the render thread (constructed inside
+    // EngineState::new). Sim no longer fires it directly — pixel
+    // callbacks happen on the render thread after each VR's readback
+    // drain. The callback closure is `Send`, so this just transfers
+    // ownership across the thread boundary at spawn time.
+    let mut state = EngineState::new(&config, frame_callback);
     state.console.info(format!("Engine started ({}x{})", config.width, config.height));
 
     // Try to load a pre-built gameplay dylib (if project is already set).
@@ -7320,6 +7608,7 @@ fn tick_loop(
     state.try_load_gameplay_dylib();
 
     let mut last_tick_start: Option<Instant> = None;
+
     loop {
         let frame_start = Instant::now();
 
@@ -7500,8 +7789,11 @@ fn tick_loop(
         // `proc_raymarch.wgsl`). Ghost-pick priority is applied there
         // too — see the BUILD+Raymarch branch in process_pick_result.
 
-        // 4. Render frame — fires `frame_callback` once per visible viewport.
-        state.render_frame(&frame_callback);
+        // 4. Build the render snapshot and submit to the render thread.
+        //    Pixel `frame_callback` fires from the render thread after
+        //    each VR's composite readback drains; sim no longer touches
+        //    it directly.
+        state.submit_render_frame();
 
         // 6. Push state to client.
         let frame_time = frame_start.elapsed();
@@ -7511,10 +7803,11 @@ fn tick_loop(
         // 7. Clear per-frame input state for next tick.
         state.input_system.begin_frame();
 
-        // 8. Frame pacing — sleep the remainder of the configured
-        // target interval. `Uncapped` skips the sleep entirely; the
-        // tick rate is then bounded only by GPU queue backpressure.
-        if let Some(target) = config.render_pacing.target_interval() {
+        // 8. Sim-loop pacing — sleep the remainder of the configured
+        // sim target interval. `Uncapped` skips the sleep entirely
+        // and lets the sim loop run as fast as its work allows.
+        // Render pacing is separate and handled on the render thread.
+        if let Some(target) = config.sim_pacing.target_interval() {
             let elapsed = frame_start.elapsed();
             if elapsed < target {
                 std::thread::sleep(target - elapsed);

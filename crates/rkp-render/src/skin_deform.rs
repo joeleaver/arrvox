@@ -99,7 +99,7 @@ pub struct SkinDeformPass {
 
 /// Scratch buffer the CPU reuses every frame when concatenating
 /// multiple `SkinDispatch`es into the two scene-wide scatter inputs.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct SkinBatchScratch {
     pub uniforms: Vec<SkinUniforms>,
     pub bricks: Vec<SkinBrickEntry>,

@@ -189,12 +189,29 @@ impl WireframePass {
             bytemuck::cast_slice(&vp_matrix.to_cols_array()),
         );
 
-        // Grow vertex buffer if needed.
+        // Truncate to whatever the device can actually hold. Without this
+        // guard, asking for a buffer larger than `max_buffer_size` returns an
+        // invalid handle that crashes later in `set_vertex_buffer`. Callers
+        // (collider wireframes, etc.) should cap their inputs first; this is
+        // the last line of defence.
+        let vert_size = std::mem::size_of::<LineVertex>();
+        let max_buffer_bytes = device.limits().max_buffer_size;
+        let max_verts = (max_buffer_bytes as usize) / vert_size;
+        let draw_count = vertices.len().min(max_verts);
+        if draw_count < vertices.len() {
+            eprintln!(
+                "[wireframe] truncating {} → {} vertices (max_buffer_size {} bytes)",
+                vertices.len(), draw_count, max_buffer_bytes,
+            );
+        }
+        let vertices = &vertices[..draw_count];
+
+        // Grow vertex buffer if needed, but never past the device limit.
         if vertices.len() > self.vertex_buffer_capacity {
-            let new_cap = vertices.len().next_power_of_two();
+            let new_cap = vertices.len().next_power_of_two().min(max_verts);
             self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("wireframe vertices"),
-                size: (new_cap * std::mem::size_of::<LineVertex>()) as u64,
+                size: (new_cap * vert_size) as u64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });

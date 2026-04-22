@@ -2,15 +2,23 @@
 //!
 //! Every control is a plain function taking `&mut RenderScope` → `NodeHandle`.
 //! All controls follow the same layout: label (left) + control (right).
-//! All values are reactive via `Signal`. Changes are reported via `Rc<dyn Fn(T)>`.
+//!
+//! Display values are `Memo<T>` — controls re-read reactively from whatever
+//! source the caller wires up (a store-backed projection, a per-field
+//! Memo over an inspector snapshot, etc.). User edits route through
+//! `on_change: Rc<dyn Fn(T)>`; the caller updates the source so the
+//! Memo refires. This avoids signal-sync Effects and gives "store is
+//! source of truth" semantics, so external updates (engine writes,
+//! gameplay, MCP, undo) flow into the UI without remounting forms.
 //!
 //! # Usage
 //!
 //! ```ignore
 //! use super::prop_controls::*;
 //!
+//! let value = Memo::new(move || store.foo.get());
 //! let on_change = Rc::new(|v: f32| { /* send command */ });
-//! prop_slider(__scope, "Roughness", Signal::new(0.5), 0.0, 1.0, 0.01, on_change);
+//! prop_slider(__scope, "Roughness", value, 0.0, 1.0, 0.01, on_change);
 //! ```
 
 use std::rc::Rc;
@@ -19,6 +27,32 @@ use rinch::prelude::*;
 
 type Scope = rinch::core::dom::RenderScope;
 type Node = rinch::core::dom::NodeHandle;
+
+/// Wrap a `Signal<T>` for use with the Memo-based prop_* controls.
+///
+/// Returns a `(Memo<T>, on_change_wrapper)` pair. The Memo reads the
+/// Signal reactively for display; the wrapper writes the Signal AND
+/// calls the user's `on_change`. Use this at call sites where a local
+/// panel Signal is still the source of truth (env/asset panels).
+///
+/// For panels reading directly from `EditorStore`, build the Memo
+/// against the store and skip this helper — the on_change just sends a
+/// command to the engine and the store-backed Memo refires when the
+/// answer comes back.
+pub fn bind<T>(
+    s: Signal<T>,
+    on_change: Rc<dyn Fn(T)>,
+) -> (Memo<T>, Rc<dyn Fn(T)>)
+where
+    T: Clone + PartialEq + 'static,
+{
+    let memo = Memo::new(move || s.get());
+    let oc: Rc<dyn Fn(T)> = Rc::new(move |v: T| {
+        s.set(v.clone());
+        on_change(v);
+    });
+    (memo, oc)
+}
 
 // ── Style constants ──────────────────────────────────────────────────────
 
@@ -54,16 +88,23 @@ pub fn prop_slider(
     step: f32,
     on_change: Rc<dyn Fn(f32)>,
 ) -> Node {
-    // Both "slider" and "scrub" paths use the same gradient-fill
-    // drag-to-change widget; keep the `prop_slider` name for
-    // call-site readability (bounded range + step → `prop_slider`;
-    // write-only field → `prop_scrub`).
-    let display = Memo::new(move || value.get());
-    let on_change_wrap: Rc<dyn Fn(f32)> = Rc::new(move |v: f32| {
-        value.set(v);
-        on_change(v);
-    });
-    prop_scrub(__scope, label, display, min, max, step, on_change_wrap)
+    let (m, oc) = bind(value, on_change);
+    prop_slider_memo(__scope, label, m, min, max, step, oc)
+}
+
+/// Memo-based variant of [`prop_slider`]. Use when the source of truth
+/// lives outside the panel (a store-backed reactive projection, a
+/// per-field Memo over an inspector snapshot, etc.).
+pub fn prop_slider_memo(
+    __scope: &mut Scope,
+    label: &str,
+    value: Memo<f32>,
+    min: f32,
+    max: f32,
+    step: f32,
+    on_change: Rc<dyn Fn(f32)>,
+) -> Node {
+    prop_scrub(__scope, label, value, min, max, step, on_change)
 }
 
 /// Slider that operates on f64 (for ECS inspector fields). Same
@@ -77,12 +118,21 @@ pub fn prop_slider_f64(
     step: f64,
     on_change: Rc<dyn Fn(f64)>,
 ) -> Node {
+    let (m, oc) = bind(value, on_change);
+    prop_slider_f64_memo(__scope, label, m, min, max, step, oc)
+}
+
+pub fn prop_slider_f64_memo(
+    __scope: &mut Scope,
+    label: &str,
+    value: Memo<f64>,
+    min: f64,
+    max: f64,
+    step: f64,
+    on_change: Rc<dyn Fn(f64)>,
+) -> Node {
     let display = Memo::new(move || value.get() as f32);
-    let on_change_wrap: Rc<dyn Fn(f32)> = Rc::new(move |v: f32| {
-        let v64 = v as f64;
-        value.set(v64);
-        on_change(v64);
-    });
+    let on_change_wrap: Rc<dyn Fn(f32)> = Rc::new(move |v: f32| on_change(v as f64));
     prop_scrub(
         __scope,
         label,
@@ -226,6 +276,17 @@ pub fn prop_number_f64(
     value: Signal<f64>,
     on_change: Rc<dyn Fn(f64)>,
 ) -> Node {
+    let (m, oc) = bind(value, on_change);
+    prop_number_f64_memo(__scope, label, m, oc)
+}
+
+/// Memo-based variant of [`prop_number_f64`].
+pub fn prop_number_f64_memo(
+    __scope: &mut Scope,
+    label: &str,
+    value: Memo<f64>,
+    on_change: Rc<dyn Fn(f64)>,
+) -> Node {
     let label = label.to_string();
     let drag_start = Signal::new(0.0f64);
     let oc_drag: Signal<Rc<dyn Fn(f64)>> = Signal::new(on_change.clone());
@@ -246,7 +307,6 @@ pub fn prop_number_f64(
                         .on_move(move |mx, _| {
                             let delta = (mx - start_x) as f64;
                             let new_val = drag_start.get() + delta * 0.02;
-                            value.set(new_val);
                             (oc_drag.get())(new_val);
                         })
                         .start();
@@ -259,7 +319,6 @@ pub fn prop_number_f64(
                 value: {move || format!("{:.3}", value.get())},
                 oninput: move |v: String| {
                     if let Ok(f) = v.parse::<f64>() {
-                        value.set(f);
                         on_change(f);
                     }
                 },
@@ -275,6 +334,17 @@ pub fn prop_number_i64(
     value: Signal<i64>,
     on_change: Rc<dyn Fn(i64)>,
 ) -> Node {
+    let (m, oc) = bind(value, on_change);
+    prop_number_i64_memo(__scope, label, m, oc)
+}
+
+/// Memo-based variant of [`prop_number_i64`].
+pub fn prop_number_i64_memo(
+    __scope: &mut Scope,
+    label: &str,
+    value: Memo<i64>,
+    on_change: Rc<dyn Fn(i64)>,
+) -> Node {
     let label = label.to_string();
     rsx! {
         div {
@@ -286,7 +356,6 @@ pub fn prop_number_i64(
                 value: {move || value.get().to_string()},
                 oninput: move |v: String| {
                     if let Ok(i) = v.parse::<i64>() {
-                        value.set(i);
                         on_change(i);
                     }
                 },
@@ -304,6 +373,18 @@ pub fn prop_text(
     value: Signal<String>,
     on_change: Rc<dyn Fn(String)>,
 ) -> Node {
+    let (m, oc) = bind(value, on_change);
+    prop_text_memo(__scope, label, m, oc)
+}
+
+/// Memo-based variant of [`prop_text`]. Standard "controlled component" —
+/// the rendered value is always whatever the Memo currently reports.
+pub fn prop_text_memo(
+    __scope: &mut Scope,
+    label: &str,
+    value: Memo<String>,
+    on_change: Rc<dyn Fn(String)>,
+) -> Node {
     let label = label.to_string();
     rsx! {
         div {
@@ -313,10 +394,7 @@ pub fn prop_text(
                 r#type: "text",
                 style: INPUT_STYLE,
                 value: {move || value.get()},
-                oninput: move |v: String| {
-                    value.set(v.clone());
-                    on_change(v);
-                },
+                oninput: move |v: String| { on_change(v); },
             }
         }
     }
@@ -331,15 +409,22 @@ pub fn prop_checkbox(
     value: Signal<bool>,
     on_change: Rc<dyn Fn(bool)>,
 ) -> Node {
+    let (m, oc) = bind(value, on_change);
+    prop_checkbox_memo(__scope, label, m, oc)
+}
+
+/// Memo-based variant of [`prop_checkbox`].
+pub fn prop_checkbox_memo(
+    __scope: &mut Scope,
+    label: &str,
+    value: Memo<bool>,
+    on_change: Rc<dyn Fn(bool)>,
+) -> Node {
     let label = label.to_string();
     rsx! {
         div {
             style: "display:flex;align-items:center;gap:6px;min-height:22px;cursor:pointer;",
-            onclick: move || {
-                let new_val = !value.get();
-                value.set(new_val);
-                on_change(new_val);
-            },
+            onclick: move || { on_change(!value.get()); },
             div {
                 style: {move || if value.get() { CHECKBOX_ON } else { CHECKBOX_OFF }},
                 // Checkmark icon (only when checked)

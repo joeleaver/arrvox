@@ -16,7 +16,7 @@ pub mod registry;
 pub mod state;
 pub mod system;
 
-pub use context::{CancelToken, GeneratorContext, ProgressHandle};
+pub use context::{child_cache_path, CancelToken, GeneratorContext, ProgressHandle};
 pub use error::{GeneratorError, GeneratorStatus};
 pub use owned::GeneratorOwned;
 pub use preset::{GeneratorAssetConfig, GeneratorPresetInfo};

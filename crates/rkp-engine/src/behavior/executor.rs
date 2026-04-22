@@ -44,29 +44,44 @@ impl BehaviorExecutor {
         Ok(())
     }
 
-    /// Run Update + FixedUpdate phases. Call this, then step physics, then `tick_late`.
-    pub fn tick(
+    /// Run the variable-rate `Update` phase. Call once per render
+    /// frame with the real wall-clock delta. Reset per-system timings
+    /// at the start so the panel only shows the most recent frame's
+    /// numbers (FixedUpdate accumulates into the same slot below; the
+    /// reset here ensures we don't carry timings from a frame that
+    /// happened to skip Update).
+    pub fn tick_update(
         &mut self,
         systems: &[&SystemEntry],
         world: &mut hecs::World,
         commands: &mut CommandQueue,
         store: &mut GameStore,
         delta_time: f32,
-        fixed_delta_time: f32,
         total_time: f64,
         frame: u64,
     ) {
-        // Reset timings.
         for t in self.system_timings.iter_mut() {
             *t = None;
         }
-
-        // Phase 1: Update
         self.run_phase(&self.schedule.update.clone(), systems, world, commands, store, delta_time, total_time, frame);
         commands.flush(world);
+    }
 
-        // Phase 2: FixedUpdate
-        self.run_phase(&self.schedule.fixed_update.clone(), systems, world, commands, store, fixed_delta_time, total_time, frame);
+    /// Run a single `FixedUpdate` step. Call N times per render frame
+    /// from an accumulator-driven loop in `tick_loop`. `delta_time`
+    /// must be the fixed step (typically 1/60) — mismatched values
+    /// will desync any system that integrates state.
+    pub fn tick_fixed_update(
+        &mut self,
+        systems: &[&SystemEntry],
+        world: &mut hecs::World,
+        commands: &mut CommandQueue,
+        store: &mut GameStore,
+        delta_time: f32,
+        total_time: f64,
+        frame: u64,
+    ) {
+        self.run_phase(&self.schedule.fixed_update.clone(), systems, world, commands, store, delta_time, total_time, frame);
         commands.flush(world);
     }
 

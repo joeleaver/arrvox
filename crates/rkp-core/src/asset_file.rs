@@ -374,6 +374,112 @@ pub fn write_rkp_with_progress<W: Write + Seek>(
     Ok(())
 }
 
+/// Serialize a [`BakeArtifact`](crate::voxelize_octree::BakeArtifact) to
+/// a `.rkp` file on disk, atomically. The artifact's file-local
+/// leaf_attr and brick IDs are passed through unchanged —
+/// `load_asset_from_disk` already handles remapping to scene-global IDs
+/// on read. Writes first to `{path}.inprogress`, then renames into
+/// place so a mid-write failure leaves any pre-existing file
+/// untouched. Creates the parent directory if missing.
+///
+/// Used by the async bake worker to persist procedural bakes alongside
+/// the scene file. No skin-meta is emitted (procedurals aren't
+/// skinned); the color section is skipped when the artifact has no
+/// per-voxel overrides.
+pub fn write_artifact_rkp(
+    path: &std::path::Path,
+    artifact: &crate::voxelize_octree::BakeArtifact,
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
+    voxel_size: f32,
+) -> Result<(), String> {
+    use crate::voxel::VoxelSample;
+
+    let voxel_count = artifact.leaf_attrs.len() as u32;
+
+    // LeafAttr material fields round-trip through load; the saved
+    // VoxelSample distance is never read (the shader only reads
+    // per-slot material + blend + normal from the .rkp), so we store
+    // zero.
+    let voxel_samples: Vec<VoxelSample> = artifact
+        .leaf_attrs
+        .iter()
+        .map(|a| {
+            VoxelSample::new_blended(
+                0.0,
+                a.material_primary,
+                a.material_secondary(),
+                a.blend_weight(),
+            )
+        })
+        .collect();
+    let voxel_bytes: &[u8] = bytemuck::cast_slice(&voxel_samples);
+
+    let normals: Vec<u32> = artifact
+        .leaf_attrs
+        .iter()
+        .map(|a| a.normal_oct)
+        .collect();
+    let normals_bytes: &[u8] = bytemuck::cast_slice(&normals);
+
+    let bricks_flat: Vec<u32> = artifact
+        .brick_cells
+        .iter()
+        .flat_map(|c| c.iter().copied())
+        .collect();
+    let bricks_bytes: &[u8] = bytemuck::cast_slice(&bricks_flat);
+
+    let has_color = artifact.leaf_attr_colors.iter().any(|&c| c != 0);
+    let color_bytes: Option<&[u8]> = if has_color {
+        Some(bytemuck::cast_slice(&artifact.leaf_attr_colors))
+    } else {
+        None
+    };
+
+    let material_ids: [u16; 0] = [];
+
+    let tmp = {
+        let mut s = path.as_os_str().to_owned();
+        s.push(".inprogress");
+        std::path::PathBuf::from(s)
+    };
+    let _ = std::fs::remove_file(&tmp);
+
+    if let Some(parent) = tmp.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create parent {}: {e}", parent.display()))?;
+    }
+
+    {
+        let file = std::fs::File::create(&tmp)
+            .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
+        write_rkp(
+            &mut writer,
+            artifact.octree.as_slice(),
+            artifact.octree.depth(),
+            voxel_size,
+            voxel_count,
+            aabb_min,
+            aabb_max,
+            &material_ids,
+            voxel_bytes,
+            Some(normals_bytes),
+            Some(bricks_bytes),
+            color_bytes,
+            None,
+        )
+        .map_err(|e| format!("write .rkp: {e}"))?;
+    }
+
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename {} -> {}: {e}", tmp.display(), path.display())
+    })?;
+
+    Ok(())
+}
+
 /// Read a .rkp file header.
 pub fn read_rkp_header<R: Read>(reader: &mut R) -> Result<RkpHeader, RkpFileError> {
     let mut buf = [0u8; std::mem::size_of::<RkpHeader>()];
@@ -588,6 +694,96 @@ mod tests {
             let sum: u16 = (0..4).map(|s| bv_out.bone_weight(s) as u16).sum();
             assert_eq!(sum, 255, "voxel {i} weights must sum to 255");
         }
+    }
+
+    #[test]
+    fn write_artifact_rkp_roundtrip() {
+        // Bake a tiny sphere into a BakeArtifact via the canonical
+        // voxelize path, persist through write_artifact_rkp, then read
+        // the sections back and check material/normal/brick/color
+        // round-trip. This is the procedural bake-cache pipeline end
+        // to end minus the scene integration.
+        use crate::voxel::VoxelSample;
+        use glam::Vec3;
+
+        let voxel_size = 0.05;
+        let half = Vec3::splat(0.3);
+        let aabb = crate::Aabb::new(-half, half);
+        let radius: f32 = 0.25;
+        let sdf = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+            positions
+                .iter()
+                .map(|p| (p.length() - radius, 7u16, 0u16, 0u8, 0u32))
+                .collect()
+        };
+
+        let mut artifact = crate::voxelize_to_artifact(sdf, &aabb, voxel_size)
+            .expect("voxelize sphere");
+        assert!(artifact.voxel_count > 0, "sphere must produce voxels");
+        // Spike a non-zero color on the first leaf so the color
+        // section is emitted — verifies `has_color` detection works.
+        artifact.leaf_attr_colors[0] = 0xFFAABBCC;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "rkp_artifact_roundtrip_{}.rkp",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        write_artifact_rkp(
+            &tmp,
+            &artifact,
+            aabb.min.to_array(),
+            aabb.max.to_array(),
+            voxel_size,
+        )
+        .expect("write_artifact_rkp");
+
+        let mut file = std::fs::File::open(&tmp).expect("open");
+        let mut reader = std::io::BufReader::new(&mut file);
+        let header = read_rkp_header(&mut reader).expect("read header");
+        // Header stores leaf_attr-slot count, not cell count — the
+        // per-slot voxel_data length is what the loader cares about.
+        // `voxelize_to_artifact` already ran prefilter, so this
+        // includes internal-node attrs in addition to the surface
+        // leaves. On load, a fresh prefilter appends again; the
+        // unreferenced "old" prefilter attrs linger harmlessly.
+        assert_eq!(header.voxel_count, artifact.leaf_attrs.len() as u32);
+        assert_eq!(header.octree_depth as u8, artifact.octree.depth());
+        assert!((header.base_voxel_size - voxel_size).abs() < 1e-6);
+        assert!(header.flags & FLAG_HAS_BRICKS != 0);
+        assert!(header.flags & FLAG_HAS_NORMALS != 0);
+        assert!(header.flags & FLAG_HAS_COLOR != 0);
+
+        let octree_nodes = read_rkp_octree(&mut reader, &header).expect("octree");
+        assert_eq!(octree_nodes, artifact.octree.as_slice());
+
+        let voxel_bytes = read_rkp_voxels(&mut reader, &header).expect("voxels");
+        let voxels: &[VoxelSample] = bytemuck::cast_slice(&voxel_bytes);
+        assert_eq!(voxels.len(), artifact.leaf_attrs.len());
+        for (v, a) in voxels.iter().zip(artifact.leaf_attrs.iter()) {
+            assert_eq!(v.material_id(), a.material_primary);
+            assert_eq!(v.secondary_material_id(), a.material_secondary());
+            assert_eq!(v.blend_weight(), a.blend_weight());
+        }
+
+        let normals_bytes = read_rkp_normals(&mut reader, &header).expect("normals");
+        let normals: &[u32] = bytemuck::cast_slice(&normals_bytes);
+        assert_eq!(normals.len(), artifact.leaf_attrs.len());
+        for (n, a) in normals.iter().zip(artifact.leaf_attrs.iter()) {
+            assert_eq!(*n, a.normal_oct);
+        }
+
+        let bricks_bytes = read_rkp_bricks(&mut reader, &header).expect("bricks");
+        let bricks: &[u32] = bytemuck::cast_slice(&bricks_bytes);
+        let expected_brick_u32s = artifact.brick_cells.len() * crate::BRICK_CELLS as usize;
+        assert_eq!(bricks.len(), expected_brick_u32s);
+
+        let color_bytes = read_rkp_color(&mut reader, &header).expect("colors");
+        let colors: &[u32] = bytemuck::cast_slice(&color_bytes);
+        assert_eq!(colors.len(), artifact.leaf_attr_colors.len());
+        assert_eq!(colors[0], 0xFFAABBCC);
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]

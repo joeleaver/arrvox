@@ -1,31 +1,36 @@
 //! `GeneratorOwned` — marker component on entities spawned by a generator.
 //!
-//! The regen path despawns every entity whose parent-in-the-marker equals
-//! the generator entity that's about to re-run. This implements the
-//! blow-away semantics agreed in the design: generator children are
-//! disposable by default; opt-in persistence arrives via a slot-key
-//! variant (M5).
+//! Every emitted child carries a stable `slot_key` (assigned by the
+//! generator at emit time). Regen reuses existing children in place by
+//! matching `(parent_uuid, slot_key)`; children whose key disappears
+//! in a later generation are despawned. Slot keys also key the
+//! on-disk bake cache, which is what makes save/reload skip regen.
 //!
-//! Not serialized — generator children re-materialize from the generator
-//! function on scene load, so their parent pointer doesn't need to survive
-//! across sessions. Manually registered as an engine built-in so the
-//! inspector can enumerate it for debug purposes.
+//! Fully serialised so children + their bake caches survive a scene
+//! reload without forcing the generator to re-run. The runtime engine
+//! map looks up the parent entity by UUID at query time — there's no
+//! transient `parent: hecs::Entity` field (Entity ids don't survive
+//! process restart, and a stale `Entity::DANGLING` placeholder between
+//! load and a fixup pass invited bugs).
 
-#[derive(Debug, Clone)]
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneratorOwned {
-    /// The generator entity that emitted this child.
-    pub parent: hecs::Entity,
+    /// UUID of the generator entity that emitted this child. Map to
+    /// the runtime `hecs::Entity` via `EngineState::entity_uuids`.
+    pub parent_uuid: Uuid,
     /// The generator's `generation` counter at emit time. Bumped on
-    /// each persistent-child reuse so an outside observer can tell
-    /// when a child was last refreshed.
+    /// each reuse. Transient — recomputed from the generator's current
+    /// state on each regen.
+    #[serde(skip)]
     pub generation: u64,
-    /// Persistent slot key. `None` = anonymous child (blown away on
-    /// every regen). `Some(key)` = persistent child (reused across
-    /// regens by matching (parent, slot_key); only despawned when the
-    /// generator stops emitting that key, or the parent goes away).
-    /// Authored by the generator via
-    /// `ctx.emit_persistent_child(slot_key, ...)`.
-    pub slot_key: Option<String>,
+    /// Stable identity assigned by the generator at emit time. The
+    /// engine matches `(parent_uuid, slot_key)` to find an existing
+    /// child to reuse on regen; absent matches → spawn fresh.
+    /// Children whose key the generator stops emitting are despawned.
+    pub slot_key: String,
 }
 
 // ─── ComponentEntry for the built-in registry ──────────────────────────
@@ -49,9 +54,17 @@ pub(crate) fn generator_owned_entry() -> ComponentEntry {
                 .map(|_| ())
                 .map_err(|e| format!("{e}"))
         },
-        // Not serialized — generator children are re-emitted on load.
-        serialize: |_, _| None,
-        deserialize_insert: |_, _, _| Ok(()),
+        // Persisted now: parent_uuid + slot_key round-trip via serde.
+        // `generation` resets to 0 on load (transient), and the
+        // generator system rebumps it the next time it emits.
+        serialize: |world, entity| {
+            let c = world.get::<&GeneratorOwned>(entity).ok()?;
+            serde_json::to_string(&*c).ok()
+        },
+        deserialize_insert: |world, entity, json| {
+            let c: GeneratorOwned = serde_json::from_str(json).map_err(|e| format!("{e}"))?;
+            world.insert_one(entity, c).map_err(|e| format!("{e}"))
+        },
         on_add: None,
         on_remove: None,
     }

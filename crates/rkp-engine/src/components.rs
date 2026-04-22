@@ -183,8 +183,15 @@ pub struct ColliderCache {
     pub voxel_coords: Vec<glam::IVec3>,
     /// Coarse cell size for the collider grid.
     pub collider_cell_size: f32,
-    /// AABB half-extents (used for box/sphere/capsule).
+    /// AABB half-extents (used for box/sphere/capsule). Computed from the
+    /// **tight bounds of the actually occupied voxels**, not from the
+    /// padded sampling AABB on `SpatialData`.
     pub aabb_half: glam::Vec3,
+    /// Center of the tight occupied AABB in entity-local space. Box/sphere/
+    /// capsule wireframes and Rapier shapes are offset by this so they sit
+    /// on the geometry rather than on `transform.position` when the bake
+    /// isn't centered on the entity origin.
+    pub local_center: glam::Vec3,
     /// Grid origin offset in local space (aabb_center - extent/2).
     /// Used to convert voxel coords to world positions.
     pub grid_origin: glam::Vec3,
