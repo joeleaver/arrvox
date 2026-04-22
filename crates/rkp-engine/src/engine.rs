@@ -4607,6 +4607,14 @@ impl EngineState {
         let uuid = uuid::Uuid::new_v4();
         self.entity_uuids.insert(entity, uuid);
         self.uuid_to_entity.insert(uuid, entity);
+        // Assign a scene_id if one isn't already set. Used as the
+        // stable sort key by the gpu-object rebuild and the scene-tree
+        // snapshot so newly-spawned entities append at the bottom
+        // instead of reshuffling existing entities via archetype
+        // iteration order.
+        self.entity_scene_ids.entry(entity).or_insert_with(|| {
+            self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        });
         uuid
     }
 
@@ -5336,7 +5344,39 @@ impl EngineState {
             }
         }
 
-        for (entity, (transform, renderable)) in self.world.query::<(&Transform, &Renderable)>().iter() {
+        // Collect renderable entities and sort by `scene_id` before
+        // building `gpu_objects`. This keeps each entity's gpu vec
+        // position stable across rebuilds — hecs query iteration order
+        // follows archetype layout, so spawning a new child with a
+        // different component set can shift pre-existing entities'
+        // positions. Since `RkpGpuObject.object_id == gpu_idx` and the
+        // render-side `interpolate_gpu_objects` matches prev↔curr by
+        // `object_id`, any such shift would blend an entity's current
+        // world matrix against some UNRELATED entity's previous world
+        // matrix — a visible smear on pre-existing geometry every time
+        // a generator emits a child, snapping back once positions
+        // stabilize. Sort by monotonically-assigned scene_id: existing
+        // entities keep their order, new ones append.
+        let mut ordered: Vec<(hecs::Entity, u32)> = self.world
+            .query::<(&Transform, &Renderable)>()
+            .iter()
+            .filter_map(|(entity, (_, r))| {
+                if r.spatial.is_some() { Some(entity) } else { None }
+            })
+            .map(|entity| {
+                // Fall back to `u32::MAX` for entities without an
+                // assigned scene_id so they sort to the end
+                // deterministically rather than colliding at 0.
+                let sid = self.entity_scene_ids.get(&entity).copied().unwrap_or(u32::MAX);
+                (entity, sid)
+            })
+            .collect();
+        ordered.sort_by_key(|&(_, sid)| sid);
+
+        for (entity, _) in ordered {
+            let Ok(transform) = self.world.get::<&Transform>(entity) else { continue };
+            let Ok(renderable) = self.world.get::<&Renderable>(entity) else { continue };
+            let transform = (*transform).clone();
             if let Some(ref spatial) = renderable.spatial {
                 let world_matrix = glam::Mat4::from_scale_rotation_translation(
                     transform.scale,
@@ -7317,8 +7357,28 @@ impl EngineState {
 
         let objects = if self.scene_dirty {
             self.scene_dirty = false;
-            let mut objs = Vec::new();
-            for (entity, meta) in self.world.query::<&crate::components::EditorMetadata>().iter() {
+            // Collect + sort by `scene_id` so the editor's scene-tree
+            // panel gets a stable ordering: pre-existing entities keep
+            // their relative positions and newly-spawned entities
+            // (generator children, drops) append at the bottom. Same
+            // fix as `update_scene_gpu` — hecs query order follows
+            // archetype layout, not spawn order, so without this the
+            // tree shuffles every time a new archetype appears.
+            let mut ordered: Vec<(hecs::Entity, u32)> = self.world
+                .query::<&crate::components::EditorMetadata>()
+                .iter()
+                .map(|(entity, _)| {
+                    let sid = self.entity_scene_ids.get(&entity).copied().unwrap_or(u32::MAX);
+                    (entity, sid)
+                })
+                .collect();
+            ordered.sort_by_key(|&(_, sid)| sid);
+
+            let mut objs = Vec::with_capacity(ordered.len());
+            for (entity, _) in ordered {
+                let Ok(meta) = self.world.get::<&crate::components::EditorMetadata>(entity) else {
+                    continue;
+                };
                 let is_light = self.world.get::<&crate::components::PointLight>(entity).is_ok()
                     || self.world.get::<&crate::components::SpotLight>(entity).is_ok();
                 let is_camera = self.world.get::<&crate::components::Camera>(entity).is_ok();
