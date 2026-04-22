@@ -16,7 +16,9 @@ const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
 const OCTREE_LEAF_BIT: u32 = 0x80000000u;
 const OCTREE_BRICK_BIT: u32 = 0x40000000u;
 const OCTREE_PAYLOAD_MASK: u32 = 0x3FFFFFFFu;
-const MAX_OBJECTS: u32 = 32u;
+// Shadow rays scan every object every ray — AABB misses short-circuit
+// cheaply, and shadow rays go in arbitrary directions so the march
+// pass's screen-space per-tile lists don't apply.
 const BRICK_DIM: u32 = 4u;
 const BRICK_DIM_F: f32 = 4.0;
 const BRICK_CELLS: u32 = 64u;
@@ -128,11 +130,14 @@ struct OctreeResult {
 @group(1) @binding(2) var shadow_lo_res: texture_storage_2d<rgba8unorm, write>;
 
 // Group 2: march params + materials + stats + lights (shared with march).
+// Shadow trace doesn't need screen_aabbs or the tile-list buffers (shadow
+// rays go in arbitrary directions, not screen-aligned), but those
+// bindings still exist in the shared layout at 4/5 — declarations would
+// trip the 15 storage-buffer limit, so we just skip declaring them here.
 @group(2) @binding(0) var<uniform> march_params: MarchParams;
 @group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
 @group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 64>;
-@group(2) @binding(3) var<storage, read> screen_aabbs: array<vec4<f32>>;
-@group(2) @binding(4) var<storage, read> lights: array<GpuLight>;
+@group(2) @binding(3) var<storage, read> lights: array<GpuLight>;
 
 const PHASE_SHADOW: u32 = 2u;
 
@@ -346,7 +351,7 @@ fn trace_shadow_ray(
 ) -> f32 {
     var transmittance = 1.0;
 
-    for (var oi = 0u; oi < num_objects && oi < MAX_OBJECTS; oi++) {
+    for (var oi = 0u; oi < num_objects; oi++) {
         let obj = objects[oi];
         if obj.geom_type == 0u { continue; }
         // Same gate as primary visibility (Phase 2). SHADOW_ONLY semantics

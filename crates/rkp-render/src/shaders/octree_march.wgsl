@@ -24,7 +24,6 @@ const OPACITY_THRESHOLD: f32 = 0.05;
 // uploaded octree depth — `MAX_STEPS_PER_OBJ = 8 * bricks_per_axis`
 // would be exact. Requires adding a field to `RkpGpuObject`.
 const MAX_STEPS: u32 = 4096u;
-const MAX_OBJECTS: u32 = 32u;
 // Brick layout — must match rkp_core::brick_pool constants.
 const BRICK_DIM: u32 = 4u;
 const BRICK_DIM_F: f32 = 4.0;
@@ -101,12 +100,16 @@ struct MarchParams {
     // Proof-of-concept: brick boundaries fall back to baked; isolated
     // or fully-surrounded voxels fall back to baked too.
     surfacenet_enabled: u32,
+    // Per-tile list grid width in tiles (render_width / 8, rounded up).
+    // Shader looks up its tile's object-list slice as
+    // `tile_object_ids[tile_offsets[tile_idx]..tile_offsets[tile_idx+1]]`
+    // where `tile_idx = ty * tile_count_x + tx`.
+    tile_count_x: u32,
     // Pad to 32 bytes (uniform size must be a multiple of 16). Plain
     // u32s, not a vec3<u32> — vec3 would promote struct alignment to 16
     // and inflate the total to 48 bytes, breaking the binding-size
     // check against the 32-byte Rust struct.
     _pad0: u32,
-    _pad1: u32,
 }
 
 const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;
@@ -264,11 +267,18 @@ fn brick_id_of(node: u32) -> u32 {
 const PHASE_MARCH: u32 = 0u;
 const PHASE_NORMAL: u32 = 1u;
 const PHASE_SHADOW: u32 = 2u;
-@group(2) @binding(3) var<storage, read> screen_aabbs: array<vec4<f32>>;
-// Per-object screen-space AABB: (min_x, min_y, max_x, max_y) in pixels.
-@group(2) @binding(4) var<storage, read> lights: array<GpuLight>;
+@group(2) @binding(3) var<storage, read> lights: array<GpuLight>;
+// Per-tile object-list offsets (prefix sum). Length = num_tiles + 1.
+// Tile `t`'s object-id slice is `tile_object_ids[tile_offsets[t]..tile_offsets[t+1]]`.
+@group(2) @binding(4) var<storage, read> tile_offsets: array<u32>;
+// Flat list of object indices, grouped by tile. Unbounded object count
+// per scene — replaces the retired 32-object bitmask culling scheme.
+@group(2) @binding(5) var<storage, read> tile_object_ids: array<u32>;
 
-var<workgroup> tile_mask: u32;
+// Workgroup-shared tile range so thread 0 reads `tile_offsets[t]`
+// + `tile_offsets[t+1]` once and every thread in the tile reuses them.
+var<workgroup> tile_range_start: u32;
+var<workgroup> tile_range_end: u32;
 
 // --- Helpers ---
 
@@ -1138,22 +1148,17 @@ fn main(
     @builtin(global_invocation_id) pixel: vec3<u32>,
     @builtin(local_invocation_index) local_idx: u32,
 ) {
-    // Tile culling: thread 0 builds bitmask of objects overlapping this 8x8 tile.
-    let num_objects = march_params.object_count;
+    // Per-tile object list: thread 0 fetches this tile's slice bounds
+    // once; every thread in the 8x8 workgroup then iterates the same
+    // range. Culling already happened CPU-side — the list only contains
+    // objects whose screen AABB overlaps this tile, so no per-object
+    // AABB re-check needed here.
     if local_idx == 0u {
-        let tx = f32(pixel.x - (pixel.x % 8u));
-        let ty = f32(pixel.y - (pixel.y % 8u));
-        var mask = 0u;
-        for (var i = 0u; i < num_objects && i < MAX_OBJECTS; i++) {
-            // Filter by render-layer + focus before paying for tile overlap.
-            // Default uniforms (u32::MAX) make this a no-op.
-            if !rkp_object_visible(objects[i]) { continue; }
-            let sa = screen_aabbs[i];
-            if sa.x < (tx + 8.0) && sa.z > tx && sa.y < (ty + 8.0) && sa.w > ty {
-                mask |= (1u << i);
-            }
-        }
-        tile_mask = mask;
+        let tx = pixel.x / 8u;
+        let ty = pixel.y / 8u;
+        let tile_idx = ty * march_params.tile_count_x + tx;
+        tile_range_start = tile_offsets[tile_idx];
+        tile_range_end = tile_offsets[tile_idx + 1u];
     }
     workgroupBarrier();
 
@@ -1161,7 +1166,7 @@ fn main(
     if pixel.x >= dims.x || pixel.y >= dims.y { return; }
 
     // No objects overlap this tile — write background and skip.
-    if tile_mask == 0u {
+    if tile_range_start == tile_range_end {
         let coord = vec2<i32>(pixel.xy);
         textureStore(gbuf_position, coord, vec4<f32>(0.0, 0.0, 0.0, 1e10));
         textureStore(gbuf_normal, coord, vec4<f32>(0.0, 0.0, 0.0, 0.0));
@@ -1192,11 +1197,14 @@ fn main(
     var closest_obj_idx = 0xFFFFFFFFu; // index of closest hit object (for shadow skip)
     var total_steps = 0u;
 
-    for (var i = 0u; i < num_objects && i < MAX_OBJECTS; i++) {
-        if i < 32u && (tile_mask & (1u << i)) == 0u { continue; }
-
+    for (var k = tile_range_start; k < tile_range_end; k++) {
+        let i = tile_object_ids[k];
         let obj = objects[i];
         if obj.geom_type == 0u { continue; }
+        // Layer + focus gate — retained here since the CPU tile-list
+        // builder runs before layer state is known to it. Default
+        // uniforms (u32::MAX) make this a cheap no-op.
+        if !rkp_object_visible(obj) { continue; }
 
         // AABB check: compute world-space entry distance, skip if behind closest hit.
         let inv_world = obj.inverse_world;

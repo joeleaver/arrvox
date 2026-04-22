@@ -1260,6 +1260,16 @@ impl EngineState {
                 vp_h as f32,
             );
             let screen_aabbs_bytes: Vec<u8> = bytemuck::cast_slice(&screen_aabbs).to_vec();
+            // Per-tile object lists — replaces the 32-object bitmask so
+            // the march shader handles arbitrary scene object counts.
+            let tile_lists = crate::scene_sync::build_tile_lists(
+                &screen_aabbs, vp_w, vp_h,
+            );
+            let tile_offsets_bytes: Vec<u8> =
+                bytemuck::cast_slice(&tile_lists.offsets).to_vec();
+            let tile_object_ids_bytes: Vec<u8> =
+                bytemuck::cast_slice(&tile_lists.object_ids).to_vec();
+            let tile_count_x = tile_lists.tile_count_x;
 
             // Per-VR vol/cloud/atmo/god-ray params — derived from
             // environment + this VR's camera. Render writes them into
@@ -1522,6 +1532,9 @@ impl EngineState {
                 preview_mode: vp_preview_mode,
                 camera: cam_uniforms,
                 screen_aabbs_bytes,
+                tile_offsets_bytes,
+                tile_object_ids_bytes,
+                tile_count_x,
                 vp_matrix,
                 vol_params,
                 cloud_params,
@@ -5435,6 +5448,7 @@ impl EngineState {
         // scene's bone_field_buffer before the scatter dispatch.
         self.skin_bone_field_bytes = (running_bone_field_cells as u64).saturating_mul(8);
         self.skin_bone_field_occ_bytes = (running_bone_field_occ_u32s as u64).saturating_mul(4);
+
 
         // Pause-aware scatter skip: if the set of skinned entities and
         // their per-bone matrices are byte-identical to last frame,

@@ -45,18 +45,19 @@ impl RenderContext {
                     max_bind_groups: 8,
                     max_storage_buffer_binding_size: 1 << 30, // 1 GB
                     max_buffer_size: 1 << 31, // 2 GB
-                    // 15 rather than the wgpu default 8 — the voxel
-                    // march pass hits 12 storage buffers in a single
-                    // stage (brick_pool, octree_nodes, objects,
-                    // color_pool, bone_matrices, bone_weights,
-                    // brick_face_links, leaf_attr_pool in group 0;
-                    // materials, stats, screen_aabbs, lights in
-                    // group 2), plus Phase-3's bone_field, Phase-3c's
-                    // bone_field_occupancy, and Phase-4's
-                    // bone_dual_quats (DQS precomputed palette).
-                    // Desktop Vulkan/Metal/DX12 support 24+; raise
-                    // only matters for GLES 3.x / some mobile.
-                    max_storage_buffers_per_shader_stage: 15,
+                    // 20 rather than the wgpu default 8 — group 0's
+                    // scene bindings are 11 storage buffers (brick_pool,
+                    // octree_nodes, objects, color_pool, bone_matrices,
+                    // bone_weights, brick_face_links, leaf_attr_pool,
+                    // bone_field, bone_field_occ, bone_dual_quats).
+                    // March group 2 adds 5 (materials, stats, lights,
+                    // tile_offsets, tile_object_ids) for 16 total.
+                    // wgpu counts unused-by-shader layout entries too,
+                    // so splitting per-shader layouts is the only way
+                    // below the limit — not worth it. Desktop GPUs
+                    // support 24+; GLES 3.x / some mobile top out at
+                    // 16 but aren't supported targets.
+                    max_storage_buffers_per_shader_stage: 20,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -113,18 +114,19 @@ impl RenderContext {
                     max_bind_groups: 8,
                     max_storage_buffer_binding_size: 1 << 30, // 1 GB
                     max_buffer_size: 1 << 31, // 2 GB
-                    // 15 rather than the wgpu default 8 — the voxel
-                    // march pass hits 12 storage buffers in a single
-                    // stage (brick_pool, octree_nodes, objects,
-                    // color_pool, bone_matrices, bone_weights,
-                    // brick_face_links, leaf_attr_pool in group 0;
-                    // materials, stats, screen_aabbs, lights in
-                    // group 2), plus Phase-3's bone_field, Phase-3c's
-                    // bone_field_occupancy, and Phase-4's
-                    // bone_dual_quats (DQS precomputed palette).
-                    // Desktop Vulkan/Metal/DX12 support 24+; raise
-                    // only matters for GLES 3.x / some mobile.
-                    max_storage_buffers_per_shader_stage: 15,
+                    // 20 rather than the wgpu default 8 — group 0's
+                    // scene bindings are 11 storage buffers (brick_pool,
+                    // octree_nodes, objects, color_pool, bone_matrices,
+                    // bone_weights, brick_face_links, leaf_attr_pool,
+                    // bone_field, bone_field_occ, bone_dual_quats).
+                    // March group 2 adds 5 (materials, stats, lights,
+                    // tile_offsets, tile_object_ids) for 16 total.
+                    // wgpu counts unused-by-shader layout entries too,
+                    // so splitting per-shader layouts is the only way
+                    // below the limit — not worth it. Desktop GPUs
+                    // support 24+; GLES 3.x / some mobile top out at
+                    // 16 but aren't supported targets.
+                    max_storage_buffers_per_shader_stage: 20,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,

@@ -32,7 +32,10 @@ pub struct MarchParams {
     /// use the baked octahedral normal from `LeafAttr`. A/B toggle for
     /// the POC.
     pub surfacenet_enabled: u32,
-    pub _pad: [u32; 2],
+    /// Per-tile list grid width in tiles (render_width / 8, rounded up).
+    /// Shader uses this to compute `tile_idx` from a pixel coordinate.
+    pub tile_count_x: u32,
+    pub _pad: u32,
 }
 
 /// The octree ray march compute pass.
@@ -46,17 +49,15 @@ pub struct OctreeMarchPass {
     /// Stats buffer for profiling (44 atomic u32s — see shader comment at stats binding).
     stats_buffer: wgpu::Buffer,
     stats_readback: wgpu::Buffer,
-    /// Screen-space AABB buffer for tile culling. Grown on upload to
-    /// fit the scene's current GpuObject count.
-    screen_aabbs_buffer: wgpu::Buffer,
-    /// Tracked capacity for `screen_aabbs_buffer` (bytes). Avoids
-    /// querying `buffer.size()` so a stale validation handle can't
-    /// trip a false-overrun error.
-    screen_aabbs_capacity: u64,
-    /// Cached params bind group needs to be invalidated when
-    /// `screen_aabbs_buffer` is recreated since it holds a ref to the
-    /// old handle.
-    screen_aabbs_dirty: bool,
+    /// Per-tile object-list offsets (prefix sum, u32). One entry per
+    /// tile plus a trailing sentinel, so `tile_offsets[t+1]` is always
+    /// a valid read bound for tile `t`'s list.
+    tile_offsets_buffer: wgpu::Buffer,
+    tile_offsets_capacity: u64,
+    /// Flat list of object indices, grouped by tile. Length = sum of
+    /// all per-tile counts, i.e. `tile_offsets[num_tiles]`.
+    tile_object_ids_buffer: wgpu::Buffer,
+    tile_object_ids_capacity: u64,
     /// Lights buffer (shared with shade pass).
     lights_buffer: Option<wgpu::Buffer>,
     /// Materials buffer reference for bind group rebuild.
@@ -118,6 +119,7 @@ impl OctreeMarchPass {
                         },
                         count: None,
                     },
+                    // Binding 3: lights.
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -128,8 +130,20 @@ impl OctreeMarchPass {
                         },
                         count: None,
                     },
+                    // Binding 4: per-tile object-list offsets (prefix sum).
                     wgpu::BindGroupLayoutEntry {
                         binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Binding 5: per-tile object-ids flat list.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -194,16 +208,23 @@ impl OctreeMarchPass {
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             }),
-            screen_aabbs_buffer: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("march screen_aabbs"),
-                // Initial capacity for 32 objects × vec4<f32>. Grown
-                // by `upload_screen_aabbs` when the scene exceeds it.
-                size: 16 * 32,
+            // Tile-list buffers — sized for 1 tile at start (2 u32s =
+            // 8 B; sentinel offset + a trivially empty object list).
+            // Both grow on `upload_tile_lists` when needed.
+            tile_offsets_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("march tile_offsets"),
+                size: 256,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
-            screen_aabbs_capacity: 16 * 32,
-            screen_aabbs_dirty: false,
+            tile_offsets_capacity: 256,
+            tile_object_ids_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("march tile_object_ids"),
+                size: 256,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            tile_object_ids_capacity: 256,
             lights_buffer: None,
             materials_buffer: None,
         }
@@ -242,43 +263,75 @@ impl OctreeMarchPass {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: self.screen_aabbs_buffer.as_entire_binding(),
+                    resource: lights_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: lights_buffer.as_entire_binding(),
+                    resource: self.tile_offsets_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.tile_object_ids_buffer.as_entire_binding(),
                 },
             ],
         }));
     }
 
-    /// Upload screen-space AABBs for tile culling. Call each frame
-    /// before dispatch. Grows the buffer if `data` exceeds the current
-    /// capacity (each new GpuObject = +16 bytes), and rebuilds the
-    /// params bind group so it points at the new handle.
-    pub fn upload_screen_aabbs(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[u8]) {
-        let needed = data.len() as u64;
-        if needed > self.screen_aabbs_capacity {
-            let mut new_cap = self.screen_aabbs_capacity.max(16 * 32);
-            while new_cap < needed {
+    /// Upload per-tile object lists. Call each frame before dispatch.
+    /// Grows both buffers if needed; a reallocation invalidates the
+    /// cached params bind group so we rebuild it before the next use.
+    pub fn upload_tile_lists(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        offsets: &[u8],
+        object_ids: &[u8],
+    ) {
+        let mut dirty = false;
+        if (offsets.len() as u64) > self.tile_offsets_capacity {
+            let mut new_cap = self.tile_offsets_capacity.max(256);
+            while new_cap < offsets.len() as u64 {
                 new_cap = new_cap.saturating_mul(2);
             }
-            self.screen_aabbs_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("march screen_aabbs"),
+            self.tile_offsets_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("march tile_offsets"),
                 size: new_cap,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.screen_aabbs_capacity = new_cap;
-            self.screen_aabbs_dirty = true;
-            // Cached bind group references the OLD buffer — invalidate
-            // so the next `try_rebuild_params_bind_group` call (via
-            // set_materials / set_lights at frame start, or our own
-            // explicit rebuild below) picks up the new handle.
+            self.tile_offsets_capacity = new_cap;
+            dirty = true;
+        }
+        // `object_ids` can legitimately be empty (no objects visible);
+        // wgpu requires a non-zero buffer size, so we always keep the
+        // tracked capacity at ≥256 B. Skip the write on an empty input —
+        // shaders only read from it via `tile_offsets[t]..[t+1]`, which
+        // will be (0..0) and short-circuit the loop.
+        let obj_needed = object_ids.len().max(4) as u64;
+        if obj_needed > self.tile_object_ids_capacity {
+            let mut new_cap = self.tile_object_ids_capacity.max(256);
+            while new_cap < obj_needed {
+                new_cap = new_cap.saturating_mul(2);
+            }
+            self.tile_object_ids_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("march tile_object_ids"),
+                size: new_cap,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.tile_object_ids_capacity = new_cap;
+            dirty = true;
+        }
+        if dirty {
             self.params_bind_group = None;
             self.try_rebuild_params_bind_group(device);
         }
-        queue.write_buffer(&self.screen_aabbs_buffer, 0, data);
+        if !offsets.is_empty() {
+            queue.write_buffer(&self.tile_offsets_buffer, 0, offsets);
+        }
+        if !object_ids.is_empty() {
+            queue.write_buffer(&self.tile_object_ids_buffer, 0, object_ids);
+        }
     }
 
     /// Expose the params bind group layout so the shadow_trace pass can
@@ -348,6 +401,7 @@ impl OctreeMarchPass {
         num_lights: u32,
         lod_enabled: bool,
         surfacenet_enabled: bool,
+        tile_count_x: u32,
         timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) {
         // Update params.
@@ -358,7 +412,8 @@ impl OctreeMarchPass {
             num_lights,
             lod_enabled: if lod_enabled { 1 } else { 0 },
             surfacenet_enabled: if surfacenet_enabled { 1 } else { 0 },
-            _pad: [0; 2],
+            tile_count_x,
+            _pad: 0,
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
 

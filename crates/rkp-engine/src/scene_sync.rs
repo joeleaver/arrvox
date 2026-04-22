@@ -15,6 +15,101 @@ pub struct ScreenAabb {
     pub max_y: f32,
 }
 
+/// Shader workgroup / tile size — must match `@workgroup_size(8, 8, 1)` in
+/// `octree_march.wgsl`. Changing this here also requires a shader edit.
+pub const MARCH_TILE_SIZE: u32 = 8;
+
+/// Per-tile object lists. Replaces the 32-bit bitmask scheme so the
+/// number of objects a tile can cover is unbounded — a tile's list is
+/// `object_ids[offsets[t]..offsets[t+1]]`.
+pub struct TileLists {
+    /// Prefix-sum of per-tile object counts. Length = `num_tiles + 1`.
+    pub offsets: Vec<u32>,
+    /// Flat array of object indices into the scene's `gpu_objects`,
+    /// grouped by tile.
+    pub object_ids: Vec<u32>,
+    /// Tile grid width (in tiles, not pixels). Shaders need this to
+    /// compute `tile_idx = ty * tile_count_x + tx` from a pixel coord.
+    pub tile_count_x: u32,
+    pub tile_count_y: u32,
+}
+
+/// Build per-tile object lists from the pre-computed screen AABBs.
+/// Two passes over the tile grid: count, then fill. O(sum of tiles
+/// each object overlaps) — a few ms for thousands of objects at 1080p.
+pub fn build_tile_lists(
+    screen_aabbs: &[ScreenAabb],
+    width: u32,
+    height: u32,
+) -> TileLists {
+    let tile_size = MARCH_TILE_SIZE;
+    let tile_count_x = (width + tile_size - 1) / tile_size;
+    let tile_count_y = (height + tile_size - 1) / tile_size;
+    let num_tiles = (tile_count_x * tile_count_y) as usize;
+
+    // Per-object tile range, clamped to the grid. Zero-sized AABBs
+    // (culled / off-screen objects) are skipped via tx_max < tx_min.
+    let object_range = |sa: &ScreenAabb| -> Option<(u32, u32, u32, u32)> {
+        if sa.max_x <= sa.min_x || sa.max_y <= sa.min_y {
+            return None;
+        }
+        let tx_min = ((sa.min_x / tile_size as f32).floor() as i32).max(0) as u32;
+        let ty_min = ((sa.min_y / tile_size as f32).floor() as i32).max(0) as u32;
+        // `(px - 1) / 8` clamps the last pixel into its tile rather than
+        // the next one, so an AABB ending exactly at a tile boundary
+        // doesn't spuriously claim the neighbor.
+        let tx_max_clip = (sa.max_x - 1.0).max(0.0) as u32 / tile_size;
+        let ty_max_clip = (sa.max_y - 1.0).max(0.0) as u32 / tile_size;
+        let tx_max = tx_max_clip.min(tile_count_x.saturating_sub(1));
+        let ty_max = ty_max_clip.min(tile_count_y.saturating_sub(1));
+        if tx_min > tx_max || ty_min > ty_max {
+            return None;
+        }
+        Some((tx_min, ty_min, tx_max, ty_max))
+    };
+
+    // Pass 1 — count objects per tile.
+    let mut counts = vec![0u32; num_tiles];
+    for sa in screen_aabbs {
+        if let Some((tx_min, ty_min, tx_max, ty_max)) = object_range(sa) {
+            for ty in ty_min..=ty_max {
+                let row = ty * tile_count_x;
+                for tx in tx_min..=tx_max {
+                    counts[(row + tx) as usize] += 1;
+                }
+            }
+        }
+    }
+
+    // Prefix sum — offsets[t] is where tile t's list starts.
+    let mut offsets = vec![0u32; num_tiles + 1];
+    let mut running = 0u32;
+    for i in 0..num_tiles {
+        offsets[i] = running;
+        running += counts[i];
+    }
+    offsets[num_tiles] = running;
+
+    // Pass 2 — fill object_ids. `cursors` tracks per-tile write position.
+    let mut object_ids = vec![0u32; running as usize];
+    let mut cursors = vec![0u32; num_tiles];
+    for (obj_idx, sa) in screen_aabbs.iter().enumerate() {
+        if let Some((tx_min, ty_min, tx_max, ty_max)) = object_range(sa) {
+            for ty in ty_min..=ty_max {
+                let row = ty * tile_count_x;
+                for tx in tx_min..=tx_max {
+                    let t = (row + tx) as usize;
+                    let slot = (offsets[t] + cursors[t]) as usize;
+                    object_ids[slot] = obj_idx as u32;
+                    cursors[t] += 1;
+                }
+            }
+        }
+    }
+
+    TileLists { offsets, object_ids, tile_count_x, tile_count_y }
+}
+
 /// Compute screen-space AABBs for all GPU objects.
 /// Projects each object's local AABB (transformed by world matrix) to pixel coordinates.
 pub fn compute_screen_aabbs(

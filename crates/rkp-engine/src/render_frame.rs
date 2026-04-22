@@ -156,6 +156,18 @@ pub struct RenderViewport {
     /// list it ships above so indices line up.
     pub screen_aabbs_bytes: Vec<u8>,
 
+    /// Per-tile object lists for the march pass. `tile_offsets` is a
+    /// prefix-sum (length `num_tiles + 1`) and `tile_object_ids` is a
+    /// flat u32 array grouped by tile. Replaces the retired 32-object
+    /// bitmask so scenes with arbitrary object counts render correctly.
+    /// Built on the sim thread from `screen_aabbs_bytes`.
+    pub tile_offsets_bytes: Vec<u8>,
+    pub tile_object_ids_bytes: Vec<u8>,
+    /// Tile grid width (matches the viewport's render width divided by
+    /// the shader's workgroup tile size, rounded up). Shader computes
+    /// `tile_idx = ty * tile_count_x + tx`.
+    pub tile_count_x: u32,
+
     /// `view * proj` glam matrix used for wireframe overlays. Same
     /// data as `camera.view_proj` but kept as `Mat4` for convenience.
     pub vp_matrix: Mat4,

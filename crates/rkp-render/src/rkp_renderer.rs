@@ -194,7 +194,9 @@ impl RkpRenderer {
         num_lights: u32,
         lod_enabled: bool,
         surfacenet_enabled: bool,
-        screen_aabbs: &[u8],
+        tile_offsets: &[u8],
+        tile_object_ids: &[u8],
+        tile_count_x: u32,
         atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
         mode: crate::RenderMode,
         preview_mode: crate::BuildPreviewMode,
@@ -202,8 +204,12 @@ impl RkpRenderer {
         let in_situ = matches!(mode, crate::RenderMode::InSitu);
         let raymarch = matches!(preview_mode, crate::BuildPreviewMode::Raymarch);
 
-        // Upload per-viewport tile-cull screen-space AABBs into the VR's march.
-        viewport.march.upload_screen_aabbs(&self.device, queue, screen_aabbs);
+        // Upload per-viewport tile-cull data. The per-object screen
+        // AABBs feed the CPU-side tile-list builder; only the built
+        // lists cross to the GPU now.
+        viewport.march.upload_tile_lists(
+            &self.device, queue, tile_offsets, tile_object_ids,
+        );
 
         // 0. Atmosphere LUTs (in-situ only — isolation uses a flat sky).
         if in_situ {
@@ -233,7 +239,8 @@ impl RkpRenderer {
             viewport.march.dispatch(
                 encoder, queue, &viewport.scene_bind_group,
                 object_count, viewport.width, viewport.height, 0,
-                shadow_steps, num_lights, lod_enabled, surfacenet_enabled, None,
+                shadow_steps, num_lights, lod_enabled, surfacenet_enabled,
+                tile_count_x, None,
             );
             self.profiler.end_query(encoder, q);
         }
