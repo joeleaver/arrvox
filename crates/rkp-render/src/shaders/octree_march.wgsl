@@ -237,6 +237,11 @@ fn brick_id_of(node: u32) -> u32 {
 @group(1) @binding(0) var gbuf_position: texture_storage_2d<rgba32float, write>;
 @group(1) @binding(1) var gbuf_normal: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(2) var gbuf_material: texture_storage_2d<rg32uint, write>;
+// Dedicated 32-bit pick channel — stores `gpu_idx` of the hit entity
+// (`0xFFFFFFFFu` for sky / miss). Replaces the old 8-bit object_id
+// slot in `gbuf_material`'s G channel, which capped pickable scenes at
+// 255 entries.
+@group(1) @binding(3) var gbuf_pick: texture_storage_2d<r32uint, write>;
 
 @group(2) @binding(0) var<uniform> march_params: MarchParams;
 @group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
@@ -1171,6 +1176,7 @@ fn main(
         textureStore(gbuf_position, coord, vec4<f32>(0.0, 0.0, 0.0, 1e10));
         textureStore(gbuf_normal, coord, vec4<f32>(0.0, 0.0, 0.0, 0.0));
         textureStore(gbuf_material, coord, vec4<u32>(0u, 0u, 0u, 0u));
+        textureStore(gbuf_pick, coord, vec4<u32>(0xFFFFFFFFu, 0u, 0u, 0u));
         return;
     }
 
@@ -1320,6 +1326,7 @@ fn main(
         textureStore(gbuf_position, coord, vec4<f32>(0.0, 0.0, 0.0, 1e10));
         textureStore(gbuf_normal, coord, vec4<f32>(0.0, 0.0, 0.0, 0.0));
         textureStore(gbuf_material, coord, vec4<u32>(0u, 0u, 0u, 0u));
+        textureStore(gbuf_pick, coord, vec4<u32>(0xFFFFFFFFu, 0u, 0u, 0u));
         return;
     }
 
@@ -1343,12 +1350,15 @@ fn main(
     // at ~5.9 %, which is what showed up as "still looks hard" on
     // MAIN even after the shade-pass fix.
     let first_blend_8 = (first_blend & 0x0Fu) << 4u | (first_blend & 0x0Fu);
+    // Bits 8-15 are free after the 8-bit object_id was retired in favor
+    // of the dedicated `gbuf_pick` channel below; left as 0 for any
+    // future packing that can use 8 bits.
     let packed_g = (first_blend_8 & 0xFFu)
-                 | (((first_obj_id + 1u) & 0xFFu) << 8u)
                  | (color_rgb565 << 16u);
 
     atomicAdd(&stats[2], 1u);
     textureStore(gbuf_position, coord, vec4<f32>(final_pos, first_dist));
     textureStore(gbuf_normal, coord, vec4<f32>(final_normal_n, accum_alpha));
     textureStore(gbuf_material, coord, vec4<u32>(packed_r, packed_g, 0u, 0u));
+    textureStore(gbuf_pick, coord, vec4<u32>(first_obj_id, 0u, 0u, 0u));
 }

@@ -91,7 +91,6 @@ pub struct BakeRequest {
     /// For generator-child bakes: unused — `generator_child.generation`
     /// is the authoritative counter.
     pub generation: u64,
-    pub scene_id: u32,
     pub input: BakeInput,
     pub aabb: rkp_core::Aabb,
     pub voxel_size: f32,
@@ -117,7 +116,6 @@ pub struct BakeRequest {
 pub struct BakeResult {
     pub entity: hecs::Entity,
     pub generation: u64,
-    pub scene_id: u32,
     pub aabb: rkp_core::Aabb,
     pub voxel_size: f32,
     pub root_scale: glam::Vec3,
@@ -208,7 +206,6 @@ impl BakeWorker {
         device: wgpu::Device,
         queue: wgpu::Queue,
         scene_mgr: Arc<Mutex<RkpSceneManager>>,
-        next_scene_id: Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
         let (tx_request, rx_request) = crossbeam::channel::unbounded::<BakeRequest>();
         let (tx_result, rx_result) = crossbeam::channel::unbounded::<BakeResult>();
@@ -245,7 +242,6 @@ impl BakeWorker {
                                 &queue,
                                 &mut evaluator,
                                 &scene_mgr,
-                                &next_scene_id,
                                 &tx_request_for_ctx,
                                 &tx_gen_event,
                             );
@@ -364,7 +360,7 @@ fn run_bake(
                 );
             }
             let result = sm.integrate_artifact(
-                a, &req.aabb, req.voxel_size, req.scene_id,
+                a, &req.aabb, req.voxel_size,
             );
             drop(sm);
             let t_total = t_start.elapsed();
@@ -372,10 +368,10 @@ fn run_bake(
                 Some(result) => {
                     let spatial = spatial_from_voxelize_result(&result);
                     eprintln!(
-                        "[bake_worker] gen={} scene_id={} voxels={} \
+                        "[bake_worker] gen={} entity={:?} voxels={} \
                          voxelize={:.1}ms lock_wait={:.2}ms \
                          integrate+dealloc={:.1}ms total={:.1}ms",
-                        req.generation, req.scene_id, voxel_count,
+                        req.generation, req.entity, voxel_count,
                         t_after_voxelize.as_secs_f32() * 1000.0,
                         t_lock_acquired.as_secs_f32() * 1000.0,
                         (t_total - t_after_voxelize).as_secs_f32() * 1000.0,
@@ -388,9 +384,9 @@ fn run_bake(
         }
         None => {
             eprintln!(
-                "[bake_worker] gen={} scene_id={} voxelize FAILED wall={:.1}ms",
+                "[bake_worker] gen={} entity={:?} voxelize FAILED wall={:.1}ms",
                 req.generation,
-                req.scene_id,
+                req.entity,
                 t_after_voxelize.as_secs_f32() * 1000.0,
             );
             BakeOutcome::Failed
@@ -400,7 +396,6 @@ fn run_bake(
     BakeResult {
         entity: req.entity,
         generation: req.generation,
-        scene_id: req.scene_id,
         aabb: req.aabb,
         voxel_size: req.voxel_size,
         root_scale: req.root_scale,
@@ -419,7 +414,6 @@ fn run_generator(
     queue: &wgpu::Queue,
     evaluator: &mut GpuEvaluator,
     scene_mgr: &Arc<Mutex<RkpSceneManager>>,
-    next_scene_id: &Arc<std::sync::atomic::AtomicU32>,
     tx_request: &Sender<BakeRequest>,
     tx_gen_event: &Sender<GeneratorWorkerEvent>,
 ) {
@@ -440,7 +434,6 @@ fn run_generator(
         queue,
         evaluator,
         scene_mgr,
-        next_scene_id,
         tx_request.clone(),
     );
 

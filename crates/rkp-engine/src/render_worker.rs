@@ -77,7 +77,7 @@ use rkp_render::{
 };
 
 use crate::render_frame::{
-    PendingPick, PickKind, PickResult, RenderCommand, RenderFrame, RenderInit, RenderResult,
+    PendingPick, PickResult, RenderCommand, RenderFrame, RenderInit, RenderResult,
 };
 use crate::viewport::ViewportId;
 
@@ -395,31 +395,27 @@ impl RenderState {
         let slice = self.pick_readback_buffer.slice(..);
         let (raw_payload, position) = {
             let data = slice.get_mapped_range();
-            // Material gbuffer (Rg32Uint) at offset 0..8:
-            //   R = primary_id_lo16 | secondary_id_lo16
-            //   G = blend(8) | (object_id+1)(8) | color_rgb565(16)
-            // Pick gbuffer (R32Uint) at offset 256..260:
-            //   primitive_node_id (low16 for proc hits, 0xFFFF for misses)
-            // Position gbuffer (Rgba32Float) at offset 512..528:
-            //   xyz = world position, w = hit distance (1e10 on miss)
+            // Buffer layout (all three textures copied per pick):
+            //   0..8    gbuf_material (Rg32Uint):
+            //             R = primary_id_lo16 | secondary_id_lo16
+            //             G = blend(8) | reserved(8) | color_rgb565(16)
+            //   256..260 gbuf_pick (R32Uint):
+            //             MAIN voxel march: `gpu_idx` of the hit entity,
+            //               or 0xFFFFFFFF on sky miss.
+            //             BUILD proc raymarch: primitive NodeId (low 16),
+            //               or 0xFFFF on miss.
+            //   512..528 gbuf_position (Rgba32Float):
+            //             xyz = world position, w = hit distance
+            //             (1e10 on miss).
             let mut payload = [0u32; 2];
             if data.len() >= 528 {
-                match pp.kind {
-                    PickKind::Material => {
-                        let r = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                        let g = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-                        payload = [r, g];
-                    }
-                    PickKind::ProceduralNode => {
-                        // Pack the pick channel as raw_payload[0]; sim
-                        // also needs the material G channel for the
-                        // object-presence bit (so we know the pick hit
-                        // a real surface, not the sky).
-                        let pick = u32::from_le_bytes([data[256], data[257], data[258], data[259]]);
-                        let g = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-                        payload = [pick, g];
-                    }
-                }
+                // Both pick kinds read the same 32-bit slot — the shader
+                // picked the right meaning. Byte 4..8 (material G) is
+                // still copied for potential future material-info-on-
+                // pick needs, but no longer carries the object id.
+                let pick = u32::from_le_bytes([data[256], data[257], data[258], data[259]]);
+                let material_g = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                payload = [pick, material_g];
             }
             let position = if data.len() >= 528 {
                 let px = f32::from_le_bytes([data[512], data[513], data[514], data[515]]);

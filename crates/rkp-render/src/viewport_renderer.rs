@@ -131,7 +131,7 @@ impl ViewportRenderer {
         let mut march = OctreeMarchPass::new(device, &renderer.scene.bind_group_layout);
         march.set_materials(device, &renderer.materials_buffer);
         march.set_lights(device, &renderer.lights_buffer);
-        march.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view);
+        march.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view);
 
         // Procedural CSG raymarch — alternative primary-visibility pass
         // for the build viewport. Wired to the same per-VR camera + gbuffer
@@ -277,7 +277,7 @@ impl ViewportRenderer {
         self.pick_view = pick_view;
 
         // Per-VR passes — resize internal textures + re-wire gbuffer bindings.
-        self.march.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view);
+        self.march.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view);
         self.proc_raymarch.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view);
         self.proc_outline.set_gbuffer(device, &self.pick_view);
 

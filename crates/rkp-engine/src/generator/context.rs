@@ -93,10 +93,9 @@ pub struct GeneratorContext<'w> {
     /// session) → caches not written → save+reload triggers regen.
     child_cache_dir: Option<std::path::PathBuf>,
     param_hash: u64,
-    next_scene_id: Option<&'w Arc<AtomicU32>>,
     tx_request: Option<Sender<BakeRequest>>,
-    /// Running counter per run used for `name_hint` defaults and for
-    /// the synthetic scene_id allocated to each emitted child bake.
+    /// Running counter per run, used only for the default `name_hint`
+    /// when a generator doesn't supply its own.
     emission_counter: u32,
     // Reserved for future in-worker use (not exposed to generators).
     #[allow(dead_code)]
@@ -129,7 +128,6 @@ impl<'w> GeneratorContext<'w> {
             generator_entity_uuid: None,
             child_cache_dir: None,
             param_hash: 0,
-            next_scene_id: None,
             tx_request: None,
             emission_counter: 0,
             device: None,
@@ -157,7 +155,6 @@ impl<'w> GeneratorContext<'w> {
         queue: &'w wgpu::Queue,
         evaluator: &'w mut GpuEvaluator,
         scene_mgr: &'w Arc<Mutex<RkpSceneManager>>,
-        next_scene_id: &'w Arc<AtomicU32>,
         tx_request: Sender<BakeRequest>,
     ) -> Self {
         Self {
@@ -170,7 +167,6 @@ impl<'w> GeneratorContext<'w> {
             generator_entity_uuid,
             child_cache_dir,
             param_hash,
-            next_scene_id: Some(next_scene_id),
             tx_request: Some(tx_request),
             emission_counter: 0,
             device: Some(device),
@@ -291,14 +287,10 @@ impl<'w> GeneratorContext<'w> {
         let tx_request = self.tx_request.as_ref().ok_or_else(|| {
             GeneratorError::Failed("emit_child called without worker context".into())
         })?;
-        let next_scene_id = self.next_scene_id.ok_or_else(|| {
-            GeneratorError::Failed("missing scene_id allocator".into())
-        })?;
         let generator_entity = self.generator_entity.ok_or_else(|| {
             GeneratorError::Failed("missing generator entity".into())
         })?;
 
-        let scene_id = next_scene_id.fetch_add(1, Ordering::Relaxed);
         self.emission_counter = self.emission_counter.wrapping_add(1);
 
         // Deterministic on-disk bake-cache path keyed by
@@ -325,7 +317,6 @@ impl<'w> GeneratorContext<'w> {
         let req = BakeRequest {
             entity: generator_entity,
             generation: self.generation,
-            scene_id,
             input,
             aabb,
             voxel_size,

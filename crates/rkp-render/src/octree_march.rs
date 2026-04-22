@@ -73,7 +73,10 @@ impl OctreeMarchPass {
         scene_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> Self {
         // Group 1: G-buffer storage textures (write-only). Shadow output
-        // moved to the rkp_shadow_trace pass (half-res).
+        // moved to the rkp_shadow_trace pass (half-res). Binding 3 is
+        // the dedicated 32-bit pick channel — replaces the old 8-bit
+        // object_id packed into the material G channel (which capped
+        // the scene at 255 pickable entries).
         let gbuffer_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("march gbuffer layout"),
@@ -81,6 +84,7 @@ impl OctreeMarchPass {
                     bgl_storage_tex(0, wgpu::TextureFormat::Rgba32Float),
                     bgl_storage_tex(1, wgpu::TextureFormat::Rgba16Float),
                     bgl_storage_tex(2, wgpu::TextureFormat::Rg32Uint),
+                    bgl_storage_tex(3, wgpu::TextureFormat::R32Uint),
                 ],
             });
 
@@ -355,6 +359,7 @@ impl OctreeMarchPass {
         position_view: &wgpu::TextureView,
         normal_view: &wgpu::TextureView,
         material_view: &wgpu::TextureView,
+        pick_view: &wgpu::TextureView,
     ) {
         self.gbuffer_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("march gbuffer bind group"),
@@ -363,6 +368,7 @@ impl OctreeMarchPass {
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(position_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(normal_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(material_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(pick_view) },
             ],
         }));
     }

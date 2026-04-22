@@ -517,12 +517,6 @@ struct EngineState {
     uuid_to_entity: std::collections::HashMap<uuid::Uuid, hecs::Entity>,
     /// UUID counter for generating stable IDs.
     next_entity_uuid: u64,
-    /// Stable scene object IDs for face emission (entity → scene_obj_id).
-    entity_scene_ids: std::collections::HashMap<hecs::Entity, u32>,
-    /// Shared with the worker so `ctx.emit_child` allocates ids off
-    /// the engine thread (lock-free fetch_add). Value ordering across
-    /// threads doesn't matter — each id is unique regardless.
-    next_scene_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Currently selected entity.
     selected_entity: Option<hecs::Entity>,
     /// Currently selected procedural node (within the selected entity's ProceduralGeometry).
@@ -534,8 +528,6 @@ struct EngineState {
     gpu_to_entity: Vec<hecs::Entity>,
     /// Maps hecs Entity → gpu_object index.
     entity_to_gpu: std::collections::HashMap<hecs::Entity, usize>,
-    /// Maps scene_id (from face emission) → gpu object index (this frame).
-    scene_id_to_gpu: std::collections::HashMap<u32, u32>,
 
     // Project state
     project_loaded: bool,
@@ -863,12 +855,10 @@ impl EngineState {
         // Bake worker: shares device/queue clones (cheap — wgpu wraps
         // the underlying objects in Arcs internally) and the same
         // scene_mgr we'll hand to the render thread below.
-        let next_scene_id = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let bake_worker = crate::bake_worker::BakeWorker::spawn(
             device.clone(),
             queue.clone(),
             scene_mgr.clone(),
-            next_scene_id.clone(),
         );
         let generator_system = crate::generator::GeneratorSystem::new(
             crate::generator::GeneratorRegistry::new(),
@@ -897,7 +887,6 @@ impl EngineState {
         Self {
             bake_worker,
             generator_system,
-            next_scene_id,
             render_worker,
             scene_mgr,
             geometry_epoch_handle,
@@ -927,13 +916,11 @@ impl EngineState {
             entity_uuids: std::collections::HashMap::new(),
             uuid_to_entity: std::collections::HashMap::new(),
             next_entity_uuid: 1,
-            entity_scene_ids: std::collections::HashMap::new(),
             selected_entity: None,
             selected_procedural_node: None,
             gpu_objects: Vec::new(),
             gpu_to_entity: Vec::new(),
             entity_to_gpu: std::collections::HashMap::new(),
-            scene_id_to_gpu: std::collections::HashMap::new(),
             project_loaded: false,
             project_name: String::new(),
             project_dir: None,
@@ -1420,9 +1407,12 @@ impl EngineState {
                             (Vec::new(), glam::Vec3::splat(1.0), glam::Vec3::splat(-1.0))
                         });
 
-                    let object_id = entity
-                        .and_then(|e| self.entity_scene_ids.get(&e).copied())
-                        .unwrap_or(0);
+                    // Any stable per-entity u32 works — the shader
+                    // packs it into the material G channel for the
+                    // (now-unused) old 8-bit pick byte; retained here
+                    // only as a non-breaking placeholder until
+                    // `ProcRaymarchParams.object_id` gets cleaned up.
+                    let object_id = entity.map(|e| e.to_bits().get() as u32).unwrap_or(0);
 
                     let entity_world = entity
                         .and_then(|e| {
@@ -1757,8 +1747,13 @@ impl EngineState {
                 // Self-hit detection only matters for the model path —
                 // generators have nothing spawned yet to self-hit. For
                 // models, ignore picks that land on the preview entity.
-                let hit_obj_raw = ((pr.raw_payload[1] >> 8) & 0xFF) as usize;
-                let hit_gpu_idx = if hit_obj_raw > 0 { Some(hit_obj_raw - 1) } else { None };
+                // `raw_payload[0]` is the 32-bit pick channel — gpu_idx
+                // on hit, 0xFFFFFFFF on sky.
+                let hit_gpu_idx = if pr.raw_payload[0] != u32::MAX {
+                    Some(pr.raw_payload[0] as usize)
+                } else {
+                    None
+                };
                 let hit_self = match &kind {
                     DragPreviewKind::Model { entity, .. } => {
                         hit_gpu_idx.is_some_and(|idx| {
@@ -1821,24 +1816,23 @@ impl EngineState {
                     self.selected_procedural_node = Some(ghost_id);
                     return;
                 }
-                let pick_channel = pr.raw_payload[0];
-                let g_channel = pr.raw_payload[1];
-                let obj_raw = (g_channel >> 8) & 0xFF;
-                let node_id_16 = pick_channel & 0xFFFFu32;
-                if obj_raw > 0 && node_id_16 != 0xFFFFu32 {
+                // Proc raymarch writes the primitive NodeId into the
+                // low 16 bits of the 32-bit pick channel, with 0xFFFF
+                // as the sky sentinel.
+                let node_id_16 = pr.raw_payload[0] & 0xFFFFu32;
+                if node_id_16 != 0xFFFFu32 {
                     self.selected_procedural_node = Some(node_id_16);
                 } else {
                     self.selected_procedural_node = None;
                 }
             }
             PickKind::Material => {
-                // MAIN voxel + BUILD voxel both decode the entity
-                // scene_id from the gbuf_material G channel's high
-                // byte (`object_id + 1`).
-                let g_channel = pr.raw_payload[1];
-                let obj_raw = (g_channel >> 8) & 0xFF;
-                if obj_raw > 0 {
-                    let gpu_idx = (obj_raw - 1) as usize;
+                // Voxel march writes `gpu_idx` to the 32-bit pick
+                // channel, 0xFFFFFFFF on sky. Direct lookup — no
+                // bit-unpacking, no 255-object cap.
+                let pick = pr.raw_payload[0];
+                if pick != u32::MAX {
+                    let gpu_idx = pick as usize;
                     if gpu_idx < self.gpu_to_entity.len() {
                         self.selected_entity = Some(self.gpu_to_entity[gpu_idx]);
                     }
@@ -2248,7 +2242,6 @@ impl EngineState {
                 proc_geo.dirty = false;
                 proc_geo.pending_bake = true;
                 proc_geo.bake_dirty_at = Some(std::time::Instant::now());
-                let scene_id = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let entity = self.world.spawn((
                     Transform::default(),
                     EditorMetadata { name: name.clone() },
@@ -2261,7 +2254,6 @@ impl EngineState {
                     proc_geo,
                 ));
                 self.assign_entity_uuid(entity);
-                self.entity_scene_ids.insert(entity, scene_id);
                 self.scene_dirty = true;
                 self.console.info(format!("Spawned procedural '{name}' (baking…)"));
             }
@@ -2736,7 +2728,6 @@ impl EngineState {
                 // this is the static voxel copy. Starts with
                 // spatial=None; the bake we enqueue below fills it.
                 let new_name = self.unique_name(&format!("{src_name} (copy)"));
-                let scene_id = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let new_entity = self.world.spawn((
                     src_transform,
                     EditorMetadata { name: new_name.clone() },
@@ -2748,7 +2739,6 @@ impl EngineState {
                     },
                 ));
                 self.assign_entity_uuid(new_entity);
-                self.entity_scene_ids.insert(new_entity, scene_id);
                 self.scene_dirty = true;
 
                 // Enqueue a bake for the copy. We're reusing the
@@ -2766,7 +2756,6 @@ impl EngineState {
                 let req = crate::bake_worker::BakeRequest {
                     entity: new_entity,
                     generation: 0,
-                    scene_id,
                     input: crate::bake_worker::BakeInput::Procedural(instructions),
                     aabb,
                     voxel_size,
@@ -4486,7 +4475,6 @@ impl EngineState {
         -> Option<(hecs::Entity, f32)>
     {
         use crate::components::*;
-        let scene_id = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let acquired = self.scene_mgr.lock().unwrap().acquire_asset(path);
         match acquired {
             Ok((handle, info)) => {
@@ -4510,7 +4498,6 @@ impl EngineState {
                     },
                 ));
                 self.assign_entity_uuid(entity);
-                self.entity_scene_ids.insert(entity, scene_id);
                 self.geometry_dirty = true;
                 self.scene_dirty = true;
                 self.gpu_objects_dirty = true;
@@ -4590,31 +4577,11 @@ impl EngineState {
         }
     }
 
-    /// Get or assign a stable scene object ID for face emission.
-    #[allow(dead_code)]
-    fn get_scene_id(&mut self, entity: hecs::Entity) -> u32 {
-        if let Some(&id) = self.entity_scene_ids.get(&entity) {
-            id
-        } else {
-            let id = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.entity_scene_ids.insert(entity, id);
-            id
-        }
-    }
-
     /// Assign a stable UUID to an entity.
     fn assign_entity_uuid(&mut self, entity: hecs::Entity) -> uuid::Uuid {
         let uuid = uuid::Uuid::new_v4();
         self.entity_uuids.insert(entity, uuid);
         self.uuid_to_entity.insert(uuid, entity);
-        // Assign a scene_id if one isn't already set. Used as the
-        // stable sort key by the gpu-object rebuild and the scene-tree
-        // snapshot so newly-spawned entities append at the bottom
-        // instead of reshuffling existing entities via archetype
-        // iteration order.
-        self.entity_scene_ids.entry(entity).or_insert_with(|| {
-            self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        });
         uuid
     }
 
@@ -4799,7 +4766,6 @@ impl EngineState {
     fn enqueue_bake(&mut self, entity: hecs::Entity) -> Option<u64> {
         use crate::components::*;
 
-        let scene_id = self.entity_scene_ids.get(&entity).copied().unwrap_or(0);
         let (tree_clone, base_voxel_size, generation) = {
             let mut proc_geo = self.world.get::<&mut ProceduralGeometry>(entity).ok()?;
             proc_geo.bake_generation = proc_geo.bake_generation.wrapping_add(1);
@@ -4838,7 +4804,6 @@ impl EngineState {
         let req = crate::bake_worker::BakeRequest {
             entity,
             generation,
-            scene_id,
             input: crate::bake_worker::BakeInput::Procedural(instructions),
             aabb,
             voxel_size,
@@ -5308,7 +5273,6 @@ impl EngineState {
         self.gpu_objects.clear();
         self.gpu_to_entity.clear();
         self.entity_to_gpu.clear();
-        self.scene_id_to_gpu.clear();
 
         // Refresh the sim-side skinning_data cache only when a
         // geometry mutation has happened since we last built it.
@@ -5344,36 +5308,27 @@ impl EngineState {
             }
         }
 
-        // Collect renderable entities and sort by `scene_id` before
-        // building `gpu_objects`. This keeps each entity's gpu vec
-        // position stable across rebuilds — hecs query iteration order
-        // follows archetype layout, so spawning a new child with a
-        // different component set can shift pre-existing entities'
-        // positions. Since `RkpGpuObject.object_id == gpu_idx` and the
-        // render-side `interpolate_gpu_objects` matches prev↔curr by
-        // `object_id`, any such shift would blend an entity's current
-        // world matrix against some UNRELATED entity's previous world
-        // matrix — a visible smear on pre-existing geometry every time
-        // a generator emits a child, snapping back once positions
-        // stabilize. Sort by monotonically-assigned scene_id: existing
-        // entities keep their order, new ones append.
-        let mut ordered: Vec<(hecs::Entity, u32)> = self.world
+        // Collect renderable entities and sort by `Entity::to_bits()`
+        // — hecs assigns monotonically-increasing bits to every spawn
+        // (generation << 32 | index), so this is stable per entity
+        // while alive AND gives newest-at-bottom ordering naturally.
+        // hecs query iteration order follows archetype layout, which
+        // shifts when a new archetype appears — without this sort,
+        // gpu vec positions of existing entities reshuffle on every
+        // such event. Since render-side `interpolate_gpu_objects`
+        // matches prev↔curr by `object_id == gpu_idx`, any shift
+        // would blend each entity against some unrelated entity's
+        // previous world matrix (visible smear, then pop-back).
+        let mut ordered: Vec<hecs::Entity> = self.world
             .query::<(&Transform, &Renderable)>()
             .iter()
             .filter_map(|(entity, (_, r))| {
                 if r.spatial.is_some() { Some(entity) } else { None }
             })
-            .map(|entity| {
-                // Fall back to `u32::MAX` for entities without an
-                // assigned scene_id so they sort to the end
-                // deterministically rather than colliding at 0.
-                let sid = self.entity_scene_ids.get(&entity).copied().unwrap_or(u32::MAX);
-                (entity, sid)
-            })
             .collect();
-        ordered.sort_by_key(|&(_, sid)| sid);
+        ordered.sort_by_key(|e| e.to_bits());
 
-        for (entity, _) in ordered {
+        for entity in ordered {
             let Ok(transform) = self.world.get::<&Transform>(entity) else { continue };
             let Ok(renderable) = self.world.get::<&Renderable>(entity) else { continue };
             let transform = (*transform).clone();
@@ -5478,9 +5433,6 @@ impl EngineState {
                     .get::<&crate::viewport::RenderLayer>(entity)
                     .map(|l| l.mask)
                     .unwrap_or(crate::viewport::layer::DEFAULT);
-                if let Some(&scene_id) = self.entity_scene_ids.get(&entity) {
-                    self.scene_id_to_gpu.insert(scene_id, gpu_idx);
-                }
                 self.entity_to_gpu.insert(entity, self.gpu_objects.len());
                 self.gpu_to_entity.push(entity);
                 self.gpu_objects.push(gpu_obj);
@@ -5823,7 +5775,6 @@ impl EngineState {
         if let Some(uuid) = self.entity_uuids.remove(&entity) {
             self.uuid_to_entity.remove(&uuid);
         }
-        self.entity_scene_ids.remove(&entity);
 
         // Despawn from ECS.
         let _ = self.world.despawn(entity);
@@ -5882,13 +5833,6 @@ impl EngineState {
         if let Ok(mut md) = self.world.get::<&mut EditorMetadata>(entity) {
             md.name = new_name.clone();
         }
-        // Renderable carries a scene_id through the external side map, not
-        // the component itself — assign a fresh one for face emission.
-        if self.world.get::<&Renderable>(entity).is_ok() {
-            let scene_id = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.entity_scene_ids.insert(entity, scene_id);
-        }
-
         self.assign_entity_uuid(entity);
 
         // Phase 4: hydrate runtime-only fields the registry's
@@ -6022,7 +5966,6 @@ impl EngineState {
                         let full_path = self.project_dir.as_ref()
                             .map(|d| d.join("assets").join(asset_path))
                             .unwrap_or_else(|| std::path::PathBuf::from(asset_path));
-                        let sid = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         match self.scene_mgr.lock().unwrap().acquire_asset(&full_path.to_string_lossy()) {
                             Ok((handle, info)) => {
                                 let spatial = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.grid_origin, info.leaf_attr_slot_start, info.leaf_attr_slot_count, Vec::new());
@@ -6034,7 +5977,6 @@ impl EngineState {
                                     asset_handle: Some(handle),
                                     ..Default::default()
                                 }));
-                                self.entity_scene_ids.insert(e, sid);
                                 self.geometry_dirty = true;
                                 Some(e)
                             }
@@ -6060,7 +6002,6 @@ impl EngineState {
                         // for generator children the parent generator's
                         // next tick will detect the missing slot and
                         // re-emit it.
-                        let sid = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let (spatial, asset_handle, voxel_count) = match (&obj.procedural_cache, &scene_dir) {
                             (Some(rel), Some(dir)) => {
                                 let full = dir.join(rel);
@@ -6103,7 +6044,6 @@ impl EngineState {
                             asset_handle,
                             ..Default::default()
                         }));
-                        self.entity_scene_ids.insert(e, sid);
                         self.geometry_dirty = true;
                         Some(e)
                     } else if let Some(ref prim_name) = obj.primitive {
@@ -6116,9 +6056,12 @@ impl EngineState {
                             },
                             _ => continue,
                         };
-                        let sid = self.next_scene_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // `object_id` is only forwarded to the retired
+                        // `pending_faces` emit path; pass 0 to indicate
+                        // "no pickable identity" until we either revive
+                        // face emission or drop the parameter.
                         self.scene_mgr.lock().unwrap().voxelize_primitive(
-                            &primitive, obj.material_id, 0.05, glam::Vec3::ONE, sid,
+                            &primitive, obj.material_id, 0.05, glam::Vec3::ONE, 0,
                         ).map(|result| {
                             let spatial = spatial_from_handle(&result.spatial, result.voxel_size, &result.aabb, result.grid_origin, result.leaf_attr_slot_start, result.leaf_attr_slot_count, result.brick_ids);
                             let e = self.world.spawn((transform, meta, Renderable {
@@ -6128,7 +6071,6 @@ impl EngineState {
                                 spatial: Some(spatial),
                                 ..Default::default()
                             }));
-                            self.entity_scene_ids.insert(e, sid);
                             self.geometry_dirty = true;
                             e
                         })
@@ -7357,25 +7299,22 @@ impl EngineState {
 
         let objects = if self.scene_dirty {
             self.scene_dirty = false;
-            // Collect + sort by `scene_id` so the editor's scene-tree
-            // panel gets a stable ordering: pre-existing entities keep
-            // their relative positions and newly-spawned entities
-            // (generator children, drops) append at the bottom. Same
-            // fix as `update_scene_gpu` — hecs query order follows
-            // archetype layout, not spawn order, so without this the
-            // tree shuffles every time a new archetype appears.
-            let mut ordered: Vec<(hecs::Entity, u32)> = self.world
+            // Sort by `Entity::to_bits()` — monotonic per spawn, stable
+            // while alive. Same reason as `update_scene_gpu`: hecs
+            // query iteration order is archetype-dependent, so without
+            // an explicit stable sort the scene-tree rows reshuffle
+            // whenever a new archetype appears. When we add a
+            // user-arrangeable `TreeOrder` component, it overrides
+            // this fallback for entities that carry it.
+            let mut ordered: Vec<hecs::Entity> = self.world
                 .query::<&crate::components::EditorMetadata>()
                 .iter()
-                .map(|(entity, _)| {
-                    let sid = self.entity_scene_ids.get(&entity).copied().unwrap_or(u32::MAX);
-                    (entity, sid)
-                })
+                .map(|(entity, _)| entity)
                 .collect();
-            ordered.sort_by_key(|&(_, sid)| sid);
+            ordered.sort_by_key(|e| e.to_bits());
 
             let mut objs = Vec::with_capacity(ordered.len());
-            for (entity, _) in ordered {
+            for entity in ordered {
                 let Ok(meta) = self.world.get::<&crate::components::EditorMetadata>(entity) else {
                     continue;
                 };
