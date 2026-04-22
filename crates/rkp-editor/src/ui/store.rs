@@ -18,6 +18,23 @@ use rkp_engine::material_library::MaterialInfo;
 use rkp_engine::procedural_snapshot::ProceduralSnapshot;
 use rkp_engine::recent_projects::RecentProject;
 
+/// Which "zone" within a scene-tree row the cursor is currently in
+/// during a drag. Editor-internal — the engine sees only the final
+/// `(new_parent, new_order)` values the drop handler computes from
+/// this zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropZone {
+    /// Top quarter of a row — drop above target at target's level.
+    Before,
+    /// Middle half — reparent and append as last child.
+    Inside,
+    /// Bottom quarter — drop below target. If target is an expanded
+    /// parent, this interprets as "first child of target" so the
+    /// drop lands between target and its first visible child (matches
+    /// where the cursor was). Otherwise it's target's next sibling.
+    After,
+}
+
 /// Editor-side view of profiling data used by [`ProfilingPanel`].
 ///
 /// The panel reads each field via `{|| …}` reactive closures. The DOM
@@ -160,6 +177,16 @@ pub struct EditorStore {
     /// drag). Paired with `scene_tree_drop` events to dispatch
     /// `EngineCommand::ReorderEntity`.
     pub scene_tree_drag: Signal<Option<uuid::Uuid>>,
+    /// Live drop-target hint while a scene-tree drag is over a row.
+    /// Populated by `ondragover` and consumed by the row's style
+    /// closure so the correct indicator (top border / full tint /
+    /// bottom border) renders. Cleared on dragleave / dragend / drop.
+    pub scene_tree_drop_hint: Signal<Option<(uuid::Uuid, DropZone)>>,
+    /// Separate hint for the synthetic scene-root row. `true` while
+    /// a drag is hovering over "Scene"; the row's style closure tints
+    /// itself. A dedicated signal is cheaper than encoding "root" into
+    /// `scene_tree_drop_hint` as a special Uuid.
+    pub scene_tree_root_hint: Signal<bool>,
     /// Generator name being dragged onto viewport (None = no drag).
     pub generator_drag: Signal<Option<String>>,
     /// `.rkgen` preset path being dragged onto viewport (None = no drag).
@@ -309,6 +336,8 @@ impl EditorStore {
             import_progress: Signal::new(Vec::new()),
             model_drag: Signal::new(None),
             scene_tree_drag: Signal::new(None),
+            scene_tree_drop_hint: Signal::new(None),
+            scene_tree_root_hint: Signal::new(false),
             generator_drag: Signal::new(None),
             generator_preset_drag: Signal::new(None),
             inspector: Signal::new(None),

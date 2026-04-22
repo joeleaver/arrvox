@@ -46,6 +46,11 @@ pub struct SceneObjectInfo {
     pub id: Uuid,
     pub name: String,
     pub parent_id: Option<Uuid>,
+    /// Tree-order key (monotonic f64, gap-insertion friendly). The
+    /// editor uses this to pick a new key for drag-reorder drops by
+    /// interpolating between neighbors — see scene_tree.rs's
+    /// `ondrop` handler.
+    pub tree_order: f64,
     pub is_camera: bool,
     pub is_light: bool,
     /// Has a `ProceduralGeometry` component — the scene tree uses
