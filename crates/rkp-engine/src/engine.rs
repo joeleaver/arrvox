@@ -82,9 +82,6 @@ fn json_to_field_value(
             }
             Ok(FieldValue::Color(out))
         }
-        // Other variants (Struct, AssetRef, etc.) aren't preset-friendly
-        // yet — surface clearly so the user knows to skip them.
-        other => Err(format!("preset override for {other:?} fields not supported")),
     }
 }
 
@@ -809,12 +806,15 @@ struct EngineState {
 
 impl EngineState {
     /// Flip the prefiltered-LOD march early-exit on or off. Public API
-    /// exists mainly for A/B correctness tests and debugging.
+    /// exists mainly for A/B correctness tests and debugging — no UI
+    /// wires it yet, but tests and MCP may poke it.
+    #[allow(dead_code)]
     pub fn set_lod_enabled(&mut self, enabled: bool) {
         self.lod_enabled = enabled;
     }
 
     /// Current LOD toggle state.
+    #[allow(dead_code)]
     pub fn lod_enabled(&self) -> bool {
         self.lod_enabled
     }
@@ -822,12 +822,15 @@ impl EngineState {
     /// Flip the Surface-Nets normal reconstruction on or off. When on,
     /// the march computes per-voxel normals from the 3³ in-brick
     /// occupancy neighborhood instead of reading the baked octahedral
-    /// `LeafAttr.normal_oct`. POC — see the `[surfnet]` log lines for
-    /// coverage metrics.
+    /// `LeafAttr.normal_oct`. Dormant infrastructure for the upcoming
+    /// sculpt path — runtime normal reconstruction is what sculpting
+    /// will need when voxels mutate between bakes.
+    #[allow(dead_code)]
     pub fn set_surfacenet_enabled(&mut self, enabled: bool) {
         self.surfacenet_enabled = enabled;
     }
 
+    #[allow(dead_code)]
     pub fn surfacenet_enabled(&self) -> bool {
         self.surfacenet_enabled
     }
@@ -4588,6 +4591,7 @@ impl EngineState {
     }
 
     /// Get or assign a stable scene object ID for face emission.
+    #[allow(dead_code)]
     fn get_scene_id(&mut self, entity: hecs::Entity) -> u32 {
         if let Some(&id) = self.entity_scene_ids.get(&entity) {
             id
@@ -7297,6 +7301,7 @@ impl EngineState {
 
     /// Access the profiling ring buffer. Intended for MCP tools and
     /// any other read-only consumer outside the editor snapshot path.
+    #[allow(dead_code)]
     pub fn profiling_history(&self) -> &crate::profiling::ProfilingHistory {
         &self.profiling
     }
@@ -8281,38 +8286,6 @@ fn tick_loop(
             }
         }
     }
-}
-
-/// Extract 6 frustum planes from a view-projection matrix.
-/// Each plane is (nx, ny, nz, d) where nx*x + ny*y + nz*z + d >= 0 means inside.
-fn extract_frustum_planes(vp: &glam::Mat4) -> [glam::Vec4; 6] {
-    let r0 = vp.row(0);
-    let r1 = vp.row(1);
-    let r2 = vp.row(2);
-    let r3 = vp.row(3);
-    [
-        r3 + r0, // left
-        r3 - r0, // right
-        r3 + r1, // bottom
-        r3 - r1, // top
-        r3 + r2, // near
-        r3 - r2, // far
-    ]
-}
-
-/// Test if an AABB (center + half-extents) is inside or intersects the frustum.
-fn aabb_in_frustum(planes: &[glam::Vec4; 6], center: glam::Vec3, half: glam::Vec3) -> bool {
-    for plane in planes {
-        let n = glam::Vec3::new(plane.x, plane.y, plane.z);
-        let d = plane.w;
-        // Effective radius: project half-extents onto the plane normal.
-        let r = half.x * n.x.abs() + half.y * n.y.abs() + half.z * n.z.abs();
-        // If the center is further than r behind the plane, the AABB is fully outside.
-        if n.dot(center) + d + r < 0.0 {
-            return false;
-        }
-    }
-    true
 }
 
 /// Read just the voxel count from a `.rkp` header. Opens the file,

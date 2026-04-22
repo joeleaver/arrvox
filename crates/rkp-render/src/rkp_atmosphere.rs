@@ -42,14 +42,12 @@ pub struct AtmosphereFrameParams {
 pub struct RkpAtmospherePass {
     // Transmittance LUT.
     transmittance_pipeline: wgpu::ComputePipeline,
-    transmittance_bind_group_layout: wgpu::BindGroupLayout,
     transmittance_bind_group: wgpu::BindGroup,
     pub transmittance_texture: wgpu::Texture,
     pub transmittance_view: wgpu::TextureView,
 
     // Multi-scattering LUT.
     multiscatter_pipeline: wgpu::ComputePipeline,
-    multiscatter_bind_group_layout: wgpu::BindGroupLayout,
     multiscatter_bind_group: wgpu::BindGroup,
     pub multiscatter_texture: wgpu::Texture,
     pub multiscatter_view: wgpu::TextureView,
@@ -59,14 +57,12 @@ pub struct RkpAtmospherePass {
 
     // Sky View LUT (per-frame).
     sky_view_pipeline: wgpu::ComputePipeline,
-    sky_view_bind_group_layout: wgpu::BindGroupLayout,
     sky_view_bind_group: wgpu::BindGroup,
     pub sky_view_texture: wgpu::Texture,
     pub sky_view_view: wgpu::TextureView,
 
     // Aerial Perspective LUT (per-frame).
     ap_pipeline: wgpu::ComputePipeline,
-    ap_bind_group_layout: wgpu::BindGroupLayout,
     ap_bind_group: wgpu::BindGroup,
     pub ap_texture: wgpu::Texture,
     pub ap_view: wgpu::TextureView,
@@ -318,25 +314,22 @@ impl RkpAtmospherePass {
             ],
         });
 
+        let _ = per_frame_layout;
         Self {
             transmittance_pipeline,
-            transmittance_bind_group_layout,
             transmittance_bind_group,
             transmittance_texture,
             transmittance_view,
             multiscatter_pipeline,
-            multiscatter_bind_group_layout,
             multiscatter_bind_group,
             multiscatter_texture,
             multiscatter_view,
             lut_sampler,
             sky_view_pipeline,
-            sky_view_bind_group_layout: per_frame_layout,
             sky_view_bind_group,
             sky_view_texture,
             sky_view_view,
             ap_pipeline,
-            ap_bind_group_layout,
             ap_bind_group,
             ap_texture,
             ap_view,

@@ -313,7 +313,7 @@ impl SkinDeformPass {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        scene: &RkpScene,
+        _scene: &RkpScene,
         batch: &SkinBatchScratch,
     ) {
         if batch.is_empty() { return; }

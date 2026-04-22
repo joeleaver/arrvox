@@ -196,7 +196,6 @@ mod atmo {
     fn len3(a: [f32; 3]) -> f32 { dot3(a, a).sqrt() }
     fn scale3(a: [f32; 3], s: f32) -> [f32; 3] { [a[0]*s, a[1]*s, a[2]*s] }
     fn add3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] { [a[0]+b[0], a[1]+b[1], a[2]+b[2]] }
-    fn mul3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] { [a[0]*b[0], a[1]*b[1], a[2]*b[2]] }
 
     fn ray_sphere(origin: [f32; 3], dir: [f32; 3], radius: f32) -> Option<(f32, f32)> {
         let b = dot3(origin, dir);

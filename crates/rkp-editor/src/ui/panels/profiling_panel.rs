@@ -274,6 +274,10 @@ pub fn ProfilingPanel() -> NodeHandle {
             // the initial text, once inside a create_effect), so a
             // non-Copy capture would move-into-two-places.
             for (idx, label) in store.gpu_pass_labels.get().as_ref().iter().cloned().enumerate().collect::<Vec<_>>() {
+                // `idx` is captured by rsx-macro-generated closures below;
+                // this explicit no-op read silences the false-positive
+                // unused_variable warning that fires at the loop binding.
+                let _ = idx;
                 div {
                     key: label.clone(),
                     style: STAT_ROW,

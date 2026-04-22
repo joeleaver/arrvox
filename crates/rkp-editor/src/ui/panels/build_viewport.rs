@@ -188,7 +188,6 @@ pub fn BuildViewport() -> NodeHandle {
                 SurfaceMouseButton::Left => InputMouseButton::Left,
                 SurfaceMouseButton::Right => InputMouseButton::Right,
                 SurfaceMouseButton::Middle => InputMouseButton::Middle,
-                _ => InputMouseButton::Left,
             }
         }
 

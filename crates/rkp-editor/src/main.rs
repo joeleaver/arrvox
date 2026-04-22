@@ -399,7 +399,6 @@ fn main() -> anyhow::Result<()> {
                         .map(|(l, _)| (l.clone(), *st.smoothed_gpu.get(l).unwrap_or(&0.0)))
                         .collect();
                     let window = ui::store::ProfilingWindow {
-                        frame_idx: frame.frame_idx,
                         latest_cpu: st.smoothed_cpu.clone(),
                         latest_gpu,
                         history: st.history.iter().copied().collect(),

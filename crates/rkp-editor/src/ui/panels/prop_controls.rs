@@ -65,8 +65,6 @@ const INPUT_STYLE: &str = "flex:1;min-width:0;background:#1e1e1e;border:1px soli
 const NUMBER_STYLE: &str = "flex:1;min-width:0;background:#1e1e1e;border:1px solid #3c3c3c;\
                             border-radius:3px;color:#ccc;font-size:11px;padding:3px 6px;\
                             outline:none;font-family:monospace;";
-const VALUE_STYLE: &str = "width:40px;text-align:right;font-size:10px;color:#777;\
-                           font-family:monospace;flex-shrink:0;";
 const CHECKBOX_ON: &str = "width:16px;height:16px;border-radius:3px;cursor:pointer;\
                            background:#4fc3f7;border:1px solid #4fc3f7;flex-shrink:0;\
                            display:flex;align-items:center;justify-content:center;";
@@ -105,21 +103,6 @@ pub fn prop_slider_memo(
     on_change: Rc<dyn Fn(f32)>,
 ) -> Node {
     prop_scrub(__scope, label, value, min, max, step, on_change)
-}
-
-/// Slider that operates on f64 (for ECS inspector fields). Same
-/// widget as [`prop_slider`], rounded through f32 for display.
-pub fn prop_slider_f64(
-    __scope: &mut Scope,
-    label: &str,
-    value: Signal<f64>,
-    min: f64,
-    max: f64,
-    step: f64,
-    on_change: Rc<dyn Fn(f64)>,
-) -> Node {
-    let (m, oc) = bind(value, on_change);
-    prop_slider_f64_memo(__scope, label, m, min, max, step, oc)
 }
 
 pub fn prop_slider_f64_memo(
@@ -270,17 +253,6 @@ pub fn prop_scrub(
 // ── Number input ─────────────────────────────────────────────────────────
 
 /// Numeric text input for unbounded f64 values. Label is drag-to-scrub.
-pub fn prop_number_f64(
-    __scope: &mut Scope,
-    label: &str,
-    value: Signal<f64>,
-    on_change: Rc<dyn Fn(f64)>,
-) -> Node {
-    let (m, oc) = bind(value, on_change);
-    prop_number_f64_memo(__scope, label, m, oc)
-}
-
-/// Memo-based variant of [`prop_number_f64`].
 pub fn prop_number_f64_memo(
     __scope: &mut Scope,
     label: &str,
@@ -328,17 +300,6 @@ pub fn prop_number_f64_memo(
 }
 
 /// Numeric text input for i64 values.
-pub fn prop_number_i64(
-    __scope: &mut Scope,
-    label: &str,
-    value: Signal<i64>,
-    on_change: Rc<dyn Fn(i64)>,
-) -> Node {
-    let (m, oc) = bind(value, on_change);
-    prop_number_i64_memo(__scope, label, m, oc)
-}
-
-/// Memo-based variant of [`prop_number_i64`].
 pub fn prop_number_i64_memo(
     __scope: &mut Scope,
     label: &str,

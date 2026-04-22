@@ -183,48 +183,6 @@ impl LayoutConfig {
         }
     }
 
-    /// Float a panel (remove from container, add to floating list).
-    pub fn float_panel(&mut self, container: ContainerKind, zone_idx: usize, tab_idx: usize) {
-        let panel = {
-            let c = self.container_mut(container);
-            if let Some(zone) = c.zones.get_mut(zone_idx) {
-                if tab_idx < zone.tabs.len() {
-                    let p = zone.tabs.remove(tab_idx);
-                    if zone.active_tab >= zone.tabs.len() && zone.active_tab > 0 {
-                        zone.active_tab -= 1;
-                    }
-                    Some(p)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        if let Some(panel) = panel {
-            self.floating.push(FloatingPanel {
-                panel,
-                x: 200.0,
-                y: 200.0,
-                width: 400.0,
-                height: 300.0,
-            });
-            self.cleanup_empty_zones();
-        }
-    }
-
-    /// Dock a floating panel back into a container.
-    pub fn dock_panel(&mut self, floating_idx: usize, target: ContainerKind, zone_idx: usize) {
-        if floating_idx < self.floating.len() {
-            let fp = self.floating.remove(floating_idx);
-            let container = self.container_mut(target);
-            if let Some(zone) = container.zones.get_mut(zone_idx) {
-                zone.tabs.push(fp.panel);
-                zone.active_tab = zone.tabs.len() - 1;
-            }
-            container.visible = true;
-        }
-    }
 }
 
 /// Default editor layout.

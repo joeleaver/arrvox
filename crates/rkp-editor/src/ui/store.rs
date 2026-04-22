@@ -30,7 +30,6 @@ use rkp_engine::recent_projects::RecentProject;
 /// raw — the sparkline should show real frame-time variance.
 #[derive(Debug, Clone)]
 pub struct ProfilingWindow {
-    pub frame_idx: u64,
     pub latest_cpu: rkp_engine::profiling::CpuPhaseTimings,
     /// GPU pass timings in engine-submit order, already smoothed. The
     /// label set matches [`gpu_pass_labels`] at the moment the panel
@@ -52,7 +51,10 @@ impl ProfilingWindow {
 
 use crate::ui::layout::{ContainerKind, LayoutConfig, PanelId, default_layout};
 
-/// Editor interaction mode.
+/// Editor interaction mode. Sculpt/Paint variants are reserved for
+/// the upcoming sculpt tool work; the `#[allow]` silences the transient
+/// dead-code warning until that lands.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorMode {
     Default,
@@ -112,13 +114,21 @@ pub struct EditorStore {
 
     /// Current gizmo mode (Translate, Rotate, Scale).
     pub gizmo_mode: Signal<GizmoMode>,
-    /// Current editor interaction mode.
+    /// Current editor interaction mode. Reserved for upcoming sculpt
+    /// work — see [`EditorMode`].
+    #[allow(dead_code)]
     pub editor_mode: Signal<EditorMode>,
 
     // ── Tool settings (written by UI) ────────────────────────────
+    // Reserved for the upcoming sculpt/paint tool. Already plumbed
+    // into the store so the toolbar + brush-param panel can bind
+    // without a later store-struct churn.
 
+    #[allow(dead_code)]
     pub sculpt_radius: Signal<f32>,
+    #[allow(dead_code)]
     pub sculpt_strength: Signal<f32>,
+    #[allow(dead_code)]
     pub paint_color: Signal<[f32; 3]>,
 
     // ── Project state (written by engine) ───────────────────────
@@ -183,8 +193,6 @@ pub struct EditorStore {
     pub play_mode: Signal<bool>,
 
     // ── View settings ────────────────────────────────────────────
-    /// Show physics collider wireframes in the viewport.
-    pub show_colliders: Signal<bool>,
     /// Which primary-visibility pass the build viewport dispatches —
     /// `Voxel` (default, shows the baked octree) or `Raymarch` (live CSG
     /// preview of the procedural tree, no bake required). Updated by the
@@ -310,7 +318,6 @@ impl EditorStore {
             environment: Signal::new(EnvironmentSettings::default()),
             console_entries: Signal::new(Vec::new()),
             play_mode: Signal::new(false),
-            show_colliders: Signal::new(false),
             build_preview_mode: Signal::new(rkp_render::BuildPreviewMode::Raymarch),
             skinning_enabled: Signal::new(true),
             dqs_enabled: Signal::new(false),

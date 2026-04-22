@@ -21,7 +21,3 @@ pub fn panel_name(id: PanelId) -> &'static str {
     }
 }
 
-/// Whether this panel must stay in the Center container.
-pub fn is_canvas_panel(id: PanelId) -> bool {
-    matches!(id, PanelId::SceneView)
-}

@@ -190,17 +190,6 @@ fn pack_rgb_u24(c: glam::Vec3) -> u32 {
     r | (g << 8) | (b << 16)
 }
 
-/// Inverse of `pack_rgb_u24` — unpack a u24-bit-laid f32 back into
-/// a Vec3 color. Used only by the CPU RPN exec in flatten tests so
-/// it mirrors the WGSL unpack bit-for-bit.
-fn unpack_rgb_u24(packed: f32) -> glam::Vec3 {
-    let bits = packed.to_bits();
-    let r = (bits & 0xFF) as f32 / 255.0;
-    let g = ((bits >> 8) & 0xFF) as f32 / 255.0;
-    let b = ((bits >> 16) & 0xFF) as f32 / 255.0;
-    glam::Vec3::new(r, g, b)
-}
-
 /// Encode a `MaterialCombine` as a u32 for the GPU. Values match the
 /// WGSL `MAT_COMBINE_*` constants.
 fn material_combine_bits(m: MaterialCombine) -> u32 {
@@ -223,8 +212,6 @@ fn combinator_radius(m: MaterialCombine) -> f32 {
 /// Flatten a procedural tree into a linear instruction stream ready for
 /// GPU upload. Returns an empty vector for an empty tree.
 pub fn flatten_tree(obj: &ProceduralObject) -> Vec<ProcInstruction> {
-    use crate::node_kind::*;
-
     let mut out = Vec::new();
     emit(obj, obj.root(), Affine3A::IDENTITY, &mut out);
     out

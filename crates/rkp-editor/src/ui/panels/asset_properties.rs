@@ -6,6 +6,13 @@
 //!
 //! When nothing is selected, shows a placeholder message.
 
+// `info` bound inside `if let Some(info) = ...` expands through the rsx
+// macro into generated closures that rustc's usage analysis can't see
+// past. The binding looks unused at the pattern site even though the
+// expanded code uses it. Local `let _ = &info;` silencers are stripped
+// by the macro, so we allow at module scope.
+#![allow(unused_variables)]
+
 use std::rc::Rc;
 
 use rinch::prelude::*;

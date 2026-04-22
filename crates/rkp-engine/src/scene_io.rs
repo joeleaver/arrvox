@@ -3,7 +3,6 @@
 //! A scene contains objects with transforms, asset references,
 //! camera state, and lights. Serialized as JSON.
 
-use glam::Vec3;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

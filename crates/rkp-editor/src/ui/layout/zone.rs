@@ -11,13 +11,6 @@ use crate::ui::panels::*;
 pub fn ZoneComponent(container: ContainerKind, zone_idx: usize) -> NodeHandle {
     let store = use_context::<EditorStore>();
 
-    let tab_count = Memo::new(move || {
-        store.layout.get().container(container)
-            .zones.get(zone_idx)
-            .map(|z| z.tabs.len())
-            .unwrap_or(0)
-    });
-
     let active_panel = Memo::new(move || {
         let layout = store.layout.get();
         let c = layout.container(container);

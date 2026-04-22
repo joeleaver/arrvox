@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::behavior::SystemEntry;
-use crate::component_registry::{ComponentEntry, ComponentRegistry};
+use crate::component_registry::ComponentEntry;
 use crate::generator::GeneratorEntry;
 
 /// Manages the gameplay dylib lifecycle.

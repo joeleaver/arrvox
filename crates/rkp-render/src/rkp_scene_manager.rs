@@ -1071,7 +1071,7 @@ impl RkpSceneManager {
         mut artifact: rkp_core::BakeArtifact,
         aabb: &rkp_core::Aabb,
         voxel_size: f32,
-        object_id: u32,
+        _object_id: u32,
     ) -> Option<VoxelizeResult> {
         self.bump_geometry_epoch();
         use rkp_core::brick_face_links::{FACE_EMPTY, FACE_INTERIOR};

@@ -1,6 +1,6 @@
 //! Recent projects list — persists across sessions.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const MAX_RECENT: usize = 10;
 

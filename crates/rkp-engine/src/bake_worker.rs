@@ -476,16 +476,6 @@ fn run_generator(
     let _ = tx_gen_event.send(event);
 }
 
-/// Public re-export of the private helper so `GeneratorContext` can
-/// build a `SpatialData` after an immediate emit-artifact integrate.
-/// (Reserved for future uses; the unified bake path does it inside
-/// `run_bake` today.)
-pub(crate) fn spatial_from_voxelize_result_public(
-    r: &rkp_render::rkp_scene_manager::VoxelizeResult,
-) -> SpatialData {
-    spatial_from_voxelize_result(r)
-}
-
 fn spatial_from_voxelize_result(r: &rkp_render::rkp_scene_manager::VoxelizeResult) -> SpatialData {
     if let rkp_core::scene_node::SpatialHandle::Octree {
         root_offset, len, depth, base_voxel_size,

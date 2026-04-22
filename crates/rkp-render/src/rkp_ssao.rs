@@ -57,12 +57,8 @@ pub struct RkpSsaoPass {
     pipeline: wgpu::ComputePipeline,
     gbuffer_bind_group_layout: wgpu::BindGroupLayout,
     output_bind_group_layout: wgpu::BindGroupLayout,
-    params_bind_group_layout: wgpu::BindGroupLayout,
     params_buffer: wgpu::Buffer,
     params_bind_group: wgpu::BindGroup,
-    /// 4x4 noise texture for random rotation.
-    noise_texture: wgpu::Texture,
-    noise_view: wgpu::TextureView,
     /// Output texture (half-res, R8Unorm).
     pub output_texture: wgpu::Texture,
     pub output_view: wgpu::TextureView,
@@ -129,8 +125,10 @@ impl RkpSsaoPass {
             mapped_at_creation: false,
         });
 
-        // Create and upload 4x4 noise texture.
-        let (noise_texture, noise_view) = Self::create_noise_texture(device, queue);
+        // Create and upload 4x4 noise texture. Only `noise_view` is
+        // bound into the SSAO params bind group; the underlying texture
+        // stays alive via wgpu's internal Arc on the view.
+        let (_noise_texture, noise_view) = Self::create_noise_texture(device, queue);
 
         let default_params = SsaoParams::default();
         queue.write_buffer(&params_buffer, 0, bytemuck::bytes_of(&default_params));
@@ -184,11 +182,8 @@ impl RkpSsaoPass {
             pipeline,
             gbuffer_bind_group_layout,
             output_bind_group_layout,
-            params_bind_group_layout,
             params_buffer,
             params_bind_group,
-            noise_texture,
-            noise_view,
             output_texture,
             output_view,
             output_bind_group,

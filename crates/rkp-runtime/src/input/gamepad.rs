@@ -1,8 +1,6 @@
 //! Gamepad backend via gilrs — polls hardware and feeds into RawInputState.
 
 use super::raw_state::RawInputState;
-use super::types::*;
-use glam::Vec2;
 
 /// Information about a connected gamepad.
 #[allow(missing_docs)]
@@ -78,18 +76,16 @@ impl GamepadManager {
         &self.connected
     }
 
+    #[cfg(feature = "gamepad")]
     fn refresh_connected(&mut self) {
-        #[cfg(feature = "gamepad")]
-        {
-            self.connected.clear();
-            for (id, gamepad) in self.gilrs.gamepads() {
-                if gamepad.is_connected() {
-                    self.connected.push(GamepadInfo {
-                        id: id.into(),
-                        name: gamepad.name().to_string(),
-                        is_connected: true,
-                    });
-                }
+        self.connected.clear();
+        for (id, gamepad) in self.gilrs.gamepads() {
+            if gamepad.is_connected() {
+                self.connected.push(GamepadInfo {
+                    id: id.into(),
+                    name: gamepad.name().to_string(),
+                    is_connected: true,
+                });
             }
         }
     }

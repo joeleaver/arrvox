@@ -110,7 +110,6 @@ fn log_entry_row(
     let store = use_context::<crate::ui::store::EditorStore>();
     // Filter check — use initial values since entry is static once created.
     let level = entry.level;
-    let visible = Signal::new(true);
     let timestamp = entry.timestamp;
     let message = entry.message.clone();
     // Stripped-for-display version — recomputes when `project_dir`

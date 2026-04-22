@@ -3,7 +3,6 @@
 //! Systems cannot directly mutate the world (it's borrowed). Instead they
 //! queue spawn/despawn/insert/remove commands which are flushed between phases.
 
-use std::any::TypeId;
 use std::collections::HashMap;
 
 /// Handle to a not-yet-spawned entity. Use with `commands.insert_temp()`.
@@ -13,7 +12,6 @@ pub struct TempEntity(usize);
 /// Type-erased component insertion.
 trait ComponentBox: Send + 'static {
     fn insert_into(self: Box<Self>, world: &mut hecs::World, entity: hecs::Entity);
-    fn type_id(&self) -> TypeId;
 }
 
 struct TypedComponent<C: hecs::Component> {
@@ -23,9 +21,6 @@ struct TypedComponent<C: hecs::Component> {
 impl<C: hecs::Component> ComponentBox for TypedComponent<C> {
     fn insert_into(self: Box<Self>, world: &mut hecs::World, entity: hecs::Entity) {
         let _ = world.insert_one(entity, self.component);
-    }
-    fn type_id(&self) -> TypeId {
-        TypeId::of::<C>()
     }
 }
 
@@ -220,7 +215,7 @@ fn despawn_cascading(world: &mut hecs::World, entity: hecs::Entity) {
     let children: Vec<hecs::Entity> = world
         .query::<&crate::components::Parent>()
         .iter()
-        .filter(|(_, p)| {
+        .filter(|(_, _p)| {
             // Check if this entity's parent_id matches.
             // Parent stores a UUID; we'd need to resolve. For now, use direct entity refs
             // if available. This is simplified — full implementation needs UUID resolution.

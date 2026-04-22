@@ -99,7 +99,7 @@ impl PlayModeState {
         // After 2 seconds, dump all body positions and collider AABBs.
         if self.frame_count == 120 || self.frame_count == 10 {
             eprintln!("[Physics] === State at frame {} ===", self.frame_count);
-            for (entity, runtime) in &self.body_map {
+            for (_entity, runtime) in &self.body_map {
                 if let Some(body) = self.physics.get_body(runtime.handle) {
                     let pos = from_rapier_vec3(body.translation().clone());
                     let vel = from_rapier_vec3(body.linvel().clone());

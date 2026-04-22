@@ -155,7 +155,6 @@ pub fn build_procedural_snapshot(
     voxel_size: f32,
     voxel_count: u32,
 ) -> ProceduralSnapshot {
-    use rkp_procedural::node_kind::*;
     use rkp_procedural::NodeKind;
 
     let tree = &proc_geo.tree;

@@ -17,7 +17,7 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
     parse::{Parse, ParseStream},
-    parse_macro_input, Data, DeriveInput, Expr, Fields, Ident, ItemFn, Lit, LitStr, Meta, Token,
+    parse_macro_input, Data, DeriveInput, Fields, Ident, ItemFn, LitStr, Meta, Token,
 };
 
 /// Classify a Rust type to a FieldType variant name.
@@ -104,7 +104,6 @@ pub fn rkp_component(attr: TokenStream, item: TokenStream) -> TokenStream {
     struct FieldInfo {
         name: String,
         ident: syn::Ident,
-        ty: syn::Type,
         field_type_str: String,
         transient: bool,
         range: Option<(f64, f64)>,
@@ -121,7 +120,7 @@ pub fn rkp_component(attr: TokenStream, item: TokenStream) -> TokenStream {
         let range = extract_range(f);
         let asset_filter = extract_asset_filter(f);
         let is_option = quote!(#ty).to_string().replace(' ', "").starts_with("Option<");
-        Some(FieldInfo { name, ident, ty, field_type_str, transient, range, asset_filter, is_option })
+        Some(FieldInfo { name, ident, field_type_str, transient, range, asset_filter, is_option })
     }).collect();
 
     // Strip custom attributes (range, transient, asset_filter) from the struct
