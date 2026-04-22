@@ -517,6 +517,20 @@ struct EngineState {
     uuid_to_entity: std::collections::HashMap<uuid::Uuid, hecs::Entity>,
     /// UUID counter for generating stable IDs.
     next_entity_uuid: u64,
+    /// Per-entity scene-tree order key. `f64` so the drag-reorder path
+    /// can insert between two neighbors (mid = (a + b) * 0.5) without
+    /// renumbering anything. Persisted in the scene file — user-
+    /// arranged ordering survives save / reload.
+    ///
+    /// Deliberately a side-map rather than a hecs component: the
+    /// properties panel reflects over components via `ComponentRegistry`,
+    /// and we don't want this editor-ordering concern to show up as a
+    /// field there.
+    entity_tree_order: std::collections::HashMap<hecs::Entity, f64>,
+    /// Next TreeOrder value to hand out on a fresh spawn. Monotonic;
+    /// reseeds past `max(loaded)` after a scene load so new spawns
+    /// still append at the bottom.
+    next_tree_order: f64,
     /// Currently selected entity.
     selected_entity: Option<hecs::Entity>,
     /// Currently selected procedural node (within the selected entity's ProceduralGeometry).
@@ -916,6 +930,8 @@ impl EngineState {
             entity_uuids: std::collections::HashMap::new(),
             uuid_to_entity: std::collections::HashMap::new(),
             next_entity_uuid: 1,
+            entity_tree_order: std::collections::HashMap::new(),
+            next_tree_order: 0.0,
             selected_entity: None,
             selected_procedural_node: None,
             gpu_objects: Vec::new(),
@@ -3099,6 +3115,10 @@ impl EngineState {
                 }
             }
 
+            EngineCommand::ReorderEntity { entity, target, position } => {
+                self.handle_reorder(entity, target, position);
+            }
+
             EngineCommand::DeleteSelected => {
                 if let Some(entity) = self.selected_entity {
                     self.delete_entity(entity);
@@ -4582,6 +4602,14 @@ impl EngineState {
         let uuid = uuid::Uuid::new_v4();
         self.entity_uuids.insert(entity, uuid);
         self.uuid_to_entity.insert(uuid, entity);
+        // Fresh spawns append to the end of the tree. `entry` makes
+        // the assignment idempotent: if a caller pre-seeded an order
+        // (e.g. scene-load from a persisted value), we keep it.
+        self.entity_tree_order.entry(entity).or_insert_with(|| {
+            let key = self.next_tree_order;
+            self.next_tree_order += 1.0;
+            key
+        });
         uuid
     }
 
@@ -5700,6 +5728,142 @@ impl EngineState {
     }
 
     /// Delete an entity and clean up all associated data.
+    /// Re-parent + re-order an entity within the scene tree. Validates
+    /// against trivial no-ops (self-drop) and cycles (dropping an
+    /// entity inside its own subtree), then computes a new TreeOrder
+    /// key via gap insertion between its new neighbors. `scene_dirty`
+    /// + `gpu_objects_dirty` flip on so the snapshot refreshes.
+    fn handle_reorder(
+        &mut self,
+        entity_id: uuid::Uuid,
+        target_id: uuid::Uuid,
+        position: crate::command::DropPosition,
+    ) {
+        use crate::command::DropPosition;
+        if entity_id == target_id {
+            return;
+        }
+        let Some(entity) = self.uuid_to_entity.get(&entity_id).copied() else { return };
+        let Some(target) = self.uuid_to_entity.get(&target_id).copied() else { return };
+
+        // Cycle check: if `target` is a descendant of `entity`, the
+        // reparent would make `entity` its own descendant's child. The
+        // scene tree is built via `Parent` components; walk upward
+        // from target to root and reject if we pass through entity.
+        let mut cursor = Some(target);
+        while let Some(c) = cursor {
+            if c == entity {
+                return;
+            }
+            cursor = self
+                .world
+                .get::<&crate::components::Parent>(c)
+                .ok()
+                .and_then(|p| self.uuid_to_entity.get(&p.parent_id).copied());
+        }
+
+        // Determine the new parent UUID.
+        let target_parent = self
+            .world
+            .get::<&crate::components::Parent>(target)
+            .ok()
+            .map(|p| p.parent_id);
+        let new_parent_uuid = match position {
+            DropPosition::Inside => Some(target_id),
+            DropPosition::Before | DropPosition::After => target_parent,
+        };
+
+        // Gather siblings (same parent as the new position), sorted by
+        // current TreeOrder. We need their keys to compute neighbor
+        // bounds for gap insertion.
+        let mut siblings: Vec<(hecs::Entity, uuid::Uuid, f64)> = self
+            .world
+            .query::<&crate::components::EditorMetadata>()
+            .iter()
+            .filter_map(|(e, _)| {
+                let e_parent_uuid = self
+                    .world
+                    .get::<&crate::components::Parent>(e)
+                    .ok()
+                    .map(|p| p.parent_id);
+                if e_parent_uuid != new_parent_uuid {
+                    return None;
+                }
+                if e == entity {
+                    // Exclude the dragged entity itself — it's moving
+                    // to a new slot, not occupying its current one.
+                    return None;
+                }
+                let uuid = *self.entity_uuids.get(&e)?;
+                let order = self.entity_tree_order.get(&e).copied()?;
+                Some((e, uuid, order))
+            })
+            .collect();
+        siblings.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Compute new TreeOrder from neighbor bounds.
+        let new_order = match position {
+            DropPosition::Before => {
+                let target_order = self.entity_tree_order.get(&target).copied().unwrap_or(0.0);
+                // Find the sibling with the largest order < target's.
+                let prev = siblings
+                    .iter()
+                    .filter(|(_, _, o)| *o < target_order)
+                    .next_back()
+                    .map(|(_, _, o)| *o);
+                match prev {
+                    Some(p) => (p + target_order) * 0.5,
+                    None => target_order - 1.0,
+                }
+            }
+            DropPosition::After => {
+                let target_order = self.entity_tree_order.get(&target).copied().unwrap_or(0.0);
+                let next = siblings
+                    .iter()
+                    .find(|(_, _, o)| *o > target_order)
+                    .map(|(_, _, o)| *o);
+                match next {
+                    Some(n) => (target_order + n) * 0.5,
+                    None => target_order + 1.0,
+                }
+            }
+            DropPosition::Inside => {
+                // Append as the last child of `target`.
+                let max = siblings
+                    .iter()
+                    .map(|(_, _, o)| *o)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                if max.is_finite() {
+                    max + 1.0
+                } else {
+                    self.next_tree_order
+                }
+            }
+        };
+        self.entity_tree_order.insert(entity, new_order);
+        // Keep the monotonic counter ahead of any key we just produced.
+        if new_order + 1.0 > self.next_tree_order {
+            self.next_tree_order = new_order + 1.0;
+        }
+
+        // Update Parent component on the dragged entity. Missing →
+        // insert; present but changed → replace; becoming root → remove.
+        match new_parent_uuid {
+            Some(pid) => {
+                let _ = self.world.insert_one(
+                    entity,
+                    crate::components::Parent { parent_id: pid },
+                );
+            }
+            None => {
+                let _ = self.world.remove_one::<crate::components::Parent>(entity);
+            }
+        }
+
+        self.scene_dirty = true;
+        self.gpu_objects_dirty = true;
+    }
+
     fn delete_entity(&mut self, entity: hecs::Entity) {
         // Get name for logging.
         let name = self.world.get::<&crate::components::EditorMetadata>(entity)
@@ -5775,6 +5939,7 @@ impl EngineState {
         if let Some(uuid) = self.entity_uuids.remove(&entity) {
             self.uuid_to_entity.remove(&uuid);
         }
+        self.entity_tree_order.remove(&entity);
 
         // Despawn from ECS.
         let _ = self.world.despawn(entity);
@@ -6086,6 +6251,14 @@ impl EngineState {
                         // references, per-entity persisted data).
                         self.set_entity_uuid(e, obj.id);
                         uuid_to_hecs.insert(obj.id, e);
+                        // Restore the scene-tree order if the save
+                        // file carried one. Brand-new entities in
+                        // old saves (no `tree_order`) fall through
+                        // to the post-load reseed loop below, which
+                        // assigns them monotonic keys past the max.
+                        if let Some(k) = obj.tree_order {
+                            self.entity_tree_order.insert(e, k);
+                        }
 
                         // Restore PointLight component.
                         if let Some(ref pl) = obj.point_light {
@@ -6203,6 +6376,31 @@ impl EngineState {
                     }
                 }
 
+                // Reseed `next_tree_order` past the max value loaded
+                // from the scene file so post-load spawns continue to
+                // append at the bottom rather than interleaving with
+                // existing entries. Old saves with no `tree_order`
+                // anywhere start this at 0.0; we also backfill those
+                // entities with fresh monotonic keys below.
+                let max_loaded = self
+                    .entity_tree_order
+                    .values()
+                    .copied()
+                    .fold(f64::NEG_INFINITY, f64::max);
+                if max_loaded.is_finite() {
+                    self.next_tree_order = max_loaded + 1.0;
+                }
+                // Any loaded entity whose save file predated this
+                // field (or any that slipped through `assign_entity_uuid`)
+                // gets a fresh key now, appended after the loaded set.
+                for (entity, _) in self.world.query::<&crate::components::EditorMetadata>().iter() {
+                    if !self.entity_tree_order.contains_key(&entity) {
+                        let key = self.next_tree_order;
+                        self.next_tree_order += 1.0;
+                        self.entity_tree_order.insert(entity, key);
+                    }
+                }
+
                 self.scene_dirty = true;
                 self.gpu_objects_dirty = true;
             }
@@ -6310,6 +6508,7 @@ impl EngineState {
                 position: transform.position.to_array(),
                 rotation: transform.rotation.to_array(),
                 scale: transform.scale.to_array(),
+                tree_order: self.entity_tree_order.get(&entity).copied(),
                 parent_id: parent.map(|p| p.parent_id),
                 asset_path: renderable.as_ref().and_then(|r| r.asset_path.clone()),
                 primitive: renderable.as_ref().and_then(|r| r.primitive.clone()),
@@ -7299,19 +7498,31 @@ impl EngineState {
 
         let objects = if self.scene_dirty {
             self.scene_dirty = false;
-            // Sort by `Entity::to_bits()` — monotonic per spawn, stable
-            // while alive. Same reason as `update_scene_gpu`: hecs
-            // query iteration order is archetype-dependent, so without
-            // an explicit stable sort the scene-tree rows reshuffle
-            // whenever a new archetype appears. When we add a
-            // user-arrangeable `TreeOrder` component, it overrides
-            // this fallback for entities that carry it.
+            // Sort by `entity_tree_order` — user-arrangeable (via a
+            // future drag-reorder command) and persisted in the scene
+            // file, so the arrangement survives save/reload. Entities
+            // missing from the map (transient edge cases) fall back
+            // to `Entity::to_bits()` as a tiebreaker, which preserves
+            // spawn order for them.
+            //
+            // The editor's scene-tree panel groups by `parent_id`
+            // after the fact, so children of the same parent end up
+            // displayed in their shared TreeOrder order naturally.
             let mut ordered: Vec<hecs::Entity> = self.world
                 .query::<&crate::components::EditorMetadata>()
                 .iter()
                 .map(|(entity, _)| entity)
                 .collect();
-            ordered.sort_by_key(|e| e.to_bits());
+            ordered.sort_by(|a, b| {
+                let ka = self.entity_tree_order.get(a).copied();
+                let kb = self.entity_tree_order.get(b).copied();
+                match (ka, kb) {
+                    (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.to_bits().cmp(&b.to_bits()),
+                }
+            });
 
             let mut objs = Vec::with_capacity(ordered.len());
             for entity in ordered {

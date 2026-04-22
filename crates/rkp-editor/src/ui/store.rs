@@ -156,6 +156,10 @@ pub struct EditorStore {
     pub import_progress: Signal<Vec<rkp_engine::snapshot::ImportProgressInfo>>,
     /// Model path being dragged onto viewport (None = no drag).
     pub model_drag: Signal<Option<String>>,
+    /// Entity UUID being dragged in the scene-tree panel (None = no
+    /// drag). Paired with `scene_tree_drop` events to dispatch
+    /// `EngineCommand::ReorderEntity`.
+    pub scene_tree_drag: Signal<Option<uuid::Uuid>>,
     /// Generator name being dragged onto viewport (None = no drag).
     pub generator_drag: Signal<Option<String>>,
     /// `.rkgen` preset path being dragged onto viewport (None = no drag).
@@ -304,6 +308,7 @@ impl EditorStore {
             importing_models: Signal::new(Vec::new()),
             import_progress: Signal::new(Vec::new()),
             model_drag: Signal::new(None),
+            scene_tree_drag: Signal::new(None),
             generator_drag: Signal::new(None),
             generator_preset_drag: Signal::new(None),
             inspector: Signal::new(None),

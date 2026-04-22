@@ -25,6 +25,11 @@ pub struct SceneObject {
     pub position: [f32; 3],
     pub rotation: [f32; 3],
     pub scale: [f32; 3],
+    /// Scene-tree display order. `None` on old saves / brand-new
+    /// objects; the engine reseeds its counter past the max loaded
+    /// value so post-load spawns still append at the bottom.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_order: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<Uuid>,
     /// Path to the .rkp asset file (relative to project assets/).

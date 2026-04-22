@@ -257,6 +257,17 @@ pub enum EngineCommand {
         new_parent: Option<Uuid>,
     },
 
+    /// Scene-tree drag-reorder: move `entity` so it sits relative to
+    /// `target` as specified by `position`. `Before`/`After` keep
+    /// siblings under the target's parent (or reparent if crossing
+    /// parents); `Inside` reparents `entity` as a child of `target`,
+    /// appended at the end.
+    ReorderEntity {
+        entity: Uuid,
+        target: Uuid,
+        position: DropPosition,
+    },
+
     // ── Geometry operations ──────────────────────────────────────────
 
     /// Convert an analytical primitive to a voxelized object.
@@ -611,6 +622,20 @@ pub enum PaintMode {
     Color,
     Material,
     Erase,
+}
+
+/// Where a drag-reorder operation drops the entity relative to its
+/// target row in the scene tree. Editor derives this from the cursor's
+/// vertical position within the row (top third / middle / bottom).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropPosition {
+    /// Insert as the sibling immediately before `target`.
+    Before,
+    /// Insert as the sibling immediately after `target`.
+    After,
+    /// Re-parent so `target` becomes the new parent; append as the
+    /// last child.
+    Inside,
 }
 
 /// What's being dragged into the viewport for a live preview. The

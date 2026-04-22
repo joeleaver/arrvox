@@ -84,6 +84,43 @@ fn tree_node(
                         onclick: move || {
                             let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SelectEntity { entity_id: id });
                         },
+                        draggable: "true",
+                        ondragstart: move || {
+                            store.scene_tree_drag.set(Some(id));
+                        },
+                        ondragend: move || {
+                            store.scene_tree_drag.set(None);
+                        },
+                        // `ondragover` must exist for the row to accept
+                        // drops. We don't compute live drop-position
+                        // feedback here — ondrop reads the cursor
+                        // position from the click context instead.
+                        ondragover: move || {},
+                        ondrop: move || {
+                            let Some(source_id) = store.scene_tree_drag.get() else { return };
+                            // Self-drop no-op; the engine would also
+                            // reject it, but short-circuit the command.
+                            if source_id == id { return; }
+                            // Row-relative Y → {Before, Inside, After}.
+                            // Top/bottom 30 % are sibling insertion;
+                            // middle 40 % re-parents inside target.
+                            let ctx = rinch::core::get_click_context();
+                            let h = ctx.element_height.max(1.0);
+                            let rel_y = (ctx.mouse_y - ctx.element_y).max(0.0) / h;
+                            let position = if rel_y < 0.30 {
+                                rkp_engine::DropPosition::Before
+                            } else if rel_y > 0.70 {
+                                rkp_engine::DropPosition::After
+                            } else {
+                                rkp_engine::DropPosition::Inside
+                            };
+                            let _ = cmd_tx.get().send(rkp_engine::EngineCommand::ReorderEntity {
+                                entity: source_id,
+                                target: id,
+                                position,
+                            });
+                            store.scene_tree_drag.set(None);
+                        },
 
                         // Chevron
                         if has_children.get() {
