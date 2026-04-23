@@ -150,9 +150,19 @@ impl EngineState {
                 if let Some(def) = self.material_lib.get_def_mut(material_id) {
                     match field.as_str() {
                         "name" => { def.name = value; }
-                        "base_color" => {
-                            if let Ok(v) = serde_json::from_str::<[f32; 4]>(&value) {
-                                def.base_color = v;
+                        "albedo" => {
+                            if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) {
+                                def.albedo = v;
+                            }
+                        }
+                        "emission_color" => {
+                            if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) {
+                                def.emission_color = v;
+                            }
+                        }
+                        "subsurface_color" => {
+                            if let Ok(v) = serde_json::from_str::<[f32; 3]>(&value) {
+                                def.subsurface_color = v;
                             }
                         }
                         "roughness" => {
@@ -164,11 +174,27 @@ impl EngineState {
                         "emission_strength" => {
                             if let Ok(v) = value.parse::<f32>() { def.emission_strength = v; }
                         }
+                        "subsurface" => {
+                            if let Ok(v) = value.parse::<f32>() { def.subsurface = v; }
+                        }
                         "opacity" => {
                             if let Ok(v) = value.parse::<f32>() { def.opacity = v; }
                         }
+                        "ior" => {
+                            if let Ok(v) = value.parse::<f32>() { def.ior = v; }
+                        }
+                        "noise_scale" => {
+                            if let Ok(v) = value.parse::<f32>() { def.noise_scale = v; }
+                        }
+                        "noise_strength" => {
+                            if let Ok(v) = value.parse::<f32>() { def.noise_strength = v; }
+                        }
+                        "noise_channels" => {
+                            if let Ok(v) = value.parse::<u32>() { def.noise_channels = v; }
+                        }
                         _ => { eprintln!("[RkpEngine] unknown material field: {field}"); }
                     }
+                    self.material_lib.mark_dirty();
                     let _ = self.material_lib.save(material_id);
                 }
             }
@@ -209,6 +235,28 @@ impl EngineState {
                     if count > 0 {
                         eprintln!("[RkpEngine] remapped {count} voxels from material {from_material} to {to_material}");
                         self.geometry_dirty = true;
+                        if let Ok(mut r) =
+                            self.world.get::<&mut crate::components::Renderable>(entity)
+                        {
+                            // Record the remap so it survives save/load.
+                            Self::compose_material_override(
+                                &mut r.material_overrides,
+                                from_material,
+                                to_material,
+                            );
+                            // Also track the latest-remap as the
+                            // entity's default material. INTERIOR
+                            // subtrees (fully-solid bulk regions
+                            // produced by the voxelizer) have no
+                            // per-voxel material and fall back to
+                            // this at march time; without updating
+                            // it, a glass remap leaves the cube's
+                            // interior rendering as whatever material
+                            // was here first (typically the opaque
+                            // Default), so only the surface shell
+                            // reads as glass.
+                            r.material_id = to_material;
+                        }
                     }
                 }
             }

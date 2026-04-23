@@ -130,6 +130,11 @@ impl ProcRaymarchPass {
                     bgl_storage_tex(1, wgpu::TextureFormat::Rgba16Float),
                     bgl_storage_tex(2, wgpu::TextureFormat::Rg32Uint),
                     bgl_storage_tex(3, wgpu::TextureFormat::R32Uint),
+                    // Glass target — procedural primitives don't do
+                    // glass (yet); the shader writes 0 to keep this
+                    // buffer coherent with what octree_march wrote
+                    // elsewhere in the frame.
+                    bgl_storage_tex(4, wgpu::TextureFormat::Rg32Uint),
                 ],
             });
 
@@ -260,6 +265,7 @@ impl ProcRaymarchPass {
     /// Wire the viewport's G-buffer views into this pass. Re-call after
     /// a G-buffer resize. `pick_view` is the rkp-side `R32Uint` pick
     /// texture that receives the hit primitive's NodeId.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_gbuffer(
         &mut self,
         device: &wgpu::Device,
@@ -267,6 +273,7 @@ impl ProcRaymarchPass {
         normal_view: &wgpu::TextureView,
         material_view: &wgpu::TextureView,
         pick_view: &wgpu::TextureView,
+        glass_view: &wgpu::TextureView,
     ) {
         self.gbuffer_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("proc_raymarch gbuffer"),
@@ -287,6 +294,10 @@ impl ProcRaymarchPass {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(pick_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(glass_view),
                 },
             ],
         }));

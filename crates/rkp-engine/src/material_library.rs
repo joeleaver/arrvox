@@ -14,14 +14,23 @@ use serde::{Deserialize, Serialize};
 
 // ── On-disk format (.rkmat) ──────────────────────────────────────────────
 
-fn default_base_color() -> [f32; 4] {
-    [0.8, 0.8, 0.8, 1.0]
+fn default_albedo() -> [f32; 3] {
+    [0.8, 0.8, 0.8]
 }
 fn default_roughness() -> f32 {
     0.5
 }
+fn default_emission_color() -> [f32; 3] {
+    [0.0, 0.0, 0.0]
+}
+fn default_subsurface_color() -> [f32; 3] {
+    [1.0, 0.8, 0.6]
+}
 fn default_opacity() -> f32 {
     1.0
+}
+fn default_ior() -> f32 {
+    1.5
 }
 
 /// Material definition — serialized to/from `.rkmat` JSON files.
@@ -31,16 +40,38 @@ pub struct MaterialDef {
     /// Path to a `.rkshader` file (future use — stored but not compiled yet).
     #[serde(default)]
     pub shader: Option<String>,
-    #[serde(default = "default_base_color")]
-    pub base_color: [f32; 4],
+
+    // PBR baseline
+    #[serde(default = "default_albedo")]
+    pub albedo: [f32; 3],
     #[serde(default = "default_roughness")]
     pub roughness: f32,
     #[serde(default)]
     pub metallic: f32,
+    #[serde(default = "default_emission_color")]
+    pub emission_color: [f32; 3],
     #[serde(default)]
     pub emission_strength: f32,
+
+    // Subsurface + translucency
+    #[serde(default)]
+    pub subsurface: f32,
+    #[serde(default = "default_subsurface_color")]
+    pub subsurface_color: [f32; 3],
     #[serde(default = "default_opacity")]
     pub opacity: f32,
+    #[serde(default = "default_ior")]
+    pub ior: f32,
+
+    // Procedural variation
+    #[serde(default)]
+    pub noise_scale: f32,
+    #[serde(default)]
+    pub noise_strength: f32,
+    /// Bit 0 = albedo, bit 1 = roughness, bit 2 = normal perturbation.
+    #[serde(default)]
+    pub noise_channels: u32,
+
     /// Shader-specific parameters (future use).
     #[serde(default)]
     pub shader_params: HashMap<String, serde_json::Value>,
@@ -51,25 +82,41 @@ impl Default for MaterialDef {
         Self {
             name: "Default".into(),
             shader: None,
-            base_color: default_base_color(),
+            albedo: default_albedo(),
             roughness: default_roughness(),
             metallic: 0.0,
+            emission_color: default_emission_color(),
             emission_strength: 0.0,
+            subsurface: 0.0,
+            subsurface_color: default_subsurface_color(),
             opacity: default_opacity(),
+            ior: default_ior(),
+            noise_scale: 0.0,
+            noise_strength: 0.0,
+            noise_channels: 0,
             shader_params: HashMap::new(),
         }
     }
 }
 
 impl MaterialDef {
-    /// Convert to the 32-byte GPU struct.
+    /// Convert to the 96-byte GPU struct.
     pub fn to_gpu(&self) -> GpuMaterial {
         GpuMaterial {
-            base_color: self.base_color,
-            metallic: self.metallic,
+            albedo: self.albedo,
             roughness: self.roughness,
+            metallic: self.metallic,
+            emission_color: self.emission_color,
             emission_strength: self.emission_strength,
+            subsurface: self.subsurface,
+            subsurface_color: self.subsurface_color,
             opacity: self.opacity,
+            ior: self.ior,
+            noise_scale: self.noise_scale,
+            noise_strength: self.noise_strength,
+            noise_channels: self.noise_channels,
+            shader_id: 0,
+            _padding: [0.0; 5],
         }
     }
 }
@@ -83,17 +130,25 @@ pub struct MaterialInfo {
     pub name: String,
     /// Path relative to project root (e.g. "assets/materials/wood.rkmat").
     pub path: String,
-    pub base_color: [f32; 4],
+    pub albedo: [f32; 3],
     pub roughness: f32,
     pub metallic: f32,
+    pub emission_color: [f32; 3],
     pub emission_strength: f32,
+    pub subsurface: f32,
+    pub subsurface_color: [f32; 3],
     pub opacity: f32,
+    pub ior: f32,
+    pub noise_scale: f32,
+    pub noise_strength: f32,
+    pub noise_channels: u32,
 }
 
 // ── Internal slot representation ─────────────────────────────────────────
 
 enum MaterialSlot {
-    /// Slot 0 only — the built-in default material.
+    /// Slot 0 only — the built-in default material. Immutable fallback;
+    /// not editable. Users create real materials via `create()`.
     Default,
     /// Loaded from a `.rkmat` file.
     Loaded { path: PathBuf, def: MaterialDef },
@@ -334,15 +389,23 @@ impl MaterialLibrary {
         let mut infos = Vec::new();
 
         // Include slot 0 (default) so the UI can show it.
+        let d = MaterialDef::default();
         infos.push(MaterialInfo {
             id: 0,
             name: "Default".into(),
             path: String::new(),
-            base_color: default_base_color(),
-            roughness: default_roughness(),
-            metallic: 0.0,
-            emission_strength: 0.0,
-            opacity: default_opacity(),
+            albedo: d.albedo,
+            roughness: d.roughness,
+            metallic: d.metallic,
+            emission_color: d.emission_color,
+            emission_strength: d.emission_strength,
+            subsurface: d.subsurface,
+            subsurface_color: d.subsurface_color,
+            opacity: d.opacity,
+            ior: d.ior,
+            noise_scale: d.noise_scale,
+            noise_strength: d.noise_strength,
+            noise_channels: d.noise_channels,
         });
 
         for (i, slot) in self.slots.iter().enumerate().skip(1) {
@@ -356,11 +419,18 @@ impl MaterialLibrary {
                     id: i as u16,
                     name: def.name.clone(),
                     path: rel_path,
-                    base_color: def.base_color,
+                    albedo: def.albedo,
                     roughness: def.roughness,
                     metallic: def.metallic,
+                    emission_color: def.emission_color,
                     emission_strength: def.emission_strength,
+                    subsurface: def.subsurface,
+                    subsurface_color: def.subsurface_color,
                     opacity: def.opacity,
+                    ior: def.ior,
+                    noise_scale: def.noise_scale,
+                    noise_strength: def.noise_strength,
+                    noise_channels: def.noise_channels,
                 });
             }
         }
@@ -386,6 +456,13 @@ impl MaterialLibrary {
     /// Clear the UI dirty flag.
     pub fn clear_ui_dirty(&mut self) {
         self.ui_dirty = false;
+    }
+
+    /// Mark both the GPU palette and UI material list as stale. Called
+    /// after any external field edit via `get_def_mut`.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.ui_dirty = true;
     }
 
     // ── Private helpers ──────────────────────────────────────────────────
@@ -421,7 +498,7 @@ fn starter_materials() -> Vec<(&'static str, MaterialDef)> {
             "stone.rkmat",
             MaterialDef {
                 name: "Stone".into(),
-                base_color: [0.55, 0.53, 0.50, 1.0],
+                albedo: [0.55, 0.53, 0.50],
                 roughness: 0.85,
                 metallic: 0.0,
                 ..Default::default()
@@ -431,7 +508,7 @@ fn starter_materials() -> Vec<(&'static str, MaterialDef)> {
             "wood.rkmat",
             MaterialDef {
                 name: "Wood".into(),
-                base_color: [0.55, 0.35, 0.18, 1.0],
+                albedo: [0.55, 0.35, 0.18],
                 roughness: 0.75,
                 metallic: 0.0,
                 ..Default::default()
@@ -441,7 +518,7 @@ fn starter_materials() -> Vec<(&'static str, MaterialDef)> {
             "metal.rkmat",
             MaterialDef {
                 name: "Metal".into(),
-                base_color: [0.77, 0.78, 0.78, 1.0],
+                albedo: [0.77, 0.78, 0.78],
                 roughness: 0.25,
                 metallic: 1.0,
                 ..Default::default()
@@ -451,7 +528,7 @@ fn starter_materials() -> Vec<(&'static str, MaterialDef)> {
             "gold.rkmat",
             MaterialDef {
                 name: "Gold".into(),
-                base_color: [1.0, 0.84, 0.0, 1.0],
+                albedo: [1.0, 0.84, 0.0],
                 roughness: 0.3,
                 metallic: 1.0,
                 ..Default::default()
@@ -461,7 +538,7 @@ fn starter_materials() -> Vec<(&'static str, MaterialDef)> {
             "brick.rkmat",
             MaterialDef {
                 name: "Brick".into(),
-                base_color: [0.65, 0.30, 0.22, 1.0],
+                albedo: [0.65, 0.30, 0.22],
                 roughness: 0.9,
                 metallic: 0.0,
                 ..Default::default()
@@ -471,7 +548,7 @@ fn starter_materials() -> Vec<(&'static str, MaterialDef)> {
             "glass.rkmat",
             MaterialDef {
                 name: "Glass".into(),
-                base_color: [0.9, 0.95, 1.0, 1.0],
+                albedo: [0.9, 0.95, 1.0],
                 roughness: 0.05,
                 metallic: 0.0,
                 opacity: 0.3,
@@ -482,7 +559,8 @@ fn starter_materials() -> Vec<(&'static str, MaterialDef)> {
             "emissive.rkmat",
             MaterialDef {
                 name: "Emissive".into(),
-                base_color: [1.0, 0.95, 0.8, 1.0],
+                albedo: [1.0, 0.95, 0.8],
+                emission_color: [1.0, 0.95, 0.8],
                 roughness: 0.5,
                 metallic: 0.0,
                 emission_strength: 5.0,
@@ -493,7 +571,7 @@ fn starter_materials() -> Vec<(&'static str, MaterialDef)> {
             "white.rkmat",
             MaterialDef {
                 name: "White".into(),
-                base_color: [0.95, 0.95, 0.95, 1.0],
+                albedo: [0.95, 0.95, 0.95],
                 roughness: 0.5,
                 metallic: 0.0,
                 ..Default::default()

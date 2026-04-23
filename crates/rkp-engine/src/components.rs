@@ -52,6 +52,16 @@ pub struct Renderable {
     /// doesn't use this (it owns its octree exclusively).
     #[serde(skip)]
     pub asset_handle: Option<rkp_render::AssetHandle>,
+    /// Per-voxel material remaps applied to this entity, preserved
+    /// across save/load. Each `(orig, current)` pair means "voxels
+    /// that loaded with `orig` as their primary material are now
+    /// showing `current` after the user dragged a material onto the
+    /// entity." On scene save this is written verbatim to
+    /// `SceneObject::material_overrides`; on load, after the entity's
+    /// voxels are acquired from the asset / cache, each pair is
+    /// replayed via `remap_entity_material`.
+    #[serde(default)]
+    pub material_overrides: Vec<(u16, u16)>,
 }
 
 /// Octree spatial data for a renderable entity. Not serialized — rebuilt on load.

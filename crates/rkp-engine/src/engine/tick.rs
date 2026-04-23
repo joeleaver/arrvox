@@ -296,6 +296,15 @@ impl EngineState {
                         + inst_hz * RENDER_HZ_EMA_ALPHA;
                 }
             }
+            // Same EMA treatment for the delivered-frame rate, fed
+            // only when a pixel ship actually fired.
+            if let Some(dt_ms) = result.delivered_dt_ms {
+                if dt_ms > 0.0 {
+                    let inst_hz = 1000.0 / dt_ms;
+                    self.delivered_hz_ema = self.delivered_hz_ema * (1.0 - RENDER_HZ_EMA_ALPHA)
+                        + inst_hz * RENDER_HZ_EMA_ALPHA;
+                }
+            }
         }
         if let Some(a) = latest_atten {
             self.last_cloud_sun_atten_raw = a;

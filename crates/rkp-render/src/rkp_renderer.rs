@@ -74,11 +74,20 @@ impl RkpRenderer {
             params: [0.0; 4],
         };
         let default_material = GpuMaterial {
-            base_color: [0.8, 0.8, 0.8, 1.0],
-            metallic: 0.0,
+            albedo: [0.8, 0.8, 0.8],
             roughness: 0.5,
+            metallic: 0.0,
+            emission_color: [0.0, 0.0, 0.0],
             emission_strength: 0.0,
+            subsurface: 0.0,
+            subsurface_color: [1.0, 0.8, 0.6],
             opacity: 1.0,
+            ior: 1.5,
+            noise_scale: 0.0,
+            noise_strength: 0.0,
+            noise_channels: 0,
+            shader_id: 0,
+            _padding: [0.0; 5],
         };
 
         let shade_params_buffer = Self::create_init_buffer(device, "rkp_shade_params",
@@ -274,7 +283,11 @@ impl RkpRenderer {
             self.profiler.end_query(encoder, q);
         }
 
-        // 4. Volumetric march + composite (in-situ only).
+        // 4. Volumetric march + composite (in-situ only). Runs
+        // before glass so clouds / fog land in the "behind" HDR
+        // and are refracted / Beer-tinted through any glass in
+        // front of them, rather than stamping over the glass
+        // composite.
         if in_situ {
             let q = self.profiler.begin_query("vol", encoder);
             // Fog + cloud are separate passes now. Fog runs over every pixel
@@ -312,7 +325,18 @@ impl RkpRenderer {
             );
         }
 
-        // 4b. God rays (in-situ only). Isolation copies the volumetric
+        // 4a. Glass composite — reads the (volumetric-composited)
+        // HDR + gbuf_glass, applies Fresnel + Beer + screen-space
+        // refraction for any pixel whose primary ray passed
+        // through transparent voxels, writes to its own HDR target.
+        // Downstream god_rays sources from `glass.output_view`.
+        {
+            let q = self.profiler.begin_query("glass", encoder);
+            viewport.glass.dispatch(encoder);
+            self.profiler.end_query(encoder, q);
+        }
+
+        // 4b. God rays (in-situ only). Isolation copies the glass
         // output forward into god_rays.output so bloom_composite's HDR
         // input is correct.
         if in_situ {
@@ -322,7 +346,7 @@ impl RkpRenderer {
         } else {
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
-                    texture: &viewport.volumetric.output_texture,
+                    texture: &viewport.glass.output_texture,
                     mip_level: 0, origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },

@@ -47,6 +47,13 @@ pub struct SceneObject {
     pub procedural_cache: Option<String>,
     #[serde(default)]
     pub material_id: u16,
+    /// Per-voxel material remaps applied to this entity's shared
+    /// asset/cache geometry. Each pair is `(original_material_id,
+    /// current_material_id)`. Empty for entities where the user
+    /// hasn't dragged a material onto them; non-empty entries are
+    /// replayed via `remap_entity_material` after load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub material_overrides: Vec<(u16, u16)>,
     /// PointLight component data (if entity has one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub point_light: Option<ScenePointLight>,

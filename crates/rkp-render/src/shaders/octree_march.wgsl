@@ -140,12 +140,24 @@ struct GpuLight {
     params: vec4<f32>,     // x = range, y = inner_angle, z = shadow_softness, w = cast_shadow
 }
 
+// vec3 fields flattened to f32 components — see rkp_shade.wgsl for the
+// full rationale (WGSL vec3 alignment would pad this to 128 bytes, but
+// the Rust/GpuMaterial is tightly packed at 96).
 struct GpuMaterial {
-    base_color: vec4<f32>,
-    metallic: f32,
+    albedo_r: f32, albedo_g: f32, albedo_b: f32,
     roughness: f32,
+    metallic: f32,
+    emission_r: f32, emission_g: f32, emission_b: f32,
     emission_strength: f32,
+    subsurface: f32,
+    subsurface_r: f32, subsurface_g: f32, subsurface_b: f32,
     opacity: f32,
+    ior: f32,
+    noise_scale: f32,
+    noise_strength: f32,
+    noise_channels: u32,
+    shader_id: u32,
+    _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32, _pad5: f32,
 }
 
 struct OctreeResult {
@@ -242,6 +254,9 @@ fn brick_id_of(node: u32) -> u32 {
 // slot in `gbuf_material`'s G channel, which capped pickable scenes at
 // 255 entries.
 @group(1) @binding(3) var gbuf_pick: texture_storage_2d<r32uint, write>;
+// Glass info — oct-packed normal in R, (thickness_mm << 16 | material_id) in G.
+// Zero in both channels = "no glass at this pixel."
+@group(1) @binding(4) var gbuf_glass: texture_storage_2d<rg32uint, write>;
 
 @group(2) @binding(0) var<uniform> march_params: MarchParams;
 @group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
@@ -610,6 +625,39 @@ struct MarchResult {
     first_slot: u32,        // voxel_pool slot (already dereferenced from leaf_attr)
     valid: bool,
     steps: u32,             // total steps taken (for profiling)
+    // Glass tracking. Set when the ray traverses at least one
+    // transparent voxel (material opacity < 0.99) before landing on
+    // the opaque `first_slot` (or exiting the object without one).
+    // `glass_normal` is the front-face normal in oc-space, same
+    // basis as `normal`. `glass_enter_t` is the ray parameter at
+    // first glass contact, `glass_exit_t` is updated on each
+    // subsequent glass cell; together they yield a thickness proxy
+    // (entry → last-glass-cell). World-space conversion happens in
+    // `main()` where the object-to-world scale is in scope.
+    glass_valid: bool,
+    glass_normal: vec3<f32>,
+    glass_material: u32,
+    glass_enter_t: f32,
+    glass_exit_t: f32,
+}
+
+// Pack a unit normal into an oct u32 — mirror of `unpack_oct_normal`
+// above, same basis rkp_core / skin_deform use.
+fn pack_oct_normal(n: vec3<f32>) -> u32 {
+    let l1 = abs(n.x) + abs(n.y) + abs(n.z);
+    let n1 = n / max(l1, 1e-8);
+    var u = n1.x;
+    var v = n1.y;
+    if n1.z < 0.0 {
+        let ox = u;
+        u = (1.0 - abs(v)) * select(-1.0, 1.0, ox >= 0.0);
+        v = (1.0 - abs(ox)) * select(-1.0, 1.0, v  >= 0.0);
+    }
+    let ui = i32(clamp(u, -1.0, 1.0) * 32767.0);
+    let vi = i32(clamp(v, -1.0, 1.0) * 32767.0);
+    let ul = u32(ui & 0xFFFF);
+    let vl = u32(vi & 0xFFFF);
+    return ul | (vl << 16u);
 }
 
 // ── Phase-3b: skinned march — deformed-field lookup ──────────────────
@@ -689,7 +737,11 @@ fn skinned_brick_exit_t(
 fn march_object_skinned(
     world_origin: vec3<f32>, world_dir: vec3<f32>, obj: RkpObject,
 ) -> MarchResult {
-    var result = MarchResult(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0.0, 0.0, 0u, false, 0u);
+    var result = MarchResult(
+        vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0),
+        0.0, 0.0, 0u, false, 0u,
+        false, vec3<f32>(0.0), 0u, 0.0, 0.0,
+    );
 
     let inv_world = obj.inverse_world;
     let local_origin_mesh = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
@@ -808,7 +860,11 @@ fn march_object(
     if obj.is_skinned != 0u && obj.bone_count > 0u && obj.bone_field_dim_x > 0u {
         return march_object_skinned(world_origin, world_dir, obj);
     }
-    var result = MarchResult(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0.0, 0.0, 0u, false, 0u);
+    var result = MarchResult(
+        vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0),
+        0.0, 0.0, 0u, false, 0u,
+        false, vec3<f32>(0.0), 0u, 0.0, 0.0,
+    );
 
     let inv_world = obj.inverse_world;
     let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
@@ -918,9 +974,29 @@ fn march_object(
                     else { face_idx = FACE_PZ; }
                     let link = brick_face_links[brick_id * 6u + face_idx];
                     if link == FACE_INTERIOR {
-                        // Ray entered solid-bulk: opaque hit with a
-                        // face-aligned normal (toward the ray) and
-                        // material default (no per-cell attrs here).
+                        // Ray is about to enter a solid-bulk region
+                        // beyond this brick's face. For a glass object
+                        // (or a ray that has already entered glass),
+                        // the bulk is part of the glass body — we
+                        // want to skip through it. Bail out of the
+                        // brick DDA and let the outer loop handle the
+                        // adjacent INTERIOR_NODE, which my OCTREE_
+                        // INTERIOR handler converts into a glass skip
+                        // with thickness tracking. For non-glass
+                        // objects, keep the original opaque-fallback
+                        // behavior so solid meshes with interior bulk
+                        // still terminate the march here.
+                        let obj_opacity = materials[obj.material_id].opacity;
+                        if obj_opacity < 0.99 || result.glass_valid {
+                            if !result.glass_valid {
+                                result.glass_valid = true;
+                                result.glass_normal = -safe_dir;
+                                result.glass_material = obj.material_id;
+                                result.glass_enter_t = t;
+                            }
+                            result.glass_exit_t = t;
+                            break; // outer loop takes over via skip_node on INTERIOR
+                        }
                         let p = oc_origin + safe_dir * t;
                         result.oc_pos = p;
                         result.normal = -safe_dir;
@@ -971,6 +1047,27 @@ fn march_object(
                 let flat = cx + cy * BRICK_DIM + cz * BRICK_DIM * BRICK_DIM;
                 let c = brick_pool[brick_base + flat];
 
+                // BRICK_CELL_INTERIOR cells are mesh-import solid bulk
+                // markers with no per-cell leaf_attr. For glass objects
+                // they still want to contribute thickness — treat
+                // them the same way we treat an OCTREE_INTERIOR node:
+                // if the object is glass (or we're already in glass),
+                // record / extend glass and move on. Non-glass objects
+                // keep the original "skip like empty air" semantics.
+                if c == BRICK_CELL_INTERIOR {
+                    let obj_opacity = materials[obj.material_id].opacity;
+                    if obj_opacity < 0.99 || result.glass_valid {
+                        if !result.glass_valid {
+                            result.glass_valid = true;
+                            result.glass_normal = -safe_dir;
+                            result.glass_material = obj.material_id;
+                            result.glass_enter_t = t;
+                        }
+                        result.glass_exit_t = t;
+                    }
+                    // Fall through to DDA step (skip either way).
+                }
+
                 // BRICK_CELL_INTERIOR cells are solid-bulk markers set
                 // by mesh imports; skip them identically to empty air
                 // so the march only ever stops on the visible shell.
@@ -990,10 +1087,11 @@ fn march_object(
                     let mid = leaf_attr_material_primary(attr);
                     atomicAdd(&stats[47], 1u); // materials read
                     let m_opacity = materials[mid].opacity;
-                    let p = oc_origin + safe_dir * t;
 
                     if m_opacity >= 0.99 {
-                        // Opaque hit — finalize result and exit both loops.
+                        // Opaque — this is the primary hit (the
+                        // "behind" the glass, if any).
+                        let p = oc_origin + safe_dir * t;
                         result.oc_pos = p;
                         result.normal = cell_normal;
                         result.alpha = 1.0;
@@ -1014,31 +1112,23 @@ fn march_object(
                         result.steps = step_count;
                         brick_done = true;
                         break;
-                    }
-
-                    // Transparent: accumulate with this cell's weight.
-                    // DDA step below advances exactly one cell — each
-                    // cell contributes once per ray traversal.
-                    let remaining = 1.0 - result.alpha;
-                    let weight = m_opacity * remaining;
-                    result.oc_pos += p * weight;
-                    result.normal += cell_normal * weight;
-                    var color = vec3<f32>(0.5);
-                    atomicAdd(&stats[46], 1u);
-                    let cp_t = color_pool_data[c];
-                    if cp_t != 0u {
-                        color = vec3<f32>(
-                            f32(cp_t & 0xFFu) / 255.0,
-                            f32((cp_t >> 8u) & 0xFFu) / 255.0,
-                            f32((cp_t >> 16u) & 0xFFu) / 255.0,
-                        );
-                    }
-                    result.color += color * weight;
-                    result.alpha += weight;
-                    if !result.valid {
-                        result.t = t;
-                        result.first_slot = c;
-                        result.valid = true;
+                    } else {
+                        // Glass cell — record entry the first time,
+                        // update exit every time, but keep marching
+                        // to find the opaque behind. Normal of the
+                        // glass surface = the entry cell's normal,
+                        // which points OUT of the glass body (toward
+                        // the camera for a front-face hit). Subsequent
+                        // glass cells don't overwrite the normal —
+                        // the front face is what matters for Fresnel.
+                        if !result.glass_valid {
+                            result.glass_valid = true;
+                            result.glass_normal = cell_normal;
+                            result.glass_material = mid;
+                            result.glass_enter_t = t;
+                        }
+                        result.glass_exit_t = t;
+                        // Fall through to DDA step below.
                     }
                 }
 
@@ -1061,63 +1151,87 @@ fn march_object(
             continue;
         }
 
-        // Every leaf is a surface voxel. Material drives coverage for the
-        // transparency compositing path; opacity-as-geometry is gone.
+        // Leaf / INTERIOR hit. Opaque cells are a first-surface stop
+        // (primary hit / behind-glass). Transparent cells record
+        // themselves as glass-in-front and the march continues so
+        // we can deliver the opaque behind to the G-buffer.
+        //
+        // INTERIOR handling is split by whether we've already
+        // entered glass:
+        //  - Not in glass yet: an INTERIOR node means we entered
+        //    solid bulk directly (e.g. a non-glass opaque primitive
+        //    collapsed to an INTERIOR subtree); treat as an opaque
+        //    hit with a ray-opposite normal fallback, same as the
+        //    pre-glass code.
+        //  - Already in glass: the INTERIOR subtree is part of the
+        //    glass body (solid voxelized primitives fill their
+        //    interior). Skip past it via `skip_node` so we reach
+        //    the opaque surface behind instead of stopping here.
+        // INTERIOR subtrees (fully-solid bulk regions produced by the
+        // voxelizer when a whole subtree is inside the object) carry
+        // no per-voxel material — `RemapMaterial` can't reach them.
+        // Treat them as the object's default material so a glass
+        // cube whose interior collapsed to INTERIOR_NODE still reads
+        // as glass throughout. The object's `material_id` IS updated
+        // by `AssignMaterial` / scene load / drag-drop, so this
+        // reliably reflects the user's intent.
+        if r.slot == OCTREE_INTERIOR {
+            let obj_opacity = materials[obj.material_id].opacity;
+            if obj_opacity < 0.99 || result.glass_valid {
+                // Glass bulk — skip through, growing thickness.
+                if !result.glass_valid {
+                    result.glass_valid = true;
+                    result.glass_normal = -safe_dir;
+                    result.glass_material = obj.material_id;
+                    result.glass_enter_t = t;
+                }
+                t += skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs);
+                result.glass_exit_t = max(result.glass_exit_t, t);
+                continue;
+            }
+        }
+
         var leaf_id = 0u;                  // leaf_attr_id for this hit (for main())
-        var mat_opacity = 1.0;
-        var first_mat = 0u;
         // For INTERIOR (fully opaque bulk region) we have no stored normal —
-        // the ray-opposite is a cheap safe default. Surface hits land on
-        // LEAF, not INTERIOR, so this rarely governs shading.
+        // the ray-opposite is a cheap safe default.
         var sample_normal = -safe_dir;
+        var mid = 0u;
+        var m_opacity = 1.0;
         if r.slot != OCTREE_INTERIOR {
             atomicAdd(&stats[44], 1u); // leaf_attr read
             let attr = leaf_attr_pool[r.slot];
             leaf_id = r.slot;
             sample_normal = unpack_oct_normal(attr.normal_oct);
-            first_mat = leaf_attr_material_primary(attr);
+            mid = leaf_attr_material_primary(attr);
             atomicAdd(&stats[47], 1u); // materials read
-            mat_opacity = materials[first_mat].opacity;
+            m_opacity = materials[mid].opacity;
         }
 
-        let sample_opacity = mat_opacity;
-
-        // Opaque material: first hit wins — no accumulation needed.
-        if mat_opacity >= 0.99 {
-            result.oc_pos = pos;
-            result.normal = sample_normal;
-            result.alpha = 1.0;
-            result.t = t;
-            result.first_slot = leaf_id;
-            result.valid = true;
-            var color = vec3<f32>(0.5);
-            // Only LEAF hits have a color; INTERIOR hits keep the gray default.
-            // We can't key off leaf_id == 0 because slot 0 is a valid pool
-            // allocation — that would mis-render the first-allocated leaf.
-            if r.slot != OCTREE_INTERIOR {
-                atomicAdd(&stats[46], 1u); // color_pool read
-                let cp = color_pool_data[leaf_id];
-                if cp != 0u {
-                    color = vec3<f32>(
-                        f32(cp & 0xFFu) / 255.0,
-                        f32((cp >> 8u) & 0xFFu) / 255.0,
-                        f32((cp >> 16u) & 0xFFu) / 255.0,
-                    );
-                }
+        if m_opacity < 0.99 {
+            // Glass — record entry, keep marching. Leaf path
+            // advances by half a voxel at a time (see below), so
+            // updating glass_exit_t every visit gives thickness.
+            if !result.glass_valid {
+                result.glass_valid = true;
+                result.glass_normal = sample_normal;
+                result.glass_material = mid;
+                result.glass_enter_t = t;
             }
-            result.color = color;
-            result.steps = step_count;
-            break; // done — opaque hit
+            result.glass_exit_t = t;
+            t += vs * 0.5;
+            continue;
         }
 
-        // Transparent material: front-to-back compositing.
-        let remaining = 1.0 - result.alpha;
-        let weight = sample_opacity * remaining;
-
-        result.oc_pos += pos * weight;
-        result.normal += sample_normal * weight;
-
+        result.oc_pos = pos;
+        result.normal = sample_normal;
+        result.alpha = 1.0;
+        result.t = t;
+        result.first_slot = leaf_id;
+        result.valid = true;
         var color = vec3<f32>(0.5);
+        // Only LEAF hits have a color; INTERIOR hits keep the gray default.
+        // We can't key off leaf_id == 0 because slot 0 is a valid pool
+        // allocation — that would mis-render the first-allocated leaf.
         if r.slot != OCTREE_INTERIOR {
             atomicAdd(&stats[46], 1u); // color_pool read
             let cp = color_pool_data[leaf_id];
@@ -1129,17 +1243,9 @@ fn march_object(
                 );
             }
         }
-        result.color += color * weight;
-        result.alpha += weight;
-
-        // First hit — record for depth and material.
-        if !result.valid {
-            result.t = t;
-            result.first_slot = leaf_id;
-            result.valid = true;
-        }
-
-        t += vs * 0.5;
+        result.color = color;
+        result.steps = step_count;
+        break; // done — first-surface hit
     }
 
     result.steps = step_count;
@@ -1201,6 +1307,30 @@ fn main(
     var have_first = false;
     var max_world_dist = 1e20; // world-space distance to closest opaque hit
     var closest_obj_idx = 0xFFFFFFFFu; // index of closest hit object (for shadow skip)
+
+    // Pick tracking — distinct from the shaded "first opaque hit"
+    // accumulators above. Picking wants the FIRST surface the ray
+    // touched, whether it was glass or opaque, so clicking on a
+    // glass cube selects the cube rather than punching through to
+    // whatever's behind it. Seeded to infinity; replaced on each
+    // closer glass entry or opaque hit.
+    var pick_obj_id = 0xFFFFFFFFu;
+    var pick_dist = 1e20;
+
+    // Glass accumulator — tracked across objects so a glass pane on
+    // object A properly tints the shaded surface of object B behind
+    // it. `glass_enter_dist` is the nearest glass front-face world
+    // distance, `glass_exit_dist` the deepest glass-cell world
+    // distance from that object; their difference is the thickness
+    // proxy (entry → last-glass-cell, over-counts air gaps in
+    // nested glass but is correct for the single-pane case). Glass
+    // only contributes to the final pixel if it sits in FRONT of
+    // the closest opaque hit (`glass_enter_dist < max_world_dist`).
+    var glass_have = false;
+    var glass_enter_dist = 1e20;
+    var glass_exit_dist = 0.0;
+    var glass_normal_world = vec3<f32>(0.0, 1.0, 0.0);
+    var glass_material_id = 0u;
     var total_steps = 0u;
 
     for (var k = tile_range_start; k < tile_range_end; k++) {
@@ -1234,6 +1364,33 @@ fn main(
         // March this object.
         let r = march_object(ray_origin, ray_dir, obj);
         total_steps += r.steps;
+
+        // Pull glass info out of this object's march, if any. Glass
+        // can be present even when `r.valid == false` (ray passed
+        // through glass and exited the object without finding an
+        // opaque cell behind) — useful when the opaque surface is
+        // in a DIFFERENT object behind this one. The winning glass
+        // is the nearest entry-point ahead of the closest opaque
+        // hit.
+        if r.glass_valid {
+            let g_enter = r.glass_enter_t * local_to_world_scale;
+            let g_exit = r.glass_exit_t * local_to_world_scale;
+            if g_enter < glass_enter_dist && g_enter < max_world_dist {
+                glass_have = true;
+                glass_enter_dist = g_enter;
+                glass_exit_dist = g_exit;
+                let world_n = normalize((obj.world * vec4<f32>(r.glass_normal, 0.0)).xyz);
+                glass_normal_world = world_n;
+                glass_material_id = r.glass_material;
+            }
+            // Pick also considers glass hits — click on a glass
+            // cube should select the cube, not the opaque object
+            // behind it.
+            if g_enter < pick_dist {
+                pick_dist = g_enter;
+                pick_obj_id = obj.object_id;
+            }
+        }
 
         if !r.valid { continue; }
 
@@ -1277,6 +1434,10 @@ fn main(
             have_first = true;
             max_world_dist = hit_dist;
             closest_obj_idx = i;
+            if hit_dist < pick_dist {
+                pick_dist = hit_dist;
+                pick_obj_id = obj.object_id;
+            }
             continue;
         }
 
@@ -1322,11 +1483,31 @@ fn main(
         atomicAdd(&stats[40u + bucket], 1u);
     }
 
+    // Pack glass info if the ray passed through any glass in front
+    // of the closest opaque hit (or with no opaque hit, any glass
+    // at all). `thickness_mm` caps at u16::MAX (≈65.5 m) — any
+    // deeper glass clamps harmlessly. `material_id` is u16; it
+    // shares the lower 16 bits of G.
+    var glass_packed = vec2<u32>(0u, 0u);
+    if glass_have {
+        let thickness = max(0.0, min(glass_exit_dist, max_world_dist) - glass_enter_dist);
+        let thickness_mm_raw = u32(clamp(thickness * 1000.0, 1.0, 65535.0));
+        let packed_g = (glass_material_id & 0xFFFFu) | (thickness_mm_raw << 16u);
+        glass_packed = vec2<u32>(pack_oct_normal(glass_normal_world), packed_g);
+    }
+
     if !have_first {
+        // No opaque hit — but the ray may still have touched glass
+        // on its way to the horizon, in which case clicking that
+        // pixel should select the glass object (not pass through
+        // to "sky miss"). Pick channel: use the tracked glass
+        // pick_obj_id when present, else the sky-miss sentinel.
+        let miss_pick_id = select(0xFFFFFFFFu, pick_obj_id, glass_have);
         textureStore(gbuf_position, coord, vec4<f32>(0.0, 0.0, 0.0, 1e10));
         textureStore(gbuf_normal, coord, vec4<f32>(0.0, 0.0, 0.0, 0.0));
         textureStore(gbuf_material, coord, vec4<u32>(0u, 0u, 0u, 0u));
-        textureStore(gbuf_pick, coord, vec4<u32>(0xFFFFFFFFu, 0u, 0u, 0u));
+        textureStore(gbuf_pick, coord, vec4<u32>(miss_pick_id, 0u, 0u, 0u));
+        textureStore(gbuf_glass, coord, vec4<u32>(glass_packed.x, glass_packed.y, 0u, 0u));
         return;
     }
 
@@ -1360,5 +1541,12 @@ fn main(
     textureStore(gbuf_position, coord, vec4<f32>(final_pos, first_dist));
     textureStore(gbuf_normal, coord, vec4<f32>(final_normal_n, accum_alpha));
     textureStore(gbuf_material, coord, vec4<u32>(packed_r, packed_g, 0u, 0u));
-    textureStore(gbuf_pick, coord, vec4<u32>(first_obj_id, 0u, 0u, 0u));
+    // Pick uses the nearest visible surface — either the opaque
+    // hit or a glass entry, whichever came first along the ray.
+    // Falls back to `first_obj_id` (the opaque accumulator) when
+    // no glass was touched, which keeps the no-glass path identical
+    // to the pre-glass behaviour.
+    let pick_id = select(first_obj_id, pick_obj_id, pick_dist < max_world_dist);
+    textureStore(gbuf_pick, coord, vec4<u32>(pick_id, 0u, 0u, 0u));
+    textureStore(gbuf_glass, coord, vec4<u32>(glass_packed.x, glass_packed.y, 0u, 0u));
 }

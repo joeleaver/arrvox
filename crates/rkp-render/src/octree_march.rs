@@ -85,6 +85,11 @@ impl OctreeMarchPass {
                     bgl_storage_tex(1, wgpu::TextureFormat::Rgba16Float),
                     bgl_storage_tex(2, wgpu::TextureFormat::Rg32Uint),
                     bgl_storage_tex(3, wgpu::TextureFormat::R32Uint),
+                    // Glass info target — oct-packed normal + packed
+                    // (thickness_mm, material_id). Written only when
+                    // the primary ray passes through a transparent
+                    // voxel; rkp_shade gates on `thickness_mm != 0`.
+                    bgl_storage_tex(4, wgpu::TextureFormat::Rg32Uint),
                 ],
             });
 
@@ -353,6 +358,7 @@ impl OctreeMarchPass {
     /// Set the G-buffer textures. Call on init and after resize. Shadows are
     /// traced in a separate half-res pass (`rkp_shadow_trace`) that no longer
     /// lives in this pipeline.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_gbuffer(
         &mut self,
         device: &wgpu::Device,
@@ -360,6 +366,7 @@ impl OctreeMarchPass {
         normal_view: &wgpu::TextureView,
         material_view: &wgpu::TextureView,
         pick_view: &wgpu::TextureView,
+        glass_view: &wgpu::TextureView,
     ) {
         self.gbuffer_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("march gbuffer bind group"),
@@ -369,6 +376,7 @@ impl OctreeMarchPass {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(normal_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(material_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(pick_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(glass_view) },
             ],
         }));
     }

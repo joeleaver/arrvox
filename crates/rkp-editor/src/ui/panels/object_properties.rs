@@ -379,11 +379,12 @@ fn MaterialUsageSection() -> NodeHandle {
                         style: "padding:6px 12px;display:flex;flex-direction:column;gap:2px;",
                         for mu in usage.get() {
                             div {
-                                key: format!("{}-{}", entity_id.get(), mu.material_id),
+                                key: format!("{}-{}-{}", entity_id.get(), mu.material_id, mu.is_fallback as u8),
                                 {material_usage_row(
                                     __scope,
                                     mu.material_id,
                                     mu.voxel_count,
+                                    mu.is_fallback,
                                     store,
                                     cmd_tx,
                                 )}
@@ -397,10 +398,16 @@ fn MaterialUsageSection() -> NodeHandle {
 }
 
 /// A single material usage row with swatch, name, count, and drag-drop remap.
+///
+/// When `is_fallback` is true, the entity has no voxel geometry yet —
+/// the drop path sends `AssignMaterial` (writes Renderable.material_id)
+/// instead of `RemapMaterial` (no-op without voxels), and the voxel
+/// count is suppressed.
 fn material_usage_row(
     __scope: &mut rinch::core::dom::RenderScope,
     material_id: u16,
     voxel_count: u32,
+    is_fallback: bool,
     store: EditorStore,
     cmd_tx: CmdSignal,
 ) -> rinch::core::dom::NodeHandle {
@@ -415,7 +422,7 @@ fn material_usage_row(
         store.materials.get()
             .iter()
             .find(|m| m.id == material_id)
-            .map(|m| m.base_color)
+            .map(|m| [m.albedo[0], m.albedo[1], m.albedo[2], 1.0])
             .unwrap_or([0.5, 0.5, 0.5, 1.0])
     });
 
@@ -446,11 +453,19 @@ fn material_usage_row(
                 if let Some(new_mat_id) = store.material_drag.get() {
                     if let Some(snap) = store.inspector.get() {
                         if let Ok(eid) = uuid::Uuid::parse_str(&snap.entity_id) {
-                            let _ = cmd_tx.get().send(rkp_engine::EngineCommand::RemapMaterial {
-                                object_id: eid,
-                                from_material: material_id,
-                                to_material: new_mat_id,
-                            });
+                            let cmd = if is_fallback {
+                                rkp_engine::EngineCommand::AssignMaterial {
+                                    entity_id: eid,
+                                    material_id: new_mat_id,
+                                }
+                            } else {
+                                rkp_engine::EngineCommand::RemapMaterial {
+                                    object_id: eid,
+                                    from_material: material_id,
+                                    to_material: new_mat_id,
+                                }
+                            };
+                            let _ = cmd_tx.get().send(cmd);
                         }
                     }
                     store.material_drag.set(None);
@@ -477,10 +492,12 @@ fn material_usage_row(
                 {move || mat_name.get()}
             }
 
-            // Voxel count
-            div {
-                style: "font-size:10px;color:#666;flex-shrink:0;font-family:monospace;",
-                {count_str}
+            // Voxel count (suppressed for fallback rows — no voxels to count).
+            if !is_fallback {
+                div {
+                    style: "font-size:10px;color:#666;flex-shrink:0;font-family:monospace;",
+                    {count_str.clone()}
+                }
             }
         }
     }

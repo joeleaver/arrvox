@@ -134,6 +134,20 @@ pub fn ProfilingPanel() -> NodeHandle {
                         if f > 0.1 { format!("{:.2} ms", 1000.0 / f) } else { "—".into() }
                     }} }
             }
+            // Delivered FPS = pixels that reached the editor surface per
+            // second. Diverges below Render FPS whenever sim is slower
+            // than render, or the 120 Hz ship cap throttles, or the GPU
+            // is busy enough that `cached_pixels()` isn't ready. This
+            // is the honest "what the user saw" number.
+            div { style: STAT_ROW,
+                span { style: STAT_LABEL, "Delivered FPS" }
+                span { style: STAT_VALUE, {move || format!("{:.0}", store.delivered_fps.get())} }
+                span { style: "color:#777;font-size:10px;",
+                    {move || {
+                        let f = store.delivered_fps.get();
+                        if f > 0.1 { format!("{:.2} ms", 1000.0 / f) } else { "—".into() }
+                    }} }
+            }
             div { style: STAT_ROW,
                 span { style: STAT_LABEL, "Sim Hz" }
                 span { style: STAT_VALUE, {move || format!("{:.1}", store.tick_hz.get())} }

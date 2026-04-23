@@ -76,16 +76,51 @@ pub struct GpuLight {
     pub params: [f32; 4],
 }
 
-/// Per-material GPU data.
+// ── Noise channel constants ─────────────────────────────────────────────
+// Bit flags for GpuMaterial::noise_channels.
+pub const NOISE_CHANNEL_ALBEDO: u32 = 1 << 0;
+pub const NOISE_CHANNEL_ROUGHNESS: u32 = 1 << 1;
+pub const NOISE_CHANNEL_NORMAL: u32 = 1 << 2;
+
+/// Per-material GPU data — 96 bytes, matches rkifield's `Material` layout.
+///
+/// | Offset | Field              | Type     |
+/// |-------:|--------------------|----------|
+/// |      0 | albedo             | [f32; 3] |
+/// |     12 | roughness          | f32      |
+/// |     16 | metallic           | f32      |
+/// |     20 | emission_color     | [f32; 3] |
+/// |     32 | emission_strength  | f32      |
+/// |     36 | subsurface         | f32      |
+/// |     40 | subsurface_color   | [f32; 3] |
+/// |     52 | opacity            | f32      |
+/// |     56 | ior                | f32      |
+/// |     60 | noise_scale        | f32      |
+/// |     64 | noise_strength     | f32      |
+/// |     68 | noise_channels     | u32      |
+/// |     72 | shader_id          | u32      |
+/// |     76 | _padding           | [f32; 5] |
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuMaterial {
-    pub base_color: [f32; 4],
-    pub metallic: f32,
+    pub albedo: [f32; 3],
     pub roughness: f32,
+    pub metallic: f32,
+    pub emission_color: [f32; 3],
     pub emission_strength: f32,
+    pub subsurface: f32,
+    pub subsurface_color: [f32; 3],
     pub opacity: f32,
+    pub ior: f32,
+    pub noise_scale: f32,
+    pub noise_strength: f32,
+    pub noise_channels: u32,
+    pub shader_id: u32,
+    pub _padding: [f32; 5],
 }
+
+// Locks the byte layout against drift; the WGSL struct depends on it.
+const _: () = assert!(std::mem::size_of::<GpuMaterial>() == 96);
 
 impl RkpShadePass {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
@@ -110,11 +145,17 @@ impl RkpShadePass {
             count: None,
         };
 
-        // Group 0: G-buffer (position, normal, material)
+        // Group 0: G-buffer (position, normal, material, glass)
         let gbuffer_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("rkp_shade gbuf"),
-                entries: &[texture_entry(0), texture_entry(1), uint_texture_entry(2)],
+                entries: &[
+                    texture_entry(0),
+                    texture_entry(1),
+                    uint_texture_entry(2),
+                    // Glass info (oct-normal + packed thickness/material_id)
+                    uint_texture_entry(3),
+                ],
             });
 
         // Group 1: shadow texture + SSAO texture
@@ -275,6 +316,7 @@ impl RkpShadePass {
         position_view: &wgpu::TextureView,
         normal_view: &wgpu::TextureView,
         material_view: &wgpu::TextureView,
+        glass_view: &wgpu::TextureView,
     ) {
         self.gbuffer_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rkp_shade gbuf bg"),
@@ -283,6 +325,7 @@ impl RkpShadePass {
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(position_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(normal_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(material_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(glass_view) },
             ],
         }));
     }

@@ -549,6 +549,13 @@ impl EngineState {
 
                         self.scan_models();
                         if let Some(ref dir) = self.project_dir {
+                            // Reseed any starter materials the project
+                            // is missing (user deleted them, or schema
+                            // churn left stale files that were cleaned
+                            // out). No-op for starters that exist.
+                            crate::material_library::write_starter_materials(
+                                &dir.join("assets/materials"),
+                            );
                             self.material_lib.scan(&dir.join("assets/materials"));
                         }
                         self.init_file_watcher();

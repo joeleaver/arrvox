@@ -58,6 +58,10 @@ impl RenderContext {
                     // support 24+; GLES 3.x / some mobile top out at
                     // 16 but aren't supported targets.
                     max_storage_buffers_per_shader_stage: 20,
+                    // wgpu default is 4; the march write group needs
+                    // 5 (position + normal + material + pick + glass).
+                    // Desktop GPUs support 8+ universally.
+                    max_storage_textures_per_shader_stage: 8,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -127,6 +131,10 @@ impl RenderContext {
                     // support 24+; GLES 3.x / some mobile top out at
                     // 16 but aren't supported targets.
                     max_storage_buffers_per_shader_stage: 20,
+                    // wgpu default is 4; the march write group needs
+                    // 5 (position + normal + material + pick + glass).
+                    // Desktop GPUs support 8+ universally.
+                    max_storage_textures_per_shader_stage: 8,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,

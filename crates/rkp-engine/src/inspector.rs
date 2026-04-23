@@ -82,6 +82,11 @@ pub struct MaterialUsage {
     pub material_id: u16,
     /// How many voxels use this as their primary material.
     pub voxel_count: u32,
+    /// True when the entity has no voxelized geometry yet and this row
+    /// is a synthetic fallback built from `Renderable.material_id`.
+    /// Drop handlers use `AssignMaterial` for fallback rows (voxel
+    /// remap is a no-op when there are no voxels).
+    pub is_fallback: bool,
 }
 
 /// Skeletal-animation sidecar on an inspector snapshot. Populated only

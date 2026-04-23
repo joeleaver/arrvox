@@ -399,7 +399,7 @@ fn material_slot_row(
         store.materials.get()
             .iter()
             .find(|m| m.id == id)
-            .map(|m| m.base_color)
+            .map(|m| [m.albedo[0], m.albedo[1], m.albedo[2], 1.0])
             .unwrap_or([0.5, 0.5, 0.5, 1.0])
     });
 

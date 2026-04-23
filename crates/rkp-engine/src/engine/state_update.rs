@@ -6,13 +6,13 @@
 //! entity details for the properties panel, plus the material-usage
 //! walk that feeds `RemapMaterial`.
 
-use super::model_scan::collect_leaf_slots;
+use super::model_scan::{collect_internal_attr_slots, collect_leaf_slots};
 use super::state::EngineState;
 use crate::snapshot::StateUpdate;
 use std::time::Duration;
 
 impl EngineState {
-    pub(crate) fn build_inspector_snapshot(&self) -> Option<crate::inspector::InspectorSnapshot> {
+    pub(crate) fn build_inspector_snapshot(&mut self) -> Option<crate::inspector::InspectorSnapshot> {
         let selected = self.selected_entity?;
         if !self.world.contains(selected) {
             return None;
@@ -81,7 +81,22 @@ impl EngineState {
         let scl = transform.as_ref().map(|t| t.scale.to_array()).unwrap_or([1.0; 3]);
 
         // Count per-material voxel usage if entity has spatial data.
-        let material_usage = self.count_material_usage(selected);
+        // The walk is O(voxels) so results are cached and reused
+        // across ticks; only the selection changing or a geometry
+        // epoch bump (bake / remap / load) invalidates it.
+        let current_epoch = self
+            .geometry_epoch_handle
+            .load(std::sync::atomic::Ordering::Acquire);
+        let material_usage = match &self.cached_material_usage {
+            Some((e, epoch, usage)) if *e == selected && *epoch == current_epoch => {
+                usage.clone()
+            }
+            _ => {
+                let fresh = self.count_material_usage(selected);
+                self.cached_material_usage = Some((selected, current_epoch, fresh.clone()));
+                fresh
+            }
+        };
 
         // Skeleton sidecar — clip + bone metadata for the dedicated
         // animation panel. Skipped when the entity has no skeleton.
@@ -114,23 +129,36 @@ impl EngineState {
     }
 
     /// Count per-material voxel usage for an entity's octree.
+    ///
+    /// When the entity has a `Renderable` but no voxel data yet (e.g. an
+    /// unbaked procedural primitive), a synthetic fallback row is
+    /// returned carrying `Renderable.material_id` so the UI always has
+    /// at least one drop slot to assign against.
     pub(crate) fn count_material_usage(&self, entity: hecs::Entity) -> Vec<crate::inspector::MaterialUsage> {
         let renderable = match self.world.get::<&crate::components::Renderable>(entity) {
             Ok(r) => r,
             Err(_) => return Vec::new(),
         };
+
+        let fallback_row = || crate::inspector::MaterialUsage {
+            material_id: renderable.material_id,
+            voxel_count: 0,
+            is_fallback: true,
+        };
+
         let spatial = match &renderable.spatial {
             Some(s) => s,
-            None => return Vec::new(),
+            None => return vec![fallback_row()],
         };
 
         // Collect leaf voxel slots from the packed octree buffer.
         // Branch offsets in the packed buffer are ABSOLUTE, so we traverse
         // the full buffer starting at root_offset (not a sub-slice).
+        // Brick-terminated subtrees expand via the brick_pool.
         let sm = self.scene_mgr.lock().unwrap();
         let all_nodes = sm.octree.data();
         let mut leaf_slots = Vec::new();
-        collect_leaf_slots(all_nodes, spatial.root_offset as usize, &mut leaf_slots);
+        collect_leaf_slots(all_nodes, &sm.brick_pool, spatial.root_offset as usize, &mut leaf_slots);
 
         // Count material IDs across all leaf slots. Every leaf is a surface
         // voxel now — no opacity gate.
@@ -144,16 +172,49 @@ impl EngineState {
             *counts.entry(attr.material_primary).or_insert(0) += 1;
         }
 
+        if counts.is_empty() {
+            return vec![fallback_row()];
+        }
+
         // Sort by voxel count descending.
         let mut usage: Vec<crate::inspector::MaterialUsage> = counts
             .into_iter()
             .map(|(material_id, voxel_count)| crate::inspector::MaterialUsage {
                 material_id,
                 voxel_count,
+                is_fallback: false,
             })
             .collect();
         usage.sort_by(|a, b| b.voxel_count.cmp(&a.voxel_count));
         usage
+    }
+
+    /// Compose a new `(from, to)` remap into the entity's persistent
+    /// override list, in-place. Invariant: each original material
+    /// appears at most once in the list, and identity entries
+    /// (orig == current) are dropped so a "remap back to original"
+    /// doesn't leave a no-op pair lying around.
+    ///
+    /// Existing pairs whose current value matches `from` are updated
+    /// (their voxels just moved again). If no existing pair tracks
+    /// `from` as an original yet, a fresh `(from, to)` pair is
+    /// appended — this captures the case where untouched original-
+    /// material voxels were hit by the new remap.
+    pub(crate) fn compose_material_override(
+        overrides: &mut Vec<(u16, u16)>,
+        from: u16,
+        to: u16,
+    ) {
+        for (_orig, cur) in overrides.iter_mut() {
+            if *cur == from {
+                *cur = to;
+            }
+        }
+        let already_tracked = overrides.iter().any(|(orig, _)| *orig == from);
+        if !already_tracked && from != to {
+            overrides.push((from, to));
+        }
+        overrides.retain(|(o, c)| o != c);
     }
 
     /// Remap all voxels on an entity from one material to another.
@@ -173,11 +234,20 @@ impl EngineState {
             None => return 0,
         };
 
-        // Collect leaf slots using absolute offsets in the packed buffer.
+        // Collect every leaf_attr slot reachable from this entity:
+        //   - per-voxel slots inside LEAFs + BRICKs (real geometry),
+        //   - prefilter slots at BRANCH nodes (LOD aggregates).
+        // Both kinds hold a material_primary that must stay in sync;
+        // missing the LOD set here is what made close-up material
+        // changes "disappear" once distance kicked in the LOD cutoff.
         let mut sm = self.scene_mgr.lock().unwrap();
-        let all_nodes = sm.octree.data();
         let mut leaf_slots = Vec::new();
-        collect_leaf_slots(all_nodes, spatial.root_offset as usize, &mut leaf_slots);
+        {
+            let all_nodes = sm.octree.data();
+            let internal_attrs = sm.octree.internal_attrs_data();
+            collect_leaf_slots(all_nodes, &sm.brick_pool, spatial.root_offset as usize, &mut leaf_slots);
+            collect_internal_attr_slots(all_nodes, internal_attrs, spatial.root_offset as usize, &mut leaf_slots);
+        }
 
         let pool_size = sm.leaf_attr_pool.allocated_count();
         let mut count = 0u32;
@@ -206,6 +276,12 @@ impl EngineState {
             if changed {
                 count += 1;
             }
+        }
+        if count > 0 {
+            // Bump so the render thread re-uploads leaf_attr_pool on its
+            // next iteration; the plain `geometry_dirty` flag only
+            // schedules collider rebuilds, not GPU upload.
+            sm.bump_geometry_epoch();
         }
         count
     }
@@ -379,6 +455,7 @@ impl EngineState {
 
         StateUpdate {
             fps,
+            delivered_fps: self.delivered_hz_ema,
             tick_hz: self.tick_hz_ema,
             physics_hz: self.physics_hz_ema,
             gpu_object_count: self.gpu_objects.len() as u32,

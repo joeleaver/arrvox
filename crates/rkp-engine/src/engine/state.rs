@@ -365,11 +365,30 @@ pub(crate) struct EngineState {
     /// reflects the on-screen production cadence, not sim CPU
     /// headroom (which `1 / cpu_total_ms` would be).
     pub(crate) render_hz_ema: f32,
+    /// Rate at which fresh pixel frames actually reach the editor
+    /// surface, EMA-smoothed. Updated from
+    /// `RenderResult::delivered_dt_ms` whenever the render thread
+    /// reports a successful pixel ship. Diverges from
+    /// `render_hz_ema` whenever render iterates faster than it ships
+    /// (interp re-renders, `MIN_FRAME_CALLBACK_INTERVAL`, sim
+    /// upstream bottleneck). This is the honest "what did the user
+    /// see" number.
+    pub(crate) delivered_hz_ema: f32,
     /// Last inspector snapshot we sent to the editor. Used to skip pushing
     /// an identical snapshot every tick — without this, the panel re-renders
     /// 60Hz when physics writes Transform on a selected RigidBody, which
     /// chunks the UI thread.
     pub(crate) prev_inspector: Option<crate::inspector::InspectorSnapshot>,
+    /// Cached per-entity `MaterialUsage` list. Computing it walks every
+    /// leaf slot in the entity's subtree (including every brick cell
+    /// and every prefilter-LOD slot), which is O(voxels) — trivial
+    /// before the brick-descent fix, but a tick-killing 50 ms+ per
+    /// call on high-voxel entities once bricks were included. Since
+    /// the list only changes when the selection or geometry changes,
+    /// cache it keyed on `(entity, geometry_epoch)` and reuse across
+    /// ticks.
+    pub(crate) cached_material_usage:
+        Option<(hecs::Entity, u64, Vec<crate::inspector::MaterialUsage>)>,
     /// Same change-detection cache for the procedural snapshot.
     pub(crate) prev_procedural: Option<crate::procedural_snapshot::ProceduralSnapshot>,
     /// Last environment we shipped to the editor — diff-suppression
@@ -655,7 +674,9 @@ impl EngineState {
             tick_hz_ema: 60.0,
             physics_hz_ema: 0.0,
             render_hz_ema: 0.0,
+            delivered_hz_ema: 0.0,
             prev_inspector: None,
+            cached_material_usage: None,
             prev_procedural: None,
             prev_environment: None,
             file_watcher: None,

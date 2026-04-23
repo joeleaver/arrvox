@@ -56,9 +56,9 @@ pub fn MaterialsPanel() -> NodeHandle {
                         key: mat.id.to_string(),
                         mat_id: mat.id.to_string(),
                         name: mat.name.clone(),
-                        color_r: mat.base_color[0].to_string(),
-                        color_g: mat.base_color[1].to_string(),
-                        color_b: mat.base_color[2].to_string(),
+                        color_r: mat.albedo[0].to_string(),
+                        color_g: mat.albedo[1].to_string(),
+                        color_b: mat.albedo[2].to_string(),
                     }
                 }
                 if store.materials.get().is_empty() {

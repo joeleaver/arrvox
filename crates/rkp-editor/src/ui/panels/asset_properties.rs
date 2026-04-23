@@ -86,13 +86,64 @@ fn MaterialPropertiesSection() -> NodeHandle {
                         cmd_tx,
                     )}
 
-                    // Properties
-                    {material_fields(__scope, info.id, info.base_color, info.roughness,
-                        info.metallic, info.emission_strength, info.opacity, cmd_tx)}
+                    // Properties — the built-in Default (id 0) is immutable;
+                    // show a nudge to create a new material instead.
+                    if info.id == 0 {
+                        div {
+                            style: "padding:12px;display:flex;flex-direction:column;\
+                                    gap:10px;color:#888;font-size:11px;",
+                            div {
+                                style: "font-style:italic;line-height:1.5;",
+                                {"The Default material is read-only. \
+                                  Create a new material to customize PBR properties."}
+                            }
+                            div {
+                                style: "padding:6px 10px;border-radius:4px;\
+                                        background:#2d5a2d;color:#ddd;\
+                                        text-align:center;cursor:pointer;\
+                                        font-size:11px;user-select:none;",
+                                onclick: move || {
+                                    let _ = cmd_tx.get().send(
+                                        rkp_engine::EngineCommand::CreateMaterial {
+                                            name: "New Material".into(),
+                                        },
+                                    );
+                                },
+                                {"+ New Material"}
+                            }
+                        }
+                    } else {
+                        // Remount the editable form on selection change
+                        // by keying a `for` loop on the material id.
+                        // Without this, `material_fields`'s inner
+                        // `Signal::new(...)` seeds run only at first
+                        // mount and the sliders / color pickers stay
+                        // pinned to the first-selected material's
+                        // values when you pick a different one. Same
+                        // pattern used for `ModelPropertiesForm` below.
+                        // Re-reading `mat_info` inside the for keeps
+                        // rinch's enclosing body-closure `Fn`-callable;
+                        // capturing `info` from the outer `if let`
+                        // would move it and force `FnOnce`.
+                        for info_keyed in mat_info.get().into_iter() {
+                            MaterialPropertiesForm {
+                                key: info_keyed.id.to_string(),
+                                info: info_keyed,
+                            }
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+#[component]
+fn MaterialPropertiesForm(
+    info: rkp_engine::material_library::MaterialInfo,
+) -> NodeHandle {
+    let cmd_tx: CmdSignal = Signal::new(use_context::<CommandSender>().0);
+    material_fields(__scope, info.id, info, cmd_tx)
 }
 
 fn asset_header(
@@ -112,7 +163,7 @@ fn asset_header(
             div {
                 style: {move || {
                     let (r, g, b) = mat_info.get()
-                        .map(|m| (m.base_color[0], m.base_color[1], m.base_color[2]))
+                        .map(|m| (m.albedo[0], m.albedo[1], m.albedo[2]))
                         .unwrap_or((0.8, 0.8, 0.8));
                     format!(
                         "width:24px;height:24px;border-radius:4px;flex-shrink:0;\
@@ -163,18 +214,28 @@ fn asset_header(
 fn material_fields(
     __scope: &mut rinch::core::dom::RenderScope,
     mat_id: u16,
-    base_color: [f32; 4],
-    roughness: f32,
-    metallic: f32,
-    emission_strength: f32,
-    opacity: f32,
+    info: rkp_engine::material_library::MaterialInfo,
     cmd_tx: CmdSignal,
 ) -> rinch::core::dom::NodeHandle {
-    let color_val = Signal::new(base_color);
-    let rough_val = Signal::new(roughness);
-    let metal_val = Signal::new(metallic);
-    let emiss_val = Signal::new(emission_strength);
-    let opac_val = Signal::new(opacity);
+    // prop_color takes [f32;4]; we pass albedo through as rgb with alpha=1.0
+    // and strip the alpha on commit. The alpha is unused (opacity is a
+    // separate material field).
+    let albedo_val = Signal::new([info.albedo[0], info.albedo[1], info.albedo[2], 1.0]);
+    let emission_col_val = Signal::new([
+        info.emission_color[0], info.emission_color[1], info.emission_color[2], 1.0,
+    ]);
+    let sss_col_val = Signal::new([
+        info.subsurface_color[0], info.subsurface_color[1], info.subsurface_color[2], 1.0,
+    ]);
+    let rough_val = Signal::new(info.roughness);
+    let metal_val = Signal::new(info.metallic);
+    let emiss_val = Signal::new(info.emission_strength);
+    let sss_val = Signal::new(info.subsurface);
+    let opac_val = Signal::new(info.opacity);
+    let ior_val = Signal::new(info.ior);
+    let noise_scale_val = Signal::new(info.noise_scale);
+    let noise_strength_val = Signal::new(info.noise_strength);
+    let noise_channels = Signal::new(info.noise_channels);
 
     // Helper to create a material field update callback.
     let mat_cb = move |field: &'static str| -> Rc<dyn Fn(f32)> {
@@ -186,22 +247,64 @@ fn material_fields(
             });
         })
     };
+    let color_cb = move |field: &'static str| -> Rc<dyn Fn([f32; 4])> {
+        Rc::new(move |v: [f32; 4]| {
+            let _ = cmd_tx.get().send(rkp_engine::EngineCommand::UpdateMaterialField {
+                material_id: mat_id,
+                field: field.into(),
+                value: format!("[{},{},{}]", v[0], v[1], v[2]),
+            });
+        })
+    };
+
+    // Noise channel bitflag toggle. Sends the whole bitmask each time.
+    let noise_channel_cb = move |bit: u32| -> Rc<dyn Fn(bool)> {
+        Rc::new(move |on: bool| {
+            let cur = noise_channels.get();
+            let new = if on { cur | bit } else { cur & !bit };
+            noise_channels.set(new);
+            let _ = cmd_tx.get().send(rkp_engine::EngineCommand::UpdateMaterialField {
+                material_id: mat_id,
+                field: "noise_channels".into(),
+                value: new.to_string(),
+            });
+        })
+    };
+
+    const NOISE_ALBEDO: u32 = 1 << 0;
+    const NOISE_ROUGHNESS: u32 = 1 << 1;
+    const NOISE_NORMAL: u32 = 1 << 2;
+
+    let noise_albedo_on = Signal::new(info.noise_channels & NOISE_ALBEDO != 0);
+    let noise_rough_on = Signal::new(info.noise_channels & NOISE_ROUGHNESS != 0);
+    let noise_normal_on = Signal::new(info.noise_channels & NOISE_NORMAL != 0);
 
     rsx! {
         div {
             style: "padding:8px;display:flex;flex-direction:column;gap:6px;\
                     overflow-y:auto;flex:1;",
-            {prop_color(__scope, "Base Color", Memo::new(move || color_val.get()), Rc::new(move |v: [f32; 4]| {
-                let _ = cmd_tx.get().send(rkp_engine::EngineCommand::UpdateMaterialField {
-                    material_id: mat_id,
-                    field: "base_color".into(),
-                    value: format!("[{},{},{},{}]", v[0], v[1], v[2], v[3]),
-                });
-            }))}
+
+            // PBR baseline
+            {prop_color(__scope, "Albedo", Memo::new(move || albedo_val.get()), color_cb("albedo"))}
             {prop_slider(__scope, "Roughness", rough_val, 0.0, 1.0, 0.01, mat_cb("roughness"))}
             {prop_slider(__scope, "Metallic", metal_val, 0.0, 1.0, 0.01, mat_cb("metallic"))}
+
+            // Emission
+            {prop_color(__scope, "Emission Color", Memo::new(move || emission_col_val.get()), color_cb("emission_color"))}
             {prop_slider(__scope, "Emission", emiss_val, 0.0, 10.0, 0.1, mat_cb("emission_strength"))}
+
+            // Translucency
+            {prop_slider(__scope, "Subsurface", sss_val, 0.0, 1.0, 0.01, mat_cb("subsurface"))}
+            {prop_color(__scope, "SSS Color", Memo::new(move || sss_col_val.get()), color_cb("subsurface_color"))}
             {prop_slider(__scope, "Opacity", opac_val, 0.0, 1.0, 0.01, mat_cb("opacity"))}
+            {prop_slider(__scope, "IOR", ior_val, 1.0, 3.0, 0.01, mat_cb("ior"))}
+
+            // Procedural noise
+            {prop_slider(__scope, "Noise Scale", noise_scale_val, 0.0, 50.0, 0.1, mat_cb("noise_scale"))}
+            {prop_slider(__scope, "Noise Strength", noise_strength_val, 0.0, 1.0, 0.01, mat_cb("noise_strength"))}
+            {prop_checkbox(__scope, "Noise: Albedo", noise_albedo_on, noise_channel_cb(NOISE_ALBEDO))}
+            {prop_checkbox(__scope, "Noise: Roughness", noise_rough_on, noise_channel_cb(NOISE_ROUGHNESS))}
+            {prop_checkbox(__scope, "Noise: Normal", noise_normal_on, noise_channel_cb(NOISE_NORMAL))}
         }
     }
 }

@@ -374,10 +374,15 @@ fn editor_metadata_entry() -> ComponentEntry {
 
 // ── Renderable ───────────────────────────────────────────────────────
 
-static RENDERABLE_FIELDS: [FieldMeta; 4] = [
+// `material_id` is intentionally omitted — materials are edited via the
+// dedicated MaterialUsageSection slots in the properties panel, which
+// give one drop-target per material actually in use on the object.
+// The field still exists on Renderable for scene I/O and as the
+// fallback material for unbaked geometry; it's just not surfaced as a
+// raw numeric editor here.
+static RENDERABLE_FIELDS: [FieldMeta; 3] = [
     FieldMeta { name: "asset_path", field_type: FieldType::String, range: None, transient: false, struct_fields: None, asset_filter: Some("rkp"), enum_options: None, scrub: false },
     FieldMeta { name: "primitive", field_type: FieldType::String, range: None, transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
-    FieldMeta { name: "material_id", field_type: FieldType::Int, range: Some((0.0, 65535.0)), transient: false, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
     FieldMeta { name: "voxel_count", field_type: FieldType::Int, range: None, transient: true, struct_fields: None, asset_filter: None, enum_options: None, scrub: false },
 ];
 

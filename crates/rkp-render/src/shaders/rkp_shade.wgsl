@@ -50,12 +50,36 @@ struct ShadeParams {
 const ISOLATION_BG: vec3<f32> = vec3<f32>(0.18, 0.18, 0.18);
 const ISOLATION_AMBIENT: vec3<f32> = vec3<f32>(0.4, 0.4, 0.4);
 
+// vec3 fields on the Rust side are [f32; 3] (12 bytes, tightly packed).
+// WGSL's vec3<f32> has 16-byte alignment which would balloon the struct
+// to 128 bytes — so on the shader side every 3-vector is spelled out as
+// three f32 components to keep the WGSL and Rust layouts in lockstep at
+// 96 bytes.
 struct Material {
-    base_color: vec4<f32>,
-    metallic: f32,
+    albedo_r: f32, albedo_g: f32, albedo_b: f32,
     roughness: f32,
+    metallic: f32,
+    emission_r: f32, emission_g: f32, emission_b: f32,
     emission_strength: f32,
+    subsurface: f32,
+    subsurface_r: f32, subsurface_g: f32, subsurface_b: f32,
     opacity: f32,
+    ior: f32,
+    noise_scale: f32,
+    noise_strength: f32,
+    noise_channels: u32,
+    shader_id: u32,
+    _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32, _pad5: f32,
+}
+
+fn mat_albedo(m: Material) -> vec3<f32> {
+    return vec3<f32>(m.albedo_r, m.albedo_g, m.albedo_b);
+}
+fn mat_emission(m: Material) -> vec3<f32> {
+    return vec3<f32>(m.emission_r, m.emission_g, m.emission_b);
+}
+fn mat_subsurface_color(m: Material) -> vec3<f32> {
+    return vec3<f32>(m.subsurface_r, m.subsurface_g, m.subsurface_b);
 }
 
 // --- Bindings ---
@@ -64,6 +88,10 @@ struct Material {
 @group(0) @binding(0) var gbuf_position: texture_2d<f32>;
 @group(0) @binding(1) var gbuf_normal: texture_2d<f32>;
 @group(0) @binding(2) var gbuf_material: texture_2d<u32>;
+// R = oct-packed normal of the glass surface, G = (thickness_mm <<
+// 16) | material_id. `thickness_mm == 0` means "no glass at this
+// pixel" — use as the gate for the glass composite path.
+@group(0) @binding(3) var gbuf_glass: texture_2d<u32>;
 
 // Group 1: shadow texture (read, half-res) + SSAO texture (read, half-res)
 // shadow_tex is written by rkp_shadow_trace at half-res; we upsample it
@@ -354,6 +382,106 @@ fn geometry_smith(n_dot_v: f32, n_dot_l: f32, roughness: f32) -> f32 {
     return geometry_schlick_ggx(n_dot_v, roughness) * geometry_schlick_ggx(n_dot_l, roughness);
 }
 
+// --- Glass / Transparency ---
+//
+// Dielectric Fresnel driven by IOR, and Beer-Lambert absorption for
+// glass tinting. The full rkifield-style glass pipeline (continue
+// the ray past the glass to find scene objects behind, composite
+// with Beer over the behind color, handle multi-layer panes) needs
+// a secondary march pass that rkp_shade can't run without scene
+// bindings, and is deferred. For now, "transmission" samples the
+// sky view LUT directly — correct when the camera sees sky through
+// the glass, not-quite-correct when there are opaque objects on
+// the far side (they'll read as sky instead of themselves).
+
+// Decode an oct-packed unit normal written by `pack_oct_normal` in
+// octree_march / skin_deform. Same basis the leaf_attr path uses;
+// used here to read the glass surface normal out of `gbuf_glass`.
+fn unpack_oct_normal(packed: u32) -> vec3<f32> {
+    let ul = packed & 0xFFFFu;
+    let vl = (packed >> 16u) & 0xFFFFu;
+    let ux = f32(i32(ul << 16u) >> 16) / 32767.0;
+    let vx = f32(i32(vl << 16u) >> 16) / 32767.0;
+    var n = vec3<f32>(ux, vx, 1.0 - abs(ux) - abs(vx));
+    if n.z < 0.0 {
+        let nx = (1.0 - abs(n.y)) * select(-1.0, 1.0, n.x >= 0.0);
+        let ny = (1.0 - abs(n.x)) * select(-1.0, 1.0, n.y >= 0.0);
+        n.x = nx;
+        n.y = ny;
+    }
+    return normalize(n);
+}
+
+fn dielectric_f0(ior: f32) -> f32 {
+    let r = (1.0 - ior) / (1.0 + ior);
+    return r * r;
+}
+
+fn fresnel_dielectric(cos_theta: f32, ior: f32) -> f32 {
+    let f0 = dielectric_f0(ior);
+    return f0 + (1.0 - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+// Beer-Lambert: a colorless glass passes everything (glass_color
+// near (1,1,1) → absorption → (1,1,1)); a saturated glass color
+// absorbs its complement, deepening with thickness. The `* 5.0`
+// scales the thickness parameter into a visually-useful range —
+// matches rkifield's choice.
+fn beer_absorption(glass_color: vec3<f32>, thickness: f32) -> vec3<f32> {
+    let sigma = max(-log(max(glass_color, vec3<f32>(0.01))), vec3<f32>(0.0));
+    return exp(-sigma * thickness * 5.0);
+}
+
+// --- Noise (procedural material variation) ---
+
+const NOISE_CHANNEL_ALBEDO: u32    = 1u;
+const NOISE_CHANNEL_ROUGHNESS: u32 = 2u;
+const NOISE_CHANNEL_NORMAL: u32    = 4u;
+
+// Hash based on Dave Hoskins' "Hash without Sine" — a handful of
+// multiply-adds and a final fract. Several × faster than
+// `fract(sin(dot(...)))` on most GPUs (sin() is a slow transcendental
+// that chews through fill rate when we're doing dozens of hashes per
+// pixel), and visually indistinguishable for material-noise use.
+fn hash13(p: vec3<f32>) -> f32 {
+    var p3 = fract(p * 0.1031);
+    p3 = p3 + dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// 3D value noise in [0,1], trilinearly interpolated from a hashed lattice.
+fn value_noise_3d(p: vec3<f32>) -> f32 {
+    let ip = floor(p);
+    let fp = fract(p);
+    let w = fp * fp * (3.0 - 2.0 * fp);
+    let c000 = hash13(ip);
+    let c100 = hash13(ip + vec3<f32>(1.0, 0.0, 0.0));
+    let c010 = hash13(ip + vec3<f32>(0.0, 1.0, 0.0));
+    let c110 = hash13(ip + vec3<f32>(1.0, 1.0, 0.0));
+    let c001 = hash13(ip + vec3<f32>(0.0, 0.0, 1.0));
+    let c101 = hash13(ip + vec3<f32>(1.0, 0.0, 1.0));
+    let c011 = hash13(ip + vec3<f32>(0.0, 1.0, 1.0));
+    let c111 = hash13(ip + vec3<f32>(1.0, 1.0, 1.0));
+    let x00 = mix(c000, c100, w.x);
+    let x10 = mix(c010, c110, w.x);
+    let x01 = mix(c001, c101, w.x);
+    let x11 = mix(c011, c111, w.x);
+    return mix(mix(x00, x10, w.y), mix(x01, x11, w.y), w.z);
+}
+
+// Forward-difference gradient of the noise field. Reuses the caller's
+// already-computed center sample `n0` so this path costs 3 extra
+// value_noise calls (was 6 under central differences). Slightly more
+// directional bias at the lattice scale; invisible for bump use.
+fn noise_gradient_3d(p: vec3<f32>, n0: f32) -> vec3<f32> {
+    let e = 0.1;
+    let inv_e = 1.0 / e;
+    let nx = value_noise_3d(p + vec3<f32>(e, 0.0, 0.0)) - n0;
+    let ny = value_noise_3d(p + vec3<f32>(0.0, e, 0.0)) - n0;
+    let nz = value_noise_3d(p + vec3<f32>(0.0, 0.0, e)) - n0;
+    return vec3<f32>(nx, ny, nz) * inv_e;
+}
+
 fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
@@ -386,6 +514,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let s_dir = normalize(shade_params.sun_dir);
 
         // Look up precomputed sky radiance from Sky View LUT.
+        // Glass compositing over sky is now handled by rkp_glass —
+        // this path just writes the raw sky; rkp_glass reads it back
+        // and does Fresnel / Beer / screen-space refraction on top.
         let sky_uv = ray_dir_to_sky_view_uv(ray_dir, s_dir, EARTH_RADIUS + shade_params.camera_altitude);
         var sky = textureSampleLevel(sky_view_lut, atmo_sampler, sky_uv, 0.0).rgb;
         sky += sun_disc(ray_dir, s_dir, shade_params.sun_intensity, shade_params.camera_altitude);
@@ -420,16 +551,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // the guard is still desirable (free early-out on single-material
     // pixels, which is the common case).
     let mat_a = materials[primary_mat_id];
-    var base_color = mat_a.base_color.rgb;
+    var base_color = mat_albedo(mat_a);
     var metallic_raw = mat_a.metallic;
     var roughness_raw = mat_a.roughness;
+    var emission_color = mat_emission(mat_a);
     var emission_strength = mat_a.emission_strength;
+    var subsurface = mat_a.subsurface;
+    var subsurface_color = mat_subsurface_color(mat_a);
+    var noise_scale = mat_a.noise_scale;
+    var noise_strength = mat_a.noise_strength;
+    var opacity = mat_a.opacity;
+    var ior = mat_a.ior;
+    // Bitmask channels don't blend meaningfully — keep primary's mask.
+    let noise_channels = mat_a.noise_channels;
     if blend_weight > 0.0 {
         let mat_b = materials[secondary_mat_id];
-        base_color = mix(base_color, mat_b.base_color.rgb, blend_weight);
+        base_color = mix(base_color, mat_albedo(mat_b), blend_weight);
         metallic_raw = mix(metallic_raw, mat_b.metallic, blend_weight);
         roughness_raw = mix(roughness_raw, mat_b.roughness, blend_weight);
+        emission_color = mix(emission_color, mat_emission(mat_b), blend_weight);
         emission_strength = mix(emission_strength, mat_b.emission_strength, blend_weight);
+        subsurface = mix(subsurface, mat_b.subsurface, blend_weight);
+        subsurface_color = mix(subsurface_color, mat_subsurface_color(mat_b), blend_weight);
+        noise_scale = mix(noise_scale, mat_b.noise_scale, blend_weight);
+        noise_strength = mix(noise_strength, mat_b.noise_strength, blend_weight);
+        opacity = mix(opacity, mat_b.opacity, blend_weight);
+        ior = mix(ior, mat_b.ior, blend_weight);
     }
 
     let color_rgb565 = (packed_g >> 16u) & 0xFFFFu;
@@ -441,15 +588,41 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         albedo = vec3<f32>(f32(cr5) / 31.0, f32(cg6) / 63.0, f32(cb5) / 31.0);
     }
     let metallic = metallic_raw;
-    let roughness = max(roughness_raw, 0.04);
+    var roughness = max(roughness_raw, 0.04);
+    var N = normal;
+
+    // Procedural noise modulation. Single value_noise sample drives albedo
+    // / roughness per the noise_channels bitmask; the normal-perturbation
+    // bit additionally pays for a 6-sample finite-difference gradient.
+    if noise_strength > 0.0 && noise_scale > 0.0 && noise_channels != 0u {
+        let np = world_pos * noise_scale;
+        let n = value_noise_3d(np) * 2.0 - 1.0; // -1..1
+        if (noise_channels & NOISE_CHANNEL_ALBEDO) != 0u {
+            albedo = clamp(albedo * (1.0 + n * noise_strength), vec3<f32>(0.0), vec3<f32>(1.0));
+        }
+        if (noise_channels & NOISE_CHANNEL_ROUGHNESS) != 0u {
+            roughness = clamp(roughness + n * noise_strength * 0.5, 0.04, 1.0);
+        }
+        if (noise_channels & NOISE_CHANNEL_NORMAL) != 0u {
+            // Reuse the center sample from above (n in [-1,1]), remapped
+            // back to the raw [0,1] range the gradient helper expects.
+            let g = noise_gradient_3d(np, n * 0.5 + 0.5);
+            let g_tan = g - N * dot(g, N);
+            N = normalize(N - g_tan * noise_strength);
+        }
+    }
 
     // View direction.
     let V = normalize(camera.position.xyz - world_pos);
-    let N = normal;
     let n_dot_v = max(dot(N, V), 0.001);
 
     // F0 for dielectrics vs metals.
-    let f0 = mix(vec3<f32>(0.04), albedo, metallic);
+    // IOR-derived F0 for dielectrics (glass IOR 1.5 → F0 ≈ 0.04,
+    // matching the old hardcoded constant; higher IOR materials like
+    // diamond (~2.4) now get their correct F0 ≈ 0.17). Metals still
+    // tint the spectrum via albedo.
+    let f0_dielectric = vec3<f32>(dielectric_f0(ior));
+    let f0 = mix(f0_dielectric, albedo, metallic);
 
     // Per-light shadow: bilateral upsample from the half-res shadow texture
     // written by rkp_shadow_trace. Each half-res sample's "reference
@@ -563,25 +736,49 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             shadow_idx++;
         }
 
-        let n_dot_l = max(dot(N, L), 0.0);
-        if n_dot_l <= 0.0 { continue; }
+        let n_dot_l_raw = dot(N, L);
+        let n_dot_l_front = max(n_dot_l_raw, 0.0);
+
+        // Wrap Lambert for diffuse: subsurface scalar widens the lit
+        // hemisphere so light "leaks" around the terminator.
+        // wrap=0 → standard Lambert; wrap=0.5 → full wrap-around.
+        let wrap = subsurface * 0.5;
+        let n_dot_l_wrapped = max(0.0, (n_dot_l_raw + wrap) / (1.0 + wrap));
+
+        // Back-light transmission (UE4/SpeedTree style). Light arriving
+        // from behind the surface scatters forward toward the camera.
+        var transmission = vec3<f32>(0.0);
+        if subsurface > 0.0 {
+            let distortion = 0.2;
+            let H_t = normalize(L + N * distortion);
+            let t = pow(max(dot(-V, H_t), 0.0), 4.0) * subsurface;
+            transmission = t * subsurface_color * albedo;
+        }
+
+        // Skip entirely when fully back-facing and no subsurface contribution.
+        let has_trans = transmission.r + transmission.g + transmission.b > 0.001;
+        if n_dot_l_wrapped <= 0.0 && !has_trans { continue; }
 
         let H = normalize(V + L);
         let n_dot_h = max(dot(N, H), 0.0);
         let h_dot_v = max(dot(H, V), 0.0);
 
-        // Cook-Torrance BRDF.
+        // Cook-Torrance BRDF. Specular uses the un-wrapped cosine — the
+        // wrap term is a diffuse-only hack; it doesn't model mirror-like
+        // light bending through the surface.
         let D = distribution_ggx(n_dot_h, roughness);
-        let G = geometry_smith(n_dot_v, n_dot_l, roughness);
+        let G = geometry_smith(n_dot_v, n_dot_l_front, roughness);
         let F = fresnel_schlick(h_dot_v, f0);
 
-        let specular = (D * G * F) / (4.0 * n_dot_v * n_dot_l + 0.0001);
+        let specular = (D * G * F) / (4.0 * n_dot_v * n_dot_l_front + 0.0001);
         let kd = (1.0 - F) * (1.0 - metallic);
         let diffuse = kd * albedo / PI;
 
         let radiance = light.color.rgb * light.color.w * attenuation;
 
-        lo += (diffuse + specular) * radiance * n_dot_l * light_shadow;
+        lo += (diffuse * n_dot_l_wrapped
+             + specular * n_dot_l_front
+             + transmission) * radiance * light_shadow;
     }
 
     // Ambient: in-situ uses multi-scattering LUT for sky irradiance; in
@@ -605,12 +802,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ambient_specular = ms_irradiance * F_env * ao;
     let ambient = ambient_diffuse + ambient_specular;
 
-    // Emission — drive from the (possibly blended) base_color and
-    // emission_strength, so a secondary material emitting in the
-    // transition zone properly shows through.
-    let emission = base_color * emission_strength;
+    // Emission — dedicated emission_color × emission_strength so an
+    // emissive material can glow a different color than its albedo.
+    // Blended across the dual-material transition band.
+    let emission = emission_color * emission_strength;
 
     var final_color = lo + ambient + emission;
+
+    // Glass composite has moved to the dedicated `rkp_glass` post-
+    // pass so it can do screen-space refraction by sampling the
+    // already-shaded HDR at an offset pixel. This pass now writes
+    // the raw "behind" color (opaque PBR) — rkp_glass overlays
+    // Fresnel / Beer / refraction on top if gbuf_glass says this
+    // pixel has glass in front of it.
 
     // Aerial perspective — atmospheric inscatter + extinction between camera
     // and the shaded surface. Under an exponential slice map, near-field

@@ -86,17 +86,44 @@ struct GpuLight {
     params: vec4<f32>,
 }
 
+// vec3 fields flattened to f32 components — see rkp_shade.wgsl for the
+// full rationale (WGSL vec3 alignment would pad this to 128 bytes, but
+// the Rust/GpuMaterial is tightly packed at 96).
 struct GpuMaterial {
-    base_color: vec4<f32>,
-    metallic: f32,
+    albedo_r: f32, albedo_g: f32, albedo_b: f32,
     roughness: f32,
+    metallic: f32,
+    emission_r: f32, emission_g: f32, emission_b: f32,
     emission_strength: f32,
+    subsurface: f32,
+    subsurface_r: f32, subsurface_g: f32, subsurface_b: f32,
     opacity: f32,
+    ior: f32,
+    noise_scale: f32,
+    noise_strength: f32,
+    noise_channels: u32,
+    shader_id: u32,
+    _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32, _pad5: f32,
 }
 
 struct LeafAttr {
     normal_oct: u32,
     material_packed: u32,
+}
+
+fn mat_albedo(m: GpuMaterial) -> vec3<f32> {
+    return vec3<f32>(m.albedo_r, m.albedo_g, m.albedo_b);
+}
+
+// Scalar Beer transmittance for shadows — mirrors `beer_absorption`
+// in rkp_shade but returns a single float (the shadow trace only
+// shades `visibility`, not color). We average the per-channel
+// absorption; this is a cheap approximation that's fine for the
+// typical mildly-tinted glass case and saves an RGB shadow path.
+fn shadow_beer(glass_color: vec3<f32>, thickness: f32) -> f32 {
+    let sigma = max(-log(max(glass_color, vec3<f32>(0.01))), vec3<f32>(0.0));
+    let a = exp(-sigma * thickness * 5.0);
+    return (a.x + a.y + a.z) * (1.0 / 3.0);
 }
 
 struct OctreeResult {
@@ -467,6 +494,16 @@ fn trace_shadow_ray(
                         else { face_idx = FACE_PZ; }
                         let link = brick_face_links[brick_id * 6u + face_idx];
                         if link == FACE_INTERIOR {
+                            // Ray exits brick into a solid-bulk region.
+                            // For glass objects, the bulk is part of
+                            // the glass body — bail out of the brick
+                            // DDA and let the outer loop attenuate
+                            // the ray across the INTERIOR_NODE span
+                            // via Beer. Opaque objects still block.
+                            let obj_opacity = materials[obj.material_id].opacity;
+                            if obj_opacity < 0.99 {
+                                break;
+                            }
                             blocked = true;
                             break;
                         }
@@ -498,11 +535,31 @@ fn trace_shadow_ray(
 
                     let flat = u32(cell.x) + u32(cell.y) * BRICK_DIM + u32(cell.z) * BRICK_DIM * BRICK_DIM;
                     let c = brick_pool[brick_base + flat];
-                    if c != BRICK_CELL_EMPTY && c != BRICK_CELL_INTERIOR {
+                    if c == BRICK_CELL_INTERIOR {
+                        // Solid-bulk cell inside a brick. Opaque
+                        // objects keep the old "skip like air"
+                        // behavior (shadow passes straight through
+                        // mesh interiors). Glass objects attenuate
+                        // by the cell's own fraction of Beer over
+                        // one cell width.
+                        let obj_opacity = materials[obj.material_id].opacity;
+                        if obj_opacity < 0.99 {
+                            let glass_albedo = mat_albedo(materials[obj.material_id]);
+                            let t_att = shadow_beer(glass_albedo, cell_size);
+                            transmittance *= t_att;
+                            if transmittance < 0.01 { blocked = true; break; }
+                        }
+                    } else if c != BRICK_CELL_EMPTY {
                         let attr = leaf_attr_pool[c];
                         let mid = leaf_attr_material_primary(attr);
                         let m_op = materials[mid].opacity;
                         if m_op >= 0.99 { blocked = true; break; }
+                        // Linear approximation — cheap, close enough
+                        // for the tiny per-cell transmission fraction
+                        // glass usually contributes. Full Beer with
+                        // cell-size thickness happens in the INTERIOR
+                        // / FACE_INTERIOR paths where the spans are
+                        // large enough to matter.
                         transmittance *= (1.0 - m_op);
                         if transmittance < 0.01 { blocked = true; break; }
                     }
@@ -525,14 +582,31 @@ fn trace_shadow_ray(
                 continue;
             }
 
-            var mat_opacity = 1.0;
-            if r.slot != OCTREE_INTERIOR {
-                atomicAdd(&stats[44], 1u);
-                let attr = leaf_attr_pool[r.slot];
-                let mid = leaf_attr_material_primary(attr);
-                atomicAdd(&stats[47], 1u);
-                mat_opacity = materials[mid].opacity;
+            // INTERIOR handling mirrors the primary march: a solid-
+            // bulk region inside a glass object attenuates the light
+            // across the full span (Beer over the node's ray length)
+            // and the shadow ray continues. Opaque INTERIOR still
+            // blocks the light, matching the existing mesh-interior
+            // shadow behavior.
+            if r.slot == OCTREE_INTERIOR {
+                let obj_opacity = materials[obj.material_id].opacity;
+                if obj_opacity < 0.99 {
+                    let span = max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);
+                    let glass_albedo = mat_albedo(materials[obj.material_id]);
+                    let span_world = span / local_scale;
+                    transmittance *= shadow_beer(glass_albedo, span_world);
+                    if transmittance < 0.01 { return 0.0; }
+                    t += span;
+                    continue;
+                }
+                return 0.0;
             }
+
+            atomicAdd(&stats[44], 1u);
+            let attr = leaf_attr_pool[r.slot];
+            let mid = leaf_attr_material_primary(attr);
+            atomicAdd(&stats[47], 1u);
+            let mat_opacity = materials[mid].opacity;
 
             if mat_opacity >= 0.99 {
                 return 0.0;

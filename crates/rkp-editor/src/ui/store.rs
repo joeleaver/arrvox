@@ -87,9 +87,17 @@ pub enum EditorMode {
 pub struct EditorStore {
     // ── Engine state (written by engine thread via send()) ────────
 
-    /// Frames per second (1 / frame work time — render-only, ignores
-    /// pacing sleep). Use `tick_hz` for the user-perceived rate.
+    /// Render thread iteration rate (EMA). Counts every frame the
+    /// renderer produced, including re-renders of the same sim
+    /// snapshot that never reach the editor surface. Use
+    /// `delivered_fps` for the rate the user actually perceives.
     pub fps: Signal<f32>,
+    /// Rate at which fresh pixel frames actually reached the editor
+    /// surface. Honest "user-visible FPS" that drops when GPU work
+    /// stretches (e.g. heavy material noise) or when sim/render
+    /// caps throttle the pixel ship. Diverges from `fps` whenever
+    /// render iterates faster than it ships.
+    pub delivered_fps: Signal<f32>,
     /// True engine tick rate including pacing sleep.
     pub tick_hz: Signal<f32>,
     /// Smoothed physics substeps per second. Stays near 60 when physics
@@ -301,6 +309,7 @@ impl EditorStore {
         Self {
             // Engine state — zeroed, engine will push real values.
             fps: Signal::new(0.0),
+            delivered_fps: Signal::new(0.0),
             tick_hz: Signal::new(0.0),
             physics_hz: Signal::new(0.0),
             gpu_object_count: Signal::new(0),

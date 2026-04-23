@@ -35,6 +35,19 @@ pub struct GBuffer {
     /// View for target 3.
     pub motion_view: wgpu::TextureView,
 
+    /// Target "glass": per-pixel glass surface info when the primary
+    /// ray passes through a transparent voxel. The primary G-buffer
+    /// targets above record the opaque hit BEHIND the glass; this
+    /// target records the glass itself so `rkp_shade` can composite
+    /// over the behind with Fresnel + Beer. `Rg32Uint`:
+    /// * R = glass normal, octahedral-packed (2×snorm16 → u32).
+    /// * G = `(thickness_mm << 16) | material_id`.
+    /// A value of `R==0, G==0` means "no glass at this pixel" —
+    /// shaders gate on `thickness_mm != 0`.
+    pub glass_texture: wgpu::Texture,
+    /// View for the glass target.
+    pub glass_view: wgpu::TextureView,
+
     /// Depth texture for rasterization-based G-buffer writes. `Depth32Float`.
     /// Used by the forward rasterization pipeline; ignored by compute march paths.
     pub depth_texture: wgpu::Texture,
@@ -65,6 +78,10 @@ pub const GBUFFER_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba
 pub const GBUFFER_MATERIAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
 /// Texture format for G-buffer target 3 (motion vectors).
 pub const GBUFFER_MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+/// Texture format for the glass target (oct-packed normal + packed
+/// thickness/material_id). Must stay `Rg32Uint` — `octree_march` and
+/// `rkp_shade` both hardcode the bit layout against these channels.
+pub const GBUFFER_GLASS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
 
 impl GBuffer {
     /// Create the G-buffer with 4 render targets at the given resolution.
@@ -131,6 +148,20 @@ impl GBuffer {
             view_formats: &[],
         });
         let motion_view = motion_texture.create_view(&Default::default());
+
+        // Glass target — oct-packed normal + (thickness_mm, material_id).
+        // See field docs on `GBuffer::glass_texture`.
+        let glass_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gbuffer glass"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GBUFFER_GLASS_FORMAT,
+            usage,
+            view_formats: &[],
+        });
+        let glass_view = glass_texture.create_view(&Default::default());
 
         // Depth texture for rasterization-based G-buffer writes
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -269,6 +300,8 @@ impl GBuffer {
             material_view,
             motion_texture,
             motion_view,
+            glass_texture,
+            glass_view,
             depth_texture,
             depth_view,
             write_bind_group_layout,

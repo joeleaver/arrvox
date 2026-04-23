@@ -28,7 +28,24 @@ impl EngineState {
     }
 }
 
-pub(crate) fn collect_leaf_slots(all_nodes: &[u32], node_idx: usize, out: &mut Vec<u32>) {
+/// Walk the octree subtree rooted at `node_idx` and collect every
+/// leaf_attr_pool slot that's reachable from this entity.
+///
+/// Handles all three terminal node kinds:
+/// - LEAF nodes: the node encodes a leaf_attr_slot directly.
+/// - BRICK nodes: the node encodes a brick_id; the brick's 64 cells
+///   each hold a leaf_attr_slot (or `BRICK_EMPTY`).
+/// - EMPTY / INTERIOR: contribute nothing.
+///
+/// Modern rkipatch terminates the octree at BRICK nodes for most
+/// geometry, so callers that only walked LEAFs saw zero voxels. This
+/// function descends into bricks via the passed-in `brick_pool`.
+pub(crate) fn collect_leaf_slots(
+    all_nodes: &[u32],
+    brick_pool: &rkp_core::brick_pool::BrickPool,
+    node_idx: usize,
+    out: &mut Vec<u32>,
+) {
     if node_idx >= all_nodes.len() {
         return;
     }
@@ -40,10 +57,55 @@ pub(crate) fn collect_leaf_slots(all_nodes: &[u32], node_idx: usize, out: &mut V
         out.push(rkp_core::sparse_octree::leaf_slot(node));
         return;
     }
+    if rkp_core::sparse_octree::is_brick(node) {
+        let bid = rkp_core::sparse_octree::brick_id(node);
+        for &cell in brick_pool.brick_cells(bid) {
+            if cell != rkp_core::brick_pool::BRICK_EMPTY {
+                out.push(cell);
+            }
+        }
+        return;
+    }
     // Branch — value is absolute offset to 8 contiguous children.
     let children_offset = node as usize;
     for octant in 0..8 {
-        collect_leaf_slots(all_nodes, children_offset + octant, out);
+        collect_leaf_slots(all_nodes, brick_pool, children_offset + octant, out);
+    }
+}
+
+/// Walk the subtree and collect every prefilter `internal_attr` slot at
+/// branch nodes. These are the aggregated leaf_attr ids the march falls
+/// back to when the LOD cutoff kicks in at distance — they must be
+/// mutated alongside the per-voxel slots whenever material state on
+/// real voxels changes, otherwise distant pixels shade through a stale
+/// prefilter and appear visually different from the close-up.
+pub(crate) fn collect_internal_attr_slots(
+    all_nodes: &[u32],
+    internal_attrs: &[u32],
+    node_idx: usize,
+    out: &mut Vec<u32>,
+) {
+    if node_idx >= all_nodes.len() {
+        return;
+    }
+    let node = all_nodes[node_idx];
+    if node == rkp_core::sparse_octree::EMPTY_NODE
+        || node == rkp_core::sparse_octree::INTERIOR_NODE
+        || rkp_core::sparse_octree::is_leaf(node)
+        || rkp_core::sparse_octree::is_brick(node)
+    {
+        return;
+    }
+    // Branch. Emit its prefilter slot (if any) and recurse.
+    if node_idx < internal_attrs.len() {
+        let attr = internal_attrs[node_idx];
+        if attr != rkp_core::sparse_octree::INTERNAL_ATTR_NONE {
+            out.push(attr);
+        }
+    }
+    let children_offset = node as usize;
+    for octant in 0..8 {
+        collect_internal_attr_slots(all_nodes, internal_attrs, children_offset + octant, out);
     }
 }
 

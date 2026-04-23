@@ -68,6 +68,12 @@ pub struct SceneObjectInfo {
 #[derive(Debug, Clone)]
 pub struct StateUpdate {
     pub fps: f32,
+    /// Rate at which fresh pixel frames actually reach the editor
+    /// surface, EMA-smoothed. `fps` above is render-thread iteration
+    /// rate; this is the honest "frames the user saw." Diverges
+    /// whenever render produces faster than it ships (interp
+    /// re-renders, 120 Hz ship cap, sim throttles below render).
+    pub delivered_fps: f32,
     /// True engine tick rate (1 / total tick interval, including pacing
     /// sleep). Reflects what the user actually perceives — distinct from
     /// `fps`, which is `1 / frame_work_time` and can read 200+ even when

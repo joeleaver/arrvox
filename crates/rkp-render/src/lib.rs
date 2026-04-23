@@ -41,6 +41,10 @@ pub mod rkp_shade;
 pub mod rkp_atmosphere;
 /// Screen-space god rays — radial blur from sun position.
 pub mod rkp_god_rays;
+/// Glass composite post-pass — Fresnel/Beer/refraction over the
+/// shaded HDR for any pixel whose primary ray passed through
+/// transparent voxels.
+pub mod rkp_glass;
 /// Volumetric rendering — fog, dust, procedural clouds.
 pub mod rkp_volumetric;
 /// Infinite world-space grid overlay (isolation-mode build viewport).

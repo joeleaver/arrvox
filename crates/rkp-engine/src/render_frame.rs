@@ -297,6 +297,17 @@ pub struct RenderResult {
     /// `None` for the very first iteration (no prior interval to
     /// measure against yet).
     pub render_dt_ms: Option<f32>,
+    /// Wall-clock interval since the *previous iteration that actually
+    /// shipped pixels to the editor surface*, in milliseconds.
+    /// `render_dt_ms` counts every render-thread iteration, including
+    /// ones that re-submitted the same sim snapshot and did not fire
+    /// `frame_callback`; this field only counts iterations where a
+    /// fresh frame reached the display. Sim EMA-smooths it into the
+    /// panel's **Delivered FPS** — the honest "what did the user
+    /// actually see" number, which diverges from Render FPS whenever
+    /// sim is slower than render or `MIN_FRAME_CALLBACK_INTERVAL`
+    /// drops ships. `None` when this iteration didn't ship.
+    pub delivered_dt_ms: Option<f32>,
 }
 
 /// Decoded pick result returned to sim.

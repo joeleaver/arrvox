@@ -285,6 +285,7 @@ fn main() -> anyhow::Result<()> {
             #[derive(Default)]
             struct LastSent {
                 fps: i32,                      // displayed as {:.0}
+                delivered_fps: i32,            // displayed as {:.0}
                 tick_hz_x10: i32,              // displayed as {:.1}, store *10
                 physics_hz_x10: i32,           // displayed as {:.1}, store *10
                 gpu_object_count: u32,
@@ -310,11 +311,16 @@ fn main() -> anyhow::Result<()> {
                 {
                     let mut ls = last_sent.lock().expect("LastSent poisoned");
                     let new_fps = update.fps.round() as i32;
+                    let new_delivered = update.delivered_fps.round() as i32;
                     let new_tick_x10 = (update.tick_hz * 10.0).round() as i32;
                     let new_phys_x10 = (update.physics_hz * 10.0).round() as i32;
                     if !ls.initialized || ls.fps != new_fps {
                         ls.fps = new_fps;
                         store.fps.send(update.fps);
+                    }
+                    if !ls.initialized || ls.delivered_fps != new_delivered {
+                        ls.delivered_fps = new_delivered;
+                        store.delivered_fps.send(update.delivered_fps);
                     }
                     if !ls.initialized || ls.tick_hz_x10 != new_tick_x10 {
                         ls.tick_hz_x10 = new_tick_x10;

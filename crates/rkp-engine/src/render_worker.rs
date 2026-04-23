@@ -652,7 +652,7 @@ fn run_render_thread(
         //    re-render the same snapshot data — those frames have
         //    no new content to display and just thrash rinch's
         //    surface buffer Mutex.
-        let cloud_sun_atten_raw = render_one_frame(
+        let outcome = render_one_frame(
             &mut state,
             &curr,
             &interp_objects,
@@ -668,9 +668,10 @@ fn run_render_thread(
             .send(RenderResult {
                 frame_index,
                 pick_result,
-                cloud_sun_atten_raw,
+                cloud_sun_atten_raw: outcome.cloud_sun_atten_raw,
                 gpu_passes,
                 render_dt_ms,
+                delivered_dt_ms: outcome.delivered_dt_ms,
             })
             .is_err()
         {
@@ -761,8 +762,7 @@ fn lerp_world_matrix(
     glam::Mat4::from_scale_rotation_translation(s, r, t).to_cols_array_2d()
 }
 
-/// Render a single snapshot. Returns the latest cloud-sun attenuation
-/// read from MAIN's volumetric pass (NaN if MAIN isn't visible).
+/// Render a single snapshot.
 ///
 /// `frame` is the canonical sim snapshot (lights, environment,
 /// cameras, proc raymarch state, etc.). `gpu_objects` is the
@@ -778,13 +778,24 @@ fn lerp_world_matrix(
 /// to the editor surface (the content didn't change, so shipping
 /// would just thrash rinch's `Mutex<RenderSurfaceBuffer>` with no
 /// visible benefit).
+struct RenderOutcome {
+    /// Latest cloud-sun attenuation read from MAIN's volumetric
+    /// pass (NaN if MAIN isn't visible).
+    cloud_sun_atten_raw: f32,
+    /// Wall-clock ms since the previous iteration that successfully
+    /// shipped pixels to the editor. `None` when this iteration did
+    /// not ship (skipped via `ship_pixels` gate) — sim uses `None`
+    /// to hold the previous delivered-FPS EMA sample unchanged.
+    delivered_dt_ms: Option<f32>,
+}
+
 fn render_one_frame(
     state: &mut RenderState,
     frame: &RenderFrame,
     gpu_objects: &[rkp_render::rkp_gpu_object::RkpGpuObject],
     new_snapshot_consumed: bool,
     frame_callback: &FrameCallback,
-) -> f32 {
+) -> RenderOutcome {
     // 0. Drive the wgpu async runtime so any in-flight async maps can
     //    complete (volumetric sun-atten readbacks, frame readbacks,
     //    pick readbacks).
@@ -1190,6 +1201,16 @@ fn render_one_frame(
     let time_ok = now.duration_since(state.last_frame_callback)
         >= MIN_FRAME_CALLBACK_INTERVAL;
     let ship_pixels = new_snapshot_consumed && time_ok;
+    // Interval since the previous successful pixel ship. Sampled
+    // BEFORE we update `last_frame_callback` below so we get the
+    // gap between ship N-1 and ship N. Only populated when at least
+    // one viewport actually handed fresh pixels to the callback —
+    // `ship_pixels` gates the try, but `cached_pixels()` may still
+    // return None (readback not ready). Delivered FPS should only
+    // count real pixel deliveries; a skipped ship leaves the sim
+    // EMA unchanged rather than double-counting.
+    let mut delivered_dt_ms: Option<f32> = None;
+    let mut shipped_any = false;
     for vp in &frame.viewports {
         let vr = state
             .viewport_renderers
@@ -1202,13 +1223,17 @@ fn render_one_frame(
         if ship_pixels {
             if let Some((pixels, cw, ch)) = vr.readback.cached_pixels() {
                 frame_callback(vp.id, pixels, cw, ch);
+                shipped_any = true;
             }
         }
     }
-    if ship_pixels {
+    if shipped_any {
+        delivered_dt_ms = Some(
+            now.duration_since(state.last_frame_callback).as_secs_f32() * 1000.0,
+        );
         state.last_frame_callback = now;
     }
 
-    cloud_sun_atten_raw
+    RenderOutcome { cloud_sun_atten_raw, delivered_dt_ms }
 }
 

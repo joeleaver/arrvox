@@ -58,6 +58,7 @@ pub struct ViewportRenderer {
     pub shadow_trace: ShadowTracePass,
     pub ssao: RkpSsaoPass,
     pub shade: RkpShadePass,
+    pub glass: crate::rkp_glass::RkpGlassPass,
     pub volumetric: RkpVolumetricPass,
     pub god_rays: RkpGodRayPass,
 
@@ -131,7 +132,7 @@ impl ViewportRenderer {
         let mut march = OctreeMarchPass::new(device, &renderer.scene.bind_group_layout);
         march.set_materials(device, &renderer.materials_buffer);
         march.set_lights(device, &renderer.lights_buffer);
-        march.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view);
+        march.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view, &gbuffer.glass_view);
 
         // Procedural CSG raymarch — alternative primary-visibility pass
         // for the build viewport. Wired to the same per-VR camera + gbuffer
@@ -139,7 +140,7 @@ impl ViewportRenderer {
         // the rest of the chain.
         let mut proc_raymarch = ProcRaymarchPass::new(device);
         proc_raymarch.set_camera(device, &camera_buffer);
-        proc_raymarch.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view);
+        proc_raymarch.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view, &gbuffer.glass_view);
 
         // Outline overlay — rebind the pick gbuffer view on resize.
         let mut proc_outline = ProcOutlinePass::new(device, crate::LDR_FORMAT);
@@ -174,15 +175,30 @@ impl ViewportRenderer {
             &renderer.atmosphere.sky_view_view,
             &renderer.atmosphere.ap_view,
         );
-        shade.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view);
+        shade.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &gbuffer.glass_view);
         shade.set_shadow_and_ssao(device, &shadow_trace.output_view, &ssao.output_view);
 
+        // Pass order: shade → volumetric → glass → god_rays. Glass
+        // runs AFTER volumetric so clouds / fog are composited into
+        // the "behind" HDR first, and then refracted / Beer-tinted
+        // through the glass (so clouds visible through a glass pane
+        // correctly bend rather than getting stamped on top of the
+        // glass composite).
         let mut volumetric = RkpVolumetricPass::new(device, width, height);
         volumetric.set_depth_view(device, &gbuffer.position_view);
         volumetric.set_scene_hdr_view(device, &shade.output_view);
 
+        let mut glass = crate::rkp_glass::RkpGlassPass::new(device, width, height);
+        glass.set_inputs(
+            device,
+            &volumetric.output_view,
+            &gbuffer.glass_view,
+            &camera_buffer,
+            &renderer.materials_buffer,
+        );
+
         let mut god_rays = RkpGodRayPass::new(device, width, height);
-        god_rays.set_inputs(device, &volumetric.output_view, &gbuffer.position_view, &volumetric.cloud_view);
+        god_rays.set_inputs(device, &glass.output_view, &gbuffer.position_view, &volumetric.cloud_view);
 
         // VR-owned bloom / tonemap chain reads this VR's god_rays output.
         let bloom = crate::BloomPass::new(device, &god_rays.output_view, width, height);
@@ -218,7 +234,7 @@ impl ViewportRenderer {
         Self {
             camera_buffer, scene_bind_group, scene_epoch, lights_materials_epoch,
             march, proc_raymarch, proc_outline, proc_ghost,
-            shadow_trace, ssao, shade, volumetric, god_rays,
+            shadow_trace, ssao, shade, glass, volumetric, god_rays,
             gbuffer, pick_texture, pick_view, bloom, bloom_composite, tone_map,
             composite_texture, composite_view,
             readback,
@@ -250,6 +266,18 @@ impl ViewportRenderer {
                 &renderer.lights_buffer,
                 &renderer.materials_buffer,
             );
+            // Glass pass also reads the materials SSBO (for glass
+            // albedo / IOR) — refresh its binding when the buffer
+            // reallocates alongside the other consumers. Input
+            // HDR comes from volumetric so clouds / fog land in
+            // the "behind" before glass Fresnel + refraction.
+            self.glass.set_inputs(
+                device,
+                &self.volumetric.output_view,
+                &self.gbuffer.glass_view,
+                &self.camera_buffer,
+                &renderer.materials_buffer,
+            );
             self.lights_materials_epoch = lm_now;
         }
     }
@@ -277,8 +305,8 @@ impl ViewportRenderer {
         self.pick_view = pick_view;
 
         // Per-VR passes — resize internal textures + re-wire gbuffer bindings.
-        self.march.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view);
-        self.proc_raymarch.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view);
+        self.march.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view, &self.gbuffer.glass_view);
+        self.proc_raymarch.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view, &self.gbuffer.glass_view);
         self.proc_outline.set_gbuffer(device, &self.pick_view);
 
         self.ssao.resize(device, width, height);
@@ -288,15 +316,24 @@ impl ViewportRenderer {
         self.shadow_trace.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view);
 
         self.shade.resize(device, width, height);
-        self.shade.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view);
+        self.shade.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.gbuffer.glass_view);
         self.shade.set_shadow_and_ssao(device, &self.shadow_trace.output_view, &self.ssao.output_view);
 
         self.volumetric.resize(device, width, height);
         self.volumetric.set_depth_view(device, &self.gbuffer.position_view);
         self.volumetric.set_scene_hdr_view(device, &self.shade.output_view);
 
+        self.glass.resize(device, width, height);
+        self.glass.set_inputs(
+            device,
+            &self.volumetric.output_view,
+            &self.gbuffer.glass_view,
+            &self.camera_buffer,
+            &renderer.materials_buffer,
+        );
+
         self.god_rays.resize(device, width, height);
-        self.god_rays.set_inputs(device, &self.volumetric.output_view, &self.gbuffer.position_view, &self.volumetric.cloud_view);
+        self.god_rays.set_inputs(device, &self.glass.output_view, &self.gbuffer.position_view, &self.volumetric.cloud_view);
 
         // Bloom / tonemap chain — these hold their own output textures.
         self.bloom = crate::BloomPass::new(device, &self.god_rays.output_view, width, height);

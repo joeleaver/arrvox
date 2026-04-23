@@ -174,7 +174,7 @@ impl Default for SphereParams {
         Self {
             radius: 0.5,
             material_id: 0,
-            color: Vec3::ONE,
+            color: Vec3::ZERO,
         }
     }
 }
@@ -196,7 +196,7 @@ impl Default for BoxParams {
             half_extents: Vec3::splat(0.5),
             rounding: 0.0,
             material_id: 0,
-            color: Vec3::ONE,
+            color: Vec3::ZERO,
         }
     }
 }
@@ -217,7 +217,7 @@ impl Default for CapsuleParams {
             half_height: 0.5,
             radius: 0.25,
             material_id: 0,
-            color: Vec3::ONE,
+            color: Vec3::ZERO,
         }
     }
 }
@@ -237,7 +237,7 @@ impl Default for CylinderParams {
             half_height: 0.5,
             radius: 0.25,
             material_id: 0,
-            color: Vec3::ONE,
+            color: Vec3::ZERO,
         }
     }
 }
@@ -259,7 +259,7 @@ impl Default for TorusParams {
             major_radius: 0.5,
             minor_radius: 0.15,
             material_id: 0,
-            color: Vec3::ONE,
+            color: Vec3::ZERO,
         }
     }
 }
@@ -276,7 +276,7 @@ impl Default for PlaneParams {
     fn default() -> Self {
         Self {
             material_id: 0,
-            color: Vec3::ONE,
+            color: Vec3::ZERO,
         }
     }
 }
@@ -303,7 +303,7 @@ impl Default for RampParams {
             half_height: 0.25,
             half_width: 0.5,
             material_id: 0,
-            color: Vec3::ONE,
+            color: Vec3::ZERO,
         }
     }
 }

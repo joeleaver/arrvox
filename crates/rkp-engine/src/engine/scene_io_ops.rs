@@ -59,6 +59,7 @@ impl EngineState {
                                     voxel_count: info.voxel_count,
                                     spatial: Some(spatial),
                                     asset_handle: Some(handle),
+                                    material_overrides: obj.material_overrides.clone(),
                                     ..Default::default()
                                 }));
                                 self.geometry_dirty = true;
@@ -126,6 +127,7 @@ impl EngineState {
                             voxel_count,
                             spatial,
                             asset_handle,
+                            material_overrides: obj.material_overrides.clone(),
                             ..Default::default()
                         }));
                         self.geometry_dirty = true;
@@ -153,6 +155,7 @@ impl EngineState {
                                 material_id: obj.material_id,
                                 voxel_count: result.voxel_count,
                                 spatial: Some(spatial),
+                                material_overrides: obj.material_overrides.clone(),
                                 ..Default::default()
                             }));
                             self.geometry_dirty = true;
@@ -170,6 +173,18 @@ impl EngineState {
                         // references, per-entity persisted data).
                         self.set_entity_uuid(e, obj.id);
                         uuid_to_hecs.insert(obj.id, e);
+
+                        // Replay any persisted material overrides
+                        // against the freshly-loaded voxels. The
+                        // `Renderable` already carries the override
+                        // list for future saves; this brings the
+                        // live voxel state in line with it.
+                        // `remap_entity_material` is a no-op when
+                        // `from == to` or when no voxels match, so
+                        // stale entries self-heal rather than error.
+                        for &(from, to) in &obj.material_overrides {
+                            self.remap_entity_material(e, from, to);
+                        }
                         // Tree order: prefer the persisted value.
                         // Legacy saves without `tree_order` get a
                         // fresh monotonic key *in file order* — the
@@ -433,7 +448,11 @@ impl EngineState {
                 asset_path: renderable.as_ref().and_then(|r| r.asset_path.clone()),
                 primitive: renderable.as_ref().and_then(|r| r.primitive.clone()),
                 procedural_cache,
-                material_id: renderable.map(|r| r.material_id).unwrap_or(0),
+                material_id: renderable.as_ref().map(|r| r.material_id).unwrap_or(0),
+                material_overrides: renderable
+                    .as_ref()
+                    .map(|r| r.material_overrides.clone())
+                    .unwrap_or_default(),
                 point_light: point_light.map(|l| crate::scene_io::ScenePointLight {
                     color: l.color,
                     intensity: l.intensity,
