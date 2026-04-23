@@ -86,6 +86,13 @@ impl RkpGlassPass {
                     },
                     count: None,
                 },
+                // 5: gbuf_position (world pos + hit distance) — used as
+                // the screen-space refraction anchor so offsets scale
+                // correctly with glass thickness regardless of camera
+                // orientation. Sampling near-camera anchors gave depth-
+                // invariant offsets that flipped sign based on the
+                // projection's quirks.
+                sampled_float(5),
             ],
         });
 
@@ -125,6 +132,7 @@ impl RkpGlassPass {
     /// Rebind every input + output. Call on init, resize, and any time
     /// a source view is re-created (G-buffer rebuild, HDR recreate,
     /// materials buffer reallocation).
+    #[allow(clippy::too_many_arguments)]
     pub fn set_inputs(
         &mut self,
         device: &wgpu::Device,
@@ -132,6 +140,7 @@ impl RkpGlassPass {
         gbuf_glass_view: &wgpu::TextureView,
         camera_buffer: &wgpu::Buffer,
         materials_buffer: &wgpu::Buffer,
+        gbuf_position_view: &wgpu::TextureView,
     ) {
         self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rkp_glass bg"),
@@ -142,6 +151,7 @@ impl RkpGlassPass {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.output_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: camera_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: materials_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(gbuf_position_view) },
             ],
         }));
     }

@@ -68,8 +68,9 @@ struct RaymarchParams {
 @group(1) @binding(3) var gbuf_pick:     texture_storage_2d<r32uint, write>;
 // Glass info — proc_raymarch has no glass support; write zero here so
 // the shared buffer stays coherent with `octree_march`. Layout: R =
-// oct-packed normal, G = (thickness_mm << 16) | material_id.
-@group(1) @binding(4) var gbuf_glass:    texture_storage_2d<rg32uint, write>;
+// oct-packed entry normal, G = (thickness_mm << 16) | material_id,
+// B = oct-packed exit normal, A = reserved.
+@group(1) @binding(4) var gbuf_glass:    texture_storage_2d<rgba32uint, write>;
 
 @group(2) @binding(0) var<uniform> params: RaymarchParams;
 @group(2) @binding(1) var<storage, read> instructions: array<ProcInstruction>;

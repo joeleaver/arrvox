@@ -134,7 +134,7 @@ impl ProcRaymarchPass {
                     // glass (yet); the shader writes 0 to keep this
                     // buffer coherent with what octree_march wrote
                     // elsewhere in the frame.
-                    bgl_storage_tex(4, wgpu::TextureFormat::Rg32Uint),
+                    bgl_storage_tex(4, wgpu::TextureFormat::Rgba32Uint),
                 ],
             });
 

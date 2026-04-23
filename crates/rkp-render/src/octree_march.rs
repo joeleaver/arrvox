@@ -85,11 +85,12 @@ impl OctreeMarchPass {
                     bgl_storage_tex(1, wgpu::TextureFormat::Rgba16Float),
                     bgl_storage_tex(2, wgpu::TextureFormat::Rg32Uint),
                     bgl_storage_tex(3, wgpu::TextureFormat::R32Uint),
-                    // Glass info target — oct-packed normal + packed
-                    // (thickness_mm, material_id). Written only when
-                    // the primary ray passes through a transparent
-                    // voxel; rkp_shade gates on `thickness_mm != 0`.
-                    bgl_storage_tex(4, wgpu::TextureFormat::Rg32Uint),
+                    // Glass info target — oct-packed entry normal,
+                    // packed (thickness_mm, material_id), oct-packed
+                    // exit normal, reserved. Written only when the
+                    // primary ray passes through a transparent voxel;
+                    // rkp_glass gates on `thickness_mm != 0`.
+                    bgl_storage_tex(4, wgpu::TextureFormat::Rgba32Uint),
                 ],
             });
 
