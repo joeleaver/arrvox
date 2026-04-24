@@ -7,7 +7,7 @@ use rkp_engine::viewport::ViewportId;
 
 use crate::CommandSender;
 use crate::ui::store::EditorStore;
-use super::viewport_toolbar::{ViewportHeaderBar, EditModeToolbar};
+use super::viewport_toolbar::{ViewportHeaderBar, EditModeToolbar, PaintToolbar};
 
 /// The viewport id this panel renders. Phase 3: only the MAIN viewport has
 /// a UI panel; the build viewport gets its own component in Phase 6.
@@ -61,6 +61,9 @@ pub fn Viewport() -> NodeHandle {
     // Track last mouse position for computing deltas.
     let last_mx = std::cell::Cell::new(0.0f32);
     let last_my = std::cell::Cell::new(0.0f32);
+    // LMB-held state — paint mode uses this to decide whether a
+    // MouseMove event should fire another `PaintAtPixel` stamp.
+    let lmb_held = std::cell::Cell::new(false);
 
     let cmd_tx = cmd.0.clone();
     let surface_for_handler = surface.clone();
@@ -79,6 +82,25 @@ pub fn Viewport() -> NodeHandle {
             });
         }
 
+        // Small helper that reads the current paint signals out of the
+        // store and sends a `PaintAtPixel` for the given pixel. The
+        // engine coalesces picks (only one in-flight at a time) so
+        // firing this on every MouseMove during a drag is safe —
+        // intermediate requests get replaced, not queued.
+        let send_paint_stamp = |x: f32, y: f32| {
+            let _ = cmd_tx.send(rkp_engine::EngineCommand::PaintAtPixel {
+                id: PANEL_VIEWPORT,
+                x: x.max(0.0) as u32,
+                y: y.max(0.0) as u32,
+                radius: store.paint_radius.get(),
+                color: store.paint_color.get(),
+                strength: store.paint_strength.get(),
+                falloff: store.paint_falloff.get(),
+                mode: store.paint_mode.get(),
+                material_id: store.selected_material.get().unwrap_or(0),
+            });
+        };
+
         match event {
             MouseMove { x, y } => {
                 let dx = x - last_mx.get();
@@ -88,6 +110,23 @@ pub fn Viewport() -> NodeHandle {
                 let _ = cmd_tx.send(rkp_engine::EngineCommand::MouseMove {
                     id: PANEL_VIEWPORT, x, y, dx, dy,
                 });
+                // Paint-drag: in paint mode with LMB held, each mouse
+                // move issues another stamp. The engine's pick
+                // in-flight gate naturally coalesces duplicates.
+                if store.paint_active.get() {
+                    if lmb_held.get() {
+                        send_paint_stamp(x, y);
+                    } else {
+                        // Hover: track the cursor sphere to the mouse
+                        // without writing any paint. Engine updates
+                        // `paint_cursor_world` from the pick result.
+                        let _ = cmd_tx.send(rkp_engine::EngineCommand::PaintHoverAtPixel {
+                            id: PANEL_VIEWPORT,
+                            x: x.max(0.0) as u32,
+                            y: y.max(0.0) as u32,
+                        });
+                    }
+                }
             }
             MouseDown { button, x, y } => {
                 let _ = cmd_tx.send(rkp_engine::EngineCommand::MouseButton {
@@ -95,13 +134,20 @@ pub fn Viewport() -> NodeHandle {
                     button: map_button(button),
                     pressed: true,
                 });
-                // Left click → pick object at this pixel.
                 if button == SurfaceMouseButton::Left {
-                    let _ = cmd_tx.send(rkp_engine::EngineCommand::Pick {
-                        id: PANEL_VIEWPORT,
-                        x: x as u32,
-                        y: y as u32,
-                    });
+                    lmb_held.set(true);
+                    if store.paint_active.get() {
+                        // Paint mode owns LMB — suppress the normal
+                        // click-select pick so the click doesn't
+                        // deselect everything while painting.
+                        send_paint_stamp(x, y);
+                    } else {
+                        let _ = cmd_tx.send(rkp_engine::EngineCommand::Pick {
+                            id: PANEL_VIEWPORT,
+                            x: x as u32,
+                            y: y as u32,
+                        });
+                    }
                 }
             }
             MouseUp { button, .. } => {
@@ -110,6 +156,9 @@ pub fn Viewport() -> NodeHandle {
                     button: map_button(button),
                     pressed: false,
                 });
+                if button == SurfaceMouseButton::Left {
+                    lmb_held.set(false);
+                }
             }
             MouseWheel { delta_y, .. } => {
                 let _ = cmd_tx.send(rkp_engine::EngineCommand::Scroll {
@@ -128,6 +177,18 @@ pub fn Viewport() -> NodeHandle {
                     } else {
                         let _ = cmd_tx.send(rkp_engine::EngineCommand::PlayStart);
                     }
+                }
+                // P → toggle paint mode. Same signal the PaintToolbar
+                // button writes, so the overlay updates immediately,
+                // and we mirror the SetPaintActive command so the
+                // engine lights up the cursor wireframe.
+                if key_data.code == "KeyP" {
+                    let on = !store.paint_active.get();
+                    store.paint_active.set(on);
+                    let _ = cmd_tx.send(rkp_engine::EngineCommand::SetPaintActive {
+                        active: on,
+                        radius: store.paint_radius.get(),
+                    });
                 }
                 if let Some(key) = map_key(&key_data.code) {
                     let _ = cmd_tx.send(rkp_engine::EngineCommand::KeyDown { key });
@@ -233,6 +294,7 @@ pub fn Viewport() -> NodeHandle {
                 style: "flex:1;min-height:0;position:relative;",
                 RenderSurface { surface: Some(surface.clone()) }
                 EditModeToolbar {}
+                PaintToolbar {}
             }
         }
     }

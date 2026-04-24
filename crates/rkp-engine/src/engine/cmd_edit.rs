@@ -551,6 +551,69 @@ impl EngineState {
                     info.voxel_count,
                 ));
             }
+            EngineCommand::Paint { position, normal, radius, color, strength, mode } => {
+                super::paint_ops::dispatch_paint(
+                    self, position, normal, radius, color, strength, mode,
+                );
+            }
+
+            EngineCommand::SetPaintActive { active, radius } => {
+                let radius_changed = (self.paint_mode_radius - radius).abs() > 1e-6;
+                self.paint_mode_active = active;
+                self.paint_mode_radius = radius;
+                if !active {
+                    // Drop any cached hover state so the cursor doesn't
+                    // flash back on the next paint-mode toggle. The
+                    // world_pos gets repopulated by the first hover
+                    // pick after re-enabling.
+                    self.paint_cursor_world = None;
+                    self.paint_cursor_entity = None;
+                    self.paint_hover_pending = None;
+                    if let Ok(mut sm) = self.scene_mgr.lock() {
+                        sm.clear_brush_overlay();
+                    }
+                } else if radius_changed {
+                    // Radius slider moved while paint is on — re-flood
+                    // at the new footprint without waiting for the next
+                    // mouse move.
+                    self.refresh_brush_overlay();
+                }
+            }
+
+            EngineCommand::PaintHoverAtPixel { id, x, y } => {
+                use super::state::PendingPick;
+                // Only track cursor while paint mode is actually on —
+                // a stale hover command after the user toggled off
+                // shouldn't resurrect the cursor.
+                if !self.paint_mode_active {
+                    return Ok(());
+                }
+                self.pending_pick = Some(PendingPick {
+                    viewport: id, x, y, ghost_pick_node_id: None,
+                });
+                self.paint_hover_pending = Some(id);
+            }
+
+            EngineCommand::PaintAtPixel {
+                id, x, y, radius, color, strength, falloff, mode, material_id,
+            } => {
+                use super::state::{PaintPickSettings, PendingPick};
+                // Stage a pick at (x, y); `paint_pick_settings` flags
+                // this as a paint readback so the result bypasses
+                // selection / drag-preview handling when it returns.
+                // Matches the drag-preview pattern (cmd_scene.rs:291)
+                // which also rides on the pending_pick pipeline.
+                self.pending_pick = Some(PendingPick {
+                    viewport: id, x, y, ghost_pick_node_id: None,
+                });
+                self.paint_pick_settings = Some(PaintPickSettings {
+                    radius, color, strength, falloff, mode, material_id,
+                });
+                // A stamp supersedes any in-flight hover pick — the
+                // stamp path updates the cursor itself from pr.position.
+                self.paint_hover_pending = None;
+            }
+
             other => return Err(other),
         }
         Ok(())

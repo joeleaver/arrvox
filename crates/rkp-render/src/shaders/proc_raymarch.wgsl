@@ -70,6 +70,10 @@ struct RaymarchParams {
 // the shared buffer stays coherent with `octree_march`. Layout: R =
 // oct-packed normal, G = (thickness_mm << 16) | material_id.
 @group(1) @binding(4) var gbuf_glass:    texture_storage_2d<rg32uint, write>;
+// Leaf-slot target — procedurals write 0 since they have no stable
+// leaf_attr_slot; the shade pass treats 0 as "no geodesic data for
+// this pixel" and skips the paint cursor there.
+@group(1) @binding(5) var gbuf_leaf_slot: texture_storage_2d<r32uint, write>;
 
 @group(2) @binding(0) var<uniform> params: RaymarchParams;
 @group(2) @binding(1) var<storage, read> instructions: array<ProcInstruction>;
@@ -145,6 +149,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(gbuf_material, coord, vec4<u32>(0u, 0u, 0u, 0u));
         textureStore(gbuf_pick,     coord, vec4<u32>(0xFFFFu, 0u, 0u, 0u));
         textureStore(gbuf_glass,    coord, vec4<u32>(0u, 0u, 0u, 0u));
+        textureStore(gbuf_leaf_slot, coord, vec4<u32>(0u, 0u, 0u, 0u));
         return;
     }
 
@@ -186,6 +191,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // as a miss.
         textureStore(gbuf_pick,     coord, vec4<u32>(0xFFFFu, 0u, 0u, 0u));
         textureStore(gbuf_glass,    coord, vec4<u32>(0u, 0u, 0u, 0u));
+        textureStore(gbuf_leaf_slot, coord, vec4<u32>(0u, 0u, 0u, 0u));
         return;
     }
 
@@ -239,4 +245,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(gbuf_material, coord, vec4<u32>(packed_r, packed_g, 0u, 0u));
     textureStore(gbuf_pick,     coord, vec4<u32>(primitive_node_id, 0u, 0u, 0u));
     textureStore(gbuf_glass,    coord, vec4<u32>(0u, 0u, 0u, 0u));
+    textureStore(gbuf_leaf_slot, coord, vec4<u32>(0u, 0u, 0u, 0u));
 }

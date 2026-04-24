@@ -48,6 +48,15 @@ pub struct GBuffer {
     /// View for the glass target.
     pub glass_view: wgpu::TextureView,
 
+    /// Target "leaf_slot": scene-global leaf_attr slot of the primary
+    /// hit. `R32Uint` — `0` means "no hit" (sky or procedural surface
+    /// without a stable leaf slot); any other value indexes
+    /// `leaf_attr_pool` / `color_pool` / `brush_overlay` in downstream
+    /// passes. Written by octree_march + proc_raymarch, read by
+    /// rkp_shade for the geodesic paint cursor (Phase 3b).
+    pub leaf_slot_texture: wgpu::Texture,
+    pub leaf_slot_view: wgpu::TextureView,
+
     /// Depth texture for rasterization-based G-buffer writes. `Depth32Float`.
     /// Used by the forward rasterization pipeline; ignored by compute march paths.
     pub depth_texture: wgpu::Texture,
@@ -83,6 +92,10 @@ pub const GBUFFER_MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba
 /// breaks `octree_march`, `proc_raymarch`, and `rkp_glass` — all
 /// hardcode against this channel layout.
 pub const GBUFFER_GLASS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
+/// Texture format for the leaf_slot target — R32Uint carrying the
+/// primary hit's scene-global `leaf_attr_slot`. `0` = sky / no hit.
+/// Used by rkp_shade's geodesic paint cursor.
+pub const GBUFFER_LEAF_SLOT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 
 impl GBuffer {
     /// Create the G-buffer with 4 render targets at the given resolution.
@@ -163,6 +176,20 @@ impl GBuffer {
             view_formats: &[],
         });
         let glass_view = glass_texture.create_view(&Default::default());
+
+        // Leaf-slot target — primary hit's leaf_attr_slot. Used by
+        // the shade pass for the geodesic paint cursor (Phase 3b).
+        let leaf_slot_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gbuffer leaf_slot"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GBUFFER_LEAF_SLOT_FORMAT,
+            usage,
+            view_formats: &[],
+        });
+        let leaf_slot_view = leaf_slot_texture.create_view(&Default::default());
 
         // Depth texture for rasterization-based G-buffer writes
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -303,6 +330,8 @@ impl GBuffer {
             motion_view,
             glass_texture,
             glass_view,
+            leaf_slot_texture,
+            leaf_slot_view,
             depth_texture,
             depth_view,
             write_bind_group_layout,

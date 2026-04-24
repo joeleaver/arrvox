@@ -145,16 +145,33 @@ pub struct EditorStore {
     pub editor_mode: Signal<EditorMode>,
 
     // ── Tool settings (written by UI) ────────────────────────────
-    // Reserved for the upcoming sculpt/paint tool. Already plumbed
-    // into the store so the toolbar + brush-param panel can bind
-    // without a later store-struct churn.
+    // Sculpt settings stay allow(dead_code) — sculpt isn't wired yet.
 
     #[allow(dead_code)]
     pub sculpt_radius: Signal<f32>,
     #[allow(dead_code)]
     pub sculpt_strength: Signal<f32>,
-    #[allow(dead_code)]
+
+    // ── Paint tool state ─────────────────────────────────────────
+    /// Whether paint mode is active — when true, LMB-drag in the
+    /// viewport fires `PaintAtPixel` commands instead of `Pick`.
+    /// Toggled by the floating PaintToolbar button and the 'P' key.
+    pub paint_active: Signal<bool>,
+    /// Material vs color vs erase. `Material` paints the currently
+    /// selected palette entry; `Color` paints `paint_color`.
+    pub paint_mode: Signal<rkp_engine::PaintMode>,
+    /// RGB color used in `PaintMode::Color`. Default = red —
+    /// visible enough for Phase-2 validation without a picker. Phase 4
+    /// replaces the hardcoded value with an interactive color picker.
     pub paint_color: Signal<[f32; 3]>,
+    /// Brush world-space radius (meters). 0.5m covers a noticeable
+    /// patch on typical scenes without repainting an entire object.
+    pub paint_radius: Signal<f32>,
+    /// Stroke strength (0..1). 1.0 = full weight at the brush center.
+    pub paint_strength: Signal<f32>,
+    /// Smoothstep shoulder width (0..1). 0 = hard edge, 1 = smoothstep
+    /// all the way from center.
+    pub paint_falloff: Signal<f32>,
 
     // ── Project state (written by engine) ───────────────────────
 
@@ -331,7 +348,16 @@ impl EditorStore {
             // Tool settings.
             sculpt_radius: Signal::new(1.0),
             sculpt_strength: Signal::new(0.5),
-            paint_color: Signal::new([0.8, 0.2, 0.2]),
+
+            // Paint tool state. Red + Color mode is the Phase-2
+            // validation default: visible against most scene albedos
+            // without a picker UI.
+            paint_active: Signal::new(false),
+            paint_mode: Signal::new(rkp_engine::PaintMode::Color),
+            paint_color: Signal::new([1.0, 0.0, 0.0]),
+            paint_radius: Signal::new(0.5),
+            paint_strength: Signal::new(1.0),
+            paint_falloff: Signal::new(0.5),
 
             // Project state.
             project_loaded: Signal::new(false),

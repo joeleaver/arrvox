@@ -319,6 +319,37 @@ pub struct RkpSceneManager {
     /// directly; only the actual geometry-mutation methods need the
     /// Mutex (which they already hold via `&mut self`).
     geometry_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+
+    // ── Paint data writes (Phase 3b perf) ───────────────────────────
+    /// Separate epoch for paint mutations. Pre-perf: paint bumped
+    /// `geometry_epoch`, which made the render thread re-upload every
+    /// scene buffer (octree + leaf_attr + color + bricks + face
+    /// links) — ~45 MB per stroke stamp on a 1M-leaf scene, at 60 Hz
+    /// that's ~2.7 GB/s for a few bytes of actual change. Paint now
+    /// bumps this epoch instead, and the render thread only uploads
+    /// the dirty slot range of `leaf_attr_pool` + `color_pool`.
+    paint_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Inclusive `[min, max]` slot range modified by paint since the
+    /// last upload. Accumulates across stamps; reset on upload.
+    paint_dirty_range: Option<(u32, u32)>,
+
+    // ── Paint cursor overlay (Phase 3b) ─────────────────────────────
+    /// Per-leaf geodesic distance from the paint cursor's world hit,
+    /// parallel to [`LeafAttrPool`] slots. `f32::INFINITY` means "not
+    /// currently under the brush"; finite values are surface-walking
+    /// distances produced by [`crate::paint::surface_flood_fill`]. The
+    /// shade pass reads this array to draw the cursor ring — indexing
+    /// by the leaf_slot written to `gbuf_leaf_slot`.
+    brush_overlay_distances: Vec<f32>,
+    /// Leaf slots written by the most recent flood fill. Next update
+    /// resets each back to `f32::INFINITY` before writing the new fill
+    /// — cheap O(previous_fill_size) vs. clearing the whole array.
+    brush_overlay_flooded_slots: Vec<u32>,
+    /// Bumped on every brush-overlay mutation. Separate from
+    /// `geometry_epoch` so the render thread can re-upload the small
+    /// overlay buffer every time the cursor moves without triggering
+    /// a full re-upload of octree / leaf_attr / color buffers.
+    brush_overlay_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl RkpSceneManager {
@@ -333,6 +364,11 @@ impl RkpSceneManager {
             pending_faces: Vec::new(),
             faces_dirty: false,
             geometry_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            paint_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            paint_dirty_range: None,
+            brush_overlay_distances: vec![f32::INFINITY; capacity as usize],
+            brush_overlay_flooded_slots: Vec::new(),
+            brush_overlay_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -353,6 +389,9 @@ impl RkpSceneManager {
         self.asset_cache = AssetCache::default();
         self.pending_faces.clear();
         self.faces_dirty = false;
+        self.brush_overlay_distances = vec![f32::INFINITY; capacity as usize];
+        self.brush_overlay_flooded_slots.clear();
+        self.bump_brush_overlay_epoch();
         // Preserve the Arc identity, but bump the value so the
         // shared handle observes the wipe.
         self.bump_geometry_epoch();
@@ -921,6 +960,318 @@ impl RkpSceneManager {
     /// asset was imported without bone weights.
     pub fn skinning_data(&self, handle: AssetHandle) -> Option<&SkinningAssetData> {
         self.asset_cache.get(handle)?.skinning.as_ref()
+    }
+
+    // ── Paint data epoch + dirty range ─────────────────────────────
+
+    /// Current paint-data epoch (lock-free read). Bumped by
+    /// `apply_paint_sphere` when leaf_attr / color writes happen.
+    /// Render polls this to decide whether to slice-upload the
+    /// dirty range.
+    pub fn paint_epoch(&self) -> u64 {
+        self.paint_epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Clone of the paint-epoch atomic for lock-free sim-side reads.
+    pub fn paint_epoch_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.paint_epoch.clone()
+    }
+
+    fn bump_paint_epoch(&mut self) {
+        self.paint_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    fn mark_paint_range_dirty(&mut self, slot: u32) {
+        self.paint_dirty_range = Some(match self.paint_dirty_range {
+            Some((a, b)) => (a.min(slot), b.max(slot)),
+            None => (slot, slot),
+        });
+    }
+
+    /// Take the current accumulated dirty range (if any) — render-side
+    /// callers use this to decide what byte ranges of `leaf_attr_pool`
+    /// and `color_pool` to slice-upload. Clears the range; the next
+    /// paint stamp re-accumulates from empty.
+    pub fn take_paint_dirty_range(&mut self) -> Option<(u32, u32)> {
+        self.paint_dirty_range.take()
+    }
+
+    /// Return a byte slice of `leaf_attr_pool` covering slots
+    /// `[slot_start, slot_start + slot_count)`. Used by the render
+    /// thread to `queue.write_buffer` only the dirty range instead of
+    /// the whole buffer.
+    pub fn leaf_attr_slice_bytes(&self, slot_start: u32, slot_count: u32) -> &[u8] {
+        let bytes_per = std::mem::size_of::<LeafAttr>();
+        let start = slot_start as usize * bytes_per;
+        let end = (slot_start as usize + slot_count as usize) * bytes_per;
+        let full = self.leaf_attr_pool.as_bytes();
+        if end > full.len() {
+            return &[];
+        }
+        &full[start..end]
+    }
+
+    /// Byte slice of the color pool covering slots
+    /// `[slot_start, slot_start + slot_count)`. Sibling of
+    /// `leaf_attr_slice_bytes` for the color companion buffer.
+    pub fn color_slice_bytes(&self, slot_start: u32, slot_count: u32) -> &[u8] {
+        let bytes_per = 4; // u32 per slot
+        let start = slot_start as usize * bytes_per;
+        let end = (slot_start as usize + slot_count as usize) * bytes_per;
+        let full = self.leaf_attr_pool.color_bytes();
+        if end > full.len() {
+            return &[];
+        }
+        &full[start..end]
+    }
+
+    // ── Paint cursor overlay ────────────────────────────────────────
+
+    /// Current brush-overlay epoch (lock-free read).
+    pub fn brush_overlay_epoch(&self) -> u64 {
+        self.brush_overlay_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Clone the brush-overlay epoch atomic so render / sim can poll
+    /// it without taking the scene_mgr Mutex.
+    pub fn brush_overlay_epoch_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.brush_overlay_epoch.clone()
+    }
+
+    fn bump_brush_overlay_epoch(&mut self) {
+        self.brush_overlay_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Brush-overlay distance array bytes for GPU upload. Parallel to
+    /// `leaf_attr_pool` — grown to match the pool's allocated size.
+    /// Sentinel: `f32::INFINITY` means "not under the current brush".
+    pub fn brush_overlay_bytes(&self) -> &[u8] {
+        let n = self.leaf_attr_pool.allocated_count() as usize;
+        if n == 0 {
+            return &[];
+        }
+        let len = n.min(self.brush_overlay_distances.len());
+        bytemuck::cast_slice(&self.brush_overlay_distances[..len])
+    }
+
+    /// Drop any currently-active brush overlay. Cheap — only touches
+    /// the slots flooded by the last `update_brush_overlay` call.
+    pub fn clear_brush_overlay(&mut self) {
+        if self.brush_overlay_flooded_slots.is_empty() {
+            return;
+        }
+        for &slot in &self.brush_overlay_flooded_slots {
+            if let Some(d) = self.brush_overlay_distances.get_mut(slot as usize) {
+                *d = f32::INFINITY;
+            }
+        }
+        self.brush_overlay_flooded_slots.clear();
+        self.bump_brush_overlay_epoch();
+    }
+
+    /// Run a geodesic surface flood fill from `brush_center_world` on
+    /// the target asset and write per-leaf distances into the overlay
+    /// array. Clears the previous fill first (so the brush doesn't
+    /// "smear" across frames). No-op when the entity's spatial handle
+    /// isn't an octree (procedurals — they don't own leaf slots and
+    /// thus have no per-voxel cursor).
+    pub fn update_brush_overlay(
+        &mut self,
+        asset: &AssetInfo,
+        entity_world: glam::Affine3A,
+        brush_center_world: glam::Vec3,
+        radius: f32,
+    ) {
+        use rkp_core::scene_node::SpatialHandle;
+        // Start by dropping the previous fill — even if this new call
+        // produces no hits we want the cursor to vanish, not linger.
+        self.clear_brush_overlay();
+
+        if radius <= 0.0 {
+            return;
+        }
+        let SpatialHandle::Octree { root_offset, depth, base_voxel_size, .. } = asset.spatial
+        else {
+            return;
+        };
+
+        let inv_world = entity_world.inverse();
+        let center_local = inv_world.transform_point3(brush_center_world);
+        let (scale, _, _) = entity_world.to_scale_rotation_translation();
+        let mean_scale = (scale.x.abs() + scale.y.abs() + scale.z.abs()) / 3.0;
+        let local_radius = radius / mean_scale.max(1e-6);
+
+        let hits = crate::paint::surface_flood_fill(
+            self.octree.data(),
+            root_offset,
+            depth,
+            base_voxel_size,
+            &self.brick_pool,
+            &self.brick_face_links,
+            asset.grid_origin,
+            center_local,
+            local_radius,
+        );
+
+        if hits.is_empty() {
+            return;
+        }
+
+        // Grow the distance array if the leaf_attr_pool has outgrown it.
+        let pool_len = self.leaf_attr_pool.capacity() as usize;
+        if self.brush_overlay_distances.len() < pool_len {
+            self.brush_overlay_distances.resize(pool_len, f32::INFINITY);
+        }
+
+        let slot_lo = asset.leaf_attr_slot_start;
+        let slot_hi = slot_lo + asset.leaf_attr_slot_count;
+        self.brush_overlay_flooded_slots.reserve(hits.len());
+        for hit in &hits {
+            if hit.leaf_slot < slot_lo || hit.leaf_slot >= slot_hi {
+                continue;
+            }
+            let idx = hit.leaf_slot as usize;
+            if idx < self.brush_overlay_distances.len() {
+                // In world-scale units — the flood fill converts
+                // object-local cell_size back up into world distance
+                // implicitly because the mean-scale adjustment above
+                // gave it a local_radius in local units. To keep the
+                // shader's radius comparison in world units, remap
+                // back up by the mean scale.
+                self.brush_overlay_distances[idx] = hit.distance * mean_scale;
+                self.brush_overlay_flooded_slots.push(hit.leaf_slot);
+            }
+        }
+        self.bump_brush_overlay_epoch();
+    }
+
+    // ── Paint orchestrator ───────────────────────────────────────────
+
+    /// Apply one brush stamp to every leaf whose voxel center sits inside a
+    /// world-space sphere centered at `brush_center_world`.
+    ///
+    /// `asset` describes the entity's geometry allocation (octree +
+    /// leaf_attr range). `entity_world` is the entity's full world
+    /// transform (from its Transform component); paint transforms the
+    /// brush center into the entity's local frame before querying the
+    /// octree, which keeps the brush aligned with rotated / scaled
+    /// objects.
+    ///
+    /// Returns the number of leaves that received a write. The caller
+    /// (editor command handler) is responsible for:
+    ///
+    /// * Skipping procedural / generator-owned entities (paint would be
+    ///   wiped on the next rebake).
+    /// * Converting its editor-side `PaintMode` into the right
+    ///   [`PaintStamp`] variant.
+    /// * Ensuring this is called on the sim / engine thread that owns
+    ///   the scene_mgr Mutex — paint is a geometry mutation.
+    pub fn apply_paint_sphere(
+        &mut self,
+        asset: &AssetInfo,
+        entity_world: glam::Affine3A,
+        brush_center_world: glam::Vec3,
+        radius: f32,
+        strength: f32,
+        falloff: f32,
+        stamp: crate::paint::PaintStamp,
+    ) -> usize {
+        use rkp_core::scene_node::SpatialHandle;
+        if radius <= 0.0 || strength <= 0.0 {
+            return 0;
+        }
+
+        let SpatialHandle::Octree { root_offset, depth, base_voxel_size, .. } =
+            asset.spatial
+        else {
+            // Non-octree spatial handles don't have leaf_attr data to paint.
+            return 0;
+        };
+
+        // World → object-local. Use the affine inverse so non-uniform
+        // scale still works correctly. The brush radius must be scaled
+        // inversely too — otherwise scaling an object up would shrink
+        // the effective paint footprint.
+        let inv_world = entity_world.inverse();
+        let center_local = inv_world.transform_point3(brush_center_world);
+        // Radius in object-local units — average the three scale axes.
+        // Exact local radius is the world radius divided by the
+        // directional scale; painting is approximate enough that the
+        // mean is a good default.
+        let (scale, _, _) = entity_world.to_scale_rotation_translation();
+        let mean_scale = (scale.x.abs() + scale.y.abs() + scale.z.abs()) / 3.0;
+        let local_radius = radius / mean_scale.max(1e-6);
+
+        let hits = crate::paint::leaves_in_sphere(
+            self.octree.data(),
+            root_offset,
+            depth,
+            base_voxel_size,
+            &self.brick_pool,
+            asset.grid_origin,
+            center_local,
+            local_radius,
+        );
+
+        if hits.is_empty() {
+            return 0;
+        }
+
+        // Validate slots against this asset's allocated range — the
+        // packed buffer's leaves carry scene-global slot ids, so a
+        // corrupted octree could in theory produce ids outside the
+        // asset's range. Clamp defensively.
+        let slot_lo = asset.leaf_attr_slot_start;
+        let slot_hi = slot_lo + asset.leaf_attr_slot_count;
+
+        let mut written: usize = 0;
+        let mut dirty_min = u32::MAX;
+        let mut dirty_max = 0u32;
+        for hit in &hits {
+            if hit.leaf_slot < slot_lo || hit.leaf_slot >= slot_hi {
+                continue;
+            }
+            let w = crate::paint::brush_weight(hit.distance, local_radius, strength, falloff);
+            if w <= 0.0 {
+                continue;
+            }
+            match stamp {
+                crate::paint::PaintStamp::Material { material_id } => {
+                    crate::paint::paint_leaf_material(
+                        &mut self.leaf_attr_pool, hit.leaf_slot, material_id, w,
+                    );
+                }
+                crate::paint::PaintStamp::Color { rgb } => {
+                    crate::paint::paint_leaf_color(
+                        &mut self.leaf_attr_pool, hit.leaf_slot, rgb, w,
+                    );
+                }
+                crate::paint::PaintStamp::Erase => {
+                    crate::paint::erase_leaf_color(
+                        &mut self.leaf_attr_pool, hit.leaf_slot, w,
+                    );
+                }
+            }
+            dirty_min = dirty_min.min(hit.leaf_slot);
+            dirty_max = dirty_max.max(hit.leaf_slot);
+            written += 1;
+        }
+
+        if written > 0 {
+            // Paint mutations are small byte-level edits — don't
+            // bump `geometry_epoch` (that would trigger a full
+            // re-upload of octree + bricks + face_links too).
+            // Record the dirty slot range and bump the paint-only
+            // epoch instead; the render thread slice-uploads just
+            // the changed leaf_attr + color bytes.
+            self.mark_paint_range_dirty(dirty_min);
+            self.mark_paint_range_dirty(dirty_max);
+            self.bump_paint_epoch();
+        }
+        written
     }
 
     // ── Primitive voxelization ───────────────────────────────────────

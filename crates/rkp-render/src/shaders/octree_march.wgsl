@@ -257,6 +257,10 @@ fn brick_id_of(node: u32) -> u32 {
 // Glass info — oct-packed normal in R, (thickness_mm << 16 | material_id) in G.
 // Zero in both channels = "no glass at this pixel."
 @group(1) @binding(4) var gbuf_glass: texture_storage_2d<rg32uint, write>;
+// Leaf-slot target — primary hit's scene-global leaf_attr_slot, or 0
+// for sky / no-hit pixels. Consumed by rkp_shade's geodesic paint
+// cursor; indexes into `brush_overlay_distances`.
+@group(1) @binding(5) var gbuf_leaf_slot: texture_storage_2d<r32uint, write>;
 
 @group(2) @binding(0) var<uniform> march_params: MarchParams;
 @group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
@@ -639,6 +643,12 @@ struct MarchResult {
     glass_material: u32,
     glass_enter_t: f32,
     glass_exit_t: f32,
+    // Leaf_attr slot of the front-face glass voxel — the first
+    // transparent cell the ray entered. Used so paint picking can
+    // target the glass voxel itself instead of the opaque voxel
+    // behind it (which is what `first_slot` records). 0 when the
+    // ray didn't hit glass.
+    glass_slot: u32,
 }
 
 // Pack a unit normal into an oct u32 — mirror of `unpack_oct_normal`
@@ -741,6 +751,7 @@ fn march_object_skinned(
         vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0),
         0.0, 0.0, 0u, false, 0u,
         false, vec3<f32>(0.0), 0u, 0.0, 0.0,
+        0u, // glass_slot
     );
 
     let inv_world = obj.inverse_world;
@@ -864,6 +875,7 @@ fn march_object(
         vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0),
         0.0, 0.0, 0u, false, 0u,
         false, vec3<f32>(0.0), 0u, 0.0, 0.0,
+        0u, // glass_slot
     );
 
     let inv_world = obj.inverse_world;
@@ -1126,6 +1138,7 @@ fn march_object(
                             result.glass_normal = cell_normal;
                             result.glass_material = mid;
                             result.glass_enter_t = t;
+                            result.glass_slot = c;
                         }
                         result.glass_exit_t = t;
                         // Fall through to DDA step below.
@@ -1216,6 +1229,7 @@ fn march_object(
                 result.glass_normal = sample_normal;
                 result.glass_material = mid;
                 result.glass_enter_t = t;
+                result.glass_slot = leaf_id;
             }
             result.glass_exit_t = t;
             t += vs * 0.5;
@@ -1283,6 +1297,7 @@ fn main(
         textureStore(gbuf_normal, coord, vec4<f32>(0.0, 0.0, 0.0, 0.0));
         textureStore(gbuf_material, coord, vec4<u32>(0u, 0u, 0u, 0u));
         textureStore(gbuf_pick, coord, vec4<u32>(0xFFFFFFFFu, 0u, 0u, 0u));
+        textureStore(gbuf_leaf_slot, coord, vec4<u32>(0u, 0u, 0u, 0u));
         return;
     }
 
@@ -1303,6 +1318,10 @@ fn main(
     var first_mat_id = 0u;
     var first_sec_mat = 0u;
     var first_blend = 0u;
+    // Leaf_attr slot of the primary hit — written to `gbuf_leaf_slot`
+    // for the geodesic paint cursor to look up per-voxel brush overlay
+    // distances. 0 stays 0 on sky / no-hit pixels.
+    var first_leaf_slot: u32 = 0u;
     var first_obj_id = 0u;
     var have_first = false;
     var max_world_dist = 1e20; // world-space distance to closest opaque hit
@@ -1316,6 +1335,11 @@ fn main(
     // closer glass entry or opaque hit.
     var pick_obj_id = 0xFFFFFFFFu;
     var pick_dist = 1e20;
+    // Paint-cursor leaf_slot tied to `pick_dist` — whichever is
+    // nearest along the ray (glass front face vs opaque hit) wins the
+    // `gbuf_leaf_slot` write so paint clicks target the voxel the
+    // user can actually see, not whatever's hidden behind glass.
+    var pick_leaf_slot: u32 = 0u;
 
     // Glass accumulator — tracked across objects so a glass pane on
     // object A properly tints the shaded surface of object B behind
@@ -1389,6 +1413,7 @@ fn main(
             if g_enter < pick_dist {
                 pick_dist = g_enter;
                 pick_obj_id = obj.object_id;
+                pick_leaf_slot = r.glass_slot;
             }
         }
 
@@ -1428,6 +1453,7 @@ fn main(
                 first_mat_id = leaf_attr_material_primary(attr);
                 first_sec_mat = leaf_attr_material_secondary(attr);
                 first_blend = leaf_attr_blend_weight(attr);
+                first_leaf_slot = r.first_slot;
             } else {
                 first_mat_id = obj.material_id;
             }
@@ -1437,6 +1463,7 @@ fn main(
             if hit_dist < pick_dist {
                 pick_dist = hit_dist;
                 pick_obj_id = obj.object_id;
+                pick_leaf_slot = r.first_slot;
             }
             continue;
         }
@@ -1458,6 +1485,7 @@ fn main(
                 first_mat_id = leaf_attr_material_primary(attr);
                 first_sec_mat = leaf_attr_material_secondary(attr);
                 first_blend = leaf_attr_blend_weight(attr);
+                first_leaf_slot = r.first_slot;
             } else {
                 first_mat_id = obj.material_id;
             }
@@ -1508,6 +1536,7 @@ fn main(
         textureStore(gbuf_material, coord, vec4<u32>(0u, 0u, 0u, 0u));
         textureStore(gbuf_pick, coord, vec4<u32>(miss_pick_id, 0u, 0u, 0u));
         textureStore(gbuf_glass, coord, vec4<u32>(glass_packed.x, glass_packed.y, 0u, 0u));
+        textureStore(gbuf_leaf_slot, coord, vec4<u32>(0u, 0u, 0u, 0u));
         return;
     }
 
@@ -1541,6 +1570,11 @@ fn main(
     textureStore(gbuf_position, coord, vec4<f32>(final_pos, first_dist));
     textureStore(gbuf_normal, coord, vec4<f32>(final_normal_n, accum_alpha));
     textureStore(gbuf_material, coord, vec4<u32>(packed_r, packed_g, 0u, 0u));
+    // Paint cursor should target whatever voxel is CLOSEST along the
+    // ray — if a glass voxel was hit before the opaque, record the
+    // glass slot. Same select() shape as `pick_id` below.
+    let paint_slot = select(first_leaf_slot, pick_leaf_slot, pick_dist < max_world_dist);
+    textureStore(gbuf_leaf_slot, coord, vec4<u32>(paint_slot, 0u, 0u, 0u));
     // Pick uses the nearest visible surface — either the opaque
     // hit or a glass entry, whichever came first along the ray.
     // Falls back to `first_obj_id` (the opaque accumulator) when

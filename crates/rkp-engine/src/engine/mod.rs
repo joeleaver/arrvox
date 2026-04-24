@@ -23,6 +23,7 @@ mod gizmo_ops;
 mod import_ops;
 mod lifecycle;
 mod model_scan;
+mod paint_ops;
 mod picking_ops;
 mod procedural_gizmo;
 mod procedural_ops;

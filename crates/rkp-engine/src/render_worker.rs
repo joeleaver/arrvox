@@ -261,6 +261,18 @@ struct RenderState {
     /// frame, not a one-shot dirty bit).
     last_uploaded_geometry_epoch: u64,
 
+    /// Brush-overlay epoch of the last successful upload to shade's
+    /// per-leaf distance buffer. Compared each frame to the incoming
+    /// snapshot's `brush_overlay_epoch` to decide whether the cursor
+    /// data needs re-uploading.
+    last_uploaded_brush_overlay_epoch: u64,
+
+    /// Paint-data epoch of the last successful slice-upload to
+    /// `leaf_attr_pool_buffer` + `color_pool_buffer`. Bumped by
+    /// paint strokes; compared each frame to decide whether to
+    /// slice-write the dirty range.
+    last_uploaded_paint_epoch: u64,
+
     /// `view_proj` of the most recent rendered frame, per viewport.
     /// Overrides the `prev_vp` baked into incoming snapshots before
     /// camera + volumetric uploads — without this, TAA reprojection
@@ -342,6 +354,8 @@ impl RenderState {
             // 0 = "never uploaded any geometry yet" — the first
             // snapshot with epoch > 0 triggers an upload.
             last_uploaded_geometry_epoch: 0,
+            last_uploaded_brush_overlay_epoch: 0,
+            last_uploaded_paint_epoch: 0,
             // Empty until the first render — the first frame's
             // override falls back to the snapshot's own view_proj
             // (i.e. prev_vp == view_proj, no motion).
@@ -841,6 +855,55 @@ fn render_one_frame(
         // don't trick us into thinking we're caught up when we're
         // not. Worst case: we re-upload next frame, which is fine.
         state.last_uploaded_geometry_epoch = sm.geometry_epoch();
+        drop(sm);
+    }
+
+    // 1.5. Paint-data upload — slice-write the dirty slot range to
+    //      leaf_attr_pool + color_pool. Bypasses the full
+    //      upload_geometry path (which would re-upload octree +
+    //      bricks + face links too — ~45 MB on a 1M-leaf scene for a
+    //      stroke that touches ~64 KB of actual data).
+    if frame.paint_epoch > state.last_uploaded_paint_epoch {
+        let mut sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
+        if let Some((min_slot, max_slot)) = sm.take_paint_dirty_range() {
+            let slot_count = max_slot - min_slot + 1;
+            let leaf_attr_bytes_per: u64 =
+                std::mem::size_of::<rkp_core::LeafAttr>() as u64;
+            let leaf_attr_offset = min_slot as u64 * leaf_attr_bytes_per;
+            let color_offset = min_slot as u64 * 4;
+            let la_slice = sm.leaf_attr_slice_bytes(min_slot, slot_count);
+            if !la_slice.is_empty() {
+                state.queue.write_buffer(
+                    &state.renderer.scene.leaf_attr_pool_buffer,
+                    leaf_attr_offset,
+                    la_slice,
+                );
+            }
+            let color_slice = sm.color_slice_bytes(min_slot, slot_count);
+            if !color_slice.is_empty() {
+                state.queue.write_buffer(
+                    &state.renderer.scene.color_pool_buffer,
+                    color_offset,
+                    color_slice,
+                );
+            }
+        }
+        state.last_uploaded_paint_epoch = sm.paint_epoch();
+        drop(sm);
+    }
+
+    // 1.6. Brush-overlay upload — paint cursor geodesic distances.
+    //      MAIN-only (BUILD viewport doesn't show the paint cursor).
+    //      queue.write_buffer is cheap (staging-buffer enqueue), so
+    //      we do it inside the scene_mgr lock — cheaper than cloning
+    //      the full ~4 MB overlay buffer out of the critical section.
+    if frame.brush_overlay_epoch > state.last_uploaded_brush_overlay_epoch {
+        let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
+        let bytes = sm.brush_overlay_bytes();
+        if let Some(main_vr) = state.viewport_renderers.get_mut(&ViewportId::MAIN) {
+            main_vr.shade.upload_brush_overlay(&state.device, &state.queue, bytes);
+        }
+        state.last_uploaded_brush_overlay_epoch = sm.brush_overlay_epoch();
         drop(sm);
     }
 

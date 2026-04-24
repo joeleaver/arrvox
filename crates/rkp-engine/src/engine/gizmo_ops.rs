@@ -9,6 +9,17 @@ use super::state::{DragPreviewKind, EngineState};
 
 impl EngineState {
     pub(crate) fn update_gizmo(&mut self) {
+        // Paint mode hides the transform gizmo entirely (see
+        // `build_gizmo_wireframe`). Suppress hover/drag detection too
+        // so a paint click on the selected object's centroid doesn't
+        // get captured by an invisible axis handle.
+        if self.paint_mode_active {
+            self.gizmo.hovered_axis = crate::gizmo::GizmoAxis::None;
+            if self.gizmo.dragging {
+                self.gizmo.end_drag();
+            }
+            return;
+        }
         let Some(selected) = self.selected_entity else {
             self.gizmo.hovered_axis = crate::gizmo::GizmoAxis::None;
             if self.gizmo.dragging {
@@ -317,7 +328,19 @@ impl EngineState {
             }
         }
 
-        // Transform gizmo — only for the selected entity.
+        // Paint cursor rendering lives in the shade pass (see
+        // `rkp_shade.wgsl`'s brush overlay block) — the ring is
+        // projected onto the shaded surface using the brush_overlay
+        // storage buffer (geodesic) + the ShadeParams brush_* uniform.
+        // No wireframe lines here anymore.
+
+        // Transform gizmo — only for the selected entity, and only
+        // when paint mode is off. Showing it in paint mode blocks
+        // clicks on the selected object's center (gizmo axes sit
+        // right on top of the surface) and crowds the cursor ring.
+        if self.paint_mode_active {
+            return verts;
+        }
         let Some(selected) = self.selected_entity else {
             return verts;
         };

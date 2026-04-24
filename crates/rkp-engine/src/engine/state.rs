@@ -64,6 +64,21 @@ pub(crate) struct PendingDrop {
     pub(crate) action: PendingDropAction,
 }
 
+/// Brush settings captured when a paint stroke sample fires its pick
+/// readback. One instance lives in [`EngineState::paint_pick_settings`]
+/// at a time — the editor throttles stamps to one pick in flight, and
+/// a fresh `PaintAtPixel` replaces the previous settings if the pick
+/// hasn't returned yet (latest sample wins, matching drag-preview).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PaintPickSettings {
+    pub(crate) radius: f32,
+    pub(crate) color: [f32; 3],
+    pub(crate) strength: f32,
+    pub(crate) falloff: f32,
+    pub(crate) mode: crate::command::PaintMode,
+    pub(crate) material_id: u16,
+}
+
 /// A live drag-and-drop preview. While active, each `DragPreviewOver`
 /// (re)sets the pending pick at the cursor pixel. What happens when
 /// the pick result arrives depends on `kind`:
@@ -131,6 +146,18 @@ pub(crate) struct EngineState {
     /// sim from 60 Hz to ~20 Hz and making animation/camera feel
     /// like 0.5 fps.
     pub(crate) geometry_epoch_handle: std::sync::Arc<std::sync::atomic::AtomicU64>,
+
+    /// Brush-overlay epoch handle. Bumped by
+    /// `RkpSceneManager::update_brush_overlay` / `clear_brush_overlay`.
+    /// Sim reads it lock-free to decide whether the next snapshot
+    /// needs to ship a fresh brush-overlay upload.
+    pub(crate) brush_overlay_epoch_handle: std::sync::Arc<std::sync::atomic::AtomicU64>,
+
+    /// Paint-data epoch handle. Bumped by `apply_paint_sphere`
+    /// whenever a stroke writes to leaf_attr / color. Separate from
+    /// `geometry_epoch` so paint doesn't re-upload octree + brick
+    /// buffers — render only slice-uploads the dirty slot range.
+    pub(crate) paint_epoch_handle: std::sync::Arc<std::sync::atomic::AtomicU64>,
 
     /// Sim-side cache of per-asset skinning data. Built lazily under
     /// the scene_mgr lock only when `skinning_data_cache_epoch` falls
@@ -483,6 +510,35 @@ pub(crate) struct EngineState {
     /// up-to-date by pick readbacks during `DragAssetOver`, cleared on
     /// commit or cancel.
     pub(crate) drag_preview: Option<DragPreviewState>,
+    /// Paint stroke that issued the current pick. When set, the next
+    /// pick result bypasses selection / drag-preview handling and is
+    /// routed to `apply_paint_stamp` with these settings. Populated by
+    /// `EngineCommand::PaintAtPixel` (sim); taken out and consumed by
+    /// `process_pick_result` when the matching readback returns.
+    pub(crate) paint_pick_settings: Option<PaintPickSettings>,
+    /// When set, the next pick result updates `paint_cursor_world`
+    /// without applying any paint — the editor uses this to keep the
+    /// cursor sphere tracking the cursor while the user is just hovering
+    /// in paint mode. Mutually exclusive in practice with
+    /// `paint_pick_settings` (LMB held → stamp path fires instead).
+    pub(crate) paint_hover_pending: Option<crate::viewport::ViewportId>,
+    /// `true` while the editor is in paint mode. Drives the cursor
+    /// wireframe — when false, the cursor sphere is never drawn even
+    /// if `paint_cursor_world` still carries a stale last-hover value.
+    /// Updated by `SetPaintActive` commands.
+    pub(crate) paint_mode_active: bool,
+    /// Brush world-space radius while paint mode is active. Cached on
+    /// the engine so the cursor sphere renders at the same size the
+    /// next stamp will use. Updated by `SetPaintActive`.
+    pub(crate) paint_mode_radius: f32,
+    /// Most recent world-space hit under the paint cursor. Updated on
+    /// every hover pick and on every successful paint stamp. `None`
+    /// when no pick has returned with a valid surface hit yet.
+    pub(crate) paint_cursor_world: Option<glam::Vec3>,
+    /// Entity the cursor is currently over — needed to re-run the
+    /// geodesic flood fill when the radius changes while the cursor
+    /// is stationary. Set by pick results; cleared on paint-off.
+    pub(crate) paint_cursor_entity: Option<hecs::Entity>,
     /// Cached light count for march pass (set in light upload block, used in render).
     pub(crate) num_lights_cache: u32,
     /// Base ShadeParams (recomputed once per frame from environment +
@@ -543,10 +599,10 @@ impl EngineState {
         // Clone the lock-free epoch handle ONCE at startup; sim
         // reads it every tick to detect geometry changes without
         // having to take the scene_mgr Mutex.
-        let geometry_epoch_handle = scene_mgr
-            .lock()
-            .expect("scene_mgr poisoned")
-            .epoch_handle();
+        let (geometry_epoch_handle, brush_overlay_epoch_handle, paint_epoch_handle) = {
+            let sm = scene_mgr.lock().expect("scene_mgr poisoned");
+            (sm.epoch_handle(), sm.brush_overlay_epoch_handle(), sm.paint_epoch_handle())
+        };
 
         // Input system with default action map.
         let mut input_system = rkp_runtime::input::InputSystem::new();
@@ -592,6 +648,8 @@ impl EngineState {
             render_worker,
             scene_mgr,
             geometry_epoch_handle,
+            brush_overlay_epoch_handle,
+            paint_epoch_handle,
             skinning_data_cache: std::collections::HashMap::new(),
             // 0 → cache rebuilds the first time epoch > 0 (any
             // geometry mutation triggers it). Until then the cache
@@ -700,6 +758,12 @@ impl EngineState {
             pending_pick: None,
             pending_drop: None,
             drag_preview: None,
+            paint_pick_settings: None,
+            paint_hover_pending: None,
+            paint_mode_active: false,
+            paint_mode_radius: 0.5,
+            paint_cursor_world: None,
+            paint_cursor_entity: None,
             num_lights_cache: 1,
             shade_params_base: rkp_render::rkp_shade::ShadeParams::default(),
             lod_enabled: true,

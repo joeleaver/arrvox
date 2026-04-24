@@ -66,6 +66,11 @@ pub mod proc_ghost;
 pub mod proc_sample;
 /// Skeletal skin-deform scatter pass — per-frame bone-field writer.
 pub mod skin_deform;
+/// CPU-side paint writes against the scene's LeafAttrPool (material +
+/// per-voxel color mutations). Used by the editor's paint tool; the
+/// shader reads the same `color_pool_data` / `leaf_attr_pool` buffers
+/// that all other passes already consume.
+pub mod paint;
 
 pub use octree_gpu::OctreeGpu;
 pub use rkp_scene_manager::{AssetHandle, AssetInfo, ReloadResult, RkpSceneManager, SkinBrick, SkinningAssetData};

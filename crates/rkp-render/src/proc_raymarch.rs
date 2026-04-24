@@ -135,6 +135,11 @@ impl ProcRaymarchPass {
                     // buffer coherent with what octree_march wrote
                     // elsewhere in the frame.
                     bgl_storage_tex(4, wgpu::TextureFormat::Rg32Uint),
+                    // Leaf-slot target — procedurals have no stable
+                    // leaf_attr_slot (they're analytical), so the
+                    // shader writes 0 (the sentinel the paint cursor
+                    // treats as "no hit").
+                    bgl_storage_tex(5, wgpu::TextureFormat::R32Uint),
                 ],
             });
 
@@ -274,6 +279,7 @@ impl ProcRaymarchPass {
         material_view: &wgpu::TextureView,
         pick_view: &wgpu::TextureView,
         glass_view: &wgpu::TextureView,
+        leaf_slot_view: &wgpu::TextureView,
     ) {
         self.gbuffer_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("proc_raymarch gbuffer"),
@@ -298,6 +304,10 @@ impl ProcRaymarchPass {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(glass_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(leaf_slot_view),
                 },
             ],
         }));

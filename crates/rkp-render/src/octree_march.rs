@@ -90,6 +90,9 @@ impl OctreeMarchPass {
                     // when the primary ray passes through a transparent
                     // voxel; rkp_glass gates on `thickness_mm != 0`.
                     bgl_storage_tex(4, wgpu::TextureFormat::Rg32Uint),
+                    // Leaf-slot target — primary hit's leaf_attr_slot.
+                    // Read by rkp_shade's geodesic paint cursor.
+                    bgl_storage_tex(5, wgpu::TextureFormat::R32Uint),
                 ],
             });
 
@@ -367,6 +370,7 @@ impl OctreeMarchPass {
         material_view: &wgpu::TextureView,
         pick_view: &wgpu::TextureView,
         glass_view: &wgpu::TextureView,
+        leaf_slot_view: &wgpu::TextureView,
     ) {
         self.gbuffer_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("march gbuffer bind group"),
@@ -377,6 +381,7 @@ impl OctreeMarchPass {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(material_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(pick_view) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(glass_view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(leaf_slot_view) },
             ],
         }));
     }

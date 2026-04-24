@@ -42,7 +42,7 @@ pub mod scene_sync;
 pub mod viewport;
 pub mod wireframe_builders;
 
-pub use command::{DragPreviewSource, EngineCommand};
+pub use command::{DragPreviewSource, EngineCommand, PaintMode, SculptMode};
 pub use snapshot::{StateUpdate, SceneObjectInfo, ModelInfo};
 pub use material_library::MaterialInfo;
 pub use engine::RkpEngine;

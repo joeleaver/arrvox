@@ -23,6 +23,101 @@ impl EngineState {
         // brand-new click later will set `pending_pick` again.
         self.pending_pick = None;
 
+        // Paint stamp: if the pick was issued by a `PaintAtPixel`
+        // command, consume it here before selection / drag-preview
+        // routing. `raw_payload[0]` is the `gpu_idx` for MAIN material
+        // picks (0xFFFFFFFF on sky); `position` is the world-space
+        // surface hit (None on sky).
+        //
+        // Paint mode locks selection: once an entity is selected
+        // (either before paint was enabled or claimed by the first
+        // paint-click when nothing was selected), every subsequent
+        // stamp targets only that entity. Hits on other geometry are
+        // treated as misses — no cursor, no stamp, no selection
+        // switch.
+        if let Some(settings) = self.paint_pick_settings.take() {
+            let hit_gpu_idx = pr.raw_payload[0];
+            let hit_entity: Option<hecs::Entity> = if hit_gpu_idx != u32::MAX {
+                let gpu_idx = hit_gpu_idx as usize;
+                self.gpu_to_entity.get(gpu_idx).copied()
+            } else {
+                None
+            };
+
+            // Resolve the stamp's target entity.
+            //   * Something selected → must match exactly (locked).
+            //   * Nothing selected → the first valid hit claims the
+            //     selection, and that entity becomes locked for the
+            //     rest of the paint session.
+            let target_entity = match self.selected_entity {
+                Some(selected) => {
+                    if hit_entity == Some(selected) { Some(selected) } else { None }
+                }
+                None => {
+                    if let Some(e) = hit_entity {
+                        self.selected_entity = Some(e);
+                        Some(e)
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            if let (Some(entity), Some(world_pos)) = (target_entity, pr.position) {
+                self.paint_cursor_world = Some(world_pos);
+                self.paint_cursor_entity = Some(entity);
+                let _ = self.apply_paint_stamp(
+                    entity,
+                    world_pos,
+                    settings.radius,
+                    settings.strength,
+                    settings.falloff,
+                    settings.color,
+                    settings.mode,
+                    settings.material_id,
+                );
+                self.refresh_brush_overlay();
+            } else {
+                // Stroke is off-target — clear any cached cursor so
+                // the overlay disappears until it re-enters the
+                // locked entity.
+                self.paint_cursor_world = None;
+                self.paint_cursor_entity = None;
+                if let Ok(mut sm) = self.scene_mgr.lock() {
+                    sm.clear_brush_overlay();
+                }
+            }
+            self.in_flight_pick_ghost = None;
+            return;
+        }
+
+        // Hover pick: track the cursor while the user is in paint
+        // mode but hasn't pressed LMB yet. Only the selected entity
+        // shows the cursor — hovering never claims selection
+        // (that's reserved for LMB stamps so idle mouse movement
+        // doesn't silently latch onto something).
+        if self.paint_hover_pending.take().is_some() {
+            let selected_gpu_idx = self.selected_entity
+                .and_then(|e| self.entity_to_gpu.get(&e).copied());
+            let hit_gpu_idx = pr.raw_payload[0];
+            let hit_matches_selection = hit_gpu_idx != u32::MAX
+                && selected_gpu_idx == Some(hit_gpu_idx as usize);
+            if hit_matches_selection {
+                self.paint_cursor_world = pr.position;
+                let entity = self.gpu_to_entity[hit_gpu_idx as usize];
+                self.paint_cursor_entity = Some(entity);
+                self.refresh_brush_overlay();
+            } else {
+                self.paint_cursor_world = None;
+                self.paint_cursor_entity = None;
+                if let Ok(mut sm) = self.scene_mgr.lock() {
+                    sm.clear_brush_overlay();
+                }
+            }
+            self.in_flight_pick_ghost = None;
+            return;
+        }
+
         // Drop-on-geometry: if a drag-drop is queued for this viewport,
         // consume it instead of running selection. The pick was issued
         // purely to get the world-space surface position at the drop

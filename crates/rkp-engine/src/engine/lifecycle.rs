@@ -378,6 +378,25 @@ impl EngineState {
             if isolation {
                 shade_params_vr.num_lights = shade_params_vr.num_lights.min(1);
             }
+            // Paint cursor overlay — MAIN only. The brush sphere is a
+            // viewport-camera-centric tool; a BUILD preview of the
+            // same scene shouldn't show it. When the engine isn't in
+            // paint mode `brush_active` stays 0 and the shader skips
+            // the overlay entirely.
+            if viewport_id == ViewportId::MAIN
+                && self.paint_mode_active
+            {
+                if let Some(center) = self.paint_cursor_world {
+                    shade_params_vr.brush_active = 1;
+                    shade_params_vr.brush_radius = self.paint_mode_radius;
+                    shade_params_vr.brush_falloff = 0.5; // editor slider in Phase 5
+                    shade_params_vr.brush_center = [center.x, center.y, center.z, 0.0];
+                    // Color: warm yellow rim — distinct from the light-
+                    // gizmo yellow the sphere placeholder used. Alpha
+                    // channel reserved; the shader does its own alpha.
+                    shade_params_vr.brush_color = [1.0, 0.85, 0.2, 1.0];
+                }
+            }
             let bloom_composite_intensity = if isolation {
                 0.0
             } else {
@@ -603,11 +622,20 @@ impl EngineState {
         //    if render hadn't consumed the previous snapshot yet,
         //    that one is dropped (newest-wins). Sim never stalls on
         //    render's GPU rate.
+        let brush_overlay_epoch = self
+            .brush_overlay_epoch_handle
+            .load(std::sync::atomic::Ordering::Acquire);
+        let paint_epoch = self
+            .paint_epoch_handle
+            .load(std::sync::atomic::Ordering::Acquire);
+
         let frame = crate::render_frame::RenderFrame {
             frame_index: self.frame_index,
             gpu_objects: self.gpu_objects.clone(),
             gpu_objects_dirty: gpu_objects_dirty_this_frame,
             geometry_epoch,
+            brush_overlay_epoch,
+            paint_epoch,
             materials,
             lights: gpu_lights,
             shade_params_base: self.shade_params_base,

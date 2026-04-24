@@ -132,7 +132,7 @@ impl ViewportRenderer {
         let mut march = OctreeMarchPass::new(device, &renderer.scene.bind_group_layout);
         march.set_materials(device, &renderer.materials_buffer);
         march.set_lights(device, &renderer.lights_buffer);
-        march.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view, &gbuffer.glass_view);
+        march.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view, &gbuffer.glass_view, &gbuffer.leaf_slot_view);
 
         // Procedural CSG raymarch — alternative primary-visibility pass
         // for the build viewport. Wired to the same per-VR camera + gbuffer
@@ -140,7 +140,7 @@ impl ViewportRenderer {
         // the rest of the chain.
         let mut proc_raymarch = ProcRaymarchPass::new(device);
         proc_raymarch.set_camera(device, &camera_buffer);
-        proc_raymarch.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view, &gbuffer.glass_view);
+        proc_raymarch.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view, &gbuffer.glass_view, &gbuffer.leaf_slot_view);
 
         // Outline overlay — rebind the pick gbuffer view on resize.
         let mut proc_outline = ProcOutlinePass::new(device, crate::LDR_FORMAT);
@@ -175,7 +175,7 @@ impl ViewportRenderer {
             &renderer.atmosphere.sky_view_view,
             &renderer.atmosphere.ap_view,
         );
-        shade.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &gbuffer.glass_view);
+        shade.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &gbuffer.glass_view, &gbuffer.leaf_slot_view);
         shade.set_shadow_and_ssao(device, &shadow_trace.output_view, &ssao.output_view);
 
         // Pass order: shade → volumetric → glass → god_rays. Glass
@@ -310,8 +310,8 @@ impl ViewportRenderer {
         self.pick_view = pick_view;
 
         // Per-VR passes — resize internal textures + re-wire gbuffer bindings.
-        self.march.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view, &self.gbuffer.glass_view);
-        self.proc_raymarch.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view, &self.gbuffer.glass_view);
+        self.march.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
+        self.proc_raymarch.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
         self.proc_outline.set_gbuffer(device, &self.pick_view);
 
         self.ssao.resize(device, width, height);
@@ -321,7 +321,7 @@ impl ViewportRenderer {
         self.shadow_trace.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view);
 
         self.shade.resize(device, width, height);
-        self.shade.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.gbuffer.glass_view);
+        self.shade.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
         self.shade.set_shadow_and_ssao(device, &self.shadow_trace.output_view, &self.ssao.output_view);
 
         self.volumetric.resize(device, width, height);

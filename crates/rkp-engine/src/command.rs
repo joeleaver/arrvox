@@ -368,7 +368,10 @@ pub enum EngineCommand {
         mode: SculptMode,
     },
 
-    /// Apply a paint brush stroke.
+    /// Apply a paint brush stroke at an already-known world position.
+    /// Used by tests and any caller that has already resolved the hit
+    /// point. The normal UI flow uses [`PaintAtPixel`] instead, which
+    /// drives a GPU pick readback to resolve position + entity.
     Paint {
         position: Vec3,
         normal: Vec3,
@@ -376,6 +379,42 @@ pub enum EngineCommand {
         color: [f32; 3],
         strength: f32,
         mode: PaintMode,
+    },
+
+    /// Toggle paint mode + update the cached brush radius. Editor
+    /// sends this when the user clicks the Paint toolbar button or
+    /// presses 'P', and on every radius-slider change once that ships.
+    /// Engine uses this to drive the cursor wireframe (so it knows
+    /// when and at what size to render the sphere) without re-reading
+    /// editor state every frame.
+    SetPaintActive { active: bool, radius: f32 },
+
+    /// Cursor-tracking pick for paint mode. Fires on `MouseMove` in
+    /// paint mode *without* LMB held. The engine issues a pick
+    /// readback identical to `PaintAtPixel` but routes the result into
+    /// `paint_cursor_world` instead of applying a stamp.
+    PaintHoverAtPixel { id: ViewportId, x: u32, y: u32 },
+
+    /// Apply a paint brush stamp at a viewport pixel. The engine issues
+    /// a GPU pick readback to resolve the (entity, world_pos) under the
+    /// cursor, then routes the result through `apply_paint_stamp` with
+    /// these settings. Editor fires this on LMB press + every
+    /// `MouseMove` while LMB held in paint mode. One pick is allowed
+    /// in flight; repeated `PaintAtPixel` calls from a drag replace the
+    /// prior in-flight settings (latest sample wins).
+    PaintAtPixel {
+        id: ViewportId,
+        x: u32,
+        y: u32,
+        radius: f32,
+        color: [f32; 3],
+        strength: f32,
+        /// Smoothstep shoulder [0, 1]. 0 = hard edge, 1 = smoothstep
+        /// from center outward.
+        falloff: f32,
+        mode: PaintMode,
+        /// Primary material id when `mode == Material`. Ignored otherwise.
+        material_id: u16,
     },
 
     // ── Asset I/O ────────────────────────────────────────────────────

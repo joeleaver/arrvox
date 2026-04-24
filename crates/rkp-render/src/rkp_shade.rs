@@ -12,6 +12,12 @@ pub struct RkpShadePass {
     pub shade_bind_group_layout: wgpu::BindGroupLayout,
     pub camera_bind_group_layout: wgpu::BindGroupLayout,
     pub atmo_bind_group_layout: wgpu::BindGroupLayout,
+    /// Group 6 — paint cursor's geodesic distance buffer (Phase 3b).
+    /// Parallel to `leaf_attr_pool`; sentinel `f32::INFINITY` means
+    /// "not under the brush". Populated by
+    /// `RkpSceneManager::update_brush_overlay` → uploaded each time
+    /// the cursor moves.
+    pub brush_overlay_bind_group_layout: wgpu::BindGroupLayout,
     /// HDR output texture (full-res, Rgba16Float).
     pub output_texture: wgpu::Texture,
     pub output_view: wgpu::TextureView,
@@ -21,6 +27,12 @@ pub struct RkpShadePass {
     shade_bind_group: Option<wgpu::BindGroup>,
     camera_bind_group: Option<wgpu::BindGroup>,
     atmo_bind_group: Option<wgpu::BindGroup>,
+    /// Resident brush-overlay buffer + the bind group referencing it.
+    /// `upload_brush_overlay` grows the buffer (and rebuilds the bind
+    /// group) when the cpu-side array outgrows GPU capacity.
+    brush_overlay_buffer: wgpu::Buffer,
+    brush_overlay_buffer_capacity: u64,
+    brush_overlay_bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
 }
@@ -45,6 +57,15 @@ pub struct ShadeParams {
     /// just before the VR's submit, same channel as the other per-VR
     /// frame params.
     pub isolation: u32,
+    /// Paint cursor overlay (Phase-3 placeholder — world-space sphere
+    /// projected onto the surface; doesn't wrap corners geodesically
+    /// yet). `brush_active` = 0 disables the overlay entirely.
+    pub brush_active: u32,
+    pub brush_radius: f32,
+    pub brush_falloff: f32,
+    pub _pad3: f32,
+    pub brush_center: [f32; 4],
+    pub brush_color: [f32; 4],
 }
 
 impl Default for ShadeParams {
@@ -62,6 +83,12 @@ impl Default for ShadeParams {
             _pad2: 0.0,
             ambient_color: [0.1, 0.15, 0.25],
             isolation: 0,
+            brush_active: 0,
+            brush_radius: 0.5,
+            brush_falloff: 0.5,
+            _pad3: 0.0,
+            brush_center: [0.0, 0.0, 0.0, 0.0],
+            brush_color: [1.0, 0.85, 0.2, 1.0],
         }
     }
 }
@@ -145,7 +172,7 @@ impl RkpShadePass {
             count: None,
         };
 
-        // Group 0: G-buffer (position, normal, material, glass)
+        // Group 0: G-buffer (position, normal, material, glass, leaf_slot)
         let gbuffer_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("rkp_shade gbuf"),
@@ -155,6 +182,9 @@ impl RkpShadePass {
                     uint_texture_entry(2),
                     // Glass info (oct-normal + packed thickness/material_id)
                     uint_texture_entry(3),
+                    // Leaf-slot — primary hit's leaf_attr_slot for the
+                    // geodesic paint cursor. `0` = no hit.
+                    uint_texture_entry(4),
                 ],
             });
 
@@ -254,6 +284,42 @@ impl RkpShadePass {
                 ],
             });
 
+        // Group 6: paint cursor's per-leaf geodesic distance buffer.
+        let brush_overlay_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("rkp_shade brush_overlay"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        // Placeholder 4-byte buffer — `upload_brush_overlay` grows it
+        // as the leaf_attr_pool grows. A minimum of one `f32` (4 B)
+        // keeps the storage binding valid even before any paint data
+        // has been uploaded.
+        let brush_overlay_buffer_capacity: u64 = 4;
+        let brush_overlay_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rkp_shade brush_overlay"),
+            size: brush_overlay_buffer_capacity,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let brush_overlay_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rkp_shade brush_overlay bg"),
+            layout: &brush_overlay_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: brush_overlay_buffer.as_entire_binding(),
+            }],
+        });
+
         // Output texture.
         let (output_texture, output_view) = Self::create_output(device, width, height);
         let output_bind_group = Self::create_output_bind_group(device, &output_bind_group_layout, &output_view);
@@ -275,6 +341,7 @@ impl RkpShadePass {
                 Some(&shade_bind_group_layout),
                 Some(&camera_bind_group_layout),
                 Some(&atmo_bind_group_layout),
+                Some(&brush_overlay_bind_group_layout),
             ],
             immediate_size: 0,
         });
@@ -296,6 +363,7 @@ impl RkpShadePass {
             shade_bind_group_layout,
             camera_bind_group_layout,
             atmo_bind_group_layout,
+            brush_overlay_bind_group_layout,
             output_texture,
             output_view,
             output_bind_group,
@@ -304,9 +372,60 @@ impl RkpShadePass {
             shade_bind_group: None,
             camera_bind_group: None,
             atmo_bind_group: None,
+            brush_overlay_buffer,
+            brush_overlay_buffer_capacity,
+            brush_overlay_bind_group,
             width,
             height,
         }
+    }
+
+    /// Upload the paint cursor's per-leaf geodesic distance array.
+    /// Grows the resident GPU buffer (rebuilds its bind group) when
+    /// `bytes` exceeds capacity, so the caller doesn't need to
+    /// pre-size anything. Called from the render worker whenever
+    /// `RkpSceneManager::brush_overlay_epoch` ticks forward.
+    pub fn upload_brush_overlay(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bytes: &[u8],
+    ) {
+        if bytes.is_empty() {
+            return;
+        }
+        let needed = bytes.len() as u64;
+        // Round up to 4 so the placeholder (4-byte) buffer can always
+        // accept at least one `f32`.
+        let needed = needed.max(4);
+        if needed > self.brush_overlay_buffer_capacity {
+            let mut new_cap = self.brush_overlay_buffer_capacity.max(4);
+            while new_cap < needed {
+                new_cap = new_cap.saturating_mul(2);
+            }
+            self.brush_overlay_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rkp_shade brush_overlay"),
+                size: new_cap,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.brush_overlay_buffer_capacity = new_cap;
+            self.brush_overlay_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rkp_shade brush_overlay bg"),
+                layout: &self.brush_overlay_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.brush_overlay_buffer.as_entire_binding(),
+                }],
+            });
+        }
+        queue.write_buffer(&self.brush_overlay_buffer, 0, bytes);
+    }
+
+    /// Accessor for the brush-overlay bind group — the dispatcher
+    /// binds this at group 6 on every shade dispatch.
+    pub fn brush_overlay_bind_group(&self) -> &wgpu::BindGroup {
+        &self.brush_overlay_bind_group
     }
 
     /// Set G-buffer views.
@@ -317,6 +436,7 @@ impl RkpShadePass {
         normal_view: &wgpu::TextureView,
         material_view: &wgpu::TextureView,
         glass_view: &wgpu::TextureView,
+        leaf_slot_view: &wgpu::TextureView,
     ) {
         self.gbuffer_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rkp_shade gbuf bg"),
@@ -326,6 +446,7 @@ impl RkpShadePass {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(normal_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(material_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(glass_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(leaf_slot_view) },
             ],
         }));
     }
@@ -433,6 +554,7 @@ impl RkpShadePass {
         pass.set_bind_group(3, shade, &[]);
         pass.set_bind_group(4, cam, &[]);
         pass.set_bind_group(5, atmo, &[]);
+        pass.set_bind_group(6, &self.brush_overlay_bind_group, &[]);
         pass.dispatch_workgroups(wg_x, wg_y, 1);
     }
 

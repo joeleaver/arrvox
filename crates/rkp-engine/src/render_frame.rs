@@ -82,6 +82,18 @@ pub struct RenderFrame {
     /// matter how many intermediate snapshots are dropped.
     pub geometry_epoch: u64,
 
+    /// Paint cursor's brush-overlay epoch. Bumped every time
+    /// `RkpSceneManager::update_brush_overlay` runs (cursor moves or
+    /// radius changes). Render uploads the per-leaf distance buffer
+    /// to each VR's shade pass when this moves ahead.
+    pub brush_overlay_epoch: u64,
+
+    /// Paint-data epoch. Bumped by `apply_paint_sphere` when a stroke
+    /// writes to leaf_attr / color. Render slice-uploads only the
+    /// dirty slot range when this moves ahead — avoids the full
+    /// scene re-upload that `geometry_epoch` would trigger.
+    pub paint_epoch: u64,
+
     /// Current material palette. Sim builds + ships every tick (cheap
     /// — small Vec). Render uploads every frame; the cost is one
     /// `queue.write_buffer` of ~1 KB. Same robustness rationale as

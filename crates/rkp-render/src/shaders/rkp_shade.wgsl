@@ -43,6 +43,17 @@ struct ShadeParams {
     _pad2: f32,
     ambient_color: vec3<f32>,
     isolation: u32,
+    // Paint cursor overlay (Phase-3 placeholder). When `brush_active`
+    // is non-zero and the shaded pixel's world position sits within
+    // `brush_radius` of `brush_center`, blend the brush color on top
+    // as a soft ring + fill. Geodesic wrapping around corners lands
+    // in Phase 3b when we plumb per-leaf flood-fill distances.
+    brush_active: u32,
+    brush_radius: f32,
+    brush_falloff: f32,
+    _pad3: f32,
+    brush_center: vec4<f32>,
+    brush_color: vec4<f32>,
 }
 
 // Neutral gray for isolation-mode sky + ambient — chosen to match a
@@ -92,6 +103,10 @@ fn mat_subsurface_color(m: Material) -> vec3<f32> {
 // 16) | material_id. `thickness_mm == 0` means "no glass at this
 // pixel" — use as the gate for the glass composite path.
 @group(0) @binding(3) var gbuf_glass: texture_2d<u32>;
+// Primary hit's scene-global leaf_attr_slot. `0` = sky / no-hit /
+// procedural (no stable slot). Used by the paint cursor to look up
+// per-voxel geodesic distance in `brush_overlay_distances`.
+@group(0) @binding(4) var gbuf_leaf_slot: texture_2d<u32>;
 
 // Group 1: shadow texture (read, half-res) + SSAO texture (read, half-res)
 // shadow_tex is written by rkp_shadow_trace at half-res; we upsample it
@@ -116,6 +131,12 @@ fn mat_subsurface_color(m: Material) -> vec3<f32> {
 @group(5) @binding(2) var atmo_sampler: sampler;
 @group(5) @binding(3) var sky_view_lut: texture_2d<f32>;
 @group(5) @binding(4) var aerial_perspective_lut: texture_3d<f32>;
+
+// Paint cursor's per-leaf geodesic distance. Parallel to
+// `leaf_attr_pool`; sentinel (INFINITY) means "not under the brush".
+// Indexed by the slot written to `gbuf_leaf_slot`; 0 is the no-hit
+// sentinel so the lookup must guard `slot != 0u`.
+@group(6) @binding(0) var<storage, read> brush_overlay_distances: array<f32>;
 
 // Aerial-perspective LUT slice parameterization — must match rkp_aerial_perspective_lut.wgsl.
 // Slice z stores the camera-to-d(z) atmospheric integral under an exponential
@@ -827,6 +848,39 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let surface_dist = length(world_pos - camera.position.xyz);
     let ap = sample_aerial_perspective(screen_uv, surface_dist);
     final_color = final_color * ap.a + ap.rgb;
+
+    // Paint cursor overlay (Phase 3b) — geodesic surface-walking
+    // distance from the brush origin, stored per-leaf in
+    // `brush_overlay_distances` by the CPU flood fill. This version
+    // wraps around corners cleanly: a voxel two hops around an edge
+    // is >2*cell_size away even if it's closer in world units.
+    //
+    // Skip when:
+    //   * brush is inactive (cursor off);
+    //   * slot == 0 (sky / procedural surface / no hit — the flood
+    //     fill has no data for these);
+    //   * brush_overlay_distances[slot] is the INFINITY sentinel
+    //     (naturally filtered by the `d < r` comparison).
+    if shade_params.brush_active != 0u {
+        let slot = textureLoad(gbuf_leaf_slot, coord, 0).r;
+        if slot != 0u && slot < arrayLength(&brush_overlay_distances) {
+            let d = brush_overlay_distances[slot];
+            let r = max(shade_params.brush_radius, 1e-4);
+            if d < r {
+                let t = d / r;
+                // Bright rim near the radius edge + a soft fill.
+                let rim = smoothstep(0.85, 0.99, t) * (1.0 - smoothstep(0.99, 1.0, t));
+                let fill = (1.0 - smoothstep(0.0, 1.0, t)) * 0.25;
+                let alpha = clamp(rim + fill, 0.0, 1.0);
+                // Local-luminance boost keeps the brush visible against
+                // both bright-sunlit and shadowed surfaces.
+                let lum = dot(final_color, vec3<f32>(0.299, 0.587, 0.114));
+                let scale = max(shade_params.ambient_intensity, lum) * 3.0;
+                let overlay = shade_params.brush_color.rgb * scale;
+                final_color = mix(final_color, overlay, alpha);
+            }
+        }
+    }
 
     textureStore(output, coord, vec4<f32>(final_color, 1.0));
 }
