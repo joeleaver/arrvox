@@ -47,7 +47,6 @@ struct Material {
 @group(0) @binding(2) var hdr_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(3) var<uniform> camera: CameraUniforms;
 @group(0) @binding(4) var<storage, read> materials: array<Material>;
-@group(0) @binding(5) var gbuf_position: texture_2d<f32>;
 
 fn mat_albedo(m: Material) -> vec3<f32> {
     return vec3<f32>(m.albedo_r, m.albedo_g, m.albedo_b);
@@ -107,7 +106,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims_f = vec2<f32>(dims_u);
 
     let hdr_here = textureLoad(hdr_in, coord, 0).rgb;
-    let glass_raw = textureLoad(gbuf_glass, coord, 0);
+    let glass_raw = textureLoad(gbuf_glass, coord, 0).rg;
     let thickness_mm = (glass_raw.y >> 16u) & 0xFFFFu;
 
     // No glass → pass through.
@@ -117,8 +116,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let glass_mat_id = glass_raw.y & 0xFFFFu;
-    let glass_N_in = normalize(unpack_oct_normal(glass_raw.x));
-    let glass_N_out = normalize(unpack_oct_normal(glass_raw.z));
+    let glass_N = normalize(unpack_oct_normal(glass_raw.x));
     let thickness = f32(thickness_mm) * 0.001;
     let gm = materials[glass_mat_id];
     let glass_albedo = mat_albedo(gm);
@@ -134,69 +132,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
     let V = -ray_dir;
 
-    // Full Snell: refract at entry (air→glass, eta = 1/n), travel
-    // through the glass in the bent direction for `thickness`
-    // meters, refract again at exit (glass→air, eta = n). For a
-    // flat pane with parallel faces the entry and exit normals are
-    // the same, so exit bends back to the original ray direction —
-    // net effect is pure lateral shift (correct). For curved glass
-    // the normals diverge, the exit refraction doesn't fully
-    // cancel the entry, and the accumulated bend lenses the
-    // behind (correct for convex lenses like spheres / bottles —
-    // objects past the focal length invert).
-    let eta_in = 1.0 / max(glass_ior, 1.0001);
-    let eta_out = glass_ior;
-
-    var entry_dir = refract(ray_dir, glass_N_in, eta_in);
-    if dot(entry_dir, entry_dir) < 1e-6 {
-        entry_dir = ray_dir; // TIR on entry — skip refract (won't happen air→glass).
+    // Screen-space refraction — bend the ray at the glass front face,
+    // trace it `thickness` worth of world-space into the bent
+    // direction, project both the straight and bent endpoints onto
+    // screen, sample HDR at the offset. This approximates "the
+    // behind pixel at the position refraction would have routed the
+    // ray to," using the already-shaded HDR as the source. Entry-
+    // only refraction — over-bends vs. full entry+exit Snell on
+    // thick flat glass, but reads as real refraction.
+    var refract_dir = refract(ray_dir, glass_N, 1.0 / max(glass_ior, 1.0001));
+    if dot(refract_dir, refract_dir) < 1e-6 {
+        refract_dir = ray_dir; // total internal reflection fallback
     }
-    // Exit refract: ray goes from glass into air. WGSL's `refract`
-    // wants N on the INCIDENT side (pointing AGAINST the ray).
-    // `glass_N_out` is the outward normal of the exit face —
-    // pointing into the far-side AIR. For the ray traveling
-    // inside the glass, the incident-side normal is the glass-
-    // side of the exit face, which is the opposite direction.
-    // For a flat pane this makes entry+exit cancel (tiny lateral
-    // shift); for a sphere head-on, the entry and exit normals
-    // are anti-parallel but the negation makes them both point
-    // at the ray correctly → entry+exit again cancel, no net
-    // bend at the center → correct physics (the sphere center
-    // ISN'T where the ray bends most; that's the edges).
-    // Track validity through the exit Snell. TIR at exit (and the
-    // off-frustum projection cases below) are physically situations
-    // we can't simulate in screen space — the ray would either
-    // bounce around inside the glass or exit through a part of the
-    // surface we don't know about. Cleanest fallback is "no
-    // refraction at this pixel": sample the HDR at the original
-    // coord. Discontinuous artifacts in the screen-space approx
-    // (the "sphere within a sphere" rim from clamping huge offsets
-    // to the screen edge) disappear in exchange for losing
-    // refraction precision in a small ring at the silhouette.
-    let final_dir_raw = refract(entry_dir, -glass_N_out, eta_out);
-    let final_dir_valid = dot(final_dir_raw, final_dir_raw) > 1e-6;
-    let final_dir = select(ray_dir, final_dir_raw, final_dir_valid);
 
     let anchor_world = camera.position.xyz + ray_dir * thickness;
-    let refract_world = camera.position.xyz + final_dir * thickness;
+    let refract_world = camera.position.xyz + refract_dir * thickness;
     let anchor_px = world_to_screen(anchor_world, dims_f);
     let refract_px = world_to_screen(refract_world, dims_f);
     let offset_px = refract_px - anchor_px;
 
-    // Reject pixels where the refraction sample would land off-
-    // screen, off-frustum, or anywhere whose projection went
-    // negative (clip.w ≤ 0 sentinels from world_to_screen). Falls
-    // back to a straight-through HDR read, which reads as "barely
-    // any refraction" at that pixel — much less jarring than
-    // showing the screen corner clamped sample.
+    // Clamp the sample coord to texture bounds — off-screen samples
+    // would otherwise return black and punch holes at grazing glass
+    // silhouettes. Reading the edge pixel is a cheap approximation
+    // that stays well-behaved.
     let sample_f = vec2<f32>(coord) + offset_px;
-    let on_screen = anchor_px.x >= 0.0 && anchor_px.y >= 0.0
-                 && refract_px.x >= 0.0 && refract_px.y >= 0.0
-                 && sample_f.x >= 0.0 && sample_f.x < dims_f.x
-                 && sample_f.y >= 0.0 && sample_f.y < dims_f.y
-                 && final_dir_valid;
-    let sample_coord = select(coord, vec2<i32>(sample_f), on_screen);
-    let behind = textureLoad(hdr_in, sample_coord, 0).rgb;
+    let sample_i = vec2<i32>(
+        clamp(i32(sample_f.x), 0, i32(dims_u.x) - 1),
+        clamp(i32(sample_f.y), 0, i32(dims_u.y) - 1),
+    );
+    let behind = textureLoad(hdr_in, sample_i, 0).rgb;
 
     // Fresnel + reflection sample. Project the reflected ray onto
     // screen and sample HDR there — cheap env-map approximation.
@@ -207,7 +171,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // should probe outside the camera frustum (e.g. looking down at
     // glass reflecting sky) we fall back to `behind` — keeps the
     // result plausibly lit rather than pinned to a random edge.
-    let reflect_dir = reflect(-V, glass_N_in);
+    let reflect_dir = reflect(-V, glass_N);
     let reflect_world = camera.position.xyz + reflect_dir * 50.0;
     let reflect_px = world_to_screen(reflect_world, dims_f);
     var reflect_sample = vec3<f32>(0.0);
@@ -219,7 +183,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         reflect_sample = behind;
     }
 
-    let cos_vn = max(dot(V, glass_N_in), 0.0);
+    let cos_vn = max(dot(V, glass_N), 0.0);
     let fresnel = fresnel_dielectric(cos_vn, glass_ior);
     let absorption = beer_absorption(glass_albedo, thickness);
     let transmitted = behind * absorption;

@@ -703,7 +703,15 @@ impl RkpSceneManager {
         };
 
         let bytes_per_voxel = std::mem::size_of::<VoxelSample>();
-        let mut file_voxel_mat: Vec<(u16, u16, u8, u32, u32)> = Vec::with_capacity(voxel_count as usize);
+        // `Option<u32>` for normal so we distinguish "file has no normals"
+        // (stays None → leaf_attr keeps its default) from "file has a
+        // normal that happens to oct-pack to 0" (which is the legitimate
+        // +Z direction; previously the load path skipped that override
+        // because it used `if normal_oct != 0`, corrupting every voxel
+        // whose baked normal pointed +Z — manifested as one face of a
+        // cube rendering with wrong refraction after save/reload, fixed
+        // only by re-baking).
+        let mut file_voxel_mat: Vec<(u16, u16, u8, u32, Option<u32>)> = Vec::with_capacity(voxel_count as usize);
         for i in 0..voxel_count as usize {
             let src_offset = i * bytes_per_voxel;
             if src_offset + bytes_per_voxel > voxel_data.len() {
@@ -712,7 +720,11 @@ impl RkpSceneManager {
             let vs: &VoxelSample =
                 bytemuck::from_bytes(&voxel_data[src_offset..src_offset + bytes_per_voxel]);
             let color = color_u32s.get(i).copied().unwrap_or(0);
-            let normal_oct = normals_u32s.get(i).copied().unwrap_or(0);
+            let normal_oct = if has_normals {
+                normals_u32s.get(i).copied()
+            } else {
+                None
+            };
             file_voxel_mat.push((
                 vs.material_id(), vs.secondary_material_id(), vs.blend_weight(), color, normal_oct,
             ));
@@ -733,8 +745,8 @@ impl RkpSceneManager {
 
         for (i, &(mat_p, mat_s, blend, color, normal_oct)) in file_voxel_mat.iter().enumerate() {
             let mut attr = LeafAttr::new_blended(glam::Vec3::Y, mat_p, mat_s, blend);
-            if normal_oct != 0 {
-                attr.normal_oct = normal_oct;
+            if let Some(n) = normal_oct {
+                attr.normal_oct = n;
             }
             let slot = leaf_attr_slot_start + i as u32;
             *self.leaf_attr_pool.get_mut(slot) = attr;

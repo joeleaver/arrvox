@@ -327,8 +327,8 @@ impl RkpRenderer {
 
         // 4a. Glass composite — reads the (volumetric-composited)
         // HDR + gbuf_glass, applies Fresnel + Beer + screen-space
-        // refraction for any pixel whose primary ray passed
-        // through transparent voxels, writes to its own HDR target.
+        // refraction for any pixel whose primary ray passed through
+        // transparent voxels, writes to its own HDR target.
         // Downstream god_rays sources from `glass.output_view`.
         {
             let q = self.profiler.begin_query("glass", encoder);

@@ -195,7 +195,6 @@ impl ViewportRenderer {
             &gbuffer.glass_view,
             &camera_buffer,
             &renderer.materials_buffer,
-            &gbuffer.position_view,
         );
 
         let mut god_rays = RkpGodRayPass::new(device, width, height);
@@ -278,7 +277,6 @@ impl ViewportRenderer {
                 &self.gbuffer.glass_view,
                 &self.camera_buffer,
                 &renderer.materials_buffer,
-                &self.gbuffer.position_view,
             );
             self.lights_materials_epoch = lm_now;
         }
@@ -332,7 +330,6 @@ impl ViewportRenderer {
             &self.gbuffer.glass_view,
             &self.camera_buffer,
             &renderer.materials_buffer,
-            &self.gbuffer.position_view,
         );
 
         self.god_rays.resize(device, width, height);

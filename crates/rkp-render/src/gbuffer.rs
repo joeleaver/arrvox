@@ -38,19 +38,12 @@ pub struct GBuffer {
     /// Target "glass": per-pixel glass surface info when the primary
     /// ray passes through a transparent voxel. The primary G-buffer
     /// targets above record the opaque hit BEHIND the glass; this
-    /// target records the glass itself so `rkp_glass` can do full
-    /// entry + exit Snell over the shaded behind. `Rgba32Uint`:
+    /// target records the glass itself so `rkp_glass` can composite
+    /// refraction + Beer + Fresnel over the shaded behind. `Rg32Uint`:
     /// * R = entry normal, oct-packed (2×snorm16 → u32).
     /// * G = `(thickness_mm << 16) | material_id`.
-    /// * B = exit normal, oct-packed.
-    /// * A = reserved (0).
     /// A value of `R==0, G==0` means "no glass at this pixel" —
-    /// shaders gate on `thickness_mm != 0`. The second normal lets
-    /// the composite apply a pair of refractions — entry air→glass,
-    /// exit glass→air. For a flat pane with parallel faces the two
-    /// bends cancel to pure lateral shift; for curved glass the
-    /// normals diverge and the bends accumulate into a lensing
-    /// effect that correctly inverts behind-object views.
+    /// shaders gate on `thickness_mm != 0`.
     pub glass_texture: wgpu::Texture,
     /// View for the glass target.
     pub glass_view: wgpu::TextureView,
@@ -85,12 +78,11 @@ pub const GBUFFER_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba
 pub const GBUFFER_MATERIAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
 /// Texture format for G-buffer target 3 (motion vectors).
 pub const GBUFFER_MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
-/// Texture format for the glass target — RGBA32Uint carrying entry
-/// normal (R), packed thickness/material_id (G), exit normal (B),
-/// reserved (A). Changing the format breaks `octree_march`,
-/// `proc_raymarch`, and `rkp_glass` — all hardcode against this
-/// channel layout.
-pub const GBUFFER_GLASS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Uint;
+/// Texture format for the glass target — Rg32Uint carrying entry
+/// normal (R), packed thickness/material_id (G). Changing the format
+/// breaks `octree_march`, `proc_raymarch`, and `rkp_glass` — all
+/// hardcode against this channel layout.
+pub const GBUFFER_GLASS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
 
 impl GBuffer {
     /// Create the G-buffer with 4 render targets at the given resolution.

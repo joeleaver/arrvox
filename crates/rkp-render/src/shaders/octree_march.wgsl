@@ -254,10 +254,9 @@ fn brick_id_of(node: u32) -> u32 {
 // slot in `gbuf_material`'s G channel, which capped pickable scenes at
 // 255 entries.
 @group(1) @binding(3) var gbuf_pick: texture_storage_2d<r32uint, write>;
-// Glass info — R: oct-packed entry normal. G: (thickness_mm << 16) |
-// material_id. B: oct-packed exit normal. A: reserved. Zero in R and
-// G = "no glass at this pixel."
-@group(1) @binding(4) var gbuf_glass: texture_storage_2d<rgba32uint, write>;
+// Glass info — oct-packed normal in R, (thickness_mm << 16 | material_id) in G.
+// Zero in both channels = "no glass at this pixel."
+@group(1) @binding(4) var gbuf_glass: texture_storage_2d<rg32uint, write>;
 
 @group(2) @binding(0) var<uniform> march_params: MarchParams;
 @group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
@@ -629,18 +628,14 @@ struct MarchResult {
     // Glass tracking. Set when the ray traverses at least one
     // transparent voxel (material opacity < 0.99) before landing on
     // the opaque `first_slot` (or exiting the object without one).
-    // Both normals are oc-space (same basis as `normal`); world-
-    // conversion happens in main(). `glass_normal` is the FRONT
-    // (entry) face normal — recorded on first glass hit and never
-    // overwritten. `glass_exit_normal` is the BACK (exit) face
-    // normal — updated on every glass cell, so it ends up being
-    // the normal of the LAST glass cell the ray visited before
-    // hitting opaque (or exiting). rkp_glass applies Snell at both
-    // surfaces: flat parallel faces cancel to lateral shift; curved
-    // glass normals diverge and lens the behind content.
+    // `glass_normal` is the front-face normal in oc-space, same
+    // basis as `normal`. `glass_enter_t` is the ray parameter at
+    // first glass contact, `glass_exit_t` is updated on each
+    // subsequent glass cell; together they yield a thickness proxy
+    // (entry → last-glass-cell). World-space conversion happens in
+    // `main()` where the object-to-world scale is in scope.
     glass_valid: bool,
     glass_normal: vec3<f32>,
-    glass_exit_normal: vec3<f32>,
     glass_material: u32,
     glass_enter_t: f32,
     glass_exit_t: f32,
@@ -745,7 +740,7 @@ fn march_object_skinned(
     var result = MarchResult(
         vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0),
         0.0, 0.0, 0u, false, 0u,
-        false, vec3<f32>(0.0), vec3<f32>(0.0), 0u, 0.0, 0.0,
+        false, vec3<f32>(0.0), 0u, 0.0, 0.0,
     );
 
     let inv_world = obj.inverse_world;
@@ -868,7 +863,7 @@ fn march_object(
     var result = MarchResult(
         vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0),
         0.0, 0.0, 0u, false, 0u,
-        false, vec3<f32>(0.0), vec3<f32>(0.0), 0u, 0.0, 0.0,
+        false, vec3<f32>(0.0), 0u, 0.0, 0.0,
     );
 
     let inv_world = obj.inverse_world;
@@ -999,17 +994,6 @@ fn march_object(
                                 result.glass_material = obj.material_id;
                                 result.glass_enter_t = t;
                             }
-                            // Fallback exit normal = entry normal
-                            // reflected across the ray plane. For a
-                            // straight-line-through-glass exit point
-                            // this equals the real back-shell normal
-                            // (sphere off-center: entry (sx,sy,sz)
-                            // → real exit (sx,sy,-sz); flat pane:
-                            // entry (0,0,1) → real exit (0,0,-1)).
-                            // No discontinuity between fallback and
-                            // real-back-brick-hit pixels, so no
-                            // visible rim.
-                            result.glass_exit_normal = reflect(result.glass_normal, safe_dir);
                             result.glass_exit_t = t;
                             break; // outer loop takes over via skip_node on INTERIOR
                         }
@@ -1079,13 +1063,6 @@ fn march_object(
                             result.glass_material = obj.material_id;
                             result.glass_enter_t = t;
                         }
-                        // See the FACE_INTERIOR path above for why we
-                        // reflect the entry normal across the ray
-                        // plane — gives the same exit_normal a real
-                        // back-shell brick would, so the boundary
-                        // between "real back hit" and "back missed"
-                        // pixels is invisible.
-                        result.glass_exit_normal = reflect(result.glass_normal, safe_dir);
                         result.glass_exit_t = t;
                     }
                     // Fall through to DDA step (skip either way).
@@ -1138,23 +1115,18 @@ fn march_object(
                     } else {
                         // Glass cell — record entry the first time,
                         // update exit every time, but keep marching
-                        // to find the opaque behind. `glass_normal`
-                        // is the ENTRY face normal (front, toward
-                        // camera); `glass_exit_normal` tracks the
-                        // LAST glass cell's normal as the ray moves
-                        // through, so by the time we stop on opaque
-                        // it holds the back-face normal. For flat
-                        // glass the entry and exit normals are
-                        // parallel, so rkp_glass's two refracts
-                        // cancel to lateral-only shift; for curved
-                        // glass they diverge and accumulate lensing.
+                        // to find the opaque behind. Normal of the
+                        // glass surface = the entry cell's normal,
+                        // which points OUT of the glass body (toward
+                        // the camera for a front-face hit). Subsequent
+                        // glass cells don't overwrite the normal —
+                        // the front face is what matters for Fresnel.
                         if !result.glass_valid {
                             result.glass_valid = true;
                             result.glass_normal = cell_normal;
                             result.glass_material = mid;
                             result.glass_enter_t = t;
                         }
-                        result.glass_exit_normal = cell_normal;
                         result.glass_exit_t = t;
                         // Fall through to DDA step below.
                     }
@@ -1213,13 +1185,6 @@ fn march_object(
                     result.glass_material = obj.material_id;
                     result.glass_enter_t = t;
                 }
-                // Fallback exit normal — reflection of entry across
-                // the ray plane. Matches what a real back-shell
-                // brick would have for a straight-line through the
-                // glass body, so transitions between "real back
-                // brick reached" and "back missed via skip_node
-                // overshoot / FP boundary" pixels are invisible.
-                result.glass_exit_normal = reflect(result.glass_normal, safe_dir);
                 t += skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs);
                 result.glass_exit_t = max(result.glass_exit_t, t);
                 continue;
@@ -1252,7 +1217,6 @@ fn march_object(
                 result.glass_material = mid;
                 result.glass_enter_t = t;
             }
-            result.glass_exit_normal = sample_normal;
             result.glass_exit_t = t;
             t += vs * 0.5;
             continue;
@@ -1366,7 +1330,6 @@ fn main(
     var glass_enter_dist = 1e20;
     var glass_exit_dist = 0.0;
     var glass_normal_world = vec3<f32>(0.0, 1.0, 0.0);
-    var glass_exit_normal_world = vec3<f32>(0.0, 1.0, 0.0);
     var glass_material_id = 0u;
     var total_steps = 0u;
 
@@ -1416,10 +1379,8 @@ fn main(
                 glass_have = true;
                 glass_enter_dist = g_enter;
                 glass_exit_dist = g_exit;
-                let world_n_in = normalize((obj.world * vec4<f32>(r.glass_normal, 0.0)).xyz);
-                let world_n_out = normalize((obj.world * vec4<f32>(r.glass_exit_normal, 0.0)).xyz);
-                glass_normal_world = world_n_in;
-                glass_exit_normal_world = world_n_out;
+                let world_n = normalize((obj.world * vec4<f32>(r.glass_normal, 0.0)).xyz);
+                glass_normal_world = world_n;
                 glass_material_id = r.glass_material;
             }
             // Pick also considers glass hits — click on a glass
@@ -1527,17 +1488,12 @@ fn main(
     // at all). `thickness_mm` caps at u16::MAX (≈65.5 m) — any
     // deeper glass clamps harmlessly. `material_id` is u16; it
     // shares the lower 16 bits of G.
-    var glass_packed = vec4<u32>(0u, 0u, 0u, 0u);
+    var glass_packed = vec2<u32>(0u, 0u);
     if glass_have {
         let thickness = max(0.0, min(glass_exit_dist, max_world_dist) - glass_enter_dist);
         let thickness_mm_raw = u32(clamp(thickness * 1000.0, 1.0, 65535.0));
         let packed_g = (glass_material_id & 0xFFFFu) | (thickness_mm_raw << 16u);
-        glass_packed = vec4<u32>(
-            pack_oct_normal(glass_normal_world),
-            packed_g,
-            pack_oct_normal(glass_exit_normal_world),
-            0u,
-        );
+        glass_packed = vec2<u32>(pack_oct_normal(glass_normal_world), packed_g);
     }
 
     if !have_first {
@@ -1551,7 +1507,7 @@ fn main(
         textureStore(gbuf_normal, coord, vec4<f32>(0.0, 0.0, 0.0, 0.0));
         textureStore(gbuf_material, coord, vec4<u32>(0u, 0u, 0u, 0u));
         textureStore(gbuf_pick, coord, vec4<u32>(miss_pick_id, 0u, 0u, 0u));
-        textureStore(gbuf_glass, coord, glass_packed);
+        textureStore(gbuf_glass, coord, vec4<u32>(glass_packed.x, glass_packed.y, 0u, 0u));
         return;
     }
 
@@ -1592,5 +1548,5 @@ fn main(
     // to the pre-glass behaviour.
     let pick_id = select(first_obj_id, pick_obj_id, pick_dist < max_world_dist);
     textureStore(gbuf_pick, coord, vec4<u32>(pick_id, 0u, 0u, 0u));
-    textureStore(gbuf_glass, coord, glass_packed);
+    textureStore(gbuf_glass, coord, vec4<u32>(glass_packed.x, glass_packed.y, 0u, 0u));
 }
