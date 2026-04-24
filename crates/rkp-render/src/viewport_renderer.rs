@@ -195,6 +195,8 @@ impl ViewportRenderer {
             &gbuffer.glass_view,
             &camera_buffer,
             &renderer.materials_buffer,
+            &renderer.shade_params_buffer,
+            &renderer.lights_buffer,
         );
 
         let mut god_rays = RkpGodRayPass::new(device, width, height);
@@ -267,16 +269,19 @@ impl ViewportRenderer {
                 &renderer.materials_buffer,
             );
             // Glass pass also reads the materials SSBO (for glass
-            // albedo / IOR) — refresh its binding when the buffer
-            // reallocates alongside the other consumers. Input
-            // HDR comes from volumetric so clouds / fog land in
-            // the "behind" before glass Fresnel + refraction.
+            // albedo / IOR) + shade_params + lights (for GGX direct
+            // spec). Refresh all three when the lights/materials
+            // epoch bumps; any of them may reallocate. Input HDR
+            // comes from volumetric so clouds / fog land in the
+            // "behind" before glass Fresnel + refraction.
             self.glass.set_inputs(
                 device,
                 &self.volumetric.output_view,
                 &self.gbuffer.glass_view,
                 &self.camera_buffer,
                 &renderer.materials_buffer,
+                &renderer.shade_params_buffer,
+                &renderer.lights_buffer,
             );
             self.lights_materials_epoch = lm_now;
         }
@@ -330,6 +335,8 @@ impl ViewportRenderer {
             &self.gbuffer.glass_view,
             &self.camera_buffer,
             &renderer.materials_buffer,
+            &renderer.shade_params_buffer,
+            &renderer.lights_buffer,
         );
 
         self.god_rays.resize(device, width, height);

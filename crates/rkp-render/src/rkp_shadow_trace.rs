@@ -177,3 +177,18 @@ fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Textur
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
     (tex, view)
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rkp_shadow_trace_shader_is_valid_wgsl() {
+        let src = include_str!("shaders/rkp_shadow_trace.wgsl");
+        let module = naga::front::wgsl::parse_str(src)
+            .unwrap_or_else(|e| panic!("parse error:\n{}", e.emit_to_string(src)));
+        let mut v = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        v.validate(&module).unwrap_or_else(|e| panic!("validation error: {e:?}"));
+    }
+}

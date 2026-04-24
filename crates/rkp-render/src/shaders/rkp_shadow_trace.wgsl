@@ -115,15 +115,35 @@ fn mat_albedo(m: GpuMaterial) -> vec3<f32> {
     return vec3<f32>(m.albedo_r, m.albedo_g, m.albedo_b);
 }
 
-// Scalar Beer transmittance for shadows — mirrors `beer_absorption`
-// in rkp_shade but returns a single float (the shadow trace only
-// shades `visibility`, not color). We average the per-channel
-// absorption; this is a cheap approximation that's fine for the
-// typical mildly-tinted glass case and saves an RGB shadow path.
-fn shadow_beer(glass_color: vec3<f32>, thickness: f32) -> f32 {
-    let sigma = max(-log(max(glass_color, vec3<f32>(0.01))), vec3<f32>(0.0));
-    let a = exp(-sigma * thickness * 5.0);
-    return (a.x + a.y + a.z) * (1.0 / 3.0);
+// Opacity extinction reference: opacity=X over glass this thick gives
+// transmittance `1 - X` at full density, matching the primary pass's
+// one-shot `(1 - opacity)` gate. Glass thinner than this brightens
+// the shadow, thicker darkens it.
+const OPACITY_REFERENCE_M: f32 = 0.3;
+
+// Overall glass-shadow darkness multiplier. Scales the total
+// extinction sigma down: 1.0 = full physical match to the primary
+// transmission pass; <1.0 lets more light through the shadow ray
+// regardless of glass thickness. Chosen by eye after user feedback
+// that a physically-matched pass read as "too dark" — 0.25 gives
+// roughly 1/4 the darkness across the board (more visually, since
+// the mapping is `T → T^0.25` in the exponential).
+const GLASS_SHADOW_DENSITY: f32 = 0.25;
+
+// Scalar Beer transmittance for shadows — combines albedo absorption
+// (mirroring rkp_shade's `beer_absorption`) with a per-meter opacity
+// extinction so cell-by-cell shadow-ray accumulation stays aligned
+// with the primary pass's `beer(albedo, total_t) * (1 - opacity)`
+// behavior, then softens the whole thing by `GLASS_SHADOW_DENSITY`.
+// Returns a scalar (shadow rays care about visibility, not color) —
+// per-channel albedo absorption is averaged, which is fine for the
+// typical mildly-tinted glass case.
+fn shadow_beer(glass_color: vec3<f32>, opacity: f32, thickness: f32) -> f32 {
+    let sigma_albedo_v = max(-log(max(glass_color, vec3<f32>(0.01))), vec3<f32>(0.0));
+    let sigma_albedo = (sigma_albedo_v.x + sigma_albedo_v.y + sigma_albedo_v.z) * (1.0 / 3.0);
+    let sigma_opacity = -log(max(1.0 - opacity, 0.01)) / OPACITY_REFERENCE_M;
+    let sigma = (sigma_albedo * 5.0 + sigma_opacity) * GLASS_SHADOW_DENSITY;
+    return exp(-sigma * thickness);
 }
 
 struct OctreeResult {
@@ -361,7 +381,12 @@ fn trace_shadow_skinned(
         let mid = leaf_attr_material_primary(attr);
         let m_op = materials[mid].opacity;
         if m_op >= 0.99 { return 0.0; }
-        transmittance *= (1.0 - m_op);
+        // Route through `shadow_beer` so opacity extinction is
+        // thickness-proportional rather than per-iteration linear
+        // (which compounded into near-black on deep glass bodies).
+        let glass_albedo = mat_albedo(materials[mid]);
+        let step_world = vs / local_scale;
+        transmittance *= shadow_beer(glass_albedo, m_op, step_world);
         if transmittance < 0.01 { return 0.0; }
         t += vs;
     }
@@ -540,13 +565,12 @@ fn trace_shadow_ray(
                         // objects keep the old "skip like air"
                         // behavior (shadow passes straight through
                         // mesh interiors). Glass objects attenuate
-                        // by the cell's own fraction of Beer over
-                        // one cell width.
+                        // by one cell's worth of Beer + opacity.
                         let obj_opacity = materials[obj.material_id].opacity;
                         if obj_opacity < 0.99 {
                             let glass_albedo = mat_albedo(materials[obj.material_id]);
-                            let t_att = shadow_beer(glass_albedo, cell_size);
-                            transmittance *= t_att;
+                            let cell_world = cell_size / local_scale;
+                            transmittance *= shadow_beer(glass_albedo, obj_opacity, cell_world);
                             if transmittance < 0.01 { blocked = true; break; }
                         }
                     } else if c != BRICK_CELL_EMPTY {
@@ -554,13 +578,16 @@ fn trace_shadow_ray(
                         let mid = leaf_attr_material_primary(attr);
                         let m_op = materials[mid].opacity;
                         if m_op >= 0.99 { blocked = true; break; }
-                        // Linear approximation — cheap, close enough
-                        // for the tiny per-cell transmission fraction
-                        // glass usually contributes. Full Beer with
-                        // cell-size thickness happens in the INTERIOR
-                        // / FACE_INTERIOR paths where the spans are
-                        // large enough to matter.
-                        transmittance *= (1.0 - m_op);
+                        // Full Beer + opacity over one cell width.
+                        // Earlier code used a per-cell linear
+                        // `(1 - m_op)` multiplier which compounded
+                        // across many cells into near-black shadows;
+                        // routing through `shadow_beer` keeps the
+                        // extinction thickness-proportional and
+                        // matches the primary pass's one-shot gate.
+                        let glass_albedo = mat_albedo(materials[mid]);
+                        let cell_world = cell_size / local_scale;
+                        transmittance *= shadow_beer(glass_albedo, m_op, cell_world);
                         if transmittance < 0.01 { blocked = true; break; }
                     }
 
@@ -594,7 +621,7 @@ fn trace_shadow_ray(
                     let span = max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);
                     let glass_albedo = mat_albedo(materials[obj.material_id]);
                     let span_world = span / local_scale;
-                    transmittance *= shadow_beer(glass_albedo, span_world);
+                    transmittance *= shadow_beer(glass_albedo, obj_opacity, span_world);
                     if transmittance < 0.01 { return 0.0; }
                     t += span;
                     continue;
@@ -611,7 +638,13 @@ fn trace_shadow_ray(
             if mat_opacity >= 0.99 {
                 return 0.0;
             }
-            transmittance *= (1.0 - mat_opacity);
+            // Route through `shadow_beer` so albedo + opacity both
+            // accumulate as thickness-proportional extinction.
+            // Earlier per-iteration `(1 - opacity)` multiplier
+            // compounded across many cells into over-dark shadows.
+            let glass_albedo = mat_albedo(materials[mid]);
+            let step_world = min_step / local_scale;
+            transmittance *= shadow_beer(glass_albedo, mat_opacity, step_world);
             if transmittance < 0.01 {
                 return 0.0;
             }

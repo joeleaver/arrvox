@@ -86,6 +86,28 @@ impl RkpGlassPass {
                     },
                     count: None,
                 },
+                // 5: shade params uniform (for sun_dir / num_lights).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 6: lights storage (for GGX direct specular).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -132,6 +154,8 @@ impl RkpGlassPass {
         gbuf_glass_view: &wgpu::TextureView,
         camera_buffer: &wgpu::Buffer,
         materials_buffer: &wgpu::Buffer,
+        shade_params_buffer: &wgpu::Buffer,
+        lights_buffer: &wgpu::Buffer,
     ) {
         self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rkp_glass bg"),
@@ -142,6 +166,8 @@ impl RkpGlassPass {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.output_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: camera_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: materials_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: shade_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: lights_buffer.as_entire_binding() },
             ],
         }));
     }
@@ -181,5 +207,20 @@ impl RkpGlassPass {
         });
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
         (tex, view)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rkp_glass_shader_is_valid_wgsl() {
+        let src = include_str!("shaders/rkp_glass.wgsl");
+        let module = naga::front::wgsl::parse_str(src)
+            .unwrap_or_else(|e| panic!("parse error:\n{}", e.emit_to_string(src)));
+        let mut v = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        v.validate(&module).unwrap_or_else(|e| panic!("validation error: {e:?}"));
     }
 }
