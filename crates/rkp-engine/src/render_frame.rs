@@ -101,6 +101,21 @@ pub struct RenderFrame {
     /// could lose the upload if the carrying snapshot got dropped.
     pub materials: Vec<GpuMaterial>,
 
+    /// Per-material user-shader params buffer — one [f32; 8] slot per
+    /// material, parallel to `materials`. Sim builds this from the
+    /// active `UserShaderRegistry` + each material's `shader_params`
+    /// HashMap. Render uploads to each viewport's shade pass alongside
+    /// `materials`.
+    pub shader_params_slots: Vec<[f32; 8]>,
+
+    /// Composed user-shader chunk for the deferred shade pass, plus
+    /// its source hash. Render thread compares hash against each
+    /// viewport shade pass's last-seen value and rebuilds the
+    /// pipeline when they differ. Empty string on the no-shaders
+    /// path; the in-tree identity stub keeps that case working.
+    pub user_shader_shade_chunk: String,
+    pub user_shader_source_hash: u64,
+
     /// Scene-wide light list (sun + entity point/spot lights), in the
     /// order the shade shader expects (entry 0 = sun).
     pub lights: Vec<GpuLight>,

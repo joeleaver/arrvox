@@ -48,14 +48,20 @@ impl PersistedEditorState {
 
     /// Deserialize from JSON, falling back to a default layout on parse
     /// error. Logs the failure so a truly broken sidecar isn't silent.
+    /// Also runs `migrate_panels` so newer panel ids that didn't exist
+    /// when the layout was saved get appended to a sensible zone — the
+    /// user shouldn't have to nuke their layout to discover a new
+    /// panel after upgrading.
     pub fn from_json_or_default(json: &str) -> Self {
-        match serde_json::from_str::<Self>(json) {
+        let mut state = match serde_json::from_str::<Self>(json) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("[rkp-editor] failed to parse editor_layout: {e} — using default");
                 Self::default()
             }
-        }
+        };
+        state.layout.migrate_panels();
+        state
     }
 }
 

@@ -199,6 +199,48 @@ impl EngineState {
         }
     }
 
+    /// Rescan `<project_root>/assets/shaders/*.wgsl`, replace the
+    /// engine's `user_shader_registry`. Phase A: that's it — the
+    /// registry is consulted on the next material upload to set
+    /// `GpuMaterial.shader_id`. Phase B+ extends this to recompile
+    /// pipelines and trigger frame-level re-renders.
+    ///
+    /// Idempotent: same source hash → no-op. Returns `None` on scan
+    /// failure (parse error / IO); the previous registry stays in
+    /// place so the renderer keeps working.
+    pub(crate) fn reload_user_shaders(&mut self) -> Option<()> {
+        use rkp_render::shader_composer;
+
+        let Some(shaders_dir) = self.shaders_dir() else {
+            return Some(());
+        };
+
+        let new_reg = match shader_composer::scan_dir(&shaders_dir) {
+            Ok(r) => r,
+            Err(e) => {
+                self.console.warn(format!("user shader scan failed: {e}"));
+                return None;
+            }
+        };
+
+        if new_reg.source_hash() == self.user_shader_registry.source_hash() {
+            return Some(());
+        }
+
+        self.user_shader_registry = new_reg;
+        // The materials palette is rebuilt on every snapshot tick from
+        // the registry, so newly-resolved shader_ids reach the GPU on
+        // the very next frame without an explicit re-upload here. See
+        // `engine/lifecycle.rs::build_palette` call site.
+        Some(())
+    }
+
+    /// `<project_root>/assets/shaders/`, or `None` if no project loaded.
+    pub(crate) fn shaders_dir(&self) -> Option<std::path::PathBuf> {
+        let project_dir = self.project_dir.as_ref()?;
+        Some(project_dir.join("assets").join("shaders"))
+    }
+
     /// Compute the bake-cache sidecar path for a procedural entity:
     /// `{scene_dir}/{scene_stem}.bakes/{uuid}.rkp`. Returns `None` when
     /// the scene has no on-disk path yet (unsaved scratch session) or
@@ -473,4 +515,5 @@ pub(crate) fn procedural_voxel_params(tree: &rkp_procedural::ProceduralObject, b
 
     (aabb, voxel_size)
 }
+
 

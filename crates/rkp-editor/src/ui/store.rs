@@ -235,6 +235,11 @@ pub struct EditorStore {
 
     /// Available materials in the project.
     pub materials: Signal<Vec<MaterialInfo>>,
+    /// Registered user shaders in the project's `assets/shaders/`.
+    /// Populated from the engine's `UserShaderRegistry` snapshot;
+    /// drives the shader dropdown + dynamic param controls in the
+    /// material editor and the shaders panel's list.
+    pub user_shaders: Signal<Vec<rkp_render::shader_composer::UserShaderInfo>>,
     /// Currently selected material in the materials panel.
     pub selected_material: Signal<Option<u16>>,
     /// Material being dragged onto viewport (None = no drag).
@@ -381,6 +386,7 @@ impl EditorStore {
 
             // Material state.
             materials: Signal::new(Vec::new()),
+            user_shaders: Signal::new(Vec::new()),
             selected_material: Signal::new(None),
             material_drag: Signal::new(None),
             selected_model: Signal::new(None),

@@ -94,7 +94,16 @@ impl EngineState {
                 }
                 FileEvent::ShaderChanged(path) => {
                     eprintln!("[RkpEngine] shader changed: {}", path.display());
-                    // TODO: recompile GPU pipelines
+                    // Only `assets/shaders/*.wgsl` files participate in
+                    // user-shader composition; other .wgsl in the project
+                    // (engine assets, debug tools) are not composed and
+                    // shouldn't trigger a registry rescan. Filter by the
+                    // canonical shaders dir.
+                    if let Some(shaders_dir) = self.shaders_dir() {
+                        if path.starts_with(&shaders_dir) {
+                            let _ = self.reload_user_shaders();
+                        }
+                    }
                 }
                 FileEvent::MaterialChanged(path) => {
                     eprintln!("[RkpEngine] material changed: {}", path.display());

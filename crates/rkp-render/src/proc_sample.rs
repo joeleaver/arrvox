@@ -120,8 +120,6 @@ pub struct GpuEvaluator {
 
 impl GpuEvaluator {
     pub fn new(device: &wgpu::Device) -> Self {
-        // Concat order matches proc_raymarch: types → this shader's
-        // bindings + entry → shared function bodies.
         let types_src = include_str!("shaders/proc_eval_types.wgsl");
         let sample_src = include_str!("shaders/proc_sample.wgsl");
         let eval_src = include_str!("shaders/proc_eval.wgsl");
@@ -246,6 +244,7 @@ impl GpuEvaluator {
             max_positions_per_dispatch,
         }
     }
+
 
     /// Evaluate the tree at every position. If the batch exceeds the
     /// per-dispatch cap, splits into chunks transparently — caller

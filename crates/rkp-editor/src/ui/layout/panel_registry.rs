@@ -17,6 +17,7 @@ pub fn panel_name(id: PanelId) -> &'static str {
         PanelId::Console => "Console",
         PanelId::Profiling => "Profiling",
         PanelId::Models => "Models",
+        PanelId::Shaders => "Shaders",
         PanelId::Build => "Build",
     }
 }

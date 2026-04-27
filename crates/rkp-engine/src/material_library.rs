@@ -100,8 +100,22 @@ impl Default for MaterialDef {
 }
 
 impl MaterialDef {
-    /// Convert to the 96-byte GPU struct.
-    pub fn to_gpu(&self) -> GpuMaterial {
+    /// Convert to the 96-byte GPU struct, resolving `shader: Option<String>`
+    /// to a numeric `shader_id` via the supplied resolver. The resolver
+    /// is typically `|name| registry.resolve(name)` from
+    /// [`rkp_render::shader_composer::UserShaderRegistry`]. Missing or
+    /// unregistered shader names produce `shader_id = 0`, which the
+    /// shade-pass dispatcher's identity arm handles as the standard
+    /// PBR path.
+    pub fn to_gpu(
+        &self,
+        shader_id_resolver: &dyn Fn(&str) -> Option<u32>,
+    ) -> GpuMaterial {
+        let shader_id = self
+            .shader
+            .as_deref()
+            .and_then(shader_id_resolver)
+            .unwrap_or(0);
         GpuMaterial {
             albedo: self.albedo,
             roughness: self.roughness,
@@ -115,7 +129,7 @@ impl MaterialDef {
             noise_scale: self.noise_scale,
             noise_strength: self.noise_strength,
             noise_channels: self.noise_channels,
-            shader_id: 0,
+            shader_id,
             _padding: [0.0; 5],
         }
     }
@@ -142,6 +156,14 @@ pub struct MaterialInfo {
     pub noise_scale: f32,
     pub noise_strength: f32,
     pub noise_channels: u32,
+    /// User-shader name reference (matches a stem in
+    /// `<project>/assets/shaders/`). `None` means "use built-in PBR".
+    pub shader: Option<String>,
+    /// Current values for shader-declared `@param` slots, keyed by
+    /// param name. The editor renders one slider per param using the
+    /// shader's `ParamDef` schema; missing keys fall back to the
+    /// shader's declared default.
+    pub shader_params: std::collections::HashMap<String, f32>,
 }
 
 // ── Internal slot representation ─────────────────────────────────────────
@@ -367,13 +389,66 @@ impl MaterialLibrary {
     }
 
     /// Build the GPU palette array. Slot 0 = default, tombstoned slots = default.
-    pub fn build_palette(&self) -> Vec<GpuMaterial> {
-        let default_gpu = MaterialDef::default().to_gpu();
+    /// `shader_id_resolver` resolves each material's `shader: Option<String>`
+    /// to a numeric dispatch id (typically `|n| registry.resolve(n)` from
+    /// the engine's `UserShaderRegistry`). Pass `&|_| None` for an
+    /// "all identity" palette in tests or pre-registry init.
+    pub fn build_palette(
+        &self,
+        shader_id_resolver: &dyn Fn(&str) -> Option<u32>,
+    ) -> Vec<GpuMaterial> {
+        let default_gpu = MaterialDef::default().to_gpu(shader_id_resolver);
         self.slots
             .iter()
             .map(|slot| match slot {
                 MaterialSlot::Default | MaterialSlot::Tombstone => default_gpu,
-                MaterialSlot::Loaded { def, .. } => def.to_gpu(),
+                MaterialSlot::Loaded { def, .. } => def.to_gpu(shader_id_resolver),
+            })
+            .collect()
+    }
+
+    /// Build the per-material shader-params buffer — one fixed-size
+    /// 8 × f32 slot per material, parallel to `build_palette`. For each
+    /// material, looks up its shader in the registry and packs its
+    /// `MaterialDef.shader_params` values in the order the shader's
+    /// metadata declared them. Missing values fall back to the
+    /// shader's declared default. Materials with no shader (or an
+    /// unregistered shader name) get an all-zeros slot.
+    ///
+    /// Phase A produces this buffer; Phase B's shade pipeline binds
+    /// it and reads `params[material_id][i]` for each named param.
+    pub fn build_shader_params(
+        &self,
+        registry: &rkp_render::shader_composer::UserShaderRegistry,
+    ) -> Vec<[f32; 8]> {
+        let default_def = MaterialDef::default();
+        let pack = |def: &MaterialDef| -> [f32; 8] {
+            let Some(name) = def.shader.as_deref() else {
+                return [0.0; 8];
+            };
+            // Find the registered shader by name; if it isn't
+            // registered, all slots zero (the shade dispatcher will
+            // fall through to identity anyway since shader_id == 0).
+            let Some(entry) = registry.entries().iter().find(|e| e.name == name)
+            else {
+                return [0.0; 8];
+            };
+            let mut out = [0.0f32; 8];
+            for (i, param) in entry.metadata.params.iter().take(8).enumerate() {
+                out[i] = def
+                    .shader_params
+                    .get(&param.name)
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32)
+                    .unwrap_or(param.default);
+            }
+            out
+        };
+        self.slots
+            .iter()
+            .map(|slot| match slot {
+                MaterialSlot::Default | MaterialSlot::Tombstone => pack(&default_def),
+                MaterialSlot::Loaded { def, .. } => pack(def),
             })
             .collect()
     }
@@ -406,6 +481,8 @@ impl MaterialLibrary {
             noise_scale: d.noise_scale,
             noise_strength: d.noise_strength,
             noise_channels: d.noise_channels,
+            shader: None,
+            shader_params: std::collections::HashMap::new(),
         });
 
         for (i, slot) in self.slots.iter().enumerate().skip(1) {
@@ -415,6 +492,11 @@ impl MaterialLibrary {
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.to_string_lossy().into_owned());
 
+                let shader_params: std::collections::HashMap<String, f32> = def
+                    .shader_params
+                    .iter()
+                    .filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f as f32)))
+                    .collect();
                 infos.push(MaterialInfo {
                     id: i as u16,
                     name: def.name.clone(),
@@ -431,6 +513,8 @@ impl MaterialLibrary {
                     noise_scale: def.noise_scale,
                     noise_strength: def.noise_strength,
                     noise_channels: def.noise_channels,
+                    shader: def.shader.clone(),
+                    shader_params,
                 });
             }
         }

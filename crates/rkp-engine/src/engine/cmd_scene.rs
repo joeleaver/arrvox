@@ -505,6 +505,10 @@ impl EngineState {
                             self.material_lib.scan(&dir.join("assets/materials"));
                         }
                         self.init_file_watcher();
+                        // Pick up any pre-existing user shaders shipped
+                        // with the project. No-op if `assets/shaders/`
+                        // is empty.
+                        let _ = self.reload_user_shaders();
                         self.scaffold_and_build_gameplay();
                         self.auto_import_meshes();
                         if let Some(ref pp) = self.project_path {
@@ -559,6 +563,7 @@ impl EngineState {
                             self.material_lib.scan(&dir.join("assets/materials"));
                         }
                         self.init_file_watcher();
+                        let _ = self.reload_user_shaders();
                         self.auto_import_meshes();
                         if let Some(ref pp) = self.project_path {
                             crate::recent_projects::add_recent(&self.project_name, &pp.to_string_lossy());

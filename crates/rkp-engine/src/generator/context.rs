@@ -428,7 +428,7 @@ mod tests {
         let obj = rkp_procedural::ProceduralObject::new(
             rkp_procedural::NodeKind::Root,
         );
-        let result = c.emit_child(&obj, 0.1, Transform::default(), None);
+        let result = c.emit_child("test_slot", &obj, 0.1, Transform::default(), None);
         assert!(matches!(result, Err(GeneratorError::Failed(_))));
     }
 }

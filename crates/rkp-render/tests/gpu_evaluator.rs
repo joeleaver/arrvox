@@ -490,7 +490,7 @@ fn artifact_roundtrip_matches_direct_voxelize() {
 
     let mut scene_a = RkpSceneManager::new(1_000_000);
     let r_a = scene_a
-        .integrate_artifact(artifact, &aabb, voxel_size, 42)
+        .integrate_artifact(artifact, &aabb, voxel_size)
         .expect("integrate");
 
     // ── Path B: direct voxelize_sdf_fn on the same scene ──

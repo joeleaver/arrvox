@@ -76,6 +76,7 @@ pub fn ZoneComponent(container: ContainerKind, zone_idx: usize) -> NodeHandle {
                 if active_panel.get() == Some(PanelId::Console) { ConsolePanel {} }
                 if active_panel.get() == Some(PanelId::Profiling) { ProfilingPanel {} }
                 if active_panel.get() == Some(PanelId::Models) { ModelsPanel {} }
+                if active_panel.get() == Some(PanelId::Shaders) { ShadersPanel {} }
                 if active_panel.get() == Some(PanelId::Build) {
                     // Build pane: 3D preview on the left (turntable +
                     // RenderSurface) with node-tree + params sidebar on

@@ -433,6 +433,9 @@ fn main() -> anyhow::Result<()> {
                 if let Some(models) = &update.available_models {
                     store.available_models.send(models.clone());
                 }
+                if let Some(shaders) = &update.user_shaders {
+                    store.user_shaders.send(shaders.clone());
+                }
                 if let Some(gens) = &update.available_generators {
                     store.available_generators.send(gens.clone());
                 }

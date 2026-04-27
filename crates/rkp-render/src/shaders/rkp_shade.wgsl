@@ -51,9 +51,77 @@ struct ShadeParams {
     brush_active: u32,
     brush_radius: f32,
     brush_falloff: f32,
-    _pad3: f32,
+    /// Engine clock in seconds. Set per frame; user shaders read it
+    /// via `ShadeCtx.time` for fresnel pulses, hologram scrolls, etc.
+    time: f32,
     brush_center: vec4<f32>,
     brush_color: vec4<f32>,
+}
+
+// 8 user-named scalar params per material, packed as two vec4s (32
+// bytes — matches `Vec<[f32; 8]>` produced by the engine's
+// `MaterialLibrary::build_shader_params`). Indexed by material_id
+// parallel to the `materials` array.
+struct ShaderParamsSlot {
+    p0: vec4<f32>,
+    p1: vec4<f32>,
+}
+
+// Inputs to the user `shade` hook. The dispatcher fills this from
+// G-buffer + resolved material data so the user fn doesn't have to
+// re-do material lookup. Layout is stable; new fields go at the end.
+struct ShadeCtx {
+    world_pos: vec3<f32>,
+    distance: f32,
+    normal: vec3<f32>,
+    n_dot_v: f32,
+    view_dir: vec3<f32>,
+    time: f32,
+    base_color: vec3<f32>,
+    metallic: f32,
+    emission_color: vec3<f32>,
+    roughness: f32,
+    // 8 named scalar parameters from this material's
+    // `ShaderParamsSlot`. Index 0..3 = params[0].xyzw, 4..7 = params[1].xyzw.
+    params: array<vec4<f32>, 2>,
+    primary_material_id: u32,
+    secondary_material_id: u32,
+    blend_weight: f32,
+    // Reserved for future per-pixel data; pads the struct to a stable
+    // 16-byte-aligned size and reserves the slot so adding a new
+    // input later doesn't shuffle existing field offsets.
+    _reserved0: f32,
+}
+
+// Output of the user `shade` hook is a luminance value in nits (cd/m²).
+// The deferred shade pass writes physically-scaled values into the HDR
+// target — auto-exposure adapts so the brightest typical pixel maps
+// near 1.0 after tone-map. Reference points:
+//
+//   * sun-lit white surface (PBR direct lighting): ~90 000 nits
+//   * bright office light:                          ~3 000 nits
+//   * laptop / phone display at full brightness:   ~500–1 000 nits
+//   * dim emissive UI element:                      ~100 nits
+//
+// A hologram emitting 5 000 nits looks vivid in a dim room and faint
+// in sunlight — same as a real holographic display would. Pick the
+// value that matches the look you want, not "1.0 = display white",
+// since auto-exposure will rescale.
+
+// Output of the user `shade` hook. V1 is replace-only: the dispatcher
+// uses `rgb` as the final pixel color and skips the rest of the
+// deferred shade pass. Augment-mode (modify ctx fields, fall through
+// to PBR) is reserved for a future phase.
+struct ShadeResult {
+    rgb: vec3<f32>,
+}
+
+fn shade_result_passthrough(ctx: ShadeCtx) -> ShadeResult {
+    // The identity arm — never reached when `shader_id == 0` (the
+    // dispatcher branch is gated on it). Returning the resolved base
+    // color keeps the output semantically valid if a user shader
+    // somehow forgets a `case` arm and the default fires.
+    return ShadeResult(ctx.base_color);
 }
 
 // Neutral gray for isolation-mode sky + ambient — chosen to match a
@@ -117,10 +185,11 @@ fn mat_subsurface_color(m: Material) -> vec3<f32> {
 // Group 2: output HDR color (write, full-res)
 @group(2) @binding(0) var output: texture_storage_2d<rgba16float, write>;
 
-// Group 3: shading params + lights + materials
+// Group 3: shading params + lights + materials + user-shader params
 @group(3) @binding(0) var<uniform> shade_params: ShadeParams;
 @group(3) @binding(1) var<storage, read> lights: array<Light>;
 @group(3) @binding(2) var<storage, read> materials: array<Material>;
+@group(3) @binding(3) var<storage, read> shader_params: array<ShaderParamsSlot>;
 
 // Group 4: camera
 @group(4) @binding(0) var<uniform> camera: CameraUniforms;
@@ -507,6 +576,20 @@ fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
+// --- User-shader dispatch (composer-injectable) ---
+//
+// `rkp_render::shader_composer::compose()` produces a chunk that
+// replaces this whole block via the begin/end markers. The chunk
+// defines `dispatch_user_shade(shader_id, ctx)` as a switch over
+// every registered shader's `user_<name>_shade` body. Phase B keeps
+// the in-tree identity stub here so the file compiles standalone.
+
+// USER_SHADE_DISPATCH_BEGIN
+fn dispatch_user_shade(shader_id: u32, ctx: ShadeCtx) -> ShadeResult {
+    return shade_result_passthrough(ctx);
+}
+// USER_SHADE_DISPATCH_END
+
 // --- Main ---
 
 @compute @workgroup_size(8, 8, 1)
@@ -598,6 +681,53 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         noise_strength = mix(noise_strength, mat_b.noise_strength, blend_weight);
         opacity = mix(opacity, mat_b.opacity, blend_weight);
         ior = mix(ior, mat_b.ior, blend_weight);
+    }
+
+    // User-shader dispatch. When the resolved material has a
+    // shader_id != 0, hand off to the user's `shade` hook for the
+    // final color and skip the rest of the deferred shade pass.
+    // Picks the dominant material's shader_id under blending — the
+    // primary unless the secondary's blend weight passes 50 %.
+    let primary_shader_id = mat_a.shader_id;
+    let secondary_shader_id = select(0u, materials[secondary_mat_id].shader_id, blend_weight > 0.0);
+    var active_shader_id = primary_shader_id;
+    var active_mat_id = primary_mat_id;
+    if blend_weight > 0.5 && secondary_shader_id != 0u {
+        active_shader_id = secondary_shader_id;
+        active_mat_id = secondary_mat_id;
+    }
+    if active_shader_id != 0u {
+        let V_pre = normalize(camera.position.xyz - world_pos);
+        var ctx: ShadeCtx;
+        ctx.world_pos = world_pos;
+        ctx.distance = pos_data.w;
+        ctx.normal = normal;
+        ctx.n_dot_v = max(dot(normal, V_pre), 0.001);
+        ctx.view_dir = V_pre;
+        ctx.time = shade_params.time;
+        ctx.base_color = base_color;
+        ctx.metallic = metallic_raw;
+        ctx.emission_color = emission_color;
+        ctx.roughness = roughness_raw;
+        ctx._reserved0 = 0.0;
+        // Read this material's 8 named params. The buffer is parallel
+        // to `materials` — guarded against a stale registry by the
+        // arrayLength check, since a freshly-loaded scene can hit a
+        // frame between materials buffer upload and shader_params buffer
+        // upload (we upload them together, but be defensive).
+        if active_mat_id < arrayLength(&shader_params) {
+            ctx.params[0] = shader_params[active_mat_id].p0;
+            ctx.params[1] = shader_params[active_mat_id].p1;
+        } else {
+            ctx.params[0] = vec4<f32>(0.0);
+            ctx.params[1] = vec4<f32>(0.0);
+        }
+        ctx.primary_material_id = primary_mat_id;
+        ctx.secondary_material_id = secondary_mat_id;
+        ctx.blend_weight = blend_weight;
+        let result = dispatch_user_shade(active_shader_id, ctx);
+        textureStore(output, coord, vec4<f32>(result.rgb, 1.0));
+        return;
     }
 
     let color_rgb565 = (packed_g >> 16u) & 0xFFFFu;

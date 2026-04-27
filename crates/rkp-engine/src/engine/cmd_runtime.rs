@@ -199,6 +199,25 @@ impl EngineState {
                 }
             }
 
+            EngineCommand::SetMaterialShader { material_id, shader_name } => {
+                if let Some(def) = self.material_lib.get_def_mut(material_id) {
+                    def.shader = match &shader_name {
+                        Some(n) if !n.is_empty() => Some(n.clone()),
+                        _ => None,
+                    };
+                    self.material_lib.mark_dirty();
+                    let _ = self.material_lib.save(material_id);
+                }
+            }
+
+            EngineCommand::SetMaterialShaderParam { material_id, name, value } => {
+                if let Some(def) = self.material_lib.get_def_mut(material_id) {
+                    def.shader_params.insert(name, serde_json::json!(value));
+                    self.material_lib.mark_dirty();
+                    let _ = self.material_lib.save(material_id);
+                }
+            }
+
             EngineCommand::DeleteMaterial { material_id } => {
                 if let Some(path) = self.material_lib.path_for_id(material_id).map(|p| p.to_owned()) {
                     let _ = std::fs::remove_file(&path);

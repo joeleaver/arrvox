@@ -64,6 +64,8 @@ pub mod proc_ghost;
 /// GPU evaluator — "sample N positions" compute pipeline shared with the
 /// (Phase 3+) voxel bake path.
 pub mod proc_sample;
+/// Composes user-authored WGSL hooks into the procedural evaluator.
+pub mod shader_composer;
 /// Skeletal skin-deform scatter pass — per-frame bone-field writer.
 pub mod skin_deform;
 /// CPU-side paint writes against the scene's LeafAttrPool (material +

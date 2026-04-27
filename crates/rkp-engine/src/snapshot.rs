@@ -137,6 +137,11 @@ pub struct StateUpdate {
     pub recent_projects: Option<Vec<crate::recent_projects::RecentProject>>,
     /// Available materials — sent when the material list changes.
     pub materials: Option<Vec<crate::material_library::MaterialInfo>>,
+    /// Registered user shaders — sent when the registry changes.
+    /// `None` = no update this tick; `Some(vec)` replaces the editor's
+    /// store list. Empty vec means "registry is empty" (project has no
+    /// `assets/shaders/*.wgsl`).
+    pub user_shaders: Option<Vec<rkp_render::shader_composer::UserShaderInfo>>,
     /// Currently selected material in the materials panel.
     pub selected_material: Option<u16>,
     /// Currently selected model path (for Asset Properties).

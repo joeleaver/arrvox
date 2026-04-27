@@ -6,6 +6,10 @@
 /// The deferred PBR shading pass.
 pub struct RkpShadePass {
     pipeline: wgpu::ComputePipeline,
+    /// Cached pipeline layout — kept on the struct so `reload_user_shaders`
+    /// can rebuild the compute pipeline with a new user-shader chunk
+    /// without re-creating the layout (which is independent of source).
+    pipeline_layout: wgpu::PipelineLayout,
     pub gbuffer_bind_group_layout: wgpu::BindGroupLayout,
     pub ssao_bind_group_layout: wgpu::BindGroupLayout,
     pub output_bind_group_layout: wgpu::BindGroupLayout,
@@ -33,6 +37,16 @@ pub struct RkpShadePass {
     brush_overlay_buffer: wgpu::Buffer,
     brush_overlay_buffer_capacity: u64,
     brush_overlay_bind_group: wgpu::BindGroup,
+    /// Resident per-material user-shader params buffer. Parallel to
+    /// the materials buffer: 32 bytes per material (8 × f32).
+    /// `upload_shader_params` grows it as the materials array grows.
+    shader_params_buffer: wgpu::Buffer,
+    shader_params_buffer_capacity: u64,
+    /// Hash of the user-shader chunk currently compiled into the
+    /// pipeline. `0` is the "no user shaders" sentinel; matches
+    /// `UserShaderRegistry::default()::source_hash()`.
+    /// `reload_user_shaders` skips rebuilds when this matches.
+    source_hash: u64,
     width: u32,
     height: u32,
 }
@@ -63,7 +77,9 @@ pub struct ShadeParams {
     pub brush_active: u32,
     pub brush_radius: f32,
     pub brush_falloff: f32,
-    pub _pad3: f32,
+    /// Engine clock in seconds. Used by user-shader `shade` hooks for
+    /// time-driven effects (hologram scroll, fresnel pulse, etc.).
+    pub time: f32,
     pub brush_center: [f32; 4],
     pub brush_color: [f32; 4],
 }
@@ -86,7 +102,7 @@ impl Default for ShadeParams {
             brush_active: 0,
             brush_radius: 0.5,
             brush_falloff: 0.5,
-            _pad3: 0.0,
+            time: 0.0,
             brush_center: [0.0, 0.0, 0.0, 0.0],
             brush_color: [1.0, 0.85, 0.2, 1.0],
         }
@@ -246,6 +262,18 @@ impl RkpShadePass {
                         },
                         count: None,
                     },
+                    // User-shader per-material params (Phase B). Parallel
+                    // to `materials`: 32 bytes per material (8 × f32).
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -324,12 +352,16 @@ impl RkpShadePass {
         let (output_texture, output_view) = Self::create_output(device, width, height);
         let output_bind_group = Self::create_output_bind_group(device, &output_bind_group_layout, &output_view);
 
-        // Pipeline.
-        let shade_src = include_str!("shaders/rkp_shade.wgsl");
-        crate::validate_wgsl(shade_src, "rkp_shade");
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rkp_shade"),
-            source: wgpu::ShaderSource::Wgsl(shade_src.into()),
+        // Placeholder per-material user-shader params buffer. Sized to
+        // hold one slot's worth of zeros at startup so the storage
+        // binding stays valid even before any material with a shader
+        // exists. `upload_shader_params` grows it on demand.
+        let shader_params_buffer_capacity: u64 = 32; // one slot
+        let shader_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rkp_shade shader_params"),
+            size: shader_params_buffer_capacity,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -346,17 +378,11 @@ impl RkpShadePass {
             immediate_size: 0,
         });
 
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("rkp_shade"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let pipeline = build_shade_pipeline(device, &pipeline_layout, "");
 
         Self {
             pipeline,
+            pipeline_layout,
             gbuffer_bind_group_layout,
             ssao_bind_group_layout,
             output_bind_group_layout,
@@ -375,9 +401,72 @@ impl RkpShadePass {
             brush_overlay_buffer,
             brush_overlay_buffer_capacity,
             brush_overlay_bind_group,
+            shader_params_buffer,
+            shader_params_buffer_capacity,
+            source_hash: 0,
             width,
             height,
         }
+    }
+
+    /// Recompile the shade pipeline with a new user-shader chunk from
+    /// `compose_shade_source`. Idempotent: matching `source_hash` skips
+    /// the rebuild. Returns true if the pipeline was actually rebuilt.
+    pub fn reload_user_shaders(
+        &mut self,
+        device: &wgpu::Device,
+        user_chunk: &str,
+        source_hash: u64,
+    ) -> bool {
+        if source_hash == self.source_hash {
+            return false;
+        }
+        self.pipeline = build_shade_pipeline(device, &self.pipeline_layout, user_chunk);
+        self.source_hash = source_hash;
+        true
+    }
+
+    pub fn source_hash(&self) -> u64 {
+        self.source_hash
+    }
+
+    /// Upload the per-material user-shader params buffer
+    /// (`Vec<[f32; 8]>` from `MaterialLibrary::build_shader_params`).
+    /// Grows the GPU buffer (and rebuilds the shade bind group on the
+    /// next `set_shade_data`) when capacity is exceeded.
+    pub fn upload_shader_params(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slots: &[[f32; 8]],
+    ) {
+        let needed = ((slots.len().max(1)) * std::mem::size_of::<[f32; 8]>()) as u64;
+        if needed > self.shader_params_buffer_capacity {
+            let mut new_cap = self.shader_params_buffer_capacity.max(32);
+            while new_cap < needed {
+                new_cap = new_cap.saturating_mul(2);
+            }
+            self.shader_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rkp_shade shader_params"),
+                size: new_cap,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.shader_params_buffer_capacity = new_cap;
+            // Bind group will be rebuilt by the next `set_shade_data`.
+            self.shade_bind_group = None;
+        }
+        if !slots.is_empty() {
+            queue.write_buffer(
+                &self.shader_params_buffer,
+                0,
+                bytemuck::cast_slice(slots),
+            );
+        }
+    }
+
+    pub fn shader_params_buffer(&self) -> &wgpu::Buffer {
+        &self.shader_params_buffer
     }
 
     /// Upload the paint cursor's per-leaf geodesic distance array.
@@ -474,7 +563,9 @@ impl RkpShadePass {
         }));
     }
 
-    /// Set shading data (params uniform, lights buffer, materials buffer).
+    /// Set shading data (params uniform, lights buffer, materials
+    /// buffer). The user-shader params buffer is owned by this pass
+    /// and bound automatically — callers don't pass it.
     pub fn set_shade_data(
         &mut self,
         device: &wgpu::Device,
@@ -489,6 +580,7 @@ impl RkpShadePass {
                 wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: lights_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: materials_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.shader_params_buffer.as_entire_binding() },
             ],
         }));
     }
@@ -630,4 +722,50 @@ impl RkpShadePass {
             }],
         })
     }
+}
+
+/// Compose the shade-pass WGSL source. The user chunk replaces the
+/// in-tree identity stub between the
+/// `// USER_SHADE_DISPATCH_BEGIN` / `_END` markers in `rkp_shade.wgsl`.
+/// Pass `""` for the no-shaders case (default identity stub stays put).
+pub fn compose_shade_source(user_chunk: &str) -> String {
+    let shade_src = include_str!("shaders/rkp_shade.wgsl");
+    if user_chunk.is_empty() {
+        return shade_src.to_string();
+    }
+    const BEGIN: &str = "// USER_SHADE_DISPATCH_BEGIN";
+    const END: &str = "// USER_SHADE_DISPATCH_END";
+    let begin = shade_src.find(BEGIN).expect(
+        "rkp_shade.wgsl missing USER_SHADE_DISPATCH_BEGIN marker",
+    );
+    let end_after = shade_src[begin..]
+        .find(END)
+        .map(|off| begin + off + END.len())
+        .expect("rkp_shade.wgsl missing USER_SHADE_DISPATCH_END marker");
+    let mut out = String::with_capacity(shade_src.len() + user_chunk.len());
+    out.push_str(&shade_src[..begin]);
+    out.push_str(user_chunk);
+    out.push_str(&shade_src[end_after..]);
+    out
+}
+
+fn build_shade_pipeline(
+    device: &wgpu::Device,
+    pipeline_layout: &wgpu::PipelineLayout,
+    user_chunk: &str,
+) -> wgpu::ComputePipeline {
+    let source = compose_shade_source(user_chunk);
+    crate::validate_wgsl(&source, "rkp_shade");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("rkp_shade"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("rkp_shade"),
+        layout: Some(pipeline_layout),
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
 }

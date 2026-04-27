@@ -15,6 +15,7 @@ pub mod console_panel;
 pub mod profiling_panel;
 pub mod field_editors;
 pub mod models_panel;
+pub mod shaders_panel;
 pub mod viewport_toolbar;
 pub mod welcome_screen;
 
@@ -30,4 +31,5 @@ pub use materials_panel::MaterialsPanel;
 pub use console_panel::ConsolePanel;
 pub use profiling_panel::ProfilingPanel;
 pub use models_panel::ModelsPanel;
+pub use shaders_panel::ShadersPanel;
 pub use welcome_screen::WelcomeScreen;

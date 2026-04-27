@@ -490,6 +490,16 @@ impl EngineState {
             } else {
                 None
             },
+            user_shaders: {
+                let cur_hash = self.user_shader_registry.source_hash();
+                if self.user_shader_first_send || cur_hash != self.prev_user_shader_hash {
+                    self.user_shader_first_send = false;
+                    self.prev_user_shader_hash = cur_hash;
+                    Some(self.user_shader_registry.shader_infos())
+                } else {
+                    None
+                }
+            },
             selected_material: self.selected_material,
             selected_model: self.selected_model.clone(),
             environment: {

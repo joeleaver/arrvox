@@ -49,7 +49,18 @@ impl EngineState {
         //     dirty" pattern could lose the upload if its carrying
         //     snapshot was dropped by the newest-wins inbox before
         //     render saw it.
-        let materials = self.material_lib.build_palette();
+        let (materials, shader_params_slots) = {
+            let registry = &self.user_shader_registry;
+            let palette = self.material_lib.build_palette(&|name| registry.resolve(name));
+            let params = self.material_lib.build_shader_params(registry);
+            (palette, params)
+        };
+        // Compose the shade-pass chunk once per tick. Cheap (small
+        // string) and the render thread compares the hash to skip
+        // pipeline rebuilds when nothing changed.
+        let composed = rkp_render::shader_composer::compose(&self.user_shader_registry);
+        let user_shader_shade_chunk = composed.shade;
+        let user_shader_source_hash = self.user_shader_registry.source_hash();
         // Clear the dirty flag so any other consumers (UI, etc.)
         // know the palette they observed has been published. We
         // ship every tick regardless, so the flag is purely for
@@ -123,6 +134,10 @@ impl EngineState {
 
         let mut shade_params = self.environment.to_shade_params(cam_y);
         shade_params.num_lights = gpu_lights.len() as u32;
+        // Engine clock for user shaders that need a time input (hologram
+        // scroll, fresnel pulse). Frame-index based at 60 Hz — same
+        // convention used elsewhere (cloud_params). Wraps at ~414 days.
+        shade_params.time = self.frame_index as f32 / 60.0;
         self.shade_params_base = shade_params;
         self.num_lights_cache = shade_params.num_lights;
 
@@ -637,6 +652,9 @@ impl EngineState {
             brush_overlay_epoch,
             paint_epoch,
             materials,
+            shader_params_slots,
+            user_shader_shade_chunk,
+            user_shader_source_hash,
             lights: gpu_lights,
             shade_params_base: self.shade_params_base,
             env_update,

@@ -308,6 +308,28 @@ pub enum EngineCommand {
         value: String,
     },
 
+    /// Set the user shader assigned to this material. `None` clears
+    /// the assignment (PBR baseline). The string must match the file
+    /// stem of a shader registered in
+    /// `<project>/assets/shaders/<name>.wgsl`; unrecognized names map
+    /// to `shader_id = 0` (identity dispatch) on the next material
+    /// upload, so a typo renders as PBR rather than failing silently.
+    SetMaterialShader {
+        material_id: u16,
+        shader_name: Option<String>,
+    },
+
+    /// Update one of the shader's named parameter values for this
+    /// material. The param name comes from the shader's
+    /// `// @param <name>: ...` schema; unknown names are accepted but
+    /// the GPU side ignores them (the buffer only packs the schema's
+    /// declared params).
+    SetMaterialShaderParam {
+        material_id: u16,
+        name: String,
+        value: f32,
+    },
+
     /// Delete a material by its runtime ID.
     DeleteMaterial {
         material_id: u16,

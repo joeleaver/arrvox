@@ -830,16 +830,51 @@ fn render_one_frame(
     //     small queue.write_buffer.
     let env = frame.env_update;
     let vr_ids: Vec<_> = state.viewport_renderers.keys().copied().collect();
-    for vr_id in vr_ids {
+    for vr_id in &vr_ids {
         let vr = state
             .viewport_renderers
-            .get_mut(&vr_id)
+            .get_mut(vr_id)
             .expect("viewport renderer must exist");
         vr.tone_map.set_exposure(&state.queue, env.exposure);
         vr.bloom
             .set_threshold(&state.queue, env.bloom_threshold, env.bloom_knee);
         vr.bloom_composite
             .set_intensity(&state.queue, env.bloom_intensity);
+    }
+
+    // 0d. User-shader integration. Each viewport's shade pass owns
+    //     its own pipeline + per-material params buffer. Recompile
+    //     when the registry's source hash changes (idempotent). Upload
+    //     params alongside the materials buffer; if the buffer grew,
+    //     the bind group gets cleared and we rebuild it via
+    //     set_shade_data. Uploading on every viewport repeats the
+    //     queue.write_buffer (cost: 32 B × num_materials) but keeps
+    //     bind-group lifetimes simple.
+    for vr_id in &vr_ids {
+        let vr = state
+            .viewport_renderers
+            .get_mut(vr_id)
+            .expect("viewport renderer must exist");
+        vr.shade.reload_user_shaders(
+            &state.device,
+            &frame.user_shader_shade_chunk,
+            frame.user_shader_source_hash,
+        );
+        vr.shade.upload_shader_params(
+            &state.device,
+            &state.queue,
+            &frame.shader_params_slots,
+        );
+        // Re-bind unconditionally — set_shade_data is one bind-group
+        // create; cheaper than threading state for "did the buffer
+        // grow" through callers, and the materials/lights buffers may
+        // have just been swapped above too.
+        vr.shade.set_shade_data(
+            &state.device,
+            &state.renderer.shade_params_buffer,
+            &state.renderer.lights_buffer,
+            &state.renderer.materials_buffer,
+        );
     }
 
     // 1. Geometry upload — epoch-driven. Robust to snapshot drops:

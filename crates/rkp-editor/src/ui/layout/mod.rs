@@ -24,6 +24,7 @@ pub enum PanelId {
     Console,
     Profiling,
     Models,
+    Shaders,
     Build,
 }
 
@@ -92,6 +93,94 @@ impl LayoutConfig {
             ContainerKind::Center => &mut self.center,
             ContainerKind::Right => &mut self.right,
             ContainerKind::Bottom => &mut self.bottom,
+        }
+    }
+
+    /// Append any panel ids that exist in the registry but aren't
+    /// referenced anywhere in the loaded layout. Runs at load time so
+    /// upgrading the editor doesn't strand new panels behind a saved
+    /// project's frozen tab list. New panels land alongside their
+    /// closest sibling (Shaders next to Models, etc.); fallback is
+    /// the bottom container's first zone.
+    pub fn migrate_panels(&mut self) {
+        // All panel ids known to this build. Order matters only for
+        // the "what's missing" diff — placement uses the per-id
+        // sibling map below.
+        let known: &[PanelId] = &[
+            PanelId::SceneTree,
+            PanelId::SceneView,
+            PanelId::ObjectProperties,
+            PanelId::AssetProperties,
+            PanelId::Environment,
+            PanelId::Materials,
+            PanelId::Console,
+            PanelId::Profiling,
+            PanelId::Models,
+            PanelId::Shaders,
+            PanelId::Build,
+        ];
+
+        // Collect every id currently referenced in any zone.
+        let mut present: std::collections::HashSet<PanelId> =
+            std::collections::HashSet::new();
+        for c in [&self.left, &self.center, &self.right, &self.bottom] {
+            for z in &c.zones {
+                for &id in &z.tabs {
+                    present.insert(id);
+                }
+            }
+        }
+        for f in &self.floating {
+            present.insert(f.panel);
+        }
+
+        // For each missing panel, find a sibling already in the layout
+        // and append next to it. The fallback zone is the bottom
+        // container's first zone (which the default layout pre-creates).
+        let sibling_for = |id: PanelId| -> &'static [PanelId] {
+            match id {
+                PanelId::Shaders => &[PanelId::Models, PanelId::Materials],
+                _ => &[],
+            }
+        };
+
+        for &id in known {
+            if present.contains(&id) {
+                continue;
+            }
+            // Try siblings first, fall back to bottom[0].
+            let mut placed = false;
+            'outer: for &sibling in sibling_for(id) {
+                for c in [
+                    ContainerKind::Bottom,
+                    ContainerKind::Left,
+                    ContainerKind::Right,
+                    ContainerKind::Center,
+                ] {
+                    let container = self.container_mut(c);
+                    for z in &mut container.zones {
+                        if z.tabs.contains(&sibling) {
+                            z.tabs.push(id);
+                            placed = true;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            if !placed {
+                if let Some(z) = self.bottom.zones.first_mut() {
+                    z.tabs.push(id);
+                } else {
+                    // No bottom zone at all (very unusual loaded state) —
+                    // create one so the panel isn't dropped.
+                    self.bottom.zones.push(Zone {
+                        tabs: vec![id],
+                        active_tab: 0,
+                        fraction: 1.0,
+                    });
+                    self.bottom.visible = true;
+                }
+            }
         }
     }
 
@@ -225,7 +314,7 @@ pub fn default_layout() -> LayoutConfig {
         bottom: Container {
             kind: ContainerKind::Bottom,
             zones: vec![Zone {
-                tabs: vec![PanelId::Materials, PanelId::Models, PanelId::Console, PanelId::Profiling],
+                tabs: vec![PanelId::Materials, PanelId::Models, PanelId::Shaders, PanelId::Console, PanelId::Profiling],
                 active_tab: 0,
                 fraction: 1.0,
             }],

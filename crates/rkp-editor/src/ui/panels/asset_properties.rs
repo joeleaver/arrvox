@@ -305,6 +305,132 @@ fn material_fields(
             {prop_checkbox(__scope, "Noise: Albedo", noise_albedo_on, noise_channel_cb(NOISE_ALBEDO))}
             {prop_checkbox(__scope, "Noise: Roughness", noise_rough_on, noise_channel_cb(NOISE_ROUGHNESS))}
             {prop_checkbox(__scope, "Noise: Normal", noise_normal_on, noise_channel_cb(NOISE_NORMAL))}
+
+            // User shader binding + dynamic param controls.
+            {shader_section(__scope, mat_id, info.clone(), cmd_tx)}
+        }
+    }
+}
+
+/// Shader dropdown + one slider per `@param` for whichever shader the
+/// material currently has assigned. Pulls the registered shader list
+/// from the editor store; the engine keeps it in sync each tick via
+/// the `user_shaders` snapshot field.
+///
+/// "None" selection clears `MaterialDef.shader`, which the engine
+/// resolves to `shader_id = 0` (PBR) on the next material upload.
+fn shader_section(
+    __scope: &mut rinch::core::dom::RenderScope,
+    mat_id: u16,
+    info: rkp_engine::material_library::MaterialInfo,
+    cmd_tx: CmdSignal,
+) -> rinch::core::dom::NodeHandle {
+    let store = use_context::<EditorStore>();
+    let current_shader: String = info.shader.clone().unwrap_or_default();
+
+    // Build the dropdown options at render time. Re-runs only on
+    // remount (whole material swap) or when the user_shaders signal
+    // changes — both cases want a fresh option list.
+    let shader_list = store.user_shaders.get();
+    let mut options: Vec<(String, String)> =
+        Vec::with_capacity(shader_list.len() + 1);
+    options.push((String::new(), "(none — PBR)".to_string()));
+    for s in &shader_list {
+        options.push((s.name.clone(), s.name.clone()));
+    }
+    let options_refs: Vec<(&str, &str)> = options
+        .iter()
+        .map(|(v, l)| (v.as_str(), l.as_str()))
+        .collect();
+
+    let current = Signal::new(current_shader.clone());
+    let dropdown_value = Memo::new(move || current.get());
+    let on_shader_change: Rc<dyn Fn(String)> = Rc::new(move |v: String| {
+        current.set(v.clone());
+        let shader_name = if v.is_empty() { None } else { Some(v) };
+        let _ = cmd_tx.get().send(
+            rkp_engine::EngineCommand::SetMaterialShader {
+                material_id: mat_id,
+                shader_name,
+            },
+        );
+    });
+
+    // Resolve the active shader's param schema and pre-resolve each
+    // slider's initial value (from MaterialDef.shader_params, falling
+    // back to the shader's declared default). Materializing into a
+    // Vec of (name, initial, lo, hi) keeps the rsx! per-iteration
+    // closures Copy/'static-friendly without juggling MaterialInfo
+    // borrows through the macro expansion.
+    #[derive(Debug, Clone, PartialEq)]
+    struct ParamRow {
+        name: String,
+        initial: f32,
+        lo: f32,
+        hi: f32,
+    }
+    // Wrap in Rc so the rsx! macro's expanded closure (which is `Fn`,
+    // not `FnOnce`) can clone the vec each render rather than moving
+    // it. Cheap — param counts are small.
+    let param_rows: Rc<Vec<ParamRow>> = Rc::new(if current_shader.is_empty() {
+        Vec::new()
+    } else {
+        shader_list
+            .iter()
+            .find(|s| s.name == current_shader)
+            .map(|s| {
+                s.params
+                    .iter()
+                    .map(|p| {
+                        let initial = info
+                            .shader_params
+                            .get(&p.name)
+                            .copied()
+                            .unwrap_or(p.default);
+                        let (lo, hi) = p.range.unwrap_or((0.0, 1.0));
+                        ParamRow {
+                            name: p.name.clone(),
+                            initial,
+                            lo,
+                            hi,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+
+    rsx! {
+        div {
+            style: "display:flex;flex-direction:column;gap:6px;\
+                    margin-top:8px;padding-top:8px;\
+                    border-top:1px solid #333;",
+            div {
+                style: "font-size:11px;color:#888;text-transform:uppercase;\
+                        letter-spacing:0.5px;",
+                "Shader"
+            }
+            {prop_select(__scope, "Shader", dropdown_value, &options_refs, on_shader_change)}
+            for row in (*param_rows).clone() {
+                {{
+                    let name = row.name.clone();
+                    let cmd_field_name = name.clone();
+                    let val_signal = Signal::new(row.initial);
+                    // 100 ticks across the range, never below 0.001 so
+                    // a default (0..1) range lands at 0.01.
+                    let step = ((row.hi - row.lo) / 100.0).max(0.001);
+                    let on_change: Rc<dyn Fn(f32)> = Rc::new(move |v: f32| {
+                        let _ = cmd_tx.get().send(
+                            rkp_engine::EngineCommand::SetMaterialShaderParam {
+                                material_id: mat_id,
+                                name: cmd_field_name.clone(),
+                                value: v,
+                            },
+                        );
+                    });
+                    prop_slider(__scope, &name, val_signal, row.lo, row.hi, step, on_change)
+                }}
+            }
         }
     }
 }

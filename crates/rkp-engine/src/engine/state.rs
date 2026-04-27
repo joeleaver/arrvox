@@ -195,6 +195,14 @@ pub(crate) struct EngineState {
     /// results arrive.
     pub(crate) generator_system: crate::generator::GeneratorSystem,
 
+    /// User-shader registry — populated by scanning
+    /// `<project_root>/assets/shaders/` on project load and on
+    /// filesystem change. The engine resolves `UserShader.shader_name`
+    /// via this registry when flattening trees, and the bake worker's
+    /// `GpuEvaluator` is recompiled whenever this registry changes
+    /// (engine sends `WorkerControl::ReloadUserShaders`).
+    pub(crate) user_shader_registry: rkp_render::shader_composer::UserShaderRegistry,
+
     // Input + Camera
     pub(crate) input_system: rkp_runtime::input::InputSystem,
     pub(crate) camera_control: CameraControlState,
@@ -423,6 +431,13 @@ pub(crate) struct EngineState {
     /// no-op (and means we no longer need the env_ui_dirty gate's
     /// "don't echo back during slider drag" workaround).
     pub(crate) prev_environment: Option<crate::environment::EnvironmentSettings>,
+    /// Tracks the source hash of the user-shader registry the editor
+    /// most recently saw, so `build_state_update` only sends a fresh
+    /// `user_shaders` list when the registry has actually changed.
+    /// `0` = "editor hasn't been told yet" (matches the empty-registry
+    /// hash, but the first tick always sends regardless to populate it).
+    pub(crate) prev_user_shader_hash: u64,
+    pub(crate) user_shader_first_send: bool,
 
     /// File watcher for hot-reload (watches project assets/ directory).
     pub(crate) file_watcher: Option<crate::file_watcher::RkpFileWatcher>,
@@ -645,6 +660,7 @@ impl EngineState {
         Self {
             bake_worker,
             generator_system,
+            user_shader_registry: rkp_render::shader_composer::UserShaderRegistry::empty(),
             render_worker,
             scene_mgr,
             geometry_epoch_handle,
@@ -737,6 +753,8 @@ impl EngineState {
             cached_material_usage: None,
             prev_procedural: None,
             prev_environment: None,
+            prev_user_shader_hash: 0,
+            user_shader_first_send: true,
             file_watcher: None,
             import_worker: crate::import_worker::ImportWorker::new(),
             geometry_dirty: false,
