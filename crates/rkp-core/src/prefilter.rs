@@ -47,13 +47,18 @@
 //!
 //! # Allocation discipline
 //!
-//! All emitted [`LeafAttr`]s go into the same [`LeafAttrPool`] as the
-//! voxelize pass, via the same `attr_dedup` map. Post-prefilter, the
-//! pool's allocated range is still the contiguous
-//! `leaf_attr_slot_start..(leaf_attr_slot_start + attr_dedup.len())` —
-//! so the scene manager's existing `deallocate_range(start, count)`
-//! correctly frees internal-attr allocations alongside leaf allocations.
-//! No new bookkeeping needed.
+//! All emitted prefilter [`LeafAttr`]s go into the same [`LeafAttrPool`]
+//! as the bake's leaf cells, appended at the tail of the asset's
+//! contiguous range via `allocate_contiguous_bump(1)`. Post-prefilter,
+//! the pool's allocated range is still the contiguous
+//! `leaf_attr_slot_start..leaf_attr_pool.allocated_count()` — so the
+//! scene manager's existing `deallocate_range(start, count)` correctly
+//! frees internal-attr allocations alongside leaf allocations. Each
+//! branch gets its own slot — no dedup, because a deduped branch can
+//! collide with a cell's slot and at LOD distance the march would
+//! return that shared slot for every pixel on the branch's footprint,
+//! which broke the cursor (whole face flashed yellow) and paint (whole
+//! face recoloured) the moment the camera was far enough away to LOD.
 
 use std::collections::HashMap;
 
@@ -180,11 +185,9 @@ impl NodeAggregate {
 
 /// Walk `octree` bottom-up, compute a prefiltered `LeafAttr` for every
 /// emittable branch, and populate `octree.internal_attr_index` with the
-/// allocated ids.
-///
-/// New `LeafAttr`s go into `leaf_attr_pool` via `attr_dedup` — so an
-/// emitted internal attr that happens to match an existing leaf attr
-/// (flat surface whose prefilter equals any leaf on it) reuses the id.
+/// allocated ids. Each branch gets its own pool slot — see the comment
+/// inside `walk` for why dedup across branches/cells would break the
+/// cursor and paint at LOD.
 ///
 /// The caller is expected to have completed `compact`,
 /// `deduplicate_subtrees`, and (typically) `morton_reorder` before
@@ -193,7 +196,6 @@ pub fn prefilter_octree_internals(
     octree: &mut SparseOctree,
     leaf_attr_pool: &mut LeafAttrPool,
     brick_pool: &BrickPool,
-    attr_dedup: &mut HashMap<(LeafAttr, u32), u32>,
 ) {
     if octree.node_count() == 0 {
         return;
@@ -210,7 +212,6 @@ pub fn prefilter_octree_internals(
         octree,
         leaf_attr_pool,
         brick_pool,
-        attr_dedup,
         &mut cache,
         0,
     );
@@ -220,7 +221,6 @@ fn walk(
     octree: &mut SparseOctree,
     leaf_attr_pool: &mut LeafAttrPool,
     brick_pool: &BrickPool,
-    attr_dedup: &mut HashMap<(LeafAttr, u32), u32>,
     cache: &mut HashMap<u32, NodeAggregate>,
     node_idx: u32,
 ) -> NodeAggregate {
@@ -249,7 +249,6 @@ fn walk(
                 octree,
                 leaf_attr_pool,
                 brick_pool,
-                attr_dedup,
                 cache,
                 children_offset + i,
             );
@@ -260,27 +259,27 @@ fn walk(
         // unchanged — we don't want emissions to short-circuit the
         // bottom-up walk.
         if let Some((attr, color)) = agg.emit() {
-            // Dedup on `(attr, color)` so a prefilter attr whose
-            // aggregate color differs from an otherwise-identical leaf
-            // (same material + normal) still gets its own slot.
-            // Matches the voxelize path's keying; without it, a
-            // flat-shaded branch could bind to a leaf slot whose color
-            // was set from a different cell's noise sample.
-            let attr_id = *attr_dedup.entry((attr, color)).or_insert_with(|| {
-                // Bump-only allocate to preserve the asset's contiguous
-                // [slot_start, next_free) range invariant that the scene
-                // manager's release relies on. A regular `allocate()`
-                // could return a free-list slot from a concurrently-
-                // released asset, producing a non-contiguous range.
-                let id = leaf_attr_pool
-                    .allocate_contiguous_bump(1)
-                    .expect("LeafAttrPool exhausted during prefilter");
-                *leaf_attr_pool.get_mut(id) = attr;
-                if color != 0 {
-                    leaf_attr_pool.set_color(id, color);
-                }
-                id
-            });
+            // Each branch gets its own slot. The previous version
+            // dedup'd `(LeafAttr, color)` across the whole walk, which
+            // let a flat face's branch attr collide with one of its
+            // cells' slots — at LOD distance the march early-exits
+            // returning that shared slot for every pixel on the
+            // branch's footprint, and any cursor / paint state on
+            // the cell also paints the entire branch region. Per-
+            // branch slots keep brush_overlay distance and paint
+            // writes scoped to their actual cell.
+            //
+            // Bump-only allocate preserves the asset's contiguous
+            // `[slot_start, next_free)` range invariant that
+            // `release_asset` relies on for a single
+            // `deallocate_range` to free everything.
+            let attr_id = leaf_attr_pool
+                .allocate_contiguous_bump(1)
+                .expect("LeafAttrPool exhausted during prefilter");
+            *leaf_attr_pool.get_mut(attr_id) = attr;
+            if color != 0 {
+                leaf_attr_pool.set_color(attr_id, color);
+            }
             octree.set_internal_attr(node_idx, attr_id);
         }
         agg
@@ -371,8 +370,7 @@ mod tests {
         let mut octree = SparseOctree::new(3, 0.1);
         let mut pool = LeafAttrPool::new(64);
         let bricks = BrickPool::new(8);
-        let mut dedup: HashMap<(LeafAttr, u32), u32> = HashMap::new();
-        prefilter_octree_internals(&mut octree, &mut pool, &bricks, &mut dedup);
+        prefilter_octree_internals(&mut octree, &mut pool, &bricks);
         // No branches, no attrs allocated, no panic.
         assert_eq!(octree.node_count(), 1);
         assert_eq!(pool.allocated_count(), 0);
@@ -387,8 +385,7 @@ mod tests {
         *pool.get_mut(slot) = attr;
         octree.set_internal_attr_index(vec![INTERNAL_ATTR_NONE; 1]);
         let bricks = BrickPool::new(8);
-        let mut dedup: HashMap<(LeafAttr, u32), u32> = HashMap::from([((attr, 0u32), slot)]);
-        prefilter_octree_internals(&mut octree, &mut pool, &bricks, &mut dedup);
+        prefilter_octree_internals(&mut octree, &mut pool, &bricks);
         // Single-node tree (root is EMPTY here since we didn't insert); nothing
         // to prefilter.
         assert_eq!(pool.allocated_count(), 1); // unchanged
@@ -403,18 +400,10 @@ mod tests {
         let mut bricks = BrickPool::new(10_000);
         let r = voxelize_sphere_octree(Vec3::ZERO, 0.3, 5, 0.05, &mut pool, &mut bricks).unwrap();
 
-        // Rebuild attr_dedup from the voxelize output — the function
-        // returned a result but not the map. For the test, reconstruct
-        // by scanning the populated pool range. (Production code keeps
-        // the map alive inside voxelize_octree; see Phase 1 wiring.)
-        let mut dedup: HashMap<(LeafAttr, u32), u32> = HashMap::new();
-        for slot in r.leaf_attr_slot_start..(r.leaf_attr_slot_start + r.leaf_attr_unique_count) {
-            dedup.insert((*pool.get(slot), pool.color(slot)), slot);
-        }
         let pool_before = pool.allocated_count();
 
         let mut octree = r.octree;
-        prefilter_octree_internals(&mut octree, &mut pool, &bricks, &mut dedup);
+        prefilter_octree_internals(&mut octree, &mut pool, &bricks);
 
         let (total_branches, populated_branches) = branch_populate_stats(&octree);
         assert!(total_branches > 0, "sphere should have branches to prefilter");
@@ -602,13 +591,8 @@ mod tests {
         let start = r.leaf_attr_slot_start;
         let before = pool.allocated_count();
 
-        let mut dedup: HashMap<(LeafAttr, u32), u32> = HashMap::new();
-        for slot in start..before {
-            dedup.insert((*pool.get(slot), pool.color(slot)), slot);
-        }
-
         let mut octree = r.octree;
-        prefilter_octree_internals(&mut octree, &mut pool, &bricks, &mut dedup);
+        prefilter_octree_internals(&mut octree, &mut pool, &bricks);
 
         let after = pool.allocated_count();
         assert!(after >= before, "pool should only grow");

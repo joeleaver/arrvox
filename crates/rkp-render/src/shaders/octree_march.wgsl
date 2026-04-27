@@ -1016,7 +1016,13 @@ fn march_object(
                         result.t = t;
                         result.first_slot = 0u;
                         result.valid = true;
-                        result.color = vec3<f32>(0.5);
+                        // No leaf_slot for interior hit → no per-voxel
+                        // colour override. Write 0 so the gbuffer's
+                        // RGB565 channel stays 0, which `rkp_shade.wgsl`
+                        // reads as "use material albedo" (writing 0.5
+                        // would pack as a non-zero RGB565 and override
+                        // the material with grey).
+                        result.color = vec3<f32>(0.0);
                         result.steps = step_count;
                         brick_done = true;
                         break;
@@ -1110,7 +1116,12 @@ fn march_object(
                         result.t = t;
                         result.first_slot = c;
                         result.valid = true;
-                        var color = vec3<f32>(0.5);
+                        // Default to 0 (no override) so the gbuffer's
+                        // RGB565 stays 0 and `rkp_shade.wgsl` falls back
+                        // to material albedo. A non-zero default would
+                        // pack as a non-zero RGB565 and override the
+                        // material colour with whatever default we set.
+                        var color = vec3<f32>(0.0);
                         atomicAdd(&stats[46], 1u); // color_pool read
                         let cp = color_pool_data[c];
                         if cp != 0u {
@@ -1242,10 +1253,12 @@ fn march_object(
         result.t = t;
         result.first_slot = leaf_id;
         result.valid = true;
-        var color = vec3<f32>(0.5);
-        // Only LEAF hits have a color; INTERIOR hits keep the gray default.
-        // We can't key off leaf_id == 0 because slot 0 is a valid pool
-        // allocation — that would mis-render the first-allocated leaf.
+        // Default 0 = "no override" — packs to RGB565 = 0, which
+        // `rkp_shade.wgsl` reads as "fall back to material albedo".
+        // Both INTERIOR hits (no leaf_slot to look up) and LEAF hits
+        // whose color_pool entry is 0 (never painted, or fully erased)
+        // route to material albedo via this path.
+        var color = vec3<f32>(0.0);
         if r.slot != OCTREE_INTERIOR {
             atomicAdd(&stats[46], 1u); // color_pool read
             let cp = color_pool_data[leaf_id];
@@ -1516,8 +1529,16 @@ fn main(
     // at all). `thickness_mm` caps at u16::MAX (≈65.5 m) — any
     // deeper glass clamps harmlessly. `material_id` is u16; it
     // shares the lower 16 bits of G.
+    // Final depth gate: glass may have been recorded earlier in the
+    // tile-list iteration, before a CLOSER opaque hit updated
+    // `max_world_dist`. The per-record check at line 1402 only sees
+    // `max_world_dist` as it stood AT THAT POINT, so glass packed
+    // ahead of a later-iterated closer opaque would leak through
+    // (thickness collapses to 0, but the 1.0 clamp floor below used
+    // to promote that to `thickness_mm = 1`, which the compositor
+    // still rendered — glass drawn in front of closer geometry).
     var glass_packed = vec2<u32>(0u, 0u);
-    if glass_have {
+    if glass_have && glass_enter_dist < max_world_dist {
         let thickness = max(0.0, min(glass_exit_dist, max_world_dist) - glass_enter_dist);
         let thickness_mm_raw = u32(clamp(thickness * 1000.0, 1.0, 65535.0));
         let packed_g = (glass_material_id & 0xFFFFu) | (thickness_mm_raw << 16u);

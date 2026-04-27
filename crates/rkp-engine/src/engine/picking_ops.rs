@@ -29,12 +29,12 @@ impl EngineState {
         // picks (0xFFFFFFFF on sky); `position` is the world-space
         // surface hit (None on sky).
         //
-        // Paint mode locks selection: once an entity is selected
-        // (either before paint was enabled or claimed by the first
-        // paint-click when nothing was selected), every subsequent
-        // stamp targets only that entity. Hits on other geometry are
-        // treated as misses — no cursor, no stamp, no selection
-        // switch.
+        // Paint mode is strictly selection-locked: the brush only
+        // affects whatever entity is selected in the scene tree. A
+        // paint-click on anything else (including sky) is a no-op —
+        // it never claims selection and never deselects. The only
+        // way to change the locked entity during paint is via the
+        // scene tree.
         if let Some(settings) = self.paint_pick_settings.take() {
             let hit_gpu_idx = pr.raw_payload[0];
             let hit_entity: Option<hecs::Entity> = if hit_gpu_idx != u32::MAX {
@@ -44,24 +44,12 @@ impl EngineState {
                 None
             };
 
-            // Resolve the stamp's target entity.
-            //   * Something selected → must match exactly (locked).
-            //   * Nothing selected → the first valid hit claims the
-            //     selection, and that entity becomes locked for the
-            //     rest of the paint session.
-            let target_entity = match self.selected_entity {
-                Some(selected) => {
-                    if hit_entity == Some(selected) { Some(selected) } else { None }
-                }
-                None => {
-                    if let Some(e) = hit_entity {
-                        self.selected_entity = Some(e);
-                        Some(e)
-                    } else {
-                        None
-                    }
-                }
-            };
+            // Strict lock — must hit the selected entity exactly.
+            // Hits on other geometry, sky, or with no selection at
+            // all are misses.
+            let target_entity = self
+                .selected_entity
+                .filter(|sel| hit_entity == Some(*sel));
 
             if let (Some(entity), Some(world_pos)) = (target_entity, pr.position) {
                 self.paint_cursor_world = Some(world_pos);
@@ -223,6 +211,15 @@ impl EngineState {
                 }
             }
             PickKind::Material => {
+                // Defense in depth: paint mode strictly locks selection
+                // to whatever is selected in the scene tree. Even if a
+                // viewport-level paint guard is bypassed (or a stray
+                // `Pick` command arrives mid-paint), don't let a
+                // pixel pick mutate selection here.
+                if self.paint_mode_active {
+                    self.in_flight_pick_ghost = None;
+                    return;
+                }
                 // Voxel march writes `gpu_idx` to the 32-bit pick
                 // channel, 0xFFFFFFFF on sky. Direct lookup — no
                 // bit-unpacking, no 255-object cap.

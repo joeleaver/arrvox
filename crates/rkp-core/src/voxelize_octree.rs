@@ -110,15 +110,18 @@ where
     let t_start = std::time::Instant::now();
     let mut octree = SparseOctree::new(depth, base_voxel_size);
     let mut voxel_count = 0u32;
-    // Dedup keyed on `(LeafAttr, color)` — the attr covers material +
-    // packed normal + blend, but per-voxel color lives in a parallel
-    // pool and isn't part of LeafAttr. Keying on both means two cells
-    // with the same attr but different colors (ColorByNoise on a flat
-    // face, per-vertex imported colors) each get their own pool slot,
-    // instead of collapsing to one slot whose color gets overwritten
-    // by whichever cell finishes last.
-    let mut attr_dedup: std::collections::HashMap<(LeafAttr, u32), u32> =
-        std::collections::HashMap::new();
+    // No cell-attr dedup. Bake-time `(LeafAttr, color)` dedup used to
+    // collapse identical cells (a flat 20m face baked to ~100 unique
+    // attrs over millions of cells) into shared slots, which broke any
+    // editor operation that needs per-cell identity — paint cursor
+    // floods the whole face, paint writes recolor every cell sharing
+    // the slot, blending across stamps had no per-cell prior to blend
+    // with. Allocating one slot per cell makes paint and cursor "just
+    // work" by reading/writing the per-cell slot directly. Cost: a
+    // 2.3M-cell flat box grows from ~1KB to ~27MB resident; mesh
+    // imports barely change because their normals already differ
+    // per cell, breaking dedup anyway. LZ4 compresses the repeated
+    // attrs effectively on disk.
     let leaf_attr_slot_start = leaf_attr_pool.allocated_count();
     let mut brick_ids: Vec<u32> = Vec::new();
 
@@ -144,7 +147,6 @@ where
         leaf_attr_pool,
         brick_pool,
         &mut voxel_count,
-        &mut attr_dedup,
         &mut brick_ids,
         grid_origin,
         depth,
@@ -175,14 +177,13 @@ where
     let nodes_after_dedup = octree.node_count();
     octree.morton_reorder();
     let t_after_structure = t_start.elapsed();
-    let attrs_before_prefilter = attr_dedup.len();
+    let attrs_before_prefilter = leaf_attr_pool.allocated_count() - leaf_attr_slot_start;
     crate::prefilter::prefilter_octree_internals(
         &mut octree,
         leaf_attr_pool,
         brick_pool,
-        &mut attr_dedup,
     );
-    let attrs_after_prefilter = attr_dedup.len();
+    let attrs_after_prefilter = leaf_attr_pool.allocated_count() - leaf_attr_slot_start;
     let t_after_prefilter = t_start.elapsed();
 
     // Compute the face-adjacency links for this voxelization's bricks.
@@ -227,7 +228,7 @@ where
     Some(VoxelizeOctreeResult {
         octree,
         voxel_count,
-        leaf_attr_unique_count: attr_dedup.len() as u32,
+        leaf_attr_unique_count: leaf_attr_pool.allocated_count() - leaf_attr_slot_start,
         leaf_attr_slot_start,
         brick_ids,
         brick_face_links,
@@ -349,7 +350,6 @@ fn subdivide_bfs<F>(
     leaf_attr_pool: &mut LeafAttrPool,
     brick_pool: &mut BrickPool,
     voxel_count: &mut u32,
-    attr_dedup: &mut std::collections::HashMap<(LeafAttr, u32), u32>,
     brick_ids: &mut Vec<u32>,
     grid_origin: Vec3,
     max_depth: u8,
@@ -475,7 +475,6 @@ where
             leaf_attr_pool,
             brick_pool,
             voxel_count,
-            attr_dedup,
             brick_ids,
             &brick_queue,
             brick_depth.expect("brick_queue non-empty ⇒ brick_depth set"),
@@ -491,7 +490,6 @@ where
             octree,
             leaf_attr_pool,
             voxel_count,
-            attr_dedup,
             &leaf_queue,
             max_depth,
             base_voxel_size,
@@ -550,7 +548,6 @@ fn emit_bricks_batched<F>(
     leaf_attr_pool: &mut LeafAttrPool,
     brick_pool: &mut BrickPool,
     voxel_count: &mut u32,
-    attr_dedup: &mut std::collections::HashMap<(LeafAttr, u32), u32>,
     brick_ids: &mut Vec<u32>,
     brick_queue: &[BrickJob],
     brick_depth: u8,
@@ -751,24 +748,16 @@ where
                 Vec3::Y
             };
             let attr = LeafAttr::new_blended(normal, sc.primary, sc.secondary, sc.blend);
-            let key = (attr, sc.color);
-            let leaf_attr_id = if let Some(&existing) = attr_dedup.get(&key) {
-                existing
-            } else {
-                // Bump-only allocate — see the allocator's docs for
-                // why we can't reuse freed slots during a single bake.
-                let id = leaf_attr_pool.allocate_contiguous_bump(1)?;
-                *leaf_attr_pool.get_mut(id) = attr;
-                // Set color on the fresh slot. Keying dedup by color
-                // means every distinct color gets its own slot, so
-                // there's no "last writer wins" collision to worry
-                // about here.
-                if sc.color != 0 {
-                    leaf_attr_pool.set_color(id, sc.color);
-                }
-                attr_dedup.insert(key, id);
-                id
-            };
+            // No dedup — every cell gets its own slot so paint and
+            // cursor have per-cell identity to work with. Bump-only
+            // allocate keeps the asset's pool range contiguous, which
+            // `release_asset` relies on for a single deallocate_range
+            // to free everything.
+            let leaf_attr_id = leaf_attr_pool.allocate_contiguous_bump(1)?;
+            *leaf_attr_pool.get_mut(leaf_attr_id) = attr;
+            if sc.color != 0 {
+                leaf_attr_pool.set_color(leaf_attr_id, sc.color);
+            }
             brick_pool.set_cell(sc.brick_slot, sc.cx, sc.cy, sc.cz, leaf_attr_id);
             *voxel_count += 1;
         }
@@ -797,7 +786,6 @@ fn emit_leaves_batched<F>(
     octree: &mut SparseOctree,
     leaf_attr_pool: &mut LeafAttrPool,
     voxel_count: &mut u32,
-    attr_dedup: &mut std::collections::HashMap<(LeafAttr, u32), u32>,
     leaf_queue: &[LeafJob],
     max_depth: u8,
     base_voxel_size: f32,
@@ -846,18 +834,14 @@ where
             Vec3::Y
         };
         let attr = LeafAttr::new_blended(normal, primary, secondary, blend);
-        let key = (attr, color);
-        let leaf_attr_id = if let Some(&existing) = attr_dedup.get(&key) {
-            existing
-        } else {
-            let id = leaf_attr_pool.allocate()?;
-            *leaf_attr_pool.get_mut(id) = attr;
-            if color != 0 {
-                leaf_attr_pool.set_color(id, color);
-            }
-            attr_dedup.insert(key, id);
-            id
-        };
+        // No dedup — see emit_bricks_batched for the reasoning. Plain
+        // LEAF emission only fires for shallow trees (depth ≤ BRICK_LEVELS),
+        // so this path is rare in practice.
+        let leaf_attr_id = leaf_attr_pool.allocate()?;
+        *leaf_attr_pool.get_mut(leaf_attr_id) = attr;
+        if color != 0 {
+            leaf_attr_pool.set_color(leaf_attr_id, color);
+        }
         octree.set_at_level(
             job.coord,
             max_depth,

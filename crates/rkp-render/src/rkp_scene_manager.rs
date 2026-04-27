@@ -389,6 +389,7 @@ impl RkpSceneManager {
         self.asset_cache = AssetCache::default();
         self.pending_faces.clear();
         self.faces_dirty = false;
+        self.paint_dirty_range = None;
         self.brush_overlay_distances = vec![f32::INFINITY; capacity as usize];
         self.brush_overlay_flooded_slots.clear();
         self.bump_brush_overlay_epoch();
@@ -818,6 +819,16 @@ impl RkpSceneManager {
             }
         }
 
+        // Actual surface-cell count across this asset. `header.voxel_count`
+        // only counts unique LeafAttr slots (one per unique normal +
+        // material + blend + color tuple after bake-time dedup), which
+        // badly understates the painted surface on flat-faced primitives
+        // — a 20×1×20 procedural cube has ~2.3M cells but ~100 unique
+        // attrs, so the header number reads as "126 voxels" after
+        // Convert-to-Voxel even though the geometry is fully intact.
+        // Count non-sentinel brick cells here (+ LEAF octree nodes
+        // below) and report that instead.
+        let mut actual_cell_count: u32 = 0;
         let brick_cells = rkp_core::brick_pool::BRICK_CELLS as usize;
         for file_id in 0..file_brick_count {
             let scene_id = scene_brick_offset + file_id;
@@ -831,19 +842,30 @@ impl RkpSceneManager {
                 // BRICK_INTERIOR is a scene-global sentinel (0xFFFFFFFD),
                 // not a file-local slot index — pass it through without
                 // the leaf_attr_slot_start offset, which would overflow
-                // and corrupt the slot into a bogus leaf_attr_id.
+                // and corrupt the slot into a bogus leaf_attr_id. Also
+                // skip it from the user-facing voxel count: interior
+                // sentinels mark "inside the solid" and never render /
+                // paint as voxels.
                 let remapped = if cell == rkp_core::brick_pool::BRICK_INTERIOR {
                     rkp_core::brick_pool::BRICK_INTERIOR
                 } else {
                     // Real leaf: cell is a file-local slot index; shift
                     // by our leaf_attr allocation offset to get the
                     // scene-global leaf_attr_id.
+                    actual_cell_count += 1;
                     leaf_attr_slot_start + cell
                 };
                 let x = (i as u32) % rkp_core::brick_pool::BRICK_DIM;
                 let y = ((i as u32) / rkp_core::brick_pool::BRICK_DIM) % rkp_core::brick_pool::BRICK_DIM;
                 let z = (i as u32) / (rkp_core::brick_pool::BRICK_DIM * rkp_core::brick_pool::BRICK_DIM);
                 self.brick_pool.set_cell(scene_id, x, y, z, remapped);
+            }
+        }
+        // Shallow trees (depth ≤ BRICK_LEVELS) skip the brick path and
+        // emit LEAF nodes at `max_depth` instead — count those too.
+        for &n in &octree_nodes {
+            if rkp_core::sparse_octree::is_leaf(n) {
+                actual_cell_count += 1;
             }
         }
 
@@ -879,18 +901,10 @@ impl RkpSceneManager {
         // contiguous leaf_attr range via allocate_contiguous_bump(1), so
         // the `leaf_attr_slot_count` grows to cover them and the
         // existing deallocate_range releases everything on asset drop.
-        let mut attr_dedup: HashMap<(LeafAttr, u32), u32> = HashMap::new();
-        for i in 0..leaf_attr_slot_count {
-            let slot = leaf_attr_slot_start + i;
-            let attr = *self.leaf_attr_pool.get(slot);
-            let color = self.leaf_attr_pool.color(slot);
-            attr_dedup.insert((attr, color), slot);
-        }
         rkp_core::prefilter::prefilter_octree_internals(
             &mut tree,
             &mut self.leaf_attr_pool,
             &self.brick_pool,
-            &mut attr_dedup,
         );
         let final_leaf_attr_slot_count =
             self.leaf_attr_pool.allocated_count() - leaf_attr_slot_start;
@@ -912,8 +926,9 @@ impl RkpSceneManager {
         let handle = self.octree.allocate(&tree);
 
         eprintln!(
-            "[RkpSceneManager] loaded {}: {} voxels, {} bricks, octree {} → compact {} → dedup {} ({:.1}× total), +{} prefilter attrs",
+            "[RkpSceneManager] loaded {}: {} voxels ({} unique attrs), {} bricks, octree {} → compact {} → dedup {} ({:.1}× total), +{} prefilter attrs",
             rkp_path.display(),
+            actual_cell_count,
             voxel_count,
             file_brick_count,
             raw_count,
@@ -947,7 +962,7 @@ impl RkpSceneManager {
             spatial_handle: handle,
             voxel_size,
             aabb,
-            voxel_count,
+            voxel_count: actual_cell_count,
             leaf_attr_slot_start,
             leaf_attr_slot_count: final_leaf_attr_slot_count,
             brick_start: scene_brick_offset,
@@ -1025,6 +1040,7 @@ impl RkpSceneManager {
         }
         &full[start..end]
     }
+
 
     // ── Paint cursor overlay ────────────────────────────────────────
 
@@ -1234,29 +1250,32 @@ impl RkpSceneManager {
             if hit.leaf_slot < slot_lo || hit.leaf_slot >= slot_hi {
                 continue;
             }
-            let w = crate::paint::brush_weight(hit.distance, local_radius, strength, falloff);
-            if w <= 0.0 {
+            let weight = crate::paint::brush_weight(
+                hit.distance, local_radius, strength, falloff,
+            );
+            if weight <= 0.0 {
                 continue;
             }
+            let paint_slot = hit.leaf_slot;
             match stamp {
                 crate::paint::PaintStamp::Material { material_id } => {
                     crate::paint::paint_leaf_material(
-                        &mut self.leaf_attr_pool, hit.leaf_slot, material_id, w,
+                        &mut self.leaf_attr_pool, paint_slot, material_id, weight,
                     );
                 }
                 crate::paint::PaintStamp::Color { rgb } => {
                     crate::paint::paint_leaf_color(
-                        &mut self.leaf_attr_pool, hit.leaf_slot, rgb, w,
+                        &mut self.leaf_attr_pool, paint_slot, rgb, weight,
                     );
                 }
                 crate::paint::PaintStamp::Erase => {
                     crate::paint::erase_leaf_color(
-                        &mut self.leaf_attr_pool, hit.leaf_slot, w,
+                        &mut self.leaf_attr_pool, paint_slot, weight,
                     );
                 }
             }
-            dirty_min = dirty_min.min(hit.leaf_slot);
-            dirty_max = dirty_max.max(hit.leaf_slot);
+            dirty_min = dirty_min.min(paint_slot);
+            dirty_max = dirty_max.max(paint_slot);
             written += 1;
         }
 

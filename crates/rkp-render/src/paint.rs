@@ -132,8 +132,8 @@ fn descend(
 
     if is_leaf(node) {
         // A leaf at non-finest depth covers a whole subtree; we treat it as
-        // one voxel centered in its AABB. Painting the leaf's slot applies
-        // uniformly to that region.
+        // one voxel centered in its AABB. Rare in baked scenes — bricks
+        // dominate.
         let center = node_origin_local + Vec3::splat(node_extent * 0.5);
         let d = (center - center_local).length();
         if d <= radius {
@@ -616,10 +616,13 @@ pub fn paint_leaf_color(
     pool.set_color(leaf_slot, pack_color(new_rgb, new_i));
 }
 
-/// Erase a leaf's color by lerping the intensity channel toward zero. Full
-/// strength wipes the override entirely, returning the leaf to material
-/// base color. Partial strength fades toward the material albedo over
-/// multiple strokes — same feel as Photoshop's eraser.
+/// Erase a leaf's color by lerping the intensity channel toward zero.
+/// Full strength wipes the override entirely (clears `color_pool[slot]`
+/// to the 0 sentinel), returning the leaf to its material's base
+/// albedo. Partial strength fades toward the material over multiple
+/// strokes — same feel as Photoshop's eraser. The shade pass routes
+/// `color_pool[slot] == 0` to `mat_albedo(material)` via a 0 in the
+/// gbuffer's RGB565 channel; see `octree_march.wgsl`.
 pub fn erase_leaf_color(
     pool: &mut LeafAttrPool,
     leaf_slot: u32,
