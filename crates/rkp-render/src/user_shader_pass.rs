@@ -362,45 +362,81 @@ impl UserShaderObjectCache {
         }
 
         // Try a free slot that fits before bumping the high-water mark.
-        let slot = if let Some(idx) = self
+        let mut slot_opt: Option<FreeSlot> = self
             .free_slots
             .iter()
             .position(|s| s.octree_capacity >= estimate.octree
                 && s.brick_capacity >= estimate.bricks
                 && s.leaf_attr_capacity >= estimate.leaf_attrs)
-        {
-            self.free_slots.swap_remove(idx)
-        } else {
+            .map(|idx| self.free_slots.swap_remove(idx));
+
+        // Bump high-water if room.
+        if slot_opt.is_none() {
             let oct = self.octree_high_water;
             let br = self.brick_high_water;
             let la = self.leaf_attr_high_water;
             let ri = self.region_index_high_water;
-            if oct + estimate.octree > self.octree_capacity
-                || br + estimate.bricks * BRICK_CELLS > self.brick_capacity
-                || la + estimate.leaf_attrs > self.leaf_attr_capacity
+            if oct + estimate.octree <= self.octree_capacity
+                && br + estimate.bricks * BRICK_CELLS <= self.brick_capacity
+                && la + estimate.leaf_attrs <= self.leaf_attr_capacity
             {
+                self.octree_high_water = oct + estimate.octree;
+                self.brick_high_water = br + estimate.bricks * BRICK_CELLS;
+                self.leaf_attr_high_water = la + estimate.leaf_attrs;
+                self.region_index_high_water = ri + 1;
+                slot_opt = Some(FreeSlot {
+                    octree_offset: self.octree_base + oct,
+                    octree_capacity: estimate.octree,
+                    brick_offset: self.brick_base + br,
+                    brick_capacity: estimate.bricks,
+                    leaf_attr_offset: self.leaf_attr_base + la,
+                    leaf_attr_capacity: estimate.leaf_attrs,
+                    region_index: ri,
+                });
+            }
+        }
+
+        // Pool exhausted — try evicting an existing untouched entry
+        // and reusing its slot. Untouched entries are guaranteed to
+        // be `evict_untouched`-removed at end-of-frame anyway, so
+        // claiming one early just runs that eviction on demand.
+        // This handles the steady-state case where last frame's
+        // cache filled the buffer but this frame's request set has
+        // shifted — old tiles vacate, new tiles claim their slots,
+        // total cache size stays bounded by MAX_REGIONS.
+        if slot_opt.is_none() {
+            let victim_key = self
+                .entries
+                .iter()
+                .find(|(_, e)| !e.touched_this_frame)
+                .map(|(k, _)| *k);
+            if let Some(victim_key) = victim_key {
+                let victim = self.entries.remove(&victim_key).unwrap();
+                slot_opt = Some(FreeSlot {
+                    octree_offset: victim.octree_offset,
+                    octree_capacity: victim.octree_capacity,
+                    brick_offset: victim.brick_offset,
+                    brick_capacity: victim.brick_capacity,
+                    leaf_attr_offset: victim.leaf_attr_offset,
+                    leaf_attr_capacity: victim.leaf_attr_capacity,
+                    region_index: victim.region_index,
+                });
+            }
+        }
+
+        let slot = match slot_opt {
+            Some(s) => s,
+            None => {
                 eprintln!(
-                    "[user_shader_pass] pool exhausted at max_depth={}: oct={}/{} brick_cells={}/{} leaf={}/{} — dropping region {}.{}",
+                    "[user_shader_pass] pool exhausted at max_depth={}: \
+                     all {} slabs in use this frame, no untouched entry \
+                     to evict — dropping region {}.{} tile {:?}",
                     request.max_depth,
-                    oct + estimate.octree, self.octree_capacity,
-                    br + estimate.bricks * BRICK_CELLS, self.brick_capacity,
-                    la + estimate.leaf_attrs, self.leaf_attr_capacity,
+                    self.region_index_high_water,
                     request.host_object_id, request.material_id,
+                    request.tile_index,
                 );
                 return None;
-            }
-            self.octree_high_water = oct + estimate.octree;
-            self.brick_high_water = br + estimate.bricks * BRICK_CELLS;
-            self.leaf_attr_high_water = la + estimate.leaf_attrs;
-            self.region_index_high_water = ri + 1;
-            FreeSlot {
-                octree_offset: self.octree_base + oct,
-                octree_capacity: estimate.octree,
-                brick_offset: self.brick_base + br,
-                brick_capacity: estimate.bricks,
-                leaf_attr_offset: self.leaf_attr_base + la,
-                leaf_attr_capacity: estimate.leaf_attrs,
-                region_index: ri,
             }
         };
 
@@ -1419,6 +1455,43 @@ mod tests {
         // Same (object, material), different tiles → distinct slots.
         assert_ne!(s1.octree_offset, s2.octree_offset);
         assert_ne!(s1.region_index, s2.region_index);
+    }
+
+    #[test]
+    fn on_demand_eviction_when_pool_full_steady_state() {
+        // V10 — last frame filled the pool with N tiles. This frame
+        // shifts to a different N tiles (e.g. user paints in a new
+        // area, abandoning some old tiles). Without on-demand
+        // eviction the new tiles get dropped because all slots
+        // appear taken; with it, untouched entries vacate as new
+        // ones request.
+        let mut cache = UserShaderObjectCache::new();
+        // Pool fits exactly 4 slabs.
+        cache.set_pool_bases(0, 32_900 * 4, 0, 4096 * 64 * 4, 0, 4096 * 32 * 4);
+        // Frame 1 — fill the pool with tiles [0..4].
+        cache.begin_frame();
+        let mut r = req(1, 1);
+        for i in 0..4 {
+            r.tile_index = [i, 0, 0];
+            assert!(cache.lookup_or_allocate(&r, 0).is_some());
+        }
+        // Pool now full. Don't evict.
+        // Frame 2 — request tiles [4..8]. None of the prior 4 are
+        // touched, so on-demand eviction should kick in and let the
+        // new ones claim slots.
+        cache.begin_frame();
+        for i in 4..8 {
+            r.tile_index = [i, 0, 0];
+            assert!(
+                cache.lookup_or_allocate(&r, 0).is_some(),
+                "on-demand eviction should free a slot for new tile {i}",
+            );
+        }
+        // After this frame the cache contains the new 4 tiles only.
+        assert_eq!(cache.entries.len(), 4);
+        for i in 4..8 {
+            assert!(cache.entries.contains_key(&(1, 1, [i, 0, 0])));
+        }
     }
 
     #[test]
