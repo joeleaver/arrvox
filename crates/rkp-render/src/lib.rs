@@ -66,10 +66,27 @@ pub mod proc_ghost;
 pub mod proc_sample;
 /// Composes user-authored WGSL hooks into the procedural evaluator.
 pub mod shader_composer;
+/// Option B — voxel sprite instancing. Parses per-instance state structs
+/// declared by `@instance_proto` and computes their byte layout.
+pub mod instance_proto;
 /// Phase C — GPU runtime geometry pass. User-shader `generate` hooks
 /// run here, materializing voxels in a transient pool the march/shade
 /// passes already know how to read.
 pub mod user_shader_pass;
+/// Option B — prototype bake pipeline. Voxelizes each instance shader's
+/// `proto_sample_at(uvw)` into a small dedicated octree+brick+leaf-attr
+/// triple, cached by source hash. Shares pool buffers with
+/// `user_shader_pass` at a disjoint byte range.
+pub mod user_shader_proto_pass;
+/// Option B — per-region instance scatter pipeline. Runs each instance
+/// shader's `emit` hook over a 3D sample grid at brick-parent
+/// granularity, atomic-appending placed instances into a per-region
+/// slice of a global instance pool.
+pub mod user_shader_emit_pass;
+/// Option B — per-tile spatial accel for the instance pipeline.
+/// Built per frame from the emit pass's cached regions; consumed by
+/// the march to look up "which regions overlap this ray's tile."
+pub mod instance_tile_index;
 /// Skeletal skin-deform scatter pass — per-frame bone-field writer.
 pub mod skin_deform;
 /// CPU-side paint writes against the scene's LeafAttrPool (material +
