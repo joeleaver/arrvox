@@ -138,25 +138,28 @@ pub const MAX_DEPTH: u32 = 8;
 /// multiplexed across all regions processed in one frame. Multiplied
 /// by `MAX_DEPTH+1` for the global queue buffer.
 ///
-/// V12: 1 M cells per level. Hundreds of tiled paint regions
-/// (e.g., a 20×20 m hillside at @tile_size 1.0) produce ~1 M cells
-/// at the deepest BFS level — proximity gate filters by surface
-/// distance but not by material match (that happens at brick
-/// parent only). Queue overflow at this scale silently drops
-/// cells → bricks never queued → flicker as the dropped subset
-/// shifts each frame under @animated.
+/// V13 sizing: 2 M cells per level. With V13 collapse-deepest into
+/// inline children, the dominant queue is now at L=max_depth-1
+/// (e.g. L=4 for grass at depth 5). For 512 tiled paint regions
+/// at depth 5 with band 0.5 m, L=4 cells ≈ 16² × 10 layers =
+/// 2.5K per tile → 1.3 M total. 1 M was right at the threshold,
+/// where atomic-add ordering pushed some frames over → silent
+/// overflow → flicker. 2 M gives margin.
 ///
-/// Total queue storage: 9 × 1 M × 32 B = 288 MB. Heavy but
-/// allocated once at startup and reused per frame.
-const PER_LEVEL_QUEUE_CAP: u32 = 1048576;
+/// Total queue storage: 9 × 2 M × 32 B = 576 MB. Heavy but
+/// allocated once at startup.
+const PER_LEVEL_QUEUE_CAP: u32 = 2097152;
 
 /// Total brick fill tasks the queue holds across all regions in one
 /// frame. With V12 deferred allocation + V13 inline brick-parent
 /// classification at L=max_depth-1, ALL admitted brick-parent cells
-/// queue fills directly — no L=max_depth active queue. For 256
-/// tiles × ~2 K L=4 cells × ~half-pass-proximity = ~4 M fill tasks.
-/// 4 M × 32 B = 128 MB.
-const FILL_QUEUE_CAP: u32 = 4194304;
+/// queue fills directly — no L=max_depth active queue. For 512
+/// tiles × ~2 K L=4 cells × 8 children = ~8 M fill tasks worst
+/// case. Beyond this the atomic counter goes past `arrayLength`
+/// and we silently drop tasks → flicker as the dropped subset
+/// shifts each frame under @animated.
+/// 8 M × 32 B = 256 MB.
+const FILL_QUEUE_CAP: u32 = 8388608;
 
 /// Workgroup size for `classify_main`. Determines how many workgroups
 /// we dispatch per level: `PER_LEVEL_QUEUE_CAP / CLASSIFY_WG_SIZE`
