@@ -565,9 +565,21 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // projected surface point isn't painted with this
             // region's material. Saves the fill dispatch entirely
             // for "above unpainted host" bricks.
+            //
+            // The push amount must be a fraction of the HOST's
+            // voxel size, not our transient brick's cell_size.
+            // Pushing 2× our cell_size (typically 60mm+) lands
+            // deep inside the host body — past the surface leaf,
+            // into interior fill which doesn't carry the painted
+            // material. That mis-rejected most blade bricks. Half
+            // a host voxel is just enough to land inside the
+            // surface leaf.
+            let host_vs = cur_region.host_octree_extent
+                / (4.0 * f32(1u << cur_region.host_octree_depth));
+            let push = max(host_vs * 0.5, 1e-4);
             let surface_probe = vec3<f32>(
                 center.x,
-                center.y - host.distance - cur_region.cell_size * 2.0,
+                center.y - host.distance - push,
                 center.z,
             );
             let surface = host_sample_in_region(surface_probe, cell.region_index);
