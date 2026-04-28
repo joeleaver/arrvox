@@ -1449,36 +1449,31 @@ fn splice_transient_into_tile_lists(
     (new_offsets, new_ids)
 }
 
-/// Phase C — user-shader runtime geometry. Reserves transient pool
-/// capacity, rebuilds the geom-build pipeline on shader changes, walks
-/// the snapshot's regions, and dispatches one workgroup per region
-/// whose cache slot is dirty. Returns the transient `RkpGpuObject`
-/// list to concatenate with `gpu_objects` for this frame's
-/// `upload_frame` (so the march/shade passes find the new geometry
-/// alongside persistent objects).
+/// User-shader runtime geometry, global-pool + persistent-cache variant.
 ///
-/// V9 — sparse BFS. Pool reservation per region is sized from the
-/// requested `painted_leaf_count` × `max_depth` rather than the dense
-/// `8^depth` worst case. Memory + compute scale with surface area.
+/// Reserves a global transient pool tail in each scene buffer,
+/// rebuilds the geom-build pipeline on shader source changes, walks
+/// the frame's regions and consults the persistent cache to decide
+/// per-region: skip / fill-only / full-bake. Returns the transient
+/// `RkpGpuObject` list to concatenate with `gpu_objects` for this
+/// frame's `upload_frame`.
+///
+/// Each region computes two hashes:
+///   - `topology_hash` — host_geom + region_thickness + max_depth +
+///     aabb + cell_size. classify can be skipped when unchanged.
+///   - `fill_hash` — shader source + params + paint epoch + time
+///     (when @animated). fill can be skipped when unchanged AND
+///     topology unchanged.
 fn run_user_shader_geom(
     state: &mut RenderState,
     frame: &RenderFrame,
 ) -> Vec<rkp_render::rkp_gpu_object::RkpGpuObject> {
     use rkp_render::user_shader_pass::{
-        build_region_uniform, effective_hash, estimate_region_pool, resolve_shader_id,
-        RegionUniform, BRICK_CELLS,
+        build_region_uniform, estimate_region_pool, resolve_shader_id, CachedSlot,
+        RegionUniform, BRICK_CELLS, MAX_GLOBAL_BRICKS, MAX_GLOBAL_LEAF_ATTRS,
+        MAX_GLOBAL_OCTREE_NODES, MAX_REGIONS,
     };
 
-    // V10 multi-region tiling: bounded so the SUM of per-region pool
-    // reservations stays within wgpu's `max_storage_buffer_binding_size`
-    // (1 GB). With slab = 2048 bricks (~512 B binding per brick across
-    // brick_pool + leaf_attr_pool), 512 regions × ~1 MB per slab =
-    // ~512 MB binding pressure per pool. CPU heads (~344 MiB scene)
-    // bring per-buffer pressure to ~860 MiB, with 100+ MiB head
-    // before the binding limit. Above 512 active tiles per frame,
-    // surplus tiles drop silently — the trade-off keeps validation
-    // green even when the user paints sprawling areas.
-    const MAX_REGIONS: u32 = 512;
     const FACE_EMPTY: u32 = 0xFFFFFFFFu32;
 
     // 1. Pipeline reload — track the shade-side hash; the geom and
@@ -1489,65 +1484,25 @@ fn run_user_shader_geom(
         frame.user_shader_source_hash,
     );
 
-    // V10 — mark all cache entries unused before we process this
-    // frame's requests. Lookups touch the entries they reference,
-    // and `evict_untouched` at the end drops the rest. Required for
-    // tile cache: when paint moves off a tile, its old cache entry
-    // would otherwise leak into transient_objects forever.
+    // 2. Mark cache entries untouched; we'll touch the ones we hit.
     state.user_shader_cache.begin_frame();
 
     if frame.user_shader_regions.is_empty() {
-        // No requests this frame — evict everything since nothing
-        // got touched.
+        // Nothing to dispatch — drop any entries left over from prior
+        // frames so they release their pool extents.
         state.user_shader_cache.evict_untouched();
         return state.user_shader_cache.build_transient_objects();
     }
 
-    // 2. Reserve transient pool capacity using a STABLE worst-case
-    //    bound, not the per-frame estimate sum. Reasoning: as the
-    //    user paints more strokes the per-frame estimate grows
-    //    monotonically (more painted leaves → more tiles → bigger
-    //    sum), which would force `ensure_user_shader_capacity` to
-    //    grow buffers nearly every frame, each grow triggering a
-    //    344 MiB CPU re-upload via `upload_geometry`. With the
-    //    stable bound the buffers grow once and stabilise; per-frame
-    //    pool *usage* still scales with paint via the cache's
-    //    sub-allocator (it bumps the high-water mark within the
-    //    reserved range without resizing the underlying buffer).
-    //
-    //    Worst-case bytes per region at our caps (4096 bricks ×
-    //    max_depth 8): ~1 MB brick, ~1 MB leaf-attr, 32 KB octree,
-    //    96 KB face-link. Times MAX_REGIONS = 256 → ~600 MB total
-    //    transient pool. CPU heads (~344 MiB scene) push total
-    //    buffer pressure to ~944 MiB per pool — under the 1 GB
-    //    binding limit with margin.
-    const MAX_BRICKS_PER_REGION: u32 = 2048;
-    const MAX_DEPTH_RESERVE: u32 = 8;
-    let max_regions_u64 = MAX_REGIONS as u64;
-    let extra_octree: u64 = max_regions_u64
-        * (MAX_BRICKS_PER_REGION as u64 * 8 + (MAX_DEPTH_RESERVE as u64 + 1) * 8)
-        * 8; // bytes per vec2<u32>
-    let extra_brick: u64 = max_regions_u64
-        * MAX_BRICKS_PER_REGION as u64
-        * BRICK_CELLS as u64 * 4;
-    let extra_leaf: u64 = max_regions_u64
-        * MAX_BRICKS_PER_REGION as u64 * BRICK_CELLS as u64 / 2 * 8;
-    let extra_face_links: u64 = max_regions_u64
-        * MAX_BRICKS_PER_REGION as u64 * 6 * 4;
+    // 3. Buffer reservation. Stable across frames once geometry is
+    //    loaded. The user-shader transient tail is sized at the
+    //    global caps; the cache sub-allocates within.
+    let extra_octree: u64 = MAX_GLOBAL_OCTREE_NODES as u64 * 8;
+    let extra_brick: u64 = MAX_GLOBAL_BRICKS as u64 * BRICK_CELLS as u64 * 4;
+    let extra_leaf: u64 = MAX_GLOBAL_LEAF_ATTRS as u64 * 8;
+    let extra_face_links: u64 = MAX_GLOBAL_BRICKS as u64 * 6 * 4;
 
-    // Per-frame estimates still drive cache sub-allocation (set_pool_bases
-    // below). Estimates that exceed the stable buffer reservation are
-    // capped at the buffer-tail size, mirroring real-world tile budgets.
     let need_regions = (frame.user_shader_regions.len() as u32).min(MAX_REGIONS);
-    let regions_for_alloc: Vec<&_> = frame
-        .user_shader_regions
-        .iter()
-        .take(need_regions as usize)
-        .collect();
-    let estimates: Vec<rkp_render::user_shader_pass::PoolEstimate> = regions_for_alloc
-        .iter()
-        .map(|r| estimate_region_pool(r.painted_leaf_count, r.max_depth))
-        .collect();
 
     let (cpu_octree_bytes, cpu_brick_bytes, cpu_leaf_attr_bytes, cpu_face_links_bytes) = {
         let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
@@ -1572,48 +1527,42 @@ fn run_user_shader_geom(
         state.renderer.upload_geometry(&state.queue, &g);
         state.last_uploaded_geometry_epoch = sm.geometry_epoch();
         drop(sm);
-        state.user_shader_cache.flush();
+        // One-time face-links init: the user-shader BFS never writes
+        // into this buffer but the march reads it for any
+        // user-shader-allocated brick. Uninitialised values would jump
+        // the DDA chain into stale brick_id=0.
+        const FACE_INIT_CHUNK: usize = 4 * 1024 * 1024;
+        let chunk_data: Vec<u32> = vec![FACE_EMPTY; FACE_INIT_CHUNK];
+        let mut written: u64 = 0;
+        while written < extra_face_links {
+            let remaining = (extra_face_links - written) as usize;
+            let this_chunk_bytes = (FACE_INIT_CHUNK * 4).min(remaining);
+            state.queue.write_buffer(
+                &state.renderer.scene.brick_face_links_buffer,
+                cpu_face_links_bytes + written,
+                bytemuck::cast_slice(&chunk_data[..this_chunk_bytes / 4]),
+            );
+            written += this_chunk_bytes as u64;
+        }
     }
 
-    // Initialise transient face-links tail to FACE_EMPTY. Required for
-    // march correctness — without this the DDA chain reads zero and
-    // jumps into CPU brick_id=0.
-    if need_regions > 0 {
-        let total_face_link_u32s: u64 = estimates.iter().map(|e| e.bricks as u64 * 6).sum();
-        let face_link_data: Vec<u32> = vec![FACE_EMPTY; total_face_link_u32s as usize];
-        let face_link_offset_bytes = cpu_face_links_bytes;
-        state.queue.write_buffer(
-            &state.renderer.scene.brick_face_links_buffer,
-            face_link_offset_bytes,
-            bytemuck::cast_slice(&face_link_data),
-        );
-    }
-
+    // 4. Configure pool bases — flushes the cache if they changed.
+    //    Also reconcile against the host's geometry epoch (any host
+    //    geometry change invalidates every region's topology_hash).
+    let octree_base_elems = (cpu_octree_bytes / 8) as u32;
+    let brick_base_bricks = (cpu_brick_bytes / 4 / BRICK_CELLS as u64) as u32;
+    let leaf_base_elems = (cpu_leaf_attr_bytes / 8) as u32;
+    state.user_shader_cache.set_pool_bases(
+        octree_base_elems, brick_base_bricks, leaf_base_elems,
+    );
     state.user_shader_cache.reconcile_epoch(frame.geometry_epoch);
 
-    // Configure pool bases. Capacities here come from the stable
-    // worst-case reservation we made above — the cache sub-allocates
-    // within this fixed range each frame. Using the per-frame
-    // estimate sum here would be wrong: it'd shrink the cache's
-    // accessible range below the buffer's actual tail size and
-    // re-set_pool_bases on each frame would `flush` unnecessarily.
-    let octree_base_elems = (cpu_octree_bytes / 8) as u32;
-    let brick_base_elems = (cpu_brick_bytes / 4) as u32;
-    let leaf_base_elems = (cpu_leaf_attr_bytes / 8) as u32;
-    let total_octree_elems = (extra_octree / 8) as u32;
-    let total_brick_elems = (extra_brick / 4) as u32;
-    let total_leaf_elems = (extra_leaf / 8) as u32;
-    state.user_shader_cache.set_pool_bases(
-        octree_base_elems, total_octree_elems,
-        brick_base_elems, total_brick_elems,
-        leaf_base_elems, total_leaf_elems,
-    );
-
-    // 3. Resolve regions, look up cache slots, build per-region
-    //    uniforms for the dirty ones. With sparse BFS the GPU pass
-    //    allocates internals on-the-fly — no CPU pre-write of perfect
-    //    trees needed.
-    let mut uniforms: Vec<RegionUniform> = Vec::with_capacity(need_regions as usize);
+    // 5. Walk regions, look up cache, gather dirty ones into two
+    //    contiguous groups: topology-dirty first, then fill-only.
+    let mut topology_dirty_uniforms: Vec<RegionUniform> = Vec::new();
+    let mut fill_only_uniforms: Vec<RegionUniform> = Vec::new();
+    let mut topology_dirty_slots: Vec<CachedSlot> = Vec::new();
+    let mut fill_only_slots: Vec<CachedSlot> = Vec::new();
     let mut max_max_depth: u32 = 0;
     let time_seconds = frame.shade_params_base.time;
     for req in frame.user_shader_regions.iter().take(need_regions as usize) {
@@ -1621,17 +1570,51 @@ fn run_user_shader_geom(
         if shader_id == 0 {
             continue;
         }
-        let h = effective_hash(req, frame.user_shader_source_hash, frame.geometry_epoch);
-        let slot = match state.user_shader_cache.lookup_or_allocate(req, h) {
+        let topology_hash = topology_hash_for(req, frame.geometry_epoch);
+        let fill_hash = fill_hash_for(
+            req,
+            topology_hash,
+            frame.user_shader_source_hash,
+            time_seconds,
+        );
+        let estimate = estimate_region_pool(req);
+        let mut slot = match state.user_shader_cache.lookup_or_allocate(
+            req, topology_hash, fill_hash, &estimate,
+        ) {
             Some(s) => s,
             None => continue,
         };
-        if !slot.was_dirty {
-            continue;
+        if !slot.topology_dirty && !slot.fill_dirty {
+            continue; // Skip entirely; cached GPU contents still valid.
         }
         max_max_depth = max_max_depth.max(slot.max_depth);
-        uniforms.push(build_region_uniform(req, &slot, shader_id, time_seconds));
+        if slot.topology_dirty {
+            slot.region_index = topology_dirty_slots.len() as u32;
+            // index will get bumped by fill_only's count below; we
+            // patch the uniform's region_index after gathering.
+            topology_dirty_slots.push(slot);
+            topology_dirty_uniforms.push(
+                build_region_uniform(req, &slot, shader_id, time_seconds),
+            );
+        } else {
+            fill_only_slots.push(slot);
+            fill_only_uniforms.push(
+                build_region_uniform(req, &slot, shader_id, time_seconds),
+            );
+        }
     }
+
+    let topology_dirty_count = topology_dirty_uniforms.len() as u32;
+    // Fill-only regions live at indices [topology_dirty_count, total).
+    // Their region_index in the dispatch uniform must reflect that.
+    for (i, _slot) in fill_only_slots.iter().enumerate() {
+        // No-op: region_index is implicit in array order; the WGSL
+        // reads `regions[wid.y]`, where wid.y = topology_dirty_count + i.
+        let _ = i;
+    }
+
+    let mut uniforms = topology_dirty_uniforms;
+    uniforms.extend(fill_only_uniforms);
 
     if !uniforms.is_empty() {
         let mut encoder = state
@@ -1639,14 +1622,12 @@ fn run_user_shader_geom(
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("user_shader_geom_encoder"),
             });
-        // dispatch_regions handles ensure_capacity + ensure_group0
-        // internally so the right ordering happens (capacity grow
-        // can invalidate group 0; we need to ensure group 0 AFTER).
         state.user_shader_pass.dispatch_regions(
             &state.device,
             &state.queue,
             &mut encoder,
             &uniforms,
+            topology_dirty_count,
             max_max_depth,
             &state.renderer.scene.octree_nodes_buffer,
             &state.renderer.scene.brick_pool_buffer,
@@ -1654,15 +1635,73 @@ fn run_user_shader_geom(
             state.renderer.scene.buffers_epoch(),
         );
         state.queue.submit(Some(encoder.finish()));
+        state.user_shader_pass.submit_overflow_readback();
     }
 
-    // V10 — drop entries that didn't get a request this frame.
-    // Their pool slices return to the free list for next frame's
-    // allocations; the entries themselves stop appearing in
-    // transient_objects so the march doesn't render stale data.
+    // 6. Drop entries not touched this frame; their extents go back
+    //    to the bucket allocators' free lists.
     state.user_shader_cache.evict_untouched();
 
     state.user_shader_cache.build_transient_objects()
+}
+
+/// Hash inputs that affect classify (BFS topology). Unchanged
+/// topology hash → skip classify dispatch for this region.
+fn topology_hash_for(
+    req: &rkp_render::user_shader_pass::ShaderRegionRequest,
+    geometry_epoch: u64,
+) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    let prime = 0x100000001b3u64;
+    let mix = |h: &mut u64, b: u8| {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(prime);
+    };
+    for &b in &geometry_epoch.to_le_bytes() { mix(&mut h, b); }
+    for &b in &req.host_octree_root.to_le_bytes() { mix(&mut h, b); }
+    for &b in &req.host_octree_depth.to_le_bytes() { mix(&mut h, b); }
+    for &b in &req.host_octree_extent.to_le_bytes() { mix(&mut h, b); }
+    for v in req.host_grid_origin.iter() {
+        for &b in &v.to_le_bytes() { mix(&mut h, b); }
+    }
+    for row in req.host_inverse_world.iter() {
+        for v in row.iter() {
+            for &b in &v.to_le_bytes() { mix(&mut h, b); }
+        }
+    }
+    for &b in &req.region_thickness.to_le_bytes() { mix(&mut h, b); }
+    for &b in &req.max_depth.to_le_bytes() { mix(&mut h, b); }
+    for v in req.aabb_min.iter().chain(req.aabb_max.iter()) {
+        for &b in &v.to_le_bytes() { mix(&mut h, b); }
+    }
+    for &b in &req.cell_size.to_le_bytes() { mix(&mut h, b); }
+    h
+}
+
+/// Hash inputs that affect fill (per-cell shader output). Unchanged
+/// fill hash AND unchanged topology hash → skip fill dispatch.
+fn fill_hash_for(
+    req: &rkp_render::user_shader_pass::ShaderRegionRequest,
+    topology_hash: u64,
+    shader_source_hash: u64,
+    time_seconds: f32,
+) -> u64 {
+    let mut h = topology_hash;
+    let prime = 0x100000001b3u64;
+    let mix = |h: &mut u64, b: u8| {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(prime);
+    };
+    for &b in &shader_source_hash.to_le_bytes() { mix(&mut h, b); }
+    for &b in &req.input_hash.to_le_bytes() { mix(&mut h, b); }
+    for &b in &req.material_id.to_le_bytes() { mix(&mut h, b); }
+    for &p in &req.params {
+        for &b in &p.to_le_bytes() { mix(&mut h, b); }
+    }
+    if req.animated {
+        for &b in &time_seconds.to_le_bytes() { mix(&mut h, b); }
+    }
+    h
 }
 
 #[cfg(test)]

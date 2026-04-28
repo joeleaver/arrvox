@@ -20,9 +20,9 @@
 
 use rkp_render::shader_composer::{compose, scan_dir};
 use rkp_render::user_shader_pass::{
-    build_region_uniform, effective_hash, estimate_region_pool, resolve_shader_id,
-    RegionUniform, ShaderRegionRequest, UserShaderObjectCache, UserShaderPass,
-    BRICK_CELLS, HOST_NO_HOST_SENTINEL, NO_TILE,
+    build_region_uniform, estimate_region_pool, resolve_shader_id, RegionUniform,
+    ShaderRegionRequest, UserShaderObjectCache, UserShaderPass, BRICK_CELLS,
+    HOST_NO_HOST_SENTINEL, NO_TILE,
 };
 
 fn create_device() -> Option<(wgpu::Device, wgpu::Queue)> {
@@ -100,22 +100,24 @@ fn user_ball_generate(cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx)
     let registry = scan_dir(&dir).unwrap();
     let composed = compose(&registry);
 
-    // Prepare scene buffers — sized to fit the test region's pool
-    // estimate. We don't need a real RkpScene here; raw storage
-    // buffers wired to UserShaderPass's group 0 are sufficient.
-    // Depth 3 gives 8³ = 512 dense bricks, well under the 2048-brick
-    // slab so the BFS expands fully without overflow. (Depth 4's
-    // 4096 dense bricks exceeds the slab; that's the V10 trade-off
-    // between per-tile granularity and per-tile capacity.)
+    // Prepare scene buffers — sized for a single-region test bake at
+    // depth 3 (8³ = 512 dense bricks worst case). We don't need a
+    // real RkpScene here; raw storage buffers wired to
+    // UserShaderPass's group 0 are sufficient.
     const MAX_DEPTH: u32 = 3;
     const PAINTED_COUNT: u32 = 64;
-    let estimate = estimate_region_pool(PAINTED_COUNT, MAX_DEPTH);
+    // Generous test caps — global pool sized to comfortably hold this
+    // single test region's worst case. Real-engine caps are
+    // MAX_GLOBAL_* but tests don't need that headroom.
+    const TEST_OCTREE_CAP: u32 = 8192;
+    const TEST_BRICK_CAP: u32 = 1024;
+    const TEST_LEAF_ATTR_CAP: u32 = TEST_BRICK_CAP * BRICK_CELLS;
     // octree_nodes is bound as `array<vec2<u32>>` (8 B/elem); brick_pool
     // as `array<u32>` (4 B/elem); leaf_attr_pool as `array<LeafAttr>`
     // (8 B/elem).
-    let octree_bytes = (estimate.octree as u64) * 8;
-    let brick_bytes = (estimate.bricks as u64) * BRICK_CELLS as u64 * 4;
-    let leaf_attr_bytes = (estimate.leaf_attrs as u64) * 8;
+    let octree_bytes = TEST_OCTREE_CAP as u64 * 8;
+    let brick_bytes = TEST_BRICK_CAP as u64 * BRICK_CELLS as u64 * 4;
+    let leaf_attr_bytes = TEST_LEAF_ATTR_CAP as u64 * 8;
 
     let octree_nodes_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("test octree_nodes"),
@@ -139,12 +141,15 @@ fn user_ball_generate(cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx)
     let mut pass = UserShaderPass::new(&device);
     pass.reload_user_shaders(&device, &composed.generate, registry.source_hash());
 
-    let mut cache = UserShaderObjectCache::new();
-    cache.set_pool_bases(
-        0, estimate.octree,
-        0, estimate.bricks * BRICK_CELLS,
-        0, estimate.leaf_attrs,
+    // Tight pool capacities for the test, well under the production
+    // MAX_GLOBAL_* but big enough for one ball region.
+    let mut cache = UserShaderObjectCache::with_capacities(
+        TEST_OCTREE_CAP,
+        TEST_BRICK_CAP,
+        TEST_LEAF_ATTR_CAP,
+        TEST_BRICK_CAP, // fill_task cap matches brick cap
     );
+    cache.set_pool_bases(0, 0, 0);
 
     let req = ShaderRegionRequest {
         host_object_id: 1,
@@ -171,8 +176,12 @@ fn user_ball_generate(cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx)
         ],
         tile_index: NO_TILE,
     };
-    let h = effective_hash(&req, registry.source_hash(), 0);
-    let slot = cache.lookup_or_allocate(&req, h).unwrap();
+    cache.begin_frame();
+    let estimate = estimate_region_pool(&req);
+    let mut slot = cache
+        .lookup_or_allocate(&req, 0xAA_AA, 0xBB_BB, &estimate)
+        .unwrap();
+    slot.region_index = 0;
     let shader_id = resolve_shader_id(&registry.shader_infos(), "ball");
     assert!(shader_id != 0, "ball shader should have id 1");
     let uniform: RegionUniform = build_region_uniform(&req, &slot, shader_id, 0.0);
@@ -181,7 +190,10 @@ fn user_ball_generate(cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx)
         label: Some("test bfs encoder"),
     });
     pass.dispatch_regions(
-        &device, &queue, &mut encoder, &[uniform], MAX_DEPTH,
+        &device, &queue, &mut encoder,
+        &[uniform],
+        1, // topology_dirty_count = 1 (the single new region)
+        MAX_DEPTH,
         &octree_nodes_buffer, &brick_pool_buffer, &leaf_attr_pool_buffer, 0,
     );
 
@@ -198,11 +210,13 @@ fn user_ball_generate(cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx)
     });
     let leaf_alloc_buffer = pass.test_leaf_attr_alloc_buffer();
     let brick_alloc_buffer = pass.test_brick_alloc_buffer();
-    let fill_count_buffer = pass.test_fill_count_buffer();
+    let fill_task_alloc_buffer = pass.test_fill_task_alloc_buffer();
     let active_count_buffer = pass.test_active_count_buffer();
-    encoder.copy_buffer_to_buffer(leaf_alloc_buffer, 0, &staging, 0, 16);
-    encoder.copy_buffer_to_buffer(brick_alloc_buffer, 0, &staging, 16, 16);
-    encoder.copy_buffer_to_buffer(fill_count_buffer, 0, &staging, 32, 16);
+    // Per-region atomics — each is array<u32, MAX_REGIONS>; we only
+    // care about index 0 (the single region in this test).
+    encoder.copy_buffer_to_buffer(leaf_alloc_buffer, 0, &staging, 0, 4);
+    encoder.copy_buffer_to_buffer(brick_alloc_buffer, 0, &staging, 16, 4);
+    encoder.copy_buffer_to_buffer(fill_task_alloc_buffer, 0, &staging, 32, 4);
     encoder.copy_buffer_to_buffer(active_count_buffer, 0, &staging, 48, 4 * 9);
     queue.submit(Some(encoder.finish()));
 
@@ -303,7 +317,7 @@ fn empty_registry_dispatch_no_op() {
         mapped_at_creation: false,
     });
     pass.dispatch_regions(
-        &device, &queue, &mut encoder, &[], 0,
+        &device, &queue, &mut encoder, &[], 0, 0,
         &dummy, &dummy, &dummy, 0,
     );
     queue.submit(Some(encoder.finish()));

@@ -1,38 +1,56 @@
-// user_shader_geom.wgsl — V9 sparse BFS GPU octree builder.
+// user_shader_geom.wgsl — sparse BFS GPU octree builder.
 //
-// Replaces the V8 dense-brick (2^depth)³ workgroup-per-brick model.
-// The whole tree is built top-down by atomically allocating nodes /
-// bricks / leaf-attrs from per-region pool ranges. Memory and compute
-// scale with painted surface area, not the enclosing-AABB volume.
+// Builds the whole tree top-down by atomically allocating nodes / bricks /
+// leaf-attrs / fill-tasks from PER-REGION blocks in the global pools.
+// Each cached region owns variable-size extents (allocated CPU-side from
+// a free-list bucketed allocator) and bumps within them via per-region
+// atomic counters. Memory and compute scale with painted surface area;
+// per-region brick locality is preserved (cache-friendly march).
 //
-// Pipeline (in the order the host encodes them):
-//   1. CPU writes one root ActiveCell per region into active_queue[level=0]
-//      and sets active_count[0] = region_count.
-//   2. For L in 0..=max_depth: dispatch `classify_main` over active_queue[L].
-//      Each thread samples host_sample_at(cell_center), classifies the
-//      cell, and:
-//        - EMPTY → write OCTREE_EMPTY at cell.octree_offset, done.
-//        - INTERIOR → write OCTREE_INTERIOR, done. (Conservative; user code
-//          inside fully-solid host body would never produce useful blades.)
-//        - L < max_depth and MIXED → atomically alloc 8 child nodes from
-//          the region's octree pool, write self as a branch pointing at
-//          first_child, push 8 ActiveCells onto active_queue[L+1].
-//        - L == max_depth and MIXED → atomically alloc one brick, write
-//          self as LEAF|BRICK|brick_id, push a BrickFillTask onto
-//          fill_queue.
-//   3. Dispatch `brick_fill_main` over fill_queue. One 4×4×4 workgroup per
-//      task; each thread runs `dispatch_user_generate` for one cell of
-//      the brick and writes its leaf-attr (or BRICK_CELL_EMPTY).
+// Allocator model: four `array<atomic<u32>>` counters indexed by
+// `region_index` — one each for `octree_alloc`, `brick_alloc`,
+// `leaf_attr_alloc`, `fill_task_alloc`. Every classify / fill thread
+// that needs a slot does `atomicAdd(&pool_alloc[region_index], n)` and
+// composes the global pool offset as `region.X_block_offset + slot`.
+// CPU pre-seeds counters before dispatch (octree=1, others=0) and
+// pre-fills topology-dirty regions' fill-task extents with sentinels
+// so the fill pass can early-out on unused slots.
 //
-// Both passes share the same scene-side `octree_nodes` / `brick_pool` /
-// `leaf_attr_pool` storage buffers as the march reads. Per-region atomic
-// counters (`octree_alloc`, `brick_alloc`, `leaf_attr_alloc`) bump-allocate
-// from each region's reserved range; overflow degrades to OCTREE_EMPTY at
-// the offending node (no crash, no data corruption — just missing detail).
+// Pipeline (per frame):
+//   1. CPU walks the persistent cache, gathers DIRTY regions
+//      (topology_dirty | fill_dirty), assigns each a 0-based
+//      `region_index_this_frame`, builds the regions storage array.
+//   2. For TOPOLOGY-DIRTY regions only: CPU writes one root ActiveCell
+//      per region into active_queue[level=0] with
+//      `octree_offset = region.octree_block_offset` and sets
+//      `active_count[0] = topology_dirty_count`.
+//   3. CPU resets per-region counters: octree=1, brick=0, leaf_attr=0,
+//      fill_task=0 (per topology-dirty region; fill-only regions
+//      preserve their cached fill-task extent and reset only
+//      brick/leaf_attr).
+//   4. For L in 0..=max_depth: dispatch `classify_main` over
+//      active_queue[L]. Each thread samples host_sample_at, classifies
+//      the cell, and:
+//        - EMPTY → write OCTREE_EMPTY, done.
+//        - INTERIOR → write OCTREE_EMPTY (transient regions don't carry
+//          host material; rendering INTERIOR as a solid block is wrong).
+//        - L < max_depth and MIXED → atomicAdd 8 from the region's
+//          octree block, write self as a branch, push children to L+1.
+//        - L == max_depth and MIXED → atomicAdd 1 from the region's
+//          fill-task block, write a BrickFillTask there. Pre-write
+//          OCTREE_EMPTY at the cell (fill decides whether to allocate
+//          a brick via V12 deferred allocation).
+//   5. Dispatch `brick_fill_main` per fill-dirty region. Workgroup
+//      `(task_idx, region_idx)` reads
+//      `fill_task_pool[region.fill_task_block_offset + task_idx]`.
+//      Sentinel slots early-out. Workgroup-cooperative deferred
+//      allocation: one brick from the region's brick block iff at
+//      least one cell emits.
 //
-// Region uniforms live in a storage<read> array indexed by
-// cell.region_index, so a single classify dispatch can process active
-// cells from many regions interleaved.
+// Overflow handling: when an allocator atomicAdd would exceed the
+// region's block capacity, the offending node degrades to OCTREE_EMPTY
+// and increments a global counter in the `overflow` binding (CPU reads
+// asynchronously and logs).
 //
 // Compose contract preserved: the Rust composer splices the user
 // shader's `dispatch_user_generate` body between the BEGIN/END
@@ -124,15 +142,6 @@ struct RegionUniform {
     cell_size: f32,
     aabb_max: vec3<f32>,
     shader_id: u32,
-    // Per-region pool slices in the scene's flat pools. *Capacity*
-    // values are element counts (vec2<u32> for octree, u32 for
-    // brick_pool, LeafAttr for leaf_attr_pool, brick for brick alloc).
-    octree_offset: u32,
-    octree_capacity: u32,
-    brick_offset: u32,
-    brick_capacity: u32,
-    leaf_attr_offset: u32,
-    leaf_attr_capacity: u32,
     max_depth: u32,
     time: f32,
     material_id: u32,
@@ -140,38 +149,69 @@ struct RegionUniform {
     host_octree_root: u32,
     host_octree_depth: u32,
     host_octree_extent: f32,
-    // Implicit padding here: WGSL aligns vec3 to 16, so naga inserts
-    // 12 bytes between host_octree_extent (offset 84) and
-    // host_grid_origin (offset 96). The Rust struct has explicit
-    // [u32; 3] padding to match.
+    // Per-region pool block offsets and sizes. *Offsets* are absolute
+    // GPU-buffer indices in pool-native units (octree nodes /
+    // BRICKS / LeafAttr slots / FillTask slots). *Sizes* are counts
+    // in those same units — the bucket allocator ensures they are
+    // powers of 2.
+    octree_block_offset: u32,
+    octree_block_size: u32,
+    brick_block_offset: u32,
+    brick_block_size: u32,
+    leaf_attr_block_offset: u32,
+    leaf_attr_block_size: u32,
+    fill_task_block_offset: u32,
+    fill_task_block_size: u32,
+    // Pad so host_grid_origin (vec3, 16-byte aligned) lands at the
+    // next 16-aligned offset.
+    _pad_host: u32,
     host_grid_origin: vec3<f32>,
-    // Implicit padding: vec4 at offset 112 → 4 bytes after vec3.
+    // Pad so params (vec4) lands at next 16-aligned offset.
+    _pad_grid: f32,
     params: array<vec4<f32>, 2>,
     host_inverse_world: mat4x4<f32>,
 }
 
-// Per-dispatch state — written by the host once per classify call. The
-// classify pipeline is reused across levels by re-uploading this uniform
-// before each dispatch.
+// Per-dispatch state — written by the host once per classify call.
 struct LevelUniform {
     current_level: u32,
     per_level_cap: u32,
-    // Used by classify threads as a Lipschitz lower bound on the descent
-    // depth — so we never recurse past the caller's reserved capacity.
     max_active_per_level: u32,
     _pad: u32,
 }
 
+// Overflow counter slots. Must match `OverflowSlot` on the Rust side.
+const OVERFLOW_OCTREE: u32 = 0u;
+const OVERFLOW_BRICK: u32 = 1u;
+const OVERFLOW_LEAF_ATTR: u32 = 2u;
+const OVERFLOW_FILL_QUEUE: u32 = 3u;
+// Per-level active-queue overflow lives at OVERFLOW_ACTIVE_QUEUE_BASE + L
+// for L in [0, MAX_DEPTH].
+const OVERFLOW_ACTIVE_QUEUE_BASE: u32 = 4u;
+
+// Sentinel value stored in unused fill_task_pool slots so fill_main
+// can early-out without needing to know the per-region count. CPU
+// pre-fills topology-dirty regions' extents with this before classify.
+const FILL_TASK_SENTINEL: u32 = 0xFFFFFFFEu;
+
 @group(0) @binding(0) var<storage, read_write> octree_nodes: array<vec2<u32>>;
 @group(0) @binding(1) var<storage, read_write> brick_pool: array<u32>;
 @group(0) @binding(2) var<storage, read_write> leaf_attr_pool: array<LeafAttr>;
+// Per-region atomic counters — array length = MAX_REGIONS on Rust side.
 @group(0) @binding(3) var<storage, read_write> octree_alloc: array<atomic<u32>>;
 @group(0) @binding(4) var<storage, read_write> brick_alloc: array<atomic<u32>>;
 @group(0) @binding(5) var<storage, read_write> leaf_attr_alloc: array<atomic<u32>>;
 @group(0) @binding(6) var<storage, read_write> active_queue: array<ActiveCell>;
 @group(0) @binding(7) var<storage, read_write> active_count: array<atomic<u32>>;
-@group(0) @binding(8) var<storage, read_write> fill_queue: array<BrickFillTask>;
-@group(0) @binding(9) var<storage, read_write> fill_count: array<atomic<u32>>;
+// Persistent fill-task pool — owned entirely by the user-shader pass.
+// Each region writes/reads from its own block within this buffer.
+@group(0) @binding(8) var<storage, read_write> fill_task_pool: array<BrickFillTask>;
+// Per-region count of fill tasks emitted by classify into the region's
+// fill_task block. Used by classify (atomicAdd to claim a slot) and
+// by fill (read to bound iteration; sentinel-checking is the primary
+// guard).
+@group(0) @binding(9) var<storage, read_write> fill_task_alloc: array<atomic<u32>>;
+@group(0) @binding(10) var<storage, read_write> overflow: array<atomic<u32>>;
 
 @group(1) @binding(0) var<storage, read> regions: array<RegionUniform>;
 
@@ -605,8 +645,8 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // pass computes the real offset from its atomically-claimed
         // slot, not from this stored value.
         octree_nodes[cell.octree_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
-        let fill_slot = atomicAdd(&fill_count[0], 1u);
-        if (fill_slot < arrayLength(&fill_queue)) {
+        let fill_slot = atomicAdd(&fill_task_alloc[cell.region_index], 1u);
+        if (fill_slot < cur_region.fill_task_block_size) {
             var task: BrickFillTask;
             task.octree_offset = cell.octree_offset;
             task.region_index = cell.region_index;
@@ -616,21 +656,25 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             task.min_y = center.y - half;
             task.min_z = center.z - half;
             task._pad = 0u;
-            fill_queue[fill_slot] = task;
+            fill_task_pool[cur_region.fill_task_block_offset + fill_slot] = task;
+        } else {
+            atomicAdd(&overflow[OVERFLOW_FILL_QUEUE], 1u);
         }
         return;
     }
 
-    // Internal level — alloc 8 children, write self as branch.
-    let child_base = atomicAdd(&octree_alloc[cell.region_index], 8u);
-    if (child_base + 8u > cur_region.octree_capacity) {
-        // Pool overflow — degrade to EMPTY at this node. The 8 child
-        // slots we (would have) allocated are past capacity so nothing
-        // reads them.
+    // Internal level — alloc 8 children from THIS REGION's octree
+    // block. Per-region atomic preserves locality (region's children
+    // are contiguous in the pool) and eliminates global atomic
+    // contention.
+    let child_slot = atomicAdd(&octree_alloc[cell.region_index], 8u);
+    if (child_slot + 8u > cur_region.octree_block_size) {
+        atomicAdd(&overflow[OVERFLOW_OCTREE], 1u);
         octree_nodes[cell.octree_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
         return;
     }
-    let first_child = cur_region.octree_offset + child_base;
+    // Compose the absolute pool offset.
+    let first_child = cur_region.octree_block_offset + child_slot;
     octree_nodes[cell.octree_offset] = vec2<u32>(first_child, INTERNAL_ATTR_NONE);
     let child_half = half * 0.5;
 
@@ -675,8 +719,8 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // task. Fill decides whether to allocate based on
             // workgroup-cooperative occupancy vote.
             octree_nodes[child_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
-            let fill_slot = atomicAdd(&fill_count[0], 1u);
-            if (fill_slot < arrayLength(&fill_queue)) {
+            let fill_slot = atomicAdd(&fill_task_alloc[cell.region_index], 1u);
+            if (fill_slot < cur_region.fill_task_block_size) {
                 var task: BrickFillTask;
                 task.octree_offset = child_offset;
                 task.region_index = cell.region_index;
@@ -686,7 +730,9 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 task.min_y = child_center.y - child_half;
                 task.min_z = child_center.z - child_half;
                 task._pad = 0u;
-                fill_queue[fill_slot] = task;
+                fill_task_pool[cur_region.fill_task_block_offset + fill_slot] = task;
+            } else {
+                atomicAdd(&overflow[OVERFLOW_FILL_QUEUE], 1u);
             }
         }
         return;
@@ -698,6 +744,7 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Next-level queue overflow. Children are allocated in
         // octree_nodes but we won't classify them; pre-stamp them as
         // EMPTY so the march doesn't read uninitialised pointers.
+        atomicAdd(&overflow[OVERFLOW_ACTIVE_QUEUE_BASE + L + 1u], 1u);
         for (var k: u32 = 0u; k < 8u; k = k + 1u) {
             octree_nodes[first_child + k] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
         }
@@ -723,31 +770,51 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
-// Brick fill — workgroup_size 4³, one workgroup per fill task. The
-// host dispatches over a 2D grid `(FILL_TILE_X, ceil(cap/TILE), 1)`
-// because wgpu caps each workgroup-dimension at 65535; we re-pack
-// `(wid.x, wid.y) → task_idx`. Workgroups past `fill_count` early-out
-// (same per-thread-cap pattern as classify).
-const FILL_TILE_X: u32 = 65535u;
+// Brick fill — workgroup_size 4³, one workgroup per fill task. Host
+// dispatches with `dispatch_workgroups(max_block_size, fill_dirty_count, 1)`:
+//   wid.x = task index within the region's fill_task_block.
+//   wid.y = region index in this frame's regions array (the
+//           fill-dirty subset is at indices [0, fill_dirty_count)).
+//
+// Workgroups past the region's actual emitted task count (or that
+// hit a sentinel slot, or whose task_idx exceeds fill_task_block_size)
+// early-out before doing any brick allocation.
 @compute @workgroup_size(4, 4, 4)
 fn brick_fill_main(@builtin(local_invocation_id) lid: vec3<u32>,
                    @builtin(workgroup_id) wid: vec3<u32>) {
-    let task_idx = wid.y * FILL_TILE_X + wid.x;
-    let count = atomicLoad(&fill_count[0]);
-    if (task_idx >= count) {
+    let region_idx = wid.y;
+    let task_idx_in_region = wid.x;
+
+    // Per-thread copy of region (cheap; common subexpression).
+    let cur_region = regions[region_idx];
+    if (task_idx_in_region >= cur_region.fill_task_block_size) {
         return;
     }
+
+    let task_global_offset = cur_region.fill_task_block_offset + task_idx_in_region;
+    let task = fill_task_pool[task_global_offset];
+    if (task.octree_offset == FILL_TASK_SENTINEL) {
+        // Unused slot in the region's fill_task_block.
+        return;
+    }
+
     let cell_idx = lid.z * BRICK_DIM * BRICK_DIM + lid.y * BRICK_DIM + lid.x;
-    let task = fill_queue[task_idx];
 
     if (cell_idx == 0u) {
-        // Populate the workgroup-shared region. After the barrier
-        // every thread (and any user code called from
-        // `dispatch_user_generate`) reads `region.X` directly.
-        region = regions[task.region_index];
+        region = regions[region_idx];
         atomicStore(&wg_any_emit, 0u);
         atomicStore(&wg_alloc_failed, 0u);
         wg_brick_offset = 0u;
+        // Pre-write OCTREE_EMPTY. If a cell emits, thread 0 below
+        // overwrites with a brick reference; otherwise the slot
+        // stays EMPTY. Required for fill-only re-bakes (cached
+        // topology, dirty fill — e.g. shader-param slider moves):
+        // classify did NOT run this frame, so the octree node
+        // still holds the prior bake's brick reference. Without
+        // this pre-write, a region whose new shader output emits
+        // fewer cells leaves stale brick references behind, and
+        // the march reads old grass.
+        octree_nodes[task.octree_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
     }
     workgroupBarrier();
 
@@ -788,13 +855,15 @@ fn brick_fill_main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     if (cell_idx == 0u) {
         if (atomicLoad(&wg_any_emit) != 0u) {
-            // At least one cell wants to emit — claim a brick slot.
-            let brick_slot = atomicAdd(&brick_alloc[task.region_index], 1u);
-            if (brick_slot >= region.brick_capacity) {
+            // At least one cell wants to emit — claim a brick slot
+            // from THIS REGION's brick block.
+            let brick_slot = atomicAdd(&brick_alloc[region_idx], 1u);
+            if (brick_slot >= region.brick_block_size) {
+                atomicAdd(&overflow[OVERFLOW_BRICK], 1u);
                 atomicStore(&wg_alloc_failed, 1u);
             } else {
-                wg_brick_offset = region.brick_offset + brick_slot * BRICK_CELLS;
-                let brick_id = (region.brick_offset / BRICK_CELLS) + brick_slot;
+                let brick_id = region.brick_block_offset + brick_slot;
+                wg_brick_offset = brick_id * BRICK_CELLS;
                 octree_nodes[task.octree_offset] = vec2<u32>(
                     OCTREE_LEAF_BIT | OCTREE_BRICK_BIT | brick_id,
                     INTERNAL_ATTR_NONE,
@@ -819,12 +888,13 @@ fn brick_fill_main(@builtin(local_invocation_id) lid: vec3<u32>,
         brick_pool[brick_slot_idx] = BRICK_CELL_EMPTY;
         return;
     }
-    let local_id = atomicAdd(&leaf_attr_alloc[task.region_index], 1u);
-    if (local_id >= region.leaf_attr_capacity) {
+    let local_id = atomicAdd(&leaf_attr_alloc[region_idx], 1u);
+    if (local_id >= region.leaf_attr_block_size) {
+        atomicAdd(&overflow[OVERFLOW_LEAF_ATTR], 1u);
         brick_pool[brick_slot_idx] = BRICK_CELL_EMPTY;
         return;
     }
-    let global_slot = region.leaf_attr_offset + local_id;
+    let global_slot = region.leaf_attr_block_offset + local_id;
     var attr: LeafAttr;
     attr.normal_oct = pack_oct(emit.normal);
     let pri = emit.material_primary & 0xFFFFu;
