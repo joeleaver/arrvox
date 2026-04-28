@@ -151,10 +151,12 @@ pub const MAX_DEPTH: u32 = 8;
 const PER_LEVEL_QUEUE_CAP: u32 = 1048576;
 
 /// Total brick fill tasks the queue holds across all regions in one
-/// frame. With V12 deferred allocation, ALL classify-admitted bricks
-/// queue fills (only those with emits actually allocate); the queue
-/// must hold the admit set, not the alloc set.
-const FILL_QUEUE_CAP: u32 = 2097152;
+/// frame. With V12 deferred allocation + V13 inline brick-parent
+/// classification at L=max_depth-1, ALL admitted brick-parent cells
+/// queue fills directly — no L=max_depth active queue. For 256
+/// tiles × ~2 K L=4 cells × ~half-pass-proximity = ~4 M fill tasks.
+/// 4 M × 32 B = 128 MB.
+const FILL_QUEUE_CAP: u32 = 4194304;
 
 /// Workgroup size for `classify_main`. Determines how many workgroups
 /// we dispatch per level: `PER_LEVEL_QUEUE_CAP / CLASSIFY_WG_SIZE`

@@ -632,8 +632,67 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let first_child = cur_region.octree_offset + child_base;
     octree_nodes[cell.octree_offset] = vec2<u32>(first_child, INTERNAL_ATTR_NONE);
-
     let child_half = half * 0.5;
+
+    // V13 — when the next level IS the brick-parent level, process
+    // those 8 children INLINE rather than queuing them. The deepest
+    // BFS level is otherwise the dominant queue consumer (tiles ×
+    // band_layers × surface_bricks_per_axis² cells); by collapsing
+    // it into the second-to-last level we cut active-queue memory
+    // by ~8× without needing a 4×-larger queue cap. Each child
+    // gets its own proximity check + (deferred) fill task; no
+    // `active_queue[L+1]` write happens.
+    if (L + 1u == cur_region.max_depth) {
+        let child_diag_half = child_half * SQRT3;
+        let band = cur_region.region_thickness;
+        for (var k: u32 = 0u; k < 8u; k = k + 1u) {
+            let cx = (k & 1u);
+            let cy = (k >> 1u) & 1u;
+            let cz = (k >> 2u) & 1u;
+            let off_x = select(-child_half, child_half, cx == 1u);
+            let off_y = select(-child_half, child_half, cy == 1u);
+            let off_z = select(-child_half, child_half, cz == 1u);
+            let child_center = vec3<f32>(
+                center.x + off_x,
+                center.y + off_y,
+                center.z + off_z,
+            );
+            let child_offset = first_child + k;
+
+            // Brick-parent classification, inline:
+            if (cur_region.host_octree_root != HOST_NO_HOST_SENTINEL) {
+                let child_host = host_sample_in_region(child_center, cell.region_index);
+                if (child_host.distance > child_diag_half + band) {
+                    octree_nodes[child_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
+                    continue;
+                }
+                if (child_host.distance < -child_diag_half) {
+                    octree_nodes[child_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
+                    continue;
+                }
+            }
+            // V12 deferred allocation — pre-write EMPTY, queue fill
+            // task. Fill decides whether to allocate based on
+            // workgroup-cooperative occupancy vote.
+            octree_nodes[child_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
+            let fill_slot = atomicAdd(&fill_count[0], 1u);
+            if (fill_slot < arrayLength(&fill_queue)) {
+                var task: BrickFillTask;
+                task.octree_offset = child_offset;
+                task.region_index = cell.region_index;
+                task.brick_offset = 0xFFFFFFFFu;
+                task.cell_size = cur_region.cell_size;
+                task.min_x = child_center.x - child_half;
+                task.min_y = child_center.y - child_half;
+                task.min_z = child_center.z - child_half;
+                task._pad = 0u;
+                fill_queue[fill_slot] = task;
+            }
+        }
+        return;
+    }
+
+    // Normal internal level — push children to L+1 queue.
     let next_count = atomicAdd(&active_count[L + 1u], 8u);
     if (next_count + 8u > cap) {
         // Next-level queue overflow. Children are allocated in

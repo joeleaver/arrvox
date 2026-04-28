@@ -221,15 +221,16 @@ fn user_ball_generate(cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx)
     let active_counts: Vec<u32> = (0..9)
         .map(|i| u32::from_le_bytes(bytes[48 + i * 4..52 + i * 4].try_into().unwrap()))
         .collect();
-    // Sanity: BFS expansion at depth=3 should be 1 → 8 → 64 → 512.
-    // V12 deferred-allocation semantics:
+    // Sanity: BFS expansion at depth=3 with V13 inline brick-parent
+    // classification at L=max_depth-1 = 2:
+    //   * active[0..3] = [1, 8, 64], active[3] = 0 (L=max_depth queue
+    //     is no longer used — L=2 inlines its 8×64=512 brick-parent
+    //     children directly into fill tasks).
     //   * fill_count: 512 (all 512 brick-parent cells queue fills).
-    //   * brick_alloc: ≤ 512 (only bricks where ≥1 cell emits).
-    //     For the ball shader in a unit cube, bricks fully outside
-    //     the sphere have all-empty cells and no longer consume a
-    //     slot. brick_alloc < fill_count is the correctness signal
-    //     for deferred allocation.
-    assert_eq!(active_counts[..4], [1, 8, 64, 512]);
+    //   * brick_alloc: ≤ 512 (V12 deferred — only bricks where ≥1
+    //     cell emits get a slot; bricks outside the sphere don't).
+    assert_eq!(active_counts[..3], [1, 8, 64]);
+    assert_eq!(active_counts[3], 0);
     assert_eq!(fill_count, 512);
     assert!(
         brick_alloc < fill_count && brick_alloc > 0,
