@@ -173,6 +173,15 @@ impl TileIndex {
             .count()
     }
 
+    /// Iterate `((host_object_id, material_id), bucket)` pairs.
+    /// Order is HashMap-arbitrary — callers that need determinism (the
+    /// GPU flatten in [`crate::instance_tile_index_gpu`]) sort by key.
+    pub fn buckets(
+        &self,
+    ) -> impl Iterator<Item = ((u32, u32), &PerMaterialTileMap)> + '_ {
+        self.by_material.iter().map(|(k, v)| (*k, v))
+    }
+
     /// Look up exactly the tile at `tile_coord` for the given
     /// `(host, material)`. `None` if no region was registered there.
     pub fn region_at(

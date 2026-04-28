@@ -87,6 +87,15 @@ pub mod user_shader_emit_pass;
 /// Built per frame from the emit pass's cached regions; consumed by
 /// the march to look up "which regions overlap this ray's tile."
 pub mod instance_tile_index;
+/// Option B Stage 5a — flat GPU layout for the per-frame [`TileIndex`].
+/// Walks the CPU index and emits a sorted `Vec<GpuTileIndexEntry>` the
+/// march can bind directly as a storage buffer.
+pub mod instance_tile_index_gpu;
+/// Option B Stage 5a — WGSL helper library for the instance march.
+/// Owns three pure WGSL functions (ray-AABB, world→local, prototype
+/// octree descent) plus a test pipeline that exercises each one in
+/// isolation against a real GPU.
+pub mod user_shader_instance_march;
 /// Skeletal skin-deform scatter pass — per-frame bone-field writer.
 pub mod skin_deform;
 /// CPU-side paint writes against the scene's LeafAttrPool (material +
