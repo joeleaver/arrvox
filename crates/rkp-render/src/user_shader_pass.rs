@@ -997,8 +997,17 @@ impl UserShaderPass {
     }
 
     /// Encode the BFS dispatch chain. `region_uniforms[i]` must align
-    /// with the i'th initial cell's `region_index`. `initial_cells` is
-    /// the level-0 active queue contents — one entry per dirty region.
+    /// with the i'th initial cell's `region_index`.
+    ///
+    /// Scene buffer refs + `buffers_epoch` are passed in (rather than
+    /// requiring a prior `ensure_group0` call) because
+    /// `ensure_capacity` below may invalidate group 0 when the
+    /// per-region counter buffers grow — we need to (re)build group
+    /// 0 *after* that grow so the dispatch sees current bindings.
+    /// Calling `ensure_group0` externally beforehand isn't enough:
+    /// growing the counter buffers nulls it out and the dispatch
+    /// silently no-ops with "group 0 not bound".
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_regions(
         &mut self,
         device: &wgpu::Device,
@@ -1006,12 +1015,26 @@ impl UserShaderPass {
         encoder: &mut wgpu::CommandEncoder,
         region_uniforms: &[RegionUniform],
         max_max_depth: u32,
+        octree_nodes_buffer: &wgpu::Buffer,
+        brick_pool_buffer: &wgpu::Buffer,
+        leaf_attr_pool_buffer: &wgpu::Buffer,
+        buffers_epoch: u64,
     ) {
         if region_uniforms.is_empty() {
             return;
         }
         let region_count = region_uniforms.len();
+        // Order matters: grow internal counter buffers FIRST (may
+        // null group 0), then ensure group 0 (rebuilds against
+        // current scene + counter buffers).
         self.ensure_capacity(device, region_count);
+        self.ensure_group0(
+            device,
+            octree_nodes_buffer,
+            brick_pool_buffer,
+            leaf_attr_pool_buffer,
+            buffers_epoch,
+        );
 
         // Counter resets + seeds. All `queue.write_buffer` calls
         // serialize on the queue and execute BEFORE the encoder's

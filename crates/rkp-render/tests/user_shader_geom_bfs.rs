@@ -139,13 +139,6 @@ fn user_ball_generate(cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx)
 
     let mut pass = UserShaderPass::new(&device);
     pass.reload_user_shaders(&device, &composed.generate, registry.source_hash());
-    pass.ensure_group0(
-        &device,
-        &octree_nodes_buffer,
-        &brick_pool_buffer,
-        &leaf_attr_pool_buffer,
-        0,
-    );
 
     let mut cache = UserShaderObjectCache::new();
     cache.set_pool_bases(
@@ -188,7 +181,10 @@ fn user_ball_generate(cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx)
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("test bfs encoder"),
     });
-    pass.dispatch_regions(&device, &queue, &mut encoder, &[uniform], MAX_DEPTH);
+    pass.dispatch_regions(
+        &device, &queue, &mut encoder, &[uniform], MAX_DEPTH,
+        &octree_nodes_buffer, &brick_pool_buffer, &leaf_attr_pool_buffer, 0,
+    );
 
     // Read back diagnostic counters: leaf_attr_alloc[0] (occupied
     // cells), brick_alloc[0] (allocated bricks), fill_count[0] (queued
@@ -288,8 +284,19 @@ fn empty_registry_dispatch_no_op() {
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("test empty bfs encoder"),
     });
-    // Empty uniforms — should bail out before any GPU work.
-    pass.dispatch_regions(&device, &queue, &mut encoder, &[], 0);
+    // Tiny dummy buffers — dispatch_regions returns on empty
+    // uniforms before touching them, but the API still requires
+    // them for the post-capacity-grow ensure_group0 path.
+    let dummy = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dummy"),
+        size: 16,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    pass.dispatch_regions(
+        &device, &queue, &mut encoder, &[], 0,
+        &dummy, &dummy, &dummy, 0,
+    );
     queue.submit(Some(encoder.finish()));
     device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
 }

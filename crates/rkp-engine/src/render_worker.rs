@@ -1612,26 +1612,25 @@ fn run_user_shader_geom(
         uniforms.push(build_region_uniform(req, &slot, shader_id, time_seconds));
     }
 
-    state.user_shader_pass.ensure_group0(
-        &state.device,
-        &state.renderer.scene.octree_nodes_buffer,
-        &state.renderer.scene.brick_pool_buffer,
-        &state.renderer.scene.leaf_attr_pool_buffer,
-        state.renderer.scene.buffers_epoch(),
-    );
-
     if !uniforms.is_empty() {
         let mut encoder = state
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("user_shader_geom_encoder"),
             });
+        // dispatch_regions handles ensure_capacity + ensure_group0
+        // internally so the right ordering happens (capacity grow
+        // can invalidate group 0; we need to ensure group 0 AFTER).
         state.user_shader_pass.dispatch_regions(
             &state.device,
             &state.queue,
             &mut encoder,
             &uniforms,
             max_max_depth,
+            &state.renderer.scene.octree_nodes_buffer,
+            &state.renderer.scene.brick_pool_buffer,
+            &state.renderer.scene.leaf_attr_pool_buffer,
+            state.renderer.scene.buffers_epoch(),
         );
         state.queue.submit(Some(encoder.finish()));
     }
