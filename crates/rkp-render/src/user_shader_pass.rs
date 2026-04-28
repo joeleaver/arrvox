@@ -138,18 +138,23 @@ pub const MAX_DEPTH: u32 = 8;
 /// multiplexed across all regions processed in one frame. Multiplied
 /// by `MAX_DEPTH+1` for the global queue buffer.
 ///
-/// V10 raises this from 65K → 256K because tiled paints can emit
-/// hundreds of regions, each contributing thousands of cells at the
-/// deepest levels. Total queue storage:
-/// `(MAX_DEPTH+1) × PER_LEVEL_QUEUE_CAP × sizeof(ActiveCell)` =
-/// 9 × 256K × 32 B ≈ 72 MB. Per-level overflow degrades to
-/// `OCTREE_EMPTY` at the offending parent's child slot.
-const PER_LEVEL_QUEUE_CAP: u32 = 262144;
+/// V12: 1 M cells per level. Hundreds of tiled paint regions
+/// (e.g., a 20×20 m hillside at @tile_size 1.0) produce ~1 M cells
+/// at the deepest BFS level — proximity gate filters by surface
+/// distance but not by material match (that happens at brick
+/// parent only). Queue overflow at this scale silently drops
+/// cells → bricks never queued → flicker as the dropped subset
+/// shifts each frame under @animated.
+///
+/// Total queue storage: 9 × 1 M × 32 B = 288 MB. Heavy but
+/// allocated once at startup and reused per frame.
+const PER_LEVEL_QUEUE_CAP: u32 = 1048576;
 
 /// Total brick fill tasks the queue holds across all regions in one
-/// frame. Sized for ~512 regions × 1K bricks each = 512 K fill
-/// tasks worst case.
-const FILL_QUEUE_CAP: u32 = 524288;
+/// frame. With V12 deferred allocation, ALL classify-admitted bricks
+/// queue fills (only those with emits actually allocate); the queue
+/// must hold the admit set, not the alloc set.
+const FILL_QUEUE_CAP: u32 = 2097152;
 
 /// Workgroup size for `classify_main`. Determines how many workgroups
 /// we dispatch per level: `PER_LEVEL_QUEUE_CAP / CLASSIFY_WG_SIZE`
