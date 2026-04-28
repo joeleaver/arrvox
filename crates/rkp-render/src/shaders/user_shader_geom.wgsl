@@ -559,39 +559,34 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // down -Y from the brick center, find the surface, read the
         // material — but cheaply, with one host_sample at an
         // estimated surface point rather than an iterative trace.
-        if (cur_region.host_octree_root != HOST_NO_HOST_SENTINEL
-            && cur_region.material_id != 0u) {
-            // Cheap material gate — skip the entire brick if its
-            // projected surface point isn't painted with this
-            // region's material. Saves the fill dispatch entirely
-            // for "above unpainted host" bricks.
-            //
-            // The push amount must be a fraction of the HOST's
-            // voxel size, not our transient brick's cell_size.
-            // Pushing 2× our cell_size (typically 60mm+) lands
-            // deep inside the host body — past the surface leaf,
-            // into interior fill which doesn't carry the painted
-            // material. That mis-rejected most blade bricks. Half
-            // a host voxel is just enough to land inside the
-            // surface leaf.
-            let host_vs = cur_region.host_octree_extent
-                / (4.0 * f32(1u << cur_region.host_octree_depth));
-            let push = max(host_vs * 0.5, 1e-4);
-            let surface_probe = vec3<f32>(
-                center.x,
-                center.y - host.distance - push,
-                center.z,
-            );
-            let surface = host_sample_in_region(surface_probe, cell.region_index);
-            let pri_match = surface.material == cur_region.material_id
-                && surface.material != 0u;
-            let sec_match = surface.material_secondary == cur_region.material_id
-                && surface.blend_weight > 0u;
-            if (!pri_match && !sec_match) {
-                octree_nodes[cell.octree_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
-                return;
-            }
-        }
+        // No early material-match check. An earlier revision tried
+        // to skip bricks whose projected surface point wasn't
+        // painted with the region's material — but the projection
+        // relied on `host.distance` (a Lipschitz LOWER BOUND on
+        // distance to the surface, not the actual height-above).
+        // For cells in coalesced empty octree regions the distance
+        // can be tiny (distance to the nearest empty-cell face,
+        // typically a side face) while the actual height to the
+        // surface is much larger. The projected probe then landed
+        // in air above the surface, read material=0, and rejected
+        // every blade brick.
+        //
+        // Sphere-tracing to recover the actual surface point would
+        // cost 5-15 host_samples per brick-parent cell. For
+        // hundreds of tiled regions × thousands of cells per tile
+        // that's millions of extra samples per frame — too
+        // expensive for the gain.
+        //
+        // V12 deferred allocation makes this check unnecessary for
+        // correctness: bricks whose 64 cells all return
+        // occupancy=0 from the user shader never consume a slot,
+        // and the user shader's own logic (e.g. grass's
+        // sphere-trace down to find painted surface) does the
+        // material match cell-by-cell in the fill pass. The cost
+        // we're paying is dispatching `brick_fill_main` for
+        // bricks that would have been pre-rejected — bounded by
+        // the proximity gate at all higher levels, so it's not
+        // unbounded.
 
         // V12 — DEFERRED BRICK ALLOCATION. Don't allocate a brick
         // here. Just queue the fill task and pre-write OCTREE_EMPTY;
