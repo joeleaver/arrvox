@@ -213,12 +213,13 @@ pub(crate) struct EngineState {
 
     /// Per-entity painted-material info, cached on
     /// `(paint_epoch, geometry_epoch)`. Outer key is the entity's
-    /// scene `object_id`; inner map is `material_id → object-local
-    /// AABB of leaves with that material`. The shader-region request
-    /// uses the AABB to size the geom dispatch tightly so grass /
-    /// fur etc. only renders where actually painted.
+    /// scene `object_id`; inner map is `material_id → (object-local
+    /// AABB of painted leaves, count of painted leaves)`. The AABB
+    /// sizes the geom dispatch tightly so grass / fur only renders
+    /// where actually painted; the count drives V9's per-region pool
+    /// sizing (sparse BFS scales with surface area).
     pub(crate) painted_materials:
-        std::collections::HashMap<u32, std::collections::HashMap<u16, rkp_core::Aabb>>,
+        std::collections::HashMap<u32, std::collections::HashMap<u16, (rkp_core::Aabb, u32)>>,
     /// Epochs the cache was last reconciled against. When either
     /// moves ahead, we invalidate and re-scan affected entities.
     pub(crate) painted_materials_paint_epoch: u64,

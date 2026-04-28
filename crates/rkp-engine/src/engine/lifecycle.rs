@@ -143,7 +143,7 @@ impl EngineState {
                     // elephant.
                     let mut mat_aabbs: std::collections::HashMap<
                         u16,
-                        rkp_core::Aabb,
+                        (rkp_core::Aabb, u32),
                     > = std::collections::HashMap::new();
                     scan_painted_aabbs(
                         octree_data,
@@ -175,7 +175,8 @@ impl EngineState {
         if !shader_materials.is_empty() {
             for obj in self.gpu_objects.iter() {
                 let Some(mat_aabbs) = self.painted_materials.get(&obj.object_id) else { continue; };
-                for (&mat_id, local_aabb) in mat_aabbs.iter() {
+                for (&mat_id, (local_aabb, painted_leaf_count)) in mat_aabbs.iter() {
+                    let painted_leaf_count = *painted_leaf_count;
                     let Some(def) = self.material_lib.get_def(mat_id) else { continue; };
                     let Some(info) = shader_materials.get(&mat_id) else { continue; };
                 // Pack params in the shader's declared order.
@@ -221,24 +222,41 @@ impl EngineState {
                         world_max[i] = world_max[i].max(p[i]);
                     }
                 }
-                // Octree depth: shader's `@octree_depth` if set, else
-                // engine default (2). Capped at 6 since deeper dense
-                // bricks blow out the pool budget; sparse BFS lifts
-                // this in V5.
-                const DEFAULT_DEPTH: u32 = 2;
-                const MAX_DEPTH: u32 = 6;
-                let octree_depth = info
-                    .octree_depth
-                    .unwrap_or(DEFAULT_DEPTH)
-                    .min(MAX_DEPTH);
-                // Cells per axis = 4 * 2^depth.
-                let cells_per_axis = 4u32 << octree_depth;
+                // V9 sparse BFS — depth is derived from the shader's
+                // `@cell_size` target plus a `@max_depth` ceiling
+                // (default 8, hard cap 8 = WGSL `MAX_DEPTH`). With
+                // surface-area-scaling bricks, depth=8 is affordable
+                // for typical paint clusters.
+                const HARD_DEPTH_CEIL: u32 = rkp_render::user_shader_pass::MAX_DEPTH;
+                const DEFAULT_MAX_DEPTH: u32 = 8;
+                let max_depth_cap = info
+                    .max_depth
+                    .unwrap_or(DEFAULT_MAX_DEPTH)
+                    .min(HARD_DEPTH_CEIL);
                 let extent = (world_max[0] - world_min[0])
                     .max(world_max[1] - world_min[1])
                     .max(world_max[2] - world_min[2]);
-                let cell_size = info
-                    .cell_size
-                    .unwrap_or((extent / cells_per_axis as f32).max(1e-3));
+                // Default target cell size — host's voxel size when
+                // the shader doesn't pin one. host_octree_extent /
+                // (BRICK_DIM * 2^host_octree_depth) ≈ host voxel.
+                let host_extent = f32::from_bits(obj.octree_extent_bits);
+                let host_voxel_size = if obj.octree_depth > 0 {
+                    host_extent / (4.0 * (1u32 << obj.octree_depth) as f32)
+                } else {
+                    extent / 64.0
+                };
+                let target_cell_size = info.cell_size.unwrap_or(host_voxel_size).max(1e-4);
+                // Solve `extent / (cell_size * 4) = 2^depth` →
+                // `depth = ceil(log2(extent / (4 * cell_size)))`.
+                let cells_per_axis_target = (extent / target_cell_size).max(1.0);
+                let bricks_per_axis_target = (cells_per_axis_target / 4.0).max(1.0);
+                let derived_depth = (bricks_per_axis_target.log2().ceil() as u32).max(0);
+                let max_depth = derived_depth.min(max_depth_cap);
+                // Re-snap cell_size so the deepest level matches the
+                // chosen depth exactly (avoids transient cubes that
+                // overshoot or undershoot the target by an arbitrary
+                // factor).
+                let cell_size = (extent / (4.0 * (1u32 << max_depth) as f32)).max(1e-4);
                 // Input hash folds material slot + object id +
                 // transform-relevant bits; the cache also folds source
                 // hash and geometry epoch on top, so changes the
@@ -311,7 +329,8 @@ impl EngineState {
                     input_hash,
                     animated: info.animated,
                     region_thickness: info.region_thickness,
-                    octree_depth,
+                    max_depth,
+                    painted_leaf_count,
                     host_octree_root,
                     host_octree_depth: obj.octree_depth,
                     host_octree_extent,
@@ -983,7 +1002,7 @@ fn scan_painted_aabbs(
     grid_origin: glam::Vec3,
     base_voxel_size: f32,
     shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
-    out: &mut std::collections::HashMap<u16, rkp_core::Aabb>,
+    out: &mut std::collections::HashMap<u16, (rkp_core::Aabb, u32)>,
 ) {
     use rkp_core::sparse_octree::{
         is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE,
@@ -991,13 +1010,22 @@ fn scan_painted_aabbs(
     use rkp_core::brick_pool::{BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR};
     const BRICK_CELL_EMPTY: u32 = 0xFFFF_FFFFu32;
 
-    fn expand_aabb(out: &mut std::collections::HashMap<u16, rkp_core::Aabb>, mat: u16, mn: glam::Vec3, mx: glam::Vec3) {
-        let entry = out.entry(mat).or_insert(rkp_core::Aabb {
-            min: glam::Vec3::splat(f32::INFINITY),
-            max: glam::Vec3::splat(f32::NEG_INFINITY),
-        });
-        entry.min = entry.min.min(mn);
-        entry.max = entry.max.max(mx);
+    fn expand_aabb(
+        out: &mut std::collections::HashMap<u16, (rkp_core::Aabb, u32)>,
+        mat: u16,
+        mn: glam::Vec3,
+        mx: glam::Vec3,
+    ) {
+        let entry = out.entry(mat).or_insert((
+            rkp_core::Aabb {
+                min: glam::Vec3::splat(f32::INFINITY),
+                max: glam::Vec3::splat(f32::NEG_INFINITY),
+            },
+            0u32,
+        ));
+        entry.0.min = entry.0.min.min(mn);
+        entry.0.max = entry.0.max.max(mx);
+        entry.1 = entry.1.saturating_add(1);
     }
 
     fn walk(
@@ -1011,7 +1039,7 @@ fn scan_painted_aabbs(
         grid_origin: glam::Vec3,
         base_vs: f32,
         shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
-        out: &mut std::collections::HashMap<u16, rkp_core::Aabb>,
+        out: &mut std::collections::HashMap<u16, (rkp_core::Aabb, u32)>,
     ) {
         use rkp_core::sparse_octree::{
             is_brick, is_leaf, leaf_slot, brick_id, EMPTY_NODE, INTERIOR_NODE,
@@ -1288,16 +1316,20 @@ pub(super) fn count_painted_halves_check(
 }
 
 fn expand_aabb(
-    out: &mut std::collections::HashMap<u16, rkp_core::Aabb>,
+    out: &mut std::collections::HashMap<u16, (rkp_core::Aabb, u32)>,
     mat: u16,
     mn: glam::Vec3,
     mx: glam::Vec3,
 ) {
-    let entry = out.entry(mat).or_insert(rkp_core::Aabb {
-        min: glam::Vec3::splat(f32::INFINITY),
-        max: glam::Vec3::splat(f32::NEG_INFINITY),
-    });
-    entry.min = entry.min.min(mn);
-    entry.max = entry.max.max(mx);
+    let entry = out.entry(mat).or_insert((
+        rkp_core::Aabb {
+            min: glam::Vec3::splat(f32::INFINITY),
+            max: glam::Vec3::splat(f32::NEG_INFINITY),
+        },
+        0u32,
+    ));
+    entry.0.min = entry.0.min.min(mn);
+    entry.0.max = entry.0.max.max(mx);
+    entry.1 = entry.1.saturating_add(1);
 }
 

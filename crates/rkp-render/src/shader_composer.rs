@@ -75,13 +75,16 @@ pub struct ShaderMetadata {
     /// param hash).
     pub animated: bool,
     /// Preferred voxel resolution for the geometry pass. `None` falls
-    /// back to a per-object default (e.g. host's voxel size).
+    /// back to a per-object default (e.g. host's voxel size). The
+    /// region's max octree depth is derived from this — sim solves
+    /// `extent / (cell_size * 4) = 2^depth` and clamps against
+    /// `max_depth` below.
     pub cell_size: Option<f32>,
-    /// Preferred octree depth N for the geometry pass — the region's
-    /// brick grid is `(4 * 2^N)` cells per axis. `None` falls back
-    /// to the engine's default (V2: 2 → 16 cells/axis). Capped to
-    /// 6 by the dispatcher; deeper requires sparse BFS.
-    pub octree_depth: Option<u32>,
+    /// Cap on the V9 sparse-BFS octree depth. `None` falls back to
+    /// the engine default. Hard ceiling is `MAX_DEPTH = 8` (mirrors
+    /// the WGSL constant + queue buffer sizing); requests above that
+    /// silently clamp.
+    pub max_depth: Option<u32>,
 }
 
 /// One user shader's parsed hook bodies + header metadata. Each `*_text`
@@ -182,7 +185,7 @@ impl UserShaderRegistry {
                 region_thickness: e.metadata.region_thickness,
                 animated: e.metadata.animated,
                 cell_size: e.metadata.cell_size,
-                octree_depth: e.metadata.octree_depth,
+                max_depth: e.metadata.max_depth,
                 has_shade: e.shade_text.is_some(),
                 has_generate: e.generate_text.is_some(),
             })
@@ -216,7 +219,7 @@ pub struct UserShaderInfo {
     pub region_thickness: f32,
     pub animated: bool,
     pub cell_size: Option<f32>,
-    pub octree_depth: Option<u32>,
+    pub max_depth: Option<u32>,
     pub has_shade: bool,
     pub has_generate: bool,
 }
@@ -431,22 +434,22 @@ fn parse_metadata(
             "cell_size" => {
                 md.cell_size = Some(parse_f32(path, line_no, "cell_size", args)?);
             }
-            "octree_depth" => {
+            "max_depth" => {
                 let v: u32 = args.trim().parse().map_err(|_| ShaderComposerError::Parse {
                     path: path.to_path_buf(),
                     line: line_no,
-                    msg: format!("@octree_depth expects a u32, got `{args}`"),
+                    msg: format!("@max_depth expects a u32, got `{args}`"),
                 })?;
-                if v > 6 {
+                if v > 8 {
                     return Err(ShaderComposerError::Parse {
                         path: path.to_path_buf(),
                         line: line_no,
                         msg: format!(
-                            "@octree_depth {v} too deep — V4 dense bricks cap at 6 (sparse BFS needed for deeper)"
+                            "@max_depth {v} exceeds V9 ceiling of 8 (queue buffer is sized for MAX_DEPTH=8)"
                         ),
                     });
                 }
-                md.octree_depth = Some(v);
+                md.max_depth = Some(v);
             }
             "animated" => {
                 if !args.is_empty() {
@@ -863,7 +866,7 @@ fn compute_registry_hash(entries: &[UserShaderEntry]) -> u64 {
             buf.extend_from_slice(&s.to_le_bytes());
         }
         buf.push(0);
-        if let Some(d) = e.metadata.octree_depth {
+        if let Some(d) = e.metadata.max_depth {
             buf.extend_from_slice(&d.to_le_bytes());
         }
         buf.push(0);

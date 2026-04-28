@@ -1457,54 +1457,20 @@ fn splice_transient_into_tile_lists(
 /// `upload_frame` (so the march/shade passes find the new geometry
 /// alongside persistent objects).
 ///
-/// Pool reservation per region (V1 single-brick shape):
-///   octree_nodes: 1 × `vec2<u32>` = 8 B
-///   brick_pool:   `BRICK_CELLS` × u32 = 256 B
-///   leaf_attr_pool: `BRICK_CELLS` × `LeafAttr` = 512 B
-///
-/// We size the reservation for `MAX_REGIONS` and refuse new entries
-/// past that (the cache logs and drops the request — sim can lower
-/// fidelity if it sees its regions disappearing).
+/// V9 — sparse BFS. Pool reservation per region is sized from the
+/// requested `painted_leaf_count` × `max_depth` rather than the dense
+/// `8^depth` worst case. Memory + compute scale with surface area.
 fn run_user_shader_geom(
     state: &mut RenderState,
     frame: &RenderFrame,
 ) -> Vec<rkp_render::rkp_gpu_object::RkpGpuObject> {
     use rkp_render::user_shader_pass::{
-        bricks_per_region, build_internal_nodes, build_region_uniform,
-        effective_hash, octree_node_count, resolve_shader_id, RegionUniform,
-        BRICK_CELLS,
+        build_region_uniform, effective_hash, estimate_region_pool, resolve_shader_id,
+        RegionUniform, BRICK_CELLS,
     };
 
-    // V4 — per-region depth from `@octree_depth` directive. Pool
-    // capacity sums per-region bytes so shallow + deep regions can
-    // coexist without one's worst case forcing the other's
-    // reservation. Memory still scales with `8^depth` per region;
-    // the brick proximity gate (this pass) skips over far-from-host
-    // bricks at compute-time but doesn't shrink the reservation.
     const MAX_REGIONS: u32 = 256;
     const FACE_EMPTY: u32 = 0xFFFFFFFFu32;
-    fn region_octree_bytes(depth: u32) -> u64 { octree_node_count(depth) as u64 * 8 }
-    // V5 — sparse brick reservation matching `lookup_or_allocate`.
-    // Reserve a quarter of the worst-case brick count per region;
-    // workgroups whose brick survives the proximity gate atomic-claim
-    // a slot. Sparse-mode shaders (with `@region_thickness > 0`) fit
-    // comfortably; ungated shaders may overflow → some bricks render
-    // as OCTREE_EMPTY.
-    fn bricks_reserved(depth: u32) -> u32 {
-        // Match user_shader_pass — full dense reserve to avoid
-        // dispatch-order asymmetric grass dropouts.
-        bricks_per_region(depth)
-    }
-    fn region_brick_bytes(depth: u32) -> u64 {
-        bricks_reserved(depth) as u64 * BRICK_CELLS as u64 * 4
-    }
-    fn region_leaf_bytes(depth: u32) -> u64 {
-        (bricks_reserved(depth) as u64 * BRICK_CELLS as u64 / 2)
-            .max(BRICK_CELLS as u64) * 8
-    }
-    fn region_face_link_bytes(depth: u32) -> u64 {
-        bricks_reserved(depth) as u64 * 6 * 4
-    }
 
     // 1. Pipeline reload — track the shade-side hash; the geom and
     //    shade chunks share the same `source_hash`.
@@ -1515,53 +1481,45 @@ fn run_user_shader_geom(
     );
 
     if frame.user_shader_regions.is_empty() {
-        // Nothing to bake — skip even the capacity reservation. Cache
-        // entries from previous frames stick around (cheap; capacity
-        // for them is already reserved if any were created last
-        // frame), so a region appearing again will hit the cache
-        // immediately if its inputs match.
         return state.user_shader_cache.build_transient_objects();
     }
 
-    // 2. Reserve transient pool capacity. Sum per-region byte sizes
-    //    based on each shader's `@octree_depth`. Cap on region count
-    //    (not bytes); a deep shader on many objects can blow memory —
-    //    user is responsible for keeping depth + region count sane.
+    // 2. Estimate per-region pool sizes from painted-leaf count, sum
+    //    for the per-frame reservation tail. Per-region overshoots
+    //    are cheap (unused slots cost only their reserved bytes); the
+    //    cache returns None on overflow so a too-tight estimate just
+    //    drops a region for the frame.
     let need_regions = (frame.user_shader_regions.len() as u32).min(MAX_REGIONS);
     let regions_for_alloc: Vec<&_> = frame
         .user_shader_regions
         .iter()
         .take(need_regions as usize)
         .collect();
-    let extra_octree: u64 = regions_for_alloc
+    let estimates: Vec<rkp_render::user_shader_pass::PoolEstimate> = regions_for_alloc
         .iter()
-        .map(|r| region_octree_bytes(r.octree_depth))
+        .map(|r| estimate_region_pool(r.painted_leaf_count, r.max_depth))
+        .collect();
+    let extra_octree: u64 = estimates.iter().map(|e| e.octree as u64 * 8).sum();
+    let extra_brick: u64 = estimates
+        .iter()
+        .map(|e| e.bricks as u64 * BRICK_CELLS as u64 * 4)
         .sum();
-    let extra_brick: u64 = regions_for_alloc
+    let extra_leaf: u64 = estimates.iter().map(|e| e.leaf_attrs as u64 * 8).sum();
+    let extra_face_links: u64 = estimates
         .iter()
-        .map(|r| region_brick_bytes(r.octree_depth))
-        .sum();
-    let extra_leaf: u64 = regions_for_alloc
-        .iter()
-        .map(|r| region_leaf_bytes(r.octree_depth))
+        .map(|e| e.bricks as u64 * 6 * 4)
         .sum();
 
-    // CPU pool sizes — read under the scene_mgr lock so we know where
-    // the CPU-managed head ends and the transient tail starts.
     let (cpu_octree_bytes, cpu_brick_bytes, cpu_leaf_attr_bytes, cpu_face_links_bytes) = {
         let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
         let g = sm.geometry_upload();
         (
-            g.octree_nodes.len() as u64 * 8, // interleaved vec2<u32>
+            g.octree_nodes.len() as u64 * 8,
             g.brick_pool.len() as u64,
             g.leaf_attr_pool.len() as u64,
             g.brick_face_links.len() as u64,
         )
     };
-    let extra_face_links: u64 = regions_for_alloc
-        .iter()
-        .map(|r| region_face_link_bytes(r.octree_depth))
-        .sum();
     let realloc = state.renderer.scene.ensure_user_shader_capacity(
         &state.device,
         cpu_octree_bytes, extra_octree,
@@ -1570,35 +1528,19 @@ fn run_user_shader_geom(
         cpu_face_links_bytes, extra_face_links,
     );
     if realloc {
-        // Reallocation invalidated BOTH the transient writes (tail) AND
-        // the CPU-uploaded head — `create_storage` returns a fresh
-        // buffer with undefined contents. Re-upload CPU data so the
-        // head is valid; flush the cache so the dispatch below
-        // re-bakes the tail this frame too.
         let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
         let g = sm.geometry_upload();
         state.renderer.upload_geometry(&state.queue, &g);
-        // The re-upload's `ensure_and_write` may have grown buffers
-        // again above what we asked for if the CPU side moved
-        // forward in the interim — but we only hold the lock briefly
-        // and the next frame's epoch check will catch any gap. Track
-        // that we did upload so the epoch-driven path doesn't double
-        // up next iteration.
         state.last_uploaded_geometry_epoch = sm.geometry_epoch();
         drop(sm);
         state.user_shader_cache.flush();
     }
 
-    // Initialize the transient face-links tail to FACE_EMPTY across
-    // every region's brick range. Required for march correctness —
-    // without this the DDA chain reads zero and jumps into CPU
-    // brick_id=0. With per-region depth, total face-link u32 count
-    // sums per-region.
+    // Initialise transient face-links tail to FACE_EMPTY. Required for
+    // march correctness — without this the DDA chain reads zero and
+    // jumps into CPU brick_id=0.
     if need_regions > 0 {
-        let total_face_link_u32s: u64 = regions_for_alloc
-            .iter()
-            .map(|r| bricks_reserved(r.octree_depth) as u64 * 6)
-            .sum();
+        let total_face_link_u32s: u64 = estimates.iter().map(|e| e.bricks as u64 * 6).sum();
         let face_link_data: Vec<u32> = vec![FACE_EMPTY; total_face_link_u32s as usize];
         let face_link_offset_bytes = cpu_face_links_bytes;
         state.queue.write_buffer(
@@ -1608,50 +1550,29 @@ fn run_user_shader_geom(
         );
     }
 
-    // 3. Cache flushes — geometry epoch bump invalidates any
-    //    host-derived data.
     state.user_shader_cache.reconcile_epoch(frame.geometry_epoch);
 
-    // Configure pool bases — base = CPU bytes / element size, capacity
-    // sized to the reservation. Re-set every frame so the cache picks
-    // up any growth.
-    // octree_nodes: bound as `array<vec2<u32>>` (8 B/elem) — the
-    // interleaved upload doubles each CPU u32 to a vec2<u32>, so the
-    // transient tail starts at `cpu_octree_bytes / 8` elements in.
-    // brick_pool: bound as `array<u32>` (4 B/elem). leaf_attr_pool:
-    // bound as `array<LeafAttr>` (8 B/elem). Geom shader brick_offset
-    // values are u32-element indices, so divide bytes by 4.
+    // Configure pool bases. Each per-region pool capacity is the SUM
+    // across regions — `lookup_or_allocate` bumps the high-water mark
+    // within these bounds as it allocates per-region slices.
     let octree_base_elems = (cpu_octree_bytes / 8) as u32;
     let brick_base_elems = (cpu_brick_bytes / 4) as u32;
     let leaf_base_elems = (cpu_leaf_attr_bytes / 8) as u32;
-    // Pool capacities are total ELEMENT counts at the variable
-    // per-region depth — sum each region's slot size.
-    let total_octree_elems: u32 = regions_for_alloc
-        .iter()
-        .map(|r| octree_node_count(r.octree_depth))
-        .sum();
-    let total_brick_elems: u32 = regions_for_alloc
-        .iter()
-        .map(|r| bricks_reserved(r.octree_depth) * BRICK_CELLS)
-        .sum();
-    let total_leaf_elems: u32 = regions_for_alloc
-        .iter()
-        .map(|r| (region_leaf_bytes(r.octree_depth) / 8) as u32)
-        .sum();
+    let total_octree_elems: u32 = estimates.iter().map(|e| e.octree).sum();
+    let total_brick_elems: u32 = estimates.iter().map(|e| e.bricks * BRICK_CELLS).sum();
+    let total_leaf_elems: u32 = estimates.iter().map(|e| e.leaf_attrs).sum();
     state.user_shader_cache.set_pool_bases(
         octree_base_elems, total_octree_elems,
         brick_base_elems, total_brick_elems,
         leaf_base_elems, total_leaf_elems,
     );
 
-    // 4. Resolve regions, look up cache slots, build per-region
-    //    uniforms for the dirty ones. For fresh slots, also write
-    //    the perfect-tree internal nodes (levels 0..depth-1) into
-    //    the octree buffer — these are deterministic from
-    //    `octree_offset` + `depth`, so we compute and queue them
-    //    CPU-side once. The GPU dispatch only writes brick-leaf
-    //    nodes (level depth) and brick cells.
+    // 3. Resolve regions, look up cache slots, build per-region
+    //    uniforms for the dirty ones. With sparse BFS the GPU pass
+    //    allocates internals on-the-fly — no CPU pre-write of perfect
+    //    trees needed.
     let mut uniforms: Vec<RegionUniform> = Vec::with_capacity(need_regions as usize);
+    let mut max_max_depth: u32 = 0;
     let time_seconds = frame.shade_params_base.time;
     for req in frame.user_shader_regions.iter().take(need_regions as usize) {
         let shader_id = resolve_shader_id(&frame.user_shader_infos, &req.shader_name);
@@ -1659,32 +1580,17 @@ fn run_user_shader_geom(
             continue;
         }
         let h = effective_hash(req, frame.user_shader_source_hash, frame.geometry_epoch);
-        let slot = match state
-            .user_shader_cache
-            .lookup_or_allocate(req, h, req.octree_depth)
-        {
+        let slot = match state.user_shader_cache.lookup_or_allocate(req, h) {
             Some(s) => s,
             None => continue,
         };
-        if slot.fresh && slot.depth > 0 {
-            let internals = build_internal_nodes(slot.octree_offset, slot.depth);
-            if !internals.is_empty() {
-                let byte_offset = slot.octree_offset as u64 * 8;
-                state.queue.write_buffer(
-                    &state.renderer.scene.octree_nodes_buffer,
-                    byte_offset,
-                    bytemuck::cast_slice(&internals),
-                );
-            }
-        }
         if !slot.was_dirty {
             continue;
         }
+        max_max_depth = max_max_depth.max(slot.max_depth);
         uniforms.push(build_region_uniform(req, &slot, shader_id, time_seconds));
     }
 
-    // 5. Refresh group-0 binding (scene buffers may have been swapped
-    //    out from under us by the upload above).
     state.user_shader_pass.ensure_group0(
         &state.device,
         &state.renderer.scene.octree_nodes_buffer,
@@ -1699,21 +1605,16 @@ fn run_user_shader_geom(
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("user_shader_geom_encoder"),
             });
-        let max_region_index = state.user_shader_cache.max_region_index();
         state.user_shader_pass.dispatch_regions(
             &state.device,
             &state.queue,
             &mut encoder,
             &uniforms,
-            max_region_index,
+            max_max_depth,
         );
         state.queue.submit(Some(encoder.finish()));
     }
 
-    // 6. Build transient `RkpGpuObject`s for every live cache entry —
-    //    even ones that hit the cache this frame, since the per-frame
-    //    upload rewrites the entire objects buffer (objects from
-    //    previous frames are gone unless re-shipped).
     state.user_shader_cache.build_transient_objects()
 }
 
