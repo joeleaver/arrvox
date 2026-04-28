@@ -1469,14 +1469,18 @@ fn run_user_shader_geom(
         RegionUniform, BRICK_CELLS,
     };
 
-    // V10 multi-region tiling: a single grass-painted host can emit
-    // dozens to low-hundreds of tile regions. 512 keeps room for
-    // many concurrent painted entities; above that we cap to keep
-    // total queue traffic within `PER_LEVEL_QUEUE_CAP` (65 K cells
-    // per level shared across regions) — overflow there silently
-    // degrades to missing tiles. Tightening MAX_REGIONS without
-    // bumping queue caps preserves correctness over coverage.
-    const MAX_REGIONS: u32 = 512;
+    // V10 multi-region tiling: bounded so the SUM of per-region pool
+    // reservations stays within wgpu's `max_storage_buffer_binding_size`
+    // (1 GB). With per-region brick cap = 4096 and ~0.5 KB binding
+    // per brick across the bound storage buffers (brick_pool +
+    // leaf_attr_pool), 256 regions worst case = 512 MB binding
+    // pressure, comfortably under 1 GB. Bumping this further means
+    // either dropping per-region brick cap or raising the device's
+    // `max_storage_buffer_binding_size` (and giving the GPU room to
+    // allocate). Above 256 active tiles per frame, surplus tiles
+    // get clipped silently — the trade-off keeps validation green
+    // when the user paints sprawling areas.
+    const MAX_REGIONS: u32 = 256;
     const FACE_EMPTY: u32 = 0xFFFFFFFFu32;
 
     // 1. Pipeline reload — track the shade-side hash; the geom and

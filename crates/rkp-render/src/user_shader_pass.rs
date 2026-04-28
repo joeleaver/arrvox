@@ -504,16 +504,23 @@ pub struct PoolEstimate {
 pub fn estimate_region_pool(painted_leaf_count: u32, max_depth: u32) -> PoolEstimate {
     let painted = painted_leaf_count.max(8);
     // Per-region brick cap: dense maximum at this depth, bounded above
-    // so large paint clusters can't reserve hundreds of MB. Above this,
-    // the BFS hits brick exhaustion and degrades to OCTREE_EMPTY on
-    // overflow bricks (missing patches). 32K bricks × 256 B = 8 MB
-    // per active region, fine for 10–20 concurrent paint regions.
+    // so the SUM of per-region reservations across MAX_REGIONS active
+    // tiles stays within wgpu's `max_storage_buffer_binding_size`
+    // (1 GB) and `max_buffer_size` (2 GB) limits.
+    //
+    // Math: each brick costs 256 B in brick_pool and 256 B in
+    // leaf_attr_pool (≈ 0.5 KB per brick across the bound buffers).
+    // With MAX_REGIONS = 256 and per-region cap = 4096:
+    //   256 × 4096 × 256 B = 256 MB per pool. Comfortably under 1 GB.
+    // Beyond this cap a single tile's BFS overflows to OCTREE_EMPTY
+    // on the surplus bricks (visible patches in detail-heavy tiles
+    // with thick bands).
     let dense_max_bricks = if max_depth >= 8 {
         u32::MAX
     } else {
         1u32 << (max_depth * 3)
     };
-    let region_cap = dense_max_bricks.min(32768);
+    let region_cap = dense_max_bricks.min(4096);
     // Per-painted-leaf brick factor scales with `2^max_depth` because
     // band-volume / brick-volume grows like 2^d as bricks shrink. At
     // depth 4 each painted host leaf needs ~20 transient bricks; at

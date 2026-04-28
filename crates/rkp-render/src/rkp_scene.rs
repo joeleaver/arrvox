@@ -283,6 +283,15 @@ impl RkpScene {
     /// user-shader transient-pool reservation. Returns `true` iff a
     /// new buffer was created (caller must refresh dependent bind
     /// groups).
+    ///
+    /// Caps the requested size at the device's
+    /// `max_storage_buffer_binding_size` so a runaway transient
+    /// reservation doesn't silently produce an invalid buffer
+    /// (which would corrupt every bind group that references it
+    /// and surface as a misleading "BindGroup is invalid"
+    /// validation error at submit time). When the cap kicks in we
+    /// log loudly so callers know to dial down their per-region
+    /// estimates.
     fn ensure_capacity(
         device: &wgpu::Device,
         buffer: &mut wgpu::Buffer,
@@ -292,8 +301,18 @@ impl RkpScene {
         if min_bytes == 0 {
             return false;
         }
-        if min_bytes > buffer.size() {
-            *buffer = Self::create_storage(device, label, min_bytes);
+        let limit = device.limits().max_storage_buffer_binding_size as u64;
+        if min_bytes > limit {
+            eprintln!(
+                "[rkp_scene] {label}: requested {min_bytes} B exceeds \
+                 max_storage_buffer_binding_size ({limit} B). Clamping — \
+                 the offending writer will see truncated capacity. \
+                 Reduce per-region brick cap, MAX_REGIONS, or paint area."
+            );
+        }
+        let request = min_bytes.min(limit);
+        if request > buffer.size() {
+            *buffer = Self::create_storage(device, label, request);
             true
         } else {
             false
