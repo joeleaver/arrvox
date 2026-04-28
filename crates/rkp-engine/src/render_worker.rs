@@ -1505,11 +1505,41 @@ fn run_user_shader_geom(
         return state.user_shader_cache.build_transient_objects();
     }
 
-    // 2. Estimate per-region pool sizes from painted-leaf count, sum
-    //    for the per-frame reservation tail. Per-region overshoots
-    //    are cheap (unused slots cost only their reserved bytes); the
-    //    cache returns None on overflow so a too-tight estimate just
-    //    drops a region for the frame.
+    // 2. Reserve transient pool capacity using a STABLE worst-case
+    //    bound, not the per-frame estimate sum. Reasoning: as the
+    //    user paints more strokes the per-frame estimate grows
+    //    monotonically (more painted leaves → more tiles → bigger
+    //    sum), which would force `ensure_user_shader_capacity` to
+    //    grow buffers nearly every frame, each grow triggering a
+    //    344 MiB CPU re-upload via `upload_geometry`. With the
+    //    stable bound the buffers grow once and stabilise; per-frame
+    //    pool *usage* still scales with paint via the cache's
+    //    sub-allocator (it bumps the high-water mark within the
+    //    reserved range without resizing the underlying buffer).
+    //
+    //    Worst-case bytes per region at our caps (4096 bricks ×
+    //    max_depth 8): ~1 MB brick, ~1 MB leaf-attr, 32 KB octree,
+    //    96 KB face-link. Times MAX_REGIONS = 256 → ~600 MB total
+    //    transient pool. CPU heads (~344 MiB scene) push total
+    //    buffer pressure to ~944 MiB per pool — under the 1 GB
+    //    binding limit with margin.
+    const MAX_BRICKS_PER_REGION: u32 = 4096;
+    const MAX_DEPTH_RESERVE: u32 = 8;
+    let max_regions_u64 = MAX_REGIONS as u64;
+    let extra_octree: u64 = max_regions_u64
+        * (MAX_BRICKS_PER_REGION as u64 * 8 + (MAX_DEPTH_RESERVE as u64 + 1) * 8)
+        * 8; // bytes per vec2<u32>
+    let extra_brick: u64 = max_regions_u64
+        * MAX_BRICKS_PER_REGION as u64
+        * BRICK_CELLS as u64 * 4;
+    let extra_leaf: u64 = max_regions_u64
+        * MAX_BRICKS_PER_REGION as u64 * BRICK_CELLS as u64 / 2 * 8;
+    let extra_face_links: u64 = max_regions_u64
+        * MAX_BRICKS_PER_REGION as u64 * 6 * 4;
+
+    // Per-frame estimates still drive cache sub-allocation (set_pool_bases
+    // below). Estimates that exceed the stable buffer reservation are
+    // capped at the buffer-tail size, mirroring real-world tile budgets.
     let need_regions = (frame.user_shader_regions.len() as u32).min(MAX_REGIONS);
     let regions_for_alloc: Vec<&_> = frame
         .user_shader_regions
@@ -1520,16 +1550,6 @@ fn run_user_shader_geom(
         .iter()
         .map(|r| estimate_region_pool(r.painted_leaf_count, r.max_depth))
         .collect();
-    let extra_octree: u64 = estimates.iter().map(|e| e.octree as u64 * 8).sum();
-    let extra_brick: u64 = estimates
-        .iter()
-        .map(|e| e.bricks as u64 * BRICK_CELLS as u64 * 4)
-        .sum();
-    let extra_leaf: u64 = estimates.iter().map(|e| e.leaf_attrs as u64 * 8).sum();
-    let extra_face_links: u64 = estimates
-        .iter()
-        .map(|e| e.bricks as u64 * 6 * 4)
-        .sum();
 
     let (cpu_octree_bytes, cpu_brick_bytes, cpu_leaf_attr_bytes, cpu_face_links_bytes) = {
         let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
@@ -1573,15 +1593,18 @@ fn run_user_shader_geom(
 
     state.user_shader_cache.reconcile_epoch(frame.geometry_epoch);
 
-    // Configure pool bases. Each per-region pool capacity is the SUM
-    // across regions — `lookup_or_allocate` bumps the high-water mark
-    // within these bounds as it allocates per-region slices.
+    // Configure pool bases. Capacities here come from the stable
+    // worst-case reservation we made above — the cache sub-allocates
+    // within this fixed range each frame. Using the per-frame
+    // estimate sum here would be wrong: it'd shrink the cache's
+    // accessible range below the buffer's actual tail size and
+    // re-set_pool_bases on each frame would `flush` unnecessarily.
     let octree_base_elems = (cpu_octree_bytes / 8) as u32;
     let brick_base_elems = (cpu_brick_bytes / 4) as u32;
     let leaf_base_elems = (cpu_leaf_attr_bytes / 8) as u32;
-    let total_octree_elems: u32 = estimates.iter().map(|e| e.octree).sum();
-    let total_brick_elems: u32 = estimates.iter().map(|e| e.bricks * BRICK_CELLS).sum();
-    let total_leaf_elems: u32 = estimates.iter().map(|e| e.leaf_attrs).sum();
+    let total_octree_elems = (extra_octree / 8) as u32;
+    let total_brick_elems = (extra_brick / 4) as u32;
+    let total_leaf_elems = (extra_leaf / 8) as u32;
     state.user_shader_cache.set_pool_bases(
         octree_base_elems, total_octree_elems,
         brick_base_elems, total_brick_elems,

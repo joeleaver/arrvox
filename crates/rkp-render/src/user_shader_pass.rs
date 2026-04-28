@@ -252,6 +252,20 @@ impl UserShaderObjectCache {
         brick_base: u32, brick_capacity: u32,
         leaf_attr_base: u32, leaf_attr_capacity: u32,
     ) {
+        // Idempotent — only flush + reset if the pool layout actually
+        // changed (CPU head moved, transient reservation grew). With
+        // the V10 stable worst-case reservation, this should be a
+        // no-op every frame after the first paint, and the cache
+        // (including all baked tile entries) survives across frames.
+        if self.octree_base == octree_base
+            && self.octree_capacity == octree_capacity
+            && self.brick_base == brick_base
+            && self.brick_capacity == brick_capacity
+            && self.leaf_attr_base == leaf_attr_base
+            && self.leaf_attr_capacity == leaf_attr_capacity
+        {
+            return;
+        }
         self.entries.clear();
         self.free_slots.clear();
         self.octree_high_water = 0;
