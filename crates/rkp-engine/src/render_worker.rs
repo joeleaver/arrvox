@@ -225,6 +225,15 @@ struct RenderState {
     viewport_renderers: std::collections::HashMap<ViewportId, ViewportRenderer>,
     scene_mgr: Arc<Mutex<RkpSceneManager>>,
 
+    /// Phase C — GPU runtime geometry pass + transient cache. The
+    /// pass owns the geom-build pipeline; the cache tracks
+    /// per-(host_object, material) slices in the scene's transient
+    /// pool tail. Both live on the render thread because they're
+    /// driven entirely by GPU work that downstream march/shade
+    /// dispatches consume in the same encoder.
+    user_shader_pass: rkp_render::user_shader_pass::UserShaderPass,
+    user_shader_cache: rkp_render::user_shader_pass::UserShaderObjectCache,
+
     /// Pick readback target. 1×1 region of the gbuf_material at offset
     /// 0, 1×1 region of the gbuf_pick at offset 256 — both 256-byte
     /// aligned per wgpu's copy alignment rules.
@@ -337,12 +346,17 @@ impl RenderState {
             mapped_at_creation: false,
         });
 
+        let user_shader_pass = rkp_render::user_shader_pass::UserShaderPass::new(&device);
+        let user_shader_cache = rkp_render::user_shader_pass::UserShaderObjectCache::new();
+
         Self {
             device,
             queue,
             renderer,
             viewport_renderers,
             scene_mgr: init.scene_mgr,
+            user_shader_pass,
+            user_shader_cache,
             pick_readback_buffer,
             pick_in_flight: None,
             curr_snap: None,
@@ -942,6 +956,27 @@ fn render_one_frame(
         drop(sm);
     }
 
+    // 1.7. User-shader geometry pass (Phase C). Reserve transient
+    //      pool tail, reload pipeline if the shader source changed,
+    //      walk regions, dispatch the geom-build pipeline for any
+    //      that need a re-bake, and concatenate the resulting
+    //      transient `RkpGpuObject`s into `gpu_objects` so the
+    //      per-frame upload below ships them alongside persistent
+    //      objects. The march/shade passes treat them identically to
+    //      bake-built objects — same octree node encoding, same leaf
+    //      attr layout — so no shader-side branching is needed.
+    let transient_objects = run_user_shader_geom(state, frame);
+    let mut combined_objects: Vec<rkp_render::rkp_gpu_object::RkpGpuObject>;
+    let gpu_objects_for_upload: &[rkp_render::rkp_gpu_object::RkpGpuObject] =
+        if transient_objects.is_empty() {
+            gpu_objects
+        } else {
+            combined_objects = Vec::with_capacity(gpu_objects.len() + transient_objects.len());
+            combined_objects.extend_from_slice(gpu_objects);
+            combined_objects.extend_from_slice(&transient_objects);
+            &combined_objects
+        };
+
     // 1b. Per-frame `RkpGpuObject` upload. `gpu_objects` here may be
     //     interpolated between the last two sim snapshots (see
     //     `interpolate_gpu_objects`), so at high render rates
@@ -950,7 +985,7 @@ fn render_one_frame(
     state.renderer.upload_frame(
         &state.queue,
         &FrameUpload {
-            objects: gpu_objects,
+            objects: gpu_objects_for_upload,
             bone_matrices: &frame.bone_matrix_lbs,
             bone_dual_quats: &frame.bone_matrix_dqs,
         },
@@ -1005,9 +1040,19 @@ fn render_one_frame(
         frame.pending_pick
     };
 
-    // Object count comes from the interpolated list (same length as
-    // `frame.gpu_objects` — interpolation never adds/removes entries).
-    let object_count = gpu_objects.len() as u32;
+    // Object count comes from the interpolated list plus any
+    // transient user-shader objects appended by `run_user_shader_geom`.
+    // Transient objects sit at the tail of `objects_buffer`, indices
+    // `gpu_objects.len()..gpu_objects.len()+transient_objects.len()`.
+    let transient_count = transient_objects.len() as u32;
+    let persistent_count = gpu_objects.len() as u32;
+    let object_count = persistent_count + transient_count;
+    // Transient object ids the per-VR tile list rebuild splices into
+    // every tile. Sim's tile_object_ids only enumerated persistent
+    // objects, so without this the march would never visit transient
+    // bricks no matter how many were uploaded.
+    let transient_indices: Vec<u32> =
+        (persistent_count..persistent_count + transient_count).collect();
 
     for vp in &frame.viewports {
         // Override `prev_vp` (and the parallel `prev_view_proj` field
@@ -1111,6 +1156,29 @@ fn render_one_frame(
         // 3h. The big one — full per-VR dispatch chain (atmo, march or
         //     proc_raymarch, shadow, ssao, shade, vol, god_rays, bloom,
         //     bloom_composite, tone_map, composite, grid).
+        //
+        // When transient user-shader objects exist, splice their
+        // indices into every tile's list so the march visits them
+        // alongside persistent objects. Sim's tile_object_ids only
+        // enumerated persistent objects (sim doesn't see the
+        // render-thread-built transient list); cheap to fix here as
+        // a per-frame O(tiles × transient_count) rebuild.
+        let (effective_tile_offsets, effective_tile_object_ids);
+        let (tile_offsets_ref, tile_object_ids_ref): (&[u8], &[u8]) = if transient_count == 0 {
+            (&vp.tile_offsets_bytes, &vp.tile_object_ids_bytes)
+        } else {
+            let (offsets, ids) = splice_transient_into_tile_lists(
+                &vp.tile_offsets_bytes,
+                &vp.tile_object_ids_bytes,
+                &transient_indices,
+            );
+            effective_tile_offsets = offsets;
+            effective_tile_object_ids = ids;
+            (
+                bytemuck::cast_slice(&effective_tile_offsets),
+                bytemuck::cast_slice(&effective_tile_object_ids),
+            )
+        };
         state.renderer.render_to(
             &mut encoder,
             &state.queue,
@@ -1120,8 +1188,8 @@ fn render_one_frame(
             vp.shade_params.num_lights,
             frame.lod_enabled,
             frame.surfacenet_enabled,
-            &vp.tile_offsets_bytes,
-            &vp.tile_object_ids_bytes,
+            tile_offsets_ref,
+            tile_object_ids_ref,
             vp.tile_count_x,
             &vp.atmo_frame,
             vp.mode,
@@ -1333,5 +1401,359 @@ fn render_one_frame(
     }
 
     RenderOutcome { cloud_sun_atten_raw, delivered_dt_ms }
+}
+
+/// Phase C V1.5 — append `transient_indices` to every tile's object
+/// list, returning rebuilt `(tile_offsets, tile_object_ids)` arrays.
+///
+/// Sim's tile_object_ids only enumerate persistent objects; transient
+/// ones (built render-thread-side after the snapshot arrives) need to
+/// be visible from every tile so the march visits them. With T tiles
+/// and N transient objects the cost is O(T × N) per frame; for V1's
+/// few-region demos that's negligible (~MB/frame at most).
+///
+/// Layout: `tile_offsets` is a prefix-sum (length `T + 1`), so each
+/// tile `t` has range `[offsets[t]..offsets[t+1])` in `tile_object_ids`.
+/// We splice `transient_indices` after each tile's existing range,
+/// shifting downstream offsets accordingly.
+fn splice_transient_into_tile_lists(
+    tile_offsets_bytes: &[u8],
+    tile_object_ids_bytes: &[u8],
+    transient_indices: &[u32],
+) -> (Vec<u32>, Vec<u32>) {
+    let n_tile = if tile_offsets_bytes.is_empty() {
+        0
+    } else {
+        (tile_offsets_bytes.len() / 4).saturating_sub(1)
+    };
+    if n_tile == 0 || transient_indices.is_empty() {
+        // Empty input — return whatever was passed in as u32 vecs.
+        let offsets = bytemuck::cast_slice::<u8, u32>(tile_offsets_bytes).to_vec();
+        let ids = bytemuck::cast_slice::<u8, u32>(tile_object_ids_bytes).to_vec();
+        return (offsets, ids);
+    }
+    let orig_offsets: &[u32] = bytemuck::cast_slice(tile_offsets_bytes);
+    let orig_ids: &[u32] = bytemuck::cast_slice(tile_object_ids_bytes);
+    let n_transient = transient_indices.len();
+    let mut new_offsets: Vec<u32> = Vec::with_capacity(n_tile + 1);
+    let mut new_ids: Vec<u32> = Vec::with_capacity(orig_ids.len() + n_tile * n_transient);
+
+    new_offsets.push(0);
+    for t in 0..n_tile {
+        let a = orig_offsets[t] as usize;
+        let b = orig_offsets[t + 1] as usize;
+        new_ids.extend_from_slice(&orig_ids[a..b]);
+        new_ids.extend_from_slice(transient_indices);
+        new_offsets.push(new_ids.len() as u32);
+    }
+    (new_offsets, new_ids)
+}
+
+/// Phase C — user-shader runtime geometry. Reserves transient pool
+/// capacity, rebuilds the geom-build pipeline on shader changes, walks
+/// the snapshot's regions, and dispatches one workgroup per region
+/// whose cache slot is dirty. Returns the transient `RkpGpuObject`
+/// list to concatenate with `gpu_objects` for this frame's
+/// `upload_frame` (so the march/shade passes find the new geometry
+/// alongside persistent objects).
+///
+/// Pool reservation per region (V1 single-brick shape):
+///   octree_nodes: 1 × `vec2<u32>` = 8 B
+///   brick_pool:   `BRICK_CELLS` × u32 = 256 B
+///   leaf_attr_pool: `BRICK_CELLS` × `LeafAttr` = 512 B
+///
+/// We size the reservation for `MAX_REGIONS` and refuse new entries
+/// past that (the cache logs and drops the request — sim can lower
+/// fidelity if it sees its regions disappearing).
+fn run_user_shader_geom(
+    state: &mut RenderState,
+    frame: &RenderFrame,
+) -> Vec<rkp_render::rkp_gpu_object::RkpGpuObject> {
+    use rkp_render::user_shader_pass::{
+        bricks_per_region, build_internal_nodes, build_region_uniform,
+        effective_hash, octree_node_count, resolve_shader_id, RegionUniform,
+        BRICK_CELLS,
+    };
+
+    // V4 — per-region depth from `@octree_depth` directive. Pool
+    // capacity sums per-region bytes so shallow + deep regions can
+    // coexist without one's worst case forcing the other's
+    // reservation. Memory still scales with `8^depth` per region;
+    // the brick proximity gate (this pass) skips over far-from-host
+    // bricks at compute-time but doesn't shrink the reservation.
+    const MAX_REGIONS: u32 = 256;
+    const FACE_EMPTY: u32 = 0xFFFFFFFFu32;
+    fn region_octree_bytes(depth: u32) -> u64 { octree_node_count(depth) as u64 * 8 }
+    // V5 — sparse brick reservation matching `lookup_or_allocate`.
+    // Reserve a quarter of the worst-case brick count per region;
+    // workgroups whose brick survives the proximity gate atomic-claim
+    // a slot. Sparse-mode shaders (with `@region_thickness > 0`) fit
+    // comfortably; ungated shaders may overflow → some bricks render
+    // as OCTREE_EMPTY.
+    fn bricks_reserved(depth: u32) -> u32 {
+        // Match user_shader_pass — full dense reserve to avoid
+        // dispatch-order asymmetric grass dropouts.
+        bricks_per_region(depth)
+    }
+    fn region_brick_bytes(depth: u32) -> u64 {
+        bricks_reserved(depth) as u64 * BRICK_CELLS as u64 * 4
+    }
+    fn region_leaf_bytes(depth: u32) -> u64 {
+        (bricks_reserved(depth) as u64 * BRICK_CELLS as u64 / 2)
+            .max(BRICK_CELLS as u64) * 8
+    }
+    fn region_face_link_bytes(depth: u32) -> u64 {
+        bricks_reserved(depth) as u64 * 6 * 4
+    }
+
+    // 1. Pipeline reload — track the shade-side hash; the geom and
+    //    shade chunks share the same `source_hash`.
+    state.user_shader_pass.reload_user_shaders(
+        &state.device,
+        &frame.user_shader_generate_chunk,
+        frame.user_shader_source_hash,
+    );
+
+    if frame.user_shader_regions.is_empty() {
+        // Nothing to bake — skip even the capacity reservation. Cache
+        // entries from previous frames stick around (cheap; capacity
+        // for them is already reserved if any were created last
+        // frame), so a region appearing again will hit the cache
+        // immediately if its inputs match.
+        return state.user_shader_cache.build_transient_objects();
+    }
+
+    // 2. Reserve transient pool capacity. Sum per-region byte sizes
+    //    based on each shader's `@octree_depth`. Cap on region count
+    //    (not bytes); a deep shader on many objects can blow memory —
+    //    user is responsible for keeping depth + region count sane.
+    let need_regions = (frame.user_shader_regions.len() as u32).min(MAX_REGIONS);
+    let regions_for_alloc: Vec<&_> = frame
+        .user_shader_regions
+        .iter()
+        .take(need_regions as usize)
+        .collect();
+    let extra_octree: u64 = regions_for_alloc
+        .iter()
+        .map(|r| region_octree_bytes(r.octree_depth))
+        .sum();
+    let extra_brick: u64 = regions_for_alloc
+        .iter()
+        .map(|r| region_brick_bytes(r.octree_depth))
+        .sum();
+    let extra_leaf: u64 = regions_for_alloc
+        .iter()
+        .map(|r| region_leaf_bytes(r.octree_depth))
+        .sum();
+
+    // CPU pool sizes — read under the scene_mgr lock so we know where
+    // the CPU-managed head ends and the transient tail starts.
+    let (cpu_octree_bytes, cpu_brick_bytes, cpu_leaf_attr_bytes, cpu_face_links_bytes) = {
+        let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
+        let g = sm.geometry_upload();
+        (
+            g.octree_nodes.len() as u64 * 8, // interleaved vec2<u32>
+            g.brick_pool.len() as u64,
+            g.leaf_attr_pool.len() as u64,
+            g.brick_face_links.len() as u64,
+        )
+    };
+    let extra_face_links: u64 = regions_for_alloc
+        .iter()
+        .map(|r| region_face_link_bytes(r.octree_depth))
+        .sum();
+    let realloc = state.renderer.scene.ensure_user_shader_capacity(
+        &state.device,
+        cpu_octree_bytes, extra_octree,
+        cpu_brick_bytes, extra_brick,
+        cpu_leaf_attr_bytes, extra_leaf,
+        cpu_face_links_bytes, extra_face_links,
+    );
+    if realloc {
+        // Reallocation invalidated BOTH the transient writes (tail) AND
+        // the CPU-uploaded head — `create_storage` returns a fresh
+        // buffer with undefined contents. Re-upload CPU data so the
+        // head is valid; flush the cache so the dispatch below
+        // re-bakes the tail this frame too.
+        let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
+        let g = sm.geometry_upload();
+        state.renderer.upload_geometry(&state.queue, &g);
+        // The re-upload's `ensure_and_write` may have grown buffers
+        // again above what we asked for if the CPU side moved
+        // forward in the interim — but we only hold the lock briefly
+        // and the next frame's epoch check will catch any gap. Track
+        // that we did upload so the epoch-driven path doesn't double
+        // up next iteration.
+        state.last_uploaded_geometry_epoch = sm.geometry_epoch();
+        drop(sm);
+        state.user_shader_cache.flush();
+    }
+
+    // Initialize the transient face-links tail to FACE_EMPTY across
+    // every region's brick range. Required for march correctness —
+    // without this the DDA chain reads zero and jumps into CPU
+    // brick_id=0. With per-region depth, total face-link u32 count
+    // sums per-region.
+    if need_regions > 0 {
+        let total_face_link_u32s: u64 = regions_for_alloc
+            .iter()
+            .map(|r| bricks_reserved(r.octree_depth) as u64 * 6)
+            .sum();
+        let face_link_data: Vec<u32> = vec![FACE_EMPTY; total_face_link_u32s as usize];
+        let face_link_offset_bytes = cpu_face_links_bytes;
+        state.queue.write_buffer(
+            &state.renderer.scene.brick_face_links_buffer,
+            face_link_offset_bytes,
+            bytemuck::cast_slice(&face_link_data),
+        );
+    }
+
+    // 3. Cache flushes — geometry epoch bump invalidates any
+    //    host-derived data.
+    state.user_shader_cache.reconcile_epoch(frame.geometry_epoch);
+
+    // Configure pool bases — base = CPU bytes / element size, capacity
+    // sized to the reservation. Re-set every frame so the cache picks
+    // up any growth.
+    // octree_nodes: bound as `array<vec2<u32>>` (8 B/elem) — the
+    // interleaved upload doubles each CPU u32 to a vec2<u32>, so the
+    // transient tail starts at `cpu_octree_bytes / 8` elements in.
+    // brick_pool: bound as `array<u32>` (4 B/elem). leaf_attr_pool:
+    // bound as `array<LeafAttr>` (8 B/elem). Geom shader brick_offset
+    // values are u32-element indices, so divide bytes by 4.
+    let octree_base_elems = (cpu_octree_bytes / 8) as u32;
+    let brick_base_elems = (cpu_brick_bytes / 4) as u32;
+    let leaf_base_elems = (cpu_leaf_attr_bytes / 8) as u32;
+    // Pool capacities are total ELEMENT counts at the variable
+    // per-region depth — sum each region's slot size.
+    let total_octree_elems: u32 = regions_for_alloc
+        .iter()
+        .map(|r| octree_node_count(r.octree_depth))
+        .sum();
+    let total_brick_elems: u32 = regions_for_alloc
+        .iter()
+        .map(|r| bricks_reserved(r.octree_depth) * BRICK_CELLS)
+        .sum();
+    let total_leaf_elems: u32 = regions_for_alloc
+        .iter()
+        .map(|r| (region_leaf_bytes(r.octree_depth) / 8) as u32)
+        .sum();
+    state.user_shader_cache.set_pool_bases(
+        octree_base_elems, total_octree_elems,
+        brick_base_elems, total_brick_elems,
+        leaf_base_elems, total_leaf_elems,
+    );
+
+    // 4. Resolve regions, look up cache slots, build per-region
+    //    uniforms for the dirty ones. For fresh slots, also write
+    //    the perfect-tree internal nodes (levels 0..depth-1) into
+    //    the octree buffer — these are deterministic from
+    //    `octree_offset` + `depth`, so we compute and queue them
+    //    CPU-side once. The GPU dispatch only writes brick-leaf
+    //    nodes (level depth) and brick cells.
+    let mut uniforms: Vec<RegionUniform> = Vec::with_capacity(need_regions as usize);
+    let time_seconds = frame.shade_params_base.time;
+    for req in frame.user_shader_regions.iter().take(need_regions as usize) {
+        let shader_id = resolve_shader_id(&frame.user_shader_infos, &req.shader_name);
+        if shader_id == 0 {
+            continue;
+        }
+        let h = effective_hash(req, frame.user_shader_source_hash, frame.geometry_epoch);
+        let slot = match state
+            .user_shader_cache
+            .lookup_or_allocate(req, h, req.octree_depth)
+        {
+            Some(s) => s,
+            None => continue,
+        };
+        if slot.fresh && slot.depth > 0 {
+            let internals = build_internal_nodes(slot.octree_offset, slot.depth);
+            if !internals.is_empty() {
+                let byte_offset = slot.octree_offset as u64 * 8;
+                state.queue.write_buffer(
+                    &state.renderer.scene.octree_nodes_buffer,
+                    byte_offset,
+                    bytemuck::cast_slice(&internals),
+                );
+            }
+        }
+        if !slot.was_dirty {
+            continue;
+        }
+        uniforms.push(build_region_uniform(req, &slot, shader_id, time_seconds));
+    }
+
+    // 5. Refresh group-0 binding (scene buffers may have been swapped
+    //    out from under us by the upload above).
+    state.user_shader_pass.ensure_group0(
+        &state.device,
+        &state.renderer.scene.octree_nodes_buffer,
+        &state.renderer.scene.brick_pool_buffer,
+        &state.renderer.scene.leaf_attr_pool_buffer,
+        state.renderer.scene.buffers_epoch(),
+    );
+
+    if !uniforms.is_empty() {
+        let mut encoder = state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("user_shader_geom_encoder"),
+            });
+        let max_region_index = state.user_shader_cache.max_region_index();
+        state.user_shader_pass.dispatch_regions(
+            &state.device,
+            &state.queue,
+            &mut encoder,
+            &uniforms,
+            max_region_index,
+        );
+        state.queue.submit(Some(encoder.finish()));
+    }
+
+    // 6. Build transient `RkpGpuObject`s for every live cache entry —
+    //    even ones that hit the cache this frame, since the per-frame
+    //    upload rewrites the entire objects buffer (objects from
+    //    previous frames are gone unless re-shipped).
+    state.user_shader_cache.build_transient_objects()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::splice_transient_into_tile_lists;
+
+    fn u32s(v: &[u32]) -> Vec<u8> { bytemuck::cast_slice(v).to_vec() }
+
+    #[test]
+    fn splice_no_transient_passes_through() {
+        let offsets = u32s(&[0, 2, 5]);
+        let ids = u32s(&[1, 2, 3, 4, 5]);
+        let (no, ni) = splice_transient_into_tile_lists(&offsets, &ids, &[]);
+        assert_eq!(no, vec![0, 2, 5]);
+        assert_eq!(ni, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn splice_appends_transient_to_each_tile() {
+        // 2 tiles. Tile 0 has [1, 2], tile 1 has [3, 4, 5]. After
+        // splicing transient [99, 100] into both, tile 0 → [1, 2, 99, 100],
+        // tile 1 → [3, 4, 5, 99, 100].
+        let offsets = u32s(&[0, 2, 5]);
+        let ids = u32s(&[1, 2, 3, 4, 5]);
+        let (no, ni) = splice_transient_into_tile_lists(&offsets, &ids, &[99, 100]);
+        // New offsets: [0, 4, 9].
+        assert_eq!(no, vec![0, 4, 9]);
+        // Concatenated ids in tile order.
+        assert_eq!(ni, vec![1, 2, 99, 100, 3, 4, 5, 99, 100]);
+    }
+
+    #[test]
+    fn splice_empty_tile_still_gets_transient() {
+        // Tile 0 has no objects, but transient should still appear.
+        let offsets = u32s(&[0, 0, 1]);
+        let ids = u32s(&[42]);
+        let (no, ni) = splice_transient_into_tile_lists(&offsets, &ids, &[7]);
+        assert_eq!(no, vec![0, 1, 3]);
+        assert_eq!(ni, vec![7, 42, 7]);
+    }
 }
 

@@ -203,6 +203,27 @@ pub(crate) struct EngineState {
     /// (engine sends `WorkerControl::ReloadUserShaders`).
     pub(crate) user_shader_registry: rkp_render::shader_composer::UserShaderRegistry,
 
+    /// Phase C — region requests for the GPU geometry-build pass.
+    /// V1: populated by explicit engine commands; the auto-scan over
+    /// ECS leaf-level materials lands in a follow-up. Sim ships this
+    /// list to the render thread each tick where `UserShaderPass`
+    /// caches + dispatches.
+    pub(crate) user_shader_regions:
+        Vec<rkp_render::user_shader_pass::ShaderRegionRequest>,
+
+    /// Per-entity painted-material info, cached on
+    /// `(paint_epoch, geometry_epoch)`. Outer key is the entity's
+    /// scene `object_id`; inner map is `material_id → object-local
+    /// AABB of leaves with that material`. The shader-region request
+    /// uses the AABB to size the geom dispatch tightly so grass /
+    /// fur etc. only renders where actually painted.
+    pub(crate) painted_materials:
+        std::collections::HashMap<u32, std::collections::HashMap<u16, rkp_core::Aabb>>,
+    /// Epochs the cache was last reconciled against. When either
+    /// moves ahead, we invalidate and re-scan affected entities.
+    pub(crate) painted_materials_paint_epoch: u64,
+    pub(crate) painted_materials_geometry_epoch: u64,
+
     // Input + Camera
     pub(crate) input_system: rkp_runtime::input::InputSystem,
     pub(crate) camera_control: CameraControlState,
@@ -661,6 +682,10 @@ impl EngineState {
             bake_worker,
             generator_system,
             user_shader_registry: rkp_render::shader_composer::UserShaderRegistry::empty(),
+            user_shader_regions: Vec::new(),
+            painted_materials: std::collections::HashMap::new(),
+            painted_materials_paint_epoch: 0,
+            painted_materials_geometry_epoch: 0,
             render_worker,
             scene_mgr,
             geometry_epoch_handle,

@@ -116,6 +116,26 @@ pub struct RenderFrame {
     pub user_shader_shade_chunk: String,
     pub user_shader_source_hash: u64,
 
+    /// Composed user-shader chunk for the geometry-build compute pass
+    /// (Phase C). Defines `dispatch_user_generate(...)`. Spliced into
+    /// `user_shader_geom.wgsl` between its USER_GENERATE markers.
+    /// Empty when no shader declares a `generate` hook; the in-tree
+    /// identity stub returns a "skip" emit.
+    pub user_shader_generate_chunk: String,
+
+    /// Editor snapshots of all currently-registered user shaders.
+    /// `UserShaderPass` reads metadata (animated, region_thickness,
+    /// cell_size, has_generate, params order) from this list. Mirrors
+    /// what `StateUpdate.user_shaders` ships to the editor.
+    pub user_shader_infos: Vec<rkp_render::shader_composer::UserShaderInfo>,
+
+    /// Region requests for the user-shader geometry pass. Each entry
+    /// asks the GPU pipeline to materialize voxels by calling the
+    /// shader's `generate` hook over its AABB at the requested
+    /// resolution. Stable across frames so the cache can hit; sim
+    /// rebuilds this list each tick. Empty = no geometry generation.
+    pub user_shader_regions: Vec<rkp_render::user_shader_pass::ShaderRegionRequest>,
+
     /// Scene-wide light list (sun + entity point/spot lights), in the
     /// order the shade shader expects (entry 0 = sun).
     pub lights: Vec<GpuLight>,

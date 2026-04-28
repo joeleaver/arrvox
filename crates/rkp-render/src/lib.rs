@@ -66,6 +66,10 @@ pub mod proc_ghost;
 pub mod proc_sample;
 /// Composes user-authored WGSL hooks into the procedural evaluator.
 pub mod shader_composer;
+/// Phase C — GPU runtime geometry pass. User-shader `generate` hooks
+/// run here, materializing voxels in a transient pool the march/shade
+/// passes already know how to read.
+pub mod user_shader_pass;
 /// Skeletal skin-deform scatter pass — per-frame bone-field writer.
 pub mod skin_deform;
 /// CPU-side paint writes against the scene's LeafAttrPool (material +

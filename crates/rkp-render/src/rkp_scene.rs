@@ -228,6 +228,78 @@ impl RkpScene {
         )
     }
 
+    /// Phase C — reserve a tail of `extra_bytes` past the currently-
+    /// uploaded CPU data on each of the three pool buffers user-shader
+    /// geometry writes into. The transient writes land in this tail;
+    /// the march/shade passes read from the same buffers via separate
+    /// `read_only` bind groups, so no data movement is required.
+    ///
+    /// Buffer reallocations bump `buffers_epoch` so viewport-renderer
+    /// scene bind groups (and the user-shader pass's group 0)
+    /// rebuild. The transient cache treats any reallocation as a
+    /// flush — its previous writes are gone.
+    ///
+    /// `cpu_*_bytes` is the byte length of the CPU-managed head — the
+    /// reserved tail starts at `cpu_*_bytes` and runs through
+    /// `cpu_*_bytes + extra_*_bytes`. Zero `extra_*_bytes` is
+    /// equivalent to "no reservation" — pass that when no user
+    /// shader has a `generate` hook.
+    pub fn ensure_user_shader_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        cpu_octree_bytes: u64,
+        extra_octree_bytes: u64,
+        cpu_brick_bytes: u64,
+        extra_brick_bytes: u64,
+        cpu_leaf_attr_bytes: u64,
+        extra_leaf_attr_bytes: u64,
+        cpu_brick_face_links_bytes: u64,
+        extra_brick_face_links_bytes: u64,
+    ) -> bool {
+        let mut bumped = false;
+        bumped |= Self::ensure_capacity(
+            device, &mut self.octree_nodes_buffer, "rkp_octree_nodes",
+            cpu_octree_bytes + extra_octree_bytes,
+        );
+        bumped |= Self::ensure_capacity(
+            device, &mut self.brick_pool_buffer, "rkp_brick_pool",
+            cpu_brick_bytes + extra_brick_bytes,
+        );
+        bumped |= Self::ensure_capacity(
+            device, &mut self.leaf_attr_pool_buffer, "rkp_leaf_attr_pool",
+            cpu_leaf_attr_bytes + extra_leaf_attr_bytes,
+        );
+        bumped |= Self::ensure_capacity(
+            device, &mut self.brick_face_links_buffer, "rkp_brick_face_links",
+            cpu_brick_face_links_bytes + extra_brick_face_links_bytes,
+        );
+        if bumped {
+            self.buffers_epoch += 1;
+        }
+        bumped
+    }
+
+    /// Buffer-size guarantee without writing data. Used by the
+    /// user-shader transient-pool reservation. Returns `true` iff a
+    /// new buffer was created (caller must refresh dependent bind
+    /// groups).
+    fn ensure_capacity(
+        device: &wgpu::Device,
+        buffer: &mut wgpu::Buffer,
+        label: &str,
+        min_bytes: u64,
+    ) -> bool {
+        if min_bytes == 0 {
+            return false;
+        }
+        if min_bytes > buffer.size() {
+            *buffer = Self::create_storage(device, label, min_bytes);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Ensure `bone_field_buffer` has at least `required_bytes` of
     /// storage. Grows (doubles) as needed and bumps `buffers_epoch` so
     /// each `ViewportRenderer` rebuilds its cached scene bind group.

@@ -77,6 +77,11 @@ pub struct ShaderMetadata {
     /// Preferred voxel resolution for the geometry pass. `None` falls
     /// back to a per-object default (e.g. host's voxel size).
     pub cell_size: Option<f32>,
+    /// Preferred octree depth N for the geometry pass — the region's
+    /// brick grid is `(4 * 2^N)` cells per axis. `None` falls back
+    /// to the engine's default (V2: 2 → 16 cells/axis). Capped to
+    /// 6 by the dispatcher; deeper requires sparse BFS.
+    pub octree_depth: Option<u32>,
 }
 
 /// One user shader's parsed hook bodies + header metadata. Each `*_text`
@@ -91,7 +96,9 @@ pub struct ShaderMetadata {
 ///     GPU geometry pipeline to emit voxels into the sidecar pool.
 ///
 /// A shader may declare either or both hooks (or neither — empty is
-/// legal, just contributes nothing).
+/// legal, just contributes nothing). Helper functions (anything not
+/// matching `user_<stem>_<hook>`) are captured into `helpers` and
+/// emitted alongside the hook bodies so user code can call them.
 #[derive(Debug, Clone)]
 pub struct UserShaderEntry {
     /// File stem, used both as the on-disk shader name (what materials
@@ -111,6 +118,11 @@ pub struct UserShaderEntry {
     /// Captured fn declarations.
     pub shade_text: Option<String>,
     pub generate_text: Option<String>,
+    /// User-defined helper functions (not hooks). Captured verbatim
+    /// so hook bodies can call them. Identifier collisions across
+    /// shaders are user-managed — pick unique helper names if
+    /// loading multiple shaders together.
+    pub helpers: Vec<String>,
 }
 
 impl UserShaderEntry {
@@ -170,6 +182,7 @@ impl UserShaderRegistry {
                 region_thickness: e.metadata.region_thickness,
                 animated: e.metadata.animated,
                 cell_size: e.metadata.cell_size,
+                octree_depth: e.metadata.octree_depth,
                 has_shade: e.shade_text.is_some(),
                 has_generate: e.generate_text.is_some(),
             })
@@ -203,6 +216,7 @@ pub struct UserShaderInfo {
     pub region_thickness: f32,
     pub animated: bool,
     pub cell_size: Option<f32>,
+    pub octree_depth: Option<u32>,
     pub has_shade: bool,
     pub has_generate: bool,
 }
@@ -304,6 +318,7 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
         metadata,
         shade_text: None,
         generate_text: None,
+        helpers: Vec::new(),
     };
 
     let mut cursor = 0usize;
@@ -360,6 +375,10 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
                 });
             }
             *slot = Some(fn_text);
+        } else {
+            // Non-hook function — user-defined helper. Captured
+            // verbatim so the hook body can call it.
+            entry.helpers.push(fn_text);
         }
 
         cursor = body_close + 1;
@@ -411,6 +430,23 @@ fn parse_metadata(
             }
             "cell_size" => {
                 md.cell_size = Some(parse_f32(path, line_no, "cell_size", args)?);
+            }
+            "octree_depth" => {
+                let v: u32 = args.trim().parse().map_err(|_| ShaderComposerError::Parse {
+                    path: path.to_path_buf(),
+                    line: line_no,
+                    msg: format!("@octree_depth expects a u32, got `{args}`"),
+                })?;
+                if v > 6 {
+                    return Err(ShaderComposerError::Parse {
+                        path: path.to_path_buf(),
+                        line: line_no,
+                        msg: format!(
+                            "@octree_depth {v} too deep — V4 dense bricks cap at 6 (sparse BFS needed for deeper)"
+                        ),
+                    });
+                }
+                md.octree_depth = Some(v);
             }
             "animated" => {
                 if !args.is_empty() {
@@ -559,7 +595,15 @@ pub fn compose(reg: &UserShaderRegistry) -> ComposedChunks {
 
 fn compose_shade_chunk(reg: &UserShaderRegistry) -> String {
     let mut out = String::new();
-    out.push_str("// ── user-shader bodies: shade ──────────────────────────\n");
+    out.push_str("// ── user-shader helpers + bodies: shade ───────────────\n");
+    for entry in &reg.entries {
+        if entry.shade_text.is_some() {
+            for helper in &entry.helpers {
+                out.push_str(helper);
+                out.push('\n');
+            }
+        }
+    }
     for entry in &reg.entries {
         if let Some(text) = &entry.shade_text {
             out.push_str(&rewrite_fn_name(
@@ -591,7 +635,15 @@ fn compose_shade_chunk(reg: &UserShaderRegistry) -> String {
 
 fn compose_generate_chunk(reg: &UserShaderRegistry) -> String {
     let mut out = String::new();
-    out.push_str("// ── user-shader bodies: generate ───────────────────────\n");
+    out.push_str("// ── user-shader helpers + bodies: generate ────────────\n");
+    for entry in &reg.entries {
+        if entry.generate_text.is_some() {
+            for helper in &entry.helpers {
+                out.push_str(helper);
+                out.push('\n');
+            }
+        }
+    }
     for entry in &reg.entries {
         if let Some(text) = &entry.generate_text {
             out.push_str(&rewrite_fn_name(
@@ -789,6 +841,10 @@ fn compute_registry_hash(entries: &[UserShaderEntry]) -> u64 {
             }
             buf.push(0);
         }
+        for helper in &e.helpers {
+            buf.extend_from_slice(helper.as_bytes());
+            buf.push(0);
+        }
         // Metadata also contributes to the hash so a change to default
         // values / range / @animated invalidates dependent caches.
         for p in &e.metadata.params {
@@ -805,6 +861,10 @@ fn compute_registry_hash(entries: &[UserShaderEntry]) -> u64 {
         buf.push(if e.metadata.animated { 1 } else { 0 });
         if let Some(s) = e.metadata.cell_size {
             buf.extend_from_slice(&s.to_le_bytes());
+        }
+        buf.push(0);
+        if let Some(d) = e.metadata.octree_depth {
+            buf.extend_from_slice(&d.to_le_bytes());
         }
         buf.push(0);
     }

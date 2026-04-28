@@ -373,6 +373,11 @@ impl MaterialLibrary {
     }
 
     /// Get an immutable reference to a material definition by ID.
+    /// Total slot count including the default (slot 0) and tombstoned
+    /// slots. Iteration `0..slot_count()` covers every id ever
+    /// assigned in the current session.
+    pub fn slot_count(&self) -> usize { self.slots.len() }
+
     pub fn get_def(&self, id: u16) -> Option<&MaterialDef> {
         match self.slots.get(id as usize) {
             Some(MaterialSlot::Loaded { def, .. }) => Some(def),

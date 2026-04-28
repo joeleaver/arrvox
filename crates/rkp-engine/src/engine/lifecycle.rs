@@ -51,7 +51,22 @@ impl EngineState {
         //     render saw it.
         let (materials, shader_params_slots) = {
             let registry = &self.user_shader_registry;
-            let palette = self.material_lib.build_palette(&|name| registry.resolve(name));
+            // Only resolve shader_ids for shaders that actually have a
+            // `shade` hook. The shade pass takes the PBR path when
+            // `material.shader_id == 0`; if we resolved every name
+            // unconditionally, a geom-only shader (no `shade` hook)
+            // would dispatch into the default `shade_result_passthrough`
+            // arm and write raw albedo (~1 nit) to the HDR output, which
+            // tone-maps to black against ~90 000-nit sun lighting. The
+            // geom pass resolves shader_ids separately by name, so this
+            // restriction doesn't affect it.
+            let palette = self.material_lib.build_palette(&|name| {
+                registry
+                    .entries()
+                    .iter()
+                    .find(|e| e.name == name && e.shade_text.is_some())
+                    .map(|e| e.id)
+            });
             let params = self.material_lib.build_shader_params(registry);
             (palette, params)
         };
@@ -60,7 +75,252 @@ impl EngineState {
         // pipeline rebuilds when nothing changed.
         let composed = rkp_render::shader_composer::compose(&self.user_shader_registry);
         let user_shader_shade_chunk = composed.shade;
+        let user_shader_generate_chunk = composed.generate;
         let user_shader_source_hash = self.user_shader_registry.source_hash();
+        let user_shader_infos = self.user_shader_registry.shader_infos();
+        // Phase C V6 — auto ECS scan with per-leaf material support.
+        // Scans each entity's leaf_attr range to find which generate-
+        // hook-equipped materials are present (entity-level fallback
+        // material, painted leaves, or both). Emits one region per
+        // (entity, painted-material). Cached on (paint_epoch,
+        // geometry_epoch) so the scan only runs when leaf data
+        // changed.
+        let mut user_shader_regions: Vec<rkp_render::user_shader_pass::ShaderRegionRequest> =
+            Vec::with_capacity(self.user_shader_regions.len());
+        // Manual registrations come first (engine-command path; empty
+        // unless something explicitly populates it).
+        user_shader_regions.extend(self.user_shader_regions.iter().cloned());
+        let infos = self.user_shader_registry.shader_infos();
+
+        // Build the set of "shader-bearing material ids" — only
+        // materials with a `generate`-hook shader trigger regions.
+        let mut shader_materials: std::collections::HashMap<
+            u16,
+            rkp_render::shader_composer::UserShaderInfo,
+        > = std::collections::HashMap::new();
+        if infos.iter().any(|i| i.has_generate) {
+            for slot_id in 0..self.material_lib.slot_count() as u16 {
+                let Some(def) = self.material_lib.get_def(slot_id) else { continue; };
+                let Some(shader_name) = def.shader.as_deref() else { continue; };
+                let Some(info) = infos.iter().find(|i| i.name == shader_name) else { continue; };
+                if info.has_generate {
+                    shader_materials.insert(slot_id, info.clone());
+                }
+            }
+        }
+
+        if !shader_materials.is_empty() {
+            // Reconcile the per-entity painted-material cache against
+            // current paint + geometry epochs. Both bump on any
+            // leaf-attr write (paint stroke, voxelize, asset load),
+            // so a single equality check covers all invalidation.
+            let (cur_paint, cur_geom) = {
+                let sm = self.scene_mgr.lock().expect("scene_mgr poisoned");
+                (sm.paint_epoch(), sm.geometry_epoch())
+            };
+            if cur_paint != self.painted_materials_paint_epoch
+                || cur_geom != self.painted_materials_geometry_epoch
+            {
+                use crate::components::{Renderable, Transform};
+                self.painted_materials.clear();
+                let sm = self.scene_mgr.lock().expect("scene_mgr poisoned");
+                let octree_data = sm.octree.data();
+                let brick_pool_data = sm.brick_pool.as_slice();
+                for (entity, _) in self
+                    .world
+                    .query::<(&Renderable, &Transform)>()
+                    .iter()
+                {
+                    let Ok(r) = self.world.get::<&Renderable>(entity) else { continue; };
+                    let Some(spatial) = &r.spatial else { continue; };
+                    let Some(&gpu_idx) = self.entity_to_gpu.get(&entity) else { continue; };
+                    let object_id = gpu_idx as u32;
+                    // Walk the entity's octree to build per-material
+                    // bounding boxes for leaves whose material has a
+                    // generate-hook shader. The AABB lets the
+                    // region request size itself tightly, so painting
+                    // grass on one ear doesn't grass-ify the whole
+                    // elephant.
+                    let mut mat_aabbs: std::collections::HashMap<
+                        u16,
+                        rkp_core::Aabb,
+                    > = std::collections::HashMap::new();
+                    scan_painted_aabbs(
+                        octree_data,
+                        brick_pool_data,
+                        &sm.leaf_attr_pool,
+                        spatial.root_offset as usize,
+                        spatial.depth,
+                        spatial.grid_origin,
+                        spatial.base_voxel_size,
+                        &shader_materials,
+                        &mut mat_aabbs,
+                    );
+                    if !mat_aabbs.is_empty() {
+                        self.painted_materials.insert(object_id, mat_aabbs);
+                    }
+                }
+                drop(sm);
+                self.painted_materials_paint_epoch = cur_paint;
+                self.painted_materials_geometry_epoch = cur_geom;
+            }
+        }
+
+        // Emit one region per (object, painted-material) pair. For
+        // objects whose primary material itself has a generate hook,
+        // that material lands in `painted_materials` from the scan
+        // above (every leaf carries the entity-level fallback unless
+        // explicitly painted), so we don't need a separate primary-
+        // material code path.
+        if !shader_materials.is_empty() {
+            for obj in self.gpu_objects.iter() {
+                let Some(mat_aabbs) = self.painted_materials.get(&obj.object_id) else { continue; };
+                for (&mat_id, local_aabb) in mat_aabbs.iter() {
+                    let Some(def) = self.material_lib.get_def(mat_id) else { continue; };
+                    let Some(info) = shader_materials.get(&mat_id) else { continue; };
+                // Pack params in the shader's declared order.
+                let mut params: Vec<f32> = Vec::with_capacity(info.params.len());
+                for p in &info.params {
+                    let v = def
+                        .shader_params
+                        .get(&p.name)
+                        .and_then(|v| v.as_f64())
+                        .map(|v| v as f32)
+                        .unwrap_or(p.default);
+                    params.push(v);
+                }
+                // V7 — transform the painted-leaf local AABB (built
+                // by the octree scan above) to world space. Tight to
+                // the painted area, so grass only appears where you
+                // painted, not over the whole host.
+                let world: glam::Mat4 = glam::Mat4::from_cols_array_2d(&obj.world);
+                let lmin = local_aabb.min;
+                let lmax = local_aabb.max;
+                // Inflate by the shader's region_thickness so the
+                // brick grid covers grass blade tips (which sit
+                // outside the painted leaves' AABB).
+                let pad = info.region_thickness.max(1e-3);
+                let lmin = [lmin.x - pad, lmin.y - pad, lmin.z - pad];
+                let lmax = [lmax.x + pad, lmax.y + pad, lmax.z + pad];
+                let local_corners = [
+                    [lmin[0], lmin[1], lmin[2]],
+                    [lmax[0], lmin[1], lmin[2]],
+                    [lmin[0], lmax[1], lmin[2]],
+                    [lmax[0], lmax[1], lmin[2]],
+                    [lmin[0], lmin[1], lmax[2]],
+                    [lmax[0], lmin[1], lmax[2]],
+                    [lmin[0], lmax[1], lmax[2]],
+                    [lmax[0], lmax[1], lmax[2]],
+                ];
+                let mut world_min = [f32::INFINITY; 3];
+                let mut world_max = [f32::NEG_INFINITY; 3];
+                for c in &local_corners {
+                    let p = world.project_point3(glam::Vec3::new(c[0], c[1], c[2]));
+                    for i in 0..3 {
+                        world_min[i] = world_min[i].min(p[i]);
+                        world_max[i] = world_max[i].max(p[i]);
+                    }
+                }
+                // Octree depth: shader's `@octree_depth` if set, else
+                // engine default (2). Capped at 6 since deeper dense
+                // bricks blow out the pool budget; sparse BFS lifts
+                // this in V5.
+                const DEFAULT_DEPTH: u32 = 2;
+                const MAX_DEPTH: u32 = 6;
+                let octree_depth = info
+                    .octree_depth
+                    .unwrap_or(DEFAULT_DEPTH)
+                    .min(MAX_DEPTH);
+                // Cells per axis = 4 * 2^depth.
+                let cells_per_axis = 4u32 << octree_depth;
+                let extent = (world_max[0] - world_min[0])
+                    .max(world_max[1] - world_min[1])
+                    .max(world_max[2] - world_min[2]);
+                let cell_size = info
+                    .cell_size
+                    .unwrap_or((extent / cells_per_axis as f32).max(1e-3));
+                // Input hash folds material slot + object id +
+                // transform-relevant bits; the cache also folds source
+                // hash and geometry epoch on top, so changes the
+                // shader / palette / host bake invalidate correctly.
+                let mut input_hash: u64 = 0xcbf29ce484222325;
+                let mix = |h: &mut u64, b: u8| {
+                    *h ^= b as u64;
+                    *h = h.wrapping_mul(0x100000001b3);
+                };
+                for &b in &obj.object_id.to_le_bytes() { mix(&mut input_hash, b); }
+                for &b in &(mat_id as u32).to_le_bytes() { mix(&mut input_hash, b); }
+                for col in &obj.world {
+                    for &v in col { for &b in &v.to_le_bytes() { mix(&mut input_hash, b); } }
+                }
+                // Center the brick-grid cube on the host's AABB
+                // center rather than anchoring it at world_min. The
+                // brick grid is always a cube of side `extent` (the
+                // largest world AABB axis), so for non-cube hosts an
+                // anchored grid puts the cube's center off the host's
+                // actual middle. Centering puts the user shader's
+                // `aabb_min + extent/2` at the true host center,
+                // which is the natural reference point for shaders
+                // that fill a sphere or shell relative to the host.
+                let world_center = [
+                    0.5 * (world_min[0] + world_max[0]),
+                    0.5 * (world_min[1] + world_max[1]),
+                    0.5 * (world_min[2] + world_max[2]),
+                ];
+                let half_extent = extent * 0.5;
+                let centered_min = [
+                    world_center[0] - half_extent,
+                    world_center[1] - half_extent,
+                    world_center[2] - half_extent,
+                ];
+                let centered_max = [
+                    world_center[0] + half_extent,
+                    world_center[1] + half_extent,
+                    world_center[2] + half_extent,
+                ];
+                // Host octree info — copied off the host's GPU
+                // object so the geom pass can descend it via
+                // `host_sample_at`. Only voxelized hosts have a
+                // valid octree; for `geom_type != VOXELIZED` we
+                // pass the no-host sentinel and host_sample_at
+                // returns the (+inf, +Y) fallback.
+                let host_voxelized = obj.geom_type
+                    == rkp_render::rkp_gpu_object::geom_type::VOXELIZED;
+                let host_octree_root = if host_voxelized {
+                    obj.octree_root
+                } else {
+                    0xFFFFFFFFu32
+                };
+                let host_octree_extent = f32::from_bits(obj.octree_extent_bits);
+                let shader_name = def
+                    .shader
+                    .as_deref()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                user_shader_regions.push(rkp_render::user_shader_pass::ShaderRegionRequest {
+                    host_object_id: obj.object_id,
+                    // V6 — material_id is the painted material, not
+                    // the entity-level fallback. Lets a single host
+                    // emit several regions, one per painted shader.
+                    material_id: mat_id as u32,
+                    shader_name,
+                    params,
+                    aabb_min: centered_min,
+                    aabb_max: centered_max,
+                    cell_size,
+                    input_hash,
+                    animated: info.animated,
+                    region_thickness: info.region_thickness,
+                    octree_depth,
+                    host_octree_root,
+                    host_octree_depth: obj.octree_depth,
+                    host_octree_extent,
+                    host_grid_origin: obj.grid_origin,
+                    host_inverse_world: obj.inverse_world,
+                });
+                }
+            }
+        }
         // Clear the dirty flag so any other consumers (UI, etc.)
         // know the palette they observed has been published. We
         // ship every tick regardless, so the flag is purely for
@@ -655,6 +915,9 @@ impl EngineState {
             shader_params_slots,
             user_shader_shade_chunk,
             user_shader_source_hash,
+            user_shader_generate_chunk,
+            user_shader_infos,
+            user_shader_regions,
             lights: gpu_lights,
             shade_params_base: self.shade_params_base,
             env_update,
@@ -698,5 +961,343 @@ impl EngineState {
         self.frame_index += 1;
     }
 
+}
+
+/// Walk an entity's octree (rooted at `root_offset` inside the
+/// global packed `octree_data` buffer) and accumulate, per
+/// shader-bearing material, the object-local AABB of leaves with
+/// that material. Used by the per-leaf-material auto-scan to size
+/// the geom-pipeline region tightly.
+///
+/// `octree_data` is the absolute-rebased packed buffer; branches
+/// store offsets directly into this slice. Bricks are flattened
+/// further — for each brick we walk its 64 cells in `brick_pool` and
+/// look up cell leaf-attrs. Leaves at higher levels (shallow trees
+/// without bricks) cover a 2^(depth-leaf_level) cube of voxel cells.
+fn scan_painted_aabbs(
+    octree_data: &[u32],
+    brick_pool: &[u32],
+    leaf_attrs: &rkp_core::LeafAttrPool,
+    root_offset: usize,
+    depth: u8,
+    grid_origin: glam::Vec3,
+    base_voxel_size: f32,
+    shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
+    out: &mut std::collections::HashMap<u16, rkp_core::Aabb>,
+) {
+    use rkp_core::sparse_octree::{
+        is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE,
+    };
+    use rkp_core::brick_pool::{BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR};
+    const BRICK_CELL_EMPTY: u32 = 0xFFFF_FFFFu32;
+
+    fn expand_aabb(out: &mut std::collections::HashMap<u16, rkp_core::Aabb>, mat: u16, mn: glam::Vec3, mx: glam::Vec3) {
+        let entry = out.entry(mat).or_insert(rkp_core::Aabb {
+            min: glam::Vec3::splat(f32::INFINITY),
+            max: glam::Vec3::splat(f32::NEG_INFINITY),
+        });
+        entry.min = entry.min.min(mn);
+        entry.max = entry.max.max(mx);
+    }
+
+    fn walk(
+        octree_data: &[u32],
+        brick_pool: &[u32],
+        leaf_attrs: &rkp_core::LeafAttrPool,
+        offset: usize,
+        level: u8,
+        max_depth: u8,
+        coord_voxels: glam::UVec3,
+        grid_origin: glam::Vec3,
+        base_vs: f32,
+        shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
+        out: &mut std::collections::HashMap<u16, rkp_core::Aabb>,
+    ) {
+        use rkp_core::sparse_octree::{
+            is_brick, is_leaf, leaf_slot, brick_id, EMPTY_NODE, INTERIOR_NODE,
+        };
+        use rkp_core::brick_pool::{BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR};
+        const BRICK_CELL_EMPTY: u32 = 0xFFFF_FFFFu32;
+
+        if offset >= octree_data.len() { return; }
+        let node = octree_data[offset];
+        if node == EMPTY_NODE || node == INTERIOR_NODE { return; }
+        if is_brick(node) {
+            let brick_id = brick_id(node);
+            let base_idx = (brick_id * BRICK_CELLS) as usize;
+            for cz in 0..BRICK_DIM {
+                for cy in 0..BRICK_DIM {
+                    for cx in 0..BRICK_DIM {
+                        let cell_idx = (cz * BRICK_DIM * BRICK_DIM + cy * BRICK_DIM + cx) as usize;
+                        let pool_idx = base_idx + cell_idx;
+                        if pool_idx >= brick_pool.len() { continue; }
+                        let cell = brick_pool[pool_idx];
+                        if cell == BRICK_CELL_EMPTY || cell == BRICK_INTERIOR { continue; }
+                        let attr = leaf_attrs.get(cell);
+                        // Detect both the primary material and any
+                        // partial-blend secondary material — paint
+                        // strokes below full strength write to
+                        // secondary + blend_weight, leaving primary
+                        // unchanged.
+                        let primary = attr.material_primary;
+                        let secondary: u16 = attr.material_secondary_blend & 0x0FFF;
+                        let blend: u16 = (attr.material_secondary_blend >> 12) & 0xF;
+                        let painted_mat = if shader_materials.contains_key(&primary) {
+                            Some(primary)
+                        } else if blend > 0 && shader_materials.contains_key(&secondary) {
+                            Some(secondary)
+                        } else {
+                            None
+                        };
+                        if let Some(mat) = painted_mat {
+                            let cell_voxel = glam::UVec3::new(
+                                coord_voxels.x + cx,
+                                coord_voxels.y + cy,
+                                coord_voxels.z + cz,
+                            );
+                            let cell_local = grid_origin
+                                + glam::Vec3::new(
+                                    cell_voxel.x as f32,
+                                    cell_voxel.y as f32,
+                                    cell_voxel.z as f32,
+                                ) * base_vs;
+                            let mx = cell_local + glam::Vec3::splat(base_vs);
+                            super::lifecycle::expand_aabb(out, mat, cell_local, mx);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if is_leaf(node) {
+            let slot = leaf_slot(node);
+            let attr = leaf_attrs.get(slot);
+            let primary = attr.material_primary;
+            let secondary: u16 = attr.material_secondary_blend & 0x0FFF;
+            let blend: u16 = (attr.material_secondary_blend >> 12) & 0xF;
+            let painted_mat = if shader_materials.contains_key(&primary) {
+                Some(primary)
+            } else if blend > 0 && shader_materials.contains_key(&secondary) {
+                Some(secondary)
+            } else {
+                None
+            };
+            if let Some(mat) = painted_mat {
+                // Leaf at `level` covers a cube of `2^(max_depth-level)`
+                // voxels per axis at the FINEST resolution.
+                let voxels_per_side = 1u32 << (max_depth - level);
+                let leaf_size = voxels_per_side as f32 * base_vs;
+                let leaf_min = grid_origin
+                    + glam::Vec3::new(
+                        coord_voxels.x as f32,
+                        coord_voxels.y as f32,
+                        coord_voxels.z as f32,
+                    ) * base_vs;
+                let leaf_max = leaf_min + glam::Vec3::splat(leaf_size);
+                super::lifecycle::expand_aabb(out, mat, leaf_min, leaf_max);
+            }
+            return;
+        }
+        // Branch — descend into 8 children. `node` is the absolute
+        // offset of the first child (rebased at allocation time).
+        let _ = leaf_slot(0);  // silence unused-import warning when no leaves
+        let _ = INTERIOR_NODE;
+        if level >= max_depth { return; }
+        let child_voxels = 1u32 << (max_depth - level - 1);
+        for octant in 0u32..8 {
+            let dx = octant & 1;
+            let dy = (octant >> 1) & 1;
+            let dz = (octant >> 2) & 1;
+            let child_coord = glam::UVec3::new(
+                coord_voxels.x + dx * child_voxels,
+                coord_voxels.y + dy * child_voxels,
+                coord_voxels.z + dz * child_voxels,
+            );
+            let child_offset = node as usize + octant as usize;
+            walk(
+                octree_data,
+                brick_pool,
+                leaf_attrs,
+                child_offset,
+                level + 1,
+                max_depth,
+                child_coord,
+                grid_origin,
+                base_vs,
+                shader_materials,
+                out,
+            );
+        }
+    }
+
+    walk(
+        octree_data,
+        brick_pool,
+        leaf_attrs,
+        root_offset,
+        0,
+        depth,
+        glam::UVec3::ZERO,
+        grid_origin,
+        base_voxel_size,
+        shader_materials,
+        out,
+    );
+    let _ = (is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE, BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR, BRICK_CELL_EMPTY);
+}
+
+/// Diagnostic — count painted leaves on each side of `mid_x` (in
+/// object-local space). Mirrors the structure of `scan_painted_aabbs`
+/// but only tallies; used once per scan to disambiguate "scan misses
+/// half" from "paint really only on one half".
+fn count_painted_halves(
+    octree_data: &[u32],
+    brick_pool: &[u32],
+    leaf_attrs: &rkp_core::LeafAttrPool,
+    root_offset: usize,
+    depth: u8,
+    grid_origin: glam::Vec3,
+    base_voxel_size: f32,
+    mid_x: f32,
+    shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
+    left: &mut u32,
+    right: &mut u32,
+) {
+    use rkp_core::sparse_octree::{
+        is_brick, is_leaf, leaf_slot, brick_id, EMPTY_NODE, INTERIOR_NODE,
+    };
+    use rkp_core::brick_pool::{BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR};
+    const BRICK_CELL_EMPTY: u32 = 0xFFFF_FFFFu32;
+
+    fn check(material_packed: u32,
+             shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>) -> bool {
+        let primary = (material_packed & 0xFFFF) as u16;
+        let sec_blend = ((material_packed >> 16) & 0xFFFF) as u16;
+        let secondary = sec_blend & 0x0FFF;
+        let blend = (sec_blend >> 12) & 0xF;
+        if shader_materials.contains_key(&primary) {
+            return true;
+        }
+        if blend > 0 && shader_materials.contains_key(&secondary) {
+            return true;
+        }
+        false
+    }
+
+    fn walk(
+        octree_data: &[u32],
+        brick_pool: &[u32],
+        leaf_attrs: &rkp_core::LeafAttrPool,
+        offset: usize,
+        level: u8,
+        max_depth: u8,
+        coord_voxels: glam::UVec3,
+        grid_origin: glam::Vec3,
+        base_vs: f32,
+        mid_x: f32,
+        shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
+        left: &mut u32,
+        right: &mut u32,
+    ) {
+        use rkp_core::sparse_octree::{
+            is_brick, is_leaf, brick_id, EMPTY_NODE, INTERIOR_NODE,
+        };
+        use rkp_core::brick_pool::{BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR};
+        const BRICK_CELL_EMPTY: u32 = 0xFFFF_FFFFu32;
+        if offset >= octree_data.len() { return; }
+        let node = octree_data[offset];
+        if node == EMPTY_NODE || node == INTERIOR_NODE { return; }
+        if is_brick(node) {
+            let bid = brick_id(node);
+            let base_idx = (bid * BRICK_CELLS) as usize;
+            for cz in 0..BRICK_DIM {
+                for cy in 0..BRICK_DIM {
+                    for cx in 0..BRICK_DIM {
+                        let cell_idx = (cz * BRICK_DIM * BRICK_DIM + cy * BRICK_DIM + cx) as usize;
+                        let pool_idx = base_idx + cell_idx;
+                        if pool_idx >= brick_pool.len() { continue; }
+                        let cell = brick_pool[pool_idx];
+                        if cell == BRICK_CELL_EMPTY || cell == BRICK_INTERIOR { continue; }
+                        let attr = leaf_attrs.get(cell);
+                        let packed = (attr.material_primary as u32)
+                            | ((attr.material_secondary_blend as u32) << 16);
+                        if super::lifecycle::count_painted_halves_check(packed, shader_materials) {
+                            let cell_x = grid_origin.x + (coord_voxels.x + cx) as f32 * base_vs;
+                            if cell_x < mid_x { *left += 1; } else { *right += 1; }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if is_leaf(node) {
+            return;
+        }
+        if level >= max_depth { return; }
+        let child_voxels = 1u32 << (max_depth - level - 1);
+        for octant in 0u32..8 {
+            let dx = octant & 1;
+            let dy = (octant >> 1) & 1;
+            let dz = (octant >> 2) & 1;
+            let child_coord = glam::UVec3::new(
+                coord_voxels.x + dx * child_voxels,
+                coord_voxels.y + dy * child_voxels,
+                coord_voxels.z + dz * child_voxels,
+            );
+            walk(
+                octree_data,
+                brick_pool,
+                leaf_attrs,
+                node as usize + octant as usize,
+                level + 1,
+                max_depth,
+                child_coord,
+                grid_origin,
+                base_vs,
+                mid_x,
+                shader_materials,
+                left,
+                right,
+            );
+        }
+    }
+
+    walk(
+        octree_data, brick_pool, leaf_attrs, root_offset, 0, depth,
+        glam::UVec3::ZERO, grid_origin, base_voxel_size, mid_x,
+        shader_materials, left, right,
+    );
+    let _ = (is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE, BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR, BRICK_CELL_EMPTY);
+}
+
+pub(super) fn count_painted_halves_check(
+    material_packed: u32,
+    shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
+) -> bool {
+    let primary = (material_packed & 0xFFFF) as u16;
+    let sec_blend = ((material_packed >> 16) & 0xFFFF) as u16;
+    let secondary = sec_blend & 0x0FFF;
+    let blend = (sec_blend >> 12) & 0xF;
+    if shader_materials.contains_key(&primary) {
+        return true;
+    }
+    if blend > 0 && shader_materials.contains_key(&secondary) {
+        return true;
+    }
+    false
+}
+
+fn expand_aabb(
+    out: &mut std::collections::HashMap<u16, rkp_core::Aabb>,
+    mat: u16,
+    mn: glam::Vec3,
+    mx: glam::Vec3,
+) {
+    let entry = out.entry(mat).or_insert(rkp_core::Aabb {
+        min: glam::Vec3::splat(f32::INFINITY),
+        max: glam::Vec3::splat(f32::NEG_INFINITY),
+    });
+    entry.min = entry.min.min(mn);
+    entry.max = entry.max.max(mx);
 }
 
