@@ -515,38 +515,39 @@ pub struct PoolEstimate {
     pub leaf_attrs: u32,
 }
 
+/// V10 — uniform per-region slab size. Every tile reserves the same
+/// fixed chunk regardless of its actual painted-leaf count. Freed
+/// slots from evicted tiles are always reusable by future
+/// allocations of any size, eliminating fragmentation.
+///
+/// Tradeoff: tiny tiles (a single painted leaf) reserve the same
+/// slab as fully-saturated tiles (~4096 bricks). Worst-case memory
+/// usage equals the steady-state reservation that
+/// `run_user_shader_geom` makes, so there's no extra cost relative
+/// to the buffer pool we already allocate.
+///
+/// `painted_leaf_count` and `max_depth` are kept on the function
+/// signature for forward compatibility (a future revision could
+/// shrink slabs for low-demand tiles via a free-list-of-free-lists
+/// — but only after we've measured fragmentation pressure).
 pub fn estimate_region_pool(painted_leaf_count: u32, max_depth: u32) -> PoolEstimate {
-    let painted = painted_leaf_count.max(8);
-    // Per-region brick cap: dense maximum at this depth, bounded above
-    // so the SUM of per-region reservations across MAX_REGIONS active
-    // tiles stays within wgpu's `max_storage_buffer_binding_size`
-    // (1 GB) and `max_buffer_size` (2 GB) limits.
-    //
-    // Math: each brick costs 256 B in brick_pool and 256 B in
-    // leaf_attr_pool (≈ 0.5 KB per brick across the bound buffers).
-    // With MAX_REGIONS = 256 and per-region cap = 4096:
-    //   256 × 4096 × 256 B = 256 MB per pool. Comfortably under 1 GB.
-    // Beyond this cap a single tile's BFS overflows to OCTREE_EMPTY
-    // on the surplus bricks (visible patches in detail-heavy tiles
-    // with thick bands).
-    let dense_max_bricks = if max_depth >= 8 {
-        u32::MAX
-    } else {
-        1u32 << (max_depth * 3)
-    };
-    let region_cap = dense_max_bricks.min(4096);
-    // Per-painted-leaf brick factor scales with `2^max_depth` because
-    // band-volume / brick-volume grows like 2^d as bricks shrink. At
-    // depth 4 each painted host leaf needs ~20 transient bricks; at
-    // depth 8 it needs ~260. The constant 4 is a per-leaf overhead
-    // (ancestors in the spine).
-    let per_leaf_factor = 4u32 + (1u32 << max_depth);
-    let bricks_target = (painted * per_leaf_factor).max(128);
-    let bricks = bricks_target.min(region_cap);
+    let _ = painted_leaf_count;
+    // Bricks per region: matches `MAX_BRICKS_PER_REGION` constant in
+    // `run_user_shader_geom`. Sized for max_depth 8 (4096 = 2^12 bricks
+    // per region) so a single shader at @max_depth 8 fits without
+    // overflow; lower-depth shaders waste reserved slots within the
+    // slab but the BFS only allocates what it actually needs from the
+    // per-region atomic counter.
+    const SLAB_BRICKS: u32 = 4096;
+    // Octree per region: enough to hold the max possible internal +
+    // brick-leaf nodes a depth-N BFS produces, plus the always-
+    // existing root-to-deepest spine. SLAB_BRICKS × 8 covers the
+    // brick-leaf nodes; the +overhead covers internal branches.
+    let depth_overhead = (max_depth.max(1) + 1) * 8;
     PoolEstimate {
-        octree: bricks * 8 + (max_depth + 1) * 8,
-        bricks,
-        leaf_attrs: bricks * BRICK_CELLS / 2,
+        octree: SLAB_BRICKS * 8 + depth_overhead,
+        bricks: SLAB_BRICKS,
+        leaf_attrs: SLAB_BRICKS * BRICK_CELLS / 2,
     }
 }
 
@@ -1366,7 +1367,8 @@ mod tests {
     #[test]
     fn cache_returns_dirty_first_time_and_clean_second() {
         let mut cache = UserShaderObjectCache::new();
-        cache.set_pool_bases(0, 8192, 0, 65536, 0, 65536);
+        // Slab fits 4 regions: 4 × (32K bricks + 8K octree + 128K leaf-attrs).
+        cache.set_pool_bases(0, 32_900 * 4, 0, 4096 * 64 * 4, 0, 4096 * 32 * 4);
         let r = req(1, 1);
         let h = effective_hash(&r, 7, 0);
         let s1 = cache.lookup_or_allocate(&r, h).unwrap();
@@ -1381,7 +1383,8 @@ mod tests {
     #[test]
     fn cache_animated_always_dirty() {
         let mut cache = UserShaderObjectCache::new();
-        cache.set_pool_bases(0, 8192, 0, 65536, 0, 65536);
+        // Slab fits 4 regions: 4 × (32K bricks + 8K octree + 128K leaf-attrs).
+        cache.set_pool_bases(0, 32_900 * 4, 0, 4096 * 64 * 4, 0, 4096 * 32 * 4);
         let mut r = req(1, 1);
         r.animated = true;
         let h = effective_hash(&r, 1, 0);
@@ -1392,7 +1395,8 @@ mod tests {
     #[test]
     fn cache_different_keys_get_different_slots() {
         let mut cache = UserShaderObjectCache::new();
-        cache.set_pool_bases(0, 8192, 0, 65536, 0, 65536);
+        // Slab fits 4 regions: 4 × (32K bricks + 8K octree + 128K leaf-attrs).
+        cache.set_pool_bases(0, 32_900 * 4, 0, 4096 * 64 * 4, 0, 4096 * 32 * 4);
         let mut r = req(1, 1);
         let s1 = cache.lookup_or_allocate(&r, 0).unwrap();
         r.material_id = 2;
@@ -1405,7 +1409,8 @@ mod tests {
     #[test]
     fn cache_distinguishes_tiles_on_same_material() {
         let mut cache = UserShaderObjectCache::new();
-        cache.set_pool_bases(0, 8192, 0, 65536, 0, 65536);
+        // Slab fits 4 regions: 4 × (32K bricks + 8K octree + 128K leaf-attrs).
+        cache.set_pool_bases(0, 32_900 * 4, 0, 4096 * 64 * 4, 0, 4096 * 32 * 4);
         let mut r = req(1, 1);
         r.tile_index = [0, 0, 0];
         let s1 = cache.lookup_or_allocate(&r, 0).unwrap();
@@ -1419,7 +1424,8 @@ mod tests {
     #[test]
     fn evict_untouched_drops_abandoned_tiles() {
         let mut cache = UserShaderObjectCache::new();
-        cache.set_pool_bases(0, 8192, 0, 65536, 0, 65536);
+        // Slab fits 4 regions: 4 × (32K bricks + 8K octree + 128K leaf-attrs).
+        cache.set_pool_bases(0, 32_900 * 4, 0, 4096 * 64 * 4, 0, 4096 * 32 * 4);
         let mut r = req(1, 1);
         // Frame 1 — three tiles allocated.
         cache.begin_frame();
@@ -1450,7 +1456,8 @@ mod tests {
     #[test]
     fn cache_flushes_on_geometry_epoch_bump() {
         let mut cache = UserShaderObjectCache::new();
-        cache.set_pool_bases(0, 8192, 0, 65536, 0, 65536);
+        // Slab fits 4 regions: 4 × (32K bricks + 8K octree + 128K leaf-attrs).
+        cache.set_pool_bases(0, 32_900 * 4, 0, 4096 * 64 * 4, 0, 4096 * 32 * 4);
         let r = req(1, 1);
         cache.lookup_or_allocate(&r, 0);
         assert!(cache.reconcile_epoch(1));
@@ -1480,20 +1487,28 @@ mod tests {
     }
 
     #[test]
-    fn estimate_scales_with_painted_count() {
+    fn estimate_uniform_slab_size() {
+        // V10 slab allocator: every region reserves the same size,
+        // independent of painted_leaf_count. The fixed slab makes
+        // freed slots reusable by any future allocation, eliminating
+        // the fragmentation that previously broke the cache once
+        // tile estimates fluctuated.
         let small = estimate_region_pool(8, 4);
         let large = estimate_region_pool(800, 4);
-        assert!(large.octree > small.octree);
-        assert!(large.bricks > small.bricks);
-        assert!(large.leaf_attrs > small.leaf_attrs);
+        assert_eq!(large.octree, small.octree);
+        assert_eq!(large.bricks, small.bricks);
+        assert_eq!(large.leaf_attrs, small.leaf_attrs);
+        assert!(small.bricks > 0);
+        assert!(small.octree > 0);
+        assert!(small.leaf_attrs > 0);
     }
 
     #[test]
-    fn estimate_floor_for_zero_painted() {
-        let zero = estimate_region_pool(0, 4);
-        assert!(zero.octree > 0);
-        assert!(zero.bricks > 0);
-        assert!(zero.leaf_attrs > 0);
+    fn estimate_depth_8_within_slab_bounds() {
+        let est = estimate_region_pool(64, 8);
+        // Depth 8 doesn't blow past the slab (it's already sized for
+        // max_depth 8 worst case).
+        assert!(est.bricks <= 4096);
     }
 
     #[test]
