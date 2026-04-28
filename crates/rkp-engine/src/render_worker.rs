@@ -1469,7 +1469,14 @@ fn run_user_shader_geom(
         RegionUniform, BRICK_CELLS,
     };
 
-    const MAX_REGIONS: u32 = 256;
+    // V10 multi-region tiling: a single grass-painted host can emit
+    // dozens to low-hundreds of tile regions. 512 keeps room for
+    // many concurrent painted entities; above that we cap to keep
+    // total queue traffic within `PER_LEVEL_QUEUE_CAP` (65 K cells
+    // per level shared across regions) — overflow there silently
+    // degrades to missing tiles. Tightening MAX_REGIONS without
+    // bumping queue caps preserves correctness over coverage.
+    const MAX_REGIONS: u32 = 512;
     const FACE_EMPTY: u32 = 0xFFFFFFFFu32;
 
     // 1. Pipeline reload — track the shade-side hash; the geom and
@@ -1480,7 +1487,17 @@ fn run_user_shader_geom(
         frame.user_shader_source_hash,
     );
 
+    // V10 — mark all cache entries unused before we process this
+    // frame's requests. Lookups touch the entries they reference,
+    // and `evict_untouched` at the end drops the rest. Required for
+    // tile cache: when paint moves off a tile, its old cache entry
+    // would otherwise leak into transient_objects forever.
+    state.user_shader_cache.begin_frame();
+
     if frame.user_shader_regions.is_empty() {
+        // No requests this frame — evict everything since nothing
+        // got touched.
+        state.user_shader_cache.evict_untouched();
         return state.user_shader_cache.build_transient_objects();
     }
 
@@ -1614,6 +1631,12 @@ fn run_user_shader_geom(
         );
         state.queue.submit(Some(encoder.finish()));
     }
+
+    // V10 — drop entries that didn't get a request this frame.
+    // Their pool slices return to the free list for next frame's
+    // allocations; the entries themselves stop appearing in
+    // transient_objects so the march doesn't render stale data.
+    state.user_shader_cache.evict_untouched();
 
     state.user_shader_cache.build_transient_objects()
 }

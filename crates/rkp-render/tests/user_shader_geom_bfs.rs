@@ -22,7 +22,7 @@ use rkp_render::shader_composer::{compose, scan_dir};
 use rkp_render::user_shader_pass::{
     build_region_uniform, effective_hash, estimate_region_pool, resolve_shader_id,
     RegionUniform, ShaderRegionRequest, UserShaderObjectCache, UserShaderPass,
-    BRICK_CELLS, HOST_NO_HOST_SENTINEL,
+    BRICK_CELLS, HOST_NO_HOST_SENTINEL, NO_TILE,
 };
 
 fn create_device() -> Option<(wgpu::Device, wgpu::Queue)> {
@@ -177,6 +177,7 @@ fn user_ball_generate(cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx)
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ],
+        tile_index: NO_TILE,
     };
     let h = effective_hash(&req, registry.source_hash(), 0);
     let slot = cache.lookup_or_allocate(&req, h).unwrap();

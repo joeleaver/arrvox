@@ -212,14 +212,23 @@ pub(crate) struct EngineState {
         Vec<rkp_render::user_shader_pass::ShaderRegionRequest>,
 
     /// Per-entity painted-material info, cached on
-    /// `(paint_epoch, geometry_epoch)`. Outer key is the entity's
-    /// scene `object_id`; inner map is `material_id → (object-local
-    /// AABB of painted leaves, count of painted leaves)`. The AABB
-    /// sizes the geom dispatch tightly so grass / fur only renders
-    /// where actually painted; the count drives V9's per-region pool
-    /// sizing (sparse BFS scales with surface area).
-    pub(crate) painted_materials:
-        std::collections::HashMap<u32, std::collections::HashMap<u16, (rkp_core::Aabb, u32)>>,
+    /// `(paint_epoch, geometry_epoch)`. Layout:
+    ///   `object_id → material_id → tile_coord → (tile-local AABB,
+    ///    count of painted leaves in that tile)`.
+    /// V10 multi-region tiling: shaders with `@tile_size` emit one
+    /// region per non-empty tile, so we bucket painted leaves by
+    /// tile coord during the scan. For shaders without `@tile_size`,
+    /// the inner map has a single entry under the sentinel coord
+    /// `NO_TILE` (V9 single-region fallback). The AABB stored is the
+    /// painted-leaf bounds within the tile (or the full bounds for
+    /// `NO_TILE`); the count drives per-region pool sizing.
+    pub(crate) painted_materials: std::collections::HashMap<
+        u32,
+        std::collections::HashMap<
+            u16,
+            std::collections::HashMap<[i32; 3], (rkp_core::Aabb, u32)>,
+        >,
+    >,
     /// Epochs the cache was last reconciled against. When either
     /// moves ahead, we invalidate and re-scan affected entities.
     pub(crate) painted_materials_paint_epoch: u64,

@@ -141,9 +141,9 @@ impl EngineState {
                     // region request size itself tightly, so painting
                     // grass on one ear doesn't grass-ify the whole
                     // elephant.
-                    let mut mat_aabbs: std::collections::HashMap<
+                    let mut mat_tiles: std::collections::HashMap<
                         u16,
-                        (rkp_core::Aabb, u32),
+                        std::collections::HashMap<[i32; 3], (rkp_core::Aabb, u32)>,
                     > = std::collections::HashMap::new();
                     scan_painted_aabbs(
                         octree_data,
@@ -154,10 +154,10 @@ impl EngineState {
                         spatial.grid_origin,
                         spatial.base_voxel_size,
                         &shader_materials,
-                        &mut mat_aabbs,
+                        &mut mat_tiles,
                     );
-                    if !mat_aabbs.is_empty() {
-                        self.painted_materials.insert(object_id, mat_aabbs);
+                    if !mat_tiles.is_empty() {
+                        self.painted_materials.insert(object_id, mat_tiles);
                     }
                 }
                 drop(sm);
@@ -173,135 +173,11 @@ impl EngineState {
         // explicitly painted), so we don't need a separate primary-
         // material code path.
         if !shader_materials.is_empty() {
+            const HARD_DEPTH_CEIL: u32 = rkp_render::user_shader_pass::MAX_DEPTH;
+            const DEFAULT_MAX_DEPTH: u32 = 8;
             for obj in self.gpu_objects.iter() {
-                let Some(mat_aabbs) = self.painted_materials.get(&obj.object_id) else { continue; };
-                for (&mat_id, (local_aabb, painted_leaf_count)) in mat_aabbs.iter() {
-                    let painted_leaf_count = *painted_leaf_count;
-                    let Some(def) = self.material_lib.get_def(mat_id) else { continue; };
-                    let Some(info) = shader_materials.get(&mat_id) else { continue; };
-                // Pack params in the shader's declared order.
-                let mut params: Vec<f32> = Vec::with_capacity(info.params.len());
-                for p in &info.params {
-                    let v = def
-                        .shader_params
-                        .get(&p.name)
-                        .and_then(|v| v.as_f64())
-                        .map(|v| v as f32)
-                        .unwrap_or(p.default);
-                    params.push(v);
-                }
-                // V7 — transform the painted-leaf local AABB (built
-                // by the octree scan above) to world space. Tight to
-                // the painted area, so grass only appears where you
-                // painted, not over the whole host.
+                let Some(mat_tiles) = self.painted_materials.get(&obj.object_id) else { continue; };
                 let world: glam::Mat4 = glam::Mat4::from_cols_array_2d(&obj.world);
-                let lmin = local_aabb.min;
-                let lmax = local_aabb.max;
-                // Inflate by the shader's region_thickness so the
-                // brick grid covers grass blade tips (which sit
-                // outside the painted leaves' AABB).
-                let pad = info.region_thickness.max(1e-3);
-                let lmin = [lmin.x - pad, lmin.y - pad, lmin.z - pad];
-                let lmax = [lmax.x + pad, lmax.y + pad, lmax.z + pad];
-                let local_corners = [
-                    [lmin[0], lmin[1], lmin[2]],
-                    [lmax[0], lmin[1], lmin[2]],
-                    [lmin[0], lmax[1], lmin[2]],
-                    [lmax[0], lmax[1], lmin[2]],
-                    [lmin[0], lmin[1], lmax[2]],
-                    [lmax[0], lmin[1], lmax[2]],
-                    [lmin[0], lmax[1], lmax[2]],
-                    [lmax[0], lmax[1], lmax[2]],
-                ];
-                let mut world_min = [f32::INFINITY; 3];
-                let mut world_max = [f32::NEG_INFINITY; 3];
-                for c in &local_corners {
-                    let p = world.project_point3(glam::Vec3::new(c[0], c[1], c[2]));
-                    for i in 0..3 {
-                        world_min[i] = world_min[i].min(p[i]);
-                        world_max[i] = world_max[i].max(p[i]);
-                    }
-                }
-                // V9 sparse BFS — depth is derived from the shader's
-                // `@cell_size` target plus a `@max_depth` ceiling
-                // (default 8, hard cap 8 = WGSL `MAX_DEPTH`). With
-                // surface-area-scaling bricks, depth=8 is affordable
-                // for typical paint clusters.
-                const HARD_DEPTH_CEIL: u32 = rkp_render::user_shader_pass::MAX_DEPTH;
-                const DEFAULT_MAX_DEPTH: u32 = 8;
-                let max_depth_cap = info
-                    .max_depth
-                    .unwrap_or(DEFAULT_MAX_DEPTH)
-                    .min(HARD_DEPTH_CEIL);
-                let extent = (world_max[0] - world_min[0])
-                    .max(world_max[1] - world_min[1])
-                    .max(world_max[2] - world_min[2]);
-                // Default target cell size — host's voxel size when
-                // the shader doesn't pin one. host_octree_extent /
-                // (BRICK_DIM * 2^host_octree_depth) ≈ host voxel.
-                let host_extent = f32::from_bits(obj.octree_extent_bits);
-                let host_voxel_size = if obj.octree_depth > 0 {
-                    host_extent / (4.0 * (1u32 << obj.octree_depth) as f32)
-                } else {
-                    extent / 64.0
-                };
-                let target_cell_size = info.cell_size.unwrap_or(host_voxel_size).max(1e-4);
-                // Solve `extent / (cell_size * 4) = 2^depth` →
-                // `depth = ceil(log2(extent / (4 * cell_size)))`.
-                let cells_per_axis_target = (extent / target_cell_size).max(1.0);
-                let bricks_per_axis_target = (cells_per_axis_target / 4.0).max(1.0);
-                let derived_depth = (bricks_per_axis_target.log2().ceil() as u32).max(0);
-                let max_depth = derived_depth.min(max_depth_cap);
-                // Re-snap cell_size so the deepest level matches the
-                // chosen depth exactly (avoids transient cubes that
-                // overshoot or undershoot the target by an arbitrary
-                // factor).
-                let cell_size = (extent / (4.0 * (1u32 << max_depth) as f32)).max(1e-4);
-                // Input hash folds material slot + object id +
-                // transform-relevant bits; the cache also folds source
-                // hash and geometry epoch on top, so changes the
-                // shader / palette / host bake invalidate correctly.
-                let mut input_hash: u64 = 0xcbf29ce484222325;
-                let mix = |h: &mut u64, b: u8| {
-                    *h ^= b as u64;
-                    *h = h.wrapping_mul(0x100000001b3);
-                };
-                for &b in &obj.object_id.to_le_bytes() { mix(&mut input_hash, b); }
-                for &b in &(mat_id as u32).to_le_bytes() { mix(&mut input_hash, b); }
-                for col in &obj.world {
-                    for &v in col { for &b in &v.to_le_bytes() { mix(&mut input_hash, b); } }
-                }
-                // Center the brick-grid cube on the host's AABB
-                // center rather than anchoring it at world_min. The
-                // brick grid is always a cube of side `extent` (the
-                // largest world AABB axis), so for non-cube hosts an
-                // anchored grid puts the cube's center off the host's
-                // actual middle. Centering puts the user shader's
-                // `aabb_min + extent/2` at the true host center,
-                // which is the natural reference point for shaders
-                // that fill a sphere or shell relative to the host.
-                let world_center = [
-                    0.5 * (world_min[0] + world_max[0]),
-                    0.5 * (world_min[1] + world_max[1]),
-                    0.5 * (world_min[2] + world_max[2]),
-                ];
-                let half_extent = extent * 0.5;
-                let centered_min = [
-                    world_center[0] - half_extent,
-                    world_center[1] - half_extent,
-                    world_center[2] - half_extent,
-                ];
-                let centered_max = [
-                    world_center[0] + half_extent,
-                    world_center[1] + half_extent,
-                    world_center[2] + half_extent,
-                ];
-                // Host octree info — copied off the host's GPU
-                // object so the geom pass can descend it via
-                // `host_sample_at`. Only voxelized hosts have a
-                // valid octree; for `geom_type != VOXELIZED` we
-                // pass the no-host sentinel and host_sample_at
-                // returns the (+inf, +Y) fallback.
                 let host_voxelized = obj.geom_type
                     == rkp_render::rkp_gpu_object::geom_type::VOXELIZED;
                 let host_octree_root = if host_voxelized {
@@ -310,33 +186,172 @@ impl EngineState {
                     0xFFFFFFFFu32
                 };
                 let host_octree_extent = f32::from_bits(obj.octree_extent_bits);
-                let shader_name = def
-                    .shader
-                    .as_deref()
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                user_shader_regions.push(rkp_render::user_shader_pass::ShaderRegionRequest {
-                    host_object_id: obj.object_id,
-                    // V6 — material_id is the painted material, not
-                    // the entity-level fallback. Lets a single host
-                    // emit several regions, one per painted shader.
-                    material_id: mat_id as u32,
-                    shader_name,
-                    params,
-                    aabb_min: centered_min,
-                    aabb_max: centered_max,
-                    cell_size,
-                    input_hash,
-                    animated: info.animated,
-                    region_thickness: info.region_thickness,
-                    max_depth,
-                    painted_leaf_count,
-                    host_octree_root,
-                    host_octree_depth: obj.octree_depth,
-                    host_octree_extent,
-                    host_grid_origin: obj.grid_origin,
-                    host_inverse_world: obj.inverse_world,
-                });
+                let host_voxel_size = if obj.octree_depth > 0 {
+                    host_octree_extent / (4.0 * (1u32 << obj.octree_depth) as f32)
+                } else {
+                    1.0
+                };
+                for (&mat_id, tiles) in mat_tiles.iter() {
+                    let Some(def) = self.material_lib.get_def(mat_id) else { continue; };
+                    let Some(info) = shader_materials.get(&mat_id) else { continue; };
+                    // Pack params in the shader's declared order.
+                    let mut params: Vec<f32> = Vec::with_capacity(info.params.len());
+                    for p in &info.params {
+                        let v = def
+                            .shader_params
+                            .get(&p.name)
+                            .and_then(|v| v.as_f64())
+                            .map(|v| v as f32)
+                            .unwrap_or(p.default);
+                        params.push(v);
+                    }
+                    let max_depth_cap = info
+                        .max_depth
+                        .unwrap_or(DEFAULT_MAX_DEPTH)
+                        .min(HARD_DEPTH_CEIL);
+                    let shader_name = def
+                        .shader
+                        .as_deref()
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    let shader_name_for_request = shader_name.clone();
+
+                    // Each tile in this (object, material) pair becomes
+                    // one ShaderRegionRequest. For non-tiled shaders
+                    // there's a single entry under NO_TILE_COORD.
+                    for (&tile_coord, (local_aabb, painted_leaf_count)) in tiles.iter() {
+                        let painted_leaf_count = *painted_leaf_count;
+
+                        // Determine the host-local AABB this region
+                        // covers. For tiled shaders, it's the tile
+                        // cube `[i*s, (i+1)*s]^3` (independent of
+                        // paint extent — that's the whole point).
+                        // For non-tiled, it's the painted-leaf bounds
+                        // (V9 behaviour).
+                        let (lmin, lmax, region_extent_local, tile_index) = if tile_coord == NO_TILE_COORD {
+                            let pad = info.region_thickness.max(1e-3);
+                            let lmin = [
+                                local_aabb.min.x - pad,
+                                local_aabb.min.y - pad,
+                                local_aabb.min.z - pad,
+                            ];
+                            let lmax = [
+                                local_aabb.max.x + pad,
+                                local_aabb.max.y + pad,
+                                local_aabb.max.z + pad,
+                            ];
+                            let extent = (lmax[0] - lmin[0])
+                                .max(lmax[1] - lmin[1])
+                                .max(lmax[2] - lmin[2]);
+                            (lmin, lmax, extent, rkp_render::user_shader_pass::NO_TILE)
+                        } else {
+                            let s = info.tile_size.unwrap_or(1.0).max(1e-4);
+                            let pad = info.region_thickness.max(1e-3);
+                            let lmin = [
+                                tile_coord[0] as f32 * s - pad,
+                                tile_coord[1] as f32 * s - pad,
+                                tile_coord[2] as f32 * s - pad,
+                            ];
+                            let lmax = [
+                                (tile_coord[0] + 1) as f32 * s + pad,
+                                (tile_coord[1] + 1) as f32 * s + pad,
+                                (tile_coord[2] + 1) as f32 * s + pad,
+                            ];
+                            (lmin, lmax, s + pad * 2.0, tile_coord)
+                        };
+
+                        // Transform local AABB to world AABB by
+                        // projecting all 8 corners.
+                        let local_corners = [
+                            [lmin[0], lmin[1], lmin[2]],
+                            [lmax[0], lmin[1], lmin[2]],
+                            [lmin[0], lmax[1], lmin[2]],
+                            [lmax[0], lmax[1], lmin[2]],
+                            [lmin[0], lmin[1], lmax[2]],
+                            [lmax[0], lmin[1], lmax[2]],
+                            [lmin[0], lmax[1], lmax[2]],
+                            [lmax[0], lmax[1], lmax[2]],
+                        ];
+                        let mut world_min = [f32::INFINITY; 3];
+                        let mut world_max = [f32::NEG_INFINITY; 3];
+                        for c in &local_corners {
+                            let p = world.project_point3(glam::Vec3::new(c[0], c[1], c[2]));
+                            for i in 0..3 {
+                                world_min[i] = world_min[i].min(p[i]);
+                                world_max[i] = world_max[i].max(p[i]);
+                            }
+                        }
+
+                        // Depth derivation. With tiling the extent is
+                        // FIXED (tile_size + thickness padding), so
+                        // cell_size doesn't grow with paint area —
+                        // the whole point. Without tiling we keep
+                        // V9 behaviour where depth is derived from
+                        // the painted-leaf extent.
+                        let extent = (world_max[0] - world_min[0])
+                            .max(world_max[1] - world_min[1])
+                            .max(world_max[2] - world_min[2])
+                            .max(region_extent_local);
+                        let target_cell_size = info.cell_size.unwrap_or(host_voxel_size).max(1e-4);
+                        let cells_per_axis_target = (extent / target_cell_size).max(1.0);
+                        let bricks_per_axis_target = (cells_per_axis_target / 4.0).max(1.0);
+                        let derived_depth = (bricks_per_axis_target.log2().ceil() as u32).max(0);
+                        let max_depth = derived_depth.min(max_depth_cap);
+                        let cell_size = (extent / (4.0 * (1u32 << max_depth) as f32)).max(1e-4);
+
+                        // Input hash folds object/material/tile/transform.
+                        let mut input_hash: u64 = 0xcbf29ce484222325;
+                        let mix = |h: &mut u64, b: u8| {
+                            *h ^= b as u64;
+                            *h = h.wrapping_mul(0x100000001b3);
+                        };
+                        for &b in &obj.object_id.to_le_bytes() { mix(&mut input_hash, b); }
+                        for &b in &(mat_id as u32).to_le_bytes() { mix(&mut input_hash, b); }
+                        for &c in &tile_index { for &b in &c.to_le_bytes() { mix(&mut input_hash, b); } }
+                        for col in &obj.world {
+                            for &v in col { for &b in &v.to_le_bytes() { mix(&mut input_hash, b); } }
+                        }
+
+                        // Centered cube around the world AABB so the
+                        // brick grid extent is uniform across axes.
+                        let world_center = [
+                            0.5 * (world_min[0] + world_max[0]),
+                            0.5 * (world_min[1] + world_max[1]),
+                            0.5 * (world_min[2] + world_max[2]),
+                        ];
+                        let half_extent = extent * 0.5;
+                        let centered_min = [
+                            world_center[0] - half_extent,
+                            world_center[1] - half_extent,
+                            world_center[2] - half_extent,
+                        ];
+                        let centered_max = [
+                            world_center[0] + half_extent,
+                            world_center[1] + half_extent,
+                            world_center[2] + half_extent,
+                        ];
+
+                        user_shader_regions.push(rkp_render::user_shader_pass::ShaderRegionRequest {
+                            host_object_id: obj.object_id,
+                            material_id: mat_id as u32,
+                            shader_name: shader_name_for_request.clone(),
+                            params: params.clone(),
+                            aabb_min: centered_min,
+                            aabb_max: centered_max,
+                            cell_size,
+                            input_hash,
+                            animated: info.animated,
+                            region_thickness: info.region_thickness,
+                            max_depth,
+                            painted_leaf_count,
+                            host_octree_root,
+                            host_octree_depth: obj.octree_depth,
+                            host_octree_extent,
+                            host_grid_origin: obj.grid_origin,
+                            host_inverse_world: obj.inverse_world,
+                            tile_index,
+                        });
+                    }
                 }
             }
         }
@@ -1002,7 +1017,10 @@ fn scan_painted_aabbs(
     grid_origin: glam::Vec3,
     base_voxel_size: f32,
     shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
-    out: &mut std::collections::HashMap<u16, (rkp_core::Aabb, u32)>,
+    out: &mut std::collections::HashMap<
+        u16,
+        std::collections::HashMap<[i32; 3], (rkp_core::Aabb, u32)>,
+    >,
 ) {
     use rkp_core::sparse_octree::{
         is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE,
@@ -1039,7 +1057,10 @@ fn scan_painted_aabbs(
         grid_origin: glam::Vec3,
         base_vs: f32,
         shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
-        out: &mut std::collections::HashMap<u16, (rkp_core::Aabb, u32)>,
+        out: &mut std::collections::HashMap<
+            u16,
+            std::collections::HashMap<[i32; 3], (rkp_core::Aabb, u32)>,
+        >,
     ) {
         use rkp_core::sparse_octree::{
             is_brick, is_leaf, leaf_slot, brick_id, EMPTY_NODE, INTERIOR_NODE,
@@ -1090,7 +1111,12 @@ fn scan_painted_aabbs(
                                     cell_voxel.z as f32,
                                 ) * base_vs;
                             let mx = cell_local + glam::Vec3::splat(base_vs);
-                            super::lifecycle::expand_aabb(out, mat, cell_local, mx);
+                            let tile_size = shader_materials
+                                .get(&mat)
+                                .and_then(|i| i.tile_size);
+                            super::lifecycle::expand_aabb(
+                                out, mat, cell_local, mx, tile_size,
+                            );
                         }
                     }
                 }
@@ -1122,7 +1148,10 @@ fn scan_painted_aabbs(
                         coord_voxels.z as f32,
                     ) * base_vs;
                 let leaf_max = leaf_min + glam::Vec3::splat(leaf_size);
-                super::lifecycle::expand_aabb(out, mat, leaf_min, leaf_max);
+                let tile_size = shader_materials.get(&mat).and_then(|i| i.tile_size);
+                super::lifecycle::expand_aabb(
+                    out, mat, leaf_min, leaf_max, tile_size,
+                );
             }
             return;
         }
@@ -1315,21 +1344,73 @@ pub(super) fn count_painted_halves_check(
     false
 }
 
+/// Sentinel tile coord for non-tiled shaders (matching
+/// `rkp_render::user_shader_pass::NO_TILE`). Single inner-map entry
+/// for the whole painted area — V9 single-region behaviour.
+const NO_TILE_COORD: [i32; 3] = [i32::MIN, i32::MIN, i32::MIN];
+
+/// Register a painted leaf occupying `[mn, mx]` (host-local) for
+/// material `mat`. For shaders with a `@tile_size`, the leaf is
+/// bucketed into every tile coord it overlaps; for non-tiled
+/// shaders, the leaf is registered under `NO_TILE_COORD` and its
+/// AABB merged into the running painted-leaf bounds.
+///
+/// Tiling assumes the grid is anchored at host-local origin
+/// (tile_coord = floor(pos / tile_size)). For typical paint where a
+/// leaf's size ≪ tile_size, each leaf lives in a single tile — the
+/// boundary case (leaf straddling tiles) registers it in all
+/// overlapping tiles, which slightly inflates per-tile counts but
+/// is correct for the band gate.
 fn expand_aabb(
-    out: &mut std::collections::HashMap<u16, (rkp_core::Aabb, u32)>,
+    out: &mut std::collections::HashMap<
+        u16,
+        std::collections::HashMap<[i32; 3], (rkp_core::Aabb, u32)>,
+    >,
     mat: u16,
     mn: glam::Vec3,
     mx: glam::Vec3,
+    tile_size: Option<f32>,
 ) {
-    let entry = out.entry(mat).or_insert((
-        rkp_core::Aabb {
-            min: glam::Vec3::splat(f32::INFINITY),
-            max: glam::Vec3::splat(f32::NEG_INFINITY),
-        },
-        0u32,
-    ));
-    entry.0.min = entry.0.min.min(mn);
-    entry.0.max = entry.0.max.max(mx);
-    entry.1 = entry.1.saturating_add(1);
+    let mat_map = out.entry(mat).or_default();
+
+    fn merge(
+        mat_map: &mut std::collections::HashMap<[i32; 3], (rkp_core::Aabb, u32)>,
+        key: [i32; 3],
+        mn: glam::Vec3,
+        mx: glam::Vec3,
+    ) {
+        let entry = mat_map.entry(key).or_insert((
+            rkp_core::Aabb {
+                min: glam::Vec3::splat(f32::INFINITY),
+                max: glam::Vec3::splat(f32::NEG_INFINITY),
+            },
+            0u32,
+        ));
+        entry.0.min = entry.0.min.min(mn);
+        entry.0.max = entry.0.max.max(mx);
+        entry.1 = entry.1.saturating_add(1);
+    }
+
+    match tile_size {
+        None => merge(mat_map, NO_TILE_COORD, mn, mx),
+        Some(s) if s > 0.0 => {
+            // Compute tile coord range the leaf overlaps. Use a tiny
+            // epsilon on the upper bound so a leaf whose max sits
+            // exactly on a tile boundary doesn't count for the next
+            // tile too.
+            let inv = 1.0 / s;
+            let lo = (mn * inv).floor();
+            let hi = ((mx - glam::Vec3::splat(1e-6)) * inv).floor();
+            for ix in (lo.x as i32)..=(hi.x as i32) {
+                for iy in (lo.y as i32)..=(hi.y as i32) {
+                    for iz in (lo.z as i32)..=(hi.z as i32) {
+                        merge(mat_map, [ix, iy, iz], mn, mx);
+                    }
+                }
+            }
+        }
+        // tile_size 0 or negative → treat as non-tiled.
+        Some(_) => merge(mat_map, NO_TILE_COORD, mn, mx),
+    }
 }
 

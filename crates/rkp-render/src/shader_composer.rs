@@ -85,6 +85,16 @@ pub struct ShaderMetadata {
     /// the WGSL constant + queue buffer sizing); requests above that
     /// silently clamp.
     pub max_depth: Option<u32>,
+    /// V10 multi-region tiling. When set, the engine's auto-scan
+    /// splits the painted area into `tile_size`-edge cubes (in
+    /// host-local space) and emits one region per tile that contains
+    /// any painted leaves. Each tile's cube is fixed-extent, so cell
+    /// size is independent of paint area — `cell_size = tile_size /
+    /// (4 × 2^max_depth)` regardless of how big a patch the user
+    /// paints. None falls back to V9 single-region behaviour
+    /// (one region per (object, material) covering the painted-leaf
+    /// AABB; cell size grows with paint extent).
+    pub tile_size: Option<f32>,
 }
 
 /// One user shader's parsed hook bodies + header metadata. Each `*_text`
@@ -186,6 +196,7 @@ impl UserShaderRegistry {
                 animated: e.metadata.animated,
                 cell_size: e.metadata.cell_size,
                 max_depth: e.metadata.max_depth,
+                tile_size: e.metadata.tile_size,
                 has_shade: e.shade_text.is_some(),
                 has_generate: e.generate_text.is_some(),
             })
@@ -220,6 +231,7 @@ pub struct UserShaderInfo {
     pub animated: bool,
     pub cell_size: Option<f32>,
     pub max_depth: Option<u32>,
+    pub tile_size: Option<f32>,
     pub has_shade: bool,
     pub has_generate: bool,
 }
@@ -450,6 +462,9 @@ fn parse_metadata(
                     });
                 }
                 md.max_depth = Some(v);
+            }
+            "tile_size" => {
+                md.tile_size = Some(parse_f32(path, line_no, "tile_size", args)?);
             }
             "animated" => {
                 if !args.is_empty() {
@@ -868,6 +883,10 @@ fn compute_registry_hash(entries: &[UserShaderEntry]) -> u64 {
         buf.push(0);
         if let Some(d) = e.metadata.max_depth {
             buf.extend_from_slice(&d.to_le_bytes());
+        }
+        buf.push(0);
+        if let Some(s) = e.metadata.tile_size {
+            buf.extend_from_slice(&s.to_le_bytes());
         }
         buf.push(0);
     }

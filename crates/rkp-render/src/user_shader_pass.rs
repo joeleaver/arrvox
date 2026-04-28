@@ -100,6 +100,12 @@ pub struct ShaderRegionRequest {
     /// back to a small floor so test/free-standing regions still get a
     /// usable reservation.
     pub painted_leaf_count: u32,
+    /// V10 tile coordinate. For shaders with `@tile_size`, this is
+    /// the host-local tile index `floor(painted_leaf_pos / tile_size)`.
+    /// For shaders without tiling, set to `NO_TILE` (sentinel).
+    /// Folded into the cache key so two tiles on the same
+    /// (object, material) get distinct cache entries + pool slices.
+    pub tile_index: [i32; 3],
     /// Host octree info for `host_sample_at(world_pos)` queries from
     /// inside the user shader. `host_octree_root == 0xFFFFFFFF` means
     /// "no host" (region is free-standing); `host_sample_at` returns
@@ -114,6 +120,11 @@ pub struct ShaderRegionRequest {
 /// Sentinel "no host" value matching `HOST_NO_HOST_SENTINEL` in WGSL.
 pub const HOST_NO_HOST_SENTINEL: u32 = 0xFFFF_FFFFu32;
 
+/// Sentinel `tile_index` value used for non-tiled shaders (those
+/// without an `@tile_size` directive). One cache entry per
+/// (object, material) pair, V9 behaviour.
+pub const NO_TILE: [i32; 3] = [i32::MIN, i32::MIN, i32::MIN];
+
 /// Cells per brick — must match `rkp_core::brick_pool::BRICK_CELLS`.
 pub const BRICK_CELLS: u32 = 64;
 
@@ -123,15 +134,22 @@ pub const BRICK_CELLS: u32 = 64;
 /// growing the queue buffers and the WGSL constant in lockstep.
 pub const MAX_DEPTH: u32 = 8;
 
-/// Worst-case active cells held per level in the BFS queue. Multiplied
-/// by `MAX_DEPTH+1` for the global queue buffer. Per-level overflow
-/// drops cells (degrades to `OCTREE_EMPTY` at their parent's child
-/// slot); raise this if real-world paint workflows hit it.
-const PER_LEVEL_QUEUE_CAP: u32 = 65536;
+/// Worst-case active cells held per level in the BFS queue,
+/// multiplexed across all regions processed in one frame. Multiplied
+/// by `MAX_DEPTH+1` for the global queue buffer.
+///
+/// V10 raises this from 65K → 256K because tiled paints can emit
+/// hundreds of regions, each contributing thousands of cells at the
+/// deepest levels. Total queue storage:
+/// `(MAX_DEPTH+1) × PER_LEVEL_QUEUE_CAP × sizeof(ActiveCell)` =
+/// 9 × 256K × 32 B ≈ 72 MB. Per-level overflow degrades to
+/// `OCTREE_EMPTY` at the offending parent's child slot.
+const PER_LEVEL_QUEUE_CAP: u32 = 262144;
 
 /// Total brick fill tasks the queue holds across all regions in one
-/// frame. Sizes the `fill_queue` buffer.
-const FILL_QUEUE_CAP: u32 = 131072;
+/// frame. Sized for ~512 regions × 1K bricks each = 512 K fill
+/// tasks worst case.
+const FILL_QUEUE_CAP: u32 = 524288;
 
 /// Workgroup size for `classify_main`. Determines how many workgroups
 /// we dispatch per level: `PER_LEVEL_QUEUE_CAP / CLASSIFY_WG_SIZE`
@@ -145,7 +163,7 @@ struct CacheEntry {
     content_hash: u64,
     /// Region index in the per-region atomic-counter buffers and the
     /// `regions` storage array. Stable across frames for the same
-    /// (host_object_id, material_id) pair until the cache is flushed.
+    /// cache key until the cache is flushed.
     region_index: u32,
     /// Pool slices (element offsets into the scene buffers).
     octree_offset: u32,
@@ -162,12 +180,24 @@ struct CacheEntry {
     /// Stable object_id used by the transient `RkpGpuObject` so tile
     /// lists key consistently across frames.
     object_id: u32,
+    /// V10 — set to `true` by `lookup_or_allocate` each frame the
+    /// entry is referenced. `evict_untouched` after the per-frame
+    /// region pass drops entries that didn't get a request this
+    /// frame (paint moved off this tile, host removed, etc.) and
+    /// returns their pool slices to the free list.
+    touched_this_frame: bool,
 }
 
 /// Per-region pool sub-allocator + cache for user-shader-generated
 /// geometry. See module docstring for layout & lifecycle.
+///
+/// Cache key is `(host_object_id, material_id, tile_index)`. For
+/// non-tiled shaders `tile_index = NO_TILE` and there's at most one
+/// entry per (object, material). For tiled shaders many entries can
+/// coexist for the same (object, material) — one per tile that
+/// currently has paint.
 pub struct UserShaderObjectCache {
-    entries: HashMap<(u32, u32), CacheEntry>,
+    entries: HashMap<(u32, u32, [i32; 3]), CacheEntry>,
     free_slots: Vec<FreeSlot>,
     octree_high_water: u32,
     brick_high_water: u32,
@@ -267,7 +297,7 @@ impl UserShaderObjectCache {
         request: &ShaderRegionRequest,
         effective_hash: u64,
     ) -> Option<CachedSlot> {
-        let key = (request.host_object_id, request.material_id);
+        let key = (request.host_object_id, request.material_id, request.tile_index);
         let estimate = estimate_region_pool(request.painted_leaf_count, request.max_depth);
 
         if let Some(entry) = self.entries.get_mut(&key) {
@@ -284,6 +314,7 @@ impl UserShaderObjectCache {
                 entry.aabb_max = request.aabb_max;
                 entry.cell_size = request.cell_size;
                 entry.animated = request.animated;
+                entry.touched_this_frame = true;
                 if dirty {
                     entry.content_hash = effective_hash;
                 }
@@ -377,6 +408,7 @@ impl UserShaderObjectCache {
             cell_size: request.cell_size,
             animated: request.animated,
             object_id,
+            touched_this_frame: true,
         };
         let result = CachedSlot {
             octree_offset: entry.octree_offset,
@@ -404,6 +436,43 @@ impl UserShaderObjectCache {
 
     pub fn max_region_index(&self) -> u32 {
         self.region_index_high_water.saturating_sub(1)
+    }
+
+    /// Mark every entry untouched at the start of a frame. The caller
+    /// then runs `lookup_or_allocate` for each ShaderRegionRequest in
+    /// the frame (which marks the matched entries touched), and
+    /// finishes with `evict_untouched` to drop entries that didn't
+    /// get a request this frame.
+    pub fn begin_frame(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.touched_this_frame = false;
+        }
+    }
+
+    /// Drop entries not referenced this frame and return their pool
+    /// slices to the free list. Required for V10 multi-region tiling
+    /// — when paint moves off a tile (or a host changes its painted
+    /// area), the abandoned tiles' cache entries would otherwise
+    /// leak into transient objects forever and stale-render. With
+    /// V9's one-entry-per-(object, material) layout this hadn't
+    /// mattered; tiling makes leaks visible immediately.
+    pub fn evict_untouched(&mut self) {
+        let entries = std::mem::take(&mut self.entries);
+        for (key, entry) in entries.into_iter() {
+            if entry.touched_this_frame {
+                self.entries.insert(key, entry);
+            } else {
+                self.free_slots.push(FreeSlot {
+                    octree_offset: entry.octree_offset,
+                    octree_capacity: entry.octree_capacity,
+                    brick_offset: entry.brick_offset,
+                    brick_capacity: entry.brick_capacity,
+                    leaf_attr_offset: entry.leaf_attr_offset,
+                    leaf_attr_capacity: entry.leaf_attr_capacity,
+                    region_index: entry.region_index,
+                });
+            }
+        }
     }
 }
 
@@ -1225,6 +1294,7 @@ mod tests {
             host_octree_extent: 0.0,
             host_grid_origin: [0.0; 3],
             host_inverse_world: [[0.0; 4]; 4],
+            tile_index: NO_TILE,
         }
     }
 
@@ -1286,6 +1356,51 @@ mod tests {
         assert_ne!(s1.octree_offset, s2.octree_offset);
         assert_ne!(s1.brick_offset, s2.brick_offset);
         assert_ne!(s1.region_index, s2.region_index);
+    }
+
+    #[test]
+    fn cache_distinguishes_tiles_on_same_material() {
+        let mut cache = UserShaderObjectCache::new();
+        cache.set_pool_bases(0, 8192, 0, 65536, 0, 65536);
+        let mut r = req(1, 1);
+        r.tile_index = [0, 0, 0];
+        let s1 = cache.lookup_or_allocate(&r, 0).unwrap();
+        r.tile_index = [1, 0, 0];
+        let s2 = cache.lookup_or_allocate(&r, 0).unwrap();
+        // Same (object, material), different tiles → distinct slots.
+        assert_ne!(s1.octree_offset, s2.octree_offset);
+        assert_ne!(s1.region_index, s2.region_index);
+    }
+
+    #[test]
+    fn evict_untouched_drops_abandoned_tiles() {
+        let mut cache = UserShaderObjectCache::new();
+        cache.set_pool_bases(0, 8192, 0, 65536, 0, 65536);
+        let mut r = req(1, 1);
+        // Frame 1 — three tiles allocated.
+        cache.begin_frame();
+        for i in 0..3 {
+            r.tile_index = [i, 0, 0];
+            cache.lookup_or_allocate(&r, 0).unwrap();
+        }
+        cache.evict_untouched();
+        assert_eq!(cache.entries.len(), 3);
+        // Frame 2 — only one tile referenced.
+        cache.begin_frame();
+        r.tile_index = [1, 0, 0];
+        cache.lookup_or_allocate(&r, 0).unwrap();
+        cache.evict_untouched();
+        assert_eq!(cache.entries.len(), 1);
+        // The freed slots from tiles 0 and 2 should be reusable.
+        assert!(cache.free_slots.len() >= 2);
+        // Frame 3 — request a new tile; should pop a free slot
+        // rather than bumping the high-water mark.
+        cache.begin_frame();
+        r.tile_index = [42, 0, 0];
+        let pre_high_water = cache.octree_high_water;
+        cache.lookup_or_allocate(&r, 0).unwrap();
+        assert_eq!(cache.octree_high_water, pre_high_water,
+            "free slot should be reused before bumping high-water");
     }
 
     #[test]
