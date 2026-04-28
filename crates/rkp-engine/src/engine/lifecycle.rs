@@ -194,6 +194,33 @@ impl EngineState {
                 for (&mat_id, tiles) in mat_tiles.iter() {
                     let Some(def) = self.material_lib.get_def(mat_id) else { continue; };
                     let Some(info) = shader_materials.get(&mat_id) else { continue; };
+                    // V11 — adaptive region_thickness. If the shader
+                    // declares a `blade_height` parameter (or a
+                    // `region_thickness` parameter), use the
+                    // material's value as the effective band — so
+                    // the BFS classifier prunes cells beyond actual
+                    // blade reach instead of the worst-case
+                    // directive value. Falls back to the directive
+                    // when neither param exists.
+                    let effective_band = {
+                        let from_param = info.params.iter()
+                            .find(|p| p.name == "blade_height" || p.name == "region_thickness")
+                            .and_then(|p| {
+                                def.shader_params
+                                    .get(&p.name)
+                                    .and_then(|v| v.as_f64())
+                                    .map(|v| v as f32)
+                                    .or(Some(p.default))
+                            });
+                        // Add a small margin for blade tip + bend reach.
+                        let with_margin = from_param.map(|h| h * 1.25 + 0.01);
+                        // Never exceed the shader's declared @region_thickness
+                        // — that's the buffer-reserved upper bound.
+                        with_margin
+                            .map(|b| b.min(info.region_thickness))
+                            .unwrap_or(info.region_thickness)
+                            .max(1e-3)
+                    };
                     // Pack params in the shader's declared order.
                     let mut params: Vec<f32> = Vec::with_capacity(info.params.len());
                     for p in &info.params {
@@ -229,7 +256,7 @@ impl EngineState {
                         // For non-tiled, it's the painted-leaf bounds
                         // (V9 behaviour).
                         let (lmin, lmax, region_extent_local, tile_index) = if tile_coord == NO_TILE_COORD {
-                            let pad = info.region_thickness.max(1e-3);
+                            let pad = effective_band;
                             let lmin = [
                                 local_aabb.min.x - pad,
                                 local_aabb.min.y - pad,
@@ -246,7 +273,7 @@ impl EngineState {
                             (lmin, lmax, extent, rkp_render::user_shader_pass::NO_TILE)
                         } else {
                             let s = info.tile_size.unwrap_or(1.0).max(1e-4);
-                            let pad = info.region_thickness.max(1e-3);
+                            let pad = effective_band;
                             let lmin = [
                                 tile_coord[0] as f32 * s - pad,
                                 tile_coord[1] as f32 * s - pad,
@@ -341,7 +368,7 @@ impl EngineState {
                             cell_size,
                             input_hash,
                             animated: info.animated,
-                            region_thickness: info.region_thickness,
+                            region_thickness: effective_band,
                             max_depth,
                             painted_leaf_count,
                             host_octree_root,

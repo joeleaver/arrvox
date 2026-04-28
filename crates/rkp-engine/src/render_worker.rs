@@ -1471,16 +1471,14 @@ fn run_user_shader_geom(
 
     // V10 multi-region tiling: bounded so the SUM of per-region pool
     // reservations stays within wgpu's `max_storage_buffer_binding_size`
-    // (1 GB). With per-region brick cap = 4096 and ~0.5 KB binding
-    // per brick across the bound storage buffers (brick_pool +
-    // leaf_attr_pool), 256 regions worst case = 512 MB binding
-    // pressure, comfortably under 1 GB. Bumping this further means
-    // either dropping per-region brick cap or raising the device's
-    // `max_storage_buffer_binding_size` (and giving the GPU room to
-    // allocate). Above 256 active tiles per frame, surplus tiles
-    // get clipped silently — the trade-off keeps validation green
-    // when the user paints sprawling areas.
-    const MAX_REGIONS: u32 = 256;
+    // (1 GB). With slab = 2048 bricks (~512 B binding per brick across
+    // brick_pool + leaf_attr_pool), 512 regions × ~1 MB per slab =
+    // ~512 MB binding pressure per pool. CPU heads (~344 MiB scene)
+    // bring per-buffer pressure to ~860 MiB, with 100+ MiB head
+    // before the binding limit. Above 512 active tiles per frame,
+    // surplus tiles drop silently — the trade-off keeps validation
+    // green even when the user paints sprawling areas.
+    const MAX_REGIONS: u32 = 512;
     const FACE_EMPTY: u32 = 0xFFFFFFFFu32;
 
     // 1. Pipeline reload — track the shade-side hash; the geom and
@@ -1523,7 +1521,7 @@ fn run_user_shader_geom(
     //    transient pool. CPU heads (~344 MiB scene) push total
     //    buffer pressure to ~944 MiB per pool — under the 1 GB
     //    binding limit with margin.
-    const MAX_BRICKS_PER_REGION: u32 = 4096;
+    const MAX_BRICKS_PER_REGION: u32 = 2048;
     const MAX_DEPTH_RESERVE: u32 = 8;
     let max_regions_u64 = MAX_REGIONS as u64;
     let extra_octree: u64 = max_regions_u64

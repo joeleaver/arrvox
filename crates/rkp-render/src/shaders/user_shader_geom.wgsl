@@ -190,6 +190,14 @@ struct LevelUniform {
 // (named `cur_region` to avoid shadowing this workgroup global).
 var<workgroup> region: RegionUniform;
 
+// V12 — workgroup-shared state for deferred brick allocation in
+// brick_fill_main. Cells evaluate the user shader, then the
+// workgroup decides whether to allocate a brick at all (skip if no
+// cell emitted). Eliminates wasted brick slots for all-empty bricks.
+var<workgroup> wg_any_emit: atomic<u32>;
+var<workgroup> wg_brick_offset: u32;
+var<workgroup> wg_alloc_failed: atomic<u32>;
+
 fn unpack_oct(packed: u32) -> vec3<f32> {
     let ix = i32(packed & 0xFFFFu);
     let iy = i32((packed >> 16u) & 0xFFFFu);
@@ -516,41 +524,86 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             octree_nodes[cell.octree_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
             return;
         }
-        // Cell is fully INSIDE the host body and beyond the band.
-        // Mark EMPTY (not INTERIOR): the user shader emits nothing
-        // here for grass-style surface effects, and writing
-        // OCTREE_INTERIOR would render as a solid voxel block in
-        // the march pass (transient regions don't carry the
-        // entity-level material slot needed for INTERIOR shading
-        // — the result is a colored block inside the host body
-        // which is never what the user wants for surface shaders).
-        // Volume-filling shaders (rare) can still emit cells inside
-        // by being passed cells in the band — this gate just prunes
-        // cells DEEP inside, beyond `band`.
-        if (host.distance < -cell_diag_half - band) {
+        // Cell is INSIDE the host body — surface-effect shaders
+        // (grass, fur, moss) emit nothing here. The proximity gate's
+        // older `< -cell_diag_half - band` threshold left a thick
+        // sub-surface band that produced bricks the user shader
+        // returned occupancy=0 for; using `< -cell_diag_half`
+        // (any cell whose Lipschitz bound says it's fully inside)
+        // halves the band volume without losing surface-straddling
+        // cells (those have distance in [-half_diag, +half_diag]
+        // and pass through to MIXED).
+        //
+        // Mark EMPTY (not INTERIOR): writing OCTREE_INTERIOR for
+        // transient regions renders as a solid voxel block in the
+        // march pass (transient regions don't carry the entity-
+        // level material slot needed for INTERIOR shading).
+        if (host.distance < -cell_diag_half) {
             octree_nodes[cell.octree_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
             return;
         }
     }
 
     if (L == cur_region.max_depth) {
-        // Brick parent — alloc one brick + queue fill.
-        let brick_slot = atomicAdd(&brick_alloc[cell.region_index], 1u);
-        if (brick_slot >= cur_region.brick_capacity) {
-            octree_nodes[cell.octree_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
-            return;
+        // V11 — paint-targeted brick allocation. Skip bricks whose
+        // projected surface point isn't painted with this region's
+        // material. This is what makes paint-driven shaders (grass,
+        // moss, fur) actually scale: instead of allocating bricks
+        // for every cell within `region_thickness` of the surface,
+        // we allocate only for bricks above painted surface area.
+        //
+        // Skipped only when region.material_id != 0 AND there's a
+        // host. Free-standing or material-agnostic regions go
+        // through the existing alloc path. The projection here
+        // mirrors what the user shader's body does — sphere-trace
+        // down -Y from the brick center, find the surface, read the
+        // material — but cheaply, with one host_sample at an
+        // estimated surface point rather than an iterative trace.
+        if (cur_region.host_octree_root != HOST_NO_HOST_SENTINEL
+            && cur_region.material_id != 0u) {
+            // Cheap material gate — skip the entire brick if its
+            // projected surface point isn't painted with this
+            // region's material. Saves the fill dispatch entirely
+            // for "above unpainted host" bricks.
+            let surface_probe = vec3<f32>(
+                center.x,
+                center.y - host.distance - cur_region.cell_size * 2.0,
+                center.z,
+            );
+            let surface = host_sample_in_region(surface_probe, cell.region_index);
+            let pri_match = surface.material == cur_region.material_id
+                && surface.material != 0u;
+            let sec_match = surface.material_secondary == cur_region.material_id
+                && surface.blend_weight > 0u;
+            if (!pri_match && !sec_match) {
+                octree_nodes[cell.octree_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
+                return;
+            }
         }
-        let brick_id = (cur_region.brick_offset / BRICK_CELLS) + brick_slot;
-        octree_nodes[cell.octree_offset] = vec2<u32>(
-            OCTREE_LEAF_BIT | OCTREE_BRICK_BIT | brick_id,
-            INTERNAL_ATTR_NONE,
-        );
+
+        // V12 — DEFERRED BRICK ALLOCATION. Don't allocate a brick
+        // here. Just queue the fill task and pre-write OCTREE_EMPTY;
+        // the fill pass evaluates all 64 cells and only allocates a
+        // brick (overwriting the octree node) when at least one
+        // cell actually emits. Bricks with all-empty cells never
+        // consume a slot.
+        //
+        // For grass: classify lets through cells that *might* emit
+        // (proximity gate, material match) but most of them are
+        // still all-empty (blade gaps, cluster gating, height
+        // beyond blade_height_max). Pre-V12 these allocated bricks
+        // anyway, eating ~5-10× more brick slots than necessary.
+        //
+        // brick_offset is set to U32_MAX as a sentinel: the fill
+        // pass computes the real offset from its atomically-claimed
+        // slot, not from this stored value.
+        octree_nodes[cell.octree_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
         let fill_slot = atomicAdd(&fill_count[0], 1u);
         if (fill_slot < arrayLength(&fill_queue)) {
             var task: BrickFillTask;
             task.octree_offset = cell.octree_offset;
             task.region_index = cell.region_index;
-            task.brick_offset = cur_region.brick_offset + brick_slot * BRICK_CELLS;
+            task.brick_offset = 0xFFFFFFFFu; // sentinel: alloc on demand in fill
             task.cell_size = cur_region.cell_size;
             task.min_x = center.x - half;
             task.min_y = center.y - half;
@@ -626,6 +679,9 @@ fn brick_fill_main(@builtin(local_invocation_id) lid: vec3<u32>,
         // every thread (and any user code called from
         // `dispatch_user_generate`) reads `region.X` directly.
         region = regions[task.region_index];
+        atomicStore(&wg_any_emit, 0u);
+        atomicStore(&wg_alloc_failed, 0u);
+        wg_brick_offset = 0u;
     }
     workgroupBarrier();
 
@@ -652,7 +708,47 @@ fn brick_fill_main(@builtin(local_invocation_id) lid: vec3<u32>,
     let host = host_sample_at(cell_world_pos);
     let emit = dispatch_user_generate(region.shader_id, cell_world_pos, host, ctx);
 
-    let brick_slot_idx = task.brick_offset + cell_idx;
+    // V12 — workgroup-cooperative deferred brick allocation. Each
+    // thread votes "any cell emit?". After the barrier, thread 0
+    // allocates a brick from the per-region atomic pool ONLY if at
+    // least one cell voted yes. All-empty bricks consume zero
+    // brick-pool slots and zero leaf-attr slots; the octree node
+    // stays at OCTREE_EMPTY (pre-written by classify) and the
+    // march reads no transient geometry there.
+    if (emit.occupancy != 0u) {
+        atomicStore(&wg_any_emit, 1u);
+    }
+    workgroupBarrier();
+
+    if (cell_idx == 0u) {
+        if (atomicLoad(&wg_any_emit) != 0u) {
+            // At least one cell wants to emit — claim a brick slot.
+            let brick_slot = atomicAdd(&brick_alloc[task.region_index], 1u);
+            if (brick_slot >= region.brick_capacity) {
+                atomicStore(&wg_alloc_failed, 1u);
+            } else {
+                wg_brick_offset = region.brick_offset + brick_slot * BRICK_CELLS;
+                let brick_id = (region.brick_offset / BRICK_CELLS) + brick_slot;
+                octree_nodes[task.octree_offset] = vec2<u32>(
+                    OCTREE_LEAF_BIT | OCTREE_BRICK_BIT | brick_id,
+                    INTERNAL_ATTR_NONE,
+                );
+            }
+        } else {
+            // No cells want to emit — leave octree EMPTY (already
+            // pre-written by classify), don't allocate a brick.
+            atomicStore(&wg_alloc_failed, 1u);
+        }
+    }
+    workgroupBarrier();
+
+    if (atomicLoad(&wg_alloc_failed) != 0u) {
+        // Either no emits or brick capacity exceeded. Either way,
+        // no brick to write into. Octree stays EMPTY.
+        return;
+    }
+
+    let brick_slot_idx = wg_brick_offset + cell_idx;
     if (emit.occupancy == 0u) {
         brick_pool[brick_slot_idx] = BRICK_CELL_EMPTY;
         return;

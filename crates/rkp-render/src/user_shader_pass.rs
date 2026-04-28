@@ -557,7 +557,7 @@ pub struct PoolEstimate {
 /// allocations of any size, eliminating fragmentation.
 ///
 /// Tradeoff: tiny tiles (a single painted leaf) reserve the same
-/// slab as fully-saturated tiles (~4096 bricks). Worst-case memory
+/// slab as fully-saturated tiles (~2048 bricks). Worst-case memory
 /// usage equals the steady-state reservation that
 /// `run_user_shader_geom` makes, so there's no extra cost relative
 /// to the buffer pool we already allocate.
@@ -568,13 +568,16 @@ pub struct PoolEstimate {
 /// — but only after we've measured fragmentation pressure).
 pub fn estimate_region_pool(painted_leaf_count: u32, max_depth: u32) -> PoolEstimate {
     let _ = painted_leaf_count;
-    // Bricks per region: matches `MAX_BRICKS_PER_REGION` constant in
-    // `run_user_shader_geom`. Sized for max_depth 8 (4096 = 2^12 bricks
-    // per region) so a single shader at @max_depth 8 fits without
-    // overflow; lower-depth shaders waste reserved slots within the
-    // slab but the BFS only allocates what it actually needs from the
-    // per-region atomic counter.
-    const SLAB_BRICKS: u32 = 4096;
+    // Bricks per region: sized for the realistic per-tile band volume
+    // at @max_depth 4 + tile_size 1m + region_thickness 0.5m
+    // (= 16² surface bricks × 8 band layers ≈ 2 K bricks). Shaders
+    // that exceed this within a single tile (e.g. @max_depth 5 on a
+    // 1m tile with a thick band) will degrade gracefully with
+    // OCTREE_EMPTY on overflow bricks — bumping `@max_depth` should
+    // be paired with a smaller `@tile_size` or tighter
+    // `@region_thickness` to keep per-tile demand under this slab
+    // size.
+    const SLAB_BRICKS: u32 = 2048;
     // Octree per region: enough to hold the max possible internal +
     // brick-leaf nodes a depth-N BFS produces, plus the always-
     // existing root-to-deepest spine. SLAB_BRICKS × 8 covers the
@@ -1404,7 +1407,7 @@ mod tests {
     fn cache_returns_dirty_first_time_and_clean_second() {
         let mut cache = UserShaderObjectCache::new();
         // Slab fits 4 regions: 4 × (32K bricks + 8K octree + 128K leaf-attrs).
-        cache.set_pool_bases(0, 32_900 * 4, 0, 4096 * 64 * 4, 0, 4096 * 32 * 4);
+        let _slab = estimate_region_pool(0, 4); cache.set_pool_bases(0, _slab.octree * 4, 0, _slab.bricks * BRICK_CELLS * 4, 0, _slab.leaf_attrs * 4);
         let r = req(1, 1);
         let h = effective_hash(&r, 7, 0);
         let s1 = cache.lookup_or_allocate(&r, h).unwrap();
@@ -1420,7 +1423,7 @@ mod tests {
     fn cache_animated_always_dirty() {
         let mut cache = UserShaderObjectCache::new();
         // Slab fits 4 regions: 4 × (32K bricks + 8K octree + 128K leaf-attrs).
-        cache.set_pool_bases(0, 32_900 * 4, 0, 4096 * 64 * 4, 0, 4096 * 32 * 4);
+        let _slab = estimate_region_pool(0, 4); cache.set_pool_bases(0, _slab.octree * 4, 0, _slab.bricks * BRICK_CELLS * 4, 0, _slab.leaf_attrs * 4);
         let mut r = req(1, 1);
         r.animated = true;
         let h = effective_hash(&r, 1, 0);
@@ -1432,7 +1435,7 @@ mod tests {
     fn cache_different_keys_get_different_slots() {
         let mut cache = UserShaderObjectCache::new();
         // Slab fits 4 regions: 4 × (32K bricks + 8K octree + 128K leaf-attrs).
-        cache.set_pool_bases(0, 32_900 * 4, 0, 4096 * 64 * 4, 0, 4096 * 32 * 4);
+        let _slab = estimate_region_pool(0, 4); cache.set_pool_bases(0, _slab.octree * 4, 0, _slab.bricks * BRICK_CELLS * 4, 0, _slab.leaf_attrs * 4);
         let mut r = req(1, 1);
         let s1 = cache.lookup_or_allocate(&r, 0).unwrap();
         r.material_id = 2;
@@ -1446,7 +1449,7 @@ mod tests {
     fn cache_distinguishes_tiles_on_same_material() {
         let mut cache = UserShaderObjectCache::new();
         // Slab fits 4 regions: 4 × (32K bricks + 8K octree + 128K leaf-attrs).
-        cache.set_pool_bases(0, 32_900 * 4, 0, 4096 * 64 * 4, 0, 4096 * 32 * 4);
+        let _slab = estimate_region_pool(0, 4); cache.set_pool_bases(0, _slab.octree * 4, 0, _slab.bricks * BRICK_CELLS * 4, 0, _slab.leaf_attrs * 4);
         let mut r = req(1, 1);
         r.tile_index = [0, 0, 0];
         let s1 = cache.lookup_or_allocate(&r, 0).unwrap();
@@ -1467,7 +1470,7 @@ mod tests {
         // ones request.
         let mut cache = UserShaderObjectCache::new();
         // Pool fits exactly 4 slabs.
-        cache.set_pool_bases(0, 32_900 * 4, 0, 4096 * 64 * 4, 0, 4096 * 32 * 4);
+        let _slab = estimate_region_pool(0, 4); cache.set_pool_bases(0, _slab.octree * 4, 0, _slab.bricks * BRICK_CELLS * 4, 0, _slab.leaf_attrs * 4);
         // Frame 1 — fill the pool with tiles [0..4].
         cache.begin_frame();
         let mut r = req(1, 1);
@@ -1498,7 +1501,7 @@ mod tests {
     fn evict_untouched_drops_abandoned_tiles() {
         let mut cache = UserShaderObjectCache::new();
         // Slab fits 4 regions: 4 × (32K bricks + 8K octree + 128K leaf-attrs).
-        cache.set_pool_bases(0, 32_900 * 4, 0, 4096 * 64 * 4, 0, 4096 * 32 * 4);
+        let _slab = estimate_region_pool(0, 4); cache.set_pool_bases(0, _slab.octree * 4, 0, _slab.bricks * BRICK_CELLS * 4, 0, _slab.leaf_attrs * 4);
         let mut r = req(1, 1);
         // Frame 1 — three tiles allocated.
         cache.begin_frame();
@@ -1530,7 +1533,7 @@ mod tests {
     fn cache_flushes_on_geometry_epoch_bump() {
         let mut cache = UserShaderObjectCache::new();
         // Slab fits 4 regions: 4 × (32K bricks + 8K octree + 128K leaf-attrs).
-        cache.set_pool_bases(0, 32_900 * 4, 0, 4096 * 64 * 4, 0, 4096 * 32 * 4);
+        let _slab = estimate_region_pool(0, 4); cache.set_pool_bases(0, _slab.octree * 4, 0, _slab.bricks * BRICK_CELLS * 4, 0, _slab.leaf_attrs * 4);
         let r = req(1, 1);
         cache.lookup_or_allocate(&r, 0);
         assert!(cache.reconcile_epoch(1));
@@ -1581,7 +1584,7 @@ mod tests {
         let est = estimate_region_pool(64, 8);
         // Depth 8 doesn't blow past the slab (it's already sized for
         // max_depth 8 worst case).
-        assert!(est.bricks <= 4096);
+        assert!(est.bricks <= 2048);
     }
 
     #[test]

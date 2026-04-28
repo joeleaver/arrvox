@@ -103,13 +103,12 @@ fn user_ball_generate(cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx)
     // Prepare scene buffers — sized to fit the test region's pool
     // estimate. We don't need a real RkpScene here; raw storage
     // buffers wired to UserShaderPass's group 0 are sufficient.
-    const MAX_DEPTH: u32 = 4;
-    // No proximity gate (no host, region_thickness=0) means the BFS
-    // expands every cell to the deepest level — full dense enumeration
-    // at depth 4 = 4096 bricks. Painted-leaf count drives the estimate
-    // function; a value high enough to cover the dense case prevents
-    // brick-pool overflow.
-    const PAINTED_COUNT: u32 = 1500;
+    // Depth 3 gives 8³ = 512 dense bricks, well under the 2048-brick
+    // slab so the BFS expands fully without overflow. (Depth 4's
+    // 4096 dense bricks exceeds the slab; that's the V10 trade-off
+    // between per-tile granularity and per-tile capacity.)
+    const MAX_DEPTH: u32 = 3;
+    const PAINTED_COUNT: u32 = 64;
     let estimate = estimate_region_pool(PAINTED_COUNT, MAX_DEPTH);
     // octree_nodes is bound as `array<vec2<u32>>` (8 B/elem); brick_pool
     // as `array<u32>` (4 B/elem); leaf_attr_pool as `array<LeafAttr>`
@@ -222,12 +221,21 @@ fn user_ball_generate(cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx)
     let active_counts: Vec<u32> = (0..9)
         .map(|i| u32::from_le_bytes(bytes[48 + i * 4..52 + i * 4].try_into().unwrap()))
         .collect();
-    // Sanity: BFS expansion at depth=4 should be 1 → 8 → 64 → 512 → 4096
-    // → 0 (last level is brick parents, not internal cells). Brick &
-    // fill counts match the deepest level's count.
-    assert_eq!(active_counts[..5], [1, 8, 64, 512, 4096]);
-    assert_eq!(brick_alloc, 4096);
-    assert_eq!(fill_count, 4096);
+    // Sanity: BFS expansion at depth=3 should be 1 → 8 → 64 → 512.
+    // V12 deferred-allocation semantics:
+    //   * fill_count: 512 (all 512 brick-parent cells queue fills).
+    //   * brick_alloc: ≤ 512 (only bricks where ≥1 cell emits).
+    //     For the ball shader in a unit cube, bricks fully outside
+    //     the sphere have all-empty cells and no longer consume a
+    //     slot. brick_alloc < fill_count is the correctness signal
+    //     for deferred allocation.
+    assert_eq!(active_counts[..4], [1, 8, 64, 512]);
+    assert_eq!(fill_count, 512);
+    assert!(
+        brick_alloc < fill_count && brick_alloc > 0,
+        "brick_alloc={brick_alloc} should be > 0 and < fill_count={fill_count} \
+         (deferred allocation skips all-empty bricks)",
+    );
     let occupied_gpu = leaf_alloc;
 
     // CPU reference — enumerate the lattice the GPU would produce for
