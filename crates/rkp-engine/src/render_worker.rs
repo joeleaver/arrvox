@@ -234,6 +234,17 @@ struct RenderState {
     user_shader_pass: rkp_render::user_shader_pass::UserShaderPass,
     user_shader_cache: rkp_render::user_shader_pass::UserShaderObjectCache,
 
+    /// Option B (voxel sprite instancing) — scene-wide pieces. The
+    /// per-viewport march + composite live in [`ViewportRenderer`]
+    /// (Stage 6c-2). All four pieces here are constructed at startup
+    /// and ticked per-frame even when no instance shader is registered;
+    /// each cache's `begin_frame` / `evict_untouched` is a cheap no-op
+    /// when no requests come in.
+    instance_proto_pass: rkp_render::user_shader_proto_pass::PrototypeBakePass,
+    instance_proto_cache: rkp_render::user_shader_proto_pass::PrototypeCache,
+    instance_emit_pass: rkp_render::user_shader_emit_pass::EmitPass,
+    instance_region_cache: rkp_render::user_shader_emit_pass::InstanceRegionCache,
+
     /// Pick readback target. 1×1 region of the gbuf_material at offset
     /// 0, 1×1 region of the gbuf_pick at offset 256 — both 256-byte
     /// aligned per wgpu's copy alignment rules.
@@ -349,6 +360,19 @@ impl RenderState {
         let user_shader_pass = rkp_render::user_shader_pass::UserShaderPass::new(&device);
         let user_shader_cache = rkp_render::user_shader_pass::UserShaderObjectCache::new();
 
+        // Option B instance-pipeline scene-wide pieces. Stage 6c-1
+        // wires them into RenderState; Stage 6c-2/3 add the per-frame
+        // dispatch + viewport march/composite. Until then both caches
+        // see zero requests per frame and tick as no-ops.
+        let instance_proto_pass =
+            rkp_render::user_shader_proto_pass::PrototypeBakePass::new(&device);
+        let instance_proto_cache =
+            rkp_render::user_shader_proto_pass::PrototypeCache::new();
+        let instance_emit_pass =
+            rkp_render::user_shader_emit_pass::EmitPass::new(&device);
+        let instance_region_cache =
+            rkp_render::user_shader_emit_pass::InstanceRegionCache::new();
+
         Self {
             device,
             queue,
@@ -357,6 +381,10 @@ impl RenderState {
             scene_mgr: init.scene_mgr,
             user_shader_pass,
             user_shader_cache,
+            instance_proto_pass,
+            instance_proto_cache,
+            instance_emit_pass,
+            instance_region_cache,
             pick_readback_buffer,
             pick_in_flight: None,
             curr_snap: None,
@@ -966,6 +994,14 @@ fn render_one_frame(
     //      bake-built objects — same octree node encoding, same leaf
     //      attr layout — so no shader-side branching is needed.
     let transient_objects = run_user_shader_geom(state, frame);
+
+    // 1.7b. Option B (instance pipeline) per-frame tick. Stage 6c-1
+    //       wires the caches' lifecycle hooks; Stage 6c-2 will follow
+    //       this with the real bake/scatter dispatch + per-viewport
+    //       march/composite. Until then both caches see zero requests
+    //       per frame and `evict_untouched` simply releases nothing.
+    tick_instance_pipeline(state);
+
     let mut combined_objects: Vec<rkp_render::rkp_gpu_object::RkpGpuObject>;
     let gpu_objects_for_upload: &[rkp_render::rkp_gpu_object::RkpGpuObject] =
         if transient_objects.is_empty() {
@@ -1464,6 +1500,30 @@ fn splice_transient_into_tile_lists(
 ///   - `fill_hash` — shader source + params + paint epoch + time
 ///     (when @animated). fill can be skipped when unchanged AND
 ///     topology unchanged.
+/// Stage 6c-1 — per-frame tick for the Option B instance pipeline's
+/// scene-wide caches. Right now this is a no-op skeleton that
+/// `begin_frame`s + `evict_untouched`s both caches; Stage 6c-2 will
+/// extend it to also build TileIndex + flatten proto-lookup + dispatch
+/// bake/scatter when there are instance shader regions to render.
+///
+/// Called every frame, even when no instance shader is registered —
+/// the cache lifecycle is cheap (HashMap iteration over zero entries
+/// when nothing's been registered) so there's no gating cost saved by
+/// skipping it.
+fn tick_instance_pipeline(state: &mut RenderState) {
+    state.instance_proto_cache.begin_frame();
+    state.instance_region_cache.begin_frame();
+
+    // Stage 6c-2 will lookup_or_allocate each instance shader region
+    // here, dispatch the bake/scatter, and produce the per-frame
+    // TileIndex + GpuPrototypeEntry arrays the per-viewport march/
+    // composite reads. None of that exists yet; ticking the lifecycle
+    // hooks is the whole job today.
+
+    state.instance_proto_cache.evict_untouched();
+    state.instance_region_cache.evict_untouched();
+}
+
 fn run_user_shader_geom(
     state: &mut RenderState,
     frame: &RenderFrame,
