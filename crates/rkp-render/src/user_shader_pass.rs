@@ -62,7 +62,7 @@
 
 use std::collections::HashMap;
 
-use crate::rkp_gpu_object::{geom_type, RkpGpuObject};
+use crate::rkp_gpu_object::{geom_type, RkpGpuAsset, RkpGpuInstance};
 use crate::shader_composer::UserShaderInfo;
 use crate::validate_wgsl;
 
@@ -692,13 +692,23 @@ impl UserShaderObjectCache {
     }
 
     /// Iterate cached entries (touched this frame) and emit one
-    /// `RkpGpuObject` each so the march pass finds the geometry.
-    pub fn build_transient_objects(&self) -> Vec<RkpGpuObject> {
-        self.entries
-            .values()
-            .filter(|e| e.touched_this_frame)
-            .map(transient_gpu_object)
-            .collect()
+    /// (asset, instance) pair each so the march pass finds the geometry.
+    /// Each transient region is its own asset (unique octree slot — no
+    /// dedupe with persistent assets or among transients), and one
+    /// instance per asset since transients aren't multi-instanced.
+    pub fn build_transient_assets_and_instances(
+        &self,
+        asset_id_base: u32,
+    ) -> (Vec<RkpGpuAsset>, Vec<RkpGpuInstance>) {
+        let mut assets: Vec<RkpGpuAsset> = Vec::new();
+        let mut instances: Vec<RkpGpuInstance> = Vec::new();
+        for e in self.entries.values().filter(|e| e.touched_this_frame) {
+            let (a, mut i) = transient_asset_and_instance(e);
+            i.asset_id = asset_id_base + assets.len() as u32;
+            assets.push(a);
+            instances.push(i);
+        }
+        (assets, instances)
     }
 
     pub fn entry_count(&self) -> usize { self.entries.len() }
@@ -852,7 +862,7 @@ pub fn estimate_region_pool(request: &ShaderRegionRequest) -> PoolEstimate {
     }
 }
 
-fn transient_gpu_object(entry: &CacheEntry) -> RkpGpuObject {
+fn transient_asset_and_instance(entry: &CacheEntry) -> (RkpGpuAsset, RkpGpuInstance) {
     // Brick grid spans `cell_size * BRICK_DIM * 2^max_depth` per axis
     // from `aabb_min` — the BFS still yields a (4 * 2^max_depth)³ cube
     // at full depth.
@@ -869,36 +879,41 @@ fn transient_gpu_object(entry: &CacheEntry) -> RkpGpuObject {
         [0.0, 0.0, 1.0, 0.0],
         [0.0, 0.0, 0.0, 1.0],
     ];
-    RkpGpuObject {
-        world: identity,
+    let asset = RkpGpuAsset {
         aabb_min: entry.aabb_min,
         octree_root: entry.octree_root,
         aabb_max: aabb_max_cube,
         octree_depth: entry.max_depth,
         octree_extent_bits: extent.to_bits(),
         voxel_size: entry.cell_size,
-        material_id: 0,
-        object_id: entry.object_id,
         geom_type: geom_type::VOXELIZED,
-        is_skinned: 0,
         bone_count: 0,
-        bone_buffer_offset: 0,
+        grid_origin: entry.aabb_min,
         rest_octree_root: 0,
         rest_octree_depth: 0,
         rest_octree_extent_bits: 0,
-        bone_field_offset: 0,
+        _pad: [0; 2],
+    };
+    let instance = RkpGpuInstance {
+        world: identity,
+        inverse_world: identity,
+        asset_id: 0, // caller assigns the actual slot index
+        material_id: 0,
+        object_id: entry.object_id,
         layer_mask: u32::MAX,
+        is_skinned: 0,
+        bone_buffer_offset: 0,
+        bone_field_offset: 0,
+        bone_field_occ_offset: 0,
         bone_field_dim_x: 0,
         bone_field_dim_y: 0,
         bone_field_dim_z: 0,
         bone_field_origin_x: 0.0,
         bone_field_origin_y: 0.0,
         bone_field_origin_z: 0.0,
-        bone_field_occ_offset: 0,
-        grid_origin: entry.aabb_min,
-        _post_grid_pad: 0,
-        inverse_world: identity,
-    }
+        _pad: [0; 2],
+    };
+    (asset, instance)
 }
 
 /// Slot descriptor returned from `lookup_or_allocate`. Carries the
@@ -1928,10 +1943,11 @@ mod tests {
         // Frame 2 — touch only one.
         c.begin_frame();
         c.lookup_or_allocate(&req(1, 1), 0, 0, &small_estimate()).unwrap();
-        let objs = c.build_transient_objects();
+        let (assets, objs) = c.build_transient_assets_and_instances(0);
         // Only the touched entry shows up; the untouched one is
         // pending eviction at end-of-frame and shouldn't render.
         assert_eq!(objs.len(), 1);
+        assert_eq!(assets.len(), 1);
     }
 
     #[test]

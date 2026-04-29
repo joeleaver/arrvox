@@ -48,7 +48,7 @@ use glam::{Affine3A, Mat4, Vec3};
 use rkp_render::{
     rkp_atmosphere::AtmosphereFrameParams,
     rkp_god_rays::GodRayParams,
-    rkp_gpu_object::RkpGpuObject,
+    rkp_gpu_object::{RkpGpuAsset, RkpGpuInstance},
     rkp_grid::GridParams,
     rkp_scene::CameraUniforms,
     rkp_shade::{GpuLight, GpuMaterial, ShadeParams},
@@ -64,12 +64,15 @@ pub struct RenderFrame {
     /// [`RenderResult::frame_index`] so sim can correlate timings.
     pub frame_index: u64,
 
-    /// Per-object GPU data, rebuilt by sim from `World` whenever
-    /// transforms / membership / visibility changed. Render uploads
-    /// (`upload_frame`) regardless of dirtiness — the cost is one
-    /// `queue.write_buffer`, cheap; sim sets `gpu_objects_dirty`
+    /// Per-asset GPU records — deduped by `octree_root`. Built by sim's
+    /// `update_scene_gpu` alongside `gpu_instances`. The instance side's
+    /// `asset_id` indexes into this vec.
+    pub gpu_assets: Vec<RkpGpuAsset>,
+    /// Per-instance GPU records — one per renderable entity. Render
+    /// uploads (`upload_frame`) regardless of dirtiness — the cost is
+    /// one `queue.write_buffer`, cheap; sim sets `gpu_objects_dirty`
     /// purely as a hint for stat tracking, not as a gate.
-    pub gpu_objects: Vec<RkpGpuObject>,
+    pub gpu_instances: Vec<RkpGpuInstance>,
     pub gpu_objects_dirty: bool,
 
     /// Monotonic counter from `scene_mgr.geometry_epoch()`. Render

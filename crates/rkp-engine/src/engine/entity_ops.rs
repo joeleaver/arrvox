@@ -356,7 +356,8 @@ impl EngineState {
         self.entity_uuids.clear();
         self.uuid_to_entity.clear();
         self.next_entity_uuid = 1;
-        self.gpu_objects.clear();
+        self.gpu_assets.clear();
+        self.gpu_instances.clear();
         self.gpu_to_entity.clear();
         // `clear()` wipes every pool but preserves the epoch atomic
         // identity — replacing the whole manager here would orphan

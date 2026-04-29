@@ -1,9 +1,11 @@
-//! Per-frame derive of `gpu_objects` + skin dispatch plans from the ECS.
+//! Per-frame derive of `gpu_assets` + `gpu_instances` + skin dispatch
+//! plans from the ECS.
 //!
-//! Flattens `world` → `gpu_objects` on every tick where either geometry
-//! or transforms are dirty, updates the UUID ↔ gpu-index maps used for
-//! pick resolution, and walks skinned entities to build the skin
-//! scatter dispatch list the render thread consumes.
+//! Flattens `world` → `gpu_instances` (per-entity) and dedupes by
+//! `octree_root` into `gpu_assets` (per-unique-asset) on every tick where
+//! either geometry or transforms are dirty. Updates the UUID ↔ gpu-index
+//! maps used for pick resolution and walks skinned entities to build
+//! the skin scatter dispatch list the render thread consumes.
 
 use super::state::EngineState;
 
@@ -27,9 +29,17 @@ impl EngineState {
         let mut this_frame_poses: std::collections::HashMap<hecs::Entity, Vec<glam::Mat4>>
             = std::collections::HashMap::new();
 
-        self.gpu_objects.clear();
+        self.gpu_assets.clear();
+        self.gpu_instances.clear();
         self.gpu_to_entity.clear();
         self.entity_to_gpu.clear();
+        // Per-frame asset table — `octree_root` → index into
+        // `gpu_assets`. Two entities sharing one .rkp asset share one
+        // slot; the dedupe authoritatively builds the asset record from
+        // the asset cache's skinning_data (when present), not from the
+        // first-encountered instance's per-frame skinning binding.
+        let mut asset_table: std::collections::HashMap<u32, u32> =
+            std::collections::HashMap::new();
 
         // Refresh the sim-side skinning_data cache only when a
         // geometry mutation has happened since we last built it.
@@ -100,7 +110,7 @@ impl EngineState {
                     ),
                     transform.position,
                 );
-                let gpu_idx = self.gpu_objects.len() as u32;
+                let gpu_idx = self.gpu_instances.len() as u32;
                 let spatial_handle = rkp_core::scene_node::SpatialHandle::Octree {
                     root_offset: spatial.root_offset,
                     len: spatial.len,
@@ -173,26 +183,47 @@ impl EngineState {
                         }
                     }
                 }
-                let mut gpu_obj = crate::scene_sync::build_gpu_object(
+                // Asset side — dedupe by `octree_root`. Source the
+                // skinning template (`bone_count`, `rest_octree_*`) from
+                // the asset cache's skinning_data so it stays correct
+                // even when this particular instance's skin plan bails.
+                let bone_count_for_asset = renderable
+                    .asset_handle
+                    .and_then(|h| self.skinning_data_cache.get(&h))
+                    .map(|sd| sd.rest_bone_aabbs.len() as u32)
+                    .unwrap_or(0);
+                let asset_id = match asset_table.get(&spatial.root_offset) {
+                    Some(&id) => id,
+                    None => {
+                        let id = self.gpu_assets.len() as u32;
+                        self.gpu_assets.push(crate::scene_sync::build_gpu_asset(
+                            &spatial.aabb,
+                            spatial.grid_origin,
+                            &spatial_handle,
+                            spatial.voxel_size,
+                            bone_count_for_asset,
+                        ));
+                        asset_table.insert(spatial.root_offset, id);
+                        id
+                    }
+                };
+                let mut inst = crate::scene_sync::build_gpu_instance(
                     &world_matrix,
-                    &spatial.aabb,
-                    spatial.grid_origin,
-                    &spatial_handle,
-                    spatial.voxel_size,
+                    asset_id,
                     renderable.material_id,
                     gpu_idx,
                     skinning,
                 );
                 // Render-layer mask — entity opt-in via RenderLayer
                 // component, otherwise the system DEFAULT bit.
-                gpu_obj.layer_mask = self
+                inst.layer_mask = self
                     .world
                     .get::<&crate::viewport::RenderLayer>(entity)
                     .map(|l| l.mask)
                     .unwrap_or(crate::viewport::layer::DEFAULT);
-                self.entity_to_gpu.insert(entity, self.gpu_objects.len());
+                self.entity_to_gpu.insert(entity, self.gpu_instances.len());
                 self.gpu_to_entity.push(entity);
-                self.gpu_objects.push(gpu_obj);
+                self.gpu_instances.push(inst);
             }
         }
 

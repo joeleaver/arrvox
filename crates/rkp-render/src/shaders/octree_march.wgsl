@@ -48,13 +48,10 @@ const BRICK_CELL_INTERIOR: u32 = 0xFFFFFFFDu;
 // in pathological cases.
 const BRICK_MAX_STEPS: u32 = 4096u;
 
-// Per-instance record (208 bytes incl. 8-B tail pad). One per scene
+// Per-instance record (192 bytes incl. 8-B tail pad). One per scene
 // entity. See `crates/rkp-render/src/rkp_gpu_object.rs` for the Rust
-// mirror. Skinning template fields (`bone_count`, `rest_octree_*`) and
-// per-frame deformed-pose fields (`bone_field_dim_*`, `bone_field_origin_*`)
-// all live here in Phase 1; Phase 1b moves the templates to the asset
-// once they're sourced from the asset cache rather than the per-frame
-// skinning binding.
+// mirror. Skinning template fields (`bone_count`, `rest_octree_*`)
+// live on RkpAsset; only per-frame skinning runtime state lives here.
 struct RkpInstance {
     world: mat4x4<f32>,
     inverse_world: mat4x4<f32>,
@@ -63,11 +60,7 @@ struct RkpInstance {
     object_id: u32,
     layer_mask: u32,
     is_skinned: u32,
-    bone_count: u32,
     bone_buffer_offset: u32,
-    rest_octree_root: u32,
-    rest_octree_depth: u32,
-    rest_octree_extent_bits: u32,
     bone_field_offset: u32,
     bone_field_occ_offset: u32,
     bone_field_dim_x: u32, bone_field_dim_y: u32,
@@ -78,14 +71,19 @@ struct RkpInstance {
     _pad0: u32, _pad1: u32,
 }
 
-// Per-asset record (64 bytes). Deduped by `octree_root`; multiple
-// instances share one slot via `inst.asset_id`.
+// Per-asset record (80 bytes). Deduped by `octree_root`; multiple
+// instances share one slot via `inst.asset_id`. Carries the skeleton
+// template (`bone_count`, `rest_octree_*`) sourced from the asset
+// cache so it stays correct regardless of any single instance's
+// per-frame skin plan succeeding.
 struct RkpAsset {
     aabb_min: vec3<f32>, octree_root: u32,
     aabb_max: vec3<f32>, octree_depth: u32,
     octree_extent_bits: u32, voxel_size: f32,
-    geom_type: u32, _pad0: u32,
-    grid_origin: vec3<f32>, _pad1: u32,
+    geom_type: u32, bone_count: u32,
+    grid_origin: vec3<f32>, rest_octree_root: u32,
+    rest_octree_depth: u32, rest_octree_extent_bits: u32,
+    _pad0: u32, _pad1: u32,
 }
 
 struct CameraUniforms {
@@ -785,7 +783,7 @@ fn march_object_skinned(
     let local_dir = normalize(local_dir_unnorm);
     let vs = asset.voxel_size;
 
-    let rest_extent = bitcast<f32>(inst.rest_octree_extent_bits);
+    let rest_extent = bitcast<f32>(asset.rest_octree_extent_bits);
     // Scatter + bone field all live in grid frame (origin at octree
     // corner, range [0, extent]); the ray enters in mesh frame from
     // `inverse_world`. Shift once up front.
@@ -894,7 +892,7 @@ fn march_object(
 ) -> MarchResult {
     // Phase-3b: skinned objects inverse-skin at march time. Unskinned
     // objects fall through to the existing rest-octree DDA.
-    if inst.is_skinned != 0u && inst.bone_count > 0u && inst.bone_field_dim_x > 0u {
+    if inst.is_skinned != 0u && asset.bone_count > 0u && inst.bone_field_dim_x > 0u {
         return march_object_skinned(world_origin, world_dir, inst, asset);
     }
     var result = MarchResult(

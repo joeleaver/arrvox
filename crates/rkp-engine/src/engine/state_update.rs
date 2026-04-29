@@ -458,7 +458,7 @@ impl EngineState {
             delivered_fps: self.delivered_hz_ema,
             tick_hz: self.tick_hz_ema,
             physics_hz: self.physics_hz_ema,
-            gpu_object_count: self.gpu_objects.len() as u32,
+            gpu_object_count: self.gpu_instances.len() as u32,
             camera_position: self.camera.position,
             play_mode: self.play_state.is_some(),
             selected_entity: self.selected_entity.map(|e| self.get_entity_uuid(e)),

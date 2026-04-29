@@ -171,10 +171,10 @@ impl EngineState {
                     // GPU object skip the leaf collection (mat_tiles
                     // still gets the AABB so Phase C still works).
                     let entity_world: Option<glam::Mat4> = self
-                        .gpu_objects
+                        .gpu_instances
                         .iter()
-                        .find(|o| o.object_id == object_id)
-                        .map(|o| glam::Mat4::from_cols_array_2d(&o.world));
+                        .find(|i| i.object_id == object_id)
+                        .map(|i| glam::Mat4::from_cols_array_2d(&i.world));
                     scan_painted_aabbs(
                         octree_data,
                         brick_pool_data,
@@ -206,19 +206,23 @@ impl EngineState {
         if !shader_materials.is_empty() {
             const HARD_DEPTH_CEIL: u32 = rkp_render::user_shader_pass::MAX_DEPTH;
             const DEFAULT_MAX_DEPTH: u32 = 8;
-            for obj in self.gpu_objects.iter() {
-                let Some(mat_tiles) = self.painted_materials.get(&obj.object_id) else { continue; };
-                let world: glam::Mat4 = glam::Mat4::from_cols_array_2d(&obj.world);
-                let host_voxelized = obj.geom_type
+            for inst in self.gpu_instances.iter() {
+                let Some(mat_tiles) = self.painted_materials.get(&inst.object_id) else { continue; };
+                let asset = match self.gpu_assets.get(inst.asset_id as usize) {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let world: glam::Mat4 = glam::Mat4::from_cols_array_2d(&inst.world);
+                let host_voxelized = asset.geom_type
                     == rkp_render::rkp_gpu_object::geom_type::VOXELIZED;
                 let host_octree_root = if host_voxelized {
-                    obj.octree_root
+                    asset.octree_root
                 } else {
                     0xFFFFFFFFu32
                 };
-                let host_octree_extent = f32::from_bits(obj.octree_extent_bits);
-                let host_voxel_size = if obj.octree_depth > 0 {
-                    host_octree_extent / (4.0 * (1u32 << obj.octree_depth) as f32)
+                let host_octree_extent = f32::from_bits(asset.octree_extent_bits);
+                let host_voxel_size = if asset.octree_depth > 0 {
+                    host_octree_extent / (4.0 * (1u32 << asset.octree_depth) as f32)
                 } else {
                     1.0
                 };
@@ -364,10 +368,10 @@ impl EngineState {
                             *h ^= b as u64;
                             *h = h.wrapping_mul(0x100000001b3);
                         };
-                        for &b in &obj.object_id.to_le_bytes() { mix(&mut input_hash, b); }
+                        for &b in &inst.object_id.to_le_bytes() { mix(&mut input_hash, b); }
                         for &b in &(mat_id as u32).to_le_bytes() { mix(&mut input_hash, b); }
                         for &c in &tile_index { for &b in &c.to_le_bytes() { mix(&mut input_hash, b); } }
-                        for col in &obj.world {
+                        for col in &inst.world {
                             for &v in col { for &b in &v.to_le_bytes() { mix(&mut input_hash, b); } }
                         }
 
@@ -397,7 +401,7 @@ impl EngineState {
                         // tile produces exactly one request.
                         if info.has_generate {
                             user_shader_regions.push(rkp_render::user_shader_pass::ShaderRegionRequest {
-                                host_object_id: obj.object_id,
+                                host_object_id: inst.object_id,
                                 material_id: mat_id as u32,
                                 shader_name: shader_name_for_request.clone(),
                                 params: params.clone(),
@@ -410,10 +414,10 @@ impl EngineState {
                                 max_depth,
                                 painted_leaf_count,
                                 host_octree_root,
-                                host_octree_depth: obj.octree_depth,
+                                host_octree_depth: asset.octree_depth,
                                 host_octree_extent,
-                                host_grid_origin: obj.grid_origin,
-                                host_inverse_world: obj.inverse_world,
+                                host_grid_origin: asset.grid_origin,
+                                host_inverse_world: inst.inverse_world,
                                 tile_index,
                             });
                         } else if info.is_instance_pipeline {
@@ -426,7 +430,7 @@ impl EngineState {
                             let leaves = tile_entry.leaves.clone();
                             instance_region_requests.push(
                                 rkp_render::user_shader_emit_pass::InstanceRegionRequest {
-                                    host_object_id: obj.object_id,
+                                    host_object_id: inst.object_id,
                                     material_id: mat_id as u32,
                                     shader_name: shader_name_for_request.clone(),
                                     params: params.clone(),
@@ -440,10 +444,10 @@ impl EngineState {
                                     stride_u32,
                                     max_instances: DEFAULT_MAX_INSTANCES,
                                     host_octree_root,
-                                    host_octree_depth: obj.octree_depth,
+                                    host_octree_depth: asset.octree_depth,
                                     host_octree_extent,
-                                    host_grid_origin: obj.grid_origin,
-                                    host_inverse_world: obj.inverse_world,
+                                    host_grid_origin: asset.grid_origin,
+                                    host_inverse_world: inst.inverse_world,
                                     leaves,
                                 },
                             );
@@ -658,7 +662,8 @@ impl EngineState {
             // Per-viewport screen-AABBs (camera-dependent) for tile cull.
             let vp_matrix = glam::Mat4::from_cols_array_2d(&cam_uniforms.view_proj);
             let screen_aabbs = crate::scene_sync::compute_screen_aabbs(
-                &self.gpu_objects,
+                &self.gpu_instances,
+                &self.gpu_assets,
                 &vp_matrix,
                 vp_w as f32,
                 vp_h as f32,
@@ -1037,7 +1042,8 @@ impl EngineState {
 
         let frame = crate::render_frame::RenderFrame {
             frame_index: self.frame_index,
-            gpu_objects: self.gpu_objects.clone(),
+            gpu_assets: self.gpu_assets.clone(),
+            gpu_instances: self.gpu_instances.clone(),
             gpu_objects_dirty: gpu_objects_dirty_this_frame,
             geometry_epoch,
             brush_overlay_epoch,
@@ -1095,7 +1101,7 @@ impl EngineState {
             // Lag is typically 1-2 frames, fine for display.
             gpu_passes: Vec::new(),
             render_dt_ms: 0.0,
-            gpu_object_count: self.gpu_objects.len() as u32,
+            gpu_object_count: self.gpu_instances.len() as u32,
         });
 
         self.frame_index += 1;

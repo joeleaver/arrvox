@@ -7,7 +7,7 @@
 //! No incremental updates, no caching, no callbacks. The caller builds the full
 //! data each time and passes it in.
 
-use crate::rkp_gpu_object::RkpGpuObject;
+use crate::rkp_gpu_object::{RkpGpuAsset, RkpGpuInstance};
 
 /// Option B proto-buffer capacities. Sized once at construction —
 /// these buffers are dedicated to the prototype cache and don't share
@@ -96,13 +96,16 @@ pub struct GeometryUpload<'a> {
     pub brick_face_links: &'a [u8],
 }
 
-/// Per-frame data — objects only. Camera uniforms are per-viewport and
-/// uploaded separately via `ViewportRenderer::upload_camera`.
+/// Per-frame data. Camera uniforms are per-viewport and uploaded
+/// separately via `ViewportRenderer::upload_camera`.
 pub struct FrameUpload<'a> {
-    /// Per-object metadata, built from scene/ECS state.
-    pub objects: &'a [RkpGpuObject],
+    /// Per-asset records, deduped upstream (one per unique octree). The
+    /// `RkpGpuInstance.asset_id` field indexes into this slice.
+    pub assets: &'a [RkpGpuAsset],
+    /// Per-instance records — one per scene entity.
+    pub instances: &'a [RkpGpuInstance],
     /// Concatenated skinning palette — one `mat4x4<f32>` per bone across
-    /// every skinned entity in the scene, in `RkpGpuObject`
+    /// every skinned entity in the scene, in `RkpGpuInstance`
     /// `bone_buffer_offset` order. Empty `&[]` when no animated entities
     /// are loaded (in which case the bone buffer keeps its dummy
     /// placeholder size so the shader bind still validates).
@@ -148,14 +151,12 @@ pub struct FrameUpload<'a> {
 pub struct RkpScene {
     pub brick_pool_buffer: wgpu::Buffer,
     pub octree_nodes_buffer: wgpu::Buffer,
-    /// Per-instance records — one entry per scene entity. Built from
-    /// `FrameUpload::objects` by [`crate::rkp_gpu_object::split_objects`]
-    /// every frame.
+    /// Per-instance records — one entry per scene entity. Sourced from
+    /// `FrameUpload::instances`.
     pub objects_buffer: wgpu::Buffer,
-    /// Per-asset records — one entry per unique octree, keyed by
-    /// `octree_root`. Built alongside `objects_buffer` in `upload_frame`.
-    /// Multiple instances reference the same slot via
-    /// `RkpGpuInstance.asset_id`.
+    /// Per-asset records — one entry per unique octree. Multiple
+    /// instances reference the same slot via `RkpGpuInstance.asset_id`.
+    /// Sourced from `FrameUpload::assets`.
     pub assets_buffer: wgpu::Buffer,
     pub color_pool_buffer: wgpu::Buffer,
     pub bone_matrices_buffer: wgpu::Buffer,
@@ -207,11 +208,11 @@ impl RkpScene {
         let octree_nodes_buffer = Self::create_storage(device, "rkp_octree_nodes", 8);
         let objects_buffer = Self::create_storage(
             device, "rkp_objects",
-            std::mem::size_of::<crate::rkp_gpu_object::RkpGpuInstance>() as u64,
+            std::mem::size_of::<RkpGpuInstance>() as u64,
         );
         let assets_buffer = Self::create_storage(
             device, "rkp_assets",
-            std::mem::size_of::<crate::rkp_gpu_object::RkpGpuAsset>() as u64,
+            std::mem::size_of::<RkpGpuAsset>() as u64,
         );
         let color_pool_buffer = Self::create_storage(device, "rkp_color_pool", 4);
         let bone_matrices_buffer = Self::create_storage(device, "rkp_bone_matrices", 64);
@@ -493,20 +494,13 @@ impl RkpScene {
         }
     }
 
-    /// Upload per-frame object data. Splits the legacy `RkpGpuObject`
-    /// list into deduplicated per-asset records + per-instance records
-    /// (see [`crate::rkp_gpu_object::split_objects`]), then writes both
-    /// to GPU. Bumps the epoch when either buffer reallocates so VRs
+    /// Upload per-frame asset + instance data. The caller has already
+    /// deduplicated assets upstream; this is a straight write of both
+    /// buffers. Bumps the epoch when either buffer reallocates so VRs
     /// rebuild their bind groups.
-    ///
-    /// Phase 1a transitional shape — CPU still constructs the legacy
-    /// 256-byte struct; the dedupe happens here on upload. Phase 1b
-    /// will move the split upstream so `FrameUpload` carries the two
-    /// vecs directly.
     pub fn upload_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &FrameUpload) {
-        let (assets, instances) = crate::rkp_gpu_object::split_objects(data.objects);
-        let inst_bytes: &[u8] = bytemuck::cast_slice(&instances);
-        let asset_bytes: &[u8] = bytemuck::cast_slice(&assets);
+        let inst_bytes: &[u8] = bytemuck::cast_slice(data.instances);
+        let asset_bytes: &[u8] = bytemuck::cast_slice(data.assets);
         let mut needs_rebuild = Self::ensure_and_write(device, queue, &mut self.objects_buffer, "rkp_objects", inst_bytes);
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.assets_buffer, "rkp_assets", asset_bytes);
 

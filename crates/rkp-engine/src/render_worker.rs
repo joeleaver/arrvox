@@ -811,17 +811,18 @@ fn run_render_thread(
             / state.sim_dt_estimate.as_secs_f32().max(1e-4))
             .clamp(0.0, 1.0);
 
-        // 5. Build the object list we'll actually upload. If there's
+        // 5. Build the instance list we'll actually upload. If there's
         //    a prev snapshot and α < 1, blend; otherwise use curr
         //    directly (free — avoids per-object work at sim rate).
-        let interp_objects: Vec<rkp_render::rkp_gpu_object::RkpGpuObject> =
+        //    Assets don't interpolate — they're pose-static for a frame.
+        let interp_instances: Vec<rkp_render::rkp_gpu_object::RkpGpuInstance> =
             match (prev.as_ref(), alpha < 0.999) {
-                (Some(p), true) => interpolate_gpu_objects(
-                    &p.gpu_objects,
-                    &curr.gpu_objects,
+                (Some(p), true) => interpolate_instances(
+                    &p.gpu_instances,
+                    &curr.gpu_instances,
                     alpha,
                 ),
-                _ => curr.gpu_objects.clone(),
+                _ => curr.gpu_instances.clone(),
             };
 
         // 6. Render — same pipeline as before; `render_one_frame`
@@ -836,7 +837,7 @@ fn run_render_thread(
         let outcome = render_one_frame(
             &mut state,
             &curr,
-            &interp_objects,
+            &interp_instances,
             new_snapshot_consumed,
             &frame_callback,
         );
@@ -883,11 +884,11 @@ fn run_render_thread(
 /// not between sim ticks. Skinned entities still carry their bone
 /// pose via the separate bone-field buffer; their `world` is usually
 /// identity and the lerp is a no-op.
-fn interpolate_gpu_objects(
-    prev: &[rkp_render::rkp_gpu_object::RkpGpuObject],
-    curr: &[rkp_render::rkp_gpu_object::RkpGpuObject],
+fn interpolate_instances(
+    prev: &[rkp_render::rkp_gpu_object::RkpGpuInstance],
+    curr: &[rkp_render::rkp_gpu_object::RkpGpuInstance],
     alpha: f32,
-) -> Vec<rkp_render::rkp_gpu_object::RkpGpuObject> {
+) -> Vec<rkp_render::rkp_gpu_object::RkpGpuInstance> {
     // object_id → index-in-prev, built once per render tick. Small
     // HashMap is fine; scenes rarely have > a few hundred objects.
     let mut prev_by_id: std::collections::HashMap<u32, usize> =
@@ -973,7 +974,7 @@ struct RenderOutcome {
 fn render_one_frame(
     state: &mut RenderState,
     frame: &RenderFrame,
-    gpu_objects: &[rkp_render::rkp_gpu_object::RkpGpuObject],
+    gpu_instances: &[rkp_render::rkp_gpu_object::RkpGpuInstance],
     new_snapshot_consumed: bool,
     frame_callback: &FrameCallback,
 ) -> RenderOutcome {
@@ -1124,33 +1125,44 @@ fn render_one_frame(
     //       pool tail, reload pipeline if the shader source changed,
     //       walk regions, dispatch the geom-build pipeline for any
     //       that need a re-bake, and concatenate the resulting
-    //       transient `RkpGpuObject`s into `gpu_objects` so the
-    //       per-frame upload below ships them alongside persistent
-    //       objects. The march/shade passes treat them identically to
-    //       bake-built objects — same octree node encoding, same leaf
-    //       attr layout — so no shader-side branching is needed.
-    let transient_objects = run_user_shader_geom(state, frame);
+    //       transient (asset, instance) pairs onto the persistent
+    //       lists so the per-frame upload below ships them alongside.
+    //       Each transient region is its own asset slot — assigned
+    //       via `asset_id_base` so it points into the correct slot in
+    //       the combined assets vec. The march/shade passes treat
+    //       transients identically to bake-built objects — same
+    //       octree node encoding, same leaf attr layout.
+    let asset_id_base = frame.gpu_assets.len() as u32;
+    let (transient_assets, transient_instances) =
+        run_user_shader_geom(state, frame, asset_id_base);
 
-    let mut combined_objects: Vec<rkp_render::rkp_gpu_object::RkpGpuObject>;
-    let gpu_objects_for_upload: &[rkp_render::rkp_gpu_object::RkpGpuObject] =
-        if transient_objects.is_empty() {
-            gpu_objects
-        } else {
-            combined_objects = Vec::with_capacity(gpu_objects.len() + transient_objects.len());
-            combined_objects.extend_from_slice(gpu_objects);
-            combined_objects.extend_from_slice(&transient_objects);
-            &combined_objects
-        };
+    let mut combined_assets: Vec<rkp_render::rkp_gpu_object::RkpGpuAsset>;
+    let mut combined_instances: Vec<rkp_render::rkp_gpu_object::RkpGpuInstance>;
+    let (assets_for_upload, instances_for_upload): (
+        &[rkp_render::rkp_gpu_object::RkpGpuAsset],
+        &[rkp_render::rkp_gpu_object::RkpGpuInstance],
+    ) = if transient_instances.is_empty() {
+        (frame.gpu_assets.as_slice(), gpu_instances)
+    } else {
+        combined_assets = Vec::with_capacity(frame.gpu_assets.len() + transient_assets.len());
+        combined_assets.extend_from_slice(&frame.gpu_assets);
+        combined_assets.extend_from_slice(&transient_assets);
+        combined_instances = Vec::with_capacity(gpu_instances.len() + transient_instances.len());
+        combined_instances.extend_from_slice(gpu_instances);
+        combined_instances.extend_from_slice(&transient_instances);
+        (combined_assets.as_slice(), combined_instances.as_slice())
+    };
 
-    // 1b. Per-frame `RkpGpuObject` upload. `gpu_objects` here may be
-    //     interpolated between the last two sim snapshots (see
-    //     `interpolate_gpu_objects`), so at high render rates
-    //     physics-driven motion is smooth instead of stuttering at
-    //     the sim rate.
+    // 1b. Per-frame upload. `gpu_instances` here may be interpolated
+    //     between the last two sim snapshots (see `interpolate_instances`),
+    //     so at high render rates physics-driven motion is smooth
+    //     instead of stuttering at the sim rate. Assets are pose-static
+    //     within a frame.
     state.renderer.upload_frame(
         &state.queue,
         &FrameUpload {
-            objects: gpu_objects_for_upload,
+            assets: assets_for_upload,
+            instances: instances_for_upload,
             bone_matrices: &frame.bone_matrix_lbs,
             bone_dual_quats: &frame.bone_matrix_dqs,
         },
@@ -1206,11 +1218,11 @@ fn render_one_frame(
     };
 
     // Object count comes from the interpolated list plus any
-    // transient user-shader objects appended by `run_user_shader_geom`.
-    // Transient objects sit at the tail of `objects_buffer`, indices
-    // `gpu_objects.len()..gpu_objects.len()+transient_objects.len()`.
-    let transient_count = transient_objects.len() as u32;
-    let persistent_count = gpu_objects.len() as u32;
+    // transient user-shader instances appended by `run_user_shader_geom`.
+    // Transient instances sit at the tail of `objects_buffer`, indices
+    // `gpu_instances.len()..gpu_instances.len()+transient_instances.len()`.
+    let transient_count = transient_instances.len() as u32;
+    let persistent_count = gpu_instances.len() as u32;
     let object_count = persistent_count + transient_count;
     // Transient object ids the per-VR tile list rebuild splices into
     // every tile. Sim's tile_object_ids only enumerated persistent
@@ -2301,8 +2313,12 @@ fn ensure_instance_leaves_capacity(state: &mut RenderState, needed_entries: u32)
 /// rebuilds the geom-build pipeline on shader source changes, walks
 /// the frame's regions and consults the persistent cache to decide
 /// per-region: skip / fill-only / full-bake. Returns the transient
-/// `RkpGpuObject` list to concatenate with `gpu_objects` for this
-/// frame's `upload_frame`.
+/// `(asset, instance)` pair lists to concatenate with the persistent
+/// vecs for this frame's `upload_frame`.
+///
+/// `asset_id_base` is the index into the combined assets vec where the
+/// first transient asset will land — the cache assigns sequential ids
+/// from this base.
 ///
 /// Each region computes two hashes: `topology_hash` (host_geom +
 /// region_thickness + max_depth + aabb + cell_size; classify can be
@@ -2312,7 +2328,11 @@ fn ensure_instance_leaves_capacity(state: &mut RenderState, needed_entries: u32)
 fn run_user_shader_geom(
     state: &mut RenderState,
     frame: &RenderFrame,
-) -> Vec<rkp_render::rkp_gpu_object::RkpGpuObject> {
+    asset_id_base: u32,
+) -> (
+    Vec<rkp_render::rkp_gpu_object::RkpGpuAsset>,
+    Vec<rkp_render::rkp_gpu_object::RkpGpuInstance>,
+) {
     use rkp_render::user_shader_pass::{
         build_region_uniform, estimate_region_pool, resolve_shader_id, CachedSlot,
         RegionUniform, BRICK_CELLS, MAX_GLOBAL_BRICKS, MAX_GLOBAL_LEAF_ATTRS,
@@ -2336,7 +2356,7 @@ fn run_user_shader_geom(
         // Nothing to dispatch — drop any entries left over from prior
         // frames so they release their pool extents.
         state.user_shader_cache.evict_untouched();
-        return state.user_shader_cache.build_transient_objects();
+        return state.user_shader_cache.build_transient_assets_and_instances(asset_id_base);
     }
 
     // 3. Buffer reservation. Stable across frames once geometry is
@@ -2487,7 +2507,7 @@ fn run_user_shader_geom(
     //    to the bucket allocators' free lists.
     state.user_shader_cache.evict_untouched();
 
-    state.user_shader_cache.build_transient_objects()
+    state.user_shader_cache.build_transient_assets_and_instances(asset_id_base)
 }
 
 /// Hash inputs that affect classify (BFS topology). Unchanged

@@ -50,11 +50,7 @@ struct RkpInstance {
     object_id: u32,
     layer_mask: u32,
     is_skinned: u32,
-    bone_count: u32,
     bone_buffer_offset: u32,
-    rest_octree_root: u32,
-    rest_octree_depth: u32,
-    rest_octree_extent_bits: u32,
     bone_field_offset: u32,
     bone_field_occ_offset: u32,
     bone_field_dim_x: u32, bone_field_dim_y: u32,
@@ -69,8 +65,10 @@ struct RkpAsset {
     aabb_min: vec3<f32>, octree_root: u32,
     aabb_max: vec3<f32>, octree_depth: u32,
     octree_extent_bits: u32, voxel_size: f32,
-    geom_type: u32, _pad0: u32,
-    grid_origin: vec3<f32>, _pad1: u32,
+    geom_type: u32, bone_count: u32,
+    grid_origin: vec3<f32>, rest_octree_root: u32,
+    rest_octree_depth: u32, rest_octree_extent_bits: u32,
+    _pad0: u32, _pad1: u32,
 }
 
 struct CameraUniforms {
@@ -340,7 +338,7 @@ fn trace_shadow_skinned(
     let local_max_t = max_world_dist * local_scale;
     let vs = asset.voxel_size;
 
-    let rest_extent = bitcast<f32>(inst.rest_octree_extent_bits);
+    let rest_extent = bitcast<f32>(asset.rest_octree_extent_bits);
     let local_origin = local_origin_mesh + vec3<f32>(rest_extent * 0.5);
 
     let grid_dim = vec3<i32>(

@@ -1,8 +1,9 @@
-//! Scene-to-GPU synchronization — builds RkpGpuObject arrays from scene state.
+//! Scene-to-GPU synchronization — builds RkpGpuAsset + RkpGpuInstance
+//! arrays from scene state.
 
 use bytemuck::Zeroable;
 use glam::{Mat4, Vec3, Vec4};
-use rkp_render::rkp_gpu_object::{self, RkpGpuObject};
+use rkp_render::rkp_gpu_object::{self, RkpGpuAsset, RkpGpuInstance};
 use rkp_render::{SkinBrickEntry, SkinUniforms, SkinningAssetData};
 
 /// Screen-space AABB for tile culling (pixel coordinates).
@@ -110,23 +111,31 @@ pub fn build_tile_lists(
     TileLists { offsets, object_ids, tile_count_x, tile_count_y }
 }
 
-/// Compute screen-space AABBs for all GPU objects.
-/// Projects each object's local AABB (transformed by world matrix) to pixel coordinates.
+/// Compute screen-space AABBs for all instances.
+/// Projects each instance's local AABB (looked up via `asset_id` in the
+/// asset table, transformed by the instance's world matrix) to pixel
+/// coordinates.
 pub fn compute_screen_aabbs(
-    objects: &[RkpGpuObject],
+    instances: &[RkpGpuInstance],
+    assets: &[RkpGpuAsset],
     view_proj: &Mat4,
     width: f32,
     height: f32,
 ) -> Vec<ScreenAabb> {
-    objects.iter().map(|obj| {
-        if obj.geom_type == 0 {
+    instances.iter().map(|inst| {
+        let asset_idx = inst.asset_id as usize;
+        if asset_idx >= assets.len() {
+            return ScreenAabb::zeroed();
+        }
+        let asset = &assets[asset_idx];
+        if asset.geom_type == 0 {
             return ScreenAabb::zeroed();
         }
 
         // Build the 8 corners of the local AABB.
-        let extent = f32::from_bits(obj.octree_extent_bits);
+        let extent = f32::from_bits(asset.octree_extent_bits);
         let half = extent * 0.5;
-        let world = Mat4::from_cols_array_2d(&obj.world);
+        let world = Mat4::from_cols_array_2d(&inst.world);
 
         let mut smin = Vec3::splat(f32::MAX);
         let mut smax = Vec3::splat(f32::MIN);
@@ -189,62 +198,80 @@ pub struct SkinnedBinding {
     pub bone_dq_offset: u32,
 }
 
-/// Build an RkpGpuObject from a scene object's transform, spatial handle,
-/// and optional skinning binding. When `skinning` is `Some`, the object's
-/// `is_skinned` / `bone_count` / `bone_buffer_offset` fields are populated
-/// so shaders can index into the bone-matrix buffer.
-pub fn build_gpu_object(
-    world_matrix: &glam::Mat4,
+/// Build an `RkpGpuAsset` from an asset's spatial + voxelization data
+/// + optional skinning template (the rest octree refs and bone count).
+///
+/// All fields here are constant across every instance of one asset, so
+/// the upstream caller (`engine/scene_gpu.rs`) builds this once per
+/// unique asset (keyed by `octree_root`) per frame.
+pub fn build_gpu_asset(
     aabb: &rkp_core::Aabb,
     grid_origin: glam::Vec3,
     spatial: &rkp_core::scene_node::SpatialHandle,
     voxel_size: f32,
-    material_id: u16,
-    object_id: u32,
-    skinning: Option<SkinnedBinding>,
-) -> RkpGpuObject {
-    let mut gpu = RkpGpuObject::zeroed();
-    gpu.world = world_matrix.to_cols_array_2d();
-    gpu.inverse_world = world_matrix.inverse().to_cols_array_2d();
-    gpu.aabb_min = aabb.min.into();
-    gpu.aabb_max = aabb.max.into();
-    gpu.grid_origin = grid_origin.into();
-    gpu.voxel_size = voxel_size;
-    gpu.material_id = material_id as u32;
-    gpu.object_id = object_id;
-    gpu.geom_type = rkp_gpu_object::geom_type::VOXELIZED;
-
+    bone_count: u32,
+) -> RkpGpuAsset {
+    let mut a = RkpGpuAsset::zeroed();
+    a.aabb_min = aabb.min.into();
+    a.aabb_max = aabb.max.into();
+    a.grid_origin = grid_origin.into();
+    a.voxel_size = voxel_size;
+    a.geom_type = rkp_gpu_object::geom_type::VOXELIZED;
+    a.bone_count = bone_count;
     if let rkp_core::scene_node::SpatialHandle::Octree {
         root_offset, depth, base_voxel_size, ..
     } = spatial
     {
-        gpu.octree_root = *root_offset;
-        gpu.octree_depth = *depth as u32;
+        a.octree_root = *root_offset;
+        a.octree_depth = *depth as u32;
         let extent = (1u32 << depth) as f32 * base_voxel_size;
-        gpu.octree_extent_bits = extent.to_bits();
-    }
-
-    if let Some(skin) = skinning {
-        gpu.is_skinned = 1;
-        gpu.bone_count = skin.bone_count;
-        gpu.bone_buffer_offset = skin.bone_buffer_offset;
+        a.octree_extent_bits = extent.to_bits();
         // Rest octree mirrors the runtime octree — the skinned march
         // uses the rest-pose structure for empty-space descent after
-        // inverse-skinning each sample.
-        gpu.rest_octree_root = gpu.octree_root;
-        gpu.rest_octree_depth = gpu.octree_depth;
-        gpu.rest_octree_extent_bits = gpu.octree_extent_bits;
-        gpu.bone_field_offset = skin.bone_field_offset;
-        gpu.bone_field_dim_x = skin.bone_field_dims[0];
-        gpu.bone_field_dim_y = skin.bone_field_dims[1];
-        gpu.bone_field_dim_z = skin.bone_field_dims[2];
-        gpu.bone_field_origin_x = skin.bone_field_origin[0];
-        gpu.bone_field_origin_y = skin.bone_field_origin[1];
-        gpu.bone_field_origin_z = skin.bone_field_origin[2];
-        gpu.bone_field_occ_offset = skin.bone_field_occ_offset;
+        // inverse-skinning each sample. (Bone_count == 0 means the
+        // asset isn't skinned; the rest_octree_* fields are still set
+        // but unused by the march path.)
+        a.rest_octree_root = a.octree_root;
+        a.rest_octree_depth = a.octree_depth;
+        a.rest_octree_extent_bits = a.octree_extent_bits;
     }
+    a
+}
 
-    gpu
+/// Build an `RkpGpuInstance` from per-entity transform + asset reference
+/// + optional per-frame skinning binding (palette offset + scattered
+/// bone-field allocation).
+///
+/// `asset_id` is the slot index in this frame's assets table — the
+/// caller assigns it after deciding whether this entity reuses an
+/// existing asset slot or creates a new one.
+pub fn build_gpu_instance(
+    world_matrix: &glam::Mat4,
+    asset_id: u32,
+    material_id: u16,
+    object_id: u32,
+    skinning: Option<SkinnedBinding>,
+) -> RkpGpuInstance {
+    let mut i = RkpGpuInstance::zeroed();
+    i.world = world_matrix.to_cols_array_2d();
+    i.inverse_world = world_matrix.inverse().to_cols_array_2d();
+    i.asset_id = asset_id;
+    i.material_id = material_id as u32;
+    i.object_id = object_id;
+
+    if let Some(skin) = skinning {
+        i.is_skinned = 1;
+        i.bone_buffer_offset = skin.bone_buffer_offset;
+        i.bone_field_offset = skin.bone_field_offset;
+        i.bone_field_dim_x = skin.bone_field_dims[0];
+        i.bone_field_dim_y = skin.bone_field_dims[1];
+        i.bone_field_dim_z = skin.bone_field_dims[2];
+        i.bone_field_origin_x = skin.bone_field_origin[0];
+        i.bone_field_origin_y = skin.bone_field_origin[1];
+        i.bone_field_origin_z = skin.bone_field_origin[2];
+        i.bone_field_occ_offset = skin.bone_field_occ_offset;
+    }
+    i
 }
 
 /// Per-frame allocator that concatenates every skinned entity's skinning

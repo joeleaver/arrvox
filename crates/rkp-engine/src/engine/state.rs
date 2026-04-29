@@ -9,7 +9,7 @@
 //! (entity_ops, procedural_ops, command_handler, etc.) can access them
 //! directly. Nothing outside the `rkp_engine` crate touches this type.
 
-use rkp_render::rkp_gpu_object::RkpGpuObject;
+use rkp_render::rkp_gpu_object::{RkpGpuAsset, RkpGpuInstance};
 use rkp_render::rkp_scene_manager::RkpSceneManager;
 use rkp_render::user_shader_emit_pass::PaintedLeaf;
 
@@ -296,10 +296,15 @@ pub(crate) struct EngineState {
     pub(crate) selected_procedural_node: Option<u32>,
 
     // Derived GPU data — rebuilt from world each frame.
-    pub(crate) gpu_objects: Vec<RkpGpuObject>,
-    /// Maps gpu_object index → hecs Entity (for pick resolution).
+    /// Per-asset records, deduped by `octree_root`. Built alongside
+    /// `gpu_instances` in `update_scene_gpu`.
+    pub(crate) gpu_assets: Vec<RkpGpuAsset>,
+    /// Per-instance records — one per renderable entity. Indexes into
+    /// `gpu_assets` via `RkpGpuInstance::asset_id`.
+    pub(crate) gpu_instances: Vec<RkpGpuInstance>,
+    /// Maps gpu_instance index → hecs Entity (for pick resolution).
     pub(crate) gpu_to_entity: Vec<hecs::Entity>,
-    /// Maps hecs Entity → gpu_object index.
+    /// Maps hecs Entity → gpu_instance index.
     pub(crate) entity_to_gpu: std::collections::HashMap<hecs::Entity, usize>,
 
     // Project state
@@ -755,7 +760,8 @@ impl EngineState {
             next_tree_order: 0.0,
             selected_entity: None,
             selected_procedural_node: None,
-            gpu_objects: Vec::new(),
+            gpu_assets: Vec::new(),
+            gpu_instances: Vec::new(),
             gpu_to_entity: Vec::new(),
             entity_to_gpu: std::collections::HashMap::new(),
             project_loaded: false,
