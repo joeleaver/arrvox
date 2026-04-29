@@ -44,7 +44,6 @@ const FACE_PZ: u32 = 5u;
 // march does, so the structs and bindings mirror.
 struct RkpInstance {
     world: mat4x4<f32>,
-    inverse_world: mat4x4<f32>,
     asset_id: u32,
     material_id: u32,
     object_id: u32,
@@ -184,6 +183,27 @@ struct OctreeResult {
 @group(0) @binding(9) var<storage, read> bone_field: array<vec2<u32>>;
 @group(0) @binding(10) var<storage, read> bone_field_occ: array<u32>;
 @group(0) @binding(12) var<storage, read> assets: array<RkpAsset>;
+
+// Inverse of an affine 4x4 matrix. See `mat4_affine_inverse` in
+// octree_march.wgsl for the full derivation. Duplicated here because
+// shadow trace and primary march don't share a WGSL source file.
+fn mat4_affine_inverse(m: mat4x4<f32>) -> mat4x4<f32> {
+    let a = m[0].xyz;
+    let b = m[1].xyz;
+    let c = m[2].xyz;
+    let t = m[3].xyz;
+    let inv_det = 1.0 / dot(a, cross(b, c));
+    let row0 = cross(b, c) * inv_det;
+    let row1 = cross(c, a) * inv_det;
+    let row2 = cross(a, b) * inv_det;
+    let new_t = -vec3<f32>(dot(row0, t), dot(row1, t), dot(row2, t));
+    return mat4x4<f32>(
+        vec4<f32>(row0.x, row1.x, row2.x, 0.0),
+        vec4<f32>(row0.y, row1.y, row2.y, 0.0),
+        vec4<f32>(row0.z, row1.z, row2.z, 0.0),
+        vec4<f32>(new_t, 1.0),
+    );
+}
 
 // Group 1: gbuf inputs (full-res, read) + half-res shadow output (write).
 @group(1) @binding(0) var gbuf_position: texture_2d<f32>;
@@ -330,7 +350,7 @@ fn trace_shadow_skinned(
     inst: RkpInstance, asset: RkpAsset,
     max_world_dist: f32, transmittance_in: f32,
 ) -> f32 {
-    let inv_world = inst.inverse_world;
+    let inv_world = mat4_affine_inverse(inst.world);
     let local_origin_mesh = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
     let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
     let local_dir = normalize(local_dir_unnorm);
@@ -438,7 +458,7 @@ fn trace_shadow_ray(
             continue;
         }
 
-        let inv_world = inst.inverse_world;
+        let inv_world = mat4_affine_inverse(inst.world);
         let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
         let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
         let local_dir = normalize(local_dir_unnorm);

@@ -48,13 +48,12 @@ const BRICK_CELL_INTERIOR: u32 = 0xFFFFFFFDu;
 // in pathological cases.
 const BRICK_MAX_STEPS: u32 = 4096u;
 
-// Per-instance record (192 bytes incl. 8-B tail pad). One per scene
-// entity. See `crates/rkp-render/src/rkp_gpu_object.rs` for the Rust
-// mirror. Skinning template fields (`bone_count`, `rest_octree_*`)
-// live on RkpAsset; only per-frame skinning runtime state lives here.
+// Per-instance record (128 bytes). One per scene entity. See
+// `crates/rkp-render/src/rkp_gpu_object.rs` for the Rust mirror.
+// Phase 2 dropped inverse_world — readers compute it on demand via
+// `mat4_affine_inverse(inst.world)`.
 struct RkpInstance {
     world: mat4x4<f32>,
-    inverse_world: mat4x4<f32>,
     asset_id: u32,
     material_id: u32,
     object_id: u32,
@@ -243,6 +242,40 @@ struct LeafAttr {
 // Per-asset records (deduped by octree_root). Instances index here via
 // `inst.asset_id`. See `rkp_gpu_object::RkpGpuAsset` for the layout.
 @group(0) @binding(12) var<storage, read> assets: array<RkpAsset>;
+
+// Inverse of an affine 4x4 matrix (last row = [0,0,0,1]). Cheaper than
+// the general 4x4 inverse (~25 ALU vs ~100). Caller is responsible for
+// making sure the matrix is genuinely affine — the world matrices we
+// build from glam's `Mat4::from_scale_rotation_translation` are.
+//
+// Derivation: for M = [[R, t], [0, 1]], M^-1 = [[R^-1, -R^-1*t], [0, 1]].
+// For a 3x3 R with columns (a, b, c), the **rows** of R^-1 are the dual
+// basis: row0 = (b × c)/det, row1 = (c × a)/det, row2 = (a × b)/det,
+// where det = a · (b × c). (Easy check: row0 · a = det/det = 1, row0 · b
+// = 0, row0 · c = 0 — exactly the (1,0,0,...) constraint.)
+//
+// WGSL `mat4x4` is column-major (`m[i]` = i-th column), so we transpose
+// the (row0, row1, row2) result when packing the return matrix.
+fn mat4_affine_inverse(m: mat4x4<f32>) -> mat4x4<f32> {
+    let a = m[0].xyz;
+    let b = m[1].xyz;
+    let c = m[2].xyz;
+    let t = m[3].xyz;
+    let inv_det = 1.0 / dot(a, cross(b, c));
+    let row0 = cross(b, c) * inv_det;
+    let row1 = cross(c, a) * inv_det;
+    let row2 = cross(a, b) * inv_det;
+    // R^-1 * t — each component is a row · t.
+    let new_t = -vec3<f32>(dot(row0, t), dot(row1, t), dot(row2, t));
+    // Pack rows as the columns of a WGSL column-major matrix → effectively
+    // transposes (row0, row1, row2) into the inverse rotation.
+    return mat4x4<f32>(
+        vec4<f32>(row0.x, row1.x, row2.x, 0.0),
+        vec4<f32>(row0.y, row1.y, row2.y, 0.0),
+        vec4<f32>(row0.z, row1.z, row2.z, 0.0),
+        vec4<f32>(new_t, 1.0),
+    );
+}
 
 const FACE_INTERIOR: u32 = 0xFFFFFFFEu;
 const FACE_EMPTY_LINK: u32 = 0xFFFFFFFFu;
@@ -777,7 +810,7 @@ fn march_object_skinned(
         0u, // glass_slot
     );
 
-    let inv_world = inst.inverse_world;
+    let inv_world = mat4_affine_inverse(inst.world);
     let local_origin_mesh = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
     let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
     let local_dir = normalize(local_dir_unnorm);
@@ -902,7 +935,7 @@ fn march_object(
         0u, // glass_slot
     );
 
-    let inv_world = inst.inverse_world;
+    let inv_world = mat4_affine_inverse(inst.world);
     let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
     let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
     let local_dir = normalize(local_dir_unnorm);
@@ -1405,7 +1438,7 @@ fn main(
         if !rkp_object_visible(inst) { continue; }
 
         // AABB check: compute world-space entry distance, skip if behind closest hit.
-        let inv_world = inst.inverse_world;
+        let inv_world = mat4_affine_inverse(inst.world);
         let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
         let local_dir_unnorm = (inv_world * vec4<f32>(ray_dir, 0.0)).xyz;
         let local_to_world_scale = 1.0 / max(length(local_dir_unnorm), 1e-10);

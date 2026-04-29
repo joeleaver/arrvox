@@ -213,6 +213,10 @@ impl EngineState {
                     None => continue,
                 };
                 let world: glam::Mat4 = glam::Mat4::from_cols_array_2d(&inst.world);
+                // Phase 2: inverse_world dropped from RkpGpuInstance.
+                // Compute on demand for the user-shader region uniforms,
+                // which carry their own host_inverse_world copy.
+                let inverse_world = world.inverse().to_cols_array_2d();
                 let host_voxelized = asset.geom_type
                     == rkp_render::rkp_gpu_object::geom_type::VOXELIZED;
                 let host_octree_root = if host_voxelized {
@@ -417,7 +421,7 @@ impl EngineState {
                                 host_octree_depth: asset.octree_depth,
                                 host_octree_extent,
                                 host_grid_origin: asset.grid_origin,
-                                host_inverse_world: inst.inverse_world,
+                                host_inverse_world: inverse_world,
                                 tile_index,
                             });
                         } else if info.is_instance_pipeline {
@@ -447,7 +451,7 @@ impl EngineState {
                                     host_octree_depth: asset.octree_depth,
                                     host_octree_extent,
                                     host_grid_origin: asset.grid_origin,
-                                    host_inverse_world: inst.inverse_world,
+                                    host_inverse_world: inverse_world,
                                     leaves,
                                 },
                             );

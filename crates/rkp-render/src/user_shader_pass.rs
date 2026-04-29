@@ -896,7 +896,6 @@ fn transient_asset_and_instance(entry: &CacheEntry) -> (RkpGpuAsset, RkpGpuInsta
     };
     let instance = RkpGpuInstance {
         world: identity,
-        inverse_world: identity,
         asset_id: 0, // caller assigns the actual slot index
         material_id: 0,
         object_id: entry.object_id,

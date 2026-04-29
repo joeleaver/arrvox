@@ -876,14 +876,15 @@ fn run_render_thread(
 /// Matches objects by `object_id` (stable across frames). For each
 /// object in `curr`, if a same-id counterpart exists in `prev` the
 /// world matrix is TRS-blended (translation / scale lerp, rotation
-/// slerp) and `inverse_world` is recomputed. Objects without a prev
-/// counterpart (newly spawned this sim tick) use `curr` verbatim.
+/// slerp). Objects without a prev counterpart (newly spawned this sim
+/// tick) use `curr` verbatim.
 ///
-/// All non-transform fields (AABBs, octree roots, bone-field offsets,
-/// material ids, etc.) come from `curr` — those change on sim edits,
-/// not between sim ticks. Skinned entities still carry their bone
-/// pose via the separate bone-field buffer; their `world` is usually
-/// identity and the lerp is a no-op.
+/// All non-transform fields (asset_id, material id, bone-field offsets,
+/// etc.) come from `curr` — those change on sim edits, not between sim
+/// ticks. Skinned entities still carry their bone pose via the separate
+/// bone-field buffer; their `world` is usually identity and the lerp is
+/// a no-op. Inverse-world isn't stored anymore — shaders compute
+/// `mat4_affine_inverse(inst.world)` on demand.
 fn interpolate_instances(
     prev: &[rkp_render::rkp_gpu_object::RkpGpuInstance],
     curr: &[rkp_render::rkp_gpu_object::RkpGpuInstance],
@@ -911,12 +912,6 @@ fn interpolate_instances(
             }
             let mut out = *c;
             out.world = lerp_world_matrix(&p.world, &c.world, alpha);
-            // Inverse is a proper 4x4 invert; the only "cheap" path
-            // would assume no scale, which we can't. Single invert
-            // per moving object per render tick is fine.
-            out.inverse_world = glam::Mat4::from_cols_array_2d(&out.world)
-                .inverse()
-                .to_cols_array_2d();
             out
         })
         .collect()

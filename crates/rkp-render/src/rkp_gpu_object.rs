@@ -86,40 +86,38 @@ pub struct RkpGpuAsset {
     pub _pad: [u32; 2],
 }
 
-/// Per-instance GPU record (192 bytes — Phase 2 will drop `inverse_world`
-/// to land at ~128 B). One per scene entity; carries:
-/// - world transform (and precomputed inverse)
+/// Per-instance GPU record (128 bytes). One per scene entity; carries:
+/// - world transform (inverse computed on demand by the shader via
+///   `mat4_affine_inverse(inst.world)` — ~25 ALU vs 64 B/instance saved)
 /// - asset reference (`asset_id` indexes into the assets table)
 /// - per-entity overrides (material, picking id, layer mask)
 /// - per-frame skinning runtime state: bone palette offset + bone-field
 ///   allocation + per-pose deformed AABB grid
 ///
-/// # Layout (192 bytes)
+/// # Layout (128 bytes)
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
 /// | 0      | 64   | world (mat4x4<f32>) |
-/// | 64     | 64   | inverse_world (mat4x4<f32>) — Phase 2: drop |
-/// | 128    | 4    | asset_id (u32) |
-/// | 132    | 4    | material_id (u32) |
-/// | 136    | 4    | object_id (u32) |
-/// | 140    | 4    | layer_mask (u32) |
-/// | 144    | 4    | is_skinned (u32) |
-/// | 148    | 4    | bone_buffer_offset (u32) |
-/// | 152    | 4    | bone_field_offset (u32) |
-/// | 156    | 4    | bone_field_occ_offset (u32) |
-/// | 160    | 4    | bone_field_dim_x (u32) |
-/// | 164    | 4    | bone_field_dim_y (u32) |
-/// | 168    | 4    | bone_field_dim_z (u32) |
-/// | 172    | 4    | bone_field_origin_x (f32) |
-/// | 176    | 4    | bone_field_origin_y (f32) |
-/// | 180    | 4    | bone_field_origin_z (f32) |
-/// | 184    | 8    | _pad (mat4x4 alignment tail) |
+/// | 64     | 4    | asset_id (u32) |
+/// | 68     | 4    | material_id (u32) |
+/// | 72     | 4    | object_id (u32) |
+/// | 76     | 4    | layer_mask (u32) |
+/// | 80     | 4    | is_skinned (u32) |
+/// | 84     | 4    | bone_buffer_offset (u32) |
+/// | 88     | 4    | bone_field_offset (u32) |
+/// | 92     | 4    | bone_field_occ_offset (u32) |
+/// | 96     | 4    | bone_field_dim_x (u32) |
+/// | 100    | 4    | bone_field_dim_y (u32) |
+/// | 104    | 4    | bone_field_dim_z (u32) |
+/// | 108    | 4    | bone_field_origin_x (f32) |
+/// | 112    | 4    | bone_field_origin_y (f32) |
+/// | 116    | 4    | bone_field_origin_z (f32) |
+/// | 120    | 8    | _pad (mat4x4 alignment tail) |
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
 pub struct RkpGpuInstance {
     pub world: [[f32; 4]; 4],
-    pub inverse_world: [[f32; 4]; 4],
     pub asset_id: u32,
     pub material_id: u32,
     pub object_id: u32,
@@ -135,7 +133,7 @@ pub struct RkpGpuInstance {
     pub bone_field_origin_y: f32,
     pub bone_field_origin_z: f32,
     /// WGSL stride must be multiple of struct alignment (16 from mat4x4).
-    /// Without this pad, Rust struct = 184 B, WGSL stride = 192 B, the
+    /// Without this pad, Rust struct = 120 B, WGSL stride = 128 B, the
     /// array indexing reads from the wrong offset.
     pub _pad: [u32; 2],
 }
@@ -163,26 +161,26 @@ mod tests {
     }
 
     #[test]
-    fn instance_size_is_192_bytes() {
+    fn instance_size_is_128_bytes() {
         // Includes 8-byte tail pad to make stride a multiple of mat4x4
-        // alignment (16). Phase 2 drops inverse_world → ~128 B.
-        assert_eq!(mem::size_of::<RkpGpuInstance>(), 192);
+        // alignment (16).
+        assert_eq!(mem::size_of::<RkpGpuInstance>(), 128);
     }
 
     #[test]
-    fn instance_bone_field_dim_at_offset_160() {
+    fn instance_bone_field_dim_at_offset_96() {
         let i = RkpGpuInstance::zeroed();
         let base = &i as *const _ as usize;
         let field = &i.bone_field_dim_x as *const _ as usize;
-        assert_eq!(field - base, 160);
+        assert_eq!(field - base, 96);
     }
 
     #[test]
-    fn instance_asset_id_at_offset_128() {
+    fn instance_asset_id_at_offset_64() {
         let i = RkpGpuInstance::zeroed();
         let base = &i as *const _ as usize;
         let field = &i.asset_id as *const _ as usize;
-        assert_eq!(field - base, 128);
+        assert_eq!(field - base, 64);
     }
 
     #[test]

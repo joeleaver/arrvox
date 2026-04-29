@@ -254,7 +254,6 @@ pub fn build_gpu_instance(
 ) -> RkpGpuInstance {
     let mut i = RkpGpuInstance::zeroed();
     i.world = world_matrix.to_cols_array_2d();
-    i.inverse_world = world_matrix.inverse().to_cols_array_2d();
     i.asset_id = asset_id;
     i.material_id = material_id as u32;
     i.object_id = object_id;
