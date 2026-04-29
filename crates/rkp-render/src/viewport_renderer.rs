@@ -173,6 +173,19 @@ impl ViewportRenderer {
         // Gbuffer.
         let gbuffer = crate::GBuffer::new(device, width, height);
 
+        // Stage 6c-2/6c-4 — Option B per-VR pieces. Constructed before
+        // `shade.set_gbuffer(...)` so Stage 6c-4's shade rebind can read
+        // from the merged G-buffer's views directly. Compute pipelines
+        // (`InstanceMarchPass` / `InstanceCompositePass`) hold no
+        // resolution state, so they don't need the same early ordering;
+        // they're constructed alongside their texture targets for
+        // proximity readability.
+        let instance_march_pass = InstanceMarchPass::new(device);
+        let instance_composite_pass = InstanceCompositePass::new(device);
+        let instance_merged_gbuffer = InstanceMergedGBuffer::new(device, width, height);
+        let instance_output_hits_buffer = make_output_hits_buffer(device, width, height);
+        let instance_march_uniforms_buffer = make_march_uniforms_buffer(device);
+
         // rkp-side pick texture (R32Uint). Written by the procedural
         // raymarch, read by `proc_outline` and the pick readback.
         let (pick_texture, pick_view) = create_pick_texture(device, width, height);
@@ -225,7 +238,16 @@ impl ViewportRenderer {
             &renderer.atmosphere.sky_view_view,
             &renderer.atmosphere.ap_view,
         );
-        shade.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &gbuffer.glass_view, &gbuffer.leaf_slot_view);
+        // Stage 6c-4 — shade reads the Option B *merged* G-buffer for
+        // position / normal / material / leaf_slot so instance hits
+        // composited on top of host hits actually reach the shade
+        // pass. Glass stays on the host G-buffer because the composite
+        // doesn't write that channel (its sentinel-driven path runs
+        // separately, post-volumetric, before glass refraction).
+        // When there are no instance shaders the composite passes the
+        // host G-buffer through unchanged; visible output is
+        // bit-identical to pre-6c-4.
+        shade.set_gbuffer(device, &instance_merged_gbuffer.position_view, &instance_merged_gbuffer.normal_view, &instance_merged_gbuffer.material_view, &gbuffer.glass_view, &instance_merged_gbuffer.leaf_slot_view);
         shade.set_shadow_and_ssao(device, &shadow_trace.output_view, &ssao.output_view);
 
         // Pass order: shade → volumetric → glass → god_rays. Glass
@@ -282,16 +304,6 @@ impl ViewportRenderer {
         let composite_view = composite_texture.create_view(&Default::default());
 
         let lights_materials_epoch = renderer.lights_materials_epoch();
-
-        // Stage 6c-2/3.5a: Option B instance pipeline per-VR pieces.
-        // Constructed but not dispatched from `render_to` yet — Stage
-        // 6c-3.5b wires the per-frame dispatch from
-        // `render_one_frame`.
-        let instance_march_pass = InstanceMarchPass::new(device);
-        let instance_composite_pass = InstanceCompositePass::new(device);
-        let instance_merged_gbuffer = InstanceMergedGBuffer::new(device, width, height);
-        let instance_output_hits_buffer = make_output_hits_buffer(device, width, height);
-        let instance_march_uniforms_buffer = make_march_uniforms_buffer(device);
 
         Self {
             camera_buffer, scene_bind_group, scene_epoch, lights_materials_epoch,
@@ -372,6 +384,12 @@ impl ViewportRenderer {
         self.pick_texture = pick_texture;
         self.pick_view = pick_view;
 
+        // Stage 6c-4 — rebuild the merged G-buffer + per-pixel hits
+        // buffer BEFORE rebinding shade so the rebind reads the new
+        // textures, not stale views from the prior resolution.
+        self.instance_merged_gbuffer = InstanceMergedGBuffer::new(device, width, height);
+        self.instance_output_hits_buffer = make_output_hits_buffer(device, width, height);
+
         // Per-VR passes — resize internal textures + re-wire gbuffer bindings.
         self.march.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
         self.proc_raymarch.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
@@ -384,7 +402,10 @@ impl ViewportRenderer {
         self.shadow_trace.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view);
 
         self.shade.resize(device, width, height);
-        self.shade.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
+        // Stage 6c-4 — read from merged G-buffer (composite output) for
+        // position/normal/material/leaf_slot. Glass stays on host
+        // gbuffer (composite doesn't write that channel).
+        self.shade.set_gbuffer(device, &self.instance_merged_gbuffer.position_view, &self.instance_merged_gbuffer.normal_view, &self.instance_merged_gbuffer.material_view, &self.gbuffer.glass_view, &self.instance_merged_gbuffer.leaf_slot_view);
         self.shade.set_shadow_and_ssao(device, &self.shadow_trace.output_view, &self.ssao.output_view);
 
         self.volumetric.resize(device, width, height);
@@ -431,13 +452,6 @@ impl ViewportRenderer {
         // Grid: rebind to the new gbuffer position view (camera buffer
         // is stable across resize so it doesn't need re-wiring).
         self.grid.set_bindings(device, &self.camera_buffer, &self.gbuffer.position_view);
-
-        // Stage 6c-2: rebuild the instance pipeline's per-resolution
-        // resources. The pipeline objects (`instance_march_pass`,
-        // `instance_composite_pass`) hold no resolution state, so they
-        // survive the resize untouched.
-        self.instance_merged_gbuffer = InstanceMergedGBuffer::new(device, width, height);
-        self.instance_output_hits_buffer = make_output_hits_buffer(device, width, height);
 
         // Env-dirty path applies bloom/tonemap params — the engine re-fires it
         // after a resize so VRs rebuilt their bloom/tonemap from defaults here
