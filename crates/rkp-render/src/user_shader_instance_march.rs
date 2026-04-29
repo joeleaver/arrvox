@@ -24,11 +24,30 @@
 //! input uniforms, dispatches a single workgroup per helper, and reads
 //! back the result buffer.
 
-/// Source text of the helper library. Stage 5b will splice this into
-/// the real instance-march pipeline alongside its own `@compute` entry;
-/// today the test pipeline below uses it verbatim.
-pub fn instance_march_wgsl_source() -> &'static str {
-    include_str!("shaders/user_shader_instance_march.wgsl")
+/// Source text of the helper library — pure functions + pool bindings.
+/// Stage 5b's `instance_march_main` pipeline composes the same chunk
+/// ahead of its own `@compute` entry.
+pub fn instance_march_helpers_source() -> &'static str {
+    include_str!("shaders/user_shader_instance_march_helpers.wgsl")
+}
+
+/// Source text of Stage 5a's test entries (three standalone compute
+/// kernels — one per helper). Concatenate after
+/// [`instance_march_helpers_source`] to build the full pipeline source.
+pub fn instance_march_test_source() -> &'static str {
+    include_str!("shaders/user_shader_instance_march_test.wgsl")
+}
+
+/// Combined helpers + Stage 5a test source — what the test pipeline
+/// in this module compiles. Single point of truth for "what the
+/// validator should parse" so the inline naga test below stays in
+/// sync with what the real device pipeline sees.
+pub fn instance_march_wgsl_source() -> String {
+    format!(
+        "{}\n{}",
+        instance_march_helpers_source(),
+        instance_march_test_source(),
+    )
 }
 
 /// Stride between consecutive uniform records when binding multiple
@@ -74,7 +93,7 @@ impl InstanceMarchTestPass {
         });
 
         let source = instance_march_wgsl_source();
-        crate::validate_wgsl(source, "user_shader_instance_march");
+        crate::validate_wgsl(&source, "user_shader_instance_march");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("user_shader_instance_march"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -225,8 +244,8 @@ mod tests {
     #[test]
     fn wgsl_helpers_validate() {
         let source = instance_march_wgsl_source();
-        let module = naga::front::wgsl::parse_str(source).unwrap_or_else(|e| {
-            panic!("parse error:\n{}", e.emit_to_string(source))
+        let module = naga::front::wgsl::parse_str(&source).unwrap_or_else(|e| {
+            panic!("parse error:\n{}", e.emit_to_string(&source))
         });
         let mut v = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),

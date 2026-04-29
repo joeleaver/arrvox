@@ -1,31 +1,29 @@
-// user_shader_instance_march.wgsl — Stage 5a WGSL helper library.
+// user_shader_instance_march_helpers.wgsl — Stage 5a/5b WGSL helper library.
 //
-// Three pure functions that Stage 5b's instance-march compute entry
-// will compose. None of them touch globals; each is invocation-local.
+// Pure (mostly) functions composed by Stage 5a's test entries and
+// Stage 5b's `instance_march_main`. The three "pure" helpers do no
+// memory access:
 //
-// * `inst_ray_aabb_intersect(ro, rd, aabb_min, aabb_max) -> vec2<f32>`
-//   — slab method, returns `(t_near, t_far)` in ray units. Miss is
-//   signalled by `t_near > t_far` (caller checks).
+// * `inst_ray_aabb_intersect(ro, inv_dir, aabb_min, aabb_max) -> vec2<f32>`
+//   — slab method, returns `(t_near, t_far)`. Miss = `t_near > t_far`.
 // * `inst_world_to_local(world_pos, instance_pos, instance_scale) -> vec3<f32>`
-//   — transforms a world-space point into the prototype's canonical
-//   `[0, 1]³` space. V1 = uniform scale only (TRS-only locked decision).
-// * `inst_proto_descend(...) -> InstProtoHit` — descends a prototype
-//   octree from `pos` (in canonical `[0,1]³`) and reports the
-//   terminator: brick + leaf-attr resolution, or empty.
+//   — transforms world-space → prototype canonical `[0, 1]³`. V1 = uniform
+//   scale only (TRS-only locked decision).
 //
-// To keep these usable from Stage 5b without code duplication, each
-// helper is a `fn` with no `@group/@binding` attributes; the bindings
-// it reads (octree_nodes, brick_pool, leaf_attr_pool) are declared at
-// module scope but tagged as the test pipeline's bindings here. Stage
-// 5b will copy the helper bodies into its own pipeline file and re-bind
-// the same buffers from its own group layout.
+// The descent helper does read the pool bindings declared below:
 //
-// ## Test compute entries
+// * `inst_proto_descend(...)` — descends a prototype octree from
+//   `(local_origin, local_dir)` and returns the first cell hit.
 //
-// Each helper has a sibling `*_test_main` compute kernel that reads a
-// small uniform of inputs and writes a fixed-layout result buffer the
-// host test reads back. One workgroup, one invocation per dispatch —
-// the helpers are pure, so threading adds no signal.
+// ## Bindings owned here
+//
+// `octree_nodes` / `brick_pool` / `leaf_attr_pool` at @group(0)
+// @binding(0/1/2). Both Stage 5a's test pipeline and Stage 5b's march
+// pipeline bind THE SAME group(0) layout, so the helpers compile
+// against either pipeline without modification.
+//
+// Pipeline-specific bindings (test inputs/outputs, march regions, etc.)
+// live in the file the Rust composer concatenates after this one.
 
 // ── Shared constants (mirror octree_march.wgsl + user_shader_proto.wgsl) ──
 
@@ -60,6 +58,12 @@ struct InstProtoHit {
     material_local: u32,
     leaf_attr_slot: u32,
 }
+
+// ── Pool bindings (shared between test + march pipelines) ─────────────
+
+@group(0) @binding(0) var<storage, read> octree_nodes: array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read> brick_pool: array<u32>;
+@group(0) @binding(2) var<storage, read> leaf_attr_pool: array<LeafAttr>;
 
 // ── Pure helpers ─────────────────────────────────────────────────────
 
@@ -352,113 +356,4 @@ fn inst_proto_descend(
         t = t + vs;
     }
     return hit;
-}
-
-// ── Test harness — three standalone compute entries ───────────────────
-//
-// Each takes a small uniform of inputs and writes a fixed-layout
-// `result` buffer at @binding(2). One workgroup, one invocation.
-//
-// The Rust integration test sets up the inputs, dispatches the entry
-// for each helper, reads back `result`, and compares against the
-// CPU-side expected value.
-
-struct AabbTestInputs {
-    ro: vec3<f32>,
-    _pad0: f32,
-    rd: vec3<f32>,
-    _pad1: f32,
-    inv_dir: vec3<f32>,
-    _pad2: f32,
-    aabb_min: vec3<f32>,
-    _pad3: f32,
-    aabb_max: vec3<f32>,
-    _pad4: f32,
-}
-
-struct WorldToLocalTestInputs {
-    world_pos: vec3<f32>,
-    instance_scale: f32,
-    instance_pos: vec3<f32>,
-    _pad0: f32,
-}
-
-struct ProtoDescendTestInputs {
-    local_origin: vec3<f32>,
-    octree_root: u32,
-    local_dir: vec3<f32>,
-    max_depth: u32,
-    max_steps_outer: u32,
-    max_steps_brick: u32,
-    _pad0: u32,
-    _pad1: u32,
-}
-
-struct AabbTestResult {
-    t_near: f32,
-    t_far: f32,
-    _pad0: f32,
-    _pad1: f32,
-}
-
-struct WorldToLocalTestResult {
-    local: vec3<f32>,
-    _pad0: f32,
-}
-
-struct ProtoDescendTestResult {
-    hit: u32,
-    leaf_attr_slot: u32,
-    material_local: u32,
-    _pad0: u32,
-    t: f32,
-    _pad1: f32,
-    _pad2: f32,
-    _pad3: f32,
-    normal: vec3<f32>,
-    _pad4: f32,
-}
-
-@group(0) @binding(0) var<storage, read> octree_nodes: array<vec2<u32>>;
-@group(0) @binding(1) var<storage, read> brick_pool: array<u32>;
-@group(0) @binding(2) var<storage, read> leaf_attr_pool: array<LeafAttr>;
-
-@group(1) @binding(0) var<uniform> aabb_inputs: AabbTestInputs;
-@group(1) @binding(1) var<storage, read_write> aabb_result: AabbTestResult;
-
-@group(2) @binding(0) var<uniform> w2l_inputs: WorldToLocalTestInputs;
-@group(2) @binding(1) var<storage, read_write> w2l_result: WorldToLocalTestResult;
-
-@group(3) @binding(0) var<uniform> proto_inputs: ProtoDescendTestInputs;
-@group(3) @binding(1) var<storage, read_write> proto_result: ProtoDescendTestResult;
-
-@compute @workgroup_size(1)
-fn aabb_test_main() {
-    let r = inst_ray_aabb_intersect(
-        aabb_inputs.ro, aabb_inputs.inv_dir,
-        aabb_inputs.aabb_min, aabb_inputs.aabb_max,
-    );
-    aabb_result.t_near = r.x;
-    aabb_result.t_far = r.y;
-}
-
-@compute @workgroup_size(1)
-fn world_to_local_test_main() {
-    w2l_result.local = inst_world_to_local(
-        w2l_inputs.world_pos, w2l_inputs.instance_pos, w2l_inputs.instance_scale,
-    );
-}
-
-@compute @workgroup_size(1)
-fn proto_descend_test_main() {
-    let r = inst_proto_descend(
-        proto_inputs.local_origin, proto_inputs.local_dir,
-        proto_inputs.octree_root, proto_inputs.max_depth,
-        proto_inputs.max_steps_outer, proto_inputs.max_steps_brick,
-    );
-    proto_result.hit = r.hit;
-    proto_result.t = r.t;
-    proto_result.normal = r.normal;
-    proto_result.material_local = r.material_local;
-    proto_result.leaf_attr_slot = r.leaf_attr_slot;
 }

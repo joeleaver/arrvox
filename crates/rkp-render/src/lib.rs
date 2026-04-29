@@ -96,6 +96,16 @@ pub mod instance_tile_index_gpu;
 /// octree descent) plus a test pipeline that exercises each one in
 /// isolation against a real GPU.
 pub mod user_shader_instance_march;
+/// Option B Stage 5b — GPU prototype-lookup struct. Builds a sorted
+/// flat array of `(shader_id, octree_root, max_depth, instance stride,
+/// pos/scale offsets)` records the march reads to translate a region's
+/// shader id into prototype state + instance decode info.
+pub mod instance_proto_lookup;
+/// Option B Stage 5b — instance-march compute pipeline. Composes the
+/// Stage 5a helpers + new bindings (regions, instances, tile-index,
+/// proto-lookup, rays, output hits) into the V1 march entry. Single
+/// ray per dispatch; Stage 6 will batch by screen tile.
+pub mod instance_march_pass;
 /// Skeletal skin-deform scatter pass — per-frame bone-field writer.
 pub mod skin_deform;
 /// CPU-side paint writes against the scene's LeafAttrPool (material +
