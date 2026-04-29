@@ -48,23 +48,44 @@ const BRICK_CELL_INTERIOR: u32 = 0xFFFFFFFDu;
 // in pathological cases.
 const BRICK_MAX_STEPS: u32 = 4096u;
 
-struct RkpObject {
+// Per-instance record (208 bytes incl. 8-B tail pad). One per scene
+// entity. See `crates/rkp-render/src/rkp_gpu_object.rs` for the Rust
+// mirror. Skinning template fields (`bone_count`, `rest_octree_*`) and
+// per-frame deformed-pose fields (`bone_field_dim_*`, `bone_field_origin_*`)
+// all live here in Phase 1; Phase 1b moves the templates to the asset
+// once they're sourced from the asset cache rather than the per-frame
+// skinning binding.
+struct RkpInstance {
     world: mat4x4<f32>,
+    inverse_world: mat4x4<f32>,
+    asset_id: u32,
+    material_id: u32,
+    object_id: u32,
+    layer_mask: u32,
+    is_skinned: u32,
+    bone_count: u32,
+    bone_buffer_offset: u32,
+    rest_octree_root: u32,
+    rest_octree_depth: u32,
+    rest_octree_extent_bits: u32,
+    bone_field_offset: u32,
+    bone_field_occ_offset: u32,
+    bone_field_dim_x: u32, bone_field_dim_y: u32,
+    bone_field_dim_z: u32,
+    bone_field_origin_x: f32,
+    bone_field_origin_y: f32,
+    bone_field_origin_z: f32,
+    _pad0: u32, _pad1: u32,
+}
+
+// Per-asset record (64 bytes). Deduped by `octree_root`; multiple
+// instances share one slot via `inst.asset_id`.
+struct RkpAsset {
     aabb_min: vec3<f32>, octree_root: u32,
     aabb_max: vec3<f32>, octree_depth: u32,
     octree_extent_bits: u32, voxel_size: f32,
-    material_id: u32, object_id: u32,
-    geom_type: u32, is_skinned: u32,
-    bone_count: u32, bone_buffer_offset: u32,
-    rest_octree_root: u32, rest_octree_depth: u32,
-    rest_octree_extent_bits: u32, bone_field_offset: u32,
-    layer_mask: u32,
-    bone_field_dim_x: u32, bone_field_dim_y: u32, bone_field_dim_z: u32,
-    bone_field_origin_x: f32, bone_field_origin_y: f32, bone_field_origin_z: f32,
-    bone_field_occ_offset: u32,
-    grid_origin: vec3<f32>,
-    _post_grid: u32,
-    inverse_world: mat4x4<f32>,
+    geom_type: u32, _pad0: u32,
+    grid_origin: vec3<f32>, _pad1: u32,
 }
 
 struct CameraUniforms {
@@ -79,9 +100,9 @@ struct CameraUniforms {
 // Render-layer + focus gate. An object is visible in this viewport iff its
 // layer mask intersects the camera's mask, OR its object_id matches the
 // camera's focus entity. Default (u32::MAX / u32::MAX) passes everything.
-fn rkp_object_visible(obj: RkpObject) -> bool {
-    return (obj.layer_mask & camera.layer_mask) != 0u
-        || obj.object_id == camera.focus_object_id;
+fn rkp_object_visible(inst: RkpInstance) -> bool {
+    return (inst.layer_mask & camera.layer_mask) != 0u
+        || inst.object_id == camera.focus_object_id;
 }
 
 struct MarchParams {
@@ -184,7 +205,7 @@ struct OctreeResult {
 // INTERNAL_ATTR_NONE (0xFFFFFFFF) when unavailable. Interleaved into a
 // single `vec2<u32>` binding to stay under the 12-storage-buffer limit.
 @group(0) @binding(1) var<storage, read> octree_nodes: array<vec2<u32>>;
-@group(0) @binding(2) var<storage, read> objects: array<RkpObject>;
+@group(0) @binding(2) var<storage, read> instances: array<RkpInstance>;
 @group(0) @binding(3) var<uniform> camera: CameraUniforms;
 // color_pool[leaf_attr_id] → packed R|G|B|A u32, 0 = no override (use
 // material base_color). Parallel to leaf_attr_pool.
@@ -221,6 +242,9 @@ struct LeafAttr {
 // here because the main bind group declares this read-only and the
 // scatter's bind group is separate.
 @group(0) @binding(10) var<storage, read> bone_field_occ: array<u32>;
+// Per-asset records (deduped by octree_root). Instances index here via
+// `inst.asset_id`. See `rkp_gpu_object::RkpGpuAsset` for the layout.
+@group(0) @binding(12) var<storage, read> assets: array<RkpAsset>;
 
 const FACE_INTERIOR: u32 = 0xFFFFFFFEu;
 const FACE_EMPTY_LINK: u32 = 0xFFFFFFFFu;
@@ -745,7 +769,8 @@ fn skinned_brick_exit_t(
 /// Skinned march — direct deformed-field lookup. See the helper
 /// doc-block above for the architecture rationale.
 fn march_object_skinned(
-    world_origin: vec3<f32>, world_dir: vec3<f32>, obj: RkpObject,
+    world_origin: vec3<f32>, world_dir: vec3<f32>,
+    inst: RkpInstance, asset: RkpAsset,
 ) -> MarchResult {
     var result = MarchResult(
         vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0),
@@ -754,13 +779,13 @@ fn march_object_skinned(
         0u, // glass_slot
     );
 
-    let inv_world = obj.inverse_world;
+    let inv_world = inst.inverse_world;
     let local_origin_mesh = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
     let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
     let local_dir = normalize(local_dir_unnorm);
-    let vs = obj.voxel_size;
+    let vs = asset.voxel_size;
 
-    let rest_extent = bitcast<f32>(obj.rest_octree_extent_bits);
+    let rest_extent = bitcast<f32>(inst.rest_octree_extent_bits);
     // Scatter + bone field all live in grid frame (origin at octree
     // corner, range [0, extent]); the ray enters in mesh frame from
     // `inverse_world`. Shift once up front.
@@ -768,9 +793,9 @@ fn march_object_skinned(
     let local_origin = local_origin_mesh + vec3<f32>(half_rest_ext);
 
     let grid_dim = vec3<i32>(
-        i32(obj.bone_field_dim_x),
-        i32(obj.bone_field_dim_y),
-        i32(obj.bone_field_dim_z),
+        i32(inst.bone_field_dim_x),
+        i32(inst.bone_field_dim_y),
+        i32(inst.bone_field_dim_z),
     );
     if grid_dim.x <= 0 || grid_dim.y <= 0 || grid_dim.z <= 0 {
         return result; // no scatter this frame; caller falls back to rigid path
@@ -778,9 +803,9 @@ fn march_object_skinned(
     atomicAdd(&stats[55], 1u); // skinned-branch entry
 
     let grid_origin = vec3<f32>(
-        obj.bone_field_origin_x,
-        obj.bone_field_origin_y,
-        obj.bone_field_origin_z,
+        inst.bone_field_origin_x,
+        inst.bone_field_origin_y,
+        inst.bone_field_origin_z,
     );
     let grid_max = grid_origin + vec3<f32>(grid_dim) * vs;
 
@@ -811,7 +836,7 @@ fn march_object_skinned(
         // up to 64 cell reads with a single bit test. `atomicAdd`s
         // 58/59 are the telemetry for brick-skip hit rate — read with
         // the [skin march] stats line in engine.rs.
-        if !bone_field_brick_populated(cell_i, grid_dim, obj.bone_field_occ_offset) {
+        if !bone_field_brick_populated(cell_i, grid_dim, inst.bone_field_occ_offset) {
             atomicAdd(&stats[58], 1u); // empty-brick skip
             let t_exit = skinned_brick_exit_t(local_origin, inv_dir, cell_i, grid_origin, vs);
             t = max(t + vs * 0.01, t_exit + vs * 0.001);
@@ -819,7 +844,7 @@ fn march_object_skinned(
         }
         atomicAdd(&stats[59], 1u); // populated-brick sample
 
-        let cell = sample_bone_field(cell_i, grid_dim, obj.bone_field_offset);
+        let cell = sample_bone_field(cell_i, grid_dim, inst.bone_field_offset);
 
         let leaf_slot = cell.x;
         let normal_oct = cell.y;
@@ -864,12 +889,13 @@ fn march_object_skinned(
 }
 
 fn march_object(
-    world_origin: vec3<f32>, world_dir: vec3<f32>, obj: RkpObject,
+    world_origin: vec3<f32>, world_dir: vec3<f32>,
+    inst: RkpInstance, asset: RkpAsset,
 ) -> MarchResult {
     // Phase-3b: skinned objects inverse-skin at march time. Unskinned
     // objects fall through to the existing rest-octree DDA.
-    if obj.is_skinned != 0u && obj.bone_count > 0u && obj.bone_field_dim_x > 0u {
-        return march_object_skinned(world_origin, world_dir, obj);
+    if inst.is_skinned != 0u && inst.bone_count > 0u && inst.bone_field_dim_x > 0u {
+        return march_object_skinned(world_origin, world_dir, inst, asset);
     }
     var result = MarchResult(
         vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0),
@@ -878,7 +904,7 @@ fn march_object(
         0u, // glass_slot
     );
 
-    let inv_world = obj.inverse_world;
+    let inv_world = inst.inverse_world;
     let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
     let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
     let local_dir = normalize(local_dir_unnorm);
@@ -890,13 +916,13 @@ fn march_object(
     // post-hit footprint histogram.
     let focal_px_y = 0.5 * camera.resolution.y / max(length(camera.up.xyz), 1e-6);
 
-    let root = obj.octree_root;
-    let max_depth = obj.octree_depth;
-    let extent = bitcast<f32>(obj.octree_extent_bits);
-    let vs = obj.voxel_size;
+    let root = asset.octree_root;
+    let max_depth = asset.octree_depth;
+    let extent = bitcast<f32>(asset.octree_extent_bits);
+    let vs = asset.voxel_size;
     let half_ext = extent * 0.5;
 
-    let oc_origin = local_origin - obj.grid_origin;
+    let oc_origin = local_origin - asset.grid_origin;
     let safe_dir = vec3<f32>(
         select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),
         select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),
@@ -998,12 +1024,12 @@ fn march_object(
                         // objects, keep the original opaque-fallback
                         // behavior so solid meshes with interior bulk
                         // still terminate the march here.
-                        let obj_opacity = materials[obj.material_id].opacity;
+                        let obj_opacity = materials[inst.material_id].opacity;
                         if obj_opacity < 0.99 || result.glass_valid {
                             if !result.glass_valid {
                                 result.glass_valid = true;
                                 result.glass_normal = -safe_dir;
-                                result.glass_material = obj.material_id;
+                                result.glass_material = inst.material_id;
                                 result.glass_enter_t = t;
                             }
                             result.glass_exit_t = t;
@@ -1073,12 +1099,12 @@ fn march_object(
                 // record / extend glass and move on. Non-glass objects
                 // keep the original "skip like empty air" semantics.
                 if c == BRICK_CELL_INTERIOR {
-                    let obj_opacity = materials[obj.material_id].opacity;
+                    let obj_opacity = materials[inst.material_id].opacity;
                     if obj_opacity < 0.99 || result.glass_valid {
                         if !result.glass_valid {
                             result.glass_valid = true;
                             result.glass_normal = -safe_dir;
-                            result.glass_material = obj.material_id;
+                            result.glass_material = inst.material_id;
                             result.glass_enter_t = t;
                         }
                         result.glass_exit_t = t;
@@ -1200,13 +1226,13 @@ fn march_object(
         // by `AssignMaterial` / scene load / drag-drop, so this
         // reliably reflects the user's intent.
         if r.slot == OCTREE_INTERIOR {
-            let obj_opacity = materials[obj.material_id].opacity;
+            let obj_opacity = materials[inst.material_id].opacity;
             if obj_opacity < 0.99 || result.glass_valid {
                 // Glass bulk — skip through, growing thickness.
                 if !result.glass_valid {
                     result.glass_valid = true;
                     result.glass_normal = -safe_dir;
-                    result.glass_material = obj.material_id;
+                    result.glass_material = inst.material_id;
                     result.glass_enter_t = t;
                 }
                 t += skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs);
@@ -1372,22 +1398,23 @@ fn main(
 
     for (var k = tile_range_start; k < tile_range_end; k++) {
         let i = tile_object_ids[k];
-        let obj = objects[i];
-        if obj.geom_type == 0u { continue; }
+        let inst = instances[i];
+        let asset = assets[inst.asset_id];
+        if asset.geom_type == 0u { continue; }
         // Layer + focus gate — retained here since the CPU tile-list
         // builder runs before layer state is known to it. Default
         // uniforms (u32::MAX) make this a cheap no-op.
-        if !rkp_object_visible(obj) { continue; }
+        if !rkp_object_visible(inst) { continue; }
 
         // AABB check: compute world-space entry distance, skip if behind closest hit.
-        let inv_world = obj.inverse_world;
+        let inv_world = inst.inverse_world;
         let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
         let local_dir_unnorm = (inv_world * vec4<f32>(ray_dir, 0.0)).xyz;
         let local_to_world_scale = 1.0 / max(length(local_dir_unnorm), 1e-10);
         let local_dir = normalize(local_dir_unnorm);
-        let extent = bitcast<f32>(obj.octree_extent_bits);
+        let extent = bitcast<f32>(asset.octree_extent_bits);
         let half_ext = extent * 0.5;
-        let oc_origin = local_origin - obj.grid_origin;
+        let oc_origin = local_origin - asset.grid_origin;
         let safe_d = vec3<f32>(
             select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),
             select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),
@@ -1399,7 +1426,7 @@ fn main(
         if world_entry > max_world_dist { continue; } // AABB entirely behind closest hit
 
         // March this object.
-        let r = march_object(ray_origin, ray_dir, obj);
+        let r = march_object(ray_origin, ray_dir, inst, asset);
         total_steps += r.steps;
 
         // Pull glass info out of this object's march, if any. Glass
@@ -1416,7 +1443,7 @@ fn main(
                 glass_have = true;
                 glass_enter_dist = g_enter;
                 glass_exit_dist = g_exit;
-                let world_n = normalize((obj.world * vec4<f32>(r.glass_normal, 0.0)).xyz);
+                let world_n = normalize((inst.world * vec4<f32>(r.glass_normal, 0.0)).xyz);
                 glass_normal_world = world_n;
                 glass_material_id = r.glass_material;
             }
@@ -1425,7 +1452,7 @@ fn main(
             // behind it.
             if g_enter < pick_dist {
                 pick_dist = g_enter;
-                pick_obj_id = obj.object_id;
+                pick_obj_id = inst.object_id;
                 pick_leaf_slot = r.glass_slot;
             }
         }
@@ -1444,14 +1471,14 @@ fn main(
         let local_normal = normalize(local_normal_raw);
 
         // Convert octree-local hit back to entity-local, then world.
-        let local_hit = oc_pos + obj.grid_origin;
-        let world_pos = (obj.world * vec4<f32>(local_hit, 1.0)).xyz;
+        let local_hit = oc_pos + asset.grid_origin;
+        let world_pos = (inst.world * vec4<f32>(local_hit, 1.0)).xyz;
         let hit_dist = length(world_pos - ray_origin);
 
         // Skip hits beyond the closest opaque surface.
         if hit_dist > max_world_dist { continue; }
 
-        let world_normal = normalize((obj.world * vec4<f32>(local_normal, 0.0)).xyz);
+        let world_normal = normalize((inst.world * vec4<f32>(local_normal, 0.0)).xyz);
 
         // Opaque hit closer than current best: replace the accumulator entirely.
         if r.alpha > 0.99 {
@@ -1460,7 +1487,7 @@ fn main(
             accum_color = color;
             accum_alpha = 1.0;
             first_dist = hit_dist;
-            first_obj_id = obj.object_id;
+            first_obj_id = inst.object_id;
             if r.first_slot != 0u {
                 let attr = leaf_attr_pool[r.first_slot];
                 first_mat_id = leaf_attr_material_primary(attr);
@@ -1468,14 +1495,14 @@ fn main(
                 first_blend = leaf_attr_blend_weight(attr);
                 first_leaf_slot = r.first_slot;
             } else {
-                first_mat_id = obj.material_id;
+                first_mat_id = inst.material_id;
             }
             have_first = true;
             max_world_dist = hit_dist;
             closest_obj_idx = i;
             if hit_dist < pick_dist {
                 pick_dist = hit_dist;
-                pick_obj_id = obj.object_id;
+                pick_obj_id = inst.object_id;
                 pick_leaf_slot = r.first_slot;
             }
             continue;
@@ -1491,7 +1518,7 @@ fn main(
 
         if !have_first {
             first_dist = hit_dist;
-            first_obj_id = obj.object_id;
+            first_obj_id = inst.object_id;
             closest_obj_idx = i;
             if r.first_slot != 0u {
                 let attr = leaf_attr_pool[r.first_slot];
@@ -1500,7 +1527,7 @@ fn main(
                 first_blend = leaf_attr_blend_weight(attr);
                 first_leaf_slot = r.first_slot;
             } else {
-                first_mat_id = obj.material_id;
+                first_mat_id = inst.material_id;
             }
             have_first = true;
         }
@@ -1515,7 +1542,7 @@ fn main(
     // camera.up.xyz encodes tan(half_fov_y), so focal_px_y = 0.5 * H / |up|.
     if have_first && closest_obj_idx != 0xFFFFFFFFu {
         let focal_px_y = 0.5 * camera.resolution.y / max(length(camera.up.xyz), 1e-6);
-        let hit_vs = objects[closest_obj_idx].voxel_size;
+        let hit_vs = assets[instances[closest_obj_idx].asset_id].voxel_size;
         let footprint = hit_vs * focal_px_y / max(first_dist, 1e-3);
         var bucket = 3u;
         if footprint < 1.0 { bucket = 0u; }

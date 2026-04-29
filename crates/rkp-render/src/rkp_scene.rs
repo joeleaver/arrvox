@@ -148,7 +148,15 @@ pub struct FrameUpload<'a> {
 pub struct RkpScene {
     pub brick_pool_buffer: wgpu::Buffer,
     pub octree_nodes_buffer: wgpu::Buffer,
+    /// Per-instance records — one entry per scene entity. Built from
+    /// `FrameUpload::objects` by [`crate::rkp_gpu_object::split_objects`]
+    /// every frame.
     pub objects_buffer: wgpu::Buffer,
+    /// Per-asset records — one entry per unique octree, keyed by
+    /// `octree_root`. Built alongside `objects_buffer` in `upload_frame`.
+    /// Multiple instances reference the same slot via
+    /// `RkpGpuInstance.asset_id`.
+    pub assets_buffer: wgpu::Buffer,
     pub color_pool_buffer: wgpu::Buffer,
     pub bone_matrices_buffer: wgpu::Buffer,
     pub bone_weights_buffer: wgpu::Buffer,
@@ -197,7 +205,14 @@ impl RkpScene {
         let brick_pool_buffer = Self::create_storage(device, "rkp_brick_pool", 256);
         // 8-byte stride: each slot is `vec2<u32>` (value, prefilter-id).
         let octree_nodes_buffer = Self::create_storage(device, "rkp_octree_nodes", 8);
-        let objects_buffer = Self::create_storage(device, "rkp_objects", std::mem::size_of::<RkpGpuObject>() as u64);
+        let objects_buffer = Self::create_storage(
+            device, "rkp_objects",
+            std::mem::size_of::<crate::rkp_gpu_object::RkpGpuInstance>() as u64,
+        );
+        let assets_buffer = Self::create_storage(
+            device, "rkp_assets",
+            std::mem::size_of::<crate::rkp_gpu_object::RkpGpuAsset>() as u64,
+        );
         let color_pool_buffer = Self::create_storage(device, "rkp_color_pool", 4);
         let bone_matrices_buffer = Self::create_storage(device, "rkp_bone_matrices", 64);
         let bone_weights_buffer = Self::create_storage(device, "rkp_bone_weights", 4);
@@ -244,7 +259,7 @@ impl RkpScene {
         let bind_group_layout = Self::create_layout(device);
 
         Self {
-            brick_pool_buffer, octree_nodes_buffer, objects_buffer,
+            brick_pool_buffer, octree_nodes_buffer, objects_buffer, assets_buffer,
             color_pool_buffer, bone_matrices_buffer,
             bone_weights_buffer, brick_face_links_buffer, leaf_attr_pool_buffer,
             bone_field_buffer, bone_field_capacity,
@@ -276,6 +291,7 @@ impl RkpScene {
             camera_buffer, &self.color_pool_buffer, &self.bone_matrices_buffer,
             &self.bone_weights_buffer, &self.brick_face_links_buffer, &self.leaf_attr_pool_buffer,
             &self.bone_field_buffer, &self.bone_field_occ_buffer, &self.bone_dual_quats_buffer,
+            &self.assets_buffer,
         )
     }
 
@@ -477,11 +493,22 @@ impl RkpScene {
         }
     }
 
-    /// Upload per-frame object data. Bumps the epoch when the objects
-    /// buffer reallocates so VRs rebuild their bind groups.
+    /// Upload per-frame object data. Splits the legacy `RkpGpuObject`
+    /// list into deduplicated per-asset records + per-instance records
+    /// (see [`crate::rkp_gpu_object::split_objects`]), then writes both
+    /// to GPU. Bumps the epoch when either buffer reallocates so VRs
+    /// rebuild their bind groups.
+    ///
+    /// Phase 1a transitional shape — CPU still constructs the legacy
+    /// 256-byte struct; the dedupe happens here on upload. Phase 1b
+    /// will move the split upstream so `FrameUpload` carries the two
+    /// vecs directly.
     pub fn upload_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &FrameUpload) {
-        let obj_bytes: &[u8] = bytemuck::cast_slice(data.objects);
-        let mut needs_rebuild = Self::ensure_and_write(device, queue, &mut self.objects_buffer, "rkp_objects", obj_bytes);
+        let (assets, instances) = crate::rkp_gpu_object::split_objects(data.objects);
+        let inst_bytes: &[u8] = bytemuck::cast_slice(&instances);
+        let asset_bytes: &[u8] = bytemuck::cast_slice(&assets);
+        let mut needs_rebuild = Self::ensure_and_write(device, queue, &mut self.objects_buffer, "rkp_objects", inst_bytes);
+        needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.assets_buffer, "rkp_assets", asset_bytes);
 
         // Bone matrices — cheap per-frame upload. When the scene has no
         // skinned entities the slice is empty; ensure_and_write keeps
@@ -570,6 +597,7 @@ impl RkpScene {
                 storage_ro(9), // bone_field (Phase 3b skinned march reads this)
                 storage_ro(10), // bone_field_occ (Phase 3c brick-level empty-space skip)
                 storage_ro(11), // bone_dual_quats (DQS precomputed palette)
+                storage_ro(12), // assets (per-asset deduped records)
             ],
         })
     }
@@ -590,6 +618,7 @@ impl RkpScene {
         bone_field: &wgpu::Buffer,
         bone_field_occ: &wgpu::Buffer,
         bone_dual_quats: &wgpu::Buffer,
+        assets: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rkp_scene_bind_group"),
@@ -607,6 +636,7 @@ impl RkpScene {
                 wgpu::BindGroupEntry { binding: 9, resource: bone_field.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: bone_field_occ.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: bone_dual_quats.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: assets.as_entire_binding() },
             ],
         })
     }
