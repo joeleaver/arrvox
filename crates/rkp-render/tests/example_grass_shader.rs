@@ -1,0 +1,81 @@
+//! Stage 6d — sanity test for the example grass shader at
+//! `<repo>/examples/shaders/grass.wgsl`.
+//!
+//! Scans the directory containing the demo shader, runs `compose()`,
+//! and validates the spliced WGSL for both the proto bake and the
+//! per-region scatter. CPU-only — no wgpu required.
+//!
+//! If this test fails, the shipped demo grass shader has rotted (a
+//! syntax change in the in-tree templates' splice surface, a renamed
+//! field on `VoxelEmit` / `HostSample` / `UserCtx`, etc.). Update the
+//! demo shader to match the current authoring API.
+
+use rkp_render::shader_composer::{compose, scan_dir};
+use rkp_render::user_shader_emit_pass::compose_emit_source;
+use rkp_render::user_shader_proto_pass::compose_proto_source;
+
+fn assert_wgsl_valid(source: &str, label: &str) {
+    let module = naga::front::wgsl::parse_str(source).unwrap_or_else(|e| {
+        panic!("[{label}] parse error:\n{}", e.emit_to_string(source))
+    });
+    let mut v = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    );
+    v.validate(&module)
+        .unwrap_or_else(|e| panic!("[{label}] validation error: {e:?}"));
+}
+
+#[test]
+fn example_grass_shader_composes_and_validates() {
+    // The example shader lives at `<repo>/examples/shaders/grass.wgsl`.
+    // CARGO_MANIFEST_DIR for this test crate is
+    // `<repo>/crates/rkp-render`; walk up two levels to find the repo
+    // root, then descend.
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let repo_root = std::path::PathBuf::from(&manifest)
+        .parent() // crates/
+        .and_then(|p| p.parent()) // <repo>/
+        .map(|p| p.to_path_buf())
+        .expect("walk up from CARGO_MANIFEST_DIR");
+    let shaders_dir = repo_root.join("examples").join("shaders");
+    assert!(
+        shaders_dir.join("grass.wgsl").exists(),
+        "expected examples/shaders/grass.wgsl to exist at {}",
+        shaders_dir.display(),
+    );
+
+    let registry = scan_dir(&shaders_dir).expect("scan_dir succeeds");
+    let infos = registry.shader_infos();
+    let grass = infos
+        .iter()
+        .find(|i| i.name == "grass")
+        .expect("registry includes grass shader");
+    assert!(
+        grass.is_instance_pipeline,
+        "grass shader must be detected as instance-pipeline (proto + emit + parsed Blade layout)",
+    );
+    assert_eq!(grass.instance_struct_name.as_deref(), Some("Blade"));
+    let struct_size = grass.instance_struct_size.expect("Blade size parsed");
+    assert!(
+        struct_size <= 64,
+        "Blade struct {struct_size} B exceeds Option B hard cap (64)",
+    );
+
+    let chunks = compose(&registry);
+    assert!(
+        chunks.proto.contains("rkp_user_") && chunks.proto.contains("_proto"),
+        "compose.proto missing per-shader proto fn for grass",
+    );
+    assert!(
+        chunks.emit.contains("rkp_user_") && chunks.emit.contains("_emit_instance"),
+        "compose.emit missing per-shader emit_instance fn for grass",
+    );
+
+    // Splice into both pipeline templates and validate via naga.
+    let proto_source = compose_proto_source(&chunks.proto);
+    assert_wgsl_valid(&proto_source, "user_shader_proto+grass");
+
+    let emit_source = compose_emit_source(&chunks.emit);
+    assert_wgsl_valid(&emit_source, "user_shader_emit+grass");
+}

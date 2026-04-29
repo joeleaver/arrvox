@@ -98,20 +98,30 @@ impl EngineState {
         // Manual registrations come first (engine-command path; empty
         // unless something explicitly populates it).
         user_shader_regions.extend(self.user_shader_regions.iter().cloned());
+        // Stage 6d — Option B instance shader region requests. Same
+        // (entity × painted-material) walk as `user_shader_regions`,
+        // partitioned by shader kind in the emit loop below.
+        let mut instance_region_requests: Vec<
+            rkp_render::user_shader_emit_pass::InstanceRegionRequest,
+        > = Vec::new();
         let infos = self.user_shader_registry.shader_infos();
 
-        // Build the set of "shader-bearing material ids" — only
-        // materials with a `generate`-hook shader trigger regions.
+        // Build the set of "shader-bearing material ids" — materials
+        // whose shader has either a `generate` hook (Phase C per-cell
+        // pipeline) or an `is_instance_pipeline` flag (Option B voxel
+        // sprite instancing). Same painted-AABB scan feeds both
+        // request types; the per-tile emit loop below partitions on
+        // shader kind.
         let mut shader_materials: std::collections::HashMap<
             u16,
             rkp_render::shader_composer::UserShaderInfo,
         > = std::collections::HashMap::new();
-        if infos.iter().any(|i| i.has_generate) {
+        if infos.iter().any(|i| i.has_generate || i.is_instance_pipeline) {
             for slot_id in 0..self.material_lib.slot_count() as u16 {
                 let Some(def) = self.material_lib.get_def(slot_id) else { continue; };
                 let Some(shader_name) = def.shader.as_deref() else { continue; };
                 let Some(info) = infos.iter().find(|i| i.name == shader_name) else { continue; };
-                if info.has_generate {
+                if info.has_generate || info.is_instance_pipeline {
                     shader_materials.insert(slot_id, info.clone());
                 }
             }
@@ -366,26 +376,66 @@ impl EngineState {
                             world_center[2] + half_extent,
                         ];
 
-                        user_shader_regions.push(rkp_render::user_shader_pass::ShaderRegionRequest {
-                            host_object_id: obj.object_id,
-                            material_id: mat_id as u32,
-                            shader_name: shader_name_for_request.clone(),
-                            params: params.clone(),
-                            aabb_min: centered_min,
-                            aabb_max: centered_max,
-                            cell_size,
-                            input_hash,
-                            animated: info.animated,
-                            region_thickness: effective_band,
-                            max_depth,
-                            painted_leaf_count,
-                            host_octree_root,
-                            host_octree_depth: obj.octree_depth,
-                            host_octree_extent,
-                            host_grid_origin: obj.grid_origin,
-                            host_inverse_world: obj.inverse_world,
-                            tile_index,
-                        });
+                        // Partition by shader kind. A single material's
+                        // shader is one or the other (a generate hook
+                        // and an instance pipeline are mutually
+                        // exclusive at registration time), so each
+                        // tile produces exactly one request.
+                        if info.has_generate {
+                            user_shader_regions.push(rkp_render::user_shader_pass::ShaderRegionRequest {
+                                host_object_id: obj.object_id,
+                                material_id: mat_id as u32,
+                                shader_name: shader_name_for_request.clone(),
+                                params: params.clone(),
+                                aabb_min: centered_min,
+                                aabb_max: centered_max,
+                                cell_size,
+                                input_hash,
+                                animated: info.animated,
+                                region_thickness: effective_band,
+                                max_depth,
+                                painted_leaf_count,
+                                host_octree_root,
+                                host_octree_depth: obj.octree_depth,
+                                host_octree_extent,
+                                host_grid_origin: obj.grid_origin,
+                                host_inverse_world: obj.inverse_world,
+                                tile_index,
+                            });
+                        } else if info.is_instance_pipeline {
+                            // V1 max instances per region. Stage 6e
+                            // (perf) can revisit if a real workload
+                            // hits the cap.
+                            const DEFAULT_MAX_INSTANCES: u32 =
+                                rkp_render::user_shader_emit_pass::DEFAULT_MAX_INSTANCES_PER_REGION;
+                            let stride_u32 = info
+                                .instance_struct_size
+                                .map(|s| s.div_ceil(4))
+                                .unwrap_or(8);
+                            let _ = painted_leaf_count;
+                            instance_region_requests.push(
+                                rkp_render::user_shader_emit_pass::InstanceRegionRequest {
+                                    host_object_id: obj.object_id,
+                                    material_id: mat_id as u32,
+                                    shader_name: shader_name_for_request.clone(),
+                                    params: params.clone(),
+                                    aabb_min: centered_min,
+                                    aabb_max: centered_max,
+                                    cell_size,
+                                    input_hash,
+                                    animated: info.animated,
+                                    region_thickness: effective_band,
+                                    tile_index,
+                                    stride_u32,
+                                    max_instances: DEFAULT_MAX_INSTANCES,
+                                    host_octree_root,
+                                    host_octree_depth: obj.octree_depth,
+                                    host_octree_extent,
+                                    host_grid_origin: obj.grid_origin,
+                                    host_inverse_world: obj.inverse_world,
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -990,11 +1040,10 @@ impl EngineState {
             user_shader_infos,
             user_shader_entries,
             user_shader_regions,
-            // Stage 6c-3 — Option B instance pipeline. The sim layer
-            // doesn't yet build instance region requests; ship empty so
-            // the engine's tick is a no-op until 6c-3.5 (or an editor-
-            // side painter) lands.
-            instance_region_requests: Vec::new(),
+            // Stage 6d — Option B instance pipeline. Built above by
+            // the same painted-AABB walk as `user_shader_regions`,
+            // partitioned on shader kind.
+            instance_region_requests,
             lights: gpu_lights,
             shade_params_base: self.shade_params_base,
             env_update,
