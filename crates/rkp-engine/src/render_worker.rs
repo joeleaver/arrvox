@@ -1390,6 +1390,7 @@ fn render_one_frame(
             &state.device,
             &state.queue,
             &mut encoder,
+            &mut state.renderer.profiler,
             &overlay_inputs,
         );
 
@@ -1885,7 +1886,14 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
         //     the prototype's leaf-level octree slots + brick + leaf
         //     attrs starting from the proto cache's reserved offset.
         //     We pre-fill the internal levels CPU-side per Stage 2's
-        //     pattern.
+        //     pattern. Wrap the whole bake loop in one profiler query
+        //     so a frame with N dirty bakes shows as one `inst_bake`
+        //     bucket; rare per-shader rebakes mean N is usually 0 or 1.
+        let bake_q = if !dirty_bakes.is_empty() {
+            Some(state.renderer.profiler.begin_query("inst_bake", &mut encoder))
+        } else {
+            None
+        };
         for bake in &dirty_bakes {
             // Pre-fill internal octree levels at the proto's reserved
             // offset. `build_internal_levels` returns the entire
@@ -1956,6 +1964,9 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             cpass.set_bind_group(0, &bake_g0, &[]);
             cpass.set_bind_group(1, &bake_g1, &[]);
             cpass.dispatch_workgroups(bricks_per_axis, bricks_per_axis, bricks_per_axis);
+        }
+        if let Some(q) = bake_q {
+            state.renderer.profiler.end_query(&mut encoder, q);
         }
 
         // 8b. Scatter — one dispatch per touched region.
@@ -2072,6 +2083,10 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
                 }],
             });
 
+            // One profiler bucket for the full scatter loop. With
+            // @animated shaders this fires every frame for every
+            // touched region, so this is the budget number to watch.
+            let scatter_q = state.renderer.profiler.begin_query("inst_scatter", &mut encoder);
             for (i, s) in scatters.iter().enumerate() {
                 if s.leaf_count == 0 {
                     continue;
@@ -2091,6 +2106,7 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
                 cpass.dispatch_workgroups(wgs, 1, 1);
                 let _ = s.instance_alloc_offset_bytes;
             }
+            state.renderer.profiler.end_query(&mut encoder, scatter_q);
         }
 
         state.queue.submit(Some(encoder.finish()));

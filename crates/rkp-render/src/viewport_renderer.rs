@@ -481,6 +481,7 @@ impl ViewportRenderer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
+        profiler: &mut wgpu_profiler::GpuProfiler,
         inputs: &InstanceOverlayInputs<'_>,
     ) {
         // 1. Write per-VR MarchUniforms.
@@ -545,6 +546,7 @@ impl ViewportRenderer {
 
         // 3. Dispatch march.
         {
+            let q = profiler.begin_query("inst_march", encoder);
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("inst march"),
                 timestamp_writes: None,
@@ -554,6 +556,8 @@ impl ViewportRenderer {
             cpass.set_bind_group(2, &m_g2, &[]);
             cpass.set_bind_group(3, &m_g3, &[]);
             self.instance_march_pass.dispatch_per_pixel(&mut cpass, self.width, self.height);
+            drop(cpass);
+            profiler.end_query(encoder, q);
         }
 
         // 4. Build composite bind groups.
@@ -601,6 +605,7 @@ impl ViewportRenderer {
 
         // 5. Dispatch composite.
         {
+            let q = profiler.begin_query("inst_composite", encoder);
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("inst composite"),
                 timestamp_writes: None,
@@ -609,6 +614,8 @@ impl ViewportRenderer {
             cpass.set_bind_group(1, &c_g1, &[]);
             cpass.set_bind_group(2, &c_g2, &[]);
             self.instance_composite_pass.dispatch_per_pixel(&mut cpass, self.width, self.height);
+            drop(cpass);
+            profiler.end_query(encoder, q);
         }
     }
 
