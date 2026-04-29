@@ -75,6 +75,27 @@ pub const HOST_NO_HOST_SENTINEL: u32 = 0xFFFF_FFFFu32;
 /// [`crate::user_shader_pass::NO_TILE`].
 pub const NO_TILE: [i32; 3] = [i32::MIN, i32::MIN, i32::MIN];
 
+/// One painted-leaf record fed to the emit pass. The engine collects
+/// these during the painted-leaf walk; the emit dispatch fires one
+/// thread per record, hands the user shader's emit hook
+/// `(host_pos = world_pos, host = ...)` directly, no descent of the
+/// host octree per sample. 32 bytes, repr(C) for direct GPU upload.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct PaintedLeaf {
+    /// Leaf's world-space center.
+    pub world_pos: [f32; 3],
+    /// Packed material — same layout as `LeafAttr.material_packed`:
+    /// primary u16 (bits 0..15) | secondary u12 (bits 16..27) | blend u4 (bits 28..31).
+    pub material_packed: u32,
+    /// Leaf's world-space surface normal (already transformed from
+    /// the host's local frame).
+    pub world_normal: [f32; 3],
+    pub _pad: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<PaintedLeaf>() == 32);
+
 /// One per-region request from sim to render. Mirrors
 /// [`crate::user_shader_pass::ShaderRegionRequest`] but trimmed to the
 /// fields the emit pipeline actually reads (no fill-task counts, no
@@ -109,6 +130,10 @@ pub struct InstanceRegionRequest {
     pub host_octree_extent: f32,
     pub host_grid_origin: [f32; 3],
     pub host_inverse_world: [[f32; 4]; 4],
+    /// Painted-leaf records the engine collected during scan. The
+    /// emit dispatch fires one thread per leaf — placement is
+    /// driven by the actual paint, not by a sample grid.
+    pub leaves: Vec<PaintedLeaf>,
 }
 
 /// Persistent cache entry for one instance region.
@@ -377,19 +402,40 @@ pub struct EmitRegionUniform {
     pub instance_block_offset: u32,         // offset  44
     pub instance_block_size: u32,           // offset  48
     pub instance_stride_u32: u32,           // offset  52
-    pub host_octree_root: u32,              // offset  56
-    pub host_octree_depth: u32,             // offset  60
-    pub host_octree_extent: f32,            // offset  64
-    /// 12 bytes (3 × u32) of padding so `host_grid_origin` lands at
-    /// offset 80. WGSL inserts this implicitly; we spell it out.
-    pub _pad_host: [u32; 3],                // offset  68 → 80
-    pub host_grid_origin: [f32; 3],         // offset  80
-    pub _pad_grid: f32,                     // offset  92
-    pub params: [[f32; 4]; 2],              // offset  96
-    pub host_inverse_world: [[f32; 4]; 4],  // offset 128
+    /// First index in the global leaves storage buffer this region
+    /// owns. The emit dispatch reads `leaves[leaf_offset + thread_id]`
+    /// for the per-thread leaf record.
+    pub leaf_offset: u32,                   // offset  56
+    /// Number of painted leaves in this region. Threads with id ≥
+    /// this value early-out.
+    pub leaf_count: u32,                    // offset  60
+    pub host_grid_origin: [f32; 3],         // offset  64 (16-aligned ✓)
+    pub _pad_grid: f32,                     // offset  76
+    pub params: [[f32; 4]; 2],              // offset  80
+    pub host_inverse_world: [[f32; 4]; 4],  // offset 112
 }
 
-const _: () = assert!(std::mem::size_of::<EmitRegionUniform>() == 192);
+// WGSL alignment for vec3<f32> / vec4<f32> / mat4<f32> is 16 — every
+// field above is hand-positioned to satisfy that. Layout walk:
+//   aabb_min vec3<f32>          0..12
+//   cell_size f32              12..16
+//   aabb_max vec3<f32>         16..28
+//   shader_id u32              28..32
+//   time f32                   32..36
+//   material_id u32            36..40
+//   region_thickness f32       40..44
+//   instance_block_offset u32  44..48
+//   instance_block_size u32    48..52
+//   instance_stride_u32 u32    52..56
+//   leaf_offset u32            56..60
+//   leaf_count u32             60..64
+//   host_grid_origin vec3<f32> 64..76 (16-aligned ✓)
+//   _pad_grid f32              76..80
+//   params [vec4<f32>;2]       80..112
+//   host_inverse_world mat4   112..176
+//   total                          176
+
+const _: () = assert!(std::mem::size_of::<EmitRegionUniform>() == 176);
 
 /// Per-dispatch state — uploaded with a dynamic-offset uniform binding
 /// so a single uniform buffer can hold many regions' values laid out
@@ -398,7 +444,9 @@ const _: () = assert!(std::mem::size_of::<EmitRegionUniform>() == 192);
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct EmitDispatchUniform {
     pub region_index: u32,
-    pub samples_per_axis: u32,
+    /// Number of painted leaves the dispatch processes. Threads with
+    /// `gid >= leaf_count` early-out.
+    pub leaf_count: u32,
     pub _pad0: u32,
     pub _pad1: u32,
 }
@@ -410,11 +458,15 @@ const _: () = assert!(std::mem::size_of::<EmitDispatchUniform>() == 16);
 pub const EMIT_DISPATCH_UNIFORM_STRIDE: u64 = 256;
 
 /// Build the per-region emit uniform from a request + cached slot.
+/// `leaf_offset` is the absolute index in the global leaves buffer
+/// where this region's painted leaves live; `leaf_count` is taken
+/// from `request.leaves.len()`.
 pub fn build_emit_region_uniform(
     request: &InstanceRegionRequest,
     slot: &CachedSlot,
     shader_id: u32,
     time_seconds: f32,
+    leaf_offset: u32,
 ) -> EmitRegionUniform {
     let mut params = [[0.0f32; 4]; 2];
     for (i, &v) in request.params.iter().take(8).enumerate() {
@@ -431,10 +483,8 @@ pub fn build_emit_region_uniform(
         instance_block_offset: slot.instance_block_offset,
         instance_block_size: slot.instance_block_size,
         instance_stride_u32: slot.stride_u32,
-        host_octree_root: request.host_octree_root,
-        host_octree_depth: request.host_octree_depth,
-        host_octree_extent: request.host_octree_extent,
-        _pad_host: [0; 3],
+        leaf_offset,
+        leaf_count: request.leaves.len() as u32,
         host_grid_origin: request.host_grid_origin,
         _pad_grid: 0.0,
         params,
@@ -442,13 +492,12 @@ pub fn build_emit_region_uniform(
     }
 }
 
-/// Compute samples_per_axis = ceil(extent / (cell_size * 4)) for the
-/// emit dispatch's grid. The dispatch then issues
-/// `ceil(samples_per_axis / 4)³` workgroups.
-pub fn samples_per_axis(request: &InstanceRegionRequest) -> u32 {
-    let extent = (request.aabb_max[0] - request.aabb_min[0]).max(1e-6);
-    let bp_cell = (request.cell_size * 4.0).max(1e-6);
-    ((extent / bp_cell).ceil() as u32).max(1)
+/// Workgroup count for the leaf-driven emit dispatch.
+/// Workgroup size is 64; one thread per leaf. Returns at least 1
+/// even for empty regions so the validator doesn't reject the
+/// dispatch.
+pub fn workgroups_for_leaf_count(leaf_count: u32) -> u32 {
+    leaf_count.div_ceil(64).max(1)
 }
 
 /// Resolve a `MaterialDef.shader` name to a shader id and parsed
@@ -512,10 +561,8 @@ impl EmitPass {
             entries: &[
                 rw_storage(0), // instance_pool
                 rw_storage(1), // instance_alloc
-                ro_storage(2), // octree_nodes
-                ro_storage(3), // brick_pool
-                ro_storage(4), // leaf_attr_pool
-                rw_storage(5), // overflow
+                ro_storage(2), // leaves (PaintedLeaf array)
+                rw_storage(3), // overflow
             ],
         });
         let group1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -717,21 +764,21 @@ mod tests {
                 [0.0, 0.0, 1.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
+            leaves: Vec::new(),
         }
     }
 
     #[test]
-    fn emit_region_uniform_size_is_192() {
-        // WGSL EmitRegionUniform total layout:
+    fn emit_region_uniform_size_is_176() {
+        // WGSL EmitRegionUniform total layout (leaf-driven):
         //   aabb_min(0..12) + cell_size(12..16) + aabb_max(16..28) +
         //   shader_id(28..32) + time(32..36) + material_id(36..40) +
         //   region_thickness(40..44) + instance_block_offset(44..48) +
         //   instance_block_size(48..52) + instance_stride_u32(52..56) +
-        //   host_octree_root(56..60) + host_octree_depth(60..64) +
-        //   host_octree_extent(64..68) + _pad_host(68..80) +
-        //   host_grid_origin(80..92) + _pad_grid(92..96) +
-        //   params(96..128) + host_inverse_world(128..192) = 192
-        assert_eq!(std::mem::size_of::<EmitRegionUniform>(), 192);
+        //   leaf_offset(56..60) + leaf_count(60..64) +
+        //   host_grid_origin(64..76) + _pad_grid(76..80) +
+        //   params(80..112) + host_inverse_world(112..176) = 176
+        assert_eq!(std::mem::size_of::<EmitRegionUniform>(), 176);
     }
 
     #[test]
@@ -911,13 +958,12 @@ fn user_grass_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) {
     }
 
     #[test]
-    fn samples_per_axis_round_up() {
-        let mut req = make_request(8, 64);
-        req.aabb_min = [0.0, 0.0, 0.0];
-        req.aabb_max = [1.0, 1.0, 1.0];
-        req.cell_size = 0.04;
-        // bp_cell = 0.16. extent 1.0 → samples = ceil(1.0/0.16) = 7.
-        assert_eq!(samples_per_axis(&req), 7);
+    fn workgroups_for_leaf_count_at_least_one() {
+        assert_eq!(workgroups_for_leaf_count(0), 1);
+        assert_eq!(workgroups_for_leaf_count(1), 1);
+        assert_eq!(workgroups_for_leaf_count(64), 1);
+        assert_eq!(workgroups_for_leaf_count(65), 2);
+        assert_eq!(workgroups_for_leaf_count(512), 8);
     }
 
     #[test]
@@ -926,13 +972,15 @@ fn user_grass_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) {
         cache.set_pool_base(2000);
         let req = make_request(8, 64);
         let slot = cache.lookup_or_allocate(&req, 0xAA, 0xBB).unwrap();
-        let u = build_emit_region_uniform(&req, &slot, 1, 0.0);
+        let u = build_emit_region_uniform(&req, &slot, 1, 0.0, 0);
         assert_eq!(u.shader_id, 1);
         assert_eq!(u.instance_block_offset, slot.instance_block_offset);
         assert_eq!(u.instance_block_size, slot.instance_block_size);
         assert_eq!(u.instance_stride_u32, 8);
         assert_eq!(u.material_id, 5);
         assert_eq!(u.region_thickness, 0.05);
+        assert_eq!(u.leaf_offset, 0);
+        assert_eq!(u.leaf_count, 0);
     }
 
     #[test]
@@ -969,7 +1017,7 @@ fn user_grass_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) {
         let mut cache = InstanceRegionCache::with_capacity(8192);
         cache.set_pool_base(0);
         let slot = cache.lookup_or_allocate(&req, 0xAA, 0xBB).unwrap();
-        let u = build_emit_region_uniform(&req, &slot, 1, 0.0);
+        let u = build_emit_region_uniform(&req, &slot, 1, 0.0, 0);
         assert_eq!(u.params[0], [1.0, 2.0, 3.0, 4.0]);
         assert_eq!(u.params[1], [5.0, 6.0, 7.0, 8.0]);
     }

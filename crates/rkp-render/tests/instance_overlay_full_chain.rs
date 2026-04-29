@@ -33,7 +33,8 @@ use rkp_render::instance_tile_index::TileIndexBuilder;
 use rkp_render::instance_tile_index_gpu::flatten_tile_index;
 use rkp_render::shader_composer::{compose, scan_dir};
 use rkp_render::user_shader_emit_pass::{
-    build_emit_region_uniform, samples_per_axis, EmitDispatchUniform, EmitPass,
+    build_emit_region_uniform, workgroups_for_leaf_count, EmitDispatchUniform, EmitPass,
+    PaintedLeaf,
     InstanceRegionCache, InstanceRegionRequest, HOST_NO_HOST_SENTINEL, NO_TILE,
 };
 use rkp_render::user_shader_proto_pass::{
@@ -237,10 +238,17 @@ fn full_chain_bake_scatter_march_composite_lands_instance_in_merged_gbuffer() {
     queue.submit(std::iter::once(encoder.finish()));
     device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
 
-    // ── Scatter one instance at the region center (no-host path) ──
+    // ── Scatter one instance at the region center via a single leaf ──
     let region_aabb_min = [1.5_f32, 0.0, 0.0];
     let region_aabb_max = [2.5_f32, 1.0, 1.0];
     let cell_size = 0.25_f32;
+    let leaves = vec![PaintedLeaf {
+        world_pos: [2.0, 0.5, 0.5],
+        material_packed: 5,
+        world_normal: [0.0, 1.0, 0.0],
+        _pad: 0.0,
+    }];
+    let leaf_count = leaves.len() as u32;
     let request = InstanceRegionRequest {
         host_object_id: 1,
         material_id: 5,
@@ -265,9 +273,8 @@ fn full_chain_bake_scatter_march_composite_lands_instance_in_merged_gbuffer() {
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ],
+        leaves: leaves.clone(),
     };
-    let spa = samples_per_axis(&request);
-    assert_eq!(spa, 1);
 
     let mut instance_cache = InstanceRegionCache::with_capacity(64 * STRIDE_U32 * 2);
     instance_cache.set_pool_base(POOL_INSTANCE_BASE);
@@ -287,12 +294,20 @@ fn full_chain_bake_scatter_march_composite_lands_instance_in_merged_gbuffer() {
     queue.write_buffer(&emit_pass.instance_alloc_buffer, 0, &[0u8; 4]);
     queue.write_buffer(&emit_pass.overflow_buffer, 0, &[0u8; 16]);
 
+    let leaves_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("fc leaves"),
+        size: (leaves.len() as u64) * 32,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&leaves_buffer, 0, bytemuck::cast_slice(&leaves));
+
     let region_uniform =
-        build_emit_region_uniform(&request, &cached_slot, SHADER_ID, /* time */ 0.0);
+        build_emit_region_uniform(&request, &cached_slot, SHADER_ID, /* time */ 0.0, 0);
     queue.write_buffer(&emit_pass.regions_buffer, 0, bytemuck::bytes_of(&region_uniform));
     let dispatch_u = EmitDispatchUniform {
         region_index: 0,
-        samples_per_axis: spa,
+        leaf_count,
         _pad0: 0,
         _pad1: 0,
     };
@@ -304,10 +319,8 @@ fn full_chain_bake_scatter_march_composite_lands_instance_in_merged_gbuffer() {
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: instance_pool.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: emit_pass.instance_alloc_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: octree_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: brick_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: leaf_attr_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: emit_pass.overflow_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: leaves_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: emit_pass.overflow_buffer.as_entire_binding() },
         ],
     });
     let emit_g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -337,7 +350,7 @@ fn full_chain_bake_scatter_march_composite_lands_instance_in_merged_gbuffer() {
         cpass.set_bind_group(0, &emit_g0, &[]);
         cpass.set_bind_group(1, &emit_g1, &[]);
         cpass.set_bind_group(2, &emit_g2, &[0u32]);
-        cpass.dispatch_workgroups(1, 1, 1);
+        cpass.dispatch_workgroups(workgroups_for_leaf_count(leaf_count), 1, 1);
     }
     queue.submit(std::iter::once(encoder.finish()));
     device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");

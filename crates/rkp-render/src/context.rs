@@ -43,8 +43,17 @@ impl RenderContext {
                 required_features: wgpu::Features::FLOAT32_FILTERABLE,
                 required_limits: wgpu::Limits {
                     max_bind_groups: 8,
-                    max_storage_buffer_binding_size: 1 << 30, // 1 GB
-                    max_buffer_size: 1 << 31, // 2 GB
+                    // Take whatever the adapter offers up to 2 GB. The
+                    // shared `brick_pool_buffer` / `leaf_attr_pool_buffer`
+                    // stack persistent CPU geometry + Phase C user-shader
+                    // tail (768 MB at MAX_GLOBAL_BRICKS=3M) + Option B
+                    // proto sub-pool, which routinely exceeds the 1 GB
+                    // wgpu downlevel default. Adapters that can't supply
+                    // 2 GB still get whatever they expose; ensure_capacity
+                    // clamps each buffer to the granted limit.
+                    max_storage_buffer_binding_size:
+                        adapter.limits().max_storage_buffer_binding_size.min(1 << 31),
+                    max_buffer_size: adapter.limits().max_buffer_size.min(1 << 31),
                     // 20 rather than the wgpu default 8 — group 0's
                     // scene bindings are 11 storage buffers (brick_pool,
                     // octree_nodes, objects, color_pool, bone_matrices,
@@ -71,6 +80,13 @@ impl RenderContext {
         ))
         .expect("failed to create GPU device");
 
+        let granted = device.limits();
+        eprintln!(
+            "[rkp_context] adapter={:?} granted limits: max_storage_buffer_binding_size={} max_buffer_size={}",
+            adapter_info.name,
+            granted.max_storage_buffer_binding_size,
+            granted.max_buffer_size,
+        );
         // Log GPU device errors and device lost events to stderr for diagnostics.
         device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
             eprintln!("[GPU ERROR] {error}");
@@ -116,8 +132,17 @@ impl RenderContext {
                     | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
                 required_limits: wgpu::Limits {
                     max_bind_groups: 8,
-                    max_storage_buffer_binding_size: 1 << 30, // 1 GB
-                    max_buffer_size: 1 << 31, // 2 GB
+                    // Take whatever the adapter offers up to 2 GB. The
+                    // shared `brick_pool_buffer` / `leaf_attr_pool_buffer`
+                    // stack persistent CPU geometry + Phase C user-shader
+                    // tail (768 MB at MAX_GLOBAL_BRICKS=3M) + Option B
+                    // proto sub-pool, which routinely exceeds the 1 GB
+                    // wgpu downlevel default. Adapters that can't supply
+                    // 2 GB still get whatever they expose; ensure_capacity
+                    // clamps each buffer to the granted limit.
+                    max_storage_buffer_binding_size:
+                        adapter.limits().max_storage_buffer_binding_size.min(1 << 31),
+                    max_buffer_size: adapter.limits().max_buffer_size.min(1 << 31),
                     // 20 rather than the wgpu default 8 — group 0's
                     // scene bindings are 11 storage buffers (brick_pool,
                     // octree_nodes, objects, color_pool, bone_matrices,

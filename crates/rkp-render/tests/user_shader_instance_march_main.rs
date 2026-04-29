@@ -25,7 +25,8 @@ use rkp_render::instance_tile_index::TileIndexBuilder;
 use rkp_render::instance_tile_index_gpu::{flatten_tile_index, GpuTileIndexEntry};
 use rkp_render::shader_composer::{compose, scan_dir};
 use rkp_render::user_shader_emit_pass::{
-    build_emit_region_uniform, samples_per_axis, EmitDispatchUniform, EmitPass,
+    build_emit_region_uniform, workgroups_for_leaf_count, EmitDispatchUniform, EmitPass,
+    PaintedLeaf,
     EmitRegionUniform, InstanceRegionCache, InstanceRegionRequest,
     HOST_NO_HOST_SENTINEL, NO_TILE,
 };
@@ -225,16 +226,22 @@ fn instance_march_hits_single_scattered_sphere_instance() {
     queue.submit(std::iter::once(encoder.finish()));
     device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
 
-    // ── Build emit-pass region request: 1×1×1 sample grid centered at (2, 0.5, 0.5) ──
+    // ── Build emit-pass region request: one painted leaf at (2, 0.5, 0.5) ──
     //
-    // extent = 1.0, cell_size = 0.25 → bp_cell = 1.0 → samples_per_axis = 1.
-    // The single sample center sits at aabb_min + 0.5 = (2.0, 0.5, 0.5),
-    // which is what `host_pos` will be inside the emit hook — and what
-    // the shader sets as `pos`. The instance scale is 1.0, so the
-    // instance AABB matches the region AABB exactly.
+    // The single leaf sits at the region center; the emit hook will see
+    // `host_pos = (2.0, 0.5, 0.5)` and set `pos` to that, scattering one
+    // instance into the per-region pool. Region AABB is unchanged for
+    // the march's ray-AABB pre-cull, but the emit dispatch is driven
+    // entirely by the leaf list now.
     let region_aabb_min = [1.5_f32, 0.0, 0.0];
     let region_aabb_max = [2.5_f32, 1.0, 1.0];
     let cell_size = 0.25_f32;
+    let leaves = vec![PaintedLeaf {
+        world_pos: [2.0, 0.5, 0.5],
+        material_packed: 5,
+        world_normal: [0.0, 1.0, 0.0],
+        _pad: 0.0,
+    }];
     let request = InstanceRegionRequest {
         host_object_id: 1,
         material_id: 5,
@@ -259,9 +266,9 @@ fn instance_march_hits_single_scattered_sphere_instance() {
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ],
+        leaves: leaves.clone(),
     };
-    let spa = samples_per_axis(&request);
-    assert_eq!(spa, 1, "test design requires 1×1×1 sample grid");
+    let leaf_count = leaves.len() as u32;
 
     let mut instance_cache = InstanceRegionCache::with_capacity(64 * STRIDE_U32 * 2);
     instance_cache.set_pool_base(POOL_INSTANCE_BASE);
@@ -283,12 +290,20 @@ fn instance_march_hits_single_scattered_sphere_instance() {
     queue.write_buffer(&emit_pass.instance_alloc_buffer, 0, &[0u8; 4]);
     queue.write_buffer(&emit_pass.overflow_buffer, 0, &[0u8; 16]);
 
+    let leaves_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("e2e leaves"),
+        size: (leaves.len() as u64) * 32,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&leaves_buffer, 0, bytemuck::cast_slice(&leaves));
+
     let region_uniform =
-        build_emit_region_uniform(&request, &cached_slot, /* shader_id */ SHADER_ID, /* time */ 0.0);
+        build_emit_region_uniform(&request, &cached_slot, /* shader_id */ SHADER_ID, /* time */ 0.0, 0);
     queue.write_buffer(&emit_pass.regions_buffer, 0, bytemuck::bytes_of(&region_uniform));
     let dispatch_u = EmitDispatchUniform {
         region_index: 0,
-        samples_per_axis: spa,
+        leaf_count,
         _pad0: 0,
         _pad1: 0,
     };
@@ -300,11 +315,8 @@ fn instance_march_hits_single_scattered_sphere_instance() {
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: instance_pool.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: emit_pass.instance_alloc_buffer.as_entire_binding() },
-            // Host octree bindings unused (no-host sentinel) but layout requires them — bind the prototype buffers.
-            wgpu::BindGroupEntry { binding: 2, resource: octree_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: brick_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: leaf_attr_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: emit_pass.overflow_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: leaves_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: emit_pass.overflow_buffer.as_entire_binding() },
         ],
     });
     let emit_g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -335,8 +347,7 @@ fn instance_march_hits_single_scattered_sphere_instance() {
         cpass.set_bind_group(0, &emit_g0, &[]);
         cpass.set_bind_group(1, &emit_g1, &[]);
         cpass.set_bind_group(2, &emit_g2, &[0u32]);
-        // wgs_per_axis = ceil(spa / 4) = 1 for spa=1.
-        cpass.dispatch_workgroups(1, 1, 1);
+        cpass.dispatch_workgroups(workgroups_for_leaf_count(leaf_count), 1, 1);
     }
     queue.submit(std::iter::once(encoder.finish()));
     device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");

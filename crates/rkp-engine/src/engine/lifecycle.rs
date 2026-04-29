@@ -161,8 +161,18 @@ impl EngineState {
                     // elephant.
                     let mut mat_tiles: std::collections::HashMap<
                         u16,
-                        std::collections::HashMap<[i32; 3], (rkp_core::Aabb, u32)>,
+                        std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
                     > = std::collections::HashMap::new();
+                    // World matrix for transforming leaf-local positions
+                    // and normals into the world frame the emit pass
+                    // hands to user shaders. Entries without a matching
+                    // GPU object skip the leaf collection (mat_tiles
+                    // still gets the AABB so Phase C still works).
+                    let entity_world: Option<glam::Mat4> = self
+                        .gpu_objects
+                        .iter()
+                        .find(|o| o.object_id == object_id)
+                        .map(|o| glam::Mat4::from_cols_array_2d(&o.world));
                     scan_painted_aabbs(
                         octree_data,
                         brick_pool_data,
@@ -172,6 +182,7 @@ impl EngineState {
                         spatial.grid_origin,
                         spatial.base_voxel_size,
                         &shader_materials,
+                        entity_world,
                         &mut mat_tiles,
                     );
                     if !mat_tiles.is_empty() {
@@ -264,8 +275,9 @@ impl EngineState {
                     // Each tile in this (object, material) pair becomes
                     // one ShaderRegionRequest. For non-tiled shaders
                     // there's a single entry under NO_TILE_COORD.
-                    for (&tile_coord, (local_aabb, painted_leaf_count)) in tiles.iter() {
-                        let painted_leaf_count = *painted_leaf_count;
+                    for (&tile_coord, tile_entry) in tiles.iter() {
+                        let local_aabb = &tile_entry.aabb;
+                        let painted_leaf_count = tile_entry.leaf_count;
 
                         // Determine the host-local AABB this region
                         // covers. For tiled shaders, it's the tile
@@ -403,16 +415,13 @@ impl EngineState {
                                 tile_index,
                             });
                         } else if info.is_instance_pipeline {
-                            // V1 max instances per region. Stage 6e
-                            // (perf) can revisit if a real workload
-                            // hits the cap.
                             const DEFAULT_MAX_INSTANCES: u32 =
                                 rkp_render::user_shader_emit_pass::DEFAULT_MAX_INSTANCES_PER_REGION;
                             let stride_u32 = info
                                 .instance_struct_size
                                 .map(|s| s.div_ceil(4))
                                 .unwrap_or(8);
-                            let _ = painted_leaf_count;
+                            let leaves = tile_entry.leaves.clone();
                             instance_region_requests.push(
                                 rkp_render::user_shader_emit_pass::InstanceRegionRequest {
                                     host_object_id: obj.object_id,
@@ -433,6 +442,7 @@ impl EngineState {
                                     host_octree_extent,
                                     host_grid_origin: obj.grid_origin,
                                     host_inverse_world: obj.inverse_world,
+                                    leaves,
                                 },
                             );
                         }
@@ -1109,9 +1119,10 @@ fn scan_painted_aabbs(
     grid_origin: glam::Vec3,
     base_voxel_size: f32,
     shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
+    entity_world: Option<glam::Mat4>,
     out: &mut std::collections::HashMap<
         u16,
-        std::collections::HashMap<[i32; 3], (rkp_core::Aabb, u32)>,
+        std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
     >,
 ) {
     use rkp_core::sparse_octree::{
@@ -1120,24 +1131,7 @@ fn scan_painted_aabbs(
     use rkp_core::brick_pool::{BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR};
     const BRICK_CELL_EMPTY: u32 = 0xFFFF_FFFFu32;
 
-    fn expand_aabb(
-        out: &mut std::collections::HashMap<u16, (rkp_core::Aabb, u32)>,
-        mat: u16,
-        mn: glam::Vec3,
-        mx: glam::Vec3,
-    ) {
-        let entry = out.entry(mat).or_insert((
-            rkp_core::Aabb {
-                min: glam::Vec3::splat(f32::INFINITY),
-                max: glam::Vec3::splat(f32::NEG_INFINITY),
-            },
-            0u32,
-        ));
-        entry.0.min = entry.0.min.min(mn);
-        entry.0.max = entry.0.max.max(mx);
-        entry.1 = entry.1.saturating_add(1);
-    }
-
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         octree_data: &[u32],
         brick_pool: &[u32],
@@ -1149,9 +1143,10 @@ fn scan_painted_aabbs(
         grid_origin: glam::Vec3,
         base_vs: f32,
         shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
+        entity_world: Option<glam::Mat4>,
         out: &mut std::collections::HashMap<
             u16,
-            std::collections::HashMap<[i32; 3], (rkp_core::Aabb, u32)>,
+            std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
         >,
     ) {
         use rkp_core::sparse_octree::{
@@ -1175,11 +1170,6 @@ fn scan_painted_aabbs(
                         let cell = brick_pool[pool_idx];
                         if cell == BRICK_CELL_EMPTY || cell == BRICK_INTERIOR { continue; }
                         let attr = leaf_attrs.get(cell);
-                        // Detect both the primary material and any
-                        // partial-blend secondary material — paint
-                        // strokes below full strength write to
-                        // secondary + blend_weight, leaving primary
-                        // unchanged.
                         let primary = attr.material_primary;
                         let secondary: u16 = attr.material_secondary_blend & 0x0FFF;
                         let blend: u16 = (attr.material_secondary_blend >> 12) & 0xF;
@@ -1202,12 +1192,32 @@ fn scan_painted_aabbs(
                                     cell_voxel.y as f32,
                                     cell_voxel.z as f32,
                                 ) * base_vs;
-                            let mx = cell_local + glam::Vec3::splat(base_vs);
-                            let tile_size = shader_materials
-                                .get(&mat)
-                                .and_then(|i| i.tile_size);
+                            let cell_max = cell_local + glam::Vec3::splat(base_vs);
+                            let info = shader_materials.get(&mat);
+                            let tile_size = info.and_then(|i| i.tile_size);
+                            // Build a PaintedLeaf record only for instance
+                            // shaders; Phase C generate shaders ignore
+                            // leaves and we save the allocation.
+                            let leaf = if info.map(|i| i.is_instance_pipeline).unwrap_or(false) {
+                                let cell_center = cell_local + glam::Vec3::splat(base_vs * 0.5);
+                                let local_normal = rkp_core::leaf_attr::unpack_oct(attr.normal_oct);
+                                let (world_pos, world_normal) = transform_leaf(
+                                    cell_center, local_normal, entity_world,
+                                );
+                                let material_packed = (primary as u32)
+                                    | ((secondary as u32) << 16)
+                                    | ((blend as u32) << 28);
+                                Some(rkp_render::user_shader_emit_pass::PaintedLeaf {
+                                    world_pos: world_pos.to_array(),
+                                    material_packed,
+                                    world_normal: world_normal.to_array(),
+                                    _pad: 0.0,
+                                })
+                            } else {
+                                None
+                            };
                             super::lifecycle::expand_aabb(
-                                out, mat, cell_local, mx, tile_size,
+                                out, mat, cell_local, cell_max, tile_size, leaf,
                             );
                         }
                     }
@@ -1229,8 +1239,6 @@ fn scan_painted_aabbs(
                 None
             };
             if let Some(mat) = painted_mat {
-                // Leaf at `level` covers a cube of `2^(max_depth-level)`
-                // voxels per axis at the FINEST resolution.
                 let voxels_per_side = 1u32 << (max_depth - level);
                 let leaf_size = voxels_per_side as f32 * base_vs;
                 let leaf_min = grid_origin
@@ -1240,16 +1248,35 @@ fn scan_painted_aabbs(
                         coord_voxels.z as f32,
                     ) * base_vs;
                 let leaf_max = leaf_min + glam::Vec3::splat(leaf_size);
-                let tile_size = shader_materials.get(&mat).and_then(|i| i.tile_size);
+                let info = shader_materials.get(&mat);
+                let tile_size = info.and_then(|i| i.tile_size);
+                let leaf = if info.map(|i| i.is_instance_pipeline).unwrap_or(false) {
+                    let cell_center = leaf_min + glam::Vec3::splat(leaf_size * 0.5);
+                    let local_normal = rkp_core::leaf_attr::unpack_oct(attr.normal_oct);
+                    let (world_pos, world_normal) = transform_leaf(
+                        cell_center, local_normal, entity_world,
+                    );
+                    let material_packed = (primary as u32)
+                        | ((secondary as u32) << 16)
+                        | ((blend as u32) << 28);
+                    Some(rkp_render::user_shader_emit_pass::PaintedLeaf {
+                        world_pos: world_pos.to_array(),
+                        material_packed,
+                        world_normal: world_normal.to_array(),
+                        _pad: 0.0,
+                    })
+                } else {
+                    None
+                };
                 super::lifecycle::expand_aabb(
-                    out, mat, leaf_min, leaf_max, tile_size,
+                    out, mat, leaf_min, leaf_max, tile_size, leaf,
                 );
             }
             return;
         }
         // Branch — descend into 8 children. `node` is the absolute
         // offset of the first child (rebased at allocation time).
-        let _ = leaf_slot(0);  // silence unused-import warning when no leaves
+        let _ = leaf_slot(0);
         let _ = INTERIOR_NODE;
         if level >= max_depth { return; }
         let child_voxels = 1u32 << (max_depth - level - 1);
@@ -1274,6 +1301,7 @@ fn scan_painted_aabbs(
                 grid_origin,
                 base_vs,
                 shader_materials,
+                entity_world,
                 out,
             );
         }
@@ -1290,9 +1318,34 @@ fn scan_painted_aabbs(
         grid_origin,
         base_voxel_size,
         shader_materials,
+        entity_world,
         out,
     );
     let _ = (is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE, BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR, BRICK_CELL_EMPTY);
+}
+
+/// Transform a leaf's local-space center + normal to world space using
+/// the entity's world matrix. When no matrix is available, the leaf is
+/// treated as already-world (identity transform).
+fn transform_leaf(
+    local_pos: glam::Vec3,
+    local_normal: glam::Vec3,
+    entity_world: Option<glam::Mat4>,
+) -> (glam::Vec3, glam::Vec3) {
+    match entity_world {
+        Some(w) => {
+            let world_pos = w.transform_point3(local_pos);
+            // Normal goes through the inverse-transpose. For a uniform-
+            // scale + rotation transform this is equivalent to the
+            // upper-3x3 of `w` re-normalized; for non-uniform scales
+            // we'd need the inverse-transpose explicitly. V1: use
+            // upper-3x3 directly and renormalize — accurate enough
+            // for grass orientation gating.
+            let world_normal = w.transform_vector3(local_normal).normalize_or_zero();
+            (world_pos, world_normal)
+        }
+        None => (local_pos, local_normal),
+    }
 }
 
 /// Diagnostic — count painted leaves on each side of `mid_x` (in
@@ -1456,35 +1509,34 @@ const NO_TILE_COORD: [i32; 3] = [i32::MIN, i32::MIN, i32::MIN];
 fn expand_aabb(
     out: &mut std::collections::HashMap<
         u16,
-        std::collections::HashMap<[i32; 3], (rkp_core::Aabb, u32)>,
+        std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
     >,
     mat: u16,
     mn: glam::Vec3,
     mx: glam::Vec3,
     tile_size: Option<f32>,
+    leaf: Option<rkp_render::user_shader_emit_pass::PaintedLeaf>,
 ) {
     let mat_map = out.entry(mat).or_default();
 
     fn merge(
-        mat_map: &mut std::collections::HashMap<[i32; 3], (rkp_core::Aabb, u32)>,
+        mat_map: &mut std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
         key: [i32; 3],
         mn: glam::Vec3,
         mx: glam::Vec3,
+        leaf: Option<rkp_render::user_shader_emit_pass::PaintedLeaf>,
     ) {
-        let entry = mat_map.entry(key).or_insert((
-            rkp_core::Aabb {
-                min: glam::Vec3::splat(f32::INFINITY),
-                max: glam::Vec3::splat(f32::NEG_INFINITY),
-            },
-            0u32,
-        ));
-        entry.0.min = entry.0.min.min(mn);
-        entry.0.max = entry.0.max.max(mx);
-        entry.1 = entry.1.saturating_add(1);
+        let entry = mat_map.entry(key).or_insert_with(super::state::PaintedTileEntry::empty);
+        entry.aabb.min = entry.aabb.min.min(mn);
+        entry.aabb.max = entry.aabb.max.max(mx);
+        entry.leaf_count = entry.leaf_count.saturating_add(1);
+        if let Some(l) = leaf {
+            entry.leaves.push(l);
+        }
     }
 
     match tile_size {
-        None => merge(mat_map, NO_TILE_COORD, mn, mx),
+        None => merge(mat_map, NO_TILE_COORD, mn, mx, leaf),
         Some(s) if s > 0.0 => {
             // Compute tile coord range the leaf overlaps. Use a tiny
             // epsilon on the upper bound so a leaf whose max sits
@@ -1496,13 +1548,16 @@ fn expand_aabb(
             for ix in (lo.x as i32)..=(hi.x as i32) {
                 for iy in (lo.y as i32)..=(hi.y as i32) {
                     for iz in (lo.z as i32)..=(hi.z as i32) {
-                        merge(mat_map, [ix, iy, iz], mn, mx);
+                        // Same leaf is appended to every tile it
+                        // overlaps. Tiled instance shaders aren't
+                        // exercised yet but the API stays consistent.
+                        merge(mat_map, [ix, iy, iz], mn, mx, leaf);
                     }
                 }
             }
         }
         // tile_size 0 or negative → treat as non-tiled.
-        Some(_) => merge(mat_map, NO_TILE_COORD, mn, mx),
+        Some(_) => merge(mat_map, NO_TILE_COORD, mn, mx, leaf),
     }
 }
 

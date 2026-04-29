@@ -175,7 +175,16 @@ impl RkpRenderer {
     }
 
     pub fn upload_frame(&mut self, queue: &wgpu::Queue, data: &FrameUpload) {
+        let prev_epoch = self.scene.buffers_epoch();
         self.scene.upload_frame(&self.device, queue, data);
+        if self.scene.buffers_epoch() != prev_epoch {
+            // `bone_matrices_buffer` and `bone_dual_quats_buffer` start
+            // life as 64 B placeholders and grow on the first non-empty
+            // upload. `skin_deform`'s scene bg references both
+            // (bindings 5 + 11), so a realloc here invalidates it.
+            // Matches the refresh in `upload_geometry`.
+            self.skin_deform.refresh_scene_bind_group(&self.device, &self.scene);
+        }
     }
 
     /// Render one frame into `viewport`. Dispatches into the VR's own

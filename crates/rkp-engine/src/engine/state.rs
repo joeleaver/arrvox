@@ -11,6 +11,30 @@
 
 use rkp_render::rkp_gpu_object::RkpGpuObject;
 use rkp_render::rkp_scene_manager::RkpSceneManager;
+use rkp_render::user_shader_emit_pass::PaintedLeaf;
+
+/// One tile's worth of painted-material info: AABB + count + the
+/// leaves themselves (only populated for instance-pipeline shaders;
+/// Phase C generate shaders ignore the leaves vec).
+#[derive(Debug, Clone)]
+pub(crate) struct PaintedTileEntry {
+    pub aabb: rkp_core::Aabb,
+    pub leaf_count: u32,
+    pub leaves: Vec<PaintedLeaf>,
+}
+
+impl PaintedTileEntry {
+    pub fn empty() -> Self {
+        Self {
+            aabb: rkp_core::Aabb {
+                min: glam::Vec3::splat(f32::INFINITY),
+                max: glam::Vec3::splat(f32::NEG_INFINITY),
+            },
+            leaf_count: 0,
+            leaves: Vec::new(),
+        }
+    }
+}
 
 use crate::camera::CameraControlState;
 
@@ -226,7 +250,7 @@ pub(crate) struct EngineState {
         u32,
         std::collections::HashMap<
             u16,
-            std::collections::HashMap<[i32; 3], (rkp_core::Aabb, u32)>,
+            std::collections::HashMap<[i32; 3], PaintedTileEntry>,
         >,
     >,
     /// Epochs the cache was last reconciled against. When either

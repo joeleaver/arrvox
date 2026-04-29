@@ -9,6 +9,22 @@
 
 use crate::rkp_gpu_object::RkpGpuObject;
 
+/// Option B proto-buffer capacities. Sized once at construction —
+/// these buffers are NOT shared with the user-shader-cache tail, so
+/// growing them is unnecessary (the per-shader bake fits comfortably
+/// in the V1 caps; bigger prototypes are a future refactor).
+///
+/// Engine-side `INSTANCE_PROTO_*_CAPACITY_*` constants must stay in
+/// sync with these — the engine sub-allocates within. Total ≈ 3 MB
+/// across all three buffers.
+///
+/// 64K octree nodes × 8 bytes = 512 KB.
+pub const PROTO_OCTREE_CAPACITY_BYTES: u64 = 64 * 1024 * 8;
+/// 8K bricks × 64 cells × 4 bytes = 2 MB.
+pub const PROTO_BRICK_CAPACITY_BYTES: u64 = 8 * 1024 * 64 * 4;
+/// 64K leaf-attr slots × 8 bytes = 512 KB.
+pub const PROTO_LEAF_ATTR_CAPACITY_BYTES: u64 = 64 * 1024 * 8;
+
 /// Camera uniforms matching the WGSL `CameraUniforms` struct.
 ///
 /// Layout (208 + 16 = 224 bytes):
@@ -152,6 +168,16 @@ pub struct RkpScene {
     /// `SkinnedBinding.bone_dq_offset` order. The scatter's DQS branch
     /// reads this directly; the matrix palette is only used by LBS.
     pub bone_dual_quats_buffer: wgpu::Buffer,
+    /// Option B prototype octree-nodes buffer. Dedicated so the proto
+    /// sub-pool doesn't stack on top of `octree_nodes_buffer`'s
+    /// MAX_GLOBAL user-shader tail (which would push the shared buffer
+    /// past memory/binding limits when even one Option B shader is
+    /// loaded). Sized at construction; never grows. Bake writes here
+    /// at offsets reported by the proto cache; march reads here via
+    /// its own group0 bindings (3/4/5).
+    pub proto_octree_buffer: wgpu::Buffer,
+    pub proto_brick_buffer: wgpu::Buffer,
+    pub proto_leaf_attr_buffer: wgpu::Buffer,
     pub bind_group_layout: wgpu::BindGroupLayout,
     /// Incremented whenever a shared buffer reallocates. Each VR caches
     /// the epoch it built its bind group at; rebuilds when the scene's
@@ -191,6 +217,23 @@ impl RkpScene {
         // even before any skinned entity is loaded.
         let bone_dual_quats_buffer = Self::create_storage(device, "rkp_bone_dual_quats", 32);
 
+        // Option B proto sub-pool — sized once at construction. The
+        // V1 caps (64K nodes / 8K bricks / 64K leaf-attrs ≈ 3 MB total)
+        // come from `INSTANCE_PROTO_*_CAPACITY` in render_worker.rs.
+        // Mirroring the totals here (rather than importing across the
+        // crate boundary) keeps `RkpScene` standalone; the engine
+        // verifies via `PROTO_*_CAPACITY_BYTES` in lib.rs that its
+        // configured caps fit.
+        let proto_octree_buffer = Self::create_storage(
+            device, "rkp_proto_octree", PROTO_OCTREE_CAPACITY_BYTES,
+        );
+        let proto_brick_buffer = Self::create_storage(
+            device, "rkp_proto_brick", PROTO_BRICK_CAPACITY_BYTES,
+        );
+        let proto_leaf_attr_buffer = Self::create_storage(
+            device, "rkp_proto_leaf_attr", PROTO_LEAF_ATTR_CAPACITY_BYTES,
+        );
+
         let bind_group_layout = Self::create_layout(device);
 
         Self {
@@ -200,6 +243,7 @@ impl RkpScene {
             bone_field_buffer, bone_field_capacity,
             bone_field_occ_buffer, bone_field_occ_capacity,
             bone_dual_quats_buffer,
+            proto_octree_buffer, proto_brick_buffer, proto_leaf_attr_buffer,
             bind_group_layout,
             buffers_epoch: 0,
         }
@@ -272,50 +316,6 @@ impl RkpScene {
         bumped |= Self::ensure_capacity(
             device, &mut self.brick_face_links_buffer, "rkp_brick_face_links",
             cpu_brick_face_links_bytes + extra_brick_face_links_bytes,
-        );
-        if bumped {
-            self.buffers_epoch += 1;
-        }
-        bumped
-    }
-
-    /// Option B (instance pipeline) — reserve a SECOND tail past the
-    /// user-shader-cache tail for the prototype cache's bake outputs.
-    /// `prior_*_bytes` is the byte offset where the proto sub-pool
-    /// begins (i.e. `cpu_*_bytes + extra_user_shader_*_bytes`); the
-    /// proto tail runs from there for `extra_proto_*_bytes`.
-    ///
-    /// Buffer layout:
-    /// ```text
-    ///   [0 ........... cpu_size) ........... persistent host data
-    ///   [cpu .. cpu+user_shader_extra) ..... user-shader-cache tail
-    ///   [.. .. prior_size+proto_extra) ..... proto sub-pool (this fn)
-    /// ```
-    /// Bumps `buffers_epoch` on growth. Same wgpu binding-size cap
-    /// applies (clamps with a one-line eprintln when the proto
-    /// reservation would push past it).
-    pub fn ensure_proto_pool_capacity(
-        &mut self,
-        device: &wgpu::Device,
-        prior_octree_bytes: u64,
-        extra_proto_octree_bytes: u64,
-        prior_brick_bytes: u64,
-        extra_proto_brick_bytes: u64,
-        prior_leaf_attr_bytes: u64,
-        extra_proto_leaf_attr_bytes: u64,
-    ) -> bool {
-        let mut bumped = false;
-        bumped |= Self::ensure_capacity(
-            device, &mut self.octree_nodes_buffer, "rkp_octree_nodes",
-            prior_octree_bytes + extra_proto_octree_bytes,
-        );
-        bumped |= Self::ensure_capacity(
-            device, &mut self.brick_pool_buffer, "rkp_brick_pool",
-            prior_brick_bytes + extra_proto_brick_bytes,
-        );
-        bumped |= Self::ensure_capacity(
-            device, &mut self.leaf_attr_pool_buffer, "rkp_leaf_attr_pool",
-            prior_leaf_attr_bytes + extra_proto_leaf_attr_bytes,
         );
         if bumped {
             self.buffers_epoch += 1;

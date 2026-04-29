@@ -285,6 +285,15 @@ struct RenderState {
     /// Capacity of `instance_proto_lookup_buffer` in entries (32 B each).
     instance_proto_lookup_capacity_entries: u32,
 
+    /// Per-frame flat `array<PaintedLeaf>` storage buffer. Holds every
+    /// region's painted leaves concatenated end-to-end; the emit
+    /// shader's region uniform carries `leaf_offset`/`leaf_count` to
+    /// index into this. Grown to the high-water of total leaves.
+    instance_leaves_buffer: wgpu::Buffer,
+    /// Capacity of `instance_leaves_buffer` in `PaintedLeaf` entries
+    /// (32 B each).
+    instance_leaves_capacity_entries: u32,
+
     /// Pick readback target. 1×1 region of the gbuf_material at offset
     /// 0, 1×1 region of the gbuf_pick at offset 256 — both 256-byte
     /// aligned per wgpu's copy alignment rules.
@@ -460,6 +469,7 @@ impl RenderState {
         // and skips iteration).
         const INSTANCE_TILE_INDEX_INITIAL_ENTRIES: u32 = 1;
         const INSTANCE_PROTO_LOOKUP_INITIAL_ENTRIES: u32 = 1;
+        const INSTANCE_LEAVES_INITIAL_ENTRIES: u32 = 1;
         let instance_tile_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("inst tile_index"),
             size: (INSTANCE_TILE_INDEX_INITIAL_ENTRIES as u64) * 32,
@@ -469,6 +479,12 @@ impl RenderState {
         let instance_proto_lookup_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("inst proto_lookup"),
             size: (INSTANCE_PROTO_LOOKUP_INITIAL_ENTRIES as u64) * 32,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let instance_leaves_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("inst leaves"),
+            size: (INSTANCE_LEAVES_INITIAL_ENTRIES as u64) * 32,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -491,6 +507,8 @@ impl RenderState {
             instance_tile_index_capacity_entries: INSTANCE_TILE_INDEX_INITIAL_ENTRIES,
             instance_proto_lookup_buffer,
             instance_proto_lookup_capacity_entries: INSTANCE_PROTO_LOOKUP_INITIAL_ENTRIES,
+            instance_leaves_buffer,
+            instance_leaves_capacity_entries: INSTANCE_LEAVES_INITIAL_ENTRIES,
             pick_readback_buffer,
             pick_in_flight: None,
             curr_snap: None,
@@ -1350,10 +1368,15 @@ fn render_one_frame(
         // G-buffer through to `instance_merged_gbuffer` unchanged. Stage
         // 6c-4 rebinds shade to read from `instance_merged_gbuffer` so
         // the overlay becomes visible.
+        // Group 0 binds the dedicated proto sub-pool buffers — the
+        // march helpers' octree_nodes/brick_pool/leaf_attr_pool symbols
+        // resolve to PROTO data here. (Host geometry reads happen only
+        // in the emit pass, which has its own bindings.) The shared
+        // `scene.*_buffer`s no longer need to make room for proto.
         let overlay_inputs = rkp_render::InstanceOverlayInputs {
-            octree_nodes: &state.renderer.scene.octree_nodes_buffer,
-            brick_pool: &state.renderer.scene.brick_pool_buffer,
-            leaf_attr_pool: &state.renderer.scene.leaf_attr_pool_buffer,
+            octree_nodes: &state.renderer.scene.proto_octree_buffer,
+            brick_pool: &state.renderer.scene.proto_brick_buffer,
+            leaf_attr_pool: &state.renderer.scene.proto_leaf_attr_buffer,
             regions: &state.instance_emit_pass.regions_buffer,
             instance_pool: &state.instance_pool_buffer,
             instance_alloc: &state.instance_emit_pass.instance_alloc_buffer,
@@ -1660,11 +1683,9 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
     use rkp_render::instance_tile_index::TileIndexBuilder;
     use rkp_render::instance_tile_index_gpu::flatten_tile_index;
     use rkp_render::user_shader_emit_pass::{
-        build_emit_region_uniform, resolve_instance_shader, samples_per_axis,
-        EmitDispatchUniform, EMIT_DISPATCH_UNIFORM_STRIDE,
-    };
-    use rkp_render::user_shader_pass::{
-        BRICK_CELLS, MAX_GLOBAL_BRICKS, MAX_GLOBAL_LEAF_ATTRS, MAX_GLOBAL_OCTREE_NODES,
+        build_emit_region_uniform, resolve_instance_shader,
+        workgroups_for_leaf_count, EmitDispatchUniform, EMIT_DISPATCH_UNIFORM_STRIDE,
+        PaintedLeaf,
     };
     use rkp_render::user_shader_proto_pass::{
         build_internal_levels, PrototypeUniform, MAX_PROTO_DISPATCH_BATCH, MAX_PROTO_MAX_DEPTH,
@@ -1686,17 +1707,18 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
     state.instance_proto_cache.begin_frame();
     state.instance_region_cache.begin_frame();
 
-    // 3. Early-out when there's no work AT ALL — no instance shaders in
-    //    the registry and no requests in the snapshot. This is the
-    //    production state today (sim ships empty
-    //    `instance_region_requests`, registry only has shade/generate
-    //    shaders). Skipping the reservation + dispatch keeps overhead
-    //    on the no-op path at zero.
-    let any_instance_shader = frame
-        .user_shader_infos
-        .iter()
-        .any(|info| info.is_instance_pipeline);
-    if !any_instance_shader && frame.instance_region_requests.is_empty() {
+    // 3. Early-out when there are no requests this frame. The
+    //    user_shader-tail + proto-pool reservations below grow
+    //    `brick_pool_buffer` / `leaf_attr_pool_buffer` by ~768 MB
+    //    (`MAX_GLOBAL_BRICKS × 64 × 4`) plus a small proto sub-pool;
+    //    on scenes whose CPU brick footprint already runs into the
+    //    hundreds of MB this pushes past the 1 GB
+    //    `max_storage_buffer_binding_size` we request, leaving the
+    //    reallocated buffers in an invalid state. Reserve lazily —
+    //    same shape as `run_user_shader_geom`'s `regions.is_empty()`
+    //    early-out — so we only pay the cost when there's actual
+    //    instance work to dispatch.
+    if frame.instance_region_requests.is_empty() {
         state.instance_proto_cache.evict_untouched();
         state.instance_region_cache.evict_untouched();
         return InstancePerFrameCounts::default();
@@ -1714,72 +1736,21 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             g.brick_face_links.len() as u64,
         )
     };
-    let user_shader_extra_octree: u64 = MAX_GLOBAL_OCTREE_NODES as u64 * 8;
-    let user_shader_extra_brick: u64 = MAX_GLOBAL_BRICKS as u64 * BRICK_CELLS as u64 * 4;
-    let user_shader_extra_leaf: u64 = MAX_GLOBAL_LEAF_ATTRS as u64 * 8;
-    let user_shader_extra_face_links: u64 = MAX_GLOBAL_BRICKS as u64 * 6 * 4;
+    // 5. Proto sub-pool lives in DEDICATED `RkpScene::proto_*_buffer`
+    //    fixed-size buffers, so no reservation here. Previously this
+    //    path stacked `cpu + user_shader_extras + proto_extras` onto
+    //    the shared `brick_pool_buffer` / `leaf_attr_pool_buffer` just
+    //    to compute proto base offsets — which pushed the shared
+    //    buffers past memory limits as soon as one Option B shader
+    //    loaded. The user-shader tail itself is still reserved by
+    //    `run_user_shader_geom` on demand. The cpu_*_bytes + face_links
+    //    snapshot above is now unused but kept for the cap-check log.
+    let _ = (cpu_octree_bytes, cpu_brick_bytes, cpu_leaf_attr_bytes, cpu_face_links_bytes);
 
-    let proto_extra_octree: u64 = (INSTANCE_PROTO_OCTREE_CAPACITY_U32 as u64) * 8;
-    let proto_extra_brick: u64 =
-        (INSTANCE_PROTO_BRICK_CAPACITY_BRICKS as u64) * (BRICK_CELLS as u64) * 4;
-    let proto_extra_leaf: u64 = (INSTANCE_PROTO_LEAF_ATTR_CAPACITY_U32 as u64) * 8;
-
-    // 5a. Reserve user-shader tail (always — proto base is computed
-    //     past it regardless of whether the user-shader pass runs).
-    let realloc_user = state.renderer.scene.ensure_user_shader_capacity(
-        &state.device,
-        cpu_octree_bytes, user_shader_extra_octree,
-        cpu_brick_bytes, user_shader_extra_brick,
-        cpu_leaf_attr_bytes, user_shader_extra_leaf,
-        cpu_face_links_bytes, user_shader_extra_face_links,
-    );
-
-    // 5b. Reserve proto sub-pool past the user-shader tail.
-    let prior_octree = cpu_octree_bytes + user_shader_extra_octree;
-    let prior_brick = cpu_brick_bytes + user_shader_extra_brick;
-    let prior_leaf = cpu_leaf_attr_bytes + user_shader_extra_leaf;
-    let realloc_proto = state.renderer.scene.ensure_proto_pool_capacity(
-        &state.device,
-        prior_octree, proto_extra_octree,
-        prior_brick, proto_extra_brick,
-        prior_leaf, proto_extra_leaf,
-    );
-
-    if realloc_user || realloc_proto {
-        // Existing data is gone (`ensure_capacity` allocates a fresh
-        // buffer on growth). Re-upload geometry + reset the user-shader
-        // face-links tail.
-        let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
-        let g = sm.geometry_upload();
-        state.renderer.upload_geometry(&state.queue, &g);
-        state.last_uploaded_geometry_epoch = sm.geometry_epoch();
-        drop(sm);
-        const FACE_INIT_CHUNK: usize = 4 * 1024 * 1024;
-        const FACE_EMPTY: u32 = 0xFFFFFFFFu32;
-        let chunk_data: Vec<u32> = vec![FACE_EMPTY; FACE_INIT_CHUNK];
-        let mut written: u64 = 0;
-        while written < user_shader_extra_face_links {
-            let remaining = (user_shader_extra_face_links - written) as usize;
-            let this_chunk_bytes = (FACE_INIT_CHUNK * 4).min(remaining);
-            state.queue.write_buffer(
-                &state.renderer.scene.brick_face_links_buffer,
-                cpu_face_links_bytes + written,
-                bytemuck::cast_slice(&chunk_data[..this_chunk_bytes / 4]),
-            );
-            written += this_chunk_bytes as u64;
-        }
-    }
-
-    // 6. Configure proto cache pool bases. Setting bases with the same
-    //    values is a no-op; a change flushes the cache.
-    let proto_octree_base = (prior_octree / 8) as u32;
-    let proto_brick_base = (prior_brick / 4 / BRICK_CELLS as u64) as u32;
-    let proto_leaf_base = (prior_leaf / 8) as u32;
-    state.instance_proto_cache.set_pool_bases(
-        proto_octree_base,
-        proto_brick_base,
-        proto_leaf_base,
-    );
+    // 6. Pool bases are 0 — proto offsets are absolute within the
+    //    dedicated proto buffers. set_pool_bases short-circuits on
+    //    no-op so calling unconditionally is cheap.
+    state.instance_proto_cache.set_pool_bases(0, 0, 0);
 
     // 7. Walk requests, look up cache, gather dirty bakes + scatters.
     struct DirtyBake {
@@ -1790,12 +1761,16 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
     struct Scatter {
         region_uniform: rkp_render::user_shader_emit_pass::EmitRegionUniform,
         region_index: u32,
-        samples_per_axis: u32,
+        leaf_count: u32,
         instance_alloc_offset_bytes: u64,
     }
     let mut dirty_bakes: Vec<DirtyBake> = Vec::new();
     let mut scatters: Vec<Scatter> = Vec::new();
     let mut tile_builder = TileIndexBuilder::new();
+    // All regions' leaves concatenated into one upload. Each region's
+    // EmitRegionUniform.leaf_offset is the index of its first leaf
+    // here.
+    let mut leaves_flat: Vec<PaintedLeaf> = Vec::new();
 
     let time_seconds = frame.shade_params_base.time;
     for req in &frame.instance_region_requests {
@@ -1863,16 +1838,23 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             }
         };
 
-        // Assign region_index by walk order.
+        // Assign region_index by walk order. Append this region's
+        // painted leaves onto the flat upload buffer; remember the
+        // start offset so the EmitRegionUniform points at it.
         let region_index = scatters.len() as u32;
+        let leaf_offset = leaves_flat.len() as u32;
+        let leaf_count = req.leaves.len() as u32;
+        leaves_flat.extend_from_slice(&req.leaves);
         let mut slot = cached;
         slot.region_index = region_index;
-        let region_uniform = build_emit_region_uniform(req, &slot, shader_id, time_seconds);
-        let spa = samples_per_axis(req);
+        let region_uniform = build_emit_region_uniform(
+            req, &slot, shader_id, time_seconds, leaf_offset,
+        );
+        let _ = proto_dirty;
         scatters.push(Scatter {
             region_uniform,
             region_index,
-            samples_per_axis: spa,
+            leaf_count,
             instance_alloc_offset_bytes: (region_index as u64) * 4,
         });
 
@@ -1881,7 +1863,6 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             eprintln!("[inst] tile index error: {e}");
         }
     }
-
     // 8. Encode bake + scatter dispatches.
     if !dirty_bakes.is_empty() || !scatters.is_empty() {
         let mut encoder = state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1898,8 +1879,11 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             // offset. `build_internal_levels` returns the entire
             // octree subtree's nodes (internal + EMPTY leaf); the bake
             // fills the leaf level only.
+            // Proto base is 0 — proto octree nodes live in the
+            // dedicated `proto_octree_buffer` at indices reported by
+            // the cache, no shared-pool offset to add.
             let internal = build_internal_levels(
-                proto_octree_base,
+                0,
                 bake.octree_extent_offset,
                 bake.max_depth,
             );
@@ -1909,11 +1893,9 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
                 bytes.extend_from_slice(&v0.to_le_bytes());
                 bytes.extend_from_slice(&v1.to_le_bytes());
             }
-            // Absolute offset = (proto_octree_base + extent_offset) * 8.
-            let octree_byte_offset =
-                (proto_octree_base as u64 + bake.octree_extent_offset as u64) * 8;
+            let octree_byte_offset = bake.octree_extent_offset as u64 * 8;
             state.queue.write_buffer(
-                &state.renderer.scene.octree_nodes_buffer,
+                &state.renderer.scene.proto_octree_buffer,
                 octree_byte_offset,
                 &bytes,
             );
@@ -1935,9 +1917,9 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
                 label: Some("inst bake g0"),
                 layout: &state.instance_proto_pass.group0_layout,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: state.renderer.scene.octree_nodes_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: state.renderer.scene.brick_pool_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: state.renderer.scene.leaf_attr_pool_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 0, resource: state.renderer.scene.proto_octree_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: state.renderer.scene.proto_brick_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: state.renderer.scene.proto_leaf_attr_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 3, resource: state.instance_proto_pass.proto_brick_alloc_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 4, resource: state.instance_proto_pass.proto_leaf_attr_alloc_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 5, resource: state.instance_proto_pass.overflow_buffer.as_entire_binding() },
@@ -1984,6 +1966,19 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
                 &region_bytes,
             );
 
+            // Upload the concatenated leaves buffer. Dispatch fires one
+            // thread per leaf; each region's uniform points at its
+            // leaf range via `leaf_offset` / `leaf_count`.
+            let leaves_needed = leaves_flat.len() as u32;
+            ensure_instance_leaves_capacity(state, leaves_needed.max(1));
+            if !leaves_flat.is_empty() {
+                state.queue.write_buffer(
+                    &state.instance_leaves_buffer,
+                    0,
+                    bytemuck::cast_slice(&leaves_flat),
+                );
+            }
+
             // Dispatch uniforms — one per scatter, EMIT_DISPATCH_UNIFORM_STRIDE
             // apart (256 B per wgpu's dynamic-offset alignment rule).
             let stride = EMIT_DISPATCH_UNIFORM_STRIDE as usize;
@@ -1991,7 +1986,7 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             for (i, s) in scatters.iter().enumerate() {
                 let dispatch_u = EmitDispatchUniform {
                     region_index: s.region_index,
-                    samples_per_axis: s.samples_per_axis,
+                    leaf_count: s.leaf_count,
                     _pad0: 0,
                     _pad1: 0,
                 };
@@ -2032,16 +2027,17 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
 
             // Build bind groups (groups 0 + 1 are stable across
             // dispatches; group 2 takes a dynamic offset per dispatch).
+            // Group 0 binding 2 is the painted-leaves buffer — the
+            // emit shader fetches `leaves[region.leaf_offset + gid]`
+            // directly, no host-octree descent.
             let scatter_g0 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("inst scatter g0"),
                 layout: &state.instance_emit_pass.group0_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: state.instance_pool_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 1, resource: state.instance_emit_pass.instance_alloc_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: state.renderer.scene.octree_nodes_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: state.renderer.scene.brick_pool_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: state.renderer.scene.leaf_attr_pool_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: state.instance_emit_pass.overflow_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: state.instance_leaves_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: state.instance_emit_pass.overflow_buffer.as_entire_binding() },
                 ],
             });
             let scatter_g1 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2068,8 +2064,11 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             });
 
             for (i, s) in scatters.iter().enumerate() {
+                if s.leaf_count == 0 {
+                    continue;
+                }
                 let dynamic_offset = (i * stride) as u32;
-                let wgs_per_axis = s.samples_per_axis.div_ceil(4);
+                let wgs = workgroups_for_leaf_count(s.leaf_count);
                 let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("inst scatter"),
                     timestamp_writes: None,
@@ -2078,10 +2077,9 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
                 cpass.set_bind_group(0, &scatter_g0, &[]);
                 cpass.set_bind_group(1, &scatter_g1, &[]);
                 cpass.set_bind_group(2, &scatter_g2, &[dynamic_offset]);
-                cpass.dispatch_workgroups(wgs_per_axis, wgs_per_axis, wgs_per_axis);
-                // Suppress unused-binding warning for the offset field
-                // (it's read off the request indirectly via dispatch
-                // uniforms — kept on `Scatter` for diagnostics).
+                // 1-D dispatch: `leaf_count.div_ceil(64)` workgroups, 64
+                // threads each → one thread per painted leaf.
+                cpass.dispatch_workgroups(wgs, 1, 1);
                 let _ = s.instance_alloc_offset_bytes;
             }
         }
@@ -2251,6 +2249,25 @@ fn ensure_instance_proto_lookup_capacity(state: &mut RenderState, needed_entries
         mapped_at_creation: false,
     });
     state.instance_proto_lookup_capacity_entries = new_cap;
+}
+
+/// Same shape as `ensure_instance_tile_index_capacity`, for the
+/// per-frame painted-leaves storage buffer (32 B per `PaintedLeaf`).
+fn ensure_instance_leaves_capacity(state: &mut RenderState, needed_entries: u32) {
+    if needed_entries <= state.instance_leaves_capacity_entries {
+        return;
+    }
+    let mut new_cap = state.instance_leaves_capacity_entries.max(1);
+    while new_cap < needed_entries {
+        new_cap = new_cap.saturating_mul(2);
+    }
+    state.instance_leaves_buffer = state.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("inst leaves"),
+        size: (new_cap as u64) * 32,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    state.instance_leaves_capacity_entries = new_cap;
 }
 
 /// User-shader runtime geometry, global-pool + persistent-cache variant.
