@@ -25,6 +25,9 @@ use crate::rkp_shade::RkpShadePass;
 use crate::rkp_volumetric::RkpVolumetricPass;
 use crate::rkp_god_rays::RkpGodRayPass;
 use crate::rkp_grid::RkpGridPass;
+use crate::instance_march_pass::InstanceMarchPass;
+use crate::instance_composite_pass::InstanceCompositePass;
+use crate::instance_merged_gbuffer::{InstanceMergedGBuffer, output_hits_buffer_bytes};
 
 pub struct ViewportRenderer {
     // ── Per-VR scene binding ────────────────────────────────────────
@@ -61,6 +64,25 @@ pub struct ViewportRenderer {
     pub glass: crate::rkp_glass::RkpGlassPass,
     pub volumetric: RkpVolumetricPass,
     pub god_rays: RkpGodRayPass,
+
+    // ── Stage 6c-2: Option B (instance pipeline) per-VR pieces ───────
+    /// V1 march entry — `dispatch_per_pixel(cpass, w, h)` per frame.
+    /// Stage 6c-3 will wire the dispatch + bind groups; today the pass
+    /// is constructed but unused.
+    pub instance_march_pass: InstanceMarchPass,
+    /// Composite pass — overlays `instance_output_hits_buffer` on the
+    /// host G-buffer into `instance_merged_gbuffer`. Dispatch wired in
+    /// Stage 6c-3.
+    pub instance_composite_pass: InstanceCompositePass,
+    /// Output target for the composite. Same formats as `gbuffer`'s
+    /// primary four. Stage 6c-4 rebinds the shade pass to read from
+    /// here instead of `gbuffer` so instance hits land in the final
+    /// image.
+    pub instance_merged_gbuffer: InstanceMergedGBuffer,
+    /// `array<InstanceMarchHit>` storage buffer — one slot per pixel,
+    /// 48 B each. The march writes here; the composite reads. Sized
+    /// to match `width * height` and resized in `resize()`.
+    pub instance_output_hits_buffer: wgpu::Buffer,
 
     // ── Per-VR render targets + post-process ───────────────────────
     pub gbuffer: crate::GBuffer,
@@ -233,10 +255,20 @@ impl ViewportRenderer {
 
         let lights_materials_epoch = renderer.lights_materials_epoch();
 
+        // Stage 6c-2: Option B instance pipeline per-VR pieces.
+        // Constructed but not dispatched — Stage 6c-3 wires the
+        // bake/scatter + per-frame dispatch sequence.
+        let instance_march_pass = InstanceMarchPass::new(device);
+        let instance_composite_pass = InstanceCompositePass::new(device);
+        let instance_merged_gbuffer = InstanceMergedGBuffer::new(device, width, height);
+        let instance_output_hits_buffer = make_output_hits_buffer(device, width, height);
+
         Self {
             camera_buffer, scene_bind_group, scene_epoch, lights_materials_epoch,
             march, proc_raymarch, proc_outline, proc_ghost,
             shadow_trace, ssao, shade, glass, volumetric, god_rays,
+            instance_march_pass, instance_composite_pass,
+            instance_merged_gbuffer, instance_output_hits_buffer,
             gbuffer, pick_texture, pick_view, bloom, bloom_composite, tone_map,
             composite_texture, composite_view,
             readback,
@@ -369,6 +401,13 @@ impl ViewportRenderer {
         // is stable across resize so it doesn't need re-wiring).
         self.grid.set_bindings(device, &self.camera_buffer, &self.gbuffer.position_view);
 
+        // Stage 6c-2: rebuild the instance pipeline's per-resolution
+        // resources. The pipeline objects (`instance_march_pass`,
+        // `instance_composite_pass`) hold no resolution state, so they
+        // survive the resize untouched.
+        self.instance_merged_gbuffer = InstanceMergedGBuffer::new(device, width, height);
+        self.instance_output_hits_buffer = make_output_hits_buffer(device, width, height);
+
         // Env-dirty path applies bloom/tonemap params — the engine re-fires it
         // after a resize so VRs rebuilt their bloom/tonemap from defaults here
         // end up with scene-correct values on the next frame.
@@ -412,6 +451,33 @@ impl ViewportRenderer {
         );
         Some(idx)
     }
+}
+
+/// Allocate the per-pixel `InstanceMarchHit` storage buffer at the
+/// given viewport size. Stage 6c-3 binds it as `output_hits` for the
+/// march dispatch and as the storage RO source for the composite. A
+/// new buffer is allocated on every resize — buffers are cheap to
+/// recreate and the alternative (track high-water + grow) would
+/// complicate the bind-group invalidation story when sizing shrinks.
+fn make_output_hits_buffer(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> wgpu::Buffer {
+    // 16 B floor so a (0, 0)-sized viewport (e.g. before the first
+    // resize) still produces a buffer that satisfies wgpu's minimum
+    // size requirement and matches the binding's `min_binding_size`
+    // (one InstanceMarchHit = 48 B; we round up to be conservative).
+    let raw = output_hits_buffer_bytes(width, height);
+    let size = raw.max(64);
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("inst output_hits"),
+        size,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    })
 }
 
 /// Triple-buffered async readback. The engine writes the composite into

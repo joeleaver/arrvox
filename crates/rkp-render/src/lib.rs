@@ -111,6 +111,11 @@ pub mod instance_march_pass;
 /// host's depth, overwrite position/normal/material/leaf_slot with the
 /// instance data; otherwise pass the host data through.
 pub mod instance_composite_pass;
+/// Option B Stage 6c-2 — output target for the composite pass. Sibling
+/// of `crate::gbuffer::GBuffer`'s primary four targets (position,
+/// normal, material, leaf_slot) at the same formats; consumed by Stage
+/// 6c-4's shade rebind.
+pub mod instance_merged_gbuffer;
 /// Skeletal skin-deform scatter pass — per-frame bone-field writer.
 pub mod skin_deform;
 /// CPU-side paint writes against the scene's LeafAttrPool (material +
