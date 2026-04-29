@@ -123,6 +123,20 @@ pub struct RenderFrame {
     /// identity stub returns a "skip" emit.
     pub user_shader_generate_chunk: String,
 
+    /// Composed user-shader chunk for the Option B prototype bake pass.
+    /// Defines `dispatch_user_proto(...)`. Spliced into
+    /// `user_shader_proto.wgsl` between its USER_PROTO_DISPATCH markers.
+    /// Empty when no shader declares an `@instance_proto`; the in-tree
+    /// identity stub returns a `voxel_emit_skip()`.
+    pub user_shader_proto_chunk: String,
+
+    /// Composed user-shader chunk for the Option B per-region instance
+    /// scatter pass. Defines per-shader `rkp_user_<id>_emit_instance` +
+    /// `dispatch_user_emit(...)`. Spliced into `user_shader_emit.wgsl`
+    /// between its USER_EMIT_DISPATCH markers. Empty when no instance
+    /// shader is registered.
+    pub user_shader_emit_chunk: String,
+
     /// Editor snapshots of all currently-registered user shaders.
     /// `UserShaderPass` reads metadata (animated, region_thickness,
     /// cell_size, has_generate, params order) from this list. Mirrors

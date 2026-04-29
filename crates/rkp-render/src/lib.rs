@@ -126,7 +126,7 @@ pub mod paint;
 
 pub use octree_gpu::OctreeGpu;
 pub use rkp_scene_manager::{AssetHandle, AssetInfo, ReloadResult, RkpSceneManager, SkinBrick, SkinningAssetData};
-pub use viewport_renderer::ViewportRenderer;
+pub use viewport_renderer::{InstanceOverlayInputs, ViewportRenderer};
 pub use skin_deform::{SkinBatchScratch, SkinBrickEntry, SkinDeformPass, SkinDispatch, SkinUniforms};
 
 /// What a viewport's render pipeline should look like.

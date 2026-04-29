@@ -261,13 +261,28 @@ struct RenderState {
     /// Default capacity = 4 M u32s = 16 MB — modest first-cut. Stage 6e
     /// (perf) can raise toward `MAX_GLOBAL_INSTANCE_U32S` (256 MB) if
     /// instance shader workloads start bumping the cap.
-    #[allow(dead_code)]
     instance_pool_buffer: wgpu::Buffer,
     /// Cached u32 capacity of `instance_pool_buffer`. Mirrors what was
     /// passed to `InstanceRegionCache::with_capacity`. Used for
     /// resize / overflow telemetry.
     #[allow(dead_code)]
     instance_pool_capacity_u32: u32,
+
+    /// Per-frame flat `array<GpuTileIndexEntry>` storage buffer. Built
+    /// each frame by `flatten_tile_index(...)` over the touched cache
+    /// entries; consumed by the per-VR instance march. Grown to the
+    /// high-water of `flatten_tile_index().len()`.
+    instance_tile_index_buffer: wgpu::Buffer,
+    /// Capacity of `instance_tile_index_buffer` in entries (32 B each).
+    instance_tile_index_capacity_entries: u32,
+
+    /// Per-frame flat `array<GpuPrototypeEntry>` storage buffer. Built
+    /// each frame by `flatten_prototype_lookup(...)` over the registry
+    /// + proto cache; consumed by the per-VR instance march to translate
+    /// `shader_id → prototype octree_root + instance struct layout`.
+    instance_proto_lookup_buffer: wgpu::Buffer,
+    /// Capacity of `instance_proto_lookup_buffer` in entries (32 B each).
+    instance_proto_lookup_capacity_entries: u32,
 
     /// Pick readback target. 1×1 region of the gbuf_material at offset
     /// 0, 1×1 region of the gbuf_pick at offset 256 — both 256-byte
@@ -414,6 +429,30 @@ impl RenderState {
         // are absolute u32 indices into `instance_pool_buffer`.
         instance_region_cache.set_pool_base(0);
 
+        // Per-frame TileIndex + ProtoLookup storage buffers. Sized to
+        // hold a single 32 B entry at startup; grown later via
+        // `ensure_instance_tile_index_capacity` / `..._proto_lookup_..`
+        // when `flatten_*` produces a longer result. Bound every frame
+        // by `dispatch_instance_overlay`; passing a min-size buffer
+        // when both lists are empty satisfies wgpu's requirement that
+        // a `storage` binding refer to a non-zero-size buffer (the
+        // shader still reads `tile_index_count == 0` from MarchUniforms
+        // and skips iteration).
+        const INSTANCE_TILE_INDEX_INITIAL_ENTRIES: u32 = 1;
+        const INSTANCE_PROTO_LOOKUP_INITIAL_ENTRIES: u32 = 1;
+        let instance_tile_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("inst tile_index"),
+            size: (INSTANCE_TILE_INDEX_INITIAL_ENTRIES as u64) * 32,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let instance_proto_lookup_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("inst proto_lookup"),
+            size: (INSTANCE_PROTO_LOOKUP_INITIAL_ENTRIES as u64) * 32,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             device,
             queue,
@@ -428,6 +467,10 @@ impl RenderState {
             instance_region_cache,
             instance_pool_buffer,
             instance_pool_capacity_u32: INSTANCE_POOL_CAPACITY_U32,
+            instance_tile_index_buffer,
+            instance_tile_index_capacity_entries: INSTANCE_TILE_INDEX_INITIAL_ENTRIES,
+            instance_proto_lookup_buffer,
+            instance_proto_lookup_capacity_entries: INSTANCE_PROTO_LOOKUP_INITIAL_ENTRIES,
             pick_readback_buffer,
             pick_in_flight: None,
             curr_snap: None,
@@ -1038,13 +1081,14 @@ fn render_one_frame(
     //      attr layout — so no shader-side branching is needed.
     let transient_objects = run_user_shader_geom(state, frame);
 
-    // 1.7b. Option B (instance pipeline) per-frame tick. Stages 6c-1/2/3
-    //       wire the caches + state holders + per-viewport resources +
-    //       request-flow-into-engine. Stage 6c-3.5 follows this with
-    //       the real bake/scatter dispatch + per-viewport march/composite.
-    //       Today the caches see zero requests per frame and
-    //       `evict_untouched` simply releases nothing.
-    tick_instance_pipeline(state, frame);
+    // 1.7b. Option B (instance pipeline) per-frame tick. Stage 6c-3.5b
+    //       extends 6c-3 by reloading the bake/emit pipelines, building
+    //       (currently empty) TileIndex + ProtoLookup, and uploading
+    //       them to per-frame storage buffers. Stage 6c-3.5c will
+    //       additionally dispatch bake + scatter once the prototype
+    //       cache's pool reservation lands inside `RkpScene`'s global
+    //       buffers.
+    let instance_counts = tick_instance_pipeline(state, frame);
 
     let mut combined_objects: Vec<rkp_render::rkp_gpu_object::RkpGpuObject>;
     let gpu_objects_for_upload: &[rkp_render::rkp_gpu_object::RkpGpuObject] =
@@ -1274,6 +1318,33 @@ fn render_one_frame(
             &vp.atmo_frame,
             vp.mode,
             vp.preview_mode,
+        );
+
+        // 3h.5. Stage 6c-3.5b — per-VR Option B instance overlay.
+        // Encodes both the per-pixel march and the G-buffer composite.
+        // Until Stage 6c-3.5c lands the bake/scatter half, both
+        // `tile_index_count` and `proto_lookup_count` are 0; the march
+        // writes hit=0 to every pixel and the composite passes the host
+        // G-buffer through to `instance_merged_gbuffer` unchanged. Stage
+        // 6c-4 rebinds shade to read from `instance_merged_gbuffer` so
+        // the overlay becomes visible.
+        let overlay_inputs = rkp_render::InstanceOverlayInputs {
+            octree_nodes: &state.renderer.scene.octree_nodes_buffer,
+            brick_pool: &state.renderer.scene.brick_pool_buffer,
+            leaf_attr_pool: &state.renderer.scene.leaf_attr_pool_buffer,
+            regions: &state.instance_emit_pass.regions_buffer,
+            instance_pool: &state.instance_pool_buffer,
+            instance_alloc: &state.instance_emit_pass.instance_alloc_buffer,
+            tile_index: &state.instance_tile_index_buffer,
+            proto_lookup: &state.instance_proto_lookup_buffer,
+            tile_index_count: instance_counts.tile_index_count,
+            proto_lookup_count: instance_counts.proto_lookup_count,
+        };
+        vr.dispatch_instance_overlay(
+            &state.device,
+            &state.queue,
+            &mut encoder,
+            &overlay_inputs,
         );
 
         // 3i. Pick encode — if there's a pending pick targeted at this
@@ -1544,51 +1615,166 @@ fn splice_transient_into_tile_lists(
 ///   - `fill_hash` — shader source + params + paint epoch + time
 ///     (when @animated). fill can be skipped when unchanged AND
 ///     topology unchanged.
-/// Stage 6c-3 — per-frame tick for the Option B instance pipeline.
+/// Stage 6c-3.5b — per-frame tick for the Option B instance pipeline.
 ///
-/// Currently:
+/// Today:
+///   - Reload the bake + emit pipelines against the composed proto +
+///     emit chunks (no-op when source hash unchanged).
 ///   - `begin_frame` both caches.
-///   - Walk `frame.instance_region_requests` for diagnostics.
+///   - Walk `frame.instance_region_requests`. **Bake/scatter dispatch
+///     is NOT wired yet** (Stage 6c-3.5c will add it once the proto
+///     cache's pool reservation lands inside `RkpScene`'s global
+///     octree/brick/leaf-attr buffers). For now: log the request count
+///     and proceed with empty cache state.
+///   - `flatten_tile_index` over the (currently empty) cache's
+///     touched keys → upload to `instance_tile_index_buffer`.
+///   - `flatten_prototype_lookup` over the registry + (currently
+///     empty) proto cache → upload to `instance_proto_lookup_buffer`.
 ///   - `evict_untouched` both caches.
 ///
-/// Stage 6c-3.5 will extend this to:
-///   - For each request: `lookup_or_allocate` against the proto cache;
-///     if dirty, dispatch the bake.
-///   - For each request: `lookup_or_allocate` against the region cache;
-///     if dirty, dispatch the scatter.
-///   - Build `TileIndex` from `instance_region_cache.touched_keys()` +
-///     region indices; `flatten_tile_index` + upload to a per-frame
-///     storage buffer.
-///   - `flatten_prototype_lookup` + upload to a second per-frame
-///     storage buffer.
-///   - For each viewport: write `MarchUniforms`, dispatch march +
-///     composite (Stages 6a/6b APIs).
-///
-/// Critically, **6c-3 doesn't call `lookup_or_allocate`** — that would
-/// allocate cache slots that no GPU dispatch fills, leaking pool
-/// extents. The cache stays empty until 6c-3.5 lands the dispatch
-/// half. The `begin_frame` / `evict_untouched` calls stay in case a
-/// future test or external path adds entries directly.
-fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) {
+/// The per-VR `dispatch_instance_overlay` (called by `render_one_frame`
+/// after this) sees `tile_index_count == 0` and `proto_lookup_count
+/// == 0` for every frame until 6c-3.5c lands; the march writes
+/// `hit=0` to every pixel and the composite passes the host G-buffer
+/// through unchanged. Validated end-to-end by the
+/// `instance_overlay_empty.rs` GPU test (Stage 6c-3.5a).
+fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> InstancePerFrameCounts {
+    use rkp_render::instance_tile_index::TileIndexBuilder;
+    use rkp_render::instance_tile_index_gpu::flatten_tile_index;
+
+    // 1. Pipeline reload — cheap when source hash unchanged.
+    state.instance_proto_pass.reload_user_shaders(
+        &state.device,
+        &frame.user_shader_proto_chunk,
+        frame.user_shader_source_hash,
+    );
+    state.instance_emit_pass.reload_user_shaders(
+        &state.device,
+        &frame.user_shader_emit_chunk,
+        frame.user_shader_source_hash,
+    );
+
+    // 2. Mark cache entries untouched.
     state.instance_proto_cache.begin_frame();
     state.instance_region_cache.begin_frame();
 
+    // 3. Diagnostic — log non-empty request lists so an editor-side
+    //    painter that turns on before 6c-3.5c lands gets a clear
+    //    "received but not yet dispatched" signal instead of a silent
+    //    no-op. Capped at one line/frame.
     let request_count = frame.instance_region_requests.len();
     if request_count > 0 {
-        // First-frame visibility for an editor-side painter that starts
-        // producing requests before 6c-3.5 lands. Without this, the
-        // requests would silently no-op (since we don't dispatch yet)
-        // and "why isn't my instance shader rendering?" would be a
-        // mystery. Cap the log at one line per frame so a busy frame
-        // doesn't spam.
         eprintln!(
             "[inst] {request_count} instance region request(s) received \
-             — Stage 6c-3.5 will dispatch them"
+             — bake/scatter dispatch lands in Stage 6c-3.5c"
         );
     }
 
+    // 4. Build TileIndex from the cache's touched_keys. Empty until
+    //    6c-3.5c starts populating the cache via lookup_or_allocate.
+    //    `add_keyed` collisions are impossible here because
+    //    `touched_keys` returns unique cache keys.
+    let mut builder = TileIndexBuilder::new();
+    for (i, (host, mat, tile)) in state
+        .instance_region_cache
+        .touched_keys()
+        .enumerate()
+    {
+        builder
+            .add_keyed(host, mat, tile, i as u32)
+            .expect("touched_keys yields unique cache keys");
+    }
+    let tile_index = builder.build();
+    let tile_entries = flatten_tile_index(&tile_index);
+
+    // 5. ProtoLookup. Stage 6c-3.5c will plumb `&[UserShaderEntry]`
+    //    through `RenderFrame` and call
+    //    `flatten_prototype_lookup(&entries, &state.instance_proto_cache)`
+    //    here. Until then the cache stays empty (no bakes), so the
+    //    flat list is unconditionally empty regardless of whether we
+    //    have entries to walk.
+    let proto_entries: Vec<rkp_render::instance_proto_lookup::GpuPrototypeEntry> =
+        Vec::new();
+
+    // 6. Upload tile_index + proto_lookup. Buffer grows to high-water;
+    //    bytes-of-empty-vec is empty so the upload is skipped when the
+    //    list is empty (the buffer keeps its previous contents, which
+    //    don't matter — the march reads `tile_index_count == 0` and
+    //    skips).
+    ensure_instance_tile_index_capacity(state, tile_entries.len() as u32);
+    if !tile_entries.is_empty() {
+        state.queue.write_buffer(
+            &state.instance_tile_index_buffer,
+            0,
+            bytemuck::cast_slice(&tile_entries),
+        );
+    }
+    ensure_instance_proto_lookup_capacity(state, proto_entries.len() as u32);
+    if !proto_entries.is_empty() {
+        state.queue.write_buffer(
+            &state.instance_proto_lookup_buffer,
+            0,
+            bytemuck::cast_slice(&proto_entries),
+        );
+    }
+
+    // 7. Drop cache entries not referenced this frame. (No-op until
+    //    6c-3.5c — the cache stays empty.)
     state.instance_proto_cache.evict_untouched();
     state.instance_region_cache.evict_untouched();
+
+    InstancePerFrameCounts {
+        tile_index_count: tile_entries.len() as u32,
+        proto_lookup_count: proto_entries.len() as u32,
+    }
+}
+
+/// Per-frame counts that `tick_instance_pipeline` produces and the
+/// per-VR `dispatch_instance_overlay` consumes. Carried as a return
+/// value so the per-VR loop doesn't have to re-flatten.
+#[derive(Debug, Clone, Copy, Default)]
+struct InstancePerFrameCounts {
+    tile_index_count: u32,
+    proto_lookup_count: u32,
+}
+
+/// Grow `instance_tile_index_buffer` to fit `needed_entries`. No-op
+/// when capacity already suffices. Doubles capacity on growth so a
+/// gradually-growing workload doesn't reallocate every frame.
+fn ensure_instance_tile_index_capacity(state: &mut RenderState, needed_entries: u32) {
+    if needed_entries <= state.instance_tile_index_capacity_entries {
+        return;
+    }
+    let mut new_cap = state.instance_tile_index_capacity_entries.max(1);
+    while new_cap < needed_entries {
+        new_cap = new_cap.saturating_mul(2);
+    }
+    state.instance_tile_index_buffer = state.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("inst tile_index"),
+        size: (new_cap as u64) * 32,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    state.instance_tile_index_capacity_entries = new_cap;
+}
+
+/// Same shape as `ensure_instance_tile_index_capacity`, for the
+/// per-shader prototype lookup buffer.
+fn ensure_instance_proto_lookup_capacity(state: &mut RenderState, needed_entries: u32) {
+    if needed_entries <= state.instance_proto_lookup_capacity_entries {
+        return;
+    }
+    let mut new_cap = state.instance_proto_lookup_capacity_entries.max(1);
+    while new_cap < needed_entries {
+        new_cap = new_cap.saturating_mul(2);
+    }
+    state.instance_proto_lookup_buffer = state.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("inst proto_lookup"),
+        size: (new_cap as u64) * 32,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    state.instance_proto_lookup_capacity_entries = new_cap;
 }
 
 fn run_user_shader_geom(
