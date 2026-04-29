@@ -240,10 +240,34 @@ struct RenderState {
     /// and ticked per-frame even when no instance shader is registered;
     /// each cache's `begin_frame` / `evict_untouched` is a cheap no-op
     /// when no requests come in.
+    ///
+    /// `dead_code` allowance covers the bake/scatter pass + pool
+    /// buffer that Stage 6c-3.5 will start dispatching against; the
+    /// caches themselves ARE read (begin_frame / evict_untouched in
+    /// `tick_instance_pipeline`).
+    #[allow(dead_code)]
     instance_proto_pass: rkp_render::user_shader_proto_pass::PrototypeBakePass,
     instance_proto_cache: rkp_render::user_shader_proto_pass::PrototypeCache,
+    #[allow(dead_code)]
     instance_emit_pass: rkp_render::user_shader_emit_pass::EmitPass,
     instance_region_cache: rkp_render::user_shader_emit_pass::InstanceRegionCache,
+
+    /// Stage 6c-3 — global `array<u32>` storage buffer holding all
+    /// scattered instance bytes. Each region's slice is bucket-allocated
+    /// inside [`InstanceRegionCache`] (which thinks in u32 units rooted
+    /// at `pool_base = 0`); the GPU emit pass writes via the pool's
+    /// `binding(0)`. Stage 6c-3.5 binds it for the per-viewport march.
+    ///
+    /// Default capacity = 4 M u32s = 16 MB — modest first-cut. Stage 6e
+    /// (perf) can raise toward `MAX_GLOBAL_INSTANCE_U32S` (256 MB) if
+    /// instance shader workloads start bumping the cap.
+    #[allow(dead_code)]
+    instance_pool_buffer: wgpu::Buffer,
+    /// Cached u32 capacity of `instance_pool_buffer`. Mirrors what was
+    /// passed to `InstanceRegionCache::with_capacity`. Used for
+    /// resize / overflow telemetry.
+    #[allow(dead_code)]
+    instance_pool_capacity_u32: u32,
 
     /// Pick readback target. 1×1 region of the gbuf_material at offset
     /// 0, 1×1 region of the gbuf_pick at offset 256 — both 256-byte
@@ -360,18 +384,35 @@ impl RenderState {
         let user_shader_pass = rkp_render::user_shader_pass::UserShaderPass::new(&device);
         let user_shader_cache = rkp_render::user_shader_pass::UserShaderObjectCache::new();
 
-        // Option B instance-pipeline scene-wide pieces. Stage 6c-1
-        // wires them into RenderState; Stage 6c-2/3 add the per-frame
-        // dispatch + viewport march/composite. Until then both caches
-        // see zero requests per frame and tick as no-ops.
+        // Option B instance-pipeline scene-wide pieces. Stages 6c-1/2/3
+        // wire them into RenderState; Stage 6c-3.5 adds the per-frame
+        // dispatch + per-viewport march/composite encoding.
         let instance_proto_pass =
             rkp_render::user_shader_proto_pass::PrototypeBakePass::new(&device);
         let instance_proto_cache =
             rkp_render::user_shader_proto_pass::PrototypeCache::new();
         let instance_emit_pass =
             rkp_render::user_shader_emit_pass::EmitPass::new(&device);
-        let instance_region_cache =
-            rkp_render::user_shader_emit_pass::InstanceRegionCache::new();
+
+        // 16 MB instance pool — fits ~500K instances at the default
+        // 32 B stride. Sized down from the 256 MB hard cap to cover the
+        // common case without burning VRAM during early development.
+        const INSTANCE_POOL_CAPACITY_U32: u32 = 4 * 1024 * 1024;
+        let instance_pool_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("inst pool"),
+            size: (INSTANCE_POOL_CAPACITY_U32 as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let mut instance_region_cache =
+            rkp_render::user_shader_emit_pass::InstanceRegionCache::with_capacity(
+                INSTANCE_POOL_CAPACITY_U32,
+            );
+        // Pool base = 0 — the cache's `instance_block_offset` values
+        // are absolute u32 indices into `instance_pool_buffer`.
+        instance_region_cache.set_pool_base(0);
 
         Self {
             device,
@@ -385,6 +426,8 @@ impl RenderState {
             instance_proto_cache,
             instance_emit_pass,
             instance_region_cache,
+            instance_pool_buffer,
+            instance_pool_capacity_u32: INSTANCE_POOL_CAPACITY_U32,
             pick_readback_buffer,
             pick_in_flight: None,
             curr_snap: None,
@@ -995,12 +1038,13 @@ fn render_one_frame(
     //      attr layout — so no shader-side branching is needed.
     let transient_objects = run_user_shader_geom(state, frame);
 
-    // 1.7b. Option B (instance pipeline) per-frame tick. Stage 6c-1
-    //       wires the caches' lifecycle hooks; Stage 6c-2 will follow
-    //       this with the real bake/scatter dispatch + per-viewport
-    //       march/composite. Until then both caches see zero requests
-    //       per frame and `evict_untouched` simply releases nothing.
-    tick_instance_pipeline(state);
+    // 1.7b. Option B (instance pipeline) per-frame tick. Stages 6c-1/2/3
+    //       wire the caches + state holders + per-viewport resources +
+    //       request-flow-into-engine. Stage 6c-3.5 follows this with
+    //       the real bake/scatter dispatch + per-viewport march/composite.
+    //       Today the caches see zero requests per frame and
+    //       `evict_untouched` simply releases nothing.
+    tick_instance_pipeline(state, frame);
 
     let mut combined_objects: Vec<rkp_render::rkp_gpu_object::RkpGpuObject>;
     let gpu_objects_for_upload: &[rkp_render::rkp_gpu_object::RkpGpuObject] =
@@ -1500,25 +1544,48 @@ fn splice_transient_into_tile_lists(
 ///   - `fill_hash` — shader source + params + paint epoch + time
 ///     (when @animated). fill can be skipped when unchanged AND
 ///     topology unchanged.
-/// Stage 6c-1 — per-frame tick for the Option B instance pipeline's
-/// scene-wide caches. Right now this is a no-op skeleton that
-/// `begin_frame`s + `evict_untouched`s both caches; Stage 6c-2 will
-/// extend it to also build TileIndex + flatten proto-lookup + dispatch
-/// bake/scatter when there are instance shader regions to render.
+/// Stage 6c-3 — per-frame tick for the Option B instance pipeline.
 ///
-/// Called every frame, even when no instance shader is registered —
-/// the cache lifecycle is cheap (HashMap iteration over zero entries
-/// when nothing's been registered) so there's no gating cost saved by
-/// skipping it.
-fn tick_instance_pipeline(state: &mut RenderState) {
+/// Currently:
+///   - `begin_frame` both caches.
+///   - Walk `frame.instance_region_requests` for diagnostics.
+///   - `evict_untouched` both caches.
+///
+/// Stage 6c-3.5 will extend this to:
+///   - For each request: `lookup_or_allocate` against the proto cache;
+///     if dirty, dispatch the bake.
+///   - For each request: `lookup_or_allocate` against the region cache;
+///     if dirty, dispatch the scatter.
+///   - Build `TileIndex` from `instance_region_cache.touched_keys()` +
+///     region indices; `flatten_tile_index` + upload to a per-frame
+///     storage buffer.
+///   - `flatten_prototype_lookup` + upload to a second per-frame
+///     storage buffer.
+///   - For each viewport: write `MarchUniforms`, dispatch march +
+///     composite (Stages 6a/6b APIs).
+///
+/// Critically, **6c-3 doesn't call `lookup_or_allocate`** — that would
+/// allocate cache slots that no GPU dispatch fills, leaking pool
+/// extents. The cache stays empty until 6c-3.5 lands the dispatch
+/// half. The `begin_frame` / `evict_untouched` calls stay in case a
+/// future test or external path adds entries directly.
+fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) {
     state.instance_proto_cache.begin_frame();
     state.instance_region_cache.begin_frame();
 
-    // Stage 6c-2 will lookup_or_allocate each instance shader region
-    // here, dispatch the bake/scatter, and produce the per-frame
-    // TileIndex + GpuPrototypeEntry arrays the per-viewport march/
-    // composite reads. None of that exists yet; ticking the lifecycle
-    // hooks is the whole job today.
+    let request_count = frame.instance_region_requests.len();
+    if request_count > 0 {
+        // First-frame visibility for an editor-side painter that starts
+        // producing requests before 6c-3.5 lands. Without this, the
+        // requests would silently no-op (since we don't dispatch yet)
+        // and "why isn't my instance shader rendering?" would be a
+        // mystery. Cap the log at one line per frame so a busy frame
+        // doesn't spam.
+        eprintln!(
+            "[inst] {request_count} instance region request(s) received \
+             — Stage 6c-3.5 will dispatch them"
+        );
+    }
 
     state.instance_proto_cache.evict_untouched();
     state.instance_region_cache.evict_untouched();

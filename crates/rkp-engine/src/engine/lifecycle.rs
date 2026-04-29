@@ -979,6 +979,11 @@ impl EngineState {
             user_shader_generate_chunk,
             user_shader_infos,
             user_shader_regions,
+            // Stage 6c-3 — Option B instance pipeline. The sim layer
+            // doesn't yet build instance region requests; ship empty so
+            // the engine's tick is a no-op until 6c-3.5 (or an editor-
+            // side painter) lands.
+            instance_region_requests: Vec::new(),
             lights: gpu_lights,
             shade_params_base: self.shade_params_base,
             env_update,

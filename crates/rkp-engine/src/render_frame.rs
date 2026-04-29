@@ -136,6 +136,16 @@ pub struct RenderFrame {
     /// rebuilds this list each tick. Empty = no geometry generation.
     pub user_shader_regions: Vec<rkp_render::user_shader_pass::ShaderRegionRequest>,
 
+    /// Stage 6c-3 — Region requests for the Option B instance pipeline.
+    /// Mirrors the shape of `user_shader_regions` but for shaders that
+    /// opt into `@instance_proto`. The render-side `tick_instance_pipeline`
+    /// consumes these; an empty list means no instance shaders need
+    /// dispatching this frame (the common case until an editor-side
+    /// painter starts producing them). Sim rebuilds the list each tick
+    /// from `(painted-host-material × registered-instance-shader)` pairs.
+    pub instance_region_requests:
+        Vec<rkp_render::user_shader_emit_pass::InstanceRegionRequest>,
+
     /// Scene-wide light list (sun + entity point/spot lights), in the
     /// order the shade shader expects (entry 0 = sun).
     pub lights: Vec<GpuLight>,
