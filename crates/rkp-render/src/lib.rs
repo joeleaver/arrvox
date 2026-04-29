@@ -106,6 +106,11 @@ pub mod instance_proto_lookup;
 /// proto-lookup, rays, output hits) into the V1 march entry. Single
 /// ray per dispatch; Stage 6 will batch by screen tile.
 pub mod instance_march_pass;
+/// Option B Stage 6b — composite the instance-march hits onto the host
+/// G-buffer. Per-pixel: when an instance hit's `t_world` beats the
+/// host's depth, overwrite position/normal/material/leaf_slot with the
+/// instance data; otherwise pass the host data through.
+pub mod instance_composite_pass;
 /// Skeletal skin-deform scatter pass — per-frame bone-field writer.
 pub mod skin_deform;
 /// CPU-side paint writes against the scene's LeafAttrPool (material +
