@@ -80,6 +80,12 @@ impl EngineState {
         let user_shader_emit_chunk = composed.emit;
         let user_shader_source_hash = self.user_shader_registry.source_hash();
         let user_shader_infos = self.user_shader_registry.shader_infos();
+        // Full registry entries for the Option B prototype lookup. The
+        // render thread runs `flatten_prototype_lookup` against these.
+        // Cheap to clone — registry rarely has more than a handful of
+        // entries.
+        let user_shader_entries =
+            self.user_shader_registry.entries().to_vec();
         // Phase C V6 — auto ECS scan with per-leaf material support.
         // Scans each entity's leaf_attr range to find which generate-
         // hook-equipped materials are present (entity-level fallback
@@ -982,6 +988,7 @@ impl EngineState {
             user_shader_proto_chunk,
             user_shader_emit_chunk,
             user_shader_infos,
+            user_shader_entries,
             user_shader_regions,
             // Stage 6c-3 — Option B instance pipeline. The sim layer
             // doesn't yet build instance region requests; ship empty so

@@ -143,6 +143,16 @@ pub struct RenderFrame {
     /// what `StateUpdate.user_shaders` ships to the editor.
     pub user_shader_infos: Vec<rkp_render::shader_composer::UserShaderInfo>,
 
+    /// Full registry entries for the Option B prototype lookup. The
+    /// render thread feeds these to `flatten_prototype_lookup(...)`
+    /// alongside the proto cache to produce the per-shader GPU table
+    /// the instance march reads. Heavier than `user_shader_infos`
+    /// (carries WGSL bodies + InstanceLayout) but only the
+    /// is_instance_pipeline shaders are inspected, and the cost is one
+    /// `Vec` clone per frame — negligible against the snapshot's
+    /// other allocations. Empty when no shaders are registered.
+    pub user_shader_entries: Vec<rkp_render::shader_composer::UserShaderEntry>,
+
     /// Region requests for the user-shader geometry pass. Each entry
     /// asks the GPU pipeline to materialize voxels by calling the
     /// shader's `generate` hook over its AABB at the requested

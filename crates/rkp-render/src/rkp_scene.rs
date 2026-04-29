@@ -279,6 +279,50 @@ impl RkpScene {
         bumped
     }
 
+    /// Option B (instance pipeline) — reserve a SECOND tail past the
+    /// user-shader-cache tail for the prototype cache's bake outputs.
+    /// `prior_*_bytes` is the byte offset where the proto sub-pool
+    /// begins (i.e. `cpu_*_bytes + extra_user_shader_*_bytes`); the
+    /// proto tail runs from there for `extra_proto_*_bytes`.
+    ///
+    /// Buffer layout:
+    /// ```text
+    ///   [0 ........... cpu_size) ........... persistent host data
+    ///   [cpu .. cpu+user_shader_extra) ..... user-shader-cache tail
+    ///   [.. .. prior_size+proto_extra) ..... proto sub-pool (this fn)
+    /// ```
+    /// Bumps `buffers_epoch` on growth. Same wgpu binding-size cap
+    /// applies (clamps with a one-line eprintln when the proto
+    /// reservation would push past it).
+    pub fn ensure_proto_pool_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        prior_octree_bytes: u64,
+        extra_proto_octree_bytes: u64,
+        prior_brick_bytes: u64,
+        extra_proto_brick_bytes: u64,
+        prior_leaf_attr_bytes: u64,
+        extra_proto_leaf_attr_bytes: u64,
+    ) -> bool {
+        let mut bumped = false;
+        bumped |= Self::ensure_capacity(
+            device, &mut self.octree_nodes_buffer, "rkp_octree_nodes",
+            prior_octree_bytes + extra_proto_octree_bytes,
+        );
+        bumped |= Self::ensure_capacity(
+            device, &mut self.brick_pool_buffer, "rkp_brick_pool",
+            prior_brick_bytes + extra_proto_brick_bytes,
+        );
+        bumped |= Self::ensure_capacity(
+            device, &mut self.leaf_attr_pool_buffer, "rkp_leaf_attr_pool",
+            prior_leaf_attr_bytes + extra_proto_leaf_attr_bytes,
+        );
+        if bumped {
+            self.buffers_epoch += 1;
+        }
+        bumped
+    }
+
     /// Buffer-size guarantee without writing data. Used by the
     /// user-shader transient-pool reservation. Returns `true` iff a
     /// new buffer was created (caller must refresh dependent bind

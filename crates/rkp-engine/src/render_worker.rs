@@ -278,8 +278,9 @@ struct RenderState {
 
     /// Per-frame flat `array<GpuPrototypeEntry>` storage buffer. Built
     /// each frame by `flatten_prototype_lookup(...)` over the registry
-    /// + proto cache; consumed by the per-VR instance march to translate
-    /// `shader_id → prototype octree_root + instance struct layout`.
+    /// and proto cache; consumed by the per-VR instance march to
+    /// translate `shader_id` to `(prototype octree_root, instance
+    /// struct layout)`.
     instance_proto_lookup_buffer: wgpu::Buffer,
     /// Capacity of `instance_proto_lookup_buffer` in entries (32 B each).
     instance_proto_lookup_capacity_entries: u32,
@@ -368,6 +369,14 @@ struct RenderState {
 const MIN_FRAME_CALLBACK_INTERVAL: std::time::Duration =
     std::time::Duration::from_micros(8_300);
 
+// Option B proto-cache pool capacities (V1). See `RenderState::new` for
+// the rationale on these specific values. Lifted to module-level consts
+// so `tick_instance_pipeline` can reuse them when sizing the scene-pool
+// reservation.
+const INSTANCE_PROTO_OCTREE_CAPACITY_U32: u32 = 64 * 1024;     // 64K nodes (512 KB)
+const INSTANCE_PROTO_BRICK_CAPACITY_BRICKS: u32 = 8 * 1024;    // 8K bricks (2 MB)
+const INSTANCE_PROTO_LEAF_ATTR_CAPACITY_U32: u32 = 64 * 1024;  // 64K slots (512 KB)
+
 impl RenderState {
     fn new(init: RenderInit) -> Self {
         let device = init.device;
@@ -400,12 +409,23 @@ impl RenderState {
         let user_shader_cache = rkp_render::user_shader_pass::UserShaderObjectCache::new();
 
         // Option B instance-pipeline scene-wide pieces. Stages 6c-1/2/3
-        // wire them into RenderState; Stage 6c-3.5 adds the per-frame
+        // wire them into RenderState; Stages 6c-3.5b/c add the per-frame
         // dispatch + per-viewport march/composite encoding.
         let instance_proto_pass =
             rkp_render::user_shader_proto_pass::PrototypeBakePass::new(&device);
+        // V1 proto-cache pool capacities — much smaller than the library
+        // defaults (PROTO_OCTREE_POOL_CAPACITY = 1.3M / etc., which would
+        // demand ~530 MB of additional buffer space on top of the
+        // user-shader tail). At these caps a project can register up to
+        // ~16 small instance shaders at depth 2-3 — plenty for early
+        // development. Stage 6e (perf) raises if a real workload bumps
+        // the high water. See module-level consts above.
         let instance_proto_cache =
-            rkp_render::user_shader_proto_pass::PrototypeCache::new();
+            rkp_render::user_shader_proto_pass::PrototypeCache::with_capacities(
+                INSTANCE_PROTO_OCTREE_CAPACITY_U32,
+                INSTANCE_PROTO_BRICK_CAPACITY_BRICKS,
+                INSTANCE_PROTO_LEAF_ATTR_CAPACITY_U32,
+            );
         let instance_emit_pass =
             rkp_render::user_shader_emit_pass::EmitPass::new(&device);
 
@@ -1070,25 +1090,27 @@ fn render_one_frame(
         drop(sm);
     }
 
-    // 1.7. User-shader geometry pass (Phase C). Reserve transient
-    //      pool tail, reload pipeline if the shader source changed,
-    //      walk regions, dispatch the geom-build pipeline for any
-    //      that need a re-bake, and concatenate the resulting
-    //      transient `RkpGpuObject`s into `gpu_objects` so the
-    //      per-frame upload below ships them alongside persistent
-    //      objects. The march/shade passes treat them identically to
-    //      bake-built objects — same octree node encoding, same leaf
-    //      attr layout — so no shader-side branching is needed.
-    let transient_objects = run_user_shader_geom(state, frame);
-
-    // 1.7b. Option B (instance pipeline) per-frame tick. Stage 6c-3.5b
-    //       extends 6c-3 by reloading the bake/emit pipelines, building
-    //       (currently empty) TileIndex + ProtoLookup, and uploading
-    //       them to per-frame storage buffers. Stage 6c-3.5c will
-    //       additionally dispatch bake + scatter once the prototype
-    //       cache's pool reservation lands inside `RkpScene`'s global
-    //       buffers.
+    // 1.7. Option B (instance pipeline) per-frame tick. Stage 6c-3.5c
+    //      reserves the proto sub-pool past the user-shader-cache tail,
+    //      walks `instance_region_requests`, dispatches bake/scatter,
+    //      and uploads TileIndex + ProtoLookup. **Runs BEFORE
+    //      run_user_shader_geom** so the proto tail's buffer reservation
+    //      stacks correctly: tick reserves the full
+    //      `cpu + user_shader_max + proto_max` envelope when there's
+    //      any instance work, then run_user_shader_geom's own reservation
+    //      is a no-op (buffer already big enough).
     let instance_counts = tick_instance_pipeline(state, frame);
+
+    // 1.7b. User-shader geometry pass (Phase C). Reserve transient
+    //       pool tail, reload pipeline if the shader source changed,
+    //       walk regions, dispatch the geom-build pipeline for any
+    //       that need a re-bake, and concatenate the resulting
+    //       transient `RkpGpuObject`s into `gpu_objects` so the
+    //       per-frame upload below ships them alongside persistent
+    //       objects. The march/shade passes treat them identically to
+    //       bake-built objects — same octree node encoding, same leaf
+    //       attr layout — so no shader-side branching is needed.
+    let transient_objects = run_user_shader_geom(state, frame);
 
     let mut combined_objects: Vec<rkp_render::rkp_gpu_object::RkpGpuObject>;
     let gpu_objects_for_upload: &[rkp_render::rkp_gpu_object::RkpGpuObject] =
@@ -1600,47 +1622,53 @@ fn splice_transient_into_tile_lists(
     (new_offsets, new_ids)
 }
 
-/// User-shader runtime geometry, global-pool + persistent-cache variant.
+/// Stage 6c-3.5c — per-frame tick for the Option B instance pipeline.
 ///
-/// Reserves a global transient pool tail in each scene buffer,
-/// rebuilds the geom-build pipeline on shader source changes, walks
-/// the frame's regions and consults the persistent cache to decide
-/// per-region: skip / fill-only / full-bake. Returns the transient
-/// `RkpGpuObject` list to concatenate with `gpu_objects` for this
-/// frame's `upload_frame`.
+/// Sequence (executed every frame, runs BEFORE `run_user_shader_geom`
+/// so the proto-pool buffer reservation stacks cleanly with the
+/// user-shader-cache reservation):
 ///
-/// Each region computes two hashes:
-///   - `topology_hash` — host_geom + region_thickness + max_depth +
-///     aabb + cell_size. classify can be skipped when unchanged.
-///   - `fill_hash` — shader source + params + paint epoch + time
-///     (when @animated). fill can be skipped when unchanged AND
-///     topology unchanged.
-/// Stage 6c-3.5b — per-frame tick for the Option B instance pipeline.
+///   1. Reload bake + emit pipelines (idempotent on source-hash match).
+///   2. `begin_frame` both caches.
+///   3. Early-out if no instance shaders are registered AND the request
+///      list is empty.
+///   4. Snapshot `cpu_*_bytes` from scene_mgr.
+///   5. Reserve `cpu + user_shader_max + proto_max` on the scene
+///      buffers (one ensure call per pool). Re-upload geometry +
+///      face-links init on realloc — same shape as `run_user_shader_geom`.
+///   6. Configure `instance_proto_cache.set_pool_bases(...)` with
+///      offsets pointing AFTER the user-shader tail.
+///   7. Walk requests:
+///      - `instance_proto_cache.lookup_or_allocate(...)` — queue bake
+///        when dirty.
+///      - `instance_region_cache.lookup_or_allocate(...)` — V1 always
+///        queues scatter (the march reads `instance_alloc[region_index]`
+///        per frame; skipping non-dirty regions while their region_index
+///        rotates would corrupt the count).
+///   8. Encode bake + scatter into ONE local encoder + queue.submit.
+///      Submit-ordering ensures these complete before the per-VR
+///      encoders' march reads from the same buffers.
+///   9. Build `TileIndex` from `touched_keys` + region indices.
+///  10. `flatten_prototype_lookup(...)` over registry + cache.
+///  11. Upload TileIndex + ProtoLookup to per-frame storage buffers.
+///  12. `evict_untouched` both caches.
 ///
-/// Today:
-///   - Reload the bake + emit pipelines against the composed proto +
-///     emit chunks (no-op when source hash unchanged).
-///   - `begin_frame` both caches.
-///   - Walk `frame.instance_region_requests`. **Bake/scatter dispatch
-///     is NOT wired yet** (Stage 6c-3.5c will add it once the proto
-///     cache's pool reservation lands inside `RkpScene`'s global
-///     octree/brick/leaf-attr buffers). For now: log the request count
-///     and proceed with empty cache state.
-///   - `flatten_tile_index` over the (currently empty) cache's
-///     touched keys → upload to `instance_tile_index_buffer`.
-///   - `flatten_prototype_lookup` over the registry + (currently
-///     empty) proto cache → upload to `instance_proto_lookup_buffer`.
-///   - `evict_untouched` both caches.
-///
-/// The per-VR `dispatch_instance_overlay` (called by `render_one_frame`
-/// after this) sees `tile_index_count == 0` and `proto_lookup_count
-/// == 0` for every frame until 6c-3.5c lands; the march writes
-/// `hit=0` to every pixel and the composite passes the host G-buffer
-/// through unchanged. Validated end-to-end by the
-/// `instance_overlay_empty.rs` GPU test (Stage 6c-3.5a).
+/// Returns `InstancePerFrameCounts` so the per-VR
+/// `dispatch_instance_overlay` knows the binding counts.
 fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> InstancePerFrameCounts {
+    use rkp_render::instance_proto_lookup::flatten_prototype_lookup;
     use rkp_render::instance_tile_index::TileIndexBuilder;
     use rkp_render::instance_tile_index_gpu::flatten_tile_index;
+    use rkp_render::user_shader_emit_pass::{
+        build_emit_region_uniform, resolve_instance_shader, samples_per_axis,
+        EmitDispatchUniform, EMIT_DISPATCH_UNIFORM_STRIDE,
+    };
+    use rkp_render::user_shader_pass::{
+        BRICK_CELLS, MAX_GLOBAL_BRICKS, MAX_GLOBAL_LEAF_ATTRS, MAX_GLOBAL_OCTREE_NODES,
+    };
+    use rkp_render::user_shader_proto_pass::{
+        build_internal_levels, PrototypeUniform, MAX_PROTO_DISPATCH_BATCH, MAX_PROTO_MAX_DEPTH,
+    };
 
     // 1. Pipeline reload — cheap when source hash unchanged.
     state.instance_proto_pass.reload_user_shaders(
@@ -1658,49 +1686,434 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
     state.instance_proto_cache.begin_frame();
     state.instance_region_cache.begin_frame();
 
-    // 3. Diagnostic — log non-empty request lists so an editor-side
-    //    painter that turns on before 6c-3.5c lands gets a clear
-    //    "received but not yet dispatched" signal instead of a silent
-    //    no-op. Capped at one line/frame.
-    let request_count = frame.instance_region_requests.len();
-    if request_count > 0 {
-        eprintln!(
-            "[inst] {request_count} instance region request(s) received \
-             — bake/scatter dispatch lands in Stage 6c-3.5c"
-        );
+    // 3. Early-out when there's no work AT ALL — no instance shaders in
+    //    the registry and no requests in the snapshot. This is the
+    //    production state today (sim ships empty
+    //    `instance_region_requests`, registry only has shade/generate
+    //    shaders). Skipping the reservation + dispatch keeps overhead
+    //    on the no-op path at zero.
+    let any_instance_shader = frame
+        .user_shader_infos
+        .iter()
+        .any(|info| info.is_instance_pipeline);
+    if !any_instance_shader && frame.instance_region_requests.is_empty() {
+        state.instance_proto_cache.evict_untouched();
+        state.instance_region_cache.evict_untouched();
+        return InstancePerFrameCounts::default();
     }
 
-    // 4. Build TileIndex from the cache's touched_keys. Empty until
-    //    6c-3.5c starts populating the cache via lookup_or_allocate.
-    //    `add_keyed` collisions are impossible here because
-    //    `touched_keys` returns unique cache keys.
-    let mut builder = TileIndexBuilder::new();
-    for (i, (host, mat, tile)) in state
-        .instance_region_cache
-        .touched_keys()
-        .enumerate()
-    {
-        builder
-            .add_keyed(host, mat, tile, i as u32)
-            .expect("touched_keys yields unique cache keys");
+    // 4. Snapshot `cpu_*_bytes` from scene_mgr — same shape as
+    //    `run_user_shader_geom` step 3.
+    let (cpu_octree_bytes, cpu_brick_bytes, cpu_leaf_attr_bytes, cpu_face_links_bytes) = {
+        let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
+        let g = sm.geometry_upload();
+        (
+            g.octree_nodes.len() as u64 * 8,
+            g.brick_pool.len() as u64,
+            g.leaf_attr_pool.len() as u64,
+            g.brick_face_links.len() as u64,
+        )
+    };
+    let user_shader_extra_octree: u64 = MAX_GLOBAL_OCTREE_NODES as u64 * 8;
+    let user_shader_extra_brick: u64 = MAX_GLOBAL_BRICKS as u64 * BRICK_CELLS as u64 * 4;
+    let user_shader_extra_leaf: u64 = MAX_GLOBAL_LEAF_ATTRS as u64 * 8;
+    let user_shader_extra_face_links: u64 = MAX_GLOBAL_BRICKS as u64 * 6 * 4;
+
+    let proto_extra_octree: u64 = (INSTANCE_PROTO_OCTREE_CAPACITY_U32 as u64) * 8;
+    let proto_extra_brick: u64 =
+        (INSTANCE_PROTO_BRICK_CAPACITY_BRICKS as u64) * (BRICK_CELLS as u64) * 4;
+    let proto_extra_leaf: u64 = (INSTANCE_PROTO_LEAF_ATTR_CAPACITY_U32 as u64) * 8;
+
+    // 5a. Reserve user-shader tail (always — proto base is computed
+    //     past it regardless of whether the user-shader pass runs).
+    let realloc_user = state.renderer.scene.ensure_user_shader_capacity(
+        &state.device,
+        cpu_octree_bytes, user_shader_extra_octree,
+        cpu_brick_bytes, user_shader_extra_brick,
+        cpu_leaf_attr_bytes, user_shader_extra_leaf,
+        cpu_face_links_bytes, user_shader_extra_face_links,
+    );
+
+    // 5b. Reserve proto sub-pool past the user-shader tail.
+    let prior_octree = cpu_octree_bytes + user_shader_extra_octree;
+    let prior_brick = cpu_brick_bytes + user_shader_extra_brick;
+    let prior_leaf = cpu_leaf_attr_bytes + user_shader_extra_leaf;
+    let realloc_proto = state.renderer.scene.ensure_proto_pool_capacity(
+        &state.device,
+        prior_octree, proto_extra_octree,
+        prior_brick, proto_extra_brick,
+        prior_leaf, proto_extra_leaf,
+    );
+
+    if realloc_user || realloc_proto {
+        // Existing data is gone (`ensure_capacity` allocates a fresh
+        // buffer on growth). Re-upload geometry + reset the user-shader
+        // face-links tail.
+        let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
+        let g = sm.geometry_upload();
+        state.renderer.upload_geometry(&state.queue, &g);
+        state.last_uploaded_geometry_epoch = sm.geometry_epoch();
+        drop(sm);
+        const FACE_INIT_CHUNK: usize = 4 * 1024 * 1024;
+        const FACE_EMPTY: u32 = 0xFFFFFFFFu32;
+        let chunk_data: Vec<u32> = vec![FACE_EMPTY; FACE_INIT_CHUNK];
+        let mut written: u64 = 0;
+        while written < user_shader_extra_face_links {
+            let remaining = (user_shader_extra_face_links - written) as usize;
+            let this_chunk_bytes = (FACE_INIT_CHUNK * 4).min(remaining);
+            state.queue.write_buffer(
+                &state.renderer.scene.brick_face_links_buffer,
+                cpu_face_links_bytes + written,
+                bytemuck::cast_slice(&chunk_data[..this_chunk_bytes / 4]),
+            );
+            written += this_chunk_bytes as u64;
+        }
     }
-    let tile_index = builder.build();
+
+    // 6. Configure proto cache pool bases. Setting bases with the same
+    //    values is a no-op; a change flushes the cache.
+    let proto_octree_base = (prior_octree / 8) as u32;
+    let proto_brick_base = (prior_brick / 4 / BRICK_CELLS as u64) as u32;
+    let proto_leaf_base = (prior_leaf / 8) as u32;
+    state.instance_proto_cache.set_pool_bases(
+        proto_octree_base,
+        proto_brick_base,
+        proto_leaf_base,
+    );
+
+    // 7. Walk requests, look up cache, gather dirty bakes + scatters.
+    struct DirtyBake {
+        uniform: PrototypeUniform,
+        max_depth: u32,
+        octree_extent_offset: u32,
+    }
+    struct Scatter {
+        region_uniform: rkp_render::user_shader_emit_pass::EmitRegionUniform,
+        region_index: u32,
+        samples_per_axis: u32,
+        instance_alloc_offset_bytes: u64,
+    }
+    let mut dirty_bakes: Vec<DirtyBake> = Vec::new();
+    let mut scatters: Vec<Scatter> = Vec::new();
+    let mut tile_builder = TileIndexBuilder::new();
+
+    let time_seconds = frame.shade_params_base.time;
+    for req in &frame.instance_region_requests {
+        // Resolve the shader. Skip when not in registry or when it's
+        // not an instance shader (shouldn't happen — the painter only
+        // emits requests for instance shaders — but defend the path).
+        let info = match resolve_instance_shader(&frame.user_shader_infos, &req.shader_name) {
+            Some(i) => i,
+            None => continue,
+        };
+        // Resolve to an id by name + index in user_shader_entries.
+        // (UserShaderInfo doesn't carry id, so look it up in entries.)
+        let shader_id = match frame
+            .user_shader_entries
+            .iter()
+            .find(|e| e.name == info.name)
+            .map(|e| e.id)
+        {
+            Some(id) => id,
+            None => continue,
+        };
+        let max_depth = info.max_depth.unwrap_or(2).min(MAX_PROTO_MAX_DEPTH);
+
+        // 7a. Proto cache lookup.
+        let (proto_entry, proto_dirty) = match state.instance_proto_cache.lookup_or_allocate(
+            shader_id,
+            frame.user_shader_source_hash,
+            max_depth,
+        ) {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "[inst] proto cache exhausted for shader_id {shader_id} \
+                     — bake skipped this frame"
+                );
+                continue;
+            }
+        };
+        if proto_dirty {
+            dirty_bakes.push(DirtyBake {
+                uniform: PrototypeUniform::from_entry(&proto_entry, &state.instance_proto_cache),
+                max_depth: proto_entry.max_depth,
+                octree_extent_offset: proto_entry.octree_extent.0,
+            });
+        }
+
+        // 7b. Region cache lookup. V1: scatter every touched region
+        //     regardless of dirty flag (see Stage 6c-3.5c memo for the
+        //     alloc-count rationale).
+        let topology_hash = topology_hash_for_inst(req, frame.geometry_epoch);
+        let fill_hash = fill_hash_for_inst(
+            req, topology_hash, frame.user_shader_source_hash, time_seconds,
+        );
+        let cached = match state
+            .instance_region_cache
+            .lookup_or_allocate(req, topology_hash, fill_hash)
+        {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "[inst] region cache exhausted for shader_id {shader_id} \
+                     — scatter skipped this frame"
+                );
+                continue;
+            }
+        };
+
+        // Assign region_index by walk order.
+        let region_index = scatters.len() as u32;
+        let mut slot = cached;
+        slot.region_index = region_index;
+        let region_uniform = build_emit_region_uniform(req, &slot, shader_id, time_seconds);
+        let spa = samples_per_axis(req);
+        scatters.push(Scatter {
+            region_uniform,
+            region_index,
+            samples_per_axis: spa,
+            instance_alloc_offset_bytes: (region_index as u64) * 4,
+        });
+
+        // Add to TileIndex. Duplicates would be a logic bug.
+        if let Err(e) = tile_builder.add_request(req, region_index) {
+            eprintln!("[inst] tile index error: {e}");
+        }
+    }
+
+    // 8. Encode bake + scatter dispatches.
+    if !dirty_bakes.is_empty() || !scatters.is_empty() {
+        let mut encoder = state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("inst bake+scatter"),
+        });
+
+        // 8a. Bake — one dispatch per dirty proto. Each dispatch writes
+        //     the prototype's leaf-level octree slots + brick + leaf
+        //     attrs starting from the proto cache's reserved offset.
+        //     We pre-fill the internal levels CPU-side per Stage 2's
+        //     pattern.
+        for bake in &dirty_bakes {
+            // Pre-fill internal octree levels at the proto's reserved
+            // offset. `build_internal_levels` returns the entire
+            // octree subtree's nodes (internal + EMPTY leaf); the bake
+            // fills the leaf level only.
+            let internal = build_internal_levels(
+                proto_octree_base,
+                bake.octree_extent_offset,
+                bake.max_depth,
+            );
+            // Each node = 2 u32s = 8 bytes.
+            let mut bytes: Vec<u8> = Vec::with_capacity(internal.len() * 8);
+            for [v0, v1] in internal {
+                bytes.extend_from_slice(&v0.to_le_bytes());
+                bytes.extend_from_slice(&v1.to_le_bytes());
+            }
+            // Absolute offset = (proto_octree_base + extent_offset) * 8.
+            let octree_byte_offset =
+                (proto_octree_base as u64 + bake.octree_extent_offset as u64) * 8;
+            state.queue.write_buffer(
+                &state.renderer.scene.octree_nodes_buffer,
+                octree_byte_offset,
+                &bytes,
+            );
+
+            // Reset proto atomic counters + overflow.
+            state.queue.write_buffer(&state.instance_proto_pass.proto_brick_alloc_buffer, 0, &[0u8; 4]);
+            state.queue.write_buffer(&state.instance_proto_pass.proto_leaf_attr_alloc_buffer, 0, &[0u8; 4]);
+            state.queue.write_buffer(&state.instance_proto_pass.overflow_buffer, 0, &[0u8; 12 * 4]);
+
+            // Upload the prototype uniform.
+            state.queue.write_buffer(
+                &state.instance_proto_pass.proto_uniform_buffer,
+                0,
+                bytemuck::bytes_of(&bake.uniform),
+            );
+
+            // Build bind groups.
+            let bake_g0 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("inst bake g0"),
+                layout: &state.instance_proto_pass.group0_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: state.renderer.scene.octree_nodes_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: state.renderer.scene.brick_pool_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: state.renderer.scene.leaf_attr_pool_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: state.instance_proto_pass.proto_brick_alloc_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: state.instance_proto_pass.proto_leaf_attr_alloc_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: state.instance_proto_pass.overflow_buffer.as_entire_binding() },
+                ],
+            });
+            let bake_g1 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("inst bake g1"),
+                layout: &state.instance_proto_pass.group1_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: state.instance_proto_pass.proto_uniform_buffer.as_entire_binding(),
+                }],
+            });
+
+            let bricks_per_axis = 1u32 << bake.max_depth;
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("inst bake"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&state.instance_proto_pass.bake_pipeline);
+            cpass.set_bind_group(0, &bake_g0, &[]);
+            cpass.set_bind_group(1, &bake_g1, &[]);
+            cpass.dispatch_workgroups(bricks_per_axis, bricks_per_axis, bricks_per_axis);
+            // V1: one bake per dispatch, no batching. The
+            // `MAX_PROTO_DISPATCH_BATCH = 16` cap exists for a future
+            // batched-submit optimization; for now we serialize.
+            let _ = MAX_PROTO_DISPATCH_BATCH;
+        }
+
+        // 8b. Scatter — one dispatch per touched region.
+        if !scatters.is_empty() {
+            // Upload all region uniforms + dispatch uniforms once.
+            // `regions_buffer` is sized for MAX_INSTANCE_REGIONS slots
+            // (192 B each). Reset alloc counters for every region we
+            // dispatch.
+            let mut region_bytes: Vec<u8> =
+                Vec::with_capacity(scatters.len() * std::mem::size_of::<rkp_render::user_shader_emit_pass::EmitRegionUniform>());
+            for s in &scatters {
+                region_bytes.extend_from_slice(bytemuck::bytes_of(&s.region_uniform));
+            }
+            state.queue.write_buffer(
+                &state.instance_emit_pass.regions_buffer,
+                0,
+                &region_bytes,
+            );
+
+            // Dispatch uniforms — one per scatter, EMIT_DISPATCH_UNIFORM_STRIDE
+            // apart (256 B per wgpu's dynamic-offset alignment rule).
+            let stride = EMIT_DISPATCH_UNIFORM_STRIDE as usize;
+            let mut dispatch_bytes: Vec<u8> = vec![0u8; scatters.len() * stride];
+            for (i, s) in scatters.iter().enumerate() {
+                let dispatch_u = EmitDispatchUniform {
+                    region_index: s.region_index,
+                    samples_per_axis: s.samples_per_axis,
+                    _pad0: 0,
+                    _pad1: 0,
+                };
+                let off = i * stride;
+                dispatch_bytes[off..off + std::mem::size_of::<EmitDispatchUniform>()]
+                    .copy_from_slice(bytemuck::bytes_of(&dispatch_u));
+            }
+            state.queue.write_buffer(
+                &state.instance_emit_pass.dispatch_uniforms_buffer,
+                0,
+                &dispatch_bytes,
+            );
+
+            // Reset alloc counters for every region we're scattering.
+            // Simplest correct approach: zero the whole alloc buffer
+            // once. Cost: 4 KB at MAX_INSTANCE_REGIONS=1024. The
+            // alternative (per-region writes) is slower for >32
+            // regions and risks leaving stale values in slots that
+            // were touched in a prior frame but aren't this frame.
+            // Note: since V1 always re-scatters every touched region,
+            // every counter that the march reads gets repopulated
+            // before submit — zeroing first is safe.
+            let zeros = vec![
+                0u8;
+                (rkp_render::user_shader_emit_pass::MAX_INSTANCE_REGIONS as usize) * 4
+            ];
+            state.queue.write_buffer(
+                &state.instance_emit_pass.instance_alloc_buffer,
+                0,
+                &zeros,
+            );
+            // Reset overflow counters.
+            state.queue.write_buffer(
+                &state.instance_emit_pass.overflow_buffer,
+                0,
+                &[0u8; 16],
+            );
+
+            // Build bind groups (groups 0 + 1 are stable across
+            // dispatches; group 2 takes a dynamic offset per dispatch).
+            let scatter_g0 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("inst scatter g0"),
+                layout: &state.instance_emit_pass.group0_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: state.instance_pool_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: state.instance_emit_pass.instance_alloc_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: state.renderer.scene.octree_nodes_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: state.renderer.scene.brick_pool_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: state.renderer.scene.leaf_attr_pool_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: state.instance_emit_pass.overflow_buffer.as_entire_binding() },
+                ],
+            });
+            let scatter_g1 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("inst scatter g1"),
+                layout: &state.instance_emit_pass.group1_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: state.instance_emit_pass.regions_buffer.as_entire_binding(),
+                }],
+            });
+            let scatter_g2 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("inst scatter g2 (dynamic)"),
+                layout: &state.instance_emit_pass.group2_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &state.instance_emit_pass.dispatch_uniforms_buffer,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<EmitDispatchUniform>() as u64,
+                        ),
+                    }),
+                }],
+            });
+
+            for (i, s) in scatters.iter().enumerate() {
+                let dynamic_offset = (i * stride) as u32;
+                let wgs_per_axis = s.samples_per_axis.div_ceil(4);
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("inst scatter"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&state.instance_emit_pass.emit_pipeline);
+                cpass.set_bind_group(0, &scatter_g0, &[]);
+                cpass.set_bind_group(1, &scatter_g1, &[]);
+                cpass.set_bind_group(2, &scatter_g2, &[dynamic_offset]);
+                cpass.dispatch_workgroups(wgs_per_axis, wgs_per_axis, wgs_per_axis);
+                // Suppress unused-binding warning for the offset field
+                // (it's read off the request indirectly via dispatch
+                // uniforms — kept on `Scatter` for diagnostics).
+                let _ = s.instance_alloc_offset_bytes;
+            }
+        }
+
+        state.queue.submit(Some(encoder.finish()));
+    }
+
+    // 9. Build TileIndex from the cache's touched_keys + scatter-order
+    //    region indices. We populated `tile_builder` above as we
+    //    walked requests.
+    let tile_index = tile_builder.build();
     let tile_entries = flatten_tile_index(&tile_index);
 
-    // 5. ProtoLookup. Stage 6c-3.5c will plumb `&[UserShaderEntry]`
-    //    through `RenderFrame` and call
-    //    `flatten_prototype_lookup(&entries, &state.instance_proto_cache)`
-    //    here. Until then the cache stays empty (no bakes), so the
-    //    flat list is unconditionally empty regardless of whether we
-    //    have entries to walk.
-    let proto_entries: Vec<rkp_render::instance_proto_lookup::GpuPrototypeEntry> =
-        Vec::new();
+    // 10. ProtoLookup over registry + cache. Skipped/unbaked shaders
+    //     return as `skipped_unbaked`; we discard since the march
+    //     simply skips unmapped shader_ids.
+    let proto_build = match flatten_prototype_lookup(
+        &frame.user_shader_entries,
+        &state.instance_proto_cache,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[inst] flatten_prototype_lookup failed: {e}");
+            rkp_render::instance_proto_lookup::PrototypeLookupBuild {
+                entries: Vec::new(),
+                skipped_unbaked: Vec::new(),
+            }
+        }
+    };
+    let proto_entries = proto_build.entries;
 
-    // 6. Upload tile_index + proto_lookup. Buffer grows to high-water;
-    //    bytes-of-empty-vec is empty so the upload is skipped when the
-    //    list is empty (the buffer keeps its previous contents, which
-    //    don't matter — the march reads `tile_index_count == 0` and
-    //    skips).
+    // 11. Upload TileIndex + ProtoLookup. Buffers grow to high-water.
     ensure_instance_tile_index_capacity(state, tile_entries.len() as u32);
     if !tile_entries.is_empty() {
         state.queue.write_buffer(
@@ -1718,8 +2131,7 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
         );
     }
 
-    // 7. Drop cache entries not referenced this frame. (No-op until
-    //    6c-3.5c — the cache stays empty.)
+    // 12. Drop cache entries not referenced this frame.
     state.instance_proto_cache.evict_untouched();
     state.instance_region_cache.evict_untouched();
 
@@ -1727,6 +2139,70 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
         tile_index_count: tile_entries.len() as u32,
         proto_lookup_count: proto_entries.len() as u32,
     }
+}
+
+/// Hash inputs that affect the proto bake's topology output for one
+/// instance region. Folds host-octree state + AABB + cell_size +
+/// max_depth + tile + region_thickness. Any change invalidates the
+/// region's cached extent.
+fn topology_hash_for_inst(
+    req: &rkp_render::user_shader_emit_pass::InstanceRegionRequest,
+    geometry_epoch: u64,
+) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    let prime = 0x100000001b3u64;
+    let mix = |h: &mut u64, b: u8| {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(prime);
+    };
+    for &b in &geometry_epoch.to_le_bytes() { mix(&mut h, b); }
+    for &b in &req.host_octree_root.to_le_bytes() { mix(&mut h, b); }
+    for &b in &req.host_octree_depth.to_le_bytes() { mix(&mut h, b); }
+    for &b in &req.host_octree_extent.to_le_bytes() { mix(&mut h, b); }
+    for v in req.host_grid_origin.iter() {
+        for &b in &v.to_le_bytes() { mix(&mut h, b); }
+    }
+    for row in req.host_inverse_world.iter() {
+        for v in row.iter() {
+            for &b in &v.to_le_bytes() { mix(&mut h, b); }
+        }
+    }
+    for &b in &req.region_thickness.to_le_bytes() { mix(&mut h, b); }
+    for v in req.aabb_min.iter().chain(req.aabb_max.iter()) {
+        for &b in &v.to_le_bytes() { mix(&mut h, b); }
+    }
+    for &b in &req.cell_size.to_le_bytes() { mix(&mut h, b); }
+    for v in req.tile_index.iter() {
+        for &b in &v.to_le_bytes() { mix(&mut h, b); }
+    }
+    h
+}
+
+/// Hash inputs that affect the scatter output (per-instance struct
+/// values). Builds on top of `topology_hash` so changing topology
+/// implies fill-dirty.
+fn fill_hash_for_inst(
+    req: &rkp_render::user_shader_emit_pass::InstanceRegionRequest,
+    topology_hash: u64,
+    shader_source_hash: u64,
+    time_seconds: f32,
+) -> u64 {
+    let mut h = topology_hash;
+    let prime = 0x100000001b3u64;
+    let mix = |h: &mut u64, b: u8| {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(prime);
+    };
+    for &b in &shader_source_hash.to_le_bytes() { mix(&mut h, b); }
+    for &b in &req.input_hash.to_le_bytes() { mix(&mut h, b); }
+    for &b in &req.material_id.to_le_bytes() { mix(&mut h, b); }
+    for p in &req.params {
+        for &b in &p.to_le_bytes() { mix(&mut h, b); }
+    }
+    if req.animated {
+        for &b in &time_seconds.to_le_bytes() { mix(&mut h, b); }
+    }
+    h
 }
 
 /// Per-frame counts that `tick_instance_pipeline` produces and the
@@ -1777,6 +2253,20 @@ fn ensure_instance_proto_lookup_capacity(state: &mut RenderState, needed_entries
     state.instance_proto_lookup_capacity_entries = new_cap;
 }
 
+/// User-shader runtime geometry, global-pool + persistent-cache variant.
+///
+/// Reserves a global transient pool tail in each scene buffer,
+/// rebuilds the geom-build pipeline on shader source changes, walks
+/// the frame's regions and consults the persistent cache to decide
+/// per-region: skip / fill-only / full-bake. Returns the transient
+/// `RkpGpuObject` list to concatenate with `gpu_objects` for this
+/// frame's `upload_frame`.
+///
+/// Each region computes two hashes: `topology_hash` (host_geom +
+/// region_thickness + max_depth + aabb + cell_size; classify can be
+/// skipped when unchanged) and `fill_hash` (shader source + params +
+/// paint epoch + time when `@animated`; fill can be skipped when
+/// unchanged AND topology unchanged).
 fn run_user_shader_geom(
     state: &mut RenderState,
     frame: &RenderFrame,
