@@ -90,28 +90,49 @@ const SCALE_KIND_NONE: u32 = 0u;
 const SCALE_KIND_UNIFORM: u32 = 1u;
 const SCALE_KIND_PER_AXIS: u32 = 2u;
 
-/// Per-ray input. The Rust pass uploads one of these per dispatch (or
-/// many in an array for screen-tile dispatch later). V1's test
-/// dispatches a single ray.
+/// Camera-derived per-pixel ray, constructed inside the shader from
+/// `MarchCameraUniform`. Held as a transient struct so the rest of the
+/// march code (`instance_march_one_ray`) reads from a single value
+/// rather than passing 4-5 args.
 struct MarchRay {
     origin: vec3<f32>,
-    instance_count_per_region: u32,
-    direction: vec3<f32>,
     max_steps_outer: u32,
+    direction: vec3<f32>,
     max_steps_brick: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
 }
 
-/// Single per-frame uniform — counts the variable-size buffers so the
-/// shader doesn't read past the end of the storage bindings (which
-/// would be a silent miss on most drivers, a hang on a few).
+/// Per-frame uniform — buffer sizes the shader needs to bound-check
+/// + screen dimensions for per-pixel indexing + outer/brick step caps.
+///
+/// `march_max_steps_outer/brick` are uniform-driven so the host can
+/// tune without recompiling the shader. Defaults pulled from the
+/// Rust mirror.
 struct MarchUniforms {
     tile_index_count: u32,
     proto_lookup_count: u32,
-    ray_count: u32,
+    screen_width: u32,
+    screen_height: u32,
+    march_max_steps_outer: u32,
+    march_max_steps_brick: u32,
     _pad0: u32,
+    _pad1: u32,
+}
+
+/// Camera state for per-pixel ray construction. Layout is the FIRST
+/// 80 BYTES of `rkp_scene::CameraUniforms` — same field order, same
+/// offsets, so Stage 6c can bind a slice of the existing camera
+/// buffer without a translation step. The remaining
+/// `layer_mask`/`focus_object_id`/`prev_vp`/`view_proj` fields aren't
+/// needed by the V1 march and are deliberately omitted from this
+/// uniform; binding them would inflate the min-binding-size for no
+/// benefit.
+struct MarchCameraUniform {
+    position: vec4<f32>,
+    forward: vec4<f32>,
+    right: vec4<f32>,
+    up: vec4<f32>,
+    resolution: vec2<f32>,
+    jitter: vec2<f32>,
 }
 
 struct InstanceMarchHit {
@@ -135,7 +156,7 @@ struct InstanceMarchHit {
 @group(2) @binding(0) var<storage, read> proto_lookup_buffer: array<GpuPrototypeEntryLayout>;
 
 @group(3) @binding(0) var<uniform> march_uniforms: MarchUniforms;
-@group(3) @binding(1) var<storage, read> rays_buffer: array<MarchRay>;
+@group(3) @binding(1) var<uniform> camera: MarchCameraUniform;
 @group(3) @binding(2) var<storage, read_write> output_hits: array<InstanceMarchHit>;
 
 /// Linear scan `proto_lookup_buffer` for `shader_id`. Returns the entry
@@ -296,11 +317,33 @@ fn instance_march_one_ray(ray: MarchRay) -> InstanceMarchHit {
     return best;
 }
 
-@compute @workgroup_size(1)
-fn instance_march_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let ray_index = gid.x;
-    if ray_index >= march_uniforms.ray_count { return; }
-    let ray = rays_buffer[ray_index];
+/// Construct the per-pixel world-space ray. Mirrors the convention in
+/// `octree_march.wgsl`'s main entry point — same uv/ndc derivation —
+/// so a Stage 6c renderer integration can rely on instance-march hits
+/// being on identical pixel-space rays as the host march.
+fn camera_pixel_ray(pixel_xy: vec2<u32>) -> MarchRay {
+    let uv = (vec2<f32>(pixel_xy) + 0.5 + camera.jitter) / camera.resolution;
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    let dir = normalize(
+        camera.forward.xyz
+        + ndc.x * camera.right.xyz
+        + ndc.y * camera.up.xyz
+    );
+    var ray: MarchRay;
+    ray.origin = camera.position.xyz;
+    ray.direction = dir;
+    ray.max_steps_outer = march_uniforms.march_max_steps_outer;
+    ray.max_steps_brick = march_uniforms.march_max_steps_brick;
+    return ray;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn instance_march_main(@builtin(global_invocation_id) pixel: vec3<u32>) {
+    let w = march_uniforms.screen_width;
+    let h = march_uniforms.screen_height;
+    if pixel.x >= w || pixel.y >= h { return; }
+    let ray = camera_pixel_ray(pixel.xy);
     let hit = instance_march_one_ray(ray);
-    output_hits[ray_index] = hit;
+    let out_index = pixel.x + pixel.y * w;
+    output_hits[out_index] = hit;
 }

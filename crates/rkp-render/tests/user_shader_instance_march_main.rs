@@ -15,7 +15,8 @@
 //! Skips silently when no wgpu adapter is available.
 
 use rkp_render::instance_march_pass::{
-    instance_march_main_source, InstanceMarchHit, InstanceMarchPass, MarchRay, MarchUniforms,
+    instance_march_main_source, InstanceMarchHit, InstanceMarchPass, MarchCameraUniform,
+    MarchUniforms,
 };
 use rkp_render::instance_proto_lookup::{
     flatten_prototype_lookup, GpuPrototypeEntry,
@@ -375,47 +376,55 @@ fn instance_march_hits_single_scattered_sphere_instance() {
         bytemuck::cast_slice(&proto_lookup.entries),
     );
 
-    // ── March uniforms + ray + output ──
+    // ── March uniforms + camera + output ──
     let march_pass = InstanceMarchPass::new(&device);
 
-    let uniforms = MarchUniforms {
-        tile_index_count: flat_tile_entries.len() as u32,
-        proto_lookup_count: proto_lookup.entries.len() as u32,
-        ray_count: 1,
-        _pad0: 0,
-    };
+    // 1×1 screen — center pixel gets `ndc = (0, 0)` → ray direction =
+    // `normalize(forward) = +X`. Ray origin = camera position.
+    let screen_width = 1u32;
+    let screen_height = 1u32;
+    let mut uniforms = MarchUniforms::default();
+    uniforms.tile_index_count = flat_tile_entries.len() as u32;
+    uniforms.proto_lookup_count = proto_lookup.entries.len() as u32;
+    uniforms.screen_width = screen_width;
+    uniforms.screen_height = screen_height;
+
     let uniforms_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("e2e march uniforms"),
-        size: 16,
+        size: std::mem::size_of::<MarchUniforms>() as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     queue.write_buffer(&uniforms_buf, 0, bytemuck::bytes_of(&uniforms));
 
-    // Ray from (0, 0.5, 0.5) toward +X. Hits the instance AABB at
-    // world_t = 1.5, then descends the canonical sphere — first cell
-    // hit roughly at canonical x = 0.1 → world_t ~ 1.6.
-    let rays = vec![MarchRay {
-        origin: [0.0, 0.5, 0.5],
-        instance_count_per_region: 0,
-        direction: [1.0, 0.0, 0.0],
-        max_steps_outer: 256,
-        max_steps_brick: 64,
-        _pad0: 0,
-        _pad1: 0,
-        _pad2: 0,
-    }];
-    let rays_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("e2e rays"),
-        size: (rays.len() * std::mem::size_of::<MarchRay>()).max(48) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    // Camera fires its single pixel-center ray from (0, 0.5, 0.5)
+    // along +X. Hits the instance AABB at world_t ≈ 1.5, descends
+    // the canonical sphere — first cell hit ~ canonical x = 0.1 →
+    // world_t ~ 1.6. (Same target as the Stage 5b version.)
+    let camera = MarchCameraUniform {
+        position: [0.0, 0.5, 0.5, 1.0],
+        forward: [1.0, 0.0, 0.0, 0.0],
+        // right + up only matter for off-center pixels; pick any
+        // orthonormal pair so jitter=0 + 1×1 res still resolves to
+        // pure forward.
+        right: [0.0, 0.0, 1.0, 0.0],
+        up: [0.0, 1.0, 0.0, 0.0],
+        resolution: [screen_width as f32, screen_height as f32],
+        jitter: [0.0, 0.0],
+    };
+    let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("e2e march camera"),
+        size: std::mem::size_of::<MarchCameraUniform>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    queue.write_buffer(&rays_buf, 0, bytemuck::cast_slice(&rays));
+    queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&camera));
 
+    let pixel_count = (screen_width * screen_height) as u64;
+    let output_size = (pixel_count * std::mem::size_of::<InstanceMarchHit>() as u64).max(48);
     let output_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("e2e march output"),
-        size: (rays.len() * std::mem::size_of::<InstanceMarchHit>()).max(48) as u64,
+        size: output_size,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
@@ -454,7 +463,7 @@ fn instance_march_hits_single_scattered_sphere_instance() {
         layout: &march_pass.group3_layout,
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: uniforms_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: rays_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: camera_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: output_buf.as_entire_binding() },
         ],
     });
@@ -462,12 +471,11 @@ fn instance_march_hits_single_scattered_sphere_instance() {
     let mut encoder = device.create_command_encoder(&Default::default());
     {
         let mut cpass = encoder.begin_compute_pass(&Default::default());
-        cpass.set_pipeline(&march_pass.pipeline);
         cpass.set_bind_group(0, &g0, &[]);
         cpass.set_bind_group(1, &g1, &[]);
         cpass.set_bind_group(2, &g2, &[]);
         cpass.set_bind_group(3, &g3, &[]);
-        cpass.dispatch_workgroups(rays.len() as u32, 1, 1);
+        march_pass.dispatch_per_pixel(&mut cpass, screen_width, screen_height);
     }
 
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
@@ -524,7 +532,7 @@ fn _api_surface_used(
     _g: GpuTileIndexEntry,
     _p: GpuPrototypeEntry,
     _u: MarchUniforms,
-    _ray: MarchRay,
+    _cam: MarchCameraUniform,
     _hit: InstanceMarchHit,
 ) {
 }

@@ -36,33 +36,67 @@ use crate::user_shader_emit_pass::EmitRegionUniform;
 use crate::user_shader_instance_march::instance_march_helpers_source;
 
 /// Per-frame uniform — must match `MarchUniforms` in
-/// `user_shader_instance_march_main.wgsl`. 16 bytes.
+/// `user_shader_instance_march_main.wgsl`. 32 bytes.
+///
+/// Tunable step caps (`march_max_steps_outer/brick`) live here rather
+/// than in the shader so the host can adjust without recompiling. The
+/// defaults match the Stage 5b values so the e2e test produces
+/// identical hits.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MarchUniforms {
     pub tile_index_count: u32,
     pub proto_lookup_count: u32,
-    pub ray_count: u32,
-    pub _pad0: u32,
-}
-
-const _: () = assert!(std::mem::size_of::<MarchUniforms>() == 16);
-
-/// Per-ray input. Mirror of `MarchRay` in the WGSL. 48 bytes.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct MarchRay {
-    pub origin: [f32; 3],
-    pub instance_count_per_region: u32,
-    pub direction: [f32; 3],
-    pub max_steps_outer: u32,
-    pub max_steps_brick: u32,
+    pub screen_width: u32,
+    pub screen_height: u32,
+    pub march_max_steps_outer: u32,
+    pub march_max_steps_brick: u32,
     pub _pad0: u32,
     pub _pad1: u32,
-    pub _pad2: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<MarchRay>() == 48);
+const _: () = assert!(std::mem::size_of::<MarchUniforms>() == 32);
+
+impl Default for MarchUniforms {
+    fn default() -> Self {
+        Self {
+            tile_index_count: 0,
+            proto_lookup_count: 0,
+            screen_width: 0,
+            screen_height: 0,
+            march_max_steps_outer: DEFAULT_MAX_STEPS_OUTER,
+            march_max_steps_brick: DEFAULT_MAX_STEPS_BRICK,
+            _pad0: 0,
+            _pad1: 0,
+        }
+    }
+}
+
+/// Default outer-DDA step cap — covers a depth-2 prototype in worst
+/// case. Tunable per-frame via `MarchUniforms.march_max_steps_outer`.
+pub const DEFAULT_MAX_STEPS_OUTER: u32 = 256;
+
+/// Default per-brick inner-DDA step cap — at most ~12 cells along the
+/// longest 4³ diagonal, so 64 is comfortably above the worst case
+/// while still bounding pathological GPU loops.
+pub const DEFAULT_MAX_STEPS_BRICK: u32 = 64;
+
+/// Camera state for per-pixel ray construction. **Layout is the FIRST
+/// 80 BYTES of [`crate::rkp_scene::CameraUniforms`]** — same field
+/// order, same offsets — so a Stage 6c renderer integration can bind
+/// a slice of the existing camera buffer with no copy or translation.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MarchCameraUniform {
+    pub position: [f32; 4],
+    pub forward: [f32; 4],
+    pub right: [f32; 4],
+    pub up: [f32; 4],
+    pub resolution: [f32; 2],
+    pub jitter: [f32; 2],
+}
+
+const _: () = assert!(std::mem::size_of::<MarchCameraUniform>() == 80);
 
 /// Per-ray output — the closest instance hit found for this ray. Mirror
 /// of `InstanceMarchHit` in the WGSL. 48 bytes.
@@ -162,7 +196,7 @@ impl InstanceMarchPass {
             }],
         });
         let group3_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("instance_march group3 (uniforms + IO)"),
+            label: Some("instance_march group3 (uniforms + camera + output)"),
             entries: &[
                 // march_uniforms
                 wgpu::BindGroupLayoutEntry {
@@ -177,20 +211,22 @@ impl InstanceMarchPass {
                     },
                     count: None,
                 },
-                // rays_buffer
+                // camera (MarchCameraUniform — bind a slice of the renderer's
+                // CameraUniforms buffer; first 80 B are layout-compatible)
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: NonZeroU64::new(
-                            std::mem::size_of::<MarchRay>() as u64,
+                            std::mem::size_of::<MarchCameraUniform>() as u64,
                         ),
                     },
                     count: None,
                 },
-                // output_hits
+                // output_hits — `array<InstanceMarchHit>` of length
+                // `screen_width * screen_height`
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -241,6 +277,36 @@ impl InstanceMarchPass {
             pipeline,
         }
     }
+
+    /// Workgroup count along one axis for `pixels`: `ceil(pixels / 8)`.
+    /// Workgroup_size is (8, 8, 1) so each thread covers one pixel.
+    pub fn workgroup_count_for_pixels(pixels: u32) -> u32 {
+        pixels.div_ceil(8)
+    }
+
+    /// Encode the per-pixel dispatch into an open compute pass. The
+    /// caller is responsible for setting all four bind groups (`group0`
+    /// pools, `group1` instance state, `group2` proto-lookup, `group3`
+    /// uniforms+camera+output) before calling this.
+    ///
+    /// `screen_width` and `screen_height` MUST match the values written
+    /// into the `MarchUniforms` bound at `group3 binding 0`. The shader
+    /// bounds-checks each thread's `pixel.xy` against the uniform's
+    /// values; mismatched dispatch shape vs uniform sizing would still
+    /// be safe but waste threads.
+    pub fn dispatch_per_pixel(
+        &self,
+        cpass: &mut wgpu::ComputePass<'_>,
+        screen_width: u32,
+        screen_height: u32,
+    ) {
+        cpass.set_pipeline(&self.pipeline);
+        cpass.dispatch_workgroups(
+            Self::workgroup_count_for_pixels(screen_width),
+            Self::workgroup_count_for_pixels(screen_height),
+            1,
+        );
+    }
 }
 
 fn ro_storage(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -265,31 +331,58 @@ mod tests {
         let u = MarchUniforms {
             tile_index_count: 1,
             proto_lookup_count: 2,
-            ray_count: 3,
+            screen_width: 1920,
+            screen_height: 1080,
+            march_max_steps_outer: 256,
+            march_max_steps_brick: 64,
             _pad0: 0,
+            _pad1: 0,
         };
         let bytes: &[u8] = bytemuck::bytes_of(&u);
         let words: &[u32] = bytemuck::cast_slice(bytes);
-        assert_eq!(words, &[1, 2, 3, 0]);
+        assert_eq!(words, &[1, 2, 1920, 1080, 256, 64, 0, 0]);
     }
 
     #[test]
-    fn march_ray_layout_origin_and_dir_match_offsets() {
-        let r = MarchRay {
-            origin: [1.0, 2.0, 3.0],
-            instance_count_per_region: 7,
-            direction: [4.0, 5.0, 6.0],
-            max_steps_outer: 256,
-            max_steps_brick: 64,
-            _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
+    fn march_uniforms_default_loads_step_caps() {
+        let u = MarchUniforms::default();
+        assert_eq!(u.march_max_steps_outer, DEFAULT_MAX_STEPS_OUTER);
+        assert_eq!(u.march_max_steps_brick, DEFAULT_MAX_STEPS_BRICK);
+        assert_eq!(u.tile_index_count, 0);
+        assert_eq!(u.screen_width, 0);
+    }
+
+    #[test]
+    fn camera_uniform_is_80_bytes_prefix_compatible() {
+        // The struct must be exactly 80 B so it slices off the front
+        // of `rkp_scene::CameraUniforms` cleanly. If this assert fails,
+        // Stage 6c's "bind a slice of the renderer camera buffer"
+        // optimisation breaks silently.
+        assert_eq!(std::mem::size_of::<MarchCameraUniform>(), 80);
+        let cam = MarchCameraUniform {
+            position: [1.0, 2.0, 3.0, 1.0],
+            forward: [4.0, 5.0, 6.0, 0.0],
+            right: [7.0, 8.0, 9.0, 0.0],
+            up: [10.0, 11.0, 12.0, 0.0],
+            resolution: [1920.0, 1080.0],
+            jitter: [0.25, -0.25],
         };
-        let bytes: &[u8] = bytemuck::bytes_of(&r);
+        let bytes: &[u8] = bytemuck::bytes_of(&cam);
         let floats: &[f32] = bytemuck::cast_slice(bytes);
-        assert_eq!(floats[0..3], [1.0, 2.0, 3.0]);
-        // Slot 3 is `instance_count_per_region` (a u32) — bitcast 7u → tiny float.
-        assert_eq!(floats[4..7], [4.0, 5.0, 6.0]);
+        assert_eq!(floats[0..4], [1.0, 2.0, 3.0, 1.0]);
+        assert_eq!(floats[4..8], [4.0, 5.0, 6.0, 0.0]);
+        assert_eq!(floats[16..18], [1920.0, 1080.0]);
+        assert_eq!(floats[18..20], [0.25, -0.25]);
+    }
+
+    #[test]
+    fn workgroup_count_rounds_up() {
+        assert_eq!(InstanceMarchPass::workgroup_count_for_pixels(0), 0);
+        assert_eq!(InstanceMarchPass::workgroup_count_for_pixels(1), 1);
+        assert_eq!(InstanceMarchPass::workgroup_count_for_pixels(8), 1);
+        assert_eq!(InstanceMarchPass::workgroup_count_for_pixels(9), 2);
+        assert_eq!(InstanceMarchPass::workgroup_count_for_pixels(1920), 240);
+        assert_eq!(InstanceMarchPass::workgroup_count_for_pixels(1921), 241);
     }
 
     #[test]
