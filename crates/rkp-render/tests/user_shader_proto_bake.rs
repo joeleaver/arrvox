@@ -14,6 +14,9 @@ use rkp_render::user_shader_proto_pass::{
     PrototypeBakePass, PrototypeCache, PrototypeUniform,
 };
 
+const PROTO_BRICK_CAPACITY: u32 = 1024;
+const PROTO_LEAF_ATTR_CAPACITY: u32 = 8192;
+
 const PROTO_MAX_DEPTH: u32 = 2;
 const SHADER_ID: u32 = 1;
 const SOURCE_HASH: u64 = 0xC0FFEE_DEADBEEF;
@@ -150,8 +153,11 @@ fn sphere_prototype_bake_matches_cpu_reference() {
     pass.reload_user_shaders(&device, &chunks.proto, registry.source_hash());
 
     // Allocate a cache slot for the sphere shader. Pool capacities are
-    // small (just enough for one prototype at depth 2).
-    let mut cache = PrototypeCache::with_capacities(1024, 1024, 8192);
+    // small (just enough for one prototype at depth 2). Brick / leaf-
+    // attr capacities double as the GPU overflow gates the bake checks.
+    let mut cache = PrototypeCache::with_capacities(
+        1024, PROTO_BRICK_CAPACITY, PROTO_LEAF_ATTR_CAPACITY,
+    );
     cache.set_pool_bases(POOL_OCTREE_BASE, POOL_BRICK_BASE, POOL_LEAF_ATTR_BASE);
     let (entry, dirty) = cache
         .lookup_or_allocate(SHADER_ID, SOURCE_HASH, PROTO_MAX_DEPTH)
@@ -161,8 +167,9 @@ fn sphere_prototype_bake_matches_cpu_reference() {
     // Build the prototype uniform from the entry.
     let uniform = PrototypeUniform::from_entry(&entry, &cache);
 
-    // Allocate small GPU buffers for the pool storage (octree, brick,
-    // leaf-attr). Sizes are bounded by the cache's bucket extents.
+    // Allocate small GPU buffers for the pool storage. Octree extent
+    // is per-prototype; bricks + leaf-attrs are global, sized to the
+    // pool capacity.
     let octree_buffer_bytes =
         ((entry.octree_extent.0 + entry.octree_extent.1) as u64) * 8 + 16;
     let octree_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -173,8 +180,7 @@ fn sphere_prototype_bake_matches_cpu_reference() {
             | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
-    let brick_buffer_bytes =
-        ((entry.brick_extent.0 + entry.brick_extent.1) as u64) * 64 * 4 + 256;
+    let brick_buffer_bytes = (PROTO_BRICK_CAPACITY as u64) * 64 * 4;
     let brick_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("test brick_pool"),
         size: brick_buffer_bytes,
@@ -183,8 +189,7 @@ fn sphere_prototype_bake_matches_cpu_reference() {
             | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
-    let leaf_attr_buffer_bytes =
-        ((entry.leaf_attr_extent.0 + entry.leaf_attr_extent.1) as u64) * 8 + 16;
+    let leaf_attr_buffer_bytes = (PROTO_LEAF_ATTR_CAPACITY as u64) * 8;
     let leaf_attr_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("test leaf_attr_pool"),
         size: leaf_attr_buffer_bytes,
@@ -208,9 +213,9 @@ fn sphere_prototype_bake_matches_cpu_reference() {
         &octree_init,
     );
 
-    // Reset the per-prototype atomic counters to 0.
-    queue.write_buffer(&pass.proto_brick_alloc_buffer, 0, &[0u8; 4]);
-    queue.write_buffer(&pass.proto_leaf_attr_alloc_buffer, 0, &[0u8; 4]);
+    // Reset the global cursor pair (brick + leaf-attr) to 0 and clear
+    // overflow for this isolated test bake.
+    pass.reset_cursors(&queue);
     queue.write_buffer(&pass.overflow_buffer, 0, &[0u8; 12 * 4]);
 
     // Upload the prototype uniform.
@@ -228,9 +233,8 @@ fn sphere_prototype_bake_matches_cpu_reference() {
             wgpu::BindGroupEntry { binding: 0, resource: octree_buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: brick_buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: leaf_attr_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: pass.proto_brick_alloc_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: pass.proto_leaf_attr_alloc_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: pass.overflow_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: pass.cursors_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: pass.overflow_buffer.as_entire_binding() },
         ],
     });
     let group1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -258,15 +262,16 @@ fn sphere_prototype_bake_matches_cpu_reference() {
         cpass.dispatch_workgroups(bricks_per_axis, bricks_per_axis, bricks_per_axis);
     }
 
-    // Stage the atomic counters for readback.
+    // Stage the global cursor pair for readback. Layout matches the
+    // WGSL `GlobalCursors` struct: brick cursor at byte 0, leaf-attr
+    // cursor at byte 4.
     let alloc_readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("proto alloc readback"),
+        label: Some("proto cursor readback"),
         size: 8,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    encoder.copy_buffer_to_buffer(&pass.proto_brick_alloc_buffer, 0, &alloc_readback, 0, 4);
-    encoder.copy_buffer_to_buffer(&pass.proto_leaf_attr_alloc_buffer, 0, &alloc_readback, 4, 4);
+    encoder.copy_buffer_to_buffer(&pass.cursors_buffer, 0, &alloc_readback, 0, 8);
 
     queue.submit(std::iter::once(encoder.finish()));
 
@@ -331,9 +336,9 @@ fn sphere_prototype_bake_matches_cpu_reference() {
         assert!(is_leaf && is_brick, "leaf-level node {i} has invalid value {value:08x}");
         let brick_id = value & 0x3FFFFFFF;
         assert!(
-            brick_id >= entry.brick_extent.0 && brick_id < entry.brick_extent.0 + entry.brick_extent.1,
-            "brick_id {brick_id} outside extent [{}..{})",
-            entry.brick_extent.0, entry.brick_extent.0 + entry.brick_extent.1,
+            brick_id < PROTO_BRICK_CAPACITY,
+            "brick_id {brick_id} outside global proto brick pool [0, {})",
+            PROTO_BRICK_CAPACITY,
         );
         valid_leaf_count += 1;
     }

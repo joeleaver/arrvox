@@ -119,12 +119,54 @@ const _: () = assert!(std::mem::size_of::<InstanceMarchHit>() == 48);
 
 /// Source-text composition: helpers + main entry. Exposed so tests can
 /// validate the WGSL with naga without going through pipeline creation.
+/// Returns the empty-chunk source — the identity-arm dispatch stubs in
+/// the template stand in for missing user `inst_to_local` / `inst_aabb`
+/// chunks.
 pub fn instance_march_main_source() -> String {
-    format!(
-        "{}\n{}",
-        instance_march_helpers_source(),
-        include_str!("shaders/user_shader_instance_march_main.wgsl"),
-    )
+    compose_march_main_source("", "")
+}
+
+/// Splice the composer's `inst_to_local` and `inst_aabb` chunks into
+/// the march template between their respective BEGIN/END markers. An
+/// empty chunk leaves the template's identity-arm stub in place.
+pub fn compose_march_main_source(
+    inst_to_local_chunk: &str,
+    inst_aabb_chunk: &str,
+) -> String {
+    let template = include_str!("shaders/user_shader_instance_march_main.wgsl");
+    // Marker strings constructed via concat so the literal occurrences
+    // in this docstring don't fool the splicer.
+    let template = splice_marker(
+        template,
+        concat!("USER_INST_TO_LOCAL_DISPATCH", "_BEGIN"),
+        concat!("USER_INST_TO_LOCAL_DISPATCH", "_END"),
+        inst_to_local_chunk,
+    );
+    let template = splice_marker(
+        &template,
+        concat!("USER_INST_AABB_DISPATCH", "_BEGIN"),
+        concat!("USER_INST_AABB_DISPATCH", "_END"),
+        inst_aabb_chunk,
+    );
+    format!("{}\n{}", instance_march_helpers_source(), template)
+}
+
+fn splice_marker(template: &str, begin: &str, end: &str, chunk: &str) -> String {
+    if chunk.is_empty() {
+        return template.to_string();
+    }
+    let begin_idx = template
+        .find(begin)
+        .unwrap_or_else(|| panic!("march template missing {begin} marker"));
+    let end_idx = template[begin_idx..]
+        .find(end)
+        .map(|off| begin_idx + off + end.len())
+        .unwrap_or_else(|| panic!("march template missing {end} marker"));
+    let mut out = String::with_capacity(template.len() + chunk.len());
+    out.push_str(&template[..begin_idx]);
+    out.push_str(chunk);
+    out.push_str(&template[end_idx..]);
+    out
 }
 
 /// Pipeline owner. Construction validates the composed WGSL with naga
@@ -137,6 +179,10 @@ pub struct InstanceMarchPass {
     pub group3_layout: wgpu::BindGroupLayout,
     pub pipeline_layout: wgpu::PipelineLayout,
     pub pipeline: wgpu::ComputePipeline,
+    /// Hash of the user-shader source mix the pipeline was last built
+    /// against. Comparing to the registry's `source_hash` decides
+    /// whether the pipeline needs rebuilding.
+    pub source_hash: u64,
 }
 
 impl InstanceMarchPass {
@@ -275,7 +321,44 @@ impl InstanceMarchPass {
             group3_layout,
             pipeline_layout,
             pipeline,
+            source_hash: 0,
         }
+    }
+
+    /// Re-build the compute pipeline against the spliced inst_to_local
+    /// + inst_aabb chunks. Returns `true` if rebuilt, `false` if the
+    /// hash matched and the existing pipeline was kept. Mirrors
+    /// `PrototypeBakePass::reload_user_shaders`.
+    pub fn reload_user_shaders(
+        &mut self,
+        device: &wgpu::Device,
+        inst_to_local_chunk: &str,
+        inst_aabb_chunk: &str,
+        source_hash: u64,
+    ) -> bool {
+        if source_hash == self.source_hash {
+            return false;
+        }
+        let source = compose_march_main_source(inst_to_local_chunk, inst_aabb_chunk);
+        crate::validate_wgsl(&source, "instance_march_main");
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("instance_march_main"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        self.pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("instance_march_main"),
+            layout: Some(&self.pipeline_layout),
+            module: &module,
+            entry_point: Some("instance_march_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        self.source_hash = source_hash;
+        true
+    }
+
+    pub fn source_hash(&self) -> u64 {
+        self.source_hash
     }
 
     /// Workgroup count along one axis for `pixels`: `ceil(pixels / 8)`.

@@ -378,13 +378,14 @@ struct RenderState {
 const MIN_FRAME_CALLBACK_INTERVAL: std::time::Duration =
     std::time::Duration::from_micros(8_300);
 
-// Option B proto-cache pool capacities (V1). See `RenderState::new` for
-// the rationale on these specific values. Lifted to module-level consts
-// so `tick_instance_pipeline` can reuse them when sizing the scene-pool
-// reservation.
-const INSTANCE_PROTO_OCTREE_CAPACITY_U32: u32 = 64 * 1024;     // 64K nodes (512 KB)
-const INSTANCE_PROTO_BRICK_CAPACITY_BRICKS: u32 = 8 * 1024;    // 8K bricks (2 MB)
-const INSTANCE_PROTO_LEAF_ATTR_CAPACITY_U32: u32 = 64 * 1024;  // 64K slots (512 KB)
+// Option B proto-cache pool capacities. Must match
+// `PROTO_*_CAPACITY_BYTES` in `rkp_scene.rs` — the cache sub-allocates
+// within those GPU buffers, and out-of-bounds writes (via the global
+// brick / leaf-attr cursors) get gated by the bake's overflow check
+// against these caps.
+const INSTANCE_PROTO_OCTREE_CAPACITY_U32: u32 = 32 * 1024 * 1024;       // 32 M nodes (256 MB)
+const INSTANCE_PROTO_BRICK_CAPACITY_BRICKS: u32 = 256 * 1024;           // 256 K bricks (64 MB)
+const INSTANCE_PROTO_LEAF_ATTR_CAPACITY_U32: u32 = 4 * 1024 * 1024;     // 4 M slots (32 MB)
 
 impl RenderState {
     fn new(init: RenderInit) -> Self {
@@ -1688,7 +1689,7 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
         PaintedLeaf,
     };
     use rkp_render::user_shader_proto_pass::{
-        build_internal_levels, PrototypeUniform, MAX_PROTO_DISPATCH_BATCH, MAX_PROTO_MAX_DEPTH,
+        build_internal_levels, PrototypeUniform, MAX_PROTO_MAX_DEPTH,
     };
 
     // 1. Pipeline reload — cheap when source hash unchanged.
@@ -1702,6 +1703,17 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
         &frame.user_shader_emit_chunk,
         frame.user_shader_source_hash,
     );
+    // The march pipeline lives on each ViewportRenderer; rebuild every
+    // VR's copy when the chunks change. Hash gate inside `reload`
+    // makes the no-change frame a no-op.
+    for vr in state.viewport_renderers.values_mut() {
+        vr.instance_march_pass.reload_user_shaders(
+            &state.device,
+            &frame.user_shader_inst_to_local_chunk,
+            &frame.user_shader_inst_aabb_chunk,
+            frame.user_shader_source_hash,
+        );
+    }
 
     // 2. Mark cache entries untouched.
     state.instance_proto_cache.begin_frame();
@@ -1900,9 +1912,11 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
                 &bytes,
             );
 
-            // Reset proto atomic counters + overflow.
-            state.queue.write_buffer(&state.instance_proto_pass.proto_brick_alloc_buffer, 0, &[0u8; 4]);
-            state.queue.write_buffer(&state.instance_proto_pass.proto_leaf_attr_alloc_buffer, 0, &[0u8; 4]);
+            // Reset overflow only — brick + leaf-attr cursors are
+            // PERSISTENT across bakes (different prototypes' slots
+            // interleave in the global pools). Clearing them here
+            // would leak unreachable slots in the previously-baked
+            // prototypes' octree branches.
             state.queue.write_buffer(&state.instance_proto_pass.overflow_buffer, 0, &[0u8; 12 * 4]);
 
             // Upload the prototype uniform.
@@ -1920,9 +1934,8 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
                     wgpu::BindGroupEntry { binding: 0, resource: state.renderer.scene.proto_octree_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 1, resource: state.renderer.scene.proto_brick_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 2, resource: state.renderer.scene.proto_leaf_attr_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: state.instance_proto_pass.proto_brick_alloc_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: state.instance_proto_pass.proto_leaf_attr_alloc_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: state.instance_proto_pass.overflow_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: state.instance_proto_pass.cursors_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: state.instance_proto_pass.overflow_buffer.as_entire_binding() },
                 ],
             });
             let bake_g1 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1943,10 +1956,6 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             cpass.set_bind_group(0, &bake_g0, &[]);
             cpass.set_bind_group(1, &bake_g1, &[]);
             cpass.dispatch_workgroups(bricks_per_axis, bricks_per_axis, bricks_per_axis);
-            // V1: one bake per dispatch, no batching. The
-            // `MAX_PROTO_DISPATCH_BATCH = 16` cap exists for a future
-            // batched-submit optimization; for now we serialize.
-            let _ = MAX_PROTO_DISPATCH_BATCH;
         }
 
         // 8b. Scatter — one dispatch per touched region.

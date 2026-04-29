@@ -188,8 +188,7 @@ fn instance_march_hits_single_scattered_sphere_instance() {
     }
     queue.write_buffer(&octree_buffer, (proto_entry.octree_extent.0 as u64) * 8, &octree_init);
 
-    queue.write_buffer(&proto_pass.proto_brick_alloc_buffer, 0, &[0u8; 4]);
-    queue.write_buffer(&proto_pass.proto_leaf_attr_alloc_buffer, 0, &[0u8; 4]);
+    proto_pass.reset_cursors(&queue);
     queue.write_buffer(&proto_pass.overflow_buffer, 0, &[0u8; 12 * 4]);
     queue.write_buffer(&proto_pass.proto_uniform_buffer, 0, bytemuck::bytes_of(&proto_uniform));
 
@@ -200,9 +199,8 @@ fn instance_march_hits_single_scattered_sphere_instance() {
             wgpu::BindGroupEntry { binding: 0, resource: octree_buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: brick_buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: leaf_attr_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: proto_pass.proto_brick_alloc_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: proto_pass.proto_leaf_attr_alloc_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: proto_pass.overflow_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: proto_pass.cursors_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: proto_pass.overflow_buffer.as_entire_binding() },
         ],
     });
     let proto_g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {

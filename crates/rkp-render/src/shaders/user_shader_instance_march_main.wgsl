@@ -157,6 +157,47 @@ struct InstanceMarchHit {
 @group(3) @binding(1) var<uniform> camera: MarchCameraUniform;
 @group(3) @binding(2) var<storage, read_write> output_hits: array<InstanceMarchHit>;
 
+/// World-space AABB returned by `dispatch_user_inst_aabb`.
+struct Aabb {
+    min: vec3<f32>,
+    max: vec3<f32>,
+}
+
+// USER_INST_TO_LOCAL_DISPATCH_BEGIN
+// Default identity stub — the Rust composer replaces this whole block
+// (markers + body) with per-shader pool-read wrappers + the dispatch
+// switch when any registered shader provides an `inst_to_local` hook.
+// Empty-registry / no-override path falls through to
+// `inst_world_to_local` (translate + uniform-scale).
+fn dispatch_user_inst_to_local(
+    shader_id: u32,
+    base_u32: u32,
+    world_pos: vec3<f32>,
+    fallback_pos: vec3<f32>,
+    fallback_scale: f32,
+) -> vec3<f32> {
+    return inst_world_to_local(world_pos, fallback_pos, fallback_scale);
+}
+// USER_INST_TO_LOCAL_DISPATCH_END
+
+// USER_INST_AABB_DISPATCH_BEGIN
+// Default world-space AABB — `pos ± 0.5 × scale × √3` covers any
+// rotation of the canonical [0, 1]³ cube. Translation-only shaders
+// can use a tighter `pos ± 0.5 × scale` AABB by overriding the hook.
+fn dispatch_user_inst_aabb(
+    shader_id: u32,
+    base_u32: u32,
+    fallback_pos: vec3<f32>,
+    fallback_scale: f32,
+) -> Aabb {
+    let half = fallback_scale * 0.5 * 1.7320508; // √3 ≈ 1.732
+    var a: Aabb;
+    a.min = fallback_pos - vec3<f32>(half);
+    a.max = fallback_pos + vec3<f32>(half);
+    return a;
+}
+// USER_INST_AABB_DISPATCH_END
+
 /// Linear scan `proto_lookup_buffer` for `shader_id`. Returns the entry
 /// pointer (as a copied struct, since arrays-of-storage aren't address-
 /// of-able in WGSL). `found == 0u` when missing.
@@ -264,25 +305,31 @@ fn instance_march_one_ray(ray: MarchRay) -> InstanceMarchHit {
             let inst_scale = read_instance_scale(
                 base, proto.scale_offset_u32, proto.scale_kind,
             );
-            let half = inst_scale * 0.5;
-            let inst_aabb_min = inst_pos - vec3<f32>(half);
-            let inst_aabb_max = inst_pos + vec3<f32>(half);
+            let aabb = dispatch_user_inst_aabb(
+                region.shader_id, base, inst_pos, inst_scale,
+            );
 
             let inst_t = inst_ray_aabb_intersect(
-                ray.origin, inv_dir, inst_aabb_min, inst_aabb_max,
+                ray.origin, inv_dir, aabb.min, aabb.max,
             );
             if inst_t.x > inst_t.y { continue; }
             if inst_t.x > best.t_world { continue; }
 
-            // Transform ray to canonical space. Origin: world-space
-            // start point at the AABB entry. Direction: world dir
-            // scaled by `1/scale` (uniform).
+            // Transform ray to canonical space. Origin and direction
+            // both go through the user's `inst_to_local` (default =
+            // translate + uniform scale). Direction is recovered as a
+            // numerical Jacobian — exact for affine transforms (V1
+            // contract; non-affine deformations need either sphere-
+            // tracing in the descent or per-step transform queries).
             let world_entry = ray.origin + safe_dir * inst_t.x;
-            let local_entry = inst_world_to_local(
-                world_entry, inst_pos, inst_scale,
+            let local_entry = dispatch_user_inst_to_local(
+                region.shader_id, base, world_entry, inst_pos, inst_scale,
             );
-            let inv_s = 1.0 / max(inst_scale, 1e-10);
-            let local_dir = safe_dir * inv_s;
+            let local_endpoint = dispatch_user_inst_to_local(
+                region.shader_id, base, world_entry + safe_dir,
+                inst_pos, inst_scale,
+            );
+            let local_dir = local_endpoint - local_entry;
 
             let hit = inst_proto_descend(
                 local_entry, local_dir,
@@ -292,11 +339,15 @@ fn instance_march_one_ray(ray: MarchRay) -> InstanceMarchHit {
 
             if hit.hit == 0u { continue; }
 
-            // Convert canonical-space `t` to world-space. The local
-            // direction was scaled by `1/scale`, so canonical `t`
-            // corresponds to a world-space distance of
-            // `world_t = inst_t.x + hit.t * scale`.
-            let world_t = inst_t.x + hit.t * inst_scale;
+            // The descent walks `local_origin + t × local_dir` for
+            // parametric t. With our numerical-Jacobian `local_dir =
+            // M × world_dir` (M = inst_to_local's 3×3 linear part) and
+            // unit world_dir, the descent's t equals world distance s
+            // along the ray — `s × local_dir = s × M × world_dir =
+            // local_pos(s)`. So `world_t = inst_t.x + hit.t` directly,
+            // no scale multiplier (the old `× inst_scale` was a bug
+            // hidden by tests using scale = 1.0).
+            let world_t = inst_t.x + hit.t;
             if world_t >= best.t_world { continue; }
 
             best.hit = 1u;
@@ -304,7 +355,15 @@ fn instance_march_one_ray(ray: MarchRay) -> InstanceMarchHit {
             best.instance_index = ii;
             best.leaf_attr_slot = hit.leaf_attr_slot;
             best.t_world = world_t;
-            best.material_packed = hit.material_local;
+            // V1 host-material inheritance (locked Stage 1 design).
+            // Pack `region.material_id` (the painted host material, 16-bit
+            // primary slot) into the same `pri | sec<<16 | bw<<28` shape
+            // the bake writes into LeafAttr — the composite shader unpacks
+            // by that schema. Secondary + blend stay 0 in V1; if a future
+            // shader wants its own structural blend (blade tip darker via
+            // blend_weight + secondary slot), that lands with a per-shader
+            // opt-out flag, not by re-litigating the V1 default.
+            best.material_packed = region.material_id & 0xFFFFu;
             best.normal = hit.normal;
         }
     }

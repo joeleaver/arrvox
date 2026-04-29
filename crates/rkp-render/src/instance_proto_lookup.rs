@@ -237,8 +237,6 @@ mod tests {
             source_hash: 0,
             max_depth,
             octree_extent: (octree_offset, 64),
-            brick_extent: (0, 64),
-            leaf_attr_extent: (0, 64),
             touched_this_frame: true,
         }
     }

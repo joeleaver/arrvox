@@ -858,6 +858,20 @@ pub struct ComposedChunks {
     /// `emit_instance(` calls textually rewritten to the per-shader
     /// generated form.
     pub emit: String,
+    /// Spliced into `user_shader_instance_march_main.wgsl` between
+    /// the `USER_INST_TO_LOCAL_DISPATCH_*` markers. Defines per-shader
+    /// pool-read wrappers + `dispatch_user_inst_to_local(shader_id,
+    /// base_u32, world_pos, fallback_pos, fallback_scale)`. Identity
+    /// default arm calls `inst_world_to_local` (translate + uniform
+    /// scale).
+    pub inst_to_local: String,
+    /// Spliced into `user_shader_instance_march_main.wgsl` between
+    /// the `USER_INST_AABB_DISPATCH_*` markers. Defines per-shader
+    /// pool-read wrappers + `dispatch_user_inst_aabb(shader_id,
+    /// base_u32, fallback_pos, fallback_scale) -> Aabb`. Identity
+    /// default arm returns `pos ± 0.5 × scale × √3` (covers any
+    /// rotation of the canonical [0, 1]³ cube).
+    pub inst_aabb: String,
 }
 
 /// Compose the per-pipeline dispatch chunks. Returns identity-default
@@ -871,6 +885,8 @@ pub fn compose(reg: &UserShaderRegistry) -> ComposedChunks {
         generate: compose_generate_chunk(reg),
         proto: compose_proto_chunk(reg),
         emit: compose_emit_chunk(reg),
+        inst_to_local: compose_inst_to_local_chunk(reg),
+        inst_aabb: compose_inst_aabb_chunk(reg),
     }
 }
 
@@ -1164,6 +1180,186 @@ fn compose_generate_chunk(reg: &UserShaderRegistry) -> String {
         }
     }
     out.push_str("        default: { return voxel_emit_skip(); }\n");
+    out.push_str("    }\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Generate a `var inst: <Struct>; inst.field = ...;` block that reads
+/// the per-field bytes out of `instance_pool[base_u32 + offset]` into
+/// a local. Mirrors [`generate_emit_instance`] but as READS, used by
+/// the inst_to_local + inst_aabb wrappers to reconstruct the user's
+/// struct from the global pool at march time.
+fn generate_read_instance(layout: &InstanceLayout) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("    var inst: {};\n", layout.struct_name));
+    for field in &layout.fields {
+        let u32_offset = field.byte_offset / 4;
+        match field.ty {
+            WgslType::F32 => out.push_str(&format!(
+                "    inst.{name} = bitcast<f32>(instance_pool[base_u32 + {u32_offset}u]);\n",
+                name = field.name,
+            )),
+            WgslType::U32 => out.push_str(&format!(
+                "    inst.{name} = instance_pool[base_u32 + {u32_offset}u];\n",
+                name = field.name,
+            )),
+            WgslType::I32 => out.push_str(&format!(
+                "    inst.{name} = bitcast<i32>(instance_pool[base_u32 + {u32_offset}u]);\n",
+                name = field.name,
+            )),
+            WgslType::Vec2F32 => {
+                out.push_str(&format!(
+                    "    inst.{name} = vec2<f32>(\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n    );\n",
+                    u32_offset, u32_offset + 1, name = field.name,
+                ));
+            }
+            WgslType::Vec3F32 => {
+                out.push_str(&format!(
+                    "    inst.{name} = vec3<f32>(\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n    );\n",
+                    u32_offset, u32_offset + 1, u32_offset + 2, name = field.name,
+                ));
+            }
+            WgslType::Vec4F32 => {
+                out.push_str(&format!(
+                    "    inst.{name} = vec4<f32>(\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n    );\n",
+                    u32_offset, u32_offset + 1, u32_offset + 2, u32_offset + 3, name = field.name,
+                ));
+            }
+        }
+    }
+    out
+}
+
+fn compose_inst_to_local_chunk(reg: &UserShaderRegistry) -> String {
+    let mut out = String::new();
+    out.push_str("// ── user-shader bodies: inst_to_local ─────────────────\n");
+    // Splice instance struct decls + helper structs from each shader
+    // that has the inst_to_local hook (helpers + decls already came
+    // through the proto/emit chunks, but the march template doesn't
+    // include those — the chunk has to be self-contained).
+    for entry in &reg.entries {
+        if entry.inst_to_local_text.is_some() {
+            for sd in &entry.struct_decls {
+                out.push_str(sd);
+                out.push('\n');
+            }
+            for helper in &entry.helpers {
+                out.push_str(helper);
+                out.push('\n');
+            }
+        }
+    }
+    // Per-shader user fn body (renamed) + pool-read wrapper.
+    for entry in &reg.entries {
+        if let Some(text) = &entry.inst_to_local_text {
+            let layout = entry
+                .instance_layout
+                .as_ref()
+                .expect("inst_to_local hook implies @instance_proto layout parsed");
+            let renamed = rewrite_fn_name(
+                text,
+                &format!("user_{}_inst_to_local", entry.name),
+                &format!("rkp_user_{}_inst_to_local", entry.id),
+            );
+            out.push_str(&renamed);
+            out.push('\n');
+            // Wrapper: read instance from pool at base_u32, call user fn.
+            out.push_str(&format!(
+                "fn rkp_user_{}_inst_to_local_at(base_u32: u32, world_pos: vec3<f32>) -> vec3<f32> {{\n",
+                entry.id,
+            ));
+            out.push_str(&generate_read_instance(layout));
+            out.push_str(&format!(
+                "    return rkp_user_{}_inst_to_local(world_pos, inst);\n}}\n",
+                entry.id,
+            ));
+        }
+    }
+    out.push_str("\n// ── dispatch_user_inst_to_local ───────────────────────\n");
+    out.push_str(
+        "fn dispatch_user_inst_to_local(shader_id: u32, base_u32: u32, world_pos: vec3<f32>, fallback_pos: vec3<f32>, fallback_scale: f32) -> vec3<f32> {\n",
+    );
+    out.push_str("    switch shader_id {\n");
+    for entry in &reg.entries {
+        if entry.inst_to_local_text.is_some() {
+            out.push_str(&format!(
+                "        case {}u: {{ return rkp_user_{}_inst_to_local_at(base_u32, world_pos); }}\n",
+                entry.id, entry.id,
+            ));
+        }
+    }
+    out.push_str(
+        "        default: { return inst_world_to_local(world_pos, fallback_pos, fallback_scale); }\n",
+    );
+    out.push_str("    }\n");
+    out.push_str("}\n");
+    out
+}
+
+fn compose_inst_aabb_chunk(reg: &UserShaderRegistry) -> String {
+    let mut out = String::new();
+    out.push_str("// ── user-shader bodies: inst_aabb ─────────────────────\n");
+    // Same self-contained-chunk pattern as inst_to_local. Note the
+    // structs + helpers spliced here may DUPLICATE those spliced by
+    // inst_to_local at the same template scope — naga rejects double
+    // declaration. Skip them when inst_to_local already emitted.
+    for entry in &reg.entries {
+        if entry.inst_aabb_text.is_some() && entry.inst_to_local_text.is_none() {
+            for sd in &entry.struct_decls {
+                out.push_str(sd);
+                out.push('\n');
+            }
+            for helper in &entry.helpers {
+                out.push_str(helper);
+                out.push('\n');
+            }
+        }
+    }
+    for entry in &reg.entries {
+        if let Some(text) = &entry.inst_aabb_text {
+            let layout = entry
+                .instance_layout
+                .as_ref()
+                .expect("inst_aabb hook implies @instance_proto layout parsed");
+            let renamed = rewrite_fn_name(
+                text,
+                &format!("user_{}_inst_aabb", entry.name),
+                &format!("rkp_user_{}_inst_aabb", entry.id),
+            );
+            out.push_str(&renamed);
+            out.push('\n');
+            out.push_str(&format!(
+                "fn rkp_user_{}_inst_aabb_at(base_u32: u32) -> Aabb {{\n",
+                entry.id,
+            ));
+            out.push_str(&generate_read_instance(layout));
+            out.push_str(&format!(
+                "    return rkp_user_{}_inst_aabb(inst);\n}}\n",
+                entry.id,
+            ));
+        }
+    }
+    out.push_str("\n// ── dispatch_user_inst_aabb ───────────────────────────\n");
+    out.push_str(
+        "fn dispatch_user_inst_aabb(shader_id: u32, base_u32: u32, fallback_pos: vec3<f32>, fallback_scale: f32) -> Aabb {\n",
+    );
+    out.push_str("    switch shader_id {\n");
+    for entry in &reg.entries {
+        if entry.inst_aabb_text.is_some() {
+            out.push_str(&format!(
+                "        case {}u: {{ return rkp_user_{}_inst_aabb_at(base_u32); }}\n",
+                entry.id, entry.id,
+            ));
+        }
+    }
+    out.push_str("        default: {\n");
+    out.push_str("            let half = fallback_scale * 0.5 * 1.7320508;\n");
+    out.push_str("            var a: Aabb;\n");
+    out.push_str("            a.min = fallback_pos - vec3<f32>(half);\n");
+    out.push_str("            a.max = fallback_pos + vec3<f32>(half);\n");
+    out.push_str("            return a;\n");
+    out.push_str("        }\n");
     out.push_str("    }\n");
     out.push_str("}\n");
     out

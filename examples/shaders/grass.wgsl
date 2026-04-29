@@ -3,113 +3,265 @@
 // Drop this into your project's `assets/shaders/grass.wgsl`. Then
 // create a material whose `shader` field is `"grass"` and paint that
 // material onto an entity's surface. The engine's per-frame
-// `tick_instance_pipeline` (rkp-engine/src/render_worker.rs) will
-// detect the painted material, bake the blade prototype, scatter one
-// blade per surface sample, march it per-pixel, and composite into
-// the merged G-buffer that shade reads from.
+// `tick_instance_pipeline` (rkp-engine/src/render_worker.rs) detects
+// the painted material, bakes the blade prototype, scatters blades on
+// every painted leaf, marches them per-pixel, and composites into the
+// merged G-buffer that shade reads from.
 //
-// Locked Option B authoring API (Stage 1 memo): WGSL-only,
-// `// @instance_proto <Struct>` directive + struct decl + the four
-// hooks (proto / emit / optional inst_aabb / optional inst_to_local).
-// See `crates/rkp-render/src/shaders/user_shader_proto.wgsl` and
-// `..._emit.wgsl` for the in-tree templates that surround this shader
-// at compose time.
+// Locked Option B authoring API: WGSL-only, `// @instance_proto
+// <Struct>` directive + struct decl + the four hooks (proto / emit /
+// optional inst_aabb / optional inst_to_local). With the inst_to_local
+// hook wired through the march, the V1 transform contract is AFFINE:
+// translate + rotation + uniform scale + linear skew. Grass uses all
+// four: position, yaw rotation, blade-height scale, and a per-blade
+// lean that linearly displaces the tip. Per-blade width scaling rides
+// on the same hook (affine X-axis dilation around the blade's
+// centerline).
 
-// ── Metadata directives ─────────────────────────────────────────────
-// Region inputs the engine uses when emitting per-region scatter
-// requests. See `lifecycle.rs::submit_render_frame` (the painted-AABB
-// walk + emit loop).
-//
-// max_depth: bake-time prototype octree depth. Each level doubles
-//            per-axis voxel count; depth 3 = 32³ voxels per blade.
-// region_thickness: world-space band above the painted surface inside
-//                   which blades scatter. 0.6 m here = blades up to
-//                   ~60 cm reach.
-// cell_size: host-space sample-grid cell (= brick-parent / 4 on the
-//            emit path). Smaller = denser blade carpet.
+// ── Region directives ───────────────────────────────────────────────
+// max_depth 5 → 128 canonical cells per axis. At blade_height=0.4 m
+// that's ~3 mm cells — fine enough for a real grass-blade silhouette
+// without losing the tip in staircase.
 
-// @max_depth 3
-// @region_thickness 0.6
+// @max_depth 5
+// @region_thickness 1.5
 // @cell_size 0.04
+// @animated
+
+// ── Per-material params ─────────────────────────────────────────────
+
+// @param blade_height:  f32 = 0.35, range = [0.05, 1.5]
+// @param blade_width:   f32 = 1.0,  range = [0.2, 3.0]
+// @param height_jitter: f32 = 0.25, range = [0.0, 0.8]
+// @param density:       f32 = 1.0,  range = [0.01, 4.0]
+// @param pos_jitter:    f32 = 0.5,  range = [0.0, 1.0]
+// @param lean_amount:   f32 = 0.15, range = [0.0, 0.6]
+// @param wind_amp:      f32 = 0.08, range = [0.0, 0.3]
+// @param wind_freq:     f32 = 1.5,  range = [0.0, 6.0]
 
 // ── Per-instance state struct ───────────────────────────────────────
 // Tagged-field discovery (see `crates/rkp-render/src/instance_proto.rs`):
-//   * `pos: vec3<f32>` — required, sets the instance's world origin.
-//   * `yaw: f32` — optional, here just rides along (V1 march doesn't
-//     use it; reserved for V2 rotation).
-// 16 bytes total (well under the 32 B soft cap, 64 B hard cap).
+//   * `pos: vec3<f32>` — required. Center of the blade's AABB cube.
+//   * `scale: f32` — uniform world-space side of the AABB. Drives blade
+//     height (with jitter); also the proto's overall extent.
+//   * `yaw: f32` — Y-axis rotation in radians, per-blade random.
+//   * `width: f32` — per-blade canonical-X dilation. >1 widens, <1
+//     narrows; applied around the blade centerline (canonical x = 0.5)
+//     in `inst_to_local`. Materializes the `@param blade_width` slider.
+//   * `lean: vec2<f32>` — per-blade tip lean in canonical units, post-
+//     yaw. lean ∈ [-0.5, 0.5] is roughly "tip moves up to 0.5 × scale m
+//     horizontally." Animated each frame for wind sway.
+// Total: 32 B (`width` packs into the natural pad before vec2's 8 B
+// alignment, so the struct stays at the soft cap).
 
 // @instance_proto Blade
 struct Blade {
     pos: vec3<f32>,
+    scale: f32,
     yaw: f32,
+    width: f32,
+    lean: vec2<f32>,
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+fn grass_hash_u01(seed: u32) -> f32 {
+    var x = seed;
+    x = x ^ (x >> 16u);
+    x = x * 0x7feb352du;
+    x = x ^ (x >> 15u);
+    x = x * 0x846ca68bu;
+    x = x ^ (x >> 16u);
+    return f32(x) / 4294967295.0;
+}
+
+fn grass_seed_from_pos(p: vec3<f32>) -> u32 {
+    return bitcast<u32>(p.x) ^ (bitcast<u32>(p.y) * 0x9E3779B9u)
+        ^ (bitcast<u32>(p.z) * 0x85EBCA6Bu);
 }
 
 // ── Prototype hook ──────────────────────────────────────────────────
-// Called for every cell in canonical [0,1]³ during the bake compute
-// dispatch. Returns a `VoxelEmit` describing whether this cell is
-// inside the prototype shape (occupancy=1) and, if so, its surface
-// normal + materials. The bake writes occupied cells into the
-// prototype octree's leaf level.
+// Bakes the static blade silhouette in canonical [0,1]³. Real grass-
+// blade dimensions: ~3-5 mm wide at base, tapering to a point, ~0.5 mm
+// thick. At `blade_height = 0.4 m` (the canonical 1-unit), 3 mm = 0.0075
+// canonical, so half-width 0.025 covers a ~20 mm-wide blade tapering to
+// a point. Thickness `half_thick_z = 0.008` is just above the cell size
+// at depth 5, so the blade is one cell deep — properly thin.
 //
-// The blade is a thin column tapering from the base. Centered on
-// (0.5, *, 0.5) with radius lerping from 0.10 at the base to 0.015
-// at the tip. y=0 is the painted surface; y=1 is the tip.
+// Bake-time `bake_curve` leans the tip in +X canonical. Per-instance
+// `lean` adds linear skew on top via inst_to_local; per-instance `width`
+// dilates X around the centerline.
+//
+// Resolution floor for the tip taper: at @max_depth 5 the canonical
+// cell size is 1/128 ≈ 0.0078, so a half-width below ~half a cell
+// (0.0039) lives between cell centers and produces speckly gaps as
+// the blade tapers. Clipping the blade where `raw_half_width` drops
+// below `min_half_width` makes the silhouette end cleanly above the
+// resolution floor — short of an actual point, but visually clean
+// (vs. a noisy stippled tip). For higher @max_depth, lower this
+// constant proportionally.
 fn user_grass_proto(uvw: vec3<f32>) -> VoxelEmit {
     var v: VoxelEmit;
     v.occupancy = 0u;
 
-    let to_axis = uvw.xz - vec2<f32>(0.5, 0.5);
-    let r = length(to_axis);
-    let max_radius = mix(0.10, 0.015, uvw.y);
-    if (uvw.y < 1.0 && r < max_radius) {
+    let bake_curve = 0.10;
+    let curve_x = bake_curve * uvw.y * uvw.y;
+
+    // Tapered ribbon: base half-width 0.025, linear taper toward 0;
+    // clipped at the resolution-limited tip rather than letting it
+    // disintegrate.
+    let raw_half_width = 0.025 * (1.0 - uvw.y);
+    let min_half_width = 0.005;
+    if (raw_half_width < min_half_width) {
+        return v;
+    }
+    let half_width_x = raw_half_width;
+    let half_thick_z = 0.008;
+
+    let dx = uvw.x - 0.5 - curve_x;
+    let dz = uvw.z - 0.5;
+
+    if (uvw.y < 1.0 && abs(dx) < half_width_x && abs(dz) < half_thick_z) {
         v.occupancy = 1u;
-        // Outward-radial normal with a small upward bias — reads as
-        // the side of a thin blade leaning slightly toward the tip.
-        v.normal = normalize(vec3<f32>(to_axis.x, 0.3, to_axis.y));
-        // Material primary = 1 means "use the host material's slot 1
-        // shading parameters." This isn't host material inheritance
-        // (the engine handles that elsewhere); it's a placeholder.
-        // V2: the composer will splice in `region.material_id` so
-        // each instance picks up the painted host's shading.
-        v.material_primary = 1u;
+        // Outward-radial normal in the XZ plane with a small +Y tilt
+        // — gives the shade pass a top-vs-side cue. Length is normalized
+        // by the bake's pack_oct so magnitude is irrelevant here.
+        v.normal = normalize(vec3<f32>(dx, 0.35, dz));
+        v.material_primary = 0u;
         v.material_secondary = 0u;
         v.blend_weight = 0u;
     }
     return v;
 }
 
-// ── Emit hook ───────────────────────────────────────────────────────
-// Called once per `(host_pos, host)` sample during the per-region
-// scatter dispatch. Calls `emit_instance(blade)` zero or more times
-// to atomic-append blades into this region's slice of the global
-// instance pool.
+// ── inst_to_local hook ──────────────────────────────────────────────
+// Map a world-space point into the blade's canonical [0, 1]³ space.
 //
-// Strategy: emit exactly one blade per surface sample where the
-// painted material matches this shader's material_id and the surface
-// is upward-facing. Higher densities can come from either:
-//   * a smaller `@cell_size` directive above (more samples per area);
-//   * emitting multiple blades per sample with a sub-grid offset.
-// V1 sticks to one-per-sample for simplicity.
+// Forward composition (canonical → world):
+//   1. Apply width: `pre_lean.x = 0.5 + width × (canonical.x - 0.5)`
+//   2. Apply linear lean: `unscaled.xz = pre_lean.xz + lean × canonical.y`
+//      `unscaled.y = canonical.y`
+//   3. Centre + scale: `unrot = (unscaled - 0.5) × scale`
+//   4. Yaw rotation around Y, then translate by `inst.pos`.
+//
+// Inverting: untranslate, un-yaw, unscale; back out the linear lean
+// using `canonical.y = unscaled.y` (lean doesn't affect Y → closed-form
+// inverse, no iteration); then divide out the width dilation.
+fn user_grass_inst_to_local(world_pos: vec3<f32>, inst: Blade) -> vec3<f32> {
+    let local = world_pos - inst.pos;
+    let cy = cos(-inst.yaw);
+    let sy = sin(-inst.yaw);
+    let unrot = vec3<f32>(
+        local.x * cy - local.z * sy,
+        local.y,
+        local.x * sy + local.z * cy,
+    );
+    let unscaled = unrot / inst.scale + vec3<f32>(0.5);
+    let canon_y = unscaled.y;
+    let pre_lean_x = unscaled.x - inst.lean.x * canon_y;
+    let canon_z = unscaled.z - inst.lean.y * canon_y;
+    // Undo width dilation: pre_lean is in "world-canonical-after-lean"
+    // coordinates with the blade centered at 0.5 and dilated by width.
+    // Map back to proto-canonical so the proto query lands on the
+    // narrower pre-baked silhouette.
+    let canon_x = (pre_lean_x - 0.5) / max(inst.width, 1e-3) + 0.5;
+    return vec3<f32>(canon_x, canon_y, canon_z);
+}
+
+// ── inst_aabb hook ──────────────────────────────────────────────────
+// Tight world-space bounds for the bent + rotated + width-dilated
+// blade. Iterates 8 canonical corners through the FORWARD map; the
+// convex hull of those corners encloses everything in [0, 1]³.
+fn user_grass_inst_aabb(inst: Blade) -> Aabb {
+    let cy_yaw = cos(inst.yaw);
+    let sy_yaw = sin(inst.yaw);
+    var amin = vec3<f32>(1.0e30);
+    var amax = vec3<f32>(-1.0e30);
+    for (var i: u32 = 0u; i < 8u; i = i + 1u) {
+        let cx = f32((i >> 0u) & 1u);
+        let cyc = f32((i >> 1u) & 1u);
+        let cz = f32((i >> 2u) & 1u);
+        // Forward (canonical → world):
+        //   pre_lean.x = 0.5 + width × (canonical.x - 0.5)
+        //   unscaled.xz = pre_lean.xz + lean × canonical.y
+        //   unrot = (unscaled - 0.5) × scale
+        //   world = R(yaw) × unrot + pos
+        let pre_lean_x = 0.5 + inst.width * (cx - 0.5);
+        let us_x = pre_lean_x + inst.lean.x * cyc;
+        let us_y = cyc;
+        let us_z = cz + inst.lean.y * cyc;
+        let ur_x = (us_x - 0.5) * inst.scale;
+        let ur_y = (us_y - 0.5) * inst.scale;
+        let ur_z = (us_z - 0.5) * inst.scale;
+        let wx = ur_x * cy_yaw - ur_z * sy_yaw + inst.pos.x;
+        let wy = ur_y + inst.pos.y;
+        let wz = ur_x * sy_yaw + ur_z * cy_yaw + inst.pos.z;
+        let p = vec3<f32>(wx, wy, wz);
+        amin = min(amin, p);
+        amax = max(amax, p);
+    }
+    var a: Aabb;
+    a.min = amin;
+    a.max = amax;
+    return a;
+}
+
+// ── Emit hook ───────────────────────────────────────────────────────
 fn user_grass_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) {
-    // Off the host surface — nothing to grow on.
-    if (host.distance > ctx.cell_size) {
-        return;
-    }
-    // Painted material must match this shader's material — otherwise
-    // the sample is an unpainted bit of the host where we shouldn't
-    // grow grass.
-    if (host.material != ctx.material_id) {
-        return;
-    }
-    // Don't grow grass on ceilings or steep walls. y > 0.5 → angle
-    // less than ~60° from vertical.
     if (host.normal.y < 0.5) {
         return;
     }
 
-    var b: Blade;
-    b.pos = host_pos;
-    b.yaw = 0.0;
-    emit_instance(b);
+    let blade_height  = ctx.params[0];
+    let blade_width   = ctx.params[1];
+    let height_jitter = ctx.params[2];
+    let density       = ctx.params[3];
+    let pos_jitter    = ctx.params[4];
+    let lean_amount   = ctx.params[5];
+    let wind_amp      = ctx.params[6];
+    let wind_freq     = ctx.params[7];
+
+    let base_seed = grass_seed_from_pos(host_pos);
+    let count_full = u32(floor(density));
+    let extra_p = density - f32(count_full);
+
+    let total_max = count_full + 1u;
+    var i: u32 = 0u;
+    loop {
+        if (i >= total_max || i >= 5u) { break; }
+
+        let s0 = base_seed ^ (i * 0x9E3779B9u);
+        let r_density = grass_hash_u01(s0);
+        let r_jx      = grass_hash_u01(s0 ^ 0xBF58476Du);
+        let r_jz      = grass_hash_u01(s0 ^ 0x94D049BBu);
+        let r_height  = grass_hash_u01(s0 ^ 0xCBF29CE4u);
+        let r_yaw     = grass_hash_u01(s0 ^ 0xA2B5C7D9u);
+        let r_lean_x  = grass_hash_u01(s0 ^ 0xC2B2AE35u);
+        let r_lean_z  = grass_hash_u01(s0 ^ 0xD3B5C7E1u);
+        let r_phase   = grass_hash_u01(s0 ^ 0xFEEDFACEu);
+
+        if (i == count_full && r_density >= extra_p) { break; }
+
+        let jitter_radius = ctx.cell_size * pos_jitter;
+        let jx = (r_jx - 0.5) * 2.0 * jitter_radius;
+        let jz = (r_jz - 0.5) * 2.0 * jitter_radius;
+
+        let h_factor = 1.0 + (r_height - 0.5) * 2.0 * height_jitter;
+        let h = max(blade_height * h_factor, 1.0e-3);
+
+        let phase = r_phase * 6.28318530718;
+        let wind_x = sin(ctx.time * wind_freq + phase) * wind_amp;
+        let wind_z = cos(ctx.time * wind_freq + phase * 0.73) * wind_amp;
+        let base_lean_x = (r_lean_x - 0.5) * 2.0 * lean_amount;
+        let base_lean_z = (r_lean_z - 0.5) * 2.0 * lean_amount;
+
+        var b: Blade;
+        b.pos = vec3<f32>(host_pos.x + jx, host_pos.y + 0.5 * h, host_pos.z + jz);
+        b.scale = h;
+        b.yaw = r_yaw * 6.28318530718;
+        b.width = max(blade_width, 1.0e-3);
+        b.lean = vec2<f32>(base_lean_x + wind_x, base_lean_z + wind_z);
+        emit_instance(b);
+
+        i = i + 1u;
+    }
 }

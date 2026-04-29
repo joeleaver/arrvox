@@ -67,33 +67,42 @@ struct VoxelEmit {
 // One prototype to bake this dispatch. The Rust pass writes one of
 // these per dirty shader and dispatches with it bound at group(1).
 //
-// `octree_leaf_offset` is the absolute index of the FIRST leaf-level
-// octree slot for this prototype (i.e. octree_block_offset +
-// level_starts[max_depth]). The bake's workgroups land at
-// `octree_leaf_offset + morton(wid)`.
+// `octree_leaf_offset` is the absolute pool index of the FIRST
+// leaf-level octree slot for this prototype (CPU pre-builds the
+// internal levels at `octree_block_offset + level_starts[max_depth]`).
+// The bake's workgroups land at `octree_leaf_offset + morton(wid)`.
+//
+// Bricks and leaf-attrs are allocated from GLOBAL atomic cursors in
+// `GlobalCursors` — they're persistent across bake dispatches so
+// successive prototype bakes accumulate slots. `brick_capacity` and
+// `leaf_attr_capacity` are the proto-pool's total slot budgets, used
+// as overflow gates so an over-budget bake degrades to OCTREE_EMPTY
+// at the offending cells rather than corrupting downstream pools.
 struct PrototypeUniform {
     shader_id: u32,
     max_depth: u32,
-    // Brick block: `brick_block_offset` is the global pool index of
-    // this prototype's first brick slot; `brick_block_size` is the
-    // bucket-allocated extent. Same units as `user_shader_geom.wgsl`.
-    brick_block_offset: u32,
-    brick_block_size: u32,
-    leaf_attr_block_offset: u32,
-    leaf_attr_block_size: u32,
     octree_leaf_offset: u32,
-    _pad: u32,
+    brick_capacity: u32,
+    leaf_attr_capacity: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+// GLOBAL bricks + leaf-attrs cursors. Single-pair atomic counters bumped
+// once per emitted brick / leaf-attr across the entire proto pool.
+// Different prototypes interleave; the march follows octree → brick_id
+// → leaf_attr_id pointers, which are absolute, so layout doesn't matter.
+struct GlobalCursors {
+    brick: atomic<u32>,
+    leaf_attr: atomic<u32>,
 }
 
 @group(0) @binding(0) var<storage, read_write> octree_nodes: array<vec2<u32>>;
 @group(0) @binding(1) var<storage, read_write> brick_pool: array<u32>;
 @group(0) @binding(2) var<storage, read_write> leaf_attr_pool: array<LeafAttr>;
-// Per-shader atomic counters — array indexed by `proto_index` for the
-// dirty prototypes baked this frame. The Rust pass resets them to 0
-// before dispatch and reads them back asynchronously for diagnostics.
-@group(0) @binding(3) var<storage, read_write> proto_brick_alloc: array<atomic<u32>>;
-@group(0) @binding(4) var<storage, read_write> proto_leaf_attr_alloc: array<atomic<u32>>;
-@group(0) @binding(5) var<storage, read_write> overflow: array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> cursors: GlobalCursors;
+@group(0) @binding(4) var<storage, read_write> overflow: array<atomic<u32>>;
 
 @group(1) @binding(0) var<uniform> proto_u: PrototypeUniform;
 
@@ -102,10 +111,6 @@ struct PrototypeUniform {
 var<workgroup> wg_any_emit: atomic<u32>;
 var<workgroup> wg_brick_offset: u32;
 var<workgroup> wg_alloc_failed: atomic<u32>;
-// Index this prototype occupies in the per-frame dirty-prototype list.
-// The Rust pass uses workgroup_id.x's high bits via PrototypeUniform —
-// here we just keep it 0 because each dispatch carries its own uniform.
-const PROTO_INDEX: u32 = 0u;
 
 fn pack_oct(n: vec3<f32>) -> u32 {
     let l1 = abs(n.x) + abs(n.y) + abs(n.z);
@@ -198,15 +203,15 @@ fn proto_bake_main(
 
     // Cooperative deferred brick allocation. Thread 0 claims a brick
     // slot iff at least one cell voted yes; otherwise leave the leaf
-    // octree slot at OCTREE_EMPTY.
+    // octree slot at OCTREE_EMPTY. The brick id is GLOBAL — bumped from
+    // the cross-bake `cursors.brick` counter.
     if (cell_idx == 0u) {
         if (atomicLoad(&wg_any_emit) != 0u) {
-            let brick_slot = atomicAdd(&proto_brick_alloc[PROTO_INDEX], 1u);
-            if (brick_slot >= proto_u.brick_block_size) {
+            let brick_id = atomicAdd(&cursors.brick, 1u);
+            if (brick_id >= proto_u.brick_capacity) {
                 atomicAdd(&overflow[OVERFLOW_BRICK], 1u);
                 atomicStore(&wg_alloc_failed, 1u);
             } else {
-                let brick_id = proto_u.brick_block_offset + brick_slot;
                 wg_brick_offset = brick_id * BRICK_CELLS;
                 octree_nodes[leaf_octree_offset] = vec2<u32>(
                     OCTREE_LEAF_BIT | OCTREE_BRICK_BIT | brick_id,
@@ -228,13 +233,12 @@ fn proto_bake_main(
         brick_pool[brick_slot_idx] = BRICK_CELL_EMPTY;
         return;
     }
-    let local_id = atomicAdd(&proto_leaf_attr_alloc[PROTO_INDEX], 1u);
-    if (local_id >= proto_u.leaf_attr_block_size) {
+    let global_slot = atomicAdd(&cursors.leaf_attr, 1u);
+    if (global_slot >= proto_u.leaf_attr_capacity) {
         atomicAdd(&overflow[OVERFLOW_LEAF_ATTR], 1u);
         brick_pool[brick_slot_idx] = BRICK_CELL_EMPTY;
         return;
     }
-    let global_slot = proto_u.leaf_attr_block_offset + local_id;
     var attr: LeafAttr;
     attr.normal_oct = pack_oct(emit.normal);
     let pri = emit.material_primary & 0xFFFFu;

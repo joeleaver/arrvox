@@ -10,8 +10,9 @@
 //!
 //! 1. `PrototypeCache::lookup_or_allocate(shader_id, source_hash, max_depth)`
 //!    returns an entry. If `source_hash` matches the cached value, the
-//!    entry is clean — bake is skipped. Otherwise the old extents are
-//!    freed and fresh ones allocated; the entry is marked dirty.
+//!    entry is clean — bake is skipped. Otherwise a fresh octree extent
+//!    is allocated (or reused from a same-sized free-list slot) and the
+//!    entry is marked dirty.
 //! 2. For each dirty entry, [`PrototypeBakePass`] uploads a
 //!    [`PrototypeUniform`] and dispatches `proto_bake_main` with
 //!    `(2^max_depth)³` workgroups. The compute shader writes leaf-level
@@ -21,21 +22,27 @@
 //!    entirely by `max_depth`. Stage 5's march descends through both
 //!    pre-built and baked levels uniformly.
 //!
-//! ## Pool storage
+//! ## Pool storage — octree per-prototype, bricks/leaf-attrs global
 //!
-//! Prototypes live in the same `octree_nodes`, `brick_pool`,
-//! `leaf_attr_pool` GPU buffers that the per-region cache and the main
-//! march pass already bind, just at a disjoint byte range owned by
-//! this cache's allocators. Consumers (the engine layer wiring this up
-//! in Stage 5+) hand each cache its own base offsets so the ranges
-//! don't overlap.
+//! The octree spine MUST be contiguous per prototype because the bake's
+//! leaf-level writes index off `octree_leaf_offset + morton(wid)` and
+//! the CPU pre-builder writes the dense internal levels into a
+//! contiguous range. Octree slots come from a per-cache bump cursor
+//! with a free-list keyed by extent size — re-baking the same shader
+//! with the same depth reuses the slot, no fragmentation.
+//!
+//! Bricks and leaf-attrs are GLOBAL across prototypes — the bake
+//! atomic-bumps a single cursor pair (in [`PrototypeBakePass`]'s
+//! cursor buffers) at GPU time. Different prototypes' slots interleave;
+//! the march follows octree → brick_id → leaf_attr_id pointers, all
+//! absolute, so layout doesn't matter. This drops the worst-case
+//! per-prototype reservation that capped depth at 4 (a depth-8 sparse
+//! blade has ~1.2 M leaf-attrs but the bucket allocator was reserving
+//! 1 G slots up front, no matter what the bake actually emitted).
 
 use std::collections::HashMap;
 
-use crate::user_shader_pass::{
-    BucketPoolAllocator, BRICK_BUCKET_MAX, BRICK_BUCKET_MIN, BRICK_CELLS,
-    LEAF_ATTR_BUCKET_MAX, LEAF_ATTR_BUCKET_MIN, OCTREE_BUCKET_MAX, OCTREE_BUCKET_MIN,
-};
+use crate::user_shader_pass::BRICK_CELLS;
 
 /// Default prototype octree depth. With depth 2 the prototype is a
 /// 16-cell-per-axis cube (4 bricks per axis, 64 max bricks) — enough
@@ -43,13 +50,15 @@ use crate::user_shader_pass::{
 /// override per-shader via `@proto_max_depth`.
 pub const DEFAULT_PROTO_MAX_DEPTH: u32 = 2;
 
-/// Hard ceiling on prototype octree depth. Larger prototypes burn
-/// per-shader pool space without a corresponding density gain — the
-/// instance pipeline's win comes from MANY instances of a SMALL
-/// prototype, not from per-prototype detail. Keeping this at 4 caps a
-/// single prototype's brick reservation at 8³ = 512 max bricks, so
-/// even a fully-solid prototype fits in the bucket allocator.
-pub const MAX_PROTO_MAX_DEPTH: u32 = 4;
+/// Hard ceiling on prototype octree depth. With sparse global brick +
+/// leaf-attr cursors (no per-prototype worst-case reservation), the
+/// real cost of higher depths is the dense octree spine. Cumulative
+/// nodes at depth 8 = (8^9 − 1) / 7 ≈ 19.2 M nodes × 8 B = 153 MB per
+/// prototype, fits in the dedicated proto octree pool sized for it.
+/// Going higher would push spine cost past the budget; for finer
+/// resolution than depth 8 gives (~0.4 mm cells on a 0.4 m blade),
+/// switch to sparse-spine BFS first.
+pub const MAX_PROTO_MAX_DEPTH: u32 = 8;
 
 /// Total octree nodes in a fully-built dense tree at given depth.
 /// Sum of geometric series 1 + 8 + 64 + ... + 8^depth = (8^(depth+1) - 1) / 7.
@@ -66,17 +75,21 @@ pub const fn octree_node_count_for_depth(max_depth: u32) -> u32 {
 }
 
 /// Cached prototype state for one shader.
+///
+/// Carries the OCTREE extent only — bricks and leaf-attrs are allocated
+/// at GPU bake time from global cursors, so an entry doesn't reserve
+/// brick / leaf-attr range up front. The slots a bake actually writes
+/// are referenced indirectly via the octree's leaf-level brick_id
+/// pointers, so per-prototype layout is unnecessary.
 #[derive(Debug, Clone)]
 pub struct PrototypeEntry {
     pub shader_id: u32,
     pub source_hash: u64,
     pub max_depth: u32,
-    /// `(offset, size)` extents in each global pool. Offsets are
-    /// RELATIVE to the cache's pool bases — add `pool_X_base` to get
-    /// an absolute GPU index.
+    /// `(offset, size)` extent in the octree pool. Offset is RELATIVE
+    /// to `pool_octree_base` — add it to get an absolute GPU index.
+    /// Size is exactly `octree_node_count_for_depth(max_depth)`.
     pub octree_extent: (u32, u32),
-    pub brick_extent: (u32, u32),
-    pub leaf_attr_extent: (u32, u32),
     /// `true` after `begin_frame`; lookups touch the entry, so untouched
     /// entries are evicted at end of frame.
     pub touched_this_frame: bool,
@@ -129,32 +142,51 @@ pub fn max_leaf_attrs_for_depth(max_depth: u32) -> u32 {
 /// projects rarely have more than a few dozen instance shaders.
 pub const MAX_PROTOTYPES: u32 = 256;
 
-/// Default capacity of the prototype-only octree sub-pool.
-/// `MAX_PROTOTYPES × octree_node_count_for_depth(MAX_PROTO_MAX_DEPTH)` =
-/// 256 × 4681 ≈ 1.2 M nodes (~9 MB at 8 B/node). Modest reservation
-/// from the global octree pool.
-pub const PROTO_OCTREE_POOL_CAPACITY: u32 = 1_300_000;
+/// Default octree-pool capacity, in nodes. Sized to fit a handful of
+/// depth-8 prototypes (each spine ~19.2 M nodes) plus headroom for the
+/// usual mix of smaller depths. 32 M nodes × 8 B = 256 MB.
+pub const PROTO_OCTREE_POOL_CAPACITY: u32 = 32 * 1024 * 1024;
 
-/// Default capacity of the prototype-only brick sub-pool.
-/// `MAX_PROTOTYPES × 8^MAX_PROTO_MAX_DEPTH` = 256 × 4096 ≈ 1 M bricks
-/// (~256 MB). Bigger than expected real usage but fits comfortably
-/// alongside the per-region cache's 768 MB reservation.
-pub const PROTO_BRICK_POOL_CAPACITY: u32 = 1_048_576;
+/// Default brick-pool capacity, in bricks (a brick = 64 cells × 4 B).
+/// A depth-8 sparse blade is ~18 K bricks; 256 K bricks = 64 MB =
+/// headroom for ~14 such prototypes baked simultaneously. Bricks are
+/// allocated globally at GPU bake time; the cap exists for overflow
+/// gating, not per-prototype reservation.
+pub const PROTO_BRICK_POOL_CAPACITY: u32 = 256 * 1024;
 
-/// Default capacity of the prototype-only leaf-attr sub-pool.
-/// `MAX_PROTOTYPES × BRICK_CELLS × 8^MAX_PROTO_MAX_DEPTH / 2` (half-occupancy)
-/// = 256 × 64 × 4096 / 2 ≈ 33 M slots (~264 MB).
-pub const PROTO_LEAF_ATTR_POOL_CAPACITY: u32 = 33_554_432;
+/// Default leaf-attr-pool capacity, in slots (each slot = 8 B).
+/// A depth-8 sparse blade is ~1.2 M slots; 4 M slots = 32 MB = a few
+/// depth-8 prototypes' worth, more if shallower. Leaf-attrs are
+/// allocated globally at GPU bake time.
+pub const PROTO_LEAF_ATTR_POOL_CAPACITY: u32 = 4 * 1024 * 1024;
 
-/// Persistent prototype cache + variable-size pool allocator. Mirrors
-/// `UserShaderObjectCache`'s shape but keyed by `shader_id` and with
-/// no per-frame topology/fill split — prototypes only re-bake when
-/// the shader source changes.
+/// Persistent prototype cache.
+///
+/// Octree extents are per-prototype contiguous (the dense spine demands
+/// it) — allocated from a bump cursor + a free-list keyed on extent
+/// size for re-bake reuse. Brick + leaf-attr extents are NOT tracked
+/// per-prototype; the GPU bake bumps global cursors live in
+/// [`PrototypeBakePass`], and the bake's overflow check uses the
+/// `*_pool_capacity` values stored here.
+///
+/// Eviction (LRU-style via `begin_frame` + `evict_untouched`) drops
+/// entries that weren't touched this frame and returns their octree
+/// extent to the free-list. Brick + leaf-attr slots used by an evicted
+/// prototype are orphaned in the GPU pool; the cursors don't reclaim.
+/// When pools fill, the engine triggers `full_reset` to mark every
+/// remaining entry dirty + zero the GPU cursors, restarting from a
+/// blank slate.
 pub struct PrototypeCache {
     entries: HashMap<u32, PrototypeEntry>,
-    octree_alloc: BucketPoolAllocator,
-    brick_alloc: BucketPoolAllocator,
-    leaf_attr_alloc: BucketPoolAllocator,
+    /// Bump cursor for the octree pool. Free-list reuses extents on
+    /// re-bake, so this only grows monotonically when a NEW (shader,
+    /// depth) tuple appears.
+    octree_high_water: u32,
+    /// Free extents (offset, size) returned by re-bakes / eviction;
+    /// preferred over a fresh bump when an extent of matching size is
+    /// available. Linear scan is fine — entries cap at MAX_PROTOTYPES
+    /// (256).
+    octree_free_list: Vec<(u32, u32)>,
     pool_octree_base: u32,
     pool_brick_base: u32,
     pool_leaf_attr_base: u32,
@@ -179,15 +211,8 @@ impl PrototypeCache {
     ) -> Self {
         Self {
             entries: HashMap::new(),
-            octree_alloc: BucketPoolAllocator::new(
-                octree_capacity, OCTREE_BUCKET_MIN, OCTREE_BUCKET_MAX,
-            ),
-            brick_alloc: BucketPoolAllocator::new(
-                brick_capacity, BRICK_BUCKET_MIN, BRICK_BUCKET_MAX,
-            ),
-            leaf_attr_alloc: BucketPoolAllocator::new(
-                leaf_attr_capacity, LEAF_ATTR_BUCKET_MIN, LEAF_ATTR_BUCKET_MAX,
-            ),
+            octree_high_water: 0,
+            octree_free_list: Vec::new(),
             pool_octree_base: 0,
             pool_brick_base: 0,
             pool_leaf_attr_base: 0,
@@ -200,7 +225,8 @@ impl PrototypeCache {
     /// Configure the GPU offsets where the prototype-only sub-pool
     /// begins. Coordinated by the engine layer (Stage 5+) so the
     /// prototype range is disjoint from the per-region transient
-    /// range.
+    /// range. Stage 6e moved the proto pool to dedicated buffers; the
+    /// expected call is `set_pool_bases(0, 0, 0)`.
     pub fn set_pool_bases(
         &mut self,
         pool_octree_base: u32,
@@ -223,18 +249,26 @@ impl PrototypeCache {
     pub fn pool_brick_base(&self) -> u32 { self.pool_brick_base }
     pub fn pool_leaf_attr_base(&self) -> u32 { self.pool_leaf_attr_base }
 
-    /// Drop every entry and reset all allocators.
+    pub fn brick_pool_capacity(&self) -> u32 { self.pool_brick_capacity }
+    pub fn leaf_attr_pool_capacity(&self) -> u32 { self.pool_leaf_attr_capacity }
+
+    /// Drop every entry and reset the octree cursor + free-list. The
+    /// engine should also zero the GPU brick + leaf-attr cursor buffers
+    /// when calling this (the cache doesn't own them).
     pub fn flush(&mut self) {
         self.entries.clear();
-        self.octree_alloc = BucketPoolAllocator::new(
-            self.pool_octree_capacity, OCTREE_BUCKET_MIN, OCTREE_BUCKET_MAX,
-        );
-        self.brick_alloc = BucketPoolAllocator::new(
-            self.pool_brick_capacity, BRICK_BUCKET_MIN, BRICK_BUCKET_MAX,
-        );
-        self.leaf_attr_alloc = BucketPoolAllocator::new(
-            self.pool_leaf_attr_capacity, LEAF_ATTR_BUCKET_MIN, LEAF_ATTR_BUCKET_MAX,
-        );
+        self.octree_high_water = 0;
+        self.octree_free_list.clear();
+    }
+
+    /// Mark every retained entry dirty (forces re-bake on next lookup)
+    /// without freeing extents. Used by [`Self::full_reset`] alongside
+    /// the engine zeroing GPU cursors so live prototypes get fresh
+    /// brick + leaf-attr slots in the new global pool.
+    pub fn dirty_all(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.source_hash = entry.source_hash.wrapping_add(1);
+        }
     }
 
     /// Mark every entry untouched at the start of a frame.
@@ -244,10 +278,11 @@ impl PrototypeCache {
         }
     }
 
-    /// Look up `shader_id` against the cache. Returns `(slot, dirty)`:
+    /// Look up `shader_id` against the cache. Returns `(entry, dirty)`:
     /// dirty=true means the bake compute must run for this entry.
-    /// Returns `None` only when allocation fails (pool exhaustion); the
-    /// caller should log overflow and proceed without the prototype.
+    /// Returns `None` only when the octree pool is exhausted (free-list
+    /// empty + cursor would overrun capacity); the caller should log
+    /// overflow and proceed without the prototype.
     pub fn lookup_or_allocate(
         &mut self,
         shader_id: u32,
@@ -259,14 +294,10 @@ impl PrototypeCache {
             "max_depth {max_depth} exceeds MAX_PROTO_MAX_DEPTH",
         );
 
-        let estimate = PrototypePoolEstimate::for_depth(max_depth);
+        let needed = octree_node_count_for_depth(max_depth);
 
         if let Some(entry) = self.entries.get_mut(&shader_id) {
-            let extents_fit = entry.octree_extent.1 >= estimate.octree
-                && entry.brick_extent.1 >= estimate.bricks
-                && entry.leaf_attr_extent.1 >= estimate.leaf_attrs;
-            let depth_match = entry.max_depth == max_depth;
-            if extents_fit && depth_match {
+            if entry.max_depth == max_depth {
                 let dirty = entry.source_hash != source_hash;
                 if dirty {
                     entry.source_hash = source_hash;
@@ -274,46 +305,28 @@ impl PrototypeCache {
                 entry.touched_this_frame = true;
                 return Some((entry.clone(), dirty));
             }
-            // Stale extents (depth changed or extents too small) — free
-            // and fall through to fresh alloc.
-            self.octree_alloc.free(entry.octree_extent.0, entry.octree_extent.1);
-            self.brick_alloc.free(entry.brick_extent.0, entry.brick_extent.1);
-            self.leaf_attr_alloc.free(entry.leaf_attr_extent.0, entry.leaf_attr_extent.1);
+            // Depth changed — return the old extent to the free-list and
+            // fall through to fresh alloc.
+            let old = entry.octree_extent;
+            self.octree_free_list.push(old);
             self.entries.remove(&shader_id);
         }
 
-        let octree_extent = self.octree_alloc.alloc(estimate.octree)?;
-        let brick_extent = match self.brick_alloc.alloc(estimate.bricks) {
-            Some(e) => e,
-            None => {
-                self.octree_alloc.free(octree_extent.0, octree_extent.1);
-                return None;
-            }
-        };
-        let leaf_attr_extent = match self.leaf_attr_alloc.alloc(estimate.leaf_attrs) {
-            Some(e) => e,
-            None => {
-                self.octree_alloc.free(octree_extent.0, octree_extent.1);
-                self.brick_alloc.free(brick_extent.0, brick_extent.1);
-                return None;
-            }
-        };
+        let octree_extent = self.alloc_octree(needed)?;
 
         let entry = PrototypeEntry {
             shader_id,
             source_hash,
             max_depth,
             octree_extent,
-            brick_extent,
-            leaf_attr_extent,
             touched_this_frame: true,
         };
         self.entries.insert(shader_id, entry.clone());
         Some((entry, true))
     }
 
-    /// Drop entries not referenced this frame and return their extents
-    /// to the bucket allocators' free lists.
+    /// Drop entries not referenced this frame and return their octree
+    /// extents to the free-list.
     pub fn evict_untouched(&mut self) {
         let to_remove: Vec<u32> = self
             .entries
@@ -323,47 +336,39 @@ impl PrototypeCache {
             .collect();
         for k in to_remove {
             if let Some(entry) = self.entries.remove(&k) {
-                self.octree_alloc.free(entry.octree_extent.0, entry.octree_extent.1);
-                self.brick_alloc.free(entry.brick_extent.0, entry.brick_extent.1);
-                self.leaf_attr_alloc.free(entry.leaf_attr_extent.0, entry.leaf_attr_extent.1);
+                self.octree_free_list.push(entry.octree_extent);
             }
         }
+    }
+
+    /// Reuse a same-sized extent from the free-list if one is available;
+    /// otherwise bump the cursor. Returns `None` if neither path can
+    /// satisfy the request.
+    fn alloc_octree(&mut self, size: u32) -> Option<(u32, u32)> {
+        if let Some(idx) = self
+            .octree_free_list
+            .iter()
+            .position(|(_, s)| *s == size)
+        {
+            return Some(self.octree_free_list.swap_remove(idx));
+        }
+        if self.octree_high_water + size > self.pool_octree_capacity {
+            return None;
+        }
+        let offset = self.octree_high_water;
+        self.octree_high_water += size;
+        Some((offset, size))
     }
 
     pub fn entry_count(&self) -> usize { self.entries.len() }
     pub fn get(&self, shader_id: u32) -> Option<&PrototypeEntry> {
         self.entries.get(&shader_id)
     }
-    pub fn octree_high_water(&self) -> u32 { self.octree_alloc.high_water() }
-    pub fn brick_high_water(&self) -> u32 { self.brick_alloc.high_water() }
-    pub fn leaf_attr_high_water(&self) -> u32 { self.leaf_attr_alloc.high_water() }
+    pub fn octree_high_water(&self) -> u32 { self.octree_high_water }
 }
 
 impl Default for PrototypeCache {
     fn default() -> Self { Self::new() }
-}
-
-/// Pool size estimate for one prototype at a given depth. Always sized
-/// to the worst case (every cell solid) — prototypes are tiny and
-/// over-estimation is cheap.
-#[derive(Debug, Clone, Copy)]
-pub struct PrototypePoolEstimate {
-    pub octree: u32,
-    pub bricks: u32,
-    pub leaf_attrs: u32,
-}
-
-impl PrototypePoolEstimate {
-    pub fn for_depth(max_depth: u32) -> Self {
-        Self {
-            octree: octree_node_count_for_depth(max_depth)
-                .clamp(OCTREE_BUCKET_MIN, OCTREE_BUCKET_MAX),
-            bricks: max_bricks_for_depth(max_depth)
-                .clamp(BRICK_BUCKET_MIN, BRICK_BUCKET_MAX),
-            leaf_attrs: max_leaf_attrs_for_depth(max_depth)
-                .clamp(LEAF_ATTR_BUCKET_MIN, LEAF_ATTR_BUCKET_MAX),
-        }
-    }
 }
 
 /// Pre-build the internal levels (0..max_depth-1) of a dense octree
@@ -416,17 +421,22 @@ pub const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu32;
 
 /// GPU prototype uniform — must match `PrototypeUniform` in
 /// `user_shader_proto.wgsl`. 32 bytes.
+///
+/// Brick + leaf-attr ranges are GLOBAL across prototypes — no per-bake
+/// offset; the bake atomic-bumps a single cursor pair from
+/// [`PrototypeBakePass`]. The two `*_capacity` fields are pool-wide
+/// caps the bake uses to gate overflow into [`OVERFLOW_*`] counters.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PrototypeUniform {
     pub shader_id: u32,
     pub max_depth: u32,
-    pub brick_block_offset: u32,
-    pub brick_block_size: u32,
-    pub leaf_attr_block_offset: u32,
-    pub leaf_attr_block_size: u32,
     pub octree_leaf_offset: u32,
-    pub _pad: u32,
+    pub brick_capacity: u32,
+    pub leaf_attr_capacity: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<PrototypeUniform>() == 32);
@@ -436,37 +446,33 @@ impl PrototypeUniform {
         Self {
             shader_id: entry.shader_id,
             max_depth: entry.max_depth,
-            brick_block_offset: cache.pool_brick_base + entry.brick_extent.0,
-            brick_block_size: entry.brick_extent.1,
-            leaf_attr_block_offset: cache.pool_leaf_attr_base + entry.leaf_attr_extent.0,
-            leaf_attr_block_size: entry.leaf_attr_extent.1,
             octree_leaf_offset: entry.octree_leaf_offset(cache.pool_octree_base),
-            _pad: 0,
+            brick_capacity: cache.pool_brick_capacity,
+            leaf_attr_capacity: cache.pool_leaf_attr_capacity,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         }
     }
 }
-
-/// Cap on per-frame prototype atomic-counter slots. Each prototype
-/// dispatch resets slot 0 of the counter buffer; the cap exists so the
-/// buffer has fixed size for binding. V1 uses one dispatch per dirty
-/// prototype (slot 0 only); batched multi-prototype dispatches in a
-/// later phase would index 0..MAX_PROTO_DISPATCH_BATCH.
-pub const MAX_PROTO_DISPATCH_BATCH: u32 = 16;
 
 /// GPU pipeline owner for the prototype bake compute shader. Mirrors
 /// the construction shape of [`crate::user_shader_pass::UserShaderPass`]
 /// but is much smaller — prototype bakes don't need the BFS classify
 /// step, the active queue, or per-region atomic counters.
+///
+/// Brick + leaf-attr cursors are persistent: the bake atomic-bumps
+/// them once per emitted slot, and the engine only zeros them on a
+/// cache full-reset (rare). Different prototypes' baked slots
+/// interleave in the global pools.
 pub struct PrototypeBakePass {
     pub group0_layout: wgpu::BindGroupLayout,
     pub group1_layout: wgpu::BindGroupLayout,
     pub pipeline_layout: wgpu::PipelineLayout,
     pub bake_pipeline: wgpu::ComputePipeline,
-    /// Per-batch-slot atomic counter for `proto_brick_alloc`.
-    /// `MAX_PROTO_DISPATCH_BATCH * 4` bytes.
-    pub proto_brick_alloc_buffer: wgpu::Buffer,
-    /// Per-batch-slot atomic counter for `proto_leaf_attr_alloc`.
-    pub proto_leaf_attr_alloc_buffer: wgpu::Buffer,
+    /// Single-pair `GlobalCursors { brick: atomic<u32>, leaf_attr: atomic<u32> }`
+    /// at group(0) binding(3). 8 bytes total.
+    pub cursors_buffer: wgpu::Buffer,
     /// Overflow counters — same layout the per-region pass uses
     /// (only `OVERFLOW_BRICK` and `OVERFLOW_LEAF_ATTR` are written by
     /// this shader). The proto pass owns its own buffer rather than
@@ -489,9 +495,8 @@ impl PrototypeBakePass {
                 rw_storage(0), // octree_nodes
                 rw_storage(1), // brick_pool
                 rw_storage(2), // leaf_attr_pool
-                rw_storage(3), // proto_brick_alloc
-                rw_storage(4), // proto_leaf_attr_alloc
-                rw_storage(5), // overflow
+                rw_storage(3), // cursors (GlobalCursors struct, 8 B)
+                rw_storage(4), // overflow
             ],
         });
         let group1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -516,19 +521,15 @@ impl PrototypeBakePass {
         });
         let bake_pipeline = build_proto_pipeline(device, &pipeline_layout, "");
 
-        let alloc_size = (MAX_PROTO_DISPATCH_BATCH as u64) * 4;
-        let make_alloc = |label| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: alloc_size,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            })
-        };
-        let proto_brick_alloc_buffer = make_alloc("user_shader_proto brick_alloc");
-        let proto_leaf_attr_alloc_buffer = make_alloc("user_shader_proto leaf_attr_alloc");
+        // GlobalCursors = brick: atomic<u32> + leaf_attr: atomic<u32> = 8 B.
+        let cursors_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("user_shader_proto cursors"),
+            size: 8,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
 
         // Overflow buffer — must be at least as large as the highest
         // index the WGSL writes (OVERFLOW_LEAF_ATTR = 2). Match the
@@ -555,12 +556,19 @@ impl PrototypeBakePass {
             group1_layout,
             pipeline_layout,
             bake_pipeline,
-            proto_brick_alloc_buffer,
-            proto_leaf_attr_alloc_buffer,
+            cursors_buffer,
             overflow_buffer,
             proto_uniform_buffer,
             source_hash: 0,
         }
+    }
+
+    /// Reset the GPU brick + leaf-attr cursors to zero. Pair with
+    /// [`PrototypeCache::flush`] / [`PrototypeCache::dirty_all`] for a
+    /// full pool reset; otherwise live prototypes' baked slots become
+    /// unreferenceable from new bakes.
+    pub fn reset_cursors(&self, queue: &wgpu::Queue) {
+        queue.write_buffer(&self.cursors_buffer, 0, &[0u8; 8]);
     }
 
     /// Re-build the compute pipeline against a fresh user-shader chunk.
@@ -697,17 +705,13 @@ mod tests {
     }
 
     #[test]
-    fn pool_estimate_clamps_to_bucket_range() {
-        // depth 0 → tiny; estimate must clamp up to OCTREE_BUCKET_MIN
-        let e = PrototypePoolEstimate::for_depth(0);
-        assert!(e.octree >= OCTREE_BUCKET_MIN);
-        assert!(e.bricks >= BRICK_BUCKET_MIN);
-        assert!(e.leaf_attrs >= LEAF_ATTR_BUCKET_MIN);
-        // depth 4 → larger; should fit comfortably in bucket maxes
-        let e = PrototypePoolEstimate::for_depth(4);
-        assert!(e.octree <= OCTREE_BUCKET_MAX);
-        assert!(e.bricks <= BRICK_BUCKET_MAX);
-        assert!(e.leaf_attrs <= LEAF_ATTR_BUCKET_MAX);
+    fn octree_alloc_is_exact_size() {
+        // No bucket clamping — the octree extent equals the dense
+        // spine count for the requested depth, byte-for-byte.
+        let mut cache = PrototypeCache::with_capacities(10_000, 1024, 32_768);
+        cache.set_pool_bases(0, 0, 0);
+        let (entry, _) = cache.lookup_or_allocate(1, 0, 2).unwrap();
+        assert_eq!(entry.octree_extent.1, octree_node_count_for_depth(2));
     }
 
     #[test]
@@ -775,10 +779,8 @@ mod tests {
         let oct_hw_after_first = cache.octree_high_water();
         let (e2, dirty) = cache.lookup_or_allocate(1, 0xBBBB, 2).unwrap();
         assert!(dirty);
-        // Same extents → same offsets. Re-bake reuses the slot.
+        // Same depth → same octree extent reused, no fresh bump.
         assert_eq!(e1.octree_extent, e2.octree_extent);
-        assert_eq!(e1.brick_extent, e2.brick_extent);
-        assert_eq!(e1.leaf_attr_extent, e2.leaf_attr_extent);
         assert_eq!(cache.octree_high_water(), oct_hw_after_first);
     }
 
@@ -789,7 +791,6 @@ mod tests {
         let (e1, _) = cache.lookup_or_allocate(1, 0xAAAA, 2).unwrap();
         let (e2, _) = cache.lookup_or_allocate(2, 0xBBBB, 2).unwrap();
         assert_ne!(e1.octree_extent.0, e2.octree_extent.0);
-        assert_ne!(e1.brick_extent.0, e2.brick_extent.0);
     }
 
     #[test]
@@ -809,18 +810,18 @@ mod tests {
     }
 
     #[test]
-    fn cache_depth_change_reallocs_extents() {
-        // Depth 4's leaf-attr estimate clamps to LEAF_ATTR_BUCKET_MAX
-        // (131 072), so the test pool needs at least that much.
+    fn cache_depth_change_reallocs_octree() {
+        // Depth-4 octree spine is 4681 nodes — bigger than depth 2's
+        // 73, so the new extent occupies a fresh range and the old
+        // depth-2 extent goes onto the free list.
         let mut cache = PrototypeCache::with_capacities(20_000, 8192, 200_000);
         cache.set_pool_bases(0, 0, 0);
         let (e1, _) = cache.lookup_or_allocate(1, 0xAAAA, 2).unwrap();
         let (e2, dirty) = cache.lookup_or_allocate(1, 0xAAAA, 4).unwrap();
         assert!(dirty);
-        // Stale extents freed, new (likely larger) extents allocated.
         assert_eq!(e2.max_depth, 4);
-        // depth 4 needs more bricks than depth 2 — extent size grows.
-        assert!(e2.brick_extent.1 >= e1.brick_extent.1);
+        assert_eq!(e2.octree_extent.1, octree_node_count_for_depth(4));
+        assert!(e2.octree_extent.1 > e1.octree_extent.1);
     }
 
     #[test]
@@ -835,16 +836,29 @@ mod tests {
 
     #[test]
     fn pool_exhaustion_returns_none() {
-        // Two prototypes at depth 2 require: octree bucket = 128 each
-        // (depth-2 estimate is 73 rounded up to OCTREE_BUCKET_MIN=64
-        // → next is 128), brick bucket = 64, leaf-attr bucket = 4096.
-        // Sized for exactly one — second fails.
-        let mut cache = PrototypeCache::with_capacities(128, 64, 4096);
+        // Pool sized for exactly one depth-2 spine (73 nodes); second
+        // request can't fit and returns None.
+        let mut cache = PrototypeCache::with_capacities(73, 64, 4096);
         cache.set_pool_bases(0, 0, 0);
         let _ = cache.lookup_or_allocate(1, 0xAAAA, 2).unwrap();
-        // Second prototype at depth 2 won't fit — octree pool out of room
-        // (one prototype already consumed bucket-rounded extent).
         assert!(cache.lookup_or_allocate(2, 0xBBBB, 2).is_none());
+    }
+
+    #[test]
+    fn evicted_octree_extent_is_reused_on_realloc() {
+        // shader 1 depth 2 → consumes an extent at offset 0.
+        // begin_frame + evict (no touch) returns it to the free-list.
+        // shader 2 depth 2 → same size → reuses offset 0; high-water
+        // doesn't advance.
+        let mut cache = PrototypeCache::with_capacities(10_000, 1024, 32_768);
+        cache.set_pool_bases(0, 0, 0);
+        let (e1, _) = cache.lookup_or_allocate(1, 0xAAAA, 2).unwrap();
+        let hw_after_first = cache.octree_high_water();
+        cache.begin_frame();
+        cache.evict_untouched();
+        let (e2, _) = cache.lookup_or_allocate(2, 0xBBBB, 2).unwrap();
+        assert_eq!(e2.octree_extent, e1.octree_extent);
+        assert_eq!(cache.octree_high_water(), hw_after_first);
     }
 
     #[test]
@@ -853,17 +867,15 @@ mod tests {
     }
 
     #[test]
-    fn proto_uniform_offsets_match_entry_extents() {
+    fn proto_uniform_carries_capacity_and_octree_offset() {
         let mut cache = PrototypeCache::with_capacities(10_000, 1024, 32_768);
         cache.set_pool_bases(1000, 2000, 3000);
         let (entry, _) = cache.lookup_or_allocate(7, 0xCAFE, 2).unwrap();
         let u = PrototypeUniform::from_entry(&entry, &cache);
         assert_eq!(u.shader_id, 7);
         assert_eq!(u.max_depth, 2);
-        assert_eq!(u.brick_block_offset, 2000 + entry.brick_extent.0);
-        assert_eq!(u.brick_block_size, entry.brick_extent.1);
-        assert_eq!(u.leaf_attr_block_offset, 3000 + entry.leaf_attr_extent.0);
-        assert_eq!(u.leaf_attr_block_size, entry.leaf_attr_extent.1);
+        assert_eq!(u.brick_capacity, 1024);
+        assert_eq!(u.leaf_attr_capacity, 32_768);
         // octree_leaf_offset = pool_octree_base + extent.0 + level_starts[max_depth]
         let level_starts = level_starts_inclusive(2);
         let expected = 1000 + entry.octree_extent.0 + level_starts[2];

@@ -10,20 +10,27 @@
 use crate::rkp_gpu_object::RkpGpuObject;
 
 /// Option B proto-buffer capacities. Sized once at construction —
-/// these buffers are NOT shared with the user-shader-cache tail, so
-/// growing them is unnecessary (the per-shader bake fits comfortably
-/// in the V1 caps; bigger prototypes are a future refactor).
+/// these buffers are dedicated to the prototype cache and don't share
+/// allocation with the user-shader transient pools.
+///
+/// Sizing is set for `MAX_PROTO_MAX_DEPTH = 8` with global brick +
+/// leaf-attr cursors (no per-prototype reservation). The dense octree
+/// spine at depth 8 is ~19.2 M nodes per prototype, so the 32 M-node
+/// pool fits one depth-8 prototype + a handful of shallower siblings.
+/// The brick + leaf-attr pools are global across prototypes; sparse
+/// usage means the 256 K bricks / 4 M leaf-attrs comfortably hold
+/// many simultaneous prototypes.
 ///
 /// Engine-side `INSTANCE_PROTO_*_CAPACITY_*` constants must stay in
-/// sync with these — the engine sub-allocates within. Total ≈ 3 MB
+/// sync with these — the engine sub-allocates within. Total ≈ 320 MB
 /// across all three buffers.
 ///
-/// 64K octree nodes × 8 bytes = 512 KB.
-pub const PROTO_OCTREE_CAPACITY_BYTES: u64 = 64 * 1024 * 8;
-/// 8K bricks × 64 cells × 4 bytes = 2 MB.
-pub const PROTO_BRICK_CAPACITY_BYTES: u64 = 8 * 1024 * 64 * 4;
-/// 64K leaf-attr slots × 8 bytes = 512 KB.
-pub const PROTO_LEAF_ATTR_CAPACITY_BYTES: u64 = 64 * 1024 * 8;
+/// 32 M octree nodes × 8 bytes = 256 MB.
+pub const PROTO_OCTREE_CAPACITY_BYTES: u64 = 32 * 1024 * 1024 * 8;
+/// 256 K bricks × 64 cells × 4 bytes = 64 MB.
+pub const PROTO_BRICK_CAPACITY_BYTES: u64 = 256 * 1024 * 64 * 4;
+/// 4 M leaf-attr slots × 8 bytes = 32 MB.
+pub const PROTO_LEAF_ATTR_CAPACITY_BYTES: u64 = 4 * 1024 * 1024 * 8;
 
 /// Camera uniforms matching the WGSL `CameraUniforms` struct.
 ///
