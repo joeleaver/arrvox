@@ -69,39 +69,79 @@ struct TileRect {
     valid: u32,
 }
 
+// Near-plane epsilon. Corners with `clip.w <= NEAR_EPS` are treated
+// as "behind camera"; AABB edges crossing this boundary are clipped
+// at `clip.w = NEAR_EPS` so the projection stays well-defined.
+const NEAR_EPS: f32 = 1.0e-3;
+
 fn project_world_aabb_to_tiles(aabb_min: vec3<f32>, aabb_max: vec3<f32>) -> TileRect {
     var rect: TileRect;
     rect.valid = 0u;
 
-    var any_behind: bool = false;
-    var min_ndc = vec2<f32>( 1.0e30,  1.0e30);
-    var max_ndc = vec2<f32>(-1.0e30, -1.0e30);
+    // Project all 8 corners to clip space; track which are in front.
+    var clips: array<vec4<f32>, 8>;
+    var in_front: array<u32, 8>;
+    var n_in_front: u32 = 0u;
 
     for (var i: u32 = 0u; i < 8u; i = i + 1u) {
         let cx = select(aabb_min.x, aabb_max.x, (i & 1u) != 0u);
         let cy = select(aabb_min.y, aabb_max.y, (i & 2u) != 0u);
         let cz = select(aabb_min.z, aabb_max.z, (i & 4u) != 0u);
         let clip = vp.view_proj * vec4<f32>(cx, cy, cz, 1.0);
-        if (clip.w <= 1e-5) {
-            any_behind = true;
-            continue;
+        clips[i] = clip;
+        if (clip.w > NEAR_EPS) {
+            in_front[i] = 1u;
+            n_in_front = n_in_front + 1u;
+        } else {
+            in_front[i] = 0u;
         }
-        let ndc = clip.xyz / clip.w;
-        min_ndc = min(min_ndc, ndc.xy);
-        max_ndc = max(max_ndc, ndc.xy);
     }
 
-    if (any_behind) {
-        // Conservative: cover the full visible tile rectangle.
-        rect.tile_min_x = 0u;
-        rect.tile_min_y = 0u;
-        rect.tile_max_x = vp.tile_count_x - 1u;
-        rect.tile_max_y = vp.tile_count_y - 1u;
-        rect.valid = 1u;
-        return rect;
+    // No corners in front → AABB fully behind camera, invisible.
+    if (n_in_front == 0u) { return rect; }
+
+    var min_ndc = vec2<f32>( 1.0e30,  1.0e30);
+    var max_ndc = vec2<f32>(-1.0e30, -1.0e30);
+
+    // Project in-front corners normally.
+    for (var i: u32 = 0u; i < 8u; i = i + 1u) {
+        if (in_front[i] == 1u) {
+            let ndc = clips[i].xyz / clips[i].w;
+            min_ndc = min(min_ndc, ndc.xy);
+            max_ndc = max(max_ndc, ndc.xy);
+        }
     }
 
-    // All-corners-in-front path. Convert NDC → pixel → tile.
+    // Mixed visibility: clip the 12 AABB edges against the near plane
+    // at w = NEAR_EPS, project the intersection points. Iterate edges
+    // by enumerating low corner + flip axis; visit each pair once via
+    // `c < other`. Replaces the previous "any_behind → full screen"
+    // broadcast that caused us_tile_entries overflow when the camera
+    // got close to a blade.
+    if (n_in_front < 8u) {
+        for (var c: u32 = 0u; c < 8u; c = c + 1u) {
+            for (var ax: u32 = 0u; ax < 3u; ax = ax + 1u) {
+                let mask = 1u << ax;
+                let other = c ^ mask;
+                if (c >= other) { continue; }
+                if (in_front[c] == in_front[other]) { continue; }
+                // One in, one out — lerp at clip.w == NEAR_EPS.
+                let ca = clips[c];
+                let cb = clips[other];
+                let denom = cb.w - ca.w;
+                // Robust against zero-length denominator (parallel to
+                // near plane) — both endpoints are near eps, take the
+                // midpoint.
+                let t = select((NEAR_EPS - ca.w) / denom, 0.5, abs(denom) < 1e-12);
+                let clip_at = mix(ca, cb, t);
+                let ndc_xy = clip_at.xy / max(clip_at.w, NEAR_EPS);
+                min_ndc = min(min_ndc, ndc_xy);
+                max_ndc = max(max_ndc, ndc_xy);
+            }
+        }
+    }
+
+    // Convert NDC → pixel → tile.
     let px_min_x = (min_ndc.x * 0.5 + 0.5) * vp.resolution_x;
     let px_min_y = (-max_ndc.y * 0.5 + 0.5) * vp.resolution_y;  // flip y
     let px_max_x = (max_ndc.x * 0.5 + 0.5) * vp.resolution_x;

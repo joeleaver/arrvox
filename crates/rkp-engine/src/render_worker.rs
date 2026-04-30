@@ -2612,10 +2612,20 @@ fn dispatch_us_tile_cull_inner(
         return;
     }
 
-    // Conservative entries estimate: each AABB might cover up to ~64
-    // tiles on average (8×8 px tile rect at typical viewing distances).
-    // Realistic worst case is much less; we round up + grow on demand.
-    let entries_estimate = scratch_count.saturating_mul(64).max(1024);
+    // Conservative entries estimate. Two regimes mixed:
+    // (a) typical: each AABB covers a small number of tiles at distance
+    //     (~16-64 tiles for grass-blade-sized AABBs).
+    // (b) close to camera: tight near-plane clipping in the projection
+    //     keeps the screen AABB bounded, but a single blade right at
+    //     the camera can still cover hundreds of tiles. With a few
+    //     close blades, the average shoots up.
+    // V1 heuristic is `scratch_count × 256 + tile_count × 4` — covers
+    // the average case with headroom and handles up to ~4 blades
+    // touching every tile without overflow. Grows on demand.
+    let entries_estimate = scratch_count
+        .saturating_mul(256)
+        .saturating_add(tile_count.saturating_mul(4))
+        .max(1024);
     let _grew_entries = vr.march.ensure_us_tile_entries_capacity(args.device, entries_estimate);
     let _grew_grid = vr.march.ensure_us_tile_grid_capacity(args.device, tile_count);
 
