@@ -13,6 +13,32 @@ use crate::validate_wgsl;
 const STATS_U32_COUNT: usize = 64;
 const STATS_BYTES: u64 = (STATS_U32_COUNT * 4) as u64;
 
+/// Per-tile user-shader entry (Phase 6). Each entry carries enough
+/// metadata for the host march to dispatch the user-shader path
+/// without going through a per-instance `RkpGpuInstance` — those are
+/// gone for user-shader paths in Phase 6.
+///
+/// Wire format must match the WGSL struct in
+/// `octree_march.wgsl::UserShaderTileEntry`. 16 bytes — std140
+/// alignment puts the four `u32`s tightly packed.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct UserShaderTileEntry {
+    /// Index into the scene's `assets[]` array. Looks up the user-
+    /// shader proto (octree_root, max_depth, voxel_size, shader_id).
+    pub asset_id: u32,
+    /// u32 offset into `instance_pool` for this instance's per-instance
+    /// state. The user's hooks read from this offset.
+    pub instance_state_offset: u32,
+    /// Painted host material id (low 16 bits). The proto bake writes
+    /// `material_primary = 0` into its leaf_attrs; the host march
+    /// overrides with this on hit (locked V1 host-material inheritance).
+    pub material_id: u32,
+    pub _pad: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<UserShaderTileEntry>() == 16);
+
 /// Uniform parameters for the march shader.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -67,6 +93,23 @@ pub struct OctreeMarchPass {
     /// all per-tile counts, i.e. `tile_offsets[num_tiles]`.
     tile_object_ids_buffer: wgpu::Buffer,
     tile_object_ids_capacity: u64,
+    /// Phase 6 — per-tile user-shader entry offsets (prefix sum).
+    /// GPU-built each frame by the user-shader tile-cull pass. One
+    /// `u32` per tile + a sentinel; slice for tile `t` is
+    /// `us_tile_entries[us_tile_offsets[t]..us_tile_offsets[t+1]]`.
+    /// Sized in pair with `tile_offsets_buffer` so the host march can
+    /// loop both in parallel without separate dispatches.
+    pub us_tile_offsets_buffer: wgpu::Buffer,
+    pub us_tile_offsets_capacity: u64,
+    /// Phase 6 — flat per-tile `UserShaderTileEntry` array
+    /// (16 B each: asset_id, instance_state_offset, material_id,
+    /// _pad). Built GPU-side by the tile-cull scatter pass; each entry
+    /// carries enough metadata for the host march to dispatch the
+    /// user-shader path without going through a per-instance
+    /// `RkpGpuInstance` (those are gone for user-shader paths in
+    /// Phase 6).
+    pub us_tile_entries_buffer: wgpu::Buffer,
+    pub us_tile_entries_capacity: u64,
     /// Lights buffer (shared with shade pass).
     lights_buffer: Option<wgpu::Buffer>,
     /// Materials buffer reference for bind group rebuild.
@@ -173,6 +216,34 @@ impl OctreeMarchPass {
                         },
                         count: None,
                     },
+                    // Binding 6: per-tile user-shader entry offsets
+                    // (prefix sum). Phase 6 — GPU-built, parallel to
+                    // bindings 4/5 but for user-shader instances.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Binding 7: per-tile user-shader entries
+                    // (`UserShaderTileEntry` records — 16 B each:
+                    // asset_id, instance_state_offset, material_id,
+                    // _pad). Slice for tile `t` is
+                    // `us_tile_entries[us_tile_offsets[t]..us_tile_offsets[t+1]]`.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -248,6 +319,24 @@ impl OctreeMarchPass {
                 mapped_at_creation: false,
             }),
             tile_object_ids_capacity: 256,
+            // Phase 6 — start at single-entry placeholders; tile-cull
+            // GPU pass writes these per frame and grows on overflow.
+            // Initial layout encodes "no user-shader instances" (one
+            // tile, one zero offset → empty entry list).
+            us_tile_offsets_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("march us_tile_offsets"),
+                size: 256,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            us_tile_offsets_capacity: 256,
+            us_tile_entries_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("march us_tile_entries"),
+                size: 256,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            us_tile_entries_capacity: 256,
             lights_buffer: None,
             materials_buffer: None,
         }
@@ -336,6 +425,14 @@ impl OctreeMarchPass {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: self.tile_object_ids_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: self.us_tile_offsets_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: self.us_tile_entries_buffer.as_entire_binding(),
                 },
             ],
         }));

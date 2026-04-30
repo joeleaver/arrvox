@@ -491,6 +491,21 @@ const PHASE_SHADOW: u32 = 2u;
 // per scene — replaces the retired 32-object bitmask culling scheme.
 @group(2) @binding(5) var<storage, read> tile_object_ids: array<u32>;
 
+// Phase 6 — user-shader instance tile lists. GPU-built each frame
+// from the actual filled slots in `instance_pool`. Replaces the
+// leaf-driven `RkpGpuInstance` emission of Phase 4c. The host march
+// loop iterates these alongside `tile_object_ids` for each tile and
+// dispatches the user-shader path directly from each entry's
+// metadata (no `instances[]` lookup required).
+struct UserShaderTileEntry {
+    asset_id: u32,
+    instance_state_offset: u32,
+    material_id: u32,
+    _pad: u32,
+}
+@group(2) @binding(6) var<storage, read> us_tile_offsets: array<u32>;
+@group(2) @binding(7) var<storage, read> us_tile_entries: array<UserShaderTileEntry>;
+
 // Workgroup-shared tile range so thread 0 reads `tile_offsets[t]`
 // + `tile_offsets[t+1]` once and every thread in the tile reuses them.
 var<workgroup> tile_range_start: u32;
