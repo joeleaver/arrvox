@@ -892,7 +892,11 @@ fn transient_asset_and_instance(entry: &CacheEntry) -> (RkpGpuAsset, RkpGpuInsta
         rest_octree_root: 0,
         rest_octree_depth: 0,
         rest_octree_extent_bits: 0,
-        _pad: [0; 2],
+        // Phase C transient regions are NOT user-shader instance
+        // protos — they're the per-region geometry-build pass output.
+        // Standard host-march descent, no per-instance hooks.
+        shader_id: 0,
+        _pad: 0,
     };
     let instance = RkpGpuInstance {
         world: identity,
@@ -915,6 +919,9 @@ fn transient_asset_and_instance(entry: &CacheEntry) -> (RkpGpuAsset, RkpGpuInsta
         // pass, so paint can't accumulate on them.
         overlay_offset: 0,
         overlay_count: 0,
+        // Phase 4c — host-march affine path; no per-instance user-shader state.
+        instance_state_offset: 0,
+        _pad: [0; 3],
     };
     (asset, instance)
 }

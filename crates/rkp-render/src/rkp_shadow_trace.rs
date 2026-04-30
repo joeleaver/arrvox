@@ -10,6 +10,13 @@ use crate::validate_wgsl;
 
 pub struct ShadowTracePass {
     pipeline: wgpu::ComputePipeline,
+    /// Kept around so `reload_user_shaders` can rebuild the pipeline
+    /// against the same bind-group layouts when user-shader chunks
+    /// change. Phase 4c.
+    pipeline_layout: wgpu::PipelineLayout,
+    /// Hash of the user-shader source mix this pipeline was last built
+    /// against. Same semantics as `OctreeMarchPass`.
+    user_shader_source_hash: u64,
     /// Group 1 layout: full-res gbuf reads + half-res shadow write.
     io_bind_group_layout: wgpu::BindGroupLayout,
     io_bind_group: Option<wgpu::BindGroup>,
@@ -101,12 +108,47 @@ impl ShadowTracePass {
 
         Self {
             pipeline,
+            pipeline_layout,
+            user_shader_source_hash: 0,
             io_bind_group_layout,
             io_bind_group: None,
             output_texture,
             output_view,
             half_w, half_h,
         }
+    }
+
+    /// Rebuild the compute pipeline against spliced user-shader chunks.
+    /// Mirrors `OctreeMarchPass::reload_user_shaders`. Phase 4c.
+    pub fn reload_user_shaders(
+        &mut self,
+        device: &wgpu::Device,
+        inst_to_local_chunk: &str,
+        inst_aabb_chunk: &str,
+        source_hash: u64,
+    ) -> bool {
+        if source_hash == self.user_shader_source_hash {
+            return false;
+        }
+        let template = include_str!("shaders/rkp_shadow_trace.wgsl");
+        let source = crate::shader_composer::splice_inst_chunks(
+            template, inst_to_local_chunk, inst_aabb_chunk,
+        );
+        validate_wgsl(&source, "rkp_shadow_trace");
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rkp_shadow_trace"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        self.pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rkp_shadow_trace"),
+            layout: Some(&self.pipeline_layout),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        self.user_shader_source_hash = source_hash;
+        true
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, full_w: u32, full_h: u32) {

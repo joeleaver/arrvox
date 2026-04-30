@@ -60,6 +60,9 @@ struct RkpInstance {
     // Per-instance paint overlay slice. See octree_march.wgsl for full notes.
     overlay_offset: u32,
     overlay_count: u32,
+    // Phase 4c — see octree_march.wgsl for full notes.
+    instance_state_offset: u32,
+    _pad0: u32, _pad1: u32, _pad2: u32,
 }
 
 struct RkpAsset {
@@ -69,7 +72,7 @@ struct RkpAsset {
     geom_type: u32, bone_count: u32,
     grid_origin: vec3<f32>, rest_octree_root: u32,
     rest_octree_depth: u32, rest_octree_extent_bits: u32,
-    _pad0: u32, _pad1: u32,
+    shader_id: u32, _pad: u32,
 }
 
 struct CameraUniforms {
@@ -196,6 +199,12 @@ struct OverlayEntry {
 }
 @group(0) @binding(13) var<storage, read> instance_overlay: array<OverlayEntry>;
 
+// Per-instance user-shader state pool (Phase 4c). Host shadow trace
+// branches on `asset.shader_id != 0` to call the user shader's
+// `inst_to_local` / `inst_aabb` hooks, which read this buffer at
+// `inst.instance_state_offset`. Standard host assets ignore it.
+@group(0) @binding(14) var<storage, read> instance_pool: array<u32>;
+
 fn fetch_overlay_index(inst: RkpInstance, leaf_slot: u32) -> u32 {
     if (inst.overlay_count == 0u) {
         return 0xFFFFFFFFu;
@@ -254,6 +263,51 @@ fn mat4_affine_inverse(m: mat4x4<f32>) -> mat4x4<f32> {
         vec4<f32>(new_t, 1.0),
     );
 }
+
+// ── User-shader instance hooks (Phase 4c) ──────────────────────────
+// Mirror of the chunks in `octree_march.wgsl`. Shadow trace and
+// primary march don't share a WGSL source file, but they need to
+// agree on the user-shader transform so shadows land on the right
+// places. The Rust composer splices user-shader bodies into both
+// shaders so a single source-of-truth WGSL drives both pipelines.
+struct Aabb {
+    min: vec3<f32>,
+    max: vec3<f32>,
+}
+
+fn inst_world_to_local(
+    world_pos: vec3<f32>, instance_pos: vec3<f32>, instance_scale: f32,
+) -> vec3<f32> {
+    let inv_s = 1.0 / max(instance_scale, 1e-10);
+    return (world_pos - instance_pos) * inv_s + vec3<f32>(0.5);
+}
+
+// USER_INST_TO_LOCAL_DISPATCH_BEGIN
+fn dispatch_user_inst_to_local(
+    shader_id: u32,
+    base_u32: u32,
+    world_pos: vec3<f32>,
+    fallback_pos: vec3<f32>,
+    fallback_scale: f32,
+) -> vec3<f32> {
+    return inst_world_to_local(world_pos, fallback_pos, fallback_scale);
+}
+// USER_INST_TO_LOCAL_DISPATCH_END
+
+// USER_INST_AABB_DISPATCH_BEGIN
+fn dispatch_user_inst_aabb(
+    shader_id: u32,
+    base_u32: u32,
+    fallback_pos: vec3<f32>,
+    fallback_scale: f32,
+) -> Aabb {
+    let half = fallback_scale * 0.5 * 1.7320508;
+    var a: Aabb;
+    a.min = fallback_pos - vec3<f32>(half);
+    a.max = fallback_pos + vec3<f32>(half);
+    return a;
+}
+// USER_INST_AABB_DISPATCH_END
 
 // Group 1: gbuf inputs (full-res, read) + half-res shadow output (write).
 @group(1) @binding(0) var gbuf_position: texture_2d<f32>;
@@ -508,9 +562,46 @@ fn trace_shadow_ray(
             continue;
         }
 
-        let inv_world = mat4_affine_inverse(inst.world);
-        let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
-        let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
+        // Phase 4c — same world↔canonical branch as `march_object`.
+        // Affine path uses inv_world; user-shader path uses the user's
+        // `inst_to_local` hook against world AABB entry. The DDA loop
+        // downstream reads only oc_origin / safe_dir / local_max_t /
+        // local_scale, so wherever `local_dir_unnorm` and `local_origin`
+        // come from, the rest of the pass is identical.
+        var local_origin: vec3<f32>;
+        var local_dir_unnorm: vec3<f32>;
+        if asset.shader_id != 0u {
+            let inst_pos = inst.world[3].xyz;
+            let inst_scale = length(inst.world[0].xyz);
+            let aabb = dispatch_user_inst_aabb(
+                asset.shader_id, inst.instance_state_offset,
+                inst_pos, inst_scale,
+            );
+            let safe_world_dir = vec3<f32>(
+                select(world_dir.x, select(-1e-10, 1e-10, world_dir.x >= 0.0), abs(world_dir.x) < 1e-10),
+                select(world_dir.y, select(-1e-10, 1e-10, world_dir.y >= 0.0), abs(world_dir.y) < 1e-10),
+                select(world_dir.z, select(-1e-10, 1e-10, world_dir.z >= 0.0), abs(world_dir.z) < 1e-10),
+            );
+            let aabb_t = intersect_aabb(world_origin, 1.0 / safe_world_dir, aabb.min, aabb.max);
+            if aabb_t.x > aabb_t.y { continue; }
+            let world_t_entry = max(aabb_t.x, 0.0);
+            if world_t_entry > max_world_dist { continue; }
+            let world_entry = world_origin + world_dir * world_t_entry;
+            let local_entry = dispatch_user_inst_to_local(
+                asset.shader_id, inst.instance_state_offset,
+                world_entry, inst_pos, inst_scale,
+            );
+            let local_endpoint = dispatch_user_inst_to_local(
+                asset.shader_id, inst.instance_state_offset,
+                world_entry + world_dir, inst_pos, inst_scale,
+            );
+            local_origin = local_entry;
+            local_dir_unnorm = local_endpoint - local_entry;
+        } else {
+            let inv_world = mat4_affine_inverse(inst.world);
+            local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
+            local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
+        }
         let local_dir = normalize(local_dir_unnorm);
         let local_scale = length(local_dir_unnorm);
         let local_max_t = max_world_dist * local_scale;

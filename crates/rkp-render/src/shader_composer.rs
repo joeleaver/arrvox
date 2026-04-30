@@ -890,6 +890,53 @@ pub fn compose(reg: &UserShaderRegistry) -> ComposedChunks {
     }
 }
 
+/// Splice the composer's `inst_to_local` + `inst_aabb` chunks into a
+/// host-side WGSL template (`octree_march.wgsl` / `rkp_shadow_trace
+/// .wgsl`) between the two `USER_INST_TO_LOCAL_DISPATCH_BEGIN/END` and
+/// `USER_INST_AABB_DISPATCH_BEGIN/END` marker pairs. Empty chunks
+/// leave the template's identity-arm stubs in place — that's the
+/// no-user-shader-registered case. Pipelines call this whenever the
+/// registry's `source_hash` changes.
+pub fn splice_inst_chunks(
+    template: &str,
+    inst_to_local_chunk: &str,
+    inst_aabb_chunk: &str,
+) -> String {
+    // Marker strings via concat so the literal occurrences in this fn
+    // body don't fool the splicer if it's ever called against this
+    // file's own source. Identical pattern to instance_march_pass.rs.
+    let with_to_local = splice_user_marker(
+        template,
+        concat!("USER_INST_TO_LOCAL_DISPATCH", "_BEGIN"),
+        concat!("USER_INST_TO_LOCAL_DISPATCH", "_END"),
+        inst_to_local_chunk,
+    );
+    splice_user_marker(
+        &with_to_local,
+        concat!("USER_INST_AABB_DISPATCH", "_BEGIN"),
+        concat!("USER_INST_AABB_DISPATCH", "_END"),
+        inst_aabb_chunk,
+    )
+}
+
+fn splice_user_marker(template: &str, begin: &str, end: &str, chunk: &str) -> String {
+    if chunk.is_empty() {
+        return template.to_string();
+    }
+    let begin_idx = template
+        .find(begin)
+        .unwrap_or_else(|| panic!("template missing {begin} marker"));
+    let end_idx = template[begin_idx..]
+        .find(end)
+        .map(|off| begin_idx + off + end.len())
+        .unwrap_or_else(|| panic!("template missing {end} marker"));
+    let mut out = String::with_capacity(template.len() + chunk.len());
+    out.push_str(&template[..begin_idx]);
+    out.push_str(chunk);
+    out.push_str(&template[end_idx..]);
+    out
+}
+
 fn compose_shade_chunk(reg: &UserShaderRegistry) -> String {
     let mut out = String::new();
     out.push_str("// ── user-shader helpers + bodies: shade ───────────────\n");

@@ -255,16 +255,11 @@ struct RenderState {
     /// Stage 6c-3 — global `array<u32>` storage buffer holding all
     /// scattered instance bytes. Each region's slice is bucket-allocated
     /// inside [`InstanceRegionCache`] (which thinks in u32 units rooted
-    /// at `pool_base = 0`); the GPU emit pass writes via the pool's
-    /// `binding(0)`. Stage 6c-3.5 binds it for the per-viewport march.
-    ///
-    /// Default capacity = 4 M u32s = 16 MB — modest first-cut. Stage 6e
-    /// (perf) can raise toward `MAX_GLOBAL_INSTANCE_U32S` (256 MB) if
-    /// instance shader workloads start bumping the cap.
-    instance_pool_buffer: wgpu::Buffer,
-    /// Cached u32 capacity of `instance_pool_buffer`. Mirrors what was
-    /// passed to `InstanceRegionCache::with_capacity`. Used for
-    /// resize / overflow telemetry.
+    /// Cached u32 capacity of the scene's `instance_pool_buffer`.
+    /// Mirrors what was passed to `InstanceRegionCache::with_capacity`.
+    /// The buffer itself lives on `RkpScene::instance_pool_buffer`
+    /// (Phase 4c — bound at scene group binding(14) so the host march
+    /// can read it for shader-asset paths).
     #[allow(dead_code)]
     instance_pool_capacity_u32: u32,
 
@@ -443,21 +438,13 @@ impl RenderState {
         let instance_emit_pass =
             rkp_render::user_shader_emit_pass::EmitPass::new(&device);
 
-        // 16 MB instance pool — fits ~500K instances at the default
-        // 32 B stride. Sized down from the 256 MB hard cap to cover the
-        // common case without burning VRAM during early development.
-        const INSTANCE_POOL_CAPACITY_U32: u32 = 4 * 1024 * 1024;
-        let instance_pool_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("inst pool"),
-            size: (INSTANCE_POOL_CAPACITY_U32 as u64) * 4,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        // The instance_pool_buffer lives on RkpScene now (bound at
+        // scene group binding(14) so the host march can read it for
+        // shader-asset paths). Capacity is set in rkp_scene.rs via
+        // INSTANCE_POOL_CAPACITY_U32.
         let mut instance_region_cache =
             rkp_render::user_shader_emit_pass::InstanceRegionCache::with_capacity(
-                INSTANCE_POOL_CAPACITY_U32,
+                rkp_render::rkp_scene::INSTANCE_POOL_CAPACITY_U32,
             );
         // Pool base = 0 — the cache's `instance_block_offset` values
         // are absolute u32 indices into `instance_pool_buffer`.
@@ -506,8 +493,7 @@ impl RenderState {
             instance_proto_cache,
             instance_emit_pass,
             instance_region_cache,
-            instance_pool_buffer,
-            instance_pool_capacity_u32: INSTANCE_POOL_CAPACITY_U32,
+            instance_pool_capacity_u32: rkp_render::rkp_scene::INSTANCE_POOL_CAPACITY_U32,
             instance_tile_index_buffer,
             instance_tile_index_capacity_entries: INSTANCE_TILE_INDEX_INITIAL_ENTRIES,
             instance_proto_lookup_buffer,
@@ -1026,6 +1012,22 @@ fn render_one_frame(
             &frame.user_shader_shade_chunk,
             frame.user_shader_source_hash,
         );
+        // Phase 4c — host march + shadow trace splice the user-shader
+        // inst_to_local + inst_aabb chunks the same way Option B's
+        // instance_march does. Hash gate inside each `reload` makes
+        // the no-change frame a no-op.
+        vr.march.reload_user_shaders(
+            &state.device,
+            &frame.user_shader_inst_to_local_chunk,
+            &frame.user_shader_inst_aabb_chunk,
+            frame.user_shader_source_hash,
+        );
+        vr.shadow_trace.reload_user_shaders(
+            &state.device,
+            &frame.user_shader_inst_to_local_chunk,
+            &frame.user_shader_inst_aabb_chunk,
+            frame.user_shader_source_hash,
+        );
         vr.shade.upload_shader_params(
             &state.device,
             &state.queue,
@@ -1105,19 +1107,19 @@ fn render_one_frame(
     //       transients identically to bake-built objects — same
     //       octree node encoding, same leaf attr layout.
     //
-    //       Phase 4 — blade assets/instances from `tick_instance_pipeline`
-    //       go BETWEEN the host's persistent set and Phase C's transient
-    //       set. Phase C's `asset_id_base` shifts up to account for the
-    //       blade assets so its per-instance `asset_id` references stay
-    //       correct after splicing.
+    //       Phase 4 — user-shader instance assets/instances from
+    //       `tick_instance_pipeline` go BETWEEN the host's persistent
+    //       set and Phase C's transient set. Phase C's `asset_id_base`
+    //       shifts up to account for them so its per-instance
+    //       `asset_id` references stay correct after splicing.
     let asset_id_base =
-        frame.gpu_assets.len() as u32 + inst_result.blade_assets.len() as u32;
+        frame.gpu_assets.len() as u32 + inst_result.user_shader_assets.len() as u32;
     let (transient_assets, transient_instances) =
         run_user_shader_geom(state, frame, asset_id_base);
 
     let mut combined_assets: Vec<rkp_render::rkp_gpu_object::RkpGpuAsset>;
     let mut combined_instances: Vec<rkp_render::rkp_gpu_object::RkpGpuInstance>;
-    let need_combine = !inst_result.blade_assets.is_empty()
+    let need_combine = !inst_result.user_shader_assets.is_empty()
         || !transient_instances.is_empty();
     let (assets_for_upload, instances_for_upload): (
         &[rkp_render::rkp_gpu_object::RkpGpuAsset],
@@ -1127,19 +1129,19 @@ fn render_one_frame(
     } else {
         combined_assets = Vec::with_capacity(
             frame.gpu_assets.len()
-                + inst_result.blade_assets.len()
+                + inst_result.user_shader_assets.len()
                 + transient_assets.len(),
         );
         combined_assets.extend_from_slice(&frame.gpu_assets);
-        combined_assets.extend_from_slice(&inst_result.blade_assets);
+        combined_assets.extend_from_slice(&inst_result.user_shader_assets);
         combined_assets.extend_from_slice(&transient_assets);
         combined_instances = Vec::with_capacity(
             gpu_instances.len()
-                + inst_result.blade_instances.len()
+                + inst_result.user_shader_instances.len()
                 + transient_instances.len(),
         );
         combined_instances.extend_from_slice(gpu_instances);
-        combined_instances.extend_from_slice(&inst_result.blade_instances);
+        combined_instances.extend_from_slice(&inst_result.user_shader_instances);
         combined_instances.extend_from_slice(&transient_instances);
         (combined_assets.as_slice(), combined_instances.as_slice())
     };
@@ -1212,37 +1214,39 @@ fn render_one_frame(
 
     // Object count comes from the interpolated list plus any
     // transient user-shader instances appended by `run_user_shader_geom`
-    // AND any blade instances appended by `tick_instance_pipeline`.
-    // Layout in `objects_buffer`:
-    //   [persistent | blade | transient]
-    let blade_count = inst_result.blade_instances.len() as u32;
+    // AND any user-shader instance proto entries appended by
+    // `tick_instance_pipeline`. Layout in `objects_buffer`:
+    //   [persistent | user_shader_instances | transient]
+    let user_shader_instance_count = inst_result.user_shader_instances.len() as u32;
     let transient_count = transient_instances.len() as u32;
     let persistent_count = gpu_instances.len() as u32;
-    let object_count = persistent_count + blade_count + transient_count;
+    let object_count = persistent_count + user_shader_instance_count + transient_count;
     // Phase C transients keep the broadcast splice path — one transient
     // region typically covers the painted entity's whole AABB, so it's
-    // visible from most tiles. Blades, by contrast, are tiny per-instance
-    // (~3 cm cubes) — broadcasting 1700+ blade indices into every tile
-    // explodes the buffer (32K tiles × 1700 = 56M entries on a 1080p
-    // viewport). Below we cull blades properly via per-blade screen
-    // AABBs and merge their per-tile lists into sim's.
+    // visible from most tiles. User-shader instances, by contrast, are
+    // tiny per-instance (~3 cm cubes for the grass demo, but the same
+    // shape applies to any `@instance_proto` shader) — broadcasting
+    // 1700+ instance ids into every tile explodes the buffer (32K
+    // tiles × 1700 = 56M entries on a 1080p viewport). Below we cull
+    // them per-instance via screen-AABB and merge per-tile lists into
+    // sim's.
     let transient_indices: Vec<u32> =
-        (persistent_count + blade_count..persistent_count + blade_count + transient_count)
+        (persistent_count + user_shader_instance_count..persistent_count + user_shader_instance_count + transient_count)
             .collect();
-    // Per-VR blade tile_lists, computed render-thread-side. Empty if no
-    // blades; otherwise one TileLists per viewport keyed by index in
-    // `frame.viewports`.
-    let blade_tile_lists_per_vp: Vec<Option<crate::scene_sync::TileLists>> = if blade_count == 0 {
+    // Per-VR user-shader-instance tile_lists, computed render-thread
+    // side. Empty if no user-shader instances; otherwise one TileLists
+    // per viewport keyed by index in `frame.viewports`.
+    let user_shader_tile_lists_per_vp: Vec<Option<crate::scene_sync::TileLists>> = if user_shader_instance_count == 0 {
         Vec::new()
     } else {
         // Build a single combined assets vec the screen-AABB pass can
-        // index into via blade.asset_id (which already accounts for
+        // index into via instance.asset_id (which already accounts for
         // asset_id_base = frame.gpu_assets.len()).
         let mut combined_for_aabb = Vec::with_capacity(
-            frame.gpu_assets.len() + inst_result.blade_assets.len(),
+            frame.gpu_assets.len() + inst_result.user_shader_assets.len(),
         );
         combined_for_aabb.extend_from_slice(&frame.gpu_assets);
-        combined_for_aabb.extend_from_slice(&inst_result.blade_assets);
+        combined_for_aabb.extend_from_slice(&inst_result.user_shader_assets);
 
         frame
             .viewports
@@ -1252,7 +1256,7 @@ fn render_one_frame(
                     return None;
                 }
                 let aabbs = crate::scene_sync::compute_screen_aabbs(
-                    &inst_result.blade_instances,
+                    &inst_result.user_shader_instances,
                     &combined_for_aabb,
                     &vp.vp_matrix,
                     vp.width as f32,
@@ -1261,10 +1265,10 @@ fn render_one_frame(
                 let mut lists = crate::scene_sync::build_tile_lists(
                     &aabbs, vp.width, vp.height,
                 );
-                // Shift blade ids into the combined-instances index
-                // space — blades live at indices
-                // [persistent_count..persistent_count+blade_count) in
-                // the per-frame `objects_buffer`.
+                // Shift user-shader instance ids into the combined-
+                // instances index space — they live at indices
+                // [persistent_count..persistent_count+user_shader_instance_count)
+                // in the per-frame `objects_buffer`.
                 for id in &mut lists.object_ids {
                     *id += persistent_count;
                 }
@@ -1378,20 +1382,21 @@ fn render_one_frame(
         //
         // Merge per-tile object lists across three sources:
         //   - sim's persistent objects (`vp.tile_*_bytes`, already culled)
-        //   - per-blade culled lists (`blade_tile_lists_per_vp[vp_idx]`)
+        //   - per-instance user-shader culled lists
+        //     (`user_shader_tile_lists_per_vp[vp_idx]`)
         //   - Phase C transient indices (broadcast to every tile;
         //     small N, mostly used for whole-entity user-shader regions)
         // No-op pass-through when none of the three contribute.
-        let blade_lists = blade_tile_lists_per_vp.get(vp_idx).and_then(|x| x.as_ref());
+        let user_shader_lists = user_shader_tile_lists_per_vp.get(vp_idx).and_then(|x| x.as_ref());
         let (effective_tile_offsets, effective_tile_object_ids);
-        let need_merge = blade_lists.is_some() || !transient_indices.is_empty();
+        let need_merge = user_shader_lists.is_some() || !transient_indices.is_empty();
         let (tile_offsets_ref, tile_object_ids_ref): (&[u8], &[u8]) = if !need_merge {
             (&vp.tile_offsets_bytes, &vp.tile_object_ids_bytes)
         } else {
             let (offsets, ids) = merge_tile_lists(
                 &vp.tile_offsets_bytes,
                 &vp.tile_object_ids_bytes,
-                blade_lists,
+                user_shader_lists,
                 &transient_indices,
             );
             effective_tile_offsets = offsets;
@@ -1419,14 +1424,13 @@ fn render_one_frame(
         );
 
         // Phase 4 verification — Option B's per-pixel pipeline is
-        // disabled. Foundation check: does the host march alone produce
-        // visible blade output? The proto bake still runs upstream
-        // (writes blade octree into the host pool), and blade
-        // RkpGpuInstance entries are still emitted, so the host march
-        // descends them like any other host asset. If blades appear
-        // here, Phase 4a's foundation is solid and we proceed to 4c
-        // (user shader hooks in host march). If not, there's a real
-        // bug in the host pipeline to chase.
+        // disabled. The proto bake still runs upstream (writes the
+        // user-shader instance octree into the host pool) and the
+        // per-instance RkpGpuInstance entries are emitted, so the
+        // host march descends them like any other host asset. Phase 4c
+        // wires the user shader's `inst_to_local` / `inst_aabb` hooks
+        // into the host march so the asset's `shader_id` triggers
+        // per-instance world-space deformation.
         //
         // Shade reads from `vr.gbuffer` (host) instead of
         // `vr.instance_merged_gbuffer` while this is disabled — the
@@ -1434,7 +1438,7 @@ fn render_one_frame(
         // earlier in the loop; we override it below.
         let _ = (
             &state.instance_emit_pass,
-            &state.instance_pool_buffer,
+            &state.renderer.scene.instance_pool_buffer,
             &state.instance_tile_index_buffer,
             &state.instance_proto_lookup_buffer,
             instance_counts,
@@ -1694,19 +1698,20 @@ fn splice_transient_into_tile_lists(
 }
 
 /// Phase 4 — merge sim's per-tile object lists with two render-side
-/// sources: a properly-culled per-tile blade list (one entry per
-/// (tile, blade) where the blade's screen-AABB overlaps the tile), and
-/// a Phase C broadcast list (every tile gets every transient).
+/// sources: a properly-culled per-tile user-shader-instance list (one
+/// entry per (tile, instance) where the instance's screen-AABB
+/// overlaps the tile), and a Phase C broadcast list (every tile gets
+/// every transient).
 ///
-/// For each tile, output is `[sim_persistent | blades_in_tile |
+/// For each tile, output is `[sim_persistent | user_shader_in_tile |
 /// transient_broadcast]`. All three index spaces are disjoint
-/// (persistent < persistent_count ≤ blades < persistent+blade ≤
-/// transient < object_count), so the march can dispatch any of them
-/// without aliasing.
+/// (persistent < persistent_count ≤ user-shader < persistent+
+/// user_shader ≤ transient < object_count), so the march can dispatch
+/// any of them without aliasing.
 fn merge_tile_lists(
     sim_offsets_bytes: &[u8],
     sim_ids_bytes: &[u8],
-    blade_lists: Option<&crate::scene_sync::TileLists>,
+    user_shader_lists: Option<&crate::scene_sync::TileLists>,
     transient_broadcast: &[u32],
 ) -> (Vec<u32>, Vec<u32>) {
     let n_tile = if sim_offsets_bytes.is_empty() {
@@ -1723,19 +1728,19 @@ fn merge_tile_lists(
     let sim_offsets: &[u32] = bytemuck::cast_slice(sim_offsets_bytes);
     let sim_ids: &[u32] = bytemuck::cast_slice(sim_ids_bytes);
 
-    let blade_n_tile = blade_lists.map(|l| l.offsets.len().saturating_sub(1)).unwrap_or(0);
-    let blade_total = blade_lists.map(|l| l.object_ids.len()).unwrap_or(0);
+    let user_shader_n_tile = user_shader_lists.map(|l| l.offsets.len().saturating_sub(1)).unwrap_or(0);
+    let user_shader_total = user_shader_lists.map(|l| l.object_ids.len()).unwrap_or(0);
     let mut new_offsets: Vec<u32> = Vec::with_capacity(n_tile + 1);
     let mut new_ids: Vec<u32> = Vec::with_capacity(
-        sim_ids.len() + blade_total + n_tile * transient_broadcast.len(),
+        sim_ids.len() + user_shader_total + n_tile * transient_broadcast.len(),
     );
     new_offsets.push(0);
     for t in 0..n_tile {
         let sa = sim_offsets[t] as usize;
         let sb = sim_offsets[t + 1] as usize;
         new_ids.extend_from_slice(&sim_ids[sa..sb]);
-        if t < blade_n_tile {
-            let lists = blade_lists.expect("blade_n_tile > 0 ⇒ Some");
+        if t < user_shader_n_tile {
+            let lists = user_shader_lists.expect("user_shader_n_tile > 0 ⇒ Some");
             let ba = lists.offsets[t] as usize;
             let bb = lists.offsets[t + 1] as usize;
             new_ids.extend_from_slice(&lists.object_ids[ba..bb]);
@@ -1840,8 +1845,8 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
         state.instance_region_cache.evict_untouched();
         return InstancePipelineResult {
             counts: InstancePerFrameCounts::default(),
-            blade_assets: Vec::new(),
-            blade_instances: Vec::new(),
+            user_shader_assets: Vec::new(),
+            user_shader_instances: Vec::new(),
         };
     }
 
@@ -1862,9 +1867,10 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
     //    tail). The dedicated `RkpScene::proto_*_buffer` fields stay in
     //    place but go unused; Phase 5 deletes them once Option B is
     //    retired. Putting proto data in the host pools means the host
-    //    march descends a baked blade asset via its existing
-    //    `octree_nodes_buffer` / `brick_pool_buffer` / `leaf_attr_pool_buffer`
-    //    bindings — no "which pool?" indirection in the shader.
+    //    march descends a baked user-shader instance asset via its
+    //    existing `octree_nodes_buffer` / `brick_pool_buffer` /
+    //    `leaf_attr_pool_buffer` bindings — no "which pool?"
+    //    indirection in the shader.
     //
     //    Sized small (16 + 16 + 8 MB) on purpose: the previous attempt
     //    to layer proto onto cpu + Phase C's huge transient (~768 MB
@@ -1977,25 +1983,27 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
     // here.
     let mut leaves_flat: Vec<PaintedLeaf> = Vec::new();
 
-    // Phase 4 — blade asset registration + per-leaf host-instance emit.
-    // One asset per `@instance_proto` shader (deduped by shader_id);
-    // one host instance per painted leaf. The host march reads these
-    // through the existing pool bindings and treats blade instances
-    // identically to ordinary host objects — so shadows, picking, fog,
-    // GI all "just work" the moment the bake completes.
+    // Phase 4 — user-shader instance asset registration + per-leaf
+    // host-instance emit. One asset per `@instance_proto` shader
+    // (deduped by shader_id); one host instance per painted leaf. The
+    // host march reads these through the existing pool bindings and
+    // treats user-shader instances identically to ordinary host objects
+    // — so shadows, picking, fog, GI all "just work" the moment the
+    // bake completes. Phase 4c branches on `asset.shader_id != 0` to
+    // call the user shader's `inst_to_local` / `inst_aabb` hooks.
     use rkp_render::rkp_gpu_object::{geom_type, RkpGpuAsset, RkpGpuInstance};
-    let mut blade_asset_for_shader: std::collections::HashMap<u32, u32> =
+    let mut asset_for_shader: std::collections::HashMap<u32, u32> =
         std::collections::HashMap::new();
-    let mut blade_assets: Vec<RkpGpuAsset> = Vec::new();
-    let mut blade_instances: Vec<RkpGpuInstance> = Vec::new();
+    let mut user_shader_assets: Vec<RkpGpuAsset> = Vec::new();
+    let mut user_shader_instances: Vec<RkpGpuInstance> = Vec::new();
     let asset_id_base = frame.gpu_assets.len() as u32;
-    // Object id space for blade instances — needs to be disjoint from
-    // both host entities (`gpu_to_entity` indices, < gpu_instances.len())
-    // and Option B's per-instance ids (`INSTANCE_OBJECT_ID_BASE`).
+    // Object id space for user-shader instances — needs to be disjoint
+    // from both host entities (`gpu_to_entity` indices, < gpu_instances
+    // .len()) and Option B's per-instance ids (`INSTANCE_OBJECT_ID_BASE`).
     // Carve out 0xF0XX_XXXX to avoid both. Object ids are only used by
     // the pick path; collisions would mis-resolve a click.
-    const BLADE_OBJECT_ID_BASE: u32 = 0xF000_0000;
-    let mut blade_object_id_cursor: u32 = BLADE_OBJECT_ID_BASE;
+    const USER_SHADER_OBJECT_ID_BASE: u32 = 0xF000_0000;
+    let mut user_shader_object_id_cursor: u32 = USER_SHADER_OBJECT_ID_BASE;
 
     let time_seconds = frame.shade_params_base.time;
     for req in &frame.instance_region_requests {
@@ -2088,23 +2096,38 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             eprintln!("[inst] tile index error: {e}");
         }
 
-        // Phase 4 — register blade asset (once per shader) and emit
-        // one host instance per painted leaf.
+        // Phase 4 — register the user-shader instance asset (once per
+        // shader) and emit one host instance per painted leaf.
         //
-        // Per-blade variation (yaw, height jitter, lean, wind sway) is
-        // not yet wired through the host pipeline — this V1 emits a
-        // translation-only world matrix scaled to `req.cell_size`. The
-        // blade is centered on the leaf's world position. Visual fidelity
-        // matches what Option B produced with the emit hook stubbed out;
-        // a follow-up step will hook the user shader's transform back in.
-        let asset_index = match blade_asset_for_shader.get(&shader_id) {
+        // The per-instance state (yaw, scale, lean, wind sway, etc — whatever
+        // the shader's `@instance_proto` struct declared) lives in
+        // `instance_pool`. The host instance carries:
+        //   * `asset_id` → the prototype's RkpGpuAsset (which has
+        //     `shader_id != 0`, telling the march to use user-shader hooks)
+        //   * `instance_state_offset` → u32 offset into `instance_pool`
+        //     where this instance's per-instance state record lives
+        //   * `world` (translation-only, centered on the leaf, scaled by
+        //     `cell_size`) — used only for the screen-AABB tile cull;
+        //     the user's `inst_to_local` / `inst_aabb` hooks override
+        //     world placement at march time using the per-instance state.
+        //
+        // The GPU emit pass writes per-instance records into
+        // `instance_pool` via atomicAdd, so the slot ordering across
+        // leaves is non-deterministic. That's fine: each rendered
+        // instance appears at its actual world position dictated by the
+        // user's hooks reading from slot N (whichever leaf wrote there).
+        // The CPU's per-leaf tile-cull AABB is conservative-but-correct
+        // because the per-instance AABB extent (~scale) is much larger
+        // than inter-leaf spacing (~cell_size), so a slot-permuted
+        // instance still falls inside its predicted screen tiles.
+        let asset_index = match asset_for_shader.get(&shader_id) {
             Some(&idx) => idx,
             None => {
-                let idx = blade_assets.len() as u32;
+                let idx = user_shader_assets.len() as u32;
                 let extent = 1.0_f32; // prototype's local-space cube
                 let voxel_size_local =
                     extent / ((1u32 << proto_entry.max_depth) as f32 * BRICK_DIM as f32);
-                blade_assets.push(RkpGpuAsset {
+                user_shader_assets.push(RkpGpuAsset {
                     aabb_min: [0.0, 0.0, 0.0],
                     octree_root: proto_entry
                         .octree_root(state.instance_proto_cache.pool_octree_base()),
@@ -2118,34 +2141,65 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
                     rest_octree_root: 0,
                     rest_octree_depth: 0,
                     rest_octree_extent_bits: 0,
-                    _pad: [0; 2],
+                    // Phase 4c — flags this asset as a user-shader proto.
+                    // The host march reads `asset.shader_id` and routes
+                    // descent through the user's `inst_to_local` /
+                    // `inst_aabb` hooks instead of the affine
+                    // `inv_world` path.
+                    shader_id,
+                    _pad: 0,
                 });
-                blade_asset_for_shader.insert(shader_id, idx);
+                asset_for_shader.insert(shader_id, idx);
                 idx
             }
         };
         let asset_id = asset_id_base + asset_index;
 
-        // Per-leaf instance emit — one blade per painted host leaf.
-        let half_cell = req.cell_size * 0.5;
-        for leaf in &req.leaves {
-            // World matrix: translate the prototype's [0,1]³ corner to
-            // (leaf_pos − half_cell), then scale by `cell_size` so the
-            // whole prototype occupies a `cell_size`-cube centered on
-            // the leaf. Column-major mat4 (last column = translation).
-            let cs = req.cell_size;
-            let tx = leaf.world_pos[0] - half_cell;
-            let ty = leaf.world_pos[1] - half_cell;
-            let tz = leaf.world_pos[2] - half_cell;
+        // Per-leaf instance emit — one host instance per painted leaf.
+        // Each instance points at its own slot in `instance_pool` via
+        // `instance_state_offset = block_offset + i * stride_u32`.
+        let pool_block_offset = region_uniform.instance_block_offset;
+        let pool_stride_u32 = region_uniform.instance_stride_u32;
+        // World matrix encoding for the user-shader path: this matrix
+        // is consumed ONLY by `compute_screen_aabbs` (tile cull) and
+        // by the default `dispatch_user_inst_aabb` fallback. The
+        // ACTUAL world-space blade placement is owned by the user's
+        // `inst_to_local` / `inst_aabb` hooks reading the per-instance
+        // state from `instance_pool`.
+        //
+        // Tile cull projects the asset's aabb_min/max ([0,1]³) corners
+        // through this matrix; we want them to land on a cube
+        // centered on `leaf.world_pos` with radius `region_thickness`
+        // — the same world-space envelope `lifecycle.rs` uses to
+        // compute `effective_band` (blade_height × 1.25 + ε, capped at
+        // the shader's `@region_thickness`). That envelope already
+        // encloses the worst-case per-instance world AABB (forward
+        // map of canonical [0,1]³ through scale + yaw + lean +
+        // jitter) for any per-instance state in the region.
+        //
+        // Slot-permutation note: emit's `atomicAdd` may move the
+        // i-th leaf's per-instance state to slot K ≠ i. The tile
+        // cull AABB is centered on leaf_i but the actual blade
+        // rendered (state from slot K) is at leaf_K. For dense paint
+        // this is fine — the `region_thickness`-radius envelope
+        // around leaf_i comfortably covers leaf_K's blade. Sparse
+        // paint stresses the assumption; future work could record
+        // GPU-side post-emit AABBs and re-cull from those.
+        let r = req.region_thickness.max(req.cell_size);
+        let scale = 2.0 * r;
+        for (i, leaf) in req.leaves.iter().enumerate() {
+            let tx = leaf.world_pos[0] - r;
+            let ty = leaf.world_pos[1] - r;
+            let tz = leaf.world_pos[2] - r;
             let world = [
-                [cs,  0.0, 0.0, 0.0],
-                [0.0, cs,  0.0, 0.0],
-                [0.0, 0.0, cs,  0.0],
-                [tx,  ty,  tz,  1.0],
+                [scale, 0.0,   0.0,   0.0],
+                [0.0,   scale, 0.0,   0.0],
+                [0.0,   0.0,   scale, 0.0],
+                [tx,    ty,    tz,    1.0],
             ];
-            let object_id = blade_object_id_cursor;
-            blade_object_id_cursor = blade_object_id_cursor.wrapping_add(1);
-            blade_instances.push(RkpGpuInstance {
+            let object_id = user_shader_object_id_cursor;
+            user_shader_object_id_cursor = user_shader_object_id_cursor.wrapping_add(1);
+            user_shader_instances.push(RkpGpuInstance {
                 world,
                 asset_id,
                 material_id: req.material_id,
@@ -2161,10 +2215,12 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
                 bone_field_origin_x: 0.0,
                 bone_field_origin_y: 0.0,
                 bone_field_origin_z: 0.0,
-                // No paint overlay on procedurally-emitted blades —
-                // they're rebuilt every frame from the host paint walk.
+                // Procedurally-emitted instances — paint overlays don't
+                // accumulate; everything is rebuilt every frame.
                 overlay_offset: 0,
                 overlay_count: 0,
+                instance_state_offset: pool_block_offset + (i as u32) * pool_stride_u32,
+                _pad: [0; 3],
             });
         }
     }
@@ -2353,7 +2409,7 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
                 label: Some("inst scatter g0"),
                 layout: &state.instance_emit_pass.group0_layout,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: state.instance_pool_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 0, resource: state.renderer.scene.instance_pool_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 1, resource: state.instance_emit_pass.instance_alloc_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 2, resource: state.instance_leaves_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 3, resource: state.instance_emit_pass.overflow_buffer.as_entire_binding() },
@@ -2462,8 +2518,8 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             tile_index_count: tile_entries.len() as u32,
             proto_lookup_count: proto_entries.len() as u32,
         },
-        blade_assets,
-        blade_instances,
+        user_shader_assets,
+        user_shader_instances,
     }
 }
 
@@ -2542,20 +2598,23 @@ struct InstancePerFrameCounts {
 
 /// What `tick_instance_pipeline` returns: the per-frame counts Option B's
 /// instance overlay still needs (until Phase 5 deletes it), plus
-/// Phase 4's host-side blade asset + instance pair that splices onto
-/// `frame.gpu_assets` / `gpu_instances` so the host march can render
-/// blades natively.
+/// Phase 4's host-side user-shader instance asset + instance pair that
+/// splices onto `frame.gpu_assets` / `gpu_instances` so the host march
+/// can render user-shader instances natively (without going through the
+/// per-pixel Option B pipeline).
 struct InstancePipelineResult {
     counts: InstancePerFrameCounts,
     /// One asset per `@instance_proto` shader, sourced from the proto
     /// cache's reserved octree slot in the host pool tail. Spliced onto
     /// the frame's persistent assets vec just like
-    /// `run_user_shader_geom`'s transient assets.
-    blade_assets: Vec<rkp_render::rkp_gpu_object::RkpGpuAsset>,
+    /// `run_user_shader_geom`'s transient assets. Each entry has
+    /// `shader_id != 0` so the host march dispatches user-shader
+    /// hooks instead of the affine `inv_world` path.
+    user_shader_assets: Vec<rkp_render::rkp_gpu_object::RkpGpuAsset>,
     /// One instance per painted host leaf. Each instance points at the
-    /// matching blade asset (offset by `frame.gpu_assets.len()` plus the
-    /// asset's index in `blade_assets`).
-    blade_instances: Vec<rkp_render::rkp_gpu_object::RkpGpuInstance>,
+    /// matching user-shader asset (offset by `frame.gpu_assets.len()`
+    /// plus the asset's index in `user_shader_assets`).
+    user_shader_instances: Vec<rkp_render::rkp_gpu_object::RkpGpuInstance>,
 }
 
 /// Grow `instance_tile_index_buffer` to fit `needed_entries`. No-op
@@ -2718,9 +2777,10 @@ fn run_user_shader_geom(
         // user-shader-allocated brick. Uninitialised values would jump
         // the DDA chain into stale brick_id=0. Also covers the proto
         // range — proto bake doesn't write face_links either, so leaving
-        // them at FACE_EMPTY makes the host march cleanly exit blade
-        // bricks at boundaries (cross-brick navigation within a single
-        // blade is unsupported until a follow-up fix populates them).
+        // them at FACE_EMPTY makes the host march cleanly exit
+        // user-shader instance bricks at boundaries (cross-brick
+        // navigation within a single instance is unsupported until a
+        // follow-up fix populates them).
         let init_total_bytes = proto_face_links_bytes + extra_face_links;
         const FACE_INIT_CHUNK: usize = 4 * 1024 * 1024;
         let chunk_data: Vec<u32> = vec![FACE_EMPTY; FACE_INIT_CHUNK];
@@ -2741,8 +2801,8 @@ fn run_user_shader_geom(
     //    Also reconcile against the host's geometry epoch (any host
     //    geometry change invalidates every region's topology_hash).
     //    Phase C's transient range starts past the proto reservation
-    //    so blade bricks and Phase C bricks have disjoint brick_ids
-    //    (and disjoint face_links slots).
+    //    so user-shader proto bricks and Phase C bricks have disjoint
+    //    brick_ids (and disjoint face_links slots).
     let proto_octree_elems = (PROTO_TAIL_OCTREE_BYTES / 8) as u32;
     let proto_leaf_attr_elems = (PROTO_TAIL_LEAF_ATTR_BYTES / 8) as u32;
     let octree_base_elems = (cpu_octree_bytes / 8) as u32 + proto_octree_elems;

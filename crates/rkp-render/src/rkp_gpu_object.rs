@@ -57,7 +57,8 @@ pub mod geom_type {
 /// | 60     | 4    | rest_octree_root (u32) |
 /// | 64     | 4    | rest_octree_depth (u32) |
 /// | 68     | 4    | rest_octree_extent_bits (u32) |
-/// | 72     | 8    | _pad |
+/// | 72     | 4    | shader_id (u32) — 0 = standard host asset; >0 = user-shader instance proto. The march branches on this to call `dispatch_user_inst_to_local` / `dispatch_user_inst_aabb` instead of the affine `inv_world` path. |
+/// | 76     | 4    | _pad |
 ///
 /// `bone_count` and `rest_octree_*` are skeleton-template properties —
 /// same across every instance of one skinned asset. Phase 1b sources
@@ -83,7 +84,8 @@ pub struct RkpGpuAsset {
     pub rest_octree_root: u32,
     pub rest_octree_depth: u32,
     pub rest_octree_extent_bits: u32,
-    pub _pad: [u32; 2],
+    pub shader_id: u32,
+    pub _pad: u32,
 }
 
 /// Per-instance GPU record (128 bytes). One per scene entity; carries:
@@ -97,7 +99,7 @@ pub struct RkpGpuAsset {
 ///   in a global overlay buffer; `overlay_count == 0` ⇒ asset's pool
 ///   values are used directly)
 ///
-/// # Layout (128 bytes)
+/// # Layout (144 bytes)
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
@@ -118,13 +120,26 @@ pub struct RkpGpuAsset {
 /// | 116    | 4    | bone_field_origin_z (f32) |
 /// | 120    | 4    | overlay_offset (u32) |
 /// | 124    | 4    | overlay_count (u32) |
+/// | 128    | 4    | instance_state_offset (u32) — u32 offset into `instance_pool` for this instance's per-instance state; ignored unless the asset has shader_id != 0. |
+/// | 132    | 12   | _pad (3× u32) — restores 16-byte stride for the mat4 alignment requirement. |
 ///
 /// `overlay_offset` + `overlay_count` describe a slice into the
 /// scene-global `instance_overlay` buffer (Phase 3). The WGSL fetch
 /// helper falls through to `leaf_attr_pool[slot]` when
-/// `overlay_count == 0`. Adding the two `u32`s consumed the previous
-/// 8-byte `_pad`; total struct size stays at 128 bytes (a multiple of
-/// the mat4x4 alignment, so the WGSL array stride is unchanged).
+/// `overlay_count == 0`.
+///
+/// `instance_state_offset` (Phase 4c) points the host march at this
+/// instance's record in `instance_pool` so the user shader's
+/// `inst_to_local` / `inst_aabb` hooks can read whatever per-instance
+/// state the shader's `@instance_proto` struct declares. Standard
+/// host instances leave it 0; the march branches on `asset.shader_id
+/// != 0` first, so the offset is only dereferenced for shader-asset
+/// paths. Field is generic by design — the engine knows nothing about
+/// the shader's struct layout, just where to point its hooks at.
+///
+/// Total struct size grows from 128 → 144 B — the mat4x4 in `world`
+/// requires 16-byte stride, so adding a single u32 forces a 12-byte
+/// trailing pad to land on the next 16-byte boundary.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
 pub struct RkpGpuInstance {
@@ -145,6 +160,8 @@ pub struct RkpGpuInstance {
     pub bone_field_origin_z: f32,
     pub overlay_offset: u32,
     pub overlay_count: u32,
+    pub instance_state_offset: u32,
+    pub _pad: [u32; 3],
 }
 
 #[cfg(test)]
@@ -170,11 +187,20 @@ mod tests {
     }
 
     #[test]
-    fn instance_size_is_128_bytes() {
-        // mat4x4 alignment requires stride to be a multiple of 16; 128
-        // satisfies it. Phase 3 consumed the previous 8-byte tail pad
-        // for `overlay_offset` + `overlay_count`.
-        assert_eq!(mem::size_of::<RkpGpuInstance>(), 128);
+    fn instance_size_is_144_bytes() {
+        // mat4x4 alignment requires stride to be a multiple of 16; 144
+        // satisfies it. Phase 4c added `instance_state_offset` + 12 B
+        // pad to the previous 128 B struct so the host march can index
+        // into `instance_pool` for user-shader assets.
+        assert_eq!(mem::size_of::<RkpGpuInstance>(), 144);
+    }
+
+    #[test]
+    fn instance_state_offset_at_offset_128() {
+        let i = RkpGpuInstance::zeroed();
+        let base = &i as *const _ as usize;
+        let field = &i.instance_state_offset as *const _ as usize;
+        assert_eq!(field - base, 128);
     }
 
     #[test]

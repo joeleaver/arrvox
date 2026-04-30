@@ -41,6 +41,15 @@ pub struct MarchParams {
 /// The octree ray march compute pass.
 pub struct OctreeMarchPass {
     pipeline: wgpu::ComputePipeline,
+    /// Kept around so `reload_user_shaders` can rebuild the pipeline
+    /// against the same bind-group layouts when user-shader chunks
+    /// change. Phase 4c.
+    pipeline_layout: wgpu::PipelineLayout,
+    /// Hash of the user-shader source mix this pipeline was last
+    /// built against. Comparing to the registry's `source_hash`
+    /// decides whether a rebuild is needed. 0 = "default identity
+    /// stubs", which is what the static template ships with.
+    user_shader_source_hash: u64,
     gbuffer_bind_group_layout: wgpu::BindGroupLayout,
     gbuffer_bind_group: Option<wgpu::BindGroup>,
     params_bind_group_layout: wgpu::BindGroupLayout,
@@ -203,6 +212,8 @@ impl OctreeMarchPass {
 
         Self {
             pipeline,
+            pipeline_layout,
+            user_shader_source_hash: 0,
             gbuffer_bind_group_layout,
             gbuffer_bind_group: None,
             params_bind_group_layout,
@@ -240,6 +251,47 @@ impl OctreeMarchPass {
             lights_buffer: None,
             materials_buffer: None,
         }
+    }
+
+    /// Re-build the compute pipeline against the spliced user-shader
+    /// `inst_to_local` + `inst_aabb` chunks. Returns `true` if rebuilt,
+    /// `false` if `source_hash` matched and the existing pipeline was
+    /// kept. Empty chunks restore the default identity-arm stubs (the
+    /// "no user shader registered" path). Phase 4c.
+    ///
+    /// Mirrors `InstanceMarchPass::reload_user_shaders` /
+    /// `PrototypeBakePass::reload_user_shaders` exactly so the engine
+    /// can call all three with the same `frame.user_shader_source_hash`
+    /// without having to track per-pass hashes.
+    pub fn reload_user_shaders(
+        &mut self,
+        device: &wgpu::Device,
+        inst_to_local_chunk: &str,
+        inst_aabb_chunk: &str,
+        source_hash: u64,
+    ) -> bool {
+        if source_hash == self.user_shader_source_hash {
+            return false;
+        }
+        let template = include_str!("shaders/octree_march.wgsl");
+        let source = crate::shader_composer::splice_inst_chunks(
+            template, inst_to_local_chunk, inst_aabb_chunk,
+        );
+        validate_wgsl(&source, "octree_march");
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("octree_march"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        self.pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("octree_march"),
+            layout: Some(&self.pipeline_layout),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        self.user_shader_source_hash = source_hash;
+        true
     }
 
     /// Set the materials buffer. Call after materials are uploaded/resized.

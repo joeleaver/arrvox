@@ -132,9 +132,16 @@ pub fn compute_screen_aabbs(
             return ScreenAabb::zeroed();
         }
 
-        // Build the 8 corners of the local AABB.
-        let extent = f32::from_bits(asset.octree_extent_bits);
-        let half = extent * 0.5;
+        // Build the 8 corners of the asset's local AABB. Iterate the
+        // ACTUAL `aabb_min` / `aabb_max` rather than `±octree_extent/2`
+        // — they're not always equivalent. Standard host assets bake
+        // their octree centered around the local origin
+        // (aabb = [-half, +half]) so the two agree there. User-shader
+        // instance protos (Phase 4c) are baked into [0, 1]³ canonical
+        // space (aabb_min = [0, 0, 0], aabb_max = [1, 1, 1]); using
+        // `±half` would project the wrong cube and miss most pixels.
+        let aabb_min = Vec3::from(asset.aabb_min);
+        let aabb_max = Vec3::from(asset.aabb_max);
         let world = Mat4::from_cols_array_2d(&inst.world);
 
         let mut smin = Vec3::splat(f32::MAX);
@@ -142,9 +149,9 @@ pub fn compute_screen_aabbs(
 
         for corner in 0..8u32 {
             let local = Vec3::new(
-                if corner & 1 != 0 { half } else { -half },
-                if corner & 2 != 0 { half } else { -half },
-                if corner & 4 != 0 { half } else { -half },
+                if corner & 1 != 0 { aabb_max.x } else { aabb_min.x },
+                if corner & 2 != 0 { aabb_max.y } else { aabb_min.y },
+                if corner & 4 != 0 { aabb_max.z } else { aabb_min.z },
             );
             let world_pos = world.transform_point3(local);
             let clip = *view_proj * Vec4::new(world_pos.x, world_pos.y, world_pos.z, 1.0);

@@ -32,6 +32,18 @@ pub const PROTO_BRICK_CAPACITY_BYTES: u64 = 256 * 1024 * 64 * 4;
 /// 4 M leaf-attr slots × 8 bytes = 32 MB.
 pub const PROTO_LEAF_ATTR_CAPACITY_BYTES: u64 = 4 * 1024 * 1024 * 8;
 
+/// Per-instance user-shader state pool capacity, in u32 units. Each
+/// `@instance_proto` instance consumes `stride_u32` of this buffer
+/// (typically 8 = 32 B). The emit pass writes; the host march reads
+/// (binding 14) for any asset with `shader_id != 0`.
+///
+/// Engine-side `RenderState::instance_pool_capacity_u32` must mirror
+/// this — the user-shader emit pass sub-allocates within. 16 MB total
+/// (4 M × 4 B) fits ~500K instances at the default 32 B stride.
+pub const INSTANCE_POOL_CAPACITY_U32: u32 = 4 * 1024 * 1024;
+/// 16 MB.
+pub const INSTANCE_POOL_CAPACITY_BYTES: u64 = (INSTANCE_POOL_CAPACITY_U32 as u64) * 4;
+
 /// Camera uniforms matching the WGSL `CameraUniforms` struct.
 ///
 /// Layout (208 + 16 = 224 bytes):
@@ -205,6 +217,14 @@ pub struct RkpScene {
     /// concatenated. Each `RkpGpuInstance.overlay_offset` +
     /// `overlay_count` slices into this. Bound at binding(13).
     pub instance_overlay_buffer: wgpu::Buffer,
+    /// Per-instance user-shader state pool (Phase 4c). The emit pass
+    /// writes per-instance records here; the host march reads them via
+    /// `instance.instance_state_offset` when the asset's `shader_id`
+    /// is non-zero. Bound at binding(14). Layout is shader-defined
+    /// (whatever struct the user's `@instance_proto` declared) — the
+    /// engine sees it as a flat `array<u32>`. Sized once at
+    /// construction; never grows.
+    pub instance_pool_buffer: wgpu::Buffer,
     pub bind_group_layout: wgpu::BindGroupLayout,
     /// Incremented whenever a shared buffer reallocates. Each VR caches
     /// the epoch it built its bind group at; rebuilds when the scene's
@@ -276,6 +296,18 @@ impl RkpScene {
             device, "rkp_instance_overlay", 16,
         );
 
+        // Per-instance user-shader state pool — sized once at
+        // construction. Emit pass writes; host march reads via
+        // `inst.instance_state_offset` for shader-asset paths.
+        let instance_pool_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rkp_instance_pool"),
+            size: INSTANCE_POOL_CAPACITY_BYTES,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
         let bind_group_layout = Self::create_layout(device);
 
         Self {
@@ -287,6 +319,7 @@ impl RkpScene {
             bone_dual_quats_buffer,
             proto_octree_buffer, proto_brick_buffer, proto_leaf_attr_buffer,
             instance_overlay_buffer,
+            instance_pool_buffer,
             bind_group_layout,
             buffers_epoch: 0,
         }
@@ -313,6 +346,7 @@ impl RkpScene {
             &self.bone_weights_buffer, &self.brick_face_links_buffer, &self.leaf_attr_pool_buffer,
             &self.bone_field_buffer, &self.bone_field_occ_buffer, &self.bone_dual_quats_buffer,
             &self.assets_buffer, &self.instance_overlay_buffer,
+            &self.instance_pool_buffer,
         )
     }
 
@@ -668,6 +702,7 @@ impl RkpScene {
                 storage_ro(11), // bone_dual_quats (DQS precomputed palette)
                 storage_ro(12), // assets (per-asset deduped records)
                 storage_ro(13), // instance_overlay (Phase 3 per-instance paint)
+                storage_ro(14), // instance_pool (Phase 4c per-instance user-shader state)
             ],
         })
     }
@@ -690,6 +725,7 @@ impl RkpScene {
         bone_dual_quats: &wgpu::Buffer,
         assets: &wgpu::Buffer,
         instance_overlay: &wgpu::Buffer,
+        instance_pool: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rkp_scene_bind_group"),
@@ -709,6 +745,7 @@ impl RkpScene {
                 wgpu::BindGroupEntry { binding: 11, resource: bone_dual_quats.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: assets.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 13, resource: instance_overlay.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 14, resource: instance_pool.as_entire_binding() },
             ],
         })
     }
