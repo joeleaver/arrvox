@@ -67,7 +67,11 @@ struct RkpInstance {
     bone_field_origin_x: f32,
     bone_field_origin_y: f32,
     bone_field_origin_z: f32,
-    _pad0: u32, _pad1: u32,
+    // Per-instance paint overlay slice into `instance_overlay` (binding 13).
+    // overlay_count == 0 ⇒ unpainted ⇒ fetch_leaf_attr falls through to
+    // the asset's `leaf_attr_pool[slot]`. Phase 3 (project_phase_1_2_shipped).
+    overlay_offset: u32,
+    overlay_count: u32,
 }
 
 // Per-asset record (80 bytes). Deduped by `octree_root`; multiple
@@ -242,6 +246,66 @@ struct LeafAttr {
 // Per-asset records (deduped by octree_root). Instances index here via
 // `inst.asset_id`. See `rkp_gpu_object::RkpGpuAsset` for the layout.
 @group(0) @binding(12) var<storage, read> assets: array<RkpAsset>;
+
+// Per-instance paint overlay (Phase 3) — sorted by `leaf_slot`. Each
+// `RkpInstance.overlay_offset` + `overlay_count` slices into this. Empty
+// (overlay_count == 0) for unpainted instances; `fetch_leaf_attr_for` /
+// `fetch_leaf_color_for` fall through to `leaf_attr_pool[slot]` /
+// `color_pool_data[slot]` in that case. Layout matches
+// `rkp_core::OverlayEntry` (16 bytes).
+struct OverlayEntry {
+    leaf_slot: u32,
+    normal_oct: u32,
+    material_packed: u32,
+    color_packed: u32,
+}
+@group(0) @binding(13) var<storage, read> instance_overlay: array<OverlayEntry>;
+
+// Look up the per-instance overlay slot for `leaf_slot`. Returns
+// `0xFFFFFFFFu` when the slot isn't overridden on this instance.
+// Branchless callers test against the sentinel.
+fn fetch_overlay_index(inst: RkpInstance, leaf_slot: u32) -> u32 {
+    if (inst.overlay_count == 0u) {
+        return 0xFFFFFFFFu;
+    }
+    var lo: u32 = 0u;
+    var hi: u32 = inst.overlay_count;
+    loop {
+        if (lo >= hi) { break; }
+        let mid = (lo + hi) >> 1u;
+        let e = instance_overlay[inst.overlay_offset + mid];
+        if (e.leaf_slot < leaf_slot) {
+            lo = mid + 1u;
+        } else if (e.leaf_slot > leaf_slot) {
+            hi = mid;
+        } else {
+            return inst.overlay_offset + mid;
+        }
+    }
+    return 0xFFFFFFFFu;
+}
+
+// Fetch the per-leaf attr (normal + materials) for the given instance,
+// preferring the overlay if the slot has been painted on this instance.
+fn fetch_leaf_attr_for(inst: RkpInstance, leaf_slot: u32) -> LeafAttr {
+    let idx = fetch_overlay_index(inst, leaf_slot);
+    if (idx != 0xFFFFFFFFu) {
+        let e = instance_overlay[idx];
+        return LeafAttr(e.normal_oct, e.material_packed);
+    }
+    return leaf_attr_pool[leaf_slot];
+}
+
+// Fetch the packed per-leaf color for the given instance. Returns 0
+// (= "use material base color") when neither the overlay nor the asset
+// pool has an override for this slot.
+fn fetch_leaf_color_for(inst: RkpInstance, leaf_slot: u32) -> u32 {
+    let idx = fetch_overlay_index(inst, leaf_slot);
+    if (idx != 0xFFFFFFFFu) {
+        return instance_overlay[idx].color_packed;
+    }
+    return color_pool_data[leaf_slot];
+}
 
 // Inverse of an affine 4x4 matrix (last row = [0,0,0,1]). Cheaper than
 // the general 4x4 inverse (~25 ALU vs ~100). Caller is responsible for
@@ -894,7 +958,7 @@ fn march_object_skinned(
         // by the scatter-time leaf_slot so we get the right voxel's
         // albedo regardless of LBS skew.
         atomicAdd(&stats[46], 1u);
-        let cp = color_pool_data[leaf_slot];
+        let cp = fetch_leaf_color_for(inst, leaf_slot);
         var color = vec3<f32>(0.5);
         if cp != 0u {
             color = vec3<f32>(
@@ -1148,7 +1212,7 @@ fn march_object(
                 // so the march only ever stops on the visible shell.
                 if c != BRICK_CELL_EMPTY && c != BRICK_CELL_INTERIOR {
                     atomicAdd(&stats[44], 1u); // leaf_attr read
-                    let attr = leaf_attr_pool[c];
+                    let attr = fetch_leaf_attr_for(inst, c);
                     let baked_normal = unpack_oct_normal(attr.normal_oct);
                     var cell_normal: vec3<f32>;
                     if march_params.surfacenet_enabled != 0u {
@@ -1180,7 +1244,7 @@ fn march_object(
                         // material colour with whatever default we set.
                         var color = vec3<f32>(0.0);
                         atomicAdd(&stats[46], 1u); // color_pool read
-                        let cp = color_pool_data[c];
+                        let cp = fetch_leaf_color_for(inst, c);
                         if cp != 0u {
                             color = vec3<f32>(
                                 f32(cp & 0xFFu) / 255.0,
@@ -1280,7 +1344,7 @@ fn march_object(
         var m_opacity = 1.0;
         if r.slot != OCTREE_INTERIOR {
             atomicAdd(&stats[44], 1u); // leaf_attr read
-            let attr = leaf_attr_pool[r.slot];
+            let attr = fetch_leaf_attr_for(inst, r.slot);
             leaf_id = r.slot;
             sample_normal = unpack_oct_normal(attr.normal_oct);
             mid = leaf_attr_material_primary(attr);
@@ -1318,7 +1382,7 @@ fn march_object(
         var color = vec3<f32>(0.0);
         if r.slot != OCTREE_INTERIOR {
             atomicAdd(&stats[46], 1u); // color_pool read
-            let cp = color_pool_data[leaf_id];
+            let cp = fetch_leaf_color_for(inst, leaf_id);
             if cp != 0u {
                 color = vec3<f32>(
                     f32(cp & 0xFFu) / 255.0,
@@ -1520,7 +1584,7 @@ fn main(
             first_dist = hit_dist;
             first_obj_id = inst.object_id;
             if r.first_slot != 0u {
-                let attr = leaf_attr_pool[r.first_slot];
+                let attr = fetch_leaf_attr_for(inst, r.first_slot);
                 first_mat_id = leaf_attr_material_primary(attr);
                 first_sec_mat = leaf_attr_material_secondary(attr);
                 first_blend = leaf_attr_blend_weight(attr);
@@ -1552,7 +1616,7 @@ fn main(
             first_obj_id = inst.object_id;
             closest_obj_idx = i;
             if r.first_slot != 0u {
-                let attr = leaf_attr_pool[r.first_slot];
+                let attr = fetch_leaf_attr_for(inst, r.first_slot);
                 first_mat_id = leaf_attr_material_primary(attr);
                 first_sec_mat = leaf_attr_material_secondary(attr);
                 first_blend = leaf_attr_blend_weight(attr);

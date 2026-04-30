@@ -57,7 +57,9 @@ struct RkpInstance {
     bone_field_origin_x: f32,
     bone_field_origin_y: f32,
     bone_field_origin_z: f32,
-    _pad0: u32, _pad1: u32,
+    // Per-instance paint overlay slice. See octree_march.wgsl for full notes.
+    overlay_offset: u32,
+    overlay_count: u32,
 }
 
 struct RkpAsset {
@@ -183,6 +185,54 @@ struct OctreeResult {
 @group(0) @binding(9) var<storage, read> bone_field: array<vec2<u32>>;
 @group(0) @binding(10) var<storage, read> bone_field_occ: array<u32>;
 @group(0) @binding(12) var<storage, read> assets: array<RkpAsset>;
+
+// Per-instance paint overlay (Phase 3) — see octree_march.wgsl for the
+// authoritative description. Shadow trace uses the same fetch helpers.
+struct OverlayEntry {
+    leaf_slot: u32,
+    normal_oct: u32,
+    material_packed: u32,
+    color_packed: u32,
+}
+@group(0) @binding(13) var<storage, read> instance_overlay: array<OverlayEntry>;
+
+fn fetch_overlay_index(inst: RkpInstance, leaf_slot: u32) -> u32 {
+    if (inst.overlay_count == 0u) {
+        return 0xFFFFFFFFu;
+    }
+    var lo: u32 = 0u;
+    var hi: u32 = inst.overlay_count;
+    loop {
+        if (lo >= hi) { break; }
+        let mid = (lo + hi) >> 1u;
+        let e = instance_overlay[inst.overlay_offset + mid];
+        if (e.leaf_slot < leaf_slot) {
+            lo = mid + 1u;
+        } else if (e.leaf_slot > leaf_slot) {
+            hi = mid;
+        } else {
+            return inst.overlay_offset + mid;
+        }
+    }
+    return 0xFFFFFFFFu;
+}
+
+fn fetch_leaf_attr_for(inst: RkpInstance, leaf_slot: u32) -> LeafAttr {
+    let idx = fetch_overlay_index(inst, leaf_slot);
+    if (idx != 0xFFFFFFFFu) {
+        let e = instance_overlay[idx];
+        return LeafAttr(e.normal_oct, e.material_packed);
+    }
+    return leaf_attr_pool[leaf_slot];
+}
+
+fn fetch_leaf_color_for(inst: RkpInstance, leaf_slot: u32) -> u32 {
+    let idx = fetch_overlay_index(inst, leaf_slot);
+    if (idx != 0xFFFFFFFFu) {
+        return instance_overlay[idx].color_packed;
+    }
+    return color_pool_data[leaf_slot];
+}
 
 // Inverse of an affine 4x4 matrix. See `mat4_affine_inverse` in
 // octree_march.wgsl for the full derivation. Duplicated here because
@@ -412,7 +462,7 @@ fn trace_shadow_skinned(
             continue;
         }
 
-        let attr = leaf_attr_pool[leaf_slot];
+        let attr = fetch_leaf_attr_for(inst, leaf_slot);
         let mid = leaf_attr_material_primary(attr);
         let m_op = materials[mid].opacity;
         if m_op >= 0.99 { return 0.0; }
@@ -610,7 +660,7 @@ fn trace_shadow_ray(
                             if transmittance < 0.01 { blocked = true; break; }
                         }
                     } else if c != BRICK_CELL_EMPTY {
-                        let attr = leaf_attr_pool[c];
+                        let attr = fetch_leaf_attr_for(inst, c);
                         let mid = leaf_attr_material_primary(attr);
                         let m_op = materials[mid].opacity;
                         if m_op >= 0.99 { blocked = true; break; }
@@ -666,7 +716,7 @@ fn trace_shadow_ray(
             }
 
             atomicAdd(&stats[44], 1u);
-            let attr = leaf_attr_pool[r.slot];
+            let attr = fetch_leaf_attr_for(inst, r.slot);
             let mid = leaf_attr_material_primary(attr);
             atomicAdd(&stats[47], 1u);
             let mat_opacity = materials[mid].opacity;

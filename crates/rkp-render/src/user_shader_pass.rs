@@ -910,7 +910,11 @@ fn transient_asset_and_instance(entry: &CacheEntry) -> (RkpGpuAsset, RkpGpuInsta
         bone_field_origin_x: 0.0,
         bone_field_origin_y: 0.0,
         bone_field_origin_z: 0.0,
-        _pad: [0; 2],
+        // Transient user-shader regions never carry per-instance paint
+        // overlays — they're rebuilt each frame from the procedural
+        // pass, so paint can't accumulate on them.
+        overlay_offset: 0,
+        overlay_count: 0,
     };
     (asset, instance)
 }

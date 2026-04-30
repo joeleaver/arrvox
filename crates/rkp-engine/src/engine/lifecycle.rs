@@ -1048,6 +1048,7 @@ impl EngineState {
             frame_index: self.frame_index,
             gpu_assets: self.gpu_assets.clone(),
             gpu_instances: self.gpu_instances.clone(),
+            gpu_instance_overlays: self.gpu_instance_overlays.clone(),
             gpu_objects_dirty: gpu_objects_dirty_this_frame,
             geometry_epoch,
             brush_overlay_epoch,

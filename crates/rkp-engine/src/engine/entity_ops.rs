@@ -221,6 +221,7 @@ impl EngineState {
             self.uuid_to_entity.remove(&uuid);
         }
         self.entity_tree_order.remove(&entity);
+        self.paint_overlays.remove(&entity);
 
         // Despawn from ECS.
         let _ = self.world.despawn(entity);
@@ -358,7 +359,9 @@ impl EngineState {
         self.next_entity_uuid = 1;
         self.gpu_assets.clear();
         self.gpu_instances.clear();
+        self.gpu_instance_overlays.clear();
         self.gpu_to_entity.clear();
+        self.paint_overlays.clear();
         // `clear()` wipes every pool but preserves the epoch atomic
         // identity — replacing the whole manager here would orphan
         // sim's `geometry_epoch_handle`, breaking the lock-free

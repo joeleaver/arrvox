@@ -546,41 +546,53 @@ pub fn paint_leaf_material(
     material_id: u16,
     weight: f32,
 ) {
+    let cur = *pool.get(leaf_slot);
+    *pool.get_mut(leaf_slot) = compute_painted_attr(cur, material_id, weight);
+}
+
+/// Pure version of [`paint_leaf_material`]: takes the current [`LeafAttr`]
+/// and the brush parameters, returns the new [`LeafAttr`]. Used by the
+/// per-instance overlay path, which reads "current" from the overlay if
+/// present (else from the asset's pool) and writes the result back into
+/// the overlay rather than mutating the shared pool.
+pub fn compute_painted_attr(
+    cur: rkp_core::LeafAttr,
+    material_id: u16,
+    weight: f32,
+) -> rkp_core::LeafAttr {
     let w = weight.clamp(0.0, 1.0);
-    let leaf = pool.get_mut(leaf_slot);
-    let cur_primary = leaf.material_primary;
+    let cur_primary = cur.material_primary;
     if cur_primary == material_id || w <= 0.0 {
         // Either already painted with this material, or weight is zero.
         // Full-weight case still falls here when primary already matches.
         if w >= 0.999 {
             // Clear any leftover secondary blend toward a different material.
-            *leaf = rkp_core::LeafAttr {
-                normal_oct: leaf.normal_oct,
+            return rkp_core::LeafAttr {
+                normal_oct: cur.normal_oct,
                 material_primary: material_id,
                 material_secondary_blend: 0,
             };
         }
-        return;
+        return cur;
     }
 
     if w >= 0.999 {
         // Hard overwrite — primary flips to the new material, blend cleared.
-        *leaf = rkp_core::LeafAttr {
-            normal_oct: leaf.normal_oct,
+        return rkp_core::LeafAttr {
+            normal_oct: cur.normal_oct,
             material_primary: material_id,
             material_secondary_blend: 0,
         };
-        return;
     }
 
     // Partial blend. Quantize weight to the 4-bit blend field.
     let blend_weight = (w * 15.0).round().clamp(0.0, 15.0) as u8;
-    *leaf = rkp_core::LeafAttr::new_blended(
-        leaf.normal(),
+    rkp_core::LeafAttr::new_blended(
+        cur.normal(),
         cur_primary,
         material_id,
         blend_weight,
-    );
+    )
 }
 
 /// Write a new color onto a leaf, lerping from the existing color by
@@ -593,11 +605,17 @@ pub fn paint_leaf_color(
     rgb: [f32; 3],
     weight: f32,
 ) {
+    let cur = pool.color(leaf_slot);
+    pool.set_color(leaf_slot, compute_painted_color(cur, rgb, weight));
+}
+
+/// Pure version of [`paint_leaf_color`]: returns the new packed color
+/// given the current packed color (0 = no override) and brush parameters.
+pub fn compute_painted_color(cur: u32, rgb: [f32; 3], weight: f32) -> u32 {
     let w = weight.clamp(0.0, 1.0);
     if w <= 0.0 {
-        return;
+        return cur;
     }
-    let cur = pool.color(leaf_slot);
     let (cur_rgb, cur_i) = if cur == 0 {
         // No existing override — treat the leaf as "target RGB, zero
         // intensity" so the first dab lerps from transparent to opaque
@@ -613,7 +631,7 @@ pub fn paint_leaf_color(
         cur_rgb[2] + (rgb[2] - cur_rgb[2]) * w,
     ];
     let new_i = cur_i + (1.0 - cur_i) * w;
-    pool.set_color(leaf_slot, pack_color(new_rgb, new_i));
+    pack_color(new_rgb, new_i)
 }
 
 /// Erase a leaf's color by lerping the intensity channel toward zero.
@@ -628,22 +646,24 @@ pub fn erase_leaf_color(
     leaf_slot: u32,
     weight: f32,
 ) {
-    let w = weight.clamp(0.0, 1.0);
-    if w <= 0.0 {
-        return;
-    }
     let cur = pool.color(leaf_slot);
-    if cur == 0 {
-        return; // already material-albedo, nothing to erase.
+    pool.set_color(leaf_slot, compute_erased_color(cur, weight));
+}
+
+/// Pure version of [`erase_leaf_color`]: returns the new packed color.
+pub fn compute_erased_color(cur: u32, weight: f32) -> u32 {
+    let w = weight.clamp(0.0, 1.0);
+    if w <= 0.0 || cur == 0 {
+        return cur;
     }
     let (cur_rgb, cur_i) = unpack_color(cur);
     let new_i = cur_i * (1.0 - w);
     if new_i <= 1.0 / 255.0 {
         // Intensity quantized to zero — clear the whole override so the
         // shader takes the material base color fast-path.
-        pool.set_color(leaf_slot, 0);
+        0
     } else {
-        pool.set_color(leaf_slot, pack_color(cur_rgb, new_i));
+        pack_color(cur_rgb, new_i)
     }
 }
 

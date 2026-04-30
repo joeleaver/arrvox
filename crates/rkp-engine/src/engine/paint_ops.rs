@@ -107,6 +107,11 @@ impl EngineState {
         };
 
         let written = {
+            // Take the per-entity overlay first so its `&mut`
+            // borrow into `self.paint_overlays` doesn't fight the
+            // scene_mgr lock. `entry().or_default()` lazily allocates
+            // the overlay on the first stamp into this entity.
+            let overlay = self.paint_overlays.entry(entity).or_default();
             let mut scene = self.scene_mgr.lock().expect("scene_mgr poisoned");
             scene.apply_paint_sphere(
                 &asset_info,
@@ -116,8 +121,17 @@ impl EngineState {
                 strength,
                 falloff,
                 stamp,
+                overlay,
             )
         };
+        if written > 0 {
+            // Per-instance `overlay_offset` / `overlay_count` shift
+            // every time the overlay vec grows (or, in theory,
+            // shrinks via erase). Force a `gpu_instances` rebuild on
+            // the next tick so the GPU side picks up the new slice
+            // into `instance_overlay_buffer`.
+            self.gpu_objects_dirty = true;
+        }
         written
     }
 

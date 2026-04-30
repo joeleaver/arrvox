@@ -45,6 +45,7 @@ use std::sync::Arc;
 
 use glam::{Affine3A, Mat4, Vec3};
 
+use rkp_core::OverlayEntry;
 use rkp_render::{
     rkp_atmosphere::AtmosphereFrameParams,
     rkp_god_rays::GodRayParams,
@@ -73,6 +74,10 @@ pub struct RenderFrame {
     /// one `queue.write_buffer`, cheap; sim sets `gpu_objects_dirty`
     /// purely as a hint for stat tracking, not as a gate.
     pub gpu_instances: Vec<RkpGpuInstance>,
+    /// Flat per-instance paint overlay entries. Each `RkpGpuInstance`
+    /// uses its `overlay_offset` + `overlay_count` to slice into this
+    /// vec. Empty when no entity has been painted.
+    pub gpu_instance_overlays: Vec<OverlayEntry>,
     pub gpu_objects_dirty: bool,
 
     /// Monotonic counter from `scene_mgr.geometry_epoch()`. Render

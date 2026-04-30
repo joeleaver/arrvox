@@ -322,16 +322,14 @@ pub struct RkpSceneManager {
 
     // ── Paint data writes (Phase 3b perf) ───────────────────────────
     /// Separate epoch for paint mutations. Pre-perf: paint bumped
-    /// `geometry_epoch`, which made the render thread re-upload every
-    /// scene buffer (octree + leaf_attr + color + bricks + face
-    /// links) — ~45 MB per stroke stamp on a 1M-leaf scene, at 60 Hz
-    /// that's ~2.7 GB/s for a few bytes of actual change. Paint now
-    /// bumps this epoch instead, and the render thread only uploads
-    /// the dirty slot range of `leaf_attr_pool` + `color_pool`.
+    /// Bumped by `apply_paint_sphere` whenever a stamp writes into a
+    /// per-instance overlay. Sim reads the value via the shared atomic
+    /// handle to drive UI (cursor refresh, save indicator). The actual
+    /// overlay data is shipped through `RenderFrame.gpu_instance_overlays`
+    /// and uploaded by the render thread inside `RkpScene::upload_frame`,
+    /// so this epoch is informational — there's no longer a paint-only
+    /// fast path on the render side that gates on it.
     paint_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Inclusive `[min, max]` slot range modified by paint since the
-    /// last upload. Accumulates across stamps; reset on upload.
-    paint_dirty_range: Option<(u32, u32)>,
 
     // ── Paint cursor overlay (Phase 3b) ─────────────────────────────
     /// Per-leaf geodesic distance from the paint cursor's world hit,
@@ -365,7 +363,6 @@ impl RkpSceneManager {
             faces_dirty: false,
             geometry_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             paint_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            paint_dirty_range: None,
             brush_overlay_distances: vec![f32::INFINITY; capacity as usize],
             brush_overlay_flooded_slots: Vec::new(),
             brush_overlay_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -389,7 +386,6 @@ impl RkpSceneManager {
         self.asset_cache = AssetCache::default();
         self.pending_faces.clear();
         self.faces_dirty = false;
-        self.paint_dirty_range = None;
         self.brush_overlay_distances = vec![f32::INFINITY; capacity as usize];
         self.brush_overlay_flooded_slots.clear();
         self.bump_brush_overlay_epoch();
@@ -997,21 +993,6 @@ impl RkpSceneManager {
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
-    fn mark_paint_range_dirty(&mut self, slot: u32) {
-        self.paint_dirty_range = Some(match self.paint_dirty_range {
-            Some((a, b)) => (a.min(slot), b.max(slot)),
-            None => (slot, slot),
-        });
-    }
-
-    /// Take the current accumulated dirty range (if any) — render-side
-    /// callers use this to decide what byte ranges of `leaf_attr_pool`
-    /// and `color_pool` to slice-upload. Clears the range; the next
-    /// paint stamp re-accumulates from empty.
-    pub fn take_paint_dirty_range(&mut self) -> Option<(u32, u32)> {
-        self.paint_dirty_range.take()
-    }
-
     /// Return a byte slice of `leaf_attr_pool` covering slots
     /// `[slot_start, slot_start + slot_count)`. Used by the render
     /// thread to `queue.write_buffer` only the dirty range instead of
@@ -1185,6 +1166,19 @@ impl RkpSceneManager {
     ///   [`PaintStamp`] variant.
     /// * Ensuring this is called on the sim / engine thread that owns
     ///   the scene_mgr Mutex — paint is a geometry mutation.
+    /// Apply a brush stamp into a per-instance overlay.
+    ///
+    /// The asset's `leaf_attr_pool` is read-only here — paint mutations
+    /// land in `overlay`, which is per-entity. This is the bug-fix for
+    /// "paint one of N shared-asset instances paints all": before
+    /// per-instance overlays, a brush write modified the shared pool
+    /// and visibly affected every sibling instance pointing at the
+    /// same `octree_root`.
+    ///
+    /// "Current" attr/color for a leaf is sourced from the overlay if
+    /// already present (so multi-stroke compounding works), else from
+    /// the asset's pool. The result is upserted into the overlay; the
+    /// pool is never written.
     pub fn apply_paint_sphere(
         &mut self,
         asset: &AssetInfo,
@@ -1194,6 +1188,7 @@ impl RkpSceneManager {
         strength: f32,
         falloff: f32,
         stamp: crate::paint::PaintStamp,
+        overlay: &mut rkp_core::LeafAttrOverlay,
     ) -> usize {
         use rkp_core::scene_node::SpatialHandle;
         if radius <= 0.0 || strength <= 0.0 {
@@ -1244,8 +1239,6 @@ impl RkpSceneManager {
         let slot_hi = slot_lo + asset.leaf_attr_slot_count;
 
         let mut written: usize = 0;
-        let mut dirty_min = u32::MAX;
-        let mut dirty_max = 0u32;
         for hit in &hits {
             if hit.leaf_slot < slot_lo || hit.leaf_slot >= slot_hi {
                 continue;
@@ -1257,37 +1250,62 @@ impl RkpSceneManager {
                 continue;
             }
             let paint_slot = hit.leaf_slot;
+
+            // Read the current (attr, color) — overlay if present, else
+            // the asset's pool. Multi-stroke compounding (gradual blend,
+            // erase fade-out) needs to read the previously-painted
+            // value, not always the base.
+            let (cur_attr, cur_color) = match overlay.get(paint_slot) {
+                Some(e) => (e.attr(), e.color_packed),
+                None => (
+                    *self.leaf_attr_pool.get(paint_slot),
+                    self.leaf_attr_pool.color(paint_slot),
+                ),
+            };
+
             match stamp {
                 crate::paint::PaintStamp::Material { material_id } => {
-                    crate::paint::paint_leaf_material(
-                        &mut self.leaf_attr_pool, paint_slot, material_id, weight,
+                    let new_attr = crate::paint::compute_painted_attr(
+                        cur_attr, material_id, weight,
                     );
+                    if new_attr == cur_attr && overlay.get(paint_slot).is_none() {
+                        // No-op write that wasn't already in the overlay
+                        // — skip the upsert so unpainted material-only
+                        // brushes don't bloat the overlay with identity
+                        // entries.
+                        continue;
+                    }
+                    overlay.upsert(paint_slot, new_attr, cur_color);
                 }
                 crate::paint::PaintStamp::Color { rgb } => {
-                    crate::paint::paint_leaf_color(
-                        &mut self.leaf_attr_pool, paint_slot, rgb, weight,
+                    let new_color = crate::paint::compute_painted_color(
+                        cur_color, rgb, weight,
                     );
+                    if new_color == cur_color && overlay.get(paint_slot).is_none() {
+                        continue;
+                    }
+                    overlay.upsert(paint_slot, cur_attr, new_color);
                 }
                 crate::paint::PaintStamp::Erase => {
-                    crate::paint::erase_leaf_color(
-                        &mut self.leaf_attr_pool, paint_slot, weight,
+                    let new_color = crate::paint::compute_erased_color(
+                        cur_color, weight,
                     );
+                    if new_color == cur_color && overlay.get(paint_slot).is_none() {
+                        continue;
+                    }
+                    overlay.upsert(paint_slot, cur_attr, new_color);
                 }
             }
-            dirty_min = dirty_min.min(paint_slot);
-            dirty_max = dirty_max.max(paint_slot);
             written += 1;
         }
 
         if written > 0 {
-            // Paint mutations are small byte-level edits — don't
-            // bump `geometry_epoch` (that would trigger a full
-            // re-upload of octree + bricks + face_links too).
-            // Record the dirty slot range and bump the paint-only
-            // epoch instead; the render thread slice-uploads just
-            // the changed leaf_attr + color bytes.
-            self.mark_paint_range_dirty(dirty_min);
-            self.mark_paint_range_dirty(dirty_max);
+            // Paint mutations are now per-instance and live outside
+            // the leaf_attr/color pools — no slot-range dirty
+            // tracking on those buffers anymore. The overlay buffer
+            // is rebuilt+uploaded each frame from sim's `paint_overlays`
+            // map; engine bumps `paint_epoch` after the call so the
+            // next render frame picks up the new content.
             self.bump_paint_epoch();
         }
         written

@@ -31,6 +31,7 @@ impl EngineState {
 
         self.gpu_assets.clear();
         self.gpu_instances.clear();
+        self.gpu_instance_overlays.clear();
         self.gpu_to_entity.clear();
         self.entity_to_gpu.clear();
         // Per-frame asset table — `octree_root` → index into
@@ -221,6 +222,20 @@ impl EngineState {
                     .get::<&crate::viewport::RenderLayer>(entity)
                     .map(|l| l.mask)
                     .unwrap_or(crate::viewport::layer::DEFAULT);
+                // Per-instance paint overlay slice. Empty (overlay_count=0)
+                // when this entity has never been painted; the WGSL fetch
+                // helper falls through to `leaf_attr_pool[slot]` in that
+                // case. We append to the global overlay vec in entity-walk
+                // order so each instance points at its own contiguous slice.
+                if let Some(overlay) = self.paint_overlays.get(&entity) {
+                    if !overlay.is_empty() {
+                        let off = self.gpu_instance_overlays.len() as u32;
+                        let count = overlay.len() as u32;
+                        self.gpu_instance_overlays.extend_from_slice(overlay.entries());
+                        inst.overlay_offset = off;
+                        inst.overlay_count = count;
+                    }
+                }
                 self.entity_to_gpu.insert(entity, self.gpu_instances.len());
                 self.gpu_to_entity.push(entity);
                 self.gpu_instances.push(inst);

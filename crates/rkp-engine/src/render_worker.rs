@@ -336,12 +336,6 @@ struct RenderState {
     /// data needs re-uploading.
     last_uploaded_brush_overlay_epoch: u64,
 
-    /// Paint-data epoch of the last successful slice-upload to
-    /// `leaf_attr_pool_buffer` + `color_pool_buffer`. Bumped by
-    /// paint strokes; compared each frame to decide whether to
-    /// slice-write the dirty range.
-    last_uploaded_paint_epoch: u64,
-
     /// `view_proj` of the most recent rendered frame, per viewport.
     /// Overrides the `prev_vp` baked into incoming snapshots before
     /// camera + volumetric uploads — without this, TAA reprojection
@@ -522,7 +516,6 @@ impl RenderState {
             // snapshot with epoch > 0 triggers an upload.
             last_uploaded_geometry_epoch: 0,
             last_uploaded_brush_overlay_epoch: 0,
-            last_uploaded_paint_epoch: 0,
             // Empty until the first render — the first frame's
             // override falls back to the snapshot's own view_proj
             // (i.e. prev_vp == view_proj, no motion).
@@ -1056,39 +1049,12 @@ fn render_one_frame(
         drop(sm);
     }
 
-    // 1.5. Paint-data upload — slice-write the dirty slot range to
-    //      leaf_attr_pool + color_pool. Bypasses the full
-    //      upload_geometry path (which would re-upload octree +
-    //      bricks + face links too — ~45 MB on a 1M-leaf scene for a
-    //      stroke that touches ~64 KB of actual data).
-    if frame.paint_epoch > state.last_uploaded_paint_epoch {
-        let mut sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
-        if let Some((min_slot, max_slot)) = sm.take_paint_dirty_range() {
-            let slot_count = max_slot - min_slot + 1;
-            let leaf_attr_bytes_per: u64 =
-                std::mem::size_of::<rkp_core::LeafAttr>() as u64;
-            let leaf_attr_offset = min_slot as u64 * leaf_attr_bytes_per;
-            let color_offset = min_slot as u64 * 4;
-            let la_slice = sm.leaf_attr_slice_bytes(min_slot, slot_count);
-            if !la_slice.is_empty() {
-                state.queue.write_buffer(
-                    &state.renderer.scene.leaf_attr_pool_buffer,
-                    leaf_attr_offset,
-                    la_slice,
-                );
-            }
-            let color_slice = sm.color_slice_bytes(min_slot, slot_count);
-            if !color_slice.is_empty() {
-                state.queue.write_buffer(
-                    &state.renderer.scene.color_pool_buffer,
-                    color_offset,
-                    color_slice,
-                );
-            }
-        }
-        state.last_uploaded_paint_epoch = sm.paint_epoch();
-        drop(sm);
-    }
+    // 1.5. Phase 3 — paint mutations land in per-instance overlays
+    //      (`paint_overlays` on EngineState), shipped each tick as
+    //      `frame.gpu_instance_overlays`. The upload happens
+    //      unconditionally inside `upload_frame` below; no slot-range
+    //      slice-upload of `leaf_attr_pool`/`color_pool` is needed.
+    //      `frame.paint_epoch` is informational only.
 
     // 1.6. Brush-overlay upload — paint cursor geodesic distances.
     //      MAIN-only (BUILD viewport doesn't show the paint cursor).
@@ -1153,6 +1119,7 @@ fn render_one_frame(
     //     so at high render rates physics-driven motion is smooth
     //     instead of stuttering at the sim rate. Assets are pose-static
     //     within a frame.
+    let overlay_bytes: &[u8] = bytemuck::cast_slice(&frame.gpu_instance_overlays);
     state.renderer.upload_frame(
         &state.queue,
         &FrameUpload {
@@ -1160,6 +1127,7 @@ fn render_one_frame(
             instances: instances_for_upload,
             bone_matrices: &frame.bone_matrix_lbs,
             bone_dual_quats: &frame.bone_matrix_dqs,
+            instance_overlays: overlay_bytes,
         },
     );
 

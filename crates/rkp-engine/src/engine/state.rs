@@ -258,6 +258,20 @@ pub(crate) struct EngineState {
     pub(crate) painted_materials_paint_epoch: u64,
     pub(crate) painted_materials_geometry_epoch: u64,
 
+    /// Per-entity sparse paint overlays. Each entry holds the leaves
+    /// painted on that *specific* instance — decoupled from the
+    /// asset's shared `LeafAttrPool`. Shipping these decouples paint
+    /// from asset sharing: load bunny.rkp twice, paint one, only that
+    /// one sees the new color.
+    ///
+    /// Lifetime: created on first stamp into an entity, dropped when
+    /// the entity is despawned (`delete_entity` / `clear_scene`).
+    /// Concatenated each frame into the GPU-side `instance_overlay`
+    /// buffer — a per-instance `(offset, count)` pair on
+    /// `RkpGpuInstance` slices into it.
+    pub(crate) paint_overlays:
+        std::collections::HashMap<hecs::Entity, rkp_core::LeafAttrOverlay>,
+
     // Input + Camera
     pub(crate) input_system: rkp_runtime::input::InputSystem,
     pub(crate) camera_control: CameraControlState,
@@ -302,6 +316,11 @@ pub(crate) struct EngineState {
     /// Per-instance records — one per renderable entity. Indexes into
     /// `gpu_assets` via `RkpGpuInstance::asset_id`.
     pub(crate) gpu_instances: Vec<RkpGpuInstance>,
+    /// Per-frame flattened overlay entries — `RkpGpuInstance.overlay_offset`
+    /// + `overlay_count` slice into this. Built alongside `gpu_instances`
+    /// in `update_scene_gpu` from the per-entity `paint_overlays` map;
+    /// shipped each tick to the render thread for upload.
+    pub(crate) gpu_instance_overlays: Vec<rkp_core::OverlayEntry>,
     /// Maps gpu_instance index → hecs Entity (for pick resolution).
     pub(crate) gpu_to_entity: Vec<hecs::Entity>,
     /// Maps hecs Entity → gpu_instance index.
@@ -725,6 +744,7 @@ impl EngineState {
             painted_materials: std::collections::HashMap::new(),
             painted_materials_paint_epoch: 0,
             painted_materials_geometry_epoch: 0,
+            paint_overlays: std::collections::HashMap::new(),
             render_worker,
             scene_mgr,
             geometry_epoch_handle,
@@ -762,6 +782,7 @@ impl EngineState {
             selected_procedural_node: None,
             gpu_assets: Vec::new(),
             gpu_instances: Vec::new(),
+            gpu_instance_overlays: Vec::new(),
             gpu_to_entity: Vec::new(),
             entity_to_gpu: std::collections::HashMap::new(),
             project_loaded: false,

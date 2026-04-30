@@ -93,6 +93,9 @@ pub struct RkpGpuAsset {
 /// - per-entity overrides (material, picking id, layer mask)
 /// - per-frame skinning runtime state: bone palette offset + bone-field
 ///   allocation + per-pose deformed AABB grid
+/// - per-instance paint overlay (sparse `(slot, attr, color)` entries
+///   in a global overlay buffer; `overlay_count == 0` ⇒ asset's pool
+///   values are used directly)
 ///
 /// # Layout (128 bytes)
 ///
@@ -113,7 +116,15 @@ pub struct RkpGpuAsset {
 /// | 108    | 4    | bone_field_origin_x (f32) |
 /// | 112    | 4    | bone_field_origin_y (f32) |
 /// | 116    | 4    | bone_field_origin_z (f32) |
-/// | 120    | 8    | _pad (mat4x4 alignment tail) |
+/// | 120    | 4    | overlay_offset (u32) |
+/// | 124    | 4    | overlay_count (u32) |
+///
+/// `overlay_offset` + `overlay_count` describe a slice into the
+/// scene-global `instance_overlay` buffer (Phase 3). The WGSL fetch
+/// helper falls through to `leaf_attr_pool[slot]` when
+/// `overlay_count == 0`. Adding the two `u32`s consumed the previous
+/// 8-byte `_pad`; total struct size stays at 128 bytes (a multiple of
+/// the mat4x4 alignment, so the WGSL array stride is unchanged).
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
 pub struct RkpGpuInstance {
@@ -132,10 +143,8 @@ pub struct RkpGpuInstance {
     pub bone_field_origin_x: f32,
     pub bone_field_origin_y: f32,
     pub bone_field_origin_z: f32,
-    /// WGSL stride must be multiple of struct alignment (16 from mat4x4).
-    /// Without this pad, Rust struct = 120 B, WGSL stride = 128 B, the
-    /// array indexing reads from the wrong offset.
-    pub _pad: [u32; 2],
+    pub overlay_offset: u32,
+    pub overlay_count: u32,
 }
 
 #[cfg(test)]
@@ -162,9 +171,20 @@ mod tests {
 
     #[test]
     fn instance_size_is_128_bytes() {
-        // Includes 8-byte tail pad to make stride a multiple of mat4x4
-        // alignment (16).
+        // mat4x4 alignment requires stride to be a multiple of 16; 128
+        // satisfies it. Phase 3 consumed the previous 8-byte tail pad
+        // for `overlay_offset` + `overlay_count`.
         assert_eq!(mem::size_of::<RkpGpuInstance>(), 128);
+    }
+
+    #[test]
+    fn instance_overlay_offset_at_offset_120() {
+        let i = RkpGpuInstance::zeroed();
+        let base = &i as *const _ as usize;
+        let field = &i.overlay_offset as *const _ as usize;
+        assert_eq!(field - base, 120);
+        let field2 = &i.overlay_count as *const _ as usize;
+        assert_eq!(field2 - base, 124);
     }
 
     #[test]

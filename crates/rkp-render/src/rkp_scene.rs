@@ -115,6 +115,12 @@ pub struct FrameUpload<'a> {
     /// `bone_matrices`. Scatter's DQS branch reads directly from here,
     /// skipping the ~60-ALU per-influence matrix→quat extraction.
     pub bone_dual_quats: &'a [u8],
+    /// Per-instance paint overlay entries — one `OverlayEntry` (16 B)
+    /// per painted leaf per painted instance. Each
+    /// `RkpGpuInstance.overlay_offset` + `overlay_count` slices into
+    /// this buffer. Empty `&[]` when no entity carries paint
+    /// (placeholder buffer keeps the bind valid).
+    pub instance_overlays: &'a [u8],
 }
 
 /// GPU scene buffer manager for RKIPatch.
@@ -194,6 +200,11 @@ pub struct RkpScene {
     pub proto_octree_buffer: wgpu::Buffer,
     pub proto_brick_buffer: wgpu::Buffer,
     pub proto_leaf_attr_buffer: wgpu::Buffer,
+    /// Per-instance sparse paint overlay buffer (Phase 3). One
+    /// `OverlayEntry` (16 B) per painted leaf, per painted instance,
+    /// concatenated. Each `RkpGpuInstance.overlay_offset` +
+    /// `overlay_count` slices into this. Bound at binding(13).
+    pub instance_overlay_buffer: wgpu::Buffer,
     pub bind_group_layout: wgpu::BindGroupLayout,
     /// Incremented whenever a shared buffer reallocates. Each VR caches
     /// the epoch it built its bind group at; rebuilds when the scene's
@@ -257,6 +268,14 @@ impl RkpScene {
             device, "rkp_proto_leaf_attr", PROTO_LEAF_ATTR_CAPACITY_BYTES,
         );
 
+        // Per-instance overlay buffer — starts at the 16-byte
+        // single-entry placeholder so the bind validates even when no
+        // entity is painted yet. `upload_frame` grows it as paint
+        // accumulates.
+        let instance_overlay_buffer = Self::create_storage(
+            device, "rkp_instance_overlay", 16,
+        );
+
         let bind_group_layout = Self::create_layout(device);
 
         Self {
@@ -267,6 +286,7 @@ impl RkpScene {
             bone_field_occ_buffer, bone_field_occ_capacity,
             bone_dual_quats_buffer,
             proto_octree_buffer, proto_brick_buffer, proto_leaf_attr_buffer,
+            instance_overlay_buffer,
             bind_group_layout,
             buffers_epoch: 0,
         }
@@ -292,7 +312,7 @@ impl RkpScene {
             camera_buffer, &self.color_pool_buffer, &self.bone_matrices_buffer,
             &self.bone_weights_buffer, &self.brick_face_links_buffer, &self.leaf_attr_pool_buffer,
             &self.bone_field_buffer, &self.bone_field_occ_buffer, &self.bone_dual_quats_buffer,
-            &self.assets_buffer,
+            &self.assets_buffer, &self.instance_overlay_buffer,
         )
     }
 
@@ -520,6 +540,12 @@ impl RkpScene {
                 "rkp_bone_dual_quats", data.bone_dual_quats,
             );
         }
+        if !data.instance_overlays.is_empty() {
+            needs_rebuild |= Self::ensure_and_write(
+                device, queue, &mut self.instance_overlay_buffer,
+                "rkp_instance_overlay", data.instance_overlays,
+            );
+        }
 
         if needs_rebuild {
             self.buffers_epoch += 1;
@@ -592,6 +618,7 @@ impl RkpScene {
                 storage_ro(10), // bone_field_occ (Phase 3c brick-level empty-space skip)
                 storage_ro(11), // bone_dual_quats (DQS precomputed palette)
                 storage_ro(12), // assets (per-asset deduped records)
+                storage_ro(13), // instance_overlay (Phase 3 per-instance paint)
             ],
         })
     }
@@ -613,6 +640,7 @@ impl RkpScene {
         bone_field_occ: &wgpu::Buffer,
         bone_dual_quats: &wgpu::Buffer,
         assets: &wgpu::Buffer,
+        instance_overlay: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rkp_scene_bind_group"),
@@ -631,6 +659,7 @@ impl RkpScene {
                 wgpu::BindGroupEntry { binding: 10, resource: bone_field_occ.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: bone_dual_quats.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: assets.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: instance_overlay.as_entire_binding() },
             ],
         })
     }
