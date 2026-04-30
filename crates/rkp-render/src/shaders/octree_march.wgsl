@@ -1545,17 +1545,69 @@ fn march_object(
     // `world_t_aabb_entry + result.t × local_to_world`. World position
     // recovers via the world ray: `world_origin + world_dir × world_t`.
     //
-    // Normal: V1 passes the canonical-space leaf normal through as
-    // world normal — same approximation Option B uses. Geometrically
-    // correct world normal would require the inverse-transpose of the
-    // user's local Jacobian, which costs three extra `inst_to_local`
-    // calls per hit; deferred to a follow-up. For grass blades the
-    // approximation is visually adequate (tested in Option B).
+    // Normal: transform the canonical-space leaf normal back to world
+    // via the inverse-transpose of the user's local Jacobian. For
+    // L: world → local with Jacobian J = ∂L/∂w, world normals satisfy
+    // `n_world ∝ Jᵀ · n_local` (standard normal-transform rule, where
+    // J equals the inverse of the local→world Jacobian).
+    //
+    // Numerical Jacobian: 3 extra `dispatch_user_inst_to_local` calls
+    // at `hit_pos + ε·{x, y, z}`. Cheap (~4 dot products + 3 hook
+    // calls per hit-pixel; hooks are tiny analytic maps for the V1
+    // affine contract). One-sided difference is exact for affine L
+    // modulo FP precision; central difference would double the cost
+    // for no benefit on V1.
+    //
+    // ε sized so the canonical-space step is comfortably above
+    // sub-cell precision (~1/128 canonical for max_depth=5 grass)
+    // without triggering FP underflow at large world scales. 1e-3 m
+    // works for the typical scale range; documented limit.
     if is_user_shader && result.valid {
         let world_t = world_t_aabb_entry + result.t * local_to_world;
+        let world_pos_hit = world_origin + world_dir * world_t;
         result.is_user_shader_hit = true;
-        result.world_pos = world_origin + world_dir * world_t;
-        result.world_normal = result.normal;
+        result.world_pos = world_pos_hit;
+
+        let inst_pos = inst.world[3].xyz;
+        let inst_scale = length(inst.world[0].xyz);
+        let l0 = dispatch_user_inst_to_local(
+            asset.shader_id, inst.instance_state_offset,
+            world_pos_hit, inst_pos, inst_scale,
+        );
+        let eps: f32 = 1.0e-3;
+        let lx = dispatch_user_inst_to_local(
+            asset.shader_id, inst.instance_state_offset,
+            world_pos_hit + vec3<f32>(eps, 0.0, 0.0), inst_pos, inst_scale,
+        );
+        let ly = dispatch_user_inst_to_local(
+            asset.shader_id, inst.instance_state_offset,
+            world_pos_hit + vec3<f32>(0.0, eps, 0.0), inst_pos, inst_scale,
+        );
+        let lz = dispatch_user_inst_to_local(
+            asset.shader_id, inst.instance_state_offset,
+            world_pos_hit + vec3<f32>(0.0, 0.0, eps), inst_pos, inst_scale,
+        );
+        // Jacobian columns (world→local).
+        let jx = (lx - l0) / eps;
+        let jy = (ly - l0) / eps;
+        let jz = (lz - l0) / eps;
+        // Jᵀ · n_local — i-th component is the i-th column of J
+        // dotted with the local normal.
+        let n_local = result.normal;
+        let n_world_unnorm = vec3<f32>(
+            dot(jx, n_local),
+            dot(jy, n_local),
+            dot(jz, n_local),
+        );
+        let n_world_len = length(n_world_unnorm);
+        // Singular-Jacobian fallback — degenerate transforms produce
+        // near-zero `n_world_unnorm`. Pass canonical normal through
+        // rather than emit NaN/inf into the G-buffer.
+        if n_world_len < 1.0e-6 {
+            result.world_normal = n_local;
+        } else {
+            result.world_normal = n_world_unnorm / n_world_len;
+        }
     }
     return result;
 }
