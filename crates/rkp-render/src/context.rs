@@ -54,19 +54,22 @@ impl RenderContext {
                     max_storage_buffer_binding_size:
                         adapter.limits().max_storage_buffer_binding_size.min(1 << 31),
                     max_buffer_size: adapter.limits().max_buffer_size.min(1 << 31),
-                    // 20 rather than the wgpu default 8 — group 0's
-                    // scene bindings are 11 storage buffers (brick_pool,
+                    // 24 rather than the wgpu default 8 — group 0's
+                    // scene bindings are 14 storage buffers (brick_pool,
                     // octree_nodes, objects, color_pool, bone_matrices,
                     // bone_weights, brick_face_links, leaf_attr_pool,
-                    // bone_field, bone_field_occ, bone_dual_quats).
-                    // March group 2 adds 5 (materials, stats, lights,
-                    // tile_offsets, tile_object_ids) for 16 total.
-                    // wgpu counts unused-by-shader layout entries too,
-                    // so splitting per-shader layouts is the only way
-                    // below the limit — not worth it. Desktop GPUs
+                    // bone_field, bone_field_occ, bone_dual_quats,
+                    // assets, instance_overlay, instance_pool).
+                    // March group 2 adds 7 (materials, stats, lights,
+                    // tile_offsets, tile_object_ids, us_tile_offsets,
+                    // us_tile_entries) for 21 total. naga
+                    // dead-code-eliminates unused-by-shader bindings, so
+                    // the host march previously used fewer; Phase 6
+                    // Session 4 actually reads us_tile_offsets/entries,
+                    // pushing the live count to 21. Desktop GPUs
                     // support 24+; GLES 3.x / some mobile top out at
                     // 16 but aren't supported targets.
-                    max_storage_buffers_per_shader_stage: 20,
+                    max_storage_buffers_per_shader_stage: 24,
                     // wgpu default is 4; the march write group needs
                     // 5 (position + normal + material + pick + glass).
                     // Desktop GPUs support 8+ universally.
@@ -143,19 +146,22 @@ impl RenderContext {
                     max_storage_buffer_binding_size:
                         adapter.limits().max_storage_buffer_binding_size.min(1 << 31),
                     max_buffer_size: adapter.limits().max_buffer_size.min(1 << 31),
-                    // 20 rather than the wgpu default 8 — group 0's
-                    // scene bindings are 11 storage buffers (brick_pool,
+                    // 24 rather than the wgpu default 8 — group 0's
+                    // scene bindings are 14 storage buffers (brick_pool,
                     // octree_nodes, objects, color_pool, bone_matrices,
                     // bone_weights, brick_face_links, leaf_attr_pool,
-                    // bone_field, bone_field_occ, bone_dual_quats).
-                    // March group 2 adds 5 (materials, stats, lights,
-                    // tile_offsets, tile_object_ids) for 16 total.
-                    // wgpu counts unused-by-shader layout entries too,
-                    // so splitting per-shader layouts is the only way
-                    // below the limit — not worth it. Desktop GPUs
+                    // bone_field, bone_field_occ, bone_dual_quats,
+                    // assets, instance_overlay, instance_pool).
+                    // March group 2 adds 7 (materials, stats, lights,
+                    // tile_offsets, tile_object_ids, us_tile_offsets,
+                    // us_tile_entries) for 21 total. naga
+                    // dead-code-eliminates unused-by-shader bindings, so
+                    // the host march previously used fewer; Phase 6
+                    // Session 4 actually reads us_tile_offsets/entries,
+                    // pushing the live count to 21. Desktop GPUs
                     // support 24+; GLES 3.x / some mobile top out at
                     // 16 but aren't supported targets.
-                    max_storage_buffers_per_shader_stage: 20,
+                    max_storage_buffers_per_shader_stage: 24,
                     // wgpu default is 4; the march write group needs
                     // 5 (position + normal + material + pick + glass).
                     // Desktop GPUs support 8+ universally.
