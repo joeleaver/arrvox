@@ -91,9 +91,12 @@ struct MarchParams {
     num_lights: u32,
     // Must match octree_march.wgsl: same uniform buffer binding.
     lod_enabled: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    surfacenet_enabled: u32,
+    tile_count_x: u32,
+    // Phase 7 Session 4b — TLAS node count. Zero gates the BVH
+    // traversal off; the helper function falls back to "no shadow
+    // caster found" (transmittance unchanged).
+    tlas_node_count: u32,
 }
 
 struct GpuLight {
@@ -315,14 +318,38 @@ fn dispatch_user_inst_aabb(
 @group(1) @binding(2) var shadow_lo_res: texture_storage_2d<rgba8unorm, write>;
 
 // Group 2: march params + materials + stats + lights (shared with march).
-// Shadow trace doesn't need screen_aabbs or the tile-list buffers (shadow
-// rays go in arbitrary directions, not screen-aligned), but those
-// bindings still exist in the shared layout at 4/5 — declarations would
-// trip the 15 storage-buffer limit, so we just skip declaring them here.
+// Shadow trace doesn't need the tile-list buffers (shadow rays don't
+// share a screen tile), so bindings 4-7 stay undeclared here — naga
+// drops them from the shadow pipeline. Phase 7 Session 4b adds the
+// TLAS bindings 8/9 which shadow trace DOES read.
 @group(2) @binding(0) var<uniform> march_params: MarchParams;
 @group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
 @group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 64>;
 @group(2) @binding(3) var<storage, read> lights: array<GpuLight>;
+
+// Phase 7 — TLAS over instance AABBs. Built each frame on CPU by
+// `TlasPass::build_tlas` and uploaded; shadow trace traverses
+// stack-based to find candidate occluders.
+struct TlasNode {
+    aabb_min: vec3<f32>,
+    left_or_leaf: u32,    // high bit = leaf marker (0x80000000)
+    aabb_max: vec3<f32>,
+    right_or_count: u32,
+}
+struct TlasInstanceLeaf {
+    asset_id: u32,
+    instance_state_offset: u32,  // u32 offset into `instance_pool` (user-shader path)
+    material_id: u32,
+    instance_index: u32,         // host: index into instances[]; user-shader: TLAS_LEAF_USER_SHADER
+}
+@group(2) @binding(8) var<storage, read> tlas_nodes: array<TlasNode>;
+@group(2) @binding(9) var<storage, read> tlas_leaves: array<TlasInstanceLeaf>;
+
+const TLAS_NODE_LEAF_BIT: u32 = 0x80000000u;
+const TLAS_LEAF_USER_SHADER: u32 = 0xFFFFFFFEu;
+// BVH traversal stack depth. Binary tree with N leaves is ≤ ⌈log2 N⌉
+// deep; 32 covers up to 4 billion leaves.
+const TLAS_STACK_DEPTH: u32 = 32u;
 
 const PHASE_SHADOW: u32 = 2u;
 
@@ -837,9 +864,50 @@ fn shadow_step_one_instance(
     return transmittance;
 }
 
-// Phase 7 Session 4a — thin wrapper iterating the existing
-// `instances[]` array. Session 4b replaces the iteration with a TLAS
-// traversal that calls `shadow_step_one_instance` from leaf hits.
+// Phase 7 Session 4b — synthesize a minimal `RkpInstance` from a
+// user-shader TLAS leaf. The user-shader path in
+// `shadow_step_one_instance` only reads instance_state_offset +
+// material_id + object_id + layer_mask + is_skinned + bone fields;
+// we fill the rest with safe defaults. Mirror of
+// `octree_march.wgsl::synth_inst_from_entry`.
+fn synth_inst_from_tlas_leaf(leaf: TlasInstanceLeaf) -> RkpInstance {
+    var inst: RkpInstance;
+    inst.world = mat4x4<f32>(
+        vec4<f32>(1.0, 0.0, 0.0, 0.0),
+        vec4<f32>(0.0, 1.0, 0.0, 0.0),
+        vec4<f32>(0.0, 0.0, 1.0, 0.0),
+        vec4<f32>(0.0, 0.0, 0.0, 1.0),
+    );
+    inst.asset_id = leaf.asset_id;
+    inst.material_id = leaf.material_id;
+    inst.object_id = TLAS_LEAF_USER_SHADER;
+    inst.layer_mask = 0xFFFFFFFFu;
+    inst.is_skinned = 0u;
+    inst.bone_buffer_offset = 0u;
+    inst.bone_field_offset = 0u;
+    inst.bone_field_occ_offset = 0u;
+    inst.bone_field_dim_x = 0u;
+    inst.bone_field_dim_y = 0u;
+    inst.bone_field_dim_z = 0u;
+    inst.bone_field_origin_x = 0.0;
+    inst.bone_field_origin_y = 0.0;
+    inst.bone_field_origin_z = 0.0;
+    inst.overlay_offset = 0u;
+    inst.overlay_count = 0u;
+    inst.instance_state_offset = leaf.instance_state_offset;
+    inst._pad0 = 0u;
+    inst._pad1 = 0u;
+    inst._pad2 = 0u;
+    return inst;
+}
+
+// Phase 7 Session 4b — stack-based TLAS traversal. Replaces the
+// previous `for oi in 0..num_objects { instances[oi] }` iteration.
+// Empty TLAS (`tlas_node_count == 0`) returns transmittance unchanged
+// (no shadow casters this frame — sun shine-through is correct).
+//
+// `num_objects` is retained in the signature for caller compatibility
+// but unused here; the BVH knows its own size.
 fn trace_shadow_ray(
     world_origin: vec3<f32>,
     world_dir: vec3<f32>,
@@ -848,14 +916,63 @@ fn trace_shadow_ray(
     max_world_dist: f32,
 ) -> f32 {
     var transmittance = 1.0;
-    for (var oi = 0u; oi < num_objects; oi++) {
-        let inst = instances[oi];
-        let asset = assets[inst.asset_id];
-        transmittance = shadow_step_one_instance(
-            inst, asset, world_origin, world_dir, max_steps, max_world_dist, transmittance,
-        );
-        if transmittance < 0.01 { return 0.0; }
+    _ = num_objects;
+    if march_params.tlas_node_count == 0u { return transmittance; }
+
+    let safe_world_dir = vec3<f32>(
+        select(world_dir.x, select(-1e-10, 1e-10, world_dir.x >= 0.0), abs(world_dir.x) < 1e-10),
+        select(world_dir.y, select(-1e-10, 1e-10, world_dir.y >= 0.0), abs(world_dir.y) < 1e-10),
+        select(world_dir.z, select(-1e-10, 1e-10, world_dir.z >= 0.0), abs(world_dir.z) < 1e-10),
+    );
+    let inv_world_dir = 1.0 / safe_world_dir;
+
+    var stack: array<u32, TLAS_STACK_DEPTH>;
+    stack[0] = 0u;
+    var top: u32 = 1u;
+
+    loop {
+        if top == 0u { break; }
+        top = top - 1u;
+        let node = tlas_nodes[stack[top]];
+
+        // World AABB cull. Skip subtrees whose AABB the ray misses
+        // OR that lie entirely past the shadow ray's max distance.
+        let t_range = intersect_aabb(world_origin, inv_world_dir, node.aabb_min, node.aabb_max);
+        if t_range.x > t_range.y { continue; }
+        if t_range.x > max_world_dist { continue; }
+
+        if (node.left_or_leaf & TLAS_NODE_LEAF_BIT) != 0u {
+            // Leaf — dispatch the per-instance descent. Host vs user-
+            // shader distinguishes by `instance_index` sentinel.
+            let leaf_idx = node.left_or_leaf & 0x7FFFFFFFu;
+            let leaf = tlas_leaves[leaf_idx];
+            var inst: RkpInstance;
+            var asset: RkpAsset;
+            if leaf.instance_index != TLAS_LEAF_USER_SHADER {
+                inst = instances[leaf.instance_index];
+                asset = assets[inst.asset_id];
+            } else {
+                inst = synth_inst_from_tlas_leaf(leaf);
+                asset = assets[leaf.asset_id];
+            }
+            transmittance = shadow_step_one_instance(
+                inst, asset, world_origin, world_dir, max_steps, max_world_dist, transmittance,
+            );
+            if transmittance < 0.01 { return 0.0; }
+        } else {
+            // Internal — push children. Stack-overflow guard: a
+            // perfectly-balanced binary tree with 2^32 leaves is 32
+            // deep, which is the stack capacity. Real TLASes are far
+            // shallower; the guard is for pathological inputs.
+            if top + 1u < TLAS_STACK_DEPTH {
+                stack[top] = node.left_or_leaf;
+                top = top + 1u;
+                stack[top] = node.right_or_count;
+                top = top + 1u;
+            }
+        }
     }
+
     return transmittance;
 }
 

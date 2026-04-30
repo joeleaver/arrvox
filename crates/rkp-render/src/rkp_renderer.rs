@@ -215,6 +215,7 @@ impl RkpRenderer {
         tile_offsets: &[u8],
         tile_object_ids: &[u8],
         tile_count_x: u32,
+        tlas_node_count: u32,
         atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
         mode: crate::RenderMode,
         preview_mode: crate::BuildPreviewMode,
@@ -258,7 +259,7 @@ impl RkpRenderer {
                 encoder, queue, &viewport.scene_bind_group,
                 object_count, viewport.width, viewport.height, 0,
                 shadow_steps, num_lights, lod_enabled, surfacenet_enabled,
-                tile_count_x, None,
+                tile_count_x, tlas_node_count, None,
             );
             self.profiler.end_query(encoder, q);
         }

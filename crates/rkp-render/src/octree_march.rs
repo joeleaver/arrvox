@@ -61,7 +61,11 @@ pub struct MarchParams {
     /// Per-tile list grid width in tiles (render_width / 8, rounded up).
     /// Shader uses this to compute `tile_idx` from a pixel coordinate.
     pub tile_count_x: u32,
-    pub _pad: u32,
+    /// Phase 7 Session 4b — TLAS node count. Shadow trace uses this to
+    /// gate on empty TLAS (zero → skip the BVH traversal). March
+    /// itself doesn't read TLAS yet; the field replaces the previous
+    /// `_pad` slot.
+    pub tlas_node_count: u32,
 }
 
 /// The octree ray march compute pass.
@@ -121,6 +125,14 @@ pub struct OctreeMarchPass {
     /// inside `us_tile_entries[]`. One `u32` per tile.
     pub us_tile_scatter_cursor_buffer: wgpu::Buffer,
     pub us_tile_scatter_cursor_capacity: u64,
+    /// Phase 7 Session 4b — TLAS node + leaf buffers, shared with
+    /// `state.tlas_pass`. Shadow trace reads bindings 8 + 9 to
+    /// traverse the BVH. March itself doesn't currently read them
+    /// (naga DCE drops them from the march pipeline) but the layout
+    /// declares them so the shared bind group can hold them for
+    /// shadow trace's use.
+    tlas_nodes_buffer: Option<wgpu::Buffer>,
+    tlas_leaves_buffer: Option<wgpu::Buffer>,
     /// Lights buffer (shared with shade pass).
     lights_buffer: Option<wgpu::Buffer>,
     /// Materials buffer reference for bind group rebuild.
@@ -255,6 +267,30 @@ impl OctreeMarchPass {
                         },
                         count: None,
                     },
+                    // Binding 8: TLAS nodes (Phase 7 Session 4b).
+                    // Read by shadow trace; march doesn't use it
+                    // (naga DCE drops the binding from march SPIR-V).
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Binding 9: TLAS leaves (Phase 7 Session 4b).
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 9,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -362,9 +398,26 @@ impl OctreeMarchPass {
                 mapped_at_creation: false,
             }),
             us_tile_scatter_cursor_capacity: 256,
+            tlas_nodes_buffer: None,
+            tlas_leaves_buffer: None,
             lights_buffer: None,
             materials_buffer: None,
         }
+    }
+
+    /// Phase 7 Session 4b — set the TLAS buffer handles. Engine calls
+    /// this whenever the buffers change (typically on
+    /// `tlas_pass.build_tlas` reallocation). The bind group rebuild
+    /// follows the same pattern as `set_lights` / `set_materials`.
+    pub fn set_tlas_buffers(
+        &mut self,
+        device: &wgpu::Device,
+        nodes_buffer: &wgpu::Buffer,
+        leaves_buffer: &wgpu::Buffer,
+    ) {
+        self.tlas_nodes_buffer = Some(nodes_buffer.clone());
+        self.tlas_leaves_buffer = Some(leaves_buffer.clone());
+        self.try_rebuild_params_bind_group(device);
     }
 
     /// Re-build the compute pipeline against the spliced user-shader
@@ -421,8 +474,12 @@ impl OctreeMarchPass {
     }
 
     fn try_rebuild_params_bind_group(&mut self, device: &wgpu::Device) {
-        let (Some(materials_buffer), Some(lights_buffer)) =
-            (&self.materials_buffer, &self.lights_buffer) else { return };
+        let (Some(materials_buffer), Some(lights_buffer), Some(tlas_nodes), Some(tlas_leaves)) = (
+            &self.materials_buffer,
+            &self.lights_buffer,
+            &self.tlas_nodes_buffer,
+            &self.tlas_leaves_buffer,
+        ) else { return };
         self.params_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("march params+materials bind group"),
             layout: &self.params_bind_group_layout,
@@ -458,6 +515,14 @@ impl OctreeMarchPass {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: self.us_tile_entries_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: tlas_nodes.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: tlas_leaves.as_entire_binding(),
                 },
             ],
         }));
@@ -691,6 +756,7 @@ impl OctreeMarchPass {
     // and MCP.
 
     /// Update params and dispatch the march.
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -705,6 +771,7 @@ impl OctreeMarchPass {
         lod_enabled: bool,
         surfacenet_enabled: bool,
         tile_count_x: u32,
+        tlas_node_count: u32,
         timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) {
         // Update params.
@@ -716,7 +783,7 @@ impl OctreeMarchPass {
             lod_enabled: if lod_enabled { 1 } else { 0 },
             surfacenet_enabled: if surfacenet_enabled { 1 } else { 0 },
             tile_count_x,
-            _pad: 0,
+            tlas_node_count,
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
 

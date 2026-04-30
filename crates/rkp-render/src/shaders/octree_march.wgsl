@@ -139,11 +139,11 @@ struct MarchParams {
     // `tile_object_ids[tile_offsets[tile_idx]..tile_offsets[tile_idx+1]]`
     // where `tile_idx = ty * tile_count_x + tx`.
     tile_count_x: u32,
-    // Pad to 32 bytes (uniform size must be a multiple of 16). Plain
-    // u32s, not a vec3<u32> — vec3 would promote struct alignment to 16
-    // and inflate the total to 48 bytes, breaking the binding-size
-    // check against the 32-byte Rust struct.
-    _pad0: u32,
+    // Phase 7 Session 4b — TLAS node count. March itself doesn't read
+    // this (naga DCE will keep the field in the struct since the
+    // host-side Rust mirror requires it; the field is consumed by
+    // shadow trace, which shares the same uniform). 32 B total.
+    tlas_node_count: u32,
 }
 
 const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;

@@ -1223,6 +1223,20 @@ fn render_one_frame(
         instances_for_upload,
         &user_shader_regions_for_tlas,
     );
+    // Phase 7 Session 4b — refresh each VR's march-pass bind group
+    // with the (possibly newly-allocated) TLAS buffer handles. wgpu's
+    // buffer handles change on capacity-doubling growth; clone-cheap
+    // and the rebuild check skips work when handles match. Required
+    // every frame because the bind group is initially built without
+    // TLAS bindings (Session 1 placeholders), and need to be present
+    // before shadow trace runs.
+    for vr in state.viewport_renderers.values_mut() {
+        vr.march.set_tlas_buffers(
+            &state.device,
+            &state.tlas_pass.nodes_buffer,
+            &state.tlas_pass.leaves_buffer,
+        );
+    }
     let overlay_bytes: &[u8] = bytemuck::cast_slice(&frame.gpu_instance_overlays);
     state.renderer.upload_frame(
         &state.queue,
@@ -1461,6 +1475,7 @@ fn render_one_frame(
             tile_offsets_ref,
             tile_object_ids_ref,
             vp.tile_count_x,
+            state.tlas_pass.last_node_count,
             &vp.atmo_frame,
             vp.mode,
             vp.preview_mode,
