@@ -135,38 +135,65 @@ impl TlasPass {
         }
     }
 
-    /// Phase 7 Session 2 — build the TLAS for the current frame's
-    /// host instances and upload to GPU. Sets `last_node_count` and
-    /// `last_leaf_count` to the produced sizes.
+    /// Phase 7 Session 3 — build the TLAS for the current frame from
+    /// host instances + user-shader instance regions, upload to GPU,
+    /// set `last_node_count` / `last_leaf_count`.
     ///
-    /// `assets` and `instances` are the combined slices the engine
-    /// passes to `upload_frame` (host persistent + Phase C transient).
-    /// User-shader instances aren't in `instances` post Phase 6 — they
-    /// join the TLAS via Session 3 (separate code path).
+    /// * `assets` / `instances` — combined host + transient (the same
+    ///   slices `upload_frame` consumes). User-shader assets in here
+    ///   are skipped at TLAS-leaf time; the user-shader path emits
+    ///   leaves directly from `user_shader_regions` instead.
+    /// * `user_shader_regions` — one entry per region the engine knows
+    ///   about this frame (built from `frame.instance_region_requests`
+    ///   in the engine layer). Each region contributes one TLAS leaf
+    ///   per painted leaf, with a conservative
+    ///   `pos ± region_thickness` AABB.
     ///
-    /// Empty input → counts go to zero, buffers untouched.
-    pub fn build_host_tlas(
+    /// Returns `true` if either GPU buffer reallocated (caller should
+    /// invalidate cached bind groups).
+    ///
+    /// ## V1 limits
+    ///
+    /// * **Slot permutation**: emit's atomicAdd assigns instance state
+    ///   slots non-deterministically, so slot K may hold leaf J's data
+    ///   (J ≠ K). The conservative AABB (radius = region_thickness)
+    ///   contains both leaves' actual blades for dense paint. Sparse
+    ///   paint may produce shadow-cast misses on individual blades —
+    ///   acceptable for V1.
+    /// * **Build cost**: O(N log N) median split. Comfortable up to
+    ///   ~10K total leaves; at 100K it dominates a 16 ms frame budget.
+    ///   Refit / rebuild-skip is a Phase 7b follow-up.
+    /// * **Per-blade AABB precision**: derived from leaf position +
+    ///   region_thickness, NOT from the user shader's `inst_aabb`
+    ///   hook. Tighter per-instance AABBs require GPU build (Session
+    ///   3b deferred).
+    pub fn build_tlas(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         assets: &[crate::rkp_gpu_object::RkpGpuAsset],
         instances: &[crate::rkp_gpu_object::RkpGpuInstance],
+        user_shader_regions: &[UserShaderRegionTlas<'_>],
     ) -> bool {
-        if instances.is_empty() {
+        let total_leaves: usize = instances.len()
+            + user_shader_regions.iter().map(|r| r.leaves.len()).sum::<usize>();
+        if total_leaves == 0 {
             self.last_node_count = 0;
             self.last_leaf_count = 0;
             return false;
         }
 
-        // Build the primitive list. One primitive per instance.
-        let mut prims: Vec<BvhPrim> = Vec::with_capacity(instances.len());
+        let mut prims: Vec<BvhPrim> = Vec::with_capacity(total_leaves);
+
+        // Host instances → one TLAS leaf each via transformed asset AABB.
         for (idx, inst) in instances.iter().enumerate() {
-            // Skip instances pointing at user-shader assets — those go
-            // through Session 3's path. Defensive: post Phase 6 there
-            // shouldn't be any, but guard against future regressions.
             let asset_id = inst.asset_id as usize;
             if asset_id >= assets.len() { continue; }
             let asset = &assets[asset_id];
+            // Skip instances pointing at user-shader assets — those go
+            // through the user_shader_regions path below. Defensive:
+            // post Phase 6 there shouldn't be any host instance with
+            // shader_id != 0, but guard against future regressions.
             if asset.shader_id != 0 { continue; }
 
             let (world_min, world_max) =
@@ -187,6 +214,31 @@ impl TlasPass {
                 aabb_max: world_max,
                 centroid,
             });
+        }
+
+        // User-shader instances → one TLAS leaf per painted leaf.
+        // Conservative AABB radius = region_thickness covers any
+        // per-instance state the user's emit hook may have produced.
+        for region in user_shader_regions {
+            let r = region.region_thickness.max(0.0);
+            for (i, leaf) in region.leaves.iter().enumerate() {
+                let p = leaf.world_pos;
+                let world_min = [p[0] - r, p[1] - r, p[2] - r];
+                let world_max = [p[0] + r, p[1] + r, p[2] + r];
+                let state_offset = region.instance_block_offset
+                    + (i as u32) * region.instance_stride_u32;
+                prims.push(BvhPrim {
+                    leaf: TlasInstanceLeaf {
+                        asset_id: region.asset_id,
+                        instance_state_offset: state_offset,
+                        material_id: region.material_id,
+                        instance_index: TLAS_LEAF_USER_SHADER,
+                    },
+                    aabb_min: world_min,
+                    aabb_max: world_max,
+                    centroid: p,
+                });
+            }
         }
 
         if prims.is_empty() {
@@ -257,6 +309,35 @@ impl TlasPass {
         }
         dirty
     }
+}
+
+/// Per-region descriptor passed to [`TlasPass::build_tlas`] for the
+/// user-shader path. Engine populates one of these per
+/// `frame.instance_region_requests` entry that resolves to an
+/// `@instance_proto` shader. Holds the metadata + leaves slice the
+/// builder needs to emit one TLAS leaf per painted leaf.
+pub struct UserShaderRegionTlas<'a> {
+    /// Index into the combined assets vec where this region's
+    /// user-shader asset lives. Engine computes as
+    /// `frame.gpu_assets.len() + asset_for_shader[shader_id]`.
+    pub asset_id: u32,
+    /// Material the host march packs over the proto's leaf-attr
+    /// (V1 host-material inheritance, locked Option B Stage 1).
+    pub material_id: u32,
+    /// Conservative blade-AABB radius. The user shader's actual
+    /// `inst_aabb` may be tighter, but this is a CPU-side build
+    /// without GPU readback, so we bound by the region's authored
+    /// thickness.
+    pub region_thickness: f32,
+    /// `region_uniform.instance_block_offset` — first slot in
+    /// `instance_pool` for this region's per-instance state.
+    pub instance_block_offset: u32,
+    /// `region_uniform.instance_stride_u32` — u32 stride between
+    /// consecutive per-instance records.
+    pub instance_stride_u32: u32,
+    /// Painted leaves the engine collected for this region. One TLAS
+    /// leaf is emitted per entry.
+    pub leaves: &'a [crate::user_shader_emit_pass::PaintedLeaf],
 }
 
 /// Per-primitive working state for the BVH builder. Stored mutably
@@ -599,6 +680,82 @@ mod tests {
             seen[idx] = true;
         }
         assert!(seen.iter().all(|s| *s));
+    }
+
+    #[test]
+    fn user_shader_region_emits_one_prim_per_leaf() {
+        // CPU-only test of the conservative leaf-AABB derivation:
+        // verify the BvhPrim list a single user-shader region produces
+        // (without going through GPU upload). Uses internal builder
+        // primitives directly.
+        use crate::user_shader_emit_pass::PaintedLeaf;
+        let leaves = vec![
+            PaintedLeaf {
+                world_pos: [0.0, 0.0, 0.0],
+                material_packed: 0,
+                world_normal: [0.0, 1.0, 0.0],
+                _pad: 0.0,
+            },
+            PaintedLeaf {
+                world_pos: [10.0, 0.0, 0.0],
+                material_packed: 0,
+                world_normal: [0.0, 1.0, 0.0],
+                _pad: 0.0,
+            },
+        ];
+        let region_thickness = 0.5_f32;
+
+        // Mirror what `build_tlas` does internally for the user-shader
+        // path so the test doesn't need a live wgpu device.
+        let mut prims: Vec<BvhPrim> = Vec::new();
+        let asset_id = 7u32;
+        let material_id = 5u32;
+        let block_offset = 100u32;
+        let stride = 8u32;
+        for (i, leaf) in leaves.iter().enumerate() {
+            let p = leaf.world_pos;
+            let world_min = [p[0] - region_thickness, p[1] - region_thickness, p[2] - region_thickness];
+            let world_max = [p[0] + region_thickness, p[1] + region_thickness, p[2] + region_thickness];
+            let state_offset = block_offset + (i as u32) * stride;
+            prims.push(BvhPrim {
+                leaf: TlasInstanceLeaf {
+                    asset_id,
+                    instance_state_offset: state_offset,
+                    material_id,
+                    instance_index: TLAS_LEAF_USER_SHADER,
+                },
+                aabb_min: world_min,
+                aabb_max: world_max,
+                centroid: p,
+            });
+        }
+
+        assert_eq!(prims.len(), 2);
+        // Leaf 0: AABB centered on (0,0,0), radius 0.5.
+        assert_eq!(prims[0].aabb_min, [-0.5, -0.5, -0.5]);
+        assert_eq!(prims[0].aabb_max, [0.5, 0.5, 0.5]);
+        assert_eq!(prims[0].leaf.instance_state_offset, 100);
+        assert_eq!(prims[0].leaf.instance_index, TLAS_LEAF_USER_SHADER);
+        // Leaf 1: AABB centered on (10,0,0), state offset = 100 + 1*8.
+        assert_eq!(prims[1].aabb_min, [9.5, -0.5, -0.5]);
+        assert_eq!(prims[1].aabb_max, [10.5, 0.5, 0.5]);
+        assert_eq!(prims[1].leaf.instance_state_offset, 108);
+
+        // Build the BVH from these — same builder host instances use.
+        let mut nodes = Vec::new();
+        let mut bvh_leaves = Vec::new();
+        let _ = build_bvh_recursive(&mut nodes, &mut bvh_leaves, &mut prims, 0, 2);
+        assert_eq!(bvh_leaves.len(), 2);
+        // Both leaves should still be user-shader-flagged (no host
+        // contamination).
+        for l in &bvh_leaves {
+            assert_eq!(l.instance_index, TLAS_LEAF_USER_SHADER);
+            assert_eq!(l.asset_id, asset_id);
+            assert_eq!(l.material_id, material_id);
+        }
+        // Root encloses both AABBs.
+        assert_eq!(nodes[0].aabb_min, [-0.5, -0.5, -0.5]);
+        assert_eq!(nodes[0].aabb_max, [10.5, 0.5, 0.5]);
     }
 
     #[test]

@@ -1196,17 +1196,32 @@ fn render_one_frame(
     //     so at high render rates physics-driven motion is smooth
     //     instead of stuttering at the sim rate. Assets are pose-static
     //     within a frame.
-    // 1b'. Phase 7 Session 2 — TLAS build over host instances. User-
-    //      shader instances aren't in `instances_for_upload` (they
-    //      flow through Phase 6's tile-cull pipeline), so this frame's
-    //      TLAS only contains the host BVH. Session 3 will add the
-    //      user-shader path; Session 4 plumbs the buffers into shadow
-    //      trace. Today nothing reads them — pure side-effect.
-    state.tlas_pass.build_host_tlas(
+    // 1b'. Phase 7 Sessions 2+3 — build the TLAS over host instances
+    //      AND user-shader instance regions. Each painted leaf in a
+    //      region contributes one TLAS leaf with a conservative AABB
+    //      (radius = region.region_thickness) — covers the actual
+    //      blade despite emit's slot-permutation. Session 4 plumbs
+    //      this into shadow trace; today the buffers are written but
+    //      unread, so pure side-effect.
+    let user_shader_regions_for_tlas: Vec<rkp_render::tlas_pass::UserShaderRegionTlas> =
+        inst_result
+            .user_shader_region_pool_info
+            .iter()
+            .map(|info| rkp_render::tlas_pass::UserShaderRegionTlas {
+                asset_id: info.asset_id,
+                material_id: info.material_id,
+                region_thickness: info.region_thickness,
+                instance_block_offset: info.instance_block_offset,
+                instance_stride_u32: info.instance_stride_u32,
+                leaves: &frame.instance_region_requests[info.request_index as usize].leaves,
+            })
+            .collect();
+    state.tlas_pass.build_tlas(
         &state.device,
         &state.queue,
         assets_for_upload,
         instances_for_upload,
+        &user_shader_regions_for_tlas,
     );
     let overlay_bytes: &[u8] = bytemuck::cast_slice(&frame.gpu_instance_overlays);
     state.renderer.upload_frame(
@@ -1830,6 +1845,7 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
         return InstancePipelineResult {
             user_shader_assets: Vec::new(),
             tile_cull_scratch_count: 0,
+            user_shader_region_pool_info: Vec::new(),
         };
     }
 
@@ -1965,6 +1981,9 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
     let mut tile_cull_regions: Vec<rkp_render::user_shader_tile_cull_pass::TileCullRegionUniform> =
         Vec::new();
     let mut tile_cull_scratch_running_offset: u32 = 0;
+    // Phase 7 Session 3 — per-region pool info, accumulated during
+    // the same walk for downstream TLAS build to consume.
+    let mut user_shader_region_pool_info: Vec<UserShaderRegionPoolInfo> = Vec::new();
     // All regions' leaves concatenated into one upload. Each region's
     // EmitRegionUniform.leaf_offset is the index of its first leaf
     // here.
@@ -1985,7 +2004,7 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
     let asset_id_base = frame.gpu_assets.len() as u32;
 
     let time_seconds = frame.shade_params_base.time;
-    for req in &frame.instance_region_requests {
+    for (req_idx, req) in frame.instance_region_requests.iter().enumerate() {
         // Resolve the shader. Skip when not in registry or when it's
         // not an instance shader (shouldn't happen — the painter only
         // emits requests for instance shaders — but defend the path).
@@ -2128,6 +2147,18 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             }
         };
         let asset_id = asset_id_base + asset_index;
+
+        // Phase 7 Session 3 — record pool layout for the TLAS build,
+        // tagged with the request index so the downstream consumer
+        // can borrow `frame.instance_region_requests[i].leaves`.
+        user_shader_region_pool_info.push(UserShaderRegionPoolInfo {
+            asset_id,
+            material_id: req.material_id,
+            region_thickness: req.region_thickness,
+            instance_block_offset: region_uniform.instance_block_offset,
+            instance_stride_u32: region_uniform.instance_stride_u32,
+            request_index: req_idx as u32,
+        });
 
         // Phase 6 Session 3d — tile-cull region uniform. One per
         // region. `scratch_offset` accumulates: each region's slice
@@ -2490,6 +2521,7 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
     InstancePipelineResult {
         user_shader_assets,
         tile_cull_scratch_count: tile_cull_scratch_running_offset,
+        user_shader_region_pool_info,
     }
 }
 
@@ -2577,6 +2609,39 @@ struct InstancePipelineResult {
     /// count/scatter dispatches use this as their thread count.
     /// Zero when no user-shader regions ran this frame.
     tile_cull_scratch_count: u32,
+    /// Phase 7 Session 3 — per-region pool offsets parallel to the
+    /// region walk order, so downstream consumers (TLAS builder) can
+    /// match a region back to its `frame.instance_region_requests`
+    /// entry and read the same instance-pool layout
+    /// `tick_instance_pipeline` assigned. One entry per region the
+    /// pipeline successfully processed (cache misses get skipped
+    /// silently — same shape `tick_instance_pipeline` already uses).
+    user_shader_region_pool_info: Vec<UserShaderRegionPoolInfo>,
+}
+
+/// Phase 7 Session 3 — pool layout descriptor for one user-shader
+/// region. Returned from `tick_instance_pipeline` so downstream
+/// consumers can correlate a region back to its
+/// `frame.instance_region_requests` entry without re-running shader
+/// resolution / cache lookup.
+#[derive(Debug, Clone)]
+struct UserShaderRegionPoolInfo {
+    /// Index into the combined assets vec where this region's user-
+    /// shader asset lives.
+    asset_id: u32,
+    /// `region_uniform.material_id` — V1 host-material inheritance.
+    material_id: u32,
+    /// `request.region_thickness` — passed through for downstream
+    /// AABB sizing (TLAS conservative leaf bounds).
+    region_thickness: f32,
+    /// `region_uniform.instance_block_offset` — first slot in
+    /// `instance_pool` for this region's per-instance state.
+    instance_block_offset: u32,
+    /// `region_uniform.instance_stride_u32`.
+    instance_stride_u32: u32,
+    /// Index into `frame.instance_region_requests` so consumers can
+    /// borrow the leaves slice without re-resolving shader lookup.
+    request_index: u32,
 }
 
 /// Phase 6 Session 3d — per-VR tile-cull dispatch chain.
