@@ -283,6 +283,14 @@ struct RenderState {
     /// dispatch; same lifecycle as `instance_tile_view_uniform_buffer`.
     instance_tile_prefix_uniform_buffer: wgpu::Buffer,
 
+    /// Phase 7 Session 1 — TLAS over instance AABBs. Foundation only:
+    /// holds the GPU node + leaf buffers. Sessions 2–4 will add the
+    /// CPU builder, GPU upload, and WGSL traversal in shadow trace.
+    /// Bound but unread by any current pipeline (zero-init buffers are
+    /// effectively no-op).
+    #[allow(dead_code)]
+    tlas_pass: rkp_render::tlas_pass::TlasPass,
+
     /// Stage 6c-3 — global `array<u32>` storage buffer holding all
     /// scattered instance bytes. Each region's slice is bucket-allocated
     /// inside [`InstanceRegionCache`] (which thinks in u32 units rooted
@@ -486,6 +494,9 @@ impl RenderState {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Phase 7 Session 1 — TLAS foundation. Empty buffers + no
+        // builder yet; Sessions 2-4 plumb in the actual BVH.
+        let tlas_pass = rkp_render::tlas_pass::TlasPass::new(&device);
 
         // The instance_pool_buffer lives on RkpScene now (bound at
         // scene group binding(14) so the host march can read it for
@@ -530,6 +541,7 @@ impl RenderState {
             instance_tile_cull_scratch_capacity_entries: INSTANCE_TILE_CULL_INITIAL_ENTRIES,
             instance_tile_view_uniform_buffer,
             instance_tile_prefix_uniform_buffer,
+            tlas_pass,
             instance_pool_capacity_u32: rkp_render::rkp_scene::INSTANCE_POOL_CAPACITY_U32,
             instance_leaves_buffer,
             instance_leaves_capacity_entries: INSTANCE_LEAVES_INITIAL_ENTRIES,

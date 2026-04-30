@@ -99,6 +99,11 @@ pub mod user_shader_tile_prefix_pass;
 /// 16-byte UserShaderTileEntry records into us_tile_entries[] using
 /// per-tile atomic cursors initialized from the prefix-summed offsets.
 pub mod user_shader_tile_scatter_pass;
+/// Phase 7 — TLAS over instance AABBs for shadow rays (and future
+/// reflections / AO / GI). Session 1 ships only the wire format +
+/// buffer storage; Sessions 2-4 add the CPU builder, GPU upload,
+/// and WGSL traversal.
+pub mod tlas_pass;
 /// Skeletal skin-deform scatter pass — per-frame bone-field writer.
 pub mod skin_deform;
 /// CPU-side paint writes against the scene's LeafAttrPool (material +
