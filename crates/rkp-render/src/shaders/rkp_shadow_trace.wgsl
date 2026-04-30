@@ -533,6 +533,313 @@ fn trace_shadow_skinned(
 }
 
 // Shadow ray — returns transmittance in [0, 1]. 0 = fully occluded, 1 = lit.
+// Per-instance shadow descent — one ray, one instance. Returns the
+// updated transmittance, or `0.0` on full occlusion. Phase 7 Session
+// 4a extracted this from `trace_shadow_ray`'s for-loop body so the
+// BVH traversal in 4b can dispatch the same code path from leaf hits.
+//
+// `transmittance_in` is the running transmittance accumulator; the fn
+// multiplies into it and returns the new value. Caller short-circuits
+// on `< 0.01`.
+fn shadow_step_one_instance(
+    inst: RkpInstance,
+    asset: RkpAsset,
+    world_origin: vec3<f32>,
+    world_dir: vec3<f32>,
+    max_steps: u32,
+    max_world_dist: f32,
+    transmittance_in: f32,
+) -> f32 {
+    var transmittance = transmittance_in;
+
+    if asset.geom_type == 0u { return transmittance; }
+    // Same gate as primary visibility (Phase 2). SHADOW_ONLY semantics
+    // come later — they need a separate camera shadow_layer_mask.
+    if (inst.layer_mask & camera.layer_mask) == 0u
+        && inst.object_id != camera.focus_object_id { return transmittance; }
+
+    // Skinned objects walk the per-frame deformed bone field
+    // instead of the rest-pose octree — otherwise the shadow would
+    // track a stale (bind-pose) silhouette.
+    if inst.is_skinned != 0u && inst.bone_field_dim_x > 0u {
+        return trace_shadow_skinned(
+            world_origin, world_dir, inst, asset, max_world_dist, transmittance,
+        );
+    }
+
+    // Phase 4c — same world↔canonical branch as `march_object`.
+    // Affine path uses inv_world; user-shader path uses the user's
+    // `inst_to_local` hook against world AABB entry. The DDA loop
+    // downstream reads only oc_origin / safe_dir / local_max_t /
+    // local_scale, so wherever `local_dir_unnorm` and `local_origin`
+    // come from, the rest of the pass is identical.
+    var local_origin: vec3<f32>;
+    var local_dir_unnorm: vec3<f32>;
+    if asset.shader_id != 0u {
+        let inst_pos = inst.world[3].xyz;
+        let inst_scale = length(inst.world[0].xyz);
+        let aabb = dispatch_user_inst_aabb(
+            asset.shader_id, inst.instance_state_offset,
+            inst_pos, inst_scale,
+        );
+        let safe_world_dir = vec3<f32>(
+            select(world_dir.x, select(-1e-10, 1e-10, world_dir.x >= 0.0), abs(world_dir.x) < 1e-10),
+            select(world_dir.y, select(-1e-10, 1e-10, world_dir.y >= 0.0), abs(world_dir.y) < 1e-10),
+            select(world_dir.z, select(-1e-10, 1e-10, world_dir.z >= 0.0), abs(world_dir.z) < 1e-10),
+        );
+        let aabb_t = intersect_aabb(world_origin, 1.0 / safe_world_dir, aabb.min, aabb.max);
+        if aabb_t.x > aabb_t.y { return transmittance; }
+        let world_t_entry = max(aabb_t.x, 0.0);
+        if world_t_entry > max_world_dist { return transmittance; }
+        let world_entry = world_origin + world_dir * world_t_entry;
+        let local_entry = dispatch_user_inst_to_local(
+            asset.shader_id, inst.instance_state_offset,
+            world_entry, inst_pos, inst_scale,
+        );
+        let local_endpoint = dispatch_user_inst_to_local(
+            asset.shader_id, inst.instance_state_offset,
+            world_entry + world_dir, inst_pos, inst_scale,
+        );
+        local_origin = local_entry;
+        local_dir_unnorm = local_endpoint - local_entry;
+    } else {
+        let inv_world = mat4_affine_inverse(inst.world);
+        local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
+        local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
+    }
+    let local_dir = normalize(local_dir_unnorm);
+    let local_scale = length(local_dir_unnorm);
+    let local_max_t = max_world_dist * local_scale;
+
+    let root = asset.octree_root;
+    let max_depth = asset.octree_depth;
+    let extent = bitcast<f32>(asset.octree_extent_bits);
+    let vs = asset.voxel_size;
+    let min_step = vs * 2.0;
+
+    let oc_origin = local_origin - asset.grid_origin;
+    let safe_dir = vec3<f32>(
+        select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),
+        select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),
+        select(local_dir.z, select(-1e-10, 1e-10, local_dir.z >= 0.0), abs(local_dir.z) < 1e-10),
+    );
+    let inv_dir = 1.0 / safe_dir;
+
+    let shadow_origin = oc_origin + safe_dir * vs * 4.0;
+    let t_range = intersect_aabb(shadow_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(extent));
+    if t_range.x > t_range.y { return transmittance; }
+
+    let t_limit = min(t_range.y, local_max_t);
+    var t = max(t_range.x, 0.0);
+    // Tiny forward-bias used only for octree_lookup / skip_node. At
+    // brick-split boundaries `pos.x == center.x` is FP-ambiguous in
+    // `pos >= center`; biasing forward disambiguates toward the cell
+    // the ray is actually entering, eliminating the dashed-seam
+    // pattern caused by rounding into an EMPTY sibling subtree.
+    let lookup_bias = vs * 1.0e-3;
+
+    for (var step = 0u; step < max_steps; step++) {
+        if t > t_limit { break; }
+
+        let pos = clamp(shadow_origin + safe_dir * (t + lookup_bias), vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
+        let r = octree_lookup(root, max_depth, extent, pos, PHASE_SHADOW);
+
+        if r.slot == OCTREE_EMPTY {
+            t += max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);
+            continue;
+        }
+
+        if slot_is_brick(r.slot) {
+            var brick_id = slot_brick_id(r.slot);
+            let cell_size = (r.cell_half * 2.0) / BRICK_DIM_F;
+            let inv_cell_size = 1.0 / cell_size;
+            var brick_origin = r.cell_center - vec3<f32>(r.cell_half);
+            var brick_base = brick_id * BRICK_CELLS;
+
+            // Amanatides-Woo 3D DDA with brick_face_links chaining.
+            // On exit through a face, consult the face-link table
+            // instead of re-querying the octree — bypasses the
+            // FP-ambiguity at brick boundaries that produces seams.
+            let p0 = shadow_origin + safe_dir * t;
+            let local0 = (p0 - brick_origin) * inv_cell_size;
+            var cell = clamp(
+                vec3<i32>(floor(local0)),
+                vec3<i32>(0),
+                vec3<i32>(3),
+            );
+            let step_i = vec3<i32>(
+                select(-1, 1, safe_dir.x >= 0.0),
+                select(-1, 1, safe_dir.y >= 0.0),
+                select(-1, 1, safe_dir.z >= 0.0),
+            );
+            let step_gt = vec3<f32>(
+                select(0.0, 1.0, safe_dir.x >= 0.0),
+                select(0.0, 1.0, safe_dir.y >= 0.0),
+                select(0.0, 1.0, safe_dir.z >= 0.0),
+            );
+            let next_b = brick_origin + (vec3<f32>(cell) + step_gt) * cell_size;
+            var t_max = t + (next_b - p0) * inv_dir;
+            let t_delta = abs(vec3<f32>(cell_size) * inv_dir);
+            // Nudge past cell boundaries for FP robustness when we
+            // do fall through to the outer loop (FACE_EMPTY_LINK case).
+            let dda_eps = cell_size * 1.0e-3;
+
+            var blocked = false;
+            for (var bs = 0u; bs < BRICK_MAX_STEPS; bs++) {
+                if t > t_limit { break; }
+
+                // Out-of-brick → follow face link to neighbor brick.
+                if cell.x < 0 || cell.x >= 4
+                    || cell.y < 0 || cell.y >= 4
+                    || cell.z < 0 || cell.z >= 4 {
+                    var face_idx: u32;
+                    if cell.x < 0 { face_idx = FACE_NX; }
+                    else if cell.x >= 4 { face_idx = FACE_PX; }
+                    else if cell.y < 0 { face_idx = FACE_NY; }
+                    else if cell.y >= 4 { face_idx = FACE_PY; }
+                    else if cell.z < 0 { face_idx = FACE_NZ; }
+                    else { face_idx = FACE_PZ; }
+                    let link = brick_face_links[brick_id * 6u + face_idx];
+                    if link == FACE_INTERIOR {
+                        // Ray exits brick into a solid-bulk region.
+                        // For glass objects, the bulk is part of
+                        // the glass body — bail out of the brick
+                        // DDA and let the outer loop attenuate
+                        // the ray across the INTERIOR_NODE span
+                        // via Beer. Opaque objects still block.
+                        let obj_opacity = materials[inst.material_id].opacity;
+                        if obj_opacity < 0.99 {
+                            break;
+                        }
+                        blocked = true;
+                        break;
+                    }
+                    if link == FACE_EMPTY_LINK {
+                        // Fall back to outer loop's skip_node.
+                        break;
+                    }
+                    // Neighbor brick — swap brick state, re-enter at
+                    // the opposite face's cell column. `t_max` and
+                    // `t_delta` are mathematically ray-invariant, but
+                    // FP error from incremental `t_max += t_delta`
+                    // accumulates across long chains. Re-anchor
+                    // `t_max` from the current ray position at every
+                    // face-link crossing — see the matching comment
+                    // in octree_march.wgsl for the full rationale.
+                    brick_id = link;
+                    brick_base = link * BRICK_CELLS;
+                    let brick_extent = BRICK_DIM_F * cell_size;
+                    if face_idx == FACE_NX { cell.x = 3; brick_origin.x -= brick_extent; }
+                    else if face_idx == FACE_PX { cell.x = 0; brick_origin.x += brick_extent; }
+                    else if face_idx == FACE_NY { cell.y = 3; brick_origin.y -= brick_extent; }
+                    else if face_idx == FACE_PY { cell.y = 0; brick_origin.y += brick_extent; }
+                    else if face_idx == FACE_NZ { cell.z = 3; brick_origin.z -= brick_extent; }
+                    else { cell.z = 0; brick_origin.z += brick_extent; }
+                    let p_now = shadow_origin + safe_dir * t;
+                    let next_b = brick_origin + (vec3<f32>(cell) + step_gt) * cell_size;
+                    t_max = t + (next_b - p_now) * inv_dir;
+                }
+
+                let flat = u32(cell.x) + u32(cell.y) * BRICK_DIM + u32(cell.z) * BRICK_DIM * BRICK_DIM;
+                let c = brick_pool[brick_base + flat];
+                if c == BRICK_CELL_INTERIOR {
+                    // Solid-bulk cell inside a brick. Opaque
+                    // objects keep the old "skip like air"
+                    // behavior (shadow passes straight through
+                    // mesh interiors). Glass objects attenuate
+                    // by one cell's worth of Beer + opacity.
+                    let obj_opacity = materials[inst.material_id].opacity;
+                    if obj_opacity < 0.99 {
+                        let glass_albedo = mat_albedo(materials[inst.material_id]);
+                        let cell_world = cell_size / local_scale;
+                        transmittance *= shadow_beer(glass_albedo, obj_opacity, cell_world);
+                        if transmittance < 0.01 { blocked = true; break; }
+                    }
+                } else if c != BRICK_CELL_EMPTY {
+                    let attr = fetch_leaf_attr_for(inst, c);
+                    let mid = leaf_attr_material_primary(attr);
+                    let m_op = materials[mid].opacity;
+                    if m_op >= 0.99 { blocked = true; break; }
+                    // Full Beer + opacity over one cell width.
+                    // Earlier code used a per-cell linear
+                    // `(1 - m_op)` multiplier which compounded
+                    // across many cells into near-black shadows;
+                    // routing through `shadow_beer` keeps the
+                    // extinction thickness-proportional and
+                    // matches the primary pass's one-shot gate.
+                    let glass_albedo = mat_albedo(materials[mid]);
+                    let cell_world = cell_size / local_scale;
+                    transmittance *= shadow_beer(glass_albedo, m_op, cell_world);
+                    if transmittance < 0.01 { blocked = true; break; }
+                }
+
+                if t_max.x < t_max.y && t_max.x < t_max.z {
+                    t = t_max.x + dda_eps;
+                    cell.x += step_i.x;
+                    t_max.x += t_delta.x;
+                } else if t_max.y < t_max.z {
+                    t = t_max.y + dda_eps;
+                    cell.y += step_i.y;
+                    t_max.y += t_delta.y;
+                } else {
+                    t = t_max.z + dda_eps;
+                    cell.z += step_i.z;
+                    t_max.z += t_delta.z;
+                }
+            }
+            if blocked { return 0.0; }
+            continue;
+        }
+
+        // INTERIOR handling mirrors the primary march: a solid-
+        // bulk region inside a glass object attenuates the light
+        // across the full span (Beer over the node's ray length)
+        // and the shadow ray continues. Opaque INTERIOR still
+        // blocks the light, matching the existing mesh-interior
+        // shadow behavior.
+        if r.slot == OCTREE_INTERIOR {
+            let obj_opacity = materials[inst.material_id].opacity;
+            if obj_opacity < 0.99 {
+                let span = max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);
+                let glass_albedo = mat_albedo(materials[inst.material_id]);
+                let span_world = span / local_scale;
+                transmittance *= shadow_beer(glass_albedo, obj_opacity, span_world);
+                if transmittance < 0.01 { return 0.0; }
+                t += span;
+                continue;
+            }
+            return 0.0;
+        }
+
+        atomicAdd(&stats[44], 1u);
+        let attr = fetch_leaf_attr_for(inst, r.slot);
+        let mid = leaf_attr_material_primary(attr);
+        atomicAdd(&stats[47], 1u);
+        let mat_opacity = materials[mid].opacity;
+
+        if mat_opacity >= 0.99 {
+            return 0.0;
+        }
+        // Route through `shadow_beer` so albedo + opacity both
+        // accumulate as thickness-proportional extinction.
+        // Earlier per-iteration `(1 - opacity)` multiplier
+        // compounded across many cells into over-dark shadows.
+        let glass_albedo = mat_albedo(materials[mid]);
+        let step_world = min_step / local_scale;
+        transmittance *= shadow_beer(glass_albedo, mat_opacity, step_world);
+        if transmittance < 0.01 {
+            return 0.0;
+        }
+
+        t += min_step;
+    }
+
+    return transmittance;
+}
+
+// Phase 7 Session 4a — thin wrapper iterating the existing
+// `instances[]` array. Session 4b replaces the iteration with a TLAS
+// traversal that calls `shadow_step_one_instance` from leaf hits.
 fn trace_shadow_ray(
     world_origin: vec3<f32>,
     world_dir: vec3<f32>,
@@ -541,295 +848,14 @@ fn trace_shadow_ray(
     max_world_dist: f32,
 ) -> f32 {
     var transmittance = 1.0;
-
     for (var oi = 0u; oi < num_objects; oi++) {
         let inst = instances[oi];
         let asset = assets[inst.asset_id];
-        if asset.geom_type == 0u { continue; }
-        // Same gate as primary visibility (Phase 2). SHADOW_ONLY semantics
-        // come later — they need a separate camera shadow_layer_mask.
-        if (inst.layer_mask & camera.layer_mask) == 0u
-            && inst.object_id != camera.focus_object_id { continue; }
-
-        // Skinned objects walk the per-frame deformed bone field
-        // instead of the rest-pose octree — otherwise the shadow would
-        // track a stale (bind-pose) silhouette.
-        if inst.is_skinned != 0u && inst.bone_field_dim_x > 0u {
-            transmittance = trace_shadow_skinned(
-                world_origin, world_dir, inst, asset, max_world_dist, transmittance,
-            );
-            if transmittance < 0.01 { return 0.0; }
-            continue;
-        }
-
-        // Phase 4c — same world↔canonical branch as `march_object`.
-        // Affine path uses inv_world; user-shader path uses the user's
-        // `inst_to_local` hook against world AABB entry. The DDA loop
-        // downstream reads only oc_origin / safe_dir / local_max_t /
-        // local_scale, so wherever `local_dir_unnorm` and `local_origin`
-        // come from, the rest of the pass is identical.
-        var local_origin: vec3<f32>;
-        var local_dir_unnorm: vec3<f32>;
-        if asset.shader_id != 0u {
-            let inst_pos = inst.world[3].xyz;
-            let inst_scale = length(inst.world[0].xyz);
-            let aabb = dispatch_user_inst_aabb(
-                asset.shader_id, inst.instance_state_offset,
-                inst_pos, inst_scale,
-            );
-            let safe_world_dir = vec3<f32>(
-                select(world_dir.x, select(-1e-10, 1e-10, world_dir.x >= 0.0), abs(world_dir.x) < 1e-10),
-                select(world_dir.y, select(-1e-10, 1e-10, world_dir.y >= 0.0), abs(world_dir.y) < 1e-10),
-                select(world_dir.z, select(-1e-10, 1e-10, world_dir.z >= 0.0), abs(world_dir.z) < 1e-10),
-            );
-            let aabb_t = intersect_aabb(world_origin, 1.0 / safe_world_dir, aabb.min, aabb.max);
-            if aabb_t.x > aabb_t.y { continue; }
-            let world_t_entry = max(aabb_t.x, 0.0);
-            if world_t_entry > max_world_dist { continue; }
-            let world_entry = world_origin + world_dir * world_t_entry;
-            let local_entry = dispatch_user_inst_to_local(
-                asset.shader_id, inst.instance_state_offset,
-                world_entry, inst_pos, inst_scale,
-            );
-            let local_endpoint = dispatch_user_inst_to_local(
-                asset.shader_id, inst.instance_state_offset,
-                world_entry + world_dir, inst_pos, inst_scale,
-            );
-            local_origin = local_entry;
-            local_dir_unnorm = local_endpoint - local_entry;
-        } else {
-            let inv_world = mat4_affine_inverse(inst.world);
-            local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
-            local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
-        }
-        let local_dir = normalize(local_dir_unnorm);
-        let local_scale = length(local_dir_unnorm);
-        let local_max_t = max_world_dist * local_scale;
-
-        let root = asset.octree_root;
-        let max_depth = asset.octree_depth;
-        let extent = bitcast<f32>(asset.octree_extent_bits);
-        let vs = asset.voxel_size;
-        let min_step = vs * 2.0;
-
-        let oc_origin = local_origin - asset.grid_origin;
-        let safe_dir = vec3<f32>(
-            select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),
-            select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),
-            select(local_dir.z, select(-1e-10, 1e-10, local_dir.z >= 0.0), abs(local_dir.z) < 1e-10),
+        transmittance = shadow_step_one_instance(
+            inst, asset, world_origin, world_dir, max_steps, max_world_dist, transmittance,
         );
-        let inv_dir = 1.0 / safe_dir;
-
-        let shadow_origin = oc_origin + safe_dir * vs * 4.0;
-        let t_range = intersect_aabb(shadow_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(extent));
-        if t_range.x > t_range.y { continue; }
-
-        let t_limit = min(t_range.y, local_max_t);
-        var t = max(t_range.x, 0.0);
-        // Tiny forward-bias used only for octree_lookup / skip_node. At
-        // brick-split boundaries `pos.x == center.x` is FP-ambiguous in
-        // `pos >= center`; biasing forward disambiguates toward the cell
-        // the ray is actually entering, eliminating the dashed-seam
-        // pattern caused by rounding into an EMPTY sibling subtree.
-        let lookup_bias = vs * 1.0e-3;
-
-        for (var step = 0u; step < max_steps; step++) {
-            if t > t_limit { break; }
-
-            let pos = clamp(shadow_origin + safe_dir * (t + lookup_bias), vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
-            let r = octree_lookup(root, max_depth, extent, pos, PHASE_SHADOW);
-
-            if r.slot == OCTREE_EMPTY {
-                t += max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);
-                continue;
-            }
-
-            if slot_is_brick(r.slot) {
-                var brick_id = slot_brick_id(r.slot);
-                let cell_size = (r.cell_half * 2.0) / BRICK_DIM_F;
-                let inv_cell_size = 1.0 / cell_size;
-                var brick_origin = r.cell_center - vec3<f32>(r.cell_half);
-                var brick_base = brick_id * BRICK_CELLS;
-
-                // Amanatides-Woo 3D DDA with brick_face_links chaining.
-                // On exit through a face, consult the face-link table
-                // instead of re-querying the octree — bypasses the
-                // FP-ambiguity at brick boundaries that produces seams.
-                let p0 = shadow_origin + safe_dir * t;
-                let local0 = (p0 - brick_origin) * inv_cell_size;
-                var cell = clamp(
-                    vec3<i32>(floor(local0)),
-                    vec3<i32>(0),
-                    vec3<i32>(3),
-                );
-                let step_i = vec3<i32>(
-                    select(-1, 1, safe_dir.x >= 0.0),
-                    select(-1, 1, safe_dir.y >= 0.0),
-                    select(-1, 1, safe_dir.z >= 0.0),
-                );
-                let step_gt = vec3<f32>(
-                    select(0.0, 1.0, safe_dir.x >= 0.0),
-                    select(0.0, 1.0, safe_dir.y >= 0.0),
-                    select(0.0, 1.0, safe_dir.z >= 0.0),
-                );
-                let next_b = brick_origin + (vec3<f32>(cell) + step_gt) * cell_size;
-                var t_max = t + (next_b - p0) * inv_dir;
-                let t_delta = abs(vec3<f32>(cell_size) * inv_dir);
-                // Nudge past cell boundaries for FP robustness when we
-                // do fall through to the outer loop (FACE_EMPTY_LINK case).
-                let dda_eps = cell_size * 1.0e-3;
-
-                var blocked = false;
-                for (var bs = 0u; bs < BRICK_MAX_STEPS; bs++) {
-                    if t > t_limit { break; }
-
-                    // Out-of-brick → follow face link to neighbor brick.
-                    if cell.x < 0 || cell.x >= 4
-                        || cell.y < 0 || cell.y >= 4
-                        || cell.z < 0 || cell.z >= 4 {
-                        var face_idx: u32;
-                        if cell.x < 0 { face_idx = FACE_NX; }
-                        else if cell.x >= 4 { face_idx = FACE_PX; }
-                        else if cell.y < 0 { face_idx = FACE_NY; }
-                        else if cell.y >= 4 { face_idx = FACE_PY; }
-                        else if cell.z < 0 { face_idx = FACE_NZ; }
-                        else { face_idx = FACE_PZ; }
-                        let link = brick_face_links[brick_id * 6u + face_idx];
-                        if link == FACE_INTERIOR {
-                            // Ray exits brick into a solid-bulk region.
-                            // For glass objects, the bulk is part of
-                            // the glass body — bail out of the brick
-                            // DDA and let the outer loop attenuate
-                            // the ray across the INTERIOR_NODE span
-                            // via Beer. Opaque objects still block.
-                            let obj_opacity = materials[inst.material_id].opacity;
-                            if obj_opacity < 0.99 {
-                                break;
-                            }
-                            blocked = true;
-                            break;
-                        }
-                        if link == FACE_EMPTY_LINK {
-                            // Fall back to outer loop's skip_node.
-                            break;
-                        }
-                        // Neighbor brick — swap brick state, re-enter at
-                        // the opposite face's cell column. `t_max` and
-                        // `t_delta` are mathematically ray-invariant, but
-                        // FP error from incremental `t_max += t_delta`
-                        // accumulates across long chains. Re-anchor
-                        // `t_max` from the current ray position at every
-                        // face-link crossing — see the matching comment
-                        // in octree_march.wgsl for the full rationale.
-                        brick_id = link;
-                        brick_base = link * BRICK_CELLS;
-                        let brick_extent = BRICK_DIM_F * cell_size;
-                        if face_idx == FACE_NX { cell.x = 3; brick_origin.x -= brick_extent; }
-                        else if face_idx == FACE_PX { cell.x = 0; brick_origin.x += brick_extent; }
-                        else if face_idx == FACE_NY { cell.y = 3; brick_origin.y -= brick_extent; }
-                        else if face_idx == FACE_PY { cell.y = 0; brick_origin.y += brick_extent; }
-                        else if face_idx == FACE_NZ { cell.z = 3; brick_origin.z -= brick_extent; }
-                        else { cell.z = 0; brick_origin.z += brick_extent; }
-                        let p_now = shadow_origin + safe_dir * t;
-                        let next_b = brick_origin + (vec3<f32>(cell) + step_gt) * cell_size;
-                        t_max = t + (next_b - p_now) * inv_dir;
-                    }
-
-                    let flat = u32(cell.x) + u32(cell.y) * BRICK_DIM + u32(cell.z) * BRICK_DIM * BRICK_DIM;
-                    let c = brick_pool[brick_base + flat];
-                    if c == BRICK_CELL_INTERIOR {
-                        // Solid-bulk cell inside a brick. Opaque
-                        // objects keep the old "skip like air"
-                        // behavior (shadow passes straight through
-                        // mesh interiors). Glass objects attenuate
-                        // by one cell's worth of Beer + opacity.
-                        let obj_opacity = materials[inst.material_id].opacity;
-                        if obj_opacity < 0.99 {
-                            let glass_albedo = mat_albedo(materials[inst.material_id]);
-                            let cell_world = cell_size / local_scale;
-                            transmittance *= shadow_beer(glass_albedo, obj_opacity, cell_world);
-                            if transmittance < 0.01 { blocked = true; break; }
-                        }
-                    } else if c != BRICK_CELL_EMPTY {
-                        let attr = fetch_leaf_attr_for(inst, c);
-                        let mid = leaf_attr_material_primary(attr);
-                        let m_op = materials[mid].opacity;
-                        if m_op >= 0.99 { blocked = true; break; }
-                        // Full Beer + opacity over one cell width.
-                        // Earlier code used a per-cell linear
-                        // `(1 - m_op)` multiplier which compounded
-                        // across many cells into near-black shadows;
-                        // routing through `shadow_beer` keeps the
-                        // extinction thickness-proportional and
-                        // matches the primary pass's one-shot gate.
-                        let glass_albedo = mat_albedo(materials[mid]);
-                        let cell_world = cell_size / local_scale;
-                        transmittance *= shadow_beer(glass_albedo, m_op, cell_world);
-                        if transmittance < 0.01 { blocked = true; break; }
-                    }
-
-                    if t_max.x < t_max.y && t_max.x < t_max.z {
-                        t = t_max.x + dda_eps;
-                        cell.x += step_i.x;
-                        t_max.x += t_delta.x;
-                    } else if t_max.y < t_max.z {
-                        t = t_max.y + dda_eps;
-                        cell.y += step_i.y;
-                        t_max.y += t_delta.y;
-                    } else {
-                        t = t_max.z + dda_eps;
-                        cell.z += step_i.z;
-                        t_max.z += t_delta.z;
-                    }
-                }
-                if blocked { return 0.0; }
-                continue;
-            }
-
-            // INTERIOR handling mirrors the primary march: a solid-
-            // bulk region inside a glass object attenuates the light
-            // across the full span (Beer over the node's ray length)
-            // and the shadow ray continues. Opaque INTERIOR still
-            // blocks the light, matching the existing mesh-interior
-            // shadow behavior.
-            if r.slot == OCTREE_INTERIOR {
-                let obj_opacity = materials[inst.material_id].opacity;
-                if obj_opacity < 0.99 {
-                    let span = max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);
-                    let glass_albedo = mat_albedo(materials[inst.material_id]);
-                    let span_world = span / local_scale;
-                    transmittance *= shadow_beer(glass_albedo, obj_opacity, span_world);
-                    if transmittance < 0.01 { return 0.0; }
-                    t += span;
-                    continue;
-                }
-                return 0.0;
-            }
-
-            atomicAdd(&stats[44], 1u);
-            let attr = fetch_leaf_attr_for(inst, r.slot);
-            let mid = leaf_attr_material_primary(attr);
-            atomicAdd(&stats[47], 1u);
-            let mat_opacity = materials[mid].opacity;
-
-            if mat_opacity >= 0.99 {
-                return 0.0;
-            }
-            // Route through `shadow_beer` so albedo + opacity both
-            // accumulate as thickness-proportional extinction.
-            // Earlier per-iteration `(1 - opacity)` multiplier
-            // compounded across many cells into over-dark shadows.
-            let glass_albedo = mat_albedo(materials[mid]);
-            let step_world = min_step / local_scale;
-            transmittance *= shadow_beer(glass_albedo, mat_opacity, step_world);
-            if transmittance < 0.01 {
-                return 0.0;
-            }
-
-            t += min_step;
-        }
+        if transmittance < 0.01 { return 0.0; }
     }
-
     return transmittance;
 }
 
