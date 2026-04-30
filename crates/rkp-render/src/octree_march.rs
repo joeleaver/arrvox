@@ -110,6 +110,17 @@ pub struct OctreeMarchPass {
     /// Phase 6).
     pub us_tile_entries_buffer: wgpu::Buffer,
     pub us_tile_entries_capacity: u64,
+    /// Phase 6 Session 3 — per-tile atomic counts populated by the
+    /// tile-cull count pass; consumed by the prefix-sum pass to build
+    /// `us_tile_offsets`. Reset to zero every frame. One `u32` per tile.
+    pub us_tile_counts_buffer: wgpu::Buffer,
+    pub us_tile_counts_capacity: u64,
+    /// Phase 6 Session 3 — per-tile atomic cursor for the scatter pass.
+    /// Engine initializes to a copy of `us_tile_offsets[..tile_count]`
+    /// before scatter; the pass `atomicAdd`s into it to claim slots
+    /// inside `us_tile_entries[]`. One `u32` per tile.
+    pub us_tile_scatter_cursor_buffer: wgpu::Buffer,
+    pub us_tile_scatter_cursor_capacity: u64,
     /// Lights buffer (shared with shade pass).
     lights_buffer: Option<wgpu::Buffer>,
     /// Materials buffer reference for bind group rebuild.
@@ -326,7 +337,7 @@ impl OctreeMarchPass {
             us_tile_offsets_buffer: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("march us_tile_offsets"),
                 size: 256,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }),
             us_tile_offsets_capacity: 256,
@@ -337,6 +348,20 @@ impl OctreeMarchPass {
                 mapped_at_creation: false,
             }),
             us_tile_entries_capacity: 256,
+            us_tile_counts_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("march us_tile_counts"),
+                size: 256,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            us_tile_counts_capacity: 256,
+            us_tile_scatter_cursor_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("march us_tile_scatter_cursor"),
+                size: 256,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            us_tile_scatter_cursor_capacity: 256,
             lights_buffer: None,
             materials_buffer: None,
         }
@@ -493,6 +518,116 @@ impl OctreeMarchPass {
         if !object_ids.is_empty() {
             queue.write_buffer(&self.tile_object_ids_buffer, 0, object_ids);
         }
+    }
+
+    /// Phase 6 Session 3 — grow the per-tile user-shader buffers to fit
+    /// `tile_count` tiles. The four buffers are sized in lock-step:
+    ///
+    /// * `us_tile_offsets`  — `(tile_count + 1) × 4 B` (prefix sum).
+    /// * `us_tile_counts`   — `tile_count × 4 B` (per-tile atomic).
+    /// * `us_tile_scatter_cursor` — `tile_count × 4 B` (per-tile atomic).
+    /// * `us_tile_entries`  — sized separately by `ensure_us_tile_entries_capacity`
+    ///   since entry count is determined by post-cull totals, not tile count.
+    ///
+    /// Returns `true` if any buffer was reallocated. The caller is
+    /// responsible for invalidating any cached bind group that references
+    /// these buffers (`params_bind_group` is rebuilt automatically by
+    /// `try_rebuild_params_bind_group`).
+    pub fn ensure_us_tile_grid_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        tile_count: u32,
+    ) -> bool {
+        let offsets_needed = ((tile_count as u64) + 1) * 4;
+        let cells_needed = (tile_count as u64) * 4;
+        let mut dirty = false;
+        if offsets_needed > self.us_tile_offsets_capacity {
+            let mut new_cap = self.us_tile_offsets_capacity.max(256);
+            while new_cap < offsets_needed { new_cap = new_cap.saturating_mul(2); }
+            self.us_tile_offsets_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("march us_tile_offsets"),
+                size: new_cap,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            self.us_tile_offsets_capacity = new_cap;
+            dirty = true;
+        }
+        if cells_needed > self.us_tile_counts_capacity {
+            let mut new_cap = self.us_tile_counts_capacity.max(256);
+            while new_cap < cells_needed { new_cap = new_cap.saturating_mul(2); }
+            self.us_tile_counts_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("march us_tile_counts"),
+                size: new_cap,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.us_tile_counts_capacity = new_cap;
+            dirty = true;
+        }
+        if cells_needed > self.us_tile_scatter_cursor_capacity {
+            let mut new_cap = self.us_tile_scatter_cursor_capacity.max(256);
+            while new_cap < cells_needed { new_cap = new_cap.saturating_mul(2); }
+            self.us_tile_scatter_cursor_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("march us_tile_scatter_cursor"),
+                size: new_cap,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            self.us_tile_scatter_cursor_capacity = new_cap;
+            dirty = true;
+        }
+        if dirty {
+            self.params_bind_group = None;
+            self.try_rebuild_params_bind_group(device);
+        }
+        dirty
+    }
+
+    /// Phase 6 Session 3 — grow `us_tile_entries_buffer` to fit
+    /// `entry_count` × 16 B `UserShaderTileEntry` records. Sized
+    /// separately from the per-tile buffers because entry count comes
+    /// from post-cull totals (sum of per-tile counts), not tile count.
+    /// Returns `true` if reallocated.
+    pub fn ensure_us_tile_entries_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        entry_count: u32,
+    ) -> bool {
+        let needed = (entry_count.max(1) as u64) * 16;
+        if needed <= self.us_tile_entries_capacity {
+            return false;
+        }
+        let mut new_cap = self.us_tile_entries_capacity.max(256);
+        while new_cap < needed { new_cap = new_cap.saturating_mul(2); }
+        self.us_tile_entries_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("march us_tile_entries"),
+            size: new_cap,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.us_tile_entries_capacity = new_cap;
+        self.params_bind_group = None;
+        self.try_rebuild_params_bind_group(device);
+        true
+    }
+
+    /// Phase 6 Session 3 — copy the prefix-summed `us_tile_offsets`
+    /// values for tiles `[0, tile_count)` into `us_tile_scatter_cursor`.
+    /// Each tile's slot starts at its prefix offset; the scatter pass's
+    /// atomicAdd produces slots in `[offset[t], offset[t+1])`.
+    pub fn init_scatter_cursor(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        tile_count: u32,
+    ) {
+        let bytes = (tile_count as u64) * 4;
+        if bytes == 0 { return; }
+        encoder.copy_buffer_to_buffer(
+            &self.us_tile_offsets_buffer, 0,
+            &self.us_tile_scatter_cursor_buffer, 0,
+            bytes,
+        );
     }
 
     /// Expose the params bind group layout so the shadow_trace pass can

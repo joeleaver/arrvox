@@ -252,6 +252,37 @@ struct RenderState {
     instance_emit_pass: rkp_render::user_shader_emit_pass::EmitPass,
     instance_region_cache: rkp_render::user_shader_emit_pass::InstanceRegionCache,
 
+    /// Phase 6 Session 3 — tile-cull pipeline. Four passes that turn
+    /// the per-instance state in `instance_pool` into per-tile
+    /// `UserShaderTileEntry` lists the host march can iterate. Pure
+    /// side-effect during Session 3d (March doesn't yet read the
+    /// produced lists — Session 4 wires that consumer).
+    #[allow(dead_code)]
+    instance_tile_cull_pass: rkp_render::user_shader_tile_cull_pass::TileCullPass,
+    #[allow(dead_code)]
+    instance_tile_count_pass: rkp_render::user_shader_tile_count_pass::TileCountPass,
+    #[allow(dead_code)]
+    instance_tile_prefix_pass: rkp_render::user_shader_tile_prefix_pass::TilePrefixPass,
+    #[allow(dead_code)]
+    instance_tile_scatter_pass: rkp_render::user_shader_tile_scatter_pass::TileScatterPass,
+    /// Per-frame scratch buffer holding one
+    /// `InstanceTileCullEntry` (48 B) per reserved instance slot across
+    /// all regions. The AABB pass writes; count + scatter read.
+    /// Doesn't carry state across frames — overwritten in place every
+    /// frame, sized by the engine to current scratch totals.
+    instance_tile_cull_scratch_buffer: wgpu::Buffer,
+    /// Capacity of `instance_tile_cull_scratch_buffer` in entries.
+    instance_tile_cull_scratch_capacity_entries: u32,
+    /// Phase 6 Session 3d — shared uniform buffer for the per-VR
+    /// `TileCullViewportUniform` (96 B). Written before each VR's
+    /// count/scatter dispatch via `queue.write_buffer`; wgpu serializes
+    /// against the dispatches behind it on the same queue.
+    instance_tile_view_uniform_buffer: wgpu::Buffer,
+    /// Phase 6 Session 3d — shared uniform buffer for the per-VR
+    /// `PrefixUniform` (16 B). Written before each VR's prefix-sum
+    /// dispatch; same lifecycle as `instance_tile_view_uniform_buffer`.
+    instance_tile_prefix_uniform_buffer: wgpu::Buffer,
+
     /// Stage 6c-3 — global `array<u32>` storage buffer holding all
     /// scattered instance bytes. Each region's slice is bucket-allocated
     /// inside [`InstanceRegionCache`] (which thinks in u32 units rooted
@@ -420,6 +451,41 @@ impl RenderState {
             );
         let instance_emit_pass =
             rkp_render::user_shader_emit_pass::EmitPass::new(&device);
+        // Phase 6 Session 3d — tile-cull GPU pipeline. Four compute
+        // passes; bake/emit feed `instance_pool`, this pipeline turns
+        // it into per-tile lists for the host march. Constructed
+        // unconditionally so the pipelines exist when the first
+        // user-shader region appears; they sit idle until then.
+        let instance_tile_cull_pass =
+            rkp_render::user_shader_tile_cull_pass::TileCullPass::new(&device);
+        let instance_tile_count_pass =
+            rkp_render::user_shader_tile_count_pass::TileCountPass::new(&device);
+        let instance_tile_prefix_pass =
+            rkp_render::user_shader_tile_prefix_pass::TilePrefixPass::new(&device);
+        let instance_tile_scatter_pass =
+            rkp_render::user_shader_tile_scatter_pass::TileScatterPass::new(&device);
+        // Initial scratch buffer — single-entry placeholder. Grown per
+        // frame by `tick_instance_pipeline` when scatter totals exceed
+        // capacity.
+        const INSTANCE_TILE_CULL_INITIAL_ENTRIES: u32 = 1;
+        let instance_tile_cull_scratch_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("inst tile_cull_scratch"),
+            size: (INSTANCE_TILE_CULL_INITIAL_ENTRIES as u64) * 48,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let instance_tile_view_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("inst tile_view_uniform"),
+            size: std::mem::size_of::<rkp_render::user_shader_tile_count_pass::TileCullViewportUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let instance_tile_prefix_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("inst tile_prefix_uniform"),
+            size: std::mem::size_of::<rkp_render::user_shader_tile_prefix_pass::PrefixUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         // The instance_pool_buffer lives on RkpScene now (bound at
         // scene group binding(14) so the host march can read it for
@@ -456,6 +522,14 @@ impl RenderState {
             instance_proto_cache,
             instance_emit_pass,
             instance_region_cache,
+            instance_tile_cull_pass,
+            instance_tile_count_pass,
+            instance_tile_prefix_pass,
+            instance_tile_scatter_pass,
+            instance_tile_cull_scratch_buffer,
+            instance_tile_cull_scratch_capacity_entries: INSTANCE_TILE_CULL_INITIAL_ENTRIES,
+            instance_tile_view_uniform_buffer,
+            instance_tile_prefix_uniform_buffer,
             instance_pool_capacity_u32: rkp_render::rkp_scene::INSTANCE_POOL_CAPACITY_U32,
             instance_leaves_buffer,
             instance_leaves_capacity_entries: INSTANCE_LEAVES_INITIAL_ENTRIES,
@@ -1296,6 +1370,31 @@ fn render_one_frame(
                 label: Some("rkp viewport"),
             });
 
+        // 3f.5. Phase 6 Session 3d — per-VR user-shader tile-cull
+        //       dispatch chain (count → prefix → scatter). Side-effect
+        //       only during Session 3d: writes per-tile entry lists
+        //       into `vr.march.us_tile_offsets/entries`, but the host
+        //       march doesn't yet iterate them (Session 4). Skipped
+        //       when no user-shader instances ran this frame.
+        if inst_result.tile_cull_scratch_count > 0 {
+            // Disjoint borrow of state's tile-cull fields so they
+            // don't conflict with the outer `vr` (which holds a
+            // &mut borrow on `state.viewport_renderers`).
+            let args = UsTileCullArgs {
+                device: &state.device,
+                queue: &state.queue,
+                renderer: &mut state.renderer,
+                scratch_buffer: &state.instance_tile_cull_scratch_buffer,
+                view_uniform_buffer: &state.instance_tile_view_uniform_buffer,
+                prefix_uniform_buffer: &state.instance_tile_prefix_uniform_buffer,
+                tile_count_pass: &state.instance_tile_count_pass,
+                tile_prefix_pass: &state.instance_tile_prefix_pass,
+                tile_scatter_pass: &state.instance_tile_scatter_pass,
+            };
+            dispatch_us_tile_cull_inner(args, vr, &mut encoder, &camera,
+                vp.width, vp.height, inst_result.tile_cull_scratch_count);
+        }
+
         // 3g. Procedural raymarch upload (instructions + outline + ghosts)
         //     when this VR is in raymarch preview mode.
         if let Some(proc) = &vp.proc_raymarch {
@@ -1770,6 +1869,7 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
         return InstancePipelineResult {
             user_shader_assets: Vec::new(),
             user_shader_instances: Vec::new(),
+            tile_cull_scratch_count: 0,
         };
     }
 
@@ -1898,6 +1998,13 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
     }
     let mut dirty_bakes: Vec<DirtyBake> = Vec::new();
     let mut scatters: Vec<Scatter> = Vec::new();
+    // Phase 6 Session 3d — tile-cull region uniforms collected
+    // alongside `scatters`. One per region, with `scratch_offset`
+    // tracking the cumulative entry index into
+    // `instance_tile_cull_scratch_buffer`.
+    let mut tile_cull_regions: Vec<rkp_render::user_shader_tile_cull_pass::TileCullRegionUniform> =
+        Vec::new();
+    let mut tile_cull_scratch_running_offset: u32 = 0;
     // All regions' leaves concatenated into one upload. Each region's
     // EmitRegionUniform.leaf_offset is the index of its first leaf
     // here.
@@ -2069,6 +2176,24 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             }
         };
         let asset_id = asset_id_base + asset_index;
+
+        // Phase 6 Session 3d — tile-cull region uniform. One per
+        // region. `scratch_offset` accumulates: each region's slice
+        // covers `instance_block_size` consecutive entries in the
+        // scratch buffer. The AABB pass writes there; count + scatter
+        // (per-VR) read.
+        tile_cull_regions.push(rkp_render::user_shader_tile_cull_pass::TileCullRegionUniform {
+            region_index,
+            asset_id,
+            material_id: req.material_id,
+            shader_id,
+            instance_block_offset: region_uniform.instance_block_offset,
+            instance_block_size: region_uniform.instance_block_size,
+            instance_stride_u32: region_uniform.instance_stride_u32,
+            scratch_offset: tile_cull_scratch_running_offset,
+        });
+        tile_cull_scratch_running_offset = tile_cull_scratch_running_offset
+            .saturating_add(region_uniform.instance_block_size);
 
         // Per-leaf instance emit — one host instance per painted leaf.
         // Each instance points at its own slot in `instance_pool` via
@@ -2379,6 +2504,84 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             state.renderer.profiler.end_query(&mut encoder, scatter_q);
         }
 
+        // 8c. Phase 6 Session 3d — tile-cull AABB pass. Per region,
+        //     one workgroup-grid sized to its `instance_block_size`;
+        //     each thread reads the per-instance state from
+        //     `instance_pool` and writes one `InstanceTileCullEntry`
+        //     into `instance_tile_cull_scratch_buffer`. Per-VR
+        //     count/prefix/scatter dispatches downstream consume
+        //     this scratch.
+        if !tile_cull_regions.is_empty() {
+            // Ensure scratch buffer is large enough for the running
+            // total computed during region walk. 48 B per entry.
+            let scratch_total_entries = tile_cull_scratch_running_offset.max(1);
+            ensure_tile_cull_scratch_capacity(state, scratch_total_entries);
+
+            // Reload the pipeline against the current user-shader
+            // chunks. Cheap when source hash unchanged.
+            state.instance_tile_cull_pass.reload_user_shaders(
+                &state.device,
+                &frame.user_shader_inst_to_local_chunk,
+                &frame.user_shader_inst_aabb_chunk,
+                frame.user_shader_source_hash,
+            );
+
+            // Upload region uniforms — one per region, 256 B stride
+            // per wgpu's dynamic-offset alignment. Pad with zero bytes
+            // between records; we only read the first 32 B per slot.
+            const STRIDE: usize = rkp_render::user_shader_tile_cull_pass::TILE_CULL_REGION_UNIFORM_STRIDE as usize;
+            let mut region_bytes: Vec<u8> = vec![0u8; tile_cull_regions.len() * STRIDE];
+            for (i, r) in tile_cull_regions.iter().enumerate() {
+                let off = i * STRIDE;
+                let end = off + std::mem::size_of::<rkp_render::user_shader_tile_cull_pass::TileCullRegionUniform>();
+                region_bytes[off..end].copy_from_slice(bytemuck::bytes_of(r));
+            }
+            state.queue.write_buffer(
+                &state.instance_tile_cull_pass.regions_buffer, 0, &region_bytes,
+            );
+
+            // Bind groups — group(0) shared across all per-region
+            // dispatches; group(1) takes a dynamic offset per region.
+            let cull_g0 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("inst tile_cull g0"),
+                layout: &state.instance_tile_cull_pass.group0_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: state.renderer.scene.instance_pool_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: state.instance_emit_pass.instance_alloc_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: state.instance_tile_cull_scratch_buffer.as_entire_binding() },
+                ],
+            });
+            let cull_g1 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("inst tile_cull g1 (dynamic)"),
+                layout: &state.instance_tile_cull_pass.group1_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &state.instance_tile_cull_pass.regions_buffer,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<rkp_render::user_shader_tile_cull_pass::TileCullRegionUniform>() as u64,
+                        ),
+                    }),
+                }],
+            });
+
+            let cull_q = state.renderer.profiler.begin_query("inst_tile_cull", &mut encoder);
+            for (i, r) in tile_cull_regions.iter().enumerate() {
+                let dynamic_offset = (i * STRIDE) as u32;
+                let wgs = rkp_render::user_shader_tile_cull_pass::workgroups_for_region(r.instance_block_size);
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("inst tile_cull"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&state.instance_tile_cull_pass.pipeline);
+                cpass.set_bind_group(0, &cull_g0, &[]);
+                cpass.set_bind_group(1, &cull_g1, &[dynamic_offset]);
+                cpass.dispatch_workgroups(wgs, 1, 1);
+            }
+            state.renderer.profiler.end_query(&mut encoder, cull_q);
+        }
+
         state.queue.submit(Some(encoder.finish()));
     }
 
@@ -2389,6 +2592,7 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
     InstancePipelineResult {
         user_shader_assets,
         user_shader_instances,
+        tile_cull_scratch_count: tile_cull_scratch_running_offset,
     }
 }
 
@@ -2472,6 +2676,228 @@ struct InstancePipelineResult {
     /// matching user-shader asset (offset by `frame.gpu_assets.len()`
     /// plus the asset's index in `user_shader_assets`).
     user_shader_instances: Vec<rkp_render::rkp_gpu_object::RkpGpuInstance>,
+    /// Phase 6 Session 3d — total entry count in
+    /// `instance_tile_cull_scratch_buffer` after the AABB pass writes.
+    /// Equal to `Σ instance_block_size` across all regions; the per-VR
+    /// count/scatter dispatches use this as their thread count.
+    /// Zero when no user-shader regions ran this frame.
+    tile_cull_scratch_count: u32,
+}
+
+/// Phase 6 Session 3d — per-VR tile-cull dispatch chain.
+///
+/// Runs count → prefix → scatter against `state.instance_tile_cull_scratch_buffer`
+/// (filled by `tick_instance_pipeline`'s AABB pass), writing per-tile
+/// entry lists into `vr.march.us_tile_offsets` / `us_tile_entries`. The
+/// host march doesn't yet read these (Session 4 wires that consumer);
+/// Session 3d is purely "make the dispatch chain run end-to-end".
+///
+/// Skipped entirely when `scratch_count == 0` (no user-shader
+/// instances this frame).
+/// Pre-borrowed handles to RenderState's tile-cull fields. The caller
+/// constructs this at the call site so the inner helper doesn't need
+/// `&mut RenderState` (which would conflict with the outer
+/// `viewport_renderers.get_mut(...)`).
+struct UsTileCullArgs<'a> {
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    /// Renderer borrow only used to access `profiler`. Held as
+    /// `&mut RkpRenderer` rather than the inner profiler so engine
+    /// callers don't need a `wgpu_profiler` import.
+    renderer: &'a mut rkp_render::rkp_renderer::RkpRenderer,
+    scratch_buffer: &'a wgpu::Buffer,
+    view_uniform_buffer: &'a wgpu::Buffer,
+    prefix_uniform_buffer: &'a wgpu::Buffer,
+    tile_count_pass: &'a rkp_render::user_shader_tile_count_pass::TileCountPass,
+    tile_prefix_pass: &'a rkp_render::user_shader_tile_prefix_pass::TilePrefixPass,
+    tile_scatter_pass: &'a rkp_render::user_shader_tile_scatter_pass::TileScatterPass,
+}
+
+fn dispatch_us_tile_cull_inner(
+    args: UsTileCullArgs,
+    vr: &mut rkp_render::ViewportRenderer,
+    encoder: &mut wgpu::CommandEncoder,
+    camera: &rkp_render::rkp_scene::CameraUniforms,
+    width: u32,
+    height: u32,
+    scratch_count: u32,
+) {
+    use rkp_render::user_shader_tile_count_pass::{
+        tile_count_for_viewport, workgroups_for_scratch, TileCullViewportUniform,
+    };
+    use rkp_render::user_shader_tile_prefix_pass::{PrefixUniform, PREFIX_MAX_TILES};
+
+    let (tile_count_x, tile_count_y, tile_count) = tile_count_for_viewport(width, height);
+    if tile_count > PREFIX_MAX_TILES {
+        // V1 cap: skip the entire VR rather than producing partial
+        // results. Above 65536 tiles (~2300×800 at 8 px tiles) the
+        // single-WG prefix-sum can't scan in one dispatch; multi-WG
+        // scan is a follow-up.
+        eprintln!(
+            "[tile_cull] tile_count {tile_count} > PREFIX_MAX_TILES {PREFIX_MAX_TILES} \
+             ({width}×{height}); skipping VR"
+        );
+        return;
+    }
+
+    // Conservative entries estimate: each AABB might cover up to ~64
+    // tiles on average (8×8 px tile rect at typical viewing distances).
+    // Realistic worst case is much less; we round up + grow on demand.
+    let entries_estimate = scratch_count.saturating_mul(64).max(1024);
+    let _grew_entries = vr.march.ensure_us_tile_entries_capacity(args.device, entries_estimate);
+    let _grew_grid = vr.march.ensure_us_tile_grid_capacity(args.device, tile_count);
+
+    // Upload the shared per-VR uniform buffers.
+    let view_u = TileCullViewportUniform {
+        view_proj: camera.view_proj,
+        resolution_x: width as f32,
+        resolution_y: height as f32,
+        tile_count_x,
+        tile_count_y,
+        tile_count,
+        scratch_count,
+        _pad0: 0,
+        _pad1: 0,
+    };
+    args.queue.write_buffer(
+        args.view_uniform_buffer, 0, bytemuck::bytes_of(&view_u),
+    );
+    let prefix_u = PrefixUniform {
+        tile_count, _pad0: 0, _pad1: 0, _pad2: 0,
+    };
+    args.queue.write_buffer(
+        args.prefix_uniform_buffer, 0, bytemuck::bytes_of(&prefix_u),
+    );
+
+    // Reset us_tile_counts to zeros for this VR. clear_buffer requires
+    // the encoder; size is `tile_count * 4` rounded up to a multiple
+    // of `wgpu::COPY_BUFFER_ALIGNMENT` (= 4) — already aligned.
+    encoder.clear_buffer(
+        &vr.march.us_tile_counts_buffer,
+        0,
+        Some((tile_count as u64) * 4),
+    );
+
+    // ── Bind groups ──────────────────────────────────────────────────
+    // Count pass: scratch (ro) + counts (rw atomic) + view uniform.
+    let count_g0 = args.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("inst tile_count g0"),
+        layout: &args.tile_count_pass.group0_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: args.scratch_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: vr.march.us_tile_counts_buffer.as_entire_binding() },
+        ],
+    });
+    let count_g1 = args.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("inst tile_count g1"),
+        layout: &args.tile_count_pass.group1_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: args.view_uniform_buffer.as_entire_binding(),
+        }],
+    });
+
+    // Prefix pass: counts (ro) + offsets (rw) + prefix uniform.
+    let prefix_g0 = args.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("inst tile_prefix g0"),
+        layout: &args.tile_prefix_pass.group0_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: vr.march.us_tile_counts_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: vr.march.us_tile_offsets_buffer.as_entire_binding() },
+        ],
+    });
+    let prefix_g1 = args.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("inst tile_prefix g1"),
+        layout: &args.tile_prefix_pass.group1_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: args.prefix_uniform_buffer.as_entire_binding(),
+        }],
+    });
+
+    // Scatter pass: scratch (ro) + scatter_cursor (rw atomic) +
+    // entries (rw) + view uniform.
+    let scatter_g0 = args.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("inst tile_scatter g0"),
+        layout: &args.tile_scatter_pass.group0_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: args.scratch_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: vr.march.us_tile_scatter_cursor_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: vr.march.us_tile_entries_buffer.as_entire_binding() },
+        ],
+    });
+    let scatter_g1 = args.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("inst tile_scatter g1"),
+        layout: &args.tile_scatter_pass.group1_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: args.view_uniform_buffer.as_entire_binding(),
+        }],
+    });
+
+    // ── Dispatches ──────────────────────────────────────────────────
+    let q = args.renderer.profiler.begin_query("inst_tile_dispatch", encoder);
+
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("inst tile_count"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&args.tile_count_pass.pipeline);
+        cpass.set_bind_group(0, &count_g0, &[]);
+        cpass.set_bind_group(1, &count_g1, &[]);
+        cpass.dispatch_workgroups(workgroups_for_scratch(scratch_count), 1, 1);
+    }
+
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("inst tile_prefix"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&args.tile_prefix_pass.pipeline);
+        cpass.set_bind_group(0, &prefix_g0, &[]);
+        cpass.set_bind_group(1, &prefix_g1, &[]);
+        // Single workgroup — see PREFIX_MAX_TILES contract.
+        cpass.dispatch_workgroups(1, 1, 1);
+    }
+
+    // Initialize scatter_cursor[t] = us_tile_offsets[t] for t in
+    // [0, tile_count). The scatter pass atomicAdd's into cursor, so
+    // each entry's slot lands in [offsets[t], offsets[t+1]) — leaving
+    // us_tile_offsets unchanged for the host march to read.
+    vr.march.init_scatter_cursor(encoder, tile_count);
+
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("inst tile_scatter"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&args.tile_scatter_pass.pipeline);
+        cpass.set_bind_group(0, &scatter_g0, &[]);
+        cpass.set_bind_group(1, &scatter_g1, &[]);
+        cpass.dispatch_workgroups(workgroups_for_scratch(scratch_count), 1, 1);
+    }
+
+    args.renderer.profiler.end_query(encoder, q);
+}
+
+/// Phase 6 Session 3d — grow `instance_tile_cull_scratch_buffer` to
+/// fit `needed_entries` × 48 B `InstanceTileCullEntry` records.
+fn ensure_tile_cull_scratch_capacity(state: &mut RenderState, needed_entries: u32) {
+    if needed_entries <= state.instance_tile_cull_scratch_capacity_entries {
+        return;
+    }
+    let mut new_cap = state.instance_tile_cull_scratch_capacity_entries.max(1);
+    while new_cap < needed_entries {
+        new_cap = new_cap.saturating_mul(2);
+    }
+    state.instance_tile_cull_scratch_buffer = state.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("inst tile_cull_scratch"),
+        size: (new_cap as u64) * 48,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    state.instance_tile_cull_scratch_capacity_entries = new_cap;
 }
 
 /// Grow `instance_leaves_buffer` to fit `needed_entries`. No-op when
