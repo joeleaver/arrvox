@@ -83,6 +83,11 @@ pub mod user_shader_proto_pass;
 /// granularity, atomic-appending placed instances into a per-region
 /// slice of a global instance pool.
 pub mod user_shader_emit_pass;
+/// Phase 6 — user-shader tile-cull AABB compute pass. Per filled
+/// instance slot in `instance_pool`, dispatches the user shader's
+/// `inst_aabb` hook to build a world-space AABB scratch buffer the
+/// downstream tile-cull (count + prefix + scatter) consumes.
+pub mod user_shader_tile_cull_pass;
 /// Skeletal skin-deform scatter pass — per-frame bone-field writer.
 pub mod skin_deform;
 /// CPU-side paint writes against the scene's LeafAttrPool (material +
