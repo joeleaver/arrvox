@@ -507,7 +507,7 @@ fn bake_sphere_prototype(
     }
     queue.write_buffer(octree_buffer, (entry.octree_extent.0 as u64) * 8, &octree_init);
 
-    pass.reset_cursors(queue);
+    pass.reset_cursors(queue, 0, 0);
     queue.write_buffer(&pass.overflow_buffer, 0, &[0u8; 12 * 4]);
     queue.write_buffer(&pass.proto_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
 

@@ -160,6 +160,30 @@ pub const PROTO_BRICK_POOL_CAPACITY: u32 = 256 * 1024;
 /// allocated globally at GPU bake time.
 pub const PROTO_LEAF_ATTR_POOL_CAPACITY: u32 = 4 * 1024 * 1024;
 
+/// Phase 4 — proto-tail reservation in the host scene buffers.
+///
+/// Sized tight enough that adding `cpu_*_bytes + proto_tail + Phase C
+/// transient` doesn't breach `max_storage_buffer_binding_size` (1 GB).
+/// Phase C's transients are huge (~768 MB on the brick buffer at
+/// MAX_GLOBAL_BRICKS = 3M), so the proto tail must be small.
+///
+/// Capacity for a typical project: a few `@instance_proto` shaders at
+/// depth 4-6 (grass, foliage, pebbles). Depth 6 sparse = ~300 K octree
+/// nodes / ~10 K bricks / ~80 K leaf-attrs per shader. The reservations
+/// below comfortably hold ~5 such shaders simultaneously.
+///
+/// Depth-8 prototypes overflow these — that's intentional. The dedicated
+/// proto buffers (PROTO_*_CAPACITY_BYTES) sized for depth-8 worst-case
+/// are dead code post-Phase 5; proto data now lives in the host pools.
+/// Authors needing depth-8 should instead reduce paint area or cell_size.
+///
+/// 2 M octree nodes × 8 B = 16 MB.
+pub const PROTO_TAIL_OCTREE_BYTES: u64 = 16 * 1024 * 1024;
+/// 64 K bricks × 64 cells × 4 B = 16 MB.
+pub const PROTO_TAIL_BRICK_BYTES: u64 = 16 * 1024 * 1024;
+/// 1 M leaf-attr slots × 8 B = 8 MB.
+pub const PROTO_TAIL_LEAF_ATTR_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Persistent prototype cache.
 ///
 /// Octree extents are per-prototype contiguous (the dense spine demands
@@ -222,27 +246,36 @@ impl PrototypeCache {
         }
     }
 
-    /// Configure the GPU offsets where the prototype-only sub-pool
-    /// begins. Coordinated by the engine layer (Stage 5+) so the
-    /// prototype range is disjoint from the per-region transient
-    /// range. Stage 6e moved the proto pool to dedicated buffers; the
-    /// expected call is `set_pool_bases(0, 0, 0)`.
+    /// Configure the GPU offsets where the prototype sub-pool begins.
+    /// Coordinated by the engine layer so the prototype range is
+    /// disjoint from the per-region transient range.
+    ///
+    /// Phase 4 — bases now point into the host scene's main pool tails
+    /// (not the dedicated proto buffers, which become dead code in
+    /// Phase 5). When bases shift (e.g. CPU geometry data grows past
+    /// the previous proto base), the cache flushes and every entry
+    /// re-bakes at the new base.
+    ///
+    /// Returns `true` iff the bases changed — the caller must also
+    /// reset the GPU cursor buffer to `(brick_base, leaf_attr_base)` so
+    /// the next bake's atomic-bumps land at the new offsets.
     pub fn set_pool_bases(
         &mut self,
         pool_octree_base: u32,
         pool_brick_base: u32,
         pool_leaf_attr_base: u32,
-    ) {
+    ) -> bool {
         if self.pool_octree_base == pool_octree_base
             && self.pool_brick_base == pool_brick_base
             && self.pool_leaf_attr_base == pool_leaf_attr_base
         {
-            return;
+            return false;
         }
         self.flush();
         self.pool_octree_base = pool_octree_base;
         self.pool_brick_base = pool_brick_base;
         self.pool_leaf_attr_base = pool_leaf_attr_base;
+        true
     }
 
     pub fn pool_octree_base(&self) -> u32 { self.pool_octree_base }
@@ -424,8 +457,13 @@ pub const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu32;
 ///
 /// Brick + leaf-attr ranges are GLOBAL across prototypes — no per-bake
 /// offset; the bake atomic-bumps a single cursor pair from
-/// [`PrototypeBakePass`]. The two `*_capacity` fields are pool-wide
-/// caps the bake uses to gate overflow into [`OVERFLOW_*`] counters.
+/// [`PrototypeBakePass`]. The two `*_capacity` fields are ABSOLUTE
+/// upper bounds the bake uses to gate overflow: bake stops emitting
+/// when `brick_id >= brick_capacity` or `leaf_attr_id >= leaf_attr_capacity`.
+/// Cursors start at `pool_brick_base` / `pool_leaf_attr_base` (proto
+/// reservation start in the host pool), so the capacities below are
+/// `pool_*_base + reservation_size` — i.e. the slot just past the
+/// proto reservation.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PrototypeUniform {
@@ -443,12 +481,20 @@ const _: () = assert!(std::mem::size_of::<PrototypeUniform>() == 32);
 
 impl PrototypeUniform {
     pub fn from_entry(entry: &PrototypeEntry, cache: &PrototypeCache) -> Self {
+        // Absolute upper bounds in the host pool: cursor starts at
+        // pool_*_base, so the cap is base + reservation_size.
+        let brick_cap_abs = cache
+            .pool_brick_base
+            .saturating_add(cache.pool_brick_capacity);
+        let leaf_attr_cap_abs = cache
+            .pool_leaf_attr_base
+            .saturating_add(cache.pool_leaf_attr_capacity);
         Self {
             shader_id: entry.shader_id,
             max_depth: entry.max_depth,
             octree_leaf_offset: entry.octree_leaf_offset(cache.pool_octree_base),
-            brick_capacity: cache.pool_brick_capacity,
-            leaf_attr_capacity: cache.pool_leaf_attr_capacity,
+            brick_capacity: brick_cap_abs,
+            leaf_attr_capacity: leaf_attr_cap_abs,
             _pad0: 0,
             _pad1: 0,
             _pad2: 0,
@@ -563,12 +609,23 @@ impl PrototypeBakePass {
         }
     }
 
-    /// Reset the GPU brick + leaf-attr cursors to zero. Pair with
-    /// [`PrototypeCache::flush`] / [`PrototypeCache::dirty_all`] for a
-    /// full pool reset; otherwise live prototypes' baked slots become
-    /// unreferenceable from new bakes.
-    pub fn reset_cursors(&self, queue: &wgpu::Queue) {
-        queue.write_buffer(&self.cursors_buffer, 0, &[0u8; 8]);
+    /// Initialize the GPU brick + leaf-attr atomic cursors to the proto
+    /// pool's base offsets in the host scene buffers. The bake compute
+    /// shader bumps these and uses the bumped values directly as
+    /// brick_id / leaf_attr_id, so a cursor starting at
+    /// `proto_brick_base` ⇒ first baked brick lands at host-pool
+    /// `proto_brick_base + 0`.
+    ///
+    /// Call this whenever the proto pool bases change (e.g. on first
+    /// frame, or when CPU geometry growth shifts the proto base). Pair
+    /// with [`PrototypeCache::flush`] / [`PrototypeCache::dirty_all`] —
+    /// otherwise live prototypes' baked slots become unreferenceable
+    /// from new bakes.
+    pub fn reset_cursors(&self, queue: &wgpu::Queue, brick_base: u32, leaf_attr_base: u32) {
+        let mut bytes = [0u8; 8];
+        bytes[0..4].copy_from_slice(&brick_base.to_le_bytes());
+        bytes[4..8].copy_from_slice(&leaf_attr_base.to_le_bytes());
+        queue.write_buffer(&self.cursors_buffer, 0, &bytes);
     }
 
     /// Re-build the compute pipeline against a fresh user-shader chunk.
@@ -874,8 +931,11 @@ mod tests {
         let u = PrototypeUniform::from_entry(&entry, &cache);
         assert_eq!(u.shader_id, 7);
         assert_eq!(u.max_depth, 2);
-        assert_eq!(u.brick_capacity, 1024);
-        assert_eq!(u.leaf_attr_capacity, 32_768);
+        // Phase 4 — capacities are ABSOLUTE upper bounds (base +
+        // reservation_size), so the bake's `id >= capacity` check
+        // works against the cursor that starts at `base`.
+        assert_eq!(u.brick_capacity, 2000 + 1024);
+        assert_eq!(u.leaf_attr_capacity, 3000 + 32_768);
         // octree_leaf_offset = pool_octree_base + extent.0 + level_starts[max_depth]
         let level_starts = level_starts_inclusive(2);
         let expected = 1000 + entry.octree_extent.0 + level_starts[2];

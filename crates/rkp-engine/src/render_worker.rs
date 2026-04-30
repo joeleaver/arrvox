@@ -372,14 +372,24 @@ struct RenderState {
 const MIN_FRAME_CALLBACK_INTERVAL: std::time::Duration =
     std::time::Duration::from_micros(8_300);
 
-// Option B proto-cache pool capacities. Must match
-// `PROTO_*_CAPACITY_BYTES` in `rkp_scene.rs` — the cache sub-allocates
-// within those GPU buffers, and out-of-bounds writes (via the global
-// brick / leaf-attr cursors) get gated by the bake's overflow check
-// against these caps.
-const INSTANCE_PROTO_OCTREE_CAPACITY_U32: u32 = 32 * 1024 * 1024;       // 32 M nodes (256 MB)
-const INSTANCE_PROTO_BRICK_CAPACITY_BRICKS: u32 = 256 * 1024;           // 256 K bricks (64 MB)
-const INSTANCE_PROTO_LEAF_ATTR_CAPACITY_U32: u32 = 4 * 1024 * 1024;     // 4 M slots (32 MB)
+// Option B proto-cache pool capacities — Phase 4 sizes. Must match the
+// `PROTO_TAIL_*_BYTES` reservation `tick_instance_pipeline` requests in
+// the host scene buffers. The cache sub-allocates octree slots within
+// `pool_octree_capacity`, and the bake's overflow check uses these to
+// gate out-of-bounds writes (via the global brick / leaf-attr cursors).
+//
+// Smaller than the pre-Phase-4 dedicated proto-buffer caps (32 M /
+// 256 K / 4 M) on purpose: the proto tail lives inside the host pool
+// alongside Phase C's much larger transient tail, so the proto budget
+// has to stay tight to keep the total under `max_buffer_size`. Authors
+// needing more proto headroom should reduce paint area or cell_size,
+// not these caps.
+const INSTANCE_PROTO_OCTREE_CAPACITY_U32: u32 =
+    (rkp_render::user_shader_proto_pass::PROTO_TAIL_OCTREE_BYTES / 8) as u32; // 2 M nodes
+const INSTANCE_PROTO_BRICK_CAPACITY_BRICKS: u32 =
+    (rkp_render::user_shader_proto_pass::PROTO_TAIL_BRICK_BYTES / 256) as u32; // 64 K bricks
+const INSTANCE_PROTO_LEAF_ATTR_CAPACITY_U32: u32 =
+    (rkp_render::user_shader_proto_pass::PROTO_TAIL_LEAF_ATTR_BYTES / 8) as u32; // 1 M slots
 
 impl RenderState {
     fn new(init: RenderInit) -> Self {
@@ -1080,7 +1090,8 @@ fn render_one_frame(
     //      `cpu + user_shader_max + proto_max` envelope when there's
     //      any instance work, then run_user_shader_geom's own reservation
     //      is a no-op (buffer already big enough).
-    let instance_counts = tick_instance_pipeline(state, frame);
+    let inst_result = tick_instance_pipeline(state, frame);
+    let instance_counts = inst_result.counts;
 
     // 1.7b. User-shader geometry pass (Phase C). Reserve transient
     //       pool tail, reload pipeline if the shader source changed,
@@ -1093,23 +1104,42 @@ fn render_one_frame(
     //       the combined assets vec. The march/shade passes treat
     //       transients identically to bake-built objects — same
     //       octree node encoding, same leaf attr layout.
-    let asset_id_base = frame.gpu_assets.len() as u32;
+    //
+    //       Phase 4 — blade assets/instances from `tick_instance_pipeline`
+    //       go BETWEEN the host's persistent set and Phase C's transient
+    //       set. Phase C's `asset_id_base` shifts up to account for the
+    //       blade assets so its per-instance `asset_id` references stay
+    //       correct after splicing.
+    let asset_id_base =
+        frame.gpu_assets.len() as u32 + inst_result.blade_assets.len() as u32;
     let (transient_assets, transient_instances) =
         run_user_shader_geom(state, frame, asset_id_base);
 
     let mut combined_assets: Vec<rkp_render::rkp_gpu_object::RkpGpuAsset>;
     let mut combined_instances: Vec<rkp_render::rkp_gpu_object::RkpGpuInstance>;
+    let need_combine = !inst_result.blade_assets.is_empty()
+        || !transient_instances.is_empty();
     let (assets_for_upload, instances_for_upload): (
         &[rkp_render::rkp_gpu_object::RkpGpuAsset],
         &[rkp_render::rkp_gpu_object::RkpGpuInstance],
-    ) = if transient_instances.is_empty() {
+    ) = if !need_combine {
         (frame.gpu_assets.as_slice(), gpu_instances)
     } else {
-        combined_assets = Vec::with_capacity(frame.gpu_assets.len() + transient_assets.len());
+        combined_assets = Vec::with_capacity(
+            frame.gpu_assets.len()
+                + inst_result.blade_assets.len()
+                + transient_assets.len(),
+        );
         combined_assets.extend_from_slice(&frame.gpu_assets);
+        combined_assets.extend_from_slice(&inst_result.blade_assets);
         combined_assets.extend_from_slice(&transient_assets);
-        combined_instances = Vec::with_capacity(gpu_instances.len() + transient_instances.len());
+        combined_instances = Vec::with_capacity(
+            gpu_instances.len()
+                + inst_result.blade_instances.len()
+                + transient_instances.len(),
+        );
         combined_instances.extend_from_slice(gpu_instances);
+        combined_instances.extend_from_slice(&inst_result.blade_instances);
         combined_instances.extend_from_slice(&transient_instances);
         (combined_assets.as_slice(), combined_instances.as_slice())
     };
@@ -1181,20 +1211,69 @@ fn render_one_frame(
     };
 
     // Object count comes from the interpolated list plus any
-    // transient user-shader instances appended by `run_user_shader_geom`.
-    // Transient instances sit at the tail of `objects_buffer`, indices
-    // `gpu_instances.len()..gpu_instances.len()+transient_instances.len()`.
+    // transient user-shader instances appended by `run_user_shader_geom`
+    // AND any blade instances appended by `tick_instance_pipeline`.
+    // Layout in `objects_buffer`:
+    //   [persistent | blade | transient]
+    let blade_count = inst_result.blade_instances.len() as u32;
     let transient_count = transient_instances.len() as u32;
     let persistent_count = gpu_instances.len() as u32;
-    let object_count = persistent_count + transient_count;
-    // Transient object ids the per-VR tile list rebuild splices into
-    // every tile. Sim's tile_object_ids only enumerated persistent
-    // objects, so without this the march would never visit transient
-    // bricks no matter how many were uploaded.
+    let object_count = persistent_count + blade_count + transient_count;
+    // Phase C transients keep the broadcast splice path — one transient
+    // region typically covers the painted entity's whole AABB, so it's
+    // visible from most tiles. Blades, by contrast, are tiny per-instance
+    // (~3 cm cubes) — broadcasting 1700+ blade indices into every tile
+    // explodes the buffer (32K tiles × 1700 = 56M entries on a 1080p
+    // viewport). Below we cull blades properly via per-blade screen
+    // AABBs and merge their per-tile lists into sim's.
     let transient_indices: Vec<u32> =
-        (persistent_count..persistent_count + transient_count).collect();
+        (persistent_count + blade_count..persistent_count + blade_count + transient_count)
+            .collect();
+    // Per-VR blade tile_lists, computed render-thread-side. Empty if no
+    // blades; otherwise one TileLists per viewport keyed by index in
+    // `frame.viewports`.
+    let blade_tile_lists_per_vp: Vec<Option<crate::scene_sync::TileLists>> = if blade_count == 0 {
+        Vec::new()
+    } else {
+        // Build a single combined assets vec the screen-AABB pass can
+        // index into via blade.asset_id (which already accounts for
+        // asset_id_base = frame.gpu_assets.len()).
+        let mut combined_for_aabb = Vec::with_capacity(
+            frame.gpu_assets.len() + inst_result.blade_assets.len(),
+        );
+        combined_for_aabb.extend_from_slice(&frame.gpu_assets);
+        combined_for_aabb.extend_from_slice(&inst_result.blade_assets);
 
-    for vp in &frame.viewports {
+        frame
+            .viewports
+            .iter()
+            .map(|vp| {
+                if vp.width == 0 || vp.height == 0 {
+                    return None;
+                }
+                let aabbs = crate::scene_sync::compute_screen_aabbs(
+                    &inst_result.blade_instances,
+                    &combined_for_aabb,
+                    &vp.vp_matrix,
+                    vp.width as f32,
+                    vp.height as f32,
+                );
+                let mut lists = crate::scene_sync::build_tile_lists(
+                    &aabbs, vp.width, vp.height,
+                );
+                // Shift blade ids into the combined-instances index
+                // space — blades live at indices
+                // [persistent_count..persistent_count+blade_count) in
+                // the per-frame `objects_buffer`.
+                for id in &mut lists.object_ids {
+                    *id += persistent_count;
+                }
+                Some(lists)
+            })
+            .collect()
+    };
+
+    for (vp_idx, vp) in frame.viewports.iter().enumerate() {
         // Override `prev_vp` (and the parallel `prev_view_proj` field
         // on the volumetric params) with the view_proj we actually
         // rendered last for THIS viewport. Sim bakes its previous
@@ -1297,19 +1376,22 @@ fn render_one_frame(
         //     proc_raymarch, shadow, ssao, shade, vol, god_rays, bloom,
         //     bloom_composite, tone_map, composite, grid).
         //
-        // When transient user-shader objects exist, splice their
-        // indices into every tile's list so the march visits them
-        // alongside persistent objects. Sim's tile_object_ids only
-        // enumerated persistent objects (sim doesn't see the
-        // render-thread-built transient list); cheap to fix here as
-        // a per-frame O(tiles × transient_count) rebuild.
+        // Merge per-tile object lists across three sources:
+        //   - sim's persistent objects (`vp.tile_*_bytes`, already culled)
+        //   - per-blade culled lists (`blade_tile_lists_per_vp[vp_idx]`)
+        //   - Phase C transient indices (broadcast to every tile;
+        //     small N, mostly used for whole-entity user-shader regions)
+        // No-op pass-through when none of the three contribute.
+        let blade_lists = blade_tile_lists_per_vp.get(vp_idx).and_then(|x| x.as_ref());
         let (effective_tile_offsets, effective_tile_object_ids);
-        let (tile_offsets_ref, tile_object_ids_ref): (&[u8], &[u8]) = if transient_count == 0 {
+        let need_merge = blade_lists.is_some() || !transient_indices.is_empty();
+        let (tile_offsets_ref, tile_object_ids_ref): (&[u8], &[u8]) = if !need_merge {
             (&vp.tile_offsets_bytes, &vp.tile_object_ids_bytes)
         } else {
-            let (offsets, ids) = splice_transient_into_tile_lists(
+            let (offsets, ids) = merge_tile_lists(
                 &vp.tile_offsets_bytes,
                 &vp.tile_object_ids_bytes,
+                blade_lists,
                 &transient_indices,
             );
             effective_tile_offsets = offsets;
@@ -1336,37 +1418,26 @@ fn render_one_frame(
             vp.preview_mode,
         );
 
-        // 3h.5. Stage 6c-3.5b — per-VR Option B instance overlay.
-        // Encodes both the per-pixel march and the G-buffer composite.
-        // Until Stage 6c-3.5c lands the bake/scatter half, both
-        // `tile_index_count` and `proto_lookup_count` are 0; the march
-        // writes hit=0 to every pixel and the composite passes the host
-        // G-buffer through to `instance_merged_gbuffer` unchanged. Stage
-        // 6c-4 rebinds shade to read from `instance_merged_gbuffer` so
-        // the overlay becomes visible.
-        // Group 0 binds the dedicated proto sub-pool buffers — the
-        // march helpers' octree_nodes/brick_pool/leaf_attr_pool symbols
-        // resolve to PROTO data here. (Host geometry reads happen only
-        // in the emit pass, which has its own bindings.) The shared
-        // `scene.*_buffer`s no longer need to make room for proto.
-        let overlay_inputs = rkp_render::InstanceOverlayInputs {
-            octree_nodes: &state.renderer.scene.proto_octree_buffer,
-            brick_pool: &state.renderer.scene.proto_brick_buffer,
-            leaf_attr_pool: &state.renderer.scene.proto_leaf_attr_buffer,
-            regions: &state.instance_emit_pass.regions_buffer,
-            instance_pool: &state.instance_pool_buffer,
-            instance_alloc: &state.instance_emit_pass.instance_alloc_buffer,
-            tile_index: &state.instance_tile_index_buffer,
-            proto_lookup: &state.instance_proto_lookup_buffer,
-            tile_index_count: instance_counts.tile_index_count,
-            proto_lookup_count: instance_counts.proto_lookup_count,
-        };
-        vr.dispatch_instance_overlay(
-            &state.device,
-            &state.queue,
-            &mut encoder,
-            &mut state.renderer.profiler,
-            &overlay_inputs,
+        // Phase 4 verification — Option B's per-pixel pipeline is
+        // disabled. Foundation check: does the host march alone produce
+        // visible blade output? The proto bake still runs upstream
+        // (writes blade octree into the host pool), and blade
+        // RkpGpuInstance entries are still emitted, so the host march
+        // descends them like any other host asset. If blades appear
+        // here, Phase 4a's foundation is solid and we proceed to 4c
+        // (user shader hooks in host march). If not, there's a real
+        // bug in the host pipeline to chase.
+        //
+        // Shade reads from `vr.gbuffer` (host) instead of
+        // `vr.instance_merged_gbuffer` while this is disabled — the
+        // bind-group selection is set up by `vr.refresh_bindings`
+        // earlier in the loop; we override it below.
+        let _ = (
+            &state.instance_emit_pass,
+            &state.instance_pool_buffer,
+            &state.instance_tile_index_buffer,
+            &state.instance_proto_lookup_buffer,
+            instance_counts,
         );
 
         // 3i. Pick encode — if there's a pending pick targeted at this
@@ -1622,6 +1693,59 @@ fn splice_transient_into_tile_lists(
     (new_offsets, new_ids)
 }
 
+/// Phase 4 — merge sim's per-tile object lists with two render-side
+/// sources: a properly-culled per-tile blade list (one entry per
+/// (tile, blade) where the blade's screen-AABB overlaps the tile), and
+/// a Phase C broadcast list (every tile gets every transient).
+///
+/// For each tile, output is `[sim_persistent | blades_in_tile |
+/// transient_broadcast]`. All three index spaces are disjoint
+/// (persistent < persistent_count ≤ blades < persistent+blade ≤
+/// transient < object_count), so the march can dispatch any of them
+/// without aliasing.
+fn merge_tile_lists(
+    sim_offsets_bytes: &[u8],
+    sim_ids_bytes: &[u8],
+    blade_lists: Option<&crate::scene_sync::TileLists>,
+    transient_broadcast: &[u32],
+) -> (Vec<u32>, Vec<u32>) {
+    let n_tile = if sim_offsets_bytes.is_empty() {
+        0
+    } else {
+        (sim_offsets_bytes.len() / 4).saturating_sub(1)
+    };
+    if n_tile == 0 {
+        return (
+            bytemuck::cast_slice::<u8, u32>(sim_offsets_bytes).to_vec(),
+            bytemuck::cast_slice::<u8, u32>(sim_ids_bytes).to_vec(),
+        );
+    }
+    let sim_offsets: &[u32] = bytemuck::cast_slice(sim_offsets_bytes);
+    let sim_ids: &[u32] = bytemuck::cast_slice(sim_ids_bytes);
+
+    let blade_n_tile = blade_lists.map(|l| l.offsets.len().saturating_sub(1)).unwrap_or(0);
+    let blade_total = blade_lists.map(|l| l.object_ids.len()).unwrap_or(0);
+    let mut new_offsets: Vec<u32> = Vec::with_capacity(n_tile + 1);
+    let mut new_ids: Vec<u32> = Vec::with_capacity(
+        sim_ids.len() + blade_total + n_tile * transient_broadcast.len(),
+    );
+    new_offsets.push(0);
+    for t in 0..n_tile {
+        let sa = sim_offsets[t] as usize;
+        let sb = sim_offsets[t + 1] as usize;
+        new_ids.extend_from_slice(&sim_ids[sa..sb]);
+        if t < blade_n_tile {
+            let lists = blade_lists.expect("blade_n_tile > 0 ⇒ Some");
+            let ba = lists.offsets[t] as usize;
+            let bb = lists.offsets[t + 1] as usize;
+            new_ids.extend_from_slice(&lists.object_ids[ba..bb]);
+        }
+        new_ids.extend_from_slice(transient_broadcast);
+        new_offsets.push(new_ids.len() as u32);
+    }
+    (new_offsets, new_ids)
+}
+
 /// Stage 6c-3.5c — per-frame tick for the Option B instance pipeline.
 ///
 /// Sequence (executed every frame, runs BEFORE `run_user_shader_geom`
@@ -1655,7 +1779,7 @@ fn splice_transient_into_tile_lists(
 ///
 /// Returns `InstancePerFrameCounts` so the per-VR
 /// `dispatch_instance_overlay` knows the binding counts.
-fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> InstancePerFrameCounts {
+fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> InstancePipelineResult {
     use rkp_render::instance_proto_lookup::flatten_prototype_lookup;
     use rkp_render::instance_tile_index::TileIndexBuilder;
     use rkp_render::instance_tile_index_gpu::flatten_tile_index;
@@ -1666,7 +1790,12 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
     };
     use rkp_render::user_shader_proto_pass::{
         build_internal_levels, PrototypeUniform, MAX_PROTO_MAX_DEPTH,
+        PROTO_TAIL_OCTREE_BYTES, PROTO_TAIL_BRICK_BYTES, PROTO_TAIL_LEAF_ATTR_BYTES,
     };
+    use rkp_render::user_shader_pass::{
+        BRICK_CELLS, MAX_GLOBAL_BRICKS, MAX_GLOBAL_LEAF_ATTRS, MAX_GLOBAL_OCTREE_NODES,
+    };
+    use rkp_core::brick_pool::BRICK_DIM;
 
     // 1. Pipeline reload — cheap when source hash unchanged.
     state.instance_proto_pass.reload_user_shaders(
@@ -1709,7 +1838,11 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
     if frame.instance_region_requests.is_empty() {
         state.instance_proto_cache.evict_untouched();
         state.instance_region_cache.evict_untouched();
-        return InstancePerFrameCounts::default();
+        return InstancePipelineResult {
+            counts: InstancePerFrameCounts::default(),
+            blade_assets: Vec::new(),
+            blade_instances: Vec::new(),
+        };
     }
 
     // 4. Snapshot `cpu_*_bytes` from scene_mgr — same shape as
@@ -1724,21 +1857,105 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             g.brick_face_links.len() as u64,
         )
     };
-    // 5. Proto sub-pool lives in DEDICATED `RkpScene::proto_*_buffer`
-    //    fixed-size buffers, so no reservation here. Previously this
-    //    path stacked `cpu + user_shader_extras + proto_extras` onto
-    //    the shared `brick_pool_buffer` / `leaf_attr_pool_buffer` just
-    //    to compute proto base offsets — which pushed the shared
-    //    buffers past memory limits as soon as one Option B shader
-    //    loaded. The user-shader tail itself is still reserved by
-    //    `run_user_shader_geom` on demand. The cpu_*_bytes + face_links
-    //    snapshot above is now unused but kept for the cap-check log.
-    let _ = (cpu_octree_bytes, cpu_brick_bytes, cpu_leaf_attr_bytes, cpu_face_links_bytes);
+    // 5. Phase 4 — reserve the proto tail in the host scene buffers
+    //    (between CPU asset data and Phase C's per-frame transient
+    //    tail). The dedicated `RkpScene::proto_*_buffer` fields stay in
+    //    place but go unused; Phase 5 deletes them once Option B is
+    //    retired. Putting proto data in the host pools means the host
+    //    march descends a baked blade asset via its existing
+    //    `octree_nodes_buffer` / `brick_pool_buffer` / `leaf_attr_pool_buffer`
+    //    bindings — no "which pool?" indirection in the shader.
+    //
+    //    Sized small (16 + 16 + 8 MB) on purpose: the previous attempt
+    //    to layer proto onto cpu + Phase C's huge transient (~768 MB
+    //    on the brick buffer) breached the 1 GB binding cap and was
+    //    rolled back. Tight proto-tail caps stay well within budget.
+    // Reserve the three-tier envelope here. The Phase C transient size
+    // only matters if Phase C will actually dispatch this frame —
+    // run_user_shader_geom early-exits when `user_shader_regions` is
+    // empty, in which case its `ensure_pool_layout` call never runs, so
+    // we don't need to leave room for its extras. Mirror that gate
+    // here: include extras IFF Phase C has work, else just `cpu + proto`.
+    //
+    // Without this gate, sizing for Phase C's extras (~1 GB on the
+    // brick buffer at MAX_GLOBAL_BRICKS = 3M) breaches `max_buffer_size`
+    // on devices that don't support a full 2 GB binding. Pre-Phase-4
+    // tick_instance_pipeline didn't grow the host buffer at all, so the
+    // breach only surfaces now that we route proto data into it.
+    let phase_c_active = !frame.user_shader_regions.is_empty();
+    let extra_octree: u64 = if phase_c_active {
+        MAX_GLOBAL_OCTREE_NODES as u64 * 8
+    } else { 0 };
+    let extra_brick: u64 = if phase_c_active {
+        MAX_GLOBAL_BRICKS as u64 * BRICK_CELLS as u64 * 4
+    } else { 0 };
+    let extra_leaf: u64 = if phase_c_active {
+        MAX_GLOBAL_LEAF_ATTRS as u64 * 8
+    } else { 0 };
+    let extra_face_links: u64 = if phase_c_active {
+        MAX_GLOBAL_BRICKS as u64 * 6 * 4
+    } else { 0 };
+    let proto_brick_count =
+        (PROTO_TAIL_BRICK_BYTES / 4 / BRICK_CELLS as u64) as u32;
+    let proto_face_links_bytes = (proto_brick_count as u64) * 6 * 4;
+    let realloc = state.renderer.scene.ensure_pool_layout(
+        &state.device,
+        cpu_octree_bytes, PROTO_TAIL_OCTREE_BYTES, extra_octree,
+        cpu_brick_bytes, PROTO_TAIL_BRICK_BYTES, extra_brick,
+        cpu_leaf_attr_bytes, PROTO_TAIL_LEAF_ATTR_BYTES, extra_leaf,
+        cpu_face_links_bytes, proto_face_links_bytes, extra_face_links,
+    );
+    if realloc {
+        // A reallocation invalidates any persistent baked data and
+        // forces a full geometry re-upload — the buffer's identity
+        // changed.
+        let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
+        let g = sm.geometry_upload();
+        state.renderer.upload_geometry(&state.queue, &g);
+        state.last_uploaded_geometry_epoch = sm.geometry_epoch();
+        drop(sm);
+        // Initialize the proto + Phase C face_links regions to FACE_EMPTY
+        // (mirrors run_user_shader_geom's existing init for the Phase C
+        // tail). Both regions sit past `cpu_face_links_bytes`.
+        const FACE_EMPTY: u32 = 0xFFFFFFFFu32;
+        const FACE_INIT_CHUNK: usize = 4 * 1024 * 1024;
+        let chunk_data: Vec<u32> = vec![FACE_EMPTY; FACE_INIT_CHUNK];
+        let init_total = proto_face_links_bytes + extra_face_links;
+        let mut written: u64 = 0;
+        while written < init_total {
+            let remaining = (init_total - written) as usize;
+            let this_chunk_bytes = (FACE_INIT_CHUNK * 4).min(remaining);
+            state.queue.write_buffer(
+                &state.renderer.scene.brick_face_links_buffer,
+                cpu_face_links_bytes + written,
+                bytemuck::cast_slice(&chunk_data[..this_chunk_bytes / 4]),
+            );
+            written += this_chunk_bytes as u64;
+        }
+    }
 
-    // 6. Pool bases are 0 — proto offsets are absolute within the
-    //    dedicated proto buffers. set_pool_bases short-circuits on
-    //    no-op so calling unconditionally is cheap.
-    state.instance_proto_cache.set_pool_bases(0, 0, 0);
+    // 6. Configure proto pool bases to point at the host pool tails.
+    //    Element units (octree slot, brick id, leaf-attr slot) — match
+    //    what `RkpGpuAsset.octree_root` / brick_id pointers use.
+    let proto_octree_base_elems = (cpu_octree_bytes / 8) as u32;
+    let proto_brick_base_bricks =
+        (cpu_brick_bytes / 4 / BRICK_CELLS as u64) as u32;
+    let proto_leaf_attr_base_elems = (cpu_leaf_attr_bytes / 8) as u32;
+    let bases_changed = state.instance_proto_cache.set_pool_bases(
+        proto_octree_base_elems,
+        proto_brick_base_bricks,
+        proto_leaf_attr_base_elems,
+    );
+    // On bases-changed (or first frame, or buffer realloc), reset the
+    // GPU cursors to the new bases so the next bake's atomic-bumps
+    // produce slot ids inside the proto reservation.
+    if bases_changed || realloc {
+        state.instance_proto_pass.reset_cursors(
+            &state.queue,
+            proto_brick_base_bricks,
+            proto_leaf_attr_base_elems,
+        );
+    }
 
     // 7. Walk requests, look up cache, gather dirty bakes + scatters.
     struct DirtyBake {
@@ -1759,6 +1976,26 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
     // EmitRegionUniform.leaf_offset is the index of its first leaf
     // here.
     let mut leaves_flat: Vec<PaintedLeaf> = Vec::new();
+
+    // Phase 4 — blade asset registration + per-leaf host-instance emit.
+    // One asset per `@instance_proto` shader (deduped by shader_id);
+    // one host instance per painted leaf. The host march reads these
+    // through the existing pool bindings and treats blade instances
+    // identically to ordinary host objects — so shadows, picking, fog,
+    // GI all "just work" the moment the bake completes.
+    use rkp_render::rkp_gpu_object::{geom_type, RkpGpuAsset, RkpGpuInstance};
+    let mut blade_asset_for_shader: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
+    let mut blade_assets: Vec<RkpGpuAsset> = Vec::new();
+    let mut blade_instances: Vec<RkpGpuInstance> = Vec::new();
+    let asset_id_base = frame.gpu_assets.len() as u32;
+    // Object id space for blade instances — needs to be disjoint from
+    // both host entities (`gpu_to_entity` indices, < gpu_instances.len())
+    // and Option B's per-instance ids (`INSTANCE_OBJECT_ID_BASE`).
+    // Carve out 0xF0XX_XXXX to avoid both. Object ids are only used by
+    // the pick path; collisions would mis-resolve a click.
+    const BLADE_OBJECT_ID_BASE: u32 = 0xF000_0000;
+    let mut blade_object_id_cursor: u32 = BLADE_OBJECT_ID_BASE;
 
     let time_seconds = frame.shade_params_base.time;
     for req in &frame.instance_region_requests {
@@ -1850,6 +2087,86 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
         if let Err(e) = tile_builder.add_request(req, region_index) {
             eprintln!("[inst] tile index error: {e}");
         }
+
+        // Phase 4 — register blade asset (once per shader) and emit
+        // one host instance per painted leaf.
+        //
+        // Per-blade variation (yaw, height jitter, lean, wind sway) is
+        // not yet wired through the host pipeline — this V1 emits a
+        // translation-only world matrix scaled to `req.cell_size`. The
+        // blade is centered on the leaf's world position. Visual fidelity
+        // matches what Option B produced with the emit hook stubbed out;
+        // a follow-up step will hook the user shader's transform back in.
+        let asset_index = match blade_asset_for_shader.get(&shader_id) {
+            Some(&idx) => idx,
+            None => {
+                let idx = blade_assets.len() as u32;
+                let extent = 1.0_f32; // prototype's local-space cube
+                let voxel_size_local =
+                    extent / ((1u32 << proto_entry.max_depth) as f32 * BRICK_DIM as f32);
+                blade_assets.push(RkpGpuAsset {
+                    aabb_min: [0.0, 0.0, 0.0],
+                    octree_root: proto_entry
+                        .octree_root(state.instance_proto_cache.pool_octree_base()),
+                    aabb_max: [extent, extent, extent],
+                    octree_depth: proto_entry.max_depth,
+                    octree_extent_bits: extent.to_bits(),
+                    voxel_size: voxel_size_local,
+                    geom_type: geom_type::VOXELIZED,
+                    bone_count: 0,
+                    grid_origin: [0.0, 0.0, 0.0],
+                    rest_octree_root: 0,
+                    rest_octree_depth: 0,
+                    rest_octree_extent_bits: 0,
+                    _pad: [0; 2],
+                });
+                blade_asset_for_shader.insert(shader_id, idx);
+                idx
+            }
+        };
+        let asset_id = asset_id_base + asset_index;
+
+        // Per-leaf instance emit — one blade per painted host leaf.
+        let half_cell = req.cell_size * 0.5;
+        for leaf in &req.leaves {
+            // World matrix: translate the prototype's [0,1]³ corner to
+            // (leaf_pos − half_cell), then scale by `cell_size` so the
+            // whole prototype occupies a `cell_size`-cube centered on
+            // the leaf. Column-major mat4 (last column = translation).
+            let cs = req.cell_size;
+            let tx = leaf.world_pos[0] - half_cell;
+            let ty = leaf.world_pos[1] - half_cell;
+            let tz = leaf.world_pos[2] - half_cell;
+            let world = [
+                [cs,  0.0, 0.0, 0.0],
+                [0.0, cs,  0.0, 0.0],
+                [0.0, 0.0, cs,  0.0],
+                [tx,  ty,  tz,  1.0],
+            ];
+            let object_id = blade_object_id_cursor;
+            blade_object_id_cursor = blade_object_id_cursor.wrapping_add(1);
+            blade_instances.push(RkpGpuInstance {
+                world,
+                asset_id,
+                material_id: req.material_id,
+                object_id,
+                layer_mask: u32::MAX,
+                is_skinned: 0,
+                bone_buffer_offset: 0,
+                bone_field_offset: 0,
+                bone_field_occ_offset: 0,
+                bone_field_dim_x: 0,
+                bone_field_dim_y: 0,
+                bone_field_dim_z: 0,
+                bone_field_origin_x: 0.0,
+                bone_field_origin_y: 0.0,
+                bone_field_origin_z: 0.0,
+                // No paint overlay on procedurally-emitted blades —
+                // they're rebuilt every frame from the host paint walk.
+                overlay_offset: 0,
+                overlay_count: 0,
+            });
+        }
     }
     // 8. Encode bake + scatter dispatches.
     if !dirty_bakes.is_empty() || !scatters.is_empty() {
@@ -1871,14 +2188,15 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
         };
         for bake in &dirty_bakes {
             // Pre-fill internal octree levels at the proto's reserved
-            // offset. `build_internal_levels` returns the entire
-            // octree subtree's nodes (internal + EMPTY leaf); the bake
-            // fills the leaf level only.
-            // Proto base is 0 — proto octree nodes live in the
-            // dedicated `proto_octree_buffer` at indices reported by
-            // the cache, no shared-pool offset to add.
+            // offset within the host octree pool. `build_internal_levels`
+            // returns the entire octree subtree's nodes (internal +
+            // EMPTY leaf); the bake fills the leaf level only.
+            //
+            // `pool_octree_base = proto_octree_base_elems` so the
+            // internal branches reference children at absolute host-pool
+            // slot indices.
             let internal = build_internal_levels(
-                0,
+                proto_octree_base_elems,
                 bake.octree_extent_offset,
                 bake.max_depth,
             );
@@ -1888,9 +2206,11 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
                 bytes.extend_from_slice(&v0.to_le_bytes());
                 bytes.extend_from_slice(&v1.to_le_bytes());
             }
-            let octree_byte_offset = bake.octree_extent_offset as u64 * 8;
+            // Absolute byte offset in the host octree_nodes_buffer.
+            let octree_byte_offset =
+                (proto_octree_base_elems as u64 + bake.octree_extent_offset as u64) * 8;
             state.queue.write_buffer(
-                &state.renderer.scene.proto_octree_buffer,
+                &state.renderer.scene.octree_nodes_buffer,
                 octree_byte_offset,
                 &bytes,
             );
@@ -1909,14 +2229,18 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
                 bytemuck::bytes_of(&bake.uniform),
             );
 
-            // Build bind groups.
+            // Build bind groups — proto bake now writes into the host
+            // scene's main pool buffers (Phase 4). The atomic cursors
+            // were initialized to `(proto_brick_base, proto_leaf_attr_base)`
+            // in step 6 so the first emitted slot lands at the proto
+            // tail, not at offset 0 (which would clobber CPU asset data).
             let bake_g0 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("inst bake g0"),
                 layout: &state.instance_proto_pass.group0_layout,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: state.renderer.scene.proto_octree_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: state.renderer.scene.proto_brick_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: state.renderer.scene.proto_leaf_attr_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 0, resource: state.renderer.scene.octree_nodes_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: state.renderer.scene.brick_pool_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: state.renderer.scene.leaf_attr_pool_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 3, resource: state.instance_proto_pass.cursors_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 4, resource: state.instance_proto_pass.overflow_buffer.as_entire_binding() },
                 ],
@@ -2133,9 +2457,13 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
     state.instance_proto_cache.evict_untouched();
     state.instance_region_cache.evict_untouched();
 
-    InstancePerFrameCounts {
-        tile_index_count: tile_entries.len() as u32,
-        proto_lookup_count: proto_entries.len() as u32,
+    InstancePipelineResult {
+        counts: InstancePerFrameCounts {
+            tile_index_count: tile_entries.len() as u32,
+            proto_lookup_count: proto_entries.len() as u32,
+        },
+        blade_assets,
+        blade_instances,
     }
 }
 
@@ -2210,6 +2538,24 @@ fn fill_hash_for_inst(
 struct InstancePerFrameCounts {
     tile_index_count: u32,
     proto_lookup_count: u32,
+}
+
+/// What `tick_instance_pipeline` returns: the per-frame counts Option B's
+/// instance overlay still needs (until Phase 5 deletes it), plus
+/// Phase 4's host-side blade asset + instance pair that splices onto
+/// `frame.gpu_assets` / `gpu_instances` so the host march can render
+/// blades natively.
+struct InstancePipelineResult {
+    counts: InstancePerFrameCounts,
+    /// One asset per `@instance_proto` shader, sourced from the proto
+    /// cache's reserved octree slot in the host pool tail. Spliced onto
+    /// the frame's persistent assets vec just like
+    /// `run_user_shader_geom`'s transient assets.
+    blade_assets: Vec<rkp_render::rkp_gpu_object::RkpGpuAsset>,
+    /// One instance per painted host leaf. Each instance points at the
+    /// matching blade asset (offset by `frame.gpu_assets.len()` plus the
+    /// asset's index in `blade_assets`).
+    blade_instances: Vec<rkp_render::rkp_gpu_object::RkpGpuInstance>,
 }
 
 /// Grow `instance_tile_index_buffer` to fit `needed_entries`. No-op
@@ -2301,6 +2647,9 @@ fn run_user_shader_geom(
         RegionUniform, BRICK_CELLS, MAX_GLOBAL_BRICKS, MAX_GLOBAL_LEAF_ATTRS,
         MAX_GLOBAL_OCTREE_NODES, MAX_REGIONS,
     };
+    use rkp_render::user_shader_proto_pass::{
+        PROTO_TAIL_OCTREE_BYTES, PROTO_TAIL_BRICK_BYTES, PROTO_TAIL_LEAF_ATTR_BYTES,
+    };
 
     const FACE_EMPTY: u32 = 0xFFFFFFFFu32;
 
@@ -2342,12 +2691,21 @@ fn run_user_shader_geom(
             g.brick_face_links.len() as u64,
         )
     };
-    let realloc = state.renderer.scene.ensure_user_shader_capacity(
+    // Phase 4 — proto tail sits between CPU and Phase C transient.
+    // The proto reservation matches `tick_instance_pipeline`'s; both
+    // calls grow the buffer to the union, so order doesn't matter.
+    // Phase C's brick range needs face_links covering its absolute
+    // brick_ids; proto's bricks need face_links too, init'd to
+    // FACE_EMPTY so the march cleanly exits proto bricks at boundaries.
+    let proto_brick_count =
+        (PROTO_TAIL_BRICK_BYTES / 4 / BRICK_CELLS as u64) as u32;
+    let proto_face_links_bytes = (proto_brick_count as u64) * 6 * 4;
+    let realloc = state.renderer.scene.ensure_pool_layout(
         &state.device,
-        cpu_octree_bytes, extra_octree,
-        cpu_brick_bytes, extra_brick,
-        cpu_leaf_attr_bytes, extra_leaf,
-        cpu_face_links_bytes, extra_face_links,
+        cpu_octree_bytes, PROTO_TAIL_OCTREE_BYTES, extra_octree,
+        cpu_brick_bytes, PROTO_TAIL_BRICK_BYTES, extra_brick,
+        cpu_leaf_attr_bytes, PROTO_TAIL_LEAF_ATTR_BYTES, extra_leaf,
+        cpu_face_links_bytes, proto_face_links_bytes, extra_face_links,
     );
     if realloc {
         let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
@@ -2358,12 +2716,17 @@ fn run_user_shader_geom(
         // One-time face-links init: the user-shader BFS never writes
         // into this buffer but the march reads it for any
         // user-shader-allocated brick. Uninitialised values would jump
-        // the DDA chain into stale brick_id=0.
+        // the DDA chain into stale brick_id=0. Also covers the proto
+        // range — proto bake doesn't write face_links either, so leaving
+        // them at FACE_EMPTY makes the host march cleanly exit blade
+        // bricks at boundaries (cross-brick navigation within a single
+        // blade is unsupported until a follow-up fix populates them).
+        let init_total_bytes = proto_face_links_bytes + extra_face_links;
         const FACE_INIT_CHUNK: usize = 4 * 1024 * 1024;
         let chunk_data: Vec<u32> = vec![FACE_EMPTY; FACE_INIT_CHUNK];
         let mut written: u64 = 0;
-        while written < extra_face_links {
-            let remaining = (extra_face_links - written) as usize;
+        while written < init_total_bytes {
+            let remaining = (init_total_bytes - written) as usize;
             let this_chunk_bytes = (FACE_INIT_CHUNK * 4).min(remaining);
             state.queue.write_buffer(
                 &state.renderer.scene.brick_face_links_buffer,
@@ -2377,9 +2740,15 @@ fn run_user_shader_geom(
     // 4. Configure pool bases — flushes the cache if they changed.
     //    Also reconcile against the host's geometry epoch (any host
     //    geometry change invalidates every region's topology_hash).
-    let octree_base_elems = (cpu_octree_bytes / 8) as u32;
-    let brick_base_bricks = (cpu_brick_bytes / 4 / BRICK_CELLS as u64) as u32;
-    let leaf_base_elems = (cpu_leaf_attr_bytes / 8) as u32;
+    //    Phase C's transient range starts past the proto reservation
+    //    so blade bricks and Phase C bricks have disjoint brick_ids
+    //    (and disjoint face_links slots).
+    let proto_octree_elems = (PROTO_TAIL_OCTREE_BYTES / 8) as u32;
+    let proto_leaf_attr_elems = (PROTO_TAIL_LEAF_ATTR_BYTES / 8) as u32;
+    let octree_base_elems = (cpu_octree_bytes / 8) as u32 + proto_octree_elems;
+    let brick_base_bricks =
+        (cpu_brick_bytes / 4 / BRICK_CELLS as u64) as u32 + proto_brick_count;
+    let leaf_base_elems = (cpu_leaf_attr_bytes / 8) as u32 + proto_leaf_attr_elems;
     state.user_shader_cache.set_pool_bases(
         octree_base_elems, brick_base_bricks, leaf_base_elems,
     );

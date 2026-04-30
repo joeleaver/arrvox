@@ -201,7 +201,7 @@ fn full_chain_bake_scatter_march_composite_lands_instance_in_merged_gbuffer() {
         octree_init.extend_from_slice(&v1.to_le_bytes());
     }
     queue.write_buffer(&octree_buffer, (proto_entry.octree_extent.0 as u64) * 8, &octree_init);
-    proto_pass.reset_cursors(&queue);
+    proto_pass.reset_cursors(&queue, 0, 0);
     queue.write_buffer(&proto_pass.overflow_buffer, 0, &[0u8; 12 * 4]);
     queue.write_buffer(&proto_pass.proto_uniform_buffer, 0, bytemuck::bytes_of(&proto_uniform));
 

@@ -344,22 +344,71 @@ impl RkpScene {
         cpu_brick_face_links_bytes: u64,
         extra_brick_face_links_bytes: u64,
     ) -> bool {
+        self.ensure_pool_layout(
+            device,
+            cpu_octree_bytes, 0, extra_octree_bytes,
+            cpu_brick_bytes, 0, extra_brick_bytes,
+            cpu_leaf_attr_bytes, 0, extra_leaf_attr_bytes,
+            cpu_brick_face_links_bytes, 0, extra_brick_face_links_bytes,
+        )
+    }
+
+    /// Phase 4 — three-tier buffer layout.
+    ///
+    /// The host scene buffers carry, in order:
+    ///
+    /// ```text
+    /// [0 .. cpu_*_bytes]                                   ← CPU-managed asset data
+    /// [cpu_*_bytes .. +proto_*_bytes]                      ← Persistent instance-prototype tail
+    /// [+proto_*_bytes .. +extra_*_bytes]                   ← Per-frame Phase C transient tail
+    /// ```
+    ///
+    /// The proto tail is where `@instance_proto` shaders' baked blade
+    /// prototype octrees live. They persist across frames (only re-baked
+    /// on shader source change) but live in the host pools so the host
+    /// march reads them via its existing bindings — no special "which
+    /// pool?" indirection.
+    ///
+    /// Phase C's transient tail starts past the proto reservation; both
+    /// caches' pool bases (`PrototypeCache::set_pool_bases` /
+    /// `UserShaderRegionCache::set_pool_bases`) must be set accordingly
+    /// by the engine.
+    ///
+    /// Returns `true` if any underlying buffer reallocated — caller must
+    /// rebuild any cached bind groups referencing them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_pool_layout(
+        &mut self,
+        device: &wgpu::Device,
+        cpu_octree_bytes: u64,
+        proto_octree_bytes: u64,
+        transient_octree_bytes: u64,
+        cpu_brick_bytes: u64,
+        proto_brick_bytes: u64,
+        transient_brick_bytes: u64,
+        cpu_leaf_attr_bytes: u64,
+        proto_leaf_attr_bytes: u64,
+        transient_leaf_attr_bytes: u64,
+        cpu_face_links_bytes: u64,
+        proto_face_links_bytes: u64,
+        transient_face_links_bytes: u64,
+    ) -> bool {
         let mut bumped = false;
         bumped |= Self::ensure_capacity(
             device, &mut self.octree_nodes_buffer, "rkp_octree_nodes",
-            cpu_octree_bytes + extra_octree_bytes,
+            cpu_octree_bytes + proto_octree_bytes + transient_octree_bytes,
         );
         bumped |= Self::ensure_capacity(
             device, &mut self.brick_pool_buffer, "rkp_brick_pool",
-            cpu_brick_bytes + extra_brick_bytes,
+            cpu_brick_bytes + proto_brick_bytes + transient_brick_bytes,
         );
         bumped |= Self::ensure_capacity(
             device, &mut self.leaf_attr_pool_buffer, "rkp_leaf_attr_pool",
-            cpu_leaf_attr_bytes + extra_leaf_attr_bytes,
+            cpu_leaf_attr_bytes + proto_leaf_attr_bytes + transient_leaf_attr_bytes,
         );
         bumped |= Self::ensure_capacity(
             device, &mut self.brick_face_links_buffer, "rkp_brick_face_links",
-            cpu_brick_face_links_bytes + extra_brick_face_links_bytes,
+            cpu_face_links_bytes + proto_face_links_bytes + transient_face_links_bytes,
         );
         if bumped {
             self.buffers_epoch += 1;

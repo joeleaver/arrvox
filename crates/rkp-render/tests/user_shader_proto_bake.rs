@@ -214,8 +214,9 @@ fn sphere_prototype_bake_matches_cpu_reference() {
     );
 
     // Reset the global cursor pair (brick + leaf-attr) to 0 and clear
-    // overflow for this isolated test bake.
-    pass.reset_cursors(&queue);
+    // overflow for this isolated test bake. Bases of (0, 0) keep the
+    // bake writing to absolute offset 0 in the dedicated test buffers.
+    pass.reset_cursors(&queue, 0, 0);
     queue.write_buffer(&pass.overflow_buffer, 0, &[0u8; 12 * 4]);
 
     // Upload the prototype uniform.

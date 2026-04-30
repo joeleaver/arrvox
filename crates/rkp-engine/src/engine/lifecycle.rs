@@ -179,6 +179,7 @@ impl EngineState {
                         octree_data,
                         brick_pool_data,
                         &sm.leaf_attr_pool,
+                        self.paint_overlays.get(&entity),
                         spatial.root_offset as usize,
                         spatial.depth,
                         spatial.grid_origin,
@@ -1125,10 +1126,28 @@ impl EngineState {
 /// further — for each brick we walk its 64 cells in `brick_pool` and
 /// look up cell leaf-attrs. Leaves at higher levels (shallow trees
 /// without bricks) cover a 2^(depth-leaf_level) cube of voxel cells.
+/// Resolve the effective `LeafAttr` for `slot` on a specific instance —
+/// overlay if present (Phase 3), else the asset's shared pool. Mirrors
+/// `fetch_leaf_attr_for` in WGSL.
+#[inline]
+fn resolve_leaf_attr(
+    overlay: Option<&rkp_core::LeafAttrOverlay>,
+    leaf_attrs: &rkp_core::LeafAttrPool,
+    slot: u32,
+) -> rkp_core::LeafAttr {
+    if let Some(o) = overlay {
+        if let Some(e) = o.get(slot) {
+            return e.attr();
+        }
+    }
+    *leaf_attrs.get(slot)
+}
+
 fn scan_painted_aabbs(
     octree_data: &[u32],
     brick_pool: &[u32],
     leaf_attrs: &rkp_core::LeafAttrPool,
+    overlay: Option<&rkp_core::LeafAttrOverlay>,
     root_offset: usize,
     depth: u8,
     grid_origin: glam::Vec3,
@@ -1151,6 +1170,7 @@ fn scan_painted_aabbs(
         octree_data: &[u32],
         brick_pool: &[u32],
         leaf_attrs: &rkp_core::LeafAttrPool,
+        overlay: Option<&rkp_core::LeafAttrOverlay>,
         offset: usize,
         level: u8,
         max_depth: u8,
@@ -1184,7 +1204,7 @@ fn scan_painted_aabbs(
                         if pool_idx >= brick_pool.len() { continue; }
                         let cell = brick_pool[pool_idx];
                         if cell == BRICK_CELL_EMPTY || cell == BRICK_INTERIOR { continue; }
-                        let attr = leaf_attrs.get(cell);
+                        let attr = resolve_leaf_attr(overlay, leaf_attrs, cell);
                         let primary = attr.material_primary;
                         let secondary: u16 = attr.material_secondary_blend & 0x0FFF;
                         let blend: u16 = (attr.material_secondary_blend >> 12) & 0xF;
@@ -1242,7 +1262,7 @@ fn scan_painted_aabbs(
         }
         if is_leaf(node) {
             let slot = leaf_slot(node);
-            let attr = leaf_attrs.get(slot);
+            let attr = resolve_leaf_attr(overlay, leaf_attrs, slot);
             let primary = attr.material_primary;
             let secondary: u16 = attr.material_secondary_blend & 0x0FFF;
             let blend: u16 = (attr.material_secondary_blend >> 12) & 0xF;
@@ -1309,6 +1329,7 @@ fn scan_painted_aabbs(
                 octree_data,
                 brick_pool,
                 leaf_attrs,
+                overlay,
                 child_offset,
                 level + 1,
                 max_depth,
@@ -1326,6 +1347,7 @@ fn scan_painted_aabbs(
         octree_data,
         brick_pool,
         leaf_attrs,
+        overlay,
         root_offset,
         0,
         depth,

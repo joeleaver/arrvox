@@ -247,7 +247,14 @@ impl ViewportRenderer {
         // When there are no instance shaders the composite passes the
         // host G-buffer through unchanged; visible output is
         // bit-identical to pre-6c-4.
-        shade.set_gbuffer(device, &instance_merged_gbuffer.position_view, &instance_merged_gbuffer.normal_view, &instance_merged_gbuffer.material_view, &gbuffer.glass_view, &instance_merged_gbuffer.leaf_slot_view);
+        // Phase 4 verification — shade reads from the host G-buffer
+        // directly, NOT from `instance_merged_gbuffer`. Option B's
+        // composite is disabled in `render_worker.rs`, so the merged
+        // textures don't get refreshed; reading from them would show
+        // stale content. Once Phase 4c proves the host march carries
+        // grass rendering, this stays pointed at host. Phase 5 deletes
+        // `instance_merged_gbuffer` outright.
+        shade.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &gbuffer.glass_view, &gbuffer.leaf_slot_view);
         shade.set_shadow_and_ssao(device, &shadow_trace.output_view, &ssao.output_view);
 
         // Pass order: shade → volumetric → glass → god_rays. Glass
@@ -402,10 +409,11 @@ impl ViewportRenderer {
         self.shadow_trace.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view);
 
         self.shade.resize(device, width, height);
-        // Stage 6c-4 — read from merged G-buffer (composite output) for
-        // position/normal/material/leaf_slot. Glass stays on host
-        // gbuffer (composite doesn't write that channel).
-        self.shade.set_gbuffer(device, &self.instance_merged_gbuffer.position_view, &self.instance_merged_gbuffer.normal_view, &self.instance_merged_gbuffer.material_view, &self.gbuffer.glass_view, &self.instance_merged_gbuffer.leaf_slot_view);
+        // Phase 4 verification — read directly from host G-buffer.
+        // Option B's composite is disabled while we verify the host
+        // pipeline carries blade rendering on its own. See the matching
+        // comment in `ViewportRenderer::new`.
+        self.shade.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
         self.shade.set_shadow_and_ssao(device, &self.shadow_trace.output_view, &self.ssao.output_view);
 
         self.volumetric.resize(device, width, height);
