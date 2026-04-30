@@ -20,7 +20,7 @@
 //!
 //! ## Sizing
 //!
-//! V1 starts with 1 KB placeholders so the buffers exist for binding
+//! V1 starts with 256 B placeholders so the buffers exist for binding
 //! validation. [`TlasPass::ensure_capacity`] grows them on demand each
 //! frame as the builder fills. Worst-case estimate: 200 K instances
 //! → ~400 K nodes × 32 B = 12.8 MB + 200 K leaves × 16 B = 3.2 MB.
@@ -135,6 +135,82 @@ impl TlasPass {
         }
     }
 
+    /// Phase 7 Session 2 — build the TLAS for the current frame's
+    /// host instances and upload to GPU. Sets `last_node_count` and
+    /// `last_leaf_count` to the produced sizes.
+    ///
+    /// `assets` and `instances` are the combined slices the engine
+    /// passes to `upload_frame` (host persistent + Phase C transient).
+    /// User-shader instances aren't in `instances` post Phase 6 — they
+    /// join the TLAS via Session 3 (separate code path).
+    ///
+    /// Empty input → counts go to zero, buffers untouched.
+    pub fn build_host_tlas(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        assets: &[crate::rkp_gpu_object::RkpGpuAsset],
+        instances: &[crate::rkp_gpu_object::RkpGpuInstance],
+    ) -> bool {
+        if instances.is_empty() {
+            self.last_node_count = 0;
+            self.last_leaf_count = 0;
+            return false;
+        }
+
+        // Build the primitive list. One primitive per instance.
+        let mut prims: Vec<BvhPrim> = Vec::with_capacity(instances.len());
+        for (idx, inst) in instances.iter().enumerate() {
+            // Skip instances pointing at user-shader assets — those go
+            // through Session 3's path. Defensive: post Phase 6 there
+            // shouldn't be any, but guard against future regressions.
+            let asset_id = inst.asset_id as usize;
+            if asset_id >= assets.len() { continue; }
+            let asset = &assets[asset_id];
+            if asset.shader_id != 0 { continue; }
+
+            let (world_min, world_max) =
+                transform_aabb(asset.aabb_min, asset.aabb_max, &inst.world);
+            let centroid = [
+                0.5 * (world_min[0] + world_max[0]),
+                0.5 * (world_min[1] + world_max[1]),
+                0.5 * (world_min[2] + world_max[2]),
+            ];
+            prims.push(BvhPrim {
+                leaf: TlasInstanceLeaf {
+                    asset_id: inst.asset_id,
+                    instance_state_offset: 0,
+                    material_id: inst.material_id,
+                    instance_index: idx as u32,
+                },
+                aabb_min: world_min,
+                aabb_max: world_max,
+                centroid,
+            });
+        }
+
+        if prims.is_empty() {
+            self.last_node_count = 0;
+            self.last_leaf_count = 0;
+            return false;
+        }
+
+        // Build BVH topology + collect leaves in build order.
+        let mut nodes: Vec<TlasNode> = Vec::with_capacity(2 * prims.len());
+        let mut leaves: Vec<TlasInstanceLeaf> = Vec::with_capacity(prims.len());
+        let prim_count = prims.len();
+        build_bvh_recursive(&mut nodes, &mut leaves, &mut prims, 0, prim_count);
+
+        // Grow + upload.
+        let realloc = self.ensure_capacity(device, nodes.len() as u32, leaves.len() as u32);
+        queue.write_buffer(&self.nodes_buffer, 0, bytemuck::cast_slice(&nodes));
+        queue.write_buffer(&self.leaves_buffer, 0, bytemuck::cast_slice(&leaves));
+
+        self.last_node_count = nodes.len() as u32;
+        self.last_leaf_count = leaves.len() as u32;
+        realloc
+    }
+
     /// Grow `nodes_buffer` and `leaves_buffer` to fit `node_count` and
     /// `leaf_count`. Reallocates with capacity doubling on overflow,
     /// mirroring `OctreeMarchPass::ensure_us_tile_grid_capacity`.
@@ -181,6 +257,134 @@ impl TlasPass {
         }
         dirty
     }
+}
+
+/// Per-primitive working state for the BVH builder. Stored mutably
+/// so the recursive partitioning can re-order primitives in place
+/// (each level partitions its slice by centroid axis).
+struct BvhPrim {
+    leaf: TlasInstanceLeaf,
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
+    centroid: [f32; 3],
+}
+
+/// Transform a local-space AABB through a column-major affine 4×4
+/// matrix, returning the world-space AABB. Standard "Arvo's
+/// transform-AABB" algorithm: for each output axis i, sum over input
+/// axes j the min/max of `M[j][i] * local_extent[j]`. O(9) ops, exact
+/// for any affine transform.
+///
+/// `world` is in column-major form (`world[col][row]`) matching
+/// `RkpGpuInstance.world` and WGSL's `mat4x4`.
+fn transform_aabb(
+    local_min: [f32; 3],
+    local_max: [f32; 3],
+    world: &[[f32; 4]; 4],
+) -> ([f32; 3], [f32; 3]) {
+    // Translation column.
+    let mut new_min = [world[3][0], world[3][1], world[3][2]];
+    let mut new_max = [world[3][0], world[3][1], world[3][2]];
+    for i in 0..3 {
+        for j in 0..3 {
+            let a = world[j][i] * local_min[j];
+            let b = world[j][i] * local_max[j];
+            new_min[i] += a.min(b);
+            new_max[i] += a.max(b);
+        }
+    }
+    (new_min, new_max)
+}
+
+/// Recursive median-split BVH builder.
+///
+/// Partitions `prims[start..end]` in place so that the left half goes
+/// to one subtree and the right half to the other. Splits on the
+/// longest centroid-AABB axis, falling back to a balanced count split
+/// (median of count) on the chosen axis. O(N log N) total via
+/// `select_nth_unstable_by` (linear partition per level).
+///
+/// Emits one [`TlasNode`] for the current range; appends one
+/// [`TlasInstanceLeaf`] per primitive when it bottoms out at a single
+/// element. Returns the index in `nodes` where the produced node
+/// landed.
+fn build_bvh_recursive(
+    nodes: &mut Vec<TlasNode>,
+    leaves: &mut Vec<TlasInstanceLeaf>,
+    prims: &mut [BvhPrim],
+    start: usize,
+    end: usize,
+) -> u32 {
+    let count = end - start;
+    debug_assert!(count > 0, "build_bvh_recursive called on empty range");
+
+    // Reserve this node's slot — children fill it after they recurse.
+    let node_idx = nodes.len() as u32;
+    nodes.push(<TlasNode as bytemuck::Zeroable>::zeroed());
+
+    // Compute the current range's world AABB (parent of this subtree).
+    let mut aabb_min = prims[start].aabb_min;
+    let mut aabb_max = prims[start].aabb_max;
+    for p in &prims[start + 1..end] {
+        for i in 0..3 {
+            if p.aabb_min[i] < aabb_min[i] { aabb_min[i] = p.aabb_min[i]; }
+            if p.aabb_max[i] > aabb_max[i] { aabb_max[i] = p.aabb_max[i]; }
+        }
+    }
+
+    // Leaf — single primitive. Emit leaf payload, mark node with the
+    // high bit on `left_or_leaf`.
+    if count == 1 {
+        let leaf_idx = leaves.len() as u32;
+        leaves.push(prims[start].leaf);
+        nodes[node_idx as usize] = TlasNode {
+            aabb_min,
+            left_or_leaf: TLAS_NODE_LEAF_BIT | leaf_idx,
+            aabb_max,
+            right_or_count: 1,
+        };
+        return node_idx;
+    }
+
+    // Choose split axis: longest extent of the centroid AABB. Falls
+    // back to longest extent of the union AABB if all centroids
+    // coincide (degenerate but possible).
+    let mut centroid_min = prims[start].centroid;
+    let mut centroid_max = prims[start].centroid;
+    for p in &prims[start + 1..end] {
+        for i in 0..3 {
+            if p.centroid[i] < centroid_min[i] { centroid_min[i] = p.centroid[i]; }
+            if p.centroid[i] > centroid_max[i] { centroid_max[i] = p.centroid[i]; }
+        }
+    }
+    let extent = [
+        centroid_max[0] - centroid_min[0],
+        centroid_max[1] - centroid_min[1],
+        centroid_max[2] - centroid_min[2],
+    ];
+    let axis = if extent[0] >= extent[1] && extent[0] >= extent[2] { 0 }
+        else if extent[1] >= extent[2] { 1 }
+        else { 2 };
+
+    // Median split via select_nth_unstable_by — O(count) average.
+    let mid_local = count / 2;
+    prims[start..end].select_nth_unstable_by(mid_local, |a, b| {
+        a.centroid[axis]
+            .partial_cmp(&b.centroid[axis])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mid = start + mid_local;
+
+    let left_idx = build_bvh_recursive(nodes, leaves, prims, start, mid);
+    let right_idx = build_bvh_recursive(nodes, leaves, prims, mid, end);
+
+    nodes[node_idx as usize] = TlasNode {
+        aabb_min,
+        left_or_leaf: left_idx,
+        aabb_max,
+        right_or_count: right_idx,
+    };
+    node_idx
 }
 
 #[cfg(test)]
@@ -239,5 +443,200 @@ mod tests {
         assert_eq!(&bytes[4..8], 0x2222_u32.to_le_bytes());
         assert_eq!(&bytes[8..12], 0x3333_u32.to_le_bytes());
         assert_eq!(&bytes[12..16], 0x4444_u32.to_le_bytes());
+    }
+
+    fn make_prim(min: [f32; 3], max: [f32; 3], leaf_idx: u32) -> BvhPrim {
+        BvhPrim {
+            leaf: TlasInstanceLeaf {
+                asset_id: leaf_idx, // tag the leaf so build_bvh tests can identify it
+                instance_state_offset: 0,
+                material_id: 0,
+                instance_index: leaf_idx,
+            },
+            aabb_min: min,
+            aabb_max: max,
+            centroid: [
+                0.5 * (min[0] + max[0]),
+                0.5 * (min[1] + max[1]),
+                0.5 * (min[2] + max[2]),
+            ],
+        }
+    }
+
+    #[test]
+    fn transform_aabb_identity_is_passthrough() {
+        let identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let (mn, mx) = transform_aabb([1.0, 2.0, 3.0], [4.0, 5.0, 6.0], &identity);
+        assert_eq!(mn, [1.0, 2.0, 3.0]);
+        assert_eq!(mx, [4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn transform_aabb_translation_only() {
+        // Pure translation — same extent, shifted center.
+        let m = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [10.0, 20.0, 30.0, 1.0], // translation column
+        ];
+        let (mn, mx) = transform_aabb([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], &m);
+        assert_eq!(mn, [10.0, 20.0, 30.0]);
+        assert_eq!(mx, [11.0, 21.0, 31.0]);
+    }
+
+    #[test]
+    fn transform_aabb_uniform_scale() {
+        let m = [
+            [2.0, 0.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0, 0.0],
+            [0.0, 0.0, 2.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let (mn, mx) = transform_aabb([1.0, 1.0, 1.0], [2.0, 2.0, 2.0], &m);
+        assert_eq!(mn, [2.0, 2.0, 2.0]);
+        assert_eq!(mx, [4.0, 4.0, 4.0]);
+    }
+
+    #[test]
+    fn transform_aabb_90deg_y_rotation_swaps_xz_extents() {
+        // Rotate 90° around Y: x → -z, z → x. A unit cube at origin
+        // stays a unit cube AABB-wise, but the world AABB grows the
+        // expected reflection.
+        let cy = 0.0_f32;
+        let sy = 1.0_f32;
+        let m = [
+            [cy, 0.0, -sy, 0.0],   // column 0: rotated x basis
+            [0.0, 1.0, 0.0, 0.0],  // y unchanged
+            [sy, 0.0, cy, 0.0],    // column 2: rotated z basis
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let (mn, mx) = transform_aabb([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], &m);
+        // A 1x1x1 cube rotated 90° still fits in a 1x1x1 AABB
+        // (centered differently). With local origin at [0..1]³, the
+        // world AABB lands at z ∈ [-1, 0] and x ∈ [0, 1].
+        assert!((mn[0] - 0.0).abs() < 1e-5, "min x = {}", mn[0]);
+        assert!((mx[0] - 1.0).abs() < 1e-5, "max x = {}", mx[0]);
+        assert!((mn[2] - (-1.0)).abs() < 1e-5, "min z = {}", mn[2]);
+        assert!((mx[2] - 0.0).abs() < 1e-5, "max z = {}", mx[2]);
+    }
+
+    #[test]
+    fn build_bvh_single_prim_is_one_leaf_node() {
+        let mut prims = vec![make_prim([0.0; 3], [1.0; 3], 0)];
+        let mut nodes = Vec::new();
+        let mut leaves = Vec::new();
+        let root = build_bvh_recursive(&mut nodes, &mut leaves, &mut prims, 0, 1);
+        assert_eq!(root, 0);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(leaves.len(), 1);
+        // Root is a leaf — high bit set.
+        assert!(nodes[0].left_or_leaf & TLAS_NODE_LEAF_BIT != 0);
+        assert_eq!(nodes[0].left_or_leaf & !TLAS_NODE_LEAF_BIT, 0); // leaf index 0
+        assert_eq!(nodes[0].right_or_count, 1); // leaf count = 1
+        assert_eq!(nodes[0].aabb_min, [0.0, 0.0, 0.0]);
+        assert_eq!(nodes[0].aabb_max, [1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn build_bvh_two_prims_root_is_internal_with_two_leaves() {
+        // Two prims along X axis. Median split should create root at
+        // node[0] with two leaf children.
+        let mut prims = vec![
+            make_prim([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], 0),
+            make_prim([5.0, 0.0, 0.0], [6.0, 1.0, 1.0], 1),
+        ];
+        let mut nodes = Vec::new();
+        let mut leaves = Vec::new();
+        let _ = build_bvh_recursive(&mut nodes, &mut leaves, &mut prims, 0, 2);
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(leaves.len(), 2);
+        // Root is internal — left/right are both leaf-marked node indices.
+        let root = &nodes[0];
+        assert!(root.left_or_leaf & TLAS_NODE_LEAF_BIT == 0);
+        assert!(root.right_or_count & TLAS_NODE_LEAF_BIT == 0);
+        let left = &nodes[root.left_or_leaf as usize];
+        let right = &nodes[root.right_or_count as usize];
+        assert!(left.left_or_leaf & TLAS_NODE_LEAF_BIT != 0);
+        assert!(right.left_or_leaf & TLAS_NODE_LEAF_BIT != 0);
+        // Root AABB encloses both prims.
+        assert_eq!(root.aabb_min, [0.0, 0.0, 0.0]);
+        assert_eq!(root.aabb_max, [6.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn build_bvh_eight_prims_topology_is_balanced() {
+        // 8 prims along the X axis at unit spacing — perfectly
+        // balanced binary tree of depth 3 (8 leaves, 15 total nodes).
+        let mut prims: Vec<BvhPrim> = (0..8u32)
+            .map(|i| {
+                let f = i as f32;
+                make_prim([f, 0.0, 0.0], [f + 1.0, 1.0, 1.0], i)
+            })
+            .collect();
+        let mut nodes = Vec::new();
+        let mut leaves = Vec::new();
+        let _ = build_bvh_recursive(&mut nodes, &mut leaves, &mut prims, 0, 8);
+        assert_eq!(nodes.len(), 15); // 2N - 1 for a binary tree with N leaves
+        assert_eq!(leaves.len(), 8);
+
+        // Root encloses all 8 unit cubes spanning x ∈ [0, 8].
+        let root = &nodes[0];
+        assert_eq!(root.aabb_min, [0.0, 0.0, 0.0]);
+        assert_eq!(root.aabb_max, [8.0, 1.0, 1.0]);
+
+        // Walk leaves; each prim should appear exactly once.
+        let mut seen = [false; 8];
+        for leaf in &leaves {
+            let idx = leaf.instance_index as usize;
+            assert!(idx < 8, "leaf instance_index out of range");
+            assert!(!seen[idx], "leaf {idx} appeared twice");
+            seen[idx] = true;
+        }
+        assert!(seen.iter().all(|s| *s));
+    }
+
+    #[test]
+    fn build_bvh_leaves_carry_correct_payloads() {
+        // Verify the leaf payload (asset_id, instance_index, etc) is
+        // preserved through the build. Each prim has a distinct
+        // material_id; we round-trip and check.
+        let mut prims = vec![
+            BvhPrim {
+                leaf: TlasInstanceLeaf {
+                    asset_id: 7,
+                    instance_state_offset: 0,
+                    material_id: 100,
+                    instance_index: 0,
+                },
+                aabb_min: [0.0; 3], aabb_max: [1.0; 3], centroid: [0.5; 3],
+            },
+            BvhPrim {
+                leaf: TlasInstanceLeaf {
+                    asset_id: 7,
+                    instance_state_offset: 0,
+                    material_id: 200,
+                    instance_index: 1,
+                },
+                aabb_min: [10.0; 3], aabb_max: [11.0; 3], centroid: [10.5; 3],
+            },
+        ];
+        let mut nodes = Vec::new();
+        let mut leaves = Vec::new();
+        let _ = build_bvh_recursive(&mut nodes, &mut leaves, &mut prims, 0, 2);
+        // Both materials should appear exactly once across the leaves,
+        // regardless of which side of the median they end up on.
+        let mut found_100 = false;
+        let mut found_200 = false;
+        for l in &leaves {
+            if l.material_id == 100 { found_100 = true; }
+            if l.material_id == 200 { found_200 = true; }
+        }
+        assert!(found_100 && found_200);
     }
 }

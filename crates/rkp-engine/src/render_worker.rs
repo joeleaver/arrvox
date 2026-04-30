@@ -283,12 +283,11 @@ struct RenderState {
     /// dispatch; same lifecycle as `instance_tile_view_uniform_buffer`.
     instance_tile_prefix_uniform_buffer: wgpu::Buffer,
 
-    /// Phase 7 Session 1 — TLAS over instance AABBs. Foundation only:
-    /// holds the GPU node + leaf buffers. Sessions 2–4 will add the
-    /// CPU builder, GPU upload, and WGSL traversal in shadow trace.
-    /// Bound but unread by any current pipeline (zero-init buffers are
-    /// effectively no-op).
-    #[allow(dead_code)]
+    /// Phase 7 — TLAS over instance AABBs. Session 2 ships the host
+    /// CPU builder + GPU upload (called per frame from
+    /// `compose_render_one_frame`); Session 3 adds user-shader
+    /// instances; Session 4 plumbs into shadow trace. Until Session 4
+    /// the GPU buffers are written but unread.
     tlas_pass: rkp_render::tlas_pass::TlasPass,
 
     /// Stage 6c-3 — global `array<u32>` storage buffer holding all
@@ -1197,6 +1196,18 @@ fn render_one_frame(
     //     so at high render rates physics-driven motion is smooth
     //     instead of stuttering at the sim rate. Assets are pose-static
     //     within a frame.
+    // 1b'. Phase 7 Session 2 — TLAS build over host instances. User-
+    //      shader instances aren't in `instances_for_upload` (they
+    //      flow through Phase 6's tile-cull pipeline), so this frame's
+    //      TLAS only contains the host BVH. Session 3 will add the
+    //      user-shader path; Session 4 plumbs the buffers into shadow
+    //      trace. Today nothing reads them — pure side-effect.
+    state.tlas_pass.build_host_tlas(
+        &state.device,
+        &state.queue,
+        assets_for_upload,
+        instances_for_upload,
+    );
     let overlay_bytes: &[u8] = bytemuck::cast_slice(&frame.gpu_instance_overlays);
     state.renderer.upload_frame(
         &state.queue,
