@@ -88,6 +88,17 @@ pub mod user_shader_emit_pass;
 /// `inst_aabb` hook to build a world-space AABB scratch buffer the
 /// downstream tile-cull (count + prefix + scatter) consumes.
 pub mod user_shader_tile_cull_pass;
+/// Phase 6 — count phase of tile-cull. Per AABB scratch entry, projects
+/// to screen tiles and atomically increments per-tile counts.
+pub mod user_shader_tile_count_pass;
+/// Phase 6 — prefix-sum phase of tile-cull. Single-WG blocked scan
+/// turning per-tile counts into per-tile entry offsets (V1 cap 65536
+/// tiles per dispatch).
+pub mod user_shader_tile_prefix_pass;
+/// Phase 6 — scatter phase of tile-cull. Per AABB scratch entry, writes
+/// 16-byte UserShaderTileEntry records into us_tile_entries[] using
+/// per-tile atomic cursors initialized from the prefix-summed offsets.
+pub mod user_shader_tile_scatter_pass;
 /// Skeletal skin-deform scatter pass — per-frame bone-field writer.
 pub mod skin_deform;
 /// CPU-side paint writes against the scene's LeafAttrPool (material +
