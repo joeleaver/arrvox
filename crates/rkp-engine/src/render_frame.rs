@@ -145,22 +145,22 @@ pub struct RenderFrame {
     /// shader is registered.
     pub user_shader_emit_chunk: String,
 
-    /// Composed user-shader chunk for the Option B instance-march
-    /// inst_to_local hook. Defines per-shader pool-read wrappers +
+    /// Composed user-shader chunk for the host-march `inst_to_local`
+    /// hook. Defines per-shader pool-read wrappers +
     /// `dispatch_user_inst_to_local(...)`. Spliced into
-    /// `user_shader_instance_march_main.wgsl` between its
-    /// USER_INST_TO_LOCAL_DISPATCH markers. Empty when no instance
-    /// shader provides the hook; the in-tree identity stub falls back
-    /// to translate + uniform-scale TRS.
+    /// `octree_march.wgsl` and `rkp_shadow_trace.wgsl` between their
+    /// USER_INST_TO_LOCAL_DISPATCH markers (Phase 4c). Empty when no
+    /// instance shader provides the hook; the in-tree identity stub
+    /// falls back to translate + uniform-scale TRS.
     pub user_shader_inst_to_local_chunk: String,
 
-    /// Composed user-shader chunk for the Option B instance-march
-    /// inst_aabb hook. Defines per-shader pool-read wrappers +
+    /// Composed user-shader chunk for the host-march `inst_aabb` hook.
+    /// Defines per-shader pool-read wrappers +
     /// `dispatch_user_inst_aabb(...) -> Aabb`. Spliced into
-    /// `user_shader_instance_march_main.wgsl` between its
-    /// USER_INST_AABB_DISPATCH markers. Empty when no instance shader
-    /// provides the hook; the in-tree identity stub returns a
-    /// rotation-tolerant `pos ± 0.5 × scale × √3` cube.
+    /// `octree_march.wgsl` and `rkp_shadow_trace.wgsl` between their
+    /// USER_INST_AABB_DISPATCH markers (Phase 4c). Empty when no
+    /// instance shader provides the hook; the in-tree identity stub
+    /// returns a rotation-tolerant `pos ± 0.5 × scale × √3` cube.
     pub user_shader_inst_aabb_chunk: String,
 
     /// Editor snapshots of all currently-registered user shaders.

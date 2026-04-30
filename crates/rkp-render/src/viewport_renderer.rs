@@ -25,32 +25,6 @@ use crate::rkp_shade::RkpShadePass;
 use crate::rkp_volumetric::RkpVolumetricPass;
 use crate::rkp_god_rays::RkpGodRayPass;
 use crate::rkp_grid::RkpGridPass;
-use crate::instance_march_pass::{InstanceMarchPass, MarchUniforms};
-use crate::instance_composite_pass::InstanceCompositePass;
-use crate::instance_merged_gbuffer::{InstanceMergedGBuffer, output_hits_buffer_bytes};
-
-/// Stage 6c-3.5a — buffer references the engine threads into
-/// [`ViewportRenderer::dispatch_instance_overlay`] each frame. All
-/// pointers are borrowed for the lifetime of the dispatch encoding;
-/// nothing is owned by this struct.
-///
-/// The pool buffers (octree/brick/leaf_attr) come from `RkpScene`; the
-/// instance state buffers (regions, instance_pool, instance_alloc) come
-/// from the engine's `InstanceRegionCache` + `EmitPass`; the per-frame
-/// `tile_index` and `proto_lookup` buffers are engine-owned per-frame
-/// scratch.
-pub struct InstanceOverlayInputs<'a> {
-    pub octree_nodes: &'a wgpu::Buffer,
-    pub brick_pool: &'a wgpu::Buffer,
-    pub leaf_attr_pool: &'a wgpu::Buffer,
-    pub regions: &'a wgpu::Buffer,
-    pub instance_pool: &'a wgpu::Buffer,
-    pub instance_alloc: &'a wgpu::Buffer,
-    pub tile_index: &'a wgpu::Buffer,
-    pub proto_lookup: &'a wgpu::Buffer,
-    pub tile_index_count: u32,
-    pub proto_lookup_count: u32,
-}
 
 pub struct ViewportRenderer {
     // ── Per-VR scene binding ────────────────────────────────────────
@@ -87,30 +61,6 @@ pub struct ViewportRenderer {
     pub glass: crate::rkp_glass::RkpGlassPass,
     pub volumetric: RkpVolumetricPass,
     pub god_rays: RkpGodRayPass,
-
-    // ── Stage 6c-2: Option B (instance pipeline) per-VR pieces ───────
-    /// V1 march entry — `dispatch_per_pixel(cpass, w, h)` per frame.
-    /// Stage 6c-3 will wire the dispatch + bind groups; today the pass
-    /// is constructed but unused.
-    pub instance_march_pass: InstanceMarchPass,
-    /// Composite pass — overlays `instance_output_hits_buffer` on the
-    /// host G-buffer into `instance_merged_gbuffer`. Dispatch wired in
-    /// Stage 6c-3.
-    pub instance_composite_pass: InstanceCompositePass,
-    /// Output target for the composite. Same formats as `gbuffer`'s
-    /// primary four. Stage 6c-4 rebinds the shade pass to read from
-    /// here instead of `gbuffer` so instance hits land in the final
-    /// image.
-    pub instance_merged_gbuffer: InstanceMergedGBuffer,
-    /// `array<InstanceMarchHit>` storage buffer — one slot per pixel,
-    /// 48 B each. The march writes here; the composite reads. Sized
-    /// to match `width * height` and resized in `resize()`.
-    pub instance_output_hits_buffer: wgpu::Buffer,
-    /// 32-byte `MarchUniforms` uniform buffer. Per-VR because the
-    /// uniform's `screen_width` / `screen_height` differ per viewport.
-    /// Engine writes a fresh value before every dispatch; the buffer
-    /// itself is stable across resize.
-    pub instance_march_uniforms_buffer: wgpu::Buffer,
 
     // ── Per-VR render targets + post-process ───────────────────────
     pub gbuffer: crate::GBuffer,
@@ -173,19 +123,6 @@ impl ViewportRenderer {
         // Gbuffer.
         let gbuffer = crate::GBuffer::new(device, width, height);
 
-        // Stage 6c-2/6c-4 — Option B per-VR pieces. Constructed before
-        // `shade.set_gbuffer(...)` so Stage 6c-4's shade rebind can read
-        // from the merged G-buffer's views directly. Compute pipelines
-        // (`InstanceMarchPass` / `InstanceCompositePass`) hold no
-        // resolution state, so they don't need the same early ordering;
-        // they're constructed alongside their texture targets for
-        // proximity readability.
-        let instance_march_pass = InstanceMarchPass::new(device);
-        let instance_composite_pass = InstanceCompositePass::new(device);
-        let instance_merged_gbuffer = InstanceMergedGBuffer::new(device, width, height);
-        let instance_output_hits_buffer = make_output_hits_buffer(device, width, height);
-        let instance_march_uniforms_buffer = make_march_uniforms_buffer(device);
-
         // rkp-side pick texture (R32Uint). Written by the procedural
         // raymarch, read by `proc_outline` and the pick readback.
         let (pick_texture, pick_view) = create_pick_texture(device, width, height);
@@ -238,22 +175,10 @@ impl ViewportRenderer {
             &renderer.atmosphere.sky_view_view,
             &renderer.atmosphere.ap_view,
         );
-        // Stage 6c-4 — shade reads the Option B *merged* G-buffer for
-        // position / normal / material / leaf_slot so instance hits
-        // composited on top of host hits actually reach the shade
-        // pass. Glass stays on the host G-buffer because the composite
-        // doesn't write that channel (its sentinel-driven path runs
-        // separately, post-volumetric, before glass refraction).
-        // When there are no instance shaders the composite passes the
-        // host G-buffer through unchanged; visible output is
-        // bit-identical to pre-6c-4.
-        // Phase 4 verification — shade reads from the host G-buffer
-        // directly, NOT from `instance_merged_gbuffer`. Option B's
-        // composite is disabled in `render_worker.rs`, so the merged
-        // textures don't get refreshed; reading from them would show
-        // stale content. Once Phase 4c proves the host march carries
-        // grass rendering, this stays pointed at host. Phase 5 deletes
-        // `instance_merged_gbuffer` outright.
+        // Phase 4c — shade reads the host G-buffer directly. Phase 5
+        // retired Option B's instance-merged G-buffer; user-shader
+        // hits land in the host G-buffer through the unified march
+        // pipeline.
         shade.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &gbuffer.glass_view, &gbuffer.leaf_slot_view);
         shade.set_shadow_and_ssao(device, &shadow_trace.output_view, &ssao.output_view);
 
@@ -316,9 +241,6 @@ impl ViewportRenderer {
             camera_buffer, scene_bind_group, scene_epoch, lights_materials_epoch,
             march, proc_raymarch, proc_outline, proc_ghost,
             shadow_trace, ssao, shade, glass, volumetric, god_rays,
-            instance_march_pass, instance_composite_pass,
-            instance_merged_gbuffer, instance_output_hits_buffer,
-            instance_march_uniforms_buffer,
             gbuffer, pick_texture, pick_view, bloom, bloom_composite, tone_map,
             composite_texture, composite_view,
             readback,
@@ -391,12 +313,6 @@ impl ViewportRenderer {
         self.pick_texture = pick_texture;
         self.pick_view = pick_view;
 
-        // Stage 6c-4 — rebuild the merged G-buffer + per-pixel hits
-        // buffer BEFORE rebinding shade so the rebind reads the new
-        // textures, not stale views from the prior resolution.
-        self.instance_merged_gbuffer = InstanceMergedGBuffer::new(device, width, height);
-        self.instance_output_hits_buffer = make_output_hits_buffer(device, width, height);
-
         // Per-VR passes — resize internal textures + re-wire gbuffer bindings.
         self.march.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
         self.proc_raymarch.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
@@ -409,10 +325,6 @@ impl ViewportRenderer {
         self.shadow_trace.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view);
 
         self.shade.resize(device, width, height);
-        // Phase 4 verification — read directly from host G-buffer.
-        // Option B's composite is disabled while we verify the host
-        // pipeline carries blade rendering on its own. See the matching
-        // comment in `ViewportRenderer::new`.
         self.shade.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
         self.shade.set_shadow_and_ssao(device, &self.shadow_trace.output_view, &self.ssao.output_view);
 
@@ -471,161 +383,11 @@ impl ViewportRenderer {
         (self.width * 4 + 255) & !255
     }
 
-    /// Stage 6c-3.5a — encode the per-VR march + composite dispatch.
-    ///
-    /// Caller supplies the scene pool buffers + instance state buffers
-    /// (owned engine-side); this method writes `MarchUniforms`, builds
-    /// the four bind groups for the march and the three for the
-    /// composite, and encodes both compute dispatches into the open
-    /// command encoder.
-    ///
-    /// Empty-case behaviour (Stage 6c-3.5a's first-light scenario):
-    /// when `inputs.tile_index_count == 0` the march loop iterates
-    /// zero tiles and writes `hit=0` to every pixel of
-    /// `instance_output_hits_buffer`; the composite then runs and
-    /// writes host-passthrough into `instance_merged_gbuffer`.
-    pub fn dispatch_instance_overlay(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        profiler: &mut wgpu_profiler::GpuProfiler,
-        inputs: &InstanceOverlayInputs<'_>,
-    ) {
-        // 1. Write per-VR MarchUniforms.
-        let mut uniforms = MarchUniforms::default();
-        uniforms.tile_index_count = inputs.tile_index_count;
-        uniforms.proto_lookup_count = inputs.proto_lookup_count;
-        uniforms.screen_width = self.width;
-        uniforms.screen_height = self.height;
-        queue.write_buffer(
-            &self.instance_march_uniforms_buffer,
-            0,
-            bytemuck::bytes_of(&uniforms),
-        );
-
-        // 2. Build march bind groups.
-        let m_g0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("inst march g0 (pools)"),
-            layout: &self.instance_march_pass.group0_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: inputs.octree_nodes.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: inputs.brick_pool.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: inputs.leaf_attr_pool.as_entire_binding() },
-            ],
-        });
-        let m_g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("inst march g1 (instance state)"),
-            layout: &self.instance_march_pass.group1_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: inputs.regions.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: inputs.instance_pool.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: inputs.tile_index.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: inputs.instance_alloc.as_entire_binding() },
-            ],
-        });
-        let m_g2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("inst march g2 (proto lookup)"),
-            layout: &self.instance_march_pass.group2_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: inputs.proto_lookup.as_entire_binding(),
-            }],
-        });
-        // group3 binds the per-VR uniforms + a slice of the existing
-        // CameraUniforms buffer (first 80 B is layout-compatible with
-        // MarchCameraUniform per Stage 6a) + the per-pixel hits buffer.
-        let camera_slice = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-            buffer: &self.camera_buffer,
-            offset: 0,
-            size: std::num::NonZeroU64::new(
-                std::mem::size_of::<crate::instance_march_pass::MarchCameraUniform>() as u64,
-            ),
-        });
-        let m_g3 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("inst march g3 (uniforms+camera+output)"),
-            layout: &self.instance_march_pass.group3_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.instance_march_uniforms_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: camera_slice },
-                wgpu::BindGroupEntry { binding: 2, resource: self.instance_output_hits_buffer.as_entire_binding() },
-            ],
-        });
-
-        // 3. Dispatch march.
-        {
-            let q = profiler.begin_query("inst_march", encoder);
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("inst march"),
-                timestamp_writes: None,
-            });
-            cpass.set_bind_group(0, &m_g0, &[]);
-            cpass.set_bind_group(1, &m_g1, &[]);
-            cpass.set_bind_group(2, &m_g2, &[]);
-            cpass.set_bind_group(3, &m_g3, &[]);
-            self.instance_march_pass.dispatch_per_pixel(&mut cpass, self.width, self.height);
-            drop(cpass);
-            profiler.end_query(encoder, q);
-        }
-
-        // 4. Build composite bind groups.
-        let c_g0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("inst composite g0 (hits + uniforms)"),
-            layout: &self.instance_composite_pass.group0_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.instance_output_hits_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.instance_march_uniforms_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    // Composite needs the same MarchCameraUniform slice
-                    // the march reads — to re-derive world position
-                    // from t_world.
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &self.camera_buffer,
-                        offset: 0,
-                        size: std::num::NonZeroU64::new(
-                            std::mem::size_of::<crate::instance_march_pass::MarchCameraUniform>() as u64,
-                        ),
-                    }),
-                },
-            ],
-        });
-        let c_g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("inst composite g1 (host gbuf reads)"),
-            layout: &self.instance_composite_pass.group1_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.gbuffer.position_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.gbuffer.normal_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.gbuffer.material_view) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.gbuffer.leaf_slot_view) },
-            ],
-        });
-        let c_g2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("inst composite g2 (merged gbuf writes)"),
-            layout: &self.instance_composite_pass.group2_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.instance_merged_gbuffer.position_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.instance_merged_gbuffer.normal_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.instance_merged_gbuffer.material_view) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.instance_merged_gbuffer.leaf_slot_view) },
-            ],
-        });
-
-        // 5. Dispatch composite.
-        {
-            let q = profiler.begin_query("inst_composite", encoder);
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("inst composite"),
-                timestamp_writes: None,
-            });
-            cpass.set_bind_group(0, &c_g0, &[]);
-            cpass.set_bind_group(1, &c_g1, &[]);
-            cpass.set_bind_group(2, &c_g2, &[]);
-            self.instance_composite_pass.dispatch_per_pixel(&mut cpass, self.width, self.height);
-            drop(cpass);
-            profiler.end_query(encoder, q);
-        }
-    }
+    // Phase 5 — Option B's `dispatch_instance_overlay` was removed.
+    // User-shader instances now flow through the unified host march
+    // via `asset.shader_id` branch (see `octree_march.wgsl` and
+    // `tick_instance_pipeline`). The per-pixel march + composite
+    // pipeline is gone.
 
     /// Encode a copy of the composite texture into the readback ring's
     /// next idle buffer. Returns the index that was written, or `None` if
@@ -660,45 +422,6 @@ impl ViewportRenderer {
         );
         Some(idx)
     }
-}
-
-/// Allocate the per-pixel `InstanceMarchHit` storage buffer at the
-/// given viewport size. Stage 6c-3 binds it as `output_hits` for the
-/// march dispatch and as the storage RO source for the composite. A
-/// new buffer is allocated on every resize — buffers are cheap to
-/// recreate and the alternative (track high-water + grow) would
-/// complicate the bind-group invalidation story when sizing shrinks.
-fn make_output_hits_buffer(
-    device: &wgpu::Device,
-    width: u32,
-    height: u32,
-) -> wgpu::Buffer {
-    // 16 B floor so a (0, 0)-sized viewport (e.g. before the first
-    // resize) still produces a buffer that satisfies wgpu's minimum
-    // size requirement and matches the binding's `min_binding_size`
-    // (one InstanceMarchHit = 48 B; we round up to be conservative).
-    let raw = output_hits_buffer_bytes(width, height);
-    let size = raw.max(64);
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("inst output_hits"),
-        size,
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    })
-}
-
-/// Allocate the 32-byte `MarchUniforms` uniform buffer. Per-VR because
-/// `screen_width` / `screen_height` differ per viewport. Engine writes
-/// a fresh value before each dispatch (see `dispatch_instance_overlay`).
-fn make_march_uniforms_buffer(device: &wgpu::Device) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("inst march uniforms"),
-        size: std::mem::size_of::<MarchUniforms>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
 }
 
 /// Triple-buffered async readback. The engine writes the composite into

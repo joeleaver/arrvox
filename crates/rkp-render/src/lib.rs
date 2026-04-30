@@ -83,39 +83,6 @@ pub mod user_shader_proto_pass;
 /// granularity, atomic-appending placed instances into a per-region
 /// slice of a global instance pool.
 pub mod user_shader_emit_pass;
-/// Option B — per-tile spatial accel for the instance pipeline.
-/// Built per frame from the emit pass's cached regions; consumed by
-/// the march to look up "which regions overlap this ray's tile."
-pub mod instance_tile_index;
-/// Option B Stage 5a — flat GPU layout for the per-frame [`TileIndex`].
-/// Walks the CPU index and emits a sorted `Vec<GpuTileIndexEntry>` the
-/// march can bind directly as a storage buffer.
-pub mod instance_tile_index_gpu;
-/// Option B Stage 5a — WGSL helper library for the instance march.
-/// Owns three pure WGSL functions (ray-AABB, world→local, prototype
-/// octree descent) plus a test pipeline that exercises each one in
-/// isolation against a real GPU.
-pub mod user_shader_instance_march;
-/// Option B Stage 5b — GPU prototype-lookup struct. Builds a sorted
-/// flat array of `(shader_id, octree_root, max_depth, instance stride,
-/// pos/scale offsets)` records the march reads to translate a region's
-/// shader id into prototype state + instance decode info.
-pub mod instance_proto_lookup;
-/// Option B Stage 5b — instance-march compute pipeline. Composes the
-/// Stage 5a helpers + new bindings (regions, instances, tile-index,
-/// proto-lookup, rays, output hits) into the V1 march entry. Single
-/// ray per dispatch; Stage 6 will batch by screen tile.
-pub mod instance_march_pass;
-/// Option B Stage 6b — composite the instance-march hits onto the host
-/// G-buffer. Per-pixel: when an instance hit's `t_world` beats the
-/// host's depth, overwrite position/normal/material/leaf_slot with the
-/// instance data; otherwise pass the host data through.
-pub mod instance_composite_pass;
-/// Option B Stage 6c-2 — output target for the composite pass. Sibling
-/// of `crate::gbuffer::GBuffer`'s primary four targets (position,
-/// normal, material, leaf_slot) at the same formats; consumed by Stage
-/// 6c-4's shade rebind.
-pub mod instance_merged_gbuffer;
 /// Skeletal skin-deform scatter pass — per-frame bone-field writer.
 pub mod skin_deform;
 /// CPU-side paint writes against the scene's LeafAttrPool (material +
@@ -126,7 +93,7 @@ pub mod paint;
 
 pub use octree_gpu::OctreeGpu;
 pub use rkp_scene_manager::{AssetHandle, AssetInfo, ReloadResult, RkpSceneManager, SkinBrick, SkinningAssetData};
-pub use viewport_renderer::{InstanceOverlayInputs, ViewportRenderer};
+pub use viewport_renderer::ViewportRenderer;
 pub use skin_deform::{SkinBatchScratch, SkinBrickEntry, SkinDeformPass, SkinDispatch, SkinUniforms};
 
 /// What a viewport's render pipeline should look like.

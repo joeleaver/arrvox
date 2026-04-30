@@ -9,29 +9,6 @@
 
 use crate::rkp_gpu_object::{RkpGpuAsset, RkpGpuInstance};
 
-/// Option B proto-buffer capacities. Sized once at construction —
-/// these buffers are dedicated to the prototype cache and don't share
-/// allocation with the user-shader transient pools.
-///
-/// Sizing is set for `MAX_PROTO_MAX_DEPTH = 8` with global brick +
-/// leaf-attr cursors (no per-prototype reservation). The dense octree
-/// spine at depth 8 is ~19.2 M nodes per prototype, so the 32 M-node
-/// pool fits one depth-8 prototype + a handful of shallower siblings.
-/// The brick + leaf-attr pools are global across prototypes; sparse
-/// usage means the 256 K bricks / 4 M leaf-attrs comfortably hold
-/// many simultaneous prototypes.
-///
-/// Engine-side `INSTANCE_PROTO_*_CAPACITY_*` constants must stay in
-/// sync with these — the engine sub-allocates within. Total ≈ 320 MB
-/// across all three buffers.
-///
-/// 32 M octree nodes × 8 bytes = 256 MB.
-pub const PROTO_OCTREE_CAPACITY_BYTES: u64 = 32 * 1024 * 1024 * 8;
-/// 256 K bricks × 64 cells × 4 bytes = 64 MB.
-pub const PROTO_BRICK_CAPACITY_BYTES: u64 = 256 * 1024 * 64 * 4;
-/// 4 M leaf-attr slots × 8 bytes = 32 MB.
-pub const PROTO_LEAF_ATTR_CAPACITY_BYTES: u64 = 4 * 1024 * 1024 * 8;
-
 /// Per-instance user-shader state pool capacity, in u32 units. Each
 /// `@instance_proto` instance consumes `stride_u32` of this buffer
 /// (typically 8 = 32 B). The emit pass writes; the host march reads
@@ -202,16 +179,6 @@ pub struct RkpScene {
     /// `SkinnedBinding.bone_dq_offset` order. The scatter's DQS branch
     /// reads this directly; the matrix palette is only used by LBS.
     pub bone_dual_quats_buffer: wgpu::Buffer,
-    /// Option B prototype octree-nodes buffer. Dedicated so the proto
-    /// sub-pool doesn't stack on top of `octree_nodes_buffer`'s
-    /// MAX_GLOBAL user-shader tail (which would push the shared buffer
-    /// past memory/binding limits when even one Option B shader is
-    /// loaded). Sized at construction; never grows. Bake writes here
-    /// at offsets reported by the proto cache; march reads here via
-    /// its own group0 bindings (3/4/5).
-    pub proto_octree_buffer: wgpu::Buffer,
-    pub proto_brick_buffer: wgpu::Buffer,
-    pub proto_leaf_attr_buffer: wgpu::Buffer,
     /// Per-instance sparse paint overlay buffer (Phase 3). One
     /// `OverlayEntry` (16 B) per painted leaf, per painted instance,
     /// concatenated. Each `RkpGpuInstance.overlay_offset` +
@@ -271,23 +238,6 @@ impl RkpScene {
         // even before any skinned entity is loaded.
         let bone_dual_quats_buffer = Self::create_storage(device, "rkp_bone_dual_quats", 32);
 
-        // Option B proto sub-pool — sized once at construction. The
-        // V1 caps (64K nodes / 8K bricks / 64K leaf-attrs ≈ 3 MB total)
-        // come from `INSTANCE_PROTO_*_CAPACITY` in render_worker.rs.
-        // Mirroring the totals here (rather than importing across the
-        // crate boundary) keeps `RkpScene` standalone; the engine
-        // verifies via `PROTO_*_CAPACITY_BYTES` in lib.rs that its
-        // configured caps fit.
-        let proto_octree_buffer = Self::create_storage(
-            device, "rkp_proto_octree", PROTO_OCTREE_CAPACITY_BYTES,
-        );
-        let proto_brick_buffer = Self::create_storage(
-            device, "rkp_proto_brick", PROTO_BRICK_CAPACITY_BYTES,
-        );
-        let proto_leaf_attr_buffer = Self::create_storage(
-            device, "rkp_proto_leaf_attr", PROTO_LEAF_ATTR_CAPACITY_BYTES,
-        );
-
         // Per-instance overlay buffer — starts at the 16-byte
         // single-entry placeholder so the bind validates even when no
         // entity is painted yet. `upload_frame` grows it as paint
@@ -317,7 +267,6 @@ impl RkpScene {
             bone_field_buffer, bone_field_capacity,
             bone_field_occ_buffer, bone_field_occ_capacity,
             bone_dual_quats_buffer,
-            proto_octree_buffer, proto_brick_buffer, proto_leaf_attr_buffer,
             instance_overlay_buffer,
             instance_pool_buffer,
             bind_group_layout,
