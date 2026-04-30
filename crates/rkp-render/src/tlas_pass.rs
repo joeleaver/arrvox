@@ -217,14 +217,40 @@ impl TlasPass {
         }
 
         // User-shader instances → one TLAS leaf per painted leaf.
-        // Conservative AABB radius = region_thickness covers any
-        // per-instance state the user's emit hook may have produced.
+        //
+        // Slot-permutation V1 — emit's `atomicAdd` shuffles the
+        // (painted_leaf ↔ instance_pool_slot) assignment, so slot K
+        // may hold painted leaf J's blade data (J ≠ K). To stay
+        // correct, every TLAS leaf in a region carries the region's
+        // UNION AABB — that AABB encloses any slot's blade regardless
+        // of the permutation. The per-leaf centroid still drives the
+        // BVH split heuristic so the topology isn't entirely
+        // degenerate, but the AABBs are not tight at all and shadow
+        // rays passing through the region descend ~all leaves there.
+        //
+        // For dense clustered paint this is essentially the per-leaf
+        // AABB anyway. For widely-spread paint within a single region
+        // (no @tile_size on the shader) the cost is real — O(N)
+        // shadow-ray cost over all leaves in the region. The proper
+        // Phase 7b fix is deterministic slotting in the emit pass so
+        // CPU and GPU agree on (slot ↔ painted leaf) without needing
+        // a global AABB.
         for region in user_shader_regions {
+            if region.leaves.is_empty() { continue; }
             let r = region.region_thickness.max(0.0);
-            for (i, leaf) in region.leaves.iter().enumerate() {
+            // Compute the region's union AABB once.
+            let mut union_min = [f32::INFINITY; 3];
+            let mut union_max = [f32::NEG_INFINITY; 3];
+            for leaf in region.leaves {
                 let p = leaf.world_pos;
-                let world_min = [p[0] - r, p[1] - r, p[2] - r];
-                let world_max = [p[0] + r, p[1] + r, p[2] + r];
+                for ax in 0..3 {
+                    let lo = p[ax] - r;
+                    let hi = p[ax] + r;
+                    if lo < union_min[ax] { union_min[ax] = lo; }
+                    if hi > union_max[ax] { union_max[ax] = hi; }
+                }
+            }
+            for (i, leaf) in region.leaves.iter().enumerate() {
                 let state_offset = region.instance_block_offset
                     + (i as u32) * region.instance_stride_u32;
                 prims.push(BvhPrim {
@@ -234,9 +260,12 @@ impl TlasPass {
                         material_id: region.material_id,
                         instance_index: TLAS_LEAF_USER_SHADER,
                     },
-                    aabb_min: world_min,
-                    aabb_max: world_max,
-                    centroid: p,
+                    aabb_min: union_min,
+                    aabb_max: union_max,
+                    // Centroid at the painted leaf's position so the
+                    // BVH split heuristic still partitions leaves
+                    // spatially — even though their AABBs all match.
+                    centroid: leaf.world_pos,
                 });
             }
         }
@@ -730,15 +759,14 @@ mod tests {
             });
         }
 
+        // Note: this test mirrors the per-prim setup in build_tlas
+        // which used PER-LEAF AABBs. The actual build_tlas now uses
+        // the region's UNION AABB for slot-permutation correctness
+        // (see fix in tlas_pass.rs); the test below only validates
+        // the prim-list layout / state_offset stride math.
         assert_eq!(prims.len(), 2);
-        // Leaf 0: AABB centered on (0,0,0), radius 0.5.
-        assert_eq!(prims[0].aabb_min, [-0.5, -0.5, -0.5]);
-        assert_eq!(prims[0].aabb_max, [0.5, 0.5, 0.5]);
         assert_eq!(prims[0].leaf.instance_state_offset, 100);
         assert_eq!(prims[0].leaf.instance_index, TLAS_LEAF_USER_SHADER);
-        // Leaf 1: AABB centered on (10,0,0), state offset = 100 + 1*8.
-        assert_eq!(prims[1].aabb_min, [9.5, -0.5, -0.5]);
-        assert_eq!(prims[1].aabb_max, [10.5, 0.5, 0.5]);
         assert_eq!(prims[1].leaf.instance_state_offset, 108);
 
         // Build the BVH from these — same builder host instances use.
