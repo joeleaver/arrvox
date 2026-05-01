@@ -402,6 +402,16 @@ fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: 
         }
         if (node & OCTREE_LEAF_BIT) != 0u {
             bucket_depth(phase, level);
+            // Phase B-redux 3b — band cells (Phase 4 wires real
+            // descent here). Treat as EMPTY for now; shadow rays
+            // pass through. Without this gate the band cell's
+            // payload would be misread as a regular leaf-attr slot
+            // index, the slot bytes (an anchor world-pos float)
+            // bitcast to garbage opacity, and the band volume
+            // would cast a solid AABB shadow.
+            if (node & OCTREE_BAND_BIT) != 0u {
+                return OctreeResult(OCTREE_EMPTY, level, center, half);
+            }
             return OctreeResult(node & OCTREE_PAYLOAD_MASK | (node & OCTREE_BRICK_BIT), level, center, half);
         }
         let gt = vec3<u32>(pos >= center);
@@ -418,6 +428,10 @@ fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: 
     if node == OCTREE_EMPTY { return OctreeResult(OCTREE_EMPTY, max_depth, center, half); }
     if node == OCTREE_INTERIOR { return OctreeResult(OCTREE_INTERIOR, max_depth, center, half); }
     if (node & OCTREE_LEAF_BIT) != 0u {
+        if (node & OCTREE_BAND_BIT) != 0u {
+            // Phase B-redux 3b — band cells skipped at max_depth too.
+            return OctreeResult(OCTREE_EMPTY, max_depth, center, half);
+        }
         return OctreeResult(node & OCTREE_PAYLOAD_MASK | (node & OCTREE_BRICK_BIT), max_depth, center, half);
     }
     return OctreeResult(OCTREE_EMPTY, max_depth, center, half);

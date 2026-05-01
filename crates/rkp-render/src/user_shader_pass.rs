@@ -307,11 +307,10 @@ pub const MAX_GLOBAL_OCTREE_NODES: u32 = 50_000_000;
 /// max-depth band cell.
 pub const MAX_GLOBAL_BAND_CELLS: u32 = 16_000_000;
 
-/// Phase B-redux 3b — max regions per frame for the band-region
-/// metadata table. Each `GpuBandRegion` is 16 B carrying
-/// `(shader_id, material_id, _pad, _pad)`. Indexed by
-/// `GpuBandCell.region_index`. Same cap as `MAX_REGIONS`.
-pub const MAX_BAND_REGIONS: u32 = MAX_REGIONS;
+// Note: an earlier draft of 3b carried a separate `GpuBandRegion`
+// table indexed by `BandCell.region_index`. V1 ships material_id
+// directly on the BandCell instead — the table was dropped to
+// avoid a new march binding for one tiny lookup.
 
 /// Persistent fill-task pool capacity. Each `BrickFillTask` is 32 B.
 /// At depth 5, each 1 m tile produces up to ~32 K fill tasks worst
@@ -1048,33 +1047,22 @@ const _: () = assert!(std::mem::size_of::<RegionUniform>() == 208);
 // future revision that uses `_pad0..2` slots in `GpuBandCell` and
 // extends the descent loop in march.
 
-/// Per-band-cell payload, 16 B. Reinterpreted at the leaf-attr-pool
-/// slot indexed by the octree node's payload bits when `OCTREE_BAND_BIT`
-/// is set... NOT in V1 — `band_cell_pool` is a separate buffer (the
-/// 16-B record doesn't fit in an 8-B leaf-attr slot).
+/// Per-band-cell payload, 16 B. The bake (`user_shader_geom.wgsl`)
+/// packs this across two consecutive `leaf_attr_pool` slots; the
+/// march (`octree_march.wgsl::read_band_cell`) reads it back.
+///
+/// V1 carries `material_id` directly per cell — the painted host
+/// material that drove this region's bake. shader_id flows through
+/// `materials[material_id].shader_id`. Self-contained so the march
+/// doesn't need a per-region metadata table.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuBandCell {
     pub anchor_world_pos: [f32; 3],
-    pub region_index: u32,
+    pub material_id: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<GpuBandCell>() == 16);
-
-/// Per-region metadata for the band-cell march path. Indexed by
-/// `GpuBandCell.region_index`. `shader_id` drives
-/// `dispatch_user_instance_descend`; `material_id` selects
-/// `shader_params[material_id * 8 + N]` for `ctx.params[N]`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GpuBandRegion {
-    pub shader_id: u32,
-    pub material_id: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
-}
-
-const _: () = assert!(std::mem::size_of::<GpuBandRegion>() == 16);
 
 /// Per-dispatch state for `classify_main`. Re-uploaded between levels.
 #[repr(C)]

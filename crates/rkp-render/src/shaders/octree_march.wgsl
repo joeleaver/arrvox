@@ -169,7 +169,7 @@ struct MarchParams {
 }
 
 // Phase B-redux 3b — band-cell wire format. Mirrors
-// `crate::user_shader_pass::{GpuBandCell, GpuBandRegion}`.
+// `crate::user_shader_pass::GpuBandCell`.
 //
 // Bake (3b.2) emits one `BandCell` per max-depth cell in the band
 // around painted host leaves. The cell's octree node carries
@@ -180,20 +180,16 @@ struct MarchParams {
 // V1 single-anchor: each band cell stores its single nearest painted
 // host leaf's world center. V2 multi-anchor (up to 4) extends this
 // struct + the descent loop in march.
+//
+// `material_id` is the painted host material that drove this
+// region's bake. It carries `shader_id` (for `dispatch_user_instance_
+// descend`) and selects `shader_params` for `ctx.params`. Stored
+// per-cell because the user-shader REGION instance's
+// `inst.material_id` is hardcoded to 0 (`transient_asset_and_instance`)
+// and there's no per-region metadata table bound at the march.
 struct BandCell {
     anchor_world_pos: vec3<f32>,
-    region_index: u32,
-}
-
-// Per-region metadata for the band-cell march path. Indexed by
-// `BandCell.region_index`. `shader_id` selects the dispatch arm in
-// `dispatch_user_instance_descend`; `material_id` selects
-// `shader_params[material_id * 8 + N]` for `ctx.params[N]`.
-struct BandRegion {
-    shader_id: u32,
     material_id: u32,
-    _pad0: u32,
-    _pad1: u32,
 }
 
 const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;
@@ -1011,7 +1007,7 @@ fn read_band_cell(band_off: u32) -> BandCell {
         bitcast<f32>(s0.material_packed),
         bitcast<f32>(s1.normal_oct),
     );
-    c.region_index = s1.material_packed;
+    c.material_id = s1.material_packed;
     return c;
 }
 
@@ -1096,6 +1092,15 @@ struct MarchResult {
     // behind it (which is what `first_slot` records). 0 when the
     // ray didn't hit glass.
     glass_slot: u32,
+    // Phase B-redux 3b — for band-cell hits, the painted host
+    // material that drove the bake. The user-shader REGION
+    // instance's `inst.material_id` is hardcoded to 0
+    // (`transient_asset_and_instance`), so main() can't read it
+    // off the instance — the band cell carries it on the leaf
+    // payload, and march_object copies it here. Zero on non-band
+    // user-shader hits (proto-baked instances inherit material
+    // through their host).
+    user_shader_material_id: u32,
 }
 
 // Pack a unit normal into an oct u32 — mirror of `unpack_oct_normal`
@@ -1203,6 +1208,7 @@ fn march_object_skinned(
         false, vec3<f32>(0.0), vec3<f32>(0.0),
         false, vec3<f32>(0.0), 0u, 0.0, 0.0,
         0u, // glass_slot
+        0u, // user_shader_material_id (Phase 3b)
     );
 
     let inv_world = mat4_affine_inverse(inst.world);
@@ -1530,6 +1536,7 @@ fn march_object(
         false, vec3<f32>(0.0), vec3<f32>(0.0),
         false, vec3<f32>(0.0), 0u, 0.0, 0.0,
         0u, // glass_slot
+        0u, // user_shader_material_id (Phase 3b)
     );
 
     // Phase 4c — branch on user-shader assets. The DDA loop downstream
@@ -1892,11 +1899,13 @@ fn march_object(
             let band = read_band_cell(band_off);
 
             // Resolve the prototype asset by linear scan for the
-            // shader_id matching this object's painted material.
-            // V1 — small registry; a uniform table is a future
-            // optimization (mirrors the same scan in main()'s
-            // Phase 3a host-hit dispatch).
-            let mat = materials[inst.material_id];
+            // shader_id matching the band cell's painted host
+            // material. The band cell carries `material_id` (NOT the
+            // user-shader region instance's `inst.material_id`, which
+            // is hardcoded to 0 in `transient_asset_and_instance`);
+            // shader_id flows through the host material entry.
+            let band_mat_id = band.material_id;
+            let mat = materials[band_mat_id];
             let shader_id = mat.shader_id;
             var proto_idx: u32 = 0xFFFFFFFFu;
             if shader_id != 0u {
@@ -1920,7 +1929,7 @@ fn march_object(
             var host_sample: HostSample;
             host_sample.distance = 0.0;
             host_sample.normal = vec3<f32>(0.0, 1.0, 0.0);
-            host_sample.material = inst.material_id;
+            host_sample.material = band_mat_id;
             host_sample.material_secondary = 0u;
             host_sample.blend_weight = 0u;
 
@@ -1929,11 +1938,11 @@ fn march_object(
             // Cell scale at max_depth — passed to the shader as a
             // hint for blade dimensions. For V1 the band cell's own
             // size is the simplest proxy; future revisions could
-            // pipe the host's voxel size through `BandRegion`.
+            // pipe the host's voxel size on the BandCell payload.
             ctx.cell_size = r.cell_half * 2.0;
-            ctx.material_id = inst.material_id;
+            ctx.material_id = band_mat_id;
             ctx.aabb_min = vec3<f32>(0.0);
-            let pbase = inst.material_id * 8u;
+            let pbase = band_mat_id * 8u;
             ctx.params[0] = shader_params[pbase + 0u];
             ctx.params[1] = shader_params[pbase + 1u];
             ctx.params[2] = shader_params[pbase + 2u];
@@ -1972,6 +1981,7 @@ fn march_object(
                 result.oc_pos = vec3<f32>(0.0); // unused on user-shader path
                 result.valid = true;
                 result.steps = step_count;
+                result.user_shader_material_id = band_mat_id;
                 break;
             }
             // No hit — skip past the cell.
@@ -2385,7 +2395,14 @@ fn main(
             // step. (project_user_shaders_option_b_stage1 locked
             // host-material inheritance as the V1 default.)
             if r.is_user_shader_hit {
-                first_mat_id = inst.material_id;
+                // Phase B-redux 3b — band-cell hits override
+                // `inst.material_id` (= 0 for user-shader regions) with
+                // the painted host material the band cell stamped on.
+                if r.user_shader_material_id != 0u {
+                    first_mat_id = r.user_shader_material_id;
+                } else {
+                    first_mat_id = inst.material_id;
+                }
                 first_sec_mat = 0u;
                 first_blend = 0u;
                 first_leaf_slot = r.first_slot;
@@ -2423,7 +2440,11 @@ fn main(
             closest_obj_idx = i;
             // Same host-material inheritance as the opaque branch.
             if r.is_user_shader_hit {
-                first_mat_id = inst.material_id;
+                if r.user_shader_material_id != 0u {
+                    first_mat_id = r.user_shader_material_id;
+                } else {
+                    first_mat_id = inst.material_id;
+                }
                 first_sec_mat = 0u;
                 first_blend = 0u;
                 first_leaf_slot = r.first_slot;

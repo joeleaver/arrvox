@@ -207,6 +207,11 @@ fn octree_lookup_no_stats(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>
             return OctreeResult(OCTREE_INTERIOR, level, center, half);
         }
         if (node & OCTREE_LEAF_BIT) != 0u {
+            // Phase B-redux 3b — band cells skipped (don't cast
+            // shadow). Phase 4 will wire descent here.
+            if (node & OCTREE_BAND_BIT) != 0u {
+                return OctreeResult(OCTREE_EMPTY, level, center, half);
+            }
             return OctreeResult(node & OCTREE_PAYLOAD_MASK | (node & OCTREE_BRICK_BIT), level, center, half);
         }
         let gt = vec3<u32>(pos >= center);
@@ -222,6 +227,9 @@ fn octree_lookup_no_stats(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>
     if node == OCTREE_EMPTY { return OctreeResult(OCTREE_EMPTY, max_depth, center, half); }
     if node == OCTREE_INTERIOR { return OctreeResult(OCTREE_INTERIOR, max_depth, center, half); }
     if (node & OCTREE_LEAF_BIT) != 0u {
+        if (node & OCTREE_BAND_BIT) != 0u {
+            return OctreeResult(OCTREE_EMPTY, max_depth, center, half);
+        }
         return OctreeResult(node & OCTREE_PAYLOAD_MASK | (node & OCTREE_BRICK_BIT), max_depth, center, half);
     }
     return OctreeResult(OCTREE_EMPTY, max_depth, center, half);

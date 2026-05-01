@@ -612,7 +612,13 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 leaf_attr_pool[abs_off] = s0;
                 var s1: LeafAttr;
                 s1.normal_oct = bitcast<u32>(anchor.z);
-                s1.material_packed = cell.region_index;
+                // Phase B-redux 3b — store the painted host material
+                // ID on the band cell so the march can resolve
+                // shader_id + ctx.params without a per-region lookup
+                // table. The user-shader REGION instance's
+                // `inst.material_id` is hardcoded to 0
+                // (`transient_asset_and_instance`).
+                s1.material_packed = cur_region.material_id;
                 leaf_attr_pool[abs_off + 1u] = s1;
                 octree_nodes[cell.octree_offset] = vec2<u32>(
                     OCTREE_LEAF_BIT | OCTREE_BAND_BIT | abs_off,
