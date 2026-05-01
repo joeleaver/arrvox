@@ -82,6 +82,15 @@ pub struct ShadeParams {
     pub time: f32,
     pub brush_center: [f32; 4],
     pub brush_color: [f32; 4],
+    /// Phase 8 S3 — non-zero ⇒ directional shadow comes from the
+    /// shadow-map sample at group 1 binding 3 instead of the
+    /// half-res ray-traced shadow_tex. Zero leaves the per-pixel
+    /// path live (used pre-S5 cutover or whenever the engine has
+    /// no live shadow map this frame).
+    pub shadow_map_enabled: u32,
+    pub _pad3: u32,
+    pub _pad4: u32,
+    pub _pad5: u32,
 }
 
 impl Default for ShadeParams {
@@ -105,6 +114,10 @@ impl Default for ShadeParams {
             time: 0.0,
             brush_center: [0.0, 0.0, 0.0, 0.0],
             brush_color: [1.0, 0.85, 0.2, 1.0],
+            shadow_map_enabled: 0,
+            _pad3: 0,
+            _pad4: 0,
+            _pad5: 0,
         }
     }
 }
@@ -204,11 +217,33 @@ impl RkpShadePass {
                 ],
             });
 
-        // Group 1: shadow texture + SSAO texture
+        // Group 1: shadow texture + SSAO texture + (Phase 8 S3)
+        // light_camera uniform + shadow_map texture. The new
+        // bindings are dormant until the engine flips
+        // `ShadeParams.shadow_map_enabled` to 1 in S4; binding the
+        // placeholders pre-S4 keeps validation happy.
         let ssao_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("rkp_shade shadow+ssao"),
-                entries: &[texture_entry(0), texture_entry(1)],
+                label: Some("rkp_shade shadow+ssao+shadowmap"),
+                entries: &[
+                    texture_entry(0),
+                    texture_entry(1),
+                    // light_camera uniform — wire format mirrors
+                    // `shadow_map_pass::LightCameraUniform` (160 B).
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Shadow map (R32Float; sampled, non-filterable —
+                    // shade reads via `textureLoad`).
+                    texture_entry(3),
+                ],
             });
 
         // Group 2: output HDR texture
@@ -540,15 +575,22 @@ impl RkpShadePass {
         }));
     }
 
-    /// Set shadow texture + SSAO texture views.
+    /// Set shadow texture + SSAO texture + (Phase 8 S3) shadow-map
+    /// texture + light-camera uniform. Pre-S4 the engine can pass
+    /// the same `shadow_view` again as `shadow_map_view` and any
+    /// 160-byte uniform buffer for `light_camera_buffer` — the WGSL
+    /// gates on `ShadeParams.shadow_map_enabled`, so the bindings
+    /// are dormant until the dispatch path lands.
     pub fn set_shadow_and_ssao(
         &mut self,
         device: &wgpu::Device,
         shadow_view: &wgpu::TextureView,
         ssao_view: &wgpu::TextureView,
+        shadow_map_view: &wgpu::TextureView,
+        light_camera_buffer: &wgpu::Buffer,
     ) {
         self.ssao_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rkp_shade shadow+ssao bg"),
+            label: Some("rkp_shade shadow+ssao+shadowmap bg"),
             layout: &self.ssao_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -558,6 +600,14 @@ impl RkpShadePass {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(ssao_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: light_camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(shadow_map_view),
                 },
             ],
         }));
@@ -768,4 +818,31 @@ fn build_shade_pipeline(
         compilation_options: Default::default(),
         cache: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shade_params_size_is_144() {
+        // Phase 8 S3 added shadow_map_enabled + 3 pad u32s after
+        // brush_color (vec4). Lock the new size against drift —
+        // the WGSL `ShadeParams` mirror depends on it.
+        assert_eq!(std::mem::size_of::<ShadeParams>(), 144);
+    }
+
+    #[test]
+    fn rkp_shade_shader_is_valid_wgsl() {
+        // Compose with no user chunk to exercise the in-tree
+        // template (identity stub stays put).
+        let src = compose_shade_source("");
+        let module = naga::front::wgsl::parse_str(&src)
+            .unwrap_or_else(|e| panic!("parse error:\n{}", e.emit_to_string(&src)));
+        let mut v = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        v.validate(&module).unwrap_or_else(|e| panic!("validation error: {e:?}"));
+    }
 }

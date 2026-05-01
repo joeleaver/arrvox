@@ -1092,6 +1092,18 @@ fn render_one_frame(
             &frame.user_shader_inst_aabb_chunk,
             frame.user_shader_source_hash,
         );
+        // Phase 8 — shadow_map_march descends into user-shader
+        // instances through the same `inst_to_local` / `inst_aabb`
+        // hooks the host march and shadow trace use. Without
+        // splicing, the pass runs against the identity stubs and
+        // user-shader instances (e.g. grass blades) cast no
+        // shadow because the depth march can't find their geometry.
+        vr.shadow_map.reload_user_shaders(
+            &state.device,
+            &frame.user_shader_inst_to_local_chunk,
+            &frame.user_shader_inst_aabb_chunk,
+            frame.user_shader_source_hash,
+        );
         vr.shade.upload_shader_params(
             &state.device,
             &state.queue,
@@ -1303,19 +1315,38 @@ fn render_one_frame(
             &state.device,
             &state.shadow_tile_cull_pass.bitmap_buffer,
         );
+        // Phase 8 S4 — shadow-map pass reads the same TLAS as the
+        // shadow trace; rebind whenever the buffers reallocate.
+        vr.shadow_map.set_tlas_buffers(
+            &state.device,
+            &state.tlas_pass.nodes_buffer,
+            &state.tlas_pass.leaves_buffer,
+        );
     }
+
+    // Phase 8 S4 — directional shadow map. Picks the first
+    // directional light, derives the light camera covering the
+    // scene AABB, writes the uniform into every VR. Returns
+    // whether the shadow map will be live this frame; the shade
+    // pass gates its sample on that. Texture dispatch happens
+    // later in `render_to`.
+    let shadow_map_enabled = prepare_shadow_maps(state, frame, scene_aabb, tlas_prim_count);
 
     // Phase 7d — build the directional-shadow tile bitmap. Scans
     // the scene's lights for the first directional one, derives a
     // light-space basis + grid, dispatches the mark pass over the
     // assembled `tlas_prims`. Result is consumed per-pixel by the
     // shadow trace's `shadow_tile_has_caster` helper.
-    let shadow_tile_cull = build_shadow_tile_bitmap(
-        state,
-        frame,
-        scene_aabb,
-        tlas_prim_count,
-    );
+    //
+    // Phase 8 S5 — skipped entirely when the shadow map is live.
+    // The shadow trace's directional rays are gated off in that
+    // case (see `march_params.shadow_map_enabled`), so the
+    // bitmap has no consumer.
+    let shadow_tile_cull = if shadow_map_enabled {
+        rkp_render::octree_march::ShadowTileCullParams::disabled()
+    } else {
+        build_shadow_tile_bitmap(state, frame, scene_aabb, tlas_prim_count)
+    };
 
     // 2. Skin scatter (one batched compute dispatch). Sim folded every
     //    skinned entity into `frame.skin.batch`; we just fire it.
@@ -1418,10 +1449,20 @@ fn render_one_frame(
         vr.volumetric.update_cloud_params(&state.queue, &vp.cloud_params);
         vr.god_rays.update_params(&state.queue, &vp.god_ray_params);
 
-        // 3c. Per-VR shade params (isolation-aware).
+        // 3c. Per-VR shade params (isolation-aware). Phase 8 S4 —
+        // flip shadow_map_enabled in lockstep with the shadow-map
+        // dispatch gate so the shade pass samples the fresh map
+        // when one was rendered. Isolation/raymarch leave it 0 so
+        // the existing forced-1.0 / shadow_data path stays in
+        // charge.
+        let mut shade_params = vp.shade_params;
+        let in_situ = matches!(vp.mode, rkp_render::RenderMode::InSitu);
+        let raymarch = matches!(vp.preview_mode, rkp_render::BuildPreviewMode::Raymarch);
+        let vr_shadow_map_live = shadow_map_enabled && in_situ && !raymarch;
+        shade_params.shadow_map_enabled = u32::from(vr_shadow_map_live);
         state
             .renderer
-            .update_shade_params(&state.queue, &vp.shade_params);
+            .update_shade_params(&state.queue, &shade_params);
 
         // 3d. Bloom-composite intensity (zero in isolation mode).
         vr.bloom_composite
@@ -1545,6 +1586,7 @@ fn render_one_frame(
             vp.tile_count_x,
             state.tlas_pass.last_node_count,
             shadow_tile_cull,
+            shadow_map_enabled,
             &vp.atmo_frame,
             vp.mode,
             vp.preview_mode,
@@ -2060,6 +2102,55 @@ fn build_shadow_tile_bitmap(
         right,
         up,
     }
+}
+
+/// Phase 8 S4 — derive the directional light camera + write the
+/// per-VR LightCameraUniform. Returns `true` when the shadow map
+/// will be live this frame (directional light present + non-empty
+/// TLAS), which is the gate the shade pass uses to swap from the
+/// half-res ray-traced shadow path to the shadow-map sample.
+///
+/// V1 mirrors `build_shadow_tile_bitmap`'s "first directional
+/// light" picker — multi-directional support comes later (CSM /
+/// per-light maps).
+fn prepare_shadow_maps(
+    state: &mut RenderState,
+    frame: &RenderFrame,
+    scene_aabb: ([f32; 3], [f32; 3]),
+    tlas_prim_count: u32,
+) -> bool {
+    use rkp_render::shadow_map_pass::compute_light_camera;
+    if tlas_prim_count == 0 {
+        return false;
+    }
+    let Some(light) = frame
+        .lights
+        .iter()
+        .find(|l| (l.position[3] as u32) == 0 && l.params[3] >= 0.5)
+    else {
+        return false;
+    };
+    let light_dir = [light.direction[0], light.direction[1], light.direction[2]];
+    // Re-derive a per-VR uniform; the shadow-map texture is shared
+    // across VRs of the same scene (one directional light → one
+    // map), but each VR's `shadow_map.uniform_buffer` is its own
+    // binding so the shade pass can read it from group 1.
+    let depth_bias = 0.001; // empirical — refine in S5 perf pass
+    let uniform = compute_light_camera(
+        scene_aabb.0,
+        scene_aabb.1,
+        light_dir,
+        rkp_render::shadow_map_pass::SHADOW_MAP_DEFAULT_SIZE,
+        depth_bias,
+    );
+    for vr in state.viewport_renderers.values_mut() {
+        state.queue.write_buffer(
+            &vr.shadow_map.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&uniform),
+        );
+    }
+    true
 }
 
 /// Phase 5 retired Option B's per-frame TileIndex + ProtoLookup

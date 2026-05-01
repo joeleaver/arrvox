@@ -217,6 +217,13 @@ impl RkpRenderer {
         tile_count_x: u32,
         tlas_node_count: u32,
         shadow_tile_cull: crate::octree_march::ShadowTileCullParams,
+        // Phase 8 S4 — when true, dispatch the shadow-map march
+        // after primary visibility. Engine sets this when there's
+        // a live directional shadow caster (non-empty TLAS +
+        // shadow-casting directional light); ShadeParams.
+        // shadow_map_enabled is in lockstep so shade samples the
+        // fresh map.
+        shadow_map_enabled: bool,
         atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
         mode: crate::RenderMode,
         preview_mode: crate::BuildPreviewMode,
@@ -260,7 +267,8 @@ impl RkpRenderer {
                 encoder, queue, &viewport.scene_bind_group,
                 object_count, viewport.width, viewport.height, 0,
                 shadow_steps, num_lights, lod_enabled, surfacenet_enabled,
-                tile_count_x, tlas_node_count, shadow_tile_cull, None,
+                tile_count_x, tlas_node_count, shadow_tile_cull,
+                shadow_map_enabled, None,
             );
             self.profiler.end_query(encoder, q);
         }
@@ -273,6 +281,19 @@ impl RkpRenderer {
                 viewport.shadow_trace.dispatch(encoder, &viewport.scene_bind_group, params_bg);
                 self.profiler.end_query(encoder, q);
             }
+        }
+
+        // 1c. Phase 8 — directional shadow map. Same in-situ/non-
+        // raymarch gate as shadow_trace; the engine flips
+        // `shadow_map_enabled` based on whether a directional
+        // caster + non-empty TLAS exists this frame. The shade
+        // pass reads the resulting depth texture for directional
+        // visibility; non-directional lights still pull from the
+        // half-res shadow_trace output.
+        if in_situ && !raymarch && shadow_map_enabled {
+            let q = self.profiler.begin_query("shadow_map", encoder);
+            viewport.shadow_map.dispatch(encoder, &viewport.scene_bind_group);
+            self.profiler.end_query(encoder, q);
         }
         if !raymarch {
             viewport.march.copy_stats(encoder);

@@ -112,6 +112,12 @@ struct MarchParams {
     shadow_tile_size: f32,
     shadow_tile_right: vec3<f32>,
     shadow_tile_up: vec3<f32>,
+    // Phase 8 S5 — `1` ⇒ a shadow-map march wrote a directional
+    // depth texture this frame; the per-pixel directional rays in
+    // this pass are redundant and skipped (their shadow_data slot
+    // is filled with 1.0; the shade pass reads sample_shadow_map
+    // for those lights instead).
+    shadow_map_enabled: u32,
 }
 
 struct GpuLight {
@@ -1066,6 +1072,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if cast_shadow < 0.5 { continue; }
 
             let light_type = u32(light.position.w);
+
+            // Phase 8 S5 — directional lights are served by the
+            // shadow-map sample in the shade pass. Skip the
+            // expensive per-pixel BVH descent here. Shade reads
+            // `sample_shadow_map(world_pos)` for those lights;
+            // `shadow_values[shadow_idx]` is written to 1.0 as an
+            // unused-but-defined sentinel and `shadow_idx`
+            // advances so the per-light slot mapping stays in
+            // sync with shade's reader (which advances the same
+            // way for both branches).
+            if light_type == 0u && march_params.shadow_map_enabled != 0u {
+                shadow_values[shadow_idx] = 1.0;
+                shadow_idx++;
+                continue;
+            }
+
             var shadow_dir: vec3<f32>;
             var shadow_max_dist = 1e20;
 

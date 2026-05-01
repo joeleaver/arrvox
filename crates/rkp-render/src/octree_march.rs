@@ -85,7 +85,16 @@ pub struct MarchParams {
     pub shadow_tile_right: [f32; 3],
     pub _pad0: u32,
     pub shadow_tile_up: [f32; 3],
-    pub _pad1: u32,
+    /// Phase 8 S5 — `1` ⇒ engine has dispatched the shadow-map
+    /// march this frame; shadow trace's directional rays are
+    /// redundant. The shadow trace iterates the full
+    /// `lights[0..num_lights]` array; setting this skips the
+    /// expensive BVH descent for any `light_type == 0u` light
+    /// and writes `1.0` into its `shadow_data` slot (shade reads
+    /// `sample_shadow_map` for that light's visibility, so the
+    /// stored value is unused either way). Spot/point shadows
+    /// keep the per-pixel ray-traced path.
+    pub shadow_map_enabled: u32,
 }
 
 /// Phase 7d — packed shadow tile cull parameters passed to
@@ -873,6 +882,7 @@ impl OctreeMarchPass {
         tile_count_x: u32,
         tlas_node_count: u32,
         shadow_tile_cull: ShadowTileCullParams,
+        shadow_map_enabled: bool,
         timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) {
         // Update params.
@@ -894,7 +904,7 @@ impl OctreeMarchPass {
             shadow_tile_right: shadow_tile_cull.right,
             _pad0: 0,
             shadow_tile_up: shadow_tile_cull.up,
-            _pad1: 0,
+            shadow_map_enabled: u32::from(shadow_map_enabled),
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
 

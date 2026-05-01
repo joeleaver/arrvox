@@ -56,6 +56,15 @@ struct ShadeParams {
     time: f32,
     brush_center: vec4<f32>,
     brush_color: vec4<f32>,
+    // Phase 8 S3 — non-zero ⇒ directional shadow reads from the
+    // shadow-map sample at group 1 binding 3 instead of the per-
+    // pixel ray-traced shadow_data. Zero leaves the per-pixel path
+    // live (used pre-S5 cutover or whenever the engine has no live
+    // shadow map this frame).
+    shadow_map_enabled: u32,
+    _pad3: u32,
+    _pad4: u32,
+    _pad5: u32,
 }
 
 // 8 user-named scalar params per material, packed as two vec4s (32
@@ -182,6 +191,23 @@ fn mat_subsurface_color(m: Material) -> vec3<f32> {
 @group(1) @binding(0) var shadow_tex: texture_2d<f32>;
 @group(1) @binding(1) var ssao_tex: texture_2d<f32>;
 
+// Phase 8 S3 — directional shadow map. Wire-format mirror of
+// `rkp_render::shadow_map_pass::LightCameraUniform` (160 B).
+// `shadow_map` is R32Float (non-filterable; sampled via
+// `textureLoad` with integer coords). Both bindings are present
+// even pre-S4; the WGSL gates reads on
+// `shade_params.shadow_map_enabled`.
+struct LightCameraShade {
+    view_proj: mat4x4<f32>,
+    view_proj_inv: mat4x4<f32>,
+    light_dir: vec3<f32>,
+    depth_bias: f32,
+    inv_shadow_map_size: vec2<f32>,
+    shadow_map_size: vec2<u32>,
+}
+@group(1) @binding(2) var<uniform> light_camera: LightCameraShade;
+@group(1) @binding(3) var shadow_map: texture_2d<f32>;
+
 // Group 2: output HDR color (write, full-res)
 @group(2) @binding(0) var output: texture_storage_2d<rgba16float, write>;
 
@@ -206,6 +232,50 @@ fn mat_subsurface_color(m: Material) -> vec3<f32> {
 // Indexed by the slot written to `gbuf_leaf_slot`; 0 is the no-hit
 // sentinel so the lookup must guard `slot != 0u`.
 @group(6) @binding(0) var<storage, read> brush_overlay_distances: array<f32>;
+
+// ── Phase 8 S3 — directional shadow-map sample ─────────────────
+//
+// Project `world_pos` through the light camera, look up the
+// shadow-map texel, depth-compare against the surface's projected
+// NDC z. Returns 1.0 (lit) or 0.0 (shadowed).
+//
+// Pixels that project outside the shadow map's clip volume return
+// 1.0 — the light extends past the map's coverage; treating those
+// regions as shadowed would produce abrupt dark bands at the edge
+// of the map. CSM is the proper fix; V1 just lights them.
+//
+// `depth_bias` is a constant offset applied to the surface depth
+// before the compare; it eats up slope-scale + acne. Positive
+// pushes the surface toward the light (less self-shadowing) at
+// the cost of peter-panning. The engine sources it from
+// `compute_light_camera`'s `depth_bias` parameter.
+fn sample_shadow_map(world_pos: vec3<f32>) -> f32 {
+    let clip = light_camera.view_proj * vec4<f32>(world_pos, 1.0);
+    if clip.w <= 0.0 { return 1.0; }
+    let ndc = clip.xyz / clip.w;
+    if ndc.x < -1.0 || ndc.x > 1.0
+        || ndc.y < -1.0 || ndc.y > 1.0
+        || ndc.z < 0.0 || ndc.z > 1.0 {
+        return 1.0;
+    }
+    // NDC → texel. The shadow march writes texel (tx, ty) at
+    // `ndc.x = (tx + 0.5)/W * 2 - 1, ndc.y = 1 - (ty + 0.5)/H * 2`,
+    // so the inverse is `tx = (ndc.x + 1) * 0.5 * W`,
+    // `ty = (1 - ndc.y) * 0.5 * H` — same y-flip the march applies.
+    let size_f = vec2<f32>(light_camera.shadow_map_size);
+    let texel_f = vec2<f32>(
+        (ndc.x * 0.5 + 0.5) * size_f.x,
+        (1.0 - (ndc.y * 0.5 + 0.5)) * size_f.y,
+    );
+    let texel = clamp(
+        vec2<i32>(texel_f),
+        vec2<i32>(0),
+        vec2<i32>(light_camera.shadow_map_size) - vec2<i32>(1),
+    );
+    let map_z = textureLoad(shadow_map, texel, 0).x;
+    let surface_z = ndc.z;
+    return select(0.0, 1.0, surface_z - light_camera.depth_bias <= map_z);
+}
 
 // Aerial-perspective LUT slice parameterization — must match rkp_aerial_perspective_lut.wgsl.
 // Slice z stores the camera-to-d(z) atmospheric integral under an exponential
@@ -883,7 +953,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         var light_shadow = 1.0;
         let cast_shadow = light.params.w;
         if cast_shadow >= 0.5 && shadow_idx < 4u {
-            light_shadow = shadow_data[shadow_idx];
+            // Phase 8 S3 — directional lights pull from the shadow
+            // map when enabled; everything else still reads the
+            // half-res ray-traced shadow_data. We always advance
+            // `shadow_idx` so the per-pixel slot mapping (set up
+            // by rkp_shadow_trace) stays in sync regardless of
+            // which path provided the visibility.
+            if light_type == 0u && shade_params.shadow_map_enabled != 0u {
+                light_shadow = sample_shadow_map(world_pos);
+            } else {
+                light_shadow = shadow_data[shadow_idx];
+            }
             shadow_idx++;
         }
 

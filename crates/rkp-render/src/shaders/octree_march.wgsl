@@ -155,6 +155,7 @@ struct MarchParams {
     shadow_tile_size: f32,
     shadow_tile_right: vec3<f32>,
     shadow_tile_up: vec3<f32>,
+    shadow_map_enabled: u32,
 }
 
 const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;

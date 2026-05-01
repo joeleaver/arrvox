@@ -20,6 +20,7 @@ use crate::proc_raymarch::ProcRaymarchPass;
 use crate::proc_outline::ProcOutlinePass;
 use crate::proc_ghost::ProcGhostPass;
 use crate::rkp_shadow_trace::ShadowTracePass;
+use crate::shadow_map_pass::{ShadowMapPass, SHADOW_MAP_DEFAULT_SIZE};
 use crate::rkp_ssao::RkpSsaoPass;
 use crate::rkp_shade::RkpShadePass;
 use crate::rkp_volumetric::RkpVolumetricPass;
@@ -56,6 +57,13 @@ pub struct ViewportRenderer {
     /// host selects based on the current tree selection.
     pub proc_ghost: ProcGhostPass,
     pub shadow_trace: ShadowTracePass,
+    /// Phase 8 — directional shadow map (light-POV depth march).
+    /// One shared per-VR depth texture; resolution is fixed at
+    /// `SHADOW_MAP_DEFAULT_SIZE` regardless of viewport size (the
+    /// map covers the whole scene). S3 just creates the pass and
+    /// binds its texture / uniform into shade; S4 will wire the
+    /// per-frame dispatch.
+    pub shadow_map: ShadowMapPass,
     pub ssao: RkpSsaoPass,
     pub shade: RkpShadePass,
     pub glass: crate::rkp_glass::RkpGlassPass,
@@ -159,6 +167,16 @@ impl ViewportRenderer {
         );
         shadow_trace.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view);
 
+        // Phase 8 S3 — shadow map pass. Dormant until S4 plumbs the
+        // per-frame dispatch + shade-side enable flag; constructed
+        // here so the shade pass's group 1 has a real texture +
+        // uniform to bind to.
+        let shadow_map = ShadowMapPass::new(
+            device,
+            SHADOW_MAP_DEFAULT_SIZE,
+            &renderer.scene.bind_group_layout,
+        );
+
         let mut shade = RkpShadePass::new(device, width, height);
         shade.set_shade_data(
             device,
@@ -180,7 +198,13 @@ impl ViewportRenderer {
         // hits land in the host G-buffer through the unified march
         // pipeline.
         shade.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &gbuffer.glass_view, &gbuffer.leaf_slot_view);
-        shade.set_shadow_and_ssao(device, &shadow_trace.output_view, &ssao.output_view);
+        shade.set_shadow_and_ssao(
+            device,
+            &shadow_trace.output_view,
+            &ssao.output_view,
+            &shadow_map.texture_view,
+            &shadow_map.uniform_buffer,
+        );
 
         // Pass order: shade → volumetric → glass → god_rays. Glass
         // runs AFTER volumetric so clouds / fog are composited into
@@ -240,7 +264,7 @@ impl ViewportRenderer {
         Self {
             camera_buffer, scene_bind_group, scene_epoch, lights_materials_epoch,
             march, proc_raymarch, proc_outline, proc_ghost,
-            shadow_trace, ssao, shade, glass, volumetric, god_rays,
+            shadow_trace, shadow_map, ssao, shade, glass, volumetric, god_rays,
             gbuffer, pick_texture, pick_view, bloom, bloom_composite, tone_map,
             composite_texture, composite_view,
             readback,
@@ -326,7 +350,16 @@ impl ViewportRenderer {
 
         self.shade.resize(device, width, height);
         self.shade.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
-        self.shade.set_shadow_and_ssao(device, &self.shadow_trace.output_view, &self.ssao.output_view);
+        // Shadow map size doesn't track viewport resolution; the
+        // texture stays at SHADOW_MAP_DEFAULT_SIZE through resize.
+        // Re-binding picks up the same view (placeholder pre-S4).
+        self.shade.set_shadow_and_ssao(
+            device,
+            &self.shadow_trace.output_view,
+            &self.ssao.output_view,
+            &self.shadow_map.texture_view,
+            &self.shadow_map.uniform_buffer,
+        );
 
         self.volumetric.resize(device, width, height);
         self.volumetric.set_depth_view(device, &self.gbuffer.position_view);
