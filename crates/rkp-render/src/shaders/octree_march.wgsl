@@ -144,17 +144,10 @@ struct MarchParams {
     // host-side Rust mirror requires it; the field is consumed by
     // shadow trace, which shares the same uniform). 32 B total.
     tlas_node_count: u32,
-    // Phase 7d — directional shadow tile cull. March doesn't read
-    // any of these (naga DCE keeps the layout consistent with the
-    // Rust `MarchParams` mirror); shadow trace uses them all.
-    shadow_tile_enabled: u32,
-    shadow_tile_light_idx: u32,
-    shadow_tile_grid_w: u32,
-    shadow_tile_grid_h: u32,
-    shadow_tile_origin: vec3<f32>,
-    shadow_tile_size: f32,
-    shadow_tile_right: vec3<f32>,
-    shadow_tile_up: vec3<f32>,
+    // Phase 8 — `1` ⇒ shadow_map covers directional lights this
+    // frame; shadow trace skips them. March itself doesn't read
+    // this; the field keeps the WGSL layout in sync with the Rust
+    // mirror (naga DCE drops it from march SPIR-V).
     shadow_map_enabled: u32,
 }
 

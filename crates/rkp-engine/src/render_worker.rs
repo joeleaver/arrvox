@@ -295,13 +295,7 @@ struct RenderState {
     /// tlas_leaves into `tlas_pass`'s buffers (which the shadow
     /// trace already binds).
     tlas_build_pass: rkp_render::tlas_build_pass::TlasBuildPass,
-    /// Phase 7d — directional shadow tile cull. Builds a 2D
-    /// occupancy bitmap in light-space; the shadow trace looks
-    /// the bitmap up before descending the BVH. Most pixels'
-    /// rays land in empty tiles → BVH walk skipped entirely.
-    shadow_tile_cull_pass: rkp_render::shadow_tile_cull_pass::ShadowTileCullPass,
-
-    /// Stage 6c-3 — global `array<u32>` storage buffer holding all
+/// Stage 6c-3 — global `array<u32>` storage buffer holding all
     /// scattered instance bytes. Each region's slice is bucket-allocated
     /// inside [`InstanceRegionCache`] (which thinks in u32 units rooted
     /// Cached u32 capacity of the scene's `instance_pool_buffer`.
@@ -510,12 +504,7 @@ impl RenderState {
         // Phase 7c — GPU TLAS build pipeline. Owns assembly +
         // Morton + radix + Karras + propagate compute pipelines.
         let tlas_build_pass = rkp_render::tlas_build_pass::TlasBuildPass::new(&device);
-        // Phase 7d — shadow tile cull. Owns the mark-pass compute
-        // pipeline + the persistent bitmap buffer.
-        let shadow_tile_cull_pass =
-            rkp_render::shadow_tile_cull_pass::ShadowTileCullPass::new(&device);
-
-        // The instance_pool_buffer lives on RkpScene now (bound at
+// The instance_pool_buffer lives on RkpScene now (bound at
         // scene group binding(14) so the host march can read it for
         // shader-asset paths). Capacity is set in rkp_scene.rs via
         // INSTANCE_POOL_CAPACITY_U32.
@@ -560,7 +549,6 @@ impl RenderState {
             instance_tile_prefix_uniform_buffer,
             tlas_pass,
             tlas_build_pass,
-            shadow_tile_cull_pass,
             instance_pool_capacity_u32: rkp_render::rkp_scene::INSTANCE_POOL_CAPACITY_U32,
             instance_leaves_buffer,
             instance_leaves_capacity_entries: INSTANCE_LEAVES_INITIAL_ENTRIES,
@@ -1308,14 +1296,7 @@ fn render_one_frame(
             &state.tlas_pass.nodes_buffer,
             &state.tlas_pass.leaves_buffer,
         );
-        // Phase 7d — bitmap buffer handle is stable across frames
-        // (no growing), so this only does work on the first frame
-        // for each VR.
-        vr.march.set_shadow_tile_buffer(
-            &state.device,
-            &state.shadow_tile_cull_pass.bitmap_buffer,
-        );
-        // Phase 8 S4 — shadow-map pass reads the same TLAS as the
+        // Phase 8 — shadow-map pass reads the same TLAS as the
         // shadow trace; rebind whenever the buffers reallocate.
         vr.shadow_map.set_tlas_buffers(
             &state.device,
@@ -1324,29 +1305,13 @@ fn render_one_frame(
         );
     }
 
-    // Phase 8 S4 — directional shadow map. Picks the first
+    // Phase 8 — directional shadow map. Picks the first
     // directional light, derives the light camera covering the
     // scene AABB, writes the uniform into every VR. Returns
     // whether the shadow map will be live this frame; the shade
     // pass gates its sample on that. Texture dispatch happens
     // later in `render_to`.
     let shadow_map_enabled = prepare_shadow_maps(state, frame, scene_aabb, tlas_prim_count);
-
-    // Phase 7d — build the directional-shadow tile bitmap. Scans
-    // the scene's lights for the first directional one, derives a
-    // light-space basis + grid, dispatches the mark pass over the
-    // assembled `tlas_prims`. Result is consumed per-pixel by the
-    // shadow trace's `shadow_tile_has_caster` helper.
-    //
-    // Phase 8 S5 — skipped entirely when the shadow map is live.
-    // The shadow trace's directional rays are gated off in that
-    // case (see `march_params.shadow_map_enabled`), so the
-    // bitmap has no consumer.
-    let shadow_tile_cull = if shadow_map_enabled {
-        rkp_render::octree_march::ShadowTileCullParams::disabled()
-    } else {
-        build_shadow_tile_bitmap(state, frame, scene_aabb, tlas_prim_count)
-    };
 
     // 2. Skin scatter (one batched compute dispatch). Sim folded every
     //    skinned entity into `frame.skin.batch`; we just fire it.
@@ -1585,7 +1550,6 @@ fn render_one_frame(
             tile_object_ids_ref,
             vp.tile_count_x,
             state.tlas_pass.last_node_count,
-            shadow_tile_cull,
             shadow_map_enabled,
             &vp.atmo_frame,
             vp.mode,
@@ -1989,130 +1953,14 @@ fn transform_aabb_world(
     (new_min, new_max)
 }
 
-/// Phase 7d — populate the shadow-tile bitmap from the assembled
-/// `tlas_prims`, returning the `ShadowTileCullParams` to feed into
-/// `render_to`. Returns `disabled()` when the cull can't run (no
-/// directional light, empty TLAS, degenerate scene AABB).
-///
-/// Picks the first directional light it finds. Multi-directional
-/// scenes only get the cull benefit on that one light; others fall
-/// back to the full BVH descent in the shadow trace.
-fn build_shadow_tile_bitmap(
-    state: &mut RenderState,
-    frame: &RenderFrame,
-    scene_aabb: ([f32; 3], [f32; 3]),
-    tlas_prim_count: u32,
-) -> rkp_render::octree_march::ShadowTileCullParams {
-    use rkp_render::octree_march::ShadowTileCullParams;
-    use rkp_render::shadow_tile_cull_pass::{
-        fit_tile_grid, light_space_basis, ShadowTileUniform,
-        SHADOW_TILE_BITMAP_U32S, SHADOW_TILE_GRID_H, SHADOW_TILE_GRID_W,
-    };
-    if tlas_prim_count == 0 {
-        return ShadowTileCullParams::disabled();
-    }
-    // Find the first directional light. `position.w` carries the
-    // light type code; 0 = directional. Mirror of the convention
-    // in `rkp_shadow_trace.wgsl::main`.
-    let (light_idx, light_dir) = match frame
-        .lights
-        .iter()
-        .enumerate()
-        .find(|(_, l)| (l.position[3] as u32) == 0)
-        .map(|(i, l)| (i as u32, [l.direction[0], l.direction[1], l.direction[2]]))
-    {
-        Some(v) => v,
-        None => return ShadowTileCullParams::disabled(),
-    };
-    let (right, up) = light_space_basis(light_dir);
-    let (tile_size, origin) =
-        fit_tile_grid(scene_aabb.0, scene_aabb.1, right, up);
-
-    // Upload uniform + zero the bitmap.
-    let uniform = ShadowTileUniform {
-        light_origin: origin,
-        tile_size,
-        light_right: right,
-        grid_w: SHADOW_TILE_GRID_W,
-        light_up: up,
-        grid_h: SHADOW_TILE_GRID_H,
-        prim_count: tlas_prim_count,
-        _pad0: 0,
-        _pad1: 0,
-        _pad2: 0,
-    };
-    state.queue.write_buffer(
-        &state.shadow_tile_cull_pass.uniform_buffer,
-        0,
-        bytemuck::bytes_of(&uniform),
-    );
-    let zeros: Vec<u32> = vec![0u32; SHADOW_TILE_BITMAP_U32S as usize];
-    state.queue.write_buffer(
-        &state.shadow_tile_cull_pass.bitmap_buffer,
-        0,
-        bytemuck::cast_slice(&zeros),
-    );
-
-    // Encode + submit the mark dispatch.
-    let g0 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("shadow_tile_mark g0"),
-        layout: &state.shadow_tile_cull_pass.g0_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: state.tlas_build_pass.tlas_prims_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: state.shadow_tile_cull_pass.bitmap_buffer.as_entire_binding(),
-            },
-        ],
-    });
-    let g1 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("shadow_tile_mark g1"),
-        layout: &state.shadow_tile_cull_pass.g1_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: state.shadow_tile_cull_pass.uniform_buffer.as_entire_binding(),
-        }],
-    });
-    let mut encoder = state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("shadow_tile_mark"),
-    });
-    {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("mark_main"),
-            timestamp_writes: None,
-        });
-        cpass.set_pipeline(&state.shadow_tile_cull_pass.mark_pipeline);
-        cpass.set_bind_group(0, &g0, &[]);
-        cpass.set_bind_group(1, &g1, &[]);
-        let wgs = ((tlas_prim_count + 63) / 64).max(1);
-        cpass.dispatch_workgroups(wgs, 1, 1);
-    }
-    state.queue.submit(std::iter::once(encoder.finish()));
-
-    ShadowTileCullParams {
-        enabled: 1,
-        light_idx,
-        grid_w: SHADOW_TILE_GRID_W,
-        grid_h: SHADOW_TILE_GRID_H,
-        origin,
-        tile_size,
-        right,
-        up,
-    }
-}
-
-/// Phase 8 S4 — derive the directional light camera + write the
+/// Phase 8 — derive the directional light camera + write the
 /// per-VR LightCameraUniform. Returns `true` when the shadow map
 /// will be live this frame (directional light present + non-empty
 /// TLAS), which is the gate the shade pass uses to swap from the
 /// half-res ray-traced shadow path to the shadow-map sample.
 ///
-/// V1 mirrors `build_shadow_tile_bitmap`'s "first directional
-/// light" picker — multi-directional support comes later (CSM /
-/// per-light maps).
+/// Picks the first directional light it finds. Multi-directional
+/// support comes later (CSM / per-light maps).
 fn prepare_shadow_maps(
     state: &mut RenderState,
     frame: &RenderFrame,

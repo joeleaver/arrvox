@@ -216,7 +216,6 @@ impl RkpRenderer {
         tile_object_ids: &[u8],
         tile_count_x: u32,
         tlas_node_count: u32,
-        shadow_tile_cull: crate::octree_march::ShadowTileCullParams,
         // Phase 8 S4 — when true, dispatch the shadow-map march
         // after primary visibility. Engine sets this when there's
         // a live directional shadow caster (non-empty TLAS +
@@ -267,7 +266,7 @@ impl RkpRenderer {
                 encoder, queue, &viewport.scene_bind_group,
                 object_count, viewport.width, viewport.height, 0,
                 shadow_steps, num_lights, lod_enabled, surfacenet_enabled,
-                tile_count_x, tlas_node_count, shadow_tile_cull,
+                tile_count_x, tlas_node_count,
                 shadow_map_enabled, None,
             );
             self.profiler.end_query(encoder, q);
