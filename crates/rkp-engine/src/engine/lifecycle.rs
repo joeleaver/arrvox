@@ -104,7 +104,10 @@ impl EngineState {
         // Stage 6d — Option B instance shader region requests. Same
         // (entity × painted-material) walk as `user_shader_regions`,
         // partitioned by shader kind in the emit loop below.
-        let mut instance_region_requests: Vec<
+        // Phase 5.1 — Option B emit path stopped producing requests;
+        // this Vec ships empty until 5.2 deletes its downstream
+        // consumers (emit/tile-cull/scatter passes).
+        let instance_region_requests: Vec<
             rkp_render::user_shader_emit_pass::InstanceRegionRequest,
         > = Vec::new();
         let infos = self.user_shader_registry.shader_infos();
@@ -459,51 +462,16 @@ impl EngineState {
                                 tile_index,
                                 is_band_region: false,
                             });
-                        } else if info.is_instance_pipeline {
-                            let stride_u32 = info
-                                .instance_struct_size
-                                .map(|s| s.div_ceil(4))
-                                .unwrap_or(8);
-                            let leaves = tile_entry.leaves.clone();
-                            // Phase 7b — deterministic slot allocation. Each
-                            // painted leaf reserves `max_emits_per_thread`
-                            // consecutive slots in `instance_pool` so the
-                            // CPU TLAS builder can map slot K back to its
-                            // owning painted leaf without atomicAdd
-                            // permutation. Reservation = leaves × cap;
-                            // unused per-thread slots stay zero (see emit
-                            // pre-clear) and produce degenerate AABBs that
-                            // the tile cull / shadow trace skip naturally.
-                            let max_emits_per_thread =
-                                info.max_emits_per_thread.unwrap_or(1).max(1);
-                            let max_instances = (leaves.len() as u32)
-                                .saturating_mul(max_emits_per_thread)
-                                .max(1);
-                            instance_region_requests.push(
-                                rkp_render::user_shader_emit_pass::InstanceRegionRequest {
-                                    host_object_id: inst.object_id,
-                                    material_id: mat_id as u32,
-                                    shader_name: shader_name_for_request.clone(),
-                                    params: params.clone(),
-                                    aabb_min: centered_min,
-                                    aabb_max: centered_max,
-                                    cell_size,
-                                    input_hash,
-                                    animated: info.animated,
-                                    region_thickness: effective_band,
-                                    tile_index,
-                                    stride_u32,
-                                    max_instances,
-                                    max_emits_per_thread,
-                                    host_octree_root,
-                                    host_octree_depth: asset.octree_depth,
-                                    host_octree_extent,
-                                    host_grid_origin: asset.grid_origin,
-                                    host_inverse_world: inverse_world,
-                                    leaves,
-                                },
-                            );
                         }
+                        // Phase 5.1 — `is_instance_pipeline` arm removed.
+                        // The grass demo shader carries both `instance_at`
+                        // (Phase B-redux) and `emit_instance` (Option B);
+                        // with `has_instance_at` preempting above, grass
+                        // routes through the band path. No other shader
+                        // in the project uses Option B, so this arm is
+                        // dead. `instance_region_requests` stays empty;
+                        // 5.2 deletes the downstream emit / cull / scatter
+                        // passes that consumed it.
                     }
                 }
             }
