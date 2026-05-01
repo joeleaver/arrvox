@@ -1970,64 +1970,27 @@ fn transform_aabb_world(
 ///
 /// Picks the first directional light it finds. Multi-directional
 /// support comes later (CSM / per-light maps).
+/// Phase 8 V3 disabled — voxel-stepped shadow-map silhouettes
+/// were worse quality than `rkp_shadow_trace`'s per-pixel ray-
+/// traced path, and the floor's per-texel descent cost made the
+/// pipeline slower than the path it was meant to replace. Always
+/// returning `false` here skips the shadow_map dispatch chain,
+/// leaves `ShadeParams.shadow_map_enabled = 0`, and routes
+/// directional lights through `shadow_data[]` — the same path
+/// point/spot lights already use.
+///
+/// All shadow_map_pass.rs + scatter shader code is kept in tree
+/// in case a follow-up revisits with a fundamentally different
+/// shadow representation (mesh extraction from voxel data, CSM,
+/// VSM, or analytic AO). To re-enable: replace this with the
+/// frustum-fit walk from commit 0a6aeed.
 fn prepare_shadow_maps(
-    state: &mut RenderState,
-    frame: &RenderFrame,
-    scene_aabb: ([f32; 3], [f32; 3]),
-    tlas_prim_count: u32,
+    _state: &mut RenderState,
+    _frame: &RenderFrame,
+    _scene_aabb: ([f32; 3], [f32; 3]),
+    _tlas_prim_count: u32,
 ) -> bool {
-    use glam::{Mat4, Vec3};
-    use rkp_render::shadow_map_pass::{
-        compute_light_camera_frustum_fit, SHADOW_FAR_DISTANCE,
-        SHADOW_MAP_DEFAULT_SIZE,
-    };
-    if tlas_prim_count == 0 {
-        return false;
-    }
-    let Some(light) = frame
-        .lights
-        .iter()
-        .find(|l| (l.position[3] as u32) == 0 && l.params[3] >= 0.5)
-    else {
-        return false;
-    };
-    let light_dir = [light.direction[0], light.direction[1], light.direction[2]];
-    let depth_bias = 0.001;
-
-    // Per-VR frustum fit. Each VR has its own camera; fitting the
-    // light camera to that VR's view frustum maximizes per-meter
-    // texel density in the visible region. The xy bounds shrink
-    // to just the visible area; z bounds extend to encompass the
-    // whole scene so casters above the camera (e.g., towers
-    // outside the view frustum) still cast shadows in.
-    let mut wrote_any = false;
-    for vp in &frame.viewports {
-        let Some(vr) = state.viewport_renderers.get_mut(&vp.id) else {
-            continue;
-        };
-        let view_proj = Mat4::from_cols_array_2d(&vp.camera.view_proj);
-        let view_proj_inv = view_proj.inverse();
-        let cam_pos = Vec3::new(
-            vp.camera.position[0],
-            vp.camera.position[1],
-            vp.camera.position[2],
-        );
-        let uniform = compute_light_camera_frustum_fit(
-            scene_aabb.0, scene_aabb.1,
-            view_proj_inv, cam_pos,
-            light_dir,
-            SHADOW_MAP_DEFAULT_SIZE,
-            depth_bias,
-            SHADOW_FAR_DISTANCE,
-        );
-        state.queue.write_buffer(
-            &vr.shadow_map.uniform_buffer,
-            0,
-            bytemuck::bytes_of(&uniform),
-        );
-        wrote_any = true;
-    }
-    wrote_any
+    false
 }
 
 /// Phase 5 retired Option B's per-frame TileIndex + ProtoLookup
