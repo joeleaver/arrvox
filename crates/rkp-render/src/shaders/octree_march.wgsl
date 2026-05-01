@@ -915,11 +915,15 @@ fn octree_lookup(
         }
         if (node & OCTREE_LEAF_BIT) != 0u {
             bucket_depth(phase, level);
-            // Preserve BRICK_BIT in the returned slot so the caller can
-            // distinguish a regular leaf from a brick (both arrive via the
-            // same code path; only their payload-mask interpretation
-            // differs).
-            return OctreeResult(node & OCTREE_PAYLOAD_MASK | (node & OCTREE_BRICK_BIT), level, center, half);
+            // Preserve BRICK_BIT and BAND_BIT in the returned slot so
+            // the caller can distinguish a leaf-attr leaf from a brick
+            // leaf (Phase 3b adds BAND for `instance_at` shaders' band
+            // cells whose payload reinterprets two consecutive
+            // leaf-attr slots as `BandCell`).
+            return OctreeResult(
+                (node & OCTREE_PAYLOAD_MASK) | (node & OCTREE_BRICK_BIT) | (node & OCTREE_BAND_BIT),
+                level, center, half,
+            );
         }
 
         // Branch — check the prefiltered-LOD cutoff before descending.
@@ -961,7 +965,10 @@ fn octree_lookup(
     if node == OCTREE_EMPTY { return OctreeResult(OCTREE_EMPTY, max_depth, center, half); }
     if node == OCTREE_INTERIOR { return OctreeResult(OCTREE_INTERIOR, max_depth, center, half); }
     if (node & OCTREE_LEAF_BIT) != 0u {
-        return OctreeResult(node & OCTREE_PAYLOAD_MASK | (node & OCTREE_BRICK_BIT), max_depth, center, half);
+        return OctreeResult(
+            (node & OCTREE_PAYLOAD_MASK) | (node & OCTREE_BRICK_BIT) | (node & OCTREE_BAND_BIT),
+            max_depth, center, half,
+        );
     }
     return OctreeResult(OCTREE_EMPTY, max_depth, center, half);
 }
@@ -976,6 +983,36 @@ fn slot_is_brick(slot: u32) -> bool {
 /// Strip the BRICK_BIT marker from a slot to get the actual brick_id.
 fn slot_brick_id(slot: u32) -> u32 {
     return slot & OCTREE_PAYLOAD_MASK;
+}
+
+/// Phase B-redux 3b — detect a BAND result from `octree_lookup`.
+fn slot_is_band(slot: u32) -> bool {
+    return (slot & OCTREE_BAND_BIT) != 0u
+        && slot != OCTREE_EMPTY
+        && slot != OCTREE_INTERIOR;
+}
+
+/// Strip BRICK_BIT / BAND_BIT to get the band-cell offset (index into
+/// `leaf_attr_pool` where the 16-byte `BandCell` record begins; the
+/// next slot at `+1` is its second half).
+fn slot_band_offset(slot: u32) -> u32 {
+    return slot & OCTREE_PAYLOAD_MASK;
+}
+
+/// Phase B-redux 3b — read a `BandCell` payload by unpacking two
+/// consecutive `leaf_attr_pool` slots. BFS bake (user_shader_geom.wgsl)
+/// writes the matching pattern.
+fn read_band_cell(band_off: u32) -> BandCell {
+    let s0 = leaf_attr_pool[band_off];
+    let s1 = leaf_attr_pool[band_off + 1u];
+    var c: BandCell;
+    c.anchor_world_pos = vec3<f32>(
+        bitcast<f32>(s0.normal_oct),
+        bitcast<f32>(s0.material_packed),
+        bitcast<f32>(s1.normal_oct),
+    );
+    c.region_index = s1.material_packed;
+    return c;
 }
 
 // Skip past an empty/interior node's region along the ray.
@@ -1841,6 +1878,107 @@ fn march_object(
             continue;
         }
 
+        // Phase B-redux 3b — band-cell hit. The BFS bake (user_shader_
+        // geom.wgsl) tagged this leaf with `LEAF | BAND` and packed a
+        // `BandCell { anchor_world_pos, region_index }` into two
+        // consecutive `leaf_attr_pool` slots at `slot_band_offset`.
+        // Fire `dispatch_user_instance_descend` seeded by the anchor.
+        // On hit, write world-space result fields (instance descent
+        // returns world coords; mark `is_user_shader_hit` so the caller
+        // skips the affine back-transform). On miss, skip past the
+        // node and continue marching.
+        if slot_is_band(r.slot) {
+            let band_off = slot_band_offset(r.slot);
+            let band = read_band_cell(band_off);
+
+            // Resolve the prototype asset by linear scan for the
+            // shader_id matching this object's painted material.
+            // V1 — small registry; a uniform table is a future
+            // optimization (mirrors the same scan in main()'s
+            // Phase 3a host-hit dispatch).
+            let mat = materials[inst.material_id];
+            let shader_id = mat.shader_id;
+            var proto_idx: u32 = 0xFFFFFFFFu;
+            if shader_id != 0u {
+                let acount = march_params.asset_count;
+                for (var ai: u32 = 0u; ai < acount; ai = ai + 1u) {
+                    if assets[ai].shader_id == shader_id {
+                        proto_idx = ai;
+                        break;
+                    }
+                }
+            }
+
+            if proto_idx == 0xFFFFFFFFu {
+                // No matching proto registered — treat as empty + skip.
+                t += skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs);
+                continue;
+            }
+
+            let proto_asset = assets[proto_idx];
+
+            var host_sample: HostSample;
+            host_sample.distance = 0.0;
+            host_sample.normal = vec3<f32>(0.0, 1.0, 0.0);
+            host_sample.material = inst.material_id;
+            host_sample.material_secondary = 0u;
+            host_sample.blend_weight = 0u;
+
+            var ctx: UserCtx;
+            ctx.time = march_params.time;
+            // Cell scale at max_depth — passed to the shader as a
+            // hint for blade dimensions. For V1 the band cell's own
+            // size is the simplest proxy; future revisions could
+            // pipe the host's voxel size through `BandRegion`.
+            ctx.cell_size = r.cell_half * 2.0;
+            ctx.material_id = inst.material_id;
+            ctx.aabb_min = vec3<f32>(0.0);
+            let pbase = inst.material_id * 8u;
+            ctx.params[0] = shader_params[pbase + 0u];
+            ctx.params[1] = shader_params[pbase + 1u];
+            ctx.params[2] = shader_params[pbase + 2u];
+            ctx.params[3] = shader_params[pbase + 3u];
+            ctx.params[4] = shader_params[pbase + 4u];
+            ctx.params[5] = shader_params[pbase + 5u];
+            ctx.params[6] = shader_params[pbase + 6u];
+            ctx.params[7] = shader_params[pbase + 7u];
+
+            atomicAdd(&stats[60], 1u); // band-cell dispatch invocation
+            // V1 — pass `1e30` as max_world_dist; the prototype
+            // descent's own AABB cull bounds the search. Cleaner
+            // bounding (e.g. `t * local_to_world + cell_diagonal`) is
+            // a future optimization.
+            let inst_hit = dispatch_user_instance_descend(
+                shader_id,
+                band.anchor_world_pos,
+                host_sample,
+                0u,
+                world_origin,
+                world_dir,
+                1.0e30,
+                ctx,
+                proto_asset,
+            );
+            if inst_hit.valid {
+                atomicAdd(&stats[61], 1u); // band-cell dispatch hit
+                result.is_user_shader_hit = true;
+                result.world_pos = inst_hit.world_pos;
+                result.world_normal = normalize(inst_hit.world_normal);
+                result.t = inst_hit.world_t;
+                result.alpha = 1.0;
+                result.color = vec3<f32>(0.0);
+                result.first_slot = 0u;
+                result.normal = vec3<f32>(0.0); // unused on user-shader path
+                result.oc_pos = vec3<f32>(0.0); // unused on user-shader path
+                result.valid = true;
+                result.steps = step_count;
+                break;
+            }
+            // No hit — skip past the cell.
+            t += skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs);
+            continue;
+        }
+
         // Leaf / INTERIOR hit. Opaque cells are a first-surface stop
         // (primary hit / behind-glass). Transparent cells record
         // themselves as glass-in-front and the march continues so
@@ -2439,11 +2577,17 @@ fn main(
     // win. Phase 2's Option B `us_tile_entries` loop above still
     // runs in parallel during the migration.
     //
-    // V1 limitation: this only fires at painted host leaves the DDA
-    // actually visited. Rays passing through the volume an instance
-    // occupies but missing the painted host surface still won't see
-    // it — Phase 3b's band cells fix that.
-    if have_first && closest_obj_idx != 0xFFFFFFFFu && first_mat_id < arrayLength(&materials) {
+    // Phase 3b coexistence: when the closest hit was at a band cell
+    // inside a user-shader REGION object, `march_object` already ran
+    // dispatch and stored the descent's world-space hit. Skip the
+    // re-dispatch by gating on the host instance's asset shader_id —
+    // user-shader region assets carry shader_id != 0; regular hosts
+    // (where Phase 3a should fire) carry shader_id == 0.
+    if have_first
+        && closest_obj_idx != 0xFFFFFFFFu
+        && first_mat_id < arrayLength(&materials)
+        && assets[instances[closest_obj_idx].asset_id].shader_id == 0u
+    {
         let hit_shader_id = materials[first_mat_id].shader_id;
         if hit_shader_id != 0u {
             // Resolve the prototype asset by linear scan of `assets[]`
