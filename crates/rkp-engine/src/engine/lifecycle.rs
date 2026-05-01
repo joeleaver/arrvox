@@ -425,6 +425,7 @@ impl EngineState {
                                 host_grid_origin: asset.grid_origin,
                                 host_inverse_world: inverse_world,
                                 tile_index,
+                                is_band_region: false,
                             });
                         } else if info.is_instance_pipeline {
                             let stride_u32 = info

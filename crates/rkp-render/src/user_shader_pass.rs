@@ -235,6 +235,13 @@ pub struct ShaderRegionRequest {
     pub host_octree_extent: f32,
     pub host_grid_origin: [f32; 3],
     pub host_inverse_world: [[f32; 4]; 4],
+    /// Phase B-redux 3b — `true` when the BFS should bake band cells
+    /// (with `instance_at` derivation hook) instead of voxel bricks.
+    /// Routed by sim from `UserShaderInfo.has_instance_at`. Mutually
+    /// exclusive with the voxel-emit path within one region; a shader
+    /// that has both `generate` and `instance_at` is rejected by the
+    /// composer.
+    pub is_band_region: bool,
 }
 
 /// Sentinel "no host" value matching `HOST_NO_HOST_SENTINEL` in WGSL.
@@ -1008,9 +1015,11 @@ pub struct RegionUniform {
     pub leaf_attr_block_size: u32,          // offset 80
     pub fill_task_block_offset: u32,        // offset 84
     pub fill_task_block_size: u32,          // offset 88
-    /// Pad so `host_grid_origin` (vec3, 16-byte aligned in WGSL)
-    /// lands at the next 16-aligned offset (96).
-    pub _pad_host: u32,                     // offset 92
+    /// Phase B-redux 3b — `1` when the BFS should bake band cells
+    /// (instance_at path) instead of voxel bricks; `0` for the
+    /// existing voxel emit path. Repurposed from `_pad_host` (the
+    /// offset still aligns `host_grid_origin` to 96).
+    pub use_band_path: u32,                 // offset 92
     pub host_grid_origin: [f32; 3],         // offset 96
     /// Pad so `params` (vec4) lands at offset 112.
     pub _pad_grid: f32,                     // offset 108
@@ -1834,7 +1843,7 @@ pub fn build_region_uniform(
         leaf_attr_block_size: slot.leaf_attr_block_size,
         fill_task_block_offset: slot.fill_task_block_offset,
         fill_task_block_size: slot.fill_task_block_size,
-        _pad_host: 0,
+        use_band_path: u32::from(request.is_band_region),
         host_grid_origin: request.host_grid_origin,
         _pad_grid: 0.0,
         params,
@@ -1882,6 +1891,7 @@ mod tests {
             host_grid_origin: [0.0; 3],
             host_inverse_world: [[0.0; 4]; 4],
             tile_index: NO_TILE,
+            is_band_region: false,
         }
     }
 

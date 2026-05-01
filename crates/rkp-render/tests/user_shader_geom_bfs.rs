@@ -175,6 +175,7 @@ fn user_ball_generate(cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx)
             [0.0, 0.0, 0.0, 1.0],
         ],
         tile_index: NO_TILE,
+        is_band_region: false,
     };
     cache.begin_frame();
     let estimate = estimate_region_pool(&req);

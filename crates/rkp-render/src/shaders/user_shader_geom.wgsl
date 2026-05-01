@@ -168,9 +168,11 @@ struct RegionUniform {
     leaf_attr_block_size: u32,
     fill_task_block_offset: u32,
     fill_task_block_size: u32,
-    // Pad so host_grid_origin (vec3, 16-byte aligned) lands at the
-    // next 16-aligned offset.
-    _pad_host: u32,
+    // Phase B-redux 3b — `1` when the BFS should bake band cells
+    // (instance_at path) instead of voxel bricks; `0` for the
+    // existing voxel emit path. Repurposed from `_pad_host` (the
+    // offset still 16-aligns host_grid_origin).
+    use_band_path: u32,
     host_grid_origin: vec3<f32>,
     // Pad so params (vec4) lands at next 16-aligned offset.
     _pad_grid: f32,
