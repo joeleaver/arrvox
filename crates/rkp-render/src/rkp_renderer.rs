@@ -221,6 +221,14 @@ impl RkpRenderer {
         // `tlas_node_count` is the BVH node count, which is up to
         // `2*prim_count - 1` and not what the setup needs.
         tlas_prim_count: u32,
+        // Phase 8 — scene extent (max world dimension) used by the
+        // setup pass to extrude per-prim AABBs along `light_dir`
+        // for the shadow-frustum cull.
+        scene_extent: f32,
+        // Phase 8 — camera world→NDC matrix forwarded to the
+        // shadow-map setup pass so it can shadow-frustum-cull
+        // each prim against the visible region.
+        camera_view_proj: [[f32; 4]; 4],
         // Phase 8 — when true, dispatch the shadow-map chain
         // (clear → setup → scatter) after primary visibility.
         // Engine sets this when there's a live directional shadow
@@ -297,7 +305,9 @@ impl RkpRenderer {
         if in_situ && !raymarch && shadow_map_enabled {
             let q = self.profiler.begin_query("shadow_map", encoder);
             viewport.shadow_map.dispatch_clear(encoder);
-            viewport.shadow_map.dispatch_setup(encoder, queue, tlas_prim_count);
+            viewport.shadow_map.dispatch_setup(
+                encoder, queue, tlas_prim_count, camera_view_proj, scene_extent,
+            );
             viewport.shadow_map.dispatch_emit(encoder, tlas_prim_count);
             viewport.shadow_map.dispatch_finalize(encoder);
             viewport.shadow_map.dispatch_scatter(

@@ -261,9 +261,6 @@ fn sample_shadow_map(world_pos: vec3<f32>) -> f32 {
         || ndc.z < 0.0 || ndc.z > 1.0 {
         return 1.0;
     }
-    // NDC → texel. Mirror the scatter pass's mapping:
-    //   tx = (ndc.x + 1) * 0.5 * W
-    //   ty = (1 - ndc.y) * 0.5 * H   (y-flip vs NDC)
     let size_u = light_camera.shadow_map_size;
     let size_f = vec2<f32>(size_u);
     let tx_f = (ndc.x * 0.5 + 0.5) * size_f.x;

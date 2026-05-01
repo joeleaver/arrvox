@@ -49,7 +49,17 @@ struct SetupParams {
     /// beyond this index zero their slots so stale data from
     /// previous frames doesn't trigger ghost dispatches.
     prim_count: u32,
-    _pad0: u32, _pad1: u32, _pad2: u32,
+    /// Conservative scene extent — the maximum world-space
+    /// distance a shadow can travel from a caster. Used to
+    /// extrude per-prim AABBs along `light_dir` for the shadow-
+    /// frustum cull.
+    scene_extent: f32,
+    _pad0: u32, _pad1: u32,
+    /// World → camera-NDC. setup_main extrudes each prim's AABB
+    /// along light_dir then tests the 8 swept corners against
+    /// camera NDC bounds; prims whose swept volume can't reach
+    /// the camera's view get skipped (no shadow contribution).
+    camera_view_proj: mat4x4<f32>,
 }
 
 @group(0) @binding(0) var<storage, read> tlas_prims: array<TlasPrim>;
@@ -71,6 +81,50 @@ fn setup_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let prim = tlas_prims[i];
+
+    // Shadow-frustum cull. Sweep the prim's AABB along light_dir
+    // by scene_extent — the result is the volume the prim *could*
+    // shadow into. If that swept volume doesn't intersect the
+    // camera frustum, the prim's shadow can't reach any visible
+    // surface; skip it.
+    //
+    // For sun overhead + camera looking up: floor sweeps DOWN,
+    // camera frustum extends UP, no overlap → cull. The big
+    // baseline-cost win for "looking at sky" cases.
+    let l = light_camera.light_dir;
+    let s = l * setup_params.scene_extent;
+    let swept_min = prim.aabb_min + min(s, vec3<f32>(0.0));
+    let swept_max = prim.aabb_max + max(s, vec3<f32>(0.0));
+    var cam_ndc_min = vec3<f32>(1e10);
+    var cam_ndc_max = vec3<f32>(-1e10);
+    for (var c = 0u; c < 8u; c++) {
+        let corner = vec3<f32>(
+            select(swept_min.x, swept_max.x, (c & 1u) != 0u),
+            select(swept_min.y, swept_max.y, (c & 2u) != 0u),
+            select(swept_min.z, swept_max.z, (c & 4u) != 0u),
+        );
+        let clip = setup_params.camera_view_proj * vec4<f32>(corner, 1.0);
+        // Behind the camera (clip.w <= 0) — the corner doesn't
+        // perspective-divide; skip it. Other corners may still
+        // project the AABB into the frustum.
+        if clip.w <= 0.0 { continue; }
+        let ndc = clip.xyz / clip.w;
+        cam_ndc_min = min(cam_ndc_min, ndc);
+        cam_ndc_max = max(cam_ndc_max, ndc);
+    }
+    // If every corner was behind the camera, cam_ndc_min/max stay
+    // at sentinels — treat as "in frustum" conservatively (the
+    // sweep volume might wrap around the camera). The strict
+    // bounds test catches the common case.
+    let any_in_front = cam_ndc_max.x > -1e9;
+    if any_in_front {
+        if cam_ndc_max.x < -1.0 || cam_ndc_min.x > 1.0
+            || cam_ndc_max.y < -1.0 || cam_ndc_min.y > 1.0
+            || cam_ndc_max.z < 0.0 || cam_ndc_min.z > 1.0 {
+            write_skip(i);
+            return;
+        }
+    }
 
     // Project the 8 AABB corners through the light view_proj.
     var ndc_min = vec3<f32>(1e10);

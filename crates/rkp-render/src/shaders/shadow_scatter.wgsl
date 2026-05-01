@@ -242,6 +242,7 @@ fn skip_node_t(pos: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, node_depth: u
     return min(min(t_pos.x, t_pos.y), t_pos.z) + vs * 0.01;
 }
 
+
 fn inst_world_to_local(
     world_pos: vec3<f32>, instance_pos: vec3<f32>, instance_scale: f32,
 ) -> vec3<f32> {

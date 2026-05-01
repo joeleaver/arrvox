@@ -42,10 +42,20 @@ use glam::{Mat4, Vec3};
 
 use crate::validate_wgsl;
 
-/// Default shadow-map resolution. 2 K square at 4 bytes / texel
-/// = 16 MB. The scatter pipeline makes texel count near-free for
-/// sparse scenes; CSM is the long-term lever for far-field detail.
-pub const SHADOW_MAP_DEFAULT_SIZE: u32 = 2048;
+/// Default shadow-map resolution. 1 K square at 4 bytes / texel
+/// = 4 MB. With frustum-fit + scene clip, a 1 K map at typical
+/// view bounds gives ~3 cm/texel — sharper than scene-fit 2 K
+/// would. CSM is the long-term lever for far-field detail.
+pub const SHADOW_MAP_DEFAULT_SIZE: u32 = 1024;
+
+/// Cap on the distance (world units, from camera) that the
+/// frustum-fit shadow camera covers. The camera's actual far
+/// plane can be 10 km+; capping keeps per-meter texel density
+/// high in the visible region. The proper fix (visible-caster
+/// AABB fit) makes this less load-bearing — until then, 30 m
+/// keeps shadow-map texels in the ~1.5 cm range for typical
+/// scenes.
+pub const SHADOW_FAR_DISTANCE: f32 = 30.0;
 
 /// "Sky" depth marker. Per-pixel shadow query treats
 /// `sample == FAR_DEPTH` as "no occluder" → returns full
@@ -93,15 +103,25 @@ pub struct LightCameraUniform {
 
 const _: () = assert!(std::mem::size_of::<LightCameraUniform>() == 160);
 
-/// Setup-pass per-frame uniform.
+/// Setup-pass per-frame uniform. Layout matches WGSL struct in
+/// `shadow_scatter_setup.wgsl`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SetupParams {
     pub prim_count: u32,
+    /// Maximum distance a shadow can travel through the scene.
+    /// Setup uses this to extrude per-prim AABBs along
+    /// `light_dir` for the shadow-frustum cull.
+    pub scene_extent: f32,
     pub _pad0: u32,
     pub _pad1: u32,
-    pub _pad2: u32,
+    /// Camera view-proj matrix (world → camera NDC). The cull
+    /// projects each prim's swept AABB through this and tests
+    /// the resulting NDC bounds against `[-1,1]² × [0,1]`.
+    pub camera_view_proj: [[f32; 4]; 4],
 }
+
+const _: () = assert!(std::mem::size_of::<SetupParams>() == 80);
 
 /// Derive an orthographic light camera. See V1 commit 3d862b0 for
 /// the derivation rationale (look_to + scene-AABB-fit).
@@ -158,6 +178,174 @@ pub fn compute_light_camera(
     let proj = Mat4::orthographic_rh(vmin.x, vmax.x, vmin.y, vmax.y, near, far);
     let view_proj = proj * view;
     let view_proj_inv = view_proj.inverse();
+    LightCameraUniform {
+        view_proj: view_proj.to_cols_array_2d(),
+        view_proj_inv: view_proj_inv.to_cols_array_2d(),
+        light_dir: l.to_array(),
+        depth_bias,
+        inv_shadow_map_size: [
+            1.0 / shadow_map_size as f32,
+            1.0 / shadow_map_size as f32,
+        ],
+        shadow_map_size: [shadow_map_size, shadow_map_size],
+    }
+}
+
+/// Per-VR frustum-fit light camera. Same shape as
+/// `compute_light_camera` but the orthographic xy bounds are
+/// fitted to the camera's *visible* frustum rather than the whole
+/// scene AABB. The z range is extended to encompass the whole
+/// scene's light-space depth so casters outside the visible
+/// frustum (e.g., a tower above the camera's forward cone) still
+/// reach the shadow map.
+///
+/// The camera's far plane is clamped at `shadow_far_dist` from
+/// the camera position — the camera's actual far plane can be
+/// kilometers, which would dilute texel density in the foreground.
+/// CSM is the proper fix for variable depth ranges; this single-
+/// cascade approach trades far-field shadow quality for near-field
+/// sharpness.
+///
+/// Inputs:
+/// * `scene_min` / `scene_max` — world-space bounds of all shadow
+///   casters. Used only for z-range extension; not for xy.
+/// * `camera_view_proj_inv` — inverse of the camera's view-proj
+///   matrix. Used to unproject the 8 NDC frustum corners into
+///   world space.
+/// * `camera_position` — world-space camera origin. Used to clamp
+///   the far corners' distance to `shadow_far_dist`.
+/// * `light_dir`, `shadow_map_size`, `depth_bias` — same as the
+///   scene-fit variant.
+/// * `shadow_far_dist` — camera-relative far cap for the fit.
+pub fn compute_light_camera_frustum_fit(
+    scene_min: [f32; 3],
+    scene_max: [f32; 3],
+    camera_view_proj_inv: Mat4,
+    camera_position: Vec3,
+    light_dir: [f32; 3],
+    shadow_map_size: u32,
+    depth_bias: f32,
+    shadow_far_dist: f32,
+) -> LightCameraUniform {
+    let l = Vec3::from_array(light_dir).normalize_or_zero();
+    let l = if l.length_squared() < 0.5 {
+        Vec3::new(0.0, -1.0, 0.0)
+    } else {
+        l
+    };
+    let world_up = if l.y.abs() < 0.99 { Vec3::Y } else { Vec3::Z };
+    let right = world_up.cross(l).normalize_or_zero();
+    let up = l.cross(right).normalize_or_zero();
+
+    // 8 frustum corners in NDC: (±1, ±1, {0, 1}). z=0 = near
+    // plane, z=1 = far plane (wgpu convention).
+    let mut frustum_world: [Vec3; 8] = [Vec3::ZERO; 8];
+    for c in 0..8u32 {
+        let ndc = Vec3::new(
+            if (c & 1) != 0 { 1.0 } else { -1.0 },
+            if (c & 2) != 0 { 1.0 } else { -1.0 },
+            if (c & 4) != 0 { 1.0 } else { 0.0 },
+        );
+        let world = camera_view_proj_inv * ndc.extend(1.0);
+        let world_pos = world.truncate() / world.w;
+        // Far corners: clamp distance from camera. The camera's
+        // far plane can be 10 km+; clamp keeps per-meter density
+        // high in the foreground. Near corners pass through.
+        if (c & 4) != 0 {
+            let dir = world_pos - camera_position;
+            let dist = dir.length();
+            if dist > shadow_far_dist {
+                frustum_world[c as usize] =
+                    camera_position + dir / dist * shadow_far_dist;
+            } else {
+                frustum_world[c as usize] = world_pos;
+            }
+        } else {
+            frustum_world[c as usize] = world_pos;
+        }
+    }
+
+    // Set the eye well behind the scene along -L. Distance is
+    // chosen so every potential caster sits in front of the
+    // ortho's near plane.
+    let scene_center = Vec3::new(
+        0.5 * (scene_min[0] + scene_max[0]),
+        0.5 * (scene_min[1] + scene_max[1]),
+        0.5 * (scene_min[2] + scene_max[2]),
+    );
+    let mut min_z = f32::INFINITY;
+    let mut max_z = f32::NEG_INFINITY;
+    for c in 0..8u32 {
+        let corner = Vec3::new(
+            if (c & 1) != 0 { scene_max[0] } else { scene_min[0] },
+            if (c & 2) != 0 { scene_max[1] } else { scene_min[1] },
+            if (c & 4) != 0 { scene_max[2] } else { scene_min[2] },
+        );
+        let lz = l.dot(corner);
+        if lz < min_z { min_z = lz; }
+        if lz > max_z { max_z = lz; }
+    }
+    let z_extent = (max_z - min_z).max(1e-3);
+    let eye = scene_center - l * (z_extent * 1.5);
+    let view = Mat4::look_to_rh(eye, l, up);
+
+    // Project camera frustum AND scene AABB into light view-space.
+    let mut frustum_vmin = Vec3::splat(f32::INFINITY);
+    let mut frustum_vmax = Vec3::splat(f32::NEG_INFINITY);
+    for &corner in &frustum_world {
+        let v = view.transform_point3(corner);
+        frustum_vmin = frustum_vmin.min(v);
+        frustum_vmax = frustum_vmax.max(v);
+    }
+    let mut scene_vmin = Vec3::splat(f32::INFINITY);
+    let mut scene_vmax = Vec3::splat(f32::NEG_INFINITY);
+    for c in 0..8u32 {
+        let corner = Vec3::new(
+            if (c & 1) != 0 { scene_max[0] } else { scene_min[0] },
+            if (c & 2) != 0 { scene_max[1] } else { scene_min[1] },
+            if (c & 4) != 0 { scene_max[2] } else { scene_min[2] },
+        );
+        let v = view.transform_point3(corner);
+        scene_vmin = scene_vmin.min(v);
+        scene_vmax = scene_vmax.max(v);
+    }
+
+    // INTERSECT xy: shadow map should only cover the visible
+    // region that contains scene geometry. The camera frustum's
+    // far plane can project to a huge area (200 m far cap × ~90°
+    // FOV ~= 400 m × 200 m in light xy), but if the scene AABB
+    // is small (e.g., 10 m × 10 m), the frustum bounds dilute
+    // texel density.
+    //
+    // Z bounds: full scene span (any caster between the visible
+    // surfaces and the light belongs in the shadow map).
+    let xy_min = Vec3::new(
+        frustum_vmin.x.max(scene_vmin.x),
+        frustum_vmin.y.max(scene_vmin.y),
+        0.0,
+    );
+    let xy_max = Vec3::new(
+        frustum_vmax.x.min(scene_vmax.x),
+        frustum_vmax.y.min(scene_vmax.y),
+        0.0,
+    );
+    // Empty intersection (camera looking away from scene): fall
+    // back to scene-fit so the shadow map still has valid bounds.
+    let (final_x_min, final_x_max, final_y_min, final_y_max) =
+        if xy_min.x >= xy_max.x || xy_min.y >= xy_max.y {
+            (scene_vmin.x, scene_vmax.x, scene_vmin.y, scene_vmax.y)
+        } else {
+            (xy_min.x, xy_max.x, xy_min.y, xy_max.y)
+        };
+
+    let near = -scene_vmax.z;
+    let far = -scene_vmin.z;
+    let proj = Mat4::orthographic_rh(
+        final_x_min, final_x_max, final_y_min, final_y_max, near, far,
+    );
+    let view_proj = proj * view;
+    let view_proj_inv = view_proj.inverse();
+
     LightCameraUniform {
         view_proj: view_proj.to_cols_array_2d(),
         view_proj_inv: view_proj_inv.to_cols_array_2d(),
@@ -540,11 +728,16 @@ impl ShadowMapPass {
 
     /// Record the setup pass — projects TLAS prims, fills
     /// `scatter_instances`, atomic-adds tile counts to `total_work`.
+    /// `camera_view_proj` and `scene_extent` drive the shadow-
+    /// frustum cull (skip prims whose swept volume can't reach
+    /// the camera view).
     pub fn dispatch_setup(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         queue: &wgpu::Queue,
         prim_count: u32,
+        camera_view_proj: [[f32; 4]; 4],
+        scene_extent: f32,
     ) {
         let Some(ref g0) = self.setup_g0_bg else { return; };
         queue.write_buffer(
@@ -552,7 +745,9 @@ impl ShadowMapPass {
             0,
             bytemuck::bytes_of(&SetupParams {
                 prim_count,
-                _pad0: 0, _pad1: 0, _pad2: 0,
+                scene_extent,
+                _pad0: 0, _pad1: 0,
+                camera_view_proj,
             }),
         );
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
