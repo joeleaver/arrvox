@@ -273,3 +273,73 @@ fn user_grass_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) {
         i = i + 1u;
     }
 }
+
+// ── instance_at hook (Phase B-redux) ────────────────────────────────
+// Indexable counterpart to `user_grass_emit`. Returns the k-th
+// instance (here, blade) for a given host position via *out_instance,
+// or `false` if there's no instance at index k (k beyond
+// density-driven count, or host normal disqualifies the cell). Same
+// per-blade math as `emit` — this is the "function form" of the emit
+// hook so the host march can call it per-pixel-per-leaf without an
+// instance_pool to scatter into.
+fn user_grass_instance_at(
+    host_pos: vec3<f32>,
+    host: HostSample,
+    ctx: UserCtx,
+    k: u32,
+    out_instance: ptr<function, Blade>,
+) -> bool {
+    if (host.normal.y < 0.5) { return false; }
+
+    let blade_height  = ctx.params[0];
+    let blade_width   = ctx.params[1];
+    let height_jitter = ctx.params[2];
+    let density       = ctx.params[3];
+    let pos_jitter    = ctx.params[4];
+    let lean_amount   = ctx.params[5];
+    let wind_amp      = ctx.params[6];
+    let wind_freq     = ctx.params[7];
+
+    let base_seed = grass_seed_from_pos(host_pos);
+    let count_full = u32(floor(density));
+    let extra_p = density - f32(count_full);
+
+    // Hard cap at @max_emits_per_thread; same as emit's `i >= 5u` exit.
+    if (k >= count_full + 1u || k >= 5u) { return false; }
+
+    let s0 = base_seed ^ (k * 0x9E3779B9u);
+    let r_density = grass_hash_u01(s0);
+    // Density's fractional part probabilistically spawns the (count_full)-th
+    // blade. This branch is identical to the emit-loop's break.
+    if (k == count_full && r_density >= extra_p) { return false; }
+
+    let r_jx      = grass_hash_u01(s0 ^ 0xBF58476Du);
+    let r_jz      = grass_hash_u01(s0 ^ 0x94D049BBu);
+    let r_height  = grass_hash_u01(s0 ^ 0xCBF29CE4u);
+    let r_yaw     = grass_hash_u01(s0 ^ 0xA2B5C7D9u);
+    let r_lean_x  = grass_hash_u01(s0 ^ 0xC2B2AE35u);
+    let r_lean_z  = grass_hash_u01(s0 ^ 0xD3B5C7E1u);
+    let r_phase   = grass_hash_u01(s0 ^ 0xFEEDFACEu);
+
+    let jitter_radius = ctx.cell_size * pos_jitter;
+    let jx = (r_jx - 0.5) * 2.0 * jitter_radius;
+    let jz = (r_jz - 0.5) * 2.0 * jitter_radius;
+
+    let h_factor = 1.0 + (r_height - 0.5) * 2.0 * height_jitter;
+    let h = max(blade_height * h_factor, 1.0e-3);
+
+    let phase = r_phase * 6.28318530718;
+    let wind_x = sin(ctx.time * wind_freq + phase) * wind_amp;
+    let wind_z = cos(ctx.time * wind_freq + phase * 0.73) * wind_amp;
+    let base_lean_x = (r_lean_x - 0.5) * 2.0 * lean_amount;
+    let base_lean_z = (r_lean_z - 0.5) * 2.0 * lean_amount;
+
+    var b: Blade;
+    b.pos = vec3<f32>(host_pos.x + jx, host_pos.y + 0.5 * h, host_pos.z + jz);
+    b.scale = h;
+    b.yaw = r_yaw * 6.28318530718;
+    b.width = max(blade_width, 1.0e-3);
+    b.lean = vec2<f32>(base_lean_x + wind_x, base_lean_z + wind_z);
+    *out_instance = b;
+    return true;
+}

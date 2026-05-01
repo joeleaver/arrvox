@@ -149,6 +149,16 @@ struct MarchParams {
     // this; the field keeps the WGSL layout in sync with the Rust
     // mirror (naga DCE drops it from march SPIR-V).
     shadow_map_enabled: u32,
+    // Phase B-redux Phase 3a — frame time, threaded into `ctx.time`
+    // for user shaders' `instance_at` hooks (wind sway, animation).
+    time: f32,
+    // Phase B-redux Phase 3a — number of records in `assets[]`.
+    // Used to scan `assets[]` for an asset matching the painted
+    // leaf's material `shader_id`, picking the right proto octree
+    // for the descent.
+    asset_count: u32,
+    // Trailing pad to align to 16 bytes.
+    _pad0: u32,
 }
 
 const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;
@@ -419,6 +429,70 @@ fn dispatch_user_inst_aabb(
 }
 // USER_INST_AABB_DISPATCH_END
 
+// Phase B-redux — per-pixel `instance_at` descent. The host octree
+// DDA hits a leaf with an instance-shader material → look up the
+// shader's per-instance derivation hook + descend the prototype
+// octree directly, no `instance_pool` involved. `InstanceHit` is the
+// world-space output (closest user-shader instance hit, if any).
+// When the splice runs no chunk (no instance shader registered, or
+// none has an `instance_at` hook), the default stub below returns
+// "no hit" unconditionally — host march falls through to the
+// standard surface result.
+struct InstanceHit {
+    valid: bool,
+    world_t: f32,
+    world_pos: vec3<f32>,
+    world_normal: vec3<f32>,
+}
+
+// User-shader-facing types. Same shapes the emit / proto / generate
+// pipelines expose — `octree_march` declares them here so the
+// `instance_at` hook (whose body the composer splices into the
+// USER_INSTANCE_AT_DISPATCH block below) can reference them. Field
+// layouts are wire-format with the corresponding Rust structs in
+// `crate::user_shader_emit_pass` / `crate::user_shader_pass`.
+struct HostSample {
+    distance: f32,
+    normal: vec3<f32>,
+    material: u32,
+    material_secondary: u32,
+    blend_weight: u32,
+}
+
+struct UserCtx {
+    time: f32,
+    cell_size: f32,
+    material_id: u32,
+    aabb_min: vec3<f32>,
+    params: array<f32, 8>,
+}
+
+// USER_INSTANCE_AT_DISPATCH_BEGIN
+// Default identity stub — Rust composer replaces this whole block
+// (markers + body) with per-shader descent helpers + the dispatch
+// switch when any registered shader provides an `instance_at` hook.
+// Empty-registry path returns "no instance hit" so the host march
+// is unchanged.
+fn dispatch_user_instance_descend(
+    shader_id: u32,
+    host_pos: vec3<f32>,
+    host: HostSample,
+    leaf_slot: u32,
+    ray_origin: vec3<f32>,
+    ray_dir: vec3<f32>,
+    world_max_t: f32,
+    ctx: UserCtx,
+    asset: RkpAsset,
+) -> InstanceHit {
+    var r: InstanceHit;
+    r.valid = false;
+    r.world_t = world_max_t;
+    r.world_pos = vec3<f32>(0.0);
+    r.world_normal = vec3<f32>(0.0, 1.0, 0.0);
+    return r;
+}
+// USER_INSTANCE_AT_DISPATCH_END
+
 const FACE_INTERIOR: u32 = 0xFFFFFFFEu;
 const FACE_EMPTY_LINK: u32 = 0xFFFFFFFFu;
 const FACE_NX: u32 = 0u;
@@ -481,7 +555,11 @@ fn brick_id_of(node: u32) -> u32 {
 // stats[55]      = skinned march entries (object-level — per skinned obj per pixel)
 // stats[56]      = skinned march hits (pixel produced a deformed G-buffer write)
 // stats[57]      = skinned march bone-field populated-cell reads
-// stats[58..64]  = reserved
+// stats[58]      = skinned march brick-skip hits (empty-brick fast-forward)
+// stats[59]      = skinned march brick-populated samples
+// stats[60]      = user-shader instance dispatch invocations (Phase B-redux 3a)
+// stats[61]      = user-shader instance dispatch hits        (Phase B-redux 3a)
+// stats[62..64]  = reserved
 //
 // octree_nodes reads are derived CPU-side from the per-phase depth histograms:
 // sum(bucket[i] * (i + 1)) since each lookup descends `depth+1` nodes.
@@ -502,14 +580,31 @@ const PHASE_SHADOW: u32 = 2u;
 // loop iterates these alongside `tile_object_ids` for each tile and
 // dispatches the user-shader path directly from each entry's
 // metadata (no `instances[]` lookup required).
+// 48 B per entry — see `octree_march::UserShaderTileEntry` for the
+// full shape. World AABB and screen-pixel rect are cached at
+// tile-cull / tile-scatter time so the per-pixel `main()` loop below
+// can pre-reject pixels with a 4-compare and `march_object`'s user-
+// shader branch can skip the (potentially expensive) `inst_aabb`
+// hook entirely.
 struct UserShaderTileEntry {
+    aabb_min: vec3<f32>,
     asset_id: u32,
+    aabb_max: vec3<f32>,
     instance_state_offset: u32,
     material_id: u32,
+    // (pixel_x as u16) | ((pixel_y as u16) << 16). Inclusive bounds.
+    screen_min_packed: u32,
+    screen_max_packed: u32,
     _pad: u32,
 }
 @group(2) @binding(6) var<storage, read> us_tile_offsets: array<u32>;
 @group(2) @binding(7) var<storage, read> us_tile_entries: array<UserShaderTileEntry>;
+// Phase B-redux Phase 3a — per-material `shader_params` flat array
+// (8 × f32 per material slot, indexed by `material_id * 8 + i`).
+// Used to populate `ctx.params` for the `instance_at` dispatcher.
+// Same buffer the shade pass binds; layout mirrors
+// `MaterialLibrary::build_shader_params()` output.
+@group(2) @binding(10) var<storage, read> shader_params: array<f32>;
 
 // Workgroup-shared tile range so thread 0 reads `tile_offsets[t]`
 // + `tile_offsets[t+1]` once and every thread in the tile reuses them.
@@ -1147,9 +1242,208 @@ fn march_object_skinned(
     return result;
 }
 
+// Phase B-redux — generic prototype-octree descent used by user-
+// shader instance derivation. Walks an asset's octree+brick pool in
+// proto-local oc-space (caller has already mapped the world ray
+// through the user's `inst_to_local`), returns the first opaque hit
+// or "no hit" if the ray exits without hitting one.
+//
+// Differs from `march_object` in three ways:
+//   1. No glass / opacity tracking — proto bakes are V1-opaque only.
+//   2. No transparency / alpha accumulation — first non-empty cell
+//      wins.
+//   3. No skinned path / no overlay reads — proto octrees are
+//      paint-overlay-immune (the host material is inherited
+//      separately at the call site).
+//
+// `local_to_world` and `focal_px_y` flow through to `octree_lookup`'s
+// LOD machinery so the descent terminates at sub-pixel cell sizes
+// the same way `march_object` does for host objects.
+struct ProtoHit {
+    valid: bool,
+    local_t: f32,            // distance in oc-space along safe_dir from oc_origin
+    oc_pos: vec3<f32>,       // hit position in oc-space
+    local_normal: vec3<f32>, // baked normal from leaf_attr
+    leaf_slot: u32,
+}
+
+fn descend_proto_octree(
+    asset: RkpAsset,
+    oc_origin: vec3<f32>,
+    safe_dir: vec3<f32>,
+    inv_dir: vec3<f32>,
+    t_start: f32,
+    t_end: f32,
+    local_to_world: f32,
+) -> ProtoHit {
+    var r: ProtoHit;
+    r.valid = false;
+    r.local_t = t_end;
+    r.oc_pos = vec3<f32>(0.0);
+    r.local_normal = vec3<f32>(0.0, 1.0, 0.0);
+    r.leaf_slot = 0u;
+
+    let extent = bitcast<f32>(asset.octree_extent_bits);
+    let vs = asset.voxel_size;
+    let root = asset.octree_root;
+    let max_depth = asset.octree_depth;
+    let lookup_bias = vs * 1.0e-3;
+    let focal_px_y = 0.5 * camera.resolution.y / max(length(camera.up.xyz), 1e-6);
+
+    var t = t_start;
+    for (var step = 0u; step < MAX_STEPS; step++) {
+        if t > t_end { break; }
+
+        let pos = clamp(
+            oc_origin + safe_dir * (t + lookup_bias),
+            vec3<f32>(vs * 0.01),
+            vec3<f32>(extent - vs * 0.01),
+        );
+        let lookup = octree_lookup(
+            root, max_depth, extent, pos, PHASE_MARCH,
+            t, local_to_world, focal_px_y,
+        );
+
+        if lookup.slot == OCTREE_EMPTY {
+            t += skip_node(pos, safe_dir, inv_dir, lookup.depth, extent, vs);
+            continue;
+        }
+        if lookup.slot == OCTREE_INTERIOR {
+            // Proto bakes shouldn't have interior bulk (thin shell only),
+            // but if one shows up treat it as opaque-with-flat-normal.
+            r.valid = true;
+            r.local_t = t;
+            r.oc_pos = oc_origin + safe_dir * t;
+            r.local_normal = -safe_dir;
+            r.leaf_slot = 0u;
+            return r;
+        }
+
+        if slot_is_brick(lookup.slot) {
+            var brick_id = slot_brick_id(lookup.slot);
+            let cell_size = (lookup.cell_half * 2.0) / BRICK_DIM_F;
+            let inv_cell_size = 1.0 / cell_size;
+            var brick_origin = lookup.cell_center - vec3<f32>(lookup.cell_half);
+            var brick_base = brick_id * BRICK_CELLS;
+
+            let p0 = oc_origin + safe_dir * t;
+            let local0 = (p0 - brick_origin) * inv_cell_size;
+            var cell = clamp(
+                vec3<i32>(floor(local0)),
+                vec3<i32>(0),
+                vec3<i32>(3),
+            );
+            let step_i = vec3<i32>(
+                select(-1, 1, safe_dir.x >= 0.0),
+                select(-1, 1, safe_dir.y >= 0.0),
+                select(-1, 1, safe_dir.z >= 0.0),
+            );
+            let step_gt = vec3<f32>(
+                select(0.0, 1.0, safe_dir.x >= 0.0),
+                select(0.0, 1.0, safe_dir.y >= 0.0),
+                select(0.0, 1.0, safe_dir.z >= 0.0),
+            );
+            let next_b = brick_origin + (vec3<f32>(cell) + step_gt) * cell_size;
+            var t_max = t + (next_b - p0) * inv_dir;
+            let t_delta = abs(vec3<f32>(cell_size) * inv_dir);
+            let dda_eps = cell_size * 1.0e-3;
+
+            for (var bs = 0u; bs < BRICK_MAX_STEPS; bs++) {
+                if t > t_end { break; }
+
+                if cell.x < 0 || cell.x >= 4
+                    || cell.y < 0 || cell.y >= 4
+                    || cell.z < 0 || cell.z >= 4 {
+                    var face_idx: u32;
+                    if cell.x < 0 { face_idx = FACE_NX; }
+                    else if cell.x >= 4 { face_idx = FACE_PX; }
+                    else if cell.y < 0 { face_idx = FACE_NY; }
+                    else if cell.y >= 4 { face_idx = FACE_PY; }
+                    else if cell.z < 0 { face_idx = FACE_NZ; }
+                    else { face_idx = FACE_PZ; }
+                    let link = brick_face_links[brick_id * 6u + face_idx];
+                    if link == FACE_INTERIOR {
+                        // Same fallback as OCTREE_INTERIOR above.
+                        r.valid = true;
+                        r.local_t = t;
+                        r.oc_pos = oc_origin + safe_dir * t;
+                        r.local_normal = -safe_dir;
+                        r.leaf_slot = 0u;
+                        return r;
+                    }
+                    if link == FACE_EMPTY_LINK { break; }
+                    brick_id = link;
+                    brick_base = link * BRICK_CELLS;
+                    let brick_extent = BRICK_DIM_F * cell_size;
+                    if face_idx == FACE_NX { cell.x = 3; brick_origin.x -= brick_extent; }
+                    else if face_idx == FACE_PX { cell.x = 0; brick_origin.x += brick_extent; }
+                    else if face_idx == FACE_NY { cell.y = 3; brick_origin.y -= brick_extent; }
+                    else if face_idx == FACE_PY { cell.y = 0; brick_origin.y += brick_extent; }
+                    else if face_idx == FACE_NZ { cell.z = 3; brick_origin.z -= brick_extent; }
+                    else { cell.z = 0; brick_origin.z += brick_extent; }
+                    let p_now = oc_origin + safe_dir * t;
+                    let next_b2 = brick_origin + (vec3<f32>(cell) + step_gt) * cell_size;
+                    t_max = t + (next_b2 - p_now) * inv_dir;
+                }
+
+                let cx = u32(cell.x);
+                let cy = u32(cell.y);
+                let cz = u32(cell.z);
+                let flat = cx + cy * BRICK_DIM + cz * BRICK_DIM * BRICK_DIM;
+                let c = brick_pool[brick_base + flat];
+
+                if c != BRICK_CELL_EMPTY && c != BRICK_CELL_INTERIOR {
+                    let attr = leaf_attr_pool[c];
+                    r.valid = true;
+                    r.local_t = t;
+                    r.oc_pos = oc_origin + safe_dir * t;
+                    r.local_normal = unpack_oct_normal(attr.normal_oct);
+                    r.leaf_slot = c;
+                    return r;
+                }
+
+                if t_max.x < t_max.y && t_max.x < t_max.z {
+                    t = t_max.x + dda_eps;
+                    cell.x += step_i.x;
+                    t_max.x += t_delta.x;
+                } else if t_max.y < t_max.z {
+                    t = t_max.y + dda_eps;
+                    cell.y += step_i.y;
+                    t_max.y += t_delta.y;
+                } else {
+                    t = t_max.z + dda_eps;
+                    cell.z += step_i.z;
+                    t_max.z += t_delta.z;
+                }
+            }
+            // Brick walk exhausted without a hit — fall through to outer
+            // loop's skip_node so we don't infinite-loop on the outer step.
+            t += vs;
+            continue;
+        }
+
+        // Non-empty, non-interior, non-brick — should be a regular leaf
+        // (single-voxel slot). Treat as opaque hit.
+        let leaf_slot = lookup.slot & OCTREE_PAYLOAD_MASK;
+        let attr = leaf_attr_pool[leaf_slot];
+        r.valid = true;
+        r.local_t = t;
+        r.oc_pos = oc_origin + safe_dir * t;
+        r.local_normal = unpack_oct_normal(attr.normal_oct);
+        r.leaf_slot = leaf_slot;
+        return r;
+    }
+    return r;
+}
+
+// Cached world AABB params at the tail of the signature — only
+// consulted on the user-shader branch (`asset.shader_id != 0u`),
+// where the tile-scatter pass already computed them. Host callers
+// pass `vec3<f32>(0.0)` for both; the affine path never reads them.
 fn march_object(
     world_origin: vec3<f32>, world_dir: vec3<f32>,
     inst: RkpInstance, asset: RkpAsset,
+    cached_aabb_min: vec3<f32>, cached_aabb_max: vec3<f32>,
 ) -> MarchResult {
     // Phase-3b: skinned objects inverse-skin at march time. Unskinned
     // objects fall through to the existing rest-octree DDA.
@@ -1185,24 +1479,21 @@ fn march_object(
     var local_dir_unnorm: vec3<f32>;
     var world_t_aabb_entry: f32 = 0.0;
     if is_user_shader {
-        // Fallback pos/scale for default identity stub — pulled from
-        // `inst.world` (translation-only mat4 scaled by cell_size in
-        // tick_instance_pipeline). Real user shaders override these
-        // by reading `instance_pool[inst.instance_state_offset]`.
+        // Fallback pos/scale for the default `inst_to_local` identity
+        // stub — pulled from `inst.world` (translation-only mat4
+        // scaled by cell_size in `tick_instance_pipeline`). Real user
+        // shaders override `inst_to_local` by reading
+        // `instance_pool[inst.instance_state_offset]`. AABB is no
+        // longer hooked here: the tile-scatter pass already cached
+        // the world AABB in the entry; `cached_aabb_min/max` are it.
         let inst_pos = inst.world[3].xyz;
         let inst_scale = length(inst.world[0].xyz);
-        let aabb = dispatch_user_inst_aabb(
-            asset.shader_id,
-            inst.instance_state_offset,
-            inst_pos,
-            inst_scale,
-        );
         let safe_world_dir = vec3<f32>(
             select(world_dir.x, select(-1e-10, 1e-10, world_dir.x >= 0.0), abs(world_dir.x) < 1e-10),
             select(world_dir.y, select(-1e-10, 1e-10, world_dir.y >= 0.0), abs(world_dir.y) < 1e-10),
             select(world_dir.z, select(-1e-10, 1e-10, world_dir.z >= 0.0), abs(world_dir.z) < 1e-10),
         );
-        let aabb_t = intersect_aabb(world_origin, 1.0 / safe_world_dir, aabb.min, aabb.max);
+        let aabb_t = intersect_aabb(world_origin, 1.0 / safe_world_dir, cached_aabb_min, cached_aabb_max);
         if aabb_t.x > aabb_t.y { return result; }
         world_t_aabb_entry = max(aabb_t.x, 0.0);
         let world_entry = world_origin + world_dir * world_t_aabb_entry;
@@ -1636,7 +1927,7 @@ fn march_object(
     // for no benefit on V1.
     //
     // ε sized so the canonical-space step is comfortably above
-    // sub-cell precision (~1/128 canonical for max_depth=5 grass)
+    // sub-cell precision (~1/128 canonical at max_depth=5)
     // without triggering FP underflow at large world scales. 1e-3 m
     // works for the typical scale range; documented limit.
     if is_user_shader && result.valid {
@@ -1827,8 +2118,12 @@ fn main(
             if world_entry > max_world_dist { continue; } // AABB entirely behind closest hit
         }
 
-        // March this object.
-        let r = march_object(ray_origin, ray_dir, inst, asset);
+        // March this object. Host objects ignore the trailing cached
+        // AABB params (only the user-shader branch consults them).
+        let r = march_object(
+            ray_origin, ray_dir, inst, asset,
+            vec3<f32>(0.0), vec3<f32>(0.0),
+        );
         total_steps += r.steps;
 
         // Pull glass info out of this object's march, if any. Glass
@@ -1976,20 +2271,43 @@ fn main(
     // above but iterates `us_tile_entries[]` and synthesizes a
     // minimal `RkpInstance` per entry. Each entry's asset has
     // `shader_id != 0`, so `march_object` takes the user-shader
-    // branch (numerical Jacobian via `inst_to_local` + per-instance
-    // AABB via `inst_aabb`). No AABB pre-cull here — the per-pixel
-    // AABB ray test happens inside `march_object` for user-shader
-    // assets, and the tile-cull GPU pipeline already filtered
-    // entries by screen-space AABB to this tile.
+    // branch (numerical Jacobian via `inst_to_local`; AABB comes
+    // from the entry's cached value). The world-AABB ray cull and
+    // the per-pixel screen-rect pre-reject below are the two cheap
+    // gates that keep user-shader instance perf bounded:
+    //
+    //   1. Screen-rect reject: the tile-scatter pass cached this
+    //      blade's full screen-pixel AABB. A pixel inside the tile
+    //      but outside the blade's screen footprint pays four u16
+    //      compares and continues — no hooks, no DDA.
+    //   2. World-AABB reject: `march_object`'s user-shader branch
+    //      runs `intersect_aabb` against the cached world AABB and
+    //      returns early if the ray misses, again without calling
+    //      the user shader.
+    let pixel_x = pixel.x;
+    let pixel_y = pixel.y;
     for (var k = us_tile_range_start; k < us_tile_range_end; k++) {
         let entry = us_tile_entries[k];
+        // Per-pixel screen-rect reject. `screen_*_packed` carries
+        // (x as u16) | ((y as u16) << 16); compare against
+        // `pixel.xy` directly.
+        let smin_x = entry.screen_min_packed & 0xFFFFu;
+        let smin_y = entry.screen_min_packed >> 16u;
+        let smax_x = entry.screen_max_packed & 0xFFFFu;
+        let smax_y = entry.screen_max_packed >> 16u;
+        if pixel_x < smin_x || pixel_x > smax_x
+            || pixel_y < smin_y || pixel_y > smax_y { continue; }
+
         let inst = synth_inst_from_entry(entry);
         let asset = assets[entry.asset_id];
         // Defensive: if a non-user-shader asset somehow ended up
         // here, skip rather than fall through to the legacy descent.
         if asset.shader_id == 0u { continue; }
 
-        let r = march_object(ray_origin, ray_dir, inst, asset);
+        let r = march_object(
+            ray_origin, ray_dir, inst, asset,
+            entry.aabb_min, entry.aabb_max,
+        );
         total_steps += r.steps;
 
         // Glass — user-shader glass is V1-best-effort. The
@@ -2073,6 +2391,110 @@ fn main(
             first_blend = 0u;
             first_leaf_slot = r.first_slot;
             have_first = true;
+        }
+    }
+
+    // Phase B-redux Phase 3a — instance_at dispatch at the host hit.
+    // When the closest host hit's material has an instance shader,
+    // run user-shader instance descent at the painted leaf. Many
+    // shaders place instances that extend OUT of the painted host
+    // surface (a blade rooted on the ground extends upward; a stalk
+    // on a wall extends outward), so the descent often produces a
+    // closer hit than the host's surface; replace accumulators on
+    // win. Phase 2's Option B `us_tile_entries` loop above still
+    // runs in parallel during the migration.
+    //
+    // V1 limitation: this only fires at painted host leaves the DDA
+    // actually visited. Rays passing through the volume an instance
+    // occupies but missing the painted host surface still won't see
+    // it — Phase 3b's band cells fix that.
+    if have_first && closest_obj_idx != 0xFFFFFFFFu && first_mat_id < arrayLength(&materials) {
+        let hit_shader_id = materials[first_mat_id].shader_id;
+        if hit_shader_id != 0u {
+            // Resolve the prototype asset by linear scan of `assets[]`
+            // for the matching `shader_id`. Small N (one asset per
+            // registered instance shader) so this is cheap; a proper
+            // shader_id → asset_id table is Phase 3b work.
+            var inst_asset_idx: u32 = 0xFFFFFFFFu;
+            let acount = march_params.asset_count;
+            for (var ai: u32 = 0u; ai < acount; ai = ai + 1u) {
+                if assets[ai].shader_id == hit_shader_id {
+                    inst_asset_idx = ai;
+                    break;
+                }
+            }
+            if inst_asset_idx != 0xFFFFFFFFu {
+                let inst_proto_asset = assets[inst_asset_idx];
+                // Snap accum_pos to the host's voxel grid. Without
+                // snapping, two pixels hitting the same painted host
+                // leaf at slightly different positions would feed
+                // different host_pos seeds into instance_at and see
+                // different per-instance derivations → flicker.
+                let host_inst = instances[closest_obj_idx];
+                let host_asset = assets[host_inst.asset_id];
+                let host_inv = mat4_affine_inverse(host_inst.world);
+                let local_hit = (host_inv * vec4<f32>(accum_pos, 1.0)).xyz;
+                let cell_size_h = max(host_asset.voxel_size, 1e-6);
+                let cell_idx = floor(local_hit / cell_size_h);
+                let local_center = (cell_idx + vec3<f32>(0.5)) * cell_size_h;
+                let host_pos = (host_inst.world * vec4<f32>(local_center, 1.0)).xyz;
+
+                // Build HostSample / UserCtx from the host hit and
+                // per-material params. ctx.params reads from the
+                // shared shader_params buffer at offset
+                // `material_id * 8`; the `instance_at` body indexes
+                // into ctx.params[N].
+                var host_sample: HostSample;
+                host_sample.distance = first_dist;
+                host_sample.normal = accum_normal;
+                host_sample.material = first_mat_id;
+                host_sample.material_secondary = first_sec_mat;
+                host_sample.blend_weight = first_blend;
+
+                var ctx: UserCtx;
+                ctx.time = march_params.time;
+                ctx.cell_size = host_asset.voxel_size;
+                ctx.material_id = first_mat_id;
+                ctx.aabb_min = vec3<f32>(0.0);
+                let pbase = first_mat_id * 8u;
+                ctx.params[0] = shader_params[pbase + 0u];
+                ctx.params[1] = shader_params[pbase + 1u];
+                ctx.params[2] = shader_params[pbase + 2u];
+                ctx.params[3] = shader_params[pbase + 3u];
+                ctx.params[4] = shader_params[pbase + 4u];
+                ctx.params[5] = shader_params[pbase + 5u];
+                ctx.params[6] = shader_params[pbase + 6u];
+                ctx.params[7] = shader_params[pbase + 7u];
+
+                atomicAdd(&stats[60], 1u); // user-shader dispatch invocations
+                let inst_hit = dispatch_user_instance_descend(
+                    hit_shader_id,
+                    host_pos,
+                    host_sample,
+                    first_leaf_slot,
+                    ray_origin,
+                    ray_dir,
+                    max_world_dist,
+                    ctx,
+                    inst_proto_asset,
+                );
+                if inst_hit.valid && inst_hit.world_t < max_world_dist {
+                    atomicAdd(&stats[61], 1u); // user-shader dispatch hits
+                    accum_pos = inst_hit.world_pos;
+                    accum_normal = normalize(inst_hit.world_normal);
+                    accum_color = vec3<f32>(0.0); // material albedo from host
+                    accum_alpha = 1.0;
+                    first_dist = inst_hit.world_t;
+                    max_world_dist = inst_hit.world_t;
+                    // Host-material inheritance (V1 — same as Option B).
+                    // Keep first_mat_id, first_sec_mat, first_blend.
+                    // Reset leaf_slot since the proto leaf isn't in
+                    // the host's overlay — paint cursor falls back to
+                    // material albedo.
+                    first_leaf_slot = 0u;
+                    closest_obj_idx = 0xFFFFFFFFu;
+                }
+            }
         }
     }
 

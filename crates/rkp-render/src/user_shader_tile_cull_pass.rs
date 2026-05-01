@@ -228,7 +228,11 @@ fn build_pipeline(
     inst_aabb_chunk: &str,
 ) -> wgpu::ComputePipeline {
     let template = include_str!("shaders/user_shader_tile_cull.wgsl");
-    let source = splice_inst_chunks(template, inst_to_local_chunk, inst_aabb_chunk);
+    // Tile cull doesn't run the per-pixel `instance_at` derivation;
+    // it only computes per-blade world AABBs via the `inst_aabb`
+    // hook. Pass an empty instance_at chunk so `splice_inst_chunks`
+    // skips that marker (the tile-cull template doesn't carry it).
+    let source = splice_inst_chunks(template, inst_to_local_chunk, inst_aabb_chunk, "");
     validate_wgsl(&source, "user_shader_tile_cull");
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("user_shader_tile_cull"),
@@ -282,7 +286,7 @@ mod tests {
     #[test]
     fn template_validates_with_empty_chunks() {
         let template = include_str!("shaders/user_shader_tile_cull.wgsl");
-        let source = splice_inst_chunks(template, "", "");
+        let source = splice_inst_chunks(template, "", "", "");
         assert_wgsl_valid(&source, "user_shader_tile_cull");
         assert!(source.contains("tile_cull_main"));
         // Identity stubs are kept verbatim when chunks are empty.
@@ -340,7 +344,7 @@ fn user_grass_inst_aabb(inst: Blade) -> Aabb {
         let registry = scan_dir(&dir).unwrap();
         let chunks = compose(&registry);
         let template = include_str!("shaders/user_shader_tile_cull.wgsl");
-        let source = splice_inst_chunks(template, &chunks.inst_to_local, &chunks.inst_aabb);
+        let source = splice_inst_chunks(template, &chunks.inst_to_local, &chunks.inst_aabb, "");
         assert_wgsl_valid(&source, "tile_cull_with_grass");
         // The composer renames `user_grass_inst_aabb` to
         // `rkp_user_<id>_inst_aabb`; confirm the per-shader switch arm

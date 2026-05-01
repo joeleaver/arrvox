@@ -102,6 +102,13 @@ struct MarchParams {
     // this pass are skipped (the shade pass reads
     // `sample_shadow_map` for those lights instead).
     shadow_map_enabled: u32,
+    // Phase B-redux Phase 3a — wire-format sync with octree_march's
+    // uniform; shadow trace doesn't read either field yet (Phase 4
+    // will when shadow goes through instance_at descent), but the
+    // shared uniform binding requires a layout match.
+    time: f32,
+    asset_count: u32,
+    _pad0: u32,
 }
 
 struct GpuLight {

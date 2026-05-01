@@ -13,20 +13,35 @@ use crate::validate_wgsl;
 const STATS_U32_COUNT: usize = 64;
 const STATS_BYTES: u64 = (STATS_U32_COUNT * 4) as u64;
 
-/// Per-tile user-shader entry (Phase 6). Each entry carries enough
-/// metadata for the host march to dispatch the user-shader path
-/// without going through a per-instance `RkpGpuInstance` — those are
-/// gone for user-shader paths in Phase 6.
+/// Per-tile user-shader entry (Phase 6, fattened post-Phase-8 perf
+/// pass). Each entry carries enough metadata for the host march to
+/// dispatch the user-shader path without going through a per-instance
+/// `RkpGpuInstance` — those are gone for user-shader paths in Phase 6.
+///
+/// The world AABB and screen-pixel rect are cached here so the per-
+/// pixel `march_object` path does NOT re-call the user shader's
+/// (potentially expensive) `inst_aabb` hook to test the ray, and
+/// `main()` can pre-reject pixels outside the blade's screen footprint
+/// with a 4-compare before any hook dispatch. Both values are already
+/// computed by the tile-cull / tile-scatter passes; they used to be
+/// recomputed per-pixel.
 ///
 /// Wire format must match the WGSL struct in
-/// `octree_march.wgsl::UserShaderTileEntry`. 16 bytes — std140
-/// alignment puts the four `u32`s tightly packed.
+/// `octree_march.wgsl::UserShaderTileEntry` and
+/// `user_shader_tile_scatter.wgsl::UserShaderTileEntry`. 48 bytes —
+/// the WGSL `vec3<f32>` followed by `u32` packs the trailing u32 into
+/// the vec3's natural pad slot (offsets 0..12, 12..16; same trick used
+/// by `InstanceTileCullEntry`).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct UserShaderTileEntry {
+    /// World-space AABB min (cached from `inst_aabb` at tile-cull time).
+    pub aabb_min: [f32; 3],
     /// Index into the scene's `assets[]` array. Looks up the user-
     /// shader proto (octree_root, max_depth, voxel_size, shader_id).
     pub asset_id: u32,
+    /// World-space AABB max.
+    pub aabb_max: [f32; 3],
     /// u32 offset into `instance_pool` for this instance's per-instance
     /// state. The user's hooks read from this offset.
     pub instance_state_offset: u32,
@@ -34,10 +49,18 @@ pub struct UserShaderTileEntry {
     /// `material_primary = 0` into its leaf_attrs; the host march
     /// overrides with this on hit (locked V1 host-material inheritance).
     pub material_id: u32,
+    /// Screen-pixel rect packed as `(x as u16) | ((y as u16) << 16)`.
+    /// Min corner. Computed by `tile_scatter_main` from the projected
+    /// world-AABB corners; clamped to viewport bounds so unpacking is
+    /// safe. The per-pixel `main()` loop tests `pixel.xy ∈ [min, max]`
+    /// and skips the entry on miss.
+    pub screen_min_packed: u32,
+    /// Screen-pixel rect max corner, same packing.
+    pub screen_max_packed: u32,
     pub _pad: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<UserShaderTileEntry>() == 16);
+const _: () = assert!(std::mem::size_of::<UserShaderTileEntry>() == 48);
 
 /// Uniform parameters for the march shader.
 #[repr(C)]
@@ -74,13 +97,21 @@ pub struct MarchParams {
     /// reads `sample_shadow_map` for that branch). Spot/point
     /// lights keep the per-pixel ray-traced path either way.
     pub shadow_map_enabled: u32,
-    /// 9 u32s × 4 = 36 bytes; uniform-storage layout rounds the
-    /// struct size up to the next 16-byte multiple, so 3 trailing
-    /// pad words bring us to 48. Keep them named so any future
-    /// additions slot in cleanly.
+    /// Phase B-redux Phase 3a — frame time threaded into `ctx.time`
+    /// so user shaders' `instance_at` hooks can derive
+    /// time-dependent parameters (wind sway, etc.) without per-frame
+    /// re-bake. Engine populates from `frame.shade_params_base.time`.
+    pub time: f32,
+    /// Phase B-redux Phase 3a — number of records in `assets[]`. The
+    /// host march scans the array to find an asset whose
+    /// `asset.shader_id` matches the painted leaf's material
+    /// `shader_id`, mapping shader_id → proto octree at march time.
+    /// Engine sets to combined_assets.len() each frame.
+    pub asset_count: u32,
+    /// Trailing pad to round the struct size up to the next 16-byte
+    /// multiple (uniform-storage layout requirement). 11 u32s × 4 =
+    /// 44 → pad to 48. Named so any future additions slot in cleanly.
     pub _pad0: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
 }
 
 /// The octree ray march compute pass.
@@ -152,6 +183,11 @@ pub struct OctreeMarchPass {
     lights_buffer: Option<wgpu::Buffer>,
     /// Materials buffer reference for bind group rebuild.
     materials_buffer: Option<wgpu::Buffer>,
+    /// Phase B-redux Phase 3a — shader_params buffer (per-material
+    /// 8 × f32 slots), shared with rkp_shade. Used by the host
+    /// march's `instance_at` dispatcher to populate `ctx.params` for
+    /// derivation.
+    shader_params_buffer: Option<wgpu::Buffer>,
 }
 
 impl OctreeMarchPass {
@@ -268,9 +304,9 @@ impl OctreeMarchPass {
                         count: None,
                     },
                     // Binding 7: per-tile user-shader entries
-                    // (`UserShaderTileEntry` records — 16 B each:
-                    // asset_id, instance_state_offset, material_id,
-                    // _pad). Slice for tile `t` is
+                    // (`UserShaderTileEntry` records — 48 B each:
+                    // world AABB + asset_id + state_offset + material_id
+                    // + screen-pixel rect packed). Slice for tile `t` is
                     // `us_tile_entries[us_tile_offsets[t]..us_tile_offsets[t+1]]`.
                     wgpu::BindGroupLayoutEntry {
                         binding: 7,
@@ -298,6 +334,23 @@ impl OctreeMarchPass {
                     // Binding 9: TLAS leaves (Phase 7 Session 4b).
                     wgpu::BindGroupLayoutEntry {
                         binding: 9,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Binding 10: shader_params — flat per-material
+                    // f32 array (8 floats per material) keyed by
+                    // material_id. Phase B-redux Phase 3a wires this
+                    // so user-shader `instance_at` derivation can read
+                    // ctx.params from the live material's slider
+                    // values. Already the same buffer the shade pass
+                    // binds; this just exposes it to march too.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 10,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -417,6 +470,7 @@ impl OctreeMarchPass {
             tlas_leaves_buffer: None,
             lights_buffer: None,
             materials_buffer: None,
+            shader_params_buffer: None,
         }
     }
 
@@ -450,6 +504,7 @@ impl OctreeMarchPass {
         device: &wgpu::Device,
         inst_to_local_chunk: &str,
         inst_aabb_chunk: &str,
+        instance_at_chunk: &str,
         source_hash: u64,
     ) -> bool {
         if source_hash == self.user_shader_source_hash {
@@ -457,7 +512,7 @@ impl OctreeMarchPass {
         }
         let template = include_str!("shaders/octree_march.wgsl");
         let source = crate::shader_composer::splice_inst_chunks(
-            template, inst_to_local_chunk, inst_aabb_chunk,
+            template, inst_to_local_chunk, inst_aabb_chunk, instance_at_chunk,
         );
         validate_wgsl(&source, "octree_march");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -488,17 +543,31 @@ impl OctreeMarchPass {
         self.try_rebuild_params_bind_group(device);
     }
 
+    /// Phase B-redux Phase 3a — set the shader_params buffer (the
+    /// per-material 8 × f32 slot array shared with `rkp_shade`).
+    /// `instance_at` derivation reads `ctx.params` from this binding;
+    /// the bind group is rebuilt to include it when both materials
+    /// and lights are also set.
+    pub fn set_shader_params(
+        &mut self, device: &wgpu::Device, shader_params_buffer: &wgpu::Buffer,
+    ) {
+        self.shader_params_buffer = Some(shader_params_buffer.clone());
+        self.try_rebuild_params_bind_group(device);
+    }
+
     fn try_rebuild_params_bind_group(&mut self, device: &wgpu::Device) {
         let (
             Some(materials_buffer),
             Some(lights_buffer),
             Some(tlas_nodes),
             Some(tlas_leaves),
+            Some(shader_params),
         ) = (
             &self.materials_buffer,
             &self.lights_buffer,
             &self.tlas_nodes_buffer,
             &self.tlas_leaves_buffer,
+            &self.shader_params_buffer,
         ) else { return };
         self.params_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("march params+materials bind group"),
@@ -543,6 +612,10 @@ impl OctreeMarchPass {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: tlas_leaves.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: shader_params.as_entire_binding(),
                 },
             ],
         }));
@@ -670,7 +743,7 @@ impl OctreeMarchPass {
     }
 
     /// Phase 6 Session 3 — grow `us_tile_entries_buffer` to fit
-    /// `entry_count` × 16 B `UserShaderTileEntry` records. Sized
+    /// `entry_count` × 48 B `UserShaderTileEntry` records. Sized
     /// separately from the per-tile buffers because entry count comes
     /// from post-cull totals (sum of per-tile counts), not tile count.
     /// Returns `true` if reallocated.
@@ -679,7 +752,8 @@ impl OctreeMarchPass {
         device: &wgpu::Device,
         entry_count: u32,
     ) -> bool {
-        let needed = (entry_count.max(1) as u64) * 16;
+        let needed =
+            (entry_count.max(1) as u64) * std::mem::size_of::<UserShaderTileEntry>() as u64;
         if needed <= self.us_tile_entries_capacity {
             return false;
         }
@@ -793,6 +867,8 @@ impl OctreeMarchPass {
         tile_count_x: u32,
         tlas_node_count: u32,
         shadow_map_enabled: bool,
+        time: f32,
+        asset_count: u32,
         timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) {
         // Update params.
@@ -806,9 +882,9 @@ impl OctreeMarchPass {
             tile_count_x,
             tlas_node_count,
             shadow_map_enabled: u32::from(shadow_map_enabled),
+            time,
+            asset_count,
             _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
 

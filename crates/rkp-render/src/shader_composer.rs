@@ -170,6 +170,17 @@ pub struct UserShaderEntry {
     /// `fn user_<stem>_inst_to_local(world_pos: vec3<f32>, inst: <Struct>) -> vec3<f32>`.
     /// Falls back to TRS inverse when absent.
     pub inst_to_local_text: Option<String>,
+    /// Phase B-redux — march-time derivation hook. Replaces the
+    /// emit-pass scatter for instance shaders. Signature:
+    /// `fn user_<stem>_instance_at(host_pos: vec3<f32>, host: HostSample,
+    /// ctx: UserCtx, k: u32, out_instance: ptr<function, <Struct>>) -> bool`.
+    /// Returns the k-th instance for this host position, or `false` to
+    /// signal "no instance at index k." Called per-pixel from the host
+    /// march at painted-region cells; allows zero per-frame state
+    /// writes (time enters via `ctx`). When present, it supersedes
+    /// `emit_text` for the new pipeline; both can coexist while
+    /// Option B is being phased out.
+    pub instance_at_text: Option<String>,
     /// Verbatim `struct ... { ... }` declarations captured from the
     /// file's top level, in source order. Shader code can declare its
     /// own helper structs; the engine splices them all back into the
@@ -417,6 +428,7 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
         emit_text: None,
         inst_aabb_text: None,
         inst_to_local_text: None,
+        instance_at_text: None,
         struct_decls: Vec::new(),
         instance_layout: None,
     };
@@ -478,12 +490,13 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
                     "emit" => &mut entry.emit_text,
                     "inst_aabb" => &mut entry.inst_aabb_text,
                     "inst_to_local" => &mut entry.inst_to_local_text,
+                    "instance_at" => &mut entry.instance_at_text,
                     other => {
                         return Err(ShaderComposerError::Parse {
                             path: path.to_path_buf(),
                             line: line_of(source, name_start),
                             msg: format!(
-                                "unknown hook `{other}` — expected `shade`, `generate`, `proto`, `emit`, `inst_aabb`, or `inst_to_local`"
+                                "unknown hook `{other}` — expected `shade`, `generate`, `proto`, `emit`, `inst_aabb`, `inst_to_local`, or `instance_at`"
                             ),
                         });
                     }
@@ -609,6 +622,44 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
                 line: 0,
                 msg: "instance helper hook defined without `// @instance_proto <StructName>` directive"
                     .to_string(),
+            });
+        }
+        if entry.instance_at_text.is_some() {
+            return Err(ShaderComposerError::Parse {
+                path: path.to_path_buf(),
+                line: 0,
+                msg: format!(
+                    "`user_{name}_instance_at` defined without `// @instance_proto <StructName>` directive"
+                ),
+            });
+        }
+    }
+
+    // Phase B-redux precondition: `instance_at` shaders must also
+    // provide `inst_aabb` and `inst_to_local`. The march-time descent
+    // calls all three on each derived instance — `inst_aabb` for the
+    // ray-AABB cull, `inst_to_local` for the world↔canonical map and
+    // the world-normal Jacobian. Reject early so the user gets a
+    // clear error instead of a spurious WGSL link error at splice
+    // time when the composer references a missing
+    // `rkp_user_<id>_inst_aabb` symbol.
+    if entry.instance_at_text.is_some() {
+        if entry.inst_aabb_text.is_none() {
+            return Err(ShaderComposerError::Parse {
+                path: path.to_path_buf(),
+                line: 0,
+                msg: format!(
+                    "`user_{name}_instance_at` requires `user_{name}_inst_aabb` (the per-pixel descent calls it for ray-AABB cull)"
+                ),
+            });
+        }
+        if entry.inst_to_local_text.is_none() {
+            return Err(ShaderComposerError::Parse {
+                path: path.to_path_buf(),
+                line: 0,
+                msg: format!(
+                    "`user_{name}_instance_at` requires `user_{name}_inst_to_local` (the per-pixel descent calls it for the world↔canonical map and Jacobian)"
+                ),
             });
         }
     }
@@ -901,6 +952,16 @@ pub struct ComposedChunks {
     /// default arm returns `pos ± 0.5 × scale × √3` (covers any
     /// rotation of the canonical [0, 1]³ cube).
     pub inst_aabb: String,
+    /// Phase B-redux — march-time derivation chunk. Spliced into the
+    /// host march / shadow-trace templates between the
+    /// `USER_INSTANCE_AT_DISPATCH_*` markers. Defines per-shader
+    /// `rkp_user_<id>_instance_at(host_pos, host, ctx, k, &instance)
+    /// -> bool` (verbatim user body, fn name rewritten). The march
+    /// splices per-shader switch cases that call into these directly
+    /// with the user's instance-struct-typed local var; no unified
+    /// dispatcher because each shader's instance struct differs.
+    /// Empty when no instance shaders register an `instance_at` hook.
+    pub instance_at: String,
 }
 
 /// Compose the per-pipeline dispatch chunks. Returns identity-default
@@ -916,13 +977,16 @@ pub fn compose(reg: &UserShaderRegistry) -> ComposedChunks {
         emit: compose_emit_chunk(reg),
         inst_to_local: compose_inst_to_local_chunk(reg),
         inst_aabb: compose_inst_aabb_chunk(reg),
+        instance_at: compose_instance_at_chunk(reg),
     }
 }
 
-/// Splice the composer's `inst_to_local` + `inst_aabb` chunks into a
-/// host-side WGSL template (`octree_march.wgsl` / `rkp_shadow_trace
-/// .wgsl`) between the two `USER_INST_TO_LOCAL_DISPATCH_BEGIN/END` and
-/// `USER_INST_AABB_DISPATCH_BEGIN/END` marker pairs. Empty chunks
+/// Splice the composer's `inst_to_local` + `inst_aabb` +
+/// `instance_at` chunks into a host-side WGSL template
+/// (`octree_march.wgsl` / `rkp_shadow_trace.wgsl`) between the
+/// `USER_INST_TO_LOCAL_DISPATCH_BEGIN/END`,
+/// `USER_INST_AABB_DISPATCH_BEGIN/END`, and
+/// `USER_INSTANCE_AT_DISPATCH_BEGIN/END` marker pairs. Empty chunks
 /// leave the template's identity-arm stubs in place — that's the
 /// no-user-shader-registered case. Pipelines call this whenever the
 /// registry's `source_hash` changes.
@@ -930,6 +994,7 @@ pub fn splice_inst_chunks(
     template: &str,
     inst_to_local_chunk: &str,
     inst_aabb_chunk: &str,
+    instance_at_chunk: &str,
 ) -> String {
     // Marker strings via concat so the literal occurrences in this fn
     // body don't fool the splicer if it's ever called against this
@@ -940,11 +1005,17 @@ pub fn splice_inst_chunks(
         concat!("USER_INST_TO_LOCAL_DISPATCH", "_END"),
         inst_to_local_chunk,
     );
-    splice_user_marker(
+    let with_aabb = splice_user_marker(
         &with_to_local,
         concat!("USER_INST_AABB_DISPATCH", "_BEGIN"),
         concat!("USER_INST_AABB_DISPATCH", "_END"),
         inst_aabb_chunk,
+    );
+    splice_user_marker(
+        &with_aabb,
+        concat!("USER_INSTANCE_AT_DISPATCH", "_BEGIN"),
+        concat!("USER_INSTANCE_AT_DISPATCH", "_END"),
+        instance_at_chunk,
     )
 }
 
@@ -1459,6 +1530,249 @@ fn compose_inst_aabb_chunk(reg: &UserShaderRegistry) -> String {
     out.push_str("        }\n");
     out.push_str("    }\n");
     out.push_str("}\n");
+    out
+}
+
+/// Phase B-redux. Compose the per-shader `instance_at` chunk for
+/// splice into the host march / shadow templates between the
+/// `USER_INSTANCE_AT_DISPATCH_BEGIN/END` markers.
+///
+/// Wire shape (per registered shader with an `instance_at` hook):
+///
+///   - The shader's instance struct decl (e.g. `struct Blade { ... }`)
+///     plus its helper fns, captured verbatim.
+///   - The user's `user_<name>_instance_at` function, fn-name
+///     rewritten to `rkp_user_<id>_instance_at`. Signature contract:
+///
+///     ```text
+///     fn rkp_user_<id>_instance_at(
+///         host_pos: vec3<f32>,
+///         host: HostSample,
+///         ctx: UserCtx,
+///         k: u32,
+///         out_instance: ptr<function, <Struct>>,
+///     ) -> bool;
+///     ```
+///
+///   - A per-shader `rkp_user_<id>_instance_descend(...)` function
+///     wrapping the actual prototype-octree descent. **Phase 2.c-1
+///     stub**: this calls into the user's `instance_at` once (so the
+///     splice path is exercised end-to-end) but always returns "no
+///     hit" — Phase 2.c-2 fills in the real DDA.
+///
+///   - A unified `dispatch_user_instance_descend(shader_id, ...)`
+///     switch routing into the per-shader descend fns. Replaces the
+///     identity-stub dispatcher in the template.
+///
+/// `inst_to_local` and `inst_aabb` chunks may be spliced into the
+/// SAME template at different markers. To avoid duplicate struct /
+/// helper declarations, this chunk skips them when either of those
+/// hooks is present (their chunk emitted them first).
+fn compose_instance_at_chunk(reg: &UserShaderRegistry) -> String {
+    // Bail when no shader registers an `instance_at` hook — the
+    // template's identity stub stays in place and the splice is a
+    // no-op (empty chunk).
+    if !reg.entries.iter().any(|e| e.instance_at_text.is_some()) {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    out.push_str("// ── user-shader bodies: instance_at ───────────────────\n");
+    // Splice instance struct decls + helpers, gated to avoid duplicate
+    // declarations when inst_to_local / inst_aabb chunks already emitted
+    // them in the same compilation unit.
+    for entry in &reg.entries {
+        let needs_decls = entry.instance_at_text.is_some()
+            && entry.inst_to_local_text.is_none()
+            && entry.inst_aabb_text.is_none();
+        if needs_decls {
+            for sd in &entry.struct_decls {
+                out.push_str(sd);
+                out.push('\n');
+            }
+            for helper in &entry.helpers {
+                out.push_str(helper);
+                out.push('\n');
+            }
+        }
+    }
+    for entry in &reg.entries {
+        if let Some(text) = &entry.instance_at_text {
+            let renamed = rewrite_fn_name(
+                text,
+                &format!("user_{}_instance_at", entry.name),
+                &format!("rkp_user_{}_instance_at", entry.id),
+            );
+            out.push_str(&renamed);
+            out.push('\n');
+        }
+    }
+
+    // Phase 2.c-2 — per-shader descent body. For each derived
+    // instance (k = 0..max_emits):
+    //
+    //   1. `rkp_user_<id>_instance_at` derives the k-th instance
+    //      struct.
+    //   2. `rkp_user_<id>_inst_aabb(inst)` returns the world AABB.
+    //      Ray-AABB cull rejects rays missing the bound.
+    //   3. `rkp_user_<id>_inst_to_local` maps `world_entry` and
+    //      `world_entry + ray_dir` into proto-canonical space; the
+    //      difference is `local_dir_unnorm` whose length is the
+    //      world↔local scale factor.
+    //   4. `descend_proto_octree` walks the prototype octree from
+    //      that local origin/direction, returns first opaque hit.
+    //   5. World-normal via Jacobian: 4 more `inst_to_local` calls
+    //      around the hit position, normal transforms by `Jᵀ`.
+    //
+    // `world_t` accumulates as `world_t_entry + hit.local_t *
+    // local_to_world` (since the proto descent walks oc-space along
+    // `local_dir_unnorm`-normalized direction, the local-distance is
+    // already aligned with world-distance scaled by 1/|local_dir_unnorm|).
+    // Closest hit across all k wins.
+    out.push_str(
+        "\n// ── per-shader instance-descent bodies (Phase 2.c-2) ─\n",
+    );
+    for entry in &reg.entries {
+        if entry.instance_at_text.is_some() {
+            let layout = entry.instance_layout.as_ref().expect(
+                "instance_at hook implies @instance_proto layout parsed",
+            );
+            let max_emits = entry.metadata.max_emits_per_thread.unwrap_or(1);
+            out.push_str(&format!(
+                "fn rkp_user_{id}_instance_descend(\n\
+                \x20   host_pos: vec3<f32>,\n\
+                \x20   host: HostSample,\n\
+                \x20   ctx: UserCtx,\n\
+                \x20   leaf_slot: u32,\n\
+                \x20   ray_origin: vec3<f32>,\n\
+                \x20   ray_dir: vec3<f32>,\n\
+                \x20   world_max_t: f32,\n\
+                \x20   asset: RkpAsset,\n\
+                ) -> InstanceHit {{\n\
+                \x20   var best: InstanceHit;\n\
+                \x20   best.valid = false;\n\
+                \x20   best.world_t = world_max_t;\n\
+                \x20   best.world_pos = vec3<f32>(0.0);\n\
+                \x20   best.world_normal = vec3<f32>(0.0, 1.0, 0.0);\n\
+                \x20   for (var k: u32 = 0u; k < {max_emits}u; k = k + 1u) {{\n\
+                \x20       var inst: {struct_name};\n\
+                \x20       if (!rkp_user_{id}_instance_at(host_pos, host, ctx, k, &inst)) {{ continue; }}\n\
+                \x20       let aabb = rkp_user_{id}_inst_aabb(inst);\n\
+                \x20       let safe_world_dir = vec3<f32>(\n\
+                \x20           select(ray_dir.x, select(-1e-10, 1e-10, ray_dir.x >= 0.0), abs(ray_dir.x) < 1e-10),\n\
+                \x20           select(ray_dir.y, select(-1e-10, 1e-10, ray_dir.y >= 0.0), abs(ray_dir.y) < 1e-10),\n\
+                \x20           select(ray_dir.z, select(-1e-10, 1e-10, ray_dir.z >= 0.0), abs(ray_dir.z) < 1e-10),\n\
+                \x20       );\n\
+                \x20       let aabb_t = intersect_aabb(ray_origin, 1.0 / safe_world_dir, aabb.min, aabb.max);\n\
+                \x20       if (aabb_t.x > aabb_t.y) {{ continue; }}\n\
+                \x20       let world_t_entry = max(aabb_t.x, 0.0);\n\
+                \x20       if (world_t_entry >= best.world_t) {{ continue; }}\n\
+                \x20       let world_entry = ray_origin + ray_dir * world_t_entry;\n\
+                \x20       let local_entry = rkp_user_{id}_inst_to_local(world_entry, inst);\n\
+                \x20       let local_endpoint = rkp_user_{id}_inst_to_local(world_entry + ray_dir, inst);\n\
+                \x20       let local_dir_unnorm = local_endpoint - local_entry;\n\
+                \x20       let local_dir_len = max(length(local_dir_unnorm), 1.0e-8);\n\
+                \x20       let local_dir = local_dir_unnorm / local_dir_len;\n\
+                \x20       let local_to_world = 1.0 / local_dir_len;\n\
+                \x20       let oc_origin = local_entry - asset.grid_origin;\n\
+                \x20       let safe_dir = vec3<f32>(\n\
+                \x20           select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),\n\
+                \x20           select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),\n\
+                \x20           select(local_dir.z, select(-1e-10, 1e-10, local_dir.z >= 0.0), abs(local_dir.z) < 1e-10),\n\
+                \x20       );\n\
+                \x20       let inv_dir = 1.0 / safe_dir;\n\
+                \x20       let extent = bitcast<f32>(asset.octree_extent_bits);\n\
+                \x20       let t_range = intersect_aabb(oc_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(extent));\n\
+                \x20       if (t_range.x > t_range.y) {{ continue; }}\n\
+                \x20       // Cap descent in oc-space at the world-distance budget remaining vs. best hit.\n\
+                \x20       let world_remaining = best.world_t - world_t_entry;\n\
+                \x20       let local_t_cap = world_remaining / max(local_to_world, 1e-10);\n\
+                \x20       let local_t_end = min(t_range.y, local_t_cap);\n\
+                \x20       let hit = descend_proto_octree(\n\
+                \x20           asset, oc_origin, safe_dir, inv_dir,\n\
+                \x20           max(t_range.x, 0.0), local_t_end, local_to_world,\n\
+                \x20       );\n\
+                \x20       if (!hit.valid) {{ continue; }}\n\
+                \x20       let world_t = world_t_entry + hit.local_t * local_to_world;\n\
+                \x20       if (world_t >= best.world_t) {{ continue; }}\n\
+                \x20       let world_pos = ray_origin + ray_dir * world_t;\n\
+                \x20       // Jacobian normal — see octree_march.wgsl::march_object for derivation.\n\
+                \x20       let eps: f32 = 1.0e-3;\n\
+                \x20       let l0 = rkp_user_{id}_inst_to_local(world_pos, inst);\n\
+                \x20       let lx = rkp_user_{id}_inst_to_local(world_pos + vec3<f32>(eps, 0.0, 0.0), inst);\n\
+                \x20       let ly = rkp_user_{id}_inst_to_local(world_pos + vec3<f32>(0.0, eps, 0.0), inst);\n\
+                \x20       let lz = rkp_user_{id}_inst_to_local(world_pos + vec3<f32>(0.0, 0.0, eps), inst);\n\
+                \x20       let jx = (lx - l0) / eps;\n\
+                \x20       let jy = (ly - l0) / eps;\n\
+                \x20       let jz = (lz - l0) / eps;\n\
+                \x20       let n_local = hit.local_normal;\n\
+                \x20       let n_world_unnorm = vec3<f32>(\n\
+                \x20           dot(jx, n_local),\n\
+                \x20           dot(jy, n_local),\n\
+                \x20           dot(jz, n_local),\n\
+                \x20       );\n\
+                \x20       let n_world_len = length(n_world_unnorm);\n\
+                \x20       var world_normal = n_local;\n\
+                \x20       if (n_world_len >= 1e-6) {{\n\
+                \x20           world_normal = n_world_unnorm / n_world_len;\n\
+                \x20       }}\n\
+                \x20       best.valid = true;\n\
+                \x20       best.world_t = world_t;\n\
+                \x20       best.world_pos = world_pos;\n\
+                \x20       best.world_normal = world_normal;\n\
+                \x20   }}\n\
+                \x20   return best;\n\
+                }}\n\n",
+                id = entry.id,
+                struct_name = layout.struct_name,
+                max_emits = max_emits,
+            ));
+        }
+    }
+
+    // Unified dispatcher — replaces the in-template identity stub.
+    // Per-shader cases route into rkp_user_<id>_instance_descend. The
+    // `asset` arg threads the prototype's asset record (octree root,
+    // depth, voxel_size, grid_origin) through to the per-shader
+    // descent so it can run `descend_proto_octree`. The march call
+    // site looks it up from the host hit's material → asset_id.
+    out.push_str("// ── dispatch_user_instance_descend ───────────────────\n");
+    out.push_str(
+        "fn dispatch_user_instance_descend(\n\
+         \x20   shader_id: u32,\n\
+         \x20   host_pos: vec3<f32>,\n\
+         \x20   host: HostSample,\n\
+         \x20   leaf_slot: u32,\n\
+         \x20   ray_origin: vec3<f32>,\n\
+         \x20   ray_dir: vec3<f32>,\n\
+         \x20   world_max_t: f32,\n\
+         \x20   ctx: UserCtx,\n\
+         \x20   asset: RkpAsset,\n\
+         ) -> InstanceHit {\n\
+         \x20   switch shader_id {\n",
+    );
+    for entry in &reg.entries {
+        if entry.instance_at_text.is_some() {
+            out.push_str(&format!(
+                "        case {id}u: {{ return rkp_user_{id}_instance_descend(\n\
+                 \x20           host_pos, host, ctx, leaf_slot, ray_origin, ray_dir, world_max_t, asset,\n\
+                 \x20       ); }}\n",
+                id = entry.id,
+            ));
+        }
+    }
+    out.push_str(
+        "        default: {\n\
+         \x20           var r: InstanceHit;\n\
+         \x20           r.valid = false;\n\
+         \x20           r.world_t = world_max_t;\n\
+         \x20           r.world_pos = vec3<f32>(0.0);\n\
+         \x20           r.world_normal = vec3<f32>(0.0, 1.0, 0.0);\n\
+         \x20           return r;\n\
+         \x20       }\n\
+         \x20   }\n\
+         }\n",
+    );
     out
 }
 
@@ -2207,6 +2521,185 @@ fn user_holo_shade(ctx: ShadeCtx) -> ShadeResult { var r: ShadeResult; return r;
         assert!(chunks.emit.contains("dispatch_user_emit"));
         assert!(!chunks.emit.contains("emit_instance"));
         assert!(!chunks.emit.contains("rkp_user_"));
+    }
+
+    // ── Phase B-redux: compose_instance_at_chunk ────────────────────
+
+    /// Parser captures the new `instance_at` hook. Composed chunk
+    /// renames `user_<name>_instance_at` →
+    /// `rkp_user_<id>_instance_at` and emits the body verbatim under
+    /// the new name. Struct + helpers are emitted once (here, by the
+    /// instance_at chunk because no inst_to_local / inst_aabb hook is
+    /// present in this fixture to claim them).
+    #[test]
+    fn compose_instance_at_chunk_renames_and_emits_struct() {
+        // `instance_at` requires `inst_aabb` + `inst_to_local`
+        // (descent calls both). This fixture provides them but uses
+        // them only for the ABI's sake — the bodies are no-ops.
+        let src = r#"
+// @instance_proto Pt
+struct Pt { pos: vec3<f32>, scale: f32 }
+
+fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
+fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
+fn user_x_inst_aabb(inst: Pt) -> Aabb {
+    var a: Aabb;
+    a.min = inst.pos - vec3<f32>(0.5 * inst.scale);
+    a.max = inst.pos + vec3<f32>(0.5 * inst.scale);
+    return a;
+}
+fn user_x_inst_to_local(world_pos: vec3<f32>, inst: Pt) -> vec3<f32> {
+    return (world_pos - inst.pos) / max(inst.scale, 1e-6) + vec3<f32>(0.5);
+}
+fn user_x_instance_at(
+    host_pos: vec3<f32>, host: HostSample, ctx: UserCtx, k: u32,
+    out_instance: ptr<function, Pt>,
+) -> bool {
+    if (k > 0u) { return false; }
+    var p: Pt;
+    p.pos = host_pos;
+    p.scale = 1.0;
+    *out_instance = p;
+    return true;
+}
+"#;
+        let tmp = tempfile_dir("instance_at_renames");
+        write(&tmp, "x.wgsl", src);
+        let reg = scan_dir(&tmp).unwrap();
+        let chunks = compose(&reg);
+
+        // With inst_to_local + inst_aabb hooks present, those chunks
+        // claim the struct decl. instance_at chunk skips it.
+        assert!(
+            !chunks.instance_at.contains("struct Pt"),
+            "instance_at chunk should skip struct decl when \
+             inst_to_local / inst_aabb chunks claim it",
+        );
+        assert!(
+            chunks.instance_at.contains("fn rkp_user_1_instance_at("),
+            "instance_at chunk should rename user_x_instance_at to \
+             per-id form. Got:\n{}",
+            chunks.instance_at,
+        );
+        // The user's body is emitted verbatim under the new name.
+        assert!(chunks.instance_at.contains("ptr<function, Pt>"));
+        assert!(chunks.instance_at.contains("*out_instance = p;"));
+        // Phase 2.c-2 — per-shader descent body + dispatcher.
+        assert!(
+            chunks.instance_at.contains("fn rkp_user_1_instance_descend("),
+            "instance_at chunk should emit the per-shader descent body",
+        );
+        assert!(
+            chunks.instance_at.contains("descend_proto_octree("),
+            "descent body should call descend_proto_octree",
+        );
+        assert!(
+            chunks.instance_at.contains("fn dispatch_user_instance_descend("),
+            "instance_at chunk should emit the unified dispatcher",
+        );
+    }
+
+    /// When the same shader also defines `inst_to_local` (or
+    /// `inst_aabb`), those chunks claim the struct + helpers; the
+    /// `instance_at` chunk must NOT re-emit them or naga rejects
+    /// duplicate declarations when both chunks are spliced into one
+    /// compilation unit.
+    #[test]
+    fn compose_instance_at_chunk_skips_struct_when_inst_chunks_present() {
+        // `instance_at` requires both `inst_to_local` and
+        // `inst_aabb`. With both present, the inst_to_local chunk
+        // is responsible for emitting struct + helper decls; the
+        // instance_at chunk must skip them to avoid duplicate
+        // declarations at splice time.
+        let src = r#"
+// @instance_proto Pt
+struct Pt { pos: vec3<f32>, scale: f32 }
+
+fn helper_noop(p: vec3<f32>) -> vec3<f32> { return p; }
+
+fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
+fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
+fn user_x_inst_to_local(world_pos: vec3<f32>, inst: Pt) -> vec3<f32> {
+    return helper_noop(world_pos - inst.pos);
+}
+fn user_x_inst_aabb(inst: Pt) -> Aabb {
+    var a: Aabb;
+    a.min = inst.pos - vec3<f32>(0.5);
+    a.max = inst.pos + vec3<f32>(0.5);
+    return a;
+}
+fn user_x_instance_at(
+    host_pos: vec3<f32>, host: HostSample, ctx: UserCtx, k: u32,
+    out_instance: ptr<function, Pt>,
+) -> bool {
+    return false;
+}
+"#;
+        let tmp = tempfile_dir("instance_at_dedupe");
+        write(&tmp, "x.wgsl", src);
+        let reg = scan_dir(&tmp).unwrap();
+        let chunks = compose(&reg);
+
+        // inst_to_local claims the struct + helpers.
+        assert!(chunks.inst_to_local.contains("struct Pt"));
+        assert!(chunks.inst_to_local.contains("fn helper_noop"));
+        // instance_at must NOT re-emit them.
+        assert!(
+            !chunks.instance_at.contains("struct Pt"),
+            "instance_at chunk should skip struct decl when \
+             inst_to_local chunk already emits it",
+        );
+        assert!(
+            !chunks.instance_at.contains("fn helper_noop"),
+            "instance_at chunk should skip helper decls when \
+             inst_to_local chunk already emits them",
+        );
+        // But the renamed instance_at fn itself is still in the chunk.
+        assert!(chunks.instance_at.contains("fn rkp_user_1_instance_at("));
+    }
+
+    /// Empty registry → empty chunk (no `instance_at` hook
+    /// registered). Downstream pipelines splicing the chunk see
+    /// only a header comment.
+    #[test]
+    fn compose_instance_at_chunk_empty_when_no_instance_at_hook() {
+        let src = r#"
+// @instance_proto Pt
+struct Pt { pos: vec3<f32>, scale: f32 }
+fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
+fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
+"#;
+        let tmp = tempfile_dir("instance_at_empty");
+        write(&tmp, "x.wgsl", src);
+        let reg = scan_dir(&tmp).unwrap();
+        let chunks = compose(&reg);
+        // Header comment only — no struct, no fn.
+        assert!(!chunks.instance_at.contains("struct Pt"));
+        assert!(!chunks.instance_at.contains("rkp_user_"));
+    }
+
+    /// `user_<name>_instance_at` declared without `@instance_proto`
+    /// directive must be rejected with a clear error.
+    #[test]
+    fn rejects_instance_at_hook_without_directive() {
+        let src = r#"
+fn user_x_instance_at(
+    host_pos: vec3<f32>, host: HostSample, ctx: UserCtx, k: u32,
+    out_instance: ptr<function, vec3<f32>>,
+) -> bool { return false; }
+"#;
+        let tmp = tempfile_dir("instance_at_no_directive");
+        write(&tmp, "x.wgsl", src);
+        let err = scan_dir(&tmp).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("user_x_instance_at"),
+            "error message should name the offending hook; got: {msg}",
+        );
+        assert!(
+            msg.contains("@instance_proto"),
+            "error message should reference the missing directive; got: {msg}",
+        );
     }
 
     // ── Option B: @instance_proto pipeline ────────────────────────────

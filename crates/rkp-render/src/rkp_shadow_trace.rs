@@ -125,6 +125,7 @@ impl ShadowTracePass {
         device: &wgpu::Device,
         inst_to_local_chunk: &str,
         inst_aabb_chunk: &str,
+        instance_at_chunk: &str,
         source_hash: u64,
     ) -> bool {
         if source_hash == self.user_shader_source_hash {
@@ -132,7 +133,7 @@ impl ShadowTracePass {
         }
         let template = include_str!("shaders/rkp_shadow_trace.wgsl");
         let source = crate::shader_composer::splice_inst_chunks(
-            template, inst_to_local_chunk, inst_aabb_chunk,
+            template, inst_to_local_chunk, inst_aabb_chunk, instance_at_chunk,
         );
         validate_wgsl(&source, "rkp_shadow_trace");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {

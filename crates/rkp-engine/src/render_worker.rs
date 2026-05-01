@@ -1072,12 +1072,17 @@ fn render_one_frame(
             &state.device,
             &frame.user_shader_inst_to_local_chunk,
             &frame.user_shader_inst_aabb_chunk,
+            &frame.user_shader_instance_at_chunk,
             frame.user_shader_source_hash,
         );
+        // Phase 4 wires instance_at into shadow_trace; for now pass
+        // empty so shadow_trace's lack of USER_INSTANCE_AT_DISPATCH
+        // markers doesn't trigger a panic in `splice_user_marker`.
         vr.shadow_trace.reload_user_shaders(
             &state.device,
             &frame.user_shader_inst_to_local_chunk,
             &frame.user_shader_inst_aabb_chunk,
+            "",
             frame.user_shader_source_hash,
         );
         // Phase 8 — shadow_map_march descends into user-shader
@@ -1096,6 +1101,14 @@ fn render_one_frame(
             &state.device,
             &state.queue,
             &frame.shader_params_slots,
+        );
+        // Phase B-redux Phase 3a — refresh march's binding too.
+        // upload_shader_params may have reallocated the buffer; the
+        // existing per-frame `set_shade_data` below picks up shade's
+        // side, march mirrors that here.
+        vr.march.set_shader_params(
+            &state.device,
+            vr.shade.shader_params_buffer(),
         );
         // Re-bind unconditionally — set_shade_data is one bind-group
         // create; cheaper than threading state for "did the buffer
@@ -1552,6 +1565,10 @@ fn render_one_frame(
             tile_object_ids_ref,
             vp.tile_count_x,
             state.tlas_pass.last_node_count,
+            // Phase B-redux Phase 3a — frame time + asset count for
+            // user-shader instance_at derivation in march.
+            frame.shade_params_base.time,
+            asset_count,
             state.tlas_pass.last_leaf_count,
             // Conservative scene extent for shadow-frustum cull —
             // the longest axis of the scene AABB.
@@ -2935,20 +2952,38 @@ fn dispatch_us_tile_cull_inner(
         return;
     }
 
-    // Conservative entries estimate. Two regimes mixed:
+    // Entries estimate. Two regimes mixed:
     // (a) typical: each AABB covers a small number of tiles at distance
-    //     (~16-64 tiles for grass-blade-sized AABBs).
-    // (b) close to camera: tight near-plane clipping in the projection
-    //     keeps the screen AABB bounded, but a single blade right at
-    //     the camera can still cover hundreds of tiles. With a few
-    //     close blades, the average shoots up.
-    // V1 heuristic is `scratch_count × 256 + tile_count × 4` — covers
-    // the average case with headroom and handles up to ~4 blades
-    // touching every tile without overflow. Grows on demand.
-    let entries_estimate = scratch_count
-        .saturating_mul(256)
+    //     (~4-32 tiles for grass-blade-sized AABBs).
+    // (b) close to camera: tight near-plane clipping bounds the screen
+    //     AABB, but a single blade right at the camera can still cover
+    //     hundreds of tiles. The MAX_TILE_SPAN cap in the count shader
+    //     keeps any one blade ≤ 65k tiles even in pathological views.
+    //
+    // The buffer must fit within the device's
+    // `max_storage_buffer_binding_size` — otherwise `create_buffer` for
+    // the new capacity may produce an invalid buffer that fails on the
+    // next bind-group create (was the crash on the 7th painted patch
+    // after the entry struct grew 16 B → 48 B). We tighten the
+    // multiplier (256 → 64; still ~2× typical blade coverage) and
+    // hard-cap at the device binding limit. On overflow, wgpu
+    // robustness drops the excess writes — visually that's a few
+    // missing blades, vs. a crash.
+    let entries_estimate_raw = scratch_count
+        .saturating_mul(64)
         .saturating_add(tile_count.saturating_mul(4))
         .max(1024);
+    let max_binding_bytes = args.device.limits().max_storage_buffer_binding_size as u64;
+    let entry_size = std::mem::size_of::<rkp_render::octree_march::UserShaderTileEntry>() as u64;
+    let entries_cap = (max_binding_bytes / entry_size).saturating_sub(1).min(u32::MAX as u64) as u32;
+    let entries_estimate = entries_estimate_raw.min(entries_cap);
+    if entries_estimate < entries_estimate_raw {
+        eprintln!(
+            "[tile_cull] entries_estimate clamped {} → {} (device binding cap {} B / {} B per entry); \
+             expect dropped scatter writes if scene actually needs more",
+            entries_estimate_raw, entries_estimate, max_binding_bytes, entry_size,
+        );
+    }
     let _grew_entries = vr.march.ensure_us_tile_entries_capacity(args.device, entries_estimate);
     let _grew_grid = vr.march.ensure_us_tile_grid_capacity(args.device, tile_count);
 

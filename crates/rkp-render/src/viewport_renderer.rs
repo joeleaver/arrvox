@@ -141,6 +141,8 @@ impl ViewportRenderer {
         march.set_materials(device, &renderer.materials_buffer);
         march.set_lights(device, &renderer.lights_buffer);
         march.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view, &gbuffer.glass_view, &gbuffer.leaf_slot_view);
+        // shader_params binding deferred — `shade` owns the buffer
+        // and isn't constructed yet. Wired below after `shade::new`.
 
         // Procedural CSG raymarch — alternative primary-visibility pass
         // for the build viewport. Wired to the same per-VR camera + gbuffer
@@ -185,6 +187,11 @@ impl ViewportRenderer {
             &renderer.lights_buffer,
             &renderer.materials_buffer,
         );
+        // Phase B-redux Phase 3a — march reads the same per-material
+        // shader_params buffer the shade pass owns. set_shader_params
+        // is also called on each `refresh_bindings` and after every
+        // `upload_shader_params` realloc in render_worker.
+        march.set_shader_params(device, shade.shader_params_buffer());
         shade.set_camera(device, &camera_buffer);
         shade.set_atmosphere_luts(
             device,
@@ -297,6 +304,10 @@ impl ViewportRenderer {
                 &renderer.lights_buffer,
                 &renderer.materials_buffer,
             );
+            // Phase B-redux Phase 3a — refresh march's shader_params
+            // binding; mirrors the per-frame call in render_worker so
+            // a buffer realloc here doesn't leave march on stale data.
+            self.march.set_shader_params(device, self.shade.shader_params_buffer());
             // Glass pass also reads the materials SSBO (for glass
             // albedo / IOR) + shade_params + lights (for GGX direct
             // spec). Refresh all three when the lights/materials

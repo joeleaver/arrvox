@@ -85,7 +85,7 @@ fn example_grass_shader_composes_and_validates() {
     // don't compile against either template's surface.
     let march_template = include_str!("../src/shaders/octree_march.wgsl");
     let march_source = splice_inst_chunks(
-        march_template, &chunks.inst_to_local, &chunks.inst_aabb,
+        march_template, &chunks.inst_to_local, &chunks.inst_aabb, &chunks.instance_at,
     );
     assert_wgsl_valid(&march_source, "octree_march+grass");
     assert!(
@@ -98,8 +98,37 @@ fn example_grass_shader_composes_and_validates() {
     );
 
     let shadow_template = include_str!("../src/shaders/rkp_shadow_trace.wgsl");
+    // Shadow trace gets its `instance_at` integration in Phase 4;
+    // for now, pass an empty chunk (the shadow_trace template has no
+    // USER_INSTANCE_AT_DISPATCH markers yet). Phase 4 lifts this.
     let shadow_source = splice_inst_chunks(
-        shadow_template, &chunks.inst_to_local, &chunks.inst_aabb,
+        shadow_template, &chunks.inst_to_local, &chunks.inst_aabb, "",
     );
     assert_wgsl_valid(&shadow_source, "rkp_shadow_trace+grass");
+
+    // Phase B-redux — `instance_at` chunk. Phase 1 ships the chunk;
+    // the march template that consumes it
+    // (USER_INSTANCE_AT_DISPATCH markers) lands in Phase 2. For
+    // Phase 1 we just confirm the chunk is produced and renamed
+    // correctly; standalone naga validation lives in
+    // `tests/instance_at_compose.rs` (uses a synthetic fixture so
+    // the test isn't entangled with grass's inst_to_local /
+    // inst_aabb hooks that pull in `instance_pool` and helpers from
+    // the live march template).
+    assert!(
+        !chunks.instance_at.is_empty(),
+        "compose.instance_at must produce a non-empty chunk for grass; \
+         got the trivial header-only string",
+    );
+    assert!(
+        chunks.instance_at.contains("rkp_user_")
+            && chunks.instance_at.contains("_instance_at("),
+        "compose.instance_at missing per-shader instance_at fn for grass: \n{}",
+        chunks.instance_at,
+    );
+    assert!(
+        chunks.instance_at.contains("ptr<function, Blade>"),
+        "instance_at chunk should preserve the out_instance pointer signature: \n{}",
+        chunks.instance_at,
+    );
 }

@@ -96,7 +96,7 @@ pub mod user_shader_tile_count_pass;
 /// tiles per dispatch).
 pub mod user_shader_tile_prefix_pass;
 /// Phase 6 — scatter phase of tile-cull. Per AABB scratch entry, writes
-/// 16-byte UserShaderTileEntry records into us_tile_entries[] using
+/// 48-byte UserShaderTileEntry records into us_tile_entries[] using
 /// per-tile atomic cursors initialized from the prefix-summed offsets.
 pub mod user_shader_tile_scatter_pass;
 /// Phase 7 — TLAS over instance AABBs for shadow rays (and future

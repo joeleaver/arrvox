@@ -216,6 +216,10 @@ impl RkpRenderer {
         tile_object_ids: &[u8],
         tile_count_x: u32,
         tlas_node_count: u32,
+        // Phase B-redux Phase 3a — frame time + asset count. Threaded
+        // through to march params for `instance_at` derivation.
+        time: f32,
+        asset_count: u32,
         // Phase 8 — TLAS prim count (one per shadow caster). The
         // shadow-map setup pass walks `tlas_prims[0..prim_count]`;
         // `tlas_node_count` is the BVH node count, which is up to
@@ -280,7 +284,7 @@ impl RkpRenderer {
                 object_count, viewport.width, viewport.height, 0,
                 shadow_steps, num_lights, lod_enabled, surfacenet_enabled,
                 tile_count_x, tlas_node_count,
-                shadow_map_enabled, None,
+                shadow_map_enabled, time, asset_count, None,
             );
             self.profiler.end_query(encoder, q);
         }

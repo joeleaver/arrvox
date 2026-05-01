@@ -33,13 +33,24 @@ struct InstanceTileCullEntry {
     _pad1: u32,
 }
 
-// 16 B per entry — matches `UserShaderTileEntry` in
+// 48 B per entry — matches `UserShaderTileEntry` in
 // `octree_march.rs` / `octree_march.wgsl`. The host march iterates
-// these alongside `tile_object_ids`.
+// these alongside `tile_object_ids`. World AABB + screen-pixel rect
+// are cached here so the per-pixel march path doesn't re-call the
+// user shader's `inst_aabb` hook and can pre-reject pixels outside
+// the blade's screen footprint with a 4-compare. WGSL `vec3<f32>` +
+// trailing `u32` packs into the vec3's 16-byte alignment slot
+// (offsets 0..12, 12..16) — same trick as `InstanceTileCullEntry`.
 struct UserShaderTileEntry {
+    aabb_min: vec3<f32>,
     asset_id: u32,
+    aabb_max: vec3<f32>,
     instance_state_offset: u32,
     material_id: u32,
+    // (screen_min_x as u16) | ((screen_min_y as u16) << 16). Pixel
+    // coords clamped to viewport bounds.
+    screen_min_packed: u32,
+    screen_max_packed: u32,
     _pad: u32,
 }
 
@@ -67,6 +78,13 @@ struct TileRect {
     tile_max_x: u32,
     tile_max_y: u32,
     valid: u32,
+    // Per-pixel screen bounds (clamped to viewport, inclusive). Cached
+    // into the entry so the per-pixel march loop can reject pixels
+    // outside the blade footprint without calling the user shader.
+    pixel_min_x: u32,
+    pixel_min_y: u32,
+    pixel_max_x: u32,
+    pixel_max_y: u32,
 }
 
 // Near-plane epsilon. Must match `user_shader_tile_count.wgsl`.
@@ -147,6 +165,15 @@ fn project_world_aabb_to_tiles(aabb_min: vec3<f32>, aabb_max: vec3<f32>) -> Tile
     rect.tile_min_y = u32(max(tile_min_y_f, 0.0));
     rect.tile_max_x = u32(min(tile_max_x_f, f32(vp.tile_count_x - 1u)));
     rect.tile_max_y = u32(min(tile_max_y_f, f32(vp.tile_count_y - 1u)));
+    // Per-pixel bounds — clamp to [0, resolution-1] so the cached
+    // values in the entry never sit outside the viewport. The
+    // per-pixel reject in march does an inclusive [min, max] test.
+    let max_x = max(vp.resolution_x - 1.0, 0.0);
+    let max_y = max(vp.resolution_y - 1.0, 0.0);
+    rect.pixel_min_x = u32(clamp(floor(px_min_x), 0.0, max_x));
+    rect.pixel_min_y = u32(clamp(floor(px_min_y), 0.0, max_y));
+    rect.pixel_max_x = u32(clamp(floor(px_max_x), 0.0, max_x));
+    rect.pixel_max_y = u32(clamp(floor(px_max_y), 0.0, max_y));
     rect.valid = 1u;
     return rect;
 }
@@ -165,10 +192,19 @@ fn tile_scatter_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let span_x = min(rect.tile_max_x - rect.tile_min_x + 1u, MAX_TILE_SPAN);
     let span_y = min(rect.tile_max_y - rect.tile_min_y + 1u, MAX_TILE_SPAN);
 
+    let screen_min_packed =
+        (rect.pixel_min_x & 0xFFFFu) | ((rect.pixel_min_y & 0xFFFFu) << 16u);
+    let screen_max_packed =
+        (rect.pixel_max_x & 0xFFFFu) | ((rect.pixel_max_y & 0xFFFFu) << 16u);
+
     var out_entry: UserShaderTileEntry;
+    out_entry.aabb_min = entry.aabb_min;
     out_entry.asset_id = entry.asset_id;
+    out_entry.aabb_max = entry.aabb_max;
     out_entry.instance_state_offset = entry.instance_state_offset;
     out_entry.material_id = entry.material_id;
+    out_entry.screen_min_packed = screen_min_packed;
+    out_entry.screen_max_packed = screen_max_packed;
     out_entry._pad = 0u;
 
     for (var ty: u32 = 0u; ty < span_y; ty = ty + 1u) {

@@ -638,8 +638,13 @@ impl ShadowMapPass {
             return false;
         }
         let template = include_str!("shaders/shadow_scatter.wgsl");
+        // Shadow-map scatter doesn't run `instance_at` (Phase 4 will
+        // add per-leaf grass descent into the half-res shadow path,
+        // but the scatter pass itself just rasterizes screen-space
+        // AABBs). Pass empty for instance_at — the splice helper
+        // skips the marker-search when the chunk is empty.
         let source = crate::shader_composer::splice_inst_chunks(
-            template, inst_to_local_chunk, inst_aabb_chunk,
+            template, inst_to_local_chunk, inst_aabb_chunk, "",
         );
         validate_wgsl(&source, "shadow_scatter");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {

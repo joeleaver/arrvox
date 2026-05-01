@@ -163,6 +163,16 @@ pub struct RenderFrame {
     /// returns a rotation-tolerant `pos ± 0.5 × scale × √3` cube.
     pub user_shader_inst_aabb_chunk: String,
 
+    /// Phase B-redux — march-time instance derivation. Per-shader
+    /// `rkp_user_<id>_instance_at(host_pos, host, ctx, k, &inst)
+    /// -> bool` definitions, spliced into the host march and shadow
+    /// templates at the USER_INSTANCE_AT_DISPATCH markers (Phase 2
+    /// wires those markers; Phase 1 just ships the chunk). Empty
+    /// when no instance shader has an `instance_at` hook. Replaces
+    /// the per-frame emit-pass scatter for instance shaders that
+    /// opt in.
+    pub user_shader_instance_at_chunk: String,
+
     /// Editor snapshots of all currently-registered user shaders.
     /// `UserShaderPass` reads metadata (animated, region_thickness,
     /// cell_size, has_generate, params order) from this list. Mirrors
