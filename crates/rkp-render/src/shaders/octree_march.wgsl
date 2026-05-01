@@ -8,7 +8,14 @@ const OCTREE_EMPTY: u32 = 0xFFFFFFFFu;
 const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
 const OCTREE_LEAF_BIT: u32 = 0x80000000u;
 const OCTREE_BRICK_BIT: u32 = 0x40000000u;
-const OCTREE_PAYLOAD_MASK: u32 = 0x3FFFFFFFu;
+// Phase B-redux 3b — band-cell sentinel. A leaf with `LEAF | BAND |
+// payload` is a band cell whose payload indexes `leaf_attr_pool`,
+// where the slot's two u32s reinterpret as `{region_id,
+// anchor_leaf_slot}` (see octree_march.wgsl::handle_band_cell).
+// Encoding: bit 31 = LEAF, bit 30 = BRICK, bit 29 = BAND, bits 28..0
+// = payload. BAND is mutually exclusive with BRICK; both 0 = leaf-attr.
+const OCTREE_BAND_BIT: u32 = 0x20000000u;
+const OCTREE_PAYLOAD_MASK: u32 = 0x1FFFFFFFu;
 const OPACITY_THRESHOLD: f32 = 0.05;
 // Safety-net ceiling for the outer ray-march loop. The ray already
 // terminates naturally when `t > t_range.y` (exits the octree); this
@@ -159,6 +166,34 @@ struct MarchParams {
     asset_count: u32,
     // Trailing pad to align to 16 bytes.
     _pad0: u32,
+}
+
+// Phase B-redux 3b — band-cell wire format. Mirrors
+// `crate::user_shader_pass::{GpuBandCell, GpuBandRegion}`.
+//
+// Bake (3b.2) emits one `BandCell` per max-depth cell in the band
+// around painted host leaves. The cell's octree node carries
+// `OCTREE_LEAF_BIT | OCTREE_BAND_BIT | payload_offset` where
+// `payload_offset` indexes `band_cell_pool` (added in 3b.3 with the
+// march dispatch).
+//
+// V1 single-anchor: each band cell stores its single nearest painted
+// host leaf's world center. V2 multi-anchor (up to 4) extends this
+// struct + the descent loop in march.
+struct BandCell {
+    anchor_world_pos: vec3<f32>,
+    region_index: u32,
+}
+
+// Per-region metadata for the band-cell march path. Indexed by
+// `BandCell.region_index`. `shader_id` selects the dispatch arm in
+// `dispatch_user_instance_descend`; `material_id` selects
+// `shader_params[material_id * 8 + N]` for `ctx.params[N]`.
+struct BandRegion {
+    shader_id: u32,
+    material_id: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;

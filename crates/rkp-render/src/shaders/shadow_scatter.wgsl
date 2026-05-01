@@ -23,7 +23,11 @@ const OCTREE_EMPTY: u32 = 0xFFFFFFFFu;
 const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
 const OCTREE_LEAF_BIT: u32 = 0x80000000u;
 const OCTREE_BRICK_BIT: u32 = 0x40000000u;
-const OCTREE_PAYLOAD_MASK: u32 = 0x3FFFFFFFu;
+// Phase B-redux 3b — band-cell sentinel. Shadow scatter (the
+// shadow-map setup pass) treats band cells as not-occluding; Phase 4
+// will revisit if band shadow casting is added.
+const OCTREE_BAND_BIT: u32 = 0x20000000u;
+const OCTREE_PAYLOAD_MASK: u32 = 0x1FFFFFFFu;
 const BRICK_DIM: u32 = 4u;
 const BRICK_DIM_F: f32 = 4.0;
 const BRICK_CELLS: u32 = 64u;

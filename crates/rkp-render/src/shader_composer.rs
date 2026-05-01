@@ -268,6 +268,7 @@ impl UserShaderRegistry {
                 has_shade: e.shade_text.is_some(),
                 has_generate: e.generate_text.is_some(),
                 is_instance_pipeline: e.is_instance_pipeline(),
+                has_instance_at: e.instance_at_text.is_some(),
                 instance_struct_name: e
                     .metadata
                     .instance_proto_struct
@@ -317,6 +318,11 @@ pub struct UserShaderInfo {
     /// time; the editor surfaces this so users can see at a glance which
     /// pipeline a shader belongs to.
     pub is_instance_pipeline: bool,
+    /// Phase B-redux — true if the shader provides a `instance_at`
+    /// hook. Such shaders take the march-time derivation path
+    /// (Phase 3a host-leaf dispatch + Phase 3b band-cell dispatch)
+    /// instead of Option B's emit-into-instance-pool flow.
+    pub has_instance_at: bool,
     /// Name of the per-instance struct (from `@instance_proto`) if any.
     pub instance_struct_name: Option<String>,
     /// Byte size of the per-instance struct, if parsed. Helpful for

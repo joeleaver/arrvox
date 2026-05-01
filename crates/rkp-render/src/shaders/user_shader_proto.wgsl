@@ -44,6 +44,12 @@ const BRICK_CELL_EMPTY: u32 = 0xFFFFFFFFu;
 const OCTREE_EMPTY: u32 = 0xFFFFFFFFu;
 const OCTREE_LEAF_BIT: u32 = 0x80000000u;
 const OCTREE_BRICK_BIT: u32 = 0x40000000u;
+// Phase B-redux 3b — band-cell sentinel reserved here for symmetry
+// with octree_march.wgsl. Proto bake never produces band cells (it
+// bakes the prototype volume, not the band volume) — kept so any
+// future band-aware proto code stays consistent.
+const OCTREE_BAND_BIT: u32 = 0x20000000u;
+const OCTREE_PAYLOAD_MASK: u32 = 0x1FFFFFFFu;
 const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;
 
 // Overflow counter slots — must match the `OVERFLOW_*` indices the

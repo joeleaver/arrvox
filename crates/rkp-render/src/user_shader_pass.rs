@@ -292,6 +292,20 @@ pub const MAX_GLOBAL_LEAF_ATTRS: u32 = MAX_GLOBAL_BRICKS * (BRICK_CELLS / 2);
 /// fit ~400 typical regions at OCTREE_BUCKET_MAX = 131 072.
 pub const MAX_GLOBAL_OCTREE_NODES: u32 = 50_000_000;
 
+/// Phase B-redux 3b — global band-cell pool capacity. Each
+/// `GpuBandCell` is 16 B carrying `(anchor_world_pos: vec3, region_index: u32)`.
+/// Sized for ~100 active painted tiles × ~100K band cells/tile = 10M
+/// cells = 160 MB. The BFS bake bumps a global atomic counter into
+/// this pool whenever an `instance_at` shader's region produces a
+/// max-depth band cell.
+pub const MAX_GLOBAL_BAND_CELLS: u32 = 16_000_000;
+
+/// Phase B-redux 3b — max regions per frame for the band-region
+/// metadata table. Each `GpuBandRegion` is 16 B carrying
+/// `(shader_id, material_id, _pad, _pad)`. Indexed by
+/// `GpuBandCell.region_index`. Same cap as `MAX_REGIONS`.
+pub const MAX_BAND_REGIONS: u32 = MAX_REGIONS;
+
 /// Persistent fill-task pool capacity. Each `BrickFillTask` is 32 B.
 /// At depth 5, each 1 m tile produces up to ~32 K fill tasks worst
 /// case (geometry-driven, NOT paint-driven). 16 M tasks × 32 B =
@@ -1005,6 +1019,53 @@ pub struct RegionUniform {
 }
 
 const _: () = assert!(std::mem::size_of::<RegionUniform>() == 208);
+
+// ============================================================
+// Phase B-redux 3b — band-cell wire format
+// ============================================================
+//
+// Bake (3b.2) emits one `GpuBandCell` per max-depth cell in the band
+// around painted host leaves. The cell's octree node carries
+// `OCTREE_LEAF_BIT | OCTREE_BAND_BIT | payload_offset`, where
+// `payload_offset` is the cell's index in the global `band_cell_pool`.
+//
+// March (3b.3) detects `OCTREE_BAND_BIT` during per-object DDA, reads
+// the payload, looks up `band_regions[region_index]` for the shader/
+// material context, and fires `dispatch_user_instance_descend`
+// seeded with `anchor_world_pos`.
+//
+// V1 single-anchor: each band cell points to its single nearest
+// painted host leaf's world center. V2 multi-anchor (up to 4) is a
+// future revision that uses `_pad0..2` slots in `GpuBandCell` and
+// extends the descent loop in march.
+
+/// Per-band-cell payload, 16 B. Reinterpreted at the leaf-attr-pool
+/// slot indexed by the octree node's payload bits when `OCTREE_BAND_BIT`
+/// is set... NOT in V1 — `band_cell_pool` is a separate buffer (the
+/// 16-B record doesn't fit in an 8-B leaf-attr slot).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuBandCell {
+    pub anchor_world_pos: [f32; 3],
+    pub region_index: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<GpuBandCell>() == 16);
+
+/// Per-region metadata for the band-cell march path. Indexed by
+/// `GpuBandCell.region_index`. `shader_id` drives
+/// `dispatch_user_instance_descend`; `material_id` selects
+/// `shader_params[material_id * 8 + N]` for `ctx.params[N]`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuBandRegion {
+    pub shader_id: u32,
+    pub material_id: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<GpuBandRegion>() == 16);
 
 /// Per-dispatch state for `classify_main`. Re-uploaded between levels.
 #[repr(C)]

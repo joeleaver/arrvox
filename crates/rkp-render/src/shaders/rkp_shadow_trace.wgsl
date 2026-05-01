@@ -15,7 +15,12 @@ const OCTREE_EMPTY: u32 = 0xFFFFFFFFu;
 const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
 const OCTREE_LEAF_BIT: u32 = 0x80000000u;
 const OCTREE_BRICK_BIT: u32 = 0x40000000u;
-const OCTREE_PAYLOAD_MASK: u32 = 0x3FFFFFFFu;
+// Phase B-redux 3b — band-cell sentinel. See octree_march.wgsl for
+// the encoding contract; shadow trace currently treats a band cell
+// as transparent (Phase 4 will wire band-cell descent through
+// `dispatch_user_instance_descend` for proper shadow casting).
+const OCTREE_BAND_BIT: u32 = 0x20000000u;
+const OCTREE_PAYLOAD_MASK: u32 = 0x1FFFFFFFu;
 // Shadow rays scan every object every ray — AABB misses short-circuit
 // cheaply, and shadow rays go in arbitrary directions so the march
 // pass's screen-space per-tile lists don't apply.

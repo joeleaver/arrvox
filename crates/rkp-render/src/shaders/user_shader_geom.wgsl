@@ -66,6 +66,12 @@ const OCTREE_EMPTY: u32 = 0xFFFFFFFFu;
 const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
 const OCTREE_LEAF_BIT: u32 = 0x80000000u;
 const OCTREE_BRICK_BIT: u32 = 0x40000000u;
+// Phase B-redux 3b — band-cell sentinel. Set on a leaf at max_depth
+// when an `instance_at` shader baked this region. The leaf-attr slot
+// reinterprets as `{region_id, anchor_leaf_slot}`. See
+// octree_march.wgsl for the canonical encoding contract.
+const OCTREE_BAND_BIT: u32 = 0x20000000u;
+const OCTREE_PAYLOAD_MASK: u32 = 0x1FFFFFFFu;
 const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;
 
 // Hard ceiling on octree depth — limits per-frame queue capacity.
