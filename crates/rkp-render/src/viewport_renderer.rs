@@ -167,12 +167,13 @@ impl ViewportRenderer {
         );
         shadow_trace.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view);
 
-        // Phase 8 S3 — shadow map pass. Dormant until S4 plumbs the
-        // per-frame dispatch + shade-side enable flag; constructed
-        // here so the shade pass's group 1 has a real texture +
-        // uniform to bind to.
+        // Phase 8 — shadow map pass. Three pipelines (clear /
+        // setup / scatter) over a u32 storage buffer. The engine
+        // writes the light_camera uniform + dispatches the chain
+        // each frame; the shade pass reads the buffer directly.
         let shadow_map = ShadowMapPass::new(
             device,
+            queue,
             SHADOW_MAP_DEFAULT_SIZE,
             &renderer.scene.bind_group_layout,
         );
@@ -202,7 +203,7 @@ impl ViewportRenderer {
             device,
             &shadow_trace.output_view,
             &ssao.output_view,
-            &shadow_map.texture_view,
+            &shadow_map.shadow_buffer,
             &shadow_map.uniform_buffer,
         );
 
@@ -351,13 +352,13 @@ impl ViewportRenderer {
         self.shade.resize(device, width, height);
         self.shade.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
         // Shadow map size doesn't track viewport resolution; the
-        // texture stays at SHADOW_MAP_DEFAULT_SIZE through resize.
-        // Re-binding picks up the same view (placeholder pre-S4).
+        // depth buffer stays at SHADOW_MAP_DEFAULT_SIZE through
+        // resize. Re-binding picks up the same buffer.
         self.shade.set_shadow_and_ssao(
             device,
             &self.shadow_trace.output_view,
             &self.ssao.output_view,
-            &self.shadow_map.texture_view,
+            &self.shadow_map.shadow_buffer,
             &self.shadow_map.uniform_buffer,
         );
 

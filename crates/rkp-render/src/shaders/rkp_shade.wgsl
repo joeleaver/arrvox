@@ -206,7 +206,10 @@ struct LightCameraShade {
     shadow_map_size: vec2<u32>,
 }
 @group(1) @binding(2) var<uniform> light_camera: LightCameraShade;
-@group(1) @binding(3) var shadow_map: texture_2d<f32>;
+// Phase 8 V2 — shadow_buffer is `array<u32>` holding bit-cast
+// f32 depths, written by the scatter pass (atomicMin on bits).
+// Index = ty * W + tx, then bitcast<f32> to recover the depth.
+@group(1) @binding(3) var<storage, read> shadow_buffer: array<u32>;
 
 // Group 2: output HDR color (write, full-res)
 @group(2) @binding(0) var output: texture_storage_2d<rgba16float, write>;
@@ -258,21 +261,17 @@ fn sample_shadow_map(world_pos: vec3<f32>) -> f32 {
         || ndc.z < 0.0 || ndc.z > 1.0 {
         return 1.0;
     }
-    // NDC → texel. The shadow march writes texel (tx, ty) at
-    // `ndc.x = (tx + 0.5)/W * 2 - 1, ndc.y = 1 - (ty + 0.5)/H * 2`,
-    // so the inverse is `tx = (ndc.x + 1) * 0.5 * W`,
-    // `ty = (1 - ndc.y) * 0.5 * H` — same y-flip the march applies.
-    let size_f = vec2<f32>(light_camera.shadow_map_size);
-    let texel_f = vec2<f32>(
-        (ndc.x * 0.5 + 0.5) * size_f.x,
-        (1.0 - (ndc.y * 0.5 + 0.5)) * size_f.y,
-    );
-    let texel = clamp(
-        vec2<i32>(texel_f),
-        vec2<i32>(0),
-        vec2<i32>(light_camera.shadow_map_size) - vec2<i32>(1),
-    );
-    let map_z = textureLoad(shadow_map, texel, 0).x;
+    // NDC → texel. Mirror the scatter pass's mapping:
+    //   tx = (ndc.x + 1) * 0.5 * W
+    //   ty = (1 - ndc.y) * 0.5 * H   (y-flip vs NDC)
+    let size_u = light_camera.shadow_map_size;
+    let size_f = vec2<f32>(size_u);
+    let tx_f = (ndc.x * 0.5 + 0.5) * size_f.x;
+    let ty_f = (1.0 - (ndc.y * 0.5 + 0.5)) * size_f.y;
+    let tx = clamp(u32(tx_f), 0u, size_u.x - 1u);
+    let ty = clamp(u32(ty_f), 0u, size_u.y - 1u);
+    let buffer_idx = ty * size_u.x + tx;
+    let map_z = bitcast<f32>(shadow_buffer[buffer_idx]);
     let surface_z = ndc.z;
     return select(0.0, 1.0, surface_z - light_camera.depth_bias <= map_z);
 }

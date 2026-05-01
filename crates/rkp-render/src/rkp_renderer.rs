@@ -216,12 +216,17 @@ impl RkpRenderer {
         tile_object_ids: &[u8],
         tile_count_x: u32,
         tlas_node_count: u32,
-        // Phase 8 S4 — when true, dispatch the shadow-map march
-        // after primary visibility. Engine sets this when there's
-        // a live directional shadow caster (non-empty TLAS +
-        // shadow-casting directional light); ShadeParams.
-        // shadow_map_enabled is in lockstep so shade samples the
-        // fresh map.
+        // Phase 8 — TLAS prim count (one per shadow caster). The
+        // shadow-map setup pass walks `tlas_prims[0..prim_count]`;
+        // `tlas_node_count` is the BVH node count, which is up to
+        // `2*prim_count - 1` and not what the setup needs.
+        tlas_prim_count: u32,
+        // Phase 8 — when true, dispatch the shadow-map chain
+        // (clear → setup → scatter) after primary visibility.
+        // Engine sets this when there's a live directional shadow
+        // caster (non-empty TLAS + shadow-casting directional
+        // light); ShadeParams.shadow_map_enabled is in lockstep so
+        // shade samples the fresh map.
         shadow_map_enabled: bool,
         atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
         mode: crate::RenderMode,
@@ -291,7 +296,13 @@ impl RkpRenderer {
         // half-res shadow_trace output.
         if in_situ && !raymarch && shadow_map_enabled {
             let q = self.profiler.begin_query("shadow_map", encoder);
-            viewport.shadow_map.dispatch(encoder, &viewport.scene_bind_group);
+            viewport.shadow_map.dispatch_clear(encoder);
+            viewport.shadow_map.dispatch_setup(encoder, queue, tlas_prim_count);
+            viewport.shadow_map.dispatch_emit(encoder, tlas_prim_count);
+            viewport.shadow_map.dispatch_finalize(encoder);
+            viewport.shadow_map.dispatch_scatter(
+                encoder, &viewport.scene_bind_group, tlas_prim_count,
+            );
             self.profiler.end_query(encoder, q);
         }
         if !raymarch {

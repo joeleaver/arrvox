@@ -1296,12 +1296,14 @@ fn render_one_frame(
             &state.tlas_pass.nodes_buffer,
             &state.tlas_pass.leaves_buffer,
         );
-        // Phase 8 — shadow-map pass reads the same TLAS as the
-        // shadow trace; rebind whenever the buffers reallocate.
-        vr.shadow_map.set_tlas_buffers(
+        // Phase 8 — shadow-map setup pass reads `tlas_prims`
+        // directly (no BVH walk needed; per-prim AABB → texel rect
+        // is a flat scan). Grow scatter scratch if the prim count
+        // jumps, then rebind the prims buffer.
+        vr.shadow_map.ensure_scatter_capacity(&state.device, tlas_prim_count);
+        vr.shadow_map.set_tlas_prims_buffer(
             &state.device,
-            &state.tlas_pass.nodes_buffer,
-            &state.tlas_pass.leaves_buffer,
+            &state.tlas_build_pass.tlas_prims_buffer,
         );
     }
 
@@ -1550,6 +1552,7 @@ fn render_one_frame(
             tile_object_ids_ref,
             vp.tile_count_x,
             state.tlas_pass.last_node_count,
+            state.tlas_pass.last_leaf_count,
             shadow_map_enabled,
             &vp.atmo_frame,
             vp.mode,

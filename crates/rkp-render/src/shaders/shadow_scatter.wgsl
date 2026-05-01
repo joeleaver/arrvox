@@ -1,29 +1,23 @@
-// Phase 8 — directional shadow-map march.
+// Phase 8 V2 — geometry-driven shadow rendering (work-list scatter).
 //
-// One thread per shadow-map texel. Each thread casts a parallel
-// ray from the light's near plane in `light_dir`, walks the TLAS
-// to find candidate occluders, descends each leaf instance's
-// octree (or the user-shader prototype octree, via the spliced
-// `dispatch_user_inst_to_local` / `dispatch_user_inst_aabb`
-// hooks), tracks the nearest world-space hit `t`, and writes the
-// hit's depth in light-NDC space to `shadow_map[tx, ty]`. No hit
-// → `SHADOW_MAP_FAR_DEPTH = 1.0`.
+// Single indirect dispatch over the global work list. Each work
+// list entry corresponds to one 8×8 tile of one instance's
+// projected light-space rect. Workgroups (8×8) walk the tile in
+// parallel, descend the instance, atomic-min the depth.
 //
-// Mirrors `rkp_shadow_trace.wgsl`'s TLAS walk + per-instance
-// octree DDA. Differences:
-//   * Visibility-only — drops transmittance accumulation, glass
-//     Beer attenuation, opacity gating, and the per-light dispatch.
-//     V1 treats every leaf as opaque; soft glass shadows are a
-//     polish session later (the per-pixel ray-traced path is the
-//     fallback for non-directional lights anyway).
-//   * Single ray per texel (orthographic — all rays parallel).
-//   * Tracks nearest hit instead of stopping at the first leaf;
-//     the shadow map needs the MINIMUM occluder depth across the
-//     scene, not just any occluder.
+// Per workgroup:
+//   flat_work_idx = wid.y * DISPATCH_X + wid.x
+//   if flat_work_idx >= total_work: return
+//   entry = work_list[flat_work_idx]
+//   inst_idx, tile_x_local, tile_y_local = unpack(entry)
+//   inst = scatter_instances[inst_idx]
+//   tx = inst.tx0 + tile_x_local * 8 + lid.x
+//   ty = inst.ty0 + tile_y_local * 8 + lid.y
+//   ... descend, atomicMin shadow_buffer[ty * W + tx]
 //
-// Rust counterparts: `LightCameraUniform`, `ShadowMapPass` in
-// `shadow_map_pass.rs`. Bindings here mirror the layout the pass
-// builds.
+// The dispatch dimensions (`DISPATCH_X` × ceil(total/DISPATCH_X) × 1)
+// come from the finalize pass via `dispatch_workgroups_indirect`,
+// so the CPU never reads back the work count.
 
 const OCTREE_EMPTY: u32 = 0xFFFFFFFFu;
 const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
@@ -46,25 +40,12 @@ const FACE_PY: u32 = 3u;
 const FACE_NZ: u32 = 4u;
 const FACE_PZ: u32 = 5u;
 
-// March budget — per-instance octree DDA step cap. Same value as
-// the per-pixel shadow_trace `shadow_max_steps` default in
-// `MarchParams::default`.
 const SHADOW_MAP_MAX_STEPS: u32 = 256u;
 const SKINNED_MAX_STEPS: u32 = 512u;
-
-// "No hit" sentinel — must be larger than any plausible scene-
-// scale ray distance. Used both as the per-instance "miss" return
-// and as the per-texel "no occluder" gate before writing FAR_DEPTH.
 const NO_HIT_T: f32 = 1.0e20;
 
-// Per-texel write when no occluder is found along the ray. Matches
-// `rkp_render::shadow_map_pass::SHADOW_MAP_FAR_DEPTH = 1.0`.
-const FAR_DEPTH: f32 = 1.0;
-
-// TLAS — same constants as the rest of the pipeline (`tlas_pass`).
-const TLAS_NODE_LEAF_BIT: u32 = 0x80000000u;
 const TLAS_LEAF_USER_SHADER: u32 = 0xFFFFFFFEu;
-const TLAS_STACK_DEPTH: u32 = 32u;
+const DISPATCH_X: u32 = 256u;
 
 struct RkpInstance {
     world: mat4x4<f32>,
@@ -97,8 +78,6 @@ struct RkpAsset {
     shader_id: u32, _pad: u32,
 }
 
-// Camera uniform from the scene group is unused by the shadow
-// march but the binding index is reserved by the shared layout.
 struct CameraUniforms {
     position: vec4<f32>, forward: vec4<f32>,
     right: vec4<f32>, up: vec4<f32>,
@@ -120,7 +99,7 @@ struct OverlayEntry {
     color_packed: u32,
 }
 
-struct LightCamera {
+struct LightCameraShadow {
     view_proj: mat4x4<f32>,
     view_proj_inv: mat4x4<f32>,
     light_dir: vec3<f32>,
@@ -129,18 +108,13 @@ struct LightCamera {
     shadow_map_size: vec2<u32>,
 }
 
-struct TlasNode {
-    aabb_min: vec3<f32>,
-    left_or_leaf: u32,
-    aabb_max: vec3<f32>,
-    right_or_count: u32,
-}
-
-struct TlasInstanceLeaf {
+struct ScatterInstance {
+    tx0: u32, ty0: u32,
+    tile_w: u32, tile_h: u32,
     asset_id: u32,
     instance_state_offset: u32,
-    material_id: u32,
     instance_index: u32,
+    work_offset: u32,
 }
 
 struct Aabb {
@@ -148,9 +122,7 @@ struct Aabb {
     max: vec3<f32>,
 }
 
-// Group 0 — scene resources (shared layout with octree_march /
-// rkp_shadow_trace). Only the bindings the shadow map actually
-// reads are declared; naga DCEs the rest.
+// Group 0 — scene resources.
 @group(0) @binding(0) var<storage, read> brick_pool: array<u32>;
 @group(0) @binding(1) var<storage, read> octree_nodes: array<vec2<u32>>;
 @group(0) @binding(2) var<storage, read> instances: array<RkpInstance>;
@@ -165,12 +137,16 @@ struct Aabb {
 @group(0) @binding(14) var<storage, read> instance_pool: array<u32>;
 
 // Group 1 — pass-private resources.
-@group(1) @binding(0) var<uniform> light_camera: LightCamera;
-@group(1) @binding(1) var shadow_map: texture_storage_2d<r32float, write>;
-@group(1) @binding(2) var<storage, read> tlas_nodes: array<TlasNode>;
-@group(1) @binding(3) var<storage, read> tlas_leaves: array<TlasInstanceLeaf>;
+@group(1) @binding(0) var<uniform> light_camera: LightCameraShadow;
+@group(1) @binding(1) var<storage, read_write> shadow_buffer: array<atomic<u32>>;
+@group(1) @binding(2) var<storage, read> scatter_instances: array<ScatterInstance>;
+@group(1) @binding(3) var<storage, read> work_list: array<u32>;
+// dispatch_args[3] holds total_work (set by finalize). Used to
+// bounds-check workgroups dispatched past the live work count.
+@group(1) @binding(4) var<storage, read> dispatch_args: array<u32>;
 
-// ── Helpers ─────────────────────────────────────────────────────
+// ── Helpers (mirror of the host march; see shadow_scatter docs
+//   for context on the find_hit_in_instance contract). ─────────
 
 fn mat4_affine_inverse(m: mat4x4<f32>) -> mat4x4<f32> {
     let a = m[0].xyz;
@@ -266,12 +242,6 @@ fn skip_node_t(pos: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, node_depth: u
     return min(min(t_pos.x, t_pos.y), t_pos.z) + vs * 0.01;
 }
 
-// ── User-shader instance hooks (Phase 4c). Composer splices in
-// per-shader bodies between the BEGIN/END markers when the user-
-// shader registry's source hash changes. The default no-shader
-// stubs return identity-ish values so the host path passes
-// through unchanged.
-
 fn inst_world_to_local(
     world_pos: vec3<f32>, instance_pos: vec3<f32>, instance_scale: f32,
 ) -> vec3<f32> {
@@ -305,12 +275,6 @@ fn dispatch_user_inst_aabb(
     return a;
 }
 // USER_INST_AABB_DISPATCH_END
-
-// ── Skinned variant ─────────────────────────────────────────────
-//
-// Mirrors `trace_shadow_skinned` from `rkp_shadow_trace.wgsl` but
-// returns the WORLD-space `t` of the first populated cell instead
-// of accumulating transmittance.
 
 const OCC_BRICK_DIM: i32 = 4;
 
@@ -408,13 +372,6 @@ fn find_hit_skinned(
     return NO_HIT_T;
 }
 
-// ── Per-instance host descent ───────────────────────────────────
-//
-// Walks the rigid (or user-shader prototype) octree. Returns the
-// world-space `t` of the first solid voxel, or NO_HIT_T on miss.
-// Mirrors `shadow_step_one_instance` but tracks `t` instead of
-// transmittance.
-
 fn find_hit_in_instance(
     inst: RkpInstance, asset: RkpAsset,
     world_origin: vec3<f32>, world_dir: vec3<f32>,
@@ -487,10 +444,6 @@ fn find_hit_in_instance(
         }
 
         if r.slot == OCTREE_INTERIOR {
-            // Solid bulk inside an opaque node — counts as a hit
-            // at the entry point. Glass (opacity < 1) is treated
-            // as opaque for V1 hard shadows; soft glass shadows
-            // are a polish session later.
             return t / local_scale;
         }
 
@@ -583,18 +536,13 @@ fn find_hit_in_instance(
             continue;
         }
 
-        // Octree leaf at this depth — first-hit; treat as opaque
-        // for V1 (no opacity gate).
         return t / local_scale;
     }
 
     return NO_HIT_T;
 }
 
-// Synthesize a minimal `RkpInstance` from a user-shader TLAS leaf.
-// Mirror of `octree_march.wgsl::synth_inst_from_entry` and
-// `rkp_shadow_trace.wgsl::synth_inst_from_tlas_leaf`.
-fn synth_inst_from_tlas_leaf(leaf: TlasInstanceLeaf) -> RkpInstance {
+fn synth_inst_from_scatter(s: ScatterInstance) -> RkpInstance {
     var inst: RkpInstance;
     inst.world = mat4x4<f32>(
         vec4<f32>(1.0, 0.0, 0.0, 0.0),
@@ -602,8 +550,8 @@ fn synth_inst_from_tlas_leaf(leaf: TlasInstanceLeaf) -> RkpInstance {
         vec4<f32>(0.0, 0.0, 1.0, 0.0),
         vec4<f32>(0.0, 0.0, 0.0, 1.0),
     );
-    inst.asset_id = leaf.asset_id;
-    inst.material_id = leaf.material_id;
+    inst.asset_id = s.asset_id;
+    inst.material_id = 0u;
     inst.object_id = TLAS_LEAF_USER_SHADER;
     inst.layer_mask = 0xFFFFFFFFu;
     inst.is_skinned = 0u;
@@ -618,99 +566,63 @@ fn synth_inst_from_tlas_leaf(leaf: TlasInstanceLeaf) -> RkpInstance {
     inst.bone_field_origin_z = 0.0;
     inst.overlay_offset = 0u;
     inst.overlay_count = 0u;
-    inst.instance_state_offset = leaf.instance_state_offset;
+    inst.instance_state_offset = s.instance_state_offset;
     inst._pad0 = 0u;
     inst._pad1 = 0u;
     inst._pad2 = 0u;
     return inst;
 }
 
-// ── Entry point ─────────────────────────────────────────────────
-
 @compute @workgroup_size(8, 8, 1)
-fn shadow_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let tx = gid.x;
-    let ty = gid.y;
-    let size = light_camera.shadow_map_size;
-    if tx >= size.x || ty >= size.y { return; }
+fn scatter_main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let total_work = dispatch_args[3];
+    let flat_work_idx = wid.y * DISPATCH_X + wid.x;
+    if flat_work_idx >= total_work { return; }
+
+    let entry = work_list[flat_work_idx];
+    let inst_idx = entry & 0xFFFFu;
+    let tile_x_local = (entry >> 16u) & 0xFFu;
+    let tile_y_local = (entry >> 24u) & 0xFFu;
+
+    let s = scatter_instances[inst_idx];
+
+    let tx = s.tx0 + tile_x_local * 8u + lid.x;
+    let ty = s.ty0 + tile_y_local * 8u + lid.y;
+    if tx >= light_camera.shadow_map_size.x || ty >= light_camera.shadow_map_size.y {
+        return;
+    }
 
     let inv_size = light_camera.inv_shadow_map_size;
     let ndc = vec2<f32>(
         (f32(tx) + 0.5) * inv_size.x * 2.0 - 1.0,
         1.0 - (f32(ty) + 0.5) * inv_size.y * 2.0,
     );
-
-    // Unproject (ndc.x, ndc.y, 0) — a point on the light's near
-    // plane — to world space. `view_proj` uses wgpu's [0, 1] z
-    // range, so 0 = near. Orthographic ⇒ w = 1 (no perspective
-    // division needed in practice, but we keep the divide for
-    // numerical safety).
     let near_clip = vec4<f32>(ndc.x, ndc.y, 0.0, 1.0);
     let near_world = light_camera.view_proj_inv * near_clip;
     let ray_origin = near_world.xyz / near_world.w;
     let ray_dir = light_camera.light_dir;
 
-    // Empty TLAS — no caster, write FAR_DEPTH (uniform full light).
-    let node_count = arrayLength(&tlas_nodes);
-    if node_count == 0u {
-        textureStore(shadow_map, vec2<i32>(i32(tx), i32(ty)), vec4<f32>(FAR_DEPTH));
-        return;
+    var inst: RkpInstance;
+    var asset: RkpAsset;
+    if s.instance_index != TLAS_LEAF_USER_SHADER {
+        inst = instances[s.instance_index];
+        asset = assets[inst.asset_id];
+    } else {
+        inst = synth_inst_from_scatter(s);
+        asset = assets[s.asset_id];
     }
 
-    let inv_world_dir = 1.0 / safe_dir3(ray_dir);
-    var nearest_t: f32 = NO_HIT_T;
+    let t = find_hit_in_instance(inst, asset, ray_origin, ray_dir);
+    if t >= NO_HIT_T * 0.5 { return; }
 
-    var stack: array<u32, TLAS_STACK_DEPTH>;
-    stack[0] = 0u;
-    var top: u32 = 1u;
-
-    loop {
-        if top == 0u { break; }
-        top = top - 1u;
-        let node = tlas_nodes[stack[top]];
-
-        let t_range = intersect_aabb(ray_origin, inv_world_dir, node.aabb_min, node.aabb_max);
-        if t_range.x > t_range.y { continue; }
-        // Cull subtrees whose nearest entry is already past our
-        // best hit — the ray can't find a closer occluder there.
-        if t_range.x > nearest_t { continue; }
-
-        if (node.left_or_leaf & TLAS_NODE_LEAF_BIT) != 0u {
-            let leaf_idx = node.left_or_leaf & 0x7FFFFFFFu;
-            let leaf = tlas_leaves[leaf_idx];
-            var inst: RkpInstance;
-            var asset: RkpAsset;
-            if leaf.instance_index != TLAS_LEAF_USER_SHADER {
-                inst = instances[leaf.instance_index];
-                asset = assets[inst.asset_id];
-            } else {
-                inst = synth_inst_from_tlas_leaf(leaf);
-                asset = assets[leaf.asset_id];
-            }
-            let t = find_hit_in_instance(inst, asset, ray_origin, ray_dir);
-            if t < nearest_t { nearest_t = t; }
-        } else {
-            if top + 1u < TLAS_STACK_DEPTH {
-                stack[top] = node.left_or_leaf;
-                top = top + 1u;
-                stack[top] = node.right_or_count;
-                top = top + 1u;
-            }
-        }
-    }
-
-    if nearest_t >= NO_HIT_T * 0.5 {
-        textureStore(shadow_map, vec2<i32>(i32(tx), i32(ty)), vec4<f32>(FAR_DEPTH));
-        return;
-    }
-
-    let world_hit = ray_origin + ray_dir * nearest_t;
+    let world_hit = ray_origin + ray_dir * t;
     let clip = light_camera.view_proj * vec4<f32>(world_hit, 1.0);
-    let ndc_z = clip.z / clip.w;
-    // Clamp into [0, FAR_DEPTH); the shade pass treats anything ≥
-    // FAR_DEPTH as "no occluder," so we never want a legitimate
-    // hit to write FAR_DEPTH itself. Floor at 0 absorbs FP noise
-    // that could push hits at the near plane below 0.
-    let depth_out = clamp(ndc_z, 0.0, 0.999999);
-    textureStore(shadow_map, vec2<i32>(i32(tx), i32(ty)), vec4<f32>(depth_out));
+    let depth = clamp(clip.z / clip.w, 0.0, 0.999999);
+    let depth_bits = bitcast<u32>(depth);
+
+    let buffer_idx = ty * light_camera.shadow_map_size.x + tx;
+    atomicMin(&shadow_buffer[buffer_idx], depth_bits);
 }
