@@ -598,11 +598,19 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // fill task; instead pack a `BandCell` record into two
         // consecutive `leaf_attr_pool` slots and tag the octree node
         // `LEAF | BAND | abs_off` so the march fires
-        // `dispatch_user_instance_descend` on hit. V1 single-anchor:
-        // anchor = cell center (a future revision adds normal-aware
-        // projection onto the host surface).
+        // `dispatch_user_instance_descend` on hit.
+        //
+        // V1 anchor projects the cell center DOWNWARD by
+        // `host.distance` — works for flat floors where the host's
+        // surface is at constant Y. `host_sample_in_region` returns
+        // a Lipschitz lower-bound distance with no usable normal
+        // (the default `(0,1,0)` is a placeholder), so vertical
+        // walls + sloped surfaces produce a misaligned anchor here.
+        // Future V2 will compute a proper surface projection
+        // (numerical gradient on the host octree, or multi-source
+        // BFS seeded by painted leaves).
         if (cur_region.use_band_path != 0u) {
-            let anchor = center;
+            let anchor = center - vec3<f32>(0.0, host.distance, 0.0);
             let band_slot = atomicAdd(&leaf_attr_alloc[cell.region_index], 2u);
             if (band_slot + 2u <= cur_region.leaf_attr_block_size) {
                 let abs_off = cur_region.leaf_attr_block_offset + band_slot;
@@ -749,9 +757,17 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             );
             let child_offset = first_child + k;
 
-            // Brick-parent classification, inline:
+            // Brick-parent classification, inline. Hoisted
+            // `child_host` so the band-cell branch below can read
+            // `child_host.distance` for the V1 anchor projection.
+            var child_host: HostSample;
+            child_host.distance = 0.0;
+            child_host.normal = vec3<f32>(0.0, 1.0, 0.0);
+            child_host.material = 0u;
+            child_host.material_secondary = 0u;
+            child_host.blend_weight = 0u;
             if (cur_region.host_octree_root != HOST_NO_HOST_SENTINEL) {
-                let child_host = host_sample_in_region(child_center, cell.region_index);
+                child_host = host_sample_in_region(child_center, cell.region_index);
                 if (child_host.distance > child_diag_half + band) {
                     octree_nodes[child_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
                     continue;
@@ -764,8 +780,11 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // Phase B-redux 3b — band-cell path, V13-inline mirror
             // of the L==max_depth branch above. Pack BandCell into
             // two leaf-attr slots; tag node `LEAF | BAND | abs_off`.
+            // Project DOWN by child_host.distance to land near the
+            // host surface (V1 flat-ground assumption — see the
+            // L==max_depth branch above for context).
             if (cur_region.use_band_path != 0u) {
-                let anchor = child_center;
+                let anchor = child_center - vec3<f32>(0.0, child_host.distance, 0.0);
                 let band_slot = atomicAdd(&leaf_attr_alloc[cell.region_index], 2u);
                 if (band_slot + 2u <= cur_region.leaf_attr_block_size) {
                     let abs_off = cur_region.leaf_attr_block_offset + band_slot;
