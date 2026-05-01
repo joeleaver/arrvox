@@ -110,21 +110,25 @@ impl EngineState {
         let infos = self.user_shader_registry.shader_infos();
 
         // Build the set of "shader-bearing material ids" — materials
-        // whose shader has either a `generate` hook (Phase C per-cell
-        // pipeline) or an `is_instance_pipeline` flag (Option B voxel
-        // sprite instancing). Same painted-AABB scan feeds both
-        // request types; the per-tile emit loop below partitions on
-        // shader kind.
+        // whose shader has any of: a `generate` hook (Phase C
+        // per-cell pipeline), an `is_instance_pipeline` flag
+        // (Option B voxel sprite instancing), or an `instance_at`
+        // hook (Phase B-redux band-cell derivation). Same painted-
+        // AABB scan feeds all three; the per-tile emit loop below
+        // partitions on shader kind.
         let mut shader_materials: std::collections::HashMap<
             u16,
             rkp_render::shader_composer::UserShaderInfo,
         > = std::collections::HashMap::new();
-        if infos.iter().any(|i| i.has_generate || i.is_instance_pipeline) {
+        let any_shader_pipeline = infos
+            .iter()
+            .any(|i| i.has_generate || i.is_instance_pipeline || i.has_instance_at);
+        if any_shader_pipeline {
             for slot_id in 0..self.material_lib.slot_count() as u16 {
                 let Some(def) = self.material_lib.get_def(slot_id) else { continue; };
                 let Some(shader_name) = def.shader.as_deref() else { continue; };
                 let Some(info) = infos.iter().find(|i| i.name == shader_name) else { continue; };
-                if info.has_generate || info.is_instance_pipeline {
+                if info.has_generate || info.is_instance_pipeline || info.has_instance_at {
                     shader_materials.insert(slot_id, info.clone());
                 }
             }
@@ -400,12 +404,40 @@ impl EngineState {
                             world_center[2] + half_extent,
                         ];
 
-                        // Partition by shader kind. A single material's
-                        // shader is one or the other (a generate hook
-                        // and an instance pipeline are mutually
-                        // exclusive at registration time), so each
-                        // tile produces exactly one request.
-                        if info.has_generate {
+                        // Partition by shader kind. Three paths today:
+                        //   - `has_instance_at` → Phase B-redux band-cell
+                        //     path. BFS bakes per-region band cells; the
+                        //     march fires `dispatch_user_instance_descend`
+                        //     on hit. Preempts `is_instance_pipeline` for
+                        //     the same shader (the grass demo carries
+                        //     both during migration; Phase 5 deletes the
+                        //     emit hook).
+                        //   - `has_generate` → Phase C voxel emit BFS.
+                        //   - `is_instance_pipeline` → Option B per-pixel
+                        //     instance pool emit. Going away in Phase 5.
+                        if info.has_instance_at {
+                            user_shader_regions.push(rkp_render::user_shader_pass::ShaderRegionRequest {
+                                host_object_id: inst.object_id,
+                                material_id: mat_id as u32,
+                                shader_name: shader_name_for_request.clone(),
+                                params: params.clone(),
+                                aabb_min: centered_min,
+                                aabb_max: centered_max,
+                                cell_size,
+                                input_hash,
+                                animated: info.animated,
+                                region_thickness: effective_band,
+                                max_depth,
+                                painted_leaf_count,
+                                host_octree_root,
+                                host_octree_depth: asset.octree_depth,
+                                host_octree_extent,
+                                host_grid_origin: asset.grid_origin,
+                                host_inverse_world: inverse_world,
+                                tile_index,
+                                is_band_region: true,
+                            });
+                        } else if info.has_generate {
                             user_shader_regions.push(rkp_render::user_shader_pass::ShaderRegionRequest {
                                 host_object_id: inst.object_id,
                                 material_id: mat_id as u32,

@@ -326,7 +326,7 @@ fn host_sample_in_region(world_pos: vec3<f32>, region_index: u32) -> HostSample 
         let is_leaf = (value & OCTREE_LEAF_BIT) != 0u;
         let is_brick = is_leaf && ((value & OCTREE_BRICK_BIT) != 0u);
         if (is_brick) {
-            let brick_id = value & 0x3FFFFFFFu;
+            let brick_id = value & OCTREE_PAYLOAD_MASK;
             let cell_size_at = (half * 2.0) / f32(BRICK_DIM);
             let brick_min = center - vec3<f32>(half);
             let pos_in_brick = oc - brick_min;
@@ -372,7 +372,7 @@ fn host_sample_in_region(world_pos: vec3<f32>, region_index: u32) -> HostSample 
             return s;
         }
         if (is_leaf) {
-            let attr = leaf_attr_pool[value & 0x3FFFFFFFu];
+            let attr = leaf_attr_pool[value & OCTREE_PAYLOAD_MASK];
             s.distance = 0.0;
             s.normal = unpack_oct(attr.normal_oct);
             s.material = attr.material_packed & 0xFFFFu;
@@ -442,7 +442,7 @@ fn host_sample_at(world_pos: vec3<f32>) -> HostSample {
         let is_leaf = (value & OCTREE_LEAF_BIT) != 0u;
         let is_brick = is_leaf && ((value & OCTREE_BRICK_BIT) != 0u);
         if (is_brick) {
-            let brick_id = value & 0x3FFFFFFFu;
+            let brick_id = value & OCTREE_PAYLOAD_MASK;
             let cell_size_at = (half * 2.0) / f32(BRICK_DIM);
             let brick_min = center - vec3<f32>(half);
             let pos_in_brick = oc - brick_min;
@@ -488,7 +488,7 @@ fn host_sample_at(world_pos: vec3<f32>) -> HostSample {
             return s;
         }
         if (is_leaf) {
-            let attr = leaf_attr_pool[value & 0x3FFFFFFFu];
+            let attr = leaf_attr_pool[value & OCTREE_PAYLOAD_MASK];
             s.distance = 0.0;
             s.normal = unpack_oct(attr.normal_oct);
             s.material = attr.material_packed & 0xFFFFu;
@@ -593,6 +593,38 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     if (L == cur_region.max_depth) {
+        // Phase B-redux 3b — band-cell path. When the region's
+        // shader uses `instance_at` (no voxel emit), don't queue a
+        // fill task; instead pack a `BandCell` record into two
+        // consecutive `leaf_attr_pool` slots and tag the octree node
+        // `LEAF | BAND | abs_off` so the march fires
+        // `dispatch_user_instance_descend` on hit. V1 single-anchor:
+        // anchor = cell center (a future revision adds normal-aware
+        // projection onto the host surface).
+        if (cur_region.use_band_path != 0u) {
+            let anchor = center;
+            let band_slot = atomicAdd(&leaf_attr_alloc[cell.region_index], 2u);
+            if (band_slot + 2u <= cur_region.leaf_attr_block_size) {
+                let abs_off = cur_region.leaf_attr_block_offset + band_slot;
+                var s0: LeafAttr;
+                s0.normal_oct = bitcast<u32>(anchor.x);
+                s0.material_packed = bitcast<u32>(anchor.y);
+                leaf_attr_pool[abs_off] = s0;
+                var s1: LeafAttr;
+                s1.normal_oct = bitcast<u32>(anchor.z);
+                s1.material_packed = cell.region_index;
+                leaf_attr_pool[abs_off + 1u] = s1;
+                octree_nodes[cell.octree_offset] = vec2<u32>(
+                    OCTREE_LEAF_BIT | OCTREE_BAND_BIT | abs_off,
+                    INTERNAL_ATTR_NONE,
+                );
+            } else {
+                atomicAdd(&overflow[OVERFLOW_LEAF_ATTR], 1u);
+                octree_nodes[cell.octree_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
+            }
+            return;
+        }
+
         // V11 — paint-targeted brick allocation. Skip bricks whose
         // projected surface point isn't painted with this region's
         // material. This is what makes paint-driven shaders (grass,
@@ -723,6 +755,33 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     continue;
                 }
             }
+            // Phase B-redux 3b — band-cell path, V13-inline mirror
+            // of the L==max_depth branch above. Pack BandCell into
+            // two leaf-attr slots; tag node `LEAF | BAND | abs_off`.
+            if (cur_region.use_band_path != 0u) {
+                let anchor = child_center;
+                let band_slot = atomicAdd(&leaf_attr_alloc[cell.region_index], 2u);
+                if (band_slot + 2u <= cur_region.leaf_attr_block_size) {
+                    let abs_off = cur_region.leaf_attr_block_offset + band_slot;
+                    var s0: LeafAttr;
+                    s0.normal_oct = bitcast<u32>(anchor.x);
+                    s0.material_packed = bitcast<u32>(anchor.y);
+                    leaf_attr_pool[abs_off] = s0;
+                    var s1: LeafAttr;
+                    s1.normal_oct = bitcast<u32>(anchor.z);
+                    s1.material_packed = cell.region_index;
+                    leaf_attr_pool[abs_off + 1u] = s1;
+                    octree_nodes[child_offset] = vec2<u32>(
+                        OCTREE_LEAF_BIT | OCTREE_BAND_BIT | abs_off,
+                        INTERNAL_ATTR_NONE,
+                    );
+                } else {
+                    atomicAdd(&overflow[OVERFLOW_LEAF_ATTR], 1u);
+                    octree_nodes[child_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
+                }
+                continue;
+            }
+
             // V12 deferred allocation — pre-write EMPTY, queue fill
             // task. Fill decides whether to allocate based on
             // workgroup-cooperative occupancy vote.
