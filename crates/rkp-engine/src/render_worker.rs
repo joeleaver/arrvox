@@ -289,6 +289,17 @@ struct RenderState {
     /// instances; Session 4 plumbs into shadow trace. Until Session 4
     /// the GPU buffers are written but unread.
     tlas_pass: rkp_render::tlas_pass::TlasPass,
+    /// Phase 7c — GPU-built TLAS pipeline (assembly + Morton + radix
+    /// + Karras + AABB propagation). Replaces the CPU median-split
+    /// builder in `tlas_pass.rs`. Writes its final tlas_nodes /
+    /// tlas_leaves into `tlas_pass`'s buffers (which the shadow
+    /// trace already binds).
+    tlas_build_pass: rkp_render::tlas_build_pass::TlasBuildPass,
+    /// Phase 7d — directional shadow tile cull. Builds a 2D
+    /// occupancy bitmap in light-space; the shadow trace looks
+    /// the bitmap up before descending the BVH. Most pixels'
+    /// rays land in empty tiles → BVH walk skipped entirely.
+    shadow_tile_cull_pass: rkp_render::shadow_tile_cull_pass::ShadowTileCullPass,
 
     /// Stage 6c-3 — global `array<u32>` storage buffer holding all
     /// scattered instance bytes. Each region's slice is bucket-allocated
@@ -496,6 +507,13 @@ impl RenderState {
         // Phase 7 Session 1 — TLAS foundation. Empty buffers + no
         // builder yet; Sessions 2-4 plumb in the actual BVH.
         let tlas_pass = rkp_render::tlas_pass::TlasPass::new(&device);
+        // Phase 7c — GPU TLAS build pipeline. Owns assembly +
+        // Morton + radix + Karras + propagate compute pipelines.
+        let tlas_build_pass = rkp_render::tlas_build_pass::TlasBuildPass::new(&device);
+        // Phase 7d — shadow tile cull. Owns the mark-pass compute
+        // pipeline + the persistent bitmap buffer.
+        let shadow_tile_cull_pass =
+            rkp_render::shadow_tile_cull_pass::ShadowTileCullPass::new(&device);
 
         // The instance_pool_buffer lives on RkpScene now (bound at
         // scene group binding(14) so the host march can read it for
@@ -541,6 +559,8 @@ impl RenderState {
             instance_tile_view_uniform_buffer,
             instance_tile_prefix_uniform_buffer,
             tlas_pass,
+            tlas_build_pass,
+            shadow_tile_cull_pass,
             instance_pool_capacity_u32: rkp_render::rkp_scene::INSTANCE_POOL_CAPACITY_U32,
             instance_leaves_buffer,
             instance_leaves_capacity_entries: INSTANCE_LEAVES_INITIAL_ENTRIES,
@@ -1196,47 +1216,36 @@ fn render_one_frame(
     //     so at high render rates physics-driven motion is smooth
     //     instead of stuttering at the sim rate. Assets are pose-static
     //     within a frame.
-    // 1b'. Phase 7 Sessions 2+3 — build the TLAS over host instances
-    //      AND user-shader instance regions. Each painted leaf in a
-    //      region contributes one TLAS leaf with a conservative AABB
-    //      (radius = region.region_thickness) — covers the actual
-    //      blade despite emit's slot-permutation. Session 4 plumbs
-    //      this into shadow trace; today the buffers are written but
-    //      unread, so pure side-effect.
-    let user_shader_regions_for_tlas: Vec<rkp_render::tlas_pass::UserShaderRegionTlas> =
-        inst_result
-            .user_shader_region_pool_info
-            .iter()
-            .map(|info| rkp_render::tlas_pass::UserShaderRegionTlas {
-                asset_id: info.asset_id,
-                material_id: info.material_id,
-                region_thickness: info.region_thickness,
-                instance_block_offset: info.instance_block_offset,
-                instance_stride_u32: info.instance_stride_u32,
-                leaves: &frame.instance_region_requests[info.request_index as usize].leaves,
-            })
-            .collect();
-    state.tlas_pass.build_tlas(
-        &state.device,
-        &state.queue,
-        assets_for_upload,
+    // 1b'. Phase 7c — GPU TLAS build. The CPU build_tlas (median-
+    //      split BVH) used `pos ± region_thickness` per-leaf AABBs
+    //      for user-shader instances because it had no way to call
+    //      the shader's `inst_aabb` hook. With grass-style shaders
+    //      that's a 3 m cube around each painted leaf — 5000 leaves'
+    //      AABBs all overlap, BVH degenerates, shadow trace tanks
+    //      (30-40 ms for one .5 m grass splat).
+    //
+    //      Phase 7c reads the tight per-instance AABBs the Phase 6
+    //      tile-cull AABB pass already wrote into
+    //      `instance_tile_cull_scratch_buffer`. Pipeline:
+    //        S1 — assemble (filter scratch.live + transform host
+    //             AABBs) → packed `tlas_prims[]`.
+    //        S2 — 30-bit Morton compute + 4×8-bit radix sort.
+    //        S3 — Karras parallel binary tree topology.
+    //        S4 — bottom-up AABB propagation via atomic visit
+    //             counter.
+    //      Output writes directly into `state.tlas_pass.{nodes,leaves}_buffer`,
+    //      which the shadow trace already binds.
+    //
+    //      Note: must run AFTER `upload_frame` because the host
+    //      assembly pass reads `state.renderer.scene.objects_buffer`
+    //      / `assets_buffer`. (Tile-cull scratch was populated
+    //      earlier by `tick_instance_pipeline`.)
+    let scene_aabb = compute_tlas_scene_aabb(
+        &inst_result.user_shader_region_pool_info,
+        frame,
         instances_for_upload,
-        &user_shader_regions_for_tlas,
+        assets_for_upload,
     );
-    // Phase 7 Session 4b — refresh each VR's march-pass bind group
-    // with the (possibly newly-allocated) TLAS buffer handles. wgpu's
-    // buffer handles change on capacity-doubling growth; clone-cheap
-    // and the rebuild check skips work when handles match. Required
-    // every frame because the bind group is initially built without
-    // TLAS bindings (Session 1 placeholders), and need to be present
-    // before shadow trace runs.
-    for vr in state.viewport_renderers.values_mut() {
-        vr.march.set_tlas_buffers(
-            &state.device,
-            &state.tlas_pass.nodes_buffer,
-            &state.tlas_pass.leaves_buffer,
-        );
-    }
     let overlay_bytes: &[u8] = bytemuck::cast_slice(&frame.gpu_instance_overlays);
     state.renderer.upload_frame(
         &state.queue,
@@ -1247,6 +1256,65 @@ fn render_one_frame(
             bone_dual_quats: &frame.bone_matrix_dqs,
             instance_overlays: overlay_bytes,
         },
+    );
+
+    // 1b''. Phase 7c — fire the GPU TLAS build. Inputs:
+    //   * tile-cull scratch buffer (populated earlier by
+    //     `tick_instance_pipeline`)
+    //   * scene's host-instance and host-asset buffers (just
+    //     populated by `upload_frame`)
+    //   * scene AABB (CPU-derived above)
+    //   The pipeline writes the final `tlas_nodes` + `tlas_leaves`
+    //   into `state.tlas_pass`'s buffers, which the shadow trace
+    //   already binds. Returns the actual prim count after the
+    //   live-filter; sets `tlas_pass.last_*_count` accordingly so
+    //   the empty-scene skip in shadow trace works.
+    let host_count = instances_for_upload.len() as u32;
+    let asset_count = assets_for_upload.len() as u32;
+    let tlas_inputs = rkp_render::tlas_build_pass::GpuTlasBuildInputs {
+        scratch_buffer: &state.instance_tile_cull_scratch_buffer,
+        scratch_count: inst_result.tile_cull_scratch_count,
+        instances_buffer: &state.renderer.scene.objects_buffer,
+        instance_count: host_count,
+        assets_buffer: &state.renderer.scene.assets_buffer,
+        asset_count,
+        scene_min: scene_aabb.0,
+        scene_max: scene_aabb.1,
+    };
+    let tlas_prim_count = state.tlas_build_pass.build_gpu_tlas(
+        &state.device,
+        &state.queue,
+        &tlas_inputs,
+        &mut state.tlas_pass,
+    );
+    // Refresh per-VR shadow-trace bind groups so they pick up any
+    // capacity-doubling reallocation of `tlas_pass.{nodes,leaves}_buffer`.
+    // Cheap when handles match.
+    for vr in state.viewport_renderers.values_mut() {
+        vr.march.set_tlas_buffers(
+            &state.device,
+            &state.tlas_pass.nodes_buffer,
+            &state.tlas_pass.leaves_buffer,
+        );
+        // Phase 7d — bitmap buffer handle is stable across frames
+        // (no growing), so this only does work on the first frame
+        // for each VR.
+        vr.march.set_shadow_tile_buffer(
+            &state.device,
+            &state.shadow_tile_cull_pass.bitmap_buffer,
+        );
+    }
+
+    // Phase 7d — build the directional-shadow tile bitmap. Scans
+    // the scene's lights for the first directional one, derives a
+    // light-space basis + grid, dispatches the mark pass over the
+    // assembled `tlas_prims`. Result is consumed per-pixel by the
+    // shadow trace's `shadow_tile_has_caster` helper.
+    let shadow_tile_cull = build_shadow_tile_bitmap(
+        state,
+        frame,
+        scene_aabb,
+        tlas_prim_count,
     );
 
     // 2. Skin scatter (one batched compute dispatch). Sim folded every
@@ -1476,6 +1544,7 @@ fn render_one_frame(
             tile_object_ids_ref,
             vp.tile_count_x,
             state.tlas_pass.last_node_count,
+            shadow_tile_cull,
             &vp.atmo_frame,
             vp.mode,
             vp.preview_mode,
@@ -1806,6 +1875,193 @@ fn merge_tile_lists(
 ///      encoders' march reads from the same buffers.
 ///   9. `evict_untouched` both caches.
 ///
+/// Phase 7c — derive a conservative scene AABB CPU-side for the
+/// GPU TLAS build's Morton normalization. Unions:
+///
+///  * Each user-shader region's authoring AABB (a tight bound on
+///    every per-blade AABB the region's shader can produce, since
+///    `inst_aabb` is constrained by `region_thickness` around the
+///    painted surface).
+///  * Each host instance's transformed asset AABB (Arvo).
+///
+/// Returns `(min, max)`. Falls back to `[0,0,0] → [1,1,1]` for
+/// empty input — the Morton dispatch's `extent.max(1e-6)` clamp
+/// prevents divide-by-zero, and the empty-TLAS skip gates the
+/// downstream chain anyway.
+fn compute_tlas_scene_aabb(
+    user_shader_regions: &[UserShaderRegionPoolInfo],
+    frame: &RenderFrame,
+    instances: &[rkp_render::rkp_gpu_object::RkpGpuInstance],
+    assets: &[rkp_render::rkp_gpu_object::RkpGpuAsset],
+) -> ([f32; 3], [f32; 3]) {
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    let mut any = false;
+
+    for region in user_shader_regions {
+        let req = &frame.instance_region_requests[region.request_index as usize];
+        for ax in 0..3 {
+            if req.aabb_min[ax] < min[ax] { min[ax] = req.aabb_min[ax]; }
+            if req.aabb_max[ax] > max[ax] { max[ax] = req.aabb_max[ax]; }
+        }
+        any = true;
+    }
+
+    for inst in instances {
+        let asset_id = inst.asset_id as usize;
+        if asset_id >= assets.len() { continue; }
+        let asset = &assets[asset_id];
+        if asset.shader_id != 0 { continue; }  // user-shader path
+        let (wmin, wmax) = transform_aabb_world(asset.aabb_min, asset.aabb_max, &inst.world);
+        for ax in 0..3 {
+            if wmin[ax] < min[ax] { min[ax] = wmin[ax]; }
+            if wmax[ax] > max[ax] { max[ax] = wmax[ax]; }
+        }
+        any = true;
+    }
+
+    if !any {
+        return ([0.0; 3], [1.0; 3]);
+    }
+    (min, max)
+}
+
+/// Arvo's transform-AABB. Mirrors
+/// `tlas_pass.rs::transform_aabb`. Used by the TLAS scene-AABB
+/// helper above.
+fn transform_aabb_world(
+    local_min: [f32; 3],
+    local_max: [f32; 3],
+    world: &[[f32; 4]; 4],
+) -> ([f32; 3], [f32; 3]) {
+    let mut new_min = [world[3][0], world[3][1], world[3][2]];
+    let mut new_max = [world[3][0], world[3][1], world[3][2]];
+    for i in 0..3 {
+        for j in 0..3 {
+            let a = world[j][i] * local_min[j];
+            let b = world[j][i] * local_max[j];
+            new_min[i] += a.min(b);
+            new_max[i] += a.max(b);
+        }
+    }
+    (new_min, new_max)
+}
+
+/// Phase 7d — populate the shadow-tile bitmap from the assembled
+/// `tlas_prims`, returning the `ShadowTileCullParams` to feed into
+/// `render_to`. Returns `disabled()` when the cull can't run (no
+/// directional light, empty TLAS, degenerate scene AABB).
+///
+/// Picks the first directional light it finds. Multi-directional
+/// scenes only get the cull benefit on that one light; others fall
+/// back to the full BVH descent in the shadow trace.
+fn build_shadow_tile_bitmap(
+    state: &mut RenderState,
+    frame: &RenderFrame,
+    scene_aabb: ([f32; 3], [f32; 3]),
+    tlas_prim_count: u32,
+) -> rkp_render::octree_march::ShadowTileCullParams {
+    use rkp_render::octree_march::ShadowTileCullParams;
+    use rkp_render::shadow_tile_cull_pass::{
+        fit_tile_grid, light_space_basis, ShadowTileUniform,
+        SHADOW_TILE_BITMAP_U32S, SHADOW_TILE_GRID_H, SHADOW_TILE_GRID_W,
+    };
+    if tlas_prim_count == 0 {
+        return ShadowTileCullParams::disabled();
+    }
+    // Find the first directional light. `position.w` carries the
+    // light type code; 0 = directional. Mirror of the convention
+    // in `rkp_shadow_trace.wgsl::main`.
+    let (light_idx, light_dir) = match frame
+        .lights
+        .iter()
+        .enumerate()
+        .find(|(_, l)| (l.position[3] as u32) == 0)
+        .map(|(i, l)| (i as u32, [l.direction[0], l.direction[1], l.direction[2]]))
+    {
+        Some(v) => v,
+        None => return ShadowTileCullParams::disabled(),
+    };
+    let (right, up) = light_space_basis(light_dir);
+    let (tile_size, origin) =
+        fit_tile_grid(scene_aabb.0, scene_aabb.1, right, up);
+
+    // Upload uniform + zero the bitmap.
+    let uniform = ShadowTileUniform {
+        light_origin: origin,
+        tile_size,
+        light_right: right,
+        grid_w: SHADOW_TILE_GRID_W,
+        light_up: up,
+        grid_h: SHADOW_TILE_GRID_H,
+        prim_count: tlas_prim_count,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
+    state.queue.write_buffer(
+        &state.shadow_tile_cull_pass.uniform_buffer,
+        0,
+        bytemuck::bytes_of(&uniform),
+    );
+    let zeros: Vec<u32> = vec![0u32; SHADOW_TILE_BITMAP_U32S as usize];
+    state.queue.write_buffer(
+        &state.shadow_tile_cull_pass.bitmap_buffer,
+        0,
+        bytemuck::cast_slice(&zeros),
+    );
+
+    // Encode + submit the mark dispatch.
+    let g0 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("shadow_tile_mark g0"),
+        layout: &state.shadow_tile_cull_pass.g0_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: state.tlas_build_pass.tlas_prims_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: state.shadow_tile_cull_pass.bitmap_buffer.as_entire_binding(),
+            },
+        ],
+    });
+    let g1 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("shadow_tile_mark g1"),
+        layout: &state.shadow_tile_cull_pass.g1_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: state.shadow_tile_cull_pass.uniform_buffer.as_entire_binding(),
+        }],
+    });
+    let mut encoder = state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("shadow_tile_mark"),
+    });
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("mark_main"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&state.shadow_tile_cull_pass.mark_pipeline);
+        cpass.set_bind_group(0, &g0, &[]);
+        cpass.set_bind_group(1, &g1, &[]);
+        let wgs = ((tlas_prim_count + 63) / 64).max(1);
+        cpass.dispatch_workgroups(wgs, 1, 1);
+    }
+    state.queue.submit(std::iter::once(encoder.finish()));
+
+    ShadowTileCullParams {
+        enabled: 1,
+        light_idx,
+        grid_w: SHADOW_TILE_GRID_W,
+        grid_h: SHADOW_TILE_GRID_H,
+        origin,
+        tile_size,
+        right,
+        up,
+    }
+}
+
 /// Phase 5 retired Option B's per-frame TileIndex + ProtoLookup
 /// upload — the host march doesn't need either since it routes
 /// through `asset.shader_id` + `inst.instance_state_offset` directly.
@@ -1985,7 +2241,20 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
         region_uniform: rkp_render::user_shader_emit_pass::EmitRegionUniform,
         region_index: u32,
         leaf_count: u32,
-        instance_alloc_offset_bytes: u64,
+        /// Phase 7b — per-region live count written to
+        /// `instance_alloc[region]` CPU-side BEFORE the emit dispatch.
+        /// Used by the downstream tile cull's `i < alloc` skip. Equals
+        /// `leaves.len() × max_emits_per_thread`; slots beyond this
+        /// (the bucket-rounded tail of `instance_block_size`) are
+        /// truly unowned and the cull marks them dead.
+        instance_alloc_value: u32,
+        /// Phase 7b — `clear_buffer` range that pre-zeros this region's
+        /// slot reservation in `instance_pool` before the emit
+        /// dispatch. `(byte_offset, byte_size)`. Covers the whole
+        /// `instance_block_size × stride` window so even unowned
+        /// trailing slots have known-zero state — their AABB hooks
+        /// then return degenerate AABBs that get culled.
+        pool_clear_range_bytes: (u64, u64),
     }
     let mut dirty_bakes: Vec<DirtyBake> = Vec::new();
     let mut scatters: Vec<Scatter> = Vec::new();
@@ -2097,11 +2366,22 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             req, &slot, shader_id, time_seconds, leaf_offset,
         );
         let _ = proto_dirty;
+        // Phase 7b — slot range to pre-clear (in u32-stride bytes).
+        // `instance_block_size` is bucket-rounded, so this clears the
+        // whole reservation. Live count = leaves × max_emits, the
+        // exact number of slots threads can write into.
+        let block_offset_bytes =
+            (region_uniform.instance_block_offset as u64) * 4;
+        let block_size_bytes = (region_uniform.instance_block_size as u64)
+            * (region_uniform.instance_stride_u32 as u64)
+            * 4;
+        let alloc_value = leaf_count.saturating_mul(req.max_emits_per_thread);
         scatters.push(Scatter {
             region_uniform,
             region_index,
             leaf_count,
-            instance_alloc_offset_bytes: (region_index as u64) * 4,
+            instance_alloc_value: alloc_value,
+            pool_clear_range_bytes: (block_offset_bytes, block_size_bytes),
         });
 
         // Phase 4 — register the user-shader instance asset (once per
@@ -2163,15 +2443,9 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
         };
         let asset_id = asset_id_base + asset_index;
 
-        // Phase 7 Session 3 — record pool layout for the TLAS build,
-        // tagged with the request index so the downstream consumer
-        // can borrow `frame.instance_region_requests[i].leaves`.
+        // Phase 7 Session 3 / 7c — record per-region request index
+        // for downstream consumers (TLAS scene-AABB derivation).
         user_shader_region_pool_info.push(UserShaderRegionPoolInfo {
-            asset_id,
-            material_id: req.material_id,
-            region_thickness: req.region_thickness,
-            instance_block_offset: region_uniform.instance_block_offset,
-            instance_stride_u32: region_uniform.instance_stride_u32,
             request_index: req_idx as u32,
         });
 
@@ -2359,23 +2633,29 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
                 &dispatch_bytes,
             );
 
-            // Reset alloc counters for every region we're scattering.
-            // Simplest correct approach: zero the whole alloc buffer
-            // once. Cost: 4 KB at MAX_INSTANCE_REGIONS=1024. The
-            // alternative (per-region writes) is slower for >32
-            // regions and risks leaving stale values in slots that
-            // were touched in a prior frame but aren't this frame.
-            // Note: since V1 always re-scatters every touched region,
-            // every counter that the march reads gets repopulated
-            // before submit — zeroing first is safe.
-            let zeros = vec![
-                0u8;
-                (rkp_render::user_shader_emit_pass::MAX_INSTANCE_REGIONS as usize) * 4
+            // Phase 7b — write the per-region live count into
+            // `instance_alloc[region]` BEFORE emit dispatches, instead
+            // of letting emit's atomicAdd accumulate it. With
+            // deterministic slot allocation (slot = thread_id × max +
+            // local_count), the live count is known up front:
+            // `leaves.len() × max_emits_per_thread` per region. Build
+            // the full MAX_REGIONS array, default 0, and stamp in
+            // touched regions; one upload covers everything and
+            // untouched regions keep their cull-skip behaviour.
+            let mut alloc_values: Vec<u32> = vec![
+                0u32;
+                rkp_render::user_shader_emit_pass::MAX_INSTANCE_REGIONS as usize
             ];
+            for s in &scatters {
+                let idx = s.region_index as usize;
+                if idx < alloc_values.len() {
+                    alloc_values[idx] = s.instance_alloc_value;
+                }
+            }
             state.queue.write_buffer(
                 &state.instance_emit_pass.instance_alloc_buffer,
                 0,
-                &zeros,
+                bytemuck::cast_slice(&alloc_values),
             );
             // Reset overflow counters.
             state.queue.write_buffer(
@@ -2383,6 +2663,26 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
                 0,
                 &[0u8; 16],
             );
+
+            // Phase 7b — pre-clear each region's slot reservation in
+            // `instance_pool` to zero before emit. Deterministic slot
+            // allocation means a given thread's slots are reserved
+            // even if the user shader's emit hook returns early
+            // without calling `emit_instance`; those slots must hold
+            // known-zero state so the AABB pass and shadow trace
+            // produce degenerate AABBs and skip them. `clear_buffer`
+            // runs on the GPU — no upload — and is encoded into the
+            // same command buffer as the emit dispatches that follow,
+            // which guarantees the ordering.
+            for s in &scatters {
+                let (off, size) = s.pool_clear_range_bytes;
+                if size == 0 { continue; }
+                encoder.clear_buffer(
+                    &state.renderer.scene.instance_pool_buffer,
+                    off,
+                    Some(size),
+                );
+            }
 
             // Build bind groups (groups 0 + 1 are stable across
             // dispatches; group 2 takes a dynamic offset per dispatch).
@@ -2443,7 +2743,6 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
                 // 1-D dispatch: `leaf_count.div_ceil(64)` workgroups, 64
                 // threads each → one thread per painted leaf.
                 cpass.dispatch_workgroups(wgs, 1, 1);
-                let _ = s.instance_alloc_offset_bytes;
             }
             state.renderer.profiler.end_query(&mut encoder, scatter_q);
         }
@@ -2637,25 +2936,15 @@ struct InstancePipelineResult {
 /// Phase 7 Session 3 — pool layout descriptor for one user-shader
 /// region. Returned from `tick_instance_pipeline` so downstream
 /// consumers can correlate a region back to its
-/// `frame.instance_region_requests` entry without re-running shader
-/// resolution / cache lookup.
+/// `frame.instance_region_requests` entry. Phase 7c trimmed to
+/// just `request_index` — the per-region pool layout fields
+/// (asset_id / material_id / instance_block_offset / etc.) were
+/// only consumed by the now-deleted CPU TLAS builder.
 #[derive(Debug, Clone)]
 struct UserShaderRegionPoolInfo {
-    /// Index into the combined assets vec where this region's user-
-    /// shader asset lives.
-    asset_id: u32,
-    /// `region_uniform.material_id` — V1 host-material inheritance.
-    material_id: u32,
-    /// `request.region_thickness` — passed through for downstream
-    /// AABB sizing (TLAS conservative leaf bounds).
-    region_thickness: f32,
-    /// `region_uniform.instance_block_offset` — first slot in
-    /// `instance_pool` for this region's per-instance state.
-    instance_block_offset: u32,
-    /// `region_uniform.instance_stride_u32`.
-    instance_stride_u32: u32,
     /// Index into `frame.instance_region_requests` so consumers can
-    /// borrow the leaves slice without re-resolving shader lookup.
+    /// borrow the request's `aabb_min` / `aabb_max` (used by the
+    /// scene-AABB derivation fed to the GPU TLAS Morton compute).
     request_index: u32,
 }
 

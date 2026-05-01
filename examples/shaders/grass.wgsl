@@ -19,14 +19,22 @@
 // centerline).
 
 // ── Region directives ───────────────────────────────────────────────
-// max_depth 5 → 128 canonical cells per axis. At blade_height=0.4 m
-// that's ~3 mm cells — fine enough for a real grass-blade silhouette
-// without losing the tip in staircase.
+// max_depth 5 → 128 canonical cells per axis. With tile_size 5.12 m
+// (= 0.04 × 4 × 2^5), each painted tile keeps its cells at the
+// intended ~4 cm grain regardless of how big a patch the user
+// paints — paint splits into multiple regions instead of one giant
+// region whose cell size grows with paint extent.
 
 // @max_depth 5
+// @tile_size 5.12
 // @region_thickness 1.5
-// @cell_size 0.04
 // @animated
+// Phase 7b — `density` can request up to 5 blades per painted leaf
+// (see the loop in user_grass_emit). Each thread reserves 5
+// consecutive slots in instance_pool so slot allocation is
+// deterministic; the TLAS builder uses this to issue one tight
+// per-leaf AABB per slot.
+// @max_emits_per_thread 5
 
 // ── Per-material params ─────────────────────────────────────────────
 

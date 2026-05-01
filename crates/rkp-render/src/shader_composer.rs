@@ -104,6 +104,14 @@ pub struct ShaderMetadata {
     /// the [`UserShaderEntry`]. None means the shader uses the existing
     /// per-cell `generate` pipeline.
     pub instance_proto_struct: Option<String>,
+    /// `@max_emits_per_thread <u32>` — Phase 7b. Per-thread cap on how
+    /// many `emit_instance(...)` calls a single emit-hook invocation may
+    /// produce. Each thread (= one painted leaf) reserves this many
+    /// consecutive slots in `instance_pool` so slot allocation is
+    /// deterministic (no atomicAdd). Uses 1 when absent, which is the
+    /// right default for shaders that emit exactly one instance per
+    /// painted leaf. Hard ceiling: 16 (keeps per-region pool bounded).
+    pub max_emits_per_thread: Option<u32>,
 }
 
 /// One user shader's parsed hook bodies + header metadata. Each `*_text`
@@ -257,6 +265,7 @@ impl UserShaderRegistry {
                     .instance_layout
                     .as_ref()
                     .map(|l| l.total_size),
+                max_emits_per_thread: e.metadata.max_emits_per_thread,
             })
             .collect()
     }
@@ -302,6 +311,8 @@ pub struct UserShaderInfo {
     /// Byte size of the per-instance struct, if parsed. Helpful for
     /// editor visibility into "am I close to the soft/hard limit?"
     pub instance_struct_size: Option<u32>,
+    /// Phase 7b — per-thread emit cap. `None` falls back to 1.
+    pub max_emits_per_thread: Option<u32>,
 }
 
 /// Errors that can arise while scanning / parsing user shaders.
@@ -630,6 +641,7 @@ fn struct_decl_name(struct_text: &str) -> &str {
 /// // @region_thickness <f32>
 /// // @cell_size <f32>
 /// // @animated
+/// // @max_emits_per_thread <u32>   // Option B; default 1
 /// ```
 ///
 /// Lines that aren't comments or aren't `@`-prefixed are skipped. Lines
@@ -723,6 +735,23 @@ fn parse_metadata(
                     });
                 }
                 md.animated = true;
+            }
+            "max_emits_per_thread" => {
+                let v: u32 = args.trim().parse().map_err(|_| ShaderComposerError::Parse {
+                    path: path.to_path_buf(),
+                    line: line_no,
+                    msg: format!("@max_emits_per_thread expects a u32, got `{args}`"),
+                })?;
+                if v == 0 || v > 16 {
+                    return Err(ShaderComposerError::Parse {
+                        path: path.to_path_buf(),
+                        line: line_no,
+                        msg: format!(
+                            "@max_emits_per_thread must be in 1..=16 (got {v}); higher values bloat per-region pool reservations"
+                        ),
+                    });
+                }
+                md.max_emits_per_thread = Some(v);
             }
             other => {
                 return Err(ShaderComposerError::Parse {
@@ -1048,7 +1077,8 @@ fn compose_emit_chunk(reg: &UserShaderRegistry) -> String {
     for entry in &reg.entries {
         if let Some(emit_text) = &entry.emit_text {
             if let Some(layout) = &entry.instance_layout {
-                out.push_str(&generate_emit_instance(entry.id, layout));
+                let max_emits = entry.metadata.max_emits_per_thread.unwrap_or(1);
+                out.push_str(&generate_emit_instance(entry.id, layout, max_emits));
                 out.push('\n');
             }
             let renamed = rewrite_fn_name(
@@ -1081,16 +1111,27 @@ fn compose_emit_chunk(reg: &UserShaderRegistry) -> String {
 }
 
 /// Generate the `rkp_user_<id>_emit_instance(<Struct>)` function for
-/// one instance shader. Body: atomic-add a slot in the per-region
-/// instance counter, then write the struct's fields into the global
-/// `instance_pool` (u32-array) via per-field bitcasts at the offsets
-/// the parsed [`InstanceLayout`] computed.
+/// one instance shader. Body: deterministically derive a slot from the
+/// thread id + per-thread local emit count (Phase 7b — replaces the
+/// pre-7b atomicAdd into `instance_alloc[region]`), then write the
+/// struct's fields into the global `instance_pool` (u32-array) via
+/// per-field bitcasts at the offsets the parsed [`InstanceLayout`]
+/// computed.
 ///
-/// Reads workgroup-shared `region: EmitRegionUniform` and
-/// `emit_region_index: u32` (set by `emit_main` before its barrier).
-/// Overflow (atomic-add past `instance_block_size`) bumps a counter
-/// in the `overflow` buffer at slot `OVERFLOW_INSTANCE = 0`.
-fn generate_emit_instance(shader_id: u32, layout: &InstanceLayout) -> String {
+/// Reads workgroup-shared `region: EmitRegionUniform` and per-thread
+/// private `rkp_emit_thread_id: u32` / `rkp_emit_local_count: u32`
+/// (set by `emit_main` before each thread enters `dispatch_user_emit`).
+/// Two overflow conditions both bump `overflow[OVERFLOW_INSTANCE]`:
+/// (a) `local_count >= max_emits_per_thread` — the user shader called
+/// `emit_instance` more times than the directive allows; (b) the
+/// derived slot index falls outside the region's reservation (should
+/// not happen as long as the engine sizes `instance_block_size` to
+/// `leaves.len() × max_emits_per_thread`, but guarded for safety).
+fn generate_emit_instance(
+    shader_id: u32,
+    layout: &InstanceLayout,
+    max_emits_per_thread: u32,
+) -> String {
     let mut out = String::new();
     // Stride in u32s, rounded up so byte alignment of the struct end
     // is preserved when consecutive instances pack tightly.
@@ -1099,7 +1140,16 @@ fn generate_emit_instance(shader_id: u32, layout: &InstanceLayout) -> String {
         "fn rkp_user_{shader_id}_emit_instance(inst: {struct_name}) {{\n",
         struct_name = layout.struct_name,
     ));
-    out.push_str("    let slot = atomicAdd(&instance_alloc[emit_region_index], 1u);\n");
+    out.push_str(&format!(
+        "    if (rkp_emit_local_count >= {max_emits_per_thread}u) {{\n"
+    ));
+    out.push_str("        atomicAdd(&overflow[OVERFLOW_INSTANCE], 1u);\n");
+    out.push_str("        return;\n");
+    out.push_str("    }\n");
+    out.push_str(&format!(
+        "    let slot = rkp_emit_thread_id * {max_emits_per_thread}u + rkp_emit_local_count;\n"
+    ));
+    out.push_str("    rkp_emit_local_count = rkp_emit_local_count + 1u;\n");
     out.push_str("    if (slot >= region.instance_block_size) {\n");
     out.push_str("        atomicAdd(&overflow[OVERFLOW_INSTANCE], 1u);\n");
     out.push_str("        return;\n");

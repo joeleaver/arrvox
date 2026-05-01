@@ -97,6 +97,21 @@ struct MarchParams {
     // traversal off; the helper function falls back to "no shadow
     // caster found" (transmittance unchanged).
     tlas_node_count: u32,
+    // Phase 7d — directional shadow tile cull. The bitmap at
+    // `shadow_tile_bitmap` is set up for `lights[shadow_tile_light_idx]`
+    // (a directional light); other lights take the full BVH path.
+    // `shadow_tile_enabled = 0` disables the cull entirely (e.g.,
+    // no directional light this frame, or the mark pass was
+    // skipped). All fields must match the Rust `MarchParams`
+    // mirror in `octree_march.rs`.
+    shadow_tile_enabled: u32,
+    shadow_tile_light_idx: u32,
+    shadow_tile_grid_w: u32,
+    shadow_tile_grid_h: u32,
+    shadow_tile_origin: vec3<f32>,
+    shadow_tile_size: f32,
+    shadow_tile_right: vec3<f32>,
+    shadow_tile_up: vec3<f32>,
 }
 
 struct GpuLight {
@@ -344,6 +359,42 @@ struct TlasInstanceLeaf {
 }
 @group(2) @binding(8) var<storage, read> tlas_nodes: array<TlasNode>;
 @group(2) @binding(9) var<storage, read> tlas_leaves: array<TlasInstanceLeaf>;
+// Phase 7d — directional shadow tile cull. Per-pixel directional
+// shadow rays look up their light-space tile bit before descending
+// the BVH; bit clear → no caster along the ray's path → return
+// transmittance unchanged. Built each frame by
+// `shadow_tile_mark.wgsl::mark_main` from the assembled
+// `tlas_prims`.
+@group(2) @binding(10) var<storage, read> shadow_tile_bitmap: array<u32>;
+
+// Returns `true` if `world_pos` projects to a tile in the
+// directional-shadow bitmap that has any caster. Returns `true`
+// (= "fall back to BVH") when the cull is disabled or when the
+// projected coords land outside the bitmap (shouldn't happen with
+// a correctly-fit grid, but the safe fallback is correctness).
+fn shadow_tile_has_caster(world_pos: vec3<f32>) -> bool {
+    if march_params.shadow_tile_enabled == 0u {
+        return true;
+    }
+    let offset = world_pos - march_params.shadow_tile_origin;
+    let xl = dot(offset, march_params.shadow_tile_right);
+    let yl = dot(offset, march_params.shadow_tile_up);
+    let tx = i32(floor(xl / march_params.shadow_tile_size));
+    let ty = i32(floor(yl / march_params.shadow_tile_size));
+    if (tx < 0 || tx >= i32(march_params.shadow_tile_grid_w)
+        || ty < 0 || ty >= i32(march_params.shadow_tile_grid_h)) {
+        // Pixel is outside the cull grid — the bitmap doesn't
+        // cover its column. Conservative: assume a caster is
+        // possible. (In practice the engine fits the grid to the
+        // scene AABB so all visible surface pixels project
+        // inside.)
+        return false;
+    }
+    let tile_idx = u32(ty) * march_params.shadow_tile_grid_w + u32(tx);
+    let word = tile_idx >> 5u;
+    let bit = tile_idx & 31u;
+    return ((shadow_tile_bitmap[word] >> bit) & 1u) != 0u;
+}
 
 const TLAS_NODE_LEAF_BIT: u32 = 0x80000000u;
 const TLAS_LEAF_USER_SHADER: u32 = 0xFFFFFFFEu;
@@ -1048,6 +1099,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 shadow_values[shadow_idx] = 0.0;
                 shadow_idx++;
                 continue;
+            }
+
+            // Phase 7d — short-circuit the BVH walk for directional
+            // lights when the surface pixel's light-space tile has
+            // no casters. Other light types fall through to the
+            // full BVH descent.
+            if light_type == 0u && li == march_params.shadow_tile_light_idx
+                && march_params.shadow_tile_enabled != 0u {
+                if !shadow_tile_has_caster(surface_pos) {
+                    shadow_values[shadow_idx] = 1.0;
+                    shadow_idx++;
+                    continue;
+                }
             }
 
             shadow_values[shadow_idx] = trace_shadow_ray(

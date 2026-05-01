@@ -104,6 +104,23 @@ pub mod user_shader_tile_scatter_pass;
 /// buffer storage; Sessions 2-4 add the CPU builder, GPU upload,
 /// and WGSL traversal.
 pub mod tlas_pass;
+/// Phase 7c — GPU-built TLAS pipeline. Session 1 ships the
+/// primitive-assembly compute passes (`tlas_assemble_*.wgsl`) and
+/// the unified `tlas_prims` output buffer; Sessions 2-4 add Morton
+/// sort, Karras tree, and AABB propagation; Session 5 cuts over
+/// from the CPU `tlas_pass::build_tlas` builder.
+pub mod tlas_build_pass;
+/// Phase 7d — directional-light shadow tile cull. Builds a 2D
+/// light-space occupancy bitmap from the assembled `tlas_prims`
+/// so the per-pixel shadow trace can short-circuit the BVH walk
+/// for pixels whose ray passes nowhere near a caster.
+pub mod shadow_tile_cull_pass;
+/// Phase 8 — directional shadow maps. Replaces the per-pixel
+/// ray-traced shadow path with a single light-POV depth render +
+/// per-pixel sample. Sessions 1-5 ship in order: light camera
+/// (S1), shadow march (S2), shade-side query (S3), engine
+/// wiring (S4), directional cutover + perf measurement (S5).
+pub mod shadow_map_pass;
 /// Skeletal skin-deform scatter pass — per-frame bone-field writer.
 pub mod skin_deform;
 /// CPU-side paint writes against the scene's LeafAttrPool (material +

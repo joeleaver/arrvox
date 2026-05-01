@@ -2,9 +2,10 @@
 //! (leaf-driven dispatch).
 //!
 //! Builds a synthetic `Vec<PaintedLeaf>` with N records, runs the emit
-//! shader on a real wgpu device, and verifies the GPU emitted exactly
-//! N instances and that each instance's `pos` matches one of the leaf
-//! positions.
+//! shader on a real wgpu device, and verifies that slot K in
+//! `instance_pool` carries leaf K's data — the deterministic slot
+//! contract Phase 7b establishes (slot = thread_id × max_emits +
+//! local_count, max_emits = 1 here so slot K = leaf K exactly).
 //!
 //! Skips silently when no wgpu adapter is available.
 
@@ -131,6 +132,7 @@ fn scatter_shader_emits_one_instance_per_leaf() {
         tile_index: NO_TILE,
         stride_u32: STRIDE_U32,
         max_instances: MAX_INSTANCES,
+        max_emits_per_thread: 1,
         host_octree_root: HOST_NO_HOST_SENTINEL,
         host_octree_depth: 0,
         host_octree_extent: 0.0,
@@ -167,6 +169,10 @@ fn scatter_shader_emits_one_instance_per_leaf() {
     });
     queue.write_buffer(&leaves_buffer, 0, bytemuck::cast_slice(&leaves));
 
+    // Phase 7b — emit no longer touches instance_alloc; the CPU
+    // writes the live count up front. For this single-region test
+    // the value isn't read by anything (no AABB pass downstream),
+    // so a placeholder zero is fine.
     queue.write_buffer(&pass.instance_alloc_buffer, 0, &[0u8; 4]);
     queue.write_buffer(&pass.overflow_buffer, 0, &[0u8; 16]);
 
@@ -233,19 +239,6 @@ fn scatter_shader_emits_one_instance_per_leaf() {
         cpass.dispatch_workgroups(wgs, 1, 1);
     }
 
-    let alloc_readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("alloc readback"),
-        size: 4,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    encoder.copy_buffer_to_buffer(
-        &pass.instance_alloc_buffer,
-        0,
-        &alloc_readback,
-        0,
-        4,
-    );
     let pool_readback_bytes = (slot.instance_extent_u32 as u64) * 4;
     let pool_readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("pool readback"),
@@ -263,29 +256,15 @@ fn scatter_shader_emits_one_instance_per_leaf() {
 
     queue.submit(std::iter::once(encoder.finish()));
 
-    let slice = alloc_readback.slice(..);
-    slice.map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
-    let view = slice.get_mapped_range();
-    let gpu_count = u32::from_le_bytes(view[0..4].try_into().unwrap());
-    drop(view);
-    alloc_readback.unmap();
-
-    assert_eq!(
-        gpu_count, LEAF_COUNT,
-        "GPU emitted {gpu_count} instances, expected {LEAF_COUNT} (one per leaf)",
-    );
-
     let slice = pool_readback.slice(..);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
     let view = slice.get_mapped_range();
     let words: &[u32] = bytemuck::cast_slice(&view);
-    // Each emitted instance's pos must equal one of the synthetic
-    // leaves. Collect emitted positions into a set and check coverage.
-    let mut emitted_xs: Vec<f32> = Vec::with_capacity(gpu_count as usize);
-    for inst in 0..gpu_count as usize {
-        let base = inst * STRIDE_U32 as usize;
+    // Phase 7b — slot K = leaf K (max_emits_per_thread = 1). Verify
+    // that slot K's struct fields match leaf K's expected values.
+    for k in 0..LEAF_COUNT as usize {
+        let base = k * STRIDE_U32 as usize;
         let pos_x = f32::from_bits(words[base]);
         let pos_y = f32::from_bits(words[base + 1]);
         let pos_z = f32::from_bits(words[base + 2]);
@@ -293,23 +272,17 @@ fn scatter_shader_emits_one_instance_per_leaf() {
         let sway = f32::from_bits(words[base + 4]);
         let height = f32::from_bits(words[base + 5]);
         let tint = words[base + 6];
-        // pos.y / pos.z constants must match the synthetic leaves.
+        let expected_x = (k as f32) * 0.01;
+        assert!(
+            (pos_x - expected_x).abs() < 1e-5,
+            "slot {k} pos.x = {pos_x}, expected {expected_x}",
+        );
         assert!((pos_y - 0.5).abs() < 1e-5);
         assert!((pos_z - 0.25).abs() < 1e-5);
-        // yaw was set to host_pos.x.
         assert!((yaw - pos_x).abs() < 1e-5);
         assert_eq!(sway, 0.0);
         assert!((height - 1.5).abs() < 1e-5);
         assert_eq!(tint, 0xC0FFEE);
-        emitted_xs.push(pos_x);
-    }
-    emitted_xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    for (i, &x) in emitted_xs.iter().enumerate() {
-        let expected = (i as f32) * 0.01;
-        assert!(
-            (x - expected).abs() < 1e-5,
-            "sorted instance {i} pos.x = {x}, expected {expected}",
-        );
     }
     drop(view);
     pool_readback.unmap();

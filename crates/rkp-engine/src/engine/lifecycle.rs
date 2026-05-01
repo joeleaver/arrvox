@@ -426,13 +426,25 @@ impl EngineState {
                                 tile_index,
                             });
                         } else if info.is_instance_pipeline {
-                            const DEFAULT_MAX_INSTANCES: u32 =
-                                rkp_render::user_shader_emit_pass::DEFAULT_MAX_INSTANCES_PER_REGION;
                             let stride_u32 = info
                                 .instance_struct_size
                                 .map(|s| s.div_ceil(4))
                                 .unwrap_or(8);
                             let leaves = tile_entry.leaves.clone();
+                            // Phase 7b — deterministic slot allocation. Each
+                            // painted leaf reserves `max_emits_per_thread`
+                            // consecutive slots in `instance_pool` so the
+                            // CPU TLAS builder can map slot K back to its
+                            // owning painted leaf without atomicAdd
+                            // permutation. Reservation = leaves × cap;
+                            // unused per-thread slots stay zero (see emit
+                            // pre-clear) and produce degenerate AABBs that
+                            // the tile cull / shadow trace skip naturally.
+                            let max_emits_per_thread =
+                                info.max_emits_per_thread.unwrap_or(1).max(1);
+                            let max_instances = (leaves.len() as u32)
+                                .saturating_mul(max_emits_per_thread)
+                                .max(1);
                             instance_region_requests.push(
                                 rkp_render::user_shader_emit_pass::InstanceRegionRequest {
                                     host_object_id: inst.object_id,
@@ -447,7 +459,8 @@ impl EngineState {
                                     region_thickness: effective_band,
                                     tile_index,
                                     stride_u32,
-                                    max_instances: DEFAULT_MAX_INSTANCES,
+                                    max_instances,
+                                    max_emits_per_thread,
                                     host_octree_root,
                                     host_octree_depth: asset.octree_depth,
                                     host_octree_extent,

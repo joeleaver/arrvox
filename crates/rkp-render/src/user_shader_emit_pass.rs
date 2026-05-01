@@ -44,22 +44,27 @@ use crate::user_shader_pass::BucketPoolAllocator;
 /// binding sizing.
 pub const MAX_INSTANCE_REGIONS: u32 = 1024;
 
-/// Default per-region instance cap when a shader doesn't override.
-/// At stride 8 (32-byte struct) → 32 768 u32s reserved per region.
-pub const DEFAULT_MAX_INSTANCES_PER_REGION: u32 = 4096;
-
-/// Global instance pool capacity in u32s. 64 M u32s × 4 = 256 MB. At
-/// the default 4096-instance/region cap and stride 8, fits ~2000
-/// fully-packed regions; with overflow handling at the high-water
-/// mark, more partial regions fit before pressure shows.
+/// Global instance pool capacity in u32s. 64 M u32s × 4 = 256 MB.
+/// Phase 7b sizes per-region reservations as
+/// `leaves.len() × max_emits_per_thread × stride`, so a single dense
+/// painted region can run into the millions of u32s.
 pub const MAX_GLOBAL_INSTANCE_U32S: u32 = 64_000_000;
 
 /// Bucket bounds for the instance pool allocator, in u32 units.
 /// MIN of 64 = 8 instances at stride 8 (the smallest allocation we
 /// hand out — even a region that emits nothing reserves the bucket
 /// minimum). MAX caps how much one region can grab.
+///
+/// Phase 7b — bumped from 64 K to 4 M u32s. With deterministic slot
+/// allocation, a region's reservation = `leaves × max_emits × stride`,
+/// which can easily exceed 64 K for ordinary paint coverage (a 0.5 m
+/// brush blot at 4 cm cells emits ~1 K leaves; ×5 blades ×8-stride =
+/// ~40 K, and 5 such blots hit ~200 K). 4 M = 16 MB caps a single
+/// region at ~500 K instances at stride 8 / ~100 K painted leaves at
+/// `max_emits = 5`, comfortably above realistic dense paint while
+/// keeping bucket-rounding waste bounded (max 50 % of 16 MB).
 pub const INSTANCE_BUCKET_MIN: u32 = 64;
-pub const INSTANCE_BUCKET_MAX: u32 = 65536;
+pub const INSTANCE_BUCKET_MAX: u32 = 4_194_304;
 
 /// Overflow buffer — must be large enough for the highest
 /// `OVERFLOW_*` slot the WGSL emits to. Today only
@@ -120,10 +125,16 @@ pub struct InstanceRegionRequest {
     /// shader's parsed `InstanceLayout` total_size. Cache keying
     /// folds this in so a stride change forces re-allocation.
     pub stride_u32: u32,
-    /// Max instances this region may emit. Defaults to
-    /// [`DEFAULT_MAX_INSTANCES_PER_REGION`]; user override comes
-    /// from a future `@max_instances_per_region` directive (TBD).
+    /// Max instances this region may emit. Phase 7b sizes this as
+    /// `leaves.len() × max_emits_per_thread` so deterministic slot
+    /// allocation has room for every potential emit. Bucket-rounded by
+    /// the pool allocator before the GPU sees it.
     pub max_instances: u32,
+    /// Phase 7b — per-thread emit cap. Mirrors the shader's
+    /// `@max_emits_per_thread` directive (default 1). The TLAS builder
+    /// emits `leaves.len() × max_emits_per_thread` per-leaf entries so
+    /// slot K maps deterministically back to leaf `K / max_emits`.
+    pub max_emits_per_thread: u32,
     /// Host octree info — same fields the geom pipeline carries.
     pub host_octree_root: u32,
     pub host_octree_depth: u32,
@@ -754,6 +765,7 @@ mod tests {
             tile_index: NO_TILE,
             stride_u32,
             max_instances,
+            max_emits_per_thread: 1,
             host_octree_root: HOST_NO_HOST_SENTINEL,
             host_octree_depth: 0,
             host_octree_extent: 0.0,

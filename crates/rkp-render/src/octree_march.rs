@@ -66,6 +66,61 @@ pub struct MarchParams {
     /// itself doesn't read TLAS yet; the field replaces the previous
     /// `_pad` slot.
     pub tlas_node_count: u32,
+
+    // ── Phase 7d — directional shadow tile cull ──────────────────
+    /// `1` if the engine populated the shadow_tile_bitmap this
+    /// frame; `0` skips the cull (e.g., no directional light, or
+    /// the bitmap pass was disabled). Shadow trace gates on this.
+    pub shadow_tile_enabled: u32,
+    /// Index in `lights[]` of the directional light the bitmap was
+    /// built for. Other lights take the full BVH path.
+    pub shadow_tile_light_idx: u32,
+    pub shadow_tile_grid_w: u32,
+    pub shadow_tile_grid_h: u32,
+    /// World-space origin of the light-space coordinate system.
+    /// Mirrors `ShadowTileUniform.light_origin`.
+    pub shadow_tile_origin: [f32; 3],
+    /// Tile size in world units.
+    pub shadow_tile_size: f32,
+    pub shadow_tile_right: [f32; 3],
+    pub _pad0: u32,
+    pub shadow_tile_up: [f32; 3],
+    pub _pad1: u32,
+}
+
+/// Phase 7d — packed shadow tile cull parameters passed to
+/// `OctreeMarchPass::dispatch` per frame. Mirrors the same fields
+/// the engine uploads into [`crate::shadow_tile_cull_pass::ShadowTileUniform`]
+/// so the mark pass and shadow trace see consistent geometry.
+#[derive(Debug, Clone, Copy)]
+pub struct ShadowTileCullParams {
+    pub enabled: u32,
+    pub light_idx: u32,
+    pub grid_w: u32,
+    pub grid_h: u32,
+    pub origin: [f32; 3],
+    pub tile_size: f32,
+    pub right: [f32; 3],
+    pub up: [f32; 3],
+}
+
+impl ShadowTileCullParams {
+    /// Sentinel for frames without an active shadow-tile bitmap
+    /// (no directional light, or the cull pass was skipped). The
+    /// shadow trace gates on `enabled == 0` and falls back to the
+    /// full BVH path.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: 0,
+            light_idx: 0,
+            grid_w: 0,
+            grid_h: 0,
+            origin: [0.0; 3],
+            tile_size: 1.0,
+            right: [1.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+        }
+    }
 }
 
 /// The octree ray march compute pass.
@@ -133,6 +188,10 @@ pub struct OctreeMarchPass {
     /// shadow trace's use.
     tlas_nodes_buffer: Option<wgpu::Buffer>,
     tlas_leaves_buffer: Option<wgpu::Buffer>,
+    /// Phase 7d — shadow tile cull bitmap. The shadow trace's
+    /// directional-light path looks up its tile bit before
+    /// descending the BVH; bit clear → skip.
+    shadow_tile_bitmap_buffer: Option<wgpu::Buffer>,
     /// Lights buffer (shared with shade pass).
     lights_buffer: Option<wgpu::Buffer>,
     /// Materials buffer reference for bind group rebuild.
@@ -291,6 +350,22 @@ impl OctreeMarchPass {
                         },
                         count: None,
                     },
+                    // Binding 10: shadow tile bitmap (Phase 7d).
+                    // 2 KB u32 array. Per-pixel directional shadow
+                    // ray short-circuits the BVH descent when its
+                    // tile bit is 0. Read by the shadow trace; the
+                    // primary octree march doesn't read it (naga
+                    // DCE drops the binding from the march SPIR-V).
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 10,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -400,6 +475,7 @@ impl OctreeMarchPass {
             us_tile_scatter_cursor_capacity: 256,
             tlas_nodes_buffer: None,
             tlas_leaves_buffer: None,
+            shadow_tile_bitmap_buffer: None,
             lights_buffer: None,
             materials_buffer: None,
         }
@@ -417,6 +493,19 @@ impl OctreeMarchPass {
     ) {
         self.tlas_nodes_buffer = Some(nodes_buffer.clone());
         self.tlas_leaves_buffer = Some(leaves_buffer.clone());
+        self.try_rebuild_params_bind_group(device);
+    }
+
+    /// Phase 7d — set the shadow tile bitmap buffer. Call after
+    /// `ShadowTileCullPass::new`; the buffer handle is stable so a
+    /// single call suffices unless the engine reconstructs the
+    /// pass.
+    pub fn set_shadow_tile_buffer(
+        &mut self,
+        device: &wgpu::Device,
+        bitmap_buffer: &wgpu::Buffer,
+    ) {
+        self.shadow_tile_bitmap_buffer = Some(bitmap_buffer.clone());
         self.try_rebuild_params_bind_group(device);
     }
 
@@ -474,11 +563,18 @@ impl OctreeMarchPass {
     }
 
     fn try_rebuild_params_bind_group(&mut self, device: &wgpu::Device) {
-        let (Some(materials_buffer), Some(lights_buffer), Some(tlas_nodes), Some(tlas_leaves)) = (
+        let (
+            Some(materials_buffer),
+            Some(lights_buffer),
+            Some(tlas_nodes),
+            Some(tlas_leaves),
+            Some(shadow_tile_bitmap),
+        ) = (
             &self.materials_buffer,
             &self.lights_buffer,
             &self.tlas_nodes_buffer,
             &self.tlas_leaves_buffer,
+            &self.shadow_tile_bitmap_buffer,
         ) else { return };
         self.params_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("march params+materials bind group"),
@@ -523,6 +619,10 @@ impl OctreeMarchPass {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: tlas_leaves.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: shadow_tile_bitmap.as_entire_binding(),
                 },
             ],
         }));
@@ -772,6 +872,7 @@ impl OctreeMarchPass {
         surfacenet_enabled: bool,
         tile_count_x: u32,
         tlas_node_count: u32,
+        shadow_tile_cull: ShadowTileCullParams,
         timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) {
         // Update params.
@@ -784,6 +885,16 @@ impl OctreeMarchPass {
             surfacenet_enabled: if surfacenet_enabled { 1 } else { 0 },
             tile_count_x,
             tlas_node_count,
+            shadow_tile_enabled: shadow_tile_cull.enabled,
+            shadow_tile_light_idx: shadow_tile_cull.light_idx,
+            shadow_tile_grid_w: shadow_tile_cull.grid_w,
+            shadow_tile_grid_h: shadow_tile_cull.grid_h,
+            shadow_tile_origin: shadow_tile_cull.origin,
+            shadow_tile_size: shadow_tile_cull.tile_size,
+            shadow_tile_right: shadow_tile_cull.right,
+            _pad0: 0,
+            shadow_tile_up: shadow_tile_cull.up,
+            _pad1: 0,
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
 

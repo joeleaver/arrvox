@@ -78,9 +78,21 @@ struct EmitRegionUniform {
 }
 
 @group(0) @binding(0) var<storage, read_write> instance_pool: array<u32>;
-// Per-region atomic counter — array length = MAX_REGIONS on Rust side.
+// Per-region "live count" array — length = MAX_REGIONS on Rust side.
 // Indexed by `region_index` (carried by the dispatch's group(2) uniform).
-@group(0) @binding(1) var<storage, read_write> instance_alloc: array<atomic<u32>>;
+//
+// Phase 7b: this used to be an `atomic<u32>` that the per-shader
+// `rkp_user_<id>_emit_instance` body atomically incremented to claim a
+// slot. Slots are now deterministically `thread_id × max_emits_per_thread
+// + local_count`, so the emit path no longer touches this buffer. The
+// engine writes `leaves.len() × max_emits_per_thread` here CPU-side
+// before the AABB pass so the downstream tile cull's `i < alloc` skip
+// still works.
+//
+// Bound here as `read_write` purely so the wgpu binding layout matches
+// the previous version's resource flags — the shader doesn't write to
+// it anymore.
+@group(0) @binding(1) var<storage, read_write> instance_alloc: array<u32>;
 // All regions' painted leaves concatenated. The current dispatch's
 // region uniform carries `leaf_offset` / `leaf_count` to slice.
 @group(0) @binding(2) var<storage, read> leaves: array<PaintedLeaf>;
@@ -103,6 +115,16 @@ struct EmitDispatchUniform {
 // references.
 var<workgroup> region: EmitRegionUniform;
 var<workgroup> emit_region_index: u32;
+
+// Phase 7b — per-thread deterministic slot allocation. `emit_main`
+// initializes both at thread entry; `rkp_user_<id>_emit_instance`
+// computes its slot as `thread_id × MAX × local_count` and bumps
+// `rkp_emit_local_count` on each successful emit. Both are
+// `var<private>`, which in WGSL means per-invocation storage — exactly
+// what we want here (separate from `var<workgroup>` which would be
+// shared by every thread in the workgroup).
+var<private> rkp_emit_thread_id: u32;
+var<private> rkp_emit_local_count: u32;
 
 // USER_EMIT_DISPATCH_BEGIN
 // Default identity stub — the Rust composer replaces this whole block
@@ -129,6 +151,11 @@ fn emit_main(
     if (leaf_idx >= dispatch_u.leaf_count) {
         return;
     }
+
+    // Phase 7b — bind the deterministic slot allocator's per-thread
+    // state for any emit_instance() call this thread makes.
+    rkp_emit_thread_id = leaf_idx;
+    rkp_emit_local_count = 0u;
 
     let leaf = leaves[region.leaf_offset + leaf_idx];
 
