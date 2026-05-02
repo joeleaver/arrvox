@@ -12,10 +12,9 @@
 
 use rkp_render::tlas_build_pass::{
     cpu_reference_morton, cpu_reference_radix_sort, scene_aabb_from_prims,
-    AssembleUserShaderUniform, MortonUniform, RadixUniform, TlasBuildPass, TlasPrim,
+    InstanceTileCullEntry, MortonUniform, RadixUniform, TlasBuildPass, TlasPrim,
     RADIX_BUCKETS, RADIX_PASSES, RADIX_WG_SIZE,
 };
-use rkp_render::user_shader_tile_cull_pass::InstanceTileCullEntry;
 
 fn create_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -445,8 +444,5 @@ fn radix_handles_single_prim() {
     vals_readback.unmap();
     assert_eq!(val0, 0u32, "single-prim sort should pass through prim_idx 0");
     // Quiet unused imports for the no-adapter branch.
-    let _ = (
-        std::any::type_name::<AssembleUserShaderUniform>(),
-        std::any::type_name::<InstanceTileCullEntry>(),
-    );
+    let _ = std::any::type_name::<InstanceTileCullEntry>();
 }

@@ -237,51 +237,14 @@ struct RenderState {
     /// Option B (voxel sprite instancing) — scene-wide pieces. The
     /// per-viewport march + composite live in [`ViewportRenderer`]
     /// (Stage 6c-2). All four pieces here are constructed at startup
-    /// and ticked per-frame even when no instance shader is registered;
-    /// each cache's `begin_frame` / `evict_untouched` is a cheap no-op
-    /// when no requests come in.
-    ///
-    /// `dead_code` allowance covers the bake/scatter pass + pool
-    /// buffer that Stage 6c-3.5 will start dispatching against; the
-    /// caches themselves ARE read (begin_frame / evict_untouched in
-    /// `tick_instance_pipeline`).
-    #[allow(dead_code)]
+    /// Phase B-redux — prototype bake pass + cache. The bake writes
+    /// each registered instance shader's prototype octree into the
+    /// host pool tail; the cache deduplicates by source hash so
+    /// re-bakes only happen on shader edit. The host march dispatches
+    /// `descend_proto_octree` against these prototypes when a band-
+    /// cell hit triggers `instance_at` derivation.
     instance_proto_pass: rkp_render::user_shader_proto_pass::PrototypeBakePass,
     instance_proto_cache: rkp_render::user_shader_proto_pass::PrototypeCache,
-    #[allow(dead_code)]
-    instance_emit_pass: rkp_render::user_shader_emit_pass::EmitPass,
-    instance_region_cache: rkp_render::user_shader_emit_pass::InstanceRegionCache,
-
-    /// Phase 6 Session 3 — tile-cull pipeline. Four passes that turn
-    /// the per-instance state in `instance_pool` into per-tile
-    /// `UserShaderTileEntry` lists the host march can iterate. Pure
-    /// side-effect during Session 3d (March doesn't yet read the
-    /// produced lists — Session 4 wires that consumer).
-    #[allow(dead_code)]
-    instance_tile_cull_pass: rkp_render::user_shader_tile_cull_pass::TileCullPass,
-    #[allow(dead_code)]
-    instance_tile_count_pass: rkp_render::user_shader_tile_count_pass::TileCountPass,
-    #[allow(dead_code)]
-    instance_tile_prefix_pass: rkp_render::user_shader_tile_prefix_pass::TilePrefixPass,
-    #[allow(dead_code)]
-    instance_tile_scatter_pass: rkp_render::user_shader_tile_scatter_pass::TileScatterPass,
-    /// Per-frame scratch buffer holding one
-    /// `InstanceTileCullEntry` (48 B) per reserved instance slot across
-    /// all regions. The AABB pass writes; count + scatter read.
-    /// Doesn't carry state across frames — overwritten in place every
-    /// frame, sized by the engine to current scratch totals.
-    instance_tile_cull_scratch_buffer: wgpu::Buffer,
-    /// Capacity of `instance_tile_cull_scratch_buffer` in entries.
-    instance_tile_cull_scratch_capacity_entries: u32,
-    /// Phase 6 Session 3d — shared uniform buffer for the per-VR
-    /// `TileCullViewportUniform` (96 B). Written before each VR's
-    /// count/scatter dispatch via `queue.write_buffer`; wgpu serializes
-    /// against the dispatches behind it on the same queue.
-    instance_tile_view_uniform_buffer: wgpu::Buffer,
-    /// Phase 6 Session 3d — shared uniform buffer for the per-VR
-    /// `PrefixUniform` (16 B). Written before each VR's prefix-sum
-    /// dispatch; same lifecycle as `instance_tile_view_uniform_buffer`.
-    instance_tile_prefix_uniform_buffer: wgpu::Buffer,
 
     /// Phase 7 — TLAS over instance AABBs. Session 2 ships the host
     /// CPU builder + GPU upload (called per frame from
@@ -295,25 +258,6 @@ struct RenderState {
     /// tlas_leaves into `tlas_pass`'s buffers (which the shadow
     /// trace already binds).
     tlas_build_pass: rkp_render::tlas_build_pass::TlasBuildPass,
-/// Stage 6c-3 — global `array<u32>` storage buffer holding all
-    /// scattered instance bytes. Each region's slice is bucket-allocated
-    /// inside [`InstanceRegionCache`] (which thinks in u32 units rooted
-    /// Cached u32 capacity of the scene's `instance_pool_buffer`.
-    /// Mirrors what was passed to `InstanceRegionCache::with_capacity`.
-    /// The buffer itself lives on `RkpScene::instance_pool_buffer`
-    /// (Phase 4c — bound at scene group binding(14) so the host march
-    /// can read it for shader-asset paths).
-    #[allow(dead_code)]
-    instance_pool_capacity_u32: u32,
-
-    /// Per-frame flat `array<PaintedLeaf>` storage buffer. Holds every
-    /// region's painted leaves concatenated end-to-end; the emit
-    /// shader's region uniform carries `leaf_offset`/`leaf_count` to
-    /// index into this. Grown to the high-water of total leaves.
-    instance_leaves_buffer: wgpu::Buffer,
-    /// Capacity of `instance_leaves_buffer` in `PaintedLeaf` entries
-    /// (32 B each).
-    instance_leaves_capacity_entries: u32,
 
     /// Pick readback target. 1×1 region of the gbuf_material at offset
     /// 0, 1×1 region of the gbuf_pick at offset 256 — both 256-byte
@@ -393,18 +337,16 @@ struct RenderState {
 const MIN_FRAME_CALLBACK_INTERVAL: std::time::Duration =
     std::time::Duration::from_micros(8_300);
 
-// Option B proto-cache pool capacities — Phase 4 sizes. Must match the
+// Phase B-redux proto-cache pool capacities. Must match the
 // `PROTO_TAIL_*_BYTES` reservation `tick_instance_pipeline` requests in
 // the host scene buffers. The cache sub-allocates octree slots within
 // `pool_octree_capacity`, and the bake's overflow check uses these to
 // gate out-of-bounds writes (via the global brick / leaf-attr cursors).
 //
-// Smaller than the pre-Phase-4 dedicated proto-buffer caps (32 M /
-// 256 K / 4 M) on purpose: the proto tail lives inside the host pool
-// alongside Phase C's much larger transient tail, so the proto budget
-// has to stay tight to keep the total under `max_buffer_size`. Authors
-// needing more proto headroom should reduce paint area or cell_size,
-// not these caps.
+// The proto tail lives inside the host pool alongside Phase C's much
+// larger transient tail, so the proto budget stays tight to keep the
+// total under `max_buffer_size`. Authors needing more proto headroom
+// should reduce paint area or cell_size, not these caps.
 const INSTANCE_PROTO_OCTREE_CAPACITY_U32: u32 =
     (rkp_render::user_shader_proto_pass::PROTO_TAIL_OCTREE_BYTES / 8) as u32; // 2 M nodes
 const INSTANCE_PROTO_BRICK_CAPACITY_BRICKS: u32 =
@@ -443,89 +385,23 @@ impl RenderState {
         let user_shader_pass = rkp_render::user_shader_pass::UserShaderPass::new(&device);
         let user_shader_cache = rkp_render::user_shader_pass::UserShaderObjectCache::new();
 
-        // Option B instance-pipeline scene-wide pieces. Stages 6c-1/2/3
-        // wire them into RenderState; Stages 6c-3.5b/c add the per-frame
-        // dispatch + per-viewport march/composite encoding.
+        // Phase B-redux instance prototype bake pass + cache. Scene
+        // dispatches the bake when an instance shader's source hash
+        // changes; the cache deduplicates per-shader prototype slots
+        // in the host pool tail. Idle until the first instance shader
+        // registers.
         let instance_proto_pass =
             rkp_render::user_shader_proto_pass::PrototypeBakePass::new(&device);
-        // V1 proto-cache pool capacities — much smaller than the library
-        // defaults (PROTO_OCTREE_POOL_CAPACITY = 1.3M / etc., which would
-        // demand ~530 MB of additional buffer space on top of the
-        // user-shader tail). At these caps a project can register up to
-        // ~16 small instance shaders at depth 2-3 — plenty for early
-        // development. Stage 6e (perf) raises if a real workload bumps
-        // the high water. See module-level consts above.
         let instance_proto_cache =
             rkp_render::user_shader_proto_pass::PrototypeCache::with_capacities(
                 INSTANCE_PROTO_OCTREE_CAPACITY_U32,
                 INSTANCE_PROTO_BRICK_CAPACITY_BRICKS,
                 INSTANCE_PROTO_LEAF_ATTR_CAPACITY_U32,
             );
-        let instance_emit_pass =
-            rkp_render::user_shader_emit_pass::EmitPass::new(&device);
-        // Phase 6 Session 3d — tile-cull GPU pipeline. Four compute
-        // passes; bake/emit feed `instance_pool`, this pipeline turns
-        // it into per-tile lists for the host march. Constructed
-        // unconditionally so the pipelines exist when the first
-        // user-shader region appears; they sit idle until then.
-        let instance_tile_cull_pass =
-            rkp_render::user_shader_tile_cull_pass::TileCullPass::new(&device);
-        let instance_tile_count_pass =
-            rkp_render::user_shader_tile_count_pass::TileCountPass::new(&device);
-        let instance_tile_prefix_pass =
-            rkp_render::user_shader_tile_prefix_pass::TilePrefixPass::new(&device);
-        let instance_tile_scatter_pass =
-            rkp_render::user_shader_tile_scatter_pass::TileScatterPass::new(&device);
-        // Initial scratch buffer — single-entry placeholder. Grown per
-        // frame by `tick_instance_pipeline` when scatter totals exceed
-        // capacity.
-        const INSTANCE_TILE_CULL_INITIAL_ENTRIES: u32 = 1;
-        let instance_tile_cull_scratch_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("inst tile_cull_scratch"),
-            size: (INSTANCE_TILE_CULL_INITIAL_ENTRIES as u64) * 48,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let instance_tile_view_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("inst tile_view_uniform"),
-            size: std::mem::size_of::<rkp_render::user_shader_tile_count_pass::TileCullViewportUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let instance_tile_prefix_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("inst tile_prefix_uniform"),
-            size: std::mem::size_of::<rkp_render::user_shader_tile_prefix_pass::PrefixUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        // Phase 7 Session 1 — TLAS foundation. Empty buffers + no
-        // builder yet; Sessions 2-4 plumb in the actual BVH.
+        // Phase 7 Session 1 — TLAS foundation.
         let tlas_pass = rkp_render::tlas_pass::TlasPass::new(&device);
-        // Phase 7c — GPU TLAS build pipeline. Owns assembly +
-        // Morton + radix + Karras + propagate compute pipelines.
+        // Phase 7c — GPU TLAS build pipeline.
         let tlas_build_pass = rkp_render::tlas_build_pass::TlasBuildPass::new(&device);
-// The instance_pool_buffer lives on RkpScene now (bound at
-        // scene group binding(14) so the host march can read it for
-        // shader-asset paths). Capacity is set in rkp_scene.rs via
-        // INSTANCE_POOL_CAPACITY_U32.
-        let mut instance_region_cache =
-            rkp_render::user_shader_emit_pass::InstanceRegionCache::with_capacity(
-                rkp_render::rkp_scene::INSTANCE_POOL_CAPACITY_U32,
-            );
-        // Pool base = 0 — the cache's `instance_block_offset` values
-        // are absolute u32 indices into `instance_pool_buffer`.
-        instance_region_cache.set_pool_base(0);
-
-        // Per-frame flat `array<PaintedLeaf>` for the emit shader.
-        // Sized to a single 32 B entry at startup; grown by
-        // `tick_instance_pipeline` when paint accumulates.
-        const INSTANCE_LEAVES_INITIAL_ENTRIES: u32 = 1;
-        let instance_leaves_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("inst leaves"),
-            size: (INSTANCE_LEAVES_INITIAL_ENTRIES as u64) * 32,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
 
         Self {
             device,
@@ -537,21 +413,8 @@ impl RenderState {
             user_shader_cache,
             instance_proto_pass,
             instance_proto_cache,
-            instance_emit_pass,
-            instance_region_cache,
-            instance_tile_cull_pass,
-            instance_tile_count_pass,
-            instance_tile_prefix_pass,
-            instance_tile_scatter_pass,
-            instance_tile_cull_scratch_buffer,
-            instance_tile_cull_scratch_capacity_entries: INSTANCE_TILE_CULL_INITIAL_ENTRIES,
-            instance_tile_view_uniform_buffer,
-            instance_tile_prefix_uniform_buffer,
             tlas_pass,
             tlas_build_pass,
-            instance_pool_capacity_u32: rkp_render::rkp_scene::INSTANCE_POOL_CAPACITY_U32,
-            instance_leaves_buffer,
-            instance_leaves_capacity_entries: INSTANCE_LEAVES_INITIAL_ENTRIES,
             pick_readback_buffer,
             pick_in_flight: None,
             curr_snap: None,
@@ -1189,19 +1052,18 @@ fn render_one_frame(
     //       shifts up to account for them so its per-instance
     //       `asset_id` references stay correct after splicing.
     let asset_id_base =
-        frame.gpu_assets.len() as u32 + inst_result.user_shader_assets.len() as u32;
+        frame.gpu_assets.len() as u32 + inst_result.len() as u32;
     let (transient_assets, transient_instances) =
         run_user_shader_geom(state, frame, asset_id_base);
 
     let mut combined_assets: Vec<rkp_render::rkp_gpu_object::RkpGpuAsset>;
     let mut combined_instances: Vec<rkp_render::rkp_gpu_object::RkpGpuInstance>;
-    // Phase 6 Session 4d — `inst_result.user_shader_instances` is gone.
-    // User-shader instance work flows through the GPU tile-cull pipeline
-    // (host march iterates `us_tile_entries[]` per tile). Only the
-    // user-shader ASSETS still need to be in the combined assets vec
-    // — each tile entry's `asset_id` indexes them.
-    let need_combine = !inst_result.user_shader_assets.is_empty()
-        || !transient_instances.is_empty();
+    // Phase B-redux — `inst_result` is the per-shader instance-prototype
+    // asset list. No host instances reference these directly; the band-
+    // cell descent path resolves them by `shader_id` linear scan when a
+    // band hit fires `descend_proto_octree`. Splice into the assets vec
+    // so that scan finds them.
+    let need_combine = !inst_result.is_empty() || !transient_instances.is_empty();
     let (assets_for_upload, instances_for_upload): (
         &[rkp_render::rkp_gpu_object::RkpGpuAsset],
         &[rkp_render::rkp_gpu_object::RkpGpuInstance],
@@ -1210,11 +1072,11 @@ fn render_one_frame(
     } else {
         combined_assets = Vec::with_capacity(
             frame.gpu_assets.len()
-                + inst_result.user_shader_assets.len()
+                + inst_result.len()
                 + transient_assets.len(),
         );
         combined_assets.extend_from_slice(&frame.gpu_assets);
-        combined_assets.extend_from_slice(&inst_result.user_shader_assets);
+        combined_assets.extend_from_slice(&inst_result);
         combined_assets.extend_from_slice(&transient_assets);
         combined_instances = Vec::with_capacity(
             gpu_instances.len() + transient_instances.len(),
@@ -1254,8 +1116,6 @@ fn render_one_frame(
     //      / `assets_buffer`. (Tile-cull scratch was populated
     //      earlier by `tick_instance_pipeline`.)
     let scene_aabb = compute_tlas_scene_aabb(
-        &inst_result.user_shader_region_pool_info,
-        frame,
         instances_for_upload,
         assets_for_upload,
     );
@@ -1285,8 +1145,6 @@ fn render_one_frame(
     let host_count = instances_for_upload.len() as u32;
     let asset_count = assets_for_upload.len() as u32;
     let tlas_inputs = rkp_render::tlas_build_pass::GpuTlasBuildInputs {
-        scratch_buffer: &state.instance_tile_cull_scratch_buffer,
-        scratch_count: inst_result.tile_cull_scratch_count,
         instances_buffer: &state.renderer.scene.objects_buffer,
         instance_count: host_count,
         assets_buffer: &state.renderer.scene.assets_buffer,
@@ -1460,31 +1318,6 @@ fn render_one_frame(
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("rkp viewport"),
             });
-
-        // 3f.5. Phase 6 Session 3d — per-VR user-shader tile-cull
-        //       dispatch chain (count → prefix → scatter). Side-effect
-        //       only during Session 3d: writes per-tile entry lists
-        //       into `vr.march.us_tile_offsets/entries`, but the host
-        //       march doesn't yet iterate them (Session 4). Skipped
-        //       when no user-shader instances ran this frame.
-        if inst_result.tile_cull_scratch_count > 0 {
-            // Disjoint borrow of state's tile-cull fields so they
-            // don't conflict with the outer `vr` (which holds a
-            // &mut borrow on `state.viewport_renderers`).
-            let args = UsTileCullArgs {
-                device: &state.device,
-                queue: &state.queue,
-                renderer: &mut state.renderer,
-                scratch_buffer: &state.instance_tile_cull_scratch_buffer,
-                view_uniform_buffer: &state.instance_tile_view_uniform_buffer,
-                prefix_uniform_buffer: &state.instance_tile_prefix_uniform_buffer,
-                tile_count_pass: &state.instance_tile_count_pass,
-                tile_prefix_pass: &state.instance_tile_prefix_pass,
-                tile_scatter_pass: &state.instance_tile_scatter_pass,
-            };
-            dispatch_us_tile_cull_inner(args, vr, &mut encoder, &camera,
-                vp.width, vp.height, inst_result.tile_cull_scratch_count);
-        }
 
         // 3g. Procedural raymarch upload (instructions + outline + ghosts)
         //     when this VR is in raymarch preview mode.
@@ -1879,50 +1712,13 @@ fn merge_tile_lists(
     (new_offsets, new_ids)
 }
 
-/// Stage 6c-3.5c — per-frame tick for the Option B instance pipeline.
-///
-/// Sequence (executed every frame, runs BEFORE `run_user_shader_geom`
-/// so the proto-pool buffer reservation stacks cleanly with the
-/// user-shader-cache reservation):
-///
-///   1. Reload bake + emit pipelines (idempotent on source-hash match).
-///   2. `begin_frame` both caches.
-///   3. Early-out if no instance shaders are registered AND the request
-///      list is empty.
-///   4. Snapshot `cpu_*_bytes` from scene_mgr.
-///   5. Reserve `cpu + user_shader_max + proto_max` on the scene
-///      buffers (one ensure call per pool). Re-upload geometry +
-///      face-links init on realloc — same shape as `run_user_shader_geom`.
-///   6. Configure `instance_proto_cache.set_pool_bases(...)` with
-///      offsets pointing AFTER the user-shader tail.
-///   7. Walk requests:
-///      - `instance_proto_cache.lookup_or_allocate(...)` — queue bake
-///        when dirty.
-///      - `instance_region_cache.lookup_or_allocate(...)` — V1 always
-///        queues scatter (the march reads `instance_alloc[region_index]`
-///        per frame; skipping non-dirty regions while their region_index
-///        rotates would corrupt the count).
-///   8. Encode bake + scatter into ONE local encoder + queue.submit.
-///      Submit-ordering ensures these complete before the per-VR
-///      encoders' march reads from the same buffers.
-///   9. `evict_untouched` both caches.
-///
-/// Phase 7c — derive a conservative scene AABB CPU-side for the
-/// GPU TLAS build's Morton normalization. Unions:
-///
-///  * Each user-shader region's authoring AABB (a tight bound on
-///    every per-blade AABB the region's shader can produce, since
-///    `inst_aabb` is constrained by `region_thickness` around the
-///    painted surface).
-///  * Each host instance's transformed asset AABB (Arvo).
-///
-/// Returns `(min, max)`. Falls back to `[0,0,0] → [1,1,1]` for
-/// empty input — the Morton dispatch's `extent.max(1e-6)` clamp
-/// prevents divide-by-zero, and the empty-TLAS skip gates the
-/// downstream chain anyway.
+/// Phase 5.2 — derive a conservative scene AABB for the GPU TLAS
+/// build's Morton normalization. Walks the host instances' transformed
+/// asset AABBs (Arvo). Returns `(min, max)`; falls back to
+/// `[0,0,0] → [1,1,1]` for empty input — the Morton dispatch's
+/// `extent.max(1e-6)` clamp prevents divide-by-zero, and the empty-
+/// TLAS skip gates the downstream chain anyway.
 fn compute_tlas_scene_aabb(
-    user_shader_regions: &[UserShaderRegionPoolInfo],
-    frame: &RenderFrame,
     instances: &[rkp_render::rkp_gpu_object::RkpGpuInstance],
     assets: &[rkp_render::rkp_gpu_object::RkpGpuAsset],
 ) -> ([f32; 3], [f32; 3]) {
@@ -1930,20 +1726,10 @@ fn compute_tlas_scene_aabb(
     let mut max = [f32::NEG_INFINITY; 3];
     let mut any = false;
 
-    for region in user_shader_regions {
-        let req = &frame.instance_region_requests[region.request_index as usize];
-        for ax in 0..3 {
-            if req.aabb_min[ax] < min[ax] { min[ax] = req.aabb_min[ax]; }
-            if req.aabb_max[ax] > max[ax] { max[ax] = req.aabb_max[ax]; }
-        }
-        any = true;
-    }
-
     for inst in instances {
         let asset_id = inst.asset_id as usize;
         if asset_id >= assets.len() { continue; }
         let asset = &assets[asset_id];
-        if asset.shader_id != 0 { continue; }  // user-shader path
         let (wmin, wmax) = transform_aabb_world(asset.aabb_min, asset.aabb_max, &inst.world);
         for ax in 0..3 {
             if wmin[ax] < min[ax] { min[ax] = wmin[ax]; }
@@ -1958,9 +1744,8 @@ fn compute_tlas_scene_aabb(
     (min, max)
 }
 
-/// Arvo's transform-AABB. Mirrors
-/// `tlas_pass.rs::transform_aabb`. Used by the TLAS scene-AABB
-/// helper above.
+/// Arvo's transform-AABB. Mirrors `tlas_pass.rs::transform_aabb`. Used
+/// by the TLAS scene-AABB helper above.
 fn transform_aabb_world(
     local_min: [f32; 3],
     local_max: [f32; 3],
@@ -1979,28 +1764,19 @@ fn transform_aabb_world(
     (new_min, new_max)
 }
 
-/// Phase 8 — derive the directional light camera + write the
-/// per-VR LightCameraUniform. Returns `true` when the shadow map
-/// will be live this frame (directional light present + non-empty
-/// TLAS), which is the gate the shade pass uses to swap from the
-/// half-res ray-traced shadow path to the shadow-map sample.
+/// Phase 8 V3 disabled — voxel-stepped shadow-map silhouettes were
+/// worse quality than `rkp_shadow_trace`'s per-pixel ray-traced path,
+/// and the floor's per-texel descent cost made the pipeline slower
+/// than the path it was meant to replace. Always returning `false`
+/// here skips the shadow_map dispatch chain, leaves
+/// `ShadeParams.shadow_map_enabled = 0`, and routes directional
+/// lights through `shadow_data[]` — the same path point/spot lights
+/// already use.
 ///
-/// Picks the first directional light it finds. Multi-directional
-/// support comes later (CSM / per-light maps).
-/// Phase 8 V3 disabled — voxel-stepped shadow-map silhouettes
-/// were worse quality than `rkp_shadow_trace`'s per-pixel ray-
-/// traced path, and the floor's per-texel descent cost made the
-/// pipeline slower than the path it was meant to replace. Always
-/// returning `false` here skips the shadow_map dispatch chain,
-/// leaves `ShadeParams.shadow_map_enabled = 0`, and routes
-/// directional lights through `shadow_data[]` — the same path
-/// point/spot lights already use.
-///
-/// All shadow_map_pass.rs + scatter shader code is kept in tree
-/// in case a follow-up revisits with a fundamentally different
-/// shadow representation (mesh extraction from voxel data, CSM,
-/// VSM, or analytic AO). To re-enable: replace this with the
-/// frustum-fit walk from commit 0a6aeed.
+/// All shadow_map_pass.rs + scatter shader code is kept in tree in
+/// case a follow-up revisits with a fundamentally different shadow
+/// representation. To re-enable: replace this with the frustum-fit
+/// walk from commit 0a6aeed.
 fn prepare_shadow_maps(
     _state: &mut RenderState,
     _frame: &RenderFrame,
@@ -2010,15 +1786,30 @@ fn prepare_shadow_maps(
     false
 }
 
-/// Phase 5 retired Option B's per-frame TileIndex + ProtoLookup
-/// upload — the host march doesn't need either since it routes
-/// through `asset.shader_id` + `inst.instance_state_offset` directly.
-fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> InstancePipelineResult {
-    use rkp_render::user_shader_emit_pass::{
-        build_emit_region_uniform, resolve_instance_shader,
-        workgroups_for_leaf_count, EmitDispatchUniform, EMIT_DISPATCH_UNIFORM_STRIDE,
-        PaintedLeaf,
-    };
+/// Phase B-redux per-frame tick — bake user-shader prototypes into the
+/// host pool tail and register one [`RkpGpuAsset`] per registered
+/// instance shader so the band-cell descent path can resolve the
+/// prototype by `shader_id`. Phase 5 retired Option B's per-pixel
+/// emit/cull/scatter pipeline; this is the surviving half.
+///
+/// Sequence (runs BEFORE `run_user_shader_geom` so the proto-pool
+/// buffer reservation stacks cleanly with the user-shader-cache
+/// reservation):
+///   1. Reload the bake pipeline (idempotent on source-hash match).
+///   2. `begin_frame` on the proto cache.
+///   3. Dedup the band regions' shaders that need a baked prototype.
+///   4. Snapshot `cpu_*_bytes` from scene_mgr.
+///   5. Reserve `cpu + proto_max (+ phase_c_max)` on the scene
+///      buffers. Re-upload geometry on realloc.
+///   6. Configure proto pool bases.
+///   7. Walk needed shaders, look up cache, queue dirty bakes,
+///      register one [`RkpGpuAsset`] per shader.
+///   8. Encode bake dispatches into a local encoder + submit.
+///   9. `evict_untouched` to drop unreferenced cache entries.
+fn tick_instance_pipeline(
+    state: &mut RenderState,
+    frame: &RenderFrame,
+) -> Vec<rkp_render::rkp_gpu_object::RkpGpuAsset> {
     use rkp_render::user_shader_proto_pass::{
         build_internal_levels, PrototypeUniform, MAX_PROTO_MAX_DEPTH,
         PROTO_TAIL_OCTREE_BYTES, PROTO_TAIL_BRICK_BYTES, PROTO_TAIL_LEAF_ATTR_BYTES,
@@ -2026,6 +1817,7 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
     use rkp_render::user_shader_pass::{
         BRICK_CELLS, MAX_GLOBAL_BRICKS, MAX_GLOBAL_LEAF_ATTRS, MAX_GLOBAL_OCTREE_NODES,
     };
+    use rkp_render::rkp_gpu_object::{geom_type, RkpGpuAsset};
     use rkp_core::brick_pool::BRICK_DIM;
 
     // 1. Pipeline reload — cheap when source hash unchanged.
@@ -2034,42 +1826,39 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
         &frame.user_shader_proto_chunk,
         frame.user_shader_source_hash,
     );
-    state.instance_emit_pass.reload_user_shaders(
-        &state.device,
-        &frame.user_shader_emit_chunk,
-        frame.user_shader_source_hash,
-    );
-    // Phase 5 — Option B's per-pixel `instance_march_pass` is gone;
-    // host march reloads instead via `vr.march.reload_user_shaders`
-    // earlier in the per-VR loop (see lifecycle.rs).
 
-    // 2. Mark cache entries untouched.
+    // 2. Mark cache untouched.
     state.instance_proto_cache.begin_frame();
-    state.instance_region_cache.begin_frame();
 
-    // 3. Early-out when there are no requests this frame. The
-    //    user_shader-tail + proto-pool reservations below grow
-    //    `brick_pool_buffer` / `leaf_attr_pool_buffer` by ~768 MB
-    //    (`MAX_GLOBAL_BRICKS × 64 × 4`) plus a small proto sub-pool;
-    //    on scenes whose CPU brick footprint already runs into the
-    //    hundreds of MB this pushes past the 1 GB
-    //    `max_storage_buffer_binding_size` we request, leaving the
-    //    reallocated buffers in an invalid state. Reserve lazily —
-    //    same shape as `run_user_shader_geom`'s `regions.is_empty()`
-    //    early-out — so we only pay the cost when there's actual
-    //    instance work to dispatch.
-    if frame.instance_region_requests.is_empty() {
+    // 3. Dedup the band-region shaders that need a baked prototype.
+    //    Phase B-redux: prototypes feed `descend_proto_octree` at march
+    //    time on band-cell hits. One asset per registered instance shader.
+    let mut needed: Vec<(u32, u32)> = Vec::new();
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for req in &frame.user_shader_regions {
+        if !req.is_band_region { continue; }
+        let Some(entry) = frame
+            .user_shader_entries
+            .iter()
+            .find(|e| e.name == req.shader_name)
+        else { continue; };
+        if !seen.insert(entry.id) { continue; }
+        let info = frame
+            .user_shader_infos
+            .iter()
+            .find(|i| i.name == req.shader_name);
+        let max_depth = info
+            .and_then(|i| i.max_depth)
+            .unwrap_or(2)
+            .min(MAX_PROTO_MAX_DEPTH);
+        needed.push((entry.id, max_depth));
+    }
+    if needed.is_empty() {
         state.instance_proto_cache.evict_untouched();
-        state.instance_region_cache.evict_untouched();
-        return InstancePipelineResult {
-            user_shader_assets: Vec::new(),
-            tile_cull_scratch_count: 0,
-            user_shader_region_pool_info: Vec::new(),
-        };
+        return Vec::new();
     }
 
-    // 4. Snapshot `cpu_*_bytes` from scene_mgr — same shape as
-    //    `run_user_shader_geom` step 3.
+    // 4. Snapshot cpu_*_bytes from scene_mgr.
     let (cpu_octree_bytes, cpu_brick_bytes, cpu_leaf_attr_bytes, cpu_face_links_bytes) = {
         let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
         let g = sm.geometry_upload();
@@ -2080,30 +1869,11 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             g.brick_face_links.len() as u64,
         )
     };
-    // 5. Phase 4 — reserve the proto tail in the host scene buffers
-    //    (between CPU asset data and Phase C's per-frame transient
-    //    tail). Putting proto data in the host pools means the host
-    //    march descends a baked user-shader instance asset via its
-    //    existing `octree_nodes_buffer` / `brick_pool_buffer` /
-    //    `leaf_attr_pool_buffer` bindings — no "which pool?"
-    //    indirection in the shader.
-    //
-    //    Sized small (16 + 16 + 8 MB) on purpose: the previous attempt
-    //    to layer proto onto cpu + Phase C's huge transient (~768 MB
-    //    on the brick buffer) breached the 1 GB binding cap and was
-    //    rolled back. Tight proto-tail caps stay well within budget.
-    // Reserve the three-tier envelope here. The Phase C transient size
-    // only matters if Phase C will actually dispatch this frame —
-    // run_user_shader_geom early-exits when `user_shader_regions` is
-    // empty, in which case its `ensure_pool_layout` call never runs, so
-    // we don't need to leave room for its extras. Mirror that gate
-    // here: include extras IFF Phase C has work, else just `cpu + proto`.
-    //
-    // Without this gate, sizing for Phase C's extras (~1 GB on the
-    // brick buffer at MAX_GLOBAL_BRICKS = 3M) breaches `max_buffer_size`
-    // on devices that don't support a full 2 GB binding. Pre-Phase-4
-    // tick_instance_pipeline didn't grow the host buffer at all, so the
-    // breach only surfaces now that we route proto data into it.
+
+    // 5. Reserve proto tail (and Phase C extras when active). Without
+    //    the gate, sizing for Phase C's extras (~1 GB on the brick
+    //    buffer at MAX_GLOBAL_BRICKS = 3M) breaches `max_buffer_size`
+    //    on devices that don't support a full 2 GB binding.
     let phase_c_active = !frame.user_shader_regions.is_empty();
     let extra_octree: u64 = if phase_c_active {
         MAX_GLOBAL_OCTREE_NODES as u64 * 8
@@ -2128,17 +1898,11 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
         cpu_face_links_bytes, proto_face_links_bytes, extra_face_links,
     );
     if realloc {
-        // A reallocation invalidates any persistent baked data and
-        // forces a full geometry re-upload — the buffer's identity
-        // changed.
         let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
         let g = sm.geometry_upload();
         state.renderer.upload_geometry(&state.queue, &g);
         state.last_uploaded_geometry_epoch = sm.geometry_epoch();
         drop(sm);
-        // Initialize the proto + Phase C face_links regions to FACE_EMPTY
-        // (mirrors run_user_shader_geom's existing init for the Phase C
-        // tail). Both regions sit past `cpu_face_links_bytes`.
         const FACE_EMPTY: u32 = 0xFFFFFFFFu32;
         const FACE_INIT_CHUNK: usize = 4 * 1024 * 1024;
         let chunk_data: Vec<u32> = vec![FACE_EMPTY; FACE_INIT_CHUNK];
@@ -2156,9 +1920,8 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
         }
     }
 
-    // 6. Configure proto pool bases to point at the host pool tails.
-    //    Element units (octree slot, brick id, leaf-attr slot) — match
-    //    what `RkpGpuAsset.octree_root` / brick_id pointers use.
+    // 6. Configure proto pool bases — element units (octree slot,
+    //    brick id, leaf-attr slot).
     let proto_octree_base_elems = (cpu_octree_bytes / 8) as u32;
     let proto_brick_base_bricks =
         (cpu_brick_bytes / 4 / BRICK_CELLS as u64) as u32;
@@ -2168,9 +1931,6 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
         proto_brick_base_bricks,
         proto_leaf_attr_base_elems,
     );
-    // On bases-changed (or first frame, or buffer realloc), reset the
-    // GPU cursors to the new bases so the next bake's atomic-bumps
-    // produce slot ids inside the proto reservation.
     if bases_changed || realloc {
         state.instance_proto_pass.reset_cursors(
             &state.queue,
@@ -2179,85 +1939,17 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
         );
     }
 
-    // 7. Walk requests, look up cache, gather dirty bakes + scatters.
+    // 7. Walk needed shaders, queue dirty bakes, register one
+    //    `RkpGpuAsset` per shader so the host march can resolve the
+    //    prototype by linear scan on `shader_id`.
     struct DirtyBake {
         uniform: PrototypeUniform,
         max_depth: u32,
         octree_extent_offset: u32,
     }
-    struct Scatter {
-        region_uniform: rkp_render::user_shader_emit_pass::EmitRegionUniform,
-        region_index: u32,
-        leaf_count: u32,
-        /// Phase 7b — per-region live count written to
-        /// `instance_alloc[region]` CPU-side BEFORE the emit dispatch.
-        /// Used by the downstream tile cull's `i < alloc` skip. Equals
-        /// `leaves.len() × max_emits_per_thread`; slots beyond this
-        /// (the bucket-rounded tail of `instance_block_size`) are
-        /// truly unowned and the cull marks them dead.
-        instance_alloc_value: u32,
-        /// Phase 7b — `clear_buffer` range that pre-zeros this region's
-        /// slot reservation in `instance_pool` before the emit
-        /// dispatch. `(byte_offset, byte_size)`. Covers the whole
-        /// `instance_block_size × stride` window so even unowned
-        /// trailing slots have known-zero state — their AABB hooks
-        /// then return degenerate AABBs that get culled.
-        pool_clear_range_bytes: (u64, u64),
-    }
     let mut dirty_bakes: Vec<DirtyBake> = Vec::new();
-    let mut scatters: Vec<Scatter> = Vec::new();
-    // Phase 6 Session 3d — tile-cull region uniforms collected
-    // alongside `scatters`. One per region, with `scratch_offset`
-    // tracking the cumulative entry index into
-    // `instance_tile_cull_scratch_buffer`.
-    let mut tile_cull_regions: Vec<rkp_render::user_shader_tile_cull_pass::TileCullRegionUniform> =
-        Vec::new();
-    let mut tile_cull_scratch_running_offset: u32 = 0;
-    // Phase 7 Session 3 — per-region pool info, accumulated during
-    // the same walk for downstream TLAS build to consume.
-    let mut user_shader_region_pool_info: Vec<UserShaderRegionPoolInfo> = Vec::new();
-    // All regions' leaves concatenated into one upload. Each region's
-    // EmitRegionUniform.leaf_offset is the index of its first leaf
-    // here.
-    let mut leaves_flat: Vec<PaintedLeaf> = Vec::new();
-
-    // Phase 4 — user-shader instance asset registration + per-leaf
-    // host-instance emit. One asset per `@instance_proto` shader
-    // (deduped by shader_id); one host instance per painted leaf. The
-    // host march reads these through the existing pool bindings and
-    // treats user-shader instances identically to ordinary host objects
-    // — so shadows, picking, fog, GI all "just work" the moment the
-    // bake completes. Phase 4c branches on `asset.shader_id != 0` to
-    // call the user shader's `inst_to_local` / `inst_aabb` hooks.
-    use rkp_render::rkp_gpu_object::{geom_type, RkpGpuAsset};
-    let mut asset_for_shader: std::collections::HashMap<u32, u32> =
-        std::collections::HashMap::new();
     let mut user_shader_assets: Vec<RkpGpuAsset> = Vec::new();
-    let asset_id_base = frame.gpu_assets.len() as u32;
-
-    let time_seconds = frame.shade_params_base.time;
-    for (req_idx, req) in frame.instance_region_requests.iter().enumerate() {
-        // Resolve the shader. Skip when not in registry or when it's
-        // not an instance shader (shouldn't happen — the painter only
-        // emits requests for instance shaders — but defend the path).
-        let info = match resolve_instance_shader(&frame.user_shader_infos, &req.shader_name) {
-            Some(i) => i,
-            None => continue,
-        };
-        // Resolve to an id by name + index in user_shader_entries.
-        // (UserShaderInfo doesn't carry id, so look it up in entries.)
-        let shader_id = match frame
-            .user_shader_entries
-            .iter()
-            .find(|e| e.name == info.name)
-            .map(|e| e.id)
-        {
-            Some(id) => id,
-            None => continue,
-        };
-        let max_depth = info.max_depth.unwrap_or(2).min(MAX_PROTO_MAX_DEPTH);
-
-        // 7a. Proto cache lookup.
+    for (shader_id, max_depth) in needed {
         let (proto_entry, proto_dirty) = match state.instance_proto_cache.lookup_or_allocate(
             shader_id,
             frame.user_shader_source_hash,
@@ -2279,196 +1971,49 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
                 octree_extent_offset: proto_entry.octree_extent.0,
             });
         }
-
-        // 7b. Region cache lookup. V1: scatter every touched region
-        //     regardless of dirty flag (see Stage 6c-3.5c memo for the
-        //     alloc-count rationale).
-        let topology_hash = topology_hash_for_inst(req, frame.geometry_epoch);
-        let fill_hash = fill_hash_for_inst(
-            req, topology_hash, frame.user_shader_source_hash, time_seconds,
-        );
-        let cached = match state
-            .instance_region_cache
-            .lookup_or_allocate(req, topology_hash, fill_hash)
-        {
-            Some(s) => s,
-            None => {
-                eprintln!(
-                    "[inst] region cache exhausted for shader_id {shader_id} \
-                     — scatter skipped this frame"
-                );
-                continue;
-            }
-        };
-
-        // Assign region_index by walk order. Append this region's
-        // painted leaves onto the flat upload buffer; remember the
-        // start offset so the EmitRegionUniform points at it.
-        let region_index = scatters.len() as u32;
-        let leaf_offset = leaves_flat.len() as u32;
-        let leaf_count = req.leaves.len() as u32;
-        leaves_flat.extend_from_slice(&req.leaves);
-        let mut slot = cached;
-        slot.region_index = region_index;
-        let region_uniform = build_emit_region_uniform(
-            req, &slot, shader_id, time_seconds, leaf_offset,
-        );
-        let _ = proto_dirty;
-        // Phase 7b — slot range to pre-clear (in u32-stride bytes).
-        // `instance_block_size` is bucket-rounded, so this clears the
-        // whole reservation. Live count = leaves × max_emits, the
-        // exact number of slots threads can write into.
-        let block_offset_bytes =
-            (region_uniform.instance_block_offset as u64) * 4;
-        let block_size_bytes = (region_uniform.instance_block_size as u64)
-            * (region_uniform.instance_stride_u32 as u64)
-            * 4;
-        let alloc_value = leaf_count.saturating_mul(req.max_emits_per_thread);
-        scatters.push(Scatter {
-            region_uniform,
-            region_index,
-            leaf_count,
-            instance_alloc_value: alloc_value,
-            pool_clear_range_bytes: (block_offset_bytes, block_size_bytes),
-        });
-
-        // Phase 4 — register the user-shader instance asset (once per
-        // shader) and emit one host instance per painted leaf.
-        //
-        // The per-instance state (yaw, scale, lean, wind sway, etc — whatever
-        // the shader's `@instance_proto` struct declared) lives in
-        // `instance_pool`. The host instance carries:
-        //   * `asset_id` → the prototype's RkpGpuAsset (which has
-        //     `shader_id != 0`, telling the march to use user-shader hooks)
-        //   * `instance_state_offset` → u32 offset into `instance_pool`
-        //     where this instance's per-instance state record lives
-        //   * `world` (translation-only, centered on the leaf, scaled by
-        //     `cell_size`) — used only for the screen-AABB tile cull;
-        //     the user's `inst_to_local` / `inst_aabb` hooks override
-        //     world placement at march time using the per-instance state.
-        //
-        // The GPU emit pass writes per-instance records into
-        // `instance_pool` via atomicAdd, so the slot ordering across
-        // leaves is non-deterministic. That's fine: each rendered
-        // instance appears at its actual world position dictated by the
-        // user's hooks reading from slot N (whichever leaf wrote there).
-        // The CPU's per-leaf tile-cull AABB is conservative-but-correct
-        // because the per-instance AABB extent (~scale) is much larger
-        // than inter-leaf spacing (~cell_size), so a slot-permuted
-        // instance still falls inside its predicted screen tiles.
-        let asset_index = match asset_for_shader.get(&shader_id) {
-            Some(&idx) => idx,
-            None => {
-                let idx = user_shader_assets.len() as u32;
-                let extent = 1.0_f32; // prototype's local-space cube
-                let voxel_size_local =
-                    extent / ((1u32 << proto_entry.max_depth) as f32 * BRICK_DIM as f32);
-                user_shader_assets.push(RkpGpuAsset {
-                    aabb_min: [0.0, 0.0, 0.0],
-                    octree_root: proto_entry
-                        .octree_root(state.instance_proto_cache.pool_octree_base()),
-                    aabb_max: [extent, extent, extent],
-                    octree_depth: proto_entry.max_depth,
-                    octree_extent_bits: extent.to_bits(),
-                    voxel_size: voxel_size_local,
-                    geom_type: geom_type::VOXELIZED,
-                    bone_count: 0,
-                    grid_origin: [0.0, 0.0, 0.0],
-                    rest_octree_root: 0,
-                    rest_octree_depth: 0,
-                    rest_octree_extent_bits: 0,
-                    // Phase 4c — flags this asset as a user-shader proto.
-                    // The host march reads `asset.shader_id` and routes
-                    // descent through the user's `inst_to_local` /
-                    // `inst_aabb` hooks instead of the affine
-                    // `inv_world` path.
-                    shader_id,
-                    _pad: 0,
-                });
-                asset_for_shader.insert(shader_id, idx);
-                idx
-            }
-        };
-        let asset_id = asset_id_base + asset_index;
-
-        // Phase 7 Session 3 / 7c — record per-region request index
-        // for downstream consumers (TLAS scene-AABB derivation).
-        user_shader_region_pool_info.push(UserShaderRegionPoolInfo {
-            request_index: req_idx as u32,
-        });
-
-        // Phase 6 Session 3d — tile-cull region uniform. One per
-        // region. `scratch_offset` accumulates: each region's slice
-        // covers `instance_block_size` consecutive entries in the
-        // scratch buffer. The AABB pass writes there; count + scatter
-        // (per-VR) read.
-        tile_cull_regions.push(rkp_render::user_shader_tile_cull_pass::TileCullRegionUniform {
-            region_index,
-            asset_id,
-            material_id: req.material_id,
+        let extent = 1.0_f32; // prototype's local-space cube
+        let voxel_size_local =
+            extent / ((1u32 << proto_entry.max_depth) as f32 * BRICK_DIM as f32);
+        user_shader_assets.push(RkpGpuAsset {
+            aabb_min: [0.0, 0.0, 0.0],
+            octree_root: proto_entry
+                .octree_root(state.instance_proto_cache.pool_octree_base()),
+            aabb_max: [extent, extent, extent],
+            octree_depth: proto_entry.max_depth,
+            octree_extent_bits: extent.to_bits(),
+            voxel_size: voxel_size_local,
+            geom_type: geom_type::VOXELIZED,
+            bone_count: 0,
+            grid_origin: [0.0, 0.0, 0.0],
+            rest_octree_root: 0,
+            rest_octree_depth: 0,
+            rest_octree_extent_bits: 0,
+            // shader_id != 0 — host march `march_object` will route
+            // descent through the user shader's hooks.
             shader_id,
-            instance_block_offset: region_uniform.instance_block_offset,
-            instance_block_size: region_uniform.instance_block_size,
-            instance_stride_u32: region_uniform.instance_stride_u32,
-            scratch_offset: tile_cull_scratch_running_offset,
+            _pad: 0,
         });
-        tile_cull_scratch_running_offset = tile_cull_scratch_running_offset
-            .saturating_add(region_uniform.instance_block_size);
-
-        // Phase 6 Session 4d — leaf-driven CPU instance emit ripped.
-        // The per-leaf `RkpGpuInstance` push that lived here is gone:
-        // user-shader instances flow exclusively through the GPU
-        // tile-cull pipeline now (Sessions 2 + 3 + 4b). The `asset_id`
-        // computed above stays in `tile_cull_regions[r].asset_id` so
-        // each entry the host march iterates can look up the right
-        // asset slot in the combined assets vec.
-        //
-        // V1 trade-off: user-shader instances no longer cast shadows
-        // (shadow trace iterates `instances[]` per pixel; it can't
-        // see the GPU-discovered entries). Documented in
-        // `project_phase_6_session_4`; future work adds light-aligned
-        // tile cull for shadows.
-        let _ = asset_id;
     }
-    // 8. Encode bake + scatter dispatches.
-    if !dirty_bakes.is_empty() || !scatters.is_empty() {
-        let mut encoder = state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("inst bake+scatter"),
-        });
 
-        // 8a. Bake — one dispatch per dirty proto. Each dispatch writes
-        //     the prototype's leaf-level octree slots + brick + leaf
-        //     attrs starting from the proto cache's reserved offset.
-        //     We pre-fill the internal levels CPU-side per Stage 2's
-        //     pattern. Wrap the whole bake loop in one profiler query
-        //     so a frame with N dirty bakes shows as one `inst_bake`
-        //     bucket; rare per-shader rebakes mean N is usually 0 or 1.
-        let bake_q = if !dirty_bakes.is_empty() {
-            Some(state.renderer.profiler.begin_query("inst_bake", &mut encoder))
-        } else {
-            None
-        };
+    // 8. Encode bake dispatches.
+    if !dirty_bakes.is_empty() {
+        let mut encoder = state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("inst bake"),
+        });
+        let bake_q = state.renderer.profiler.begin_query("inst_bake", &mut encoder);
         for bake in &dirty_bakes {
             // Pre-fill internal octree levels at the proto's reserved
-            // offset within the host octree pool. `build_internal_levels`
-            // returns the entire octree subtree's nodes (internal +
-            // EMPTY leaf); the bake fills the leaf level only.
-            //
-            // `pool_octree_base = proto_octree_base_elems` so the
-            // internal branches reference children at absolute host-pool
-            // slot indices.
+            // offset within the host octree pool.
             let internal = build_internal_levels(
                 proto_octree_base_elems,
                 bake.octree_extent_offset,
                 bake.max_depth,
             );
-            // Each node = 2 u32s = 8 bytes.
             let mut bytes: Vec<u8> = Vec::with_capacity(internal.len() * 8);
             for [v0, v1] in internal {
                 bytes.extend_from_slice(&v0.to_le_bytes());
                 bytes.extend_from_slice(&v1.to_le_bytes());
             }
-            // Absolute byte offset in the host octree_nodes_buffer.
             let octree_byte_offset =
                 (proto_octree_base_elems as u64 + bake.octree_extent_offset as u64) * 8;
             state.queue.write_buffer(
@@ -2478,24 +2023,15 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             );
 
             // Reset overflow only — brick + leaf-attr cursors are
-            // PERSISTENT across bakes (different prototypes' slots
-            // interleave in the global pools). Clearing them here
-            // would leak unreachable slots in the previously-baked
-            // prototypes' octree branches.
+            // PERSISTENT across bakes.
             state.queue.write_buffer(&state.instance_proto_pass.overflow_buffer, 0, &[0u8; 12 * 4]);
 
-            // Upload the prototype uniform.
             state.queue.write_buffer(
                 &state.instance_proto_pass.proto_uniform_buffer,
                 0,
                 bytemuck::bytes_of(&bake.uniform),
             );
 
-            // Build bind groups — proto bake now writes into the host
-            // scene's main pool buffers (Phase 4). The atomic cursors
-            // were initialized to `(proto_brick_base, proto_leaf_attr_base)`
-            // in step 6 so the first emitted slot lands at the proto
-            // tail, not at offset 0 (which would clobber CPU asset data).
             let bake_g0 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("inst bake g0"),
                 layout: &state.instance_proto_pass.group0_layout,
@@ -2526,659 +2062,16 @@ fn tick_instance_pipeline(state: &mut RenderState, frame: &RenderFrame) -> Insta
             cpass.set_bind_group(1, &bake_g1, &[]);
             cpass.dispatch_workgroups(bricks_per_axis, bricks_per_axis, bricks_per_axis);
         }
-        if let Some(q) = bake_q {
-            state.renderer.profiler.end_query(&mut encoder, q);
-        }
-
-        // 8b. Scatter — one dispatch per touched region.
-        if !scatters.is_empty() {
-            // Upload all region uniforms + dispatch uniforms once.
-            // `regions_buffer` is sized for MAX_INSTANCE_REGIONS slots
-            // (192 B each). Reset alloc counters for every region we
-            // dispatch.
-            let mut region_bytes: Vec<u8> =
-                Vec::with_capacity(scatters.len() * std::mem::size_of::<rkp_render::user_shader_emit_pass::EmitRegionUniform>());
-            for s in &scatters {
-                region_bytes.extend_from_slice(bytemuck::bytes_of(&s.region_uniform));
-            }
-            state.queue.write_buffer(
-                &state.instance_emit_pass.regions_buffer,
-                0,
-                &region_bytes,
-            );
-
-            // Upload the concatenated leaves buffer. Dispatch fires one
-            // thread per leaf; each region's uniform points at its
-            // leaf range via `leaf_offset` / `leaf_count`.
-            let leaves_needed = leaves_flat.len() as u32;
-            ensure_instance_leaves_capacity(state, leaves_needed.max(1));
-            if !leaves_flat.is_empty() {
-                state.queue.write_buffer(
-                    &state.instance_leaves_buffer,
-                    0,
-                    bytemuck::cast_slice(&leaves_flat),
-                );
-            }
-
-            // Dispatch uniforms — one per scatter, EMIT_DISPATCH_UNIFORM_STRIDE
-            // apart (256 B per wgpu's dynamic-offset alignment rule).
-            let stride = EMIT_DISPATCH_UNIFORM_STRIDE as usize;
-            let mut dispatch_bytes: Vec<u8> = vec![0u8; scatters.len() * stride];
-            for (i, s) in scatters.iter().enumerate() {
-                let dispatch_u = EmitDispatchUniform {
-                    region_index: s.region_index,
-                    leaf_count: s.leaf_count,
-                    _pad0: 0,
-                    _pad1: 0,
-                };
-                let off = i * stride;
-                dispatch_bytes[off..off + std::mem::size_of::<EmitDispatchUniform>()]
-                    .copy_from_slice(bytemuck::bytes_of(&dispatch_u));
-            }
-            state.queue.write_buffer(
-                &state.instance_emit_pass.dispatch_uniforms_buffer,
-                0,
-                &dispatch_bytes,
-            );
-
-            // Phase 7b — write the per-region live count into
-            // `instance_alloc[region]` BEFORE emit dispatches, instead
-            // of letting emit's atomicAdd accumulate it. With
-            // deterministic slot allocation (slot = thread_id × max +
-            // local_count), the live count is known up front:
-            // `leaves.len() × max_emits_per_thread` per region. Build
-            // the full MAX_REGIONS array, default 0, and stamp in
-            // touched regions; one upload covers everything and
-            // untouched regions keep their cull-skip behaviour.
-            let mut alloc_values: Vec<u32> = vec![
-                0u32;
-                rkp_render::user_shader_emit_pass::MAX_INSTANCE_REGIONS as usize
-            ];
-            for s in &scatters {
-                let idx = s.region_index as usize;
-                if idx < alloc_values.len() {
-                    alloc_values[idx] = s.instance_alloc_value;
-                }
-            }
-            state.queue.write_buffer(
-                &state.instance_emit_pass.instance_alloc_buffer,
-                0,
-                bytemuck::cast_slice(&alloc_values),
-            );
-            // Reset overflow counters.
-            state.queue.write_buffer(
-                &state.instance_emit_pass.overflow_buffer,
-                0,
-                &[0u8; 16],
-            );
-
-            // Phase 7b — pre-clear each region's slot reservation in
-            // `instance_pool` to zero before emit. Deterministic slot
-            // allocation means a given thread's slots are reserved
-            // even if the user shader's emit hook returns early
-            // without calling `emit_instance`; those slots must hold
-            // known-zero state so the AABB pass and shadow trace
-            // produce degenerate AABBs and skip them. `clear_buffer`
-            // runs on the GPU — no upload — and is encoded into the
-            // same command buffer as the emit dispatches that follow,
-            // which guarantees the ordering.
-            for s in &scatters {
-                let (off, size) = s.pool_clear_range_bytes;
-                if size == 0 { continue; }
-                encoder.clear_buffer(
-                    &state.renderer.scene.instance_pool_buffer,
-                    off,
-                    Some(size),
-                );
-            }
-
-            // Build bind groups (groups 0 + 1 are stable across
-            // dispatches; group 2 takes a dynamic offset per dispatch).
-            // Group 0 binding 2 is the painted-leaves buffer — the
-            // emit shader fetches `leaves[region.leaf_offset + gid]`
-            // directly, no host-octree descent.
-            let scatter_g0 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("inst scatter g0"),
-                layout: &state.instance_emit_pass.group0_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: state.renderer.scene.instance_pool_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: state.instance_emit_pass.instance_alloc_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: state.instance_leaves_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: state.instance_emit_pass.overflow_buffer.as_entire_binding() },
-                ],
-            });
-            let scatter_g1 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("inst scatter g1"),
-                layout: &state.instance_emit_pass.group1_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: state.instance_emit_pass.regions_buffer.as_entire_binding(),
-                }],
-            });
-            let scatter_g2 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("inst scatter g2 (dynamic)"),
-                layout: &state.instance_emit_pass.group2_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &state.instance_emit_pass.dispatch_uniforms_buffer,
-                        offset: 0,
-                        size: std::num::NonZeroU64::new(
-                            std::mem::size_of::<EmitDispatchUniform>() as u64,
-                        ),
-                    }),
-                }],
-            });
-
-            // One profiler bucket for the full scatter loop. With
-            // @animated shaders this fires every frame for every
-            // touched region, so this is the budget number to watch.
-            let scatter_q = state.renderer.profiler.begin_query("inst_scatter", &mut encoder);
-            for (i, s) in scatters.iter().enumerate() {
-                if s.leaf_count == 0 {
-                    continue;
-                }
-                let dynamic_offset = (i * stride) as u32;
-                let wgs = workgroups_for_leaf_count(s.leaf_count);
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("inst scatter"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&state.instance_emit_pass.emit_pipeline);
-                cpass.set_bind_group(0, &scatter_g0, &[]);
-                cpass.set_bind_group(1, &scatter_g1, &[]);
-                cpass.set_bind_group(2, &scatter_g2, &[dynamic_offset]);
-                // 1-D dispatch: `leaf_count.div_ceil(64)` workgroups, 64
-                // threads each → one thread per painted leaf.
-                cpass.dispatch_workgroups(wgs, 1, 1);
-            }
-            state.renderer.profiler.end_query(&mut encoder, scatter_q);
-        }
-
-        // 8c. Phase 6 Session 3d — tile-cull AABB pass. Per region,
-        //     one workgroup-grid sized to its `instance_block_size`;
-        //     each thread reads the per-instance state from
-        //     `instance_pool` and writes one `InstanceTileCullEntry`
-        //     into `instance_tile_cull_scratch_buffer`. Per-VR
-        //     count/prefix/scatter dispatches downstream consume
-        //     this scratch.
-        if !tile_cull_regions.is_empty() {
-            // Ensure scratch buffer is large enough for the running
-            // total computed during region walk. 48 B per entry.
-            let scratch_total_entries = tile_cull_scratch_running_offset.max(1);
-            ensure_tile_cull_scratch_capacity(state, scratch_total_entries);
-
-            // Reload the pipeline against the current user-shader
-            // chunks. Cheap when source hash unchanged.
-            state.instance_tile_cull_pass.reload_user_shaders(
-                &state.device,
-                &frame.user_shader_inst_to_local_chunk,
-                &frame.user_shader_inst_aabb_chunk,
-                frame.user_shader_source_hash,
-            );
-
-            // Upload region uniforms — one per region, 256 B stride
-            // per wgpu's dynamic-offset alignment. Pad with zero bytes
-            // between records; we only read the first 32 B per slot.
-            const STRIDE: usize = rkp_render::user_shader_tile_cull_pass::TILE_CULL_REGION_UNIFORM_STRIDE as usize;
-            let mut region_bytes: Vec<u8> = vec![0u8; tile_cull_regions.len() * STRIDE];
-            for (i, r) in tile_cull_regions.iter().enumerate() {
-                let off = i * STRIDE;
-                let end = off + std::mem::size_of::<rkp_render::user_shader_tile_cull_pass::TileCullRegionUniform>();
-                region_bytes[off..end].copy_from_slice(bytemuck::bytes_of(r));
-            }
-            state.queue.write_buffer(
-                &state.instance_tile_cull_pass.regions_buffer, 0, &region_bytes,
-            );
-
-            // Bind groups — group(0) shared across all per-region
-            // dispatches; group(1) takes a dynamic offset per region.
-            let cull_g0 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("inst tile_cull g0"),
-                layout: &state.instance_tile_cull_pass.group0_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: state.renderer.scene.instance_pool_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: state.instance_emit_pass.instance_alloc_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: state.instance_tile_cull_scratch_buffer.as_entire_binding() },
-                ],
-            });
-            let cull_g1 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("inst tile_cull g1 (dynamic)"),
-                layout: &state.instance_tile_cull_pass.group1_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &state.instance_tile_cull_pass.regions_buffer,
-                        offset: 0,
-                        size: std::num::NonZeroU64::new(
-                            std::mem::size_of::<rkp_render::user_shader_tile_cull_pass::TileCullRegionUniform>() as u64,
-                        ),
-                    }),
-                }],
-            });
-
-            let cull_q = state.renderer.profiler.begin_query("inst_tile_cull", &mut encoder);
-            for (i, r) in tile_cull_regions.iter().enumerate() {
-                let dynamic_offset = (i * STRIDE) as u32;
-                let wgs = rkp_render::user_shader_tile_cull_pass::workgroups_for_region(r.instance_block_size);
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("inst tile_cull"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&state.instance_tile_cull_pass.pipeline);
-                cpass.set_bind_group(0, &cull_g0, &[]);
-                cpass.set_bind_group(1, &cull_g1, &[dynamic_offset]);
-                cpass.dispatch_workgroups(wgs, 1, 1);
-            }
-            state.renderer.profiler.end_query(&mut encoder, cull_q);
-        }
-
+        state.renderer.profiler.end_query(&mut encoder, bake_q);
         state.queue.submit(Some(encoder.finish()));
     }
 
     // 9. Drop cache entries not referenced this frame.
     state.instance_proto_cache.evict_untouched();
-    state.instance_region_cache.evict_untouched();
 
-    InstancePipelineResult {
-        user_shader_assets,
-        tile_cull_scratch_count: tile_cull_scratch_running_offset,
-        user_shader_region_pool_info,
-    }
+    user_shader_assets
 }
 
-/// Hash inputs that affect the proto bake's topology output for one
-/// instance region. Folds host-octree state + AABB + cell_size +
-/// max_depth + tile + region_thickness. Any change invalidates the
-/// region's cached extent.
-fn topology_hash_for_inst(
-    req: &rkp_render::user_shader_emit_pass::InstanceRegionRequest,
-    geometry_epoch: u64,
-) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    let prime = 0x100000001b3u64;
-    let mix = |h: &mut u64, b: u8| {
-        *h ^= b as u64;
-        *h = h.wrapping_mul(prime);
-    };
-    for &b in &geometry_epoch.to_le_bytes() { mix(&mut h, b); }
-    for &b in &req.host_octree_root.to_le_bytes() { mix(&mut h, b); }
-    for &b in &req.host_octree_depth.to_le_bytes() { mix(&mut h, b); }
-    for &b in &req.host_octree_extent.to_le_bytes() { mix(&mut h, b); }
-    for v in req.host_grid_origin.iter() {
-        for &b in &v.to_le_bytes() { mix(&mut h, b); }
-    }
-    for row in req.host_inverse_world.iter() {
-        for v in row.iter() {
-            for &b in &v.to_le_bytes() { mix(&mut h, b); }
-        }
-    }
-    for &b in &req.region_thickness.to_le_bytes() { mix(&mut h, b); }
-    for v in req.aabb_min.iter().chain(req.aabb_max.iter()) {
-        for &b in &v.to_le_bytes() { mix(&mut h, b); }
-    }
-    for &b in &req.cell_size.to_le_bytes() { mix(&mut h, b); }
-    for v in req.tile_index.iter() {
-        for &b in &v.to_le_bytes() { mix(&mut h, b); }
-    }
-    h
-}
-
-/// Hash inputs that affect the scatter output (per-instance struct
-/// values). Builds on top of `topology_hash` so changing topology
-/// implies fill-dirty.
-fn fill_hash_for_inst(
-    req: &rkp_render::user_shader_emit_pass::InstanceRegionRequest,
-    topology_hash: u64,
-    shader_source_hash: u64,
-    time_seconds: f32,
-) -> u64 {
-    let mut h = topology_hash;
-    let prime = 0x100000001b3u64;
-    let mix = |h: &mut u64, b: u8| {
-        *h ^= b as u64;
-        *h = h.wrapping_mul(prime);
-    };
-    for &b in &shader_source_hash.to_le_bytes() { mix(&mut h, b); }
-    for &b in &req.input_hash.to_le_bytes() { mix(&mut h, b); }
-    for &b in &req.material_id.to_le_bytes() { mix(&mut h, b); }
-    for p in &req.params {
-        for &b in &p.to_le_bytes() { mix(&mut h, b); }
-    }
-    if req.animated {
-        for &b in &time_seconds.to_le_bytes() { mix(&mut h, b); }
-    }
-    h
-}
-
-/// What `tick_instance_pipeline` returns: Phase 4c's host-side
-/// user-shader instance asset + instance pair that splices onto
-/// `frame.gpu_assets` / `gpu_instances` so the host march can render
-/// user-shader instances natively.
-struct InstancePipelineResult {
-    /// One asset per `@instance_proto` shader, sourced from the proto
-    /// cache's reserved octree slot in the host pool tail. Spliced onto
-    /// the frame's persistent assets vec just like
-    /// `run_user_shader_geom`'s transient assets. Each entry has
-    /// `shader_id != 0` so the host march dispatches user-shader
-    /// hooks instead of the affine `inv_world` path. The host march
-    /// reads each `UserShaderTileEntry`'s `asset_id` and indexes into
-    /// `assets[asset_id]` directly.
-    user_shader_assets: Vec<rkp_render::rkp_gpu_object::RkpGpuAsset>,
-    /// Phase 6 Session 3d — total entry count in
-    /// `instance_tile_cull_scratch_buffer` after the AABB pass writes.
-    /// Equal to `Σ instance_block_size` across all regions; the per-VR
-    /// count/scatter dispatches use this as their thread count.
-    /// Zero when no user-shader regions ran this frame.
-    tile_cull_scratch_count: u32,
-    /// Phase 7 Session 3 — per-region pool offsets parallel to the
-    /// region walk order, so downstream consumers (TLAS builder) can
-    /// match a region back to its `frame.instance_region_requests`
-    /// entry and read the same instance-pool layout
-    /// `tick_instance_pipeline` assigned. One entry per region the
-    /// pipeline successfully processed (cache misses get skipped
-    /// silently — same shape `tick_instance_pipeline` already uses).
-    user_shader_region_pool_info: Vec<UserShaderRegionPoolInfo>,
-}
-
-/// Phase 7 Session 3 — pool layout descriptor for one user-shader
-/// region. Returned from `tick_instance_pipeline` so downstream
-/// consumers can correlate a region back to its
-/// `frame.instance_region_requests` entry. Phase 7c trimmed to
-/// just `request_index` — the per-region pool layout fields
-/// (asset_id / material_id / instance_block_offset / etc.) were
-/// only consumed by the now-deleted CPU TLAS builder.
-#[derive(Debug, Clone)]
-struct UserShaderRegionPoolInfo {
-    /// Index into `frame.instance_region_requests` so consumers can
-    /// borrow the request's `aabb_min` / `aabb_max` (used by the
-    /// scene-AABB derivation fed to the GPU TLAS Morton compute).
-    request_index: u32,
-}
-
-/// Phase 6 Session 3d — per-VR tile-cull dispatch chain.
-///
-/// Runs count → prefix → scatter against `state.instance_tile_cull_scratch_buffer`
-/// (filled by `tick_instance_pipeline`'s AABB pass), writing per-tile
-/// entry lists into `vr.march.us_tile_offsets` / `us_tile_entries`. The
-/// host march doesn't yet read these (Session 4 wires that consumer);
-/// Session 3d is purely "make the dispatch chain run end-to-end".
-///
-/// Skipped entirely when `scratch_count == 0` (no user-shader
-/// instances this frame).
-/// Pre-borrowed handles to RenderState's tile-cull fields. The caller
-/// constructs this at the call site so the inner helper doesn't need
-/// `&mut RenderState` (which would conflict with the outer
-/// `viewport_renderers.get_mut(...)`).
-struct UsTileCullArgs<'a> {
-    device: &'a wgpu::Device,
-    queue: &'a wgpu::Queue,
-    /// Renderer borrow only used to access `profiler`. Held as
-    /// `&mut RkpRenderer` rather than the inner profiler so engine
-    /// callers don't need a `wgpu_profiler` import.
-    renderer: &'a mut rkp_render::rkp_renderer::RkpRenderer,
-    scratch_buffer: &'a wgpu::Buffer,
-    view_uniform_buffer: &'a wgpu::Buffer,
-    prefix_uniform_buffer: &'a wgpu::Buffer,
-    tile_count_pass: &'a rkp_render::user_shader_tile_count_pass::TileCountPass,
-    tile_prefix_pass: &'a rkp_render::user_shader_tile_prefix_pass::TilePrefixPass,
-    tile_scatter_pass: &'a rkp_render::user_shader_tile_scatter_pass::TileScatterPass,
-}
-
-fn dispatch_us_tile_cull_inner(
-    args: UsTileCullArgs,
-    vr: &mut rkp_render::ViewportRenderer,
-    encoder: &mut wgpu::CommandEncoder,
-    camera: &rkp_render::rkp_scene::CameraUniforms,
-    width: u32,
-    height: u32,
-    scratch_count: u32,
-) {
-    use rkp_render::user_shader_tile_count_pass::{
-        tile_count_for_viewport, workgroups_for_scratch, TileCullViewportUniform,
-    };
-    use rkp_render::user_shader_tile_prefix_pass::{PrefixUniform, PREFIX_MAX_TILES};
-
-    let (tile_count_x, tile_count_y, tile_count) = tile_count_for_viewport(width, height);
-    if tile_count > PREFIX_MAX_TILES {
-        // V1 cap: skip the entire VR rather than producing partial
-        // results. Above 65536 tiles (~2300×800 at 8 px tiles) the
-        // single-WG prefix-sum can't scan in one dispatch; multi-WG
-        // scan is a follow-up.
-        eprintln!(
-            "[tile_cull] tile_count {tile_count} > PREFIX_MAX_TILES {PREFIX_MAX_TILES} \
-             ({width}×{height}); skipping VR"
-        );
-        return;
-    }
-
-    // Entries estimate. Two regimes mixed:
-    // (a) typical: each AABB covers a small number of tiles at distance
-    //     (~4-32 tiles for grass-blade-sized AABBs).
-    // (b) close to camera: tight near-plane clipping bounds the screen
-    //     AABB, but a single blade right at the camera can still cover
-    //     hundreds of tiles. The MAX_TILE_SPAN cap in the count shader
-    //     keeps any one blade ≤ 65k tiles even in pathological views.
-    //
-    // The buffer must fit within the device's
-    // `max_storage_buffer_binding_size` — otherwise `create_buffer` for
-    // the new capacity may produce an invalid buffer that fails on the
-    // next bind-group create (was the crash on the 7th painted patch
-    // after the entry struct grew 16 B → 48 B). We tighten the
-    // multiplier (256 → 64; still ~2× typical blade coverage) and
-    // hard-cap at the device binding limit. On overflow, wgpu
-    // robustness drops the excess writes — visually that's a few
-    // missing blades, vs. a crash.
-    let entries_estimate_raw = scratch_count
-        .saturating_mul(64)
-        .saturating_add(tile_count.saturating_mul(4))
-        .max(1024);
-    let max_binding_bytes = args.device.limits().max_storage_buffer_binding_size as u64;
-    let entry_size = std::mem::size_of::<rkp_render::octree_march::UserShaderTileEntry>() as u64;
-    let entries_cap = (max_binding_bytes / entry_size).saturating_sub(1).min(u32::MAX as u64) as u32;
-    let entries_estimate = entries_estimate_raw.min(entries_cap);
-    if entries_estimate < entries_estimate_raw {
-        eprintln!(
-            "[tile_cull] entries_estimate clamped {} → {} (device binding cap {} B / {} B per entry); \
-             expect dropped scatter writes if scene actually needs more",
-            entries_estimate_raw, entries_estimate, max_binding_bytes, entry_size,
-        );
-    }
-    let _grew_entries = vr.march.ensure_us_tile_entries_capacity(args.device, entries_estimate);
-    let _grew_grid = vr.march.ensure_us_tile_grid_capacity(args.device, tile_count);
-
-    // Upload the shared per-VR uniform buffers.
-    let view_u = TileCullViewportUniform {
-        view_proj: camera.view_proj,
-        resolution_x: width as f32,
-        resolution_y: height as f32,
-        tile_count_x,
-        tile_count_y,
-        tile_count,
-        scratch_count,
-        _pad0: 0,
-        _pad1: 0,
-    };
-    args.queue.write_buffer(
-        args.view_uniform_buffer, 0, bytemuck::bytes_of(&view_u),
-    );
-    let prefix_u = PrefixUniform {
-        tile_count, _pad0: 0, _pad1: 0, _pad2: 0,
-    };
-    args.queue.write_buffer(
-        args.prefix_uniform_buffer, 0, bytemuck::bytes_of(&prefix_u),
-    );
-
-    // Reset us_tile_counts to zeros for this VR. clear_buffer requires
-    // the encoder; size is `tile_count * 4` rounded up to a multiple
-    // of `wgpu::COPY_BUFFER_ALIGNMENT` (= 4) — already aligned.
-    encoder.clear_buffer(
-        &vr.march.us_tile_counts_buffer,
-        0,
-        Some((tile_count as u64) * 4),
-    );
-
-    // ── Bind groups ──────────────────────────────────────────────────
-    // Count pass: scratch (ro) + counts (rw atomic) + view uniform.
-    let count_g0 = args.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("inst tile_count g0"),
-        layout: &args.tile_count_pass.group0_layout,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: args.scratch_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: vr.march.us_tile_counts_buffer.as_entire_binding() },
-        ],
-    });
-    let count_g1 = args.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("inst tile_count g1"),
-        layout: &args.tile_count_pass.group1_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: args.view_uniform_buffer.as_entire_binding(),
-        }],
-    });
-
-    // Prefix pass: counts (ro) + offsets (rw) + prefix uniform.
-    let prefix_g0 = args.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("inst tile_prefix g0"),
-        layout: &args.tile_prefix_pass.group0_layout,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: vr.march.us_tile_counts_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: vr.march.us_tile_offsets_buffer.as_entire_binding() },
-        ],
-    });
-    let prefix_g1 = args.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("inst tile_prefix g1"),
-        layout: &args.tile_prefix_pass.group1_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: args.prefix_uniform_buffer.as_entire_binding(),
-        }],
-    });
-
-    // Scatter pass: scratch (ro) + scatter_cursor (rw atomic) +
-    // entries (rw) + view uniform.
-    let scatter_g0 = args.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("inst tile_scatter g0"),
-        layout: &args.tile_scatter_pass.group0_layout,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: args.scratch_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: vr.march.us_tile_scatter_cursor_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: vr.march.us_tile_entries_buffer.as_entire_binding() },
-        ],
-    });
-    let scatter_g1 = args.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("inst tile_scatter g1"),
-        layout: &args.tile_scatter_pass.group1_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: args.view_uniform_buffer.as_entire_binding(),
-        }],
-    });
-
-    // ── Dispatches ──────────────────────────────────────────────────
-    let q = args.renderer.profiler.begin_query("inst_tile_dispatch", encoder);
-
-    {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("inst tile_count"),
-            timestamp_writes: None,
-        });
-        cpass.set_pipeline(&args.tile_count_pass.pipeline);
-        cpass.set_bind_group(0, &count_g0, &[]);
-        cpass.set_bind_group(1, &count_g1, &[]);
-        cpass.dispatch_workgroups(workgroups_for_scratch(scratch_count), 1, 1);
-    }
-
-    {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("inst tile_prefix"),
-            timestamp_writes: None,
-        });
-        cpass.set_pipeline(&args.tile_prefix_pass.pipeline);
-        cpass.set_bind_group(0, &prefix_g0, &[]);
-        cpass.set_bind_group(1, &prefix_g1, &[]);
-        // Single workgroup — see PREFIX_MAX_TILES contract.
-        cpass.dispatch_workgroups(1, 1, 1);
-    }
-
-    // Initialize scatter_cursor[t] = us_tile_offsets[t] for t in
-    // [0, tile_count). The scatter pass atomicAdd's into cursor, so
-    // each entry's slot lands in [offsets[t], offsets[t+1]) — leaving
-    // us_tile_offsets unchanged for the host march to read.
-    vr.march.init_scatter_cursor(encoder, tile_count);
-
-    {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("inst tile_scatter"),
-            timestamp_writes: None,
-        });
-        cpass.set_pipeline(&args.tile_scatter_pass.pipeline);
-        cpass.set_bind_group(0, &scatter_g0, &[]);
-        cpass.set_bind_group(1, &scatter_g1, &[]);
-        cpass.dispatch_workgroups(workgroups_for_scratch(scratch_count), 1, 1);
-    }
-
-    args.renderer.profiler.end_query(encoder, q);
-}
-
-/// Phase 6 Session 3d — grow `instance_tile_cull_scratch_buffer` to
-/// fit `needed_entries` × 48 B `InstanceTileCullEntry` records.
-fn ensure_tile_cull_scratch_capacity(state: &mut RenderState, needed_entries: u32) {
-    if needed_entries <= state.instance_tile_cull_scratch_capacity_entries {
-        return;
-    }
-    let mut new_cap = state.instance_tile_cull_scratch_capacity_entries.max(1);
-    while new_cap < needed_entries {
-        new_cap = new_cap.saturating_mul(2);
-    }
-    state.instance_tile_cull_scratch_buffer = state.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("inst tile_cull_scratch"),
-        size: (new_cap as u64) * 48,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    state.instance_tile_cull_scratch_capacity_entries = new_cap;
-}
-
-/// Grow `instance_leaves_buffer` to fit `needed_entries`. No-op when
-/// capacity already suffices. Doubles capacity on growth so a
-/// gradually-growing workload doesn't reallocate every frame. The
-/// buffer holds 32 B per `PaintedLeaf`.
-fn ensure_instance_leaves_capacity(state: &mut RenderState, needed_entries: u32) {
-    if needed_entries <= state.instance_leaves_capacity_entries {
-        return;
-    }
-    let mut new_cap = state.instance_leaves_capacity_entries.max(1);
-    while new_cap < needed_entries {
-        new_cap = new_cap.saturating_mul(2);
-    }
-    state.instance_leaves_buffer = state.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("inst leaves"),
-        size: (new_cap as u64) * 32,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    state.instance_leaves_capacity_entries = new_cap;
-}
-
-/// User-shader runtime geometry, global-pool + persistent-cache variant.
-///
-/// Reserves a global transient pool tail in each scene buffer,
-/// rebuilds the geom-build pipeline on shader source changes, walks
-/// the frame's regions and consults the persistent cache to decide
-/// per-region: skip / fill-only / full-bake. Returns the transient
-/// `(asset, instance)` pair lists to concatenate with the persistent
-/// vecs for this frame's `upload_frame`.
-///
-/// `asset_id_base` is the index into the combined assets vec where the
-/// first transient asset will land — the cache assigns sequential ids
-/// from this base.
-///
-/// Each region computes two hashes: `topology_hash` (host_geom +
-/// region_thickness + max_depth + aabb + cell_size; classify can be
-/// skipped when unchanged) and `fill_hash` (shader source + params +
-/// paint epoch + time when `@animated`; fill can be skipped when
-/// unchanged AND topology unchanged).
 fn run_user_shader_geom(
     state: &mut RenderState,
     frame: &RenderFrame,

@@ -605,31 +605,6 @@ const PHASE_SHADOW: u32 = 2u;
 // per scene — replaces the retired 32-object bitmask culling scheme.
 @group(2) @binding(5) var<storage, read> tile_object_ids: array<u32>;
 
-// Phase 6 — user-shader instance tile lists. GPU-built each frame
-// from the actual filled slots in `instance_pool`. Replaces the
-// leaf-driven `RkpGpuInstance` emission of Phase 4c. The host march
-// loop iterates these alongside `tile_object_ids` for each tile and
-// dispatches the user-shader path directly from each entry's
-// metadata (no `instances[]` lookup required).
-// 48 B per entry — see `octree_march::UserShaderTileEntry` for the
-// full shape. World AABB and screen-pixel rect are cached at
-// tile-cull / tile-scatter time so the per-pixel `main()` loop below
-// can pre-reject pixels with a 4-compare and `march_object`'s user-
-// shader branch can skip the (potentially expensive) `inst_aabb`
-// hook entirely.
-struct UserShaderTileEntry {
-    aabb_min: vec3<f32>,
-    asset_id: u32,
-    aabb_max: vec3<f32>,
-    instance_state_offset: u32,
-    material_id: u32,
-    // (pixel_x as u16) | ((pixel_y as u16) << 16). Inclusive bounds.
-    screen_min_packed: u32,
-    screen_max_packed: u32,
-    _pad: u32,
-}
-@group(2) @binding(6) var<storage, read> us_tile_offsets: array<u32>;
-@group(2) @binding(7) var<storage, read> us_tile_entries: array<UserShaderTileEntry>;
 // Phase B-redux Phase 3a — per-material `shader_params` flat array
 // (8 × f32 per material slot, indexed by `material_id * 8 + i`).
 // Used to populate `ctx.params` for the `instance_at` dispatcher.
@@ -641,63 +616,6 @@ struct UserShaderTileEntry {
 // + `tile_offsets[t+1]` once and every thread in the tile reuses them.
 var<workgroup> tile_range_start: u32;
 var<workgroup> tile_range_end: u32;
-// Phase 6 — same pattern for the user-shader entry slice (built by
-// the GPU tile-cull pipeline, parallel to `tile_object_ids[]`).
-var<workgroup> us_tile_range_start: u32;
-var<workgroup> us_tile_range_end: u32;
-
-// Phase 6 — synthetic `RkpInstance` for an entry-driven user-shader
-// hit. The host march's per-instance code path expects an
-// `RkpInstance` it can read transform / material / object_id / overlay
-// state from; for user-shader assets only a few fields are actually
-// consumed downstream. Fill the rest with safe defaults so the affine
-// branches in `march_object` and the post-DDA block still validate
-// against valid values without doing any work.
-//
-// * `instance_state_offset` — points the user shader's hooks at this
-//   entry's per-instance struct in `instance_pool`.
-// * `material_id` — V1 host-material inheritance (the proto bake
-//   writes `material_primary = 0`; the host march replaces with this).
-// * `object_id` — pick sentinel; V1 user-shader instances share one
-//   id (0xFFFFFFFE) since per-blade picking has no entity to map to.
-// * everything else — zero / identity. The user-shader branch never
-//   reads `is_skinned`, `world` (ignored for user-shader hits), bone
-//   fields, or overlays.
-const USER_SHADER_PICK_SENTINEL: u32 = 0xFFFFFFFEu;
-
-fn synth_inst_from_entry(entry: UserShaderTileEntry) -> RkpInstance {
-    var inst: RkpInstance;
-    // Identity world — only consulted by the default `inst_aabb` stub
-    // for shaders that don't override the hook (which is no-one in
-    // practice — every `@instance_proto` shader provides one).
-    inst.world = mat4x4<f32>(
-        vec4<f32>(1.0, 0.0, 0.0, 0.0),
-        vec4<f32>(0.0, 1.0, 0.0, 0.0),
-        vec4<f32>(0.0, 0.0, 1.0, 0.0),
-        vec4<f32>(0.0, 0.0, 0.0, 1.0),
-    );
-    inst.asset_id = entry.asset_id;
-    inst.material_id = entry.material_id;
-    inst.object_id = USER_SHADER_PICK_SENTINEL;
-    inst.layer_mask = 0xFFFFFFFFu;
-    inst.is_skinned = 0u;
-    inst.bone_buffer_offset = 0u;
-    inst.bone_field_offset = 0u;
-    inst.bone_field_occ_offset = 0u;
-    inst.bone_field_dim_x = 0u;
-    inst.bone_field_dim_y = 0u;
-    inst.bone_field_dim_z = 0u;
-    inst.bone_field_origin_x = 0.0;
-    inst.bone_field_origin_y = 0.0;
-    inst.bone_field_origin_z = 0.0;
-    inst.overlay_offset = 0u;
-    inst.overlay_count = 0u;
-    inst.instance_state_offset = entry.instance_state_offset;
-    inst._pad0 = 0u;
-    inst._pad1 = 0u;
-    inst._pad2 = 0u;
-    return inst;
-}
 
 // --- Helpers ---
 
@@ -2181,21 +2099,14 @@ fn main(
         let tile_idx = ty * march_params.tile_count_x + tx;
         tile_range_start = tile_offsets[tile_idx];
         tile_range_end = tile_offsets[tile_idx + 1u];
-        // Phase 6 — user-shader entry slice for this tile, GPU-built
-        // by the tile-cull pipeline. Iterated alongside the host
-        // object-id slice below.
-        us_tile_range_start = us_tile_offsets[tile_idx];
-        us_tile_range_end = us_tile_offsets[tile_idx + 1u];
     }
     workgroupBarrier();
 
     let dims = textureDimensions(gbuf_position);
     if pixel.x >= dims.x || pixel.y >= dims.y { return; }
 
-    // No objects overlap this tile — write background and skip. Both
-    // host objects AND user-shader entries must be empty; tiles with
-    // user-shader-only coverage still need to march.
-    if tile_range_start == tile_range_end && us_tile_range_start == us_tile_range_end {
+    // No objects overlap this tile — write background and skip.
+    if tile_range_start == tile_range_end {
         let coord = vec2<i32>(pixel.xy);
         textureStore(gbuf_position, coord, vec4<f32>(0.0, 0.0, 0.0, 1e10));
         textureStore(gbuf_normal, coord, vec4<f32>(0.0, 0.0, 0.0, 0.0));
@@ -2461,133 +2372,6 @@ fn main(
         }
     }
 
-    // Phase 6 — user-shader entry loop. Mirrors the host-object loop
-    // above but iterates `us_tile_entries[]` and synthesizes a
-    // minimal `RkpInstance` per entry. Each entry's asset has
-    // `shader_id != 0`, so `march_object` takes the user-shader
-    // branch (numerical Jacobian via `inst_to_local`; AABB comes
-    // from the entry's cached value). The world-AABB ray cull and
-    // the per-pixel screen-rect pre-reject below are the two cheap
-    // gates that keep user-shader instance perf bounded:
-    //
-    //   1. Screen-rect reject: the tile-scatter pass cached this
-    //      blade's full screen-pixel AABB. A pixel inside the tile
-    //      but outside the blade's screen footprint pays four u16
-    //      compares and continues — no hooks, no DDA.
-    //   2. World-AABB reject: `march_object`'s user-shader branch
-    //      runs `intersect_aabb` against the cached world AABB and
-    //      returns early if the ray misses, again without calling
-    //      the user shader.
-    let pixel_x = pixel.x;
-    let pixel_y = pixel.y;
-    for (var k = us_tile_range_start; k < us_tile_range_end; k++) {
-        let entry = us_tile_entries[k];
-        // Per-pixel screen-rect reject. `screen_*_packed` carries
-        // (x as u16) | ((y as u16) << 16); compare against
-        // `pixel.xy` directly.
-        let smin_x = entry.screen_min_packed & 0xFFFFu;
-        let smin_y = entry.screen_min_packed >> 16u;
-        let smax_x = entry.screen_max_packed & 0xFFFFu;
-        let smax_y = entry.screen_max_packed >> 16u;
-        if pixel_x < smin_x || pixel_x > smax_x
-            || pixel_y < smin_y || pixel_y > smax_y { continue; }
-
-        let inst = synth_inst_from_entry(entry);
-        let asset = assets[entry.asset_id];
-        // Defensive: if a non-user-shader asset somehow ended up
-        // here, skip rather than fall through to the legacy descent.
-        if asset.shader_id == 0u { continue; }
-
-        let r = march_object(
-            ray_origin, ray_dir, inst, asset,
-            entry.aabb_min, entry.aabb_max,
-        );
-        total_steps += r.steps;
-
-        // Glass — user-shader glass is V1-best-effort. The
-        // user-shader branch in `march_object` populates `glass_*_t`
-        // in oc-units against `local_dir_unnorm`-normalized direction
-        // — same convention as the affine path with
-        // `local_to_world_scale = 1.0`. Mirror the affine path's
-        // tracking but treat returned t-values as already world.
-        if r.glass_valid {
-            let g_enter = r.glass_enter_t;
-            let g_exit = r.glass_exit_t;
-            if g_enter < glass_enter_dist && g_enter < max_world_dist {
-                glass_have = true;
-                glass_enter_dist = g_enter;
-                glass_exit_dist = g_exit;
-                glass_normal_world = normalize(r.glass_normal);
-                glass_material_id = r.glass_material;
-            }
-            if g_enter < pick_dist {
-                pick_dist = g_enter;
-                pick_obj_id = inst.object_id;
-                pick_leaf_slot = r.glass_slot;
-            }
-        }
-
-        if !r.valid { continue; }
-
-        // User-shader hit: world_pos / world_normal already populated
-        // by `march_object`'s user-shader branch via `inst_to_local`'s
-        // numerical Jacobian. No back-transform through `inst.world`
-        // (which is identity here anyway).
-        let inv_a = 1.0 / max(r.alpha, 0.001);
-        let color = r.color * inv_a;
-        let world_pos = r.world_pos;
-        let hit_dist = length(world_pos - ray_origin);
-        if hit_dist > max_world_dist { continue; }
-        let world_normal = normalize(r.world_normal);
-
-        if r.alpha > 0.99 {
-            accum_pos = world_pos;
-            accum_normal = world_normal;
-            accum_color = color;
-            accum_alpha = 1.0;
-            first_dist = hit_dist;
-            first_obj_id = inst.object_id;
-            // V1 host-material inheritance (locked Option B Stage 1):
-            // proto bake writes `material_primary = 0`; the host march
-            // packs the entry's painted material over.
-            first_mat_id = inst.material_id;
-            first_sec_mat = 0u;
-            first_blend = 0u;
-            first_leaf_slot = r.first_slot;
-            have_first = true;
-            max_world_dist = hit_dist;
-            // Sentinel — `closest_obj_idx` is consumed by the
-            // footprint histogram to look up `instances[idx]`. User-
-            // shader hits have no instances[] index; the histogram
-            // skips when this is `0xFFFFFFFFu`.
-            closest_obj_idx = 0xFFFFFFFFu;
-            if hit_dist < pick_dist {
-                pick_dist = hit_dist;
-                pick_obj_id = inst.object_id;
-                pick_leaf_slot = r.first_slot;
-            }
-            continue;
-        }
-
-        // Transparent — same accumulator as legacy loop.
-        let remaining = 1.0 - accum_alpha;
-        let weight = r.alpha * remaining;
-        accum_pos += world_pos * weight;
-        accum_normal += world_normal * weight;
-        accum_color += color * weight;
-        accum_alpha += weight;
-        if !have_first {
-            first_dist = hit_dist;
-            first_obj_id = inst.object_id;
-            closest_obj_idx = 0xFFFFFFFFu;
-            first_mat_id = inst.material_id;
-            first_sec_mat = 0u;
-            first_blend = 0u;
-            first_leaf_slot = r.first_slot;
-            have_first = true;
-        }
-    }
-
     // Phase B-redux Phase 3a — instance_at dispatch at the host hit.
     // When the closest host hit's material has an instance shader,
     // run user-shader instance descent at the painted leaf. Many
@@ -2595,8 +2379,7 @@ fn main(
     // surface (a blade rooted on the ground extends upward; a stalk
     // on a wall extends outward), so the descent often produces a
     // closer hit than the host's surface; replace accumulators on
-    // win. Phase 2's Option B `us_tile_entries` loop above still
-    // runs in parallel during the migration.
+    // win.
     //
     // Phase 3b coexistence: when the closest hit was at a band cell
     // inside a user-shader REGION object, `march_object` already ran

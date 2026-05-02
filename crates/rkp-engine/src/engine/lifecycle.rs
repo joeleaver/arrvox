@@ -77,7 +77,6 @@ impl EngineState {
         let user_shader_shade_chunk = composed.shade;
         let user_shader_generate_chunk = composed.generate;
         let user_shader_proto_chunk = composed.proto;
-        let user_shader_emit_chunk = composed.emit;
         let user_shader_inst_to_local_chunk = composed.inst_to_local;
         let user_shader_inst_aabb_chunk = composed.inst_aabb;
         let user_shader_instance_at_chunk = composed.instance_at;
@@ -101,37 +100,26 @@ impl EngineState {
         // Manual registrations come first (engine-command path; empty
         // unless something explicitly populates it).
         user_shader_regions.extend(self.user_shader_regions.iter().cloned());
-        // Stage 6d — Option B instance shader region requests. Same
-        // (entity × painted-material) walk as `user_shader_regions`,
-        // partitioned by shader kind in the emit loop below.
-        // Phase 5.1 — Option B emit path stopped producing requests;
-        // this Vec ships empty until 5.2 deletes its downstream
-        // consumers (emit/tile-cull/scatter passes).
-        let instance_region_requests: Vec<
-            rkp_render::user_shader_emit_pass::InstanceRegionRequest,
-        > = Vec::new();
         let infos = self.user_shader_registry.shader_infos();
 
         // Build the set of "shader-bearing material ids" — materials
-        // whose shader has any of: a `generate` hook (Phase C
-        // per-cell pipeline), an `is_instance_pipeline` flag
-        // (Option B voxel sprite instancing), or an `instance_at`
-        // hook (Phase B-redux band-cell derivation). Same painted-
-        // AABB scan feeds all three; the per-tile emit loop below
-        // partitions on shader kind.
+        // whose shader has either a `generate` hook (Phase C per-cell
+        // pipeline) or an `instance_at` hook (Phase B-redux band-cell
+        // derivation). Same painted-AABB scan feeds both kinds; the
+        // per-tile emit loop below partitions on shader kind.
         let mut shader_materials: std::collections::HashMap<
             u16,
             rkp_render::shader_composer::UserShaderInfo,
         > = std::collections::HashMap::new();
         let any_shader_pipeline = infos
             .iter()
-            .any(|i| i.has_generate || i.is_instance_pipeline || i.has_instance_at);
+            .any(|i| i.has_generate || i.has_instance_at);
         if any_shader_pipeline {
             for slot_id in 0..self.material_lib.slot_count() as u16 {
                 let Some(def) = self.material_lib.get_def(slot_id) else { continue; };
                 let Some(shader_name) = def.shader.as_deref() else { continue; };
                 let Some(info) = infos.iter().find(|i| i.name == shader_name) else { continue; };
-                if info.has_generate || info.is_instance_pipeline || info.has_instance_at {
+                if info.has_generate || info.has_instance_at {
                     shader_materials.insert(slot_id, info.clone());
                 }
             }
@@ -407,17 +395,12 @@ impl EngineState {
                             world_center[2] + half_extent,
                         ];
 
-                        // Partition by shader kind. Three paths today:
+                        // Partition by shader kind. Two paths today:
                         //   - `has_instance_at` → Phase B-redux band-cell
                         //     path. BFS bakes per-region band cells; the
                         //     march fires `dispatch_user_instance_descend`
-                        //     on hit. Preempts `is_instance_pipeline` for
-                        //     the same shader (the grass demo carries
-                        //     both during migration; Phase 5 deletes the
-                        //     emit hook).
+                        //     on hit.
                         //   - `has_generate` → Phase C voxel emit BFS.
-                        //   - `is_instance_pipeline` → Option B per-pixel
-                        //     instance pool emit. Going away in Phase 5.
                         if info.has_instance_at {
                             user_shader_regions.push(rkp_render::user_shader_pass::ShaderRegionRequest {
                                 host_object_id: inst.object_id,
@@ -463,15 +446,6 @@ impl EngineState {
                                 is_band_region: false,
                             });
                         }
-                        // Phase 5.1 — `is_instance_pipeline` arm removed.
-                        // The grass demo shader carries both `instance_at`
-                        // (Phase B-redux) and `emit_instance` (Option B);
-                        // with `has_instance_at` preempting above, grass
-                        // routes through the band path. No other shader
-                        // in the project uses Option B, so this arm is
-                        // dead. `instance_region_requests` stays empty;
-                        // 5.2 deletes the downstream emit / cull / scatter
-                        // passes that consumed it.
                     }
                 }
             }
@@ -1075,17 +1049,12 @@ impl EngineState {
             user_shader_source_hash,
             user_shader_generate_chunk,
             user_shader_proto_chunk,
-            user_shader_emit_chunk,
             user_shader_inst_to_local_chunk,
             user_shader_inst_aabb_chunk,
             user_shader_instance_at_chunk,
             user_shader_infos,
             user_shader_entries,
             user_shader_regions,
-            // Stage 6d — Option B instance pipeline. Built above by
-            // the same painted-AABB walk as `user_shader_regions`,
-            // partitioned on shader kind.
-            instance_region_requests,
             lights: gpu_lights,
             shade_params_base: self.shade_params_base,
             env_update,
@@ -1246,29 +1215,8 @@ fn scan_painted_aabbs(
                             let cell_max = cell_local + glam::Vec3::splat(base_vs);
                             let info = shader_materials.get(&mat);
                             let tile_size = info.and_then(|i| i.tile_size);
-                            // Build a PaintedLeaf record only for instance
-                            // shaders; Phase C generate shaders ignore
-                            // leaves and we save the allocation.
-                            let leaf = if info.map(|i| i.is_instance_pipeline).unwrap_or(false) {
-                                let cell_center = cell_local + glam::Vec3::splat(base_vs * 0.5);
-                                let local_normal = rkp_core::leaf_attr::unpack_oct(attr.normal_oct);
-                                let (world_pos, world_normal) = transform_leaf(
-                                    cell_center, local_normal, entity_world,
-                                );
-                                let material_packed = (primary as u32)
-                                    | ((secondary as u32) << 16)
-                                    | ((blend as u32) << 28);
-                                Some(rkp_render::user_shader_emit_pass::PaintedLeaf {
-                                    world_pos: world_pos.to_array(),
-                                    material_packed,
-                                    world_normal: world_normal.to_array(),
-                                    _pad: 0.0,
-                                })
-                            } else {
-                                None
-                            };
                             super::lifecycle::expand_aabb(
-                                out, mat, cell_local, cell_max, tile_size, leaf,
+                                out, mat, cell_local, cell_max, tile_size,
                             );
                         }
                     }
@@ -1301,26 +1249,8 @@ fn scan_painted_aabbs(
                 let leaf_max = leaf_min + glam::Vec3::splat(leaf_size);
                 let info = shader_materials.get(&mat);
                 let tile_size = info.and_then(|i| i.tile_size);
-                let leaf = if info.map(|i| i.is_instance_pipeline).unwrap_or(false) {
-                    let cell_center = leaf_min + glam::Vec3::splat(leaf_size * 0.5);
-                    let local_normal = rkp_core::leaf_attr::unpack_oct(attr.normal_oct);
-                    let (world_pos, world_normal) = transform_leaf(
-                        cell_center, local_normal, entity_world,
-                    );
-                    let material_packed = (primary as u32)
-                        | ((secondary as u32) << 16)
-                        | ((blend as u32) << 28);
-                    Some(rkp_render::user_shader_emit_pass::PaintedLeaf {
-                        world_pos: world_pos.to_array(),
-                        material_packed,
-                        world_normal: world_normal.to_array(),
-                        _pad: 0.0,
-                    })
-                } else {
-                    None
-                };
                 super::lifecycle::expand_aabb(
-                    out, mat, leaf_min, leaf_max, tile_size, leaf,
+                    out, mat, leaf_min, leaf_max, tile_size,
                 );
             }
             return;
@@ -1568,7 +1498,6 @@ fn expand_aabb(
     mn: glam::Vec3,
     mx: glam::Vec3,
     tile_size: Option<f32>,
-    leaf: Option<rkp_render::user_shader_emit_pass::PaintedLeaf>,
 ) {
     let mat_map = out.entry(mat).or_default();
 
@@ -1577,19 +1506,15 @@ fn expand_aabb(
         key: [i32; 3],
         mn: glam::Vec3,
         mx: glam::Vec3,
-        leaf: Option<rkp_render::user_shader_emit_pass::PaintedLeaf>,
     ) {
         let entry = mat_map.entry(key).or_insert_with(super::state::PaintedTileEntry::empty);
         entry.aabb.min = entry.aabb.min.min(mn);
         entry.aabb.max = entry.aabb.max.max(mx);
         entry.leaf_count = entry.leaf_count.saturating_add(1);
-        if let Some(l) = leaf {
-            entry.leaves.push(l);
-        }
     }
 
     match tile_size {
-        None => merge(mat_map, NO_TILE_COORD, mn, mx, leaf),
+        None => merge(mat_map, NO_TILE_COORD, mn, mx),
         Some(s) if s > 0.0 => {
             // Compute tile coord range the leaf overlaps. Use a tiny
             // epsilon on the upper bound so a leaf whose max sits
@@ -1601,16 +1526,13 @@ fn expand_aabb(
             for ix in (lo.x as i32)..=(hi.x as i32) {
                 for iy in (lo.y as i32)..=(hi.y as i32) {
                     for iz in (lo.z as i32)..=(hi.z as i32) {
-                        // Same leaf is appended to every tile it
-                        // overlaps. Tiled instance shaders aren't
-                        // exercised yet but the API stays consistent.
-                        merge(mat_map, [ix, iy, iz], mn, mx, leaf);
+                        merge(mat_map, [ix, iy, iz], mn, mx);
                     }
                 }
             }
         }
         // tile_size 0 or negative → treat as non-tiled.
-        Some(_) => merge(mat_map, NO_TILE_COORD, mn, mx, leaf),
+        Some(_) => merge(mat_map, NO_TILE_COORD, mn, mx),
     }
 }
 

@@ -13,55 +13,6 @@ use crate::validate_wgsl;
 const STATS_U32_COUNT: usize = 64;
 const STATS_BYTES: u64 = (STATS_U32_COUNT * 4) as u64;
 
-/// Per-tile user-shader entry (Phase 6, fattened post-Phase-8 perf
-/// pass). Each entry carries enough metadata for the host march to
-/// dispatch the user-shader path without going through a per-instance
-/// `RkpGpuInstance` — those are gone for user-shader paths in Phase 6.
-///
-/// The world AABB and screen-pixel rect are cached here so the per-
-/// pixel `march_object` path does NOT re-call the user shader's
-/// (potentially expensive) `inst_aabb` hook to test the ray, and
-/// `main()` can pre-reject pixels outside the blade's screen footprint
-/// with a 4-compare before any hook dispatch. Both values are already
-/// computed by the tile-cull / tile-scatter passes; they used to be
-/// recomputed per-pixel.
-///
-/// Wire format must match the WGSL struct in
-/// `octree_march.wgsl::UserShaderTileEntry` and
-/// `user_shader_tile_scatter.wgsl::UserShaderTileEntry`. 48 bytes —
-/// the WGSL `vec3<f32>` followed by `u32` packs the trailing u32 into
-/// the vec3's natural pad slot (offsets 0..12, 12..16; same trick used
-/// by `InstanceTileCullEntry`).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct UserShaderTileEntry {
-    /// World-space AABB min (cached from `inst_aabb` at tile-cull time).
-    pub aabb_min: [f32; 3],
-    /// Index into the scene's `assets[]` array. Looks up the user-
-    /// shader proto (octree_root, max_depth, voxel_size, shader_id).
-    pub asset_id: u32,
-    /// World-space AABB max.
-    pub aabb_max: [f32; 3],
-    /// u32 offset into `instance_pool` for this instance's per-instance
-    /// state. The user's hooks read from this offset.
-    pub instance_state_offset: u32,
-    /// Painted host material id (low 16 bits). The proto bake writes
-    /// `material_primary = 0` into its leaf_attrs; the host march
-    /// overrides with this on hit (locked V1 host-material inheritance).
-    pub material_id: u32,
-    /// Screen-pixel rect packed as `(x as u16) | ((y as u16) << 16)`.
-    /// Min corner. Computed by `tile_scatter_main` from the projected
-    /// world-AABB corners; clamped to viewport bounds so unpacking is
-    /// safe. The per-pixel `main()` loop tests `pixel.xy ∈ [min, max]`
-    /// and skips the entry on miss.
-    pub screen_min_packed: u32,
-    /// Screen-pixel rect max corner, same packing.
-    pub screen_max_packed: u32,
-    pub _pad: u32,
-}
-
-const _: () = assert!(std::mem::size_of::<UserShaderTileEntry>() == 48);
-
 /// Uniform parameters for the march shader.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -143,34 +94,6 @@ pub struct OctreeMarchPass {
     /// all per-tile counts, i.e. `tile_offsets[num_tiles]`.
     tile_object_ids_buffer: wgpu::Buffer,
     tile_object_ids_capacity: u64,
-    /// Phase 6 — per-tile user-shader entry offsets (prefix sum).
-    /// GPU-built each frame by the user-shader tile-cull pass. One
-    /// `u32` per tile + a sentinel; slice for tile `t` is
-    /// `us_tile_entries[us_tile_offsets[t]..us_tile_offsets[t+1]]`.
-    /// Sized in pair with `tile_offsets_buffer` so the host march can
-    /// loop both in parallel without separate dispatches.
-    pub us_tile_offsets_buffer: wgpu::Buffer,
-    pub us_tile_offsets_capacity: u64,
-    /// Phase 6 — flat per-tile `UserShaderTileEntry` array
-    /// (16 B each: asset_id, instance_state_offset, material_id,
-    /// _pad). Built GPU-side by the tile-cull scatter pass; each entry
-    /// carries enough metadata for the host march to dispatch the
-    /// user-shader path without going through a per-instance
-    /// `RkpGpuInstance` (those are gone for user-shader paths in
-    /// Phase 6).
-    pub us_tile_entries_buffer: wgpu::Buffer,
-    pub us_tile_entries_capacity: u64,
-    /// Phase 6 Session 3 — per-tile atomic counts populated by the
-    /// tile-cull count pass; consumed by the prefix-sum pass to build
-    /// `us_tile_offsets`. Reset to zero every frame. One `u32` per tile.
-    pub us_tile_counts_buffer: wgpu::Buffer,
-    pub us_tile_counts_capacity: u64,
-    /// Phase 6 Session 3 — per-tile atomic cursor for the scatter pass.
-    /// Engine initializes to a copy of `us_tile_offsets[..tile_count]`
-    /// before scatter; the pass `atomicAdd`s into it to claim slots
-    /// inside `us_tile_entries[]`. One `u32` per tile.
-    pub us_tile_scatter_cursor_buffer: wgpu::Buffer,
-    pub us_tile_scatter_cursor_capacity: u64,
     /// Phase 7 Session 4b — TLAS node + leaf buffers, shared with
     /// `state.tlas_pass`. Shadow trace reads bindings 8 + 9 to
     /// traverse the BVH. March itself doesn't currently read them
@@ -282,34 +205,6 @@ impl OctreeMarchPass {
                     // Binding 5: per-tile object-ids flat list.
                     wgpu::BindGroupLayoutEntry {
                         binding: 5,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    // Binding 6: per-tile user-shader entry offsets
-                    // (prefix sum). Phase 6 — GPU-built, parallel to
-                    // bindings 4/5 but for user-shader instances.
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 6,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    // Binding 7: per-tile user-shader entries
-                    // (`UserShaderTileEntry` records — 48 B each:
-                    // world AABB + asset_id + state_offset + material_id
-                    // + screen-pixel rect packed). Slice for tile `t` is
-                    // `us_tile_entries[us_tile_offsets[t]..us_tile_offsets[t+1]]`.
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 7,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -434,38 +329,6 @@ impl OctreeMarchPass {
                 mapped_at_creation: false,
             }),
             tile_object_ids_capacity: 256,
-            // Phase 6 — start at single-entry placeholders; tile-cull
-            // GPU pass writes these per frame and grows on overflow.
-            // Initial layout encodes "no user-shader instances" (one
-            // tile, one zero offset → empty entry list).
-            us_tile_offsets_buffer: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("march us_tile_offsets"),
-                size: 256,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            }),
-            us_tile_offsets_capacity: 256,
-            us_tile_entries_buffer: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("march us_tile_entries"),
-                size: 256,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }),
-            us_tile_entries_capacity: 256,
-            us_tile_counts_buffer: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("march us_tile_counts"),
-                size: 256,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }),
-            us_tile_counts_capacity: 256,
-            us_tile_scatter_cursor_buffer: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("march us_tile_scatter_cursor"),
-                size: 256,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            }),
-            us_tile_scatter_cursor_capacity: 256,
             tlas_nodes_buffer: None,
             tlas_leaves_buffer: None,
             lights_buffer: None,
@@ -598,14 +461,6 @@ impl OctreeMarchPass {
                     resource: self.tile_object_ids_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: self.us_tile_offsets_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: self.us_tile_entries_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
                     binding: 8,
                     resource: tlas_nodes.as_entire_binding(),
                 },
@@ -676,117 +531,6 @@ impl OctreeMarchPass {
         if !object_ids.is_empty() {
             queue.write_buffer(&self.tile_object_ids_buffer, 0, object_ids);
         }
-    }
-
-    /// Phase 6 Session 3 — grow the per-tile user-shader buffers to fit
-    /// `tile_count` tiles. The four buffers are sized in lock-step:
-    ///
-    /// * `us_tile_offsets`  — `(tile_count + 1) × 4 B` (prefix sum).
-    /// * `us_tile_counts`   — `tile_count × 4 B` (per-tile atomic).
-    /// * `us_tile_scatter_cursor` — `tile_count × 4 B` (per-tile atomic).
-    /// * `us_tile_entries`  — sized separately by `ensure_us_tile_entries_capacity`
-    ///   since entry count is determined by post-cull totals, not tile count.
-    ///
-    /// Returns `true` if any buffer was reallocated. The caller is
-    /// responsible for invalidating any cached bind group that references
-    /// these buffers (`params_bind_group` is rebuilt automatically by
-    /// `try_rebuild_params_bind_group`).
-    pub fn ensure_us_tile_grid_capacity(
-        &mut self,
-        device: &wgpu::Device,
-        tile_count: u32,
-    ) -> bool {
-        let offsets_needed = ((tile_count as u64) + 1) * 4;
-        let cells_needed = (tile_count as u64) * 4;
-        let mut dirty = false;
-        if offsets_needed > self.us_tile_offsets_capacity {
-            let mut new_cap = self.us_tile_offsets_capacity.max(256);
-            while new_cap < offsets_needed { new_cap = new_cap.saturating_mul(2); }
-            self.us_tile_offsets_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("march us_tile_offsets"),
-                size: new_cap,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-            self.us_tile_offsets_capacity = new_cap;
-            dirty = true;
-        }
-        if cells_needed > self.us_tile_counts_capacity {
-            let mut new_cap = self.us_tile_counts_capacity.max(256);
-            while new_cap < cells_needed { new_cap = new_cap.saturating_mul(2); }
-            self.us_tile_counts_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("march us_tile_counts"),
-                size: new_cap,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.us_tile_counts_capacity = new_cap;
-            dirty = true;
-        }
-        if cells_needed > self.us_tile_scatter_cursor_capacity {
-            let mut new_cap = self.us_tile_scatter_cursor_capacity.max(256);
-            while new_cap < cells_needed { new_cap = new_cap.saturating_mul(2); }
-            self.us_tile_scatter_cursor_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("march us_tile_scatter_cursor"),
-                size: new_cap,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-            self.us_tile_scatter_cursor_capacity = new_cap;
-            dirty = true;
-        }
-        if dirty {
-            self.params_bind_group = None;
-            self.try_rebuild_params_bind_group(device);
-        }
-        dirty
-    }
-
-    /// Phase 6 Session 3 — grow `us_tile_entries_buffer` to fit
-    /// `entry_count` × 48 B `UserShaderTileEntry` records. Sized
-    /// separately from the per-tile buffers because entry count comes
-    /// from post-cull totals (sum of per-tile counts), not tile count.
-    /// Returns `true` if reallocated.
-    pub fn ensure_us_tile_entries_capacity(
-        &mut self,
-        device: &wgpu::Device,
-        entry_count: u32,
-    ) -> bool {
-        let needed =
-            (entry_count.max(1) as u64) * std::mem::size_of::<UserShaderTileEntry>() as u64;
-        if needed <= self.us_tile_entries_capacity {
-            return false;
-        }
-        let mut new_cap = self.us_tile_entries_capacity.max(256);
-        while new_cap < needed { new_cap = new_cap.saturating_mul(2); }
-        self.us_tile_entries_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("march us_tile_entries"),
-            size: new_cap,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.us_tile_entries_capacity = new_cap;
-        self.params_bind_group = None;
-        self.try_rebuild_params_bind_group(device);
-        true
-    }
-
-    /// Phase 6 Session 3 — copy the prefix-summed `us_tile_offsets`
-    /// values for tiles `[0, tile_count)` into `us_tile_scatter_cursor`.
-    /// Each tile's slot starts at its prefix offset; the scatter pass's
-    /// atomicAdd produces slots in `[offset[t], offset[t+1])`.
-    pub fn init_scatter_cursor(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        tile_count: u32,
-    ) {
-        let bytes = (tile_count as u64) * 4;
-        if bytes == 0 { return; }
-        encoder.copy_buffer_to_buffer(
-            &self.us_tile_offsets_buffer, 0,
-            &self.us_tile_scatter_cursor_buffer, 0,
-            bytes,
-        );
     }
 
     /// Expose the params bind group layout so the shadow_trace pass can

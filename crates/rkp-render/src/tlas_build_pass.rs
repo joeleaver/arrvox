@@ -28,13 +28,30 @@
 //! AABBs → real BVH culling → shadow trace stays fast.
 
 use crate::rkp_gpu_object::{RkpGpuAsset, RkpGpuInstance};
-use crate::user_shader_tile_cull_pass::InstanceTileCullEntry;
 
-/// One primitive in the unified TLAS-build input list. Same wire
-/// shape as [`InstanceTileCullEntry`] minus the `live` flag (the
-/// assembly pass filters those out) plus an `instance_index` field
-/// that distinguishes host (real `RkpGpuInstance` index) from
-/// user-shader ([`TLAS_LEAF_USER_SHADER`]) leaves.
+/// 48-byte scratch entry used by Phase 6's deleted tile-cull AABB
+/// pass. Phase 5 cleanup retires the per-pixel emit/cull/scatter
+/// pipeline that produced these; the type is kept here as the wire
+/// shape for [`TlasPrim`] (and for the test-only CPU oracle path).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct InstanceTileCullEntry {
+    pub aabb_min: [f32; 3],
+    pub asset_id: u32,
+    pub aabb_max: [f32; 3],
+    pub instance_state_offset: u32,
+    pub material_id: u32,
+    pub live: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<InstanceTileCullEntry>() == 48);
+
+/// One primitive in the unified TLAS-build input list. Plus an
+/// `instance_index` field that distinguishes host (real
+/// `RkpGpuInstance` index) from user-shader
+/// ([`TLAS_LEAF_USER_SHADER`]) leaves.
 ///
 /// `aabb_min` / `aabb_max` are tight world-space bounds:
 /// * **Host** — `world × asset.local_aabb` via Arvo's transform.
@@ -67,20 +84,6 @@ const _: () = assert!(std::mem::size_of::<TlasPrim>() == 48);
 /// `tlas_pass.rs` in V1; once Session 5 retires the CPU path we
 /// can hoist the constant to a shared module.
 pub const TLAS_LEAF_USER_SHADER: u32 = 0xFFFF_FFFEu32;
-
-/// Per-dispatch uniform for the user-shader assembly pass. 16 B —
-/// matches `AssembleUserShaderUniform` in
-/// `tlas_assemble_user_shader.wgsl`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct AssembleUserShaderUniform {
-    pub scratch_count: u32,
-    pub prims_capacity: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
-}
-
-const _: () = assert!(std::mem::size_of::<AssembleUserShaderUniform>() == 16);
 
 /// Per-dispatch uniform for the host-instance assembly pass. 16 B —
 /// matches `AssembleHostUniform` in `tlas_assemble_host.wgsl`.
@@ -159,23 +162,19 @@ pub const TLAS_PRIMS_INITIAL_ENTRIES: u32 = 1;
 /// and AABB propagation.
 pub struct TlasBuildPass {
     // ── Session 1 ──────────────────────────────────────────────────
-    pub user_shader_pipeline: wgpu::ComputePipeline,
-    pub user_shader_g0_layout: wgpu::BindGroupLayout,
-    pub user_shader_g1_layout: wgpu::BindGroupLayout,
     pub host_pipeline: wgpu::ComputePipeline,
     pub host_g0_layout: wgpu::BindGroupLayout,
     pub host_g1_layout: wgpu::BindGroupLayout,
     /// Packed `array<TlasPrim>`. Capacity grows; `tlas_prim_count`
-    /// holds the per-frame live count after both assembly
-    /// dispatches finish.
+    /// holds the per-frame live count after the host assembly
+    /// dispatch finishes.
     pub tlas_prims_buffer: wgpu::Buffer,
     pub tlas_prims_capacity: u32,
-    /// Single-element `array<atomic<u32>>` — the assembly passes
-    /// `atomicAdd` into slot 0. Engine zeroes per frame before
+    /// Single-element `array<atomic<u32>>` — the assembly pass
+    /// `atomicAdd`s into slot 0. Engine zeroes per frame before
     /// dispatch.
     pub tlas_prim_count_buffer: wgpu::Buffer,
-    /// Per-dispatch uniforms. One slot each — re-uploaded per frame.
-    pub user_shader_uniform_buffer: wgpu::Buffer,
+    /// Per-dispatch uniform — re-uploaded per frame.
     pub host_uniform_buffer: wgpu::Buffer,
 
     // ── Session 2 — Morton + radix sort ───────────────────────────
@@ -261,13 +260,6 @@ pub struct TlasBuildPass {
 /// borrowed from external owners; the build pass binds them as
 /// pipeline inputs but doesn't take ownership.
 pub struct GpuTlasBuildInputs<'a> {
-    /// `instance_tile_cull_scratch_buffer` from the engine.
-    /// Holds one `InstanceTileCullEntry` per reserved instance
-    /// slot across all user-shader regions.
-    pub scratch_buffer: &'a wgpu::Buffer,
-    /// Total entries in `scratch_buffer` to walk. = sum of
-    /// `instance_block_size` across all regions this frame.
-    pub scratch_count: u32,
     /// `state.renderer.scene.objects_buffer` — `array<RkpGpuInstance>`.
     pub instances_buffer: &'a wgpu::Buffer,
     pub instance_count: u32,
@@ -283,40 +275,6 @@ pub struct GpuTlasBuildInputs<'a> {
 
 impl TlasBuildPass {
     pub fn new(device: &wgpu::Device) -> Self {
-        let user_shader_g0_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("tlas_assemble_user_shader g0"),
-                entries: &[
-                    ro_storage(0), // tile_cull_scratch
-                    rw_storage(1), // tlas_prims
-                    rw_storage(2), // tlas_prim_count
-                ],
-            });
-        let user_shader_g1_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("tlas_assemble_user_shader g1"),
-                entries: &[uniform_entry(0, std::mem::size_of::<AssembleUserShaderUniform>() as u64)],
-            });
-        let user_shader_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("tlas_assemble_user_shader pipeline layout"),
-            bind_group_layouts: &[Some(&user_shader_g0_layout), Some(&user_shader_g1_layout)],
-            immediate_size: 0,
-        });
-        let user_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("tlas_assemble_user_shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("shaders/tlas_assemble_user_shader.wgsl").into(),
-            ),
-        });
-        let user_shader_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("tlas_assemble_user_shader"),
-            layout: Some(&user_shader_layout),
-            module: &user_shader_module,
-            entry_point: Some("assemble_user_shader_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
         let host_g0_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("tlas_assemble_host g0"),
@@ -372,12 +330,6 @@ impl TlasBuildPass {
             mapped_at_creation: false,
         });
 
-        let user_shader_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tlas_assemble_user_shader uniform"),
-            size: std::mem::size_of::<AssembleUserShaderUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let host_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tlas_assemble_host uniform"),
             size: std::mem::size_of::<AssembleHostUniform>() as u64,
@@ -629,16 +581,12 @@ impl TlasBuildPass {
         });
 
         Self {
-            user_shader_pipeline,
-            user_shader_g0_layout,
-            user_shader_g1_layout,
             host_pipeline,
             host_g0_layout,
             host_g1_layout,
             tlas_prims_buffer,
             tlas_prims_capacity: TLAS_PRIMS_INITIAL_ENTRIES,
             tlas_prim_count_buffer,
-            user_shader_uniform_buffer,
             host_uniform_buffer,
             morton_pipeline,
             morton_g0_layout,
@@ -723,7 +671,7 @@ impl TlasBuildPass {
         inputs: &GpuTlasBuildInputs,
         tlas_pass: &mut crate::tlas_pass::TlasPass,
     ) -> u32 {
-        let upper_bound = inputs.scratch_count.saturating_add(inputs.instance_count);
+        let upper_bound = inputs.instance_count;
         if upper_bound == 0 {
             tlas_pass.last_node_count = 0;
             tlas_pass.last_leaf_count = 0;
@@ -740,17 +688,7 @@ impl TlasBuildPass {
         });
         enc1.clear_buffer(&self.tlas_prim_count_buffer, 0, Some(4));
 
-        // Upload assembly uniforms.
-        queue.write_buffer(
-            &self.user_shader_uniform_buffer,
-            0,
-            bytemuck::bytes_of(&AssembleUserShaderUniform {
-                scratch_count: inputs.scratch_count,
-                prims_capacity: self.tlas_prims_capacity,
-                _pad0: 0,
-                _pad1: 0,
-            }),
-        );
+        // Upload assembly uniform.
         queue.write_buffer(
             &self.host_uniform_buffer,
             0,
@@ -761,36 +699,6 @@ impl TlasBuildPass {
                 _pad: 0,
             }),
         );
-
-        // User-shader assembly bind groups + dispatch.
-        if inputs.scratch_count > 0 {
-            let g0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("tlas_assemble_user_shader g0"),
-                layout: &self.user_shader_g0_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: inputs.scratch_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: self.tlas_prims_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: self.tlas_prim_count_buffer.as_entire_binding() },
-                ],
-            });
-            let g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("tlas_assemble_user_shader g1"),
-                layout: &self.user_shader_g1_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.user_shader_uniform_buffer.as_entire_binding(),
-                }],
-            });
-            let mut cpass = enc1.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("assemble_user_shader_main"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.user_shader_pipeline);
-            cpass.set_bind_group(0, &g0, &[]);
-            cpass.set_bind_group(1, &g1, &[]);
-            let wgs = ((inputs.scratch_count + 63) / 64).max(1);
-            cpass.dispatch_workgroups(wgs, 1, 1);
-        }
 
         // Host assembly bind groups + dispatch.
         if inputs.instance_count > 0 {
@@ -846,21 +754,11 @@ impl TlasBuildPass {
         // `if (slot >= u.prims_capacity) return;`; the counter
         // just kept incrementing for telemetry.
         let actual_count = raw_count.min(self.tlas_prims_capacity);
-        let upper_bound = inputs.scratch_count.saturating_add(inputs.instance_count);
-        // Diagnostic logging — log every frame that involves
-        // grass (scratch_count > 0). User observation report
-        // can be correlated against these values.
-        if inputs.scratch_count > 0 {
+        let upper_bound = inputs.instance_count;
+        if raw_count > upper_bound || (raw_count == 0 && upper_bound > 0) {
             eprintln!(
-                "[tlas_build] raw={raw_count} actual={actual_count} scratch={} host={} upper={} caps prims={} keys={}",
-                inputs.scratch_count, inputs.instance_count, upper_bound,
-                self.tlas_prims_capacity, self.keys_capacity,
-            );
-        } else if raw_count > upper_bound || (raw_count == 0 && upper_bound > 0) {
-            // Suspicious value even without grass.
-            eprintln!(
-                "[tlas_build] suspect raw={raw_count} upper={upper_bound} scratch={} host={}",
-                inputs.scratch_count, inputs.instance_count,
+                "[tlas_build] suspect raw={raw_count} upper={upper_bound} host={}",
+                inputs.instance_count,
             );
         }
 

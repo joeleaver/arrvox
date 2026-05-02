@@ -11,16 +11,14 @@
 
 use rkp_render::rkp_gpu_object::{RkpGpuAsset, RkpGpuInstance};
 use rkp_render::rkp_scene_manager::RkpSceneManager;
-use rkp_render::user_shader_emit_pass::PaintedLeaf;
 
-/// One tile's worth of painted-material info: AABB + count + the
-/// leaves themselves (only populated for instance-pipeline shaders;
-/// Phase C generate shaders ignore the leaves vec).
+/// One tile's worth of painted-material info: AABB + count of painted
+/// leaves that fall inside the tile. Used by Phase B-redux + Phase C
+/// region partitioning.
 #[derive(Debug, Clone)]
 pub(crate) struct PaintedTileEntry {
     pub aabb: rkp_core::Aabb,
     pub leaf_count: u32,
-    pub leaves: Vec<PaintedLeaf>,
 }
 
 impl PaintedTileEntry {
@@ -31,7 +29,6 @@ impl PaintedTileEntry {
                 max: glam::Vec3::splat(f32::NEG_INFINITY),
             },
             leaf_count: 0,
-            leaves: Vec::new(),
         }
     }
 }

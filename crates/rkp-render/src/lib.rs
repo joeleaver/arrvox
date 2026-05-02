@@ -73,32 +73,13 @@ pub mod instance_proto;
 /// run here, materializing voxels in a transient pool the march/shade
 /// passes already know how to read.
 pub mod user_shader_pass;
-/// Option B — prototype bake pipeline. Voxelizes each instance shader's
-/// `proto_sample_at(uvw)` into a small dedicated octree+brick+leaf-attr
-/// triple, cached by source hash. Shares pool buffers with
-/// `user_shader_pass` at a disjoint byte range.
+/// Phase B-redux — prototype bake pipeline. Voxelizes each instance
+/// shader's `proto_sample_at(uvw)` into a dedicated octree+brick+leaf-
+/// attr triple, cached by source hash. Shares pool buffers with
+/// `user_shader_pass` at a disjoint byte range. The march path's
+/// `descend_proto_octree` reads these baked prototypes when a
+/// band-cell hit triggers `instance_at` derivation.
 pub mod user_shader_proto_pass;
-/// Option B — per-region instance scatter pipeline. Runs each instance
-/// shader's `emit` hook over a 3D sample grid at brick-parent
-/// granularity, atomic-appending placed instances into a per-region
-/// slice of a global instance pool.
-pub mod user_shader_emit_pass;
-/// Phase 6 — user-shader tile-cull AABB compute pass. Per filled
-/// instance slot in `instance_pool`, dispatches the user shader's
-/// `inst_aabb` hook to build a world-space AABB scratch buffer the
-/// downstream tile-cull (count + prefix + scatter) consumes.
-pub mod user_shader_tile_cull_pass;
-/// Phase 6 — count phase of tile-cull. Per AABB scratch entry, projects
-/// to screen tiles and atomically increments per-tile counts.
-pub mod user_shader_tile_count_pass;
-/// Phase 6 — prefix-sum phase of tile-cull. Single-WG blocked scan
-/// turning per-tile counts into per-tile entry offsets (V1 cap 65536
-/// tiles per dispatch).
-pub mod user_shader_tile_prefix_pass;
-/// Phase 6 — scatter phase of tile-cull. Per AABB scratch entry, writes
-/// 48-byte UserShaderTileEntry records into us_tile_entries[] using
-/// per-tile atomic cursors initialized from the prefix-summed offsets.
-pub mod user_shader_tile_scatter_pass;
 /// Phase 7 — TLAS over instance AABBs for shadow rays (and future
 /// reflections / AO / GI). Session 1 ships only the wire format +
 /// buffer storage; Sessions 2-4 add the CPU builder, GPU upload,
