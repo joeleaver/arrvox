@@ -532,6 +532,45 @@ fn dispatch_user_generate(shader_id: u32, cell_world_pos: vec3<f32>, host: HostS
 }
 // USER_GENERATE_DISPATCH_END
 
+// V2 band-cell anchor — surface projection along the host distance
+// field's gradient. Six extra `host_sample_in_region` calls (central
+// differences along ±X/±Y/±Z) yield a normal that aims at the nearest
+// surface; projecting `center` along that normal by the Lipschitz
+// distance lands on the host surface for flat floors, walls, AND
+// slopes alike. The V1 hack used `(0,1,0)` and worked only on flat
+// ground.
+//
+// Gradient sample step is the cell's half-extent — same scale as the
+// cell, large enough to span a brick boundary if the cell sits on
+// one (so the gradient sees the surface even when the cell straddles
+// a brick face) but tight enough that the bound stays meaningful.
+//
+// Falls back to `(0,1,0)` when the gradient is degenerate
+// (`length < 1e-4`) — happens far from any host surface or in flat
+// regions of the distance field. The fallback matches the V1 default
+// so the regression on a flat floor is zero.
+fn band_anchor_v2(
+    center: vec3<f32>,
+    host_distance: f32,
+    cell_half: f32,
+    region_index: u32,
+) -> vec3<f32> {
+    let eps = cell_half;
+    let dx = host_sample_in_region(center + vec3<f32>(eps, 0.0, 0.0), region_index).distance
+           - host_sample_in_region(center - vec3<f32>(eps, 0.0, 0.0), region_index).distance;
+    let dy = host_sample_in_region(center + vec3<f32>(0.0, eps, 0.0), region_index).distance
+           - host_sample_in_region(center - vec3<f32>(0.0, eps, 0.0), region_index).distance;
+    let dz = host_sample_in_region(center + vec3<f32>(0.0, 0.0, eps), region_index).distance
+           - host_sample_in_region(center - vec3<f32>(0.0, 0.0, eps), region_index).distance;
+    let g = vec3<f32>(dx, dy, dz);
+    let g_len = length(g);
+    var normal = vec3<f32>(0.0, 1.0, 0.0);
+    if (g_len > 1e-4) {
+        normal = g / g_len;
+    }
+    return center - normal * host_distance;
+}
+
 // Classify pass — workgroup_size 64. One thread per active cell at level
 // `level_u.current_level`. Threads with gid.x past the level's count
 // early-out (saves us a separate "build indirect args" dispatch pass at
@@ -600,17 +639,11 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // `LEAF | BAND | abs_off` so the march fires
         // `dispatch_user_instance_descend` on hit.
         //
-        // V1 anchor projects the cell center DOWNWARD by
-        // `host.distance` — works for flat floors where the host's
-        // surface is at constant Y. `host_sample_in_region` returns
-        // a Lipschitz lower-bound distance with no usable normal
-        // (the default `(0,1,0)` is a placeholder), so vertical
-        // walls + sloped surfaces produce a misaligned anchor here.
-        // Future V2 will compute a proper surface projection
-        // (numerical gradient on the host octree, or multi-source
-        // BFS seeded by painted leaves).
+        // V2 anchor: projects along the numerical gradient of the
+        // host distance field; lands on the surface for flat floors,
+        // walls, AND slopes (was `(0,1,0)` in V1).
         if (cur_region.use_band_path != 0u) {
-            let anchor = center - vec3<f32>(0.0, host.distance, 0.0);
+            let anchor = band_anchor_v2(center, host.distance, half, cell.region_index);
             let band_slot = atomicAdd(&leaf_attr_alloc[cell.region_index], 2u);
             if (band_slot + 2u <= cur_region.leaf_attr_block_size) {
                 let abs_off = cur_region.leaf_attr_block_offset + band_slot;
@@ -778,13 +811,12 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
             // Phase B-redux 3b — band-cell path, V13-inline mirror
-            // of the L==max_depth branch above. Pack BandCell into
-            // two leaf-attr slots; tag node `LEAF | BAND | abs_off`.
-            // Project DOWN by child_host.distance to land near the
-            // host surface (V1 flat-ground assumption — see the
-            // L==max_depth branch above for context).
+            // of the L==max_depth branch above. Same V2 gradient
+            // anchor + same BandCell layout (anchor xyz + region's
+            // host material_id, NOT region_index — the march reads
+            // it as material_id to resolve shader_id and ctx.params).
             if (cur_region.use_band_path != 0u) {
-                let anchor = child_center - vec3<f32>(0.0, child_host.distance, 0.0);
+                let anchor = band_anchor_v2(child_center, child_host.distance, child_half, cell.region_index);
                 let band_slot = atomicAdd(&leaf_attr_alloc[cell.region_index], 2u);
                 if (band_slot + 2u <= cur_region.leaf_attr_block_size) {
                     let abs_off = cur_region.leaf_attr_block_offset + band_slot;
@@ -794,7 +826,7 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     leaf_attr_pool[abs_off] = s0;
                     var s1: LeafAttr;
                     s1.normal_oct = bitcast<u32>(anchor.z);
-                    s1.material_packed = cell.region_index;
+                    s1.material_packed = cur_region.material_id;
                     leaf_attr_pool[abs_off + 1u] = s1;
                     octree_nodes[child_offset] = vec2<u32>(
                         OCTREE_LEAF_BIT | OCTREE_BAND_BIT | abs_off,
