@@ -119,12 +119,10 @@ impl ShadowTracePass {
     }
 
     /// Rebuild the compute pipeline against spliced user-shader chunks.
-    /// Mirrors `OctreeMarchPass::reload_user_shaders`. Phase 4c.
+    /// Mirrors `OctreeMarchPass::reload_user_shaders`.
     pub fn reload_user_shaders(
         &mut self,
         device: &wgpu::Device,
-        inst_to_local_chunk: &str,
-        inst_aabb_chunk: &str,
         instance_at_chunk: &str,
         source_hash: u64,
     ) -> bool {
@@ -133,7 +131,7 @@ impl ShadowTracePass {
         }
         let template = include_str!("shaders/rkp_shadow_trace.wgsl");
         let source = crate::shader_composer::splice_inst_chunks(
-            template, inst_to_local_chunk, inst_aabb_chunk, instance_at_chunk,
+            template, instance_at_chunk,
         );
         validate_wgsl(&source, "rkp_shadow_trace");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {

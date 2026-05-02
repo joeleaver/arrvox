@@ -55,18 +55,18 @@ impl RenderContext {
                         adapter.limits().max_storage_buffer_binding_size.min(1 << 31),
                     max_buffer_size: adapter.limits().max_buffer_size.min(1 << 31),
                     // 24 rather than the wgpu default 8 — group 0's
-                    // scene bindings are 14 storage buffers (brick_pool,
+                    // scene bindings are 13 storage buffers (brick_pool,
                     // octree_nodes, objects, color_pool, bone_matrices,
                     // bone_weights, brick_face_links, leaf_attr_pool,
                     // bone_field, bone_field_occ, bone_dual_quats,
-                    // assets, instance_overlay, instance_pool).
+                    // assets, instance_overlay).
                     // March group 2 adds 7 (materials, stats, lights,
                     // tile_offsets, tile_object_ids, us_tile_offsets,
-                    // us_tile_entries) for 21 total. naga
+                    // us_tile_entries) for 20 total. naga
                     // dead-code-eliminates unused-by-shader bindings, so
                     // the host march previously used fewer; Phase 6
                     // Session 4 actually reads us_tile_offsets/entries,
-                    // pushing the live count to 21. Desktop GPUs
+                    // pushing the live count to 20. Desktop GPUs
                     // support 24+; GLES 3.x / some mobile top out at
                     // 16 but aren't supported targets.
                     max_storage_buffers_per_shader_stage: 24,
@@ -147,18 +147,18 @@ impl RenderContext {
                         adapter.limits().max_storage_buffer_binding_size.min(1 << 31),
                     max_buffer_size: adapter.limits().max_buffer_size.min(1 << 31),
                     // 24 rather than the wgpu default 8 — group 0's
-                    // scene bindings are 14 storage buffers (brick_pool,
+                    // scene bindings are 13 storage buffers (brick_pool,
                     // octree_nodes, objects, color_pool, bone_matrices,
                     // bone_weights, brick_face_links, leaf_attr_pool,
                     // bone_field, bone_field_occ, bone_dual_quats,
-                    // assets, instance_overlay, instance_pool).
+                    // assets, instance_overlay).
                     // March group 2 adds 7 (materials, stats, lights,
                     // tile_offsets, tile_object_ids, us_tile_offsets,
-                    // us_tile_entries) for 21 total. naga
+                    // us_tile_entries) for 20 total. naga
                     // dead-code-eliminates unused-by-shader bindings, so
                     // the host march previously used fewer; Phase 6
                     // Session 4 actually reads us_tile_offsets/entries,
-                    // pushing the live count to 21. Desktop GPUs
+                    // pushing the live count to 20. Desktop GPUs
                     // support 24+; GLES 3.x / some mobile top out at
                     // 16 but aren't supported targets.
                     max_storage_buffers_per_shader_stage: 24,

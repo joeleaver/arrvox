@@ -23,7 +23,7 @@ struct TlasPrim {
     _pad1: u32,
 }
 
-// Mirrors `RkpGpuInstance` (144 B). Only the fields this pass needs
+// Mirrors `RkpGpuInstance` (128 B). Only the fields this pass needs
 // are referenced.
 struct GpuInstance {
     world: mat4x4<f32>,
@@ -43,10 +43,6 @@ struct GpuInstance {
     bone_field_origin_z: f32,
     overlay_offset: u32,
     overlay_count: u32,
-    instance_state_offset: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
 }
 
 // Mirrors `RkpGpuAsset` (80 B).

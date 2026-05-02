@@ -927,37 +927,27 @@ fn render_one_frame(
             &frame.user_shader_shade_chunk,
             frame.user_shader_source_hash,
         );
-        // Phase 4c — host march + shadow trace splice the user-shader
-        // inst_to_local + inst_aabb chunks the same way Option B's
-        // instance_march does. Hash gate inside each `reload` makes
-        // the no-change frame a no-op.
+        // Host march + shadow trace splice the user-shader instance_at
+        // chunk (the band-cell descent hook). Hash gate inside each
+        // `reload` makes the no-change frame a no-op.
         vr.march.reload_user_shaders(
             &state.device,
-            &frame.user_shader_inst_to_local_chunk,
-            &frame.user_shader_inst_aabb_chunk,
             &frame.user_shader_instance_at_chunk,
             frame.user_shader_source_hash,
         );
-        // Phase 4 wires instance_at into shadow_trace; for now pass
-        // empty so shadow_trace's lack of USER_INSTANCE_AT_DISPATCH
-        // markers doesn't trigger a panic in `splice_user_marker`.
+        // Shadow trace lacks USER_INSTANCE_AT_DISPATCH markers in V1;
+        // pass empty so the splice helper short-circuits. Phase 4
+        // wires real shadows for band-cell instance hits.
         vr.shadow_trace.reload_user_shaders(
             &state.device,
-            &frame.user_shader_inst_to_local_chunk,
-            &frame.user_shader_inst_aabb_chunk,
             "",
             frame.user_shader_source_hash,
         );
-        // Phase 8 — shadow_map_march descends into user-shader
-        // instances through the same `inst_to_local` / `inst_aabb`
-        // hooks the host march and shadow trace use. Without
-        // splicing, the pass runs against the identity stubs and
-        // user-shader instances (e.g. grass blades) cast no
-        // shadow because the depth march can't find their geometry.
+        // Shadow-map scatter likewise lacks markers in V1; user-shader
+        // instances do not yet cast directional-light shadows through
+        // this pass.
         vr.shadow_map.reload_user_shaders(
             &state.device,
-            &frame.user_shader_inst_to_local_chunk,
-            &frame.user_shader_inst_aabb_chunk,
             frame.user_shader_source_hash,
         );
         vr.shade.upload_shader_params(

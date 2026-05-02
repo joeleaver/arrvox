@@ -627,24 +627,22 @@ impl ShadowMapPass {
     }
 
     /// Rebuild the scatter pipeline against spliced user-shader chunks.
+    /// Shadow-map scatter doesn't run `instance_at` (Phase 4 will add
+    /// per-leaf grass descent into the half-res shadow path, but the
+    /// scatter pass itself just rasterizes screen-space AABBs).
     pub fn reload_user_shaders(
         &mut self,
         device: &wgpu::Device,
-        inst_to_local_chunk: &str,
-        inst_aabb_chunk: &str,
         source_hash: u64,
     ) -> bool {
         if source_hash == self.user_shader_source_hash {
             return false;
         }
         let template = include_str!("shaders/shadow_scatter.wgsl");
-        // Shadow-map scatter doesn't run `instance_at` (Phase 4 will
-        // add per-leaf grass descent into the half-res shadow path,
-        // but the scatter pass itself just rasterizes screen-space
-        // AABBs). Pass empty for instance_at — the splice helper
-        // skips the marker-search when the chunk is empty.
+        // Pass empty for instance_at — the splice helper short-circuits
+        // when the chunk is empty (shadow_scatter has no markers in V1).
         let source = crate::shader_composer::splice_inst_chunks(
-            template, inst_to_local_chunk, inst_aabb_chunk, "",
+            template, "",
         );
         validate_wgsl(&source, "shadow_scatter");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {

@@ -77,8 +77,6 @@ impl EngineState {
         let user_shader_shade_chunk = composed.shade;
         let user_shader_generate_chunk = composed.generate;
         let user_shader_proto_chunk = composed.proto;
-        let user_shader_inst_to_local_chunk = composed.inst_to_local;
-        let user_shader_inst_aabb_chunk = composed.inst_aabb;
         let user_shader_instance_at_chunk = composed.instance_at;
         let user_shader_source_hash = self.user_shader_registry.source_hash();
         let user_shader_infos = self.user_shader_registry.shader_infos();
@@ -1049,8 +1047,6 @@ impl EngineState {
             user_shader_source_hash,
             user_shader_generate_chunk,
             user_shader_proto_chunk,
-            user_shader_inst_to_local_chunk,
-            user_shader_inst_aabb_chunk,
             user_shader_instance_at_chunk,
             user_shader_infos,
             user_shader_entries,

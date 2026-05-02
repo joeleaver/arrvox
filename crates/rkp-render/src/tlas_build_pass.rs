@@ -1660,8 +1660,6 @@ mod tests {
             bone_field_origin_z: 0.0,
             overlay_offset: 0,
             overlay_count: 0,
-            instance_state_offset: 0,
-            _pad: [0, 0, 0],
         }
     }
 

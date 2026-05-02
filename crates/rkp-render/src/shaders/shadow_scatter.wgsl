@@ -68,8 +68,6 @@ struct RkpInstance {
     bone_field_origin_z: f32,
     overlay_offset: u32,
     overlay_count: u32,
-    instance_state_offset: u32,
-    _pad0: u32, _pad1: u32, _pad2: u32,
 }
 
 struct RkpAsset {
@@ -138,7 +136,6 @@ struct Aabb {
 @group(0) @binding(10) var<storage, read> bone_field_occ: array<u32>;
 @group(0) @binding(12) var<storage, read> assets: array<RkpAsset>;
 @group(0) @binding(13) var<storage, read> instance_overlay: array<OverlayEntry>;
-@group(0) @binding(14) var<storage, read> instance_pool: array<u32>;
 
 // Group 1 — pass-private resources.
 @group(1) @binding(0) var<uniform> light_camera: LightCameraShadow;
@@ -255,40 +252,6 @@ fn skip_node_t(pos: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, node_depth: u
 }
 
 
-fn inst_world_to_local(
-    world_pos: vec3<f32>, instance_pos: vec3<f32>, instance_scale: f32,
-) -> vec3<f32> {
-    let inv_s = 1.0 / max(instance_scale, 1e-10);
-    return (world_pos - instance_pos) * inv_s + vec3<f32>(0.5);
-}
-
-// USER_INST_TO_LOCAL_DISPATCH_BEGIN
-fn dispatch_user_inst_to_local(
-    shader_id: u32,
-    base_u32: u32,
-    world_pos: vec3<f32>,
-    fallback_pos: vec3<f32>,
-    fallback_scale: f32,
-) -> vec3<f32> {
-    return inst_world_to_local(world_pos, fallback_pos, fallback_scale);
-}
-// USER_INST_TO_LOCAL_DISPATCH_END
-
-// USER_INST_AABB_DISPATCH_BEGIN
-fn dispatch_user_inst_aabb(
-    shader_id: u32,
-    base_u32: u32,
-    fallback_pos: vec3<f32>,
-    fallback_scale: f32,
-) -> Aabb {
-    let half = fallback_scale * 0.5 * 1.7320508;
-    var a: Aabb;
-    a.min = fallback_pos - vec3<f32>(half);
-    a.max = fallback_pos + vec3<f32>(half);
-    return a;
-}
-// USER_INST_AABB_DISPATCH_END
-
 const OCC_BRICK_DIM: i32 = 4;
 
 fn skinned_brick_populated(
@@ -395,35 +358,9 @@ fn find_hit_in_instance(
         return find_hit_skinned(world_origin, world_dir, inst, asset);
     }
 
-    var local_origin: vec3<f32>;
-    var local_dir_unnorm: vec3<f32>;
-    if asset.shader_id != 0u {
-        let inst_pos = inst.world[3].xyz;
-        let inst_scale = length(inst.world[0].xyz);
-        let aabb = dispatch_user_inst_aabb(
-            asset.shader_id, inst.instance_state_offset,
-            inst_pos, inst_scale,
-        );
-        let inv_world_dir = 1.0 / safe_dir3(world_dir);
-        let aabb_t = intersect_aabb(world_origin, inv_world_dir, aabb.min, aabb.max);
-        if aabb_t.x > aabb_t.y { return NO_HIT_T; }
-        let world_t_entry = max(aabb_t.x, 0.0);
-        let world_entry = world_origin + world_dir * world_t_entry;
-        let local_entry = dispatch_user_inst_to_local(
-            asset.shader_id, inst.instance_state_offset,
-            world_entry, inst_pos, inst_scale,
-        );
-        let local_endpoint = dispatch_user_inst_to_local(
-            asset.shader_id, inst.instance_state_offset,
-            world_entry + world_dir, inst_pos, inst_scale,
-        );
-        local_origin = local_entry;
-        local_dir_unnorm = local_endpoint - local_entry;
-    } else {
-        let inv_world = mat4_affine_inverse(inst.world);
-        local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
-        local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
-    }
+    let inv_world = mat4_affine_inverse(inst.world);
+    let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
+    let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
     let local_dir = normalize(local_dir_unnorm);
     let local_scale = length(local_dir_unnorm);
     if local_scale < 1e-10 { return NO_HIT_T; }
@@ -579,10 +516,6 @@ fn synth_inst_from_scatter(s: ScatterInstance) -> RkpInstance {
     inst.bone_field_origin_z = 0.0;
     inst.overlay_offset = 0u;
     inst.overlay_count = 0u;
-    inst.instance_state_offset = s.instance_state_offset;
-    inst._pad0 = 0u;
-    inst._pad1 = 0u;
-    inst._pad2 = 0u;
     return inst;
 }
 

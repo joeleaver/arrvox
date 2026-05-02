@@ -118,11 +118,15 @@ fn user_pebble_instance_at(
         "instance_at chunk should rename user_pebble_instance_at:\n{}",
         chunks.instance_at,
     );
-    // Helpers are claimed by the inst_to_local chunk (which is
-    // emitted first in the splice order); instance_at chunk must NOT
-    // re-emit them.
-    assert!(chunks.inst_to_local.contains("fn pebble_hash"));
-    assert!(!chunks.instance_at.contains("fn pebble_hash"));
+    // After the Cluster A cleanup, the instance_at chunk is the SOLE
+    // emitter of the instance struct + helpers + the bare per-shader
+    // `inst_aabb` / `inst_to_local` bodies. The dead `inst_to_local`
+    // and `inst_aabb` ComposedChunks fields were removed.
+    assert!(chunks.instance_at.contains("fn pebble_hash"));
+    assert_eq!(
+        chunks.instance_at.matches("fn pebble_hash").count(), 1,
+        "helper should be emitted exactly once",
+    );
     assert!(
         chunks.instance_at.contains("fn rkp_user_1_instance_descend("),
         "instance_at chunk should emit the per-shader descent body",

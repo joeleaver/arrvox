@@ -139,24 +139,6 @@ pub struct RenderFrame {
     /// dispatches this whenever a band-cell hit triggers descent.
     pub user_shader_proto_chunk: String,
 
-    /// Composed user-shader chunk for the host-march `inst_to_local`
-    /// hook. Defines per-shader pool-read wrappers +
-    /// `dispatch_user_inst_to_local(...)`. Spliced into
-    /// `octree_march.wgsl` and `rkp_shadow_trace.wgsl` between their
-    /// USER_INST_TO_LOCAL_DISPATCH markers (Phase 4c). Empty when no
-    /// instance shader provides the hook; the in-tree identity stub
-    /// falls back to translate + uniform-scale TRS.
-    pub user_shader_inst_to_local_chunk: String,
-
-    /// Composed user-shader chunk for the host-march `inst_aabb` hook.
-    /// Defines per-shader pool-read wrappers +
-    /// `dispatch_user_inst_aabb(...) -> Aabb`. Spliced into
-    /// `octree_march.wgsl` and `rkp_shadow_trace.wgsl` between their
-    /// USER_INST_AABB_DISPATCH markers (Phase 4c). Empty when no
-    /// instance shader provides the hook; the in-tree identity stub
-    /// returns a rotation-tolerant `pos ± 0.5 × scale × √3` cube.
-    pub user_shader_inst_aabb_chunk: String,
-
     /// Phase B-redux — march-time instance derivation. Per-shader
     /// `rkp_user_<id>_instance_at(host_pos, host, ctx, k, &inst)
     /// -> bool` definitions, spliced into the host march and shadow

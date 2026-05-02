@@ -58,10 +58,7 @@ const BRICK_MAX_STEPS: u32 = 4096u;
 // Per-instance record (144 bytes). One per scene entity. See
 // `crates/rkp-render/src/rkp_gpu_object.rs` for the Rust mirror.
 // Phase 2 dropped inverse_world — readers compute it on demand via
-// `mat4_affine_inverse(inst.world)`. Phase 4c added
-// `instance_state_offset` + 12 B pad for the user-shader instance
-// path; the field is generic — engine has no knowledge of what the
-// shader stores in `instance_pool`, just where to point its hooks.
+// `mat4_affine_inverse(inst.world)`.
 struct RkpInstance {
     world: mat4x4<f32>,
     asset_id: u32,
@@ -82,22 +79,15 @@ struct RkpInstance {
     // the asset's `leaf_attr_pool[slot]`. Phase 3 (project_phase_1_2_shipped).
     overlay_offset: u32,
     overlay_count: u32,
-    // u32 offset into `instance_pool` for this instance's per-instance
-    // user-shader state (whatever struct the shader's `@instance_proto`
-    // declared). Only meaningful when the asset's shader_id != 0;
-    // standard host instances leave it 0. Phase 4c.
-    instance_state_offset: u32,
-    _pad0: u32, _pad1: u32, _pad2: u32,
 }
 
 // Per-asset record (80 bytes). Deduped by `octree_root`; multiple
 // instances share one slot via `inst.asset_id`. Carries the skeleton
 // template (`bone_count`, `rest_octree_*`) sourced from the asset
 // cache so it stays correct regardless of any single instance's
-// per-frame skin plan succeeding. Phase 4c repurposed one of the
-// trailing pad u32s as `shader_id`: 0 = standard host asset,
-// >0 = user-shader instance proto whose per-pixel descent goes
-// through `dispatch_user_inst_to_local` / `dispatch_user_inst_aabb`.
+// per-frame skin plan succeeding. `shader_id`: 0 = standard host
+// asset, >0 = user-shader prototype octree consumed by the
+// band-cell descent path (`dispatch_user_instance_descend`).
 struct RkpAsset {
     aabb_min: vec3<f32>, octree_root: u32,
     aabb_max: vec3<f32>, octree_depth: u32,
@@ -319,13 +309,6 @@ struct OverlayEntry {
 }
 @group(0) @binding(13) var<storage, read> instance_overlay: array<OverlayEntry>;
 
-// Per-instance user-shader state pool (Phase 4c). The user shader's
-// `inst_to_local` / `inst_aabb` hooks read whatever struct their
-// `@instance_proto` directive declared from this buffer at offset
-// `inst.instance_state_offset`. The host march only dereferences it
-// when `asset.shader_id != 0` — standard host assets ignore it.
-@group(0) @binding(14) var<storage, read> instance_pool: array<u32>;
-
 // Look up the per-instance overlay slot for `leaf_slot`. Returns
 // `0xFFFFFFFFu` when the slot isn't overridden on this instance.
 // Branchless callers test against the sentinel.
@@ -406,69 +389,22 @@ fn mat4_affine_inverse(m: mat4x4<f32>) -> mat4x4<f32> {
     );
 }
 
-// ── User-shader instance hooks (Phase 4c) ──────────────────────────
-// World-space AABB returned by `dispatch_user_inst_aabb`. Mirror of
-// the type in `user_shader_instance_march_main.wgsl`.
+// ── User-shader instance hooks ─────────────────────────────────────
+// World-space AABB returned by per-shader `inst_aabb` hooks. Used by
+// the band-cell descent path's per-shader `_instance_descend` body.
 struct Aabb {
     min: vec3<f32>,
     max: vec3<f32>,
 }
 
-// Default canonical → world map: world AABB centered at `instance_pos`
-// with side `instance_scale`, so canonical = (world - pos)/scale + 0.5.
-// User shaders that override `inst_to_local` get the user's body
-// spliced over the default arm in `dispatch_user_inst_to_local`.
-fn inst_world_to_local(
-    world_pos: vec3<f32>, instance_pos: vec3<f32>, instance_scale: f32,
-) -> vec3<f32> {
-    let inv_s = 1.0 / max(instance_scale, 1e-10);
-    return (world_pos - instance_pos) * inv_s + vec3<f32>(0.5);
-}
-
-// USER_INST_TO_LOCAL_DISPATCH_BEGIN
-// Default identity stub — the Rust composer replaces this whole block
-// (markers + body) with per-shader pool-read wrappers + the dispatch
-// switch when any registered shader provides an `inst_to_local` hook.
-// Empty-registry path falls through to `inst_world_to_local`
-// (translate + uniform-scale).
-fn dispatch_user_inst_to_local(
-    shader_id: u32,
-    base_u32: u32,
-    world_pos: vec3<f32>,
-    fallback_pos: vec3<f32>,
-    fallback_scale: f32,
-) -> vec3<f32> {
-    return inst_world_to_local(world_pos, fallback_pos, fallback_scale);
-}
-// USER_INST_TO_LOCAL_DISPATCH_END
-
-// USER_INST_AABB_DISPATCH_BEGIN
-// Default world-space AABB — `pos ± 0.5 × scale × √3` covers any
-// rotation of the canonical [0, 1]³ cube. Translation-only shaders
-// can use a tighter `pos ± 0.5 × scale` AABB by overriding the hook.
-fn dispatch_user_inst_aabb(
-    shader_id: u32,
-    base_u32: u32,
-    fallback_pos: vec3<f32>,
-    fallback_scale: f32,
-) -> Aabb {
-    let half = fallback_scale * 0.5 * 1.7320508; // √3 ≈ 1.732
-    var a: Aabb;
-    a.min = fallback_pos - vec3<f32>(half);
-    a.max = fallback_pos + vec3<f32>(half);
-    return a;
-}
-// USER_INST_AABB_DISPATCH_END
-
 // Phase B-redux — per-pixel `instance_at` descent. The host octree
-// DDA hits a leaf with an instance-shader material → look up the
-// shader's per-instance derivation hook + descend the prototype
-// octree directly, no `instance_pool` involved. `InstanceHit` is the
-// world-space output (closest user-shader instance hit, if any).
-// When the splice runs no chunk (no instance shader registered, or
-// none has an `instance_at` hook), the default stub below returns
-// "no hit" unconditionally — host march falls through to the
-// standard surface result.
+// DDA hits a band-cell leaf with an instance-shader material → look up
+// the shader's per-instance derivation hook + descend the prototype
+// octree directly. `InstanceHit` is the world-space output (closest
+// user-shader instance hit, if any). When the splice runs no chunk
+// (no instance shader registered, or none has an `instance_at` hook),
+// the default stub below returns "no hit" unconditionally — host
+// march falls through to the standard surface result.
 struct InstanceHit {
     valid: bool,
     world_t: f32,
@@ -1432,14 +1368,9 @@ fn descend_proto_octree(
     return r;
 }
 
-// Cached world AABB params at the tail of the signature — only
-// consulted on the user-shader branch (`asset.shader_id != 0u`),
-// where the tile-scatter pass already computed them. Host callers
-// pass `vec3<f32>(0.0)` for both; the affine path never reads them.
 fn march_object(
     world_origin: vec3<f32>, world_dir: vec3<f32>,
     inst: RkpInstance, asset: RkpAsset,
-    cached_aabb_min: vec3<f32>, cached_aabb_max: vec3<f32>,
 ) -> MarchResult {
     // Phase-3b: skinned objects inverse-skin at march time. Unskinned
     // objects fall through to the existing rest-octree DDA.
@@ -1449,66 +1380,19 @@ fn march_object(
     var result = MarchResult(
         vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0),
         0.0, 0.0, 0u, false, 0u,
-        // Phase 4c user-shader path fields — populated at the end of
-        // `march_object` only when the asset has shader_id != 0.
+        // is_user_shader_hit, world_pos, world_normal — populated by
+        // the band-cell descent path (`dispatch_user_instance_descend`)
+        // when a band-cell hit produces a world-space hit.
         false, vec3<f32>(0.0), vec3<f32>(0.0),
         false, vec3<f32>(0.0), 0u, 0.0, 0.0,
         0u, // glass_slot
-        0u, // user_shader_material_id (Phase 3b)
+        0u, // user_shader_material_id (Phase B-redux 3b)
     );
 
-    // Phase 4c — branch on user-shader assets. The DDA loop downstream
-    // is identical; only the world↔canonical setup differs.
-    //
-    // User-shader path: the user's `inst_to_local` hook owns the
-    // world→canonical map. We cull the world ray against the world
-    // AABB returned by `inst_aabb`, shift origin to the AABB entry,
-    // then take a numerical Jacobian along the world ray to recover
-    // the local-space direction. With non-normalized
-    // `local_dir_unnorm = M·world_dir`, the parametric `t` along the
-    // descent equals world distance from the AABB entry, so
-    // `local_to_world` falls out the usual way (`1/|unnorm|`).
-    //
-    // Affine path: existing code — local_origin/local_dir from
-    // `inv_world × world`.
-    let is_user_shader = asset.shader_id != 0u;
-    var local_origin: vec3<f32>;
-    var local_dir_unnorm: vec3<f32>;
-    var world_t_aabb_entry: f32 = 0.0;
-    if is_user_shader {
-        // Fallback pos/scale for the default `inst_to_local` identity
-        // stub — pulled from `inst.world` (translation-only mat4
-        // scaled by cell_size in `tick_instance_pipeline`). Real user
-        // shaders override `inst_to_local` by reading
-        // `instance_pool[inst.instance_state_offset]`. AABB is no
-        // longer hooked here: the tile-scatter pass already cached
-        // the world AABB in the entry; `cached_aabb_min/max` are it.
-        let inst_pos = inst.world[3].xyz;
-        let inst_scale = length(inst.world[0].xyz);
-        let safe_world_dir = vec3<f32>(
-            select(world_dir.x, select(-1e-10, 1e-10, world_dir.x >= 0.0), abs(world_dir.x) < 1e-10),
-            select(world_dir.y, select(-1e-10, 1e-10, world_dir.y >= 0.0), abs(world_dir.y) < 1e-10),
-            select(world_dir.z, select(-1e-10, 1e-10, world_dir.z >= 0.0), abs(world_dir.z) < 1e-10),
-        );
-        let aabb_t = intersect_aabb(world_origin, 1.0 / safe_world_dir, cached_aabb_min, cached_aabb_max);
-        if aabb_t.x > aabb_t.y { return result; }
-        world_t_aabb_entry = max(aabb_t.x, 0.0);
-        let world_entry = world_origin + world_dir * world_t_aabb_entry;
-        let local_entry = dispatch_user_inst_to_local(
-            asset.shader_id, inst.instance_state_offset,
-            world_entry, inst_pos, inst_scale,
-        );
-        let local_endpoint = dispatch_user_inst_to_local(
-            asset.shader_id, inst.instance_state_offset,
-            world_entry + world_dir, inst_pos, inst_scale,
-        );
-        local_origin = local_entry;
-        local_dir_unnorm = local_endpoint - local_entry;
-    } else {
-        let inv_world = mat4_affine_inverse(inst.world);
-        local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
-        local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
-    }
+    // Standard host-asset path — affine inv_world × world.
+    let inv_world = mat4_affine_inverse(inst.world);
+    let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
+    let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
     let local_dir = normalize(local_dir_unnorm);
     // Conversion from oc-space (where `t` marches) to world units.
     // `length(local_dir_unnorm) = 1/S` for uniform scale S in the
@@ -2008,76 +1892,6 @@ fn march_object(
     }
 
     result.steps = step_count;
-    // Phase 4c — populate world-space hit fields for the user-shader
-    // path. The DDA's `result.t` is local-space distance from the
-    // world AABB entry, so world distance is
-    // `world_t_aabb_entry + result.t × local_to_world`. World position
-    // recovers via the world ray: `world_origin + world_dir × world_t`.
-    //
-    // Normal: transform the canonical-space leaf normal back to world
-    // via the inverse-transpose of the user's local Jacobian. For
-    // L: world → local with Jacobian J = ∂L/∂w, world normals satisfy
-    // `n_world ∝ Jᵀ · n_local` (standard normal-transform rule, where
-    // J equals the inverse of the local→world Jacobian).
-    //
-    // Numerical Jacobian: 3 extra `dispatch_user_inst_to_local` calls
-    // at `hit_pos + ε·{x, y, z}`. Cheap (~4 dot products + 3 hook
-    // calls per hit-pixel; hooks are tiny analytic maps for the V1
-    // affine contract). One-sided difference is exact for affine L
-    // modulo FP precision; central difference would double the cost
-    // for no benefit on V1.
-    //
-    // ε sized so the canonical-space step is comfortably above
-    // sub-cell precision (~1/128 canonical at max_depth=5)
-    // without triggering FP underflow at large world scales. 1e-3 m
-    // works for the typical scale range; documented limit.
-    if is_user_shader && result.valid {
-        let world_t = world_t_aabb_entry + result.t * local_to_world;
-        let world_pos_hit = world_origin + world_dir * world_t;
-        result.is_user_shader_hit = true;
-        result.world_pos = world_pos_hit;
-
-        let inst_pos = inst.world[3].xyz;
-        let inst_scale = length(inst.world[0].xyz);
-        let l0 = dispatch_user_inst_to_local(
-            asset.shader_id, inst.instance_state_offset,
-            world_pos_hit, inst_pos, inst_scale,
-        );
-        let eps: f32 = 1.0e-3;
-        let lx = dispatch_user_inst_to_local(
-            asset.shader_id, inst.instance_state_offset,
-            world_pos_hit + vec3<f32>(eps, 0.0, 0.0), inst_pos, inst_scale,
-        );
-        let ly = dispatch_user_inst_to_local(
-            asset.shader_id, inst.instance_state_offset,
-            world_pos_hit + vec3<f32>(0.0, eps, 0.0), inst_pos, inst_scale,
-        );
-        let lz = dispatch_user_inst_to_local(
-            asset.shader_id, inst.instance_state_offset,
-            world_pos_hit + vec3<f32>(0.0, 0.0, eps), inst_pos, inst_scale,
-        );
-        // Jacobian columns (world→local).
-        let jx = (lx - l0) / eps;
-        let jy = (ly - l0) / eps;
-        let jz = (lz - l0) / eps;
-        // Jᵀ · n_local — i-th component is the i-th column of J
-        // dotted with the local normal.
-        let n_local = result.normal;
-        let n_world_unnorm = vec3<f32>(
-            dot(jx, n_local),
-            dot(jy, n_local),
-            dot(jz, n_local),
-        );
-        let n_world_len = length(n_world_unnorm);
-        // Singular-Jacobian fallback — degenerate transforms produce
-        // near-zero `n_world_unnorm`. Pass canonical normal through
-        // rather than emit NaN/inf into the G-buffer.
-        if n_world_len < 1.0e-6 {
-            result.world_normal = n_local;
-        } else {
-            result.world_normal = n_world_unnorm / n_world_len;
-        }
-    }
     return result;
 }
 
@@ -2183,15 +1997,11 @@ fn main(
         if !rkp_object_visible(inst) { continue; }
 
         // AABB check: compute world-space entry distance, skip if
-        // behind closest hit. The affine path uses the asset's
-        // canonical AABB through `inv_world`; the user-shader path
-        // delegates to `march_object` which calls
-        // `dispatch_user_inst_aabb` on the per-instance state. Glass
-        // tracking on the user-shader path is V1-undefined; the
-        // `local_to_world_scale` recovered here for affine doesn't
-        // generalize to the user's hook (no closed-form), so glass
-        // distances on shader-asset hits stay in oc-units (treated as
-        // best-effort by the shade pass).
+        // behind closest hit. Hosts use the asset's canonical AABB
+        // through `inv_world`. User-shader prototype assets
+        // (`shader_id != 0`) skip the cull — they enter only via the
+        // band-cell descent path, which has its own AABB cull inside
+        // each shader's `_instance_descend` body.
         var local_to_world_scale: f32 = 1.0;
         if asset.shader_id == 0u {
             let inv_world = mat4_affine_inverse(inst.world);
@@ -2212,11 +2022,9 @@ fn main(
             if world_entry > max_world_dist { continue; } // AABB entirely behind closest hit
         }
 
-        // March this object. Host objects ignore the trailing cached
-        // AABB params (only the user-shader branch consults them).
+        // March this object.
         let r = march_object(
             ray_origin, ray_dir, inst, asset,
-            vec3<f32>(0.0), vec3<f32>(0.0),
         );
         total_steps += r.steps;
 
@@ -2261,11 +2069,10 @@ fn main(
         let local_normal_raw = r.normal * inv_a;
         let local_normal = normalize(local_normal_raw);
 
-        // Convert local hit → world. Affine assets back-transform
-        // through `inst.world`. User-shader assets (Phase 4c) read the
-        // world-space fields `march_object` populated using the user's
-        // `inst_to_local` hook — the affine map doesn't apply because
-        // the user's transform is nonlinear or affine-with-deformation.
+        // Convert local hit → world. Affine host hits back-transform
+        // through `inst.world`. Band-cell user-shader hits already
+        // carry world-space fields populated by the per-shader
+        // `instance_descend` body in `dispatch_user_instance_descend`.
         var world_pos: vec3<f32>;
         if r.is_user_shader_hit {
             world_pos = r.world_pos;

@@ -42,7 +42,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::instance_proto::{parse_instance_layout, InstanceLayout, WgslType};
+use crate::instance_proto::{parse_instance_layout, InstanceLayout};
 
 /// One user-declared parameter: name, default, optional UI range. Built
 /// from `// @param <name>: <type> = <default>, range = [<lo>, <hi>]`
@@ -886,20 +886,6 @@ pub struct ComposedChunks {
     /// only shaders with `@instance_proto` directives; identity
     /// default arm returns a skip emit.
     pub proto: String,
-    /// Spliced into `user_shader_instance_march_main.wgsl` between
-    /// the `USER_INST_TO_LOCAL_DISPATCH_*` markers. Defines per-shader
-    /// pool-read wrappers + `dispatch_user_inst_to_local(shader_id,
-    /// base_u32, world_pos, fallback_pos, fallback_scale)`. Identity
-    /// default arm calls `inst_world_to_local` (translate + uniform
-    /// scale).
-    pub inst_to_local: String,
-    /// Spliced into `user_shader_instance_march_main.wgsl` between
-    /// the `USER_INST_AABB_DISPATCH_*` markers. Defines per-shader
-    /// pool-read wrappers + `dispatch_user_inst_aabb(shader_id,
-    /// base_u32, fallback_pos, fallback_scale) -> Aabb`. Identity
-    /// default arm returns `pos ± 0.5 × scale × √3` (covers any
-    /// rotation of the canonical [0, 1]³ cube).
-    pub inst_aabb: String,
     /// Phase B-redux — march-time derivation chunk. Spliced into the
     /// host march / shadow-trace templates between the
     /// `USER_INSTANCE_AT_DISPATCH_*` markers. Defines per-shader
@@ -922,44 +908,22 @@ pub fn compose(reg: &UserShaderRegistry) -> ComposedChunks {
         shade: compose_shade_chunk(reg),
         generate: compose_generate_chunk(reg),
         proto: compose_proto_chunk(reg),
-        inst_to_local: compose_inst_to_local_chunk(reg),
-        inst_aabb: compose_inst_aabb_chunk(reg),
         instance_at: compose_instance_at_chunk(reg),
     }
 }
 
-/// Splice the composer's `inst_to_local` + `inst_aabb` +
-/// `instance_at` chunks into a host-side WGSL template
-/// (`octree_march.wgsl` / `rkp_shadow_trace.wgsl`) between the
-/// `USER_INST_TO_LOCAL_DISPATCH_BEGIN/END`,
-/// `USER_INST_AABB_DISPATCH_BEGIN/END`, and
-/// `USER_INSTANCE_AT_DISPATCH_BEGIN/END` marker pairs. Empty chunks
-/// leave the template's identity-arm stubs in place — that's the
+/// Splice the composer's `instance_at` chunk into a host-side WGSL
+/// template (`octree_march.wgsl` / `rkp_shadow_trace.wgsl`) between
+/// the `USER_INSTANCE_AT_DISPATCH_BEGIN/END` marker pair. Empty chunk
+/// leaves the template's identity-arm stub in place — that's the
 /// no-user-shader-registered case. Pipelines call this whenever the
 /// registry's `source_hash` changes.
 pub fn splice_inst_chunks(
     template: &str,
-    inst_to_local_chunk: &str,
-    inst_aabb_chunk: &str,
     instance_at_chunk: &str,
 ) -> String {
-    // Marker strings via concat so the literal occurrences in this fn
-    // body don't fool the splicer if it's ever called against this
-    // file's own source. Identical pattern to instance_march_pass.rs.
-    let with_to_local = splice_user_marker(
-        template,
-        concat!("USER_INST_TO_LOCAL_DISPATCH", "_BEGIN"),
-        concat!("USER_INST_TO_LOCAL_DISPATCH", "_END"),
-        inst_to_local_chunk,
-    );
-    let with_aabb = splice_user_marker(
-        &with_to_local,
-        concat!("USER_INST_AABB_DISPATCH", "_BEGIN"),
-        concat!("USER_INST_AABB_DISPATCH", "_END"),
-        inst_aabb_chunk,
-    );
     splice_user_marker(
-        &with_aabb,
+        template,
         concat!("USER_INSTANCE_AT_DISPATCH", "_BEGIN"),
         concat!("USER_INSTANCE_AT_DISPATCH", "_END"),
         instance_at_chunk,
@@ -1114,185 +1078,6 @@ fn compose_generate_chunk(reg: &UserShaderRegistry) -> String {
     out
 }
 
-/// Generate a `var inst: <Struct>; inst.field = ...;` block that reads
-/// the per-field bytes out of `instance_pool[base_u32 + offset]` into
-/// a local. Used by the inst_to_local + inst_aabb wrappers to
-/// reconstruct the user's struct from the global pool at march time.
-fn generate_read_instance(layout: &InstanceLayout) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("    var inst: {};\n", layout.struct_name));
-    for field in &layout.fields {
-        let u32_offset = field.byte_offset / 4;
-        match field.ty {
-            WgslType::F32 => out.push_str(&format!(
-                "    inst.{name} = bitcast<f32>(instance_pool[base_u32 + {u32_offset}u]);\n",
-                name = field.name,
-            )),
-            WgslType::U32 => out.push_str(&format!(
-                "    inst.{name} = instance_pool[base_u32 + {u32_offset}u];\n",
-                name = field.name,
-            )),
-            WgslType::I32 => out.push_str(&format!(
-                "    inst.{name} = bitcast<i32>(instance_pool[base_u32 + {u32_offset}u]);\n",
-                name = field.name,
-            )),
-            WgslType::Vec2F32 => {
-                out.push_str(&format!(
-                    "    inst.{name} = vec2<f32>(\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n    );\n",
-                    u32_offset, u32_offset + 1, name = field.name,
-                ));
-            }
-            WgslType::Vec3F32 => {
-                out.push_str(&format!(
-                    "    inst.{name} = vec3<f32>(\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n    );\n",
-                    u32_offset, u32_offset + 1, u32_offset + 2, name = field.name,
-                ));
-            }
-            WgslType::Vec4F32 => {
-                out.push_str(&format!(
-                    "    inst.{name} = vec4<f32>(\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n        bitcast<f32>(instance_pool[base_u32 + {}u]),\n    );\n",
-                    u32_offset, u32_offset + 1, u32_offset + 2, u32_offset + 3, name = field.name,
-                ));
-            }
-        }
-    }
-    out
-}
-
-fn compose_inst_to_local_chunk(reg: &UserShaderRegistry) -> String {
-    let mut out = String::new();
-    out.push_str("// ── user-shader bodies: inst_to_local ─────────────────\n");
-    // Splice instance struct decls + helper structs from each shader
-    // that has the inst_to_local hook (helpers + decls already came
-    // through the proto/emit chunks, but the march template doesn't
-    // include those — the chunk has to be self-contained).
-    for entry in &reg.entries {
-        if entry.inst_to_local_text.is_some() {
-            for sd in &entry.struct_decls {
-                out.push_str(sd);
-                out.push('\n');
-            }
-            for helper in &entry.helpers {
-                out.push_str(helper);
-                out.push('\n');
-            }
-        }
-    }
-    // Per-shader user fn body (renamed) + pool-read wrapper.
-    for entry in &reg.entries {
-        if let Some(text) = &entry.inst_to_local_text {
-            let layout = entry
-                .instance_layout
-                .as_ref()
-                .expect("inst_to_local hook implies @instance_proto layout parsed");
-            let renamed = rewrite_fn_name(
-                text,
-                &format!("user_{}_inst_to_local", entry.name),
-                &format!("rkp_user_{}_inst_to_local", entry.id),
-            );
-            out.push_str(&renamed);
-            out.push('\n');
-            // Wrapper: read instance from pool at base_u32, call user fn.
-            out.push_str(&format!(
-                "fn rkp_user_{}_inst_to_local_at(base_u32: u32, world_pos: vec3<f32>) -> vec3<f32> {{\n",
-                entry.id,
-            ));
-            out.push_str(&generate_read_instance(layout));
-            out.push_str(&format!(
-                "    return rkp_user_{}_inst_to_local(world_pos, inst);\n}}\n",
-                entry.id,
-            ));
-        }
-    }
-    out.push_str("\n// ── dispatch_user_inst_to_local ───────────────────────\n");
-    out.push_str(
-        "fn dispatch_user_inst_to_local(shader_id: u32, base_u32: u32, world_pos: vec3<f32>, fallback_pos: vec3<f32>, fallback_scale: f32) -> vec3<f32> {\n",
-    );
-    out.push_str("    switch shader_id {\n");
-    for entry in &reg.entries {
-        if entry.inst_to_local_text.is_some() {
-            out.push_str(&format!(
-                "        case {}u: {{ return rkp_user_{}_inst_to_local_at(base_u32, world_pos); }}\n",
-                entry.id, entry.id,
-            ));
-        }
-    }
-    out.push_str(
-        "        default: { return inst_world_to_local(world_pos, fallback_pos, fallback_scale); }\n",
-    );
-    out.push_str("    }\n");
-    out.push_str("}\n");
-    out
-}
-
-fn compose_inst_aabb_chunk(reg: &UserShaderRegistry) -> String {
-    let mut out = String::new();
-    out.push_str("// ── user-shader bodies: inst_aabb ─────────────────────\n");
-    // Same self-contained-chunk pattern as inst_to_local. Note the
-    // structs + helpers spliced here may DUPLICATE those spliced by
-    // inst_to_local at the same template scope — naga rejects double
-    // declaration. Skip them when inst_to_local already emitted.
-    for entry in &reg.entries {
-        if entry.inst_aabb_text.is_some() && entry.inst_to_local_text.is_none() {
-            for sd in &entry.struct_decls {
-                out.push_str(sd);
-                out.push('\n');
-            }
-            for helper in &entry.helpers {
-                out.push_str(helper);
-                out.push('\n');
-            }
-        }
-    }
-    for entry in &reg.entries {
-        if let Some(text) = &entry.inst_aabb_text {
-            let layout = entry
-                .instance_layout
-                .as_ref()
-                .expect("inst_aabb hook implies @instance_proto layout parsed");
-            let renamed = rewrite_fn_name(
-                text,
-                &format!("user_{}_inst_aabb", entry.name),
-                &format!("rkp_user_{}_inst_aabb", entry.id),
-            );
-            out.push_str(&renamed);
-            out.push('\n');
-            out.push_str(&format!(
-                "fn rkp_user_{}_inst_aabb_at(base_u32: u32) -> Aabb {{\n",
-                entry.id,
-            ));
-            out.push_str(&generate_read_instance(layout));
-            out.push_str(&format!(
-                "    return rkp_user_{}_inst_aabb(inst);\n}}\n",
-                entry.id,
-            ));
-        }
-    }
-    out.push_str("\n// ── dispatch_user_inst_aabb ───────────────────────────\n");
-    out.push_str(
-        "fn dispatch_user_inst_aabb(shader_id: u32, base_u32: u32, fallback_pos: vec3<f32>, fallback_scale: f32) -> Aabb {\n",
-    );
-    out.push_str("    switch shader_id {\n");
-    for entry in &reg.entries {
-        if entry.inst_aabb_text.is_some() {
-            out.push_str(&format!(
-                "        case {}u: {{ return rkp_user_{}_inst_aabb_at(base_u32); }}\n",
-                entry.id, entry.id,
-            ));
-        }
-    }
-    out.push_str("        default: {\n");
-    out.push_str("            let half = fallback_scale * 0.5 * 1.7320508;\n");
-    out.push_str("            var a: Aabb;\n");
-    out.push_str("            a.min = fallback_pos - vec3<f32>(half);\n");
-    out.push_str("            a.max = fallback_pos + vec3<f32>(half);\n");
-    out.push_str("            return a;\n");
-    out.push_str("        }\n");
-    out.push_str("    }\n");
-    out.push_str("}\n");
-    out
-}
-
 /// Phase B-redux. Compose the per-shader `instance_at` chunk for
 /// splice into the host march / shadow templates between the
 /// `USER_INSTANCE_AT_DISPATCH_BEGIN/END` markers.
@@ -1301,6 +1086,11 @@ fn compose_inst_aabb_chunk(reg: &UserShaderRegistry) -> String {
 ///
 ///   - The shader's instance struct decl (e.g. `struct Blade { ... }`)
 ///     plus its helper fns, captured verbatim.
+///   - The user's `user_<name>_inst_aabb` and `user_<name>_inst_to_local`
+///     bare functions, fn-names rewritten to `rkp_user_<id>_inst_aabb`
+///     and `rkp_user_<id>_inst_to_local`. These are CALLED BY the
+///     per-shader `rkp_user_<id>_instance_descend` body below — they
+///     take the in-register `inst` struct directly (no pool read).
 ///   - The user's `user_<name>_instance_at` function, fn-name
 ///     rewritten to `rkp_user_<id>_instance_at`. Signature contract:
 ///
@@ -1315,19 +1105,14 @@ fn compose_inst_aabb_chunk(reg: &UserShaderRegistry) -> String {
 ///     ```
 ///
 ///   - A per-shader `rkp_user_<id>_instance_descend(...)` function
-///     wrapping the actual prototype-octree descent. **Phase 2.c-1
-///     stub**: this calls into the user's `instance_at` once (so the
-///     splice path is exercised end-to-end) but always returns "no
-///     hit" — Phase 2.c-2 fills in the real DDA.
+///     wrapping the actual prototype-octree descent. Calls
+///     `rkp_user_<id>_inst_aabb(inst)` for the world AABB cull and
+///     `rkp_user_<id>_inst_to_local(world_pos, inst)` for the
+///     world↔canonical map and Jacobian.
 ///
 ///   - A unified `dispatch_user_instance_descend(shader_id, ...)`
 ///     switch routing into the per-shader descend fns. Replaces the
 ///     identity-stub dispatcher in the template.
-///
-/// `inst_to_local` and `inst_aabb` chunks may be spliced into the
-/// SAME template at different markers. To avoid duplicate struct /
-/// helper declarations, this chunk skips them when either of those
-/// hooks is present (their chunk emitted them first).
 fn compose_instance_at_chunk(reg: &UserShaderRegistry) -> String {
     // Bail when no shader registers an `instance_at` hook — the
     // template's identity stub stays in place and the splice is a
@@ -1338,20 +1123,46 @@ fn compose_instance_at_chunk(reg: &UserShaderRegistry) -> String {
 
     let mut out = String::new();
     out.push_str("// ── user-shader bodies: instance_at ───────────────────\n");
-    // Splice instance struct decls + helpers, gated to avoid duplicate
-    // declarations when inst_to_local / inst_aabb chunks already emitted
-    // them in the same compilation unit.
+    // Splice instance struct decls + helpers for every shader that has
+    // an `instance_at` hook. This chunk is the SOLE emitter of the
+    // per-shader bare functions (`rkp_user_<id>_inst_aabb`,
+    // `rkp_user_<id>_inst_to_local`) and their type / helper context;
+    // the dead `_at(base_u32, ...)` pool-read wrappers were dropped
+    // along with the per-pixel Option B pipeline.
     for entry in &reg.entries {
-        let needs_decls = entry.instance_at_text.is_some()
-            && entry.inst_to_local_text.is_none()
-            && entry.inst_aabb_text.is_none();
-        if needs_decls {
+        if entry.instance_at_text.is_some() {
             for sd in &entry.struct_decls {
                 out.push_str(sd);
                 out.push('\n');
             }
             for helper in &entry.helpers {
                 out.push_str(helper);
+                out.push('\n');
+            }
+        }
+    }
+    // Bare `inst_aabb` / `inst_to_local` bodies — called directly by
+    // the per-shader `instance_descend` with the in-register `inst`
+    // struct. Validation upstream guarantees both are present alongside
+    // any `instance_at`.
+    for entry in &reg.entries {
+        if entry.instance_at_text.is_some() {
+            if let Some(text) = &entry.inst_aabb_text {
+                let renamed = rewrite_fn_name(
+                    text,
+                    &format!("user_{}_inst_aabb", entry.name),
+                    &format!("rkp_user_{}_inst_aabb", entry.id),
+                );
+                out.push_str(&renamed);
+                out.push('\n');
+            }
+            if let Some(text) = &entry.inst_to_local_text {
+                let renamed = rewrite_fn_name(
+                    text,
+                    &format!("user_{}_inst_to_local", entry.name),
+                    &format!("rkp_user_{}_inst_to_local", entry.id),
+                );
+                out.push_str(&renamed);
                 out.push('\n');
             }
         }
@@ -2136,17 +1947,16 @@ fn user_grass_shade(ctx: ShadeCtx) -> ShadeResult { var r: ShadeResult; return r
 
     // ── Phase B-redux: compose_instance_at_chunk ────────────────────
 
-    /// Parser captures the new `instance_at` hook. Composed chunk
-    /// renames `user_<name>_instance_at` →
+    /// Composed chunk renames `user_<name>_instance_at` →
     /// `rkp_user_<id>_instance_at` and emits the body verbatim under
-    /// the new name. Struct + helpers are emitted once (here, by the
-    /// instance_at chunk because no inst_to_local / inst_aabb hook is
-    /// present in this fixture to claim them).
+    /// the new name. The instance_at chunk is the SOLE emitter of
+    /// the instance struct + helpers + the bare per-shader
+    /// `inst_aabb` / `inst_to_local` bodies that the descent body
+    /// calls.
     #[test]
     fn compose_instance_at_chunk_renames_and_emits_struct() {
         // `instance_at` requires `inst_aabb` + `inst_to_local`
-        // (descent calls both). This fixture provides them but uses
-        // them only for the ABI's sake — the bodies are no-ops.
+        // (descent calls both).
         let src = r#"
 // @instance_proto Pt
 struct Pt { pos: vec3<f32>, scale: f32 }
@@ -2178,12 +1988,22 @@ fn user_x_instance_at(
         let reg = scan_dir(&tmp).unwrap();
         let chunks = compose(&reg);
 
-        // With inst_to_local + inst_aabb hooks present, those chunks
-        // claim the struct decl. instance_at chunk skips it.
+        // instance_at chunk now ALWAYS emits the struct decl (sole emitter).
         assert!(
-            !chunks.instance_at.contains("struct Pt"),
-            "instance_at chunk should skip struct decl when \
-             inst_to_local / inst_aabb chunks claim it",
+            chunks.instance_at.contains("struct Pt"),
+            "instance_at chunk should emit struct decl. Got:\n{}",
+            chunks.instance_at,
+        );
+        // Bare per-shader functions called by the descent body.
+        assert!(
+            chunks.instance_at.contains("fn rkp_user_1_inst_aabb("),
+            "instance_at chunk should emit bare rkp_user_<id>_inst_aabb. Got:\n{}",
+            chunks.instance_at,
+        );
+        assert!(
+            chunks.instance_at.contains("fn rkp_user_1_inst_to_local("),
+            "instance_at chunk should emit bare rkp_user_<id>_inst_to_local. Got:\n{}",
+            chunks.instance_at,
         );
         assert!(
             chunks.instance_at.contains("fn rkp_user_1_instance_at("),
@@ -2209,18 +2029,12 @@ fn user_x_instance_at(
         );
     }
 
-    /// When the same shader also defines `inst_to_local` (or
-    /// `inst_aabb`), those chunks claim the struct + helpers; the
-    /// `instance_at` chunk must NOT re-emit them or naga rejects
-    /// duplicate declarations when both chunks are spliced into one
-    /// compilation unit.
+    /// The instance_at chunk is the SOLE emitter of the instance
+    /// struct + helpers + bare `inst_aabb` / `inst_to_local`. Helpers
+    /// from a shader that also defines those hooks come through
+    /// exactly once.
     #[test]
-    fn compose_instance_at_chunk_skips_struct_when_inst_chunks_present() {
-        // `instance_at` requires both `inst_to_local` and
-        // `inst_aabb`. With both present, the inst_to_local chunk
-        // is responsible for emitting struct + helper decls; the
-        // instance_at chunk must skip them to avoid duplicate
-        // declarations at splice time.
+    fn compose_instance_at_chunk_emits_helpers_once() {
         let src = r#"
 // @instance_proto Pt
 struct Pt { pos: vec3<f32>, scale: f32 }
@@ -2249,22 +2063,20 @@ fn user_x_instance_at(
         let reg = scan_dir(&tmp).unwrap();
         let chunks = compose(&reg);
 
-        // inst_to_local claims the struct + helpers.
-        assert!(chunks.inst_to_local.contains("struct Pt"));
-        assert!(chunks.inst_to_local.contains("fn helper_noop"));
-        // instance_at must NOT re-emit them.
-        assert!(
-            !chunks.instance_at.contains("struct Pt"),
-            "instance_at chunk should skip struct decl when \
-             inst_to_local chunk already emits it",
+        // instance_at chunk emits struct + helpers exactly once.
+        assert_eq!(
+            chunks.instance_at.matches("struct Pt").count(), 1,
+            "instance_at should emit struct Pt exactly once. Got:\n{}",
+            chunks.instance_at,
         );
-        assert!(
-            !chunks.instance_at.contains("fn helper_noop"),
-            "instance_at chunk should skip helper decls when \
-             inst_to_local chunk already emits them",
+        assert_eq!(
+            chunks.instance_at.matches("fn helper_noop").count(), 1,
+            "instance_at should emit helper_noop exactly once. Got:\n{}",
+            chunks.instance_at,
         );
-        // But the renamed instance_at fn itself is still in the chunk.
         assert!(chunks.instance_at.contains("fn rkp_user_1_instance_at("));
+        assert!(chunks.instance_at.contains("fn rkp_user_1_inst_aabb("));
+        assert!(chunks.instance_at.contains("fn rkp_user_1_inst_to_local("));
     }
 
     /// Empty registry → empty chunk (no `instance_at` hook

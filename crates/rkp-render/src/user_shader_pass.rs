@@ -939,9 +939,6 @@ fn transient_asset_and_instance(entry: &CacheEntry) -> (RkpGpuAsset, RkpGpuInsta
         // pass, so paint can't accumulate on them.
         overlay_offset: 0,
         overlay_count: 0,
-        // Phase 4c — host-march affine path; no per-instance user-shader state.
-        instance_state_offset: 0,
-        _pad: [0; 3],
     };
     (asset, instance)
 }

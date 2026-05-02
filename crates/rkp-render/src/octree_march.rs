@@ -358,15 +358,12 @@ impl OctreeMarchPass {
     /// kept. Empty chunks restore the default identity-arm stubs (the
     /// "no user shader registered" path). Phase 4c.
     ///
-    /// Mirrors `InstanceMarchPass::reload_user_shaders` /
-    /// `PrototypeBakePass::reload_user_shaders` exactly so the engine
-    /// can call all three with the same `frame.user_shader_source_hash`
+    /// Mirrors `PrototypeBakePass::reload_user_shaders` exactly so the
+    /// engine can call both with the same `frame.user_shader_source_hash`
     /// without having to track per-pass hashes.
     pub fn reload_user_shaders(
         &mut self,
         device: &wgpu::Device,
-        inst_to_local_chunk: &str,
-        inst_aabb_chunk: &str,
         instance_at_chunk: &str,
         source_hash: u64,
     ) -> bool {
@@ -375,7 +372,7 @@ impl OctreeMarchPass {
         }
         let template = include_str!("shaders/octree_march.wgsl");
         let source = crate::shader_composer::splice_inst_chunks(
-            template, inst_to_local_chunk, inst_aabb_chunk, instance_at_chunk,
+            template, instance_at_chunk,
         );
         validate_wgsl(&source, "octree_march");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
