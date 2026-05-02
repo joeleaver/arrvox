@@ -20,6 +20,14 @@ pub struct ShadowTracePass {
     /// Group 1 layout: full-res gbuf reads + half-res shadow write.
     io_bind_group_layout: wgpu::BindGroupLayout,
     io_bind_group: Option<wgpu::BindGroup>,
+    /// Phase 4 — kept for future binding rebuilds. The shadow trace
+    /// shares `OctreeMarchPass`'s `params_bind_group_layout` (which
+    /// already includes binding 10 for `shader_params`); rebuilding
+    /// the actual bind group lives on `OctreeMarchPass`. Storing the
+    /// buffer handle here keeps the API symmetric with the primary
+    /// march for future-proofing if shadow grows its own params bind
+    /// group.
+    shader_params_buffer: Option<wgpu::Buffer>,
     /// Half-res shadow output texture.
     pub output_texture: wgpu::Texture,
     pub output_view: wgpu::TextureView,
@@ -112,10 +120,24 @@ impl ShadowTracePass {
             user_shader_source_hash: 0,
             io_bind_group_layout,
             io_bind_group: None,
+            shader_params_buffer: None,
             output_texture,
             output_view,
             half_w, half_h,
         }
+    }
+
+    /// Phase 4 — record the per-material `shader_params` buffer.
+    /// The actual binding is on the shared params bind group built
+    /// by `OctreeMarchPass`; this is symmetry for when the engine
+    /// calls `set_shader_params` on every pipeline that consumes the
+    /// buffer.
+    pub fn set_shader_params(
+        &mut self,
+        _device: &wgpu::Device,
+        shader_params_buffer: &wgpu::Buffer,
+    ) {
+        self.shader_params_buffer = Some(shader_params_buffer.clone());
     }
 
     /// Rebuild the compute pipeline against spliced user-shader chunks.

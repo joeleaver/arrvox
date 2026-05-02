@@ -411,8 +411,16 @@ pub struct ShadowMapPass {
     scatter_pipeline: wgpu::ComputePipeline,
     scatter_pipeline_layout: wgpu::PipelineLayout,
     scatter_pass_layout: wgpu::BindGroupLayout,
-    scatter_pass_bg: wgpu::BindGroup,
+    scatter_pass_bg: Option<wgpu::BindGroup>,
     user_shader_source_hash: u64,
+
+    // Phase 4 — band-cell shadow dispatch bindings. The scatter
+    // pass reads these to drive `dispatch_user_instance_descend`
+    // for grass-style instance shaders. Engine sets them per
+    // frame; the scatter bind group is rebuilt on changes.
+    march_params_buffer: wgpu::Buffer,
+    materials_buffer: Option<wgpu::Buffer>,
+    shader_params_buffer: Option<wgpu::Buffer>,
 }
 
 impl ShadowMapPass {
@@ -511,6 +519,10 @@ impl ShadowMapPass {
                 ro_storage_layout_entry(2), // scatter_instances
                 ro_storage_layout_entry(3), // work_list
                 ro_storage_layout_entry(4), // dispatch_args (read-only here)
+                // Phase 4 — band-cell shadow dispatch bindings.
+                ro_storage_layout_entry(5), // materials
+                ro_storage_layout_entry(6), // shader_params
+                uniform_layout_entry(7),    // march_params (lite mirror)
             ],
         });
 
@@ -591,11 +603,15 @@ impl ShadowMapPass {
                 wgpu::BindGroupEntry { binding: 1, resource: dispatch_args_buffer.as_entire_binding() },
             ],
         });
-        let scatter_pass_bg = build_scatter_pass_bg(
-            device, &scatter_pass_layout,
-            &uniform_buffer, &shadow_buffer, &scatter_instances_buffer,
-            &work_list_buffer, &dispatch_args_buffer,
-        );
+        // Phase 4 — band-cell shadow dispatch march_params buffer.
+        // Tight 12-u32 mirror; engine writes it each frame via
+        // `update_march_params`.
+        let march_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shadow_scatter march_params"),
+            size: std::mem::size_of::<ShadowScatterMarchParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             size,
@@ -621,28 +637,78 @@ impl ShadowMapPass {
             scatter_pipeline,
             scatter_pipeline_layout,
             scatter_pass_layout,
-            scatter_pass_bg,
+            scatter_pass_bg: None,
             user_shader_source_hash: 0,
+            march_params_buffer,
+            materials_buffer: None,
+            shader_params_buffer: None,
         }
     }
 
+    /// Phase 4 — set the materials buffer (shared with shade /
+    /// march). The scatter bind group is rebuilt the next frame
+    /// once both materials + shader_params are present.
+    pub fn set_materials(&mut self, device: &wgpu::Device, materials: &wgpu::Buffer) {
+        self.materials_buffer = Some(materials.clone());
+        self.try_rebuild_scatter_pass_bg(device);
+    }
+
+    /// Phase 4 — set the per-material shader_params buffer.
+    pub fn set_shader_params(&mut self, device: &wgpu::Device, shader_params: &wgpu::Buffer) {
+        self.shader_params_buffer = Some(shader_params.clone());
+        self.try_rebuild_scatter_pass_bg(device);
+    }
+
+    /// Phase 4 — write the lite march_params uniform. Engine calls
+    /// each frame.
+    pub fn update_march_params(&self, queue: &wgpu::Queue, time: f32, asset_count: u32) {
+        let p = ShadowScatterMarchParams {
+            object_count: 0,
+            mode: 0,
+            shadow_max_steps: 0,
+            num_lights: 0,
+            lod_enabled: 0,
+            surfacenet_enabled: 0,
+            tile_count_x: 0,
+            tlas_node_count: 0,
+            shadow_map_enabled: 0,
+            time,
+            asset_count,
+            _pad0: 0,
+        };
+        queue.write_buffer(&self.march_params_buffer, 0, bytemuck::bytes_of(&p));
+    }
+
+    fn try_rebuild_scatter_pass_bg(&mut self, device: &wgpu::Device) {
+        let (Some(materials), Some(shader_params)) = (
+            &self.materials_buffer, &self.shader_params_buffer,
+        ) else { return };
+        self.scatter_pass_bg = Some(build_scatter_pass_bg(
+            device, &self.scatter_pass_layout,
+            &self.uniform_buffer, &self.shadow_buffer,
+            &self.scatter_instances_buffer, &self.work_list_buffer,
+            &self.dispatch_args_buffer, materials, shader_params,
+            &self.march_params_buffer,
+        ));
+    }
+
     /// Rebuild the scatter pipeline against spliced user-shader chunks.
-    /// Shadow-map scatter doesn't run `instance_at` (Phase 4 will add
-    /// per-leaf grass descent into the half-res shadow path, but the
-    /// scatter pass itself just rasterizes screen-space AABBs).
+    /// Phase 4 — shadow-map scatter now splices the same
+    /// `instance_at` chunk the primary march does, so band cells
+    /// dispatch the user-shader prototype descent into the
+    /// directional shadow path.
     pub fn reload_user_shaders(
         &mut self,
         device: &wgpu::Device,
+        instance_at_chunk: &str,
         source_hash: u64,
     ) -> bool {
         if source_hash == self.user_shader_source_hash {
             return false;
         }
         let template = include_str!("shaders/shadow_scatter.wgsl");
-        // Pass empty for instance_at — the splice helper short-circuits
-        // when the chunk is empty (shadow_scatter has no markers in V1).
         let source = crate::shader_composer::splice_inst_chunks(
-            template, "",
+            template, instance_at_chunk,
         );
         validate_wgsl(&source, "shadow_scatter");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -703,12 +769,12 @@ impl ShadowMapPass {
                 device, &self.emit_g0_layout,
                 &self.scatter_instances_buffer, &self.work_list_buffer,
             );
-            self.scatter_pass_bg = build_scatter_pass_bg(
-                device, &self.scatter_pass_layout,
-                &self.uniform_buffer, &self.shadow_buffer,
-                &self.scatter_instances_buffer,
-                &self.work_list_buffer, &self.dispatch_args_buffer,
-            );
+            // scatter_pass_bg references the resized
+            // scatter_instances_buffer; rebuild on the next call to
+            // `try_rebuild_scatter_pass_bg` once materials +
+            // shader_params are present.
+            self.scatter_pass_bg = None;
+            self.try_rebuild_scatter_pass_bg(device);
             grew = true;
         }
         grew
@@ -804,15 +870,40 @@ impl ShadowMapPass {
         prim_count: u32,
     ) {
         if prim_count == 0 { return; }
+        // Phase 4 — scatter_pass_bg is built lazily once
+        // materials + shader_params land on the pass; if the engine
+        // hasn't wired them yet, the scatter dispatch is skipped
+        // (correct behavior: no work, no shadow casters).
+        let Some(ref scatter_bg) = self.scatter_pass_bg else { return; };
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("shadow_scatter"),
             timestamp_writes: None,
         });
         cpass.set_pipeline(&self.scatter_pipeline);
         cpass.set_bind_group(0, scene_bind_group, &[]);
-        cpass.set_bind_group(1, &self.scatter_pass_bg, &[]);
+        cpass.set_bind_group(1, scatter_bg, &[]);
         cpass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
     }
+}
+
+/// Phase 4 — scatter pass's lite march_params uniform mirror.
+/// Layout matches `octree_march::MarchParams` (uniform-storage
+/// alignment safe; total 48 B).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct ShadowScatterMarchParams {
+    object_count: u32,
+    mode: u32,
+    shadow_max_steps: u32,
+    num_lights: u32,
+    lod_enabled: u32,
+    surfacenet_enabled: u32,
+    tile_count_x: u32,
+    tlas_node_count: u32,
+    shadow_map_enabled: u32,
+    time: f32,
+    asset_count: u32,
+    _pad0: u32,
 }
 
 fn ro_storage_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -897,6 +988,7 @@ fn build_emit_g0_bg(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_scatter_pass_bg(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -905,6 +997,9 @@ fn build_scatter_pass_bg(
     scatter_instances_buffer: &wgpu::Buffer,
     work_list_buffer: &wgpu::Buffer,
     dispatch_args_buffer: &wgpu::Buffer,
+    materials_buffer: &wgpu::Buffer,
+    shader_params_buffer: &wgpu::Buffer,
+    march_params_buffer: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("shadow_scatter pass bg"),
@@ -915,6 +1010,9 @@ fn build_scatter_pass_bg(
             wgpu::BindGroupEntry { binding: 2, resource: scatter_instances_buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: work_list_buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: dispatch_args_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: materials_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: shader_params_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: march_params_buffer.as_entire_binding() },
         ],
     })
 }

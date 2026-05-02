@@ -526,7 +526,8 @@ fn brick_id_of(node: u32) -> u32 {
 // stats[59]      = skinned march brick-populated samples
 // stats[60]      = user-shader instance dispatch invocations (Phase B-redux 3a)
 // stats[61]      = user-shader instance dispatch hits        (Phase B-redux 3a)
-// stats[62..64]  = reserved
+// stats[62]      = band-cell shadow dispatch invocations (Phase 4)
+// stats[63]      = band-cell shadow dispatch hits        (Phase 4)
 //
 // octree_nodes reads are derived CPU-side from the per-phase depth histograms:
 // sum(bucket[i] * (i + 1)) since each lookup descends `depth+1` nodes.

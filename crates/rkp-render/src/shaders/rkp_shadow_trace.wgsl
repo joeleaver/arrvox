@@ -16,9 +16,10 @@ const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
 const OCTREE_LEAF_BIT: u32 = 0x80000000u;
 const OCTREE_BRICK_BIT: u32 = 0x40000000u;
 // Phase B-redux 3b — band-cell sentinel. See octree_march.wgsl for
-// the encoding contract; shadow trace currently treats a band cell
-// as transparent (Phase 4 will wire band-cell descent through
-// `dispatch_user_instance_descend` for proper shadow casting).
+// the encoding contract. Phase 4 wires band-cell descent through
+// `dispatch_user_instance_descend` so painted blades cast shadows;
+// `octree_lookup` now preserves BAND_BIT so the caller can detect
+// the cell and run the descent.
 const OCTREE_BAND_BIT: u32 = 0x20000000u;
 const OCTREE_PAYLOAD_MASK: u32 = 0x1FFFFFFFu;
 // Shadow rays scan every object every ray — AABB misses short-circuit
@@ -143,6 +144,42 @@ struct GpuMaterial {
 struct LeafAttr {
     normal_oct: u32,
     material_packed: u32,
+}
+
+// Phase B-redux 3b — band-cell wire format. Mirrors
+// `octree_march.wgsl::BandCell` (and the Rust `GpuBandCell` it
+// targets). Each band cell's payload reinterprets two consecutive
+// `leaf_attr_pool` slots; see `read_band_cell` below.
+struct BandCell {
+    anchor_world_pos: vec3<f32>,
+    material_id: u32,
+}
+
+// Phase 4 — user-shader-facing types for the band-cell shadow
+// dispatch. Same shapes as octree_march.wgsl so the composer's
+// shared `dispatch_user_instance_descend` body splices in
+// unchanged. Wire-format with the corresponding Rust structs.
+struct HostSample {
+    distance: f32,
+    normal: vec3<f32>,
+    material: u32,
+    material_secondary: u32,
+    blend_weight: u32,
+}
+
+struct UserCtx {
+    time: f32,
+    cell_size: f32,
+    material_id: u32,
+    aabb_min: vec3<f32>,
+    params: array<f32, 8>,
+}
+
+struct InstanceHit {
+    valid: bool,
+    world_t: f32,
+    world_pos: vec3<f32>,
+    world_normal: vec3<f32>,
 }
 
 fn mat_albedo(m: GpuMaterial) -> vec3<f32> {
@@ -289,6 +326,10 @@ fn mat4_affine_inverse(m: mat4x4<f32>) -> mat4x4<f32> {
 @group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
 @group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 64>;
 @group(2) @binding(3) var<storage, read> lights: array<GpuLight>;
+// Phase 4 — per-material 8 × f32 array shared with the primary
+// march. Used to populate `ctx.params` for the band-cell instance
+// descent dispatcher when a band cell is hit by a shadow ray.
+@group(2) @binding(10) var<storage, read> shader_params: array<f32>;
 
 // Phase 7 — TLAS over instance AABBs. Built each frame on CPU by
 // `TlasPass::build_tlas` and uploaded; shadow trace traverses
@@ -348,17 +389,16 @@ fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: 
         }
         if (node & OCTREE_LEAF_BIT) != 0u {
             bucket_depth(phase, level);
-            // Phase B-redux 3b — band cells (Phase 4 wires real
-            // descent here). Treat as EMPTY for now; shadow rays
-            // pass through. Without this gate the band cell's
-            // payload would be misread as a regular leaf-attr slot
-            // index, the slot bytes (an anchor world-pos float)
-            // bitcast to garbage opacity, and the band volume
-            // would cast a solid AABB shadow.
-            if (node & OCTREE_BAND_BIT) != 0u {
-                return OctreeResult(OCTREE_EMPTY, level, center, half);
-            }
-            return OctreeResult(node & OCTREE_PAYLOAD_MASK | (node & OCTREE_BRICK_BIT), level, center, half);
+            // Phase 4 — preserve BRICK_BIT and BAND_BIT in the
+            // returned slot so the caller can distinguish a leaf-
+            // attr leaf from a brick leaf or a band cell. Band
+            // cells trigger `dispatch_user_instance_descend` for
+            // proper shadow casting through painted instance
+            // shaders (e.g. grass blades).
+            return OctreeResult(
+                (node & OCTREE_PAYLOAD_MASK) | (node & OCTREE_BRICK_BIT) | (node & OCTREE_BAND_BIT),
+                level, center, half,
+            );
         }
         let gt = vec3<u32>(pos >= center);
         offset = node + gt.x + gt.y * 2u + gt.z * 4u;
@@ -374,11 +414,10 @@ fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: 
     if node == OCTREE_EMPTY { return OctreeResult(OCTREE_EMPTY, max_depth, center, half); }
     if node == OCTREE_INTERIOR { return OctreeResult(OCTREE_INTERIOR, max_depth, center, half); }
     if (node & OCTREE_LEAF_BIT) != 0u {
-        if (node & OCTREE_BAND_BIT) != 0u {
-            // Phase B-redux 3b — band cells skipped at max_depth too.
-            return OctreeResult(OCTREE_EMPTY, max_depth, center, half);
-        }
-        return OctreeResult(node & OCTREE_PAYLOAD_MASK | (node & OCTREE_BRICK_BIT), max_depth, center, half);
+        return OctreeResult(
+            (node & OCTREE_PAYLOAD_MASK) | (node & OCTREE_BRICK_BIT) | (node & OCTREE_BAND_BIT),
+            max_depth, center, half,
+        );
     }
     return OctreeResult(OCTREE_EMPTY, max_depth, center, half);
 }
@@ -392,6 +431,63 @@ fn slot_is_brick(slot: u32) -> bool {
 fn slot_brick_id(slot: u32) -> u32 {
     return slot & OCTREE_PAYLOAD_MASK;
 }
+
+/// Phase B-redux 3b — detect a BAND result from `octree_lookup`.
+fn slot_is_band(slot: u32) -> bool {
+    return (slot & OCTREE_BAND_BIT) != 0u
+        && slot != OCTREE_EMPTY
+        && slot != OCTREE_INTERIOR;
+}
+
+/// Strip BRICK_BIT / BAND_BIT to get the band-cell offset (index
+/// into `leaf_attr_pool` where the 16-byte `BandCell` record begins;
+/// the next slot at `+1` is its second half).
+fn slot_band_offset(slot: u32) -> u32 {
+    return slot & OCTREE_PAYLOAD_MASK;
+}
+
+/// Phase B-redux 3b — read a `BandCell` payload by unpacking two
+/// consecutive `leaf_attr_pool` slots. Same byte layout the BFS
+/// bake (user_shader_geom.wgsl) writes.
+fn read_band_cell(band_off: u32) -> BandCell {
+    let s0 = leaf_attr_pool[band_off];
+    let s1 = leaf_attr_pool[band_off + 1u];
+    var c: BandCell;
+    c.anchor_world_pos = vec3<f32>(
+        bitcast<f32>(s0.normal_oct),
+        bitcast<f32>(s0.material_packed),
+        bitcast<f32>(s1.normal_oct),
+    );
+    c.material_id = s1.material_packed;
+    return c;
+}
+
+// USER_INSTANCE_AT_DISPATCH_BEGIN
+// Default identity stub — Rust composer replaces this whole block
+// (markers + body) with per-shader descent helpers + the dispatch
+// switch when any registered shader provides an `instance_at` hook.
+// Empty-registry path returns "no instance hit" so the band-cell
+// shadow branch falls through to the no-hit case (light passes
+// straight through).
+fn dispatch_user_instance_descend(
+    shader_id: u32,
+    host_pos: vec3<f32>,
+    host: HostSample,
+    leaf_slot: u32,
+    ray_origin: vec3<f32>,
+    ray_dir: vec3<f32>,
+    world_max_t: f32,
+    ctx: UserCtx,
+    asset: RkpAsset,
+) -> InstanceHit {
+    var r: InstanceHit;
+    r.valid = false;
+    r.world_t = world_max_t;
+    r.world_pos = vec3<f32>(0.0);
+    r.world_normal = vec3<f32>(0.0, 1.0, 0.0);
+    return r;
+}
+// USER_INSTANCE_AT_DISPATCH_END
 
 fn skip_node(pos: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, node_depth: u32, extent: f32, vs: f32) -> f32 {
     let node_size = extent / f32(1u << node_depth);
@@ -613,6 +709,89 @@ fn shadow_step_one_instance(
         let r = octree_lookup(root, max_depth, extent, pos, PHASE_SHADOW);
 
         if r.slot == OCTREE_EMPTY {
+            t += max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);
+            continue;
+        }
+
+        // Phase 4 — band-cell shadow dispatch. Mirror of the primary
+        // march's band-cell branch (octree_march.wgsl). The BFS bake
+        // tagged this leaf with `LEAF | BAND` and packed a
+        // `BandCell { anchor_world_pos, material_id }` into two
+        // consecutive `leaf_attr_pool` slots at `slot_band_offset`.
+        // Resolve the prototype asset for the cell's painted host
+        // material's shader_id, then fire the same
+        // `dispatch_user_instance_descend` the primary march uses.
+        // V1: any hit fully blocks the shadow ray (transmittance =
+        // 0). Future revisions can attenuate by user-material
+        // opacity for translucent blades.
+        if slot_is_band(r.slot) {
+            let band_off = slot_band_offset(r.slot);
+            let band = read_band_cell(band_off);
+            let band_mat_id = band.material_id;
+            let mat = materials[band_mat_id];
+            let shader_id = mat.shader_id;
+            var proto_idx: u32 = 0xFFFFFFFFu;
+            if shader_id != 0u {
+                let acount = march_params.asset_count;
+                for (var ai: u32 = 0u; ai < acount; ai = ai + 1u) {
+                    if assets[ai].shader_id == shader_id {
+                        proto_idx = ai;
+                        break;
+                    }
+                }
+            }
+            if proto_idx == 0xFFFFFFFFu {
+                // No matching proto registered — treat as empty + skip.
+                t += max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);
+                continue;
+            }
+            let proto_asset = assets[proto_idx];
+
+            var host_sample: HostSample;
+            host_sample.distance = 0.0;
+            host_sample.normal = vec3<f32>(0.0, 1.0, 0.0);
+            host_sample.material = band_mat_id;
+            host_sample.material_secondary = 0u;
+            host_sample.blend_weight = 0u;
+
+            var ctx: UserCtx;
+            ctx.time = march_params.time;
+            ctx.cell_size = r.cell_half * 2.0;
+            ctx.material_id = band_mat_id;
+            ctx.aabb_min = vec3<f32>(0.0);
+            let pbase = band_mat_id * 8u;
+            ctx.params[0] = shader_params[pbase + 0u];
+            ctx.params[1] = shader_params[pbase + 1u];
+            ctx.params[2] = shader_params[pbase + 2u];
+            ctx.params[3] = shader_params[pbase + 3u];
+            ctx.params[4] = shader_params[pbase + 4u];
+            ctx.params[5] = shader_params[pbase + 5u];
+            ctx.params[6] = shader_params[pbase + 6u];
+            ctx.params[7] = shader_params[pbase + 7u];
+
+            atomicAdd(&stats[62], 1u); // band-cell shadow dispatch
+            // Shadow stepper passes WORLD-space origin/dir; the
+            // dispatcher takes WORLD-space inputs and descends the
+            // prototype octree in its own canonical frame internally.
+            // local_origin / local_dir are NOT used for the band
+            // branch.
+            let inst_hit = dispatch_user_instance_descend(
+                shader_id,
+                band.anchor_world_pos,
+                host_sample,
+                0u,
+                world_origin,
+                world_dir,
+                max_world_dist,
+                ctx,
+                proto_asset,
+            );
+            if inst_hit.valid {
+                atomicAdd(&stats[63], 1u); // band-cell shadow hit
+                // V1 — blade silhouette fully blocks the shadow ray.
+                return 0.0;
+            }
+            // Miss — skip past the cell and continue.
             t += max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);
             continue;
         }

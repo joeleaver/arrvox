@@ -935,19 +935,20 @@ fn render_one_frame(
             &frame.user_shader_instance_at_chunk,
             frame.user_shader_source_hash,
         );
-        // Shadow trace lacks USER_INSTANCE_AT_DISPATCH markers in V1;
-        // pass empty so the splice helper short-circuits. Phase 4
-        // wires real shadows for band-cell instance hits.
+        // Phase 4 — shadow trace splices the same instance_at chunk
+        // the primary march does so band cells dispatch the same
+        // user-shader prototype descent into the shadow path.
         vr.shadow_trace.reload_user_shaders(
             &state.device,
-            "",
+            &frame.user_shader_instance_at_chunk,
             frame.user_shader_source_hash,
         );
-        // Shadow-map scatter likewise lacks markers in V1; user-shader
-        // instances do not yet cast directional-light shadows through
-        // this pass.
+        // Phase 4 — shadow-map scatter splices the same instance_at
+        // chunk so band cells fire the user-shader instance descent
+        // for directional-light shadows too.
         vr.shadow_map.reload_user_shaders(
             &state.device,
+            &frame.user_shader_instance_at_chunk,
             frame.user_shader_source_hash,
         );
         vr.shade.upload_shader_params(
@@ -960,6 +961,27 @@ fn render_one_frame(
         // existing per-frame `set_shade_data` below picks up shade's
         // side, march mirrors that here.
         vr.march.set_shader_params(
+            &state.device,
+            vr.shade.shader_params_buffer(),
+        );
+        // Phase 4 — shadow trace shares the params bind group that
+        // OctreeMarchPass owns (binding 10 already lives there), but
+        // we still record the buffer handle on the shadow pass for
+        // API symmetry with the rest of the chain.
+        vr.shadow_trace.set_shader_params(
+            &state.device,
+            vr.shade.shader_params_buffer(),
+        );
+        // Phase 4 — shadow-map scatter has its own scatter_pass_bg
+        // (group 1) that needs materials + shader_params bound for
+        // the band-cell dispatch. Re-wiring is cheap; the inner
+        // try-rebuild short-circuits when both handles + the
+        // scatter_instances buffer are stable.
+        vr.shadow_map.set_materials(
+            &state.device,
+            &state.renderer.materials_buffer,
+        );
+        vr.shadow_map.set_shader_params(
             &state.device,
             vr.shade.shader_params_buffer(),
         );
@@ -1165,6 +1187,15 @@ fn render_one_frame(
         vr.shadow_map.set_tlas_prims_buffer(
             &state.device,
             &state.tlas_build_pass.tlas_prims_buffer,
+        );
+        // Phase 4 — band-cell shadow dispatch reads `time` and
+        // `asset_count` from a lite march_params uniform.
+        // `asset_count` matches what the primary march sees
+        // because both originate from the same `assets_for_upload`.
+        vr.shadow_map.update_march_params(
+            &state.queue,
+            frame.shade_params_base.time,
+            asset_count,
         );
     }
 
