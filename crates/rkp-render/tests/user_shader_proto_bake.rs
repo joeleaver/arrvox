@@ -48,8 +48,6 @@ fn user_sphere_proto(uvw: vec3<f32>) -> VoxelEmit {
     return v;
 }
 
-fn user_sphere_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) {
-}
 "#;
 
 fn create_device() -> Option<(wgpu::Device, wgpu::Queue)> {

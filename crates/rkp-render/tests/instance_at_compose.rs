@@ -61,11 +61,6 @@ fn user_pebble_proto(uvw: vec3<f32>) -> VoxelEmit {
     return v;
 }
 
-fn user_pebble_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) {
-    // Option B back-compat — emits nothing in this fixture; the new
-    // path uses instance_at instead.
-}
-
 fn user_pebble_inst_aabb(inst: Pebble) -> Aabb {
     var a: Aabb;
     a.min = inst.pos - vec3<f32>(inst.radius);
@@ -160,7 +155,6 @@ fn instance_at_chunk_empty_for_no_instance_at_hook_validates() {
 // @instance_proto Pt
 struct Pt { pos: vec3<f32> }
 fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
-fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 "#;
 
     let tmp = std::env::temp_dir().join(format!(

@@ -29,11 +29,9 @@
 // @tile_size 5.12
 // @region_thickness 1.5
 // @animated
-// Phase 7b — `density` can request up to 5 blades per painted leaf
-// (see the loop in user_grass_emit). Each thread reserves 5
-// consecutive slots in instance_pool so slot allocation is
-// deterministic; the TLAS builder uses this to issue one tight
-// per-leaf AABB per slot.
+// `density` can request up to 5 blades per host position; the
+// instance_at hook short-circuits to `false` once k exceeds the
+// density-driven count.
 // @max_emits_per_thread 5
 
 // ── Per-material params ─────────────────────────────────────────────
@@ -213,75 +211,13 @@ fn user_grass_inst_aabb(inst: Blade) -> Aabb {
     return a;
 }
 
-// ── Emit hook ───────────────────────────────────────────────────────
-fn user_grass_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) {
-    if (host.normal.y < 0.5) {
-        return;
-    }
-
-    let blade_height  = ctx.params[0];
-    let blade_width   = ctx.params[1];
-    let height_jitter = ctx.params[2];
-    let density       = ctx.params[3];
-    let pos_jitter    = ctx.params[4];
-    let lean_amount   = ctx.params[5];
-    let wind_amp      = ctx.params[6];
-    let wind_freq     = ctx.params[7];
-
-    let base_seed = grass_seed_from_pos(host_pos);
-    let count_full = u32(floor(density));
-    let extra_p = density - f32(count_full);
-
-    let total_max = count_full + 1u;
-    var i: u32 = 0u;
-    loop {
-        if (i >= total_max || i >= 5u) { break; }
-
-        let s0 = base_seed ^ (i * 0x9E3779B9u);
-        let r_density = grass_hash_u01(s0);
-        let r_jx      = grass_hash_u01(s0 ^ 0xBF58476Du);
-        let r_jz      = grass_hash_u01(s0 ^ 0x94D049BBu);
-        let r_height  = grass_hash_u01(s0 ^ 0xCBF29CE4u);
-        let r_yaw     = grass_hash_u01(s0 ^ 0xA2B5C7D9u);
-        let r_lean_x  = grass_hash_u01(s0 ^ 0xC2B2AE35u);
-        let r_lean_z  = grass_hash_u01(s0 ^ 0xD3B5C7E1u);
-        let r_phase   = grass_hash_u01(s0 ^ 0xFEEDFACEu);
-
-        if (i == count_full && r_density >= extra_p) { break; }
-
-        let jitter_radius = ctx.cell_size * pos_jitter;
-        let jx = (r_jx - 0.5) * 2.0 * jitter_radius;
-        let jz = (r_jz - 0.5) * 2.0 * jitter_radius;
-
-        let h_factor = 1.0 + (r_height - 0.5) * 2.0 * height_jitter;
-        let h = max(blade_height * h_factor, 1.0e-3);
-
-        let phase = r_phase * 6.28318530718;
-        let wind_x = sin(ctx.time * wind_freq + phase) * wind_amp;
-        let wind_z = cos(ctx.time * wind_freq + phase * 0.73) * wind_amp;
-        let base_lean_x = (r_lean_x - 0.5) * 2.0 * lean_amount;
-        let base_lean_z = (r_lean_z - 0.5) * 2.0 * lean_amount;
-
-        var b: Blade;
-        b.pos = vec3<f32>(host_pos.x + jx, host_pos.y + 0.5 * h, host_pos.z + jz);
-        b.scale = h;
-        b.yaw = r_yaw * 6.28318530718;
-        b.width = max(blade_width, 1.0e-3);
-        b.lean = vec2<f32>(base_lean_x + wind_x, base_lean_z + wind_z);
-        emit_instance(b);
-
-        i = i + 1u;
-    }
-}
-
 // ── instance_at hook (Phase B-redux) ────────────────────────────────
-// Indexable counterpart to `user_grass_emit`. Returns the k-th
-// instance (here, blade) for a given host position via *out_instance,
-// or `false` if there's no instance at index k (k beyond
-// density-driven count, or host normal disqualifies the cell). Same
-// per-blade math as `emit` — this is the "function form" of the emit
-// hook so the host march can call it per-pixel-per-leaf without an
-// instance_pool to scatter into.
+// Returns the k-th instance (here, blade) for a given host position
+// via *out_instance, or `false` if there's no instance at index k (k
+// beyond density-driven count, or host normal disqualifies the cell).
+// Called per-pixel-per-leaf from the host march on band-cell hits;
+// stateless — every input but `k` derives from `host_pos` + `ctx.time`
+// via hashing, so no per-frame state writes are needed.
 fn user_grass_instance_at(
     host_pos: vec3<f32>,
     host: HostSample,

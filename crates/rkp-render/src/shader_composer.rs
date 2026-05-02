@@ -97,20 +97,17 @@ pub struct ShaderMetadata {
     /// (one region per (object, material) covering the painted-leaf
     /// AABB; cell size grows with paint extent).
     pub tile_size: Option<f32>,
-    /// `@instance_proto <StructName>` — opt-in for the Option B voxel
-    /// sprite instancing pipeline. When `Some`, the file MUST also
-    /// contain the named struct declaration plus the `user_<stem>_proto`
-    /// and `user_<stem>_emit` hooks; the parsed struct layout lives on
-    /// the [`UserShaderEntry`]. None means the shader uses the existing
+    /// `@instance_proto <StructName>` — opt-in for the per-instance
+    /// pipeline (Phase B-redux band-cell descent). When `Some`, the
+    /// file MUST also contain the named struct declaration plus the
+    /// `user_<stem>_proto` hook; the parsed struct layout lives on the
+    /// [`UserShaderEntry`]. None means the shader uses the existing
     /// per-cell `generate` pipeline.
     pub instance_proto_struct: Option<String>,
-    /// `@max_emits_per_thread <u32>` — Phase 7b. Per-thread cap on how
-    /// many `emit_instance(...)` calls a single emit-hook invocation may
-    /// produce. Each thread (= one painted leaf) reserves this many
-    /// consecutive slots in `instance_pool` so slot allocation is
-    /// deterministic (no atomicAdd). Uses 1 when absent, which is the
-    /// right default for shaders that emit exactly one instance per
-    /// painted leaf. Hard ceiling: 16 (keeps per-region pool bounded).
+    /// `@max_emits_per_thread <u32>` — per-host-position cap on how
+    /// many instances `instance_at` may return for a single host hit
+    /// before the dispatcher gives up. Uses 1 when absent. Hard
+    /// ceiling: 16.
     pub max_emits_per_thread: Option<u32>,
 }
 
@@ -153,33 +150,22 @@ pub struct UserShaderEntry {
     /// shaders are user-managed — pick unique helper names if
     /// loading multiple shaders together.
     pub helpers: Vec<String>,
-    /// Option B — `fn user_<stem>_proto(uvw: vec3<f32>) -> VoxelEmit`,
-    /// the prototype shape used by every instance the shader emits.
+    /// `fn user_<stem>_proto(uvw: vec3<f32>) -> VoxelEmit` — the
+    /// prototype shape descended at march time from band-cell hits.
     /// Required when `metadata.instance_proto_struct` is `Some`.
     pub proto_text: Option<String>,
-    /// Option B — `fn user_<stem>_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx)`,
-    /// the per-host-sample instance scatter. Required when
-    /// `metadata.instance_proto_struct` is `Some`.
-    pub emit_text: Option<String>,
-    /// Option B — optional override for non-affine deformation.
-    /// `fn user_<stem>_inst_aabb(inst: <Struct>) -> Aabb`. Falls back
-    /// to engine-derived AABB (`pos + rotated/scaled prototype AABB`)
-    /// when absent.
+    /// `fn user_<stem>_inst_aabb(inst: <Struct>) -> Aabb` — instance
+    /// world-space AABB. Required alongside `instance_at`.
     pub inst_aabb_text: Option<String>,
-    /// Option B — optional override for non-affine deformation.
-    /// `fn user_<stem>_inst_to_local(world_pos: vec3<f32>, inst: <Struct>) -> vec3<f32>`.
-    /// Falls back to TRS inverse when absent.
+    /// `fn user_<stem>_inst_to_local(world_pos: vec3<f32>, inst: <Struct>) -> vec3<f32>`
+    /// — world→prototype-local mapping. Required alongside `instance_at`.
     pub inst_to_local_text: Option<String>,
-    /// Phase B-redux — march-time derivation hook. Replaces the
-    /// emit-pass scatter for instance shaders. Signature:
+    /// Phase B-redux march-time derivation hook. Signature:
     /// `fn user_<stem>_instance_at(host_pos: vec3<f32>, host: HostSample,
     /// ctx: UserCtx, k: u32, out_instance: ptr<function, <Struct>>) -> bool`.
     /// Returns the k-th instance for this host position, or `false` to
-    /// signal "no instance at index k." Called per-pixel from the host
-    /// march at painted-region cells; allows zero per-frame state
-    /// writes (time enters via `ctx`). When present, it supersedes
-    /// `emit_text` for the new pipeline; both can coexist while
-    /// Option B is being phased out.
+    /// signal "no instance at index k." Called from the host march on
+    /// band-cell hits; allows zero per-frame state writes.
     pub instance_at_text: Option<String>,
     /// Verbatim `struct ... { ... }` declarations captured from the
     /// file's top level, in source order. Shader code can declare its
@@ -201,17 +187,7 @@ impl UserShaderEntry {
         self.shade_text.is_some()
             || self.generate_text.is_some()
             || self.proto_text.is_some()
-            || self.emit_text.is_some()
-    }
-
-    /// Routes a fully-formed instance shader (Option B): has a parsed
-    /// per-instance struct layout AND both required hooks. Used by the
-    /// engine to dispatch this shader through the instance pipeline
-    /// instead of the per-cell `generate` path.
-    pub fn is_instance_pipeline(&self) -> bool {
-        self.instance_layout.is_some()
-            && self.proto_text.is_some()
-            && self.emit_text.is_some()
+            || self.instance_at_text.is_some()
     }
 }
 
@@ -267,7 +243,6 @@ impl UserShaderRegistry {
                 tile_size: e.metadata.tile_size,
                 has_shade: e.shade_text.is_some(),
                 has_generate: e.generate_text.is_some(),
-                is_instance_pipeline: e.is_instance_pipeline(),
                 has_instance_at: e.instance_at_text.is_some(),
                 instance_struct_name: e
                     .metadata
@@ -313,11 +288,6 @@ pub struct UserShaderInfo {
     pub tile_size: Option<f32>,
     pub has_shade: bool,
     pub has_generate: bool,
-    /// True if the shader opts into Option B (voxel sprite instancing).
-    /// Mutually exclusive with the per-cell `generate` path at dispatch
-    /// time; the editor surfaces this so users can see at a glance which
-    /// pipeline a shader belongs to.
-    pub is_instance_pipeline: bool,
     /// Phase B-redux — true if the shader provides a `instance_at`
     /// hook. Such shaders take the march-time derivation path
     /// (Phase 3a host-leaf dispatch + Phase 3b band-cell dispatch)
@@ -431,7 +401,6 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
         generate_text: None,
         helpers: Vec::new(),
         proto_text: None,
-        emit_text: None,
         inst_aabb_text: None,
         inst_to_local_text: None,
         instance_at_text: None,
@@ -493,7 +462,6 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
                     "shade" => &mut entry.shade_text,
                     "generate" => &mut entry.generate_text,
                     "proto" => &mut entry.proto_text,
-                    "emit" => &mut entry.emit_text,
                     "inst_aabb" => &mut entry.inst_aabb_text,
                     "inst_to_local" => &mut entry.inst_to_local_text,
                     "instance_at" => &mut entry.instance_at_text,
@@ -502,7 +470,7 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
                             path: path.to_path_buf(),
                             line: line_of(source, name_start),
                             msg: format!(
-                                "unknown hook `{other}` — expected `shade`, `generate`, `proto`, `emit`, `inst_aabb`, `inst_to_local`, or `instance_at`"
+                                "unknown hook `{other}` — expected `shade`, `generate`, `proto`, `inst_aabb`, `inst_to_local`, or `instance_at`"
                             ),
                         });
                     }
@@ -569,15 +537,6 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
                 ),
             });
         }
-        if entry.emit_text.is_none() {
-            return Err(ShaderComposerError::Parse {
-                path: path.to_path_buf(),
-                line: 0,
-                msg: format!(
-                    "@instance_proto declared but `user_{name}_emit` hook is missing"
-                ),
-            });
-        }
         let Some(struct_text) = entry
             .struct_decls
             .iter()
@@ -610,15 +569,6 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
                 line: 0,
                 msg: format!(
                     "`user_{name}_proto` defined without `// @instance_proto <StructName>` directive"
-                ),
-            });
-        }
-        if entry.emit_text.is_some() {
-            return Err(ShaderComposerError::Parse {
-                path: path.to_path_buf(),
-                line: 0,
-                msg: format!(
-                    "`user_{name}_emit` defined without `// @instance_proto <StructName>` directive"
                 ),
             });
         }
@@ -1166,9 +1116,8 @@ fn compose_generate_chunk(reg: &UserShaderRegistry) -> String {
 
 /// Generate a `var inst: <Struct>; inst.field = ...;` block that reads
 /// the per-field bytes out of `instance_pool[base_u32 + offset]` into
-/// a local. Mirrors [`generate_emit_instance`] but as READS, used by
-/// the inst_to_local + inst_aabb wrappers to reconstruct the user's
-/// struct from the global pool at march time.
+/// a local. Used by the inst_to_local + inst_aabb wrappers to
+/// reconstruct the user's struct from the global pool at march time.
 fn generate_read_instance(layout: &InstanceLayout) -> String {
     let mut out = String::new();
     out.push_str(&format!("    var inst: {};\n", layout.struct_name));
@@ -1751,9 +1700,9 @@ fn compute_registry_hash(entries: &[UserShaderEntry]) -> u64 {
             &e.shade_text,
             &e.generate_text,
             &e.proto_text,
-            &e.emit_text,
             &e.inst_aabb_text,
             &e.inst_to_local_text,
+            &e.instance_at_text,
         ] {
             if let Some(t) = hook {
                 buf.extend_from_slice(t.as_bytes());
@@ -2157,7 +2106,6 @@ fn user_grass_generate(cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx
 // @instance_proto Blade
 struct Blade { pos: vec3<f32> }
 fn user_grass_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
-fn user_grass_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 "#;
         let tmp = tempfile_dir("compose_proto");
         write(&tmp, "grass.wgsl", src);
@@ -2204,7 +2152,6 @@ fn user_grass_shade(ctx: ShadeCtx) -> ShadeResult { var r: ShadeResult; return r
 struct Pt { pos: vec3<f32>, scale: f32 }
 
 fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
-fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 fn user_x_inst_aabb(inst: Pt) -> Aabb {
     var a: Aabb;
     a.min = inst.pos - vec3<f32>(0.5 * inst.scale);
@@ -2281,7 +2228,6 @@ struct Pt { pos: vec3<f32>, scale: f32 }
 fn helper_noop(p: vec3<f32>) -> vec3<f32> { return p; }
 
 fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
-fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 fn user_x_inst_to_local(world_pos: vec3<f32>, inst: Pt) -> vec3<f32> {
     return helper_noop(world_pos - inst.pos);
 }
@@ -2330,7 +2276,6 @@ fn user_x_instance_at(
 // @instance_proto Pt
 struct Pt { pos: vec3<f32>, scale: f32 }
 fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
-fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 "#;
         let tmp = tempfile_dir("instance_at_empty");
         write(&tmp, "x.wgsl", src);
@@ -2365,12 +2310,11 @@ fn user_x_instance_at(
         );
     }
 
-    // ── Option B: @instance_proto pipeline ────────────────────────────
+    // ── @instance_proto pipeline ──────────────────────────────────────
 
     /// Canonical happy-path instance shader. Has the directive, struct,
-    /// proto + emit hooks, plus an optional `inst_to_local` deformation
-    /// helper. Should parse, populate `instance_layout`, and report
-    /// `is_instance_pipeline()` = true.
+    /// proto hook + the Phase B-redux helper hooks. Should parse and
+    /// populate `instance_layout`.
     #[test]
     fn parses_full_instance_shader() {
         let src = r#"
@@ -2391,11 +2335,6 @@ fn user_grass_proto(uvw: vec3<f32>) -> VoxelEmit {
     return v;
 }
 
-fn user_grass_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) {
-    var b: Blade;
-    emit_instance(b);
-}
-
 fn user_grass_inst_to_local(world_pos: vec3<f32>, inst: Blade) -> vec3<f32> {
     return world_pos - inst.pos;
 }
@@ -2404,10 +2343,8 @@ fn user_grass_inst_to_local(world_pos: vec3<f32>, inst: Blade) -> vec3<f32> {
         write(&tmp, "grass.wgsl", src);
         let reg = scan_dir(&tmp).unwrap();
         let e = &reg.entries()[0];
-        assert!(e.is_instance_pipeline());
         assert_eq!(e.metadata.instance_proto_struct.as_deref(), Some("Blade"));
         assert!(e.proto_text.is_some());
-        assert!(e.emit_text.is_some());
         assert!(e.inst_to_local_text.is_some());
         assert!(e.inst_aabb_text.is_none());
         let layout = e.instance_layout.as_ref().unwrap();
@@ -2416,11 +2353,9 @@ fn user_grass_inst_to_local(world_pos: vec3<f32>, inst: Blade) -> vec3<f32> {
         assert_eq!(layout.fields.len(), 5);
     }
 
-    /// `is_instance_pipeline()` must be false for plain shade-only shaders
-    /// — they take the existing dispatch path and shouldn't be routed
-    /// through the new pipeline.
+    /// Plain shade-only shaders shouldn't pick up any instance state.
     #[test]
-    fn classic_shade_shader_is_not_instance_pipeline() {
+    fn classic_shade_shader_has_no_instance_layout() {
         let src = r#"
 fn user_holo_shade(ctx: ShadeCtx) -> ShadeResult { var r: ShadeResult; return r; }
 "#;
@@ -2428,7 +2363,6 @@ fn user_holo_shade(ctx: ShadeCtx) -> ShadeResult { var r: ShadeResult; return r;
         write(&tmp, "holo.wgsl", src);
         let reg = scan_dir(&tmp).unwrap();
         let e = &reg.entries()[0];
-        assert!(!e.is_instance_pipeline());
         assert!(e.instance_layout.is_none());
     }
 
@@ -2440,7 +2374,6 @@ fn user_holo_shade(ctx: ShadeCtx) -> ShadeResult { var r: ShadeResult; return r;
         let src = r#"
 // @instance_proto Missing
 fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
-fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 "#;
         let tmp = tempfile_dir("instance_no_struct");
         write(&tmp, "x.wgsl", src);
@@ -2458,7 +2391,6 @@ fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
         let src = r#"
 // @instance_proto Blade
 struct Blade { pos: vec3<f32> }
-fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 "#;
         let tmp = tempfile_dir("instance_no_proto");
         write(&tmp, "x.wgsl", src);
@@ -2472,28 +2404,9 @@ fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
     }
 
     #[test]
-    fn rejects_instance_proto_without_emit_hook() {
-        let src = r#"
-// @instance_proto Blade
-struct Blade { pos: vec3<f32> }
-fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
-"#;
-        let tmp = tempfile_dir("instance_no_emit");
-        write(&tmp, "x.wgsl", src);
-        let err = scan_dir(&tmp).unwrap_err();
-        match err {
-            ShaderComposerError::Parse { msg, .. } => {
-                assert!(msg.contains("`user_x_emit` hook is missing"), "got: {msg}");
-            }
-            other => panic!("expected Parse, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn rejects_proto_hook_without_directive() {
-        // `proto`/`emit` are reserved for instance mode. Defining one
-        // without `@instance_proto` is almost certainly a typo or
-        // misunderstanding — fail loudly.
+        // `proto` is reserved for instance mode. Defining it without
+        // `@instance_proto` is almost certainly a typo — fail loudly.
         let src = r#"
 fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
 "#;
@@ -2514,7 +2427,6 @@ fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
 // @instance_proto Bad
 struct Bad { foo: f32 }
 fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
-fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 "#;
         let tmp = tempfile_dir("instance_no_pos");
         write(&tmp, "x.wgsl", src);
@@ -2543,7 +2455,6 @@ struct Big {
     g: vec4<f32>,
 }
 fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
-fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 "#;
         let tmp = tempfile_dir("instance_oversize");
         write(&tmp, "x.wgsl", src);
@@ -2563,7 +2474,6 @@ fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 // @instance_proto Other
 struct Blade { pos: vec3<f32> }
 fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
-fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 "#;
         let tmp = tempfile_dir("dup_instance_proto");
         write(&tmp, "x.wgsl", src);
@@ -2603,13 +2513,13 @@ struct X { pos: vec3<f32> }
 struct Blade { pos: vec3<f32>, yaw: f32 }
 struct LocalSample { density: f32, color: vec3<f32> }
 fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
-fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 "#;
         let tmp = tempfile_dir("helper_struct");
         write(&tmp, "x.wgsl", src);
         let reg = scan_dir(&tmp).unwrap();
         let e = &reg.entries()[0];
-        assert!(e.is_instance_pipeline());
+        assert!(e.proto_text.is_some());
+        assert!(e.instance_layout.is_some());
         assert_eq!(e.struct_decls.len(), 2);
         assert_eq!(
             e.instance_layout.as_ref().unwrap().struct_name,
@@ -2627,7 +2537,6 @@ fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 // @instance_proto Blade
 struct Blade { pos: vec3<f32>, yaw: f32 }
 fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
-fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 "#,
         );
         let h1 = scan_dir(&tmp).unwrap().source_hash();
@@ -2639,7 +2548,6 @@ fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 // @instance_proto Blade
 struct Blade { pos: vec3<f32>, yaw: f32, scale: f32 }
 fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
-fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 "#,
         );
         let h2 = scan_dir(&tmp).unwrap().source_hash();
@@ -2652,13 +2560,11 @@ fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 // @instance_proto Blade
 struct Blade { pos: vec3<f32>, yaw: f32 }
 fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
-fn user_x_emit(host_pos: vec3<f32>, host: HostSample, ctx: UserCtx) { }
 "#;
         let tmp = tempfile_dir("info");
         write(&tmp, "x.wgsl", src);
         let reg = scan_dir(&tmp).unwrap();
         let info = &reg.shader_infos()[0];
-        assert!(info.is_instance_pipeline);
         assert_eq!(info.instance_struct_name.as_deref(), Some("Blade"));
         assert_eq!(info.instance_struct_size, Some(16));
     }
