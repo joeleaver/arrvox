@@ -89,6 +89,8 @@ A working map of the renderer's hot paths. Module-level only — the file-level 
 | `rkp_scene_manager::asset_load` | impl block for `acquire_asset` / `reload_asset` / `release_asset` / `load_asset_from_disk` / `skinning_data` | (impl methods) |
 | `rkp_scene_manager::paint` | impl block for paint_epoch + brush_overlay + apply_paint_sphere + slice accessors | (impl methods) |
 | `rkp_scene_manager::voxelize` | impl block for voxelize_primitive / voxelize_sdf_fn / integrate_artifact / deallocate_geometry | (impl methods) |
+| `paint::select` | Spatial selection: sphere brush, single-cell pick, geodesic flood. Pure octree + brick reads. | `leaves_in_sphere`, `leaf_at_local_pos`, `surface_flood_fill`, `PaintedLeaf`, `LeafHit`, `FloodedLeaf` |
+| `paint::write` | Paint write ops + brush math + color packing | `PaintStamp`, `paint_leaf_material/color`, `erase_leaf_color`, `compute_painted_attr/color`, `compute_erased_color`, `brush_weight`, `pack_color`, `unpack_color` |
 
 ---
 
@@ -157,13 +159,16 @@ CLAUDE.md targets ~700 lines per file. As of the user-shader + shader_composer s
 | `rkp_scene_manager/asset_load.rs` | 463 | ✅ |
 | `rkp_scene_manager/paint.rs` | 346 | ✅ |
 | `rkp_scene_manager/voxelize.rs` | 343 | ✅ |
+| `paint.rs` (mod root) | 39 | ✅ |
+| `paint/select.rs` | 453 | ✅ |
+| `paint/write.rs` | 220 | ✅ |
+| `paint/tests.rs` | 495 | (tests file, exempt) |
 
 Other crate files still over budget (next cleanup targets, in size order):
 
 - `lifecycle.rs` 1586 (V1.1-modified — wait for in-flight work to land/revert before splitting)
-- `paint.rs` 1164
 - `shadow_map_pass.rs` 1088
-- `rkp_shade.rs` 866
+- `rkp_shade.rs` 866 (V1.1-modified — Material struct mirror)
 
 WGSL files over budget (no hard 700-line rule but worth flagging):
 
