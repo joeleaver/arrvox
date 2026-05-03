@@ -12,7 +12,7 @@ fn empty_registry_resolves_all_to_zero() {
     let reg = UserShaderRegistry::empty();
     let mut def = MaterialDef::default();
     def.shader = Some("hologram".to_string());
-    let gpu = def.to_gpu(&|n| reg.resolve(n));
+    let gpu = def.to_gpu(&|n| reg.resolve(n), &|n| reg.resolve(n));
     assert_eq!(
         gpu.shader_id, 0,
         "unregistered shader name must resolve to 0 (identity dispatch)",
@@ -24,7 +24,7 @@ fn no_shader_field_resolves_to_zero() {
     let reg = UserShaderRegistry::empty();
     let def = MaterialDef::default();
     assert!(def.shader.is_none());
-    let gpu = def.to_gpu(&|n| reg.resolve(n));
+    let gpu = def.to_gpu(&|n| reg.resolve(n), &|n| reg.resolve(n));
     assert_eq!(gpu.shader_id, 0);
 }
 
@@ -52,12 +52,12 @@ fn registered_shader_resolves_to_id() {
 
     let mut def = MaterialDef::default();
     def.shader = Some("hologram".to_string());
-    let gpu = def.to_gpu(&|n| reg.resolve(n));
+    let gpu = def.to_gpu(&|n| reg.resolve(n), &|n| reg.resolve(n));
     assert_eq!(gpu.shader_id, 1);
 
     // Different name on the same registry → still 0.
     def.shader = Some("nope".to_string());
-    let gpu = def.to_gpu(&|n| reg.resolve(n));
+    let gpu = def.to_gpu(&|n| reg.resolve(n), &|n| reg.resolve(n));
     assert_eq!(gpu.shader_id, 0);
 }
 
@@ -69,6 +69,6 @@ fn empty_string_shader_name_resolves_to_zero() {
     let reg = UserShaderRegistry::empty();
     let mut def = MaterialDef::default();
     def.shader = Some(String::new());
-    let gpu = def.to_gpu(&|n| reg.resolve(n));
+    let gpu = def.to_gpu(&|n| reg.resolve(n), &|n| reg.resolve(n));
     assert_eq!(gpu.shader_id, 0);
 }

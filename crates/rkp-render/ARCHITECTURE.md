@@ -76,6 +76,11 @@ A working map of the renderer's hot paths. Module-level only — the file-level 
 | `shader_composer::parser` | WGSL source → registry: `scan_dir`, `parse_file`, header `@`-directives, low-level scanner | `scan_dir`, `parse_file` |
 | `shader_composer::compose` | Registry → per-pipeline WGSL chunks; per-shader `instance_descend` body emission; template splice | `compose`, `splice_inst_chunks` |
 | `shader_composer::hash` | Deterministic FNV-1a 64 of registry contents (cache-key stable across restarts) | `fnv1a_64` |
+| `rkp_engine::render_worker::state` | RenderWorker handle, RenderInbox mailbox, internal RenderState | `RenderWorker`, `RenderInbox`, `RenderState` |
+| `rkp_engine::render_worker::loop_thread` | Render-thread main loop + per-snapshot interpolation | `run_render_thread`, `interpolate_instances`, `lerp_world_matrix` |
+| `rkp_engine::render_worker::frame` | Per-frame orchestration (`render_one_frame` ~800 lines) | `render_one_frame`, `RenderOutcome` |
+| `rkp_engine::render_worker::frame_helpers` | Tile-list splice, AABB transforms, shadow-map setup | `splice_transient_into_tile_lists`, `merge_tile_lists`, `compute_tlas_scene_aabb`, `transform_aabb_world`, `prepare_shadow_maps` |
+| `rkp_engine::render_worker::user_shader_tick` | Per-frame user-shader bake + region BFS dispatch + cache hashing | `tick_instance_pipeline`, `run_user_shader_geom`, `topology_hash_for`, `fill_hash_for` |
 
 ---
 
@@ -127,16 +132,21 @@ CLAUDE.md targets ~700 lines per file. As of the user-shader + shader_composer s
 | `shader_composer/compose.rs` | 478 | ✅ |
 | `shader_composer/hash.rs` | 88 | ✅ |
 | `shader_composer/tests.rs` | 827 | (tests file, exempt from budget) |
+| `render_worker.rs` (mod root) | 83 | ✅ |
+| `render_worker/state.rs` | 484 | ✅ |
+| `render_worker/loop_thread.rs` | 340 | ✅ |
+| `render_worker/frame.rs` | 820 | ⚠️ over; structurally one big function (`render_one_frame`) — splitting it further is a refactor not a move |
+| `render_worker/frame_helpers.rs` | 178 | ✅ |
+| `render_worker/user_shader_tick.rs` | 578 | ✅ |
 
 Other crate files still over budget (next cleanup targets, in size order):
 
 - `tlas_build_pass.rs` 1899
 - `rkp_scene_manager.rs` 1649
+- `lifecycle.rs` 1586 (V1.1-modified — wait for in-flight work to land/revert before splitting)
 - `paint.rs` 1164
 - `shadow_map_pass.rs` 1088
 - `rkp_shade.rs` 866
-
-(Engine-side: `render_worker.rs` 2461, `lifecycle.rs` 1586 are next-priority targets in their respective crate.)
 
 WGSL files over budget (no hard 700-line rule but worth flagging):
 
