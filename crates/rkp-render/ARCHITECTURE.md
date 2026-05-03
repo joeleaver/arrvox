@@ -84,6 +84,11 @@ A working map of the renderer's hot paths. Module-level only — the file-level 
 | `tlas_build_pass::types` | Wire-format types + uniform structs for the TLAS build chain | `TlasPrim`, `InstanceTileCullEntry`, `AssembleHost/Morton/Radix/Karras` uniforms, RADIX_* constants |
 | `tlas_build_pass::pass` | `TlasBuildPass` GPU pipelines + buffers + per-frame dispatch chain | `TlasBuildPass`, `GpuTlasBuildInputs` |
 | `tlas_build_pass::cpu_reference` | CPU oracle for every stage (used by integration tests) | `cpu_reference_assemble_host/_user_shader/_morton/_radix_sort/_full_tree/_karras_node`, `karras_delta`, `scene_aabb_from_prims` |
+| `rkp_scene_manager::types` | Public data types + private AssetCache machinery + emit_faces helper | `FaceInstance`, `AssetHandle`, `AssetInfo`, `SkinBrick`, `SkinningAssetData`, `ReloadResult`, `VoxelizeResult` |
+| `rkp_scene_manager::manager` | RkpSceneManager struct + core methods (construction, faces, geometry epoch, slices, deallocation) | `RkpSceneManager` |
+| `rkp_scene_manager::asset_load` | impl block for `acquire_asset` / `reload_asset` / `release_asset` / `load_asset_from_disk` / `skinning_data` | (impl methods) |
+| `rkp_scene_manager::paint` | impl block for paint_epoch + brush_overlay + apply_paint_sphere + slice accessors | (impl methods) |
+| `rkp_scene_manager::voxelize` | impl block for voxelize_primitive / voxelize_sdf_fn / integrate_artifact / deallocate_geometry | (impl methods) |
 
 ---
 
@@ -146,10 +151,15 @@ CLAUDE.md targets ~700 lines per file. As of the user-shader + shader_composer s
 | `tlas_build_pass/pass.rs` | 1052 | ⚠️ over; per-stage split (assemble / morton-radix / karras / propagate) is a refactor not a move — deferred |
 | `tlas_build_pass/cpu_reference.rs` | 387 | ✅ |
 | `tlas_build_pass/tests.rs` | 341 | (tests file, exempt) |
+| `rkp_scene_manager.rs` (mod root) | 35 | ✅ |
+| `rkp_scene_manager/types.rs` | 269 | ✅ |
+| `rkp_scene_manager/manager.rs` | 272 | ✅ |
+| `rkp_scene_manager/asset_load.rs` | 463 | ✅ |
+| `rkp_scene_manager/paint.rs` | 346 | ✅ |
+| `rkp_scene_manager/voxelize.rs` | 343 | ✅ |
 
 Other crate files still over budget (next cleanup targets, in size order):
 
-- `rkp_scene_manager.rs` 1649
 - `lifecycle.rs` 1586 (V1.1-modified — wait for in-flight work to land/revert before splitting)
 - `paint.rs` 1164
 - `shadow_map_pass.rs` 1088
