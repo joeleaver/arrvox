@@ -51,22 +51,34 @@ impl EngineState {
         //     render saw it.
         let (materials, shader_params_slots) = {
             let registry = &self.user_shader_registry;
-            // Only resolve shader_ids for shaders that actually have a
-            // `shade` hook. The shade pass takes the PBR path when
-            // `material.shader_id == 0`; if we resolved every name
-            // unconditionally, a geom-only shader (no `shade` hook)
-            // would dispatch into the default `shade_result_passthrough`
-            // arm and write raw albedo (~1 nit) to the HDR output, which
-            // tone-maps to black against ~90 000-nit sun lighting. The
-            // geom pass resolves shader_ids separately by name, so this
-            // restriction doesn't affect it.
-            let palette = self.material_lib.build_palette(&|name| {
-                registry
-                    .entries()
-                    .iter()
-                    .find(|e| e.name == name && e.shade_text.is_some())
-                    .map(|e| e.id)
-            });
+            // Two separate dispatch ids on each material:
+            //   * `shader_id`          → shade-pass dispatch. Resolved
+            //     ONLY for shaders with a `shade` hook; otherwise stays
+            //     0 so the shade pass takes the PBR path. (Resolving
+            //     for non-shade shaders would route the dispatcher
+            //     through its identity arm and emit raw albedo, which
+            //     tone-maps to black against direct sun.)
+            //   * `instance_shader_id` → band-cell descent dispatch
+            //     (Phase B-redux). Resolved ONLY for shaders with an
+            //     `instance_at` hook; the march reads it on a band-cell
+            //     hit to find the prototype asset.
+            // A shader can populate one, both, or neither.
+            let palette = self.material_lib.build_palette(
+                &|name| {
+                    registry
+                        .entries()
+                        .iter()
+                        .find(|e| e.name == name && e.shade_text.is_some())
+                        .map(|e| e.id)
+                },
+                &|name| {
+                    registry
+                        .entries()
+                        .iter()
+                        .find(|e| e.name == name && e.instance_at_text.is_some())
+                        .map(|e| e.id)
+                },
+            );
             let params = self.material_lib.build_shader_params(registry);
             (palette, params)
         };
@@ -344,6 +356,33 @@ impl EngineState {
                             }
                         }
 
+                        // Phase B-redux V1.1 — surface y + horizontal AABB
+                        // for the band-cell BFS gates. Computed by
+                        // projecting the painted leaves' host-local AABB
+                        // (8 corners) to world. `host_surface_y` is the
+                        // center of that world AABB on Y; painted_world_min/max
+                        // are the full bounds for x/z gating.
+                        let painted_corners = [
+                            [local_aabb.min.x, local_aabb.min.y, local_aabb.min.z],
+                            [local_aabb.max.x, local_aabb.min.y, local_aabb.min.z],
+                            [local_aabb.min.x, local_aabb.max.y, local_aabb.min.z],
+                            [local_aabb.max.x, local_aabb.max.y, local_aabb.min.z],
+                            [local_aabb.min.x, local_aabb.min.y, local_aabb.max.z],
+                            [local_aabb.max.x, local_aabb.min.y, local_aabb.max.z],
+                            [local_aabb.min.x, local_aabb.max.y, local_aabb.max.z],
+                            [local_aabb.max.x, local_aabb.max.y, local_aabb.max.z],
+                        ];
+                        let mut painted_world_min = [f32::INFINITY; 3];
+                        let mut painted_world_max = [f32::NEG_INFINITY; 3];
+                        for c in &painted_corners {
+                            let p = world.project_point3(glam::Vec3::new(c[0], c[1], c[2]));
+                            for i in 0..3 {
+                                painted_world_min[i] = painted_world_min[i].min(p[i]);
+                                painted_world_max[i] = painted_world_max[i].max(p[i]);
+                            }
+                        }
+                        let host_surface_y = 0.5 * (painted_world_min[1] + painted_world_max[1]);
+
                         // Depth derivation. With tiling the extent is
                         // FIXED (tile_size + thickness padding), so
                         // cell_size doesn't grow with paint area —
@@ -420,6 +459,9 @@ impl EngineState {
                                 host_inverse_world: inverse_world,
                                 tile_index,
                                 is_band_region: true,
+                                host_surface_y,
+                                painted_world_min,
+                                painted_world_max,
                             });
                         } else if info.has_generate {
                             user_shader_regions.push(rkp_render::user_shader_pass::ShaderRegionRequest {
@@ -442,6 +484,9 @@ impl EngineState {
                                 host_inverse_world: inverse_world,
                                 tile_index,
                                 is_band_region: false,
+                                host_surface_y,
+                                painted_world_min,
+                                painted_world_max,
                             });
                         }
                     }

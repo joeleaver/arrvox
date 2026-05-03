@@ -2332,6 +2332,12 @@ fn topology_hash_for(
         for &b in &v.to_le_bytes() { mix(&mut h, b); }
     }
     for &b in &req.cell_size.to_le_bytes() { mix(&mut h, b); }
+    // V1.1 — fold in the painted-area gate inputs so changes to
+    // either invalidate the BFS cache.
+    for &b in &req.host_surface_y.to_le_bytes() { mix(&mut h, b); }
+    for v in req.painted_world_min.iter().chain(req.painted_world_max.iter()) {
+        for &b in &v.to_le_bytes() { mix(&mut h, b); }
+    }
     h
 }
 
