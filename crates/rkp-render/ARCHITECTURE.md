@@ -81,6 +81,9 @@ A working map of the renderer's hot paths. Module-level only — the file-level 
 | `rkp_engine::render_worker::frame` | Per-frame orchestration (`render_one_frame` ~800 lines) | `render_one_frame`, `RenderOutcome` |
 | `rkp_engine::render_worker::frame_helpers` | Tile-list splice, AABB transforms, shadow-map setup | `splice_transient_into_tile_lists`, `merge_tile_lists`, `compute_tlas_scene_aabb`, `transform_aabb_world`, `prepare_shadow_maps` |
 | `rkp_engine::render_worker::user_shader_tick` | Per-frame user-shader bake + region BFS dispatch + cache hashing | `tick_instance_pipeline`, `run_user_shader_geom`, `topology_hash_for`, `fill_hash_for` |
+| `tlas_build_pass::types` | Wire-format types + uniform structs for the TLAS build chain | `TlasPrim`, `InstanceTileCullEntry`, `AssembleHost/Morton/Radix/Karras` uniforms, RADIX_* constants |
+| `tlas_build_pass::pass` | `TlasBuildPass` GPU pipelines + buffers + per-frame dispatch chain | `TlasBuildPass`, `GpuTlasBuildInputs` |
+| `tlas_build_pass::cpu_reference` | CPU oracle for every stage (used by integration tests) | `cpu_reference_assemble_host/_user_shader/_morton/_radix_sort/_full_tree/_karras_node`, `karras_delta`, `scene_aabb_from_prims` |
 
 ---
 
@@ -138,10 +141,14 @@ CLAUDE.md targets ~700 lines per file. As of the user-shader + shader_composer s
 | `render_worker/frame.rs` | 820 | ⚠️ over; structurally one big function (`render_one_frame`) — splitting it further is a refactor not a move |
 | `render_worker/frame_helpers.rs` | 178 | ✅ |
 | `render_worker/user_shader_tick.rs` | 578 | ✅ |
+| `tlas_build_pass.rs` (mod root) | 57 | ✅ |
+| `tlas_build_pass/types.rs` | 131 | ✅ |
+| `tlas_build_pass/pass.rs` | 1052 | ⚠️ over; per-stage split (assemble / morton-radix / karras / propagate) is a refactor not a move — deferred |
+| `tlas_build_pass/cpu_reference.rs` | 387 | ✅ |
+| `tlas_build_pass/tests.rs` | 341 | (tests file, exempt) |
 
 Other crate files still over budget (next cleanup targets, in size order):
 
-- `tlas_build_pass.rs` 1899
 - `rkp_scene_manager.rs` 1649
 - `lifecycle.rs` 1586 (V1.1-modified — wait for in-flight work to land/revert before splitting)
 - `paint.rs` 1164
