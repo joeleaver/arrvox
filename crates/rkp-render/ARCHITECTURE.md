@@ -94,6 +94,9 @@ A working map of the renderer's hot paths. Module-level only — the file-level 
 | `shadow_map_pass::types` | Constants + LightCameraUniform + SetupParams wire types | `LightCameraUniform`, `SetupParams`, `SHADOW_MAP_*`, `SCATTER_INSTANCE_STRIDE` |
 | `shadow_map_pass::light_camera` | CPU-side light-camera derivation (scene fit + frustum fit) | `compute_light_camera`, `compute_light_camera_frustum_fit` |
 | `shadow_map_pass::pass` | ShadowMapPass GPU runtime — 5 pipelines + buffers + per-frame dispatch chain | `ShadowMapPass` |
+| `user_shader_proto_pass::types` | Pool sizing constants + PrototypeEntry + depth helpers + OCTREE_EMPTY/INTERNAL_ATTR_NONE sentinels | `PrototypeEntry`, `MAX_PROTO_MAX_DEPTH`, `PROTO_*_POOL_CAPACITY` |
+| `user_shader_proto_pass::cache` | PrototypeCache + per-shader octree-extent allocator + build_internal_levels pre-builder | `PrototypeCache`, `build_internal_levels` |
+| `user_shader_proto_pass::pass` | PrototypeBakePass GPU runtime + PrototypeUniform + compose_proto_source | `PrototypeBakePass`, `PrototypeUniform`, `compose_proto_source` |
 
 ---
 
@@ -171,11 +174,44 @@ CLAUDE.md targets ~700 lines per file. As of the user-shader + shader_composer s
 | `shadow_map_pass/light_camera.rs` | 250 | ✅ |
 | `shadow_map_pass/pass.rs` | 669 | ✅ at budget |
 | `shadow_map_pass/tests.rs` | 67 | (tests file, exempt) |
+| `user_shader_proto_pass.rs` (mod root) | 52 | ✅ |
+| `user_shader_proto_pass/types.rs` | 159 | ✅ |
+| `user_shader_proto_pass/cache.rs` | 282 | ✅ |
+| `user_shader_proto_pass/pass.rs` | 273 | ✅ |
+| `user_shader_proto_pass/tests.rs` | 259 | (tests file, exempt) |
 
-Other crate files still over budget (next cleanup targets, in size order):
+Other crate files still over budget (in size order):
 
-- `lifecycle.rs` 1586 (V1.1-modified — wait for in-flight work to land/revert before splitting)
+In rkp-render:
+- `rkp_volumetric.rs` 859 (NOT V1.1-touched)
 - `rkp_shade.rs` 866 (V1.1-modified — Material struct mirror)
+- `tlas_build_pass/pass.rs` 1052 (already split-once; would need per-stage refactor not module move)
+- `user_shader_pass/cache.rs` 924 (already split-once)
+- `shader_composer/parser.rs` 710 (already split-once, slightly over)
+- `user_shader_pass/dispatch.rs` 707 (already split-once, at budget)
+
+In rkp-engine:
+- `lifecycle.rs` 1579 (V1.1-modified — wait for in-flight work)
+- `component_registry.rs` 896 (NOT V1.1)
+- `engine/state.rs` 886 (NOT V1.1)
+- `render_worker/frame.rs` 820 (already split-once)
+- `play_mode.rs` 710 (NOT V1.1)
+- `command.rs` 705 (NOT V1.1)
+- `material_library.rs` 703 (V1.1-modified)
+
+In other crates (NOT touched this session):
+- `rkp-core/src/sparse_octree.rs` 1820
+- `rkp-core/src/voxelize_octree.rs` 1179
+- `rkp-runtime/src/input/system.rs` 1140
+- `rkp-procedural/src/arena.rs` 1029
+- `rkp-core/src/scene_node.rs` 892
+- `rkp-physics/src/sdf_collision.rs` 879
+- `rkp-editor/src/ui/panels/object_properties.rs` 858
+- `rkp-core/src/asset_file.rs` 821
+- `rkp-procedural/src/flatten.rs` 801
+- `rkp-editor/src/ui/panels/asset_properties.rs` 790
+- `rkp-editor/src/ui/panels/prop_controls.rs` 743
+- `rkp-core/src/companion.rs` 737
 
 WGSL files over budget (no hard 700-line rule but worth flagging):
 
