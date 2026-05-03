@@ -91,6 +91,9 @@ A working map of the renderer's hot paths. Module-level only — the file-level 
 | `rkp_scene_manager::voxelize` | impl block for voxelize_primitive / voxelize_sdf_fn / integrate_artifact / deallocate_geometry | (impl methods) |
 | `paint::select` | Spatial selection: sphere brush, single-cell pick, geodesic flood. Pure octree + brick reads. | `leaves_in_sphere`, `leaf_at_local_pos`, `surface_flood_fill`, `PaintedLeaf`, `LeafHit`, `FloodedLeaf` |
 | `paint::write` | Paint write ops + brush math + color packing | `PaintStamp`, `paint_leaf_material/color`, `erase_leaf_color`, `compute_painted_attr/color`, `compute_erased_color`, `brush_weight`, `pack_color`, `unpack_color` |
+| `shadow_map_pass::types` | Constants + LightCameraUniform + SetupParams wire types | `LightCameraUniform`, `SetupParams`, `SHADOW_MAP_*`, `SCATTER_INSTANCE_STRIDE` |
+| `shadow_map_pass::light_camera` | CPU-side light-camera derivation (scene fit + frustum fit) | `compute_light_camera`, `compute_light_camera_frustum_fit` |
+| `shadow_map_pass::pass` | ShadowMapPass GPU runtime — 5 pipelines + buffers + per-frame dispatch chain | `ShadowMapPass` |
 
 ---
 
@@ -163,11 +166,15 @@ CLAUDE.md targets ~700 lines per file. As of the user-shader + shader_composer s
 | `paint/select.rs` | 453 | ✅ |
 | `paint/write.rs` | 220 | ✅ |
 | `paint/tests.rs` | 495 | (tests file, exempt) |
+| `shadow_map_pass.rs` (mod root) | 67 | ✅ |
+| `shadow_map_pass/types.rs` | 86 | ✅ |
+| `shadow_map_pass/light_camera.rs` | 250 | ✅ |
+| `shadow_map_pass/pass.rs` | 669 | ✅ at budget |
+| `shadow_map_pass/tests.rs` | 67 | (tests file, exempt) |
 
 Other crate files still over budget (next cleanup targets, in size order):
 
 - `lifecycle.rs` 1586 (V1.1-modified — wait for in-flight work to land/revert before splitting)
-- `shadow_map_pass.rs` 1088
 - `rkp_shade.rs` 866 (V1.1-modified — Material struct mirror)
 
 WGSL files over budget (no hard 700-line rule but worth flagging):
