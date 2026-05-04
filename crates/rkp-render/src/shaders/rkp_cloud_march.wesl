@@ -15,6 +15,7 @@
 // Distance fog / participating-medium haze live in rkp_fog_march.wgsl.
 
 import package::lib::math::PI;
+import package::lib::math::SKY_DEPTH_SENTINEL;
 import package::lib::math::interleaved_gradient_noise;
 import package::lib::math::value_noise_3d;
 import package::lib::types::CloudParams;
@@ -182,10 +183,10 @@ fn cloud_march(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d1 = textureLoad(depth_buffer, full_base + vec2<i32>(1, 0), 0).w;
     let d2 = textureLoad(depth_buffer, full_base + vec2<i32>(0, 1), 0).w;
     let d3 = textureLoad(depth_buffer, full_base + vec2<i32>(1, 1), 0).w;
-    let is_sky = (d0 >= 9999.0 || d0 <= 0.0)
-              && (d1 >= 9999.0 || d1 <= 0.0)
-              && (d2 >= 9999.0 || d2 <= 0.0)
-              && (d3 >= 9999.0 || d3 <= 0.0);
+    let is_sky = (d0 >= SKY_DEPTH_SENTINEL || d0 <= 0.0)
+              && (d1 >= SKY_DEPTH_SENTINEL || d1 <= 0.0)
+              && (d2 >= SKY_DEPTH_SENTINEL || d2 <= 0.0)
+              && (d3 >= SKY_DEPTH_SENTINEL || d3 <= 0.0);
 
     // Non-sky → write identity so the composite's cloud layer is a no-op
     // there, and bail out before touching any cloud bindings.

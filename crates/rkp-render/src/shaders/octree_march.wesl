@@ -30,6 +30,7 @@ import package::lib::octree::PHASE_MARCH;
 import package::lib::octree::PHASE_SHADOW;
 import package::lib::octree::LOD_CUTOFF_PX;
 import package::lib::octree::skip_node;
+import package::lib::octree::OCTREE_LOOKUP_BIAS_FACTOR;
 import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
 import package::lib::octree_slot::OCTREE_LEAF_BIT;
@@ -900,7 +901,7 @@ fn march_object(
     // pos-on-exact-boundary case where `pos >= center` would otherwise
     // round into an EMPTY sibling subtree and miss the brick we're
     // entering. See rkp_shadow_trace.wgsl.
-    let lookup_bias = vs * 1.0e-3;
+    let lookup_bias = vs * OCTREE_LOOKUP_BIAS_FACTOR;
 
     for (var step = 0u; step < MAX_STEPS; step++) {
         step_count += 1u;

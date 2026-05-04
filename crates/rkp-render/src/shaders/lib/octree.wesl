@@ -63,11 +63,29 @@ const LOD_CUTOFF_PX: f32 = 2.0;
 // when geometry-shader prototypes grow extents that need it.
 const MAX_STEPS_PROTO: u32 = 4096u;
 
+// Voxel-size-relative kick applied past a node-exit plane in
+// `skip_node` so the next iteration steps into the new node rather
+// than re-hitting the boundary. 1% of voxel size is well above
+// FP-rounding noise at metre scale and well below the next interior
+// feature, so it can't accidentally skip a thin shell.
+const OCTREE_SKIP_EPSILON_FACTOR: f32 = 0.01;
+
+// Voxel-size-relative bias applied to a ray's lookup position before
+// `octree_lookup` to disambiguate ties at exact brick boundaries.
+// Same scale rationale as `OCTREE_SKIP_EPSILON_FACTOR` but an order
+// of magnitude smaller — the lookup only needs to break exact ties,
+// not push past a boundary the DDA already crossed.
+const OCTREE_LOOKUP_BIAS_FACTOR: f32 = 1.0e-3;
+
+// Slab-test denominator floor for `skip_node`. Floats below this are
+// numerically indistinguishable from zero at metre scale; clamping
+// keeps the per-component reciprocal `1/d` finite.
+const OCTREE_SLAB_EPS: f32 = 1.0e-6;
+
 // Compute the t-distance to the next octree node boundary along a
 // ray. `vs` is the voxel size (smallest cell dimension); the
-// `+ vs * 0.01` epsilon kicks the ray just past the boundary so the
-// next iteration steps into the new node rather than re-hitting the
-// boundary.
+// `+ vs * OCTREE_SKIP_EPSILON_FACTOR` kick keeps the next iteration
+// inside the new node.
 fn skip_node(pos: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, node_depth: u32, extent: f32, vs: f32) -> f32 {
     let node_size = extent / f32(1u << node_depth);
     let node_min = floor(pos / node_size) * node_size;
@@ -75,8 +93,8 @@ fn skip_node(pos: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, node_depth: u32
     // Exit planes: for positive dir, exit through max; for negative, through min.
     let t_exit = select((node_min - pos) * inv_dir, (node_max - pos) * inv_dir, dir > vec3<f32>(0.0));
     // Smallest positive exit = nearest boundary crossing.
-    let t_pos = max(t_exit, vec3<f32>(1e-6));
-    return min(min(t_pos.x, t_pos.y), t_pos.z) + vs * 0.01;
+    let t_pos = max(t_exit, vec3<f32>(OCTREE_SLAB_EPS));
+    return min(min(t_pos.x, t_pos.y), t_pos.z) + vs * OCTREE_SKIP_EPSILON_FACTOR;
 }
 
 // Descend the octree from its root and return the terminating slot +

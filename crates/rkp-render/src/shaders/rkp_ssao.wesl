@@ -5,6 +5,7 @@
 // compares depths to estimate occlusion. Writes AO factor to Rgba8Unorm (.r).
 
 import package::lib::math::PI;
+import package::lib::math::SKY_DEPTH_SENTINEL;
 
 const NUM_SAMPLES: u32 = 16u;
 
@@ -58,7 +59,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let hit_t = pos_data.w;
 
     // No geometry hit → no occlusion.
-    if hit_t >= 9999.0 || hit_t <= 0.0 {
+    if hit_t >= SKY_DEPTH_SENTINEL || hit_t <= 0.0 {
         textureStore(ao_out, vec2<i32>(gid.xy), vec4<f32>(1.0, 0.0, 0.0, 0.0));
         return;
     }
@@ -97,7 +98,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let sample_t = sample_data.w;
 
         // No geometry at sample → not occluded by this sample.
-        if sample_t >= 9999.0 || sample_t <= 0.0 {
+        if sample_t >= SKY_DEPTH_SENTINEL || sample_t <= 0.0 {
             continue;
         }
 

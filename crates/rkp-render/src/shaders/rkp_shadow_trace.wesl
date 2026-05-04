@@ -33,6 +33,7 @@ import package::lib::octree::octree_lookup;
 import package::lib::octree::descend_proto_octree;
 import package::lib::octree::PHASE_SHADOW;
 import package::lib::octree::skip_node;
+import package::lib::octree::OCTREE_LOOKUP_BIAS_FACTOR;
 import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
 import package::lib::octree_slot::OCTREE_LEAF_BIT;
@@ -91,6 +92,20 @@ const OPACITY_REFERENCE_M: f32 = 0.3;
 // roughly 1/4 the darkness across the board (more visually, since
 // the mapping is `T → T^0.25` in the exponential).
 const GLASS_SHADOW_DENSITY: f32 = 0.25;
+
+// Per-cell transmittance attenuation when a shadow ray traverses a
+// painted-grass band cell that contains a blade hit. Cell-as-coverage-
+// event model (V1.1) — the BFS doesn't descend per-blade, so each
+// covered cell contributes one multiplicative attenuation step. 0.65
+// reads as about right for typical grass density; tunable.
+const BAND_BLADE_TRANSMITTANCE: f32 = 0.65;
+
+// Multiples of voxel size to push the shadow-ray origin off the
+// hit-surface to avoid self-shadowing on the marched leaf. 4 is
+// brick-aligned (BRICK_DIM = 4 cells per brick) — pushing exactly one
+// brick avoids aliasing back into the originating brick after the
+// safe-direction nudge.
+const SHADOW_SELF_BIAS_VOXELS: f32 = 4.0;
 
 // Scalar Beer transmittance for shadows — combines albedo absorption
 // (mirroring rkp_shade's `beer_absorption`) with a per-meter opacity
@@ -312,10 +327,10 @@ fn trace_shadow_skinned(
     );
     let inv_dir = 1.0 / safe_dir;
 
-    // Push the start point forward by a few voxels so self-shadow
-    // from the surface we're shading doesn't block its own light.
-    // Primary shadow path uses a similar `vs * 4` bias.
-    let shadow_origin = local_origin + safe_dir * vs * 4.0;
+    // Push the start point forward by SHADOW_SELF_BIAS_VOXELS voxels
+    // so self-shadow from the surface we're shading doesn't block its
+    // own light.
+    let shadow_origin = local_origin + safe_dir * vs * SHADOW_SELF_BIAS_VOXELS;
     let t_range = intersect_aabb(shadow_origin, inv_dir, grid_origin, grid_max);
     if t_range.x > t_range.y { return transmittance_in; }
     let t_limit = min(t_range.y, local_max_t);
@@ -414,7 +429,7 @@ fn shadow_step_one_instance(
     );
     let inv_dir = 1.0 / safe_dir;
 
-    let shadow_origin = oc_origin + safe_dir * vs * 4.0;
+    let shadow_origin = oc_origin + safe_dir * vs * SHADOW_SELF_BIAS_VOXELS;
     let t_range = intersect_aabb(shadow_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(extent));
     if t_range.x > t_range.y { return transmittance; }
 
@@ -425,7 +440,7 @@ fn shadow_step_one_instance(
     // `pos >= center`; biasing forward disambiguates toward the cell
     // the ray is actually entering, eliminating the dashed-seam
     // pattern caused by rounding into an EMPTY sibling subtree.
-    let lookup_bias = vs * 1.0e-3;
+    let lookup_bias = vs * OCTREE_LOOKUP_BIAS_FACTOR;
 
     for (var step = 0u; step < max_steps; step++) {
         if t > t_limit { break; }
@@ -502,7 +517,6 @@ fn shadow_step_one_instance(
                 );
                 if inst_hit.valid {
                     atomicAdd(&stats[63], 1u); // band-cell shadow hit
-                    let BAND_BLADE_TRANSMITTANCE: f32 = 0.65;
                     transmittance *= BAND_BLADE_TRANSMITTANCE;
                     if transmittance < 0.01 { return 0.0; }
                 }

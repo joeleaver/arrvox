@@ -10,6 +10,7 @@
 // module-scope global resolved at the consumer's import site.
 
 import package::lib::math::SQRT3;
+import package::lib::sdf::PROC_MISS_DISTANCE;
 import package::lib::sdf::sdf_sphere;
 import package::lib::sdf::sdf_box;
 import package::lib::sdf::sdf_capsule;
@@ -564,7 +565,7 @@ fn eval_primitive_distance(ins: ProcInstruction, world_pos: vec3<f32>) -> f32 {
         case 4u: { return sdf_torus(local, ins.params_lo.x, ins.params_lo.y); }
         case 5u: { return sdf_plane(local); }
         case 6u: { return sdf_ramp(local, ins.params_lo.x, ins.params_lo.y, ins.params_lo.z); }
-        default: { return 1e30; }
+        default: { return PROC_MISS_DISTANCE; }
     }
 }
 
@@ -721,7 +722,7 @@ fn eval_tree_distance(world_pos: vec3<f32>, count: u32) -> f32 {
     }
 
     if (sp == 0u) {
-        return 1e30;
+        return PROC_MISS_DISTANCE;
     }
     return stack[sp - 1u];
 }

@@ -11,6 +11,7 @@
 // marker dance that the old combined pass needed.
 
 import package::lib::math::PI;
+import package::lib::math::SKY_DEPTH_SENTINEL;
 import package::lib::math::interleaved_gradient_noise;
 import package::lib::types::VolumetricParams;
 
@@ -54,10 +55,10 @@ fn fog_march(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d1 = textureLoad(depth_buffer, full_base + vec2<i32>(1, 0), 0).w;
     let d2 = textureLoad(depth_buffer, full_base + vec2<i32>(0, 1), 0).w;
     let d3 = textureLoad(depth_buffer, full_base + vec2<i32>(1, 1), 0).w;
-    let is_sky0 = d0 >= 9999.0 || d0 <= 0.0;
-    let is_sky1 = d1 >= 9999.0 || d1 <= 0.0;
-    let is_sky2 = d2 >= 9999.0 || d2 <= 0.0;
-    let is_sky3 = d3 >= 9999.0 || d3 <= 0.0;
+    let is_sky0 = d0 >= SKY_DEPTH_SENTINEL || d0 <= 0.0;
+    let is_sky1 = d1 >= SKY_DEPTH_SENTINEL || d1 <= 0.0;
+    let is_sky2 = d2 >= SKY_DEPTH_SENTINEL || d2 <= 0.0;
+    let is_sky3 = d3 >= SKY_DEPTH_SENTINEL || d3 <= 0.0;
     var min_depth = params.far;
     if !is_sky0 { min_depth = min(min_depth, d0); }
     if !is_sky1 { min_depth = min(min_depth, d1); }

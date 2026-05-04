@@ -12,6 +12,7 @@
 // visible through solid geometry by design (you want to see your
 // cutter through the minuend when editing).
 //
+import package::lib::sdf::PROC_MISS_DISTANCE;
 import package::lib::sdf::sdf_sphere;
 import package::lib::sdf::sdf_box;
 import package::lib::sdf::sdf_capsule;
@@ -71,7 +72,7 @@ fn eval_primitive_dist(ins: ProcInstruction, world_pos: vec3<f32>) -> f32 {
         case 4u: { return sdf_torus(local, ins.params_lo.x, ins.params_lo.y); }
         case 5u: { return sdf_plane(local); }
         case 6u: { return sdf_ramp(local, ins.params_lo.x, ins.params_lo.y, ins.params_lo.z); }
-        default: { return 1e30; }
+        default: { return PROC_MISS_DISTANCE; }
     }
 }
 

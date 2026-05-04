@@ -11,6 +11,8 @@
 //   * cloud_trans — thick clouds covering the sun dim their march samples,
 //     so clouds soften the beam; gaps sharpen it into fingers.
 
+import package::lib::math::SKY_DEPTH_SENTINEL;
+
 struct GodRayParams {
     sun_screen_pos: vec2<f32>, // sun UV [0,1]
     sun_on_screen:  f32,       // 1.0 if in front of camera
@@ -84,7 +86,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let half_coord = vec2<i32>(clamped * cloud_dims_f);
 
         let depth = textureLoad(gbuf_position, full_coord, 0).w;
-        let is_sky = depth >= 9999.0 || depth <= 0.0;
+        let is_sky = depth >= SKY_DEPTH_SENTINEL || depth <= 0.0;
 
         if is_sky {
             // Perceptual luminance of the composite, thresholded so only

@@ -2,6 +2,17 @@
 // counterpart in `rkp_procedural::leaves`. Pure functions — no
 // bindings, no struct dependencies.
 
+// Floor for divisions by SDF-derived lengths (e.g. ramp hypotenuse).
+// Below FP precision at metre scale; clamping avoids div-by-zero on
+// degenerate primitives (zero-extent ramps, etc.).
+const SDF_EPS: f32 = 1e-6;
+
+// Sentinel distance returned by procedural SDF dispatchers when no
+// primitive matches (or evaluation falls through a default arm). Far
+// above any plausible scene-scale hit, finite under FP arithmetic so
+// callers can `min(stack[i], result)` without special-casing.
+const PROC_MISS_DISTANCE: f32 = 1e30;
+
 fn sdf_sphere(p: vec3<f32>, radius: f32) -> f32 {
     return length(p) - radius;
 }
@@ -46,7 +57,7 @@ fn sdf_ramp(p: vec3<f32>, half_length: f32, half_height: f32, half_width: f32) -
     let outside = length(max(q, vec3<f32>(0.0)));
     let inside = min(max(q.x, max(q.y, q.z)), 0.0);
     let box_dist = outside + inside;
-    let hyp = max(sqrt(half_length * half_length + half_height * half_height), 1e-6);
+    let hyp = max(sqrt(half_length * half_length + half_height * half_height), SDF_EPS);
     let plane_dist = (half_length * p.y - half_height * p.x) / hyp;
     return max(box_dist, plane_dist);
 }

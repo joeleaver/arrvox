@@ -41,6 +41,7 @@ import package::lib::octree::octree_lookup;
 import package::lib::octree::descend_proto_octree;
 import package::lib::octree::PHASE_SHADOW;
 import package::lib::octree::skip_node;
+import package::lib::octree::OCTREE_LOOKUP_BIAS_FACTOR;
 import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
 import package::lib::octree_slot::OCTREE_LEAF_BIT;
@@ -331,7 +332,7 @@ fn find_hit_in_instance(
 
     var t = max(t_range.x, 0.0);
     let t_limit = t_range.y;
-    let lookup_bias = vs * 1.0e-3;
+    let lookup_bias = vs * OCTREE_LOOKUP_BIAS_FACTOR;
 
     for (var step = 0u; step < SHADOW_MAP_MAX_STEPS; step++) {
         if t > t_limit { break; }

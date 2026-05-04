@@ -5,6 +5,7 @@
 // blended over the composite. Two grid scales (1 m primary, 0.1 m
 // secondary) with distance fade. X/Z origin axes painted distinctly.
 
+import package::lib::math::SKY_DEPTH_SENTINEL;
 import package::lib::types::CameraUniforms;
 
 struct GridParams {
@@ -91,7 +92,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // gbuffer surface distance. `pos.w` is the surface t; >= 9999 = miss.
     let pos = textureLoad(gbuf_position, coord, 0);
     let scene_t = pos.w;
-    if scene_t > 0.0 && scene_t < 9999.0 && t > scene_t {
+    if scene_t > 0.0 && scene_t < SKY_DEPTH_SENTINEL && t > scene_t {
         return vec4<f32>(0.0);
     }
 

@@ -18,6 +18,7 @@ import package::lib::atmosphere::cornette_shanks;
 import package::lib::atmosphere::lookup_transmittance;
 import package::lib::atmosphere::lookup_multiscatter;
 import package::lib::math::PI;
+import package::lib::math::SKY_DEPTH_SENTINEL;
 import package::lib::math::value_noise_3d;
 import package::lib::math::ray_sphere;
 import package::lib::pbr::dielectric_f0;
@@ -497,7 +498,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let hit_t = pos_data.w;
 
     // No geometry → sky.
-    if hit_t >= 9999.0 || hit_t <= 0.0 {
+    if hit_t >= SKY_DEPTH_SENTINEL || hit_t <= 0.0 {
         if shade_params.isolation != 0u {
             // Isolation: flat neutral background, no sun disc, no sky LUT.
             // The grid pass paints over this for floor pixels.
@@ -726,7 +727,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let d_pos = ref_pos.xyz - world_pos;
         let pos_term = exp(-dot(d_pos, d_pos) * inv_sigma2);
         let n_dot = clamp(dot(ref_normal, N), 0.0, 1.0);
-        let normal_term = n_dot * n_dot * n_dot * n_dot * n_dot * n_dot * n_dot * n_dot; // ^8
+        // BILATERAL_NORMAL_POW = 8 — sharper exponent than the cosine
+        // weight under-rejects neighbors at >~25° of normal difference;
+        // 8 keeps shadow detail from bleeding across surface facets.
+        // Open-coded as repeated multiplies to avoid pow()'s log/exp.
+        let nd2 = n_dot * n_dot;
+        let nd4 = nd2 * nd2;
+        let normal_term = nd4 * nd4;
         let w = spatial_w[k] * pos_term * normal_term;
         shadow_data += s * w;
         w_sum += w;
