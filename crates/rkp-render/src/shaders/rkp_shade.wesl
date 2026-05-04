@@ -18,25 +18,11 @@ import package::lib::atmosphere::cornette_shanks;
 import package::lib::math::ray_sphere;
 import package::lib::types::GpuMaterial;
 import package::lib::types::mat_albedo;
+import package::lib::types::CameraUniforms;
 
 const PI: f32 = 3.14159265;
 
 // --- Structs ---
-
-struct CameraUniforms {
-    position: vec4<f32>,
-    forward: vec4<f32>,
-    right: vec4<f32>,
-    up: vec4<f32>,
-    resolution: vec2<f32>,
-    jitter: vec2<f32>,
-    layer_mask: u32,
-    focus_object_id: u32,
-    _cam_pad0: u32,
-    _cam_pad1: u32,
-    prev_vp: mat4x4<f32>,
-    view_proj: mat4x4<f32>,
-}
 
 struct Light {
     position: vec4<f32>,   // xyz = position/direction, w = type (0=dir, 1=point, 2=spot)

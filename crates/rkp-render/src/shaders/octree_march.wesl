@@ -24,6 +24,7 @@ import package::lib::types::leaf_attr_material_primary;
 import package::lib::types::BandCell;
 import package::lib::types::RkpInstance;
 import package::lib::types::GpuMaterial;
+import package::lib::types::CameraUniforms;
 
 const OPACITY_THRESHOLD: f32 = 0.05;
 // Safety-net ceiling for the outer ray-march loop. The ray already
@@ -84,15 +85,6 @@ struct RkpAsset {
     grid_origin: vec3<f32>, rest_octree_root: u32,
     rest_octree_depth: u32, rest_octree_extent_bits: u32,
     shader_id: u32, _pad: u32,
-}
-
-struct CameraUniforms {
-    position: vec4<f32>, forward: vec4<f32>,
-    right: vec4<f32>, up: vec4<f32>,
-    resolution: vec2<f32>, jitter: vec2<f32>,
-    layer_mask: u32, focus_object_id: u32,
-    _cam_pad0: u32, _cam_pad1: u32,
-    prev_vp: mat4x4<f32>, view_proj: mat4x4<f32>,
 }
 
 // Render-layer + focus gate. An object is visible in this viewport iff its

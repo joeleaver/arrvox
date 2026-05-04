@@ -20,25 +20,11 @@
 import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::types::GpuMaterial;
 import package::lib::types::mat_albedo;
+import package::lib::types::CameraUniforms;
 
 const PI: f32 = 3.14159265358979323846;
 
 // Camera uniform — matches rkp_shade.wgsl's layout.
-struct CameraUniforms {
-    position: vec4<f32>,
-    forward: vec4<f32>,
-    right: vec4<f32>,
-    up: vec4<f32>,
-    resolution: vec2<f32>,
-    jitter: vec2<f32>,
-    layer_mask: u32,
-    focus_object_id: u32,
-    _cam_pad0: u32,
-    _cam_pad1: u32,
-    prev_vp: mat4x4<f32>,
-    view_proj: mat4x4<f32>,
-}
-
 // vec3 fields flattened to f32 channels — see rkp_shade.wgsl for why.
 
 // Mirrors rkp_shade.wgsl's Light layout (position.w encodes type).

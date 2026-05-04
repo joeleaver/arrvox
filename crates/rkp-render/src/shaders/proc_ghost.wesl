@@ -19,6 +19,7 @@ import package::lib::sdf::sdf_cylinder;
 import package::lib::sdf::sdf_torus;
 import package::lib::sdf::sdf_plane;
 import package::lib::sdf::sdf_ramp;
+import package::lib::types::CameraUniforms;
 
 // Fragment pass, full-screen triangle. Primitives arrive as a
 // `ProcInstruction` array in the same byte layout as the main
@@ -37,15 +38,6 @@ const OP_RAMP:      u32 = 6u;
 const MAX_STEPS:    u32 = 96u;
 const MAX_DIST:     f32 = 500.0;
 const SURFACE_EPS:  f32 = 0.002;
-
-struct CameraUniforms {
-    position: vec4<f32>, forward: vec4<f32>,
-    right: vec4<f32>, up: vec4<f32>,
-    resolution: vec2<f32>, jitter: vec2<f32>,
-    layer_mask: u32, focus_object_id: u32,
-    _cam_pad0: u32, _cam_pad1: u32,
-    prev_vp: mat4x4<f32>, view_proj: mat4x4<f32>,
-}
 
 /// Must match the byte layout of `rkp_procedural::flatten::ProcInstruction`.
 struct ProcInstruction {

@@ -5,19 +5,7 @@
 // blended over the composite. Two grid scales (1 m primary, 0.1 m
 // secondary) with distance fade. X/Z origin axes painted distinctly.
 
-struct CameraUniforms {
-    position: vec4<f32>,
-    forward: vec4<f32>,
-    right: vec4<f32>,
-    up: vec4<f32>,
-    resolution: vec2<f32>,
-    jitter: vec2<f32>,
-    layer_mask: u32,
-    focus_object_id: u32,
-    _pad: vec2<u32>,
-    prev_vp: mat4x4<f32>,
-    view_proj: mat4x4<f32>,
-}
+import package::lib::types::CameraUniforms;
 
 struct GridParams {
     /// Distance at which the grid fades fully out, in world units.
