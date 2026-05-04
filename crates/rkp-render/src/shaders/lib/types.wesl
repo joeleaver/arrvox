@@ -1,20 +1,29 @@
 // Shared GPU type definitions.
 //
-// As of Wave V, the build runs WESL with `ManglerKind::None`, so every
-// imported identifier appears in the emitted artifact under its original
-// name. Types splice-referenced by `shader_composer/compose.rs` (Aabb,
-// HostSample, UserCtx, VoxelEmit, RkpAsset, InstanceHit, ShadeCtx,
-// ShadeResult, Material) can therefore live in this module the same as
-// any other type — the splice chunks resolve them through the import
-// just like local declarations. The trade-off is that root-level
-// identifiers must be unique across each emitted artifact; build-time
-// naga validation catches collisions immediately.
+// As of Wave V the build runs WESL with `ManglerKind::None`, so every
+// imported identifier appears in the emitted artifact under its
+// original name. Types splice-referenced by `shader_composer`
+// (`Aabb`, `HostSample`, `UserCtx`, `VoxelEmit`, `RkpAsset`,
+// `InstanceHit`, `ShadeCtx`, `ShadeResult`, `Material`) can therefore
+// live in this module the same as any other type — splice chunks
+// resolve them through the import. The trade-off is that every
+// root-level identifier must be unique across each emitted artifact;
+// build-time naga validation catches collisions immediately.
+//
+// CPU mirrors: many of the structs below are wire-format with a Rust
+// `#[repr(C)]` mirror cast via `bytemuck`. Field order + size are
+// load-bearing for those; treat changes as a coordinated CPU/GPU
+// migration. Mirror locations are noted on each struct's docstring.
 
-// Result of an octree descent: the terminating slot, the depth at which
-// it terminated, and the spatial bounds of the terminating cell in
-// object-local oc-space. For BRICK results the cell bounds are the
-// brick's bounds; the brick DDA loop uses them to compute local cell
-// coords without re-descending.
+// ──────────────────────────────────────────────────────────────────
+// Octree-descent results & per-leaf attributes
+// ──────────────────────────────────────────────────────────────────
+
+// Result of an octree descent: the terminating slot, the depth at
+// which it terminated, and the spatial bounds of the terminating
+// cell in object-local oc-space. For BRICK results the cell bounds
+// are the brick's bounds; the brick DDA loop uses them to compute
+// local cell coords without re-descending.
 struct OctreeResult {
     slot: u32,
     depth: u32,
@@ -22,8 +31,8 @@ struct OctreeResult {
     cell_half: f32,
 }
 
-// Per-leaf attributes (8 bytes), one entry in the per-asset pool. The
-// march samples one of these on every leaf hit to drive shading.
+// Per-leaf attributes (8 bytes), one entry in the per-asset pool.
+// The march samples one of these on every leaf hit to drive shading.
 //
 // `normal_oct`         2× snorm16 octahedral surface normal.
 // `material_packed`    bits  0..16: material_primary (u16)
@@ -36,11 +45,11 @@ struct LeafAttr {
 
 fn leaf_attr_material_primary(a: LeafAttr) -> u32 { return a.material_packed & 0xFFFFu; }
 
-// Per-instance band-cell record (16 bytes), one entry per painted-band
-// cell on a host instance. Reinterprets the leaf-attr slot when the
-// band sentinel bit is set on the slot — `anchor_world_pos` is the
-// world-space anchor for the painted material, `material_id` selects
-// the host material override.
+// Per-instance band-cell record (16 bytes), one entry per painted-
+// band cell on a host instance. Reinterprets the leaf-attr slot
+// when the band sentinel bit is set on the slot —
+// `anchor_world_pos` is the world-space anchor for the painted
+// material, `material_id` selects the host material override.
 struct BandCell {
     anchor_world_pos: vec3<f32>,
     material_id: u32,
@@ -64,6 +73,21 @@ fn unpack_band_cell(s0: LeafAttr, s1: LeafAttr) -> BandCell {
     c.material_id = s1.material_packed;
     return c;
 }
+
+// One per-leaf paint-overlay record (16 bytes). Packed into the
+// per-instance overlay slice (`RkpInstance.overlay_offset` /
+// `overlay_count`); referenced by `lib::leaf_attr::fetch_*` and the
+// geom pass when re-emitting overlay-modified leaves.
+struct OverlayEntry {
+    leaf_slot: u32,
+    normal_oct: u32,
+    material_packed: u32,
+    color_packed: u32,
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Scene data — instances, assets, materials, lights
+// ──────────────────────────────────────────────────────────────────
 
 // One per scene instance. CPU-side mirror is `rkp_scene::GpuInstance`;
 // keep field order aligned with that struct (the layout is locked by
@@ -92,6 +116,19 @@ struct RkpInstance {
     overlay_count: u32,
 }
 
+// Per-asset metadata (one per imported model / generated mesh). CPU
+// mirror is `rkp_scene::GpuAsset`; the buffer is bound as
+// `assets: array<RkpAsset>` and indexed by `RkpInstance.asset_id`.
+struct RkpAsset {
+    aabb_min: vec3<f32>, octree_root: u32,
+    aabb_max: vec3<f32>, octree_depth: u32,
+    octree_extent_bits: u32, voxel_size: f32,
+    geom_type: u32, bone_count: u32,
+    grid_origin: vec3<f32>, rest_octree_root: u32,
+    rest_octree_depth: u32, rest_octree_extent_bits: u32,
+    shader_id: u32, _pad: u32,
+}
+
 // GPU material record (96 bytes). CPU-side mirror is
 // `rkp_scene::GpuMaterial`; field order locked by `bytemuck` cast.
 struct GpuMaterial {
@@ -116,6 +153,27 @@ fn mat_albedo(m: GpuMaterial) -> vec3<f32> {
     return vec3<f32>(m.albedo_r, m.albedo_g, m.albedo_b);
 }
 
+// Light record (64 bytes). CPU-side mirror is `rkp_shade::GpuLight`.
+//
+// `position.w`     light type — 0 = directional, 1 = point, 2 = spot.
+//                  For directional lights, `position.xyz` is the
+//                  light direction; for point/spot it's world position.
+// `color.rgb`      linear color; `color.w` is intensity (lumens for
+//                  point, lux for directional).
+// `direction.xyz`  spot direction; `direction.w` is spot outer half-angle.
+// `params`         x = range, y = inner_half_angle, z = shadow_softness,
+//                  w = cast_shadow flag (0 / 1).
+struct GpuLight {
+    position: vec4<f32>,
+    color: vec4<f32>,
+    direction: vec4<f32>,
+    params: vec4<f32>,
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Camera + bounding-volume primitives
+// ──────────────────────────────────────────────────────────────────
+
 // Per-frame camera uniforms (192 bytes). CPU-side mirror is
 // `rkp_scene::CameraUniforms`; field order locked by `bytemuck` cast.
 //
@@ -136,6 +194,16 @@ struct CameraUniforms {
     prev_vp: mat4x4<f32>,
     view_proj: mat4x4<f32>,
 }
+
+// World-space axis-aligned bounding box.
+struct Aabb {
+    min: vec3<f32>,
+    max: vec3<f32>,
+}
+
+// ──────────────────────────────────────────────────────────────────
+// TLAS (top-level acceleration structure)
+// ──────────────────────────────────────────────────────────────────
 
 // TLAS primitive (32 bytes) — one per scene instance, fed into Karras
 // LBVH construction. CPU-side mirror is `rkp_render::tlas`.
@@ -174,16 +242,9 @@ struct TlasInstanceLeaf {
     instance_index: u32,
 }
 
-// One per-leaf paint-overlay record (16 bytes). Packed into the
-// per-instance overlay slice (`RkpInstance.overlay_offset` /
-// `overlay_count`); referenced by `fetch_leaf_attr` and the geom
-// pass when re-emitting overlay-modified leaves.
-struct OverlayEntry {
-    leaf_slot: u32,
-    normal_oct: u32,
-    material_packed: u32,
-    color_packed: u32,
-}
+// ──────────────────────────────────────────────────────────────────
+// Shadow scatter (per-instance work-list metadata)
+// ──────────────────────────────────────────────────────────────────
 
 // Per-instance shadow-scatter descent metadata. Setup pass writes
 // these; emit pass reads them to fill the global work-list, scatter
@@ -202,28 +263,25 @@ struct ScatterInstance {
     work_offset: u32,
 }
 
-// User-shader Option B prototype-march hit record. Returned by the
-// per-pixel instance march and consumed by the composite pass.
-//
-// `local_t`         distance in oc-space along the safe ray direction
-//                   from `oc_origin` (the instance-local ray origin).
-// `oc_pos`          hit position in oc-space.
-// `local_normal`    octahedral-decoded normal from the prototype's
-//                   leaf_attr; transformed to world by the composite.
-// `leaf_slot`       prototype's leaf-attr slot, used for material
-//                   inheritance and overlay lookup.
-struct ProtoHit {
-    valid: bool,
-    local_t: f32,
-    oc_pos: vec3<f32>,
-    local_normal: vec3<f32>,
-    leaf_slot: u32,
+// Light-space camera + shadow-map metadata for shadow scatter.
+// CPU-side mirror in `rkp_render::shadow_map`; layout locked.
+struct LightCameraShadow {
+    view_proj: mat4x4<f32>,
+    view_proj_inv: mat4x4<f32>,
+    light_dir: vec3<f32>,
+    depth_bias: f32,
+    inv_shadow_map_size: vec2<f32>,
+    shadow_map_size: vec2<u32>,
 }
+
+// ──────────────────────────────────────────────────────────────────
+// Per-pass parameter uniforms
+// ──────────────────────────────────────────────────────────────────
 
 // Per-frame uniform shared by octree_march and rkp_shadow_trace —
 // the two passes bind the same buffer, so the layout has to match.
-// Some fields are read by only one of them (notes inline); naga
-// DCE drops the unused fields from the SPIR-V on each side.
+// Some fields are read by only one of them; naga DCE drops the
+// unused fields from each side's SPIR-V.
 struct MarchParams {
     object_count: u32,
     mode: u32,
@@ -239,48 +297,37 @@ struct MarchParams {
     _pad0: u32,
 }
 
-// Light-space camera + shadow-map metadata for shadow scatter.
-// CPU-side mirror in `rkp_render::shadow_map`; layout locked.
-struct LightCameraShadow {
-    view_proj: mat4x4<f32>,
-    view_proj_inv: mat4x4<f32>,
-    light_dir: vec3<f32>,
-    depth_bias: f32,
-    inv_shadow_map_size: vec2<f32>,
-    shadow_map_size: vec2<u32>,
+// Shading-pass parameters (144 bytes). CPU mirror is
+// `rkp_shade::ShadeParams`. Bound by both the shade pass (which uses
+// the brush, time, and shadow_map_enabled fields for paint preview,
+// user-shader timing, and shadow-map gating) and the glass pass
+// (which only reads the lighting prefix). naga DCE drops the unused
+// tail from glass's SPIR-V.
+struct ShadeParams {
+    num_lights: u32,
+    ambient_intensity: f32,
+    camera_altitude: f32,
+    sun_intensity: f32,
+    sky_color_top: vec3<f32>,
+    _pad0: f32,
+    sky_color_horizon: vec3<f32>,
+    _pad1: f32,
+    sun_dir: vec3<f32>,
+    _pad2: f32,
+    ambient_color: vec3<f32>,
+    isolation: u32,
+    brush_active: u32,
+    brush_radius: f32,
+    brush_falloff: f32,
+    time: f32,
+    brush_center: vec4<f32>,
+    brush_color: vec4<f32>,
+    shadow_map_enabled: u32,
+    _pad3: u32,
+    _pad4: u32,
+    _pad5: u32,
 }
 
-// Procedural-eval volumetric clouds parameters. Six tightly-packed
-// vec4s bundling the noise / wind / quality / flags state, sized
-// to fit a small uniform binding. cloud_march reads everything;
-// cloud_sun_atten only reads `altitude`/`noise`/`wind`/`flags`/
-// `coverage` but binds the same uniform.
-struct CloudParams {
-    altitude: vec4<f32>,   // x=cloud_min, y=cloud_max, z=threshold, w=density_scale
-    noise:    vec4<f32>,   // x=shape_freq, y=detail_freq, z=detail_weight, w=weather_scale
-    wind:     vec4<f32>,   // x=wind_dir.x, y=wind_dir.y, z=wind_speed, w=time
-    flags:    vec4<f32>,   // x=enable, y=coverage
-    quality:  vec4<f32>,   // x=slab_steps, y=shadow_steps, z=detail_octaves, w=ms_octaves
-    quality2: vec4<f32>,   // x=taa_alpha
-}
-
-// One procedural-eval bytecode instruction (96 bytes). CPU writer is
-// `rkp_procedural::compile_tree`; consumers are proc_eval (the
-// interpreter) and proc_ghost (the gizmo / picking helper).
-//
-// `distance_scale` is the local-to-world scale baked at compile
-// time so primitives can return scale-invariant local distances —
-// see compile_tree docs for the math.
-// Light record (64 bytes). CPU-side mirror is `rkp_shade::GpuLight`.
-//
-// `position.w`     light type — 0 = directional, 1 = point, 2 = spot.
-//                  For directional lights, `position.xyz` is the
-//                  light direction; for point/spot it's world position.
-// `color.rgb`      linear color; `color.w` is intensity (lumens for
-//                  point, lux for directional).
-// `direction.xyz`  spot direction; `direction.w` is spot outer half-angle.
-// `params`         x = range, y = inner_half_angle, z = shadow_softness,
-//                  w = cast_shadow flag (0 / 1).
 // Volumetric march parameters (224 bytes). CPU mirror is
 // `rkp_volumetric::VolumetricParams`. Bound by both the cloud march
 // (which reads `prev_view_proj` for reprojection) and the fog march
@@ -309,55 +356,30 @@ struct VolumetricParams {
     prev_view_proj: mat4x4<f32>,
 }
 
-// Shading-pass parameters (144 bytes). CPU mirror is
-// `rkp_shade::ShadeParams`. Bound by both the shade pass (which
-// uses the brush, time, and shadow_map_enabled fields for paint
-// preview, user-shader timing, and shadow-map gating) and the
-// glass pass (which only reads the lighting prefix). naga DCE
-// drops the unused tail from glass's SPIR-V.
-struct ShadeParams {
-    num_lights: u32,
-    ambient_intensity: f32,
-    camera_altitude: f32,
-    sun_intensity: f32,
-    sky_color_top: vec3<f32>,
-    _pad0: f32,
-    sky_color_horizon: vec3<f32>,
-    _pad1: f32,
-    sun_dir: vec3<f32>,
-    _pad2: f32,
-    ambient_color: vec3<f32>,
-    isolation: u32,
-    brush_active: u32,
-    brush_radius: f32,
-    brush_falloff: f32,
-    time: f32,
-    brush_center: vec4<f32>,
-    brush_color: vec4<f32>,
-    shadow_map_enabled: u32,
-    _pad3: u32,
-    _pad4: u32,
-    _pad5: u32,
+// Procedural-cloud parameters. Six tightly-packed vec4s bundling the
+// noise / wind / quality / flags state, sized to fit a small uniform
+// binding. cloud_march reads everything; cloud_sun_atten only reads
+// `altitude`/`noise`/`wind`/`flags`/`coverage` but binds the same
+// uniform.
+struct CloudParams {
+    altitude: vec4<f32>,   // x=cloud_min, y=cloud_max, z=threshold, w=density_scale
+    noise:    vec4<f32>,   // x=shape_freq, y=detail_freq, z=detail_weight, w=weather_scale
+    wind:     vec4<f32>,   // x=wind_dir.x, y=wind_dir.y, z=wind_speed, w=time
+    flags:    vec4<f32>,   // x=enable, y=coverage
+    quality:  vec4<f32>,   // x=slab_steps, y=shadow_steps, z=detail_octaves, w=ms_octaves
+    quality2: vec4<f32>,   // x=taa_alpha
 }
 
-struct GpuLight {
-    position: vec4<f32>,
-    color: vec4<f32>,
-    direction: vec4<f32>,
-    params: vec4<f32>,
-}
+// ──────────────────────────────────────────────────────────────────
+// User-shader API — types threaded through composer-spliced hooks
+// ──────────────────────────────────────────────────────────────────
 
-// World-space axis-aligned bounding box.
-struct Aabb {
-    min: vec3<f32>,
-    max: vec3<f32>,
-}
-
-// User-shader sampling context. Threaded through `dispatch_user_generate`
-// and `dispatch_user_shade` to give shader bodies access to per-cell
-// metadata (cell size, painted material, region origin, frame time,
-// per-shader scalar params). `params[0..8]` mirrors the 8 scalar slots
-// the editor surfaces per shader.
+// User-shader sampling context. Threaded through
+// `dispatch_user_generate` and `dispatch_user_shade` to give shader
+// bodies access to per-cell metadata (cell size, painted material,
+// region origin, frame time, per-shader scalar params).
+// `params[0..8]` mirrors the 8 scalar slots the editor surfaces per
+// shader.
 struct UserCtx {
     time: f32,
     cell_size: f32,
@@ -366,22 +388,10 @@ struct UserCtx {
     params: array<f32, 8>,
 }
 
-// Sample of the host (parent voxel grid) at a world position. Returned
-// by `host_sample_at` / `host_sample_in_region`; consumed by
-// user-shader `instance_at` and `generate` hooks for grass-on-host
-// effects (gate emission on host material/normal/distance).
-struct HostSample {
-    distance: f32,
-    normal: vec3<f32>,
-    material: u32,
-    material_secondary: u32,
-    blend_weight: u32,
-}
-
-// What a `dispatch_user_generate` hook writes per cell. Occupancy bit
-// + normal + dual-material blend; the geom pass packs this into the
-// brick + leaf-attr pools. Splice consumers populate one of these in
-// the spliced shader body and return it.
+// What a `dispatch_user_generate` hook writes per cell. Occupancy
+// bit + normal + dual-material blend; the geom pass packs this into
+// the brick + leaf-attr pools. Splice consumers populate one of
+// these in the spliced shader body and return it.
 struct VoxelEmit {
     occupancy: u32,
     normal: vec3<f32>,
@@ -390,17 +400,16 @@ struct VoxelEmit {
     blend_weight: u32,
 }
 
-// Per-asset metadata (one per imported model / generated mesh). CPU
-// mirror is `rkp_scene::GpuAsset`; the buffer is bound as
-// `assets: array<RkpAsset>` and indexed by `RkpInstance.asset_id`.
-struct RkpAsset {
-    aabb_min: vec3<f32>, octree_root: u32,
-    aabb_max: vec3<f32>, octree_depth: u32,
-    octree_extent_bits: u32, voxel_size: f32,
-    geom_type: u32, bone_count: u32,
-    grid_origin: vec3<f32>, rest_octree_root: u32,
-    rest_octree_depth: u32, rest_octree_extent_bits: u32,
-    shader_id: u32, _pad: u32,
+// Sample of the host (parent voxel grid) at a world position.
+// Returned by `host_sample_at` / `host_sample_in_region`; consumed
+// by user-shader `instance_at` and `generate` hooks for grass-on-
+// host effects (gate emission on host material/normal/distance).
+struct HostSample {
+    distance: f32,
+    normal: vec3<f32>,
+    material: u32,
+    material_secondary: u32,
+    blend_weight: u32,
 }
 
 // Per-pixel result of marching one user-shader instance prototype.
@@ -413,6 +422,35 @@ struct InstanceHit {
     world_normal: vec3<f32>,
 }
 
+// User-shader prototype-march hit record. Returned by the per-pixel
+// instance march and consumed by the composite pass.
+//
+// `local_t`         distance in oc-space along the safe ray direction
+//                   from `oc_origin` (the instance-local ray origin).
+// `oc_pos`          hit position in oc-space.
+// `local_normal`    octahedral-decoded normal from the prototype's
+//                   leaf_attr; transformed to world by the composite.
+// `leaf_slot`       prototype's leaf-attr slot, used for material
+//                   inheritance and overlay lookup.
+struct ProtoHit {
+    valid: bool,
+    local_t: f32,
+    oc_pos: vec3<f32>,
+    local_normal: vec3<f32>,
+    leaf_slot: u32,
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Procedural bytecode
+// ──────────────────────────────────────────────────────────────────
+
+// One procedural-eval bytecode instruction (96 bytes). CPU writer is
+// `rkp_procedural::compile_tree`; consumers are proc_eval (the
+// interpreter) and proc_ghost (the gizmo / picking helper).
+//
+// `distance_scale` is the local-to-world scale baked at compile
+// time so primitives can return scale-invariant local distances —
+// see compile_tree docs for the math.
 struct ProcInstruction {
     op: u32,
     arity: u32,
