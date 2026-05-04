@@ -4,30 +4,7 @@
 // if that shader changes, update this one too.
 
 import package::lib::types::CloudParams;
-
-struct VolumetricParams {
-    cam_pos:      vec4<f32>,
-    cam_forward:  vec4<f32>,
-    cam_right:    vec4<f32>,
-    cam_up:       vec4<f32>,
-    sun_dir:      vec4<f32>,   // xyz = toward sun
-    sun_color:    vec4<f32>,
-    width:        u32,
-    height:       u32,
-    full_width:   u32,
-    full_height:  u32,
-    max_steps:    u32,
-    step_size:    f32,
-    near:         f32,
-    far:          f32,
-    fog_color:    vec4<f32>,
-    fog_height:   vec4<f32>,
-    frame_index:  u32,
-    vol_ambient_r: f32,
-    vol_ambient_g: f32,
-    vol_ambient_b: f32,
-    prev_view_proj: mat4x4<f32>,
-}
+import package::lib::types::VolumetricParams;
 
 @group(0) @binding(0) var<uniform> params: VolumetricParams;
 @group(0) @binding(1) var<uniform> cloud_params: CloudParams;

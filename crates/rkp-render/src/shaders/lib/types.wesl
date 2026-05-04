@@ -269,6 +269,34 @@ struct CloudParams {
 // `direction.xyz`  spot direction; `direction.w` is spot outer half-angle.
 // `params`         x = range, y = inner_half_angle, z = shadow_softness,
 //                  w = cast_shadow flag (0 / 1).
+// Volumetric march parameters (224 bytes). CPU mirror is
+// `rkp_volumetric::VolumetricParams`. Bound by both the cloud march
+// (which reads `prev_view_proj` for reprojection) and the fog march
+// (which doesn't); naga DCE drops the unused tail from fog's SPIR-V.
+struct VolumetricParams {
+    cam_pos: vec4<f32>,
+    cam_forward: vec4<f32>,
+    cam_right: vec4<f32>,
+    cam_up: vec4<f32>,
+    sun_dir: vec4<f32>,
+    sun_color: vec4<f32>,
+    width: u32,
+    height: u32,
+    full_width: u32,
+    full_height: u32,
+    max_steps: u32,
+    step_size: f32,
+    near: f32,
+    far: f32,
+    fog_color: vec4<f32>,
+    fog_height: vec4<f32>,
+    frame_index: u32,
+    vol_ambient_r: f32,
+    vol_ambient_g: f32,
+    vol_ambient_b: f32,
+    prev_view_proj: mat4x4<f32>,
+}
+
 struct GpuLight {
     position: vec4<f32>,
     color: vec4<f32>,

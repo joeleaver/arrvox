@@ -11,38 +11,11 @@
 // marker dance that the old combined pass needed.
 
 import package::lib::math::interleaved_gradient_noise;
+import package::lib::types::VolumetricParams;
 
 const PI: f32 = 3.14159265;
 
-// Matches the CPU-side VolumetricParams layout. Kept in sync with the cloud
-// shader's declaration — any layout change in rkp_volumetric.rs must update
-// both. Prev-view-proj lives at the tail and is only read by the cloud
-// shader, so omitting it here is safe (WGSL reads only up to the declared
-// struct size).
-struct VolParams {
-    cam_pos:      vec4<f32>,
-    cam_forward:  vec4<f32>,
-    cam_right:    vec4<f32>,
-    cam_up:       vec4<f32>,
-    sun_dir:      vec4<f32>,   // xyz = toward sun
-    sun_color:    vec4<f32>,   // xyz = color * intensity
-    width:        u32,
-    height:       u32,
-    full_width:   u32,
-    full_height:  u32,
-    max_steps:    u32,
-    step_size:    f32,
-    near:         f32,
-    far:          f32,
-    fog_color:    vec4<f32>,   // xyz = scatter albedo
-    fog_height:   vec4<f32>,   // x = base_density, y = base_height, z = falloff
-    frame_index:  u32,
-    vol_ambient_r: f32,
-    vol_ambient_g: f32,
-    vol_ambient_b: f32,
-}
-
-@group(0) @binding(0) var<uniform> params: VolParams;
+@group(0) @binding(0) var<uniform> params: VolumetricParams;
 @group(0) @binding(1) var depth_buffer: texture_2d<f32>;
 @group(0) @binding(2) var fog_out: texture_storage_2d<rgba16float, write>;
 
