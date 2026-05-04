@@ -437,7 +437,12 @@ pub(super) fn run_user_shader_geom(
         if shader_id == 0 {
             continue;
         }
-        let topology_hash = topology_hash_for(req, frame.geometry_epoch, frame.paint_epoch);
+        let topology_hash = topology_hash_for(
+            req,
+            frame.geometry_epoch,
+            frame.paint_epoch,
+            frame.user_shader_source_hash,
+        );
         let fill_hash = fill_hash_for(
             req,
             topology_hash,
@@ -515,10 +520,27 @@ pub(super) fn run_user_shader_geom(
 
 /// Hash inputs that affect classify (BFS topology). Unchanged
 /// topology hash → skip classify dispatch for this region.
+///
+/// Inputs:
+/// - `geometry_epoch` — host octree, brick pool, leaf-attr pool
+///   regenerated → host probe reads different data → reclassify.
+/// - `paint_epoch` — overlay bytes changed → host probe sees different
+///   material → reclassify (the V1.1 paint-grass flow depends on this).
+/// - `shader_source_hash` — folded conservatively. The BFS classify
+///   pass doesn't run user-shader code itself, but a directive change
+///   (e.g. `@max_depth`, `@cell_size`) is supposed to flow into `req`
+///   via sim re-derivation; folding the source hash defends against a
+///   future metadata field that gets added to the source but forgotten
+///   in the request mapping.
+/// - `req.*` — every directly-referenced topology field on the
+///   request: host octree pointer/depth/extent/origin/inverse-world,
+///   region thickness, max depth, AABB, cell size, surface-y anchor,
+///   overlay slice.
 pub(super) fn topology_hash_for(
     req: &rkp_render::user_shader_pass::ShaderRegionRequest,
     geometry_epoch: u64,
     paint_epoch: u64,
+    shader_source_hash: u64,
 ) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     let prime = 0x100000001b3u64;
@@ -532,8 +554,15 @@ pub(super) fn topology_hash_for(
     // paint epoch in so any paint forces a re-bake; without this, a
     // paint that lands in an already-allocated overlay slot leaves
     // overlay_offset/count unchanged and the BFS uses last frame's
-    // bake.
+    // bake. paint_epoch only ticks on actual paint operations (not
+    // per frame), so animated shaders with no painting still classify-
+    // hit-cache.
     for &b in &paint_epoch.to_le_bytes() { mix(&mut h, b); }
+    // Defense in depth — a directive change in the user shader source
+    // forces reclassify even if the corresponding `req` field wasn't
+    // re-derived. Worst case: an over-invalidate every shader edit;
+    // best case: catches a future metadata field that bypasses `req`.
+    for &b in &shader_source_hash.to_le_bytes() { mix(&mut h, b); }
     for &b in &req.host_octree_root.to_le_bytes() { mix(&mut h, b); }
     for &b in &req.host_octree_depth.to_le_bytes() { mix(&mut h, b); }
     for &b in &req.host_octree_extent.to_le_bytes() { mix(&mut h, b); }
@@ -563,6 +592,14 @@ pub(super) fn topology_hash_for(
 
 /// Hash inputs that affect fill (per-cell shader output). Unchanged
 /// fill hash AND unchanged topology hash → skip fill dispatch.
+///
+/// Folds in `topology_hash` so any topology change implies a fill
+/// change (you must re-fill new cells). On top of that, folds:
+/// - `shader_source_hash` — user edited the generate hook.
+/// - `req.input_hash` / `req.material_id` / `req.params` — caller-
+///   supplied per-region fill inputs.
+/// - `time_seconds` — only when `req.animated`. Animated shaders are
+///   the only case where the fill hash legitimately ticks each frame.
 pub(super) fn fill_hash_for(
     req: &rkp_render::user_shader_pass::ShaderRegionRequest,
     topology_hash: u64,
@@ -632,8 +669,8 @@ mod tests {
     #[test]
     fn topology_hash_invalidates_on_paint_epoch() {
         let req = base_request();
-        let h1 = topology_hash_for(&req, 0, 0);
-        let h2 = topology_hash_for(&req, 0, 1);
+        let h1 = topology_hash_for(&req, 0, 0, 0);
+        let h2 = topology_hash_for(&req, 0, 1, 0);
         assert_ne!(
             h1, h2,
             "paint_epoch must affect the topology hash; otherwise paint into existing \
@@ -648,13 +685,13 @@ mod tests {
     #[test]
     fn topology_hash_invalidates_on_overlay_slice_move() {
         let mut req = base_request();
-        let baseline = topology_hash_for(&req, 0, 0);
+        let baseline = topology_hash_for(&req, 0, 0, 0);
         req.host_overlay_offset = 64;
-        let moved_offset = topology_hash_for(&req, 0, 0);
+        let moved_offset = topology_hash_for(&req, 0, 0, 0);
         assert_ne!(baseline, moved_offset, "overlay_offset must affect hash");
         req.host_overlay_offset = 0;
         req.host_overlay_count = 32;
-        let moved_count = topology_hash_for(&req, 0, 0);
+        let moved_count = topology_hash_for(&req, 0, 0, 0);
         assert_ne!(baseline, moved_count, "overlay_count must affect hash");
     }
 
@@ -664,8 +701,21 @@ mod tests {
     #[test]
     fn topology_hash_invalidates_on_geometry_epoch() {
         let req = base_request();
-        let h1 = topology_hash_for(&req, 0, 0);
-        let h2 = topology_hash_for(&req, 1, 0);
+        let h1 = topology_hash_for(&req, 0, 0, 0);
+        let h2 = topology_hash_for(&req, 1, 0, 0);
         assert_ne!(h1, h2, "geometry_epoch must affect the topology hash");
+    }
+
+    /// Defense-in-depth: a shader source change forces reclassify even
+    /// if every `req` field happens to match. This catches the case
+    /// where a future metadata directive is added to the source but
+    /// not yet mirrored on `ShaderRegionRequest` — the source hash
+    /// shifts, topology dirties, classify re-runs.
+    #[test]
+    fn topology_hash_invalidates_on_shader_source_hash() {
+        let req = base_request();
+        let h1 = topology_hash_for(&req, 0, 0, 0xDEAD);
+        let h2 = topology_hash_for(&req, 0, 0, 0xBEEF);
+        assert_ne!(h1, h2, "shader_source_hash must affect the topology hash");
     }
 }
