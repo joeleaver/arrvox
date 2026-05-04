@@ -19,7 +19,7 @@
 //! decoupled means adding or removing the preview in the pipeline is a
 //! simple toggle at the frame-driver level.
 
-use crate::validate_wgsl;
+use crate::compile_pass_shader;
 use bytemuck::{Pod, Zeroable};
 use rkp_procedural::flatten::ProcInstruction;
 
@@ -197,12 +197,7 @@ impl ProcRaymarchPass {
         // site. WGSL resolves functions across the whole module
         // regardless of declaration order, so `main` calling
         // `eval_tree` before its body appears in the emit works.
-        let shader_src = wesl::include_wesl!("proc_raymarch");
-        validate_wgsl(shader_src, "proc_raymarch");
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("proc_raymarch"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
+        let module = compile_pass_shader(device, wesl::include_wesl!("proc_raymarch"), "proc_raymarch");
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("proc_raymarch pipeline layout"),

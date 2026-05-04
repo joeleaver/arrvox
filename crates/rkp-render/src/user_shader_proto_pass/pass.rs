@@ -228,11 +228,7 @@ fn build_proto_pipeline(
     proto_chunk: &str,
 ) -> wgpu::ComputePipeline {
     let source = compose_proto_source(proto_chunk);
-    crate::validate_wgsl(&source, "user_shader_proto");
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("user_shader_proto"),
-        source: wgpu::ShaderSource::Wgsl(source.into()),
-    });
+    let module = crate::compile_pass_shader(device, &source, "user_shader_proto");
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("user_shader_proto bake"),
         layout: Some(pipeline_layout),

@@ -10,7 +10,7 @@
 //! branch for the ~90 % of pixels without glass; ~4 samples + Snell /
 //! Beer math for glass pixels. Sub-ms at 1920×1080 on desktop GPUs.
 
-use crate::validate_wgsl;
+use crate::compile_pass_shader;
 
 /// Glass composite compute pass.
 pub struct RkpGlassPass {
@@ -113,12 +113,7 @@ impl RkpGlassPass {
 
         let (output_texture, output_view) = Self::create_output(device, width, height);
 
-        let shader_src = wesl::include_wesl!("rkp_glass");
-        validate_wgsl(shader_src, "rkp_glass");
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rkp_glass"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
+        let module = compile_pass_shader(device, wesl::include_wesl!("rkp_glass"), "rkp_glass");
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("rkp_glass"),

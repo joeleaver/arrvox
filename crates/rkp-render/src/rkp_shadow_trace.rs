@@ -6,7 +6,7 @@
 //! position/normal-weighted bilateral gather; quality approaches full-res
 //! at ~25% of the shadow-trace cost.
 
-use crate::validate_wgsl;
+use crate::compile_pass_shader;
 
 pub struct ShadowTracePass {
     pipeline: wgpu::ComputePipeline,
@@ -86,12 +86,7 @@ impl ShadowTracePass {
                 ],
             });
 
-        let shader_src = wesl::include_wesl!("rkp_shadow_trace");
-        validate_wgsl(shader_src, "rkp_shadow_trace");
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rkp_shadow_trace"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
+        let module = compile_pass_shader(device, wesl::include_wesl!("rkp_shadow_trace"), "rkp_shadow_trace");
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("rkp_shadow_trace pipeline layout"),
@@ -155,11 +150,7 @@ impl ShadowTracePass {
         let source = crate::shader_composer::splice_inst_chunks(
             template, instance_at_chunk,
         );
-        validate_wgsl(&source, "rkp_shadow_trace");
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rkp_shadow_trace"),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
+        let module = compile_pass_shader(device, &source, "rkp_shadow_trace");
         self.pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("rkp_shadow_trace"),
             layout: Some(&self.pipeline_layout),

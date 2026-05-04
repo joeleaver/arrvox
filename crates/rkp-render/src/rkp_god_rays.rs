@@ -3,7 +3,7 @@
 //! Post-process compute pass. Reads (composite HDR, G-buffer depth, cloud
 //! transmittance) and writes the composite with additive light shafts.
 
-use crate::validate_wgsl;
+use crate::compile_pass_shader;
 
 /// GPU parameters for the god ray pass.
 #[repr(C)]
@@ -103,12 +103,7 @@ impl RkpGodRayPass {
 
         let (output_texture, output_view) = Self::create_output(device, width, height);
 
-        let shader_src = wesl::include_wesl!("rkp_god_rays");
-        validate_wgsl(shader_src, "rkp_god_rays");
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rkp_god_rays"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
+        let module = compile_pass_shader(device, wesl::include_wesl!("rkp_god_rays"), "rkp_god_rays");
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("god_rays"),

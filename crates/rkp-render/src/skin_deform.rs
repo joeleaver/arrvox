@@ -229,12 +229,7 @@ impl SkinDeformPass {
             mapped_at_creation: false,
         });
 
-        let shader_src = wesl::include_wesl!("skin_deform");
-        crate::validate_wgsl(shader_src, "skin_deform");
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("skin_deform"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
+        let shader = crate::compile_pass_shader(device, wesl::include_wesl!("skin_deform"), "skin_deform");
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("skin_deform pipeline"),

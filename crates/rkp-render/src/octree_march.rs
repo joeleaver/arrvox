@@ -4,7 +4,7 @@
 //! a camera ray, traverses the octree hierarchy for each object, and writes
 //! the closest hit to the G-buffer.
 
-use crate::validate_wgsl;
+use crate::compile_pass_shader;
 
 /// Stats buffer size in bytes (64 × u32). See the `stats` binding in
 /// `shaders/octree_march.wgsl` for the layout. Expanded from 52 when
@@ -265,12 +265,7 @@ impl OctreeMarchPass {
         });
 
         // Pipeline.
-        let shader_src = wesl::include_wesl!("octree_march");
-        validate_wgsl(shader_src, "octree_march");
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("octree_march"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
+        let module = compile_pass_shader(device, wesl::include_wesl!("octree_march"), "octree_march");
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("octree_march pipeline layout"),
@@ -374,11 +369,7 @@ impl OctreeMarchPass {
         let source = crate::shader_composer::splice_inst_chunks(
             template, instance_at_chunk,
         );
-        validate_wgsl(&source, "octree_march");
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("octree_march"),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
+        let module = compile_pass_shader(device, &source, "octree_march");
         self.pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("octree_march"),
             layout: Some(&self.pipeline_layout),

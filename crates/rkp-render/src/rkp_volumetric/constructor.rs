@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU32}};
 
-use crate::validate_wgsl;
+use crate::compile_pass_shader;
 
 use super::{CloudParams, RkpVolumetricPass, VolumetricParams};
 
@@ -196,12 +196,7 @@ impl RkpVolumetricPass {
             Self::create_texture(device, "vol output", width, height, wgpu::TextureFormat::Rgba16Float);
 
         // Fog march pipeline.
-        let fog_src = wesl::include_wesl!("rkp_fog_march");
-        validate_wgsl(fog_src, "rkp_fog_march");
-        let fog_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rkp_fog_march"),
-            source: wgpu::ShaderSource::Wgsl(fog_src.into()),
-        });
+        let fog_module = compile_pass_shader(device, wesl::include_wesl!("rkp_fog_march"), "rkp_fog_march");
         let fog_march_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("vol fog march"),
             layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -216,12 +211,7 @@ impl RkpVolumetricPass {
         });
 
         // Cloud march pipeline.
-        let cloud_src = wesl::include_wesl!("rkp_cloud_march");
-        validate_wgsl(cloud_src, "rkp_cloud_march");
-        let cloud_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rkp_cloud_march"),
-            source: wgpu::ShaderSource::Wgsl(cloud_src.into()),
-        });
+        let cloud_module = compile_pass_shader(device, wesl::include_wesl!("rkp_cloud_march"), "rkp_cloud_march");
         let cloud_march_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("vol cloud march"),
             layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -236,12 +226,7 @@ impl RkpVolumetricPass {
         });
 
         // Composite pipeline.
-        let composite_src = wesl::include_wesl!("rkp_vol_composite");
-        validate_wgsl(composite_src, "rkp_vol_composite");
-        let composite_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rkp_vol_composite"),
-            source: wgpu::ShaderSource::Wgsl(composite_src.into()),
-        });
+        let composite_module = compile_pass_shader(device, wesl::include_wesl!("rkp_vol_composite"), "rkp_vol_composite");
         let composite_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("vol composite pipeline"),
             bind_group_layouts: &[Some(&composite_bind_group_layout)],
@@ -293,12 +278,9 @@ impl RkpVolumetricPass {
                 },
             ],
         });
-        let history_update_src = wesl::include_wesl!("rkp_vol_history_update");
-        validate_wgsl(history_update_src, "rkp_vol_history_update");
-        let history_update_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rkp_vol_history_update"),
-            source: wgpu::ShaderSource::Wgsl(history_update_src.into()),
-        });
+        let history_update_module = compile_pass_shader(
+            device, wesl::include_wesl!("rkp_vol_history_update"), "rkp_vol_history_update",
+        );
         let history_update_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("vol history update pipeline layout"),
             bind_group_layouts: &[Some(&history_update_bind_group_layout)],
@@ -370,12 +352,9 @@ impl RkpVolumetricPass {
                 wgpu::BindGroupEntry { binding: 2, resource: sun_atten_storage.as_entire_binding() },
             ],
         });
-        let sun_atten_src = wesl::include_wesl!("rkp_cloud_sun_atten");
-        validate_wgsl(sun_atten_src, "rkp_cloud_sun_atten");
-        let sun_atten_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rkp_cloud_sun_atten"),
-            source: wgpu::ShaderSource::Wgsl(sun_atten_src.into()),
-        });
+        let sun_atten_module = compile_pass_shader(
+            device, wesl::include_wesl!("rkp_cloud_sun_atten"), "rkp_cloud_sun_atten",
+        );
         let sun_atten_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("vol sun atten pipeline layout"),
             bind_group_layouts: &[Some(&sun_atten_layout)],

@@ -811,11 +811,7 @@ fn build_shade_pipeline(
     user_chunk: &str,
 ) -> wgpu::ComputePipeline {
     let source = compose_shade_source(user_chunk);
-    crate::validate_wgsl(&source, "rkp_shade");
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("rkp_shade"),
-        source: wgpu::ShaderSource::Wgsl(source.into()),
-    });
+    let module = crate::compile_pass_shader(device, &source, "rkp_shade");
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("rkp_shade"),
         layout: Some(pipeline_layout),

@@ -14,7 +14,7 @@
 //! the same slot (it carries secondary_material_id there), so reading
 //! it in voxel mode would outline noise.
 
-use crate::validate_wgsl;
+use crate::compile_pass_shader;
 use bytemuck::{Pod, Zeroable};
 
 /// Uniform matching `OutlineParams` in the shader.
@@ -88,12 +88,7 @@ impl ProcOutlinePass {
             mapped_at_creation: false,
         });
 
-        let shader_src = wesl::include_wesl!("proc_outline");
-        validate_wgsl(shader_src, "proc_outline");
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("proc_outline"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
+        let module = compile_pass_shader(device, wesl::include_wesl!("proc_outline"), "proc_outline");
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("proc_outline pipeline layout"),

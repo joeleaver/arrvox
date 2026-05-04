@@ -31,7 +31,7 @@
 //! their brick / leaf-attr counters reset.
 
 use crate::shader_composer::UserShaderInfo;
-use crate::validate_wgsl;
+use crate::compile_pass_shader;
 
 use super::cache::{FILL_TASK_BUCKET_MAX, MAX_GLOBAL_FILL_TASKS};
 use super::overflow::{
@@ -668,11 +668,7 @@ fn build_pipelines(
     user_chunk: &str,
 ) -> (wgpu::ComputePipeline, wgpu::ComputePipeline) {
     let source = compose_geom_source(user_chunk);
-    validate_wgsl(&source, "user_shader_geom");
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("user_shader_geom"),
-        source: wgpu::ShaderSource::Wgsl(source.into()),
-    });
+    let module = compile_pass_shader(device, &source, "user_shader_geom");
     let classify = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("user_shader_geom classify"),
         layout: Some(pipeline_layout),

@@ -154,10 +154,7 @@ impl RkpSsaoPass {
             Self::create_output_bind_group(device, &output_bind_group_layout, &output_view);
 
         // Pipeline.
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rkp_ssao"),
-            source: wgpu::ShaderSource::Wgsl(wesl::include_wesl!("rkp_ssao").into()),
-        });
+        let shader = crate::compile_pass_shader(device, wesl::include_wesl!("rkp_ssao"), "rkp_ssao");
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("rkp_ssao pipeline"),

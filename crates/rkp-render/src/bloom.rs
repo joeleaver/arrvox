@@ -101,10 +101,7 @@ impl BloomPass {
         height: u32,
     ) -> Self {
         // --- Shader module (all 3 entry points) ---
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("bloom.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(wesl::include_wesl!("bloom").into()),
-        });
+        let shader = crate::compile_pass_shader(device, wesl::include_wesl!("bloom"), "bloom");
 
         // --- Mip dimensions ---
         let mut mip_widths = [0u32; BLOOM_MIP_LEVELS as usize];

@@ -88,10 +88,7 @@ impl ToneMapPass {
         height: u32,
         exposure_buffer: Option<&wgpu::Buffer>,
     ) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("tone_map.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(wesl::include_wesl!("tone_map").into()),
-        });
+        let shader = crate::compile_pass_shader(device, wesl::include_wesl!("tone_map"), "tone_map");
 
         // LDR output texture
         let ldr_texture = device.create_texture(&wgpu::TextureDescriptor {

@@ -13,7 +13,7 @@
 //! the shader early-outs on `instruction_count == 0`, so this is
 //! effectively free when no CSG op is selected.
 
-use crate::validate_wgsl;
+use crate::compile_pass_shader;
 use bytemuck::{Pod, Zeroable};
 use rkp_procedural::flatten::ProcInstruction;
 
@@ -115,12 +115,7 @@ impl ProcGhostPass {
             mapped_at_creation: false,
         });
 
-        let shader_src = wesl::include_wesl!("proc_ghost");
-        validate_wgsl(shader_src, "proc_ghost");
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("proc_ghost"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
+        let module = compile_pass_shader(device, wesl::include_wesl!("proc_ghost"), "proc_ghost");
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("proc_ghost pipeline layout"),

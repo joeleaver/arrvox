@@ -31,12 +31,9 @@ impl TlasBuildPass {
             bind_group_layouts: &[Some(&host_g0_layout), Some(&host_g1_layout)],
             immediate_size: 0,
         });
-        let host_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("tlas_assemble_host"),
-            source: wgpu::ShaderSource::Wgsl(
-                wesl::include_wesl!("tlas_assemble_host").into(),
-            ),
-        });
+        let host_module = crate::compile_pass_shader(
+            device, wesl::include_wesl!("tlas_assemble_host"), "tlas_assemble_host",
+        );
         let host_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("tlas_assemble_host"),
             layout: Some(&host_layout),
@@ -91,10 +88,9 @@ impl TlasBuildPass {
             bind_group_layouts: &[Some(&morton_g0_layout), Some(&morton_g1_layout)],
             immediate_size: 0,
         });
-        let morton_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("tlas_morton"),
-            source: wgpu::ShaderSource::Wgsl(wesl::include_wesl!("tlas_morton").into()),
-        });
+        let morton_module = crate::compile_pass_shader(
+            device, wesl::include_wesl!("tlas_morton"), "tlas_morton",
+        );
         let morton_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("tlas_morton"),
             layout: Some(&morton_layout),
@@ -139,10 +135,9 @@ impl TlasBuildPass {
             bind_group_layouts: &[Some(&radix_g0_layout), Some(&radix_g1_layout)],
             immediate_size: 0,
         });
-        let radix_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("tlas_radix_sort"),
-            source: wgpu::ShaderSource::Wgsl(wesl::include_wesl!("tlas_radix_sort").into()),
-        });
+        let radix_module = crate::compile_pass_shader(
+            device, wesl::include_wesl!("tlas_radix_sort"), "tlas_radix_sort",
+        );
         let radix_count_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("tlas_radix_count"),
             layout: Some(&radix_pipeline_layout),
@@ -231,10 +226,9 @@ impl TlasBuildPass {
             bind_group_layouts: &[Some(&karras_g0_layout), Some(&karras_g1_layout)],
             immediate_size: 0,
         });
-        let karras_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("tlas_karras"),
-            source: wgpu::ShaderSource::Wgsl(wesl::include_wesl!("tlas_karras").into()),
-        });
+        let karras_module = crate::compile_pass_shader(
+            device, wesl::include_wesl!("tlas_karras"), "tlas_karras",
+        );
         let karras_leaves_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("tlas_karras_leaves"),
             layout: Some(&karras_pipeline_layout),

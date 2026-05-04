@@ -7,7 +7,7 @@
 //! Both are recomputed only when atmosphere parameters change (which is rare).
 //! The shade pass samples these LUTs instead of per-pixel ray marching.
 
-use crate::validate_wgsl;
+use crate::compile_pass_shader;
 
 const TRANSMITTANCE_W: u32 = 256;
 const TRANSMITTANCE_H: u32 = 64;
@@ -110,12 +110,11 @@ impl RkpAtmospherePass {
                 ],
             });
 
-        let trans_src = wesl::include_wesl!("rkp_transmittance_lut");
-        validate_wgsl(trans_src, "rkp_transmittance_lut");
-        let trans_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rkp_transmittance_lut"),
-            source: wgpu::ShaderSource::Wgsl(trans_src.into()),
-        });
+        let trans_module = compile_pass_shader(
+            device,
+            wesl::include_wesl!("rkp_transmittance_lut"),
+            "rkp_transmittance_lut",
+        );
         let transmittance_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("transmittance_lut"),
             layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -175,12 +174,11 @@ impl RkpAtmospherePass {
                 ],
             });
 
-        let ms_src = wesl::include_wesl!("rkp_multiscatter_lut");
-        validate_wgsl(ms_src, "rkp_multiscatter_lut");
-        let ms_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rkp_multiscatter_lut"),
-            source: wgpu::ShaderSource::Wgsl(ms_src.into()),
-        });
+        let ms_module = compile_pass_shader(
+            device,
+            wesl::include_wesl!("rkp_multiscatter_lut"),
+            "rkp_multiscatter_lut",
+        );
         let multiscatter_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("multiscatter_lut"),
             layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -241,11 +239,11 @@ impl RkpAtmospherePass {
         // --- Sky View LUT ---
         let (sky_view_texture, sky_view_view) = Self::create_lut(device, "sky_view_lut", SKY_VIEW_W, SKY_VIEW_H);
 
-        let sv_src = wesl::include_wesl!("rkp_sky_view_lut");
-        validate_wgsl(sv_src, "rkp_sky_view_lut");
-        let sv_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rkp_sky_view_lut"), source: wgpu::ShaderSource::Wgsl(sv_src.into()),
-        });
+        let sv_module = compile_pass_shader(
+            device,
+            wesl::include_wesl!("rkp_sky_view_lut"),
+            "rkp_sky_view_lut",
+        );
         let sky_view_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("sky_view_lut"), layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("sky_view layout"), bind_group_layouts: &[Some(&per_frame_layout)], immediate_size: 0,
@@ -292,11 +290,11 @@ impl RkpAtmospherePass {
             ],
         });
 
-        let ap_src = wesl::include_wesl!("rkp_aerial_perspective_lut");
-        validate_wgsl(ap_src, "rkp_aerial_perspective_lut");
-        let ap_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rkp_aerial_perspective_lut"), source: wgpu::ShaderSource::Wgsl(ap_src.into()),
-        });
+        let ap_module = compile_pass_shader(
+            device,
+            wesl::include_wesl!("rkp_aerial_perspective_lut"),
+            "rkp_aerial_perspective_lut",
+        );
         let ap_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("aerial_perspective_lut"), layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("aerial_perspective layout"), bind_group_layouts: &[Some(&ap_bind_group_layout)], immediate_size: 0,

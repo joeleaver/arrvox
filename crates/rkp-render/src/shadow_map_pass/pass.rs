@@ -3,7 +3,7 @@
 //! scatter). Plus the small bind-group layout helpers and the
 //! `ShadowScatterMarchParams` private uniform.
 
-use crate::validate_wgsl;
+use crate::compile_pass_shader;
 
 use super::types::{
     LightCameraUniform, SetupParams, SCATTER_INSTANCE_STRIDE, SHADOW_MAP_MAX_CASTERS_INITIAL,
@@ -202,12 +202,9 @@ impl ShadowMapPass {
             "finalize_main",
             &[Some(&finalize_g0_layout)],
         );
-        let scatter_src = wesl::include_wesl!("shadow_scatter");
-        validate_wgsl(scatter_src, "shadow_scatter");
-        let scatter_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("shadow_scatter"),
-            source: wgpu::ShaderSource::Wgsl(scatter_src.into()),
-        });
+        let scatter_module = compile_pass_shader(
+            device, wesl::include_wesl!("shadow_scatter"), "shadow_scatter",
+        );
         let scatter_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shadow_scatter pipeline layout"),
             bind_group_layouts: &[
@@ -361,11 +358,7 @@ impl ShadowMapPass {
         let source = crate::shader_composer::splice_inst_chunks(
             template, instance_at_chunk,
         );
-        validate_wgsl(&source, "shadow_scatter");
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("shadow_scatter"),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
+        let module = compile_pass_shader(device, &source, "shadow_scatter");
         self.scatter_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("shadow_scatter"),
             layout: Some(&self.scatter_pipeline_layout),
@@ -603,11 +596,7 @@ fn build_pipeline(
     entry_point: &str,
     bind_group_layouts: &[Option<&wgpu::BindGroupLayout>],
 ) -> wgpu::ComputePipeline {
-    validate_wgsl(src, label);
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(src.into()),
-    });
+    let module = compile_pass_shader(device, src, label);
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(&format!("{label} pipeline layout")),
         bind_group_layouts,

@@ -5,7 +5,7 @@
 //! buffer as a depth-occlusion source. Used by the build viewport in
 //! `RenderMode::Isolation` to give a clean studio backdrop.
 
-use crate::validate_wgsl;
+use crate::compile_pass_shader;
 
 /// Uniform parameters for the grid pass.
 #[repr(C)]
@@ -96,12 +96,7 @@ impl RkpGridPass {
             mapped_at_creation: false,
         });
 
-        let shader_src = wesl::include_wesl!("rkp_grid");
-        validate_wgsl(shader_src, "rkp_grid");
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rkp_grid"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
+        let module = compile_pass_shader(device, wesl::include_wesl!("rkp_grid"), "rkp_grid");
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("rkp_grid pipeline layout"),

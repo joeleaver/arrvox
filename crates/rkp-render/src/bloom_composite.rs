@@ -67,12 +67,9 @@ impl BloomCompositePass {
         display_height: u32,
     ) -> Self {
         // --- Shader ---
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("bloom_composite.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(
-                wesl::include_wesl!("bloom_composite").into(),
-            ),
-        });
+        let shader = crate::compile_pass_shader(
+            device, wesl::include_wesl!("bloom_composite"), "bloom_composite",
+        );
 
         // --- Bilinear sampler for bloom texture upsampling ---
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {

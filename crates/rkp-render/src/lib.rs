@@ -175,3 +175,23 @@ pub fn validate_wgsl(source: &str, label: &str) -> naga::Module {
         .unwrap_or_else(|e| panic!("[{label}] WGSL validation error: {e}"));
     module
 }
+
+/// Validate `source` and create a labelled wgpu shader module from
+/// it in one step. The recommended path for every pipeline-creation
+/// site — using it makes the "validate before create" contract
+/// impossible to forget.
+///
+/// `wesl::include_wesl!(...)` is a compile-time macro so each caller
+/// still expands the include in its own scope; this helper just
+/// folds the validate + module-create boilerplate.
+pub fn compile_pass_shader(
+    device: &wgpu::Device,
+    source: &str,
+    label: &str,
+) -> wgpu::ShaderModule {
+    let _ = validate_wgsl(source, label);
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    })
+}

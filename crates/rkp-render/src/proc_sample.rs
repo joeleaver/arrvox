@@ -18,7 +18,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 use rkp_procedural::flatten::ProcInstruction;
 
-use crate::validate_wgsl;
+use crate::compile_pass_shader;
 
 /// Per-dispatch parameters (uniform).
 #[repr(C)]
@@ -120,13 +120,7 @@ pub struct GpuEvaluator {
 
 impl GpuEvaluator {
     pub fn new(device: &wgpu::Device) -> Self {
-        let shader_src = wesl::include_wesl!("proc_sample");
-        validate_wgsl(shader_src, "proc_sample");
-
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("proc_sample"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
+        let module = compile_pass_shader(device, wesl::include_wesl!("proc_sample"), "proc_sample");
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("proc_sample bind group layout"),
