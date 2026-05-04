@@ -872,6 +872,47 @@ fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
 }
 
 #[test]
+fn rejects_helper_fn_colliding_with_lib_symbol() {
+    // `mat_albedo` lives in lib/types.wesl. A user helper of the same
+    // name would produce a duplicate root-level fn under
+    // ManglerKind::None.
+    let src = r#"
+fn mat_albedo(m: u32) -> u32 { return m; }
+fn user_test_shade(ctx: ShadeCtx) -> ShadeResult { var r: ShadeResult; return r; }
+"#;
+    let tmp = tempfile_dir("collide_helper");
+    write(&tmp, "test.wgsl", src);
+    let err = scan_dir(&tmp).unwrap_err();
+    match err {
+        ShaderComposerError::Parse { msg, .. } => {
+            assert!(msg.contains("mat_albedo"), "got: {msg}");
+            assert!(msg.contains("collides with a lib symbol"), "got: {msg}");
+        }
+        other => panic!("expected Parse, got {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_struct_colliding_with_lib_symbol() {
+    // `Aabb` is declared in lib/types.wesl; user-shader struct of
+    // the same name would clash.
+    let src = r#"
+struct Aabb { lo: vec3<f32>, hi: vec3<f32> }
+fn user_test_shade(ctx: ShadeCtx) -> ShadeResult { var r: ShadeResult; return r; }
+"#;
+    let tmp = tempfile_dir("collide_struct");
+    write(&tmp, "test.wgsl", src);
+    let err = scan_dir(&tmp).unwrap_err();
+    match err {
+        ShaderComposerError::Parse { msg, .. } => {
+            assert!(msg.contains("Aabb"), "got: {msg}");
+            assert!(msg.contains("collides with a lib symbol"), "got: {msg}");
+        }
+        other => panic!("expected Parse, got {other:?}"),
+    }
+}
+
+#[test]
 fn splice_marker_skips_in_comment_occurrence() {
     let template = "\
 // @author wrote about USER_TEST_DISPATCH_BEGIN: u32 = 0u; somewhere

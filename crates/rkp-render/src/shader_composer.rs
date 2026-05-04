@@ -55,6 +55,7 @@
 
 pub mod compose;
 pub mod hash;
+pub mod lib_symbols;
 pub mod parser;
 pub mod types;
 

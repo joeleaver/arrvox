@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use crate::instance_proto::parse_instance_layout;
 
 use super::hash::compute_registry_hash;
+use super::lib_symbols::is_lib_symbol;
 use super::types::{
     ParamDef, ShaderComposerError, ShaderMetadata, UserShaderEntry, UserShaderRegistry,
 };
@@ -200,7 +201,20 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
                 *slot = Some(fn_text);
             } else {
                 // Non-hook function — user-defined helper. Captured
-                // verbatim so the hook body can call it.
+                // verbatim so the hook body can call it. Reject if
+                // it would collide with a lib symbol (post-splice
+                // duplicate-decl in naga).
+                if is_lib_symbol(fn_name) {
+                    return Err(ShaderComposerError::Parse {
+                        path: path.to_path_buf(),
+                        line: line_of(source, name_start),
+                        msg: format!(
+                            "helper fn `{fn_name}` collides with a lib symbol — \
+                             rename it (every root-level identifier in the emitted \
+                             artifact must be unique under ManglerKind::None)"
+                        ),
+                    });
+                }
                 entry.helpers.push(fn_text);
             }
 
@@ -233,6 +247,17 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
                     msg: format!("unmatched `{{` in body of struct `{struct_name}`"),
                 }
             })?;
+            if is_lib_symbol(struct_name) {
+                return Err(ShaderComposerError::Parse {
+                    path: path.to_path_buf(),
+                    line: line_of(source, name_start),
+                    msg: format!(
+                        "struct `{struct_name}` collides with a lib symbol — \
+                         rename it (every root-level identifier in the emitted \
+                         artifact must be unique under ManglerKind::None)"
+                    ),
+                });
+            }
             let struct_text = source[item_start..=body_close].to_string();
             entry.struct_decls.push(struct_text);
             cursor = body_close + 1;
