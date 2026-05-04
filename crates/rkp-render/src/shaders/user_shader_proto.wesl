@@ -44,11 +44,11 @@ import package::lib::octree_slot::OCTREE_BAND_BIT;
 import package::lib::octree_slot::OCTREE_PAYLOAD_MASK;
 import package::lib::types::LeafAttr;
 import package::lib::types::VoxelEmit;
+import package::lib::brick::BRICK_DIM;
+import package::lib::brick::BRICK_CELLS;
+import package::lib::brick::BRICK_CELL_EMPTY;
+import package::lib::brick::INTERNAL_ATTR_NONE;
 
-const BRICK_DIM: u32 = 4u;
-const BRICK_CELLS: u32 = 64u;
-const BRICK_CELL_EMPTY: u32 = 0xFFFFFFFFu;
-const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;
 
 // Overflow counter slots — must match the `OVERFLOW_*` indices the
 // Rust pass writes into the same buffer.

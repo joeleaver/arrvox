@@ -8,6 +8,21 @@ import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::oct_normal::pack_oct_normal;
 import package::lib::math::mat4_affine_inverse;
 import package::lib::math::intersect_aabb;
+import package::lib::brick::BRICK_DIM;
+import package::lib::brick::BRICK_DIM_F;
+import package::lib::brick::BRICK_CELLS;
+import package::lib::brick::BRICK_CELL_EMPTY;
+import package::lib::brick::BRICK_CELL_INTERIOR;
+import package::lib::brick::BRICK_MAX_STEPS;
+import package::lib::brick::INTERNAL_ATTR_NONE;
+import package::lib::brick::FACE_INTERIOR;
+import package::lib::brick::FACE_EMPTY_LINK;
+import package::lib::brick::FACE_NX;
+import package::lib::brick::FACE_PX;
+import package::lib::brick::FACE_NY;
+import package::lib::brick::FACE_PY;
+import package::lib::brick::FACE_NZ;
+import package::lib::brick::FACE_PZ;
 import package::lib::octree::skip_node;
 import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
@@ -52,17 +67,12 @@ const OPACITY_THRESHOLD: f32 = 0.05;
 // would be exact. Requires adding a field to `RkpGpuObject`.
 const MAX_STEPS: u32 = 4096u;
 // Brick layout — must match rkp_core::brick_pool constants.
-const BRICK_DIM: u32 = 4u;
-const BRICK_DIM_F: f32 = 4.0;
-const BRICK_CELLS: u32 = 64u; // 4³
-const BRICK_CELL_EMPTY: u32 = 0xFFFFFFFFu;
 // Interior-of-solid sentinel (see rkp_core::brick_pool::BRICK_INTERIOR).
 // Stored by the mesh import for cells that are inside the solid but
 // aren't the visible shell. The march skips past these identically to
 // BRICK_CELL_EMPTY (rays hit the shell first, never see the interior);
 // neighborhood kernels count them as occupied mass so centroid-based
 // normal reconstruction has something to bias against.
-const BRICK_CELL_INTERIOR: u32 = 0xFFFFFFFDu;
 // A 4³ brick has at most ~12 cells along the longest diagonal traversal,
 // so capping inner-DDA at 16 keeps a misbehaving loop from melting the
 // frame. Real traversals never come close to this cap.
@@ -73,7 +83,6 @@ const BRICK_CELL_INTERIOR: u32 = 0xFFFFFFFDu;
 // across brick boundaries via `brick_face_links`. Sized the same as
 // `MAX_STEPS` since the inner chain can cover the full octree diagonal
 // in pathological cases.
-const BRICK_MAX_STEPS: u32 = 4096u;
 
 // Per-instance record (144 bytes). One per scene entity. See
 // `crates/rkp-render/src/rkp_gpu_object.rs` for the Rust mirror.
@@ -115,7 +124,6 @@ fn rkp_object_visible(inst: RkpInstance) -> bool {
 // per-cell because the user-shader REGION instance's
 // `inst.material_id` is hardcoded to 0 (`transient_asset_and_instance`)
 // and there's no per-region metadata table bound at the march.
-const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;
 // Footprint threshold below which we treat a branch as small enough to
 // represent with its prefilter attr. Strict `<` (not `<=`) so the
 // fallback path still runs for exactly-1px nodes. See the LOD plan for
@@ -305,14 +313,6 @@ fn dispatch_user_instance_descend(
 }
 const USER_INSTANCE_AT_DISPATCH_END: u32 = 0u;
 
-const FACE_INTERIOR: u32 = 0xFFFFFFFEu;
-const FACE_EMPTY_LINK: u32 = 0xFFFFFFFFu;
-const FACE_NX: u32 = 0u;
-const FACE_PX: u32 = 1u;
-const FACE_NY: u32 = 2u;
-const FACE_PY: u32 = 3u;
-const FACE_NZ: u32 = 4u;
-const FACE_PZ: u32 = 5u;
 
 fn leaf_attr_material_secondary(a: LeafAttr) -> u32 { return (a.material_packed >> 16u) & 0x0FFFu; }
 fn leaf_attr_blend_weight(a: LeafAttr) -> u32 { return (a.material_packed >> 28u) & 0x0Fu; }

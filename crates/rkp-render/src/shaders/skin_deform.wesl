@@ -5,7 +5,7 @@
 // 4×4×4 = 64 threads, one per cell in the brick. Each thread:
 //
 //   1. Reads its brick cell from the scene's brick_pool. Cells that
-//      carry `BRICK_EMPTY` / `BRICK_INTERIOR` sentinels are skipped
+//      carry `BRICK_CELL_EMPTY` / `BRICK_CELL_INTERIOR` sentinels are skipped
 //      (neither is a shell leaf).
 //   2. Looks up the cell's 4-bone LBS influences from the scene's
 //      bone_weights_buffer at the cell's leaf_attr slot.
@@ -29,6 +29,10 @@
 import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::oct_normal::pack_oct_normal;
 import package::lib::types::LeafAttr;
+import package::lib::brick::BRICK_DIM;
+import package::lib::brick::BRICK_CELLS;
+import package::lib::brick::BRICK_CELL_EMPTY;
+import package::lib::brick::BRICK_CELL_INTERIOR;
 
 // ---- Scene bindings (reused from the main octree_march bind group) --
 // We don't need the full scene layout — just brick_pool, bone_matrices,
@@ -119,10 +123,6 @@ struct SkinBrickEntry {
 
 // ---- Constants mirroring rkp-core::brick_pool -----------------------
 
-const BRICK_DIM: u32 = 4u;
-const BRICK_CELLS: u32 = 64u;               // 4^3
-const BRICK_EMPTY: u32 = 0xFFFFFFFFu;
-const BRICK_INTERIOR: u32 = 0xFFFFFFFDu;
 
 // Forward-skin a rest-pose position by weighted LBS. Weights are u8
 // (0..=255) packed into a u32; indices are u8s packed into another u32.
@@ -316,8 +316,8 @@ fn main(
     // Read brick cell; skip empty and interior sentinels.
     let pool_idx = info.brick_id * BRICK_CELLS + cell_flat;
     let slot = brick_pool[pool_idx];
-    if slot == BRICK_EMPTY { return; }
-    if slot == BRICK_INTERIOR { return; }
+    if slot == BRICK_CELL_EMPTY { return; }
+    if slot == BRICK_CELL_INTERIOR { return; }
 
     // `slot` is the leaf_attr_id. Fetch this cell's bone influences.
     let bw_base = slot * 2u;

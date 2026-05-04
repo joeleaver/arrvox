@@ -14,6 +14,20 @@
 import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::math::mat4_affine_inverse;
 import package::lib::math::intersect_aabb;
+import package::lib::brick::BRICK_DIM;
+import package::lib::brick::BRICK_DIM_F;
+import package::lib::brick::BRICK_CELLS;
+import package::lib::brick::BRICK_CELL_EMPTY;
+import package::lib::brick::BRICK_CELL_INTERIOR;
+import package::lib::brick::BRICK_MAX_STEPS;
+import package::lib::brick::FACE_INTERIOR;
+import package::lib::brick::FACE_EMPTY_LINK;
+import package::lib::brick::FACE_NX;
+import package::lib::brick::FACE_PX;
+import package::lib::brick::FACE_NY;
+import package::lib::brick::FACE_PY;
+import package::lib::brick::FACE_NZ;
+import package::lib::brick::FACE_PZ;
 import package::lib::octree::skip_node;
 import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
@@ -47,25 +61,11 @@ import package::lib::types::InstanceHit;
 // Shadow rays scan every object every ray — AABB misses short-circuit
 // cheaply, and shadow rays go in arbitrary directions so the march
 // pass's screen-space per-tile lists don't apply.
-const BRICK_DIM: u32 = 4u;
-const BRICK_DIM_F: f32 = 4.0;
-const BRICK_CELLS: u32 = 64u;
-const BRICK_CELL_EMPTY: u32 = 0xFFFFFFFFu;
-const BRICK_CELL_INTERIOR: u32 = 0xFFFFFFFDu;
 // Raised from 16 to 128: the inner DDA now chains across adjacent
 // bricks via brick_face_links, so a single inner loop can traverse
 // many bricks before the outer loop needs to intervene.
-const BRICK_MAX_STEPS: u32 = 4096u;
 
 // Face-link sentinels — must match rkp_core::brick_face_links.
-const FACE_INTERIOR: u32 = 0xFFFFFFFEu;
-const FACE_EMPTY_LINK: u32 = 0xFFFFFFFFu;
-const FACE_NX: u32 = 0u;
-const FACE_PX: u32 = 1u;
-const FACE_NY: u32 = 2u;
-const FACE_PY: u32 = 3u;
-const FACE_NZ: u32 = 4u;
-const FACE_PZ: u32 = 5u;
 
 // Per-instance + per-asset records — see octree_march.wgsl for the
 // authoritative layouts. Shadow trace marches the same scene the primary

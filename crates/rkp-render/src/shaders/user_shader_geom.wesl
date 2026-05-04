@@ -62,11 +62,12 @@ import package::lib::types::OverlayEntry;
 import package::lib::types::UserCtx;
 import package::lib::types::HostSample;
 import package::lib::types::VoxelEmit;
+import package::lib::brick::BRICK_DIM;
+import package::lib::brick::BRICK_CELLS;
+import package::lib::brick::BRICK_CELL_EMPTY;
+import package::lib::brick::BRICK_CELL_INTERIOR;
+import package::lib::brick::INTERNAL_ATTR_NONE;
 
-const BRICK_DIM: u32 = 4u;
-const BRICK_CELLS: u32 = 64u;
-const BRICK_CELL_EMPTY: u32 = 0xFFFFFFFFu;
-const BRICK_CELL_INTERIOR: u32 = 0xFFFFFFFDu;
 
 const OCTREE_EMPTY: u32 = 0xFFFFFFFFu;
 const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
@@ -78,7 +79,6 @@ const OCTREE_BRICK_BIT: u32 = 0x40000000u;
 // octree_march.wgsl for the canonical encoding contract.
 const OCTREE_BAND_BIT: u32 = 0x20000000u;
 const OCTREE_PAYLOAD_MASK: u32 = 0x1FFFFFFFu;
-const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;
 
 // Hard ceiling on octree depth — limits per-frame queue capacity.
 // `MAX_DEPTH = 8` gives 4 × 2^8 = 1024 cells/axis at the deepest level
