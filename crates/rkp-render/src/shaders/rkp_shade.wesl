@@ -20,6 +20,10 @@ import package::lib::atmosphere::lookup_transmittance;
 import package::lib::atmosphere::lookup_multiscatter;
 import package::lib::math::value_noise_3d;
 import package::lib::math::ray_sphere;
+import package::lib::pbr::dielectric_f0;
+import package::lib::pbr::fresnel_dielectric;
+import package::lib::pbr::fresnel_schlick;
+import package::lib::pbr::beer_absorption;
 import package::lib::types::GpuMaterial;
 import package::lib::types::mat_albedo;
 import package::lib::types::CameraUniforms;
@@ -439,25 +443,9 @@ fn geometry_smith(n_dot_v: f32, n_dot_l: f32, roughness: f32) -> f32 {
 // zero-length guard. The lib version (Variant A) returns +Y for
 // degenerate inputs instead of NaN.
 
-fn dielectric_f0(ior: f32) -> f32 {
-    let r = (1.0 - ior) / (1.0 + ior);
-    return r * r;
-}
-
-fn fresnel_dielectric(cos_theta: f32, ior: f32) -> f32 {
-    let f0 = dielectric_f0(ior);
-    return f0 + (1.0 - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
-}
-
-// Beer-Lambert: a colorless glass passes everything (glass_color
-// near (1,1,1) → absorption → (1,1,1)); a saturated glass color
-// absorbs its complement, deepening with thickness. The `* 5.0`
-// scales the thickness parameter into a visually-useful range —
-// matches rkifield's choice.
-fn beer_absorption(glass_color: vec3<f32>, thickness: f32) -> vec3<f32> {
-    let sigma = max(-log(max(glass_color, vec3<f32>(0.01))), vec3<f32>(0.0));
-    return exp(-sigma * thickness * 5.0);
-}
+// dielectric_f0, fresnel_dielectric, beer_absorption are imported
+// from `lib::pbr` at the top of this file (Wave AF unification with
+// rkp_glass).
 
 // --- Noise (procedural material variation) ---
 
@@ -478,9 +466,7 @@ fn noise_gradient_3d(p: vec3<f32>, n0: f32) -> vec3<f32> {
     return vec3<f32>(nx, ny, nz) * inv_e;
 }
 
-fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
-    return f0 + (1.0 - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
-}
+// fresnel_schlick is imported from `lib::pbr` at the top of this file.
 
 // --- User-shader dispatch (composer-injectable) ---
 //

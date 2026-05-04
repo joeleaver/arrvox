@@ -18,6 +18,10 @@
 // Non-glass pixels pass through unchanged.
 
 import package::lib::oct_normal::unpack_oct_normal;
+import package::lib::pbr::dielectric_f0;
+import package::lib::pbr::fresnel_dielectric;
+import package::lib::pbr::fresnel_schlick_f0;
+import package::lib::pbr::beer_absorption;
 import package::lib::types::GpuMaterial;
 import package::lib::types::mat_albedo;
 import package::lib::types::CameraUniforms;
@@ -46,24 +50,10 @@ const PI: f32 = 3.14159265358979323846;
 // Wave A2: this site previously used a Variant-B copy without the
 // zero-length guard. The lib version (Variant A) returns +Y for
 // degenerate inputs instead of NaN.
-
-fn dielectric_f0(ior: f32) -> f32 {
-    let r = (1.0 - ior) / (1.0 + ior);
-    return r * r;
-}
-
-fn fresnel_schlick_f0(cos_theta: f32, f0: f32) -> f32 {
-    return f0 + (1.0 - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
-}
-
-fn fresnel_dielectric(cos_theta: f32, ior: f32) -> f32 {
-    return fresnel_schlick_f0(cos_theta, dielectric_f0(ior));
-}
-
-fn beer_absorption(glass_color: vec3<f32>, thickness: f32) -> vec3<f32> {
-    let sigma = max(-log(max(glass_color, vec3<f32>(0.01))), vec3<f32>(0.0));
-    return exp(-sigma * thickness * 5.0);
-}
+//
+// dielectric_f0, fresnel_schlick_f0, fresnel_dielectric,
+// beer_absorption are imported from `lib::pbr` at the top of this
+// file (Wave AF unification with rkp_shade).
 
 // Standard GGX / Trowbridge-Reitz microfacet distribution.
 fn ggx_d(n_dot_h: f32, roughness: f32) -> f32 {
