@@ -1,0 +1,116 @@
+//! Post-frame: kick off MAIN's cloud-sun-atten readback, drive the
+//! wgpu async runtime, wire up any pending pick map_async, drain the
+//! per-VR composite readbacks and ship pixels (gated on
+//! `new_snapshot_consumed` + `MIN_FRAME_CALLBACK_INTERVAL`).
+//!
+//! Phase 4-7 of [`super::render_one_frame`]. Reads pick state from
+//! [`super::EncodeOutput`] and assembles the final
+//! [`super::RenderOutcome`].
+
+use crate::render_frame::RenderFrame;
+use crate::viewport::ViewportId;
+
+use super::super::state::{FrameCallback, RenderState, MIN_FRAME_CALLBACK_INTERVAL};
+
+use super::{EncodeOutput, RenderOutcome};
+
+pub(super) fn finalize_frame(
+    state: &mut RenderState,
+    frame: &RenderFrame,
+    new_snapshot_consumed: bool,
+    frame_callback: &FrameCallback,
+    encode: EncodeOutput,
+) -> RenderOutcome {
+    // 4. Kick off MAIN's cloud-sun-atten readback (used by sim's
+    //    smoothed sun-color attenuation next frame).
+    let cloud_sun_atten_raw = if let Some(main_vr) =
+        state.viewport_renderers.get(&ViewportId::MAIN)
+    {
+        main_vr.volumetric.issue_sun_atten_map();
+        main_vr.volumetric.sun_atten_value()
+    } else {
+        f32::NAN
+    };
+
+    // 5. Drive async runtime so map_async callbacks can fire.
+    let _ = state.device.poll(wgpu::PollType::Poll);
+
+    // 6. If we issued a pick this frame, wire it up so next frame's
+    //    `drain_pick` can return the result to sim. The
+    //    `active_pending_pick` filter above guarantees `pick_in_flight`
+    //    is `None` here whenever `pick_issued` is true, so the
+    //    `map_async` can't double-map.
+    if encode.pick_issued {
+        if let Some(pp) = encode.active_pending_pick {
+            let (tx, rx) = std::sync::mpsc::channel();
+            state
+                .pick_readback_buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx.send(r);
+                });
+            state.pick_in_flight = Some((pp, rx));
+        }
+    }
+
+    // 7. Drain composite readbacks for each visible viewport. The
+    //    readback drain itself runs every iteration so the rings
+    //    don't back up. Whether to fire the editor pixel callback
+    //    is gated on TWO things:
+    //
+    //    a) `new_snapshot_consumed` — there's no point shipping
+    //       pixels for an iteration that just re-rendered the same
+    //       sim state. The visual content is identical to whatever
+    //       we shipped last time. With Uncapped render at 200 Hz
+    //       and 60 Hz sim, this alone drops pixel ships from 200
+    //       /sec to 60 /sec — matching display refresh.
+    //
+    //    b) `MIN_FRAME_CALLBACK_INTERVAL` — soft cap that handles
+    //       the edge case where sim itself runs faster than
+    //       display refresh (Uncapped sim, very fast scenes).
+    //       Without this an Uncapped sim at 600 Hz would still try
+    //       to ship 600 frames/sec to the editor and saturate
+    //       rinch's surface buffer Mutex.
+    //
+    //    Together: pixel ship rate = min(sim_rate, display_rate),
+    //    which is exactly what the editor surface can usefully
+    //    consume.
+    let now = std::time::Instant::now();
+    let time_ok = now.duration_since(state.last_frame_callback)
+        >= MIN_FRAME_CALLBACK_INTERVAL;
+    let ship_pixels = new_snapshot_consumed && time_ok;
+    // Interval since the previous successful pixel ship. Sampled
+    // BEFORE we update `last_frame_callback` below so we get the
+    // gap between ship N-1 and ship N. Only populated when at least
+    // one viewport actually handed fresh pixels to the callback —
+    // `ship_pixels` gates the try, but `cached_pixels()` may still
+    // return None (readback not ready). Delivered FPS should only
+    // count real pixel deliveries; a skipped ship leaves the sim
+    // EMA unchanged rather than double-counting.
+    let mut delivered_dt_ms: Option<f32> = None;
+    let mut shipped_any = false;
+    for vp in &frame.viewports {
+        let vr = state
+            .viewport_renderers
+            .get_mut(&vp.id)
+            .expect("viewport renderer must exist");
+        let w = vr.width;
+        let h = vr.height;
+        let padded_row = vr.readback_padded_row();
+        vr.readback.drain_completed(w, h, padded_row);
+        if ship_pixels {
+            if let Some((pixels, cw, ch)) = vr.readback.cached_pixels() {
+                frame_callback(vp.id, pixels, cw, ch);
+                shipped_any = true;
+            }
+        }
+    }
+    if shipped_any {
+        delivered_dt_ms = Some(
+            now.duration_since(state.last_frame_callback).as_secs_f32() * 1000.0,
+        );
+        state.last_frame_callback = now;
+    }
+
+    RenderOutcome { cloud_sun_atten_raw, delivered_dt_ms }
+}
