@@ -19,17 +19,12 @@ import package::lib::math::ray_sphere;
 import package::lib::types::GpuMaterial;
 import package::lib::types::mat_albedo;
 import package::lib::types::CameraUniforms;
+import package::lib::types::GpuLight;
 
 const PI: f32 = 3.14159265;
 
 // --- Structs ---
 
-struct Light {
-    position: vec4<f32>,   // xyz = position/direction, w = type (0=dir, 1=point, 2=spot)
-    color: vec4<f32>,      // rgb = color, w = intensity
-    direction: vec4<f32>,  // xyz = spot direction, w = spot angle
-    params: vec4<f32>,     // x = range, y = inner_angle, z = shadow_softness, w = cast_shadow
-}
 
 struct ShadeParams {
     num_lights: u32,
@@ -198,7 +193,7 @@ struct LightCameraShade {
 
 // Group 3: shading params + lights + materials + user-shader params
 @group(3) @binding(0) var<uniform> shade_params: ShadeParams;
-@group(3) @binding(1) var<storage, read> lights: array<Light>;
+@group(3) @binding(1) var<storage, read> lights: array<GpuLight>;
 @group(3) @binding(2) var<storage, read> materials: array<GpuMaterial>;
 @group(3) @binding(3) var<storage, read> shader_params: array<ShaderParamsSlot>;
 

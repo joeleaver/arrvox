@@ -259,6 +259,23 @@ struct CloudParams {
 // `distance_scale` is the local-to-world scale baked at compile
 // time so primitives can return scale-invariant local distances —
 // see compile_tree docs for the math.
+// Light record (64 bytes). CPU-side mirror is `rkp_shade::GpuLight`.
+//
+// `position.w`     light type — 0 = directional, 1 = point, 2 = spot.
+//                  For directional lights, `position.xyz` is the
+//                  light direction; for point/spot it's world position.
+// `color.rgb`      linear color; `color.w` is intensity (lumens for
+//                  point, lux for directional).
+// `direction.xyz`  spot direction; `direction.w` is spot outer half-angle.
+// `params`         x = range, y = inner_half_angle, z = shadow_softness,
+//                  w = cast_shadow flag (0 / 1).
+struct GpuLight {
+    position: vec4<f32>,
+    color: vec4<f32>,
+    direction: vec4<f32>,
+    params: vec4<f32>,
+}
+
 struct ProcInstruction {
     op: u32,
     arity: u32,

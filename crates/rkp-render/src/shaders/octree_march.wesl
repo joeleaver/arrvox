@@ -28,6 +28,7 @@ import package::lib::types::CameraUniforms;
 import package::lib::types::OverlayEntry;
 import package::lib::types::ProtoHit;
 import package::lib::types::MarchParams;
+import package::lib::types::GpuLight;
 
 const OPACITY_THRESHOLD: f32 = 0.05;
 // Safety-net ceiling for the outer ray-march loop. The ray already
@@ -138,12 +139,6 @@ const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;
 // branch was several px on screen so LOD never fired.
 const LOD_CUTOFF_PX: f32 = 2.0;
 
-struct GpuLight {
-    position: vec4<f32>,   // xyz = position, w = type (0=dir, 1=point, 2=spot)
-    color: vec4<f32>,      // rgb = color, w = intensity
-    direction: vec4<f32>,  // xyz = direction, w = spot angle
-    params: vec4<f32>,     // x = range, y = inner_angle, z = shadow_softness, w = cast_shadow
-}
 
 // vec3 fields flattened to f32 components — see rkp_shade.wgsl for the
 // full rationale (WGSL vec3 alignment would pad this to 128 bytes, but

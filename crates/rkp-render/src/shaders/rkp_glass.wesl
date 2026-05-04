@@ -21,19 +21,13 @@ import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::types::GpuMaterial;
 import package::lib::types::mat_albedo;
 import package::lib::types::CameraUniforms;
+import package::lib::types::GpuLight;
 
 const PI: f32 = 3.14159265358979323846;
 
 // Camera uniform — matches rkp_shade.wgsl's layout.
 // vec3 fields flattened to f32 channels — see rkp_shade.wgsl for why.
 
-// Mirrors rkp_shade.wgsl's Light layout (position.w encodes type).
-struct Light {
-    position: vec4<f32>,
-    color: vec4<f32>,
-    direction: vec4<f32>,
-    params: vec4<f32>,
-}
 
 // Only the handful of fields we actually use — layout must match
 // rkp_shade.wgsl::ShadeParams so the same uniform buffer binds cleanly.
@@ -58,7 +52,7 @@ struct ShadeParams {
 @group(0) @binding(3) var<uniform> camera: CameraUniforms;
 @group(0) @binding(4) var<storage, read> materials: array<GpuMaterial>;
 @group(0) @binding(5) var<uniform> shade_params: ShadeParams;
-@group(0) @binding(6) var<storage, read> lights: array<Light>;
+@group(0) @binding(6) var<storage, read> lights: array<GpuLight>;
 
 
 // `unpack_oct_normal` is imported from `lib::oct_normal` at the top.

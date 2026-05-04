@@ -37,6 +37,7 @@ import package::lib::types::TlasInstanceLeaf;
 import package::lib::types::OverlayEntry;
 import package::lib::types::ProtoHit;
 import package::lib::types::MarchParams;
+import package::lib::types::GpuLight;
 // Shadow rays scan every object every ray — AABB misses short-circuit
 // cheaply, and shadow rays go in arbitrary directions so the march
 // pass's screen-space per-tile lists don't apply.
@@ -74,12 +75,6 @@ struct RkpAsset {
     shader_id: u32, _pad: u32,
 }
 
-struct GpuLight {
-    position: vec4<f32>,
-    color: vec4<f32>,
-    direction: vec4<f32>,
-    params: vec4<f32>,
-}
 
 // vec3 fields flattened to f32 components — see rkp_shade.wgsl for the
 // full rationale (WGSL vec3 alignment would pad this to 128 bytes, but
