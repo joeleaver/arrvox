@@ -70,24 +70,73 @@ pub fn splice_inst_chunks(
 /// Const-decl anchors (versus comment markers) survive WESL's
 /// parse-emit roundtrip; this is the splice contract every
 /// user-shader pipeline depends on.
+///
+/// Anchors are matched only when they appear at top level — the
+/// marker text must occupy its own line modulo leading whitespace.
+/// A literal mention of the marker in a comment, docstring, or
+/// string body therefore does not match. Templates must contain
+/// exactly one BEGIN and one END anchor; both 0 and >1 matches
+/// panic with a diagnostic.
 pub fn splice_const_marker(template: &str, marker_name: &str, chunk: &str) -> String {
     if chunk.is_empty() {
         return template.to_string();
     }
     let begin = format!("const {marker_name}_BEGIN: u32 = 0u;");
     let end = format!("const {marker_name}_END: u32 = 0u;");
-    let begin_idx = template
-        .find(&begin)
-        .unwrap_or_else(|| panic!("template missing `{begin}` anchor"));
-    let end_idx = template[begin_idx..]
-        .find(&end)
-        .map(|off| begin_idx + off + end.len())
-        .unwrap_or_else(|| panic!("template missing `{end}` anchor"));
+    let begin_idx = find_unique_top_level_anchor(template, &begin);
+    // Search for END strictly after BEGIN — a paired anchor never
+    // appears before its opener.
+    let end_rel = find_unique_top_level_anchor(&template[begin_idx..], &end);
+    let end_idx = begin_idx + end_rel + end.len();
     let mut out = String::with_capacity(template.len() + chunk.len());
     out.push_str(&template[..begin_idx]);
     out.push_str(chunk);
     out.push_str(&template[end_idx..]);
     out
+}
+
+/// Locate `needle` at top-level position in `haystack` — i.e. the
+/// match's line contains only whitespace before the needle. Panics
+/// with a diagnostic when there are zero or multiple top-level
+/// matches; in-comment occurrences are skipped silently.
+fn find_unique_top_level_anchor(haystack: &str, needle: &str) -> usize {
+    let mut hits: Vec<usize> = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(off) = haystack[search_from..].find(needle) {
+        let absolute = search_from + off;
+        if anchor_is_top_level(haystack, absolute) {
+            hits.push(absolute);
+        }
+        search_from = absolute + needle.len();
+    }
+    match hits.len() {
+        0 => panic!("template missing top-level anchor `{needle}`"),
+        1 => hits[0],
+        n => panic!(
+            "template contains {n} top-level anchors `{needle}` — \
+             anchors must be unique (at offsets {:?})",
+            hits
+        ),
+    }
+}
+
+/// True iff the bytes from the start of `byte_offset`'s line up to
+/// the offset are all ASCII whitespace. Skips in-comment matches
+/// (which have `//` before the marker on the same line).
+fn anchor_is_top_level(source: &str, byte_offset: usize) -> bool {
+    let bytes = source.as_bytes();
+    let mut i = byte_offset;
+    while i > 0 {
+        let prev = bytes[i - 1];
+        if prev == b'\n' {
+            break;
+        }
+        if !prev.is_ascii_whitespace() {
+            return false;
+        }
+        i -= 1;
+    }
+    true
 }
 
 fn compose_shade_chunk(reg: &UserShaderRegistry) -> String {

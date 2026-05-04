@@ -871,6 +871,57 @@ fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
     assert_eq!(info.instance_struct_size, Some(16));
 }
 
+#[test]
+fn splice_marker_skips_in_comment_occurrence() {
+    let template = "\
+// @author wrote about USER_TEST_DISPATCH_BEGIN: u32 = 0u; somewhere
+const USER_TEST_DISPATCH_BEGIN: u32 = 0u;
+fn old_body() {}
+const USER_TEST_DISPATCH_END: u32 = 0u;
+";
+    let out = splice_const_marker(template, "USER_TEST_DISPATCH", "fn new_body() {}\n");
+    assert!(out.contains("fn new_body() {}"));
+    assert!(!out.contains("fn old_body()"));
+    // The literal mention in the leading comment must survive,
+    // because the splice replaced the syntactic anchor pair only.
+    assert!(out.contains("@author"));
+}
+
+#[test]
+#[should_panic(expected = "missing top-level anchor")]
+fn splice_marker_panics_when_only_comment_match_exists() {
+    let template = "\
+// const USER_TEST_DISPATCH_BEGIN: u32 = 0u;
+// const USER_TEST_DISPATCH_END: u32 = 0u;
+";
+    let _ = splice_const_marker(template, "USER_TEST_DISPATCH", "// chunk\n");
+}
+
+#[test]
+#[should_panic(expected = "contains 2 top-level anchors")]
+fn splice_marker_panics_on_duplicate_top_level_anchor() {
+    let template = "\
+const USER_TEST_DISPATCH_BEGIN: u32 = 0u;
+const USER_TEST_DISPATCH_END: u32 = 0u;
+const USER_TEST_DISPATCH_BEGIN: u32 = 0u;
+const USER_TEST_DISPATCH_END: u32 = 0u;
+";
+    let _ = splice_const_marker(template, "USER_TEST_DISPATCH", "// chunk\n");
+}
+
+#[test]
+fn splice_marker_empty_chunk_is_identity() {
+    let template = "\
+const USER_TEST_DISPATCH_BEGIN: u32 = 0u;
+fn old_body() {}
+const USER_TEST_DISPATCH_END: u32 = 0u;
+";
+    assert_eq!(
+        splice_const_marker(template, "USER_TEST_DISPATCH", ""),
+        template,
+    );
+}
+
 fn tempfile_dir(label: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!(
         "rkpatch_shader_composer_{label}_{}",
