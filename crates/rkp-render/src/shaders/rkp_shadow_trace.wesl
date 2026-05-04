@@ -29,6 +29,8 @@ import package::lib::brick::FACE_PY;
 import package::lib::brick::FACE_NZ;
 import package::lib::brick::FACE_PZ;
 import package::lib::types::unpack_band_cell;
+import package::lib::octree::octree_lookup;
+import package::lib::octree::PHASE_SHADOW;
 import package::lib::octree::skip_node;
 import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
@@ -136,7 +138,7 @@ fn descend_proto_octree(
             vec3<f32>(vs * 0.01),
             vec3<f32>(extent - vs * 0.01),
         );
-        let lookup = octree_lookup(root, max_depth, extent, pos, PHASE_SHADOW);
+        let lookup = octree_lookup(root, max_depth, extent, pos, PHASE_SHADOW, 0u, 0.0, 1.0, 0.0);
 
         if lookup.slot == OCTREE_EMPTY {
             t += skip_node(pos, safe_dir, inv_dir, lookup.depth, extent, vs);
@@ -393,7 +395,6 @@ const TLAS_LEAF_USER_SHADER: u32 = 0xFFFFFFFEu;
 // deep; 32 covers up to 4 billion leaves.
 const TLAS_STACK_DEPTH: u32 = 32u;
 
-const PHASE_SHADOW: u32 = 2u;
 
 
 // `intersect_aabb` is duplicated across splice-consumer files
@@ -407,54 +408,11 @@ fn bucket_depth(phase: u32, level: u32) {
     atomicAdd(&stats[base + min(level, 11u)], 1u);
 }
 
-fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: u32) -> OctreeResult {
-    var offset = root;
-    var half = extent * 0.5;
-    var center = vec3<f32>(half);
-    for (var level = 0u; level < max_depth; level++) {
-        let node = octree_nodes[offset].x;
-        if node == OCTREE_EMPTY {
-            bucket_depth(phase, level);
-            return OctreeResult(OCTREE_EMPTY, level, center, half);
-        }
-        if node == OCTREE_INTERIOR {
-            bucket_depth(phase, level);
-            return OctreeResult(OCTREE_INTERIOR, level, center, half);
-        }
-        if (node & OCTREE_LEAF_BIT) != 0u {
-            bucket_depth(phase, level);
-            // Phase 4 — preserve BRICK_BIT and BAND_BIT in the
-            // returned slot so the caller can distinguish a leaf-
-            // attr leaf from a brick leaf or a band cell. Band
-            // cells trigger `dispatch_user_instance_descend` for
-            // proper shadow casting through painted instance
-            // shaders (e.g. grass blades).
-            return OctreeResult(
-                (node & OCTREE_PAYLOAD_MASK) | (node & OCTREE_BRICK_BIT) | (node & OCTREE_BAND_BIT),
-                level, center, half,
-            );
-        }
-        let gt = vec3<u32>(pos >= center);
-        offset = node + gt.x + gt.y * 2u + gt.z * 4u;
-        half *= 0.5;
-        center += vec3<f32>(
-            select(-half, half, pos.x >= center.x),
-            select(-half, half, pos.y >= center.y),
-            select(-half, half, pos.z >= center.z),
-        );
-    }
-    bucket_depth(phase, max_depth);
-    let node = octree_nodes[offset].x;
-    if node == OCTREE_EMPTY { return OctreeResult(OCTREE_EMPTY, max_depth, center, half); }
-    if node == OCTREE_INTERIOR { return OctreeResult(OCTREE_INTERIOR, max_depth, center, half); }
-    if (node & OCTREE_LEAF_BIT) != 0u {
-        return OctreeResult(
-            (node & OCTREE_PAYLOAD_MASK) | (node & OCTREE_BRICK_BIT) | (node & OCTREE_BAND_BIT),
-            max_depth, center, half,
-        );
-    }
-    return OctreeResult(OCTREE_EMPTY, max_depth, center, half);
-}
+// No-op stub. Trace passes `lod_enabled = 0` so the LOD branch in
+// the unified `octree_lookup` never fires; this declaration exists
+// only because the lib fn still references the symbol.
+fn bucket_lod_exit(level: u32) {}
+
 
 // `slot_is_brick`, `slot_brick_id`, `slot_is_band`, `slot_band_offset`
 // are imported from `lib::octree_slot` at the top of this file.
@@ -703,7 +661,7 @@ fn shadow_step_one_instance(
         if t > t_limit { break; }
 
         let pos = clamp(shadow_origin + safe_dir * (t + lookup_bias), vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
-        let r = octree_lookup(root, max_depth, extent, pos, PHASE_SHADOW);
+        let r = octree_lookup(root, max_depth, extent, pos, PHASE_SHADOW, 0u, 0.0, 1.0, 0.0);
 
         if r.slot == OCTREE_EMPTY {
             t += max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);

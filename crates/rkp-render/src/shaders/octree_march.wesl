@@ -24,6 +24,10 @@ import package::lib::brick::FACE_PY;
 import package::lib::brick::FACE_NZ;
 import package::lib::brick::FACE_PZ;
 import package::lib::types::unpack_band_cell;
+import package::lib::octree::octree_lookup;
+import package::lib::octree::PHASE_MARCH;
+import package::lib::octree::PHASE_SHADOW;
+import package::lib::octree::LOD_CUTOFF_PX;
 import package::lib::octree::skip_node;
 import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
@@ -143,7 +147,6 @@ fn rkp_object_visible(inst: RkpInstance) -> bool {
 // Note: an earlier 0.9-px draft was too conservative — at typical
 // viewing distances for meter-scale assets with mm-scale voxels, every
 // branch was several px on screen so LOD never fired.
-const LOD_CUTOFF_PX: f32 = 2.0;
 
 
 // vec3 fields flattened to f32 components — see rkp_shade.wgsl for the
@@ -376,9 +379,7 @@ fn brick_id_of(node: u32) -> u32 {
 //
 // octree_nodes reads are derived CPU-side from the per-phase depth histograms:
 // sum(bucket[i] * (i + 1)) since each lookup descends `depth+1` nodes.
-const PHASE_MARCH: u32 = 0u;
 const PHASE_NORMAL: u32 = 1u;
-const PHASE_SHADOW: u32 = 2u;
 @group(2) @binding(3) var<storage, read> lights: array<GpuLight>;
 // Per-tile object-list offsets (prefix sum). Length = num_tiles + 1.
 // Tile `t`'s object-id slice is `tile_object_ids[tile_offsets[t]..tile_offsets[t+1]]`.
@@ -583,89 +584,6 @@ fn bucket_lod_exit(level: u32) {
 ///   footprint histogram in the caller already works in world units.
 /// * `focal_px_y` — vertical pixels per world unit at unit depth. Read
 ///   once in the caller from `camera`.
-fn octree_lookup(
-    root: u32,
-    max_depth: u32,
-    extent: f32,
-    pos: vec3<f32>,
-    phase: u32,
-    t_current: f32,
-    local_to_world_scale: f32,
-    focal_px_y: f32,
-) -> OctreeResult {
-    var offset = root;
-    var half = extent * 0.5;
-    var center = vec3<f32>(half);
-    for (var level = 0u; level < max_depth; level++) {
-        let packed = octree_nodes[offset];
-        let node = packed.x;
-        if node == OCTREE_EMPTY {
-            bucket_depth(phase, level);
-            return OctreeResult(OCTREE_EMPTY, level, center, half);
-        }
-        if node == OCTREE_INTERIOR {
-            bucket_depth(phase, level);
-            return OctreeResult(OCTREE_INTERIOR, level, center, half);
-        }
-        if (node & OCTREE_LEAF_BIT) != 0u {
-            bucket_depth(phase, level);
-            // Preserve BRICK_BIT and BAND_BIT in the returned slot so
-            // the caller can distinguish a leaf-attr leaf from a brick
-            // leaf (Phase 3b adds BAND for `instance_at` shaders' band
-            // cells whose payload reinterprets two consecutive
-            // leaf-attr slots as `BandCell`).
-            return OctreeResult(
-                (node & OCTREE_PAYLOAD_MASK) | (node & OCTREE_BRICK_BIT) | (node & OCTREE_BAND_BIT),
-                level, center, half,
-            );
-        }
-
-        // Branch — check the prefiltered-LOD cutoff before descending.
-        // Gated on `phase == PHASE_MARCH`: the shadow path uses a cone-
-        // footprint LOD (Phase 3) and must not pixel-footprint-exit;
-        // the normal path doesn't need LOD (normals baked into leaves).
-        // The node's side in world units is `(half * 2.0) * scale`; the
-        // distance from the ray origin is `t * scale`. Both pull from the
-        // same `scale`, so the ratio matches the existing world-space
-        // footprint histogram's formula (`vs * focal_px_y / dist`).
-        if march_params.lod_enabled != 0u
-            && phase == PHASE_MARCH
-            && packed.y != INTERNAL_ATTR_NONE
-        {
-            let node_size_world = (half * 2.0) * local_to_world_scale;
-            let dist_world = max(t_current * local_to_world_scale, 1e-3);
-            let footprint_px = node_size_world * focal_px_y / dist_world;
-            if footprint_px < LOD_CUTOFF_PX {
-                bucket_depth(phase, level);
-                bucket_lod_exit(level);
-                // `packed.y` is a `leaf_attr_id` (< BRICK_BIT). Return it
-                // as a regular leaf — no BRICK_BIT, callers shade it via
-                // the standard leaf-hit path.
-                return OctreeResult(packed.y, level, center, half);
-            }
-        }
-
-        let gt = vec3<u32>(pos >= center);
-        offset = node + gt.x + gt.y * 2u + gt.z * 4u;
-        half *= 0.5;
-        center += vec3<f32>(
-            select(-half, half, pos.x >= center.x),
-            select(-half, half, pos.y >= center.y),
-            select(-half, half, pos.z >= center.z),
-        );
-    }
-    bucket_depth(phase, max_depth);
-    let node = octree_nodes[offset].x;
-    if node == OCTREE_EMPTY { return OctreeResult(OCTREE_EMPTY, max_depth, center, half); }
-    if node == OCTREE_INTERIOR { return OctreeResult(OCTREE_INTERIOR, max_depth, center, half); }
-    if (node & OCTREE_LEAF_BIT) != 0u {
-        return OctreeResult(
-            (node & OCTREE_PAYLOAD_MASK) | (node & OCTREE_BRICK_BIT) | (node & OCTREE_BAND_BIT),
-            max_depth, center, half,
-        );
-    }
-    return OctreeResult(OCTREE_EMPTY, max_depth, center, half);
-}
 
 // `slot_is_brick`, `slot_brick_id`, `slot_is_band`, `slot_band_offset`
 // are imported from `lib::octree_slot` at the top of this file.
@@ -995,6 +913,7 @@ fn descend_proto_octree(
         );
         let lookup = octree_lookup(
             root, max_depth, extent, pos, PHASE_MARCH,
+            march_params.lod_enabled,
             t, local_to_world, focal_px_y,
         );
 
@@ -1197,7 +1116,7 @@ fn march_object(
         if result.alpha > 0.99 { break; }
 
         let pos = clamp(oc_origin + safe_dir * (t + lookup_bias), vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
-        let r = octree_lookup(root, max_depth, extent, pos, PHASE_MARCH, t, local_to_world, focal_px_y);
+        let r = octree_lookup(root, max_depth, extent, pos, PHASE_MARCH, march_params.lod_enabled, t, local_to_world, focal_px_y);
 
         if r.slot == OCTREE_EMPTY {
             t += skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs);
