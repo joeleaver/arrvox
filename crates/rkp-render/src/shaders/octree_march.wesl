@@ -23,6 +23,7 @@ import package::lib::brick::FACE_NY;
 import package::lib::brick::FACE_PY;
 import package::lib::brick::FACE_NZ;
 import package::lib::brick::FACE_PZ;
+import package::lib::types::unpack_band_cell;
 import package::lib::octree::skip_node;
 import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
@@ -673,16 +674,7 @@ fn octree_lookup(
 /// consecutive `leaf_attr_pool` slots. BFS bake (user_shader_geom.wgsl)
 /// writes the matching pattern.
 fn read_band_cell(band_off: u32) -> BandCell {
-    let s0 = leaf_attr_pool[band_off];
-    let s1 = leaf_attr_pool[band_off + 1u];
-    var c: BandCell;
-    c.anchor_world_pos = vec3<f32>(
-        bitcast<f32>(s0.normal_oct),
-        bitcast<f32>(s0.material_packed),
-        bitcast<f32>(s1.normal_oct),
-    );
-    c.material_id = s1.material_packed;
-    return c;
+    return unpack_band_cell(leaf_attr_pool[band_off], leaf_attr_pool[band_off + 1u]);
 }
 
 // Skip past an empty/interior node's region along the ray.

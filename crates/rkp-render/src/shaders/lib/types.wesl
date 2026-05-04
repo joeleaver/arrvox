@@ -46,6 +46,25 @@ struct BandCell {
     material_id: u32,
 }
 
+// Decode a band cell from two consecutive `LeafAttr` slots in the
+// per-asset attr pool. Band cells are encoded as a pair of LeafAttrs
+// where bits reinterpret as world-space anchor + material id (see
+// `feedback_normal_oct_zero_bug.md` for the encoding contract).
+//
+// Caller reads the two slots from its bound `leaf_attr_pool[band_off]`
+// and `leaf_attr_pool[band_off + 1u]` and passes them in — keeps this
+// helper binding-free so it lives next to BandCell.
+fn unpack_band_cell(s0: LeafAttr, s1: LeafAttr) -> BandCell {
+    var c: BandCell;
+    c.anchor_world_pos = vec3<f32>(
+        bitcast<f32>(s0.normal_oct),
+        bitcast<f32>(s0.material_packed),
+        bitcast<f32>(s1.normal_oct),
+    );
+    c.material_id = s1.material_packed;
+    return c;
+}
+
 // One per scene instance. CPU-side mirror is `rkp_scene::GpuInstance`;
 // keep field order aligned with that struct (the layout is locked by
 // `bytemuck` casts on the Rust side).

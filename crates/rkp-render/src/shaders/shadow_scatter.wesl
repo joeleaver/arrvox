@@ -36,6 +36,7 @@ import package::lib::brick::FACE_NY;
 import package::lib::brick::FACE_PY;
 import package::lib::brick::FACE_NZ;
 import package::lib::brick::FACE_PZ;
+import package::lib::types::unpack_band_cell;
 import package::lib::octree::skip_node;
 import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
@@ -200,16 +201,7 @@ fn octree_lookup_no_stats(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>
 // are imported from `lib::octree_slot` at the top of this file.
 
 fn read_band_cell(band_off: u32) -> BandCell {
-    let s0 = leaf_attr_pool[band_off];
-    let s1 = leaf_attr_pool[band_off + 1u];
-    var c: BandCell;
-    c.anchor_world_pos = vec3<f32>(
-        bitcast<f32>(s0.normal_oct),
-        bitcast<f32>(s0.material_packed),
-        bitcast<f32>(s1.normal_oct),
-    );
-    c.material_id = s1.material_packed;
-    return c;
+    return unpack_band_cell(leaf_attr_pool[band_off], leaf_attr_pool[band_off + 1u]);
 }
 
 const MAX_STEPS_PROTO: u32 = 4096u;
