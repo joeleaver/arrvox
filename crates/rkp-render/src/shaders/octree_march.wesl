@@ -2364,7 +2364,7 @@ fn main(
     // this rkp_shade's `blend / 255.0` would cap dual-material lerp
     // at ~5.9 %, which is what showed up as "still looks hard" on
     // MAIN even after the shade-pass fix.
-    let first_blend_8 = (first_blend & 0x0Fu) << 4u | (first_blend & 0x0Fu);
+    let first_blend_8 = ((first_blend & 0x0Fu) << 4u) | (first_blend & 0x0Fu);
     // Bits 8-15 are free after the 8-bit object_id was retired in favor
     // of the dedicated `gbuf_pick` channel below; left as 0 for any
     // future packing that can use 8 bits.

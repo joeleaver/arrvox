@@ -34,7 +34,7 @@ impl TlasBuildPass {
         let host_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tlas_assemble_host"),
             source: wgpu::ShaderSource::Wgsl(
-                include_str!("../../shaders/tlas_assemble_host.wgsl").into(),
+                wesl::include_wesl!("tlas_assemble_host").into(),
             ),
         });
         let host_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -93,7 +93,7 @@ impl TlasBuildPass {
         });
         let morton_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tlas_morton"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/tlas_morton.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(wesl::include_wesl!("tlas_morton").into()),
         });
         let morton_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("tlas_morton"),
@@ -141,7 +141,7 @@ impl TlasBuildPass {
         });
         let radix_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tlas_radix_sort"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/tlas_radix_sort.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(wesl::include_wesl!("tlas_radix_sort").into()),
         });
         let radix_count_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("tlas_radix_count"),
@@ -233,7 +233,7 @@ impl TlasBuildPass {
         });
         let karras_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tlas_karras"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/tlas_karras.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(wesl::include_wesl!("tlas_karras").into()),
         });
         let karras_leaves_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("tlas_karras_leaves"),

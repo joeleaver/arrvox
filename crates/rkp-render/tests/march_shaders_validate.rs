@@ -20,7 +20,7 @@ fn naga_validates(source: &str, label: &str) {
 #[test]
 fn octree_march_validates() {
     naga_validates(
-        include_str!("../src/shaders/octree_march.wgsl"),
+        wesl::include_wesl!("octree_march"),
         "octree_march",
     );
 }
@@ -28,7 +28,7 @@ fn octree_march_validates() {
 #[test]
 fn rkp_shadow_trace_validates() {
     naga_validates(
-        include_str!("../src/shaders/rkp_shadow_trace.wgsl"),
+        wesl::include_wesl!("rkp_shadow_trace"),
         "rkp_shadow_trace",
     );
 }

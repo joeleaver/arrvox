@@ -98,9 +98,9 @@ fn instance_at_chunk_splices_cleanly_into_all_consumers() {
     });
 
     for (label, template) in [
-        ("octree_march", include_str!("../src/shaders/octree_march.wgsl")),
-        ("rkp_shadow_trace", include_str!("../src/shaders/rkp_shadow_trace.wgsl")),
-        ("shadow_scatter", include_str!("../src/shaders/shadow_scatter.wgsl")),
+        ("octree_march", wesl::include_wesl!("octree_march")),
+        ("rkp_shadow_trace", wesl::include_wesl!("rkp_shadow_trace")),
+        ("shadow_scatter", wesl::include_wesl!("shadow_scatter")),
     ] {
         let source = splice_inst_chunks(template, &chunks.instance_at);
         let module = naga::front::wgsl::parse_str(&source).unwrap_or_else(|e| {

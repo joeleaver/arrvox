@@ -70,7 +70,7 @@ impl BloomCompositePass {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("bloom_composite.wgsl"),
             source: wgpu::ShaderSource::Wgsl(
-                include_str!("shaders/bloom_composite.wgsl").into(),
+                wesl::include_wesl!("bloom_composite").into(),
             ),
         });
 

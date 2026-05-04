@@ -156,7 +156,7 @@ impl RkpSsaoPass {
         // Pipeline.
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rkp_ssao"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/rkp_ssao.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(wesl::include_wesl!("rkp_ssao").into()),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

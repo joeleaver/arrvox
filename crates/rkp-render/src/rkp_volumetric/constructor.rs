@@ -196,7 +196,7 @@ impl RkpVolumetricPass {
             Self::create_texture(device, "vol output", width, height, wgpu::TextureFormat::Rgba16Float);
 
         // Fog march pipeline.
-        let fog_src = include_str!("../shaders/rkp_fog_march.wgsl");
+        let fog_src = wesl::include_wesl!("rkp_fog_march");
         validate_wgsl(fog_src, "rkp_fog_march");
         let fog_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rkp_fog_march"),
@@ -216,7 +216,7 @@ impl RkpVolumetricPass {
         });
 
         // Cloud march pipeline.
-        let cloud_src = include_str!("../shaders/rkp_cloud_march.wgsl");
+        let cloud_src = wesl::include_wesl!("rkp_cloud_march");
         validate_wgsl(cloud_src, "rkp_cloud_march");
         let cloud_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rkp_cloud_march"),
@@ -236,7 +236,7 @@ impl RkpVolumetricPass {
         });
 
         // Composite pipeline.
-        let composite_src = include_str!("../shaders/rkp_vol_composite.wgsl");
+        let composite_src = wesl::include_wesl!("rkp_vol_composite");
         validate_wgsl(composite_src, "rkp_vol_composite");
         let composite_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rkp_vol_composite"),
@@ -293,7 +293,7 @@ impl RkpVolumetricPass {
                 },
             ],
         });
-        let history_update_src = include_str!("../shaders/rkp_vol_history_update.wgsl");
+        let history_update_src = wesl::include_wesl!("rkp_vol_history_update");
         validate_wgsl(history_update_src, "rkp_vol_history_update");
         let history_update_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rkp_vol_history_update"),
@@ -370,7 +370,7 @@ impl RkpVolumetricPass {
                 wgpu::BindGroupEntry { binding: 2, resource: sun_atten_storage.as_entire_binding() },
             ],
         });
-        let sun_atten_src = include_str!("../shaders/rkp_cloud_sun_atten.wgsl");
+        let sun_atten_src = wesl::include_wesl!("rkp_cloud_sun_atten");
         validate_wgsl(sun_atten_src, "rkp_cloud_sun_atten");
         let sun_atten_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rkp_cloud_sun_atten"),

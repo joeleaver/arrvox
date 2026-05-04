@@ -113,7 +113,7 @@ impl RkpGlassPass {
 
         let (output_texture, output_view) = Self::create_output(device, width, height);
 
-        let shader_src = include_str!("shaders/rkp_glass.wgsl");
+        let shader_src = wesl::include_wesl!("rkp_glass");
         validate_wgsl(shader_src, "rkp_glass");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rkp_glass"),
@@ -214,7 +214,7 @@ impl RkpGlassPass {
 mod tests {
     #[test]
     fn rkp_glass_shader_is_valid_wgsl() {
-        let src = include_str!("shaders/rkp_glass.wgsl");
+        let src = wesl::include_wesl!("rkp_glass");
         let module = naga::front::wgsl::parse_str(src)
             .unwrap_or_else(|e| panic!("parse error:\n{}", e.emit_to_string(src)));
         let mut v = naga::valid::Validator::new(

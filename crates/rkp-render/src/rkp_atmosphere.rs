@@ -110,7 +110,7 @@ impl RkpAtmospherePass {
                 ],
             });
 
-        let trans_src = include_str!("shaders/rkp_transmittance_lut.wgsl");
+        let trans_src = wesl::include_wesl!("rkp_transmittance_lut");
         validate_wgsl(trans_src, "rkp_transmittance_lut");
         let trans_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rkp_transmittance_lut"),
@@ -175,7 +175,7 @@ impl RkpAtmospherePass {
                 ],
             });
 
-        let ms_src = include_str!("shaders/rkp_multiscatter_lut.wgsl");
+        let ms_src = wesl::include_wesl!("rkp_multiscatter_lut");
         validate_wgsl(ms_src, "rkp_multiscatter_lut");
         let ms_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rkp_multiscatter_lut"),
@@ -241,7 +241,7 @@ impl RkpAtmospherePass {
         // --- Sky View LUT ---
         let (sky_view_texture, sky_view_view) = Self::create_lut(device, "sky_view_lut", SKY_VIEW_W, SKY_VIEW_H);
 
-        let sv_src = include_str!("shaders/rkp_sky_view_lut.wgsl");
+        let sv_src = wesl::include_wesl!("rkp_sky_view_lut");
         validate_wgsl(sv_src, "rkp_sky_view_lut");
         let sv_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rkp_sky_view_lut"), source: wgpu::ShaderSource::Wgsl(sv_src.into()),
@@ -292,7 +292,7 @@ impl RkpAtmospherePass {
             ],
         });
 
-        let ap_src = include_str!("shaders/rkp_aerial_perspective_lut.wgsl");
+        let ap_src = wesl::include_wesl!("rkp_aerial_perspective_lut");
         validate_wgsl(ap_src, "rkp_aerial_perspective_lut");
         let ap_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rkp_aerial_perspective_lut"), source: wgpu::ShaderSource::Wgsl(ap_src.into()),

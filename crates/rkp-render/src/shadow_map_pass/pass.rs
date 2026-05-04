@@ -180,29 +180,29 @@ impl ShadowMapPass {
         // ── Pipelines ──────────────────────────────────────────
         let clear_pipeline = build_pipeline(
             device, "shadow_clear",
-            include_str!("../shaders/shadow_clear.wgsl"),
+            wesl::include_wesl!("shadow_clear"),
             "clear_main",
             &[Some(&clear_g0_layout)],
         );
         let setup_pipeline = build_pipeline(
             device, "shadow_scatter_setup",
-            include_str!("../shaders/shadow_scatter_setup.wgsl"),
+            wesl::include_wesl!("shadow_scatter_setup"),
             "setup_main",
             &[Some(&setup_g0_layout), Some(&setup_g1_layout)],
         );
         let emit_pipeline = build_pipeline(
             device, "shadow_scatter_emit",
-            include_str!("../shaders/shadow_scatter_emit.wgsl"),
+            wesl::include_wesl!("shadow_scatter_emit"),
             "emit_main",
             &[Some(&emit_g0_layout)],
         );
         let finalize_pipeline = build_pipeline(
             device, "shadow_scatter_finalize",
-            include_str!("../shaders/shadow_scatter_finalize.wgsl"),
+            wesl::include_wesl!("shadow_scatter_finalize"),
             "finalize_main",
             &[Some(&finalize_g0_layout)],
         );
-        let scatter_src = include_str!("../shaders/shadow_scatter.wgsl");
+        let scatter_src = wesl::include_wesl!("shadow_scatter");
         validate_wgsl(scatter_src, "shadow_scatter");
         let scatter_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadow_scatter"),
@@ -357,7 +357,7 @@ impl ShadowMapPass {
         if source_hash == self.user_shader_source_hash {
             return false;
         }
-        let template = include_str!("../shaders/shadow_scatter.wgsl");
+        let template = wesl::include_wesl!("shadow_scatter");
         let source = crate::shader_composer::splice_inst_chunks(
             template, instance_at_chunk,
         );

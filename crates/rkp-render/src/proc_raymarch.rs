@@ -197,9 +197,9 @@ impl ProcRaymarchPass {
         // as a module-scope global. WGSL resolves functions across the
         // whole module regardless of declaration order, so `main`
         // calling `eval_tree` before it's defined works.
-        let types_src = include_str!("shaders/proc_eval_types.wgsl");
-        let raymarch_src = include_str!("shaders/proc_raymarch.wgsl");
-        let eval_src = include_str!("shaders/proc_eval.wgsl");
+        let types_src = include_str!("shaders/proc_eval_types.wesl");
+        let raymarch_src = include_str!("shaders/proc_raymarch.wesl");
+        let eval_src = include_str!("shaders/proc_eval.wesl");
         let shader_src = format!("{types_src}\n{raymarch_src}\n{eval_src}");
         validate_wgsl(&shader_src, "proc_raymarch");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {

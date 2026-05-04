@@ -265,7 +265,7 @@ impl OctreeMarchPass {
         });
 
         // Pipeline.
-        let shader_src = include_str!("shaders/octree_march.wgsl");
+        let shader_src = wesl::include_wesl!("octree_march");
         validate_wgsl(shader_src, "octree_march");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("octree_march"),
@@ -370,7 +370,7 @@ impl OctreeMarchPass {
         if source_hash == self.user_shader_source_hash {
             return false;
         }
-        let template = include_str!("shaders/octree_march.wgsl");
+        let template = wesl::include_wesl!("octree_march");
         let source = crate::shader_composer::splice_inst_chunks(
             template, instance_at_chunk,
         );
@@ -655,7 +655,7 @@ impl OctreeMarchPass {
 mod tests {
     #[test]
     fn octree_march_shader_is_valid_wgsl() {
-        let src = include_str!("shaders/octree_march.wgsl");
+        let src = wesl::include_wesl!("octree_march");
         let module = naga::front::wgsl::parse_str(src)
             .unwrap_or_else(|e| panic!("parse error:\n{}", e.emit_to_string(src)));
         let mut v = naga::valid::Validator::new(

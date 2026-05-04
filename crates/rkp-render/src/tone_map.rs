@@ -90,7 +90,7 @@ impl ToneMapPass {
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tone_map.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/tone_map.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(wesl::include_wesl!("tone_map").into()),
         });
 
         // LDR output texture

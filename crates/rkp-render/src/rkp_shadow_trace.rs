@@ -86,7 +86,7 @@ impl ShadowTracePass {
                 ],
             });
 
-        let shader_src = include_str!("shaders/rkp_shadow_trace.wgsl");
+        let shader_src = wesl::include_wesl!("rkp_shadow_trace");
         validate_wgsl(shader_src, "rkp_shadow_trace");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rkp_shadow_trace"),
@@ -151,7 +151,7 @@ impl ShadowTracePass {
         if source_hash == self.user_shader_source_hash {
             return false;
         }
-        let template = include_str!("shaders/rkp_shadow_trace.wgsl");
+        let template = wesl::include_wesl!("rkp_shadow_trace");
         let source = crate::shader_composer::splice_inst_chunks(
             template, instance_at_chunk,
         );
@@ -245,7 +245,7 @@ fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Textur
 mod tests {
     #[test]
     fn rkp_shadow_trace_shader_is_valid_wgsl() {
-        let src = include_str!("shaders/rkp_shadow_trace.wgsl");
+        let src = wesl::include_wesl!("rkp_shadow_trace");
         let module = naga::front::wgsl::parse_str(src)
             .unwrap_or_else(|e| panic!("parse error:\n{}", e.emit_to_string(src)));
         let mut v = naga::valid::Validator::new(

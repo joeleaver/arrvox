@@ -96,7 +96,7 @@ impl RkpGridPass {
             mapped_at_creation: false,
         });
 
-        let shader_src = include_str!("shaders/rkp_grid.wgsl");
+        let shader_src = wesl::include_wesl!("rkp_grid");
         validate_wgsl(shader_src, "rkp_grid");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rkp_grid"),

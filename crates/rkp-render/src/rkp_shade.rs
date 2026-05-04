@@ -797,7 +797,7 @@ impl RkpShadePass {
 /// `_END` const-decl anchors in `rkp_shade.wgsl`. Pass `""` for the
 /// no-shaders case (default identity stub stays put).
 pub fn compose_shade_source(user_chunk: &str) -> String {
-    let shade_src = include_str!("shaders/rkp_shade.wgsl");
+    let shade_src = wesl::include_wesl!("rkp_shade");
     crate::shader_composer::splice_const_marker(
         shade_src,
         "USER_SHADE_DISPATCH",

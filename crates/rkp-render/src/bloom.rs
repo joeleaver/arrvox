@@ -103,7 +103,7 @@ impl BloomPass {
         // --- Shader module (all 3 entry points) ---
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("bloom.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/bloom.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(wesl::include_wesl!("bloom").into()),
         });
 
         // --- Mip dimensions ---

@@ -88,7 +88,7 @@ impl ProcOutlinePass {
             mapped_at_creation: false,
         });
 
-        let shader_src = include_str!("shaders/proc_outline.wgsl");
+        let shader_src = wesl::include_wesl!("proc_outline");
         validate_wgsl(shader_src, "proc_outline");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("proc_outline"),

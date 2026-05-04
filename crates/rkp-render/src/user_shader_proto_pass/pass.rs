@@ -249,7 +249,7 @@ fn build_proto_pipeline(
 /// stub and the markers themselves with `proto_chunk`. Mirrors
 /// `compose_geom_source` in `user_shader_pass.rs`.
 pub fn compose_proto_source(proto_chunk: &str) -> String {
-    let template = include_str!("../shaders/user_shader_proto.wgsl");
+    let template = wesl::include_wesl!("user_shader_proto");
     crate::shader_composer::splice_const_marker(
         template,
         concat!("USER_PROTO_DISPATCH"),

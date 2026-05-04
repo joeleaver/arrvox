@@ -112,7 +112,7 @@ const _: () = assert!(std::mem::size_of::<ActiveCell>() == 32);
 /// Compose the geom-build WGSL with a user `generate` chunk. Empty
 /// chunk leaves the in-tree identity stub in place.
 pub fn compose_geom_source(user_chunk: &str) -> String {
-    let geom_src = include_str!("../shaders/user_shader_geom.wgsl");
+    let geom_src = wesl::include_wesl!("user_shader_geom");
     crate::shader_composer::splice_const_marker(
         geom_src,
         "USER_GENERATE_DISPATCH",

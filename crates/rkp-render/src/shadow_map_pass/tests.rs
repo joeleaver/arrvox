@@ -18,27 +18,27 @@ fn assert_wgsl_valid(label: &str, src: &str) {
 
 #[test]
 fn shadow_clear_shader_is_valid_wgsl() {
-    assert_wgsl_valid("shadow_clear", include_str!("../shaders/shadow_clear.wgsl"));
+    assert_wgsl_valid("shadow_clear", wesl::include_wesl!("shadow_clear"));
 }
 
 #[test]
 fn shadow_scatter_setup_shader_is_valid_wgsl() {
-    assert_wgsl_valid("shadow_scatter_setup", include_str!("../shaders/shadow_scatter_setup.wgsl"));
+    assert_wgsl_valid("shadow_scatter_setup", wesl::include_wesl!("shadow_scatter_setup"));
 }
 
 #[test]
 fn shadow_scatter_emit_shader_is_valid_wgsl() {
-    assert_wgsl_valid("shadow_scatter_emit", include_str!("../shaders/shadow_scatter_emit.wgsl"));
+    assert_wgsl_valid("shadow_scatter_emit", wesl::include_wesl!("shadow_scatter_emit"));
 }
 
 #[test]
 fn shadow_scatter_finalize_shader_is_valid_wgsl() {
-    assert_wgsl_valid("shadow_scatter_finalize", include_str!("../shaders/shadow_scatter_finalize.wgsl"));
+    assert_wgsl_valid("shadow_scatter_finalize", wesl::include_wesl!("shadow_scatter_finalize"));
 }
 
 #[test]
 fn shadow_scatter_shader_is_valid_wgsl() {
-    assert_wgsl_valid("shadow_scatter", include_str!("../shaders/shadow_scatter.wgsl"));
+    assert_wgsl_valid("shadow_scatter", wesl::include_wesl!("shadow_scatter"));
 }
 
 #[test]

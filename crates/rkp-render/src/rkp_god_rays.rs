@@ -103,7 +103,7 @@ impl RkpGodRayPass {
 
         let (output_texture, output_view) = Self::create_output(device, width, height);
 
-        let shader_src = include_str!("shaders/rkp_god_rays.wgsl");
+        let shader_src = wesl::include_wesl!("rkp_god_rays");
         validate_wgsl(shader_src, "rkp_god_rays");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rkp_god_rays"),

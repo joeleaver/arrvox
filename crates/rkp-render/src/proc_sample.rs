@@ -120,9 +120,9 @@ pub struct GpuEvaluator {
 
 impl GpuEvaluator {
     pub fn new(device: &wgpu::Device) -> Self {
-        let types_src = include_str!("shaders/proc_eval_types.wgsl");
-        let sample_src = include_str!("shaders/proc_sample.wgsl");
-        let eval_src = include_str!("shaders/proc_eval.wgsl");
+        let types_src = include_str!("shaders/proc_eval_types.wesl");
+        let sample_src = include_str!("shaders/proc_sample.wesl");
+        let eval_src = include_str!("shaders/proc_eval.wesl");
         let shader_src = format!("{types_src}\n{sample_src}\n{eval_src}");
         validate_wgsl(&shader_src, "proc_sample");
 
