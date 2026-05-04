@@ -74,3 +74,28 @@ struct RkpInstance {
     overlay_offset: u32,
     overlay_count: u32,
 }
+
+// GPU material record (96 bytes). CPU-side mirror is
+// `rkp_scene::GpuMaterial`; field order locked by `bytemuck` cast.
+//
+// NOTE: rkp_shade.wesl and rkp_glass.wesl declare a *separate* `Material`
+// struct (similar shape, different padding tail, currently diverged
+// from each other on `instance_shader_id`). Unifying `Material` ↔
+// `GpuMaterial` is its own refactor — out of scope for this module.
+struct GpuMaterial {
+    albedo_r: f32, albedo_g: f32, albedo_b: f32,
+    roughness: f32,
+    metallic: f32,
+    emission_r: f32, emission_g: f32, emission_b: f32,
+    emission_strength: f32,
+    subsurface: f32,
+    subsurface_r: f32, subsurface_g: f32, subsurface_b: f32,
+    opacity: f32,
+    ior: f32,
+    noise_scale: f32,
+    noise_strength: f32,
+    noise_channels: u32,
+    shader_id: u32,
+    instance_shader_id: u32,
+    _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32,
+}

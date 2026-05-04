@@ -36,6 +36,7 @@ import package::lib::types::OctreeResult;
 import package::lib::types::LeafAttr;
 import package::lib::types::BandCell;
 import package::lib::types::RkpInstance;
+import package::lib::types::GpuMaterial;
 const BRICK_DIM: u32 = 4u;
 const BRICK_DIM_F: f32 = 4.0;
 const BRICK_CELLS: u32 = 64u;
@@ -116,24 +117,6 @@ struct InstanceHit {
 
 // vec3 fields flattened to f32 — see rkp_shade.wgsl for the
 // rationale (96 B vs 128 B padded).
-struct GpuMaterial {
-    albedo_r: f32, albedo_g: f32, albedo_b: f32,
-    roughness: f32,
-    metallic: f32,
-    emission_r: f32, emission_g: f32, emission_b: f32,
-    emission_strength: f32,
-    subsurface: f32,
-    subsurface_r: f32, subsurface_g: f32, subsurface_b: f32,
-    opacity: f32,
-    ior: f32,
-    noise_scale: f32,
-    noise_strength: f32,
-    noise_channels: u32,
-    shader_id: u32,
-    instance_shader_id: u32,
-    _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32,
-}
-
 // Subset of the primary `MarchParams` — only the fields the band-
 // cell dispatch needs (time + asset_count). Layout is the leading
 // portion of the full uniform; we declare a tight wrapper here to

@@ -29,6 +29,7 @@ import package::lib::types::LeafAttr;
 import package::lib::types::leaf_attr_material_primary;
 import package::lib::types::BandCell;
 import package::lib::types::RkpInstance;
+import package::lib::types::GpuMaterial;
 // Shadow rays scan every object every ray — AABB misses short-circuit
 // cheaply, and shadow rays go in arbitrary directions so the march
 // pass's screen-space per-tile lists don't apply.
@@ -112,24 +113,6 @@ struct GpuLight {
 // vec3 fields flattened to f32 components — see rkp_shade.wgsl for the
 // full rationale (WGSL vec3 alignment would pad this to 128 bytes, but
 // the Rust/GpuMaterial is tightly packed at 96).
-struct GpuMaterial {
-    albedo_r: f32, albedo_g: f32, albedo_b: f32,
-    roughness: f32,
-    metallic: f32,
-    emission_r: f32, emission_g: f32, emission_b: f32,
-    emission_strength: f32,
-    subsurface: f32,
-    subsurface_r: f32, subsurface_g: f32, subsurface_b: f32,
-    opacity: f32,
-    ior: f32,
-    noise_scale: f32,
-    noise_strength: f32,
-    noise_channels: u32,
-    shader_id: u32,
-    instance_shader_id: u32,
-    _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32,
-}
-
 // Phase B-redux 3b — band-cell wire format. Mirrors
 // `octree_march.wgsl::BandCell` (and the Rust `GpuBandCell` it
 // targets). Each band cell's payload reinterprets two consecutive
