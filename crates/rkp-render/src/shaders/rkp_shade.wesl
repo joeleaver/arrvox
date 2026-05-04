@@ -17,6 +17,7 @@ import package::lib::atmosphere::rayleigh_phase;
 import package::lib::atmosphere::cornette_shanks;
 import package::lib::math::ray_sphere;
 import package::lib::types::GpuMaterial;
+import package::lib::types::mat_albedo;
 
 const PI: f32 = 3.14159265;
 
@@ -158,9 +159,6 @@ const ISOLATION_AMBIENT: vec3<f32> = vec3<f32>(0.4, 0.4, 0.4);
 // three f32 components to keep the WGSL and Rust layouts in lockstep at
 // 96 bytes.
 
-fn mat_albedo(m: GpuMaterial) -> vec3<f32> {
-    return vec3<f32>(m.albedo_r, m.albedo_g, m.albedo_b);
-}
 fn mat_emission(m: GpuMaterial) -> vec3<f32> {
     return vec3<f32>(m.emission_r, m.emission_g, m.emission_b);
 }

@@ -30,6 +30,7 @@ import package::lib::types::leaf_attr_material_primary;
 import package::lib::types::BandCell;
 import package::lib::types::RkpInstance;
 import package::lib::types::GpuMaterial;
+import package::lib::types::mat_albedo;
 // Shadow rays scan every object every ray — AABB misses short-circuit
 // cheaply, and shadow rays go in arbitrary directions so the march
 // pass's screen-space per-tile lists don't apply.
@@ -331,9 +332,6 @@ fn descend_proto_octree(
     return r;
 }
 
-fn mat_albedo(m: GpuMaterial) -> vec3<f32> {
-    return vec3<f32>(m.albedo_r, m.albedo_g, m.albedo_b);
-}
 
 // Opacity extinction reference: opacity=X over glass this thick gives
 // transmittance `1 - X` at full density, matching the primary pass's

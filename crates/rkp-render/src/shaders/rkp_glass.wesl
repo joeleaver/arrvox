@@ -19,6 +19,7 @@
 
 import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::types::GpuMaterial;
+import package::lib::types::mat_albedo;
 
 const PI: f32 = 3.14159265358979323846;
 
@@ -73,9 +74,6 @@ struct ShadeParams {
 @group(0) @binding(5) var<uniform> shade_params: ShadeParams;
 @group(0) @binding(6) var<storage, read> lights: array<Light>;
 
-fn mat_albedo(m: GpuMaterial) -> vec3<f32> {
-    return vec3<f32>(m.albedo_r, m.albedo_g, m.albedo_b);
-}
 
 // `unpack_oct_normal` is imported from `lib::oct_normal` at the top.
 // Wave A2: this site previously used a Variant-B copy without the

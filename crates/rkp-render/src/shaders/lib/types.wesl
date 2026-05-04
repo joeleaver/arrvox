@@ -99,3 +99,7 @@ struct GpuMaterial {
     instance_shader_id: u32,
     _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32,
 }
+
+fn mat_albedo(m: GpuMaterial) -> vec3<f32> {
+    return vec3<f32>(m.albedo_r, m.albedo_g, m.albedo_b);
+}
