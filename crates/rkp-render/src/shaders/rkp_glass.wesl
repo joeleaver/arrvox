@@ -18,6 +18,7 @@
 // Non-glass pixels pass through unchanged.
 
 import package::lib::oct_normal::unpack_oct_normal;
+import package::lib::types::GpuMaterial;
 
 const PI: f32 = 3.14159265358979323846;
 
@@ -38,22 +39,6 @@ struct CameraUniforms {
 }
 
 // vec3 fields flattened to f32 channels — see rkp_shade.wgsl for why.
-struct Material {
-    albedo_r: f32, albedo_g: f32, albedo_b: f32,
-    roughness: f32,
-    metallic: f32,
-    emission_r: f32, emission_g: f32, emission_b: f32,
-    emission_strength: f32,
-    subsurface: f32,
-    subsurface_r: f32, subsurface_g: f32, subsurface_b: f32,
-    opacity: f32,
-    ior: f32,
-    noise_scale: f32,
-    noise_strength: f32,
-    noise_channels: u32,
-    shader_id: u32,
-    _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32, _pad5: f32,
-}
 
 // Mirrors rkp_shade.wgsl's Light layout (position.w encodes type).
 struct Light {
@@ -84,11 +69,11 @@ struct ShadeParams {
 @group(0) @binding(1) var gbuf_glass: texture_2d<u32>;
 @group(0) @binding(2) var hdr_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(3) var<uniform> camera: CameraUniforms;
-@group(0) @binding(4) var<storage, read> materials: array<Material>;
+@group(0) @binding(4) var<storage, read> materials: array<GpuMaterial>;
 @group(0) @binding(5) var<uniform> shade_params: ShadeParams;
 @group(0) @binding(6) var<storage, read> lights: array<Light>;
 
-fn mat_albedo(m: Material) -> vec3<f32> {
+fn mat_albedo(m: GpuMaterial) -> vec3<f32> {
     return vec3<f32>(m.albedo_r, m.albedo_g, m.albedo_b);
 }
 

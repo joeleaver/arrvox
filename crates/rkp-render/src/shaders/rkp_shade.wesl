@@ -16,6 +16,7 @@ import package::lib::atmosphere::transmittance_params_to_uv;
 import package::lib::atmosphere::rayleigh_phase;
 import package::lib::atmosphere::cornette_shanks;
 import package::lib::math::ray_sphere;
+import package::lib::types::GpuMaterial;
 
 const PI: f32 = 3.14159265;
 
@@ -156,31 +157,14 @@ const ISOLATION_AMBIENT: vec3<f32> = vec3<f32>(0.4, 0.4, 0.4);
 // to 128 bytes — so on the shader side every 3-vector is spelled out as
 // three f32 components to keep the WGSL and Rust layouts in lockstep at
 // 96 bytes.
-struct Material {
-    albedo_r: f32, albedo_g: f32, albedo_b: f32,
-    roughness: f32,
-    metallic: f32,
-    emission_r: f32, emission_g: f32, emission_b: f32,
-    emission_strength: f32,
-    subsurface: f32,
-    subsurface_r: f32, subsurface_g: f32, subsurface_b: f32,
-    opacity: f32,
-    ior: f32,
-    noise_scale: f32,
-    noise_strength: f32,
-    noise_channels: u32,
-    shader_id: u32,
-    instance_shader_id: u32,
-    _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32,
-}
 
-fn mat_albedo(m: Material) -> vec3<f32> {
+fn mat_albedo(m: GpuMaterial) -> vec3<f32> {
     return vec3<f32>(m.albedo_r, m.albedo_g, m.albedo_b);
 }
-fn mat_emission(m: Material) -> vec3<f32> {
+fn mat_emission(m: GpuMaterial) -> vec3<f32> {
     return vec3<f32>(m.emission_r, m.emission_g, m.emission_b);
 }
-fn mat_subsurface_color(m: Material) -> vec3<f32> {
+fn mat_subsurface_color(m: GpuMaterial) -> vec3<f32> {
     return vec3<f32>(m.subsurface_r, m.subsurface_g, m.subsurface_b);
 }
 
@@ -231,7 +215,7 @@ struct LightCameraShade {
 // Group 3: shading params + lights + materials + user-shader params
 @group(3) @binding(0) var<uniform> shade_params: ShadeParams;
 @group(3) @binding(1) var<storage, read> lights: array<Light>;
-@group(3) @binding(2) var<storage, read> materials: array<Material>;
+@group(3) @binding(2) var<storage, read> materials: array<GpuMaterial>;
 @group(3) @binding(3) var<storage, read> shader_params: array<ShaderParamsSlot>;
 
 // Group 4: camera
