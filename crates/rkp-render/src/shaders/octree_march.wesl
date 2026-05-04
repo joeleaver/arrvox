@@ -7,6 +7,7 @@
 import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::oct_normal::pack_oct_normal;
 import package::lib::math::mat4_affine_inverse;
+import package::lib::octree::skip_node;
 import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
 import package::lib::octree_slot::OCTREE_LEAF_BIT;
@@ -835,16 +836,7 @@ fn read_band_cell(band_off: u32) -> BandCell {
 
 // Skip past an empty/interior node's region along the ray.
 // Uses DDA exit: find the nearest axis-aligned plane the ray crosses to leave this node.
-fn skip_node(pos: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, node_depth: u32, extent: f32, vs: f32) -> f32 {
-    let node_size = extent / f32(1u << node_depth);
-    let node_min = floor(pos / node_size) * node_size;
-    let node_max = node_min + node_size;
-    // Exit planes: for positive dir, exit through max; for negative, through min.
-    let t_exit = select((node_min - pos) * inv_dir, (node_max - pos) * inv_dir, dir > vec3<f32>(0.0));
-    // Smallest positive exit = nearest boundary crossing.
-    let t_pos = max(t_exit, vec3<f32>(1e-6));
-    return min(min(t_pos.x, t_pos.y), t_pos.z) + vs * 0.01;
-}
+// `skip_node` is imported from `lib::octree` at the top.
 
 // `unpack_oct_normal` and `pack_oct_normal` are imported from
 // `lib::oct_normal` at the top of this file.

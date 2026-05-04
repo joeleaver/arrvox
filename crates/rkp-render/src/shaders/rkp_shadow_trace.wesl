@@ -13,6 +13,7 @@
 
 import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::math::mat4_affine_inverse;
+import package::lib::octree::skip_node;
 import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
 import package::lib::octree_slot::OCTREE_LEAF_BIT;
@@ -646,14 +647,7 @@ fn dispatch_user_instance_descend(
 }
 const USER_INSTANCE_AT_DISPATCH_END: u32 = 0u;
 
-fn skip_node(pos: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, node_depth: u32, extent: f32, vs: f32) -> f32 {
-    let node_size = extent / f32(1u << node_depth);
-    let node_min = floor(pos / node_size) * node_size;
-    let node_max = node_min + node_size;
-    let t_exit = select((node_min - pos) * inv_dir, (node_max - pos) * inv_dir, dir > vec3<f32>(0.0));
-    let t_pos = max(t_exit, vec3<f32>(1e-6));
-    return min(min(t_pos.x, t_pos.y), t_pos.z) + vs * 0.01;
-}
+// `skip_node` is imported from `lib::octree` at the top.
 
 // ── Skinned-object shadow branch ────────────────────────────────────
 //

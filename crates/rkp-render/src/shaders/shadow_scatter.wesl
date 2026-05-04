@@ -21,6 +21,7 @@
 
 import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::math::mat4_affine_inverse;
+import package::lib::octree::skip_node;
 import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
 import package::lib::octree_slot::OCTREE_LEAF_BIT;
@@ -373,7 +374,7 @@ fn descend_proto_octree(
         let lookup = octree_lookup_no_stats(root, max_depth, extent, pos);
 
         if lookup.slot == OCTREE_EMPTY {
-            t += skip_node_t(pos, safe_dir, inv_dir, lookup.depth, extent, vs);
+            t += skip_node(pos, safe_dir, inv_dir, lookup.depth, extent, vs);
             continue;
         }
         if lookup.slot == OCTREE_INTERIOR {
@@ -523,14 +524,9 @@ fn dispatch_user_instance_descend(
 }
 const USER_INSTANCE_AT_DISPATCH_END: u32 = 0u;
 
-fn skip_node_t(pos: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, node_depth: u32, extent: f32, vs: f32) -> f32 {
-    let node_size = extent / f32(1u << node_depth);
-    let node_min = floor(pos / node_size) * node_size;
-    let node_max = node_min + node_size;
-    let t_exit = select((node_min - pos) * inv_dir, (node_max - pos) * inv_dir, dir > vec3<f32>(0.0));
-    let t_pos = max(t_exit, vec3<f32>(1e-6));
-    return min(min(t_pos.x, t_pos.y), t_pos.z) + vs * 0.01;
-}
+// `skip_node` (formerly `skip_node_t` here) is imported from
+// `lib::octree` at the top. The `_t` suffix was historical and
+// served no purpose — same body as `octree_march::skip_node`.
 
 
 const OCC_BRICK_DIM: i32 = 4;
@@ -670,7 +666,7 @@ fn find_hit_in_instance(
         let r = octree_lookup_no_stats(root, max_depth, extent, pos);
 
         if r.slot == OCTREE_EMPTY {
-            t += max(skip_node_t(pos, safe, inv_dir, r.depth, extent, vs), min_step);
+            t += max(skip_node(pos, safe, inv_dir, r.depth, extent, vs), min_step);
             continue;
         }
 
@@ -696,7 +692,7 @@ fn find_hit_in_instance(
                 }
             }
             if proto_idx == 0xFFFFFFFFu {
-                t += max(skip_node_t(pos, safe, inv_dir, r.depth, extent, vs), min_step);
+                t += max(skip_node(pos, safe, inv_dir, r.depth, extent, vs), min_step);
                 continue;
             }
             let proto_asset = assets[proto_idx];
@@ -741,7 +737,7 @@ fn find_hit_in_instance(
                 // dispatcher already returns world distance.
                 return inst_hit.world_t;
             }
-            t += max(skip_node_t(pos, safe, inv_dir, r.depth, extent, vs), min_step);
+            t += max(skip_node(pos, safe, inv_dir, r.depth, extent, vs), min_step);
             continue;
         }
 
