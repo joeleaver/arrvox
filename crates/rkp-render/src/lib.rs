@@ -151,22 +151,27 @@ impl Default for BuildPreviewMode {
     }
 }
 
-/// Validate WGSL source with naga at startup. Panics with a clear error message
-/// on shader bugs instead of producing cryptic "pipeline invalid" GPU errors.
-pub fn validate_wgsl(source: &str, label: &str) {
-    match naga::front::wgsl::parse_str(source) {
-        Ok(module) => {
-            let mut validator = naga::valid::Validator::new(
-                naga::valid::ValidationFlags::all(),
-                naga::valid::Capabilities::all(),
-            );
-            if let Err(e) = validator.validate(&module) {
-                eprintln!("[{label}] WGSL validation error: {e}");
-            }
-        }
-        Err(e) => {
-            let msg = e.emit_to_string(source);
-            eprintln!("[{label}] WGSL parse error:\n{msg}");
-        }
-    }
+/// Validate WGSL source with naga at startup.
+///
+/// Fail-fast on parse / validation errors so shader bugs surface
+/// here with attribution back to the labelled shader, instead of
+/// downstream as opaque "pipeline invalid" wgpu errors. Panics by
+/// design — every caller is on the renderer's startup path; a bad
+/// shader at this layer is unrecoverable.
+///
+/// Returns the validated `naga::Module` so callers that need it can
+/// reuse the parse without re-parsing.
+pub fn validate_wgsl(source: &str, label: &str) -> naga::Module {
+    let module = naga::front::wgsl::parse_str(source).unwrap_or_else(|e| {
+        let msg = e.emit_to_string(source);
+        panic!("[{label}] WGSL parse error:\n{msg}");
+    });
+    let mut validator = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    );
+    validator
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("[{label}] WGSL validation error: {e}"));
+    module
 }
