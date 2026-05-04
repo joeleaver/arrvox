@@ -35,6 +35,7 @@ import package::lib::octree_slot::slot_band_offset;
 import package::lib::types::OctreeResult;
 import package::lib::types::LeafAttr;
 import package::lib::types::BandCell;
+import package::lib::types::RkpInstance;
 const BRICK_DIM: u32 = 4u;
 const BRICK_DIM_F: f32 = 4.0;
 const BRICK_CELLS: u32 = 64u;
@@ -58,24 +59,6 @@ const NO_HIT_T: f32 = 1.0e20;
 const TLAS_LEAF_USER_SHADER: u32 = 0xFFFFFFFEu;
 const DISPATCH_X: u32 = 256u;
 
-struct RkpInstance {
-    world: mat4x4<f32>,
-    asset_id: u32,
-    material_id: u32,
-    object_id: u32,
-    layer_mask: u32,
-    is_skinned: u32,
-    bone_buffer_offset: u32,
-    bone_field_offset: u32,
-    bone_field_occ_offset: u32,
-    bone_field_dim_x: u32, bone_field_dim_y: u32,
-    bone_field_dim_z: u32,
-    bone_field_origin_x: f32,
-    bone_field_origin_y: f32,
-    bone_field_origin_z: f32,
-    overlay_offset: u32,
-    overlay_count: u32,
-}
 
 struct RkpAsset {
     aabb_min: vec3<f32>, octree_root: u32,

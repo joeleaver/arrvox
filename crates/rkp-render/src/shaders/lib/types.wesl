@@ -47,3 +47,30 @@ struct BandCell {
     anchor_world_pos: vec3<f32>,
     material_id: u32,
 }
+
+// One per scene instance. CPU-side mirror is `rkp_scene::GpuInstance`;
+// keep field order aligned with that struct (the layout is locked by
+// `bytemuck` casts on the Rust side).
+//
+// `overlay_offset`/`overlay_count` slice into the `instance_overlay`
+// binding for per-instance paint overlays — `overlay_count == 0` ⇒
+// unpainted, `fetch_leaf_attr` falls through to the asset's
+// `leaf_attr_pool[slot]`.
+struct RkpInstance {
+    world: mat4x4<f32>,
+    asset_id: u32,
+    material_id: u32,
+    object_id: u32,
+    layer_mask: u32,
+    is_skinned: u32,
+    bone_buffer_offset: u32,
+    bone_field_offset: u32,
+    bone_field_occ_offset: u32,
+    bone_field_dim_x: u32, bone_field_dim_y: u32,
+    bone_field_dim_z: u32,
+    bone_field_origin_x: f32,
+    bone_field_origin_y: f32,
+    bone_field_origin_z: f32,
+    overlay_offset: u32,
+    overlay_count: u32,
+}

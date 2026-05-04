@@ -22,6 +22,7 @@ import package::lib::types::OctreeResult;
 import package::lib::types::LeafAttr;
 import package::lib::types::leaf_attr_material_primary;
 import package::lib::types::BandCell;
+import package::lib::types::RkpInstance;
 
 const OPACITY_THRESHOLD: f32 = 0.05;
 // Safety-net ceiling for the outer ray-march loop. The ray already
@@ -66,27 +67,6 @@ const BRICK_MAX_STEPS: u32 = 4096u;
 // `crates/rkp-render/src/rkp_gpu_object.rs` for the Rust mirror.
 // Phase 2 dropped inverse_world — readers compute it on demand via
 // `mat4_affine_inverse(inst.world)`.
-struct RkpInstance {
-    world: mat4x4<f32>,
-    asset_id: u32,
-    material_id: u32,
-    object_id: u32,
-    layer_mask: u32,
-    is_skinned: u32,
-    bone_buffer_offset: u32,
-    bone_field_offset: u32,
-    bone_field_occ_offset: u32,
-    bone_field_dim_x: u32, bone_field_dim_y: u32,
-    bone_field_dim_z: u32,
-    bone_field_origin_x: f32,
-    bone_field_origin_y: f32,
-    bone_field_origin_z: f32,
-    // Per-instance paint overlay slice into `instance_overlay` (binding 13).
-    // overlay_count == 0 ⇒ unpainted ⇒ fetch_leaf_attr falls through to
-    // the asset's `leaf_attr_pool[slot]`. Phase 3 (project_phase_1_2_shipped).
-    overlay_offset: u32,
-    overlay_count: u32,
-}
 
 // Per-asset record (80 bytes). Deduped by `octree_root`; multiple
 // instances share one slot via `inst.asset_id`. Carries the skeleton

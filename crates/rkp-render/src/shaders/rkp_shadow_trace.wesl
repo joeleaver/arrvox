@@ -28,6 +28,7 @@ import package::lib::types::OctreeResult;
 import package::lib::types::LeafAttr;
 import package::lib::types::leaf_attr_material_primary;
 import package::lib::types::BandCell;
+import package::lib::types::RkpInstance;
 // Shadow rays scan every object every ray — AABB misses short-circuit
 // cheaply, and shadow rays go in arbitrary directions so the march
 // pass's screen-space per-tile lists don't apply.
@@ -54,25 +55,6 @@ const FACE_PZ: u32 = 5u;
 // Per-instance + per-asset records — see octree_march.wgsl for the
 // authoritative layouts. Shadow trace marches the same scene the primary
 // march does, so the structs and bindings mirror.
-struct RkpInstance {
-    world: mat4x4<f32>,
-    asset_id: u32,
-    material_id: u32,
-    object_id: u32,
-    layer_mask: u32,
-    is_skinned: u32,
-    bone_buffer_offset: u32,
-    bone_field_offset: u32,
-    bone_field_occ_offset: u32,
-    bone_field_dim_x: u32, bone_field_dim_y: u32,
-    bone_field_dim_z: u32,
-    bone_field_origin_x: f32,
-    bone_field_origin_y: f32,
-    bone_field_origin_z: f32,
-    // Per-instance paint overlay slice. See octree_march.wgsl for full notes.
-    overlay_offset: u32,
-    overlay_count: u32,
-}
 
 struct RkpAsset {
     aabb_min: vec3<f32>, octree_root: u32,
