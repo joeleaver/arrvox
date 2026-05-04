@@ -26,6 +26,8 @@
 // no chance of picking a neighbouring leaf's normal due to LBS
 // inexactness at joints.
 
+import package::lib::oct_normal::unpack_oct_normal;
+
 // ---- Scene bindings (reused from the main octree_march bind group) --
 // We don't need the full scene layout — just brick_pool, bone_matrices,
 // bone_weights. Using their stable binding numbers from `rkp_scene.rs`
@@ -442,23 +444,5 @@ fn main(
     }
 }
 
-// `unpack_oct_normal` — same as the one in `octree_march.wgsl`.
-// Duplicated so the scatter shader can decode the leaf's stored
-// rest-pose normal without dragging the whole march file in.
-fn unpack_oct_normal(packed: u32) -> vec3<f32> {
-    let ui_raw = i32(packed & 0xFFFFu);
-    let vi_raw = i32((packed >> 16u) & 0xFFFFu);
-    let ui = select(ui_raw, ui_raw - 65536, ui_raw >= 32768);
-    let vi = select(vi_raw, vi_raw - 65536, vi_raw >= 32768);
-    let u = clamp(f32(ui) / 32767.0, -1.0, 1.0);
-    let v = clamp(f32(vi) / 32767.0, -1.0, 1.0);
-    var n = vec3<f32>(u, v, 1.0 - abs(u) - abs(v));
-    if n.z < 0.0 {
-        let nx0 = n.x;
-        n.x = (1.0 - abs(n.y)) * select(-1.0, 1.0, nx0 >= 0.0);
-        n.y = (1.0 - abs(nx0)) * select(-1.0, 1.0, n.y >= 0.0);
-    }
-    let len = length(n);
-    if len < 1e-8 { return vec3<f32>(0.0, 1.0, 0.0); }
-    return n / len;
-}
+// `unpack_oct_normal` is provided by the lib::oct_normal import at the top
+// of this file.

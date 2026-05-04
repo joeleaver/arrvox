@@ -229,7 +229,7 @@ impl SkinDeformPass {
             mapped_at_creation: false,
         });
 
-        let shader_src = include_str!("shaders/skin_deform.wgsl");
+        let shader_src = wesl::include_wesl!("skin_deform");
         crate::validate_wgsl(shader_src, "skin_deform");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("skin_deform"),
@@ -386,7 +386,7 @@ impl SkinDeformPass {
 mod tests {
     #[test]
     fn skin_deform_shader_is_valid_wgsl() {
-        let src = include_str!("shaders/skin_deform.wgsl");
+        let src = wesl::include_wesl!("skin_deform");
         let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| {
             panic!("skin_deform.wgsl parse error: {}", e.emit_to_string(src));
         });

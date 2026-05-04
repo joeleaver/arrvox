@@ -19,3 +19,7 @@ pollster = { workspace = true }
 rayon = { workspace = true }
 wgpu-profiler = { workspace = true }
 naga = { workspace = true }
+wesl = { workspace = true }
+
+[build-dependencies]
+wesl = { workspace = true }
