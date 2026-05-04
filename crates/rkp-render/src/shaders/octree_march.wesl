@@ -4,6 +4,9 @@
 // EMPTY nodes at coarse depth levels let us skip large regions in one step.
 // Surface detected at first occupied voxel (opacity > threshold).
 
+import package::lib::oct_normal::unpack_oct_normal;
+import package::lib::oct_normal::pack_oct_normal;
+
 const OCTREE_EMPTY: u32 = 0xFFFFFFFFu;
 const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
 const OCTREE_LEAF_BIT: u32 = 0x80000000u;
@@ -880,25 +883,8 @@ fn skip_node(pos: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, node_depth: u32
     return min(min(t_pos.x, t_pos.y), t_pos.z) + vs * 0.01;
 }
 
-// Decode a packed 2× snorm16 octahedral normal. Mirror of rkp_core::unpack_oct.
-fn unpack_oct_normal(packed: u32) -> vec3<f32> {
-    let ui_raw = i32(packed & 0xFFFFu);
-    let vi_raw = i32((packed >> 16u) & 0xFFFFu);
-    // snorm16: interpret as i16 (sign-extend the 16-bit value).
-    let ui = select(ui_raw, ui_raw - 65536, ui_raw >= 32768);
-    let vi = select(vi_raw, vi_raw - 65536, vi_raw >= 32768);
-    let u = clamp(f32(ui) / 32767.0, -1.0, 1.0);
-    let v = clamp(f32(vi) / 32767.0, -1.0, 1.0);
-    var n = vec3<f32>(u, v, 1.0 - abs(u) - abs(v));
-    if n.z < 0.0 {
-        let nx0 = n.x;
-        n.x = (1.0 - abs(n.y)) * select(-1.0, 1.0, nx0 >= 0.0);
-        n.y = (1.0 - abs(nx0)) * select(-1.0, 1.0, n.y >= 0.0);
-    }
-    let len = length(n);
-    if len < 1e-8 { return vec3<f32>(0.0, 1.0, 0.0); }
-    return n / len;
-}
+// `unpack_oct_normal` and `pack_oct_normal` are imported from
+// `lib::oct_normal` at the top of this file.
 
 // --- Accumulating march (per object) ---
 //
@@ -959,24 +945,7 @@ struct MarchResult {
     user_shader_material_id: u32,
 }
 
-// Pack a unit normal into an oct u32 — mirror of `unpack_oct_normal`
-// above, same basis rkp_core / skin_deform use.
-fn pack_oct_normal(n: vec3<f32>) -> u32 {
-    let l1 = abs(n.x) + abs(n.y) + abs(n.z);
-    let n1 = n / max(l1, 1e-8);
-    var u = n1.x;
-    var v = n1.y;
-    if n1.z < 0.0 {
-        let ox = u;
-        u = (1.0 - abs(v)) * select(-1.0, 1.0, ox >= 0.0);
-        v = (1.0 - abs(ox)) * select(-1.0, 1.0, v  >= 0.0);
-    }
-    let ui = i32(clamp(u, -1.0, 1.0) * 32767.0);
-    let vi = i32(clamp(v, -1.0, 1.0) * 32767.0);
-    let ul = u32(ui & 0xFFFF);
-    let vl = u32(vi & 0xFFFF);
-    return ul | (vl << 16u);
-}
+// `pack_oct_normal` is imported from `lib::oct_normal` at the top.
 
 // ── Phase-3b: skinned march — deformed-field lookup ──────────────────
 //

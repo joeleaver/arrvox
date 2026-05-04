@@ -19,6 +19,8 @@
 // come from the finalize pass via `dispatch_workgroups_indirect`,
 // so the CPU never reads back the work count.
 
+import package::lib::oct_normal::unpack_oct_normal;
+
 const OCTREE_EMPTY: u32 = 0xFFFFFFFFu;
 const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
 const OCTREE_LEAF_BIT: u32 = 0x80000000u;
@@ -354,25 +356,8 @@ fn read_band_cell(band_off: u32) -> BandCell {
 
 const MAX_STEPS_PROTO: u32 = 4096u;
 
-// Decode an octahedrally-packed surface normal stored in `LeafAttr.normal_oct`.
-// Mirrors `octree_march.wgsl::unpack_oct_normal`.
-fn unpack_oct_normal(packed: u32) -> vec3<f32> {
-    let ui_raw = i32(packed & 0xFFFFu);
-    let vi_raw = i32((packed >> 16u) & 0xFFFFu);
-    let ui = select(ui_raw, ui_raw - 65536, ui_raw >= 32768);
-    let vi = select(vi_raw, vi_raw - 65536, vi_raw >= 32768);
-    let u = clamp(f32(ui) / 32767.0, -1.0, 1.0);
-    let v = clamp(f32(vi) / 32767.0, -1.0, 1.0);
-    var n = vec3<f32>(u, v, 1.0 - abs(u) - abs(v));
-    if n.z < 0.0 {
-        let nx0 = n.x;
-        n.x = (1.0 - abs(n.y)) * select(-1.0, 1.0, nx0 >= 0.0);
-        n.y = (1.0 - abs(nx0)) * select(-1.0, 1.0, n.y >= 0.0);
-    }
-    let len = length(n);
-    if len < 1e-8 { return vec3<f32>(0.0, 1.0, 0.0); }
-    return n / len;
-}
+// `unpack_oct_normal` is imported from `lib::oct_normal` at the top
+// of this file.
 
 // Prototype-octree descent, adapted from `octree_march.wgsl::descend_proto_octree`
 // to call shadow_scatter's `octree_lookup_no_stats` (4 args, no LOD) and

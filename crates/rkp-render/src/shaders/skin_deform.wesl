@@ -27,6 +27,7 @@
 // inexactness at joints.
 
 import package::lib::oct_normal::unpack_oct_normal;
+import package::lib::oct_normal::pack_oct_normal;
 
 // ---- Scene bindings (reused from the main octree_march bind group) --
 // We don't need the full scene layout — just brick_pool, bone_matrices,
@@ -294,27 +295,8 @@ fn forward_rotate_normal(
     return rest_normal;
 }
 
-// Pack a unit normal into an oct u32 — matches
-// `rkp_core::leaf_attr::pack_oct` so the main march can decode it
-// with its existing `unpack_oct_normal`.
-fn pack_oct_normal(n: vec3<f32>) -> u32 {
-    let l1 = abs(n.x) + abs(n.y) + abs(n.z);
-    let n1 = n / max(l1, 1e-8);
-    var u = n1.x;
-    var v = n1.y;
-    if n1.z < 0.0 {
-        let ox = u;
-        u = (1.0 - abs(v)) * select(-1.0, 1.0, ox >= 0.0);
-        v = (1.0 - abs(ox)) * select(-1.0, 1.0, v  >= 0.0);
-    }
-    // Quantise to snorm16 (sign-extended i16 values round-tripped
-    // through `unpack_oct_normal` on the read side).
-    let ui = i32(clamp(u, -1.0, 1.0) * 32767.0);
-    let vi = i32(clamp(v, -1.0, 1.0) * 32767.0);
-    let ul = u32(ui & 0xFFFF);
-    let vl = u32(vi & 0xFFFF);
-    return ul | (vl << 16u);
-}
+// `pack_oct_normal` is imported from `lib::oct_normal` at the top
+// of this file.
 
 @compute @workgroup_size(4, 4, 4)
 fn main(

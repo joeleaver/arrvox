@@ -22,3 +22,22 @@ fn unpack_oct_normal(packed: u32) -> vec3<f32> {
     if len < 1e-8 { return vec3<f32>(0.0, 1.0, 0.0); }
     return n / len;
 }
+
+// Pack a unit normal into the same 2× snorm16 octahedral u32 form
+// `unpack_oct_normal` decodes. Matches `rkp_core::leaf_attr::pack_oct`.
+fn pack_oct_normal(n: vec3<f32>) -> u32 {
+    let l1 = abs(n.x) + abs(n.y) + abs(n.z);
+    let n1 = n / max(l1, 1e-8);
+    var u = n1.x;
+    var v = n1.y;
+    if n1.z < 0.0 {
+        let ox = u;
+        u = (1.0 - abs(v)) * select(-1.0, 1.0, ox >= 0.0);
+        v = (1.0 - abs(ox)) * select(-1.0, 1.0, v  >= 0.0);
+    }
+    let ui = i32(clamp(u, -1.0, 1.0) * 32767.0);
+    let vi = i32(clamp(v, -1.0, 1.0) * 32767.0);
+    let ul = u32(ui & 0xFFFF);
+    let vl = u32(vi & 0xFFFF);
+    return ul | (vl << 16u);
+}
