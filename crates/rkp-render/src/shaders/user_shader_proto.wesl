@@ -43,6 +43,7 @@ import package::lib::octree_slot::OCTREE_BRICK_BIT;
 import package::lib::octree_slot::OCTREE_BAND_BIT;
 import package::lib::octree_slot::OCTREE_PAYLOAD_MASK;
 import package::lib::types::LeafAttr;
+import package::lib::types::VoxelEmit;
 
 const BRICK_DIM: u32 = 4u;
 const BRICK_CELLS: u32 = 64u;
@@ -54,13 +55,6 @@ const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;
 const OVERFLOW_BRICK: u32 = 1u;
 const OVERFLOW_LEAF_ATTR: u32 = 2u;
 
-struct VoxelEmit {
-    occupancy: u32,
-    normal: vec3<f32>,
-    material_primary: u32,
-    material_secondary: u32,
-    blend_weight: u32,
-}
 
 // One prototype to bake this dispatch. The Rust pass writes one of
 // these per dirty shader and dispatches with it bound at group(1).

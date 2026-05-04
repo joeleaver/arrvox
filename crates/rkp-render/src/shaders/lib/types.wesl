@@ -1,16 +1,14 @@
 // Shared GPU type definitions.
 //
-// IMPORTANT — splice-chunk types stay LOCAL.
-// `HostSample`, `UserCtx`, `VoxelEmit`, `ShadeCtx`, `ShadeResult`, `Aabb`,
-// `RkpAsset`, `Material` are all referenced by `shader_composer/compose.rs`
-// in spliced text chunks. WESL mangles imported symbols at emit time, but
-// the splice chunk arrives as raw text using unmangled names; resolving
-// the mismatch requires either Phase 4 (WESL-native composition) or
-// emitting mangled names from compose.rs. Until then, those types must
-// be declared in each splice-consumer file.
-//
-// Grep `crates/rkp-render/src/shader_composer/compose.rs` before adding
-// any type to this module. If the type name appears there, keep it local.
+// As of Wave V, the build runs WESL with `ManglerKind::None`, so every
+// imported identifier appears in the emitted artifact under its original
+// name. Types splice-referenced by `shader_composer/compose.rs` (Aabb,
+// HostSample, UserCtx, VoxelEmit, RkpAsset, InstanceHit, ShadeCtx,
+// ShadeResult, Material) can therefore live in this module the same as
+// any other type — the splice chunks resolve them through the import
+// just like local declarations. The trade-off is that root-level
+// identifiers must be unique across each emitted artifact; build-time
+// naga validation catches collisions immediately.
 
 // Result of an octree descent: the terminating slot, the depth at which
 // it terminated, and the spatial bounds of the terminating cell in
@@ -333,6 +331,72 @@ struct GpuLight {
     color: vec4<f32>,
     direction: vec4<f32>,
     params: vec4<f32>,
+}
+
+// World-space axis-aligned bounding box.
+struct Aabb {
+    min: vec3<f32>,
+    max: vec3<f32>,
+}
+
+// User-shader sampling context. Threaded through `dispatch_user_generate`
+// and `dispatch_user_shade` to give shader bodies access to per-cell
+// metadata (cell size, painted material, region origin, frame time,
+// per-shader scalar params). `params[0..8]` mirrors the 8 scalar slots
+// the editor surfaces per shader.
+struct UserCtx {
+    time: f32,
+    cell_size: f32,
+    material_id: u32,
+    aabb_min: vec3<f32>,
+    params: array<f32, 8>,
+}
+
+// Sample of the host (parent voxel grid) at a world position. Returned
+// by `host_sample_at` / `host_sample_in_region`; consumed by
+// user-shader `instance_at` and `generate` hooks for grass-on-host
+// effects (gate emission on host material/normal/distance).
+struct HostSample {
+    distance: f32,
+    normal: vec3<f32>,
+    material: u32,
+    material_secondary: u32,
+    blend_weight: u32,
+}
+
+// What a `dispatch_user_generate` hook writes per cell. Occupancy bit
+// + normal + dual-material blend; the geom pass packs this into the
+// brick + leaf-attr pools. Splice consumers populate one of these in
+// the spliced shader body and return it.
+struct VoxelEmit {
+    occupancy: u32,
+    normal: vec3<f32>,
+    material_primary: u32,
+    material_secondary: u32,
+    blend_weight: u32,
+}
+
+// Per-asset metadata (one per imported model / generated mesh). CPU
+// mirror is `rkp_scene::GpuAsset`; the buffer is bound as
+// `assets: array<RkpAsset>` and indexed by `RkpInstance.asset_id`.
+struct RkpAsset {
+    aabb_min: vec3<f32>, octree_root: u32,
+    aabb_max: vec3<f32>, octree_depth: u32,
+    octree_extent_bits: u32, voxel_size: f32,
+    geom_type: u32, bone_count: u32,
+    grid_origin: vec3<f32>, rest_octree_root: u32,
+    rest_octree_depth: u32, rest_octree_extent_bits: u32,
+    shader_id: u32, _pad: u32,
+}
+
+// Per-pixel result of marching one user-shader instance prototype.
+// Populated by `dispatch_user_instance_descend` and merged into the
+// host hit by the composite pass.
+struct InstanceHit {
+    valid: bool,
+    world_t: f32,
+    world_pos: vec3<f32>,
+    world_normal: vec3<f32>,
 }
 
 struct ProcInstruction {

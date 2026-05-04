@@ -38,6 +38,11 @@ import package::lib::types::OverlayEntry;
 import package::lib::types::ProtoHit;
 import package::lib::types::MarchParams;
 import package::lib::types::GpuLight;
+import package::lib::types::Aabb;
+import package::lib::types::UserCtx;
+import package::lib::types::HostSample;
+import package::lib::types::RkpAsset;
+import package::lib::types::InstanceHit;
 // Shadow rays scan every object every ray — AABB misses short-circuit
 // cheaply, and shadow rays go in arbitrary directions so the march
 // pass's screen-space per-tile lists don't apply.
@@ -65,15 +70,6 @@ const FACE_PZ: u32 = 5u;
 // authoritative layouts. Shadow trace marches the same scene the primary
 // march does, so the structs and bindings mirror.
 
-struct RkpAsset {
-    aabb_min: vec3<f32>, octree_root: u32,
-    aabb_max: vec3<f32>, octree_depth: u32,
-    octree_extent_bits: u32, voxel_size: f32,
-    geom_type: u32, bone_count: u32,
-    grid_origin: vec3<f32>, rest_octree_root: u32,
-    rest_octree_depth: u32, rest_octree_extent_bits: u32,
-    shader_id: u32, _pad: u32,
-}
 
 
 // vec3 fields flattened to f32 components — see rkp_shade.wgsl for the
@@ -87,36 +83,12 @@ struct RkpAsset {
 // dispatch. Same shapes as octree_march.wgsl so the composer's
 // shared `dispatch_user_instance_descend` body splices in
 // unchanged. Wire-format with the corresponding Rust structs.
-struct HostSample {
-    distance: f32,
-    normal: vec3<f32>,
-    material: u32,
-    material_secondary: u32,
-    blend_weight: u32,
-}
 
-struct UserCtx {
-    time: f32,
-    cell_size: f32,
-    material_id: u32,
-    aabb_min: vec3<f32>,
-    params: array<f32, 8>,
-}
 
-struct InstanceHit {
-    valid: bool,
-    world_t: f32,
-    world_pos: vec3<f32>,
-    world_normal: vec3<f32>,
-}
 
 // World-space AABB returned by per-shader `inst_aabb` hooks. Mirrors
 // `octree_march.wgsl::Aabb`; needed here because the composer-emitted
 // `rkp_user_<id>_inst_aabb` body returns this type.
-struct Aabb {
-    min: vec3<f32>,
-    max: vec3<f32>,
-}
 
 // MAX_STEPS for `descend_proto_octree`'s outer DDA loop. Protos are
 // small (max_depth ≤ 8) so the cap rarely matters in practice.

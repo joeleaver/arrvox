@@ -42,6 +42,11 @@ import package::lib::types::OverlayEntry;
 import package::lib::types::ScatterInstance;
 import package::lib::types::ProtoHit;
 import package::lib::types::LightCameraShadow;
+import package::lib::types::Aabb;
+import package::lib::types::UserCtx;
+import package::lib::types::HostSample;
+import package::lib::types::RkpAsset;
+import package::lib::types::InstanceHit;
 const BRICK_DIM: u32 = 4u;
 const BRICK_DIM_F: f32 = 4.0;
 const BRICK_CELLS: u32 = 64u;
@@ -66,43 +71,14 @@ const TLAS_LEAF_USER_SHADER: u32 = 0xFFFFFFFEu;
 const DISPATCH_X: u32 = 256u;
 
 
-struct RkpAsset {
-    aabb_min: vec3<f32>, octree_root: u32,
-    aabb_max: vec3<f32>, octree_depth: u32,
-    octree_extent_bits: u32, voxel_size: f32,
-    geom_type: u32, bone_count: u32,
-    grid_origin: vec3<f32>, rest_octree_root: u32,
-    rest_octree_depth: u32, rest_octree_extent_bits: u32,
-    shader_id: u32, _pad: u32,
-}
 
 // Phase B-redux 3b — band-cell wire format. Mirrors
 // octree_march.wgsl::BandCell.
 // Phase 4 — user-shader-facing types for the band-cell shadow
 // dispatch. Same shapes as octree_march.wgsl so the composer's
 // `dispatch_user_instance_descend` body splices in unchanged.
-struct HostSample {
-    distance: f32,
-    normal: vec3<f32>,
-    material: u32,
-    material_secondary: u32,
-    blend_weight: u32,
-}
 
-struct UserCtx {
-    time: f32,
-    cell_size: f32,
-    material_id: u32,
-    aabb_min: vec3<f32>,
-    params: array<f32, 8>,
-}
 
-struct InstanceHit {
-    valid: bool,
-    world_t: f32,
-    world_pos: vec3<f32>,
-    world_normal: vec3<f32>,
-}
 
 // vec3 fields flattened to f32 — see rkp_shade.wgsl for the
 // rationale (96 B vs 128 B padded).
@@ -125,10 +101,6 @@ struct MarchParamsLite {
     _pad0: u32,
 }
 
-struct Aabb {
-    min: vec3<f32>,
-    max: vec3<f32>,
-}
 
 // Group 0 — scene resources.
 @group(0) @binding(0) var<storage, read> brick_pool: array<u32>;

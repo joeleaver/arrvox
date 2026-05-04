@@ -59,6 +59,9 @@
 
 import package::lib::types::LeafAttr;
 import package::lib::types::OverlayEntry;
+import package::lib::types::UserCtx;
+import package::lib::types::HostSample;
+import package::lib::types::VoxelEmit;
 
 const BRICK_DIM: u32 = 4u;
 const BRICK_CELLS: u32 = 64u;
@@ -88,29 +91,8 @@ const SQRT3: f32 = 1.7320508075688772f;
 
 const HOST_NO_HOST_SENTINEL: u32 = 0xFFFFFFFFu;
 
-struct HostSample {
-    distance: f32,
-    normal: vec3<f32>,
-    material: u32,
-    material_secondary: u32,
-    blend_weight: u32,
-}
 
-struct UserCtx {
-    time: f32,
-    cell_size: f32,
-    material_id: u32,
-    aabb_min: vec3<f32>,
-    params: array<f32, 8>,
-}
 
-struct VoxelEmit {
-    occupancy: u32,
-    normal: vec3<f32>,
-    material_primary: u32,
-    material_secondary: u32,
-    blend_weight: u32,
-}
 
 // One "active" octree node awaiting classification at level L. The Rust
 // side seeds active_queue[level=0] with one root cell per region; each

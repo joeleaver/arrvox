@@ -29,6 +29,11 @@ import package::lib::types::OverlayEntry;
 import package::lib::types::ProtoHit;
 import package::lib::types::MarchParams;
 import package::lib::types::GpuLight;
+import package::lib::types::Aabb;
+import package::lib::types::UserCtx;
+import package::lib::types::HostSample;
+import package::lib::types::RkpAsset;
+import package::lib::types::InstanceHit;
 
 const OPACITY_THRESHOLD: f32 = 0.05;
 // Safety-net ceiling for the outer ray-march loop. The ray already
@@ -81,15 +86,6 @@ const BRICK_MAX_STEPS: u32 = 4096u;
 // per-frame skin plan succeeding. `shader_id`: 0 = standard host
 // asset, >0 = user-shader prototype octree consumed by the
 // band-cell descent path (`dispatch_user_instance_descend`).
-struct RkpAsset {
-    aabb_min: vec3<f32>, octree_root: u32,
-    aabb_max: vec3<f32>, octree_depth: u32,
-    octree_extent_bits: u32, voxel_size: f32,
-    geom_type: u32, bone_count: u32,
-    grid_origin: vec3<f32>, rest_octree_root: u32,
-    rest_octree_depth: u32, rest_octree_extent_bits: u32,
-    shader_id: u32, _pad: u32,
-}
 
 // Render-layer + focus gate. An object is visible in this viewport iff its
 // layer mask intersects the camera's mask, OR its object_id matches the
@@ -264,10 +260,6 @@ fn fetch_leaf_color_for(inst: RkpInstance, leaf_slot: u32) -> u32 {
 // ── User-shader instance hooks ─────────────────────────────────────
 // World-space AABB returned by per-shader `inst_aabb` hooks. Used by
 // the band-cell descent path's per-shader `_instance_descend` body.
-struct Aabb {
-    min: vec3<f32>,
-    max: vec3<f32>,
-}
 
 // Phase B-redux — per-pixel `instance_at` descent. The host octree
 // DDA hits a band-cell leaf with an instance-shader material → look up
@@ -277,12 +269,6 @@ struct Aabb {
 // (no instance shader registered, or none has an `instance_at` hook),
 // the default stub below returns "no hit" unconditionally — host
 // march falls through to the standard surface result.
-struct InstanceHit {
-    valid: bool,
-    world_t: f32,
-    world_pos: vec3<f32>,
-    world_normal: vec3<f32>,
-}
 
 // User-shader-facing types. Same shapes the emit / proto / generate
 // pipelines expose — `octree_march` declares them here so the
@@ -290,21 +276,7 @@ struct InstanceHit {
 // USER_INSTANCE_AT_DISPATCH block below) can reference them. Field
 // layouts are wire-format with the corresponding Rust structs in
 // `crate::user_shader_emit_pass` / `crate::user_shader_pass`.
-struct HostSample {
-    distance: f32,
-    normal: vec3<f32>,
-    material: u32,
-    material_secondary: u32,
-    blend_weight: u32,
-}
 
-struct UserCtx {
-    time: f32,
-    cell_size: f32,
-    material_id: u32,
-    aabb_min: vec3<f32>,
-    params: array<f32, 8>,
-}
 
 const USER_INSTANCE_AT_DISPATCH_BEGIN: u32 = 0u;
 // Default identity stub — Rust composer replaces this whole block
