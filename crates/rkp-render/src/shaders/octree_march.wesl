@@ -18,6 +18,7 @@ import package::lib::octree_slot::slot_is_brick;
 import package::lib::octree_slot::slot_is_band;
 import package::lib::octree_slot::slot_brick_id;
 import package::lib::octree_slot::slot_band_offset;
+import package::lib::types::OctreeResult;
 
 const OPACITY_THRESHOLD: f32 = 0.05;
 // Safety-net ceiling for the outer ray-march loop. The ray already
@@ -232,16 +233,6 @@ struct GpuMaterial {
     shader_id: u32,
     instance_shader_id: u32,
     _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32,
-}
-
-struct OctreeResult {
-    slot: u32,
-    depth: u32,
-    // Spatial bounds of the terminating cell (in object-local oc-space).
-    // For BRICK results these are the brick's bounds; the brick DDA loop
-    // uses them to compute local cell coords without re-descending.
-    cell_center: vec3<f32>,
-    cell_half: f32,
 }
 
 // --- Bindings ---

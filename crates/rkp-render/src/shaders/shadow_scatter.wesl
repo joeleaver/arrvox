@@ -32,6 +32,7 @@ import package::lib::octree_slot::slot_is_brick;
 import package::lib::octree_slot::slot_is_band;
 import package::lib::octree_slot::slot_brick_id;
 import package::lib::octree_slot::slot_band_offset;
+import package::lib::types::OctreeResult;
 const BRICK_DIM: u32 = 4u;
 const BRICK_DIM_F: f32 = 4.0;
 const BRICK_CELLS: u32 = 64u;
@@ -256,13 +257,6 @@ fn safe_dir3(d: vec3<f32>) -> vec3<f32> {
         select(d.y, select(-1e-10, 1e-10, d.y >= 0.0), abs(d.y) < 1e-10),
         select(d.z, select(-1e-10, 1e-10, d.z >= 0.0), abs(d.z) < 1e-10),
     );
-}
-
-struct OctreeResult {
-    slot: u32,
-    depth: u32,
-    cell_center: vec3<f32>,
-    cell_half: f32,
 }
 
 fn octree_lookup_no_stats(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>) -> OctreeResult {

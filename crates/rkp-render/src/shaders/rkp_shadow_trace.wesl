@@ -24,6 +24,7 @@ import package::lib::octree_slot::slot_is_brick;
 import package::lib::octree_slot::slot_is_band;
 import package::lib::octree_slot::slot_brick_id;
 import package::lib::octree_slot::slot_band_offset;
+import package::lib::types::OctreeResult;
 // Shadow rays scan every object every ray — AABB misses short-circuit
 // cheaply, and shadow rays go in arbitrary directions so the march
 // pass's screen-space per-tile lists don't apply.
@@ -405,13 +406,6 @@ fn shadow_beer(glass_color: vec3<f32>, opacity: f32, thickness: f32) -> f32 {
     let sigma_opacity = -log(max(1.0 - opacity, 0.01)) / OPACITY_REFERENCE_M;
     let sigma = (sigma_albedo * 5.0 + sigma_opacity) * GLASS_SHADOW_DENSITY;
     return exp(-sigma * thickness);
-}
-
-struct OctreeResult {
-    slot: u32,
-    depth: u32,
-    cell_center: vec3<f32>,
-    cell_half: f32,
 }
 
 // Group 0: scene data (shared with march).
