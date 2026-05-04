@@ -1,5 +1,6 @@
 use super::*;
 use crate::shader_composer::UserShaderInfo;
+use super::super::setup::compose_geom_source;
 
 #[test]
 fn geom_shader_validates_with_empty_chunk() {

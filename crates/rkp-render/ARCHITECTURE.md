@@ -146,7 +146,8 @@ CLAUDE.md targets ~700 lines per file. As of the user-shader + shader_composer s
 |---|---|---|
 | `user_shader_pass.rs` (mod root) | 89 | ✅ |
 | `user_shader_pass/cache.rs` | 924 | ⚠️ slightly over; coherent (allocator + cache + estimator) — split `BucketPoolAllocator` out if it grows further |
-| `user_shader_pass/dispatch.rs` | 707 | ✅ at budget |
+| `user_shader_pass/dispatch.rs` | 490 | ✅ |
+| `user_shader_pass/setup.rs` | 255 | ✅ |
 | `user_shader_pass/region.rs` | 165 | ✅ |
 | `user_shader_pass/overflow.rs` | 169 | ✅ |
 | `shader_composer.rs` (mod root) | 71 | ✅ |
@@ -163,7 +164,9 @@ CLAUDE.md targets ~700 lines per file. As of the user-shader + shader_composer s
 | `render_worker/user_shader_tick.rs` | 578 | ✅ |
 | `tlas_build_pass.rs` (mod root) | 57 | ✅ |
 | `tlas_build_pass/types.rs` | 131 | ✅ |
-| `tlas_build_pass/pass.rs` | 1052 | ⚠️ over; per-stage split (assemble / morton-radix / karras / propagate) is a refactor not a move — deferred |
+| `tlas_build_pass/pass/mod.rs` | 315 | ✅ |
+| `tlas_build_pass/pass/constructor.rs` | 355 | ✅ |
+| `tlas_build_pass/pass/build.rs` | 401 | ✅ |
 | `tlas_build_pass/cpu_reference.rs` | 387 | ✅ |
 | `tlas_build_pass/tests.rs` | 341 | (tests file, exempt) |
 | `rkp_scene_manager.rs` (mod root) | 35 | ✅ |

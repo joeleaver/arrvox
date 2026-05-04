@@ -13,9 +13,12 @@
 //!   `estimate_region_pool`, all pool / bucket constants.
 //! - [`region`] — `RegionUniform` (GPU-side per-region storage), the
 //!   16-byte `GpuBandCell` band-cell payload, `build_region_uniform`.
-//! - [`dispatch`] — `UserShaderPass` (BFS pipelines + buffers),
-//!   `compose_geom_source`, `resolve_shader_id`, `LevelUniform`,
-//!   `MAX_DEPTH`, `MAX_REGIONS`.
+//! - [`dispatch`] — `UserShaderPass` per-frame work
+//!   (`dispatch_regions`, `ensure_group0`, `submit_overflow_readback`),
+//!   `resolve_shader_id`, `LevelUniform`, `MAX_DEPTH`, `MAX_REGIONS`.
+//! - [`setup`] — `UserShaderPass::new`, `reload_user_shaders`,
+//!   `compose_geom_source`, and the WGPU bind-group / pipeline
+//!   construction helpers (one-time / shader-edit work).
 //! - [`overflow`] — internal CPU readback ring for the GPU overflow
 //!   counters; not part of the public API.
 //!
@@ -72,6 +75,7 @@ pub mod cache;
 pub mod dispatch;
 mod overflow;
 pub mod region;
+pub mod setup;
 
 // Public re-exports — keep `rkp_render::user_shader_pass::Foo` stable
 // for external callers regardless of which submodule a symbol lives in.
@@ -84,6 +88,7 @@ pub use cache::{
     NO_TILE, OCTREE_BUCKET_MAX, OCTREE_BUCKET_MIN,
 };
 pub use dispatch::{
-    compose_geom_source, resolve_shader_id, LevelUniform, UserShaderPass, MAX_DEPTH, MAX_REGIONS,
+    resolve_shader_id, LevelUniform, UserShaderPass, MAX_DEPTH, MAX_REGIONS,
 };
 pub use region::{build_region_uniform, GpuBandCell, RegionUniform};
+pub use setup::compose_geom_source;
