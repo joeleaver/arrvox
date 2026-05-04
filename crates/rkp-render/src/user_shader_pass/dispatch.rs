@@ -72,7 +72,14 @@ pub const MAX_REGIONS: u32 = 1024;
 const CLASSIFY_WG_SIZE: u32 = 64;
 
 /// Stride between per-level uniforms in `level_uniforms_buffer`.
-/// 256 B fits typical wgpu min-uniform-buffer-offset-alignment.
+///
+/// 256 B is wgpu's default `min_uniform_buffer_offset_alignment`
+/// limit (used by every backend wgpu currently supports). Per-level
+/// uniforms are 16 B, so we waste 240 B per level × 9 levels = 2.16 KB
+/// of buffer space — accepted as the cost of a runtime-stable
+/// constant. `UserShaderPass::new` asserts the device's actual
+/// alignment doesn't exceed this; the unlikely future case where a
+/// GPU demands >256 B alignment would surface there immediately.
 const LEVEL_UNIFORM_STRIDE: u64 = 256;
 
 /// Sentinel value the brick_fill kernel checks in the first u32 of a
@@ -170,6 +177,18 @@ pub struct UserShaderPass {
 
 impl UserShaderPass {
     pub fn new(device: &wgpu::Device) -> Self {
+        // Catch the (unlikely) case of a backend that demands greater
+        // uniform-buffer-offset alignment than our compile-time stride
+        // can satisfy. Today every wgpu backend caps the requirement
+        // at 256.
+        assert!(
+            (device.limits().min_uniform_buffer_offset_alignment as u64)
+                <= LEVEL_UNIFORM_STRIDE,
+            "device requires min_uniform_buffer_offset_alignment of {} \
+             which exceeds the LEVEL_UNIFORM_STRIDE constant of {}",
+            device.limits().min_uniform_buffer_offset_alignment,
+            LEVEL_UNIFORM_STRIDE,
+        );
         let group0_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("user_shader_geom group0"),
             entries: &[
