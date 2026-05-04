@@ -6,19 +6,17 @@
 
 import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::oct_normal::pack_oct_normal;
+import package::lib::octree_slot::OCTREE_EMPTY;
+import package::lib::octree_slot::OCTREE_INTERIOR;
+import package::lib::octree_slot::OCTREE_LEAF_BIT;
+import package::lib::octree_slot::OCTREE_BRICK_BIT;
+import package::lib::octree_slot::OCTREE_BAND_BIT;
+import package::lib::octree_slot::OCTREE_PAYLOAD_MASK;
+import package::lib::octree_slot::slot_is_brick;
+import package::lib::octree_slot::slot_is_band;
+import package::lib::octree_slot::slot_brick_id;
+import package::lib::octree_slot::slot_band_offset;
 
-const OCTREE_EMPTY: u32 = 0xFFFFFFFFu;
-const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
-const OCTREE_LEAF_BIT: u32 = 0x80000000u;
-const OCTREE_BRICK_BIT: u32 = 0x40000000u;
-// Phase B-redux 3b — band-cell sentinel. A leaf with `LEAF | BAND |
-// payload` is a band cell whose payload indexes `leaf_attr_pool`,
-// where the slot's two u32s reinterpret as `{region_id,
-// anchor_leaf_slot}` (see octree_march.wgsl::handle_band_cell).
-// Encoding: bit 31 = LEAF, bit 30 = BRICK, bit 29 = BAND, bits 28..0
-// = payload. BAND is mutually exclusive with BRICK; both 0 = leaf-attr.
-const OCTREE_BAND_BIT: u32 = 0x20000000u;
-const OCTREE_PAYLOAD_MASK: u32 = 0x1FFFFFFFu;
 const OPACITY_THRESHOLD: f32 = 0.05;
 // Safety-net ceiling for the outer ray-march loop. The ray already
 // terminates naturally when `t > t_range.y` (exits the octree); this
@@ -828,31 +826,8 @@ fn octree_lookup(
     return OctreeResult(OCTREE_EMPTY, max_depth, center, half);
 }
 
-/// Detect a BRICK result from `octree_lookup`: BRICK_BIT preserved in slot.
-fn slot_is_brick(slot: u32) -> bool {
-    return (slot & OCTREE_BRICK_BIT) != 0u
-        && slot != OCTREE_EMPTY
-        && slot != OCTREE_INTERIOR;
-}
-
-/// Strip the BRICK_BIT marker from a slot to get the actual brick_id.
-fn slot_brick_id(slot: u32) -> u32 {
-    return slot & OCTREE_PAYLOAD_MASK;
-}
-
-/// Phase B-redux 3b — detect a BAND result from `octree_lookup`.
-fn slot_is_band(slot: u32) -> bool {
-    return (slot & OCTREE_BAND_BIT) != 0u
-        && slot != OCTREE_EMPTY
-        && slot != OCTREE_INTERIOR;
-}
-
-/// Strip BRICK_BIT / BAND_BIT to get the band-cell offset (index into
-/// `leaf_attr_pool` where the 16-byte `BandCell` record begins; the
-/// next slot at `+1` is its second half).
-fn slot_band_offset(slot: u32) -> u32 {
-    return slot & OCTREE_PAYLOAD_MASK;
-}
+// `slot_is_brick`, `slot_brick_id`, `slot_is_band`, `slot_band_offset`
+// are imported from `lib::octree_slot` at the top of this file.
 
 /// Phase B-redux 3b — read a `BandCell` payload by unpacking two
 /// consecutive `leaf_attr_pool` slots. BFS bake (user_shader_geom.wgsl)

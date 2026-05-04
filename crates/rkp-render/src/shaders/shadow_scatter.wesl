@@ -20,18 +20,16 @@
 // so the CPU never reads back the work count.
 
 import package::lib::oct_normal::unpack_oct_normal;
-
-const OCTREE_EMPTY: u32 = 0xFFFFFFFFu;
-const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
-const OCTREE_LEAF_BIT: u32 = 0x80000000u;
-const OCTREE_BRICK_BIT: u32 = 0x40000000u;
-// Phase B-redux 3b — band-cell sentinel. Phase 4 wires band-cell
-// descent through `dispatch_user_instance_descend` so painted
-// blades cast shadows in the directional shadow map too;
-// `octree_lookup_no_stats` now preserves BAND_BIT and the band
-// branch in `find_hit_in_instance` runs the descent.
-const OCTREE_BAND_BIT: u32 = 0x20000000u;
-const OCTREE_PAYLOAD_MASK: u32 = 0x1FFFFFFFu;
+import package::lib::octree_slot::OCTREE_EMPTY;
+import package::lib::octree_slot::OCTREE_INTERIOR;
+import package::lib::octree_slot::OCTREE_LEAF_BIT;
+import package::lib::octree_slot::OCTREE_BRICK_BIT;
+import package::lib::octree_slot::OCTREE_BAND_BIT;
+import package::lib::octree_slot::OCTREE_PAYLOAD_MASK;
+import package::lib::octree_slot::slot_is_brick;
+import package::lib::octree_slot::slot_is_band;
+import package::lib::octree_slot::slot_brick_id;
+import package::lib::octree_slot::slot_band_offset;
 const BRICK_DIM: u32 = 4u;
 const BRICK_DIM_F: f32 = 4.0;
 const BRICK_CELLS: u32 = 64u;
@@ -320,26 +318,8 @@ fn octree_lookup_no_stats(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>
     return OctreeResult(OCTREE_EMPTY, max_depth, center, half);
 }
 
-fn slot_is_brick(slot: u32) -> bool {
-    return (slot & OCTREE_BRICK_BIT) != 0u
-        && slot != OCTREE_EMPTY
-        && slot != OCTREE_INTERIOR;
-}
-
-fn slot_brick_id(slot: u32) -> u32 {
-    return slot & OCTREE_PAYLOAD_MASK;
-}
-
-/// Phase B-redux 3b — detect a BAND result from `octree_lookup_no_stats`.
-fn slot_is_band(slot: u32) -> bool {
-    return (slot & OCTREE_BAND_BIT) != 0u
-        && slot != OCTREE_EMPTY
-        && slot != OCTREE_INTERIOR;
-}
-
-fn slot_band_offset(slot: u32) -> u32 {
-    return slot & OCTREE_PAYLOAD_MASK;
-}
+// `slot_is_brick`, `slot_brick_id`, `slot_is_band`, `slot_band_offset`
+// are imported from `lib::octree_slot` at the top of this file.
 
 fn read_band_cell(band_off: u32) -> BandCell {
     let s0 = leaf_attr_pool[band_off];

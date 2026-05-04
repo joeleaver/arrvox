@@ -37,19 +37,15 @@
 // The Rust composer splices each user shader's `proto` body and the
 // `dispatch_user_proto` switch between the BEGIN/END markers below.
 
+import package::lib::octree_slot::OCTREE_EMPTY;
+import package::lib::octree_slot::OCTREE_LEAF_BIT;
+import package::lib::octree_slot::OCTREE_BRICK_BIT;
+import package::lib::octree_slot::OCTREE_BAND_BIT;
+import package::lib::octree_slot::OCTREE_PAYLOAD_MASK;
+
 const BRICK_DIM: u32 = 4u;
 const BRICK_CELLS: u32 = 64u;
 const BRICK_CELL_EMPTY: u32 = 0xFFFFFFFFu;
-
-const OCTREE_EMPTY: u32 = 0xFFFFFFFFu;
-const OCTREE_LEAF_BIT: u32 = 0x80000000u;
-const OCTREE_BRICK_BIT: u32 = 0x40000000u;
-// Phase B-redux 3b — band-cell sentinel reserved here for symmetry
-// with octree_march.wgsl. Proto bake never produces band cells (it
-// bakes the prototype volume, not the band volume) — kept so any
-// future band-aware proto code stays consistent.
-const OCTREE_BAND_BIT: u32 = 0x20000000u;
-const OCTREE_PAYLOAD_MASK: u32 = 0x1FFFFFFFu;
 const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;
 
 // Overflow counter slots — must match the `OVERFLOW_*` indices the

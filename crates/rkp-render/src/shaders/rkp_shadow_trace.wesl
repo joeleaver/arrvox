@@ -12,18 +12,16 @@
 // file once the half-res shadow path has stuck.
 
 import package::lib::oct_normal::unpack_oct_normal;
-
-const OCTREE_EMPTY: u32 = 0xFFFFFFFFu;
-const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
-const OCTREE_LEAF_BIT: u32 = 0x80000000u;
-const OCTREE_BRICK_BIT: u32 = 0x40000000u;
-// Phase B-redux 3b — band-cell sentinel. See octree_march.wgsl for
-// the encoding contract. Phase 4 wires band-cell descent through
-// `dispatch_user_instance_descend` so painted blades cast shadows;
-// `octree_lookup` now preserves BAND_BIT so the caller can detect
-// the cell and run the descent.
-const OCTREE_BAND_BIT: u32 = 0x20000000u;
-const OCTREE_PAYLOAD_MASK: u32 = 0x1FFFFFFFu;
+import package::lib::octree_slot::OCTREE_EMPTY;
+import package::lib::octree_slot::OCTREE_INTERIOR;
+import package::lib::octree_slot::OCTREE_LEAF_BIT;
+import package::lib::octree_slot::OCTREE_BRICK_BIT;
+import package::lib::octree_slot::OCTREE_BAND_BIT;
+import package::lib::octree_slot::OCTREE_PAYLOAD_MASK;
+import package::lib::octree_slot::slot_is_brick;
+import package::lib::octree_slot::slot_is_band;
+import package::lib::octree_slot::slot_brick_id;
+import package::lib::octree_slot::slot_band_offset;
 // Shadow rays scan every object every ray — AABB misses short-circuit
 // cheaply, and shadow rays go in arbitrary directions so the march
 // pass's screen-space per-tile lists don't apply.
@@ -612,29 +610,8 @@ fn octree_lookup(root: u32, max_depth: u32, extent: f32, pos: vec3<f32>, phase: 
     return OctreeResult(OCTREE_EMPTY, max_depth, center, half);
 }
 
-fn slot_is_brick(slot: u32) -> bool {
-    return (slot & OCTREE_BRICK_BIT) != 0u
-        && slot != OCTREE_EMPTY
-        && slot != OCTREE_INTERIOR;
-}
-
-fn slot_brick_id(slot: u32) -> u32 {
-    return slot & OCTREE_PAYLOAD_MASK;
-}
-
-/// Phase B-redux 3b — detect a BAND result from `octree_lookup`.
-fn slot_is_band(slot: u32) -> bool {
-    return (slot & OCTREE_BAND_BIT) != 0u
-        && slot != OCTREE_EMPTY
-        && slot != OCTREE_INTERIOR;
-}
-
-/// Strip BRICK_BIT / BAND_BIT to get the band-cell offset (index
-/// into `leaf_attr_pool` where the 16-byte `BandCell` record begins;
-/// the next slot at `+1` is its second half).
-fn slot_band_offset(slot: u32) -> u32 {
-    return slot & OCTREE_PAYLOAD_MASK;
-}
+// `slot_is_brick`, `slot_brick_id`, `slot_is_band`, `slot_band_offset`
+// are imported from `lib::octree_slot` at the top of this file.
 
 /// Phase B-redux 3b — read a `BandCell` payload by unpacking two
 /// consecutive `leaf_attr_pool` slots. Same byte layout the BFS
