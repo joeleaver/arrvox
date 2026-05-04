@@ -12,6 +12,14 @@
 // visible through solid geometry by design (you want to see your
 // cutter through the minuend when editing).
 //
+import package::lib::sdf::sdf_sphere;
+import package::lib::sdf::sdf_box;
+import package::lib::sdf::sdf_capsule;
+import package::lib::sdf::sdf_cylinder;
+import package::lib::sdf::sdf_torus;
+import package::lib::sdf::sdf_plane;
+import package::lib::sdf::sdf_ramp;
+
 // Fragment pass, full-screen triangle. Primitives arrive as a
 // `ProcInstruction` array in the same byte layout as the main
 // raymarch's; we just ignore the combinator opcodes and assume a
@@ -72,46 +80,7 @@ struct GhostParams {
 @group(1) @binding(0) var<uniform> params: GhostParams;
 @group(1) @binding(1) var<storage, read> instructions: array<ProcInstruction>;
 
-// ── Primitive SDFs ─────────────────────────────────────────────────────
-// Duplicates of `proc_raymarch.wgsl`. WGSL has no include mechanism; the
-// alternative (CPU-side string concat at shader-module creation) buys
-// little given the CPU-side SDF is also duplicated into `leaves.rs`.
-// If we ever move to a shader preprocessor, factor these out.
-
-fn sdf_sphere(p: vec3<f32>, radius: f32) -> f32 {
-    return length(p) - radius;
-}
-fn sdf_box(p: vec3<f32>, half_extents: vec3<f32>, rounding: f32) -> f32 {
-    let q = abs(p) - half_extents + vec3<f32>(rounding);
-    let outside = length(max(q, vec3<f32>(0.0)));
-    let inside = min(max(q.x, max(q.y, q.z)), 0.0);
-    return outside + inside - rounding;
-}
-fn sdf_capsule(p: vec3<f32>, radius: f32, half_height: f32) -> f32 {
-    let t = clamp(p.y, -half_height, half_height);
-    return length(p - vec3<f32>(0.0, t, 0.0)) - radius;
-}
-fn sdf_cylinder(p: vec3<f32>, radius: f32, half_height: f32) -> f32 {
-    let radial = length(vec3<f32>(p.x, 0.0, p.z)) - radius;
-    let axial = abs(p.y) - half_height;
-    if (radial > 0.0 && axial > 0.0) { return sqrt(radial * radial + axial * axial); }
-    return max(radial, axial);
-}
-fn sdf_torus(p: vec3<f32>, major_radius: f32, minor_radius: f32) -> f32 {
-    let xz_len = length(vec3<f32>(p.x, 0.0, p.z));
-    let q = vec3<f32>(xz_len - major_radius, p.y, 0.0);
-    return length(q) - minor_radius;
-}
-fn sdf_plane(p: vec3<f32>) -> f32 { return p.y; }
-fn sdf_ramp(p: vec3<f32>, half_length: f32, half_height: f32, half_width: f32) -> f32 {
-    let q = abs(p) - vec3<f32>(half_length, half_height, half_width);
-    let outside = length(max(q, vec3<f32>(0.0)));
-    let inside = min(max(q.x, max(q.y, q.z)), 0.0);
-    let box_dist = outside + inside;
-    let hyp = max(sqrt(half_length * half_length + half_height * half_height), 1e-6);
-    let plane_dist = (half_length * p.y - half_height * p.x) / hyp;
-    return max(box_dist, plane_dist);
-}
+// Primitive SDFs are imported from `lib::sdf` at the top of this file.
 
 fn eval_primitive_dist(ins: ProcInstruction, world_pos: vec3<f32>) -> f32 {
     let local = (ins.inverse_world * vec4<f32>(world_pos, 1.0)).xyz;

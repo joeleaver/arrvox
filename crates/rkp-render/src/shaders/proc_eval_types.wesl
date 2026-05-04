@@ -63,7 +63,13 @@ const POS_STACK_CAP: u32 = 8u;
 // eliminate the `pos_stack` — which is dynamic-indexed and gets
 // demoted to local memory otherwise, costing every sphere-trace step
 // a round trip there.
-override HAS_POS_WARPS: bool = true;
+// `HAS_POS_WARPS` is declared per-consumer (proc_sample.wesl,
+// proc_raymarch.wesl). Pipeline-overridable constants must keep their
+// unmangled name in the emitted WGSL because the Rust side names them
+// at pipeline creation; WESL would rename an imported override to its
+// mangled form (`package__2proc_eval_types__2HAS_POS_WARPS`), breaking
+// the override lookup. proc_eval's references resolve as free names
+// against the consumer's scope.
 
 // ── Shared structs ─────────────────────────────────────────────────────
 

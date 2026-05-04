@@ -9,10 +9,20 @@
 // `proc_eval.wgsl`. This shader owns only the bindings and the
 // sphere-trace loop.
 //
-// Loader wraps this file between `proc_eval_types.wgsl` (types +
-// opcode constants) and `proc_eval.wgsl` (function bodies) at
-// shader-module creation. See `proc_raymarch.rs::new`. The shared
-// `eval_tree` reads the `instructions` binding declared below.
+// Imports the RPN interpreter from `proc_eval` and types/opcodes
+// from `proc_eval_types`. The shared `eval_tree` reads the
+// `instructions` binding declared below.
+
+import package::proc_eval_types::ProcInstruction;
+import package::proc_eval_types::TreeSample;
+import package::proc_eval::eval_tree;
+import package::proc_eval::eval_tree_distance;
+import package::proc_eval::gradient_normal;
+
+// Pipeline-override constant — kept unmangled so the Rust side
+// (`proc_raymarch.rs`) can override it at pipeline creation by name.
+// proc_eval's body references this as a free name resolved at emit.
+override HAS_POS_WARPS: bool = true;
 
 // March parameters. Tight by design — the build viewport is an
 // editor preview, not a final renderer, and the user's procedural

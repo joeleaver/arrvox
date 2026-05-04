@@ -17,15 +17,16 @@ fn main() {
     let mut resolver = Wesl::new(shaders_dir);
     resolver.use_stripping(false);
 
-    // Skiplist: compose-by-concat fragments. Currently `include_str!`'d
-    // individually and string-concatenated by `proc_sample.rs` /
-    // `proc_raymarch.rs` to form a complete shader. Phase 2 Wave E
-    // folds them onto WESL `import` and removes this skiplist.
+    // Skiplist: imports-only modules with no entry point. They get
+    // pulled into emitting artifacts via `import package::<stem>`
+    // and don't need their own artifact.
+    //
+    // `proc_sample` and `proc_raymarch` import from these and emit
+    // standalone artifacts (Wave E folded the old compose-by-concat
+    // model onto WESL imports).
     const SKIP: &[&str] = &[
         "proc_eval",
         "proc_eval_types",
-        "proc_sample",
-        "proc_raymarch",
     ];
 
     // Enumerate every top-level `.wesl` file and emit a flat WGSL

@@ -190,18 +190,15 @@ impl ProcRaymarchPass {
             mapped_at_creation: false,
         });
 
-        // Concat order: shared types → this shader's bindings + entry
-        // → shared function bodies. The types file defines
-        // `ProcInstruction` so the binding declaration below can name
-        // it; the function bodies reference the `instructions` binding
-        // as a module-scope global. WGSL resolves functions across the
-        // whole module regardless of declaration order, so `main`
-        // calling `eval_tree` before it's defined works.
-        let types_src = include_str!("shaders/proc_eval_types.wesl");
-        let raymarch_src = include_str!("shaders/proc_raymarch.wesl");
-        let eval_src = include_str!("shaders/proc_eval.wesl");
-        let shader_src = format!("{types_src}\n{raymarch_src}\n{eval_src}");
-        validate_wgsl(&shader_src, "proc_raymarch");
+        // WESL resolves the imports from `proc_eval_types` (types +
+        // opcodes) and `proc_eval` (function bodies); the function
+        // bodies reference the `instructions` binding declared below
+        // as a module-scope global, resolved at the consumer's import
+        // site. WGSL resolves functions across the whole module
+        // regardless of declaration order, so `main` calling
+        // `eval_tree` before its body appears in the emit works.
+        let shader_src = wesl::include_wesl!("proc_raymarch");
+        validate_wgsl(shader_src, "proc_raymarch");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("proc_raymarch"),
             source: wgpu::ShaderSource::Wgsl(shader_src.into()),

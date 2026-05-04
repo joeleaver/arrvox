@@ -5,9 +5,17 @@
 // pipeline (Phase 3+) can use the same RPN interpreter as the live
 // raymarch — one implementation of the procedural math, on the GPU.
 //
-// Loader concatenates this with `proc_eval_types.wgsl` (types) and
-// `proc_eval.wgsl` (function bodies). The shared `eval_tree` reads
-// the `instructions` binding declared below.
+// Imports the RPN interpreter from `proc_eval` and its type/opcode
+// constants from `proc_eval_types`. The shared `eval_tree` reads the
+// `instructions` binding declared below.
+
+import package::proc_eval_types::ProcInstruction;
+import package::proc_eval::eval_tree;
+
+// Pipeline-override constant — kept unmangled so the Rust side
+// (`proc_sample.rs`) can override it at pipeline creation by name.
+// proc_eval's body references this as a free name resolved at emit.
+override HAS_POS_WARPS: bool = true;
 
 struct SampleParams {
     // Instructions in the `instructions` buffer to execute per query.
