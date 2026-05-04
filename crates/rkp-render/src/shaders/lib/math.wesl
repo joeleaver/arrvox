@@ -49,6 +49,40 @@ fn intersect_aabb(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box
                      min(min(tmax.x, tmax.y), tmax.z));
 }
 
+// Hash 3 floats into one float in [0, 1). Hugues Hoppe's "hash13" —
+// the canonical building block for value/gradient noise. Cheap and
+// good enough for cloud / fog / fresnel stippling; not for crypto.
+fn hash13(p: vec3<f32>) -> f32 {
+    var p3 = fract(p * 0.1031);
+    p3 = p3 + dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// 3D value noise in [0, 1], trilinearly interpolated from a hashed
+// lattice. Smoothstep on the fractional coords kills the lattice-
+// derivative discontinuity. Multiple octaves layer cleanly via fbm
+// (caller's responsibility).
+fn value_noise_3d(p: vec3<f32>) -> f32 {
+    let ip = floor(p);
+    let fp = fract(p);
+    let w = fp * fp * (3.0 - 2.0 * fp);
+    let c000 = hash13(ip);
+    let c100 = hash13(ip + vec3<f32>(1.0, 0.0, 0.0));
+    let c010 = hash13(ip + vec3<f32>(0.0, 1.0, 0.0));
+    let c110 = hash13(ip + vec3<f32>(1.0, 1.0, 0.0));
+    let c001 = hash13(ip + vec3<f32>(0.0, 0.0, 1.0));
+    let c101 = hash13(ip + vec3<f32>(1.0, 0.0, 1.0));
+    let c011 = hash13(ip + vec3<f32>(0.0, 1.0, 1.0));
+    let c111 = hash13(ip + vec3<f32>(1.0, 1.0, 1.0));
+    let x00 = mix(c000, c100, w.x);
+    let x10 = mix(c010, c110, w.x);
+    let x01 = mix(c001, c101, w.x);
+    let x11 = mix(c011, c111, w.x);
+    let y0 = mix(x00, x10, w.y);
+    let y1 = mix(x01, x11, w.y);
+    return mix(y0, y1, w.z);
+}
+
 // Affine 4x4 inverse — the common case for object↔world transforms.
 // Cheaper than a full 4x4 inverse; assumes the bottom row is `(0,0,0,1)`
 // and the top-left 3x3 is invertible (any rotation+scale satisfies that).

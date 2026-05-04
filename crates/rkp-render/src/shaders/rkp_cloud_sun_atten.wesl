@@ -5,35 +5,11 @@
 
 import package::lib::types::CloudParams;
 import package::lib::types::VolumetricParams;
+import package::lib::math::value_noise_3d;
 
 @group(0) @binding(0) var<uniform> params: VolumetricParams;
 @group(0) @binding(1) var<uniform> cloud_params: CloudParams;
 @group(0) @binding(2) var<storage, read_write> sun_atten_out: vec4<f32>;
-
-fn hash3(p: vec3<f32>) -> f32 {
-    var q = fract(p * 0.1031);
-    q += dot(q, q.yzx + 33.33);
-    return fract((q.x + q.y) * q.z);
-}
-
-fn value_noise_3d(p: vec3<f32>) -> f32 {
-    let i = floor(p);
-    let f = fract(p);
-    let u = f * f * (3.0 - 2.0 * f);
-    let n000 = hash3(i);
-    let n100 = hash3(i + vec3<f32>(1.0, 0.0, 0.0));
-    let n010 = hash3(i + vec3<f32>(0.0, 1.0, 0.0));
-    let n110 = hash3(i + vec3<f32>(1.0, 1.0, 0.0));
-    let n001 = hash3(i + vec3<f32>(0.0, 0.0, 1.0));
-    let n101 = hash3(i + vec3<f32>(1.0, 0.0, 1.0));
-    let n011 = hash3(i + vec3<f32>(0.0, 1.0, 1.0));
-    let n111 = hash3(i + vec3<f32>(1.0, 1.0, 1.0));
-    let x0 = mix(n000, n100, u.x);
-    let x1 = mix(n010, n110, u.x);
-    let x2 = mix(n001, n101, u.x);
-    let x3 = mix(n011, n111, u.x);
-    return mix(mix(x0, x1, u.y), mix(x2, x3, u.y), u.z);
-}
 
 fn fbm_3d(p: vec3<f32>, octaves: u32) -> f32 {
     var sum = 0.0;

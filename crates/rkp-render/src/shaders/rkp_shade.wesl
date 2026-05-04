@@ -18,6 +18,7 @@ import package::lib::atmosphere::cornette_shanks;
 import package::lib::atmosphere::PI;
 import package::lib::atmosphere::lookup_transmittance;
 import package::lib::atmosphere::lookup_multiscatter;
+import package::lib::math::value_noise_3d;
 import package::lib::math::ray_sphere;
 import package::lib::types::GpuMaterial;
 import package::lib::types::mat_albedo;
@@ -463,37 +464,6 @@ fn beer_absorption(glass_color: vec3<f32>, thickness: f32) -> vec3<f32> {
 const NOISE_CHANNEL_ALBEDO: u32    = 1u;
 const NOISE_CHANNEL_ROUGHNESS: u32 = 2u;
 const NOISE_CHANNEL_NORMAL: u32    = 4u;
-
-// Hash based on Dave Hoskins' "Hash without Sine" — a handful of
-// multiply-adds and a final fract. Several × faster than
-// `fract(sin(dot(...)))` on most GPUs (sin() is a slow transcendental
-// that chews through fill rate when we're doing dozens of hashes per
-// pixel), and visually indistinguishable for material-noise use.
-fn hash13(p: vec3<f32>) -> f32 {
-    var p3 = fract(p * 0.1031);
-    p3 = p3 + dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
-}
-
-// 3D value noise in [0,1], trilinearly interpolated from a hashed lattice.
-fn value_noise_3d(p: vec3<f32>) -> f32 {
-    let ip = floor(p);
-    let fp = fract(p);
-    let w = fp * fp * (3.0 - 2.0 * fp);
-    let c000 = hash13(ip);
-    let c100 = hash13(ip + vec3<f32>(1.0, 0.0, 0.0));
-    let c010 = hash13(ip + vec3<f32>(0.0, 1.0, 0.0));
-    let c110 = hash13(ip + vec3<f32>(1.0, 1.0, 0.0));
-    let c001 = hash13(ip + vec3<f32>(0.0, 0.0, 1.0));
-    let c101 = hash13(ip + vec3<f32>(1.0, 0.0, 1.0));
-    let c011 = hash13(ip + vec3<f32>(0.0, 1.0, 1.0));
-    let c111 = hash13(ip + vec3<f32>(1.0, 1.0, 1.0));
-    let x00 = mix(c000, c100, w.x);
-    let x10 = mix(c010, c110, w.x);
-    let x01 = mix(c001, c101, w.x);
-    let x11 = mix(c011, c111, w.x);
-    return mix(mix(x00, x10, w.y), mix(x01, x11, w.y), w.z);
-}
 
 // Forward-difference gradient of the noise field. Reuses the caller's
 // already-computed center sample `n0` so this path costs 3 extra
