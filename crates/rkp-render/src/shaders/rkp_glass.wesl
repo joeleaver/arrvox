@@ -22,6 +22,7 @@ import package::lib::types::GpuMaterial;
 import package::lib::types::mat_albedo;
 import package::lib::types::CameraUniforms;
 import package::lib::types::GpuLight;
+import package::lib::types::ShadeParams;
 
 const PI: f32 = 3.14159265358979323846;
 
@@ -31,20 +32,6 @@ const PI: f32 = 3.14159265358979323846;
 
 // Only the handful of fields we actually use — layout must match
 // rkp_shade.wgsl::ShadeParams so the same uniform buffer binds cleanly.
-struct ShadeParams {
-    num_lights: u32,
-    ambient_intensity: f32,
-    camera_altitude: f32,
-    sun_intensity: f32,
-    sky_color_top: vec3<f32>,
-    _pad0: f32,
-    sky_color_horizon: vec3<f32>,
-    _pad1: f32,
-    sun_dir: vec3<f32>,
-    _pad2: f32,
-    ambient_color: vec3<f32>,
-    isolation: u32,
-}
 
 @group(0) @binding(0) var hdr_in: texture_2d<f32>;
 @group(0) @binding(1) var gbuf_glass: texture_2d<u32>;

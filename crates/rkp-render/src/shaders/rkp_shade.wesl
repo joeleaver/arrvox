@@ -20,48 +20,13 @@ import package::lib::types::GpuMaterial;
 import package::lib::types::mat_albedo;
 import package::lib::types::CameraUniforms;
 import package::lib::types::GpuLight;
+import package::lib::types::ShadeParams;
 
 const PI: f32 = 3.14159265;
 
 // --- Structs ---
 
 
-struct ShadeParams {
-    num_lights: u32,
-    ambient_intensity: f32,
-    camera_altitude: f32,
-    sun_intensity: f32,
-    sky_color_top: vec3<f32>,
-    _pad0: f32,
-    sky_color_horizon: vec3<f32>,
-    _pad1: f32,
-    sun_dir: vec3<f32>,
-    _pad2: f32,
-    ambient_color: vec3<f32>,
-    isolation: u32,
-    // Paint cursor overlay (Phase-3 placeholder). When `brush_active`
-    // is non-zero and the shaded pixel's world position sits within
-    // `brush_radius` of `brush_center`, blend the brush color on top
-    // as a soft ring + fill. Geodesic wrapping around corners lands
-    // in Phase 3b when we plumb per-leaf flood-fill distances.
-    brush_active: u32,
-    brush_radius: f32,
-    brush_falloff: f32,
-    /// Engine clock in seconds. Set per frame; user shaders read it
-    /// via `ShadeCtx.time` for fresnel pulses, hologram scrolls, etc.
-    time: f32,
-    brush_center: vec4<f32>,
-    brush_color: vec4<f32>,
-    // Phase 8 S3 — non-zero ⇒ directional shadow reads from the
-    // shadow-map sample at group 1 binding 3 instead of the per-
-    // pixel ray-traced shadow_data. Zero leaves the per-pixel path
-    // live (used pre-S5 cutover or whenever the engine has no live
-    // shadow map this frame).
-    shadow_map_enabled: u32,
-    _pad3: u32,
-    _pad4: u32,
-    _pad5: u32,
-}
 
 // 8 user-named scalar params per material, packed as two vec4s (32
 // bytes — matches `Vec<[f32; 8]>` produced by the engine's

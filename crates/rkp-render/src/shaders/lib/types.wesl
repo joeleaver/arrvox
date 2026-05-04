@@ -297,6 +297,37 @@ struct VolumetricParams {
     prev_view_proj: mat4x4<f32>,
 }
 
+// Shading-pass parameters (144 bytes). CPU mirror is
+// `rkp_shade::ShadeParams`. Bound by both the shade pass (which
+// uses the brush, time, and shadow_map_enabled fields for paint
+// preview, user-shader timing, and shadow-map gating) and the
+// glass pass (which only reads the lighting prefix). naga DCE
+// drops the unused tail from glass's SPIR-V.
+struct ShadeParams {
+    num_lights: u32,
+    ambient_intensity: f32,
+    camera_altitude: f32,
+    sun_intensity: f32,
+    sky_color_top: vec3<f32>,
+    _pad0: f32,
+    sky_color_horizon: vec3<f32>,
+    _pad1: f32,
+    sun_dir: vec3<f32>,
+    _pad2: f32,
+    ambient_color: vec3<f32>,
+    isolation: u32,
+    brush_active: u32,
+    brush_radius: f32,
+    brush_falloff: f32,
+    time: f32,
+    brush_center: vec4<f32>,
+    brush_color: vec4<f32>,
+    shadow_map_enabled: u32,
+    _pad3: u32,
+    _pad4: u32,
+    _pad5: u32,
+}
+
 struct GpuLight {
     position: vec4<f32>,
     color: vec4<f32>,
