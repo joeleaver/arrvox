@@ -161,7 +161,7 @@ fn morton_3d(b: vec3<u32>, max_depth: u32) -> u32 {
     return result;
 }
 
-// USER_PROTO_DISPATCH_BEGIN
+const USER_PROTO_DISPATCH_BEGIN: u32 = 0u;
 // Default identity stub — the Rust composer replaces this block with
 // the concatenated user-shader bodies + `dispatch_user_proto` switch
 // when any registered shader provides a `proto` hook. Empty-registry
@@ -169,7 +169,7 @@ fn morton_3d(b: vec3<u32>, max_depth: u32) -> u32 {
 fn dispatch_user_proto(shader_id: u32, uvw: vec3<f32>) -> VoxelEmit {
     return voxel_emit_skip();
 }
-// USER_PROTO_DISPATCH_END
+const USER_PROTO_DISPATCH_END: u32 = 0u;
 
 @compute @workgroup_size(4, 4, 4)
 fn proto_bake_main(

@@ -58,7 +58,7 @@ fn user_hologram_shade(ctx: ShadeCtx) -> ShadeResult {
     // The composed source MUST NOT still contain the in-tree identity
     // dispatch — the marker block should have been swapped out.
     assert!(
-        !src.contains("return shade_result_passthrough(ctx);\n}\n// USER_SHADE_DISPATCH_END"),
+        !src.contains("return shade_result_passthrough(ctx);\n}\nconst USER_SHADE_DISPATCH_END"),
         "marker block was not replaced"
     );
     assert!(src.contains("rkp_user_1_shade"));

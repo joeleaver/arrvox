@@ -59,7 +59,7 @@ pub mod parser;
 pub mod types;
 
 // Public re-exports — keep `rkp_render::shader_composer::Foo` stable.
-pub use compose::{compose, splice_inst_chunks};
+pub use compose::{compose, splice_const_marker, splice_inst_chunks};
 pub use hash::fnv1a_64;
 pub use parser::{parse_file, scan_dir};
 pub use types::{

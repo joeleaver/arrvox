@@ -435,7 +435,7 @@ struct UserCtx {
     params: array<f32, 8>,
 }
 
-// USER_INSTANCE_AT_DISPATCH_BEGIN
+const USER_INSTANCE_AT_DISPATCH_BEGIN: u32 = 0u;
 // Default identity stub — Rust composer replaces this whole block
 // (markers + body) with per-shader descent helpers + the dispatch
 // switch when any registered shader provides an `instance_at` hook.
@@ -459,7 +459,7 @@ fn dispatch_user_instance_descend(
     r.world_normal = vec3<f32>(0.0, 1.0, 0.0);
     return r;
 }
-// USER_INSTANCE_AT_DISPATCH_END
+const USER_INSTANCE_AT_DISPATCH_END: u32 = 0u;
 
 const FACE_INTERIOR: u32 = 0xFFFFFFFEu;
 const FACE_EMPTY_LINK: u32 = 0xFFFFFFFFu;

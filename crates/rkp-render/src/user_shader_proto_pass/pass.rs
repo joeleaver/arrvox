@@ -250,24 +250,9 @@ fn build_proto_pipeline(
 /// `compose_geom_source` in `user_shader_pass.rs`.
 pub fn compose_proto_source(proto_chunk: &str) -> String {
     let template = include_str!("../shaders/user_shader_proto.wgsl");
-    if proto_chunk.is_empty() {
-        return template.to_string();
-    }
-    // Marker strings constructed via concat so the `find` below isn't
-    // fooled by literal occurrences in this docstring or elsewhere in
-    // the Rust source.
-    let begin_marker = concat!("USER_PROTO_DISPATCH", "_BEGIN");
-    let end_marker = concat!("USER_PROTO_DISPATCH", "_END");
-    let begin = template
-        .find(begin_marker)
-        .expect("user_shader_proto.wgsl missing USER_PROTO_DISPATCH_BEGIN marker");
-    let end_after = template[begin..]
-        .find(end_marker)
-        .map(|off| begin + off + end_marker.len())
-        .expect("user_shader_proto.wgsl missing USER_PROTO_DISPATCH_END marker");
-    let mut out = String::with_capacity(template.len() + proto_chunk.len());
-    out.push_str(&template[..begin]);
-    out.push_str(proto_chunk);
-    out.push_str(&template[end_after..]);
-    out
+    crate::shader_composer::splice_const_marker(
+        template,
+        concat!("USER_PROTO_DISPATCH"),
+        proto_chunk,
+    )
 }

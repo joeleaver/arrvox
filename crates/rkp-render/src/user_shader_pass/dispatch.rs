@@ -113,23 +113,11 @@ const _: () = assert!(std::mem::size_of::<ActiveCell>() == 32);
 /// chunk leaves the in-tree identity stub in place.
 pub fn compose_geom_source(user_chunk: &str) -> String {
     let geom_src = include_str!("../shaders/user_shader_geom.wgsl");
-    if user_chunk.is_empty() {
-        return geom_src.to_string();
-    }
-    const BEGIN: &str = "// USER_GENERATE_DISPATCH_BEGIN";
-    const END: &str = "// USER_GENERATE_DISPATCH_END";
-    let begin = geom_src.find(BEGIN).expect(
-        "user_shader_geom.wgsl missing USER_GENERATE_DISPATCH_BEGIN marker",
-    );
-    let end_after = geom_src[begin..]
-        .find(END)
-        .map(|off| begin + off + END.len())
-        .expect("user_shader_geom.wgsl missing USER_GENERATE_DISPATCH_END marker");
-    let mut out = String::with_capacity(geom_src.len() + user_chunk.len());
-    out.push_str(&geom_src[..begin]);
-    out.push_str(user_chunk);
-    out.push_str(&geom_src[end_after..]);
-    out
+    crate::shader_composer::splice_const_marker(
+        geom_src,
+        "USER_GENERATE_DISPATCH",
+        user_chunk,
+    )
 }
 
 /// Holds the BFS pipelines, the transient resources they own, and the

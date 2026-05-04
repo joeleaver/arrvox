@@ -605,7 +605,7 @@ fn voxel_emit_skip() -> VoxelEmit {
     return v;
 }
 
-// USER_GENERATE_DISPATCH_BEGIN
+const USER_GENERATE_DISPATCH_BEGIN: u32 = 0u;
 // Default identity stub — the Rust composer replaces this block with the
 // concatenated user-shader bodies + `dispatch_user_generate` switch when
 // any registered shader provides a `generate` hook. The empty-registry
@@ -613,7 +613,7 @@ fn voxel_emit_skip() -> VoxelEmit {
 fn dispatch_user_generate(shader_id: u32, cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx) -> VoxelEmit {
     return voxel_emit_skip();
 }
-// USER_GENERATE_DISPATCH_END
+const USER_GENERATE_DISPATCH_END: u32 = 0u;
 
 // V2 band-cell anchor — surface projection along the host distance
 // field's gradient. Six extra `host_sample_in_region` calls (central

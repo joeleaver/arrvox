@@ -793,28 +793,16 @@ impl RkpShadePass {
 }
 
 /// Compose the shade-pass WGSL source. The user chunk replaces the
-/// in-tree identity stub between the
-/// `// USER_SHADE_DISPATCH_BEGIN` / `_END` markers in `rkp_shade.wgsl`.
-/// Pass `""` for the no-shaders case (default identity stub stays put).
+/// in-tree identity stub between the `USER_SHADE_DISPATCH_BEGIN` /
+/// `_END` const-decl anchors in `rkp_shade.wgsl`. Pass `""` for the
+/// no-shaders case (default identity stub stays put).
 pub fn compose_shade_source(user_chunk: &str) -> String {
     let shade_src = include_str!("shaders/rkp_shade.wgsl");
-    if user_chunk.is_empty() {
-        return shade_src.to_string();
-    }
-    const BEGIN: &str = "// USER_SHADE_DISPATCH_BEGIN";
-    const END: &str = "// USER_SHADE_DISPATCH_END";
-    let begin = shade_src.find(BEGIN).expect(
-        "rkp_shade.wgsl missing USER_SHADE_DISPATCH_BEGIN marker",
-    );
-    let end_after = shade_src[begin..]
-        .find(END)
-        .map(|off| begin + off + END.len())
-        .expect("rkp_shade.wgsl missing USER_SHADE_DISPATCH_END marker");
-    let mut out = String::with_capacity(shade_src.len() + user_chunk.len());
-    out.push_str(&shade_src[..begin]);
-    out.push_str(user_chunk);
-    out.push_str(&shade_src[end_after..]);
-    out
+    crate::shader_composer::splice_const_marker(
+        shade_src,
+        "USER_SHADE_DISPATCH",
+        user_chunk,
+    )
 }
 
 fn build_shade_pipeline(

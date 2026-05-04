@@ -543,7 +543,7 @@ fn descend_proto_octree(
     return r;
 }
 
-// USER_INSTANCE_AT_DISPATCH_BEGIN
+const USER_INSTANCE_AT_DISPATCH_BEGIN: u32 = 0u;
 // Default identity stub — Rust composer replaces this whole block
 // (markers + body) with per-shader descent helpers + the dispatch
 // switch when any registered shader provides an `instance_at` hook.
@@ -567,7 +567,7 @@ fn dispatch_user_instance_descend(
     r.world_normal = vec3<f32>(0.0, 1.0, 0.0);
     return r;
 }
-// USER_INSTANCE_AT_DISPATCH_END
+const USER_INSTANCE_AT_DISPATCH_END: u32 = 0u;
 
 fn skip_node_t(pos: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, node_depth: u32, extent: f32, vs: f32) -> f32 {
     let node_size = extent / f32(1u << node_depth);

@@ -651,11 +651,11 @@ fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
 // every registered shader's `user_<name>_shade` body. Phase B keeps
 // the in-tree identity stub here so the file compiles standalone.
 
-// USER_SHADE_DISPATCH_BEGIN
+const USER_SHADE_DISPATCH_BEGIN: u32 = 0u;
 fn dispatch_user_shade(shader_id: u32, ctx: ShadeCtx) -> ShadeResult {
     return shade_result_passthrough(ctx);
 }
-// USER_SHADE_DISPATCH_END
+const USER_SHADE_DISPATCH_END: u32 = 0u;
 
 // --- Main ---
 

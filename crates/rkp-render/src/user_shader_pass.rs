@@ -64,8 +64,8 @@
 //! ## Compose contract
 //!
 //! `compose_geom_source` splices the composer's `generate` chunk
-//! between `// USER_GENERATE_DISPATCH_BEGIN/_END` markers in
-//! `user_shader_geom.wgsl`. User shaders that called
+//! between the `USER_GENERATE_DISPATCH_BEGIN/_END` const-decl
+//! anchors in `user_shader_geom.wgsl`. User shaders that called
 //! `host_sample_at(world_pos)` keep working unchanged.
 
 pub mod cache;

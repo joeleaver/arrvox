@@ -18,7 +18,15 @@
 //!
 //! [`splice_inst_chunks`] is a small splice helper consumers call to
 //! drop the `instance_at` chunk into a host-side WGSL template
-//! between the `USER_INSTANCE_AT_DISPATCH_BEGIN/END` markers.
+//! between the `USER_INSTANCE_AT_DISPATCH_BEGIN/END` const-decl
+//! anchors. The four splice consumers (this one plus the shade,
+//! generate, and proto pipelines) all funnel through
+//! [`splice_const_marker`].
+//!
+//! Anchor form: `const USER_<NAME>_BEGIN: u32 = 0u;` — declarations
+//! survive WESL's parse-and-emit roundtrip (line comments do not),
+//! so the same templates can be either text-spliced raw `.wgsl` or
+//! WESL-emitted `.wesl` and the splicer keeps working.
 
 use super::types::{ComposedChunks, UserShaderRegistry};
 
@@ -46,25 +54,35 @@ pub fn splice_inst_chunks(
     template: &str,
     instance_at_chunk: &str,
 ) -> String {
-    splice_user_marker(
+    splice_const_marker(
         template,
-        concat!("USER_INSTANCE_AT_DISPATCH", "_BEGIN"),
-        concat!("USER_INSTANCE_AT_DISPATCH", "_END"),
+        concat!("USER_INSTANCE_AT_DISPATCH"),
         instance_at_chunk,
     )
 }
 
-fn splice_user_marker(template: &str, begin: &str, end: &str, chunk: &str) -> String {
+/// Replace everything from the `const <NAME>_BEGIN: u32 = 0u;`
+/// declaration through the matching `const <NAME>_END: u32 = 0u;`
+/// declaration (inclusive, both anchors consumed) with `chunk`. Empty
+/// chunk returns the template unchanged — anchors stay in place and
+/// behave as harmless unused const declarations.
+///
+/// Const-decl anchors (versus comment markers) survive WESL's
+/// parse-emit roundtrip; this is the splice contract every
+/// user-shader pipeline depends on.
+pub fn splice_const_marker(template: &str, marker_name: &str, chunk: &str) -> String {
     if chunk.is_empty() {
         return template.to_string();
     }
+    let begin = format!("const {marker_name}_BEGIN: u32 = 0u;");
+    let end = format!("const {marker_name}_END: u32 = 0u;");
     let begin_idx = template
-        .find(begin)
-        .unwrap_or_else(|| panic!("template missing {begin} marker"));
+        .find(&begin)
+        .unwrap_or_else(|| panic!("template missing `{begin}` anchor"));
     let end_idx = template[begin_idx..]
-        .find(end)
+        .find(&end)
         .map(|off| begin_idx + off + end.len())
-        .unwrap_or_else(|| panic!("template missing {end} marker"));
+        .unwrap_or_else(|| panic!("template missing `{end}` anchor"));
     let mut out = String::with_capacity(template.len() + chunk.len());
     out.push_str(&template[..begin_idx]);
     out.push_str(chunk);
