@@ -32,6 +32,8 @@ import package::lib::types::RkpInstance;
 import package::lib::types::GpuMaterial;
 import package::lib::types::mat_albedo;
 import package::lib::types::CameraUniforms;
+import package::lib::types::TlasNode;
+import package::lib::types::TlasInstanceLeaf;
 // Shadow rays scan every object every ray — AABB misses short-circuit
 // cheaply, and shadow rays go in arbitrary directions so the march
 // pass's screen-space per-tile lists don't apply.
@@ -450,18 +452,6 @@ fn fetch_leaf_color_for(inst: RkpInstance, leaf_slot: u32) -> u32 {
 // Phase 7 — TLAS over instance AABBs. Built each frame on CPU by
 // `TlasPass::build_tlas` and uploaded; shadow trace traverses
 // stack-based to find candidate occluders.
-struct TlasNode {
-    aabb_min: vec3<f32>,
-    left_or_leaf: u32,    // high bit = leaf marker (0x80000000)
-    aabb_max: vec3<f32>,
-    right_or_count: u32,
-}
-struct TlasInstanceLeaf {
-    asset_id: u32,
-    instance_state_offset: u32,  // legacy field kept for TLAS wire-format compatibility
-    material_id: u32,
-    instance_index: u32,         // host: index into instances[]; user-shader: TLAS_LEAF_USER_SHADER
-}
 @group(2) @binding(8) var<storage, read> tlas_nodes: array<TlasNode>;
 @group(2) @binding(9) var<storage, read> tlas_leaves: array<TlasInstanceLeaf>;
 

@@ -11,16 +11,7 @@
 // land in the same Morton bucket (common for sibling blades inside
 // one painted leaf).
 
-struct TlasPrim {
-    aabb_min: vec3<f32>,
-    asset_id: u32,
-    aabb_max: vec3<f32>,
-    instance_state_offset: u32,
-    material_id: u32,
-    instance_index: u32,
-    _pad0: u32,
-    _pad1: u32,
-}
+import package::lib::types::TlasPrim;
 
 struct MortonUniform {
     // Engine-computed scene AABB. CPU walks the per-frame region

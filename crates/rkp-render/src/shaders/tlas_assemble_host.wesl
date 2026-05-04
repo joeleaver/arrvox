@@ -12,16 +12,7 @@
 // user-shader pass uses, so the engine fires both dispatches
 // before Session 2's Morton sort consumes the unified buffer.
 
-struct TlasPrim {
-    aabb_min: vec3<f32>,
-    asset_id: u32,
-    aabb_max: vec3<f32>,
-    instance_state_offset: u32,
-    material_id: u32,
-    instance_index: u32,
-    _pad0: u32,
-    _pad1: u32,
-}
+import package::lib::types::TlasPrim;
 
 // Mirrors `RkpGpuInstance` (128 B). Only the fields this pass needs
 // are referenced.

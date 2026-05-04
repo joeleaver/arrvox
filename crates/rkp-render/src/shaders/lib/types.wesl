@@ -124,3 +124,40 @@ struct CameraUniforms {
     prev_vp: mat4x4<f32>,
     view_proj: mat4x4<f32>,
 }
+
+// TLAS primitive (32 bytes) — one per scene instance, fed into Karras
+// LBVH construction. CPU-side mirror is `rkp_render::tlas`.
+struct TlasPrim {
+    aabb_min: vec3<f32>,
+    asset_id: u32,
+    aabb_max: vec3<f32>,
+    instance_state_offset: u32,
+    material_id: u32,
+    instance_index: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+// TLAS BVH node (32 bytes). Output of Karras construction; consumed
+// by rkp_shadow_trace's BVH descent.
+//
+// `left_or_leaf` high bit (0x80000000) is the leaf marker — when set,
+// the low bits index into the TlasInstanceLeaf array; when clear, they
+// index the next interior node.
+struct TlasNode {
+    aabb_min: vec3<f32>,
+    left_or_leaf: u32,
+    aabb_max: vec3<f32>,
+    right_or_count: u32,
+}
+
+// One per TLAS leaf — what the BVH descent yields when it hits a leaf.
+// `instance_state_offset` is kept for TLAS wire-format compatibility;
+// `instance_index` is the index into `instances[]` for hosts, or the
+// `TLAS_LEAF_USER_SHADER` sentinel for user-shader proto leaves.
+struct TlasInstanceLeaf {
+    asset_id: u32,
+    instance_state_offset: u32,
+    material_id: u32,
+    instance_index: u32,
+}

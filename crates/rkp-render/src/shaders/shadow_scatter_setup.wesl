@@ -18,13 +18,7 @@
 // is the number of 8×8 blocks needed to cover the instance's
 // projected rect. Each tile becomes one workgroup in the scatter.
 
-struct TlasPrim {
-    aabb_min: vec3<f32>, asset_id: u32,
-    aabb_max: vec3<f32>, instance_state_offset: u32,
-    material_id: u32,
-    instance_index: u32,
-    _pad0: u32, _pad1: u32,
-}
+import package::lib::types::TlasPrim;
 
 struct LightCameraShadow {
     view_proj: mat4x4<f32>,

@@ -36,32 +36,11 @@
 // `(morton[i] << 32) | i` so duplicates produce strictly increasing
 // virtual keys, matching Karras' uniqueness assumption.
 
+import package::lib::types::TlasPrim;
+import package::lib::types::TlasNode;
+import package::lib::types::TlasInstanceLeaf;
+
 const TLAS_NODE_LEAF_BIT: u32 = 0x80000000u;
-
-struct TlasPrim {
-    aabb_min: vec3<f32>,
-    asset_id: u32,
-    aabb_max: vec3<f32>,
-    instance_state_offset: u32,
-    material_id: u32,
-    instance_index: u32,
-    _pad0: u32,
-    _pad1: u32,
-}
-
-struct TlasNode {
-    aabb_min: vec3<f32>,
-    left_or_leaf: u32,
-    aabb_max: vec3<f32>,
-    right_or_count: u32,
-}
-
-struct TlasInstanceLeaf {
-    asset_id: u32,
-    instance_state_offset: u32,
-    material_id: u32,
-    instance_index: u32,
-}
 
 struct KarrasUniform {
     // Number of primitives = number of leaves = N. Internal node
