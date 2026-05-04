@@ -4,6 +4,15 @@
 //   bit 31 = LEAF, bit 30 = BRICK, bit 29 = BAND, bits 28..0 = payload.
 // Two whole-word sentinels (EMPTY, INTERIOR) take precedence over the
 // bit-pattern interpretation — slot helpers must reject them.
+//
+// Renderer-wide convention: `0xFFFFFFFFu` (= u32::MAX) is the
+// "no value here" sentinel. The same numeric value is reused in
+// several semantically distinct contexts (OCTREE_EMPTY,
+// BRICK_CELL_EMPTY, INTERNAL_ATTR_NONE, FACE_EMPTY_LINK,
+// HOST_NO_HOST_SENTINEL); the names document intent at the call
+// site, the value is shared because u32::MAX is the most
+// distinctive sentinel a 32-bit field can carry. Mirrored on the
+// Rust side as `rkp_render::sentinels::SENTINEL_NONE`.
 
 const OCTREE_EMPTY:        u32 = 0xFFFFFFFFu;
 const OCTREE_INTERIOR:     u32 = 0xFFFFFFFEu;

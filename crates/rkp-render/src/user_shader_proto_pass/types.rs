@@ -154,6 +154,6 @@ pub const PROTO_TAIL_BRICK_BYTES: u64 = 16 * 1024 * 1024;
 pub const PROTO_TAIL_LEAF_ATTR_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Constants mirrored from `user_shader_proto.wgsl`. Kept in Rust so
-/// the CPU pre-builder doesn't have to read the WGSL.
-pub const OCTREE_EMPTY: u32 = 0xFFFFFFFFu32;
-pub const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu32;
+/// the CPU pre-builder doesn't have to read the WGSL. Both alias
+/// [`crate::sentinels::SENTINEL_NONE`] (= `u32::MAX`).
+pub use crate::sentinels::{INTERNAL_ATTR_NONE, OCTREE_EMPTY};

@@ -4,6 +4,8 @@
 //! deferred shadow/AO and PBR shading. Post-processing (tone mapping, bloom,
 //! wireframe overlay) is handled by passes in this crate.
 
+/// `0xFFFFFFFFu`-as-sentinel constants shared with WGSL.
+pub mod sentinels;
 /// GPU device/queue wrapper.
 pub mod context;
 /// G-buffer textures for deferred shading.
