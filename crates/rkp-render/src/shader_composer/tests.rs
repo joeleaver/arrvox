@@ -131,6 +131,61 @@ return r;
     assert!(shade.trim_end().ends_with('}'));
 }
 
+// A line comment containing `/*` must not trip the block-comment
+// scanner — the `//` claims everything to end-of-line.
+#[test]
+fn line_comment_swallows_block_comment_opener() {
+    let src = r#"
+fn user_test_shade(ctx: ShadeCtx) -> ShadeResult {
+// look ma /* not a block comment } { }
+var r: ShadeResult;
+return r;
+}
+"#;
+    let tmp = tempfile_dir("linecmt_blockopen");
+    write(&tmp, "test.wgsl", src);
+    let reg = scan_dir(&tmp).unwrap();
+    let shade = reg.entries()[0].shade_text.as_ref().unwrap();
+    assert!(shade.contains("return r;"));
+    assert!(shade.trim_end().ends_with('}'));
+}
+
+// A block comment containing `//` must not terminate early — only
+// `*/` ends a block comment.
+#[test]
+fn block_comment_swallows_line_comment_marker() {
+    let src = r#"
+fn user_test_shade(ctx: ShadeCtx) -> ShadeResult {
+/* this is // not a line comment } { } } */
+var r: ShadeResult;
+return r;
+}
+"#;
+    let tmp = tempfile_dir("blockcmt_lineopen");
+    write(&tmp, "test.wgsl", src);
+    let reg = scan_dir(&tmp).unwrap();
+    let shade = reg.entries()[0].shade_text.as_ref().unwrap();
+    assert!(shade.contains("return r;"));
+    assert!(shade.trim_end().ends_with('}'));
+}
+
+// An unterminated block comment must fail — earlier behaviour silently
+// walked past EOF, which made downstream errors hard to attribute.
+#[test]
+fn rejects_unterminated_block_comment() {
+    let src = r#"
+fn user_test_shade(ctx: ShadeCtx) -> ShadeResult {
+/* never closed
+var r: ShadeResult;
+return r;
+}
+"#;
+    let tmp = tempfile_dir("unterminated_block");
+    write(&tmp, "test.wgsl", src);
+    let err = scan_dir(&tmp).unwrap_err();
+    assert!(matches!(err, ShaderComposerError::Parse { .. }));
+}
+
 #[test]
 fn rejects_unknown_hook() {
     let src = r#"

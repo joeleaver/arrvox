@@ -663,28 +663,53 @@ fn find_open_brace(source: &str, from: usize) -> Option<usize> {
     None
 }
 
+/// Brace-balance scan from an opening `{` to its matching `}`.
+///
+/// The input is assumed to be syntactically valid WGSL inside the
+/// function body. WGSL has no string or character literals and no
+/// nested block comments, so the only constructs that can contain a
+/// stray `{` or `}` are line (`//`) and block (`/* ... */`)
+/// comments. Both forms are skipped here.
+///
+/// Multi-byte UTF-8 is safe to byte-scan: continuation bytes
+/// (0x80..=0xBF) and lead bytes (0xC2+) never collide with the
+/// 0x7B/0x7D bytes for `{`/`}` or with `/`/`*`.
+///
+/// Returns the index of the matching `}`, or `None` for unbalanced
+/// input or an unterminated block comment.
 fn match_brace(source: &str, open: usize) -> Option<usize> {
     debug_assert_eq!(source.as_bytes()[open], b'{');
+    let bytes = source.as_bytes();
     let mut depth: i32 = 1;
     let mut i = open + 1;
-    while i < source.len() {
-        let b = source.as_bytes()[i];
-        // Skip comments inside the body so braces in `// {` don't
-        // throw the depth count off.
-        if b == b'/' && i + 1 < source.len() && source.as_bytes()[i + 1] == b'/' {
-            while i < source.len() && source.as_bytes()[i] != b'\n' {
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Line comment — skip to the newline. Anything inside is
+        // inert (including a literal `/*` that would otherwise look
+        // like a block-comment start).
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
             }
             continue;
         }
-        if b == b'/' && i + 1 < source.len() && source.as_bytes()[i + 1] == b'*' {
+        // Block comment — skip to the next `*/`. WGSL forbids nesting
+        // so we only consume the first terminator. Unterminated
+        // comment (no `*/` before EOF) is a malformed input — fail
+        // closed by returning `None`.
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
             i += 2;
-            while i + 1 < source.len() {
-                if source.as_bytes()[i] == b'*' && source.as_bytes()[i + 1] == b'/' {
+            let mut closed = false;
+            while i + 1 < bytes.len() {
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
                     i += 2;
+                    closed = true;
                     break;
                 }
                 i += 1;
+            }
+            if !closed {
+                return None;
             }
             continue;
         }
