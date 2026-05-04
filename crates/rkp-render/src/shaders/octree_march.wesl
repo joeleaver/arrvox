@@ -427,13 +427,6 @@ fn invert_rigid(m: mat4x4<f32>) -> mat4x4<f32> {
     );
 }
 
-// `intersect_aabb` is duplicated across splice-consumer files
-// (octree_march, rkp_shadow_trace, shadow_scatter) — it gets
-// referenced from the user-shader composer's spliced
-// `instance_at` chunk, which uses the unmangled name. Lifting it
-// to lib would break the splice (WESL renames imported symbols).
-// See `lib/math.wesl` for the canonical comment.
-
 fn bucket_depth(phase: u32, level: u32) {
     // 12 buckets per phase starting at stats[4]. Levels beyond 11 clamp to 11.
     let base = 4u + phase * 12u;

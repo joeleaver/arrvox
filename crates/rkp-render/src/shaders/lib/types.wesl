@@ -94,11 +94,6 @@ struct RkpInstance {
 
 // GPU material record (96 bytes). CPU-side mirror is
 // `rkp_scene::GpuMaterial`; field order locked by `bytemuck` cast.
-//
-// NOTE: rkp_shade.wesl and rkp_glass.wesl declare a *separate* `Material`
-// struct (similar shape, different padding tail, currently diverged
-// from each other on `instance_shader_id`). Unifying `Material` ↔
-// `GpuMaterial` is its own refactor — out of scope for this module.
 struct GpuMaterial {
     albedo_r: f32, albedo_g: f32, albedo_b: f32,
     roughness: f32,

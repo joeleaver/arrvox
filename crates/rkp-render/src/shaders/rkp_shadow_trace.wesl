@@ -7,9 +7,9 @@
 // texture. The shade pass upsamples this with a position/normal-weighted
 // bilateral filter.
 //
-// Shared helpers (types, bindings, octree_lookup, trace_shadow_ray) are
-// duplicated from octree_march.wgsl for now — refactor into a common
-// file once the half-res shadow path has stuck.
+// Shared types/bindings/octree helpers come in via `lib::*` imports
+// below. Per-pass behaviour (LOD gating, the band-cell shadow branch,
+// glass attenuation) lives in this file.
 
 import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::math::mat4_affine_inverse;
@@ -69,43 +69,8 @@ import package::lib::types::InstanceHit;
 // bricks via brick_face_links, so a single inner loop can traverse
 // many bricks before the outer loop needs to intervene.
 
-// Face-link sentinels — must match rkp_core::brick_face_links.
-
-// Per-instance + per-asset records — see octree_march.wgsl for the
-// authoritative layouts. Shadow trace marches the same scene the primary
-// march does, so the structs and bindings mirror.
-
-
-
-// vec3 fields flattened to f32 components — see rkp_shade.wgsl for the
-// full rationale (WGSL vec3 alignment would pad this to 128 bytes, but
-// the Rust/GpuMaterial is tightly packed at 96).
-// Phase B-redux 3b — band-cell wire format. Mirrors
-// `octree_march.wgsl::BandCell` (and the Rust `GpuBandCell` it
-// targets). Each band cell's payload reinterprets two consecutive
-// `leaf_attr_pool` slots; see `read_band_cell` below.
-// Phase 4 — user-shader-facing types for the band-cell shadow
-// dispatch. Same shapes as octree_march.wgsl so the composer's
-// shared `dispatch_user_instance_descend` body splices in
-// unchanged. Wire-format with the corresponding Rust structs.
-
-
-
-// World-space AABB returned by per-shader `inst_aabb` hooks. Mirrors
-// `octree_march.wgsl::Aabb`; needed here because the composer-emitted
-// `rkp_user_<id>_inst_aabb` body returns this type.
-
 // Stats phase for `descend_proto_octree`'s internal `octree_lookup`.
 const PROTO_PHASE: u32 = PHASE_SHADOW;
-
-// `unpack_oct_normal` is imported from `lib::oct_normal` at the top
-// of this file.
-
-// Prototype-octree descent, mirror of `octree_march.wgsl::descend_proto_octree`.
-// Signature differs only in the inner `octree_lookup` call — shadow_trace's
-// 5-arg variant skips the LOD machinery the primary march uses (LOD is
-// pointless for shadow rays + small proto octrees). Called from the
-// composer-emitted per-shader `rkp_user_<id>_instance_descend` body.
 
 
 
@@ -238,12 +203,6 @@ const TLAS_LEAF_USER_SHADER: u32 = 0xFFFFFFFEu;
 const TLAS_STACK_DEPTH: u32 = 32u;
 
 
-
-// `intersect_aabb` is duplicated across splice-consumer files
-// (octree_march, rkp_shadow_trace, shadow_scatter) — it gets
-// referenced from the user-shader composer's spliced
-// `instance_at` chunk, which uses the unmangled name. Lifting it
-// to lib would break the splice (WESL renames imported symbols).
 
 fn bucket_depth(phase: u32, level: u32) {
     let base = 4u + phase * 12u;

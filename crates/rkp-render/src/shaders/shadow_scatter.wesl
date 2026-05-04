@@ -142,13 +142,6 @@ struct MarchParamsLite {
 // ── Helpers (mirror of the host march; see shadow_scatter docs
 //   for context on the find_hit_in_instance contract). ─────────
 
-// `mat4_affine_inverse` is imported from `lib::math` at the top.
-//
-// `intersect_aabb` stays local — it gets referenced from the
-// user-shader composer's spliced `instance_at` chunk, which uses
-// the unmangled name. Lifting it to lib would break the splice
-// (WESL renames imported symbols).
-
 fn safe_dir3(d: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(
         select(d.x, select(-1e-10, 1e-10, d.x >= 0.0), abs(d.x) < 1e-10),

@@ -1,10 +1,10 @@
 // General-purpose math helpers shared across shaders. Anything here
 // must be pure: no bindings, no struct dependencies, no side effects.
 //
-// As of Wave V the build runs WESL with `ManglerKind::None`, so
-// helpers used inside `shader_composer` text splices (`intersect_aabb`)
-// can live here just like any other helper — names round-trip
-// through imports unmodified.
+// As of Wave V the build runs WESL with `ManglerKind::None`, so any
+// helper here is reachable both from native imports and from
+// shader-composer text splices — names round-trip through imports
+// unmodified.
 
 // Ray-sphere intersection (origin assumed at sphere centre's frame).
 // Returns (t_enter, t_exit) in `vec2<f32>(-1.0, -1.0)` on miss.
