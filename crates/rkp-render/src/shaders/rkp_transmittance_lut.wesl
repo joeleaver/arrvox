@@ -13,6 +13,7 @@ import package::lib::atmosphere::EARTH_RADIUS;
 import package::lib::atmosphere::ATMO_RADIUS;
 import package::lib::atmosphere::sample_extinction;
 import package::lib::atmosphere::uv_to_transmittance_params;
+import package::lib::math::ray_sphere_exit;
 
 const NUM_STEPS: u32 = 40u;
 
@@ -20,15 +21,7 @@ const NUM_STEPS: u32 = 40u;
 
 @group(0) @binding(0) var transmittance_out: texture_storage_2d<rgba16float, write>;
 
-// --- Helpers ---
-
-fn ray_sphere_exit(origin: vec3<f32>, dir: vec3<f32>, radius: f32) -> f32 {
-    let b = dot(origin, dir);
-    let c = dot(origin, origin) - radius * radius;
-    let d = b * b - c;
-    if d < 0.0 { return -1.0; }
-    return -b + sqrt(d);
-}
+// `ray_sphere_exit` is imported from `lib::math` at the top.
 
 // --- Main ---
 

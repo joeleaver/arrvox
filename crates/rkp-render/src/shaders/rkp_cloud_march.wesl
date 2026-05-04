@@ -14,6 +14,8 @@
 //
 // Distance fog / participating-medium haze live in rkp_fog_march.wgsl.
 
+import package::lib::math::interleaved_gradient_noise;
+
 const PI: f32 = 3.14159265;
 
 // Matches the CPU-side VolumetricParams layout. Must stay in sync with the
@@ -63,13 +65,7 @@ struct CloudParams {
 @group(0) @binding(4) var history_scatter: texture_2d<f32>;
 
 // --- Helpers ---
-
-fn interleaved_gradient_noise(pixel: vec2<f32>, frame: u32) -> f32 {
-    let magic = vec3<f32>(0.06711056, 0.00583715, 52.9829189);
-    let offset = 5.588238 * f32(frame % 64u);
-    let p = pixel + vec2<f32>(offset, offset);
-    return fract(magic.z * fract(dot(p, magic.xy)));
-}
+// `interleaved_gradient_noise` is imported from `lib::math` at the top.
 
 fn henyey_greenstein(cos_theta: f32, g: f32) -> f32 {
     let g2 = g * g;

@@ -15,6 +15,7 @@ import package::lib::atmosphere::sample_extinction;
 import package::lib::atmosphere::transmittance_params_to_uv;
 import package::lib::atmosphere::rayleigh_phase;
 import package::lib::atmosphere::cornette_shanks;
+import package::lib::math::ray_sphere;
 
 const PI: f32 = 3.14159265;
 
@@ -300,14 +301,7 @@ const AP_FAR_DISTANCE: f32 = 128000.0;
 const MIE_G: f32 = 0.8;
 const SUN_ANGULAR_RADIUS: f32 = 0.004675;
 
-fn ray_sphere(origin: vec3<f32>, dir: vec3<f32>, radius: f32) -> vec2<f32> {
-    let b = dot(origin, dir);
-    let c = dot(origin, origin) - radius * radius;
-    let d = b * b - c;
-    if d < 0.0 { return vec2<f32>(-1.0, -1.0); }
-    let s = sqrt(d);
-    return vec2<f32>(-b - s, -b + s);
-}
+// `ray_sphere` is imported from `lib::math` at the top.
 
 fn sample_scattering(altitude: f32) -> vec2<f32> {
     let density_r = exp(-altitude / RAYLEIGH_SCALE_H);

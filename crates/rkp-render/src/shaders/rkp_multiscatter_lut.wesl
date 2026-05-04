@@ -21,6 +21,7 @@ import package::lib::atmosphere::BETA_R;
 import package::lib::atmosphere::BETA_M_SCAT;
 import package::lib::atmosphere::sample_extinction;
 import package::lib::atmosphere::transmittance_params_to_uv;
+import package::lib::math::ray_sphere_exit;
 
 const GROUND_ALBEDO: vec3<f32> = vec3<f32>(0.3, 0.3, 0.3);
 
@@ -46,13 +47,7 @@ fn sample_scattering(altitude: f32) -> vec3<f32> {
     return density_r * BETA_R + density_m * BETA_M_SCAT;
 }
 
-fn ray_sphere_exit(origin: vec3<f32>, dir: vec3<f32>, radius: f32) -> f32 {
-    let b = dot(origin, dir);
-    let c = dot(origin, origin) - radius * radius;
-    let d = b * b - c;
-    if d < 0.0 { return -1.0; }
-    return -b + sqrt(d);
-}
+// `ray_sphere_exit` is imported from `lib::math` at the top.
 
 fn ray_sphere_entry(origin: vec3<f32>, dir: vec3<f32>, radius: f32) -> f32 {
     let b = dot(origin, dir);

@@ -12,6 +12,7 @@
 // file once the half-res shadow path has stuck.
 
 import package::lib::oct_normal::unpack_oct_normal;
+import package::lib::math::mat4_affine_inverse;
 import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
 import package::lib::octree_slot::OCTREE_LEAF_BIT;
@@ -482,23 +483,7 @@ fn fetch_leaf_color_for(inst: RkpInstance, leaf_slot: u32) -> u32 {
 // Inverse of an affine 4x4 matrix. See `mat4_affine_inverse` in
 // octree_march.wgsl for the full derivation. Duplicated here because
 // shadow trace and primary march don't share a WGSL source file.
-fn mat4_affine_inverse(m: mat4x4<f32>) -> mat4x4<f32> {
-    let a = m[0].xyz;
-    let b = m[1].xyz;
-    let c = m[2].xyz;
-    let t = m[3].xyz;
-    let inv_det = 1.0 / dot(a, cross(b, c));
-    let row0 = cross(b, c) * inv_det;
-    let row1 = cross(c, a) * inv_det;
-    let row2 = cross(a, b) * inv_det;
-    let new_t = -vec3<f32>(dot(row0, t), dot(row1, t), dot(row2, t));
-    return mat4x4<f32>(
-        vec4<f32>(row0.x, row1.x, row2.x, 0.0),
-        vec4<f32>(row0.y, row1.y, row2.y, 0.0),
-        vec4<f32>(row0.z, row1.z, row2.z, 0.0),
-        vec4<f32>(new_t, 1.0),
-    );
-}
+// `mat4_affine_inverse` is imported from `lib::math` at the top.
 
 // Group 1: gbuf inputs (full-res, read) + half-res shadow output (write).
 @group(1) @binding(0) var gbuf_position: texture_2d<f32>;
@@ -547,6 +532,11 @@ const PHASE_SHADOW: u32 = 2u;
 
 fn leaf_attr_material_primary(a: LeafAttr) -> u32 { return a.material_packed & 0xFFFFu; }
 
+// `intersect_aabb` is duplicated across splice-consumer files
+// (octree_march, rkp_shadow_trace, shadow_scatter) — it gets
+// referenced from the user-shader composer's spliced
+// `instance_at` chunk, which uses the unmangled name. Lifting it
+// to lib would break the splice (WESL renames imported symbols).
 fn intersect_aabb(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>) -> vec2<f32> {
     let t0 = (box_min - origin) * inv_dir;
     let t1 = (box_max - origin) * inv_dir;

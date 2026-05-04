@@ -15,6 +15,7 @@ import package::lib::atmosphere::sample_extinction;
 import package::lib::atmosphere::transmittance_params_to_uv;
 import package::lib::atmosphere::rayleigh_phase;
 import package::lib::atmosphere::cornette_shanks;
+import package::lib::math::ray_sphere;
 
 const MIE_G: f32 = 0.8;
 
@@ -38,16 +39,7 @@ struct SkyViewParams {
 @group(0) @binding(3) var lut_sampler: sampler;
 @group(0) @binding(4) var sky_view_out: texture_storage_2d<rgba16float, write>;
 
-// --- File-local helpers (atmosphere math is imported from lib) ---
-
-fn ray_sphere(origin: vec3<f32>, dir: vec3<f32>, radius: f32) -> vec2<f32> {
-    let b = dot(origin, dir);
-    let c = dot(origin, origin) - radius * radius;
-    let d = b * b - c;
-    if d < 0.0 { return vec2<f32>(-1.0, -1.0); }
-    let s = sqrt(d);
-    return vec2<f32>(-b - s, -b + s);
-}
+// --- File-local helpers (atmosphere math + ray_sphere come from lib) ---
 
 fn lookup_transmittance(view_height: f32, cos_zenith: f32) -> vec3<f32> {
     let uv = transmittance_params_to_uv(view_height, cos_zenith);
