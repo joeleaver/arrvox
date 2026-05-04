@@ -42,6 +42,7 @@ import package::lib::octree_slot::OCTREE_LEAF_BIT;
 import package::lib::octree_slot::OCTREE_BRICK_BIT;
 import package::lib::octree_slot::OCTREE_BAND_BIT;
 import package::lib::octree_slot::OCTREE_PAYLOAD_MASK;
+import package::lib::types::LeafAttr;
 
 const BRICK_DIM: u32 = 4u;
 const BRICK_CELLS: u32 = 64u;
@@ -52,11 +53,6 @@ const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;
 // Rust pass writes into the same buffer.
 const OVERFLOW_BRICK: u32 = 1u;
 const OVERFLOW_LEAF_ATTR: u32 = 2u;
-
-struct LeafAttr {
-    normal_oct: u32,
-    material_packed: u32,
-}
 
 struct VoxelEmit {
     occupancy: u32,

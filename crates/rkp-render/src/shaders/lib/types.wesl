@@ -23,3 +23,17 @@ struct OctreeResult {
     cell_center: vec3<f32>,
     cell_half: f32,
 }
+
+// Per-leaf attributes (8 bytes), one entry in the per-asset pool. The
+// march samples one of these on every leaf hit to drive shading.
+//
+// `normal_oct`         2× snorm16 octahedral surface normal.
+// `material_packed`    bits  0..16: material_primary (u16)
+//                      bits 16..28: material_secondary (u12, shifted 16)
+//                      bits 28..32: blend_weight     (u4,  shifted 28)
+struct LeafAttr {
+    normal_oct: u32,
+    material_packed: u32,
+}
+
+fn leaf_attr_material_primary(a: LeafAttr) -> u32 { return a.material_packed & 0xFFFFu; }

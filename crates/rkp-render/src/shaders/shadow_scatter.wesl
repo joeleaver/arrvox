@@ -33,6 +33,7 @@ import package::lib::octree_slot::slot_is_band;
 import package::lib::octree_slot::slot_brick_id;
 import package::lib::octree_slot::slot_band_offset;
 import package::lib::types::OctreeResult;
+import package::lib::types::LeafAttr;
 const BRICK_DIM: u32 = 4u;
 const BRICK_DIM_F: f32 = 4.0;
 const BRICK_CELLS: u32 = 64u;
@@ -92,11 +93,6 @@ struct CameraUniforms {
     layer_mask: u32, focus_object_id: u32,
     _cam_pad0: u32, _cam_pad1: u32,
     prev_vp: mat4x4<f32>, view_proj: mat4x4<f32>,
-}
-
-struct LeafAttr {
-    normal_oct: u32,
-    material_packed: u32,
 }
 
 struct OverlayEntry {

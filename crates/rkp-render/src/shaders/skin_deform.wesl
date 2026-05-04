@@ -28,6 +28,7 @@
 
 import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::oct_normal::pack_oct_normal;
+import package::lib::types::LeafAttr;
 
 // ---- Scene bindings (reused from the main octree_march bind group) --
 // We don't need the full scene layout — just brick_pool, bone_matrices,
@@ -41,10 +42,6 @@ import package::lib::oct_normal::pack_oct_normal;
 // Also need the leaf-attr pool so we can fetch each leaf's rest
 // normal to forward-rotate into the deformed field. Same binding as
 // the main march reads.
-struct LeafAttr {
-    normal_oct: u32,
-    material_packed: u32,
-}
 @group(0) @binding(8) var<storage, read> leaf_attr_pool: array<LeafAttr>;
 // Bone field — scatter destination. Read-write here, vs. read-only in
 // the main march bind group (`octree_march.wgsl`); both groups

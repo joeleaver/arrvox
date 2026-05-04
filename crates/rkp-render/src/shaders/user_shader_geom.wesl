@@ -57,6 +57,8 @@
 // markers below (their literal names live further down the file
 // to avoid polluting `find`).
 
+import package::lib::types::LeafAttr;
+
 const BRICK_DIM: u32 = 4u;
 const BRICK_CELLS: u32 = 64u;
 const BRICK_CELL_EMPTY: u32 = 0xFFFFFFFFu;
@@ -84,11 +86,6 @@ const MAX_DEPTH: u32 = 8u;
 const SQRT3: f32 = 1.7320508075688772f;
 
 const HOST_NO_HOST_SENTINEL: u32 = 0xFFFFFFFFu;
-
-struct LeafAttr {
-    normal_oct: u32,
-    material_packed: u32,
-}
 
 struct HostSample {
     distance: f32,

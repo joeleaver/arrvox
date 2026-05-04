@@ -19,6 +19,8 @@ import package::lib::octree_slot::slot_is_band;
 import package::lib::octree_slot::slot_brick_id;
 import package::lib::octree_slot::slot_band_offset;
 import package::lib::types::OctreeResult;
+import package::lib::types::LeafAttr;
+import package::lib::types::leaf_attr_material_primary;
 
 const OPACITY_THRESHOLD: f32 = 0.05;
 // Safety-net ceiling for the outer ray-march loop. The ray already
@@ -256,12 +258,6 @@ struct GpuMaterial {
 @group(0) @binding(4) var<storage, read> color_pool_data: array<u32>;
 // leaf_attr[leaf_id] carries normal + material IDs. One 8-byte read per
 // hit; everything needed to shade the leaf.
-struct LeafAttr {
-    normal_oct: u32,                 // 2× snorm16 octahedral
-    material_packed: u32,            // low 16: material_primary
-                                     // mid 12:  material_secondary (shifted 16)
-                                     // high 4:  blend_weight (shifted 28)
-}
 // bone_matrices[offset + i] = forward skinning palette (world × inv_bind).
 // bone_matrices[offset + bone_count + i] = inverse skinning palette
 // used by the Phase-3b skinned march to invert deformed samples back
@@ -445,7 +441,6 @@ const FACE_PY: u32 = 3u;
 const FACE_NZ: u32 = 4u;
 const FACE_PZ: u32 = 5u;
 
-fn leaf_attr_material_primary(a: LeafAttr) -> u32 { return a.material_packed & 0xFFFFu; }
 fn leaf_attr_material_secondary(a: LeafAttr) -> u32 { return (a.material_packed >> 16u) & 0x0FFFu; }
 fn leaf_attr_blend_weight(a: LeafAttr) -> u32 { return (a.material_packed >> 28u) & 0x0Fu; }
 

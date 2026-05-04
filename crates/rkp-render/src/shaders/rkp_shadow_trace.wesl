@@ -25,6 +25,8 @@ import package::lib::octree_slot::slot_is_band;
 import package::lib::octree_slot::slot_brick_id;
 import package::lib::octree_slot::slot_band_offset;
 import package::lib::types::OctreeResult;
+import package::lib::types::LeafAttr;
+import package::lib::types::leaf_attr_material_primary;
 // Shadow rays scan every object every ray — AABB misses short-circuit
 // cheaply, and shadow rays go in arbitrary directions so the march
 // pass's screen-space per-tile lists don't apply.
@@ -143,11 +145,6 @@ struct GpuMaterial {
     shader_id: u32,
     instance_shader_id: u32,
     _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32,
-}
-
-struct LeafAttr {
-    normal_oct: u32,
-    material_packed: u32,
 }
 
 // Phase B-redux 3b — band-cell wire format. Mirrors
@@ -525,7 +522,6 @@ const TLAS_STACK_DEPTH: u32 = 32u;
 
 const PHASE_SHADOW: u32 = 2u;
 
-fn leaf_attr_material_primary(a: LeafAttr) -> u32 { return a.material_packed & 0xFFFFu; }
 
 // `intersect_aabb` is duplicated across splice-consumer files
 // (octree_march, rkp_shadow_trace, shadow_scatter) — it gets
