@@ -12,15 +12,16 @@
 // This captures ALL orders of scattering in one pass, fixing the orange horizon
 // that single-scattering produces at oblique viewing angles.
 
-const PI: f32 = 3.14159265;
-const EARTH_RADIUS: f32 = 6360000.0;
-const ATMO_RADIUS: f32 = 6460000.0;
-const RAYLEIGH_SCALE_H: f32 = 8000.0;
-const MIE_SCALE_H: f32 = 1200.0;
-const BETA_R: vec3<f32> = vec3<f32>(5.802e-6, 13.558e-6, 33.1e-6);
-const BETA_M_SCAT: vec3<f32> = vec3<f32>(3.996e-6, 3.996e-6, 3.996e-6);
-const BETA_M_EXT: vec3<f32> = vec3<f32>(4.44e-6, 4.44e-6, 4.44e-6);
-const BETA_OZONE: vec3<f32> = vec3<f32>(0.650e-6, 1.881e-6, 0.085e-6);
+import package::lib::atmosphere::PI;
+import package::lib::atmosphere::EARTH_RADIUS;
+import package::lib::atmosphere::ATMO_RADIUS;
+import package::lib::atmosphere::RAYLEIGH_SCALE_H;
+import package::lib::atmosphere::MIE_SCALE_H;
+import package::lib::atmosphere::BETA_R;
+import package::lib::atmosphere::BETA_M_SCAT;
+import package::lib::atmosphere::sample_extinction;
+import package::lib::atmosphere::transmittance_params_to_uv;
+
 const GROUND_ALBEDO: vec3<f32> = vec3<f32>(0.3, 0.3, 0.3);
 
 const NUM_MARCH_STEPS: u32 = 20u;
@@ -38,19 +39,6 @@ var<workgroup> shared_l: array<vec3<f32>, 64>;
 var<workgroup> shared_fms: array<vec3<f32>, 64>;
 
 // --- Helpers ---
-
-fn sample_extinction(altitude: f32) -> vec3<f32> {
-    let density_r = exp(-altitude / RAYLEIGH_SCALE_H);
-    let density_m = exp(-altitude / MIE_SCALE_H);
-    let h_km = altitude / 1000.0;
-    var density_o = 0.0;
-    if h_km < 25.0 {
-        density_o = max(h_km / 15.0 - 2.0 / 3.0, 0.0);
-    } else {
-        density_o = max(-h_km / 15.0 + 8.0 / 3.0, 0.0);
-    }
-    return density_r * BETA_R + density_m * BETA_M_EXT + density_o * BETA_OZONE;
-}
 
 fn sample_scattering(altitude: f32) -> vec3<f32> {
     let density_r = exp(-altitude / RAYLEIGH_SCALE_H);
@@ -72,20 +60,6 @@ fn ray_sphere_entry(origin: vec3<f32>, dir: vec3<f32>, radius: f32) -> f32 {
     let d = b * b - c;
     if d < 0.0 { return -1.0; }
     return -b - sqrt(d);
-}
-
-/// UV mapping for transmittance LUT lookup (Bruneton 2017).
-fn transmittance_params_to_uv(view_height: f32, cos_zenith: f32) -> vec2<f32> {
-    let H = sqrt(ATMO_RADIUS * ATMO_RADIUS - EARTH_RADIUS * EARTH_RADIUS);
-    let rho = sqrt(max(view_height * view_height - EARTH_RADIUS * EARTH_RADIUS, 0.0));
-    let d_min = ATMO_RADIUS - view_height;
-    let d_max = rho + H;
-    let disc = view_height * view_height * (cos_zenith * cos_zenith - 1.0)
-             + ATMO_RADIUS * ATMO_RADIUS;
-    let d = max(-view_height * cos_zenith + sqrt(max(disc, 0.0)), 0.0);
-    let u = clamp((d - d_min) / max(d_max - d_min, 1e-6), 0.0, 1.0);
-    let v = clamp(rho / max(H, 1e-6), 0.0, 1.0);
-    return vec2<f32>(u, v);
 }
 
 fn lookup_transmittance(view_height: f32, cos_zenith: f32) -> vec3<f32> {

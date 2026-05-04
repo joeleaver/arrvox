@@ -9,16 +9,10 @@
 //
 // Includes Rayleigh scattering, Mie extinction, and ozone absorption.
 
-// --- Atmosphere constants (Hillaire 2020 reference values) ---
-
-const EARTH_RADIUS: f32 = 6360000.0;       // meters
-const ATMO_RADIUS: f32 = 6460000.0;        // Earth + 100km
-const RAYLEIGH_SCALE_H: f32 = 8000.0;
-const MIE_SCALE_H: f32 = 1200.0;
-const BETA_R: vec3<f32> = vec3<f32>(5.802e-6, 13.558e-6, 33.1e-6);  // Rayleigh scattering
-const BETA_M_SCAT: vec3<f32> = vec3<f32>(3.996e-6, 3.996e-6, 3.996e-6);  // Mie scattering
-const BETA_M_EXT: vec3<f32> = vec3<f32>(4.44e-6, 4.44e-6, 4.44e-6);     // Mie extinction (scat + abs)
-const BETA_OZONE: vec3<f32> = vec3<f32>(0.650e-6, 1.881e-6, 0.085e-6);  // Ozone absorption
+import package::lib::atmosphere::EARTH_RADIUS;
+import package::lib::atmosphere::ATMO_RADIUS;
+import package::lib::atmosphere::sample_extinction;
+import package::lib::atmosphere::uv_to_transmittance_params;
 
 const NUM_STEPS: u32 = 40u;
 
@@ -34,44 +28,6 @@ fn ray_sphere_exit(origin: vec3<f32>, dir: vec3<f32>, radius: f32) -> f32 {
     let d = b * b - c;
     if d < 0.0 { return -1.0; }
     return -b + sqrt(d);
-}
-
-/// Sample atmospheric extinction (Rayleigh + Mie + Ozone) at a given altitude.
-fn sample_extinction(altitude: f32) -> vec3<f32> {
-    let density_r = exp(-altitude / RAYLEIGH_SCALE_H);
-    let density_m = exp(-altitude / MIE_SCALE_H);
-
-    // Ozone: tent profile peaking at 25km.
-    let h_km = altitude / 1000.0;
-    var density_o = 0.0;
-    if h_km < 25.0 {
-        density_o = max(h_km / 15.0 - 2.0 / 3.0, 0.0);
-    } else {
-        density_o = max(-h_km / 15.0 + 8.0 / 3.0, 0.0);
-    }
-
-    return density_r * BETA_R    // Rayleigh scattering (= extinction, no absorption)
-         + density_m * BETA_M_EXT  // Mie extinction (scattering + absorption)
-         + density_o * BETA_OZONE; // Ozone absorption
-}
-
-// --- UV ↔ Physical parameter mapping (Bruneton 2017) ---
-
-fn uv_to_transmittance_params(uv: vec2<f32>) -> vec2<f32> {
-    let H = sqrt(ATMO_RADIUS * ATMO_RADIUS - EARTH_RADIUS * EARTH_RADIUS);
-    let rho = H * uv.y;
-    let view_height = sqrt(rho * rho + EARTH_RADIUS * EARTH_RADIUS);
-
-    let d_min = ATMO_RADIUS - view_height;
-    let d_max = rho + H;
-    let d = d_min + uv.x * (d_max - d_min);
-    let cos_zenith = select(
-        (H * H - rho * rho - d * d) / (2.0 * view_height * d),
-        1.0,
-        d == 0.0
-    );
-
-    return vec2<f32>(view_height, clamp(cos_zenith, -1.0, 1.0));
 }
 
 // --- Main ---

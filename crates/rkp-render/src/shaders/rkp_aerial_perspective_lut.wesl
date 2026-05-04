@@ -11,15 +11,16 @@
 // RGB = inscattered luminance, A = averaged transmittance.
 // Applied to geometry pixels: final = inscattered + surface_color * transmittance.
 
-const PI: f32 = 3.14159265;
-const EARTH_RADIUS: f32 = 6360000.0;
-const ATMO_RADIUS: f32 = 6460000.0;
-const RAYLEIGH_SCALE_H: f32 = 8000.0;
-const MIE_SCALE_H: f32 = 1200.0;
-const BETA_R: vec3<f32> = vec3<f32>(5.802e-6, 13.558e-6, 33.1e-6);
-const BETA_M_SCAT: vec3<f32> = vec3<f32>(3.996e-6, 3.996e-6, 3.996e-6);
-const BETA_M_EXT: vec3<f32> = vec3<f32>(4.44e-6, 4.44e-6, 4.44e-6);
-const BETA_OZONE: vec3<f32> = vec3<f32>(0.650e-6, 1.881e-6, 0.085e-6);
+import package::lib::atmosphere::PI;
+import package::lib::atmosphere::EARTH_RADIUS;
+import package::lib::atmosphere::ATMO_RADIUS;
+import package::lib::atmosphere::BETA_R;
+import package::lib::atmosphere::BETA_M_SCAT;
+import package::lib::atmosphere::sample_extinction;
+import package::lib::atmosphere::transmittance_params_to_uv;
+import package::lib::atmosphere::rayleigh_phase;
+import package::lib::atmosphere::cornette_shanks;
+
 const MIE_G: f32 = 0.8;
 // Exponential slice parameterization — keep in sync with rkp_shade.wgsl.
 // With (1 m, 128 km) the 32 slices fall at roughly
@@ -53,39 +54,7 @@ struct AerialParams {
 @group(0) @binding(3) var lut_sampler: sampler;
 @group(0) @binding(4) var ap_out: texture_storage_3d<rgba16float, write>;
 
-// --- Shared functions (same as sky view) ---
-
-fn sample_extinction(altitude: f32) -> vec3<f32> {
-    let density_r = exp(-altitude / RAYLEIGH_SCALE_H);
-    let density_m = exp(-altitude / MIE_SCALE_H);
-    let h_km = altitude / 1000.0;
-    var density_o = 0.0;
-    if h_km < 25.0 { density_o = max(h_km / 15.0 - 2.0 / 3.0, 0.0); }
-    else { density_o = max(-h_km / 15.0 + 8.0 / 3.0, 0.0); }
-    return density_r * BETA_R + density_m * BETA_M_EXT + density_o * BETA_OZONE;
-}
-
-fn rayleigh_phase(cos_theta: f32) -> f32 {
-    return (3.0 / (16.0 * PI)) * (1.0 + cos_theta * cos_theta);
-}
-
-fn cornette_shanks(cos_theta: f32, g: f32) -> f32 {
-    let k = (3.0 / (8.0 * PI)) * (1.0 - g * g) / (2.0 + g * g);
-    return k * (1.0 + cos_theta * cos_theta) / pow(max(1.0 + g * g - 2.0 * g * cos_theta, 1e-6), 1.5);
-}
-
-fn transmittance_params_to_uv(view_height: f32, cos_zenith: f32) -> vec2<f32> {
-    let H = sqrt(ATMO_RADIUS * ATMO_RADIUS - EARTH_RADIUS * EARTH_RADIUS);
-    let rho = sqrt(max(view_height * view_height - EARTH_RADIUS * EARTH_RADIUS, 0.0));
-    let d_min = ATMO_RADIUS - view_height;
-    let d_max = rho + H;
-    let disc = view_height * view_height * (cos_zenith * cos_zenith - 1.0)
-             + ATMO_RADIUS * ATMO_RADIUS;
-    let d = max(-view_height * cos_zenith + sqrt(max(disc, 0.0)), 0.0);
-    let u = clamp((d - d_min) / max(d_max - d_min, 1e-6), 0.0, 1.0);
-    let v = clamp(rho / max(H, 1e-6), 0.0, 1.0);
-    return vec2<f32>(u, v);
-}
+// --- File-local helpers (atmosphere math is imported from lib) ---
 
 fn lookup_transmittance(view_height: f32, cos_zenith: f32) -> vec3<f32> {
     let uv = transmittance_params_to_uv(view_height, cos_zenith);
