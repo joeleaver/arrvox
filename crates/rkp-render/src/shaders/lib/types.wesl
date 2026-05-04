@@ -161,3 +161,14 @@ struct TlasInstanceLeaf {
     material_id: u32,
     instance_index: u32,
 }
+
+// One per-leaf paint-overlay record (16 bytes). Packed into the
+// per-instance overlay slice (`RkpInstance.overlay_offset` /
+// `overlay_count`); referenced by `fetch_leaf_attr` and the geom
+// pass when re-emitting overlay-modified leaves.
+struct OverlayEntry {
+    leaf_slot: u32,
+    normal_oct: u32,
+    material_packed: u32,
+    color_packed: u32,
+}

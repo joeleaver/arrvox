@@ -58,6 +58,7 @@
 // to avoid polluting `find`).
 
 import package::lib::types::LeafAttr;
+import package::lib::types::OverlayEntry;
 
 const BRICK_DIM: u32 = 4u;
 const BRICK_CELLS: u32 = 64u;
@@ -219,12 +220,6 @@ const FILL_TASK_SENTINEL: u32 = 0xFFFFFFFEu;
 // `cur_region.host_overlay_offset/count` to find the painted material
 // for a given leaf_slot — without it, the BFS would see the host's
 // asset-baseline material and never recognise paint.
-struct OverlayEntry {
-    leaf_slot: u32,
-    normal_oct: u32,
-    material_packed: u32,
-    color_packed: u32,
-}
 @group(0) @binding(11) var<storage, read> instance_overlay: array<OverlayEntry>;
 // Per-region atomic counters — array length = MAX_REGIONS on Rust side.
 @group(0) @binding(3) var<storage, read_write> octree_alloc: array<atomic<u32>>;

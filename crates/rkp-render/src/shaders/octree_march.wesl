@@ -25,6 +25,7 @@ import package::lib::types::BandCell;
 import package::lib::types::RkpInstance;
 import package::lib::types::GpuMaterial;
 import package::lib::types::CameraUniforms;
+import package::lib::types::OverlayEntry;
 
 const OPACITY_THRESHOLD: f32 = 0.05;
 // Safety-net ceiling for the outer ray-march loop. The ray already
@@ -243,12 +244,6 @@ struct GpuLight {
 // `fetch_leaf_color_for` fall through to `leaf_attr_pool[slot]` /
 // `color_pool_data[slot]` in that case. Layout matches
 // `rkp_core::OverlayEntry` (16 bytes).
-struct OverlayEntry {
-    leaf_slot: u32,
-    normal_oct: u32,
-    material_packed: u32,
-    color_packed: u32,
-}
 @group(0) @binding(13) var<storage, read> instance_overlay: array<OverlayEntry>;
 
 // Look up the per-instance overlay slot for `leaf_slot`. Returns

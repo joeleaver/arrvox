@@ -34,6 +34,7 @@ import package::lib::types::mat_albedo;
 import package::lib::types::CameraUniforms;
 import package::lib::types::TlasNode;
 import package::lib::types::TlasInstanceLeaf;
+import package::lib::types::OverlayEntry;
 // Shadow rays scan every object every ray — AABB misses short-circuit
 // cheaply, and shadow rays go in arbitrary directions so the march
 // pass's screen-space per-tile lists don't apply.
@@ -379,12 +380,6 @@ fn shadow_beer(glass_color: vec3<f32>, opacity: f32, thickness: f32) -> f32 {
 
 // Per-instance paint overlay (Phase 3) — see octree_march.wgsl for the
 // authoritative description. Shadow trace uses the same fetch helpers.
-struct OverlayEntry {
-    leaf_slot: u32,
-    normal_oct: u32,
-    material_packed: u32,
-    color_packed: u32,
-}
 @group(0) @binding(13) var<storage, read> instance_overlay: array<OverlayEntry>;
 
 fn fetch_overlay_index(inst: RkpInstance, leaf_slot: u32) -> u32 {

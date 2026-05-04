@@ -38,6 +38,7 @@ import package::lib::types::BandCell;
 import package::lib::types::RkpInstance;
 import package::lib::types::GpuMaterial;
 import package::lib::types::CameraUniforms;
+import package::lib::types::OverlayEntry;
 const BRICK_DIM: u32 = 4u;
 const BRICK_DIM_F: f32 = 4.0;
 const BRICK_CELLS: u32 = 64u;
@@ -70,13 +71,6 @@ struct RkpAsset {
     grid_origin: vec3<f32>, rest_octree_root: u32,
     rest_octree_depth: u32, rest_octree_extent_bits: u32,
     shader_id: u32, _pad: u32,
-}
-
-struct OverlayEntry {
-    leaf_slot: u32,
-    normal_oct: u32,
-    material_packed: u32,
-    color_packed: u32,
 }
 
 // Phase B-redux 3b — band-cell wire format. Mirrors
