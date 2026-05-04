@@ -30,6 +30,7 @@ import package::lib::brick::FACE_NZ;
 import package::lib::brick::FACE_PZ;
 import package::lib::types::unpack_band_cell;
 import package::lib::octree::octree_lookup;
+import package::lib::octree::descend_proto_octree;
 import package::lib::octree::PHASE_SHADOW;
 import package::lib::octree::skip_node;
 import package::lib::octree_slot::OCTREE_EMPTY;
@@ -94,9 +95,8 @@ import package::lib::types::InstanceHit;
 // `octree_march.wgsl::Aabb`; needed here because the composer-emitted
 // `rkp_user_<id>_inst_aabb` body returns this type.
 
-// MAX_STEPS for `descend_proto_octree`'s outer DDA loop. Protos are
-// small (max_depth ≤ 8) so the cap rarely matters in practice.
-const MAX_STEPS_PROTO: u32 = 4096u;
+// Stats phase for `descend_proto_octree`'s internal `octree_lookup`.
+const PROTO_PHASE: u32 = PHASE_SHADOW;
 
 // `unpack_oct_normal` is imported from `lib::oct_normal` at the top
 // of this file.
@@ -107,164 +107,6 @@ const MAX_STEPS_PROTO: u32 = 4096u;
 // pointless for shadow rays + small proto octrees). Called from the
 // composer-emitted per-shader `rkp_user_<id>_instance_descend` body.
 
-fn descend_proto_octree(
-    asset: RkpAsset,
-    oc_origin: vec3<f32>,
-    safe_dir: vec3<f32>,
-    inv_dir: vec3<f32>,
-    t_start: f32,
-    t_end: f32,
-    local_to_world: f32,
-) -> ProtoHit {
-    var r: ProtoHit;
-    r.valid = false;
-    r.local_t = t_end;
-    r.oc_pos = vec3<f32>(0.0);
-    r.local_normal = vec3<f32>(0.0, 1.0, 0.0);
-    r.leaf_slot = 0u;
-
-    let extent = bitcast<f32>(asset.octree_extent_bits);
-    let vs = asset.voxel_size;
-    let root = asset.octree_root;
-    let max_depth = asset.octree_depth;
-    let lookup_bias = vs * 1.0e-3;
-
-    var t = t_start;
-    for (var step = 0u; step < MAX_STEPS_PROTO; step++) {
-        if t > t_end { break; }
-
-        let pos = clamp(
-            oc_origin + safe_dir * (t + lookup_bias),
-            vec3<f32>(vs * 0.01),
-            vec3<f32>(extent - vs * 0.01),
-        );
-        let lookup = octree_lookup(root, max_depth, extent, pos, PHASE_SHADOW, 0u, 0.0, 1.0, 0.0);
-
-        if lookup.slot == OCTREE_EMPTY {
-            t += skip_node(pos, safe_dir, inv_dir, lookup.depth, extent, vs);
-            continue;
-        }
-        if lookup.slot == OCTREE_INTERIOR {
-            r.valid = true;
-            r.local_t = t;
-            r.oc_pos = oc_origin + safe_dir * t;
-            r.local_normal = -safe_dir;
-            r.leaf_slot = 0u;
-            return r;
-        }
-
-        if slot_is_brick(lookup.slot) {
-            var brick_id = slot_brick_id(lookup.slot);
-            let cell_size = (lookup.cell_half * 2.0) / BRICK_DIM_F;
-            let inv_cell_size = 1.0 / cell_size;
-            var brick_origin = lookup.cell_center - vec3<f32>(lookup.cell_half);
-            var brick_base = brick_id * BRICK_CELLS;
-
-            let p0 = oc_origin + safe_dir * t;
-            let local0 = (p0 - brick_origin) * inv_cell_size;
-            var cell = clamp(
-                vec3<i32>(floor(local0)),
-                vec3<i32>(0),
-                vec3<i32>(3),
-            );
-            let step_i = vec3<i32>(
-                select(-1, 1, safe_dir.x >= 0.0),
-                select(-1, 1, safe_dir.y >= 0.0),
-                select(-1, 1, safe_dir.z >= 0.0),
-            );
-            let step_gt = vec3<f32>(
-                select(0.0, 1.0, safe_dir.x >= 0.0),
-                select(0.0, 1.0, safe_dir.y >= 0.0),
-                select(0.0, 1.0, safe_dir.z >= 0.0),
-            );
-            let next_b = brick_origin + (vec3<f32>(cell) + step_gt) * cell_size;
-            var t_max = t + (next_b - p0) * inv_dir;
-            let t_delta = abs(vec3<f32>(cell_size) * inv_dir);
-            let dda_eps = cell_size * 1.0e-3;
-
-            for (var bs = 0u; bs < BRICK_MAX_STEPS; bs++) {
-                if t > t_end { break; }
-
-                if cell.x < 0 || cell.x >= 4
-                    || cell.y < 0 || cell.y >= 4
-                    || cell.z < 0 || cell.z >= 4 {
-                    var face_idx: u32;
-                    if cell.x < 0 { face_idx = FACE_NX; }
-                    else if cell.x >= 4 { face_idx = FACE_PX; }
-                    else if cell.y < 0 { face_idx = FACE_NY; }
-                    else if cell.y >= 4 { face_idx = FACE_PY; }
-                    else if cell.z < 0 { face_idx = FACE_NZ; }
-                    else { face_idx = FACE_PZ; }
-                    let link = brick_face_links[brick_id * 6u + face_idx];
-                    if link == FACE_INTERIOR {
-                        r.valid = true;
-                        r.local_t = t;
-                        r.oc_pos = oc_origin + safe_dir * t;
-                        r.local_normal = -safe_dir;
-                        r.leaf_slot = 0u;
-                        return r;
-                    }
-                    if link == FACE_EMPTY_LINK { break; }
-                    brick_id = link;
-                    brick_base = link * BRICK_CELLS;
-                    let brick_extent = BRICK_DIM_F * cell_size;
-                    if face_idx == FACE_NX { cell.x = 3; brick_origin.x -= brick_extent; }
-                    else if face_idx == FACE_PX { cell.x = 0; brick_origin.x += brick_extent; }
-                    else if face_idx == FACE_NY { cell.y = 3; brick_origin.y -= brick_extent; }
-                    else if face_idx == FACE_PY { cell.y = 0; brick_origin.y += brick_extent; }
-                    else if face_idx == FACE_NZ { cell.z = 3; brick_origin.z -= brick_extent; }
-                    else { cell.z = 0; brick_origin.z += brick_extent; }
-                    let p_now = oc_origin + safe_dir * t;
-                    let next_b2 = brick_origin + (vec3<f32>(cell) + step_gt) * cell_size;
-                    t_max = t + (next_b2 - p_now) * inv_dir;
-                }
-
-                let cx = u32(cell.x);
-                let cy = u32(cell.y);
-                let cz = u32(cell.z);
-                let flat = cx + cy * BRICK_DIM + cz * BRICK_DIM * BRICK_DIM;
-                let c = brick_pool[brick_base + flat];
-
-                if c != BRICK_CELL_EMPTY && c != BRICK_CELL_INTERIOR {
-                    let attr = leaf_attr_pool[c];
-                    r.valid = true;
-                    r.local_t = t;
-                    r.oc_pos = oc_origin + safe_dir * t;
-                    r.local_normal = unpack_oct_normal(attr.normal_oct);
-                    r.leaf_slot = c;
-                    return r;
-                }
-
-                if t_max.x < t_max.y && t_max.x < t_max.z {
-                    t = t_max.x + dda_eps;
-                    cell.x += step_i.x;
-                    t_max.x += t_delta.x;
-                } else if t_max.y < t_max.z {
-                    t = t_max.y + dda_eps;
-                    cell.y += step_i.y;
-                    t_max.y += t_delta.y;
-                } else {
-                    t = t_max.z + dda_eps;
-                    cell.z += step_i.z;
-                    t_max.z += t_delta.z;
-                }
-            }
-            t += vs;
-            continue;
-        }
-
-        // Plain leaf — single-voxel slot.
-        let leaf_slot = lookup.slot & OCTREE_PAYLOAD_MASK;
-        let attr = leaf_attr_pool[leaf_slot];
-        r.valid = true;
-        r.local_t = t;
-        r.oc_pos = oc_origin + safe_dir * t;
-        r.local_normal = unpack_oct_normal(attr.normal_oct);
-        r.leaf_slot = leaf_slot;
-        return r;
-    }
-    return r;
-}
 
 
 // Opacity extinction reference: opacity=X over glass this thick gives

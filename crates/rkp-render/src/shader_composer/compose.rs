@@ -403,6 +403,7 @@ fn compose_instance_at_chunk(reg: &UserShaderRegistry) -> String {
                 \x20       let hit = descend_proto_octree(\n\
                 \x20           asset, oc_origin, safe_dir, inv_dir,\n\
                 \x20           max(t_range.x, 0.0), local_t_end, local_to_world,\n\
+                \x20           PROTO_PHASE,\n\
                 \x20       );\n\
                 \x20       if (!hit.valid) {{ continue; }}\n\
                 \x20       let world_t = world_t_entry + hit.local_t * local_to_world;\n\
