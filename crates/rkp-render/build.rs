@@ -14,27 +14,11 @@ fn main() {
     let mut resolver = Wesl::new(shaders_dir);
     resolver.use_stripping(false);
 
-    // Skiplist: shaders that don't compile standalone in Phase 1.
-    // Two kinds:
-    //   - Orphans (no Rust include site, dead leftovers from the
-    //     pre-octree opacity-pipeline removal): opacity_grass,
-    //     opacity_shade_pbr.
-    //   - Compose-by-concat fragments (loaded together with sibling
-    //     files at runtime to form a complete shader): proc_eval,
-    //     proc_eval_types, proc_sample, proc_raymarch — these get
-    //     `include_str!`'d separately and string-concatenated by
-    //     `proc_sample.rs` / `proc_raymarch.rs`. Phase 2 will fold
-    //     them onto WESL `import` and remove this skiplist entry.
+    // Skiplist: compose-by-concat fragments. Currently `include_str!`'d
+    // individually and string-concatenated by `proc_sample.rs` /
+    // `proc_raymarch.rs` to form a complete shader. Phase 2 Wave E
+    // folds them onto WESL `import` and removes this skiplist.
     const SKIP: &[&str] = &[
-        // Orphans — leftovers from pre-octree opacity-pipeline removal.
-        // No Rust include site, references unbound symbols.
-        "opacity_grass",
-        "opacity_shade_pbr",
-        "shade_grass",
-        // Compose-by-concat fragments — currently `include_str!`'d
-        // separately and string-concatenated by their `proc_*.rs`
-        // pipeline constructors. Phase 2 Wave E folds them onto WESL
-        // `import` and removes these entries.
         "proc_eval",
         "proc_eval_types",
         "proc_sample",
