@@ -75,30 +75,6 @@ const POS_STACK_CAP: u32 = 8u;
 
 // One flattened instruction. Layout MUST match
 // `rkp_procedural::flatten::ProcInstruction` byte-for-byte.
-struct ProcInstruction {
-    op: u32,
-    arity: u32,
-    material_combine: u32,
-    material_id: u32,
-    // `node_id` is the source NodeId the primitive came from, used for
-    // per-primitive picking; `u32::MAX` on combinators.
-    node_id: u32,
-    // Scalar multiplier that converts each primitive's returned
-    // LOCAL distance back into world distance — equals the smallest
-    // axis scale of the composed world transform. Combinators /
-    // effects leave this at 1.0 since their inputs are already in
-    // world space after the primitive multiplies. Without this, any
-    // `Root.scale > 1` tree bakes to pathological voxel counts
-    // because the classifier sees compressed-local distances and
-    // decides the whole volume is "near the surface".
-    distance_scale: f32,
-    _pad1: u32,
-    _pad2: u32,
-    params_lo: vec4<f32>,
-    params_hi: vec4<f32>,
-    color: vec4<f32>,
-    inverse_world: mat4x4<f32>,
-}
 
 // A sample at one point. Combinators don't propagate secondary/blend —
 // only post-op effects write them, and the winner of any downstream

@@ -20,15 +20,7 @@
 
 import package::lib::types::TlasPrim;
 import package::lib::types::ScatterInstance;
-
-struct LightCameraShadow {
-    view_proj: mat4x4<f32>,
-    view_proj_inv: mat4x4<f32>,
-    light_dir: vec3<f32>,
-    depth_bias: f32,
-    inv_shadow_map_size: vec2<f32>,
-    shadow_map_size: vec2<u32>,
-}
+import package::lib::types::LightCameraShadow;
 
 struct SetupParams {
     /// Live `tlas_prim_count` from the assembly pass. Threads

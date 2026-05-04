@@ -27,6 +27,7 @@ import package::lib::types::GpuMaterial;
 import package::lib::types::CameraUniforms;
 import package::lib::types::OverlayEntry;
 import package::lib::types::ProtoHit;
+import package::lib::types::MarchParams;
 
 const OPACITY_THRESHOLD: f32 = 0.05;
 // Safety-net ceiling for the outer ray-march loop. The ray already
@@ -95,49 +96,6 @@ struct RkpAsset {
 fn rkp_object_visible(inst: RkpInstance) -> bool {
     return (inst.layer_mask & camera.layer_mask) != 0u
         || inst.object_id == camera.focus_object_id;
-}
-
-struct MarchParams {
-    object_count: u32,
-    mode: u32,
-    shadow_max_steps: u32,
-    num_lights: u32,
-    // Prefiltered-LOD early-exit gate. `1` → check each branch's `.y`
-    // (prefilter attr id) plus a screen-footprint threshold and
-    // terminate descent when the node would occupy <1 pixel. `0` →
-    // always descend to a terminator (pre-LOD behavior).
-    lod_enabled: u32,
-    // Surface-Nets normal reconstruction gate. `1` → at each brick-cell
-    // hit, replace the baked octahedral normal with one reconstructed
-    // from the 3³ in-brick occupancy neighborhood (centroid-outward).
-    // Proof-of-concept: brick boundaries fall back to baked; isolated
-    // or fully-surrounded voxels fall back to baked too.
-    surfacenet_enabled: u32,
-    // Per-tile list grid width in tiles (render_width / 8, rounded up).
-    // Shader looks up its tile's object-list slice as
-    // `tile_object_ids[tile_offsets[tile_idx]..tile_offsets[tile_idx+1]]`
-    // where `tile_idx = ty * tile_count_x + tx`.
-    tile_count_x: u32,
-    // Phase 7 Session 4b — TLAS node count. March itself doesn't read
-    // this (naga DCE will keep the field in the struct since the
-    // host-side Rust mirror requires it; the field is consumed by
-    // shadow trace, which shares the same uniform). 32 B total.
-    tlas_node_count: u32,
-    // Phase 8 — `1` ⇒ shadow_map covers directional lights this
-    // frame; shadow trace skips them. March itself doesn't read
-    // this; the field keeps the WGSL layout in sync with the Rust
-    // mirror (naga DCE drops it from march SPIR-V).
-    shadow_map_enabled: u32,
-    // Phase B-redux Phase 3a — frame time, threaded into `ctx.time`
-    // for user shaders' `instance_at` hooks (wind sway, animation).
-    time: f32,
-    // Phase B-redux Phase 3a — number of records in `assets[]`.
-    // Used to scan `assets[]` for an asset matching the painted
-    // leaf's material `shader_id`, picking the right proto octree
-    // for the descent.
-    asset_count: u32,
-    // Trailing pad to align to 16 bytes.
-    _pad0: u32,
 }
 
 // Phase B-redux 3b — band-cell wire format. Mirrors

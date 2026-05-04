@@ -20,6 +20,7 @@ import package::lib::sdf::sdf_torus;
 import package::lib::sdf::sdf_plane;
 import package::lib::sdf::sdf_ramp;
 import package::lib::types::CameraUniforms;
+import package::lib::types::ProcInstruction;
 
 // Fragment pass, full-screen triangle. Primitives arrive as a
 // `ProcInstruction` array in the same byte layout as the main
@@ -40,20 +41,6 @@ const MAX_DIST:     f32 = 500.0;
 const SURFACE_EPS:  f32 = 0.002;
 
 /// Must match the byte layout of `rkp_procedural::flatten::ProcInstruction`.
-struct ProcInstruction {
-    op: u32,
-    arity: u32,
-    material_combine: u32,
-    material_id: u32,
-    node_id: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
-    params_lo: vec4<f32>,
-    params_hi: vec4<f32>,
-    color: vec4<f32>,
-    inverse_world: mat4x4<f32>,
-}
 
 struct GhostParams {
     /// How many entries in `instructions` to evaluate. Shorter than

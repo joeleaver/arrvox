@@ -17,7 +17,7 @@ import package::lib::sdf::sdf_torus;
 import package::lib::sdf::sdf_plane;
 import package::lib::sdf::sdf_ramp;
 
-import package::proc_eval_types::ProcInstruction;
+import package::lib::types::ProcInstruction;
 import package::proc_eval_types::TreeSample;
 import package::proc_eval_types::HeightClassify;
 import package::proc_eval_types::OP_SPHERE;

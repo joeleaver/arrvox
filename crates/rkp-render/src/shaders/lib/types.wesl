@@ -207,3 +207,69 @@ struct ProtoHit {
     local_normal: vec3<f32>,
     leaf_slot: u32,
 }
+
+// Per-frame uniform shared by octree_march and rkp_shadow_trace —
+// the two passes bind the same buffer, so the layout has to match.
+// Some fields are read by only one of them (notes inline); naga
+// DCE drops the unused fields from the SPIR-V on each side.
+struct MarchParams {
+    object_count: u32,
+    mode: u32,
+    shadow_max_steps: u32,
+    num_lights: u32,
+    lod_enabled: u32,
+    surfacenet_enabled: u32,
+    tile_count_x: u32,
+    tlas_node_count: u32,
+    shadow_map_enabled: u32,
+    time: f32,
+    asset_count: u32,
+    _pad0: u32,
+}
+
+// Light-space camera + shadow-map metadata for shadow scatter.
+// CPU-side mirror in `rkp_render::shadow_map`; layout locked.
+struct LightCameraShadow {
+    view_proj: mat4x4<f32>,
+    view_proj_inv: mat4x4<f32>,
+    light_dir: vec3<f32>,
+    depth_bias: f32,
+    inv_shadow_map_size: vec2<f32>,
+    shadow_map_size: vec2<u32>,
+}
+
+// Procedural-eval volumetric clouds parameters. Six tightly-packed
+// vec4s bundling the noise / wind / quality / flags state, sized
+// to fit a small uniform binding. cloud_march reads everything;
+// cloud_sun_atten only reads `altitude`/`noise`/`wind`/`flags`/
+// `coverage` but binds the same uniform.
+struct CloudParams {
+    altitude: vec4<f32>,   // x=cloud_min, y=cloud_max, z=threshold, w=density_scale
+    noise:    vec4<f32>,   // x=shape_freq, y=detail_freq, z=detail_weight, w=weather_scale
+    wind:     vec4<f32>,   // x=wind_dir.x, y=wind_dir.y, z=wind_speed, w=time
+    flags:    vec4<f32>,   // x=enable, y=coverage
+    quality:  vec4<f32>,   // x=slab_steps, y=shadow_steps, z=detail_octaves, w=ms_octaves
+    quality2: vec4<f32>,   // x=taa_alpha
+}
+
+// One procedural-eval bytecode instruction (96 bytes). CPU writer is
+// `rkp_procedural::compile_tree`; consumers are proc_eval (the
+// interpreter) and proc_ghost (the gizmo / picking helper).
+//
+// `distance_scale` is the local-to-world scale baked at compile
+// time so primitives can return scale-invariant local distances —
+// see compile_tree docs for the math.
+struct ProcInstruction {
+    op: u32,
+    arity: u32,
+    material_combine: u32,
+    material_id: u32,
+    node_id: u32,
+    distance_scale: f32,
+    _pad1: u32,
+    _pad2: u32,
+    params_lo: vec4<f32>,
+    params_hi: vec4<f32>,
+    color: vec4<f32>,
+    inverse_world: mat4x4<f32>,
+}

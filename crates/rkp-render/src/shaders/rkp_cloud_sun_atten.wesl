@@ -3,6 +3,8 @@
 // readback. Cloud density replicates `cloud_density` in rkp_volumetric.wgsl —
 // if that shader changes, update this one too.
 
+import package::lib::types::CloudParams;
+
 struct VolumetricParams {
     cam_pos:      vec4<f32>,
     cam_forward:  vec4<f32>,
@@ -25,15 +27,6 @@ struct VolumetricParams {
     vol_ambient_g: f32,
     vol_ambient_b: f32,
     prev_view_proj: mat4x4<f32>,
-}
-
-struct CloudParams {
-    altitude: vec4<f32>,   // x=min, y=max, z=threshold, w=density_scale
-    noise:    vec4<f32>,   // x=shape_freq, y=detail_freq, z=detail_weight, w=weather_scale
-    wind:     vec4<f32>,
-    flags:    vec4<f32>,   // x=enable, y=coverage
-    quality:  vec4<f32>,   // unused here but must match struct layout
-    quality2: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: VolumetricParams;

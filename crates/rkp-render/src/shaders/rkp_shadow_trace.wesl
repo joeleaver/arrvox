@@ -36,6 +36,7 @@ import package::lib::types::TlasNode;
 import package::lib::types::TlasInstanceLeaf;
 import package::lib::types::OverlayEntry;
 import package::lib::types::ProtoHit;
+import package::lib::types::MarchParams;
 // Shadow rays scan every object every ray — AABB misses short-circuit
 // cheaply, and shadow rays go in arbitrary directions so the march
 // pass's screen-space per-tile lists don't apply.
@@ -71,33 +72,6 @@ struct RkpAsset {
     grid_origin: vec3<f32>, rest_octree_root: u32,
     rest_octree_depth: u32, rest_octree_extent_bits: u32,
     shader_id: u32, _pad: u32,
-}
-
-struct MarchParams {
-    object_count: u32,
-    mode: u32,
-    shadow_max_steps: u32,
-    num_lights: u32,
-    // Must match octree_march.wgsl: same uniform buffer binding.
-    lod_enabled: u32,
-    surfacenet_enabled: u32,
-    tile_count_x: u32,
-    // Phase 7 Session 4b — TLAS node count. Zero gates the BVH
-    // traversal off; the helper function falls back to "no shadow
-    // caster found" (transmittance unchanged).
-    tlas_node_count: u32,
-    // Phase 8 — `1` ⇒ a shadow-map march wrote a directional
-    // depth texture this frame; the per-pixel directional rays in
-    // this pass are skipped (the shade pass reads
-    // `sample_shadow_map` for those lights instead).
-    shadow_map_enabled: u32,
-    // Phase B-redux Phase 3a — wire-format sync with octree_march's
-    // uniform; shadow trace doesn't read either field yet (Phase 4
-    // will when shadow goes through instance_at descent), but the
-    // shared uniform binding requires a layout match.
-    time: f32,
-    asset_count: u32,
-    _pad0: u32,
 }
 
 struct GpuLight {

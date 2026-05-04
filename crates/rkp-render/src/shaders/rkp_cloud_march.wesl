@@ -15,6 +15,7 @@
 // Distance fog / participating-medium haze live in rkp_fog_march.wgsl.
 
 import package::lib::math::interleaved_gradient_noise;
+import package::lib::types::CloudParams;
 
 const PI: f32 = 3.14159265;
 
@@ -42,15 +43,6 @@ struct VolParams {
     vol_ambient_g: f32,
     vol_ambient_b: f32,
     prev_view_proj: mat4x4<f32>,
-}
-
-struct CloudParams {
-    altitude: vec4<f32>,   // x=cloud_min, y=cloud_max, z=threshold, w=density_scale
-    noise:    vec4<f32>,   // x=shape_freq, y=detail_freq, z=detail_weight, w=weather_scale
-    wind:     vec4<f32>,   // x=wind_dir.x, y=wind_dir.y, z=wind_speed, w=time
-    flags:    vec4<f32>,   // x=enable, y=coverage
-    quality:  vec4<f32>,   // x=slab_steps, y=shadow_steps, z=detail_octaves, w=ms_octaves
-    quality2: vec4<f32>,   // x=taa_alpha
 }
 
 @group(0) @binding(0) var<uniform> params: VolParams;

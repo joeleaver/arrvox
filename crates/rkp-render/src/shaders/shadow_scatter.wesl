@@ -41,6 +41,7 @@ import package::lib::types::CameraUniforms;
 import package::lib::types::OverlayEntry;
 import package::lib::types::ScatterInstance;
 import package::lib::types::ProtoHit;
+import package::lib::types::LightCameraShadow;
 const BRICK_DIM: u32 = 4u;
 const BRICK_DIM_F: f32 = 4.0;
 const BRICK_CELLS: u32 = 64u;
@@ -122,15 +123,6 @@ struct MarchParamsLite {
     time: f32,
     asset_count: u32,
     _pad0: u32,
-}
-
-struct LightCameraShadow {
-    view_proj: mat4x4<f32>,
-    view_proj_inv: mat4x4<f32>,
-    light_dir: vec3<f32>,
-    depth_bias: f32,
-    inv_shadow_map_size: vec2<f32>,
-    shadow_map_size: vec2<u32>,
 }
 
 struct Aabb {
