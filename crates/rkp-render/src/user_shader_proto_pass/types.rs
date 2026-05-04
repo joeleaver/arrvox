@@ -11,7 +11,7 @@
 //! Larger types (`PrototypeUniform`, `PrototypeCache`, `PrototypeBakePass`)
 //! live in their respective sibling modules.
 
-use crate::user_shader_pass::BRICK_CELLS;
+use rkp_core::brick_pool::BRICK_CELLS;
 
 /// Default prototype octree depth. With depth 2 the prototype is a
 /// 16-cell-per-axis cube (4 bricks per axis, 64 max bricks) — enough

@@ -45,35 +45,6 @@ struct LeafAttr {
 
 fn leaf_attr_material_primary(a: LeafAttr) -> u32 { return a.material_packed & 0xFFFFu; }
 
-// Per-instance band-cell record (16 bytes), one entry per painted-
-// band cell on a host instance. Reinterprets the leaf-attr slot
-// when the band sentinel bit is set on the slot —
-// `anchor_world_pos` is the world-space anchor for the painted
-// material, `material_id` selects the host material override.
-struct BandCell {
-    anchor_world_pos: vec3<f32>,
-    material_id: u32,
-}
-
-// Decode a band cell from two consecutive `LeafAttr` slots in the
-// per-asset attr pool. Band cells are encoded as a pair of LeafAttrs
-// where bits reinterpret as world-space anchor + material id (see
-// `feedback_normal_oct_zero_bug.md` for the encoding contract).
-//
-// Caller reads the two slots from its bound `leaf_attr_pool[band_off]`
-// and `leaf_attr_pool[band_off + 1u]` and passes them in — keeps this
-// helper binding-free so it lives next to BandCell.
-fn unpack_band_cell(s0: LeafAttr, s1: LeafAttr) -> BandCell {
-    var c: BandCell;
-    c.anchor_world_pos = vec3<f32>(
-        bitcast<f32>(s0.normal_oct),
-        bitcast<f32>(s0.material_packed),
-        bitcast<f32>(s1.normal_oct),
-    );
-    c.material_id = s1.material_packed;
-    return c;
-}
-
 // One per-leaf paint-overlay record (16 bytes). Packed into the
 // per-instance overlay slice (`RkpInstance.overlay_offset` /
 // `overlay_count`); referenced by `lib::leaf_attr::fetch_*` and the

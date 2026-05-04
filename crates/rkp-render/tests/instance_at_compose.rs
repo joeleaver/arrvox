@@ -1,17 +1,10 @@
-//! Phase B-redux Phase 1 — naga validation for the `instance_at`
-//! chunk.
-//!
-//! Phase 2 will wire `USER_INSTANCE_AT_DISPATCH_BEGIN/END` markers
-//! into the host march template and use `splice_X_chunk`-style
-//! helpers to splice the composer's chunk in. Phase 1 ships only the
-//! chunk — nothing consumes it yet — so this test wraps the chunk
-//! with the minimum type stubs (`HostSample`, `UserCtx`, etc.) and
-//! asserts the result parses + validates with naga.
-//!
-//! Uses a synthetic instance shader (no inst_to_local / inst_aabb
-//! hook) so the chunk owns its struct + helper declarations and the
-//! test source has no dependency on Option B's `instance_pool`-bound
-//! pool-read wrappers.
+//! Composer's `instance_at` chunk is now a stub (empty string) since
+//! the band-cell descent path it fed has been deleted. The user shader
+//! API still parses `instance_at` / `inst_aabb` / `inst_to_local`
+//! hooks — those will be consumed by the new emit pass (rebuild
+//! Phase 8/9) which writes `RkpInstance` records with forward affine
+//! `world` matrices. Until that lands, the chunk stays empty and any
+//! splice into a host template is a no-op.
 
 use rkp_render::shader_composer::{compose, scan_dir};
 
@@ -33,26 +26,17 @@ fn write_shader(dir: &std::path::Path, name: &str, body: &str) {
 }
 
 #[test]
-fn instance_at_chunk_validates_standalone() {
-    // Synthetic fixture: a minimal instance shader. Provides all
-    // four hooks the descent path needs (proto, emit for Option B
-    // back-compat, inst_aabb + inst_to_local for descent, and the
-    // new instance_at hook).
+fn instance_at_chunk_is_empty_when_hook_present() {
+    // Even when a shader registers all four instance hooks (proto,
+    // inst_aabb, inst_to_local, instance_at), the composer's
+    // `instance_at` chunk is empty. The new emit pass owns the work
+    // these hooks feed; the host march no longer splices in any
+    // per-shader descent body.
     let src = r#"
 // @instance_proto Pebble
 struct Pebble {
     pos: vec3<f32>,
     radius: f32,
-}
-
-fn pebble_hash(seed: u32) -> f32 {
-    var x = seed;
-    x = x ^ (x >> 16u);
-    x = x * 0x7feb352du;
-    x = x ^ (x >> 15u);
-    x = x * 0x846ca68bu;
-    x = x ^ (x >> 16u);
-    return f32(x) / 4294967295.0;
 }
 
 fn user_pebble_proto(uvw: vec3<f32>) -> VoxelEmit {
@@ -82,10 +66,9 @@ fn user_pebble_instance_at(
 ) -> bool {
     if (k > 0u) { return false; }
     if (host.normal.y < 0.5) { return false; }
-    let r = pebble_hash(bitcast<u32>(host_pos.x));
     var p: Pebble;
     p.pos = host_pos;
-    p.radius = 0.05 + 0.05 * r;
+    p.radius = 0.05;
     *out_instance = p;
     return true;
 }
@@ -104,49 +87,12 @@ fn user_pebble_instance_at(
     let chunks = compose(&reg);
     let _ = std::fs::remove_dir_all(&tmp);
 
-    // Phase 2.c-2: the chunk now references helpers from the march
-    // template (`descend_proto_octree`, `intersect_aabb`, `RkpAsset`,
-    // …). Standalone naga validation would require stubbing all of
-    // those out, which becomes brittle as the descent body evolves.
-    // The integration test in `tests/example_grass_shader.rs` splices
-    // the chunk into the live march template and validates that —
-    // authoritative.  Here we just assert text-level invariants on
-    // the composer's output so a regression in the splice surface
-    // (e.g. a renamed helper) is caught at the chunk level.
     assert!(
-        chunks.instance_at.contains("fn rkp_user_1_instance_at("),
-        "instance_at chunk should rename user_pebble_instance_at:\n{}",
+        chunks.instance_at.is_empty(),
+        "instance_at chunk should be empty stub. Got:\n{}",
         chunks.instance_at,
     );
-    // After the Cluster A cleanup, the instance_at chunk is the SOLE
-    // emitter of the instance struct + helpers + the bare per-shader
-    // `inst_aabb` / `inst_to_local` bodies. The dead `inst_to_local`
-    // and `inst_aabb` ComposedChunks fields were removed.
-    assert!(chunks.instance_at.contains("fn pebble_hash"));
-    assert_eq!(
-        chunks.instance_at.matches("fn pebble_hash").count(), 1,
-        "helper should be emitted exactly once",
-    );
-    assert!(
-        chunks.instance_at.contains("fn rkp_user_1_instance_descend("),
-        "instance_at chunk should emit the per-shader descent body",
-    );
-    assert!(
-        chunks.instance_at.contains("descend_proto_octree("),
-        "descent body should call descend_proto_octree",
-    );
-    assert!(
-        chunks.instance_at.contains("rkp_user_1_inst_aabb(inst)"),
-        "descent body should call the renamed inst_aabb hook",
-    );
-    assert!(
-        chunks.instance_at.contains("rkp_user_1_inst_to_local("),
-        "descent body should call the renamed inst_to_local hook",
-    );
-    assert!(
-        chunks.instance_at.contains("fn dispatch_user_instance_descend("),
-        "instance_at chunk should emit the unified dispatcher",
-    );
+    let _ = assert_wgsl_valid;
 }
 
 #[test]

@@ -314,6 +314,20 @@ pub(super) fn encode_viewports(
         if let Some(idx) = readback_idx {
             vr.readback.issue_map_async(idx);
         }
+
+        // March stats — async readback. Gated behind RKP_MARCH_STATS=1
+        // so it doesn't spam by default; when enabled, drains any
+        // previously-resolved snapshot and eprintln's the descend-body
+        // breakdown counters (band-cell + Phase-3a invocations,
+        // candidate AABB rejection / descent / hit ratios). Single
+        // staging buffer with skip-if-busy — sampling rate is whatever
+        // the GPU/driver completes per frame, never blocks.
+        if std::env::var("RKP_MARCH_STATS").is_ok() {
+            if let Some(stats) = vr.march.try_drain_stats() {
+                eprint_march_stats(vp.id, &stats);
+            }
+            vr.march.submit_stats_readback();
+        }
     }
 
     // Stash this frame's un-interpolated view_proj per viewport for
@@ -325,4 +339,29 @@ pub(super) fn encode_viewports(
     }
 
     EncodeOutput { pick_issued, active_pending_pick }
+}
+
+/// Format the user-shader descend breakdown from a stats snapshot.
+/// See `shaders/octree_march.wgsl` for the slot layout. Only meaningful
+/// when there are non-zero band-cell or Phase-3a invocations; otherwise
+/// the band-cell descent path didn't fire this frame and the line is
+/// dominated by zeros.
+fn eprint_march_stats(vp_id: crate::viewport::ViewportId, stats: &[u32]) {
+    let band_invoke = stats.get(60).copied().unwrap_or(0);
+    let band_hit = stats.get(61).copied().unwrap_or(0);
+    let p3a_invoke = stats.get(64).copied().unwrap_or(0);
+    let p3a_hit = stats.get(65).copied().unwrap_or(0);
+    if band_invoke == 0 && p3a_invoke == 0 {
+        return;
+    }
+    let k_test = stats.get(66).copied().unwrap_or(0);
+    let aabb_rej = stats.get(67).copied().unwrap_or(0);
+    let descended = stats.get(68).copied().unwrap_or(0);
+    let miss = stats.get(69).copied().unwrap_or(0);
+    let hit = stats.get(70).copied().unwrap_or(0);
+    eprintln!(
+        "[march_stats vp={vp_id:?}] dispatch: band={band_invoke}/hits={band_hit} \
+         phase3a={p3a_invoke}/hits={p3a_hit} | candidates: k_test={k_test} \
+         aabb_rej={aabb_rej} descended={descended} miss={miss} hit={hit}",
+    );
 }

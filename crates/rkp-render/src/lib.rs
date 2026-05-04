@@ -71,16 +71,12 @@ pub mod shader_composer;
 /// Option B — voxel sprite instancing. Parses per-instance state structs
 /// declared by `@instance_proto` and computes their byte layout.
 pub mod instance_proto;
-/// Phase C — GPU runtime geometry pass. User-shader `generate` hooks
-/// run here, materializing voxels in a transient pool the march/shade
-/// passes already know how to read.
-pub mod user_shader_pass;
-/// Phase B-redux — prototype bake pipeline. Voxelizes each instance
-/// shader's `proto_sample_at(uvw)` into a dedicated octree+brick+leaf-
-/// attr triple, cached by source hash. Shares pool buffers with
-/// `user_shader_pass` at a disjoint byte range. The march path's
-/// `descend_proto_octree` reads these baked prototypes when a
-/// band-cell hit triggers `instance_at` derivation.
+/// Prototype bake pipeline. Voxelizes each instance shader's
+/// `proto_sample_at(uvw)` into a dedicated octree+brick+leaf-attr
+/// triple, cached by source hash. The new emit pass (Phase 9) writes
+/// `RkpInstance` records pointing at one of these baked protos as
+/// their `asset_id`; the host march descends the proto via the
+/// standard `march_object` flow.
 pub mod user_shader_proto_pass;
 /// Phase 7 — TLAS over instance AABBs for shadow rays (and future
 /// reflections / AO / GI). Session 1 ships only the wire format +

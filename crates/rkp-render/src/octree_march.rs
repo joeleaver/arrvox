@@ -6,12 +6,22 @@
 
 use crate::compile_pass_shader;
 
-/// Stats buffer size in bytes (64 × u32). See the `stats` binding in
-/// `shaders/octree_march.wgsl` for the layout. Expanded from 52 when
-/// the Surface-Nets normal-reconstruction POC added counters at
-/// stats[52..55].
-const STATS_U32_COUNT: usize = 64;
-const STATS_BYTES: u64 = (STATS_U32_COUNT * 4) as u64;
+/// Stats buffer size in bytes. See the `stats` binding in
+/// `shaders/octree_march.wgsl` for the layout. Expanded from 52 → 64
+/// when Surface-Nets normal-reconstruction added counters at
+/// stats[52..55]; 64 → 80 added the user-shader descend-body
+/// breakdown counters at stats[64..72] (k-loop, AABB rejected, descent
+/// run, descent miss, hit) for measuring the band-cell descent cost.
+pub const STATS_U32_COUNT: usize = 80;
+pub const STATS_BYTES: u64 = (STATS_U32_COUNT * 4) as u64;
+
+/// State machine for the async stats readback. Single buffer rather
+/// than a ring — stats are sampled sparsely (debug eprintln), so
+/// "skip if previous map_async still in flight" is sufficient.
+const STATS_MAP_IDLE: u8 = 0;
+const STATS_MAP_PENDING: u8 = 1;
+const STATS_MAP_READY: u8 = 2;
+const STATS_MAP_FAILED: u8 = 3;
 
 /// Uniform parameters for the march shader.
 #[repr(C)]
@@ -82,9 +92,13 @@ pub struct OctreeMarchPass {
     params_bind_group_layout: wgpu::BindGroupLayout,
     params_buffer: wgpu::Buffer,
     params_bind_group: Option<wgpu::BindGroup>,
-    /// Stats buffer for profiling (44 atomic u32s — see shader comment at stats binding).
+    /// Stats buffer for profiling. See the `stats` binding doc in
+    /// `shaders/octree_march.wgsl` for the slot layout.
     stats_buffer: wgpu::Buffer,
     stats_readback: wgpu::Buffer,
+    /// Map state for the async stats readback. Held in an `Arc` so the
+    /// `map_async` callback can flip it from the wgpu-internal worker.
+    stats_map_state: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// Per-tile object-list offsets (prefix sum, u32). One entry per
     /// tile plus a trailing sentinel, so `tile_offsets[t+1]` is always
     /// a valid read bound for tile `t`'s list.
@@ -307,6 +321,9 @@ impl OctreeMarchPass {
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             }),
+            stats_map_state: std::sync::Arc::new(
+                std::sync::atomic::AtomicU8::new(STATS_MAP_IDLE),
+            ),
             // Tile-list buffers — sized for 1 tile at start (2 u32s =
             // 8 B; sentinel offset + a trivially empty object list).
             // Both grow on `upload_tile_lists` when needed.
@@ -566,20 +583,66 @@ impl OctreeMarchPass {
         encoder.clear_buffer(&self.stats_buffer, 0, None);
     }
 
-    /// Copy stats to readback buffer after dispatch.
+    /// Copy stats to readback buffer after dispatch. Skipped when a
+    /// previous `submit_stats_readback`'s map_async is still pending or
+    /// the result hasn't been drained yet — encoding a copy into a
+    /// mapped (or about-to-be-mapped) buffer is a wgpu validation
+    /// error. The drain-then-submit cycle in the engine clears the
+    /// state each frame, so under steady state we get fresh data
+    /// every frame the env var is enabled; without the env var the
+    /// state stays IDLE and the copy fires every frame.
     pub fn copy_stats(&self, encoder: &mut wgpu::CommandEncoder) {
+        use std::sync::atomic::Ordering;
+        let state = self.stats_map_state.load(Ordering::Acquire);
+        if state == STATS_MAP_PENDING || state == STATS_MAP_READY {
+            return;
+        }
         encoder.copy_buffer_to_buffer(&self.stats_buffer, 0, &self.stats_readback, 0, STATS_BYTES);
     }
 
-    // NOTE: the march shader writes verbose per-frame counters
-    // (descent histograms, bandwidth tallies, skin-march probe) into
-    // `stats_buffer`; they used to be blocking-read and eprintln'd
-    // here every 60 frames. That log has been retired in favor of the
-    // engine-side `ProfilingHistory`. The GPU scaffolding (stats
-    // buffer + clear/copy) is still wired so the shader keeps
-    // compiling; a future change will route these counters through
-    // async readback into `ProfilingHistory::counters` for the panel
-    // and MCP.
+    /// Schedule async readback of the stats buffer. Call AFTER
+    /// `queue.submit` of the encoder containing `copy_stats`. No-op
+    /// (returns immediately) if a previous map_async is still pending
+    /// or hasn't been drained yet — caller can poll every frame and
+    /// the readback will progress at GPU/driver pace.
+    pub fn submit_stats_readback(&self) {
+        use std::sync::atomic::Ordering;
+        let state = self.stats_map_state.load(Ordering::Acquire);
+        if state == STATS_MAP_PENDING || state == STATS_MAP_READY {
+            return;
+        }
+        self.stats_map_state.store(STATS_MAP_PENDING, Ordering::Release);
+        let state_arc = std::sync::Arc::clone(&self.stats_map_state);
+        let slice = self.stats_readback.slice(0..STATS_BYTES);
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let next = if result.is_ok() { STATS_MAP_READY } else { STATS_MAP_FAILED };
+            state_arc.store(next, Ordering::Release);
+        });
+    }
+
+    /// Try to drain the stats readback. Returns the most-recent stats
+    /// snapshot if the previous `submit_stats_readback` has resolved,
+    /// or `None` if no resolution is ready. After draining, the slot
+    /// is freed for the next `submit_stats_readback`.
+    pub fn try_drain_stats(&self) -> Option<Vec<u32>> {
+        use std::sync::atomic::Ordering;
+        let state = self.stats_map_state.load(Ordering::Acquire);
+        if state == STATS_MAP_FAILED {
+            self.stats_map_state.store(STATS_MAP_IDLE, Ordering::Release);
+            return None;
+        }
+        if state != STATS_MAP_READY {
+            return None;
+        }
+        let slice = self.stats_readback.slice(0..STATS_BYTES);
+        let counts: Vec<u32> = {
+            let view = slice.get_mapped_range();
+            bytemuck::cast_slice::<u8, u32>(&view).to_vec()
+        };
+        self.stats_readback.unmap();
+        self.stats_map_state.store(STATS_MAP_IDLE, Ordering::Release);
+        Some(counts)
+    }
 
     /// Update params and dispatch the march.
     #[allow(clippy::too_many_arguments)]

@@ -23,9 +23,7 @@ import package::lib::brick::FACE_NY;
 import package::lib::brick::FACE_PY;
 import package::lib::brick::FACE_NZ;
 import package::lib::brick::FACE_PZ;
-import package::lib::types::unpack_band_cell;
 import package::lib::octree::octree_lookup;
-import package::lib::octree::descend_proto_octree;
 import package::lib::octree::PHASE_MARCH;
 import package::lib::octree::PHASE_SHADOW;
 import package::lib::octree::LOD_CUTOFF_PX;
@@ -35,37 +33,23 @@ import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
 import package::lib::octree_slot::OCTREE_LEAF_BIT;
 import package::lib::octree_slot::OCTREE_BRICK_BIT;
-import package::lib::octree_slot::OCTREE_BAND_BIT;
 import package::lib::octree_slot::OCTREE_PAYLOAD_MASK;
 import package::lib::octree_slot::slot_is_brick;
-import package::lib::octree_slot::slot_is_band;
 import package::lib::octree_slot::slot_brick_id;
-import package::lib::octree_slot::slot_band_offset;
 import package::lib::types::OctreeResult;
 import package::lib::types::LeafAttr;
 import package::lib::types::leaf_attr_material_primary;
-import package::lib::types::BandCell;
 import package::lib::types::RkpInstance;
 import package::lib::types::GpuMaterial;
 import package::lib::types::CameraUniforms;
 import package::lib::types::OverlayEntry;
-import package::lib::types::ProtoHit;
 import package::lib::types::MarchParams;
 import package::lib::types::GpuLight;
 import package::lib::types::Aabb;
-import package::lib::types::UserCtx;
-import package::lib::types::HostSample;
 import package::lib::types::RkpAsset;
-import package::lib::types::InstanceHit;
 import package::lib::leaf_attr::fetch_overlay_index;
 import package::lib::leaf_attr::fetch_leaf_attr_for;
 import package::lib::leaf_attr::fetch_leaf_color_for;
-
-// Stats phase passed by `dispatch_user_instance_descend`'s splice
-// chunk to `descend_proto_octree`. PHASE_MARCH so proto descents
-// that fire while marching the camera-visible scene bucket alongside
-// the host octree descents.
-const PROTO_PHASE: u32 = PHASE_MARCH;
 
 const OPACITY_THRESHOLD: f32 = 0.05;
 // Safety-net ceiling for the outer ray-march loop. The ray already
@@ -121,25 +105,6 @@ fn rkp_object_visible(inst: RkpInstance) -> bool {
         || inst.object_id == camera.focus_object_id;
 }
 
-// Phase B-redux 3b — band-cell wire format. Mirrors
-// `crate::user_shader_pass::GpuBandCell`.
-//
-// Bake (3b.2) emits one `BandCell` per max-depth cell in the band
-// around painted host leaves. The cell's octree node carries
-// `OCTREE_LEAF_BIT | OCTREE_BAND_BIT | payload_offset` where
-// `payload_offset` indexes `band_cell_pool` (added in 3b.3 with the
-// march dispatch).
-//
-// V1 single-anchor: each band cell stores its single nearest painted
-// host leaf's world center. V2 multi-anchor (up to 4) extends this
-// struct + the descent loop in march.
-//
-// `material_id` is the painted host material that drove this
-// region's bake. It carries `shader_id` (for `dispatch_user_instance_
-// descend`) and selects `shader_params` for `ctx.params`. Stored
-// per-cell because the user-shader REGION instance's
-// `inst.material_id` is hardcoded to 0 (`transient_asset_and_instance`)
-// and there's no per-region metadata table bound at the march.
 // Footprint threshold below which we treat a branch as small enough to
 // represent with its prefilter attr. Strict `<` (not `<=`) so the
 // fallback path still runs for exactly-1px nodes. See the LOD plan for
@@ -239,54 +204,6 @@ fn rkp_object_visible(inst: RkpInstance) -> bool {
 // the (row0, row1, row2) result when packing the return matrix.
 // `mat4_affine_inverse` is imported from `lib::math` at the top.
 
-// ── User-shader instance hooks ─────────────────────────────────────
-// World-space AABB returned by per-shader `inst_aabb` hooks. Used by
-// the band-cell descent path's per-shader `_instance_descend` body.
-
-// Phase B-redux — per-pixel `instance_at` descent. The host octree
-// DDA hits a band-cell leaf with an instance-shader material → look up
-// the shader's per-instance derivation hook + descend the prototype
-// octree directly. `InstanceHit` is the world-space output (closest
-// user-shader instance hit, if any). When the splice runs no chunk
-// (no instance shader registered, or none has an `instance_at` hook),
-// the default stub below returns "no hit" unconditionally — host
-// march falls through to the standard surface result.
-
-// User-shader-facing types. Same shapes the emit / proto / generate
-// pipelines expose — `octree_march` declares them here so the
-// `instance_at` hook (whose body the composer splices into the
-// USER_INSTANCE_AT_DISPATCH block below) can reference them. Field
-// layouts are wire-format with the corresponding Rust structs in
-// `crate::user_shader_emit_pass` / `crate::user_shader_pass`.
-
-
-const USER_INSTANCE_AT_DISPATCH_BEGIN: u32 = 0u;
-// Default identity stub — Rust composer replaces this whole block
-// (markers + body) with per-shader descent helpers + the dispatch
-// switch when any registered shader provides an `instance_at` hook.
-// Empty-registry path returns "no instance hit" so the host march
-// is unchanged.
-fn dispatch_user_instance_descend(
-    shader_id: u32,
-    host_pos: vec3<f32>,
-    host: HostSample,
-    leaf_slot: u32,
-    ray_origin: vec3<f32>,
-    ray_dir: vec3<f32>,
-    world_max_t: f32,
-    ctx: UserCtx,
-    asset: RkpAsset,
-) -> InstanceHit {
-    var r: InstanceHit;
-    r.valid = false;
-    r.world_t = world_max_t;
-    r.world_pos = vec3<f32>(0.0);
-    r.world_normal = vec3<f32>(0.0, 1.0, 0.0);
-    return r;
-}
-const USER_INSTANCE_AT_DISPATCH_END: u32 = 0u;
-
-
 fn leaf_attr_material_secondary(a: LeafAttr) -> u32 { return (a.material_packed >> 16u) & 0x0FFFu; }
 fn leaf_attr_blend_weight(a: LeafAttr) -> u32 { return (a.material_packed >> 28u) & 0x0Fu; }
 
@@ -319,7 +236,7 @@ fn brick_id_of(node: u32) -> u32 {
 
 @group(2) @binding(0) var<uniform> march_params: MarchParams;
 @group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
-@group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 64>;
+@group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 80>;
 // stats[0]       = total steps across all pixels
 // stats[1]       = (reserved — was total_lookups; retained slot for layout stability)
 // stats[2]       = pixels that found a hit
@@ -341,10 +258,18 @@ fn brick_id_of(node: u32) -> u32 {
 // stats[57]      = skinned march bone-field populated-cell reads
 // stats[58]      = skinned march brick-skip hits (empty-brick fast-forward)
 // stats[59]      = skinned march brick-populated samples
-// stats[60]      = user-shader instance dispatch invocations (Phase B-redux 3a)
-// stats[61]      = user-shader instance dispatch hits        (Phase B-redux 3a)
+// stats[60]      = user-shader instance dispatch invocations (band-cell — Phase B-redux 3b)
+// stats[61]      = user-shader instance dispatch hits        (band-cell — Phase B-redux 3b)
 // stats[62]      = band-cell shadow dispatch invocations (Phase 4)
 // stats[63]      = band-cell shadow dispatch hits        (Phase 4)
+// stats[64]      = user-shader Phase-3a dispatch invocations (post-host-hit branch)
+// stats[65]      = user-shader Phase-3a dispatch hits
+// stats[66]      = descend k-loop iterations passed by `instance_at` (per-candidate)
+// stats[67]      = descend candidates rejected at AABB cull
+// stats[68]      = descend candidates that ran proto-octree descent
+// stats[69]      = descend candidates whose proto descent missed
+// stats[70]      = descend candidates that produced a hit (best.valid set)
+// stats[71..80]  = (reserved — slack for future descend-body counters)
 //
 // octree_nodes reads are derived CPU-side from the per-phase depth histograms:
 // sum(bucket[i] * (i + 1)) since each lookup descends `depth+1` nodes.
@@ -394,6 +319,19 @@ fn bucket_depth(phase: u32, level: u32) {
     let base = 4u + phase * 12u;
     atomicAdd(&stats[base + min(level, 11u)], 1u);
 }
+
+// Descend-body breakdown counters. The composer-generated
+// `rkp_user_<id>_instance_descend` body calls these per candidate so
+// we can attribute time across the per-candidate cost stages
+// (`stats[66..71]`). Defined as free functions because the same
+// composed body is spliced into shadow_scatter.wgsl, which has no
+// `stats` binding and stubs them out as no-ops; same pattern as
+// `bucket_depth`.
+fn record_descend_k_test()      { atomicAdd(&stats[66], 1u); }
+fn record_descend_aabb_reject() { atomicAdd(&stats[67], 1u); }
+fn record_descend_descended()   { atomicAdd(&stats[68], 1u); }
+fn record_descend_miss()        { atomicAdd(&stats[69], 1u); }
+fn record_descend_hit()         { atomicAdd(&stats[70], 1u); }
 
 /// Look up a single neighbor cell's occupancy state given an offset
 /// from the hit cell. Resolves cross-brick reads by chaining 1–3
@@ -547,15 +485,8 @@ fn bucket_lod_exit(level: u32) {
 /// * `focal_px_y` — vertical pixels per world unit at unit depth. Read
 ///   once in the caller from `camera`.
 
-// `slot_is_brick`, `slot_brick_id`, `slot_is_band`, `slot_band_offset`
-// are imported from `lib::octree_slot` at the top of this file.
-
-/// Phase B-redux 3b — read a `BandCell` payload by unpacking two
-/// consecutive `leaf_attr_pool` slots. BFS bake (user_shader_geom.wgsl)
-/// writes the matching pattern.
-fn read_band_cell(band_off: u32) -> BandCell {
-    return unpack_band_cell(leaf_attr_pool[band_off], leaf_attr_pool[band_off + 1u]);
-}
+// `slot_is_brick`, `slot_brick_id` are imported from
+// `lib::octree_slot` at the top of this file.
 
 // Skip past an empty/interior node's region along the ray.
 // Uses DDA exit: find the nearest axis-aligned plane the ray crosses to leave this node.
@@ -581,17 +512,6 @@ struct MarchResult {
     first_slot: u32,        // voxel_pool slot (already dereferenced from leaf_attr)
     valid: bool,
     steps: u32,             // total steps taken (for profiling)
-    // Phase 4c — set ONLY on the user-shader path (asset.shader_id !=
-    // 0). The user's `inst_to_local` hook provides a non-affine
-    // world→canonical map that the existing `inst.world` matrix
-    // doesn't capture, so we can't reuse the affine-path back-
-    // transform at the call site. `march_object` precomputes world
-    // pos / world normal here using the actual user-shader transform
-    // and the call site picks them up directly. Both fields stay zero
-    // on the affine path; `is_user_shader_hit` distinguishes.
-    is_user_shader_hit: bool,
-    world_pos: vec3<f32>,
-    world_normal: vec3<f32>,
     // Glass tracking. Set when the ray traverses at least one
     // transparent voxel (material opacity < 0.99) before landing on
     // the opaque `first_slot` (or exiting the object without one).
@@ -612,15 +532,6 @@ struct MarchResult {
     // behind it (which is what `first_slot` records). 0 when the
     // ray didn't hit glass.
     glass_slot: u32,
-    // Phase B-redux 3b — for band-cell hits, the painted host
-    // material that drove the bake. The user-shader REGION
-    // instance's `inst.material_id` is hardcoded to 0
-    // (`transient_asset_and_instance`), so main() can't read it
-    // off the instance — the band cell carries it on the leaf
-    // payload, and march_object copies it here. Zero on non-band
-    // user-shader hits (proto-baked instances inherit material
-    // through their host).
-    user_shader_material_id: u32,
 }
 
 // `pack_oct_normal` is imported from `lib::oct_normal` at the top.
@@ -706,12 +617,8 @@ fn march_object_skinned(
     var result = MarchResult(
         vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0),
         0.0, 0.0, 0u, false, 0u,
-        // Phase 4c user-shader path fields — populated at the end of
-        // `march_object` only when the asset has shader_id != 0.
-        false, vec3<f32>(0.0), vec3<f32>(0.0),
         false, vec3<f32>(0.0), 0u, 0.0, 0.0,
         0u, // glass_slot
-        0u, // user_shader_material_id (Phase 3b)
     );
 
     let inv_world = mat4_affine_inverse(inst.world);
@@ -854,13 +761,8 @@ fn march_object(
     var result = MarchResult(
         vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0),
         0.0, 0.0, 0u, false, 0u,
-        // is_user_shader_hit, world_pos, world_normal — populated by
-        // the band-cell descent path (`dispatch_user_instance_descend`)
-        // when a band-cell hit produces a world-space hit.
-        false, vec3<f32>(0.0), vec3<f32>(0.0),
         false, vec3<f32>(0.0), 0u, 0.0, 0.0,
         0u, // glass_slot
-        0u, // user_shader_material_id (Phase B-redux 3b)
     );
 
     // Standard host-asset path — affine inv_world × world.
@@ -1161,110 +1063,6 @@ fn march_object(
             continue;
         }
 
-        // Phase B-redux 3b — band-cell hit. The BFS bake (user_shader_
-        // geom.wgsl) tagged this leaf with `LEAF | BAND` and packed a
-        // `BandCell { anchor_world_pos, region_index }` into two
-        // consecutive `leaf_attr_pool` slots at `slot_band_offset`.
-        // Fire `dispatch_user_instance_descend` seeded by the anchor.
-        // On hit, write world-space result fields (instance descent
-        // returns world coords; mark `is_user_shader_hit` so the caller
-        // skips the affine back-transform). On miss, skip past the
-        // node and continue marching.
-        if slot_is_band(r.slot) {
-            let band_off = slot_band_offset(r.slot);
-            let band = read_band_cell(band_off);
-
-            // Resolve the prototype asset by linear scan for the
-            // shader_id matching the band cell's painted host
-            // material. The band cell carries `material_id` (NOT the
-            // user-shader region instance's `inst.material_id`, which
-            // is hardcoded to 0 in `transient_asset_and_instance`);
-            // shader_id flows through the host material entry.
-            let band_mat_id = band.material_id;
-            let mat = materials[band_mat_id];
-            let shader_id = mat.instance_shader_id;
-            var proto_idx: u32 = 0xFFFFFFFFu;
-            if shader_id != 0u {
-                let acount = march_params.asset_count;
-                for (var ai: u32 = 0u; ai < acount; ai = ai + 1u) {
-                    if assets[ai].shader_id == shader_id {
-                        proto_idx = ai;
-                        break;
-                    }
-                }
-            }
-
-            if proto_idx == 0xFFFFFFFFu {
-                // No matching proto registered — treat as empty + skip.
-                t += skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs);
-                continue;
-            }
-
-            let proto_asset = assets[proto_idx];
-
-            var host_sample: HostSample;
-            host_sample.distance = 0.0;
-            host_sample.normal = vec3<f32>(0.0, 1.0, 0.0);
-            host_sample.material = band_mat_id;
-            host_sample.material_secondary = 0u;
-            host_sample.blend_weight = 0u;
-
-            var ctx: UserCtx;
-            ctx.time = march_params.time;
-            // Cell scale at max_depth — passed to the shader as a
-            // hint for blade dimensions. For V1 the band cell's own
-            // size is the simplest proxy; future revisions could
-            // pipe the host's voxel size on the BandCell payload.
-            ctx.cell_size = r.cell_half * 2.0;
-            ctx.material_id = band_mat_id;
-            ctx.aabb_min = vec3<f32>(0.0);
-            let pbase = band_mat_id * 8u;
-            ctx.params[0] = shader_params[pbase + 0u];
-            ctx.params[1] = shader_params[pbase + 1u];
-            ctx.params[2] = shader_params[pbase + 2u];
-            ctx.params[3] = shader_params[pbase + 3u];
-            ctx.params[4] = shader_params[pbase + 4u];
-            ctx.params[5] = shader_params[pbase + 5u];
-            ctx.params[6] = shader_params[pbase + 6u];
-            ctx.params[7] = shader_params[pbase + 7u];
-
-            atomicAdd(&stats[60], 1u); // band-cell dispatch invocation
-            // V1 — pass `1e30` as max_world_dist; the prototype
-            // descent's own AABB cull bounds the search. Cleaner
-            // bounding (e.g. `t * local_to_world + cell_diagonal`) is
-            // a future optimization.
-            let inst_hit = dispatch_user_instance_descend(
-                shader_id,
-                band.anchor_world_pos,
-                host_sample,
-                0u,
-                world_origin,
-                world_dir,
-                1.0e30,
-                ctx,
-                proto_asset,
-            );
-            if inst_hit.valid {
-                atomicAdd(&stats[61], 1u); // band-cell dispatch hit
-                result.is_user_shader_hit = true;
-                result.world_pos = inst_hit.world_pos;
-                result.world_normal = normalize(inst_hit.world_normal);
-                result.t = inst_hit.world_t;
-                result.alpha = 1.0;
-                result.color = vec3<f32>(0.0);
-                result.first_slot = 0u;
-                result.normal = vec3<f32>(0.0); // unused on user-shader path
-                result.oc_pos = vec3<f32>(0.0); // unused on user-shader path
-                result.valid = true;
-                result.steps = step_count;
-                result.user_shader_material_id = band_mat_id;
-                break;
-            }
-            // No hit — skip past the cell.
-            t += skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs);
-            continue;
-        }
-
         // Leaf / INTERIOR hit. Opaque cells are a first-surface stop
         // (primary hit / behind-glass). Transparent cells record
         // themselves as glass-in-front and the march continues so
@@ -1471,30 +1269,26 @@ fn main(
         if !rkp_object_visible(inst) { continue; }
 
         // AABB check: compute world-space entry distance, skip if
-        // behind closest hit. Hosts use the asset's canonical AABB
-        // through `inv_world`. User-shader prototype assets
-        // (`shader_id != 0`) skip the cull — they enter only via the
-        // band-cell descent path, which has its own AABB cull inside
-        // each shader's `_instance_descend` body.
-        var local_to_world_scale: f32 = 1.0;
-        if asset.shader_id == 0u {
-            let inv_world = mat4_affine_inverse(inst.world);
-            let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
-            let local_dir_unnorm = (inv_world * vec4<f32>(ray_dir, 0.0)).xyz;
-            local_to_world_scale = 1.0 / max(length(local_dir_unnorm), 1e-10);
-            let local_dir = normalize(local_dir_unnorm);
-            let extent = bitcast<f32>(asset.octree_extent_bits);
-            let oc_origin = local_origin - asset.grid_origin;
-            let safe_d = vec3<f32>(
-                select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),
-                select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),
-                select(local_dir.z, select(-1e-10, 1e-10, local_dir.z >= 0.0), abs(local_dir.z) < 1e-10),
-            );
-            let t_range = intersect_aabb(oc_origin, 1.0 / safe_d, vec3<f32>(0.0), vec3<f32>(extent));
-            if t_range.x > t_range.y { continue; } // ray misses AABB
-            let world_entry = t_range.x * local_to_world_scale;
-            if world_entry > max_world_dist { continue; } // AABB entirely behind closest hit
-        }
+        // behind closest hit. The asset's canonical AABB is `[0..extent]`
+        // in local space; back-transform via inv_world. Same path for
+        // host objects and emitted user-shader instance prototypes —
+        // both run through march_object → descend_proto_octree.
+        let inv_world = mat4_affine_inverse(inst.world);
+        let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
+        let local_dir_unnorm = (inv_world * vec4<f32>(ray_dir, 0.0)).xyz;
+        let local_to_world_scale = 1.0 / max(length(local_dir_unnorm), 1e-10);
+        let local_dir = normalize(local_dir_unnorm);
+        let extent = bitcast<f32>(asset.octree_extent_bits);
+        let oc_origin = local_origin - asset.grid_origin;
+        let safe_d = vec3<f32>(
+            select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),
+            select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),
+            select(local_dir.z, select(-1e-10, 1e-10, local_dir.z >= 0.0), abs(local_dir.z) < 1e-10),
+        );
+        let aabb_t_range = intersect_aabb(oc_origin, 1.0 / safe_d, vec3<f32>(0.0), vec3<f32>(extent));
+        if aabb_t_range.x > aabb_t_range.y { continue; } // ray misses AABB
+        let world_entry = aabb_t_range.x * local_to_world_scale;
+        if world_entry > max_world_dist { continue; } // AABB entirely behind closest hit
 
         // March this object.
         let r = march_object(
@@ -1547,27 +1341,14 @@ fn main(
         // through `inst.world`. Band-cell user-shader hits already
         // carry world-space fields populated by the per-shader
         // `instance_descend` body in `dispatch_user_instance_descend`.
-        var world_pos: vec3<f32>;
-        if r.is_user_shader_hit {
-            world_pos = r.world_pos;
-        } else {
-            let local_hit = oc_pos + asset.grid_origin;
-            world_pos = (inst.world * vec4<f32>(local_hit, 1.0)).xyz;
-        }
+        let local_hit = oc_pos + asset.grid_origin;
+        let world_pos = (inst.world * vec4<f32>(local_hit, 1.0)).xyz;
         let hit_dist = length(world_pos - ray_origin);
 
         // Skip hits beyond the closest opaque surface.
         if hit_dist > max_world_dist { continue; }
 
-        var world_normal: vec3<f32>;
-        if r.is_user_shader_hit {
-            // V1 — pass canonical-space normal through as world.
-            // Mirror Option B; proper world-normal needs a 3-Jacobian
-            // inverse-transpose (deferred follow-up).
-            world_normal = normalize(r.world_normal);
-        } else {
-            world_normal = normalize((inst.world * vec4<f32>(local_normal, 0.0)).xyz);
-        }
+        let world_normal = normalize((inst.world * vec4<f32>(local_normal, 0.0)).xyz);
 
         // Opaque hit closer than current best: replace the accumulator entirely.
         if r.alpha > 0.99 {
@@ -1577,28 +1358,7 @@ fn main(
             accum_alpha = 1.0;
             first_dist = hit_dist;
             first_obj_id = inst.object_id;
-            // V1 user-shader path inherits the painted host material:
-            // the proto bake writes `material_primary = 0` into its
-            // leaf_attr entries (it doesn't know about host materials),
-            // so reading the leaf_attr's material would render every
-            // user-shader instance as material slot 0 (yellow). Mirror
-            // Option B's `instance_march_main.wgsl` which packs
-            // `region.material_id` over the proto's value at the same
-            // step. (project_user_shaders_option_b_stage1 locked
-            // host-material inheritance as the V1 default.)
-            if r.is_user_shader_hit {
-                // Phase B-redux 3b — band-cell hits override
-                // `inst.material_id` (= 0 for user-shader regions) with
-                // the painted host material the band cell stamped on.
-                if r.user_shader_material_id != 0u {
-                    first_mat_id = r.user_shader_material_id;
-                } else {
-                    first_mat_id = inst.material_id;
-                }
-                first_sec_mat = 0u;
-                first_blend = 0u;
-                first_leaf_slot = r.first_slot;
-            } else if r.first_slot != 0u {
+            if r.first_slot != 0u {
                 let attr = fetch_leaf_attr_for(inst, r.first_slot);
                 first_mat_id = leaf_attr_material_primary(attr);
                 first_sec_mat = leaf_attr_material_secondary(attr);
@@ -1630,17 +1390,7 @@ fn main(
             first_dist = hit_dist;
             first_obj_id = inst.object_id;
             closest_obj_idx = i;
-            // Same host-material inheritance as the opaque branch.
-            if r.is_user_shader_hit {
-                if r.user_shader_material_id != 0u {
-                    first_mat_id = r.user_shader_material_id;
-                } else {
-                    first_mat_id = inst.material_id;
-                }
-                first_sec_mat = 0u;
-                first_blend = 0u;
-                first_leaf_slot = r.first_slot;
-            } else if r.first_slot != 0u {
+            if r.first_slot != 0u {
                 let attr = fetch_leaf_attr_for(inst, r.first_slot);
                 first_mat_id = leaf_attr_material_primary(attr);
                 first_sec_mat = leaf_attr_material_secondary(attr);
@@ -1653,114 +1403,6 @@ fn main(
         }
     }
 
-    // Phase B-redux Phase 3a — instance_at dispatch at the host hit.
-    // When the closest host hit's material has an instance shader,
-    // run user-shader instance descent at the painted leaf. Many
-    // shaders place instances that extend OUT of the painted host
-    // surface (a blade rooted on the ground extends upward; a stalk
-    // on a wall extends outward), so the descent often produces a
-    // closer hit than the host's surface; replace accumulators on
-    // win.
-    //
-    // Phase 3b coexistence: when the closest hit was at a band cell
-    // inside a user-shader REGION object, `march_object` already ran
-    // dispatch and stored the descent's world-space hit. Skip the
-    // re-dispatch by gating on the host instance's asset shader_id —
-    // user-shader region assets carry shader_id != 0; regular hosts
-    // (where Phase 3a should fire) carry shader_id == 0.
-    if have_first
-        && closest_obj_idx != 0xFFFFFFFFu
-        && first_mat_id < arrayLength(&materials)
-        && assets[instances[closest_obj_idx].asset_id].shader_id == 0u
-    {
-        let hit_shader_id = materials[first_mat_id].instance_shader_id;
-        if hit_shader_id != 0u {
-            // Resolve the prototype asset by linear scan of `assets[]`
-            // for the matching `shader_id`. Small N (one asset per
-            // registered instance shader) so this is cheap; a proper
-            // shader_id → asset_id table is Phase 3b work.
-            var inst_asset_idx: u32 = 0xFFFFFFFFu;
-            let acount = march_params.asset_count;
-            for (var ai: u32 = 0u; ai < acount; ai = ai + 1u) {
-                if assets[ai].shader_id == hit_shader_id {
-                    inst_asset_idx = ai;
-                    break;
-                }
-            }
-            if inst_asset_idx != 0xFFFFFFFFu {
-                let inst_proto_asset = assets[inst_asset_idx];
-                // Snap accum_pos to the host's voxel grid. Without
-                // snapping, two pixels hitting the same painted host
-                // leaf at slightly different positions would feed
-                // different host_pos seeds into instance_at and see
-                // different per-instance derivations → flicker.
-                let host_inst = instances[closest_obj_idx];
-                let host_asset = assets[host_inst.asset_id];
-                let host_inv = mat4_affine_inverse(host_inst.world);
-                let local_hit = (host_inv * vec4<f32>(accum_pos, 1.0)).xyz;
-                let cell_size_h = max(host_asset.voxel_size, 1e-6);
-                let cell_idx = floor(local_hit / cell_size_h);
-                let local_center = (cell_idx + vec3<f32>(0.5)) * cell_size_h;
-                let host_pos = (host_inst.world * vec4<f32>(local_center, 1.0)).xyz;
-
-                // Build HostSample / UserCtx from the host hit and
-                // per-material params. ctx.params reads from the
-                // shared shader_params buffer at offset
-                // `material_id * 8`; the `instance_at` body indexes
-                // into ctx.params[N].
-                var host_sample: HostSample;
-                host_sample.distance = first_dist;
-                host_sample.normal = accum_normal;
-                host_sample.material = first_mat_id;
-                host_sample.material_secondary = first_sec_mat;
-                host_sample.blend_weight = first_blend;
-
-                var ctx: UserCtx;
-                ctx.time = march_params.time;
-                ctx.cell_size = host_asset.voxel_size;
-                ctx.material_id = first_mat_id;
-                ctx.aabb_min = vec3<f32>(0.0);
-                let pbase = first_mat_id * 8u;
-                ctx.params[0] = shader_params[pbase + 0u];
-                ctx.params[1] = shader_params[pbase + 1u];
-                ctx.params[2] = shader_params[pbase + 2u];
-                ctx.params[3] = shader_params[pbase + 3u];
-                ctx.params[4] = shader_params[pbase + 4u];
-                ctx.params[5] = shader_params[pbase + 5u];
-                ctx.params[6] = shader_params[pbase + 6u];
-                ctx.params[7] = shader_params[pbase + 7u];
-
-                atomicAdd(&stats[60], 1u); // user-shader dispatch invocations
-                let inst_hit = dispatch_user_instance_descend(
-                    hit_shader_id,
-                    host_pos,
-                    host_sample,
-                    first_leaf_slot,
-                    ray_origin,
-                    ray_dir,
-                    max_world_dist,
-                    ctx,
-                    inst_proto_asset,
-                );
-                if inst_hit.valid && inst_hit.world_t < max_world_dist {
-                    atomicAdd(&stats[61], 1u); // user-shader dispatch hits
-                    accum_pos = inst_hit.world_pos;
-                    accum_normal = normalize(inst_hit.world_normal);
-                    accum_color = vec3<f32>(0.0); // material albedo from host
-                    accum_alpha = 1.0;
-                    first_dist = inst_hit.world_t;
-                    max_world_dist = inst_hit.world_t;
-                    // Host-material inheritance (V1 — same as Option B).
-                    // Keep first_mat_id, first_sec_mat, first_blend.
-                    // Reset leaf_slot since the proto leaf isn't in
-                    // the host's overlay — paint cursor falls back to
-                    // material albedo.
-                    first_leaf_slot = 0u;
-                    closest_obj_idx = 0xFFFFFFFFu;
-                }
-            }
-        }
-    }
 
     // Stats.
     atomicAdd(&stats[0], total_steps);

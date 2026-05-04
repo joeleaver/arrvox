@@ -7,7 +7,6 @@ import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
 import package::lib::octree_slot::OCTREE_LEAF_BIT;
 import package::lib::octree_slot::OCTREE_BRICK_BIT;
-import package::lib::octree_slot::OCTREE_BAND_BIT;
 import package::lib::octree_slot::OCTREE_PAYLOAD_MASK;
 import package::lib::octree_slot::slot_is_brick;
 import package::lib::octree_slot::slot_brick_id;
@@ -143,13 +142,10 @@ fn octree_lookup(
         }
         if (node & OCTREE_LEAF_BIT) != 0u {
             bucket_depth(phase, level);
-            // Preserve BRICK_BIT and BAND_BIT in the returned slot so
-            // the caller can distinguish a leaf-attr leaf from a brick
-            // leaf or a band cell. Band cells trigger
-            // `dispatch_user_instance_descend` for proper instance-
-            // shader rendering.
+            // Preserve BRICK_BIT in the returned slot so the caller
+            // can distinguish a leaf-attr leaf from a brick leaf.
             return OctreeResult(
-                (node & OCTREE_PAYLOAD_MASK) | (node & OCTREE_BRICK_BIT) | (node & OCTREE_BAND_BIT),
+                (node & OCTREE_PAYLOAD_MASK) | (node & OCTREE_BRICK_BIT),
                 level, center, half,
             );
         }
@@ -189,7 +185,7 @@ fn octree_lookup(
     if node == OCTREE_INTERIOR { return OctreeResult(OCTREE_INTERIOR, max_depth, center, half); }
     if (node & OCTREE_LEAF_BIT) != 0u {
         return OctreeResult(
-            (node & OCTREE_PAYLOAD_MASK) | (node & OCTREE_BRICK_BIT) | (node & OCTREE_BAND_BIT),
+            (node & OCTREE_PAYLOAD_MASK) | (node & OCTREE_BRICK_BIT),
             max_depth, center, half,
         );
     }

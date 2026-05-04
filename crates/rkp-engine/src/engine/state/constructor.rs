@@ -70,7 +70,6 @@ impl EngineState {
             bake_worker,
             generator_system,
             user_shader_registry: rkp_render::shader_composer::UserShaderRegistry::empty(),
-            user_shader_regions: Vec::new(),
             painted_materials: std::collections::HashMap::new(),
             painted_materials_paint_epoch: 0,
             painted_materials_geometry_epoch: 0,

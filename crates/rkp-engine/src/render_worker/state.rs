@@ -179,16 +179,7 @@ pub(super) struct RenderState {
     pub(super) viewport_renderers: std::collections::HashMap<ViewportId, ViewportRenderer>,
     pub(super) scene_mgr: Arc<Mutex<RkpSceneManager>>,
 
-    /// Phase C — GPU runtime geometry pass + transient cache. The
-    /// pass owns the geom-build pipeline; the cache tracks
-    /// per-(host_object, material) slices in the scene's transient
-    /// pool tail. Both live on the render thread because they're
-    /// driven entirely by GPU work that downstream march/shade
-    /// dispatches consume in the same encoder.
-    pub(super) user_shader_pass: rkp_render::user_shader_pass::UserShaderPass,
-    pub(super) user_shader_cache: rkp_render::user_shader_pass::UserShaderObjectCache,
-
-    /// Option B (voxel sprite instancing) — scene-wide pieces. The
+    /// Voxel sprite instancing — scene-wide pieces. The
     /// per-viewport march + composite live in [`ViewportRenderer`]
     /// (Stage 6c-2). All four pieces here are constructed at startup
     /// Phase B-redux — prototype bake pass + cache. The bake writes
@@ -336,10 +327,7 @@ impl RenderState {
             mapped_at_creation: false,
         });
 
-        let user_shader_pass = rkp_render::user_shader_pass::UserShaderPass::new(&device);
-        let user_shader_cache = rkp_render::user_shader_pass::UserShaderObjectCache::new();
-
-        // Phase B-redux instance prototype bake pass + cache. Scene
+        // Instance prototype bake pass + cache. Scene
         // dispatches the bake when an instance shader's source hash
         // changes; the cache deduplicates per-shader prototype slots
         // in the host pool tail. Idle until the first instance shader
@@ -363,8 +351,6 @@ impl RenderState {
             renderer,
             viewport_renderers,
             scene_mgr: init.scene_mgr,
-            user_shader_pass,
-            user_shader_cache,
             instance_proto_pass,
             instance_proto_cache,
             tlas_pass,

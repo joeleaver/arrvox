@@ -435,18 +435,22 @@ fn user_grass_shade(ctx: ShadeCtx) -> ShadeResult { var r: ShadeResult; return r
     assert!(chunks.proto.contains("default:"));
 }
 
-// ── Phase B-redux: compose_instance_at_chunk ────────────────────
+// ── compose_instance_at_chunk: stub since band-cell strip ───────
+//
+// The composer's `instance_at` chunk used to splice per-shader
+// `rkp_user_<id>_instance_descend` bodies into the host march and
+// shadow shaders for the band-cell descent path. After the strip
+// the band-cell branches are gone, and the new emit pass (Phase 2
+// of the rebuild) consumes the parsed `instance_at` / `inst_aabb` /
+// `inst_to_local` / `inst_world_matrix` hooks directly. The chunk
+// is now always empty so the splice is a no-op for every consumer
+// template (`splice_const_marker` returns the template unchanged
+// on empty input).
 
-/// Composed chunk renames `user_<name>_instance_at` →
-/// `rkp_user_<id>_instance_at` and emits the body verbatim under
-/// the new name. The instance_at chunk is the SOLE emitter of
-/// the instance struct + helpers + the bare per-shader
-/// `inst_aabb` / `inst_to_local` bodies that the descent body
-/// calls.
+/// Even when shaders register an `instance_at` hook, the composer
+/// emits an empty chunk — the new emit pass owns this responsibility.
 #[test]
-fn compose_instance_at_chunk_renames_and_emits_struct() {
-    // `instance_at` requires `inst_aabb` + `inst_to_local`
-    // (descent calls both).
+fn compose_instance_at_chunk_is_empty_with_instance_at_hook() {
     let src = r#"
 // @instance_proto Pt
 struct Pt { pos: vec3<f32>, scale: f32 }
@@ -465,127 +469,34 @@ fn user_x_instance_at(
 host_pos: vec3<f32>, host: HostSample, ctx: UserCtx, k: u32,
 out_instance: ptr<function, Pt>,
 ) -> bool {
-if (k > 0u) { return false; }
-var p: Pt;
-p.pos = host_pos;
-p.scale = 1.0;
-*out_instance = p;
-return true;
-}
-"#;
-    let tmp = tempfile_dir("instance_at_renames");
-    write(&tmp, "x.wgsl", src);
-    let reg = scan_dir(&tmp).unwrap();
-    let chunks = compose(&reg);
-
-    // instance_at chunk now ALWAYS emits the struct decl (sole emitter).
-    assert!(
-        chunks.instance_at.contains("struct Pt"),
-        "instance_at chunk should emit struct decl. Got:\n{}",
-        chunks.instance_at,
-    );
-    // Bare per-shader functions called by the descent body.
-    assert!(
-        chunks.instance_at.contains("fn rkp_user_1_inst_aabb("),
-        "instance_at chunk should emit bare rkp_user_<id>_inst_aabb. Got:\n{}",
-        chunks.instance_at,
-    );
-    assert!(
-        chunks.instance_at.contains("fn rkp_user_1_inst_to_local("),
-        "instance_at chunk should emit bare rkp_user_<id>_inst_to_local. Got:\n{}",
-        chunks.instance_at,
-    );
-    assert!(
-        chunks.instance_at.contains("fn rkp_user_1_instance_at("),
-        "instance_at chunk should rename user_x_instance_at to \
-         per-id form. Got:\n{}",
-        chunks.instance_at,
-    );
-    // The user's body is emitted verbatim under the new name.
-    assert!(chunks.instance_at.contains("ptr<function, Pt>"));
-    assert!(chunks.instance_at.contains("*out_instance = p;"));
-    // Phase 2.c-2 — per-shader descent body + dispatcher.
-    assert!(
-        chunks.instance_at.contains("fn rkp_user_1_instance_descend("),
-        "instance_at chunk should emit the per-shader descent body",
-    );
-    assert!(
-        chunks.instance_at.contains("descend_proto_octree("),
-        "descent body should call descend_proto_octree",
-    );
-    assert!(
-        chunks.instance_at.contains("fn dispatch_user_instance_descend("),
-        "instance_at chunk should emit the unified dispatcher",
-    );
-}
-
-/// The instance_at chunk is the SOLE emitter of the instance
-/// struct + helpers + bare `inst_aabb` / `inst_to_local`. Helpers
-/// from a shader that also defines those hooks come through
-/// exactly once.
-#[test]
-fn compose_instance_at_chunk_emits_helpers_once() {
-    let src = r#"
-// @instance_proto Pt
-struct Pt { pos: vec3<f32>, scale: f32 }
-
-fn helper_noop(p: vec3<f32>) -> vec3<f32> { return p; }
-
-fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
-fn user_x_inst_to_local(world_pos: vec3<f32>, inst: Pt) -> vec3<f32> {
-return helper_noop(world_pos - inst.pos);
-}
-fn user_x_inst_aabb(inst: Pt) -> Aabb {
-var a: Aabb;
-a.min = inst.pos - vec3<f32>(0.5);
-a.max = inst.pos + vec3<f32>(0.5);
-return a;
-}
-fn user_x_instance_at(
-host_pos: vec3<f32>, host: HostSample, ctx: UserCtx, k: u32,
-out_instance: ptr<function, Pt>,
-) -> bool {
 return false;
 }
 "#;
-    let tmp = tempfile_dir("instance_at_dedupe");
+    let tmp = tempfile_dir("instance_at_stub_with_hook");
     write(&tmp, "x.wgsl", src);
     let reg = scan_dir(&tmp).unwrap();
     let chunks = compose(&reg);
-
-    // instance_at chunk emits struct + helpers exactly once.
-    assert_eq!(
-        chunks.instance_at.matches("struct Pt").count(), 1,
-        "instance_at should emit struct Pt exactly once. Got:\n{}",
+    assert!(
+        chunks.instance_at.is_empty(),
+        "instance_at chunk should be empty after band-cell strip. Got:\n{}",
         chunks.instance_at,
     );
-    assert_eq!(
-        chunks.instance_at.matches("fn helper_noop").count(), 1,
-        "instance_at should emit helper_noop exactly once. Got:\n{}",
-        chunks.instance_at,
-    );
-    assert!(chunks.instance_at.contains("fn rkp_user_1_instance_at("));
-    assert!(chunks.instance_at.contains("fn rkp_user_1_inst_aabb("));
-    assert!(chunks.instance_at.contains("fn rkp_user_1_inst_to_local("));
 }
 
-/// Empty registry → empty chunk (no `instance_at` hook
-/// registered). Downstream pipelines splicing the chunk see
-/// only a header comment.
+/// Empty registry → empty chunk. Same outcome as the with-hook
+/// case above.
 #[test]
-fn compose_instance_at_chunk_empty_when_no_instance_at_hook() {
+fn compose_instance_at_chunk_is_empty_without_instance_at_hook() {
     let src = r#"
 // @instance_proto Pt
 struct Pt { pos: vec3<f32>, scale: f32 }
 fn user_x_proto(uvw: vec3<f32>) -> VoxelEmit { var v: VoxelEmit; return v; }
 "#;
-    let tmp = tempfile_dir("instance_at_empty");
+    let tmp = tempfile_dir("instance_at_stub_without_hook");
     write(&tmp, "x.wgsl", src);
     let reg = scan_dir(&tmp).unwrap();
     let chunks = compose(&reg);
-    // Header comment only — no struct, no fn.
-    assert!(!chunks.instance_at.contains("struct Pt"));
-    assert!(!chunks.instance_at.contains("rkp_user_"));
+    assert!(chunks.instance_at.is_empty());
 }
 
 /// `user_<name>_instance_at` declared without `@instance_proto`

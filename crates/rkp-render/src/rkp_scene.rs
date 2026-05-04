@@ -9,6 +9,15 @@
 
 use crate::rkp_gpu_object::{RkpGpuAsset, RkpGpuInstance};
 
+/// Capacity of `RkpScene::user_shader_instance_buffer`, in slots. One
+/// slot = one `RkpGpuInstance` = 128 B; this cap × 128 sets the buffer
+/// byte size. 256K × 128 = 32 MB — fits comfortably under any sane
+/// `max_storage_buffer_binding_size`, and is more than enough for the
+/// "few thousand blades per painted patch" first-cut workload. Bump
+/// once GPU-side tile binning lands (Phase 6) and we want to scale to
+/// "hillsides as far as the eye can see."
+pub const USER_SHADER_INSTANCE_CAPACITY: u32 = 256 * 1024;
+
 /// Camera uniforms matching the WGSL `CameraUniforms` struct.
 ///
 /// Layout (208 + 16 = 224 bytes):
@@ -172,6 +181,21 @@ pub struct RkpScene {
     /// concatenated. Each `RkpGpuInstance.overlay_offset` +
     /// `overlay_count` slices into this. Bound at binding(13).
     pub instance_overlay_buffer: wgpu::Buffer,
+    /// User-shader emitted instances. Each entry is one `RkpGpuInstance`
+    /// (128 B) representing a single emitted primitive (grass blade,
+    /// scatter object, etc.) with a forward affine `world` matrix and
+    /// `asset_id` pointing at the shader's prototype asset.
+    ///
+    /// Sized for `USER_SHADER_INSTANCE_CAPACITY` slots at construction.
+    /// The emit pass atomically allocates slots; overflow drops blades
+    /// silently (the cap is a load-bearing budget, not a soft limit).
+    /// All registered shaders share this buffer (each blade carries its
+    /// own `asset_id`); separating them per-shader buys nothing here.
+    pub user_shader_instance_buffer: wgpu::Buffer,
+    /// Single u32 atomic — bump-allocator cursor for
+    /// `user_shader_instance_buffer`. Reset to 0 each frame; the emit
+    /// pass atomic-adds to claim slots.
+    pub user_shader_instance_count_buffer: wgpu::Buffer,
     pub bind_group_layout: wgpu::BindGroupLayout,
     /// Incremented whenever a shared buffer reallocates. Each VR caches
     /// the epoch it built its bind group at; rebuilds when the scene's
@@ -226,6 +250,29 @@ impl RkpScene {
             device, "rkp_instance_overlay", 16,
         );
 
+        // User-shader instance buffer — one `RkpGpuInstance` (128 B)
+        // per emitted blade. Sized at startup; never grows. The emit
+        // pass atomic-bumps a cursor (`user_shader_instance_count_buffer`)
+        // to claim slots. Capacity is a hard budget — blades emitted
+        // past the cap are silently dropped.
+        let user_shader_instance_buffer_bytes =
+            USER_SHADER_INSTANCE_CAPACITY as u64
+                * std::mem::size_of::<RkpGpuInstance>() as u64;
+        let user_shader_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rkp_user_shader_instances"),
+            size: user_shader_instance_buffer_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let user_shader_instance_count_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rkp_user_shader_instance_count"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
         let bind_group_layout = Self::create_layout(device);
 
         Self {
@@ -236,6 +283,8 @@ impl RkpScene {
             bone_field_occ_buffer, bone_field_occ_capacity,
             bone_dual_quats_buffer,
             instance_overlay_buffer,
+            user_shader_instance_buffer,
+            user_shader_instance_count_buffer,
             bind_group_layout,
             buffers_epoch: 0,
         }

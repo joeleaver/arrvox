@@ -226,14 +226,6 @@ pub(crate) struct EngineState {
     /// (engine sends `WorkerControl::ReloadUserShaders`).
     pub(crate) user_shader_registry: rkp_render::shader_composer::UserShaderRegistry,
 
-    /// Phase C — region requests for the GPU geometry-build pass.
-    /// V1: populated by explicit engine commands; the auto-scan over
-    /// ECS leaf-level materials lands in a follow-up. Sim ships this
-    /// list to the render thread each tick where `UserShaderPass`
-    /// caches + dispatches.
-    pub(crate) user_shader_regions:
-        Vec<rkp_render::user_shader_pass::ShaderRegionRequest>,
-
     /// Per-entity painted-material info, cached on
     /// `(paint_epoch, geometry_epoch)`. Layout:
     ///   `object_id → material_id → tile_coord → (tile-local AABB,

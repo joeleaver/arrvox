@@ -12,7 +12,7 @@ use crate::viewport::ViewportId;
 
 use super::super::frame_helpers::{compute_tlas_scene_aabb, prepare_shadow_maps};
 use super::super::state::RenderState;
-use super::super::user_shader_tick::{run_user_shader_geom, tick_instance_pipeline};
+use super::super::user_shader_tick::tick_instance_pipeline;
 
 use super::PreFrameOutput;
 
@@ -71,28 +71,24 @@ pub(super) fn run_pre_frame(
             &frame.user_shader_shade_chunk,
             frame.user_shader_source_hash,
         );
-        // Host march + shadow trace splice the user-shader instance_at
-        // chunk (the band-cell descent hook). Hash gate inside each
-        // `reload` makes the no-change frame a no-op.
+        // Host march + shadow shaders no longer splice an `instance_at`
+        // descent chunk (the band-cell path is gone). Pass an empty
+        // chunk so the splice is a no-op for unchanged source. Once
+        // the new emit pass lands, reloading happens on the emit pass
+        // itself, not on the consumer templates.
         vr.march.reload_user_shaders(
             &state.device,
-            &frame.user_shader_instance_at_chunk,
+            "",
             frame.user_shader_source_hash,
         );
-        // Phase 4 — shadow trace splices the same instance_at chunk
-        // the primary march does so band cells dispatch the same
-        // user-shader prototype descent into the shadow path.
         vr.shadow_trace.reload_user_shaders(
             &state.device,
-            &frame.user_shader_instance_at_chunk,
+            "",
             frame.user_shader_source_hash,
         );
-        // Phase 4 — shadow-map scatter splices the same instance_at
-        // chunk so band cells fire the user-shader instance descent
-        // for directional-light shadows too.
         vr.shadow_map.reload_user_shaders(
             &state.device,
-            &frame.user_shader_instance_at_chunk,
+            "",
             frame.user_shader_source_hash,
         );
         vr.shade.upload_shader_params(
@@ -179,88 +175,40 @@ pub(super) fn run_pre_frame(
         drop(sm);
     }
 
-    // 1.7. Option B (instance pipeline) per-frame tick. Stage 6c-3.5c
-    //      reserves the proto sub-pool past the user-shader-cache tail,
-    //      walks `instance_region_requests`, dispatches bake/scatter,
-    //      and uploads TileIndex + ProtoLookup. **Runs BEFORE
-    //      run_user_shader_geom** so the proto tail's buffer reservation
-    //      stacks correctly: tick reserves the full
-    //      `cpu + user_shader_max + proto_max` envelope when there's
-    //      any instance work, then run_user_shader_geom's own reservation
-    //      is a no-op (buffer already big enough).
+    // 1.7. Per-frame proto bake. Bakes each registered instance
+    //      shader's prototype octree (canonical [0,1]³) into the
+    //      shared host pool tail; emit pass + march descend it as a
+    //      regular asset. Returns one `RkpGpuAsset` per shader_id so
+    //      emitted blade instances can reference it.
     let inst_result = tick_instance_pipeline(state, frame);
 
-    // 1.7a. Upload `instance_overlay_buffer` BEFORE the BFS dispatch
-    //       below. The user-shader-pass probe (Phase B-redux band-cell
-    //       host-material check) descends the host octree and reads
-    //       this buffer to find painted material at each anchor. The
-    //       full `upload_frame` runs later (line ~279) because it
-    //       depends on `transient_assets` from the BFS, but the
-    //       overlay slice is independent and must be current here or
-    //       the probe sees the previous frame's paint state and the
-    //       BFS bakes off-by-one paint operations.
+    // 1.7a. Upload `instance_overlay_buffer` for the per-instance
+    //       paint cursor (Phase 3). Independent of the proto bake;
+    //       just needs to land before any consumer reads.
     if !frame.gpu_instance_overlays.is_empty() {
         let overlay_bytes: &[u8] = bytemuck::cast_slice(&frame.gpu_instance_overlays);
-        let prev_epoch = state.renderer.scene.buffers_epoch();
         state.renderer.scene.upload_instance_overlay(
             &state.device, &state.queue, overlay_bytes,
         );
-        // If the overlay buffer was resized, buffers_epoch bumps —
-        // user_shader_pass's `ensure_group0` recreates its bind group
-        // on epoch mismatch.
-        let _ = prev_epoch;
     }
 
-    // 1.7b. User-shader geometry pass (Phase C). Reserve transient
-    //       pool tail, reload pipeline if the shader source changed,
-    //       walk regions, dispatch the geom-build pipeline for any
-    //       that need a re-bake, and concatenate the resulting
-    //       transient (asset, instance) pairs onto the persistent
-    //       lists so the per-frame upload below ships them alongside.
-    //       Each transient region is its own asset slot — assigned
-    //       via `asset_id_base` so it points into the correct slot in
-    //       the combined assets vec. The march/shade passes treat
-    //       transients identically to bake-built objects — same
-    //       octree node encoding, same leaf attr layout.
-    //
-    //       Phase 4 — user-shader instance assets/instances from
-    //       `tick_instance_pipeline` go BETWEEN the host's persistent
-    //       set and Phase C's transient set. Phase C's `asset_id_base`
-    //       shifts up to account for them so its per-instance
-    //       `asset_id` references stay correct after splicing.
-    let asset_id_base =
-        frame.gpu_assets.len() as u32 + inst_result.len() as u32;
-    let (transient_assets, transient_instances) =
-        run_user_shader_geom(state, frame, asset_id_base);
-
     let mut combined_assets: Vec<rkp_render::rkp_gpu_object::RkpGpuAsset>;
-    let mut combined_instances: Vec<rkp_render::rkp_gpu_object::RkpGpuInstance>;
-    // Phase B-redux — `inst_result` is the per-shader instance-prototype
-    // asset list. No host instances reference these directly; the band-
-    // cell descent path resolves them by `shader_id` linear scan when a
-    // band hit fires `descend_proto_octree`. Splice into the assets vec
-    // so that scan finds them.
-    let need_combine = !inst_result.is_empty() || !transient_instances.is_empty();
+    // Splice proto assets onto the host's persistent set. Emitted
+    // blade instances (built by the new emit pass — TODO Phase 9)
+    // will reference these by `asset_id`. Until that lands the
+    // assets sit in the buffer unreferenced; cheap.
     let (assets_for_upload, instances_for_upload): (
         &[rkp_render::rkp_gpu_object::RkpGpuAsset],
         &[rkp_render::rkp_gpu_object::RkpGpuInstance],
-    ) = if !need_combine {
+    ) = if inst_result.is_empty() {
         (frame.gpu_assets.as_slice(), gpu_instances)
     } else {
         combined_assets = Vec::with_capacity(
-            frame.gpu_assets.len()
-                + inst_result.len()
-                + transient_assets.len(),
+            frame.gpu_assets.len() + inst_result.len(),
         );
         combined_assets.extend_from_slice(&frame.gpu_assets);
         combined_assets.extend_from_slice(&inst_result);
-        combined_assets.extend_from_slice(&transient_assets);
-        combined_instances = Vec::with_capacity(
-            gpu_instances.len() + transient_instances.len(),
-        );
-        combined_instances.extend_from_slice(gpu_instances);
-        combined_instances.extend_from_slice(&transient_instances);
-        (combined_assets.as_slice(), combined_instances.as_slice())
+        (combined_assets.as_slice(), gpu_instances)
     };
 
     // 1b. Per-frame upload. `gpu_instances` here may be interpolated
@@ -397,18 +345,12 @@ pub(super) fn run_pre_frame(
         state.queue.submit(std::iter::once(skin_encoder.finish()));
     }
 
-    // Phase 6 Session 4d — user-shader instances no longer appear in
-    // the host instances buffer. Layout is now:
-    //   [persistent | transient]
-    // and the host march iterates `us_tile_entries[]` for user-shader
-    // work (Sessions 1–3 + 4b). The per-VR `compute_screen_aabbs` /
-    // `build_tile_lists` for user-shader instances + the
-    // `user_shader_tile_lists_per_vp` Vec are gone.
-    let transient_count = transient_instances.len() as u32;
-    let persistent_count = gpu_instances.len() as u32;
-    let object_count = persistent_count + transient_count;
-    let transient_indices: Vec<u32> =
-        (persistent_count..persistent_count + transient_count).collect();
+    // The user-shader BFS path (Phase C) is gone — only persistent
+    // host instances live in the buffer right now. Phase 9's emit
+    // pass will append blade `RkpInstance`s here too; the layout
+    // shape (persistent + transient) stays.
+    let transient_indices: Vec<u32> = Vec::new();
+    let object_count = gpu_instances.len() as u32;
 
     PreFrameOutput {
         transient_indices,

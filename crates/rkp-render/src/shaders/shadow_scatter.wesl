@@ -36,9 +36,7 @@ import package::lib::brick::FACE_NY;
 import package::lib::brick::FACE_PY;
 import package::lib::brick::FACE_NZ;
 import package::lib::brick::FACE_PZ;
-import package::lib::types::unpack_band_cell;
 import package::lib::octree::octree_lookup;
-import package::lib::octree::descend_proto_octree;
 import package::lib::octree::PHASE_SHADOW;
 import package::lib::octree::skip_node;
 import package::lib::octree::OCTREE_LOOKUP_BIAS_FACTOR;
@@ -46,27 +44,19 @@ import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
 import package::lib::octree_slot::OCTREE_LEAF_BIT;
 import package::lib::octree_slot::OCTREE_BRICK_BIT;
-import package::lib::octree_slot::OCTREE_BAND_BIT;
 import package::lib::octree_slot::OCTREE_PAYLOAD_MASK;
 import package::lib::octree_slot::slot_is_brick;
-import package::lib::octree_slot::slot_is_band;
 import package::lib::octree_slot::slot_brick_id;
-import package::lib::octree_slot::slot_band_offset;
 import package::lib::types::OctreeResult;
 import package::lib::types::LeafAttr;
-import package::lib::types::BandCell;
 import package::lib::types::RkpInstance;
 import package::lib::types::GpuMaterial;
 import package::lib::types::CameraUniforms;
 import package::lib::types::OverlayEntry;
 import package::lib::types::ScatterInstance;
-import package::lib::types::ProtoHit;
 import package::lib::types::LightCameraShadow;
 import package::lib::types::Aabb;
-import package::lib::types::UserCtx;
-import package::lib::types::HostSample;
 import package::lib::types::RkpAsset;
-import package::lib::types::InstanceHit;
 
 
 const SHADOW_MAP_MAX_STEPS: u32 = 256u;
@@ -75,14 +65,6 @@ const NO_HIT_T: f32 = 1.0e20;
 
 const TLAS_LEAF_USER_SHADER: u32 = 0xFFFFFFFEu;
 const DISPATCH_X: u32 = 256u;
-
-
-
-// Phase B-redux 3b — band-cell wire format. Mirrors
-// octree_march.wgsl::BandCell.
-// Phase 4 — user-shader-facing types for the band-cell shadow
-// dispatch. Same shapes as octree_march.wgsl so the composer's
-// `dispatch_user_instance_descend` body splices in unchanged.
 
 
 
@@ -153,51 +135,9 @@ fn safe_dir3(d: vec3<f32>) -> vec3<f32> {
 
 // Stats no-op stubs. shadow_scatter doesn't bind a `stats` buffer;
 // the unified `octree_lookup` calls these by free name, so they have
-// to exist. naga DCE-eliminates the empty bodies. If we ever want
-// scatter-phase profiling, replace these with real bucket writes
-// (and add the stats binding to the bind group).
+// to exist. naga DCE-eliminates the empty bodies.
 fn bucket_depth(phase: u32, level: u32) {}
 fn bucket_lod_exit(level: u32) {}
-
-// `slot_is_brick`, `slot_brick_id`, `slot_is_band`, `slot_band_offset`
-// are imported from `lib::octree_slot` at the top of this file.
-
-fn read_band_cell(band_off: u32) -> BandCell {
-    return unpack_band_cell(leaf_attr_pool[band_off], leaf_attr_pool[band_off + 1u]);
-}
-
-// Stats phase for `descend_proto_octree`'s internal `octree_lookup`.
-// scatter has no stats binding — its `bucket_depth` is a no-op stub —
-// so the value is moot, but we keep the const for symmetry with the
-// other consumer files.
-const PROTO_PHASE: u32 = PHASE_SHADOW;
-
-
-const USER_INSTANCE_AT_DISPATCH_BEGIN: u32 = 0u;
-// Default identity stub — Rust composer replaces this whole block
-// (markers + body) with per-shader descent helpers + the dispatch
-// switch when any registered shader provides an `instance_at` hook.
-// Empty-registry path returns "no instance hit" so the band-cell
-// shadow branch falls through to the no-hit case.
-fn dispatch_user_instance_descend(
-    shader_id: u32,
-    host_pos: vec3<f32>,
-    host: HostSample,
-    leaf_slot: u32,
-    ray_origin: vec3<f32>,
-    ray_dir: vec3<f32>,
-    world_max_t: f32,
-    ctx: UserCtx,
-    asset: RkpAsset,
-) -> InstanceHit {
-    var r: InstanceHit;
-    r.valid = false;
-    r.world_t = world_max_t;
-    r.world_pos = vec3<f32>(0.0);
-    r.world_normal = vec3<f32>(0.0, 1.0, 0.0);
-    return r;
-}
-const USER_INSTANCE_AT_DISPATCH_END: u32 = 0u;
 
 // `skip_node` (formerly `skip_node_t` here) is imported from
 // `lib::octree` at the top. The `_t` suffix was historical and
@@ -350,72 +290,6 @@ fn find_hit_in_instance(
         // hit return the world-space `t` directly (the dispatcher
         // works in world space; the caller multiplies by world_dir
         // to recover the world hit). On miss skip past the cell.
-        if slot_is_band(r.slot) {
-            let band_off = slot_band_offset(r.slot);
-            let band = read_band_cell(band_off);
-            let band_mat_id = band.material_id;
-            let mat = materials[band_mat_id];
-            let shader_id = mat.instance_shader_id;
-            var proto_idx: u32 = 0xFFFFFFFFu;
-            if shader_id != 0u {
-                let acount = march_params.asset_count;
-                for (var ai: u32 = 0u; ai < acount; ai = ai + 1u) {
-                    if assets[ai].shader_id == shader_id {
-                        proto_idx = ai;
-                        break;
-                    }
-                }
-            }
-            if proto_idx == 0xFFFFFFFFu {
-                t += max(skip_node(pos, safe, inv_dir, r.depth, extent, vs), min_step);
-                continue;
-            }
-            let proto_asset = assets[proto_idx];
-
-            var host_sample: HostSample;
-            host_sample.distance = 0.0;
-            host_sample.normal = vec3<f32>(0.0, 1.0, 0.0);
-            host_sample.material = band_mat_id;
-            host_sample.material_secondary = 0u;
-            host_sample.blend_weight = 0u;
-
-            var ctx: UserCtx;
-            ctx.time = march_params.time;
-            ctx.cell_size = r.cell_half * 2.0;
-            ctx.material_id = band_mat_id;
-            ctx.aabb_min = vec3<f32>(0.0);
-            let pbase = band_mat_id * 8u;
-            ctx.params[0] = shader_params[pbase + 0u];
-            ctx.params[1] = shader_params[pbase + 1u];
-            ctx.params[2] = shader_params[pbase + 2u];
-            ctx.params[3] = shader_params[pbase + 3u];
-            ctx.params[4] = shader_params[pbase + 4u];
-            ctx.params[5] = shader_params[pbase + 5u];
-            ctx.params[6] = shader_params[pbase + 6u];
-            ctx.params[7] = shader_params[pbase + 7u];
-
-            // Dispatcher takes WORLD-space inputs; pass the
-            // caller's `world_origin` / `world_dir` directly.
-            let inst_hit = dispatch_user_instance_descend(
-                shader_id,
-                band.anchor_world_pos,
-                host_sample,
-                0u,
-                world_origin,
-                world_dir,
-                1.0e30,
-                ctx,
-                proto_asset,
-            );
-            if inst_hit.valid {
-                // The function contract returns world-space `t` —
-                // dispatcher already returns world distance.
-                return inst_hit.world_t;
-            }
-            t += max(skip_node(pos, safe, inv_dir, r.depth, extent, vs), min_step);
-            continue;
-        }
-
         if r.slot == OCTREE_INTERIOR {
             return t / local_scale;
         }

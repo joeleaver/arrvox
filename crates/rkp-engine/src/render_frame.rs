@@ -124,51 +124,27 @@ pub struct RenderFrame {
     pub user_shader_shade_chunk: String,
     pub user_shader_source_hash: u64,
 
-    /// Composed user-shader chunk for the geometry-build compute pass
-    /// (Phase C). Defines `dispatch_user_generate(...)`. Spliced into
-    /// `user_shader_geom.wgsl` between its USER_GENERATE markers.
-    /// Empty when no shader declares a `generate` hook; the in-tree
-    /// identity stub returns a "skip" emit.
-    pub user_shader_generate_chunk: String,
-
     /// Composed user-shader chunk for the prototype bake pass.
     /// Defines `dispatch_user_proto(...)`. Spliced into
     /// `user_shader_proto.wgsl` between its USER_PROTO_DISPATCH markers.
     /// Empty when no shader declares an `@instance_proto`; the in-tree
-    /// identity stub returns a `voxel_emit_skip()`. Phase B-redux
-    /// dispatches this whenever a band-cell hit triggers descent.
+    /// identity stub returns a `voxel_emit_skip()`. Each shader's proto
+    /// is baked once into the shared pool and re-used by every emitted
+    /// instance.
     pub user_shader_proto_chunk: String,
 
-    /// Phase B-redux — march-time instance derivation. Per-shader
-    /// `rkp_user_<id>_instance_at(host_pos, host, ctx, k, &inst)
-    /// -> bool` definitions, spliced into the host march and shadow
-    /// templates at the USER_INSTANCE_AT_DISPATCH markers (Phase 2
-    /// wires those markers; Phase 1 just ships the chunk). Empty
-    /// when no instance shader has an `instance_at` hook. Replaces
-    /// the per-frame emit-pass scatter for instance shaders that
-    /// opt in.
-    pub user_shader_instance_at_chunk: String,
-
     /// Editor snapshots of all currently-registered user shaders.
-    /// `UserShaderPass` reads metadata (animated, region_thickness,
-    /// cell_size, has_generate, params order) from this list. Mirrors
-    /// what `StateUpdate.user_shaders` ships to the editor.
+    /// Mirrors `StateUpdate.user_shaders`.
     pub user_shader_infos: Vec<rkp_render::shader_composer::UserShaderInfo>,
 
-    /// Full registry entries used by the prototype bake. The render
-    /// thread walks these to deduplicate per-shader prototype assets
-    /// against the proto cache. Heavier than `user_shader_infos`
-    /// (carries WGSL bodies + InstanceLayout). Cost is one `Vec` clone
-    /// per frame — negligible against the snapshot's other allocations.
+    /// Full registry entries used by the prototype bake + emit pass.
+    /// The render thread walks these to deduplicate per-shader proto
+    /// assets against the proto cache and to drive the per-shader
+    /// emit-shader compose. Heavier than `user_shader_infos` (carries
+    /// WGSL bodies + InstanceLayout). Cost is one `Vec` clone per
+    /// frame — negligible against the snapshot's other allocations.
     /// Empty when no shaders are registered.
     pub user_shader_entries: Vec<rkp_render::shader_composer::UserShaderEntry>,
-
-    /// Region requests for the user-shader geometry pass. Each entry
-    /// asks the GPU pipeline to materialize voxels by calling the
-    /// shader's `generate` hook over its AABB at the requested
-    /// resolution. Stable across frames so the cache can hit; sim
-    /// rebuilds this list each tick. Empty = no geometry generation.
-    pub user_shader_regions: Vec<rkp_render::user_shader_pass::ShaderRegionRequest>,
 
     /// Scene-wide light list (sun + entity point/spot lights), in the
     /// order the shade shader expects (entry 0 = sun).
