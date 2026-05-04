@@ -8,12 +8,41 @@ fn main() {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
     let out_dir = Path::new(&out_dir);
 
-    // Stripping must stay off: the user-shader composer splices new
-    // function bodies into shader templates at runtime via the
-    // const-decl anchors `USER_<NAME>_DISPATCH_BEGIN/_END` (see
-    // `shader_composer::splice_const_marker`). Some helpers are only
-    // transitively reachable AFTER that splice runs, and WESL's
-    // default lazy-compile would strip them as dead code.
+    // `use_stripping(false)` is a deliberate trade-off vs. the WESL
+    // idiom (`use_stripping(true)` + `keep_declarations(...)`).
+    //
+    // Why we keep stripping off in wesl-rs 0.3.2:
+    //
+    //   1. The user-shader composer text-splices new bodies into
+    //      templates at runtime (see `splice_const_marker`). Helpers
+    //      called from those splices (`intersect_aabb`,
+    //      `descend_proto_octree`) and the const-decl anchors that
+    //      bracket the splice region are NOT reachable from any
+    //      pre-splice entry point and would be stripped.
+    //
+    //   2. Setting `keep_declarations` OVERRIDES the auto-keep-
+    //      entrypoints default — the keep list becomes exclusive,
+    //      so it must also enumerate every `@compute`/`@vertex`/
+    //      `@fragment` entry across every shader.
+    //
+    //   3. CRITICAL — wesl-rs 0.3.2's stripping doesn't trace
+    //      reachability through imports for binding declarations.
+    //      `proc_eval::eval_tree` (imported by `proc_sample`)
+    //      references the `instructions` binding declared in
+    //      `proc_sample` at root scope, but stripping doesn't see
+    //      `main → eval_tree (imported) → instructions` and erases
+    //      the binding. To work around it the keep list would have
+    //      to enumerate every root-level binding/struct/const/type
+    //      across every shader, which eats most of the size win.
+    //
+    // The cost: artifacts include all imported lib code even when
+    // unused by a particular consumer. Acceptable — engine ships
+    // ~40 shaders, none over 2 MB compiled, and runtime perf is
+    // unaffected (drivers run their own dead-code elimination).
+    //
+    // Revisit when wesl-rs implements `@publicName` (currently
+    // proposed but not implemented per the spec) or improves
+    // import-aware stripping.
     let mut resolver = Wesl::new(shaders_dir);
     resolver.use_stripping(false);
 
