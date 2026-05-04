@@ -918,14 +918,75 @@ fn shadow_step_one_instance(
             continue;
         }
 
-        // Phase 4 — band-cell shadow dispatch is TEMPORARILY DISABLED.
-        // V1's "any band-cell hit blocks the shadow ray fully"
-        // produces black grass: every blade's shadow ray to the sun
-        // hits other band cells in the dense band volume and gets
-        // fully blocked. Until partial-opacity attenuation is wired
-        // in, just skip band cells the same way pre-Phase-4 did so
-        // blades light up.
+        // Phase 4 — band-cell shadow dispatch with partial opacity.
+        // V1's "any hit blocks fully" produced black grass via dense
+        // self-shadow. Now: each band cell that contains a blade hit
+        // attenuates transmittance by `BAND_BLADE_TRANSMITTANCE`. The
+        // blade-hit bookkeeping is per-cell rather than per-blade
+        // (no recursive descent past the first hit), which models
+        // the cell's average blade-projected coverage well enough for
+        // soft self-shadowing and avoids the O(blades-per-cell)
+        // descent cost. After processing, advance past the cell so
+        // subsequent cells along the ray accumulate independently.
         if slot_is_band(r.slot) {
+            atomicAdd(&stats[62], 1u); // band-cell shadow invocation
+            let band_off = slot_band_offset(r.slot);
+            let band = read_band_cell(band_off);
+            let band_mat_id = band.material_id;
+            let band_mat = materials[band_mat_id];
+            let shader_id = band_mat.instance_shader_id;
+            var proto_idx: u32 = 0xFFFFFFFFu;
+            if shader_id != 0u {
+                let acount = march_params.asset_count;
+                for (var ai: u32 = 0u; ai < acount; ai = ai + 1u) {
+                    if assets[ai].shader_id == shader_id {
+                        proto_idx = ai;
+                        break;
+                    }
+                }
+            }
+            if proto_idx != 0xFFFFFFFFu {
+                let proto_asset = assets[proto_idx];
+                var host_sample: HostSample;
+                host_sample.distance = 0.0;
+                host_sample.normal = vec3<f32>(0.0, 1.0, 0.0);
+                host_sample.material = band_mat_id;
+                host_sample.material_secondary = 0u;
+                host_sample.blend_weight = 0u;
+                var ctx: UserCtx;
+                ctx.time = march_params.time;
+                ctx.cell_size = r.cell_half * 2.0;
+                ctx.material_id = band_mat_id;
+                ctx.aabb_min = vec3<f32>(0.0);
+                let pbase = band_mat_id * 8u;
+                ctx.params[0] = shader_params[pbase + 0u];
+                ctx.params[1] = shader_params[pbase + 1u];
+                ctx.params[2] = shader_params[pbase + 2u];
+                ctx.params[3] = shader_params[pbase + 3u];
+                ctx.params[4] = shader_params[pbase + 4u];
+                ctx.params[5] = shader_params[pbase + 5u];
+                ctx.params[6] = shader_params[pbase + 6u];
+                ctx.params[7] = shader_params[pbase + 7u];
+                // Dispatcher takes WORLD-space ray; inputs to this
+                // function are already world-frame.
+                let inst_hit = dispatch_user_instance_descend(
+                    shader_id,
+                    band.anchor_world_pos,
+                    host_sample,
+                    0u,
+                    world_origin,
+                    world_dir,
+                    max_world_dist,
+                    ctx,
+                    proto_asset,
+                );
+                if inst_hit.valid {
+                    atomicAdd(&stats[63], 1u); // band-cell shadow hit
+                    let BAND_BLADE_TRANSMITTANCE: f32 = 0.65;
+                    transmittance *= BAND_BLADE_TRANSMITTANCE;
+                    if transmittance < 0.01 { return 0.0; }
+                }
+            }
             t += max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);
             continue;
         }
