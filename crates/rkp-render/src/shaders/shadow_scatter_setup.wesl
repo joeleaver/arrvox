@@ -19,6 +19,7 @@
 // projected rect. Each tile becomes one workgroup in the scatter.
 
 import package::lib::types::TlasPrim;
+import package::lib::types::ScatterInstance;
 
 struct LightCameraShadow {
     view_proj: mat4x4<f32>,
@@ -27,15 +28,6 @@ struct LightCameraShadow {
     depth_bias: f32,
     inv_shadow_map_size: vec2<f32>,
     shadow_map_size: vec2<u32>,
-}
-
-struct ScatterInstance {
-    tx0: u32, ty0: u32,
-    tile_w: u32, tile_h: u32, // tile counts (8×8 each)
-    asset_id: u32,
-    instance_state_offset: u32,
-    instance_index: u32,
-    work_offset: u32,         // index into work_list[]
 }
 
 struct SetupParams {

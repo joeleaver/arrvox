@@ -19,14 +19,7 @@
 //
 // MAX 65 535 instances and 256 tiles per axis is plenty for V1.
 
-struct ScatterInstance {
-    tx0: u32, ty0: u32,
-    tile_w: u32, tile_h: u32,
-    asset_id: u32,
-    instance_state_offset: u32,
-    instance_index: u32,
-    work_offset: u32,
-}
+import package::lib::types::ScatterInstance;
 
 @group(0) @binding(0) var<storage, read> scatter_instances: array<ScatterInstance>;
 @group(0) @binding(1) var<storage, read_write> work_list: array<u32>;

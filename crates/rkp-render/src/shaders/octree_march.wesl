@@ -26,6 +26,7 @@ import package::lib::types::RkpInstance;
 import package::lib::types::GpuMaterial;
 import package::lib::types::CameraUniforms;
 import package::lib::types::OverlayEntry;
+import package::lib::types::ProtoHit;
 
 const OPACITY_THRESHOLD: f32 = 0.05;
 // Safety-net ceiling for the outer ray-march loop. The ray already
@@ -1049,13 +1050,6 @@ fn march_object_skinned(
 // `local_to_world` and `focal_px_y` flow through to `octree_lookup`'s
 // LOD machinery so the descent terminates at sub-pixel cell sizes
 // the same way `march_object` does for host objects.
-struct ProtoHit {
-    valid: bool,
-    local_t: f32,            // distance in oc-space along safe_dir from oc_origin
-    oc_pos: vec3<f32>,       // hit position in oc-space
-    local_normal: vec3<f32>, // baked normal from leaf_attr
-    leaf_slot: u32,
-}
 
 fn descend_proto_octree(
     asset: RkpAsset,

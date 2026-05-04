@@ -172,3 +172,38 @@ struct OverlayEntry {
     material_packed: u32,
     color_packed: u32,
 }
+
+// Per-instance shadow-scatter descent metadata. Setup pass writes
+// these; emit pass reads them to fill the global work-list, scatter
+// pass reads them again to descend the octree at each tile.
+//
+// `(tx0, ty0)` is the upper-left texel of the instance's projected
+// rect in shadow-map space; `tile_w/tile_h` are 8×8 tile counts.
+// `work_offset` is the start of this instance's tile entries in
+// the global `work_list[]`.
+struct ScatterInstance {
+    tx0: u32, ty0: u32,
+    tile_w: u32, tile_h: u32,
+    asset_id: u32,
+    instance_state_offset: u32,
+    instance_index: u32,
+    work_offset: u32,
+}
+
+// User-shader Option B prototype-march hit record. Returned by the
+// per-pixel instance march and consumed by the composite pass.
+//
+// `local_t`         distance in oc-space along the safe ray direction
+//                   from `oc_origin` (the instance-local ray origin).
+// `oc_pos`          hit position in oc-space.
+// `local_normal`    octahedral-decoded normal from the prototype's
+//                   leaf_attr; transformed to world by the composite.
+// `leaf_slot`       prototype's leaf-attr slot, used for material
+//                   inheritance and overlay lookup.
+struct ProtoHit {
+    valid: bool,
+    local_t: f32,
+    oc_pos: vec3<f32>,
+    local_normal: vec3<f32>,
+    leaf_slot: u32,
+}

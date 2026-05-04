@@ -35,6 +35,7 @@ import package::lib::types::CameraUniforms;
 import package::lib::types::TlasNode;
 import package::lib::types::TlasInstanceLeaf;
 import package::lib::types::OverlayEntry;
+import package::lib::types::ProtoHit;
 // Shadow rays scan every object every ray — AABB misses short-circuit
 // cheaply, and shadow rays go in arbitrary directions so the march
 // pass's screen-space per-tile lists don't apply.
@@ -160,13 +161,6 @@ const MAX_STEPS_PROTO: u32 = 4096u;
 // 5-arg variant skips the LOD machinery the primary march uses (LOD is
 // pointless for shadow rays + small proto octrees). Called from the
 // composer-emitted per-shader `rkp_user_<id>_instance_descend` body.
-struct ProtoHit {
-    valid: bool,
-    local_t: f32,
-    oc_pos: vec3<f32>,
-    local_normal: vec3<f32>,
-    leaf_slot: u32,
-}
 
 fn descend_proto_octree(
     asset: RkpAsset,

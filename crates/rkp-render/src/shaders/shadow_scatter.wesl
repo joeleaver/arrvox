@@ -39,6 +39,8 @@ import package::lib::types::RkpInstance;
 import package::lib::types::GpuMaterial;
 import package::lib::types::CameraUniforms;
 import package::lib::types::OverlayEntry;
+import package::lib::types::ScatterInstance;
+import package::lib::types::ProtoHit;
 const BRICK_DIM: u32 = 4u;
 const BRICK_DIM_F: f32 = 4.0;
 const BRICK_CELLS: u32 = 64u;
@@ -129,15 +131,6 @@ struct LightCameraShadow {
     depth_bias: f32,
     inv_shadow_map_size: vec2<f32>,
     shadow_map_size: vec2<u32>,
-}
-
-struct ScatterInstance {
-    tx0: u32, ty0: u32,
-    tile_w: u32, tile_h: u32,
-    asset_id: u32,
-    instance_state_offset: u32,
-    instance_index: u32,
-    work_offset: u32,
 }
 
 struct Aabb {
@@ -270,13 +263,6 @@ const MAX_STEPS_PROTO: u32 = 4096u;
 // Prototype-octree descent, adapted from `octree_march.wgsl::descend_proto_octree`
 // to call shadow_scatter's `octree_lookup_no_stats` (4 args, no LOD) and
 // `skip_node_t` instead of the LOD-aware march variants.
-struct ProtoHit {
-    valid: bool,
-    local_t: f32,
-    oc_pos: vec3<f32>,
-    local_normal: vec3<f32>,
-    leaf_slot: u32,
-}
 
 fn descend_proto_octree(
     asset: RkpAsset,
