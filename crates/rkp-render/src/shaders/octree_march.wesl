@@ -56,6 +56,9 @@ import package::lib::types::UserCtx;
 import package::lib::types::HostSample;
 import package::lib::types::RkpAsset;
 import package::lib::types::InstanceHit;
+import package::lib::leaf_attr::fetch_overlay_index;
+import package::lib::leaf_attr::fetch_leaf_attr_for;
+import package::lib::leaf_attr::fetch_leaf_color_for;
 
 // Stats phase passed by `dispatch_user_instance_descend`'s splice
 // chunk to `descend_proto_octree`. PHASE_MARCH so proto descents
@@ -216,51 +219,9 @@ fn rkp_object_visible(inst: RkpInstance) -> bool {
 // `rkp_core::OverlayEntry` (16 bytes).
 @group(0) @binding(13) var<storage, read> instance_overlay: array<OverlayEntry>;
 
-// Look up the per-instance overlay slot for `leaf_slot`. Returns
-// `0xFFFFFFFFu` when the slot isn't overridden on this instance.
-// Branchless callers test against the sentinel.
-fn fetch_overlay_index(inst: RkpInstance, leaf_slot: u32) -> u32 {
-    if (inst.overlay_count == 0u) {
-        return 0xFFFFFFFFu;
-    }
-    var lo: u32 = 0u;
-    var hi: u32 = inst.overlay_count;
-    loop {
-        if (lo >= hi) { break; }
-        let mid = (lo + hi) >> 1u;
-        let e = instance_overlay[inst.overlay_offset + mid];
-        if (e.leaf_slot < leaf_slot) {
-            lo = mid + 1u;
-        } else if (e.leaf_slot > leaf_slot) {
-            hi = mid;
-        } else {
-            return inst.overlay_offset + mid;
-        }
-    }
-    return 0xFFFFFFFFu;
-}
-
-// Fetch the per-leaf attr (normal + materials) for the given instance,
-// preferring the overlay if the slot has been painted on this instance.
-fn fetch_leaf_attr_for(inst: RkpInstance, leaf_slot: u32) -> LeafAttr {
-    let idx = fetch_overlay_index(inst, leaf_slot);
-    if (idx != 0xFFFFFFFFu) {
-        let e = instance_overlay[idx];
-        return LeafAttr(e.normal_oct, e.material_packed);
-    }
-    return leaf_attr_pool[leaf_slot];
-}
-
-// Fetch the packed per-leaf color for the given instance. Returns 0
-// (= "use material base color") when neither the overlay nor the asset
-// pool has an override for this slot.
-fn fetch_leaf_color_for(inst: RkpInstance, leaf_slot: u32) -> u32 {
-    let idx = fetch_overlay_index(inst, leaf_slot);
-    if (idx != 0xFFFFFFFFu) {
-        return instance_overlay[idx].color_packed;
-    }
-    return color_pool_data[leaf_slot];
-}
+// fetch_overlay_index / fetch_leaf_attr_for / fetch_leaf_color_for
+// are imported from `lib::leaf_attr` at the top of this file
+// (Wave AH unification with rkp_shadow_trace).
 
 // Inverse of an affine 4x4 matrix (last row = [0,0,0,1]). Cheaper than
 // the general 4x4 inverse (~25 ALU vs ~100). Caller is responsible for

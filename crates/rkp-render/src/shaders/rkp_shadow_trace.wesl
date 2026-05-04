@@ -62,6 +62,9 @@ import package::lib::types::UserCtx;
 import package::lib::types::HostSample;
 import package::lib::types::RkpAsset;
 import package::lib::types::InstanceHit;
+import package::lib::leaf_attr::fetch_overlay_index;
+import package::lib::leaf_attr::fetch_leaf_attr_for;
+import package::lib::leaf_attr::fetch_leaf_color_for;
 // Shadow rays scan every object every ray — AABB misses short-circuit
 // cheaply, and shadow rays go in arbitrary directions so the march
 // pass's screen-space per-tile lists don't apply.
@@ -128,43 +131,9 @@ fn shadow_beer(glass_color: vec3<f32>, opacity: f32, thickness: f32) -> f32 {
 // authoritative description. Shadow trace uses the same fetch helpers.
 @group(0) @binding(13) var<storage, read> instance_overlay: array<OverlayEntry>;
 
-fn fetch_overlay_index(inst: RkpInstance, leaf_slot: u32) -> u32 {
-    if (inst.overlay_count == 0u) {
-        return 0xFFFFFFFFu;
-    }
-    var lo: u32 = 0u;
-    var hi: u32 = inst.overlay_count;
-    loop {
-        if (lo >= hi) { break; }
-        let mid = (lo + hi) >> 1u;
-        let e = instance_overlay[inst.overlay_offset + mid];
-        if (e.leaf_slot < leaf_slot) {
-            lo = mid + 1u;
-        } else if (e.leaf_slot > leaf_slot) {
-            hi = mid;
-        } else {
-            return inst.overlay_offset + mid;
-        }
-    }
-    return 0xFFFFFFFFu;
-}
-
-fn fetch_leaf_attr_for(inst: RkpInstance, leaf_slot: u32) -> LeafAttr {
-    let idx = fetch_overlay_index(inst, leaf_slot);
-    if (idx != 0xFFFFFFFFu) {
-        let e = instance_overlay[idx];
-        return LeafAttr(e.normal_oct, e.material_packed);
-    }
-    return leaf_attr_pool[leaf_slot];
-}
-
-fn fetch_leaf_color_for(inst: RkpInstance, leaf_slot: u32) -> u32 {
-    let idx = fetch_overlay_index(inst, leaf_slot);
-    if (idx != 0xFFFFFFFFu) {
-        return instance_overlay[idx].color_packed;
-    }
-    return color_pool_data[leaf_slot];
-}
+// fetch_overlay_index / fetch_leaf_attr_for / fetch_leaf_color_for
+// are imported from `lib::leaf_attr` at the top of this file
+// (Wave AH unification with octree_march).
 
 // Inverse of an affine 4x4 matrix. See `mat4_affine_inverse` in
 // octree_march.wgsl for the full derivation. Duplicated here because
