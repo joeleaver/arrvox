@@ -27,6 +27,7 @@ import package::lib::octree_slot::slot_band_offset;
 import package::lib::types::OctreeResult;
 import package::lib::types::LeafAttr;
 import package::lib::types::leaf_attr_material_primary;
+import package::lib::types::BandCell;
 // Shadow rays scan every object every ray — AABB misses short-circuit
 // cheaply, and shadow rays go in arbitrary directions so the march
 // pass's screen-space per-tile lists don't apply.
@@ -151,11 +152,6 @@ struct GpuMaterial {
 // `octree_march.wgsl::BandCell` (and the Rust `GpuBandCell` it
 // targets). Each band cell's payload reinterprets two consecutive
 // `leaf_attr_pool` slots; see `read_band_cell` below.
-struct BandCell {
-    anchor_world_pos: vec3<f32>,
-    material_id: u32,
-}
-
 // Phase 4 — user-shader-facing types for the band-cell shadow
 // dispatch. Same shapes as octree_march.wgsl so the composer's
 // shared `dispatch_user_instance_descend` body splices in

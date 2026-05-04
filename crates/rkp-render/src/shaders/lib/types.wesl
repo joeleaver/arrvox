@@ -37,3 +37,13 @@ struct LeafAttr {
 }
 
 fn leaf_attr_material_primary(a: LeafAttr) -> u32 { return a.material_packed & 0xFFFFu; }
+
+// Per-instance band-cell record (16 bytes), one entry per painted-band
+// cell on a host instance. Reinterprets the leaf-attr slot when the
+// band sentinel bit is set on the slot — `anchor_world_pos` is the
+// world-space anchor for the painted material, `material_id` selects
+// the host material override.
+struct BandCell {
+    anchor_world_pos: vec3<f32>,
+    material_id: u32,
+}

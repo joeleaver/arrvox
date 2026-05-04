@@ -21,6 +21,7 @@ import package::lib::octree_slot::slot_band_offset;
 import package::lib::types::OctreeResult;
 import package::lib::types::LeafAttr;
 import package::lib::types::leaf_attr_material_primary;
+import package::lib::types::BandCell;
 
 const OPACITY_THRESHOLD: f32 = 0.05;
 // Safety-net ceiling for the outer ray-march loop. The ray already
@@ -183,11 +184,6 @@ struct MarchParams {
 // per-cell because the user-shader REGION instance's
 // `inst.material_id` is hardcoded to 0 (`transient_asset_and_instance`)
 // and there's no per-region metadata table bound at the march.
-struct BandCell {
-    anchor_world_pos: vec3<f32>,
-    material_id: u32,
-}
-
 const INTERNAL_ATTR_NONE: u32 = 0xFFFFFFFFu;
 // Footprint threshold below which we treat a branch as small enough to
 // represent with its prefilter attr. Strict `<` (not `<=`) so the

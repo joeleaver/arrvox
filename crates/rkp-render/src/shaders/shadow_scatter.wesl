@@ -34,6 +34,7 @@ import package::lib::octree_slot::slot_brick_id;
 import package::lib::octree_slot::slot_band_offset;
 import package::lib::types::OctreeResult;
 import package::lib::types::LeafAttr;
+import package::lib::types::BandCell;
 const BRICK_DIM: u32 = 4u;
 const BRICK_DIM_F: f32 = 4.0;
 const BRICK_CELLS: u32 = 64u;
@@ -104,11 +105,6 @@ struct OverlayEntry {
 
 // Phase B-redux 3b — band-cell wire format. Mirrors
 // octree_march.wgsl::BandCell.
-struct BandCell {
-    anchor_world_pos: vec3<f32>,
-    material_id: u32,
-}
-
 // Phase 4 — user-shader-facing types for the band-cell shadow
 // dispatch. Same shapes as octree_march.wgsl so the composer's
 // `dispatch_user_instance_descend` body splices in unchanged.
