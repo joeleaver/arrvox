@@ -68,18 +68,12 @@ import package::lib::brick::BRICK_CELLS;
 import package::lib::brick::BRICK_CELL_EMPTY;
 import package::lib::brick::BRICK_CELL_INTERIOR;
 import package::lib::brick::INTERNAL_ATTR_NONE;
-
-
-const OCTREE_EMPTY: u32 = 0xFFFFFFFFu;
-const OCTREE_INTERIOR: u32 = 0xFFFFFFFEu;
-const OCTREE_LEAF_BIT: u32 = 0x80000000u;
-const OCTREE_BRICK_BIT: u32 = 0x40000000u;
-// Phase B-redux 3b — band-cell sentinel. Set on a leaf at max_depth
-// when an `instance_at` shader baked this region. The leaf-attr slot
-// reinterprets as `{region_id, anchor_leaf_slot}`. See
-// octree_march.wgsl for the canonical encoding contract.
-const OCTREE_BAND_BIT: u32 = 0x20000000u;
-const OCTREE_PAYLOAD_MASK: u32 = 0x1FFFFFFFu;
+import package::lib::octree_slot::OCTREE_EMPTY;
+import package::lib::octree_slot::OCTREE_INTERIOR;
+import package::lib::octree_slot::OCTREE_LEAF_BIT;
+import package::lib::octree_slot::OCTREE_BRICK_BIT;
+import package::lib::octree_slot::OCTREE_BAND_BIT;
+import package::lib::octree_slot::OCTREE_PAYLOAD_MASK;
 
 // Hard ceiling on octree depth — limits per-frame queue capacity.
 // `MAX_DEPTH = 8` gives 4 × 2^8 = 1024 cells/axis at the deepest level
