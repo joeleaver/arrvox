@@ -4,6 +4,8 @@
 // Evaluates PBR Cook-Torrance BRDF with direct lighting.
 // Writes final HDR color to output texture.
 
+import package::lib::oct_normal::unpack_oct_normal;
+
 const PI: f32 = 3.14159265;
 
 // --- Structs ---
@@ -551,23 +553,10 @@ fn geometry_smith(n_dot_v: f32, n_dot_l: f32, roughness: f32) -> f32 {
 // the glass, not-quite-correct when there are opaque objects on
 // the far side (they'll read as sky instead of themselves).
 
-// Decode an oct-packed unit normal written by `pack_oct_normal` in
-// octree_march / skin_deform. Same basis the leaf_attr path uses;
-// used here to read the glass surface normal out of `gbuf_glass`.
-fn unpack_oct_normal(packed: u32) -> vec3<f32> {
-    let ul = packed & 0xFFFFu;
-    let vl = (packed >> 16u) & 0xFFFFu;
-    let ux = f32(i32(ul << 16u) >> 16) / 32767.0;
-    let vx = f32(i32(vl << 16u) >> 16) / 32767.0;
-    var n = vec3<f32>(ux, vx, 1.0 - abs(ux) - abs(vx));
-    if n.z < 0.0 {
-        let nx = (1.0 - abs(n.y)) * select(-1.0, 1.0, n.x >= 0.0);
-        let ny = (1.0 - abs(n.x)) * select(-1.0, 1.0, n.y >= 0.0);
-        n.x = nx;
-        n.y = ny;
-    }
-    return normalize(n);
-}
+// `unpack_oct_normal` is imported from `lib::oct_normal` at the top.
+// Wave A2: this site previously used a Variant-B copy without the
+// zero-length guard. The lib version (Variant A) returns +Y for
+// degenerate inputs instead of NaN.
 
 fn dielectric_f0(ior: f32) -> f32 {
     let r = (1.0 - ior) / (1.0 + ior);
