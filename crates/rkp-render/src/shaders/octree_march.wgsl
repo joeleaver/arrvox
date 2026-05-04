@@ -227,7 +227,8 @@ struct GpuMaterial {
     noise_strength: f32,
     noise_channels: u32,
     shader_id: u32,
-    _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32, _pad5: f32,
+    instance_shader_id: u32,
+    _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32,
 }
 
 struct OctreeResult {
@@ -1709,7 +1710,7 @@ fn march_object(
             // shader_id flows through the host material entry.
             let band_mat_id = band.material_id;
             let mat = materials[band_mat_id];
-            let shader_id = mat.shader_id;
+            let shader_id = mat.instance_shader_id;
             var proto_idx: u32 = 0xFFFFFFFFu;
             if shader_id != 0u {
                 let acount = march_params.asset_count;
@@ -2200,7 +2201,7 @@ fn main(
         && first_mat_id < arrayLength(&materials)
         && assets[instances[closest_obj_idx].asset_id].shader_id == 0u
     {
-        let hit_shader_id = materials[first_mat_id].shader_id;
+        let hit_shader_id = materials[first_mat_id].instance_shader_id;
         if hit_shader_id != 0u {
             // Resolve the prototype asset by linear scan of `assets[]`
             // for the matching `shader_id`. Small N (one asset per

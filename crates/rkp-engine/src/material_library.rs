@@ -110,11 +110,17 @@ impl MaterialDef {
     pub fn to_gpu(
         &self,
         shader_id_resolver: &dyn Fn(&str) -> Option<u32>,
+        instance_shader_id_resolver: &dyn Fn(&str) -> Option<u32>,
     ) -> GpuMaterial {
         let shader_id = self
             .shader
             .as_deref()
             .and_then(shader_id_resolver)
+            .unwrap_or(0);
+        let instance_shader_id = self
+            .shader
+            .as_deref()
+            .and_then(instance_shader_id_resolver)
             .unwrap_or(0);
         GpuMaterial {
             albedo: self.albedo,
@@ -130,7 +136,8 @@ impl MaterialDef {
             noise_strength: self.noise_strength,
             noise_channels: self.noise_channels,
             shader_id,
-            _padding: [0.0; 5],
+            instance_shader_id,
+            _padding: [0.0; 4],
         }
     }
 }
@@ -401,13 +408,17 @@ impl MaterialLibrary {
     pub fn build_palette(
         &self,
         shader_id_resolver: &dyn Fn(&str) -> Option<u32>,
+        instance_shader_id_resolver: &dyn Fn(&str) -> Option<u32>,
     ) -> Vec<GpuMaterial> {
-        let default_gpu = MaterialDef::default().to_gpu(shader_id_resolver);
+        let default_gpu = MaterialDef::default()
+            .to_gpu(shader_id_resolver, instance_shader_id_resolver);
         self.slots
             .iter()
             .map(|slot| match slot {
                 MaterialSlot::Default | MaterialSlot::Tombstone => default_gpu,
-                MaterialSlot::Loaded { def, .. } => def.to_gpu(shader_id_resolver),
+                MaterialSlot::Loaded { def, .. } => {
+                    def.to_gpu(shader_id_resolver, instance_shader_id_resolver)
+                }
             })
             .collect()
     }

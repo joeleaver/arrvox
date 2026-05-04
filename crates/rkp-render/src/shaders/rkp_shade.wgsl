@@ -157,7 +157,8 @@ struct Material {
     noise_strength: f32,
     noise_channels: u32,
     shader_id: u32,
-    _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32, _pad5: f32,
+    instance_shader_id: u32,
+    _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32,
 }
 
 fn mat_albedo(m: Material) -> vec3<f32> {

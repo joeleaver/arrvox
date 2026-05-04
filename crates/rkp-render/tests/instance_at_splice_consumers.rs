@@ -79,6 +79,24 @@ fn instance_at_chunk_splices_cleanly_into_all_consumers() {
     let chunks = compose(&reg);
     let _ = std::fs::remove_dir_all(&tmp);
 
+    // Proto chunk is consumed by user_shader_proto.wgsl through a
+    // separate marker pair (USER_PROTO_DISPATCH_BEGIN/END). Verify it
+    // splices+validates separately.
+    let proto_source = rkp_render::user_shader_proto_pass::compose_proto_source(&chunks.proto);
+    let proto_module = naga::front::wgsl::parse_str(&proto_source).unwrap_or_else(|e| {
+        panic!(
+            "[user_shader_proto] proto chunk failed to PARSE:\n{}",
+            e.emit_to_string(&proto_source)
+        );
+    });
+    let mut v = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    );
+    v.validate(&proto_module).unwrap_or_else(|e| {
+        panic!("[user_shader_proto] proto chunk failed naga VALIDATION: {e:?}");
+    });
+
     for (label, template) in [
         ("octree_march", include_str!("../src/shaders/octree_march.wgsl")),
         ("rkp_shadow_trace", include_str!("../src/shaders/rkp_shadow_trace.wgsl")),

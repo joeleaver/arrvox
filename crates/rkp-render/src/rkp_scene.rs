@@ -516,6 +516,25 @@ impl RkpScene {
     /// deduplicated assets upstream; this is a straight write of both
     /// buffers. Bumps the epoch when either buffer reallocates so VRs
     /// rebuild their bind groups.
+    /// Upload only the per-instance paint overlay buffer. Used by
+    /// callers that need the overlay current before the rest of the
+    /// per-frame upload (e.g. the user-shader BFS host-material probe
+    /// runs before `upload_frame` because `upload_frame` depends on
+    /// the BFS's transient asset list).
+    pub fn upload_instance_overlay(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bytes: &[u8],
+    ) {
+        if Self::ensure_and_write(
+            device, queue, &mut self.instance_overlay_buffer,
+            "rkp_instance_overlay", bytes,
+        ) {
+            self.buffers_epoch += 1;
+        }
+    }
+
     pub fn upload_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &FrameUpload) {
         let inst_bytes: &[u8] = bytemuck::cast_slice(data.instances);
         let asset_bytes: &[u8] = bytemuck::cast_slice(data.assets);

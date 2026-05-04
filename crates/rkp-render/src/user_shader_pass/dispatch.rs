@@ -196,6 +196,7 @@ impl UserShaderPass {
                 rw_storage(8),  // fill_task_pool
                 rw_storage(9),  // fill_task_alloc (per-region atomic array)
                 rw_storage(10), // overflow counters
+                ro_storage(11), // instance_overlay (per-instance paint)
             ],
         });
         let group1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -370,6 +371,7 @@ impl UserShaderPass {
         octree_nodes_buffer: &wgpu::Buffer,
         brick_pool_buffer: &wgpu::Buffer,
         leaf_attr_pool_buffer: &wgpu::Buffer,
+        instance_overlay_buffer: &wgpu::Buffer,
         buffers_epoch: u64,
     ) {
         if self.group0_bind_group.is_some() && buffers_epoch == self.group0_buffers_epoch {
@@ -390,6 +392,7 @@ impl UserShaderPass {
                 wgpu::BindGroupEntry { binding: 8, resource: self.fill_task_pool_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: self.fill_task_alloc_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: self.overflow_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: instance_overlay_buffer.as_entire_binding() },
             ],
         }));
         self.group0_buffers_epoch = buffers_epoch;
@@ -423,6 +426,7 @@ impl UserShaderPass {
         octree_nodes_buffer: &wgpu::Buffer,
         brick_pool_buffer: &wgpu::Buffer,
         leaf_attr_pool_buffer: &wgpu::Buffer,
+        instance_overlay_buffer: &wgpu::Buffer,
         buffers_epoch: u64,
     ) {
         if region_uniforms.is_empty() {
@@ -439,6 +443,7 @@ impl UserShaderPass {
             octree_nodes_buffer,
             brick_pool_buffer,
             leaf_attr_pool_buffer,
+            instance_overlay_buffer,
             buffers_epoch,
         );
 
@@ -649,6 +654,19 @@ fn rw_storage(binding: u32) -> wgpu::BindGroupLayoutEntry {
         visibility: wgpu::ShaderStages::COMPUTE,
         ty: wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn ro_storage(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
             has_dynamic_offset: false,
             min_binding_size: None,
         },

@@ -77,21 +77,18 @@ pub struct ShaderRegionRequest {
     pub is_band_region: bool,
     /// Phase B-redux band-cell anchor projection target. World-space
     /// y of the painted surface; the BFS uses this directly as the
-    /// anchor's y when `is_band_region == true`. Replaces V1's
-    /// `host.distance` projection which was unreliable on hosts whose
-    /// octree subdivides finely above the surface (returns ~0 for
-    /// cells in BRICK_CELL_EMPTY, gating off and producing scattered
-    /// blades). Computed CPU-side from the painted leaves' world-space
-    /// y. Flat-surface only for V1; sloped/curved hosts need a more
-    /// expressive scheme (per-cell projection or multi-source BFS).
+    /// anchor's y when `is_band_region == true`. Computed CPU-side
+    /// from the painted leaves' world-space y. Flat-surface only;
+    /// sloped/curved hosts need a more expressive scheme (per-cell
+    /// projection or multi-source BFS).
     pub host_surface_y: f32,
-    /// Phase B-redux V1.1 — world-space AABB of the painted leaves.
-    /// The BFS uses this on the band path to gate horizontally:
-    /// cells whose x/z fall outside `[painted_min - band, painted_max + band]`
-    /// are rejected. Without this gate, blades fill the whole tile
-    /// cube horizontally instead of just the painted area.
-    pub painted_world_min: [f32; 3],
-    pub painted_world_max: [f32; 3],
+    /// Per-instance paint overlay slice (mirrors the host
+    /// `RkpGpuInstance`'s fields). The BFS's host-material probe
+    /// consults this so it sees painted material — without it, the
+    /// probe falls back on the asset's baseline material and
+    /// rejects every painted anchor.
+    pub host_overlay_offset: u32,
+    pub host_overlay_count: u32,
 }
 
 // ============================================================

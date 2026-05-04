@@ -4,8 +4,8 @@
 //! `array<RegionUniform>` (group 1, binding 0). It carries every
 //! per-region input the BFS classifier needs: tile AABB, cell size,
 //! shader / material ids, host-octree handles, pool block extents
-//! handed out by the cache, plus the V1.1 anchor projection inputs
-//! (`host_surface_y`, `painted_world_min/max`).
+//! handed out by the cache, plus the band-cell anchor projection y
+//! (`host_surface_y`).
 //!
 //! `GpuBandCell` is the 16 B Phase B-redux band-cell payload: the BFS
 //! bake writes one per max-depth cell in the band around painted host
@@ -21,7 +21,7 @@ use super::cache::{CachedSlot, ShaderRegionRequest};
 /// Per-region uniform — laid out to match WGSL's std430 storage layout
 /// for `array<RegionUniform>`.
 ///
-/// 240 bytes. Carries per-region pool block offsets/sizes (allocator
+/// 224 bytes. Carries per-region pool block offsets/sizes (allocator
 /// output) so each region's allocator atomicAdd composes a global
 /// pool offset as `block_offset + atomic_slot`.
 #[repr(C)]
@@ -57,29 +57,25 @@ pub struct RegionUniform {
     /// offset still aligns `host_grid_origin` to 96).
     pub use_band_path: u32,                 // offset 92
     pub host_grid_origin: [f32; 3],         // offset 96
-    /// Phase B-redux V1.1 — world-space y of the painted surface,
-    /// used by the band-cell BFS as the anchor projection target.
-    /// Replaces V1's `host.distance` projection (unreliable on hosts
-    /// with finely-subdivided host octrees that don't fold large
-    /// empty subtrees). Flat-surface only; sloped/curved surfaces
-    /// need a more expressive scheme (per-cell normal projection or
-    /// multi-source BFS). Repurposed from `_pad_grid` so the struct
-    /// stays 208 B.
+    /// World-space y of the painted surface, used by the band-cell
+    /// BFS as the anchor projection target. Flat-surface only;
+    /// sloped/curved surfaces need a more expressive scheme (per-cell
+    /// normal projection or multi-source BFS).
     pub host_surface_y: f32,                // offset 108
     pub params: [[f32; 4]; 2],              // offset 112
-    pub host_inverse_world: [[f32; 4]; 4],  // offset 144
-    /// Phase B-redux V1.1 — world-space AABB of the PAINTED leaves
-    /// (not the band region's outer tile cube). The BFS uses this on
-    /// the band path to reject cells whose x/z fall outside
-    /// `[painted_min - band, painted_max + band]`. Without this gate
-    /// cells fill the entire tile cube horizontally.
-    pub painted_world_min: [f32; 3],        // offset 208
-    pub _pad_painted_min: f32,              // offset 220
-    pub painted_world_max: [f32; 3],        // offset 224
-    pub _pad_painted_max: f32,              // offset 236
+    pub host_inverse_world: [[f32; 4]; 4],  // offset 144 (ends at 208)
+    /// Per-instance paint overlay slice (mirrors `RkpGpuInstance`'s
+    /// fields). The band-path probe consults this when descending the
+    /// host octree so it sees the *painted* material at each leaf,
+    /// not just the asset's baseline. `host_overlay_count == 0`
+    /// means unpainted; the descent falls through to `leaf_attr_pool`.
+    pub host_overlay_offset: u32,           // offset 208
+    pub host_overlay_count: u32,            // offset 212
+    pub _pad_overlay0: u32,                 // offset 216
+    pub _pad_overlay1: u32,                 // offset 220 (struct ends at 224)
 }
 
-const _: () = assert!(std::mem::size_of::<RegionUniform>() == 240);
+const _: () = assert!(std::mem::size_of::<RegionUniform>() == 224);
 
 // ============================================================
 // Phase B-redux 3b — band-cell wire format
@@ -153,10 +149,10 @@ pub fn build_region_uniform(
         host_surface_y: request.host_surface_y,
         params,
         host_inverse_world: request.host_inverse_world,
-        painted_world_min: request.painted_world_min,
-        _pad_painted_min: 0.0,
-        painted_world_max: request.painted_world_max,
-        _pad_painted_max: 0.0,
+        host_overlay_offset: request.host_overlay_offset,
+        host_overlay_count: request.host_overlay_count,
+        _pad_overlay0: 0,
+        _pad_overlay1: 0,
     }
 }
 

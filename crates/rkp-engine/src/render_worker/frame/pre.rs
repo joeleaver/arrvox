@@ -190,6 +190,27 @@ pub(super) fn run_pre_frame(
     //      is a no-op (buffer already big enough).
     let inst_result = tick_instance_pipeline(state, frame);
 
+    // 1.7a. Upload `instance_overlay_buffer` BEFORE the BFS dispatch
+    //       below. The user-shader-pass probe (Phase B-redux band-cell
+    //       host-material check) descends the host octree and reads
+    //       this buffer to find painted material at each anchor. The
+    //       full `upload_frame` runs later (line ~279) because it
+    //       depends on `transient_assets` from the BFS, but the
+    //       overlay slice is independent and must be current here or
+    //       the probe sees the previous frame's paint state and the
+    //       BFS bakes off-by-one paint operations.
+    if !frame.gpu_instance_overlays.is_empty() {
+        let overlay_bytes: &[u8] = bytemuck::cast_slice(&frame.gpu_instance_overlays);
+        let prev_epoch = state.renderer.scene.buffers_epoch();
+        state.renderer.scene.upload_instance_overlay(
+            &state.device, &state.queue, overlay_bytes,
+        );
+        // If the overlay buffer was resized, buffers_epoch bumps —
+        // user_shader_pass's `ensure_group0` recreates its bind group
+        // on epoch mismatch.
+        let _ = prev_epoch;
+    }
+
     // 1.7b. User-shader geometry pass (Phase C). Reserve transient
     //       pool tail, reload pipeline if the shader source changed,
     //       walk regions, dispatch the geom-build pipeline for any

@@ -22,8 +22,8 @@ fn req(host: u32, mat: u32) -> ShaderRegionRequest {
         tile_index: NO_TILE,
         is_band_region: false,
         host_surface_y: 0.0,
-        painted_world_min: [0.0; 3],
-        painted_world_max: [0.0; 3],
+        host_overlay_offset: 0,
+        host_overlay_count: 0,
     }
 }
 

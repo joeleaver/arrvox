@@ -152,7 +152,8 @@ struct GpuMaterial {
     noise_strength: f32,
     noise_channels: u32,
     shader_id: u32,
-    _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32, _pad5: f32,
+    instance_shader_id: u32,
+    _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32,
 }
 
 // Subset of the primary `MarchParams` — only the fields the band-
@@ -729,7 +730,7 @@ fn find_hit_in_instance(
             let band = read_band_cell(band_off);
             let band_mat_id = band.material_id;
             let mat = materials[band_mat_id];
-            let shader_id = mat.shader_id;
+            let shader_id = mat.instance_shader_id;
             var proto_idx: u32 = 0xFFFFFFFFu;
             if shader_id != 0u {
                 let acount = march_params.asset_count;

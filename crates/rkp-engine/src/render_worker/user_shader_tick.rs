@@ -437,7 +437,7 @@ pub(super) fn run_user_shader_geom(
         if shader_id == 0 {
             continue;
         }
-        let topology_hash = topology_hash_for(req, frame.geometry_epoch);
+        let topology_hash = topology_hash_for(req, frame.geometry_epoch, frame.paint_epoch);
         let fill_hash = fill_hash_for(
             req,
             topology_hash,
@@ -499,6 +499,7 @@ pub(super) fn run_user_shader_geom(
             &state.renderer.scene.octree_nodes_buffer,
             &state.renderer.scene.brick_pool_buffer,
             &state.renderer.scene.leaf_attr_pool_buffer,
+            &state.renderer.scene.instance_overlay_buffer,
             state.renderer.scene.buffers_epoch(),
         );
         state.queue.submit(Some(encoder.finish()));
@@ -517,6 +518,7 @@ pub(super) fn run_user_shader_geom(
 pub(super) fn topology_hash_for(
     req: &rkp_render::user_shader_pass::ShaderRegionRequest,
     geometry_epoch: u64,
+    paint_epoch: u64,
 ) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     let prime = 0x100000001b3u64;
@@ -525,6 +527,13 @@ pub(super) fn topology_hash_for(
         *h = h.wrapping_mul(prime);
     };
     for &b in &geometry_epoch.to_le_bytes() { mix(&mut h, b); }
+    // Paint changes the host's leaf-slot → material mapping (via the
+    // overlay), which is what the BFS host probe consults. Fold the
+    // paint epoch in so any paint forces a re-bake; without this, a
+    // paint that lands in an already-allocated overlay slot leaves
+    // overlay_offset/count unchanged and the BFS uses last frame's
+    // bake.
+    for &b in &paint_epoch.to_le_bytes() { mix(&mut h, b); }
     for &b in &req.host_octree_root.to_le_bytes() { mix(&mut h, b); }
     for &b in &req.host_octree_depth.to_le_bytes() { mix(&mut h, b); }
     for &b in &req.host_octree_extent.to_le_bytes() { mix(&mut h, b); }
@@ -542,12 +551,13 @@ pub(super) fn topology_hash_for(
         for &b in &v.to_le_bytes() { mix(&mut h, b); }
     }
     for &b in &req.cell_size.to_le_bytes() { mix(&mut h, b); }
-    // V1.1 — fold in the painted-area gate inputs so changes to
-    // either invalidate the BFS cache.
+    // Band-cell anchor projection y — invalidate cache when the
+    // painted surface moves vertically.
     for &b in &req.host_surface_y.to_le_bytes() { mix(&mut h, b); }
-    for v in req.painted_world_min.iter().chain(req.painted_world_max.iter()) {
-        for &b in &v.to_le_bytes() { mix(&mut h, b); }
-    }
+    // Per-instance paint overlay slice — invalidate cache when paint
+    // changes on the host instance (the overlay slice migrates).
+    for &b in &req.host_overlay_offset.to_le_bytes() { mix(&mut h, b); }
+    for &b in &req.host_overlay_count.to_le_bytes() { mix(&mut h, b); }
     h
 }
 

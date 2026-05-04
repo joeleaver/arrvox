@@ -171,8 +171,19 @@ pub struct GpuMaterial {
     pub noise_scale: f32,
     pub noise_strength: f32,
     pub noise_channels: u32,
+    /// Shade-dispatch id. Non-zero only for shaders that provide a
+    /// `shade` hook; the shade pass routes to the per-shader case
+    /// when set, or falls through to the PBR path when zero.
     pub shader_id: u32,
-    pub _padding: [f32; 5],
+    /// Phase B-redux band-cell dispatch id. Non-zero only for shaders
+    /// that provide an `instance_at` hook. The march reads this when
+    /// it hits a band cell to look up the prototype asset; lookup is
+    /// SEPARATE from `shader_id` so a geom-only shader (e.g. grass)
+    /// doesn't accidentally route the shade pass through the user-
+    /// dispatch default arm (which would emit raw albedo and tone-map
+    /// to black against direct sun).
+    pub instance_shader_id: u32,
+    pub _padding: [f32; 4],
 }
 
 // Locks the byte layout against drift; the WGSL struct depends on it.

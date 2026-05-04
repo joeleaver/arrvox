@@ -87,7 +87,8 @@ impl RkpRenderer {
             noise_strength: 0.0,
             noise_channels: 0,
             shader_id: 0,
-            _padding: [0.0; 5],
+            instance_shader_id: 0,
+            _padding: [0.0; 4],
         };
 
         let shade_params_buffer = Self::create_init_buffer(device, "rkp_shade_params",

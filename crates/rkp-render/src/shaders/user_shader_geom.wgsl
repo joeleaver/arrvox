@@ -174,10 +174,21 @@ struct RegionUniform {
     // offset still 16-aligns host_grid_origin).
     use_band_path: u32,
     host_grid_origin: vec3<f32>,
-    // Pad so params (vec4) lands at next 16-aligned offset.
-    _pad_grid: f32,
+    // World-space y of the painted surface, used as the band-cell
+    // anchor projection target. Flat-surface only — sloped/curved
+    // hosts need a more expressive scheme.
+    host_surface_y: f32,
     params: array<vec4<f32>, 2>,
     host_inverse_world: mat4x4<f32>,
+    // Per-instance paint overlay slice into `instance_overlay`. The
+    // band-path probe consults this when descending the host octree
+    // so it sees the *painted* material at each leaf, not just the
+    // asset's baseline material. `host_overlay_count == 0` means
+    // unpainted — the probe falls through to leaf_attr_pool.
+    host_overlay_offset: u32,
+    host_overlay_count: u32,
+    _pad_overlay0: u32,
+    _pad_overlay1: u32,
 }
 
 // Per-dispatch state — written by the host once per classify call.
@@ -205,6 +216,19 @@ const FILL_TASK_SENTINEL: u32 = 0xFFFFFFFEu;
 @group(0) @binding(0) var<storage, read_write> octree_nodes: array<vec2<u32>>;
 @group(0) @binding(1) var<storage, read_write> brick_pool: array<u32>;
 @group(0) @binding(2) var<storage, read_write> leaf_attr_pool: array<LeafAttr>;
+
+// Per-instance paint overlay slice, sorted by leaf_slot. Same layout
+// as `rkp_core::OverlayEntry` (16 B). The host-material probe uses
+// `cur_region.host_overlay_offset/count` to find the painted material
+// for a given leaf_slot — without it, the BFS would see the host's
+// asset-baseline material and never recognise paint.
+struct OverlayEntry {
+    leaf_slot: u32,
+    normal_oct: u32,
+    material_packed: u32,
+    color_packed: u32,
+}
+@group(0) @binding(11) var<storage, read> instance_overlay: array<OverlayEntry>;
 // Per-region atomic counters — array length = MAX_REGIONS on Rust side.
 @group(0) @binding(3) var<storage, read_write> octree_alloc: array<atomic<u32>>;
 @group(0) @binding(4) var<storage, read_write> brick_alloc: array<atomic<u32>>;
@@ -285,8 +309,33 @@ fn distance_to_local_box(pos: vec3<f32>, c: vec3<f32>, h: f32) -> f32 {
     return length(max(d, vec3<f32>(0.0))) + min(max(d.x, max(d.y, d.z)), 0.0);
 }
 
+// Per-instance overlay binary-search. Returns the absolute index into
+// `instance_overlay`, or `0xFFFFFFFFu` if `leaf_slot` isn't painted on
+// this region's host instance.
+fn find_overlay_for_leaf_slot(offset: u32, count: u32, leaf_slot: u32) -> u32 {
+    if (count == 0u) { return 0xFFFFFFFFu; }
+    var lo: u32 = 0u;
+    var hi: u32 = count;
+    loop {
+        if (lo >= hi) { break; }
+        let mid = (lo + hi) >> 1u;
+        let e = instance_overlay[offset + mid];
+        if (e.leaf_slot < leaf_slot) {
+            lo = mid + 1u;
+        } else if (e.leaf_slot > leaf_slot) {
+            hi = mid;
+        } else {
+            return offset + mid;
+        }
+    }
+    return 0xFFFFFFFFu;
+}
+
 // host_sample variant that takes the region by index — used by classify
 // threads (each may process a different region in the same workgroup).
+// Overlay-aware: when descent reaches a leaf, consult the host
+// instance's paint overlay first (via region.host_overlay_*); the
+// asset-baseline material is the fallback.
 fn host_sample_in_region(world_pos: vec3<f32>, region_index: u32) -> HostSample {
     var s: HostSample;
     s.distance = 1e30;
@@ -363,21 +412,38 @@ fn host_sample_in_region(world_pos: vec3<f32>, region_index: u32) -> HostSample 
                 s.blend_weight = rep_blend;
                 return s;
             }
-            let attr = leaf_attr_pool[cell];
+            var packed = leaf_attr_pool[cell].material_packed;
+            var n_oct = leaf_attr_pool[cell].normal_oct;
+            let ov_idx = find_overlay_for_leaf_slot(
+                region.host_overlay_offset, region.host_overlay_count, cell,
+            );
+            if (ov_idx != 0xFFFFFFFFu) {
+                packed = instance_overlay[ov_idx].material_packed;
+                n_oct = instance_overlay[ov_idx].normal_oct;
+            }
             s.distance = 0.0;
-            s.normal = unpack_oct(attr.normal_oct);
-            s.material = attr.material_packed & 0xFFFFu;
-            s.material_secondary = (attr.material_packed >> 16u) & 0x0FFFu;
-            s.blend_weight = (attr.material_packed >> 28u) & 0x0Fu;
+            s.normal = unpack_oct(n_oct);
+            s.material = packed & 0xFFFFu;
+            s.material_secondary = (packed >> 16u) & 0x0FFFu;
+            s.blend_weight = (packed >> 28u) & 0x0Fu;
             return s;
         }
         if (is_leaf) {
-            let attr = leaf_attr_pool[value & OCTREE_PAYLOAD_MASK];
+            let leaf_slot = value & OCTREE_PAYLOAD_MASK;
+            var packed = leaf_attr_pool[leaf_slot].material_packed;
+            var n_oct = leaf_attr_pool[leaf_slot].normal_oct;
+            let ov_idx = find_overlay_for_leaf_slot(
+                region.host_overlay_offset, region.host_overlay_count, leaf_slot,
+            );
+            if (ov_idx != 0xFFFFFFFFu) {
+                packed = instance_overlay[ov_idx].material_packed;
+                n_oct = instance_overlay[ov_idx].normal_oct;
+            }
             s.distance = 0.0;
-            s.normal = unpack_oct(attr.normal_oct);
-            s.material = attr.material_packed & 0xFFFFu;
-            s.material_secondary = (attr.material_packed >> 16u) & 0x0FFFu;
-            s.blend_weight = (attr.material_packed >> 28u) & 0x0Fu;
+            s.normal = unpack_oct(n_oct);
+            s.material = packed & 0xFFFFu;
+            s.material_secondary = (packed >> 16u) & 0x0FFFu;
+            s.blend_weight = (packed >> 28u) & 0x0Fu;
             return s;
         }
         let cx = select(0u, 1u, oc.x >= center.x);
@@ -479,21 +545,38 @@ fn host_sample_at(world_pos: vec3<f32>) -> HostSample {
                 s.blend_weight = rep_blend;
                 return s;
             }
-            let attr = leaf_attr_pool[cell];
+            var packed = leaf_attr_pool[cell].material_packed;
+            var n_oct = leaf_attr_pool[cell].normal_oct;
+            let ov_idx = find_overlay_for_leaf_slot(
+                region.host_overlay_offset, region.host_overlay_count, cell,
+            );
+            if (ov_idx != 0xFFFFFFFFu) {
+                packed = instance_overlay[ov_idx].material_packed;
+                n_oct = instance_overlay[ov_idx].normal_oct;
+            }
             s.distance = 0.0;
-            s.normal = unpack_oct(attr.normal_oct);
-            s.material = attr.material_packed & 0xFFFFu;
-            s.material_secondary = (attr.material_packed >> 16u) & 0x0FFFu;
-            s.blend_weight = (attr.material_packed >> 28u) & 0x0Fu;
+            s.normal = unpack_oct(n_oct);
+            s.material = packed & 0xFFFFu;
+            s.material_secondary = (packed >> 16u) & 0x0FFFu;
+            s.blend_weight = (packed >> 28u) & 0x0Fu;
             return s;
         }
         if (is_leaf) {
-            let attr = leaf_attr_pool[value & OCTREE_PAYLOAD_MASK];
+            let leaf_slot = value & OCTREE_PAYLOAD_MASK;
+            var packed = leaf_attr_pool[leaf_slot].material_packed;
+            var n_oct = leaf_attr_pool[leaf_slot].normal_oct;
+            let ov_idx = find_overlay_for_leaf_slot(
+                region.host_overlay_offset, region.host_overlay_count, leaf_slot,
+            );
+            if (ov_idx != 0xFFFFFFFFu) {
+                packed = instance_overlay[ov_idx].material_packed;
+                n_oct = instance_overlay[ov_idx].normal_oct;
+            }
             s.distance = 0.0;
-            s.normal = unpack_oct(attr.normal_oct);
-            s.material = attr.material_packed & 0xFFFFu;
-            s.material_secondary = (attr.material_packed >> 16u) & 0x0FFFu;
-            s.blend_weight = (attr.material_packed >> 28u) & 0x0Fu;
+            s.normal = unpack_oct(n_oct);
+            s.material = packed & 0xFFFFu;
+            s.material_secondary = (packed >> 16u) & 0x0FFFu;
+            s.blend_weight = (packed >> 28u) & 0x0Fu;
             return s;
         }
         let cx = select(0u, 1u, oc.x >= center.x);
@@ -606,28 +689,32 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (cur_region.host_octree_root != HOST_NO_HOST_SENTINEL) {
         let cell_diag_half = half * SQRT3;
         let band = cur_region.region_thickness;
-        // Cell is too far OUTSIDE the host body to be in the band.
-        if (host.distance > cell_diag_half + band) {
-            octree_nodes[cell.octree_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
-            return;
-        }
-        // Cell is INSIDE the host body — surface-effect shaders
-        // (grass, fur, moss) emit nothing here. The proximity gate's
-        // older `< -cell_diag_half - band` threshold left a thick
-        // sub-surface band that produced bricks the user shader
-        // returned occupancy=0 for; using `< -cell_diag_half`
-        // (any cell whose Lipschitz bound says it's fully inside)
-        // halves the band volume without losing surface-straddling
-        // cells (those have distance in [-half_diag, +half_diag]
-        // and pass through to MIXED).
-        //
-        // Mark EMPTY (not INTERIOR): writing OCTREE_INTERIOR for
-        // transient regions renders as a solid voxel block in the
-        // march pass (transient regions don't carry the entity-
-        // level material slot needed for INTERIOR shading).
-        if (host.distance < -cell_diag_half) {
-            octree_nodes[cell.octree_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
-            return;
+        // Band-path regions gate by *vertical distance to the painted
+        // surface y* — `host.distance` (Lipschitz lower bound from the
+        // host octree) returns ~0 in BRICK_CELL_EMPTY regardless of how
+        // far above the surface the cell is, defeating the gate. The
+        // surface-y gate is exact on flat hosts; sloped/curved hosts
+        // need a per-cell normal-aware projection (future revision).
+        // Horizontal placement is filtered at leaf-emit time by probing
+        // the host's actual material — no horizontal proximity gate is
+        // needed (or correct, since the painted area can be non-convex
+        // and an AABB approximation spawns blades on unpainted ground).
+        if (cur_region.use_band_path != 0u) {
+            let dy = center.y - cur_region.host_surface_y;
+            if (abs(dy) > cell_diag_half + band) {
+                octree_nodes[cell.octree_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
+                return;
+            }
+        } else {
+            // Voxel-emit path — original Lipschitz gate.
+            if (host.distance > cell_diag_half + band) {
+                octree_nodes[cell.octree_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
+                return;
+            }
+            if (host.distance < -cell_diag_half) {
+                octree_nodes[cell.octree_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
+                return;
+            }
         }
     }
 
@@ -638,12 +725,23 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // consecutive `leaf_attr_pool` slots and tag the octree node
         // `LEAF | BAND | abs_off` so the march fires
         // `dispatch_user_instance_descend` on hit.
-        //
-        // V2 anchor: projects along the numerical gradient of the
-        // host distance field; lands on the surface for flat floors,
-        // walls, AND slopes (was `(0,1,0)` in V1).
         if (cur_region.use_band_path != 0u) {
-            let anchor = band_anchor_v2(center, host.distance, half, cell.region_index);
+            // Project the cell's x/z onto the painted surface y. Then
+            // probe the host material at that anchor — emit only if
+            // the host leaf there is actually painted with our
+            // region's material (or carries it as the blended
+            // secondary). This is the per-leaf membership test that
+            // makes blade placement track the painted mask exactly,
+            // so non-convex paint shapes (curves, L's, rings) don't
+            // get filled in to their bounding rectangle.
+            let anchor = vec3<f32>(center.x, cur_region.host_surface_y, center.z);
+            let probe = host_sample_in_region(anchor, cell.region_index);
+            let mat = cur_region.material_id;
+            let blend_match = probe.blend_weight > 0u && probe.material_secondary == mat;
+            if (probe.material != mat && !blend_match) {
+                octree_nodes[cell.octree_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
+                return;
+            }
             let band_slot = atomicAdd(&leaf_attr_alloc[cell.region_index], 2u);
             if (band_slot + 2u <= cur_region.leaf_attr_block_size) {
                 let abs_off = cur_region.leaf_attr_block_offset + band_slot;
@@ -790,9 +888,9 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             );
             let child_offset = first_child + k;
 
-            // Brick-parent classification, inline. Hoisted
-            // `child_host` so the band-cell branch below can read
-            // `child_host.distance` for the V1 anchor projection.
+            // Brick-parent classification, inline. V1.1 — band-path
+            // regions use surface-y gate; voxel-emit regions retain
+            // the host_sample Lipschitz gate.
             var child_host: HostSample;
             child_host.distance = 0.0;
             child_host.normal = vec3<f32>(0.0, 1.0, 0.0);
@@ -800,23 +898,38 @@ fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             child_host.material_secondary = 0u;
             child_host.blend_weight = 0u;
             if (cur_region.host_octree_root != HOST_NO_HOST_SENTINEL) {
-                child_host = host_sample_in_region(child_center, cell.region_index);
-                if (child_host.distance > child_diag_half + band) {
-                    octree_nodes[child_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
-                    continue;
-                }
-                if (child_host.distance < -child_diag_half) {
-                    octree_nodes[child_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
-                    continue;
+                if (cur_region.use_band_path != 0u) {
+                    let dy = child_center.y - cur_region.host_surface_y;
+                    if (abs(dy) > child_diag_half + band) {
+                        octree_nodes[child_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
+                        continue;
+                    }
+                } else {
+                    child_host = host_sample_in_region(child_center, cell.region_index);
+                    if (child_host.distance > child_diag_half + band) {
+                        octree_nodes[child_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
+                        continue;
+                    }
+                    if (child_host.distance < -child_diag_half) {
+                        octree_nodes[child_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
+                        continue;
+                    }
                 }
             }
             // Phase B-redux 3b — band-cell path, V13-inline mirror
-            // of the L==max_depth branch above. Same V2 gradient
-            // anchor + same BandCell layout (anchor xyz + region's
-            // host material_id, NOT region_index — the march reads
-            // it as material_id to resolve shader_id and ctx.params).
+            // of the L==max_depth branch above. BandCell layout:
+            // anchor xyz + region's host material_id (NOT
+            // region_index — the march reads it as material_id to
+            // resolve shader_id and ctx.params).
             if (cur_region.use_band_path != 0u) {
-                let anchor = band_anchor_v2(child_center, child_host.distance, child_half, cell.region_index);
+                let anchor = vec3<f32>(child_center.x, cur_region.host_surface_y, child_center.z);
+                let probe = host_sample_in_region(anchor, cell.region_index);
+                let mat = cur_region.material_id;
+                let blend_match = probe.blend_weight > 0u && probe.material_secondary == mat;
+                if (probe.material != mat && !blend_match) {
+                    octree_nodes[child_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
+                    continue;
+                }
                 let band_slot = atomicAdd(&leaf_attr_alloc[cell.region_index], 2u);
                 if (band_slot + 2u <= cur_region.leaf_attr_block_size) {
                     let abs_off = cur_region.leaf_attr_block_offset + band_slot;

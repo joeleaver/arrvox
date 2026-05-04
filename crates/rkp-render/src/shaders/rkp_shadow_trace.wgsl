@@ -138,7 +138,8 @@ struct GpuMaterial {
     noise_strength: f32,
     noise_channels: u32,
     shader_id: u32,
-    _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32, _pad5: f32,
+    instance_shader_id: u32,
+    _pad1: f32, _pad2: f32, _pad3: f32, _pad4: f32,
 }
 
 struct LeafAttr {
@@ -917,85 +918,14 @@ fn shadow_step_one_instance(
             continue;
         }
 
-        // Phase 4 — band-cell shadow dispatch. Mirror of the primary
-        // march's band-cell branch (octree_march.wgsl). The BFS bake
-        // tagged this leaf with `LEAF | BAND` and packed a
-        // `BandCell { anchor_world_pos, material_id }` into two
-        // consecutive `leaf_attr_pool` slots at `slot_band_offset`.
-        // Resolve the prototype asset for the cell's painted host
-        // material's shader_id, then fire the same
-        // `dispatch_user_instance_descend` the primary march uses.
-        // V1: any hit fully blocks the shadow ray (transmittance =
-        // 0). Future revisions can attenuate by user-material
-        // opacity for translucent blades.
+        // Phase 4 — band-cell shadow dispatch is TEMPORARILY DISABLED.
+        // V1's "any band-cell hit blocks the shadow ray fully"
+        // produces black grass: every blade's shadow ray to the sun
+        // hits other band cells in the dense band volume and gets
+        // fully blocked. Until partial-opacity attenuation is wired
+        // in, just skip band cells the same way pre-Phase-4 did so
+        // blades light up.
         if slot_is_band(r.slot) {
-            let band_off = slot_band_offset(r.slot);
-            let band = read_band_cell(band_off);
-            let band_mat_id = band.material_id;
-            let mat = materials[band_mat_id];
-            let shader_id = mat.shader_id;
-            var proto_idx: u32 = 0xFFFFFFFFu;
-            if shader_id != 0u {
-                let acount = march_params.asset_count;
-                for (var ai: u32 = 0u; ai < acount; ai = ai + 1u) {
-                    if assets[ai].shader_id == shader_id {
-                        proto_idx = ai;
-                        break;
-                    }
-                }
-            }
-            if proto_idx == 0xFFFFFFFFu {
-                // No matching proto registered — treat as empty + skip.
-                t += max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);
-                continue;
-            }
-            let proto_asset = assets[proto_idx];
-
-            var host_sample: HostSample;
-            host_sample.distance = 0.0;
-            host_sample.normal = vec3<f32>(0.0, 1.0, 0.0);
-            host_sample.material = band_mat_id;
-            host_sample.material_secondary = 0u;
-            host_sample.blend_weight = 0u;
-
-            var ctx: UserCtx;
-            ctx.time = march_params.time;
-            ctx.cell_size = r.cell_half * 2.0;
-            ctx.material_id = band_mat_id;
-            ctx.aabb_min = vec3<f32>(0.0);
-            let pbase = band_mat_id * 8u;
-            ctx.params[0] = shader_params[pbase + 0u];
-            ctx.params[1] = shader_params[pbase + 1u];
-            ctx.params[2] = shader_params[pbase + 2u];
-            ctx.params[3] = shader_params[pbase + 3u];
-            ctx.params[4] = shader_params[pbase + 4u];
-            ctx.params[5] = shader_params[pbase + 5u];
-            ctx.params[6] = shader_params[pbase + 6u];
-            ctx.params[7] = shader_params[pbase + 7u];
-
-            atomicAdd(&stats[62], 1u); // band-cell shadow dispatch
-            // Shadow stepper passes WORLD-space origin/dir; the
-            // dispatcher takes WORLD-space inputs and descends the
-            // prototype octree in its own canonical frame internally.
-            // local_origin / local_dir are NOT used for the band
-            // branch.
-            let inst_hit = dispatch_user_instance_descend(
-                shader_id,
-                band.anchor_world_pos,
-                host_sample,
-                0u,
-                world_origin,
-                world_dir,
-                max_world_dist,
-                ctx,
-                proto_asset,
-            );
-            if inst_hit.valid {
-                atomicAdd(&stats[63], 1u); // band-cell shadow hit
-                // V1 — blade silhouette fully blocks the shadow ray.
-                return 0.0;
-            }
-            // Miss — skip past the cell and continue.
             t += max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);
             continue;
         }

@@ -137,6 +137,14 @@ fn user_ball_generate(cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx)
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
+    // Tiny dummy overlay buffer — test request has overlay_count = 0,
+    // so the binary search short-circuits without reading.
+    let instance_overlay_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("test instance_overlay"),
+        size: 16,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
 
     let mut pass = UserShaderPass::new(&device);
     pass.reload_user_shaders(&device, &composed.generate, registry.source_hash());
@@ -177,8 +185,8 @@ fn user_ball_generate(cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx)
         tile_index: NO_TILE,
         is_band_region: false,
         host_surface_y: 0.0,
-        painted_world_min: [0.0; 3],
-        painted_world_max: [0.0; 3],
+        host_overlay_offset: 0,
+        host_overlay_count: 0,
     };
     cache.begin_frame();
     let estimate = estimate_region_pool(&req);
@@ -198,7 +206,8 @@ fn user_ball_generate(cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx)
         &[uniform],
         1, // topology_dirty_count = 1 (the single new region)
         MAX_DEPTH,
-        &octree_nodes_buffer, &brick_pool_buffer, &leaf_attr_pool_buffer, 0,
+        &octree_nodes_buffer, &brick_pool_buffer, &leaf_attr_pool_buffer,
+        &instance_overlay_buffer, 0,
     );
 
     // Read back diagnostic counters: leaf_attr_alloc[0] (occupied
@@ -322,7 +331,7 @@ fn empty_registry_dispatch_no_op() {
     });
     pass.dispatch_regions(
         &device, &queue, &mut encoder, &[], 0, 0,
-        &dummy, &dummy, &dummy, 0,
+        &dummy, &dummy, &dummy, &dummy, 0,
     );
     queue.submit(Some(encoder.finish()));
     device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");

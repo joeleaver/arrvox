@@ -135,6 +135,19 @@ impl EngineState {
             }
         }
 
+        // Rebuild GPU objects from ECS world BEFORE constructing
+        // ShaderRegionRequests below — those requests carry the host
+        // instance's `overlay_offset`/`overlay_count`, which the
+        // user-shader-pass uses to find painted material at each
+        // anchor. Reading stale values here causes the BFS probe to
+        // see last frame's overlay slice while the GPU buffer holds
+        // this frame's content, missing the latest paint.
+        let gpu_objects_dirty_this_frame = self.gpu_objects_dirty;
+        if self.gpu_objects_dirty {
+            self.update_scene_gpu();
+            self.gpu_objects_dirty = false;
+        }
+
         if !shader_materials.is_empty() {
             // Reconcile the per-entity painted-material cache against
             // current paint + geometry epochs. Both bump on any
@@ -356,32 +369,24 @@ impl EngineState {
                             }
                         }
 
-                        // Phase B-redux V1.1 — surface y + horizontal AABB
-                        // for the band-cell BFS gates. Computed by
-                        // projecting the painted leaves' host-local AABB
-                        // (8 corners) to world. `host_surface_y` is the
-                        // center of that world AABB on Y; painted_world_min/max
-                        // are the full bounds for x/z gating.
-                        let painted_corners = [
-                            [local_aabb.min.x, local_aabb.min.y, local_aabb.min.z],
-                            [local_aabb.max.x, local_aabb.min.y, local_aabb.min.z],
-                            [local_aabb.min.x, local_aabb.max.y, local_aabb.min.z],
-                            [local_aabb.max.x, local_aabb.max.y, local_aabb.min.z],
-                            [local_aabb.min.x, local_aabb.min.y, local_aabb.max.z],
-                            [local_aabb.max.x, local_aabb.min.y, local_aabb.max.z],
-                            [local_aabb.min.x, local_aabb.max.y, local_aabb.max.z],
-                            [local_aabb.max.x, local_aabb.max.y, local_aabb.max.z],
-                        ];
-                        let mut painted_world_min = [f32::INFINITY; 3];
-                        let mut painted_world_max = [f32::NEG_INFINITY; 3];
-                        for c in &painted_corners {
-                            let p = world.project_point3(glam::Vec3::new(c[0], c[1], c[2]));
-                            for i in 0..3 {
-                                painted_world_min[i] = painted_world_min[i].min(p[i]);
-                                painted_world_max[i] = painted_world_max[i].max(p[i]);
+                        // Band-cell anchor projection target: world-space
+                        // y of the painted surface, derived by projecting
+                        // the painted leaves' host-local AABB y-bounds to
+                        // world and taking the centroid. Flat-surface
+                        // assumption — sloped/curved hosts need a more
+                        // expressive scheme.
+                        let mut painted_world_y_min = f32::INFINITY;
+                        let mut painted_world_y_max = f32::NEG_INFINITY;
+                        for cy in [local_aabb.min.y, local_aabb.max.y] {
+                            for cx in [local_aabb.min.x, local_aabb.max.x] {
+                                for cz in [local_aabb.min.z, local_aabb.max.z] {
+                                    let p = world.project_point3(glam::Vec3::new(cx, cy, cz));
+                                    painted_world_y_min = painted_world_y_min.min(p.y);
+                                    painted_world_y_max = painted_world_y_max.max(p.y);
+                                }
                             }
                         }
-                        let host_surface_y = 0.5 * (painted_world_min[1] + painted_world_max[1]);
+                        let host_surface_y = 0.5 * (painted_world_y_min + painted_world_y_max);
 
                         // Depth derivation. With tiling the extent is
                         // FIXED (tile_size + thickness padding), so
@@ -460,8 +465,8 @@ impl EngineState {
                                 tile_index,
                                 is_band_region: true,
                                 host_surface_y,
-                                painted_world_min,
-                                painted_world_max,
+                                host_overlay_offset: inst.overlay_offset,
+                                host_overlay_count: inst.overlay_count,
                             });
                         } else if info.has_generate {
                             user_shader_regions.push(rkp_render::user_shader_pass::ShaderRegionRequest {
@@ -485,8 +490,8 @@ impl EngineState {
                                 tile_index,
                                 is_band_region: false,
                                 host_surface_y,
-                                painted_world_min,
-                                painted_world_max,
+                                host_overlay_offset: inst.overlay_offset,
+                                host_overlay_count: inst.overlay_count,
                             });
                         }
                     }
@@ -586,13 +591,9 @@ impl EngineState {
         // gates on it.
         self.environment_dirty = false;
 
-        // 0c. Rebuild GPU objects from ECS world only when
-        //     transforms/objects/membership changed.
-        let gpu_objects_dirty_this_frame = self.gpu_objects_dirty;
-        if self.gpu_objects_dirty {
-            self.update_scene_gpu();
-            self.gpu_objects_dirty = false;
-        }
+        // GPU objects rebuild was relocated upstream so it runs
+        // BEFORE the user_shader_regions request loop reads
+        // `inst.overlay_offset`/`overlay_count`. See comment there.
 
         let t_cpu_setup = frame_start.elapsed();
 
