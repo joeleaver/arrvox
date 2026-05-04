@@ -1,17 +1,10 @@
 // General-purpose math helpers shared across shaders. Anything here
 // must be pure: no bindings, no struct dependencies, no side effects.
-// Type-bound helpers (mat_albedo, leaf_attr_material_primary, etc.)
-// belong in the Phase 3 type-unification lib once the structs they
-// reference move there too.
 //
-// CAVEAT — splice-consumer compatibility: any helper called from a
-// `shader_composer` spliced chunk must NOT live here. The chunk is
-// emitted as text with unmangled names, but WESL renames imported
-// symbols at emit time, so the names diverge and the splice fails
-// at parse. `intersect_aabb` is the canonical example; it stays
-// duplicated across `octree_march`, `rkp_shadow_trace`, and
-// `shadow_scatter` until the composer migrates to WESL-native
-// composition (deferred Phase 4 work).
+// As of Wave V the build runs WESL with `ManglerKind::None`, so
+// helpers used inside `shader_composer` text splices (`intersect_aabb`)
+// can live here just like any other helper — names round-trip
+// through imports unmodified.
 
 // Ray-sphere intersection (origin assumed at sphere centre's frame).
 // Returns (t_enter, t_exit) in `vec2<f32>(-1.0, -1.0)` on miss.
@@ -41,6 +34,19 @@ fn interleaved_gradient_noise(pixel: vec2<f32>, frame: u32) -> f32 {
     let offset = 5.588238 * f32(frame % 64u);
     let p = pixel + vec2<f32>(offset, offset);
     return fract(magic.z * fract(dot(p, magic.xy)));
+}
+
+// Slab-test ray-AABB intersection. Returns
+// `vec2<f32>(t_enter, t_exit)` clamped to `t_enter >= 0` (so rays
+// starting inside the box clip the entry to the origin). Miss is
+// indicated by `t_enter > t_exit` — callers must check.
+fn intersect_aabb(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>) -> vec2<f32> {
+    let t0 = (box_min - origin) * inv_dir;
+    let t1 = (box_max - origin) * inv_dir;
+    let tmin = min(t0, t1);
+    let tmax = max(t0, t1);
+    return vec2<f32>(max(max(max(tmin.x, tmin.y), tmin.z), 0.0),
+                     min(min(tmax.x, tmax.y), tmax.z));
 }
 
 // Affine 4x4 inverse — the common case for object↔world transforms.

@@ -21,6 +21,7 @@
 
 import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::math::mat4_affine_inverse;
+import package::lib::math::intersect_aabb;
 import package::lib::octree::skip_node;
 import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
@@ -143,14 +144,6 @@ struct MarchParamsLite {
 // user-shader composer's spliced `instance_at` chunk, which uses
 // the unmangled name. Lifting it to lib would break the splice
 // (WESL renames imported symbols).
-fn intersect_aabb(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>) -> vec2<f32> {
-    let t0 = (box_min - origin) * inv_dir;
-    let t1 = (box_max - origin) * inv_dir;
-    let tmin = min(t0, t1);
-    let tmax = max(t0, t1);
-    return vec2<f32>(max(max(max(tmin.x, tmin.y), tmin.z), 0.0),
-                     min(min(tmax.x, tmax.y), tmax.z));
-}
 
 fn safe_dir3(d: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(
