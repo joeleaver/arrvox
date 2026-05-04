@@ -13,7 +13,7 @@ A working map of the renderer's hot paths. Module-level only — the file-level 
 ```
 [CPU sim] ECS scan: for each painted host with a user-shader material →
    • build ShaderRegionRequest { aabb, shader_name, host_octree_*,
-     painted_world_min/max, host_surface_y, is_band_region, ... }
+     host_surface_y, host_overlay_offset/count, is_band_region, ... }
    • RenderFrame.user_shader_regions: Vec<ShaderRegionRequest>
 
          │  RenderFrame
@@ -30,7 +30,7 @@ A working map of the renderer's hot paths. Module-level only — the file-level 
        extents in the global pools; topology_hash + fill_hash decide
        whether classify / fill can be skipped
    • build_region_uniform (region.rs) packs per-region inputs into
-     RegionUniform (240 B std430)
+     RegionUniform (224 B std430)
    • UserShaderPass.dispatch_regions (dispatch.rs):
        1. seed active_queue[L=0] with one root cell per topology-dirty region
        2. classify_main per BFS level — atomicAdd into global pools,
@@ -64,7 +64,7 @@ A working map of the renderer's hot paths. Module-level only — the file-level 
 | Module | Owns | Key types |
 |---|---|---|
 | `user_shader_pass::cache` | Persistent per-region cache + variable-size pool allocators + sim→render request type | `BucketPoolAllocator`, `ShaderRegionRequest`, `UserShaderObjectCache`, `CachedSlot`, `PoolEstimate`, `estimate_region_pool` |
-| `user_shader_pass::region` | GPU-side per-region uniform + band-cell wire format | `RegionUniform` (240 B), `GpuBandCell` (16 B), `build_region_uniform` |
+| `user_shader_pass::region` | GPU-side per-region uniform + band-cell wire format | `RegionUniform` (224 B), `GpuBandCell` (16 B), `build_region_uniform` |
 | `user_shader_pass::dispatch` | BFS pipelines, transient buffers, per-frame dispatch encoder | `UserShaderPass`, `LevelUniform`, `compose_geom_source`, `resolve_shader_id` |
 | `user_shader_pass::overflow` | Async readback ring for GPU overflow counters | `OverflowReadback` (private — internal use only) |
 | `user_shader_proto_pass` | Prototype bake (`@instance_proto` shaders → octree in host main pool) | `PrototypeUniform`, prototype cache |
@@ -118,16 +118,23 @@ If a memory file references any of these as if they were live, treat the memory 
 
 ---
 
-## V1.1 / band-cell debug session (uncommitted as of 2026-05-02)
+## V1.1 — paint-driven grass (shipped 2026-05-04)
 
-The current uncommitted work layers band-cell shadow + V1.1 anchor projection on top of the band-cell architecture. This is in flight, not yet shipped, and adds known-band-aid fields:
+Paint-driven shaders (grass, moss, fur) now place blades that follow the painted shape exactly, including non-convex strokes (curves, L's, rings). The architecture is:
 
-- `GpuMaterial.instance_shader_id` (separate from `shader_id`) — band-aid, see `project_grass_debug_session`
-- `RegionUniform.host_surface_y`, `painted_world_min/max` — V1.1 anchor projection inputs
-- `user_shader_geom.wgsl` BFS gates for x/z (currently not constraining blade placement — open bug)
-- `rkp_shadow_trace.wgsl` band-cell shadow path disabled (would otherwise produce dense self-shadow → black grass)
+**Anchor projection.** Each band cell at `L == max_depth` projects its (x, z) onto `host_surface_y` (CPU-derived from the painted leaves' world-space y centroid; flat-surface-only for now). The cell's anchor is `(center.x, host_surface_y, center.z)`. Sloped/curved hosts will need a per-cell normal-aware projection.
 
-When the debug session lands or gets reset, update this section.
+**Per-anchor host-material probe.** Before emitting a band cell, the BFS calls `host_sample_in_region(anchor)` and checks the probed material against `region.material_id` (or its blended secondary). The probe is overlay-aware — the host octree descent consults the per-instance paint overlay (sorted-by-leaf-slot binary search) before falling back to `leaf_attr_pool`. Without overlay-awareness the probe sees only the host's asset-baseline material and rejects every painted anchor.
+
+**Frame ordering matters.** `update_scene_gpu` runs BEFORE the user_shader_regions request loop (so `inst.overlay_offset/count` are current), and `upload_instance_overlay` runs BEFORE `run_user_shader_geom` (so the GPU buffer holds this frame's paint when the BFS probes). `topology_hash_for` folds in `paint_epoch` so paint that lands in an already-allocated overlay slot still forces a re-bake.
+
+**Phase 4 band-cell shadows.** `rkp_shadow_trace.wgsl::shadow_step_one_instance`'s band-cell branch attenuates transmittance by 0.65 per cell that contains a blade hit (per-cell rather than per-blade — the cell-as-coverage-event model matches BFS granularity and avoids per-blade descent cost). Soft self-shadow accumulates across cells; the ray short-circuits at `transmittance < 0.01`.
+
+**Load-bearing artifacts:**
+- `GpuMaterial.instance_shader_id` is separate from `shader_id`. The march reads it on band-cell hits to look up the prototype asset, while `shader_id` only routes the shade pass for shaders with a `shade` hook. Conflating them either left band-cell dispatch broken (when filtered to shade-only shaders) or routed grass through the shade default arm and tone-mapped to black.
+- `RegionUniform.host_surface_y` — anchor projection target.
+- `RegionUniform.host_overlay_offset/count` — per-instance paint slice; the BFS probe consults the overlay through these.
+- `BAND_BLADE_TRANSMITTANCE = 0.65` constant in `rkp_shadow_trace.wgsl` — tunable knob for grass shadow density.
 
 ---
 
@@ -216,7 +223,7 @@ In other crates (NOT touched this session):
 WGSL files over budget (no hard 700-line rule but worth flagging):
 
 - `octree_march.wgsl` 2391 — host march + band-cell descent inlined throughout
-- `rkp_shadow_trace.wgsl` 1331 — shadow trace + disabled band-cell shadow branch
+- `rkp_shadow_trace.wgsl` 1392 — shadow trace + Phase 4 band-cell partial-opacity shadow branch
 - `rkp_shade.wgsl` 1093
-- `user_shader_geom.wgsl` 1080 — BFS classify + V13-inline duplicate + V1.1 gates
+- `user_shader_geom.wgsl` 1143 — BFS classify + V13-inline duplicate + V1.1 host-material probe
 - `shadow_scatter.wgsl` 972

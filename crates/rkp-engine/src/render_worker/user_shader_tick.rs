@@ -586,3 +586,86 @@ pub(super) fn fill_hash_for(
     }
     h
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rkp_render::user_shader_pass::{ShaderRegionRequest, NO_TILE};
+
+    fn base_request() -> ShaderRegionRequest {
+        ShaderRegionRequest {
+            host_object_id: 1,
+            material_id: 7,
+            shader_name: "grass".to_string(),
+            params: vec![],
+            aabb_min: [0.0; 3],
+            aabb_max: [1.0; 3],
+            cell_size: 0.04,
+            input_hash: 0,
+            animated: false,
+            region_thickness: 0.5,
+            max_depth: 5,
+            painted_leaf_count: 64,
+            host_octree_root: 0,
+            host_octree_depth: 8,
+            host_octree_extent: 8.0,
+            host_grid_origin: [0.0; 3],
+            host_inverse_world: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            tile_index: NO_TILE,
+            is_band_region: true,
+            host_surface_y: 0.5,
+            host_overlay_offset: 0,
+            host_overlay_count: 0,
+        }
+    }
+
+    /// V1.1 regression — topology hash MUST differ on paint_epoch
+    /// changes. Without this, paint that lands in an already-allocated
+    /// overlay slot (offset/count unchanged, content updated) leaves
+    /// the cached BFS bake serving stale paint state and the most
+    /// recent paint goes invisible.
+    #[test]
+    fn topology_hash_invalidates_on_paint_epoch() {
+        let req = base_request();
+        let h1 = topology_hash_for(&req, 0, 0);
+        let h2 = topology_hash_for(&req, 0, 1);
+        assert_ne!(
+            h1, h2,
+            "paint_epoch must affect the topology hash; otherwise paint into existing \
+             overlay slots leaves stale BFS bake."
+        );
+    }
+
+    /// V1.1 regression — topology hash MUST differ when the host's
+    /// overlay slice moves (new entity painted, slice reshuffled).
+    /// The BFS host-material probe consumes overlay_offset/count to
+    /// find painted material; a stale slice mis-points the probe.
+    #[test]
+    fn topology_hash_invalidates_on_overlay_slice_move() {
+        let mut req = base_request();
+        let baseline = topology_hash_for(&req, 0, 0);
+        req.host_overlay_offset = 64;
+        let moved_offset = topology_hash_for(&req, 0, 0);
+        assert_ne!(baseline, moved_offset, "overlay_offset must affect hash");
+        req.host_overlay_offset = 0;
+        req.host_overlay_count = 32;
+        let moved_count = topology_hash_for(&req, 0, 0);
+        assert_ne!(baseline, moved_count, "overlay_count must affect hash");
+    }
+
+    /// Geometry epoch already had to invalidate (host octree topology
+    /// changing means the BFS reads different cells); pin the
+    /// behavior to keep the contract clear alongside the new fields.
+    #[test]
+    fn topology_hash_invalidates_on_geometry_epoch() {
+        let req = base_request();
+        let h1 = topology_hash_for(&req, 0, 0);
+        let h2 = topology_hash_for(&req, 1, 0);
+        assert_ne!(h1, h2, "geometry_epoch must affect the topology hash");
+    }
+}
