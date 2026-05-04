@@ -16,6 +16,8 @@ import package::lib::atmosphere::transmittance_params_to_uv;
 import package::lib::atmosphere::rayleigh_phase;
 import package::lib::atmosphere::cornette_shanks;
 import package::lib::atmosphere::PI;
+import package::lib::atmosphere::lookup_transmittance;
+import package::lib::atmosphere::lookup_multiscatter;
 import package::lib::math::ray_sphere;
 import package::lib::types::GpuMaterial;
 import package::lib::types::mat_albedo;
@@ -238,17 +240,8 @@ fn sample_scattering(altitude: f32) -> vec2<f32> {
 }
 
 /// Look up transmittance from the precomputed LUT.
-fn lookup_transmittance(view_height: f32, cos_zenith: f32) -> vec3<f32> {
-    let uv = transmittance_params_to_uv(view_height, cos_zenith);
-    return textureSampleLevel(transmittance_lut, atmo_sampler, uv, 0.0).rgb;
-}
 
 /// Look up multi-scattered luminance from the precomputed LUT.
-fn lookup_multiscatter(view_height: f32, sun_cos_zenith: f32) -> vec3<f32> {
-    let v = clamp((view_height - EARTH_RADIUS) / (ATMO_RADIUS - EARTH_RADIUS), 0.0, 1.0);
-    let u = clamp(sun_cos_zenith * 0.5 + 0.5, 0.0, 1.0);
-    return textureSampleLevel(multiscatter_lut, atmo_sampler, vec2<f32>(u, v), 0.0).rgb;
-}
 
 /// Map a view ray direction to Sky View LUT UV coordinates.
 /// Inverse of the parameterization in rkp_sky_view_lut.wgsl.
@@ -328,7 +321,7 @@ fn atmosphere(ray_dir: vec3<f32>, sun_dir: vec3<f32>, sun_intensity: f32, camera
         // Sun transmittance from LUT (replaces per-pixel secondary march).
         let up = pos / length(pos);
         let sun_cos = dot(up, sun_dir);
-        let sun_trans = lookup_transmittance(length(pos), sun_cos);
+        let sun_trans = lookup_transmittance(transmittance_lut, atmo_sampler, length(pos), sun_cos);
 
         // Earth shadow check.
         let earth_shadow = select(0.0, 1.0, sun_cos > -sqrt(max(1.0 - (EARTH_RADIUS * EARTH_RADIUS) / (length(pos) * length(pos)), 0.0)));
@@ -338,7 +331,7 @@ fn atmosphere(ray_dir: vec3<f32>, sun_dir: vec3<f32>, sun_intensity: f32, camera
                * earth_shadow * sun_trans * sun_intensity;
 
         // Multi-scattering from LUT (replaces inline fms hack).
-        let ms = lookup_multiscatter(length(pos), sun_cos) * scattering * sun_intensity;
+        let ms = lookup_multiscatter(multiscatter_lut, atmo_sampler, length(pos), sun_cos) * scattering * sun_intensity;
 
         // Integrate analytically within step (more accurate than Euler).
         let s_total = ss + ms;
@@ -364,7 +357,7 @@ fn sun_disc(ray_dir: vec3<f32>, sun_dir: vec3<f32>, sun_intensity: f32, camera_a
     let horizon_cos = -sqrt(max(1.0 - (EARTH_RADIUS * EARTH_RADIUS) / (view_height * view_height), 0.0));
     if ray_dir.y < horizon_cos { return vec3<f32>(0.0); }
     let sun_cos = dot(vec3<f32>(0.0, 1.0, 0.0), sun_dir);
-    let sun_transmittance = lookup_transmittance(view_height, sun_cos);
+    let sun_transmittance = lookup_transmittance(transmittance_lut, atmo_sampler, view_height, sun_cos);
 
     // Sun disc luminance = illuminance / solid_angle (Filament reference).
     let sun_solid_angle = 2.0 * PI * (1.0 - cos(SUN_ANGULAR_RADIUS));
@@ -894,7 +887,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         let cam_height = EARTH_RADIUS + shade_params.camera_altitude;
         let sun_cos_z = shade_params.sun_dir.y;
-        ms_irradiance = lookup_multiscatter(cam_height, sun_cos_z)
+        ms_irradiance = lookup_multiscatter(multiscatter_lut, atmo_sampler, cam_height, sun_cos_z)
                       * shade_params.sun_intensity
                       * shade_params.ambient_intensity;
     }

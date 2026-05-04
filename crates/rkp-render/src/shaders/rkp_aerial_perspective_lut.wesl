@@ -22,6 +22,8 @@ import package::lib::atmosphere::sample_extinction;
 import package::lib::atmosphere::transmittance_params_to_uv;
 import package::lib::atmosphere::rayleigh_phase;
 import package::lib::atmosphere::cornette_shanks;
+import package::lib::atmosphere::lookup_transmittance;
+import package::lib::atmosphere::lookup_multiscatter;
 
 const MIE_G: f32 = 0.8;
 // Exponential slice parameterization — keep in sync with rkp_shade.wgsl.
@@ -55,19 +57,6 @@ struct AerialParams {
 @group(0) @binding(2) var multiscatter_lut: texture_2d<f32>;
 @group(0) @binding(3) var lut_sampler: sampler;
 @group(0) @binding(4) var ap_out: texture_storage_3d<rgba16float, write>;
-
-// --- File-local helpers (atmosphere math is imported from lib) ---
-
-fn lookup_transmittance(view_height: f32, cos_zenith: f32) -> vec3<f32> {
-    let uv = transmittance_params_to_uv(view_height, cos_zenith);
-    return textureSampleLevel(transmittance_lut, lut_sampler, uv, 0.0).rgb;
-}
-
-fn lookup_multiscatter(view_height: f32, sun_cos_zenith: f32) -> vec3<f32> {
-    let v = clamp((view_height - EARTH_RADIUS) / (ATMO_RADIUS - EARTH_RADIUS), 0.0, 1.0);
-    let u = clamp(sun_cos_zenith * 0.5 + 0.5, 0.0, 1.0);
-    return textureSampleLevel(multiscatter_lut, lut_sampler, vec2<f32>(u, v), 0.0).rgb;
-}
 
 // --- Main ---
 
@@ -115,12 +104,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let pos_up = pos / length(pos);
         let sun_cos_at_pos = dot(pos_up, params.sun_dir);
-        let sun_trans = lookup_transmittance(length(pos), sun_cos_at_pos);
+        let sun_trans = lookup_transmittance(transmittance_lut, lut_sampler, length(pos), sun_cos_at_pos);
         let earth_shadow = select(0.0, 1.0, sun_cos_at_pos > -sqrt(max(1.0 - (EARTH_RADIUS * EARTH_RADIUS) / (length(pos) * length(pos)), 0.0)));
 
         let ss = (density_r * BETA_R * phase_r + density_m * BETA_M_SCAT * phase_m)
                * earth_shadow * sun_trans * params.sun_intensity;
-        let ms = lookup_multiscatter(length(pos), sun_cos_at_pos) * scattering * params.sun_intensity;
+        let ms = lookup_multiscatter(multiscatter_lut, lut_sampler, length(pos), sun_cos_at_pos) * scattering * params.sun_intensity;
 
         let s_total = ss + ms;
         let s_int = (s_total - s_total * sample_transmittance) / max(extinction, vec3<f32>(1e-10));

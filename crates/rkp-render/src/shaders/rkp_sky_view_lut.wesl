@@ -16,6 +16,8 @@ import package::lib::atmosphere::transmittance_params_to_uv;
 import package::lib::atmosphere::rayleigh_phase;
 import package::lib::atmosphere::cornette_shanks;
 import package::lib::math::ray_sphere;
+import package::lib::atmosphere::lookup_transmittance;
+import package::lib::atmosphere::lookup_multiscatter;
 
 const MIE_G: f32 = 0.8;
 
@@ -38,19 +40,6 @@ struct SkyViewParams {
 @group(0) @binding(2) var multiscatter_lut: texture_2d<f32>;
 @group(0) @binding(3) var lut_sampler: sampler;
 @group(0) @binding(4) var sky_view_out: texture_storage_2d<rgba16float, write>;
-
-// --- File-local helpers (atmosphere math + ray_sphere come from lib) ---
-
-fn lookup_transmittance(view_height: f32, cos_zenith: f32) -> vec3<f32> {
-    let uv = transmittance_params_to_uv(view_height, cos_zenith);
-    return textureSampleLevel(transmittance_lut, lut_sampler, uv, 0.0).rgb;
-}
-
-fn lookup_multiscatter(view_height: f32, sun_cos_zenith: f32) -> vec3<f32> {
-    let v = clamp((view_height - EARTH_RADIUS) / (ATMO_RADIUS - EARTH_RADIUS), 0.0, 1.0);
-    let u = clamp(sun_cos_zenith * 0.5 + 0.5, 0.0, 1.0);
-    return textureSampleLevel(multiscatter_lut, lut_sampler, vec2<f32>(u, v), 0.0).rgb;
-}
 
 // --- Sky View UV parameterization (Hillaire 2020) ---
 
@@ -160,12 +149,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let pos_up = pos / length(pos);
         let sun_cos_at_pos = dot(pos_up, sun_dir);
-        let sun_trans = lookup_transmittance(length(pos), sun_cos_at_pos);
+        let sun_trans = lookup_transmittance(transmittance_lut, lut_sampler, length(pos), sun_cos_at_pos);
         let earth_shadow = select(0.0, 1.0, sun_cos_at_pos > -sqrt(max(1.0 - (EARTH_RADIUS * EARTH_RADIUS) / (length(pos) * length(pos)), 0.0)));
 
         let ss = (density_r * BETA_R * phase_r + density_m * BETA_M_SCAT * phase_m)
                * earth_shadow * sun_trans * params.sun_intensity;
-        let ms = lookup_multiscatter(length(pos), sun_cos_at_pos) * scattering * params.sun_intensity;
+        let ms = lookup_multiscatter(multiscatter_lut, lut_sampler, length(pos), sun_cos_at_pos) * scattering * params.sun_intensity;
 
         let s_total = ss + ms;
         let s_int = (s_total - s_total * sample_transmittance) / max(extinction, vec3<f32>(1e-10));
@@ -185,9 +174,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let r_ground = length(p_ground);
         let normal_ground = p_ground / r_ground;
         let sun_cos_ground = dot(normal_ground, sun_dir);
-        let sun_trans_ground = lookup_transmittance(r_ground, sun_cos_ground);
+        let sun_trans_ground = lookup_transmittance(transmittance_lut, lut_sampler, r_ground, sun_cos_ground);
         let direct = sun_trans_ground * max(sun_cos_ground, 0.0) * params.sun_intensity;
-        let ambient = lookup_multiscatter(r_ground, sun_cos_ground) * params.sun_intensity;
+        let ambient = lookup_multiscatter(multiscatter_lut, lut_sampler, r_ground, sun_cos_ground) * params.sun_intensity;
         let ground_albedo = vec3<f32>(
             params.ground_albedo_r, params.ground_albedo_g, params.ground_albedo_b,
         );

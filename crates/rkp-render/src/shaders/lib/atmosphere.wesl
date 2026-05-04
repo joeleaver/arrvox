@@ -1,9 +1,8 @@
 // Shared atmosphere constants + pure-math helpers (Bruneton 2017 /
-// Hillaire 2020 references). Texture-sampling lookups
-// (`lookup_transmittance`, `lookup_multiscatter`) stay per-shader
-// because each consumer binds its own LUTs at distinct binding
-// numbers; lifting them here would require either bind-group
-// abstraction or function-parameter texture/sampler types.
+// Hillaire 2020 references). Includes the LUT-sampling lookups,
+// which take their texture + sampler as parameters so consumers
+// can wire their own bind-group-bound LUT and sampler in (the
+// binding numbers vary per pass).
 
 const PI: f32 = 3.14159265;
 
@@ -20,6 +19,33 @@ const BETA_OZONE:  vec3<f32> = vec3<f32>(0.650e-6, 1.881e-6, 0.085e-6); // Ozone
 // --- Density scale heights ---
 const RAYLEIGH_SCALE_H: f32 = 8000.0;
 const MIE_SCALE_H:      f32 = 1200.0;
+
+// LUT lookups. The transmittance LUT stores ⟨view-height, sun-cos-zenith⟩ →
+// extinction towards space; the multiscatter LUT stores ⟨view-height,
+// sun-cos-zenith⟩ → second-order in-scatter (Hillaire 2020). Both are
+// 2D, sampled with a linear sampler at level 0 — pass the texture +
+// sampler in from the caller's bind group.
+
+fn lookup_transmittance(
+    transmittance_lut: texture_2d<f32>,
+    s: sampler,
+    view_height: f32,
+    cos_zenith: f32,
+) -> vec3<f32> {
+    let uv = transmittance_params_to_uv(view_height, cos_zenith);
+    return textureSampleLevel(transmittance_lut, s, uv, 0.0).rgb;
+}
+
+fn lookup_multiscatter(
+    multiscatter_lut: texture_2d<f32>,
+    s: sampler,
+    view_height: f32,
+    sun_cos_zenith: f32,
+) -> vec3<f32> {
+    let v = clamp((view_height - EARTH_RADIUS) / (ATMO_RADIUS - EARTH_RADIUS), 0.0, 1.0);
+    let u = clamp(sun_cos_zenith * 0.5 + 0.5, 0.0, 1.0);
+    return textureSampleLevel(multiscatter_lut, s, vec2<f32>(u, v), 0.0).rgb;
+}
 
 // Sample atmospheric extinction at a given altitude (Rayleigh + Mie + Ozone).
 // `altitude` is meters above the planet centre? No — meters above sea level.

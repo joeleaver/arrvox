@@ -22,6 +22,7 @@ import package::lib::atmosphere::BETA_M_SCAT;
 import package::lib::atmosphere::sample_extinction;
 import package::lib::atmosphere::transmittance_params_to_uv;
 import package::lib::math::ray_sphere_exit;
+import package::lib::atmosphere::lookup_transmittance;
 
 const GROUND_ALBEDO: vec3<f32> = vec3<f32>(0.3, 0.3, 0.3);
 
@@ -55,11 +56,6 @@ fn ray_sphere_entry(origin: vec3<f32>, dir: vec3<f32>, radius: f32) -> f32 {
     let d = b * b - c;
     if d < 0.0 { return -1.0; }
     return -b - sqrt(d);
-}
-
-fn lookup_transmittance(view_height: f32, cos_zenith: f32) -> vec3<f32> {
-    let uv = transmittance_params_to_uv(view_height, cos_zenith);
-    return textureSampleLevel(transmittance_lut, lut_sampler, uv, 0.0).rgb;
 }
 
 // --- Main ---
@@ -133,7 +129,7 @@ fn main(
             // Transmittance from this point to the sun.
             let up = pos / length(pos);
             let sun_cos = dot(up, sun_dir);
-            let sun_trans = lookup_transmittance(length(pos), sun_cos);
+            let sun_trans = lookup_transmittance(transmittance_lut, lut_sampler, length(pos), sun_cos);
 
             // Check earth shadow.
             let earth_shadow = select(1.0, 0.0, ray_sphere_entry(pos, sun_dir, EARTH_RADIUS) > 0.0);
@@ -164,7 +160,7 @@ fn main(
             let up = ground_pos / length(ground_pos);
             let sun_cos = dot(up, sun_dir);
             let earth_shadow = select(1.0, 0.0, sun_cos < 0.0);
-            let sun_trans = lookup_transmittance(length(ground_pos), sun_cos);
+            let sun_trans = lookup_transmittance(transmittance_lut, lut_sampler, length(ground_pos), sun_cos);
             // Ground reflects light diffusely (Lambertian).
             l_accum += throughput * GROUND_ALBEDO * earth_shadow * sun_trans * max(sun_cos, 0.0) / PI;
         }
