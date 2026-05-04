@@ -15,6 +15,7 @@ import package::lib::atmosphere::sample_extinction;
 import package::lib::atmosphere::transmittance_params_to_uv;
 import package::lib::atmosphere::rayleigh_phase;
 import package::lib::atmosphere::cornette_shanks;
+import package::lib::atmosphere::PI;
 import package::lib::math::ray_sphere;
 import package::lib::types::GpuMaterial;
 import package::lib::types::mat_albedo;
@@ -22,7 +23,6 @@ import package::lib::types::CameraUniforms;
 import package::lib::types::GpuLight;
 import package::lib::types::ShadeParams;
 
-const PI: f32 = 3.14159265;
 
 // --- Structs ---
 

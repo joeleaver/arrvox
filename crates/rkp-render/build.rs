@@ -1,5 +1,5 @@
 use std::path::Path;
-use wesl::Wesl;
+use wesl::{ManglerKind, Wesl};
 
 fn main() {
     let shaders_dir = Path::new("src/shaders");
@@ -45,6 +45,15 @@ fn main() {
     // import-aware stripping.
     let mut resolver = Wesl::new(shaders_dir);
     resolver.use_stripping(false);
+    // Experiment: NoMangler emits identifiers as-is. The default
+    // EscapeMangler produces names like `package_lib_types_GpuMaterial`,
+    // which fights the user-shader composer's text splicing (the
+    // splice chunks reference unmangled names). Flipping to None
+    // eliminates the mismatch and unblocks lifting splice-pinned
+    // types (Aabb, HostSample, UserCtx, etc.) into lib/types.wesl.
+    // Trade: every root-level identifier must be unique across the
+    // emitted artifact (else naga rejects the duplicate decl).
+    resolver.set_mangler(ManglerKind::None);
 
     // Skiplist: imports-only modules with no entry point. They get
     // pulled into emitting artifacts via `import package::<stem>`
