@@ -9,6 +9,7 @@
 // `eval_*` functions in this module reference `instructions` as a
 // module-scope global resolved at the consumer's import site.
 
+import package::lib::math::SQRT3;
 import package::lib::sdf::sdf_sphere;
 import package::lib::sdf::sdf_box;
 import package::lib::sdf::sdf_capsule;
@@ -322,7 +323,7 @@ fn eval_tree(world_pos: vec3<f32>, count: u32) -> TreeSample {
             // `child.distance - amp * sqrt(3)`.
             if (sp > 0u) {
                 let amp = ins.params_lo.x;
-                stack[sp - 1u].distance = stack[sp - 1u].distance - amp * 1.7320508;
+                stack[sp - 1u].distance = stack[sp - 1u].distance - amp * SQRT3;
             }
             continue;
         }
@@ -609,7 +610,7 @@ fn eval_tree_distance(world_pos: vec3<f32>, count: u32) -> f32 {
                 if (pos_top > 0u) { pos_top = pos_top - 1u; }
                 if (sp > 0u) {
                     let amp = ins.params_lo.x;
-                    stack[sp - 1u] = stack[sp - 1u] - amp * 1.7320508;
+                    stack[sp - 1u] = stack[sp - 1u] - amp * SQRT3;
                 }
                 continue;
             }

@@ -11,7 +11,7 @@
 // RGB = inscattered luminance, A = averaged transmittance.
 // Applied to geometry pixels: final = inscattered + surface_color * transmittance.
 
-import package::lib::atmosphere::PI;
+import package::lib::math::PI;
 import package::lib::atmosphere::EARTH_RADIUS;
 import package::lib::atmosphere::ATMO_RADIUS;
 import package::lib::atmosphere::RAYLEIGH_SCALE_H;

@@ -57,6 +57,7 @@
 // markers below (their literal names live further down the file
 // to avoid polluting `find`).
 
+import package::lib::math::SQRT3;
 import package::lib::types::LeafAttr;
 import package::lib::types::OverlayEntry;
 import package::lib::types::UserCtx;
@@ -84,10 +85,6 @@ const OCTREE_PAYLOAD_MASK: u32 = 0x1FFFFFFFu;
 // `MAX_DEPTH = 8` gives 4 × 2^8 = 1024 cells/axis at the deepest level
 // per region — fine enough that most paint workflows never hit it.
 const MAX_DEPTH: u32 = 8u;
-// sqrt(3) — half the L2 length of a unit cube's diagonal. Used to
-// inflate `half_extent` into the conservative L2 distance from cell
-// center to its furthest corner, for the Lipschitz proximity classifier.
-const SQRT3: f32 = 1.7320508075688772f;
 
 const HOST_NO_HOST_SENTINEL: u32 = 0xFFFFFFFFu;
 

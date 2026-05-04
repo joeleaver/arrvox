@@ -17,6 +17,7 @@
 //
 // Non-glass pixels pass through unchanged.
 
+import package::lib::math::PI;
 import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::pbr::dielectric_f0;
 import package::lib::pbr::fresnel_dielectric;
@@ -27,8 +28,6 @@ import package::lib::types::mat_albedo;
 import package::lib::types::CameraUniforms;
 import package::lib::types::GpuLight;
 import package::lib::types::ShadeParams;
-
-const PI: f32 = 3.14159265358979323846;
 
 // Camera uniform — matches rkp_shade.wgsl's layout.
 // vec3 fields flattened to f32 channels — see rkp_shade.wgsl for why.

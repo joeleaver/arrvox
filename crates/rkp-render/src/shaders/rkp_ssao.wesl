@@ -4,7 +4,8 @@
 // Reads G-buffer position + normal, samples hemisphere in screen space,
 // compares depths to estimate occlusion. Writes AO factor to Rgba8Unorm (.r).
 
-const PI: f32 = 3.14159265;
+import package::lib::math::PI;
+
 const NUM_SAMPLES: u32 = 16u;
 
 // --- Structs ---

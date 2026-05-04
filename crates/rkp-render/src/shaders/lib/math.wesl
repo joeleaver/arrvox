@@ -6,6 +6,16 @@
 // shader-composer text splices — names round-trip through imports
 // unmodified.
 
+// Float32 has 24 bits of mantissa precision, so any digits past
+// `3.14159265` are below FP rounding noise — keep the canonical
+// constant short and identical everywhere.
+const PI: f32 = 3.14159265;
+
+// Conservative L2 distance from a unit cube's center to its corner.
+// Used by procedural noise displacement to shrink a child's
+// distance estimate so sphere tracing stays safe across the warp.
+const SQRT3: f32 = 1.7320508075688772;
+
 // Ray-sphere intersection (origin assumed at sphere centre's frame).
 // Returns (t_enter, t_exit) in `vec2<f32>(-1.0, -1.0)` on miss.
 fn ray_sphere(origin: vec3<f32>, dir: vec3<f32>, radius: f32) -> vec2<f32> {

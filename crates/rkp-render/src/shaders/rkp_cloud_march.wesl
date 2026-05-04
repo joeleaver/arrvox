@@ -14,12 +14,11 @@
 //
 // Distance fog / participating-medium haze live in rkp_fog_march.wgsl.
 
+import package::lib::math::PI;
 import package::lib::math::interleaved_gradient_noise;
 import package::lib::math::value_noise_3d;
 import package::lib::types::CloudParams;
 import package::lib::types::VolumetricParams;
-
-const PI: f32 = 3.14159265;
 
 @group(0) @binding(0) var<uniform> params: VolumetricParams;
 @group(0) @binding(1) var depth_buffer: texture_2d<f32>;

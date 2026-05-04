@@ -4,7 +4,7 @@
 // can wire their own bind-group-bound LUT and sampler in (the
 // binding numbers vary per pass).
 
-const PI: f32 = 3.14159265;
+import package::lib::math::PI;
 
 // --- Earth + atmosphere geometry ---
 const EARTH_RADIUS: f32 = 6360000.0;       // meters

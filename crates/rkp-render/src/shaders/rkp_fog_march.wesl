@@ -10,10 +10,9 @@
 // shader. This eliminates the is_sky branching and the (0,0,0,1)-neutral
 // marker dance that the old combined pass needed.
 
+import package::lib::math::PI;
 import package::lib::math::interleaved_gradient_noise;
 import package::lib::types::VolumetricParams;
-
-const PI: f32 = 3.14159265;
 
 @group(0) @binding(0) var<uniform> params: VolumetricParams;
 @group(0) @binding(1) var depth_buffer: texture_2d<f32>;

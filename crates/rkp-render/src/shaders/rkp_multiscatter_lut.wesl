@@ -12,7 +12,7 @@
 // This captures ALL orders of scattering in one pass, fixing the orange horizon
 // that single-scattering produces at oblique viewing angles.
 
-import package::lib::atmosphere::PI;
+import package::lib::math::PI;
 import package::lib::atmosphere::EARTH_RADIUS;
 import package::lib::atmosphere::ATMO_RADIUS;
 import package::lib::atmosphere::RAYLEIGH_SCALE_H;

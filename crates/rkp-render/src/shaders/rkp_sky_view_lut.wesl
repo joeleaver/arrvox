@@ -4,7 +4,7 @@
 // Non-linear mapping concentrates resolution near the horizon.
 // Shade pass samples this instead of per-pixel 32-step atmosphere march.
 
-import package::lib::atmosphere::PI;
+import package::lib::math::PI;
 import package::lib::atmosphere::EARTH_RADIUS;
 import package::lib::atmosphere::ATMO_RADIUS;
 import package::lib::atmosphere::RAYLEIGH_SCALE_H;
