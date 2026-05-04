@@ -5,6 +5,9 @@ fn main() {
     let shaders_dir = Path::new("src/shaders");
     println!("cargo:rerun-if-changed={}", shaders_dir.display());
 
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
+    let out_dir = Path::new(&out_dir);
+
     // Stripping must stay off: the user-shader composer splices new
     // function bodies into shader templates at runtime via the
     // const-decl anchors `USER_<NAME>_DISPATCH_BEGIN/_END` (see
@@ -50,5 +53,31 @@ fn main() {
             .parse()
             .unwrap_or_else(|e| panic!("parse module path package::{stem}: {e}"));
         resolver.build_artifact(&module_path, stem);
+
+        // Strict naga validation. WESL emits flat WGSL without
+        // checking that every identifier resolves (it leaves unknown
+        // names in place expecting them to be locally declared);
+        // unresolved identifiers slip through to wgpu pipeline
+        // creation as runtime errors. Catch them here at build time.
+        let emitted = out_dir.join(format!("{stem}.wgsl"));
+        let src = std::fs::read_to_string(&emitted)
+            .unwrap_or_else(|e| panic!("read emitted artifact {stem}.wgsl: {e}"));
+        match naga::front::wgsl::parse_str(&src) {
+            Ok(module) => {
+                let mut v = naga::valid::Validator::new(
+                    naga::valid::ValidationFlags::all(),
+                    naga::valid::Capabilities::all(),
+                );
+                if let Err(e) = v.validate(&module) {
+                    panic!("naga validation failed for `{stem}`:\n{e:?}");
+                }
+            }
+            Err(e) => {
+                panic!(
+                    "naga parse failed for `{stem}`:\n{}",
+                    e.emit_to_string(&src),
+                );
+            }
+        }
     }
 }

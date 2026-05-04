@@ -7,6 +7,8 @@
 import package::lib::atmosphere::PI;
 import package::lib::atmosphere::EARTH_RADIUS;
 import package::lib::atmosphere::ATMO_RADIUS;
+import package::lib::atmosphere::RAYLEIGH_SCALE_H;
+import package::lib::atmosphere::MIE_SCALE_H;
 import package::lib::atmosphere::BETA_R;
 import package::lib::atmosphere::BETA_M_SCAT;
 import package::lib::atmosphere::sample_extinction;
