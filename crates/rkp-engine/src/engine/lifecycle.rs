@@ -321,6 +321,12 @@ impl EngineState {
         // `inst.overlay_offset`/`overlay_count`. See comment there.
 
         let t_cpu_setup = frame_start.elapsed();
+        // Sub-phase timing inside the snapshot build, gated on
+        // `RKP_SNAP_PROFILE=1`. Drops the per-phase ms split into
+        // stderr each frame so we can attribute snapshot wallclock
+        // when the cumulative `snapshot_ms` blows up.
+        let snap_profile = std::env::var("RKP_SNAP_PROFILE").is_ok();
+        let snap_phase_start = std::time::Instant::now();
 
         // 1. Geometry epoch — read lock-free via the shared atomic
         //    handle. Render compares against its own last-uploaded
@@ -347,6 +353,8 @@ impl EngineState {
             self.rebuild_collider_caches();
             self.collider_caches_dirty = false;
         }
+
+        let snap_t_geom = snap_phase_start.elapsed();
 
         // 2. Bone matrix bytes for shading (LBS + DQ paths).
         let bone_matrix_lbs = self.bone_matrix_allocator.bytes().to_vec();
@@ -396,6 +404,8 @@ impl EngineState {
             }
             None
         };
+
+        let snap_t_bone = snap_phase_start.elapsed();
 
         // 3. Per-viewport snapshot build — derive every per-VR
         //    parameter the render thread needs from current sim state
@@ -750,6 +760,8 @@ impl EngineState {
             }
         }
 
+        let snap_t_vrs = snap_phase_start.elapsed();
+
         // 4. Pending pick — convert sim's `PendingPick` (which carries
         //    a CPU-resolved ghost hint) to the render-side struct.
         //    Ghost hint stays sim-side; we'll re-apply it when the
@@ -791,6 +803,8 @@ impl EngineState {
         } else {
             None
         };
+
+        let snap_t_pick = snap_phase_start.elapsed();
 
         // 5. Build + submit the snapshot. `submit` is non-blocking;
         //    if render hadn't consumed the previous snapshot yet,
@@ -836,6 +850,22 @@ impl EngineState {
         };
 
         let t_encode = frame_start.elapsed();
+        let snap_t_frame = snap_phase_start.elapsed();
+        if snap_profile {
+            // Per-phase ms — each value is a delta within the
+            // snapshot build, sums to `total`. Useful when
+            // `snapshot_ms` blows up to attribute the cost.
+            let to_ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
+            eprintln!(
+                "[snap] geom={:.2} bone={:.2} vrs={:.2} pick={:.2} frame={:.2} | total={:.2}",
+                to_ms(snap_t_geom),
+                to_ms(snap_t_bone) - to_ms(snap_t_geom),
+                to_ms(snap_t_vrs) - to_ms(snap_t_bone),
+                to_ms(snap_t_pick) - to_ms(snap_t_vrs),
+                to_ms(snap_t_frame) - to_ms(snap_t_pick),
+                to_ms(snap_t_frame),
+            );
+        }
         self.render_worker.inbox.submit(frame);
         let t_frame_end = frame_start.elapsed();
 
