@@ -196,11 +196,16 @@ pub(super) fn encode_viewports(
         };
         vr.user_shader_tile_bin.update_params(&state.queue, &bin_params);
         if let Some(bg) = &vr.user_shader_tile_bin_bg {
+            let q = state
+                .renderer
+                .profiler
+                .begin_query("user_shader_tile_bin", &mut encoder);
             vr.user_shader_tile_bin.dispatch(
                 &mut encoder,
                 bg,
                 pre.user_shader_instance_count,
             );
+            state.renderer.profiler.end_query(&mut encoder, q);
         }
 
         state.renderer.render_to(
