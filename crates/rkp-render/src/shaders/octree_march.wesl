@@ -281,6 +281,12 @@ const PHASE_NORMAL: u32 = 1u;
 // Flat list of object indices, grouped by tile. Unbounded object count
 // per scene — replaces the retired 32-object bitmask culling scheme.
 @group(2) @binding(5) var<storage, read> tile_object_ids: array<u32>;
+// User-shader emit-pass output: each blade as a real RkpInstance with
+// `world` set to the forward affine and `asset_id` pointing at its
+// proto. Read in a fall-through scan past the per-tile loop. Empty
+// (count = 0) when no shader registers an `instance_at` hook.
+@group(2) @binding(6) var<storage, read> user_shader_instances: array<RkpInstance>;
+@group(2) @binding(7) var<storage, read> user_shader_instance_count: array<u32>;
 
 // Phase B-redux Phase 3a — per-material `shader_params` flat array
 // (8 × f32 per material slot, indexed by `material_id * 8 + i`).
@@ -1400,6 +1406,83 @@ fn main(
                 first_mat_id = inst.material_id;
             }
             have_first = true;
+        }
+    }
+
+    // ── User-shader emitted instances ────────────────────────────
+    // The emit pass writes one RkpInstance per painted-leaf-derived
+    // blade (or equivalent primitive) into `user_shader_instances`.
+    // No CPU-side tile binning yet — this scan is per-pixel-O(N) on
+    // the AABB cull. For dense grass at "hillside" scale we'll need a
+    // GPU-built tile bin or TLAS; for the first cut this works at
+    // ~hundreds-to-low-thousands of blades.
+    let us_count = user_shader_instance_count[0];
+    for (var ui: u32 = 0u; ui < us_count; ui = ui + 1u) {
+        let inst = user_shader_instances[ui];
+        let asset = assets[inst.asset_id];
+        if asset.geom_type == 0u { continue; }
+        if !rkp_object_visible(inst) { continue; }
+
+        let inv_world = mat4_affine_inverse(inst.world);
+        let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
+        let local_dir_unnorm = (inv_world * vec4<f32>(ray_dir, 0.0)).xyz;
+        let local_to_world_scale = 1.0 / max(length(local_dir_unnorm), 1e-10);
+        let local_dir = normalize(local_dir_unnorm);
+        let extent = bitcast<f32>(asset.octree_extent_bits);
+        let oc_origin = local_origin - asset.grid_origin;
+        let safe_d = vec3<f32>(
+            select(local_dir.x, select(-1e-10, 1e-10, local_dir.x >= 0.0), abs(local_dir.x) < 1e-10),
+            select(local_dir.y, select(-1e-10, 1e-10, local_dir.y >= 0.0), abs(local_dir.y) < 1e-10),
+            select(local_dir.z, select(-1e-10, 1e-10, local_dir.z >= 0.0), abs(local_dir.z) < 1e-10),
+        );
+        let aabb_t_range = intersect_aabb(oc_origin, 1.0 / safe_d, vec3<f32>(0.0), vec3<f32>(extent));
+        if aabb_t_range.x > aabb_t_range.y { continue; }
+        let world_entry = aabb_t_range.x * local_to_world_scale;
+        if world_entry > max_world_dist { continue; }
+
+        let r = march_object(ray_origin, ray_dir, inst, asset);
+        total_steps += r.steps;
+        if !r.valid { continue; }
+
+        let inv_a = 1.0 / max(r.alpha, 0.001);
+        let oc_pos = r.oc_pos * inv_a;
+        let color = r.color * inv_a;
+        let local_normal = normalize(r.normal * inv_a);
+        let local_hit = oc_pos + asset.grid_origin;
+        let world_pos = (inst.world * vec4<f32>(local_hit, 1.0)).xyz;
+        let hit_dist = length(world_pos - ray_origin);
+        if hit_dist > max_world_dist { continue; }
+        let world_normal = normalize((inst.world * vec4<f32>(local_normal, 0.0)).xyz);
+
+        if r.alpha > 0.99 {
+            accum_pos = world_pos;
+            accum_normal = world_normal;
+            accum_color = color;
+            accum_alpha = 1.0;
+            first_dist = hit_dist;
+            first_obj_id = inst.object_id;
+            // Emit-pass instances inherit material from the host paint
+            // through `inst.material_id`. The proto's leaf_attrs carry
+            // `material_primary = 0` (proto bake doesn't know about
+            // host materials); override to the per-instance material.
+            first_mat_id = inst.material_id;
+            first_sec_mat = 0u;
+            first_blend = 0u;
+            first_leaf_slot = 0u;
+            have_first = true;
+            max_world_dist = hit_dist;
+            // Pick: emitted blades select their host instance for now
+            // (`inst.object_id` carries the host's `object_id`).
+            if hit_dist < pick_dist {
+                pick_dist = hit_dist;
+                pick_obj_id = inst.object_id;
+                pick_leaf_slot = 0u;
+            }
+            // Don't update closest_obj_idx — it indexes `instances[]`,
+            // not `user_shader_instances[]`. Footprint histogram +
+            // post-loop pickup gates on `closest_obj_idx != 0xFFFFFFFF`,
+            // so leaving the sentinel here harmlessly skips them.
+            closest_obj_idx = 0xFFFFFFFFu;
         }
     }
 

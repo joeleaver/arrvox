@@ -139,19 +139,73 @@ fn user_grass_proto(uvw: vec3<f32>) -> VoxelEmit {
     return v;
 }
 
-// ── inst_to_local hook ──────────────────────────────────────────────
-// Map a world-space point into the blade's canonical [0, 1]³ space.
+// ── inst_world_matrix hook ──────────────────────────────────────────
+// Forward affine: canonical [0, 1]³ → world. Returned matrix is
+// column-major (WGSL convention). The new emit pass writes this
+// directly into `RkpInstance.world` for each emitted blade so the
+// host march can descend the proto via its standard `inv_world × ray`
+// flow.
 //
-// Forward composition (canonical → world):
+// Composition (canonical → world):
 //   1. Apply width: `pre_lean.x = 0.5 + width × (canonical.x - 0.5)`
 //   2. Apply linear lean: `unscaled.xz = pre_lean.xz + lean × canonical.y`
 //      `unscaled.y = canonical.y`
 //   3. Centre + scale: `unrot = (unscaled - 0.5) × scale`
 //   4. Yaw rotation around Y, then translate by `inst.pos`.
 //
-// Inverting: untranslate, un-yaw, unscale; back out the linear lean
-// using `canonical.y = unscaled.y` (lean doesn't affect Y → closed-form
-// inverse, no iteration); then divide out the width dilation.
+// Building the 4x4 columns by transforming the canonical basis:
+//   col0 = forward(1,0,0) - forward(0,0,0)   (mapped X axis in world)
+//   col1 = forward(0,1,0) - forward(0,0,0)
+//   col2 = forward(0,0,1) - forward(0,0,0)
+//   col3 = forward(0,0,0)                    (translation; projective row 1)
+fn user_grass_inst_world_matrix(inst: Blade) -> mat4x4<f32> {
+    let cy = cos(inst.yaw);
+    let sy = sin(inst.yaw);
+    // canonical (0,0,0) maps to world: pre_lean.x = 0.5 - 0.5*width,
+    //   us.x = pre_lean.x + 0, us.y = 0, us.z = 0,
+    //   ur = (us - 0.5) * scale = (-0.5, -0.5, -0.5) * scale shifted by width
+    //   world = R(yaw) * ur + pos
+    let w = inst.width;
+    let s = inst.scale;
+    let lx = inst.lean.x;
+    let lz = inst.lean.y;
+    // Column 0: ∂world/∂canonical.x, evaluated at any canonical point
+    // (the map is affine, so the derivative is constant).
+    //   ∂pre_lean.x/∂canon.x = w
+    //   ∂us.x/∂canon.x = w; ∂us.y = 0; ∂us.z = 0
+    //   ∂ur = (w*s, 0, 0)
+    //   ∂world = R(yaw) * (w*s, 0, 0) = (w*s*cy, 0, w*s*sy)
+    let col0 = vec4<f32>(w * s * cy, 0.0, w * s * sy, 0.0);
+    // Column 1: ∂world/∂canonical.y
+    //   ∂pre_lean.x = 0; ∂us.x = lx; ∂us.y = 1; ∂us.z = lz
+    //   ∂ur = (lx*s, s, lz*s)
+    //   ∂world = R(yaw) * (lx*s, s, lz*s)
+    //          = (lx*s*cy - lz*s*sy, s, lx*s*sy + lz*s*cy)
+    let col1 = vec4<f32>(lx * s * cy - lz * s * sy, s, lx * s * sy + lz * s * cy, 0.0);
+    // Column 2: ∂world/∂canonical.z
+    //   ∂pre_lean.x = 0; ∂us.x = 0; ∂us.y = 0; ∂us.z = 1
+    //   ∂ur = (0, 0, s)
+    //   ∂world = R(yaw) * (0, 0, s) = (-s*sy, 0, s*cy)
+    let col2 = vec4<f32>(-s * sy, 0.0, s * cy, 0.0);
+    // Column 3: world at canonical (0,0,0)
+    //   pre_lean.x = 0.5 - 0.5*w; us = (pre_lean.x, 0, 0)
+    //   ur = (us - 0.5) * s = ((0.5 - 0.5*w - 0.5) * s, -0.5*s, -0.5*s)
+    //      = (-0.5*w*s, -0.5*s, -0.5*s)
+    //   world = R(yaw) * ur + pos
+    let urx = -0.5 * w * s;
+    let ury = -0.5 * s;
+    let urz = -0.5 * s;
+    let wx = urx * cy - urz * sy + inst.pos.x;
+    let wy = ury + inst.pos.y;
+    let wz = urx * sy + urz * cy + inst.pos.z;
+    let col3 = vec4<f32>(wx, wy, wz, 1.0);
+    return mat4x4<f32>(col0, col1, col2, col3);
+}
+
+// ── inst_to_local hook ──────────────────────────────────────────────
+// Map a world-space point into the blade's canonical [0, 1]³ space.
+// Inverse of `inst_world_matrix`. Kept on the API for future use
+// (e.g. paint-cursor hit-testing within an emitted instance).
 fn user_grass_inst_to_local(world_pos: vec3<f32>, inst: Blade) -> vec3<f32> {
     let local = world_pos - inst.pos;
     let cy = cos(-inst.yaw);

@@ -108,6 +108,12 @@ pub struct OctreeMarchPass {
     /// all per-tile counts, i.e. `tile_offsets[num_tiles]`.
     tile_object_ids_buffer: wgpu::Buffer,
     tile_object_ids_capacity: u64,
+    /// User-shader emit-pass output buffers (refs the scene's
+    /// `user_shader_instance_buffer` + count). Stored Option-style so
+    /// the params bind group can be built before the engine has wired
+    /// them in; `None` falls back to a placeholder + count = 0.
+    user_shader_instances_buffer: Option<wgpu::Buffer>,
+    user_shader_instance_count_buffer: Option<wgpu::Buffer>,
     /// Phase 7 Session 4b — TLAS node + leaf buffers, shared with
     /// `state.tlas_pass`. Shadow trace reads bindings 8 + 9 to
     /// traverse the BVH. March itself doesn't currently read them
@@ -219,6 +225,31 @@ impl OctreeMarchPass {
                     // Binding 5: per-tile object-ids flat list.
                     wgpu::BindGroupLayoutEntry {
                         binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Binding 6: user-shader emitted instances. Written
+                    // by the emit pass, read here in a fall-through scan
+                    // after the per-tile loop. Empty (count = 0) when
+                    // no shader registers an `instance_at` hook.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Binding 7: emitted-instance count (single u32).
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -341,6 +372,8 @@ impl OctreeMarchPass {
                 mapped_at_creation: false,
             }),
             tile_object_ids_capacity: 256,
+            user_shader_instances_buffer: None,
+            user_shader_instance_count_buffer: None,
             tlas_nodes_buffer: None,
             tlas_leaves_buffer: None,
             lights_buffer: None,
@@ -423,6 +456,19 @@ impl OctreeMarchPass {
         self.try_rebuild_params_bind_group(device);
     }
 
+    /// Set the user-shader emit-pass output buffers. The march reads
+    /// these in a fall-through scan past the per-tile loop.
+    pub fn set_user_shader_emit_buffers(
+        &mut self,
+        device: &wgpu::Device,
+        instances_buffer: &wgpu::Buffer,
+        count_buffer: &wgpu::Buffer,
+    ) {
+        self.user_shader_instances_buffer = Some(instances_buffer.clone());
+        self.user_shader_instance_count_buffer = Some(count_buffer.clone());
+        self.try_rebuild_params_bind_group(device);
+    }
+
     fn try_rebuild_params_bind_group(&mut self, device: &wgpu::Device) {
         let (
             Some(materials_buffer),
@@ -430,12 +476,16 @@ impl OctreeMarchPass {
             Some(tlas_nodes),
             Some(tlas_leaves),
             Some(shader_params),
+            Some(us_instances),
+            Some(us_count),
         ) = (
             &self.materials_buffer,
             &self.lights_buffer,
             &self.tlas_nodes_buffer,
             &self.tlas_leaves_buffer,
             &self.shader_params_buffer,
+            &self.user_shader_instances_buffer,
+            &self.user_shader_instance_count_buffer,
         ) else { return };
         self.params_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("march params+materials bind group"),
@@ -464,6 +514,14 @@ impl OctreeMarchPass {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: self.tile_object_ids_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: us_instances.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: us_count.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,

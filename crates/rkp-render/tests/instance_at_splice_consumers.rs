@@ -51,6 +51,17 @@ fn user_x_inst_to_local(world_pos: vec3<f32>, inst: Pebble) -> vec3<f32> {
     return (world_pos - inst.pos) * inv + vec3<f32>(0.5);
 }
 
+fn user_x_inst_world_matrix(inst: Pebble) -> mat4x4<f32> {
+    let d = inst.radius * 2.0;
+    let p = inst.pos;
+    return mat4x4<f32>(
+        vec4<f32>(d, 0.0, 0.0, 0.0),
+        vec4<f32>(0.0, d, 0.0, 0.0),
+        vec4<f32>(0.0, 0.0, d, 0.0),
+        vec4<f32>(p.x - inst.radius, p.y - inst.radius, p.z - inst.radius, 1.0),
+    );
+}
+
 fn user_x_instance_at(
     host_pos: vec3<f32>,
     host: HostSample,

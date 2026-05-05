@@ -73,11 +73,15 @@ pub mod shader_composer;
 pub mod instance_proto;
 /// Prototype bake pipeline. Voxelizes each instance shader's
 /// `proto_sample_at(uvw)` into a dedicated octree+brick+leaf-attr
-/// triple, cached by source hash. The new emit pass (Phase 9) writes
-/// `RkpInstance` records pointing at one of these baked protos as
-/// their `asset_id`; the host march descends the proto via the
-/// standard `march_object` flow.
+/// triple, cached by source hash. The emit pass writes `RkpInstance`
+/// records pointing at one of these baked protos as their `asset_id`;
+/// the host march descends the proto via the standard `march_object`
+/// flow.
 pub mod user_shader_proto_pass;
+/// User-shader instance emit pass. Per painted-leaf compute pass
+/// that writes `RkpInstance` records into the scene's user-shader
+/// instance buffer. Replaces the band-cell descend path.
+pub mod user_shader_emit_pass;
 /// Phase 7 — TLAS over instance AABBs for shadow rays (and future
 /// reflections / AO / GI). Session 1 ships only the wire format +
 /// buffer storage; Sessions 2-4 add the CPU builder, GPU upload,

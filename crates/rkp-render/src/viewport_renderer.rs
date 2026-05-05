@@ -140,6 +140,11 @@ impl ViewportRenderer {
         let mut march = OctreeMarchPass::new(device, &renderer.scene.bind_group_layout);
         march.set_materials(device, &renderer.materials_buffer);
         march.set_lights(device, &renderer.lights_buffer);
+        march.set_user_shader_emit_buffers(
+            device,
+            &renderer.scene.user_shader_instance_buffer,
+            &renderer.scene.user_shader_instance_count_buffer,
+        );
         march.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view, &gbuffer.glass_view, &gbuffer.leaf_slot_view);
         // shader_params binding deferred — `shade` owns the buffer
         // and isn't constructed yet. Wired below after `shade::new`.
@@ -293,6 +298,14 @@ impl ViewportRenderer {
         if scene_now != self.scene_epoch {
             self.scene_bind_group = renderer.scene.build_bind_group(device, &self.camera_buffer);
             self.scene_epoch = scene_now;
+            // The user-shader instance buffers live on the scene; if
+            // the scene buffers epoch bumped they may have moved too.
+            // Re-wire so march's params bg points at the live handles.
+            self.march.set_user_shader_emit_buffers(
+                device,
+                &renderer.scene.user_shader_instance_buffer,
+                &renderer.scene.user_shader_instance_count_buffer,
+            );
         }
         let lm_now = renderer.lights_materials_epoch();
         if lm_now != self.lights_materials_epoch {

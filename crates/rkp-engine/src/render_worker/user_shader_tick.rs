@@ -106,10 +106,10 @@ pub(super) fn tick_instance_pipeline(
     let proto_face_links_bytes = (proto_brick_count as u64) * 6 * 4;
     let realloc = state.renderer.scene.ensure_pool_layout(
         &state.device,
-        cpu_octree_bytes, PROTO_TAIL_OCTREE_BYTES, 0,
-        cpu_brick_bytes, PROTO_TAIL_BRICK_BYTES, 0,
-        cpu_leaf_attr_bytes, PROTO_TAIL_LEAF_ATTR_BYTES, 0,
-        cpu_face_links_bytes, proto_face_links_bytes, 0,
+        cpu_octree_bytes, PROTO_TAIL_OCTREE_BYTES,
+        cpu_brick_bytes, PROTO_TAIL_BRICK_BYTES,
+        cpu_leaf_attr_bytes, PROTO_TAIL_LEAF_ATTR_BYTES,
+        cpu_face_links_bytes, proto_face_links_bytes,
     );
     if realloc {
         let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
@@ -284,4 +284,122 @@ pub(super) fn tick_instance_pipeline(
     state.instance_proto_cache.evict_untouched();
 
     user_shader_assets
+}
+
+/// Per-frame user-shader emit dispatch. Reads `frame.painted_leaves`,
+/// builds the per-material → (shader_id, proto_asset_id) lookup, and
+/// dispatches the emit pass into its own command encoder.
+///
+/// Caller passes:
+///   - `proto_assets` — the result of `tick_instance_pipeline` (one
+///     `RkpGpuAsset` per registered instance shader; `shader_id` field
+///     identifies which shader each entry corresponds to).
+///   - `proto_asset_id_base` — absolute asset index where `proto_assets`
+///     start in the combined `assets[]` buffer (= `frame.gpu_assets.len()`).
+///
+/// Reset of `user_shader_instance_count_buffer` happens here too —
+/// the emit pass atomically bumps it as it allocates slots.
+pub(super) fn tick_emit_pass(
+    state: &mut RenderState,
+    frame: &RenderFrame,
+    proto_assets: &[rkp_render::rkp_gpu_object::RkpGpuAsset],
+    proto_asset_id_base: u32,
+) {
+    use rkp_render::user_shader_emit_pass::{EmitParams, MatToProto};
+
+    // Reload pipeline if shader source changed (the composed `emit`
+    // chunk needs to be spliced in).
+    state.user_shader_emit_pass.reload_user_shaders(
+        &state.device,
+        &frame.user_shader_emit_chunk,
+        frame.user_shader_source_hash,
+    );
+
+    // Always reset the count buffer — even when there are no leaves,
+    // downstream readers (Task #10) need a clean 0.
+    state
+        .user_shader_emit_pass
+        .reset_instance_count(&state.queue, &state.renderer.scene.user_shader_instance_count_buffer);
+
+    if frame.painted_leaves.is_empty() {
+        return;
+    }
+
+    // Build mat_to_proto. Indexed by material_id; entries default to
+    // `(0, 0)` (= "no shader, no asset", emit-pass thread early-returns).
+    // Sized to `materials.len()` so leaf.material_id can index directly.
+    let mut mat_to_proto = vec![
+        MatToProto { shader_id: 0, proto_asset_id: 0 };
+        frame.materials.len()
+    ];
+    for (mat_id, mat) in frame.materials.iter().enumerate() {
+        if mat.instance_shader_id == 0 {
+            continue;
+        }
+        // Find the proto asset for this shader_id.
+        let Some(idx) = proto_assets.iter().position(|a| a.shader_id == mat.instance_shader_id)
+        else {
+            continue;
+        };
+        mat_to_proto[mat_id] = MatToProto {
+            shader_id: mat.instance_shader_id,
+            proto_asset_id: proto_asset_id_base + idx as u32,
+        };
+    }
+
+    state.user_shader_emit_pass.upload_mat_to_proto(
+        &state.device,
+        &state.queue,
+        &mat_to_proto,
+    );
+    state.user_shader_emit_pass.upload_leaves(
+        &state.device,
+        &state.queue,
+        &frame.painted_leaves,
+    );
+
+    let leaf_count = frame.painted_leaves.len() as u32;
+    let instance_capacity = rkp_render::rkp_scene::USER_SHADER_INSTANCE_CAPACITY;
+    state.user_shader_emit_pass.update_params(
+        &state.queue,
+        &EmitParams {
+            leaf_count,
+            instance_capacity,
+            time: frame.shade_params_base.time,
+            _pad0: 0,
+        },
+    );
+
+    state.user_shader_emit_pass.ensure_bind_group(
+        &state.device,
+        &state.renderer.scene.user_shader_instance_buffer,
+        &state.renderer.scene.user_shader_instance_count_buffer,
+        state
+            .viewport_renderers
+            .values()
+            .next()
+            .map(|vr| vr.shade.shader_params_buffer())
+            .expect("at least one viewport"),
+        state.renderer.scene.buffers_epoch(),
+    );
+
+    let mut encoder = state
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("user_shader_emit_encoder"),
+        });
+    let q = state.renderer.profiler.begin_query("user_shader_emit", &mut encoder);
+    state.user_shader_emit_pass.dispatch(&mut encoder, leaf_count);
+    state.renderer.profiler.end_query(&mut encoder, q);
+    // Stage the count readback so we can verify the dispatch is
+    // producing instances. Skip-if-busy keeps successive frames from
+    // double-mapping the same staging buffer.
+    let count_copied = state.user_shader_emit_pass.copy_count_for_readback(
+        &mut encoder,
+        &state.renderer.scene.user_shader_instance_count_buffer,
+    );
+    state.queue.submit(Some(encoder.finish()));
+    if count_copied {
+        state.user_shader_emit_pass.submit_count_readback();
+    }
 }

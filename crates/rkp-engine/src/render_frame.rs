@@ -146,6 +146,20 @@ pub struct RenderFrame {
     /// Empty when no shaders are registered.
     pub user_shader_entries: Vec<rkp_render::shader_composer::UserShaderEntry>,
 
+    /// Per-leaf records for the user-shader emit pass. One entry per
+    /// painted leaf cell whose material has an `instance_at` hook.
+    /// The emit pass dispatches one thread per leaf, calls the
+    /// shader's `instance_at` for k = 0..MAX_EMITS_PER_LEAF, and
+    /// writes one `RkpInstance` per accepted instance into
+    /// `RkpScene::user_shader_instance_buffer`.
+    pub painted_leaves: Vec<rkp_render::user_shader_emit_pass::EmitLeaf>,
+
+    /// Composed `emit` chunk — per-shader `instance_at` +
+    /// `inst_world_matrix` bodies + dispatch switch, spliced into
+    /// `user_shader_emit.wgsl` between its USER_EMIT_DISPATCH markers.
+    /// Empty when no shader has an `instance_at` hook.
+    pub user_shader_emit_chunk: String,
+
     /// Scene-wide light list (sun + entity point/spot lights), in the
     /// order the shade shader expects (entry 0 = sun).
     pub lights: Vec<GpuLight>,

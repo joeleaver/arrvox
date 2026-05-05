@@ -179,6 +179,12 @@ pub(super) struct RenderState {
     pub(super) viewport_renderers: std::collections::HashMap<ViewportId, ViewportRenderer>,
     pub(super) scene_mgr: Arc<Mutex<RkpSceneManager>>,
 
+    /// User-shader instance emit pass. Per-frame compute pass that
+    /// reads `frame.painted_leaves`, calls each shader's
+    /// `instance_at` + `inst_world_matrix` hooks per leaf, and writes
+    /// `RkpInstance` records into `RkpScene::user_shader_instance_buffer`.
+    pub(super) user_shader_emit_pass: rkp_render::user_shader_emit_pass::UserShaderEmitPass,
+
     /// Voxel sprite instancing — scene-wide pieces. The
     /// per-viewport march + composite live in [`ViewportRenderer`]
     /// (Stage 6c-2). All four pieces here are constructed at startup
@@ -334,6 +340,12 @@ impl RenderState {
         // registers.
         let instance_proto_pass =
             rkp_render::user_shader_proto_pass::PrototypeBakePass::new(&device);
+        // User-shader instance emit pass. Reads painted-leaf records
+        // each frame, dispatches the per-shader instance derivation,
+        // writes `RkpInstance` records to the scene's
+        // `user_shader_instance_buffer`.
+        let user_shader_emit_pass =
+            rkp_render::user_shader_emit_pass::UserShaderEmitPass::new(&device);
         let instance_proto_cache =
             rkp_render::user_shader_proto_pass::PrototypeCache::with_capacities(
                 INSTANCE_PROTO_OCTREE_CAPACITY_U32,
@@ -352,6 +364,7 @@ impl RenderState {
             viewport_renderers,
             scene_mgr: init.scene_mgr,
             instance_proto_pass,
+            user_shader_emit_pass,
             instance_proto_cache,
             tlas_pass,
             tlas_build_pass,

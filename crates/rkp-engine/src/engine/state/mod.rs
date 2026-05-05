@@ -244,6 +244,12 @@ pub(crate) struct EngineState {
             std::collections::HashMap<[i32; 3], PaintedTileEntry>,
         >,
     >,
+    /// Flat per-leaf list collected alongside `painted_materials` for
+    /// the user-shader emit pass. One record per painted-leaf cell
+    /// whose material has an `instance_at` hook. World-space pos +
+    /// normal, ready to ship to the GPU emit dispatch each frame.
+    /// Rebuilt whenever `painted_materials` is rebuilt.
+    pub(crate) painted_leaves: Vec<rkp_render::user_shader_emit_pass::EmitLeaf>,
     /// Epochs the cache was last reconciled against. When either
     /// moves ahead, we invalidate and re-scan affected entities.
     pub(crate) painted_materials_paint_epoch: u64,

@@ -12,7 +12,7 @@ use crate::viewport::ViewportId;
 
 use super::super::frame_helpers::{compute_tlas_scene_aabb, prepare_shadow_maps};
 use super::super::state::RenderState;
-use super::super::user_shader_tick::tick_instance_pipeline;
+use super::super::user_shader_tick::{tick_emit_pass, tick_instance_pipeline};
 
 use super::PreFrameOutput;
 
@@ -194,9 +194,10 @@ pub(super) fn run_pre_frame(
 
     let mut combined_assets: Vec<rkp_render::rkp_gpu_object::RkpGpuAsset>;
     // Splice proto assets onto the host's persistent set. Emitted
-    // blade instances (built by the new emit pass — TODO Phase 9)
-    // will reference these by `asset_id`. Until that lands the
-    // assets sit in the buffer unreferenced; cheap.
+    // blade instances (written by the user-shader emit pass below)
+    // reference these by `asset_id` — the proto's absolute index in
+    // the combined assets buffer is `frame.gpu_assets.len() + idx`.
+    let proto_asset_id_base = frame.gpu_assets.len() as u32;
     let (assets_for_upload, instances_for_upload): (
         &[rkp_render::rkp_gpu_object::RkpGpuAsset],
         &[rkp_render::rkp_gpu_object::RkpGpuInstance],
@@ -210,6 +211,15 @@ pub(super) fn run_pre_frame(
         combined_assets.extend_from_slice(&inst_result);
         (combined_assets.as_slice(), gpu_instances)
     };
+
+    // 1.7c. User-shader emit pass. Reads `frame.painted_leaves`,
+    //       runs each shader's `instance_at` / `inst_world_matrix`
+    //       hooks, writes `RkpInstance` records into the scene's
+    //       user_shader_instance_buffer. The host march reads those
+    //       records in Task #10 (currently the buffer is written but
+    //       nothing consumes it; engine logs the count behind
+    //       `RKP_MARCH_STATS=1` for verification).
+    tick_emit_pass(state, frame, &inst_result, proto_asset_id_base);
 
     // 1b. Per-frame upload. `gpu_instances` here may be interpolated
     //     between the last two sim snapshots (see `interpolate_instances`),

@@ -119,6 +119,7 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
         proto_text: None,
         inst_aabb_text: None,
         inst_to_local_text: None,
+        inst_world_matrix_text: None,
         instance_at_text: None,
         struct_decls: Vec::new(),
         instance_layout: None,
@@ -180,13 +181,14 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
                     "proto" => &mut entry.proto_text,
                     "inst_aabb" => &mut entry.inst_aabb_text,
                     "inst_to_local" => &mut entry.inst_to_local_text,
+                    "inst_world_matrix" => &mut entry.inst_world_matrix_text,
                     "instance_at" => &mut entry.instance_at_text,
                     other => {
                         return Err(ShaderComposerError::Parse {
                             path: path.to_path_buf(),
                             line: line_of(source, name_start),
                             msg: format!(
-                                "unknown hook `{other}` — expected `shade`, `generate`, `proto`, `inst_aabb`, `inst_to_local`, or `instance_at`"
+                                "unknown hook `{other}` — expected `shade`, `generate`, `proto`, `inst_aabb`, `inst_to_local`, `inst_world_matrix`, or `instance_at`"
                             ),
                         });
                     }
@@ -312,7 +314,10 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
                 ),
             });
         }
-        if entry.inst_aabb_text.is_some() || entry.inst_to_local_text.is_some() {
+        if entry.inst_aabb_text.is_some()
+            || entry.inst_to_local_text.is_some()
+            || entry.inst_world_matrix_text.is_some()
+        {
             return Err(ShaderComposerError::Parse {
                 path: path.to_path_buf(),
                 line: 0,
@@ -331,21 +336,25 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
         }
     }
 
-    // Phase B-redux precondition: `instance_at` shaders must also
-    // provide `inst_aabb` and `inst_to_local`. The march-time descent
-    // calls all three on each derived instance — `inst_aabb` for the
-    // ray-AABB cull, `inst_to_local` for the world↔canonical map and
-    // the world-normal Jacobian. Reject early so the user gets a
-    // clear error instead of a spurious WGSL link error at splice
-    // time when the composer references a missing
-    // `rkp_user_<id>_inst_aabb` symbol.
+    // Precondition: `instance_at` shaders must also provide
+    // `inst_aabb`, `inst_to_local`, and `inst_world_matrix`.
+    //   - `inst_world_matrix` builds `RkpInstance.world` for each
+    //     emitted blade (the new emit pass writes the matrix
+    //     directly; the host march descends via `inv_world × ray`).
+    //   - `inst_aabb` is read by the emit pass when building the
+    //     scene-AABB / tile bins for emitted instances.
+    //   - `inst_to_local` is currently informational, kept on the
+    //     entry for any march-time normal reconstruction or paint
+    //     cursor work that wants the inverse map.
+    // Reject early so the user gets a clear error instead of a
+    // spurious WGSL link error at splice time.
     if entry.instance_at_text.is_some() {
         if entry.inst_aabb_text.is_none() {
             return Err(ShaderComposerError::Parse {
                 path: path.to_path_buf(),
                 line: 0,
                 msg: format!(
-                    "`user_{name}_instance_at` requires `user_{name}_inst_aabb` (the per-pixel descent calls it for ray-AABB cull)"
+                    "`user_{name}_instance_at` requires `user_{name}_inst_aabb` (the emit pass calls it for tile binning + scene AABB)"
                 ),
             });
         }
@@ -354,7 +363,16 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
                 path: path.to_path_buf(),
                 line: 0,
                 msg: format!(
-                    "`user_{name}_instance_at` requires `user_{name}_inst_to_local` (the per-pixel descent calls it for the world↔canonical map and Jacobian)"
+                    "`user_{name}_instance_at` requires `user_{name}_inst_to_local` (world→canonical map)"
+                ),
+            });
+        }
+        if entry.inst_world_matrix_text.is_none() {
+            return Err(ShaderComposerError::Parse {
+                path: path.to_path_buf(),
+                line: 0,
+                msg: format!(
+                    "`user_{name}_instance_at` requires `user_{name}_inst_world_matrix` (forward affine canonical → world; written into RkpInstance.world by the emit pass)"
                 ),
             });
         }

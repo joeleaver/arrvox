@@ -318,15 +318,17 @@ pub(super) fn encode_viewports(
         // March stats — async readback. Gated behind RKP_MARCH_STATS=1
         // so it doesn't spam by default; when enabled, drains any
         // previously-resolved snapshot and eprintln's the descend-body
-        // breakdown counters (band-cell + Phase-3a invocations,
-        // candidate AABB rejection / descent / hit ratios). Single
-        // staging buffer with skip-if-busy — sampling rate is whatever
-        // the GPU/driver completes per frame, never blocks.
+        // breakdown counters + the user-shader emit instance count.
+        // Single staging buffer per source, skip-if-busy — never
+        // blocks the render thread.
         if std::env::var("RKP_MARCH_STATS").is_ok() {
             if let Some(stats) = vr.march.try_drain_stats() {
                 eprint_march_stats(vp.id, &stats);
             }
             vr.march.submit_stats_readback();
+            if let Some(count) = state.user_shader_emit_pass.try_drain_count() {
+                eprintln!("[user_shader_emit] emitted instances={count}");
+            }
         }
     }
 

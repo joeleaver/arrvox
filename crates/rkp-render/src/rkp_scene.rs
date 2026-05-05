@@ -314,99 +314,58 @@ impl RkpScene {
         )
     }
 
-    /// Phase C — reserve a tail of `extra_bytes` past the currently-
-    /// uploaded CPU data on each of the three pool buffers user-shader
-    /// geometry writes into. The transient writes land in this tail;
-    /// the march/shade passes read from the same buffers via separate
-    /// `read_only` bind groups, so no data movement is required.
-    ///
-    /// Buffer reallocations bump `buffers_epoch` so viewport-renderer
-    /// scene bind groups (and the user-shader pass's group 0)
-    /// rebuild. The transient cache treats any reallocation as a
-    /// flush — its previous writes are gone.
-    ///
-    /// `cpu_*_bytes` is the byte length of the CPU-managed head — the
-    /// reserved tail starts at `cpu_*_bytes` and runs through
-    /// `cpu_*_bytes + extra_*_bytes`. Zero `extra_*_bytes` is
-    /// equivalent to "no reservation" — pass that when no user
-    /// shader has a `generate` hook.
-    pub fn ensure_user_shader_capacity(
-        &mut self,
-        device: &wgpu::Device,
-        cpu_octree_bytes: u64,
-        extra_octree_bytes: u64,
-        cpu_brick_bytes: u64,
-        extra_brick_bytes: u64,
-        cpu_leaf_attr_bytes: u64,
-        extra_leaf_attr_bytes: u64,
-        cpu_brick_face_links_bytes: u64,
-        extra_brick_face_links_bytes: u64,
-    ) -> bool {
-        self.ensure_pool_layout(
-            device,
-            cpu_octree_bytes, 0, extra_octree_bytes,
-            cpu_brick_bytes, 0, extra_brick_bytes,
-            cpu_leaf_attr_bytes, 0, extra_leaf_attr_bytes,
-            cpu_brick_face_links_bytes, 0, extra_brick_face_links_bytes,
-        )
-    }
-
-    /// Phase 4 — three-tier buffer layout.
+    /// Two-tier shared-pool layout.
     ///
     /// The host scene buffers carry, in order:
     ///
     /// ```text
     /// [0 .. cpu_*_bytes]                                   ← CPU-managed asset data
     /// [cpu_*_bytes .. +proto_*_bytes]                      ← Persistent instance-prototype tail
-    /// [+proto_*_bytes .. +extra_*_bytes]                   ← Per-frame Phase C transient tail
     /// ```
     ///
     /// The proto tail is where `@instance_proto` shaders' baked blade
     /// prototype octrees live. They persist across frames (only re-baked
     /// on shader source change) but live in the host pools so the host
     /// march reads them via its existing bindings — no special "which
-    /// pool?" indirection.
-    ///
-    /// Phase C's transient tail starts past the proto reservation; both
-    /// caches' pool bases (`PrototypeCache::set_pool_bases` /
-    /// `UserShaderRegionCache::set_pool_bases`) must be set accordingly
-    /// by the engine.
+    /// pool?" indirection. `PrototypeCache::set_pool_bases` configures
+    /// the proto cache's offset within these buffers.
     ///
     /// Returns `true` if any underlying buffer reallocated — caller must
     /// rebuild any cached bind groups referencing them.
+    ///
+    /// Replaces the old three-tier layout that had a Phase-C transient
+    /// tier sized for 768 MB of band-cell BFS extras. The band-cell
+    /// path was deleted; the new emit pass scatters into a separate
+    /// `user_shader_instance_buffer` instead.
     #[allow(clippy::too_many_arguments)]
     pub fn ensure_pool_layout(
         &mut self,
         device: &wgpu::Device,
         cpu_octree_bytes: u64,
         proto_octree_bytes: u64,
-        transient_octree_bytes: u64,
         cpu_brick_bytes: u64,
         proto_brick_bytes: u64,
-        transient_brick_bytes: u64,
         cpu_leaf_attr_bytes: u64,
         proto_leaf_attr_bytes: u64,
-        transient_leaf_attr_bytes: u64,
         cpu_face_links_bytes: u64,
         proto_face_links_bytes: u64,
-        transient_face_links_bytes: u64,
     ) -> bool {
         let mut bumped = false;
         bumped |= Self::ensure_capacity(
             device, &mut self.octree_nodes_buffer, "rkp_octree_nodes",
-            cpu_octree_bytes + proto_octree_bytes + transient_octree_bytes,
+            cpu_octree_bytes + proto_octree_bytes,
         );
         bumped |= Self::ensure_capacity(
             device, &mut self.brick_pool_buffer, "rkp_brick_pool",
-            cpu_brick_bytes + proto_brick_bytes + transient_brick_bytes,
+            cpu_brick_bytes + proto_brick_bytes,
         );
         bumped |= Self::ensure_capacity(
             device, &mut self.leaf_attr_pool_buffer, "rkp_leaf_attr_pool",
-            cpu_leaf_attr_bytes + proto_leaf_attr_bytes + transient_leaf_attr_bytes,
+            cpu_leaf_attr_bytes + proto_leaf_attr_bytes,
         );
         bumped |= Self::ensure_capacity(
             device, &mut self.brick_face_links_buffer, "rkp_brick_face_links",
-            cpu_face_links_bytes + proto_face_links_bytes + transient_face_links_bytes,
+            cpu_face_links_bytes + proto_face_links_bytes,
         );
         if bumped {
             self.buffers_epoch += 1;

@@ -131,13 +131,24 @@ pub struct UserShaderEntry {
     pub inst_aabb_text: Option<String>,
     /// `fn user_<stem>_inst_to_local(world_pos: vec3<f32>, inst: <Struct>) -> vec3<f32>`
     /// — world→prototype-local mapping. Required alongside `instance_at`.
+    /// Used at march time for ray-into-local transform and Jacobian
+    /// normal reconstruction; the new emit pass also uses it (along
+    /// with the inverse derived from the forward) for fallback cases.
     pub inst_to_local_text: Option<String>,
-    /// Phase B-redux march-time derivation hook. Signature:
+    /// `fn user_<stem>_inst_world_matrix(inst: <Struct>) -> mat4x4<f32>`
+    /// — forward affine transform from canonical [0,1]³ to world space.
+    /// Returned matrix is column-major (WGSL convention). Required
+    /// alongside `instance_at`. The new emit pass writes this matrix
+    /// directly into `RkpInstance.world` for each emitted blade so the
+    /// host march descends the proto via its standard `inv_world × ray`
+    /// flow without any per-shader bespoke transform code.
+    pub inst_world_matrix_text: Option<String>,
+    /// Per-instance derivation hook. Signature:
     /// `fn user_<stem>_instance_at(host_pos: vec3<f32>, host: HostSample,
     /// ctx: UserCtx, k: u32, out_instance: ptr<function, <Struct>>) -> bool`.
     /// Returns the k-th instance for this host position, or `false` to
-    /// signal "no instance at index k." Called from the host march on
-    /// band-cell hits; allows zero per-frame state writes.
+    /// signal "no instance at index k." Called from the new emit pass
+    /// per painted leaf to populate the per-shader instance buffer.
     pub instance_at_text: Option<String>,
     /// Verbatim `struct ... { ... }` declarations captured from the
     /// file's top level, in source order. Shader code can declare its
@@ -312,14 +323,16 @@ pub struct ComposedChunks {
     /// only shaders with `@instance_proto` directives; identity
     /// default arm returns a skip emit.
     pub proto: String,
-    /// Phase B-redux — march-time derivation chunk. Spliced into the
-    /// host march / shadow-trace templates between the
-    /// `USER_INSTANCE_AT_DISPATCH_*` markers. Defines per-shader
-    /// `rkp_user_<id>_instance_at(host_pos, host, ctx, k, &instance)
-    /// -> bool` (verbatim user body, fn name rewritten). The march
-    /// splices per-shader switch cases that call into these directly
-    /// with the user's instance-struct-typed local var; no unified
-    /// dispatcher because each shader's instance struct differs.
-    /// Empty when no instance shaders register an `instance_at` hook.
+    /// Empty stub since the band-cell descend path it fed was deleted.
+    /// Kept on the struct to keep the splice consumers' API stable
+    /// (their `splice_inst_chunks` calls splice an empty chunk = no-op).
     pub instance_at: String,
+    /// Per-shader `instance_at` + `inst_world_matrix` bodies spliced
+    /// into the user-shader emit pass between the
+    /// `USER_EMIT_DISPATCH_BEGIN/END` markers. Defines the dispatch
+    /// switch that routes a `(shader_id, k)` pair to the per-shader
+    /// derivation, returning `true` + populating `*out_world_matrix`
+    /// on a successful derivation. Empty when no shader has an
+    /// `instance_at` hook.
+    pub emit: String,
 }

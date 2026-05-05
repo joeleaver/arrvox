@@ -88,6 +88,7 @@ impl EngineState {
         let composed = rkp_render::shader_composer::compose(&self.user_shader_registry);
         let user_shader_shade_chunk = composed.shade;
         let user_shader_proto_chunk = composed.proto;
+        let user_shader_emit_chunk = composed.emit;
         let _ = composed.generate; // band-cell BFS strip — no consumer
         let _ = composed.instance_at; // band-cell descend strip — no consumer
         let user_shader_source_hash = self.user_shader_registry.source_hash();
@@ -156,6 +157,7 @@ impl EngineState {
             {
                 use crate::components::{Renderable, Transform};
                 self.painted_materials.clear();
+                self.painted_leaves.clear();
                 let sm = self.scene_mgr.lock().expect("scene_mgr poisoned");
                 let octree_data = sm.octree.data();
                 let brick_pool_data = sm.brick_pool.as_slice();
@@ -199,7 +201,9 @@ impl EngineState {
                         spatial.base_voxel_size,
                         &shader_materials,
                         entity_world,
+                        object_id,
                         &mut mat_tiles,
+                        &mut self.painted_leaves,
                     );
                     if !mat_tiles.is_empty() {
                         self.painted_materials.insert(object_id, mat_tiles);
@@ -815,6 +819,8 @@ impl EngineState {
             user_shader_proto_chunk,
             user_shader_infos,
             user_shader_entries,
+            painted_leaves: self.painted_leaves.clone(),
+            user_shader_emit_chunk,
             lights: gpu_lights,
             shade_params_base: self.shade_params_base,
             env_update,
@@ -899,10 +905,12 @@ fn scan_painted_aabbs(
     base_voxel_size: f32,
     shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
     entity_world: Option<glam::Mat4>,
+    object_id: u32,
     out: &mut std::collections::HashMap<
         u16,
         std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
     >,
+    out_leaves: &mut Vec<rkp_render::user_shader_emit_pass::EmitLeaf>,
 ) {
     use rkp_core::sparse_octree::{
         is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE,
@@ -924,10 +932,12 @@ fn scan_painted_aabbs(
         base_vs: f32,
         shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
         entity_world: Option<glam::Mat4>,
+        object_id: u32,
         out: &mut std::collections::HashMap<
             u16,
             std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
         >,
+        out_leaves: &mut Vec<rkp_render::user_shader_emit_pass::EmitLeaf>,
     ) {
         use rkp_core::sparse_octree::{
             is_brick, is_leaf, leaf_slot, brick_id, EMPTY_NODE, INTERIOR_NODE,
@@ -978,6 +988,37 @@ fn scan_painted_aabbs(
                             super::lifecycle::expand_aabb(
                                 out, mat, cell_local, cell_max, tile_size,
                             );
+                            // Emit a per-leaf record for the new emit
+                            // pass (Phase 9). World-space pos + normal
+                            // — entity_world rotates the leaf's local
+                            // normal into world; without an entity_world
+                            // the host hasn't materialized as a GPU
+                            // instance yet, so skip (paint cursor +
+                            // base material still work).
+                            if let Some(world) = entity_world {
+                                let cell_center_local = cell_local
+                                    + glam::Vec3::splat(0.5 * base_vs);
+                                let world_pos = world
+                                    .transform_point3(cell_center_local);
+                                let local_normal = rkp_core::leaf_attr::unpack_oct(
+                                    attr.normal_oct,
+                                );
+                                let world_normal = world
+                                    .transform_vector3(local_normal)
+                                    .normalize_or_zero();
+                                let world_normal_oct =
+                                    rkp_core::leaf_attr::pack_oct(world_normal);
+                                out_leaves.push(
+                                    rkp_render::user_shader_emit_pass::EmitLeaf {
+                                        world_pos: world_pos.to_array(),
+                                        material_id: mat as u32,
+                                        normal_oct: world_normal_oct,
+                                        object_id,
+                                        leaf_slot: cell,
+                                        cell_size: base_vs,
+                                    },
+                                );
+                            }
                         }
                     }
                 }
@@ -1044,7 +1085,9 @@ fn scan_painted_aabbs(
                 base_vs,
                 shader_materials,
                 entity_world,
+                object_id,
                 out,
+                out_leaves,
             );
         }
     }
@@ -1062,7 +1105,9 @@ fn scan_painted_aabbs(
         base_voxel_size,
         shader_materials,
         entity_world,
+        object_id,
         out,
+        out_leaves,
     );
     let _ = (is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE, BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR, BRICK_CELL_EMPTY);
 }

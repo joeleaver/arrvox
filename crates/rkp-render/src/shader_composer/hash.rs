@@ -38,6 +38,7 @@ pub(super) fn compute_registry_hash(entries: &[UserShaderEntry]) -> u64 {
             &e.proto_text,
             &e.inst_aabb_text,
             &e.inst_to_local_text,
+            &e.inst_world_matrix_text,
             &e.instance_at_text,
         ] {
             if let Some(t) = hook {

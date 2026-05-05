@@ -447,8 +447,9 @@ fn user_grass_shade(ctx: ShadeCtx) -> ShadeResult { var r: ShadeResult; return r
 // template (`splice_const_marker` returns the template unchanged
 // on empty input).
 
-/// Even when shaders register an `instance_at` hook, the composer
-/// emits an empty chunk — the new emit pass owns this responsibility.
+/// Even when shaders register an `instance_at` hook (with all the
+/// required companion hooks), the composer emits an empty chunk —
+/// the new emit pass owns this responsibility.
 #[test]
 fn compose_instance_at_chunk_is_empty_with_instance_at_hook() {
     let src = r#"
@@ -464,6 +465,16 @@ return a;
 }
 fn user_x_inst_to_local(world_pos: vec3<f32>, inst: Pt) -> vec3<f32> {
 return (world_pos - inst.pos) / max(inst.scale, 1e-6) + vec3<f32>(0.5);
+}
+fn user_x_inst_world_matrix(inst: Pt) -> mat4x4<f32> {
+let s = inst.scale;
+let p = inst.pos;
+return mat4x4<f32>(
+vec4<f32>(s, 0.0, 0.0, 0.0),
+vec4<f32>(0.0, s, 0.0, 0.0),
+vec4<f32>(0.0, 0.0, s, 0.0),
+vec4<f32>(p.x - 0.5 * s, p.y - 0.5 * s, p.z - 0.5 * s, 1.0),
+);
 }
 fn user_x_instance_at(
 host_pos: vec3<f32>, host: HostSample, ctx: UserCtx, k: u32,
