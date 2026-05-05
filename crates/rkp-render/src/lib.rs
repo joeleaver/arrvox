@@ -82,6 +82,11 @@ pub mod user_shader_proto_pass;
 /// that writes `RkpInstance` records into the scene's user-shader
 /// instance buffer. Replaces the band-cell descend path.
 pub mod user_shader_emit_pass;
+/// GPU tile-binning for emitted user-shader instances. Per viewport
+/// per frame: walks each instance's world AABB, projects to screen,
+/// atomically appends the instance index to per-tile lists. The
+/// march reads only the current pixel's tile list.
+pub mod user_shader_tile_bin_pass;
 /// Phase 7 — TLAS over instance AABBs for shadow rays (and future
 /// reflections / AO / GI). Session 1 ships only the wire format +
 /// buffer storage; Sessions 2-4 add the CPU builder, GPU upload,

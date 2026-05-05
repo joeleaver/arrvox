@@ -291,6 +291,13 @@ const PHASE_NORMAL: u32 = 1u;
 // `user_shader_instances`). Two `vec4<f32>` per entry: (min.xyz, _),
 // (max.xyz, _). Fast pre-cull before the matrix-inverse + descend.
 @group(2) @binding(11) var<storage, read> user_shader_instance_aabbs: array<vec4<f32>>;
+// Per-tile (8×8 pixel) bin of emitted instance indices. Built each
+// frame by `user_shader_tile_bin.wgsl`. The march reads only the
+// current pixel's tile list — per-pixel cost drops to
+// `O(N_in_my_tile)`.
+@group(2) @binding(12) var<storage, read> user_shader_tile_counts: array<u32>;
+@group(2) @binding(13) var<storage, read> user_shader_tile_lists: array<u32>;
+const USER_SHADER_MAX_INSTANCES_PER_TILE: u32 = 256u;
 
 // Phase B-redux Phase 3a — per-material `shader_params` flat array
 // (8 × f32 per material slot, indexed by `material_id * 8 + i`).
@@ -1420,22 +1427,29 @@ fn main(
     // the AABB cull. For dense grass at "hillside" scale we'll need a
     // GPU-built tile bin or TLAS; for the first cut this works at
     // ~hundreds-to-low-thousands of blades.
-    let us_count = user_shader_instance_count[0];
-    // Precompute the world-space ray inverse direction once for the
-    // cheap world-AABB pre-cull below; it doesn't depend on the
-    // instance.
+    // GPU tile-bin walk. Each pixel only iterates the emitted
+    // instances in its own 8×8-pixel tile, dropping per-pixel cost
+    // from O(N_total) to O(N_in_my_tile). Built each frame by
+    // `user_shader_tile_bin.wgsl` from each instance's world AABB
+    // projected to screen.
+    let us_pixel_tile_x = u32(coord.x) / 8u;
+    let us_pixel_tile_y = u32(coord.y) / 8u;
+    let us_pixel_tile_id = us_pixel_tile_y * march_params.tile_count_x + us_pixel_tile_x;
+    let us_tile_raw_count = user_shader_tile_counts[us_pixel_tile_id];
+    let us_tile_count = min(us_tile_raw_count, USER_SHADER_MAX_INSTANCES_PER_TILE);
+    // Precompute world-space inverse ray direction for the cheap
+    // ray-vs-world-AABB pre-cull (still useful — many tile-list
+    // entries are conservative AABB bin overlaps that pixels miss).
     let safe_world_dir = vec3<f32>(
         select(ray_dir.x, select(-1e-10, 1e-10, ray_dir.x >= 0.0), abs(ray_dir.x) < 1e-10),
         select(ray_dir.y, select(-1e-10, 1e-10, ray_dir.y >= 0.0), abs(ray_dir.y) < 1e-10),
         select(ray_dir.z, select(-1e-10, 1e-10, ray_dir.z >= 0.0), abs(ray_dir.z) < 1e-10),
     );
     let inv_world_dir = 1.0 / safe_world_dir;
-    for (var ui: u32 = 0u; ui < us_count; ui = ui + 1u) {
-        // Cheap world-AABB pre-cull. The emit pass populated this from
-        // the user shader's `inst_aabb` hook; testing in world space
-        // skips the matrix inverse for ~90% of off-ray instances. This
-        // is the difference between O(N × matrix-inverse) per pixel
-        // and O(N × ray-AABB) per pixel — typically ~5-10× speedup.
+    for (var li: u32 = 0u; li < us_tile_count; li = li + 1u) {
+        let ui = user_shader_tile_lists[
+            us_pixel_tile_id * USER_SHADER_MAX_INSTANCES_PER_TILE + li
+        ];
         let aabb_min = user_shader_instance_aabbs[ui * 2u + 0u].xyz;
         let aabb_max = user_shader_instance_aabbs[ui * 2u + 1u].xyz;
         let world_aabb_t = intersect_aabb(ray_origin, inv_world_dir, aabb_min, aabb_max);

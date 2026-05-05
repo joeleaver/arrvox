@@ -181,6 +181,28 @@ pub(super) fn encode_viewports(
                 bytemuck::cast_slice(&effective_tile_object_ids),
             )
         };
+
+        // 3h-pre. User-shader tile-bin pass. Reset per-tile counts and
+        // dispatch the binner into the same encoder so its writes are
+        // visible to the march that follows. No-op when the emit pass
+        // produced 0 instances; the march still reads the (zero-
+        // initialized) counts and skips the inner loop.
+        vr.clear_user_shader_tile_counts(&mut encoder);
+        let bin_params = rkp_render::user_shader_tile_bin_pass::BinParams {
+            instance_count_upper_bound: pre.user_shader_instance_count,
+            tile_count_x: vr.user_shader_tile_count_x,
+            tile_count_y: vr.user_shader_tile_count_y,
+            _pad0: 0,
+        };
+        vr.user_shader_tile_bin.update_params(&state.queue, &bin_params);
+        if let Some(bg) = &vr.user_shader_tile_bin_bg {
+            vr.user_shader_tile_bin.dispatch(
+                &mut encoder,
+                bg,
+                pre.user_shader_instance_count,
+            );
+        }
+
         state.renderer.render_to(
             &mut encoder,
             &state.queue,

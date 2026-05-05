@@ -362,11 +362,20 @@ pub(super) fn run_pre_frame(
     let transient_indices: Vec<u32> = Vec::new();
     let object_count = gpu_instances.len() as u32;
 
+    // Upper bound on emitted instances. The shader threshold-checks
+    // against the actual count, so over-shooting is safe (just wastes
+    // a few workgroups).
+    const MAX_EMITS_PER_LEAF: u32 = 8;
+    let user_shader_instance_count = (frame.painted_leaves.len() as u32)
+        .saturating_mul(MAX_EMITS_PER_LEAF)
+        .min(rkp_render::rkp_scene::USER_SHADER_INSTANCE_CAPACITY);
+
     PreFrameOutput {
         transient_indices,
         object_count,
         asset_count,
         scene_aabb,
         shadow_map_enabled,
+        user_shader_instance_count,
     }
 }
