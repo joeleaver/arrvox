@@ -229,17 +229,39 @@ fn user_grass_inst_to_local(world_pos: vec3<f32>, inst: Blade) -> vec3<f32> {
 
 // ── inst_aabb hook ──────────────────────────────────────────────────
 // Tight world-space bounds for the bent + rotated + width-dilated
-// blade. Iterates 8 canonical corners through the FORWARD map; the
-// convex hull of those corners encloses everything in [0, 1]³.
+// blade. Iterates 8 canonical corners of the proto's *tight* occupied
+// region (NOT the full [0, 1]³ cube) through the FORWARD map.
+//
+// Per `user_grass_proto`: the blade only occupies a thin column
+// inside the canonical cube — half_width 0.025 in X, half_thick 0.008
+// in Z, tip clipping at y ≈ 0.80 where raw_half_width drops below
+// 0.005. With the bake_curve = 0.10 leaning the tip in +X, the tight
+// canonical bounds are roughly [0.475, 0.57] × [0, 0.80] × [0.492,
+// 0.508]; rounded outward to (0.47, 0, 0.49) → (0.58, 0.81, 0.51).
+//
+// Using the full [0,1]³ cube here was the original implementation —
+// correct (the convex hull of all 8 cube corners does enclose every
+// occupied cell) but ~1000× looser in volume than the actual blade.
+// That oversized world AABB blew up the tile-bin polygon, multiplied
+// per-pixel candidate iterations, and starved the emit-scan march on
+// memory bandwidth (most rays passed the loose AABB without hitting
+// any geometry inside). Tightening here is a 5–20× win on emit-scan
+// wallclock at the typical viewing distances we paint at.
 fn user_grass_inst_aabb(inst: Blade) -> Aabb {
     let cy_yaw = cos(inst.yaw);
     let sy_yaw = sin(inst.yaw);
+    let bx_min = 0.47;
+    let bx_max = 0.58;
+    let by_min = 0.0;
+    let by_max = 0.81;
+    let bz_min = 0.49;
+    let bz_max = 0.51;
     var amin = vec3<f32>(1.0e30);
     var amax = vec3<f32>(-1.0e30);
     for (var i: u32 = 0u; i < 8u; i = i + 1u) {
-        let cx = f32((i >> 0u) & 1u);
-        let cyc = f32((i >> 1u) & 1u);
-        let cz = f32((i >> 2u) & 1u);
+        let cx  = select(bx_min, bx_max, ((i >> 0u) & 1u) != 0u);
+        let cyc = select(by_min, by_max, ((i >> 1u) & 1u) != 0u);
+        let cz  = select(bz_min, bz_max, ((i >> 2u) & 1u) != 0u);
         // Forward (canonical → world):
         //   pre_lean.x = 0.5 + width × (canonical.x - 0.5)
         //   unscaled.xz = pre_lean.xz + lean × canonical.y
