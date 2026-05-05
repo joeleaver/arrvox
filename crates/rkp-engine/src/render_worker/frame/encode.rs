@@ -387,11 +387,11 @@ pub(super) fn encode_viewports(
     EncodeOutput { pick_issued, active_pending_pick }
 }
 
-/// Format the user-shader emit-scan breakdown from a stats snapshot.
-/// See `shaders/octree_march.wesl` for the slot layout (stats[71..80]).
-/// Silent when the emit scan didn't fire this frame, so the line only
-/// shows up when there's actually a user-shader paint contributing.
+/// Format both the primary-march counters (always) and the user-shader
+/// emit-scan breakdown (only when the emit scan fired) from a stats
+/// snapshot. See `shaders/octree_march.wesl` for the full slot layout.
 fn eprint_march_stats(vp_id: crate::viewport::ViewportId, stats: &[u32]) {
+    eprint_primary_march(vp_id, stats);
     let candidates = stats.get(71).copied().unwrap_or(0);
     if candidates == 0 {
         return;
@@ -460,5 +460,62 @@ fn eprint_march_stats(vp_id: crate::viewport::ViewportId, stats: &[u32]) {
          split: outer={outer_steps} brick={brick_steps} \
          ({outer_pct:.1}% outer) | \
          per-march: miss={steps_per_miss:.1} hit={steps_per_hit:.1}",
+    );
+}
+
+/// Always-printed primary-march counters: total step count, hits, max
+/// per-pixel steps, depth histograms across the three march entry points
+/// (surface, normal, shadow), and pool-read counts. Tells us which axis
+/// the per-pixel march is bottlenecked on without needing the
+/// user-shader emit path to fire.
+fn eprint_primary_march(vp_id: crate::viewport::ViewportId, stats: &[u32]) {
+    let total_steps = stats.first().copied().unwrap_or(0);
+    let hits = stats.get(2).copied().unwrap_or(0);
+    let max_steps = stats.get(3).copied().unwrap_or(0);
+    if total_steps == 0 && hits == 0 {
+        return;
+    }
+    // Depth histograms: 12 buckets (L0..L11) per entry point.
+    let surf_hist: u32 = (4..16).map(|i| stats.get(i).copied().unwrap_or(0)).sum();
+    let norm_hist: u32 = (16..28).map(|i| stats.get(i).copied().unwrap_or(0)).sum();
+    let shdw_hist: u32 = (28..40).map(|i| stats.get(i).copied().unwrap_or(0)).sum();
+    // Mean depth per entry point (weighted by descend count at each level).
+    let mean_depth = |range: std::ops::Range<usize>| -> f32 {
+        let mut total: u64 = 0;
+        let mut weighted: u64 = 0;
+        for (level, slot) in range.enumerate() {
+            let n = stats.get(slot).copied().unwrap_or(0) as u64;
+            total = total.saturating_add(n);
+            weighted = weighted.saturating_add(n.saturating_mul(level as u64));
+        }
+        if total == 0 { 0.0 } else { weighted as f32 / total as f32 }
+    };
+    let surf_mean = mean_depth(4..16);
+    let norm_mean = mean_depth(16..28);
+    let shdw_mean = mean_depth(28..40);
+    // Hit footprint buckets — coarse pixel-LOD distribution at hit.
+    let foot_lt1 = stats.get(40).copied().unwrap_or(0);
+    let foot_1to2 = stats.get(41).copied().unwrap_or(0);
+    let foot_2to4 = stats.get(42).copied().unwrap_or(0);
+    let foot_ge4 = stats.get(43).copied().unwrap_or(0);
+    // Pool reads.
+    let leaf_attr = stats.get(44).copied().unwrap_or(0);
+    let voxel = stats.get(45).copied().unwrap_or(0);
+    let color = stats.get(46).copied().unwrap_or(0);
+    let materials = stats.get(47).copied().unwrap_or(0);
+
+    let steps_per_hit = if hits == 0 {
+        0.0
+    } else {
+        total_steps as f64 / hits as f64
+    };
+    eprintln!(
+        "[march vp={vp_id:?}] total_steps={total_steps} hits={hits} \
+         max_steps={max_steps} steps/hit={steps_per_hit:.1} | \
+         descend: surf={surf_hist} (mean L{surf_mean:.1}) \
+         norm={norm_hist} (mean L{norm_mean:.1}) \
+         shadow={shdw_hist} (mean L{shdw_mean:.1}) | \
+         footprint <1px={foot_lt1} 1-2={foot_1to2} 2-4={foot_2to4} >=4={foot_ge4} | \
+         pool reads: leaf_attr={leaf_attr} voxel={voxel} color={color} mat={materials}",
     );
 }
