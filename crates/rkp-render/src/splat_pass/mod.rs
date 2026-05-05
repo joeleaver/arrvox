@@ -12,5 +12,7 @@
 //! memory `project_splat_prototype` for findings.
 
 pub mod extract;
+pub mod pass;
 
 pub use extract::{extract_splats, SplatVertex, DISC_RADIUS_FACTOR};
+pub use pass::{SplatCamera, SplatPass, SplatPassConfig, SPLAT_CAMERA_BYTES};
