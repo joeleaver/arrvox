@@ -30,6 +30,10 @@ pub use wireframe::{WireframePass, LineVertex};
 pub mod octree_gpu;
 /// Octree-accelerated compute ray marcher — primary visibility pass.
 pub mod octree_march;
+/// Surface-splat rasterization prototype — Phase A walks the octree
+/// to produce a per-voxel vertex buffer; Phase B will dispatch oriented
+/// disc splats as an alternative primary visibility path.
+pub mod splat_pass;
 pub mod rkp_shadow_trace;
 /// Per-object GPU struct — forward world transform, octree params, no inverse_world.
 pub mod rkp_gpu_object;
