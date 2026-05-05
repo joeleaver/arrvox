@@ -252,6 +252,17 @@ pub(super) struct RenderState {
     /// data needs re-uploading.
     pub(super) last_uploaded_brush_overlay_epoch: u64,
 
+    /// `Arc` handle to the painted-leaf vec we last uploaded to the
+    /// emit pass's `leaves_buffer`. Sim ships an `Arc<Vec<EmitLeaf>>`
+    /// in every snapshot; the inner pointer only changes when sim
+    /// rebuilds (paint or geometry epoch transition). Comparing Arc
+    /// pointers (`Arc::ptr_eq`) before each frame's upload skips a
+    /// ~130 MB `queue.write_buffer` per frame on heavy-paint scenes
+    /// in steady state.
+    pub(super) last_uploaded_painted_leaves: Option<
+        std::sync::Arc<Vec<rkp_render::user_shader_emit_pass::EmitLeaf>>,
+    >,
+
     /// `view_proj` of the most recent rendered frame, per viewport.
     /// Overrides the `prev_vp` baked into incoming snapshots before
     /// camera + volumetric uploads — without this, TAA reprojection
@@ -380,6 +391,7 @@ impl RenderState {
             // snapshot with epoch > 0 triggers an upload.
             last_uploaded_geometry_epoch: 0,
             last_uploaded_brush_overlay_epoch: 0,
+            last_uploaded_painted_leaves: None,
             // Empty until the first render — the first frame's
             // override falls back to the snapshot's own view_proj
             // (i.e. prev_vp == view_proj, no motion).

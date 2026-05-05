@@ -448,11 +448,27 @@ pub(super) fn tick_emit_pass(
         &state.queue,
         &mat_to_proto,
     );
-    state.user_shader_emit_pass.upload_leaves(
-        &state.device,
-        &state.queue,
-        &frame.painted_leaves,
-    );
+    // Skip the painted-leaves upload when the sim hasn't rebuilt
+    // the vec since our last upload. `frame.painted_leaves` is
+    // `Arc<Vec<EmitLeaf>>` (`render_frame.rs`); sim swaps in a fresh
+    // `Arc::new(...)` only on paint/geometry-epoch rebuild, so
+    // `Arc::ptr_eq` against the most recent uploaded handle is a
+    // correct identity check. On a 4.6 M-leaf scene the upload was
+    // ~130 MB / ~17 ms per frame; in steady state we now skip it.
+    let leaves_unchanged = state
+        .last_uploaded_painted_leaves
+        .as_ref()
+        .map(|prev| std::sync::Arc::ptr_eq(prev, &frame.painted_leaves))
+        .unwrap_or(false);
+    if !leaves_unchanged {
+        state.user_shader_emit_pass.upload_leaves(
+            &state.device,
+            &state.queue,
+            &frame.painted_leaves,
+        );
+        state.last_uploaded_painted_leaves =
+            Some(std::sync::Arc::clone(&frame.painted_leaves));
+    }
 
     let leaf_count = frame.painted_leaves.len() as u32;
     let instance_capacity = rkp_render::rkp_scene::USER_SHADER_INSTANCE_CAPACITY;
