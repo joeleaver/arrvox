@@ -453,13 +453,19 @@ pub(super) fn tick_emit_pass(
 
     let leaf_count = frame.painted_leaves.len() as u32;
     let instance_capacity = rkp_render::rkp_scene::USER_SHADER_INSTANCE_CAPACITY;
+    // Mirror the dispatch's X/Y split logic so the shader can rebuild
+    // the linear leaf index. workgroup_size is 64 in X, so each X-stripe
+    // covers `dispatch_x * 64` leaves. Must match `UserShaderEmitPass::dispatch`.
+    const MAX_DIM: u32 = 65535;
+    let dispatch_workgroups = leaf_count.div_ceil(64);
+    let dispatch_x = dispatch_workgroups.min(MAX_DIM);
     state.user_shader_emit_pass.update_params(
         &state.queue,
         &EmitParams {
             leaf_count,
             instance_capacity,
             time: frame.shade_params_base.time,
-            _pad0: 0,
+            dispatch_x_threads: dispatch_x * 64,
         },
     );
 

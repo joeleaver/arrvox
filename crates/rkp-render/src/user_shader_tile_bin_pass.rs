@@ -37,7 +37,10 @@ pub struct BinParams {
     pub instance_count_upper_bound: u32,
     pub tile_count_x: u32,
     pub tile_count_y: u32,
-    pub _pad0: u32,
+    /// Threads per Y-stripe for the 2D-split dispatch — see
+    /// `UserShaderEmitPass` for the same pattern. Lets us spread
+    /// `instance_count > 65535 * 64` across X+Y dispatch dims.
+    pub dispatch_x_threads: u32,
 }
 
 pub struct UserShaderTileBinPass {
@@ -133,8 +136,26 @@ impl UserShaderTileBinPass {
         });
         cpass.set_pipeline(&self.pipeline);
         cpass.set_bind_group(0, bind_group, &[]);
+        // Same X+Y split logic as `UserShaderEmitPass::dispatch`. The
+        // shader rebuilds inst_idx as `gid.y * dispatch_x_threads + gid.x`,
+        // where dispatch_x_threads is written into BinParams by the
+        // caller (must match `dispatch_x` here).
+        const MAX_DIM: u32 = 65535;
         let workgroups = instance_count.div_ceil(64);
-        cpass.dispatch_workgroups(workgroups, 1, 1);
+        let x = workgroups.min(MAX_DIM);
+        let y = workgroups.div_ceil(x);
+        cpass.dispatch_workgroups(x, y, 1);
+    }
+
+    /// Compute the `dispatch_x_threads` value the shader needs, given
+    /// the same `instance_count_upper_bound` the caller will pass to
+    /// [`Self::dispatch`]. Caller writes this into [`BinParams`] before
+    /// `update_params`.
+    pub fn dispatch_x_threads_for(instance_count_upper_bound: u32) -> u32 {
+        const MAX_DIM: u32 = 65535;
+        let workgroups = instance_count_upper_bound.div_ceil(64);
+        let x = workgroups.min(MAX_DIM);
+        x * 64
     }
 }
 

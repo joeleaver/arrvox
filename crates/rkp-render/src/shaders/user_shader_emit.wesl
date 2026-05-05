@@ -49,7 +49,11 @@ struct EmitParams {
     leaf_count: u32,
     instance_capacity: u32,
     time: f32,
-    _pad0: u32,
+    // Number of threads dispatched per Y-stripe = `dispatch_x * 64`.
+    // Used to rebuild the linear leaf index when the dispatch is split
+    // across X+Y to dodge wgpu's 65535 per-dim workgroup-count limit:
+    // `leaf_idx = gid.y * dispatch_x_threads + gid.x`.
+    dispatch_x_threads: u32,
 }
 
 @group(0) @binding(0) var<storage, read> leaves: array<EmitLeaf>;
@@ -96,7 +100,7 @@ const USER_EMIT_DISPATCH_END: u32 = 0u;
 
 @compute @workgroup_size(64, 1, 1)
 fn emit_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let leaf_idx = gid.x;
+    let leaf_idx = gid.y * emit_params.dispatch_x_threads + gid.x;
     if leaf_idx >= emit_params.leaf_count { return; }
     let leaf = leaves[leaf_idx];
 

@@ -22,7 +22,11 @@ struct BinParams {
     instance_count_upper_bound: u32,
     tile_count_x: u32,
     tile_count_y: u32,
-    _pad0: u32,
+    // Threads per Y-stripe — `dispatch_x * 64`. The CPU side writes
+    // this so the shader can rebuild the linear instance index when
+    // the dispatch is split across X+Y to dodge wgpu's 65535 per-dim
+    // workgroup-count limit.
+    dispatch_x_threads: u32,
 }
 
 @group(0) @binding(0) var<storage, read> instance_aabbs: array<vec4<f32>>;
@@ -38,7 +42,7 @@ struct BinParams {
 
 @compute @workgroup_size(64, 1, 1)
 fn bin_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let inst_idx = gid.x;
+    let inst_idx = gid.y * bin_params.dispatch_x_threads + gid.x;
     if inst_idx >= bin_params.instance_count_upper_bound { return; }
     if inst_idx >= instance_count[0] { return; }
 

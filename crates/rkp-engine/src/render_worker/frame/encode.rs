@@ -206,7 +206,10 @@ pub(super) fn encode_viewports(
             instance_count_upper_bound: pre.user_shader_instance_count,
             tile_count_x: vr.user_shader_tile_count_x,
             tile_count_y: vr.user_shader_tile_count_y,
-            _pad0: 0,
+            dispatch_x_threads:
+                rkp_render::user_shader_tile_bin_pass::UserShaderTileBinPass::dispatch_x_threads_for(
+                    pre.user_shader_instance_count,
+                ),
         };
         vr.user_shader_tile_bin.update_params(&state.queue, &bin_params);
         if let Some(bg) = &vr.user_shader_tile_bin_bg {

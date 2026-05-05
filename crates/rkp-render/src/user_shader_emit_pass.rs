@@ -64,7 +64,12 @@ pub struct EmitParams {
     pub leaf_count: u32,
     pub instance_capacity: u32,
     pub time: f32,
-    pub _pad0: u32,
+    /// Number of threads dispatched per Y-stripe = `dispatch_x_workgroups
+    /// * 64`. The shader rebuilds the linear leaf index as
+    /// `gid.y * dispatch_x_threads + gid.x` so we can spread leaf_count
+    /// > 65535 * 64 across both X and Y dispatch dimensions (wgpu's
+    /// per-dim limit is 65535).
+    pub dispatch_x_threads: u32,
 }
 
 /// Compute pass that consumes painted-leaf records and emits
@@ -348,8 +353,18 @@ impl UserShaderEmitPass {
         });
         cpass.set_pipeline(&self.pipeline);
         cpass.set_bind_group(0, bg, &[]);
+        // Split across X+Y when leaf_count overflows the wgpu per-dim
+        // limit (65535 workgroups). At workgroup_size(64) and a 20×20m
+        // grass coat producing several million painted leaves, single-
+        // dim dispatch trips validation. The shader reconstructs the
+        // linear leaf index from `gid.y * dispatch_x_threads + gid.x`
+        // — `dispatch_x_threads` is written to the uniform alongside
+        // `leaf_count` in `update_params` for that purpose.
+        const MAX_DIM: u32 = 65535;
         let workgroups = leaf_count.div_ceil(64);
-        cpass.dispatch_workgroups(workgroups, 1, 1);
+        let x = workgroups.min(MAX_DIM);
+        let y = workgroups.div_ceil(x);
+        cpass.dispatch_workgroups(x, y, 1);
     }
 
     pub fn bind_group_layout(&self) -> &wgpu::BindGroupLayout {
