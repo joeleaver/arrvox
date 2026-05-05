@@ -249,7 +249,11 @@ pub(crate) struct EngineState {
     /// whose material has an `instance_at` hook. World-space pos +
     /// normal, ready to ship to the GPU emit dispatch each frame.
     /// Rebuilt whenever `painted_materials` is rebuilt.
-    pub(crate) painted_leaves: Vec<rkp_render::user_shader_emit_pass::EmitLeaf>,
+    /// Wrapped in `Arc` so each per-frame snapshot can ship a
+    /// reference-counted handle instead of memcpy'ing the whole vec.
+    /// At paint scale (millions of leaves) the clone-per-frame was
+    /// the dominant CPU cost in the snapshot build.
+    pub(crate) painted_leaves: std::sync::Arc<Vec<rkp_render::user_shader_emit_pass::EmitLeaf>>,
     /// Epochs the cache was last reconciled against. When either
     /// moves ahead, we invalidate and re-scan affected entities.
     pub(crate) painted_materials_paint_epoch: u64,

@@ -157,7 +157,14 @@ impl EngineState {
             {
                 use crate::components::{Renderable, Transform};
                 self.painted_materials.clear();
-                self.painted_leaves.clear();
+                // Build a fresh local Vec for this rebuild and atomically
+                // swap into the Arc at the end. The previous Arc may
+                // still be held by the most recent in-flight snapshot;
+                // letting that reference live on its own avoids a
+                // make_mut copy-on-write for the older view.
+                let mut new_painted_leaves: Vec<
+                    rkp_render::user_shader_emit_pass::EmitLeaf,
+                > = Vec::new();
                 let sm = self.scene_mgr.lock().expect("scene_mgr poisoned");
                 let octree_data = sm.octree.data();
                 let brick_pool_data = sm.brick_pool.as_slice();
@@ -203,13 +210,14 @@ impl EngineState {
                         entity_world,
                         object_id,
                         &mut mat_tiles,
-                        &mut self.painted_leaves,
+                        &mut new_painted_leaves,
                     );
                     if !mat_tiles.is_empty() {
                         self.painted_materials.insert(object_id, mat_tiles);
                     }
                 }
                 drop(sm);
+                self.painted_leaves = std::sync::Arc::new(new_painted_leaves);
                 self.painted_materials_paint_epoch = cur_paint;
                 self.painted_materials_geometry_epoch = cur_geom;
             }
@@ -833,7 +841,7 @@ impl EngineState {
             user_shader_proto_chunk,
             user_shader_infos,
             user_shader_entries,
-            painted_leaves: self.painted_leaves.clone(),
+            painted_leaves: std::sync::Arc::clone(&self.painted_leaves),
             user_shader_emit_chunk,
             lights: gpu_lights,
             shade_params_base: self.shade_params_base,
@@ -852,9 +860,9 @@ impl EngineState {
         let t_encode = frame_start.elapsed();
         let snap_t_frame = snap_phase_start.elapsed();
         if snap_profile {
-            // Per-phase ms — each value is a delta within the
-            // snapshot build, sums to `total`. Useful when
-            // `snapshot_ms` blows up to attribute the cost.
+            // Per-phase ms — each value is the cumulative time from
+            // t_cpu_setup to that phase's end, so deltas read left
+            // to right.
             let to_ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
             eprintln!(
                 "[snap] geom={:.2} bone={:.2} vrs={:.2} pick={:.2} frame={:.2} | total={:.2}",

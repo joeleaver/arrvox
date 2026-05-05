@@ -152,7 +152,12 @@ pub struct RenderFrame {
     /// shader's `instance_at` for k = 0..MAX_EMITS_PER_LEAF, and
     /// writes one `RkpInstance` per accepted instance into
     /// `RkpScene::user_shader_instance_buffer`.
-    pub painted_leaves: Vec<rkp_render::user_shader_emit_pass::EmitLeaf>,
+    /// Wrapped in `Arc` so the per-frame snapshot handoff is a refcount
+    /// bump rather than a 100+ MB memcpy when paint covers a million-
+    /// plus host leaves. Sim rebuilds the inner `Vec` only on paint or
+    /// geometry epoch change; in steady state the same `Arc` is shared
+    /// across frames.
+    pub painted_leaves: std::sync::Arc<Vec<rkp_render::user_shader_emit_pass::EmitLeaf>>,
 
     /// Composed `emit` chunk — per-shader `instance_at` +
     /// `inst_world_matrix` bodies + dispatch switch, spliced into
