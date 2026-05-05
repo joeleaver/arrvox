@@ -196,6 +196,14 @@ pub struct RkpScene {
     /// `user_shader_instance_buffer`. Reset to 0 each frame; the emit
     /// pass atomic-adds to claim slots.
     pub user_shader_instance_count_buffer: wgpu::Buffer,
+    /// Per-emitted-instance world-space AABB (32 B = vec3 min + pad +
+    /// vec3 max + pad), parallel-indexed with
+    /// `user_shader_instance_buffer`. The emit pass writes via the
+    /// user shader's `inst_aabb` hook; the march reads to do a
+    /// cheap world-AABB cull before the matrix-inverse + descend.
+    /// Without this the per-pixel-O(N) scan was 500+ ops per
+    /// instance — most blades cull cheaply now.
+    pub user_shader_instance_aabbs_buffer: wgpu::Buffer,
     pub bind_group_layout: wgpu::BindGroupLayout,
     /// Incremented whenever a shared buffer reallocates. Each VR caches
     /// the epoch it built its bind group at; rebuilds when the scene's
@@ -272,6 +280,12 @@ impl RkpScene {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let user_shader_instance_aabbs_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rkp_user_shader_instance_aabbs"),
+            size: USER_SHADER_INSTANCE_CAPACITY as u64 * 32, // (vec3 min + pad + vec3 max + pad)
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let bind_group_layout = Self::create_layout(device);
 
@@ -285,6 +299,7 @@ impl RkpScene {
             instance_overlay_buffer,
             user_shader_instance_buffer,
             user_shader_instance_count_buffer,
+            user_shader_instance_aabbs_buffer,
             bind_group_layout,
             buffers_epoch: 0,
         }

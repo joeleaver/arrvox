@@ -57,6 +57,12 @@ struct EmitParams {
 @group(0) @binding(3) var<storage, read> shader_params: array<f32>;
 @group(0) @binding(4) var<storage, read> mat_to_proto: array<MatToProto>;
 @group(0) @binding(5) var<uniform> emit_params: EmitParams;
+// Parallel-indexed with `instances`. Each entry is the world-space
+// AABB returned by the user shader's `inst_aabb` hook; the march
+// reads it for a cheap ray-vs-world-AABB cull before the matrix
+// inverse + proto descent. Stored as two vec4<f32> (min.xyz + pad,
+// max.xyz + pad) for std430 alignment cleanliness.
+@group(0) @binding(6) var<storage, read_write> instance_aabbs: array<vec4<f32>>;
 
 // Hard cap on the per-leaf k-loop. Per-shader `@max_emits_per_thread`
 // directives may declare lower caps via early-return from
@@ -76,6 +82,7 @@ fn dispatch_user_emit(
     ctx: UserCtx,
     k: u32,
     out_world_matrix: ptr<function, mat4x4<f32>>,
+    out_aabb: ptr<function, Aabb>,
 ) -> bool {
     return false;
 }
@@ -116,7 +123,8 @@ fn emit_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     for (var k: u32 = 0u; k < MAX_EMITS_PER_LEAF; k = k + 1u) {
         var world_matrix: mat4x4<f32>;
-        if !dispatch_user_emit(shader_id, leaf.world_pos, host, ctx, k, &world_matrix) {
+        var aabb: Aabb;
+        if !dispatch_user_emit(shader_id, leaf.world_pos, host, ctx, k, &world_matrix, &aabb) {
             break;
         }
         let slot = atomicAdd(&instance_count, 1u);
@@ -126,6 +134,11 @@ fn emit_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             atomicSub(&instance_count, 1u);
             return;
         }
+        // Store the world AABB parallel-indexed with the instance.
+        // Two vec4f slots per entry — march reads back as
+        // `(min, _, max, _)`.
+        instance_aabbs[slot * 2u + 0u] = vec4<f32>(aabb.min, 0.0);
+        instance_aabbs[slot * 2u + 1u] = vec4<f32>(aabb.max, 0.0);
         // Build the RkpInstance record. Field order + offsets mirror
         // `RkpGpuInstance` exactly; the host march reads this through
         // its standard `instances` binding.

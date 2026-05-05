@@ -388,6 +388,7 @@ fn compose_emit_chunk(reg: &UserShaderRegistry) -> String {
          \x20   ctx: UserCtx,\n\
          \x20   k: u32,\n\
          \x20   out_world_matrix: ptr<function, mat4x4<f32>>,\n\
+         \x20   out_aabb: ptr<function, Aabb>,\n\
          ) -> bool {\n\
          \x20   switch shader_id {\n",
     );
@@ -405,6 +406,7 @@ fn compose_emit_chunk(reg: &UserShaderRegistry) -> String {
              \x20               return false;\n\
              \x20           }}\n\
              \x20           *out_world_matrix = rkp_user_{id}_inst_world_matrix(inst);\n\
+             \x20           *out_aabb = rkp_user_{id}_inst_aabb(inst);\n\
              \x20           return true;\n\
              \x20       }}\n",
             id = entry.id,

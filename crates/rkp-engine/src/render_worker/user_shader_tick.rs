@@ -374,6 +374,7 @@ pub(super) fn tick_emit_pass(
         &state.device,
         &state.renderer.scene.user_shader_instance_buffer,
         &state.renderer.scene.user_shader_instance_count_buffer,
+        &state.renderer.scene.user_shader_instance_aabbs_buffer,
         state
             .viewport_renderers
             .values()

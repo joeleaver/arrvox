@@ -144,6 +144,7 @@ impl ViewportRenderer {
             device,
             &renderer.scene.user_shader_instance_buffer,
             &renderer.scene.user_shader_instance_count_buffer,
+            &renderer.scene.user_shader_instance_aabbs_buffer,
         );
         march.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view, &gbuffer.glass_view, &gbuffer.leaf_slot_view);
         // shader_params binding deferred — `shade` owns the buffer
@@ -305,6 +306,7 @@ impl ViewportRenderer {
                 device,
                 &renderer.scene.user_shader_instance_buffer,
                 &renderer.scene.user_shader_instance_count_buffer,
+                &renderer.scene.user_shader_instance_aabbs_buffer,
             );
         }
         let lm_now = renderer.lights_materials_epoch();
