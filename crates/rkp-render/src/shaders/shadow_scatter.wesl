@@ -86,7 +86,9 @@ struct MarchParamsLite {
     shadow_map_enabled: u32,
     time: f32,
     asset_count: u32,
-    _pad0: u32,
+    // Trailing slot — `uss_disable` in the primary MarchParams; unused
+    // here, declared for layout parity with the shared uniform buffer.
+    uss_disable: u32,
 }
 
 

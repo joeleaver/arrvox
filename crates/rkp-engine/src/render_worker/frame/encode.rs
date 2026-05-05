@@ -370,27 +370,35 @@ pub(super) fn encode_viewports(
     EncodeOutput { pick_issued, active_pending_pick }
 }
 
-/// Format the user-shader descend breakdown from a stats snapshot.
-/// See `shaders/octree_march.wgsl` for the slot layout. Only meaningful
-/// when there are non-zero band-cell or Phase-3a invocations; otherwise
-/// the band-cell descent path didn't fire this frame and the line is
-/// dominated by zeros.
+/// Format the user-shader emit-scan breakdown from a stats snapshot.
+/// See `shaders/octree_march.wesl` for the slot layout (stats[71..76]).
+/// Silent when the emit scan didn't fire this frame, so the line only
+/// shows up when there's actually a user-shader paint contributing.
 fn eprint_march_stats(vp_id: crate::viewport::ViewportId, stats: &[u32]) {
-    let band_invoke = stats.get(60).copied().unwrap_or(0);
-    let band_hit = stats.get(61).copied().unwrap_or(0);
-    let p3a_invoke = stats.get(64).copied().unwrap_or(0);
-    let p3a_hit = stats.get(65).copied().unwrap_or(0);
-    if band_invoke == 0 && p3a_invoke == 0 {
+    let candidates = stats.get(71).copied().unwrap_or(0);
+    if candidates == 0 {
         return;
     }
-    let k_test = stats.get(66).copied().unwrap_or(0);
-    let aabb_rej = stats.get(67).copied().unwrap_or(0);
-    let descended = stats.get(68).copied().unwrap_or(0);
-    let miss = stats.get(69).copied().unwrap_or(0);
-    let hit = stats.get(70).copied().unwrap_or(0);
+    let aabb_pass = stats.get(72).copied().unwrap_or(0);
+    let marches = stats.get(73).copied().unwrap_or(0);
+    let descent_steps = stats.get(74).copied().unwrap_or(0);
+    let hits = stats.get(75).copied().unwrap_or(0);
+    let total_steps = stats.first().copied().unwrap_or(0);
+    let host_steps = total_steps.saturating_sub(descent_steps);
+    let cull_pct = if candidates == 0 {
+        0.0
+    } else {
+        100.0 * (1.0 - (aabb_pass as f64 / candidates as f64))
+    };
+    let emit_step_pct = if total_steps == 0 {
+        0.0
+    } else {
+        100.0 * descent_steps as f64 / total_steps as f64
+    };
     eprintln!(
-        "[march_stats vp={vp_id:?}] dispatch: band={band_invoke}/hits={band_hit} \
-         phase3a={p3a_invoke}/hits={p3a_hit} | candidates: k_test={k_test} \
-         aabb_rej={aabb_rej} descended={descended} miss={miss} hit={hit}",
+        "[emit_scan vp={vp_id:?}] candidates={candidates} \
+         aabb_pass={aabb_pass} ({cull_pct:.1}% culled) marches={marches} \
+         hits={hits} | steps: emit={descent_steps} host={host_steps} \
+         (emit={emit_step_pct:.1}% of total)",
     );
 }

@@ -69,10 +69,11 @@ pub struct MarchParams {
     /// `shader_id`, mapping shader_id → proto octree at march time.
     /// Engine sets to combined_assets.len() each frame.
     pub asset_count: u32,
-    /// Trailing pad to round the struct size up to the next 16-byte
-    /// multiple (uniform-storage layout requirement). 11 u32s × 4 =
-    /// 44 → pad to 48. Named so any future additions slot in cleanly.
-    pub _pad0: u32,
+    /// Instrumentation toggle: when `1`, the march skips its scan over
+    /// `user_shader_instances[]` (the emit-pass output). Lets us A/B
+    /// the per-frame cost of the user-shader path against an otherwise
+    /// identical scene. CPU side reads `RKP_USS_DISABLE=1`.
+    pub uss_disable: u32,
 }
 
 /// The octree ray march compute pass.
@@ -837,7 +838,7 @@ impl OctreeMarchPass {
             shadow_map_enabled: u32::from(shadow_map_enabled),
             time,
             asset_count,
-            _pad0: 0,
+            uss_disable: u32::from(std::env::var("RKP_USS_DISABLE").is_ok()),
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
 

@@ -265,7 +265,9 @@ struct MarchParams {
     shadow_map_enabled: u32,
     time: f32,
     asset_count: u32,
-    _pad0: u32,
+    // Instrumentation: 1 ⇒ skip the user-shader emit-instance scan in
+    // `octree_march::main`. CPU mirrors `MarchParams::uss_disable`.
+    uss_disable: u32,
 }
 
 // Shading-pass parameters (144 bytes). CPU mirror is
