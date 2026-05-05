@@ -752,34 +752,21 @@ fn march_object_skinned(
     return result;
 }
 
-// Phase B-redux — generic prototype-octree descent used by user-
-// shader instance derivation. Walks an asset's octree+brick pool in
-// proto-local oc-space (caller has already mapped the world ray
-// through the user's `inst_to_local`), returns the first opaque hit
-// or "no hit" if the ray exits without hitting one.
+// Affine descent body — caller has already pre-transformed the ray
+// into the instance's local space. Both call sites (the host scan and
+// the user-shader emit scan) carry inv_world for their own AABB / cull
+// work, so re-inverting `inst.world` here would be redundant.
 //
-// Differs from `march_object` in three ways:
-//   1. No glass / opacity tracking — proto bakes are V1-opaque only.
-//   2. No transparency / alpha accumulation — first non-empty cell
-//      wins.
-//   3. No skinned path / no overlay reads — proto octrees are
-//      paint-overlay-immune (the host material is inherited
-//      separately at the call site).
+// `local_origin` = inv_world * world_origin (point)
+// `local_dir_unnorm` = inv_world * world_dir (vector). Length encodes
+//                      1/S (uniform-scale Jacobian) — used for oc→world.
 //
-// `local_to_world` and `focal_px_y` flow through to `octree_lookup`'s
-// LOD machinery so the descent terminates at sub-pixel cell sizes
-// the same way `march_object` does for host objects.
-
-
-fn march_object(
-    world_origin: vec3<f32>, world_dir: vec3<f32>,
+// Skinned objects are NOT routed here; the caller dispatches to
+// `march_object_skinned` based on `inst.is_skinned`.
+fn march_object_inner(
+    local_origin: vec3<f32>, local_dir_unnorm: vec3<f32>,
     inst: RkpInstance, asset: RkpAsset,
 ) -> MarchResult {
-    // Phase-3b: skinned objects inverse-skin at march time. Unskinned
-    // objects fall through to the existing rest-octree DDA.
-    if inst.is_skinned != 0u && asset.bone_count > 0u && inst.bone_field_dim_x > 0u {
-        return march_object_skinned(world_origin, world_dir, inst, asset);
-    }
     var result = MarchResult(
         vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0),
         0.0, 0.0, 0u, false, 0u,
@@ -787,10 +774,6 @@ fn march_object(
         0u, // glass_slot
     );
 
-    // Standard host-asset path — affine inv_world × world.
-    let inv_world = mat4_affine_inverse(inst.world);
-    let local_origin = (inv_world * vec4<f32>(world_origin, 1.0)).xyz;
-    let local_dir_unnorm = (inv_world * vec4<f32>(world_dir, 0.0)).xyz;
     let local_dir = normalize(local_dir_unnorm);
     // Conversion from oc-space (where `t` marches) to world units.
     // `length(local_dir_unnorm) = 1/S` for uniform scale S in the
@@ -1292,9 +1275,7 @@ fn main(
 
         // AABB check: compute world-space entry distance, skip if
         // behind closest hit. The asset's canonical AABB is `[0..extent]`
-        // in local space; back-transform via inv_world. Same path for
-        // host objects and emitted user-shader instance prototypes —
-        // both run through march_object → descend_proto_octree.
+        // in local space; back-transform via inv_world.
         let inv_world = mat4_affine_inverse(inst.world);
         let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
         let local_dir_unnorm = (inv_world * vec4<f32>(ray_dir, 0.0)).xyz;
@@ -1312,10 +1293,15 @@ fn main(
         let world_entry = aabb_t_range.x * local_to_world_scale;
         if world_entry > max_world_dist { continue; } // AABB entirely behind closest hit
 
-        // March this object.
-        let r = march_object(
-            ray_origin, ray_dir, inst, asset,
-        );
+        // March this object. Skinned objects route through the inverse-
+        // skin path on the world ray; affine objects reuse the locals
+        // we already computed above for the AABB cull.
+        var r: MarchResult;
+        if inst.is_skinned != 0u && asset.bone_count > 0u && inst.bone_field_dim_x > 0u {
+            r = march_object_skinned(ray_origin, ray_dir, inst, asset);
+        } else {
+            r = march_object_inner(local_origin, local_dir_unnorm, inst, asset);
+        }
         total_steps += r.steps;
 
         // Pull glass info out of this object's march, if any. Glass
@@ -1466,9 +1452,14 @@ fn main(
         if asset.geom_type == 0u { continue; }
         if !rkp_object_visible(inst) { continue; }
 
-        // `march_object` computes its own inv_world internally — don't
-        // duplicate the ~30-op matrix inverse + ray transform here.
-        let r = march_object(ray_origin, ray_dir, inst, asset);
+        // Use the precomputed inv_world from the emit pass instead of
+        // re-inverting inst.world per pixel. Emit instances are never
+        // skinned (the proto-bake path doesn't support skinning), so we
+        // skip the skinned dispatch entirely and call the affine body.
+        let inv_world = user_shader_instance_inv_world[ui];
+        let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
+        let local_dir_unnorm = (inv_world * vec4<f32>(ray_dir, 0.0)).xyz;
+        let r = march_object_inner(local_origin, local_dir_unnorm, inst, asset);
         total_steps += r.steps;
         if !r.valid { continue; }
 
