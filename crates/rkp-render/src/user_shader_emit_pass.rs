@@ -107,6 +107,7 @@ impl UserShaderEmitPass {
                 bgl_storage_ro(4),  // mat_to_proto
                 bgl_uniform(5),     // emit_params
                 bgl_storage_rw(6),  // instance_aabbs (parallel to instances)
+                bgl_storage_rw(7),  // instance_inv_world (parallel)
             ],
         });
 
@@ -305,6 +306,7 @@ impl UserShaderEmitPass {
         instance_buffer: &wgpu::Buffer,
         instance_count_buffer: &wgpu::Buffer,
         instance_aabbs_buffer: &wgpu::Buffer,
+        instance_inv_world_buffer: &wgpu::Buffer,
         shader_params_buffer: &wgpu::Buffer,
         inputs_epoch: u64,
     ) {
@@ -322,6 +324,7 @@ impl UserShaderEmitPass {
                 wgpu::BindGroupEntry { binding: 4, resource: self.mat_to_proto_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: self.params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: instance_aabbs_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: instance_inv_world_buffer.as_entire_binding() },
             ],
         }));
         self.bind_group_inputs_epoch = inputs_epoch;

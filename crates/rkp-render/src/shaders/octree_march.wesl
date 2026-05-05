@@ -297,6 +297,11 @@ const PHASE_NORMAL: u32 = 1u;
 // `O(N_in_my_tile)`.
 @group(2) @binding(12) var<storage, read> user_shader_tile_counts: array<u32>;
 @group(2) @binding(13) var<storage, read> user_shader_tile_lists: array<u32>;
+// Per-emitted-instance precomputed inv_world (mat4x4<f32>, 64 B
+// each). The emit pass computes once per blade so the per-pixel
+// march doesn't redo the affine inverse — saves ~30 ops per
+// (instance × pixel).
+@group(2) @binding(14) var<storage, read> user_shader_instance_inv_world: array<mat4x4<f32>>;
 const USER_SHADER_MAX_INSTANCES_PER_TILE: u32 = 256u;
 
 // Phase B-redux Phase 3a — per-material `shader_params` flat array
@@ -1461,11 +1466,8 @@ fn main(
         if asset.geom_type == 0u { continue; }
         if !rkp_object_visible(inst) { continue; }
 
-        let inv_world = mat4_affine_inverse(inst.world);
-        let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
-        let local_dir_unnorm = (inv_world * vec4<f32>(ray_dir, 0.0)).xyz;
-        let local_to_world_scale = 1.0 / max(length(local_dir_unnorm), 1e-10);
-
+        // `march_object` computes its own inv_world internally — don't
+        // duplicate the ~30-op matrix inverse + ray transform here.
         let r = march_object(ray_origin, ray_dir, inst, asset);
         total_steps += r.steps;
         if !r.valid { continue; }

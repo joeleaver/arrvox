@@ -204,6 +204,14 @@ pub struct RkpScene {
     /// Without this the per-pixel-O(N) scan was 500+ ops per
     /// instance — most blades cull cheaply now.
     pub user_shader_instance_aabbs_buffer: wgpu::Buffer,
+    /// Per-emitted-instance inverse-world matrix (64 B), parallel-
+    /// indexed with `user_shader_instance_buffer`. Computed once in
+    /// the emit pass so the per-pixel march doesn't redo the
+    /// `mat4_affine_inverse` per (instance × pixel). At ~60
+    /// instances/tile × thousands of pixels per painted region the
+    /// matrix inverse alone was costing tens of ms; precomputing
+    /// once per frame collapses that to a single 64-byte read.
+    pub user_shader_instance_inv_world_buffer: wgpu::Buffer,
     pub bind_group_layout: wgpu::BindGroupLayout,
     /// Incremented whenever a shared buffer reallocates. Each VR caches
     /// the epoch it built its bind group at; rebuilds when the scene's
@@ -286,6 +294,12 @@ impl RkpScene {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let user_shader_instance_inv_world_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rkp_user_shader_instance_inv_world"),
+            size: USER_SHADER_INSTANCE_CAPACITY as u64 * 64, // mat4x4<f32>
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let bind_group_layout = Self::create_layout(device);
 
@@ -300,6 +314,7 @@ impl RkpScene {
             user_shader_instance_buffer,
             user_shader_instance_count_buffer,
             user_shader_instance_aabbs_buffer,
+            user_shader_instance_inv_world_buffer,
             bind_group_layout,
             buffers_epoch: 0,
         }

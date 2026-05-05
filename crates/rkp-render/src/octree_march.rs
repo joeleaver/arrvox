@@ -115,6 +115,7 @@ pub struct OctreeMarchPass {
     user_shader_instances_buffer: Option<wgpu::Buffer>,
     user_shader_instance_count_buffer: Option<wgpu::Buffer>,
     user_shader_instance_aabbs_buffer: Option<wgpu::Buffer>,
+    user_shader_instance_inv_world_buffer: Option<wgpu::Buffer>,
     user_shader_tile_counts_buffer: Option<wgpu::Buffer>,
     user_shader_tile_lists_buffer: Option<wgpu::Buffer>,
     /// Phase 7 Session 4b — TLAS node + leaf buffers, shared with
@@ -297,6 +298,18 @@ impl OctreeMarchPass {
                         },
                         count: None,
                     },
+                    // Binding 14: per-emitted-instance precomputed
+                    // inv_world. Replaces the in-shader matrix inverse.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 14,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                     // Binding 8: TLAS nodes (Phase 7 Session 4b).
                     // Read by shadow trace; march doesn't use it
                     // (naga DCE drops the binding from march SPIR-V).
@@ -414,6 +427,7 @@ impl OctreeMarchPass {
             user_shader_instances_buffer: None,
             user_shader_instance_count_buffer: None,
             user_shader_instance_aabbs_buffer: None,
+            user_shader_instance_inv_world_buffer: None,
             user_shader_tile_counts_buffer: None,
             user_shader_tile_lists_buffer: None,
             tlas_nodes_buffer: None,
@@ -507,10 +521,12 @@ impl OctreeMarchPass {
         instances_buffer: &wgpu::Buffer,
         count_buffer: &wgpu::Buffer,
         aabbs_buffer: &wgpu::Buffer,
+        inv_world_buffer: &wgpu::Buffer,
     ) {
         self.user_shader_instances_buffer = Some(instances_buffer.clone());
         self.user_shader_instance_count_buffer = Some(count_buffer.clone());
         self.user_shader_instance_aabbs_buffer = Some(aabbs_buffer.clone());
+        self.user_shader_instance_inv_world_buffer = Some(inv_world_buffer.clone());
         self.try_rebuild_params_bind_group(device);
     }
 
@@ -539,6 +555,7 @@ impl OctreeMarchPass {
             Some(us_instances),
             Some(us_count),
             Some(us_aabbs),
+            Some(us_inv_world),
             Some(us_tile_counts),
             Some(us_tile_lists),
         ) = (
@@ -550,6 +567,7 @@ impl OctreeMarchPass {
             &self.user_shader_instances_buffer,
             &self.user_shader_instance_count_buffer,
             &self.user_shader_instance_aabbs_buffer,
+            &self.user_shader_instance_inv_world_buffer,
             &self.user_shader_tile_counts_buffer,
             &self.user_shader_tile_lists_buffer,
         ) else { return };
@@ -600,6 +618,10 @@ impl OctreeMarchPass {
                 wgpu::BindGroupEntry {
                     binding: 13,
                     resource: us_tile_lists.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: us_inv_world.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,

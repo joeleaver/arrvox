@@ -23,6 +23,7 @@ import package::lib::types::HostSample;
 import package::lib::types::UserCtx;
 import package::lib::types::Aabb;
 import package::lib::oct_normal::unpack_oct_normal;
+import package::lib::math::mat4_affine_inverse;
 
 // Per-painted-leaf record. CPU packs one of these per leaf cell whose
 // material has a shader-bearing `instance_at` hook. Layout mirrors
@@ -63,6 +64,11 @@ struct EmitParams {
 // inverse + proto descent. Stored as two vec4<f32> (min.xyz + pad,
 // max.xyz + pad) for std430 alignment cleanliness.
 @group(0) @binding(6) var<storage, read_write> instance_aabbs: array<vec4<f32>>;
+// Parallel-indexed inv_world matrices (mat4x4<f32>, 64 B each). The
+// emit pass computes the affine inverse once per blade so the
+// per-pixel march can skip the in-shader matrix inverse — saves ~30
+// ops × instances × pixels in the painted region.
+@group(0) @binding(7) var<storage, read_write> instance_inv_world: array<mat4x4<f32>>;
 
 // Hard cap on the per-leaf k-loop. Per-shader `@max_emits_per_thread`
 // directives may declare lower caps via early-return from
@@ -139,6 +145,10 @@ fn emit_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // `(min, _, max, _)`.
         instance_aabbs[slot * 2u + 0u] = vec4<f32>(aabb.min, 0.0);
         instance_aabbs[slot * 2u + 1u] = vec4<f32>(aabb.max, 0.0);
+        // Precompute inv_world so the per-pixel march doesn't redo
+        // the matrix inverse. The user transform is locked as affine
+        // (V1 contract), so the cheap rigid-style inverse applies.
+        instance_inv_world[slot] = mat4_affine_inverse(world_matrix);
         // Build the RkpInstance record. Field order + offsets mirror
         // `RkpGpuInstance` exactly; the host march reads this through
         // its standard `instances` binding.
