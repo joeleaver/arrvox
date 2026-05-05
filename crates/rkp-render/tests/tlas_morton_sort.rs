@@ -12,7 +12,7 @@
 
 use rkp_render::tlas_build_pass::{
     cpu_reference_morton, cpu_reference_radix_sort, scene_aabb_from_prims,
-    InstanceTileCullEntry, MortonUniform, RadixUniform, TlasBuildPass, TlasPrim,
+    InstanceTileCullEntry, MortonUniform, RadixUniform, TlasBuildPass, TlasPrim, TlasState,
     RADIX_BUCKETS, RADIX_PASSES, RADIX_WG_SIZE,
 };
 
@@ -89,6 +89,19 @@ fn morton_then_radix_sort_matches_cpu_reference() {
     // tested in tlas_assemble.rs).
     queue.write_buffer(&pass.tlas_prims_buffer, 0, bytemuck::cast_slice(&prims));
 
+    // Tests bypass the dispatch_args pass — write `tlas_state`
+    // directly so the shaders see the right per-frame counts.
+    queue.write_buffer(
+        &pass.tlas_state_buffer,
+        0,
+        bytemuck::bytes_of(&TlasState {
+            prim_count,
+            radix_workgroups: num_workgroups,
+            internal_wgs: 0,
+            total_node_wgs: 0,
+        }),
+    );
+
     // ── Morton compute ────────────────────────────────────────────
     let (scene_min, scene_max) = scene_aabb_from_prims(&prims);
     queue.write_buffer(
@@ -98,7 +111,7 @@ fn morton_then_radix_sort_matches_cpu_reference() {
             scene_min,
             _pad0: 0,
             scene_max,
-            prim_count,
+            _pad1: 0,
         }),
     );
 
@@ -114,10 +127,16 @@ fn morton_then_radix_sort_matches_cpu_reference() {
     let morton_g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("morton g1"),
         layout: &pass.morton_g1_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: pass.morton_uniform_buffer.as_entire_binding(),
-        }],
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: pass.morton_uniform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: pass.tlas_state_buffer.as_entire_binding(),
+            },
+        ],
     });
 
     // ── Radix sort uniforms — 4 passes ───────────────────────────
@@ -125,10 +144,10 @@ fn morton_then_radix_sort_matches_cpu_reference() {
     let mut radix_uniform_bytes: Vec<u8> = vec![0u8; (RADIX_PASSES as u64 * radix_uniform_stride) as usize];
     for p in 0..RADIX_PASSES {
         let u = RadixUniform {
-            prim_count,
             digit_shift: p * 8,
-            num_workgroups,
-            _pad: 0,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         let off = (p as u64 * radix_uniform_stride) as usize;
         radix_uniform_bytes[off..off + std::mem::size_of::<RadixUniform>()]
@@ -165,14 +184,20 @@ fn morton_then_radix_sort_matches_cpu_reference() {
     let radix_g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("radix g1"),
         layout: &pass.radix_g1_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: &pass.radix_uniform_buffer,
-                offset: 0,
-                size: std::num::NonZeroU64::new(std::mem::size_of::<RadixUniform>() as u64),
-            }),
-        }],
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &pass.radix_uniform_buffer,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(std::mem::size_of::<RadixUniform>() as u64),
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: pass.tlas_state_buffer.as_entire_binding(),
+            },
+        ],
     });
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -314,6 +339,16 @@ fn radix_handles_single_prim() {
     pass.ensure_histogram_capacity(&device, num_workgroups);
 
     queue.write_buffer(&pass.tlas_prims_buffer, 0, bytemuck::cast_slice(&prims));
+    queue.write_buffer(
+        &pass.tlas_state_buffer,
+        0,
+        bytemuck::bytes_of(&TlasState {
+            prim_count,
+            radix_workgroups: num_workgroups,
+            internal_wgs: 0,
+            total_node_wgs: 0,
+        }),
+    );
     let (scene_min, scene_max) = scene_aabb_from_prims(&prims);
     queue.write_buffer(
         &pass.morton_uniform_buffer,
@@ -322,17 +357,17 @@ fn radix_handles_single_prim() {
             scene_min,
             _pad0: 0,
             scene_max,
-            prim_count,
+            _pad1: 0,
         }),
     );
     let radix_uniform_stride: u64 = 256;
     let mut radix_uniform_bytes: Vec<u8> = vec![0u8; (RADIX_PASSES as u64 * radix_uniform_stride) as usize];
     for p in 0..RADIX_PASSES {
         let u = RadixUniform {
-            prim_count,
             digit_shift: p * 8,
-            num_workgroups,
-            _pad: 0,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         let off = (p as u64 * radix_uniform_stride) as usize;
         radix_uniform_bytes[off..off + std::mem::size_of::<RadixUniform>()]
@@ -352,7 +387,10 @@ fn radix_handles_single_prim() {
     let morton_g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &pass.morton_g1_layout,
-        entries: &[wgpu::BindGroupEntry { binding: 0, resource: pass.morton_uniform_buffer.as_entire_binding() }],
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: pass.morton_uniform_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: pass.tlas_state_buffer.as_entire_binding() },
+        ],
     });
     let radix_g0_a_to_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
@@ -381,14 +419,20 @@ fn radix_handles_single_prim() {
     let radix_g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &pass.radix_g1_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: &pass.radix_uniform_buffer,
-                offset: 0,
-                size: std::num::NonZeroU64::new(std::mem::size_of::<RadixUniform>() as u64),
-            }),
-        }],
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &pass.radix_uniform_buffer,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(std::mem::size_of::<RadixUniform>() as u64),
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: pass.tlas_state_buffer.as_entire_binding(),
+            },
+        ],
     });
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });

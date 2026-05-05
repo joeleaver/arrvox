@@ -75,31 +75,76 @@ pub struct AssembleHostUniform {
 const _: () = assert!(std::mem::size_of::<AssembleHostUniform>() == 16);
 
 /// Per-dispatch uniform for the Morton-code compute pass. 32 B —
-/// matches `MortonUniform` in `tlas_morton.wgsl`.
+/// matches `MortonUniform` in `tlas_morton.wesl`. Carries only the
+/// static scene-AABB config; per-frame `prim_count` is sourced from
+/// the GPU-resident [`TlasState`] buffer.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MortonUniform {
     pub scene_min: [f32; 3],
     pub _pad0: u32,
     pub scene_max: [f32; 3],
-    pub prim_count: u32,
+    pub _pad1: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<MortonUniform>() == 32);
 
 /// Per-dispatch uniform for one radix-sort sub-pass. 16 B — matches
-/// `RadixUniform` in `tlas_radix_sort.wgsl`. The engine bumps
-/// `digit_shift` by 8 between the four passes (0, 8, 16, 24).
+/// `RadixUniform` in `tlas_radix_sort.wesl`. Only the static
+/// `digit_shift` lives here; `prim_count` and `num_workgroups` come
+/// from the shared [`TlasState`] buffer.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RadixUniform {
-    pub prim_count: u32,
     pub digit_shift: u32,
-    pub num_workgroups: u32,
-    pub _pad: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<RadixUniform>() == 16);
+
+/// GPU-resident per-frame state shared across every TLAS-build pass.
+/// Written by `tlas_compute_dispatch_args.wesl` once per frame; read
+/// by morton, radix, karras, and propagation shaders.
+///
+/// `radix_workgroups` is also the workgroup count for the morton,
+/// karras_leaves, and propagate dispatches (all `ceil(N/64)`).
+/// `internal_wgs` covers karras_internal + decode (`ceil((N-1)/64)`).
+/// `total_node_wgs` covers init_atomic (`ceil((2N-1)/64)`).
+///
+/// 16 B — matches `TlasState` in `tlas_compute_dispatch_args.wesl`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+pub struct TlasState {
+    pub prim_count: u32,
+    pub radix_workgroups: u32,
+    pub internal_wgs: u32,
+    pub total_node_wgs: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<TlasState>() == 16);
+
+/// Stride of one slot in `tlas_dispatch_args` — three u32s (x/y/z
+/// workgroup counts), packed contiguously. Indirect dispatch reads
+/// 12 bytes starting at the slot's byte offset.
+pub const TLAS_DISPATCH_ARG_STRIDE: u64 = 12;
+
+/// Number of dispatch slots packed into `tlas_dispatch_args`. One per
+/// indirect dispatch in the chain; the four radix sub-passes share
+/// slot 1 since they have the same workgroup count.
+pub const TLAS_DISPATCH_ARG_SLOTS: u64 = 7;
+
+/// Indices into `tlas_dispatch_args`. Each slot is
+/// [`TLAS_DISPATCH_ARG_STRIDE`] bytes wide; the indirect-dispatch
+/// byte offset for slot `i` is `i * TLAS_DISPATCH_ARG_STRIDE`.
+pub const TLAS_DISPATCH_SLOT_MORTON: u32 = 0;
+pub const TLAS_DISPATCH_SLOT_RADIX: u32 = 1;
+pub const TLAS_DISPATCH_SLOT_KARRAS_LEAVES: u32 = 2;
+pub const TLAS_DISPATCH_SLOT_KARRAS_INTERNAL: u32 = 3;
+pub const TLAS_DISPATCH_SLOT_INIT_ATOMIC: u32 = 4;
+pub const TLAS_DISPATCH_SLOT_PROPAGATE: u32 = 5;
+pub const TLAS_DISPATCH_SLOT_DECODE: u32 = 6;
 
 /// Workgroup size of the radix count + scatter passes. 64 threads
 /// per workgroup; `num_workgroups = prim_count.div_ceil(64)`.
@@ -110,19 +155,6 @@ pub const RADIX_BUCKETS: u32 = 256;
 
 /// Number of radix passes. 32-bit Morton ÷ 8-bit digit = 4 passes.
 pub const RADIX_PASSES: u32 = 4;
-
-/// Per-dispatch uniform for the Karras tree builder. 16 B —
-/// matches `KarrasUniform` in `tlas_karras.wgsl`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct KarrasUniform {
-    pub prim_count: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
-}
-
-const _: () = assert!(std::mem::size_of::<KarrasUniform>() == 16);
 
 /// Initial `tlas_prims` buffer capacity in entries. Grows on demand
 /// via [`super::pass::TlasBuildPass::ensure_prims_capacity`]. Sized

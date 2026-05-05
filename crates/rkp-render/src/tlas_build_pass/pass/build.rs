@@ -1,33 +1,65 @@
-//! `TlasBuildPass::build_gpu_tlas` — per-frame end-to-end dispatch chain:
-//! assembly → readback → Morton → 4× radix → Karras leaves+internal → AABB propagation.
+//! `TlasBuildPass::build_gpu_tlas` — per-frame end-to-end dispatch chain.
+//!
+//! Pure-GPU pipeline: assembly → compute_dispatch_args → Morton →
+//! 4× radix → atomic-AABB init → Karras leaves + internal →
+//! propagate → decode. Every dispatch downstream of assembly fires
+//! via `dispatch_workgroups_indirect`, so the host never reads the
+//! per-frame primitive count back to CPU. Single submit, no
+//! `device.poll`.
 
 use super::super::types::{
-    AssembleHostUniform, KarrasUniform, MortonUniform, RadixUniform, RADIX_BUCKETS,
-    RADIX_PASSES,
+    AssembleHostUniform, MortonUniform, RadixUniform, RADIX_BUCKETS, RADIX_PASSES,
+    TLAS_DISPATCH_ARG_STRIDE, TLAS_DISPATCH_SLOT_DECODE, TLAS_DISPATCH_SLOT_INIT_ATOMIC,
+    TLAS_DISPATCH_SLOT_KARRAS_INTERNAL, TLAS_DISPATCH_SLOT_KARRAS_LEAVES,
+    TLAS_DISPATCH_SLOT_MORTON, TLAS_DISPATCH_SLOT_PROPAGATE, TLAS_DISPATCH_SLOT_RADIX,
 };
 
 use super::{GpuTlasBuildInputs, TlasBuildPass};
 
+const RADIX_WG_SIZE: u32 = 64;
+
+/// Bytes of a `TlasNode` whose AABB is guaranteed to miss every ray
+/// (`min = +∞`, `max = −∞`, so the slab test always yields
+/// `t_range.x > t_range.y`). Pre-filled into `tlas_nodes_buffer[0]`
+/// before each chain dispatch — the chain overwrites it whenever
+/// the actual prim count is ≥ 1; for the empty-after-assembly edge
+/// case (`instance_count > 0` but every host instance gets filtered
+/// by `assemble_host_main`'s asset-id / shader-id gates) the safe
+/// value remains, and the shadow trace's traversal skips node 0
+/// without infinite-recursing on stale topology.
+const SAFE_TLAS_NODE_BYTES: [u8; 32] = {
+    let pos_inf = f32::INFINITY.to_le_bytes();
+    let neg_inf = f32::NEG_INFINITY.to_le_bytes();
+    let zero = [0u8; 4];
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 4 {
+        out[i] = pos_inf[i];
+        out[4 + i] = pos_inf[i];
+        out[8 + i] = pos_inf[i];
+        out[12 + i] = zero[i]; // left_or_leaf = 0
+        out[16 + i] = neg_inf[i];
+        out[20 + i] = neg_inf[i];
+        out[24 + i] = neg_inf[i];
+        out[28 + i] = zero[i]; // right_or_count = 0
+        i += 1;
+    }
+    out
+};
+
 impl TlasBuildPass {
-    /// Drive the full GPU TLAS build (Sessions 1-4) end to end.
-    /// Encodes assembly → readback → Morton → 4× radix → Karras
-    /// leaves + internal → AABB propagation, writing the final
-    /// `tlas_nodes` + `tlas_leaves` into the supplied
-    /// [`crate::tlas_pass::TlasPass`] buffers (which the shadow
-    /// trace already binds).
+    /// Drive the full GPU TLAS build end to end. Encodes assembly →
+    /// `compute_dispatch_args` → Morton → 4× radix → init_atomic_aabb →
+    /// Karras leaves + internal → propagate → decode, writing the
+    /// final `tlas_nodes` + `tlas_leaves` into the supplied
+    /// [`crate::tlas_pass::TlasPass`] buffers.
     ///
-    /// Returns the actual primitive count after assembly (= number
-    /// of leaves in the built TLAS). Caller stamps this into
-    /// `tlas_pass.last_node_count = 2N-1` and
-    /// `tlas_pass.last_leaf_count = N` so the shadow trace's empty-
-    /// scene skip works (the WGSL early-outs when `tlas_node_count
-    /// == 0`).
-    ///
-    /// V1 uses a synchronous readback between assembly and the
-    /// downstream chain — `device.poll(wait_indefinitely)` blocks
-    /// the calling thread for ~1 ms per frame. Acceptable for V1
-    /// (we're trading 1 ms here to save 30+ ms of shadow trace);
-    /// future refactor to indirect dispatch would remove the stall.
+    /// Returns `inputs.instance_count` — the upper-bound primitive
+    /// count, used by the caller to stamp `tlas_pass.last_*_count`.
+    /// The actual count is GPU-resident in `tlas_state.prim_count`;
+    /// the shadow trace's empty-scene skip uses the dispatch_args
+    /// 0-workgroup gating + each shader's own early-out (so a
+    /// stamped upper-bound here is harmless).
     pub fn build_gpu_tlas(
         &mut self,
         device: &wgpu::Device,
@@ -42,17 +74,33 @@ impl TlasBuildPass {
             return 0;
         }
 
-        // Capacities for the assembly stage.
+        // Pre-size every chain buffer to the instance-count upper
+        // bound. The actual prim_count is GPU-resident and may be
+        // smaller, but indirect dispatch is driven by GPU-written
+        // workgroup counts — the buffers just need to fit the
+        // upper bound. The CPU never sees the per-frame count.
         self.ensure_prims_capacity(device, upper_bound);
+        self.ensure_keys_capacity(device, upper_bound);
+        let radix_workgroups_upper = ((upper_bound + RADIX_WG_SIZE - 1) / RADIX_WG_SIZE).max(1);
+        self.ensure_histogram_capacity(device, radix_workgroups_upper);
+        let total_nodes_upper = (2 * upper_bound).saturating_sub(1).max(1);
+        self.ensure_parents_capacity(device, total_nodes_upper);
+        let aabb_atomic_entries = total_nodes_upper.saturating_mul(3).max(3);
+        self.ensure_aabb_atomic_capacity(device, aabb_atomic_entries);
+        tlas_pass.ensure_capacity(device, total_nodes_upper, upper_bound);
 
-        // Assemble + count readback. Single submit + map_async +
-        // device.poll. The blocking poll is the 1 ms stall.
-        let mut enc1 = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("tlas_build assemble"),
-        });
-        enc1.clear_buffer(&self.tlas_prim_count_buffer, 0, Some(4));
+        // Pre-fill `tlas_nodes[0]` with a "miss-everything" sentinel
+        // so the shadow trace terminates cleanly when assembly
+        // produces zero prims (every host instance filtered out).
+        // The chain dispatches' first writes to node 0 — by
+        // `karras_internal` (N ≥ 2) or `karras_leaves` (N == 1) —
+        // overwrite this; for N == 0 they have 0 workgroups and
+        // node 0 stays at the safe value.
+        queue.write_buffer(&tlas_pass.nodes_buffer, 0, &SAFE_TLAS_NODE_BYTES);
 
-        // Upload assembly uniform.
+        // Upload all uniforms up-front. The dispatch_args pass needs
+        // `prims_capacity` from `host_uniform_buffer`; downstream
+        // shaders need scene_min/max (morton) and digit_shift (radix).
         queue.write_buffer(
             &self.host_uniform_buffer,
             0,
@@ -63,90 +111,6 @@ impl TlasBuildPass {
                 _pad: 0,
             }),
         );
-
-        // Host assembly bind groups + dispatch.
-        if inputs.instance_count > 0 {
-            let g0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("tlas_assemble_host g0"),
-                layout: &self.host_g0_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: inputs.instances_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: inputs.assets_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: self.tlas_prims_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: self.tlas_prim_count_buffer.as_entire_binding() },
-                ],
-            });
-            let g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("tlas_assemble_host g1"),
-                layout: &self.host_g1_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.host_uniform_buffer.as_entire_binding(),
-                }],
-            });
-            let mut cpass = enc1.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("assemble_host_main"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.host_pipeline);
-            cpass.set_bind_group(0, &g0, &[]);
-            cpass.set_bind_group(1, &g1, &[]);
-            let wgs = ((inputs.instance_count + 63) / 64).max(1);
-            cpass.dispatch_workgroups(wgs, 1, 1);
-        }
-
-        // Copy count to staging for readback.
-        enc1.copy_buffer_to_buffer(&self.tlas_prim_count_buffer, 0, &self.count_staging_buffer, 0, 4);
-        queue.submit(std::iter::once(enc1.finish()));
-
-        // Synchronous readback. Stalls the engine thread ~1 ms.
-        let slice = self.count_staging_buffer.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("device poll for tlas count readback");
-        let raw_count = {
-            let view = slice.get_mapped_range();
-            let c = u32::from_le_bytes(view[0..4].try_into().unwrap());
-            drop(view);
-            self.count_staging_buffer.unmap();
-            c
-        };
-        // Clamp the readback to actual capacity. If the assembly
-        // atomic recorded more attempted writes than the buffer
-        // holds (overflow), the writes themselves were gated by
-        // `if (slot >= u.prims_capacity) return;`; the counter
-        // just kept incrementing for telemetry.
-        let actual_count = raw_count.min(self.tlas_prims_capacity);
-        let upper_bound = inputs.instance_count;
-        if raw_count > upper_bound || (raw_count == 0 && upper_bound > 0) {
-            eprintln!(
-                "[tlas_build] suspect raw={raw_count} upper={upper_bound} host={}",
-                inputs.instance_count,
-            );
-        }
-
-        if actual_count == 0 {
-            tlas_pass.last_node_count = 0;
-            tlas_pass.last_leaf_count = 0;
-            return 0;
-        }
-
-        // Capacities for the downstream chain.
-        self.ensure_keys_capacity(device, actual_count);
-        let radix_workgroups = ((actual_count + 63) / 64).max(1);
-        self.ensure_histogram_capacity(device, radix_workgroups);
-        self.ensure_parents_capacity(device, 2 * actual_count - 1);
-        // Phase 7c.6 — atomic AABB accumulators sized 3 × (2N-1)
-        // u32s each (one per axis per node). Init pass clears
-        // them to ±∞ sentinels at frame start; `propagate_atomic_main`
-        // walks each leaf up the parent chain applying atomicMin/Max.
-        let total_nodes = (2 * actual_count).saturating_sub(1).max(1);
-        let aabb_atomic_entries = total_nodes.saturating_mul(3).max(3);
-        self.ensure_aabb_atomic_capacity(device, aabb_atomic_entries);
-        tlas_pass.ensure_capacity(device, 2 * actual_count - 1, actual_count);
-
-        // Upload uniforms for the chain.
         queue.write_buffer(
             &self.morton_uniform_buffer,
             0,
@@ -154,49 +118,91 @@ impl TlasBuildPass {
                 scene_min: inputs.scene_min,
                 _pad0: 0,
                 scene_max: inputs.scene_max,
-                prim_count: actual_count,
+                _pad1: 0,
             }),
         );
         let radix_stride: u64 = 256;
         let mut radix_bytes: Vec<u8> = vec![0u8; (RADIX_PASSES as u64 * radix_stride) as usize];
         for p in 0..RADIX_PASSES {
             let u = RadixUniform {
-                prim_count: actual_count,
                 digit_shift: p * 8,
-                num_workgroups: radix_workgroups,
-                _pad: 0,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
             };
             let off = (p as u64 * radix_stride) as usize;
             radix_bytes[off..off + std::mem::size_of::<RadixUniform>()]
                 .copy_from_slice(bytemuck::bytes_of(&u));
         }
         queue.write_buffer(&self.radix_uniform_buffer, 0, &radix_bytes);
-        queue.write_buffer(
-            &self.karras_uniform_buffer,
-            0,
-            bytemuck::bytes_of(&KarrasUniform {
-                prim_count: actual_count,
-                _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
-            }),
-        );
 
-        // Init parents (sentinel) + visit_counter (zero).
-        let parents_init: Vec<u32> = vec![0xFFFFFFFFu32; (2 * actual_count - 1) as usize];
-        queue.write_buffer(&self.parents_buffer, 0, bytemuck::cast_slice(&parents_init));
-        // Phase 7c.6 — `init_atomic_aabb_main` (in the dispatch
-        // chain below) writes ±∞ sentinels to both atomic
-        // buffers; no CPU pre-fill needed. Just declare we're
-        // about to use them at the new size.
-        let _ = total_nodes;
-
-        // Encode the chain.
-        let mut enc2 = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        // Single command encoder for the entire chain.
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("tlas_build chain"),
         });
+        enc.clear_buffer(&self.tlas_prim_count_buffer, 0, Some(4));
 
-        // Morton compute.
+        // ── Assembly ─────────────────────────────────────────────
+        let assemble_g0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tlas_assemble_host g0"),
+            layout: &self.host_g0_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: inputs.instances_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: inputs.assets_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.tlas_prims_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.tlas_prim_count_buffer.as_entire_binding() },
+            ],
+        });
+        let assemble_g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tlas_assemble_host g1"),
+            layout: &self.host_g1_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.host_uniform_buffer.as_entire_binding(),
+            }],
+        });
+        {
+            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("assemble_host_main"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.host_pipeline);
+            cpass.set_bind_group(0, &assemble_g0, &[]);
+            cpass.set_bind_group(1, &assemble_g1, &[]);
+            let wgs = ((inputs.instance_count + 63) / 64).max(1);
+            cpass.dispatch_workgroups(wgs, 1, 1);
+        }
+
+        // ── Compute dispatch args ────────────────────────────────
+        let dispatch_args_g0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tlas_compute_dispatch_args g0"),
+            layout: &self.dispatch_args_g0_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.tlas_prim_count_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.tlas_state_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.tlas_dispatch_args_buffer.as_entire_binding() },
+            ],
+        });
+        let dispatch_args_g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tlas_compute_dispatch_args g1"),
+            layout: &self.dispatch_args_g1_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.host_uniform_buffer.as_entire_binding(),
+            }],
+        });
+        {
+            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("compute_dispatch_args_main"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.dispatch_args_pipeline);
+            cpass.set_bind_group(0, &dispatch_args_g0, &[]);
+            cpass.set_bind_group(1, &dispatch_args_g1, &[]);
+            cpass.dispatch_workgroups(1, 1, 1);
+        }
+
+        // ── Morton compute ───────────────────────────────────────
         let morton_g0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("morton g0"),
             layout: &self.morton_g0_layout,
@@ -209,23 +215,26 @@ impl TlasBuildPass {
         let morton_g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("morton g1"),
             layout: &self.morton_g1_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: self.morton_uniform_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.morton_uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.tlas_state_buffer.as_entire_binding() },
+            ],
         });
         {
-            let mut cpass = enc2.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("compute_morton_main"),
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.morton_pipeline);
             cpass.set_bind_group(0, &morton_g0, &[]);
             cpass.set_bind_group(1, &morton_g1, &[]);
-            cpass.dispatch_workgroups(radix_workgroups, 1, 1);
+            cpass.dispatch_workgroups_indirect(
+                &self.tlas_dispatch_args_buffer,
+                TLAS_DISPATCH_SLOT_MORTON as u64 * TLAS_DISPATCH_ARG_STRIDE,
+            );
         }
 
-        // Radix sort — 4 passes ping-ponging a→b→a→b.
+        // ── Radix sort — 4 passes ping-ponging a→b→a→b ──────────
         let radix_g0_a_to_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("radix g0 a→b"),
             layout: &self.radix_g0_layout,
@@ -253,32 +262,40 @@ impl TlasBuildPass {
         let radix_g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("radix g1"),
             layout: &self.radix_g1_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &self.radix_uniform_buffer,
-                    offset: 0,
-                    size: std::num::NonZeroU64::new(std::mem::size_of::<RadixUniform>() as u64),
-                }),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.radix_uniform_buffer,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(std::mem::size_of::<RadixUniform>() as u64),
+                    }),
+                },
+                wgpu::BindGroupEntry { binding: 1, resource: self.tlas_state_buffer.as_entire_binding() },
+            ],
         });
-        let histogram_bytes = (radix_workgroups as u64) * (RADIX_BUCKETS as u64) * 4;
+        let histogram_bytes = (radix_workgroups_upper as u64) * (RADIX_BUCKETS as u64) * 4;
         for p in 0..RADIX_PASSES {
             let g0 = if p % 2 == 0 { &radix_g0_a_to_b } else { &radix_g0_b_to_a };
             let dyn_off = (p as u64 * radix_stride) as u32;
-            enc2.clear_buffer(&self.histogram_buffer, 0, Some(histogram_bytes));
+            enc.clear_buffer(&self.histogram_buffer, 0, Some(histogram_bytes));
             {
-                let mut cpass = enc2.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("radix count_main"),
                     timestamp_writes: None,
                 });
                 cpass.set_pipeline(&self.radix_count_pipeline);
                 cpass.set_bind_group(0, g0, &[]);
                 cpass.set_bind_group(1, &radix_g1, &[dyn_off]);
-                cpass.dispatch_workgroups(radix_workgroups, 1, 1);
+                cpass.dispatch_workgroups_indirect(
+                    &self.tlas_dispatch_args_buffer,
+                    TLAS_DISPATCH_SLOT_RADIX as u64 * TLAS_DISPATCH_ARG_STRIDE,
+                );
             }
             {
-                let mut cpass = enc2.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                // Scan stays direct — always 1 workgroup of 256 threads.
+                // It walks `tlas_state.radix_workgroups` internally.
+                let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("radix scan_main"),
                     timestamp_writes: None,
                 });
@@ -288,19 +305,26 @@ impl TlasBuildPass {
                 cpass.dispatch_workgroups(1, 1, 1);
             }
             {
-                let mut cpass = enc2.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("radix scatter_main"),
                     timestamp_writes: None,
                 });
                 cpass.set_pipeline(&self.radix_scatter_pipeline);
                 cpass.set_bind_group(0, g0, &[]);
                 cpass.set_bind_group(1, &radix_g1, &[dyn_off]);
-                cpass.dispatch_workgroups(radix_workgroups, 1, 1);
+                cpass.dispatch_workgroups_indirect(
+                    &self.tlas_dispatch_args_buffer,
+                    TLAS_DISPATCH_SLOT_RADIX as u64 * TLAS_DISPATCH_ARG_STRIDE,
+                );
             }
         }
 
-        // Karras tree + AABB propagation. Output goes into the
-        // shadow-trace consumer buffers (`tlas_pass.{nodes,leaves}_buffer`).
+        // ── Karras tree + atomic AABB propagation ───────────────
+        // Order matters: `init_atomic_aabb_main` writes both the
+        // ±∞ accumulator sentinels AND `parents[i] = PARENT_SENTINEL`,
+        // and must run BEFORE `build_internal_main` (which overwrites
+        // `parents[non-root]` with real values). The root keeps the
+        // sentinel so propagate's walk-up loop terminates.
         let karras_g0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("karras g0"),
             layout: &self.karras_g0_layout,
@@ -320,82 +344,94 @@ impl TlasBuildPass {
             layout: &self.karras_g1_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: self.karras_uniform_buffer.as_entire_binding(),
+                resource: self.tlas_state_buffer.as_entire_binding(),
             }],
         });
-        let leaf_wgs = ((actual_count + 63) / 64).max(1);
+        // 1. Init — clears ±∞ sentinels into both atomic AABB
+        //    buffers and seeds `parents[i] = PARENT_SENTINEL`.
         {
-            let mut cpass = enc2.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("init_atomic_aabb_main"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.init_atomic_aabb_pipeline);
+            cpass.set_bind_group(0, &karras_g0, &[]);
+            cpass.set_bind_group(1, &karras_g1, &[]);
+            cpass.dispatch_workgroups_indirect(
+                &self.tlas_dispatch_args_buffer,
+                TLAS_DISPATCH_SLOT_INIT_ATOMIC as u64 * TLAS_DISPATCH_ARG_STRIDE,
+            );
+        }
+        // 2. Karras leaves — packs `tlas_leaves` payload + leaf-marker
+        //    `tlas_nodes` entries.
+        {
+            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("build_leaves_main"),
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.karras_leaves_pipeline);
             cpass.set_bind_group(0, &karras_g0, &[]);
             cpass.set_bind_group(1, &karras_g1, &[]);
-            cpass.dispatch_workgroups(leaf_wgs, 1, 1);
+            cpass.dispatch_workgroups_indirect(
+                &self.tlas_dispatch_args_buffer,
+                TLAS_DISPATCH_SLOT_KARRAS_LEAVES as u64 * TLAS_DISPATCH_ARG_STRIDE,
+            );
         }
-        if actual_count >= 2 {
-            let internal_wgs = (((actual_count - 1) + 63) / 64).max(1);
-            {
-                let mut cpass = enc2.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("build_internal_main"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&self.karras_internal_pipeline);
-                cpass.set_bind_group(0, &karras_g0, &[]);
-                cpass.set_bind_group(1, &karras_g1, &[]);
-                cpass.dispatch_workgroups(internal_wgs, 1, 1);
-            }
+        // 3. Karras internal — assigns child indices and writes
+        //    real parent pointers (overwriting init's sentinels for
+        //    non-root nodes).
+        {
+            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("build_internal_main"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.karras_internal_pipeline);
+            cpass.set_bind_group(0, &karras_g0, &[]);
+            cpass.set_bind_group(1, &karras_g1, &[]);
+            cpass.dispatch_workgroups_indirect(
+                &self.tlas_dispatch_args_buffer,
+                TLAS_DISPATCH_SLOT_KARRAS_INTERNAL as u64 * TLAS_DISPATCH_ARG_STRIDE,
+            );
         }
-        // Phase 7c.6 — atomic AABB propagation. Three passes:
-        //   1. init: clear accumulators to ±∞ sentinels.
-        //   2. propagate: each leaf walks up to root, atomic-min/max
-        //      into ancestors. Commutative — no thread ordering
-        //      issues, no cross-buffer memory visibility needed.
-        //   3. decode: read accumulators, write tlas_nodes AABBs.
-        let total_node_wgs = (((2 * actual_count - 1) + 63) / 64).max(1);
-        let internal_wgs = if actual_count >= 2 {
-            (((actual_count - 1) + 63) / 64).max(1)
-        } else {
-            1
-        };
-        if actual_count >= 2 {
-            {
-                let mut cpass = enc2.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("init_atomic_aabb_main"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&self.init_atomic_aabb_pipeline);
-                cpass.set_bind_group(0, &karras_g0, &[]);
-                cpass.set_bind_group(1, &karras_g1, &[]);
-                cpass.dispatch_workgroups(total_node_wgs, 1, 1);
-            }
-            {
-                let mut cpass = enc2.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("propagate_atomic_main"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&self.propagate_atomic_pipeline);
-                cpass.set_bind_group(0, &karras_g0, &[]);
-                cpass.set_bind_group(1, &karras_g1, &[]);
-                cpass.dispatch_workgroups(leaf_wgs, 1, 1);
-            }
-            {
-                let mut cpass = enc2.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("decode_aabb_main"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&self.decode_aabb_pipeline);
-                cpass.set_bind_group(0, &karras_g0, &[]);
-                cpass.set_bind_group(1, &karras_g1, &[]);
-                cpass.dispatch_workgroups(internal_wgs, 1, 1);
-            }
+        // 4. Propagate — atomicMin/Max walks each leaf up to root.
+        {
+            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("propagate_atomic_main"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.propagate_atomic_pipeline);
+            cpass.set_bind_group(0, &karras_g0, &[]);
+            cpass.set_bind_group(1, &karras_g1, &[]);
+            cpass.dispatch_workgroups_indirect(
+                &self.tlas_dispatch_args_buffer,
+                TLAS_DISPATCH_SLOT_PROPAGATE as u64 * TLAS_DISPATCH_ARG_STRIDE,
+            );
+        }
+        // 5. Decode — read accumulators, write `tlas_nodes[i].aabb_*`.
+        {
+            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("decode_aabb_main"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.decode_aabb_pipeline);
+            cpass.set_bind_group(0, &karras_g0, &[]);
+            cpass.set_bind_group(1, &karras_g1, &[]);
+            cpass.dispatch_workgroups_indirect(
+                &self.tlas_dispatch_args_buffer,
+                TLAS_DISPATCH_SLOT_DECODE as u64 * TLAS_DISPATCH_ARG_STRIDE,
+            );
         }
 
-        queue.submit(std::iter::once(enc2.finish()));
+        queue.submit(std::iter::once(enc.finish()));
 
-        tlas_pass.last_node_count = 2 * actual_count - 1;
-        tlas_pass.last_leaf_count = actual_count;
-        actual_count
+        // Stamp the upper bound. The shadow trace's empty-scene skip
+        // checks `tlas_node_count == 0`; an upper-bound stamp here
+        // is harmless when the actual GPU tree is smaller because
+        // the unused leaf nodes have aabb=(0,0,0) and won't be hit
+        // by any ray, while internal nodes beyond the real root
+        // chain are unreachable from index 0.
+        tlas_pass.last_node_count = total_nodes_upper;
+        tlas_pass.last_leaf_count = upper_bound;
+        upper_bound
     }
 }

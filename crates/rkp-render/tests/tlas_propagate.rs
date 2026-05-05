@@ -10,7 +10,7 @@
 //! Skips silently when no wgpu adapter is available.
 
 use rkp_render::tlas_build_pass::{
-    cpu_reference_full_tree, KarrasUniform, TlasBuildPass, TlasPrim, TLAS_LEAF_USER_SHADER,
+    cpu_reference_full_tree, TlasBuildPass, TlasPrim, TlasState, TLAS_LEAF_USER_SHADER,
 };
 use rkp_render::tlas_pass::{TlasInstanceLeaf, TlasNode, TLAS_NODE_LEAF_BIT};
 
@@ -69,22 +69,22 @@ fn run_full_build(
     queue.write_buffer(&pass.keys_a_buffer, 0, bytemuck::cast_slice(sorted_keys));
     queue.write_buffer(&pass.vals_a_buffer, 0, bytemuck::cast_slice(sorted_vals));
     queue.write_buffer(&pass.tlas_prims_buffer, 0, bytemuck::cast_slice(prims));
+    let radix_workgroups = ((n + 63) / 64).max(1);
+    let internal_wgs = if n >= 2 { (((n - 1) + 63) / 64).max(1) } else { 0 };
+    let total_node_wgs = if n >= 2 { ((2 * n - 1 + 63) / 64).max(1) } else { 0 };
     queue.write_buffer(
-        &pass.karras_uniform_buffer,
+        &pass.tlas_state_buffer,
         0,
-        bytemuck::bytes_of(&KarrasUniform {
+        bytemuck::bytes_of(&TlasState {
             prim_count: n,
-            _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
+            radix_workgroups,
+            internal_wgs,
+            total_node_wgs,
         }),
     );
-    // Pre-fill parents with sentinel; tree-builder overwrites
-    // non-root entries.
-    let parents_init: Vec<u32> = vec![0xFFFFFFFFu32; (2 * n - 1) as usize];
-    queue.write_buffer(&pass.parents_buffer, 0, bytemuck::cast_slice(&parents_init));
-    // Phase 7c.6 — atomic AABB accumulators. Init pass clears
-    // them on the GPU; nothing to do CPU-side.
+    // The GPU init pass writes parents/aabb_atomic when run; this
+    // test invokes it explicitly below, so no CPU pre-fill is
+    // needed (the init pass also seeds `parents[i] = SENTINEL`).
 
     let total_nodes = (2 * n - 1).max(1);
     let nodes_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -119,14 +119,33 @@ fn run_full_build(
         layout: &pass.karras_g1_layout,
         entries: &[wgpu::BindGroupEntry {
             binding: 0,
-            resource: pass.karras_uniform_buffer.as_entire_binding(),
+            resource: pass.tlas_state_buffer.as_entire_binding(),
         }],
     });
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("propagate enc"),
     });
-    let leaf_wgs = ((n + 63) / 64).max(1);
+    let leaf_wgs = radix_workgroups;
+    // Match the production chain order: init must run BEFORE
+    // build_internal_main, since init seeds `parents[i] = SENTINEL`
+    // and build_internal overwrites the non-root entries.
+    if n >= 2 {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("init_atomic_aabb_main"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pass.init_atomic_aabb_pipeline);
+        cpass.set_bind_group(0, &g0, &[]);
+        cpass.set_bind_group(1, &g1, &[]);
+        cpass.dispatch_workgroups(total_node_wgs, 1, 1);
+    } else {
+        // N == 1: no internal nodes; pre-fill parent[0] with the
+        // sentinel so propagate's walk-up loop terminates if it
+        // were to run (it doesn't here, but keeps semantics clean).
+        let parents_init: Vec<u32> = vec![0xFFFFFFFFu32; (2 * n - 1) as usize];
+        queue.write_buffer(&pass.parents_buffer, 0, bytemuck::cast_slice(&parents_init));
+    }
     {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("build_leaves_main"),
@@ -146,21 +165,7 @@ fn run_full_build(
             cpass.set_pipeline(&pass.karras_internal_pipeline);
             cpass.set_bind_group(0, &g0, &[]);
             cpass.set_bind_group(1, &g1, &[]);
-            let internal_wgs = (((n - 1) + 63) / 64).max(1);
             cpass.dispatch_workgroups(internal_wgs, 1, 1);
-        }
-        // Phase 7c.6 — atomic AABB propagation: init → propagate → decode.
-        let internal_wgs = (((n - 1) + 63) / 64).max(1);
-        let total_node_wgs = (((2 * n - 1) + 63) / 64).max(1);
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("init_atomic_aabb_main"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&pass.init_atomic_aabb_pipeline);
-            cpass.set_bind_group(0, &g0, &[]);
-            cpass.set_bind_group(1, &g1, &[]);
-            cpass.dispatch_workgroups(total_node_wgs, 1, 1);
         }
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

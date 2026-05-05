@@ -38,10 +38,21 @@ const WG_SIZE_SCAN: u32 = 256u;
 const RADIX_BUCKETS: u32 = 256u;
 
 struct RadixUniform {
-    prim_count: u32,
     digit_shift: u32,
-    num_workgroups: u32,
-    _pad: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+// Shared state written by `tlas_compute_dispatch_args.wesl`.
+// `prim_count` and `radix_workgroups` (= num_workgroups for the
+// count + scatter passes) flow through this buffer instead of the
+// per-pass uniform.
+struct TlasState {
+    prim_count: u32,
+    radix_workgroups: u32,
+    internal_wgs: u32,
+    total_node_wgs: u32,
 }
 
 @group(0) @binding(0) var<storage, read> keys_in: array<u32>;
@@ -51,6 +62,7 @@ struct RadixUniform {
 @group(0) @binding(4) var<storage, read_write> histogram: array<atomic<u32>>;
 @group(0) @binding(5) var<storage, read_write> scan_offsets: array<atomic<u32>>;
 @group(1) @binding(0) var<uniform> u: RadixUniform;
+@group(1) @binding(1) var<uniform> tlas_state: TlasState;
 
 // ── Pass 1 — count digits per workgroup ────────────────────────────
 
@@ -60,7 +72,7 @@ fn count_main(
     @builtin(workgroup_id) wg: vec3<u32>,
 ) {
     let i = gid.x;
-    if (i >= u.prim_count) {
+    if (i >= tlas_state.prim_count) {
         return;
     }
     let key = keys_in[i];
@@ -89,9 +101,10 @@ var<workgroup> bucket_global: array<u32, 256>;
 
 @compute @workgroup_size(256, 1, 1)
 fn scan_main(@builtin(local_invocation_index) lid: u32) {
+    let num_workgroups = tlas_state.radix_workgroups;
     // Step 1 — sum histogram[*][lid] across workgroups.
     var sum: u32 = 0u;
-    for (var w: u32 = 0u; w < u.num_workgroups; w = w + 1u) {
+    for (var w: u32 = 0u; w < num_workgroups; w = w + 1u) {
         sum = sum + atomicLoad(&histogram[w * RADIX_BUCKETS + lid]);
     }
     bucket_total[lid] = sum;
@@ -123,7 +136,7 @@ fn scan_main(@builtin(local_invocation_index) lid: u32) {
     // scan_offsets. Each thread b walks all workgroups for its
     // bucket, accumulating the running prefix.
     var prefix = bucket_global[lid];
-    for (var w: u32 = 0u; w < u.num_workgroups; w = w + 1u) {
+    for (var w: u32 = 0u; w < num_workgroups; w = w + 1u) {
         let h = atomicLoad(&histogram[w * RADIX_BUCKETS + lid]);
         atomicStore(&scan_offsets[w * RADIX_BUCKETS + lid], prefix);
         prefix = prefix + h;
@@ -149,7 +162,7 @@ fn scatter_main(
     @builtin(workgroup_id) wg: vec3<u32>,
 ) {
     let i = gid.x;
-    if (i >= u.prim_count) {
+    if (i >= tlas_state.prim_count) {
         return;
     }
     let key = keys_in[i];

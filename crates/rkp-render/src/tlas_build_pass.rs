@@ -47,9 +47,12 @@ pub use cpu_reference::{
 };
 pub use pass::{GpuTlasBuildInputs, TlasBuildPass};
 pub use types::{
-    AssembleHostUniform, InstanceTileCullEntry, KarrasUniform, MortonUniform, RadixUniform,
-    TlasPrim, RADIX_BUCKETS, RADIX_PASSES, RADIX_WG_SIZE, TLAS_LEAF_USER_SHADER,
-    TLAS_PRIMS_INITIAL_ENTRIES,
+    AssembleHostUniform, InstanceTileCullEntry, MortonUniform, RadixUniform, TlasPrim, TlasState,
+    RADIX_BUCKETS, RADIX_PASSES, RADIX_WG_SIZE, TLAS_DISPATCH_ARG_SLOTS,
+    TLAS_DISPATCH_ARG_STRIDE, TLAS_DISPATCH_SLOT_DECODE, TLAS_DISPATCH_SLOT_INIT_ATOMIC,
+    TLAS_DISPATCH_SLOT_KARRAS_INTERNAL, TLAS_DISPATCH_SLOT_KARRAS_LEAVES,
+    TLAS_DISPATCH_SLOT_MORTON, TLAS_DISPATCH_SLOT_PROPAGATE, TLAS_DISPATCH_SLOT_RADIX,
+    TLAS_LEAF_USER_SHADER, TLAS_PRIMS_INITIAL_ENTRIES,
 };
 
 #[cfg(test)]

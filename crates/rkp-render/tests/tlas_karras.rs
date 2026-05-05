@@ -14,8 +14,7 @@
 //! Skips silently when no wgpu adapter is available.
 
 use rkp_render::tlas_build_pass::{
-    cpu_reference_karras_node, KarrasUniform, TlasBuildPass, TlasPrim,
-    TLAS_LEAF_USER_SHADER,
+    cpu_reference_karras_node, TlasBuildPass, TlasPrim, TlasState, TLAS_LEAF_USER_SHADER,
 };
 use rkp_render::tlas_pass::{TlasInstanceLeaf, TlasNode, TLAS_NODE_LEAF_BIT};
 
@@ -74,19 +73,22 @@ fn run_karras(
     queue.write_buffer(&pass.keys_a_buffer, 0, bytemuck::cast_slice(sorted_keys));
     queue.write_buffer(&pass.vals_a_buffer, 0, bytemuck::cast_slice(sorted_vals));
     queue.write_buffer(&pass.tlas_prims_buffer, 0, bytemuck::cast_slice(prims));
+    let radix_workgroups = ((n + 63) / 64).max(1);
+    let internal_wgs = if n >= 2 { (((n - 1) + 63) / 64).max(1) } else { 0 };
+    let total_node_wgs = if n >= 2 { ((2 * n - 1 + 63) / 64).max(1) } else { 0 };
     queue.write_buffer(
-        &pass.karras_uniform_buffer,
+        &pass.tlas_state_buffer,
         0,
-        bytemuck::bytes_of(&KarrasUniform {
+        bytemuck::bytes_of(&TlasState {
             prim_count: n,
-            _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
+            radix_workgroups,
+            internal_wgs,
+            total_node_wgs,
         }),
     );
-    // Pre-fill parents with the sentinel — the tree builder
-    // overwrites for non-root nodes; root's parent slot stays
-    // 0xFFFFFFFF.
+    // Pre-fill parents with the sentinel — the test bypasses the
+    // GPU init pass that normally seeds these, but `build_internal`
+    // still relies on the root retaining the sentinel.
     let parents_init: Vec<u32> = vec![0xFFFFFFFFu32; (2 * n - 1) as usize];
     queue.write_buffer(&pass.parents_buffer, 0, bytemuck::cast_slice(&parents_init));
 
@@ -123,7 +125,7 @@ fn run_karras(
         layout: &pass.karras_g1_layout,
         entries: &[wgpu::BindGroupEntry {
             binding: 0,
-            resource: pass.karras_uniform_buffer.as_entire_binding(),
+            resource: pass.tlas_state_buffer.as_entire_binding(),
         }],
     });
 

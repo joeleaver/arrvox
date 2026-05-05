@@ -82,7 +82,6 @@ pub struct TlasBuildPass {
     pub karras_internal_pipeline: wgpu::ComputePipeline,
     pub karras_g0_layout: wgpu::BindGroupLayout,
     pub karras_g1_layout: wgpu::BindGroupLayout,
-    pub karras_uniform_buffer: wgpu::Buffer,
 
     // ── Session 4 — bottom-up AABB propagation ───────────────────
     /// Phase 7c.6 — atomic AABB-accumulator propagation. Three
@@ -111,11 +110,25 @@ pub struct TlasBuildPass {
     /// Capacity of each atomic-AABB buffer in u32 entries
     /// (= 3 × (2N-1) target).
     pub aabb_atomic_capacity: u32,
-    /// 4-byte staging buffer used to read `tlas_prim_count[0]`
-    /// back to CPU after the assembly stage. The Phase 7c V1
-    /// uses a synchronous readback to drive the rest of the
-    /// pipeline; this buffer is the readback target.
-    pub count_staging_buffer: wgpu::Buffer,
+
+    // ── Indirect-dispatch driver ──────────────────────────────────
+    /// Shared per-frame state — `prim_count`, `radix_workgroups`,
+    /// `internal_wgs`, `total_node_wgs`. Written by
+    /// `tlas_compute_dispatch_args.wesl`; read by every chain
+    /// shader as a substitute for per-pass-uniform-driven counts.
+    pub tlas_state_buffer: wgpu::Buffer,
+    /// Packed indirect-dispatch arguments — 7 slots × 12 B
+    /// (u32 x/y/z workgroup counts). Drives every chain dispatch
+    /// via `dispatch_workgroups_indirect`. Replaced the V1
+    /// CPU-side readback + direct dispatch.
+    pub tlas_dispatch_args_buffer: wgpu::Buffer,
+    /// Single-thread, single-workgroup pipeline that reads
+    /// `tlas_prim_count[0]` and writes both
+    /// `tlas_state_buffer` + `tlas_dispatch_args_buffer`. Run
+    /// once per frame at the head of the chain.
+    pub dispatch_args_pipeline: wgpu::ComputePipeline,
+    pub dispatch_args_g0_layout: wgpu::BindGroupLayout,
+    pub dispatch_args_g1_layout: wgpu::BindGroupLayout,
 }
 
 /// Inputs to [`TlasBuildPass::build_gpu_tlas`]. All buffers are

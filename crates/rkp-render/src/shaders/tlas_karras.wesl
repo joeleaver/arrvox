@@ -42,13 +42,15 @@ import package::lib::types::TlasInstanceLeaf;
 
 const TLAS_NODE_LEAF_BIT: u32 = 0x80000000u;
 
-struct KarrasUniform {
-    // Number of primitives = number of leaves = N. Internal node
-    // count is N-1; total tlas_nodes entries is 2N-1.
+// Shared state written by `tlas_compute_dispatch_args.wesl`.
+// Replaces the old `KarrasUniform` — the per-frame N, internal_wgs,
+// and total_node_wgs flow through this buffer, leaving the karras
+// shader pipeline with no per-pass uniform of its own.
+struct TlasState {
     prim_count: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    radix_workgroups: u32,
+    internal_wgs: u32,
+    total_node_wgs: u32,
 }
 
 @group(0) @binding(0) var<storage, read> sorted_keys: array<u32>;
@@ -77,7 +79,7 @@ struct KarrasUniform {
 // to `tlas_nodes[i].aabb_min/max`.
 @group(0) @binding(6) var<storage, read_write> aabb_min_atomic: array<atomic<u32>>;
 @group(0) @binding(7) var<storage, read_write> aabb_max_atomic: array<atomic<u32>>;
-@group(1) @binding(0) var<uniform> u: KarrasUniform;
+@group(1) @binding(0) var<uniform> tlas_state: TlasState;
 
 const PARENT_SENTINEL: u32 = 0xFFFFFFFFu;
 // Sentinels for the atomic accumulators.
@@ -143,7 +145,7 @@ fn sign_i32(a: i32, b: i32) -> i32 {
 @compute @workgroup_size(64, 1, 1)
 fn build_leaves_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    if (i >= u.prim_count) {
+    if (i >= tlas_state.prim_count) {
         return;
     }
     let prim_idx = sorted_vals[i];
@@ -157,7 +159,7 @@ fn build_leaves_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Leaf-marker node at index N-1+i. Write the leaf AABB
     // directly — only this thread touches this slot, so no race.
-    let n = u.prim_count;
+    let n = tlas_state.prim_count;
     var leaf_node: TlasNode;
     leaf_node.aabb_min = p.aabb_min;
     leaf_node.aabb_max = p.aabb_max;
@@ -171,7 +173,7 @@ fn build_leaves_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(64, 1, 1)
 fn build_internal_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx_u = gid.x;
-    let n_u = u.prim_count;
+    let n_u = tlas_state.prim_count;
     if (n_u < 2u) {
         // Trivial case: 0 or 1 prims. Nothing to build — root is
         // either non-existent or the single leaf-marker (handled
@@ -306,7 +308,7 @@ fn build_internal_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(64, 1, 1)
 fn init_atomic_aabb_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    let n = u.prim_count;
+    let n = tlas_state.prim_count;
     if (n < 2u) {
         return;
     }
@@ -321,12 +323,21 @@ fn init_atomic_aabb_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&aabb_max_atomic[i * 3u + 0u], FP_MAX_SENTINEL);
     atomicStore(&aabb_max_atomic[i * 3u + 1u], FP_MAX_SENTINEL);
     atomicStore(&aabb_max_atomic[i * 3u + 2u], FP_MAX_SENTINEL);
+    // Parent slot — initialise every node to PARENT_SENTINEL.
+    // `build_internal_main` overwrites parents for non-root nodes
+    // immediately after this pass; the root keeps SENTINEL so
+    // `propagate_atomic_main`'s walk-up loop terminates. Writing
+    // here (rather than CPU `queue.write_buffer`) is a hard
+    // ordering requirement: init MUST run before karras_internal,
+    // which is guaranteed by the dispatch ordering in
+    // `TlasBuildPass::build_gpu_tlas`.
+    parents[i] = PARENT_SENTINEL;
 }
 
 @compute @workgroup_size(64, 1, 1)
 fn propagate_atomic_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    let n = u.prim_count;
+    let n = tlas_state.prim_count;
     if (i >= n) {
         return;
     }
@@ -362,7 +373,7 @@ fn propagate_atomic_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(64, 1, 1)
 fn decode_aabb_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    let n = u.prim_count;
+    let n = tlas_state.prim_count;
     if (n < 2u) { return; }
     if (i >= n - 1u) {
         // Only internal nodes; leaf-marker AABBs were already

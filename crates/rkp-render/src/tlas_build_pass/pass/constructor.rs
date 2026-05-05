@@ -2,8 +2,8 @@
 //! TLAS build sessions: assembly, Morton/radix sort, Karras tree, AABB propagation.
 
 use super::super::types::{
-    AssembleHostUniform, KarrasUniform, MortonUniform, RadixUniform, TlasPrim, RADIX_BUCKETS,
-    RADIX_PASSES, TLAS_PRIMS_INITIAL_ENTRIES,
+    AssembleHostUniform, MortonUniform, RadixUniform, TlasPrim, TlasState, RADIX_BUCKETS,
+    RADIX_PASSES, TLAS_DISPATCH_ARG_SLOTS, TLAS_DISPATCH_ARG_STRIDE, TLAS_PRIMS_INITIAL_ENTRIES,
 };
 
 use super::TlasBuildPass;
@@ -81,7 +81,14 @@ impl TlasBuildPass {
         });
         let morton_g1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tlas_morton g1"),
-            entries: &[uniform_entry(0, std::mem::size_of::<MortonUniform>() as u64)],
+            entries: &[
+                uniform_entry(0, std::mem::size_of::<MortonUniform>() as u64),
+                // `tlas_state` is bound here as UNIFORM rather than
+                // STORAGE so the karras pass (which already binds 8
+                // storage buffers — wgpu's default per-stage limit)
+                // can fit it without bumping the device limit.
+                uniform_entry(1, std::mem::size_of::<TlasState>() as u64),
+            ],
         });
         let morton_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tlas_morton pipeline layout"),
@@ -119,16 +126,19 @@ impl TlasBuildPass {
         });
         let radix_g1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tlas_radix g1"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<RadixUniform>() as u64),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<RadixUniform>() as u64),
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                uniform_entry(1, std::mem::size_of::<TlasState>() as u64), // tlas_state
+            ],
         });
         let radix_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tlas_radix pipeline layout"),
@@ -219,7 +229,7 @@ impl TlasBuildPass {
         });
         let karras_g1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tlas_karras g1"),
-            entries: &[uniform_entry(0, std::mem::size_of::<KarrasUniform>() as u64)],
+            entries: &[uniform_entry(0, std::mem::size_of::<TlasState>() as u64)], // tlas_state
         });
         let karras_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tlas_karras pipeline layout"),
@@ -245,12 +255,77 @@ impl TlasBuildPass {
             compilation_options: Default::default(),
             cache: None,
         });
-        let karras_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tlas_karras uniform"),
-            size: std::mem::size_of::<KarrasUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        // ── tlas_state — shared dynamic-counts buffer ────────────────
+        // Written by `tlas_compute_dispatch_args.wesl` once per frame;
+        // read by morton/radix/karras shaders. 16 B `TlasState`.
+        //
+        // Carries BOTH `STORAGE` and `UNIFORM` usages: the writer
+        // pipeline binds it as `var<storage, read_write>` (so it
+        // can write the new counts), while the consumer pipelines
+        // bind it as `var<uniform>` to keep within wgpu's default
+        // 8-storage-buffer-per-stage limit (the karras pass already
+        // saturates that limit with its 8 storage buffers in g0).
+        let tlas_state_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tlas_state"),
+            size: std::mem::size_of::<TlasState>() as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+
+        // ── tlas_dispatch_args — packed indirect-dispatch buffer ─────
+        // 7 slots × 12 B (u32 x/y/z workgroup counts) = 84 B. STORAGE
+        // for the writer; INDIRECT for the chain dispatches' calls
+        // to `dispatch_workgroups_indirect`.
+        let dispatch_args_bytes = TLAS_DISPATCH_ARG_SLOTS * TLAS_DISPATCH_ARG_STRIDE;
+        let tlas_dispatch_args_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tlas_dispatch_args"),
+            size: dispatch_args_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // ── dispatch_args pipeline ───────────────────────────────────
+        let dispatch_args_g0_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("tlas_compute_dispatch_args g0"),
+                entries: &[
+                    rw_storage(0), // tlas_prim_count (atomic u32)
+                    rw_storage(1), // tlas_state
+                    rw_storage(2), // tlas_dispatch_args
+                ],
+            });
+        let dispatch_args_g1_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("tlas_compute_dispatch_args g1"),
+                entries: &[uniform_entry(0, std::mem::size_of::<AssembleHostUniform>() as u64)],
+            });
+        let dispatch_args_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("tlas_compute_dispatch_args pipeline layout"),
+                bind_group_layouts: &[
+                    Some(&dispatch_args_g0_layout),
+                    Some(&dispatch_args_g1_layout),
+                ],
+                immediate_size: 0,
+            });
+        let dispatch_args_module = crate::compile_pass_shader(
+            device,
+            wesl::include_wesl!("tlas_compute_dispatch_args"),
+            "tlas_compute_dispatch_args",
+        );
+        let dispatch_args_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("tlas_compute_dispatch_args"),
+                layout: Some(&dispatch_args_pipeline_layout),
+                module: &dispatch_args_module,
+                entry_point: Some("compute_dispatch_args_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         // ── Session 4 — AABB propagation ──────────────────────────
         let init_atomic_aabb_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -303,13 +378,6 @@ impl TlasBuildPass {
             "tlas_aabb_max_atomic",
             initial_aabb_atomic_capacity,
         ));
-        let count_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tlas_prim_count_staging"),
-            size: 4,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
         Self {
             host_pipeline,
             host_g0_layout,
@@ -340,7 +408,6 @@ impl TlasBuildPass {
             karras_internal_pipeline,
             karras_g0_layout,
             karras_g1_layout,
-            karras_uniform_buffer,
             init_atomic_aabb_pipeline,
             propagate_atomic_pipeline,
             decode_aabb_pipeline,
@@ -349,7 +416,11 @@ impl TlasBuildPass {
             aabb_max_atomic_buffer,
             parents_capacity: initial_parents_capacity,
             aabb_atomic_capacity: initial_aabb_atomic_capacity,
-            count_staging_buffer,
+            tlas_state_buffer,
+            tlas_dispatch_args_buffer,
+            dispatch_args_pipeline,
+            dispatch_args_g0_layout,
+            dispatch_args_g1_layout,
         }
     }
 }

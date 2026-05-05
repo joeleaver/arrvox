@@ -22,15 +22,24 @@ struct MortonUniform {
     scene_min: vec3<f32>,
     _pad0: u32,
     scene_max: vec3<f32>,
-    // Number of primitives written to `tlas_prims` by Session 1.
-    // Threads with `gid >= prim_count` early-out.
+    _pad1: u32,
+}
+
+// Shared state written by `tlas_compute_dispatch_args.wesl`.
+// Per-frame `prim_count` flows through this buffer, not the
+// MortonUniform — keeps the chain indirect-dispatch-driven.
+struct TlasState {
     prim_count: u32,
+    radix_workgroups: u32,
+    internal_wgs: u32,
+    total_node_wgs: u32,
 }
 
 @group(0) @binding(0) var<storage, read> tlas_prims: array<TlasPrim>;
 @group(0) @binding(1) var<storage, read_write> keys_a: array<u32>;
 @group(0) @binding(2) var<storage, read_write> vals_a: array<u32>;
 @group(1) @binding(0) var<uniform> u: MortonUniform;
+@group(1) @binding(1) var<uniform> tlas_state: TlasState;
 
 // Spread 10 input bits across 30 output bits (positions 0, 3, 6,
 // ..., 27). Standard Morton "expand" via shift+mask. 10 bits caps
@@ -57,7 +66,7 @@ fn morton_30(x: u32, y: u32, z: u32) -> u32 {
 @compute @workgroup_size(64, 1, 1)
 fn compute_morton_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    if (i >= u.prim_count) {
+    if (i >= tlas_state.prim_count) {
         return;
     }
     let p = tlas_prims[i];
