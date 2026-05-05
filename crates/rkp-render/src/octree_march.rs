@@ -11,8 +11,12 @@ use crate::compile_pass_shader;
 /// when Surface-Nets normal-reconstruction added counters at
 /// stats[52..55]; 64 → 80 added the user-shader descend-body
 /// breakdown counters at stats[64..72] (k-loop, AABB rejected, descent
-/// run, descent miss, hit) for measuring the band-cell descent cost.
-pub const STATS_U32_COUNT: usize = 80;
+/// run, descent miss, hit) for measuring the band-cell descent cost;
+/// 80 → 82 split the emit-scan AABB-cull total into ray-misses-AABB
+/// (stats[80]) and behind-max_world_dist (stats[81]) to diagnose
+/// whether tile-binning slack or depth-cull dominates the 45% reject
+/// path.
+pub const STATS_U32_COUNT: usize = 82;
 pub const STATS_BYTES: u64 = (STATS_U32_COUNT * 4) as u64;
 
 /// State machine for the async stats readback. Single buffer rather

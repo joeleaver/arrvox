@@ -404,10 +404,23 @@ fn eprint_march_stats(vp_id: crate::viewport::ViewportId, stats: &[u32]) {
     let brick_steps = stats.get(77).copied().unwrap_or(0);
     let misses = stats.get(78).copied().unwrap_or(0);
     let miss_steps = stats.get(79).copied().unwrap_or(0);
+    let aabb_3d_miss = stats.get(80).copied().unwrap_or(0);
+    let behind_max_dist = stats.get(81).copied().unwrap_or(0);
     let total_steps = stats.first().copied().unwrap_or(0);
     let host_steps = total_steps.saturating_sub(descent_steps);
 
     let cull_pct = 100.0 * (1.0 - (aabb_pass as f64 / candidates as f64));
+    let total_culls = aabb_3d_miss + behind_max_dist;
+    let pct_3d = if total_culls == 0 {
+        0.0
+    } else {
+        100.0 * aabb_3d_miss as f64 / total_culls as f64
+    };
+    let pct_behind = if total_culls == 0 {
+        0.0
+    } else {
+        100.0 * behind_max_dist as f64 / total_culls as f64
+    };
     let emit_step_pct = if total_steps == 0 {
         0.0
     } else {
@@ -440,6 +453,8 @@ fn eprint_march_stats(vp_id: crate::viewport::ViewportId, stats: &[u32]) {
         "[emit_scan vp={vp_id:?}] candidates={candidates} \
          aabb_pass={aabb_pass} ({cull_pct:.1}% culled) \
          marches={marches} ({miss_pct:.1}% miss) hits={hits} | \
+         cull-reason: 3d_miss={aabb_3d_miss} ({pct_3d:.1}%) \
+         behind_max_dist={behind_max_dist} ({pct_behind:.1}%) | \
          steps: emit={descent_steps} host={host_steps} \
          (emit={emit_step_pct:.1}% of total) | \
          split: outer={outer_steps} brick={brick_steps} \

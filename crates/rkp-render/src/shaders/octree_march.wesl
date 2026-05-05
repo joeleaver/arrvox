@@ -239,7 +239,7 @@ fn brick_id_of(node: u32) -> u32 {
 
 @group(2) @binding(0) var<uniform> march_params: MarchParams;
 @group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
-@group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 80>;
+@group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 82>;
 // stats[0]       = total steps across all pixels
 // stats[1]       = (reserved — was total_lookups; retained slot for layout stability)
 // stats[2]       = pixels that found a hit
@@ -284,6 +284,12 @@ fn brick_id_of(node: u32) -> u32 {
 // stats[79]      = emit-scan miss-march descent steps (sum of `r.steps`
 //                   for marches with `r.valid == false`); the per-miss
 //                   step cost = `stats[79] / stats[78]`
+// stats[80]      = emit-scan candidates rejected because the ray missed
+//                   the instance world AABB in 3D (tile-bin slack)
+// stats[81]      = emit-scan candidates rejected because the AABB sits
+//                   behind `max_world_dist` (depth-occluded by an
+//                   already-recorded hit). [80] + [81] sums to the
+//                   pre-`emit_aabb_pass` reject count.
 //
 // octree_nodes reads are derived CPU-side from the per-phase depth histograms:
 // sum(bucket[i] * (i + 1)) since each lookup descends `depth+1` nodes.
@@ -1465,6 +1471,8 @@ fn main(
     var emit_brick_steps: u32 = 0u;
     var emit_misses: u32 = 0u;
     var emit_miss_steps: u32 = 0u;
+    var emit_aabb_3d_miss: u32 = 0u;
+    var emit_behind_max_dist: u32 = 0u;
     if march_params.uss_disable == 0u {
         let us_pixel_tile_x = u32(coord.x) / 8u;
         let us_pixel_tile_y = u32(coord.y) / 8u;
@@ -1488,8 +1496,14 @@ fn main(
             let aabb_min = user_shader_instance_aabbs[ui * 2u + 0u].xyz;
             let aabb_max = user_shader_instance_aabbs[ui * 2u + 1u].xyz;
             let world_aabb_t = intersect_aabb(ray_origin, inv_world_dir, aabb_min, aabb_max);
-            if world_aabb_t.x > world_aabb_t.y { continue; }
-            if world_aabb_t.x > max_world_dist { continue; }
+            if world_aabb_t.x > world_aabb_t.y {
+                emit_aabb_3d_miss = emit_aabb_3d_miss + 1u;
+                continue;
+            }
+            if world_aabb_t.x > max_world_dist {
+                emit_behind_max_dist = emit_behind_max_dist + 1u;
+                continue;
+            }
 
             let inst = user_shader_instances[ui];
             let asset = assets[inst.asset_id];
@@ -1577,6 +1591,8 @@ fn main(
     if emit_brick_steps != 0u { atomicAdd(&stats[77], emit_brick_steps); }
     if emit_misses      != 0u { atomicAdd(&stats[78], emit_misses); }
     if emit_miss_steps  != 0u { atomicAdd(&stats[79], emit_miss_steps); }
+    if emit_aabb_3d_miss    != 0u { atomicAdd(&stats[80], emit_aabb_3d_miss); }
+    if emit_behind_max_dist != 0u { atomicAdd(&stats[81], emit_behind_max_dist); }
 
     // Footprint histogram: size in pixels of the finest voxel at the hit point.
     // <1px means we walked to a mip level finer than the screen can resolve.
