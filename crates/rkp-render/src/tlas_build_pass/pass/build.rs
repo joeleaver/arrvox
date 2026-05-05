@@ -66,6 +66,7 @@ impl TlasBuildPass {
         queue: &wgpu::Queue,
         inputs: &GpuTlasBuildInputs,
         tlas_pass: &mut crate::tlas_pass::TlasPass,
+        profiler: Option<&wgpu_profiler::GpuProfiler>,
     ) -> u32 {
         let upper_bound = inputs.instance_count;
         if upper_bound == 0 {
@@ -142,6 +143,21 @@ impl TlasBuildPass {
         });
         enc.clear_buffer(&self.tlas_prim_count_buffer, 0, Some(4));
 
+        // Per-region profiler scopes. Each call surrounds a single
+        // dispatch (or a tight block of them) so the wgpu-profiler
+        // results break the TLAS build down into measurable phases.
+        // `Option<&GpuProfiler>` keeps the path tests-friendly —
+        // tests pass `None` and skip query allocation.
+        let begin = |label: &'static str, enc: &mut wgpu::CommandEncoder| {
+            profiler.map(|p| p.begin_query(label, enc))
+        };
+        let end = |enc: &mut wgpu::CommandEncoder,
+                   q: Option<wgpu_profiler::GpuProfilerQuery>| {
+            if let (Some(p), Some(q)) = (profiler, q) {
+                p.end_query(enc, q);
+            }
+        };
+
         // ── Assembly ─────────────────────────────────────────────
         let assemble_g0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tlas_assemble_host g0"),
@@ -161,6 +177,7 @@ impl TlasBuildPass {
                 resource: self.host_uniform_buffer.as_entire_binding(),
             }],
         });
+        let q = begin("tlas.assemble", &mut enc);
         {
             let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("assemble_host_main"),
@@ -172,6 +189,7 @@ impl TlasBuildPass {
             let wgs = ((inputs.instance_count + 63) / 64).max(1);
             cpass.dispatch_workgroups(wgs, 1, 1);
         }
+        end(&mut enc, q);
 
         // ── Compute dispatch args ────────────────────────────────
         let dispatch_args_g0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -191,6 +209,7 @@ impl TlasBuildPass {
                 resource: self.host_uniform_buffer.as_entire_binding(),
             }],
         });
+        let q = begin("tlas.dispatch_args", &mut enc);
         {
             let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("compute_dispatch_args_main"),
@@ -201,6 +220,7 @@ impl TlasBuildPass {
             cpass.set_bind_group(1, &dispatch_args_g1, &[]);
             cpass.dispatch_workgroups(1, 1, 1);
         }
+        end(&mut enc, q);
 
         // ── Morton compute ───────────────────────────────────────
         let morton_g0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -220,6 +240,7 @@ impl TlasBuildPass {
                 wgpu::BindGroupEntry { binding: 1, resource: self.tlas_state_buffer.as_entire_binding() },
             ],
         });
+        let q = begin("tlas.morton", &mut enc);
         {
             let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("compute_morton_main"),
@@ -233,6 +254,7 @@ impl TlasBuildPass {
                 TLAS_DISPATCH_SLOT_MORTON as u64 * TLAS_DISPATCH_ARG_STRIDE,
             );
         }
+        end(&mut enc, q);
 
         // ── Radix sort — 4 passes ping-ponging a→b→a→b ──────────
         let radix_g0_a_to_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -275,6 +297,7 @@ impl TlasBuildPass {
             ],
         });
         let histogram_bytes = (radix_workgroups_upper as u64) * (RADIX_BUCKETS as u64) * 4;
+        let q = begin("tlas.radix", &mut enc);
         for p in 0..RADIX_PASSES {
             let g0 = if p % 2 == 0 { &radix_g0_a_to_b } else { &radix_g0_b_to_a };
             let dyn_off = (p as u64 * radix_stride) as u32;
@@ -318,6 +341,7 @@ impl TlasBuildPass {
                 );
             }
         }
+        end(&mut enc, q);
 
         // ── Karras tree + atomic AABB propagation ───────────────
         // Order matters: `init_atomic_aabb_main` writes both the
@@ -349,6 +373,7 @@ impl TlasBuildPass {
         });
         // 1. Init — clears ±∞ sentinels into both atomic AABB
         //    buffers and seeds `parents[i] = PARENT_SENTINEL`.
+        let q = begin("tlas.init_atomic", &mut enc);
         {
             let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("init_atomic_aabb_main"),
@@ -362,8 +387,10 @@ impl TlasBuildPass {
                 TLAS_DISPATCH_SLOT_INIT_ATOMIC as u64 * TLAS_DISPATCH_ARG_STRIDE,
             );
         }
+        end(&mut enc, q);
         // 2. Karras leaves — packs `tlas_leaves` payload + leaf-marker
         //    `tlas_nodes` entries.
+        let q = begin("tlas.karras_leaves", &mut enc);
         {
             let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("build_leaves_main"),
@@ -377,9 +404,11 @@ impl TlasBuildPass {
                 TLAS_DISPATCH_SLOT_KARRAS_LEAVES as u64 * TLAS_DISPATCH_ARG_STRIDE,
             );
         }
+        end(&mut enc, q);
         // 3. Karras internal — assigns child indices and writes
         //    real parent pointers (overwriting init's sentinels for
         //    non-root nodes).
+        let q = begin("tlas.karras_internal", &mut enc);
         {
             let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("build_internal_main"),
@@ -393,7 +422,9 @@ impl TlasBuildPass {
                 TLAS_DISPATCH_SLOT_KARRAS_INTERNAL as u64 * TLAS_DISPATCH_ARG_STRIDE,
             );
         }
+        end(&mut enc, q);
         // 4. Propagate — atomicMin/Max walks each leaf up to root.
+        let q = begin("tlas.propagate", &mut enc);
         {
             let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("propagate_atomic_main"),
@@ -407,7 +438,9 @@ impl TlasBuildPass {
                 TLAS_DISPATCH_SLOT_PROPAGATE as u64 * TLAS_DISPATCH_ARG_STRIDE,
             );
         }
+        end(&mut enc, q);
         // 5. Decode — read accumulators, write `tlas_nodes[i].aabb_*`.
+        let q = begin("tlas.decode", &mut enc);
         {
             let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("decode_aabb_main"),
@@ -421,6 +454,7 @@ impl TlasBuildPass {
                 TLAS_DISPATCH_SLOT_DECODE as u64 * TLAS_DISPATCH_ARG_STRIDE,
             );
         }
+        end(&mut enc, q);
 
         queue.submit(std::iter::once(enc.finish()));
 

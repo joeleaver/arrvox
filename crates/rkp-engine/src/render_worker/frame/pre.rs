@@ -308,6 +308,7 @@ pub(super) fn run_pre_frame(
         &state.queue,
         &tlas_inputs,
         &mut state.tlas_pass,
+        Some(&state.renderer.profiler),
     );
     // Refresh per-VR shadow-trace bind groups so they pick up any
     // capacity-doubling reallocation of `tlas_pass.{nodes,leaves}_buffer`.

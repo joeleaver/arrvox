@@ -260,6 +260,27 @@ pub(super) fn run_render_thread(
         let gpu_passes = state.renderer.end_profiler_frame(frame_index);
         let r_t_prof = render_phase_start.elapsed();
 
+        // 7b. Optional GPU-side breakdown of the TLAS chain. The `tlas`
+        //     line in `[render.pre]` is CPU wall-time; this one shows
+        //     where the GPU is actually spending its time inside
+        //     `build_gpu_tlas`. Gated on `render_profile` like the
+        //     `[render]` summary.
+        if render_profile && frame_index % 30 == 0 {
+            // Diagnostic: dump every label every ~half-second so we
+            // can see what the profiler is actually returning. Will
+            // tighten back to tlas.* once we confirm queries surface.
+            let labels: Vec<String> = gpu_passes
+                .iter()
+                .map(|(l, ms)| format!("{l}={ms:.2}"))
+                .collect();
+            eprintln!(
+                "[render.gpu] frame={} count={} | {}",
+                frame_index,
+                gpu_passes.len(),
+                labels.join(" ")
+            );
+        }
+
         // 8. Send result back to sim. Exit on disconnect.
         if out_tx
             .send(RenderResult {
