@@ -109,6 +109,20 @@ pub(super) fn encode_viewports(
         }
 
         // 3f. Per-viewport encoder.
+        //
+        // Drain the previous frame's stats readback BEFORE building this
+        // frame's encoder, so the next `copy_stats` (encoded inside
+        // `render_to`) sees state IDLE and isn't skipped. Doing this
+        // after submit (the old order) deadlocked the readback into a
+        // stuck-snapshot loop: state went IDLE → PENDING → READY and
+        // then every subsequent frame's copy was skipped because state
+        // stayed READY until the next drain.
+        let drained_stats = if std::env::var("RKP_MARCH_STATS").is_ok() {
+            vr.march.try_drain_stats()
+        } else {
+            None
+        };
+
         let mut encoder = state
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -349,13 +363,33 @@ pub(super) fn encode_viewports(
         // Single staging buffer per source, skip-if-busy — never
         // blocks the render thread.
         if std::env::var("RKP_MARCH_STATS").is_ok() {
-            if let Some(stats) = vr.march.try_drain_stats() {
-                eprint_march_stats(vp.id, &stats);
+            if let Some(stats) = &drained_stats {
+                eprint_march_stats(vp.id, stats);
             }
             vr.march.submit_stats_readback();
-            if let Some(count) = state.user_shader_emit_pass.try_drain_count() {
-                eprintln!("[user_shader_emit] emitted instances={count}");
+            let count = state.user_shader_emit_pass.try_drain_count();
+            if let Some(c) = count {
+                eprintln!("[user_shader_emit] emitted instances={c}");
             }
+            // Heartbeat — also dumps stats[0] (total march steps) and
+            // stats[71..76] (the new emit-scan counters) raw, so we
+            // can see whether the writes are landing at all.
+            let s = drained_stats.as_deref();
+            let total = s.and_then(|s| s.first()).copied().unwrap_or(0);
+            let cands = s.and_then(|s| s.get(71)).copied().unwrap_or(0);
+            let aabb = s.and_then(|s| s.get(72)).copied().unwrap_or(0);
+            let marches = s.and_then(|s| s.get(73)).copied().unwrap_or(0);
+            let steps = s.and_then(|s| s.get(74)).copied().unwrap_or(0);
+            let hits = s.and_then(|s| s.get(75)).copied().unwrap_or(0);
+            eprintln!(
+                "[march_stats vp={:?}] heartbeat: drain={} count={:?} \
+                 total_steps={} | s71={} s72={} s73={} s74={} s75={}",
+                vp.id,
+                if drained_stats.is_some() { "data" } else { "none" },
+                count,
+                total,
+                cands, aabb, marches, steps, hits,
+            );
         }
     }
 
