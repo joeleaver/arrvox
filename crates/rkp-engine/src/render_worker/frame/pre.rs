@@ -21,6 +21,12 @@ pub(super) fn run_pre_frame(
     frame: &RenderFrame,
     gpu_instances: &[rkp_render::rkp_gpu_object::RkpGpuInstance],
 ) -> PreFrameOutput {
+    // Sub-phase timing inside pre, gated on `RKP_RENDER_PROFILE=1`.
+    // Splits the `pre` bucket of `[render.frame]` into the major
+    // upload/dispatch groups so we can attribute the cost.
+    let pre_profile = std::env::var("RKP_RENDER_PROFILE").is_ok();
+    let pre_start = std::time::Instant::now();
+
     // 0. Drive the wgpu async runtime so any in-flight async maps can
     //    complete (volumetric sun-atten readbacks, frame readbacks,
     //    pick readbacks).
@@ -137,6 +143,8 @@ pub(super) fn run_pre_frame(
         );
     }
 
+    let p_t_setup = pre_start.elapsed();
+
     // 1. Geometry upload — epoch-driven. Robust to snapshot drops:
     //    sim ships scene_mgr's current epoch every frame, so we'll
     //    catch up on the next snapshot if an intermediate one was
@@ -175,6 +183,8 @@ pub(super) fn run_pre_frame(
         drop(sm);
     }
 
+    let p_t_uploads = pre_start.elapsed();
+
     // 1.7. Per-frame proto bake. Bakes each registered instance
     //      shader's prototype octree (canonical [0,1]³) into the
     //      shared host pool tail; emit pass + march descend it as a
@@ -212,6 +222,8 @@ pub(super) fn run_pre_frame(
         (combined_assets.as_slice(), gpu_instances)
     };
 
+    let p_t_proto = pre_start.elapsed();
+
     // 1.7c. User-shader emit pass. Reads `frame.painted_leaves`,
     //       runs each shader's `instance_at` / `inst_world_matrix`
     //       hooks, writes `RkpInstance` records into the scene's
@@ -220,6 +232,8 @@ pub(super) fn run_pre_frame(
     //       nothing consumes it; engine logs the count behind
     //       `RKP_MARCH_STATS=1` for verification).
     tick_emit_pass(state, frame, &inst_result, proto_asset_id_base);
+
+    let p_t_emit = pre_start.elapsed();
 
     // 1b. Per-frame upload. `gpu_instances` here may be interpolated
     //     between the last two sim snapshots (see `interpolate_instances`),
@@ -265,6 +279,8 @@ pub(super) fn run_pre_frame(
             instance_overlays: overlay_bytes,
         },
     );
+
+    let p_t_upload_frame = pre_start.elapsed();
 
     // 1b''. Phase 7c — fire the GPU TLAS build. Inputs:
     //   * tile-cull scratch buffer (populated earlier by
@@ -322,6 +338,8 @@ pub(super) fn run_pre_frame(
         );
     }
 
+    let p_t_tlas = pre_start.elapsed();
+
     // Phase 8 — directional shadow map. Picks the first
     // directional light, derives the light camera covering the
     // scene AABB, writes the uniform into every VR. Returns
@@ -329,6 +347,8 @@ pub(super) fn run_pre_frame(
     // pass gates its sample on that. Texture dispatch happens
     // later in `render_to`.
     let shadow_map_enabled = prepare_shadow_maps(state, frame, scene_aabb, tlas_prim_count);
+
+    let p_t_shadow_prepare = pre_start.elapsed();
 
     // 2. Skin scatter (one batched compute dispatch). Sim folded every
     //    skinned entity into `frame.skin.batch`; we just fire it.
@@ -370,6 +390,22 @@ pub(super) fn run_pre_frame(
         .saturating_mul(MAX_EMITS_PER_LEAF)
         .min(rkp_render::rkp_scene::USER_SHADER_INSTANCE_CAPACITY);
 
+    let p_t_skin = pre_start.elapsed();
+    if pre_profile {
+        let to_ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
+        eprintln!(
+            "[render.pre] setup={:.2} uploads={:.2} proto={:.2} emit={:.2} upload_frame={:.2} tlas={:.2} shadow={:.2} skin={:.2} | total={:.2}",
+            to_ms(p_t_setup),
+            to_ms(p_t_uploads) - to_ms(p_t_setup),
+            to_ms(p_t_proto) - to_ms(p_t_uploads),
+            to_ms(p_t_emit) - to_ms(p_t_proto),
+            to_ms(p_t_upload_frame) - to_ms(p_t_emit),
+            to_ms(p_t_tlas) - to_ms(p_t_upload_frame),
+            to_ms(p_t_shadow_prepare) - to_ms(p_t_tlas),
+            to_ms(p_t_skin) - to_ms(p_t_shadow_prepare),
+            to_ms(p_t_skin),
+        );
+    }
     PreFrameOutput {
         transient_indices,
         object_count,

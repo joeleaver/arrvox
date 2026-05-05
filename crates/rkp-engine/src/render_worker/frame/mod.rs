@@ -93,7 +93,29 @@ pub(super) fn render_one_frame(
     new_snapshot_consumed: bool,
     frame_callback: &FrameCallback,
 ) -> RenderOutcome {
+    // Sub-phase timing inside the render thread, gated on
+    // `RKP_RENDER_PROFILE=1`. Splits the `render` bucket of
+    // `[render]` into the three internal calls so we can attribute
+    // any unaccounted-for CPU cost.
+    let render_profile = std::env::var("RKP_RENDER_PROFILE").is_ok();
+    let phase_start = std::time::Instant::now();
     let pre = pre::run_pre_frame(state, frame, gpu_instances);
+    let t_pre = phase_start.elapsed();
     let encode = encode::encode_viewports(state, frame, &pre);
-    post::finalize_frame(state, frame, new_snapshot_consumed, frame_callback, encode)
+    let t_encode = phase_start.elapsed();
+    let outcome = post::finalize_frame(
+        state, frame, new_snapshot_consumed, frame_callback, encode,
+    );
+    let t_post = phase_start.elapsed();
+    if render_profile {
+        let to_ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
+        eprintln!(
+            "[render.frame] pre={:.2} encode={:.2} post={:.2} | total={:.2}",
+            to_ms(t_pre),
+            to_ms(t_encode) - to_ms(t_pre),
+            to_ms(t_post) - to_ms(t_encode),
+            to_ms(t_post),
+        );
+    }
+    outcome
 }

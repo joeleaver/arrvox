@@ -158,6 +158,14 @@ pub(super) fn run_render_thread(
             .map(|p| iter_start.duration_since(p).as_secs_f32() * 1000.0);
         prev_render_start = Some(iter_start);
 
+        // Render-thread sub-phase timing, gated on
+        // `RKP_RENDER_PROFILE=1`. Mirrors the sim-thread `[snap]`
+        // line — emits one ms-split per real frame so we can
+        // attribute the gap between GPU-pass timestamps and
+        // wallclock frame time.
+        let render_profile = std::env::var("RKP_RENDER_PROFILE").is_ok();
+        let render_phase_start = std::time::Instant::now();
+
         // 2b. Drain a completed pick, if any. Non-blocking.
         //
         // Must run AFTER the backoff gate above. `drain_pick` calls
@@ -168,6 +176,7 @@ pub(super) fn run_render_thread(
         // sim. Picks tolerate a few ms of extra latency; outright
         // losing them does not.
         let pick_result = state.drain_pick();
+        let r_t_pick = render_phase_start.elapsed();
 
         // 3. Check for a fresh snapshot — non-blocking. If present,
         //    update the two-snapshot window and refresh the sim_dt
@@ -201,6 +210,8 @@ pub(super) fn run_render_thread(
         let prev: Option<Arc<RenderFrame>> = state.prev_snap.clone();
         let frame_index = curr.frame_index;
 
+        let r_t_snap = render_phase_start.elapsed();
+
         // 4. Interpolation alpha. At α=0 we'd show prev; at α=1 we
         //    show curr. Clamp to [0,1] so render never extrapolates
         //    past the latest sim state (extrapolation is a correctness
@@ -225,6 +236,8 @@ pub(super) fn run_render_thread(
                 _ => curr.gpu_instances.clone(),
             };
 
+        let r_t_interp = render_phase_start.elapsed();
+
         // 6. Render — same pipeline as before; `render_one_frame`
         //    now takes the interpolated objects as an explicit
         //    parameter separate from the snapshot (the snapshot's
@@ -241,9 +254,11 @@ pub(super) fn run_render_thread(
             new_snapshot_consumed,
             &frame_callback,
         );
+        let r_t_render = render_phase_start.elapsed();
 
         // 7. GPU profiler — drain resolved timings for sim's history.
         let gpu_passes = state.renderer.end_profiler_frame(frame_index);
+        let r_t_prof = render_phase_start.elapsed();
 
         // 8. Send result back to sim. Exit on disconnect.
         if out_tx
@@ -258,6 +273,20 @@ pub(super) fn run_render_thread(
             .is_err()
         {
             return;
+        }
+        let r_t_send = render_phase_start.elapsed();
+        if render_profile {
+            let to_ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
+            eprintln!(
+                "[render] pick={:.2} snap={:.2} interp={:.2} render={:.2} prof={:.2} send={:.2} | total={:.2}",
+                to_ms(r_t_pick),
+                to_ms(r_t_snap) - to_ms(r_t_pick),
+                to_ms(r_t_interp) - to_ms(r_t_snap),
+                to_ms(r_t_render) - to_ms(r_t_interp),
+                to_ms(r_t_prof) - to_ms(r_t_render),
+                to_ms(r_t_send) - to_ms(r_t_prof),
+                to_ms(r_t_send),
+            );
         }
 
         // 9. Pace. `Uncapped` skips the sleep entirely; `TargetHz(N)`
