@@ -146,19 +146,17 @@ fn splat_renders_elephant_and_reports_gpu_time() {
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    // Materials — one default plus a few colourful ones so visual
-    // dump is at least slightly informative. Index 1 = mid-grey diffuse.
-    // GpuMaterial layout matches `lib::types::GpuMaterial` (104 B).
-    let mut materials = vec![[0u32; 26]; 8]; // 26 × u32 = 104 B per entry
+    // Materials — `GpuMaterial` is 24 × 4 = 96 B (see
+    // `shaders/lib/types.wesl`). One default plus a few extra slots
+    // so the leaf_attr_pool's stub material_id=1 maps to a defined
+    // entry. Index 1 = mid-grey diffuse.
+    let mut materials = vec![[0u32; 24]; 8]; // stride MUST match the WGSL struct
     for m in &mut materials {
-        // albedo: mid-grey
-        m[0] = 0.7f32.to_bits();
-        m[1] = 0.7f32.to_bits();
-        m[2] = 0.7f32.to_bits();
-        // roughness
-        m[3] = 0.5f32.to_bits();
-        // opacity = 1 at slot 12
-        m[12] = 1.0f32.to_bits();
+        m[0] = 0.7f32.to_bits(); // albedo_r
+        m[1] = 0.7f32.to_bits(); // albedo_g
+        m[2] = 0.7f32.to_bits(); // albedo_b
+        m[3] = 0.5f32.to_bits(); // roughness
+        m[12] = 1.0f32.to_bits(); // opacity
     }
     let materials_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("materials"),
@@ -169,11 +167,23 @@ fn splat_renders_elephant_and_reports_gpu_time() {
     // ── 4. Camera ──────────────────────────────────────────────────
     let aabb_center = (aabb_min + aabb_max) * 0.5;
     let asset_extent = (aabb_max - aabb_min).length();
-    // Place camera 1.6× extent away looking at center, slight elevation.
-    let cam_pos = aabb_center + Vec3::new(1.0, 0.6, 1.0).normalize() * (asset_extent * 1.6);
+    // Camera distance scaled by env var so we can A/B sub-pixel
+    // sensitivity without recompiling. Default 0.55 puts us close
+    // enough that voxels project to ~few pixels each.
+    let dist_factor: f32 = std::env::var("RKP_SPLAT_CAM_DIST")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.55);
+    let cam_pos =
+        aabb_center + Vec3::new(1.0, 0.6, 1.0).normalize() * (asset_extent * dist_factor);
     let view = Mat4::look_at_rh(cam_pos, aabb_center, Vec3::Y);
     let aspect = W as f32 / H as f32;
     let proj = Mat4::perspective_rh(60_f32.to_radians(), aspect, 0.05, asset_extent * 4.0);
+    eprintln!(
+        "[splat_render] camera at {:.2} m from center, asset_extent {:.2} m",
+        (cam_pos - aabb_center).length(),
+        asset_extent,
+    );
     let view_proj = proj * view;
     let camera = SplatCamera {
         view_proj: view_proj.to_cols_array_2d(),
@@ -335,12 +345,100 @@ fn splat_renders_elephant_and_reports_gpu_time() {
         mean_us / 1000.0,
     );
 
-    // ── 8. (optional) PNG dump for visual sanity ───────────────────
+    // ── 8. (optional) Image dump for visual sanity ─────────────────
     if let Ok(dir) = std::env::var("RKP_SPLAT_DUMP_DIR") {
-        eprintln!("[splat_render] dumping albedo/normal to {}", dir);
-        // We chose Rgba16Float — readback + tonemap would be its own
-        // chunk of work. Leaving the texture-read-and-PNG-encode for
-        // a follow-up if visual sanity becomes critical.
-        let _ = dir;
+        std::fs::create_dir_all(&dir).expect("create dump dir");
+        dump_rgba16_to_ppm(&device, &queue, &albedo_tex, W, H, &format!("{dir}/albedo.ppm"), true);
+        dump_rgba16_to_ppm(&device, &queue, &normal_tex, W, H, &format!("{dir}/normal.ppm"), false);
+        eprintln!("[splat_render] wrote {dir}/{{albedo,normal}}.ppm");
     }
+}
+
+/// Read back an `Rgba16Float` render target, tonemap (Reinhard + sRGB
+/// gamma) when `tonemap` is set, and write a P6 PPM. Trivial format —
+/// any image viewer or `convert in.ppm out.png` opens it.
+///
+/// `bytes_per_row` is already a multiple of 256 for our 1920-pixel
+/// width (1920 × 8 = 15360 = 60 × 256), so the copy lays out cleanly.
+fn dump_rgba16_to_ppm(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex: &wgpu::Texture,
+    width: u32,
+    height: u32,
+    path: &str,
+    tonemap: bool,
+) {
+    let bytes_per_pixel = 8u32; // Rgba16Float
+    let row_bytes = width * bytes_per_pixel;
+    assert_eq!(
+        row_bytes % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
+        0,
+        "bytes_per_row must be 256-aligned; pad if you change W"
+    );
+    let buffer_size = (row_bytes as u64) * height as u64;
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ppm_staging"),
+        size: buffer_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("ppm copy") });
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &staging,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row_bytes),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(std::iter::once(enc.finish()));
+    let slice = staging.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    let view = slice.get_mapped_range();
+    let halfs: &[half::f16] = bytemuck::cast_slice(&view);
+
+    // Header: P6 magic, width height, max value, single newline before
+    // raw bytes.
+    let mut out = Vec::with_capacity((3 * (width * height) as usize) + 64);
+    out.extend_from_slice(format!("P6\n{} {}\n255\n", width, height).as_bytes());
+
+    for pix in 0..(width * height) as usize {
+        let r = halfs[pix * 4].to_f32();
+        let g = halfs[pix * 4 + 1].to_f32();
+        let b = halfs[pix * 4 + 2].to_f32();
+        let (rr, gg, bb) = if tonemap {
+            // Reinhard: c / (1 + c). Then sRGB-ish gamma 2.2 via sqrt.
+            let r = (r / (1.0 + r)).sqrt();
+            let g = (g / (1.0 + g)).sqrt();
+            let b = (b / (1.0 + b)).sqrt();
+            (r, g, b)
+        } else {
+            // Normal target — values are already in [0, 1] (encoded
+            // n*0.5 + 0.5). Just clamp.
+            (r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0))
+        };
+        out.push((rr * 255.0).round().clamp(0.0, 255.0) as u8);
+        out.push((gg * 255.0).round().clamp(0.0, 255.0) as u8);
+        out.push((bb * 255.0).round().clamp(0.0, 255.0) as u8);
+    }
+
+    drop(view);
+    staging.unmap();
+    std::fs::write(path, &out).expect("write ppm");
 }
