@@ -211,11 +211,80 @@ pub(super) fn tick_instance_pipeline(
 
     // 8. Encode bake dispatches.
     if !dirty_bakes.is_empty() {
+        // Pre-compute every dirty bake's per-level rollup uniforms so
+        // we can write the rollup uniform buffer (dynamic-offset
+        // backed) ONCE per submit instead of per-level. Layout:
+        //   [bake0_level0, bake0_level1, ..., bake1_level0, ...]
+        // each entry padded to ROLLUP_UNIFORM_STRIDE.
+        use rkp_render::user_shader_proto_pass::{
+            level_starts_inclusive, RollupUniform, ROLLUP_UNIFORM_STRIDE,
+        };
+        let stride = ROLLUP_UNIFORM_STRIDE as usize;
+        // Total entries = sum of max_depth across dirty bakes (one
+        // entry per internal level, levels 0..max_depth-1 inclusive).
+        let total_entries: usize =
+            dirty_bakes.iter().map(|b| b.max_depth as usize).sum();
+        let mut rollup_bytes = vec![0u8; total_entries * stride];
+        // Per-bake start offset into the rollup buffer (in entries),
+        // so we can address each bake's level k as
+        // (bake_entry_base + k) * stride.
+        let mut bake_entry_bases: Vec<usize> = Vec::with_capacity(dirty_bakes.len());
+        let mut entry_cursor: usize = 0;
+        for bake in &dirty_bakes {
+            bake_entry_bases.push(entry_cursor);
+            let levels = level_starts_inclusive(bake.max_depth);
+            for k in 0..bake.max_depth {
+                let parent_first_offset = proto_octree_base_elems
+                    + bake.octree_extent_offset
+                    + levels[k as usize];
+                let parent_count = 8u32.pow(k);
+                let u = RollupUniform {
+                    parent_first_offset,
+                    parent_count,
+                    _pad0: 0,
+                    _pad1: 0,
+                };
+                let off = (entry_cursor + k as usize) * stride;
+                rollup_bytes[off..off + 16]
+                    .copy_from_slice(bytemuck::bytes_of(&u));
+            }
+            entry_cursor += bake.max_depth as usize;
+        }
+        if !rollup_bytes.is_empty() {
+            state.queue.write_buffer(
+                &state.instance_proto_pass.rollup_uniform_buffer,
+                0,
+                &rollup_bytes,
+            );
+        }
+        // Build the rollup bind groups once — they don't change across
+        // levels (the dynamic offset selects the per-level entry).
+        let rollup_g0 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("inst rollup g0"),
+            layout: &state.instance_proto_pass.rollup_group0_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: state.renderer.scene.octree_nodes_buffer.as_entire_binding(),
+            }],
+        });
+        let rollup_g1 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("inst rollup g1"),
+            layout: &state.instance_proto_pass.rollup_group1_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &state.instance_proto_pass.rollup_uniform_buffer,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(16),
+                }),
+            }],
+        });
+
         let mut encoder = state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("inst bake"),
         });
         let bake_q = state.renderer.profiler.begin_query("inst_bake", &mut encoder);
-        for bake in &dirty_bakes {
+        for (bi, bake) in dirty_bakes.iter().enumerate() {
             // Pre-fill internal octree levels at the proto's reserved
             // offset within the host octree pool.
             let internal = build_internal_levels(
@@ -267,14 +336,38 @@ pub(super) fn tick_instance_pipeline(
             });
 
             let bricks_per_axis = 1u32 << bake.max_depth;
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("inst bake"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&state.instance_proto_pass.bake_pipeline);
-            cpass.set_bind_group(0, &bake_g0, &[]);
-            cpass.set_bind_group(1, &bake_g1, &[]);
-            cpass.dispatch_workgroups(bricks_per_axis, bricks_per_axis, bricks_per_axis);
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("inst bake"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&state.instance_proto_pass.bake_pipeline);
+                cpass.set_bind_group(0, &bake_g0, &[]);
+                cpass.set_bind_group(1, &bake_g1, &[]);
+                cpass.dispatch_workgroups(bricks_per_axis, bricks_per_axis, bricks_per_axis);
+            }
+
+            // Roll-up: bottom-up coarsen empty subtrees so miss-marches
+            // skip across them in one outer-DDA step instead of one per
+            // leaf-level empty cell. One dispatch per internal level
+            // (max_depth-1 down to 0); each dispatch is its own compute
+            // pass so wgpu's storage-buffer hazard tracking inserts the
+            // barrier between levels (level k reads children written by
+            // level k+1's dispatch).
+            for k in (0..bake.max_depth).rev() {
+                let parent_count = 8u32.pow(k);
+                let workgroups = (parent_count + 63) / 64;
+                let entry_idx = bake_entry_bases[bi] + k as usize;
+                let dyn_offset = (entry_idx * stride) as u32;
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("inst rollup"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&state.instance_proto_pass.rollup_pipeline);
+                cpass.set_bind_group(0, &rollup_g0, &[]);
+                cpass.set_bind_group(1, &rollup_g1, &[dyn_offset]);
+                cpass.dispatch_workgroups(workgroups, 1, 1);
+            }
         }
         state.renderer.profiler.end_query(&mut encoder, bake_q);
         state.queue.submit(Some(encoder.finish()));

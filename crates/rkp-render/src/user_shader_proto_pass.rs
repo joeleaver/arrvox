@@ -38,7 +38,10 @@ pub mod types;
 
 // Public re-exports — keep `rkp_render::user_shader_proto_pass::Foo` stable.
 pub use cache::{build_internal_levels, PrototypeCache};
-pub use pass::{compose_proto_source, PrototypeBakePass, PrototypeUniform};
+pub use pass::{
+    compose_proto_source, PrototypeBakePass, PrototypeUniform, RollupUniform,
+    ROLLUP_UNIFORM_BUFFER_SIZE, ROLLUP_UNIFORM_STRIDE,
+};
 pub use types::{
     level_starts_inclusive, max_bricks_for_depth, max_leaf_attrs_for_depth,
     octree_node_count_for_depth, PrototypeEntry, DEFAULT_PROTO_MAX_DEPTH, MAX_PROTOTYPES,

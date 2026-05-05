@@ -74,6 +74,19 @@ pub struct PrototypeBakePass {
     pub group1_layout: wgpu::BindGroupLayout,
     pub pipeline_layout: wgpu::PipelineLayout,
     pub bake_pipeline: wgpu::ComputePipeline,
+    /// Bottom-up empty-coarsen pass. Runs after the leaf-level bake to
+    /// collapse internal nodes whose 8 children are all `OCTREE_EMPTY`
+    /// — without it, miss-marches descend from root to leaf to find
+    /// an empty cell, costing O(max_depth) octree-DDA steps per skip.
+    /// Layout uses `octree_nodes` only at group(0) and a small per-
+    /// level uniform at group(1).
+    pub rollup_group0_layout: wgpu::BindGroupLayout,
+    pub rollup_group1_layout: wgpu::BindGroupLayout,
+    pub rollup_pipeline_layout: wgpu::PipelineLayout,
+    pub rollup_pipeline: wgpu::ComputePipeline,
+    /// Per-level `RollupUniform { parent_first_offset, parent_count, … }`.
+    /// Re-written CPU-side once per level per bake.
+    pub rollup_uniform_buffer: wgpu::Buffer,
     /// Single-pair `GlobalCursors { brick: atomic<u32>, leaf_attr: atomic<u32> }`
     /// at group(0) binding(3). 8 bytes total.
     pub cursors_buffer: wgpu::Buffer,
@@ -155,11 +168,55 @@ impl PrototypeBakePass {
             mapped_at_creation: false,
         });
 
+        // Roll-up resources. Group 0 = octree_nodes (RW). Group 1 =
+        // RollupUniform (16 B). The shader entry point lives in the
+        // same WGSL file as the bake but compiles to its own pipeline.
+        let rollup_group0_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("user_shader_proto rollup group0"),
+            entries: &[rw_storage(0)], // octree_nodes
+        });
+        // Dynamic-offset uniform: one bind group, MAX_PROTO_MAX_DEPTH
+        // sub-entries spaced at ROLLUP_UNIFORM_STRIDE. Lets us write
+        // every level's uniform in one shot before dispatching, then
+        // pick the per-level offset per `set_bind_group` call. Avoids
+        // the "last write wins on shared buffer" pitfall when multiple
+        // dispatches in one submit need different uniforms.
+        let rollup_group1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("user_shader_proto rollup group1"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: std::num::NonZeroU64::new(16),
+                },
+                count: None,
+            }],
+        });
+        let rollup_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("user_shader_proto rollup pipeline layout"),
+            bind_group_layouts: &[Some(&rollup_group0_layout), Some(&rollup_group1_layout)],
+            immediate_size: 0,
+        });
+        let rollup_pipeline = build_rollup_pipeline(device, &rollup_pipeline_layout);
+        let rollup_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("user_shader_proto rollup uniform"),
+            size: ROLLUP_UNIFORM_BUFFER_SIZE,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             group0_layout,
             group1_layout,
             pipeline_layout,
             bake_pipeline,
+            rollup_group0_layout,
+            rollup_group1_layout,
+            rollup_pipeline_layout,
+            rollup_pipeline,
+            rollup_uniform_buffer,
             cursors_buffer,
             overflow_buffer,
             proto_uniform_buffer,
@@ -238,6 +295,50 @@ fn build_proto_pipeline(
         cache: None,
     })
 }
+
+/// Build the roll-up pipeline. The roll-up shader is independent of
+/// any user-shader chunk — it's pure octree-structure work — so it
+/// uses its own self-contained WGSL file with no compose splicing.
+fn build_rollup_pipeline(
+    device: &wgpu::Device,
+    pipeline_layout: &wgpu::PipelineLayout,
+) -> wgpu::ComputePipeline {
+    let source = wesl::include_wesl!("user_shader_proto_rollup");
+    let module = crate::compile_pass_shader(device, source, "user_shader_proto_rollup");
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("user_shader_proto rollup"),
+        layout: Some(pipeline_layout),
+        module: &module,
+        entry_point: Some("proto_rollup_main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+/// CPU mirror of the WGSL `RollupUniform`. Caller writes one of these
+/// per level into [`PrototypeBakePass::rollup_uniform_buffer`] and
+/// dispatches the roll-up pipeline. 16 bytes — matches the WGSL
+/// `min_binding_size`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RollupUniform {
+    pub parent_first_offset: u32,
+    pub parent_count: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+
+/// Stride between consecutive [`RollupUniform`] entries in
+/// [`PrototypeBakePass::rollup_uniform_buffer`]. wgpu's
+/// `min_uniform_buffer_offset_alignment` is at most 256 B on every
+/// supported backend; padding entries to that lets the dynamic-offset
+/// binding accept any level index without device-specific math.
+pub const ROLLUP_UNIFORM_STRIDE: u64 = 256;
+
+/// Total size of the roll-up uniform buffer — one stride-aligned
+/// entry per supported max_depth level.
+pub const ROLLUP_UNIFORM_BUFFER_SIZE: u64 =
+    ROLLUP_UNIFORM_STRIDE * super::types::MAX_PROTO_MAX_DEPTH as u64;
 
 /// Splice the composer's `proto` chunk into the bake shader source.
 /// Empty chunk returns the in-tree default (which has its own
