@@ -313,7 +313,7 @@ const PHASE_NORMAL: u32 = 1u;
 // march doesn't redo the affine inverse — saves ~30 ops per
 // (instance × pixel).
 @group(2) @binding(14) var<storage, read> user_shader_instance_inv_world: array<mat4x4<f32>>;
-const USER_SHADER_MAX_INSTANCES_PER_TILE: u32 = 256u;
+const USER_SHADER_MAX_INSTANCES_PER_TILE: u32 = 1024u;
 
 // Phase B-redux Phase 3a — per-material `shader_params` flat array
 // (8 × f32 per material slot, indexed by `material_id * 8 + i`).

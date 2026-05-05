@@ -12,7 +12,7 @@
 //! `tick_emit_pass` and the march dispatch.
 //!
 //! Capacity:
-//!   - `MAX_INSTANCES_PER_TILE = 256` matches the WGSL constant.
+//!   - `MAX_INSTANCES_PER_TILE = 1024` matches the WGSL constant.
 //!   - `tile_lists` size = `num_tiles × 256 × 4 bytes`. At 1920×1080
 //!     (240×135 = 32400 tiles) that's 32 MB.
 //!   - Overflow drops silently — visible artifact: blades disappear
@@ -26,7 +26,7 @@ use crate::compile_pass_shader;
 
 /// Mirror of the WGSL constant. Tile-list buffer sizing depends on
 /// it; engine multiplies tile count by this when sizing the buffer.
-pub const MAX_INSTANCES_PER_TILE: u32 = 256;
+pub const MAX_INSTANCES_PER_TILE: u32 = 1024;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
