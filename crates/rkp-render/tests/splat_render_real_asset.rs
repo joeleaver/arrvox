@@ -16,7 +16,9 @@
 use std::io::BufReader;
 
 use glam::{Mat4, Vec3};
-use rkp_render::splat_pass::{extract_splats, SplatCamera, SplatPass, SplatPassConfig};
+use rkp_render::splat_pass::{
+    extract_splats_with_radius, SplatCamera, SplatPass, SplatPassConfig, DISC_RADIUS_FACTOR,
+};
 
 const W: u32 = 1920;
 const H: u32 = 1080;
@@ -99,17 +101,28 @@ fn splat_renders_elephant_and_reports_gpu_time() {
     let grid_origin = (aabb_min + aabb_max) * 0.5 - Vec3::splat(extent * 0.5);
 
     // ── 2. Extract splats ───────────────────────────────────────────
+    // Disc radius factor — controls overlap between adjacent splats.
+    // Default is 0.6 (just enough to cover diagonals on flat surfaces);
+    // bump higher to mask glancing-angle silhouette stepping.
+    let radius_factor: f32 = std::env::var("RKP_SPLAT_RADIUS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DISC_RADIUS_FACTOR);
     let extract_started = std::time::Instant::now();
-    let splats = extract_splats(
+    let splats = extract_splats_with_radius(
         &octree_nodes,
         header.octree_depth as u8,
         header.base_voxel_size,
         grid_origin,
         Mat4::IDENTITY,
         bricks,
+        radius_factor,
     );
     let extract_ms = extract_started.elapsed().as_secs_f32() * 1000.0;
-    eprintln!("[splat_render] extracted {} splats in {extract_ms:.1} ms", splats.len());
+    eprintln!(
+        "[splat_render] extracted {} splats in {extract_ms:.1} ms (radius_factor={radius_factor})",
+        splats.len(),
+    );
 
     // ── 3. Upload buffers ───────────────────────────────────────────
     use wgpu::util::DeviceExt;

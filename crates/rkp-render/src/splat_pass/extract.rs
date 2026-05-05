@@ -49,6 +49,11 @@ pub const DISC_RADIUS_FACTOR: f32 = 0.6;
 /// Walk a brick-terminated octree and emit one [`SplatVertex`] per
 /// occupied cell.
 ///
+/// `radius_factor` scales the disc radius by `cell_size`. The default
+/// for ad-hoc callers is [`DISC_RADIUS_FACTOR`] (0.6); silhouettes can
+/// step at glancing angles when this is too tight, so the prototype
+/// test exposes it via env var. 0.6–0.9 is the sensible range.
+///
 /// * `octree_nodes` — raw `nodes` slice from the asset's `SparseOctree`
 ///   (or directly from `rkp_core::asset_file::read_rkp_octree`). Root at
 ///   index 0; branch nodes hold a child-array offset, leaf-likes are
@@ -77,6 +82,29 @@ pub fn extract_splats(
     asset_world: Mat4,
     brick_cells: &[u32],
 ) -> Vec<SplatVertex> {
+    extract_splats_with_radius(
+        octree_nodes,
+        octree_depth,
+        base_voxel_size,
+        grid_origin,
+        asset_world,
+        brick_cells,
+        DISC_RADIUS_FACTOR,
+    )
+}
+
+/// Like [`extract_splats`] but takes an explicit `radius_factor` so
+/// callers can sweep the silhouette-overlap-vs-overshoot trade-off
+/// without recompiling.
+pub fn extract_splats_with_radius(
+    octree_nodes: &[u32],
+    octree_depth: u8,
+    base_voxel_size: f32,
+    grid_origin: Vec3,
+    asset_world: Mat4,
+    brick_cells: &[u32],
+    radius_factor: f32,
+) -> Vec<SplatVertex> {
     // Cap pre-allocation at a few million to avoid wild OOM on huge
     // assets; the Vec will still grow if the cap is too low.
     let max_capacity = (brick_cells.len()).min(8_000_000);
@@ -94,6 +122,7 @@ pub fn extract_splats(
         base_voxel_size,
         grid_origin,
         asset_world,
+        radius_factor,
         &mut out,
     );
     out
@@ -110,6 +139,7 @@ fn walk(
     vs: f32,
     grid_origin: Vec3,
     asset_world: Mat4,
+    radius_factor: f32,
     out: &mut Vec<SplatVertex>,
 ) {
     let node = nodes[node_idx];
@@ -131,7 +161,7 @@ fn walk(
         let world = asset_world.transform_point3(center_local);
         out.push(SplatVertex {
             world_pos: world.to_array(),
-            radius: cell_size * DISC_RADIUS_FACTOR,
+            radius: cell_size * radius_factor,
             leaf_attr_id: leaf_slot(node),
             _pad: [0; 3],
         });
@@ -161,7 +191,7 @@ fn walk(
                     let world = asset_world.transform_point3(center_local);
                     out.push(SplatVertex {
                         world_pos: world.to_array(),
-                        radius: vs * DISC_RADIUS_FACTOR,
+                        radius: vs * radius_factor,
                         leaf_attr_id: c,
                         _pad: [0; 3],
                     });
@@ -192,6 +222,7 @@ fn walk(
                 vs,
                 grid_origin,
                 asset_world,
+                radius_factor,
                 out,
             );
         }

@@ -14,5 +14,7 @@
 pub mod extract;
 pub mod pass;
 
-pub use extract::{extract_splats, SplatVertex, DISC_RADIUS_FACTOR};
+pub use extract::{
+    extract_splats, extract_splats_with_radius, SplatVertex, DISC_RADIUS_FACTOR,
+};
 pub use pass::{SplatCamera, SplatPass, SplatPassConfig, SPLAT_CAMERA_BYTES};
