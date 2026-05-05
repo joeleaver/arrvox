@@ -271,7 +271,16 @@ fn brick_id_of(node: u32) -> u32 {
 //                   attributable to user-shader emit instances)
 // stats[75]      = emit-scan pixels that produced an opaque hit from
 //                   an emitted instance (`r.alpha > 0.99` branch taken)
-// stats[76..80]  = (reserved — slack for future emit-scan counters)
+// stats[76]      = emit-scan OUTER octree-DDA steps (sum across all
+//                   emit marches; includes EMPTY-cell skip_node hops)
+// stats[77]      = emit-scan BRICK-DDA steps (sum across all emit
+//                   marches; cell-by-cell traversal inside a 4³ brick)
+// stats[78]      = emit-scan marches that returned `r.valid == false`
+//                   (proto descent ran but found no surface — the
+//                   "miss" path that dominates a sparse paint)
+// stats[79]      = emit-scan miss-march descent steps (sum of `r.steps`
+//                   for marches with `r.valid == false`); the per-miss
+//                   step cost = `stats[79] / stats[78]`
 //
 // octree_nodes reads are derived CPU-side from the per-phase depth histograms:
 // sum(bucket[i] * (i + 1)) since each lookup descends `depth+1` nodes.
@@ -535,7 +544,19 @@ struct MarchResult {
     t: f32,
     first_slot: u32,        // voxel_pool slot (already dereferenced from leaf_attr)
     valid: bool,
-    steps: u32,             // total steps taken (for profiling)
+    steps: u32,             // total steps taken (= outer_steps + brick_steps)
+    // Profiling split:
+    //   outer_steps = top-level octree DDA iterations (one per
+    //                 `octree_lookup` call). Includes EMPTY-cell
+    //                 skip_node hops and BRICK transitions.
+    //   brick_steps = inside-brick DDA iterations (one per cell
+    //                 visited within a 4³ brick).
+    // The two are tracked separately so callers can tell whether a
+    // long march is dominated by empty-space stepping vs. brick-
+    // interior traversal. `steps = outer + brick` for compatibility
+    // with existing readers.
+    outer_steps: u32,
+    brick_steps: u32,
     // Glass tracking. Set when the ray traverses at least one
     // transparent voxel (material opacity < 0.99) before landing on
     // the opaque `first_slot` (or exiting the object without one).
@@ -641,6 +662,7 @@ fn march_object_skinned(
     var result = MarchResult(
         vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0),
         0.0, 0.0, 0u, false, 0u,
+        0u, 0u, // outer_steps, brick_steps
         false, vec3<f32>(0.0), 0u, 0.0, 0.0,
         0u, // glass_slot
     );
@@ -686,10 +708,11 @@ fn march_object_skinned(
     if t_range.x > t_range.y { return result; }
 
     var t = max(t_range.x, 0.0) + vs * 0.001;
-    var step_count = 0u;
-
+    // Skinned path has no brick DDA — every step is an "outer" step.
+    var outer_steps = 0u;
+    var brick_steps = 0u;
     for (var step = 0u; step < SKINNED_MAX_STEPS; step++) {
-        step_count += 1u;
+        outer_steps += 1u;
         if t > t_range.y { break; }
 
         let p_local = local_origin + safe_dir * t;
@@ -746,11 +769,11 @@ fn march_object_skinned(
         result.t = t;
         result.first_slot = leaf_slot;
         result.valid = true;
-        result.steps = step_count;
+        result.outer_steps = outer_steps; result.brick_steps = brick_steps; result.steps = outer_steps + brick_steps;
         return result;
     }
 
-    result.steps = step_count;
+    result.outer_steps = outer_steps; result.brick_steps = brick_steps; result.steps = outer_steps + brick_steps;
     return result;
 }
 
@@ -772,6 +795,7 @@ fn march_object_inner(
     var result = MarchResult(
         vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0),
         0.0, 0.0, 0u, false, 0u,
+        0u, 0u, // outer_steps, brick_steps
         false, vec3<f32>(0.0), 0u, 0.0, 0.0,
         0u, // glass_slot
     );
@@ -805,7 +829,8 @@ fn march_object_inner(
     }
 
     var t = t_range.x;
-    var step_count = 0u;
+    var outer_steps = 0u;
+    var brick_steps = 0u;
     // Forward bias for octree_lookup / skip_node — disambiguates the
     // pos-on-exact-boundary case where `pos >= center` would otherwise
     // round into an EMPTY sibling subtree and miss the brick we're
@@ -813,7 +838,7 @@ fn march_object_inner(
     let lookup_bias = vs * OCTREE_LOOKUP_BIAS_FACTOR;
 
     for (var step = 0u; step < MAX_STEPS; step++) {
-        step_count += 1u;
+        outer_steps += 1u;
         if t > t_range.y { break; }
         if result.alpha > 0.99 { break; }
 
@@ -865,7 +890,7 @@ fn march_object_inner(
 
             var brick_done = false;
             for (var bs = 0u; bs < BRICK_MAX_STEPS; bs++) {
-                step_count += 1u;
+                brick_steps += 1u;
                 if t > t_range.y { brick_done = true; break; }
                 if result.alpha > 0.99 { brick_done = true; break; }
 
@@ -918,7 +943,7 @@ fn march_object_inner(
                         // would pack as a non-zero RGB565 and override
                         // the material with grey).
                         result.color = vec3<f32>(0.0);
-                        result.steps = step_count;
+                        result.outer_steps = outer_steps; result.brick_steps = brick_steps; result.steps = outer_steps + brick_steps;
                         brick_done = true;
                         break;
                     }
@@ -1027,7 +1052,7 @@ fn march_object_inner(
                             );
                         }
                         result.color = color;
-                        result.steps = step_count;
+                        result.outer_steps = outer_steps; result.brick_steps = brick_steps; result.steps = outer_steps + brick_steps;
                         brick_done = true;
                         break;
                     } else {
@@ -1166,11 +1191,11 @@ fn march_object_inner(
             }
         }
         result.color = color;
-        result.steps = step_count;
+        result.outer_steps = outer_steps; result.brick_steps = brick_steps; result.steps = outer_steps + brick_steps;
         break; // done — first-surface hit
     }
 
-    result.steps = step_count;
+    result.outer_steps = outer_steps; result.brick_steps = brick_steps; result.steps = outer_steps + brick_steps;
     return result;
 }
 
@@ -1429,6 +1454,10 @@ fn main(
     var emit_marches: u32 = 0u;
     var emit_steps: u32 = 0u;
     var emit_hits: u32 = 0u;
+    var emit_outer_steps: u32 = 0u;
+    var emit_brick_steps: u32 = 0u;
+    var emit_misses: u32 = 0u;
+    var emit_miss_steps: u32 = 0u;
     if march_params.uss_disable == 0u {
         let us_pixel_tile_x = u32(coord.x) / 8u;
         let us_pixel_tile_y = u32(coord.y) / 8u;
@@ -1471,8 +1500,14 @@ fn main(
             let r = march_object_inner(local_origin, local_dir_unnorm, inst, asset);
             emit_marches = emit_marches + 1u;
             emit_steps = emit_steps + r.steps;
+            emit_outer_steps = emit_outer_steps + r.outer_steps;
+            emit_brick_steps = emit_brick_steps + r.brick_steps;
             total_steps += r.steps;
-            if !r.valid { continue; }
+            if !r.valid {
+                emit_misses = emit_misses + 1u;
+                emit_miss_steps = emit_miss_steps + r.steps;
+                continue;
+            }
 
             let inv_a = 1.0 / max(r.alpha, 0.001);
             let oc_pos = r.oc_pos * inv_a;
@@ -1526,11 +1561,15 @@ fn main(
     // accumulation above; one atomic per slot per pixel here. Skipped
     // when the counter is zero so empty-tile pixels don't pay for the
     // atomic at all.
-    if emit_candidates != 0u { atomicAdd(&stats[71], emit_candidates); }
-    if emit_aabb_pass  != 0u { atomicAdd(&stats[72], emit_aabb_pass); }
-    if emit_marches    != 0u { atomicAdd(&stats[73], emit_marches); }
-    if emit_steps      != 0u { atomicAdd(&stats[74], emit_steps); }
-    if emit_hits       != 0u { atomicAdd(&stats[75], emit_hits); }
+    if emit_candidates  != 0u { atomicAdd(&stats[71], emit_candidates); }
+    if emit_aabb_pass   != 0u { atomicAdd(&stats[72], emit_aabb_pass); }
+    if emit_marches     != 0u { atomicAdd(&stats[73], emit_marches); }
+    if emit_steps       != 0u { atomicAdd(&stats[74], emit_steps); }
+    if emit_hits        != 0u { atomicAdd(&stats[75], emit_hits); }
+    if emit_outer_steps != 0u { atomicAdd(&stats[76], emit_outer_steps); }
+    if emit_brick_steps != 0u { atomicAdd(&stats[77], emit_brick_steps); }
+    if emit_misses      != 0u { atomicAdd(&stats[78], emit_misses); }
+    if emit_miss_steps  != 0u { atomicAdd(&stats[79], emit_miss_steps); }
 
     // Footprint histogram: size in pixels of the finest voxel at the hit point.
     // <1px means we walked to a mip level finer than the screen can resolve.

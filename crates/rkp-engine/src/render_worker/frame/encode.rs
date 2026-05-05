@@ -367,29 +367,9 @@ pub(super) fn encode_viewports(
                 eprint_march_stats(vp.id, stats);
             }
             vr.march.submit_stats_readback();
-            let count = state.user_shader_emit_pass.try_drain_count();
-            if let Some(c) = count {
-                eprintln!("[user_shader_emit] emitted instances={c}");
+            if let Some(count) = state.user_shader_emit_pass.try_drain_count() {
+                eprintln!("[user_shader_emit] emitted instances={count}");
             }
-            // Heartbeat — also dumps stats[0] (total march steps) and
-            // stats[71..76] (the new emit-scan counters) raw, so we
-            // can see whether the writes are landing at all.
-            let s = drained_stats.as_deref();
-            let total = s.and_then(|s| s.first()).copied().unwrap_or(0);
-            let cands = s.and_then(|s| s.get(71)).copied().unwrap_or(0);
-            let aabb = s.and_then(|s| s.get(72)).copied().unwrap_or(0);
-            let marches = s.and_then(|s| s.get(73)).copied().unwrap_or(0);
-            let steps = s.and_then(|s| s.get(74)).copied().unwrap_or(0);
-            let hits = s.and_then(|s| s.get(75)).copied().unwrap_or(0);
-            eprintln!(
-                "[march_stats vp={:?}] heartbeat: drain={} count={:?} \
-                 total_steps={} | s71={} s72={} s73={} s74={} s75={}",
-                vp.id,
-                if drained_stats.is_some() { "data" } else { "none" },
-                count,
-                total,
-                cands, aabb, marches, steps, hits,
-            );
         }
     }
 
@@ -405,7 +385,7 @@ pub(super) fn encode_viewports(
 }
 
 /// Format the user-shader emit-scan breakdown from a stats snapshot.
-/// See `shaders/octree_march.wesl` for the slot layout (stats[71..76]).
+/// See `shaders/octree_march.wesl` for the slot layout (stats[71..80]).
 /// Silent when the emit scan didn't fire this frame, so the line only
 /// shows up when there's actually a user-shader paint contributing.
 fn eprint_march_stats(vp_id: crate::viewport::ViewportId, stats: &[u32]) {
@@ -417,22 +397,50 @@ fn eprint_march_stats(vp_id: crate::viewport::ViewportId, stats: &[u32]) {
     let marches = stats.get(73).copied().unwrap_or(0);
     let descent_steps = stats.get(74).copied().unwrap_or(0);
     let hits = stats.get(75).copied().unwrap_or(0);
+    let outer_steps = stats.get(76).copied().unwrap_or(0);
+    let brick_steps = stats.get(77).copied().unwrap_or(0);
+    let misses = stats.get(78).copied().unwrap_or(0);
+    let miss_steps = stats.get(79).copied().unwrap_or(0);
     let total_steps = stats.first().copied().unwrap_or(0);
     let host_steps = total_steps.saturating_sub(descent_steps);
-    let cull_pct = if candidates == 0 {
-        0.0
-    } else {
-        100.0 * (1.0 - (aabb_pass as f64 / candidates as f64))
-    };
+
+    let cull_pct = 100.0 * (1.0 - (aabb_pass as f64 / candidates as f64));
     let emit_step_pct = if total_steps == 0 {
         0.0
     } else {
         100.0 * descent_steps as f64 / total_steps as f64
     };
+    let outer_pct = if descent_steps == 0 {
+        0.0
+    } else {
+        100.0 * outer_steps as f64 / descent_steps as f64
+    };
+    let hit_marches = marches.saturating_sub(misses);
+    let hit_steps = descent_steps.saturating_sub(miss_steps);
+    let steps_per_miss = if misses == 0 {
+        0.0
+    } else {
+        miss_steps as f64 / misses as f64
+    };
+    let steps_per_hit = if hit_marches == 0 {
+        0.0
+    } else {
+        hit_steps as f64 / hit_marches as f64
+    };
+    let miss_pct = if marches == 0 {
+        0.0
+    } else {
+        100.0 * misses as f64 / marches as f64
+    };
+
     eprintln!(
         "[emit_scan vp={vp_id:?}] candidates={candidates} \
-         aabb_pass={aabb_pass} ({cull_pct:.1}% culled) marches={marches} \
-         hits={hits} | steps: emit={descent_steps} host={host_steps} \
-         (emit={emit_step_pct:.1}% of total)",
+         aabb_pass={aabb_pass} ({cull_pct:.1}% culled) \
+         marches={marches} ({miss_pct:.1}% miss) hits={hits} | \
+         steps: emit={descent_steps} host={host_steps} \
+         (emit={emit_step_pct:.1}% of total) | \
+         split: outer={outer_steps} brick={brick_steps} \
+         ({outer_pct:.1}% outer) | \
+         per-march: miss={steps_per_miss:.1} hit={steps_per_hit:.1}",
     );
 }
