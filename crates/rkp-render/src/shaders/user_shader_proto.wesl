@@ -90,7 +90,7 @@ struct GlobalCursors {
     leaf_attr: atomic<u32>,
 }
 
-@group(0) @binding(0) var<storage, read_write> octree_nodes: array<vec2<u32>>;
+@group(0) @binding(0) var<storage, read_write> octree_nodes: array<vec4<u32>>;
 @group(0) @binding(1) var<storage, read_write> brick_pool: array<u32>;
 @group(0) @binding(2) var<storage, read_write> leaf_attr_pool: array<LeafAttr>;
 @group(0) @binding(3) var<storage, read_write> cursors: GlobalCursors;
@@ -103,6 +103,20 @@ struct GlobalCursors {
 var<workgroup> wg_any_emit: atomic<u32>;
 var<workgroup> wg_brick_offset: u32;
 var<workgroup> wg_alloc_failed: atomic<u32>;
+// Workgroup-shared tight-bounds tracking. Each thread evaluating an
+// occupied cell at lid.{x,y,z} ∈ [0, 4) atomicMin's its index into
+// `wg_tight_lo` and atomicMax's into `wg_tight_hi`. Thread 0 packs the
+// final extents into the leaf node's `.zw` so the march can early-out
+// on rays that don't pass through the brick's actual occupied region
+// rather than the full 4³ cell. Initial sentinel values: lo = 4 (no
+// cell emitted yet — overwritten downward by any real emit), hi = 0
+// (overwritten upward).
+var<workgroup> wg_tight_lo_x: atomic<u32>;
+var<workgroup> wg_tight_lo_y: atomic<u32>;
+var<workgroup> wg_tight_lo_z: atomic<u32>;
+var<workgroup> wg_tight_hi_x: atomic<u32>;
+var<workgroup> wg_tight_hi_y: atomic<u32>;
+var<workgroup> wg_tight_hi_z: atomic<u32>;
 
 fn pack_oct(n: vec3<f32>) -> u32 {
     let l1 = abs(n.x) + abs(n.y) + abs(n.z);
@@ -178,18 +192,32 @@ fn proto_bake_main(
         atomicStore(&wg_any_emit, 0u);
         atomicStore(&wg_alloc_failed, 0u);
         wg_brick_offset = 0u;
+        // Sentinels: lo = 4 (above any valid cell idx), hi = 0. The
+        // first occupied cell pulls them into the valid 0..3 range.
+        atomicStore(&wg_tight_lo_x, 4u);
+        atomicStore(&wg_tight_lo_y, 4u);
+        atomicStore(&wg_tight_lo_z, 4u);
+        atomicStore(&wg_tight_hi_x, 0u);
+        atomicStore(&wg_tight_hi_y, 0u);
+        atomicStore(&wg_tight_hi_z, 0u);
         // Pre-write OCTREE_EMPTY at the leaf slot. Thread 0 below
         // overwrites with a brick reference iff any cell emitted.
         // Mirrors the brick_fill_main pattern — required for
         // deterministic re-bakes (free old extents, the leaf level
         // would carry stale brick references otherwise).
-        octree_nodes[leaf_octree_offset] = vec2<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE);
+        octree_nodes[leaf_octree_offset] = vec4<u32>(OCTREE_EMPTY, INTERNAL_ATTR_NONE, 0u, 0u);
     }
     workgroupBarrier();
 
     let emit = dispatch_user_proto(proto_u.shader_id, uvw);
     if (emit.occupancy != 0u) {
         atomicStore(&wg_any_emit, 1u);
+        atomicMin(&wg_tight_lo_x, lid.x);
+        atomicMin(&wg_tight_lo_y, lid.y);
+        atomicMin(&wg_tight_lo_z, lid.z);
+        atomicMax(&wg_tight_hi_x, lid.x);
+        atomicMax(&wg_tight_hi_y, lid.y);
+        atomicMax(&wg_tight_hi_z, lid.z);
     }
     workgroupBarrier();
 
@@ -205,9 +233,30 @@ fn proto_bake_main(
                 atomicStore(&wg_alloc_failed, 1u);
             } else {
                 wg_brick_offset = brick_id * BRICK_CELLS;
-                octree_nodes[leaf_octree_offset] = vec2<u32>(
+                // Encode the brick's tight occupancy AABB. Each
+                // occupied cell at lid.* ∈ [0, 3] maps to the [lid *
+                // 0.25, (lid + 1) * 0.25] range in normalized brick
+                // space. floor/ceil rounding guarantees the encoded
+                // bounds never reject a ray that might hit an
+                // emitted cell.
+                let min_x = atomicLoad(&wg_tight_lo_x);
+                let min_y = atomicLoad(&wg_tight_lo_y);
+                let min_z = atomicLoad(&wg_tight_lo_z);
+                let max_x = atomicLoad(&wg_tight_hi_x);
+                let max_y = atomicLoad(&wg_tight_hi_y);
+                let max_z = atomicLoad(&wg_tight_hi_z);
+                let lo_x = u32(floor(f32(min_x) * 63.75));
+                let lo_y = u32(floor(f32(min_y) * 63.75));
+                let lo_z = u32(floor(f32(min_z) * 63.75));
+                let hi_x = u32(ceil(f32(max_x + 1u) * 63.75));
+                let hi_y = u32(ceil(f32(max_y + 1u) * 63.75));
+                let hi_z = u32(ceil(f32(max_z + 1u) * 63.75));
+                let aabb_lo = (lo_z << 16u) | (lo_y << 8u) | lo_x;
+                let aabb_hi = (hi_z << 16u) | (hi_y << 8u) | hi_x;
+                octree_nodes[leaf_octree_offset] = vec4<u32>(
                     OCTREE_LEAF_BIT | OCTREE_BRICK_BIT | brick_id,
                     INTERNAL_ATTR_NONE,
+                    aabb_lo, aabb_hi,
                 );
             }
         } else {

@@ -136,12 +136,15 @@ fn rkp_object_visible(inst: RkpInstance) -> bool {
 // before bricks landed; we reused the slot to stay under the 12
 // storage-buffer limit per shader stage.)
 @group(0) @binding(0) var<storage, read> brick_pool: array<u32>;
-// Each slot is (node_value, prefilter_attr_id). `.x` holds the existing
-// node encoding (EMPTY / INTERIOR / BRANCH offset / LEAF id / BRICK id);
-// `.y` holds a prefiltered leaf_attr_id for LOD-cutoff early-exit, or
-// INTERNAL_ATTR_NONE (0xFFFFFFFF) when unavailable. Interleaved into a
-// single `vec2<u32>` binding to stay under the 12-storage-buffer limit.
-@group(0) @binding(1) var<storage, read> octree_nodes: array<vec2<u32>>;
+// Each slot is (node_value, prefilter_attr_id, tight_aabb_lo, tight_aabb_hi).
+// `.x` holds the existing node encoding (EMPTY / INTERIOR / BRANCH offset
+// / LEAF id / BRICK id). `.y` holds a prefiltered leaf_attr_id for LOD-
+// cutoff early-exit, or INTERNAL_ATTR_NONE (0xFFFFFFFF) when unavailable.
+// `.zw` carry the quantized tight occupancy AABB (8-bit per axis × xyz,
+// last byte reserved); zeroed during Step 1 of the per-node tight-bounds
+// rollout. Interleaved into a single binding to stay under the
+// 12-storage-buffer limit.
+@group(0) @binding(1) var<storage, read> octree_nodes: array<vec4<u32>>;
 @group(0) @binding(2) var<storage, read> instances: array<RkpInstance>;
 @group(0) @binding(3) var<uniform> camera: CameraUniforms;
 // color_pool[leaf_attr_id] → packed R|G|B|A u32, 0 = no override (use
@@ -843,7 +846,11 @@ fn march_object_inner(
         if result.alpha > 0.99 { break; }
 
         let pos = clamp(oc_origin + safe_dir * (t + lookup_bias), vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
-        let r = octree_lookup(root, max_depth, extent, pos, PHASE_MARCH, march_params.lod_enabled, t, local_to_world, focal_px_y);
+        let r = octree_lookup(
+            root, max_depth, extent, pos,
+            oc_origin, inv_dir,
+            PHASE_MARCH, march_params.lod_enabled, t, local_to_world, focal_px_y,
+        );
 
         if r.slot == OCTREE_EMPTY {
             t += skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs);

@@ -258,24 +258,26 @@ pub fn build_internal_levels(
     pool_octree_base: u32,
     octree_block_offset: u32,
     max_depth: u32,
-) -> Vec<[u32; 2]> {
+) -> Vec<[u32; 4]> {
     let levels = level_starts_inclusive(max_depth);
     let total = levels[max_depth as usize + 1] as usize;
     let block_root = pool_octree_base + octree_block_offset;
-    let mut out: Vec<[u32; 2]> = Vec::with_capacity(total);
+    let mut out: Vec<[u32; 4]> = Vec::with_capacity(total);
     // Internal levels 0..max_depth-1: each node is a branch pointing to
-    // 8 children at the next level.
+    // 8 children at the next level. The trailing two u32 lanes are
+    // the per-node tight-AABB slots — zeroed during Step 1 of the
+    // rollout; bake/rollup fill them in Step 2.
     for k in 0..max_depth {
         let level_size = 8u32.saturating_pow(k);
         for i in 0..level_size {
             let first_child = block_root + levels[(k + 1) as usize] + i * 8;
-            out.push([first_child, INTERNAL_ATTR_NONE]);
+            out.push([first_child, INTERNAL_ATTR_NONE, 0u32, 0u32]);
         }
     }
     // Leaf level: bake fills these in. Initialize to EMPTY.
     let leaf_level_size = 8u32.saturating_pow(max_depth);
     for _ in 0..leaf_level_size {
-        out.push([OCTREE_EMPTY, INTERNAL_ATTR_NONE]);
+        out.push([OCTREE_EMPTY, INTERNAL_ATTR_NONE, 0u32, 0u32]);
     }
     debug_assert_eq!(out.len(), total);
     out

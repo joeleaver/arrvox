@@ -109,17 +109,29 @@ pub struct FrameUpload<'a> {
     pub instance_overlays: &'a [u8],
 }
 
+/// Storage stride (u32 lanes) of one octree node on the GPU. Lanes:
+///   .x = node value (EMPTY / INTERIOR / BRANCH offset / LEAF / BRICK id)
+///   .y = prefiltered-LOD attr id (INTERNAL_ATTR_NONE when absent)
+///   .z = quantized tight occupancy AABB lo (8 bits per axis × xyz, last
+///        byte reserved); zeroed during Step 1 of the per-node tight-bounds
+///        rollout — bake/march writes land in Steps 2/3.
+///   .w = quantized tight occupancy AABB hi (same layout); zeroed during
+///        Step 1.
+pub const OCTREE_NODE_U32S: usize = 4;
+/// Byte stride of one octree node on the GPU.
+pub const OCTREE_NODE_BYTES: u64 = (OCTREE_NODE_U32S * 4) as u64;
+
 /// GPU scene buffer manager for RKIPatch.
 ///
 /// Bind group layout (group 0):
 ///   0: brick_pool (storage, read) — flat array of u32 cells, `brick_id * 64 + idx` indexes into it.
 ///       (Was a dummy voxel_pool slot pre-bricks; repurposed because we
 ///       were one storage-buffer over the per-stage limit.)
-///   1: octree_nodes (storage, read) — `array<vec2<u32>>`: `.x` = node
-///       value (EMPTY / INTERIOR / BRANCH offset / LEAF id / BRICK id),
-///       `.y` = prefiltered-LOD attr id (INTERNAL_ATTR_NONE when absent).
-///       Interleaved to stay under the 12-storage-buffer-per-stage limit
-///       — a separate buffer would have pushed us over.
+///   1: octree_nodes (storage, read) — `array<vec4<u32>>`: see
+///       `OCTREE_NODE_U32S` for the lane layout. The buffer was
+///       interleaved (`vec2<u32>`) before per-node tight bounds; now
+///       widened to `vec4<u32>` with `.zw` reserved for the quantized
+///       AABB written at bake time.
 ///   2: objects (storage, read)
 ///   3: camera (uniform)
 ///   4: color_pool (storage, read) — parallel to leaf_attr_pool
@@ -222,8 +234,10 @@ pub struct RkpScene {
 impl RkpScene {
     pub fn new(device: &wgpu::Device) -> Self {
         let brick_pool_buffer = Self::create_storage(device, "rkp_brick_pool", 256);
-        // 8-byte stride: each slot is `vec2<u32>` (value, prefilter-id).
-        let octree_nodes_buffer = Self::create_storage(device, "rkp_octree_nodes", 8);
+        // 16-byte stride: each slot is `vec4<u32>` (value, prefilter-id, tight-aabb-lo, tight-aabb-hi).
+        let octree_nodes_buffer = Self::create_storage(
+            device, "rkp_octree_nodes", OCTREE_NODE_BYTES,
+        );
         let objects_buffer = Self::create_storage(
             device, "rkp_objects",
             std::mem::size_of::<RkpGpuInstance>() as u64,
@@ -501,16 +515,21 @@ impl RkpScene {
             "octree_nodes and octree_internal_attrs must have matching length",
         );
 
-        // Interleave (value, prefilter_id) into a `vec2<u32>`-layout buffer
-        // so a single binding slot carries both. Two separate bindings
-        // would have pushed us over the 12-storage-buffer-per-stage limit.
-        // One allocation per upload; octree_nodes uploads are rare
-        // (voxelize, load) so the cost is amortized.
-        let interleaved_u32_count = data.octree_nodes.len() * 2;
+        // Interleave (value, prefilter_id, aabb_lo, aabb_hi) into a
+        // `vec4<u32>`-layout buffer so a single binding slot carries
+        // all four lanes. The original (value, prefilter_id)-only
+        // interleave existed to stay under the 12-storage-buffer-per-
+        // stage limit; the .zw lanes are reserved for per-node tight
+        // bounds (Step 2 of the rollout writes real values; Step 1
+        // zeroes them). One allocation per upload; octree_nodes
+        // uploads are rare (voxelize, load) so the cost is amortized.
+        let interleaved_u32_count = data.octree_nodes.len() * OCTREE_NODE_U32S;
         let mut interleaved: Vec<u32> = Vec::with_capacity(interleaved_u32_count);
         for (i, &node) in data.octree_nodes.iter().enumerate() {
             interleaved.push(node);
             interleaved.push(data.octree_internal_attrs[i]);
+            interleaved.push(0u32);
+            interleaved.push(0u32);
         }
         let interleaved_bytes: &[u8] = bytemuck::cast_slice(&interleaved);
 

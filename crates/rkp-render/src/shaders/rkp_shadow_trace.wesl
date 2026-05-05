@@ -108,8 +108,10 @@ fn shadow_beer(glass_color: vec3<f32>, opacity: f32, thickness: f32) -> f32 {
 
 // Group 0: scene data (shared with march).
 @group(0) @binding(0) var<storage, read> brick_pool: array<u32>;
-// Interleaved (node_value, prefilter_attr_id) — see octree_march.wgsl.
-@group(0) @binding(1) var<storage, read> octree_nodes: array<vec2<u32>>;
+// Interleaved (node_value, prefilter_attr_id, tight_aabb_lo, tight_aabb_hi) —
+// see octree_march.wgsl. The .zw lanes are zeroed during Step 1 of the
+// per-node tight-bounds rollout; bake/march writes land in Steps 2/3.
+@group(0) @binding(1) var<storage, read> octree_nodes: array<vec4<u32>>;
 @group(0) @binding(2) var<storage, read> instances: array<RkpInstance>;
 @group(0) @binding(3) var<uniform> camera: CameraUniforms;
 @group(0) @binding(4) var<storage, read> color_pool_data: array<u32>;
@@ -406,7 +408,11 @@ fn shadow_step_one_instance(
         if t > t_limit { break; }
 
         let pos = clamp(shadow_origin + safe_dir * (t + lookup_bias), vec3<f32>(vs * 0.01), vec3<f32>(extent - vs * 0.01));
-        let r = octree_lookup(root, max_depth, extent, pos, PHASE_SHADOW, 0u, 0.0, 1.0, 0.0);
+        let r = octree_lookup(
+            root, max_depth, extent, pos,
+            shadow_origin, inv_dir,
+            PHASE_SHADOW, 0u, 0.0, 1.0, 0.0,
+        );
 
         if r.slot == OCTREE_EMPTY {
             t += max(skip_node(pos, safe_dir, inv_dir, r.depth, extent, vs), min_step);

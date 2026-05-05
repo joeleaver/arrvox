@@ -2,6 +2,7 @@ import package::lib::types::OctreeResult;
 import package::lib::types::ProtoHit;
 import package::lib::types::RkpAsset;
 import package::lib::types::LeafAttr;
+import package::lib::math::intersect_aabb;
 import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::octree_slot::OCTREE_EMPTY;
 import package::lib::octree_slot::OCTREE_INTERIOR;
@@ -42,6 +43,11 @@ import package::lib::brick::FACE_PZ;
 // `descend_proto_octree` stays per-consumer until its three sites
 // converge on a single `octree_lookup` call shape (in progress;
 // see Wave AC notes in project_wesl_phase_2_endpoint).
+//
+// `octree_nodes` is `array<vec4<u32>>` (16 B per node): `.x` = node
+// value, `.y` = prefiltered-LOD attr, `.z` / `.w` = quantized tight
+// occupancy AABB lo / hi (zeroed during Step 1 of the per-node
+// tight-bounds rollout).
 
 // March/shadow phase ids — used as a stats-bucket selector and as a
 // gate for the LOD branch (only PHASE_MARCH triggers prefiltered-LOD
@@ -115,11 +121,22 @@ fn skip_node(pos: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, node_depth: u32
 // CPU-side stats reader can build per-phase depth histograms. The
 // LOD-exit return additionally calls `bucket_lod_exit`. Consumers
 // without a `stats` storage binding declare these as no-op stubs.
+//
+// `ray_origin` and `inv_dir` carry the marching ray. At each descent
+// level we test the ray against the node's tight occupancy AABB
+// decoded from `packed.zw`; when the ray misses, we return EMPTY for
+// that level so the outer DDA's `skip_node` advances past the cell
+// without descending into a brick whose actual content the ray
+// doesn't intersect. Callers without a meaningful ray (none today,
+// but pass `(vec3(0), vec3(1))` to disable the test — every node's
+// tight AABB will pass).
 fn octree_lookup(
     root: u32,
     max_depth: u32,
     extent: f32,
     pos: vec3<f32>,
+    ray_origin: vec3<f32>,
+    inv_dir: vec3<f32>,
     phase: u32,
     lod_enabled: u32,
     t_current: f32,
@@ -139,6 +156,33 @@ fn octree_lookup(
         if node == OCTREE_INTERIOR {
             bucket_depth(phase, level);
             return OctreeResult(OCTREE_INTERIOR, level, center, half);
+        }
+        // Per-node tight-bounds ray cull. Skip on `(z, w) == (0, 0)`
+        // (the Step-1 sentinel meaning "tight bounds not set"; pre-
+        // bake state). Otherwise decode the quantized bounds (8 bits
+        // per axis) from normalized cell-fractions to oc-space, and
+        // ray-AABB-test. Miss → treat as EMPTY at this level so the
+        // outer DDA's `skip_node` advances past the cell.
+        if (packed.z != 0u || packed.w != 0u) {
+            let cell_min = center - vec3<f32>(half);
+            let cell_size = half * 2.0;
+            let lo_norm = vec3<f32>(
+                f32(packed.z & 0xFFu),
+                f32((packed.z >> 8u) & 0xFFu),
+                f32((packed.z >> 16u) & 0xFFu),
+            ) * (1.0 / 255.0);
+            let hi_norm = vec3<f32>(
+                f32(packed.w & 0xFFu),
+                f32((packed.w >> 8u) & 0xFFu),
+                f32((packed.w >> 16u) & 0xFFu),
+            ) * (1.0 / 255.0);
+            let tight_min = cell_min + lo_norm * cell_size;
+            let tight_max = cell_min + hi_norm * cell_size;
+            let t_range = intersect_aabb(ray_origin, inv_dir, tight_min, tight_max);
+            if t_range.x > t_range.y {
+                bucket_depth(phase, level);
+                return OctreeResult(OCTREE_EMPTY, level, center, half);
+            }
         }
         if (node & OCTREE_LEAF_BIT) != 0u {
             bucket_depth(phase, level);
@@ -180,9 +224,32 @@ fn octree_lookup(
         );
     }
     bucket_depth(phase, max_depth);
-    let node = octree_nodes[offset].x;
+    let leaf_packed = octree_nodes[offset];
+    let node = leaf_packed.x;
     if node == OCTREE_EMPTY { return OctreeResult(OCTREE_EMPTY, max_depth, center, half); }
     if node == OCTREE_INTERIOR { return OctreeResult(OCTREE_INTERIOR, max_depth, center, half); }
+    // Leaf-level tight-bounds cull. Same encoding as the descent-
+    // level test above.
+    if (leaf_packed.z != 0u || leaf_packed.w != 0u) {
+        let cell_min = center - vec3<f32>(half);
+        let cell_size = half * 2.0;
+        let lo_norm = vec3<f32>(
+            f32(leaf_packed.z & 0xFFu),
+            f32((leaf_packed.z >> 8u) & 0xFFu),
+            f32((leaf_packed.z >> 16u) & 0xFFu),
+        ) * (1.0 / 255.0);
+        let hi_norm = vec3<f32>(
+            f32(leaf_packed.w & 0xFFu),
+            f32((leaf_packed.w >> 8u) & 0xFFu),
+            f32((leaf_packed.w >> 16u) & 0xFFu),
+        ) * (1.0 / 255.0);
+        let tight_min = cell_min + lo_norm * cell_size;
+        let tight_max = cell_min + hi_norm * cell_size;
+        let t_range = intersect_aabb(ray_origin, inv_dir, tight_min, tight_max);
+        if t_range.x > t_range.y {
+            return OctreeResult(OCTREE_EMPTY, max_depth, center, half);
+        }
+    }
     if (node & OCTREE_LEAF_BIT) != 0u {
         return OctreeResult(
             (node & OCTREE_PAYLOAD_MASK) | (node & OCTREE_BRICK_BIT),
@@ -244,7 +311,11 @@ fn descend_proto_octree(
             vec3<f32>(vs * 0.01),
             vec3<f32>(extent - vs * 0.01),
         );
-        let lookup = octree_lookup(root, max_depth, extent, pos, phase, 0u, 0.0, 1.0, 0.0);
+        let lookup = octree_lookup(
+            root, max_depth, extent, pos,
+            oc_origin, inv_dir,
+            phase, 0u, 0.0, 1.0, 0.0,
+        );
 
         if lookup.slot == OCTREE_EMPTY {
             t += skip_node(pos, safe_dir, inv_dir, lookup.depth, extent, vs);

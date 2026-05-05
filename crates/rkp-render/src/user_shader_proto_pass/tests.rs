@@ -65,18 +65,18 @@ fn build_internal_levels_layout_for_depth_2() {
     // Level 2 (64 nodes at slots 9..73): all OCTREE_EMPTY
     let nodes = build_internal_levels(1000, 50, 2);
     assert_eq!(nodes.len(), 73);
-    assert_eq!(nodes[0], [1051, INTERNAL_ATTR_NONE]);
+    assert_eq!(nodes[0], [1051, INTERNAL_ATTR_NONE, 0, 0]);
     for i in 0..8u32 {
         assert_eq!(
             nodes[1 + i as usize],
-            [1050 + 9 + i * 8, INTERNAL_ATTR_NONE],
+            [1050 + 9 + i * 8, INTERNAL_ATTR_NONE, 0, 0],
             "level-1 node {i} mismatch",
         );
     }
     for (idx, node) in nodes.iter().enumerate().skip(9) {
         assert_eq!(
             *node,
-            [OCTREE_EMPTY, INTERNAL_ATTR_NONE],
+            [OCTREE_EMPTY, INTERNAL_ATTR_NONE, 0, 0],
             "leaf-level slot {idx} should start empty",
         );
     }
@@ -87,7 +87,7 @@ fn build_internal_levels_root_only_for_depth_0() {
     let nodes = build_internal_levels(0, 0, 0);
     // depth 0: only the leaf level exists, 1 node, EMPTY.
     assert_eq!(nodes.len(), 1);
-    assert_eq!(nodes[0], [OCTREE_EMPTY, INTERNAL_ATTR_NONE]);
+    assert_eq!(nodes[0], [OCTREE_EMPTY, INTERNAL_ATTR_NONE, 0, 0]);
 }
 
 #[test]

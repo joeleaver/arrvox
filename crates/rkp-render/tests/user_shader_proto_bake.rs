@@ -13,6 +13,7 @@ use rkp_render::user_shader_proto_pass::{
     build_internal_levels, level_starts_inclusive, max_bricks_for_depth,
     PrototypeBakePass, PrototypeCache, PrototypeUniform,
 };
+use rkp_render::rkp_scene::{OCTREE_NODE_BYTES, OCTREE_NODE_U32S};
 
 const PROTO_BRICK_CAPACITY: u32 = 1024;
 const PROTO_LEAF_ATTR_CAPACITY: u32 = 8192;
@@ -169,7 +170,7 @@ fn sphere_prototype_bake_matches_cpu_reference() {
     // is per-prototype; bricks + leaf-attrs are global, sized to the
     // pool capacity.
     let octree_buffer_bytes =
-        ((entry.octree_extent.0 + entry.octree_extent.1) as u64) * 8 + 16;
+        ((entry.octree_extent.0 + entry.octree_extent.1) as u64) * OCTREE_NODE_BYTES + 16;
     let octree_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("test octree_nodes"),
         size: octree_buffer_bytes.max(64),
@@ -198,16 +199,19 @@ fn sphere_prototype_bake_matches_cpu_reference() {
     });
 
     // Pre-build the internal octree levels into the octree buffer at
-    // the entry's extent offset. Each node is vec2<u32> = 8 bytes.
+    // the entry's extent offset. Each node is `vec4<u32>` = 16 bytes
+    // (post Step 1 of the per-node tight-bounds rollout).
     let internal = build_internal_levels(POOL_OCTREE_BASE, entry.octree_extent.0, PROTO_MAX_DEPTH);
-    let mut octree_init: Vec<u8> = Vec::with_capacity(internal.len() * 8);
-    for [v0, v1] in internal {
+    let mut octree_init: Vec<u8> = Vec::with_capacity(internal.len() * OCTREE_NODE_BYTES as usize);
+    for [v0, v1, v2, v3] in internal {
         octree_init.extend_from_slice(&v0.to_le_bytes());
         octree_init.extend_from_slice(&v1.to_le_bytes());
+        octree_init.extend_from_slice(&v2.to_le_bytes());
+        octree_init.extend_from_slice(&v3.to_le_bytes());
     }
     queue.write_buffer(
         &octree_buffer,
-        (entry.octree_extent.0 as u64) * 8,
+        (entry.octree_extent.0 as u64) * OCTREE_NODE_BYTES,
         &octree_init,
     );
 
@@ -326,7 +330,8 @@ fn sphere_prototype_bake_matches_cpu_reference() {
     let mut valid_leaf_count = 0;
     for i in 0..leaf_level_size {
         let abs = (entry.octree_extent.0 + leaf_level_offset + i) as usize;
-        let value = octree_words[abs * 2];
+        let stride = OCTREE_NODE_U32S;
+        let value = octree_words[abs * stride];
         if value == 0xFFFFFFFF {
             continue; // OCTREE_EMPTY
         }
@@ -339,6 +344,31 @@ fn sphere_prototype_bake_matches_cpu_reference() {
             "brick_id {brick_id} outside global proto brick pool [0, {})",
             PROTO_BRICK_CAPACITY,
         );
+
+        // Tight-bounds sanity. The bake writes `(.z, .w)` for every
+        // non-empty leaf; the sentinel `(0, 0)` would mean "tight
+        // bounds not set, treat as full cell" (Step 1 buffer-init
+        // default), which after bake should never occur on a node
+        // that allocated a brick.
+        let aabb_lo = octree_words[abs * stride + 2];
+        let aabb_hi = octree_words[abs * stride + 3];
+        assert!(
+            !(aabb_lo == 0 && aabb_hi == 0),
+            "non-empty leaf {i} has Step-1 sentinel `.zw == 0` — bake \
+             didn't write tight bounds (brick_id {brick_id})",
+        );
+        let lo_x = aabb_lo & 0xFF;
+        let lo_y = (aabb_lo >> 8) & 0xFF;
+        let lo_z = (aabb_lo >> 16) & 0xFF;
+        let hi_x = aabb_hi & 0xFF;
+        let hi_y = (aabb_hi >> 8) & 0xFF;
+        let hi_z = (aabb_hi >> 16) & 0xFF;
+        assert!(
+            lo_x <= hi_x && lo_y <= hi_y && lo_z <= hi_z,
+            "non-empty leaf {i} has inverted tight bounds: \
+             lo=({lo_x}, {lo_y}, {lo_z}) hi=({hi_x}, {hi_y}, {hi_z})",
+        );
+
         valid_leaf_count += 1;
     }
     drop(view);

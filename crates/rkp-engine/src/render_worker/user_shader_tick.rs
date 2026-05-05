@@ -44,6 +44,7 @@ pub(super) fn tick_instance_pipeline(
         PROTO_TAIL_OCTREE_BYTES, PROTO_TAIL_BRICK_BYTES, PROTO_TAIL_LEAF_ATTR_BYTES,
     };
     use rkp_render::rkp_gpu_object::{geom_type, RkpGpuAsset};
+    use rkp_render::rkp_scene::OCTREE_NODE_BYTES;
     use rkp_core::brick_pool::{BRICK_CELLS, BRICK_DIM};
 
     // 1. Pipeline reload — cheap when source hash unchanged.
@@ -90,7 +91,7 @@ pub(super) fn tick_instance_pipeline(
         let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
         let g = sm.geometry_upload();
         (
-            g.octree_nodes.len() as u64 * 8,
+            g.octree_nodes.len() as u64 * OCTREE_NODE_BYTES,
             g.brick_pool.len() as u64,
             g.leaf_attr_pool.len() as u64,
             g.brick_face_links.len() as u64,
@@ -139,7 +140,7 @@ pub(super) fn tick_instance_pipeline(
 
     // 6. Configure proto pool bases — element units (octree slot,
     //    brick id, leaf-attr slot).
-    let proto_octree_base_elems = (cpu_octree_bytes / 8) as u32;
+    let proto_octree_base_elems = (cpu_octree_bytes / OCTREE_NODE_BYTES) as u32;
     let proto_brick_base_bricks =
         (cpu_brick_bytes / 4 / BRICK_CELLS as u64) as u32;
     let proto_leaf_attr_base_elems = (cpu_leaf_attr_bytes / 8) as u32;
@@ -292,13 +293,15 @@ pub(super) fn tick_instance_pipeline(
                 bake.octree_extent_offset,
                 bake.max_depth,
             );
-            let mut bytes: Vec<u8> = Vec::with_capacity(internal.len() * 8);
-            for [v0, v1] in internal {
+            let mut bytes: Vec<u8> = Vec::with_capacity(internal.len() * OCTREE_NODE_BYTES as usize);
+            for [v0, v1, v2, v3] in internal {
                 bytes.extend_from_slice(&v0.to_le_bytes());
                 bytes.extend_from_slice(&v1.to_le_bytes());
+                bytes.extend_from_slice(&v2.to_le_bytes());
+                bytes.extend_from_slice(&v3.to_le_bytes());
             }
             let octree_byte_offset =
-                (proto_octree_base_elems as u64 + bake.octree_extent_offset as u64) * 8;
+                (proto_octree_base_elems as u64 + bake.octree_extent_offset as u64) * OCTREE_NODE_BYTES;
             state.queue.write_buffer(
                 &state.renderer.scene.octree_nodes_buffer,
                 octree_byte_offset,
