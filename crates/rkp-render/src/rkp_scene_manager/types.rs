@@ -124,19 +124,27 @@ pub(super) struct AssetEntry {
     /// Stored alongside `splats` until the Phase 2 forward triangle
     /// pipeline replaces the splat path.
     pub(super) mesh_vertices: Vec<crate::mesh_pass::MeshVertex>,
-    /// Triangle indices into `mesh_vertices`. Two triangles per
-    /// exposed cell face, CCW-wound around the outward normal.
+    /// Triangle indices into `mesh_vertices`.
     ///
-    /// **Phase 5:** the index buffer is now cluster-reordered — each
-    /// entry of `meshlet_clusters` references a contiguous run
-    /// `[index_offset .. index_offset + index_count)`. The triangle
-    /// **multiset** is unchanged; only the per-triangle order shifts,
-    /// so consumers that draw the entire range continue to work.
+    /// **Phase 5** stored only the LOD-0 (finest) cluster-reordered
+    /// IBO. **Phase 6.1** grew this to the full DAG: LOD-0 indices
+    /// first (in `[0 .. mesh_lod0_index_count)`), then LOD-1, then
+    /// LOD-2, … Each [`MeshletCluster`] entry's `index_offset` is
+    /// global into this concatenated buffer. The Phase 6.1 dispatch
+    /// path renders only the LOD-0 prefix (visuals unchanged); the
+    /// upcoming Phase 6.2 indirect dispatch will reference per-LOD
+    /// offsets via the cluster table.
     pub(super) mesh_indices: Vec<u32>,
-    /// Per-asset meshlet cluster table. ~64 verts / 124 tris each,
-    /// with object-local AABB. Both Phase 6 LOD selection and the
-    /// per-cluster culling path consume this. Empty when
-    /// `mesh_vertices` is empty.
+    /// Index count of the LOD-0 prefix in `mesh_indices`. Equal to
+    /// `mesh_indices.len()` for empty-DAG assets (single-triangle,
+    /// pre-Phase-6 behaviour); otherwise strictly less. Phase 6.1's
+    /// `dispatch_mesh` draws `0 .. mesh_lod0_index_count`.
+    pub(super) mesh_lod0_index_count: u32,
+    /// Per-asset meshlet cluster table — **the full DAG** as of
+    /// Phase 6.1, spanning every LOD level the builder reached. Each
+    /// cluster carries `lod_level`, `cluster_error`, and
+    /// `parent_group_error` so the Phase 6.2 GPU LOD-select compute
+    /// pass can apply the Karis selection rule.
     pub(super) meshlet_clusters: Vec<crate::mesh_pass::MeshletCluster>,
     /// Coarse-LOD surface mesh used by `MeshShadowMapPass` (Phase 3).
     /// Same SN topology, walked at `SHADOW_LOD_LEVELS` levels above

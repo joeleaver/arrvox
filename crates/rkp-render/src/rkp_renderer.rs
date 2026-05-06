@@ -249,23 +249,27 @@ impl RkpRenderer {
     }
 
     /// Upload (or replace) the surface-mesh vertex + index buffers for
-    /// a given asset. Caller passes the asset's `AssetHandle::raw()`
-    /// and the `(vertices, indices)` slices from
-    /// `RkpSceneManager::asset_mesh`. Re-upload is safe — the previous
-    /// buffers (if any) are dropped at the end of the call. An empty
-    /// mesh clears the cached entry.
+    /// a given asset. Caller passes the asset's `AssetHandle::raw()`,
+    /// the `(vertices, indices)` slices from
+    /// `RkpSceneManager::asset_mesh`, and `dispatch_index_count` —
+    /// the index range that `dispatch_mesh` should draw. Phase 6.1
+    /// passes `lod0_index_count` here so the IBO holds the full DAG
+    /// (for Phase 6.2's indirect path) but dispatch keeps drawing
+    /// only the LOD-0 prefix (visuals unchanged). Re-upload is safe;
+    /// empty mesh clears the cached entry.
     pub fn upload_mesh_for_asset(
         &mut self,
         handle_raw: u32,
         vertices: &[MeshVertex],
         indices: &[u32],
+        dispatch_index_count: u32,
     ) {
         use wgpu::util::DeviceExt;
         let idx = handle_raw as usize;
         if idx >= self.mesh_buffers.len() {
             self.mesh_buffers.resize_with(idx + 1, || None);
         }
-        if vertices.is_empty() || indices.is_empty() {
+        if vertices.is_empty() || indices.is_empty() || dispatch_index_count == 0 {
             self.mesh_buffers[idx] = None;
             return;
         }
@@ -275,11 +279,11 @@ impl RkpRenderer {
             usage: wgpu::BufferUsages::VERTEX,
         });
         let ibo = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh asset ibo"),
+            label: Some("mesh asset ibo (full DAG)"),
             contents: bytemuck::cast_slice(indices),
-            usage: wgpu::BufferUsages::INDEX,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::STORAGE,
         });
-        self.mesh_buffers[idx] = Some((vbo, ibo, indices.len() as u32));
+        self.mesh_buffers[idx] = Some((vbo, ibo, dispatch_index_count));
     }
 
     /// Drop the cached mesh buffers for `handle_raw`. Called when an

@@ -13,10 +13,15 @@
 
 pub mod cluster;
 pub mod extract;
+pub mod lod;
 pub mod pass;
 
-pub use cluster::{cluster_mesh, MeshletCluster, MAX_TRIS_PER_CLUSTER, MAX_VERTS_PER_CLUSTER};
+pub use cluster::{
+    cluster_mesh, MeshletCluster, MAX_TRIS_PER_CLUSTER, MAX_VERTS_PER_CLUSTER,
+    PARENT_GROUP_ERROR_ROOT,
+};
 pub use extract::{extract_shadow_mesh_lod, extract_surface_mesh, MeshVertex};
+pub use lod::{build_cluster_dag, ClusterDag, LOD_LEVELS};
 pub use pass::{MeshDraw, MeshPass};
 
 /// LOD level used for the shadow-mesh path.

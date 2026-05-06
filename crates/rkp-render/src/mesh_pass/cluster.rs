@@ -42,13 +42,25 @@ const _: () = assert!(MAX_TRIS_PER_CLUSTER % 4 == 0);
 const _: () = assert!(MAX_VERTS_PER_CLUSTER <= 256);
 const _: () = assert!(MAX_TRIS_PER_CLUSTER <= 512);
 
+/// Sentinel "no parent group" — used for clusters at the coarsest
+/// LOD level (top of the DAG); they're always admitted because no
+/// further simplification exists. `f32::INFINITY` projects to
+/// `+inf` pixels so the Phase 6 selection rule's
+/// `parent_group_error_proj >= threshold` arm is always true.
+pub const PARENT_GROUP_ERROR_ROOT: f32 = f32::INFINITY;
+
 /// One meshlet cluster. Stored both on `AssetEntry` (CPU side) and
 /// uploaded to the GPU verbatim via `bytemuck::cast_slice` for the
 /// Phase 6 LOD-selection compute pass to read.
 ///
-/// 48 B, std430-friendly: `[f32;3]` fields are padded to 16 B so
+/// 64 B, std430-friendly: `[f32;3]` fields are padded to 16 B so
 /// they line up with WGSL `vec3<f32>` alignment (16) without forcing
 /// the consumer to use `vec3` rather than `array<f32,3>`.
+///
+/// Phase 5 only fills `aabb_*` + `index_*`; `lod_level=0`,
+/// `cluster_error=0`, `parent_group_error=∞`. Phase 6's DAG
+/// builder grows the cluster set across LOD levels and fills the
+/// error metrics.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub struct MeshletCluster {
@@ -65,11 +77,28 @@ pub struct MeshletCluster {
     /// Index count for this cluster. `index_count / 3` triangles.
     /// Becomes `DrawIndexedIndirect.index_count`.
     pub index_count: u32,
-    /// Reserved for Phase 6: `lod_level` and `parent_chain_id`.
-    pub _pad2: [u32; 2],
+    /// LOD level this cluster lives at. 0 = finest (original
+    /// surface mesh), higher = progressively simplified.
+    pub lod_level: u32,
+    pub _pad2: u32,
+    /// Maximum simplification error introduced at-or-below this
+    /// cluster in the DAG (object-local units). Monotonically
+    /// non-decreasing along chains from leaf → root. Phase 6
+    /// selection rule admits this cluster iff its projected size
+    /// is `< pixel_threshold`.
+    pub cluster_error: f32,
+    /// Simplification error of the parent group (the group whose
+    /// simplification produced this cluster's parents at the
+    /// next-coarser LOD). `PARENT_GROUP_ERROR_ROOT` for clusters
+    /// at the coarsest level. Phase 6 admits the cluster iff
+    /// `parent_group_error_proj >= pixel_threshold` AND
+    /// `cluster_error_proj < pixel_threshold` — guarantees exactly
+    /// one cluster picked per chain (Karis '21 SIGGRAPH).
+    pub parent_group_error: f32,
+    pub _pad3: [u32; 2],
 }
 
-const _: () = assert!(std::mem::size_of::<MeshletCluster>() == 48);
+const _: () = assert!(std::mem::size_of::<MeshletCluster>() == 64);
 const _: () = assert!(std::mem::align_of::<MeshletCluster>() == 4);
 
 /// Partition a mesh into meshlet clusters with per-cluster AABBs.
@@ -156,7 +185,11 @@ pub fn cluster_mesh(
             _pad1: 0.0,
             index_offset: cluster_index_offset,
             index_count: cluster_index_count,
-            _pad2: [0; 2],
+            lod_level: 0,
+            _pad2: 0,
+            cluster_error: 0.0,
+            parent_group_error: PARENT_GROUP_ERROR_ROOT,
+            _pad3: [0; 2],
         });
     }
 
@@ -191,9 +224,23 @@ mod tests {
     }
 
     #[test]
-    fn cluster_layout_size_is_48() {
+    fn cluster_layout_size_is_64() {
         // Belt-and-suspenders for the const_assert above.
-        assert_eq!(std::mem::size_of::<MeshletCluster>(), 48);
+        assert_eq!(std::mem::size_of::<MeshletCluster>(), 64);
+    }
+
+    #[test]
+    fn phase5_cluster_defaults_lod0_zero_error_root_parent() {
+        let v = vec![
+            vert([0.0, 0.0, 0.0]),
+            vert([1.0, 0.0, 0.0]),
+            vert([0.0, 1.0, 0.0]),
+        ];
+        let (clusters, _) = cluster_mesh(&v, &[0, 1, 2]);
+        let c = &clusters[0];
+        assert_eq!(c.lod_level, 0);
+        assert_eq!(c.cluster_error, 0.0);
+        assert!(c.parent_group_error.is_infinite());
     }
 
     #[test]

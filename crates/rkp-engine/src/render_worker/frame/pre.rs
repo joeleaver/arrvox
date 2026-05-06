@@ -166,9 +166,16 @@ pub(super) fn run_pre_frame(
         // path's per-asset (vbo, ibo) cache. iter_loaded_asset_meshes
         // skips empty mesh extractions (procedurals etc.) so this only
         // touches assets that produced a non-empty surface mesh at
-        // load time.
-        for (handle, vertices, indices) in sm.iter_loaded_asset_meshes() {
-            state.renderer.upload_mesh_for_asset(handle.raw(), vertices, indices);
+        // load time. Phase 6.1: indices is the full DAG IBO (LOD-0
+        // first, then LOD-1, ...); dispatch draws only the LOD-0
+        // prefix until Phase 6.2 wires the indirect path.
+        for (handle, vertices, indices, lod0_index_count) in sm.iter_loaded_asset_meshes() {
+            state.renderer.upload_mesh_for_asset(
+                handle.raw(),
+                vertices,
+                indices,
+                lod0_index_count,
+            );
         }
         // Phase 3 — coarse-LOD shadow mesh per asset. Parallel cache;
         // `dispatch_mesh_shadow` reads from it instead of `mesh_buffers`.

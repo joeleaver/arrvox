@@ -433,15 +433,22 @@ impl RkpSceneManager {
             self.leaf_attr_pool.as_slice(),
         );
 
-        // Phase 5: partition the surface mesh into ~64v/124t meshlet
-        // clusters with per-cluster object-local AABBs. The IBO is
-        // re-emitted so each cluster occupies a contiguous index
-        // range — the per-triangle order is the only thing that
-        // changes; the triangle multiset is identical and dispatch
-        // still draws `0..total_index_count` until Phase 6 wires
-        // per-cluster indirect dispatch.
-        let (meshlet_clusters, mesh_indices) =
-            crate::mesh_pass::cluster_mesh(&mesh_vertices, &mesh_indices_unclustered);
+        // Phase 6.1: build the full Karis-Nanite-style cluster DAG.
+        // LOD 0 is the same Phase-5 surface clustering; higher LOD
+        // levels are produced by spatially grouping prev-level
+        // clusters, locking each group's exterior boundary verts,
+        // running `meshopt::simplify_with_locks`, and re-clustering
+        // the simplified result. The IBO concatenates all LOD
+        // levels (LOD 0 first); `mesh_lod0_index_count` records the
+        // LOD-0 prefix so dispatch keeps drawing what it always did
+        // until Phase 6.2 wires the indirect path.
+        let dag = crate::mesh_pass::build_cluster_dag(
+            &mesh_vertices,
+            &mesh_indices_unclustered,
+        );
+        let mesh_indices = dag.indices;
+        let meshlet_clusters = dag.clusters;
+        let mesh_lod0_index_count = dag.lod0_index_range.1 - dag.lod0_index_range.0;
 
         // Coarse-LOD shadow mesh (Phase 3). Same SN walk at a coarser
         // octree depth — produces a dramatically simpler mesh that
@@ -482,7 +489,7 @@ impl RkpSceneManager {
         let handle = self.octree.allocate(&tree);
 
         eprintln!(
-            "[RkpSceneManager] loaded {}: {} voxels ({} unique attrs), {} bricks, octree {} → compact {} → dedup {} ({:.1}× total), +{} prefilter attrs, {} splats, mesh {} verts / {} tris / {} clusters, shadow-lod {} verts / {} tris",
+            "[RkpSceneManager] loaded {}: {} voxels ({} unique attrs), {} bricks, octree {} → compact {} → dedup {} ({:.1}× total), +{} prefilter attrs, {} splats, mesh {} verts / lod0 {} tris / dag {} tris / {} clusters max-lod {}, shadow-lod {} verts / {} tris",
             rkp_path.display(),
             actual_cell_count,
             voxel_count,
@@ -494,8 +501,10 @@ impl RkpSceneManager {
             final_leaf_attr_slot_count - leaf_attr_slot_count,
             splats.len(),
             mesh_vertices.len(),
+            mesh_lod0_index_count / 3,
             mesh_indices.len() / 3,
             meshlet_clusters.len(),
+            meshlet_clusters.iter().map(|c| c.lod_level).max().unwrap_or(0),
             mesh_shadow_vertices.len(),
             mesh_shadow_indices.len() / 3,
         );
@@ -533,6 +542,7 @@ impl RkpSceneManager {
             splats,
             mesh_vertices,
             mesh_indices,
+            mesh_lod0_index_count,
             meshlet_clusters,
             mesh_shadow_vertices,
             mesh_shadow_indices,
@@ -581,27 +591,31 @@ impl RkpSceneManager {
             })
     }
 
-    /// Surface-mesh `(vertices, indices)` for `handle`, produced at
-    /// load time by naive surface-nets. Object-local positions; the
-    /// per-instance world matrix is applied in the (forthcoming
-    /// Phase 2) vertex shader. Returns `None` for an unknown handle.
+    /// Surface-mesh `(vertices, indices, lod0_index_count)` for
+    /// `handle`. Phase 6.1: `indices` is the **full DAG IBO** with
+    /// LOD-0 indices first; `lod0_index_count` is the LOD-0 prefix
+    /// length (what dispatch currently draws). Returns `None` for
+    /// an unknown handle.
     pub fn asset_mesh(
         &self,
         handle: AssetHandle,
-    ) -> Option<(&[crate::mesh_pass::MeshVertex], &[u32])> {
+    ) -> Option<(&[crate::mesh_pass::MeshVertex], &[u32], u32)> {
         let entry = self.asset_cache.get(handle)?;
-        Some((entry.mesh_vertices.as_slice(), entry.mesh_indices.as_slice()))
+        Some((
+            entry.mesh_vertices.as_slice(),
+            entry.mesh_indices.as_slice(),
+            entry.mesh_lod0_index_count,
+        ))
     }
 
-    /// Iterator over `(AssetHandle, &[MeshVertex], &[u32])` for every
-    /// loaded asset that produced a non-empty surface mesh. Skips
-    /// assets whose mesh is empty so the caller's upload loop only
-    /// touches assets that need it. Mirrors `iter_loaded_asset_splats`
-    /// — the render thread will use this once Phase 2 wires per-asset
-    /// GPU vertex/index buffer caches.
+    /// Iterator over `(AssetHandle, &[MeshVertex], &[u32],
+    /// lod0_index_count)` for every loaded asset that produced a
+    /// non-empty surface mesh. Phase 6.1: `lod0_index_count` is the
+    /// LOD-0 prefix of the DAG IBO; the render thread caches it as
+    /// the dispatch draw count.
     pub fn iter_loaded_asset_meshes(
         &self,
-    ) -> impl Iterator<Item = (AssetHandle, &[crate::mesh_pass::MeshVertex], &[u32])> {
+    ) -> impl Iterator<Item = (AssetHandle, &[crate::mesh_pass::MeshVertex], &[u32], u32)> {
         self.asset_cache
             .entries
             .iter()
@@ -615,6 +629,7 @@ impl RkpSceneManager {
                     AssetHandle::from_raw(idx as u32),
                     entry.mesh_vertices.as_slice(),
                     entry.mesh_indices.as_slice(),
+                    entry.mesh_lod0_index_count,
                 ))
             })
     }
