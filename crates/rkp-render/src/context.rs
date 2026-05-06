@@ -40,7 +40,12 @@ impl RenderContext {
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("rkp-render device"),
-                required_features: wgpu::Features::FLOAT32_FILTERABLE,
+                required_features: wgpu::Features::FLOAT32_FILTERABLE
+                    | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT,
+                    // Match `new_headless` — see the longer comment
+                    // there for the rationale. Phase 6 mesh path
+                    // depends on native multi-draw to avoid CPU
+                    // encode-loop bottleneck.
                 required_limits: wgpu::Limits {
                     max_bind_groups: 8,
                     // Take whatever the adapter offers up to 2 GB. The
@@ -131,15 +136,27 @@ impl RenderContext {
                 label: Some("rkp-render headless device"),
                 required_features: wgpu::Features::FLOAT32_FILTERABLE
                     | wgpu::Features::TIMESTAMP_QUERY
-                    | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
-                    // Phase 6.2/6.3 note: `multi_draw_indexed_indirect`
-                    // is part of wgpu's core (no feature flag); when
-                    // the adapter lacks `MULTI_DRAW_INDIRECT_COUNT`
-                    // wgpu emulates it as a series of
-                    // `draw_indexed_indirect` calls, which is
-                    // correctness-equivalent. Non-admitted args slots
-                    // carry `index_count = 0` so the no-op draws cost
-                    // nothing on either path.
+                    | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+                    | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT,
+                    // `MULTI_DRAW_INDIRECT_COUNT` is load-bearing
+                    // for the Phase 6 mesh path even though we don't
+                    // use the count-from-GPU variant (yet). Per the
+                    // wgpu 29 feature docs: when the feature is
+                    // present, ordinary `multi_draw_indexed_indirect`
+                    // calls take the native path; when it's absent,
+                    // wgpu emulates them as N separate
+                    // `draw_indexed_indirect` CPU encoder calls.
+                    // With LOD_LEVELS=4 a real multi-asset scene
+                    // issues hundreds of thousands of cluster draws
+                    // per frame (primary + shadow combined); the
+                    // emulated CPU loop dominates frame time
+                    // (~50ms encode wall-clock vs ~17ms actual GPU
+                    // work). On Vulkan 1.2+ / DX12 + modern desktop
+                    // GPUs the feature is universally supported, so
+                    // a hard require is fine. Metal + GLES don't
+                    // have it and would need a runtime fallback
+                    // (e.g., direct `draw_indexed` over LOD-0); not
+                    // a supported target today.
                 required_limits: wgpu::Limits {
                     max_bind_groups: 8,
                     // Take whatever the adapter offers up to 2 GB. The
