@@ -162,6 +162,23 @@ pub(super) fn run_pre_frame(
         for (handle, splats) in sm.iter_loaded_asset_splats() {
             state.renderer.upload_splats_for_asset(handle.raw(), splats);
         }
+        // Phase 2 (splat-to-mesh pivot) — same logic for the mesh
+        // path's per-asset (vbo, ibo) cache. iter_loaded_asset_meshes
+        // skips empty mesh extractions (procedurals etc.) so this only
+        // touches assets that produced a non-empty surface mesh at
+        // load time.
+        for (handle, vertices, indices) in sm.iter_loaded_asset_meshes() {
+            state.renderer.upload_mesh_for_asset(handle.raw(), vertices, indices);
+        }
+        // Phase 3 — coarse-LOD shadow mesh per asset. Parallel cache;
+        // `dispatch_mesh_shadow` reads from it instead of `mesh_buffers`.
+        for (handle, vertices, indices) in sm.iter_loaded_asset_shadow_meshes() {
+            state.renderer.upload_mesh_shadow_for_asset(
+                handle.raw(),
+                vertices,
+                indices,
+            );
+        }
         // Read-back the epoch *under the same lock* so concurrent
         // mutations (bake worker integrating an artifact mid-frame)
         // don't trick us into thinking we're caught up when we're

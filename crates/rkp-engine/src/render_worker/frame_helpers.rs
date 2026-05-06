@@ -165,12 +165,84 @@ pub(super) fn transform_aabb_world(
 /// representation. To re-enable: replace this with the frustum-fit
 /// walk from commit 0a6aeed.
 pub(super) fn prepare_shadow_maps(
-    _state: &mut RenderState,
-    _frame: &RenderFrame,
-    _scene_aabb: ([f32; 3], [f32; 3]),
+    state: &mut RenderState,
+    frame: &RenderFrame,
+    scene_aabb: ([f32; 3], [f32; 3]),
     _tlas_prim_count: u32,
 ) -> bool {
-    false
+    // The voxel-march scatter shadow_map remains disabled (the
+    // commit-comment context above still applies — it produced
+    // worse silhouettes than rkp_shadow_trace at higher cost).
+    //
+    // The mesh path needs an actual depth-rendered shadow map
+    // though, and it has the right input data — real triangle
+    // geometry. Re-enable the per-VR LightCameraUniform write
+    // for mesh mode; `MeshShadowMapPass` is what consumes it.
+    let mesh_mode = matches!(
+        state.renderer.primary_mode,
+        rkp_render::rkp_renderer::PrimaryMode::Mesh,
+    );
+    if !mesh_mode {
+        return false;
+    }
+    use rkp_render::shadow_map_pass::{compute_light_camera, SHADOW_MAP_DEFAULT_SIZE};
+    // Pick the first directional caster — `position[3] == 0` flags
+    // a directional light in the GpuLight wire format, and
+    // `params[3] >= 0.5` is the shadow-caster bit. Multi-caster /
+    // CSM is future work.
+    let Some(light) = frame
+        .lights
+        .iter()
+        .find(|l| (l.position[3] as u32) == 0 && l.params[3] >= 0.5)
+    else {
+        return false;
+    };
+    let light_dir = [
+        light.direction[0],
+        light.direction[1],
+        light.direction[2],
+    ];
+    // Small bias to avoid classic shadow-map self-shadow acne. Front-
+    // face cull (in `MeshShadowMapPass`) does most of the heavy
+    // lifting; this just covers the residual when the lit surface
+    // sits very close to its own back-face shadow depth.
+    let depth_bias = 0.001;
+
+    // `scene_aabb` here is `compute_tlas_scene_aabb`'s output — the
+    // tightest world AABB of the visible casters. Passing it to
+    // `compute_light_camera` gives a caster-fit orthographic light
+    // camera, which is dramatically tighter than the camera-frustum
+    // fit that V1 used. For a 1 m elephant 5 m from camera the xy
+    // bounds collapse from ~30 m → ~2 m, taking shadow texels from
+    // ~3 cm → ~2 mm and erasing the stair-stepping. Trade-off:
+    // shadow casters that don't visually overlap the camera view
+    // will still cast (the AABB is whole-scene), but casters
+    // entirely outside the AABB won't reach the map. Acceptable
+    // when the AABB is the union of all live casters.
+    let uniform = compute_light_camera(
+        scene_aabb.0,
+        scene_aabb.1,
+        light_dir,
+        SHADOW_MAP_DEFAULT_SIZE,
+        depth_bias,
+    );
+
+    let mut wrote_any = false;
+    for vp in &frame.viewports {
+        let Some(vr) = state.viewport_renderers.get_mut(&vp.id) else {
+            continue;
+        };
+        // Per-VR write — same uniform across all viewports because
+        // the caster fit is camera-independent. Multi-viewport CSM
+        // would diverge here per-VR.
+        state.queue.write_buffer(
+            &vr.shadow_map.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&uniform),
+        );
+        wrote_any = true;
+    }
+    wrote_any
 }
 
 #[cfg(test)]

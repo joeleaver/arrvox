@@ -15,6 +15,7 @@ use super::manager::RkpSceneManager;
 use super::types::{
     AssetEntry, AssetHandle, AssetInfo, ReloadResult, SkinBrick, SkinningAssetData,
 };
+use crate::mesh_pass::{extract_shadow_mesh_lod, extract_surface_mesh, SHADOW_LOD_LEVELS};
 use crate::splat_pass::extract_splats;
 
 impl RkpSceneManager {
@@ -417,6 +418,43 @@ impl RkpSceneManager {
             self.brick_pool.as_slice(),
         );
 
+        // Surface-mesh extraction (Phase 1 of the splat-to-mesh pivot).
+        // Walks the same brick-remapped tree as `extract_splats`, so
+        // the mesh's per-vertex `leaf_attr_id` indexes directly into
+        // the scene-global `leaf_attr_pool`. Phase 2 will rasterize
+        // these triangles into the visibility buffer; until then they
+        // ride along on `AssetEntry` as inert data.
+        let (mesh_vertices, mesh_indices) = extract_surface_mesh(
+            tree.as_slice(),
+            header.octree_depth as u8,
+            header.base_voxel_size,
+            asset_grid_origin,
+            self.brick_pool.as_slice(),
+            self.leaf_attr_pool.as_slice(),
+        );
+
+        // Coarse-LOD shadow mesh (Phase 3). Same SN walk at a coarser
+        // octree depth — produces a dramatically simpler mesh that
+        // still resolves correctly against the 1024² shadow map.
+        // Skipped if the asset's depth is too shallow for the LOD to
+        // make sense.
+        let (mesh_shadow_vertices, mesh_shadow_indices) =
+            if (header.octree_depth as u8) > SHADOW_LOD_LEVELS {
+                extract_shadow_mesh_lod(
+                    tree.as_slice(),
+                    header.octree_depth as u8,
+                    SHADOW_LOD_LEVELS,
+                    header.base_voxel_size,
+                    asset_grid_origin,
+                    self.brick_pool.as_slice(),
+                )
+            } else {
+                // Asset is so shallow the LOD would collapse it
+                // entirely — fall back to the full-detail mesh for
+                // shadow casting.
+                (mesh_vertices.clone(), mesh_indices.clone())
+            };
+
         // Compute brick face-links for this asset. The tree's brick ids
         // have already been remapped to global ids above, so the rows
         // produced are scene-global and ready to merge. When the file
@@ -434,7 +472,7 @@ impl RkpSceneManager {
         let handle = self.octree.allocate(&tree);
 
         eprintln!(
-            "[RkpSceneManager] loaded {}: {} voxels ({} unique attrs), {} bricks, octree {} → compact {} → dedup {} ({:.1}× total), +{} prefilter attrs, {} splats",
+            "[RkpSceneManager] loaded {}: {} voxels ({} unique attrs), {} bricks, octree {} → compact {} → dedup {} ({:.1}× total), +{} prefilter attrs, {} splats, mesh {} verts / {} tris, shadow-lod {} verts / {} tris",
             rkp_path.display(),
             actual_cell_count,
             voxel_count,
@@ -445,6 +483,10 @@ impl RkpSceneManager {
             if dedup_count > 0 { raw_count as f64 / dedup_count as f64 } else { 0.0 },
             final_leaf_attr_slot_count - leaf_attr_slot_count,
             splats.len(),
+            mesh_vertices.len(),
+            mesh_indices.len() / 3,
+            mesh_shadow_vertices.len(),
+            mesh_shadow_indices.len() / 3,
         );
 
         // Promote the baked skin-meta (file-local brick ids) into
@@ -478,6 +520,10 @@ impl RkpSceneManager {
             brick_count: file_brick_count,
             skinning,
             splats,
+            mesh_vertices,
+            mesh_indices,
+            mesh_shadow_vertices,
+            mesh_shadow_indices,
         })
     }
 
@@ -520,6 +566,84 @@ impl RkpSceneManager {
                     return None;
                 }
                 Some((AssetHandle::from_raw(idx as u32), entry.splats.as_slice()))
+            })
+    }
+
+    /// Surface-mesh `(vertices, indices)` for `handle`, produced at
+    /// load time by naive surface-nets. Object-local positions; the
+    /// per-instance world matrix is applied in the (forthcoming
+    /// Phase 2) vertex shader. Returns `None` for an unknown handle.
+    pub fn asset_mesh(
+        &self,
+        handle: AssetHandle,
+    ) -> Option<(&[crate::mesh_pass::MeshVertex], &[u32])> {
+        let entry = self.asset_cache.get(handle)?;
+        Some((entry.mesh_vertices.as_slice(), entry.mesh_indices.as_slice()))
+    }
+
+    /// Iterator over `(AssetHandle, &[MeshVertex], &[u32])` for every
+    /// loaded asset that produced a non-empty surface mesh. Skips
+    /// assets whose mesh is empty so the caller's upload loop only
+    /// touches assets that need it. Mirrors `iter_loaded_asset_splats`
+    /// — the render thread will use this once Phase 2 wires per-asset
+    /// GPU vertex/index buffer caches.
+    pub fn iter_loaded_asset_meshes(
+        &self,
+    ) -> impl Iterator<Item = (AssetHandle, &[crate::mesh_pass::MeshVertex], &[u32])> {
+        self.asset_cache
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| {
+                let entry = slot.as_ref()?;
+                if entry.mesh_vertices.is_empty() {
+                    return None;
+                }
+                Some((
+                    AssetHandle::from_raw(idx as u32),
+                    entry.mesh_vertices.as_slice(),
+                    entry.mesh_indices.as_slice(),
+                ))
+            })
+    }
+
+    /// Coarse-LOD shadow mesh for `handle` (Phase 3). Produced by
+    /// `extract_shadow_mesh_lod` at load time — typically 64-256×
+    /// fewer triangles than the primary mesh. Returns `None` for
+    /// unknown handles.
+    pub fn asset_mesh_shadow(
+        &self,
+        handle: AssetHandle,
+    ) -> Option<(&[crate::mesh_pass::MeshVertex], &[u32])> {
+        let entry = self.asset_cache.get(handle)?;
+        Some((
+            entry.mesh_shadow_vertices.as_slice(),
+            entry.mesh_shadow_indices.as_slice(),
+        ))
+    }
+
+    /// Iterator over `(AssetHandle, &[MeshVertex], &[u32])` for every
+    /// loaded asset that produced a non-empty shadow LOD mesh.
+    /// Mirrors `iter_loaded_asset_meshes` — the render thread uses
+    /// this to keep the per-asset mesh-shadow vertex/index buffer
+    /// cache in sync.
+    pub fn iter_loaded_asset_shadow_meshes(
+        &self,
+    ) -> impl Iterator<Item = (AssetHandle, &[crate::mesh_pass::MeshVertex], &[u32])> {
+        self.asset_cache
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| {
+                let entry = slot.as_ref()?;
+                if entry.mesh_shadow_vertices.is_empty() {
+                    return None;
+                }
+                Some((
+                    AssetHandle::from_raw(idx as u32),
+                    entry.mesh_shadow_vertices.as_slice(),
+                    entry.mesh_shadow_indices.as_slice(),
+                ))
             })
     }
 }

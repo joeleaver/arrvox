@@ -96,10 +96,18 @@ pub(super) fn encode_viewports(
             state.renderer.primary_mode,
             rkp_render::rkp_renderer::PrimaryMode::Splat,
         );
-        // Splat path skips shadow_trace + shadow_map dispatch (they
+        // Splat path skips shadow_trace + shadow_map dispatch (both
         // need march's params bg). Force shade to use shadow=1.0
         // instead of sampling the stale shadow_tex / shadow_buffer.
-        let vr_shadow_map_live = pre.shadow_map_enabled && in_situ && !raymarch && !splat;
+        //
+        // Mesh path renders its own directional shadow map into the
+        // same `shadow_buffer` shade already samples — gated by
+        // `pre.shadow_map_enabled`, which `prepare_shadow_maps`
+        // returns true for in mesh mode whenever a directional caster
+        // is live. So mesh keeps `shadow_disabled = 0` and toggles
+        // `shadow_map_enabled` like march does.
+        let vr_shadow_map_live =
+            pre.shadow_map_enabled && in_situ && !raymarch && !splat;
         shade_params.shadow_map_enabled = u32::from(vr_shadow_map_live);
         shade_params.shadow_disabled = u32::from(splat);
         state

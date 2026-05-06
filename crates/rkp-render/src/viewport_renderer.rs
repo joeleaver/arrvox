@@ -146,6 +146,19 @@ pub struct ViewportRenderer {
     pub splat_resolve_g1_bg: Option<wgpu::BindGroup>,
     pub splat_resolve_scene_epoch: u64,
 
+    // ── Mesh-rendered shadow-map per-VR state (Phase 3) ────────────
+    /// 1024×1024 `Depth32Float` texture used by `MeshShadowMapPass`.
+    /// Filled by depth-only rasterization, then read by the blit
+    /// compute pass which copies bitcast(depth) into `shadow_map.
+    /// shadow_buffer` for shade to sample.
+    pub mesh_shadow_depth_texture: wgpu::Texture,
+    pub mesh_shadow_depth_view: wgpu::TextureView,
+    /// Cached render `g0` for the mesh-shadow pipeline — just the
+    /// `light_camera` uniform.
+    pub mesh_shadow_render_g0_bg: Option<wgpu::BindGroup>,
+    /// Cached blit `g0` — `depth_view` + `shadow_map.shadow_buffer`.
+    pub mesh_shadow_blit_g0_bg: Option<wgpu::BindGroup>,
+
     pub width: u32,
     pub height: u32,
 }
@@ -258,6 +271,29 @@ impl ViewportRenderer {
             &renderer.scene.bind_group_layout,
         );
 
+        // Phase 3 (splat-to-mesh pivot) — depth attachment for the
+        // mesh-shadow render pass. The render writes here (vertex +
+        // rasterizer + depth-only, no fragment shader); the blit
+        // compute pass reads it back and copies bitcast(depth) into
+        // `shadow_map.shadow_buffer`. Hence both `RENDER_ATTACHMENT`
+        // and `TEXTURE_BINDING` usage.
+        let mesh_shadow_depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rkp_mesh_shadow_depth"),
+            size: wgpu::Extent3d {
+                width: SHADOW_MAP_DEFAULT_SIZE,
+                height: SHADOW_MAP_DEFAULT_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let mesh_shadow_depth_view = mesh_shadow_depth_texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
         let mut shade = RkpShadePass::new(device, width, height);
         shade.set_shade_data(
             device,
@@ -369,6 +405,10 @@ impl ViewportRenderer {
             splat_resolve_g0_bg: None,
             splat_resolve_g1_bg: None,
             splat_resolve_scene_epoch: u64::MAX,
+            mesh_shadow_depth_texture,
+            mesh_shadow_depth_view,
+            mesh_shadow_render_g0_bg: None,
+            mesh_shadow_blit_g0_bg: None,
             width, height,
         }
     }
@@ -393,6 +433,34 @@ impl ViewportRenderer {
         ));
         self.splat_g0_scene_epoch = scene_now;
         self.splat_g0_lights_materials_epoch = lm_now;
+    }
+
+    /// Rebuild the mesh-shadow render + blit `g0` bind groups if not
+    /// present. The underlying buffers (`shadow_map.uniform_buffer`,
+    /// `shadow_map.shadow_buffer`) and the depth texture all have
+    /// stable lifetimes, so once built the bind groups stay valid
+    /// for the lifetime of this VR. Called once before
+    /// `dispatch_mesh_shadow`.
+    pub fn refresh_mesh_shadow_bindings(
+        &mut self,
+        device: &wgpu::Device,
+        renderer: &RkpRenderer,
+    ) {
+        if self.mesh_shadow_render_g0_bg.is_none() {
+            self.mesh_shadow_render_g0_bg =
+                Some(renderer.mesh_shadow_map.create_render_g0_bind_group(
+                    device,
+                    &self.shadow_map.uniform_buffer,
+                ));
+        }
+        if self.mesh_shadow_blit_g0_bg.is_none() {
+            self.mesh_shadow_blit_g0_bg =
+                Some(renderer.mesh_shadow_map.create_blit_g0_bind_group(
+                    device,
+                    &self.mesh_shadow_depth_view,
+                    &self.shadow_map.shadow_buffer,
+                ));
+        }
     }
 
     /// Rebuild the splat-resolve compute pass's bind groups. `g0`

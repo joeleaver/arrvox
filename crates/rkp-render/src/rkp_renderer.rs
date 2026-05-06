@@ -19,27 +19,33 @@
 use crate::rkp_scene::{RkpScene, GeometryUpload, FrameUpload};
 use crate::rkp_shade::{ShadeParams, GpuLight, GpuMaterial};
 use crate::rkp_atmosphere::RkpAtmospherePass;
+use crate::mesh_pass::{MeshPass, MeshVertex};
+use crate::mesh_shadow_map_pass::MeshShadowMapPass;
 use crate::splat_pass::{SplatDraw, SplatPass, SplatVertex};
 use crate::splat_resolve_pass::SplatResolvePass;
 use wgpu_profiler::GpuProfiler;
 
 /// Primary-visibility selector. Set by the `RKP_PRIMARY` env var at
 /// `RkpRenderer` construction. `Splat` swaps the compute octree-march
-/// for the splat raster path inside `render_to`; `March` keeps the
+/// for the splat raster path; `Mesh` swaps it for the surface-mesh
+/// raster path (Phase 2 of the splat-to-mesh pivot); `March` keeps the
 /// existing behaviour. The selector is read once at startup so per-
 /// frame env reads don't show up in profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrimaryMode {
     March,
     Splat,
+    Mesh,
 }
 
 impl PrimaryMode {
-    /// Read `RKP_PRIMARY`. `splat` (case-insensitive) selects splat;
-    /// anything else (including unset) keeps the existing march path.
+    /// Read `RKP_PRIMARY`. `splat` (case-insensitive) selects splat,
+    /// `mesh` selects the surface-mesh path; anything else (including
+    /// unset) keeps the existing march path.
     fn from_env() -> Self {
         match std::env::var("RKP_PRIMARY").as_deref() {
             Ok(s) if s.eq_ignore_ascii_case("splat") => PrimaryMode::Splat,
+            Ok(s) if s.eq_ignore_ascii_case("mesh") => PrimaryMode::Mesh,
             _ => PrimaryMode::March,
         }
     }
@@ -87,6 +93,23 @@ pub struct RkpRenderer {
     /// been uploaded, `None` otherwise. Grows as new assets are
     /// loaded; entries are cleared on `release_splats_for_asset`.
     splat_buffers: Vec<Option<(wgpu::Buffer, u32)>>,
+    /// Surface-mesh raster pipeline (Phase 2 of the splat-to-mesh
+    /// pivot). Shares `g0_layout` / `g1_layout` with `splat_pass` so
+    /// the same per-VR bind groups drive both pipelines.
+    pub mesh_pass: MeshPass,
+    /// Mesh-rendered directional shadow-map pipeline (Phase 3 of the
+    /// pivot). Renders the same triangles from the light's POV; per-VR
+    /// state (depth texture, g0 bind group) lives in `ViewportRenderer`.
+    pub mesh_shadow_map: MeshShadowMapPass,
+    /// Per-asset vertex/index buffer cache for the mesh path. Same
+    /// shape as `splat_buffers`, but each entry carries `(vbo, ibo,
+    /// index_count)`. Cleared on `release_mesh_for_asset`.
+    mesh_buffers: Vec<Option<(wgpu::Buffer, wgpu::Buffer, u32)>>,
+    /// Per-asset cache for the **coarse-LOD shadow mesh** (Phase 3).
+    /// Same shape as `mesh_buffers`. The mesh-shadow render uses this
+    /// — much smaller triangle count than `mesh_buffers`, sufficient
+    /// detail for the 1024² shadow map.
+    mesh_shadow_buffers: Vec<Option<(wgpu::Buffer, wgpu::Buffer, u32)>>,
     /// Primary-visibility selector — `March` (compute octree march)
     /// or `Splat` (rasterized surface splats). Read from the
     /// `RKP_PRIMARY` env var at construction. See [`PrimaryMode`].
@@ -148,6 +171,8 @@ impl RkpRenderer {
 
         let skin_deform = crate::skin_deform::SkinDeformPass::new(device, &scene);
         let splat_pass = SplatPass::new(device);
+        let mesh_pass = MeshPass::new(device, &splat_pass.g0_layout, &splat_pass.g1_layout);
+        let mesh_shadow_map = MeshShadowMapPass::new(device, &splat_pass.g1_layout);
         let splat_resolve = SplatResolvePass::new(device);
         let primary_mode = PrimaryMode::from_env();
         eprintln!("[RkpRenderer] primary_mode = {primary_mode:?}");
@@ -164,6 +189,10 @@ impl RkpRenderer {
             splat_pass,
             splat_resolve,
             splat_buffers: Vec::new(),
+            mesh_pass,
+            mesh_shadow_map,
+            mesh_buffers: Vec::new(),
+            mesh_shadow_buffers: Vec::new(),
             primary_mode,
             device: device.clone(),
             profiler, timestamp_period,
@@ -209,6 +238,110 @@ impl RkpRenderer {
             .get(handle_raw as usize)
             .and_then(|s| s.as_ref())
             .map(|(b, c)| (b, *c))
+    }
+
+    /// Upload (or replace) the surface-mesh vertex + index buffers for
+    /// a given asset. Caller passes the asset's `AssetHandle::raw()`
+    /// and the `(vertices, indices)` slices from
+    /// `RkpSceneManager::asset_mesh`. Re-upload is safe — the previous
+    /// buffers (if any) are dropped at the end of the call. An empty
+    /// mesh clears the cached entry.
+    pub fn upload_mesh_for_asset(
+        &mut self,
+        handle_raw: u32,
+        vertices: &[MeshVertex],
+        indices: &[u32],
+    ) {
+        use wgpu::util::DeviceExt;
+        let idx = handle_raw as usize;
+        if idx >= self.mesh_buffers.len() {
+            self.mesh_buffers.resize_with(idx + 1, || None);
+        }
+        if vertices.is_empty() || indices.is_empty() {
+            self.mesh_buffers[idx] = None;
+            return;
+        }
+        let vbo = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mesh asset vbo"),
+            contents: bytemuck::cast_slice(vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let ibo = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mesh asset ibo"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        self.mesh_buffers[idx] = Some((vbo, ibo, indices.len() as u32));
+    }
+
+    /// Drop the cached mesh buffers for `handle_raw`. Called when an
+    /// asset is released or invalidated.
+    pub fn release_mesh_for_asset(&mut self, handle_raw: u32) {
+        let idx = handle_raw as usize;
+        if let Some(slot) = self.mesh_buffers.get_mut(idx) {
+            *slot = None;
+        }
+    }
+
+    /// Look up the cached mesh buffers. Returns `(vbo, ibo,
+    /// index_count)` when the asset has been uploaded, else `None`.
+    pub fn mesh_buffer(&self, handle_raw: u32) -> Option<(&wgpu::Buffer, &wgpu::Buffer, u32)> {
+        self.mesh_buffers
+            .get(handle_raw as usize)
+            .and_then(|s| s.as_ref())
+            .map(|(v, i, c)| (v, i, *c))
+    }
+
+    /// Upload (or replace) the coarse-LOD **shadow** mesh buffers for
+    /// an asset. Same contract as `upload_mesh_for_asset`, but the
+    /// data goes into the parallel `mesh_shadow_buffers` cache that
+    /// `dispatch_mesh_shadow` reads.
+    pub fn upload_mesh_shadow_for_asset(
+        &mut self,
+        handle_raw: u32,
+        vertices: &[MeshVertex],
+        indices: &[u32],
+    ) {
+        use wgpu::util::DeviceExt;
+        let idx = handle_raw as usize;
+        if idx >= self.mesh_shadow_buffers.len() {
+            self.mesh_shadow_buffers.resize_with(idx + 1, || None);
+        }
+        if vertices.is_empty() || indices.is_empty() {
+            self.mesh_shadow_buffers[idx] = None;
+            return;
+        }
+        let vbo = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mesh shadow asset vbo"),
+            contents: bytemuck::cast_slice(vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let ibo = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mesh shadow asset ibo"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        self.mesh_shadow_buffers[idx] = Some((vbo, ibo, indices.len() as u32));
+    }
+
+    /// Drop the cached shadow mesh buffers for `handle_raw`.
+    pub fn release_mesh_shadow_for_asset(&mut self, handle_raw: u32) {
+        let idx = handle_raw as usize;
+        if let Some(slot) = self.mesh_shadow_buffers.get_mut(idx) {
+            *slot = None;
+        }
+    }
+
+    /// Look up the cached shadow mesh buffers. Returns `(vbo, ibo,
+    /// index_count)` when uploaded, else `None`.
+    pub fn mesh_shadow_buffer(
+        &self,
+        handle_raw: u32,
+    ) -> Option<(&wgpu::Buffer, &wgpu::Buffer, u32)> {
+        self.mesh_shadow_buffers
+            .get(handle_raw as usize)
+            .and_then(|s| s.as_ref())
+            .map(|(v, i, c)| (v, i, *c))
     }
 
     /// Splat-raster equivalent of `OctreeMarchPass::dispatch`. Writes
@@ -341,6 +474,193 @@ impl RkpRenderer {
             viewport.height,
         );
         self.profiler.end_query(encoder, q_resolve);
+    }
+
+    /// Surface-mesh equivalent of `dispatch_splat`. Same visibility-
+    /// buffer contract — writes (position, pick, leaf_slot) and depth,
+    /// then runs `splat_resolve` to fill in normal / material / glass.
+    /// Uses the shared splat g0/g1 bind groups (layouts are identical;
+    /// `MeshPass` was constructed against the splat layouts).
+    ///
+    /// Steps mirror `dispatch_splat` exactly, except step 5 issues an
+    /// indexed draw instead of an instanced quad — vertex layout is
+    /// per-vertex, two triangles per exposed cell face.
+    pub fn dispatch_mesh(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        viewport: &mut crate::viewport_renderer::ViewportRenderer,
+        draws: &[SplatDraw],
+    ) {
+        viewport.refresh_splat_g0(&self.device, self);
+        viewport.refresh_splat_resolve_bindings(&self.device, self);
+        viewport.ensure_splat_instance_capacity(&self.device, self, draws.len() as u32);
+        for (slot, d) in draws.iter().enumerate() {
+            viewport.write_splat_instance(queue, slot as u32, &d.world, d.object_id);
+        }
+
+        // RKP_MESH_STATS=1 prints per-frame mesh stats with a per-asset
+        // breakdown, mirroring RKP_SPLAT_STATS.
+        if std::env::var("RKP_MESH_STATS").is_ok() {
+            use std::collections::HashMap;
+            // handle_raw → (instance_count, indices_per_asset)
+            let mut per_asset: HashMap<u32, (u32, u32)> = HashMap::new();
+            let mut total_indices: u64 = 0;
+            let mut drawn = 0u32;
+            let mut missing = 0u32;
+            for d in draws {
+                match self.mesh_buffer(d.asset_handle_raw) {
+                    Some((_, _, count)) => {
+                        total_indices += count as u64;
+                        drawn += 1;
+                        let entry = per_asset
+                            .entry(d.asset_handle_raw)
+                            .or_insert((0, count));
+                        entry.0 += 1;
+                    }
+                    None => missing += 1,
+                }
+            }
+            let unique_indices: u64 = per_asset.values().map(|(_, s)| *s as u64).sum();
+            eprintln!(
+                "[mesh] {}×{} · {} draws ({} drawn, {} skipped) · {} unique assets · {} unique tris · {} total tris rasterized",
+                viewport.width, viewport.height,
+                draws.len(), drawn, missing,
+                per_asset.len(), unique_indices / 3, total_indices / 3,
+            );
+        }
+
+        let g0_bg = viewport
+            .splat_g0_bg
+            .as_ref()
+            .expect("splat g0 bg present after refresh_splat_g0");
+
+        // 1. Visibility-buffer raster — same RT layout as the splat
+        //    pass; clears use the same march-equivalent miss sentinels.
+        let q_raster = self.profiler.begin_query("mesh_raster", encoder);
+        {
+            let mut rp = self.mesh_pass.begin_pass(
+                encoder,
+                &viewport.gbuffer.position_view,
+                &viewport.pick_view,
+                &viewport.gbuffer.leaf_slot_view,
+                &viewport.gbuffer.depth_view,
+                None,
+            );
+            rp.set_pipeline(&self.mesh_pass.pipeline);
+            rp.set_bind_group(0, g0_bg, &[]);
+            for (slot, d) in draws.iter().enumerate() {
+                let Some((vbo, ibo, count)) = self.mesh_buffer(d.asset_handle_raw) else {
+                    continue;
+                };
+                let g1_bg = &viewport.splat_instance_bind_groups[slot];
+                rp.set_bind_group(1, g1_bg, &[]);
+                rp.set_vertex_buffer(0, vbo.slice(..));
+                rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..count, 0, 0..1);
+            }
+        }
+        self.profiler.end_query(encoder, q_raster);
+
+        // 2. Resolve compute — identical to the splat path.
+        let resolve_g0 = viewport
+            .splat_resolve_g0_bg
+            .as_ref()
+            .expect("splat_resolve g0 bg present after refresh");
+        let resolve_g1 = viewport
+            .splat_resolve_g1_bg
+            .as_ref()
+            .expect("splat_resolve g1 bg present after refresh");
+        let q_resolve = self.profiler.begin_query("mesh_resolve", encoder);
+        self.splat_resolve.dispatch(
+            encoder,
+            resolve_g0,
+            resolve_g1,
+            viewport.width,
+            viewport.height,
+        );
+        self.profiler.end_query(encoder, q_resolve);
+    }
+
+    /// Render the mesh-mode directional shadow map. Mirrors
+    /// `dispatch_mesh` but draws into the shadow_buffer (atomicMin via
+    /// fragment shader) using the light camera's view-proj. Per-asset
+    /// vertex/index buffers and per-instance uniforms are reused from
+    /// the primary mesh dispatch — they describe the same triangles.
+    ///
+    /// Caller must:
+    ///   1. Have already populated `shadow_map.uniform_buffer` with a
+    ///      live `LightCameraUniform` for this frame (engine does this
+    ///      in `prepare_shadow_maps`).
+    ///   2. Have already populated `splat_instance_buffers` (any
+    ///      previous `dispatch_mesh`/`dispatch_splat` this frame did
+    ///      this; if mesh-shadow runs before primary mesh dispatch the
+    ///      caller should write the per-instance uniforms first).
+    ///
+    /// This dispatch clears `shadow_map.shadow_buffer` (via the
+    /// shared `ShadowMapPass::dispatch_clear` compute pass) before
+    /// the render so each frame starts from FAR_DEPTH.
+    pub fn dispatch_mesh_shadow(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        viewport: &mut crate::viewport_renderer::ViewportRenderer,
+        draws: &[SplatDraw],
+    ) {
+        viewport.refresh_mesh_shadow_bindings(&self.device, self);
+
+        // 1. Depth-only render. Vertex transforms through light_camera
+        //    view-proj; rasterizer fills the depth attachment. No
+        //    fragment shader, so the GPU's early-z runs at full speed.
+        let render_g0 = viewport
+            .mesh_shadow_render_g0_bg
+            .as_ref()
+            .expect("mesh_shadow render g0 bg present after refresh");
+        let q_render = self.profiler.begin_query("mesh_shadow_render", encoder);
+        {
+            let mut rp = self.mesh_shadow_map.begin_render_pass(
+                encoder,
+                &viewport.mesh_shadow_depth_view,
+                None,
+            );
+            rp.set_pipeline(&self.mesh_shadow_map.render_pipeline);
+            rp.set_bind_group(0, render_g0, &[]);
+            for (slot, d) in draws.iter().enumerate() {
+                // Use the SAME mesh primary visibility renders. The
+                // alternative is `mesh_shadow_buffer` (a coarser LOD
+                // version pre-extracted at load time) — that's faster
+                // but produces a silhouette mismatch between primary
+                // and shadow that shows up as blocky shadow casts.
+                // Real triangle engines solve this with mesh
+                // simplification (decimation), not voxel-LOD; until
+                // we have that, the primary mesh is the
+                // fidelity-correct choice. The LOD path stays in
+                // tree so it can be flipped back once we want the
+                // perf at the cost of quality.
+                let Some((vbo, ibo, count)) = self.mesh_buffer(d.asset_handle_raw)
+                else {
+                    continue;
+                };
+                let g1_bg = &viewport.splat_instance_bind_groups[slot];
+                rp.set_bind_group(1, g1_bg, &[]);
+                rp.set_vertex_buffer(0, vbo.slice(..));
+                rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..count, 0, 0..1);
+            }
+        }
+        self.profiler.end_query(encoder, q_render);
+
+        // 2. Blit compute — copy bitcast(depth) into shadow_buffer.
+        //    Single thread per texel, full overwrite; no need to
+        //    pre-clear shadow_buffer because every texel is written
+        //    (uncovered ones get the depth attachment's clear value
+        //    of 1.0 = SHADOW_MAP_FAR_DEPTH_BITS after bitcast).
+        let blit_g0 = viewport
+            .mesh_shadow_blit_g0_bg
+            .as_ref()
+            .expect("mesh_shadow blit g0 bg present after refresh");
+        let q_blit = self.profiler.begin_query("mesh_shadow_blit", encoder);
+        self.mesh_shadow_map.dispatch_blit(encoder, blit_g0);
+        self.profiler.end_query(encoder, q_blit);
     }
 
     /// Current lights/materials epoch — ViewportRenderers compare against
@@ -478,6 +798,7 @@ impl RkpRenderer {
         let in_situ = matches!(mode, crate::RenderMode::InSitu);
         let raymarch = matches!(preview_mode, crate::BuildPreviewMode::Raymarch);
         let splat = self.primary_mode == PrimaryMode::Splat;
+        let mesh = self.primary_mode == PrimaryMode::Mesh;
 
         // Upload per-viewport tile-cull data. The per-object screen
         // AABBs feed the CPU-side tile-list builder; only the built
@@ -512,6 +833,10 @@ impl RkpRenderer {
             self.profiler.end_query(encoder, q);
         } else if splat {
             self.dispatch_splat(queue, encoder, viewport, splat_draws);
+        } else if mesh {
+            // Mesh path consumes the same per-instance draw list as
+            // splat — both record (asset_handle, world, object_id).
+            self.dispatch_mesh(queue, encoder, viewport, splat_draws);
         } else {
             viewport.march.clear_stats(encoder);
             let q = self.profiler.begin_query("march", encoder);
@@ -532,7 +857,7 @@ impl RkpRenderer {
         // that the splat path doesn't provide. Splat A/B comparisons
         // therefore render shadow=1.0; document this when interpreting
         // visual diffs.
-        if in_situ && !raymarch && !splat {
+        if in_situ && !raymarch && !splat && !mesh {
             if let Some(params_bg) = viewport.march.params_bind_group() {
                 let q = self.profiler.begin_query("shadow", encoder);
                 viewport.shadow_trace.dispatch(encoder, &viewport.scene_bind_group, params_bg);
@@ -547,7 +872,7 @@ impl RkpRenderer {
         // pass reads the resulting depth texture for directional
         // visibility; non-directional lights still pull from the
         // half-res shadow_trace output.
-        if in_situ && !raymarch && !splat && shadow_map_enabled {
+        if in_situ && !raymarch && !splat && !mesh && shadow_map_enabled {
             let q = self.profiler.begin_query("shadow_map", encoder);
             viewport.shadow_map.dispatch_clear(encoder);
             viewport.shadow_map.dispatch_setup(
@@ -560,7 +885,14 @@ impl RkpRenderer {
             );
             self.profiler.end_query(encoder, q);
         }
-        if !raymarch && !splat {
+        // Mesh-mode directional shadow map: real triangle rasterization
+        // from the light's POV into the same `shadow_buffer` shade
+        // already samples. Per-instance uniforms were written by the
+        // earlier `dispatch_mesh` call this frame.
+        if in_situ && !raymarch && mesh && shadow_map_enabled {
+            self.dispatch_mesh_shadow(encoder, viewport, splat_draws);
+        }
+        if !raymarch && !splat && !mesh {
             viewport.march.copy_stats(encoder);
         }
 

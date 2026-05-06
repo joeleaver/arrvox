@@ -116,6 +116,24 @@ pub(super) struct AssetEntry {
     /// after the GPU buffer is built, but for now we keep it so re-
     /// extraction isn't needed when the GPU side reallocates.
     pub(super) splats: Vec<crate::splat_pass::SplatVertex>,
+    /// Surface-mesh vertices from naive surface-nets extraction
+    /// (Phase 1 of the splat-to-mesh pivot). Object-local positions on
+    /// grid corners; carries oct-packed normal + `leaf_attr_id`. Sized
+    /// proportional to surface area, not voxel count — typically a
+    /// large fraction of `splats.len()` on assets with thin shells.
+    /// Stored alongside `splats` until the Phase 2 forward triangle
+    /// pipeline replaces the splat path.
+    pub(super) mesh_vertices: Vec<crate::mesh_pass::MeshVertex>,
+    /// Triangle indices into `mesh_vertices`. Two triangles per
+    /// exposed cell face, CCW-wound around the outward normal.
+    pub(super) mesh_indices: Vec<u32>,
+    /// Coarse-LOD surface mesh used by `MeshShadowMapPass` (Phase 3).
+    /// Same SN topology, walked at `SHADOW_LOD_LEVELS` levels above
+    /// finest — typically ~64-256× fewer triangles than the primary
+    /// mesh. Vertex `normal_oct` / `leaf_attr_id` are zeroed because
+    /// the shadow shader only consumes `local_pos`.
+    pub(super) mesh_shadow_vertices: Vec<crate::mesh_pass::MeshVertex>,
+    pub(super) mesh_shadow_indices: Vec<u32>,
 }
 
 impl AssetEntry {

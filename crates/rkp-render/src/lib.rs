@@ -34,6 +34,15 @@ pub mod octree_march;
 /// to produce a per-voxel vertex buffer; Phase B will dispatch oriented
 /// disc splats as an alternative primary visibility path.
 pub mod splat_pass;
+/// Surface-mesh path (Phase 1 of the splat-to-mesh pivot) — naive
+/// surface-nets extraction at asset load. CPU-only; the Phase 2 forward
+/// triangle pipeline reads the resulting `(vertices, indices)` buffer.
+pub mod mesh_pass;
+/// Mesh-rendered directional shadow map (Phase 3 of the splat-to-mesh
+/// pivot). Renders mesh triangles from the light's POV, writes depth
+/// into the existing shadow_buffer storage so shade samples it via
+/// the unchanged `sample_shadow_map` path.
+pub mod mesh_shadow_map_pass;
 /// Splat-rasterizer compute fixup pass — reads the visibility-buffer
 /// triplet (leaf_slot, pick) `splat_pass` writes and fills in the
 /// remaining G-buffer entries (normal / material / glass) via the
