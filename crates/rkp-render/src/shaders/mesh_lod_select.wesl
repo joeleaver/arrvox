@@ -128,23 +128,36 @@ fn lod_select(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cluster_err_px = c.cluster_error * scale * world_to_pixels;
     let parent_err_px = c.parent_group_error * scale * world_to_pixels;
 
-    // Karis '21 admit rule. `parent_group_error = +∞` for DAG
-    // roots ensures `parent_err_px > threshold` is always true, so
-    // those clusters are admitted whenever their own error fits.
-    let admit_parent = parent_err_px >= params.pixel_threshold;
-    let admit_self = cluster_err_px < params.pixel_threshold;
+    // Karis '21 admit rule, written NaN-safely:
+    //
+    //   `parent_group_error = +∞` is the DAG-root sentinel
+    //   (no level above this cluster). Computing
+    //   `parent_err_px = ∞ * scale * world_to_pixels` produces NaN
+    //   on any frame where `scale` or `world_to_pixels` happens to
+    //   be 0 (degenerate transform / pre-camera-write first frame),
+    //   and `NaN >= threshold` is `false`. The sentinel check below
+    //   bypasses the projection math entirely so DAG roots are
+    //   always admitted on the parent side.
+    //
+    //   `cluster_error = 0` is the LOD-0-leaf sentinel; the
+    //   cluster's own error is exactly zero so it always fits any
+    //   pixel budget, no projection needed.
+    let parent_is_root = c.parent_group_error >= 1.0e20;
+    let cluster_is_leaf = c.cluster_error == 0.0;
+    let admit_parent = parent_is_root || parent_err_px >= params.pixel_threshold;
+    let admit_self = cluster_is_leaf || cluster_err_px < params.pixel_threshold;
 
     if (admit_parent && admit_self) {
         out.index_count = c.index_count;
         out.instance_count = 1u;
         out.first_index = c.index_offset;
         out.base_vertex = 0;
-        // `first_instance` is unused by the existing mesh.wesl
-        // (instance is read from a uniform binding, not from
-        // `@builtin(instance_index)`), but encoding `object_id`
-        // here keeps the field meaningful for any downstream
-        // shader that does want to read it via vertex stage.
-        out.first_instance = instance.object_id;
+        // `first_instance` must be 0 unless `INDIRECT_FIRST_INSTANCE`
+        // is enabled (it isn't in our context.rs). The current
+        // mesh.wesl reads instance state from a uniform binding,
+        // not via `@builtin(instance_index)`, so 0 is the right
+        // value either way.
+        out.first_instance = 0u;
     }
 
     args[cidx] = out;
