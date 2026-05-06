@@ -40,7 +40,36 @@ use super::extract::MeshVertex;
 /// finest; LOD `LOD_LEVELS - 1` is the coarsest the DAG converges
 /// to). Construction may stop early if a level's simplification
 /// makes no progress or only one cluster remains.
-pub const LOD_LEVELS: usize = 4;
+///
+/// **Temporary default of 1** until the per-group simplify is
+/// properly optimised (parallelised + locally-compacted vertex
+/// buffer). The current implementation pays full-mesh cost per
+/// `simplify_with_locks` call (FULL `vertex_lock: &[bool]` of
+/// length `vertex_count` per call → multi-MB scan inside meshopt
+/// for every group), which means seconds-per-asset extending into
+/// hours-per-asset on real meshes. With `LOD_LEVELS = 1` only the
+/// LOD-0 clustering runs (Phase-5-equivalent); `parent_group_error
+/// = ∞` admits every cluster, so the GPU pipeline degrades
+/// gracefully to "render every cluster". Set
+/// `RKP_MESH_LOD_LEVELS=4` (or any value 1..=4) to opt back into
+/// the full DAG once you're prepared to wait for the build.
+pub const LOD_LEVELS: usize = 1;
+
+/// Hard cap on `lod_levels` — selection-rule + per-cluster fields
+/// can scale up if needed, but `>4` levels has rarely been worth it
+/// in published Nanite-style implementations.
+pub const LOD_LEVELS_MAX: usize = 4;
+
+/// Read the runtime-configurable LOD-level count. Reads
+/// `RKP_MESH_LOD_LEVELS` once and clamps to `1..=LOD_LEVELS_MAX`;
+/// falls back to the [`LOD_LEVELS`] compile-time default.
+fn lod_levels_runtime() -> usize {
+    std::env::var("RKP_MESH_LOD_LEVELS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.clamp(1, LOD_LEVELS_MAX))
+        .unwrap_or(LOD_LEVELS)
+}
 
 /// Target group size — Nanite uses 4. Per LOD level, the algorithm
 /// greedy-clusters the previous level's cluster set into groups of
@@ -87,17 +116,28 @@ impl ClusterDag {
     }
 }
 
-/// Build the cluster DAG.
-///
-/// Returns [`ClusterDag::empty`] for empty input. Otherwise produces
-/// up to `LOD_LEVELS` levels of clusters; the build may converge
-/// early (1 cluster remaining at some level) or stall (a level's
-/// simplification fails to reduce triangles below the target),
-/// either of which terminates DAG growth cleanly.
+/// Build the cluster DAG using the runtime-configured LOD level
+/// count. Reads `RKP_MESH_LOD_LEVELS` (clamped 1..=4) once per call
+/// and forwards to [`build_cluster_dag_with_levels`].
 pub fn build_cluster_dag(vertices: &[MeshVertex], indices: &[u32]) -> ClusterDag {
+    build_cluster_dag_with_levels(vertices, indices, lod_levels_runtime())
+}
+
+/// Build the cluster DAG to exactly `lod_levels` levels. `lod_levels
+/// = 1` skips the simplify-and-regroup loop entirely (returns the
+/// LOD-0 clustering, no parent links — every cluster is a DAG leaf
+/// with `parent_group_error = ∞`, admitted by the LOD-select rule
+/// as "can't go coarser"). `lod_levels >= 2` runs the full DAG
+/// build. Empty input → [`ClusterDag::empty`].
+pub fn build_cluster_dag_with_levels(
+    vertices: &[MeshVertex],
+    indices: &[u32],
+    lod_levels: usize,
+) -> ClusterDag {
     if vertices.is_empty() || indices.len() < 3 {
         return ClusterDag::empty();
     }
+    let lod_levels = lod_levels.clamp(1, LOD_LEVELS_MAX);
 
     let mut all_clusters: Vec<MeshletCluster> = Vec::new();
     let mut all_indices: Vec<u32> = Vec::new();
@@ -119,11 +159,12 @@ pub fn build_cluster_dag(vertices: &[MeshVertex], indices: &[u32]) -> ClusterDag
 
     let mut prev_level_range: std::ops::Range<usize> = lod0_cluster_base..lod0_cluster_end;
     eprintln!(
-        "[lod] LOD 0: {} clusters",
-        prev_level_range.len()
+        "[lod] LOD 0: {} clusters (target lod_levels={})",
+        prev_level_range.len(),
+        lod_levels,
     );
 
-    for lod in 1..LOD_LEVELS {
+    for lod in 1..lod_levels {
         if prev_level_range.len() <= 1 {
             break; // DAG converged to a single cluster
         }
@@ -497,7 +538,11 @@ mod tests {
     #[test]
     fn dag_grows_at_least_two_levels_on_grid_mesh() {
         let (v, i) = grid_mesh(17);
-        let dag = build_cluster_dag(&v, &i);
+        // Explicit lod_levels=4 — the shipped default `LOD_LEVELS=1`
+        // is a temporary perf-bypass while the per-group simplify is
+        // optimised; the DAG-build correctness this test guards
+        // against still has to work end-to-end.
+        let dag = build_cluster_dag_with_levels(&v, &i, 4);
         let max_lod = dag.clusters.iter().map(|c| c.lod_level).max().unwrap_or(0);
         assert!(
             max_lod >= 1,
@@ -509,7 +554,7 @@ mod tests {
     #[test]
     fn dag_per_cluster_caps_respected_at_every_level() {
         let (v, i) = grid_mesh(17);
-        let dag = build_cluster_dag(&v, &i);
+        let dag = build_cluster_dag_with_levels(&v, &i, 4);
         for c in &dag.clusters {
             assert_eq!(c.index_count % 3, 0);
             // Vertex-cap is the meshopt invariant; verify on the
@@ -532,7 +577,7 @@ mod tests {
         // Within a level, cluster_error is uniform-per-group; across
         // levels it must be monotonically non-decreasing.
         let (v, i) = grid_mesh(17);
-        let dag = build_cluster_dag(&v, &i);
+        let dag = build_cluster_dag_with_levels(&v, &i, 4);
         let max_lod = dag.clusters.iter().map(|c| c.lod_level).max().unwrap_or(0);
 
         let mut max_err_per_lod = vec![0.0_f32; (max_lod + 1) as usize];
@@ -556,7 +601,7 @@ mod tests {
         // LOD-0 cluster that became a DAG leaf (its group failed
         // to simplify, or there is no level above it) keeps `∞`.
         let (v, i) = grid_mesh(17);
-        let dag = build_cluster_dag(&v, &i);
+        let dag = build_cluster_dag_with_levels(&v, &i, 4);
         let max_lod = dag.clusters.iter().map(|c| c.lod_level).max().unwrap_or(0);
         if max_lod == 0 {
             // Mesh too small for the DAG to grow — nothing to assert
