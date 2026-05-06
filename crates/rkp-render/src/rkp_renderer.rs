@@ -619,33 +619,48 @@ impl RkpRenderer {
         }
 
         // RKP_MESH_STATS=1 prints per-frame mesh stats with a per-asset
-        // breakdown, mirroring RKP_SPLAT_STATS.
+        // breakdown, mirroring RKP_SPLAT_STATS. The cluster counts are
+        // load-bearing for diagnosing emulated-multi-draw CPU cost —
+        // wgpu emulates `multi_draw_indexed_indirect` as N
+        // `draw_indexed_indirect` calls when the adapter lacks
+        // `MULTI_DRAW_INDIRECT_COUNT`, where N is the total cluster
+        // count across all active draw slots. Total clusters per
+        // primary pass × 2 (primary + shadow) = upper bound on
+        // emulated indirect-draw calls per frame.
         if std::env::var("RKP_MESH_STATS").is_ok() {
             use std::collections::HashMap;
-            // handle_raw → (instance_count, indices_per_asset)
-            let mut per_asset: HashMap<u32, (u32, u32)> = HashMap::new();
+            // handle_raw → (instance_count, indices_per_asset, clusters_per_asset)
+            let mut per_asset: HashMap<u32, (u32, u32, u32)> = HashMap::new();
             let mut total_indices: u64 = 0;
+            let mut total_clusters: u64 = 0;
             let mut drawn = 0u32;
             let mut missing = 0u32;
             for d in draws {
                 match self.mesh_buffer(d.asset_handle_raw) {
                     Some((_, _, count)) => {
                         total_indices += count as u64;
+                        let clusters = self
+                            .mesh_cluster_buffer(d.asset_handle_raw)
+                            .map(|(_, c)| c)
+                            .unwrap_or(0);
+                        total_clusters += clusters as u64;
                         drawn += 1;
                         let entry = per_asset
                             .entry(d.asset_handle_raw)
-                            .or_insert((0, count));
+                            .or_insert((0, count, clusters));
                         entry.0 += 1;
                     }
                     None => missing += 1,
                 }
             }
-            let unique_indices: u64 = per_asset.values().map(|(_, s)| *s as u64).sum();
+            let unique_indices: u64 = per_asset.values().map(|(_, s, _)| *s as u64).sum();
+            let unique_clusters: u64 = per_asset.values().map(|(_, _, c)| *c as u64).sum();
             eprintln!(
-                "[mesh] {}×{} · {} draws ({} drawn, {} skipped) · {} unique assets · {} unique tris · {} total tris rasterized",
+                "[mesh] {}×{} · {} draws ({} drawn, {} skipped) · {} unique assets · {} unique tris · {} total tris rasterized · {} unique clusters · {} total clusters (= emulated multi-draw call count for this pass)",
                 viewport.width, viewport.height,
                 draws.len(), drawn, missing,
                 per_asset.len(), unique_indices / 3, total_indices / 3,
+                unique_clusters, total_clusters,
             );
         }
 
