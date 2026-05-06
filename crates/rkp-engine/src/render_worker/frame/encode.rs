@@ -380,6 +380,11 @@ pub(super) fn encode_viewports(
         if let Some(idx) = readback_idx {
             vr.readback.issue_map_async(idx);
         }
+        // Pair the LOD-stats map_async with the matching submit
+        // (validation requires map_async after submit, not before).
+        // No-op when `RKP_MESH_LOD_STATS=1` is unset since
+        // `dispatch_mesh*` skipped the encoder copy.
+        vr.lod_stats_post_submit();
 
         // March stats — async readback. Gated behind RKP_MARCH_STATS=1
         // so it doesn't spam by default; when enabled, drains any

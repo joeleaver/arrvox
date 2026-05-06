@@ -198,6 +198,37 @@ pub struct ViewportRenderer {
     /// cluster table + the shadow args buffer.
     pub mesh_lod_shadow_g2_bgs: Vec<Option<(wgpu::BindGroup, u32, u32)>>,
 
+    // ── Mesh LOD admit stats (RKP_MESH_LOD_STATS=1 diagnostic) ─────
+    /// Pass-shared 32 B (8 × u32) histograms. Slots 0..4: admitted
+    /// clusters per LOD. Slots 4..8: total clusters per LOD. The
+    /// shader atomic-adds into these only when `record_stats != 0`
+    /// in the per-draw params; the CPU pre-clears at the start of
+    /// each LOD-select pass and copies to the matching staging
+    /// buffer after.
+    pub mesh_lod_admit_stats_primary: wgpu::Buffer,
+    pub mesh_lod_admit_stats_shadow: wgpu::Buffer,
+    /// Per-pass staging buffer for async readback. Persistent — the
+    /// 32 B size makes one allocation cheap. State machine:
+    /// `pending = None` (idle) → `submit_copy + issue_map_async`
+    /// → `pending = Some(rx)` (in flight or mapped) → `try_recv`
+    /// returns Ok → `read + log + unmap` → `pending = None`. Skip
+    /// the copy on frames where `pending.is_some()` so we don't
+    /// double-map.
+    pub mesh_lod_admit_stats_primary_staging: wgpu::Buffer,
+    pub mesh_lod_admit_stats_shadow_staging: wgpu::Buffer,
+    pub mesh_lod_admit_stats_primary_pending:
+        Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    pub mesh_lod_admit_stats_shadow_pending:
+        Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    /// Set by `lod_stats_finalize_*` when it queues a copy this
+    /// frame; the engine calls `lod_stats_post_submit` after
+    /// `queue.submit()` to pair `map_async` with the matching submit.
+    /// Splitting it across the submit boundary avoids the
+    /// `Buffer is still mapped` validation error wgpu fires when a
+    /// submit touches a buffer the same encoder also map_async'd.
+    pub mesh_lod_admit_stats_primary_needs_map: bool,
+    pub mesh_lod_admit_stats_shadow_needs_map: bool,
+
     pub width: u32,
     pub height: u32,
 }
@@ -469,6 +500,38 @@ impl ViewportRenderer {
             mesh_lod_shadow_args_buffers: Vec::new(),
             mesh_lod_shadow_g0_bgs: Vec::new(),
             mesh_lod_shadow_g2_bgs: Vec::new(),
+            mesh_lod_admit_stats_primary: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rkp_vr_mesh_lod_admit_stats_primary"),
+                size: 32,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            mesh_lod_admit_stats_shadow: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rkp_vr_mesh_lod_admit_stats_shadow"),
+                size: 32,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            mesh_lod_admit_stats_primary_staging: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rkp_vr_mesh_lod_admit_stats_primary_staging"),
+                size: 32,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            mesh_lod_admit_stats_shadow_staging: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rkp_vr_mesh_lod_admit_stats_shadow_staging"),
+                size: 32,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            mesh_lod_admit_stats_primary_pending: None,
+            mesh_lod_admit_stats_shadow_pending: None,
+            mesh_lod_admit_stats_primary_needs_map: false,
+            mesh_lod_admit_stats_shadow_needs_map: false,
             width, height,
         }
     }
@@ -762,6 +825,164 @@ impl ViewportRenderer {
             0,
             bytemuck::bytes_of(&cam),
         );
+    }
+
+    /// Mesh LOD-select admit-stats lifecycle. Called by `dispatch_mesh`
+    /// + `dispatch_mesh_shadow` when `RKP_MESH_LOD_STATS=1`. Three
+    /// phases composed in order per frame:
+    ///
+    /// 1. `lod_stats_drain_*`: try_recv the previous frame's pending
+    ///    map; if it's mapped, read 32 B + log + unmap + reset to
+    ///    idle. Cheap when nothing is in flight.
+    /// 2. `lod_stats_clear_*`: encoder.clear_buffer the histogram so
+    ///    this frame's atomics start at zero. Always called before
+    ///    the LOD-select dispatch (no-op if stats disabled — clear
+    ///    is harmless either way and avoids an env-var-gated branch
+    ///    on the hot path).
+    /// 3. `lod_stats_finalize_*`: encoder.copy_buffer_to_buffer the
+    ///    histogram → staging buffer. Called immediately after the
+    ///    LOD-select dispatch finishes. Skipped when a map is already
+    ///    pending so we don't overwrite in-flight data.
+    pub fn lod_stats_drain_primary(&mut self, label: &str) {
+        Self::lod_stats_drain(
+            &self.mesh_lod_admit_stats_primary_staging,
+            &mut self.mesh_lod_admit_stats_primary_pending,
+            label,
+        );
+    }
+    pub fn lod_stats_drain_shadow(&mut self, label: &str) {
+        Self::lod_stats_drain(
+            &self.mesh_lod_admit_stats_shadow_staging,
+            &mut self.mesh_lod_admit_stats_shadow_pending,
+            label,
+        );
+    }
+    fn lod_stats_drain(
+        staging: &wgpu::Buffer,
+        pending: &mut Option<
+            std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+        >,
+        label: &str,
+    ) {
+        let Some(rx) = pending.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                let slice = staging.slice(..);
+                let data = slice.get_mapped_range();
+                if data.len() >= 32 {
+                    let mut admitted = [0u32; 4];
+                    let mut total = [0u32; 4];
+                    for i in 0..4 {
+                        admitted[i] = u32::from_le_bytes([
+                            data[i * 4],
+                            data[i * 4 + 1],
+                            data[i * 4 + 2],
+                            data[i * 4 + 3],
+                        ]);
+                        total[i] = u32::from_le_bytes([
+                            data[16 + i * 4],
+                            data[16 + i * 4 + 1],
+                            data[16 + i * 4 + 2],
+                            data[16 + i * 4 + 3],
+                        ]);
+                    }
+                    let admitted_total: u32 = admitted.iter().sum();
+                    let evaluated_total: u32 = total.iter().sum();
+                    eprintln!(
+                        "[mesh_lod_stats {label}] evaluated={evaluated_total} admitted={admitted_total} | \
+                         lod0 {}/{} | lod1 {}/{} | lod2 {}/{} | lod3 {}/{}",
+                        admitted[0], total[0],
+                        admitted[1], total[1],
+                        admitted[2], total[2],
+                        admitted[3], total[3],
+                    );
+                }
+                drop(data);
+                staging.unmap();
+                *pending = None;
+            }
+            Ok(Err(e)) => {
+                eprintln!("[mesh_lod_stats {label}] map_async error: {e:?}");
+                *pending = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Still in flight; check again next frame.
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Sender dropped without sending — shouldn't happen
+                // since the closure stays alive until the callback
+                // fires. Reset defensively.
+                *pending = None;
+            }
+        }
+    }
+
+    pub fn lod_stats_clear_primary(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.clear_buffer(&self.mesh_lod_admit_stats_primary, 0, None);
+    }
+    pub fn lod_stats_clear_shadow(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.clear_buffer(&self.mesh_lod_admit_stats_shadow, 0, None);
+    }
+
+    /// Queue the GPU-side copy of the histogram into the staging
+    /// buffer. Returns `true` if the copy was actually queued (i.e.,
+    /// no map is in flight); the caller MUST then call
+    /// `lod_stats_issue_map_async_primary` after `queue.submit()` to
+    /// pair the map_async with this submit. Issuing map_async before
+    /// submit triggers `Buffer is still mapped` validation errors
+    /// because wgpu reads the map state at submit time.
+    pub fn lod_stats_finalize_primary(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if self.mesh_lod_admit_stats_primary_pending.is_some() {
+            return;
+        }
+        encoder.copy_buffer_to_buffer(
+            &self.mesh_lod_admit_stats_primary,
+            0,
+            &self.mesh_lod_admit_stats_primary_staging,
+            0,
+            32,
+        );
+        self.mesh_lod_admit_stats_primary_needs_map = true;
+    }
+    pub fn lod_stats_finalize_shadow(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if self.mesh_lod_admit_stats_shadow_pending.is_some() {
+            return;
+        }
+        encoder.copy_buffer_to_buffer(
+            &self.mesh_lod_admit_stats_shadow,
+            0,
+            &self.mesh_lod_admit_stats_shadow_staging,
+            0,
+            32,
+        );
+        self.mesh_lod_admit_stats_shadow_needs_map = true;
+    }
+
+    /// Engine call after `queue.submit()`. Issues map_async on any
+    /// staging buffers `lod_stats_finalize_*` flagged this frame.
+    pub fn lod_stats_post_submit(&mut self) {
+        if self.mesh_lod_admit_stats_primary_needs_map {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.mesh_lod_admit_stats_primary_staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx.send(r);
+                });
+            self.mesh_lod_admit_stats_primary_pending = Some(rx);
+            self.mesh_lod_admit_stats_primary_needs_map = false;
+        }
+        if self.mesh_lod_admit_stats_shadow_needs_map {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.mesh_lod_admit_stats_shadow_staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx.send(r);
+                });
+            self.mesh_lod_admit_stats_shadow_pending = Some(rx);
+            self.mesh_lod_admit_stats_shadow_needs_map = false;
+        }
     }
 
     /// Write one frame's `SplatInstanceUniform` for the given slot.

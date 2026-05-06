@@ -20,6 +20,15 @@
 //   @group(1) @binding(0)  MeshInstance (read)              — per-draw
 //   @group(2) @binding(0)  array<MeshletCluster> (read)     — per-asset
 //   @group(2) @binding(1)  array<DrawIndexedIndirectArgs>   — per-draw, RW
+//   @group(2) @binding(2)  array<atomic<u32>, 8> stats      — pass-shared, RW
+//
+// `stats` is an 8-slot histogram: indices 0..4 are the per-LOD
+// admitted-cluster counts, indices 4..8 are the per-LOD total-cluster
+// counts (everything we evaluated, regardless of admit). Pass-shared
+// means every draw within a pass (primary or shadow) atomic-adds into
+// the same buffer; the CPU pre-clears it at the start of each pass.
+// Diagnostic-only — values are read back to host and logged behind
+// `RKP_MESH_LOD_STATS=1`.
 
 import package::lib::types::CameraUniforms;
 
@@ -35,7 +44,9 @@ struct MeshLodSelectParams {
     /// regardless of the Karis rule. CPU sets this from
     /// `RKP_MESH_DEBUG_FORCE_ADMIT`.
     force_admit: u32,
-    _pad: u32,
+    /// When non-zero, atomic-add into the pass-shared `stats`
+    /// histogram. CPU sets this from `RKP_MESH_LOD_STATS=1`.
+    record_stats: u32,
 }
 
 struct MeshInstance {
@@ -71,6 +82,7 @@ struct DrawIndexedIndirectArgs {
 @group(1) @binding(0) var<uniform> instance: MeshInstance;
 @group(2) @binding(0) var<storage, read> clusters: array<MeshletCluster>;
 @group(2) @binding(1) var<storage, read_write> args: array<DrawIndexedIndirectArgs>;
+@group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 8>;
 
 /// Approximate the maximum axis-scale of an affine 4x4 transform.
 /// Cluster errors are object-local lengths; we multiply by this to
@@ -166,4 +178,20 @@ fn lod_select(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     args[cidx] = out;
+
+    // Diagnostic histogram — gated on `record_stats` because atomic
+    // contention on 8 hot cache lines from millions of threads adds
+    // measurable GPU time, and we don't want to pay it on the
+    // production path. Slots 0..4: admitted per LOD; slots 4..8:
+    // total per LOD. CPU pre-clears the buffer to 0 at the start of
+    // each pass and reads it back behind `RKP_MESH_LOD_STATS=1`.
+    // `lod_level` is clamped so a corrupt cluster entry can't index
+    // out-of-bounds.
+    if (params.record_stats != 0u) {
+        let lvl = min(c.lod_level, 3u);
+        if (admit) {
+            atomicAdd(&stats[lvl], 1u);
+        }
+        atomicAdd(&stats[lvl + 4u], 1u);
+    }
 }

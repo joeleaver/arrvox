@@ -56,7 +56,11 @@ pub struct MeshLodSelectParams {
     pub pixel_threshold: f32,
     pub cluster_count: u32,
     pub force_admit: u32,
-    pub _pad: u32,
+    /// When non-zero, the shader atomicAdds into the pass-shared
+    /// stats histogram. Off by default — atomics on hot cache
+    /// lines aren't free at the 1M+ threads/frame Phase 6 issues.
+    /// CPU sets this from `RKP_MESH_LOD_STATS=1`.
+    pub record_stats: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<MeshLodSelectParams>() == 16);
@@ -105,7 +109,7 @@ impl MeshLodSelectPass {
         });
 
         let g2_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mesh_lod_select g2 (clusters + args)"),
+            label: Some("mesh_lod_select g2 (clusters + args + stats)"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -119,6 +123,16 @@ impl MeshLodSelectPass {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -182,14 +196,18 @@ impl MeshLodSelectPass {
     }
 
     /// Build the per-draw `g2` bind group — asset cluster table + the
-    /// per-draw args buffer. The args buffer must have STORAGE +
-    /// INDIRECT usage so the same buffer can be written here and
-    /// read by `multi_draw_indexed_indirect` in the render pass.
+    /// per-draw args buffer + the pass-shared stats buffer. The args
+    /// buffer must have STORAGE + INDIRECT usage so the same buffer
+    /// can be written here and read by `multi_draw_indexed_indirect`
+    /// in the render pass. The stats buffer is shared across every
+    /// draw within a pass (primary or shadow): all g2 BGs in the same
+    /// pass reference the same buffer.
     pub fn create_g2_bind_group(
         &self,
         device: &wgpu::Device,
         cluster_buffer: &wgpu::Buffer,
         args_buffer: &wgpu::Buffer,
+        stats_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mesh_lod_select g2 bg"),
@@ -202,6 +220,10 @@ impl MeshLodSelectPass {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: args_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: stats_buffer.as_entire_binding(),
                 },
             ],
         })
