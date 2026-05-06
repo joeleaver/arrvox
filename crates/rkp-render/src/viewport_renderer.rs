@@ -136,6 +136,16 @@ pub struct ViewportRenderer {
     /// Bind groups paired one-to-one with `splat_instance_buffers`.
     pub splat_instance_bind_groups: Vec<wgpu::BindGroup>,
 
+    /// Splat-resolve compute pass — per-VR texture bindings (g0).
+    /// Bound to (leaf_slot, pick) reads + (normal, material, glass)
+    /// storage writes. Rebuilt on resize (gbuffer texture views move).
+    pub splat_resolve_g0_bg: Option<wgpu::BindGroup>,
+    /// Splat-resolve compute pass — scene-buffers bindings (g1).
+    /// Bound to leaf_attr_pool / color_pool / objects_buffer; rebuilt
+    /// when scene_buffers_epoch bumps.
+    pub splat_resolve_g1_bg: Option<wgpu::BindGroup>,
+    pub splat_resolve_scene_epoch: u64,
+
     pub width: u32,
     pub height: u32,
 }
@@ -356,13 +366,17 @@ impl ViewportRenderer {
             splat_g0_lights_materials_epoch: u64::MAX,
             splat_instance_buffers: Vec::new(),
             splat_instance_bind_groups: Vec::new(),
+            splat_resolve_g0_bg: None,
+            splat_resolve_g1_bg: None,
+            splat_resolve_scene_epoch: u64::MAX,
             width, height,
         }
     }
 
-    /// Rebuild the splat scene-wide (`g0`) bind group when its referenced
-    /// buffers may have moved. Cheap when no rebuild is needed (one
-    /// epoch comparison). Caller invokes once before `dispatch_splat`.
+    /// Rebuild the splat-raster scene-wide (`g0`) bind group when its
+    /// referenced buffers may have moved. Cheap when no rebuild is
+    /// needed (one epoch comparison). Caller invokes once before
+    /// `dispatch_splat`.
     pub fn refresh_splat_g0(&mut self, device: &wgpu::Device, renderer: &RkpRenderer) {
         let scene_now = renderer.scene.buffers_epoch();
         let lm_now = renderer.lights_materials_epoch();
@@ -376,11 +390,41 @@ impl ViewportRenderer {
             device,
             &self.camera_buffer,
             &renderer.scene.leaf_attr_pool_buffer,
-            &renderer.materials_buffer,
-            &renderer.scene.color_pool_buffer,
         ));
         self.splat_g0_scene_epoch = scene_now;
         self.splat_g0_lights_materials_epoch = lm_now;
+    }
+
+    /// Rebuild the splat-resolve compute pass's bind groups. `g0`
+    /// (per-VR textures) is rebuilt unconditionally if absent —
+    /// `resize` clears it. `g1` (scene buffers) follows the
+    /// scene-buffers epoch, same trigger as the march's
+    /// `scene_bind_group`.
+    pub fn refresh_splat_resolve_bindings(
+        &mut self,
+        device: &wgpu::Device,
+        renderer: &RkpRenderer,
+    ) {
+        if self.splat_resolve_g0_bg.is_none() {
+            self.splat_resolve_g0_bg = Some(renderer.splat_resolve.create_g0_bind_group(
+                device,
+                &self.gbuffer.leaf_slot_view,
+                &self.pick_view,
+                &self.gbuffer.normal_view,
+                &self.gbuffer.material_view,
+                &self.gbuffer.glass_view,
+            ));
+        }
+        let scene_now = renderer.scene.buffers_epoch();
+        if self.splat_resolve_g1_bg.is_none() || self.splat_resolve_scene_epoch != scene_now {
+            self.splat_resolve_g1_bg = Some(renderer.splat_resolve.create_g1_bind_group(
+                device,
+                &renderer.scene.leaf_attr_pool_buffer,
+                &renderer.scene.color_pool_buffer,
+                &renderer.scene.objects_buffer,
+            ));
+            self.splat_resolve_scene_epoch = scene_now;
+        }
     }
 
     /// Grow `splat_instance_buffers` + `splat_instance_bind_groups` to
@@ -518,6 +562,11 @@ impl ViewportRenderer {
         let (pick_texture, pick_view) = create_pick_texture(device, width, height);
         self.pick_texture = pick_texture;
         self.pick_view = pick_view;
+
+        // Splat-resolve g0 references gbuffer texture views which all
+        // just moved. Drop it — `refresh_splat_resolve_bindings` will
+        // rebuild on next dispatch.
+        self.splat_resolve_g0_bg = None;
 
         // Tile-bin per-tile buffers depend on resolution. Reallocate
         // and rebuild the cached bind group + march's tile-bin

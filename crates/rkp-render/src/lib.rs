@@ -34,6 +34,11 @@ pub mod octree_march;
 /// to produce a per-voxel vertex buffer; Phase B will dispatch oriented
 /// disc splats as an alternative primary visibility path.
 pub mod splat_pass;
+/// Splat-rasterizer compute fixup pass — reads the visibility-buffer
+/// triplet (leaf_slot, pick) `splat_pass` writes and fills in the
+/// remaining G-buffer entries (normal / material / glass) via the
+/// scene's `leaf_attr_pool` / `color_pool` / `instances` indirection.
+pub mod splat_resolve_pass;
 pub mod rkp_shadow_trace;
 /// Per-object GPU struct — forward world transform, octree params, no inverse_world.
 pub mod rkp_gpu_object;

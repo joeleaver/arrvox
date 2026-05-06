@@ -20,6 +20,7 @@ use crate::rkp_scene::{RkpScene, GeometryUpload, FrameUpload};
 use crate::rkp_shade::{ShadeParams, GpuLight, GpuMaterial};
 use crate::rkp_atmosphere::RkpAtmospherePass;
 use crate::splat_pass::{SplatDraw, SplatPass, SplatVertex};
+use crate::splat_resolve_pass::SplatResolvePass;
 use wgpu_profiler::GpuProfiler;
 
 /// Primary-visibility selector. Set by the `RKP_PRIMARY` env var at
@@ -75,6 +76,11 @@ pub struct RkpRenderer {
     /// across viewports — the per-VR state lives in `ViewportRenderer`
     /// (g0 bind group, per-instance bind groups + uniform buffers).
     pub splat_pass: SplatPass,
+    /// Splat-resolve compute fixup. Reads the visibility-buffer
+    /// triplet `splat_pass` writes and fills in the remaining G-buffer
+    /// entries (normal / material / glass). One pipeline shared across
+    /// viewports.
+    pub splat_resolve: SplatResolvePass,
     /// Per-asset vertex-buffer cache for the splat path. Indexed by
     /// `AssetHandle::raw()` — `splat_buffers[handle.raw() as usize]`
     /// is `Some((vbo, splat_count))` for assets whose splat data has
@@ -142,6 +148,7 @@ impl RkpRenderer {
 
         let skin_deform = crate::skin_deform::SkinDeformPass::new(device, &scene);
         let splat_pass = SplatPass::new(device);
+        let splat_resolve = SplatResolvePass::new(device);
         let primary_mode = PrimaryMode::from_env();
         eprintln!("[RkpRenderer] primary_mode = {primary_mode:?}");
 
@@ -155,6 +162,7 @@ impl RkpRenderer {
             lights_materials_epoch: 0,
             skin_deform,
             splat_pass,
+            splat_resolve,
             splat_buffers: Vec::new(),
             primary_mode,
             device: device.clone(),
@@ -230,6 +238,7 @@ impl RkpRenderer {
         timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
         viewport.refresh_splat_g0(&self.device, self);
+        viewport.refresh_splat_resolve_bindings(&self.device, self);
         viewport.ensure_splat_instance_capacity(&self.device, self, draws.len() as u32);
         for (slot, d) in draws.iter().enumerate() {
             viewport.write_splat_instance(queue, slot as u32, &d.world, d.object_id);
@@ -240,28 +249,51 @@ impl RkpRenderer {
             .as_ref()
             .expect("splat g0 bg present after refresh_splat_g0");
 
-        let mut rp = self.splat_pass.begin_pass(
-            encoder,
-            &viewport.gbuffer.position_view,
-            &viewport.gbuffer.normal_view,
-            &viewport.gbuffer.material_view,
-            &viewport.pick_view,
-            &viewport.gbuffer.glass_view,
-            &viewport.gbuffer.leaf_slot_view,
-            &viewport.gbuffer.depth_view,
-            timestamp_writes,
-        );
-        rp.set_pipeline(&self.splat_pass.pipeline);
-        rp.set_bind_group(0, g0_bg, &[]);
-        for (slot, d) in draws.iter().enumerate() {
-            let Some((vbo, count)) = self.splat_buffer(d.asset_handle_raw) else {
-                continue;
-            };
-            let g1_bg = &viewport.splat_instance_bind_groups[slot];
-            rp.set_bind_group(1, g1_bg, &[]);
-            rp.set_vertex_buffer(0, vbo.slice(..));
-            rp.draw(0..4, 0..count);
+        // 1. Visibility-buffer raster — writes position + pick +
+        //    leaf_slot for hit pixels; clears all three (and depth) to
+        //    march-equivalent miss sentinels.
+        {
+            let mut rp = self.splat_pass.begin_pass(
+                encoder,
+                &viewport.gbuffer.position_view,
+                &viewport.pick_view,
+                &viewport.gbuffer.leaf_slot_view,
+                &viewport.gbuffer.depth_view,
+                timestamp_writes,
+            );
+            rp.set_pipeline(&self.splat_pass.pipeline);
+            rp.set_bind_group(0, g0_bg, &[]);
+            for (slot, d) in draws.iter().enumerate() {
+                let Some((vbo, count)) = self.splat_buffer(d.asset_handle_raw) else {
+                    continue;
+                };
+                let g1_bg = &viewport.splat_instance_bind_groups[slot];
+                rp.set_bind_group(1, g1_bg, &[]);
+                rp.set_vertex_buffer(0, vbo.slice(..));
+                rp.draw(0..4, 0..count);
+            }
         }
+
+        // 2. Resolve compute — reads (leaf_slot, pick) per pixel,
+        //    writes normal / material / glass via the storage-texture
+        //    G-buffer entries. Branches on leaf_slot==0 to write march-
+        //    equivalent miss sentinels for non-hit pixels (so those
+        //    targets don't need a separate clear).
+        let resolve_g0 = viewport
+            .splat_resolve_g0_bg
+            .as_ref()
+            .expect("splat_resolve g0 bg present after refresh");
+        let resolve_g1 = viewport
+            .splat_resolve_g1_bg
+            .as_ref()
+            .expect("splat_resolve g1 bg present after refresh");
+        self.splat_resolve.dispatch(
+            encoder,
+            resolve_g0,
+            resolve_g1,
+            viewport.width,
+            viewport.height,
+        );
     }
 
     /// Current lights/materials epoch — ViewportRenderers compare against

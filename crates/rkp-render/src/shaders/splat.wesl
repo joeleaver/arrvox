@@ -1,9 +1,17 @@
 // Surface-splat rasterizer — vertex + fragment entry points.
 //
-// Rasterizes one quad per voxel. The quad is oriented to the prefiltered
-// surface normal stored in `LeafAttr.normal_oct`, so adjacent voxel discs
-// produce a smooth surface at any voxel resolution — silhouettes follow
-// the actual surface, not the grid axes.
+// Visibility-buffer architecture: the raster pass writes only the data
+// that can't be reconstructed downstream — world position, the per-leaf
+// `leaf_attr_id`, and the per-instance `object_id`. A follow-up
+// `splat_resolve` compute pass reads (leaf_slot, pick) per pixel and
+// derives the rest of the G-buffer (normal, material, glass) via the
+// existing `leaf_attr_pool` / `color_pool` / `instances` indirection.
+//
+// This split keeps the raster pass under wgpu's 32 B/sample
+// `max_color_attachment_bytes_per_sample` limit (16 + 4 + 4 = 24 B) so
+// the pipeline validates with the default device limits. The compute
+// fixup runs once per pixel — trivial cost compared to the raster
+// itself.
 //
 // Pipeline contract:
 //   · Vertex buffer: one `SplatVertex` per voxel (Rust splat_pass::extract).
@@ -15,16 +23,9 @@
 //   · One draw per scene-instance per asset; the per-instance world matrix
 //     comes from `instance` at @group(1) @binding(0). A separate draw +
 //     `set_bind_group(1, ...)` is issued for each scene-instance.
-//
-// Fragment writes the SAME G-buffer the compute octree_march produces
-// (position / normal / material / pick / glass / leaf_slot). Glass is
-// always written zero — splats are alpha-1 with hard discard. Motion is
-// not bound; TAA isn't dispatched in render_to today, so motion staleness
-// has no observable effect.
 
 import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::types::LeafAttr;
-import package::lib::types::GpuMaterial;
 import package::lib::types::CameraUniforms;
 
 // Per-instance uniform — one mat4x4 world transform plus the entity's
@@ -40,21 +41,14 @@ struct SplatInstance {
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
 @group(0) @binding(1) var<storage, read> leaf_attr_pool: array<LeafAttr>;
-@group(0) @binding(2) var<storage, read> materials: array<GpuMaterial>;
-// Per-voxel colour overrides (packed RGBA8, u32 per leaf slot). Zero
-// means "use material base_color". Same encoding as `color_pool` in
-// `RkpScene` and the same downstream consumer (`rkp_shade` decodes
-// `color_rgb565` from `gbuf_material.g` bits 16..32).
-@group(0) @binding(3) var<storage, read> color_pool: array<u32>;
 
 @group(1) @binding(0) var<uniform> instance: SplatInstance;
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) corner_uv: vec2<f32>,        // -1..1 across the disc
-    @location(1) world_normal: vec3<f32>,     // prefiltered, flat across splat
-    @location(2) world_pos: vec3<f32>,        // interpolated; for depth + dist
-    @location(3) @interpolate(flat) leaf_attr_id: u32,
+    @location(1) world_pos: vec3<f32>,        // disc CENTER world pos
+    @location(2) @interpolate(flat) leaf_attr_id: u32,
 };
 
 // Branch-free tangent-basis construction (Frisvad 2012). For unit `n`,
@@ -90,15 +84,11 @@ fn vert_main(
     // Build the disc in OBJECT-LOCAL space, then transform corners
     // through `instance.world`. This makes the disc inherit any scale
     // / non-uniform scale / rotation in the instance transform without
-    // special-casing — a rotated parent rotates the disc, a scaled
-    // parent scales the disc. The alternative ("transform the basis to
-    // world, then size in world units") loses this property under
-    // non-uniform scale.
+    // special-casing.
     let basis_local = frisvad_tangent_basis(n_local);
     let local_u = basis_local[0] * radius;
     let local_v = basis_local[1] * radius;
 
-    // World-space disc anchors.
     let world_pos = (instance.world * vec4<f32>(local_pos, 1.0)).xyz;
     let world_basis = mat3x3<f32>(
         instance.world[0].xyz,
@@ -107,7 +97,6 @@ fn vert_main(
     );
     let world_u = world_basis * local_u;
     let world_v = world_basis * local_v;
-    let n_world = normalize(world_basis * n_local);
 
     // Triangle-strip corner layout: bits of vertex_index pick ±u, ±v.
     let uv = vec2<f32>(
@@ -116,11 +105,11 @@ fn vert_main(
     );
 
     // Edge-on fall-through fix. When the projected screen-space length
-    // of either tangent axis drops below ~half a pixel, the splat is
-    // nearly edge-on to the view; rasterized as a thin sliver, adjacent
-    // splats leave visible black gaps along the back of the silhouette.
-    // Detect that case and switch this splat to a small camera-facing
-    // billboard sized to ~1 px in screen space.
+    // of either tangent axis drops below ~half a pixel, swap to a
+    // small camera-facing billboard sized to ~1 px to keep the
+    // silhouette tight. Same fix as the prototype, retained because
+    // it's a vertex-stage cheap test that prevents visible holes on
+    // glancing surfaces.
     let clip_center = camera.view_proj * vec4<f32>(world_pos, 1.0);
     let proj_u = camera.view_proj * vec4<f32>(world_u, 0.0);
     let proj_v = camera.view_proj * vec4<f32>(world_v, 0.0);
@@ -130,15 +119,10 @@ fn vert_main(
     let px_v = length(proj_v.xy * inv_w * half_res);
     let min_px = min(px_u, px_v);
 
-    // Camera-facing basis for the billboard fallback. world_up = +Y;
-    // breaks at the zenith/nadir singularity, fine for prototype scenes.
     let view_dir = normalize(world_pos - camera.position.xyz);
     let world_up = vec3<f32>(0.0, 1.0, 0.0);
     let cam_right = normalize(cross(view_dir, world_up));
     let cam_up = cross(cam_right, view_dir);
-    // World-space radius that yields ~1 pixel at the disc center's
-    // clip-w. ndc_per_pixel = 2/resolution.x, so world_per_pixel ≈
-    // clip_w * 2 / resolution.x.
     let billboard_world_radius =
         max(abs(clip_center.w), 1e-6) * 2.0 / camera.resolution.x;
 
@@ -153,31 +137,24 @@ fn vert_main(
     var out: VsOut;
     out.clip_pos = clip;
     out.corner_uv = uv;
-    out.world_normal = n_world;
-    // Interpolate the disc CENTER's world position into the fragment.
-    // Using `corner_world` here would give per-corner positions and the
-    // fragment-side `length(world_pos - camera.position)` would compute
-    // distance to the rim, not the center. The center is what matches
-    // the compute-march's `first_dist`.
+    // Disc CENTER's world pos (not the corner), so the fragment-side
+    // hit_distance matches the compute march's `first_dist`.
     out.world_pos = world_pos;
     out.leaf_attr_id = leaf_attr_id;
     return out;
 }
 
-// Six-attachment fragment output — matches the texture layout written
-// by `octree_march` (storage textures there, render attachments here).
-//
-// Motion (`gbuf_motion`) is intentionally NOT in this list. The march
-// doesn't write it either, and TAA isn't dispatched in `render_to`
-// today; if TAA ever lands here, this is the place to add the velocity
-// output (prev_vp * prev_world * local_pos vs current).
+// Three-attachment fragment output — visibility-buffer triplet:
+//   position   (Rgba32Float, 16 B): world.xyz + hit_distance
+//   pick       (R32Uint,      4 B): instance.object_id
+//   leaf_slot  (R32Uint,      4 B): leaf_attr_id
+// Total 24 B, well under the default 32 B/sample limit. The remaining
+// G-buffer entries (normal/material/glass) are filled by the
+// `splat_resolve` compute pass.
 struct FsOut {
-    @location(0) position:  vec4<f32>,    // gbuf_position (Rgba32Float)
-    @location(1) normal:    vec4<f32>,    // gbuf_normal   (Rgba16Float)
-    @location(2) material:  vec2<u32>,    // gbuf_material (Rg32Uint)
-    @location(3) pick:      u32,          // gbuf_pick     (R32Uint)
-    @location(4) glass:     vec2<u32>,    // gbuf_glass    (Rg32Uint)
-    @location(5) leaf_slot: u32,          // gbuf_leaf_slot (R32Uint)
+    @location(0) position:  vec4<f32>,
+    @location(1) pick:      u32,
+    @location(2) leaf_slot: u32,
 }
 
 @fragment
@@ -186,44 +163,10 @@ fn frag_main(in: VsOut) -> FsOut {
     if (length(in.corner_uv) > 1.0) {
         discard;
     }
-
-    let attr = leaf_attr_pool[in.leaf_attr_id];
-
-    // LeafAttr packing:
-    //   bits  0..16  primary material id (u16)
-    //   bits 16..28  secondary material id (u12)
-    //   bits 28..32  blend weight (u4)
-    let primary   = attr.material_packed & 0xFFFFu;
-    let secondary = (attr.material_packed >> 16u) & 0xFFFu;
-    let blend4    = (attr.material_packed >> 28u) & 0xFu;
-
-    // gbuf_material packing — must match `octree_march`:
-    //   r: primary (lo16) | secondary (hi16)
-    //   g: blend_8 (lo8)  | color_rgb565 (hi16)
-    let blend8 = (blend4 << 4u) | blend4;
-    let packed_r = (primary & 0xFFFFu) | ((secondary & 0xFFFFu) << 16u);
-
-    // Per-voxel colour. 0 means "use material base_color"; the shade
-    // pass already handles that as the no-override path.
-    let c_packed = color_pool[in.leaf_attr_id];
-    let cr8 = c_packed & 0xFFu;
-    let cg8 = (c_packed >> 8u) & 0xFFu;
-    let cb8 = (c_packed >> 16u) & 0xFFu;
-    let cr5 = (cr8 * 31u) / 255u;
-    let cg6 = (cg8 * 63u) / 255u;
-    let cb5 = (cb8 * 31u) / 255u;
-    let color_rgb565 = cr5 | (cg6 << 5u) | (cb5 << 11u);
-    let packed_g = (blend8 & 0xFFu) | (color_rgb565 << 16u);
-
     let hit_distance = length(in.world_pos - camera.position.xyz);
-
     var out: FsOut;
     out.position  = vec4<f32>(in.world_pos, hit_distance);
-    // Match march: alpha channel carries `accum_alpha` (=1 for opaque).
-    out.normal    = vec4<f32>(in.world_normal, 1.0);
-    out.material  = vec2<u32>(packed_r, packed_g);
     out.pick      = instance.object_id;
-    out.glass     = vec2<u32>(0u, 0u);
     out.leaf_slot = in.leaf_attr_id;
     return out;
 }

@@ -40,3 +40,11 @@ fn splat_validates() {
         "splat",
     );
 }
+
+#[test]
+fn splat_resolve_validates() {
+    naga_validates(
+        wesl::include_wesl!("splat_resolve"),
+        "splat_resolve",
+    );
+}
