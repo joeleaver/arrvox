@@ -769,11 +769,96 @@ impl RkpRenderer {
     /// the render so each frame starts from FAR_DEPTH.
     pub fn dispatch_mesh_shadow(
         &mut self,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         viewport: &mut crate::viewport_renderer::ViewportRenderer,
         draws: &[SplatDraw],
     ) {
         viewport.refresh_mesh_shadow_bindings(&self.device, self);
+        viewport.ensure_mesh_lod_shadow_capacity(&self.device, self, draws.len() as u32);
+
+        // Phase 6.4: per-draw shadow LOD-select prep. Same shape as
+        // the primary path in `dispatch_mesh`, but with a doubled
+        // pixel threshold so the Karis admit rule effectively picks
+        // `lod + 1` from the same chain that primary uses.
+        const PIXEL_THRESHOLD_SHADOW: f32 = 2.0;
+        let mut slot_active: Vec<bool> = vec![false; draws.len()];
+        for (slot, d) in draws.iter().enumerate() {
+            if self.mesh_buffer(d.asset_handle_raw).is_none() {
+                continue;
+            }
+            let Some((cluster_buf, cluster_count)) =
+                self.mesh_cluster_buffer(d.asset_handle_raw)
+            else {
+                continue;
+            };
+            if cluster_count == 0 {
+                continue;
+            }
+            let asset_handle_raw = d.asset_handle_raw;
+
+            viewport.ensure_mesh_lod_shadow_args_capacity(
+                &self.device,
+                slot as u32,
+                cluster_count,
+            );
+
+            let (args_buf, args_cap) = &viewport.mesh_lod_shadow_args_buffers[slot];
+            let need_rebuild = match &viewport.mesh_lod_shadow_g2_bgs[slot] {
+                Some((_, cached_handle, cached_cap)) => {
+                    *cached_handle != asset_handle_raw || *cached_cap != *args_cap
+                }
+                None => true,
+            };
+            if need_rebuild {
+                let bg = self.mesh_lod_select_pass.create_g2_bind_group(
+                    &self.device,
+                    cluster_buf,
+                    args_buf,
+                );
+                viewport.mesh_lod_shadow_g2_bgs[slot] = Some((bg, asset_handle_raw, *args_cap));
+            }
+
+            let params = crate::mesh_lod_select_pass::MeshLodSelectParams {
+                pixel_threshold: PIXEL_THRESHOLD_SHADOW,
+                cluster_count,
+                _pad0: 0,
+                _pad1: 0,
+            };
+            queue.write_buffer(
+                &viewport.mesh_lod_shadow_params_buffers[slot],
+                0,
+                bytemuck::bytes_of(&params),
+            );
+
+            slot_active[slot] = true;
+        }
+
+        // 0. Shadow-side LOD-select compute pass.
+        let q_lod = self.profiler.begin_query("mesh_shadow_lod_select", encoder);
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("mesh_shadow_lod_select"),
+                timestamp_writes: None,
+            });
+            for (slot, d) in draws.iter().enumerate() {
+                if !slot_active[slot] {
+                    continue;
+                }
+                let cluster_count =
+                    self.mesh_cluster_buffer(d.asset_handle_raw).map(|(_, c)| c).unwrap_or(0);
+                let g0 = &viewport.mesh_lod_shadow_g0_bgs[slot];
+                let g1 = &viewport.splat_instance_bind_groups[slot];
+                let g2 = &viewport
+                    .mesh_lod_shadow_g2_bgs[slot]
+                    .as_ref()
+                    .expect("g2 set above for active slot")
+                    .0;
+                self.mesh_lod_select_pass
+                    .dispatch(&mut cpass, g0, g1, g2, cluster_count);
+            }
+        }
+        self.profiler.end_query(encoder, q_lod);
 
         // 1. Depth-only render. Vertex transforms through light_camera
         //    view-proj; rasterizer fills the depth attachment. No
@@ -792,26 +877,22 @@ impl RkpRenderer {
             rp.set_pipeline(&self.mesh_shadow_map.render_pipeline);
             rp.set_bind_group(0, render_g0, &[]);
             for (slot, d) in draws.iter().enumerate() {
-                // Use the SAME mesh primary visibility renders. The
-                // alternative is `mesh_shadow_buffer` (a coarser LOD
-                // version pre-extracted at load time) — that's faster
-                // but produces a silhouette mismatch between primary
-                // and shadow that shows up as blocky shadow casts.
-                // Real triangle engines solve this with mesh
-                // simplification (decimation), not voxel-LOD; until
-                // we have that, the primary mesh is the
-                // fidelity-correct choice. The LOD path stays in
-                // tree so it can be flipped back once we want the
-                // perf at the cost of quality.
-                let Some((vbo, ibo, count)) = self.mesh_buffer(d.asset_handle_raw)
-                else {
+                let Some((vbo, ibo, _)) = self.mesh_buffer(d.asset_handle_raw) else {
                     continue;
                 };
+                if !slot_active[slot] {
+                    continue;
+                }
+                let cluster_count = self
+                    .mesh_cluster_buffer(d.asset_handle_raw)
+                    .map(|(_, c)| c)
+                    .unwrap_or(0);
                 let g1_bg = &viewport.splat_instance_bind_groups[slot];
                 rp.set_bind_group(1, g1_bg, &[]);
                 rp.set_vertex_buffer(0, vbo.slice(..));
                 rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
-                rp.draw_indexed(0..count, 0, 0..1);
+                let (args_buf, _) = &viewport.mesh_lod_shadow_args_buffers[slot];
+                rp.multi_draw_indexed_indirect(args_buf, 0, cluster_count);
             }
         }
         self.profiler.end_query(encoder, q_render);
@@ -1057,7 +1138,7 @@ impl RkpRenderer {
         // already samples. Per-instance uniforms were written by the
         // earlier `dispatch_mesh` call this frame.
         if in_situ && !raymarch && mesh && shadow_map_enabled {
-            self.dispatch_mesh_shadow(encoder, viewport, splat_draws);
+            self.dispatch_mesh_shadow(queue, encoder, viewport, splat_draws);
         }
         if !raymarch && !splat && !mesh {
             viewport.march.copy_stats(encoder);

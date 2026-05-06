@@ -240,6 +240,11 @@ pub(super) fn prepare_shadow_maps(
             0,
             bytemuck::bytes_of(&uniform),
         );
+        // Phase 6.4: also populate the per-VR shadow LOD-select
+        // camera buffer (CameraUniforms-shaped) from the same
+        // LightCameraUniform so the LOD compute pass picks
+        // shadow-side admit decisions one LOD coarser than primary.
+        vr.write_mesh_lod_shadow_camera(&state.queue, &uniform);
         wrote_any = true;
     }
     wrote_any

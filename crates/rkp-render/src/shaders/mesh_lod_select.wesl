@@ -106,15 +106,23 @@ fn lod_select(@builtin(global_invocation_id) gid: vec3<u32>) {
     let world_center = (instance.world * vec4<f32>(center_local, 1.0)).xyz;
     let scale = world_scale_factor(instance.world);
 
-    let view_distance = max(length(world_center - camera.position.xyz), 0.001);
-    // `view_proj[1][1]` ~= cot(fov_y/2) for a standard perspective
-    // projection (glam `Mat4::perspective_*`). Multiplied by half
-    // viewport height gives pixels per world-unit at unit distance;
-    // dividing by view_distance gives projected pixels per world-unit
-    // at this depth. Approximation is exact for axis-aligned camera
-    // basis and within ~10% for typical orbit views — well within
-    // LOD selection's tolerance.
+    // `view_proj[1][1]` ≈ cot(fov_y/2) for perspective and `2/height`
+    // for orthographic projections (glam `Mat4::perspective_*` /
+    // `Mat4::orthographic_*`). Multiplied by half viewport height it
+    // gives pixels per world-unit at unit distance.
     let focal_pixels = abs(camera.view_proj[1][1]) * 0.5 * camera.resolution.y;
+
+    // Ortho cameras (used by directional shadow maps) put `1` in
+    // `view_proj[3][3]`; perspective puts `0`. For ortho the screen
+    // projection is depth-independent so view_distance drops out
+    // (we substitute `1.0`); for perspective we use the standard
+    // `world_to_pixels = focal_pixels / view_distance` formula.
+    let is_ortho = abs(camera.view_proj[3][3] - 1.0) < 0.01;
+    let view_distance = select(
+        max(length(world_center - camera.position.xyz), 0.001),
+        1.0,
+        is_ortho,
+    );
     let world_to_pixels = focal_pixels / view_distance;
 
     let cluster_err_px = c.cluster_error * scale * world_to_pixels;

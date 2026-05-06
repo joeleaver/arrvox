@@ -176,6 +176,28 @@ pub struct ViewportRenderer {
     /// populates it; `(handle, cap)` as the freshness key.
     pub mesh_lod_select_g2_bgs: Vec<Option<(wgpu::BindGroup, u32, u32)>>,
 
+    // ── Mesh shadow LOD-select per-VR state (Phase 6.4) ────────────
+    /// `CameraUniforms`-shaped buffer populated each frame from the
+    /// active light camera. Carries the light's `view_proj` (so the
+    /// LOD shader gets the ortho focal-length factor),
+    /// `resolution = shadow_map_size`, and the eye position derived
+    /// from `view_proj_inv * (0,0,0,1)`. Other fields zeroed; the
+    /// LOD shader doesn't read them.
+    pub mesh_lod_shadow_camera_buffer: wgpu::Buffer,
+    /// Parallel to `mesh_lod_params_buffers` — per-draw shadow
+    /// params with doubled `pixel_threshold` for `lod + 1` selection.
+    pub mesh_lod_shadow_params_buffers: Vec<wgpu::Buffer>,
+    /// Parallel to `mesh_lod_args_buffers` — separate args storage
+    /// for the shadow path so primary and shadow can run their
+    /// compute passes back-to-back without aliasing.
+    pub mesh_lod_shadow_args_buffers: Vec<(wgpu::Buffer, u32)>,
+    /// Parallel to `mesh_lod_select_g0_bgs` — bound to the
+    /// synthetic shadow camera buffer + per-draw shadow params.
+    pub mesh_lod_shadow_g0_bgs: Vec<wgpu::BindGroup>,
+    /// Parallel to `mesh_lod_select_g2_bgs` — bound to the asset
+    /// cluster table + the shadow args buffer.
+    pub mesh_lod_shadow_g2_bgs: Vec<Option<(wgpu::BindGroup, u32, u32)>>,
+
     pub width: u32,
     pub height: u32,
 }
@@ -197,6 +219,18 @@ impl ViewportRenderer {
         // Camera buffer + scene bind group (Phase 6a pattern).
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rkp_vr_camera"),
+            size: std::mem::size_of::<CameraUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Synthetic camera buffer used by the mesh-shadow LOD-select
+        // compute pass (Phase 6.4). Filled each frame from the active
+        // light camera so the shader's `view_proj[1][1]` /
+        // `view_proj[3][3]` switch picks the orthographic projection
+        // formula and `resolution.y` carries the shadow map size.
+        let mesh_lod_shadow_camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rkp_vr_mesh_lod_shadow_camera"),
             size: std::mem::size_of::<CameraUniforms>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -430,6 +464,11 @@ impl ViewportRenderer {
             mesh_lod_args_buffers: Vec::new(),
             mesh_lod_select_g0_bgs: Vec::new(),
             mesh_lod_select_g2_bgs: Vec::new(),
+            mesh_lod_shadow_camera_buffer,
+            mesh_lod_shadow_params_buffers: Vec::new(),
+            mesh_lod_shadow_args_buffers: Vec::new(),
+            mesh_lod_shadow_g0_bgs: Vec::new(),
+            mesh_lod_shadow_g2_bgs: Vec::new(),
             width, height,
         }
     }
@@ -612,6 +651,117 @@ impl ViewportRenderer {
         self.mesh_lod_args_buffers[i] = (new_buf, new_cap);
         // Invalidate cached g2 — it referenced the old args buffer.
         self.mesh_lod_select_g2_bgs[i] = None;
+    }
+
+    /// Phase 6.4 sibling of `ensure_mesh_lod_capacity` for the
+    /// shadow LOD-select pass. One per-draw shadow params uniform +
+    /// args buffer + g0 bind group bound to the synthetic shadow
+    /// camera. Args buffer is allocated lazily by
+    /// `ensure_mesh_lod_shadow_args_capacity` to avoid waste on
+    /// frames where shadow is gated off.
+    pub fn ensure_mesh_lod_shadow_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        renderer: &crate::rkp_renderer::RkpRenderer,
+        count: u32,
+    ) {
+        use crate::mesh_lod_select_pass::MeshLodSelectParams;
+        let needed = count as usize;
+        while self.mesh_lod_shadow_params_buffers.len() < needed {
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mesh_lod_shadow params"),
+                size: std::mem::size_of::<MeshLodSelectParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bg = renderer.mesh_lod_select_pass.create_g0_bind_group(
+                device,
+                &self.mesh_lod_shadow_camera_buffer,
+                &buf,
+            );
+            self.mesh_lod_shadow_params_buffers.push(buf);
+            self.mesh_lod_shadow_g0_bgs.push(bg);
+            self.mesh_lod_shadow_args_buffers.push((
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("mesh_lod_shadow args (placeholder)"),
+                    size: std::mem::size_of::<crate::mesh_lod_select_pass::DrawIndexedIndirectArgs>()
+                        as u64,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::INDIRECT
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                0,
+            ));
+            self.mesh_lod_shadow_g2_bgs.push(None);
+        }
+    }
+
+    /// Grow the per-slot shadow args buffer to fit `cluster_count`
+    /// entries; invalidates the cached `g2` shadow bind group.
+    pub fn ensure_mesh_lod_shadow_args_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        slot: u32,
+        cluster_count: u32,
+    ) {
+        use crate::mesh_lod_select_pass::DrawIndexedIndirectArgs;
+        let i = slot as usize;
+        let (_, cap) = self.mesh_lod_shadow_args_buffers[i];
+        if cap >= cluster_count {
+            return;
+        }
+        let new_cap = cluster_count.next_power_of_two().max(64);
+        let new_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mesh_lod_shadow args"),
+            size: (new_cap as u64) * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.mesh_lod_shadow_args_buffers[i] = (new_buf, new_cap);
+        self.mesh_lod_shadow_g2_bgs[i] = None;
+    }
+
+    /// Populate `mesh_lod_shadow_camera_buffer` from the active light
+    /// camera. The LOD-select shader reads `position` (eye for
+    /// view_distance — unused under ortho), `view_proj` (the [1][1]
+    /// is the ortho-or-perspective focal factor; [3][3] = 1 picks
+    /// the ortho path), and `resolution.y` (shadow map height).
+    /// Other CameraUniforms fields aren't read; we leave them zero.
+    pub fn write_mesh_lod_shadow_camera(
+        &self,
+        queue: &wgpu::Queue,
+        light: &crate::shadow_map_pass::LightCameraUniform,
+    ) {
+        // Eye in world space = view_proj_inv * (0,0,0,1) / w.
+        // For ortho `view_proj_inv[3][3] != 0` so the divide is fine.
+        let m = light.view_proj_inv;
+        let ex = m[3][0];
+        let ey = m[3][1];
+        let ez = m[3][2];
+        let ew = m[3][3].abs().max(1e-6) * m[3][3].signum();
+        let eye = [ex / ew, ey / ew, ez / ew, 0.0];
+
+        let cam = CameraUniforms {
+            position: eye,
+            forward: [0.0; 4],
+            right: [0.0; 4],
+            up: [0.0; 4],
+            resolution: [light.shadow_map_size[0] as f32, light.shadow_map_size[1] as f32],
+            jitter: [0.0; 2],
+            layer_mask: 0,
+            focus_object_id: 0,
+            _pad: [0; 2],
+            prev_vp: [[0.0; 4]; 4],
+            view_proj: light.view_proj,
+        };
+        queue.write_buffer(
+            &self.mesh_lod_shadow_camera_buffer,
+            0,
+            bytemuck::bytes_of(&cam),
+        );
     }
 
     /// Write one frame's `SplatInstanceUniform` for the given slot.
