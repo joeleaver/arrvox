@@ -53,9 +53,17 @@ pub const PARENT_GROUP_ERROR_ROOT: f32 = f32::INFINITY;
 /// uploaded to the GPU verbatim via `bytemuck::cast_slice` for the
 /// Phase 6 LOD-selection compute pass to read.
 ///
-/// 64 B, std430-friendly: `[f32;3]` fields are padded to 16 B so
-/// they line up with WGSL `vec3<f32>` alignment (16) without forcing
-/// the consumer to use `vec3` rather than `array<f32,3>`.
+/// 64 B. **Field offsets are hand-tuned to match WGSL std430 of the
+/// matching `MeshletCluster` struct in `mesh_lod_select.wesl`:**
+/// `vec3<f32>` consumes 12 bytes but starts on a 16-byte boundary,
+/// and a following `u32` (align 4) sits *immediately* after with no
+/// implicit padding to 16 — so `index_offset` is at byte 28, not
+/// byte 32. A 4-byte `_pad0` matches std430's auto-pad bringing
+/// `aabb_max` to byte 16, but there is **no `_pad1`** between
+/// `aabb_max` and `index_offset` because std430 doesn't insert one.
+/// Three trailing `u32`s of pad keep the layout 4-aligned and the
+/// total stride at 64 B; using `vec2<u32>` would force the trailing
+/// pad to start at byte 56 (8-aligned) and shift everything.
 ///
 /// Phase 5 only fills `aabb_*` + `index_*`; `lod_level=0`,
 /// `cluster_error=0`, `parent_group_error=∞`. Phase 6's DAG
@@ -65,27 +73,28 @@ pub const PARENT_GROUP_ERROR_ROOT: f32 = f32::INFINITY;
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub struct MeshletCluster {
     /// Object-local AABB minimum. World transform is applied per
-    /// instance at LOD-select time.
+    /// instance at LOD-select time.                              (0..12)
     pub aabb_min: [f32; 3],
+    /// std430-mandated padding before the next `vec3<f32>`.      (12..16)
     pub _pad0: f32,
-    /// Object-local AABB maximum.
+    /// Object-local AABB maximum.                                (16..28)
     pub aabb_max: [f32; 3],
-    pub _pad1: f32,
     /// First index in the cluster's IBO range. Becomes
-    /// `DrawIndexedIndirect.first_index` in Phase 6.
+    /// `DrawIndexedIndirect.first_index` in Phase 6.              (28..32)
     pub index_offset: u32,
     /// Index count for this cluster. `index_count / 3` triangles.
-    /// Becomes `DrawIndexedIndirect.index_count`.
+    /// Becomes `DrawIndexedIndirect.index_count`.                 (32..36)
     pub index_count: u32,
     /// LOD level this cluster lives at. 0 = finest (original
-    /// surface mesh), higher = progressively simplified.
+    /// surface mesh), higher = progressively simplified.          (36..40)
     pub lod_level: u32,
+    /// Reserved for future flags (cone-cull bits, etc).           (40..44)
     pub _pad2: u32,
     /// Maximum simplification error introduced at-or-below this
     /// cluster in the DAG (object-local units). Monotonically
     /// non-decreasing along chains from leaf → root. Phase 6
     /// selection rule admits this cluster iff its projected size
-    /// is `< pixel_threshold`.
+    /// is `< pixel_threshold`.                                    (44..48)
     pub cluster_error: f32,
     /// Simplification error of the parent group (the group whose
     /// simplification produced this cluster's parents at the
@@ -93,13 +102,28 @@ pub struct MeshletCluster {
     /// at the coarsest level. Phase 6 admits the cluster iff
     /// `parent_group_error_proj >= pixel_threshold` AND
     /// `cluster_error_proj < pixel_threshold` — guarantees exactly
-    /// one cluster picked per chain (Karis '21 SIGGRAPH).
+    /// one cluster picked per chain (Karis '21 SIGGRAPH).         (48..52)
     pub parent_group_error: f32,
-    pub _pad3: [u32; 2],
+    /// Trailing pad to a 64-byte stride.                          (52..64)
+    pub _pad3: [u32; 3],
 }
 
 const _: () = assert!(std::mem::size_of::<MeshletCluster>() == 64);
 const _: () = assert!(std::mem::align_of::<MeshletCluster>() == 4);
+// Hand-checked field offsets — must match WGSL std430.
+const _: () = {
+    use std::mem::offset_of;
+    assert!(offset_of!(MeshletCluster, aabb_min) == 0);
+    assert!(offset_of!(MeshletCluster, _pad0) == 12);
+    assert!(offset_of!(MeshletCluster, aabb_max) == 16);
+    assert!(offset_of!(MeshletCluster, index_offset) == 28);
+    assert!(offset_of!(MeshletCluster, index_count) == 32);
+    assert!(offset_of!(MeshletCluster, lod_level) == 36);
+    assert!(offset_of!(MeshletCluster, _pad2) == 40);
+    assert!(offset_of!(MeshletCluster, cluster_error) == 44);
+    assert!(offset_of!(MeshletCluster, parent_group_error) == 48);
+    assert!(offset_of!(MeshletCluster, _pad3) == 52);
+};
 
 /// Partition a mesh into meshlet clusters with per-cluster AABBs.
 ///
@@ -182,14 +206,13 @@ pub fn cluster_mesh(
             aabb_min,
             _pad0: 0.0,
             aabb_max,
-            _pad1: 0.0,
             index_offset: cluster_index_offset,
             index_count: cluster_index_count,
             lod_level: 0,
             _pad2: 0,
             cluster_error: 0.0,
             parent_group_error: PARENT_GROUP_ERROR_ROOT,
-            _pad3: [0; 2],
+            _pad3: [0; 3],
         });
     }
 
