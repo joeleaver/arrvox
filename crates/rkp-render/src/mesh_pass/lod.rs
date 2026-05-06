@@ -53,10 +53,13 @@ use super::extract::MeshVertex;
 /// `RKP_MESH_LOD_LEVELS=1..=4` at runtime to override.
 pub const LOD_LEVELS: usize = 4;
 
-/// Hard cap on `lod_levels` — selection-rule + per-cluster fields
-/// can scale up if needed, but `>4` levels has rarely been worth it
-/// in published Nanite-style implementations.
-pub const LOD_LEVELS_MAX: usize = 4;
+/// Hard cap on `lod_levels` for the runtime
+/// `RKP_MESH_LOD_LEVELS` override. The DAG converges naturally
+/// when a level produces ≤ 1 cluster, so going higher than the
+/// scene actually needs is a no-op. 8 covers the splat5
+/// elephant scene's worst-case (51K LOD-0 clusters → ~200
+/// clusters at LOD-7 with 50% reduction per level).
+pub const LOD_LEVELS_MAX: usize = 8;
 
 /// Read the runtime-configurable LOD-level count. Reads
 /// `RKP_MESH_LOD_LEVELS` once and clamps to `1..=LOD_LEVELS_MAX`;
