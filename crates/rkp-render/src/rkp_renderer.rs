@@ -243,10 +243,15 @@ impl RkpRenderer {
             viewport.write_splat_instance(queue, slot as u32, &d.world, d.object_id);
         }
 
-        // RKP_SPLAT_STATS=1 prints (draws, total splats, drawn assets,
-        // missing assets) once per second. Gated so production runs
-        // don't spam stderr.
+        // RKP_SPLAT_STATS=1 prints per-frame draw stats with a
+        // per-asset breakdown. The breakdown distinguishes "lots of
+        // unique geometry" from "few unique assets × many instances"
+        // — different shapes call for different optimizations
+        // (frustum cull / hardware-instanced single draw / LOD cut).
         if std::env::var("RKP_SPLAT_STATS").is_ok() {
+            use std::collections::HashMap;
+            // handle_raw → (instance_count, splats_per_asset)
+            let mut per_asset: HashMap<u32, (u32, u32)> = HashMap::new();
             let mut total_splats: u64 = 0;
             let mut drawn = 0u32;
             let mut missing = 0u32;
@@ -255,14 +260,31 @@ impl RkpRenderer {
                     Some((_, count)) => {
                         total_splats += count as u64;
                         drawn += 1;
+                        let entry = per_asset
+                            .entry(d.asset_handle_raw)
+                            .or_insert((0, count));
+                        entry.0 += 1;
                     }
                     None => missing += 1,
                 }
             }
+            let unique_splats: u64 = per_asset.values().map(|(_, s)| *s as u64).sum();
             eprintln!(
-                "[splat] {}×{} viewport: {} draws ({} drawn, {} skipped — no vbo) · {} total splats",
-                viewport.width, viewport.height, draws.len(), drawn, missing, total_splats,
+                "[splat] {}×{} · {} draws ({} drawn, {} skipped) · {} unique assets · {} unique splats · {} total rasterized",
+                viewport.width, viewport.height,
+                draws.len(), drawn, missing,
+                per_asset.len(), unique_splats, total_splats,
             );
+            // Sort by total contribution descending so the heaviest
+            // hitter shows up first.
+            let mut rows: Vec<_> = per_asset.iter().collect();
+            rows.sort_by_key(|(_, (n, s))| std::cmp::Reverse(*n as u64 * *s as u64));
+            for (handle, (n_inst, splats)) in rows {
+                eprintln!(
+                    "  asset {}: {} inst × {} splats = {}",
+                    handle, n_inst, splats, *n_inst as u64 * *splats as u64,
+                );
+            }
         }
 
         let g0_bg = viewport
