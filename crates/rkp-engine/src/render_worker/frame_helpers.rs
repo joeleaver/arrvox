@@ -226,6 +226,21 @@ pub(super) fn prepare_shadow_maps(
         SHADOW_MAP_DEFAULT_SIZE,
         depth_bias,
     );
+    // Per-frame shadow-fit diagnostic. Helps diagnose "blocky
+    // shadows" reports — if the scene AABB is large the 1024²
+    // shadow map's texel coverage is intrinsically chunky
+    // regardless of the rasterizer.
+    if std::env::var("RKP_SHADOW_FIT_LOG").is_ok() {
+        let dx = scene_aabb.1[0] - scene_aabb.0[0];
+        let dy = scene_aabb.1[1] - scene_aabb.0[1];
+        let dz = scene_aabb.1[2] - scene_aabb.0[2];
+        let max_extent = dx.max(dy).max(dz);
+        let texel_world = max_extent / SHADOW_MAP_DEFAULT_SIZE as f32;
+        eprintln!(
+            "[shadow] scene_aabb extent = {:.2} × {:.2} × {:.2} m → max ~{:.1} m / {} = ~{:.0} mm per shadow-map texel",
+            dx, dy, dz, max_extent, SHADOW_MAP_DEFAULT_SIZE, texel_world * 1000.0,
+        );
+    }
 
     let mut wrote_any = false;
     for vp in &frame.viewports {

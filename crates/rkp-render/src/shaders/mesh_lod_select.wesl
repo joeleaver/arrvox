@@ -31,8 +31,11 @@ struct MeshLodSelectParams {
     /// Number of clusters in the asset's cluster table for this
     /// dispatch. Threads beyond this are no-ops.
     cluster_count: u32,
-    _pad0: u32,
-    _pad1: u32,
+    /// Debug bypass: when non-zero, every cluster is admitted
+    /// regardless of the Karis rule. CPU sets this from
+    /// `RKP_MESH_DEBUG_FORCE_ADMIT`.
+    force_admit: u32,
+    _pad: u32,
 }
 
 struct MeshInstance {
@@ -146,8 +149,10 @@ fn lod_select(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cluster_is_leaf = c.cluster_error == 0.0;
     let admit_parent = parent_is_root || parent_err_px >= params.pixel_threshold;
     let admit_self = cluster_is_leaf || cluster_err_px < params.pixel_threshold;
+    let karis_admit = admit_parent && admit_self;
+    let admit = (params.force_admit != 0u) || karis_admit;
 
-    if (admit_parent && admit_self) {
+    if (admit) {
         out.index_count = c.index_count;
         out.instance_count = 1u;
         out.first_index = c.index_offset;

@@ -43,13 +43,20 @@ const _: () = assert!(std::mem::size_of::<DrawIndexedIndirectArgs>() == 20);
 /// shader derives `focal_pixels` from `camera.view_proj[1][1]`
 /// directly so the engine doesn't have to plumb a FOV value
 /// alongside the camera buffer.
+///
+/// `force_admit` is a debug knob: when non-zero, every cluster is
+/// admitted regardless of the Karis selection rule. Used to bisect
+/// "no geometry" issues in the indirect dispatch path — if
+/// geometry shows up with `force_admit=1` but not with `=0`, the
+/// bug is in the admit-rule math, not in the
+/// `multi_draw_indexed_indirect` plumbing.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub struct MeshLodSelectParams {
     pub pixel_threshold: f32,
     pub cluster_count: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
+    pub force_admit: u32,
+    pub _pad: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<MeshLodSelectParams>() == 16);

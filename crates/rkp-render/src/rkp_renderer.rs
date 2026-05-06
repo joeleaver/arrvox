@@ -514,6 +514,11 @@ impl RkpRenderer {
         // group are sized for it; write the per-slot params uniform.
         // Skip slots whose asset is unloaded (or has no clusters yet).
         const PIXEL_THRESHOLD_PRIMARY: f32 = 1.0;
+        let force_admit_flag: u32 = if std::env::var("RKP_MESH_DEBUG_FORCE_ADMIT").is_ok() {
+            1
+        } else {
+            0
+        };
         let mut slot_active: Vec<bool> = vec![false; draws.len()];
         for (slot, d) in draws.iter().enumerate() {
             let Some((_, _, _)) = self.mesh_buffer(d.asset_handle_raw) else {
@@ -561,8 +566,8 @@ impl RkpRenderer {
             let params = crate::mesh_lod_select_pass::MeshLodSelectParams {
                 pixel_threshold: PIXEL_THRESHOLD_PRIMARY,
                 cluster_count,
-                _pad0: 0,
-                _pad1: 0,
+                force_admit: force_admit_flag,
+                _pad: 0,
             };
             queue.write_buffer(
                 &viewport.mesh_lod_params_buffers[slot],
@@ -573,32 +578,45 @@ impl RkpRenderer {
             slot_active[slot] = true;
         }
 
+        // `RKP_MESH_DEBUG_DIRECT=1` bypasses Phase 6.2/6.3 entirely:
+        // skip the LOD-select compute and the
+        // `multi_draw_indexed_indirect` dispatch, fall back to a
+        // Phase 1-3-style direct `draw_indexed` over the LOD-0
+        // prefix. Used to bisect "no geometry" issues — if direct
+        // mode renders but indirect doesn't, the bug is in the
+        // LOD-select / indirect-dispatch path.
+        let direct_mode = std::env::var("RKP_MESH_DEBUG_DIRECT").is_ok();
+
         // 0. Per-cluster LOD-select compute pass. One dispatch per
         //    active draw slot writes that draw's args table.
-        let q_lod = self.profiler.begin_query("mesh_lod_select", encoder);
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("mesh_lod_select"),
-                timestamp_writes: None,
-            });
-            for (slot, d) in draws.iter().enumerate() {
-                if !slot_active[slot] {
-                    continue;
+        if !direct_mode {
+            let q_lod = self.profiler.begin_query("mesh_lod_select", encoder);
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("mesh_lod_select"),
+                    timestamp_writes: None,
+                });
+                for (slot, d) in draws.iter().enumerate() {
+                    if !slot_active[slot] {
+                        continue;
+                    }
+                    let cluster_count = self
+                        .mesh_cluster_buffer(d.asset_handle_raw)
+                        .map(|(_, c)| c)
+                        .unwrap_or(0);
+                    let g0 = &viewport.mesh_lod_select_g0_bgs[slot];
+                    let g1 = &viewport.splat_instance_bind_groups[slot];
+                    let g2 = &viewport
+                        .mesh_lod_select_g2_bgs[slot]
+                        .as_ref()
+                        .expect("g2 set above for active slot")
+                        .0;
+                    self.mesh_lod_select_pass
+                        .dispatch(&mut cpass, g0, g1, g2, cluster_count);
                 }
-                let cluster_count =
-                    self.mesh_cluster_buffer(d.asset_handle_raw).map(|(_, c)| c).unwrap_or(0);
-                let g0 = &viewport.mesh_lod_select_g0_bgs[slot];
-                let g1 = &viewport.splat_instance_bind_groups[slot];
-                let g2 = &viewport
-                    .mesh_lod_select_g2_bgs[slot]
-                    .as_ref()
-                    .expect("g2 set above for active slot")
-                    .0;
-                self.mesh_lod_select_pass
-                    .dispatch(&mut cpass, g0, g1, g2, cluster_count);
             }
+            self.profiler.end_query(encoder, q_lod);
         }
-        self.profiler.end_query(encoder, q_lod);
 
         // RKP_MESH_STATS=1 prints per-frame mesh stats with a per-asset
         // breakdown, mirroring RKP_SPLAT_STATS.
@@ -651,22 +669,41 @@ impl RkpRenderer {
             rp.set_pipeline(&self.mesh_pass.pipeline);
             rp.set_bind_group(0, g0_bg, &[]);
             for (slot, d) in draws.iter().enumerate() {
-                let Some((vbo, ibo, _)) = self.mesh_buffer(d.asset_handle_raw) else {
+                let Some((vbo, ibo, lod0_index_count)) = self.mesh_buffer(d.asset_handle_raw)
+                else {
                     continue;
                 };
                 if !slot_active[slot] {
                     continue;
                 }
-                let cluster_count = self
-                    .mesh_cluster_buffer(d.asset_handle_raw)
-                    .map(|(_, c)| c)
-                    .unwrap_or(0);
                 let g1_bg = &viewport.splat_instance_bind_groups[slot];
                 rp.set_bind_group(1, g1_bg, &[]);
                 rp.set_vertex_buffer(0, vbo.slice(..));
                 rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
-                let (args_buf, _) = &viewport.mesh_lod_args_buffers[slot];
-                rp.multi_draw_indexed_indirect(args_buf, 0, cluster_count);
+                if direct_mode {
+                    // Phase-1-3-style direct draw of the LOD-0 prefix.
+                    // No compute pass / indirect args buffer involved.
+                    rp.draw_indexed(0..lod0_index_count, 0, 0..1);
+                } else {
+                    let cluster_count = self
+                        .mesh_cluster_buffer(d.asset_handle_raw)
+                        .map(|(_, c)| c)
+                        .unwrap_or(0);
+                    // `RKP_MESH_DEBUG_MAX_DRAWS` caps the number of
+                    // indirect-args entries `multi_draw_indexed_indirect`
+                    // walks. With 50K+ clusters per asset and 20+ assets
+                    // per scene the total draw count slams the Vulkan
+                    // command processor and kills the UI thread; capping
+                    // to e.g. 100 lets us prove the dispatch path itself
+                    // works without that pressure.
+                    let max_draws = std::env::var("RKP_MESH_DEBUG_MAX_DRAWS")
+                        .ok()
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .map(|n| n.min(cluster_count))
+                        .unwrap_or(cluster_count);
+                    let (args_buf, _) = &viewport.mesh_lod_args_buffers[slot];
+                    rp.multi_draw_indexed_indirect(args_buf, 0, max_draws);
+                }
             }
         }
         self.profiler.end_query(encoder, q_raster);
@@ -719,6 +756,11 @@ impl RkpRenderer {
         viewport.refresh_mesh_shadow_bindings(&self.device, self);
         viewport.ensure_mesh_lod_shadow_capacity(&self.device, self, draws.len() as u32);
 
+        // `RKP_MESH_DEBUG_DIRECT=1` also bypasses the shadow LOD
+        // compute + indirect dispatch — depth-only `draw_indexed` of
+        // the LOD-0 prefix, just like the Phase 1-3 baseline.
+        let direct_mode = std::env::var("RKP_MESH_DEBUG_DIRECT").is_ok();
+
         // Phase 6.4: per-draw shadow LOD-select prep. Same shape as
         // the primary path in `dispatch_mesh`, but with a doubled
         // pixel threshold so the Karis admit rule effectively picks
@@ -764,8 +806,12 @@ impl RkpRenderer {
             let params = crate::mesh_lod_select_pass::MeshLodSelectParams {
                 pixel_threshold: PIXEL_THRESHOLD_SHADOW,
                 cluster_count,
-                _pad0: 0,
-                _pad1: 0,
+                force_admit: if std::env::var("RKP_MESH_DEBUG_FORCE_ADMIT").is_ok() {
+                    1
+                } else {
+                    0
+                },
+                _pad: 0,
             };
             queue.write_buffer(
                 &viewport.mesh_lod_shadow_params_buffers[slot],
@@ -777,30 +823,34 @@ impl RkpRenderer {
         }
 
         // 0. Shadow-side LOD-select compute pass.
-        let q_lod = self.profiler.begin_query("mesh_shadow_lod_select", encoder);
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("mesh_shadow_lod_select"),
-                timestamp_writes: None,
-            });
-            for (slot, d) in draws.iter().enumerate() {
-                if !slot_active[slot] {
-                    continue;
+        if !direct_mode {
+            let q_lod = self.profiler.begin_query("mesh_shadow_lod_select", encoder);
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("mesh_shadow_lod_select"),
+                    timestamp_writes: None,
+                });
+                for (slot, d) in draws.iter().enumerate() {
+                    if !slot_active[slot] {
+                        continue;
+                    }
+                    let cluster_count = self
+                        .mesh_cluster_buffer(d.asset_handle_raw)
+                        .map(|(_, c)| c)
+                        .unwrap_or(0);
+                    let g0 = &viewport.mesh_lod_shadow_g0_bgs[slot];
+                    let g1 = &viewport.splat_instance_bind_groups[slot];
+                    let g2 = &viewport
+                        .mesh_lod_shadow_g2_bgs[slot]
+                        .as_ref()
+                        .expect("g2 set above for active slot")
+                        .0;
+                    self.mesh_lod_select_pass
+                        .dispatch(&mut cpass, g0, g1, g2, cluster_count);
                 }
-                let cluster_count =
-                    self.mesh_cluster_buffer(d.asset_handle_raw).map(|(_, c)| c).unwrap_or(0);
-                let g0 = &viewport.mesh_lod_shadow_g0_bgs[slot];
-                let g1 = &viewport.splat_instance_bind_groups[slot];
-                let g2 = &viewport
-                    .mesh_lod_shadow_g2_bgs[slot]
-                    .as_ref()
-                    .expect("g2 set above for active slot")
-                    .0;
-                self.mesh_lod_select_pass
-                    .dispatch(&mut cpass, g0, g1, g2, cluster_count);
             }
+            self.profiler.end_query(encoder, q_lod);
         }
-        self.profiler.end_query(encoder, q_lod);
 
         // 1. Depth-only render. Vertex transforms through light_camera
         //    view-proj; rasterizer fills the depth attachment. No
@@ -819,22 +869,32 @@ impl RkpRenderer {
             rp.set_pipeline(&self.mesh_shadow_map.render_pipeline);
             rp.set_bind_group(0, render_g0, &[]);
             for (slot, d) in draws.iter().enumerate() {
-                let Some((vbo, ibo, _)) = self.mesh_buffer(d.asset_handle_raw) else {
+                let Some((vbo, ibo, lod0_index_count)) = self.mesh_buffer(d.asset_handle_raw)
+                else {
                     continue;
                 };
                 if !slot_active[slot] {
                     continue;
                 }
-                let cluster_count = self
-                    .mesh_cluster_buffer(d.asset_handle_raw)
-                    .map(|(_, c)| c)
-                    .unwrap_or(0);
                 let g1_bg = &viewport.splat_instance_bind_groups[slot];
                 rp.set_bind_group(1, g1_bg, &[]);
                 rp.set_vertex_buffer(0, vbo.slice(..));
                 rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
-                let (args_buf, _) = &viewport.mesh_lod_shadow_args_buffers[slot];
-                rp.multi_draw_indexed_indirect(args_buf, 0, cluster_count);
+                if direct_mode {
+                    rp.draw_indexed(0..lod0_index_count, 0, 0..1);
+                } else {
+                    let cluster_count = self
+                        .mesh_cluster_buffer(d.asset_handle_raw)
+                        .map(|(_, c)| c)
+                        .unwrap_or(0);
+                    let max_draws = std::env::var("RKP_MESH_DEBUG_MAX_DRAWS")
+                        .ok()
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .map(|n| n.min(cluster_count))
+                        .unwrap_or(cluster_count);
+                    let (args_buf, _) = &viewport.mesh_lod_shadow_args_buffers[slot];
+                    rp.multi_draw_indexed_indirect(args_buf, 0, max_draws);
+                }
             }
         }
         self.profiler.end_query(encoder, q_render);
