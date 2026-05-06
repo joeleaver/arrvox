@@ -197,6 +197,12 @@ fn build_menus(
 fn main() -> anyhow::Result<()> {
     env_logger::init();
 
+    // Optional positional CLI arg: path to a `.rkproject` to auto-open
+    // on startup. Useful for headless testing / scripted reproductions
+    // where round-tripping File → Open Project... would be tedious.
+    // Skipped silently if absent or if the path doesn't exist.
+    let auto_open_project: Option<String> = std::env::args().nth(1);
+
     // 1. Create render surfaces — one per viewport. MAIN renders the
     //    scene; BUILD renders the selected procedural object in its own
     //    panel.
@@ -522,6 +528,23 @@ fn main() -> anyhow::Result<()> {
 
     // 5. Build menus.
     let menus = build_menus(engine.cmd_tx.clone(), store);
+
+    // 5b. If invoked with a project path, queue an OpenProject before
+    //     the UI starts. Engine command channel is FIFO, so this lands
+    //     before any UI-driven commands and the project is loaded by
+    //     the time the first frame paints.
+    if let Some(ref path) = auto_open_project {
+        if std::path::Path::new(path).exists() {
+            eprintln!("[rkp-editor] auto-opening project: {path}");
+            let _ = engine.cmd_tx.send(rkp_engine::EngineCommand::OpenProject {
+                path: path.clone(),
+            });
+        } else {
+            eprintln!(
+                "[rkp-editor] project path does not exist, skipping auto-open: {path}"
+            );
+        }
+    }
 
     // 6. Run rinch UI.
     let cmd_tx = engine.cmd_tx.clone();
