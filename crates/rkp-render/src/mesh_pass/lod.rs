@@ -32,6 +32,7 @@ use std::collections::{HashMap, HashSet};
 use meshopt::{
     partition_clusters_with_positions, simplify_with_locks, SimplifyOptions, VertexDataAdapter,
 };
+use rayon::prelude::*;
 
 use super::cluster::{cluster_mesh, MeshletCluster, PARENT_GROUP_ERROR_ROOT};
 use super::extract::MeshVertex;
@@ -41,12 +42,12 @@ use super::extract::MeshVertex;
 /// to). Construction may stop early if a level's simplification
 /// makes no progress or only one cluster remains.
 ///
-/// **Temporary default of 1** while the second half of the DAG
-/// perf fix lands — per-group simplify is now compact-VBO (no
-/// longer scans the full asset VBO + lock array per group, see
-/// [`build_local_simplify_inputs`]), but each level's groups
-/// still run sequentially. Once `rayon::par_iter` lifts that to
-/// multi-core this should flip back to 4. Set
+/// **Default still `1`** until Phase 6.5 measures the elephant
+/// scene with the full perf fix in place — the per-group
+/// simplify path now (a) builds a compact local VBO + lock
+/// array bounded by the group's unique-vertex count instead of
+/// the asset's, and (b) runs across rayon. Once a real-asset
+/// load comes in under target this flips to 4. Set
 /// `RKP_MESH_LOD_LEVELS=4` (or any value 1..=4) at runtime to
 /// opt into the full DAG today.
 pub const LOD_LEVELS: usize = 1;
@@ -185,94 +186,48 @@ pub fn build_cluster_dag_with_levels(
 
         let new_level_start = all_clusters.len();
 
-        for (g_idx, group_local) in groups.iter().enumerate() {
-            // Translate group's prev-level positions back to global cluster indices.
-            let group_global: Vec<usize> =
-                group_local.iter().map(|&li| prev_indices[li]).collect();
+        // Per-group simplify is read-only over `all_clusters` and
+        // `all_indices` (it only consults the prev-level clusters'
+        // index ranges + cluster_error to compute the new
+        // cluster_error). The mutations — appending sub-clusters /
+        // sub-indices and backfilling parent_group_error on
+        // consumed prev-level clusters — happen sequentially after
+        // the parallel collect so cluster `index_offset` values
+        // stay deterministic and bit-equivalent to the sequential
+        // build.
+        let results: Vec<GroupResult> = groups
+            .par_iter()
+            .enumerate()
+            .map(|(g_idx, group_local)| {
+                simplify_one_group(
+                    g_idx,
+                    group_local,
+                    &prev_indices,
+                    &all_clusters,
+                    &all_indices,
+                    vertices,
+                    &vert_to_groups,
+                    lod as u32,
+                )
+            })
+            .collect();
 
-            // Merge member clusters' triangles into a single index buffer.
-            let mut merged_tris: Vec<u32> = Vec::new();
-            for &gi in &group_global {
-                let c = &all_clusters[gi];
-                merged_tris.extend_from_slice(
-                    &all_indices
-                        [c.index_offset as usize..(c.index_offset + c.index_count) as usize],
-                );
-            }
-            if merged_tris.len() < 3 {
-                continue;
-            }
-
-            // Compact the group's geometry into a local VBO + lock
-            // array so meshopt's per-vertex sweep is bounded by the
-            // group's unique-vertex count (~256 typical) rather
-            // than the asset's vertex count (~1-3M on real meshes).
-            // See `build_local_simplify_inputs` for the rationale.
-            let (local_verts, local_tris, local_locks, local_to_global) =
-                build_local_simplify_inputs(&merged_tris, vertices, &vert_to_groups, g_idx);
-
-            // meshopt::simplify_with_locks. Target ~50% triangles;
-            // unbounded error budget (the simplifier returns the
-            // actual error in `result_error`, which we capture as
-            // the group's parametric error metric).
-            let target_index_count = ((local_tris.len() as f32 * LOD_REDUCTION_TARGET) as usize
-                / 3)
-                * 3;
-            let mut group_error = 0.0_f32;
-            let simplified_local = simplify_meshopt(
-                &local_tris,
-                &local_verts,
-                &local_locks,
-                target_index_count,
-                &mut group_error,
-            );
-
-            if simplified_local.len() < 3 || simplified_local.len() >= local_tris.len() {
-                // No reduction (simplifier was blocked by locks or
-                // topology). The group's prev-level clusters retain
-                // `parent_group_error = ∞` and become DAG leaves at
-                // this branch, which is correct: the LOD selection
-                // rule will always render them.
-                continue;
-            }
-
-            // Map the simplifier's local-id output back to global
-            // VBO ids; the DAG accumulator + re-cluster step both
-            // operate in global-VBO space.
-            let simplified: Vec<u32> = simplified_local
-                .iter()
-                .map(|&li| local_to_global[li as usize])
-                .collect();
-
-            // Re-cluster the simplified triangles.
-            let (sub_clusters, sub_indices) = cluster_mesh(vertices, &simplified);
-            if sub_clusters.is_empty() {
+        for result in results {
+            if result.skipped {
                 continue;
             }
             let sub_index_base = all_indices.len() as u32;
-            all_indices.extend(sub_indices);
-
-            // cluster_error: max along chain from leaves to here.
-            let max_input_error = group_global
-                .iter()
-                .map(|&gi| all_clusters[gi].cluster_error)
-                .fold(0.0_f32, f32::max);
-            let new_cluster_error = max_input_error.max(group_error);
-
-            for mut sc in sub_clusters {
+            all_indices.extend(result.sub_indices);
+            for mut sc in result.sub_clusters {
                 sc.index_offset += sub_index_base;
-                sc.lod_level = lod as u32;
-                sc.cluster_error = new_cluster_error;
-                sc.parent_group_error = PARENT_GROUP_ERROR_ROOT;
                 all_clusters.push(sc);
             }
-
             // Backfill parent_group_error on prev-level clusters
             // that this group consumed — they're no longer DAG
             // leaves, so the LOD-selection rule needs to know what
             // error the next coarser level introduced.
-            for &gi in &group_global {
-                all_clusters[gi].parent_group_error = group_error;
+            for gi in result.consumed_global_ids {
+                all_clusters[gi].parent_group_error = result.group_error;
             }
         }
 
@@ -391,6 +346,141 @@ fn build_vert_to_groups(
         }
     }
     map
+}
+
+/// Output of one group's parallel simplify worker. Index offsets
+/// in `sub_clusters` are relative to the start of `sub_indices`
+/// — the sequential flatten step rebases them into the level's
+/// shared `all_indices`. `lod_level`, `cluster_error`, and
+/// `parent_group_error` are already final.
+struct GroupResult {
+    sub_clusters: Vec<MeshletCluster>,
+    sub_indices: Vec<u32>,
+    /// Parametric error from `simplify_with_locks`. Backfills the
+    /// `parent_group_error` of every prev-level cluster in
+    /// `consumed_global_ids`. Only meaningful when `!skipped`.
+    group_error: f32,
+    /// Prev-level global cluster IDs consumed by this group.
+    consumed_global_ids: Vec<usize>,
+    /// True when the group produced no new clusters — simplifier
+    /// failed to reduce or `cluster_mesh` returned empty. The
+    /// flatten step skips these without touching `all_clusters` /
+    /// `all_indices`; the consumed clusters remain DAG leaves.
+    skipped: bool,
+}
+
+impl GroupResult {
+    fn skipped() -> Self {
+        Self {
+            sub_clusters: Vec::new(),
+            sub_indices: Vec::new(),
+            group_error: 0.0,
+            consumed_global_ids: Vec::new(),
+            skipped: true,
+        }
+    }
+}
+
+/// Per-group simplify worker. Pure over its inputs (only reads
+/// `all_clusters` / `all_indices`), so safe to run in parallel
+/// across `groups` via rayon. Returns a [`GroupResult`] the
+/// caller flattens sequentially into the level's shared cluster
+/// + index buffers.
+fn simplify_one_group(
+    g_idx: usize,
+    group_local: &[usize],
+    prev_indices: &[usize],
+    all_clusters: &[MeshletCluster],
+    all_indices: &[u32],
+    vertices: &[MeshVertex],
+    vert_to_groups: &HashMap<u32, HashSet<u32>>,
+    lod: u32,
+) -> GroupResult {
+    // Translate group's prev-level positions back to global cluster indices.
+    let group_global: Vec<usize> = group_local.iter().map(|&li| prev_indices[li]).collect();
+
+    // Merge member clusters' triangles into a single index buffer.
+    let mut merged_tris: Vec<u32> = Vec::new();
+    for &gi in &group_global {
+        let c = &all_clusters[gi];
+        merged_tris.extend_from_slice(
+            &all_indices[c.index_offset as usize..(c.index_offset + c.index_count) as usize],
+        );
+    }
+    if merged_tris.len() < 3 {
+        return GroupResult::skipped();
+    }
+
+    // Compact the group's geometry into a local VBO + lock array
+    // so meshopt's per-vertex sweep is bounded by the group's
+    // unique-vertex count (~256 typical) rather than the asset's
+    // vertex count (~1-3M on real meshes). See
+    // `build_local_simplify_inputs` for the rationale.
+    let (local_verts, local_tris, local_locks, local_to_global) =
+        build_local_simplify_inputs(&merged_tris, vertices, vert_to_groups, g_idx);
+
+    // meshopt::simplify_with_locks. Target ~50% triangles;
+    // unbounded error budget (the simplifier returns the actual
+    // error in `result_error`, which we capture as the group's
+    // parametric error metric).
+    let target_index_count =
+        ((local_tris.len() as f32 * LOD_REDUCTION_TARGET) as usize / 3) * 3;
+    let mut group_error = 0.0_f32;
+    let simplified_local = simplify_meshopt(
+        &local_tris,
+        &local_verts,
+        &local_locks,
+        target_index_count,
+        &mut group_error,
+    );
+
+    if simplified_local.len() < 3 || simplified_local.len() >= local_tris.len() {
+        // No reduction (simplifier was blocked by locks or
+        // topology). The group's prev-level clusters retain
+        // `parent_group_error = ∞` and become DAG leaves — the LOD
+        // selection rule will always render them.
+        return GroupResult::skipped();
+    }
+
+    // Map the simplifier's local-id output back to global VBO ids
+    // so the re-cluster step + DAG accumulator stay in
+    // global-VBO space.
+    let simplified: Vec<u32> = simplified_local
+        .iter()
+        .map(|&li| local_to_global[li as usize])
+        .collect();
+
+    let (sub_clusters_raw, sub_indices) = cluster_mesh(vertices, &simplified);
+    if sub_clusters_raw.is_empty() {
+        return GroupResult::skipped();
+    }
+
+    // cluster_error: max along chain from leaves to here.
+    let max_input_error = group_global
+        .iter()
+        .map(|&gi| all_clusters[gi].cluster_error)
+        .fold(0.0_f32, f32::max);
+    let new_cluster_error = max_input_error.max(group_error);
+
+    let sub_clusters: Vec<MeshletCluster> = sub_clusters_raw
+        .into_iter()
+        .map(|mut sc| {
+            // index_offset stays at the meshlet builder's local
+            // offset into sub_indices; the flatten step rebases.
+            sc.lod_level = lod;
+            sc.cluster_error = new_cluster_error;
+            sc.parent_group_error = PARENT_GROUP_ERROR_ROOT;
+            sc
+        })
+        .collect();
+
+    GroupResult {
+        sub_clusters,
+        sub_indices,
+        group_error,
+        consumed_global_ids: group_global,
+        skipped: false,
+    }
 }
 
 /// Build a compact local VBO + lock array for one group's
@@ -702,6 +792,21 @@ mod tests {
         // For the 17×17 grid, the DAG should grow past LOD 0 →
         // at least some LOD-0 clusters get consumed (covered by
         // `dag_consumed_lod0_clusters_have_finite_parent_group_error`).
+    }
+
+    #[test]
+    fn dag_build_is_deterministic_across_invocations() {
+        // The per-group simplify runs in parallel via rayon, then
+        // flattens sequentially. This test guards against any
+        // future shared-mutable state that would let thread
+        // scheduling affect cluster ordering or index_offsets.
+        let (v, i) = grid_mesh(17);
+        let a = build_cluster_dag_with_levels(&v, &i, 4);
+        let b = build_cluster_dag_with_levels(&v, &i, 4);
+        assert_eq!(a.clusters, b.clusters);
+        assert_eq!(a.indices, b.indices);
+        assert_eq!(a.lod0_cluster_range, b.lod0_cluster_range);
+        assert_eq!(a.lod0_index_range, b.lod0_index_range);
     }
 
     #[test]
