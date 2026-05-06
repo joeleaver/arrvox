@@ -41,18 +41,14 @@ use super::extract::MeshVertex;
 /// to). Construction may stop early if a level's simplification
 /// makes no progress or only one cluster remains.
 ///
-/// **Temporary default of 1** until the per-group simplify is
-/// properly optimised (parallelised + locally-compacted vertex
-/// buffer). The current implementation pays full-mesh cost per
-/// `simplify_with_locks` call (FULL `vertex_lock: &[bool]` of
-/// length `vertex_count` per call → multi-MB scan inside meshopt
-/// for every group), which means seconds-per-asset extending into
-/// hours-per-asset on real meshes. With `LOD_LEVELS = 1` only the
-/// LOD-0 clustering runs (Phase-5-equivalent); `parent_group_error
-/// = ∞` admits every cluster, so the GPU pipeline degrades
-/// gracefully to "render every cluster". Set
-/// `RKP_MESH_LOD_LEVELS=4` (or any value 1..=4) to opt back into
-/// the full DAG once you're prepared to wait for the build.
+/// **Temporary default of 1** while the second half of the DAG
+/// perf fix lands — per-group simplify is now compact-VBO (no
+/// longer scans the full asset VBO + lock array per group, see
+/// [`build_local_simplify_inputs`]), but each level's groups
+/// still run sequentially. Once `rayon::par_iter` lifts that to
+/// multi-core this should flip back to 4. Set
+/// `RKP_MESH_LOD_LEVELS=4` (or any value 1..=4) at runtime to
+/// opt into the full DAG today.
 pub const LOD_LEVELS: usize = 1;
 
 /// Hard cap on `lod_levels` — selection-rule + per-cluster fields
@@ -207,27 +203,31 @@ pub fn build_cluster_dag_with_levels(
                 continue;
             }
 
-            // Group-boundary vertex locks. Lock any vertex shared
-            // with a cluster in another group at this LOD level.
-            let lock_flags = compute_group_boundary_locks(
-                &merged_tris,
-                vertices.len(),
-                &vert_to_groups,
-                g_idx,
-            );
+            // Compact the group's geometry into a local VBO + lock
+            // array so meshopt's per-vertex sweep is bounded by the
+            // group's unique-vertex count (~256 typical) rather
+            // than the asset's vertex count (~1-3M on real meshes).
+            // See `build_local_simplify_inputs` for the rationale.
+            let (local_verts, local_tris, local_locks, local_to_global) =
+                build_local_simplify_inputs(&merged_tris, vertices, &vert_to_groups, g_idx);
 
             // meshopt::simplify_with_locks. Target ~50% triangles;
             // unbounded error budget (the simplifier returns the
             // actual error in `result_error`, which we capture as
             // the group's parametric error metric).
-            let target_index_count = ((merged_tris.len() as f32 * LOD_REDUCTION_TARGET) as usize
+            let target_index_count = ((local_tris.len() as f32 * LOD_REDUCTION_TARGET) as usize
                 / 3)
                 * 3;
             let mut group_error = 0.0_f32;
-            let simplified =
-                simplify_meshopt(&merged_tris, vertices, &lock_flags, target_index_count, &mut group_error);
+            let simplified_local = simplify_meshopt(
+                &local_tris,
+                &local_verts,
+                &local_locks,
+                target_index_count,
+                &mut group_error,
+            );
 
-            if simplified.len() < 3 || simplified.len() >= merged_tris.len() {
+            if simplified_local.len() < 3 || simplified_local.len() >= local_tris.len() {
                 // No reduction (simplifier was blocked by locks or
                 // topology). The group's prev-level clusters retain
                 // `parent_group_error = ∞` and become DAG leaves at
@@ -235,6 +235,14 @@ pub fn build_cluster_dag_with_levels(
                 // rule will always render them.
                 continue;
             }
+
+            // Map the simplifier's local-id output back to global
+            // VBO ids; the DAG accumulator + re-cluster step both
+            // operate in global-VBO space.
+            let simplified: Vec<u32> = simplified_local
+                .iter()
+                .map(|&li| local_to_global[li as usize])
+                .collect();
 
             // Re-cluster the simplified triangles.
             let (sub_clusters, sub_indices) = cluster_mesh(vertices, &simplified);
@@ -385,26 +393,60 @@ fn build_vert_to_groups(
     map
 }
 
-/// Compute the per-vertex lock flags for a single group's
-/// simplification call. A vertex is locked iff it's referenced by
-/// any prev-level cluster *outside* this group — i.e., it's on the
-/// group's exterior boundary and must keep its position so
-/// adjacent groups' boundary geometry continues to match.
-fn compute_group_boundary_locks(
+/// Build a compact local VBO + lock array for one group's
+/// `simplify_with_locks` call. Doing this avoids meshopt walking
+/// the asset's full per-vertex lock array on every group call —
+/// real meshes have 1-3M vertices and ~thousands of groups per
+/// LOD level, and meshopt's FFI per-vertex sweep dominates wall
+/// clock when the lock array is full-sized (memory note
+/// `project_mesh_phase5_shipped`). With typical groups of ≤ 256
+/// unique verts the inner cost drops by ~4 orders of magnitude.
+///
+/// Returns `(local_verts, local_tris, local_locks, local_to_global)`:
+///
+/// * `local_verts` — `MeshVertex` for each unique global vertex
+///   referenced by `merged_tris`, in first-encounter order.
+/// * `local_tris` — `merged_tris` remapped through the local
+///   numbering. Indices into `local_verts`.
+/// * `local_locks` — same length as `local_verts`. `true` iff
+///   the corresponding global vertex appears in any group other
+///   than `this_group` (exterior boundary; must be preserved so
+///   adjacent groups' boundary geometry continues to match — the
+///   crack-avoidance invariant from Karis '21 §3.2).
+/// * `local_to_global` — local id → global VBO id. Caller
+///   remaps the simplifier's output back through this before
+///   feeding it to `cluster_mesh` / the DAG accumulator.
+fn build_local_simplify_inputs(
     merged_tris: &[u32],
-    vertex_count: usize,
+    vertices: &[MeshVertex],
     vert_to_groups: &HashMap<u32, HashSet<u32>>,
     this_group: usize,
-) -> Vec<bool> {
-    let mut locks = vec![false; vertex_count];
-    for &v in merged_tris {
-        if let Some(groups) = vert_to_groups.get(&v) {
-            if groups.iter().any(|&g| g != this_group as u32) {
-                locks[v as usize] = true;
+) -> (Vec<MeshVertex>, Vec<u32>, Vec<bool>, Vec<u32>) {
+    let mut global_to_local: HashMap<u32, u32> = HashMap::new();
+    let mut local_to_global: Vec<u32> = Vec::new();
+    let mut local_verts: Vec<MeshVertex> = Vec::new();
+    let mut local_locks: Vec<bool> = Vec::new();
+    let mut local_tris: Vec<u32> = Vec::with_capacity(merged_tris.len());
+
+    for &g in merged_tris {
+        let local_id = match global_to_local.get(&g) {
+            Some(&id) => id,
+            None => {
+                let id = local_to_global.len() as u32;
+                global_to_local.insert(g, id);
+                local_to_global.push(g);
+                local_verts.push(vertices[g as usize]);
+                let locked = vert_to_groups
+                    .get(&g)
+                    .is_some_and(|groups| groups.iter().any(|&og| og != this_group as u32));
+                local_locks.push(locked);
+                id
             }
-        }
+        };
+        local_tris.push(local_id);
     }
-    locks
+
+    (local_verts, local_tris, local_locks, local_to_global)
 }
 
 /// Thin wrapper around `meshopt::simplify_with_locks`. Pulled out
@@ -663,23 +705,73 @@ mod tests {
     }
 
     #[test]
-    fn compute_group_boundary_locks_marks_cross_group_verts() {
-        // Two groups: {tri 0-1-2} and {tri 2-3-4}. Vertex 2 is
-        // shared → must be locked when simplifying either group.
+    fn build_local_simplify_inputs_compacts_and_locks_correctly() {
+        // 6 global verts; group 0 owns {0,1,2,3}, group 1 owns
+        // {2,3,4,5}. Verts 2 and 3 are exterior-boundary for either
+        // group → locked when simplifying that group.
         let mut vert_to_groups: HashMap<u32, HashSet<u32>> = HashMap::new();
-        vert_to_groups.entry(0).or_default().insert(0);
-        vert_to_groups.entry(1).or_default().insert(0);
-        vert_to_groups.entry(2).or_default().insert(0);
-        vert_to_groups.entry(2).or_default().insert(1);
-        vert_to_groups.entry(3).or_default().insert(1);
-        vert_to_groups.entry(4).or_default().insert(1);
+        for v in 0..=3 {
+            vert_to_groups.entry(v).or_default().insert(0);
+        }
+        for v in 2..=5 {
+            vert_to_groups.entry(v).or_default().insert(1);
+        }
 
-        // Group 0's merged tris = [0,1,2]; vert 2 should be locked.
-        let g0_locks = compute_group_boundary_locks(&[0, 1, 2], 5, &vert_to_groups, 0);
-        assert_eq!(g0_locks, vec![false, false, true, false, false]);
+        // Distinct positions per global vert so the round-trip
+        // assertion below has bite.
+        let verts: Vec<MeshVertex> = (0..6)
+            .map(|i| vert([i as f32, i as f32 * 0.5, i as f32 * 0.25]))
+            .collect();
 
-        // Group 1's merged tris = [2,3,4]; vert 2 should be locked.
-        let g1_locks = compute_group_boundary_locks(&[2, 3, 4], 5, &vert_to_groups, 1);
-        assert_eq!(g1_locks, vec![false, false, true, false, false]);
+        // Group 0's merged_tris in global IDs (two triangles
+        // sharing the boundary).
+        let merged = vec![0u32, 1, 2, 1, 2, 3];
+
+        let (local_verts, local_tris, local_locks, local_to_global) =
+            build_local_simplify_inputs(&merged, &verts, &vert_to_groups, 0);
+
+        // 4 unique global verts referenced → 4 local entries.
+        assert_eq!(local_verts.len(), 4);
+        assert_eq!(local_to_global.len(), 4);
+        assert_eq!(local_locks.len(), 4);
+        assert_eq!(local_tris.len(), merged.len());
+
+        // local_to_global is a permutation of the unique input verts.
+        let global_set: HashSet<u32> = local_to_global.iter().copied().collect();
+        let expected: HashSet<u32> = [0u32, 1, 2, 3].into_iter().collect();
+        assert_eq!(global_set, expected);
+
+        // Locks: only verts 2 and 3 (shared with group 1).
+        for (li, &gi) in local_to_global.iter().enumerate() {
+            let want = matches!(gi, 2 | 3);
+            assert_eq!(local_locks[li], want, "vert g={} li={}", gi, li);
+        }
+
+        // Triangle round-trip: local_to_global[local_tris[i]] == merged[i].
+        let round: Vec<u32> = local_tris
+            .iter()
+            .map(|&li| local_to_global[li as usize])
+            .collect();
+        assert_eq!(round, merged);
+
+        // Local VBO carries the original positions for each remapped vert.
+        for (li, &gi) in local_to_global.iter().enumerate() {
+            assert_eq!(local_verts[li].local_pos, verts[gi as usize].local_pos);
+        }
+    }
+
+    #[test]
+    fn build_local_simplify_inputs_no_locks_when_group_owns_all_verts() {
+        // Single-group scenario: every vert in vert_to_groups
+        // belongs only to this_group → no locks.
+        let mut vert_to_groups: HashMap<u32, HashSet<u32>> = HashMap::new();
+        for v in 0..=2 {
+            vert_to_groups.entry(v).or_default().insert(0);
+        }
+        let verts: Vec<MeshVertex> = (0..3).map(|i| vert([i as f32, 0.0, 0.0])).collect();
+
+        let (_lv, _lt, locks, _l2g) =
+            build_local_simplify_inputs(&[0u32, 1, 2], &verts, &vert_to_groups, 0);
+        assert_eq!(locks, vec![false, false, false]);
     }
 }
