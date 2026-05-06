@@ -230,12 +230,11 @@ impl RkpRenderer {
     /// silently skipped — they'll show through as the "miss" clear,
     /// matching how the march path handles missing assets.
     pub fn dispatch_splat(
-        &self,
+        &mut self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         viewport: &mut crate::viewport_renderer::ViewportRenderer,
         draws: &[SplatDraw],
-        timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
         viewport.refresh_splat_g0(&self.device, self);
         viewport.refresh_splat_resolve_bindings(&self.device, self);
@@ -274,6 +273,7 @@ impl RkpRenderer {
         // 1. Visibility-buffer raster — writes position + pick +
         //    leaf_slot for hit pixels; clears all three (and depth) to
         //    march-equivalent miss sentinels.
+        let q_raster = self.profiler.begin_query("splat_raster", encoder);
         {
             let mut rp = self.splat_pass.begin_pass(
                 encoder,
@@ -281,7 +281,7 @@ impl RkpRenderer {
                 &viewport.pick_view,
                 &viewport.gbuffer.leaf_slot_view,
                 &viewport.gbuffer.depth_view,
-                timestamp_writes,
+                None,
             );
             rp.set_pipeline(&self.splat_pass.pipeline);
             rp.set_bind_group(0, g0_bg, &[]);
@@ -295,6 +295,7 @@ impl RkpRenderer {
                 rp.draw(0..4, 0..count);
             }
         }
+        self.profiler.end_query(encoder, q_raster);
 
         // 2. Resolve compute — reads (leaf_slot, pick) per pixel,
         //    writes normal / material / glass via the storage-texture
@@ -309,6 +310,7 @@ impl RkpRenderer {
             .splat_resolve_g1_bg
             .as_ref()
             .expect("splat_resolve g1 bg present after refresh");
+        let q_resolve = self.profiler.begin_query("splat_resolve", encoder);
         self.splat_resolve.dispatch(
             encoder,
             resolve_g0,
@@ -316,6 +318,7 @@ impl RkpRenderer {
             viewport.width,
             viewport.height,
         );
+        self.profiler.end_query(encoder, q_resolve);
     }
 
     /// Current lights/materials epoch — ViewportRenderers compare against
@@ -486,9 +489,7 @@ impl RkpRenderer {
             );
             self.profiler.end_query(encoder, q);
         } else if splat {
-            let q = self.profiler.begin_query("splat", encoder);
-            self.dispatch_splat(queue, encoder, viewport, splat_draws, None);
-            self.profiler.end_query(encoder, q);
+            self.dispatch_splat(queue, encoder, viewport, splat_draws);
         } else {
             viewport.march.clear_stats(encoder);
             let q = self.profiler.begin_query("march", encoder);
