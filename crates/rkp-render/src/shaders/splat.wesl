@@ -81,6 +81,35 @@ fn vert_main(
     let attr = leaf_attr_pool[leaf_attr_id];
     let n_local = unpack_oct_normal(attr.normal_oct);
 
+    let world_pos = (instance.world * vec4<f32>(local_pos, 1.0)).xyz;
+    let world_basis = mat3x3<f32>(
+        instance.world[0].xyz,
+        instance.world[1].xyz,
+        instance.world[2].xyz,
+    );
+    let n_world_unscaled = world_basis * n_local;
+
+    // Backface cull. The compute march implicitly does this by stopping
+    // at the first hit; the splat path has to do it explicitly or every
+    // back-facing splat costs vertex+fragment work for nothing. Roughly
+    // halves emitted fragments on a closed mesh.
+    //
+    // Strict `< 0` keeps silhouette splats (dot ≈ 0) — they're picked
+    // up by the billboard-fallback below. Going more aggressive
+    // (e.g. `< 0.1`) reintroduces silhouette holes.
+    let to_camera = camera.position.xyz - world_pos;
+    if (dot(n_world_unscaled, to_camera) < 0.0) {
+        var out: VsOut;
+        // Degenerate the quad: all four corners at the same outside-
+        // clip-volume point ⇒ both triangles in the strip have zero
+        // area, rasterizer emits zero fragments.
+        out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+        out.corner_uv = vec2<f32>(0.0);
+        out.world_pos = vec3<f32>(0.0);
+        out.leaf_attr_id = 0u;
+        return out;
+    }
+
     // Build the disc in OBJECT-LOCAL space, then transform corners
     // through `instance.world`. This makes the disc inherit any scale
     // / non-uniform scale / rotation in the instance transform without
@@ -89,12 +118,6 @@ fn vert_main(
     let local_u = basis_local[0] * radius;
     let local_v = basis_local[1] * radius;
 
-    let world_pos = (instance.world * vec4<f32>(local_pos, 1.0)).xyz;
-    let world_basis = mat3x3<f32>(
-        instance.world[0].xyz,
-        instance.world[1].xyz,
-        instance.world[2].xyz,
-    );
     let world_u = world_basis * local_u;
     let world_v = world_basis * local_v;
 
@@ -137,9 +160,22 @@ fn vert_main(
     var out: VsOut;
     out.clip_pos = clip;
     out.corner_uv = uv;
-    // Disc CENTER's world pos (not the corner), so the fragment-side
-    // hit_distance matches the compute march's `first_dist`.
-    out.world_pos = world_pos;
+    // Per-pixel world position. Interpolating `corner_world` (with
+    // perspective correction) gives each fragment the actual surface
+    // point under that pixel — equivalent to the camera ray's
+    // intersection with the disc plane, since the disc is planar.
+    //
+    // Earlier we passed `world_pos` (the disc center, identical for
+    // all 4 corners). That made `gbuf_position` piecewise-flat across
+    // each disc, which broke shade's screen-space neighbor reads
+    // (SSAO, bilateral) and pushed the shade pass to ~13 ms. With the
+    // interpolation, neighbor reads see smoothly varying positions.
+    //
+    // For the billboard-fallback case, `corner_world` is on the
+    // billboard plane rather than the surface plane — a small offset
+    // from "true" surface position, but the billboard is an
+    // approximation anyway.
+    out.world_pos = corner_world;
     out.leaf_attr_id = leaf_attr_id;
     return out;
 }
