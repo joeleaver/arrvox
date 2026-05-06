@@ -435,16 +435,31 @@ impl RkpSceneManager {
 
         // Phase 6.1: build the full Karis-Nanite-style cluster DAG.
         // LOD 0 is the same Phase-5 surface clustering; higher LOD
-        // levels are produced by spatially grouping prev-level
-        // clusters, locking each group's exterior boundary verts,
-        // running `meshopt::simplify_with_locks`, and re-clustering
-        // the simplified result. The IBO concatenates all LOD
-        // levels (LOD 0 first); `mesh_lod0_index_count` records the
-        // LOD-0 prefix so dispatch keeps drawing what it always did
-        // until Phase 6.2 wires the indirect path.
+        // levels are produced by grouping prev-level clusters via
+        // meshopt's shared-vertex partitioner, locking each group's
+        // exterior boundary verts, running
+        // `meshopt::simplify_with_locks`, and re-clustering the
+        // simplified result. The IBO concatenates all LOD levels
+        // (LOD 0 first); `mesh_lod0_index_count` records the LOD-0
+        // prefix so dispatch keeps drawing what it always did until
+        // Phase 6.2 wires the indirect path.
+        let dag_t0 = std::time::Instant::now();
+        eprintln!(
+            "[RkpSceneManager] {}: building cluster DAG over {} verts / {} tris...",
+            rkp_path.display(),
+            mesh_vertices.len(),
+            mesh_indices_unclustered.len() / 3,
+        );
         let dag = crate::mesh_pass::build_cluster_dag(
             &mesh_vertices,
             &mesh_indices_unclustered,
+        );
+        eprintln!(
+            "[RkpSceneManager] {}: DAG built in {:.2}s ({} clusters across {} LOD levels)",
+            rkp_path.display(),
+            dag_t0.elapsed().as_secs_f32(),
+            dag.clusters.len(),
+            dag.clusters.iter().map(|c| c.lod_level).max().unwrap_or(0) + 1,
         );
         let mesh_indices = dag.indices;
         let meshlet_clusters = dag.clusters;

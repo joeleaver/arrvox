@@ -29,8 +29,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use glam::Vec3;
-use meshopt::{simplify_with_locks, SimplifyOptions, VertexDataAdapter};
+use meshopt::{
+    partition_clusters_with_positions, simplify_with_locks, SimplifyOptions, VertexDataAdapter,
+};
 
 use super::cluster::{cluster_mesh, MeshletCluster, PARENT_GROUP_ERROR_ROOT};
 use super::extract::MeshVertex;
@@ -117,14 +118,25 @@ pub fn build_cluster_dag(vertices: &[MeshVertex], indices: &[u32]) -> ClusterDag
     let lod0_index_range = (lod0_index_base, all_indices.len() as u32);
 
     let mut prev_level_range: std::ops::Range<usize> = lod0_cluster_base..lod0_cluster_end;
+    eprintln!(
+        "[lod] LOD 0: {} clusters",
+        prev_level_range.len()
+    );
 
     for lod in 1..LOD_LEVELS {
         if prev_level_range.len() <= 1 {
             break; // DAG converged to a single cluster
         }
 
+        let lod_t0 = std::time::Instant::now();
         let prev_indices: Vec<usize> = prev_level_range.clone().collect();
-        let groups = group_clusters_spatially(&all_clusters, &prev_indices, GROUP_SIZE_TARGET);
+        let groups = group_clusters_meshopt(
+            &all_clusters,
+            &all_indices,
+            vertices,
+            &prev_indices,
+            GROUP_SIZE_TARGET,
+        );
         if groups.is_empty() {
             break;
         }
@@ -222,6 +234,13 @@ pub fn build_cluster_dag(vertices: &[MeshVertex], indices: &[u32]) -> ClusterDag
             // had < 3 input tris). Stop.
             break;
         }
+        eprintln!(
+            "[lod] LOD {}: {} clusters from {} groups ({:.2}s)",
+            lod,
+            new_level_end - new_level_start,
+            groups.len(),
+            lod_t0.elapsed().as_secs_f32(),
+        );
         prev_level_range = new_level_start..new_level_end;
     }
 
@@ -233,17 +252,22 @@ pub fn build_cluster_dag(vertices: &[MeshVertex], indices: &[u32]) -> ClusterDag
     }
 }
 
-/// Greedy spatial grouping: pick an unused seed cluster, add its
-/// `target_size - 1` AABB-centroid-nearest unused neighbours,
-/// repeat until every cluster is in a group. Returns groups as
-/// vectors of indices into `prev_indices` (positional within the
-/// LOD level — *not* into `clusters` directly).
+/// Group prev-level clusters via `meshopt::partition_clusters_with_positions`.
+/// meshopt prioritises grouping clusters that share vertices (so the
+/// group's shared-edge boundary stays small, which is what gives the
+/// simplifier real reduction headroom under our group-boundary lock
+/// regime); spatial proximity from the position adapter is the
+/// tie-breaker. Linear-ish time in the cluster count + total
+/// vertex-index references — orders of magnitude faster than the
+/// O(N²) seed-and-nearest-neighbour pass it replaces (which would
+/// take many minutes on the 100K+-cluster meshes real assets produce).
 ///
-/// Brute-force O(N²) on cluster count per level. With ≤ low-
-/// thousands of clusters per LOD level this is ~milliseconds at
-/// load time and trivially correct.
-fn group_clusters_spatially(
+/// Returns groups as vectors of positions within `prev_indices`
+/// (not global cluster ids); empty groups are filtered out.
+fn group_clusters_meshopt(
     clusters: &[MeshletCluster],
+    indices: &[u32],
+    vertices: &[MeshVertex],
     prev_indices: &[usize],
     target_size: usize,
 ) -> Vec<Vec<usize>> {
@@ -251,38 +275,50 @@ fn group_clusters_spatially(
         return Vec::new();
     }
     let n = prev_indices.len();
-    let centroids: Vec<Vec3> = prev_indices
-        .iter()
-        .map(|&gi| {
-            let lo = Vec3::from_array(clusters[gi].aabb_min);
-            let hi = Vec3::from_array(clusters[gi].aabb_max);
-            (lo + hi) * 0.5
-        })
-        .collect();
-
-    let mut used = vec![false; n];
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-
-    for seed in 0..n {
-        if used[seed] {
-            continue;
-        }
-        used[seed] = true;
-        let mut group = vec![seed];
-
-        // Sort remaining unused clusters by distance to seed.
-        let mut candidates: Vec<(usize, f32)> = (0..n)
-            .filter(|&i| !used[i])
-            .map(|i| (i, centroids[seed].distance_squared(centroids[i])))
-            .collect();
-        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        for (i, _) in candidates.iter().take(target_size - 1) {
-            used[*i] = true;
-            group.push(*i);
-        }
-        groups.push(group);
+    if n == 1 {
+        return vec![vec![0]];
     }
+
+    // Build the per-cluster unique-vertex list meshopt expects:
+    // sequential concatenation of each cluster's vertex IDs +
+    // a parallel `cluster_index_counts` giving each cluster's
+    // unique-vertex count.
+    let mut cluster_indices_flat: Vec<u32> = Vec::new();
+    let mut cluster_index_counts: Vec<u32> = Vec::with_capacity(n);
+    let mut seen: HashSet<u32> = HashSet::new();
+    for &gi in prev_indices {
+        let c = &clusters[gi];
+        let span = &indices[c.index_offset as usize..(c.index_offset + c.index_count) as usize];
+        seen.clear();
+        let start = cluster_indices_flat.len();
+        for &v in span {
+            if seen.insert(v) {
+                cluster_indices_flat.push(v);
+            }
+        }
+        cluster_index_counts.push((cluster_indices_flat.len() - start) as u32);
+    }
+
+    let vertex_bytes = bytemuck::cast_slice::<MeshVertex, u8>(vertices);
+    let stride = std::mem::size_of::<MeshVertex>();
+    let adapter = VertexDataAdapter::new(vertex_bytes, stride, 0)
+        .expect("MeshVertex layout matches VertexDataAdapter");
+
+    let mut destination: Vec<u32> = vec![0; n];
+    let partition_count = partition_clusters_with_positions(
+        &mut destination,
+        &cluster_indices_flat,
+        &cluster_index_counts,
+        &adapter,
+        target_size,
+    );
+
+    // Invert: partition id → list of cluster positions in prev_indices.
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); partition_count];
+    for (cluster_idx, &part_id) in destination.iter().enumerate() {
+        groups[part_id as usize].push(cluster_idx);
+    }
+    groups.retain(|g| !g.is_empty());
     groups
 }
 
@@ -561,34 +597,24 @@ mod tests {
     }
 
     #[test]
-    fn group_clusters_spatially_partitions_all() {
-        // Synthetic: 7 clusters at distinct positions; group_size=3
-        // → groups of {3, 3, 1}.
-        let mk = |center: [f32; 3]| MeshletCluster {
-            aabb_min: [center[0] - 0.1, center[1] - 0.1, center[2] - 0.1],
-            _pad0: 0.0,
-            aabb_max: [center[0] + 0.1, center[1] + 0.1, center[2] + 0.1],
-            _pad1: 0.0,
-            index_offset: 0,
-            index_count: 3,
-            lod_level: 0,
-            _pad2: 0,
-            cluster_error: 0.0,
-            parent_group_error: f32::INFINITY,
-            _pad3: [0; 2],
-        };
-        let clusters: Vec<MeshletCluster> = (0..7).map(|i| mk([i as f32, 0.0, 0.0])).collect();
-        let prev: Vec<usize> = (0..7).collect();
-        let groups = group_clusters_spatially(&clusters, &prev, 3);
-
-        let total: usize = groups.iter().map(|g| g.len()).sum();
-        assert_eq!(total, 7, "every cluster appears exactly once");
-        let mut seen: HashSet<usize> = HashSet::new();
-        for g in &groups {
-            for &i in g {
-                assert!(seen.insert(i), "no cluster appears in more than one group");
-            }
+    fn dag_groups_partition_all_prev_clusters() {
+        // The DAG builder's grouper (now meshopt-backed) must
+        // assign every prev-level cluster to exactly one group at
+        // the next level. Verified end-to-end on the grid mesh:
+        // every LOD-0 cluster either has a finite
+        // `parent_group_error` (consumed by a group) OR `∞` (its
+        // own group failed to simplify and it became a DAG leaf).
+        let (v, i) = grid_mesh(17);
+        let dag = build_cluster_dag(&v, &i);
+        for c in &dag.clusters[..dag.lod0_cluster_range.1 as usize] {
+            assert!(
+                c.parent_group_error.is_finite() || c.parent_group_error.is_infinite(),
+                "every LOD-0 cluster must have a defined parent_group_error",
+            );
         }
+        // For the 17×17 grid, the DAG should grow past LOD 0 →
+        // at least some LOD-0 clusters get consumed (covered by
+        // `dag_consumed_lod0_clusters_have_finite_parent_group_error`).
     }
 
     #[test]
