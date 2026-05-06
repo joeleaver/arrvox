@@ -424,7 +424,7 @@ impl RkpSceneManager {
         // the scene-global `leaf_attr_pool`. Phase 2 will rasterize
         // these triangles into the visibility buffer; until then they
         // ride along on `AssetEntry` as inert data.
-        let (mesh_vertices, mesh_indices) = extract_surface_mesh(
+        let (mesh_vertices, mesh_indices_unclustered) = extract_surface_mesh(
             tree.as_slice(),
             header.octree_depth as u8,
             header.base_voxel_size,
@@ -432,6 +432,16 @@ impl RkpSceneManager {
             self.brick_pool.as_slice(),
             self.leaf_attr_pool.as_slice(),
         );
+
+        // Phase 5: partition the surface mesh into ~64v/124t meshlet
+        // clusters with per-cluster object-local AABBs. The IBO is
+        // re-emitted so each cluster occupies a contiguous index
+        // range — the per-triangle order is the only thing that
+        // changes; the triangle multiset is identical and dispatch
+        // still draws `0..total_index_count` until Phase 6 wires
+        // per-cluster indirect dispatch.
+        let (meshlet_clusters, mesh_indices) =
+            crate::mesh_pass::cluster_mesh(&mesh_vertices, &mesh_indices_unclustered);
 
         // Coarse-LOD shadow mesh (Phase 3). Same SN walk at a coarser
         // octree depth — produces a dramatically simpler mesh that
@@ -472,7 +482,7 @@ impl RkpSceneManager {
         let handle = self.octree.allocate(&tree);
 
         eprintln!(
-            "[RkpSceneManager] loaded {}: {} voxels ({} unique attrs), {} bricks, octree {} → compact {} → dedup {} ({:.1}× total), +{} prefilter attrs, {} splats, mesh {} verts / {} tris, shadow-lod {} verts / {} tris",
+            "[RkpSceneManager] loaded {}: {} voxels ({} unique attrs), {} bricks, octree {} → compact {} → dedup {} ({:.1}× total), +{} prefilter attrs, {} splats, mesh {} verts / {} tris / {} clusters, shadow-lod {} verts / {} tris",
             rkp_path.display(),
             actual_cell_count,
             voxel_count,
@@ -485,6 +495,7 @@ impl RkpSceneManager {
             splats.len(),
             mesh_vertices.len(),
             mesh_indices.len() / 3,
+            meshlet_clusters.len(),
             mesh_shadow_vertices.len(),
             mesh_shadow_indices.len() / 3,
         );
@@ -522,6 +533,7 @@ impl RkpSceneManager {
             splats,
             mesh_vertices,
             mesh_indices,
+            meshlet_clusters,
             mesh_shadow_vertices,
             mesh_shadow_indices,
         })
@@ -603,6 +615,29 @@ impl RkpSceneManager {
                     AssetHandle::from_raw(idx as u32),
                     entry.mesh_vertices.as_slice(),
                     entry.mesh_indices.as_slice(),
+                ))
+            })
+    }
+
+    /// Iterator over `(AssetHandle, &[MeshletCluster])` for every
+    /// loaded asset whose surface mesh has clusters (Phase 5). The
+    /// render thread uploads these to a per-asset GPU storage buffer
+    /// once per geometry epoch, parallel to `iter_loaded_asset_meshes`.
+    pub fn iter_loaded_asset_clusters(
+        &self,
+    ) -> impl Iterator<Item = (AssetHandle, &[crate::mesh_pass::MeshletCluster])> {
+        self.asset_cache
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| {
+                let entry = slot.as_ref()?;
+                if entry.meshlet_clusters.is_empty() {
+                    return None;
+                }
+                Some((
+                    AssetHandle::from_raw(idx as u32),
+                    entry.meshlet_clusters.as_slice(),
                 ))
             })
     }

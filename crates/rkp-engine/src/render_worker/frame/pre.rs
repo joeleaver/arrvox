@@ -179,6 +179,13 @@ pub(super) fn run_pre_frame(
                 indices,
             );
         }
+        // Phase 5 — per-asset meshlet cluster table. Storage buffer
+        // for the Phase 6 LOD-selection compute pass; uploaded here
+        // but unused by current dispatch (validates the upload path
+        // without rewiring the hot draw call).
+        for (handle, clusters) in sm.iter_loaded_asset_clusters() {
+            state.renderer.upload_mesh_clusters_for_asset(handle.raw(), clusters);
+        }
         // Read-back the epoch *under the same lock* so concurrent
         // mutations (bake worker integrating an artifact mid-frame)
         // don't trick us into thinking we're caught up when we're

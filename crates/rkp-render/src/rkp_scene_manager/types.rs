@@ -126,7 +126,18 @@ pub(super) struct AssetEntry {
     pub(super) mesh_vertices: Vec<crate::mesh_pass::MeshVertex>,
     /// Triangle indices into `mesh_vertices`. Two triangles per
     /// exposed cell face, CCW-wound around the outward normal.
+    ///
+    /// **Phase 5:** the index buffer is now cluster-reordered — each
+    /// entry of `meshlet_clusters` references a contiguous run
+    /// `[index_offset .. index_offset + index_count)`. The triangle
+    /// **multiset** is unchanged; only the per-triangle order shifts,
+    /// so consumers that draw the entire range continue to work.
     pub(super) mesh_indices: Vec<u32>,
+    /// Per-asset meshlet cluster table. ~64 verts / 124 tris each,
+    /// with object-local AABB. Both Phase 6 LOD selection and the
+    /// per-cluster culling path consume this. Empty when
+    /// `mesh_vertices` is empty.
+    pub(super) meshlet_clusters: Vec<crate::mesh_pass::MeshletCluster>,
     /// Coarse-LOD surface mesh used by `MeshShadowMapPass` (Phase 3).
     /// Same SN topology, walked at `SHADOW_LOD_LEVELS` levels above
     /// finest — typically ~64-256× fewer triangles than the primary

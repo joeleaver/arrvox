@@ -19,7 +19,7 @@
 use crate::rkp_scene::{RkpScene, GeometryUpload, FrameUpload};
 use crate::rkp_shade::{ShadeParams, GpuLight, GpuMaterial};
 use crate::rkp_atmosphere::RkpAtmospherePass;
-use crate::mesh_pass::{MeshPass, MeshVertex};
+use crate::mesh_pass::{MeshPass, MeshVertex, MeshletCluster};
 use crate::mesh_shadow_map_pass::MeshShadowMapPass;
 use crate::splat_pass::{SplatDraw, SplatPass, SplatVertex};
 use crate::splat_resolve_pass::SplatResolvePass;
@@ -110,6 +110,13 @@ pub struct RkpRenderer {
     /// — much smaller triangle count than `mesh_buffers`, sufficient
     /// detail for the 1024² shadow map.
     mesh_shadow_buffers: Vec<Option<(wgpu::Buffer, wgpu::Buffer, u32)>>,
+    /// Per-asset meshlet cluster table on the GPU (Phase 5).
+    /// `(buffer, cluster_count)`; the buffer holds a flat
+    /// `[MeshletCluster]` array uploaded via `cast_slice` and is
+    /// bound as STORAGE for the Phase 6 LOD-selection compute pass.
+    /// Phase 5 uploads but does not yet consume — validates the
+    /// upload path without touching the hot dispatch.
+    mesh_cluster_buffers: Vec<Option<(wgpu::Buffer, u32)>>,
     /// Primary-visibility selector — `March` (compute octree march)
     /// or `Splat` (rasterized surface splats). Read from the
     /// `RKP_PRIMARY` env var at construction. See [`PrimaryMode`].
@@ -193,6 +200,7 @@ impl RkpRenderer {
             mesh_shadow_map,
             mesh_buffers: Vec::new(),
             mesh_shadow_buffers: Vec::new(),
+            mesh_cluster_buffers: Vec::new(),
             primary_mode,
             device: device.clone(),
             profiler, timestamp_period,
@@ -342,6 +350,53 @@ impl RkpRenderer {
             .get(handle_raw as usize)
             .and_then(|s| s.as_ref())
             .map(|(v, i, c)| (v, i, *c))
+    }
+
+    /// Upload (or replace) the meshlet cluster table for an asset
+    /// (Phase 5). Caller passes `AssetHandle::raw()` and the
+    /// `&[MeshletCluster]` slice from
+    /// `RkpSceneManager::iter_loaded_asset_clusters`. Re-upload is
+    /// safe — the previous buffer is dropped at the end of the
+    /// call. An empty cluster list clears the entry.
+    pub fn upload_mesh_clusters_for_asset(
+        &mut self,
+        handle_raw: u32,
+        clusters: &[MeshletCluster],
+    ) {
+        use wgpu::util::DeviceExt;
+        let idx = handle_raw as usize;
+        if idx >= self.mesh_cluster_buffers.len() {
+            self.mesh_cluster_buffers.resize_with(idx + 1, || None);
+        }
+        if clusters.is_empty() {
+            self.mesh_cluster_buffers[idx] = None;
+            return;
+        }
+        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mesh asset cluster table"),
+            contents: bytemuck::cast_slice(clusters),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        self.mesh_cluster_buffers[idx] = Some((buffer, clusters.len() as u32));
+    }
+
+    /// Drop the cached cluster table for `handle_raw`. Called when
+    /// an asset is released or invalidated.
+    pub fn release_mesh_clusters_for_asset(&mut self, handle_raw: u32) {
+        let idx = handle_raw as usize;
+        if let Some(slot) = self.mesh_cluster_buffers.get_mut(idx) {
+            *slot = None;
+        }
+    }
+
+    /// Look up the cached cluster table. Returns `(buffer,
+    /// cluster_count)` when the asset has been uploaded, else
+    /// `None`.
+    pub fn mesh_cluster_buffer(&self, handle_raw: u32) -> Option<(&wgpu::Buffer, u32)> {
+        self.mesh_cluster_buffers
+            .get(handle_raw as usize)
+            .and_then(|s| s.as_ref())
+            .map(|(b, c)| (b, *c))
     }
 
     /// Splat-raster equivalent of `OctreeMarchPass::dispatch`. Writes

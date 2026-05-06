@@ -11,9 +11,11 @@
 //! `(vertices, indices)` buffer just lives on `AssetEntry` next to
 //! `splats` until the Phase 2 forward pipeline is wired in.
 
+pub mod cluster;
 pub mod extract;
 pub mod pass;
 
+pub use cluster::{cluster_mesh, MeshletCluster, MAX_TRIS_PER_CLUSTER, MAX_VERTS_PER_CLUSTER};
 pub use extract::{extract_shadow_mesh_lod, extract_surface_mesh, MeshVertex};
 pub use pass::{MeshDraw, MeshPass};
 

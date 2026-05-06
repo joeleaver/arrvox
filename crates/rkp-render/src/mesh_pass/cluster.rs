@@ -1,0 +1,364 @@
+//! Meshlet clustering — Phase 5 of the mesh pivot.
+//!
+//! Partitions a single asset's `(vertices, indices)` mesh into
+//! meshlets capped at `MAX_VERTS_PER_CLUSTER` unique vertices and
+//! `MAX_TRIS_PER_CLUSTER` triangles, with a per-cluster object-local
+//! AABB. Both primary visibility (Phase 6 LOD selection) and the
+//! shadow path will consume these clusters.
+//!
+//! Clustering runs through `meshopt::build_meshlets` so we get the
+//! same locality / cone-fit quality as every other modern engine
+//! using meshoptimizer. The output is repackaged into a flat IBO
+//! where each cluster's indices land in a contiguous range
+//! `[index_offset .. index_offset + index_count)`. The original VBO
+//! is **not** reordered — Phase 6 indirect dispatch only needs
+//! `first_index` + `index_count`, so the per-cluster vertex range
+//! buys nothing and would force a parallel VBO permutation.
+
+use bytemuck::{Pod, Zeroable};
+use meshopt::{build_meshlets, VertexDataAdapter};
+
+use super::extract::MeshVertex;
+
+/// NV-mesh-shader-style cluster cap — 64 unique verts per cluster.
+///
+/// Matches meshoptimizer's recommended value and is what every
+/// modern AAA cluster pipeline (UE5 Nanite, Bevy virtual geometry,
+/// id Tech 7 megatextures) targets. Smaller clusters mean more
+/// indirect-draw entries; larger means worse cone-cull granularity
+/// in Phase 6.
+pub const MAX_VERTS_PER_CLUSTER: usize = 64;
+
+/// Triangle cap per cluster. Must be `<= 512` and divisible by 4
+/// per `meshopt::build_meshlets` contract.
+pub const MAX_TRIS_PER_CLUSTER: usize = 124;
+
+/// Cone weight passed to `meshopt::build_meshlets`. Zero disables
+/// cone-cull bias (we don't cone-cull yet); Phase 6 may revisit if
+/// it turns out to matter for shadow-pass culling.
+const CONE_WEIGHT: f32 = 0.0;
+
+const _: () = assert!(MAX_TRIS_PER_CLUSTER % 4 == 0);
+const _: () = assert!(MAX_VERTS_PER_CLUSTER <= 256);
+const _: () = assert!(MAX_TRIS_PER_CLUSTER <= 512);
+
+/// One meshlet cluster. Stored both on `AssetEntry` (CPU side) and
+/// uploaded to the GPU verbatim via `bytemuck::cast_slice` for the
+/// Phase 6 LOD-selection compute pass to read.
+///
+/// 48 B, std430-friendly: `[f32;3]` fields are padded to 16 B so
+/// they line up with WGSL `vec3<f32>` alignment (16) without forcing
+/// the consumer to use `vec3` rather than `array<f32,3>`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct MeshletCluster {
+    /// Object-local AABB minimum. World transform is applied per
+    /// instance at LOD-select time.
+    pub aabb_min: [f32; 3],
+    pub _pad0: f32,
+    /// Object-local AABB maximum.
+    pub aabb_max: [f32; 3],
+    pub _pad1: f32,
+    /// First index in the cluster's IBO range. Becomes
+    /// `DrawIndexedIndirect.first_index` in Phase 6.
+    pub index_offset: u32,
+    /// Index count for this cluster. `index_count / 3` triangles.
+    /// Becomes `DrawIndexedIndirect.index_count`.
+    pub index_count: u32,
+    /// Reserved for Phase 6: `lod_level` and `parent_chain_id`.
+    pub _pad2: [u32; 2],
+}
+
+const _: () = assert!(std::mem::size_of::<MeshletCluster>() == 48);
+const _: () = assert!(std::mem::align_of::<MeshletCluster>() == 4);
+
+/// Partition a mesh into meshlet clusters with per-cluster AABBs.
+///
+/// * `vertices` — the asset's [`MeshVertex`] buffer. Position is
+///   read from `local_pos`; the rest of the vertex is opaque to
+///   meshopt (only the 12-byte position prefix is used).
+/// * `indices` — the original triangle index buffer. Length must
+///   be a multiple of 3.
+///
+/// Returns `(clusters, reordered_indices)`. The reordered indices
+/// are a permutation of triangles from the original `indices`
+/// (each cluster contributes a contiguous run). The vertex buffer
+/// is unchanged — clusters reference the same vertex IDs.
+///
+/// Empty mesh → `(vec![], vec![])`. A mesh with `< 3` indices is
+/// treated as empty (defensive; SN extraction never produces this).
+pub fn cluster_mesh(
+    vertices: &[MeshVertex],
+    indices: &[u32],
+) -> (Vec<MeshletCluster>, Vec<u32>) {
+    if vertices.is_empty() || indices.len() < 3 {
+        return (Vec::new(), Vec::new());
+    }
+    debug_assert_eq!(
+        indices.len() % 3,
+        0,
+        "indices length must be a multiple of 3 (got {})",
+        indices.len()
+    );
+
+    let vertex_bytes = bytemuck::cast_slice::<MeshVertex, u8>(vertices);
+    let stride = std::mem::size_of::<MeshVertex>();
+    // `local_pos` is the first field — position offset is 0.
+    let adapter = VertexDataAdapter::new(vertex_bytes, stride, 0)
+        .expect("MeshVertex layout matches VertexDataAdapter expectations");
+
+    let meshlets = build_meshlets(
+        indices,
+        &adapter,
+        MAX_VERTS_PER_CLUSTER,
+        MAX_TRIS_PER_CLUSTER,
+        CONE_WEIGHT,
+    );
+
+    let mut clusters = Vec::with_capacity(meshlets.len());
+    let mut flat_indices: Vec<u32> = Vec::with_capacity(indices.len());
+
+    for meshlet in meshlets.iter() {
+        // meshlet.vertices: original VBO indices used by this cluster.
+        // meshlet.triangles: per-cluster local indices into meshlet.vertices.
+        let cluster_index_offset = flat_indices.len() as u32;
+
+        // Materialize the cluster's triangles as absolute VBO indices.
+        for &local in meshlet.triangles {
+            flat_indices.push(meshlet.vertices[local as usize]);
+        }
+
+        let cluster_index_count = (flat_indices.len() as u32) - cluster_index_offset;
+
+        // Compute object-local AABB by iterating the cluster's
+        // unique vertex set. meshlet.vertices may include verts not
+        // touched by any active triangle (meshopt over-allocates the
+        // vertex slice up front and `optimizeMeshlet` reorders), so
+        // restrict to verts actually referenced from the index slice.
+        let mut aabb_min = [f32::INFINITY; 3];
+        let mut aabb_max = [f32::NEG_INFINITY; 3];
+        for &abs_vid in flat_indices[cluster_index_offset as usize..].iter() {
+            let p = vertices[abs_vid as usize].local_pos;
+            for k in 0..3 {
+                if p[k] < aabb_min[k] {
+                    aabb_min[k] = p[k];
+                }
+                if p[k] > aabb_max[k] {
+                    aabb_max[k] = p[k];
+                }
+            }
+        }
+
+        clusters.push(MeshletCluster {
+            aabb_min,
+            _pad0: 0.0,
+            aabb_max,
+            _pad1: 0.0,
+            index_offset: cluster_index_offset,
+            index_count: cluster_index_count,
+            _pad2: [0; 2],
+        });
+    }
+
+    (clusters, flat_indices)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn vert(p: [f32; 3]) -> MeshVertex {
+        MeshVertex {
+            local_pos: p,
+            normal_oct: 0,
+            leaf_attr_id: 0,
+            _pad: [0; 3],
+        }
+    }
+
+    /// Each triangle as a sorted (a,b,c) tuple, for set-equality
+    /// comparison across permutations.
+    fn triangle_multiset(indices: &[u32]) -> HashMap<[u32; 3], usize> {
+        let mut m = HashMap::new();
+        for tri in indices.chunks_exact(3) {
+            let mut t = [tri[0], tri[1], tri[2]];
+            t.sort();
+            *m.entry(t).or_insert(0) += 1;
+        }
+        m
+    }
+
+    #[test]
+    fn cluster_layout_size_is_48() {
+        // Belt-and-suspenders for the const_assert above.
+        assert_eq!(std::mem::size_of::<MeshletCluster>(), 48);
+    }
+
+    #[test]
+    fn cluster_empty_mesh_yields_no_clusters() {
+        let (clusters, indices) = cluster_mesh(&[], &[]);
+        assert!(clusters.is_empty());
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn cluster_too_few_indices_yields_no_clusters() {
+        // Two indices is below a triangle; treated as empty.
+        let v = vec![vert([0.0, 0.0, 0.0]), vert([1.0, 0.0, 0.0])];
+        let (clusters, indices) = cluster_mesh(&v, &[0, 1]);
+        assert!(clusters.is_empty());
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn cluster_single_triangle_aabb_matches_triangle() {
+        let v = vec![
+            vert([0.0, 0.0, 0.0]),
+            vert([1.0, 0.0, 0.0]),
+            vert([0.0, 2.0, 3.0]),
+        ];
+        let i = vec![0, 1, 2];
+        let (clusters, flat) = cluster_mesh(&v, &i);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(flat.len(), 3);
+        let c = &clusters[0];
+        assert_eq!(c.index_offset, 0);
+        assert_eq!(c.index_count, 3);
+        assert_eq!(c.aabb_min, [0.0, 0.0, 0.0]);
+        assert_eq!(c.aabb_max, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn cluster_cube_fits_in_one_cluster() {
+        // 8 verts, 12 tris — well under 64v/124t.
+        let v = vec![
+            vert([0.0, 0.0, 0.0]),
+            vert([1.0, 0.0, 0.0]),
+            vert([1.0, 1.0, 0.0]),
+            vert([0.0, 1.0, 0.0]),
+            vert([0.0, 0.0, 1.0]),
+            vert([1.0, 0.0, 1.0]),
+            vert([1.0, 1.0, 1.0]),
+            vert([0.0, 1.0, 1.0]),
+        ];
+        #[rustfmt::skip]
+        let i = vec![
+            0, 1, 2,  0, 2, 3, // -z
+            5, 4, 7,  5, 7, 6, // +z
+            4, 0, 3,  4, 3, 7, // -x
+            1, 5, 6,  1, 6, 2, // +x
+            4, 5, 1,  4, 1, 0, // -y
+            3, 2, 6,  3, 6, 7, // +y
+        ];
+        let (clusters, flat) = cluster_mesh(&v, &i);
+        assert_eq!(clusters.len(), 1, "cube fits in one cluster");
+        assert_eq!(flat.len(), 36, "12 tris × 3 indices preserved");
+        let c = &clusters[0];
+        assert_eq!(c.aabb_min, [0.0, 0.0, 0.0]);
+        assert_eq!(c.aabb_max, [1.0, 1.0, 1.0]);
+        assert_eq!(triangle_multiset(&i), triangle_multiset(&flat));
+    }
+
+    /// Build a flat 9×9 grid of vertices on the XZ plane and a
+    /// triangle list that covers all 8×8 quads. 81 verts, 128 tris —
+    /// exceeds the 64-vert cap so meshopt must split.
+    fn grid_mesh(side: usize) -> (Vec<MeshVertex>, Vec<u32>) {
+        let n = side as u32;
+        let mut verts = Vec::new();
+        for y in 0..side {
+            for x in 0..side {
+                verts.push(vert([x as f32, 0.0, y as f32]));
+            }
+        }
+        let mut idx = Vec::new();
+        for y in 0..(side as u32 - 1) {
+            for x in 0..(side as u32 - 1) {
+                let a = y * n + x;
+                let b = y * n + x + 1;
+                let c = (y + 1) * n + x + 1;
+                let d = (y + 1) * n + x;
+                idx.extend_from_slice(&[a, b, c, a, c, d]);
+            }
+        }
+        (verts, idx)
+    }
+
+    #[test]
+    fn cluster_grid_splits_when_over_vertex_cap() {
+        let (v, i) = grid_mesh(9);
+        assert_eq!(v.len(), 81);
+        assert_eq!(i.len(), 128 * 3);
+
+        let (clusters, flat) = cluster_mesh(&v, &i);
+        assert!(
+            clusters.len() >= 2,
+            "81 verts must split across multiple clusters (got {})",
+            clusters.len()
+        );
+
+        // Per-cluster caps respected.
+        for (ci, c) in clusters.iter().enumerate() {
+            assert!(
+                c.index_count <= (MAX_TRIS_PER_CLUSTER * 3) as u32,
+                "cluster {} index_count {} exceeds tri cap",
+                ci,
+                c.index_count
+            );
+            assert_eq!(
+                c.index_count % 3,
+                0,
+                "cluster {} index_count must be tri-aligned",
+                ci
+            );
+            // Unique-vertex count under MAX_VERTS_PER_CLUSTER.
+            let unique: std::collections::HashSet<u32> = flat
+                [c.index_offset as usize..(c.index_offset + c.index_count) as usize]
+                .iter()
+                .copied()
+                .collect();
+            assert!(
+                unique.len() <= MAX_VERTS_PER_CLUSTER,
+                "cluster {} has {} unique verts, cap {}",
+                ci,
+                unique.len(),
+                MAX_VERTS_PER_CLUSTER
+            );
+        }
+
+        // Index ranges tile the IBO with no gaps and no overlap.
+        let mut cursor = 0u32;
+        for c in &clusters {
+            assert_eq!(c.index_offset, cursor, "clusters must be contiguous");
+            cursor += c.index_count;
+        }
+        assert_eq!(cursor as usize, flat.len(), "all indices accounted for");
+
+        // Triangle multiset preserved (permutation, no loss/dup).
+        assert_eq!(triangle_multiset(&i), triangle_multiset(&flat));
+    }
+
+    #[test]
+    fn cluster_aabbs_contain_their_vertices() {
+        let (v, i) = grid_mesh(9);
+        let (clusters, flat) = cluster_mesh(&v, &i);
+        for (ci, c) in clusters.iter().enumerate() {
+            for vid in &flat[c.index_offset as usize..(c.index_offset + c.index_count) as usize] {
+                let p = v[*vid as usize].local_pos;
+                for k in 0..3 {
+                    assert!(
+                        c.aabb_min[k] <= p[k] && p[k] <= c.aabb_max[k],
+                        "cluster {}: vertex {} pos[{}] = {} outside [{}, {}]",
+                        ci,
+                        vid,
+                        k,
+                        p[k],
+                        c.aabb_min[k],
+                        c.aabb_max[k]
+                    );
+                }
+            }
+        }
+    }
+}

@@ -65,6 +65,7 @@ ufbx = "0.10"
 crossbeam = "0.8"
 inventory = "0.3"
 rapier3d = "0.32"
+meshopt = "0.6"
 
 # Rinch dependencies (same sources as RKIField)
 rinch = { git = "ssh://git@github.com/joeleaver/rinch.git", default-features = false }
