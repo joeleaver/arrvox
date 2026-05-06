@@ -426,29 +426,31 @@ fn dump_rgba16_to_ppm(
     let view = slice.get_mapped_range();
     let halfs: &[half::f16] = bytemuck::cast_slice(&view);
 
-    // Header: P6 magic, width height, max value, single newline before
-    // raw bytes.
-    let mut out = Vec::with_capacity((3 * (width * height) as usize) + 64);
-    out.extend_from_slice(format!("P6\n{} {}\n255\n", width, height).as_bytes());
+    // 16-bit P6 PPM — maxval 65535, 2 bytes per channel big-endian.
+    // 16-bit avoids contour-banding artefacts that 8-bit truncation
+    // would produce on smoothly-varying values like surface normals.
+    let mut out = Vec::with_capacity((6 * (width * height) as usize) + 64);
+    out.extend_from_slice(format!("P6\n{} {}\n65535\n", width, height).as_bytes());
 
     for pix in 0..(width * height) as usize {
         let r = halfs[pix * 4].to_f32();
         let g = halfs[pix * 4 + 1].to_f32();
         let b = halfs[pix * 4 + 2].to_f32();
         let (rr, gg, bb) = if tonemap {
-            // Reinhard: c / (1 + c). Then sRGB-ish gamma 2.2 via sqrt.
             let r = (r / (1.0 + r)).sqrt();
             let g = (g / (1.0 + g)).sqrt();
             let b = (b / (1.0 + b)).sqrt();
             (r, g, b)
         } else {
-            // Normal target — values are already in [0, 1] (encoded
-            // n*0.5 + 0.5). Just clamp.
             (r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0))
         };
-        out.push((rr * 255.0).round().clamp(0.0, 255.0) as u8);
-        out.push((gg * 255.0).round().clamp(0.0, 255.0) as u8);
-        out.push((bb * 255.0).round().clamp(0.0, 255.0) as u8);
+        let w = |v: f32| -> [u8; 2] {
+            let q = (v * 65535.0).round().clamp(0.0, 65535.0) as u16;
+            q.to_be_bytes()
+        };
+        out.extend_from_slice(&w(rr));
+        out.extend_from_slice(&w(gg));
+        out.extend_from_slice(&w(bb));
     }
 
     drop(view);

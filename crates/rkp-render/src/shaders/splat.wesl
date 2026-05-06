@@ -85,9 +85,46 @@ fn vert_main(
         select(-1.0, 1.0, (vertex_index & 2u) != 0u),
     );
 
-    let corner_world = world_pos
-        + tangent_u * (uv.x * radius)
-        + tangent_v * (uv.y * radius);
+    // Edge-on fall-through fix. When the projected screen-space
+    // length of either tangent axis drops below ~half a pixel, the
+    // splat is nearly edge-on to the view; rasterized as a thin
+    // sliver, adjacent splats leave visible black gaps along the
+    // back of the silhouette. Detect that case and switch this
+    // splat to a small camera-facing billboard sized to 1 px in
+    // screen space — covers the gap without distorting splats that
+    // were rasterizing cleanly.
+    //
+    // We check the WORLD-space tangent disc's projected size by
+    // running its u/v deltas through view_proj (with w=0 input so
+    // we pick up just the linear projection), then dividing by the
+    // disc CENTER's clip-w to convert to NDC.
+    let clip_center = camera.view_proj * vec4<f32>(world_pos, 1.0);
+    let proj_u = camera.view_proj * vec4<f32>(tangent_u * radius, 0.0);
+    let proj_v = camera.view_proj * vec4<f32>(tangent_v * radius, 0.0);
+    let inv_w = 1.0 / max(abs(clip_center.w), 1e-6);
+    let half_res = 0.5 * camera.resolution;
+    let px_u = length(proj_u.xy * inv_w * half_res);
+    let px_v = length(proj_v.xy * inv_w * half_res);
+    let min_px = min(px_u, px_v);
+
+    // Camera-facing basis for the billboard fallback. world_up = +Y;
+    // breaks at the zenith/nadir singularity, fine for prototype scenes.
+    let view_dir = normalize(world_pos - camera.position);
+    let world_up = vec3<f32>(0.0, 1.0, 0.0);
+    let cam_right = normalize(cross(view_dir, world_up));
+    let cam_up = cross(cam_right, view_dir);
+    // World-space radius that yields ~1 pixel at the disc center's
+    // clip-w. ndc_per_pixel = 2/resolution.x, so world_per_pixel ≈
+    // clip_w * 2 / resolution.x.
+    let billboard_world_radius =
+        max(abs(clip_center.w), 1e-6) * 2.0 / camera.resolution.x;
+
+    let billboard_threshold: f32 = 0.5;
+    let use_billboard = min_px < billboard_threshold;
+    let final_u = select(tangent_u * radius, cam_right * billboard_world_radius, use_billboard);
+    let final_v = select(tangent_v * radius, cam_up * billboard_world_radius, use_billboard);
+
+    let corner_world = world_pos + final_u * uv.x + final_v * uv.y;
     let clip = camera.view_proj * vec4<f32>(corner_world, 1.0);
 
     var out: VsOut;
