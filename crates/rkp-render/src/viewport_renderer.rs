@@ -159,6 +159,23 @@ pub struct ViewportRenderer {
     /// Cached blit `g0` — `depth_view` + `shadow_map.shadow_buffer`.
     pub mesh_shadow_blit_g0_bg: Option<wgpu::BindGroup>,
 
+    // ── Mesh per-cluster LOD-select per-VR state (Phase 6.2/6.3) ───
+    /// Per-draw `MeshLodSelectParams` uniform (16 B). Slot index
+    /// matches `splat_instance_buffers`; one buffer per draw slot.
+    pub mesh_lod_params_buffers: Vec<wgpu::Buffer>,
+    /// Per-draw `DrawIndexedIndirectArgs` storage buffer + capacity
+    /// in cluster slots. Grown to fit the largest cluster count any
+    /// asset draw at this slot has needed. Bound as STORAGE for
+    /// the LOD-select compute and as INDIRECT for the render path.
+    pub mesh_lod_args_buffers: Vec<(wgpu::Buffer, u32)>,
+    /// Per-draw `g0` bind group: (camera, params).
+    pub mesh_lod_select_g0_bgs: Vec<wgpu::BindGroup>,
+    /// Per-draw `g2` bind group: (cluster_table, args). Cached with
+    /// `(asset_handle_raw, args_capacity)` so we rebuild on asset
+    /// change or args resize. `None` until the first dispatch
+    /// populates it; `(handle, cap)` as the freshness key.
+    pub mesh_lod_select_g2_bgs: Vec<Option<(wgpu::BindGroup, u32, u32)>>,
+
     pub width: u32,
     pub height: u32,
 }
@@ -409,6 +426,10 @@ impl ViewportRenderer {
             mesh_shadow_depth_view,
             mesh_shadow_render_g0_bg: None,
             mesh_shadow_blit_g0_bg: None,
+            mesh_lod_params_buffers: Vec::new(),
+            mesh_lod_args_buffers: Vec::new(),
+            mesh_lod_select_g0_bgs: Vec::new(),
+            mesh_lod_select_g2_bgs: Vec::new(),
             width, height,
         }
     }
@@ -520,6 +541,77 @@ impl ViewportRenderer {
             self.splat_instance_buffers.push(buf);
             self.splat_instance_bind_groups.push(bg);
         }
+    }
+
+    /// Ensure per-VR mesh LOD-select state has at least `count` draw
+    /// slots. Each slot owns a 16 B `MeshLodSelectParams` uniform +
+    /// `g0` bind group; the args buffer is allocated lazily on first
+    /// use, sized at the draw's cluster count. Slot index matches
+    /// `splat_instance_buffers`.
+    pub fn ensure_mesh_lod_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        renderer: &crate::rkp_renderer::RkpRenderer,
+        count: u32,
+    ) {
+        use crate::mesh_lod_select_pass::MeshLodSelectParams;
+        let needed = count as usize;
+        while self.mesh_lod_params_buffers.len() < needed {
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mesh_lod_select params"),
+                size: std::mem::size_of::<MeshLodSelectParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bg = renderer
+                .mesh_lod_select_pass
+                .create_g0_bind_group(device, &self.camera_buffer, &buf);
+            self.mesh_lod_params_buffers.push(buf);
+            self.mesh_lod_select_g0_bgs.push(bg);
+            self.mesh_lod_args_buffers.push((
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("mesh_lod_select args (placeholder)"),
+                    size: std::mem::size_of::<crate::mesh_lod_select_pass::DrawIndexedIndirectArgs>()
+                        as u64,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::INDIRECT
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                0,
+            ));
+            self.mesh_lod_select_g2_bgs.push(None);
+        }
+    }
+
+    /// Make sure the args buffer at `slot` has capacity for at least
+    /// `cluster_count` `DrawIndexedIndirectArgs`. Grows the buffer
+    /// to a power-of-two size and invalidates the cached `g2` bind
+    /// group when it does.
+    pub fn ensure_mesh_lod_args_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        slot: u32,
+        cluster_count: u32,
+    ) {
+        use crate::mesh_lod_select_pass::DrawIndexedIndirectArgs;
+        let i = slot as usize;
+        let (_, cap) = self.mesh_lod_args_buffers[i];
+        if cap >= cluster_count {
+            return;
+        }
+        let new_cap = cluster_count.next_power_of_two().max(64);
+        let new_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mesh_lod_select args"),
+            size: (new_cap as u64) * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.mesh_lod_args_buffers[i] = (new_buf, new_cap);
+        // Invalidate cached g2 — it referenced the old args buffer.
+        self.mesh_lod_select_g2_bgs[i] = None;
     }
 
     /// Write one frame's `SplatInstanceUniform` for the given slot.

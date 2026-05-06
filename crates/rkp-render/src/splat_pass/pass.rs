@@ -84,11 +84,15 @@ impl SplatPass {
         });
 
         // ── g1: per-instance uniform ───────────────────────────────
+        // Visibility includes COMPUTE so the same per-VR
+        // `splat_instance_bind_groups` drive both the splat / mesh
+        // render pipelines (vertex+fragment) AND the Phase 6.2
+        // `mesh_lod_select` compute pass — one bind group, one layout.
         let g1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("splat g1"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,

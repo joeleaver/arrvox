@@ -101,6 +101,10 @@ pub struct RkpRenderer {
     /// pivot). Renders the same triangles from the light's POV; per-VR
     /// state (depth texture, g0 bind group) lives in `ViewportRenderer`.
     pub mesh_shadow_map: MeshShadowMapPass,
+    /// Per-cluster LOD-select compute pass (Phase 6.2). Applies the
+    /// Karis admit rule and writes a `DrawIndexedIndirectArgs` table
+    /// the render path consumes via `multi_draw_indexed_indirect`.
+    pub mesh_lod_select_pass: crate::mesh_lod_select_pass::MeshLodSelectPass,
     /// Per-asset vertex/index buffer cache for the mesh path. Same
     /// shape as `splat_buffers`, but each entry carries `(vbo, ibo,
     /// index_count)`. Cleared on `release_mesh_for_asset`.
@@ -180,6 +184,8 @@ impl RkpRenderer {
         let splat_pass = SplatPass::new(device);
         let mesh_pass = MeshPass::new(device, &splat_pass.g0_layout, &splat_pass.g1_layout);
         let mesh_shadow_map = MeshShadowMapPass::new(device, &splat_pass.g1_layout);
+        let mesh_lod_select_pass =
+            crate::mesh_lod_select_pass::MeshLodSelectPass::new(device, &splat_pass.g1_layout);
         let splat_resolve = SplatResolvePass::new(device);
         let primary_mode = PrimaryMode::from_env();
         eprintln!("[RkpRenderer] primary_mode = {primary_mode:?}");
@@ -198,6 +204,7 @@ impl RkpRenderer {
             splat_buffers: Vec::new(),
             mesh_pass,
             mesh_shadow_map,
+            mesh_lod_select_pass,
             mesh_buffers: Vec::new(),
             mesh_shadow_buffers: Vec::new(),
             mesh_cluster_buffers: Vec::new(),
@@ -535,15 +542,16 @@ impl RkpRenderer {
         self.profiler.end_query(encoder, q_resolve);
     }
 
-    /// Surface-mesh equivalent of `dispatch_splat`. Same visibility-
-    /// buffer contract — writes (position, pick, leaf_slot) and depth,
-    /// then runs `splat_resolve` to fill in normal / material / glass.
-    /// Uses the shared splat g0/g1 bind groups (layouts are identical;
-    /// `MeshPass` was constructed against the splat layouts).
+    /// Surface-mesh equivalent of `dispatch_splat`. Phase 6.3:
+    /// per draw, runs the LOD-select compute pass that fills a
+    /// `DrawIndexedIndirectArgs` table for the asset's full DAG of
+    /// clusters; then issues `multi_draw_indexed_indirect` over that
+    /// table. Non-admitted slots carry `index_count = 0` so the no-op
+    /// draws cost nothing.
     ///
-    /// Steps mirror `dispatch_splat` exactly, except step 5 issues an
-    /// indexed draw instead of an instanced quad — vertex layout is
-    /// per-vertex, two triangles per exposed cell face.
+    /// Visibility-buffer contract is unchanged from Phase 1-3 — the
+    /// splat-resolve compute pass still reads (leaf_slot, pick) +
+    /// fills normal / material / glass per pixel.
     pub fn dispatch_mesh(
         &mut self,
         queue: &wgpu::Queue,
@@ -554,9 +562,101 @@ impl RkpRenderer {
         viewport.refresh_splat_g0(&self.device, self);
         viewport.refresh_splat_resolve_bindings(&self.device, self);
         viewport.ensure_splat_instance_capacity(&self.device, self, draws.len() as u32);
+        viewport.ensure_mesh_lod_capacity(&self.device, self, draws.len() as u32);
         for (slot, d) in draws.iter().enumerate() {
             viewport.write_splat_instance(queue, slot as u32, &d.world, d.object_id);
         }
+
+        // Phase 6.3: per-draw LOD-select prep. Resolve each draw's
+        // cluster count + ensure per-slot args buffer + g2 bind
+        // group are sized for it; write the per-slot params uniform.
+        // Skip slots whose asset is unloaded (or has no clusters yet).
+        const PIXEL_THRESHOLD_PRIMARY: f32 = 1.0;
+        let mut slot_active: Vec<bool> = vec![false; draws.len()];
+        for (slot, d) in draws.iter().enumerate() {
+            let Some((_, _, _)) = self.mesh_buffer(d.asset_handle_raw) else {
+                continue;
+            };
+            let Some((cluster_buf, cluster_count)) =
+                self.mesh_cluster_buffer(d.asset_handle_raw)
+            else {
+                continue;
+            };
+            if cluster_count == 0 {
+                continue;
+            }
+            // The cluster buffer is owned by `self` (by raw handle);
+            // bind group creation only needs `&Buffer` references.
+            // Take a local copy of the asset handle so we can release
+            // the shared borrow before mutating viewport state.
+            let asset_handle_raw = d.asset_handle_raw;
+
+            viewport.ensure_mesh_lod_args_capacity(
+                &self.device,
+                slot as u32,
+                cluster_count,
+            );
+
+            // Rebuild g2 bind group if asset changed at this slot or
+            // args buffer was reallocated.
+            let (args_buf, args_cap) = &viewport.mesh_lod_args_buffers[slot];
+            let need_rebuild = match &viewport.mesh_lod_select_g2_bgs[slot] {
+                Some((_, cached_handle, cached_cap)) => {
+                    *cached_handle != asset_handle_raw || *cached_cap != *args_cap
+                }
+                None => true,
+            };
+            if need_rebuild {
+                let bg = self.mesh_lod_select_pass.create_g2_bind_group(
+                    &self.device,
+                    cluster_buf,
+                    args_buf,
+                );
+                viewport.mesh_lod_select_g2_bgs[slot] = Some((bg, asset_handle_raw, *args_cap));
+            }
+
+            // Per-draw uniform — admit threshold + cluster count.
+            let params = crate::mesh_lod_select_pass::MeshLodSelectParams {
+                pixel_threshold: PIXEL_THRESHOLD_PRIMARY,
+                cluster_count,
+                _pad0: 0,
+                _pad1: 0,
+            };
+            queue.write_buffer(
+                &viewport.mesh_lod_params_buffers[slot],
+                0,
+                bytemuck::bytes_of(&params),
+            );
+
+            slot_active[slot] = true;
+        }
+
+        // 0. Per-cluster LOD-select compute pass. One dispatch per
+        //    active draw slot writes that draw's args table.
+        let q_lod = self.profiler.begin_query("mesh_lod_select", encoder);
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("mesh_lod_select"),
+                timestamp_writes: None,
+            });
+            for (slot, d) in draws.iter().enumerate() {
+                if !slot_active[slot] {
+                    continue;
+                }
+                let cluster_count =
+                    self.mesh_cluster_buffer(d.asset_handle_raw).map(|(_, c)| c).unwrap_or(0);
+                let g0 = &viewport.mesh_lod_select_g0_bgs[slot];
+                let g1 = &viewport.splat_instance_bind_groups[slot];
+                let g2 = &viewport
+                    .mesh_lod_select_g2_bgs[slot]
+                    .as_ref()
+                    .expect("g2 set above for active slot")
+                    .0;
+                self.mesh_lod_select_pass
+                    .dispatch(&mut cpass, g0, g1, g2, cluster_count);
+            }
+        }
+        self.profiler.end_query(encoder, q_lod);
 
         // RKP_MESH_STATS=1 prints per-frame mesh stats with a per-asset
         // breakdown, mirroring RKP_SPLAT_STATS.
@@ -609,14 +709,22 @@ impl RkpRenderer {
             rp.set_pipeline(&self.mesh_pass.pipeline);
             rp.set_bind_group(0, g0_bg, &[]);
             for (slot, d) in draws.iter().enumerate() {
-                let Some((vbo, ibo, count)) = self.mesh_buffer(d.asset_handle_raw) else {
+                let Some((vbo, ibo, _)) = self.mesh_buffer(d.asset_handle_raw) else {
                     continue;
                 };
+                if !slot_active[slot] {
+                    continue;
+                }
+                let cluster_count = self
+                    .mesh_cluster_buffer(d.asset_handle_raw)
+                    .map(|(_, c)| c)
+                    .unwrap_or(0);
                 let g1_bg = &viewport.splat_instance_bind_groups[slot];
                 rp.set_bind_group(1, g1_bg, &[]);
                 rp.set_vertex_buffer(0, vbo.slice(..));
                 rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
-                rp.draw_indexed(0..count, 0, 0..1);
+                let (args_buf, _) = &viewport.mesh_lod_args_buffers[slot];
+                rp.multi_draw_indexed_indirect(args_buf, 0, cluster_count);
             }
         }
         self.profiler.end_query(encoder, q_raster);

@@ -43,6 +43,10 @@ pub mod mesh_pass;
 /// into the existing shadow_buffer storage so shade samples it via
 /// the unchanged `sample_shadow_map` path.
 pub mod mesh_shadow_map_pass;
+/// Phase 6.2 LOD-select compute pass — applies the Karis-Nanite admit
+/// rule per cluster and writes a `DrawIndexedIndirectArgs` table that
+/// `multi_draw_indexed_indirect` consumes in `dispatch_mesh`.
+pub mod mesh_lod_select_pass;
 /// Splat-rasterizer compute fixup pass — reads the visibility-buffer
 /// triplet (leaf_slot, pick) `splat_pass` writes and fills in the
 /// remaining G-buffer entries (normal / material / glass) via the

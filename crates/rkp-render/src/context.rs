@@ -132,6 +132,14 @@ impl RenderContext {
                 required_features: wgpu::Features::FLOAT32_FILTERABLE
                     | wgpu::Features::TIMESTAMP_QUERY
                     | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
+                    // Phase 6.2/6.3 note: `multi_draw_indexed_indirect`
+                    // is part of wgpu's core (no feature flag); when
+                    // the adapter lacks `MULTI_DRAW_INDIRECT_COUNT`
+                    // wgpu emulates it as a series of
+                    // `draw_indexed_indirect` calls, which is
+                    // correctness-equivalent. Non-admitted args slots
+                    // carry `index_count = 0` so the no-op draws cost
+                    // nothing on either path.
                 required_limits: wgpu::Limits {
                     max_bind_groups: 8,
                     // Take whatever the adapter offers up to 2 GB. The
