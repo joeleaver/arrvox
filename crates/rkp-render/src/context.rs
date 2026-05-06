@@ -198,6 +198,18 @@ impl RenderContext {
         ))
         .expect("failed to create headless GPU device");
 
+        // Log granted features so a missing one is visible at startup.
+        // Listing only the perf-load-bearing features rather than the
+        // full set keeps the line readable.
+        let features = device.features();
+        eprintln!(
+            "[rkp_context] granted features: multi_draw_indirect_count={} timestamp={} timestamp_inside={} float32_filterable={}",
+            features.contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT),
+            features.contains(wgpu::Features::TIMESTAMP_QUERY),
+            features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
+            features.contains(wgpu::Features::FLOAT32_FILTERABLE),
+        );
+
         device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
             eprintln!("[GPU ERROR] {error}");
         }));
