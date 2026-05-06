@@ -19,8 +19,30 @@
 use crate::rkp_scene::{RkpScene, GeometryUpload, FrameUpload};
 use crate::rkp_shade::{ShadeParams, GpuLight, GpuMaterial};
 use crate::rkp_atmosphere::RkpAtmospherePass;
-use crate::splat_pass::{SplatPass, SplatVertex};
+use crate::splat_pass::{SplatDraw, SplatPass, SplatVertex};
 use wgpu_profiler::GpuProfiler;
+
+/// Primary-visibility selector. Set by the `RKP_PRIMARY` env var at
+/// `RkpRenderer` construction. `Splat` swaps the compute octree-march
+/// for the splat raster path inside `render_to`; `March` keeps the
+/// existing behaviour. The selector is read once at startup so per-
+/// frame env reads don't show up in profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryMode {
+    March,
+    Splat,
+}
+
+impl PrimaryMode {
+    /// Read `RKP_PRIMARY`. `splat` (case-insensitive) selects splat;
+    /// anything else (including unset) keeps the existing march path.
+    fn from_env() -> Self {
+        match std::env::var("RKP_PRIMARY").as_deref() {
+            Ok(s) if s.eq_ignore_ascii_case("splat") => PrimaryMode::Splat,
+            _ => PrimaryMode::March,
+        }
+    }
+}
 
 /// The RKIPatch renderer — shared state only. Per-viewport passes live
 /// in [`ViewportRenderer`].
@@ -59,6 +81,10 @@ pub struct RkpRenderer {
     /// been uploaded, `None` otherwise. Grows as new assets are
     /// loaded; entries are cleared on `release_splats_for_asset`.
     splat_buffers: Vec<Option<(wgpu::Buffer, u32)>>,
+    /// Primary-visibility selector — `March` (compute octree march)
+    /// or `Splat` (rasterized surface splats). Read from the
+    /// `RKP_PRIMARY` env var at construction. See [`PrimaryMode`].
+    pub primary_mode: PrimaryMode,
     /// Device for buffer operations.
     pub device: wgpu::Device,
     /// GPU profiler (wgpu-profiler).
@@ -116,6 +142,8 @@ impl RkpRenderer {
 
         let skin_deform = crate::skin_deform::SkinDeformPass::new(device, &scene);
         let splat_pass = SplatPass::new(device);
+        let primary_mode = PrimaryMode::from_env();
+        eprintln!("[RkpRenderer] primary_mode = {primary_mode:?}");
 
         let lights_capacity = lights_buffer.size();
         let materials_capacity = materials_buffer.size();
@@ -128,6 +156,7 @@ impl RkpRenderer {
             skin_deform,
             splat_pass,
             splat_buffers: Vec::new(),
+            primary_mode,
             device: device.clone(),
             profiler, timestamp_period,
         }
@@ -172,6 +201,67 @@ impl RkpRenderer {
             .get(handle_raw as usize)
             .and_then(|s| s.as_ref())
             .map(|(b, c)| (b, *c))
+    }
+
+    /// Splat-raster equivalent of `OctreeMarchPass::dispatch`. Writes
+    /// the same G-buffer the compute march writes, so the downstream
+    /// shade / SSAO / etc passes are unchanged.
+    ///
+    /// Steps:
+    ///   1. Refresh the per-VR `g0` bind group (if scene buffers /
+    ///      lights+materials moved).
+    ///   2. Grow per-instance uniform slots to `draws.len()`.
+    ///   3. Write each `SplatDraw`'s world matrix + object_id into its
+    ///      slot via `queue.write_buffer`.
+    ///   4. Begin the splat render pass (clears all six gbuffer
+    ///      targets to march-equivalent miss sentinels).
+    ///   5. For each draw with a cached vertex buffer, bind the slot's
+    ///      g1 + the asset's vbo and `pass.draw(0..4, 0..count)`.
+    ///
+    /// Draws with no cached vertex buffer (asset not yet uploaded) are
+    /// silently skipped — they'll show through as the "miss" clear,
+    /// matching how the march path handles missing assets.
+    pub fn dispatch_splat(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        viewport: &mut crate::viewport_renderer::ViewportRenderer,
+        draws: &[SplatDraw],
+        timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
+        viewport.refresh_splat_g0(&self.device, self);
+        viewport.ensure_splat_instance_capacity(&self.device, self, draws.len() as u32);
+        for (slot, d) in draws.iter().enumerate() {
+            viewport.write_splat_instance(queue, slot as u32, &d.world, d.object_id);
+        }
+
+        let g0_bg = viewport
+            .splat_g0_bg
+            .as_ref()
+            .expect("splat g0 bg present after refresh_splat_g0");
+
+        let mut rp = self.splat_pass.begin_pass(
+            encoder,
+            &viewport.gbuffer.position_view,
+            &viewport.gbuffer.normal_view,
+            &viewport.gbuffer.material_view,
+            &viewport.pick_view,
+            &viewport.gbuffer.glass_view,
+            &viewport.gbuffer.leaf_slot_view,
+            &viewport.gbuffer.depth_view,
+            timestamp_writes,
+        );
+        rp.set_pipeline(&self.splat_pass.pipeline);
+        rp.set_bind_group(0, g0_bg, &[]);
+        for (slot, d) in draws.iter().enumerate() {
+            let Some((vbo, count)) = self.splat_buffer(d.asset_handle_raw) else {
+                continue;
+            };
+            let g1_bg = &viewport.splat_instance_bind_groups[slot];
+            rp.set_bind_group(1, g1_bg, &[]);
+            rp.set_vertex_buffer(0, vbo.slice(..));
+            rp.draw(0..4, 0..count);
+        }
     }
 
     /// Current lights/materials epoch — ViewportRenderers compare against
@@ -299,9 +389,16 @@ impl RkpRenderer {
         atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
         mode: crate::RenderMode,
         preview_mode: crate::BuildPreviewMode,
+        // Phase B-2 — splat-raster instance list. Used only when
+        // `self.primary_mode == PrimaryMode::Splat`; the march path
+        // ignores it. One entry per visible scene-instance whose asset
+        // has splat data (i.e. came from `acquire_asset`); procedural
+        // objects without splats are skipped client-side.
+        splat_draws: &[SplatDraw],
     ) {
         let in_situ = matches!(mode, crate::RenderMode::InSitu);
         let raymarch = matches!(preview_mode, crate::BuildPreviewMode::Raymarch);
+        let splat = self.primary_mode == PrimaryMode::Splat;
 
         // Upload per-viewport tile-cull data. The per-object screen
         // AABBs feed the CPU-side tile-list builder; only the built
@@ -318,19 +415,25 @@ impl RkpRenderer {
             self.profiler.end_query(encoder, q);
         }
 
-        // 1. Primary visibility → G-buffer. Voxel march *or* procedural
-        //    raymarch, never both — each fully populates the G-buffer
-        //    (including writing "miss" at non-hit pixels), so the one
-        //    that doesn't run would just be overwriting. Shadow_trace
-        //    is skipped in raymarch mode because the procedural preview
-        //    doesn't have the world-space voxel grid that pass needs;
-        //    isolation mode already forces shadow=1.0 inside shade,
-        //    which is what we want for the clean preview look anyway.
+        // 1. Primary visibility → G-buffer. Three mutually-exclusive
+        //    paths: procedural raymarch (build viewport), splat raster
+        //    (Phase B-2 A/B path, gated on `RKP_PRIMARY=splat`), or
+        //    voxel march (default). Each fully populates the G-buffer
+        //    including miss sentinels at non-hit pixels, so downstream
+        //    passes are unaware of which path ran.
+        //    Shadow_trace is skipped in raymarch mode because the
+        //    procedural preview doesn't have the world-space voxel
+        //    grid that pass needs; isolation mode already forces
+        //    shadow=1.0 inside shade.
         if raymarch {
             let q = self.profiler.begin_query("proc_raymarch", encoder);
             viewport.proc_raymarch.dispatch(
                 encoder, viewport.width, viewport.height, None,
             );
+            self.profiler.end_query(encoder, q);
+        } else if splat {
+            let q = self.profiler.begin_query("splat", encoder);
+            self.dispatch_splat(queue, encoder, viewport, splat_draws, None);
             self.profiler.end_query(encoder, q);
         } else {
             viewport.march.clear_stats(encoder);
@@ -347,7 +450,12 @@ impl RkpRenderer {
 
         // 1b. Half-res shadow trace. Skipped in isolation — the shade
         // pass forces shadow=1.0 there. Uses march's params bind group.
-        if in_situ && !raymarch {
+        // Splat path skips this for the Phase B-2 prototype: the shadow
+        // trace expects the world-space voxel grid + march's params bg
+        // that the splat path doesn't provide. Splat A/B comparisons
+        // therefore render shadow=1.0; document this when interpreting
+        // visual diffs.
+        if in_situ && !raymarch && !splat {
             if let Some(params_bg) = viewport.march.params_bind_group() {
                 let q = self.profiler.begin_query("shadow", encoder);
                 viewport.shadow_trace.dispatch(encoder, &viewport.scene_bind_group, params_bg);
@@ -362,7 +470,7 @@ impl RkpRenderer {
         // pass reads the resulting depth texture for directional
         // visibility; non-directional lights still pull from the
         // half-res shadow_trace output.
-        if in_situ && !raymarch && shadow_map_enabled {
+        if in_situ && !raymarch && !splat && shadow_map_enabled {
             let q = self.profiler.begin_query("shadow_map", encoder);
             viewport.shadow_map.dispatch_clear(encoder);
             viewport.shadow_map.dispatch_setup(
@@ -375,7 +483,7 @@ impl RkpRenderer {
             );
             self.profiler.end_query(encoder, q);
         }
-        if !raymarch {
+        if !raymarch && !splat {
             viewport.march.copy_stats(encoder);
         }
 

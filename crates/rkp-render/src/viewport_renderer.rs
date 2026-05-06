@@ -15,6 +15,7 @@
 
 use crate::rkp_renderer::RkpRenderer;
 use crate::rkp_scene::{CameraUniforms, RkpScene};
+use crate::splat_pass::{SplatInstanceUniform, SPLAT_INSTANCE_BYTES};
 use crate::octree_march::OctreeMarchPass;
 use crate::proc_raymarch::ProcRaymarchPass;
 use crate::proc_outline::ProcOutlinePass;
@@ -112,6 +113,29 @@ pub struct ViewportRenderer {
     /// Isolation-mode infinite grid overlay. Always constructed; the
     /// host only dispatches it when the viewport's mode is `Isolation`.
     pub grid: RkpGridPass,
+
+    // ── Splat-rasterizer per-VR state (Phase B-2) ───────────────────
+    /// Scene-wide bind group for the splat path: camera + leaf_attr_pool
+    /// + materials + color_pool. Built lazily on first `dispatch_splat`
+    /// and rebuilt whenever the scene-buffers or lights/materials epoch
+    /// bumps (same triggers as the existing march bindings).
+    pub splat_g0_bg: Option<wgpu::BindGroup>,
+    /// Epoch the splat g0 bg was last built against — combination of
+    /// scene_buffers_epoch and lights_materials_epoch. Stored separately
+    /// from the march's `scene_epoch`/`lights_materials_epoch` because
+    /// the splat g0 has a different shape (no objects buffer, no bone
+    /// data, but adds materials + color_pool).
+    pub splat_g0_scene_epoch: u64,
+    pub splat_g0_lights_materials_epoch: u64,
+    /// Per-instance uniform buffers (80 B each) — one slot per scene
+    /// instance the splat path will draw this frame. Grown on demand
+    /// by `ensure_splat_instance_capacity`. Reused frame to frame; the
+    /// engine writes the current frame's matrices via `write_splat_instance`
+    /// before calling `dispatch_splat`.
+    pub splat_instance_buffers: Vec<wgpu::Buffer>,
+    /// Bind groups paired one-to-one with `splat_instance_buffers`.
+    pub splat_instance_bind_groups: Vec<wgpu::BindGroup>,
+
     pub width: u32,
     pub height: u32,
 }
@@ -326,8 +350,88 @@ impl ViewportRenderer {
             gbuffer, pick_texture, pick_view, bloom, bloom_composite, tone_map,
             composite_texture, composite_view,
             readback,
-            wireframe_pass, grid, width, height,
+            wireframe_pass, grid,
+            splat_g0_bg: None,
+            splat_g0_scene_epoch: u64::MAX,
+            splat_g0_lights_materials_epoch: u64::MAX,
+            splat_instance_buffers: Vec::new(),
+            splat_instance_bind_groups: Vec::new(),
+            width, height,
         }
+    }
+
+    /// Rebuild the splat scene-wide (`g0`) bind group when its referenced
+    /// buffers may have moved. Cheap when no rebuild is needed (one
+    /// epoch comparison). Caller invokes once before `dispatch_splat`.
+    pub fn refresh_splat_g0(&mut self, device: &wgpu::Device, renderer: &RkpRenderer) {
+        let scene_now = renderer.scene.buffers_epoch();
+        let lm_now = renderer.lights_materials_epoch();
+        if self.splat_g0_bg.is_some()
+            && self.splat_g0_scene_epoch == scene_now
+            && self.splat_g0_lights_materials_epoch == lm_now
+        {
+            return;
+        }
+        self.splat_g0_bg = Some(renderer.splat_pass.create_g0_bind_group(
+            device,
+            &self.camera_buffer,
+            &renderer.scene.leaf_attr_pool_buffer,
+            &renderer.materials_buffer,
+            &renderer.scene.color_pool_buffer,
+        ));
+        self.splat_g0_scene_epoch = scene_now;
+        self.splat_g0_lights_materials_epoch = lm_now;
+    }
+
+    /// Grow `splat_instance_buffers` + `splat_instance_bind_groups` to
+    /// at least `count` slots. Slots are reused across frames; the
+    /// engine writes the current frame's matrices via
+    /// [`Self::write_splat_instance`] before [`RkpRenderer::dispatch_splat`].
+    ///
+    /// Each slot is an 80 B uniform buffer holding one
+    /// `SplatInstanceUniform` (mat4 world + object_id + 12 B pad).
+    pub fn ensure_splat_instance_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        renderer: &RkpRenderer,
+        count: u32,
+    ) {
+        let needed = count as usize;
+        while self.splat_instance_buffers.len() < needed {
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("splat instance uniform"),
+                size: SPLAT_INSTANCE_BYTES,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bg = renderer.splat_pass.create_g1_bind_group(device, &buf);
+            self.splat_instance_buffers.push(buf);
+            self.splat_instance_bind_groups.push(bg);
+        }
+    }
+
+    /// Write one frame's `SplatInstanceUniform` for the given slot.
+    /// Caller must have already extended the slot vector via
+    /// `ensure_splat_instance_capacity`.
+    pub fn write_splat_instance(
+        &self,
+        queue: &wgpu::Queue,
+        slot: u32,
+        world: &[[f32; 4]; 4],
+        object_id: u32,
+    ) {
+        let uniform = SplatInstanceUniform {
+            world: *world,
+            object_id,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        queue.write_buffer(
+            &self.splat_instance_buffers[slot as usize],
+            0,
+            bytemuck::bytes_of(&uniform),
+        );
     }
 
     /// Reset per-tile counts to 0. Call BEFORE the tile-bin dispatch
@@ -723,9 +827,14 @@ fn create_pick_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::R32Uint,
+        // RENDER_ATTACHMENT for the splat raster path (splat.wesl writes
+        // pick at @location(3)). Compute march writes via STORAGE_BINDING
+        // — both bits live here so the same texture is reachable from
+        // either pipeline without reallocating.
         usage: wgpu::TextureUsages::STORAGE_BINDING
             | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_SRC,
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
     let view = tex.create_view(&Default::default());

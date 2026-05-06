@@ -18,3 +18,19 @@ pub use extract::{
     extract_splats, extract_splats_with_radius, SplatVertex, DISC_RADIUS_FACTOR,
 };
 pub use pass::{SplatInstanceUniform, SplatPass, SPLAT_INSTANCE_BYTES};
+
+/// One scene-instance to render in this frame's splat dispatch. The
+/// engine populates a `Vec<SplatDraw>` per visible viewport when the
+/// primary path is `Splat`, and passes it through to `RkpRenderer::render_to`.
+///
+/// `asset_handle_raw` is the `AssetHandle::raw()` of the asset to draw —
+/// used to look up the per-asset vertex buffer in
+/// `RkpRenderer::splat_buffer`. `world` is the instance's world
+/// transform; `object_id` lands in the pick texture so picking works
+/// the same as the march path.
+#[derive(Debug, Clone, Copy)]
+pub struct SplatDraw {
+    pub asset_handle_raw: u32,
+    pub world: [[f32; 4]; 4],
+    pub object_id: u32,
+}
