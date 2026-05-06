@@ -42,15 +42,16 @@ use super::extract::MeshVertex;
 /// to). Construction may stop early if a level's simplification
 /// makes no progress or only one cluster remains.
 ///
-/// **Default still `1`** until Phase 6.5 measures the elephant
-/// scene with the full perf fix in place — the per-group
-/// simplify path now (a) builds a compact local VBO + lock
-/// array bounded by the group's unique-vertex count instead of
-/// the asset's, and (b) runs across rayon. Once a real-asset
-/// load comes in under target this flips to 4. Set
-/// `RKP_MESH_LOD_LEVELS=4` (or any value 1..=4) at runtime to
-/// opt into the full DAG today.
-pub const LOD_LEVELS: usize = 1;
+/// `4` since the per-group simplify perf fix landed (compact
+/// local VBO + lock array, rayon across groups). Real-asset load
+/// numbers post-fix: elephant 51K LOD-0 clusters ⇒ ~8s DAG build,
+/// box_8 46K ⇒ ~7s, bunny 26K ⇒ ~2.6s; everything below 15K
+/// clusters builds in well under a second. Multi-asset scenes
+/// can still spend tens of seconds in DAG build at editor open
+/// — bake-at-import (`project_dag_bake_at_import.md`) is the
+/// proper fix once Phase 6.5 freezes the DAG params. Set
+/// `RKP_MESH_LOD_LEVELS=1..=4` at runtime to override.
+pub const LOD_LEVELS: usize = 4;
 
 /// Hard cap on `lod_levels` — selection-rule + per-cluster fields
 /// can scale up if needed, but `>4` levels has rarely been worth it
