@@ -35,6 +35,10 @@ pub struct AssetHandle(u32);
 
 impl AssetHandle {
     pub fn raw(self) -> u32 { self.0 }
+    /// Build an `AssetHandle` from its raw u32 representation.
+    /// Internal-only — used by `iter_loaded_asset_splats` to surface
+    /// handles without exposing the private constructor.
+    pub(super) fn from_raw(raw: u32) -> Self { AssetHandle(raw) }
 }
 
 /// Everything a scene instance needs to render an asset. Returned from

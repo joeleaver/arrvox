@@ -32,6 +32,7 @@ impl EngineState {
         self.gpu_assets.clear();
         self.gpu_instances.clear();
         self.gpu_instance_overlays.clear();
+        self.splat_draws.clear();
         self.gpu_to_entity.clear();
         self.entity_to_gpu.clear();
         // Per-frame asset table — `octree_root` → index into
@@ -239,6 +240,22 @@ impl EngineState {
                 self.entity_to_gpu.insert(entity, self.gpu_instances.len());
                 self.gpu_to_entity.push(entity);
                 self.gpu_instances.push(inst);
+
+                // Splat-rasterizer per-instance draw record. Only
+                // `Renderable` entities with an `asset_handle` (i.e.
+                // loaded `.rkp` assets, not procedurals) make it into
+                // the splat path — procedurals don't have splat data
+                // extracted today. Built every frame because world
+                // transforms can change per-tick; the engine ships
+                // this list to the render thread alongside the
+                // existing `gpu_instances`.
+                if let Some(handle) = renderable.asset_handle {
+                    self.splat_draws.push(rkp_render::splat_pass::SplatDraw {
+                        asset_handle_raw: handle.raw(),
+                        world: world_matrix.to_cols_array_2d(),
+                        object_id: gpu_idx,
+                    });
+                }
             }
         }
 

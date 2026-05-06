@@ -253,11 +253,12 @@ pub(super) fn encode_viewports(
             &vp.atmo_frame,
             vp.mode,
             vp.preview_mode,
-            // Phase B-2 — splat-raster instance list. Empty until step
-            // 5 walks the visible-instance set and populates this; the
-            // splat path then renders an all-miss frame, which is fine
-            // for verifying the pipeline plumbing.
-            &[],
+            // Phase B-2 — splat-raster instance list. Built in
+            // `update_scene_gpu` from `Renderable.asset_handle`; the
+            // march path ignores it. Procedural entities without an
+            // `AssetHandle` don't appear here and won't render under
+            // `RKP_PRIMARY=splat`.
+            &frame.splat_draws,
         );
 
         // 3i. Pick encode — if there's a pending pick targeted at this

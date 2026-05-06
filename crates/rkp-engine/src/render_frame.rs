@@ -78,6 +78,14 @@ pub struct RenderFrame {
     /// uses its `overlay_offset` + `overlay_count` to slice into this
     /// vec. Empty when no entity has been painted.
     pub gpu_instance_overlays: Vec<OverlayEntry>,
+    /// Splat-rasterizer per-instance draws. One entry per visible
+    /// `Renderable` whose asset_handle is `Some(_)` — i.e. the entity
+    /// references a loaded `.rkp` asset whose splat data has been
+    /// extracted at load time. Procedural objects without an
+    /// `AssetHandle` are not represented here and won't render under
+    /// `RKP_PRIMARY=splat` (logged as known limitation; they need their
+    /// own splat-extraction path later).
+    pub splat_draws: Vec<rkp_render::splat_pass::SplatDraw>,
     pub gpu_objects_dirty: bool,
 
     /// Monotonic counter from `scene_mgr.geometry_epoch()`. Render

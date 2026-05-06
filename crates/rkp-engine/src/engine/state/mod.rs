@@ -322,6 +322,12 @@ pub(crate) struct EngineState {
     /// in `update_scene_gpu` from the per-entity `paint_overlays` map;
     /// shipped each tick to the render thread for upload.
     pub(crate) gpu_instance_overlays: Vec<rkp_core::OverlayEntry>,
+    /// Splat-rasterizer per-instance draws. One entry per `Renderable`
+    /// entity whose asset_handle is `Some(_)`. Built alongside
+    /// `gpu_instances` in `update_scene_gpu`. Used only when the
+    /// renderer's primary mode is `Splat` (RKP_PRIMARY=splat); the
+    /// march path ignores it.
+    pub(crate) splat_draws: Vec<rkp_render::splat_pass::SplatDraw>,
     /// Maps gpu_instance index → hecs Entity (for pick resolution).
     pub(crate) gpu_to_entity: Vec<hecs::Entity>,
     /// Maps hecs Entity → gpu_instance index.

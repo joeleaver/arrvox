@@ -153,6 +153,15 @@ pub(super) fn run_pre_frame(
         let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
         let geo = sm.geometry_upload();
         state.renderer.upload_geometry(&state.queue, &geo);
+        // Phase B-2 — keep the splat-raster per-asset vertex-buffer
+        // cache in step with the loaded asset set. Re-upload all of
+        // them on every geometry-epoch bump rather than tracking which
+        // assets actually changed; matches the upload_geometry "build
+        // everything from scratch" pattern, and the cost is bounded by
+        // total splat count (rare, off-the-hot-path).
+        for (handle, splats) in sm.iter_loaded_asset_splats() {
+            state.renderer.upload_splats_for_asset(handle.raw(), splats);
+        }
         // Read-back the epoch *under the same lock* so concurrent
         // mutations (bake worker integrating an artifact mid-frame)
         // don't trick us into thinking we're caught up when we're

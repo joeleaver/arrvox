@@ -499,4 +499,27 @@ impl RkpSceneManager {
     ) -> Option<&[crate::splat_pass::SplatVertex]> {
         Some(self.asset_cache.get(handle)?.splats.as_slice())
     }
+
+    /// Iterator over `(AssetHandle, &[SplatVertex])` for every loaded
+    /// asset. Used by the render thread to keep the per-asset GPU
+    /// vertex-buffer cache in sync with the CPU-side asset cache —
+    /// called once per geometry epoch after `upload_geometry`.
+    ///
+    /// Skips empty splat lists (procedural assets, future-proof) so
+    /// the caller's upload loop only touches assets that need it.
+    pub fn iter_loaded_asset_splats(
+        &self,
+    ) -> impl Iterator<Item = (AssetHandle, &[crate::splat_pass::SplatVertex])> {
+        self.asset_cache
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| {
+                let entry = slot.as_ref()?;
+                if entry.splats.is_empty() {
+                    return None;
+                }
+                Some((AssetHandle::from_raw(idx as u32), entry.splats.as_slice()))
+            })
+    }
 }
