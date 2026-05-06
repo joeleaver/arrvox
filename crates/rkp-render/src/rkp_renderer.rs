@@ -51,6 +51,18 @@ impl PrimaryMode {
     }
 }
 
+/// Read a positive finite f32 from the named env var; fall back to
+/// `default` if the var is unset, unparseable, or non-positive. Used
+/// for the LOD `pixel_threshold` knobs so we can tune without
+/// recompiling.
+fn pixel_threshold_env(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(default)
+}
+
 /// The RKIPatch renderer — shared state only. Per-viewport passes live
 /// in [`ViewportRenderer`].
 pub struct RkpRenderer {
@@ -513,7 +525,16 @@ impl RkpRenderer {
         // cluster count + ensure per-slot args buffer + g2 bind
         // group are sized for it; write the per-slot params uniform.
         // Skip slots whose asset is unloaded (or has no clusters yet).
+        //
+        // `RKP_MESH_LOD_THRESHOLD` overrides the compile-time default
+        // for LOD-effectiveness tuning experiments. Higher = more
+        // aggressive LOD culling (fewer fine clusters admit).
         const PIXEL_THRESHOLD_PRIMARY: f32 = 1.0;
+        let pixel_threshold_primary = pixel_threshold_env(
+            "RKP_MESH_LOD_THRESHOLD",
+            PIXEL_THRESHOLD_PRIMARY,
+        );
+        let lod_stats_enabled = std::env::var("RKP_MESH_LOD_STATS").is_ok();
         let force_admit_flag: u32 = if std::env::var("RKP_MESH_DEBUG_FORCE_ADMIT").is_ok() {
             1
         } else {
@@ -558,16 +579,17 @@ impl RkpRenderer {
                     &self.device,
                     cluster_buf,
                     args_buf,
+                    &viewport.mesh_lod_admit_stats_primary,
                 );
                 viewport.mesh_lod_select_g2_bgs[slot] = Some((bg, asset_handle_raw, *args_cap));
             }
 
             // Per-draw uniform — admit threshold + cluster count.
             let params = crate::mesh_lod_select_pass::MeshLodSelectParams {
-                pixel_threshold: PIXEL_THRESHOLD_PRIMARY,
+                pixel_threshold: pixel_threshold_primary,
                 cluster_count,
                 force_admit: force_admit_flag,
-                _pad: 0,
+                record_stats: lod_stats_enabled as u32,
             };
             queue.write_buffer(
                 &viewport.mesh_lod_params_buffers[slot],
@@ -590,6 +612,16 @@ impl RkpRenderer {
         // 0. Per-cluster LOD-select compute pass. One dispatch per
         //    active draw slot writes that draw's args table.
         if !direct_mode {
+            // Stats lifecycle (RKP_MESH_LOD_STATS=1 only):
+            // (a) drain previous frame's mapped buffer if ready
+            // (b) clear the histogram for this frame's atomics
+            // (c) dispatch — atomics fire iff record_stats != 0
+            // (d) copy histogram → staging + map_async for next frame
+            if lod_stats_enabled {
+                viewport.lod_stats_drain_primary("primary");
+                viewport.lod_stats_clear_primary(encoder);
+            }
+
             let q_lod = self.profiler.begin_query("mesh_lod_select", encoder);
             {
                 let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -616,6 +648,10 @@ impl RkpRenderer {
                 }
             }
             self.profiler.end_query(encoder, q_lod);
+
+            if lod_stats_enabled {
+                viewport.lod_stats_finalize_primary(encoder);
+            }
         }
 
         // RKP_MESH_STATS=1 prints per-frame mesh stats with a per-asset
@@ -780,7 +816,15 @@ impl RkpRenderer {
         // the primary path in `dispatch_mesh`, but with a doubled
         // pixel threshold so the Karis admit rule effectively picks
         // `lod + 1` from the same chain that primary uses.
+        //
+        // `RKP_MESH_SHADOW_LOD_THRESHOLD` overrides the compile-time
+        // default. Mirrors `RKP_MESH_LOD_THRESHOLD` for the primary path.
         const PIXEL_THRESHOLD_SHADOW: f32 = 2.0;
+        let pixel_threshold_shadow = pixel_threshold_env(
+            "RKP_MESH_SHADOW_LOD_THRESHOLD",
+            PIXEL_THRESHOLD_SHADOW,
+        );
+        let lod_stats_enabled = std::env::var("RKP_MESH_LOD_STATS").is_ok();
         let mut slot_active: Vec<bool> = vec![false; draws.len()];
         for (slot, d) in draws.iter().enumerate() {
             if self.mesh_buffer(d.asset_handle_raw).is_none() {
@@ -814,19 +858,20 @@ impl RkpRenderer {
                     &self.device,
                     cluster_buf,
                     args_buf,
+                    &viewport.mesh_lod_admit_stats_shadow,
                 );
                 viewport.mesh_lod_shadow_g2_bgs[slot] = Some((bg, asset_handle_raw, *args_cap));
             }
 
             let params = crate::mesh_lod_select_pass::MeshLodSelectParams {
-                pixel_threshold: PIXEL_THRESHOLD_SHADOW,
+                pixel_threshold: pixel_threshold_shadow,
                 cluster_count,
                 force_admit: if std::env::var("RKP_MESH_DEBUG_FORCE_ADMIT").is_ok() {
                     1
                 } else {
                     0
                 },
-                _pad: 0,
+                record_stats: lod_stats_enabled as u32,
             };
             queue.write_buffer(
                 &viewport.mesh_lod_shadow_params_buffers[slot],
@@ -839,6 +884,11 @@ impl RkpRenderer {
 
         // 0. Shadow-side LOD-select compute pass.
         if !direct_mode {
+            if lod_stats_enabled {
+                viewport.lod_stats_drain_shadow("shadow");
+                viewport.lod_stats_clear_shadow(encoder);
+            }
+
             let q_lod = self.profiler.begin_query("mesh_shadow_lod_select", encoder);
             {
                 let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -865,6 +915,10 @@ impl RkpRenderer {
                 }
             }
             self.profiler.end_query(encoder, q_lod);
+
+            if lod_stats_enabled {
+                viewport.lod_stats_finalize_shadow(encoder);
+            }
         }
 
         // 1. Depth-only render. Vertex transforms through light_camera
