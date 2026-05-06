@@ -118,6 +118,18 @@ impl RenderContext {
     pub fn new_headless() -> Self {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12,
+            // `InstanceFlags::empty()` overrides wgpu's
+            // `from_build_config()` default. That default is
+            // `VALIDATION_INDIRECT_CALL` even in release builds
+            // (wgpu-types/src/instance.rs:253-264), which gates
+            // wgpu-core's per-indirect-draw validation pass
+            // (wgpu-core/src/device/resource.rs:502-507). With
+            // Phase 6 mesh-mode issuing ~1.16M cluster draws per
+            // frame on real scenes, that validation pass is the
+            // sole reason the encode CPU phase ran at ~62ms vs
+            // the ~0.7ms of `RKP_MESH_DEBUG_DIRECT=1`. Bisected
+            // 2026-05-06 against the splat5 elephant scene.
+            flags: wgpu::InstanceFlags::empty(),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
