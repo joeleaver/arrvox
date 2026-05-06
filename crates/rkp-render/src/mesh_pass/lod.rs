@@ -213,10 +213,27 @@ pub fn build_cluster_dag_with_levels(
             })
             .collect();
 
+        // Stats for the diagnostic log: how many groups produced
+        // simplified output, how many bailed (degenerate input or
+        // simplify_with_locks unable to reduce), and the cluster_error
+        // distribution at the new level. If most groups bail, the
+        // simplifier is being blocked by group-boundary locks (the
+        // new sub-clusters' input tris are mostly locked verts) —
+        // which means the DAG mostly stalls and the LOD-select admit
+        // rule keeps prev-level (or LOD-0) clusters as DAG leaves.
+        // High-impact stat for "is LOD doing real work?".
+        let groups_count = groups.len();
+        let skipped_groups = results.iter().filter(|r| r.skipped).count();
+        let mut consumed_prev: usize = 0;
+        let mut new_cluster_errors: Vec<f32> = Vec::new();
+
         for result in results {
             if result.skipped {
                 continue;
             }
+            consumed_prev += result.consumed_global_ids.len();
+            new_cluster_errors.extend(result.sub_clusters.iter().map(|c| c.cluster_error));
+
             let sub_index_base = all_indices.len() as u32;
             all_indices.extend(result.sub_indices);
             for mut sc in result.sub_clusters {
@@ -239,11 +256,26 @@ pub fn build_cluster_dag_with_levels(
             // had < 3 input tris). Stop.
             break;
         }
+        let prev_count = prev_indices.len();
+        let consumed_pct = if prev_count == 0 {
+            0.0
+        } else {
+            100.0 * consumed_prev as f32 / prev_count as f32
+        };
+        let (err_p50, err_p95) = percentiles_p50_p95(&mut new_cluster_errors);
         eprintln!(
-            "[lod] LOD {}: {} clusters from {} groups ({:.2}s)",
+            "[lod] LOD {}: {} clusters from {} groups ({} ok, {} skip); \
+             consumed {}/{} prev-level ({:.1}%); cluster_error p50={:.4} p95={:.4} ({:.2}s)",
             lod,
             new_level_end - new_level_start,
-            groups.len(),
+            groups_count,
+            groups_count - skipped_groups,
+            skipped_groups,
+            consumed_prev,
+            prev_count,
+            consumed_pct,
+            err_p50,
+            err_p95,
             lod_t0.elapsed().as_secs_f32(),
         );
         prev_level_range = new_level_start..new_level_end;
@@ -538,6 +570,22 @@ fn build_local_simplify_inputs(
     }
 
     (local_verts, local_tris, local_locks, local_to_global)
+}
+
+/// p50 + p95 of a `Vec<f32>` (used for the per-LOD `cluster_error`
+/// distribution in the diagnostic log). Sorts the vec in place;
+/// returns `(0.0, 0.0)` for empty input. Total-order sort via
+/// `f32::total_cmp` so NaNs sort consistently rather than
+/// pessimising the partial-cmp into a panic.
+fn percentiles_p50_p95(v: &mut Vec<f32>) -> (f32, f32) {
+    if v.is_empty() {
+        return (0.0, 0.0);
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    let n = v.len();
+    let p50 = v[n / 2];
+    let p95 = v[(n * 95 / 100).min(n - 1)];
+    (p50, p95)
 }
 
 /// Thin wrapper around `meshopt::simplify_with_locks`. Pulled out
