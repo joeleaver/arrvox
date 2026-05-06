@@ -100,6 +100,18 @@ pub(super) struct AssetEntry {
     /// section. Phase-3 scatter pass reads this to drive the per-frame
     /// bone-field write.
     pub(super) skinning: Option<SkinningAssetData>,
+    /// Flattened surface-voxel data for the splat-rasterizer path. One
+    /// entry per non-empty, non-interior cell, in **object-local**
+    /// coordinates (per-instance world is applied in the splat vertex
+    /// shader). Shared across every scene-instance of this asset; the
+    /// render side uploads it to a GPU vertex buffer once per geometry
+    /// epoch via `RkpRenderer::upload_splats_for_asset`.
+    ///
+    /// ~32 B per cell. A 2.5 M-cell asset (elephant) carries ~80 MB
+    /// resident on the CPU; future optimization may release the Vec
+    /// after the GPU buffer is built, but for now we keep it so re-
+    /// extraction isn't needed when the GPU side reallocates.
+    pub(super) splats: Vec<crate::splat_pass::SplatVertex>,
 }
 
 impl AssetEntry {

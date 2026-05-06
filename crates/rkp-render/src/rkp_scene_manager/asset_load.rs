@@ -15,6 +15,7 @@ use super::manager::RkpSceneManager;
 use super::types::{
     AssetEntry, AssetHandle, AssetInfo, ReloadResult, SkinBrick, SkinningAssetData,
 };
+use crate::splat_pass::extract_splats;
 
 impl RkpSceneManager {
     fn resolve_rkp_path(path: &str) -> Result<PathBuf, String> {
@@ -393,6 +394,29 @@ impl RkpSceneManager {
         let final_leaf_attr_slot_count =
             self.leaf_attr_pool.allocated_count() - leaf_attr_slot_start;
 
+        // Splat extraction — flatten the surface into one
+        // `SplatVertex` per occupied cell, in object-local coordinates.
+        // The render side uploads this to a per-asset GPU vertex buffer
+        // and rasterizes it as oriented disc splats when the editor's
+        // primary-visibility path is set to splats. Tree nodes are
+        // already in their final compacted/morton form here, and brick
+        // ids have been remapped to scene-global; the brick cells'
+        // leaf_attr ids likewise. So `tree.as_slice()` paired with the
+        // scene-global `brick_pool.as_slice()` produces splats whose
+        // `leaf_attr_id` indexes directly into `leaf_attr_pool` — the
+        // same indirection the splat shader's vertex stage expects.
+        let asset_extent =
+            (1u32 << header.octree_depth as u8) as f32 * header.base_voxel_size;
+        let aabb_center = (aabb.min + aabb.max) * 0.5;
+        let asset_grid_origin = aabb_center - glam::Vec3::splat(asset_extent * 0.5);
+        let splats = extract_splats(
+            tree.as_slice(),
+            header.octree_depth as u8,
+            header.base_voxel_size,
+            asset_grid_origin,
+            self.brick_pool.as_slice(),
+        );
+
         // Compute brick face-links for this asset. The tree's brick ids
         // have already been remapped to global ids above, so the rows
         // produced are scene-global and ready to merge. When the file
@@ -410,7 +434,7 @@ impl RkpSceneManager {
         let handle = self.octree.allocate(&tree);
 
         eprintln!(
-            "[RkpSceneManager] loaded {}: {} voxels ({} unique attrs), {} bricks, octree {} → compact {} → dedup {} ({:.1}× total), +{} prefilter attrs",
+            "[RkpSceneManager] loaded {}: {} voxels ({} unique attrs), {} bricks, octree {} → compact {} → dedup {} ({:.1}× total), +{} prefilter attrs, {} splats",
             rkp_path.display(),
             actual_cell_count,
             voxel_count,
@@ -420,6 +444,7 @@ impl RkpSceneManager {
             dedup_count,
             if dedup_count > 0 { raw_count as f64 / dedup_count as f64 } else { 0.0 },
             final_leaf_attr_slot_count - leaf_attr_slot_count,
+            splats.len(),
         );
 
         // Promote the baked skin-meta (file-local brick ids) into
@@ -452,6 +477,7 @@ impl RkpSceneManager {
             brick_start: scene_brick_offset,
             brick_count: file_brick_count,
             skinning,
+            splats,
         })
     }
 
@@ -459,5 +485,18 @@ impl RkpSceneManager {
     /// asset was imported without bone weights.
     pub fn skinning_data(&self, handle: AssetHandle) -> Option<&SkinningAssetData> {
         self.asset_cache.get(handle)?.skinning.as_ref()
+    }
+
+    /// Splat-rasterizer surface data for `handle`. One `SplatVertex` per
+    /// occupied surface cell, in object-local coordinates; the per-
+    /// instance world matrix is applied in the splat vertex shader.
+    /// Returns `None` for an unknown handle. The slice is shared across
+    /// every scene-instance of the asset; the render side uploads it
+    /// once per geometry epoch.
+    pub fn asset_splats(
+        &self,
+        handle: AssetHandle,
+    ) -> Option<&[crate::splat_pass::SplatVertex]> {
+        Some(self.asset_cache.get(handle)?.splats.as_slice())
     }
 }
