@@ -19,6 +19,7 @@
 use crate::rkp_scene::{RkpScene, GeometryUpload, FrameUpload};
 use crate::rkp_shade::{ShadeParams, GpuLight, GpuMaterial};
 use crate::rkp_atmosphere::RkpAtmospherePass;
+use crate::splat_pass::{SplatPass, SplatVertex};
 use wgpu_profiler::GpuProfiler;
 
 /// The RKIPatch renderer — shared state only. Per-viewport passes live
@@ -48,6 +49,16 @@ pub struct RkpRenderer {
     /// Skeletal skin-deform scatter pass — writes the per-frame
     /// deformed-space bone field (Phase 3a). See `skin_deform.rs`.
     pub skin_deform: crate::skin_deform::SkinDeformPass,
+    /// Splat-rasterizer pipeline (Phase B-2). One pipeline shared
+    /// across viewports — the per-VR state lives in `ViewportRenderer`
+    /// (g0 bind group, per-instance bind groups + uniform buffers).
+    pub splat_pass: SplatPass,
+    /// Per-asset vertex-buffer cache for the splat path. Indexed by
+    /// `AssetHandle::raw()` — `splat_buffers[handle.raw() as usize]`
+    /// is `Some((vbo, splat_count))` for assets whose splat data has
+    /// been uploaded, `None` otherwise. Grows as new assets are
+    /// loaded; entries are cleared on `release_splats_for_asset`.
+    splat_buffers: Vec<Option<(wgpu::Buffer, u32)>>,
     /// Device for buffer operations.
     pub device: wgpu::Device,
     /// GPU profiler (wgpu-profiler).
@@ -104,6 +115,7 @@ impl RkpRenderer {
         let atmosphere = RkpAtmospherePass::new(device);
 
         let skin_deform = crate::skin_deform::SkinDeformPass::new(device, &scene);
+        let splat_pass = SplatPass::new(device);
 
         let lights_capacity = lights_buffer.size();
         let materials_capacity = materials_buffer.size();
@@ -114,9 +126,52 @@ impl RkpRenderer {
             materials_buffer, materials_capacity,
             lights_materials_epoch: 0,
             skin_deform,
+            splat_pass,
+            splat_buffers: Vec::new(),
             device: device.clone(),
             profiler, timestamp_period,
         }
+    }
+
+    /// Upload (or replace) the splat vertex buffer for a given asset.
+    /// Caller passes the asset's `AssetHandle::raw()` and the
+    /// `&[SplatVertex]` from `RkpSceneManager::asset_splats`. Re-upload
+    /// is safe — the previous buffer (if any) is dropped at the end of
+    /// the call. Empty splat lists clear the cached entry.
+    pub fn upload_splats_for_asset(&mut self, handle_raw: u32, splats: &[SplatVertex]) {
+        use wgpu::util::DeviceExt;
+        let idx = handle_raw as usize;
+        if idx >= self.splat_buffers.len() {
+            self.splat_buffers.resize_with(idx + 1, || None);
+        }
+        if splats.is_empty() {
+            self.splat_buffers[idx] = None;
+            return;
+        }
+        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("splat asset vbo"),
+            contents: bytemuck::cast_slice(splats),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        self.splat_buffers[idx] = Some((buffer, splats.len() as u32));
+    }
+
+    /// Drop the cached splat vertex buffer for `handle_raw`. Called
+    /// when an asset is released or invalidated.
+    pub fn release_splats_for_asset(&mut self, handle_raw: u32) {
+        let idx = handle_raw as usize;
+        if let Some(slot) = self.splat_buffers.get_mut(idx) {
+            *slot = None;
+        }
+    }
+
+    /// Look up the cached splat vertex buffer. Returns `(buffer,
+    /// splat_count)` when the asset has been uploaded, else `None`.
+    pub fn splat_buffer(&self, handle_raw: u32) -> Option<(&wgpu::Buffer, u32)> {
+        self.splat_buffers
+            .get(handle_raw as usize)
+            .and_then(|s| s.as_ref())
+            .map(|(b, c)| (b, *c))
     }
 
     /// Current lights/materials epoch — ViewportRenderers compare against
