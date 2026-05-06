@@ -296,7 +296,14 @@ struct ShadeParams {
     brush_center: vec4<f32>,
     brush_color: vec4<f32>,
     shadow_map_enabled: u32,
-    _pad3: u32,
+    // Non-zero ⇒ shade forces shadow=1.0 instead of sampling
+    // `shadow_tex` (and ignores `shadow_map_enabled`). Engine sets
+    // this when running the splat path, since `shadow_trace` can't
+    // dispatch without march's params bg. Lets the shade path stay
+    // in_situ (real sky / atmosphere) while skipping the shadow
+    // gather; without it `shadow_tex`'s stale data clamps lighting
+    // to ~zero and the whole frame goes dark.
+    shadow_disabled: u32,
     _pad4: u32,
     _pad5: u32,
 }

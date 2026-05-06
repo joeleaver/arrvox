@@ -88,7 +88,13 @@ pub struct ShadeParams {
     /// path live (used pre-S5 cutover or whenever the engine has
     /// no live shadow map this frame).
     pub shadow_map_enabled: u32,
-    pub _pad3: u32,
+    /// Non-zero ⇒ shade forces shadow=1.0 instead of sampling
+    /// `shadow_tex`. Engine sets this when running the splat path
+    /// (`RKP_PRIMARY=splat`), since `shadow_trace` requires march's
+    /// params bg and can't dispatch under splat. Without this gate
+    /// the (uninitialized / stale) shadow_tex would clamp lighting
+    /// to near-zero and the whole frame would render dark.
+    pub shadow_disabled: u32,
     pub _pad4: u32,
     pub _pad5: u32,
 }
@@ -115,7 +121,7 @@ impl Default for ShadeParams {
             brush_center: [0.0, 0.0, 0.0, 0.0],
             brush_color: [1.0, 0.85, 0.2, 1.0],
             shadow_map_enabled: 0,
-            _pad3: 0,
+            shadow_disabled: 0,
             _pad4: 0,
             _pad5: 0,
         }

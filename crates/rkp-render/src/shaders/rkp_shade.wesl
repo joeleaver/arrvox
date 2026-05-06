@@ -692,7 +692,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var bilinear_data = vec4<f32>(0.0);
     // Isolation: shadow_trace pass is skipped, so shadow_tex contains
     // stale data. Force fully-lit and bypass the bilateral gather.
-    if shade_params.isolation != 0u {
+    // Splat path takes the same branch via `shadow_disabled` — see
+    // ShadeParams docs.
+    if shade_params.isolation != 0u || shade_params.shadow_disabled != 0u {
         shadow_data = vec4<f32>(1.0);
         w_sum = 1.0;
     } else {

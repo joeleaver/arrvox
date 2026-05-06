@@ -92,8 +92,16 @@ pub(super) fn encode_viewports(
         let mut shade_params = vp.shade_params;
         let in_situ = matches!(vp.mode, rkp_render::RenderMode::InSitu);
         let raymarch = matches!(vp.preview_mode, rkp_render::BuildPreviewMode::Raymarch);
-        let vr_shadow_map_live = pre.shadow_map_enabled && in_situ && !raymarch;
+        let splat = matches!(
+            state.renderer.primary_mode,
+            rkp_render::rkp_renderer::PrimaryMode::Splat,
+        );
+        // Splat path skips shadow_trace + shadow_map dispatch (they
+        // need march's params bg). Force shade to use shadow=1.0
+        // instead of sampling the stale shadow_tex / shadow_buffer.
+        let vr_shadow_map_live = pre.shadow_map_enabled && in_situ && !raymarch && !splat;
         shade_params.shadow_map_enabled = u32::from(vr_shadow_map_live);
+        shade_params.shadow_disabled = u32::from(splat);
         state
             .renderer
             .update_shade_params(&state.queue, &shade_params);

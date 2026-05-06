@@ -244,6 +244,28 @@ impl RkpRenderer {
             viewport.write_splat_instance(queue, slot as u32, &d.world, d.object_id);
         }
 
+        // RKP_SPLAT_STATS=1 prints (draws, total splats, drawn assets,
+        // missing assets) once per second. Gated so production runs
+        // don't spam stderr.
+        if std::env::var("RKP_SPLAT_STATS").is_ok() {
+            let mut total_splats: u64 = 0;
+            let mut drawn = 0u32;
+            let mut missing = 0u32;
+            for d in draws {
+                match self.splat_buffer(d.asset_handle_raw) {
+                    Some((_, count)) => {
+                        total_splats += count as u64;
+                        drawn += 1;
+                    }
+                    None => missing += 1,
+                }
+            }
+            eprintln!(
+                "[splat] {}×{} viewport: {} draws ({} drawn, {} skipped — no vbo) · {} total splats",
+                viewport.width, viewport.height, draws.len(), drawn, missing, total_splats,
+            );
+        }
+
         let g0_bg = viewport
             .splat_g0_bg
             .as_ref()
