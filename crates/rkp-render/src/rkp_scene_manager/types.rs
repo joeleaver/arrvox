@@ -144,15 +144,11 @@ pub(super) struct AssetEntry {
     /// Phase 6.1, spanning every LOD level the builder reached. Each
     /// cluster carries `lod_level`, `cluster_error`, and
     /// `parent_group_error` so the Phase 6.2 GPU LOD-select compute
-    /// pass can apply the Karis selection rule.
+    /// pass can apply the Karis selection rule. Phase 6.4: the
+    /// shadow path consumes the same DAG with a doubled pixel
+    /// threshold (~lod + 1), retiring the previously-dormant voxel-
+    /// LOD shadow mesh.
     pub(super) meshlet_clusters: Vec<crate::mesh_pass::MeshletCluster>,
-    /// Coarse-LOD surface mesh used by `MeshShadowMapPass` (Phase 3).
-    /// Same SN topology, walked at `SHADOW_LOD_LEVELS` levels above
-    /// finest — typically ~64-256× fewer triangles than the primary
-    /// mesh. Vertex `normal_oct` / `leaf_attr_id` are zeroed because
-    /// the shadow shader only consumes `local_pos`.
-    pub(super) mesh_shadow_vertices: Vec<crate::mesh_pass::MeshVertex>,
-    pub(super) mesh_shadow_indices: Vec<u32>,
 }
 
 impl AssetEntry {

@@ -177,15 +177,6 @@ pub(super) fn run_pre_frame(
                 lod0_index_count,
             );
         }
-        // Phase 3 — coarse-LOD shadow mesh per asset. Parallel cache;
-        // `dispatch_mesh_shadow` reads from it instead of `mesh_buffers`.
-        for (handle, vertices, indices) in sm.iter_loaded_asset_shadow_meshes() {
-            state.renderer.upload_mesh_shadow_for_asset(
-                handle.raw(),
-                vertices,
-                indices,
-            );
-        }
         // Phase 5 — per-asset meshlet cluster table. Storage buffer
         // for the Phase 6 LOD-selection compute pass; uploaded here
         // but unused by current dispatch (validates the upload path

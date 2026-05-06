@@ -109,11 +109,6 @@ pub struct RkpRenderer {
     /// shape as `splat_buffers`, but each entry carries `(vbo, ibo,
     /// index_count)`. Cleared on `release_mesh_for_asset`.
     mesh_buffers: Vec<Option<(wgpu::Buffer, wgpu::Buffer, u32)>>,
-    /// Per-asset cache for the **coarse-LOD shadow mesh** (Phase 3).
-    /// Same shape as `mesh_buffers`. The mesh-shadow render uses this
-    /// — much smaller triangle count than `mesh_buffers`, sufficient
-    /// detail for the 1024² shadow map.
-    mesh_shadow_buffers: Vec<Option<(wgpu::Buffer, wgpu::Buffer, u32)>>,
     /// Per-asset meshlet cluster table on the GPU (Phase 5).
     /// `(buffer, cluster_count)`; the buffer holds a flat
     /// `[MeshletCluster]` array uploaded via `cast_slice` and is
@@ -206,7 +201,6 @@ impl RkpRenderer {
             mesh_shadow_map,
             mesh_lod_select_pass,
             mesh_buffers: Vec::new(),
-            mesh_shadow_buffers: Vec::new(),
             mesh_cluster_buffers: Vec::new(),
             primary_mode,
             device: device.clone(),
@@ -306,58 +300,6 @@ impl RkpRenderer {
     /// index_count)` when the asset has been uploaded, else `None`.
     pub fn mesh_buffer(&self, handle_raw: u32) -> Option<(&wgpu::Buffer, &wgpu::Buffer, u32)> {
         self.mesh_buffers
-            .get(handle_raw as usize)
-            .and_then(|s| s.as_ref())
-            .map(|(v, i, c)| (v, i, *c))
-    }
-
-    /// Upload (or replace) the coarse-LOD **shadow** mesh buffers for
-    /// an asset. Same contract as `upload_mesh_for_asset`, but the
-    /// data goes into the parallel `mesh_shadow_buffers` cache that
-    /// `dispatch_mesh_shadow` reads.
-    pub fn upload_mesh_shadow_for_asset(
-        &mut self,
-        handle_raw: u32,
-        vertices: &[MeshVertex],
-        indices: &[u32],
-    ) {
-        use wgpu::util::DeviceExt;
-        let idx = handle_raw as usize;
-        if idx >= self.mesh_shadow_buffers.len() {
-            self.mesh_shadow_buffers.resize_with(idx + 1, || None);
-        }
-        if vertices.is_empty() || indices.is_empty() {
-            self.mesh_shadow_buffers[idx] = None;
-            return;
-        }
-        let vbo = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh shadow asset vbo"),
-            contents: bytemuck::cast_slice(vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let ibo = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh shadow asset ibo"),
-            contents: bytemuck::cast_slice(indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        self.mesh_shadow_buffers[idx] = Some((vbo, ibo, indices.len() as u32));
-    }
-
-    /// Drop the cached shadow mesh buffers for `handle_raw`.
-    pub fn release_mesh_shadow_for_asset(&mut self, handle_raw: u32) {
-        let idx = handle_raw as usize;
-        if let Some(slot) = self.mesh_shadow_buffers.get_mut(idx) {
-            *slot = None;
-        }
-    }
-
-    /// Look up the cached shadow mesh buffers. Returns `(vbo, ibo,
-    /// index_count)` when uploaded, else `None`.
-    pub fn mesh_shadow_buffer(
-        &self,
-        handle_raw: u32,
-    ) -> Option<(&wgpu::Buffer, &wgpu::Buffer, u32)> {
-        self.mesh_shadow_buffers
             .get(handle_raw as usize)
             .and_then(|s| s.as_ref())
             .map(|(v, i, c)| (v, i, *c))

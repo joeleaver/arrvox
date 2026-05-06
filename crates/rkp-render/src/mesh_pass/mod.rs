@@ -20,21 +20,6 @@ pub use cluster::{
     cluster_mesh, MeshletCluster, MAX_TRIS_PER_CLUSTER, MAX_VERTS_PER_CLUSTER,
     PARENT_GROUP_ERROR_ROOT,
 };
-pub use extract::{extract_shadow_mesh_lod, extract_surface_mesh, MeshVertex};
+pub use extract::{extract_surface_mesh, MeshVertex};
 pub use lod::{build_cluster_dag, ClusterDag, LOD_LEVELS};
 pub use pass::{MeshDraw, MeshPass};
-
-/// LOD level used for the shadow-mesh path.
-///
-/// `lod_levels = 1` puts shadow cells at `2 × finest_voxel_size`. On
-/// a 5 mm-finest asset that's ~10 mm shadow cells — fine enough that
-/// the LOD cube tessellation isn't visually obvious in the cast
-/// shadow but coarse enough to drop triangle count by ~8× vs. finest.
-///
-/// `walk_collect_cells_lod` subdivides bricks at this level so the
-/// LOD mesh tracks each brick's actual occupancy instead of inflating
-/// to a full cube — without that step the shadow shows axis-aligned
-/// brick-cube silhouettes wherever the surface passes through a
-/// brick. Coarser values (2, 3, …) skip the subdivision and produce
-/// progressively blockier shadow silhouettes.
-pub const SHADOW_LOD_LEVELS: u8 = 1;
