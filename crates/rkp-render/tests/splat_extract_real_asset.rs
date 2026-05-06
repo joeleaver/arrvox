@@ -9,7 +9,7 @@
 
 use std::io::BufReader;
 
-use glam::{Mat4, Vec3};
+use glam::Vec3;
 use rkp_render::splat_pass::extract_splats;
 
 #[test]
@@ -64,7 +64,6 @@ fn elephant_extracts_to_a_sensible_splat_count() {
         depth_u8,
         header.base_voxel_size,
         grid_origin,
-        Mat4::IDENTITY,
         bricks,
     );
     let elapsed = started.elapsed();
@@ -88,11 +87,13 @@ fn elephant_extracts_to_a_sensible_splat_count() {
     // be absurd. 50M cap is a soft "is this scaling right" alarm.
     assert!(splats.len() < 50_000_000, "splat count blew past 50M");
 
-    // Per-splat sanity: every position should sit inside the asset's
-    // AABB plus a small margin (half a voxel for cell-center).
+    // Per-splat sanity: every (object-local) position should sit inside
+    // the asset's AABB plus a small margin (half a voxel for cell-center).
+    // The AABB is in object-local space at extract time — the per-instance
+    // world matrix isn't applied until the vertex shader.
     let pad = header.base_voxel_size;
     for s in splats.iter().take(1000) {
-        let p = s.world_pos;
+        let p = s.local_pos;
         assert!(
             p[0] >= aabb_min.x - pad && p[0] <= aabb_max.x + pad,
             "splat x={} out of aabb [{},{}]",

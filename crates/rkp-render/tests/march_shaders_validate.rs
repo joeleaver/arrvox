@@ -32,3 +32,11 @@ fn rkp_shadow_trace_validates() {
         "rkp_shadow_trace",
     );
 }
+
+#[test]
+fn splat_validates() {
+    naga_validates(
+        wesl::include_wesl!("splat"),
+        "splat",
+    );
+}

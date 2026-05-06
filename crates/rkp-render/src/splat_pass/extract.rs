@@ -10,7 +10,7 @@
 //! data so the prototype's integration test can call it directly with
 //! the blobs that come out of `rkp_core::asset_file`.
 
-use glam::{Mat4, UVec3, Vec3};
+use glam::{UVec3, Vec3};
 use rkp_core::brick_pool::{BRICK_CELLS, BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR};
 use rkp_core::sparse_octree::{
     brick_id, is_branch, is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE,
@@ -21,14 +21,21 @@ use rkp_core::sparse_octree::{
 /// 32 B, `repr(C)` so it can be `bytemuck`-cast directly into a vertex
 /// buffer. `_pad` keeps the struct's size at 32 B for clean `array_stride`
 /// arithmetic in the wgpu pipeline layout.
+///
+/// Positions are **object-local** — the per-instance world matrix is
+/// applied in the vertex shader from the per-instance uniform. One
+/// `Vec<SplatVertex>` per asset; reused across every scene-instance of
+/// that asset. The earlier prototype baked `asset_world` into the
+/// positions; that's been removed because it forced re-extraction on
+/// every transform change in a multi-instance scene.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SplatVertex {
-    pub world_pos: [f32; 3],
-    /// Disc radius in world units. Sized so adjacent voxel discs overlap
-    /// at any voxel resolution — a 0.6× factor empirically covers the
-    /// √3/2 worst-case diagonal between cell centers without blowing
-    /// silhouettes way past the cell.
+    pub local_pos: [f32; 3],
+    /// Disc radius in object-local units. Sized so adjacent voxel discs
+    /// overlap at any voxel resolution — a 0.6× factor empirically
+    /// covers the √3/2 worst-case diagonal between cell centers without
+    /// blowing silhouettes way past the cell.
     pub radius: f32,
     /// Absolute index into the global `leaf_attr_pool` (matches
     /// `fetch_leaf_attr_for`'s `leaf_slot` argument). The fragment
@@ -65,21 +72,20 @@ pub const DISC_RADIUS_FACTOR: f32 = 0.6;
 /// * `grid_origin` — object-local position of the octree extent's lo
 ///   corner. Same field that's stored on `RkpGpuAsset` and that the
 ///   GPU shader uses for `oc_origin = local_origin - asset.grid_origin`.
-/// * `asset_world` — per-instance world matrix (typically affine; we
-///   take the full 4×4 in case a future caller wants a non-affine
-///   transform like Phase-3 skinning rest pose).
 /// * `brick_cells` — flat brick storage; `brick_id * BRICK_CELLS + flat`
-///   indexes into it.
+///   indexes into it. For runtime use this is the SCENE-global
+///   `brick_pool.as_slice()` after `load_asset_from_disk` has remapped
+///   the asset's brick ids and slot indices to scene-global values.
 ///
-/// Returns one vertex per non-empty, non-interior cell. Capacity is
-/// pre-reserved to the maximum possible (every brick fully populated)
-/// so the inner loop never reallocates.
+/// Returns one vertex per non-empty, non-interior cell, in
+/// **object-local** coordinates. Capacity is pre-reserved to the
+/// maximum possible (every brick fully populated) so the inner loop
+/// never reallocates.
 pub fn extract_splats(
     octree_nodes: &[u32],
     octree_depth: u8,
     base_voxel_size: f32,
     grid_origin: Vec3,
-    asset_world: Mat4,
     brick_cells: &[u32],
 ) -> Vec<SplatVertex> {
     extract_splats_with_radius(
@@ -87,7 +93,6 @@ pub fn extract_splats(
         octree_depth,
         base_voxel_size,
         grid_origin,
-        asset_world,
         brick_cells,
         DISC_RADIUS_FACTOR,
     )
@@ -101,7 +106,6 @@ pub fn extract_splats_with_radius(
     octree_depth: u8,
     base_voxel_size: f32,
     grid_origin: Vec3,
-    asset_world: Mat4,
     brick_cells: &[u32],
     radius_factor: f32,
 ) -> Vec<SplatVertex> {
@@ -121,7 +125,6 @@ pub fn extract_splats_with_radius(
         brick_cells,
         base_voxel_size,
         grid_origin,
-        asset_world,
         radius_factor,
         &mut out,
     );
@@ -138,7 +141,6 @@ fn walk(
     bricks: &[u32],
     vs: f32,
     grid_origin: Vec3,
-    asset_world: Mat4,
     radius_factor: f32,
     out: &mut Vec<SplatVertex>,
 ) {
@@ -158,9 +160,8 @@ fn walk(
                 (origin_voxels.y as f32 + cell_voxels as f32 * 0.5) * vs,
                 (origin_voxels.z as f32 + cell_voxels as f32 * 0.5) * vs,
             );
-        let world = asset_world.transform_point3(center_local);
         out.push(SplatVertex {
-            world_pos: world.to_array(),
+            local_pos: center_local.to_array(),
             radius: cell_size * radius_factor,
             leaf_attr_id: leaf_slot(node),
             _pad: [0; 3],
@@ -188,9 +189,8 @@ fn walk(
                             (cell_voxel.y as f32 + 0.5) * vs,
                             (cell_voxel.z as f32 + 0.5) * vs,
                         );
-                    let world = asset_world.transform_point3(center_local);
                     out.push(SplatVertex {
-                        world_pos: world.to_array(),
+                        local_pos: center_local.to_array(),
                         radius: vs * radius_factor,
                         leaf_attr_id: c,
                         _pad: [0; 3],
@@ -221,7 +221,6 @@ fn walk(
                 bricks,
                 vs,
                 grid_origin,
-                asset_world,
                 radius_factor,
                 out,
             );
@@ -242,7 +241,7 @@ mod tests {
     #[test]
     fn empty_octree_yields_nothing() {
         let nodes = vec![EMPTY_NODE];
-        let splats = extract_splats(&nodes, 4, 0.001, Vec3::ZERO, Mat4::IDENTITY, &[]);
+        let splats = extract_splats(&nodes, 4, 0.001, Vec3::ZERO, &[]);
         assert!(splats.is_empty());
     }
 
@@ -252,13 +251,13 @@ mod tests {
         // 1-voxel extent.
         let nodes = vec![make_leaf(42)];
         let vs = 0.5;
-        let splats = extract_splats(&nodes, 0, vs, Vec3::new(1.0, 2.0, 3.0), Mat4::IDENTITY, &[]);
+        let splats = extract_splats(&nodes, 0, vs, Vec3::new(1.0, 2.0, 3.0), &[]);
         assert_eq!(splats.len(), 1);
         let s = splats[0];
         assert_eq!(s.leaf_attr_id, 42);
         // grid_origin + half-extent. depth 0 → cell_voxels = 1, so center
-        // is at grid_origin + vs * 0.5 on each axis.
-        assert_eq!(s.world_pos, [1.0 + vs * 0.5, 2.0 + vs * 0.5, 3.0 + vs * 0.5]);
+        // is at grid_origin + vs * 0.5 on each axis (object-local coords).
+        assert_eq!(s.local_pos, [1.0 + vs * 0.5, 2.0 + vs * 0.5, 3.0 + vs * 0.5]);
         // Disc radius = cell_size × factor.
         assert!((s.radius - vs * DISC_RADIUS_FACTOR).abs() < 1e-6);
     }
@@ -267,7 +266,7 @@ mod tests {
     fn single_brick_with_two_filled_cells() {
         // Root is a BRICK referencing brick 0. Brick storage holds 64
         // cells; we mark exactly two as filled (slots 100 and 101) and
-        // verify both come back at the right world positions.
+        // verify both come back at the right object-local positions.
         let nodes = vec![make_brick(0)];
         let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
         // Cell (0,0,0) = leaf slot 100.
@@ -280,17 +279,17 @@ mod tests {
 
         // depth 2 = brick at root spans 1<<2 = 4 finest voxels per axis.
         let vs = 1.0;
-        let splats = extract_splats(&nodes, 2, vs, Vec3::ZERO, Mat4::IDENTITY, &bricks);
+        let splats = extract_splats(&nodes, 2, vs, Vec3::ZERO, &bricks);
         assert_eq!(splats.len(), 2);
 
         // The (0,0,0) cell.
         let a = splats.iter().find(|s| s.leaf_attr_id == 100).unwrap();
-        assert_eq!(a.world_pos, [0.5, 0.5, 0.5]);
+        assert_eq!(a.local_pos, [0.5, 0.5, 0.5]);
         assert!((a.radius - vs * DISC_RADIUS_FACTOR).abs() < 1e-6);
 
         // The (3,3,3) cell — center at (3.5, 3.5, 3.5) for vs=1.
         let b = splats.iter().find(|s| s.leaf_attr_id == 101).unwrap();
-        assert_eq!(b.world_pos, [3.5, 3.5, 3.5]);
+        assert_eq!(b.local_pos, [3.5, 3.5, 3.5]);
     }
 
     #[test]
@@ -302,24 +301,11 @@ mod tests {
         bricks[2] = BRICK_INTERIOR;
         bricks[3] = 51;
 
-        let splats = extract_splats(&nodes, 2, 1.0, Vec3::ZERO, Mat4::IDENTITY, &bricks);
+        let splats = extract_splats(&nodes, 2, 1.0, Vec3::ZERO, &bricks);
         assert_eq!(splats.len(), 2);
         let ids: std::collections::HashSet<u32> =
             splats.iter().map(|s| s.leaf_attr_id).collect();
         assert!(ids.contains(&50));
         assert!(ids.contains(&51));
-    }
-
-    #[test]
-    fn world_transform_applied() {
-        // Single leaf, identity grid, but apply a translation in the
-        // asset_world matrix and check the splat lands there.
-        let nodes = vec![make_leaf(7)];
-        let vs = 1.0;
-        let world = Mat4::from_translation(Vec3::new(10.0, 20.0, 30.0));
-        let splats = extract_splats(&nodes, 0, vs, Vec3::ZERO, world, &[]);
-        assert_eq!(splats.len(), 1);
-        // Local center at (0.5, 0.5, 0.5) + translation.
-        assert_eq!(splats[0].world_pos, [10.5, 20.5, 30.5]);
     }
 }

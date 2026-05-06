@@ -1,29 +1,39 @@
-//! Phase B-1 — full splat-rasterizer integration test.
+//! End-to-end splat-rasterizer integration test (Phase B-2).
 //!
-//! Loads a real `.rkp`, builds the SplatVertex buffer, renders a
-//! 1920×1080 frame via the splat pipeline with timestamp queries, and
-//! reports GPU time. Optionally dumps the albedo + normal targets to
-//! PNGs for visual sanity (set `RKP_SPLAT_DUMP_DIR=/some/dir`).
+//! Loads a real `.rkp`, extracts SplatVertex data, drives the full
+//! `SplatPass` (the same pipeline the editor uses) over a 1920×1080
+//! G-buffer, and reports GPU time. Optionally dumps the position +
+//! normal targets to PPM for visual sanity (set
+//! `RKP_SPLAT_DUMP_DIR=/some/dir`).
 //!
-//! Skipped by default — set `RKP_SPLAT_TEST_ASSET=/path/to/scene.rkp`
-//! (and ensure the wgpu adapter is available + supports
-//! TIMESTAMP_QUERY).
+//! Skipped by default — set `RKP_SPLAT_TEST_ASSET=/path/to/scene.rkp`.
+//! Adapter must support `TIMESTAMP_QUERY` and the three Uint render
+//! targets the splat fragment writes (R32Uint / Rg32Uint).
 //!
-//! This runs the splat path *in isolation*: no editor, no scene
-//! manager, no march. The numbers it reports are pure splat-rasterize
-//! GPU time for a single asset, fixed camera, identity world matrix.
+//! Runs in isolation: no editor, no scene manager, no march. The
+//! numbers reflect raw splat-rasterize GPU time for a single asset
+//! with identity world matrix.
 
 use std::io::BufReader;
 
 use glam::{Mat4, Vec3};
+use rkp_render::rkp_scene::CameraUniforms;
 use rkp_render::splat_pass::{
-    extract_splats_with_radius, SplatCamera, SplatPass, SplatPassConfig, DISC_RADIUS_FACTOR,
+    extract_splats_with_radius, SplatInstanceUniform, SplatPass, DISC_RADIUS_FACTOR,
 };
 
 const W: u32 = 1920;
 const H: u32 = 1080;
-const ALBEDO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+// G-buffer formats — must match `crate::gbuffer` constants. Replicated
+// here so the test can spell them out at the texture-creation site
+// without depending on the (private?) re-exports.
+const POSITION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 const NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const MATERIAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
+const PICK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
+const GLASS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
+const LEAF_SLOT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 fn create_device() -> Option<(wgpu::Device, wgpu::Queue)> {
@@ -73,14 +83,8 @@ fn splat_renders_elephant_and_reports_gpu_time() {
     let _voxels =
         rkp_core::asset_file::read_rkp_voxels(&mut reader, &header).expect("voxels");
 
-    // Per-leaf normals — packed alongside the voxel records on disk;
-    // we need them on the GPU as a `LeafAttr` array indexed by
-    // leaf_attr_id. The runtime asset_load merges these with the
-    // material-id field; for the prototype we pull just the normals
-    // (materials all default to material_id 1, the "default" slot).
     let normals_bytes = if header.flags & rkp_core::asset_file::FLAG_HAS_NORMALS != 0 {
-        rkp_core::asset_file::read_rkp_normals(&mut reader, &header)
-            .expect("normals")
+        rkp_core::asset_file::read_rkp_normals(&mut reader, &header).expect("normals")
     } else {
         Vec::new()
     };
@@ -101,9 +105,6 @@ fn splat_renders_elephant_and_reports_gpu_time() {
     let grid_origin = (aabb_min + aabb_max) * 0.5 - Vec3::splat(extent * 0.5);
 
     // ── 2. Extract splats ───────────────────────────────────────────
-    // Disc radius factor — controls overlap between adjacent splats.
-    // Default is 0.6 (just enough to cover diagonals on flat surfaces);
-    // bump higher to mask glancing-angle silhouette stepping.
     let radius_factor: f32 = std::env::var("RKP_SPLAT_RADIUS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -114,7 +115,6 @@ fn splat_renders_elephant_and_reports_gpu_time() {
         header.octree_depth as u8,
         header.base_voxel_size,
         grid_origin,
-        Mat4::IDENTITY,
         bricks,
         radius_factor,
     );
@@ -132,11 +132,9 @@ fn splat_renders_elephant_and_reports_gpu_time() {
         usage: wgpu::BufferUsages::VERTEX,
     });
 
-    // LeafAttr pool — one entry per voxel slot. The cell value `c`
-    // we stuffed into SplatVertex.leaf_attr_id is the absolute index
-    // into this pool. For the prototype we synthesize entries from
-    // the on-disk normals blob: 4 bytes per leaf = 1× u32 oct-normal.
-    // material_packed defaults to 1 (the "default" material slot).
+    // LeafAttr pool — one entry per voxel slot, 8 B each (normal_oct +
+    // material_packed). Synthesize from on-disk normals; default the
+    // material packing to material_id 1.
     let normals_u32: &[u32] = if normals_bytes.len() >= 4 {
         bytemuck::cast_slice(&normals_bytes)
     } else {
@@ -145,7 +143,6 @@ fn splat_renders_elephant_and_reports_gpu_time() {
     let leaf_attr_count = normals_u32.len();
     let mut leaf_attrs = Vec::with_capacity(leaf_attr_count);
     for &n in normals_u32 {
-        // 8-byte LeafAttr: (normal_oct, material_packed)
         leaf_attrs.push([n, 1u32]);
     }
     eprintln!(
@@ -159,17 +156,15 @@ fn splat_renders_elephant_and_reports_gpu_time() {
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    // Materials — `GpuMaterial` is 24 × 4 = 96 B (see
-    // `shaders/lib/types.wesl`). One default plus a few extra slots
-    // so the leaf_attr_pool's stub material_id=1 maps to a defined
-    // entry. Index 1 = mid-grey diffuse.
-    let mut materials = vec![[0u32; 24]; 8]; // stride MUST match the WGSL struct
+    // Materials — `GpuMaterial` is 24 × 4 = 96 B. One default plus a
+    // few extra slots so material_id=1 maps to a defined entry.
+    let mut materials = vec![[0u32; 24]; 8];
     for m in &mut materials {
-        m[0] = 0.7f32.to_bits(); // albedo_r
-        m[1] = 0.7f32.to_bits(); // albedo_g
-        m[2] = 0.7f32.to_bits(); // albedo_b
-        m[3] = 0.5f32.to_bits(); // roughness
-        m[12] = 1.0f32.to_bits(); // opacity
+        m[0] = 0.7f32.to_bits();
+        m[1] = 0.7f32.to_bits();
+        m[2] = 0.7f32.to_bits();
+        m[3] = 0.5f32.to_bits();
+        m[12] = 1.0f32.to_bits();
     }
     let materials_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("materials"),
@@ -177,12 +172,18 @@ fn splat_renders_elephant_and_reports_gpu_time() {
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    // ── 4. Camera ──────────────────────────────────────────────────
+    // Color pool — zero for every slot (= "use material base_color").
+    // Same length as leaf_attrs so per-leaf indexing stays bounds-safe.
+    let color_pool = vec![0u32; leaf_attr_count.max(1)];
+    let color_pool_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("color_pool"),
+        contents: bytemuck::cast_slice(&color_pool),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
+    // ── 4. Camera (CameraUniforms — 224 B) ─────────────────────────
     let aabb_center = (aabb_min + aabb_max) * 0.5;
     let asset_extent = (aabb_max - aabb_min).length();
-    // Camera distance scaled by env var so we can A/B sub-pixel
-    // sensitivity without recompiling. Default 0.55 puts us close
-    // enough that voxels project to ~few pixels each.
     let dist_factor: f32 = std::env::var("RKP_SPLAT_CAM_DIST")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -198,12 +199,26 @@ fn splat_renders_elephant_and_reports_gpu_time() {
         asset_extent,
     );
     let view_proj = proj * view;
-    let camera = SplatCamera {
-        view_proj: view_proj.to_cols_array_2d(),
-        position: cam_pos.to_array(),
-        _pad0: 0.0,
+    let view_dir = (aabb_center - cam_pos).normalize();
+    let world_up = Vec3::Y;
+    let cam_right = view_dir.cross(world_up).normalize();
+    let cam_up = cam_right.cross(view_dir);
+
+    // CameraUniforms layout: position vec4 / forward vec4 / right vec4
+    // / up vec4 / resolution vec2 / jitter vec2 / layer_mask u32 /
+    // focus_object_id u32 / pad u32 u32 / prev_vp mat4 / view_proj mat4
+    let camera = CameraUniforms {
+        position: [cam_pos.x, cam_pos.y, cam_pos.z, 0.0],
+        forward: [view_dir.x, view_dir.y, view_dir.z, 0.0],
+        right: [cam_right.x, cam_right.y, cam_right.z, 0.0],
+        up: [cam_up.x, cam_up.y, cam_up.z, 0.0],
         resolution: [W as f32, H as f32],
-        _pad1: [0.0; 2],
+        jitter: [0.0, 0.0],
+        layer_mask: u32::MAX,
+        focus_object_id: u32::MAX,
+        _pad: [0; 2],
+        prev_vp: view_proj.to_cols_array_2d(),
+        view_proj: view_proj.to_cols_array_2d(),
     };
     let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("splat camera"),
@@ -211,7 +226,21 @@ fn splat_renders_elephant_and_reports_gpu_time() {
         usage: wgpu::BufferUsages::UNIFORM,
     });
 
-    // ── 5. Targets ──────────────────────────────────────────────────
+    // Per-instance uniform — identity world matrix, object_id 1.
+    let instance = SplatInstanceUniform {
+        world: Mat4::IDENTITY.to_cols_array_2d(),
+        object_id: 1,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
+    let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("splat instance"),
+        contents: bytemuck::bytes_of(&instance),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    // ── 5. G-buffer render targets ──────────────────────────────────
     let make_color_tex = |label: &'static str, format: wgpu::TextureFormat| {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
@@ -230,10 +259,14 @@ fn splat_renders_elephant_and_reports_gpu_time() {
             view_formats: &[],
         })
     };
-    let albedo_tex = make_color_tex("splat_albedo", ALBEDO_FORMAT);
-    let normal_tex = make_color_tex("splat_normal", NORMAL_FORMAT);
+    let position_tex = make_color_tex("gbuf_position", POSITION_FORMAT);
+    let normal_tex = make_color_tex("gbuf_normal", NORMAL_FORMAT);
+    let material_tex = make_color_tex("gbuf_material", MATERIAL_FORMAT);
+    let pick_tex = make_color_tex("gbuf_pick", PICK_FORMAT);
+    let glass_tex = make_color_tex("gbuf_glass", GLASS_FORMAT);
+    let leaf_slot_tex = make_color_tex("gbuf_leaf_slot", LEAF_SLOT_FORMAT);
     let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("splat_depth"),
+        label: Some("gbuf_depth"),
         size: wgpu::Extent3d {
             width: W,
             height: H,
@@ -246,40 +279,26 @@ fn splat_renders_elephant_and_reports_gpu_time() {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
-    let albedo_view = albedo_tex.create_view(&Default::default());
+    let position_view = position_tex.create_view(&Default::default());
     let normal_view = normal_tex.create_view(&Default::default());
+    let material_view = material_tex.create_view(&Default::default());
+    let pick_view = pick_tex.create_view(&Default::default());
+    let glass_view = glass_tex.create_view(&Default::default());
+    let leaf_slot_view = leaf_slot_tex.create_view(&Default::default());
     let depth_view = depth_tex.create_view(&Default::default());
 
-    // ── 6. Pipeline + bind group ───────────────────────────────────
-    let pass = SplatPass::new(
+    // ── 6. Pipeline + bind groups ──────────────────────────────────
+    let pass = SplatPass::new(&device);
+    let g0_bg = pass.create_g0_bind_group(
         &device,
-        &SplatPassConfig {
-            albedo_format: ALBEDO_FORMAT,
-            normal_format: NORMAL_FORMAT,
-            depth_format: DEPTH_FORMAT,
-            sample_count: 1,
-        },
+        &camera_buffer,
+        &leaf_attr_buffer,
+        &materials_buffer,
+        &color_pool_buffer,
     );
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("splat g0"),
-        layout: &pass.g0_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: leaf_attr_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: materials_buffer.as_entire_binding(),
-            },
-        ],
-    });
+    let g1_bg = pass.create_g1_bind_group(&device, &instance_buffer);
 
-    // ── 7. Timestamp queries ───────────────────────────────────────
+    // ── 7. Timestamps + frames ─────────────────────────────────────
     let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
         label: Some("splat timestamps"),
         count: 2,
@@ -298,35 +317,40 @@ fn splat_renders_elephant_and_reports_gpu_time() {
         mapped_at_creation: false,
     });
 
-    // Warm-up + measurement: render a few frames to let driver/cache
-    // settle, then time the average over the next frames.
     let warmup_frames = 3;
     let measure_frames = 8;
     let mut measure_us: Vec<f32> = Vec::new();
 
     for frame in 0..(warmup_frames + measure_frames) {
-        let mut encoder = device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("splat frame") });
-        pass.render(
-            &mut encoder,
-            &vertex_buffer,
-            splats.len() as u32,
-            &bind_group,
-            &albedo_view,
-            &normal_view,
-            &depth_view,
-            wgpu::Color { r: 0.0, g: 0.0, b: 0.05, a: 1.0 },
-            Some(wgpu::RenderPassTimestampWrites {
-                query_set: &query_set,
-                beginning_of_pass_write_index: Some(0),
-                end_of_pass_write_index: Some(1),
-            }),
-        );
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("splat frame"),
+        });
+        {
+            let mut rp = pass.begin_pass(
+                &mut encoder,
+                &position_view,
+                &normal_view,
+                &material_view,
+                &pick_view,
+                &glass_view,
+                &leaf_slot_view,
+                &depth_view,
+                Some(wgpu::RenderPassTimestampWrites {
+                    query_set: &query_set,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: Some(1),
+                }),
+            );
+            rp.set_pipeline(&pass.pipeline);
+            rp.set_bind_group(0, &g0_bg, &[]);
+            rp.set_bind_group(1, &g1_bg, &[]);
+            rp.set_vertex_buffer(0, vertex_buffer.slice(..));
+            rp.draw(0..4, 0..(splats.len() as u32));
+        }
         encoder.resolve_query_set(&query_set, 0..2, &timestamp_resolve_buf, 0);
         encoder.copy_buffer_to_buffer(&timestamp_resolve_buf, 0, &timestamp_read_buf, 0, 16);
         queue.submit(std::iter::once(encoder.finish()));
 
-        // Read back the timestamp.
         let slice = timestamp_read_buf.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
@@ -358,37 +382,51 @@ fn splat_renders_elephant_and_reports_gpu_time() {
         mean_us / 1000.0,
     );
 
-    // ── 8. (optional) Image dump for visual sanity ─────────────────
+    // ── 8. (optional) Image dumps for visual sanity ────────────────
     if let Ok(dir) = std::env::var("RKP_SPLAT_DUMP_DIR") {
         std::fs::create_dir_all(&dir).expect("create dump dir");
-        dump_rgba16_to_ppm(&device, &queue, &albedo_tex, W, H, &format!("{dir}/albedo.ppm"), true);
-        dump_rgba16_to_ppm(&device, &queue, &normal_tex, W, H, &format!("{dir}/normal.ppm"), false);
-        eprintln!("[splat_render] wrote {dir}/{{albedo,normal}}.ppm");
+        // Position is Rgba32Float (xyz, hit_distance) — visualize as
+        // colour-coded per-axis. Normal is Rgba16Float — visualize the
+        // unsigned half-vec mapping classic to the eye.
+        dump_rgba32f_xyz_to_ppm(
+            &device,
+            &queue,
+            &position_tex,
+            W,
+            H,
+            &format!("{dir}/position.ppm"),
+            aabb_min,
+            aabb_max,
+        );
+        dump_rgba16f_normal_to_ppm(
+            &device,
+            &queue,
+            &normal_tex,
+            W,
+            H,
+            &format!("{dir}/normal.ppm"),
+        );
+        eprintln!("[splat_render] wrote {dir}/{{position,normal}}.ppm");
     }
 }
 
-/// Read back an `Rgba16Float` render target, tonemap (Reinhard + sRGB
-/// gamma) when `tonemap` is set, and write a P6 PPM. Trivial format —
-/// any image viewer or `convert in.ppm out.png` opens it.
-///
-/// `bytes_per_row` is already a multiple of 256 for our 1920-pixel
-/// width (1920 × 8 = 15360 = 60 × 256), so the copy lays out cleanly.
-fn dump_rgba16_to_ppm(
+/// Read back a `Rgba32Float` position target and write it as an RGB PPM
+/// where each channel is the per-axis world-space position remapped
+/// against the asset's AABB. Pixels with the miss sentinel
+/// (hit_distance == 1e10) are written black.
+fn dump_rgba32f_xyz_to_ppm(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     tex: &wgpu::Texture,
     width: u32,
     height: u32,
     path: &str,
-    tonemap: bool,
+    aabb_min: Vec3,
+    aabb_max: Vec3,
 ) {
-    let bytes_per_pixel = 8u32; // Rgba16Float
+    let bytes_per_pixel = 16u32; // Rgba32Float
     let row_bytes = width * bytes_per_pixel;
-    assert_eq!(
-        row_bytes % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
-        0,
-        "bytes_per_row must be 256-aligned; pad if you change W"
-    );
+    assert_eq!(row_bytes % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 0);
     let buffer_size = (row_bytes as u64) * height as u64;
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("ppm_staging"),
@@ -396,8 +434,90 @@ fn dump_rgba16_to_ppm(
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let mut enc =
-        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("ppm copy") });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("ppm copy"),
+    });
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &staging,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row_bytes),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(std::iter::once(enc.finish()));
+    let slice = staging.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    let view = slice.get_mapped_range();
+    let floats: &[f32] = bytemuck::cast_slice(&view);
+
+    let mut out = Vec::with_capacity((6 * (width * height) as usize) + 64);
+    out.extend_from_slice(format!("P6\n{} {}\n65535\n", width, height).as_bytes());
+    let extent = aabb_max - aabb_min;
+    for pix in 0..(width * height) as usize {
+        let x = floats[pix * 4];
+        let y = floats[pix * 4 + 1];
+        let z = floats[pix * 4 + 2];
+        let hit = floats[pix * 4 + 3];
+        let (rr, gg, bb) = if hit > 1e9 {
+            (0.0, 0.0, 0.0)
+        } else {
+            (
+                ((x - aabb_min.x) / extent.x).clamp(0.0, 1.0),
+                ((y - aabb_min.y) / extent.y).clamp(0.0, 1.0),
+                ((z - aabb_min.z) / extent.z).clamp(0.0, 1.0),
+            )
+        };
+        let w = |v: f32| -> [u8; 2] {
+            let q = (v * 65535.0).round().clamp(0.0, 65535.0) as u16;
+            q.to_be_bytes()
+        };
+        out.extend_from_slice(&w(rr));
+        out.extend_from_slice(&w(gg));
+        out.extend_from_slice(&w(bb));
+    }
+    drop(view);
+    staging.unmap();
+    std::fs::write(path, &out).expect("write ppm");
+}
+
+/// Read back a `Rgba16Float` normal target and write it as an RGB PPM.
+/// Maps `(n.xyz * 0.5 + 0.5)` to colour so positive components light up.
+fn dump_rgba16f_normal_to_ppm(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex: &wgpu::Texture,
+    width: u32,
+    height: u32,
+    path: &str,
+) {
+    let bytes_per_pixel = 8u32;
+    let row_bytes = width * bytes_per_pixel;
+    assert_eq!(row_bytes % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 0);
+    let buffer_size = (row_bytes as u64) * height as u64;
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ppm_staging"),
+        size: buffer_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("ppm copy"),
+    });
     enc.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: tex,
@@ -426,24 +546,15 @@ fn dump_rgba16_to_ppm(
     let view = slice.get_mapped_range();
     let halfs: &[half::f16] = bytemuck::cast_slice(&view);
 
-    // 16-bit P6 PPM — maxval 65535, 2 bytes per channel big-endian.
-    // 16-bit avoids contour-banding artefacts that 8-bit truncation
-    // would produce on smoothly-varying values like surface normals.
     let mut out = Vec::with_capacity((6 * (width * height) as usize) + 64);
     out.extend_from_slice(format!("P6\n{} {}\n65535\n", width, height).as_bytes());
-
     for pix in 0..(width * height) as usize {
         let r = halfs[pix * 4].to_f32();
         let g = halfs[pix * 4 + 1].to_f32();
         let b = halfs[pix * 4 + 2].to_f32();
-        let (rr, gg, bb) = if tonemap {
-            let r = (r / (1.0 + r)).sqrt();
-            let g = (g / (1.0 + g)).sqrt();
-            let b = (b / (1.0 + b)).sqrt();
-            (r, g, b)
-        } else {
-            (r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0))
-        };
+        let rr = (r * 0.5 + 0.5).clamp(0.0, 1.0);
+        let gg = (g * 0.5 + 0.5).clamp(0.0, 1.0);
+        let bb = (b * 0.5 + 0.5).clamp(0.0, 1.0);
         let w = |v: f32| -> [u8; 2] {
             let q = (v * 65535.0).round().clamp(0.0, 65535.0) as u16;
             q.to_be_bytes()
@@ -452,7 +563,6 @@ fn dump_rgba16_to_ppm(
         out.extend_from_slice(&w(gg));
         out.extend_from_slice(&w(bb));
     }
-
     drop(view);
     staging.unmap();
     std::fs::write(path, &out).expect("write ppm");
