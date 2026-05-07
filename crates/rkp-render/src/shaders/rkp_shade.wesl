@@ -141,12 +141,15 @@ fn mat_subsurface_color(m: GpuMaterial) -> vec3<f32> {
 @group(1) @binding(0) var shadow_tex: texture_2d<f32>;
 @group(1) @binding(1) var ssao_tex: texture_2d<f32>;
 
-// Phase 8 S3 — directional shadow map. Wire-format mirror of
-// `rkp_render::shadow_map_pass::LightCameraUniform` (160 B).
-// `shadow_map` is R32Float (non-filterable; sampled via
-// `textureLoad` with integer coords). Both bindings are present
-// even pre-S4; the WGSL gates reads on
-// `shade_params.shadow_map_enabled`.
+// CSM (Cascaded Shadow Maps) — directional shadow uniform + buffer.
+// Wire-format mirror of `rkp_render::shadow_map_pass::LightCameraCsm`
+// (672 B). Each cascade is a 160 B `LightCameraShade` slice; the
+// shade pass picks the slice per-pixel based on view-space depth and
+// indexes into `shadow_buffer` at `cascade * SIZE² + ty * SIZE + tx`.
+//
+// In march-mode `cascade_count = 1` and only `cascades[0]` is filled,
+// so cascade selection collapses to "always slice 0" and the math
+// reduces to today's single-cascade flow.
 struct LightCameraShade {
     view_proj: mat4x4<f32>,
     view_proj_inv: mat4x4<f32>,
@@ -155,10 +158,19 @@ struct LightCameraShade {
     inv_shadow_map_size: vec2<f32>,
     shadow_map_size: vec2<u32>,
 }
-@group(1) @binding(2) var<uniform> light_camera: LightCameraShade;
+struct LightCameraShadeCsm {
+    cascades: array<LightCameraShade, 4>,
+    cascade_far_view_z: vec4<f32>,
+    cascade_count: u32,
+    _csm_pad0: u32,
+    _csm_pad1: u32,
+    _csm_pad2: u32,
+}
+@group(1) @binding(2) var<uniform> light_camera: LightCameraShadeCsm;
 // Phase 8 V2 — shadow_buffer is `array<u32>` holding bit-cast
-// f32 depths, written by the scatter pass (atomicMin on bits).
-// Index = ty * W + tx, then bitcast<f32> to recover the depth.
+// f32 depths, written by the mesh blit (mesh-mode) or scatter pass
+// (march-mode). For CSM the buffer is `CSM_CASCADE_COUNT * SIZE²`
+// u32s laid out cascade-major: `[cascade * SIZE² + ty * SIZE + tx]`.
 @group(1) @binding(3) var<storage, read> shadow_buffer: array<u32>;
 
 // Group 2: output HDR color (write, full-res)
@@ -186,41 +198,89 @@ struct LightCameraShade {
 // sentinel so the lookup must guard `slot != 0u`.
 @group(6) @binding(0) var<storage, read> brush_overlay_distances: array<f32>;
 
-// ── Phase 8 S3 — directional shadow-map sample ─────────────────
+// ── CSM directional shadow-map sample ──────────────────────────
 //
-// Project `world_pos` through the light camera, look up the
-// shadow-map texel, depth-compare against the surface's projected
-// NDC z. Returns 1.0 (lit) or 0.0 (shadowed).
+// Project `world_pos` through cascade `i`'s light camera, look up
+// the matching slot in `shadow_buffer`, depth-compare against the
+// surface's projected NDC z. Returns:
+//   shadow ∈ [0, 1]  — 1.0 lit, 0.0 shadowed
+//   in_bounds        — false if the projection landed outside
+//                      cascade `i`'s clip volume (caller falls
+//                      through to cascade `i+1`).
 //
-// Pixels that project outside the shadow map's clip volume return
-// 1.0 — the light extends past the map's coverage; treating those
-// regions as shadowed would produce abrupt dark bands at the edge
-// of the map. CSM is the proper fix; V1 just lights them.
+// Storage layout: `shadow_buffer` holds CSM_CASCADE_COUNT slices
+// laid out cascade-major. Index = `cascade * (W*H) + ty*W + tx`.
 //
-// `depth_bias` is a constant offset applied to the surface depth
-// before the compare; it eats up slope-scale + acne. Positive
-// pushes the surface toward the light (less self-shadowing) at
-// the cost of peter-panning. The engine sources it from
-// `compute_light_camera`'s `depth_bias` parameter.
-fn sample_shadow_map(world_pos: vec3<f32>) -> f32 {
-    let clip = light_camera.view_proj * vec4<f32>(world_pos, 1.0);
-    if clip.w <= 0.0 { return 1.0; }
+// `depth_bias` (per-cascade, set CPU-side by `compute_csm_cascades`)
+// pushes the surface toward the light pre-compare to eat up
+// slope-scale + acne. Positive reduces self-shadowing at the cost of
+// peter-panning.
+struct CascadeSample {
+    shadow: f32,
+    in_bounds: bool,
+}
+
+fn sample_one_cascade(world_pos: vec3<f32>, i: u32) -> CascadeSample {
+    let cam = light_camera.cascades[i];
+    let clip = cam.view_proj * vec4<f32>(world_pos, 1.0);
+    if clip.w <= 0.0 { return CascadeSample(1.0, false); }
     let ndc = clip.xyz / clip.w;
     if ndc.x < -1.0 || ndc.x > 1.0
         || ndc.y < -1.0 || ndc.y > 1.0
         || ndc.z < 0.0 || ndc.z > 1.0 {
-        return 1.0;
+        return CascadeSample(1.0, false);
     }
-    let size_u = light_camera.shadow_map_size;
+    let size_u = cam.shadow_map_size;
     let size_f = vec2<f32>(size_u);
     let tx_f = (ndc.x * 0.5 + 0.5) * size_f.x;
     let ty_f = (1.0 - (ndc.y * 0.5 + 0.5)) * size_f.y;
     let tx = clamp(u32(tx_f), 0u, size_u.x - 1u);
     let ty = clamp(u32(ty_f), 0u, size_u.y - 1u);
-    let buffer_idx = ty * size_u.x + tx;
+    let slice = size_u.x * size_u.y;
+    let buffer_idx = i * slice + ty * size_u.x + tx;
     let map_z = bitcast<f32>(shadow_buffer[buffer_idx]);
     let surface_z = ndc.z;
-    return select(0.0, 1.0, surface_z - light_camera.depth_bias <= map_z);
+    let s = select(0.0, 1.0, surface_z - cam.depth_bias <= map_z);
+    return CascadeSample(s, true);
+}
+
+// View-space depth of `world_pos` along the camera forward axis.
+// `camera.forward.xyz` is unit (per `build_camera_uniforms`), so
+// dot-product with the offset is exactly the camera-space z (positive
+// into the scene).
+fn view_z_of(world_pos: vec3<f32>) -> f32 {
+    return dot(world_pos - camera.position.xyz, camera.forward.xyz);
+}
+
+// Cascade-aware shadow lookup. Picks the smallest cascade `i` such
+// that `view_z <= cascade_far_view_z[i]`, samples it, and falls
+// through to `i+1` if the projection landed outside its clip volume
+// (covers fragments near a slice boundary that get nudged out by
+// the texel snap). If the last cascade is also out-of-bounds, return
+// 1.0 (fully lit) — same edge behavior as today's single-cascade
+// path.
+//
+// In march-mode `cascade_count == 1` and `cascade_far_view_z[0]` is
+// `+INF`, so this collapses to a single sample of slice 0 (today's
+// behavior bit-for-bit).
+fn sample_shadow_map(world_pos: vec3<f32>) -> f32 {
+    let view_z = view_z_of(world_pos);
+    let n = light_camera.cascade_count;
+
+    var i: u32 = 0u;
+    loop {
+        if i + 1u >= n { break; }
+        if view_z <= light_camera.cascade_far_view_z[i] { break; }
+        i = i + 1u;
+    }
+
+    let r0 = sample_one_cascade(world_pos, i);
+    if r0.in_bounds { return r0.shadow; }
+    if i + 1u < n {
+        let r1 = sample_one_cascade(world_pos, i + 1u);
+        if r1.in_bounds { return r1.shadow; }
+    }
+    return 1.0;
 }
 
 // Aerial-perspective LUT slice parameterization — must match rkp_aerial_perspective_lut.wgsl.

@@ -185,11 +185,13 @@ pub(super) fn prepare_shadow_maps(
     if !mesh_mode {
         return false;
     }
-    use rkp_render::shadow_map_pass::{compute_light_camera, SHADOW_MAP_DEFAULT_SIZE};
+    use rkp_render::shadow_map_pass::{
+        compute_csm_cascades, CsmInputs, CSM_CASCADE_COUNT, SHADOW_MAP_DEFAULT_SIZE,
+    };
     // Pick the first directional caster — `position[3] == 0` flags
     // a directional light in the GpuLight wire format, and
-    // `params[3] >= 0.5` is the shadow-caster bit. Multi-caster /
-    // CSM is future work.
+    // `params[3] >= 0.5` is the shadow-caster bit. CSM applies to
+    // the dominant directional light only.
     let Some(light) = frame
         .lights
         .iter()
@@ -202,43 +204,39 @@ pub(super) fn prepare_shadow_maps(
         light.direction[1],
         light.direction[2],
     ];
-    // Small bias to avoid classic shadow-map self-shadow acne. Front-
-    // face cull (in `MeshShadowMapPass`) does most of the heavy
-    // lifting; this just covers the residual when the lit surface
-    // sits very close to its own back-face shadow depth.
-    let depth_bias = 0.001;
 
-    // `scene_aabb` here is `compute_tlas_scene_aabb`'s output — the
-    // tightest world AABB of the visible casters. Passing it to
-    // `compute_light_camera` gives a caster-fit orthographic light
-    // camera, which is dramatically tighter than the camera-frustum
-    // fit that V1 used. For a 1 m elephant 5 m from camera the xy
-    // bounds collapse from ~30 m → ~2 m, taking shadow texels from
-    // ~3 cm → ~2 mm and erasing the stair-stepping. Trade-off:
-    // shadow casters that don't visually overlap the camera view
-    // will still cast (the AABB is whole-scene), but casters
-    // entirely outside the AABB won't reach the map. Acceptable
-    // when the AABB is the union of all live casters.
-    let uniform = compute_light_camera(
-        scene_aabb.0,
-        scene_aabb.1,
-        light_dir,
-        SHADOW_MAP_DEFAULT_SIZE,
-        depth_bias,
-    );
-    // Per-frame shadow-fit diagnostic. Helps diagnose "blocky
-    // shadows" reports — if the scene AABB is large the 1024²
-    // shadow map's texel coverage is intrinsically chunky
-    // regardless of the rasterizer.
-    if std::env::var("RKP_SHADOW_FIT_LOG").is_ok() {
+    // CSM knobs from the scene environment (runtime-configurable
+    // via the editor's Environment panel). Env-var overrides
+    // (RKP_CSM_*) take precedence for headless / CI testing.
+    let csm_max_distance = std::env::var("RKP_CSM_MAX_DISTANCE")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(frame.shadow_csm_max_distance)
+        .clamp(10.0, 1000.0);
+    let csm_lambda = std::env::var("RKP_CSM_LAMBDA")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(frame.shadow_csm_lambda)
+        .clamp(0.0, 1.0);
+    let csm_near = std::env::var("RKP_CSM_NEAR")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(frame.shadow_csm_near)
+        .clamp(0.05, 10.0);
+    let depth_bias = frame.shadow_csm_depth_bias.max(0.0);
+
+    // Optional one-time fit log — extends the existing
+    // RKP_SHADOW_FIT_LOG with the scene-AABB context.
+    let fit_log = std::env::var("RKP_CSM_FIT_LOG").is_ok()
+        || std::env::var("RKP_SHADOW_FIT_LOG").is_ok();
+    if fit_log {
         let dx = scene_aabb.1[0] - scene_aabb.0[0];
         let dy = scene_aabb.1[1] - scene_aabb.0[1];
         let dz = scene_aabb.1[2] - scene_aabb.0[2];
-        let max_extent = dx.max(dy).max(dz);
-        let texel_world = max_extent / SHADOW_MAP_DEFAULT_SIZE as f32;
         eprintln!(
-            "[shadow] scene_aabb extent = {:.2} × {:.2} × {:.2} m → max ~{:.1} m / {} = ~{:.0} mm per shadow-map texel",
-            dx, dy, dz, max_extent, SHADOW_MAP_DEFAULT_SIZE, texel_world * 1000.0,
+            "[csm] scene_aabb extent = {:.2} × {:.2} × {:.2} m, \
+             near = {:.2} m, max_distance = {:.1} m, λ = {:.2}, cascades = {}",
+            dx, dy, dz, csm_near, csm_max_distance, csm_lambda, CSM_CASCADE_COUNT,
         );
     }
 
@@ -247,19 +245,75 @@ pub(super) fn prepare_shadow_maps(
         let Some(vr) = state.viewport_renderers.get_mut(&vp.id) else {
             continue;
         };
-        // Per-VR write — same uniform across all viewports because
-        // the caster fit is camera-independent. Multi-viewport CSM
-        // would diverge here per-VR.
+
+        // Per-VR cascade fit: each viewport's camera frustum drives
+        // its own CSM. The light direction + scene AABB are scene-
+        // wide.
+        let view_proj = glam::Mat4::from_cols_array_2d(&vp.camera.view_proj);
+        let camera_position = glam::Vec3::new(
+            vp.camera.position[0],
+            vp.camera.position[1],
+            vp.camera.position[2],
+        );
+        let camera_forward = glam::Vec3::new(
+            vp.camera.forward[0],
+            vp.camera.forward[1],
+            vp.camera.forward[2],
+        );
+        let csm = compute_csm_cascades(CsmInputs {
+            scene_min: scene_aabb.0,
+            scene_max: scene_aabb.1,
+            camera_view_proj_inv: view_proj.inverse(),
+            camera_position,
+            camera_forward,
+            light_dir,
+            shadow_map_size: SHADOW_MAP_DEFAULT_SIZE,
+            depth_bias,
+            csm_near,
+            csm_max_distance,
+            csm_lambda,
+        });
+
+        if fit_log {
+            for i in 0..CSM_CASCADE_COUNT as usize {
+                let m: glam::Mat4 = glam::Mat4::from_cols_array_2d(
+                    &csm.cascades[i].view_proj_inv,
+                );
+                let p_pos = m * glam::Vec4::new(1.0, 0.0, 0.5, 1.0);
+                let p_neg = m * glam::Vec4::new(-1.0, 0.0, 0.5, 1.0);
+                let world_pos = p_pos.truncate() / p_pos.w;
+                let world_neg = p_neg.truncate() / p_neg.w;
+                let half_width = (world_pos - world_neg).length() * 0.5;
+                let texel_world = (2.0 * half_width)
+                    / SHADOW_MAP_DEFAULT_SIZE as f32;
+                eprintln!(
+                    "[csm]   cascade {i}: far_view_z = {:.2} m, \
+                     half_width = {:.3} m → ~{:.2} mm/texel",
+                    csm.cascade_far_view_z[i],
+                    half_width,
+                    texel_world * 1000.0,
+                );
+            }
+        }
+
+        // Single write of the consolidated 672-byte CSM uniform.
         state.queue.write_buffer(
             &vr.shadow_map.uniform_buffer,
             0,
-            bytemuck::bytes_of(&uniform),
+            bytemuck::bytes_of(&csm),
         );
-        // Phase 6.4: also populate the per-VR shadow LOD-select
-        // camera buffer (CameraUniforms-shaped) from the same
-        // LightCameraUniform so the LOD compute pass picks
-        // shadow-side admit decisions one LOD coarser than primary.
-        vr.write_mesh_lod_shadow_camera(&state.queue, &uniform);
+
+        // Per-cascade synthetic LOD-select camera. The shader picks
+        // the ortho admit path from view_proj[3][3], so each cascade
+        // gets its own CameraUniforms-shaped buffer.
+        for i in 0..CSM_CASCADE_COUNT {
+            vr.write_mesh_lod_shadow_camera(
+                &state.queue,
+                i,
+                &csm.cascades[i as usize],
+            );
+        }
+
         wrote_any = true;
     }
     wrote_any

@@ -856,6 +856,10 @@ impl EngineState {
             lod_enabled: self.lod_enabled,
             surfacenet_enabled: self.surfacenet_enabled,
             shadow_steps: self.environment.shadow_steps,
+            shadow_csm_near: self.environment.shadow_csm_near,
+            shadow_csm_max_distance: self.environment.shadow_csm_max_distance,
+            shadow_csm_lambda: self.environment.shadow_csm_lambda,
+            shadow_csm_depth_bias: self.environment.shadow_csm_depth_bias,
         };
 
         let t_encode = frame_start.elapsed();

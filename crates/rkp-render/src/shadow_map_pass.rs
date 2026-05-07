@@ -54,12 +54,15 @@ pub mod pass;
 pub mod types;
 
 // Public re-exports — keep `rkp_render::shadow_map_pass::Foo` stable.
-pub use light_camera::{compute_light_camera, compute_light_camera_frustum_fit};
+pub use light_camera::{
+    compute_csm_cascades, compute_light_camera, compute_light_camera_frustum_fit, CsmInputs,
+};
 pub use pass::ShadowMapPass;
 pub use types::{
-    LightCameraUniform, SetupParams, SCATTER_INSTANCE_STRIDE, SHADOW_FAR_DISTANCE,
-    SHADOW_MAP_DEFAULT_SIZE, SHADOW_MAP_FAR_DEPTH, SHADOW_MAP_FAR_DEPTH_BITS,
-    SHADOW_MAP_MAX_CASTERS_INITIAL, SHADOW_MAP_WORK_LIST_INITIAL, SHADOW_SCATTER_DISPATCH_X,
+    CSM_CASCADE_COUNT, LightCameraCsm, LightCameraUniform, SetupParams,
+    SCATTER_INSTANCE_STRIDE, SHADOW_FAR_DISTANCE, SHADOW_MAP_DEFAULT_SIZE,
+    SHADOW_MAP_FAR_DEPTH, SHADOW_MAP_FAR_DEPTH_BITS, SHADOW_MAP_MAX_CASTERS_INITIAL,
+    SHADOW_MAP_WORK_LIST_INITIAL, SHADOW_SCATTER_DISPATCH_X,
 };
 
 #[cfg(test)]

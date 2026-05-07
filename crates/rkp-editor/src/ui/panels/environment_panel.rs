@@ -56,6 +56,9 @@ pub fn EnvironmentPanel() -> NodeHandle {
     let sun_intensity = Memo::new(move || store.environment.get().sun_intensity);
 
     let shadow_steps = Memo::new(move || store.environment.get().shadow_steps as f32);
+    let shadow_csm_max_distance = Memo::new(move || store.environment.get().shadow_csm_max_distance);
+    let shadow_csm_lambda = Memo::new(move || store.environment.get().shadow_csm_lambda);
+    let shadow_csm_depth_bias = Memo::new(move || store.environment.get().shadow_csm_depth_bias);
     let ao_radius = Memo::new(move || store.environment.get().ao_radius);
     let ao_steps = Memo::new(move || store.environment.get().ao_steps as f32);
 
@@ -253,6 +256,19 @@ pub fn EnvironmentPanel() -> NodeHandle {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
                     {prop_slider_memo(__scope, "Shadow Steps", shadow_steps, 4.0, 64.0, 4.0, env_f32("shadow_steps"))}
+                    // Shadow Distance: far cap of CSM coverage. Anything past
+                    // this distance falls back to "fully lit". 100 m is a
+                    // reasonable default for the editor; raise for vista
+                    // shots, lower if the scene is small (smaller distance =
+                    // sharper everywhere).
+                    {prop_slider_memo(__scope, "Shadow Distance (m)", shadow_csm_max_distance, 10.0, 500.0, 5.0, env_f32("shadow_csm_max_distance"))}
+                    // Cascade Split λ: how aggressively cascades cluster
+                    // toward the camera. 0.5 = balanced, 0.95 = strong
+                    // near-camera bias (default). Below ~0.7 the slider
+                    // doesn't do much because the uniform-split component
+                    // takes over.
+                    {prop_slider_memo(__scope, "Cascade Split λ", shadow_csm_lambda, 0.5, 1.0, 0.01, env_f32("shadow_csm_lambda"))}
+                    {prop_slider_memo(__scope, "Shadow Depth Bias", shadow_csm_depth_bias, 0.0, 0.01, 0.0001, env_f32("shadow_csm_depth_bias"))}
                     {prop_slider_memo(__scope, "AO Radius", ao_radius, 0.01, 1.0, 0.01, env_f32("ao_radius"))}
                     {prop_slider_memo(__scope, "AO Steps", ao_steps, 1.0, 16.0, 1.0, env_f32("ao_steps"))}
                 }

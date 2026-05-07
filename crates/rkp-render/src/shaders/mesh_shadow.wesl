@@ -22,7 +22,7 @@
 // helper that takes pre-fetched bone palettes is a candidate
 // follow-on, but inline keeps each render-pass self-contained.
 
-import package::lib::types::LightCameraShadow;
+import package::lib::types::LightCameraCsm;
 
 struct MeshShadowInstance {
     world: mat4x4<f32>,
@@ -31,6 +31,16 @@ struct MeshShadowInstance {
     bone_offset_lbs: u32,
     bone_offset_dqs: u32,
     skinning_mode: u32,
+}
+
+/// Per-render-pass uniform selecting which cascade to render this
+/// pass. Engine writes `cascade_index = i` and binds before each
+/// `dispatch_mesh_shadow` cascade iteration. 16 B (vec4 alignment).
+struct MeshShadowParams {
+    cascade_index: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 const SKINNING_MODE_NONE: u32 = 0xFFFFFFFFu;
@@ -46,7 +56,8 @@ struct DualQuat {
 // `skin_deform.wesl`). Declaring it as `mat3x4` would shave 16 B per
 // bone but mismatches the on-GPU stride that the writer uses, which
 // produced "stretched all over" geometry in an earlier draft.
-@group(0) @binding(0) var<uniform> light_camera: LightCameraShadow;
+@group(0) @binding(0) var<uniform> light_camera: LightCameraCsm;
+@group(0) @binding(1) var<uniform> shadow_params: MeshShadowParams;
 @group(0) @binding(2) var<storage, read> bone_matrices: array<mat4x4<f32>>;
 @group(0) @binding(3) var<storage, read> bone_dual_quats: array<DualQuat>;
 
@@ -136,7 +147,8 @@ fn vert_main(
     }
 
     let world_pos = (instance.world * vec4<f32>(skinned_pos, 1.0)).xyz;
-    let clip = light_camera.view_proj * vec4<f32>(world_pos, 1.0);
+    let cam = light_camera.cascades[shadow_params.cascade_index];
+    let clip = cam.view_proj * vec4<f32>(world_pos, 1.0);
     var out: VsOut;
     out.clip_pos = clip;
     return out;

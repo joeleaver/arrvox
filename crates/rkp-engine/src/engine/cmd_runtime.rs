@@ -428,6 +428,26 @@ impl EngineState {
                     "shadow_steps" => {
                         if let Ok(v) = value.parse::<u32>() { env.shadow_steps = v; }
                     }
+                    "shadow_csm_near" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            env.shadow_csm_near = v.clamp(0.05, 10.0);
+                        }
+                    }
+                    "shadow_csm_max_distance" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            env.shadow_csm_max_distance = v.clamp(10.0, 1000.0);
+                        }
+                    }
+                    "shadow_csm_lambda" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            env.shadow_csm_lambda = v.clamp(0.0, 1.0);
+                        }
+                    }
+                    "shadow_csm_depth_bias" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            env.shadow_csm_depth_bias = v.clamp(0.0, 0.05);
+                        }
+                    }
                     "ao_radius" => {
                         if let Ok(v) = value.parse::<f32>() { env.ao_radius = v; }
                     }

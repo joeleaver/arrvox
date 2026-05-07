@@ -29,6 +29,38 @@ pub struct EnvironmentSettings {
     // ── Shadows ─────────────────────────────────────────────────────
     pub shadow_steps: u32,
 
+    /// CSM near distance, in metres. The four cascades partition
+    /// `[shadow_csm_near, shadow_csm_max_distance]`. NOT exposed in
+    /// the editor UI — raising it actually *worsens* cascade 0's
+    /// resolution because the slice [near, split1] then covers a
+    /// wider mid-range chunk of the camera frustum (the bounding
+    /// sphere grows with the *screen* footprint of the slice, not
+    /// with the camera distance). Pinning to 0.1 m keeps cascade 0
+    /// tight against the eye. Power users can override via
+    /// `RKP_CSM_NEAR=...` for headless tuning.
+    pub shadow_csm_near: f32,
+    /// CSM (Cascaded Shadow Maps) far-distance cap, in metres. The four
+    /// cascades partition `[shadow_csm_near, shadow_csm_max_distance]`.
+    /// Anything beyond this distance is treated as fully lit (matches
+    /// today's "out-of-bounds → 1.0" behaviour at the single-cascade
+    /// edge).
+    pub shadow_csm_max_distance: f32,
+    /// PSSM hybrid factor. 0 = uniform (linear) splits across the
+    /// full range (mid-range bias); 1 = log (geometric) splits
+    /// (near-camera bias). With our `[0.1, 100]` m default range the
+    /// uniform component dominates below λ ≈ 0.7, which is why the
+    /// editor slider doesn't do much under that. Default 0.95 puts
+    /// cascade 0 ≈ `[0.1, 1.79]` m → ~5 mm/texel at 1024². Drop
+    /// toward 0.5 if mid-range shadows are visibly chunky; raise
+    /// toward 1.0 for the sharpest near-camera detail at the cost
+    /// of coarser far cascades.
+    pub shadow_csm_lambda: f32,
+    /// Additive depth bias applied to the surface depth before the
+    /// shadow-map compare (light-space NDC z units). Positive pushes
+    /// the surface toward the light → less self-shadowing at the cost
+    /// of peter-panning. Replaces the previously-hardcoded 0.001.
+    pub shadow_csm_depth_bias: f32,
+
     // ── Ambient occlusion ───────────────────────────────────────────
     pub ao_radius: f32,
     pub ao_steps: u32,
@@ -115,6 +147,10 @@ impl Default for EnvironmentSettings {
             sun_color_override: None,
             sun_intensity: 110_000.0,
             shadow_steps: 32,
+            shadow_csm_near: 0.1,
+            shadow_csm_max_distance: 100.0,
+            shadow_csm_lambda: 0.95,
+            shadow_csm_depth_bias: 0.001,
             ao_radius: 0.1,
             ao_steps: 5,
             exposure: 0.0000254, // EV100=15 (sunny-16 rule): 1/(1.2 × 2^15)

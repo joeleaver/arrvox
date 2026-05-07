@@ -21,7 +21,8 @@ use crate::proc_raymarch::ProcRaymarchPass;
 use crate::proc_outline::ProcOutlinePass;
 use crate::proc_ghost::ProcGhostPass;
 use crate::rkp_shadow_trace::ShadowTracePass;
-use crate::shadow_map_pass::{ShadowMapPass, SHADOW_MAP_DEFAULT_SIZE};
+use crate::shadow_map_pass::{ShadowMapPass, CSM_CASCADE_COUNT, SHADOW_MAP_DEFAULT_SIZE};
+use crate::mesh_shadow_map_pass::{MeshShadowParams, MeshShadowBlitParams};
 use crate::rkp_ssao::RkpSsaoPass;
 use crate::rkp_shade::RkpShadePass;
 use crate::rkp_volumetric::RkpVolumetricPass;
@@ -146,23 +147,34 @@ pub struct ViewportRenderer {
     pub splat_resolve_g1_bg: Option<wgpu::BindGroup>,
     pub splat_resolve_scene_epoch: u64,
 
-    // ── Mesh-rendered shadow-map per-VR state (Phase 3) ────────────
-    /// 1024×1024 `Depth32Float` texture used by `MeshShadowMapPass`.
-    /// Filled by depth-only rasterization, then read by the blit
-    /// compute pass which copies bitcast(depth) into `shadow_map.
-    /// shadow_buffer` for shade to sample.
+    // ── Mesh-rendered shadow-map per-VR state (Phase 3 + CSM) ──────
+    /// 1024×1024 `Depth32Float` texture array (4 layers — one per
+    /// cascade). Filled by depth-only rasterization, then read by
+    /// the blit compute pass which copies bitcast(depth) into the
+    /// matching slice of `shadow_map.shadow_buffer` for shade to
+    /// sample.
     pub mesh_shadow_depth_texture: wgpu::Texture,
-    pub mesh_shadow_depth_view: wgpu::TextureView,
-    /// Cached render `g0` for the mesh-shadow pipeline — `light_camera`
-    /// uniform plus the scene's bone palettes (Phase 6.6 VS skinning).
-    /// Now follows `scene.buffers_epoch()` so a bone-buffer realloc
-    /// triggers a rebuild; previously it was build-once because all
-    /// referenced buffers had stable lifetimes.
-    pub mesh_shadow_render_g0_bg: Option<wgpu::BindGroup>,
-    /// Epoch the shadow render g0 bg was last built against.
+    /// Per-layer views (one per cascade) for use as
+    /// `RenderPassDepthStencilAttachment.view`. Indexed by cascade.
+    pub mesh_shadow_depth_views: Vec<wgpu::TextureView>,
+    /// Per-cascade render `g0` for the mesh-shadow pipeline —
+    /// `light_camera` (CSM uniform) + per-cascade `MeshShadowParams`
+    /// + bone palettes (Phase 6.6 VS skinning). Indexed by cascade.
+    /// Follows `scene.buffers_epoch()` so a bone-buffer realloc
+    /// triggers a rebuild.
+    pub mesh_shadow_render_g0_bgs: Vec<Option<wgpu::BindGroup>>,
+    /// Per-cascade `MeshShadowParams` uniform buffer (16 B). Each
+    /// holds `cascade_index = i` so the render VS can pick the
+    /// matching cascade from the shared `LightCameraCsm`.
+    pub mesh_shadow_render_params_buffers: Vec<wgpu::Buffer>,
+    /// Epoch the shadow render g0 bgs were last built against.
     pub mesh_shadow_render_g0_scene_epoch: u64,
-    /// Cached blit `g0` — `depth_view` + `shadow_map.shadow_buffer`.
-    pub mesh_shadow_blit_g0_bg: Option<wgpu::BindGroup>,
+    /// Per-cascade blit `g0` — depth-layer view +
+    /// `shadow_map.shadow_buffer` + per-cascade
+    /// `MeshShadowBlitParams`.
+    pub mesh_shadow_blit_g0_bgs: Vec<Option<wgpu::BindGroup>>,
+    /// Per-cascade `MeshShadowBlitParams` uniform buffer (16 B).
+    pub mesh_shadow_blit_params_buffers: Vec<wgpu::Buffer>,
 
     // ── Mesh per-cluster LOD-select per-VR state (Phase 6.2/6.3) ───
     /// Per-draw `MeshLodSelectParams` uniform (16 B). Slot index
@@ -181,27 +193,27 @@ pub struct ViewportRenderer {
     /// populates it; `(handle, cap)` as the freshness key.
     pub mesh_lod_select_g2_bgs: Vec<Option<(wgpu::BindGroup, u32, u32)>>,
 
-    // ── Mesh shadow LOD-select per-VR state (Phase 6.4) ────────────
-    /// `CameraUniforms`-shaped buffer populated each frame from the
-    /// active light camera. Carries the light's `view_proj` (so the
-    /// LOD shader gets the ortho focal-length factor),
-    /// `resolution = shadow_map_size`, and the eye position derived
-    /// from `view_proj_inv * (0,0,0,1)`. Other fields zeroed; the
-    /// LOD shader doesn't read them.
-    pub mesh_lod_shadow_camera_buffer: wgpu::Buffer,
-    /// Parallel to `mesh_lod_params_buffers` — per-draw shadow
-    /// params with doubled `pixel_threshold` for `lod + 1` selection.
-    pub mesh_lod_shadow_params_buffers: Vec<wgpu::Buffer>,
-    /// Parallel to `mesh_lod_args_buffers` — separate args storage
-    /// for the shadow path so primary and shadow can run their
-    /// compute passes back-to-back without aliasing.
-    pub mesh_lod_shadow_args_buffers: Vec<(wgpu::Buffer, u32)>,
-    /// Parallel to `mesh_lod_select_g0_bgs` — bound to the
-    /// synthetic shadow camera buffer + per-draw shadow params.
-    pub mesh_lod_shadow_g0_bgs: Vec<wgpu::BindGroup>,
-    /// Parallel to `mesh_lod_select_g2_bgs` — bound to the asset
-    /// cluster table + the shadow args buffer.
-    pub mesh_lod_shadow_g2_bgs: Vec<Option<(wgpu::BindGroup, u32, u32)>>,
+    // ── Mesh shadow LOD-select per-VR state (Phase 6.4 + CSM) ──────
+    /// Per-cascade `CameraUniforms`-shaped buffer populated each
+    /// frame from the active cascade's light camera. Indexed by
+    /// cascade. Carries `view_proj` for the ortho focal-length
+    /// factor, `resolution = shadow_map_size`, and the eye position
+    /// derived from `view_proj_inv * (0,0,0,1)`.
+    pub mesh_lod_shadow_camera_buffers: Vec<wgpu::Buffer>,
+    /// Per-draw × per-cascade shadow LOD params. `pixel_threshold`
+    /// scales as `base * 2^cascade_index` so the far cascade culls
+    /// hardest. Outer index = draw slot, inner index = cascade.
+    pub mesh_lod_shadow_params_buffers: Vec<Vec<wgpu::Buffer>>,
+    /// Per-draw × per-cascade args storage. Separate from primary
+    /// args so each cascade can run its LOD-select + render
+    /// back-to-back without aliasing.
+    pub mesh_lod_shadow_args_buffers: Vec<Vec<(wgpu::Buffer, u32)>>,
+    /// Per-draw × per-cascade `g0` bind group: the cascade's
+    /// synthetic camera + the cascade's params buffer.
+    pub mesh_lod_shadow_g0_bgs: Vec<Vec<wgpu::BindGroup>>,
+    /// Per-draw × per-cascade `g2` bind group: cluster table +
+    /// cascade-specific args.
+    pub mesh_lod_shadow_g2_bgs: Vec<Vec<Option<(wgpu::BindGroup, u32, u32)>>>,
 
     // ── Mesh LOD admit stats (RKP_MESH_LOD_STATS=1 diagnostic) ─────
     /// Pass-shared 32 B (8 × u32) histograms. Slots 0..4: admitted
@@ -278,17 +290,18 @@ impl ViewportRenderer {
             mapped_at_creation: false,
         });
 
-        // Synthetic camera buffer used by the mesh-shadow LOD-select
-        // compute pass (Phase 6.4). Filled each frame from the active
-        // light camera so the shader's `view_proj[1][1]` /
-        // `view_proj[3][3]` switch picks the orthographic projection
-        // formula and `resolution.y` carries the shadow map size.
-        let mesh_lod_shadow_camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rkp_vr_mesh_lod_shadow_camera"),
-            size: std::mem::size_of::<CameraUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // Per-cascade synthetic camera buffers used by the mesh-shadow
+        // LOD-select compute pass (Phase 6.4 + CSM). One CameraUniforms
+        // per cascade; engine writes each before that cascade's
+        // LOD-select dispatch.
+        let mesh_lod_shadow_camera_buffers: Vec<wgpu::Buffer> = (0..CSM_CASCADE_COUNT)
+            .map(|i| device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("rkp_vr_mesh_lod_shadow_camera_csm{i}")),
+                size: std::mem::size_of::<CameraUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }))
+            .collect();
         let (scene_bind_group, scene_epoch) = {
             let scene: &RkpScene = &renderer.scene;
             (scene.build_bind_group(device, &camera_buffer), scene.buffers_epoch())
@@ -376,18 +389,20 @@ impl ViewportRenderer {
             &renderer.scene.bind_group_layout,
         );
 
-        // Phase 3 (splat-to-mesh pivot) — depth attachment for the
-        // mesh-shadow render pass. The render writes here (vertex +
-        // rasterizer + depth-only, no fragment shader); the blit
-        // compute pass reads it back and copies bitcast(depth) into
+        // Phase 3 (splat-to-mesh pivot) + CSM — depth attachment for
+        // the mesh-shadow render pass. The render writes per-cascade
+        // (vertex + rasterizer + depth-only, no fragment shader); the
+        // blit compute pass reads each layer back and copies
+        // bitcast(depth) into the matching slice of
         // `shadow_map.shadow_buffer`. Hence both `RENDER_ATTACHMENT`
-        // and `TEXTURE_BINDING` usage.
+        // and `TEXTURE_BINDING` usage. `depth_or_array_layers =
+        // CSM_CASCADE_COUNT` — one layer per cascade.
         let mesh_shadow_depth_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("rkp_mesh_shadow_depth"),
             size: wgpu::Extent3d {
                 width: SHADOW_MAP_DEFAULT_SIZE,
                 height: SHADOW_MAP_DEFAULT_SIZE,
-                depth_or_array_layers: 1,
+                depth_or_array_layers: CSM_CASCADE_COUNT,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -396,8 +411,53 @@ impl ViewportRenderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let mesh_shadow_depth_view = mesh_shadow_depth_texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mesh_shadow_depth_views: Vec<wgpu::TextureView> = (0..CSM_CASCADE_COUNT)
+            .map(|i| mesh_shadow_depth_texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some(&format!("rkp_mesh_shadow_depth_csm{i}")),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: i,
+                array_layer_count: Some(1),
+                aspect: wgpu::TextureAspect::DepthOnly,
+                ..Default::default()
+            }))
+            .collect();
+
+        // Per-cascade `MeshShadowParams` (16 B) — each holds
+        // `cascade_index = i`. Static after init; the render g0
+        // bind groups bind these.
+        let mesh_shadow_render_params_buffers: Vec<wgpu::Buffer> = (0..CSM_CASCADE_COUNT)
+            .map(|i| {
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("mesh_shadow_render_params_csm{i}")),
+                    size: std::mem::size_of::<MeshShadowParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                queue.write_buffer(&buf, 0, bytemuck::bytes_of(&MeshShadowParams {
+                    cascade_index: i,
+                    _pad0: 0, _pad1: 0, _pad2: 0,
+                }));
+                buf
+            })
+            .collect();
+
+        // Per-cascade `MeshShadowBlitParams` (16 B) — same shape, also
+        // static.
+        let mesh_shadow_blit_params_buffers: Vec<wgpu::Buffer> = (0..CSM_CASCADE_COUNT)
+            .map(|i| {
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("mesh_shadow_blit_params_csm{i}")),
+                    size: std::mem::size_of::<MeshShadowBlitParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                queue.write_buffer(&buf, 0, bytemuck::bytes_of(&MeshShadowBlitParams {
+                    cascade_index: i,
+                    _pad0: 0, _pad1: 0, _pad2: 0,
+                }));
+                buf
+            })
+            .collect();
 
         let mut shade = RkpShadePass::new(device, width, height);
         shade.set_shade_data(
@@ -511,15 +571,17 @@ impl ViewportRenderer {
             splat_resolve_g1_bg: None,
             splat_resolve_scene_epoch: u64::MAX,
             mesh_shadow_depth_texture,
-            mesh_shadow_depth_view,
-            mesh_shadow_render_g0_bg: None,
+            mesh_shadow_depth_views,
+            mesh_shadow_render_g0_bgs: vec![None; CSM_CASCADE_COUNT as usize],
+            mesh_shadow_render_params_buffers,
             mesh_shadow_render_g0_scene_epoch: u64::MAX,
-            mesh_shadow_blit_g0_bg: None,
+            mesh_shadow_blit_g0_bgs: vec![None; CSM_CASCADE_COUNT as usize],
+            mesh_shadow_blit_params_buffers,
             mesh_lod_params_buffers: Vec::new(),
             mesh_lod_args_buffers: Vec::new(),
             mesh_lod_select_g0_bgs: Vec::new(),
             mesh_lod_select_g2_bgs: Vec::new(),
-            mesh_lod_shadow_camera_buffer,
+            mesh_lod_shadow_camera_buffers,
             mesh_lod_shadow_params_buffers: Vec::new(),
             mesh_lod_shadow_args_buffers: Vec::new(),
             mesh_lod_shadow_g0_bgs: Vec::new(),
@@ -622,25 +684,31 @@ impl ViewportRenderer {
         renderer: &RkpRenderer,
     ) {
         let scene_now = renderer.scene.buffers_epoch();
-        if self.mesh_shadow_render_g0_bg.is_none()
-            || self.mesh_shadow_render_g0_scene_epoch != scene_now
-        {
-            self.mesh_shadow_render_g0_bg =
-                Some(renderer.mesh_shadow_map.create_render_g0_bind_group(
-                    device,
-                    &self.shadow_map.uniform_buffer,
-                    &renderer.scene.bone_matrices_buffer,
-                    &renderer.scene.bone_dual_quats_buffer,
-                ));
+        let needs_render = self.mesh_shadow_render_g0_bgs.iter().any(Option::is_none)
+            || self.mesh_shadow_render_g0_scene_epoch != scene_now;
+        if needs_render {
+            for i in 0..CSM_CASCADE_COUNT as usize {
+                self.mesh_shadow_render_g0_bgs[i] =
+                    Some(renderer.mesh_shadow_map.create_render_g0_bind_group(
+                        device,
+                        &self.shadow_map.uniform_buffer,
+                        &self.mesh_shadow_render_params_buffers[i],
+                        &renderer.scene.bone_matrices_buffer,
+                        &renderer.scene.bone_dual_quats_buffer,
+                    ));
+            }
             self.mesh_shadow_render_g0_scene_epoch = scene_now;
         }
-        if self.mesh_shadow_blit_g0_bg.is_none() {
-            self.mesh_shadow_blit_g0_bg =
-                Some(renderer.mesh_shadow_map.create_blit_g0_bind_group(
-                    device,
-                    &self.mesh_shadow_depth_view,
-                    &self.shadow_map.shadow_buffer,
-                ));
+        for i in 0..CSM_CASCADE_COUNT as usize {
+            if self.mesh_shadow_blit_g0_bgs[i].is_none() {
+                self.mesh_shadow_blit_g0_bgs[i] =
+                    Some(renderer.mesh_shadow_map.create_blit_g0_bind_group(
+                        device,
+                        &self.mesh_shadow_depth_views[i],
+                        &self.shadow_map.shadow_buffer,
+                        &self.mesh_shadow_blit_params_buffers[i],
+                    ));
+            }
         }
     }
 
@@ -793,72 +861,92 @@ impl ViewportRenderer {
     ) {
         use crate::mesh_lod_select_pass::MeshLodSelectParams;
         let needed = count as usize;
+        let n = CSM_CASCADE_COUNT as usize;
         while self.mesh_lod_shadow_params_buffers.len() < needed {
-            let buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("mesh_lod_shadow params"),
-                size: std::mem::size_of::<MeshLodSelectParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let bg = renderer.mesh_lod_select_pass.create_g0_bind_group(
-                device,
-                &self.mesh_lod_shadow_camera_buffer,
-                &buf,
-            );
-            self.mesh_lod_shadow_params_buffers.push(buf);
-            self.mesh_lod_shadow_g0_bgs.push(bg);
-            self.mesh_lod_shadow_args_buffers.push((
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("mesh_lod_shadow args (placeholder)"),
-                    size: std::mem::size_of::<crate::mesh_lod_select_pass::DrawIndexedIndirectArgs>()
-                        as u64,
-                    usage: wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::INDIRECT
-                        | wgpu::BufferUsages::COPY_DST,
+            // For this draw-slot, allocate one per-cascade entry in
+            // each parallel array (params buffer, g0 bind group,
+            // placeholder args, g2 cache).
+            let mut params_per_cascade: Vec<wgpu::Buffer> = Vec::with_capacity(n);
+            let mut g0_per_cascade: Vec<wgpu::BindGroup> = Vec::with_capacity(n);
+            let mut args_per_cascade: Vec<(wgpu::Buffer, u32)> = Vec::with_capacity(n);
+            let mut g2_per_cascade: Vec<Option<(wgpu::BindGroup, u32, u32)>> =
+                Vec::with_capacity(n);
+            for i in 0..n {
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("mesh_lod_shadow params csm{i}")),
+                    size: std::mem::size_of::<MeshLodSelectParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
-                }),
-                0,
-            ));
-            self.mesh_lod_shadow_g2_bgs.push(None);
+                });
+                let bg = renderer.mesh_lod_select_pass.create_g0_bind_group(
+                    device,
+                    &self.mesh_lod_shadow_camera_buffers[i],
+                    &buf,
+                );
+                params_per_cascade.push(buf);
+                g0_per_cascade.push(bg);
+                args_per_cascade.push((
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(&format!("mesh_lod_shadow args csm{i} (placeholder)")),
+                        size: std::mem::size_of::<crate::mesh_lod_select_pass::DrawIndexedIndirectArgs>()
+                            as u64,
+                        usage: wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::INDIRECT
+                            | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }),
+                    0,
+                ));
+                g2_per_cascade.push(None);
+            }
+            self.mesh_lod_shadow_params_buffers.push(params_per_cascade);
+            self.mesh_lod_shadow_g0_bgs.push(g0_per_cascade);
+            self.mesh_lod_shadow_args_buffers.push(args_per_cascade);
+            self.mesh_lod_shadow_g2_bgs.push(g2_per_cascade);
         }
     }
 
-    /// Grow the per-slot shadow args buffer to fit `cluster_count`
-    /// entries; invalidates the cached `g2` shadow bind group.
+    /// Grow the per-slot, per-cascade shadow args buffer to fit
+    /// `cluster_count` entries; invalidates the cached `g2` shadow
+    /// bind group for that cascade.
     pub fn ensure_mesh_lod_shadow_args_capacity(
         &mut self,
         device: &wgpu::Device,
         slot: u32,
+        cascade: u32,
         cluster_count: u32,
     ) {
         use crate::mesh_lod_select_pass::DrawIndexedIndirectArgs;
         let i = slot as usize;
-        let (_, cap) = self.mesh_lod_shadow_args_buffers[i];
+        let c = cascade as usize;
+        let (_, cap) = self.mesh_lod_shadow_args_buffers[i][c];
         if cap >= cluster_count {
             return;
         }
         let new_cap = cluster_count.next_power_of_two().max(64);
         let new_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mesh_lod_shadow args"),
+            label: Some(&format!("mesh_lod_shadow args slot{i} csm{c}")),
             size: (new_cap as u64) * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::INDIRECT
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.mesh_lod_shadow_args_buffers[i] = (new_buf, new_cap);
-        self.mesh_lod_shadow_g2_bgs[i] = None;
+        self.mesh_lod_shadow_args_buffers[i][c] = (new_buf, new_cap);
+        self.mesh_lod_shadow_g2_bgs[i][c] = None;
     }
 
-    /// Populate `mesh_lod_shadow_camera_buffer` from the active light
-    /// camera. The LOD-select shader reads `position` (eye for
-    /// view_distance — unused under ortho), `view_proj` (the [1][1]
-    /// is the ortho-or-perspective focal factor; [3][3] = 1 picks
-    /// the ortho path), and `resolution.y` (shadow map height).
-    /// Other CameraUniforms fields aren't read; we leave them zero.
+    /// Populate `mesh_lod_shadow_camera_buffers[cascade]` from the
+    /// matching cascade's light camera. The LOD-select shader reads
+    /// `position` (eye for view_distance — unused under ortho),
+    /// `view_proj` (the [1][1] is the ortho-or-perspective focal
+    /// factor; [3][3] = 1 picks the ortho path), and `resolution.y`
+    /// (shadow map height). Other CameraUniforms fields aren't
+    /// read; we leave them zero.
     pub fn write_mesh_lod_shadow_camera(
         &self,
         queue: &wgpu::Queue,
+        cascade: u32,
         light: &crate::shadow_map_pass::LightCameraUniform,
     ) {
         // Eye in world space = view_proj_inv * (0,0,0,1) / w.
@@ -884,7 +972,7 @@ impl ViewportRenderer {
             view_proj: light.view_proj,
         };
         queue.write_buffer(
-            &self.mesh_lod_shadow_camera_buffer,
+            &self.mesh_lod_shadow_camera_buffers[cascade as usize],
             0,
             bytemuck::bytes_of(&cam),
         );

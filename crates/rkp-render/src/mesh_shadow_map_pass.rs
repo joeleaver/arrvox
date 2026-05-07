@@ -27,6 +27,35 @@ use crate::shadow_map_pass::types::SHADOW_MAP_DEFAULT_SIZE;
 
 use rkp_core::mesh_extract::MeshVertex;
 
+/// Wire format for the per-cascade `MeshShadowParams` uniform read by
+/// the depth-only render VS. 16 B (vec4 alignment). Mirror of the
+/// WGSL struct in `mesh_shadow.wesl`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MeshShadowParams {
+    pub cascade_index: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MeshShadowParams>() == 16);
+
+/// Wire format for the per-cascade `BlitParams` uniform read by the
+/// depth → shadow_buffer blit. Same shape as `MeshShadowParams`;
+/// kept as a separate type for clarity (different binding, different
+/// shader). 16 B.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MeshShadowBlitParams {
+    pub cascade_index: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MeshShadowBlitParams>() == 16);
+
 /// Render-pipeline owner for the mesh path's directional shadow map.
 /// One pipeline shared across viewports — per-VR state (depth texture,
 /// g0 bind group) lives in `ViewportRenderer`.
@@ -55,8 +84,25 @@ impl MeshShadowMapPass {
         let render_g0_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("mesh_shadow render g0"),
             entries: &[
+                // light_camera: LightCameraCsm (672 B). Engine binds
+                // the same buffer for every cascade — the cascade
+                // selection happens via `shadow_params.cascade_index`
+                // below.
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // shadow_params: MeshShadowParams (16 B). Per-cascade
+                // bind groups bind a different params buffer, each
+                // holding `cascade_index = i`.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
                     visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -210,6 +256,18 @@ impl MeshShadowMapPass {
                     },
                     count: None,
                 },
+                // params: MeshShadowBlitParams (16 B) — holds the
+                // cascade_index for the slice offset into shadow_buffer.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -243,12 +301,16 @@ impl MeshShadowMapPass {
         }
     }
 
-    /// Build the per-VR render `g0` bind group — light_camera uniform
-    /// + bone_matrices / bone_dual_quats (Phase 6.6).
+    /// Build a per-cascade render `g0` bind group — light_camera CSM
+    /// uniform + per-cascade `MeshShadowParams` + bone palettes
+    /// (Phase 6.6). The light_camera buffer is shared across all
+    /// cascades; only the `params_buffer` differs (each holds the
+    /// matching `cascade_index`).
     pub fn create_render_g0_bind_group(
         &self,
         device: &wgpu::Device,
         light_camera_buffer: &wgpu::Buffer,
+        shadow_params_buffer: &wgpu::Buffer,
         bone_matrices_buffer: &wgpu::Buffer,
         bone_dual_quats_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
@@ -259,6 +321,10 @@ impl MeshShadowMapPass {
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: light_camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: shadow_params_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -272,13 +338,15 @@ impl MeshShadowMapPass {
         })
     }
 
-    /// Build the per-VR blit `g0` bind group — depth texture view +
-    /// shadow_buffer.
+    /// Build a per-cascade blit `g0` bind group — depth-layer view +
+    /// shadow_buffer + per-cascade `MeshShadowBlitParams`. The depth
+    /// view should target the cascade's array layer.
     pub fn create_blit_g0_bind_group(
         &self,
         device: &wgpu::Device,
         depth_view: &wgpu::TextureView,
         shadow_buffer: &wgpu::Buffer,
+        blit_params_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mesh_shadow blit g0 bg"),
@@ -291,6 +359,10 @@ impl MeshShadowMapPass {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: shadow_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: blit_params_buffer.as_entire_binding(),
                 },
             ],
         })

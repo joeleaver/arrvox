@@ -222,6 +222,19 @@ pub struct RenderFrame {
     /// Shadow trace step cap (from environment). Snapshotted so
     /// render doesn't need to read environment on its thread.
     pub shadow_steps: u32,
+
+    /// CSM near distance (metres). Frame's mesh-mode shadow setup
+    /// partitions `[shadow_csm_near, shadow_csm_max_distance]` into
+    /// `CSM_CASCADE_COUNT` slices.
+    pub shadow_csm_near: f32,
+    /// CSM far-distance cap (metres). Frame's mesh-mode shadow setup
+    /// partitions `[shadow_csm_near, shadow_csm_max_distance]` into
+    /// `CSM_CASCADE_COUNT` slices.
+    pub shadow_csm_max_distance: f32,
+    /// PSSM hybrid factor for cascade splits (0 = uniform, 1 = log).
+    pub shadow_csm_lambda: f32,
+    /// Per-cascade additive depth bias used in `LightCameraUniform`.
+    pub shadow_csm_depth_bias: f32,
 }
 
 /// Per-viewport render data — enough for the render thread to upload

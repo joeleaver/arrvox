@@ -904,194 +904,243 @@ impl RkpRenderer {
         // the LOD-0 prefix, just like the Phase 1-3 baseline.
         let direct_mode = std::env::var("RKP_MESH_DEBUG_DIRECT").is_ok();
 
-        // Phase 6.4: per-draw shadow LOD-select prep. Same shape as
-        // the primary path in `dispatch_mesh`, but with a doubled
-        // pixel threshold so the Karis admit rule effectively picks
-        // `lod + 1` from the same chain that primary uses.
-        //
-        // `RKP_MESH_SHADOW_LOD_THRESHOLD` overrides the compile-time
-        // default. Mirrors `RKP_MESH_LOD_THRESHOLD` for the primary path.
+        // Per-cascade base pixel threshold + falloff. Each cascade
+        // scales the base by `falloff^cascade_index` so the far
+        // cascade culls hardest. Default base 2.0 (one LOD coarser
+        // than primary's 1.0) and falloff 4.0 → cascades 0..3 use
+        // thresholds {2, 8, 32, 128}, which keeps far-cascade cluster
+        // counts in the ~1 % range of the primary path. Override
+        // with `RKP_MESH_SHADOW_LOD_THRESHOLD` (base) and
+        // `RKP_CSM_THRESHOLD_FALLOFF` (per-cascade scale).
         const PIXEL_THRESHOLD_SHADOW: f32 = 2.0;
-        let pixel_threshold_shadow = pixel_threshold_env(
+        const CSM_THRESHOLD_FALLOFF: f32 = 4.0;
+        let base_threshold = pixel_threshold_env(
             "RKP_MESH_SHADOW_LOD_THRESHOLD",
             PIXEL_THRESHOLD_SHADOW,
         );
+        let threshold_falloff = std::env::var("RKP_CSM_THRESHOLD_FALLOFF")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(CSM_THRESHOLD_FALLOFF)
+            .max(1.0);
         let lod_stats_enabled = std::env::var("RKP_MESH_LOD_STATS").is_ok();
         let pipestats_enabled = std::env::var("RKP_MESH_PIPESTATS").is_ok();
+        let force_admit = std::env::var("RKP_MESH_DEBUG_FORCE_ADMIT").is_ok();
+        let max_draws_override = std::env::var("RKP_MESH_DEBUG_MAX_DRAWS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok());
+
+        let cascade_count = crate::shadow_map_pass::CSM_CASCADE_COUNT as usize;
+
+        // Determine per-slot eligibility once — the same set of slots
+        // applies to every cascade (they all read the same cluster
+        // table; only `pixel_threshold` differs).
         let mut slot_active: Vec<bool> = vec![false; draws.len()];
         for (slot, d) in draws.iter().enumerate() {
             if self.mesh_buffer(d.asset_handle_raw).is_none() {
                 continue;
             }
-            let Some((cluster_buf, cluster_count)) =
-                self.mesh_cluster_buffer(d.asset_handle_raw)
-            else {
+            let Some((_, cluster_count)) = self.mesh_cluster_buffer(d.asset_handle_raw) else {
                 continue;
             };
             if cluster_count == 0 {
                 continue;
             }
-            let asset_handle_raw = d.asset_handle_raw;
-
-            viewport.ensure_mesh_lod_shadow_args_capacity(
-                &self.device,
-                slot as u32,
-                cluster_count,
-            );
-
-            let (args_buf, args_cap) = &viewport.mesh_lod_shadow_args_buffers[slot];
-            let need_rebuild = match &viewport.mesh_lod_shadow_g2_bgs[slot] {
-                Some((_, cached_handle, cached_cap)) => {
-                    *cached_handle != asset_handle_raw || *cached_cap != *args_cap
-                }
-                None => true,
-            };
-            if need_rebuild {
-                let bg = self.mesh_lod_select_pass.create_g2_bind_group(
-                    &self.device,
-                    cluster_buf,
-                    args_buf,
-                    &viewport.mesh_lod_admit_stats_shadow,
-                );
-                viewport.mesh_lod_shadow_g2_bgs[slot] = Some((bg, asset_handle_raw, *args_cap));
-            }
-
-            let params = crate::mesh_lod_select_pass::MeshLodSelectParams {
-                pixel_threshold: pixel_threshold_shadow,
-                cluster_count,
-                force_admit: if std::env::var("RKP_MESH_DEBUG_FORCE_ADMIT").is_ok() {
-                    1
-                } else {
-                    0
-                },
-                record_stats: lod_stats_enabled as u32,
-            };
-            queue.write_buffer(
-                &viewport.mesh_lod_shadow_params_buffers[slot],
-                0,
-                bytemuck::bytes_of(&params),
-            );
-
             slot_active[slot] = true;
         }
 
-        // 0. Shadow-side LOD-select compute pass.
-        if !direct_mode {
-            if lod_stats_enabled {
-                viewport.lod_stats_drain_shadow("shadow");
-                viewport.lod_stats_clear_shadow(encoder);
-            }
+        // ── Per-cascade loop ───────────────────────────────────────
+        for cascade in 0..cascade_count {
+            // Cascade-scaled pixel threshold: cascade 0 admits more
+            // (sharp shadows near camera); cascade N-1 admits very
+            // few (cheap far coverage). Keeps total shadow GPU cost
+            // comparable to the single-cascade baseline.
+            let pixel_threshold =
+                base_threshold * threshold_falloff.powi(cascade as i32);
 
-            let q_lod = self.profiler.begin_query("mesh_shadow_lod_select", encoder);
-            {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("mesh_shadow_lod_select"),
-                    timestamp_writes: None,
-                });
-                if pipestats_enabled {
-                    cpass.begin_pipeline_statistics_query(
-                        &viewport.mesh_pipestats_query_set, 2,
-                    );
-                }
-                for (slot, d) in draws.iter().enumerate() {
-                    if !slot_active[slot] {
-                        continue;
-                    }
-                    let cluster_count = self
-                        .mesh_cluster_buffer(d.asset_handle_raw)
-                        .map(|(_, c)| c)
-                        .unwrap_or(0);
-                    let g0 = &viewport.mesh_lod_shadow_g0_bgs[slot];
-                    let g1 = &viewport.splat_instance_bind_groups[slot];
-                    let g2 = &viewport
-                        .mesh_lod_shadow_g2_bgs[slot]
-                        .as_ref()
-                        .expect("g2 set above for active slot")
-                        .0;
-                    self.mesh_lod_select_pass
-                        .dispatch(&mut cpass, g0, g1, g2, cluster_count);
-                }
-                if pipestats_enabled {
-                    cpass.end_pipeline_statistics_query();
-                }
-            }
-            self.profiler.end_query(encoder, q_lod);
+            // Stats / pipestats: only collected on cascade 0 to avoid
+            // multiplying query sets. Most useful for correctness +
+            // tuning anyway; per-cascade breakdowns are a follow-up.
+            let collect_stats = lod_stats_enabled && cascade == 0;
+            let collect_pipestats = pipestats_enabled && cascade == 0;
 
-            if lod_stats_enabled {
-                viewport.lod_stats_finalize_shadow(encoder);
-            }
-        }
-
-        // 1. Depth-only render. Vertex transforms through light_camera
-        //    view-proj; rasterizer fills the depth attachment. No
-        //    fragment shader, so the GPU's early-z runs at full speed.
-        let render_g0 = viewport
-            .mesh_shadow_render_g0_bg
-            .as_ref()
-            .expect("mesh_shadow render g0 bg present after refresh");
-        let q_render = self.profiler.begin_query("mesh_shadow_render", encoder);
-        {
-            let mut rp = self.mesh_shadow_map.begin_render_pass(
-                encoder,
-                &viewport.mesh_shadow_depth_view,
-                None,
-            );
-            rp.set_pipeline(&self.mesh_shadow_map.render_pipeline);
-            rp.set_bind_group(0, render_g0, &[]);
-            if pipestats_enabled {
-                rp.begin_pipeline_statistics_query(
-                    &viewport.mesh_pipestats_query_set, 3,
-                );
-            }
+            // Per-slot prep for this cascade: ensure args buffer +
+            // (re)build g2 bg + write params with this cascade's
+            // pixel threshold.
             for (slot, d) in draws.iter().enumerate() {
-                let Some((vbo, ibo, lod0_index_count)) = self.mesh_buffer(d.asset_handle_raw)
-                else {
-                    continue;
-                };
                 if !slot_active[slot] {
                     continue;
                 }
-                let g1_bg = &viewport.splat_instance_bind_groups[slot];
-                rp.set_bind_group(1, g1_bg, &[]);
-                rp.set_vertex_buffer(0, vbo.slice(..));
-                rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
-                if direct_mode {
-                    rp.draw_indexed(0..lod0_index_count, 0, 0..1);
-                } else {
-                    let cluster_count = self
-                        .mesh_cluster_buffer(d.asset_handle_raw)
-                        .map(|(_, c)| c)
-                        .unwrap_or(0);
-                    let max_draws = std::env::var("RKP_MESH_DEBUG_MAX_DRAWS")
-                        .ok()
-                        .and_then(|s| s.parse::<u32>().ok())
-                        .map(|n| n.min(cluster_count))
-                        .unwrap_or(cluster_count);
-                    let (args_buf, _) = &viewport.mesh_lod_shadow_args_buffers[slot];
-                    rp.multi_draw_indexed_indirect(args_buf, 0, max_draws);
+                let asset_handle_raw = d.asset_handle_raw;
+                let Some((cluster_buf, cluster_count)) =
+                    self.mesh_cluster_buffer(asset_handle_raw)
+                else {
+                    continue;
+                };
+
+                viewport.ensure_mesh_lod_shadow_args_capacity(
+                    &self.device,
+                    slot as u32,
+                    cascade as u32,
+                    cluster_count,
+                );
+
+                let (args_buf, args_cap) =
+                    &viewport.mesh_lod_shadow_args_buffers[slot][cascade];
+                let need_rebuild = match &viewport.mesh_lod_shadow_g2_bgs[slot][cascade] {
+                    Some((_, cached_handle, cached_cap)) => {
+                        *cached_handle != asset_handle_raw || *cached_cap != *args_cap
+                    }
+                    None => true,
+                };
+                if need_rebuild {
+                    let bg = self.mesh_lod_select_pass.create_g2_bind_group(
+                        &self.device,
+                        cluster_buf,
+                        args_buf,
+                        &viewport.mesh_lod_admit_stats_shadow,
+                    );
+                    viewport.mesh_lod_shadow_g2_bgs[slot][cascade] =
+                        Some((bg, asset_handle_raw, *args_cap));
+                }
+
+                let params = crate::mesh_lod_select_pass::MeshLodSelectParams {
+                    pixel_threshold,
+                    cluster_count,
+                    force_admit: force_admit as u32,
+                    record_stats: collect_stats as u32,
+                };
+                queue.write_buffer(
+                    &viewport.mesh_lod_shadow_params_buffers[slot][cascade],
+                    0,
+                    bytemuck::bytes_of(&params),
+                );
+            }
+
+            // 0. Shadow-side LOD-select compute pass for this cascade.
+            if !direct_mode {
+                if collect_stats {
+                    viewport.lod_stats_drain_shadow("shadow");
+                    viewport.lod_stats_clear_shadow(encoder);
+                }
+
+                let q_lod = self.profiler.begin_query(
+                    &format!("mesh_shadow_lod_select[{cascade}]"),
+                    encoder,
+                );
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("mesh_shadow_lod_select"),
+                        timestamp_writes: None,
+                    });
+                    if collect_pipestats {
+                        cpass.begin_pipeline_statistics_query(
+                            &viewport.mesh_pipestats_query_set, 2,
+                        );
+                    }
+                    for (slot, d) in draws.iter().enumerate() {
+                        if !slot_active[slot] {
+                            continue;
+                        }
+                        let cluster_count = self
+                            .mesh_cluster_buffer(d.asset_handle_raw)
+                            .map(|(_, c)| c)
+                            .unwrap_or(0);
+                        let g0 = &viewport.mesh_lod_shadow_g0_bgs[slot][cascade];
+                        let g1 = &viewport.splat_instance_bind_groups[slot];
+                        let g2 = &viewport
+                            .mesh_lod_shadow_g2_bgs[slot][cascade]
+                            .as_ref()
+                            .expect("g2 set above for active slot")
+                            .0;
+                        self.mesh_lod_select_pass
+                            .dispatch(&mut cpass, g0, g1, g2, cluster_count);
+                    }
+                    if collect_pipestats {
+                        cpass.end_pipeline_statistics_query();
+                    }
+                }
+                self.profiler.end_query(encoder, q_lod);
+
+                if collect_stats {
+                    viewport.lod_stats_finalize_shadow(encoder);
                 }
             }
-            if pipestats_enabled {
-                rp.end_pipeline_statistics_query();
+
+            // 1. Depth-only render for this cascade. Vertex transforms
+            //    through `cascades[cascade].view_proj`; rasterizer
+            //    fills `mesh_shadow_depth_views[cascade]`.
+            let render_g0 = viewport
+                .mesh_shadow_render_g0_bgs[cascade]
+                .as_ref()
+                .expect("mesh_shadow render g0 bg present after refresh");
+            let q_render = self.profiler.begin_query(
+                &format!("mesh_shadow_render[{cascade}]"),
+                encoder,
+            );
+            {
+                let mut rp = self.mesh_shadow_map.begin_render_pass(
+                    encoder,
+                    &viewport.mesh_shadow_depth_views[cascade],
+                    None,
+                );
+                rp.set_pipeline(&self.mesh_shadow_map.render_pipeline);
+                rp.set_bind_group(0, render_g0, &[]);
+                if collect_pipestats {
+                    rp.begin_pipeline_statistics_query(
+                        &viewport.mesh_pipestats_query_set, 3,
+                    );
+                }
+                for (slot, d) in draws.iter().enumerate() {
+                    let Some((vbo, ibo, lod0_index_count)) =
+                        self.mesh_buffer(d.asset_handle_raw)
+                    else {
+                        continue;
+                    };
+                    if !slot_active[slot] {
+                        continue;
+                    }
+                    let g1_bg = &viewport.splat_instance_bind_groups[slot];
+                    rp.set_bind_group(1, g1_bg, &[]);
+                    rp.set_vertex_buffer(0, vbo.slice(..));
+                    rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
+                    if direct_mode {
+                        rp.draw_indexed(0..lod0_index_count, 0, 0..1);
+                    } else {
+                        let cluster_count = self
+                            .mesh_cluster_buffer(d.asset_handle_raw)
+                            .map(|(_, c)| c)
+                            .unwrap_or(0);
+                        let max_draws = max_draws_override
+                            .map(|n| n.min(cluster_count))
+                            .unwrap_or(cluster_count);
+                        let (args_buf, _) =
+                            &viewport.mesh_lod_shadow_args_buffers[slot][cascade];
+                        rp.multi_draw_indexed_indirect(args_buf, 0, max_draws);
+                    }
+                }
+                if collect_pipestats {
+                    rp.end_pipeline_statistics_query();
+                }
             }
+            self.profiler.end_query(encoder, q_render);
+
+            // 2. Blit compute — copy bitcast(depth) into the cascade's
+            //    slice of `shadow_buffer`. Single thread per texel,
+            //    full overwrite; no pre-clear needed (uncovered texels
+            //    get the depth attachment's clear value of 1.0 =
+            //    SHADOW_MAP_FAR_DEPTH_BITS after bitcast).
+            let blit_g0 = viewport
+                .mesh_shadow_blit_g0_bgs[cascade]
+                .as_ref()
+                .expect("mesh_shadow blit g0 bg present after refresh");
+            let q_blit = self.profiler.begin_query(
+                &format!("mesh_shadow_blit[{cascade}]"),
+                encoder,
+            );
+            self.mesh_shadow_map.dispatch_blit(encoder, blit_g0);
+            self.profiler.end_query(encoder, q_blit);
         }
-        self.profiler.end_query(encoder, q_render);
-
-        // Pipestats finalize moved to `render_to` — single per-frame
-        // call so it fires regardless of which mesh passes ran.
-
-        // 2. Blit compute — copy bitcast(depth) into shadow_buffer.
-        //    Single thread per texel, full overwrite; no need to
-        //    pre-clear shadow_buffer because every texel is written
-        //    (uncovered ones get the depth attachment's clear value
-        //    of 1.0 = SHADOW_MAP_FAR_DEPTH_BITS after bitcast).
-        let blit_g0 = viewport
-            .mesh_shadow_blit_g0_bg
-            .as_ref()
-            .expect("mesh_shadow blit g0 bg present after refresh");
-        let q_blit = self.profiler.begin_query("mesh_shadow_blit", encoder);
-        self.mesh_shadow_map.dispatch_blit(encoder, blit_g0);
-        self.profiler.end_query(encoder, q_blit);
     }
 
     /// Current lights/materials epoch — ViewportRenderers compare against

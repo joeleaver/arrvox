@@ -245,6 +245,30 @@ struct LightCameraShadow {
     shadow_map_size: vec2<u32>,
 }
 
+// CSM (Cascaded Shadow Maps) wire format. Bound by:
+// * `mesh_shadow.wesl` (per-cascade VS — picks `cascades[cascade_index]`)
+// * `mesh_shadow_blit.wesl` (writes to slot `cascade_index`)
+// * `shadow_scatter.wesl` (march-mode — writes only `cascades[0]`)
+// * `rkp_shade.wesl` (per-pixel cascade selection from view_z)
+//
+// CPU-side mirror is `rkp_render::shadow_map_pass::LightCameraCsm`;
+// layout locked at 672 B with offsets {0, 640, 656}.
+//
+// `cascade_far_view_z[i]` is the *view-space* far Z of cascade `i`
+// (positive into the scene). The shade pass picks the smallest `i`
+// such that `view_z <= cascade_far_view_z[i]`.
+//
+// In march-mode, `cascade_count = 1` and only `cascades[0]` is filled,
+// preserving today's single-cascade behavior bit-for-bit.
+struct LightCameraCsm {
+    cascades: array<LightCameraShadow, 4>,
+    cascade_far_view_z: vec4<f32>,
+    cascade_count: u32,
+    _csm_pad0: u32,
+    _csm_pad1: u32,
+    _csm_pad2: u32,
+}
+
 // ──────────────────────────────────────────────────────────────────
 // Per-pass parameter uniforms
 // ──────────────────────────────────────────────────────────────────

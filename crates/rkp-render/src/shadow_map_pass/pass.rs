@@ -6,8 +6,8 @@
 use crate::compile_pass_shader;
 
 use super::types::{
-    LightCameraUniform, SetupParams, SCATTER_INSTANCE_STRIDE, SHADOW_MAP_MAX_CASTERS_INITIAL,
-    SHADOW_MAP_WORK_LIST_INITIAL,
+    CSM_CASCADE_COUNT, LightCameraCsm, SetupParams, SCATTER_INSTANCE_STRIDE,
+    SHADOW_MAP_MAX_CASTERS_INITIAL, SHADOW_MAP_WORK_LIST_INITIAL,
 };
 
 /// Pipeline holder for the work-list scatter shadow render. Owns
@@ -82,7 +82,13 @@ impl ShadowMapPass {
         scene_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> Self {
         // ── Buffers ────────────────────────────────────────────
-        let shadow_buffer_bytes = (size as u64) * (size as u64) * 4;
+        // shadow_buffer holds CSM_CASCADE_COUNT slices laid out
+        // contiguously: `[cascade * size² + ty * size + tx]`. In
+        // mesh-mode all 4 slices are written per frame; in march-
+        // mode only slice 0 is touched (LightCameraCsm.cascade_count
+        // = 1 keeps shade-side reads on slice 0).
+        let shadow_buffer_bytes =
+            (size as u64) * (size as u64) * (CSM_CASCADE_COUNT as u64) * 4;
         let shadow_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shadow_map shadow_buffer"),
             size: shadow_buffer_bytes,
@@ -90,8 +96,8 @@ impl ShadowMapPass {
             mapped_at_creation: false,
         });
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("shadow_map light_camera_uniform"),
-            size: std::mem::size_of::<LightCameraUniform>() as u64,
+            label: Some("shadow_map light_camera_csm"),
+            size: std::mem::size_of::<LightCameraCsm>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });

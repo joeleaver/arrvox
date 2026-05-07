@@ -114,11 +114,33 @@ fn lod_select(@builtin(global_invocation_id) gid: vec3<u32>) {
     out.base_vertex = 0;
     out.first_instance = 0u;
 
-    // World-space center via the instance transform; per-axis scale
-    // converts cluster_error / parent_group_error from object-local
-    // to world-space length.
-    let center_local = (c.aabb_min + c.aabb_max) * 0.5;
-    let world_center = (instance.world * vec4<f32>(center_local, 1.0)).xyz;
+    // INSTANCE pivot in world (NOT this cluster's AABB center). All
+    // clusters in the same instance see the same `view_distance` and
+    // `world_to_pixels`, which is what makes the Karis admit rule
+    // chain-consistent in floating-point.
+    //
+    // Why this matters: the rule assumes `parent_err_px` for a child
+    // cluster *exactly equals* `cluster_err_px` for that child's
+    // parent — they're both `parent_group_error * scale *
+    // world_to_pixels`. If we compute `world_to_pixels` from each
+    // cluster's own AABB center, the ratio drifts ~10-20% between
+    // siblings and the parent (different AABB centers → different
+    // distances). At the threshold boundary that's enough to leave a
+    // chain with *zero* admitted clusters: the LOD-N child says
+    // `parent_err_px < threshold` ("parent will admit") while the
+    // LOD-N+1 parent says `cluster_err_px >= threshold` ("descend to
+    // me"). Result: cluster-shaped holes that flicker and move with
+    // tiny camera motion (`project_mesh_close_up_hole_bug.md`).
+    //
+    // Using the instance pivot loses per-cluster LOD precision — one
+    // LOD level per instance, regardless of where the camera is
+    // relative to individual clusters within the instance. For our
+    // typical 0.5–5 m props the precision loss is well below the
+    // pixel threshold; the proper fix is a Nanite-style monotonic
+    // bounding-sphere DAG (each cluster's sphere encloses all its
+    // children's), to be revisited if/when LOD oscillation across an
+    // instance becomes visible.
+    let world_pivot = (instance.world * vec4<f32>(0.0, 0.0, 0.0, 1.0)).xyz;
     let scale = world_scale_factor(instance.world);
 
     // `view_proj[1][1]` ≈ cot(fov_y/2) for perspective and `2/height`
@@ -134,7 +156,7 @@ fn lod_select(@builtin(global_invocation_id) gid: vec3<u32>) {
     // `world_to_pixels = focal_pixels / view_distance` formula.
     let is_ortho = abs(camera.view_proj[3][3] - 1.0) < 0.01;
     let view_distance = select(
-        max(length(world_center - camera.position.xyz), 0.001),
+        max(length(world_pivot - camera.position.xyz), 0.001),
         1.0,
         is_ortho,
     );
