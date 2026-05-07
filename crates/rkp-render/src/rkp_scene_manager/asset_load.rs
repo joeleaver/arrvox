@@ -492,10 +492,33 @@ impl RkpSceneManager {
                 (v, dag.indices, dag.clusters, lod0)
             };
 
+        // For v5 files baked BEFORE the bone-fields-in-vertex change
+        // (Phase 6.6 commit 1), the on-disk vertices carry zero
+        // `bone_indices/weights` because the corresponding bytes were
+        // unnamed `_pad` and zero-written. Newer bakes carry correct
+        // file-local bone data already. The load-path merge below
+        // runs in both cases — for old bakes it back-fills bone data
+        // from the file's skin-meta payload (avoiding a re-bake of
+        // every existing splat5 .rkp); for new bakes it writes the
+        // same file-local values back, idempotent and cheap. The
+        // legacy v4 fallback above already produced correct,
+        // scene-global bone data via the extractor, so it skips this
+        // pass entirely.
+        if have_baked_mesh && !mesh_vertices.is_empty() && !file_bones.is_empty() {
+            for v in &mut mesh_vertices {
+                if let Some(bv) = file_bones.get(v.leaf_attr_id as usize) {
+                    v.bone_indices = bv.indices;
+                    v.bone_weights = bv.weights;
+                }
+            }
+        }
+
         // Relocate vertex `leaf_attr_id`s from file-local (what
         // rkp-import baked into v5) to scene-global. The legacy v4
         // path already produced scene-global IDs because it ran
         // `extract_surface_mesh` against the scene-merged pools.
+        // **Order matters:** the bone-merge above must run BEFORE
+        // this — `file_bones` is indexed by file-local slot id.
         if have_baked_mesh && leaf_attr_slot_start > 0 && !mesh_vertices.is_empty() {
             for v in &mut mesh_vertices {
                 v.leaf_attr_id += leaf_attr_slot_start;
