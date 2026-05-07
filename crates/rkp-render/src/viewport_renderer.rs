@@ -596,6 +596,8 @@ impl ViewportRenderer {
             device,
             &self.camera_buffer,
             &renderer.scene.leaf_attr_pool_buffer,
+            &renderer.scene.bone_matrices_buffer,
+            &renderer.scene.bone_dual_quats_buffer,
         ));
         self.splat_g0_scene_epoch = scene_now;
         self.splat_g0_lights_materials_epoch = lm_now;

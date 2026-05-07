@@ -65,9 +65,13 @@ impl MeshPass {
 
         // MeshVertex: 32 B per vertex. Layout matches
         // `extract::MeshVertex` (local_pos, normal_oct, leaf_attr_id,
-        // _pad). `normal_oct` is currently unused by the shader (the
-        // resolve pass reads `LeafAttr.normal_oct` from the pool); it's
-        // declared in the layout to keep the buffer reader aligned.
+        // bone_indices, bone_weights, _pad). `normal_oct` is currently
+        // unused by the shader (the resolve pass reads
+        // `LeafAttr.normal_oct` from the pool); it's declared in the
+        // layout to keep the buffer reader aligned. `bone_indices` /
+        // `bone_weights` are the Phase 6.6 skinning attributes — the
+        // VS reads them only when the per-instance `skinning_mode`
+        // selects LBS or DQS.
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<MeshVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -85,6 +89,16 @@ impl MeshPass {
                 wgpu::VertexAttribute {
                     shader_location: 2,
                     offset: 16,
+                    format: wgpu::VertexFormat::Uint32,
+                },
+                wgpu::VertexAttribute {
+                    shader_location: 3,
+                    offset: 20,
+                    format: wgpu::VertexFormat::Uint32,
+                },
+                wgpu::VertexAttribute {
+                    shader_location: 4,
+                    offset: 24,
                     format: wgpu::VertexFormat::Uint32,
                 },
             ],

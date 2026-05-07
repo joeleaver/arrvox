@@ -107,6 +107,37 @@ impl SplatPass {
                     },
                     count: None,
                 },
+                // bone_matrices (storage<read>) — Phase 6.6 mesh-VS
+                // skinning. Carries the per-frame `mat3x4`-packed LBS
+                // palette concatenated across all skinned entities;
+                // the per-instance `bone_offset_lbs` indexes into it.
+                // Splat path doesn't use it (splats render rest-pose
+                // splats; deformation lives in the user-shader path),
+                // so leaving the binding declared but unread is fine —
+                // wgpu doesn't require shaders to read every binding.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // bone_dual_quats (storage<read>) — Phase 6.6 mesh-VS
+                // DQS palette, parallel to `bone_matrices`. Indexed by
+                // the per-instance `bone_offset_dqs`.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -237,6 +268,8 @@ impl SplatPass {
         device: &wgpu::Device,
         camera_buffer: &wgpu::Buffer,
         leaf_attr_pool_buffer: &wgpu::Buffer,
+        bone_matrices_buffer: &wgpu::Buffer,
+        bone_dual_quats_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("splat g0 bg"),
@@ -249,6 +282,14 @@ impl SplatPass {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: leaf_attr_pool_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bone_matrices_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: bone_dual_quats_buffer.as_entire_binding(),
                 },
             ],
         })
