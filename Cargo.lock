@@ -5086,7 +5086,10 @@ dependencies = [
 name = "rkp-convert"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "clap",
+ "glam 0.29.3",
+ "rkp-core",
  "rkp-import",
 ]
 

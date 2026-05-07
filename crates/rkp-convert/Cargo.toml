@@ -7,4 +7,7 @@ description = "Mesh-to-.rkp CLI: runs the rkp-import pipeline from the command l
 
 [dependencies]
 rkp-import = { workspace = true }
+rkp-core = { workspace = true }
 clap = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
