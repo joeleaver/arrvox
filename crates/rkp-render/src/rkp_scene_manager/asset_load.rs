@@ -532,12 +532,33 @@ impl RkpSceneManager {
         // weight against. No-op for unskinned assets (empty
         // `rest_bone_aabbs`). `meshlet_clusters` is `Vec<MeshletCluster>`
         // already, mutated in place.
+        //
+        // **Frame translation:** `rest_bone_aabbs` are computed by
+        // rkp-import in **grid-frame** (cell_idx × voxel_size, origin
+        // at the octree corner — see `crates/rkp-import/src/voxelize/
+        // shell.rs::accumulate_rest_bone_aabbs`). The cluster AABBs
+        // produced by `cluster_mesh` are in **mesh-frame** (origin at
+        // object centre, range ±half_extent), matching `MeshVertex.local_pos`
+        // which the surface-mesh extractor offsets by `grid_origin`.
+        // Unioning the two frames as-is inflates clusters by ~1.5×
+        // asset extent and breaks LOD selection (wrong leaf_slot per
+        // pixel → wrong colors + visible holes from rejected fine
+        // clusters). Translate the bone AABBs into mesh-frame first.
         if !skin_meta.rest_bone_aabbs.is_empty() && !mesh_vertices.is_empty() {
+            let go = asset_grid_origin;
+            let mesh_frame_aabbs: Vec<[f32; 6]> = skin_meta
+                .rest_bone_aabbs
+                .iter()
+                .map(|a| [
+                    a[0] + go.x, a[1] + go.y, a[2] + go.z,
+                    a[3] + go.x, a[4] + go.y, a[5] + go.z,
+                ])
+                .collect();
             rkp_core::mesh_cluster::expand_clusters_for_skinning(
                 &mut meshlet_clusters,
                 &mesh_vertices,
                 &mesh_indices,
-                &skin_meta.rest_bone_aabbs,
+                &mesh_frame_aabbs,
             );
         }
         let _ = (mesh_indices.len(), meshlet_clusters.len());
