@@ -513,6 +513,14 @@ impl RkpRenderer {
         viewport: &mut crate::viewport_renderer::ViewportRenderer,
         draws: &[SplatDraw],
     ) {
+        // Diagnostic: skip primary visibility entirely. Used to
+        // measure shadow_render in isolation when chasing the
+        // anti-correlation pattern between the two passes.
+        // Visuals: composite stays as last-frame output; shade
+        // sees a sky-cleared G-buffer.
+        if std::env::var("RKP_MESH_DISABLE_PRIMARY").is_ok() {
+            return;
+        }
         viewport.refresh_splat_g0(&self.device, self);
         viewport.refresh_splat_resolve_bindings(&self.device, self);
         viewport.ensure_splat_instance_capacity(&self.device, self, draws.len() as u32);
@@ -804,6 +812,13 @@ impl RkpRenderer {
         viewport: &mut crate::viewport_renderer::ViewportRenderer,
         draws: &[SplatDraw],
     ) {
+        // Diagnostic: skip shadow visibility entirely. Used to
+        // measure mesh_raster in isolation. Visuals: shadows go
+        // pure black for a frame as the shadow buffer stays at
+        // its last cleared state; shade still samples it.
+        if std::env::var("RKP_MESH_DISABLE_SHADOW").is_ok() {
+            return;
+        }
         viewport.refresh_mesh_shadow_bindings(&self.device, self);
         viewport.ensure_mesh_lod_shadow_capacity(&self.device, self, draws.len() as u32);
 
