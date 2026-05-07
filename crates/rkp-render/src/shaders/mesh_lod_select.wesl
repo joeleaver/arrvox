@@ -8,11 +8,11 @@
 //
 // using the cluster's object-local error metrics projected to
 // screen-pixels through the per-instance world matrix and the
-// camera's perspective focal length. Each thread writes one entry
-// into the per-draw `args` buffer; non-admitted clusters write a
-// zeroed `DrawIndexedIndirectArgs` (index_count = 0) so the matching
-// `multi_draw_indexed_indirect` no-ops them at draw time without a
-// CPU-side count read.
+// camera's perspective focal length. Admitted clusters atomicAdd
+// into the per-draw `draw_count` and write their args at the
+// compacted slot. Non-admitted clusters skip writing entirely —
+// the GPU walks only the compacted prefix at draw time via
+// `multi_draw_indexed_indirect_count`.
 //
 // Bind-group layout:
 //   @group(0) @binding(0)  CameraUniforms (read)            — per-VR
@@ -21,6 +21,7 @@
 //   @group(2) @binding(0)  array<MeshletCluster> (read)     — per-asset
 //   @group(2) @binding(1)  array<DrawIndexedIndirectArgs>   — per-draw, RW
 //   @group(2) @binding(2)  array<atomic<u32>, 8> stats      — pass-shared, RW
+//   @group(2) @binding(3)  atomic<u32> draw_count           — per-draw, RW
 //
 // `stats` is an 8-slot histogram: indices 0..4 are the per-LOD
 // admitted-cluster counts, indices 4..8 are the per-LOD total-cluster
@@ -29,6 +30,12 @@
 // the same buffer; the CPU pre-clears it at the start of each pass.
 // Diagnostic-only — values are read back to host and logged behind
 // `RKP_MESH_LOD_STATS=1`.
+//
+// `draw_count` is the per-draw indirect-draw count consumed by
+// `multi_draw_indexed_indirect_count`. CPU pre-clears to 0 before
+// the dispatch; admitted threads atomicAdd 1 to claim their args
+// slot. Bound with INDIRECT usage so the same buffer the compute
+// pass writes is read by the renderer's count parameter.
 
 import package::lib::types::CameraUniforms;
 
@@ -83,6 +90,7 @@ struct DrawIndexedIndirectArgs {
 @group(2) @binding(0) var<storage, read> clusters: array<MeshletCluster>;
 @group(2) @binding(1) var<storage, read_write> args: array<DrawIndexedIndirectArgs>;
 @group(2) @binding(2) var<storage, read_write> stats: array<atomic<u32>, 8>;
+@group(2) @binding(3) var<storage, read_write> draw_count: atomic<u32>;
 
 /// Approximate the maximum axis-scale of an affine 4x4 transform.
 /// Cluster errors are object-local lengths; we multiply by this to
@@ -104,15 +112,6 @@ fn lod_select(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let c = clusters[cidx];
-
-    // Default: zeroed args entry — `index_count = 0` makes
-    // `multi_draw_indexed_indirect` a no-op for non-admitted slots.
-    var out: DrawIndexedIndirectArgs;
-    out.index_count = 0u;
-    out.instance_count = 0u;
-    out.first_index = 0u;
-    out.base_vertex = 0;
-    out.first_instance = 0u;
 
     // INSTANCE pivot in world (NOT this cluster's AABB center). All
     // clusters in the same instance see the same `view_distance` and
@@ -187,6 +186,15 @@ fn lod_select(@builtin(global_invocation_id) gid: vec3<u32>) {
     let admit = (params.force_admit != 0u) || karis_admit;
 
     if (admit) {
+        // Claim a compacted slot. All admitted threads atomicAdd 1
+        // into the per-draw counter; the returned index is the slot
+        // they own in the args buffer. Non-admitted threads skip
+        // entirely — the draw count tells the renderer's
+        // `multi_draw_indexed_indirect_count` exactly how many
+        // entries to walk, so the args[cidx] zero-fill of the old
+        // path is no longer needed.
+        let slot = atomicAdd(&draw_count, 1u);
+        var out: DrawIndexedIndirectArgs;
         out.index_count = c.index_count;
         out.instance_count = 1u;
         out.first_index = c.index_offset;
@@ -197,9 +205,8 @@ fn lod_select(@builtin(global_invocation_id) gid: vec3<u32>) {
         // not via `@builtin(instance_index)`, so 0 is the right
         // value either way.
         out.first_instance = 0u;
+        args[slot] = out;
     }
-
-    args[cidx] = out;
 
     // Diagnostic histogram — gated on `record_stats` because atomic
     // contention on 8 hot cache lines from millions of threads adds

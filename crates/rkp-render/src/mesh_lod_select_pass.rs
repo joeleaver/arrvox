@@ -3,11 +3,11 @@
 //! For each draw, runs one workgroup per ~64 clusters of the asset's
 //! [`MeshletCluster`] table. Each thread applies the Karis-Nanite
 //! admit rule (`parent_group_error_proj ≥ thresh` AND
-//! `cluster_error_proj < thresh`) and writes a
-//! [`DrawIndexedIndirectArgs`] entry into a per-draw `args` buffer:
-//! admitted clusters get real draw args, non-admitted slots get
-//! zeroed args (`index_count = 0` → no-op draw at
-//! `multi_draw_indexed_indirect` time without a CPU count read).
+//! `cluster_error_proj < thresh`); admitted threads atomicAdd into
+//! a per-draw `draw_count` and write their args at the compacted
+//! slot. The renderer reads `draw_count` via
+//! `multi_draw_indexed_indirect_count` so the GPU walks only the
+//! admitted prefix instead of every `cluster_count` entries.
 //!
 //! Bind-group shape:
 //!   · `g0` = camera + per-draw `MeshLodSelectParams` uniforms
@@ -15,7 +15,10 @@
 //!   · `g1` = per-instance world matrix uniform (reuses splat's
 //!     `g1_layout` — same `MeshInstance` shape as the render path)
 //!   · `g2` = per-asset cluster table (storage, read) + per-draw
-//!     args buffer (storage, read-write)
+//!     args buffer (storage, read-write) + pass-shared stats
+//!     histogram (storage, read-write) + per-draw atomic count
+//!     (storage, read-write; bound with INDIRECT usage so the same
+//!     buffer the compute writes is read by the renderer)
 //!
 //! Phase 6.4 will run this pipeline twice per frame (primary +
 //! shadow) with different `pixel_threshold` so the shadow chain
@@ -109,7 +112,7 @@ impl MeshLodSelectPass {
         });
 
         let g2_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mesh_lod_select g2 (clusters + args + stats)"),
+            label: Some("mesh_lod_select g2 (clusters + args + stats + count)"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -133,6 +136,16 @@ impl MeshLodSelectPass {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -196,18 +209,20 @@ impl MeshLodSelectPass {
     }
 
     /// Build the per-draw `g2` bind group — asset cluster table + the
-    /// per-draw args buffer + the pass-shared stats buffer. The args
-    /// buffer must have STORAGE + INDIRECT usage so the same buffer
-    /// can be written here and read by `multi_draw_indexed_indirect`
-    /// in the render pass. The stats buffer is shared across every
-    /// draw within a pass (primary or shadow): all g2 BGs in the same
-    /// pass reference the same buffer.
+    /// per-draw args buffer + the pass-shared stats buffer + the
+    /// per-draw atomic count. The args + count buffers must have
+    /// STORAGE + INDIRECT usage so the same buffers the compute pass
+    /// writes are read by `multi_draw_indexed_indirect_count` in the
+    /// render pass. The stats buffer is shared across every draw
+    /// within a pass (primary or shadow); the count buffer is
+    /// per-draw and pre-cleared to 0 before each dispatch.
     pub fn create_g2_bind_group(
         &self,
         device: &wgpu::Device,
         cluster_buffer: &wgpu::Buffer,
         args_buffer: &wgpu::Buffer,
         stats_buffer: &wgpu::Buffer,
+        count_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mesh_lod_select g2 bg"),
@@ -224,6 +239,10 @@ impl MeshLodSelectPass {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: stats_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: count_buffer.as_entire_binding(),
                 },
             ],
         })

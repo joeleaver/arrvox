@@ -185,6 +185,13 @@ pub struct ViewportRenderer {
     /// asset draw at this slot has needed. Bound as STORAGE for
     /// the LOD-select compute and as INDIRECT for the render path.
     pub mesh_lod_args_buffers: Vec<(wgpu::Buffer, u32)>,
+    /// Per-draw atomic `u32` count buffer (4 B). The LOD-select
+    /// shader atomicAdds into this for every admitted cluster; the
+    /// renderer reads it via `multi_draw_indexed_indirect_count`.
+    /// Pre-cleared to 0 by the engine before each LOD-select
+    /// dispatch. STORAGE | INDIRECT | COPY_DST. Slot index matches
+    /// `mesh_lod_args_buffers`.
+    pub mesh_lod_count_buffers: Vec<wgpu::Buffer>,
     /// Per-draw `g0` bind group: (camera, params).
     pub mesh_lod_select_g0_bgs: Vec<wgpu::BindGroup>,
     /// Per-draw `g2` bind group: (cluster_table, args). Cached with
@@ -208,6 +215,11 @@ pub struct ViewportRenderer {
     /// args so each cascade can run its LOD-select + render
     /// back-to-back without aliasing.
     pub mesh_lod_shadow_args_buffers: Vec<Vec<(wgpu::Buffer, u32)>>,
+    /// Per-draw × per-cascade atomic `u32` count buffer (4 B). One
+    /// per (slot, cascade) pair so each cascade's LOD-select +
+    /// render can use independent counters without aliasing. Same
+    /// usage as `mesh_lod_count_buffers`.
+    pub mesh_lod_shadow_count_buffers: Vec<Vec<wgpu::Buffer>>,
     /// Per-draw × per-cascade `g0` bind group: the cascade's
     /// synthetic camera + the cascade's params buffer.
     pub mesh_lod_shadow_g0_bgs: Vec<Vec<wgpu::BindGroup>>,
@@ -579,11 +591,13 @@ impl ViewportRenderer {
             mesh_shadow_blit_params_buffers,
             mesh_lod_params_buffers: Vec::new(),
             mesh_lod_args_buffers: Vec::new(),
+            mesh_lod_count_buffers: Vec::new(),
             mesh_lod_select_g0_bgs: Vec::new(),
             mesh_lod_select_g2_bgs: Vec::new(),
             mesh_lod_shadow_camera_buffers,
             mesh_lod_shadow_params_buffers: Vec::new(),
             mesh_lod_shadow_args_buffers: Vec::new(),
+            mesh_lod_shadow_count_buffers: Vec::new(),
             mesh_lod_shadow_g0_bgs: Vec::new(),
             mesh_lod_shadow_g2_bgs: Vec::new(),
             mesh_lod_admit_stats_primary: device.create_buffer(&wgpu::BufferDescriptor {
@@ -813,6 +827,14 @@ impl ViewportRenderer {
                 }),
                 0,
             ));
+            self.mesh_lod_count_buffers.push(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mesh_lod_select count"),
+                size: 4,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
             self.mesh_lod_select_g2_bgs.push(None);
         }
     }
@@ -869,6 +891,7 @@ impl ViewportRenderer {
             let mut params_per_cascade: Vec<wgpu::Buffer> = Vec::with_capacity(n);
             let mut g0_per_cascade: Vec<wgpu::BindGroup> = Vec::with_capacity(n);
             let mut args_per_cascade: Vec<(wgpu::Buffer, u32)> = Vec::with_capacity(n);
+            let mut count_per_cascade: Vec<wgpu::Buffer> = Vec::with_capacity(n);
             let mut g2_per_cascade: Vec<Option<(wgpu::BindGroup, u32, u32)>> =
                 Vec::with_capacity(n);
             for i in 0..n {
@@ -897,11 +920,20 @@ impl ViewportRenderer {
                     }),
                     0,
                 ));
+                count_per_cascade.push(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("mesh_lod_shadow count csm{i}")),
+                    size: 4,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::INDIRECT
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
                 g2_per_cascade.push(None);
             }
             self.mesh_lod_shadow_params_buffers.push(params_per_cascade);
             self.mesh_lod_shadow_g0_bgs.push(g0_per_cascade);
             self.mesh_lod_shadow_args_buffers.push(args_per_cascade);
+            self.mesh_lod_shadow_count_buffers.push(count_per_cascade);
             self.mesh_lod_shadow_g2_bgs.push(g2_per_cascade);
         }
     }

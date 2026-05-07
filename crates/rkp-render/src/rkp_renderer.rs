@@ -633,11 +633,13 @@ impl RkpRenderer {
                 None => true,
             };
             if need_rebuild {
+                let count_buf = &viewport.mesh_lod_count_buffers[slot];
                 let bg = self.mesh_lod_select_pass.create_g2_bind_group(
                     &self.device,
                     cluster_buf,
                     args_buf,
                     &viewport.mesh_lod_admit_stats_primary,
+                    count_buf,
                 );
                 viewport.mesh_lod_select_g2_bgs[slot] = Some((bg, asset_handle_raw, *args_cap));
             }
@@ -681,6 +683,17 @@ impl RkpRenderer {
             }
             if pipestats_enabled {
                 viewport.pipestats_drain();
+            }
+
+            // Zero each active slot's atomic count buffer before the
+            // LOD-select dispatch — admitted threads atomicAdd into
+            // it, and `multi_draw_indexed_indirect_count` reads it
+            // as the actual draw count for the render pass.
+            for (slot, _) in draws.iter().enumerate() {
+                if !slot_active[slot] {
+                    continue;
+                }
+                encoder.clear_buffer(&viewport.mesh_lod_count_buffers[slot], 0, None);
             }
 
             let q_lod = self.profiler.begin_query("mesh_lod_select", encoder);
@@ -835,7 +848,10 @@ impl RkpRenderer {
                         .map(|n| n.min(cluster_count))
                         .unwrap_or(cluster_count);
                     let (args_buf, _) = &viewport.mesh_lod_args_buffers[slot];
-                    rp.multi_draw_indexed_indirect(args_buf, 0, max_draws);
+                    let count_buf = &viewport.mesh_lod_count_buffers[slot];
+                    rp.multi_draw_indexed_indirect_count(
+                        args_buf, 0, count_buf, 0, max_draws,
+                    );
                 }
             }
             if pipestats_enabled {
@@ -994,11 +1010,13 @@ impl RkpRenderer {
                     None => true,
                 };
                 if need_rebuild {
+                    let count_buf = &viewport.mesh_lod_shadow_count_buffers[slot][cascade];
                     let bg = self.mesh_lod_select_pass.create_g2_bind_group(
                         &self.device,
                         cluster_buf,
                         args_buf,
                         &viewport.mesh_lod_admit_stats_shadow,
+                        count_buf,
                     );
                     viewport.mesh_lod_shadow_g2_bgs[slot][cascade] =
                         Some((bg, asset_handle_raw, *args_cap));
@@ -1022,6 +1040,21 @@ impl RkpRenderer {
                 if collect_stats {
                     viewport.lod_stats_drain_shadow("shadow");
                     viewport.lod_stats_clear_shadow(encoder);
+                }
+
+                // Zero this cascade's per-slot atomic count buffers
+                // before the dispatch — same role as the primary
+                // path; consumed by `multi_draw_indexed_indirect_count`
+                // in the matching mesh_shadow_render below.
+                for (slot, _) in draws.iter().enumerate() {
+                    if !slot_active[slot] {
+                        continue;
+                    }
+                    encoder.clear_buffer(
+                        &viewport.mesh_lod_shadow_count_buffers[slot][cascade],
+                        0,
+                        None,
+                    );
                 }
 
                 let q_lod = self.profiler.begin_query(
@@ -1116,7 +1149,11 @@ impl RkpRenderer {
                             .unwrap_or(cluster_count);
                         let (args_buf, _) =
                             &viewport.mesh_lod_shadow_args_buffers[slot][cascade];
-                        rp.multi_draw_indexed_indirect(args_buf, 0, max_draws);
+                        let count_buf =
+                            &viewport.mesh_lod_shadow_count_buffers[slot][cascade];
+                        rp.multi_draw_indexed_indirect_count(
+                            args_buf, 0, count_buf, 0, max_draws,
+                        );
                     }
                 }
                 if collect_pipestats {
