@@ -630,7 +630,9 @@ mod tests {
             local_pos: p,
             normal_oct: 0,
             leaf_attr_id: 0,
-            _pad: [0; 3],
+            bone_indices: 0,
+            bone_weights: 0,
+            _pad: 0,
         }
     }
 

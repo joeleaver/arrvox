@@ -209,6 +209,14 @@ impl LeafAttrPool {
         bytemuck::cast_slice(&self.bones[..count])
     }
 
+    /// Typed slice of the parallel bone-weight array. Indexed by the
+    /// same slot id as [`as_slice`] / [`bone`]; unskinned slots stay
+    /// zero-default. Used by the surface-mesh extractor to bake bone
+    /// quads into `MeshVertex` at extract time.
+    pub fn bones_as_slice(&self) -> &[BoneVoxel] {
+        &self.bones[..self.next_free as usize]
+    }
+
     /// Raw slice of allocated entries.
     pub fn as_slice(&self) -> &[LeafAttr] {
         &self.data[..self.next_free as usize]

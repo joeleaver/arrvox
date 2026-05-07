@@ -473,6 +473,12 @@ impl RkpSceneManager {
                     asset_grid_origin,
                     self.brick_pool.as_slice(),
                     self.leaf_attr_pool.as_slice(),
+                    // Fallback path runs against scene-merged pools, so
+                    // by the time we get here the bone slice has been
+                    // populated via `set_bone(slot, bv)` above. Skinned
+                    // v4 assets get their bone weights baked into the
+                    // newly extracted vertices on the spot.
+                    self.leaf_attr_pool.bones_as_slice(),
                 );
                 let dag_t0 = std::time::Instant::now();
                 let dag = crate::mesh_pass::build_cluster_dag(&v, &i_unc);

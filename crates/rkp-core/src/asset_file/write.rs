@@ -278,6 +278,9 @@ pub fn write_artifact_rkp(
             artifact.grid_origin,
             &bricks_flat,
             &artifact.leaf_attrs,
+            // Procedural bakes never carry skinning data — generator
+            // outputs are static geometry.
+            &[],
         );
     let mesh_sections = if !mesh_vertex_bytes.is_empty() {
         Some(MeshSectionsIn {
@@ -350,6 +353,7 @@ pub fn build_mesh_sections_blob(
     grid_origin: glam::Vec3,
     brick_pool: &[u32],
     leaf_attrs: &[crate::leaf_attr::LeafAttr],
+    bone_voxels: &[crate::companion::BoneVoxel],
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>, u32) {
     if octree_nodes.is_empty() || leaf_attrs.is_empty() {
         return (Vec::new(), Vec::new(), Vec::new(), 0);
@@ -361,6 +365,7 @@ pub fn build_mesh_sections_blob(
         grid_origin,
         brick_pool,
         leaf_attrs,
+        bone_voxels,
     );
     if vertices.is_empty() || indices_unclustered.is_empty() {
         return (Vec::new(), Vec::new(), Vec::new(), 0);

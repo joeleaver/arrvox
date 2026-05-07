@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use glam::{IVec3, UVec3, Vec3};
 
 use crate::brick_pool::{BRICK_CELLS, BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR};
+use crate::companion::BoneVoxel;
 use crate::leaf_attr::{pack_oct, unpack_oct, LeafAttr};
 use crate::sparse_octree::{
     brick_id, is_branch, is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE,
@@ -47,10 +48,35 @@ pub struct MeshVertex {
     /// cube's 8 corners — deterministic and stable across reruns.
     /// Falls back to 0 when no corner is a surface cell.
     pub leaf_attr_id: u32,
-    pub _pad: [u32; 3],
+    /// 4 × u8 bone indices packed little-endian (matches `BoneVoxel.indices`).
+    /// Sourced from the same cell that contributed `leaf_attr_id` so the
+    /// per-vertex attribution is internally consistent. Zero for
+    /// unskinned assets — the matching `bone_weights` is then also zero,
+    /// which the vertex shader treats as "skip skinning, rest pose".
+    pub bone_indices: u32,
+    /// 4 × u8 bone weights packed little-endian (sum to 255 in
+    /// well-formed skinning data; 0 for unskinned cells).
+    pub bone_weights: u32,
+    /// Reserved for future per-vertex attributes (LOD bias, blend
+    /// shapes, etc). Keeps the stride at 32 B and the layout
+    /// 16-byte-aligned for GPU access.
+    pub _pad: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<MeshVertex>() == 32);
+// Hand-checked field offsets — vertex layout in `mesh_pass/pass.rs`
+// pulls position from offset 0, normal_oct from 12, leaf_attr_id from 16.
+// Bone fields live in what was `_pad[0..1]`; the GPU-side decl picks
+// them up in commit 4 when the VS starts skinning.
+const _: () = {
+    use std::mem::offset_of;
+    assert!(offset_of!(MeshVertex, local_pos) == 0);
+    assert!(offset_of!(MeshVertex, normal_oct) == 12);
+    assert!(offset_of!(MeshVertex, leaf_attr_id) == 16);
+    assert!(offset_of!(MeshVertex, bone_indices) == 20);
+    assert!(offset_of!(MeshVertex, bone_weights) == 24);
+    assert!(offset_of!(MeshVertex, _pad) == 28);
+};
 
 /// Sentinel marking INTERIOR cells in the dense cell map. INTERIOR
 /// cells count as "solid" for SN sign purposes but carry no per-cell
@@ -75,6 +101,11 @@ const CELL_INTERIOR: u32 = u32::MAX;
 ///   per-cell `leaf_attr_id` to read the prefiltered normal that gets
 ///   averaged into vertex normals. Pass `&[]` to skip vertex-normal
 ///   averaging entirely (vertices fall back to +Y); useful for tests.
+/// * `bone_voxel_pool` — parallel `BoneVoxel` pool indexed by the same
+///   `leaf_attr_id` slots. Vertex shader skinning reads from
+///   `bone_indices/weights` baked here. Pass `&[]` for unskinned
+///   assets (or tests) — vertices then carry zero weights, which the
+///   VS treats as "rest pose".
 pub fn extract_surface_mesh(
     octree_nodes: &[u32],
     octree_depth: u8,
@@ -82,6 +113,7 @@ pub fn extract_surface_mesh(
     grid_origin: Vec3,
     brick_cells: &[u32],
     leaf_attr_pool: &[LeafAttr],
+    bone_voxel_pool: &[BoneVoxel],
 ) -> (Vec<MeshVertex>, Vec<u32>) {
     let mut vertices: Vec<MeshVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
@@ -151,6 +183,7 @@ pub fn extract_surface_mesh(
                             base_voxel_size,
                             grid_origin,
                             leaf_attr_pool,
+                            bone_voxel_pool,
                         );
                         let vid = vertices.len() as u32;
                         vertices.push(vertex);
@@ -196,6 +229,7 @@ fn build_cube_vertex(
     voxel_size: f32,
     grid_origin: Vec3,
     leaf_attr_pool: &[LeafAttr],
+    bone_voxel_pool: &[BoneVoxel],
 ) -> MeshVertex {
     // Pre-classify the 8 corner cells once; the edge loop reuses these.
     // Bit layout: index = bit0(+X) | bit1(+Y) | bit2(+Z).
@@ -263,11 +297,25 @@ fn build_cube_vertex(
     };
     let local_pos = grid_origin + local_centroid * voxel_size;
 
+    // Bone weights come from the same chosen surface cell that
+    // contributed `leaf_attr_id` — keeps the per-vertex attribution
+    // consistent across normal / material / skinning. SN cubes that
+    // straddle a bone boundary will pick whichever side won the
+    // (z, y, x) tie-break; a smarter blend (max-weighted bone across
+    // the 8 corners) is possible but unnecessary at finest voxel size,
+    // where each cube already spans a sub-millimeter neighborhood.
+    let bone_voxel = bone_voxel_pool
+        .get(leaf_attr_id as usize)
+        .copied()
+        .unwrap_or_default();
+
     MeshVertex {
         local_pos: local_pos.to_array(),
         normal_oct,
         leaf_attr_id,
-        _pad: [0; 3],
+        bone_indices: bone_voxel.indices,
+        bone_weights: bone_voxel.weights,
+        _pad: 0,
     }
 }
 
@@ -534,7 +582,7 @@ mod tests {
     #[test]
     fn empty_octree_yields_nothing() {
         let nodes = vec![EMPTY_NODE];
-        let (verts, indices) = extract_surface_mesh(&nodes, 4, 0.001, Vec3::ZERO, &[], &[]);
+        let (verts, indices) = extract_surface_mesh(&nodes, 4, 0.001, Vec3::ZERO, &[], &[], &[]);
         assert!(verts.is_empty());
         assert!(indices.is_empty());
     }
@@ -556,7 +604,7 @@ mod tests {
         let nodes = vec![make_leaf(7)];
         let vs = 0.5;
         let origin = Vec3::new(1.0, 2.0, 3.0);
-        let (verts, indices) = extract_surface_mesh(&nodes, 0, vs, origin, &[], &[]);
+        let (verts, indices) = extract_surface_mesh(&nodes, 0, vs, origin, &[], &[], &[]);
 
         assert_eq!(verts.len(), 8, "8 SN-cube vertices around the unit cell");
         assert_eq!(indices.len(), 36, "6 faces × 2 triangles × 3 indices");
@@ -595,7 +643,7 @@ mod tests {
     #[test]
     fn closed_cube_winds_outward() {
         let nodes = vec![make_leaf(0)];
-        let (verts, indices) = extract_surface_mesh(&nodes, 0, 1.0, Vec3::ZERO, &[], &[]);
+        let (verts, indices) = extract_surface_mesh(&nodes, 0, 1.0, Vec3::ZERO, &[], &[], &[]);
         let mut counts = [0i32; 6]; // +X -X +Y -Y +Z -Z
 
         for tri in indices.chunks(3) {
@@ -634,7 +682,7 @@ mod tests {
         let nodes = vec![make_brick(0)];
         let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
         bricks[0] = 99;
-        let (verts, indices) = extract_surface_mesh(&nodes, 2, 1.0, Vec3::ZERO, &bricks, &[]);
+        let (verts, indices) = extract_surface_mesh(&nodes, 2, 1.0, Vec3::ZERO, &bricks, &[], &[]);
         assert_eq!(verts.len(), 8);
         assert_eq!(indices.len(), 36);
         for v in &verts {
@@ -653,7 +701,7 @@ mod tests {
         let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
         bricks[0] = 1; // (0,0,0)
         bricks[1] = 2; // (1,0,0) — face-adjacent in +X
-        let (verts, indices) = extract_surface_mesh(&nodes, 2, 1.0, Vec3::ZERO, &bricks, &[]);
+        let (verts, indices) = extract_surface_mesh(&nodes, 2, 1.0, Vec3::ZERO, &bricks, &[], &[]);
         assert_eq!(verts.len(), 12, "12 unique corners of a 2×1×1 box");
         assert_eq!(indices.len(), 60, "10 exposed faces × 2 triangles × 3 indices");
     }
@@ -670,7 +718,7 @@ mod tests {
         let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
         bricks[0] = 5; // (0,0,0) surface
         bricks[1] = BRICK_INTERIOR; // (1,0,0) interior
-        let (verts, indices) = extract_surface_mesh(&nodes, 2, 1.0, Vec3::ZERO, &bricks, &[]);
+        let (verts, indices) = extract_surface_mesh(&nodes, 2, 1.0, Vec3::ZERO, &bricks, &[], &[]);
         // Surface cell exposes 5 of 6 faces (+X is hidden by INTERIOR).
         // INTERIOR cell exposes 5 of 6 faces toward EMPTY (-X is hidden
         // by the surface cell, but +X, +Y, -Y, +Z, -Z are exposed to
@@ -726,7 +774,7 @@ mod tests {
             }
         }
 
-        let (verts, indices) = extract_surface_mesh(&nodes, 3, 1.0, Vec3::ZERO, &bricks, &[]);
+        let (verts, indices) = extract_surface_mesh(&nodes, 3, 1.0, Vec3::ZERO, &bricks, &[], &[]);
 
         // Every triangle must point along an outward axis. Check that
         // *no* triangle points in +X (those would be surface→INTERIOR
@@ -748,6 +796,51 @@ mod tests {
         // Sanity: we did emit *something* (the other 5 faces of each
         // surface cell are exposed).
         assert!(!indices.is_empty());
+    }
+
+    /// Bone weights baked at extract time should match the BoneVoxel
+    /// of the surface cell that contributed `leaf_attr_id`. With both
+    /// surface slots sharing a single bone (idx 7, weight 255), every
+    /// emitted vertex should carry that exact pair — no zeros, no
+    /// averaging artifacts. Confirms the extractor reads the parallel
+    /// pool by `leaf_attr_id` and the layout matches the VS contract.
+    #[test]
+    fn vertex_carries_bone_weights_from_chosen_cell() {
+        let nodes = vec![make_brick(0)];
+        let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
+        bricks[0] = 0;
+        bricks[1] = 1;
+        let leaf_attrs = vec![LeafAttr::EMPTY; 2];
+        let bone_pool = vec![
+            BoneVoxel::new([7, 0, 0, 0], [255, 0, 0, 0]),
+            BoneVoxel::new([7, 0, 0, 0], [255, 0, 0, 0]),
+        ];
+        let (verts, _) = extract_surface_mesh(
+            &nodes, 2, 1.0, Vec3::ZERO, &bricks, &leaf_attrs, &bone_pool,
+        );
+        assert!(!verts.is_empty(), "extractor produced no vertices");
+        for v in &verts {
+            assert_eq!(v.bone_indices, u32::from_le_bytes([7, 0, 0, 0]));
+            assert_eq!(v.bone_weights, u32::from_le_bytes([255, 0, 0, 0]));
+        }
+    }
+
+    /// Empty bone pool → vertices carry zero bone fields. The VS
+    /// treats this as "skip skinning, rest pose" (weights sum to 0).
+    #[test]
+    fn vertex_bone_fields_zero_for_unskinned_assets() {
+        let nodes = vec![make_brick(0)];
+        let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
+        bricks[0] = 0;
+        bricks[1] = 1;
+        let (verts, _) = extract_surface_mesh(
+            &nodes, 2, 1.0, Vec3::ZERO, &bricks, &[], &[],
+        );
+        assert!(!verts.is_empty());
+        for v in &verts {
+            assert_eq!(v.bone_indices, 0);
+            assert_eq!(v.bone_weights, 0);
+        }
     }
 
     /// Vertex normal averaging: with two surface cells sharing a
@@ -772,7 +865,7 @@ mod tests {
                 material_secondary_blend: 0,
             },
         ];
-        let (verts, _) = extract_surface_mesh(&nodes, 2, 1.0, Vec3::ZERO, &bricks, &pool);
+        let (verts, _) = extract_surface_mesh(&nodes, 2, 1.0, Vec3::ZERO, &bricks, &pool, &[]);
         for v in &verts {
             let n = unpack_oct(v.normal_oct);
             assert!((n - Vec3::Y).length() < 1e-3, "expected +Y, got {:?}", n);

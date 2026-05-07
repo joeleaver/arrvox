@@ -193,6 +193,18 @@ fn upgrade_v4_to_v5(path: &std::path::Path) -> Result<(), String> {
         * 0.5;
     let grid_origin = aabb_center - glam::Vec3::splat(asset_extent * 0.5);
 
+    // Decode the file's BoneVoxel quads from the skin-meta payload —
+    // the upgrade re-bakes the surface mesh, so it has to feed the
+    // extractor the same per-cell bone weights the original import had,
+    // otherwise skinned assets that go through `--upgrade-v4` would
+    // ship rest-pose vertices in v5.
+    let bone_voxels: &[rkp_core::companion::BoneVoxel] =
+        if skin_meta_decoded.bone_voxels.len() >= std::mem::size_of::<rkp_core::companion::BoneVoxel>() {
+            bytemuck::cast_slice(&skin_meta_decoded.bone_voxels)
+        } else {
+            &[]
+        };
+
     let (mesh_v_bytes, mesh_i_bytes, meshlet_bytes, lod0_index_count) =
         build_mesh_sections_blob(
             &octree_nodes,
@@ -201,6 +213,7 @@ fn upgrade_v4_to_v5(path: &std::path::Path) -> Result<(), String> {
             grid_origin,
             bricks_u32,
             &leaf_attrs,
+            bone_voxels,
         );
     if mesh_v_bytes.is_empty() {
         eprintln!(

@@ -155,6 +155,12 @@ pub fn write_rkp(
             grid_origin,
             &shell.file_bricks,
             &leaf_attrs,
+            // For skinned imports, bone weights come straight from the
+            // voxelizer's per-cell BoneVoxel quads; the mesh extractor
+            // pulls them by `leaf_attr_id` and bakes them into the vertex
+            // so the mesh VS can do LBS/DQS without a runtime merge.
+            // Empty for unskinned assets — extractor zeros the fields.
+            &shell.bone_voxels,
         );
     let mesh_sections = if !mesh_vertex_bytes.is_empty() {
         Some(rkp_core::asset_file::MeshSectionsIn {
