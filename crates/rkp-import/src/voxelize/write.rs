@@ -127,6 +127,46 @@ pub fn write_rkp(
         });
     };
 
+    // Build the surface mesh + Karis-Nanite cluster DAG up front so
+    // the editor doesn't have to rebuild it every load. The
+    // extractor only reads `LeafAttr.normal_oct`, so we synthesize a
+    // LeafAttr Vec from the normals-packed array (other fields zero).
+    // `leaf_attr_id`s baked into the vertices are FILE-LOCAL — the
+    // load path adds the scene-global offset before any GPU upload,
+    // mirroring how brick ids are remapped.
+    use rkp_core::leaf_attr::LeafAttr;
+    let leaf_attrs: Vec<LeafAttr> = shell
+        .normals_packed
+        .iter()
+        .map(|&n| LeafAttr {
+            normal_oct: n,
+            material_primary: 0,
+            material_secondary_blend: 0,
+        })
+        .collect();
+    let asset_extent = (1u32 << octree_depth) as f32 * voxel_size;
+    let aabb_center = (geometry_aabb.min + geometry_aabb.max) * 0.5;
+    let grid_origin = aabb_center - Vec3::splat(asset_extent * 0.5);
+    let (mesh_vertex_bytes, mesh_index_bytes, meshlet_cluster_bytes, lod0_index_count) =
+        rkp_core::asset_file::build_mesh_sections_blob(
+            octree_nodes,
+            octree_depth,
+            voxel_size,
+            grid_origin,
+            &shell.file_bricks,
+            &leaf_attrs,
+        );
+    let mesh_sections = if !mesh_vertex_bytes.is_empty() {
+        Some(rkp_core::asset_file::MeshSectionsIn {
+            vertices: &mesh_vertex_bytes,
+            indices: &mesh_index_bytes,
+            clusters: &meshlet_cluster_bytes,
+            lod0_index_count,
+        })
+    } else {
+        None
+    };
+
     write_rkp_atomic(output_path, |writer| {
         rkp_core::asset_file::write_rkp_with_progress(
             writer,
@@ -142,6 +182,7 @@ pub fn write_rkp(
             if bricks_bytes.is_empty() { None } else { Some(bricks_bytes) },
             color_bytes,
             skin_meta,
+            mesh_sections,
             Some(&progress_cb),
         )
         .map_err(|e| format!("write .rkp: {e}"))

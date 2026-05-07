@@ -228,6 +228,25 @@ impl RkpSceneManager {
             &[]
         };
 
+        // v5+: pre-built mesh + cluster DAG sections. Replace the
+        // load-time `extract_surface_mesh` + `build_cluster_dag` calls
+        // (~12s on a 2.5M-vert elephant) with a deserialize. Vertices'
+        // `leaf_attr_id`s are file-local; we relocate them to scene-
+        // global below, the same pattern bricks already use.
+        let mesh_vertices_bytes = rkp_core::asset_file::read_rkp_mesh_vertices(
+            &mut reader, &header,
+        )
+        .map_err(|e| format!("read mesh vertices: {e}"))?;
+        let mesh_indices_bytes = rkp_core::asset_file::read_rkp_mesh_indices(
+            &mut reader, &header,
+        )
+        .map_err(|e| format!("read mesh indices: {e}"))?;
+        let meshlet_clusters_bytes = rkp_core::asset_file::read_rkp_meshlet_clusters(
+            &mut reader, &header,
+        )
+        .map_err(|e| format!("read meshlet clusters: {e}"))?;
+        let mesh_lod0_index_count_from_file = header.mesh_lod0_index_count;
+
         let bytes_per_voxel = std::mem::size_of::<VoxelSample>();
         // `Option<u32>` for normal so we distinguish "file has no normals"
         // (stays None → leaf_attr keeps its default) from "file has a
@@ -418,52 +437,65 @@ impl RkpSceneManager {
             self.brick_pool.as_slice(),
         );
 
-        // Surface-mesh extraction (Phase 1 of the splat-to-mesh pivot).
-        // Walks the same brick-remapped tree as `extract_splats`, so
-        // the mesh's per-vertex `leaf_attr_id` indexes directly into
-        // the scene-global `leaf_attr_pool`. Phase 2 will rasterize
-        // these triangles into the visibility buffer; until then they
-        // ride along on `AssetEntry` as inert data.
-        let (mesh_vertices, mesh_indices_unclustered) = extract_surface_mesh(
-            tree.as_slice(),
-            header.octree_depth as u8,
-            header.base_voxel_size,
-            asset_grid_origin,
-            self.brick_pool.as_slice(),
-            self.leaf_attr_pool.as_slice(),
-        );
+        // v5+ pre-built mesh deserialization. The .rkp ships
+        // `(MeshVertex[], u32[], MeshletCluster[])` so the editor
+        // skips the ~12s `extract_surface_mesh` +
+        // `build_cluster_dag` it used to do at every load. v4 files
+        // (`mesh_vertices_bytes` empty after the v4-header
+        // fallback) take the fall-back path below: rebuild from the
+        // scene-merged tree as before.
+        use rkp_core::mesh_extract::MeshVertex;
+        use rkp_core::mesh_cluster::MeshletCluster;
+        let have_baked_mesh = !mesh_vertices_bytes.is_empty();
+        let (mut mesh_vertices, mesh_indices, meshlet_clusters, mesh_lod0_index_count) =
+            if have_baked_mesh {
+                let v: Vec<MeshVertex> =
+                    bytemuck::cast_slice::<u8, MeshVertex>(&mesh_vertices_bytes).to_vec();
+                let i: Vec<u32> =
+                    bytemuck::cast_slice::<u8, u32>(&mesh_indices_bytes).to_vec();
+                let c: Vec<MeshletCluster> =
+                    bytemuck::cast_slice::<u8, MeshletCluster>(&meshlet_clusters_bytes)
+                        .to_vec();
+                (v, i, c, mesh_lod0_index_count_from_file)
+            } else {
+                // Legacy v4 fallback — extract + build at load time
+                // exactly like the pre-v5 path. Logged so a slow load
+                // is attributable to a stale .rkp instead of looking
+                // like a perf regression.
+                eprintln!(
+                    "[RkpSceneManager] {}: v4 .rkp without baked mesh sections — extracting + building DAG at load (re-import to avoid this)",
+                    rkp_path.display(),
+                );
+                let (v, i_unc) = extract_surface_mesh(
+                    tree.as_slice(),
+                    header.octree_depth as u8,
+                    header.base_voxel_size,
+                    asset_grid_origin,
+                    self.brick_pool.as_slice(),
+                    self.leaf_attr_pool.as_slice(),
+                );
+                let dag_t0 = std::time::Instant::now();
+                let dag = crate::mesh_pass::build_cluster_dag(&v, &i_unc);
+                eprintln!(
+                    "[RkpSceneManager] {}: legacy DAG built in {:.2}s ({} clusters)",
+                    rkp_path.display(),
+                    dag_t0.elapsed().as_secs_f32(),
+                    dag.clusters.len(),
+                );
+                let lod0 = dag.lod0_index_range.1 - dag.lod0_index_range.0;
+                (v, dag.indices, dag.clusters, lod0)
+            };
 
-        // Phase 6.1: build the full Karis-Nanite-style cluster DAG.
-        // LOD 0 is the same Phase-5 surface clustering; higher LOD
-        // levels are produced by grouping prev-level clusters via
-        // meshopt's shared-vertex partitioner, locking each group's
-        // exterior boundary verts, running
-        // `meshopt::simplify_with_locks`, and re-clustering the
-        // simplified result. The IBO concatenates all LOD levels
-        // (LOD 0 first); `mesh_lod0_index_count` records the LOD-0
-        // prefix so dispatch keeps drawing what it always did until
-        // Phase 6.2 wires the indirect path.
-        let dag_t0 = std::time::Instant::now();
-        eprintln!(
-            "[RkpSceneManager] {}: building cluster DAG over {} verts / {} tris...",
-            rkp_path.display(),
-            mesh_vertices.len(),
-            mesh_indices_unclustered.len() / 3,
-        );
-        let dag = crate::mesh_pass::build_cluster_dag(
-            &mesh_vertices,
-            &mesh_indices_unclustered,
-        );
-        eprintln!(
-            "[RkpSceneManager] {}: DAG built in {:.2}s ({} clusters across {} LOD levels)",
-            rkp_path.display(),
-            dag_t0.elapsed().as_secs_f32(),
-            dag.clusters.len(),
-            dag.clusters.iter().map(|c| c.lod_level).max().unwrap_or(0) + 1,
-        );
-        let mesh_indices = dag.indices;
-        let meshlet_clusters = dag.clusters;
-        let mesh_lod0_index_count = dag.lod0_index_range.1 - dag.lod0_index_range.0;
+        // Relocate vertex `leaf_attr_id`s from file-local (what
+        // rkp-import baked into v5) to scene-global. The legacy v4
+        // path already produced scene-global IDs because it ran
+        // `extract_surface_mesh` against the scene-merged pools.
+        if have_baked_mesh && leaf_attr_slot_start > 0 && !mesh_vertices.is_empty() {
+            for v in &mut mesh_vertices {
+                v.leaf_attr_id += leaf_attr_slot_start;
+            }
+        }
+        let _ = (mesh_indices.len(), meshlet_clusters.len());
 
         // Compute brick face-links for this asset. The tree's brick ids
         // have already been remapped to global ids above, so the rows

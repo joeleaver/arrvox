@@ -8,6 +8,23 @@ use super::{
     RKP_VERSION, RkpFileError, RkpHeader, SkinMetaIn, encode_skin_meta, write_stage,
 };
 
+/// Pre-built mesh + cluster DAG to ship in a v5 .rkp. All four
+/// fields populated together (or `None` for the whole struct);
+/// partial population isn't supported — the renderer expects the
+/// triplet to be self-consistent.
+#[derive(Debug, Clone, Copy)]
+pub struct MeshSectionsIn<'a> {
+    /// `MeshVertex` bytes from `extract_surface_mesh`. 32 B per vertex.
+    pub vertices: &'a [u8],
+    /// Concatenated index buffer across all LOD levels, LOD-0 first.
+    /// `bytemuck`-castable from `&[u32]`.
+    pub indices: &'a [u8],
+    /// `MeshletCluster` bytes from `build_cluster_dag`. 64 B each.
+    pub clusters: &'a [u8],
+    /// Length of the LOD-0 prefix in `indices` (number of u32 entries).
+    pub lod0_index_count: u32,
+}
+
 /// Thin wrapper that delegates to [`write_rkp_with_progress`] without
 /// emitting any progress. Kept for callers (including the rkp-core
 /// tests) that don't want progress reporting.
@@ -26,6 +43,7 @@ pub fn write_rkp<W: Write + Seek>(
     bricks_data: Option<&[u8]>,
     color_data: Option<&[u8]>,
     skin_meta: Option<SkinMetaIn<'_>>,
+    mesh_sections: Option<MeshSectionsIn<'_>>,
 ) -> Result<(), RkpFileError> {
     write_rkp_with_progress(
         writer,
@@ -41,6 +59,7 @@ pub fn write_rkp<W: Write + Seek>(
         bricks_data,
         color_data,
         skin_meta,
+        mesh_sections,
         None,
     )
 }
@@ -66,6 +85,7 @@ pub fn write_rkp_with_progress<W: Write + Seek>(
     bricks_data: Option<&[u8]>,
     color_data: Option<&[u8]>,
     skin_meta: Option<SkinMetaIn<'_>>,
+    mesh_sections: Option<MeshSectionsIn<'_>>,
     progress: Option<&dyn Fn(&'static str)>,
 ) -> Result<(), RkpFileError> {
     let tick = |label: &'static str| {
@@ -99,6 +119,18 @@ pub fn write_rkp_with_progress<W: Write + Seek>(
         tick(write_stage::COMPRESS_BONES);
         lz4_flex::compress_prepend_size(d)
     });
+    let mesh_vertices_compressed = mesh_sections.map(|m| {
+        tick(write_stage::COMPRESS_MESH_VERTICES);
+        lz4_flex::compress_prepend_size(m.vertices)
+    });
+    let mesh_indices_compressed = mesh_sections.map(|m| {
+        tick(write_stage::COMPRESS_MESH_INDICES);
+        lz4_flex::compress_prepend_size(m.indices)
+    });
+    let meshlet_clusters_compressed = mesh_sections.map(|m| {
+        tick(write_stage::COMPRESS_MESHLET_CLUSTERS);
+        lz4_flex::compress_prepend_size(m.clusters)
+    });
     tick(write_stage::WRITE_FILE);
 
     let mut flags = 0u32;
@@ -131,6 +163,13 @@ pub fn write_rkp_with_progress<W: Write + Seek>(
         color_compressed_size: color_compressed.as_ref().map(|d| d.len() as u32).unwrap_or(0),
         bone_compressed_size: bone_compressed.as_ref().map(|d| d.len() as u32).unwrap_or(0),
         bricks_compressed_size: bricks_compressed.as_ref().map(|d| d.len() as u32).unwrap_or(0),
+        mesh_vertices_compressed_size: mesh_vertices_compressed
+            .as_ref().map(|d| d.len() as u32).unwrap_or(0),
+        mesh_indices_compressed_size: mesh_indices_compressed
+            .as_ref().map(|d| d.len() as u32).unwrap_or(0),
+        meshlet_clusters_compressed_size: meshlet_clusters_compressed
+            .as_ref().map(|d| d.len() as u32).unwrap_or(0),
+        mesh_lod0_index_count: mesh_sections.map(|m| m.lod0_index_count).unwrap_or(0),
     };
 
     writer.write_all(bytemuck::bytes_of(&header))?;
@@ -146,6 +185,15 @@ pub fn write_rkp_with_progress<W: Write + Seek>(
         writer.write_all(data)?;
     }
     if let Some(ref data) = bone_compressed {
+        writer.write_all(data)?;
+    }
+    if let Some(ref data) = mesh_vertices_compressed {
+        writer.write_all(data)?;
+    }
+    if let Some(ref data) = mesh_indices_compressed {
+        writer.write_all(data)?;
+    }
+    if let Some(ref data) = meshlet_clusters_compressed {
         writer.write_all(data)?;
     }
 
@@ -216,6 +264,32 @@ pub fn write_artifact_rkp(
 
     let material_ids: [u16; 0] = [];
 
+    // Pre-build the surface mesh + Karis-Nanite cluster DAG so the
+    // editor doesn't have to rebuild it at load. `leaf_attr_id`s
+    // baked into the vertices are file-local; the load path adds
+    // the asset's global leaf_attr offset before any GPU upload.
+    // Same one-time cost the rkp-import path pays — moves DAG
+    // build out of the editor's load critical path.
+    let (mesh_vertex_bytes, mesh_index_bytes, meshlet_cluster_bytes, lod0_index_count) =
+        build_mesh_sections_blob(
+            artifact.octree.as_slice(),
+            artifact.octree.depth(),
+            voxel_size,
+            artifact.grid_origin,
+            &bricks_flat,
+            &artifact.leaf_attrs,
+        );
+    let mesh_sections = if !mesh_vertex_bytes.is_empty() {
+        Some(MeshSectionsIn {
+            vertices: &mesh_vertex_bytes,
+            indices: &mesh_index_bytes,
+            clusters: &meshlet_cluster_bytes,
+            lod0_index_count,
+        })
+    } else {
+        None
+    };
+
     let tmp = {
         let mut s = path.as_os_str().to_owned();
         s.push(".inprogress");
@@ -246,6 +320,7 @@ pub fn write_artifact_rkp(
             Some(bricks_bytes),
             color_bytes,
             None,
+            mesh_sections,
         )
         .map_err(|e| format!("write .rkp: {e}"))?;
     }
@@ -256,4 +331,46 @@ pub fn write_artifact_rkp(
     })?;
 
     Ok(())
+}
+
+/// Run surface-mesh extraction + Karis-Nanite cluster-DAG build over
+/// the asset's geometry, returning the byte buffers ready for the
+/// `MeshSectionsIn` v5 sections (`vertices`, `indices`, `clusters`)
+/// plus the LOD-0 index count. Empty Vecs when there's no surface
+/// to extract (degenerate input).
+///
+/// `leaf_attr_id`s baked into the vertices are FILE-LOCAL — i.e.,
+/// indexes into the asset's own `leaf_attrs` Vec. The load path is
+/// responsible for adding the scene-global leaf_attr offset before
+/// any GPU upload, the same way it relocates `brick_id`s today.
+pub fn build_mesh_sections_blob(
+    octree_nodes: &[u32],
+    octree_depth: u8,
+    base_voxel_size: f32,
+    grid_origin: glam::Vec3,
+    brick_pool: &[u32],
+    leaf_attrs: &[crate::leaf_attr::LeafAttr],
+) -> (Vec<u8>, Vec<u8>, Vec<u8>, u32) {
+    if octree_nodes.is_empty() || leaf_attrs.is_empty() {
+        return (Vec::new(), Vec::new(), Vec::new(), 0);
+    }
+    let (vertices, indices_unclustered) = crate::mesh_extract::extract_surface_mesh(
+        octree_nodes,
+        octree_depth,
+        base_voxel_size,
+        grid_origin,
+        brick_pool,
+        leaf_attrs,
+    );
+    if vertices.is_empty() || indices_unclustered.is_empty() {
+        return (Vec::new(), Vec::new(), Vec::new(), 0);
+    }
+    let dag = crate::mesh_lod::build_cluster_dag(&vertices, &indices_unclustered);
+    let lod0_index_count = dag.lod0_index_range.1 - dag.lod0_index_range.0;
+    (
+        bytemuck::cast_slice(&vertices).to_vec(),
+        bytemuck::cast_slice(&dag.indices).to_vec(),
+        bytemuck::cast_slice(&dag.clusters).to_vec(),
+        lod0_index_count,
+    )
 }

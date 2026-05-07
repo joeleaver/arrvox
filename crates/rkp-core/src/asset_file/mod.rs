@@ -22,7 +22,16 @@
 //!                               [u32; 3] × brick_origin_count,
 //!                               u32 rest_aabb_count,
 //!                               [f32; 6] × rest_aabb_count
+//! [mesh vertices (optional)]  v5+: LZ4, MeshVertex × N (32 B each)
+//! [mesh indices (optional)]   v5+: LZ4, u32 × M (concatenated all-LODs)
+//! [meshlet clusters (opt)]    v5+: LZ4, MeshletCluster × K (64 B each)
 //! ```
+//!
+//! v5 adds three pre-built mesh sections so the editor doesn't have
+//! to re-extract the surface mesh + rebuild the Karis-Nanite cluster
+//! DAG every load. Build is done once at import (or procedural bake)
+//! and the result ships in the .rkp. v4 files are no longer
+//! supported — re-import to migrate.
 //!
 //! The skin-meta section consolidates everything the Phase-3 scatter
 //! pass needs: per-leaf bone influences (weights + indices), per-brick
@@ -49,7 +58,10 @@ mod write;
 #[cfg(test)]
 mod tests;
 
-pub use write::{write_artifact_rkp, write_rkp, write_rkp_with_progress};
+pub use write::{
+    build_mesh_sections_blob, write_artifact_rkp, write_rkp, write_rkp_with_progress,
+    MeshSectionsIn,
+};
 
 use bytemuck::{Pod, Zeroable};
 
@@ -57,7 +69,10 @@ use bytemuck::{Pod, Zeroable};
 pub const RKP_MAGIC: [u8; 4] = [b'R', b'K', b'P', 0x01];
 
 /// Current format version.
-pub const RKP_VERSION: u32 = 4;
+///
+/// v5 (current): adds pre-built mesh + cluster DAG sections. v4 files
+/// fail to load — re-import to migrate.
+pub const RKP_VERSION: u32 = 5;
 
 /// Flags for optional sections.
 pub const FLAG_HAS_COLOR: u32 = 1 << 0;
@@ -104,6 +119,16 @@ pub struct RkpHeader {
     pub bone_compressed_size: u32,
     /// Compressed size of bricks section (0 if no bricks). v4+.
     pub bricks_compressed_size: u32,
+    /// Compressed size of mesh vertices section. v5+. 0 if absent.
+    pub mesh_vertices_compressed_size: u32,
+    /// Compressed size of mesh indices section. v5+. 0 if absent.
+    pub mesh_indices_compressed_size: u32,
+    /// Compressed size of meshlet clusters section. v5+. 0 if absent.
+    pub meshlet_clusters_compressed_size: u32,
+    /// Length of the LOD-0 prefix in `mesh_indices` (number of u32
+    /// indices). Lets the renderer access just the LOD-0 portion
+    /// without walking the cluster table. v5+. 0 if absent.
+    pub mesh_lod0_index_count: u32,
 }
 
 /// Per-write skin-meta input. Fed into [`write_rkp_with_progress`]'s
@@ -234,23 +259,50 @@ pub mod write_stage {
     pub const COMPRESS_BRICKS: &str = "compress_bricks";
     pub const COMPRESS_COLORS: &str = "compress_colors";
     pub const COMPRESS_BONES: &str = "compress_bones";
+    pub const COMPRESS_MESH_VERTICES: &str = "compress_mesh_vertices";
+    pub const COMPRESS_MESH_INDICES: &str = "compress_mesh_indices";
+    pub const COMPRESS_MESHLET_CLUSTERS: &str = "compress_meshlet_clusters";
     pub const WRITE_FILE: &str = "write_file";
 }
 
 
-/// Read a .rkp file header.
-pub fn read_rkp_header<R: Read>(reader: &mut R) -> Result<RkpHeader, RkpFileError> {
-    let mut buf = [0u8; std::mem::size_of::<RkpHeader>()];
-    reader.read_exact(&mut buf)?;
-    let header: RkpHeader = *bytemuck::from_bytes(&buf);
+/// Header size for the v4 layout (128 B). v5 added 16 trailing
+/// bytes (3 mesh-section sizes + lod0_index_count). Reader detects
+/// version after the first 8 bytes (magic + version) and reads the
+/// rest accordingly so existing v4 files keep loading while we
+/// migrate to v5.
+const V4_HEADER_SIZE: usize = 128;
+const V5_HEADER_SIZE: usize = std::mem::size_of::<RkpHeader>();
 
-    if header.magic != RKP_MAGIC {
+/// Read a .rkp file header. Accepts v4 (128 B) and v5 (144 B); the
+/// v4 path zero-fills the new mesh-section fields so the renderer's
+/// fallback (build DAG at load) kicks in. Rejects any other version.
+pub fn read_rkp_header<R: Read>(reader: &mut R) -> Result<RkpHeader, RkpFileError> {
+    // Peek magic + version first.
+    let mut prefix = [0u8; 8];
+    reader.read_exact(&mut prefix)?;
+    let magic: [u8; 4] = prefix[0..4].try_into().unwrap();
+    if magic != RKP_MAGIC {
         return Err(RkpFileError::BadMagic);
     }
-    if header.version != RKP_VERSION {
-        return Err(RkpFileError::UnsupportedVersion(header.version));
-    }
+    let version = u32::from_le_bytes(prefix[4..8].try_into().unwrap());
 
+    let body_len = match version {
+        4 => V4_HEADER_SIZE - 8,
+        5 => V5_HEADER_SIZE - 8,
+        v => return Err(RkpFileError::UnsupportedVersion(v)),
+    };
+    let mut body = vec![0u8; body_len];
+    reader.read_exact(&mut body)?;
+
+    // Reassemble into a fixed-size v5 buffer; v4's tail is zeroed,
+    // which leaves `mesh_*_compressed_size` and `mesh_lod0_index_count`
+    // at zero. The mesh-section readers short-circuit on size == 0
+    // and the renderer falls back to in-process DAG build.
+    let mut buf = [0u8; V5_HEADER_SIZE];
+    buf[..8].copy_from_slice(&prefix);
+    buf[8..8 + body_len].copy_from_slice(&body);
+    let header: RkpHeader = *bytemuck::from_bytes(&buf);
     Ok(header)
 }
 
@@ -337,5 +389,52 @@ pub fn read_rkp_skin_meta<R: Read>(
     let raw = lz4_flex::decompress_size_prepended(&compressed)
         .map_err(|e| RkpFileError::Decompress(e.to_string()))?;
     decode_skin_meta(&raw)
+}
+
+/// Read + decompress the mesh-vertices section (v5+). Empty vec if
+/// `header.mesh_vertices_compressed_size == 0`. Bytes are
+/// `bytemuck`-castable to `MeshVertex` (32 B each); caller does the
+/// cast since `MeshVertex` lives in the consuming layer.
+pub fn read_rkp_mesh_vertices<R: Read>(
+    reader: &mut R,
+    header: &RkpHeader,
+) -> Result<Vec<u8>, RkpFileError> {
+    if header.mesh_vertices_compressed_size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut compressed = vec![0u8; header.mesh_vertices_compressed_size as usize];
+    reader.read_exact(&mut compressed)?;
+    lz4_flex::decompress_size_prepended(&compressed)
+        .map_err(|e| RkpFileError::Decompress(e.to_string()))
+}
+
+/// Read + decompress the mesh-indices section (v5+). u32 indices
+/// concatenated across all LOD levels (LOD-0 first).
+pub fn read_rkp_mesh_indices<R: Read>(
+    reader: &mut R,
+    header: &RkpHeader,
+) -> Result<Vec<u8>, RkpFileError> {
+    if header.mesh_indices_compressed_size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut compressed = vec![0u8; header.mesh_indices_compressed_size as usize];
+    reader.read_exact(&mut compressed)?;
+    lz4_flex::decompress_size_prepended(&compressed)
+        .map_err(|e| RkpFileError::Decompress(e.to_string()))
+}
+
+/// Read + decompress the meshlet-clusters section (v5+). Bytes are
+/// `bytemuck`-castable to `MeshletCluster` (64 B each).
+pub fn read_rkp_meshlet_clusters<R: Read>(
+    reader: &mut R,
+    header: &RkpHeader,
+) -> Result<Vec<u8>, RkpFileError> {
+    if header.meshlet_clusters_compressed_size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut compressed = vec![0u8; header.meshlet_clusters_compressed_size as usize];
+    reader.read_exact(&mut compressed)?;
+    lz4_flex::decompress_size_prepended(&compressed)
+        .map_err(|e| RkpFileError::Decompress(e.to_string()))
 }
 

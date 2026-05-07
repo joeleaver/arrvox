@@ -3,8 +3,10 @@ use std::io::{Cursor, Seek, SeekFrom, Write};
 
 
 #[test]
-fn header_size_is_128_bytes() {
-    assert_eq!(std::mem::size_of::<RkpHeader>(), 128);
+fn header_size_is_144_bytes() {
+    // v5: grew from 128 → 144 with the addition of three mesh
+    // section size slots + the lod0_index_count prefix (4 × u32).
+    assert_eq!(std::mem::size_of::<RkpHeader>(), 144);
 }
 
 #[test]
@@ -29,6 +31,7 @@ fn write_and_read_header_roundtrip() {
         None,
         None,
         None, // skin_meta
+        None, // mesh_sections
     )
     .unwrap();
 
@@ -84,6 +87,7 @@ fn write_and_read_skin_meta_roundtrip() {
             brick_origins: &brick_origins,
             rest_bone_aabbs: &rest_aabbs,
         }),
+        None, // mesh_sections
     )
     .unwrap();
 
@@ -225,6 +229,7 @@ fn write_and_read_octree_roundtrip() {
         None,
         None,
         None, // skin_meta
+        None, // mesh_sections
     )
     .unwrap();
 
