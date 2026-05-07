@@ -543,6 +543,7 @@ impl RkpRenderer {
             PIXEL_THRESHOLD_PRIMARY,
         );
         let lod_stats_enabled = std::env::var("RKP_MESH_LOD_STATS").is_ok();
+        let pipestats_enabled = std::env::var("RKP_MESH_PIPESTATS").is_ok();
         let force_admit_flag: u32 = if std::env::var("RKP_MESH_DEBUG_FORCE_ADMIT").is_ok() {
             1
         } else {
@@ -629,6 +630,9 @@ impl RkpRenderer {
                 viewport.lod_stats_drain_primary("primary");
                 viewport.lod_stats_clear_primary(encoder);
             }
+            if pipestats_enabled {
+                viewport.pipestats_drain();
+            }
 
             let q_lod = self.profiler.begin_query("mesh_lod_select", encoder);
             {
@@ -636,6 +640,11 @@ impl RkpRenderer {
                     label: Some("mesh_lod_select"),
                     timestamp_writes: None,
                 });
+                if pipestats_enabled {
+                    cpass.begin_pipeline_statistics_query(
+                        &viewport.mesh_pipestats_query_set, 0,
+                    );
+                }
                 for (slot, d) in draws.iter().enumerate() {
                     if !slot_active[slot] {
                         continue;
@@ -653,6 +662,9 @@ impl RkpRenderer {
                         .0;
                     self.mesh_lod_select_pass
                         .dispatch(&mut cpass, g0, g1, g2, cluster_count);
+                }
+                if pipestats_enabled {
+                    cpass.end_pipeline_statistics_query();
                 }
             }
             self.profiler.end_query(encoder, q_lod);
@@ -727,6 +739,11 @@ impl RkpRenderer {
             );
             rp.set_pipeline(&self.mesh_pass.pipeline);
             rp.set_bind_group(0, g0_bg, &[]);
+            if pipestats_enabled {
+                rp.begin_pipeline_statistics_query(
+                    &viewport.mesh_pipestats_query_set, 1,
+                );
+            }
             for (slot, d) in draws.iter().enumerate() {
                 let Some((vbo, ibo, lod0_index_count)) = self.mesh_buffer(d.asset_handle_raw)
                 else {
@@ -763,6 +780,9 @@ impl RkpRenderer {
                     let (args_buf, _) = &viewport.mesh_lod_args_buffers[slot];
                     rp.multi_draw_indexed_indirect(args_buf, 0, max_draws);
                 }
+            }
+            if pipestats_enabled {
+                rp.end_pipeline_statistics_query();
             }
         }
         self.profiler.end_query(encoder, q_raster);
@@ -840,6 +860,7 @@ impl RkpRenderer {
             PIXEL_THRESHOLD_SHADOW,
         );
         let lod_stats_enabled = std::env::var("RKP_MESH_LOD_STATS").is_ok();
+        let pipestats_enabled = std::env::var("RKP_MESH_PIPESTATS").is_ok();
         let mut slot_active: Vec<bool> = vec![false; draws.len()];
         for (slot, d) in draws.iter().enumerate() {
             if self.mesh_buffer(d.asset_handle_raw).is_none() {
@@ -910,6 +931,11 @@ impl RkpRenderer {
                     label: Some("mesh_shadow_lod_select"),
                     timestamp_writes: None,
                 });
+                if pipestats_enabled {
+                    cpass.begin_pipeline_statistics_query(
+                        &viewport.mesh_pipestats_query_set, 2,
+                    );
+                }
                 for (slot, d) in draws.iter().enumerate() {
                     if !slot_active[slot] {
                         continue;
@@ -927,6 +953,9 @@ impl RkpRenderer {
                         .0;
                     self.mesh_lod_select_pass
                         .dispatch(&mut cpass, g0, g1, g2, cluster_count);
+                }
+                if pipestats_enabled {
+                    cpass.end_pipeline_statistics_query();
                 }
             }
             self.profiler.end_query(encoder, q_lod);
@@ -952,6 +981,11 @@ impl RkpRenderer {
             );
             rp.set_pipeline(&self.mesh_shadow_map.render_pipeline);
             rp.set_bind_group(0, render_g0, &[]);
+            if pipestats_enabled {
+                rp.begin_pipeline_statistics_query(
+                    &viewport.mesh_pipestats_query_set, 3,
+                );
+            }
             for (slot, d) in draws.iter().enumerate() {
                 let Some((vbo, ibo, lod0_index_count)) = self.mesh_buffer(d.asset_handle_raw)
                 else {
@@ -980,8 +1014,20 @@ impl RkpRenderer {
                     rp.multi_draw_indexed_indirect(args_buf, 0, max_draws);
                 }
             }
+            if pipestats_enabled {
+                rp.end_pipeline_statistics_query();
+            }
         }
         self.profiler.end_query(encoder, q_render);
+
+        // After both shadow passes have closed their queries, resolve
+        // the QuerySet → resolve_buffer → staging. Pipestats are
+        // pass-shared across the whole frame's mesh chain (4 slots:
+        // primary lod_select + raster, shadow lod_select + render),
+        // so this is the natural single resolve point.
+        if pipestats_enabled {
+            viewport.pipestats_finalize(encoder);
+        }
 
         // 2. Blit compute — copy bitcast(depth) into shadow_buffer.
         //    Single thread per texel, full overwrite; no need to

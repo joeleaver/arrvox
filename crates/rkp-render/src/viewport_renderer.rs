@@ -229,6 +229,24 @@ pub struct ViewportRenderer {
     pub mesh_lod_admit_stats_primary_needs_map: bool,
     pub mesh_lod_admit_stats_shadow_needs_map: bool,
 
+    // ── Mesh pipeline-statistics queries (RKP_MESH_PIPESTATS=1) ────
+    /// One QuerySet with 4 slots covering the mesh passes:
+    /// 0 = mesh_lod_select (compute), 1 = mesh_raster (graphics),
+    /// 2 = mesh_shadow_lod_select (compute), 3 = mesh_shadow_render
+    /// (graphics). All five PipelineStatisticsTypes flags are
+    /// enabled so each slot returns 5 × u64 = 40 bytes
+    /// (vs/clipper-in/clipper-out/fs/cs invocations).
+    pub mesh_pipestats_query_set: wgpu::QuerySet,
+    /// 4 slots × 40 bytes = 160 bytes; rounded up to 256 for the
+    /// COPY_BUFFER_ALIGNMENT requirement on resolve_query_set →
+    /// copy_buffer_to_buffer.
+    pub mesh_pipestats_resolve_buffer: wgpu::Buffer,
+    /// MAP_READ staging buffer for async readback. Same 256 B size.
+    pub mesh_pipestats_staging_buffer: wgpu::Buffer,
+    pub mesh_pipestats_pending:
+        Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    pub mesh_pipestats_needs_map: bool,
+
     pub width: u32,
     pub height: u32,
 }
@@ -532,6 +550,31 @@ impl ViewportRenderer {
             mesh_lod_admit_stats_shadow_pending: None,
             mesh_lod_admit_stats_primary_needs_map: false,
             mesh_lod_admit_stats_shadow_needs_map: false,
+            mesh_pipestats_query_set: device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("rkp_vr_mesh_pipestats"),
+                ty: wgpu::QueryType::PipelineStatistics(
+                    wgpu::PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS
+                        | wgpu::PipelineStatisticsTypes::CLIPPER_INVOCATIONS
+                        | wgpu::PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT
+                        | wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS
+                        | wgpu::PipelineStatisticsTypes::COMPUTE_SHADER_INVOCATIONS,
+                ),
+                count: 4,
+            }),
+            mesh_pipestats_resolve_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rkp_vr_mesh_pipestats_resolve"),
+                size: 256,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            mesh_pipestats_staging_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rkp_vr_mesh_pipestats_staging"),
+                size: 256,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            mesh_pipestats_pending: None,
+            mesh_pipestats_needs_map: false,
             width, height,
         }
     }
@@ -960,8 +1003,92 @@ impl ViewportRenderer {
         self.mesh_lod_admit_stats_shadow_needs_map = true;
     }
 
+    /// Mesh pipeline-statistics drain: read the previous frame's
+    /// 4-slot u64 array if the staging buffer is mapped, log p
+    /// er-pass VS / clipper-in / clipper-out / FS / CS counts.
+    /// Cheap when nothing's in flight.
+    pub fn pipestats_drain(&mut self) {
+        let Some(rx) = self.mesh_pipestats_pending.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                let slice = self.mesh_pipestats_staging_buffer.slice(..);
+                let data = slice.get_mapped_range();
+                if data.len() >= 160 {
+                    // Layout: 4 slots × 5 × u64. Stat order matches
+                    // the `PipelineStatisticsTypes` bit order:
+                    // VS, CLIPPER_IN, CLIPPER_OUT, FS, CS.
+                    let read_slot = |slot: usize| -> [u64; 5] {
+                        let base = slot * 40;
+                        let mut out = [0u64; 5];
+                        for i in 0..5 {
+                            let off = base + i * 8;
+                            out[i] = u64::from_le_bytes(
+                                data[off..off + 8].try_into().unwrap(),
+                            );
+                        }
+                        out
+                    };
+                    let labels = [
+                        "mesh_lod_select",
+                        "mesh_raster",
+                        "mesh_shadow_lod_select",
+                        "mesh_shadow_render",
+                    ];
+                    for (slot, label) in labels.iter().enumerate() {
+                        let s = read_slot(slot);
+                        eprintln!(
+                            "[mesh_pipestats {label}] vs={} clipper_in={} clipper_out={} fs={} cs={}",
+                            s[0], s[1], s[2], s[3], s[4],
+                        );
+                    }
+                }
+                drop(data);
+                self.mesh_pipestats_staging_buffer.unmap();
+                self.mesh_pipestats_pending = None;
+            }
+            Ok(Err(e)) => {
+                eprintln!("[mesh_pipestats] map_async error: {e:?}");
+                self.mesh_pipestats_pending = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.mesh_pipestats_pending = None;
+            }
+        }
+    }
+
+    /// Resolve the query set into the resolve buffer + copy to
+    /// staging. Called once per frame after both mesh passes have
+    /// emitted their begin/end_pipeline_statistics_query pairs.
+    /// Skip when an earlier frame's map is still pending so we
+    /// don't overwrite mid-flight data.
+    pub fn pipestats_finalize(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if self.mesh_pipestats_pending.is_some() {
+            return;
+        }
+        encoder.resolve_query_set(
+            &self.mesh_pipestats_query_set,
+            0..4,
+            &self.mesh_pipestats_resolve_buffer,
+            0,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.mesh_pipestats_resolve_buffer,
+            0,
+            &self.mesh_pipestats_staging_buffer,
+            0,
+            160,
+        );
+        self.mesh_pipestats_needs_map = true;
+    }
+
     /// Engine call after `queue.submit()`. Issues map_async on any
-    /// staging buffers `lod_stats_finalize_*` flagged this frame.
+    /// staging buffers the per-frame finalize methods flagged.
+    /// Bundles all the diagnostic readback stagings (LOD admit
+    /// histograms + pipeline-statistics query results) so the
+    /// engine has one symmetric pre/post-submit pair.
     pub fn lod_stats_post_submit(&mut self) {
         if self.mesh_lod_admit_stats_primary_needs_map {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -982,6 +1109,16 @@ impl ViewportRenderer {
                 });
             self.mesh_lod_admit_stats_shadow_pending = Some(rx);
             self.mesh_lod_admit_stats_shadow_needs_map = false;
+        }
+        if self.mesh_pipestats_needs_map {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.mesh_pipestats_staging_buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx.send(r);
+                });
+            self.mesh_pipestats_pending = Some(rx);
+            self.mesh_pipestats_needs_map = false;
         }
     }
 

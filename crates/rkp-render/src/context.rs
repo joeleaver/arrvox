@@ -149,7 +149,8 @@ impl RenderContext {
                 required_features: wgpu::Features::FLOAT32_FILTERABLE
                     | wgpu::Features::TIMESTAMP_QUERY
                     | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
-                    | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT,
+                    | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
+                    | wgpu::Features::PIPELINE_STATISTICS_QUERY,
                     // `MULTI_DRAW_INDIRECT_COUNT` is load-bearing
                     // for the Phase 6 mesh path even though we don't
                     // use the count-from-GPU variant (yet). Per the
