@@ -384,27 +384,44 @@ pub(super) fn run_pre_frame(
 
     // 2. Skin scatter (one batched compute dispatch). Sim folded every
     //    skinned entity into `frame.skin.batch`; we just fire it.
+    //
+    // **Phase 6.6 gate:** the scatter writes the voxel-march bone
+    // field that only the legacy march path samples. Mesh primary
+    // does its skinning in the vertex shader against the same per-
+    // frame `bone_matrices` / `bone_dual_quats` buffers (which the
+    // sim still uploads via `RenderFrame::bone_matrix_lbs/dqs`), so
+    // the bone-field scatter is dead weight in mesh mode — measured
+    // at ~1.6 ms p50 on splat5 elephant pre-gate. The check stays
+    // local to this dispatch so the legacy buffers + the matrix
+    // upload upstream remain wired for any viewport that's still on
+    // march (`RKP_PRIMARY=march` or default).
+    let skip_skin_deform = matches!(
+        state.renderer.primary_mode,
+        rkp_render::rkp_renderer::PrimaryMode::Mesh,
+    );
     if let Some(skin) = &frame.skin {
-        let mut skin_encoder = state
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("rkp_skin_deform_encoder"),
-            });
-        let q = state
-            .renderer
-            .profiler
-            .begin_query("skin_deform", &mut skin_encoder);
-        state.renderer.prepare_bone_field(
-            &state.queue,
-            &mut skin_encoder,
-            skin.bone_field_bytes,
-            skin.bone_field_occ_bytes,
-        );
-        state
-            .renderer
-            .scatter_skin_batch(&state.queue, &mut skin_encoder, &skin.batch);
-        state.renderer.profiler.end_query(&mut skin_encoder, q);
-        state.queue.submit(std::iter::once(skin_encoder.finish()));
+        if !skip_skin_deform {
+            let mut skin_encoder = state
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("rkp_skin_deform_encoder"),
+                });
+            let q = state
+                .renderer
+                .profiler
+                .begin_query("skin_deform", &mut skin_encoder);
+            state.renderer.prepare_bone_field(
+                &state.queue,
+                &mut skin_encoder,
+                skin.bone_field_bytes,
+                skin.bone_field_occ_bytes,
+            );
+            state
+                .renderer
+                .scatter_skin_batch(&state.queue, &mut skin_encoder, &skin.batch);
+            state.renderer.profiler.end_query(&mut skin_encoder, q);
+            state.queue.submit(std::iter::once(skin_encoder.finish()));
+        }
     }
 
     // The user-shader BFS path (Phase C) is gone — only persistent
