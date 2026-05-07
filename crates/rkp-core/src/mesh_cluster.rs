@@ -219,6 +219,104 @@ pub fn cluster_mesh(
     (clusters, flat_indices)
 }
 
+/// Inflate per-cluster AABBs to cover the rest-pose extents of the
+/// bones their vertices are weighted against.
+///
+/// **Why:** mesh-VS skinning (Phase 6.6) deforms vertex positions at
+/// draw time. The static rest-pose AABBs `cluster_mesh` produces no
+/// longer bound the animated geometry — a cluster on an arm can leave
+/// its rest-pose AABB entirely as the arm raises. The Phase-6 LOD
+/// selector would then wrongly cull that cluster from the camera or
+/// shadow pass.
+///
+/// This is the **conservative** variant from the Phase 6.6 plan: at
+/// load time, for each cluster, union the rest-pose AABBs of every
+/// bone any of its vertices actually weights against. Bones cover the
+/// geometry they animate, so unioning their rest AABBs bounds where
+/// the cluster's geometry can land for any per-bone *transform* that
+/// keeps each bone within the same volume it occupies at rest. That
+/// covers typical character animation (limb rotations around
+/// stationary roots); exotic poses (full somersaults, scale anims)
+/// can still escape — those need the per-frame GPU recompute variant
+/// the memory plan flags as a follow-on.
+///
+/// Inputs:
+/// * `clusters` — mutated in place; `aabb_min` / `aabb_max` widened.
+/// * `vertices` — the asset's vertex buffer (with `bone_indices` /
+///   `bone_weights` baked in by `extract_surface_mesh`).
+/// * `flat_indices` — index buffer; cluster slices read here.
+/// * `rest_bone_aabbs` — per-bone `[min_x, min_y, min_z,
+///   max_x, max_y, max_z]` extents at rest pose, indexed by the same
+///   `bone_idx` the vertex's `bone_indices` carries.
+///
+/// No-op when `rest_bone_aabbs` is empty (unskinned asset) or any
+/// cluster's vertex range is empty. Bone indices that fall outside
+/// `rest_bone_aabbs` are silently skipped — defensive against stale
+/// asset bakes.
+pub fn expand_clusters_for_skinning(
+    clusters: &mut [MeshletCluster],
+    vertices: &[crate::mesh_extract::MeshVertex],
+    flat_indices: &[u32],
+    rest_bone_aabbs: &[[f32; 6]],
+) {
+    if rest_bone_aabbs.is_empty() {
+        return;
+    }
+    for c in clusters.iter_mut() {
+        let start = c.index_offset as usize;
+        let end = start + c.index_count as usize;
+        if end > flat_indices.len() {
+            continue;
+        }
+        let mut seen_bones = [false; 256];
+        for &vid in &flat_indices[start..end] {
+            let v = match vertices.get(vid as usize) {
+                Some(v) => v,
+                None => continue,
+            };
+            // Only count bones that actually carry weight on this
+            // vertex — `bone_indices` slot whose matching `bone_weights`
+            // byte is zero is just zero-padding, not a real influence.
+            for slot in 0..4u32 {
+                let w = (v.bone_weights >> (slot * 8)) & 0xFFu32;
+                if w == 0 {
+                    continue;
+                }
+                let bone_idx = ((v.bone_indices >> (slot * 8)) & 0xFFu32) as usize;
+                if bone_idx < seen_bones.len() {
+                    seen_bones[bone_idx] = true;
+                }
+            }
+        }
+        let mut aabb_min = c.aabb_min;
+        let mut aabb_max = c.aabb_max;
+        for (bone_idx, &touched) in seen_bones.iter().enumerate() {
+            if !touched {
+                continue;
+            }
+            let aabb = match rest_bone_aabbs.get(bone_idx) {
+                Some(a) => a,
+                None => continue,
+            };
+            // Sentinel empty AABB (min > max) — skip; a bone the
+            // skeleton declares but no geometry touches.
+            if aabb[0] > aabb[3] || aabb[1] > aabb[4] || aabb[2] > aabb[5] {
+                continue;
+            }
+            for k in 0..3 {
+                if aabb[k] < aabb_min[k] {
+                    aabb_min[k] = aabb[k];
+                }
+                if aabb[k + 3] > aabb_max[k] {
+                    aabb_max[k] = aabb[k + 3];
+                }
+            }
+        }
+        c.aabb_min = aabb_min;
+        c.aabb_max = aabb_max;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -234,6 +332,90 @@ mod tests {
             bone_weights: 0,
             _pad: 0,
         }
+    }
+
+    /// Helper: vertex with explicit bone weight on a single bone.
+    fn vert_with_bone(p: [f32; 3], bone_idx: u8) -> MeshVertex {
+        MeshVertex {
+            local_pos: p,
+            normal_oct: 0,
+            leaf_attr_id: 0,
+            bone_indices: u32::from_le_bytes([bone_idx, 0, 0, 0]),
+            bone_weights: u32::from_le_bytes([255, 0, 0, 0]),
+            _pad: 0,
+        }
+    }
+
+    #[test]
+    fn expand_clusters_unioning_referenced_bone_aabbs() {
+        // Two-triangle cluster: 3 verts on bone 1, 1 vert on bone 2.
+        // Rest AABBs: bone 1 lives near origin; bone 2 way out at +X.
+        // Expanded cluster AABB must cover both.
+        let v = vec![
+            vert_with_bone([0.0, 0.0, 0.0], 1),
+            vert_with_bone([1.0, 0.0, 0.0], 1),
+            vert_with_bone([0.0, 1.0, 0.0], 1),
+            vert_with_bone([0.5, 0.5, 0.0], 2),
+        ];
+        let i = vec![0, 1, 2, 0, 2, 3];
+        let (mut clusters, flat) = cluster_mesh(&v, &i);
+        assert_eq!(clusters.len(), 1, "small mesh fits in one cluster");
+        let pre_min = clusters[0].aabb_min;
+        let pre_max = clusters[0].aabb_max;
+        // bone 0 unused, bone 1 at origin±0.5, bone 2 way out at +X.
+        let bone_aabbs = vec![
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],   // 0 (unused)
+            [-0.5, -0.5, -0.5, 1.0, 1.0, 0.5],// 1
+            [10.0, 0.0, 0.0, 12.0, 1.0, 0.5], // 2
+        ];
+        expand_clusters_for_skinning(&mut clusters, &v, &flat, &bone_aabbs);
+        let c = &clusters[0];
+        assert!(
+            c.aabb_min[0] <= pre_min[0] && c.aabb_max[0] >= pre_max[0],
+            "x-extent must not shrink ({}/{} → {}/{})",
+            pre_min[0], pre_max[0], c.aabb_min[0], c.aabb_max[0],
+        );
+        assert!(
+            c.aabb_max[0] >= 12.0,
+            "expanded aabb_max.x must reach bone-2 rest-AABB max (12.0); got {}",
+            c.aabb_max[0],
+        );
+    }
+
+    #[test]
+    fn expand_skips_unreferenced_bones() {
+        // Cluster only weights bone 1; bone 2's rest AABB must NOT
+        // pollute the cluster's expanded AABB.
+        let v = vec![
+            vert_with_bone([0.0, 0.0, 0.0], 1),
+            vert_with_bone([1.0, 0.0, 0.0], 1),
+            vert_with_bone([0.0, 1.0, 0.0], 1),
+        ];
+        let i = vec![0, 1, 2];
+        let (mut clusters, flat) = cluster_mesh(&v, &i);
+        let bone_aabbs = vec![
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [-0.5, -0.5, -0.5, 1.0, 1.0, 0.5],
+            [100.0, 100.0, 100.0, 200.0, 200.0, 200.0], // unused — must NOT count
+        ];
+        expand_clusters_for_skinning(&mut clusters, &v, &flat, &bone_aabbs);
+        assert!(clusters[0].aabb_max[0] < 50.0, "unreferenced bone 2 leaked into AABB");
+    }
+
+    #[test]
+    fn expand_no_op_for_unskinned_assets() {
+        // Empty rest_bone_aabbs → no mutation regardless of vertex
+        // bone fields.
+        let v = vec![
+            vert_with_bone([0.0, 0.0, 0.0], 1),
+            vert_with_bone([1.0, 0.0, 0.0], 1),
+            vert_with_bone([0.0, 1.0, 0.0], 1),
+        ];
+        let i = vec![0, 1, 2];
+        let (mut clusters, flat) = cluster_mesh(&v, &i);
+        let snapshot = clusters[0];
+        expand_clusters_for_skinning(&mut clusters, &v, &flat, &[]);
+        assert_eq!(clusters[0], snapshot, "unskinned asset must not mutate");
     }
 
     /// Each triangle as a sorted (a,b,c) tuple, for set-equality

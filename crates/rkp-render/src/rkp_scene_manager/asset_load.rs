@@ -447,7 +447,7 @@ impl RkpSceneManager {
         use rkp_core::mesh_extract::MeshVertex;
         use rkp_core::mesh_cluster::MeshletCluster;
         let have_baked_mesh = !mesh_vertices_bytes.is_empty();
-        let (mut mesh_vertices, mesh_indices, meshlet_clusters, mesh_lod0_index_count) =
+        let (mut mesh_vertices, mesh_indices, mut meshlet_clusters, mesh_lod0_index_count) =
             if have_baked_mesh {
                 let v: Vec<MeshVertex> =
                     bytemuck::cast_slice::<u8, MeshVertex>(&mesh_vertices_bytes).to_vec();
@@ -523,6 +523,22 @@ impl RkpSceneManager {
             for v in &mut mesh_vertices {
                 v.leaf_attr_id += leaf_attr_slot_start;
             }
+        }
+
+        // Phase 6.6: inflate cluster AABBs for skinned assets so the
+        // LOD selector doesn't wrongly cull animated geometry that
+        // leaves its rest-pose AABB. Conservative — unions
+        // `rest_bone_aabbs` for the bones each cluster's vertices
+        // weight against. No-op for unskinned assets (empty
+        // `rest_bone_aabbs`). `meshlet_clusters` is `Vec<MeshletCluster>`
+        // already, mutated in place.
+        if !skin_meta.rest_bone_aabbs.is_empty() && !mesh_vertices.is_empty() {
+            rkp_core::mesh_cluster::expand_clusters_for_skinning(
+                &mut meshlet_clusters,
+                &mesh_vertices,
+                &mesh_indices,
+                &skin_meta.rest_bone_aabbs,
+            );
         }
         let _ = (mesh_indices.len(), meshlet_clusters.len());
 
