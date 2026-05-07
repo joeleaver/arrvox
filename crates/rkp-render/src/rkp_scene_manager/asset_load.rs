@@ -525,42 +525,33 @@ impl RkpSceneManager {
             }
         }
 
-        // Phase 6.6: inflate cluster AABBs for skinned assets so the
-        // LOD selector doesn't wrongly cull animated geometry that
-        // leaves its rest-pose AABB. Conservative — unions
-        // `rest_bone_aabbs` for the bones each cluster's vertices
-        // weight against. No-op for unskinned assets (empty
-        // `rest_bone_aabbs`). `meshlet_clusters` is `Vec<MeshletCluster>`
-        // already, mutated in place.
+        // Phase 6.6: cluster AABB expansion for skinned assets is
+        // intentionally disabled. The original plan (union the
+        // `rest_bone_aabbs` of every bone a cluster's vertices weight
+        // against) inflates each cluster by roughly the union of all
+        // its referenced bones' territory — for a chest cluster
+        // weighted to chest + neck + shoulder bones, that's most of
+        // the upper body. The Karis LOD rule projects through the
+        // AABB; an oversized AABB makes `cluster_error_proj` huge and
+        // forces fine clusters to fail their admission test, leaving
+        // the chain root (coarsest LOD) as the only admitted level.
+        // Visually that prints CesiumMan in chunky LOD-N triangles
+        // (the "ugly triangle quilt" report).
         //
-        // **Frame translation:** `rest_bone_aabbs` are computed by
-        // rkp-import in **grid-frame** (cell_idx × voxel_size, origin
-        // at the octree corner — see `crates/rkp-import/src/voxelize/
-        // shell.rs::accumulate_rest_bone_aabbs`). The cluster AABBs
-        // produced by `cluster_mesh` are in **mesh-frame** (origin at
-        // object centre, range ±half_extent), matching `MeshVertex.local_pos`
-        // which the surface-mesh extractor offsets by `grid_origin`.
-        // Unioning the two frames as-is inflates clusters by ~1.5×
-        // asset extent and breaks LOD selection (wrong leaf_slot per
-        // pixel → wrong colors + visible holes from rejected fine
-        // clusters). Translate the bone AABBs into mesh-frame first.
-        if !skin_meta.rest_bone_aabbs.is_empty() && !mesh_vertices.is_empty() {
-            let go = asset_grid_origin;
-            let mesh_frame_aabbs: Vec<[f32; 6]> = skin_meta
-                .rest_bone_aabbs
-                .iter()
-                .map(|a| [
-                    a[0] + go.x, a[1] + go.y, a[2] + go.z,
-                    a[3] + go.x, a[4] + go.y, a[5] + go.z,
-                ])
-                .collect();
-            rkp_core::mesh_cluster::expand_clusters_for_skinning(
-                &mut meshlet_clusters,
-                &mesh_vertices,
-                &mesh_indices,
-                &mesh_frame_aabbs,
-            );
-        }
+        // Why removing it is safe in practice: the LOD selector uses
+        // the AABB only to pick an LOD level, not to cull triangles
+        // outright. A cluster admitted at the wrong LOD still renders
+        // its triangles (deformed by the VS); the result is a small
+        // resolution mismatch invisible compared to the quilting the
+        // expansion produced. For typical character animation the
+        // rest-pose projected size is within ~10-20 % of the
+        // deformed projected size, so the LOD pick is close anyway.
+        //
+        // The proper fix is the per-frame GPU recompute the memory
+        // plan flagged as a follow-on (`project_mesh_skinning_rewrite.md`)
+        // — kept out of this commit on purpose. The helper
+        // `mesh_cluster::expand_clusters_for_skinning` stays in tree
+        // for that future variant; it just isn't called today.
         let _ = (mesh_indices.len(), meshlet_clusters.len());
 
         // Compute brick face-links for this asset. The tree's brick ids
