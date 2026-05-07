@@ -18,7 +18,7 @@
 use bytemuck::{Pod, Zeroable};
 use meshopt::{build_meshlets, VertexDataAdapter};
 
-use super::extract::MeshVertex;
+use crate::mesh_extract::MeshVertex;
 
 /// NV-mesh-shader-style cluster cap — 64 unique verts per cluster.
 ///

@@ -22,7 +22,7 @@
 
 use crate::gbuffer::{GBUFFER_DEPTH_FORMAT, GBUFFER_POSITION_FORMAT};
 
-use super::extract::MeshVertex;
+use rkp_core::mesh_extract::MeshVertex;
 
 // Same RT formats as the splat path so the visibility-buffer contract
 // is bit-identical and `splat_resolve` accepts the output unchanged.

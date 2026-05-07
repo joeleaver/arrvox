@@ -25,7 +25,7 @@
 
 use crate::shadow_map_pass::types::SHADOW_MAP_DEFAULT_SIZE;
 
-use super::mesh_pass::extract::MeshVertex;
+use rkp_core::mesh_extract::MeshVertex;
 
 /// Render-pipeline owner for the mesh path's directional shadow map.
 /// One pipeline shared across viewports — per-VR state (depth texture,

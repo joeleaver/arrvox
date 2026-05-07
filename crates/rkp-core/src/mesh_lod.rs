@@ -34,8 +34,8 @@ use meshopt::{
 };
 use rayon::prelude::*;
 
-use super::cluster::{cluster_mesh, MeshletCluster, PARENT_GROUP_ERROR_ROOT};
-use super::extract::MeshVertex;
+use crate::mesh_cluster::{cluster_mesh, MeshletCluster, PARENT_GROUP_ERROR_ROOT};
+use crate::mesh_extract::MeshVertex;
 
 /// Number of LOD levels the DAG attempts to build (LOD 0 is the
 /// finest; LOD `LOD_LEVELS - 1` is the coarsest the DAG converges
@@ -623,7 +623,7 @@ fn simplify_meshopt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mesh_pass::cluster::MAX_VERTS_PER_CLUSTER;
+    use crate::mesh_cluster::MAX_VERTS_PER_CLUSTER;
 
     fn vert(p: [f32; 3]) -> MeshVertex {
         MeshVertex {

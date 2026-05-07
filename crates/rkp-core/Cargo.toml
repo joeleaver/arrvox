@@ -13,6 +13,10 @@ serde = { workspace = true }
 log = { workspace = true }
 lz4_flex = { workspace = true }
 thiserror = { workspace = true }
+# Mesh extraction + Karis-Nanite cluster DAG live here so rkp-import
+# (write-time bake) and rkp-render (load-time consumer) can share them.
+meshopt = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

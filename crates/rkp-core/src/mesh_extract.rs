@@ -17,9 +17,9 @@ use std::collections::HashMap;
 
 use glam::{IVec3, UVec3, Vec3};
 
-use rkp_core::brick_pool::{BRICK_CELLS, BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR};
-use rkp_core::leaf_attr::{pack_oct, unpack_oct, LeafAttr};
-use rkp_core::sparse_octree::{
+use crate::brick_pool::{BRICK_CELLS, BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR};
+use crate::leaf_attr::{pack_oct, unpack_oct, LeafAttr};
+use crate::sparse_octree::{
     brick_id, is_branch, is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE,
 };
 
@@ -524,7 +524,7 @@ fn is_solid_lookup(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rkp_core::sparse_octree::{make_brick, make_leaf};
+    use crate::sparse_octree::{make_brick, make_leaf};
 
     #[test]
     fn mesh_vertex_size_is_32() {
