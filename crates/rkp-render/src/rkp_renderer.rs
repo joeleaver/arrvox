@@ -513,14 +513,17 @@ impl RkpRenderer {
         viewport: &mut crate::viewport_renderer::ViewportRenderer,
         draws: &[SplatDraw],
     ) {
-        // Diagnostic: skip primary visibility entirely. Used to
+        // Diagnostic: skip primary visibility GPU work. Used to
         // measure shadow_render in isolation when chasing the
-        // anti-correlation pattern between the two passes.
-        // Visuals: composite stays as last-frame output; shade
-        // sees a sky-cleared G-buffer.
-        if std::env::var("RKP_MESH_DISABLE_PRIMARY").is_ok() {
-            return;
-        }
+        // anti-correlation pattern between the two passes. The
+        // per-slot instance + bind-group setup below still runs
+        // because the shadow path consumes
+        // `splat_instance_bind_groups` for per-instance world
+        // matrices — early-returning here would crash shadow with
+        // an empty Vec. The actual LOD-select compute + raster
+        // render passes are gated separately at their dispatch
+        // sites.
+        let primary_disabled = std::env::var("RKP_MESH_DISABLE_PRIMARY").is_ok();
         viewport.refresh_splat_g0(&self.device, self);
         viewport.refresh_splat_resolve_bindings(&self.device, self);
         viewport.ensure_splat_instance_capacity(&self.device, self, draws.len() as u32);
@@ -620,7 +623,7 @@ impl RkpRenderer {
 
         // 0. Per-cluster LOD-select compute pass. One dispatch per
         //    active draw slot writes that draw's args table.
-        if !direct_mode {
+        if !direct_mode && !primary_disabled {
             // Stats lifecycle (RKP_MESH_LOD_STATS=1 only):
             // (a) drain previous frame's mapped buffer if ready
             // (b) clear the histogram for this frame's atomics
@@ -718,6 +721,13 @@ impl RkpRenderer {
                 per_asset.len(), unique_indices / 3, total_indices / 3,
                 unique_clusters, total_clusters,
             );
+        }
+
+        if primary_disabled {
+            // Diagnostic isolation mode: skip the raster + resolve
+            // GPU work entirely. The per-slot setup above still ran
+            // so shadow has populated bind groups to consume.
+            return;
         }
 
         let g0_bg = viewport
@@ -1020,14 +1030,8 @@ impl RkpRenderer {
         }
         self.profiler.end_query(encoder, q_render);
 
-        // After both shadow passes have closed their queries, resolve
-        // the QuerySet → resolve_buffer → staging. Pipestats are
-        // pass-shared across the whole frame's mesh chain (4 slots:
-        // primary lod_select + raster, shadow lod_select + render),
-        // so this is the natural single resolve point.
-        if pipestats_enabled {
-            viewport.pipestats_finalize(encoder);
-        }
+        // Pipestats finalize moved to `render_to` — single per-frame
+        // call so it fires regardless of which mesh passes ran.
 
         // 2. Blit compute — copy bitcast(depth) into shadow_buffer.
         //    Single thread per texel, full overwrite; no need to
@@ -1272,6 +1276,16 @@ impl RkpRenderer {
         if in_situ && !raymarch && mesh && shadow_map_enabled {
             self.dispatch_mesh_shadow(queue, encoder, viewport, splat_draws);
         }
+
+        // Pipeline-statistics resolve: single per-frame point so it
+        // fires regardless of which mesh passes (primary / shadow /
+        // both) ran. Each pass writes to its own slot; unwritten
+        // slots come back as undefined data (caller can detect
+        // by all-zero results or just trust the slot it cares about).
+        if mesh && std::env::var("RKP_MESH_PIPESTATS").is_ok() {
+            viewport.pipestats_finalize(encoder);
+        }
+
         if !raymarch && !splat && !mesh {
             viewport.march.copy_stats(encoder);
         }
