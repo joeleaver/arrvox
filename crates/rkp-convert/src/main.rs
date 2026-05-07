@@ -51,13 +51,15 @@ struct Args {
     #[arg(long)]
     scale: Option<f32>,
 
-    /// Upgrade an existing v4 .rkp in place to v5 (rebuilds the
-    /// surface mesh + cluster DAG and writes it back). Use when the
-    /// source mesh is unavailable (procedural bakes, generator
-    /// outputs in `assets/converted/`). Skips voxelization entirely
-    /// — much faster than a full re-import.
-    #[arg(long)]
-    upgrade_v4: bool,
+    /// Rebuild the surface mesh + cluster DAG of an existing .rkp in
+    /// place, preserving its octree and voxel data. Works on both v4
+    /// (which had no mesh sections) and v5 files (replaces the
+    /// existing mesh sections). Use when the source mesh is
+    /// unavailable (procedural bakes, generator outputs in
+    /// `assets/converted/`) or after a DAG-builder change to re-bake
+    /// without re-voxelizing — much faster than a full re-import.
+    #[arg(long, alias = "upgrade-v4")]
+    rebuild_mesh: bool,
 }
 
 fn parse_rotation(s: &str) -> Result<[f32; 3], String> {
@@ -75,11 +77,11 @@ fn parse_rotation(s: &str) -> Result<[f32; 3], String> {
 fn main() -> ExitCode {
     let args = Args::parse();
 
-    if args.upgrade_v4 {
-        return match upgrade_v4_to_v5(&args.input) {
+    if args.rebuild_mesh {
+        return match rebuild_mesh_sections(&args.input) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("rkp-convert --upgrade-v4: {e}");
+                eprintln!("rkp-convert --rebuild-mesh: {e}");
                 ExitCode::FAILURE
             }
         };
@@ -121,14 +123,16 @@ fn main() -> ExitCode {
     }
 }
 
-/// Upgrade a v4 .rkp file in place to v5 by reading every existing
-/// section, synthesising the LeafAttr Vec the mesh extractor needs,
-/// running `extract_surface_mesh` + `build_cluster_dag` over the
-/// file-local pools, and writing the result back as a v5 .rkp with
-/// the new mesh sections appended. Skips voxelization — purely a
-/// re-encoding pass. Atomic: writes to `<path>.inprogress`, renames
-/// on success.
-fn upgrade_v4_to_v5(path: &std::path::Path) -> Result<(), String> {
+/// Rebuild the mesh + cluster DAG sections of a .rkp in place,
+/// preserving everything else. Reads every existing section,
+/// synthesises the LeafAttr Vec the mesh extractor needs, re-runs
+/// `extract_surface_mesh` + `build_cluster_dag` over the file-local
+/// pools, and writes the result back with fresh mesh sections.
+/// Skips voxelization — purely a re-encoding pass. Atomic: writes to
+/// `<path>.inprogress`, renames on success. Works on v4 files (which
+/// had no mesh sections — the readers no-op when size is 0) and on
+/// v5 files (replaces the existing mesh sections).
+fn rebuild_mesh_sections(path: &std::path::Path) -> Result<(), String> {
     use rkp_core::asset_file::{
         build_mesh_sections_blob, read_rkp_bricks, read_rkp_color, read_rkp_header,
         read_rkp_mesh_indices, read_rkp_mesh_vertices, read_rkp_meshlet_clusters,
@@ -143,13 +147,6 @@ fn upgrade_v4_to_v5(path: &std::path::Path) -> Result<(), String> {
     let mut reader = std::io::BufReader::new(&mut file);
     let header: RkpHeader = read_rkp_header(&mut reader)
         .map_err(|e| format!("read header: {e}"))?;
-    if header.mesh_vertices_compressed_size != 0 {
-        eprintln!(
-            "[upgrade] {}: already v5 (has baked mesh sections), skipping",
-            path.display()
-        );
-        return Ok(());
-    }
     let octree_nodes = read_rkp_octree(&mut reader, &header)
         .map_err(|e| format!("read octree: {e}"))?;
     let voxel_data = read_rkp_voxels(&mut reader, &header)
@@ -162,7 +159,8 @@ fn upgrade_v4_to_v5(path: &std::path::Path) -> Result<(), String> {
         .map_err(|e| format!("read color: {e}"))?;
     let skin_meta_decoded = read_rkp_skin_meta(&mut reader, &header)
         .map_err(|e| format!("read skin: {e}"))?;
-    // v4 had no mesh sections; the readers no-op when size is 0.
+    // Drain the existing mesh sections so the read cursor advances
+    // past them — needed on v5 files; v4 readers no-op when size=0.
     let _ = read_rkp_mesh_vertices(&mut reader, &header);
     let _ = read_rkp_mesh_indices(&mut reader, &header);
     let _ = read_rkp_meshlet_clusters(&mut reader, &header);
@@ -217,7 +215,7 @@ fn upgrade_v4_to_v5(path: &std::path::Path) -> Result<(), String> {
         );
     if mesh_v_bytes.is_empty() {
         eprintln!(
-            "[upgrade] {}: no surface mesh extracted (degenerate octree), wrote v5 without mesh sections",
+            "[rebuild-mesh] {}: no surface mesh extracted (degenerate octree), wrote v5 without mesh sections",
             path.display()
         );
     }
@@ -289,7 +287,7 @@ fn upgrade_v4_to_v5(path: &std::path::Path) -> Result<(), String> {
 
     let cluster_count = meshlet_bytes.len() / 64;
     eprintln!(
-        "[upgrade] {}: v4 → v5 in {:.2}s ({} clusters)",
+        "[rebuild-mesh] {}: in {:.2}s ({} clusters)",
         path.display(),
         t0.elapsed().as_secs_f32(),
         cluster_count,
