@@ -271,10 +271,29 @@ impl EngineState {
                             0,
                         ),
                     };
+                    // The asset's `grid_origin` (in object-local /
+                    // mesh frame) is what the surface-mesh extractor
+                    // baked into every vertex's `local_pos`. Bone
+                    // matrices in `skin_deform`'s palette operate on
+                    // **grid-frame** positions (origin at octree
+                    // corner), so the mesh VS subtracts grid_origin
+                    // before applying bones and adds it back after.
+                    // `Skeleton.grid_offset = -grid_origin`. For
+                    // unskinned entities (no Skeleton component) we
+                    // fall back to `[0, 0, 0]`; the VS skips the
+                    // bridge entirely when `skinning_mode == NONE`,
+                    // so the value doesn't matter on that path.
+                    let grid_origin: [f32; 3] = self
+                        .world
+                        .get::<&crate::components::Skeleton>(entity)
+                        .ok()
+                        .map(|s| (-s.grid_offset).to_array())
+                        .unwrap_or([0.0, 0.0, 0.0]);
                     self.splat_draws.push(rkp_render::splat_pass::SplatDraw {
                         asset_handle_raw: handle.raw(),
                         world: world_matrix.to_cols_array_2d(),
                         object_id: gpu_idx,
+                        grid_origin,
                         bone_offset_lbs,
                         bone_offset_dqs,
                         skinning_mode,

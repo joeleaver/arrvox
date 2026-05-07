@@ -29,11 +29,20 @@
 import package::lib::types::CameraUniforms;
 
 // Per-instance uniform — shape-compatible with `splat.wesl`'s
-// `SplatInstance` (80 B, mat4x4 + 4×u32). Skinning fields drive the
-// VS branch — see `SKINNING_MODE_NONE` below for the rest-pose
-// sentinel.
+// `SplatInstance` (96 B). Skinning fields drive the VS branch —
+// see `SKINNING_MODE_NONE` below for the rest-pose sentinel.
+//
+// `grid_origin` is the asset's voxel-grid origin in mesh-frame —
+// the same value the surface-mesh extractor added to every cell's
+// centroid when baking `local_pos`. Bone matrices in
+// `skin_deform`'s palette operate on **grid-frame** positions
+// (origin at octree corner) per `animation::tick`'s
+// `N · pose · N⁻¹` conjugation. The VS subtracts grid_origin from
+// `local_pos` before bones and adds it back after, so bones see
+// the same frame they were trained against.
 struct MeshInstance {
     world: mat4x4<f32>,
+    grid_origin: vec3<f32>,
     object_id: u32,
     bone_offset_lbs: u32,
     bone_offset_dqs: u32,
@@ -173,11 +182,15 @@ fn vert_main(
     // assets always took.
     var skinned_pos = local_pos;
     if instance.skinning_mode != SKINNING_MODE_NONE && bone_weights != 0u {
+        // Bridge mesh-frame → grid-frame, skin, bridge back.
+        let grid_pos = local_pos - instance.grid_origin;
+        var deformed: vec3<f32>;
         if instance.skinning_mode == SKINNING_MODE_LBS {
-            skinned_pos = skin_lbs(local_pos, bone_indices, bone_weights, instance.bone_offset_lbs);
-        } else if instance.skinning_mode == SKINNING_MODE_DQS {
-            skinned_pos = skin_dqs(local_pos, bone_indices, bone_weights, instance.bone_offset_dqs);
+            deformed = skin_lbs(grid_pos, bone_indices, bone_weights, instance.bone_offset_lbs);
+        } else {
+            deformed = skin_dqs(grid_pos, bone_indices, bone_weights, instance.bone_offset_dqs);
         }
+        skinned_pos = deformed + instance.grid_origin;
     }
 
     let world_pos = (instance.world * vec4<f32>(skinned_pos, 1.0)).xyz;

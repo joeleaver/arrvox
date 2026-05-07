@@ -29,14 +29,18 @@ import package::lib::types::LeafAttr;
 import package::lib::types::CameraUniforms;
 
 // Per-instance uniform — one mat4x4 world transform plus the entity's
-// `object_id` (written into the pick texture). 80 B, multiple of 16 so
-// the WGSL uniform alignment rules are happy.
+// `object_id` (written into the pick texture). 96 B, layout shared
+// with `mesh.wesl`'s `MeshInstance` so the same g1 bind group drives
+// both pipelines (Phase 6.6 grew this from 80 B by adding
+// `grid_origin` for mesh-VS skinning's mesh-frame ↔ grid-frame
+// bridge; the splat path doesn't read those new fields).
 struct SplatInstance {
     world: mat4x4<f32>,
+    grid_origin: vec3<f32>,
     object_id: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    bone_offset_lbs: u32,
+    bone_offset_dqs: u32,
+    skinning_mode: u32,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;

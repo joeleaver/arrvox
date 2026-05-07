@@ -1151,16 +1151,19 @@ impl ViewportRenderer {
         slot: u32,
         world: &[[f32; 4]; 4],
         object_id: u32,
+        grid_origin: [f32; 3],
         bone_offset_lbs: u32,
         bone_offset_dqs: u32,
         skinning_mode: u32,
     ) {
         let uniform = SplatInstanceUniform {
             world: *world,
+            grid_origin,
             object_id,
             bone_offset_lbs,
             bone_offset_dqs,
             skinning_mode,
+            _pad: 0,
         };
         queue.write_buffer(
             &self.splat_instance_buffers[slot as usize],

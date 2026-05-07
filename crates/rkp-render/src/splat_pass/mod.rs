@@ -40,6 +40,12 @@ pub struct SplatDraw {
     pub asset_handle_raw: u32,
     pub world: [[f32; 4]; 4],
     pub object_id: u32,
+    /// Asset's voxel-grid origin in mesh-frame. The mesh VS uses this
+    /// to bridge from the vertex's mesh-frame local_pos to the
+    /// grid-frame bone matrices want. Zero for assets where grid and
+    /// mesh frames coincide (e.g. anything voxelized with origin at
+    /// the octree corner).
+    pub grid_origin: [f32; 3],
     /// First mat4 in `bone_matrices` for this instance's bones.
     /// Ignored when `skinning_mode != 0`.
     pub bone_offset_lbs: u32,

@@ -26,7 +26,7 @@ const GBUFFER_LEAF_SLOT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Ui
 
 /// Per-instance uniform — one mat4 world transform, the entity's
 /// `object_id` (written into the pick texture), and the per-instance
-/// bone-skinning state (Phase 6.6). 80 B, multiple of 16. CPU mirror
+/// bone-skinning state (Phase 6.6). 96 B, multiple of 16. CPU mirror
 /// of the `SplatInstance` struct in `splat.wesl` and the matching
 /// declaration in the mesh raster + shadow shaders.
 ///
@@ -45,10 +45,24 @@ const GBUFFER_LEAF_SLOT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Ui
 /// The two offsets are independent — LBS and DQS palettes are sized
 /// and packed separately by `BoneMatrixAllocator`. The unused offset
 /// is harmless filler.
+///
+/// **`grid_origin`** is the asset's voxel-grid origin in object-local
+/// (mesh-frame) coordinates — the same value `extract_surface_mesh`
+/// added to every cell's centroid. The mesh VS subtracts it from
+/// `local_pos` before applying bone matrices (which were trained
+/// against grid-frame positions, origin at the octree corner) and
+/// adds it back after, before the world transform. Splat path
+/// ignores it. For unskinned instances `grid_origin` is irrelevant
+/// because the VS skips the subtract/add path entirely; the engine
+/// still uploads a sane value for debugging.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SplatInstanceUniform {
     pub world: [[f32; 4]; 4],
+    /// Asset's voxel-grid origin in mesh-frame; bridge between
+    /// vertex local_pos (mesh-frame) and bone-matrix input frame
+    /// (grid-frame, origin at octree corner).
+    pub grid_origin: [f32; 3],
     pub object_id: u32,
     /// First index in `bone_matrices` for this instance's LBS palette.
     pub bone_offset_lbs: u32,
@@ -56,6 +70,9 @@ pub struct SplatInstanceUniform {
     pub bone_offset_dqs: u32,
     /// `0` = LBS, `1` = DQS, `SKINNING_MODE_NONE` = not skinned.
     pub skinning_mode: u32,
+    /// Trailing pad bumps the struct to 96 B (16-aligned) to match
+    /// WGSL's struct-alignment rule for uniform buffers.
+    pub _pad: u32,
 }
 
 /// Sentinel `skinning_mode` value meaning "this instance carries no
@@ -64,7 +81,21 @@ pub struct SplatInstanceUniform {
 /// an extra "is_skinned" flag.
 pub const SKINNING_MODE_NONE: u32 = u32::MAX;
 
-const _: () = assert!(std::mem::size_of::<SplatInstanceUniform>() == 80);
+const _: () = assert!(std::mem::size_of::<SplatInstanceUniform>() == 96);
+// Hand-checked field offsets — must match the WGSL declaration in
+// `mesh.wesl` / `mesh_shadow.wesl` / `splat.wesl`. WGSL's uniform
+// buffer layout treats vec3 as size-12-align-16, so a u32 following
+// vec3 sits immediately after at offset 76 (no auto-pad to 80).
+const _: () = {
+    use std::mem::offset_of;
+    assert!(offset_of!(SplatInstanceUniform, world) == 0);
+    assert!(offset_of!(SplatInstanceUniform, grid_origin) == 64);
+    assert!(offset_of!(SplatInstanceUniform, object_id) == 76);
+    assert!(offset_of!(SplatInstanceUniform, bone_offset_lbs) == 80);
+    assert!(offset_of!(SplatInstanceUniform, bone_offset_dqs) == 84);
+    assert!(offset_of!(SplatInstanceUniform, skinning_mode) == 88);
+    assert!(offset_of!(SplatInstanceUniform, _pad) == 92);
+};
 pub const SPLAT_INSTANCE_BYTES: u64 = std::mem::size_of::<SplatInstanceUniform>() as u64;
 
 /// Splat-rasterizer GPU pass.

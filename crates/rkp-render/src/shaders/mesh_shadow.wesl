@@ -26,6 +26,7 @@ import package::lib::types::LightCameraShadow;
 
 struct MeshShadowInstance {
     world: mat4x4<f32>,
+    grid_origin: vec3<f32>,
     object_id: u32,
     bone_offset_lbs: u32,
     bone_offset_dqs: u32,
@@ -124,11 +125,14 @@ fn vert_main(
 ) -> VsOut {
     var skinned_pos = local_pos;
     if instance.skinning_mode != SKINNING_MODE_NONE && bone_weights != 0u {
+        let grid_pos = local_pos - instance.grid_origin;
+        var deformed: vec3<f32>;
         if instance.skinning_mode == SKINNING_MODE_LBS {
-            skinned_pos = skin_lbs(local_pos, bone_indices, bone_weights, instance.bone_offset_lbs);
-        } else if instance.skinning_mode == SKINNING_MODE_DQS {
-            skinned_pos = skin_dqs(local_pos, bone_indices, bone_weights, instance.bone_offset_dqs);
+            deformed = skin_lbs(grid_pos, bone_indices, bone_weights, instance.bone_offset_lbs);
+        } else {
+            deformed = skin_dqs(grid_pos, bone_indices, bone_weights, instance.bone_offset_dqs);
         }
+        skinned_pos = deformed + instance.grid_origin;
     }
 
     let world_pos = (instance.world * vec4<f32>(skinned_pos, 1.0)).xyz;
