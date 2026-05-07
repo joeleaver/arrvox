@@ -80,6 +80,13 @@ pub struct GBuffer {
 }
 
 /// Texture format for G-buffer target 0 (position + hit distance).
+///
+/// Rgba32Float — full 32-bit precision per channel. Tested
+/// Rgba16Float (commit log notes the 2026-05-06 measurement) and
+/// it didn't move mesh_raster / mesh_shadow_render time at all
+/// on the splat5 elephant scene; ROP write bandwidth is not the
+/// bottleneck for either pass. Reverted to f32 to keep mm-scale
+/// world-space precision out to scene boundaries.
 pub const GBUFFER_POSITION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 /// Texture format for G-buffer target 1 (normal + blend weight).
 pub const GBUFFER_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
