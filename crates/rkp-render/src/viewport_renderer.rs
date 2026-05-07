@@ -153,9 +153,14 @@ pub struct ViewportRenderer {
     /// shadow_buffer` for shade to sample.
     pub mesh_shadow_depth_texture: wgpu::Texture,
     pub mesh_shadow_depth_view: wgpu::TextureView,
-    /// Cached render `g0` for the mesh-shadow pipeline — just the
-    /// `light_camera` uniform.
+    /// Cached render `g0` for the mesh-shadow pipeline — `light_camera`
+    /// uniform plus the scene's bone palettes (Phase 6.6 VS skinning).
+    /// Now follows `scene.buffers_epoch()` so a bone-buffer realloc
+    /// triggers a rebuild; previously it was build-once because all
+    /// referenced buffers had stable lifetimes.
     pub mesh_shadow_render_g0_bg: Option<wgpu::BindGroup>,
+    /// Epoch the shadow render g0 bg was last built against.
+    pub mesh_shadow_render_g0_scene_epoch: u64,
     /// Cached blit `g0` — `depth_view` + `shadow_map.shadow_buffer`.
     pub mesh_shadow_blit_g0_bg: Option<wgpu::BindGroup>,
 
@@ -508,6 +513,7 @@ impl ViewportRenderer {
             mesh_shadow_depth_texture,
             mesh_shadow_depth_view,
             mesh_shadow_render_g0_bg: None,
+            mesh_shadow_render_g0_scene_epoch: u64::MAX,
             mesh_shadow_blit_g0_bg: None,
             mesh_lod_params_buffers: Vec::new(),
             mesh_lod_args_buffers: Vec::new(),
@@ -603,23 +609,30 @@ impl ViewportRenderer {
         self.splat_g0_lights_materials_epoch = lm_now;
     }
 
-    /// Rebuild the mesh-shadow render + blit `g0` bind groups if not
-    /// present. The underlying buffers (`shadow_map.uniform_buffer`,
-    /// `shadow_map.shadow_buffer`) and the depth texture all have
-    /// stable lifetimes, so once built the bind groups stay valid
-    /// for the lifetime of this VR. Called once before
-    /// `dispatch_mesh_shadow`.
+    /// Rebuild the mesh-shadow render + blit `g0` bind groups when
+    /// stale. The blit g0 references stable-lifetime buffers
+    /// (`shadow_map.shadow_buffer`, `mesh_shadow_depth_view`) so it's
+    /// build-once. The render g0 now also references the scene's
+    /// bone palettes (Phase 6.6) — those reallocate when the scene
+    /// gains a deeper-skeleton entity, so the render bg is rebuilt
+    /// on a scene-buffers-epoch bump, same trigger the splat g0 uses.
     pub fn refresh_mesh_shadow_bindings(
         &mut self,
         device: &wgpu::Device,
         renderer: &RkpRenderer,
     ) {
-        if self.mesh_shadow_render_g0_bg.is_none() {
+        let scene_now = renderer.scene.buffers_epoch();
+        if self.mesh_shadow_render_g0_bg.is_none()
+            || self.mesh_shadow_render_g0_scene_epoch != scene_now
+        {
             self.mesh_shadow_render_g0_bg =
                 Some(renderer.mesh_shadow_map.create_render_g0_bind_group(
                     device,
                     &self.shadow_map.uniform_buffer,
+                    &renderer.scene.bone_matrices_buffer,
+                    &renderer.scene.bone_dual_quats_buffer,
                 ));
+            self.mesh_shadow_render_g0_scene_epoch = scene_now;
         }
         if self.mesh_shadow_blit_g0_bg.is_none() {
             self.mesh_shadow_blit_g0_bg =

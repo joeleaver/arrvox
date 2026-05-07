@@ -54,16 +54,43 @@ impl MeshShadowMapPass {
         // ── Render pipeline (depth-only, no fragment shader) ───────
         let render_g0_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("mesh_shadow render g0"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                // bone_matrices + bone_dual_quats — Phase 6.6 shadow
+                // VS skinning. Slot numbering matches the splat g0
+                // (binding 2 / 3) so the WGSL declarations can be
+                // copy-pasted between the two pipelines without
+                // having to remember which group holds which buffer.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
 
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -78,7 +105,10 @@ impl MeshShadowMapPass {
             "mesh_shadow",
         );
 
-        // Vertex layout matches `MeshVertex`; only `local_pos` is read.
+        // Vertex layout matches `MeshVertex`. `local_pos` + bone
+        // attributes are read for skinning; `normal_oct` and
+        // `leaf_attr_id` are declared to keep the buffer reader
+        // aligned but unused on the depth-only shadow path.
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<MeshVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -96,6 +126,16 @@ impl MeshShadowMapPass {
                 wgpu::VertexAttribute {
                     shader_location: 2,
                     offset: 16,
+                    format: wgpu::VertexFormat::Uint32,
+                },
+                wgpu::VertexAttribute {
+                    shader_location: 3,
+                    offset: 20,
+                    format: wgpu::VertexFormat::Uint32,
+                },
+                wgpu::VertexAttribute {
+                    shader_location: 4,
+                    offset: 24,
                     format: wgpu::VertexFormat::Uint32,
                 },
             ],
@@ -203,20 +243,32 @@ impl MeshShadowMapPass {
         }
     }
 
-    /// Build the per-VR render `g0` bind group — the light_camera
-    /// uniform.
+    /// Build the per-VR render `g0` bind group — light_camera uniform
+    /// + bone_matrices / bone_dual_quats (Phase 6.6).
     pub fn create_render_g0_bind_group(
         &self,
         device: &wgpu::Device,
         light_camera_buffer: &wgpu::Buffer,
+        bone_matrices_buffer: &wgpu::Buffer,
+        bone_dual_quats_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mesh_shadow render g0 bg"),
             layout: &self.render_g0_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: light_camera_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: light_camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bone_matrices_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: bone_dual_quats_buffer.as_entire_binding(),
+                },
+            ],
         })
     }
 
