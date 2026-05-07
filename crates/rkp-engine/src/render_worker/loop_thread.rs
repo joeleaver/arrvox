@@ -72,6 +72,15 @@ pub(super) fn run_render_thread(
     // EMA value for that one frame).
     let mut prev_render_start: Option<std::time::Instant> = None;
 
+    // Per-scope rolling sample buffer for the [render.gpu.percentiles]
+    // diagnostic dump. Bounded to PERCENTILE_WINDOW; oldest sample
+    // drops when full. Costs ~PERCENTILE_WINDOW × 4 B × scope_count
+    // (≤ 30 scopes typical → ~3.5 KB) and only allocates when
+    // `RKP_RENDER_PROFILE=1` is set.
+    const PERCENTILE_WINDOW: usize = 64;
+    let mut percentile_history: std::collections::HashMap<String, std::collections::VecDeque<f32>> =
+        std::collections::HashMap::new();
+
     loop {
         let iter_start = std::time::Instant::now();
 
@@ -265,20 +274,54 @@ pub(super) fn run_render_thread(
         //     where the GPU is actually spending its time inside
         //     `build_gpu_tlas`. Gated on `render_profile` like the
         //     `[render]` summary.
-        if render_profile && frame_index % 30 == 0 {
-            // Diagnostic: dump every label every ~half-second so we
-            // can see what the profiler is actually returning. Will
-            // tighten back to tlas.* once we confirm queries surface.
-            let labels: Vec<String> = gpu_passes
-                .iter()
-                .map(|(l, ms)| format!("{l}={ms:.2}"))
-                .collect();
-            eprintln!(
-                "[render.gpu] frame={} count={} | {}",
-                frame_index,
-                gpu_passes.len(),
-                labels.join(" ")
-            );
+        if render_profile {
+            // Update rolling per-scope sample history every frame
+            // when profiling is on. Cap at PERCENTILE_WINDOW so the
+            // memory stays bounded; oldest sample drops first.
+            for (label, ms) in &gpu_passes {
+                let buf = percentile_history
+                    .entry(label.clone())
+                    .or_insert_with(|| {
+                        std::collections::VecDeque::with_capacity(PERCENTILE_WINDOW)
+                    });
+                if buf.len() == PERCENTILE_WINDOW {
+                    buf.pop_front();
+                }
+                buf.push_back(*ms);
+            }
+            if frame_index % 30 == 0 {
+                // Latest single-sample line — same format as before.
+                let labels: Vec<String> = gpu_passes
+                    .iter()
+                    .map(|(l, ms)| format!("{l}={ms:.2}"))
+                    .collect();
+                eprintln!(
+                    "[render.gpu] frame={} count={} | {}",
+                    frame_index,
+                    gpu_passes.len(),
+                    labels.join(" ")
+                );
+                // Rolling-window percentiles. Same scope ordering as
+                // the latest line so a reader can scan side-by-side.
+                let pct: Vec<String> = gpu_passes
+                    .iter()
+                    .map(|(l, _)| {
+                        let buf = percentile_history.get(l);
+                        let (p50, p95, p99) = match buf {
+                            Some(b) if !b.is_empty() => percentiles_p50_p95_p99(b),
+                            _ => (0.0, 0.0, 0.0),
+                        };
+                        let n = buf.map(|b| b.len()).unwrap_or(0);
+                        format!("{l}=p50:{p50:.2}/p95:{p95:.2}/p99:{p99:.2}@{n}")
+                    })
+                    .collect();
+                eprintln!(
+                    "[render.gpu.percentiles] frame={} window={} | {}",
+                    frame_index,
+                    PERCENTILE_WINDOW,
+                    pct.join(" ")
+                );
+            }
         }
 
         // 8. Send result back to sim. Exit on disconnect.
@@ -387,4 +430,21 @@ fn lerp_world_matrix(
     let r = ra.slerp(rb, alpha);
     let t = ta.lerp(tb, alpha);
     glam::Mat4::from_scale_rotation_translation(s, r, t).to_cols_array_2d()
+}
+
+/// p50 / p95 / p99 over a window of `f32` samples. Sorts a clone
+/// (input is left untouched). `total_cmp` for NaN-safety so a
+/// stray NaN in the profiler stream doesn't panic the diagnostic
+/// path. Returns (0,0,0) for empty input.
+fn percentiles_p50_p95_p99(samples: &std::collections::VecDeque<f32>) -> (f32, f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mut v: Vec<f32> = samples.iter().copied().collect();
+    v.sort_by(|a, b| a.total_cmp(b));
+    let n = v.len();
+    let p50 = v[n / 2];
+    let p95 = v[(n * 95 / 100).min(n - 1)];
+    let p99 = v[(n * 99 / 100).min(n - 1)];
+    (p50, p95, p99)
 }
