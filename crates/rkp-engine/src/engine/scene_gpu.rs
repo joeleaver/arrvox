@@ -250,10 +250,34 @@ impl EngineState {
                 // this list to the render thread alongside the
                 // existing `gpu_instances`.
                 if let Some(handle) = renderable.asset_handle {
+                    // Per-instance skinning state (Phase 6.6) — when
+                    // `skinning` is `Some(_)` the entity has both a
+                    // live `Skeleton` and a baked skin-meta payload,
+                    // and the skin_deform plan above already pushed
+                    // bone matrices into the per-frame palette. The
+                    // mesh VS picks them up via `bone_offset_*`.
+                    // `dqs_enabled` is the renderer-wide toggle that
+                    // also drives `skin_deform`'s mode — keeping mesh
+                    // raster and the legacy march path aligned.
+                    let (skinning_mode, bone_offset_lbs, bone_offset_dqs) = match skinning {
+                        Some(b) => (
+                            if self.dqs_enabled { 1 } else { 0 },
+                            b.bone_buffer_offset,
+                            b.bone_dq_offset,
+                        ),
+                        None => (
+                            rkp_render::splat_pass::SKINNING_MODE_NONE,
+                            0,
+                            0,
+                        ),
+                    };
                     self.splat_draws.push(rkp_render::splat_pass::SplatDraw {
                         asset_handle_raw: handle.raw(),
                         world: world_matrix.to_cols_array_2d(),
                         object_id: gpu_idx,
+                        bone_offset_lbs,
+                        bone_offset_dqs,
+                        skinning_mode,
                     });
                 }
             }

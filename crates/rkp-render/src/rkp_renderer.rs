@@ -393,7 +393,15 @@ impl RkpRenderer {
         viewport.refresh_splat_resolve_bindings(&self.device, self);
         viewport.ensure_splat_instance_capacity(&self.device, self, draws.len() as u32);
         for (slot, d) in draws.iter().enumerate() {
-            viewport.write_splat_instance(queue, slot as u32, &d.world, d.object_id);
+            viewport.write_splat_instance(
+                queue,
+                slot as u32,
+                &d.world,
+                d.object_id,
+                d.bone_offset_lbs,
+                d.bone_offset_dqs,
+                d.skinning_mode,
+            );
         }
 
         // RKP_SPLAT_STATS=1 prints per-frame draw stats with a
@@ -529,7 +537,15 @@ impl RkpRenderer {
         viewport.ensure_splat_instance_capacity(&self.device, self, draws.len() as u32);
         viewport.ensure_mesh_lod_capacity(&self.device, self, draws.len() as u32);
         for (slot, d) in draws.iter().enumerate() {
-            viewport.write_splat_instance(queue, slot as u32, &d.world, d.object_id);
+            viewport.write_splat_instance(
+                queue,
+                slot as u32,
+                &d.world,
+                d.object_id,
+                d.bone_offset_lbs,
+                d.bone_offset_dqs,
+                d.skinning_mode,
+            );
         }
 
         // Phase 6.3: per-draw LOD-select prep. Resolve each draw's

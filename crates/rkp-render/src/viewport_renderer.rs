@@ -1125,19 +1125,27 @@ impl ViewportRenderer {
     /// Write one frame's `SplatInstanceUniform` for the given slot.
     /// Caller must have already extended the slot vector via
     /// `ensure_splat_instance_capacity`.
+    ///
+    /// `skinning_mode` follows the [`SplatInstanceUniform`] convention
+    /// (`0` LBS / `1` DQS / `SKINNING_MODE_NONE` rest-pose); the two
+    /// `bone_offset_*` values are read by the mesh VS only when the
+    /// matching mode is selected.
     pub fn write_splat_instance(
         &self,
         queue: &wgpu::Queue,
         slot: u32,
         world: &[[f32; 4]; 4],
         object_id: u32,
+        bone_offset_lbs: u32,
+        bone_offset_dqs: u32,
+        skinning_mode: u32,
     ) {
         let uniform = SplatInstanceUniform {
             world: *world,
             object_id,
-            _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
+            bone_offset_lbs,
+            bone_offset_dqs,
+            skinning_mode,
         };
         queue.write_buffer(
             &self.splat_instance_buffers[slot as usize],

@@ -24,18 +24,45 @@ use super::extract::SplatVertex;
 const GBUFFER_PICK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 const GBUFFER_LEAF_SLOT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 
-/// Per-instance uniform — one mat4 world transform plus the entity's
-/// `object_id` (written into the pick texture). 80 B, multiple of 16.
-/// CPU mirror of the `SplatInstance` struct in `splat.wesl`.
+/// Per-instance uniform — one mat4 world transform, the entity's
+/// `object_id` (written into the pick texture), and the per-instance
+/// bone-skinning state (Phase 6.6). 80 B, multiple of 16. CPU mirror
+/// of the `SplatInstance` struct in `splat.wesl` and the matching
+/// declaration in the mesh raster + shadow shaders.
+///
+/// **Skinning semantics:**
+/// * `skinning_mode == SKINNING_MODE_NONE` → instance is not skinned
+///   (no live bone matrices); the mesh VS skips skinning entirely
+///   regardless of per-vertex `bone_weights` and emits the rest-pose
+///   transform.
+/// * `skinning_mode == 0` → linear blend skinning; the VS reads
+///   `bone_matrices[bone_offset_lbs + bone_idx]` for the four
+///   referenced bones, weighted-sums, and applies.
+/// * `skinning_mode == 1` → dual-quaternion skinning; the VS reads
+///   `bone_dual_quats[bone_offset_dqs + bone_idx]`, blends, and
+///   normalises before applying.
+///
+/// The two offsets are independent — LBS and DQS palettes are sized
+/// and packed separately by `BoneMatrixAllocator`. The unused offset
+/// is harmless filler.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SplatInstanceUniform {
     pub world: [[f32; 4]; 4],
     pub object_id: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
+    /// First index in `bone_matrices` for this instance's LBS palette.
+    pub bone_offset_lbs: u32,
+    /// First index in `bone_dual_quats` for this instance's DQS palette.
+    pub bone_offset_dqs: u32,
+    /// `0` = LBS, `1` = DQS, `SKINNING_MODE_NONE` = not skinned.
+    pub skinning_mode: u32,
 }
+
+/// Sentinel `skinning_mode` value meaning "this instance carries no
+/// live bone matrices; render rest pose." Lives in the value space of
+/// `u32` outside the LBS / DQS enum so the VS can branch on it without
+/// an extra "is_skinned" flag.
+pub const SKINNING_MODE_NONE: u32 = u32::MAX;
 
 const _: () = assert!(std::mem::size_of::<SplatInstanceUniform>() == 80);
 pub const SPLAT_INSTANCE_BYTES: u64 = std::mem::size_of::<SplatInstanceUniform>() as u64;
