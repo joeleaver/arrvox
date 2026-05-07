@@ -47,16 +47,6 @@ const SKINNING_MODE_NONE: u32 = 0xFFFFFFFFu;
 const SKINNING_MODE_LBS: u32 = 0u;
 const SKINNING_MODE_DQS: u32 = 1u;
 
-// Linear blend skinning palette — `mat3x4` packing keeps each bone at
-// 48 B vs 64 B for a full mat4 (the 4th row is always (0,0,0,1) for
-// affine bones). Matches the layout `BoneMatrixAllocator` writes on
-// the CPU.
-struct BoneMatrix {
-    row0: vec4<f32>,
-    row1: vec4<f32>,
-    row2: vec4<f32>,
-}
-
 // Dual-quaternion form for DQS — 32 B per bone. `r` is the rotation
 // (real) part, `d` is the translation-encoded (dual) part. Matches
 // `skin_deform.wesl`'s `DualQuat` so the same per-frame buffer feeds
@@ -66,8 +56,16 @@ struct DualQuat {
     d: vec4<f32>,
 }
 
+// `bone_matrices` matches the buffer `BoneMatrixAllocator` writes —
+// one full `mat4x4<f32>` (64 B) per bone. The trailing row is always
+// `(0,0,0,1)` for affine bones; reading the bottom row as part of
+// the matrix is harmless and keeps the WGSL layout in lockstep with
+// `skin_deform.wesl`'s declaration. (An earlier draft of this shader
+// declared `BoneMatrix { row0, row1, row2 }` at 48 B and produced
+// "stretched all over" geometry — every other bone read landed mid-
+// matrix because the actual on-GPU stride is 64.)
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
-@group(0) @binding(2) var<storage, read> bone_matrices: array<BoneMatrix>;
+@group(0) @binding(2) var<storage, read> bone_matrices: array<mat4x4<f32>>;
 @group(0) @binding(3) var<storage, read> bone_dual_quats: array<DualQuat>;
 
 @group(1) @binding(0) var<uniform> instance: MeshInstance;
@@ -78,19 +76,12 @@ struct VsOut {
     @location(1) @interpolate(flat) leaf_attr_id: u32,
 }
 
-// Apply a packed `mat3x4` bone (3 rows × 4 cols, affine) to a
-// position. Equivalent to the upper 3 rows of a mat4 multiply against
-// `vec4(p, 1)`.
-fn apply_bone_lbs(b: BoneMatrix, p: vec3<f32>) -> vec3<f32> {
-    let p4 = vec4<f32>(p, 1.0);
-    return vec3<f32>(dot(b.row0, p4), dot(b.row1, p4), dot(b.row2, p4));
-}
-
 // Linear blend of 4 bone influences in matrix space. Weights and
 // indices are unpacked from the per-vertex u32 quads on the call
 // site; offset shifts the bone index into this instance's palette.
 fn skin_lbs(p: vec3<f32>, indices: u32, weights: u32, offset: u32) -> vec3<f32> {
     let inv255 = 1.0 / 255.0;
+    let p4 = vec4<f32>(p, 1.0);
     var acc = vec3<f32>(0.0);
     var total_w = 0.0;
     for (var i = 0u; i < 4u; i = i + 1u) {
@@ -98,8 +89,8 @@ fn skin_lbs(p: vec3<f32>, indices: u32, weights: u32, offset: u32) -> vec3<f32> 
         let wu = (weights >> (i * 8u)) & 0xFFu;
         if wu == 0u { continue; }
         let w = f32(wu) * inv255;
-        let b = bone_matrices[offset + bi];
-        acc = acc + w * apply_bone_lbs(b, p);
+        let m = bone_matrices[offset + bi];
+        acc = acc + w * (m * p4).xyz;
         total_w = total_w + w;
     }
     // Normalise — well-formed weights sum to 255 (= 1.0), but the

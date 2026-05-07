@@ -36,19 +36,17 @@ const SKINNING_MODE_NONE: u32 = 0xFFFFFFFFu;
 const SKINNING_MODE_LBS: u32 = 0u;
 const SKINNING_MODE_DQS: u32 = 1u;
 
-struct BoneMatrix {
-    row0: vec4<f32>,
-    row1: vec4<f32>,
-    row2: vec4<f32>,
-}
-
 struct DualQuat {
     r: vec4<f32>,
     d: vec4<f32>,
 }
 
+// `bone_matrices` is a 64 B `mat4x4<f32>` per bone (matches
+// `skin_deform.wesl`). Declaring it as `mat3x4` would shave 16 B per
+// bone but mismatches the on-GPU stride that the writer uses, which
+// produced "stretched all over" geometry in an earlier draft.
 @group(0) @binding(0) var<uniform> light_camera: LightCameraShadow;
-@group(0) @binding(2) var<storage, read> bone_matrices: array<BoneMatrix>;
+@group(0) @binding(2) var<storage, read> bone_matrices: array<mat4x4<f32>>;
 @group(0) @binding(3) var<storage, read> bone_dual_quats: array<DualQuat>;
 
 @group(1) @binding(0) var<uniform> instance: MeshShadowInstance;
@@ -57,13 +55,9 @@ struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
 }
 
-fn apply_bone_lbs(b: BoneMatrix, p: vec3<f32>) -> vec3<f32> {
-    let p4 = vec4<f32>(p, 1.0);
-    return vec3<f32>(dot(b.row0, p4), dot(b.row1, p4), dot(b.row2, p4));
-}
-
 fn skin_lbs(p: vec3<f32>, indices: u32, weights: u32, offset: u32) -> vec3<f32> {
     let inv255 = 1.0 / 255.0;
+    let p4 = vec4<f32>(p, 1.0);
     var acc = vec3<f32>(0.0);
     var total_w = 0.0;
     for (var i = 0u; i < 4u; i = i + 1u) {
@@ -71,8 +65,8 @@ fn skin_lbs(p: vec3<f32>, indices: u32, weights: u32, offset: u32) -> vec3<f32> 
         let wu = (weights >> (i * 8u)) & 0xFFu;
         if wu == 0u { continue; }
         let w = f32(wu) * inv255;
-        let b = bone_matrices[offset + bi];
-        acc = acc + w * apply_bone_lbs(b, p);
+        let m = bone_matrices[offset + bi];
+        acc = acc + w * (m * p4).xyz;
         total_w = total_w + w;
     }
     if total_w > 0.0 { return acc / total_w; }
