@@ -83,6 +83,14 @@ struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) world_pos: vec3<f32>,
     @location(1) @interpolate(flat) leaf_attr_id: u32,
+    // Pre-skin, mesh-frame local position. Interpolates barycentrically
+    // across the triangle so the FS gets the per-pixel rest-pose
+    // surface point. `splat_resolve` uses this to descend the asset's
+    // octree per pixel and recover the actual cell — fixes the
+    // chunky-per-triangle look caused by `@interpolate(flat) leaf_attr_id`.
+    // Same value for skinned and unskinned (skinning happens AFTER this
+    // is captured, so the rest pose is preserved across the wire).
+    @location(2) local_rest_pos: vec3<f32>,
 }
 
 // Linear blend of 4 bone influences in matrix space. Weights and
@@ -200,18 +208,27 @@ fn vert_main(
     out.clip_pos = clip;
     out.world_pos = world_pos;
     out.leaf_attr_id = leaf_attr_id;
+    // Pre-skin local mesh-frame position — same value the surface-net
+    // extractor wrote for this vertex. Interpolated per-fragment, this
+    // recovers the rest-pose surface point even for skinned instances.
+    out.local_rest_pos = local_pos;
     return out;
 }
 
-// Three-attachment fragment output — same visibility-buffer triplet
-// `splat.wesl` writes:
+// Four-attachment fragment output — visibility-buffer triplet plus
+// rest_pos for per-pixel cell descent in `splat_resolve`:
 //   position   (Rgba32Float, 16 B): world.xyz + hit_distance
 //   pick       (R32Uint,      4 B): instance.object_id
-//   leaf_slot  (R32Uint,      4 B): leaf_attr_id
+//   leaf_slot  (R32Uint,      4 B): leaf_attr_id (provoking vertex's
+//                                   cell — used as a fallback /
+//                                   miss-path hint)
+//   rest_pos   (Rgba32Float, 16 B): local mesh-frame rest position
+//                                   (xyz) + valid-bit (.w = 1)
 struct FsOut {
     @location(0) position:  vec4<f32>,
     @location(1) pick:      u32,
     @location(2) leaf_slot: u32,
+    @location(3) rest_pos:  vec4<f32>,
 }
 
 @fragment
@@ -221,5 +238,10 @@ fn frag_main(in: VsOut) -> FsOut {
     out.position  = vec4<f32>(in.world_pos, hit_distance);
     out.pick      = instance.object_id;
     out.leaf_slot = in.leaf_attr_id;
+    // .w = 1 marks this pixel as "mesh wrote rest_pos" — splat_resolve
+    // gates the per-pixel descent on this. Splat path leaves the
+    // texture cleared so .w stays 0 there and resolve falls back to
+    // leaf_slot.
+    out.rest_pos  = vec4<f32>(in.local_rest_pos, 1.0);
     return out;
 }

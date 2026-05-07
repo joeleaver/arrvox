@@ -662,6 +662,7 @@ impl ViewportRenderer {
                 &self.gbuffer.normal_view,
                 &self.gbuffer.material_view,
                 &self.gbuffer.glass_view,
+                &self.gbuffer.rest_pos_view,
             ));
         }
         let scene_now = renderer.scene.buffers_epoch();
@@ -671,6 +672,10 @@ impl ViewportRenderer {
                 &renderer.scene.leaf_attr_pool_buffer,
                 &renderer.scene.color_pool_buffer,
                 &renderer.scene.objects_buffer,
+                &renderer.scene.assets_buffer,
+                &renderer.scene.octree_nodes_buffer,
+                &renderer.scene.brick_pool_buffer,
+                &renderer.scene.brick_face_links_buffer,
             ));
             self.splat_resolve_scene_epoch = scene_now;
         }

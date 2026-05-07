@@ -454,6 +454,34 @@ impl RkpRenderer {
             .as_ref()
             .expect("splat g0 bg present after refresh_splat_g0");
 
+        // 0. Clear the rest_pos texture so its .w stays 0 across the
+        //    splat path. The splat raster doesn't bind rest_pos —
+        //    only the mesh raster writes it — but `splat_resolve` reads
+        //    it to decide whether to do per-pixel octree descent. If
+        //    we don't clear, leftover mesh-frame writes leak through
+        //    on splat frames and the resolve mis-descends with stale
+        //    rest_pos values, producing wrong cell colors. The cheapest
+        //    portable clear is a render pass with a single color
+        //    attachment whose only op is LoadOp::Clear.
+        {
+            let _clear_rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("splat clear rest_pos"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &viewport.gbuffer.rest_pos_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+
         // 1. Visibility-buffer raster — writes position + pick +
         //    leaf_slot for hit pixels; clears all three (and depth) to
         //    march-equivalent miss sentinels.
@@ -762,6 +790,7 @@ impl RkpRenderer {
                 &viewport.gbuffer.position_view,
                 &viewport.pick_view,
                 &viewport.gbuffer.leaf_slot_view,
+                &viewport.gbuffer.rest_pos_view,
                 &viewport.gbuffer.depth_view,
                 None,
             );

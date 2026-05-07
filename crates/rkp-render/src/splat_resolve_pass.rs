@@ -78,6 +78,19 @@ impl SplatResolvePass {
                     },
                     count: None,
                 },
+                // rest_pos_in (Rgba32Float, sampled — the mesh-path
+                // per-pixel rest-pose position; .w gates per-pixel
+                // octree descent in the resolve)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -95,9 +108,22 @@ impl SplatResolvePass {
         let g1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("splat_resolve g1"),
             entries: &[
+                // 0 = leaf_attr_pool, 1 = color_pool, 2 = instances —
+                // unchanged from the pre-Phase-6.7 layout.
                 wgpu::BindGroupLayoutEntry { binding: 0, ..storage_ro },
                 wgpu::BindGroupLayoutEntry { binding: 1, ..storage_ro },
                 wgpu::BindGroupLayoutEntry { binding: 2, ..storage_ro },
+                // 3 = assets, 4 = octree_nodes, 5 = brick_pool — added
+                // for per-pixel octree descent on the mesh path.
+                wgpu::BindGroupLayoutEntry { binding: 3, ..storage_ro },
+                wgpu::BindGroupLayoutEntry { binding: 4, ..storage_ro },
+                wgpu::BindGroupLayoutEntry { binding: 5, ..storage_ro },
+                // 6 = brick_face_links. Not actually read by the resolve,
+                // but `lib::octree::descend_proto_octree` references it
+                // as a free name and the WESL composer pulls the whole
+                // module into the emitted WGSL — see the matching
+                // comment in `splat_resolve.wesl`.
+                wgpu::BindGroupLayoutEntry { binding: 6, ..storage_ro },
             ],
         });
 
@@ -135,6 +161,7 @@ impl SplatResolvePass {
         normal_view: &wgpu::TextureView,
         material_view: &wgpu::TextureView,
         glass_view: &wgpu::TextureView,
+        rest_pos_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("splat_resolve g0 bg"),
@@ -145,19 +172,24 @@ impl SplatResolvePass {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(normal_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(material_view) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(glass_view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(rest_pos_view) },
             ],
         })
     }
 
     /// Build the scene-wide `g1` bind group. Rebuild after a scene-
-    /// buffers epoch bump — `leaf_attr_pool` / `color_pool` / `instances`
-    /// can move underneath us when the scene resizes its pools.
+    /// buffers epoch bump — any of these buffers can move underneath
+    /// us when the scene resizes its pools.
     pub fn create_g1_bind_group(
         &self,
         device: &wgpu::Device,
         leaf_attr_pool_buffer: &wgpu::Buffer,
         color_pool_buffer: &wgpu::Buffer,
         instances_buffer: &wgpu::Buffer,
+        assets_buffer: &wgpu::Buffer,
+        octree_nodes_buffer: &wgpu::Buffer,
+        brick_pool_buffer: &wgpu::Buffer,
+        brick_face_links_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("splat_resolve g1 bg"),
@@ -166,6 +198,10 @@ impl SplatResolvePass {
                 wgpu::BindGroupEntry { binding: 0, resource: leaf_attr_pool_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: color_pool_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: instances_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: assets_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: octree_nodes_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: brick_pool_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: brick_face_links_buffer.as_entire_binding() },
             ],
         })
     }

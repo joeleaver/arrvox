@@ -20,7 +20,7 @@
 //!   · Vertex layout: per-vertex (not per-instance) — `MeshVertex` at
 //!     a 32 B stride, locations matching `extract::MeshVertex`.
 
-use crate::gbuffer::{GBUFFER_DEPTH_FORMAT, GBUFFER_POSITION_FORMAT};
+use crate::gbuffer::{GBUFFER_DEPTH_FORMAT, GBUFFER_POSITION_FORMAT, GBUFFER_REST_POS_FORMAT};
 
 use rkp_core::mesh_extract::MeshVertex;
 
@@ -140,8 +140,12 @@ impl MeshPass {
                 module: &module,
                 entry_point: Some("frag_main"),
                 compilation_options: Default::default(),
-                // Same three-attachment visibility-buffer output as the
-                // splat path. Order is locked by `mesh.wesl`'s `FsOut`.
+                // Visibility-buffer triplet + rest_pos. Order locked
+                // by `mesh.wesl`'s `FsOut`. The 4th target carries the
+                // pre-skin mesh-frame rest position so `splat_resolve`
+                // can descend the asset's octree per pixel — fixes the
+                // chunky-per-triangle look of `@interpolate(flat)
+                // leaf_attr_id`.
                 targets: &[
                     Some(wgpu::ColorTargetState {
                         format: GBUFFER_POSITION_FORMAT,
@@ -155,6 +159,11 @@ impl MeshPass {
                     }),
                     Some(wgpu::ColorTargetState {
                         format: GBUFFER_LEAF_SLOT_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: GBUFFER_REST_POS_FORMAT,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -181,13 +190,19 @@ impl MeshPass {
     /// | position    | (0, 0, 0, 1e10) |
     /// | pick        | 0xFFFFFFFF      |
     /// | leaf_slot   | 0               |
+    /// | rest_pos    | (0, 0, 0, 0)    |
     /// | depth       | 1.0             |
+    ///
+    /// `rest_pos` clears to .w = 0 (the "no rest_pos written" sentinel)
+    /// so any miss pixel reads as "fall back to leaf_slot" in
+    /// `splat_resolve`.
     pub fn begin_pass<'a>(
         &'a self,
         encoder: &'a mut wgpu::CommandEncoder,
         position_view: &wgpu::TextureView,
         pick_view: &wgpu::TextureView,
         leaf_slot_view: &wgpu::TextureView,
+        rest_pos_view: &wgpu::TextureView,
         depth_view: &wgpu::TextureView,
         timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'a>>,
     ) -> wgpu::RenderPass<'a> {
@@ -224,6 +239,15 @@ impl MeshPass {
                 }),
                 Some(wgpu::RenderPassColorAttachment {
                     view: leaf_slot_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: rest_pos_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {

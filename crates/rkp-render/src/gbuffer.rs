@@ -57,6 +57,22 @@ pub struct GBuffer {
     pub leaf_slot_texture: wgpu::Texture,
     pub leaf_slot_view: wgpu::TextureView,
 
+    /// Target "rest_pos": per-pixel local mesh-frame rest position
+    /// (the un-skinned vertex position interpolated barycentrically
+    /// across the triangle). `Rgba32Float`. Written by `mesh.wesl`'s
+    /// fragment stage as a 4th visibility-buffer attachment so
+    /// `splat_resolve` can descend the asset's octree per pixel and
+    /// recover the actual cell at the surface point — the mesh path's
+    /// flat-interpolated `leaf_attr_id` only carries one cell's value
+    /// per triangle, which appears as chunky per-triangle color
+    /// patches at fine LOD.
+    /// `.w == 1` ⇒ mesh wrote a valid rest_pos; `.w == 0` ⇒ "no
+    /// rest_pos available, fall back to leaf_slot." The splat path
+    /// doesn't write this target; the texture is cleared at frame
+    /// start so .w stays 0 there.
+    pub rest_pos_texture: wgpu::Texture,
+    pub rest_pos_view: wgpu::TextureView,
+
     /// Depth texture for rasterization-based G-buffer writes. `Depth32Float`.
     /// Used by the forward rasterization pipeline; ignored by compute march paths.
     pub depth_texture: wgpu::Texture,
@@ -103,6 +119,13 @@ pub const GBUFFER_GLASS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32U
 /// primary hit's scene-global `leaf_attr_slot`. `0` = sky / no hit.
 /// Used by rkp_shade's geodesic paint cursor.
 pub const GBUFFER_LEAF_SLOT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
+/// Texture format for the mesh-path rest-pose position target.
+/// Rgba32Float for full FP precision in mesh-frame coordinates; the
+/// per-pixel octree descent in `splat_resolve` needs sub-voxel
+/// accuracy and meshes can range over ~100 m of extent. Changing
+/// this format requires updating `mesh.wesl`'s 4th color target +
+/// `splat_resolve.wesl`'s sample type.
+pub const GBUFFER_REST_POS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
 impl GBuffer {
     /// Create the G-buffer with 4 render targets at the given resolution.
@@ -197,6 +220,26 @@ impl GBuffer {
             view_formats: &[],
         });
         let leaf_slot_view = leaf_slot_texture.create_view(&Default::default());
+
+        // Mesh-path rest_pos target — per-pixel rest-pose mesh-frame
+        // position. Written by `mesh.wesl` as a 4th MRT attachment;
+        // consumed by `splat_resolve.wesl` for per-pixel cell descent.
+        // RENDER_ATTACHMENT for mesh writes, TEXTURE_BINDING for the
+        // resolve read, COPY_DST so the splat path can clear it via
+        // `encoder.clear_texture` (it doesn't bind this attachment).
+        let rest_pos_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gbuffer rest_pos"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GBUFFER_REST_POS_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let rest_pos_view = rest_pos_texture.create_view(&Default::default());
 
         // Depth texture for rasterization-based G-buffer writes
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -339,6 +382,8 @@ impl GBuffer {
             glass_view,
             leaf_slot_texture,
             leaf_slot_view,
+            rest_pos_texture,
+            rest_pos_view,
             depth_texture,
             depth_view,
             write_bind_group_layout,

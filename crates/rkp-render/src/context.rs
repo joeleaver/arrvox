@@ -78,6 +78,16 @@ impl RenderContext {
                     // 5 (position + normal + material + pick + glass).
                     // Desktop GPUs support 8+ universally.
                     max_storage_textures_per_shader_stage: 8,
+                    // wgpu default is 32 B; the mesh raster path writes
+                    // position (Rgba32Float, 16 B) + pick (R32Uint, 4 B) +
+                    // leaf_slot (R32Uint, 4 B) + rest_pos (Rgba32Float,
+                    // 16 B) = 40 B/sample. rest_pos was added in Phase
+                    // 6.7 for per-pixel cell sampling in `splat_resolve`.
+                    // Desktop GPUs (RTX 20+, RDNA2+) report 64-128 B; take
+                    // whatever the adapter exposes so the default cap is
+                    // lifted.
+                    max_color_attachment_bytes_per_sample:
+                        adapter.limits().max_color_attachment_bytes_per_sample,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -202,6 +212,16 @@ impl RenderContext {
                     // 5 (position + normal + material + pick + glass).
                     // Desktop GPUs support 8+ universally.
                     max_storage_textures_per_shader_stage: 8,
+                    // wgpu default is 32 B; the mesh raster path writes
+                    // position (Rgba32Float, 16 B) + pick (R32Uint, 4 B) +
+                    // leaf_slot (R32Uint, 4 B) + rest_pos (Rgba32Float,
+                    // 16 B) = 40 B/sample. rest_pos was added in Phase
+                    // 6.7 for per-pixel cell sampling in `splat_resolve`.
+                    // Desktop GPUs (RTX 20+, RDNA2+) report 64-128 B; take
+                    // whatever the adapter exposes so the default cap is
+                    // lifted.
+                    max_color_attachment_bytes_per_sample:
+                        adapter.limits().max_color_attachment_bytes_per_sample,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
