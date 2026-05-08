@@ -453,6 +453,11 @@ impl EngineState {
                             env.shadow_csm_threshold_falloff = v.clamp(1.0, 6.0);
                         }
                     }
+                    "shadow_csm_sharp_distance" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            env.shadow_csm_sharp_distance = v.clamp(0.5, 50.0);
+                        }
+                    }
                     "ao_radius" => {
                         if let Ok(v) = value.parse::<f32>() { env.ao_radius = v; }
                     }

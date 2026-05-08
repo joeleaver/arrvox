@@ -231,6 +231,11 @@ pub(super) fn prepare_shadow_maps(
         .unwrap_or(frame.shadow_csm_near)
         .clamp(0.05, 10.0);
     let depth_bias = frame.shadow_csm_depth_bias.max(0.0);
+    let sharp_distance = std::env::var("RKP_CSM_SHARP_DISTANCE")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(frame.shadow_csm_sharp_distance)
+        .clamp(0.0, 100.0);
 
     // Optional one-time fit log — extends the existing
     // RKP_SHADOW_FIT_LOG with the scene-AABB context.
@@ -279,6 +284,7 @@ pub(super) fn prepare_shadow_maps(
             csm_near,
             csm_max_distance,
             csm_lambda,
+            sharp_distance,
         });
 
         if fit_log {

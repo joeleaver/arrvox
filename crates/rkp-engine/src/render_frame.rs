@@ -238,6 +238,9 @@ pub struct RenderFrame {
     /// Per-cascade LOD pixel-threshold falloff. See
     /// `EnvironmentSettings::shadow_csm_threshold_falloff`.
     pub shadow_csm_threshold_falloff: f32,
+    /// Distance (m) the highest-detail cascade extends to. See
+    /// `EnvironmentSettings::shadow_csm_sharp_distance`.
+    pub shadow_csm_sharp_distance: f32,
 }
 
 /// Per-viewport render data — enough for the render thread to upload

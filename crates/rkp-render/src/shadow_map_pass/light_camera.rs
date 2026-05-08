@@ -278,6 +278,13 @@ pub struct CsmInputs {
     /// 0.5 is the practical default that keeps the near cascade tight
     /// while still giving the far cascade enough breathing room.
     pub csm_lambda: f32,
+    /// User-facing override for cascade-0 extent (m). When valid
+    /// (`csm_near < sharp_distance < csm_max_distance`), cascade 0
+    /// is hard-set to cover `[csm_near, sharp_distance]` and PSSM
+    /// distributes cascades 1..N over `[sharp_distance,
+    /// csm_max_distance]`. Pass 0.0 (or any value out of range) to
+    /// disable and let PSSM run over the full range as before.
+    pub sharp_distance: f32,
 }
 
 /// Per-cascade light camera derivation for the CSM path.
@@ -303,14 +310,28 @@ pub fn compute_csm_cascades(inputs: CsmInputs) -> LightCameraCsm {
     let lambda = inputs.csm_lambda.clamp(0.0, 1.0);
 
     // ── PSSM splits ───────────────────────────────────────────
-    // splits[0] = near, splits[N] = far, intermediates blend log + uniform.
+    // splits[0] = near, splits[N] = far, intermediates blend log +
+    // uniform. When `sharp_distance` is in `(near, far)`, cascade 0
+    // is hard-set to `[near, sharp_distance]` and PSSM splits the
+    // remaining `[sharp_distance, far]` range across cascades 1..N
+    // (so the user-facing "Sharp Distance" knob directly controls
+    // where the highest-detail tier ends, not the abstract λ).
     let mut splits = [0.0_f32; CSM_CASCADE_COUNT as usize + 1];
     splits[0] = near;
     splits[n] = far;
-    for i in 1..n {
-        let f = i as f32 / n as f32;
-        let z_log = near * (far / near).powf(f);
-        let z_uniform = near + (far - near) * f;
+    let use_sharp = inputs.sharp_distance > near && inputs.sharp_distance < far;
+    let pssm_near = if use_sharp {
+        splits[1] = inputs.sharp_distance;
+        inputs.sharp_distance
+    } else {
+        near
+    };
+    let pssm_start = if use_sharp { 2 } else { 1 };
+    let pssm_n = (n - pssm_start + 1) as f32; // sub-intervals over [pssm_near, far]
+    for i in pssm_start..n {
+        let f = (i - pssm_start + 1) as f32 / pssm_n;
+        let z_log = pssm_near * (far / pssm_near).powf(f);
+        let z_uniform = pssm_near + (far - pssm_near) * f;
         splits[i] = lambda * z_log + (1.0 - lambda) * z_uniform;
     }
 

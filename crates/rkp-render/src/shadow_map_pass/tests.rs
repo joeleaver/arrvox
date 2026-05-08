@@ -94,6 +94,7 @@ fn default_csm_inputs() -> CsmInputs {
         csm_near: 0.1,
         csm_max_distance: 100.0,
         csm_lambda: 0.5,
+        sharp_distance: 0.0,
     }
 }
 
@@ -273,5 +274,63 @@ fn compute_light_camera_view_proj_inv_round_trips() {
         assert!((recovered.x - ndc[0]).abs() < 1e-3);
         assert!((recovered.y - ndc[1]).abs() < 1e-3);
         assert!((recovered.z - ndc[2]).abs() < 1e-3);
+    }
+}
+
+#[test]
+fn csm_sharp_distance_overrides_first_split() {
+    // sharp_distance=5 → splits[1] = 5 (cascade 0 covers [near, 5]),
+    // remaining splits PSSM-distributed over [5, 100].
+    let mut inp = default_csm_inputs();
+    inp.sharp_distance = 5.0;
+    inp.csm_lambda = 1.0; // Pure log over the post-sharp range so we can predict.
+    let csm = compute_csm_cascades(inp);
+    assert!(
+        (csm.cascade_far_view_z[0] - 5.0).abs() < 1e-3,
+        "expected cascade 0 to end at sharp_distance=5, got {}",
+        csm.cascade_far_view_z[0],
+    );
+    // Remaining 3 splits distribute log over [5, 100]: ratio=20,
+    // 20^(1/3) ≈ 2.714. Splits at 5*2.714 ≈ 13.57 and 5*2.714^2 ≈ 36.84.
+    // Last is the hard `far` cap.
+    let expected_1 = 5.0 * 20.0_f32.powf(1.0 / 3.0);
+    let expected_2 = 5.0 * 20.0_f32.powf(2.0 / 3.0);
+    assert!(
+        (csm.cascade_far_view_z[1] - expected_1).abs() < 0.1,
+        "cascade 1 expected ~{expected_1}, got {}",
+        csm.cascade_far_view_z[1],
+    );
+    assert!(
+        (csm.cascade_far_view_z[2] - expected_2).abs() < 0.1,
+        "cascade 2 expected ~{expected_2}, got {}",
+        csm.cascade_far_view_z[2],
+    );
+    assert!(
+        (csm.cascade_far_view_z[3] - 100.0).abs() < 1e-3,
+        "cascade 3 should hit the far cap, got {}",
+        csm.cascade_far_view_z[3],
+    );
+}
+
+#[test]
+fn csm_sharp_distance_zero_falls_back_to_pssm() {
+    // sharp_distance=0 → bypass override; splits identical to the
+    // pre-feature behavior. Compare against `csm_lambda_one_is_log_split`
+    // expectations.
+    let mut inp = default_csm_inputs();
+    inp.sharp_distance = 0.0;
+    inp.csm_lambda = 1.0;
+    let csm = compute_csm_cascades(inp);
+    let near: f32 = 0.1;
+    let far: f32 = 100.0;
+    let n = CSM_CASCADE_COUNT as usize;
+    for i in 0..n {
+        let f = (i + 1) as f32 / n as f32;
+        let expected = near * (far / near).powf(f);
+        let got = csm.cascade_far_view_z[i];
+        assert!(
+            (got - expected).abs() < 0.1,
+            "fallback split [{i}]: expected {expected}, got {got}",
+        );
     }
 }

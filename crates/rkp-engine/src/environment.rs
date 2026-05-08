@@ -69,8 +69,21 @@ pub struct EnvironmentSettings {
     /// cascade 1 detail. 1.0 = every cascade uses the same threshold;
     /// 4.0 = aggressive (cascades 1-3 admit ~1% of cascade 0's
     /// clusters). Default 2.0 keeps cascade 1 close to cascade 0
-    /// quality at modest extra cost.
+    /// quality at modest extra cost. Driven by the Shadow Quality
+    /// preset row in the env panel; not exposed as a raw slider.
     pub shadow_csm_threshold_falloff: f32,
+    /// Distance (m) the highest-detail shadow cascade extends to.
+    /// Bypasses the PSSM math for cascade 0's split: cascade 0
+    /// covers `[shadow_csm_near, shadow_csm_sharp_distance]` and
+    /// cascades 1..N split `[shadow_csm_sharp_distance,
+    /// shadow_csm_max_distance]` via PSSM. This is the user-facing
+    /// answer to "I want sharp shadows out to X meters" — it
+    /// replaces the previous Cascade Split λ slider, which
+    /// controlled cascade-0 extent indirectly through PSSM and was
+    /// confusing (raise λ → cascade 0 SHRINKS). Default 2.0 m
+    /// matches the splat5 elephant scene's typical inspection
+    /// distance.
+    pub shadow_csm_sharp_distance: f32,
 
     // ── Ambient occlusion ───────────────────────────────────────────
     pub ao_radius: f32,
@@ -163,6 +176,7 @@ impl Default for EnvironmentSettings {
             shadow_csm_lambda: 0.95,
             shadow_csm_depth_bias: 0.001,
             shadow_csm_threshold_falloff: 2.0,
+            shadow_csm_sharp_distance: 2.0,
             ao_radius: 0.1,
             ao_steps: 5,
             exposure: 0.0000254, // EV100=15 (sunny-16 rule): 1/(1.2 × 2^15)
@@ -225,6 +239,35 @@ pub fn cloud_quality_values(preset: CloudQualityPreset) -> (u32, u32, u32, u32, 
         CloudQualityPreset::Medium => (24, 3, 3, 3, 0.25),
         CloudQualityPreset::High   => (32, 4, 4, 3, 0.25),
         CloudQualityPreset::Ultra  => (48, 5, 5, 4, 0.35),
+    }
+}
+
+/// Named quality tiers for the CSM shadow LOD select. Bundles the
+/// per-cascade pixel-error falloff and the cascade-split λ into a
+/// single user-facing knob. Picked by the env panel preset row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowQualityPreset {
+    Low,
+    Medium,
+    High,
+}
+
+/// (threshold_falloff, lambda) for a `ShadowQualityPreset`.
+///
+/// `threshold_falloff` controls per-cascade geometry detail —
+/// `2 * falloff^cascade` px is the admit threshold for cascade N.
+/// Higher = coarser far cascades = cheaper.
+///
+/// `lambda` is the PSSM hybrid factor (0 = uniform, 1 = log).
+/// Pinned at 0.95 across all presets — that's the value
+/// `project_csm_shipped` settled on for sharp near-camera detail.
+/// The Sharp Distance slider is what users tune for cascade 0
+/// extent now; lambda is just a fixed implementation detail.
+pub fn shadow_quality_values(preset: ShadowQualityPreset) -> (f32, f32) {
+    match preset {
+        ShadowQualityPreset::Low    => (4.0, 0.95),
+        ShadowQualityPreset::Medium => (2.0, 0.95),
+        ShadowQualityPreset::High   => (1.5, 0.95),
     }
 }
 

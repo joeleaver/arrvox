@@ -12,7 +12,9 @@ use std::rc::Rc;
 
 use rinch::prelude::*;
 
-use rkp_engine::environment::{CloudQualityPreset, cloud_quality_values};
+use rkp_engine::environment::{
+    cloud_quality_values, shadow_quality_values, CloudQualityPreset, ShadowQualityPreset,
+};
 
 use crate::CommandSender;
 use crate::ui::store::EditorStore;
@@ -60,6 +62,7 @@ pub fn EnvironmentPanel() -> NodeHandle {
     let shadow_csm_lambda = Memo::new(move || store.environment.get().shadow_csm_lambda);
     let shadow_csm_depth_bias = Memo::new(move || store.environment.get().shadow_csm_depth_bias);
     let shadow_csm_threshold_falloff = Memo::new(move || store.environment.get().shadow_csm_threshold_falloff);
+    let shadow_csm_sharp_distance = Memo::new(move || store.environment.get().shadow_csm_sharp_distance);
     let ao_radius = Memo::new(move || store.environment.get().ao_radius);
     let ao_steps = Memo::new(move || store.environment.get().ao_steps as f32);
 
@@ -152,6 +155,40 @@ pub fn EnvironmentPanel() -> NodeHandle {
             send("cloud_taa_alpha", alpha.to_string());
         })
     };
+
+    // Shadow Quality preset — bundles the per-cascade falloff knob
+    // (and λ, pinned at 0.95). Sets `shadow_csm_threshold_falloff`
+    // and `shadow_csm_lambda` on apply; the active row is derived
+    // from those two reading them back through env Memos.
+    let shadow_apply_preset: Rc<dyn Fn(ShadowQualityPreset)> = {
+        Rc::new(move |preset: ShadowQualityPreset| {
+            let (falloff, lambda) = shadow_quality_values(preset);
+            let tx = cmd_tx.get();
+            let send = |field: &str, v: String| {
+                let _ = tx.send(rkp_engine::EngineCommand::UpdateEnvironment {
+                    field: field.into(),
+                    value: v,
+                });
+            };
+            send("shadow_csm_threshold_falloff", falloff.to_string());
+            send("shadow_csm_lambda", lambda.to_string());
+        })
+    };
+    let shadow_active_preset = Memo::new(move || -> Option<ShadowQualityPreset> {
+        let f = shadow_csm_threshold_falloff.get();
+        let l = shadow_csm_lambda.get();
+        for p in [
+            ShadowQualityPreset::Low,
+            ShadowQualityPreset::Medium,
+            ShadowQualityPreset::High,
+        ] {
+            let (pf, pl) = shadow_quality_values(p);
+            if (f - pf).abs() < 0.01 && (l - pl).abs() < 0.001 {
+                return Some(p);
+            }
+        }
+        None
+    });
 
     // Active preset — derived Memo so preset buttons re-style only when
     // the preset selection actually changes.
@@ -257,27 +294,33 @@ pub fn EnvironmentPanel() -> NodeHandle {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
                     {prop_slider_memo(__scope, "Shadow Steps", shadow_steps, 4.0, 64.0, 4.0, env_f32("shadow_steps"))}
-                    // Shadow Distance: far cap of CSM coverage. Anything past
-                    // this distance falls back to "fully lit". 100 m is a
-                    // reasonable default for the editor; raise for vista
-                    // shots, lower if the scene is small (smaller distance =
-                    // sharper everywhere).
-                    {prop_slider_memo(__scope, "Shadow Distance (m)", shadow_csm_max_distance, 10.0, 500.0, 5.0, env_f32("shadow_csm_max_distance"))}
-                    // Cascade Split λ: how aggressively cascades cluster
-                    // toward the camera. 0.5 = balanced, 0.95 = strong
-                    // near-camera bias (default). Below ~0.7 the slider
-                    // doesn't do much because the uniform-split component
-                    // takes over.
-                    {prop_slider_memo(__scope, "Cascade Split λ", shadow_csm_lambda, 0.5, 1.0, 0.01, env_f32("shadow_csm_lambda"))}
+                    // Sharp Distance: how far the highest-detail shadow
+                    // cascade extends. Cascade 0 covers `[near, sharp]`,
+                    // remaining cascades distribute over `[sharp, max]`.
+                    // Default 2 m is fine for prop-scale assets; raise
+                    // for terrain / outdoor vistas where you want
+                    // pixel-perfect shadows further out.
+                    {prop_slider_memo(__scope, "Sharp Distance (m)", shadow_csm_sharp_distance, 0.5, 50.0, 0.5, env_f32("shadow_csm_sharp_distance"))}
+                    // Max Distance: the far cap. Anything beyond falls
+                    // back to fully-lit. Lower = sharper everywhere
+                    // (cascades pack tighter); higher = shadows reach
+                    // further but each cascade covers more area.
+                    {prop_slider_memo(__scope, "Max Distance (m)", shadow_csm_max_distance, 10.0, 500.0, 5.0, env_f32("shadow_csm_max_distance"))}
+                    // Quality preset — bundles the per-cascade detail
+                    // falloff. Low = far cascades drop to coarse
+                    // geometry quickly (fastest); High = far cascades
+                    // stay close to cascade-0 quality (most expensive).
+                    div {
+                        style: "font-size:11px;color:#888;margin-top:8px;",
+                        {"Shadow Quality"}
+                    }
+                    div {
+                        style: "display:flex;gap:4px;",
+                        {preset_button(__scope, "Low", ShadowQualityPreset::Low, shadow_apply_preset.clone(), shadow_active_preset)}
+                        {preset_button(__scope, "Medium", ShadowQualityPreset::Medium, shadow_apply_preset.clone(), shadow_active_preset)}
+                        {preset_button(__scope, "High", ShadowQualityPreset::High, shadow_apply_preset.clone(), shadow_active_preset)}
+                    }
                     {prop_slider_memo(__scope, "Shadow Depth Bias", shadow_csm_depth_bias, 0.0, 0.01, 0.0001, env_f32("shadow_csm_depth_bias"))}
-                    // Cascade LOD Falloff: per-cascade pixel-error budget
-                    // multiplier. The shadow LOD select uses
-                    // `2 * falloff^cascade` px as the threshold for each
-                    // cascade. 1.0 = every cascade uses the same threshold
-                    // (most detail, slowest); 4.0 = aggressive (cascade 1
-                    // jumps to noticeably coarser geometry, fastest). 2.0
-                    // default keeps cascade 1 close to cascade 0 quality.
-                    {prop_slider_memo(__scope, "Cascade LOD Falloff", shadow_csm_threshold_falloff, 1.0, 6.0, 0.1, env_f32("shadow_csm_threshold_falloff"))}
                     {prop_slider_memo(__scope, "AO Radius", ao_radius, 0.01, 1.0, 0.01, env_f32("ao_radius"))}
                     {prop_slider_memo(__scope, "AO Steps", ao_steps, 1.0, 16.0, 1.0, env_f32("ao_steps"))}
                 }
@@ -374,12 +417,12 @@ pub fn EnvironmentPanel() -> NodeHandle {
 
 /// One entry in the cloud quality preset row. Highlights itself when the
 /// active preset Memo matches; clicking fires `apply_preset`.
-fn preset_button(
+fn preset_button<P: Copy + PartialEq + 'static>(
     __scope: &mut rinch::core::dom::RenderScope,
     label: &str,
-    preset: CloudQualityPreset,
-    apply: Rc<dyn Fn(CloudQualityPreset)>,
-    active: Memo<Option<CloudQualityPreset>>,
+    preset: P,
+    apply: Rc<dyn Fn(P)>,
+    active: Memo<Option<P>>,
 ) -> rinch::core::dom::NodeHandle {
     const BASE: &str = "flex:1;padding:4px 8px;font-size:11px;border-radius:3px;\
                         cursor:pointer;border:1px solid #333;";
