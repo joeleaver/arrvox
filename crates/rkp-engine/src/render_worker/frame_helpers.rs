@@ -193,7 +193,7 @@ pub(super) fn prepare_shadow_maps(
         frame.shadow_csm_threshold_falloff,
     );
     use rkp_render::shadow_map_pass::{
-        compute_csm_cascades, CsmInputs, CSM_CASCADE_COUNT, SHADOW_MAP_DEFAULT_SIZE,
+        compute_csm_cascades, CsmInputs, CSM_CASCADE_COUNT,
     };
     // Pick the first directional caster — `position[3] == 0` flags
     // a directional light in the GpuLight wire format, and
@@ -236,6 +236,11 @@ pub(super) fn prepare_shadow_maps(
         .and_then(|s| s.parse::<f32>().ok())
         .unwrap_or(frame.shadow_csm_sharp_distance)
         .clamp(0.0, 100.0);
+    let map_size = std::env::var("RKP_CSM_MAP_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(frame.shadow_csm_map_size)
+        .clamp(256, 4096);
 
     // Optional one-time fit log — extends the existing
     // RKP_SHADOW_FIT_LOG with the scene-AABB context.
@@ -258,6 +263,12 @@ pub(super) fn prepare_shadow_maps(
             continue;
         };
 
+        // Resize the per-viewport shadow_buffer + depth texture +
+        // shade bg if the user picked a new Shadow Quality tier.
+        // No-op if already at `map_size`. Must run before the
+        // bind-group refresh inside dispatch_mesh_shadow.
+        vr.set_shadow_map_size(&state.device, map_size);
+
         // Per-VR cascade fit: each viewport's camera frustum drives
         // its own CSM. The light direction + scene AABB are scene-
         // wide.
@@ -279,7 +290,7 @@ pub(super) fn prepare_shadow_maps(
             camera_position,
             camera_forward,
             light_dir,
-            shadow_map_size: SHADOW_MAP_DEFAULT_SIZE,
+            shadow_map_size: map_size,
             depth_bias,
             csm_near,
             csm_max_distance,
@@ -297,8 +308,7 @@ pub(super) fn prepare_shadow_maps(
                 let world_pos = p_pos.truncate() / p_pos.w;
                 let world_neg = p_neg.truncate() / p_neg.w;
                 let half_width = (world_pos - world_neg).length() * 0.5;
-                let texel_world = (2.0 * half_width)
-                    / SHADOW_MAP_DEFAULT_SIZE as f32;
+                let texel_world = (2.0 * half_width) / map_size as f32;
                 eprintln!(
                     "[csm]   cascade {i}: far_view_z = {:.2} m, \
                      half_width = {:.3} m → ~{:.2} mm/texel",

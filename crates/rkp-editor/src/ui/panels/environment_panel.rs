@@ -63,6 +63,7 @@ pub fn EnvironmentPanel() -> NodeHandle {
     let shadow_csm_depth_bias = Memo::new(move || store.environment.get().shadow_csm_depth_bias);
     let shadow_csm_threshold_falloff = Memo::new(move || store.environment.get().shadow_csm_threshold_falloff);
     let shadow_csm_sharp_distance = Memo::new(move || store.environment.get().shadow_csm_sharp_distance);
+    let shadow_csm_map_size = Memo::new(move || store.environment.get().shadow_csm_map_size as f32);
     let ao_radius = Memo::new(move || store.environment.get().ao_radius);
     let ao_steps = Memo::new(move || store.environment.get().ao_steps as f32);
 
@@ -105,6 +106,7 @@ pub fn EnvironmentPanel() -> NodeHandle {
     let sky_collapsed = Signal::new(false);
     let light_collapsed = Signal::new(false);
     let shadow_collapsed = Signal::new(false);
+    let shadow_advanced_collapsed = Signal::new(true);
     let tone_collapsed = Signal::new(false);
     let bloom_collapsed = Signal::new(false);
     let god_ray_collapsed = Signal::new(false);
@@ -156,13 +158,14 @@ pub fn EnvironmentPanel() -> NodeHandle {
         })
     };
 
-    // Shadow Quality preset — bundles the per-cascade falloff knob
-    // (and λ, pinned at 0.95). Sets `shadow_csm_threshold_falloff`
-    // and `shadow_csm_lambda` on apply; the active row is derived
-    // from those two reading them back through env Memos.
+    // Shadow Quality preset — bundles per-cascade falloff +
+    // shadow-map texel resolution (Low=512²..Ultra=4096²) so the
+    // user-visible quality vs perf knob is one click. Sets
+    // `shadow_csm_threshold_falloff`, `shadow_csm_lambda`, and
+    // `shadow_csm_map_size`; active row is derived from those.
     let shadow_apply_preset: Rc<dyn Fn(ShadowQualityPreset)> = {
         Rc::new(move |preset: ShadowQualityPreset| {
-            let (falloff, lambda) = shadow_quality_values(preset);
+            let (falloff, lambda, map_size) = shadow_quality_values(preset);
             let tx = cmd_tx.get();
             let send = |field: &str, v: String| {
                 let _ = tx.send(rkp_engine::EngineCommand::UpdateEnvironment {
@@ -172,18 +175,21 @@ pub fn EnvironmentPanel() -> NodeHandle {
             };
             send("shadow_csm_threshold_falloff", falloff.to_string());
             send("shadow_csm_lambda", lambda.to_string());
+            send("shadow_csm_map_size", (map_size as f32).to_string());
         })
     };
     let shadow_active_preset = Memo::new(move || -> Option<ShadowQualityPreset> {
         let f = shadow_csm_threshold_falloff.get();
         let l = shadow_csm_lambda.get();
+        let m = shadow_csm_map_size.get() as u32;
         for p in [
             ShadowQualityPreset::Low,
             ShadowQualityPreset::Medium,
             ShadowQualityPreset::High,
+            ShadowQualityPreset::Ultra,
         ] {
-            let (pf, pl) = shadow_quality_values(p);
-            if (f - pf).abs() < 0.01 && (l - pl).abs() < 0.001 {
+            let (pf, pl, pm) = shadow_quality_values(p);
+            if (f - pf).abs() < 0.01 && (l - pl).abs() < 0.001 && m == pm {
                 return Some(p);
             }
         }
@@ -293,25 +299,13 @@ pub fn EnvironmentPanel() -> NodeHandle {
             if !shadow_collapsed.get() {
                 div {
                     style: "padding:6px 12px;display:flex;flex-direction:column;gap:4px;",
-                    {prop_slider_memo(__scope, "Shadow Steps", shadow_steps, 4.0, 64.0, 4.0, env_f32("shadow_steps"))}
-                    // Sharp Distance: how far the highest-detail shadow
-                    // cascade extends. Cascade 0 covers `[near, sharp]`,
-                    // remaining cascades distribute over `[sharp, max]`.
-                    // Default 2 m is fine for prop-scale assets; raise
-                    // for terrain / outdoor vistas where you want
-                    // pixel-perfect shadows further out.
-                    {prop_slider_memo(__scope, "Sharp Distance (m)", shadow_csm_sharp_distance, 0.5, 50.0, 0.5, env_f32("shadow_csm_sharp_distance"))}
-                    // Max Distance: the far cap. Anything beyond falls
-                    // back to fully-lit. Lower = sharper everywhere
-                    // (cascades pack tighter); higher = shadows reach
-                    // further but each cascade covers more area.
-                    {prop_slider_memo(__scope, "Max Distance (m)", shadow_csm_max_distance, 10.0, 500.0, 5.0, env_f32("shadow_csm_max_distance"))}
-                    // Quality preset — bundles the per-cascade detail
-                    // falloff. Low = far cascades drop to coarse
-                    // geometry quickly (fastest); High = far cascades
-                    // stay close to cascade-0 quality (most expensive).
+                    // Top-level shadow controls: just the user-intent
+                    // knobs (Quality preset + Max Distance). Everything
+                    // else (Sharp Distance, raw falloff/λ/map size,
+                    // depth bias, shadow steps) lives in the
+                    // Advanced expander below.
                     div {
-                        style: "font-size:11px;color:#888;margin-top:8px;",
+                        style: "font-size:11px;color:#888;margin-top:4px;",
                         {"Shadow Quality"}
                     }
                     div {
@@ -319,10 +313,32 @@ pub fn EnvironmentPanel() -> NodeHandle {
                         {preset_button(__scope, "Low", ShadowQualityPreset::Low, shadow_apply_preset.clone(), shadow_active_preset)}
                         {preset_button(__scope, "Medium", ShadowQualityPreset::Medium, shadow_apply_preset.clone(), shadow_active_preset)}
                         {preset_button(__scope, "High", ShadowQualityPreset::High, shadow_apply_preset.clone(), shadow_active_preset)}
+                        {preset_button(__scope, "Ultra", ShadowQualityPreset::Ultra, shadow_apply_preset.clone(), shadow_active_preset)}
                     }
-                    {prop_slider_memo(__scope, "Shadow Depth Bias", shadow_csm_depth_bias, 0.0, 0.01, 0.0001, env_f32("shadow_csm_depth_bias"))}
+                    {prop_slider_memo(__scope, "Max Distance (m)", shadow_csm_max_distance, 10.0, 500.0, 5.0, env_f32("shadow_csm_max_distance"))}
                     {prop_slider_memo(__scope, "AO Radius", ao_radius, 0.01, 1.0, 0.01, env_f32("ao_radius"))}
                     {prop_slider_memo(__scope, "AO Steps", ao_steps, 1.0, 16.0, 1.0, env_f32("ao_steps"))}
+
+                    // Advanced expander — power-user knobs that the
+                    // presets normally drive. Useful for scene-specific
+                    // tuning or for diagnosing shadow artefacts.
+                    {prop_section_header(__scope, "Advanced", shadow_advanced_collapsed, None)}
+                    if !shadow_advanced_collapsed.get() {
+                        // Sharp Distance: how far cascade 0 (the
+                        // highest-detail tier) extends. Higher = top
+                        // tier covers more of the scene at the cost
+                        // of per-texel sharpness within it (cascade 0
+                        // has a fixed map size, so stretching it
+                        // means each texel covers more world area).
+                        // Raise Shadow Quality to compensate by
+                        // boosting the map size.
+                        {prop_slider_memo(__scope, "Sharp Distance (m)", shadow_csm_sharp_distance, 0.5, 50.0, 0.5, env_f32("shadow_csm_sharp_distance"))}
+                        {prop_slider_memo(__scope, "Cascade LOD Falloff", shadow_csm_threshold_falloff, 1.0, 6.0, 0.1, env_f32("shadow_csm_threshold_falloff"))}
+                        {prop_slider_memo(__scope, "Cascade Split λ", shadow_csm_lambda, 0.5, 1.0, 0.01, env_f32("shadow_csm_lambda"))}
+                        {prop_slider_memo(__scope, "Shadow Map Size", shadow_csm_map_size, 256.0, 4096.0, 256.0, env_f32("shadow_csm_map_size"))}
+                        {prop_slider_memo(__scope, "Shadow Depth Bias", shadow_csm_depth_bias, 0.0, 0.01, 0.0001, env_f32("shadow_csm_depth_bias"))}
+                        {prop_slider_memo(__scope, "Shadow Steps (march)", shadow_steps, 4.0, 64.0, 4.0, env_f32("shadow_steps"))}
+                    }
                 }
             }
 

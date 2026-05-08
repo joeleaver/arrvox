@@ -72,6 +72,13 @@ pub struct EnvironmentSettings {
     /// quality at modest extra cost. Driven by the Shadow Quality
     /// preset row in the env panel; not exposed as a raw slider.
     pub shadow_csm_threshold_falloff: f32,
+    /// Shadow-map side length in texels. Driven by the Shadow
+    /// Quality preset (Low=512, Medium=1024, High=2048, Ultra=4096).
+    /// Per-cascade buffers (depth texture + shadow_buffer slice)
+    /// scale as `map_size² × 4 B × CSM_CASCADE_COUNT` per viewport
+    /// → 16 MB at 1024², 256 MB at 4096². Recreates the relevant
+    /// GPU resources on change.
+    pub shadow_csm_map_size: u32,
     /// Distance (m) the highest-detail shadow cascade extends to.
     /// Bypasses the PSSM math for cascade 0's split: cascade 0
     /// covers `[shadow_csm_near, shadow_csm_sharp_distance]` and
@@ -176,6 +183,7 @@ impl Default for EnvironmentSettings {
             shadow_csm_lambda: 0.95,
             shadow_csm_depth_bias: 0.001,
             shadow_csm_threshold_falloff: 2.0,
+            shadow_csm_map_size: 1024,
             shadow_csm_sharp_distance: 2.0,
             ao_radius: 0.1,
             ao_steps: 5,
@@ -242,32 +250,45 @@ pub fn cloud_quality_values(preset: CloudQualityPreset) -> (u32, u32, u32, u32, 
     }
 }
 
-/// Named quality tiers for the CSM shadow LOD select. Bundles the
-/// per-cascade pixel-error falloff and the cascade-split λ into a
-/// single user-facing knob. Picked by the env panel preset row.
+/// Named quality tiers for the CSM shadow chain. Bundles the
+/// per-cascade pixel-error falloff, the cascade-split λ, AND the
+/// shadow-map texture size — so a single user-facing knob trades
+/// quality (texel sharpness + geometry detail) for performance and
+/// VRAM. Picked by the env panel preset row.
+///
+/// Tier defaults match common engine conventions (Unity / Unreal /
+/// Frostbite all expose 3-5 tiers driven from a single Quality
+/// dropdown). Sharp Distance, Max Distance, and Depth Bias remain
+/// independently tunable for scene-design needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShadowQualityPreset {
     Low,
     Medium,
     High,
+    Ultra,
 }
 
-/// (threshold_falloff, lambda) for a `ShadowQualityPreset`.
+/// (threshold_falloff, lambda, map_size) for a `ShadowQualityPreset`.
 ///
-/// `threshold_falloff` controls per-cascade geometry detail —
-/// `2 * falloff^cascade` px is the admit threshold for cascade N.
-/// Higher = coarser far cascades = cheaper.
-///
-/// `lambda` is the PSSM hybrid factor (0 = uniform, 1 = log).
-/// Pinned at 0.95 across all presets — that's the value
-/// `project_csm_shipped` settled on for sharp near-camera detail.
-/// The Sharp Distance slider is what users tune for cascade 0
-/// extent now; lambda is just a fixed implementation detail.
-pub fn shadow_quality_values(preset: ShadowQualityPreset) -> (f32, f32) {
+/// - `threshold_falloff` controls per-cascade geometry detail.
+///   `2 * falloff^cascade` px is the admit threshold for cascade N.
+///   Higher = coarser far cascades = cheaper.
+/// - `lambda` is the PSSM hybrid factor (0 = uniform, 1 = log).
+///   Pinned at 0.95 across all presets — that's the value
+///   `project_csm_shipped` settled on for sharp near-camera detail.
+///   The Sharp Distance slider is the user-facing cascade-0 control;
+///   λ is an implementation detail.
+/// - `map_size` is the per-cascade shadow-map side length in texels.
+///   The on-GPU `shadow_buffer` consumes
+///   `map_size² × CSM_CASCADE_COUNT × 4 B` (16 MB at 1024², 256 MB
+///   at 4096²) plus an equal-size depth texture per viewport, so
+///   Ultra is a meaningful VRAM cost.
+pub fn shadow_quality_values(preset: ShadowQualityPreset) -> (f32, f32, u32) {
     match preset {
-        ShadowQualityPreset::Low    => (4.0, 0.95),
-        ShadowQualityPreset::Medium => (2.0, 0.95),
-        ShadowQualityPreset::High   => (1.5, 0.95),
+        ShadowQualityPreset::Low    => (4.0, 0.95, 512),
+        ShadowQualityPreset::Medium => (2.0, 0.95, 1024),
+        ShadowQualityPreset::High   => (1.5, 0.95, 2048),
+        ShadowQualityPreset::Ultra  => (1.0, 0.95, 4096),
     }
 }
 

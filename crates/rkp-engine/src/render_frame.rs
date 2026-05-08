@@ -241,6 +241,9 @@ pub struct RenderFrame {
     /// Distance (m) the highest-detail cascade extends to. See
     /// `EnvironmentSettings::shadow_csm_sharp_distance`.
     pub shadow_csm_sharp_distance: f32,
+    /// Shadow-map side length in texels. See
+    /// `EnvironmentSettings::shadow_csm_map_size`.
+    pub shadow_csm_map_size: u32,
 }
 
 /// Per-viewport render data — enough for the render thread to upload

@@ -458,6 +458,15 @@ impl EngineState {
                             env.shadow_csm_sharp_distance = v.clamp(0.5, 50.0);
                         }
                     }
+                    "shadow_csm_map_size" => {
+                        if let Ok(v) = value.parse::<u32>() {
+                            // Clamp to powers of two we actually
+                            // expose: 256..=4096. Other values
+                            // technically work but the preset row
+                            // doesn't recognize them.
+                            env.shadow_csm_map_size = v.clamp(256, 4096);
+                        }
+                    }
                     "ao_radius" => {
                         if let Ok(v) = value.parse::<f32>() { env.ao_radius = v; }
                     }

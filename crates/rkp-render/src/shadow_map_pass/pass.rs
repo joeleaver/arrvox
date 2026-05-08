@@ -45,6 +45,7 @@ pub struct ShadowMapPass {
 
     // ── Pipelines + bind groups ────────────────────────────────
     clear_pipeline: wgpu::ComputePipeline,
+    clear_g0_layout: wgpu::BindGroupLayout,
     clear_g0_bg: wgpu::BindGroup,
 
     setup_pipeline: wgpu::ComputePipeline,
@@ -278,6 +279,7 @@ impl ShadowMapPass {
             scatter_instances_buffer,
             scatter_capacity,
             clear_pipeline,
+            clear_g0_layout,
             clear_g0_bg,
             setup_pipeline,
             setup_g0_layout,
@@ -311,6 +313,46 @@ impl ShadowMapPass {
     pub fn set_shader_params(&mut self, device: &wgpu::Device, shader_params: &wgpu::Buffer) {
         self.shader_params_buffer = Some(shader_params.clone());
         self.try_rebuild_scatter_pass_bg(device);
+    }
+
+    /// Resize the per-cascade shadow_buffer to a new map side length.
+    /// Returns `true` when the buffer was actually recreated (caller
+    /// can use this to invalidate downstream bind groups). No-op if
+    /// `new_size == self.size`. The owned `clear_g0_bg` references
+    /// `shadow_buffer` directly so it's rebuilt here; `scatter_pass_bg`
+    /// (lazily built, also references `shadow_buffer`) is invalidated
+    /// and will be rebuilt on the next `try_rebuild_scatter_pass_bg`.
+    /// External bind groups (`mesh_shadow_blit_g0_bgs`, the shade
+    /// pass's shadow+ssao bg) are owned by the viewport renderer and
+    /// must be invalidated by it on the same trigger.
+    pub fn resize_shadow_buffer(&mut self, device: &wgpu::Device, new_size: u32) -> bool {
+        if new_size == self.size {
+            return false;
+        }
+        let shadow_buffer_bytes =
+            (new_size as u64) * (new_size as u64) * (CSM_CASCADE_COUNT as u64) * 4;
+        self.shadow_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shadow_map shadow_buffer (resized)"),
+            size: shadow_buffer_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Rebuild owned bind groups that referenced the old buffer.
+        self.clear_g0_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow_clear g0 bg (resized)"),
+            layout: &self.clear_g0_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.shadow_buffer.as_entire_binding(),
+            }],
+        });
+        // scatter_pass_bg is rebuilt next frame from
+        // try_rebuild_scatter_pass_bg once materials + shader_params
+        // are present (same Option<None> pattern as set_materials).
+        self.scatter_pass_bg = None;
+        self.try_rebuild_scatter_pass_bg(device);
+        self.size = new_size;
+        true
     }
 
     /// Phase 4 — write the lite march_params uniform. Engine calls

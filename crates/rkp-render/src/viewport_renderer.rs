@@ -691,6 +691,81 @@ impl ViewportRenderer {
         self.splat_g0_lights_materials_epoch = lm_now;
     }
 
+    /// Resize every shadow-map-sized resource on this viewport
+    /// (depth texture + per-layer views, `shadow_map.shadow_buffer`,
+    /// the shade pass's shadow+ssao bind group) to a new side
+    /// length. No-op if the size already matches. Engine calls this
+    /// once per frame from `prepare_shadow_maps` based on
+    /// `EnvironmentSettings::shadow_csm_map_size`.
+    pub fn set_shadow_map_size(&mut self, device: &wgpu::Device, new_size: u32) {
+        let buffer_changed = self.shadow_map.resize_shadow_buffer(device, new_size);
+        let depth_changed = self.resize_shadow_map_depth(device, new_size);
+        // Rebind the shade pass's shadow+ssao bind group when either
+        // side resized — the shade pass holds a reference to the old
+        // shadow_buffer (resize_shadow_buffer recreated it) and the
+        // shadow_view from the trace pass (unchanged here, but cheap
+        // to rebind).
+        if buffer_changed || depth_changed.is_some() {
+            self.shade.set_shadow_and_ssao(
+                device,
+                &self.shadow_trace.output_view,
+                &self.ssao.output_view,
+                &self.shadow_map.shadow_buffer,
+                &self.shadow_map.uniform_buffer,
+            );
+        }
+    }
+
+    /// Resize the shadow map's depth texture + per-layer views to a
+    /// new side length. Returns the new size when the resources were
+    /// actually recreated, `None` when no change. Caller (engine) is
+    /// responsible for invalidating downstream bind groups via
+    /// `refresh_mesh_shadow_bindings` (blit) and rebinding the shade
+    /// pass's shadow+ssao bg (which referenced the old buffer).
+    ///
+    /// Wrapper `set_shadow_map_size` does this together with the
+    /// `shadow_map.shadow_buffer` resize and the shade rebind.
+    pub fn resize_shadow_map_depth(
+        &mut self,
+        device: &wgpu::Device,
+        new_size: u32,
+    ) -> Option<u32> {
+        let cur = self.mesh_shadow_depth_texture.width();
+        if cur == new_size {
+            return None;
+        }
+        self.mesh_shadow_depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rkp_mesh_shadow_depth (resized)"),
+            size: wgpu::Extent3d {
+                width: new_size,
+                height: new_size,
+                depth_or_array_layers: CSM_CASCADE_COUNT,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.mesh_shadow_depth_views = (0..CSM_CASCADE_COUNT)
+            .map(|i| self.mesh_shadow_depth_texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some(&format!("rkp_mesh_shadow_depth_csm{i} (resized)")),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: i,
+                array_layer_count: Some(1),
+                aspect: wgpu::TextureAspect::DepthOnly,
+                ..Default::default()
+            }))
+            .collect();
+        // Force the blit g0 bind groups to rebuild against the new
+        // depth views + (presumably also resized) shadow_buffer.
+        for slot in &mut self.mesh_shadow_blit_g0_bgs {
+            *slot = None;
+        }
+        Some(new_size)
+    }
+
     /// Rebuild the mesh-shadow render + blit `g0` bind groups when
     /// stale. The blit g0 references stable-lifetime buffers
     /// (`shadow_map.shadow_buffer`, `mesh_shadow_depth_view`) so it's
