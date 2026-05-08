@@ -110,6 +110,9 @@ pub(super) fn encode_viewports(
             pre.shadow_map_enabled && in_situ && !raymarch && !splat;
         shade_params.shadow_map_enabled = u32::from(vr_shadow_map_live);
         shade_params.shadow_disabled = u32::from(splat);
+        // PCF tap count comes from the Shadow Quality preset; the
+        // shade shader clamps 1..16 internally.
+        shade_params.pcf_taps = frame.shadow_csm_pcf_taps;
         state
             .renderer
             .update_shade_params(&state.queue, &shade_params);

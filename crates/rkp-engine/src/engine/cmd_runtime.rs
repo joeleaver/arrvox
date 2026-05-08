@@ -467,6 +467,11 @@ impl EngineState {
                             env.shadow_csm_map_size = v.clamp(256, 4096);
                         }
                     }
+                    "shadow_csm_pcf_taps" => {
+                        if let Ok(v) = value.parse::<u32>() {
+                            env.shadow_csm_pcf_taps = v.clamp(1, 16);
+                        }
+                    }
                     "ao_radius" => {
                         if let Ok(v) = value.parse::<f32>() { env.ao_radius = v; }
                     }

@@ -863,6 +863,7 @@ impl EngineState {
             shadow_csm_threshold_falloff: self.environment.shadow_csm_threshold_falloff,
             shadow_csm_sharp_distance: self.environment.shadow_csm_sharp_distance,
             shadow_csm_map_size: self.environment.shadow_csm_map_size,
+            shadow_csm_pcf_taps: self.environment.shadow_csm_pcf_taps,
         };
 
         let t_encode = frame_start.elapsed();

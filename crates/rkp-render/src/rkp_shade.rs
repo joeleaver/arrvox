@@ -95,7 +95,12 @@ pub struct ShadeParams {
     /// the (uninitialized / stale) shadow_tex would clamp lighting
     /// to near-zero and the whole frame would render dark.
     pub shadow_disabled: u32,
-    pub _pad4: u32,
+    /// Per-fragment shadow-map tap count used by `sample_shadow_map`.
+    /// 1 = single-tap (hard shadow, current cheapest); 4/9/16 =
+    /// rotated PCF over a per-cascade-texel disc (soft shadows).
+    /// Driven by the Shadow Quality preset; clamped to {1,4,9,16}
+    /// on the shader side. Zero is treated as 1 for safety.
+    pub pcf_taps: u32,
     pub _pad5: u32,
 }
 
@@ -122,7 +127,7 @@ impl Default for ShadeParams {
             brush_color: [1.0, 0.85, 0.2, 1.0],
             shadow_map_enabled: 0,
             shadow_disabled: 0,
-            _pad4: 0,
+            pcf_taps: 1,
             _pad5: 0,
         }
     }

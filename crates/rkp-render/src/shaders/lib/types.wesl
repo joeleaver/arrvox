@@ -328,7 +328,10 @@ struct ShadeParams {
     // gather; without it `shadow_tex`'s stale data clamps lighting
     // to ~zero and the whole frame goes dark.
     shadow_disabled: u32,
-    _pad4: u32,
+    /// Per-fragment PCF tap count for `sample_shadow_map`. 1 = hard,
+    /// 4/9/16 = soft (rotated disc PCF). Driven by the Shadow
+    /// Quality preset on the engine side.
+    pcf_taps: u32,
     _pad5: u32,
 }
 

@@ -244,6 +244,9 @@ pub struct RenderFrame {
     /// Shadow-map side length in texels. See
     /// `EnvironmentSettings::shadow_csm_map_size`.
     pub shadow_csm_map_size: u32,
+    /// Per-fragment PCF tap count. See
+    /// `EnvironmentSettings::shadow_csm_pcf_taps`.
+    pub shadow_csm_pcf_taps: u32,
 }
 
 /// Per-viewport render data — enough for the render thread to upload

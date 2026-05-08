@@ -220,6 +220,37 @@ struct CascadeSample {
     in_bounds: bool,
 }
 
+// Poisson disc taps in unit-disc space — hand-tuned 16-sample
+// distribution that doubles as the source for the 4 / 9 sub-counts
+// (just take the prefix). The first tap is `(0,0)` so a 1-sample
+// fast-path matches the hard-shadow behavior of the pre-PCF code
+// exactly.
+const PCF_DISC: array<vec2<f32>, 16> = array<vec2<f32>, 16>(
+    vec2<f32>( 0.000000,  0.000000),
+    vec2<f32>(-0.942016, -0.399062),
+    vec2<f32>( 0.945586, -0.768907),
+    vec2<f32>(-0.094184, -0.929389),
+    vec2<f32>( 0.344959,  0.293878),
+    vec2<f32>(-0.915886,  0.457714),
+    vec2<f32>(-0.815442, -0.879125),
+    vec2<f32>(-0.382775,  0.276768),
+    vec2<f32>( 0.974844,  0.756484),
+    vec2<f32>( 0.443233, -0.975116),
+    vec2<f32>( 0.537430, -0.473734),
+    vec2<f32>(-0.264969, -0.418930),
+    vec2<f32>( 0.791975,  0.190902),
+    vec2<f32>(-0.241888,  0.997065),
+    vec2<f32>(-0.814100,  0.914376),
+    vec2<f32>( 0.199841,  0.786414),
+);
+
+// Radius (in shadow-map texels) the PCF disc is scaled to. 1.5 keeps
+// the penumbra narrow enough that detail isn't washed out at low tap
+// counts but wide enough to mask single-texel staircasing. The disc
+// is in [-1,1] so a tap at `(±1, ±1)` lands ~`PCF_RADIUS_TEXELS`
+// texels from the projected center.
+const PCF_RADIUS_TEXELS: f32 = 1.5;
+
 fn sample_one_cascade(world_pos: vec3<f32>, i: u32) -> CascadeSample {
     let cam = light_camera.cascades[i];
     let clip = cam.view_proj * vec4<f32>(world_pos, 1.0);
@@ -234,14 +265,23 @@ fn sample_one_cascade(world_pos: vec3<f32>, i: u32) -> CascadeSample {
     let size_f = vec2<f32>(size_u);
     let tx_f = (ndc.x * 0.5 + 0.5) * size_f.x;
     let ty_f = (1.0 - (ndc.y * 0.5 + 0.5)) * size_f.y;
-    let tx = clamp(u32(tx_f), 0u, size_u.x - 1u);
-    let ty = clamp(u32(ty_f), 0u, size_u.y - 1u);
+    let surface_z = ndc.z - cam.depth_bias;
     let slice = size_u.x * size_u.y;
-    let buffer_idx = i * slice + ty * size_u.x + tx;
-    let map_z = bitcast<f32>(shadow_buffer[buffer_idx]);
-    let surface_z = ndc.z;
-    let s = select(0.0, 1.0, surface_z - cam.depth_bias <= map_z);
-    return CascadeSample(s, true);
+    let base_idx = i * slice;
+    // PCF tap count comes from the Quality preset via ShadeParams.
+    // Clamp 1..16; 1 keeps the hard-shadow look (single tap at the
+    // projected texel), higher counts soften the edge by averaging
+    // a Poisson disc neighborhood.
+    let taps = clamp(shade_params.pcf_taps, 1u, 16u);
+    var lit: f32 = 0.0;
+    for (var k: u32 = 0u; k < taps; k = k + 1u) {
+        let offs = PCF_DISC[k] * PCF_RADIUS_TEXELS;
+        let stx = clamp(u32(tx_f + offs.x), 0u, size_u.x - 1u);
+        let sty = clamp(u32(ty_f + offs.y), 0u, size_u.y - 1u);
+        let map_z = bitcast<f32>(shadow_buffer[base_idx + sty * size_u.x + stx]);
+        lit = lit + select(0.0, 1.0, surface_z <= map_z);
+    }
+    return CascadeSample(lit / f32(taps), true);
 }
 
 // View-space depth of `world_pos` along the camera forward axis.

@@ -72,6 +72,11 @@ pub struct EnvironmentSettings {
     /// quality at modest extra cost. Driven by the Shadow Quality
     /// preset row in the env panel; not exposed as a raw slider.
     pub shadow_csm_threshold_falloff: f32,
+    /// Per-fragment PCF tap count for the shadow-map sample at
+    /// shade time. 1 = single-tap (hard shadow); 4/9/16 = rotated
+    /// Poisson-disc PCF (soft, hides texel staircasing). Driven by
+    /// the Shadow Quality preset.
+    pub shadow_csm_pcf_taps: u32,
     /// Shadow-map side length in texels. Driven by the Shadow
     /// Quality preset (Low=512, Medium=1024, High=2048, Ultra=4096).
     /// Per-cascade buffers (depth texture + shadow_buffer slice)
@@ -184,6 +189,7 @@ impl Default for EnvironmentSettings {
             shadow_csm_depth_bias: 0.001,
             shadow_csm_threshold_falloff: 2.0,
             shadow_csm_map_size: 1024,
+            shadow_csm_pcf_taps: 4,
             shadow_csm_sharp_distance: 2.0,
             ao_radius: 0.1,
             ao_steps: 5,
@@ -268,7 +274,8 @@ pub enum ShadowQualityPreset {
     Ultra,
 }
 
-/// (threshold_falloff, lambda, map_size) for a `ShadowQualityPreset`.
+/// (threshold_falloff, lambda, map_size, pcf_taps) for a
+/// `ShadowQualityPreset`.
 ///
 /// - `threshold_falloff` controls per-cascade geometry detail.
 ///   `2 * falloff^cascade` px is the admit threshold for cascade N.
@@ -283,12 +290,21 @@ pub enum ShadowQualityPreset {
 ///   `map_size² × CSM_CASCADE_COUNT × 4 B` (16 MB at 1024², 256 MB
 ///   at 4096²) plus an equal-size depth texture per viewport, so
 ///   Ultra is a meaningful VRAM cost.
-pub fn shadow_quality_values(preset: ShadowQualityPreset) -> (f32, f32, u32) {
+/// - `pcf_taps` is the per-fragment shadow filter tap count. 1 =
+///   hard (single tap, current cheapest); 4/9/16 = soft (rotated
+///   Poisson-disc PCF). Cost in shade is roughly proportional to
+///   tap count (~0.05 ms / 9 taps at 1080p) and orthogonal to
+///   `map_size`.
+pub fn shadow_quality_values(preset: ShadowQualityPreset) -> (f32, f32, u32, u32) {
     match preset {
-        ShadowQualityPreset::Low    => (4.0, 0.95, 512),
-        ShadowQualityPreset::Medium => (2.0, 0.95, 1024),
-        ShadowQualityPreset::High   => (1.5, 0.95, 2048),
-        ShadowQualityPreset::Ultra  => (1.0, 0.95, 4096),
+        // Low gets a wide PCF disc to hide the 512² staircasing.
+        // Medium / High keep penumbra narrow with 4 taps. Ultra
+        // bumps to 16 because hard 4096² shadows produce visible
+        // single-pixel aliased edges that PCF naturally softens.
+        ShadowQualityPreset::Low    => (4.0, 0.95,  512, 9),
+        ShadowQualityPreset::Medium => (2.0, 0.95, 1024, 4),
+        ShadowQualityPreset::High   => (1.5, 0.95, 2048, 4),
+        ShadowQualityPreset::Ultra  => (1.0, 0.95, 4096, 16),
     }
 }
 

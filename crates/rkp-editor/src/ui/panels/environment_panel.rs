@@ -64,6 +64,7 @@ pub fn EnvironmentPanel() -> NodeHandle {
     let shadow_csm_threshold_falloff = Memo::new(move || store.environment.get().shadow_csm_threshold_falloff);
     let shadow_csm_sharp_distance = Memo::new(move || store.environment.get().shadow_csm_sharp_distance);
     let shadow_csm_map_size = Memo::new(move || store.environment.get().shadow_csm_map_size as f32);
+    let shadow_csm_pcf_taps = Memo::new(move || store.environment.get().shadow_csm_pcf_taps as f32);
     let ao_radius = Memo::new(move || store.environment.get().ao_radius);
     let ao_steps = Memo::new(move || store.environment.get().ao_steps as f32);
 
@@ -165,7 +166,7 @@ pub fn EnvironmentPanel() -> NodeHandle {
     // `shadow_csm_map_size`; active row is derived from those.
     let shadow_apply_preset: Rc<dyn Fn(ShadowQualityPreset)> = {
         Rc::new(move |preset: ShadowQualityPreset| {
-            let (falloff, lambda, map_size) = shadow_quality_values(preset);
+            let (falloff, lambda, map_size, pcf_taps) = shadow_quality_values(preset);
             let tx = cmd_tx.get();
             let send = |field: &str, v: String| {
                 let _ = tx.send(rkp_engine::EngineCommand::UpdateEnvironment {
@@ -176,20 +177,22 @@ pub fn EnvironmentPanel() -> NodeHandle {
             send("shadow_csm_threshold_falloff", falloff.to_string());
             send("shadow_csm_lambda", lambda.to_string());
             send("shadow_csm_map_size", (map_size as f32).to_string());
+            send("shadow_csm_pcf_taps", (pcf_taps as f32).to_string());
         })
     };
     let shadow_active_preset = Memo::new(move || -> Option<ShadowQualityPreset> {
         let f = shadow_csm_threshold_falloff.get();
         let l = shadow_csm_lambda.get();
         let m = shadow_csm_map_size.get() as u32;
+        let p_taps = shadow_csm_pcf_taps.get() as u32;
         for p in [
             ShadowQualityPreset::Low,
             ShadowQualityPreset::Medium,
             ShadowQualityPreset::High,
             ShadowQualityPreset::Ultra,
         ] {
-            let (pf, pl, pm) = shadow_quality_values(p);
-            if (f - pf).abs() < 0.01 && (l - pl).abs() < 0.001 && m == pm {
+            let (pf, pl, pm, pp) = shadow_quality_values(p);
+            if (f - pf).abs() < 0.01 && (l - pl).abs() < 0.001 && m == pm && p_taps == pp {
                 return Some(p);
             }
         }
@@ -336,6 +339,7 @@ pub fn EnvironmentPanel() -> NodeHandle {
                         {prop_slider_memo(__scope, "Cascade LOD Falloff", shadow_csm_threshold_falloff, 1.0, 6.0, 0.1, env_f32("shadow_csm_threshold_falloff"))}
                         {prop_slider_memo(__scope, "Cascade Split λ", shadow_csm_lambda, 0.5, 1.0, 0.01, env_f32("shadow_csm_lambda"))}
                         {prop_slider_memo(__scope, "Shadow Map Size", shadow_csm_map_size, 256.0, 4096.0, 256.0, env_f32("shadow_csm_map_size"))}
+                        {prop_slider_memo(__scope, "PCF Taps", shadow_csm_pcf_taps, 1.0, 16.0, 1.0, env_f32("shadow_csm_pcf_taps"))}
                         {prop_slider_memo(__scope, "Shadow Depth Bias", shadow_csm_depth_bias, 0.0, 0.01, 0.0001, env_f32("shadow_csm_depth_bias"))}
                         {prop_slider_memo(__scope, "Shadow Steps (march)", shadow_steps, 4.0, 64.0, 4.0, env_f32("shadow_steps"))}
                     }
