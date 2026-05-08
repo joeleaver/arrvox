@@ -60,6 +60,17 @@ pub struct EnvironmentSettings {
     /// the surface toward the light → less self-shadowing at the cost
     /// of peter-panning. Replaces the previously-hardcoded 0.001.
     pub shadow_csm_depth_bias: f32,
+    /// Per-cascade LOD pixel-threshold falloff. The shadow LOD select
+    /// uses `base * falloff^cascade` as the per-cascade pixel-error
+    /// budget, so higher falloff = coarser geometry on far cascades
+    /// (cheaper, but a quality cliff between cascade 0 and 1). With
+    /// the LOD_LEVELS=8 enablement (`project_lod8_enablement`) this
+    /// knob actually bites — raising from 2 → 4 noticeably drops
+    /// cascade 1 detail. 1.0 = every cascade uses the same threshold;
+    /// 4.0 = aggressive (cascades 1-3 admit ~1% of cascade 0's
+    /// clusters). Default 2.0 keeps cascade 1 close to cascade 0
+    /// quality at modest extra cost.
+    pub shadow_csm_threshold_falloff: f32,
 
     // ── Ambient occlusion ───────────────────────────────────────────
     pub ao_radius: f32,
@@ -151,6 +162,7 @@ impl Default for EnvironmentSettings {
             shadow_csm_max_distance: 100.0,
             shadow_csm_lambda: 0.95,
             shadow_csm_depth_bias: 0.001,
+            shadow_csm_threshold_falloff: 2.0,
             ao_radius: 0.1,
             ao_steps: 5,
             exposure: 0.0000254, // EV100=15 (sunny-16 rule): 1/(1.2 × 2^15)

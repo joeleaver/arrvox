@@ -448,6 +448,11 @@ impl EngineState {
                             env.shadow_csm_depth_bias = v.clamp(0.0, 0.05);
                         }
                     }
+                    "shadow_csm_threshold_falloff" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            env.shadow_csm_threshold_falloff = v.clamp(1.0, 6.0);
+                        }
+                    }
                     "ao_radius" => {
                         if let Ok(v) = value.parse::<f32>() { env.ao_radius = v; }
                     }

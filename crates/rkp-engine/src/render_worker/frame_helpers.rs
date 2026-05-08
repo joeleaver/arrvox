@@ -185,6 +185,13 @@ pub(super) fn prepare_shadow_maps(
     if !mesh_mode {
         return false;
     }
+    // Stash the per-cascade LOD pixel-threshold falloff on the
+    // renderer so the next `dispatch_mesh_shadow` picks it up. The
+    // env-var override (`RKP_CSM_THRESHOLD_FALLOFF`) takes precedence
+    // inside the renderer for one-shot CI / headless tuning.
+    state.renderer.set_shadow_csm_threshold_falloff(
+        frame.shadow_csm_threshold_falloff,
+    );
     use rkp_render::shadow_map_pass::{
         compute_csm_cascades, CsmInputs, CSM_CASCADE_COUNT, SHADOW_MAP_DEFAULT_SIZE,
     };

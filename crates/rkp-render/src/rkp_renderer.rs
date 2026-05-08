@@ -137,6 +137,13 @@ pub struct RkpRenderer {
     /// GPU profiler (wgpu-profiler).
     pub profiler: GpuProfiler,
     timestamp_period: f32,
+    /// Per-cascade shadow LOD pixel-threshold falloff. The shadow
+    /// LOD-select uses `base * shadow_csm_threshold_falloff^cascade`
+    /// as the per-cascade pixel-error budget. Set per frame by the
+    /// engine from `EnvironmentSettings::shadow_csm_threshold_falloff`
+    /// via `set_shadow_csm_threshold_falloff`. Default 2.0; range
+    /// clamped 1.0..6.0.
+    shadow_csm_threshold_falloff: f32,
 }
 
 impl RkpRenderer {
@@ -217,7 +224,18 @@ impl RkpRenderer {
             primary_mode,
             device: device.clone(),
             profiler, timestamp_period,
+            shadow_csm_threshold_falloff: 2.0,
         }
+    }
+
+    /// Set the per-cascade LOD pixel-threshold falloff (1.0..6.0).
+    /// Engine writes this once per frame from
+    /// `frame.shadow_csm_threshold_falloff` so the next
+    /// `dispatch_mesh_shadow` picks it up. Replaces the prior
+    /// `RKP_CSM_THRESHOLD_FALLOFF` env-var path (still honored as a
+    /// CI override, see `dispatch_mesh_shadow`).
+    pub fn set_shadow_csm_threshold_falloff(&mut self, v: f32) {
+        self.shadow_csm_threshold_falloff = v.clamp(1.0, 6.0);
     }
 
     /// Upload (or replace) the splat vertex buffer for a given asset.
@@ -941,16 +959,20 @@ impl RkpRenderer {
         // with `RKP_MESH_SHADOW_LOD_THRESHOLD` (base) and
         // `RKP_CSM_THRESHOLD_FALLOFF` (per-cascade scale).
         const PIXEL_THRESHOLD_SHADOW: f32 = 2.0;
-        const CSM_THRESHOLD_FALLOFF: f32 = 4.0;
         let base_threshold = pixel_threshold_env(
             "RKP_MESH_SHADOW_LOD_THRESHOLD",
             PIXEL_THRESHOLD_SHADOW,
         );
+        // Per-cascade falloff: env var (CI / headless) takes precedence
+        // over the engine-set value so RKP_CSM_THRESHOLD_FALLOFF still
+        // works for one-shot diagnostic runs. UI / scene-stored value
+        // flows in via `set_shadow_csm_threshold_falloff` (env panel
+        // slider, range clamped 1.0..6.0).
         let threshold_falloff = std::env::var("RKP_CSM_THRESHOLD_FALLOFF")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(CSM_THRESHOLD_FALLOFF)
-            .max(1.0);
+            .unwrap_or(self.shadow_csm_threshold_falloff)
+            .clamp(1.0, 6.0);
         let lod_stats_enabled = std::env::var("RKP_MESH_LOD_STATS").is_ok();
         let pipestats_enabled = std::env::var("RKP_MESH_PIPESTATS").is_ok();
         let force_admit = std::env::var("RKP_MESH_DEBUG_FORCE_ADMIT").is_ok();

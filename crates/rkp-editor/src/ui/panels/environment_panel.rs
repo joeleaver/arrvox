@@ -59,6 +59,7 @@ pub fn EnvironmentPanel() -> NodeHandle {
     let shadow_csm_max_distance = Memo::new(move || store.environment.get().shadow_csm_max_distance);
     let shadow_csm_lambda = Memo::new(move || store.environment.get().shadow_csm_lambda);
     let shadow_csm_depth_bias = Memo::new(move || store.environment.get().shadow_csm_depth_bias);
+    let shadow_csm_threshold_falloff = Memo::new(move || store.environment.get().shadow_csm_threshold_falloff);
     let ao_radius = Memo::new(move || store.environment.get().ao_radius);
     let ao_steps = Memo::new(move || store.environment.get().ao_steps as f32);
 
@@ -269,6 +270,14 @@ pub fn EnvironmentPanel() -> NodeHandle {
                     // takes over.
                     {prop_slider_memo(__scope, "Cascade Split λ", shadow_csm_lambda, 0.5, 1.0, 0.01, env_f32("shadow_csm_lambda"))}
                     {prop_slider_memo(__scope, "Shadow Depth Bias", shadow_csm_depth_bias, 0.0, 0.01, 0.0001, env_f32("shadow_csm_depth_bias"))}
+                    // Cascade LOD Falloff: per-cascade pixel-error budget
+                    // multiplier. The shadow LOD select uses
+                    // `2 * falloff^cascade` px as the threshold for each
+                    // cascade. 1.0 = every cascade uses the same threshold
+                    // (most detail, slowest); 4.0 = aggressive (cascade 1
+                    // jumps to noticeably coarser geometry, fastest). 2.0
+                    // default keeps cascade 1 close to cascade 0 quality.
+                    {prop_slider_memo(__scope, "Cascade LOD Falloff", shadow_csm_threshold_falloff, 1.0, 6.0, 0.1, env_f32("shadow_csm_threshold_falloff"))}
                     {prop_slider_memo(__scope, "AO Radius", ao_radius, 0.01, 1.0, 0.01, env_f32("ao_radius"))}
                     {prop_slider_memo(__scope, "AO Steps", ao_steps, 1.0, 16.0, 1.0, env_f32("ao_steps"))}
                 }

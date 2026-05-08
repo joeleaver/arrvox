@@ -235,6 +235,9 @@ pub struct RenderFrame {
     pub shadow_csm_lambda: f32,
     /// Per-cascade additive depth bias used in `LightCameraUniform`.
     pub shadow_csm_depth_bias: f32,
+    /// Per-cascade LOD pixel-threshold falloff. See
+    /// `EnvironmentSettings::shadow_csm_threshold_falloff`.
+    pub shadow_csm_threshold_falloff: f32,
 }
 
 /// Per-viewport render data — enough for the render thread to upload
