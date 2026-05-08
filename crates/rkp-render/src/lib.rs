@@ -47,6 +47,14 @@ pub mod mesh_shadow_map_pass;
 /// rule per cluster and writes a `DrawIndexedIndirectArgs` table that
 /// `multi_draw_indexed_indirect` consumes in `dispatch_mesh`.
 pub mod mesh_lod_select_pass;
+/// Mesh-mode glass pipeline (front + back raster + combine compute).
+/// Produces the same `gbuf_glass` packing as the march, so the
+/// existing `rkp_glass` composite runs unchanged in mesh-mode.
+pub mod mesh_glass_pass;
+/// Mesh-mode glass shadow pipelines — per-cascade front/back depth
+/// captures so the shade pass can apply Beer attenuation on the
+/// existing CSM shadow factor.
+pub mod mesh_glass_shadow_pass;
 /// Splat-rasterizer compute fixup pass — reads the visibility-buffer
 /// triplet (leaf_slot, pick) `splat_pass` writes and fills in the
 /// remaining G-buffer entries (normal / material / glass) via the

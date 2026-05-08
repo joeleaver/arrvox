@@ -22,6 +22,12 @@ use crate::proc_outline::ProcOutlinePass;
 use crate::proc_ghost::ProcGhostPass;
 use crate::rkp_shadow_trace::ShadowTracePass;
 use crate::shadow_map_pass::{ShadowMapPass, CSM_CASCADE_COUNT, SHADOW_MAP_DEFAULT_SIZE};
+use rkp_core::mesh_lod::LOD_LEVELS_MAX;
+
+/// Size in bytes of the LOD admit-stats histogram. 2 × `LOD_LEVELS_MAX`
+/// `u32` slots: per-LOD admitted counts then per-LOD totals. Must
+/// match `array<atomic<u32>, 16> stats` in `mesh_lod_select.wesl`.
+pub const MESH_LOD_STATS_BYTES: u64 = (2 * LOD_LEVELS_MAX as u64) * 4;
 use crate::mesh_shadow_map_pass::{MeshShadowParams, MeshShadowBlitParams};
 use crate::rkp_ssao::RkpSsaoPass;
 use crate::rkp_shade::RkpShadePass;
@@ -147,6 +153,45 @@ pub struct ViewportRenderer {
     pub splat_resolve_g1_bg: Option<wgpu::BindGroup>,
     pub splat_resolve_scene_epoch: u64,
 
+    // ── Mesh-mode glass per-VR textures + bind groups ──────────────
+    /// Front-face glass entry data (Rgba32Uint): R = oct-packed world
+    /// entry normal, G = material_id (low 16 bits), B =
+    /// `bitcast<u32>(entry_dist)`, A = 0. Cleared with B set to
+    /// `bitcast<u32>(GLASS_ENTRY_SENTINEL)` so the combine compute
+    /// can detect "no glass at this pixel".
+    pub glass_entry_packed_texture: wgpu::Texture,
+    pub glass_entry_packed_view: wgpu::TextureView,
+    /// Back-face glass exit distance (R32Float, world-space metres).
+    /// Cleared to 0; combine compute treats `<= entry_dist` as "no
+    /// back-face hit" and falls back to a 1 mm thickness.
+    pub glass_exit_dist_texture: wgpu::Texture,
+    pub glass_exit_dist_view: wgpu::TextureView,
+    /// Depth target for the front raster (Depth32Float, clear 1.0,
+    /// compare Less). Separate from the primary G-buffer depth so
+    /// glass writes don't pollute opaque depth.
+    pub glass_depth_front_texture: wgpu::Texture,
+    pub glass_depth_front_view: wgpu::TextureView,
+    /// Depth target for the back raster (Depth32Float, clear 0.0,
+    /// compare Greater so the *farthest* back-face wins).
+    pub glass_depth_back_texture: wgpu::Texture,
+    pub glass_depth_back_view: wgpu::TextureView,
+    /// Combine-compute bind group. Per-VR; rebuilt on resize.
+    pub mesh_glass_combine_bg: Option<wgpu::BindGroup>,
+    /// Per-VR uniform for `mesh_glass_combine.wesl::CombineParams`.
+    /// Currently carries only `debug_force` (set by
+    /// `RKP_MESH_GLASS_DEBUG_FORCE=1`); the engine writes it once
+    /// per frame in `refresh_mesh_glass_bindings`.
+    pub mesh_glass_combine_params_buffer: wgpu::Buffer,
+    /// Per-VR uniform for `mesh_glass.wesl::GlassFsParams` —
+    /// the front/back FS opacity-discard threshold.
+    pub mesh_glass_fs_params_buffer: wgpu::Buffer,
+    /// Scene-side g2 bind group for the glass front/back raster
+    /// passes — `leaf_attr_pool` + `materials`. Rebuilt when either
+    /// backing buffer reallocates.
+    pub mesh_glass_g2_bg: Option<wgpu::BindGroup>,
+    pub mesh_glass_g2_scene_epoch: u64,
+    pub mesh_glass_g2_lights_materials_epoch: u64,
+
     // ── Mesh-rendered shadow-map per-VR state (Phase 3 + CSM) ──────
     /// 1024×1024 `Depth32Float` texture array (4 layers — one per
     /// cascade). Filled by depth-only rasterization, then read by
@@ -157,6 +202,23 @@ pub struct ViewportRenderer {
     /// Per-layer views (one per cascade) for use as
     /// `RenderPassDepthStencilAttachment.view`. Indexed by cascade.
     pub mesh_shadow_depth_views: Vec<wgpu::TextureView>,
+
+    /// Glass shadow front-face depth — `Depth32Float` texture array,
+    /// one layer per cascade. Captures the closest glass entry depth
+    /// from the light POV; the shade pass samples this + the back
+    /// texture below to compute glass thickness for Beer
+    /// attenuation. Same dimensions as `mesh_shadow_depth_texture`
+    /// — both resize together via `resize_shadow_map_depth`.
+    pub mesh_glass_shadow_front_texture: wgpu::Texture,
+    pub mesh_glass_shadow_front_views: Vec<wgpu::TextureView>,
+    /// Whole-array view, used by the shade pass to sample any
+    /// cascade. `D2Array` so the FS can index by cascade.
+    pub mesh_glass_shadow_front_array_view: wgpu::TextureView,
+    /// Glass shadow back-face depth — farthest glass exit depth
+    /// from light POV. Pair with the front texture for thickness.
+    pub mesh_glass_shadow_back_texture: wgpu::Texture,
+    pub mesh_glass_shadow_back_views: Vec<wgpu::TextureView>,
+    pub mesh_glass_shadow_back_array_view: wgpu::TextureView,
     /// Per-cascade render `g0` for the mesh-shadow pipeline —
     /// `light_camera` (CSM uniform) + per-cascade `MeshShadowParams`
     /// + bone palettes (Phase 6.6 VS skinning). Indexed by cascade.
@@ -228,16 +290,16 @@ pub struct ViewportRenderer {
     pub mesh_lod_shadow_g2_bgs: Vec<Vec<Option<(wgpu::BindGroup, u32, u32)>>>,
 
     // ── Mesh LOD admit stats (RKP_MESH_LOD_STATS=1 diagnostic) ─────
-    /// Pass-shared 32 B (8 × u32) histograms. Slots 0..4: admitted
-    /// clusters per LOD. Slots 4..8: total clusters per LOD. The
-    /// shader atomic-adds into these only when `record_stats != 0`
-    /// in the per-draw params; the CPU pre-clears at the start of
-    /// each LOD-select pass and copies to the matching staging
-    /// buffer after.
+    /// Pass-shared 64 B (16 × u32) histograms. Slots 0..8: admitted
+    /// clusters per LOD. Slots 8..16: total clusters per LOD (sized
+    /// to `LOD_LEVELS_MAX`). The shader atomic-adds into these only
+    /// when `record_stats != 0` in the per-draw params; the CPU
+    /// pre-clears at the start of each LOD-select pass and copies
+    /// to the matching staging buffer after.
     pub mesh_lod_admit_stats_primary: wgpu::Buffer,
     pub mesh_lod_admit_stats_shadow: wgpu::Buffer,
     /// Per-pass staging buffer for async readback. Persistent — the
-    /// 32 B size makes one allocation cheap. State machine:
+    /// 64 B size makes one allocation cheap. State machine:
     /// `pending = None` (idle) → `submit_copy + issue_map_async`
     /// → `pending = Some(rx)` (in flight or mapped) → `try_recv`
     /// returns Ok → `read + log + unmap` → `pending = None`. Skip
@@ -325,6 +387,25 @@ impl ViewportRenderer {
         // rkp-side pick texture (R32Uint). Written by the procedural
         // raymarch, read by `proc_outline` and the pick readback.
         let (pick_texture, pick_view) = create_pick_texture(device, width, height);
+
+        // Mesh-mode glass scratch targets. Allocated here even when
+        // the active primary mode isn't `Mesh` so a runtime mode
+        // switch doesn't require viewport reallocation. Named
+        // `mesh_glass_tx` to avoid shadowing the `glass` shadow-pass
+        // local declared further down.
+        let mesh_glass_tx = create_glass_textures(device, width, height);
+        let mesh_glass_combine_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mesh_glass_combine params"),
+            size: std::mem::size_of::<crate::mesh_glass_pass::CombineParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mesh_glass_fs_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mesh_glass fs params"),
+            size: std::mem::size_of::<crate::mesh_glass_pass::GlassFsParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         // Per-VR passes. Each wired to: (a) its own gbuffer views, (b)
         // the shared scene bind-group layout + shared buffers on renderer.
@@ -434,6 +515,11 @@ impl ViewportRenderer {
             }))
             .collect();
 
+        // Glass shadow front + back depth, one layer per cascade.
+        // Allocated at the same size as the opaque shadow depth so
+        // the per-cascade view-projection matches.
+        let mesh_glass_shadow_tx = create_glass_shadow_textures(device, SHADOW_MAP_DEFAULT_SIZE);
+
         // Per-cascade `MeshShadowParams` (16 B) — each holds
         // `cascade_index = i`. Static after init; the render g0
         // bind groups bind these.
@@ -504,6 +590,8 @@ impl ViewportRenderer {
             &ssao.output_view,
             &shadow_map.shadow_buffer,
             &shadow_map.uniform_buffer,
+            &mesh_glass_shadow_tx.front_array_view,
+            &mesh_glass_shadow_tx.back_array_view,
         );
 
         // Pass order: shade → volumetric → glass → god_rays. Glass
@@ -583,8 +671,28 @@ impl ViewportRenderer {
             splat_resolve_g0_bg: None,
             splat_resolve_g1_bg: None,
             splat_resolve_scene_epoch: u64::MAX,
+            glass_entry_packed_texture: mesh_glass_tx.entry_packed,
+            glass_entry_packed_view:    mesh_glass_tx.entry_packed_view,
+            glass_exit_dist_texture:    mesh_glass_tx.exit_dist,
+            glass_exit_dist_view:       mesh_glass_tx.exit_dist_view,
+            glass_depth_front_texture:  mesh_glass_tx.depth_front,
+            glass_depth_front_view:     mesh_glass_tx.depth_front_view,
+            glass_depth_back_texture:   mesh_glass_tx.depth_back,
+            glass_depth_back_view:      mesh_glass_tx.depth_back_view,
+            mesh_glass_combine_bg: None,
+            mesh_glass_combine_params_buffer,
+            mesh_glass_fs_params_buffer,
+            mesh_glass_g2_bg: None,
+            mesh_glass_g2_scene_epoch: u64::MAX,
+            mesh_glass_g2_lights_materials_epoch: u64::MAX,
             mesh_shadow_depth_texture,
             mesh_shadow_depth_views,
+            mesh_glass_shadow_front_texture: mesh_glass_shadow_tx.front_texture,
+            mesh_glass_shadow_front_views: mesh_glass_shadow_tx.front_views,
+            mesh_glass_shadow_front_array_view: mesh_glass_shadow_tx.front_array_view,
+            mesh_glass_shadow_back_texture: mesh_glass_shadow_tx.back_texture,
+            mesh_glass_shadow_back_views: mesh_glass_shadow_tx.back_views,
+            mesh_glass_shadow_back_array_view: mesh_glass_shadow_tx.back_array_view,
             mesh_shadow_render_g0_bgs: vec![None; CSM_CASCADE_COUNT as usize],
             mesh_shadow_render_params_buffers,
             mesh_shadow_render_g0_scene_epoch: u64::MAX,
@@ -603,7 +711,7 @@ impl ViewportRenderer {
             mesh_lod_shadow_g2_bgs: Vec::new(),
             mesh_lod_admit_stats_primary: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rkp_vr_mesh_lod_admit_stats_primary"),
-                size: 32,
+                size: MESH_LOD_STATS_BYTES,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::COPY_SRC,
@@ -611,7 +719,7 @@ impl ViewportRenderer {
             }),
             mesh_lod_admit_stats_shadow: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rkp_vr_mesh_lod_admit_stats_shadow"),
-                size: 32,
+                size: MESH_LOD_STATS_BYTES,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::COPY_SRC,
@@ -619,13 +727,13 @@ impl ViewportRenderer {
             }),
             mesh_lod_admit_stats_primary_staging: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rkp_vr_mesh_lod_admit_stats_primary_staging"),
-                size: 32,
+                size: MESH_LOD_STATS_BYTES,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
             mesh_lod_admit_stats_shadow_staging: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rkp_vr_mesh_lod_admit_stats_shadow_staging"),
-                size: 32,
+                size: MESH_LOD_STATS_BYTES,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
@@ -718,6 +826,8 @@ impl ViewportRenderer {
             &self.ssao.output_view,
             &self.shadow_map.shadow_buffer,
             &self.shadow_map.uniform_buffer,
+            &self.mesh_glass_shadow_front_array_view,
+            &self.mesh_glass_shadow_back_array_view,
         );
         // Update the per-cascade blit-params uniforms so the blit
         // shader's stride math matches the new size. The `cascade_index`
@@ -778,8 +888,19 @@ impl ViewportRenderer {
                 ..Default::default()
             }))
             .collect();
+        // Glass shadow front + back depth — same dimensions, same
+        // resize trigger.
+        let glass_shadow = create_glass_shadow_textures(device, new_size);
+        self.mesh_glass_shadow_front_texture     = glass_shadow.front_texture;
+        self.mesh_glass_shadow_front_views       = glass_shadow.front_views;
+        self.mesh_glass_shadow_front_array_view  = glass_shadow.front_array_view;
+        self.mesh_glass_shadow_back_texture      = glass_shadow.back_texture;
+        self.mesh_glass_shadow_back_views        = glass_shadow.back_views;
+        self.mesh_glass_shadow_back_array_view   = glass_shadow.back_array_view;
         // Force the blit g0 bind groups to rebuild against the new
         // depth views + (presumably also resized) shadow_buffer.
+        // Shade-side bg also drops (it now references the glass
+        // shadow array views).
         for slot in &mut self.mesh_shadow_blit_g0_bgs {
             *slot = None;
         }
@@ -862,6 +983,141 @@ impl ViewportRenderer {
             ));
             self.splat_resolve_scene_epoch = scene_now;
         }
+    }
+
+    /// Build (or rebuild) the scene-side glass `g2` bind group and the
+    /// per-VR combine-compute bind group. `g2` follows scene-buffer +
+    /// materials epochs; the combine bg is rebuilt whenever any of
+    /// the glass scratch textures or `gbuf_position` / `gbuf_glass`
+    /// view moved (resize). Cheap to call every frame — the bg-build
+    /// is skipped when no rebuild is required.
+    pub fn refresh_mesh_glass_bindings(
+        &mut self,
+        device: &wgpu::Device,
+        renderer: &RkpRenderer,
+    ) {
+        let scene_now = renderer.scene.buffers_epoch();
+        let lm_now = renderer.lights_materials_epoch();
+        if self.mesh_glass_g2_bg.is_none()
+            || self.mesh_glass_g2_scene_epoch != scene_now
+            || self.mesh_glass_g2_lights_materials_epoch != lm_now
+        {
+            self.mesh_glass_g2_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mesh_glass g2"),
+                layout: &renderer.mesh_glass.g2_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: renderer.scene.leaf_attr_pool_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: renderer.materials_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: renderer.scene.objects_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: renderer.scene.instance_overlay_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: renderer.scene.color_pool_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: self.mesh_glass_fs_params_buffer.as_entire_binding(),
+                    },
+                    // Octree-lookup bindings — used by
+                    // `mesh_glass.wesl`'s per-pixel resolved normal
+                    // (lookup_cell_at). The other consumers of this
+                    // layout (mesh.wesl, mesh_shadow.wesl,
+                    // mesh_glass_shadow.wesl) don't reference them.
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: renderer.scene.assets_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: renderer.scene.octree_nodes_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: renderer.scene.brick_pool_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: renderer.scene.brick_face_links_buffer.as_entire_binding(),
+                    },
+                ],
+            }));
+            self.mesh_glass_g2_scene_epoch = scene_now;
+            self.mesh_glass_g2_lights_materials_epoch = lm_now;
+        }
+        if self.mesh_glass_combine_bg.is_none() {
+            self.mesh_glass_combine_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mesh_glass_combine g0"),
+                layout: &renderer.mesh_glass.combine_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.glass_entry_packed_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.glass_exit_dist_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.gbuffer.position_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&self.gbuffer.glass_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.mesh_glass_combine_params_buffer.as_entire_binding(),
+                    },
+                ],
+            }));
+        }
+    }
+
+    /// Write the per-frame `CombineParams` for the mesh-glass combine
+    /// compute and the FS opacity-threshold uniform. Called from
+    /// `RkpRenderer::dispatch_mesh` once per frame; reads the cached
+    /// debug values from `RkpRenderer`.
+    pub fn write_mesh_glass_combine_params(
+        &self,
+        queue: &wgpu::Queue,
+        debug_force: u32,
+        opacity_threshold: f32,
+    ) {
+        let params = crate::mesh_glass_pass::CombineParams {
+            debug_force,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        queue.write_buffer(
+            &self.mesh_glass_combine_params_buffer,
+            0,
+            bytemuck::bytes_of(&params),
+        );
+        let fs_params = crate::mesh_glass_pass::GlassFsParams {
+            opacity_threshold,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        queue.write_buffer(
+            &self.mesh_glass_fs_params_buffer,
+            0,
+            bytemuck::bytes_of(&fs_params),
+        );
     }
 
     /// Grow `splat_instance_buffers` + `splat_instance_bind_groups` to
@@ -1155,10 +1411,11 @@ impl ViewportRenderer {
             Ok(Ok(())) => {
                 let slice = staging.slice(..);
                 let data = slice.get_mapped_range();
-                if data.len() >= 32 {
-                    let mut admitted = [0u32; 4];
-                    let mut total = [0u32; 4];
-                    for i in 0..4 {
+                if data.len() >= MESH_LOD_STATS_BYTES as usize {
+                    let mut admitted = [0u32; LOD_LEVELS_MAX];
+                    let mut total = [0u32; LOD_LEVELS_MAX];
+                    let total_offset = LOD_LEVELS_MAX * 4;
+                    for i in 0..LOD_LEVELS_MAX {
                         admitted[i] = u32::from_le_bytes([
                             data[i * 4],
                             data[i * 4 + 1],
@@ -1166,21 +1423,26 @@ impl ViewportRenderer {
                             data[i * 4 + 3],
                         ]);
                         total[i] = u32::from_le_bytes([
-                            data[16 + i * 4],
-                            data[16 + i * 4 + 1],
-                            data[16 + i * 4 + 2],
-                            data[16 + i * 4 + 3],
+                            data[total_offset + i * 4],
+                            data[total_offset + i * 4 + 1],
+                            data[total_offset + i * 4 + 2],
+                            data[total_offset + i * 4 + 3],
                         ]);
                     }
                     let admitted_total: u32 = admitted.iter().sum();
                     let evaluated_total: u32 = total.iter().sum();
+                    let mut per_lod = String::new();
+                    for i in 0..LOD_LEVELS_MAX {
+                        if total[i] == 0 {
+                            continue;
+                        }
+                        if !per_lod.is_empty() {
+                            per_lod.push_str(" | ");
+                        }
+                        per_lod.push_str(&format!("lod{i} {}/{}", admitted[i], total[i]));
+                    }
                     eprintln!(
-                        "[mesh_lod_stats {label}] evaluated={evaluated_total} admitted={admitted_total} | \
-                         lod0 {}/{} | lod1 {}/{} | lod2 {}/{} | lod3 {}/{}",
-                        admitted[0], total[0],
-                        admitted[1], total[1],
-                        admitted[2], total[2],
-                        admitted[3], total[3],
+                        "[mesh_lod_stats {label}] evaluated={evaluated_total} admitted={admitted_total} | {per_lod}"
                     );
                 }
                 drop(data);
@@ -1226,7 +1488,7 @@ impl ViewportRenderer {
             0,
             &self.mesh_lod_admit_stats_primary_staging,
             0,
-            32,
+            MESH_LOD_STATS_BYTES,
         );
         self.mesh_lod_admit_stats_primary_needs_map = true;
     }
@@ -1239,7 +1501,7 @@ impl ViewportRenderer {
             0,
             &self.mesh_lod_admit_stats_shadow_staging,
             0,
-            32,
+            MESH_LOD_STATS_BYTES,
         );
         self.mesh_lod_admit_stats_shadow_needs_map = true;
     }
@@ -1488,6 +1750,20 @@ impl ViewportRenderer {
         self.pick_texture = pick_texture;
         self.pick_view = pick_view;
 
+        // Mesh-mode glass scratch targets — same resolution as the
+        // gbuffer; reallocate and drop the cached bind groups so the
+        // next dispatch rebuilds against the new views.
+        let mesh_glass_tx = create_glass_textures(device, width, height);
+        self.glass_entry_packed_texture = mesh_glass_tx.entry_packed;
+        self.glass_entry_packed_view    = mesh_glass_tx.entry_packed_view;
+        self.glass_exit_dist_texture    = mesh_glass_tx.exit_dist;
+        self.glass_exit_dist_view       = mesh_glass_tx.exit_dist_view;
+        self.glass_depth_front_texture  = mesh_glass_tx.depth_front;
+        self.glass_depth_front_view     = mesh_glass_tx.depth_front_view;
+        self.glass_depth_back_texture   = mesh_glass_tx.depth_back;
+        self.glass_depth_back_view      = mesh_glass_tx.depth_back_view;
+        self.mesh_glass_combine_bg = None;
+
         // Splat-resolve g0 references gbuffer texture views which all
         // just moved. Drop it — `refresh_splat_resolve_bindings` will
         // rebuild on next dispatch.
@@ -1537,6 +1813,8 @@ impl ViewportRenderer {
             &self.ssao.output_view,
             &self.shadow_map.shadow_buffer,
             &self.shadow_map.uniform_buffer,
+            &self.mesh_glass_shadow_front_array_view,
+            &self.mesh_glass_shadow_back_array_view,
         );
 
         self.volumetric.resize(device, width, height);
@@ -1787,6 +2065,132 @@ fn make_tile_bin_buffers(
         mapped_at_creation: false,
     });
     (counts_buffer, lists_buffer, tile_count_x, tile_count_y)
+}
+
+/// Glass shadow depth resources for a single cascaded shadow map —
+/// front + back depth textures sized to `shadow_map_size²`, with a
+/// per-layer view per cascade and a whole-array view for shade-side
+/// sampling.
+struct GlassShadowTextures {
+    front_texture: wgpu::Texture,
+    front_views: Vec<wgpu::TextureView>,
+    front_array_view: wgpu::TextureView,
+    back_texture: wgpu::Texture,
+    back_views: Vec<wgpu::TextureView>,
+    back_array_view: wgpu::TextureView,
+}
+
+fn create_glass_shadow_textures(device: &wgpu::Device, size: u32) -> GlassShadowTextures {
+    let mk = |label: &'static str| -> (wgpu::Texture, Vec<wgpu::TextureView>, wgpu::TextureView) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: CSM_CASCADE_COUNT,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let layer_views: Vec<wgpu::TextureView> = (0..CSM_CASCADE_COUNT)
+            .map(|i| {
+                tex.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some(&format!("{label} layer {i}")),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: i,
+                    array_layer_count: Some(1),
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let array_view = tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some(&format!("{label} array")),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            aspect: wgpu::TextureAspect::DepthOnly,
+            ..Default::default()
+        });
+        (tex, layer_views, array_view)
+    };
+    let (front_texture, front_views, front_array_view) = mk("rkp_mesh_glass_shadow_front");
+    let (back_texture, back_views, back_array_view) = mk("rkp_mesh_glass_shadow_back");
+    GlassShadowTextures {
+        front_texture,
+        front_views,
+        front_array_view,
+        back_texture,
+        back_views,
+        back_array_view,
+    }
+}
+
+/// All four mesh-mode glass textures, allocated together at the
+/// internal viewport resolution. Returned in lockstep with the
+/// `glass_*` fields on `ViewportRenderer`.
+struct GlassTextures {
+    entry_packed:     wgpu::Texture,
+    entry_packed_view: wgpu::TextureView,
+    exit_dist:        wgpu::Texture,
+    exit_dist_view:   wgpu::TextureView,
+    depth_front:      wgpu::Texture,
+    depth_front_view: wgpu::TextureView,
+    depth_back:       wgpu::Texture,
+    depth_back_view:  wgpu::TextureView,
+}
+
+fn create_glass_textures(device: &wgpu::Device, width: u32, height: u32) -> GlassTextures {
+    let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+    let entry_packed = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("mesh_glass entry_packed"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: crate::mesh_glass_pass::GLASS_ENTRY_PACKED_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let entry_packed_view = entry_packed.create_view(&Default::default());
+
+    let exit_dist = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("mesh_glass exit_dist"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: crate::mesh_glass_pass::GLASS_EXIT_DIST_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let exit_dist_view = exit_dist.create_view(&Default::default());
+
+    let mk_depth = |label: &'static str| -> (wgpu::Texture, wgpu::TextureView) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::mesh_glass_pass::GLASS_DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+        (tex, view)
+    };
+    let (depth_front, depth_front_view) = mk_depth("mesh_glass depth_front");
+    let (depth_back,  depth_back_view)  = mk_depth("mesh_glass depth_back");
+
+    GlassTextures {
+        entry_packed, entry_packed_view,
+        exit_dist, exit_dist_view,
+        depth_front, depth_front_view,
+        depth_back, depth_back_view,
+    }
 }
 
 fn create_pick_texture(

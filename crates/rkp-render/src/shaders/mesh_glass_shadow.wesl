@@ -1,26 +1,22 @@
-// Mesh-rendered shadow map — depth-only render.
+// Glass shadow render — captures glass front-face / back-face depth
+// from each cascade's light POV so the shade pass can apply Beer
+// attenuation through glass meshes.
 //
-// Phase 3 of the splat-to-mesh pivot. Vertex stage projects mesh
-// triangles through the directional light's view-proj into a 1024²
-// `Depth32Float` attachment. There is NO fragment shader — the
-// rasterizer fills depth on its own. This lets the GPU run early-z
-// culling at full speed; the prior atomic-min-from-fragment approach
-// disabled early-z because the fragment had a side effect, costing
-// ~3-5× the fragment work.
+// Two pipelines share this VS + FS:
+//   · front: cull = Back,  depth_compare = Less    (closest entry)
+//   · back:  cull = Front, depth_compare = Greater (farthest exit)
 //
-// A separate compute pass (`mesh_shadow_blit.wesl`) reads this depth
-// texture and writes `bitcast<u32>(depth)` into the existing
-// `shadow_buffer` storage that `shadow_map_pass` owns and shade
-// already samples — so the shade-side sampling code is reused
-// unchanged.
+// The FS discards non-glass fragments (opacity ≥ 0.99) so the depth
+// targets only carry glass surfaces. Opaque casters land in the
+// existing `mesh_shadow_render` map; the shade pass multiplies the
+// opaque shadow factor by `exp(-sigma * thickness)` where thickness =
+// `back_depth - front_depth` projected to world units.
 //
-// **Phase 6.6:** the VS now does the same LBS / DQS skinning
-// `mesh.wesl` does, so shadows follow skeletal animation. The math
-// is duplicated (rather than imported from a shared lib) because the
-// bone bindings live on this pipeline's `g0`, not the shared scene
-// `g0` that `skin_deform.wesl` reads from. A shared `lib::skin`
-// helper that takes pre-fetched bone palettes is a candidate
-// follow-on, but inline keeps each render-pass self-contained.
+// VS is byte-for-byte identical to `mesh_shadow.wesl::vert_main` —
+// duplicated rather than imported so each render pass stays
+// self-contained. Bindings match `mesh_shadow.wesl` for `g0`/`g1`/
+// `g2` so the same per-cascade `g0` and per-instance `g1` bind groups
+// drive both pipelines.
 
 import package::lib::types::LightCameraCsm;
 import package::lib::types::LeafAttr;
@@ -38,9 +34,6 @@ struct MeshShadowInstance {
     skinning_mode: u32,
 }
 
-/// Per-render-pass uniform selecting which cascade to render this
-/// pass. Engine writes `cascade_index = i` and binds before each
-/// `dispatch_mesh_shadow` cascade iteration. 16 B (vec4 alignment).
 struct MeshShadowParams {
     cascade_index: u32,
     _pad0: u32,
@@ -57,10 +50,6 @@ struct DualQuat {
     d: vec4<f32>,
 }
 
-// `bone_matrices` is a 64 B `mat4x4<f32>` per bone (matches
-// `skin_deform.wesl`). Declaring it as `mat3x4` would shave 16 B per
-// bone but mismatches the on-GPU stride that the writer uses, which
-// produced "stretched all over" geometry in an earlier draft.
 @group(0) @binding(0) var<uniform> light_camera: LightCameraCsm;
 @group(0) @binding(1) var<uniform> shadow_params: MeshShadowParams;
 @group(0) @binding(2) var<storage, read> bone_matrices: array<mat4x4<f32>>;
@@ -68,16 +57,6 @@ struct DualQuat {
 
 @group(1) @binding(0) var<uniform> instance: MeshShadowInstance;
 
-// Glass-classify bindings — same shape as `mesh.wesl::group(2)`. The
-// FS reads the cell's material and discards glass fragments so the
-// opaque shadow map only contains opaque casters; glass casters are
-// rendered separately by `mesh_glass_shadow.wesl` and the shade pass
-// applies Beer attenuation on top of the opaque shadow factor.
-//
-// Adding this FS does forfeit early-z on instances that go through
-// it; the per-instance `has_glass` filter sends all-opaque instances
-// to a NoGlass pipeline that has no FS (preserving early-z), and
-// only mixed / glass-only instances pay the FS cost.
 @group(2) @binding(0) var<storage, read> leaf_attr_pool: array<LeafAttr>;
 @group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
 @group(2) @binding(2) var<storage, read> instances: array<RkpInstance>;
@@ -178,12 +157,16 @@ fn vert_main(
     return out;
 }
 
+// Single FS shared by both `frag_front` and `frag_back` pipelines —
+// they differ only in the Rust-side cull mode + depth compare. The
+// classify is the inverse of `mesh.wesl` / `mesh_shadow.wesl`:
+// discard *opaque* fragments so glass-only depth lands in the target.
 @fragment
 fn frag_main(in: VsOut) {
     let inst = instances[instance.object_id];
     let attr = fetch_leaf_attr_for(inst, in.leaf_attr_id);
     let mat_id = attr.material_packed & 0xFFFFu;
-    if materials[mat_id].opacity < 0.99 {
+    if materials[mat_id].opacity >= 0.99 {
         discard;
     }
 }

@@ -274,6 +274,30 @@ impl RkpShadePass {
                         },
                         count: None,
                     },
+                    // glass_shadow_front / back — Depth32Float
+                    // texture arrays, one layer per cascade. Sampled
+                    // with integer coords (no sampler) by
+                    // `glass_shadow_attenuation` in `rkp_shade.wesl`.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2Array,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2Array,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -617,6 +641,8 @@ impl RkpShadePass {
         ssao_view: &wgpu::TextureView,
         shadow_buffer: &wgpu::Buffer,
         light_camera_buffer: &wgpu::Buffer,
+        glass_shadow_front_array_view: &wgpu::TextureView,
+        glass_shadow_back_array_view: &wgpu::TextureView,
     ) {
         self.ssao_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rkp_shade shadow+ssao+shadowmap bg"),
@@ -637,6 +663,14 @@ impl RkpShadePass {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: shadow_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(glass_shadow_front_array_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(glass_shadow_back_array_view),
                 },
             ],
         }));

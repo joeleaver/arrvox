@@ -27,6 +27,11 @@
 // shared layout but doesn't read them.
 
 import package::lib::types::CameraUniforms;
+import package::lib::types::LeafAttr;
+import package::lib::types::GpuMaterial;
+import package::lib::types::RkpInstance;
+import package::lib::types::OverlayEntry;
+import package::lib::leaf_attr::fetch_leaf_attr_for;
 
 // Per-instance uniform — shape-compatible with `splat.wesl`'s
 // `SplatInstance` (96 B). Skinning fields drive the VS branch —
@@ -78,6 +83,23 @@ struct DualQuat {
 @group(0) @binding(3) var<storage, read> bone_dual_quats: array<DualQuat>;
 
 @group(1) @binding(0) var<uniform> instance: MeshInstance;
+
+// Glass-classification bindings — see `mesh_glass.wesl` for the
+// matching FS-side group. The primary FS reads the cell's material
+// so it can `discard` glass fragments, matching the march's
+// behavior of stepping past glass to find the opaque hit behind.
+// Without this discard, glass meshes write opaque visibility into
+// the G-buffer, the glass composite pass then gates them out
+// (entry_dist == opaque_dist), and they render fully opaque.
+//
+// `color_pool_data` is unused at FS time but the imported
+// `lib::leaf_attr` module's `fetch_leaf_color_for` references it
+// at parse time (`use_stripping(false)` in build.rs).
+@group(2) @binding(0) var<storage, read> leaf_attr_pool: array<LeafAttr>;
+@group(2) @binding(1) var<storage, read> materials: array<GpuMaterial>;
+@group(2) @binding(2) var<storage, read> instances: array<RkpInstance>;
+@group(2) @binding(3) var<storage, read> instance_overlay: array<OverlayEntry>;
+@group(2) @binding(4) var<storage, read> color_pool_data: array<u32>;
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
@@ -233,6 +255,18 @@ struct FsOut {
 
 @fragment
 fn frag_main(in: VsOut) -> FsOut {
+    // Glass discard: step past transparent fragments so the opaque
+    // hit captured in `gbuf_position` is the surface BEHIND the
+    // glass (matching the march). The glass passes
+    // (`mesh_glass.wesl`) capture entry/exit on the same triangles
+    // separately and pack into `gbuf_glass` for the composite.
+    let inst = instances[instance.object_id];
+    let attr = fetch_leaf_attr_for(inst, in.leaf_attr_id);
+    let mat_id = attr.material_packed & 0xFFFFu;
+    if materials[mat_id].opacity < 0.99 {
+        discard;
+    }
+
     let hit_distance = length(in.world_pos - camera.position.xyz);
     var out: FsOut;
     out.position  = vec4<f32>(in.world_pos, hit_distance);

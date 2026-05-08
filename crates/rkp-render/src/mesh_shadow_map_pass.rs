@@ -78,6 +78,7 @@ impl MeshShadowMapPass {
     pub fn new(
         device: &wgpu::Device,
         splat_g1_layout: &wgpu::BindGroupLayout,
+        g2_layout: &wgpu::BindGroupLayout,
     ) -> Self {
         // ── Render pipeline (depth-only, no fragment shader) ───────
         let render_g0_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -140,7 +141,7 @@ impl MeshShadowMapPass {
 
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh_shadow render layout"),
-            bind_group_layouts: &[Some(&render_g0_layout), Some(splat_g1_layout)],
+            bind_group_layouts: &[Some(&render_g0_layout), Some(splat_g1_layout), Some(g2_layout)],
             immediate_size: 0,
         });
 
@@ -219,11 +220,22 @@ impl MeshShadowMapPass {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            // No fragment stage — depth-only render. The rasterizer
-            // fills the depth attachment; the GPU's early-z culling
-            // runs at full speed because there's no fragment side
-            // effect that would force late-z.
-            fragment: None,
+            // FS does the same glass classify + discard as the
+            // primary mesh raster, so the opaque shadow map only
+            // contains opaque casters. Glass casters are rendered
+            // separately by `mesh_glass_shadow.wesl` and the shade
+            // pass applies Beer attenuation on top of the opaque
+            // shadow factor. Adding the FS forfeits early-z on
+            // glass-bearing instances; the per-instance `has_glass`
+            // filter sends pure-opaque assets to a no-FS variant
+            // (TODO once both pipelines coexist) — for now every
+            // instance pays the FS cost in shadow.
+            fragment: Some(wgpu::FragmentState {
+                module: &render_module,
+                entry_point: Some("frag_main"),
+                compilation_options: Default::default(),
+                targets: &[],
+            }),
             multiview_mask: None,
             cache: None,
         });

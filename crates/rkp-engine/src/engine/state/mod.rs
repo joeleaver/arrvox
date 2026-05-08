@@ -273,6 +273,25 @@ pub(crate) struct EngineState {
     pub(crate) paint_overlays:
         std::collections::HashMap<hecs::Entity, rkp_core::LeafAttrOverlay>,
 
+    /// Per-material flag — `true` if the material's `opacity < 0.99`
+    /// (i.e., classified as glass by the march and the mesh-mode
+    /// glass passes). Indexed by material id. Rebuilt from the
+    /// material library at the start of `update_scene_gpu` whenever
+    /// `material_glass_lib_epoch` doesn't match the library's
+    /// current state. Used to compute `SplatDraw.has_glass`.
+    pub(crate) material_is_glass: Vec<bool>,
+    /// Snapshot of `MaterialLibrary::slot_count() + an opacity-checksum`
+    /// at the last `material_is_glass` rebuild. Tracked so we don't
+    /// rebuild every frame; cheap to compute since material counts
+    /// stay in the dozens.
+    pub(crate) material_glass_lib_epoch: u64,
+    /// Per-asset cached "has any glass cell" flag. Key is the asset's
+    /// `spatial.root_offset` (same key the per-frame asset_table
+    /// uses). Computed lazily — first time a draw touches an asset,
+    /// we walk its leaves once with `material_is_glass` and store
+    /// the result. Cleared whenever `material_is_glass` rebuilds.
+    pub(crate) asset_has_glass_cache: std::collections::HashMap<u32, bool>,
+
     // Input + Camera
     pub(crate) input_system: rkp_runtime::input::InputSystem,
     pub(crate) camera_control: CameraControlState,

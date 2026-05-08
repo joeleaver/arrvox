@@ -35,6 +35,36 @@ impl EngineState {
         self.splat_draws.clear();
         self.gpu_to_entity.clear();
         self.entity_to_gpu.clear();
+
+        // Refresh `material_is_glass` from the material library —
+        // O(slot_count), typically dozens. If the resulting Vec
+        // differs from last frame, clear `asset_has_glass_cache` so
+        // every asset re-scans its leaves on its next draw. Also
+        // invalidate the cache when geometry changes
+        // (`remap_entity_material` mutates leaf materials in-place
+        // and bumps geometry_epoch).
+        {
+            let slot_count = self.material_lib.slot_count();
+            let new_material_is_glass: Vec<bool> = (0..slot_count)
+                .map(|id| {
+                    self.material_lib
+                        .get_def(id as u16)
+                        .map(|d| d.opacity < 0.99)
+                        .unwrap_or(false)
+                })
+                .collect();
+            if new_material_is_glass != self.material_is_glass {
+                self.material_is_glass = new_material_is_glass;
+                self.asset_has_glass_cache.clear();
+            }
+            let geom_epoch = self
+                .geometry_epoch_handle
+                .load(std::sync::atomic::Ordering::Acquire);
+            if geom_epoch > self.material_glass_lib_epoch {
+                self.asset_has_glass_cache.clear();
+                self.material_glass_lib_epoch = geom_epoch;
+            }
+        }
         // Per-frame asset table — `octree_root` → index into
         // `gpu_assets`. Two entities sharing one .rkp asset share one
         // slot; the dedupe authoritatively builds the asset record from
@@ -289,6 +319,74 @@ impl EngineState {
                         .ok()
                         .map(|s| (-s.grid_offset).to_array())
                         .unwrap_or([0.0, 0.0, 0.0]);
+                    // Compute `has_glass` for this draw — the mesh
+                    // primary path skips the front/back glass raster
+                    // passes for `!has_glass` instances, recovering
+                    // most of the perf cost on opaque-only assets.
+                    //
+                    // Two sources of glass on an instance:
+                    //   1. Asset leaves carry a glass material in
+                    //      their `material_primary` slot (bake-time
+                    //      assignment, post-paint mutations of the
+                    //      shared pool). Cached per asset by
+                    //      `root_offset` since the scan walks every
+                    //      leaf and is expensive on big meshes.
+                    //   2. Per-entity `material_overrides` map an
+                    //      asset's original material to a glass one
+                    //      (deferred remap, e.g. for save/load
+                    //      replay). Checked per draw — overrides are
+                    //      a short Vec.
+                    let root_offset = spatial.root_offset;
+                    let asset_has_glass = match self
+                        .asset_has_glass_cache
+                        .get(&root_offset)
+                    {
+                        Some(&v) => v,
+                        None => {
+                            let sm = self.scene_mgr.lock().unwrap();
+                            let mut leaf_slots: Vec<u32> = Vec::new();
+                            let all_nodes = sm.octree.data();
+                            let internal_attrs = sm.octree.internal_attrs_data();
+                            crate::engine::model_scan::collect_leaf_slots(
+                                all_nodes,
+                                &sm.brick_pool,
+                                root_offset as usize,
+                                &mut leaf_slots,
+                            );
+                            crate::engine::model_scan::collect_internal_attr_slots(
+                                all_nodes,
+                                internal_attrs,
+                                root_offset as usize,
+                                &mut leaf_slots,
+                            );
+                            let pool_size = sm.leaf_attr_pool.allocated_count();
+                            let mut found = false;
+                            for slot in &leaf_slots {
+                                if *slot >= pool_size {
+                                    continue;
+                                }
+                                let attr = sm.leaf_attr_pool.get(*slot);
+                                let mat_id = attr.material_primary as usize;
+                                if mat_id < self.material_is_glass.len()
+                                    && self.material_is_glass[mat_id]
+                                {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            drop(sm);
+                            self.asset_has_glass_cache.insert(root_offset, found);
+                            found
+                        }
+                    };
+                    let overlay_glass =
+                        renderable.material_overrides.iter().any(|(_, to)| {
+                            let to = *to as usize;
+                            to < self.material_is_glass.len()
+                                && self.material_is_glass[to]
+                        });
+                    let has_glass = asset_has_glass || overlay_glass;
+
                     self.splat_draws.push(rkp_render::splat_pass::SplatDraw {
                         asset_handle_raw: handle.raw(),
                         world: world_matrix.to_cols_array_2d(),
@@ -297,6 +395,7 @@ impl EngineState {
                         bone_offset_lbs,
                         bone_offset_dqs,
                         skinning_mode,
+                        has_glass,
                     });
                 }
             }

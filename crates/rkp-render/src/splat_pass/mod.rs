@@ -54,4 +54,15 @@ pub struct SplatDraw {
     pub bone_offset_dqs: u32,
     /// `0` = LBS, `1` = DQS, [`SKINNING_MODE_NONE`] = no skinning.
     pub skinning_mode: u32,
+    /// Whether this instance contains any transparent (`opacity < 0.99`)
+    /// material — either in the asset's `leaf_attr_pool` slice or via
+    /// a paint-overlay remap. The mesh-mode primary path uses this
+    /// flag to skip the front/back glass raster passes entirely on
+    /// instances that can't contribute glass — saves the
+    /// triangulation cost on opaque-only assets, which is most of
+    /// them. Glass meshes still pay full cost; the FS-side
+    /// per-fragment classify catches per-cell glass within those.
+    /// Conservative default is `true` (preserves correctness if the
+    /// caller hasn't computed it).
+    pub has_glass: bool,
 }

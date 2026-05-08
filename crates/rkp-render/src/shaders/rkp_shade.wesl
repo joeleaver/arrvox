@@ -172,6 +172,16 @@ struct LightCameraShadeCsm {
 // (march-mode). For CSM the buffer is `CSM_CASCADE_COUNT * SIZE²`
 // u32s laid out cascade-major: `[cascade * SIZE² + ty * SIZE + tx]`.
 @group(1) @binding(3) var<storage, read> shadow_buffer: array<u32>;
+// Glass-shadow per-cascade depth maps from the light POV — captured
+// by `mesh_glass_shadow.wesl`'s front/back pipelines. Cleared to 1.0
+// on the front (closest entry wins) and 0.0 on the back (farthest
+// exit wins). The shade pass samples both at the fragment's
+// light-space coords and applies Beer attenuation when glass sits
+// between the light and the fragment. Mesh-mode only — march mode
+// leaves these at clear values, which `glass_shadow_attenuation`
+// reads as "no glass" (front >= back) and skips.
+@group(1) @binding(4) var glass_shadow_front: texture_depth_2d_array;
+@group(1) @binding(5) var glass_shadow_back:  texture_depth_2d_array;
 
 // Group 2: output HDR color (write, full-res)
 @group(2) @binding(0) var output: texture_storage_2d<rgba16float, write>;
@@ -321,6 +331,73 @@ fn sample_shadow_map(world_pos: vec3<f32>) -> f32 {
         if r1.in_bounds { return r1.shadow; }
     }
     return 1.0;
+}
+
+// Per-meter optical density used for glass shadow attenuation —
+// matches the march's `GLASS_SHADOW_DENSITY * sigma_albedo` averaged
+// over a neutral glass material (albedo ~0.7, opacity ~0.5). Tunable
+// constant; raise for darker glass shadows, lower for almost-clear.
+const GLASS_SHADOW_SIGMA: f32 = 1.5;
+
+// Beer-attenuation factor for glass between the directional light
+// and `world_pos`. Returns 1.0 when no glass sits in the path
+// (`back_z <= front_z` at the projected light-space coords, or the
+// fragment is in front of the back-face — i.e., the glass is BEHIND
+// the fragment relative to the light). Otherwise multiplies into the
+// opaque CSM shadow factor.
+//
+// Picks the cascade the same way `sample_shadow_map` does (smallest
+// `i` whose far Z covers `view_z`); falls through to the next on a
+// frustum miss.
+fn glass_shadow_attenuation(world_pos: vec3<f32>) -> f32 {
+    let view_z = view_z_of(world_pos);
+    let n = light_camera.cascade_count;
+
+    var i: u32 = 0u;
+    loop {
+        if i + 1u >= n { break; }
+        if view_z <= light_camera.cascade_far_view_z[i] { break; }
+        i = i + 1u;
+    }
+
+    var atten = 1.0;
+    for (var step: u32 = 0u; step < 2u; step = step + 1u) {
+        let c = i + step;
+        if c >= n { break; }
+        let cam = light_camera.cascades[c];
+        let clip = cam.view_proj * vec4<f32>(world_pos, 1.0);
+        if clip.w <= 0.0 { continue; }
+        let ndc = clip.xyz / clip.w;
+        if abs(ndc.x) > 1.0 || abs(ndc.y) > 1.0 || ndc.z < 0.0 || ndc.z > 1.0 {
+            continue;
+        }
+        // Light-space tex coords. y flipped to match wgpu's
+        // [0,0]-top-left convention.
+        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
+        let map_size = vec2<f32>(cam.shadow_map_size);
+        let icoord = vec2<i32>(clamp(uv * map_size, vec2<f32>(0.0), map_size - vec2<f32>(1.0)));
+        let front_z = textureLoad(glass_shadow_front, icoord, c, 0);
+        let back_z  = textureLoad(glass_shadow_back,  icoord, c, 0);
+        // No glass at this texel — front cleared to 1.0, back to 0.0,
+        // so back <= front means uncovered.
+        if back_z <= front_z { return atten; }
+        // If the fragment is closer to the light than the glass back
+        // face, the glass sits BEHIND the fragment along the light
+        // ray — it can't attenuate light reaching this fragment.
+        if ndc.z <= back_z { return atten; }
+        // Back-project both depths to world space. For wgpu's NDC
+        // convention, the front/back textures store the same NDC z
+        // values that `view_proj` produces — so the inverse maps
+        // directly.
+        let p_front_h = cam.view_proj_inv * vec4<f32>(ndc.x, ndc.y, front_z, 1.0);
+        let p_back_h  = cam.view_proj_inv * vec4<f32>(ndc.x, ndc.y, back_z,  1.0);
+        let p_front = p_front_h.xyz / p_front_h.w;
+        let p_back  = p_back_h.xyz  / p_back_h.w;
+        let thickness = length(p_back - p_front);
+        atten = exp(-GLASS_SHADOW_SIGMA * thickness);
+        return atten;
+    }
+    return atten;
 }
 
 // Aerial-perspective LUT slice parameterization — must match rkp_aerial_perspective_lut.wgsl.
@@ -891,7 +968,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // by rkp_shadow_trace) stays in sync regardless of
             // which path provided the visibility.
             if light_type == 0u && shade_params.shadow_map_enabled != 0u {
-                light_shadow = sample_shadow_map(world_pos);
+                light_shadow = sample_shadow_map(world_pos)
+                    * glass_shadow_attenuation(world_pos);
             } else {
                 light_shadow = shadow_data[shadow_idx];
             }

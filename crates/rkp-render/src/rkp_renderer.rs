@@ -117,6 +117,25 @@ pub struct RkpRenderer {
     /// Karis admit rule and writes a `DrawIndexedIndirectArgs` table
     /// the render path consumes via `multi_draw_indexed_indirect`.
     pub mesh_lod_select_pass: crate::mesh_lod_select_pass::MeshLodSelectPass,
+    /// Mesh-mode glass pipeline (front + back raster + combine
+    /// compute). Produces the same `gbuf_glass` Rg32Uint packing the
+    /// march does, so the existing `rkp_glass` composite runs
+    /// unchanged.
+    pub mesh_glass: crate::mesh_glass_pass::MeshGlassPass,
+    /// Mesh-mode glass shadow pipelines — per-cascade front + back
+    /// depth captures so the shade pass can apply Beer attenuation
+    /// on top of the existing CSM shadow factor.
+    pub mesh_glass_shadow: crate::mesh_glass_shadow_pass::MeshGlassShadowPass,
+    /// `RKP_MESH_GLASS_DEBUG_FORCE` snapshot (read once at startup).
+    /// `1` ⇒ the combine compute spoofs a 100 mm glass shell on every
+    /// opaque mesh hit, bypassing the entry-FS classify/discard path.
+    /// `2` ⇒ the front/back FS opacity threshold is raised above 1.0,
+    /// so every mesh fragment classifies as glass with its actual
+    /// leaf-derived material id (lets us tell whether the leaf
+    /// lookup itself is wrong vs the discard threshold being wrong
+    /// for the user's material). Bisects "no glass visible" —
+    /// see `mesh_glass.wesl::GlassFsParams`.
+    mesh_glass_debug_force: u32,
     /// Per-asset vertex/index buffer cache for the mesh path. Same
     /// shape as `splat_buffers`, but each entry carries `(vbo, ibo,
     /// index_count)`. Cleared on `release_mesh_for_asset`.
@@ -196,13 +215,50 @@ impl RkpRenderer {
 
         let skin_deform = crate::skin_deform::SkinDeformPass::new(device, &scene);
         let splat_pass = SplatPass::new(device);
-        let mesh_pass = MeshPass::new(device, &splat_pass.g0_layout, &splat_pass.g1_layout);
-        let mesh_shadow_map = MeshShadowMapPass::new(device, &splat_pass.g1_layout);
+        // `MeshGlassPass` owns the shared `g2_layout` (glass-classify
+        // bindings) used by both the primary mesh raster and the
+        // glass front/back rasters. Construct it first so the layout
+        // can flow into `MeshPass::new`.
+        let mesh_glass = crate::mesh_glass_pass::MeshGlassPass::new(
+            device,
+            &splat_pass.g0_layout,
+            &splat_pass.g1_layout,
+        );
+        let mesh_pass = MeshPass::new(
+            device,
+            &splat_pass.g0_layout,
+            &splat_pass.g1_layout,
+            &mesh_glass.g2_layout,
+        );
+        let mesh_shadow_map = MeshShadowMapPass::new(
+            device,
+            &splat_pass.g1_layout,
+            &mesh_glass.g2_layout,
+        );
+        let mesh_glass_shadow = crate::mesh_glass_shadow_pass::MeshGlassShadowPass::new(
+            device,
+            &mesh_shadow_map.render_g0_layout,
+            &splat_pass.g1_layout,
+            &mesh_glass.g2_layout,
+        );
         let mesh_lod_select_pass =
             crate::mesh_lod_select_pass::MeshLodSelectPass::new(device, &splat_pass.g1_layout);
         let splat_resolve = SplatResolvePass::new(device);
         let primary_mode = PrimaryMode::from_env();
         eprintln!("[RkpRenderer] primary_mode = {primary_mode:?}");
+
+        let mesh_glass_debug_force = std::env::var("RKP_MESH_GLASS_DEBUG_FORCE")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        if mesh_glass_debug_force != 0 {
+            let mode = match mesh_glass_debug_force {
+                1 => "1: combine spoofs glass on every opaque hit (hardcoded normal/material)",
+                2 => "2: FS treats every fragment as glass (leaf-derived material)",
+                _ => "unknown — values are 1 or 2",
+            };
+            eprintln!("[RkpRenderer] RKP_MESH_GLASS_DEBUG_FORCE={mesh_glass_debug_force} — {mode}");
+        }
 
         let lights_capacity = lights_buffer.size();
         let materials_capacity = materials_buffer.size();
@@ -219,6 +275,9 @@ impl RkpRenderer {
             mesh_pass,
             mesh_shadow_map,
             mesh_lod_select_pass,
+            mesh_glass,
+            mesh_glass_shadow,
+            mesh_glass_debug_force,
             mesh_buffers: Vec::new(),
             mesh_cluster_buffers: Vec::new(),
             primary_mode,
@@ -581,6 +640,22 @@ impl RkpRenderer {
         let primary_disabled = std::env::var("RKP_MESH_DISABLE_PRIMARY").is_ok();
         viewport.refresh_splat_g0(&self.device, self);
         viewport.refresh_splat_resolve_bindings(&self.device, self);
+        viewport.refresh_mesh_glass_bindings(&self.device, self);
+        // `RKP_MESH_GLASS_DEBUG_FORCE=2` raises the FS opacity gate
+        // above 1.0 so every fragment classifies as glass with its
+        // actual leaf-derived material; a bisect for "the FS classify
+        // path itself is broken" vs "the discard threshold is wrong
+        // for this material".
+        let fs_threshold = if self.mesh_glass_debug_force == 2 {
+            10.0
+        } else {
+            crate::mesh_glass_pass::DEFAULT_OPACITY_THRESHOLD
+        };
+        viewport.write_mesh_glass_combine_params(
+            queue,
+            self.mesh_glass_debug_force,
+            fs_threshold,
+        );
         viewport.ensure_splat_instance_capacity(&self.device, self, draws.len() as u32);
         viewport.ensure_mesh_lod_capacity(&self.device, self, draws.len() as u32);
         for (slot, d) in draws.iter().enumerate() {
@@ -823,6 +898,18 @@ impl RkpRenderer {
             .splat_g0_bg
             .as_ref()
             .expect("splat g0 bg present after refresh_splat_g0");
+        // `glass_g2` is needed by the primary mesh raster (FS
+        // glass-discard) AND by the glass front/back passes. Borrow
+        // it once at the top so all three render passes can use the
+        // same bind group.
+        let glass_g2 = viewport
+            .mesh_glass_g2_bg
+            .as_ref()
+            .expect("mesh_glass g2 bg present after refresh");
+        let glass_combine_bg = viewport
+            .mesh_glass_combine_bg
+            .as_ref()
+            .expect("mesh_glass combine bg present after refresh");
 
         // 1. Visibility-buffer raster — same RT layout as the splat
         //    pass; clears use the same march-equivalent miss sentinels.
@@ -839,6 +926,11 @@ impl RkpRenderer {
             );
             rp.set_pipeline(&self.mesh_pass.pipeline);
             rp.set_bind_group(0, g0_bg, &[]);
+            // `g2` (glass-classify) is required so the FS can
+            // `discard` glass fragments. Without it, glass meshes
+            // write opaque depth into `gbuf_position` and the glass
+            // composite then gates them out (entry == opaque).
+            rp.set_bind_group(2, glass_g2, &[]);
             if pipestats_enabled {
                 rp.begin_pipeline_statistics_query(
                     &viewport.mesh_pipestats_query_set, 1,
@@ -908,6 +1000,111 @@ impl RkpRenderer {
             viewport.height,
         );
         self.profiler.end_query(encoder, q_resolve);
+
+        // 3. Mesh-mode glass — front raster + back raster + combine.
+        //    Runs after `splat_resolve` (which writes zeros to
+        //    `gbuf_glass`); the combine pass overwrites those zeros
+        //    with actual glass data wherever a glass fragment was
+        //    captured. `glass_g2` and `glass_combine_bg` were borrowed
+        //    at the top of this method.
+
+        // Closure that issues every primary mesh draw against the
+        // currently-bound glass pipeline. Reuses the LOD-select
+        // indirect args + count from the primary path — glass picks
+        // the same LOD level as opaque, which keeps thickness
+        // consistent across faces (mixing LODs would let one face
+        // come from LOD-0 and the other from LOD-3, producing a
+        // mismatched shell).
+        let q_glass_front = self.profiler.begin_query("mesh_glass_front", encoder);
+        {
+            let mut rp = self.mesh_glass.begin_front_pass(
+                encoder,
+                &viewport.glass_entry_packed_view,
+                &viewport.glass_depth_front_view,
+            );
+            rp.set_pipeline(&self.mesh_glass.front_pipeline);
+            rp.set_bind_group(0, g0_bg, &[]);
+            rp.set_bind_group(2, glass_g2, &[]);
+            for (slot, d) in draws.iter().enumerate() {
+                if !d.has_glass { continue; }
+                let Some((vbo, ibo, lod0_index_count)) = self.mesh_buffer(d.asset_handle_raw)
+                else { continue; };
+                if !slot_active[slot] { continue; }
+                let g1_bg = &viewport.splat_instance_bind_groups[slot];
+                rp.set_bind_group(1, g1_bg, &[]);
+                rp.set_vertex_buffer(0, vbo.slice(..));
+                rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
+                if direct_mode {
+                    rp.draw_indexed(0..lod0_index_count, 0, 0..1);
+                } else {
+                    let cluster_count = self
+                        .mesh_cluster_buffer(d.asset_handle_raw)
+                        .map(|(_, c)| c)
+                        .unwrap_or(0);
+                    let max_draws = std::env::var("RKP_MESH_DEBUG_MAX_DRAWS")
+                        .ok()
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .map(|n| n.min(cluster_count))
+                        .unwrap_or(cluster_count);
+                    let (args_buf, _) = &viewport.mesh_lod_args_buffers[slot];
+                    let count_buf = &viewport.mesh_lod_count_buffers[slot];
+                    rp.multi_draw_indexed_indirect_count(
+                        args_buf, 0, count_buf, 0, max_draws,
+                    );
+                }
+            }
+        }
+        self.profiler.end_query(encoder, q_glass_front);
+
+        let q_glass_back = self.profiler.begin_query("mesh_glass_back", encoder);
+        {
+            let mut rp = self.mesh_glass.begin_back_pass(
+                encoder,
+                &viewport.glass_exit_dist_view,
+                &viewport.glass_depth_back_view,
+            );
+            rp.set_pipeline(&self.mesh_glass.back_pipeline);
+            rp.set_bind_group(0, g0_bg, &[]);
+            rp.set_bind_group(2, glass_g2, &[]);
+            for (slot, d) in draws.iter().enumerate() {
+                if !d.has_glass { continue; }
+                let Some((vbo, ibo, lod0_index_count)) = self.mesh_buffer(d.asset_handle_raw)
+                else { continue; };
+                if !slot_active[slot] { continue; }
+                let g1_bg = &viewport.splat_instance_bind_groups[slot];
+                rp.set_bind_group(1, g1_bg, &[]);
+                rp.set_vertex_buffer(0, vbo.slice(..));
+                rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
+                if direct_mode {
+                    rp.draw_indexed(0..lod0_index_count, 0, 0..1);
+                } else {
+                    let cluster_count = self
+                        .mesh_cluster_buffer(d.asset_handle_raw)
+                        .map(|(_, c)| c)
+                        .unwrap_or(0);
+                    let max_draws = std::env::var("RKP_MESH_DEBUG_MAX_DRAWS")
+                        .ok()
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .map(|n| n.min(cluster_count))
+                        .unwrap_or(cluster_count);
+                    let (args_buf, _) = &viewport.mesh_lod_args_buffers[slot];
+                    let count_buf = &viewport.mesh_lod_count_buffers[slot];
+                    rp.multi_draw_indexed_indirect_count(
+                        args_buf, 0, count_buf, 0, max_draws,
+                    );
+                }
+            }
+        }
+        self.profiler.end_query(encoder, q_glass_back);
+
+        let q_glass_combine = self.profiler.begin_query("mesh_glass_combine", encoder);
+        self.mesh_glass.dispatch_combine(
+            encoder,
+            glass_combine_bg,
+            viewport.width,
+            viewport.height,
+        );
+        self.profiler.end_query(encoder, q_glass_combine);
     }
 
     /// Render the mesh-mode directional shadow map. Mirrors
@@ -943,6 +1140,7 @@ impl RkpRenderer {
             return;
         }
         viewport.refresh_mesh_shadow_bindings(&self.device, self);
+        viewport.refresh_mesh_glass_bindings(&self.device, self);
         viewport.ensure_mesh_lod_shadow_capacity(&self.device, self, draws.len() as u32);
 
         // `RKP_MESH_DEBUG_DIRECT=1` also bypasses the shadow LOD
@@ -1165,6 +1363,16 @@ impl RkpRenderer {
                 );
                 rp.set_pipeline(&self.mesh_shadow_map.render_pipeline);
                 rp.set_bind_group(0, render_g0, &[]);
+                // Glass-classify bg, borrowed after all per-cascade
+                // `&mut viewport` work above is done. Same bg the
+                // primary mesh raster + glass front/back use — the
+                // shadow FS does the same `discard`-on-glass classify
+                // so the opaque shadow map only has opaque casters.
+                let glass_g2 = viewport
+                    .mesh_glass_g2_bg
+                    .as_ref()
+                    .expect("mesh_glass g2 bg present after refresh");
+                rp.set_bind_group(2, glass_g2, &[]);
                 if collect_pipestats {
                     // Slots 6..10 = mesh_shadow_render[0..3].
                     rp.begin_pipeline_statistics_query(
@@ -1209,6 +1417,108 @@ impl RkpRenderer {
                 }
             }
             self.profiler.end_query(encoder, q_render);
+
+            // 1b. Glass shadow front + back. Captures glass entry +
+            //     exit depth from this cascade's light POV. The
+            //     shade pass reads both and applies Beer attenuation
+            //     to the existing opaque CSM shadow factor.
+            //     Per-instance `has_glass` filter — pure-opaque
+            //     instances skip these passes entirely.
+            let q_glass_front = self.profiler.begin_query(
+                &format!("mesh_glass_shadow_front[{cascade}]"),
+                encoder,
+            );
+            {
+                let mut rp = self.mesh_glass_shadow.begin_front_pass(
+                    encoder,
+                    &viewport.mesh_glass_shadow_front_views[cascade],
+                );
+                rp.set_pipeline(&self.mesh_glass_shadow.front_pipeline);
+                rp.set_bind_group(0, render_g0, &[]);
+                let glass_g2 = viewport
+                    .mesh_glass_g2_bg
+                    .as_ref()
+                    .expect("mesh_glass g2 bg present after refresh");
+                rp.set_bind_group(2, glass_g2, &[]);
+                for (slot, d) in draws.iter().enumerate() {
+                    if !d.has_glass { continue; }
+                    let Some((vbo, ibo, lod0_index_count)) =
+                        self.mesh_buffer(d.asset_handle_raw)
+                    else { continue; };
+                    if !slot_active[slot] { continue; }
+                    let g1_bg = &viewport.splat_instance_bind_groups[slot];
+                    rp.set_bind_group(1, g1_bg, &[]);
+                    rp.set_vertex_buffer(0, vbo.slice(..));
+                    rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
+                    if direct_mode {
+                        rp.draw_indexed(0..lod0_index_count, 0, 0..1);
+                    } else {
+                        let cluster_count = self
+                            .mesh_cluster_buffer(d.asset_handle_raw)
+                            .map(|(_, c)| c)
+                            .unwrap_or(0);
+                        let max_draws = max_draws_override
+                            .map(|n| n.min(cluster_count))
+                            .unwrap_or(cluster_count);
+                        let (args_buf, _) =
+                            &viewport.mesh_lod_shadow_args_buffers[slot][cascade];
+                        let count_buf =
+                            &viewport.mesh_lod_shadow_count_buffers[slot][cascade];
+                        rp.multi_draw_indexed_indirect_count(
+                            args_buf, 0, count_buf, 0, max_draws,
+                        );
+                    }
+                }
+            }
+            self.profiler.end_query(encoder, q_glass_front);
+
+            let q_glass_back = self.profiler.begin_query(
+                &format!("mesh_glass_shadow_back[{cascade}]"),
+                encoder,
+            );
+            {
+                let mut rp = self.mesh_glass_shadow.begin_back_pass(
+                    encoder,
+                    &viewport.mesh_glass_shadow_back_views[cascade],
+                );
+                rp.set_pipeline(&self.mesh_glass_shadow.back_pipeline);
+                rp.set_bind_group(0, render_g0, &[]);
+                let glass_g2 = viewport
+                    .mesh_glass_g2_bg
+                    .as_ref()
+                    .expect("mesh_glass g2 bg present after refresh");
+                rp.set_bind_group(2, glass_g2, &[]);
+                for (slot, d) in draws.iter().enumerate() {
+                    if !d.has_glass { continue; }
+                    let Some((vbo, ibo, lod0_index_count)) =
+                        self.mesh_buffer(d.asset_handle_raw)
+                    else { continue; };
+                    if !slot_active[slot] { continue; }
+                    let g1_bg = &viewport.splat_instance_bind_groups[slot];
+                    rp.set_bind_group(1, g1_bg, &[]);
+                    rp.set_vertex_buffer(0, vbo.slice(..));
+                    rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
+                    if direct_mode {
+                        rp.draw_indexed(0..lod0_index_count, 0, 0..1);
+                    } else {
+                        let cluster_count = self
+                            .mesh_cluster_buffer(d.asset_handle_raw)
+                            .map(|(_, c)| c)
+                            .unwrap_or(0);
+                        let max_draws = max_draws_override
+                            .map(|n| n.min(cluster_count))
+                            .unwrap_or(cluster_count);
+                        let (args_buf, _) =
+                            &viewport.mesh_lod_shadow_args_buffers[slot][cascade];
+                        let count_buf =
+                            &viewport.mesh_lod_shadow_count_buffers[slot][cascade];
+                        rp.multi_draw_indexed_indirect_count(
+                            args_buf, 0, count_buf, 0, max_draws,
+                        );
+                    }
+                }
+            }
+            self.profiler.end_query(encoder, q_glass_back);
 
             // 2. Blit compute — copy bitcast(depth) into the cascade's
             //    slice of `shadow_buffer`. Single thread per texel,

@@ -45,15 +45,23 @@ pub struct MeshPass {
 impl MeshPass {
     /// Build the mesh raster pipeline. Reuses `g0_layout` / `g1_layout`
     /// from the splat pass so the same bind groups can drive both
-    /// pipelines.
+    /// pipelines. `g2_layout` carries the glass-classification
+    /// bindings (`leaf_attr_pool` + `materials` + `instances` +
+    /// `instance_overlay` + `color_pool_data`); the FS reads them to
+    /// `discard` glass fragments so `gbuf_position` only carries
+    /// opaque-hit depth — same convention the march uses (it walks
+    /// past glass cells to find the opaque behind). Reuse
+    /// `MeshGlassPass::g2_layout` so a single bind group drives both
+    /// passes.
     pub fn new(
         device: &wgpu::Device,
         g0_layout: &wgpu::BindGroupLayout,
         g1_layout: &wgpu::BindGroupLayout,
+        g2_layout: &wgpu::BindGroupLayout,
     ) -> Self {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh pipeline layout"),
-            bind_group_layouts: &[Some(g0_layout), Some(g1_layout)],
+            bind_group_layouts: &[Some(g0_layout), Some(g1_layout), Some(g2_layout)],
             immediate_size: 0,
         });
 

@@ -50,7 +50,11 @@ use crate::mesh_extract::MeshVertex;
 /// can still spend tens of seconds in DAG build at editor open
 /// — bake-at-import (`project_dag_bake_at_import.md`) is the
 /// proper fix once Phase 6.5 freezes the DAG params. Set
-/// `RKP_MESH_LOD_LEVELS=1..=4` at runtime to override.
+/// `RKP_MESH_LOD_LEVELS=1..=LOD_LEVELS_MAX` at bake time to
+/// override. (At runtime the v5 load path uses whatever was
+/// baked into the asset; the env var only affects
+/// `build_cluster_dag` in `--rebuild-mesh` and the v4 legacy
+/// load fallback.)
 pub const LOD_LEVELS: usize = 4;
 
 /// Hard cap on `lod_levels` for the runtime
@@ -118,8 +122,8 @@ impl ClusterDag {
 }
 
 /// Build the cluster DAG using the runtime-configured LOD level
-/// count. Reads `RKP_MESH_LOD_LEVELS` (clamped 1..=4) once per call
-/// and forwards to [`build_cluster_dag_with_levels`].
+/// count. Reads `RKP_MESH_LOD_LEVELS` (clamped 1..=LOD_LEVELS_MAX)
+/// once per call and forwards to [`build_cluster_dag_with_levels`].
 pub fn build_cluster_dag(vertices: &[MeshVertex], indices: &[u32]) -> ClusterDag {
     build_cluster_dag_with_levels(vertices, indices, lod_levels_runtime())
 }
