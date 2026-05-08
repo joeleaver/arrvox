@@ -598,6 +598,14 @@ impl RkpRenderer {
         } else {
             0
         };
+        // RKP_MESH_DEBUG_FORCE_LEVEL=N: bypass Karis admit and admit
+        // ONLY clusters at LOD level N. Used to diagnose whether
+        // mixed-level admit is causing cross-cluster cracks.
+        // Sentinel u32::MAX == "use Karis admit (default)".
+        let force_level: u32 = std::env::var("RKP_MESH_DEBUG_FORCE_LEVEL")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(u32::MAX);
         let mut slot_active: Vec<bool> = vec![false; draws.len()];
         for (slot, d) in draws.iter().enumerate() {
             let Some((_, _, _)) = self.mesh_buffer(d.asset_handle_raw) else {
@@ -650,6 +658,10 @@ impl RkpRenderer {
                 cluster_count,
                 force_admit: force_admit_flag,
                 record_stats: lod_stats_enabled as u32,
+                force_level,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
             };
             queue.write_buffer(
                 &viewport.mesh_lod_params_buffers[slot],
@@ -942,6 +954,10 @@ impl RkpRenderer {
         let lod_stats_enabled = std::env::var("RKP_MESH_LOD_STATS").is_ok();
         let pipestats_enabled = std::env::var("RKP_MESH_PIPESTATS").is_ok();
         let force_admit = std::env::var("RKP_MESH_DEBUG_FORCE_ADMIT").is_ok();
+        let force_level: u32 = std::env::var("RKP_MESH_DEBUG_FORCE_LEVEL")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(u32::MAX);
         let max_draws_override = std::env::var("RKP_MESH_DEBUG_MAX_DRAWS")
             .ok()
             .and_then(|s| s.parse::<u32>().ok());
@@ -974,11 +990,13 @@ impl RkpRenderer {
             let pixel_threshold =
                 base_threshold * threshold_falloff.powi(cascade as i32);
 
-            // Stats / pipestats: only collected on cascade 0 to avoid
-            // multiplying query sets. Most useful for correctness +
-            // tuning anyway; per-cascade breakdowns are a follow-up.
+            // LOD admit stats are still pass-shared (one buffer per
+            // primary/shadow), so we collect on cascade 0 only —
+            // mixing all cascades' atomicAdds would double-count.
+            // Pipestats has dedicated per-cascade slots in the query
+            // set, so it runs every cascade.
             let collect_stats = lod_stats_enabled && cascade == 0;
-            let collect_pipestats = pipestats_enabled && cascade == 0;
+            let collect_pipestats = pipestats_enabled;
 
             // Per-slot prep for this cascade: ensure args buffer +
             // (re)build g2 bg + write params with this cascade's
@@ -1027,6 +1045,10 @@ impl RkpRenderer {
                     cluster_count,
                     force_admit: force_admit as u32,
                     record_stats: collect_stats as u32,
+                    force_level,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
                 };
                 queue.write_buffer(
                     &viewport.mesh_lod_shadow_params_buffers[slot][cascade],
@@ -1067,8 +1089,10 @@ impl RkpRenderer {
                         timestamp_writes: None,
                     });
                     if collect_pipestats {
+                        // Slots 2..6 = mesh_shadow_lod_select[0..3].
                         cpass.begin_pipeline_statistics_query(
-                            &viewport.mesh_pipestats_query_set, 2,
+                            &viewport.mesh_pipestats_query_set,
+                            2 + cascade as u32,
                         );
                     }
                     for (slot, d) in draws.iter().enumerate() {
@@ -1120,8 +1144,10 @@ impl RkpRenderer {
                 rp.set_pipeline(&self.mesh_shadow_map.render_pipeline);
                 rp.set_bind_group(0, render_g0, &[]);
                 if collect_pipestats {
+                    // Slots 6..10 = mesh_shadow_render[0..3].
                     rp.begin_pipeline_statistics_query(
-                        &viewport.mesh_pipestats_query_set, 3,
+                        &viewport.mesh_pipestats_query_set,
+                        2 + crate::shadow_map_pass::CSM_CASCADE_COUNT + cascade as u32,
                     );
                 }
                 for (slot, d) in draws.iter().enumerate() {

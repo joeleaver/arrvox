@@ -445,7 +445,7 @@ impl RkpSceneManager {
         // fallback) take the fall-back path below: rebuild from the
         // scene-merged tree as before.
         use rkp_core::mesh_extract::MeshVertex;
-        use rkp_core::mesh_cluster::MeshletCluster;
+        use rkp_core::mesh_cluster::{MeshletCluster, PARENT_GROUP_ERROR_ROOT};
         let have_baked_mesh = !mesh_vertices_bytes.is_empty();
         let (mut mesh_vertices, mesh_indices, mut meshlet_clusters, mesh_lod0_index_count) =
             if have_baked_mesh {
@@ -491,6 +491,66 @@ impl RkpSceneManager {
                 let lod0 = dag.lod0_index_range.1 - dag.lod0_index_range.0;
                 (v, dag.indices, dag.clusters, lod0)
             };
+
+        // Per-LOD-level error normalization. The Karis admit rule's
+        // chain consistency requires `cluster_error` of a level-N
+        // cluster to equal `parent_group_error` of its level-(N-1)
+        // children. The DAG builder already enforces this PER GROUP
+        // (all sub-clusters of a group share the same cluster_error,
+        // and consumed prev-level clusters get their parent_group_error
+        // backfilled from the same group_error). But across DIFFERENT
+        // groups at the same level the error values differ, so
+        // adjacent clusters may pick DIFFERENT LOD levels at runtime.
+        // The simplifier's group-boundary lock keeps each level pair
+        // watertight in isolation, but mixing 3+ adjacent levels in
+        // one frame creates topological cracks at group boundaries
+        // (T-junctions / mismatched edge chains across N+2-step LOD
+        // gaps). Visually: the elephant scene at LOD_LEVELS=8 falls
+        // apart into chunks once Karis admits at multiple levels.
+        //
+        // Workaround until monotonic bounding spheres land
+        // (`project_mesh_lod_monotonic_spheres_followup`): collapse
+        // every level's cluster_error to the LEVEL'S MAX, and rewrite
+        // each non-root cluster's parent_group_error to the next
+        // level's max. This makes the entire instance admit at one
+        // level (since all chains see the same boundary error), at
+        // the cost of per-cluster LOD precision. For the splat5
+        // elephant the precision loss is invisible because all chains
+        // were converging on the same level anyway.
+        if !meshlet_clusters.is_empty() {
+            let mut max_level = 0u32;
+            for c in &meshlet_clusters {
+                if c.lod_level > max_level {
+                    max_level = c.lod_level;
+                }
+            }
+            // Per-level max cluster_error. Index by lod_level.
+            let mut level_max_error: Vec<f32> = vec![0.0; max_level as usize + 1];
+            for c in &meshlet_clusters {
+                let l = c.lod_level as usize;
+                if c.cluster_error > level_max_error[l] {
+                    level_max_error[l] = c.cluster_error;
+                }
+            }
+            for c in &mut meshlet_clusters {
+                let l = c.lod_level as usize;
+                // Don't override the leaf sentinel (cluster_error=0
+                // means cluster_is_leaf in the shader). Leaves are at
+                // LOD 0 by construction; leaving their cluster_error
+                // at 0 keeps the leaf admit short-circuit working.
+                if c.cluster_error != 0.0 {
+                    c.cluster_error = level_max_error[l];
+                }
+                // Rewrite parent_group_error to the next level's max,
+                // preserving the root sentinel for true DAG roots.
+                if c.parent_group_error < PARENT_GROUP_ERROR_ROOT * 0.5 {
+                    let next_l = (c.lod_level + 1) as usize;
+                    if next_l <= max_level as usize {
+                        c.parent_group_error = level_max_error[next_l];
+                    }
+                }
+            }
+        }
 
         // For v5 files baked BEFORE the bone-fields-in-vertex change
         // (Phase 6.6 commit 1), the on-disk vertices carry zero

@@ -54,6 +54,15 @@ struct MeshLodSelectParams {
     /// When non-zero, atomic-add into the pass-shared `stats`
     /// histogram. CPU sets this from `RKP_MESH_LOD_STATS=1`.
     record_stats: u32,
+    /// Debug: when not 0xFFFFFFFF, admit ONLY clusters whose
+    /// `lod_level` exactly equals this value. Bypasses Karis
+    /// admit entirely. Used to A/B-test whether mixed-level
+    /// admit is the cause of cross-cluster cracks.
+    /// CPU sets from `RKP_MESH_DEBUG_FORCE_LEVEL=N`.
+    force_level: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 struct MeshInstance {
@@ -183,7 +192,8 @@ fn lod_select(@builtin(global_invocation_id) gid: vec3<u32>) {
     let admit_parent = parent_is_root || parent_err_px >= params.pixel_threshold;
     let admit_self = cluster_is_leaf || cluster_err_px < params.pixel_threshold;
     let karis_admit = admit_parent && admit_self;
-    let admit = (params.force_admit != 0u) || karis_admit;
+    let level_admit = (params.force_level != 0xFFFFFFFFu) && (c.lod_level == params.force_level);
+    let admit = level_admit || (params.force_admit != 0u) || (params.force_level == 0xFFFFFFFFu && karis_admit);
 
     if (admit) {
         // Claim a compacted slot. All admitted threads atomicAdd 1

@@ -641,17 +641,23 @@ impl ViewportRenderer {
                         | wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS
                         | wgpu::PipelineStatisticsTypes::COMPUTE_SHADER_INVOCATIONS,
                 ),
-                count: 4,
+                // 0  = mesh_lod_select (compute, primary)
+                // 1  = mesh_raster (graphics, primary)
+                // 2..6 = mesh_shadow_lod_select[0..3] (compute, per cascade)
+                // 6..10 = mesh_shadow_render[0..3]    (graphics, per cascade)
+                count: 2 + 2 * CSM_CASCADE_COUNT,
             }),
             mesh_pipestats_resolve_buffer: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rkp_vr_mesh_pipestats_resolve"),
-                size: 256,
+                // 10 slots × 5 × u64 = 400 B; round up to 512 for the
+                // COPY_BUFFER_ALIGNMENT requirement on resolve_query_set.
+                size: 512,
                 usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }),
             mesh_pipestats_staging_buffer: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rkp_vr_mesh_pipestats_staging"),
-                size: 256,
+                size: 512,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
@@ -1155,8 +1161,9 @@ impl ViewportRenderer {
             Ok(Ok(())) => {
                 let slice = self.mesh_pipestats_staging_buffer.slice(..);
                 let data = slice.get_mapped_range();
-                if data.len() >= 160 {
-                    // Layout: 4 slots × 5 × u64. Stat order matches
+                let needed = (2 + 2 * CSM_CASCADE_COUNT as usize) * 40;
+                if data.len() >= needed {
+                    // Layout: N slots × 5 × u64. Stat order matches
                     // the `PipelineStatisticsTypes` bit order:
                     // VS, CLIPPER_IN, CLIPPER_OUT, FS, CS.
                     let read_slot = |slot: usize| -> [u64; 5] {
@@ -1170,18 +1177,20 @@ impl ViewportRenderer {
                         }
                         out
                     };
-                    let labels = [
-                        "mesh_lod_select",
-                        "mesh_raster",
-                        "mesh_shadow_lod_select",
-                        "mesh_shadow_render",
-                    ];
-                    for (slot, label) in labels.iter().enumerate() {
-                        let s = read_slot(slot);
+                    let log = |label: &str, s: [u64; 5]| {
                         eprintln!(
                             "[mesh_pipestats {label}] vs={} clipper_in={} clipper_out={} fs={} cs={}",
                             s[0], s[1], s[2], s[3], s[4],
                         );
+                    };
+                    log("mesh_lod_select", read_slot(0));
+                    log("mesh_raster", read_slot(1));
+                    let n = CSM_CASCADE_COUNT as usize;
+                    for c in 0..n {
+                        log(&format!("mesh_shadow_lod_select[{c}]"), read_slot(2 + c));
+                    }
+                    for c in 0..n {
+                        log(&format!("mesh_shadow_render[{c}]"), read_slot(2 + n + c));
                     }
                 }
                 drop(data);
@@ -1208,9 +1217,11 @@ impl ViewportRenderer {
         if self.mesh_pipestats_pending.is_some() {
             return;
         }
+        let n = 2 + 2 * CSM_CASCADE_COUNT;
+        let bytes = (n as u64) * 40;
         encoder.resolve_query_set(
             &self.mesh_pipestats_query_set,
-            0..4,
+            0..n,
             &self.mesh_pipestats_resolve_buffer,
             0,
         );
@@ -1219,7 +1230,7 @@ impl ViewportRenderer {
             0,
             &self.mesh_pipestats_staging_buffer,
             0,
-            160,
+            bytes,
         );
         self.mesh_pipestats_needs_map = true;
     }

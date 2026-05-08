@@ -64,9 +64,16 @@ pub struct MeshLodSelectParams {
     /// lines aren't free at the 1M+ threads/frame Phase 6 issues.
     /// CPU sets this from `RKP_MESH_LOD_STATS=1`.
     pub record_stats: u32,
+    /// Debug: 0xFFFFFFFF (default) means "use Karis admit". Any
+    /// other value forces admit only on clusters with that exact
+    /// lod_level. CPU sets from `RKP_MESH_DEBUG_FORCE_LEVEL=N`.
+    pub force_level: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<MeshLodSelectParams>() == 16);
+const _: () = assert!(std::mem::size_of::<MeshLodSelectParams>() == 32);
 
 /// Compute pipeline + reusable bind-group layouts.
 pub struct MeshLodSelectPass {
