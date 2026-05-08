@@ -42,14 +42,15 @@ pub struct MeshShadowParams {
 const _: () = assert!(std::mem::size_of::<MeshShadowParams>() == 16);
 
 /// Wire format for the per-cascade `BlitParams` uniform read by the
-/// depth → shadow_buffer blit. Same shape as `MeshShadowParams`;
-/// kept as a separate type for clarity (different binding, different
-/// shader). 16 B.
+/// depth → shadow_buffer blit. 16 B. `shadow_map_size` carries the
+/// current per-cascade map side length (in texels) so the blit's
+/// stride math tracks the engine-side size when the user changes
+/// the Shadow Quality preset.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MeshShadowBlitParams {
     pub cascade_index: u32,
-    pub _pad0: u32,
+    pub shadow_map_size: u32,
     pub _pad1: u32,
     pub _pad2: u32,
 }
@@ -71,8 +72,6 @@ pub struct MeshShadowMapPass {
     /// Blit-pass `g0` layout — depth texture (read) + shadow_buffer
     /// (write).
     pub blit_g0_layout: wgpu::BindGroupLayout,
-    /// Shadow-map side length in texels. Matches `SHADOW_MAP_DEFAULT_SIZE`.
-    pub size: u32,
 }
 
 impl MeshShadowMapPass {
@@ -297,7 +296,6 @@ impl MeshShadowMapPass {
             render_g0_layout,
             blit_pipeline,
             blit_g0_layout,
-            size: SHADOW_MAP_DEFAULT_SIZE,
         }
     }
 
@@ -397,11 +395,16 @@ impl MeshShadowMapPass {
     }
 
     /// Dispatch the depth → shadow_buffer copy. One workgroup per
-    /// 8×8 texel tile, writes one u32 per texel.
+    /// 8×8 texel tile, writes one u32 per texel. `map_size` is the
+    /// per-cascade map side length (passed in rather than stored so
+    /// the dispatch always tracks the per-viewport
+    /// `EnvironmentSettings::shadow_csm_map_size`, which the engine
+    /// can change at runtime via the Shadow Quality preset).
     pub fn dispatch_blit(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         blit_g0_bg: &wgpu::BindGroup,
+        map_size: u32,
     ) {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("mesh_shadow blit"),
@@ -409,7 +412,7 @@ impl MeshShadowMapPass {
         });
         cpass.set_pipeline(&self.blit_pipeline);
         cpass.set_bind_group(0, blit_g0_bg, &[]);
-        let groups = self.size.div_ceil(8);
+        let groups = map_size.div_ceil(8);
         cpass.dispatch_workgroups(groups, groups, 1);
     }
 

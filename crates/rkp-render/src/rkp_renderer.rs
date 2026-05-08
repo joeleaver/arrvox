@@ -1223,7 +1223,11 @@ impl RkpRenderer {
                 &format!("mesh_shadow_blit[{cascade}]"),
                 encoder,
             );
-            self.mesh_shadow_map.dispatch_blit(encoder, blit_g0);
+            self.mesh_shadow_map.dispatch_blit(
+                encoder,
+                blit_g0,
+                viewport.shadow_map.size,
+            );
             self.profiler.end_query(encoder, q_blit);
         }
     }

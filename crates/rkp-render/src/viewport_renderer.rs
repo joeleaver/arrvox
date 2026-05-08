@@ -465,7 +465,8 @@ impl ViewportRenderer {
                 });
                 queue.write_buffer(&buf, 0, bytemuck::bytes_of(&MeshShadowBlitParams {
                     cascade_index: i,
-                    _pad0: 0, _pad1: 0, _pad2: 0,
+                    shadow_map_size: SHADOW_MAP_DEFAULT_SIZE,
+                    _pad1: 0, _pad2: 0,
                 }));
                 buf
             })
@@ -693,25 +694,44 @@ impl ViewportRenderer {
 
     /// Resize every shadow-map-sized resource on this viewport
     /// (depth texture + per-layer views, `shadow_map.shadow_buffer`,
-    /// the shade pass's shadow+ssao bind group) to a new side
-    /// length. No-op if the size already matches. Engine calls this
-    /// once per frame from `prepare_shadow_maps` based on
+    /// the shade pass's shadow+ssao bind group, the per-cascade
+    /// blit-params uniforms that carry `shadow_map_size`) to a new
+    /// side length. No-op if the size already matches. Engine calls
+    /// this once per frame from `prepare_shadow_maps` based on
     /// `EnvironmentSettings::shadow_csm_map_size`.
-    pub fn set_shadow_map_size(&mut self, device: &wgpu::Device, new_size: u32) {
+    pub fn set_shadow_map_size(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        new_size: u32,
+    ) {
         let buffer_changed = self.shadow_map.resize_shadow_buffer(device, new_size);
         let depth_changed = self.resize_shadow_map_depth(device, new_size);
-        // Rebind the shade pass's shadow+ssao bind group when either
-        // side resized — the shade pass holds a reference to the old
-        // shadow_buffer (resize_shadow_buffer recreated it) and the
-        // shadow_view from the trace pass (unchanged here, but cheap
-        // to rebind).
-        if buffer_changed || depth_changed.is_some() {
-            self.shade.set_shadow_and_ssao(
-                device,
-                &self.shadow_trace.output_view,
-                &self.ssao.output_view,
-                &self.shadow_map.shadow_buffer,
-                &self.shadow_map.uniform_buffer,
+        if !buffer_changed && depth_changed.is_none() {
+            return;
+        }
+        // Rebind the shade pass's shadow+ssao bind group — it holds
+        // a reference to the old shadow_buffer (just recreated).
+        self.shade.set_shadow_and_ssao(
+            device,
+            &self.shadow_trace.output_view,
+            &self.ssao.output_view,
+            &self.shadow_map.shadow_buffer,
+            &self.shadow_map.uniform_buffer,
+        );
+        // Update the per-cascade blit-params uniforms so the blit
+        // shader's stride math matches the new size. The `cascade_index`
+        // field stays the same; only `shadow_map_size` changes.
+        for i in 0..CSM_CASCADE_COUNT as usize {
+            queue.write_buffer(
+                &self.mesh_shadow_blit_params_buffers[i],
+                0,
+                bytemuck::bytes_of(&MeshShadowBlitParams {
+                    cascade_index: i as u32,
+                    shadow_map_size: new_size,
+                    _pad1: 0,
+                    _pad2: 0,
+                }),
             );
         }
     }

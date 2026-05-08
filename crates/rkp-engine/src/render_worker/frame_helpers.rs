@@ -264,10 +264,12 @@ pub(super) fn prepare_shadow_maps(
         };
 
         // Resize the per-viewport shadow_buffer + depth texture +
-        // shade bg if the user picked a new Shadow Quality tier.
-        // No-op if already at `map_size`. Must run before the
-        // bind-group refresh inside dispatch_mesh_shadow.
-        vr.set_shadow_map_size(&state.device, map_size);
+        // shade bg + blit params (which carry shadow_map_size for
+        // the per-cascade blit's stride math) if the user picked a
+        // new Shadow Quality tier. No-op if already at `map_size`.
+        // Must run before the bind-group refresh inside
+        // dispatch_mesh_shadow.
+        vr.set_shadow_map_size(&state.device, &state.queue, map_size);
 
         // Per-VR cascade fit: each viewport's camera frustum drives
         // its own CSM. The light direction + scene AABB are scene-

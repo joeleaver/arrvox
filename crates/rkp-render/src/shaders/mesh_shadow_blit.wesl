@@ -11,12 +11,16 @@
 // clear value (1.0); after bitcast that's `0x3F800000` =
 // `SHADOW_MAP_FAR_DEPTH_BITS`, exactly the "no occluder" sentinel
 // shade's `sample_shadow_map` expects.
-
-const SHADOW_MAP_SIZE: u32 = 1024u;
+//
+// `shadow_map_size` is read from `BlitParams` rather than baked as a
+// constant — the engine resizes the per-viewport shadow buffer when
+// the user changes the Shadow Quality preset (Low=512² ↔ Ultra=4096²),
+// and a stale stride here would write to the wrong slice (visual:
+// striped output at smaller sizes, all-shadowed output at larger).
 
 struct BlitParams {
     cascade_index: u32,
-    _pad0: u32,
+    shadow_map_size: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -27,11 +31,12 @@ struct BlitParams {
 
 @compute @workgroup_size(8, 8, 1)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if gid.x >= SHADOW_MAP_SIZE || gid.y >= SHADOW_MAP_SIZE {
+    let size = params.shadow_map_size;
+    if gid.x >= size || gid.y >= size {
         return;
     }
     let depth = textureLoad(depth_tex, vec2<i32>(i32(gid.x), i32(gid.y)), 0);
-    let slice = SHADOW_MAP_SIZE * SHADOW_MAP_SIZE;
-    let idx = params.cascade_index * slice + gid.y * SHADOW_MAP_SIZE + gid.x;
+    let slice = size * size;
+    let idx = params.cascade_index * slice + gid.y * size + gid.x;
     shadow_buffer[idx] = bitcast<u32>(depth);
 }
