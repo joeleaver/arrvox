@@ -72,26 +72,43 @@ pub struct Renderable {
 /// How a renderable entity's geometry is registered with the
 /// renderer. Each variant carries the bookkeeping needed to free its
 /// allocations when the entity's geometry is replaced or destroyed.
-///
-/// Existing single variant `Octree` covers the only path today;
-/// proxy-mesh + future paths land here as additional variants.
 #[derive(Debug, Clone)]
 pub enum RenderGeometry {
     /// Voxelized asset or procedural — owns an octree allocation
     /// (and on procedurals, brick allocations) inside the
     /// scene-global pools.
     Octree(SpatialData),
+    /// Procedural rendered as a triangle proxy mesh, no octree.
+    /// Owns a renderer mesh handle (vbo + ibo + cluster table)
+    /// allocated via `RkpSceneManager::reserve_procedural_handle`.
+    ProxyMesh(ProxyMeshData),
+}
+
+/// Renderer state for a proxy-mesh procedural. The actual triangle
+/// data lives on the GPU in `RkpRenderer`'s `mesh_buffers` /
+/// `mesh_cluster_buffers` keyed by `handle`.
+#[derive(Debug, Clone)]
+pub struct ProxyMeshData {
+    /// Renderer mesh handle. Allocated from the same handle space
+    /// as disk assets so `mesh_buffers[handle.raw()]` is the GPU
+    /// buffer pair. Released via
+    /// `RkpSceneManager::release_procedural_handle` when the entity
+    /// is destroyed or re-baked into a different mode.
+    pub handle: rkp_render::AssetHandle,
+    /// Object-local AABB of the meshed surface. Same value the
+    /// single proxy `MeshletCluster` carries — kept on the CPU side
+    /// so Renderable consumers (gizmo / pick / overlap queries) can
+    /// answer bounds questions without a GPU readback.
+    pub aabb: rkp_core::Aabb,
 }
 
 impl RenderGeometry {
-    /// Borrow the octree variant if this is one. Logically
-    /// infallible while `Octree` is the only variant — added so
-    /// future variants force every reader to handle the new case
-    /// explicitly.
+    /// Borrow the octree variant if this is one.
     #[inline]
     pub fn as_octree(&self) -> Option<&SpatialData> {
         match self {
             RenderGeometry::Octree(s) => Some(s),
+            RenderGeometry::ProxyMesh(_) => None,
         }
     }
 
@@ -99,6 +116,7 @@ impl RenderGeometry {
     pub fn as_octree_mut(&mut self) -> Option<&mut SpatialData> {
         match self {
             RenderGeometry::Octree(s) => Some(s),
+            RenderGeometry::ProxyMesh(_) => None,
         }
     }
 
@@ -108,6 +126,27 @@ impl RenderGeometry {
     pub fn into_octree(self) -> Option<SpatialData> {
         match self {
             RenderGeometry::Octree(s) => Some(s),
+            RenderGeometry::ProxyMesh(_) => None,
+        }
+    }
+
+    /// Borrow the proxy-mesh variant if this is one.
+    #[inline]
+    pub fn as_proxy_mesh(&self) -> Option<&ProxyMeshData> {
+        match self {
+            RenderGeometry::ProxyMesh(p) => Some(p),
+            RenderGeometry::Octree(_) => None,
+        }
+    }
+
+    /// Renderer asset handle for this geometry (octree → asset
+    /// cache handle, proxy → reserved handle, primitives without a
+    /// GPU registration → None).
+    #[inline]
+    pub fn renderer_handle(&self) -> Option<rkp_render::AssetHandle> {
+        match self {
+            RenderGeometry::Octree(_) => None,
+            RenderGeometry::ProxyMesh(p) => Some(p.handle),
         }
     }
 
@@ -116,8 +155,29 @@ impl RenderGeometry {
     pub fn aabb(&self) -> rkp_core::Aabb {
         match self {
             RenderGeometry::Octree(s) => s.aabb,
+            RenderGeometry::ProxyMesh(p) => p.aabb,
         }
     }
+}
+
+/// What the bake worker does with a procedural's tree. Determines
+/// whether the procedural ends up as voxels (default) or as a flat
+/// triangle proxy mesh that bypasses the voxel pool entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BakeMode {
+    /// Voxelize → integrate into the scene-global octree + brick
+    /// pools. Required for paint, sculpt, surface user-shaders, and
+    /// any future per-leaf operations.
+    Voxelize,
+    /// Run GPU surface-nets on the SDF → emit a flat triangle mesh
+    /// the renderer draws via the standard mesh raster path. No
+    /// voxels are allocated; paint / sculpt / surface user-shaders
+    /// are unsupported on these entities until they're converted.
+    ProxyMesh,
+}
+
+impl Default for BakeMode {
+    fn default() -> Self { BakeMode::Voxelize }
 }
 
 /// Octree spatial data for a renderable entity. Not serialized — rebuilt on load.
@@ -345,6 +405,11 @@ pub struct ProceduralGeometry {
     /// indicator.
     #[serde(default, skip)]
     pub bake_in_flight: bool,
+    /// Whether the bake worker should voxelize this procedural or
+    /// emit a triangle proxy mesh. Persists across save/load — same
+    /// procedural always renders the same way.
+    #[serde(default)]
+    pub bake_mode: BakeMode,
 }
 
 impl Default for ProceduralGeometry {
@@ -382,6 +447,7 @@ impl ProceduralGeometry {
             last_evaluated_root_scale: glam::Vec3::ONE,
             bake_generation: 0,
             bake_in_flight: false,
+            bake_mode: BakeMode::Voxelize,
         }
     }
 }

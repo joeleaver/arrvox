@@ -326,6 +326,10 @@ impl<'w> GeneratorContext<'w> {
             prev_spatial: None,
             cache_output_path,
             generator_child: Some(spec),
+            // Generator-emitted children always voxelize. Proxy-mesh
+            // generators are out of scope until the integrate path
+            // grows a proxy-mesh-child branch.
+            bake_mode: crate::components::BakeMode::Voxelize,
         };
         if tx_request.send(req).is_err() {
             // Worker gone → engine shutting down. Surface as cancel.

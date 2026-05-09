@@ -293,6 +293,11 @@ impl EngineState {
             .ok()
             .and_then(|r| r.spatial.clone())
             .and_then(|g| g.into_octree());
+        let bake_mode = self
+            .world
+            .get::<&ProceduralGeometry>(entity)
+            .map(|pg| pg.bake_mode)
+            .unwrap_or_default();
 
         let (aabb, voxel_size) = procedural_voxel_params(&tree_clone, base_voxel_size);
         let instructions = rkp_procedural::flatten_tree(&tree_clone);
@@ -316,6 +321,7 @@ impl EngineState {
             prev_spatial,
             cache_output_path,
             generator_child: None,
+            bake_mode,
         };
         if self.bake_worker.tx_request.send(req).is_err() {
             self.console.warn("bake worker channel closed".to_string());
@@ -357,6 +363,17 @@ impl EngineState {
                             spec.name_hint,
                         );
                     }
+                    BakeOutcome::ProxyMeshOk { .. } => {
+                        // Generator children always voxelize today
+                        // (see context.rs's BakeRequest construction);
+                        // a ProxyMeshOk for a generator child means
+                        // the gate was bypassed somewhere upstream.
+                        self.console.warn(format!(
+                            "Generator child returned ProxyMesh — only Voxelize is supported \
+                             for generator-emitted children (parent={:?}).",
+                            spec.parent_entity,
+                        ));
+                    }
                     BakeOutcome::Failed => {
                         self.console.warn(format!(
                             "Generator child voxelization failed (parent={:?}, vs={:.4}).",
@@ -395,6 +412,12 @@ impl EngineState {
 
             match result.outcome {
                 BakeOutcome::Ok { spatial, voxel_count } => {
+                    // Switch from ProxyMesh → Voxelize: the bake
+                    // worker can't release the proxy handle (it's
+                    // owned by the renderer/scene_mgr on the engine
+                    // side), so do it here before installing the
+                    // new octree spatial.
+                    self.release_proxy_handle_if_any(entity);
                     self.apply_bake_result(
                         entity,
                         result.root_scale,
@@ -402,17 +425,132 @@ impl EngineState {
                         voxel_count,
                     );
                 }
+                BakeOutcome::ProxyMeshOk { surface_mesh, cluster } => {
+                    self.apply_proxy_mesh_result(
+                        entity,
+                        result.root_scale,
+                        surface_mesh,
+                        cluster,
+                    );
+                }
                 BakeOutcome::Failed => {
                     // Keep `dirty` / `pending_bake` intact so the user
                     // can retry (via a new edit or the Bake button) —
                     // clearing them would pretend the bake succeeded.
                     self.console.warn(format!(
-                        "Procedural voxelization failed (voxel_size={:.4}, extent={:.1}).",
+                        "Procedural bake failed (voxel_size={:.4}, extent={:.1}).",
                         result.voxel_size,
                         (result.aabb.max - result.aabb.min).length(),
                     ));
                 }
             }
+        }
+    }
+
+    /// Apply a completed proxy-mesh bake. Releases any previous
+    /// renderer handle on the entity, reserves a fresh one,
+    /// commands the render thread to upload the GPU buffers, and
+    /// stamps the entity's `Renderable.spatial` with the
+    /// `RenderGeometry::ProxyMesh` variant.
+    pub(crate) fn apply_proxy_mesh_result(
+        &mut self,
+        entity: hecs::Entity,
+        baked_root_scale: glam::Vec3,
+        surface_mesh: rkp_render::proc_surface_nets::SurfaceMesh,
+        cluster: rkp_core::mesh_cluster::MeshletCluster,
+    ) {
+        use crate::components::*;
+
+        // Free the previous geometry — either an octree allocation
+        // (first switch from Voxelize to ProxyMesh) or a previous
+        // ProxyMesh handle (re-bake of a proxy-mesh procedural).
+        self.release_renderable_geometry(entity);
+
+        // Reserve a fresh procedural handle and command the render
+        // thread to upload the GPU buffers under it.
+        let handle = self
+            .scene_mgr
+            .lock()
+            .unwrap()
+            .reserve_procedural_handle();
+        let aabb = rkp_core::Aabb {
+            min: surface_mesh.aabb_min,
+            max: surface_mesh.aabb_max,
+        };
+        let _ = self
+            .render_worker
+            .commands
+            .send(crate::render_frame::RenderCommand::UploadProxyMesh {
+                handle_raw: handle.raw(),
+                vertices: surface_mesh.vertices,
+                indices: surface_mesh.indices,
+                cluster,
+            });
+
+        if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
+            renderable.spatial = Some(RenderGeometry::ProxyMesh(ProxyMeshData {
+                handle,
+                aabb,
+            }));
+            renderable.asset_handle = Some(handle);
+            renderable.voxel_count = 0;
+        } else {
+            // Entity disappeared between request and result —
+            // release the freshly-reserved handle so we don't leak.
+            self.scene_mgr
+                .lock()
+                .unwrap()
+                .release_procedural_handle(handle);
+            let _ = self
+                .render_worker
+                .commands
+                .send(crate::render_frame::RenderCommand::ReleaseProxyMesh {
+                    handle_raw: handle.raw(),
+                });
+            return;
+        }
+
+        // Update last_evaluated_root_scale so the preview-multiplier
+        // path zeroes back out (procedural now matches the latest
+        // scale).
+        if let Ok(mut proc_geo) = self.world.get::<&mut ProceduralGeometry>(entity) {
+            proc_geo.dirty = false;
+            proc_geo.pending_bake = false;
+            proc_geo.last_evaluated_root_scale = baked_root_scale;
+        }
+
+        self.geometry_dirty = true;
+        self.gpu_objects_dirty = true;
+    }
+
+    /// If `entity` currently has a `RenderGeometry::ProxyMesh`
+    /// spatial, free its renderer handle (both scene-manager-side
+    /// and render-thread GPU buffers) and clear the field. Returns
+    /// silently if the entity has no proxy handle.
+    pub(crate) fn release_proxy_handle_if_any(&mut self, entity: hecs::Entity) {
+        use crate::components::*;
+        let Some(handle) = self
+            .world
+            .get::<&Renderable>(entity)
+            .ok()
+            .and_then(|r| r.spatial.as_ref().and_then(|g| g.as_proxy_mesh()).map(|p| p.handle))
+        else {
+            return;
+        };
+        self.scene_mgr
+            .lock()
+            .unwrap()
+            .release_procedural_handle(handle);
+        let _ = self
+            .render_worker
+            .commands
+            .send(crate::render_frame::RenderCommand::ReleaseProxyMesh {
+                handle_raw: handle.raw(),
+            });
+        if let Ok(mut r) = self.world.get::<&mut Renderable>(entity) {
+            r.spatial = None;
+            r.asset_handle = None;
+            r.voxel_count = 0;
         }
     }
 

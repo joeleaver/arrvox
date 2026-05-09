@@ -416,6 +416,26 @@ impl RenderState {
                 // Same: per-frame snapshot carries `mode` + `preview_mode`
                 // for every viewport. Render reads from there.
             }
+            RenderCommand::UploadProxyMesh {
+                handle_raw,
+                vertices,
+                indices,
+                cluster,
+            } => {
+                let dispatch_index_count = indices.len() as u32;
+                self.renderer.upload_mesh_for_asset(
+                    handle_raw,
+                    &vertices,
+                    &indices,
+                    dispatch_index_count,
+                );
+                self.renderer
+                    .upload_mesh_clusters_for_asset(handle_raw, &[cluster]);
+            }
+            RenderCommand::ReleaseProxyMesh { handle_raw } => {
+                self.renderer.release_mesh_for_asset(handle_raw);
+                self.renderer.release_mesh_clusters_for_asset(handle_raw);
+            }
             RenderCommand::Shutdown => {
                 // Handled by the outer loop's poll of `is_shutdown`.
             }

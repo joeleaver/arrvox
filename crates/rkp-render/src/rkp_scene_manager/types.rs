@@ -203,6 +203,33 @@ impl AssetCache {
         handle
     }
 
+    /// Reserve a handle without backing an `AssetEntry`. Used for
+    /// procedural proxy-mesh entities that have GPU mesh buffers
+    /// (in `RkpRenderer::mesh_buffers` / `mesh_cluster_buffers`)
+    /// but no octree / leaf_attr / brick allocations to refcount —
+    /// they aren't shared via path lookup either, since each
+    /// procedural owns its own proxy mesh.
+    pub(super) fn reserve_handle(&mut self) -> AssetHandle {
+        if let Some(slot) = self.free_slots.pop() {
+            self.entries[slot as usize] = None;
+            AssetHandle(slot)
+        } else {
+            let idx = self.entries.len() as u32;
+            self.entries.push(None);
+            AssetHandle(idx)
+        }
+    }
+
+    /// Release a handle previously reserved with `reserve_handle`.
+    /// Pushes the slot onto the free list so the next `insert` /
+    /// `reserve_handle` reuses it.
+    pub(super) fn release_reserved(&mut self, handle: AssetHandle) {
+        if (handle.0 as usize) < self.entries.len() {
+            self.entries[handle.0 as usize] = None;
+            self.free_slots.push(handle.0);
+        }
+    }
+
     pub(super) fn lookup_path(&self, path: &std::path::Path) -> Option<AssetHandle> {
         self.path_to_handle.get(path).copied()
     }

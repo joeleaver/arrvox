@@ -123,6 +123,7 @@ impl EngineState {
                     // scene reload would look for a sidecar here.
                     cache_output_path: None,
                     generator_child: None,
+                    bake_mode: crate::components::BakeMode::Voxelize,
                 };
                 if self.bake_worker.tx_request.send(req).is_err() {
                     self.console.warn("Copy: bake worker channel closed".to_string());

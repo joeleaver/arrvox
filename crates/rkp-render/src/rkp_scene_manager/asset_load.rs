@@ -120,6 +120,26 @@ impl RkpSceneManager {
         }
     }
 
+    /// Reserve a fresh `AssetHandle` for a procedural proxy-mesh
+    /// entity. The handle is allocated from the same flat handle
+    /// space as disk assets (so `mesh_buffers[handle.raw()]` works
+    /// the same way), but no `AssetEntry` is attached — proxy meshes
+    /// have no octree / leaf_attr / brick allocations to refcount,
+    /// and aren't shared by path. Caller is responsible for pairing
+    /// with `release_procedural_handle` and for uploading
+    /// `mesh_buffers` + `mesh_cluster_buffers` on the renderer side.
+    pub fn reserve_procedural_handle(&mut self) -> AssetHandle {
+        self.asset_cache.reserve_handle()
+    }
+
+    /// Release a handle reserved via `reserve_procedural_handle`.
+    /// Caller must drop the renderer's `mesh_buffers` /
+    /// `mesh_cluster_buffers` for that handle separately.
+    pub fn release_procedural_handle(&mut self, handle: AssetHandle) {
+        self.asset_cache.release_reserved(handle);
+        self.bump_geometry_epoch();
+    }
+
     /// Disk read + pool allocation for one .rkp file. Called exactly once
     /// per unique path — repeated acquisitions share the returned entry
     /// via the cache.

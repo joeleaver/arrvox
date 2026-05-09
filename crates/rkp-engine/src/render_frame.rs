@@ -466,6 +466,24 @@ pub enum RenderCommand {
     SetViewportMode { id: ViewportId, mode: RenderMode },
     /// Replace BUILD viewport's preview mode (Voxel vs. Raymarch).
     SetBuildPreviewMode(BuildPreviewMode),
+    /// Upload a procedural's proxy-mesh GPU buffers under a fresh
+    /// asset handle. Sent by `drain_bake_results` after a
+    /// `BakeMode::ProxyMesh` bake completes; the render thread
+    /// calls `RkpRenderer::upload_mesh_for_asset` +
+    /// `upload_mesh_clusters_for_asset` and the next frame's
+    /// `SplatDraw` for that entity references the handle.
+    UploadProxyMesh {
+        handle_raw: u32,
+        vertices: Vec<rkp_core::mesh_extract::MeshVertex>,
+        indices: Vec<u32>,
+        cluster: rkp_core::mesh_cluster::MeshletCluster,
+    },
+    /// Drop renderer mesh buffers for a procedural's previous proxy
+    /// handle (e.g., on switch to Voxelize mode or on entity
+    /// destroy). The scene-manager-side `release_procedural_handle`
+    /// is the engine's responsibility; this command only frees the
+    /// GPU vbo/ibo/cluster buffers for that handle.
+    ReleaseProxyMesh { handle_raw: u32 },
     /// Graceful shutdown.
     Shutdown,
 }
