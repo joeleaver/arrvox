@@ -197,7 +197,14 @@ impl RkpGlassPass {
             format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::STORAGE_BINDING
                  | wgpu::TextureUsages::TEXTURE_BINDING
-                 | wgpu::TextureUsages::COPY_DST,
+                 | wgpu::TextureUsages::COPY_DST
+                 // Isolation-mode (build viewport) skips god_rays
+                 // and copies glass output → god_rays.output as the
+                 // bloom_composite input — see rkp_renderer.rs's
+                 // `if in_situ { … } else { copy_texture_to_texture }`.
+                 // Without COPY_SRC that copy fails validation every
+                 // frame in isolation mode.
+                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
