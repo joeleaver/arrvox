@@ -30,6 +30,7 @@ import package::lib::types::mat_albedo;
 import package::lib::types::CameraUniforms;
 import package::lib::types::GpuLight;
 import package::lib::types::ShadeParams;
+import package::lib::types::BrushState;
 
 
 // --- Structs ---
@@ -130,10 +131,10 @@ fn mat_subsurface_color(m: GpuMaterial) -> vec3<f32> {
 // 16) | material_id. `thickness_mm == 0` means "no glass at this
 // pixel" — use as the gate for the glass composite path.
 @group(0) @binding(3) var gbuf_glass: texture_2d<u32>;
-// Primary hit's scene-global leaf_attr_slot. `0` = sky / no-hit /
-// procedural (no stable slot). Used by the paint cursor to look up
-// per-voxel geodesic distance in `brush_overlay_distances`.
-@group(0) @binding(4) var gbuf_leaf_slot: texture_2d<u32>;
+// Primary hit's `gpu_idx` (object id). `0xFFFFFFFFu` = sky / no-hit.
+// Used by the screen-space paint cursor's per-pixel selection-lock
+// gate so the ring stops at the silhouette of the selected entity.
+@group(0) @binding(4) var gbuf_pick: texture_2d<u32>;
 
 // Group 1: shadow texture (read, half-res) + SSAO texture (read, half-res)
 // shadow_tex is written by rkp_shadow_trace at half-res; we upsample it
@@ -202,11 +203,11 @@ struct LightCameraShadeCsm {
 @group(5) @binding(3) var sky_view_lut: texture_2d<f32>;
 @group(5) @binding(4) var aerial_perspective_lut: texture_3d<f32>;
 
-// Paint cursor's per-leaf geodesic distance. Parallel to
-// `leaf_attr_pool`; sentinel (INFINITY) means "not under the brush".
-// Indexed by the slot written to `gbuf_leaf_slot`; 0 is the no-hit
-// sentinel so the lookup must guard `slot != 0u`.
-@group(6) @binding(0) var<storage, read> brush_overlay_distances: array<f32>;
+// Per-frame `BrushState` (32 B) written by `brush_state.wesl` from
+// the gbuffer at the cursor pixel. Carries the world-space surface
+// point + entity id under the cursor — everything the screen-space
+// cursor below needs without a CPU pick round-trip.
+@group(6) @binding(0) var<storage, read> brush_state: BrushState;
 
 // ── CSM directional shadow-map sample ──────────────────────────
 //
@@ -724,7 +725,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // read on stale bits. Once pick IDs move to a dedicated texture
     // the guard is still desirable (free early-out on single-material
     // pixels, which is the common case).
-    let mat_a = materials[primary_mat_id];
+    // Bounds-check the primary material lookup. WGSL OOB array reads
+    // are implementation-defined — most drivers return zero, which on
+    // an unconfigured asset (leaf attrs point at slots past the
+    // loaded `MaterialLibrary` palette) lands as `albedo = (0, 0, 0)`
+    // and shows up as a thin black ring at painted-region boundaries.
+    // Clamping OOB ids to slot 0 (the project's "Default" material)
+    // makes those cells render as the default gray instead. The same
+    // clamp on `secondary_mat_id` below covers the dual-material
+    // blend path.
+    let materials_len = arrayLength(&materials);
+    let primary_idx_safe = select(
+        primary_mat_id, 0u, primary_mat_id >= materials_len,
+    );
+    let mat_a = materials[primary_idx_safe];
     var base_color = mat_albedo(mat_a);
     var metallic_raw = mat_a.metallic;
     var roughness_raw = mat_a.roughness;
@@ -739,7 +753,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Bitmask channels don't blend meaningfully — keep primary's mask.
     let noise_channels = mat_a.noise_channels;
     if blend_weight > 0.0 {
-        let mat_b = materials[secondary_mat_id];
+        let secondary_idx_safe = select(
+            secondary_mat_id, 0u, secondary_mat_id >= materials_len,
+        );
+        let mat_b = materials[secondary_idx_safe];
         base_color = mix(base_color, mat_albedo(mat_b), blend_weight);
         metallic_raw = mix(metallic_raw, mat_b.metallic, blend_weight);
         roughness_raw = mix(roughness_raw, mat_b.roughness, blend_weight);
@@ -800,13 +817,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
+    // Per-voxel paint override. `color_rgb565 == 0` (no override at
+    // all) routes to the material's base_color — fast path. Otherwise
+    // we have a painted leaf; the 8-bit intensity in bits 8-15 says
+    // how much of the painted RGB to lerp in on top of base_color, so
+    // soft-falloff brushes fade smoothly into the underlying material
+    // at the edge instead of stamping a hard boundary disc. Layout
+    // matches `splat_resolve.wesl` and `octree_march.wesl`.
     let color_rgb565 = (packed_g >> 16u) & 0xFFFFu;
     var albedo = base_color;
     if color_rgb565 != 0u {
         let cr5 = color_rgb565 & 0x1Fu;
         let cg6 = (color_rgb565 >> 5u) & 0x3Fu;
         let cb5 = (color_rgb565 >> 11u) & 0x1Fu;
-        albedo = vec3<f32>(f32(cr5) / 31.0, f32(cg6) / 63.0, f32(cb5) / 31.0);
+        let painted_rgb = vec3<f32>(
+            f32(cr5) / 31.0, f32(cg6) / 63.0, f32(cb5) / 31.0,
+        );
+        // intensity == 0 ⇒ keep base_color (mix with t=0); intensity
+        // == 1 ⇒ full painted_rgb override. Both write paths
+        // (`splat_resolve.wesl`, `octree_march.wesl`) are responsible
+        // for packing the brush intensity here.
+        let intensity = f32((packed_g >> 8u) & 0xFFu) / 255.0;
+        albedo = mix(base_color, painted_rgb, intensity);
     }
     let metallic = metallic_raw;
     var roughness = max(roughness_raw, 0.04);
@@ -1068,22 +1100,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ap = sample_aerial_perspective(screen_uv, surface_dist);
     final_color = final_color * ap.a + ap.rgb;
 
-    // Paint cursor overlay (Phase 3b) — geodesic surface-walking
-    // distance from the brush origin, stored per-leaf in
-    // `brush_overlay_distances` by the CPU flood fill. This version
-    // wraps around corners cleanly: a voxel two hops around an edge
-    // is >2*cell_size away even if it's closer in world units.
+    // Paint cursor — screen-space sphere intersection on the visible
+    // surface. `brush_state` is written each frame by the brush-state
+    // probe pass from the gbuffer at the cursor pixel; per-fragment
+    // we compare the world-space distance from the cursor's surface
+    // hit to the fragment's world position against the brush radius.
     //
-    // Skip when:
-    //   * brush is inactive (cursor off);
-    //   * slot == 0 (sky / procedural surface / no hit — the flood
-    //     fill has no data for these);
-    //   * brush_overlay_distances[slot] is the INFINITY sentinel
-    //     (naturally filtered by the `d < r` comparison).
-    if shade_params.brush_active != 0u {
-        let slot = textureLoad(gbuf_leaf_slot, coord, 0).r;
-        if slot != 0u && slot < arrayLength(&brush_overlay_distances) {
-            let d = brush_overlay_distances[slot];
+    // Skip when any of:
+    //   * brush is inactive (paint mode off);
+    //   * the cursor is over sky / off-screen
+    //     (`brush_state.hit_distance >= 1e9`);
+    //   * the cursor hit a different entity than the selected one
+    //     (selection-lock — paint only acts on the selected entity,
+    //     so showing the cursor elsewhere would mislead);
+    //   * this fragment's surface belongs to a different entity than
+    //     the cursor's hit (`gbuf_pick != brush_state.hit_object_id`)
+    //     — same selection-lock, applied per-pixel so the ring stops
+    //     at the silhouette of the selected object.
+    if shade_params.brush_active != 0u
+        && brush_state.hit_distance < 1.0e9
+        && brush_state.hit_object_id == shade_params.brush_object_id
+    {
+        let pick_here = textureLoad(gbuf_pick, coord, 0).r;
+        if pick_here == brush_state.hit_object_id {
+            let d = length(world_pos - brush_state.center_world);
             let r = max(shade_params.brush_radius, 1e-4);
             if d < r {
                 let t = d / r;

@@ -124,6 +124,12 @@ impl SplatResolvePass {
                 // module into the emitted WGSL — see the matching
                 // comment in `splat_resolve.wesl`.
                 wgpu::BindGroupLayoutEntry { binding: 6, ..storage_ro },
+                // 7 = instance_overlay. Required so `fetch_leaf_attr_for`
+                // / `fetch_leaf_color_for` (from `lib::leaf_attr`) can
+                // consult the per-instance paint overlay before falling
+                // through to the asset's pool. Mesh-mode paint
+                // visibility depends on this binding.
+                wgpu::BindGroupLayoutEntry { binding: 7, ..storage_ro },
             ],
         });
 
@@ -190,6 +196,7 @@ impl SplatResolvePass {
         octree_nodes_buffer: &wgpu::Buffer,
         brick_pool_buffer: &wgpu::Buffer,
         brick_face_links_buffer: &wgpu::Buffer,
+        instance_overlay_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("splat_resolve g1 bg"),
@@ -202,6 +209,7 @@ impl SplatResolvePass {
                 wgpu::BindGroupEntry { binding: 4, resource: octree_nodes_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: brick_pool_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: brick_face_links_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: instance_overlay_buffer.as_entire_binding() },
             ],
         })
     }

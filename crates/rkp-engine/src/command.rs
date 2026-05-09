@@ -411,12 +411,6 @@ pub enum EngineCommand {
     /// editor state every frame.
     SetPaintActive { active: bool, radius: f32 },
 
-    /// Cursor-tracking pick for paint mode. Fires on `MouseMove` in
-    /// paint mode *without* LMB held. The engine issues a pick
-    /// readback identical to `PaintAtPixel` but routes the result into
-    /// `paint_cursor_world` instead of applying a stamp.
-    PaintHoverAtPixel { id: ViewportId, x: u32, y: u32 },
-
     /// Apply a paint brush stamp at a viewport pixel. The engine issues
     /// a GPU pick readback to resolve the (entity, world_pos) under the
     /// cursor, then routes the result through `apply_paint_stamp` with

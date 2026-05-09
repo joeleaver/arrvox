@@ -113,19 +113,12 @@ pub fn Viewport() -> NodeHandle {
                 // Paint-drag: in paint mode with LMB held, each mouse
                 // move issues another stamp. The engine's pick
                 // in-flight gate naturally coalesces duplicates.
-                if store.paint_active.get() {
-                    if lmb_held.get() {
-                        send_paint_stamp(x, y);
-                    } else {
-                        // Hover: track the cursor sphere to the mouse
-                        // without writing any paint. Engine updates
-                        // `paint_cursor_world` from the pick result.
-                        let _ = cmd_tx.send(rkp_engine::EngineCommand::PaintHoverAtPixel {
-                            id: PANEL_VIEWPORT,
-                            x: x.max(0.0) as u32,
-                            y: y.max(0.0) as u32,
-                        });
-                    }
+                if store.paint_active.get() && lmb_held.get() {
+                    // Drag-paint: each mouse move issues another stamp
+                    // while LMB is held. Hover tracking is GPU-driven
+                    // (the brush-state probe pass reads gbuf at the
+                    // engine-side `mouse_pos`), so no extra command.
+                    send_paint_stamp(x, y);
                 }
             }
             MouseDown { button, x, y } => {

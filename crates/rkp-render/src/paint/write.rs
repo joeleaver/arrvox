@@ -163,27 +163,38 @@ pub fn paint_leaf_color(
 
 /// Pure version of [`paint_leaf_color`]: returns the new packed color
 /// given the current packed color (0 = no override) and brush parameters.
+///
+/// The brush's soft edge is realized at cell granularity — each leaf
+/// inside the radius lerps its current RGB toward the target by
+/// `weight`, but every painted cell ends up at full intensity (1.0).
+/// Sub-voxel intensity used to be the soft-edge mechanism, but at low
+/// intensity the gbuffer's `mix(base_color, painted_rgb, intensity)`
+/// fades through whatever the host material's albedo is — including
+/// black on assets whose leaves point at an unconfigured material
+/// slot. Forcing intensity=1 makes painted cells predictable across
+/// every base material; the visible falloff is the per-cell RGB lerp
+/// instead.
 pub fn compute_painted_color(cur: u32, rgb: [f32; 3], weight: f32) -> u32 {
     let w = weight.clamp(0.0, 1.0);
     if w <= 0.0 {
         return cur;
     }
-    let (cur_rgb, cur_i) = if cur == 0 {
-        // No existing override — treat the leaf as "target RGB, zero
-        // intensity" so the first dab lerps from transparent to opaque
-        // at the target color instead of going through material-albedo
-        // grey.
-        (rgb, 0.0)
+    let cur_rgb = if cur == 0 {
+        // No existing override — there's no "previous color" to lerp
+        // from, so seed with the target. The first stamp writes the
+        // target RGB at full intensity (a hard cell of `rgb`); later
+        // stamps with a different target lerp toward that new target
+        // by their own weight.
+        rgb
     } else {
-        unpack_color(cur)
+        unpack_color(cur).0
     };
     let new_rgb = [
         cur_rgb[0] + (rgb[0] - cur_rgb[0]) * w,
         cur_rgb[1] + (rgb[1] - cur_rgb[1]) * w,
         cur_rgb[2] + (rgb[2] - cur_rgb[2]) * w,
     ];
-    let new_i = cur_i + (1.0 - cur_i) * w;
-    pack_color(new_rgb, new_i)
+    pack_color(new_rgb, 1.0)
 }
 
 /// Erase a leaf's color by lerping the intensity channel toward zero.

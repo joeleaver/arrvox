@@ -222,6 +222,13 @@ impl EngineState {
         }
         self.entity_tree_order.remove(&entity);
         self.paint_overlays.remove(&entity);
+        // Drop any cached painted-material walk results so the next
+        // flat-rebuild doesn't carry phantom leaves for this entity.
+        // The dirty set entry (if present) would also resolve to a
+        // remove on the next walk via `world.contains`, but pulling
+        // it out here keeps the dirty set tight.
+        self.painted_per_entity.remove(&entity);
+        self.painted_dirty_entities.remove(&entity);
 
         // Despawn from ECS.
         let _ = self.world.despawn(entity);
@@ -362,6 +369,8 @@ impl EngineState {
         self.gpu_instance_overlays.clear();
         self.gpu_to_entity.clear();
         self.paint_overlays.clear();
+        self.painted_per_entity.clear();
+        self.painted_dirty_entities.clear();
         // `clear()` wipes every pool but preserves the epoch atomic
         // identity — replacing the whole manager here would orphan
         // sim's `geometry_epoch_handle`, breaking the lock-free

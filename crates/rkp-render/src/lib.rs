@@ -69,6 +69,9 @@ pub mod rkp_scene;
 pub mod rkp_ssao;
 /// Deferred PBR shading compute pass.
 pub mod rkp_shade;
+/// Brush-state probe — single-thread compute that captures the
+/// G-buffer at the cursor pixel for the screen-space paint cursor.
+pub mod brush_state_pass;
 /// Atmosphere LUT computation — transmittance and multi-scattering.
 pub mod rkp_atmosphere;
 /// Screen-space god rays — radial blur from sun position.

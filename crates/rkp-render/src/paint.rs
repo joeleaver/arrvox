@@ -8,10 +8,9 @@
 //!
 //! ## Module layout (post-split)
 //!
-//! - [`select`] — spatial queries: sphere brush ([`leaves_in_sphere`]),
-//!   single-cell cursor pick ([`leaf_at_local_pos`]), geodesic surface
-//!   flood fill ([`surface_flood_fill`]). Plus the output types
-//!   ([`PaintedLeaf`], [`LeafHit`], [`FloodedLeaf`]).
+//! - [`select`] — spatial queries: sphere brush ([`leaves_in_sphere`])
+//!   and single-cell cursor pick ([`leaf_at_local_pos`]). Plus the
+//!   output types ([`PaintedLeaf`], [`LeafHit`]).
 //! - [`write`] — paint write operations: [`PaintStamp`] +
 //!   [`paint_leaf_material`] / [`paint_leaf_color`] / [`erase_leaf_color`]
 //!   + their `compute_*` helpers + brush-weight + color packing.
@@ -26,9 +25,7 @@ pub mod select;
 pub mod write;
 
 // Public re-exports — keep `rkp_render::paint::Foo` stable.
-pub use select::{
-    leaf_at_local_pos, leaves_in_sphere, surface_flood_fill, FloodedLeaf, LeafHit, PaintedLeaf,
-};
+pub use select::{leaf_at_local_pos, leaves_in_sphere, LeafHit, PaintedLeaf};
 pub use write::{
     brush_weight, compute_erased_color, compute_painted_attr, compute_painted_color,
     erase_leaf_color, pack_color, paint_leaf_color, paint_leaf_material, unpack_color, PaintStamp,

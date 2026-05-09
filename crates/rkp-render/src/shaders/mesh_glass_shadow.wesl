@@ -166,7 +166,14 @@ fn frag_main(in: VsOut) {
     let inst = instances[instance.object_id];
     let attr = fetch_leaf_attr_for(inst, in.leaf_attr_id);
     let mat_id = attr.material_packed & 0xFFFFu;
-    if materials[mat_id].opacity >= 0.99 {
+    // OOB-safe lookup — same rationale as `mesh.wesl`. OOB reads
+    // produce a zero `GpuMaterial.opacity` which is `< 0.99`, so
+    // without the clamp those fragments would *survive* the
+    // glass-pass discard and pollute the glass shadow depth.
+    let mat_id_safe = select(
+        mat_id, 0u, mat_id >= arrayLength(&materials),
+    );
+    if materials[mat_id_safe].opacity >= 0.99 {
         discard;
     }
 }

@@ -233,8 +233,8 @@ fn brick_id_of(node: u32) -> u32 {
 // Zero in both channels = "no glass at this pixel."
 @group(1) @binding(4) var gbuf_glass: texture_storage_2d<rg32uint, write>;
 // Leaf-slot target — primary hit's scene-global leaf_attr_slot, or 0
-// for sky / no-hit pixels. Consumed by rkp_shade's geodesic paint
-// cursor; indexes into `brush_overlay_distances`.
+// for sky / no-hit pixels. Carries the per-pixel cell so downstream
+// passes (e.g. user-shader emit) can look up the hit's leaf attrs.
 @group(1) @binding(5) var gbuf_leaf_slot: texture_storage_2d<r32uint, write>;
 
 @group(2) @binding(0) var<uniform> march_params: MarchParams;
@@ -586,6 +586,13 @@ struct MarchResult {
     // behind it (which is what `first_slot` records). 0 when the
     // ray didn't hit glass.
     glass_slot: u32,
+    // Brush "intensity" carried by the per-leaf color override. 0
+    // means "no override at this voxel — fall back to material
+    // base_color"; 1 means "fully replace base_color with `color`".
+    // Intermediate values lerp the two in `rkp_shade.wesl`, which is
+    // how a soft-falloff brush at an unpainted edge fades into the
+    // underlying material instead of stamping a hard disc.
+    color_intensity: f32,
 }
 
 // `pack_oct_normal` is imported from `lib::oct_normal` at the top.
@@ -674,6 +681,7 @@ fn march_object_skinned(
         0u, 0u, // outer_steps, brick_steps
         false, vec3<f32>(0.0), 0u, 0.0, 0.0,
         0u, // glass_slot
+        0.0, // color_intensity
     );
 
     let inv_world = mat4_affine_inverse(inst.world);
@@ -763,17 +771,20 @@ fn march_object_skinned(
         atomicAdd(&stats[46], 1u);
         let cp = fetch_leaf_color_for(inst, leaf_slot);
         var color = vec3<f32>(0.5);
+        var color_intensity = 0.0;
         if cp != 0u {
             color = vec3<f32>(
                 f32(cp & 0xFFu) / 255.0,
                 f32((cp >> 8u) & 0xFFu) / 255.0,
                 f32((cp >> 16u) & 0xFFu) / 255.0,
             );
+            color_intensity = f32((cp >> 24u) & 0xFFu) / 255.0;
         }
 
         result.oc_pos = p_local;
         result.normal = deformed_normal;
         result.color = color;
+        result.color_intensity = color_intensity;
         result.alpha = 1.0;
         result.t = t;
         result.first_slot = leaf_slot;
@@ -807,6 +818,7 @@ fn march_object_inner(
         0u, 0u, // outer_steps, brick_steps
         false, vec3<f32>(0.0), 0u, 0.0, 0.0,
         0u, // glass_slot
+        0.0, // color_intensity
     );
 
     let local_dir = normalize(local_dir_unnorm);
@@ -954,8 +966,11 @@ fn march_object_inner(
                         // RGB565 channel stays 0, which `rkp_shade.wgsl`
                         // reads as "use material albedo" (writing 0.5
                         // would pack as a non-zero RGB565 and override
-                        // the material with grey).
+                        // the material with grey). `color_intensity`
+                        // stays at the constructor's 0.0 — keeping the
+                        // override-suppressed semantics either way.
                         result.color = vec3<f32>(0.0);
+                        result.color_intensity = 0.0;
                         result.outer_steps = outer_steps; result.brick_steps = brick_steps; result.steps = outer_steps + brick_steps;
                         brick_done = true;
                         break;
@@ -1055,6 +1070,7 @@ fn march_object_inner(
                         // pack as a non-zero RGB565 and override the
                         // material colour with whatever default we set.
                         var color = vec3<f32>(0.0);
+                        var color_intensity = 0.0;
                         atomicAdd(&stats[46], 1u); // color_pool read
                         let cp = fetch_leaf_color_for(inst, c);
                         if cp != 0u {
@@ -1063,8 +1079,10 @@ fn march_object_inner(
                                 f32((cp >> 8u) & 0xFFu) / 255.0,
                                 f32((cp >> 16u) & 0xFFu) / 255.0,
                             );
+                            color_intensity = f32((cp >> 24u) & 0xFFu) / 255.0;
                         }
                         result.color = color;
+                        result.color_intensity = color_intensity;
                         result.outer_steps = outer_steps; result.brick_steps = brick_steps; result.steps = outer_steps + brick_steps;
                         brick_done = true;
                         break;
@@ -1192,6 +1210,7 @@ fn march_object_inner(
         // whose color_pool entry is 0 (never painted, or fully erased)
         // route to material albedo via this path.
         var color = vec3<f32>(0.0);
+        var color_intensity = 0.0;
         if r.slot != OCTREE_INTERIOR {
             atomicAdd(&stats[46], 1u); // color_pool read
             let cp = fetch_leaf_color_for(inst, leaf_id);
@@ -1201,9 +1220,11 @@ fn march_object_inner(
                     f32((cp >> 8u) & 0xFFu) / 255.0,
                     f32((cp >> 16u) & 0xFFu) / 255.0,
                 );
+                color_intensity = f32((cp >> 24u) & 0xFFu) / 255.0;
             }
         }
         result.color = color;
+        result.color_intensity = color_intensity;
         result.outer_steps = outer_steps; result.brick_steps = brick_steps; result.steps = outer_steps + brick_steps;
         break; // done — first-surface hit
     }
@@ -1264,6 +1285,12 @@ fn main(
     var first_mat_id = 0u;
     var first_sec_mat = 0u;
     var first_blend = 0u;
+    // Brush "intensity" of the primary hit — the high byte of the
+    // per-leaf packed color, decoded into `[0, 1]`. Packed into
+    // `gbuf_material.g` bits 8-15 so `rkp_shade.wesl` can lerp
+    // between `base_color` and the painted RGB instead of stamping
+    // a hard override at the brush edge.
+    var first_color_intensity = 0.0;
     // Leaf_attr slot of the primary hit — written to `gbuf_leaf_slot`
     // for the geodesic paint cursor to look up per-voxel brush overlay
     // distances. 0 stays 0 on sky / no-hit pixels.
@@ -1406,6 +1433,7 @@ fn main(
             accum_alpha = 1.0;
             first_dist = hit_dist;
             first_obj_id = inst.object_id;
+            first_color_intensity = r.color_intensity;
             if r.first_slot != 0u {
                 let attr = fetch_leaf_attr_for(inst, r.first_slot);
                 first_mat_id = leaf_attr_material_primary(attr);
@@ -1437,6 +1465,7 @@ fn main(
         if !have_first {
             first_dist = hit_dist;
             first_obj_id = inst.object_id;
+            first_color_intensity = r.color_intensity;
             closest_obj_idx = i;
             if r.first_slot != 0u {
                 let attr = fetch_leaf_attr_for(inst, r.first_slot);
@@ -1547,6 +1576,7 @@ fn main(
                 accum_alpha = 1.0;
                 first_dist = hit_dist;
                 first_obj_id = inst.object_id;
+                first_color_intensity = r.color_intensity;
                 // Emit-pass instances inherit material from the host paint
                 // through `inst.material_id`. The proto's leaf_attrs carry
                 // `material_primary = 0` (proto bake doesn't know about
@@ -1665,10 +1695,12 @@ fn main(
     // at ~5.9 %, which is what showed up as "still looks hard" on
     // MAIN even after the shade-pass fix.
     let first_blend_8 = ((first_blend & 0x0Fu) << 4u) | (first_blend & 0x0Fu);
-    // Bits 8-15 are free after the 8-bit object_id was retired in favor
-    // of the dedicated `gbuf_pick` channel below; left as 0 for any
-    // future packing that can use 8 bits.
+    // Bits 8-15 carry the brush "intensity" — see `MarchResult`
+    // doc-comment + `rkp_shade.wesl`. `splat_resolve.wesl` uses the
+    // same layout for mesh-mode primary visibility.
+    let intensity_8 = u32(clamp(first_color_intensity, 0.0, 1.0) * 255.0);
     let packed_g = (first_blend_8 & 0xFFu)
+                 | ((intensity_8 & 0xFFu) << 8u)
                  | (color_rgb565 << 16u);
 
     atomicAdd(&stats[2], 1u);

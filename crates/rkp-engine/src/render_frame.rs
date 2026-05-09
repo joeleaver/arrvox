@@ -98,12 +98,6 @@ pub struct RenderFrame {
     /// matter how many intermediate snapshots are dropped.
     pub geometry_epoch: u64,
 
-    /// Paint cursor's brush-overlay epoch. Bumped every time
-    /// `RkpSceneManager::update_brush_overlay` runs (cursor moves or
-    /// radius changes). Render uploads the per-leaf distance buffer
-    /// to each VR's shade pass when this moves ahead.
-    pub brush_overlay_epoch: u64,
-
     /// Paint-data epoch. Bumped by `apply_paint_sphere` when a stroke
     /// writes to leaf_attr / color. Render slice-uploads only the
     /// dirty slot range when this moves ahead — avoids the full
@@ -313,6 +307,14 @@ pub struct RenderViewport {
     /// `preview_mode == Raymarch` and an entity with
     /// `ProceduralGeometry` is selected.
     pub proc_raymarch: Option<RenderProcRaymarch>,
+
+    /// Cursor pixel for the brush-state probe pass — `Some((x, y))`
+    /// when paint mode is active and the mouse sits inside this
+    /// viewport, `None` otherwise. Render dispatches the probe pass
+    /// each frame; on `None` the dispatched probe writes the miss
+    /// sentinel so the shade pass hides the cursor without any extra
+    /// gating. Engine fills from the per-viewport `mouse_pos`.
+    pub brush_pixel: Option<(u32, u32)>,
 }
 
 /// Procedural-raymarch payload for a single viewport. Sim flattens

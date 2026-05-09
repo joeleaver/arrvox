@@ -289,7 +289,13 @@ pub(super) fn run_render_thread(
                 }
                 buf.push_back(*ms);
             }
-            if frame_index % 30 == 0 {
+            // Emit every 30 frames at steady state, AND every frame
+            // when the render frame is slow (>33 ms — anything below
+            // 30 fps). The slow-frame gate keeps perf hunts loud
+            // during the spike that triggered them; the periodic
+            // gate keeps idle from spamming.
+            let slow_frame = render_dt_ms.map(|d| d > 33.0).unwrap_or(false);
+            if frame_index % 30 == 0 || slow_frame {
                 // Latest single-sample line — same format as before.
                 let labels: Vec<String> = gpu_passes
                     .iter()

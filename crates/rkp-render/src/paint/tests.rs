@@ -123,13 +123,37 @@ fn paint_color_from_unpainted_creates_override() {
 }
 
 #[test]
-fn paint_color_partial_weight_ramps_intensity() {
+fn paint_color_first_stamp_writes_full_intensity() {
+    // First stamp on an unpainted leaf — there's no prior color to
+    // lerp from, so the cell gets the target RGB at full intensity
+    // regardless of brush weight. Sub-voxel intensity ramping used to
+    // produce a "fade through base material" at the brush edge, but
+    // that fades through black on assets whose base material has
+    // dark albedo. Forcing intensity=1 makes paint look the same on
+    // any asset; the brush's visible falloff lives in *which* cells
+    // get touched (gated by `brush_weight > 0`), not in per-cell
+    // intensity blending.
     let mut pool = LeafAttrPool::new(8);
     pool.allocate_range(1).unwrap();
     paint_leaf_color(&mut pool, 0, [1.0, 0.0, 0.0], 0.5);
-    let (_, i) = unpack_color(pool.color(0));
-    // 0.0 + (1.0-0.0)*0.5 = 0.5
-    assert!((i - 0.5).abs() < 0.01, "partial weight should give ~0.5 intensity, got {i}");
+    let (rgb, i) = unpack_color(pool.color(0));
+    assert!((rgb[0] - 1.0).abs() < 0.01);
+    assert!((i - 1.0).abs() < 0.01, "first stamp should write full intensity, got {i}");
+}
+
+#[test]
+fn paint_color_subsequent_stamp_lerps_rgb() {
+    // Second stamp at a different target lerps the RGB toward the
+    // new target by `weight`; intensity stays at 1.0. This is how a
+    // long drag with varying targets paints a smooth color gradient.
+    let mut pool = LeafAttrPool::new(8);
+    pool.allocate_range(1).unwrap();
+    paint_leaf_color(&mut pool, 0, [1.0, 0.0, 0.0], 1.0); // red, full
+    paint_leaf_color(&mut pool, 0, [0.0, 0.0, 1.0], 0.5); // toward blue, half
+    let (rgb, i) = unpack_color(pool.color(0));
+    assert!((rgb[0] - 0.5).abs() < 0.02, "r should lerp halfway, got {}", rgb[0]);
+    assert!((rgb[2] - 0.5).abs() < 0.02, "b should lerp halfway, got {}", rgb[2]);
+    assert!((i - 1.0).abs() < 0.01, "intensity stays 1, got {i}");
 }
 
 #[test]
@@ -346,135 +370,6 @@ fn leaf_at_local_pos_returns_none_for_empty_octree() {
         &bricks, Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0),
     );
     assert!(hit.is_none());
-}
-
-// -------- surface_flood_fill --------
-
-#[test]
-fn flood_fill_starts_from_hit_voxel() {
-    let mut attrs = LeafAttrPool::new(64);
-    let mut bricks = BrickPool::new(4);
-    let (tree, _) = slab_octree(&mut attrs, &mut bricks);
-    // Force the face links to all-empty — this test uses a single
-    // brick so no cross-brick walks are needed.
-    let face_links: Vec<[u32; 6]> = vec![[FACE_EMPTY; 6]];
-    let mut alloc = OctreeAllocator::new();
-    let h = alloc.allocate(&tree);
-
-    // Radius 0.0-ish: only the hit cell should come back.
-    let hits = surface_flood_fill(
-        alloc.as_slice(), h.root_offset, h.depth, h.base_voxel_size,
-        &bricks, &face_links, Vec3::ZERO,
-        Vec3::new(2.5, 1.5, 0.5), 0.0001,
-    );
-    // init_dist from center is 0, so even an epsilon radius captures the hit.
-    assert_eq!(hits.len(), 1, "got {hits:?}");
-    assert!(hits[0].distance < EPS);
-}
-
-#[test]
-fn flood_fill_expands_face_neighbors_within_radius() {
-    let mut attrs = LeafAttrPool::new(64);
-    let mut bricks = BrickPool::new(4);
-    let (tree, _) = slab_octree(&mut attrs, &mut bricks);
-    let face_links: Vec<[u32; 6]> = vec![[FACE_EMPTY; 6]];
-    let mut alloc = OctreeAllocator::new();
-    let h = alloc.allocate(&tree);
-
-    // Start at (2.5, 1.5, 0.5). Radius 1.5 emits every z=0 voxel
-    // whose world-local center sits within 1.5 world units of the
-    // brush origin — BFS uses face adjacency for reachability but
-    // the emitted distance is straight-line, so diagonals enter
-    // once the diagonal neighbor is within radius.
-    let hits = surface_flood_fill(
-        alloc.as_slice(), h.root_offset, h.depth, h.base_voxel_size,
-        &bricks, &face_links, Vec3::ZERO,
-        Vec3::new(2.5, 1.5, 0.5), 1.5,
-    );
-    // Expected: 1 center + 4 face neighbors (dist 1.0) + 4
-    // diagonals (dist sqrt(2) ≈ 1.414 < 1.5). Missing voxels
-    // beyond the 3×3 centered patch are at dist >= 2.
-    assert_eq!(hits.len(), 9, "got {hits:?}");
-
-    let near_zero = hits.iter().filter(|h| h.distance < 0.01).count();
-    let near_one = hits.iter().filter(|h| (h.distance - 1.0).abs() < 0.01).count();
-    let near_diag = hits.iter()
-        .filter(|h| (h.distance - std::f32::consts::SQRT_2).abs() < 0.01)
-        .count();
-    assert_eq!(near_zero, 1);
-    assert_eq!(near_one, 4);
-    assert_eq!(near_diag, 4);
-}
-
-#[test]
-fn flood_fill_crosses_brick_boundary_via_face_link() {
-    // Two bricks side-by-side on +X. Start in brick A, expand into
-    // brick B through the face link.
-    let mut attrs = LeafAttrPool::new(128);
-    let mut bricks = BrickPool::new(4);
-
-    let brick_a = bricks.allocate().unwrap();
-    let brick_b = bricks.allocate().unwrap();
-
-    // Populate brick A's +X edge cell (3, 0, 0) and brick B's
-    // −X edge cell (0, 0, 0). Leave everything else empty.
-    let slots = attrs.allocate_range(2).unwrap();
-    bricks.set_cell(brick_a, 3, 0, 0, slots[0]);
-    bricks.set_cell(brick_b, 0, 0, 0, slots[1]);
-
-    // Build an octree that has both bricks. Depth 3 gives us 8³
-    // voxels split into a 2×2×2 brick grid (brick edge = 4 voxels).
-    let mut tree = SparseOctree::new(3, 1.0);
-    // Put brick A at brick-coord (0,0,0) (voxel 0), brick B at
-    // (1,0,0) (voxel 4). `set_at_level` with target_level equal to
-    // the brick depth (1, for depth 3 with BRICK_LEVELS=2) puts a
-    // brick terminator.
-    let brick_depth = 3 - 2; // 1
-    let a_node = rkp_core::sparse_octree::make_brick(brick_a);
-    let b_node = rkp_core::sparse_octree::make_brick(brick_b);
-    tree.set_at_level(UVec3::new(0, 0, 0), brick_depth, a_node);
-    tree.set_at_level(UVec3::new(4, 0, 0), brick_depth, b_node);
-
-    // Face-link table: A's +X → B; B's −X → A; everything else empty.
-    let max_brick_id = brick_a.max(brick_b);
-    let mut face_links: Vec<[u32; 6]> = vec![[FACE_EMPTY; 6]; (max_brick_id + 1) as usize];
-    face_links[brick_a as usize][1] = brick_b; // FACE_PX
-    face_links[brick_b as usize][0] = brick_a; // FACE_NX
-
-    let mut alloc = OctreeAllocator::new();
-    let h = alloc.allocate(&tree);
-
-    // Start at brick A's edge cell center (3.5, 0.5, 0.5). Radius
-    // 1.5 should reach the cell at brick B's (0, 0, 0) which is at
-    // world (4.5, 0.5, 0.5) — distance 1.0 away.
-    let hits = surface_flood_fill(
-        alloc.as_slice(), h.root_offset, h.depth, h.base_voxel_size,
-        &bricks, &face_links, Vec3::ZERO,
-        Vec3::new(3.5, 0.5, 0.5), 1.5,
-    );
-    assert_eq!(hits.len(), 2, "expected A + B neighbor, got {hits:?}");
-    let slots_hit: Vec<u32> = hits.iter().map(|h| h.leaf_slot).collect();
-    assert!(slots_hit.contains(&slots[0]));
-    assert!(slots_hit.contains(&slots[1]));
-}
-
-#[test]
-fn flood_fill_respects_radius_cutoff() {
-    let mut attrs = LeafAttrPool::new(64);
-    let mut bricks = BrickPool::new(4);
-    let (tree, _) = slab_octree(&mut attrs, &mut bricks);
-    let face_links: Vec<[u32; 6]> = vec![[FACE_EMPTY; 6]];
-    let mut alloc = OctreeAllocator::new();
-    let h = alloc.allocate(&tree);
-
-    // Radius 0.7 is less than one cell hop (1.0), so only the hit
-    // cell should be returned.
-    let hits = surface_flood_fill(
-        alloc.as_slice(), h.root_offset, h.depth, h.base_voxel_size,
-        &bricks, &face_links, Vec3::ZERO,
-        Vec3::new(2.5, 1.5, 0.5), 0.7,
-    );
-    assert_eq!(hits.len(), 1, "got {hits:?}");
 }
 
 #[test]

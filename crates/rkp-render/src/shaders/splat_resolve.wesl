@@ -39,6 +39,9 @@ import package::lib::types::LeafAttr;
 import package::lib::types::RkpInstance;
 import package::lib::types::RkpAsset;
 import package::lib::types::OctreeResult;
+import package::lib::types::OverlayEntry;
+import package::lib::leaf_attr::fetch_leaf_attr_for;
+import package::lib::leaf_attr::fetch_leaf_color_for;
 import package::lib::octree::octree_lookup;
 import package::lib::octree::PHASE_MARCH;
 import package::lib::octree_slot::OCTREE_EMPTY;
@@ -68,12 +71,17 @@ import package::lib::brick::BRICK_CELL_INTERIOR;
 // per-pixel descent — same buffers `octree_march` binds, so the lookup
 // resolves identically to a degenerate march (a single descent at a
 // known surface point, no ray walk).
-@group(1) @binding(0) var<storage, read> leaf_attr_pool: array<LeafAttr>;
-@group(1) @binding(1) var<storage, read> color_pool:     array<u32>;
-@group(1) @binding(2) var<storage, read> instances:      array<RkpInstance>;
-@group(1) @binding(3) var<storage, read> assets:         array<RkpAsset>;
-@group(1) @binding(4) var<storage, read> octree_nodes:   array<vec4<u32>>;
-@group(1) @binding(5) var<storage, read> brick_pool:     array<u32>;
+// `lib::leaf_attr` references `leaf_attr_pool`, `color_pool_data`, and
+// `instance_overlay` by free name (see its module docstring). The
+// names + binding shapes below match those expectations so the
+// inlined `fetch_leaf_attr_for` / `fetch_leaf_color_for` resolve
+// under `ManglerKind::None`.
+@group(1) @binding(0) var<storage, read> leaf_attr_pool:  array<LeafAttr>;
+@group(1) @binding(1) var<storage, read> color_pool_data: array<u32>;
+@group(1) @binding(2) var<storage, read> instances:       array<RkpInstance>;
+@group(1) @binding(3) var<storage, read> assets:          array<RkpAsset>;
+@group(1) @binding(4) var<storage, read> octree_nodes:    array<vec4<u32>>;
+@group(1) @binding(5) var<storage, read> brick_pool:      array<u32>;
 // `brick_face_links` is referenced by `lib::octree::descend_proto_octree`
 // as a free name. We don't call that function — `lookup_cell_at` only
 // uses `octree_lookup` — but the WESL composer pulls the whole
@@ -81,6 +89,12 @@ import package::lib::brick::BRICK_CELL_INTERIOR;
 // in scope to parse. Bind it to the same scene buffer the march uses;
 // naga's DCE drops the unused reads from the resolve's compiled SPIR-V.
 @group(1) @binding(6) var<storage, read> brick_face_links: array<u32>;
+// Per-instance paint overlay — sorted-by-leaf_slot slice carrying the
+// painted attr + color overrides. `fetch_leaf_attr_for` /
+// `fetch_leaf_color_for` consult it via binary search before falling
+// through to the asset's pool. Without this binding mesh-mode paint
+// stamps are invisible (the resolve reads the unpainted base).
+@group(1) @binding(7) var<storage, read> instance_overlay: array<OverlayEntry>;
 
 // `octree_lookup` (in `lib::octree`) calls `bucket_depth` and
 // `bucket_lod_exit` by free name. We have no stats binding here, so
@@ -265,7 +279,28 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // world frame. `instances[pick].world`'s upper-left 3×3 is the
     // rotation+scale; for affine transforms with non-uniform scale the
     // normalize() at the end handles the resulting vector.
-    let attr = leaf_attr_pool[leaf_slot];
+    //
+    // Overlay-aware fetch: paint stamps land in the per-instance
+    // `instance_overlay` slice — the helpers binary-search it and
+    // fall through to the asset's pool when the slot isn't painted.
+    // Without this the mesh path renders the unpainted base color.
+    //
+    // Empty-slot guard: when the per-pixel descent picks a leaf whose
+    // pool entry is all-zeros (`normal_oct == 0 && material_packed
+    // == 0` — an uninitialized slot in the asset's allocated leaf-
+    // attr range, can happen at brick boundaries / interior-cell
+    // resolution edge cases), substitute the hint cell's data. The
+    // hint slot comes from the triangle's provoking vertex, which the
+    // mesh extractor binds to a known-populated surface cell, so its
+    // pool entry is reliable. Without this guard, the resolved-bad
+    // leaf renders with `unpack_oct_normal(0) == +Z`, giving sun
+    // direct=0 and SSAO≈0 — manifesting as a black ring at the
+    // brush boundary specifically because painted leaves bypass the
+    // pool via the overlay path and unpainted ones don't.
+    var attr = fetch_leaf_attr_for(inst, leaf_slot);
+    if (attr.normal_oct == 0u && attr.material_packed == 0u) {
+        attr = hint_attr;
+    }
     let n_local = unpack_oct_normal(attr.normal_oct);
     let world = inst.world;
     let world_basis = mat3x3<f32>(world[0].xyz, world[1].xyz, world[2].xyz);
@@ -281,18 +316,30 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let blend8    = (blend4 << 4u) | blend4;
     let packed_r  = (primary & 0xFFFFu) | ((secondary & 0xFFFFu) << 16u);
 
-    // Per-voxel colour packed as RGBA8 in `color_pool`. 0 ⇒ "no
-    // override; use material base_color" — the same convention the
-    // shade pass already handles.
-    let c_packed = color_pool[leaf_slot];
+    // Per-voxel colour packed as RGBA8 in `color_pool_data`, or in
+    // the per-instance overlay if the slot's been painted. The high
+    // byte is the brush "intensity" (0 = "no override, use material
+    // base_color"; 255 = "fully overrides base_color"; intermediate
+    // values lerp the two so a soft-falloff brush edge fades into
+    // the underlying material instead of producing a hard boundary
+    // disc of painted RGB).
+    let c_packed = fetch_leaf_color_for(inst, leaf_slot);
     let cr8 = c_packed & 0xFFu;
     let cg8 = (c_packed >> 8u) & 0xFFu;
     let cb8 = (c_packed >> 16u) & 0xFFu;
+    let ci8 = (c_packed >> 24u) & 0xFFu;
     let cr5 = (cr8 * 31u) / 255u;
     let cg6 = (cg8 * 63u) / 255u;
     let cb5 = (cb8 * 31u) / 255u;
     let color_rgb565 = cr5 | (cg6 << 5u) | (cb5 << 11u);
-    let packed_g = (blend8 & 0xFFu) | (color_rgb565 << 16u);
+    // packed_g layout — must match `octree_march.wesl`'s opaque-hit
+    // path and `rkp_shade.wesl`'s decode:
+    //   bits  0- 7: blend8 (dual-material weight)
+    //   bits  8-15: paint intensity (0..255)
+    //   bits 16-31: color_rgb565
+    let packed_g = (blend8 & 0xFFu)
+                 | ((ci8 & 0xFFu) << 8u)
+                 | (color_rgb565 << 16u);
 
     // gbuf_normal alpha = `accum_alpha` in the march; opaque splat hit
     // ⇒ 1.0.

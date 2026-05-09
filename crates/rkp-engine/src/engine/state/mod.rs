@@ -35,6 +35,24 @@ impl PaintedTileEntry {
     }
 }
 
+/// Per-entity painted-material walk cache. Populated by
+/// `scan_painted_aabbs` in `lifecycle::tick`'s incremental walk; the
+/// flat `painted_materials` + `painted_leaves` views on `EngineState`
+/// are concatenations of every entry's contents.
+///
+/// Keeping the per-entity result around lets the walk skip entities
+/// that haven't been touched since their last cache build — drag-paint
+/// stamps mark only the painted entity dirty, so the walk's lock scope
+/// shrinks from O(all entities) to O(dirty entities).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct EntityPaintedCache {
+    pub mat_tiles: std::collections::HashMap<
+        u16,
+        std::collections::HashMap<[i32; 3], PaintedTileEntry>,
+    >,
+    pub leaves: Vec<rkp_render::user_shader_emit_pass::EmitLeaf>,
+}
+
 use crate::camera::CameraControlState;
 
 use super::{CameraState, EngineConfig, FrameCallback};
@@ -170,12 +188,6 @@ pub(crate) struct EngineState {
     /// like 0.5 fps.
     pub(crate) geometry_epoch_handle: std::sync::Arc<std::sync::atomic::AtomicU64>,
 
-    /// Brush-overlay epoch handle. Bumped by
-    /// `RkpSceneManager::update_brush_overlay` / `clear_brush_overlay`.
-    /// Sim reads it lock-free to decide whether the next snapshot
-    /// needs to ship a fresh brush-overlay upload.
-    pub(crate) brush_overlay_epoch_handle: std::sync::Arc<std::sync::atomic::AtomicU64>,
-
     /// Paint-data epoch handle. Bumped by `apply_paint_sphere`
     /// whenever a stroke writes to leaf_attr / color. Separate from
     /// `geometry_epoch` so paint doesn't re-upload octree + brick
@@ -254,6 +266,21 @@ pub(crate) struct EngineState {
     /// At paint scale (millions of leaves) the clone-per-frame was
     /// the dominant CPU cost in the snapshot build.
     pub(crate) painted_leaves: std::sync::Arc<Vec<rkp_render::user_shader_emit_pass::EmitLeaf>>,
+    /// Per-entity walk results. The flat `painted_materials` /
+    /// `painted_leaves` above are derived views over this map's values.
+    /// Mutated by the lifecycle walk only — `apply_paint_stamp` drives
+    /// updates by adding the painted entity to
+    /// [`Self::painted_dirty_entities`].
+    pub(crate) painted_per_entity:
+        std::collections::HashMap<hecs::Entity, EntityPaintedCache>,
+    /// Entities whose painted-material cache needs a re-scan on the
+    /// next lifecycle tick. Populated by `apply_paint_stamp` (one
+    /// entry per stamp) and by the geometry-epoch path (every
+    /// renderable entity, when scene geometry mutates). The walk
+    /// drains this set, locking `scene_mgr` briefly per entity rather
+    /// than holding it across all entities for the duration of the
+    /// O(all-octrees) walk.
+    pub(crate) painted_dirty_entities: std::collections::HashSet<hecs::Entity>,
     /// Epochs the cache was last reconciled against. When either
     /// moves ahead, we invalidate and re-scan affected entities.
     pub(crate) painted_materials_paint_epoch: u64,
@@ -636,29 +663,19 @@ pub(crate) struct EngineState {
     /// `EngineCommand::PaintAtPixel` (sim); taken out and consumed by
     /// `process_pick_result` when the matching readback returns.
     pub(crate) paint_pick_settings: Option<PaintPickSettings>,
-    /// When set, the next pick result updates `paint_cursor_world`
-    /// without applying any paint — the editor uses this to keep the
-    /// cursor sphere tracking the cursor while the user is just hovering
-    /// in paint mode. Mutually exclusive in practice with
-    /// `paint_pick_settings` (LMB held → stamp path fires instead).
-    pub(crate) paint_hover_pending: Option<crate::viewport::ViewportId>,
-    /// `true` while the editor is in paint mode. Drives the cursor
-    /// wireframe — when false, the cursor sphere is never drawn even
-    /// if `paint_cursor_world` still carries a stale last-hover value.
-    /// Updated by `SetPaintActive` commands.
+    /// Wallclock instant of the most recent successful paint stamp.
+    /// Used purely as a profiling gate: `RKP_PAINT_PROFILE` traces
+    /// only fire when this is recent, so idle (and non-drag hover)
+    /// stays quiet.
+    pub(crate) last_paint_stamp_at: Option<std::time::Instant>,
+    /// `true` while the editor is in paint mode. Drives both the
+    /// brush-state probe pass (cursor) and the paint-stamp's
+    /// selection-lock check. Updated by `SetPaintActive` commands.
     pub(crate) paint_mode_active: bool,
-    /// Brush world-space radius while paint mode is active. Cached on
-    /// the engine so the cursor sphere renders at the same size the
-    /// next stamp will use. Updated by `SetPaintActive`.
+    /// Brush world-space radius while paint mode is active. Shared
+    /// between the cursor visualization (`shade_params.brush_radius`)
+    /// and the next paint stamp's footprint. Updated by `SetPaintActive`.
     pub(crate) paint_mode_radius: f32,
-    /// Most recent world-space hit under the paint cursor. Updated on
-    /// every hover pick and on every successful paint stamp. `None`
-    /// when no pick has returned with a valid surface hit yet.
-    pub(crate) paint_cursor_world: Option<glam::Vec3>,
-    /// Entity the cursor is currently over — needed to re-run the
-    /// geodesic flood fill when the radius changes while the cursor
-    /// is stationary. Set by pick results; cleared on paint-off.
-    pub(crate) paint_cursor_entity: Option<hecs::Entity>,
     /// Cached light count for march pass (set in light upload block, used in render).
     pub(crate) num_lights_cache: u32,
     /// Base ShadeParams (recomputed once per frame from environment +

@@ -16,12 +16,11 @@ pub struct RkpShadePass {
     pub shade_bind_group_layout: wgpu::BindGroupLayout,
     pub camera_bind_group_layout: wgpu::BindGroupLayout,
     pub atmo_bind_group_layout: wgpu::BindGroupLayout,
-    /// Group 6 — paint cursor's geodesic distance buffer (Phase 3b).
-    /// Parallel to `leaf_attr_pool`; sentinel `f32::INFINITY` means
-    /// "not under the brush". Populated by
-    /// `RkpSceneManager::update_brush_overlay` → uploaded each time
-    /// the cursor moves.
-    pub brush_overlay_bind_group_layout: wgpu::BindGroupLayout,
+    /// Group 6 — `BrushState` storage buffer written each frame by
+    /// the brush-state probe pass (`brush_state.wesl`). Carries the
+    /// world-space surface point + entity id under the cursor pixel,
+    /// consumed by the screen-space paint cursor in `rkp_shade.wesl`.
+    pub brush_state_bind_group_layout: wgpu::BindGroupLayout,
     /// HDR output texture (full-res, Rgba16Float).
     pub output_texture: wgpu::Texture,
     pub output_view: wgpu::TextureView,
@@ -31,12 +30,11 @@ pub struct RkpShadePass {
     shade_bind_group: Option<wgpu::BindGroup>,
     camera_bind_group: Option<wgpu::BindGroup>,
     atmo_bind_group: Option<wgpu::BindGroup>,
-    /// Resident brush-overlay buffer + the bind group referencing it.
-    /// `upload_brush_overlay` grows the buffer (and rebuilds the bind
-    /// group) when the cpu-side array outgrows GPU capacity.
-    brush_overlay_buffer: wgpu::Buffer,
-    brush_overlay_buffer_capacity: u64,
-    brush_overlay_bind_group: wgpu::BindGroup,
+    /// `BrushState` storage-buffer bind group. Set via
+    /// [`Self::set_brush_state`] from the per-VR buffer that the
+    /// brush-state probe pass writes. The `Option` lets the pass
+    /// no-op cleanly before the first viewport setup.
+    brush_state_bind_group: Option<wgpu::BindGroup>,
     /// Resident per-material user-shader params buffer. Parallel to
     /// the materials buffer: 32 bytes per material (8 × f32).
     /// `upload_shader_params` grows it as the materials array grows.
@@ -71,16 +69,20 @@ pub struct ShadeParams {
     /// just before the VR's submit, same channel as the other per-VR
     /// frame params.
     pub isolation: u32,
-    /// Paint cursor overlay (Phase-3 placeholder — world-space sphere
-    /// projected onto the surface; doesn't wrap corners geodesically
-    /// yet). `brush_active` = 0 disables the overlay entirely.
+    /// `brush_active = 0` disables the screen-space paint cursor.
+    /// `brush_active = 1` arms it; the cursor is drawn iff the
+    /// per-frame `BrushState` buffer's `hit_object_id` matches the
+    /// `brush_object_id` below (selection-lock).
     pub brush_active: u32,
     pub brush_radius: f32,
-    pub brush_falloff: f32,
+    /// `gpu_idx` of the currently-selected entity, or `u32::MAX` when
+    /// nothing is selected. Used by the shade pass to gate the cursor
+    /// to fragments belonging to that entity (mirrors the CPU paint
+    /// stamp's selection-lock check).
+    pub brush_object_id: u32,
     /// Engine clock in seconds. Used by user-shader `shade` hooks for
     /// time-driven effects (hologram scroll, fresnel pulse, etc.).
     pub time: f32,
-    pub brush_center: [f32; 4],
     pub brush_color: [f32; 4],
     /// Phase 8 S3 — non-zero ⇒ directional shadow comes from the
     /// shadow-map sample at group 1 binding 3 instead of the
@@ -101,7 +103,7 @@ pub struct ShadeParams {
     /// Driven by the Shadow Quality preset; clamped to {1,4,9,16}
     /// on the shader side. Zero is treated as 1 for safety.
     pub pcf_taps: u32,
-    pub _pad5: u32,
+    pub _pad3: u32,
 }
 
 impl Default for ShadeParams {
@@ -121,17 +123,47 @@ impl Default for ShadeParams {
             isolation: 0,
             brush_active: 0,
             brush_radius: 0.5,
-            brush_falloff: 0.5,
+            brush_object_id: u32::MAX,
             time: 0.0,
-            brush_center: [0.0, 0.0, 0.0, 0.0],
             brush_color: [1.0, 0.85, 0.2, 1.0],
             shadow_map_enabled: 0,
             shadow_disabled: 0,
             pcf_taps: 1,
-            _pad5: 0,
+            _pad3: 0,
         }
     }
 }
+
+/// 32-byte storage buffer written by `brush_state.wesl` once per
+/// frame and consumed by `rkp_shade.wesl` to draw the screen-space
+/// paint cursor. Mirror of the WGSL `BrushState` struct in
+/// `lib/types.wesl`. Default value (`hit_distance >= 1e9`) is
+/// equivalent to "no surface under the cursor — hide the cursor."
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BrushState {
+    pub center_world: [f32; 3],
+    pub hit_distance: f32,
+    pub hit_object_id: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+impl Default for BrushState {
+    fn default() -> Self {
+        Self {
+            center_world: [0.0; 3],
+            hit_distance: 1.0e10,
+            hit_object_id: u32::MAX,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<BrushState>() == 32);
 
 /// Per-light GPU data.
 #[repr(C)]
@@ -223,7 +255,7 @@ impl RkpShadePass {
             count: None,
         };
 
-        // Group 0: G-buffer (position, normal, material, glass, leaf_slot)
+        // Group 0: G-buffer (position, normal, material, glass, pick)
         let gbuffer_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("rkp_shade gbuf"),
@@ -233,8 +265,9 @@ impl RkpShadePass {
                     uint_texture_entry(2),
                     // Glass info (oct-normal + packed thickness/material_id)
                     uint_texture_entry(3),
-                    // Leaf-slot — primary hit's leaf_attr_slot for the
-                    // geodesic paint cursor. `0` = no hit.
+                    // Pick — primary hit's `gpu_idx`. `0xFFFFFFFFu` =
+                    // sky / no hit. Used by the screen-space paint
+                    // cursor's per-pixel selection-lock gate.
                     uint_texture_entry(4),
                 ],
             });
@@ -402,10 +435,11 @@ impl RkpShadePass {
                 ],
             });
 
-        // Group 6: paint cursor's per-leaf geodesic distance buffer.
-        let brush_overlay_bind_group_layout =
+        // Group 6: `BrushState` storage buffer. Read-only on this
+        // side — the brush-state probe pass owns the writes.
+        let brush_state_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("rkp_shade brush_overlay"),
+                label: Some("rkp_shade brush_state"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -417,26 +451,6 @@ impl RkpShadePass {
                     count: None,
                 }],
             });
-
-        // Placeholder 4-byte buffer — `upload_brush_overlay` grows it
-        // as the leaf_attr_pool grows. A minimum of one `f32` (4 B)
-        // keeps the storage binding valid even before any paint data
-        // has been uploaded.
-        let brush_overlay_buffer_capacity: u64 = 4;
-        let brush_overlay_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rkp_shade brush_overlay"),
-            size: brush_overlay_buffer_capacity,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let brush_overlay_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rkp_shade brush_overlay bg"),
-            layout: &brush_overlay_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: brush_overlay_buffer.as_entire_binding(),
-            }],
-        });
 
         // Output texture.
         let (output_texture, output_view) = Self::create_output(device, width, height);
@@ -463,7 +477,7 @@ impl RkpShadePass {
                 Some(&shade_bind_group_layout),
                 Some(&camera_bind_group_layout),
                 Some(&atmo_bind_group_layout),
-                Some(&brush_overlay_bind_group_layout),
+                Some(&brush_state_bind_group_layout),
             ],
             immediate_size: 0,
         });
@@ -479,7 +493,7 @@ impl RkpShadePass {
             shade_bind_group_layout,
             camera_bind_group_layout,
             atmo_bind_group_layout,
-            brush_overlay_bind_group_layout,
+            brush_state_bind_group_layout,
             output_texture,
             output_view,
             output_bind_group,
@@ -488,9 +502,7 @@ impl RkpShadePass {
             shade_bind_group: None,
             camera_bind_group: None,
             atmo_bind_group: None,
-            brush_overlay_buffer,
-            brush_overlay_buffer_capacity,
-            brush_overlay_bind_group,
+            brush_state_bind_group: None,
             shader_params_buffer,
             shader_params_buffer_capacity,
             source_hash: 0,
@@ -559,52 +571,18 @@ impl RkpShadePass {
         &self.shader_params_buffer
     }
 
-    /// Upload the paint cursor's per-leaf geodesic distance array.
-    /// Grows the resident GPU buffer (rebuilds its bind group) when
-    /// `bytes` exceeds capacity, so the caller doesn't need to
-    /// pre-size anything. Called from the render worker whenever
-    /// `RkpSceneManager::brush_overlay_epoch` ticks forward.
-    pub fn upload_brush_overlay(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        bytes: &[u8],
-    ) {
-        if bytes.is_empty() {
-            return;
-        }
-        let needed = bytes.len() as u64;
-        // Round up to 4 so the placeholder (4-byte) buffer can always
-        // accept at least one `f32`.
-        let needed = needed.max(4);
-        if needed > self.brush_overlay_buffer_capacity {
-            let mut new_cap = self.brush_overlay_buffer_capacity.max(4);
-            while new_cap < needed {
-                new_cap = new_cap.saturating_mul(2);
-            }
-            self.brush_overlay_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("rkp_shade brush_overlay"),
-                size: new_cap,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.brush_overlay_buffer_capacity = new_cap;
-            self.brush_overlay_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("rkp_shade brush_overlay bg"),
-                layout: &self.brush_overlay_bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.brush_overlay_buffer.as_entire_binding(),
-                }],
-            });
-        }
-        queue.write_buffer(&self.brush_overlay_buffer, 0, bytes);
-    }
-
-    /// Accessor for the brush-overlay bind group — the dispatcher
-    /// binds this at group 6 on every shade dispatch.
-    pub fn brush_overlay_bind_group(&self) -> &wgpu::BindGroup {
-        &self.brush_overlay_bind_group
+    /// Bind the per-VR `BrushState` storage buffer the brush-state
+    /// probe pass writes. Idempotent — called from the viewport's
+    /// per-resize binding refresh.
+    pub fn set_brush_state(&mut self, device: &wgpu::Device, brush_state_buffer: &wgpu::Buffer) {
+        self.brush_state_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rkp_shade brush_state bg"),
+            layout: &self.brush_state_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: brush_state_buffer.as_entire_binding(),
+            }],
+        }));
     }
 
     /// Set G-buffer views.
@@ -615,7 +593,7 @@ impl RkpShadePass {
         normal_view: &wgpu::TextureView,
         material_view: &wgpu::TextureView,
         glass_view: &wgpu::TextureView,
-        leaf_slot_view: &wgpu::TextureView,
+        pick_view: &wgpu::TextureView,
     ) {
         self.gbuffer_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rkp_shade gbuf bg"),
@@ -625,7 +603,7 @@ impl RkpShadePass {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(normal_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(material_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(glass_view) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(leaf_slot_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(pick_view) },
             ],
         }));
     }
@@ -744,6 +722,7 @@ impl RkpShadePass {
         let shade = match &self.shade_bind_group { Some(bg) => bg, None => return };
         let cam = match &self.camera_bind_group { Some(bg) => bg, None => return };
         let atmo = match &self.atmo_bind_group { Some(bg) => bg, None => return };
+        let brush_state = match &self.brush_state_bind_group { Some(bg) => bg, None => return };
 
         let wg_x = (self.width + 7) / 8;
         let wg_y = (self.height + 7) / 8;
@@ -759,7 +738,7 @@ impl RkpShadePass {
         pass.set_bind_group(3, shade, &[]);
         pass.set_bind_group(4, cam, &[]);
         pass.set_bind_group(5, atmo, &[]);
-        pass.set_bind_group(6, &self.brush_overlay_bind_group, &[]);
+        pass.set_bind_group(6, brush_state, &[]);
         pass.dispatch_workgroups(wg_x, wg_y, 1);
     }
 
@@ -872,11 +851,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shade_params_size_is_144() {
-        // Phase 8 S3 added shadow_map_enabled + 3 pad u32s after
-        // brush_color (vec4). Lock the new size against drift —
-        // the WGSL `ShadeParams` mirror depends on it.
-        assert_eq!(std::mem::size_of::<ShadeParams>(), 144);
+    fn shade_params_size_is_128() {
+        // Dropping the geodesic paint cursor freed brush_falloff +
+        // brush_center (20 B) and added brush_object_id (4 B), netting
+        // -16 B. Lock the new size — the WGSL `ShadeParams` mirror in
+        // `lib/types.wesl` depends on it.
+        assert_eq!(std::mem::size_of::<ShadeParams>(), 128);
     }
 
     #[test]

@@ -246,12 +246,6 @@ pub(super) struct RenderState {
     /// frame, not a one-shot dirty bit).
     pub(super) last_uploaded_geometry_epoch: u64,
 
-    /// Brush-overlay epoch of the last successful upload to shade's
-    /// per-leaf distance buffer. Compared each frame to the incoming
-    /// snapshot's `brush_overlay_epoch` to decide whether the cursor
-    /// data needs re-uploading.
-    pub(super) last_uploaded_brush_overlay_epoch: u64,
-
     /// `Arc` handle to the painted-leaf vec we last uploaded to the
     /// emit pass's `leaves_buffer`. Sim ships an `Arc<Vec<EmitLeaf>>`
     /// in every snapshot; the inner pointer only changes when sim
@@ -390,7 +384,6 @@ impl RenderState {
             // 0 = "never uploaded any geometry yet" — the first
             // snapshot with epoch > 0 triggers an upload.
             last_uploaded_geometry_epoch: 0,
-            last_uploaded_brush_overlay_epoch: 0,
             last_uploaded_painted_leaves: None,
             // Empty until the first render — the first frame's
             // override falls back to the snapshot's own view_proj

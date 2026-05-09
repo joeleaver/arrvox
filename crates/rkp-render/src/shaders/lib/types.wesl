@@ -315,9 +315,13 @@ struct ShadeParams {
     isolation: u32,
     brush_active: u32,
     brush_radius: f32,
-    brush_falloff: f32,
+    /// `gpu_idx` of the entity the brush is locked to (the currently
+    /// selected entity). The shade pass draws the cursor only when
+    /// `brush_state.hit_object_id == brush_object_id`, enforcing the
+    /// "cursor only on the selected entity" UX without a CPU pick
+    /// readback round-trip.
+    brush_object_id: u32,
     time: f32,
-    brush_center: vec4<f32>,
     brush_color: vec4<f32>,
     shadow_map_enabled: u32,
     // Non-zero ⇒ shade forces shadow=1.0 instead of sampling
@@ -332,7 +336,25 @@ struct ShadeParams {
     /// 4/9/16 = soft (rotated disc PCF). Driven by the Shadow
     /// Quality preset on the engine side.
     pcf_taps: u32,
-    _pad5: u32,
+    _pad3: u32,
+}
+
+// 32-byte storage buffer written by `brush_state.wesl` once per frame
+// (when paint mode is active) — captures whatever the cursor pixel
+// resolves to in this frame's G-buffer. `rkp_shade.wesl` reads it to
+// place the screen-space paint cursor.
+//
+// `hit_distance >= 1e9` ⇒ "no surface under the cursor" (sky / paint
+// mode off); the shade pass uses that as the hide-cursor sentinel.
+// `hit_object_id == 0xFFFFFFFFu` is the same condition expressed
+// through the pick channel — either gate hides the cursor.
+struct BrushState {
+    center_world: vec3<f32>,
+    hit_distance: f32,
+    hit_object_id: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 // Volumetric march parameters (224 bytes). CPU mirror is

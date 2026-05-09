@@ -19,7 +19,26 @@ use crate::generator::GeneratorOwned;
 
 use super::state::EngineState;
 
+/// Window after the last paint stamp during which `RKP_PAINT_PROFILE`
+/// traces are emitted. Long enough to cover the sim ticks between
+/// stamps in a drag (pick round-trip is typically a few frames),
+/// short enough that idle silences within a beat of releasing.
+const PAINT_PROFILE_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
 impl EngineState {
+    /// `true` when paint profiling traces should fire. Gated on the
+    /// `RKP_PAINT_PROFILE` env var AND a recent stamp activity, so
+    /// hover / idle paint mode stay quiet.
+    pub(crate) fn paint_profile_active(&self) -> bool {
+        if std::env::var("RKP_PAINT_PROFILE").is_err() {
+            return false;
+        }
+        match self.last_paint_stamp_at {
+            Some(t) => t.elapsed() < PAINT_PROFILE_WINDOW,
+            None => false,
+        }
+    }
     /// Dispatch an [`EngineCommand::Paint`] stamp. Returns the number of
     /// leaves written (0 if the command was dropped — see [`Self::apply_paint_stamp`]).
     pub(crate) fn handle_paint_command(
@@ -71,8 +90,8 @@ impl EngineState {
         // Paint only acts on the currently selected entity. Picking
         // through a non-selected object returns 0 silently so casual
         // clicks don't deselect or paint unrelated geometry. The
-        // cursor overlay is gated the same way (see
-        // `refresh_brush_overlay`).
+        // cursor visualization is gated the same way (per-pixel
+        // selection lock in `rkp_shade.wesl`).
         if self.selected_entity != Some(entity) {
             return 0;
         }
@@ -106,14 +125,23 @@ impl EngineState {
             PaintMode::Erase => rkp_render::paint::PaintStamp::Erase,
         };
 
-        let written = {
+        let profile = std::env::var("RKP_PAINT_PROFILE").is_ok();
+        let t0 = std::time::Instant::now();
+        // Stretch the profile-active window forward — covers the
+        // sim ticks BETWEEN stamps too, so update_scene_gpu's
+        // gap-since-last trace fires throughout the drag instead of
+        // dropping out 500 ms after the most recent commit.
+        if profile {
+            self.last_paint_stamp_at = Some(t0);
+        }
+        let (written, overlay_len_after) = {
             // Take the per-entity overlay first so its `&mut`
             // borrow into `self.paint_overlays` doesn't fight the
             // scene_mgr lock. `entry().or_default()` lazily allocates
             // the overlay on the first stamp into this entity.
             let overlay = self.paint_overlays.entry(entity).or_default();
             let mut scene = self.scene_mgr.lock().expect("scene_mgr poisoned");
-            scene.apply_paint_sphere(
+            let w = scene.apply_paint_sphere(
                 &asset_info,
                 entity_world,
                 world_pos,
@@ -122,62 +150,38 @@ impl EngineState {
                 falloff,
                 stamp,
                 overlay,
-            )
+            );
+            (w, overlay.len())
         };
+        if profile && written > 0 {
+            eprintln!(
+                "[paint] stamp written={} overlay_len={} stamp_dt={:?}",
+                written, overlay_len_after, t0.elapsed(),
+            );
+        }
         if written > 0 {
+            // Bump the active-window anchor on actual stamps too, so
+            // a long pause between stamps doesn't leak into idle
+            // before the user resumes the drag.
+            self.last_paint_stamp_at = Some(std::time::Instant::now());
             // Per-instance `overlay_offset` / `overlay_count` shift
             // every time the overlay vec grows (or, in theory,
             // shrinks via erase). Force a `gpu_instances` rebuild on
             // the next tick so the GPU side picks up the new slice
             // into `instance_overlay_buffer`.
             self.gpu_objects_dirty = true;
+            // Mark this entity for an incremental painted-material
+            // re-scan in the next lifecycle tick — but ONLY for
+            // material-mode stamps. Color and Erase stamps keep the
+            // leaf's `material_id` (and therefore its shader-material
+            // membership) unchanged, so the walk's result can't move.
+            // Skipping the dirty-mark on color drags keeps the
+            // 60+ Hz drag path off the O(octree) walk entirely.
+            if matches!(mode, PaintMode::Material) {
+                self.painted_dirty_entities.insert(entity);
+            }
         }
         written
-    }
-
-    /// Re-run the geodesic flood fill for the current brush cursor +
-    /// radius. Called on every pick result that updates the cursor
-    /// position, and on every settings change (radius) that would
-    /// shift the footprint. Clears the overlay instead of writing
-    /// when any precondition fails so a stale cursor doesn't linger.
-    pub(crate) fn refresh_brush_overlay(&mut self) {
-        // `clear_overlay` wraps the lock-acquire so both the early-
-        // return cases below stay tidy.
-        let clear_overlay = |state: &mut EngineState| {
-            if let Ok(mut sm) = state.scene_mgr.lock() {
-                sm.clear_brush_overlay();
-            }
-        };
-
-        let (Some(entity), Some(world_pos)) =
-            (self.paint_cursor_entity, self.paint_cursor_world)
-        else {
-            clear_overlay(self);
-            return;
-        };
-        // Only show the cursor on the currently selected entity. A
-        // hover over an unselected or deselected object clears — so
-        // the user sees the cursor only when they can actually paint.
-        if self.selected_entity != Some(entity) {
-            clear_overlay(self);
-            return;
-        }
-        // Procedural / generator-owned entities can't be painted; if
-        // one is somehow selected + hovered, hide the cursor too.
-        if self.world.get::<&ProceduralGeometry>(entity).is_ok()
-            || self.world.get::<&GeneratorOwned>(entity).is_ok()
-        {
-            clear_overlay(self);
-            return;
-        }
-        let Some((asset_info, entity_world)) = self.build_paint_context(entity) else {
-            clear_overlay(self);
-            return;
-        };
-        let radius = self.paint_mode_radius;
-        if let Ok(mut sm) = self.scene_mgr.lock() {
-            sm.update_brush_overlay(&asset_info, entity_world, world_pos, radius);
-        }
     }
 
     /// Resolve an entity into the data paint needs: an `AssetInfo`

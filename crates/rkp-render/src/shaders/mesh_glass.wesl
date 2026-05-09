@@ -349,13 +349,21 @@ fn classify_glass(leaf_attr_id: u32) -> GlassClass {
     let inst = instances[instance.object_id];
     let attr = fetch_leaf_attr_for(inst, leaf_attr_id);
     let mat_id = attr.material_packed & 0xFFFFu;
-    let mat = materials[mat_id];
+    // OOB-safe lookup — same rationale as `mesh.wesl`. Without this,
+    // virgin pool slots whose material ids are outside the loaded
+    // palette would classify as glass (zero `GpuMaterial.opacity`)
+    // and capture as glass entries here even though the underlying
+    // material is implicitly the project default.
+    let mat_id_safe = select(
+        mat_id, 0u, mat_id >= arrayLength(&materials),
+    );
+    let mat = materials[mat_id_safe];
     var out: GlassClass;
     out.attr = attr;
     if mat.opacity >= fs_params.opacity_threshold {
         out.material_id = 0xFFFFFFFFu;
     } else {
-        out.material_id = mat_id;
+        out.material_id = mat_id_safe;
     }
     return out;
 }

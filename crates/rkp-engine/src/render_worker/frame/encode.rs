@@ -278,6 +278,11 @@ pub(super) fn encode_viewports(
             // `AssetHandle` don't appear here and won't render under
             // `RKP_PRIMARY=splat`.
             &frame.splat_draws,
+            // Cursor pixel for the screen-space paint cursor's
+            // brush-state probe pass. `None` = paint mode off (or
+            // mouse outside the framebuffer); the probe will write
+            // the miss sentinel and shade hides the cursor.
+            vp.brush_pixel,
         );
 
         // 3i. Pick encode — if there's a pending pick targeted at this

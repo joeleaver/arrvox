@@ -52,8 +52,6 @@ impl EngineState {
                 .filter(|sel| hit_entity == Some(*sel));
 
             if let (Some(entity), Some(world_pos)) = (target_entity, pr.position) {
-                self.paint_cursor_world = Some(world_pos);
-                self.paint_cursor_entity = Some(entity);
                 let _ = self.apply_paint_stamp(
                     entity,
                     world_pos,
@@ -64,43 +62,6 @@ impl EngineState {
                     settings.mode,
                     settings.material_id,
                 );
-                self.refresh_brush_overlay();
-            } else {
-                // Stroke is off-target — clear any cached cursor so
-                // the overlay disappears until it re-enters the
-                // locked entity.
-                self.paint_cursor_world = None;
-                self.paint_cursor_entity = None;
-                if let Ok(mut sm) = self.scene_mgr.lock() {
-                    sm.clear_brush_overlay();
-                }
-            }
-            self.in_flight_pick_ghost = None;
-            return;
-        }
-
-        // Hover pick: track the cursor while the user is in paint
-        // mode but hasn't pressed LMB yet. Only the selected entity
-        // shows the cursor — hovering never claims selection
-        // (that's reserved for LMB stamps so idle mouse movement
-        // doesn't silently latch onto something).
-        if self.paint_hover_pending.take().is_some() {
-            let selected_gpu_idx = self.selected_entity
-                .and_then(|e| self.entity_to_gpu.get(&e).copied());
-            let hit_gpu_idx = pr.raw_payload[0];
-            let hit_matches_selection = hit_gpu_idx != u32::MAX
-                && selected_gpu_idx == Some(hit_gpu_idx as usize);
-            if hit_matches_selection {
-                self.paint_cursor_world = pr.position;
-                let entity = self.gpu_to_entity[hit_gpu_idx as usize];
-                self.paint_cursor_entity = Some(entity);
-                self.refresh_brush_overlay();
-            } else {
-                self.paint_cursor_world = None;
-                self.paint_cursor_entity = None;
-                if let Ok(mut sm) = self.scene_mgr.lock() {
-                    sm.clear_brush_overlay();
-                }
             }
             self.in_flight_pick_ghost = None;
             return;

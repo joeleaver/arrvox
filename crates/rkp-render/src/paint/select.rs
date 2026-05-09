@@ -1,30 +1,16 @@
-//! Spatial paint selection — sphere brush, single-cell cursor pick, and
-//! geodesic surface flood fill. Every fn here is a pure read of the
-//! octree + brick pool + face-link table; no `LeafAttrPool` writes.
+//! Spatial paint selection — sphere brush + single-cell cursor pick.
+//! Every fn here is a pure read of the octree + brick pool; no
+//! `LeafAttrPool` writes.
 //!
-//! Output types ([`PaintedLeaf`], [`LeafHit`], [`FloodedLeaf`]) live
-//! here too — they're the products of selection that [`super::write`]
-//! consumes.
-//!
-//! The 6-face delta table [`FACE_DELTAS`] is `pub(super)` so write-side
-//! helpers can match on the same ordering as `brick_face_links`.
+//! Output types ([`PaintedLeaf`], [`LeafHit`]) live here too —
+//! they're the products of selection that [`super::write`] consumes.
 
 use glam::{UVec3, Vec3};
-use rkp_core::brick_face_links::{FACE_EMPTY, FACE_INTERIOR};
 use rkp_core::brick_pool::{brick_flat_index, BrickPool, BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR};
 use rkp_core::sparse_octree::{
     brick_id as node_brick_id, is_branch, is_brick, is_leaf, leaf_slot as node_leaf_slot,
     EMPTY_NODE, INTERIOR_NODE,
 };
-
-/// 6-face deltas matching `brick_face_links` ordering:
-/// `(−X, +X, −Y, +Y, −Z, +Z)`. Used by the geodesic flood fill so cell
-/// neighbors pair correctly with the brick face the hop crosses.
-const FACE_DELTAS: [(i32, i32, i32); 6] = [
-    (-1, 0, 0), (1, 0, 0),
-    (0, -1, 0), (0, 1, 0),
-    (0, 0, -1), (0, 0, 1),
-];
 
 /// One leaf inside a brush's influence, ready to receive a paint edit.
 #[derive(Debug, Clone, Copy)]
@@ -308,146 +294,3 @@ pub fn leaf_at_local_pos(
     None
 }
 
-/// One voxel touched by the geodesic flood fill. `distance` is the
-/// world-space geodesic distance from the brush origin (the pick
-/// position, not the voxel center) — surface-walking distance, not
-/// straight-line — which is why the cursor wraps around corners.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct FloodedLeaf {
-    pub leaf_slot: u32,
-    pub distance: f32,
-}
-
-/// Walk face-adjacent surface voxels from the brush origin, collecting
-/// leaves whose **euclidean distance** to the brush origin is within
-/// `radius`. The walk itself uses face adjacency (so the cursor can't
-/// jump across gaps / through air), but the emitted distance is
-/// straight-line — BFS hop count × cell_size gives a rhombic
-/// (Manhattan-ball) cursor shape, which looks hexagonal on flat
-/// surfaces. Euclidean distance on the face-connected set gives a
-/// proper circle on flat regions, cleanly cut off by surface
-/// topology around edges and corners.
-///
-/// Neighbor lookup: cell-local within a brick (4³), cross-brick via
-/// `brick_face_links` (wrap the stepped-out-of-bounds cell coord into
-/// the neighbor brick's face).
-pub fn surface_flood_fill(
-    octree_buffer: &[u32],
-    root_offset: u32,
-    depth: u8,
-    base_voxel_size: f32,
-    brick_pool: &BrickPool,
-    brick_face_links: &[[u32; 6]],
-    grid_origin_local: Vec3,
-    start_pos_local: Vec3,
-    radius: f32,
-) -> Vec<FloodedLeaf> {
-    if radius <= 0.0 {
-        return Vec::new();
-    }
-    let Some(start) = leaf_at_local_pos(
-        octree_buffer, root_offset, depth, base_voxel_size,
-        brick_pool, grid_origin_local, start_pos_local,
-    ) else {
-        return Vec::new();
-    };
-
-    let init_dist = (start.center_local - start_pos_local).length();
-    if init_dist > radius {
-        return Vec::new();
-    }
-
-    let cell_size = start.cell_size;
-
-    // BFS state. `visited` de-dupes leaf_slots; each queue entry
-    // carries the cell's world-local center so neighbors can compute
-    // their own world positions by adding `cell_size * face_delta`.
-    //
-    // Pruning: we keep exploring as long as a neighbor COULD land
-    // within the radius. A face-neighbor is at most `cell_size`
-    // closer to the brush origin than the current cell, so we can
-    // safely cut the search off once a cell is farther than
-    // `radius + cell_size` (any neighbor would still be > radius).
-    use std::collections::{HashSet, VecDeque};
-    let mut visited: HashSet<u32> = HashSet::new();
-    let mut queue: VecDeque<(u32, UVec3, u32, Vec3)> = VecDeque::new();
-    let mut out: Vec<FloodedLeaf> = Vec::new();
-
-    visited.insert(start.leaf_slot);
-    queue.push_back((start.brick_id, start.cell, start.leaf_slot, start.center_local));
-    out.push(FloodedLeaf { leaf_slot: start.leaf_slot, distance: init_dist });
-
-    let brick_dim = BRICK_DIM as i32;
-    let prune_dist = radius + cell_size;
-
-    while let Some((brick_id, cell, _slot, center)) = queue.pop_front() {
-        let cur_dist = (center - start_pos_local).length();
-        if cur_dist > prune_dist {
-            // No neighbor can cross back under the radius from here.
-            continue;
-        }
-
-        for face_idx in 0..6 {
-            let (dx, dy, dz) = FACE_DELTAS[face_idx];
-            let nx = cell.x as i32 + dx;
-            let ny = cell.y as i32 + dy;
-            let nz = cell.z as i32 + dz;
-
-            let (nbr_brick_id, ncx, ncy, ncz) =
-                if (0..brick_dim).contains(&nx)
-                    && (0..brick_dim).contains(&ny)
-                    && (0..brick_dim).contains(&nz)
-                {
-                    // Within the same brick.
-                    (brick_id, nx as u32, ny as u32, nz as u32)
-                } else {
-                    // Stepped off a face — follow the brick face link.
-                    let row = brick_face_links.get(brick_id as usize).copied();
-                    let link = match row {
-                        Some(r) => r[face_idx],
-                        None => continue,
-                    };
-                    if link == FACE_EMPTY || link == FACE_INTERIOR {
-                        continue;
-                    }
-                    // Wrap the out-of-bounds coord into the neighbor's
-                    // facing edge: +X out of cell.x=3 lands on the
-                    // neighbor's x=0, and so on.
-                    let wx = ((nx + brick_dim) % brick_dim) as u32;
-                    let wy = ((ny + brick_dim) % brick_dim) as u32;
-                    let wz = ((nz + brick_dim) % brick_dim) as u32;
-                    (link, wx, wy, wz)
-                };
-
-            let cells = brick_pool.brick_cells(nbr_brick_id);
-            let nbr_slot = cells[brick_flat_index(ncx, ncy, ncz) as usize];
-            if nbr_slot == BRICK_EMPTY || nbr_slot == BRICK_INTERIOR {
-                continue;
-            }
-            if !visited.insert(nbr_slot) {
-                continue;
-            }
-            // Neighbor's world-local center: face hops move exactly
-            // `cell_size` along the face-delta axis. Works identically
-            // for within-brick and across-brick-face moves.
-            let nbr_center = center
-                + Vec3::new(
-                    dx as f32 * cell_size,
-                    dy as f32 * cell_size,
-                    dz as f32 * cell_size,
-                );
-            let nbr_dist = (nbr_center - start_pos_local).length();
-            if nbr_dist <= radius {
-                out.push(FloodedLeaf { leaf_slot: nbr_slot, distance: nbr_dist });
-            }
-            // Still enqueue even when outside the radius so BFS can
-            // reach voxels that are topologically connected through a
-            // just-outside-radius voxel (rare but possible on curved
-            // surfaces). `prune_dist` bounds the search at
-            // `radius + cell_size`.
-            queue.push_back((nbr_brick_id, UVec3::new(ncx, ncy, ncz), nbr_slot, nbr_center));
-        }
-    }
-
-    out
-}

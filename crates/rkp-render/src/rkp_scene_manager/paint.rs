@@ -1,10 +1,8 @@
 //! Paint epoch + brush overlay + sphere paint application.
 //!
-//! Sibling impl block on `RkpSceneManager`. Owns `paint_epoch`,
-//! `brush_overlay_*`, and `apply_paint_sphere`. Reads `pub(super)`
-//! fields on the struct directly. The `bump_brush_overlay_epoch`
-//! helper is `pub(super)` so [`super::manager::RkpSceneManager::clear`]
-//! can bump on a full reset.
+//! Sibling impl block on `RkpSceneManager`. Owns `paint_epoch` and
+//! `apply_paint_sphere`. Reads `pub(super)` fields on the struct
+//! directly.
 
 use rkp_core::LeafAttr;
 
@@ -55,128 +53,6 @@ impl RkpSceneManager {
         &full[start..end]
     }
 
-
-    // ── Paint cursor overlay ────────────────────────────────────────
-
-    /// Current brush-overlay epoch (lock-free read).
-    pub fn brush_overlay_epoch(&self) -> u64 {
-        self.brush_overlay_epoch
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Clone the brush-overlay epoch atomic so render / sim can poll
-    /// it without taking the scene_mgr Mutex.
-    pub fn brush_overlay_epoch_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
-        self.brush_overlay_epoch.clone()
-    }
-
-    pub(super) fn bump_brush_overlay_epoch(&mut self) {
-        self.brush_overlay_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Brush-overlay distance array bytes for GPU upload. Parallel to
-    /// `leaf_attr_pool` — grown to match the pool's allocated size.
-    /// Sentinel: `f32::INFINITY` means "not under the current brush".
-    pub fn brush_overlay_bytes(&self) -> &[u8] {
-        let n = self.leaf_attr_pool.allocated_count() as usize;
-        if n == 0 {
-            return &[];
-        }
-        let len = n.min(self.brush_overlay_distances.len());
-        bytemuck::cast_slice(&self.brush_overlay_distances[..len])
-    }
-
-    /// Drop any currently-active brush overlay. Cheap — only touches
-    /// the slots flooded by the last `update_brush_overlay` call.
-    pub fn clear_brush_overlay(&mut self) {
-        if self.brush_overlay_flooded_slots.is_empty() {
-            return;
-        }
-        for &slot in &self.brush_overlay_flooded_slots {
-            if let Some(d) = self.brush_overlay_distances.get_mut(slot as usize) {
-                *d = f32::INFINITY;
-            }
-        }
-        self.brush_overlay_flooded_slots.clear();
-        self.bump_brush_overlay_epoch();
-    }
-
-    /// Run a geodesic surface flood fill from `brush_center_world` on
-    /// the target asset and write per-leaf distances into the overlay
-    /// array. Clears the previous fill first (so the brush doesn't
-    /// "smear" across frames). No-op when the entity's spatial handle
-    /// isn't an octree (procedurals — they don't own leaf slots and
-    /// thus have no per-voxel cursor).
-    pub fn update_brush_overlay(
-        &mut self,
-        asset: &AssetInfo,
-        entity_world: glam::Affine3A,
-        brush_center_world: glam::Vec3,
-        radius: f32,
-    ) {
-        use rkp_core::scene_node::SpatialHandle;
-        // Start by dropping the previous fill — even if this new call
-        // produces no hits we want the cursor to vanish, not linger.
-        self.clear_brush_overlay();
-
-        if radius <= 0.0 {
-            return;
-        }
-        let SpatialHandle::Octree { root_offset, depth, base_voxel_size, .. } = asset.spatial
-        else {
-            return;
-        };
-
-        let inv_world = entity_world.inverse();
-        let center_local = inv_world.transform_point3(brush_center_world);
-        let (scale, _, _) = entity_world.to_scale_rotation_translation();
-        let mean_scale = (scale.x.abs() + scale.y.abs() + scale.z.abs()) / 3.0;
-        let local_radius = radius / mean_scale.max(1e-6);
-
-        let hits = crate::paint::surface_flood_fill(
-            self.octree.data(),
-            root_offset,
-            depth,
-            base_voxel_size,
-            &self.brick_pool,
-            &self.brick_face_links,
-            asset.grid_origin,
-            center_local,
-            local_radius,
-        );
-
-        if hits.is_empty() {
-            return;
-        }
-
-        // Grow the distance array if the leaf_attr_pool has outgrown it.
-        let pool_len = self.leaf_attr_pool.capacity() as usize;
-        if self.brush_overlay_distances.len() < pool_len {
-            self.brush_overlay_distances.resize(pool_len, f32::INFINITY);
-        }
-
-        let slot_lo = asset.leaf_attr_slot_start;
-        let slot_hi = slot_lo + asset.leaf_attr_slot_count;
-        self.brush_overlay_flooded_slots.reserve(hits.len());
-        for hit in &hits {
-            if hit.leaf_slot < slot_lo || hit.leaf_slot >= slot_hi {
-                continue;
-            }
-            let idx = hit.leaf_slot as usize;
-            if idx < self.brush_overlay_distances.len() {
-                // In world-scale units — the flood fill converts
-                // object-local cell_size back up into world distance
-                // implicitly because the mean-scale adjustment above
-                // gave it a local_radius in local units. To keep the
-                // shader's radius comparison in world units, remap
-                // back up by the mean scale.
-                self.brush_overlay_distances[idx] = hit.distance * mean_scale;
-                self.brush_overlay_flooded_slots.push(hit.leaf_slot);
-            }
-        }
-        self.bump_brush_overlay_epoch();
-    }
 
     // ── Paint orchestrator ───────────────────────────────────────────
 
@@ -271,7 +147,13 @@ impl RkpSceneManager {
         let slot_lo = asset.leaf_attr_slot_start;
         let slot_hi = slot_lo + asset.leaf_attr_slot_count;
 
-        let mut written: usize = 0;
+        // Accumulate new/updated entries into a batch and commit at the
+        // end via `upsert_batch`. Per-entry `upsert` is O(N) on the
+        // sorted vec; a stamp touching K leaves on an overlay of size
+        // N is therefore O(K · N), which on a long drag (N grows
+        // each stamp) blew up to ~1 fps. Batched merge-pass is
+        // O(N + K log K).
+        let mut batch: Vec<rkp_core::OverlayEntry> = Vec::with_capacity(hits.len());
         for hit in &hits {
             if hit.leaf_slot < slot_lo || hit.leaf_slot >= slot_hi {
                 continue;
@@ -288,7 +170,8 @@ impl RkpSceneManager {
             // the asset's pool. Multi-stroke compounding (gradual blend,
             // erase fade-out) needs to read the previously-painted
             // value, not always the base.
-            let (cur_attr, cur_color) = match overlay.get(paint_slot) {
+            let cur_overlay = overlay.get(paint_slot);
+            let (cur_attr, cur_color) = match cur_overlay {
                 Some(e) => (e.attr(), e.color_packed),
                 None => (
                     *self.leaf_attr_pool.get(paint_slot),
@@ -301,35 +184,43 @@ impl RkpSceneManager {
                     let new_attr = crate::paint::compute_painted_attr(
                         cur_attr, material_id, weight,
                     );
-                    if new_attr == cur_attr && overlay.get(paint_slot).is_none() {
+                    if new_attr == cur_attr && cur_overlay.is_none() {
                         // No-op write that wasn't already in the overlay
-                        // — skip the upsert so unpainted material-only
-                        // brushes don't bloat the overlay with identity
-                        // entries.
+                        // — skip so unpainted material-only brushes
+                        // don't bloat the overlay with identity entries.
                         continue;
                     }
-                    overlay.upsert(paint_slot, new_attr, cur_color);
+                    batch.push(rkp_core::OverlayEntry::from_parts(
+                        paint_slot, new_attr, cur_color,
+                    ));
                 }
                 crate::paint::PaintStamp::Color { rgb } => {
                     let new_color = crate::paint::compute_painted_color(
                         cur_color, rgb, weight,
                     );
-                    if new_color == cur_color && overlay.get(paint_slot).is_none() {
+                    if new_color == cur_color && cur_overlay.is_none() {
                         continue;
                     }
-                    overlay.upsert(paint_slot, cur_attr, new_color);
+                    batch.push(rkp_core::OverlayEntry::from_parts(
+                        paint_slot, cur_attr, new_color,
+                    ));
                 }
                 crate::paint::PaintStamp::Erase => {
                     let new_color = crate::paint::compute_erased_color(
                         cur_color, weight,
                     );
-                    if new_color == cur_color && overlay.get(paint_slot).is_none() {
+                    if new_color == cur_color && cur_overlay.is_none() {
                         continue;
                     }
-                    overlay.upsert(paint_slot, cur_attr, new_color);
+                    batch.push(rkp_core::OverlayEntry::from_parts(
+                        paint_slot, cur_attr, new_color,
+                    ));
                 }
             }
-            written += 1;
+        }
+        let written = batch.len();
+        if written > 0 {
+            overlay.upsert_batch(batch);
         }
 
         if written > 0 {

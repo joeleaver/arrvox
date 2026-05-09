@@ -183,7 +183,14 @@ fn frag_main(in: VsOut) {
     let inst = instances[instance.object_id];
     let attr = fetch_leaf_attr_for(inst, in.leaf_attr_id);
     let mat_id = attr.material_packed & 0xFFFFu;
-    if materials[mat_id].opacity < 0.99 {
+    // OOB-safe lookup — see `mesh.wesl` for the rationale. Without
+    // this, virgin pool slots that point at material ids beyond the
+    // loaded palette would discard as glass and miss casting shadow,
+    // creating dark/light fringes that follow the brush boundary.
+    let mat_id_safe = select(
+        mat_id, 0u, mat_id >= arrayLength(&materials),
+    );
+    if materials[mat_id_safe].opacity < 0.99 {
         discard;
     }
 }

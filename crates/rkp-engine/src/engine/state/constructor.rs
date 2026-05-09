@@ -23,9 +23,9 @@ impl EngineState {
         // Clone the lock-free epoch handle ONCE at startup; sim
         // reads it every tick to detect geometry changes without
         // having to take the scene_mgr Mutex.
-        let (geometry_epoch_handle, brush_overlay_epoch_handle, paint_epoch_handle) = {
+        let (geometry_epoch_handle, paint_epoch_handle) = {
             let sm = scene_mgr.lock().expect("scene_mgr poisoned");
-            (sm.epoch_handle(), sm.brush_overlay_epoch_handle(), sm.paint_epoch_handle())
+            (sm.epoch_handle(), sm.paint_epoch_handle())
         };
 
         // Input system with default action map.
@@ -72,6 +72,8 @@ impl EngineState {
             user_shader_registry: rkp_render::shader_composer::UserShaderRegistry::empty(),
             painted_materials: std::collections::HashMap::new(),
             painted_leaves: std::sync::Arc::new(Vec::new()),
+            painted_per_entity: std::collections::HashMap::new(),
+            painted_dirty_entities: std::collections::HashSet::new(),
             painted_materials_paint_epoch: 0,
             painted_materials_geometry_epoch: 0,
             paint_overlays: std::collections::HashMap::new(),
@@ -81,7 +83,6 @@ impl EngineState {
             render_worker,
             scene_mgr,
             geometry_epoch_handle,
-            brush_overlay_epoch_handle,
             paint_epoch_handle,
             skinning_data_cache: std::collections::HashMap::new(),
             // 0 → cache rebuilds the first time epoch > 0 (any
@@ -197,11 +198,9 @@ impl EngineState {
             pending_drop: None,
             drag_preview: None,
             paint_pick_settings: None,
-            paint_hover_pending: None,
+            last_paint_stamp_at: None,
             paint_mode_active: false,
             paint_mode_radius: 0.5,
-            paint_cursor_world: None,
-            paint_cursor_entity: None,
             num_lights_cache: 1,
             shade_params_base: rkp_render::rkp_shade::ShadeParams::default(),
             lod_enabled: true,

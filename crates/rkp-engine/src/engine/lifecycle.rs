@@ -139,87 +139,203 @@ impl EngineState {
         // this frame's content, missing the latest paint.
         let gpu_objects_dirty_this_frame = self.gpu_objects_dirty;
         if self.gpu_objects_dirty {
+            let profile = self.paint_profile_active();
+            let t0 = std::time::Instant::now();
             self.update_scene_gpu();
+            if profile {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static LAST_NS: AtomicU64 = AtomicU64::new(0);
+                let now_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                let prev = LAST_NS.swap(now_ns, Ordering::Relaxed);
+                let gap_ms = if prev == 0 { 0.0 } else { (now_ns.saturating_sub(prev)) as f64 / 1.0e6 };
+                eprintln!(
+                    "[paint] update_scene_gpu dt={:?} instances={} overlays={} gap_since_last={:.1}ms",
+                    t0.elapsed(),
+                    self.gpu_instances.len(),
+                    self.gpu_instance_overlays.len(),
+                    gap_ms,
+                );
+            }
             self.gpu_objects_dirty = false;
         }
 
         if !shader_materials.is_empty() {
             // Reconcile the per-entity painted-material cache against
-            // current paint + geometry epochs. Both bump on any
-            // leaf-attr write (paint stroke, voxelize, asset load),
-            // so a single equality check covers all invalidation.
-            let (cur_paint, cur_geom) = {
-                let sm = self.scene_mgr.lock().expect("scene_mgr poisoned");
-                (sm.paint_epoch(), sm.geometry_epoch())
+            // current paint + geometry epochs.
+            //
+            // - paint_epoch advances only via `apply_paint_stamp`, which
+            //   also adds the painted entity to `painted_dirty_entities`.
+            //   So a paint-only frame walks just that one entity.
+            // - geometry_epoch advances on any voxel-pool / octree write
+            //   (asset load, voxelize, bake, sculpt). We mirror the old
+            //   "wipe all" behavior here: every renderable goes into the
+            //   dirty set so the next walk pass rebuilds them.
+            // Lock-free walk path. We acquire `scene_mgr` only long
+            // enough to (a) read both epoch counters and (b) clone an
+            // `Arc`-shared `WalkSnapshot` of the three pool buffers
+            // the scan needs. The `O(tree)` walks themselves run
+            // outside the lock — render and other sim paths can
+            // proceed in parallel. The first call after a
+            // geometry-epoch bump pays a one-time `~300 MB` memcpy
+            // inside `walk_snapshot()`; every subsequent stamp's walk
+            // hits the cached snapshot and the lock is held for
+            // microseconds.
+            let (cur_paint, cur_geom, snapshot_opt) = {
+                let mut sm = self.scene_mgr.lock().expect("scene_mgr poisoned");
+                let cur_paint = sm.paint_epoch();
+                let cur_geom = sm.geometry_epoch();
+                // Skip the snapshot rebuild on frames where there's
+                // no work to do (no dirty entities AND no geometry
+                // change). This keeps the brief lock-and-clone path
+                // off frames that don't reach the walk loop below.
+                let want_snapshot = !self.painted_dirty_entities.is_empty()
+                    || cur_geom != self.painted_materials_geometry_epoch;
+                let snapshot = if want_snapshot {
+                    Some(sm.walk_snapshot())
+                } else {
+                    None
+                };
+                (cur_paint, cur_geom, snapshot)
             };
-            if cur_paint != self.painted_materials_paint_epoch
-                || cur_geom != self.painted_materials_geometry_epoch
-            {
-                use crate::components::{Renderable, Transform};
-                self.painted_materials.clear();
-                // Build a fresh local Vec for this rebuild and atomically
-                // swap into the Arc at the end. The previous Arc may
-                // still be held by the most recent in-flight snapshot;
-                // letting that reference live on its own avoids a
-                // make_mut copy-on-write for the older view.
-                let mut new_painted_leaves: Vec<
-                    rkp_render::user_shader_emit_pass::EmitLeaf,
-                > = Vec::new();
-                let sm = self.scene_mgr.lock().expect("scene_mgr poisoned");
-                let octree_data = sm.octree.data();
-                let brick_pool_data = sm.brick_pool.as_slice();
-                for (entity, _) in self
-                    .world
-                    .query::<(&Renderable, &Transform)>()
-                    .iter()
-                {
-                    let Ok(r) = self.world.get::<&Renderable>(entity) else { continue; };
-                    let Some(spatial) = &r.spatial else { continue; };
-                    let Some(&gpu_idx) = self.entity_to_gpu.get(&entity) else { continue; };
+            let geom_changed =
+                cur_geom != self.painted_materials_geometry_epoch;
+            if geom_changed {
+                use crate::components::Renderable;
+                self.painted_per_entity.clear();
+                for (entity, _) in self.world.query::<&Renderable>().iter() {
+                    self.painted_dirty_entities.insert(entity);
+                }
+            }
+
+            let painted_walk_profile = self.paint_profile_active();
+            let painted_walk_t0 = std::time::Instant::now();
+            let dirty_count = self.painted_dirty_entities.len();
+            if dirty_count > 0 {
+                use crate::components::Renderable;
+                // The snapshot is guaranteed `Some` here: `want_snapshot`
+                // was true iff dirty was non-empty OR geom_changed (which
+                // also adds to dirty above), so reaching this branch
+                // implies we asked for a snapshot.
+                let snapshot = snapshot_opt.expect(
+                    "walk_snapshot must be present when dirty set is non-empty",
+                );
+                // Drain rather than iterate-then-clear so we can mutate
+                // `painted_per_entity` from inside the loop without
+                // double-borrowing `self`. `mem::take` keeps the dirty
+                // set's allocation around for the next stamp.
+                let dirty: std::collections::HashSet<hecs::Entity> =
+                    std::mem::take(&mut self.painted_dirty_entities);
+                for entity in dirty {
+                    // Despawned-while-dirty: drop any stale cache so
+                    // the flat concat below doesn't carry phantoms.
+                    if !self.world.contains(entity) {
+                        self.painted_per_entity.remove(&entity);
+                        continue;
+                    }
+                    let (root_offset, depth, grid_origin, base_voxel_size) = {
+                        let Ok(r) = self.world.get::<&Renderable>(entity) else {
+                            self.painted_per_entity.remove(&entity);
+                            continue;
+                        };
+                        let Some(spatial) = &r.spatial else {
+                            self.painted_per_entity.remove(&entity);
+                            continue;
+                        };
+                        (
+                            spatial.root_offset,
+                            spatial.depth,
+                            spatial.grid_origin,
+                            spatial.base_voxel_size,
+                        )
+                    };
+                    let Some(&gpu_idx) = self.entity_to_gpu.get(&entity) else {
+                        // No GPU instance yet — keep the entity dirty
+                        // for a later tick (re-add) and leave any old
+                        // cache alone. Without re-adding the walk would
+                        // never come back to it after the gpu mapping
+                        // appears (the dirty set has been drained).
+                        self.painted_dirty_entities.insert(entity);
+                        continue;
+                    };
                     let object_id = gpu_idx as u32;
-                    // Walk the entity's octree to build per-material
-                    // bounding boxes for leaves whose material has a
-                    // generate-hook shader. The AABB lets the
-                    // region request size itself tightly, so painting
-                    // grass on one ear doesn't grass-ify the whole
-                    // elephant.
-                    let mut mat_tiles: std::collections::HashMap<
-                        u16,
-                        std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
-                    > = std::collections::HashMap::new();
-                    // World matrix for transforming leaf-local positions
-                    // and normals into the world frame the emit pass
-                    // hands to user shaders. Entries without a matching
-                    // GPU object skip the leaf collection (mat_tiles
-                    // still gets the AABB so Phase C still works).
                     let entity_world: Option<glam::Mat4> = self
                         .gpu_instances
                         .iter()
                         .find(|i| i.object_id == object_id)
                         .map(|i| glam::Mat4::from_cols_array_2d(&i.world));
+
+                    let mut entry = super::state::EntityPaintedCache::default();
                     scan_painted_aabbs(
-                        octree_data,
-                        brick_pool_data,
-                        &sm.leaf_attr_pool,
+                        &snapshot.octree_data,
+                        &snapshot.brick_pool_data,
+                        &snapshot.leaf_attr_data,
                         self.paint_overlays.get(&entity),
-                        spatial.root_offset as usize,
-                        spatial.depth,
-                        spatial.grid_origin,
-                        spatial.base_voxel_size,
+                        root_offset as usize,
+                        depth,
+                        grid_origin,
+                        base_voxel_size,
                         &shader_materials,
                         entity_world,
                         object_id,
-                        &mut mat_tiles,
-                        &mut new_painted_leaves,
+                        &mut entry.mat_tiles,
+                        &mut entry.leaves,
                     );
-                    if !mat_tiles.is_empty() {
-                        self.painted_materials.insert(object_id, mat_tiles);
+                    if entry.mat_tiles.is_empty() && entry.leaves.is_empty() {
+                        self.painted_per_entity.remove(&entity);
+                    } else {
+                        self.painted_per_entity.insert(entity, entry);
                     }
                 }
-                drop(sm);
+            }
+
+            // Rebuild the flat views whenever per-entity contents
+            // changed (dirty set was non-empty) OR object_id mappings
+            // shifted (gpu_objects rebuild this frame). The latter
+            // matters because `painted_materials` is keyed by
+            // object_id — without rebuilding, a frame that moves
+            // entity A from object_id=3 to object_id=4 leaves a stale
+            // entry under the old key.
+            let need_flat_rebuild = dirty_count > 0
+                || gpu_objects_dirty_this_frame
+                || geom_changed;
+            if need_flat_rebuild {
+                self.painted_materials.clear();
+                let total_leaves: usize = self
+                    .painted_per_entity
+                    .values()
+                    .map(|e| e.leaves.len())
+                    .sum();
+                let mut new_painted_leaves: Vec<
+                    rkp_render::user_shader_emit_pass::EmitLeaf,
+                > = Vec::with_capacity(total_leaves);
+                for (entity, entry) in &self.painted_per_entity {
+                    if let Some(&gpu_idx) = self.entity_to_gpu.get(entity) {
+                        if !entry.mat_tiles.is_empty() {
+                            self.painted_materials
+                                .insert(gpu_idx as u32, entry.mat_tiles.clone());
+                        }
+                    }
+                    new_painted_leaves.extend_from_slice(&entry.leaves);
+                }
                 self.painted_leaves = std::sync::Arc::new(new_painted_leaves);
-                self.painted_materials_paint_epoch = cur_paint;
-                self.painted_materials_geometry_epoch = cur_geom;
+            }
+
+            self.painted_materials_paint_epoch = cur_paint;
+            self.painted_materials_geometry_epoch = cur_geom;
+
+            if painted_walk_profile && (dirty_count > 0 || geom_changed) {
+                eprintln!(
+                    "[paint] painted_materials_walk dt={:?} painted_leaves={} entities_walked={} cached_entities={} shader_materials={} geom_changed={}",
+                    painted_walk_t0.elapsed(),
+                    self.painted_leaves.len(),
+                    dirty_count,
+                    self.painted_per_entity.len(),
+                    shader_materials.len(),
+                    geom_changed,
+                );
             }
         }
 
@@ -575,18 +691,35 @@ impl EngineState {
             // same scene shouldn't show it. When the engine isn't in
             // paint mode `brush_active` stays 0 and the shader skips
             // the overlay entirely.
-            if viewport_id == ViewportId::MAIN
-                && self.paint_mode_active
-            {
-                if let Some(center) = self.paint_cursor_world {
-                    shade_params_vr.brush_active = 1;
-                    shade_params_vr.brush_radius = self.paint_mode_radius;
-                    shade_params_vr.brush_falloff = 0.5; // editor slider in Phase 5
-                    shade_params_vr.brush_center = [center.x, center.y, center.z, 0.0];
-                    // Color: warm yellow rim — distinct from the light-
-                    // gizmo yellow the sphere placeholder used. Alpha
-                    // channel reserved; the shader does its own alpha.
-                    shade_params_vr.brush_color = [1.0, 0.85, 0.2, 1.0];
+            //
+            // The cursor's world center comes from the brush-state
+            // probe pass (which reads gbuf_position at the cursor
+            // pixel each frame), so engine just sets the static
+            // bits — radius, color, the selected entity's
+            // `gpu_idx` for the per-pixel selection-lock gate.
+            let mut brush_pixel: Option<(u32, u32)> = None;
+            if viewport_id == ViewportId::MAIN && self.paint_mode_active {
+                shade_params_vr.brush_active = 1;
+                shade_params_vr.brush_radius = self.paint_mode_radius;
+                // Color: warm yellow rim — distinct from the light-
+                // gizmo yellow the sphere placeholder used. Alpha
+                // channel reserved; the shader does its own alpha.
+                shade_params_vr.brush_color = [1.0, 0.85, 0.2, 1.0];
+                // Selection-lock: only paint on the selected entity.
+                // `u32::MAX` keeps the cursor hidden while nothing is
+                // selected (the per-pixel match never fires).
+                shade_params_vr.brush_object_id = self
+                    .selected_entity
+                    .and_then(|e| self.entity_to_gpu.get(&e).copied())
+                    .map(|i| i as u32)
+                    .unwrap_or(u32::MAX);
+                // Probe at the live mouse pixel iff the cursor is
+                // inside the framebuffer. Otherwise leave `None` and
+                // the probe pass will write the miss sentinel.
+                let mx = self.mouse_pos.x;
+                let my = self.mouse_pos.y;
+                if mx >= 0.0 && my >= 0.0 && (mx as u32) < vp_w && (my as u32) < vp_h {
+                    brush_pixel = Some((mx as u32, my as u32));
                 }
             }
             let bloom_composite_intensity = if isolation {
@@ -758,6 +891,7 @@ impl EngineState {
                 wireframe_verts,
                 show_editor_overlays,
                 proc_raymarch,
+                brush_pixel,
             });
 
             // Update sim-side `prev_view_proj` so next frame's
@@ -818,9 +952,6 @@ impl EngineState {
         //    if render hadn't consumed the previous snapshot yet,
         //    that one is dropped (newest-wins). Sim never stalls on
         //    render's GPU rate.
-        let brush_overlay_epoch = self
-            .brush_overlay_epoch_handle
-            .load(std::sync::atomic::Ordering::Acquire);
         let paint_epoch = self
             .paint_epoch_handle
             .load(std::sync::atomic::Ordering::Acquire);
@@ -833,7 +964,6 @@ impl EngineState {
             splat_draws: self.splat_draws.clone(),
             gpu_objects_dirty: gpu_objects_dirty_this_frame,
             geometry_epoch,
-            brush_overlay_epoch,
             paint_epoch,
             materials,
             shader_params_slots,
@@ -930,7 +1060,7 @@ impl EngineState {
 #[inline]
 fn resolve_leaf_attr(
     overlay: Option<&rkp_core::LeafAttrOverlay>,
-    leaf_attrs: &rkp_core::LeafAttrPool,
+    leaf_attrs: &[rkp_core::LeafAttr],
     slot: u32,
 ) -> rkp_core::LeafAttr {
     if let Some(o) = overlay {
@@ -938,13 +1068,13 @@ fn resolve_leaf_attr(
             return e.attr();
         }
     }
-    *leaf_attrs.get(slot)
+    leaf_attrs[slot as usize]
 }
 
 fn scan_painted_aabbs(
     octree_data: &[u32],
     brick_pool: &[u32],
-    leaf_attrs: &rkp_core::LeafAttrPool,
+    leaf_attrs: &[rkp_core::LeafAttr],
     overlay: Option<&rkp_core::LeafAttrOverlay>,
     root_offset: usize,
     depth: u8,
@@ -969,7 +1099,7 @@ fn scan_painted_aabbs(
     fn walk(
         octree_data: &[u32],
         brick_pool: &[u32],
-        leaf_attrs: &rkp_core::LeafAttrPool,
+        leaf_attrs: &[rkp_core::LeafAttr],
         overlay: Option<&rkp_core::LeafAttrOverlay>,
         offset: usize,
         level: u8,

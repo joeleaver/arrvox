@@ -65,7 +65,7 @@ impl OverlayEntry {
     }
 
     #[inline]
-    fn from_parts(leaf_slot: u32, attr: LeafAttr, color_packed: u32) -> Self {
+    pub fn from_parts(leaf_slot: u32, attr: LeafAttr, color_packed: u32) -> Self {
         let material_packed = (attr.material_primary as u32)
             | ((attr.material_secondary_blend as u32) << 16);
         Self { leaf_slot, normal_oct: attr.normal_oct, material_packed, color_packed }
@@ -99,13 +99,70 @@ impl LeafAttrOverlay {
         }
     }
 
-    /// Insert or replace the overlay entry at `leaf_slot`.
+    /// Insert or replace the overlay entry at `leaf_slot`. O(log N) for
+    /// the binary search + O(N) for the vec shift on insert. Prefer
+    /// [`Self::upsert_batch`] when committing many entries at once
+    /// (e.g. a single paint stamp touching hundreds of leaves) — the
+    /// batch path is O(N + K log K) instead of O(K · N).
     pub fn upsert(&mut self, leaf_slot: u32, attr: LeafAttr, color_packed: u32) {
         let entry = OverlayEntry::from_parts(leaf_slot, attr, color_packed);
         match self.entries.binary_search_by_key(&leaf_slot, |e| e.leaf_slot) {
             Ok(idx) => self.entries[idx] = entry,
             Err(idx) => self.entries.insert(idx, entry),
         }
+    }
+
+    /// Commit a batch of `(leaf_slot, attr, color)` upserts in one
+    /// merge-pass against the existing sorted vec. Cost is
+    /// O(N + K log K) — sort the batch, then walk both vecs once.
+    /// Per-entry [`Self::upsert`] is O(K · N) for K entries because
+    /// every insert shifts the tail; this is unworkable on paint
+    /// stamps where K reaches the thousands and N grows over a drag.
+    ///
+    /// `batch` may contain duplicate `leaf_slot` values; the last one
+    /// wins (matches `upsert`'s replace-on-collision semantics).
+    pub fn upsert_batch(&mut self, mut batch: Vec<OverlayEntry>) {
+        if batch.is_empty() {
+            return;
+        }
+        // Sort then dedupe-keeping-last so duplicate slots in the batch
+        // collapse to a single entry. `dedup_by` keeps the first of a
+        // run, so reverse-then-dedupe-then-reverse to keep the last
+        // — equivalent to "last write wins" semantics.
+        batch.sort_unstable_by(|a, b| {
+            a.leaf_slot.cmp(&b.leaf_slot)
+        });
+        batch.reverse();
+        batch.dedup_by_key(|e| e.leaf_slot);
+        batch.reverse();
+
+        let mut merged = Vec::with_capacity(self.entries.len() + batch.len());
+        let mut i = 0;
+        let mut j = 0;
+        let existing = std::mem::take(&mut self.entries);
+        while i < existing.len() && j < batch.len() {
+            let a_slot = existing[i].leaf_slot;
+            let b_slot = batch[j].leaf_slot;
+            if a_slot < b_slot {
+                merged.push(existing[i]);
+                i += 1;
+            } else if a_slot > b_slot {
+                merged.push(batch[j]);
+                j += 1;
+            } else {
+                // Slot collision — batch wins (replace).
+                merged.push(batch[j]);
+                i += 1;
+                j += 1;
+            }
+        }
+        if i < existing.len() {
+            merged.extend_from_slice(&existing[i..]);
+        }
+        if j < batch.len() {
+            merged.extend_from_slice(&batch[j..]);
+        }
+        self.entries = merged;
     }
 
     /// Update only the [`LeafAttr`] portion at `leaf_slot`. Inserts a new
@@ -234,6 +291,35 @@ mod tests {
         assert!(o.remove(42));
         assert!(!o.remove(42));
         assert!(o.is_empty());
+    }
+
+    #[test]
+    fn upsert_batch_merges_into_sorted_set() {
+        let mut o = LeafAttrOverlay::new();
+        o.upsert(10, attr(1), 0xAA);
+        o.upsert(20, attr(2), 0xBB);
+        o.upsert(30, attr(3), 0xCC);
+        // Mix new slots with one slot that overlaps an existing entry.
+        let batch = vec![
+            OverlayEntry::from_parts(15, attr(15), 0x15),
+            OverlayEntry::from_parts(20, attr(20), 0x20),  // replaces existing
+            OverlayEntry::from_parts(25, attr(25), 0x25),
+            OverlayEntry::from_parts(5,  attr(5),  0x05),
+        ];
+        o.upsert_batch(batch);
+        let slots: Vec<u32> = o.entries().iter().map(|e| e.leaf_slot).collect();
+        assert_eq!(slots, vec![5, 10, 15, 20, 25, 30]);
+        assert_eq!(o.get(20).unwrap().attr().material_primary, 20, "batch overrides existing");
+        assert_eq!(o.get(20).unwrap().color_packed, 0x20);
+        assert_eq!(o.get(10).unwrap().color_packed, 0xAA, "untouched entry preserved");
+    }
+
+    #[test]
+    fn upsert_batch_empty_is_noop() {
+        let mut o = LeafAttrOverlay::new();
+        o.upsert(42, attr(7), 0x1234);
+        o.upsert_batch(Vec::new());
+        assert_eq!(o.len(), 1);
     }
 
     #[test]

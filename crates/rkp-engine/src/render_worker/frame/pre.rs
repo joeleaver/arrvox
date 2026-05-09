@@ -199,20 +199,12 @@ pub(super) fn run_pre_frame(
     //      slice-upload of `leaf_attr_pool`/`color_pool` is needed.
     //      `frame.paint_epoch` is informational only.
 
-    // 1.6. Brush-overlay upload — paint cursor geodesic distances.
-    //      MAIN-only (BUILD viewport doesn't show the paint cursor).
-    //      queue.write_buffer is cheap (staging-buffer enqueue), so
-    //      we do it inside the scene_mgr lock — cheaper than cloning
-    //      the full ~4 MB overlay buffer out of the critical section.
-    if frame.brush_overlay_epoch > state.last_uploaded_brush_overlay_epoch {
-        let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
-        let bytes = sm.brush_overlay_bytes();
-        if let Some(main_vr) = state.viewport_renderers.get_mut(&ViewportId::MAIN) {
-            main_vr.shade.upload_brush_overlay(&state.device, &state.queue, bytes);
-        }
-        state.last_uploaded_brush_overlay_epoch = sm.brush_overlay_epoch();
-        drop(sm);
-    }
+    // (The geodesic paint-cursor overlay was retired in favor of the
+    // screen-space cursor — its per-frame upload of
+    // `brush_overlay_distances` is gone. The per-VR `BrushState`
+    // buffer the new cursor reads is written by the GPU-side
+    // brush-state probe pass each frame, so there's nothing to
+    // upload from sim here.)
 
     let p_t_uploads = pre_start.elapsed();
 

@@ -47,12 +47,16 @@ pub(super) fn tick_instance_pipeline(
     use rkp_render::rkp_scene::OCTREE_NODE_BYTES;
     use rkp_core::brick_pool::{BRICK_CELLS, BRICK_DIM};
 
+    let proto_profile = std::env::var("RKP_PAINT_PROFILE").is_ok();
+    let t0 = std::time::Instant::now();
+
     // 1. Pipeline reload — cheap when source hash unchanged.
     state.instance_proto_pass.reload_user_shaders(
         &state.device,
         &frame.user_shader_proto_chunk,
         frame.user_shader_source_hash,
     );
+    let t_reload = t0.elapsed();
 
     // 2. Mark cache untouched.
     state.instance_proto_cache.begin_frame();
@@ -81,12 +85,21 @@ pub(super) fn tick_instance_pipeline(
             .min(MAX_PROTO_MAX_DEPTH);
         needed.push((entry.id, max_depth));
     }
+    let t_dedup = t0.elapsed();
+    let needed_len = needed.len();
     if needed.is_empty() {
         state.instance_proto_cache.evict_untouched();
+        if proto_profile && t0.elapsed() > std::time::Duration::from_millis(2) {
+            eprintln!(
+                "[paint.proto] reload={:?} dedup={:?} needed=0 total={:?}",
+                t_reload, t_dedup - t_reload, t0.elapsed(),
+            );
+        }
         return Vec::new();
     }
 
     // 4. Snapshot cpu_*_bytes from scene_mgr.
+    let t_before_snap = t0.elapsed();
     let (cpu_octree_bytes, cpu_brick_bytes, cpu_leaf_attr_bytes, cpu_face_links_bytes) = {
         let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
         let g = sm.geometry_upload();
@@ -97,6 +110,7 @@ pub(super) fn tick_instance_pipeline(
             g.brick_face_links.len() as u64,
         )
     };
+    let t_snap = t0.elapsed();
 
     // 5. Reserve the proto tail past the CPU-managed head. The 768 MB
     //    Phase-C transient extras are gone — the new path scatters
@@ -112,6 +126,7 @@ pub(super) fn tick_instance_pipeline(
         cpu_leaf_attr_bytes, PROTO_TAIL_LEAF_ATTR_BYTES,
         cpu_face_links_bytes, proto_face_links_bytes,
     );
+    let t_layout = t0.elapsed();
     if realloc {
         let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
         let g = sm.geometry_upload();
@@ -156,6 +171,9 @@ pub(super) fn tick_instance_pipeline(
             proto_leaf_attr_base_elems,
         );
     }
+    let t_after_layout = t0.elapsed();
+    let realloc_flag = realloc;
+    let bases_flag = bases_changed;
 
     // 7. Walk needed shaders, queue dirty bakes, register one
     //    `RkpGpuAsset` per shader.
@@ -376,8 +394,35 @@ pub(super) fn tick_instance_pipeline(
         state.queue.submit(Some(encoder.finish()));
     }
 
+    let t_after_bakes = t0.elapsed();
+    let dirty_bakes_count = if t_after_bakes > t_after_layout
+        { user_shader_assets.len() } else { 0 };
+
     // 9. Drop cache entries not referenced this frame.
     state.instance_proto_cache.evict_untouched();
+    let t_total = t0.elapsed();
+
+    if proto_profile && t_total > std::time::Duration::from_millis(2) {
+        eprintln!(
+            "[paint.proto] reload={:?} dedup={:?} snap_lock={:?} layout={:?} \
+             bakes={:?} (assets={} realloc={} bases_changed={}) total={:?} | \
+             needed={} cpu_oct={} cpu_brick={} cpu_leaf={} cpu_links={}",
+            t_reload,
+            t_dedup - t_reload,
+            t_snap - t_before_snap,
+            t_layout - t_snap,
+            t_after_bakes - t_after_layout,
+            dirty_bakes_count,
+            realloc_flag,
+            bases_flag,
+            t_total,
+            needed_len,
+            cpu_octree_bytes,
+            cpu_brick_bytes,
+            cpu_leaf_attr_bytes,
+            cpu_face_links_bytes,
+        );
+    }
 
     user_shader_assets
 }

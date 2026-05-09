@@ -99,6 +99,11 @@ pub struct RkpRenderer {
     /// entries (normal / material / glass). One pipeline shared across
     /// viewports.
     pub splat_resolve: SplatResolvePass,
+    /// Brush-state probe — single-thread compute reading the gbuffer
+    /// at the cursor pixel, feeding the screen-space paint cursor.
+    /// One pipeline shared across viewports; per-VR bind group lives
+    /// on `ViewportRenderer`.
+    pub brush_state: crate::brush_state_pass::BrushStatePass,
     /// Per-asset vertex-buffer cache for the splat path. Indexed by
     /// `AssetHandle::raw()` — `splat_buffers[handle.raw() as usize]`
     /// is `Some((vbo, splat_count))` for assets whose splat data has
@@ -244,6 +249,7 @@ impl RkpRenderer {
         let mesh_lod_select_pass =
             crate::mesh_lod_select_pass::MeshLodSelectPass::new(device, &splat_pass.g1_layout);
         let splat_resolve = SplatResolvePass::new(device);
+        let brush_state = crate::brush_state_pass::BrushStatePass::new(device);
         let primary_mode = PrimaryMode::from_env();
         eprintln!("[RkpRenderer] primary_mode = {primary_mode:?}");
 
@@ -271,6 +277,7 @@ impl RkpRenderer {
             skin_deform,
             splat_pass,
             splat_resolve,
+            brush_state,
             splat_buffers: Vec::new(),
             mesh_pass,
             mesh_shadow_map,
@@ -1673,6 +1680,13 @@ impl RkpRenderer {
         // has splat data (i.e. came from `acquire_asset`); procedural
         // objects without splats are skipped client-side.
         splat_draws: &[SplatDraw],
+        // Cursor pixel for the screen-space paint cursor — `Some` when
+        // paint mode is active and the mouse sits inside the
+        // framebuffer, `None` otherwise. Drives a single-thread
+        // compute that captures gbuf_position + gbuf_pick at this
+        // pixel into the per-VR `BrushState` buffer the shade pass
+        // reads. `None` writes the miss sentinel.
+        brush_pixel: Option<(u32, u32)>,
     ) {
         let in_situ = matches!(mode, crate::RenderMode::InSitu);
         let raymarch = matches!(preview_mode, crate::BuildPreviewMode::Raymarch);
@@ -1790,6 +1804,29 @@ impl RkpRenderer {
             let q = self.profiler.begin_query("ssao", encoder);
             viewport.ssao.dispatch(encoder);
             self.profiler.end_query(encoder, q);
+        }
+
+        // 2b. Brush-state probe — captures `(world_pos, hit_object_id)`
+        // at the cursor pixel into the per-VR `BrushState` buffer
+        // for the screen-space paint cursor in shade. Always
+        // dispatches: `None` writes the miss sentinel so the cursor
+        // hides without any extra gating, and the cost (1 thread)
+        // is below noise.
+        {
+            let params = crate::brush_state_pass::BrushParams {
+                cursor_x: brush_pixel.map(|(x, _)| x).unwrap_or(0),
+                cursor_y: brush_pixel.map(|(_, y)| y).unwrap_or(0),
+                enabled: brush_pixel.is_some() as u32,
+                _pad0: 0,
+            };
+            queue.write_buffer(
+                &viewport.brush_state_params_buffer,
+                0,
+                bytemuck::bytes_of(&params),
+            );
+            if let Some(bg) = viewport.brush_state_pass_bg.as_ref() {
+                self.brush_state.dispatch(encoder, bg);
+            }
         }
 
         // 3. Deferred PBR shading. ShadeParams.isolation drives the

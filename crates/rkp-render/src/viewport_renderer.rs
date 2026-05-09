@@ -153,6 +153,22 @@ pub struct ViewportRenderer {
     pub splat_resolve_g1_bg: Option<wgpu::BindGroup>,
     pub splat_resolve_scene_epoch: u64,
 
+    // ── Paint cursor per-VR state ──────────────────────────────────
+    /// 32-byte storage buffer written each frame by the brush-state
+    /// probe pass and consumed by `rkp_shade` for the screen-space
+    /// paint cursor. Default value (`hit_distance >= 1e9`) reads as
+    /// "no cursor" so the shader hides the ring before the first
+    /// dispatch.
+    pub brush_state_buffer: wgpu::Buffer,
+    /// Uniform driving the probe pass: `(cursor_x, cursor_y, active)`.
+    /// Engine writes to this each frame from sim's `mouse_pos` +
+    /// paint-mode flag.
+    pub brush_state_params_buffer: wgpu::Buffer,
+    /// Bind group for the probe pass — `(gbuf_position, gbuf_pick,
+    /// brush_state_buffer, brush_state_params_buffer)`. Rebuilt on
+    /// resize because the gbuffer texture views move.
+    pub brush_state_pass_bg: Option<wgpu::BindGroup>,
+
     // ── Mesh-mode glass per-VR textures + bind groups ──────────────
     /// Front-face glass entry data (Rgba32Uint): R = oct-packed world
     /// entry normal, G = material_id (low 16 bits), B =
@@ -583,7 +599,22 @@ impl ViewportRenderer {
         // retired Option B's instance-merged G-buffer; user-shader
         // hits land in the host G-buffer through the unified march
         // pipeline.
-        shade.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &gbuffer.glass_view, &gbuffer.leaf_slot_view);
+        shade.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &gbuffer.glass_view, &pick_view);
+        // Per-VR brush-state probe buffers + initial bind groups. The
+        // params are zeroed (active=0) so the cursor stays hidden
+        // until paint mode arms it.
+        let brush_state_buffer =
+            crate::brush_state_pass::BrushStatePass::create_state_buffer(device);
+        let brush_state_params_buffer =
+            crate::brush_state_pass::BrushStatePass::create_params_buffer(device);
+        shade.set_brush_state(device, &brush_state_buffer);
+        let brush_state_pass_bg = Some(renderer.brush_state.create_bind_group(
+            device,
+            &gbuffer.position_view,
+            &pick_view,
+            &brush_state_buffer,
+            &brush_state_params_buffer,
+        ));
         shade.set_shadow_and_ssao(
             device,
             &shadow_trace.output_view,
@@ -671,6 +702,9 @@ impl ViewportRenderer {
             splat_resolve_g0_bg: None,
             splat_resolve_g1_bg: None,
             splat_resolve_scene_epoch: u64::MAX,
+            brush_state_buffer,
+            brush_state_params_buffer,
+            brush_state_pass_bg,
             glass_entry_packed_texture: mesh_glass_tx.entry_packed,
             glass_entry_packed_view:    mesh_glass_tx.entry_packed_view,
             glass_exit_dist_texture:    mesh_glass_tx.exit_dist,
@@ -980,6 +1014,7 @@ impl ViewportRenderer {
                 &renderer.scene.octree_nodes_buffer,
                 &renderer.scene.brick_pool_buffer,
                 &renderer.scene.brick_face_links_buffer,
+                &renderer.scene.instance_overlay_buffer,
             ));
             self.splat_resolve_scene_epoch = scene_now;
         }
@@ -1803,7 +1838,17 @@ impl ViewportRenderer {
         self.shadow_trace.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view);
 
         self.shade.resize(device, width, height);
-        self.shade.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
+        self.shade.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.gbuffer.glass_view, &self.pick_view);
+        // Brush-state probe — rebuild the bind group around the new
+        // gbuffer views. The buffer itself is unchanged.
+        self.shade.set_brush_state(device, &self.brush_state_buffer);
+        self.brush_state_pass_bg = Some(renderer.brush_state.create_bind_group(
+            device,
+            &self.gbuffer.position_view,
+            &self.pick_view,
+            &self.brush_state_buffer,
+            &self.brush_state_params_buffer,
+        ));
         // Shadow map size doesn't track viewport resolution; the
         // depth buffer stays at SHADOW_MAP_DEFAULT_SIZE through
         // resize. Re-binding picks up the same buffer.

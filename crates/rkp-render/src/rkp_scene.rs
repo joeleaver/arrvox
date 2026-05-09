@@ -636,8 +636,16 @@ impl RkpScene {
         if data.is_empty() {
             return false;
         }
-        if data.len() as u64 > buffer.size() {
-            *buffer = Self::create_storage(device, label, data.len() as u64);
+        let needed = data.len() as u64;
+        if needed > buffer.size() {
+            // Grow with 2× headroom so a stream of incremental appends
+            // (e.g. paint stamps growing the per-instance overlay
+            // frame-by-frame) reallocates O(log N) times rather than
+            // every frame. Reallocation forces every consumer's bind
+            // group to rebuild via `buffers_epoch`, so amortizing it
+            // matters on the hot path.
+            let new_size = needed.max(buffer.size().saturating_mul(2)).max(64);
+            *buffer = Self::create_storage(device, label, new_size);
             queue.write_buffer(buffer, 0, data);
             true
         } else {
