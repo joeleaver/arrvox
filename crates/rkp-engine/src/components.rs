@@ -100,6 +100,14 @@ pub struct ProxyMeshData {
     /// so Renderable consumers (gizmo / pick / overlap queries) can
     /// answer bounds questions without a GPU readback.
     pub aabb: rkp_core::Aabb,
+    /// LeafAttr pool slot containing this procedural's
+    /// `(material_id, normal_oct)` pair. Every proxy-mesh vertex
+    /// has its `leaf_attr_id` patched to this slot at upload time,
+    /// so the resolve pass reads the right material when shading.
+    /// Single slot for now → flat shading with one normal of
+    /// record; per-vertex-normal support is a follow-up requiring
+    /// a slot per surface-nets vertex.
+    pub leaf_attr_slot: u32,
 }
 
 impl RenderGeometry {
