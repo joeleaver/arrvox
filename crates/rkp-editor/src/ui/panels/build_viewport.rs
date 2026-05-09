@@ -337,6 +337,7 @@ pub fn BuildViewport() -> NodeHandle {
                                 display:flex;flex-direction:column;gap:6px;\
                                 min-width:240px;",
                         {render_preview_toggle(__scope, store.clone(), tree_cmd_tx)}
+                        {render_bake_mode(__scope, tree_snapshot, tree_cmd_tx)}
                         {render_resolution(__scope, tree_snapshot, tree_cmd_tx)}
                         {render_bake_action(__scope, tree_snapshot, tree_cmd_tx)}
                     }
@@ -468,6 +469,37 @@ fn render_bake_action(
             }
         }
     }
+}
+
+/// Bake-mode picker — Voxelize (default) vs ProxyMesh. Voxel mode
+/// supports paint, sculpt, and surface user-shaders; proxy-mesh
+/// mode is faster to live-edit but read-only. Auto-rebakes on flip.
+fn render_bake_mode(
+    __scope: &mut rinch::core::dom::RenderScope,
+    snapshot: Memo<ProceduralSnapshot>,
+    cmd_tx: Signal<crossbeam::channel::Sender<rkp_engine::EngineCommand>>,
+) -> rinch::core::dom::NodeHandle {
+    let current = Signal::new(match snapshot.get().bake_mode {
+        rkp_engine::components::BakeMode::Voxelize => "voxelize".to_string(),
+        rkp_engine::components::BakeMode::ProxyMesh => "proxy".to_string(),
+    });
+    let on_change: std::rc::Rc<dyn Fn(String)> = std::rc::Rc::new(move |v: String| {
+        let mode = match v.as_str() {
+            "proxy" => rkp_engine::components::BakeMode::ProxyMesh,
+            _ => rkp_engine::components::BakeMode::Voxelize,
+        };
+        let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetProceduralBakeMode { mode });
+    });
+    super::prop_controls::prop_select(
+        __scope,
+        "Mode",
+        Memo::new(move || current.get()),
+        &[
+            ("voxelize", "Voxels (paintable)"),
+            ("proxy", "Proxy mesh (fast)"),
+        ],
+        on_change,
+    )
 }
 
 /// Resolution picker — tier buffer size for the voxelizer. Same dropdown

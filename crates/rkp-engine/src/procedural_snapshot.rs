@@ -19,6 +19,9 @@ pub struct ProceduralSnapshot {
     pub selected_node: Option<u32>,
     /// Render voxel size.
     pub voxel_size: f32,
+    /// Whether the bake worker should voxelize this procedural
+    /// (default) or emit a triangle proxy mesh.
+    pub bake_mode: crate::components::BakeMode,
     /// Tree has been edited since the last voxel bake — the "Bake" button
     /// should show as enabled/highlighted when this is true. Includes
     /// both `dirty` (build-panel param edits awaiting an explicit
@@ -288,6 +291,7 @@ pub fn build_procedural_snapshot(
         root: tree.root().0,
         selected_node,
         voxel_size,
+        bake_mode: proc_geo.bake_mode,
         dirty: proc_geo.dirty || proc_geo.pending_bake || proc_geo.bake_in_flight,
         voxel_count,
     }

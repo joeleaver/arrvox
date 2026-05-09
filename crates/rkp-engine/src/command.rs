@@ -162,6 +162,14 @@ pub enum EngineCommand {
         tier: String,
     },
 
+    /// Switch the selected procedural's bake target between voxels
+    /// (the default — supports paint/sculpt/surface user-shaders)
+    /// and a triangle proxy mesh (faster live edit, no per-leaf
+    /// operations). Auto-rebakes on change.
+    SetProceduralBakeMode {
+        mode: crate::components::BakeMode,
+    },
+
     /// Set the local position of a procedural node. Rotation + scale
     /// on the node are preserved.
     SetProceduralNodePosition {

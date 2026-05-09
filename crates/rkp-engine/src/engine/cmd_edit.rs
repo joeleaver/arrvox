@@ -155,6 +155,24 @@ impl EngineState {
                 self.selected_procedural_node = node_id;
             }
 
+            EngineCommand::SetProceduralBakeMode { mode } => {
+                if let Some(entity) = self.selected_entity {
+                    if let Ok(mut proc_geo) = self.world.get::<&mut crate::components::ProceduralGeometry>(entity) {
+                        if proc_geo.bake_mode != mode {
+                            proc_geo.bake_mode = mode;
+                            // Mode flip changes the renderable
+                            // shape entirely — no debounce, just
+                            // bake. The drain handler releases the
+                            // previous handle/octree before
+                            // installing the new representation.
+                            proc_geo.dirty = true;
+                            proc_geo.pending_bake = true;
+                            proc_geo.bake_dirty_at = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+            }
+
             EngineCommand::SetProceduralVoxelSize { tier } => {
                 const VOXEL_TIERS: [f32; 4] = [0.005, 0.02, 0.08, 0.32];
                 if let Some(entity) = self.selected_entity {
