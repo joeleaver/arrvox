@@ -99,6 +99,9 @@ pub mod proc_ghost;
 /// GPU evaluator — "sample N positions" compute pipeline shared with the
 /// (Phase 3+) voxel bake path.
 pub mod proc_sample;
+/// GPU surface-nets-from-SDF spike — proxy-mesh path for procedurals
+/// without going through the octree + brick + DAG + meshlet bake.
+pub mod proc_surface_nets;
 /// Composes user-authored WGSL hooks into the procedural evaluator.
 pub mod shader_composer;
 /// Option B — voxel sprite instancing. Parses per-instance state structs
