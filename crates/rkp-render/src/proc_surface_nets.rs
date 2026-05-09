@@ -18,6 +18,8 @@
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
+use rkp_core::mesh_cluster::{MeshletCluster, PARENT_GROUP_ERROR_ROOT};
+use rkp_core::mesh_extract::MeshVertex;
 use rkp_procedural::flatten::ProcInstruction;
 
 use crate::compile_pass_shader;
@@ -34,24 +36,40 @@ struct SnParams {
     index_cap: u32,
 }
 
-/// 32 B — same layout as `rkp_core::mesh_extract::MeshVertex`.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Default, Debug)]
-pub struct MeshVertex {
-    pub local_pos: [f32; 3],
-    pub normal_oct: u32,
-    pub leaf_attr_id: u32,
-    pub bone_indices: u32,
-    pub bone_weights: u32,
-    pub _pad: u32,
-}
-
-const _: () = assert!(std::mem::size_of::<MeshVertex>() == 32);
-
-/// Output of one extraction call.
+/// Output of one extraction call. Re-uses `rkp_core::MeshVertex` so
+/// the result feeds straight into the renderer's
+/// `upload_mesh_for_asset` path without a type conversion.
 pub struct SurfaceMesh {
     pub vertices: Vec<MeshVertex>,
     pub indices: Vec<u32>,
+    /// Object-local AABB of the meshed surface. The single proxy
+    /// cluster's bbox; the per-instance world matrix is applied on
+    /// top by `mesh_lod_select`.
+    pub aabb_min: Vec3,
+    pub aabb_max: Vec3,
+}
+
+impl SurfaceMesh {
+    /// Build the single-cluster `MeshletCluster` describing this
+    /// proxy mesh. `cluster_error = 0` and
+    /// `parent_group_error = PARENT_GROUP_ERROR_ROOT` so the LOD
+    /// admit rule lets it through every frame at any pixel
+    /// threshold (Karis '21: a root-level cluster with infinite
+    /// parent error is always admitted).
+    pub fn single_cluster(&self) -> MeshletCluster {
+        MeshletCluster {
+            aabb_min: self.aabb_min.to_array(),
+            _pad0: 0.0,
+            aabb_max: self.aabb_max.to_array(),
+            index_offset: 0,
+            index_count: self.indices.len() as u32,
+            lod_level: 0,
+            _pad2: 0,
+            cluster_error: 0.0,
+            parent_group_error: PARENT_GROUP_ERROR_ROOT,
+            _pad3: [0; 3],
+        }
+    }
 }
 
 /// Per-pass timings, accumulated across one `extract` call.
@@ -503,6 +521,8 @@ impl GpuSurfaceNets {
             Some(SurfaceMesh {
                 vertices: all_v[..v_keep].to_vec(),
                 indices: all_i[..i_keep].to_vec(),
+                aabb_min,
+                aabb_max,
             })
         } else {
             None
@@ -599,6 +619,57 @@ impl GpuSurfaceNets {
             }));
             self.indices_cap = new_cap;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rkp_core::leaf_attr::LeafAttr;
+
+    /// `single_cluster()` produces a `MeshletCluster` that the
+    /// LOD-selection compute pass + the indirect-draw raster will
+    /// happily consume:
+    ///   - bbox copied from the mesh,
+    ///   - `index_offset = 0` covers the entire IBO (no chunking),
+    ///   - `index_count` matches the index buffer length,
+    ///   - `parent_group_error = INFINITY` so the Karis admit rule
+    ///     always lets it through.
+    #[test]
+    fn single_cluster_metadata_is_consistent() {
+        let mesh = SurfaceMesh {
+            vertices: vec![MeshVertex {
+                local_pos: [0.0, 0.0, 0.0],
+                normal_oct: rkp_core::pack_oct(Vec3::Y),
+                leaf_attr_id: 0,
+                bone_indices: 0,
+                bone_weights: 0,
+                _pad: 0,
+            }],
+            indices: vec![0; 27],
+            aabb_min: Vec3::new(-1.0, -2.0, -3.0),
+            aabb_max: Vec3::new(4.0, 5.0, 6.0),
+        };
+        let c = mesh.single_cluster();
+        assert_eq!(c.aabb_min, [-1.0, -2.0, -3.0]);
+        assert_eq!(c.aabb_max, [4.0, 5.0, 6.0]);
+        assert_eq!(c.index_offset, 0);
+        assert_eq!(c.index_count, 27);
+        assert_eq!(c.lod_level, 0);
+        assert_eq!(c.cluster_error, 0.0);
+        assert_eq!(c.parent_group_error, PARENT_GROUP_ERROR_ROOT);
+        assert!(c.parent_group_error.is_infinite());
+    }
+
+    /// Layout sanity — the SurfaceMesh.vertices type must be
+    /// `rkp_core::MeshVertex` (32 B) so the renderer's
+    /// `upload_mesh_for_asset` accepts the slice without conversion.
+    #[test]
+    fn surface_mesh_uses_rkp_core_mesh_vertex() {
+        const _ASSERT: () = {
+            assert!(std::mem::size_of::<MeshVertex>() == 32);
+            assert!(std::mem::size_of::<LeafAttr>() == 8);
+        };
     }
 }
 

@@ -119,10 +119,16 @@ fn run_case(
         }
 
         if let (Some(dir), Some(mesh)) = (dump_dir, mesh) {
+            // Sanity-check the proxy cluster the renderer would consume.
+            let cluster = mesh.single_cluster();
+            assert_eq!(cluster.index_count as usize, mesh.indices.len());
+            assert_eq!(cluster.aabb_min, aabb_min.to_array());
+            assert!(cluster.parent_group_error.is_infinite());
+
             let safe_label = label.replace([' ', '(', ')', '+', '=', ','], "_");
             let path = format!("{}/{}_n{}.obj", dir.trim_end_matches('/'), safe_label, grid_n);
             match dump_obj(&path, &mesh) {
-                Ok(_) => println!("  → dumped {}", path),
+                Ok(_) => println!("  → dumped {} (cluster: idx_count={}, lod=0)", path, cluster.index_count),
                 Err(e) => eprintln!("  ✗ dump failed ({}): {}", path, e),
             }
         }
