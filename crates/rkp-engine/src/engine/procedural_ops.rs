@@ -291,7 +291,8 @@ impl EngineState {
             .world
             .get::<&Renderable>(entity)
             .ok()
-            .and_then(|r| r.spatial.clone());
+            .and_then(|r| r.spatial.clone())
+            .and_then(|g| g.into_octree());
 
         let (aabb, voxel_size) = procedural_voxel_params(&tree_clone, base_voxel_size);
         let instructions = rkp_procedural::flatten_tree(&tree_clone);
@@ -431,7 +432,7 @@ impl EngineState {
 
         if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
             renderable.voxel_count = voxel_count;
-            renderable.spatial = Some(spatial);
+            renderable.spatial = Some(RenderGeometry::Octree(spatial));
         }
 
         // Recompute `Transform.scale` as `current_root / baked_root`

@@ -131,7 +131,7 @@ impl EngineState {
             let Ok(transform) = self.world.get::<&Transform>(entity) else { continue };
             let Ok(renderable) = self.world.get::<&Renderable>(entity) else { continue };
             let transform = (*transform).clone();
-            if let Some(ref spatial) = renderable.spatial {
+            if let Some(spatial) = renderable.spatial.as_ref().and_then(|g| g.as_octree()) {
                 let world_matrix = glam::Mat4::from_scale_rotation_translation(
                     transform.scale,
                     glam::Quat::from_euler(

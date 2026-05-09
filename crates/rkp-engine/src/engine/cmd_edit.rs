@@ -531,7 +531,7 @@ impl EngineState {
 
                 if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
                     renderable.primitive = None;
-                    renderable.spatial = Some(new_spatial);
+                    renderable.spatial = Some(crate::components::RenderGeometry::Octree(new_spatial));
                     renderable.asset_handle = Some(handle);
                     renderable.asset_path = Some(rel_path.clone());
                     renderable.voxel_count = info.voxel_count;

@@ -264,7 +264,7 @@ impl EngineState {
                     Vec::new(),
                 );
                 r.asset_handle = Some(reload.new_handle);
-                r.spatial = Some(spatial);
+                r.spatial = Some(crate::components::RenderGeometry::Octree(spatial));
                 r.voxel_count = reload.info.voxel_count;
             }
         }
@@ -304,7 +304,7 @@ impl EngineState {
                 let grid_offset = self.world
                     .get::<&crate::components::Renderable>(entity)
                     .ok()
-                    .and_then(|r| r.spatial.as_ref().map(|s| {
+                    .and_then(|r| r.spatial.as_ref().and_then(|g| g.as_octree()).map(|s| {
                         let he = 0.5 * s.base_voxel_size * (1u32 << s.depth) as f32;
                         glam::Vec3::splat(he)
                     }))

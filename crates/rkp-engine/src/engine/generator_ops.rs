@@ -156,7 +156,7 @@ impl EngineState {
                 *t = world_transform;
             }
             if let Ok(mut r) = self.world.get::<&mut Renderable>(existing) {
-                r.spatial = Some(spatial);
+                r.spatial = Some(crate::components::RenderGeometry::Octree(spatial));
                 r.voxel_count = voxel_count;
                 // Reload-from-cache populates `asset_handle` (children
                 // round-trip through the asset cache on load). The
@@ -194,7 +194,7 @@ impl EngineState {
             primitive: None,
             material_id: 0,
             voxel_count,
-            spatial: Some(spatial),
+            spatial: Some(crate::components::RenderGeometry::Octree(spatial)),
             ..Default::default()
         };
         let parent_uuid = self.entity_uuids.get(&generator_entity).copied();
@@ -268,7 +268,7 @@ impl EngineState {
             if let Some(handle) = renderable.asset_handle {
                 drop(renderable);
                 self.scene_mgr.lock().unwrap().release_asset(handle);
-            } else if let Some(ref spatial) = renderable.spatial {
+            } else if let Some(spatial) = renderable.spatial.as_ref().and_then(|g| g.as_octree()) {
                 let handle = rkp_core::OctreeHandle {
                     root_offset: spatial.root_offset,
                     len: spatial.len,

@@ -384,7 +384,10 @@ impl EngineState {
             .query::<(&RigidBody, Option<&Renderable>, &Transform)>()
             .iter()
             .map(|(e, (rb, r, t))| {
-                (e, rb.clone(), r.and_then(|r| r.spatial.clone()), t.scale)
+                let spatial = r
+                    .and_then(|r| r.spatial.clone())
+                    .and_then(|g| g.into_octree());
+                (e, rb.clone(), spatial, t.scale)
             })
             .collect();
 

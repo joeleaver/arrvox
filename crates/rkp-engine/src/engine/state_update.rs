@@ -146,7 +146,7 @@ impl EngineState {
             is_fallback: true,
         };
 
-        let spatial = match &renderable.spatial {
+        let spatial = match renderable.spatial.as_ref().and_then(|g| g.as_octree()) {
             Some(s) => s,
             None => return vec![fallback_row()],
         };
@@ -229,7 +229,7 @@ impl EngineState {
             Ok(r) => r.clone(),
             Err(_) => return 0,
         };
-        let spatial = match &renderable.spatial {
+        let spatial = match renderable.spatial.as_ref().and_then(|g| g.as_octree()) {
             Some(s) => s.clone(),
             None => return 0,
         };

@@ -57,7 +57,7 @@ impl EngineState {
                                     asset_path: Some(asset_path.clone()),
                                     material_id: obj.material_id,
                                     voxel_count: info.voxel_count,
-                                    spatial: Some(spatial),
+                                    spatial: Some(crate::components::RenderGeometry::Octree(spatial)),
                                     asset_handle: Some(handle),
                                     material_overrides: obj.material_overrides.clone(),
                                     ..Default::default()
@@ -94,7 +94,7 @@ impl EngineState {
                                     match self.scene_mgr.lock().unwrap().acquire_asset(&full.to_string_lossy()) {
                                         Ok((handle, info)) => {
                                             let sp = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.grid_origin, info.leaf_attr_slot_start, info.leaf_attr_slot_count, Vec::new());
-                                            (Some(sp), Some(handle), info.voxel_count)
+                                            (Some(crate::components::RenderGeometry::Octree(sp)), Some(handle), info.voxel_count)
                                         }
                                         Err(e) => {
                                             self.console.warn(format!(
@@ -154,7 +154,7 @@ impl EngineState {
                                 primitive: Some(prim_name.clone()),
                                 material_id: obj.material_id,
                                 voxel_count: result.voxel_count,
-                                spatial: Some(spatial),
+                                spatial: Some(crate::components::RenderGeometry::Octree(spatial)),
                                 material_overrides: obj.material_overrides.clone(),
                                 ..Default::default()
                             }));

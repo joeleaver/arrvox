@@ -42,9 +42,14 @@ pub struct Renderable {
     /// Number of voxels (populated after voxelization).
     #[serde(default)]
     pub voxel_count: u32,
-    /// Octree spatial reference (populated after voxelization/loading).
+    /// Renderable geometry registration — populated after
+    /// voxelization, asset load, or proxy-mesh extraction. Variant
+    /// records *how* the entity's geometry is registered with the
+    /// renderer (octree allocation, GPU mesh buffer, etc.). `None`
+    /// means the entity has no geometry yet (pending bake, no
+    /// asset assigned, etc.).
     #[serde(skip)]
-    pub spatial: Option<SpatialData>,
+    pub spatial: Option<RenderGeometry>,
     /// Handle into the scene manager's asset cache for .rkp-backed
     /// entities. Present when this entity shares an octree with other
     /// instances; the cache refcounts these and frees the underlying
@@ -62,6 +67,57 @@ pub struct Renderable {
     /// replayed via `remap_entity_material`.
     #[serde(default)]
     pub material_overrides: Vec<(u16, u16)>,
+}
+
+/// How a renderable entity's geometry is registered with the
+/// renderer. Each variant carries the bookkeeping needed to free its
+/// allocations when the entity's geometry is replaced or destroyed.
+///
+/// Existing single variant `Octree` covers the only path today;
+/// proxy-mesh + future paths land here as additional variants.
+#[derive(Debug, Clone)]
+pub enum RenderGeometry {
+    /// Voxelized asset or procedural — owns an octree allocation
+    /// (and on procedurals, brick allocations) inside the
+    /// scene-global pools.
+    Octree(SpatialData),
+}
+
+impl RenderGeometry {
+    /// Borrow the octree variant if this is one. Logically
+    /// infallible while `Octree` is the only variant — added so
+    /// future variants force every reader to handle the new case
+    /// explicitly.
+    #[inline]
+    pub fn as_octree(&self) -> Option<&SpatialData> {
+        match self {
+            RenderGeometry::Octree(s) => Some(s),
+        }
+    }
+
+    #[inline]
+    pub fn as_octree_mut(&mut self) -> Option<&mut SpatialData> {
+        match self {
+            RenderGeometry::Octree(s) => Some(s),
+        }
+    }
+
+    /// Consume into the octree variant — used by `prev_spatial`
+    /// flows that move a `SpatialData` out for deallocation.
+    #[inline]
+    pub fn into_octree(self) -> Option<SpatialData> {
+        match self {
+            RenderGeometry::Octree(s) => Some(s),
+        }
+    }
+
+    /// Entity-local AABB — common across all variants.
+    #[inline]
+    pub fn aabb(&self) -> rkp_core::Aabb {
+        match self {
+            RenderGeometry::Octree(s) => s.aabb,
+        }
+    }
 }
 
 /// Octree spatial data for a renderable entity. Not serialized — rebuilt on load.

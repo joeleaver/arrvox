@@ -198,7 +198,7 @@ impl EngineState {
     ) -> Option<(rkp_render::AssetInfo, glam::Affine3A)> {
         use crate::components::Transform;
         let renderable = self.world.get::<&Renderable>(entity).ok()?;
-        let spatial = renderable.spatial.as_ref()?;
+        let spatial = renderable.spatial.as_ref().and_then(|g| g.as_octree())?;
         let transform = self.world.get::<&Transform>(entity).ok()?;
 
         let asset_info = rkp_render::AssetInfo {
@@ -245,7 +245,7 @@ impl EngineState {
         for (entity, (renderable, transform)) in
             self.world.query::<(&Renderable, &Transform)>().iter()
         {
-            let Some(spatial) = renderable.spatial.as_ref() else {
+            let Some(spatial) = renderable.spatial.as_ref().and_then(|g| g.as_octree()) else {
                 continue;
             };
             let entity_world = glam::Affine3A::from_scale_rotation_translation(

@@ -98,7 +98,7 @@ impl EngineState {
                     Renderable {
                         asset_path: Some(path.to_string()),
                         voxel_count: info.voxel_count,
-                        spatial: Some(spatial),
+                        spatial: Some(crate::components::RenderGeometry::Octree(spatial)),
                         asset_handle: Some(handle),
                         ..Default::default()
                     },
@@ -180,7 +180,7 @@ impl EngineState {
             if let Some(handle) = renderable.asset_handle {
                 drop(renderable);
                 self.scene_mgr.lock().unwrap().release_asset(handle);
-            } else if let Some(ref spatial) = renderable.spatial {
+            } else if let Some(spatial) = renderable.spatial.as_ref().and_then(|g| g.as_octree()) {
                 let handle = rkp_core::OctreeHandle {
                     root_offset: spatial.root_offset,
                     len: spatial.len,
@@ -328,7 +328,7 @@ impl EngineState {
                         Vec::new(),
                     );
                     if let Ok(mut r) = self.world.get::<&mut Renderable>(entity) {
-                        r.spatial = Some(new_spatial);
+                        r.spatial = Some(crate::components::RenderGeometry::Octree(new_spatial));
                         r.asset_handle = Some(handle);
                         r.voxel_count = info.voxel_count;
                     }

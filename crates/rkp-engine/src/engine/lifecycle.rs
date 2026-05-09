@@ -240,7 +240,7 @@ impl EngineState {
                             self.painted_per_entity.remove(&entity);
                             continue;
                         };
-                        let Some(spatial) = &r.spatial else {
+                        let Some(spatial) = r.spatial.as_ref().and_then(|g| g.as_octree()) else {
                             self.painted_per_entity.remove(&entity);
                             continue;
                         };
