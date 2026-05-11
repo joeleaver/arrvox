@@ -99,6 +99,10 @@ pub struct RkpRenderer {
     /// entries (normal / material / glass). One pipeline shared across
     /// viewports.
     pub splat_resolve: SplatResolvePass,
+    /// Procedural proxy-mesh raster pipeline (GPU surface-nets-from-
+    /// SDF). Writes the full G-buffer for proxy pixels directly,
+    /// bypassing `splat_resolve`. One pipeline shared across viewports.
+    pub mesh_proxy: crate::mesh_proxy_pass::MeshProxyPass,
     /// Brush-state probe — single-thread compute reading the gbuffer
     /// at the cursor pixel, feeding the screen-space paint cursor.
     /// One pipeline shared across viewports; per-VR bind group lives
@@ -152,6 +156,11 @@ pub struct RkpRenderer {
     /// Phase 5 uploads but does not yet consume — validates the
     /// upload path without touching the hot dispatch.
     mesh_cluster_buffers: Vec<Option<(wgpu::Buffer, u32)>>,
+    /// Per-asset vertex/index buffer cache for the procedural
+    /// proxy-mesh path. Separate from `mesh_buffers` because the
+    /// proxy vertex layout is `ProxyVertex` (32 B; material + color
+    /// payload) — not `MeshVertex`. Indexed by `AssetHandle::raw()`.
+    proxy_mesh_buffers: Vec<Option<(wgpu::Buffer, wgpu::Buffer, u32)>>,
     /// Primary-visibility selector — `March` (compute octree march)
     /// or `Splat` (rasterized surface splats). Read from the
     /// `RKP_PRIMARY` env var at construction. See [`PrimaryMode`].
@@ -249,6 +258,7 @@ impl RkpRenderer {
         let mesh_lod_select_pass =
             crate::mesh_lod_select_pass::MeshLodSelectPass::new(device, &splat_pass.g1_layout);
         let splat_resolve = SplatResolvePass::new(device);
+        let mesh_proxy = crate::mesh_proxy_pass::MeshProxyPass::new(device);
         let brush_state = crate::brush_state_pass::BrushStatePass::new(device);
         let primary_mode = PrimaryMode::from_env();
         eprintln!("[RkpRenderer] primary_mode = {primary_mode:?}");
@@ -277,6 +287,7 @@ impl RkpRenderer {
             skin_deform,
             splat_pass,
             splat_resolve,
+            mesh_proxy,
             brush_state,
             splat_buffers: Vec::new(),
             mesh_pass,
@@ -287,6 +298,7 @@ impl RkpRenderer {
             mesh_glass_debug_force,
             mesh_buffers: Vec::new(),
             mesh_cluster_buffers: Vec::new(),
+            proxy_mesh_buffers: Vec::new(),
             primary_mode,
             device: device.clone(),
             profiler, timestamp_period,
@@ -446,6 +458,58 @@ impl RkpRenderer {
             .get(handle_raw as usize)
             .and_then(|s| s.as_ref())
             .map(|(b, c)| (b, *c))
+    }
+
+    /// Upload (or replace) a proxy mesh's vertex + index buffers. Same
+    /// shape as `upload_mesh_for_asset` but writes into the proxy
+    /// buffer slab (`ProxyVertex` layout, no cluster table — proxy
+    /// meshes draw a single direct indexed draw, no LOD select).
+    pub fn upload_proxy_mesh_for_asset(
+        &mut self,
+        handle_raw: u32,
+        vertices: &[rkp_core::mesh_extract::ProxyVertex],
+        indices: &[u32],
+    ) {
+        use wgpu::util::DeviceExt;
+        let idx = handle_raw as usize;
+        if idx >= self.proxy_mesh_buffers.len() {
+            self.proxy_mesh_buffers.resize_with(idx + 1, || None);
+        }
+        if vertices.is_empty() || indices.is_empty() {
+            self.proxy_mesh_buffers[idx] = None;
+            return;
+        }
+        let vbo = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("proxy mesh vbo"),
+            contents: bytemuck::cast_slice(vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let ibo = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("proxy mesh ibo"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        self.proxy_mesh_buffers[idx] = Some((vbo, ibo, indices.len() as u32));
+    }
+
+    /// Drop the cached proxy mesh buffers for `handle_raw`.
+    pub fn release_proxy_mesh_for_asset(&mut self, handle_raw: u32) {
+        let idx = handle_raw as usize;
+        if let Some(slot) = self.proxy_mesh_buffers.get_mut(idx) {
+            *slot = None;
+        }
+    }
+
+    /// Look up the proxy mesh buffers. Returns `(vbo, ibo,
+    /// index_count)` when uploaded, else `None`.
+    pub fn proxy_mesh_buffer(
+        &self,
+        handle_raw: u32,
+    ) -> Option<(&wgpu::Buffer, &wgpu::Buffer, u32)> {
+        self.proxy_mesh_buffers
+            .get(handle_raw as usize)
+            .and_then(|s| s.as_ref())
+            .map(|(v, i, c)| (v, i, *c))
     }
 
     /// Splat-raster equivalent of `OctreeMarchPass::dispatch`. Writes
@@ -615,6 +679,61 @@ impl RkpRenderer {
             viewport.height,
         );
         self.profiler.end_query(encoder, q_resolve);
+    }
+
+    /// Rasterize procedural proxy meshes into the existing G-buffer.
+    /// Runs after the primary mode's main pass + `splat_resolve` so the
+    /// G-buffer carries octree-mesh/splat output; proxy raster
+    /// depth-composites on top using `LoadOp::Load`. Writes all five
+    /// gbuf targets directly — no `splat_resolve` participation for
+    /// proxy pixels.
+    pub fn dispatch_proxy_meshes(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        viewport: &mut crate::viewport_renderer::ViewportRenderer,
+        draws: &[crate::mesh_proxy_pass::ProxyDraw],
+    ) {
+        if draws.is_empty() {
+            return;
+        }
+        viewport.refresh_proxy_g0(&self.device, self);
+        viewport.ensure_proxy_instance_capacity(&self.device, self, draws.len() as u32);
+        for (slot, d) in draws.iter().enumerate() {
+            viewport.write_proxy_instance(queue, slot as u32, &d.world, d.object_id);
+        }
+
+        let g0_bg = viewport
+            .proxy_g0_bg
+            .as_ref()
+            .expect("proxy g0 bg present after refresh");
+
+        let q = self.profiler.begin_query("proxy_raster", encoder);
+        {
+            let mut rp = self.mesh_proxy.begin_pass(
+                encoder,
+                &viewport.gbuffer.position_view,
+                &viewport.pick_view,
+                &viewport.gbuffer.normal_view,
+                &viewport.gbuffer.material_view,
+                &viewport.gbuffer.glass_view,
+                &viewport.gbuffer.depth_view,
+                None,
+            );
+            rp.set_pipeline(&self.mesh_proxy.pipeline);
+            rp.set_bind_group(0, g0_bg, &[]);
+            for (slot, d) in draws.iter().enumerate() {
+                let Some((vbo, ibo, index_count)) = self.proxy_mesh_buffer(d.handle_raw) else {
+                    continue;
+                };
+                let g1_bg = &viewport.proxy_instance_bind_groups[slot];
+                rp.set_bind_group(1, g1_bg, &[]);
+                rp.set_vertex_buffer(0, vbo.slice(..));
+                rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..index_count, 0, 0..1);
+            }
+        }
+        self.profiler.end_query(encoder, q);
     }
 
     /// Surface-mesh equivalent of `dispatch_splat`. Phase 6.3:
@@ -1680,6 +1799,10 @@ impl RkpRenderer {
         // has splat data (i.e. came from `acquire_asset`); procedural
         // objects without splats are skipped client-side.
         splat_draws: &[SplatDraw],
+        // Procedural proxy-mesh draws (GPU surface-nets-from-SDF).
+        // Rendered by `dispatch_proxy_meshes` after the primary mode
+        // completes; composites into the G-buffer via depth-test.
+        proxy_draws: &[crate::mesh_proxy_pass::ProxyDraw],
         // Cursor pixel for the screen-space paint cursor — `Some` when
         // paint mode is active and the mouse sits inside the
         // framebuffer, `None` otherwise. Drives a single-thread
@@ -1741,6 +1864,14 @@ impl RkpRenderer {
                 shadow_map_enabled, time, asset_count, None,
             );
             self.profiler.end_query(encoder, q);
+        }
+
+        // 1a'. Proxy-mesh raster — composites procedural triangle
+        //      meshes onto the G-buffer regardless of primary mode.
+        //      Skipped in raymarch preview (single-procedural focus
+        //      target, no scene composition).
+        if !raymarch {
+            self.dispatch_proxy_meshes(queue, encoder, viewport, proxy_draws);
         }
 
         // 1b. Half-res shadow trace. Skipped in isolation — the shade

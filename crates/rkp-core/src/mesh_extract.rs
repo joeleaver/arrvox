@@ -78,6 +78,50 @@ const _: () = {
     assert!(offset_of!(MeshVertex, _pad) == 28);
 };
 
+/// Vertex format for the procedural proxy-mesh pipeline (GPU surface-
+/// nets-from-SDF). Distinct from [`MeshVertex`]: proxy meshes have no
+/// octree, no LeafAttr pool slots, no skinning. Instead the SDF
+/// evaluator's full `TreeSample` (material + secondary + blend + color)
+/// is baked per-vertex at extraction time; the proxy raster pipeline
+/// reads these directly and writes the G-buffer without going through
+/// the LeafAttr indirection used by octree-backed meshes.
+///
+/// 32 B, `repr(C)`, `bytemuck`-castable. Same stride as [`MeshVertex`]
+/// so the surface-nets extractor's buffer allocation logic carries over.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ProxyVertex {
+    /// SN-cube vertex position in object-local space.
+    pub local_pos: [f32; 3],
+    /// SDF-gradient normal, octahedral-packed. Encoding matches
+    /// [`LeafAttr::normal_oct`].
+    pub normal_oct: u32,
+    /// Packed material identifiers + blend weight. Same layout as
+    /// [`LeafAttr::material_packed`]:
+    ///   bits  0-15: primary material_id (u16)
+    ///   bits 16-27: secondary material_id (u12)
+    ///   bits 28-31: blend_weight (u4)
+    pub material_packed: u32,
+    /// Per-vertex RGBA8 color from the procedural's color nodes
+    /// (`ColorByHeight`, `ColorByNoise`, leaf `color` params).
+    /// Low byte = R, next = G, then B, then alpha/intensity.
+    /// 0 = "no procedural override, use material base_color".
+    pub color_packed: u32,
+    /// Reserved for future per-vertex attributes (LOD bias, emission,
+    /// node_id for picking, etc.). Keeps the stride at 32 B.
+    pub _reserved: [u32; 2],
+}
+
+const _: () = assert!(std::mem::size_of::<ProxyVertex>() == 32);
+const _: () = {
+    use std::mem::offset_of;
+    assert!(offset_of!(ProxyVertex, local_pos) == 0);
+    assert!(offset_of!(ProxyVertex, normal_oct) == 12);
+    assert!(offset_of!(ProxyVertex, material_packed) == 16);
+    assert!(offset_of!(ProxyVertex, color_packed) == 20);
+    assert!(offset_of!(ProxyVertex, _reserved) == 24);
+};
+
 /// Sentinel marking INTERIOR cells in the dense cell map. INTERIOR
 /// cells count as "solid" for SN sign purposes but carry no per-cell
 /// `leaf_attr_id`, so we can't store a real slot here.

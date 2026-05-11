@@ -33,6 +33,7 @@ impl EngineState {
         self.gpu_instances.clear();
         self.gpu_instance_overlays.clear();
         self.splat_draws.clear();
+        self.proxy_draws.clear();
         self.gpu_to_entity.clear();
         self.entity_to_gpu.clear();
 
@@ -399,14 +400,13 @@ impl EngineState {
                     });
                 }
             } else if let Some(proxy) = renderable.spatial.as_ref().and_then(|g| g.as_proxy_mesh()) {
-                // Procedural rendered as a triangle proxy mesh — no
-                // octree, no leaf_attr pool entry, no skinning. The
-                // mesh raster path consumes a SplatDraw with the
-                // proxy's reserved asset handle plus the entity's
-                // world transform; everything downstream (LOD-select,
-                // shadow, shading) reuses the existing pipeline since
-                // the GPU buffers were uploaded under that handle by
-                // `RenderCommand::UploadProxyMesh`.
+                // Procedural rendered as a first-class triangle proxy
+                // mesh. Own raster pipeline (`mesh_proxy_pass`); no
+                // octree, no LeafAttr indirection, no LOD select, no
+                // skinning, no shadow yet. The GpuInstance entry is
+                // kept so pick-buffer reads map back to a hecs entity;
+                // no synthesized GpuAsset record is needed since the
+                // proxy raster doesn't consult the asset buffer.
                 let world_matrix = glam::Mat4::from_scale_rotation_translation(
                     transform.scale,
                     glam::Quat::from_euler(
@@ -419,31 +419,12 @@ impl EngineState {
                 );
                 let gpu_idx = self.gpu_instances.len() as u32;
 
-                // Build a minimal GpuInstance — proxy meshes don't
-                // share a baked asset record, so synthesize one
-                // per-instance asset entry covering this mesh's AABB.
-                // `asset_table` keys on octree root_offset, which proxy
-                // meshes don't have; the asset record only matters for
-                // the AABB the LOD-select pass reads. Use the proxy's
-                // own AABB.
-                let proxy_aabb = proxy.aabb;
-                let asset_id = self.gpu_assets.len() as u32;
-                self.gpu_assets.push(crate::scene_sync::build_gpu_asset(
-                    &proxy_aabb,
-                    glam::Vec3::ZERO, // no grid origin — proxy mesh writes
-                                      // world-space positions today.
-                    &rkp_core::scene_node::SpatialHandle::Octree {
-                        root_offset: 0,
-                        len: 0,
-                        depth: 0,
-                        base_voxel_size: 0.0,
-                    },
-                    0.0,
-                    0,
-                ));
+                // Asset id is a don't-care for proxies — point it at
+                // slot 0 so the GpuInstance is well-formed even
+                // though the proxy raster ignores it.
                 let mut inst = crate::scene_sync::build_gpu_instance(
                     &world_matrix,
-                    asset_id,
+                    /* asset_id */ 0,
                     renderable.material_id,
                     gpu_idx,
                     None,
@@ -456,16 +437,14 @@ impl EngineState {
                 self.entity_to_gpu.insert(entity, self.gpu_instances.len());
                 self.gpu_to_entity.push(entity);
                 self.gpu_instances.push(inst);
+                // Suppress unused-field warning on the proxy aabb —
+                // kept on `ProxyMeshData` for pick/overlap CPU queries.
+                let _proxy_aabb = proxy.aabb;
 
-                self.splat_draws.push(rkp_render::splat_pass::SplatDraw {
-                    asset_handle_raw: proxy.handle.raw(),
+                self.proxy_draws.push(rkp_render::mesh_proxy_pass::ProxyDraw {
+                    handle_raw: proxy.handle.raw(),
                     world: world_matrix.to_cols_array_2d(),
                     object_id: gpu_idx,
-                    grid_origin: [0.0, 0.0, 0.0],
-                    bone_offset_lbs: 0,
-                    bone_offset_dqs: 0,
-                    skinning_mode: rkp_render::splat_pass::SKINNING_MODE_NONE,
-                    has_glass: false,
                 });
             }
         }

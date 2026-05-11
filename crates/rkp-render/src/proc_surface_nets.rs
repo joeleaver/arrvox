@@ -12,14 +12,15 @@
 //! readback is blocking. Caller-friendly: one `extract` call per
 //! procedural per re-mesh.
 //!
-//! Vertex layout matches `rkp_core::mesh_extract::MeshVertex` (32 B)
-//! so feeding the result into the existing mesh raster pipeline is a
-//! later plumbing step, not another data conversion.
+//! Vertex layout is `rkp_core::mesh_extract::ProxyVertex` (32 B) —
+//! distinct from the octree-mesh `MeshVertex`. Each vertex carries
+//! its own shading payload (normal + dual-material + color), consumed
+//! directly by the proxy raster pass without LeafAttr indirection.
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 use rkp_core::mesh_cluster::{MeshletCluster, PARENT_GROUP_ERROR_ROOT};
-use rkp_core::mesh_extract::MeshVertex;
+use rkp_core::mesh_extract::ProxyVertex;
 use rkp_procedural::flatten::ProcInstruction;
 
 use crate::compile_pass_shader;
@@ -36,11 +37,11 @@ struct SnParams {
     index_cap: u32,
 }
 
-/// Output of one extraction call. Re-uses `rkp_core::MeshVertex` so
-/// the result feeds straight into the renderer's
-/// `upload_mesh_for_asset` path without a type conversion.
+/// Output of one extraction call. Carries [`ProxyVertex`] — proxy
+/// meshes have no octree / no LeafAttr indirection, so each vertex
+/// holds its full shading payload (normal + material + color).
 pub struct SurfaceMesh {
-    pub vertices: Vec<MeshVertex>,
+    pub vertices: Vec<ProxyVertex>,
     pub indices: Vec<u32>,
     /// Object-local AABB of the meshed surface. The single proxy
     /// cluster's bbox; the per-instance world matrix is applied on
@@ -489,7 +490,7 @@ impl GpuSurfaceNets {
                 0,
                 self.vertices_staging.as_ref().unwrap(),
                 0,
-                self.vertices_cap * std::mem::size_of::<MeshVertex>() as u64,
+                self.vertices_cap * std::mem::size_of::<ProxyVertex>() as u64,
             );
             enc.copy_buffer_to_buffer(
                 self.indices_buf.as_ref().unwrap(),
@@ -507,9 +508,9 @@ impl GpuSurfaceNets {
 
         let mesh = if read_geometry {
             let v_bytes =
-                self.vertices_cap * std::mem::size_of::<MeshVertex>() as u64;
+                self.vertices_cap * std::mem::size_of::<ProxyVertex>() as u64;
             let i_bytes = self.indices_cap * 4;
-            let all_v = map_and_read::<MeshVertex>(
+            let all_v = map_and_read::<ProxyVertex>(
                 device,
                 self.vertices_staging.as_ref().unwrap(),
                 v_bytes,
@@ -584,7 +585,7 @@ impl GpuSurfaceNets {
     fn ensure_vertex_capacity(&mut self, device: &wgpu::Device, needed: u64) {
         if self.vertices_cap < needed {
             let new_cap = (needed * 3) / 2;
-            let bytes = new_cap * std::mem::size_of::<MeshVertex>() as u64;
+            let bytes = new_cap * std::mem::size_of::<ProxyVertex>() as u64;
             self.vertices_buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("sn vertices"),
                 size: bytes,
@@ -638,13 +639,12 @@ mod tests {
     #[test]
     fn single_cluster_metadata_is_consistent() {
         let mesh = SurfaceMesh {
-            vertices: vec![MeshVertex {
+            vertices: vec![ProxyVertex {
                 local_pos: [0.0, 0.0, 0.0],
                 normal_oct: rkp_core::pack_oct(Vec3::Y),
-                leaf_attr_id: 0,
-                bone_indices: 0,
-                bone_weights: 0,
-                _pad: 0,
+                material_packed: 0,
+                color_packed: 0,
+                _reserved: [0; 2],
             }],
             indices: vec![0; 27],
             aabb_min: Vec3::new(-1.0, -2.0, -3.0),
@@ -661,13 +661,13 @@ mod tests {
         assert!(c.parent_group_error.is_infinite());
     }
 
-    /// Layout sanity — the SurfaceMesh.vertices type must be
-    /// `rkp_core::MeshVertex` (32 B) so the renderer's
-    /// `upload_mesh_for_asset` accepts the slice without conversion.
+    /// Layout sanity — `ProxyVertex` is 32 B so the surface-nets
+    /// extractor's per-vertex stride matches the WGSL `ProxyVertex`
+    /// declared in `proc_surface_nets.wesl`.
     #[test]
-    fn surface_mesh_uses_rkp_core_mesh_vertex() {
+    fn surface_mesh_proxy_vertex_layout() {
         const _ASSERT: () = {
-            assert!(std::mem::size_of::<MeshVertex>() == 32);
+            assert!(std::mem::size_of::<ProxyVertex>() == 32);
             assert!(std::mem::size_of::<LeafAttr>() == 8);
         };
     }

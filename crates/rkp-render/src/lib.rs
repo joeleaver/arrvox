@@ -60,6 +60,12 @@ pub mod mesh_glass_shadow_pass;
 /// remaining G-buffer entries (normal / material / glass) via the
 /// scene's `leaf_attr_pool` / `color_pool` / `instances` indirection.
 pub mod splat_resolve_pass;
+/// Procedural proxy-mesh raster pipeline. First-class triangle-mesh
+/// renderer for procedurals baked via GPU surface-nets-from-SDF.
+/// Bypasses `LeafAttr` indirection — each `ProxyVertex` carries its
+/// own normal + material + color and the FS writes the full G-buffer
+/// directly. See `notes/proxy-mesh-first-class.md`.
+pub mod mesh_proxy_pass;
 pub mod rkp_shadow_trace;
 /// Per-object GPU struct — forward world transform, octree params, no inverse_world.
 pub mod rkp_gpu_object;

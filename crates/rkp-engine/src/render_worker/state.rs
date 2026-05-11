@@ -420,21 +420,16 @@ impl RenderState {
                 handle_raw,
                 vertices,
                 indices,
-                cluster,
+                cluster: _,
             } => {
-                let dispatch_index_count = indices.len() as u32;
-                self.renderer.upload_mesh_for_asset(
-                    handle_raw,
-                    &vertices,
-                    &indices,
-                    dispatch_index_count,
-                );
+                // Proxy meshes go into the dedicated proxy slab —
+                // `ProxyVertex` layout + single direct indexed draw,
+                // no LOD select / cluster table needed.
                 self.renderer
-                    .upload_mesh_clusters_for_asset(handle_raw, &[cluster]);
+                    .upload_proxy_mesh_for_asset(handle_raw, &vertices, &indices);
             }
             RenderCommand::ReleaseProxyMesh { handle_raw } => {
-                self.renderer.release_mesh_for_asset(handle_raw);
-                self.renderer.release_mesh_clusters_for_asset(handle_raw);
+                self.renderer.release_proxy_mesh_for_asset(handle_raw);
             }
             RenderCommand::Shutdown => {
                 // Handled by the outer loop's poll of `is_shutdown`.

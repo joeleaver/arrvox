@@ -8,8 +8,9 @@
 //
 // Three compute entry points share the bind group:
 //   1. `classify`    — sample SDF at every cell center, write u32 (1=solid, 0=empty).
-//   2. `vertex_emit` — per SN-cube corner, if active emit one MeshVertex
-//                      with edge-crossing centroid + 6-tap gradient normal.
+//   2. `vertex_emit` — per SN-cube corner, if active emit one ProxyVertex
+//                      with edge-crossing centroid + 6-tap gradient normal
+//                      + per-vertex shading payload from `eval_tree`.
 //   3. `index_emit`  — per cell × 3 +-axis edges, if sign-change emit a
 //                      6-index quad referencing the 4 SN-cube vertices around it.
 //
@@ -23,6 +24,7 @@
 
 import package::lib::types::ProcInstruction;
 import package::lib::oct_normal::pack_oct_normal;
+import package::proc_eval::eval_tree;
 import package::proc_eval::eval_tree_distance;
 import package::proc_eval::gradient_normal;
 
@@ -44,18 +46,26 @@ struct SnParams {
     index_cap: u32,
 }
 
-// 32 bytes — matches `rkp_core::mesh_extract::MeshVertex` layout so the
-// future render-integration step can stream this straight into the
-// existing mesh raster pipeline.
-struct MeshVertex {
+// 32 bytes — matches `rkp_core::mesh_extract::ProxyVertex` layout.
+// Proxy meshes have no octree and no LeafAttr indirection: the full
+// shading payload (material primary/secondary/blend + color) is
+// baked per vertex at extraction time and consumed directly by the
+// proxy raster's FS.
+struct ProxyVertex {
     local_pos_x: f32,
     local_pos_y: f32,
     local_pos_z: f32,
     normal_oct: u32,
-    leaf_attr_id: u32,
-    bone_indices: u32,
-    bone_weights: u32,
-    pad: u32,
+    // bits  0-15: primary material_id (u16)
+    // bits 16-27: secondary material_id (u12)
+    // bits 28-31: blend_weight (u4)
+    material_packed: u32,
+    // R | G<<8 | B<<16 | 0xFF<<24 — high byte forced to 0xFF so a
+    // black procedural color doesn't collide with the
+    // "no override" sentinel used by the voxel color path.
+    color_packed: u32,
+    _reserved0: u32,
+    _reserved1: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: SnParams;
@@ -70,7 +80,7 @@ struct MeshVertex {
 // `min_storage_buffer_offset_alignment` (typically 256 B) constraint
 // that two separate bindings into adjacent u32 offsets would hit.
 @group(0) @binding(4) var<storage, read_write> counters: array<atomic<u32>, 2>;
-@group(0) @binding(5) var<storage, read_write> vertices: array<MeshVertex>;
+@group(0) @binding(5) var<storage, read_write> vertices: array<ProxyVertex>;
 @group(0) @binding(6) var<storage, read_write> indices: array<u32>;
 
 const SOLID: u32 = 1u;
@@ -212,6 +222,30 @@ fn vertex_emit(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = gradient_normal(pos_world, params.instruction_count, params.cell_size);
     let normal_oct = pack_oct_normal(n);
 
+    // Full TreeSample at the vertex — primary/secondary material, blend
+    // weight, and procedural color. Pack into the vertex so the proxy
+    // raster's FS reads shading data directly with no LeafAttr lookup.
+    let s = eval_tree(pos_world, params.instruction_count);
+
+    // Match `proc_sample.wesl`'s blend quantization (round-to-nearest u4).
+    let blend_u4 = u32(trunc(clamp(s.blend_weight, 0.0, 1.0) * 15.0 + 0.5));
+
+    // Material packing layout — must match `LeafAttr.material_packed`
+    // as decoded by `splat_resolve.wesl` (primary lo16, secondary
+    // mid12, blend hi4) so downstream packing matches the existing
+    // G-buffer material consumer.
+    let material_packed =
+        (s.material_id & 0xFFFFu)
+        | ((s.secondary_material_id & 0xFFFu) << 16u)
+        | ((blend_u4 & 0xFu) << 28u);
+
+    // RGBA8 color packing — high byte 0xFF avoids the "no override"
+    // sentinel (=0) the voxel color path uses.
+    let cr = u32(clamp(s.color.r, 0.0, 1.0) * 255.0 + 0.5);
+    let cg = u32(clamp(s.color.g, 0.0, 1.0) * 255.0 + 0.5);
+    let cb = u32(clamp(s.color.b, 0.0, 1.0) * 255.0 + 0.5);
+    let color_packed = cr | (cg << 8u) | (cb << 16u) | (0xFFu << 24u);
+
     let slot = atomicAdd(&counters[0], 1u);
     if (slot >= params.vertex_cap) {
         // Out of vertex space — leave map empty so index_emit skips
@@ -220,15 +254,15 @@ fn vertex_emit(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    var v: MeshVertex;
+    var v: ProxyVertex;
     v.local_pos_x = pos_world.x;
     v.local_pos_y = pos_world.y;
     v.local_pos_z = pos_world.z;
     v.normal_oct = normal_oct;
-    v.leaf_attr_id = 0u;
-    v.bone_indices = 0u;
-    v.bone_weights = 0u;
-    v.pad = 0u;
+    v.material_packed = material_packed;
+    v.color_packed = color_packed;
+    v._reserved0 = 0u;
+    v._reserved1 = 0u;
     vertices[slot] = v;
     cube_vertex_map[cube_storage_index(q)] = slot;
 }

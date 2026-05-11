@@ -456,7 +456,7 @@ impl EngineState {
         &mut self,
         entity: hecs::Entity,
         baked_root_scale: glam::Vec3,
-        mut surface_mesh: rkp_render::proc_surface_nets::SurfaceMesh,
+        surface_mesh: rkp_render::proc_surface_nets::SurfaceMesh,
         cluster: rkp_core::mesh_cluster::MeshletCluster,
     ) {
         use crate::components::*;
@@ -466,56 +466,15 @@ impl EngineState {
         // ProxyMesh handle (re-bake of a proxy-mesh procedural).
         self.release_renderable_geometry(entity);
 
-        // Pull the entity's material override (if any) — this is
-        // what the proxy mesh's synthetic LeafAttr should report
-        // to the resolve pass. Default 0 falls through to the
-        // material palette's slot 0.
-        let material_id = self
-            .world
-            .get::<&Renderable>(entity)
-            .map(|r| r.material_id)
-            .unwrap_or(0);
-
-        // Reserve a fresh procedural handle, allocate one LeafAttr
-        // slot for the proxy mesh's shading info, stamp it, and
-        // patch every vertex's `leaf_attr_id` to point at it. Single
-        // slot per procedural → flat shading with one normal of
-        // record (Y-up); per-vertex-normal proxies are a follow-up
-        // (see project_proc_surface_nets_spike memory).
-        let (handle, leaf_attr_slot) = {
+        // Proxy meshes carry their full shading payload (material,
+        // color, dual-material blend) per-vertex via `ProxyVertex`.
+        // No LeafAttr pool slot, no octree, no per-cell indirection.
+        // The proxy raster reads vertex attrs directly and writes
+        // the G-buffer.
+        let handle = {
             let mut sm = self.scene_mgr.lock().unwrap();
-            let h = sm.reserve_procedural_handle();
-            // `allocate()` returns None only when the pool is at
-            // capacity — at which point the entire scene is in
-            // worse trouble than a single missing proxy slot. Treat
-            // that as fatal-for-this-entity: free the handle, log,
-            // and bail.
-            let Some(slot) = sm.leaf_attr_pool.allocate() else {
-                drop(sm);
-                self.scene_mgr.lock().unwrap().release_procedural_handle(h);
-                self.console.warn(
-                    "Proxy-mesh bake: leaf_attr_pool exhausted, cannot register material slot."
-                        .to_string(),
-                );
-                return;
-            };
-            // Use a Y-up normal as the default "normal of record"
-            // for every fragment of the mesh. Per-vertex normals
-            // computed by surface-nets are written into each
-            // vertex's `normal_oct` field but ignored by the
-            // resolve pass today — see splat_resolve.wesl's
-            // `attr.normal_oct` lookup. Wiring per-vertex normals
-            // requires a slot per vertex, deferred.
-            *sm.leaf_attr_pool.get_mut(slot) = rkp_core::LeafAttr {
-                normal_oct: rkp_core::pack_oct(glam::Vec3::Y),
-                material_primary: material_id,
-                material_secondary_blend: 0,
-            };
-            (h, slot)
+            sm.reserve_procedural_handle()
         };
-        for v in surface_mesh.vertices.iter_mut() {
-            v.leaf_attr_id = leaf_attr_slot;
-        }
         let aabb = rkp_core::Aabb {
             min: surface_mesh.aabb_min,
             max: surface_mesh.aabb_max,
@@ -534,19 +493,16 @@ impl EngineState {
             renderable.spatial = Some(RenderGeometry::ProxyMesh(ProxyMeshData {
                 handle,
                 aabb,
-                leaf_attr_slot,
             }));
             renderable.asset_handle = Some(handle);
             renderable.voxel_count = 0;
         } else {
             // Entity disappeared between request and result —
-            // release the freshly-reserved handle + leaf_attr slot
-            // so we don't leak.
-            {
-                let mut sm = self.scene_mgr.lock().unwrap();
-                sm.release_procedural_handle(handle);
-                sm.leaf_attr_pool.deallocate_range(leaf_attr_slot, 1);
-            }
+            // release the freshly-reserved handle so we don't leak.
+            self.scene_mgr
+                .lock()
+                .unwrap()
+                .release_procedural_handle(handle);
             let _ = self
                 .render_worker
                 .commands
@@ -575,7 +531,7 @@ impl EngineState {
     /// silently if the entity has no proxy handle.
     pub(crate) fn release_proxy_handle_if_any(&mut self, entity: hecs::Entity) {
         use crate::components::*;
-        let Some((handle, leaf_attr_slot)) = self
+        let Some(handle) = self
             .world
             .get::<&Renderable>(entity)
             .ok()
@@ -583,16 +539,15 @@ impl EngineState {
                 r.spatial
                     .as_ref()
                     .and_then(|g| g.as_proxy_mesh())
-                    .map(|p| (p.handle, p.leaf_attr_slot))
+                    .map(|p| p.handle)
             })
         else {
             return;
         };
-        {
-            let mut sm = self.scene_mgr.lock().unwrap();
-            sm.release_procedural_handle(handle);
-            sm.leaf_attr_pool.deallocate_range(leaf_attr_slot, 1);
-        }
+        self.scene_mgr
+            .lock()
+            .unwrap()
+            .release_procedural_handle(handle);
         let _ = self
             .render_worker
             .commands

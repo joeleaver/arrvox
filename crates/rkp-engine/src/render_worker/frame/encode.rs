@@ -278,6 +278,10 @@ pub(super) fn encode_viewports(
             // `AssetHandle` don't appear here and won't render under
             // `RKP_PRIMARY=splat`.
             &frame.splat_draws,
+            // Procedural proxy-mesh draws. Rendered after primary
+            // visibility regardless of `primary_mode` — proxy meshes
+            // are first-class scene geometry.
+            &frame.proxy_draws,
             // Cursor pixel for the screen-space paint cursor's
             // brush-state probe pass. `None` = paint mode off (or
             // mouse outside the framebuffer); the probe will write

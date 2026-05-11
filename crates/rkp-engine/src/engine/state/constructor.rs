@@ -118,6 +118,7 @@ impl EngineState {
             gpu_instances: Vec::new(),
             gpu_instance_overlays: Vec::new(),
             splat_draws: Vec::new(),
+            proxy_draws: Vec::new(),
             gpu_to_entity: Vec::new(),
             entity_to_gpu: std::collections::HashMap::new(),
             project_loaded: false,

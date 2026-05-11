@@ -86,6 +86,11 @@ pub struct RenderFrame {
     /// `RKP_PRIMARY=splat` (logged as known limitation; they need their
     /// own splat-extraction path later).
     pub splat_draws: Vec<rkp_render::splat_pass::SplatDraw>,
+    /// Per-frame proxy-mesh draw list (procedurals baked via GPU
+    /// surface-nets-from-SDF). Rendered by `dispatch_proxy_meshes`
+    /// after the primary mode's main pass; composites into the
+    /// G-buffer via depth-test.
+    pub proxy_draws: Vec<rkp_render::mesh_proxy_pass::ProxyDraw>,
     pub gpu_objects_dirty: bool,
 
     /// Monotonic counter from `scene_mgr.geometry_epoch()`. Render
@@ -474,7 +479,7 @@ pub enum RenderCommand {
     /// `SplatDraw` for that entity references the handle.
     UploadProxyMesh {
         handle_raw: u32,
-        vertices: Vec<rkp_core::mesh_extract::MeshVertex>,
+        vertices: Vec<rkp_core::mesh_extract::ProxyVertex>,
         indices: Vec<u32>,
         cluster: rkp_core::mesh_cluster::MeshletCluster,
     },

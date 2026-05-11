@@ -143,6 +143,18 @@ pub struct ViewportRenderer {
     /// Bind groups paired one-to-one with `splat_instance_buffers`.
     pub splat_instance_bind_groups: Vec<wgpu::BindGroup>,
 
+    // ── Procedural proxy-mesh pass bindings ──
+    /// Per-viewport camera bind group for `MeshProxyPass` (g0). Built
+    /// on first dispatch; the camera uniform buffer is stable per
+    /// viewport so this lives for the viewport's lifetime.
+    pub proxy_g0_bg: Option<wgpu::BindGroup>,
+    /// Per-instance 80 B uniform buffers for proxy draws. Grown on
+    /// demand by `ensure_proxy_instance_capacity`, reused across
+    /// frames.
+    pub proxy_instance_buffers: Vec<wgpu::Buffer>,
+    /// Bind groups paired one-to-one with `proxy_instance_buffers`.
+    pub proxy_instance_bind_groups: Vec<wgpu::BindGroup>,
+
     /// Splat-resolve compute pass — per-VR texture bindings (g0).
     /// Bound to (leaf_slot, pick) reads + (normal, material, glass)
     /// storage writes. Rebuilt on resize (gbuffer texture views move).
@@ -699,6 +711,9 @@ impl ViewportRenderer {
             splat_g0_lights_materials_epoch: u64::MAX,
             splat_instance_buffers: Vec::new(),
             splat_instance_bind_groups: Vec::new(),
+            proxy_g0_bg: None,
+            proxy_instance_buffers: Vec::new(),
+            proxy_instance_bind_groups: Vec::new(),
             splat_resolve_g0_bg: None,
             splat_resolve_g1_bg: None,
             splat_resolve_scene_epoch: u64::MAX,
@@ -1180,6 +1195,64 @@ impl ViewportRenderer {
             self.splat_instance_buffers.push(buf);
             self.splat_instance_bind_groups.push(bg);
         }
+    }
+
+    /// Grow per-instance uniform buffers + bind groups for the
+    /// `mesh_proxy` pass to at least `count` slots. Layout matches
+    /// `mesh_proxy.wesl::ProxyInstance` — 80 B per slot.
+    pub fn ensure_proxy_instance_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        renderer: &RkpRenderer,
+        count: u32,
+    ) {
+        use crate::mesh_proxy_pass::PROXY_INSTANCE_BYTES;
+        let needed = count as usize;
+        while self.proxy_instance_buffers.len() < needed {
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("proxy instance uniform"),
+                size: PROXY_INSTANCE_BYTES,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bg = renderer.mesh_proxy.create_g1_bind_group(device, &buf);
+            self.proxy_instance_buffers.push(buf);
+            self.proxy_instance_bind_groups.push(bg);
+        }
+    }
+
+    /// Build the `mesh_proxy` g0 bind group once per viewport (camera
+    /// buffer doesn't move during the viewport's lifetime).
+    pub fn refresh_proxy_g0(&mut self, device: &wgpu::Device, renderer: &RkpRenderer) {
+        if self.proxy_g0_bg.is_none() {
+            self.proxy_g0_bg = Some(
+                renderer
+                    .mesh_proxy
+                    .create_g0_bind_group(device, &self.camera_buffer),
+            );
+        }
+    }
+
+    /// Upload one proxy instance's uniform into slot `slot`. Slots are
+    /// reused across frames; the caller must call
+    /// `ensure_proxy_instance_capacity` first.
+    pub fn write_proxy_instance(
+        &self,
+        queue: &wgpu::Queue,
+        slot: u32,
+        world: &[[f32; 4]; 4],
+        object_id: u32,
+    ) {
+        let inst = crate::mesh_proxy_pass::ProxyInstanceUniform {
+            world: *world,
+            object_id,
+            _pad: [0; 3],
+        };
+        queue.write_buffer(
+            &self.proxy_instance_buffers[slot as usize],
+            0,
+            bytemuck::bytes_of(&inst),
+        );
     }
 
     /// Ensure per-VR mesh LOD-select state has at least `count` draw

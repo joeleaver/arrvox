@@ -962,6 +962,7 @@ impl EngineState {
             gpu_instances: self.gpu_instances.clone(),
             gpu_instance_overlays: self.gpu_instance_overlays.clone(),
             splat_draws: self.splat_draws.clone(),
+            proxy_draws: self.proxy_draws.clone(),
             gpu_objects_dirty: gpu_objects_dirty_this_frame,
             geometry_epoch,
             paint_epoch,

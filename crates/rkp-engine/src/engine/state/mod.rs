@@ -374,6 +374,12 @@ pub(crate) struct EngineState {
     /// renderer's primary mode is `Splat` (RKP_PRIMARY=splat); the
     /// march path ignores it.
     pub(crate) splat_draws: Vec<rkp_render::splat_pass::SplatDraw>,
+    /// Procedural proxy-mesh draws. Built per-frame from entities
+    /// whose `Renderable.spatial` is `RenderGeometry::ProxyMesh`.
+    /// Disjoint from `splat_draws`: proxy meshes ride a dedicated
+    /// raster pipeline (`mesh_proxy_pass`) that writes the full
+    /// G-buffer directly — no LeafAttr indirection.
+    pub(crate) proxy_draws: Vec<rkp_render::mesh_proxy_pass::ProxyDraw>,
     /// Maps gpu_instance index → hecs Entity (for pick resolution).
     pub(crate) gpu_to_entity: Vec<hecs::Entity>,
     /// Maps hecs Entity → gpu_instance index.
