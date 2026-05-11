@@ -197,6 +197,21 @@ pub(super) struct RenderState {
     /// during the per-VR encode phase.
     pub(super) user_shader_mesh_draws:
         Vec<rkp_render::user_shader_mesh_pass::UserShaderMeshDraw>,
+    /// `Arc` handle to the painted-anchor map we last uploaded to
+    /// the mesh-path GPU buffers. Sim swaps the inner `Arc` only on
+    /// paint/geometry/param-epoch rebuild, so an `Arc::ptr_eq` check
+    /// against this handle lets us skip the per-material upload +
+    /// compute-trio dispatch on idle frames (steady state). Without
+    /// this gate, every frame paid ~5 dispatches × N materials of
+    /// CPU encoding for work whose output was already on the GPU.
+    pub(super) last_uploaded_painted_anchors: Option<
+        std::sync::Arc<
+            std::collections::HashMap<
+                u16,
+                Vec<rkp_render::user_shader_mesh_pass::AnchorRecord>,
+            >,
+        >,
+    >,
 
     /// Voxel sprite instancing — scene-wide pieces. The
     /// per-viewport march + composite live in [`ViewportRenderer`]
@@ -385,6 +400,7 @@ impl RenderState {
             user_shader_emit_pass,
             mesh_user_shader_cache: std::collections::HashMap::new(),
             user_shader_mesh_draws: Vec::new(),
+            last_uploaded_painted_anchors: None,
             instance_proto_cache,
             tlas_pass,
             tlas_build_pass,

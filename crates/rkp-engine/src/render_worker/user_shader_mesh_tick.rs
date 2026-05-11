@@ -65,10 +65,23 @@ pub(super) fn tick_user_shader_mesh(state: &mut RenderState, frame: &RenderFrame
     state.user_shader_mesh_draws.clear();
 
     if frame.painted_anchors.is_empty() {
+        state.last_uploaded_painted_anchors = None;
         return;
     }
 
     let source_hash = frame.user_shader_source_hash;
+
+    // Skip per-material anchor upload + compute trio when the painted
+    // anchor set is byte-identical to last frame (`Arc::ptr_eq` —
+    // sim swaps the inner `Arc` only on paint/geometry/param epoch
+    // rebuild). Steady-state idle frames pay only the per-frame
+    // uniform write + draw-descriptor emit, not 5 compute dispatches
+    // per material. Big CPU win for static painted scenes.
+    let anchors_unchanged = state
+        .last_uploaded_painted_anchors
+        .as_ref()
+        .map(|prev| std::sync::Arc::ptr_eq(prev, &frame.painted_anchors))
+        .unwrap_or(false);
 
     // Collect (material_id, anchors) pairs up front so the per-material
     // loop can mutate state without aliasing frame.painted_anchors.
@@ -146,17 +159,9 @@ pub(super) fn tick_user_shader_mesh(state: &mut RenderState, frame: &RenderFrame
             .get_mut(&material_id)
             .expect("just-inserted material state");
 
-        // Upload anchor records (truncated to V1 cap).
-        let upload_slice = &anchors[..anchor_count as usize];
-        state.queue.write_buffer(
-            &mat_state.anchors_buffer,
-            0,
-            bytemuck::cast_slice(upload_slice),
-        );
-
-        // FrameUniforms — time/wind/camera. V1 fills time from the
-        // shade params; camera_pos + delta_time + wind are zeroed for
-        // V1 (subscribed-uniforms wiring is a follow-up).
+        // Always upload FrameUniforms — `frame.time` advances each
+        // frame and the raster VS uses it for wind animation. Cheap
+        // 48-byte write.
         let frame_uniforms = FrameUniforms {
             time: frame.shade_params_base.time,
             delta_time: 0.0,
@@ -172,72 +177,80 @@ pub(super) fn tick_user_shader_mesh(state: &mut RenderState, frame: &RenderFrame
             bytemuck::bytes_of(&frame_uniforms),
         );
 
-        // Params — copy from the per-material shader_params_slots entry.
-        let params = frame
-            .shader_params_slots
-            .get(material_id as usize)
-            .copied()
-            .unwrap_or([0.0; 8]);
-        let params_uniform = UserShaderParams { p: params };
-        state.queue.write_buffer(
-            &mat_state.params_buffer,
-            0,
-            bytemuck::bytes_of(&params_uniform),
-        );
+        // Anchor data + params + dispatch + compute trio only run
+        // when the painted-anchor set changed. Steady-state painting
+        // pause → only the FrameUniforms write above + the draw
+        // emit below run.
+        if !anchors_unchanged {
+            let upload_slice = &anchors[..anchor_count as usize];
+            state.queue.write_buffer(
+                &mat_state.anchors_buffer,
+                0,
+                bytemuck::cast_slice(upload_slice),
+            );
 
-        // DispatchInfo — current anchor count + verts-per-spawn.
-        let dispatch_info = DispatchInfo {
-            num_anchors: anchor_count,
-            verts_per_spawn: vertex_count_per_spawn,
-            _pad0: 0,
-            _pad1: 0,
-        };
-        state.queue.write_buffer(
-            &mat_state.dispatch_buffer,
-            0,
-            bytemuck::bytes_of(&dispatch_info),
-        );
+            // Params — copy from the per-material shader_params_slots entry.
+            let params = frame
+                .shader_params_slots
+                .get(material_id as usize)
+                .copied()
+                .unwrap_or([0.0; 8]);
+            let params_uniform = UserShaderParams { p: params };
+            state.queue.write_buffer(
+                &mat_state.params_buffer,
+                0,
+                bytemuck::bytes_of(&params_uniform),
+            );
 
-        mat_state.last_anchor_count = anchor_count;
+            // DispatchInfo — current anchor count + verts-per-spawn.
+            let dispatch_info = DispatchInfo {
+                num_anchors: anchor_count,
+                verts_per_spawn: vertex_count_per_spawn,
+                _pad0: 0,
+                _pad1: 0,
+            };
+            state.queue.write_buffer(
+                &mat_state.dispatch_buffer,
+                0,
+                bytemuck::bytes_of(&dispatch_info),
+            );
 
-        // Encode + submit the three compute passes.
-        let mut encoder = state
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some(&format!(
-                    "user_shader_mesh material {material_id} compute"
-                )),
-            });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("user_shader_mesh compute"),
-                timestamp_writes: None,
-            });
-            pass.set_bind_group(0, &mat_state.compute_g0, &[]);
+            mat_state.last_anchor_count = anchor_count;
 
-            // 1. spawn_count — 1 thread per anchor (workgroup_size 64).
-            pass.set_pipeline(&mat_state.pipelines.spawn_count);
-            let wg_x_64 = anchor_count.div_ceil(64).max(1);
-            pass.dispatch_workgroups(wg_x_64, 1, 1);
+            // Encode + submit the five compute passes.
+            let mut encoder = state
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some(&format!(
+                        "user_shader_mesh material {material_id} compute"
+                    )),
+                });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("user_shader_mesh compute"),
+                    timestamp_writes: None,
+                });
+                pass.set_bind_group(0, &mat_state.compute_g0, &[]);
 
-            // 2a. prefix_local — 1 thread per anchor at WG=256.
-            pass.set_pipeline(&mat_state.pipelines.prefix_local);
-            let wg_x_256 = anchor_count.div_ceil(256).max(1);
-            pass.dispatch_workgroups(wg_x_256, 1, 1);
+                pass.set_pipeline(&mat_state.pipelines.spawn_count);
+                let wg_x_64 = anchor_count.div_ceil(64).max(1);
+                pass.dispatch_workgroups(wg_x_64, 1, 1);
 
-            // 2b. prefix_scan_sums — single workgroup scans wg_sums[].
-            pass.set_pipeline(&mat_state.pipelines.prefix_scan_sums);
-            pass.dispatch_workgroups(1, 1, 1);
+                pass.set_pipeline(&mat_state.pipelines.prefix_local);
+                let wg_x_256 = anchor_count.div_ceil(256).max(1);
+                pass.dispatch_workgroups(wg_x_256, 1, 1);
 
-            // 2c. prefix_add_back — add per-workgroup base back.
-            pass.set_pipeline(&mat_state.pipelines.prefix_add_back);
-            pass.dispatch_workgroups(wg_x_256, 1, 1);
+                pass.set_pipeline(&mat_state.pipelines.prefix_scan_sums);
+                pass.dispatch_workgroups(1, 1, 1);
 
-            // 3. fill — 1 thread per anchor (workgroup_size 64).
-            pass.set_pipeline(&mat_state.pipelines.fill);
-            pass.dispatch_workgroups(wg_x_64, 1, 1);
+                pass.set_pipeline(&mat_state.pipelines.prefix_add_back);
+                pass.dispatch_workgroups(wg_x_256, 1, 1);
+
+                pass.set_pipeline(&mat_state.pipelines.fill);
+                pass.dispatch_workgroups(wg_x_64, 1, 1);
+            }
+            state.queue.submit(Some(encoder.finish()));
         }
-        state.queue.submit(Some(encoder.finish()));
 
         // Enqueue draw descriptor.
         state.user_shader_mesh_draws.push(UserShaderMeshDraw {
@@ -248,6 +261,11 @@ pub(super) fn tick_user_shader_mesh(state: &mut RenderState, frame: &RenderFrame
             raster_g1: mat_state.raster_g1.clone(),
             indirect_buffer: mat_state.indirect_buffer.clone(),
         });
+    }
+
+    if !anchors_unchanged {
+        state.last_uploaded_painted_anchors =
+            Some(std::sync::Arc::clone(&frame.painted_anchors));
     }
 }
 

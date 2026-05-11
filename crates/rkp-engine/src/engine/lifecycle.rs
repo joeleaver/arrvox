@@ -386,22 +386,32 @@ impl EngineState {
                                 tile_local_max,
                                 entity_world,
                             );
-                            // Surface y from painted-leaf bounds —
-                            // stable for flat ground (only changes
-                            // when paint extends to a new y level
-                            // within the tile, which doesn't happen
-                            // for ground-painting).
-                            let painted_world_max_y = entity_world
-                                .map(|m| m.transform_point3(te.aabb.max).y)
-                                .unwrap_or(te.aabb.max.y);
-                            // Stable seed: tile coord + material +
-                            // object_id.
+                            // Surface y = bottom of tile cube. Earlier
+                            // versions used `painted_aabb.max.y`,
+                            // which shifted when paint extended to a
+                            // new y level within the tile. Tile cube
+                            // bottom is determined purely by
+                            // tile_coord × tile_size, so it's stable
+                            // for a static entity even as paint
+                            // extends. For ground painted at the
+                            // tile-aligned bottom this is the surface
+                            // y; up to `tile_size` low otherwise (V1
+                            // approximation; paint-probe lifts this).
+                            let surface_y = tile_world_min.y;
+                            // Stable seed: tile coord + material.
+                            // Dropped `object_id` because `gpu_idx`
+                            // can shuffle on `gpu_objects` rebuild
+                            // (which the paint hot path triggers via
+                            // `gpu_objects_dirty`), which re-randomized
+                            // every blade on every paint stamp. Same
+                            // local tile_coord across entities will
+                            // correlate yaws/jitters; acceptable for
+                            // V1.
                             let seed = rkp_render::user_shader_mesh_pass::anchor_seed([
                                 tile_coord[0] as f32,
                                 tile_coord[1] as f32,
                                 tile_coord[2] as f32,
-                            ]) ^ (mat as u32).wrapping_mul(0x9E37_79B9)
-                                ^ object_id.wrapping_mul(0x85EB_CA6B);
+                            ]) ^ (mat as u32).wrapping_mul(0x9E37_79B9);
                             bucket.push(
                                 rkp_render::user_shader_mesh_pass::AnchorRecord {
                                     tile_min: tile_world_min.to_array(),
@@ -409,7 +419,7 @@ impl EngineState {
                                     tile_max: tile_world_max.to_array(),
                                     leaf_count: te.leaf_count,
                                     object_id,
-                                    surface_y: painted_world_max_y,
+                                    surface_y,
                                     seed,
                                     _pad: [0; 5],
                                 },
