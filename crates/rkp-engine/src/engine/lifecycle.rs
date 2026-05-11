@@ -282,8 +282,12 @@ impl EngineState {
                         object_id,
                         &mut entry.mat_tiles,
                         &mut entry.leaves,
+                        &mut entry.anchors,
                     );
-                    if entry.mat_tiles.is_empty() && entry.leaves.is_empty() {
+                    if entry.mat_tiles.is_empty()
+                        && entry.leaves.is_empty()
+                        && entry.anchors.is_empty()
+                    {
                         self.painted_per_entity.remove(&entity);
                     } else {
                         self.painted_per_entity.insert(entity, entry);
@@ -311,6 +315,10 @@ impl EngineState {
                 let mut new_painted_leaves: Vec<
                     rkp_render::user_shader_emit_pass::EmitLeaf,
                 > = Vec::with_capacity(total_leaves);
+                let mut new_painted_anchors: std::collections::HashMap<
+                    u16,
+                    Vec<rkp_render::user_shader_mesh_pass::AnchorRecord>,
+                > = std::collections::HashMap::new();
                 for (entity, entry) in &self.painted_per_entity {
                     if let Some(&gpu_idx) = self.entity_to_gpu.get(entity) {
                         if !entry.mat_tiles.is_empty() {
@@ -319,8 +327,15 @@ impl EngineState {
                         }
                     }
                     new_painted_leaves.extend_from_slice(&entry.leaves);
+                    for (mat, anchors) in &entry.anchors {
+                        new_painted_anchors
+                            .entry(*mat)
+                            .or_default()
+                            .extend_from_slice(anchors);
+                    }
                 }
                 self.painted_leaves = std::sync::Arc::new(new_painted_leaves);
+                self.painted_anchors = std::sync::Arc::new(new_painted_anchors);
             }
 
             self.painted_materials_paint_epoch = cur_paint;
@@ -974,6 +989,7 @@ impl EngineState {
             user_shader_infos,
             user_shader_entries,
             painted_leaves: std::sync::Arc::clone(&self.painted_leaves),
+            painted_anchors: std::sync::Arc::clone(&self.painted_anchors),
             user_shader_emit_chunk,
             lights: gpu_lights,
             shade_params_base: self.shade_params_base,
@@ -1089,6 +1105,10 @@ fn scan_painted_aabbs(
         std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
     >,
     out_leaves: &mut Vec<rkp_render::user_shader_emit_pass::EmitLeaf>,
+    out_anchors: &mut std::collections::HashMap<
+        u16,
+        Vec<rkp_render::user_shader_mesh_pass::AnchorRecord>,
+    >,
 ) {
     use rkp_core::sparse_octree::{
         is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE,
@@ -1116,6 +1136,10 @@ fn scan_painted_aabbs(
             std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
         >,
         out_leaves: &mut Vec<rkp_render::user_shader_emit_pass::EmitLeaf>,
+        out_anchors: &mut std::collections::HashMap<
+            u16,
+            Vec<rkp_render::user_shader_mesh_pass::AnchorRecord>,
+        >,
     ) {
         use rkp_core::sparse_octree::{
             is_brick, is_leaf, leaf_slot, brick_id, EMPTY_NODE, INTERIOR_NODE,
@@ -1196,6 +1220,47 @@ fn scan_painted_aabbs(
                                         cell_size: base_vs,
                                     },
                                 );
+                                // Per-material anchor record for the
+                                // new mesh-path user-shader pipeline.
+                                // Unpacked normal (so the WGSL vs
+                                // doesn't have to call unpack_oct);
+                                // host_color from the paint overlay
+                                // (0 if no override — downstream uses
+                                // the material's base color).
+                                let color_packed = overlay
+                                    .and_then(|o| o.get(cell))
+                                    .map(|e| e.color_packed)
+                                    .unwrap_or(0);
+                                let host_color = [
+                                    ((color_packed >> 0) & 0xFF) as f32 / 255.0,
+                                    ((color_packed >> 8) & 0xFF) as f32 / 255.0,
+                                    ((color_packed >> 16) & 0xFF) as f32 / 255.0,
+                                    ((color_packed >> 24) & 0xFF) as f32 / 255.0,
+                                ];
+                                let secondary = (attr.material_secondary_blend
+                                    & 0x0FFF)
+                                    as u32;
+                                let blend = ((attr.material_secondary_blend
+                                    >> 12)
+                                    & 0x000F)
+                                    as u32;
+                                let material_blend =
+                                    secondary | (blend << 16);
+                                let world_pos_arr = world_pos.to_array();
+                                let anchor = rkp_render::user_shader_mesh_pass::AnchorRecord {
+                                    world_pos: world_pos_arr,
+                                    leaf_extent: 0.5 * base_vs,
+                                    surface_normal: world_normal.to_array(),
+                                    surface_area: base_vs * base_vs,
+                                    host_color,
+                                    material_id: mat as u32,
+                                    material_blend,
+                                    leaf_slot: cell,
+                                    seed: rkp_render::user_shader_mesh_pass::anchor_seed(
+                                        world_pos_arr,
+                                    ),
+                                };
+                                out_anchors.entry(mat).or_default().push(anchor);
                             }
                         }
                     }
@@ -1266,6 +1331,7 @@ fn scan_painted_aabbs(
                 object_id,
                 out,
                 out_leaves,
+                out_anchors,
             );
         }
     }
@@ -1286,6 +1352,7 @@ fn scan_painted_aabbs(
         object_id,
         out,
         out_leaves,
+        out_anchors,
     );
     let _ = (is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE, BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR, BRICK_CELL_EMPTY);
 }

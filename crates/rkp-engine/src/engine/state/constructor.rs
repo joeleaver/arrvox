@@ -72,6 +72,7 @@ impl EngineState {
             user_shader_registry: rkp_render::shader_composer::UserShaderRegistry::empty(),
             painted_materials: std::collections::HashMap::new(),
             painted_leaves: std::sync::Arc::new(Vec::new()),
+            painted_anchors: std::sync::Arc::new(std::collections::HashMap::new()),
             painted_per_entity: std::collections::HashMap::new(),
             painted_dirty_entities: std::collections::HashSet::new(),
             painted_materials_paint_epoch: 0,

@@ -129,6 +129,13 @@ pub mod user_shader_emit_pass;
 /// atomically appends the instance index to per-tile lists. The
 /// march reads only the current pixel's tile list.
 pub mod user_shader_tile_bin_pass;
+/// V1 mesh-path user-shader pipeline. Replaces the proto / emit /
+/// tile-bin chain with a vertex-shader-driven path:
+/// spawn_count → prefix_sum → fill → indirect draw against own raster.
+/// See `notes/user-shaders-mesh.md`. This module is being built
+/// alongside the old path; the retirement step deletes the older
+/// modules once the new path validates.
+pub mod user_shader_mesh_pass;
 /// Phase 7 — TLAS over instance AABBs for shadow rays (and future
 /// reflections / AO / GI). Session 1 ships only the wire format +
 /// buffer storage; Sessions 2-4 add the CPU builder, GPU upload,

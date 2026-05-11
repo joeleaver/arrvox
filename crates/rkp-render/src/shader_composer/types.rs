@@ -26,6 +26,44 @@ pub struct ParamDef {
     pub range: Option<(f32, f32)>,
 }
 
+/// V1 mesh-path geometry declaration. Parsed from
+/// `// @geometry procedural { vertex_count: N, index_count: M }` or
+/// `// @geometry mesh { asset: "..." }`. Drives how the engine sets up
+/// the per-shader draw call.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GeometryDecl {
+    /// VS reads `@builtin(vertex_index)` and computes geometry inline.
+    /// `vertex_count` is the per-spawn vertex count; non-indexed draw.
+    Procedural { vertex_count: u32 },
+    /// HW-instanced mesh asset. The engine binds the asset's vertex
+    /// buffer; the VS reads vertex attributes the same way the
+    /// proxy-mesh path does. V1: opaque only.
+    Mesh { asset: String },
+}
+
+impl Default for GeometryDecl {
+    fn default() -> Self {
+        // Sensible default: 1 vertex per spawn. Effectively a no-op
+        // shader unless the user overrides `@geometry`.
+        Self::Procedural { vertex_count: 1 }
+    }
+}
+
+/// V1 mesh-path spawn-count cache policy. Drives whether the
+/// engine re-runs spawn_count + prefix_sum + fill every frame or
+/// caches the output until paint / geometry / params change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpawnCountCache {
+    /// Default — cache by `paint_epoch + geometry_epoch + param_epoch`.
+    /// Cheaper for static scenes; refused at compose time if the
+    /// user's `spawn_count` references `FrameContext`.
+    #[default]
+    Static,
+    /// Re-run every frame. Required for distance-LOD shaders that
+    /// read `frame.camera_pos` or time-varying density.
+    PerFrame,
+}
+
 /// Per-shader metadata extracted from `// @<key> ...` comments at the top
 /// of the source file (anything before the first `fn`). All fields are
 /// optional with sensible defaults; missing headers don't error.
@@ -81,6 +119,13 @@ pub struct ShaderMetadata {
     /// before the dispatcher gives up. Uses 1 when absent. Hard
     /// ceiling: 16.
     pub max_emits_per_thread: Option<u32>,
+    /// V1 mesh-path geometry declaration. `None` means the file
+    /// didn't opt into the mesh path (it may still expose the older
+    /// shade/generate/instance_at hooks).
+    pub mesh_geometry: Option<GeometryDecl>,
+    /// V1 mesh-path spawn-count cache policy. Defaults to
+    /// [`SpawnCountCache::Static`].
+    pub spawn_count_cache: SpawnCountCache,
 }
 
 /// One user shader's parsed hook bodies + header metadata. Each `*_text`
@@ -160,6 +205,19 @@ pub struct UserShaderEntry {
     /// `metadata.instance_proto_struct`. Populated alongside the entry
     /// when the shader opts into Option B.
     pub instance_layout: Option<InstanceLayout>,
+    /// V1 mesh-path `fn spawn_count(anchor, frame) -> u32`. Required
+    /// for mesh-path shaders. The orchestration layer copies this
+    /// verbatim into both the raster and compute composed sources.
+    pub spawn_count_text: Option<String>,
+    /// V1 mesh-path `fn spawn_alive(anchor, spawn_idx, frame) -> bool`.
+    /// Optional — default behavior is "always alive". Compute-only.
+    pub spawn_alive_text: Option<String>,
+    /// V1 mesh-path `fn vs(anchor, spawn_idx, vid, frame) -> VsOut`.
+    /// Required for mesh-path shaders.
+    pub vs_text: Option<String>,
+    /// V1 mesh-path `fn fs(in: VsOut) -> FsOut`. Optional — when
+    /// `None`, the engine's default G-buffer pack is used.
+    pub fs_text: Option<String>,
 }
 
 impl UserShaderEntry {
@@ -172,6 +230,15 @@ impl UserShaderEntry {
             || self.generate_text.is_some()
             || self.proto_text.is_some()
             || self.instance_at_text.is_some()
+            || self.vs_text.is_some()
+    }
+
+    /// True iff this shader opts into the V1 mesh-path. Requires a
+    /// `@geometry` directive AND both `spawn_count` + `vs` functions.
+    pub fn is_mesh_path(&self) -> bool {
+        self.metadata.mesh_geometry.is_some()
+            && self.spawn_count_text.is_some()
+            && self.vs_text.is_some()
     }
 }
 

@@ -885,6 +885,226 @@ const USER_TEST_DISPATCH_END: u32 = 0u;
     );
 }
 
+// ── V1 mesh-path tests ─────────────────────────────────────────────
+
+#[test]
+fn parses_mesh_path_shader_minimal() {
+    let src = r#"
+// @geometry procedural { vertex_count: 7 }
+// @param density: f32 = 1.0, range = [0.0, 4.0]
+
+fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 {
+    return u32(ctx_param(0) * anchor.surface_area);
+}
+
+fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> VsOut {
+    var out: VsOut;
+    out.clip_pos = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    return out;
+}
+"#;
+    let tmp = tempfile_dir("mesh_path_minimal");
+    write(&tmp, "test.wgsl", src);
+    let reg = scan_dir(&tmp).unwrap();
+    assert_eq!(reg.entries().len(), 1);
+    let e = &reg.entries()[0];
+    assert!(e.is_mesh_path());
+    assert!(matches!(
+        e.metadata.mesh_geometry,
+        Some(GeometryDecl::Procedural { vertex_count: 7 })
+    ));
+    assert_eq!(e.metadata.spawn_count_cache, SpawnCountCache::Static);
+    assert!(e.spawn_count_text.is_some());
+    assert!(e.vs_text.is_some());
+    assert!(e.spawn_alive_text.is_none());
+    assert!(e.fs_text.is_none());
+}
+
+#[test]
+fn parses_mesh_path_with_per_frame_cache_and_spawn_alive() {
+    let src = r#"
+// @geometry procedural { vertex_count: 12 }
+// @spawn_count_cache per_frame
+// @animated
+
+fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 {
+    return u32(10.0 + frame.time);
+}
+
+fn spawn_alive(anchor: AnchorContext, spawn_idx: u32, frame: FrameContext) -> bool {
+    return spawn_idx < 5u;
+}
+
+fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> VsOut {
+    var out: VsOut;
+    out.clip_pos = vec4<f32>(0.0);
+    return out;
+}
+"#;
+    let tmp = tempfile_dir("mesh_path_per_frame");
+    write(&tmp, "test.wgsl", src);
+    let reg = scan_dir(&tmp).unwrap();
+    let e = &reg.entries()[0];
+    assert_eq!(e.metadata.spawn_count_cache, SpawnCountCache::PerFrame);
+    assert!(e.spawn_alive_text.is_some());
+}
+
+#[test]
+fn parses_mesh_geometry_asset_form() {
+    let src = r#"
+// @geometry mesh { asset: "rock.glb" }
+
+fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 { return 1u; }
+fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> VsOut {
+    var out: VsOut; out.clip_pos = vec4<f32>(0.0); return out;
+}
+"#;
+    let tmp = tempfile_dir("mesh_path_asset");
+    write(&tmp, "test.wgsl", src);
+    let reg = scan_dir(&tmp).unwrap();
+    let e = &reg.entries()[0];
+    match &e.metadata.mesh_geometry {
+        Some(GeometryDecl::Mesh { asset }) => assert_eq!(asset, "rock.glb"),
+        other => panic!("expected mesh, got {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_mesh_path_missing_spawn_count() {
+    let src = r#"
+// @geometry procedural { vertex_count: 1 }
+fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> VsOut {
+    var out: VsOut; out.clip_pos = vec4<f32>(0.0); return out;
+}
+"#;
+    let tmp = tempfile_dir("mesh_path_no_spawn_count");
+    write(&tmp, "test.wgsl", src);
+    let err = scan_dir(&tmp).unwrap_err();
+    match err {
+        ShaderComposerError::Parse { msg, .. } => {
+            assert!(msg.contains("spawn_count"), "got: {msg}");
+        }
+        other => panic!("expected Parse, got {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_mesh_path_missing_vs() {
+    let src = r#"
+// @geometry procedural { vertex_count: 1 }
+fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 { return 1u; }
+"#;
+    let tmp = tempfile_dir("mesh_path_no_vs");
+    write(&tmp, "test.wgsl", src);
+    let err = scan_dir(&tmp).unwrap_err();
+    match err {
+        ShaderComposerError::Parse { msg, .. } => {
+            assert!(msg.contains(" vs"), "got: {msg}");
+        }
+        other => panic!("expected Parse, got {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_mesh_path_hook_without_geometry() {
+    let src = r#"
+fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> VsOut {
+    var out: VsOut; out.clip_pos = vec4<f32>(0.0); return out;
+}
+"#;
+    let tmp = tempfile_dir("mesh_path_no_geometry");
+    write(&tmp, "test.wgsl", src);
+    let err = scan_dir(&tmp).unwrap_err();
+    match err {
+        ShaderComposerError::Parse { msg, .. } => {
+            assert!(msg.contains("@geometry"), "got: {msg}");
+        }
+        other => panic!("expected Parse, got {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_static_cache_with_frame_reference() {
+    // Default cache is static; spawn_count reads frame.time → reject.
+    let src = r#"
+// @geometry procedural { vertex_count: 1 }
+fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 {
+    return u32(frame.time);
+}
+fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> VsOut {
+    var out: VsOut; out.clip_pos = vec4<f32>(0.0); return out;
+}
+"#;
+    let tmp = tempfile_dir("static_cache_frame_ref");
+    write(&tmp, "test.wgsl", src);
+    let err = scan_dir(&tmp).unwrap_err();
+    match err {
+        ShaderComposerError::Parse { msg, .. } => {
+            assert!(msg.contains("per_frame"), "got: {msg}");
+        }
+        other => panic!("expected Parse, got {other:?}"),
+    }
+}
+
+#[test]
+fn compose_mesh_path_splices_user_body_into_both_templates() {
+    // Build a registry by parsing a minimal mesh-path shader, then
+    // compose against fake templates. Verify the user's vs body
+    // lands in the raster output and spawn_count lands in the
+    // compute output; helpers + default fs land where expected.
+    let src = r#"
+// @geometry procedural { vertex_count: 3 }
+
+fn helper_double(x: f32) -> f32 { return x * 2.0; }
+
+fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 {
+    return u32(helper_double(anchor.surface_area));
+}
+
+fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> VsOut {
+    var out: VsOut;
+    out.clip_pos = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    return out;
+}
+"#;
+    let tmp = tempfile_dir("compose_mesh_splice");
+    write(&tmp, "test.wgsl", src);
+    let reg = scan_dir(&tmp).unwrap();
+    let entry = &reg.entries()[0];
+
+    let raster_template = "\
+struct VsOut { @builtin(position) clip_pos: vec4<f32> }
+const USER_BODY_BEGIN: u32 = 0u;
+fn stub_placeholder() {}
+const USER_BODY_END: u32 = 0u;
+";
+    let compute_template = "\
+const USER_BODY_BEGIN: u32 = 0u;
+fn stub_placeholder() {}
+const USER_BODY_END: u32 = 0u;
+";
+    let (raster_wgsl, compute_wgsl) =
+        compose_mesh_path_pipeline_sources(entry, raster_template, compute_template);
+
+    // Raster splice received vs body + helper.
+    assert!(raster_wgsl.contains("fn helper_double"));
+    assert!(raster_wgsl.contains("fn vs("));
+    // Default fs was emitted because user didn't provide one.
+    assert!(raster_wgsl.contains("fn fs(in: VsOut)"));
+    // spawn_count is compute-only; should NOT appear in raster.
+    assert!(!raster_wgsl.contains("fn spawn_count"));
+    // Stub got replaced.
+    assert!(!raster_wgsl.contains("stub_placeholder"));
+
+    // Compute splice received spawn_count body + helper + default
+    // spawn_alive (user omitted it).
+    assert!(compute_wgsl.contains("fn helper_double"));
+    assert!(compute_wgsl.contains("fn spawn_count"));
+    assert!(compute_wgsl.contains("fn spawn_alive"));
+    // vs is raster-only; should NOT appear in compute.
+    assert!(!compute_wgsl.contains("fn vs("));
+}
+
 fn tempfile_dir(label: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!(
         "rkpatch_shader_composer_{label}_{}",

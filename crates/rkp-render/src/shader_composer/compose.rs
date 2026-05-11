@@ -28,7 +28,7 @@
 //! so the same templates can be either text-spliced raw `.wgsl` or
 //! WESL-emitted `.wesl` and the splicer keeps working.
 
-use super::types::{ComposedChunks, UserShaderRegistry};
+use super::types::{ComposedChunks, UserShaderEntry, UserShaderRegistry};
 
 /// Compose the per-pipeline dispatch chunks. Returns identity-default
 /// chunks when the registry is empty. Phase A: emits structurally
@@ -52,6 +52,127 @@ pub fn compose(reg: &UserShaderRegistry) -> ComposedChunks {
 pub fn splice_emit_chunks(template: &str, emit_chunk: &str) -> String {
     splice_const_marker(template, "USER_EMIT_DISPATCH", emit_chunk)
 }
+
+/// V1 mesh-path — compose the per-shader raster + compute WGSL
+/// sources for a single user shader. The orchestration layer caches
+/// the output keyed on `(entry.id, source_hash)` and builds
+/// pipelines via `UserShaderMeshPass::build_pipelines`.
+///
+/// Two outputs (one per shader module):
+///   · `raster` — `user_shader_mesh.wgsl` with the user's body
+///     (helpers + structs + `vs` + optional `fs`) spliced between
+///     `USER_BODY_BEGIN/END`.
+///   · `compute` — `user_shader_mesh_compute.wgsl` with helpers +
+///     structs + `spawn_count` + optional `spawn_alive` spliced.
+///
+/// Helpers and struct decls land in BOTH outputs since the user
+/// might call a helper from `vs` (raster) AND from `spawn_count`
+/// (compute). Per-spawn determinism relies on identical helper
+/// behaviour across the two compilations.
+pub fn compose_mesh_path_pipeline_sources(
+    entry: &UserShaderEntry,
+    raster_template: &str,
+    compute_template: &str,
+) -> (String, String) {
+    let raster_body = build_mesh_path_raster_body(entry);
+    let compute_body = build_mesh_path_compute_body(entry);
+    let raster = splice_const_marker(raster_template, "USER_BODY", &raster_body);
+    let compute = splice_const_marker(compute_template, "USER_BODY", &compute_body);
+    (raster, compute)
+}
+
+fn build_mesh_path_raster_body(entry: &UserShaderEntry) -> String {
+    let mut out = String::new();
+    out.push_str("// ── user shader (mesh-path raster): ");
+    out.push_str(&entry.name);
+    out.push_str(" ──\n");
+    for sd in &entry.struct_decls {
+        out.push_str(sd);
+        out.push('\n');
+    }
+    for helper in &entry.helpers {
+        out.push_str(helper);
+        out.push('\n');
+    }
+    if let Some(text) = &entry.vs_text {
+        out.push_str(text);
+        out.push('\n');
+    }
+    // Only emit user fs if defined. When absent, the template's
+    // default fs body stays in place (the splicer leaves the section
+    // unchanged when the chunk is empty, but here we always splice,
+    // so we must include the default).
+    if let Some(text) = &entry.fs_text {
+        out.push_str(text);
+        out.push('\n');
+    } else {
+        out.push_str(DEFAULT_FS_BODY);
+        out.push('\n');
+    }
+    out
+}
+
+fn build_mesh_path_compute_body(entry: &UserShaderEntry) -> String {
+    let mut out = String::new();
+    out.push_str("// ── user shader (mesh-path compute): ");
+    out.push_str(&entry.name);
+    out.push_str(" ──\n");
+    for sd in &entry.struct_decls {
+        out.push_str(sd);
+        out.push('\n');
+    }
+    for helper in &entry.helpers {
+        out.push_str(helper);
+        out.push('\n');
+    }
+    if let Some(text) = &entry.spawn_count_text {
+        out.push_str(text);
+        out.push('\n');
+    }
+    if let Some(text) = &entry.spawn_alive_text {
+        out.push_str(text);
+        out.push('\n');
+    } else {
+        out.push_str(DEFAULT_SPAWN_ALIVE_BODY);
+        out.push('\n');
+    }
+    out
+}
+
+/// Default `fs` body matching the engine skeleton's stub. The
+/// composer always splices the USER_BODY region (it can't selectively
+/// leave parts untouched), so when the user omits `fs` we re-emit
+/// the engine default here.
+const DEFAULT_FS_BODY: &str = r#"fn fs(in: VsOut) -> FsOut {
+    let n_world = normalize(in.world_normal);
+    let primary   = in.material_packed & 0xFFFFu;
+    let secondary = (in.material_packed >> 16u) & 0xFFFu;
+    let blend_clamped = clamp(in.blend_f, 0.0, 1.0);
+    let blend4 = u32(blend_clamped * 15.0 + 0.5);
+    let blend8 = (blend4 << 4u) | blend4;
+    let cr8 = u32(clamp(in.color_rgb.r, 0.0, 1.0) * 255.0 + 0.5);
+    let cg8 = u32(clamp(in.color_rgb.g, 0.0, 1.0) * 255.0 + 0.5);
+    let cb8 = u32(clamp(in.color_rgb.b, 0.0, 1.0) * 255.0 + 0.5);
+    let cr5 = (cr8 * 31u) / 255u;
+    let cg6 = (cg8 * 63u) / 255u;
+    let cb5 = (cb8 * 31u) / 255u;
+    let color_rgb565 = cr5 | (cg6 << 5u) | (cb5 << 11u);
+    let packed_r = primary | (secondary << 16u);
+    let packed_g = (blend8 & 0xFFu) | ((in.intensity & 0xFFu) << 8u) | (color_rgb565 << 16u);
+    let hit_distance = length(in.world_pos - camera.position.xyz);
+    var out: FsOut;
+    out.position = vec4<f32>(in.world_pos, hit_distance);
+    out.pick     = 0xFFFFFFFEu;
+    out.normal   = vec4<f32>(n_world, 1.0);
+    out.material = vec2<u32>(packed_r, packed_g);
+    out.glass    = vec2<u32>(0u, 0u);
+    return out;
+}"#;
+
+/// Default `spawn_alive` body — always true. Same rationale as
+/// `DEFAULT_FS_BODY`.
+const DEFAULT_SPAWN_ALIVE_BODY: &str =
+    "fn spawn_alive(anchor: AnchorContext, spawn_idx: u32, frame: FrameContext) -> bool { return true; }";
 
 /// Splice the composer's `instance_at` chunk into a host-side WGSL
 /// template (`octree_march.wgsl` / `rkp_shadow_trace.wgsl`) between

@@ -51,6 +51,15 @@ pub(crate) struct EntityPaintedCache {
         std::collections::HashMap<[i32; 3], PaintedTileEntry>,
     >,
     pub leaves: Vec<rkp_render::user_shader_emit_pass::EmitLeaf>,
+    /// Per-material anchor records for the V1 mesh-path user shader.
+    /// Same data as `leaves` but partitioned by material_id and shaped
+    /// for direct GPU upload (`AnchorRecord` is 64 B, std430-compatible).
+    /// Flat `painted_anchors` on `EngineState` is the concatenation of
+    /// every entry's contents.
+    pub anchors: std::collections::HashMap<
+        u16,
+        Vec<rkp_render::user_shader_mesh_pass::AnchorRecord>,
+    >,
 }
 
 use crate::camera::CameraControlState;
@@ -266,8 +275,20 @@ pub(crate) struct EngineState {
     /// At paint scale (millions of leaves) the clone-per-frame was
     /// the dominant CPU cost in the snapshot build.
     pub(crate) painted_leaves: std::sync::Arc<Vec<rkp_render::user_shader_emit_pass::EmitLeaf>>,
+    /// Per-material anchor records for the V1 mesh-path user shader.
+    /// Each material with painted leaves gets its own anchor list —
+    /// the new pipeline runs once per material (one set of compute +
+    /// raster passes, sharing the per-shader pipeline objects).
+    /// Rebuilt whenever `painted_materials` is rebuilt.
+    pub(crate) painted_anchors: std::sync::Arc<
+        std::collections::HashMap<
+            u16,
+            Vec<rkp_render::user_shader_mesh_pass::AnchorRecord>,
+        >,
+    >,
     /// Per-entity walk results. The flat `painted_materials` /
-    /// `painted_leaves` above are derived views over this map's values.
+    /// `painted_leaves` / `painted_anchors` above are derived views
+    /// over this map's values.
     /// Mutated by the lifecycle walk only — `apply_paint_stamp` drives
     /// updates by adding the painted entity to
     /// [`Self::painted_dirty_entities`].

@@ -29,7 +29,8 @@ use crate::instance_proto::parse_instance_layout;
 use super::hash::compute_registry_hash;
 use super::lib_symbols::is_lib_symbol;
 use super::types::{
-    ParamDef, ShaderComposerError, ShaderMetadata, UserShaderEntry, UserShaderRegistry,
+    GeometryDecl, ParamDef, ShaderComposerError, ShaderMetadata, SpawnCountCache,
+    UserShaderEntry, UserShaderRegistry,
 };
 
 /// Scan a directory for `*.wgsl` files and build a registry. Files are
@@ -123,6 +124,10 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
         instance_at_text: None,
         struct_decls: Vec::new(),
         instance_layout: None,
+        spawn_count_text: None,
+        spawn_alive_text: None,
+        vs_text: None,
+        fs_text: None,
     };
 
     // Walk the file linearly, dispatching on whichever keyword (`fn` or
@@ -198,6 +203,25 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
                         path: path.to_path_buf(),
                         line: line_of(source, name_start),
                         msg: format!("hook `{hook}` defined twice in this file"),
+                    });
+                }
+                *slot = Some(fn_text);
+            } else if matches!(fn_name, "vs" | "fs" | "spawn_count" | "spawn_alive") {
+                // V1 mesh-path hooks — bare names (no `user_<stem>_`
+                // prefix). Each shader gets its own pipeline so no
+                // dispatch-switch renaming is needed.
+                let slot = match fn_name {
+                    "vs" => &mut entry.vs_text,
+                    "fs" => &mut entry.fs_text,
+                    "spawn_count" => &mut entry.spawn_count_text,
+                    "spawn_alive" => &mut entry.spawn_alive_text,
+                    _ => unreachable!(),
+                };
+                if slot.is_some() {
+                    return Err(ShaderComposerError::Parse {
+                        path: path.to_path_buf(),
+                        line: line_of(source, name_start),
+                        msg: format!("mesh-path hook `{fn_name}` defined twice in this file"),
                     });
                 }
                 *slot = Some(fn_text);
@@ -378,8 +402,186 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
         }
     }
 
+    // Mesh-path completeness check. `@geometry` opts in; once opted
+    // in, both `spawn_count` and `vs` are required.
+    if entry.metadata.mesh_geometry.is_some() {
+        if entry.spawn_count_text.is_none() {
+            return Err(ShaderComposerError::Parse {
+                path: path.to_path_buf(),
+                line: 0,
+                msg: "@geometry declared but `fn spawn_count(anchor, frame) -> u32` is missing".to_string(),
+            });
+        }
+        if entry.vs_text.is_none() {
+            return Err(ShaderComposerError::Parse {
+                path: path.to_path_buf(),
+                line: 0,
+                msg: "@geometry declared but `fn vs(anchor, spawn_idx, vid, frame) -> VsOut` is missing".to_string(),
+            });
+        }
+    } else if entry.spawn_count_text.is_some()
+        || entry.spawn_alive_text.is_some()
+        || entry.vs_text.is_some()
+        || entry.fs_text.is_some()
+    {
+        return Err(ShaderComposerError::Parse {
+            path: path.to_path_buf(),
+            line: 0,
+            msg: "mesh-path hook (vs / fs / spawn_count / spawn_alive) defined without `// @geometry` directive".to_string(),
+        });
+    }
+
+    // Static-cache + per-frame reference is contradictory. Reject
+    // shaders whose spawn_count body references `frame.` when the
+    // cache is declared static — they'd silently use stale values.
+    if entry.metadata.spawn_count_cache == SpawnCountCache::Static {
+        if let Some(text) = &entry.spawn_count_text {
+            if references_frame_context(text) {
+                return Err(ShaderComposerError::Parse {
+                    path: path.to_path_buf(),
+                    line: 0,
+                    msg: "`fn spawn_count` references `frame.` but @spawn_count_cache is `static` — \
+                          declare `@spawn_count_cache per_frame` to read time-varying frame fields"
+                        .to_string(),
+                });
+            }
+        }
+    }
+
     let _ = entry.has_any_hook(); // entries with zero hooks are legal
     Ok(entry)
+}
+
+/// Parse a `@geometry procedural { vertex_count: N }` or
+/// `@geometry mesh { asset: "path" }` directive body.
+fn parse_geometry_decl(
+    path: &Path,
+    line_no: usize,
+    args: &str,
+) -> Result<GeometryDecl, ShaderComposerError> {
+    let trimmed = args.trim();
+    if let Some(body) = trimmed
+        .strip_prefix("procedural")
+        .map(str::trim_start)
+        .and_then(|s| s.strip_prefix('{').and_then(|b| b.strip_suffix('}')))
+    {
+        // body: "vertex_count: N" (V1 — index_count deferred)
+        let mut vertex_count: Option<u32> = None;
+        for kv in body.split(',') {
+            let kv = kv.trim();
+            if kv.is_empty() {
+                continue;
+            }
+            let (k, v) = kv.split_once(':').ok_or_else(|| ShaderComposerError::Parse {
+                path: path.to_path_buf(),
+                line: line_no,
+                msg: format!("@geometry procedural body: expected `key: value`, got `{kv}`"),
+            })?;
+            let k = k.trim();
+            let v = v.trim();
+            match k {
+                "vertex_count" => {
+                    let n: u32 = v.parse().map_err(|_| ShaderComposerError::Parse {
+                        path: path.to_path_buf(),
+                        line: line_no,
+                        msg: format!("@geometry vertex_count expects a u32, got `{v}`"),
+                    })?;
+                    if n == 0 || n > 4096 {
+                        return Err(ShaderComposerError::Parse {
+                            path: path.to_path_buf(),
+                            line: line_no,
+                            msg: format!(
+                                "@geometry vertex_count must be in 1..=4096 (got {n}); larger \
+                                 procedural meshes should use `@geometry mesh {{ asset: ... }}` instead"
+                            ),
+                        });
+                    }
+                    vertex_count = Some(n);
+                }
+                other => {
+                    return Err(ShaderComposerError::Parse {
+                        path: path.to_path_buf(),
+                        line: line_no,
+                        msg: format!("unknown @geometry procedural key `{other}`"),
+                    });
+                }
+            }
+        }
+        let vertex_count = vertex_count.ok_or_else(|| ShaderComposerError::Parse {
+            path: path.to_path_buf(),
+            line: line_no,
+            msg: "@geometry procedural requires `vertex_count: N`".to_string(),
+        })?;
+        return Ok(GeometryDecl::Procedural { vertex_count });
+    }
+    if let Some(body) = trimmed
+        .strip_prefix("mesh")
+        .map(str::trim_start)
+        .and_then(|s| s.strip_prefix('{').and_then(|b| b.strip_suffix('}')))
+    {
+        // body: `asset: "path"`
+        let body = body.trim();
+        let (k, v) = body.split_once(':').ok_or_else(|| ShaderComposerError::Parse {
+            path: path.to_path_buf(),
+            line: line_no,
+            msg: "@geometry mesh body: expected `asset: \"path\"`".to_string(),
+        })?;
+        if k.trim() != "asset" {
+            return Err(ShaderComposerError::Parse {
+                path: path.to_path_buf(),
+                line: line_no,
+                msg: format!("@geometry mesh: unknown key `{}`", k.trim()),
+            });
+        }
+        let v = v.trim();
+        let asset = v
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .ok_or_else(|| ShaderComposerError::Parse {
+                path: path.to_path_buf(),
+                line: line_no,
+                msg: format!("@geometry mesh asset must be a quoted string, got `{v}`"),
+            })?
+            .to_string();
+        if asset.is_empty() {
+            return Err(ShaderComposerError::Parse {
+                path: path.to_path_buf(),
+                line: line_no,
+                msg: "@geometry mesh asset path is empty".to_string(),
+            });
+        }
+        return Ok(GeometryDecl::Mesh { asset });
+    }
+    Err(ShaderComposerError::Parse {
+        path: path.to_path_buf(),
+        line: line_no,
+        msg: format!(
+            "@geometry expects `procedural {{ vertex_count: N }}` or `mesh {{ asset: \"path\" }}`, got `{args}`"
+        ),
+    })
+}
+
+/// Heuristic check: does `text` reference the `frame` uniform? Used to
+/// reject `@spawn_count_cache static` shaders whose spawn_count reads
+/// frame-dependent state (which the static cache would freeze stale).
+fn references_frame_context(text: &str) -> bool {
+    // The `frame` parameter is bound in the engine prelude as an
+    // identifier in scope; user code references `frame.time`,
+    // `frame.wind_strength`, etc. A token-prefix check covers all
+    // realistic cases without an AST.
+    let mut search = text;
+    while let Some(idx) = search.find("frame") {
+        let before_ok = idx == 0
+            || !search.as_bytes()[idx - 1].is_ascii_alphanumeric()
+                && search.as_bytes()[idx - 1] != b'_';
+        let after = idx + "frame".len();
+        let after_ok = after < search.len() && search.as_bytes()[after] == b'.';
+        if before_ok && after_ok {
+            return true;
+        }
+        search = &search[idx + "frame".len()..];
+    }
+    false
 }
 
 /// Pull the struct's name out of a captured `struct <Name> { ... }` block.
@@ -517,6 +719,31 @@ fn parse_metadata(
                     });
                 }
                 md.max_emits_per_thread = Some(v);
+            }
+            "geometry" => {
+                if md.mesh_geometry.is_some() {
+                    return Err(ShaderComposerError::Parse {
+                        path: path.to_path_buf(),
+                        line: line_no,
+                        msg: "@geometry declared twice in this file".to_string(),
+                    });
+                }
+                md.mesh_geometry = Some(parse_geometry_decl(path, line_no, args)?);
+            }
+            "spawn_count_cache" => {
+                md.spawn_count_cache = match args.trim() {
+                    "static" => SpawnCountCache::Static,
+                    "per_frame" => SpawnCountCache::PerFrame,
+                    other => {
+                        return Err(ShaderComposerError::Parse {
+                            path: path.to_path_buf(),
+                            line: line_no,
+                            msg: format!(
+                                "@spawn_count_cache expects `static` or `per_frame`, got `{other}`"
+                            ),
+                        });
+                    }
+                };
             }
             other => {
                 return Err(ShaderComposerError::Parse {

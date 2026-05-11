@@ -166,6 +166,18 @@ pub struct RenderFrame {
     /// across frames.
     pub painted_leaves: std::sync::Arc<Vec<rkp_render::user_shader_emit_pass::EmitLeaf>>,
 
+    /// Per-material anchor records for the V1 mesh-path user-shader
+    /// pipeline. Each material with painted leaves carries its own
+    /// anchor list (compute + raster dispatch once per material per
+    /// frame). Same `Arc` sharing as `painted_leaves` — sim rebuilds
+    /// the inner map only on paint/geometry-epoch change.
+    pub painted_anchors: std::sync::Arc<
+        std::collections::HashMap<
+            u16,
+            Vec<rkp_render::user_shader_mesh_pass::AnchorRecord>,
+        >,
+    >,
+
     /// Composed `emit` chunk — per-shader `instance_at` +
     /// `inst_world_matrix` bodies + dispatch switch, spliced into
     /// `user_shader_emit.wgsl` between its USER_EMIT_DISPATCH markers.
