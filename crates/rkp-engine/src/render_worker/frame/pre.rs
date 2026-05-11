@@ -8,12 +8,10 @@
 use rkp_render::rkp_scene::FrameUpload;
 
 use crate::render_frame::RenderFrame;
-use crate::viewport::ViewportId;
 
 use super::super::frame_helpers::{compute_tlas_scene_aabb, prepare_shadow_maps};
 use super::super::state::RenderState;
 use super::super::user_shader_mesh_tick::tick_user_shader_mesh;
-use super::super::user_shader_tick::{tick_emit_pass, tick_instance_pipeline};
 
 use super::PreFrameOutput;
 
@@ -76,26 +74,6 @@ pub(super) fn run_pre_frame(
         vr.shade.reload_user_shaders(
             &state.device,
             &frame.user_shader_shade_chunk,
-            frame.user_shader_source_hash,
-        );
-        // Host march + shadow shaders no longer splice an `instance_at`
-        // descent chunk (the band-cell path is gone). Pass an empty
-        // chunk so the splice is a no-op for unchanged source. Once
-        // the new emit pass lands, reloading happens on the emit pass
-        // itself, not on the consumer templates.
-        vr.march.reload_user_shaders(
-            &state.device,
-            "",
-            frame.user_shader_source_hash,
-        );
-        vr.shadow_trace.reload_user_shaders(
-            &state.device,
-            "",
-            frame.user_shader_source_hash,
-        );
-        vr.shadow_map.reload_user_shaders(
-            &state.device,
-            "",
             frame.user_shader_source_hash,
         );
         vr.shade.upload_shader_params(
@@ -209,16 +187,8 @@ pub(super) fn run_pre_frame(
 
     let p_t_uploads = pre_start.elapsed();
 
-    // 1.7. Per-frame proto bake. Bakes each registered instance
-    //      shader's prototype octree (canonical [0,1]³) into the
-    //      shared host pool tail; emit pass + march descend it as a
-    //      regular asset. Returns one `RkpGpuAsset` per shader_id so
-    //      emitted blade instances can reference it.
-    let inst_result = tick_instance_pipeline(state, frame);
-
     // 1.7a. Upload `instance_overlay_buffer` for the per-instance
-    //       paint cursor (Phase 3). Independent of the proto bake;
-    //       just needs to land before any consumer reads.
+    //       paint cursor (Phase 3).
     if !frame.gpu_instance_overlays.is_empty() {
         let overlay_bytes: &[u8] = bytemuck::cast_slice(&frame.gpu_instance_overlays);
         state.renderer.scene.upload_instance_overlay(
@@ -226,36 +196,8 @@ pub(super) fn run_pre_frame(
         );
     }
 
-    let mut combined_assets: Vec<rkp_render::rkp_gpu_object::RkpGpuAsset>;
-    // Splice proto assets onto the host's persistent set. Emitted
-    // blade instances (written by the user-shader emit pass below)
-    // reference these by `asset_id` — the proto's absolute index in
-    // the combined assets buffer is `frame.gpu_assets.len() + idx`.
-    let proto_asset_id_base = frame.gpu_assets.len() as u32;
-    let (assets_for_upload, instances_for_upload): (
-        &[rkp_render::rkp_gpu_object::RkpGpuAsset],
-        &[rkp_render::rkp_gpu_object::RkpGpuInstance],
-    ) = if inst_result.is_empty() {
-        (frame.gpu_assets.as_slice(), gpu_instances)
-    } else {
-        combined_assets = Vec::with_capacity(
-            frame.gpu_assets.len() + inst_result.len(),
-        );
-        combined_assets.extend_from_slice(&frame.gpu_assets);
-        combined_assets.extend_from_slice(&inst_result);
-        (combined_assets.as_slice(), gpu_instances)
-    };
-
-    let p_t_proto = pre_start.elapsed();
-
-    // 1.7c. User-shader emit pass. Reads `frame.painted_leaves`,
-    //       runs each shader's `instance_at` / `inst_world_matrix`
-    //       hooks, writes `RkpInstance` records into the scene's
-    //       user_shader_instance_buffer. The host march reads those
-    //       records in Task #10 (currently the buffer is written but
-    //       nothing consumes it; engine logs the count behind
-    //       `RKP_MARCH_STATS=1` for verification).
-    tick_emit_pass(state, frame, &inst_result, proto_asset_id_base);
+    let assets_for_upload: &[rkp_render::rkp_gpu_object::RkpGpuAsset] = frame.gpu_assets.as_slice();
+    let instances_for_upload: &[rkp_render::rkp_gpu_object::RkpGpuInstance] = gpu_instances;
 
     // 1.7d. V1 mesh-path user-shader orchestration. Reads
     //       `frame.painted_anchors`, dispatches per-material
@@ -267,7 +209,7 @@ pub(super) fn run_pre_frame(
     //       draws happen).
     tick_user_shader_mesh(state, frame);
 
-    let p_t_emit = pre_start.elapsed();
+    let p_t_mesh = pre_start.elapsed();
 
     // 1b. Per-frame upload. `gpu_instances` here may be interpolated
     //     between the last two sim snapshots (see `interpolate_instances`),
@@ -296,8 +238,7 @@ pub(super) fn run_pre_frame(
     //
     //      Note: must run AFTER `upload_frame` because the host
     //      assembly pass reads `state.renderer.scene.objects_buffer`
-    //      / `assets_buffer`. (Tile-cull scratch was populated
-    //      earlier by `tick_instance_pipeline`.)
+    //      / `assets_buffer`.
     let scene_aabb = compute_tlas_scene_aabb(
         instances_for_upload,
         assets_for_upload,
@@ -317,8 +258,8 @@ pub(super) fn run_pre_frame(
     let p_t_upload_frame = pre_start.elapsed();
 
     // 1b''. Phase 7c — fire the GPU TLAS build. Inputs:
-    //   * tile-cull scratch buffer (populated earlier by
-    //     `tick_instance_pipeline`)
+    //   * tile-cull scratch buffer (populated by Phase 6 tile-cull
+    //     AABB pass)
     //   * scene's host-instance and host-asset buffers (just
     //     populated by `upload_frame`)
     //   * scene AABB (CPU-derived above)
@@ -427,31 +368,18 @@ pub(super) fn run_pre_frame(
         }
     }
 
-    // The user-shader BFS path (Phase C) is gone — only persistent
-    // host instances live in the buffer right now. Phase 9's emit
-    // pass will append blade `RkpInstance`s here too; the layout
-    // shape (persistent + transient) stays.
     let transient_indices: Vec<u32> = Vec::new();
     let object_count = gpu_instances.len() as u32;
-
-    // Upper bound on emitted instances. The shader threshold-checks
-    // against the actual count, so over-shooting is safe (just wastes
-    // a few workgroups).
-    const MAX_EMITS_PER_LEAF: u32 = 8;
-    let user_shader_instance_count = (frame.painted_leaves.len() as u32)
-        .saturating_mul(MAX_EMITS_PER_LEAF)
-        .min(rkp_render::rkp_scene::USER_SHADER_INSTANCE_CAPACITY);
 
     let p_t_skin = pre_start.elapsed();
     if pre_profile {
         let to_ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
         eprintln!(
-            "[render.pre] setup={:.2} uploads={:.2} proto={:.2} emit={:.2} upload_frame={:.2} tlas={:.2} shadow={:.2} skin={:.2} | total={:.2}",
+            "[render.pre] setup={:.2} uploads={:.2} mesh_user_shader={:.2} upload_frame={:.2} tlas={:.2} shadow={:.2} skin={:.2} | total={:.2}",
             to_ms(p_t_setup),
             to_ms(p_t_uploads) - to_ms(p_t_setup),
-            to_ms(p_t_proto) - to_ms(p_t_uploads),
-            to_ms(p_t_emit) - to_ms(p_t_proto),
-            to_ms(p_t_upload_frame) - to_ms(p_t_emit),
+            to_ms(p_t_mesh) - to_ms(p_t_uploads),
+            to_ms(p_t_upload_frame) - to_ms(p_t_mesh),
             to_ms(p_t_tlas) - to_ms(p_t_upload_frame),
             to_ms(p_t_shadow_prepare) - to_ms(p_t_tlas),
             to_ms(p_t_skin) - to_ms(p_t_shadow_prepare),
@@ -464,6 +392,5 @@ pub(super) fn run_pre_frame(
         asset_count,
         scene_aabb,
         shadow_map_enabled,
-        user_shader_instance_count,
     }
 }

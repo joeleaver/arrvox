@@ -8,9 +8,6 @@
 //! - [`frame`] — `render_one_frame` orchestration (~800 lines).
 //! - [`frame_helpers`] — small frame helpers (tile-list splice, AABB
 //!   transforms, shadow-map setup).
-//! - [`user_shader_tick`] — per-frame user-shader bake +
-//!   region-classification dispatch (`tick_instance_pipeline`,
-//!   `run_user_shader_geom`) + cache-key hashing.
 //!
 //! Public API surface (`crate::render_worker::*`) is stable: only
 //! `RenderWorker` + `RenderInbox` are exposed externally.
@@ -79,6 +76,5 @@ mod frame_helpers;
 mod loop_thread;
 mod state;
 mod user_shader_mesh_tick;
-mod user_shader_tick;
 
 pub use state::{FrameCallback, RenderInbox, RenderWorker};

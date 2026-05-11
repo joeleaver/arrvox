@@ -35,15 +35,6 @@ pub(super) fn compute_registry_hash(entries: &[UserShaderEntry]) -> u64 {
         for hook in [
             &e.shade_text,
             &e.generate_text,
-            &e.proto_text,
-            &e.inst_aabb_text,
-            &e.inst_to_local_text,
-            &e.inst_world_matrix_text,
-            &e.instance_at_text,
-            // V1 mesh-path hooks. Order matters — appending lets old
-            // entries hash to the same value (zero-bytes for missing
-            // hooks) so this addition is hash-stable for non-mesh
-            // shaders.
             &e.spawn_count_text,
             &e.spawn_alive_text,
             &e.vs_text,
@@ -86,10 +77,6 @@ pub(super) fn compute_registry_hash(entries: &[UserShaderEntry]) -> u64 {
         buf.push(0);
         if let Some(s) = e.metadata.tile_size {
             buf.extend_from_slice(&s.to_le_bytes());
-        }
-        buf.push(0);
-        if let Some(name) = &e.metadata.instance_proto_struct {
-            buf.extend_from_slice(name.as_bytes());
         }
         buf.push(0);
         // V1 mesh-path manifest. Appending keeps the hash stable for

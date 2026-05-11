@@ -37,8 +37,8 @@ impl PaintedTileEntry {
 
 /// Per-entity painted-material walk cache. Populated by
 /// `scan_painted_aabbs` in `lifecycle::tick`'s incremental walk; the
-/// flat `painted_materials` + `painted_leaves` views on `EngineState`
-/// are concatenations of every entry's contents.
+/// flat `painted_materials` view on `EngineState` is the concatenation
+/// of every entry's contents.
 ///
 /// Keeping the per-entity result around lets the walk skip entities
 /// that haven't been touched since their last cache build — drag-paint
@@ -50,7 +50,6 @@ pub(crate) struct EntityPaintedCache {
         u16,
         std::collections::HashMap<[i32; 3], PaintedTileEntry>,
     >,
-    pub leaves: Vec<rkp_render::user_shader_emit_pass::EmitLeaf>,
 }
 
 use crate::camera::CameraControlState;
@@ -256,16 +255,6 @@ pub(crate) struct EngineState {
             std::collections::HashMap<[i32; 3], PaintedTileEntry>,
         >,
     >,
-    /// Flat per-leaf list collected alongside `painted_materials` for
-    /// the user-shader emit pass. One record per painted-leaf cell
-    /// whose material has an `instance_at` hook. World-space pos +
-    /// normal, ready to ship to the GPU emit dispatch each frame.
-    /// Rebuilt whenever `painted_materials` is rebuilt.
-    /// Wrapped in `Arc` so each per-frame snapshot can ship a
-    /// reference-counted handle instead of memcpy'ing the whole vec.
-    /// At paint scale (millions of leaves) the clone-per-frame was
-    /// the dominant CPU cost in the snapshot build.
-    pub(crate) painted_leaves: std::sync::Arc<Vec<rkp_render::user_shader_emit_pass::EmitLeaf>>,
     /// Per-material anchor records for the V1 mesh-path user shader.
     /// Each material with painted leaves gets its own anchor list —
     /// the new pipeline runs once per material (one set of compute +
@@ -286,8 +275,7 @@ pub(crate) struct EngineState {
         std::collections::HashMap<(u32, u32, u32, u32, u16), u32>,
     >,
     /// Per-entity walk results. The flat `painted_materials` /
-    /// `painted_leaves` / `painted_anchors` above are derived views
-    /// over this map's values.
+    /// `painted_anchors` above are derived views over this map's values.
     /// Mutated by the lifecycle walk only — `apply_paint_stamp` drives
     /// updates by adding the painted entity to
     /// [`Self::painted_dirty_entities`].

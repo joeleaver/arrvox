@@ -48,20 +48,6 @@ pub struct ViewportRenderer {
 
     // ── Per-VR resolution-coupled passes ───────────────────────────
     pub march: OctreeMarchPass,
-    /// Per-viewport tile-binning pass for user-shader emitted instances.
-    /// Resolution-coupled because tile count = (W/8) × (H/8).
-    pub user_shader_tile_bin: crate::user_shader_tile_bin_pass::UserShaderTileBinPass,
-    /// Per-tile counters for emitted-instance binning (atomic u32 each,
-    /// cleared to 0 each frame).
-    pub user_shader_tile_counts_buffer: wgpu::Buffer,
-    /// Per-tile flat instance-index lists. Sized
-    /// `tile_count × MAX_INSTANCES_PER_TILE × 4 bytes`.
-    pub user_shader_tile_lists_buffer: wgpu::Buffer,
-    /// Cached tile-bin bind group; rebuilt on resize.
-    pub user_shader_tile_bin_bg: Option<wgpu::BindGroup>,
-    /// Tile counts on the X / Y axes (`W.div_ceil(8)` / `H.div_ceil(8)`).
-    pub user_shader_tile_count_x: u32,
-    pub user_shader_tile_count_y: u32,
     /// Live CSG preview for the build viewport. Writes the same G-buffer
     /// as `march`, so downstream passes don't care which one ran — only
     /// one of the two executes per frame, chosen by the host via
@@ -445,39 +431,9 @@ impl ViewportRenderer {
         let mut march = OctreeMarchPass::new(device, &renderer.scene.bind_group_layout);
         march.set_materials(device, &renderer.materials_buffer);
         march.set_lights(device, &renderer.lights_buffer);
-        march.set_user_shader_emit_buffers(
-            device,
-            &renderer.scene.user_shader_instance_buffer,
-            &renderer.scene.user_shader_instance_count_buffer,
-            &renderer.scene.user_shader_instance_aabbs_buffer,
-            &renderer.scene.user_shader_instance_inv_world_buffer,
-        );
         march.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view, &gbuffer.glass_view, &gbuffer.leaf_slot_view);
         // shader_params binding deferred — `shade` owns the buffer
         // and isn't constructed yet. Wired below after `shade::new`.
-
-        // Tile-bin pass + per-tile buffers.
-        let user_shader_tile_bin =
-            crate::user_shader_tile_bin_pass::UserShaderTileBinPass::new(device);
-        let (
-            user_shader_tile_counts_buffer,
-            user_shader_tile_lists_buffer,
-            user_shader_tile_count_x,
-            user_shader_tile_count_y,
-        ) = make_tile_bin_buffers(device, width, height);
-        let user_shader_tile_bin_bg = Some(user_shader_tile_bin.build_bind_group(
-            device,
-            &renderer.scene.user_shader_instance_aabbs_buffer,
-            &camera_buffer,
-            &user_shader_tile_counts_buffer,
-            &user_shader_tile_lists_buffer,
-            &renderer.scene.user_shader_instance_count_buffer,
-        ));
-        march.set_user_shader_tile_bin_buffers(
-            device,
-            &user_shader_tile_counts_buffer,
-            &user_shader_tile_lists_buffer,
-        );
 
         // Procedural CSG raymarch — alternative primary-visibility pass
         // for the build viewport. Wired to the same per-VR camera + gbuffer
@@ -700,12 +656,6 @@ impl ViewportRenderer {
         Self {
             camera_buffer, scene_bind_group, scene_epoch, lights_materials_epoch,
             march, proc_raymarch, proc_outline, proc_ghost,
-            user_shader_tile_bin,
-            user_shader_tile_counts_buffer,
-            user_shader_tile_lists_buffer,
-            user_shader_tile_bin_bg,
-            user_shader_tile_count_x,
-            user_shader_tile_count_y,
             shadow_trace, shadow_map, ssao, shade, glass, volumetric, god_rays,
             gbuffer, pick_texture, pick_view, bloom, bloom_composite, tone_map,
             composite_texture, composite_view,
@@ -1801,12 +1751,6 @@ impl ViewportRenderer {
         );
     }
 
-    /// Reset per-tile counts to 0. Call BEFORE the tile-bin dispatch
-    /// each frame; otherwise stale counts from the previous frame leak.
-    pub fn clear_user_shader_tile_counts(&self, encoder: &mut wgpu::CommandEncoder) {
-        encoder.clear_buffer(&self.user_shader_tile_counts_buffer, 0, None);
-    }
-
     /// Upload this viewport's camera uniform.
     pub fn upload_camera(&self, queue: &wgpu::Queue, camera: &CameraUniforms) {
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
@@ -1820,16 +1764,6 @@ impl ViewportRenderer {
         if scene_now != self.scene_epoch {
             self.scene_bind_group = renderer.scene.build_bind_group(device, &self.camera_buffer);
             self.scene_epoch = scene_now;
-            // The user-shader instance buffers live on the scene; if
-            // the scene buffers epoch bumped they may have moved too.
-            // Re-wire so march's params bg points at the live handles.
-            self.march.set_user_shader_emit_buffers(
-                device,
-                &renderer.scene.user_shader_instance_buffer,
-                &renderer.scene.user_shader_instance_count_buffer,
-                &renderer.scene.user_shader_instance_aabbs_buffer,
-                &renderer.scene.user_shader_instance_inv_world_buffer,
-            );
         }
         let lm_now = renderer.lights_materials_epoch();
         if lm_now != self.lights_materials_epoch {
@@ -1904,28 +1838,6 @@ impl ViewportRenderer {
         // just moved. Drop it — `refresh_splat_resolve_bindings` will
         // rebuild on next dispatch.
         self.splat_resolve_g0_bg = None;
-
-        // Tile-bin per-tile buffers depend on resolution. Reallocate
-        // and rebuild the cached bind group + march's tile-bin
-        // bindings.
-        let (counts_buf, lists_buf, tx, ty) = make_tile_bin_buffers(device, width, height);
-        self.user_shader_tile_counts_buffer = counts_buf;
-        self.user_shader_tile_lists_buffer = lists_buf;
-        self.user_shader_tile_count_x = tx;
-        self.user_shader_tile_count_y = ty;
-        self.user_shader_tile_bin_bg = Some(self.user_shader_tile_bin.build_bind_group(
-            device,
-            &renderer.scene.user_shader_instance_aabbs_buffer,
-            &self.camera_buffer,
-            &self.user_shader_tile_counts_buffer,
-            &self.user_shader_tile_lists_buffer,
-            &renderer.scene.user_shader_instance_count_buffer,
-        ));
-        self.march.set_user_shader_tile_bin_buffers(
-            device,
-            &self.user_shader_tile_counts_buffer,
-            &self.user_shader_tile_lists_buffer,
-        );
 
         // Per-VR passes — resize internal textures + re-wire gbuffer bindings.
         self.march.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
@@ -2183,34 +2095,6 @@ fn create_readback_buffer(device: &wgpu::Device, width: u32, height: u32) -> wgp
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     })
-}
-
-/// Allocate the user-shader tile-bin buffers for a given resolution.
-/// Returns `(counts_buffer, lists_buffer, tile_count_x, tile_count_y)`.
-/// Tile size is hardcoded to 8×8 pixels — matches the march workgroup
-/// layout.
-fn make_tile_bin_buffers(
-    device: &wgpu::Device,
-    width: u32,
-    height: u32,
-) -> (wgpu::Buffer, wgpu::Buffer, u32, u32) {
-    use crate::user_shader_tile_bin_pass::MAX_INSTANCES_PER_TILE;
-    let tile_count_x = width.div_ceil(8);
-    let tile_count_y = height.div_ceil(8);
-    let tile_count = tile_count_x * tile_count_y;
-    let counts_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("user_shader_tile_counts"),
-        size: tile_count as u64 * 4,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let lists_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("user_shader_tile_lists"),
-        size: tile_count as u64 * MAX_INSTANCES_PER_TILE as u64 * 4,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    (counts_buffer, lists_buffer, tile_count_x, tile_count_y)
 }
 
 /// Glass shadow depth resources for a single cascaded shadow map —

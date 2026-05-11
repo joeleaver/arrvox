@@ -61,10 +61,8 @@ pub struct ShadowMapPass {
     finalize_g0_bg: wgpu::BindGroup,
 
     scatter_pipeline: wgpu::ComputePipeline,
-    scatter_pipeline_layout: wgpu::PipelineLayout,
     scatter_pass_layout: wgpu::BindGroupLayout,
     scatter_pass_bg: Option<wgpu::BindGroup>,
-    user_shader_source_hash: u64,
 
     // Phase 4 — band-cell shadow dispatch bindings. The scatter
     // pass reads these to drive `dispatch_user_instance_descend`
@@ -291,10 +289,8 @@ impl ShadowMapPass {
             finalize_pipeline,
             finalize_g0_bg,
             scatter_pipeline,
-            scatter_pipeline_layout,
             scatter_pass_layout,
             scatter_pass_bg: None,
-            user_shader_source_hash: 0,
             march_params_buffer,
             materials_buffer: None,
             shader_params_buffer: None,
@@ -386,37 +382,6 @@ impl ShadowMapPass {
             &self.dispatch_args_buffer, materials, shader_params,
             &self.march_params_buffer,
         ));
-    }
-
-    /// Rebuild the scatter pipeline against spliced user-shader chunks.
-    /// Phase 4 — shadow-map scatter now splices the same
-    /// `instance_at` chunk the primary march does, so band cells
-    /// dispatch the user-shader prototype descent into the
-    /// directional shadow path.
-    pub fn reload_user_shaders(
-        &mut self,
-        device: &wgpu::Device,
-        instance_at_chunk: &str,
-        source_hash: u64,
-    ) -> bool {
-        if source_hash == self.user_shader_source_hash {
-            return false;
-        }
-        let template = wesl::include_wesl!("shadow_scatter");
-        let source = crate::shader_composer::splice_inst_chunks(
-            template, instance_at_chunk,
-        );
-        let module = compile_pass_shader(device, &source, "shadow_scatter");
-        self.scatter_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("shadow_scatter"),
-            layout: Some(&self.scatter_pipeline_layout),
-            module: &module,
-            entry_point: Some("scatter_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        self.user_shader_source_hash = source_hash;
-        true
     }
 
     /// Bind the TLAS prims buffer the setup pass reads.

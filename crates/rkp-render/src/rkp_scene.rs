@@ -9,15 +9,6 @@
 
 use crate::rkp_gpu_object::{RkpGpuAsset, RkpGpuInstance};
 
-/// Capacity of `RkpScene::user_shader_instance_buffer`, in slots. One
-/// slot = one `RkpGpuInstance` = 128 B; this cap × 128 sets the buffer
-/// byte size. 256K × 128 = 32 MB — fits comfortably under any sane
-/// `max_storage_buffer_binding_size`, and is more than enough for the
-/// "few thousand blades per painted patch" first-cut workload. Bump
-/// once GPU-side tile binning lands (Phase 6) and we want to scale to
-/// "hillsides as far as the eye can see."
-pub const USER_SHADER_INSTANCE_CAPACITY: u32 = 256 * 1024;
-
 /// Camera uniforms matching the WGSL `CameraUniforms` struct.
 ///
 /// Layout (208 + 16 = 224 bytes):
@@ -197,33 +188,6 @@ pub struct RkpScene {
     /// (128 B) representing a single emitted primitive (grass blade,
     /// scatter object, etc.) with a forward affine `world` matrix and
     /// `asset_id` pointing at the shader's prototype asset.
-    ///
-    /// Sized for `USER_SHADER_INSTANCE_CAPACITY` slots at construction.
-    /// The emit pass atomically allocates slots; overflow drops blades
-    /// silently (the cap is a load-bearing budget, not a soft limit).
-    /// All registered shaders share this buffer (each blade carries its
-    /// own `asset_id`); separating them per-shader buys nothing here.
-    pub user_shader_instance_buffer: wgpu::Buffer,
-    /// Single u32 atomic — bump-allocator cursor for
-    /// `user_shader_instance_buffer`. Reset to 0 each frame; the emit
-    /// pass atomic-adds to claim slots.
-    pub user_shader_instance_count_buffer: wgpu::Buffer,
-    /// Per-emitted-instance world-space AABB (32 B = vec3 min + pad +
-    /// vec3 max + pad), parallel-indexed with
-    /// `user_shader_instance_buffer`. The emit pass writes via the
-    /// user shader's `inst_aabb` hook; the march reads to do a
-    /// cheap world-AABB cull before the matrix-inverse + descend.
-    /// Without this the per-pixel-O(N) scan was 500+ ops per
-    /// instance — most blades cull cheaply now.
-    pub user_shader_instance_aabbs_buffer: wgpu::Buffer,
-    /// Per-emitted-instance inverse-world matrix (64 B), parallel-
-    /// indexed with `user_shader_instance_buffer`. Computed once in
-    /// the emit pass so the per-pixel march doesn't redo the
-    /// `mat4_affine_inverse` per (instance × pixel). At ~60
-    /// instances/tile × thousands of pixels per painted region the
-    /// matrix inverse alone was costing tens of ms; precomputing
-    /// once per frame collapses that to a single 64-byte read.
-    pub user_shader_instance_inv_world_buffer: wgpu::Buffer,
     pub bind_group_layout: wgpu::BindGroupLayout,
     /// Incremented whenever a shared buffer reallocates. Each VR caches
     /// the epoch it built its bind group at; rebuilds when the scene's
@@ -280,41 +244,6 @@ impl RkpScene {
             device, "rkp_instance_overlay", 16,
         );
 
-        // User-shader instance buffer — one `RkpGpuInstance` (128 B)
-        // per emitted blade. Sized at startup; never grows. The emit
-        // pass atomic-bumps a cursor (`user_shader_instance_count_buffer`)
-        // to claim slots. Capacity is a hard budget — blades emitted
-        // past the cap are silently dropped.
-        let user_shader_instance_buffer_bytes =
-            USER_SHADER_INSTANCE_CAPACITY as u64
-                * std::mem::size_of::<RkpGpuInstance>() as u64;
-        let user_shader_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rkp_user_shader_instances"),
-            size: user_shader_instance_buffer_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let user_shader_instance_count_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rkp_user_shader_instance_count"),
-            size: 4,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let user_shader_instance_aabbs_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rkp_user_shader_instance_aabbs"),
-            size: USER_SHADER_INSTANCE_CAPACITY as u64 * 32, // (vec3 min + pad + vec3 max + pad)
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let user_shader_instance_inv_world_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rkp_user_shader_instance_inv_world"),
-            size: USER_SHADER_INSTANCE_CAPACITY as u64 * 64, // mat4x4<f32>
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let bind_group_layout = Self::create_layout(device);
 
         Self {
@@ -325,10 +254,6 @@ impl RkpScene {
             bone_field_occ_buffer, bone_field_occ_capacity,
             bone_dual_quats_buffer,
             instance_overlay_buffer,
-            user_shader_instance_buffer,
-            user_shader_instance_count_buffer,
-            user_shader_instance_aabbs_buffer,
-            user_shader_instance_inv_world_buffer,
             bind_group_layout,
             buffers_epoch: 0,
         }
@@ -358,58 +283,33 @@ impl RkpScene {
         )
     }
 
-    /// Two-tier shared-pool layout.
-    ///
-    /// The host scene buffers carry, in order:
-    ///
-    /// ```text
-    /// [0 .. cpu_*_bytes]                                   ← CPU-managed asset data
-    /// [cpu_*_bytes .. +proto_*_bytes]                      ← Persistent instance-prototype tail
-    /// ```
-    ///
-    /// The proto tail is where `@instance_proto` shaders' baked blade
-    /// prototype octrees live. They persist across frames (only re-baked
-    /// on shader source change) but live in the host pools so the host
-    /// march reads them via its existing bindings — no special "which
-    /// pool?" indirection. `PrototypeCache::set_pool_bases` configures
-    /// the proto cache's offset within these buffers.
-    ///
-    /// Returns `true` if any underlying buffer reallocated — caller must
-    /// rebuild any cached bind groups referencing them.
-    ///
-    /// Replaces the old three-tier layout that had a Phase-C transient
-    /// tier sized for 768 MB of band-cell BFS extras. The band-cell
-    /// path was deleted; the new emit pass scatters into a separate
-    /// `user_shader_instance_buffer` instead.
-    #[allow(clippy::too_many_arguments)]
+    /// CPU-managed asset data lives in `[0 .. cpu_*_bytes]` of each
+    /// shared pool. Returns `true` if any underlying buffer reallocated
+    /// — caller must rebuild any cached bind groups referencing them.
     pub fn ensure_pool_layout(
         &mut self,
         device: &wgpu::Device,
         cpu_octree_bytes: u64,
-        proto_octree_bytes: u64,
         cpu_brick_bytes: u64,
-        proto_brick_bytes: u64,
         cpu_leaf_attr_bytes: u64,
-        proto_leaf_attr_bytes: u64,
         cpu_face_links_bytes: u64,
-        proto_face_links_bytes: u64,
     ) -> bool {
         let mut bumped = false;
         bumped |= Self::ensure_capacity(
             device, &mut self.octree_nodes_buffer, "rkp_octree_nodes",
-            cpu_octree_bytes + proto_octree_bytes,
+            cpu_octree_bytes,
         );
         bumped |= Self::ensure_capacity(
             device, &mut self.brick_pool_buffer, "rkp_brick_pool",
-            cpu_brick_bytes + proto_brick_bytes,
+            cpu_brick_bytes,
         );
         bumped |= Self::ensure_capacity(
             device, &mut self.leaf_attr_pool_buffer, "rkp_leaf_attr_pool",
-            cpu_leaf_attr_bytes + proto_leaf_attr_bytes,
+            cpu_leaf_attr_bytes,
         );
         bumped |= Self::ensure_capacity(
             device, &mut self.brick_face_links_buffer, "rkp_brick_face_links",
-            cpu_face_links_bytes + proto_face_links_bytes,
+            cpu_face_links_bytes,
         );
         if bumped {
             self.buffers_epoch += 1;

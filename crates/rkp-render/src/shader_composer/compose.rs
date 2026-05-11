@@ -1,27 +1,19 @@
 //! Registry → per-pipeline WGSL chunks.
 //!
-//! Four chunks, one per pipeline that consumes user shaders:
+//! Two chunks, one per pipeline that consumes legacy user-shader hooks:
 //!   - `shade` — spliced into `rkp_shade.wgsl`; defines
 //!     `dispatch_user_shade(shader_id, ctx) -> ShadeResult`.
 //!   - `generate` — spliced into `user_shader_geom.wgsl`'s BFS fill;
 //!     defines `dispatch_user_generate(shader_id, ...) -> VoxelEmit`.
-//!   - `proto` — spliced into `user_shader_proto.wgsl`'s prototype
-//!     bake; defines `dispatch_user_proto(shader_id, uvw) -> VoxelEmit`.
-//!   - `instance_at` — spliced into the host march + shadow trace;
-//!     defines per-shader `rkp_user_<id>_instance_descend(...)` plus
-//!     the unified `dispatch_user_instance_descend(...)` switch.
 //!
 //! Each chunk emits the user's hook bodies verbatim under a stable name
 //! (`rkp_user_<id>_<hook>`), then a switch-statement dispatcher that
 //! routes by `shader_id`. `shader_id == 0` (no shader registered) hits
 //! the identity default arm in every dispatcher.
 //!
-//! [`splice_inst_chunks`] is a small splice helper consumers call to
-//! drop the `instance_at` chunk into a host-side WGSL template
-//! between the `USER_INSTANCE_AT_DISPATCH_BEGIN/END` const-decl
-//! anchors. The four splice consumers (this one plus the shade,
-//! generate, and proto pipelines) all funnel through
-//! [`splice_const_marker`].
+//! V1 mesh-path shaders take a separate path through
+//! [`compose_mesh_path_pipeline_sources`] which emits self-contained
+//! per-shader raster + compute modules.
 //!
 //! Anchor form: `const USER_<NAME>_BEGIN: u32 = 0u;` — declarations
 //! survive WESL's parse-and-emit roundtrip (line comments do not),
@@ -31,26 +23,12 @@
 use super::types::{ComposedChunks, UserShaderEntry, UserShaderRegistry};
 
 /// Compose the per-pipeline dispatch chunks. Returns identity-default
-/// chunks when the registry is empty. Phase A: emits structurally
-/// valid switch statements but the surrounding WGSL types
-/// (`ShadeCtx`, `ShadeResult`, `HostSample`, `VoxelEmit`, `UserCtx`)
-/// will land with their consuming pipelines in Phases B and C.
+/// chunks when the registry is empty.
 pub fn compose(reg: &UserShaderRegistry) -> ComposedChunks {
     ComposedChunks {
         shade: compose_shade_chunk(reg),
         generate: compose_generate_chunk(reg),
-        proto: compose_proto_chunk(reg),
-        instance_at: compose_instance_at_chunk(reg),
-        emit: compose_emit_chunk(reg),
     }
-}
-
-/// Splice the composer's `emit` chunk into the user-shader emit
-/// shader between the `USER_EMIT_DISPATCH_BEGIN/END` markers. Empty
-/// chunk leaves the template's no-op stub in place (no-shader-
-/// registered case).
-pub fn splice_emit_chunks(template: &str, emit_chunk: &str) -> String {
-    splice_const_marker(template, "USER_EMIT_DISPATCH", emit_chunk)
 }
 
 /// V1 mesh-path — compose the per-shader raster + compute WGSL
@@ -174,23 +152,6 @@ const DEFAULT_FS_BODY: &str = r#"fn fs(in: VsOut) -> FsOut {
 const DEFAULT_SPAWN_ALIVE_BODY: &str =
     "fn spawn_alive(anchor: AnchorContext, spawn_idx: u32, frame: FrameContext) -> bool { return true; }";
 
-/// Splice the composer's `instance_at` chunk into a host-side WGSL
-/// template (`octree_march.wgsl` / `rkp_shadow_trace.wgsl`) between
-/// the `USER_INSTANCE_AT_DISPATCH_BEGIN/END` marker pair. Empty chunk
-/// leaves the template's identity-arm stub in place — that's the
-/// no-user-shader-registered case. Pipelines call this whenever the
-/// registry's `source_hash` changes.
-pub fn splice_inst_chunks(
-    template: &str,
-    instance_at_chunk: &str,
-) -> String {
-    splice_const_marker(
-        template,
-        concat!("USER_INSTANCE_AT_DISPATCH"),
-        instance_at_chunk,
-    )
-}
-
 /// Replace everything from the `const <NAME>_BEGIN: u32 = 0u;`
 /// declaration through the matching `const <NAME>_END: u32 = 0u;`
 /// declaration (inclusive, both anchors consumed) with `chunk`. Empty
@@ -309,53 +270,6 @@ fn compose_shade_chunk(reg: &UserShaderRegistry) -> String {
     out
 }
 
-fn compose_proto_chunk(reg: &UserShaderRegistry) -> String {
-    let mut out = String::new();
-    out.push_str("// ── user-shader helpers + bodies: proto ───────────────\n");
-    // Splice every helper struct from instance shaders so the user's
-    // `proto` body and any helper fns can reference them. Non-instance
-    // shaders contribute nothing to the proto chunk.
-    for entry in &reg.entries {
-        if entry.proto_text.is_some() {
-            for sd in &entry.struct_decls {
-                out.push_str(sd);
-                out.push('\n');
-            }
-            for helper in &entry.helpers {
-                out.push_str(helper);
-                out.push('\n');
-            }
-        }
-    }
-    for entry in &reg.entries {
-        if let Some(text) = &entry.proto_text {
-            out.push_str(&rewrite_fn_name(
-                text,
-                &format!("user_{}_proto", entry.name),
-                &format!("rkp_user_{}_proto", entry.id),
-            ));
-            out.push('\n');
-        }
-    }
-    out.push_str("\n// ── dispatch_user_proto ────────────────────────────────\n");
-    out.push_str(
-        "fn dispatch_user_proto(shader_id: u32, uvw: vec3<f32>) -> VoxelEmit {\n",
-    );
-    out.push_str("    switch shader_id {\n");
-    for entry in &reg.entries {
-        if entry.proto_text.is_some() {
-            out.push_str(&format!(
-                "        case {}u: {{ return rkp_user_{}_proto(uvw); }}\n",
-                entry.id, entry.id,
-            ));
-        }
-    }
-    out.push_str("        default: { return voxel_emit_skip(); }\n");
-    out.push_str("    }\n");
-    out.push_str("}\n");
-    out
-}
-
 fn compose_generate_chunk(reg: &UserShaderRegistry) -> String {
     let mut out = String::new();
     out.push_str("// ── user-shader helpers + bodies: generate ────────────\n");
@@ -395,150 +309,6 @@ fn compose_generate_chunk(reg: &UserShaderRegistry) -> String {
     out.push_str("        default: { return voxel_emit_skip(); }\n");
     out.push_str("    }\n");
     out.push_str("}\n");
-    out
-}
-
-/// `instance_at` chunk composer. Stub since the band-cell descent
-/// path is gone — there are no consumers of an `instance_at` chunk
-/// in the host march / shadow shaders any more. Returns an empty
-/// chunk so `splice_inst_chunks` is a no-op for every consumer
-/// template (templates never had to remove their markers, since the
-/// splice helper is a no-op on empty input).
-///
-/// The user-shader API still parses `instance_at` / `inst_aabb` /
-/// `inst_to_local` / `inst_world_matrix` — those bodies feed the
-/// new emit pass (Phase 2 of the rebuild). The composer will grow a
-/// new `emit` chunk that consumes them, replacing this empty stub.
-fn compose_instance_at_chunk(_reg: &UserShaderRegistry) -> String {
-    String::new()
-}
-
-/// Compose the `emit` chunk. The user-shader emit pass splices this
-/// between its `USER_EMIT_DISPATCH_BEGIN/END` markers; the chunk
-/// defines:
-///
-///   - The per-shader instance struct (e.g. `struct Blade { ... }`),
-///     helper fns, and renamed bodies for `instance_at` +
-///     `inst_world_matrix` (named `rkp_user_<id>_instance_at` and
-///     `rkp_user_<id>_inst_world_matrix`).
-///   - The unified `dispatch_user_emit(shader_id, ...)` switch. On
-///     success, sets `*out_world_matrix` to the forward affine and
-///     returns `true`. On instance_at returning `false` (no instance
-///     at this k), or shader_id missing, returns `false`.
-///
-/// Empty when no shader registers an `instance_at` hook (the empty-
-/// registry stub in the template returns `false` for all inputs).
-fn compose_emit_chunk(reg: &UserShaderRegistry) -> String {
-    if !reg.entries.iter().any(|e| e.instance_at_text.is_some()) {
-        return String::new();
-    }
-
-    let mut out = String::new();
-    out.push_str("// ── user-shader bodies: emit ─────────────────────────\n");
-
-    // Splice instance struct decls + helpers for every emit-eligible
-    // shader. This chunk is the SOLE emitter of the per-shader struct
-    // + helpers when the emit chunk is non-empty (the shade / proto /
-    // generate chunks own their own copies for their respective
-    // pipelines; the emit pass lives in a separate compute shader).
-    for entry in &reg.entries {
-        if entry.instance_at_text.is_some() {
-            for sd in &entry.struct_decls {
-                out.push_str(sd);
-                out.push('\n');
-            }
-            for helper in &entry.helpers {
-                out.push_str(helper);
-                out.push('\n');
-            }
-        }
-    }
-
-    // Per-shader bodies. Validation upstream guarantees `instance_at`
-    // implies `inst_world_matrix` + `inst_aabb` + `inst_to_local`.
-    for entry in &reg.entries {
-        if entry.instance_at_text.is_none() {
-            continue;
-        }
-        if let Some(text) = &entry.instance_at_text {
-            out.push_str(&rewrite_fn_name(
-                text,
-                &format!("user_{}_instance_at", entry.name),
-                &format!("rkp_user_{}_instance_at", entry.id),
-            ));
-            out.push('\n');
-        }
-        if let Some(text) = &entry.inst_world_matrix_text {
-            out.push_str(&rewrite_fn_name(
-                text,
-                &format!("user_{}_inst_world_matrix", entry.name),
-                &format!("rkp_user_{}_inst_world_matrix", entry.id),
-            ));
-            out.push('\n');
-        }
-        // `inst_aabb` and `inst_to_local` aren't called from the emit
-        // pass, but their bodies sometimes share helper types with
-        // `inst_world_matrix`. Splicing them costs nothing (naga
-        // DCE-eliminates) and keeps the per-shader splice consistent
-        // across pipelines.
-        if let Some(text) = &entry.inst_aabb_text {
-            out.push_str(&rewrite_fn_name(
-                text,
-                &format!("user_{}_inst_aabb", entry.name),
-                &format!("rkp_user_{}_inst_aabb", entry.id),
-            ));
-            out.push('\n');
-        }
-        if let Some(text) = &entry.inst_to_local_text {
-            out.push_str(&rewrite_fn_name(
-                text,
-                &format!("user_{}_inst_to_local", entry.name),
-                &format!("rkp_user_{}_inst_to_local", entry.id),
-            ));
-            out.push('\n');
-        }
-    }
-
-    // Unified dispatcher.
-    out.push_str("// ── dispatch_user_emit ───────────────────────────────\n");
-    out.push_str(
-        "fn dispatch_user_emit(\n\
-         \x20   shader_id: u32,\n\
-         \x20   host_pos: vec3<f32>,\n\
-         \x20   host: HostSample,\n\
-         \x20   ctx: UserCtx,\n\
-         \x20   k: u32,\n\
-         \x20   out_world_matrix: ptr<function, mat4x4<f32>>,\n\
-         \x20   out_aabb: ptr<function, Aabb>,\n\
-         ) -> bool {\n\
-         \x20   switch shader_id {\n",
-    );
-    for entry in &reg.entries {
-        if entry.instance_at_text.is_none() {
-            continue;
-        }
-        let layout = entry.instance_layout.as_ref().expect(
-            "instance_at hook implies @instance_proto layout parsed",
-        );
-        out.push_str(&format!(
-            "        case {id}u: {{\n\
-             \x20           var inst: {struct_name};\n\
-             \x20           if (!rkp_user_{id}_instance_at(host_pos, host, ctx, k, &inst)) {{\n\
-             \x20               return false;\n\
-             \x20           }}\n\
-             \x20           *out_world_matrix = rkp_user_{id}_inst_world_matrix(inst);\n\
-             \x20           *out_aabb = rkp_user_{id}_inst_aabb(inst);\n\
-             \x20           return true;\n\
-             \x20       }}\n",
-            id = entry.id,
-            struct_name = layout.struct_name,
-        ));
-    }
-    out.push_str(
-        "        default: { return false; }\n\
-         \x20   }\n\
-         }\n",
-    );
     out
 }
 

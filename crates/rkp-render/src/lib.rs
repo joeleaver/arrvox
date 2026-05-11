@@ -110,31 +110,9 @@ pub mod proc_sample;
 pub mod proc_surface_nets;
 /// Composes user-authored WGSL hooks into the procedural evaluator.
 pub mod shader_composer;
-/// Option B — voxel sprite instancing. Parses per-instance state structs
-/// declared by `@instance_proto` and computes their byte layout.
-pub mod instance_proto;
-/// Prototype bake pipeline. Voxelizes each instance shader's
-/// `proto_sample_at(uvw)` into a dedicated octree+brick+leaf-attr
-/// triple, cached by source hash. The emit pass writes `RkpInstance`
-/// records pointing at one of these baked protos as their `asset_id`;
-/// the host march descends the proto via the standard `march_object`
-/// flow.
-pub mod user_shader_proto_pass;
-/// User-shader instance emit pass. Per painted-leaf compute pass
-/// that writes `RkpInstance` records into the scene's user-shader
-/// instance buffer. Replaces the band-cell descend path.
-pub mod user_shader_emit_pass;
-/// GPU tile-binning for emitted user-shader instances. Per viewport
-/// per frame: walks each instance's world AABB, projects to screen,
-/// atomically appends the instance index to per-tile lists. The
-/// march reads only the current pixel's tile list.
-pub mod user_shader_tile_bin_pass;
-/// V1 mesh-path user-shader pipeline. Replaces the proto / emit /
-/// tile-bin chain with a vertex-shader-driven path:
+/// V1 mesh-path user-shader pipeline. Vertex-shader-driven path:
 /// spawn_count → prefix_sum → fill → indirect draw against own raster.
-/// See `notes/user-shaders-mesh.md`. This module is being built
-/// alongside the old path; the retirement step deletes the older
-/// modules once the new path validates.
+/// See `notes/user-shaders-mesh.md`.
 pub mod user_shader_mesh_pass;
 /// Phase 7 — TLAS over instance AABBs for shadow rays (and future
 /// reflections / AO / GI). Session 1 ships only the wire format +

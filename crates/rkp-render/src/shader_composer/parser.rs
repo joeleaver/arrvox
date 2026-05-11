@@ -16,15 +16,8 @@
 //! is captured under the matching slot on [`UserShaderEntry`]. Other
 //! top-level fns become helpers; structs become struct decls. Header
 //! directives populate [`super::types::ShaderMetadata`].
-//!
-//! Validation: `@instance_proto Foo` requires a matching `struct Foo`
-//! AND a `user_<stem>_proto` hook; `instance_at` requires its
-//! companion `inst_aabb` + `inst_to_local`. Reject fast — the user
-//! sees a clear error instead of a downstream WGSL link failure.
 
 use std::path::{Path, PathBuf};
-
-use crate::instance_proto::parse_instance_layout;
 
 use super::hash::compute_registry_hash;
 use super::lib_symbols::is_lib_symbol;
@@ -117,13 +110,7 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
         shade_text: None,
         generate_text: None,
         helpers: Vec::new(),
-        proto_text: None,
-        inst_aabb_text: None,
-        inst_to_local_text: None,
-        inst_world_matrix_text: None,
-        instance_at_text: None,
         struct_decls: Vec::new(),
-        instance_layout: None,
         spawn_count_text: None,
         spawn_alive_text: None,
         vs_text: None,
@@ -183,17 +170,12 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
                 let slot = match hook {
                     "shade" => &mut entry.shade_text,
                     "generate" => &mut entry.generate_text,
-                    "proto" => &mut entry.proto_text,
-                    "inst_aabb" => &mut entry.inst_aabb_text,
-                    "inst_to_local" => &mut entry.inst_to_local_text,
-                    "inst_world_matrix" => &mut entry.inst_world_matrix_text,
-                    "instance_at" => &mut entry.instance_at_text,
                     other => {
                         return Err(ShaderComposerError::Parse {
                             path: path.to_path_buf(),
                             line: line_of(source, name_start),
                             msg: format!(
-                                "unknown hook `{other}` — expected `shade`, `generate`, `proto`, `inst_aabb`, `inst_to_local`, `inst_world_matrix`, or `instance_at`"
+                                "unknown hook `{other}` — expected `shade` or `generate`"
                             ),
                         });
                     }
@@ -247,8 +229,7 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
             cursor = body_close + 1;
         } else {
             // `struct` declaration: capture verbatim from `struct` keyword
-            // through the matching `}`. Not validated here — user may
-            // declare helper structs unrelated to @instance_proto.
+            // through the matching `}`.
             let after_kw = item_start + "struct".len();
             let name_start = skip_ws(source, after_kw);
             if name_start >= source.len() {
@@ -287,118 +268,6 @@ pub fn parse_file(path: &Path, source: &str) -> Result<UserShaderEntry, ShaderCo
             let struct_text = source[item_start..=body_close].to_string();
             entry.struct_decls.push(struct_text);
             cursor = body_close + 1;
-        }
-    }
-
-    // Validate / parse the @instance_proto target now that all fns +
-    // structs are captured. Errors here are user-facing — they wrote
-    // `@instance_proto Blade` but skipped one of the required pieces.
-    if let Some(target) = entry.metadata.instance_proto_struct.clone() {
-        if entry.proto_text.is_none() {
-            return Err(ShaderComposerError::Parse {
-                path: path.to_path_buf(),
-                line: 0,
-                msg: format!(
-                    "@instance_proto declared but `user_{name}_proto` hook is missing"
-                ),
-            });
-        }
-        let Some(struct_text) = entry
-            .struct_decls
-            .iter()
-            .find(|t| struct_decl_name(t) == target)
-            .cloned()
-        else {
-            return Err(ShaderComposerError::Parse {
-                path: path.to_path_buf(),
-                line: 0,
-                msg: format!(
-                    "@instance_proto target `{target}` — no matching `struct {target} {{ ... }}` in this file"
-                ),
-            });
-        };
-        let layout = parse_instance_layout(path, &target, &struct_text).map_err(|e| {
-            ShaderComposerError::Parse {
-                path: e.path,
-                line: 0,
-                msg: e.msg,
-            }
-        })?;
-        entry.instance_layout = Some(layout);
-    } else {
-        // No @instance_proto directive — the instance hooks are reserved
-        // names that don't make sense outside Option B. Reject so the
-        // user gets a clear error instead of silent no-op.
-        if entry.proto_text.is_some() {
-            return Err(ShaderComposerError::Parse {
-                path: path.to_path_buf(),
-                line: 0,
-                msg: format!(
-                    "`user_{name}_proto` defined without `// @instance_proto <StructName>` directive"
-                ),
-            });
-        }
-        if entry.inst_aabb_text.is_some()
-            || entry.inst_to_local_text.is_some()
-            || entry.inst_world_matrix_text.is_some()
-        {
-            return Err(ShaderComposerError::Parse {
-                path: path.to_path_buf(),
-                line: 0,
-                msg: "instance helper hook defined without `// @instance_proto <StructName>` directive"
-                    .to_string(),
-            });
-        }
-        if entry.instance_at_text.is_some() {
-            return Err(ShaderComposerError::Parse {
-                path: path.to_path_buf(),
-                line: 0,
-                msg: format!(
-                    "`user_{name}_instance_at` defined without `// @instance_proto <StructName>` directive"
-                ),
-            });
-        }
-    }
-
-    // Precondition: `instance_at` shaders must also provide
-    // `inst_aabb`, `inst_to_local`, and `inst_world_matrix`.
-    //   - `inst_world_matrix` builds `RkpInstance.world` for each
-    //     emitted blade (the new emit pass writes the matrix
-    //     directly; the host march descends via `inv_world × ray`).
-    //   - `inst_aabb` is read by the emit pass when building the
-    //     scene-AABB / tile bins for emitted instances.
-    //   - `inst_to_local` is currently informational, kept on the
-    //     entry for any march-time normal reconstruction or paint
-    //     cursor work that wants the inverse map.
-    // Reject early so the user gets a clear error instead of a
-    // spurious WGSL link error at splice time.
-    if entry.instance_at_text.is_some() {
-        if entry.inst_aabb_text.is_none() {
-            return Err(ShaderComposerError::Parse {
-                path: path.to_path_buf(),
-                line: 0,
-                msg: format!(
-                    "`user_{name}_instance_at` requires `user_{name}_inst_aabb` (the emit pass calls it for tile binning + scene AABB)"
-                ),
-            });
-        }
-        if entry.inst_to_local_text.is_none() {
-            return Err(ShaderComposerError::Parse {
-                path: path.to_path_buf(),
-                line: 0,
-                msg: format!(
-                    "`user_{name}_instance_at` requires `user_{name}_inst_to_local` (world→canonical map)"
-                ),
-            });
-        }
-        if entry.inst_world_matrix_text.is_none() {
-            return Err(ShaderComposerError::Parse {
-                path: path.to_path_buf(),
-                line: 0,
-                msg: format!(
-                    "`user_{name}_instance_at` requires `user_{name}_inst_world_matrix` (forward affine canonical → world; written into RkpInstance.world by the emit pass)"
-                ),
-            });
         }
     }
 
@@ -584,23 +453,6 @@ fn references_frame_context(text: &str) -> bool {
     false
 }
 
-/// Pull the struct's name out of a captured `struct <Name> { ... }` block.
-/// Returns "" if the text doesn't match that shape — callers are expected
-/// to feed only text we just captured, so the empty-string fallback only
-/// fires when the directive's target genuinely doesn't match any struct.
-fn struct_decl_name(struct_text: &str) -> &str {
-    let trimmed = struct_text.trim_start();
-    let after = match trimmed.strip_prefix("struct") {
-        Some(s) => s,
-        None => return "",
-    };
-    let rest = after.trim_start();
-    let end = rest
-        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .unwrap_or(rest.len());
-    &rest[..end]
-}
-
 /// Parse the prefix-of-source where `@`-directives live. Recognized:
 ///
 /// ```text
@@ -608,7 +460,9 @@ fn struct_decl_name(struct_text: &str) -> &str {
 /// // @region_thickness <f32>
 /// // @cell_size <f32>
 /// // @animated
-/// // @max_emits_per_thread <u32>   // Option B; default 1
+/// // @geometry procedural { vertex_count: N }   // V1 mesh-path
+/// // @tile_size <f32>
+/// // @spawn_count_cache static | per_frame
 /// ```
 ///
 /// Lines that aren't comments or aren't `@`-prefixed are skipped. Lines
@@ -666,33 +520,6 @@ fn parse_metadata(
             "tile_size" => {
                 md.tile_size = Some(parse_f32(path, line_no, "tile_size", args)?);
             }
-            "instance_proto" => {
-                let target = args.trim();
-                if target.is_empty() {
-                    return Err(ShaderComposerError::Parse {
-                        path: path.to_path_buf(),
-                        line: line_no,
-                        msg: "@instance_proto requires a struct name (e.g. `// @instance_proto Blade`)".to_string(),
-                    });
-                }
-                if !target.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                    || !target.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                {
-                    return Err(ShaderComposerError::Parse {
-                        path: path.to_path_buf(),
-                        line: line_no,
-                        msg: format!("@instance_proto target `{target}` is not a valid identifier"),
-                    });
-                }
-                if md.instance_proto_struct.is_some() {
-                    return Err(ShaderComposerError::Parse {
-                        path: path.to_path_buf(),
-                        line: line_no,
-                        msg: "@instance_proto declared twice in this file".to_string(),
-                    });
-                }
-                md.instance_proto_struct = Some(target.to_string());
-            }
             "animated" => {
                 if !args.is_empty() {
                     return Err(ShaderComposerError::Parse {
@@ -702,23 +529,6 @@ fn parse_metadata(
                     });
                 }
                 md.animated = true;
-            }
-            "max_emits_per_thread" => {
-                let v: u32 = args.trim().parse().map_err(|_| ShaderComposerError::Parse {
-                    path: path.to_path_buf(),
-                    line: line_no,
-                    msg: format!("@max_emits_per_thread expects a u32, got `{args}`"),
-                })?;
-                if v == 0 || v > 16 {
-                    return Err(ShaderComposerError::Parse {
-                        path: path.to_path_buf(),
-                        line: line_no,
-                        msg: format!(
-                            "@max_emits_per_thread must be in 1..=16 (got {v}); higher values bloat per-region pool reservations"
-                        ),
-                    });
-                }
-                md.max_emits_per_thread = Some(v);
             }
             "geometry" => {
                 if md.mesh_geometry.is_some() {

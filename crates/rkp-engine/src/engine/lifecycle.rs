@@ -72,19 +72,14 @@ impl EngineState {
                         .map(|e| e.id)
                 },
                 &|name| {
-                    // Geometry-emitting shaders — either the legacy
-                    // `instance_at` path or the V1 mesh-path. Either
-                    // populates `GpuMaterial.instance_shader_id`; the
-                    // orchestration layer routes by entry type
-                    // (`is_mesh_path()` vs `instance_at_text.is_some()`)
-                    // to the right per-frame tick.
+                    // V1 mesh-path geometry-emitting shaders. Populates
+                    // `GpuMaterial.instance_shader_id`; the orchestration
+                    // layer routes mesh-path materials to
+                    // `tick_user_shader_mesh`.
                     registry
                         .entries()
                         .iter()
-                        .find(|e| {
-                            e.name == name
-                                && (e.instance_at_text.is_some() || e.is_mesh_path())
-                        })
+                        .find(|e| e.name == name && e.is_mesh_path())
                         .map(|e| e.id)
                 },
             );
@@ -96,10 +91,7 @@ impl EngineState {
         // pipeline rebuilds when nothing changed.
         let composed = rkp_render::shader_composer::compose(&self.user_shader_registry);
         let user_shader_shade_chunk = composed.shade;
-        let user_shader_proto_chunk = composed.proto;
-        let user_shader_emit_chunk = composed.emit;
         let _ = composed.generate; // band-cell BFS strip — no consumer
-        let _ = composed.instance_at; // band-cell descend strip — no consumer
         let user_shader_source_hash = self.user_shader_registry.source_hash();
         let user_shader_infos = self.user_shader_registry.shader_infos();
         // Full registry entries — render thread reads these to drive the
@@ -127,13 +119,13 @@ impl EngineState {
         > = std::collections::HashMap::new();
         let any_shader_pipeline = infos
             .iter()
-            .any(|i| i.has_generate || i.has_instance_at || i.has_vs);
+            .any(|i| i.has_generate || i.has_vs);
         if any_shader_pipeline {
             for slot_id in 0..self.material_lib.slot_count() as u16 {
                 let Some(def) = self.material_lib.get_def(slot_id) else { continue; };
                 let Some(shader_name) = def.shader.as_deref() else { continue; };
                 let Some(info) = infos.iter().find(|i| i.name == shader_name) else { continue; };
-                if info.has_generate || info.has_instance_at || info.has_vs {
+                if info.has_generate || info.has_vs {
                     shader_materials.insert(slot_id, info.clone());
                 }
             }
@@ -269,12 +261,7 @@ impl EngineState {
                         self.painted_dirty_entities.insert(entity);
                         continue;
                     };
-                    let object_id = gpu_idx as u32;
-                    let entity_world: Option<glam::Mat4> = self
-                        .gpu_instances
-                        .iter()
-                        .find(|i| i.object_id == object_id)
-                        .map(|i| glam::Mat4::from_cols_array_2d(&i.world));
+                    let _ = gpu_idx;
 
                     let mut entry = super::state::EntityPaintedCache::default();
                     scan_painted_aabbs(
@@ -287,12 +274,9 @@ impl EngineState {
                         grid_origin,
                         base_voxel_size,
                         &shader_materials,
-                        entity_world,
-                        object_id,
                         &mut entry.mat_tiles,
-                        &mut entry.leaves,
                     );
-                    if entry.mat_tiles.is_empty() && entry.leaves.is_empty() {
+                    if entry.mat_tiles.is_empty() {
                         self.painted_per_entity.remove(&entity);
                     } else {
                         self.painted_per_entity.insert(entity, entry);
@@ -312,12 +296,11 @@ impl EngineState {
             // `gpu_objects_dirty_this_frame` from the trigger so that
             // animation-only frames (which set `gpu_objects_dirty` via
             // `animation::tick` every frame a skeleton is playing)
-            // don't churn through cloning every entity's `mat_tiles`,
-            // re-uploading `painted_leaves` (768 KB+ at heavy paint),
+            // don't churn through cloning every entity's `mat_tiles`
             // and re-running the new mesh-path compute trio. Animation
             // doesn't move entity world transforms (just bones within
-            // them), so painted_anchors / painted_leaves / painted_materials
-            // are content-stable across animation ticks.
+            // them), so painted_anchors / painted_materials are
+            // content-stable across animation ticks.
             //
             // Caveat: if a Renderable entity is added or removed without
             // any paint or geometry epoch change, the `entity_to_gpu`
@@ -328,14 +311,6 @@ impl EngineState {
             let need_flat_rebuild = dirty_count > 0 || geom_changed;
             if need_flat_rebuild {
                 self.painted_materials.clear();
-                let total_leaves: usize = self
-                    .painted_per_entity
-                    .values()
-                    .map(|e| e.leaves.len())
-                    .sum();
-                let mut new_painted_leaves: Vec<
-                    rkp_render::user_shader_emit_pass::EmitLeaf,
-                > = Vec::with_capacity(total_leaves);
                 let mut new_painted_anchors: std::collections::HashMap<
                     u16,
                     Vec<rkp_render::user_shader_mesh_pass::AnchorRecord>,
@@ -348,7 +323,6 @@ impl EngineState {
                         self.painted_materials
                             .insert(gpu_idx as u32, entry.mat_tiles.clone());
                     }
-                    new_painted_leaves.extend_from_slice(&entry.leaves);
 
                     // V1 mesh-path AnchorRecords from the per-tile
                     // PaintedTileEntry table. Two bounds in play:
@@ -443,8 +417,6 @@ impl EngineState {
                         }
                     }
                 }
-                self.painted_leaves = std::sync::Arc::new(new_painted_leaves);
-
                 // Debug: detect per-tile seed instability. Compare each
                 // tile's (object_id, tile_min) → seed against last
                 // rebuild's value; only log when the seed for an
@@ -520,9 +492,8 @@ impl EngineState {
 
             if painted_walk_profile && (dirty_count > 0 || geom_changed) {
                 eprintln!(
-                    "[paint] painted_materials_walk dt={:?} painted_leaves={} entities_walked={} cached_entities={} shader_materials={} geom_changed={}",
+                    "[paint] painted_materials_walk dt={:?} entities_walked={} cached_entities={} shader_materials={} geom_changed={}",
                     painted_walk_t0.elapsed(),
-                    self.painted_leaves.len(),
                     dirty_count,
                     self.painted_per_entity.len(),
                     shader_materials.len(),
@@ -530,14 +501,6 @@ impl EngineState {
                 );
             }
         }
-
-        // The new emit pass (Phase 9) will consume `self.painted_materials`
-        // directly, dispatching one thread per (painted leaf × density)
-        // and writing `RkpGpuInstance` records into
-        // `RkpScene::user_shader_instance_buffer`. Until that lands,
-        // painted shader-bearing surfaces simply don't render any
-        // user-shader-derived geometry — paint cursor + base host
-        // material still work.
 
         // Clear the dirty flag so any other consumers (UI, etc.)
         // know the palette they observed has been published. We
@@ -1162,12 +1125,9 @@ impl EngineState {
             shader_params_slots,
             user_shader_shade_chunk,
             user_shader_source_hash,
-            user_shader_proto_chunk,
             user_shader_infos,
             user_shader_entries,
-            painted_leaves: std::sync::Arc::clone(&self.painted_leaves),
             painted_anchors: std::sync::Arc::clone(&self.painted_anchors),
-            user_shader_emit_chunk,
             lights: gpu_lights,
             shade_params_base: self.shade_params_base,
             env_update,
@@ -1275,13 +1235,10 @@ fn scan_painted_aabbs(
     grid_origin: glam::Vec3,
     base_voxel_size: f32,
     shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
-    entity_world: Option<glam::Mat4>,
-    object_id: u32,
     out: &mut std::collections::HashMap<
         u16,
         std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
     >,
-    out_leaves: &mut Vec<rkp_render::user_shader_emit_pass::EmitLeaf>,
 ) {
     use rkp_core::sparse_octree::{
         is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE,
@@ -1302,13 +1259,10 @@ fn scan_painted_aabbs(
         grid_origin: glam::Vec3,
         base_vs: f32,
         shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
-        entity_world: Option<glam::Mat4>,
-        object_id: u32,
         out: &mut std::collections::HashMap<
             u16,
             std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
         >,
-        out_leaves: &mut Vec<rkp_render::user_shader_emit_pass::EmitLeaf>,
     ) {
         use rkp_core::sparse_octree::{
             is_brick, is_leaf, leaf_slot, brick_id, EMPTY_NODE, INTERIOR_NODE,
@@ -1359,37 +1313,6 @@ fn scan_painted_aabbs(
                             super::lifecycle::expand_aabb(
                                 out, mat, cell_local, cell_max, tile_size,
                             );
-                            // Emit a per-leaf record for the new emit
-                            // pass (Phase 9). World-space pos + normal
-                            // — entity_world rotates the leaf's local
-                            // normal into world; without an entity_world
-                            // the host hasn't materialized as a GPU
-                            // instance yet, so skip (paint cursor +
-                            // base material still work).
-                            if let Some(world) = entity_world {
-                                let cell_center_local = cell_local
-                                    + glam::Vec3::splat(0.5 * base_vs);
-                                let world_pos = world
-                                    .transform_point3(cell_center_local);
-                                let local_normal = rkp_core::leaf_attr::unpack_oct(
-                                    attr.normal_oct,
-                                );
-                                let world_normal = world
-                                    .transform_vector3(local_normal)
-                                    .normalize_or_zero();
-                                let world_normal_oct =
-                                    rkp_core::leaf_attr::pack_oct(world_normal);
-                                out_leaves.push(
-                                    rkp_render::user_shader_emit_pass::EmitLeaf {
-                                        world_pos: world_pos.to_array(),
-                                        material_id: mat as u32,
-                                        normal_oct: world_normal_oct,
-                                        object_id,
-                                        leaf_slot: cell,
-                                        cell_size: base_vs,
-                                    },
-                                );
-                            }
                         }
                     }
                 }
@@ -1455,10 +1378,7 @@ fn scan_painted_aabbs(
                 grid_origin,
                 base_vs,
                 shader_materials,
-                entity_world,
-                object_id,
                 out,
-                out_leaves,
             );
         }
     }
@@ -1475,36 +1395,9 @@ fn scan_painted_aabbs(
         grid_origin,
         base_voxel_size,
         shader_materials,
-        entity_world,
-        object_id,
         out,
-        out_leaves,
     );
     let _ = (is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE, BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR, BRICK_CELL_EMPTY);
-}
-
-/// Transform a leaf's local-space center + normal to world space using
-/// the entity's world matrix. When no matrix is available, the leaf is
-/// treated as already-world (identity transform).
-fn transform_leaf(
-    local_pos: glam::Vec3,
-    local_normal: glam::Vec3,
-    entity_world: Option<glam::Mat4>,
-) -> (glam::Vec3, glam::Vec3) {
-    match entity_world {
-        Some(w) => {
-            let world_pos = w.transform_point3(local_pos);
-            // Normal goes through the inverse-transpose. For a uniform-
-            // scale + rotation transform this is equivalent to the
-            // upper-3x3 of `w` re-normalized; for non-uniform scales
-            // we'd need the inverse-transpose explicitly. V1: use
-            // upper-3x3 directly and renormalize — accurate enough
-            // for grass orientation gating.
-            let world_normal = w.transform_vector3(local_normal).normalize_or_zero();
-            (world_pos, world_normal)
-        }
-        None => (local_pos, local_normal),
-    }
 }
 
 /// Diagnostic — count painted leaves on each side of `mid_x` (in

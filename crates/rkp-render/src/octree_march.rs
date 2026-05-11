@@ -83,15 +83,6 @@ pub struct MarchParams {
 /// The octree ray march compute pass.
 pub struct OctreeMarchPass {
     pipeline: wgpu::ComputePipeline,
-    /// Kept around so `reload_user_shaders` can rebuild the pipeline
-    /// against the same bind-group layouts when user-shader chunks
-    /// change. Phase 4c.
-    pipeline_layout: wgpu::PipelineLayout,
-    /// Hash of the user-shader source mix this pipeline was last
-    /// built against. Comparing to the registry's `source_hash`
-    /// decides whether a rebuild is needed. 0 = "default identity
-    /// stubs", which is what the static template ships with.
-    user_shader_source_hash: u64,
     gbuffer_bind_group_layout: wgpu::BindGroupLayout,
     gbuffer_bind_group: Option<wgpu::BindGroup>,
     params_bind_group_layout: wgpu::BindGroupLayout,
@@ -113,16 +104,6 @@ pub struct OctreeMarchPass {
     /// all per-tile counts, i.e. `tile_offsets[num_tiles]`.
     tile_object_ids_buffer: wgpu::Buffer,
     tile_object_ids_capacity: u64,
-    /// User-shader emit-pass output buffers (refs the scene's
-    /// `user_shader_instance_buffer` + count). Stored Option-style so
-    /// the params bind group can be built before the engine has wired
-    /// them in; `None` falls back to a placeholder + count = 0.
-    user_shader_instances_buffer: Option<wgpu::Buffer>,
-    user_shader_instance_count_buffer: Option<wgpu::Buffer>,
-    user_shader_instance_aabbs_buffer: Option<wgpu::Buffer>,
-    user_shader_instance_inv_world_buffer: Option<wgpu::Buffer>,
-    user_shader_tile_counts_buffer: Option<wgpu::Buffer>,
-    user_shader_tile_lists_buffer: Option<wgpu::Buffer>,
     /// Phase 7 Session 4b — TLAS node + leaf buffers, shared with
     /// `state.tlas_pass`. Shadow trace reads bindings 8 + 9 to
     /// traverse the BVH. March itself doesn't currently read them
@@ -242,79 +223,6 @@ impl OctreeMarchPass {
                         },
                         count: None,
                     },
-                    // Binding 6: user-shader emitted instances. Written
-                    // by the emit pass, read here in a fall-through scan
-                    // after the per-tile loop. Empty (count = 0) when
-                    // no shader registers an `instance_at` hook.
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 6,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    // Binding 7: emitted-instance count (single u32).
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 7,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    // Binding 11: per-emitted-instance world AABBs.
-                    // Read in the user-shader fall-through scan for a
-                    // cheap ray-vs-world-AABB pre-cull before the
-                    // matrix inverse + descend.
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 11,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    // Binding 12: per-tile counts for emitted instances.
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 12,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    // Binding 13: per-tile flat instance-index lists.
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 13,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    // Binding 14: per-emitted-instance precomputed
-                    // inv_world. Replaces the in-shader matrix inverse.
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 14,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
                     // Binding 8: TLAS nodes (Phase 7 Session 4b).
                     // Read by shadow trace; march doesn't use it
                     // (naga DCE drops the binding from march SPIR-V).
@@ -390,8 +298,6 @@ impl OctreeMarchPass {
 
         Self {
             pipeline,
-            pipeline_layout,
-            user_shader_source_hash: 0,
             gbuffer_bind_group_layout,
             gbuffer_bind_group: None,
             params_bind_group_layout,
@@ -429,12 +335,6 @@ impl OctreeMarchPass {
                 mapped_at_creation: false,
             }),
             tile_object_ids_capacity: 256,
-            user_shader_instances_buffer: None,
-            user_shader_instance_count_buffer: None,
-            user_shader_instance_aabbs_buffer: None,
-            user_shader_instance_inv_world_buffer: None,
-            user_shader_tile_counts_buffer: None,
-            user_shader_tile_lists_buffer: None,
             tlas_nodes_buffer: None,
             tlas_leaves_buffer: None,
             lights_buffer: None,
@@ -456,41 +356,6 @@ impl OctreeMarchPass {
         self.tlas_nodes_buffer = Some(nodes_buffer.clone());
         self.tlas_leaves_buffer = Some(leaves_buffer.clone());
         self.try_rebuild_params_bind_group(device);
-    }
-
-    /// Re-build the compute pipeline against the spliced user-shader
-    /// `inst_to_local` + `inst_aabb` chunks. Returns `true` if rebuilt,
-    /// `false` if `source_hash` matched and the existing pipeline was
-    /// kept. Empty chunks restore the default identity-arm stubs (the
-    /// "no user shader registered" path). Phase 4c.
-    ///
-    /// Mirrors `PrototypeBakePass::reload_user_shaders` exactly so the
-    /// engine can call both with the same `frame.user_shader_source_hash`
-    /// without having to track per-pass hashes.
-    pub fn reload_user_shaders(
-        &mut self,
-        device: &wgpu::Device,
-        instance_at_chunk: &str,
-        source_hash: u64,
-    ) -> bool {
-        if source_hash == self.user_shader_source_hash {
-            return false;
-        }
-        let template = wesl::include_wesl!("octree_march");
-        let source = crate::shader_composer::splice_inst_chunks(
-            template, instance_at_chunk,
-        );
-        let module = compile_pass_shader(device, &source, "octree_march");
-        self.pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("octree_march"),
-            layout: Some(&self.pipeline_layout),
-            module: &module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        self.user_shader_source_hash = source_hash;
-        true
     }
 
     /// Set the materials buffer. Call after materials are uploaded/resized.
@@ -517,39 +382,6 @@ impl OctreeMarchPass {
         self.try_rebuild_params_bind_group(device);
     }
 
-    /// Set the user-shader emit-pass output buffers. The march reads
-    /// these in the user-shader fall-through scan after the per-tile
-    /// loop.
-    pub fn set_user_shader_emit_buffers(
-        &mut self,
-        device: &wgpu::Device,
-        instances_buffer: &wgpu::Buffer,
-        count_buffer: &wgpu::Buffer,
-        aabbs_buffer: &wgpu::Buffer,
-        inv_world_buffer: &wgpu::Buffer,
-    ) {
-        self.user_shader_instances_buffer = Some(instances_buffer.clone());
-        self.user_shader_instance_count_buffer = Some(count_buffer.clone());
-        self.user_shader_instance_aabbs_buffer = Some(aabbs_buffer.clone());
-        self.user_shader_instance_inv_world_buffer = Some(inv_world_buffer.clone());
-        self.try_rebuild_params_bind_group(device);
-    }
-
-    /// Set the per-viewport tile-bin output buffers. Per-pixel scan
-    /// of emitted instances reads the current tile's list — the
-    /// total per-pixel cost drops to `O(N_in_my_tile)` once these
-    /// are wired and the engine dispatches the bin pass each frame.
-    pub fn set_user_shader_tile_bin_buffers(
-        &mut self,
-        device: &wgpu::Device,
-        tile_counts_buffer: &wgpu::Buffer,
-        tile_lists_buffer: &wgpu::Buffer,
-    ) {
-        self.user_shader_tile_counts_buffer = Some(tile_counts_buffer.clone());
-        self.user_shader_tile_lists_buffer = Some(tile_lists_buffer.clone());
-        self.try_rebuild_params_bind_group(device);
-    }
-
     fn try_rebuild_params_bind_group(&mut self, device: &wgpu::Device) {
         let (
             Some(materials_buffer),
@@ -557,24 +389,12 @@ impl OctreeMarchPass {
             Some(tlas_nodes),
             Some(tlas_leaves),
             Some(shader_params),
-            Some(us_instances),
-            Some(us_count),
-            Some(us_aabbs),
-            Some(us_inv_world),
-            Some(us_tile_counts),
-            Some(us_tile_lists),
         ) = (
             &self.materials_buffer,
             &self.lights_buffer,
             &self.tlas_nodes_buffer,
             &self.tlas_leaves_buffer,
             &self.shader_params_buffer,
-            &self.user_shader_instances_buffer,
-            &self.user_shader_instance_count_buffer,
-            &self.user_shader_instance_aabbs_buffer,
-            &self.user_shader_instance_inv_world_buffer,
-            &self.user_shader_tile_counts_buffer,
-            &self.user_shader_tile_lists_buffer,
         ) else { return };
         self.params_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("march params+materials bind group"),
@@ -603,30 +423,6 @@ impl OctreeMarchPass {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: self.tile_object_ids_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: us_instances.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: us_count.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 11,
-                    resource: us_aabbs.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 12,
-                    resource: us_tile_counts.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 13,
-                    resource: us_tile_lists.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 14,
-                    resource: us_inv_world.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,

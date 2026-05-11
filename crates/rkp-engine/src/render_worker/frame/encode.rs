@@ -215,35 +215,6 @@ pub(super) fn encode_viewports(
             )
         };
 
-        // 3h-pre. User-shader tile-bin pass. Reset per-tile counts and
-        // dispatch the binner into the same encoder so its writes are
-        // visible to the march that follows. No-op when the emit pass
-        // produced 0 instances; the march still reads the (zero-
-        // initialized) counts and skips the inner loop.
-        vr.clear_user_shader_tile_counts(&mut encoder);
-        let bin_params = rkp_render::user_shader_tile_bin_pass::BinParams {
-            instance_count_upper_bound: pre.user_shader_instance_count,
-            tile_count_x: vr.user_shader_tile_count_x,
-            tile_count_y: vr.user_shader_tile_count_y,
-            dispatch_x_threads:
-                rkp_render::user_shader_tile_bin_pass::UserShaderTileBinPass::dispatch_x_threads_for(
-                    pre.user_shader_instance_count,
-                ),
-        };
-        vr.user_shader_tile_bin.update_params(&state.queue, &bin_params);
-        if let Some(bg) = &vr.user_shader_tile_bin_bg {
-            let q = state
-                .renderer
-                .profiler
-                .begin_query("user_shader_tile_bin", &mut encoder);
-            vr.user_shader_tile_bin.dispatch(
-                &mut encoder,
-                bg,
-                pre.user_shader_instance_count,
-            );
-            state.renderer.profiler.end_query(&mut encoder, q);
-        }
-
         // Snapshot the user-shader mesh draws before the
         // `state.renderer.render_to` mutable borrow so the
         // immutable read above doesn't conflict. The draws are
@@ -415,17 +386,13 @@ pub(super) fn encode_viewports(
         // March stats — async readback. Gated behind RKP_MARCH_STATS=1
         // so it doesn't spam by default; when enabled, drains any
         // previously-resolved snapshot and eprintln's the descend-body
-        // breakdown counters + the user-shader emit instance count.
-        // Single staging buffer per source, skip-if-busy — never
-        // blocks the render thread.
+        // breakdown counters. Single staging buffer per source,
+        // skip-if-busy — never blocks the render thread.
         if std::env::var("RKP_MARCH_STATS").is_ok() {
             if let Some(stats) = &drained_stats {
                 eprint_march_stats(vp.id, stats);
             }
             vr.march.submit_stats_readback();
-            if let Some(count) = state.user_shader_emit_pass.try_drain_count() {
-                eprintln!("[user_shader_emit] emitted instances={count}");
-            }
         }
     }
 

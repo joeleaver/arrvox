@@ -14,8 +14,6 @@
 
 use std::path::PathBuf;
 
-use crate::instance_proto::InstanceLayout;
-
 /// One user-declared parameter: name, default, optional UI range. Built
 /// from `// @param <name>: <type> = <default>, range = [<lo>, <hi>]`
 /// header comments in the shader source.
@@ -107,21 +105,9 @@ pub struct ShaderMetadata {
     /// (one region per (object, material) covering the painted-leaf
     /// AABB; cell size grows with paint extent).
     pub tile_size: Option<f32>,
-    /// `@instance_proto <StructName>` — opt-in for the per-instance
-    /// pipeline (Phase B-redux band-cell descent). When `Some`, the
-    /// file MUST also contain the named struct declaration plus the
-    /// `user_<stem>_proto` hook; the parsed struct layout lives on the
-    /// [`UserShaderEntry`]. None means the shader uses the existing
-    /// per-cell `generate` pipeline.
-    pub instance_proto_struct: Option<String>,
-    /// `@max_emits_per_thread <u32>` — per-host-position cap on how
-    /// many instances `instance_at` may return for a single host hit
-    /// before the dispatcher gives up. Uses 1 when absent. Hard
-    /// ceiling: 16.
-    pub max_emits_per_thread: Option<u32>,
     /// V1 mesh-path geometry declaration. `None` means the file
     /// didn't opt into the mesh path (it may still expose the older
-    /// shade/generate/instance_at hooks).
+    /// `shade` / `generate` hooks).
     pub mesh_geometry: Option<GeometryDecl>,
     /// V1 mesh-path spawn-count cache policy. Defaults to
     /// [`SpawnCountCache::Static`].
@@ -167,44 +153,11 @@ pub struct UserShaderEntry {
     /// shaders are user-managed — pick unique helper names if
     /// loading multiple shaders together.
     pub helpers: Vec<String>,
-    /// `fn user_<stem>_proto(uvw: vec3<f32>) -> VoxelEmit` — the
-    /// prototype shape descended at march time from band-cell hits.
-    /// Required when `metadata.instance_proto_struct` is `Some`.
-    pub proto_text: Option<String>,
-    /// `fn user_<stem>_inst_aabb(inst: <Struct>) -> Aabb` — instance
-    /// world-space AABB. Required alongside `instance_at`.
-    pub inst_aabb_text: Option<String>,
-    /// `fn user_<stem>_inst_to_local(world_pos: vec3<f32>, inst: <Struct>) -> vec3<f32>`
-    /// — world→prototype-local mapping. Required alongside `instance_at`.
-    /// Used at march time for ray-into-local transform and Jacobian
-    /// normal reconstruction; the new emit pass also uses it (along
-    /// with the inverse derived from the forward) for fallback cases.
-    pub inst_to_local_text: Option<String>,
-    /// `fn user_<stem>_inst_world_matrix(inst: <Struct>) -> mat4x4<f32>`
-    /// — forward affine transform from canonical [0,1]³ to world space.
-    /// Returned matrix is column-major (WGSL convention). Required
-    /// alongside `instance_at`. The new emit pass writes this matrix
-    /// directly into `RkpInstance.world` for each emitted blade so the
-    /// host march descends the proto via its standard `inv_world × ray`
-    /// flow without any per-shader bespoke transform code.
-    pub inst_world_matrix_text: Option<String>,
-    /// Per-instance derivation hook. Signature:
-    /// `fn user_<stem>_instance_at(host_pos: vec3<f32>, host: HostSample,
-    /// ctx: UserCtx, k: u32, out_instance: ptr<function, <Struct>>) -> bool`.
-    /// Returns the k-th instance for this host position, or `false` to
-    /// signal "no instance at index k." Called from the new emit pass
-    /// per painted leaf to populate the per-shader instance buffer.
-    pub instance_at_text: Option<String>,
     /// Verbatim `struct ... { ... }` declarations captured from the
     /// file's top level, in source order. Shader code can declare its
     /// own helper structs; the engine splices them all back into the
-    /// generated WGSL alongside the hooks. The instance struct (if any)
-    /// is one of these.
+    /// generated WGSL alongside the hooks.
     pub struct_decls: Vec<String>,
-    /// Parsed layout of the per-instance state struct named by
-    /// `metadata.instance_proto_struct`. Populated alongside the entry
-    /// when the shader opts into Option B.
-    pub instance_layout: Option<InstanceLayout>,
     /// V1 mesh-path `fn spawn_count(anchor, frame) -> u32`. Required
     /// for mesh-path shaders. The orchestration layer copies this
     /// verbatim into both the raster and compute composed sources.
@@ -228,8 +181,6 @@ impl UserShaderEntry {
     pub(super) fn has_any_hook(&self) -> bool {
         self.shade_text.is_some()
             || self.generate_text.is_some()
-            || self.proto_text.is_some()
-            || self.instance_at_text.is_some()
             || self.vs_text.is_some()
     }
 
@@ -294,17 +245,7 @@ impl UserShaderRegistry {
                 tile_size: e.metadata.tile_size,
                 has_shade: e.shade_text.is_some(),
                 has_generate: e.generate_text.is_some(),
-                has_instance_at: e.instance_at_text.is_some(),
                 has_vs: e.is_mesh_path(),
-                instance_struct_name: e
-                    .metadata
-                    .instance_proto_struct
-                    .clone(),
-                instance_struct_size: e
-                    .instance_layout
-                    .as_ref()
-                    .map(|l| l.total_size),
-                max_emits_per_thread: e.metadata.max_emits_per_thread,
             })
             .collect()
     }
@@ -340,23 +281,11 @@ pub struct UserShaderInfo {
     pub tile_size: Option<f32>,
     pub has_shade: bool,
     pub has_generate: bool,
-    /// Phase B-redux — true if the shader provides a `instance_at`
-    /// hook. Such shaders take the march-time derivation path
-    /// (Phase 3a host-leaf dispatch + Phase 3b band-cell dispatch)
-    /// instead of Option B's emit-into-instance-pool flow.
-    pub has_instance_at: bool,
     /// V1 mesh-path — true if the shader provides a `vs` hook AND
     /// opted into `@geometry`. Such shaders route through the
     /// `tick_user_shader_mesh` per-frame compute + indirect-draw
-    /// pipeline instead of the proto/emit/tile-bin chain.
+    /// pipeline.
     pub has_vs: bool,
-    /// Name of the per-instance struct (from `@instance_proto`) if any.
-    pub instance_struct_name: Option<String>,
-    /// Byte size of the per-instance struct, if parsed. Helpful for
-    /// editor visibility into "am I close to the soft/hard limit?"
-    pub instance_struct_size: Option<u32>,
-    /// Phase 7b — per-thread emit cap. `None` falls back to 1.
-    pub max_emits_per_thread: Option<u32>,
 }
 
 /// Errors that can arise while scanning / parsing user shaders.
@@ -391,21 +320,4 @@ pub struct ComposedChunks {
     /// `dispatch_user_generate(shader_id, cell_world_pos, host, ctx)
     /// -> VoxelEmit`.
     pub generate: String,
-    /// Spliced into the prototype-bake compute shader. Defines
-    /// `dispatch_user_proto(shader_id, uvw) -> VoxelEmit`. Routes
-    /// only shaders with `@instance_proto` directives; identity
-    /// default arm returns a skip emit.
-    pub proto: String,
-    /// Empty stub since the band-cell descend path it fed was deleted.
-    /// Kept on the struct to keep the splice consumers' API stable
-    /// (their `splice_inst_chunks` calls splice an empty chunk = no-op).
-    pub instance_at: String,
-    /// Per-shader `instance_at` + `inst_world_matrix` bodies spliced
-    /// into the user-shader emit pass between the
-    /// `USER_EMIT_DISPATCH_BEGIN/END` markers. Defines the dispatch
-    /// switch that routes a `(shader_id, k)` pair to the per-shader
-    /// derivation, returning `true` + populating `*out_world_matrix`
-    /// on a successful derivation. Empty when no shader has an
-    /// `instance_at` hook.
-    pub emit: String,
 }

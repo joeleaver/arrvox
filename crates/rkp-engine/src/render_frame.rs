@@ -131,58 +131,28 @@ pub struct RenderFrame {
     pub user_shader_shade_chunk: String,
     pub user_shader_source_hash: u64,
 
-    /// Composed user-shader chunk for the prototype bake pass.
-    /// Defines `dispatch_user_proto(...)`. Spliced into
-    /// `user_shader_proto.wgsl` between its USER_PROTO_DISPATCH markers.
-    /// Empty when no shader declares an `@instance_proto`; the in-tree
-    /// identity stub returns a `voxel_emit_skip()`. Each shader's proto
-    /// is baked once into the shared pool and re-used by every emitted
-    /// instance.
-    pub user_shader_proto_chunk: String,
-
     /// Editor snapshots of all currently-registered user shaders.
     /// Mirrors `StateUpdate.user_shaders`.
     pub user_shader_infos: Vec<rkp_render::shader_composer::UserShaderInfo>,
 
-    /// Full registry entries used by the prototype bake + emit pass.
-    /// The render thread walks these to deduplicate per-shader proto
-    /// assets against the proto cache and to drive the per-shader
-    /// emit-shader compose. Heavier than `user_shader_infos` (carries
-    /// WGSL bodies + InstanceLayout). Cost is one `Vec` clone per
-    /// frame — negligible against the snapshot's other allocations.
+    /// Full registry entries — render thread walks these to drive the
+    /// per-shader mesh-path compose. Heavier than `user_shader_infos`
+    /// (carries WGSL bodies). Cost is one `Vec` clone per frame.
     /// Empty when no shaders are registered.
     pub user_shader_entries: Vec<rkp_render::shader_composer::UserShaderEntry>,
-
-    /// Per-leaf records for the user-shader emit pass. One entry per
-    /// painted leaf cell whose material has an `instance_at` hook.
-    /// The emit pass dispatches one thread per leaf, calls the
-    /// shader's `instance_at` for k = 0..MAX_EMITS_PER_LEAF, and
-    /// writes one `RkpInstance` per accepted instance into
-    /// `RkpScene::user_shader_instance_buffer`.
-    /// Wrapped in `Arc` so the per-frame snapshot handoff is a refcount
-    /// bump rather than a 100+ MB memcpy when paint covers a million-
-    /// plus host leaves. Sim rebuilds the inner `Vec` only on paint or
-    /// geometry epoch change; in steady state the same `Arc` is shared
-    /// across frames.
-    pub painted_leaves: std::sync::Arc<Vec<rkp_render::user_shader_emit_pass::EmitLeaf>>,
 
     /// Per-material anchor records for the V1 mesh-path user-shader
     /// pipeline. Each material with painted leaves carries its own
     /// anchor list (compute + raster dispatch once per material per
-    /// frame). Same `Arc` sharing as `painted_leaves` — sim rebuilds
-    /// the inner map only on paint/geometry-epoch change.
+    /// frame). Wrapped in `Arc` so the per-frame snapshot handoff is a
+    /// refcount bump; sim rebuilds the inner map only on paint /
+    /// geometry-epoch change.
     pub painted_anchors: std::sync::Arc<
         std::collections::HashMap<
             u16,
             Vec<rkp_render::user_shader_mesh_pass::AnchorRecord>,
         >,
     >,
-
-    /// Composed `emit` chunk — per-shader `instance_at` +
-    /// `inst_world_matrix` bodies + dispatch switch, spliced into
-    /// `user_shader_emit.wgsl` between its USER_EMIT_DISPATCH markers.
-    /// Empty when no shader has an `instance_at` hook.
-    pub user_shader_emit_chunk: String,
 
     /// Scene-wide light list (sun + entity point/spot lights), in the
     /// order the shade shader expects (entry 0 = sun).

@@ -261,35 +261,10 @@ fn brick_id_of(node: u32) -> u32 {
 // stats[57]      = skinned march bone-field populated-cell reads
 // stats[58]      = skinned march brick-skip hits (empty-brick fast-forward)
 // stats[59]      = skinned march brick-populated samples
-// stats[60..71]  = (deprecated — band-cell + Phase-3a descend counters
-//                   from the pre-`2bc372c` user-shader path. Slots
-//                   stay zero now; kept reserved for one cycle so any
-//                   in-flight readback tooling reads predictable nulls.)
-// stats[71]      = emit-scan candidates iterated (per-pixel sum of
-//                   `us_tile_count`)
-// stats[72]      = emit-scan candidates passing world-AABB pre-cull
-// stats[73]      = emit-scan marches issued (`march_object_inner`
-//                   calls — only the AABB-passing subset)
-// stats[74]      = emit-scan total descent steps (subset of `stats[0]`
-//                   attributable to user-shader emit instances)
-// stats[75]      = emit-scan pixels that produced an opaque hit from
-//                   an emitted instance (`r.alpha > 0.99` branch taken)
-// stats[76]      = emit-scan OUTER octree-DDA steps (sum across all
-//                   emit marches; includes EMPTY-cell skip_node hops)
-// stats[77]      = emit-scan BRICK-DDA steps (sum across all emit
-//                   marches; cell-by-cell traversal inside a 4³ brick)
-// stats[78]      = emit-scan marches that returned `r.valid == false`
-//                   (proto descent ran but found no surface — the
-//                   "miss" path that dominates a sparse paint)
-// stats[79]      = emit-scan miss-march descent steps (sum of `r.steps`
-//                   for marches with `r.valid == false`); the per-miss
-//                   step cost = `stats[79] / stats[78]`
-// stats[80]      = emit-scan candidates rejected because the ray missed
-//                   the instance world AABB in 3D (tile-bin slack)
-// stats[81]      = emit-scan candidates rejected because the AABB sits
-//                   behind `max_world_dist` (depth-occluded by an
-//                   already-recorded hit). [80] + [81] sums to the
-//                   pre-`emit_aabb_pass` reject count.
+// stats[60..82]  = (reserved — old user-shader emit + descend counters,
+//                   retired alongside the band-cell / emit / proto path.
+//                   Slots stay zero so any in-flight readback tooling
+//                   reads predictable nulls.)
 //
 // octree_nodes reads are derived CPU-side from the per-phase depth histograms:
 // sum(bucket[i] * (i + 1)) since each lookup descends `depth+1` nodes.
@@ -301,29 +276,6 @@ const PHASE_NORMAL: u32 = 1u;
 // Flat list of object indices, grouped by tile. Unbounded object count
 // per scene — replaces the retired 32-object bitmask culling scheme.
 @group(2) @binding(5) var<storage, read> tile_object_ids: array<u32>;
-// User-shader emit-pass output: each blade as a real RkpInstance with
-// `world` set to the forward affine and `asset_id` pointing at its
-// proto. Read in a fall-through scan past the per-tile loop. Empty
-// (count = 0) when no shader registers an `instance_at` hook.
-@group(2) @binding(6) var<storage, read> user_shader_instances: array<RkpInstance>;
-@group(2) @binding(7) var<storage, read> user_shader_instance_count: array<u32>;
-// Per-emitted-instance world AABB (parallel-indexed with
-// `user_shader_instances`). Two `vec4<f32>` per entry: (min.xyz, _),
-// (max.xyz, _). Fast pre-cull before the matrix-inverse + descend.
-@group(2) @binding(11) var<storage, read> user_shader_instance_aabbs: array<vec4<f32>>;
-// Per-tile (8×8 pixel) bin of emitted instance indices. Built each
-// frame by `user_shader_tile_bin.wgsl`. The march reads only the
-// current pixel's tile list — per-pixel cost drops to
-// `O(N_in_my_tile)`.
-@group(2) @binding(12) var<storage, read> user_shader_tile_counts: array<u32>;
-@group(2) @binding(13) var<storage, read> user_shader_tile_lists: array<u32>;
-// Per-emitted-instance precomputed inv_world (mat4x4<f32>, 64 B
-// each). The emit pass computes once per blade so the per-pixel
-// march doesn't redo the affine inverse — saves ~30 ops per
-// (instance × pixel).
-@group(2) @binding(14) var<storage, read> user_shader_instance_inv_world: array<mat4x4<f32>>;
-const USER_SHADER_MAX_INSTANCES_PER_TILE: u32 = 1024u;
-
 // Phase B-redux Phase 3a — per-material `shader_params` flat array
 // (8 × f32 per material slot, indexed by `material_id * 8 + i`).
 // Used to populate `ctx.params` for the `instance_at` dispatcher.
@@ -361,19 +313,6 @@ fn bucket_depth(phase: u32, level: u32) {
     let base = 4u + phase * 12u;
     atomicAdd(&stats[base + min(level, 11u)], 1u);
 }
-
-// Descend-body breakdown counters. The composer-generated
-// `rkp_user_<id>_instance_descend` body calls these per candidate so
-// we can attribute time across the per-candidate cost stages
-// (`stats[66..71]`). Defined as free functions because the same
-// composed body is spliced into shadow_scatter.wgsl, which has no
-// `stats` binding and stubs them out as no-ops; same pattern as
-// `bucket_depth`.
-fn record_descend_k_test()      { atomicAdd(&stats[66], 1u); }
-fn record_descend_aabb_reject() { atomicAdd(&stats[67], 1u); }
-fn record_descend_descended()   { atomicAdd(&stats[68], 1u); }
-fn record_descend_miss()        { atomicAdd(&stats[69], 1u); }
-fn record_descend_hit()         { atomicAdd(&stats[70], 1u); }
 
 /// Look up a single neighbor cell's occupancy state given an offset
 /// from the hit cell. Resolves cross-brick reads by chaining 1–3
@@ -1480,149 +1419,9 @@ fn main(
         }
     }
 
-    // ── User-shader emitted instances ────────────────────────────
-    // The emit pass writes one RkpInstance per painted-leaf-derived
-    // blade into `user_shader_instances`. Each pixel walks its 8×8
-    // tile's bin (built each frame by `user_shader_tile_bin.wgsl`),
-    // ray-AABB pre-culls, then calls `march_object_inner` on survivors.
-    // Per-pixel cost is `O(N_in_my_tile)`.
-    //
-    // `march_params.uss_disable` (CPU mirror of `RKP_USS_DISABLE=1`)
-    // skips the whole block — the host march still populates the
-    // G-buffer, so the scene renders without grass / blades and the
-    // delta in pass time is the pure user-shader scan cost.
-    var emit_candidates: u32 = 0u;
-    var emit_aabb_pass: u32 = 0u;
-    var emit_marches: u32 = 0u;
-    var emit_steps: u32 = 0u;
-    var emit_hits: u32 = 0u;
-    var emit_outer_steps: u32 = 0u;
-    var emit_brick_steps: u32 = 0u;
-    var emit_misses: u32 = 0u;
-    var emit_miss_steps: u32 = 0u;
-    var emit_aabb_3d_miss: u32 = 0u;
-    var emit_behind_max_dist: u32 = 0u;
-    if march_params.uss_disable == 0u {
-        let us_pixel_tile_x = u32(coord.x) / 8u;
-        let us_pixel_tile_y = u32(coord.y) / 8u;
-        let us_pixel_tile_id = us_pixel_tile_y * march_params.tile_count_x + us_pixel_tile_x;
-        let us_tile_raw_count = user_shader_tile_counts[us_pixel_tile_id];
-        let us_tile_count = min(us_tile_raw_count, USER_SHADER_MAX_INSTANCES_PER_TILE);
-        // Precompute world-space inverse ray direction for the cheap
-        // ray-vs-world-AABB pre-cull (still useful — many tile-list
-        // entries are conservative AABB bin overlaps that pixels miss).
-        let safe_world_dir = vec3<f32>(
-            select(ray_dir.x, select(-1e-10, 1e-10, ray_dir.x >= 0.0), abs(ray_dir.x) < 1e-10),
-            select(ray_dir.y, select(-1e-10, 1e-10, ray_dir.y >= 0.0), abs(ray_dir.y) < 1e-10),
-            select(ray_dir.z, select(-1e-10, 1e-10, ray_dir.z >= 0.0), abs(ray_dir.z) < 1e-10),
-        );
-        let inv_world_dir = 1.0 / safe_world_dir;
-        emit_candidates = us_tile_count;
-        for (var li: u32 = 0u; li < us_tile_count; li = li + 1u) {
-            let ui = user_shader_tile_lists[
-                us_pixel_tile_id * USER_SHADER_MAX_INSTANCES_PER_TILE + li
-            ];
-            let aabb_min = user_shader_instance_aabbs[ui * 2u + 0u].xyz;
-            let aabb_max = user_shader_instance_aabbs[ui * 2u + 1u].xyz;
-            let world_aabb_t = intersect_aabb(ray_origin, inv_world_dir, aabb_min, aabb_max);
-            if world_aabb_t.x > world_aabb_t.y {
-                emit_aabb_3d_miss = emit_aabb_3d_miss + 1u;
-                continue;
-            }
-            if world_aabb_t.x > max_world_dist {
-                emit_behind_max_dist = emit_behind_max_dist + 1u;
-                continue;
-            }
-
-            let inst = user_shader_instances[ui];
-            let asset = assets[inst.asset_id];
-            if asset.geom_type == 0u { continue; }
-            if !rkp_object_visible(inst) { continue; }
-            emit_aabb_pass = emit_aabb_pass + 1u;
-
-            // Use the precomputed inv_world from the emit pass instead of
-            // re-inverting inst.world per pixel. Emit instances are never
-            // skinned (the proto-bake path doesn't support skinning), so we
-            // skip the skinned dispatch entirely and call the affine body.
-            let inv_world = user_shader_instance_inv_world[ui];
-            let local_origin = (inv_world * vec4<f32>(ray_origin, 1.0)).xyz;
-            let local_dir_unnorm = (inv_world * vec4<f32>(ray_dir, 0.0)).xyz;
-            let r = march_object_inner(local_origin, local_dir_unnorm, inst, asset);
-            emit_marches = emit_marches + 1u;
-            emit_steps = emit_steps + r.steps;
-            emit_outer_steps = emit_outer_steps + r.outer_steps;
-            emit_brick_steps = emit_brick_steps + r.brick_steps;
-            total_steps += r.steps;
-            if !r.valid {
-                emit_misses = emit_misses + 1u;
-                emit_miss_steps = emit_miss_steps + r.steps;
-                continue;
-            }
-
-            let inv_a = 1.0 / max(r.alpha, 0.001);
-            let oc_pos = r.oc_pos * inv_a;
-            let color = r.color * inv_a;
-            let local_normal = normalize(r.normal * inv_a);
-            let local_hit = oc_pos + asset.grid_origin;
-            let world_pos = (inst.world * vec4<f32>(local_hit, 1.0)).xyz;
-            let hit_dist = length(world_pos - ray_origin);
-            if hit_dist > max_world_dist { continue; }
-            let world_normal = normalize((inst.world * vec4<f32>(local_normal, 0.0)).xyz);
-
-            if r.alpha > 0.99 {
-                accum_pos = world_pos;
-                accum_normal = world_normal;
-                accum_color = color;
-                accum_alpha = 1.0;
-                first_dist = hit_dist;
-                first_obj_id = inst.object_id;
-                first_color_intensity = r.color_intensity;
-                // Emit-pass instances inherit material from the host paint
-                // through `inst.material_id`. The proto's leaf_attrs carry
-                // `material_primary = 0` (proto bake doesn't know about
-                // host materials); override to the per-instance material.
-                first_mat_id = inst.material_id;
-                first_sec_mat = 0u;
-                first_blend = 0u;
-                first_leaf_slot = 0u;
-                have_first = true;
-                max_world_dist = hit_dist;
-                emit_hits = emit_hits + 1u;
-                // Pick: emitted blades select their host instance for now
-                // (`inst.object_id` carries the host's `object_id`).
-                if hit_dist < pick_dist {
-                    pick_dist = hit_dist;
-                    pick_obj_id = inst.object_id;
-                    pick_leaf_slot = 0u;
-                }
-                // Don't update closest_obj_idx — it indexes `instances[]`,
-                // not `user_shader_instances[]`. Footprint histogram +
-                // post-loop pickup gates on `closest_obj_idx != 0xFFFFFFFF`,
-                // so leaving the sentinel here harmlessly skips them.
-                closest_obj_idx = 0xFFFFFFFFu;
-            }
-        }
-    }
-
-
     // Stats.
     atomicAdd(&stats[0], total_steps);
     atomicMax(&stats[3], total_steps);
-    // Emit-scan per-pixel counters → stats[71..76]. Thread-local
-    // accumulation above; one atomic per slot per pixel here. Skipped
-    // when the counter is zero so empty-tile pixels don't pay for the
-    // atomic at all.
-    if emit_candidates  != 0u { atomicAdd(&stats[71], emit_candidates); }
-    if emit_aabb_pass   != 0u { atomicAdd(&stats[72], emit_aabb_pass); }
-    if emit_marches     != 0u { atomicAdd(&stats[73], emit_marches); }
-    if emit_steps       != 0u { atomicAdd(&stats[74], emit_steps); }
-    if emit_hits        != 0u { atomicAdd(&stats[75], emit_hits); }
-    if emit_outer_steps != 0u { atomicAdd(&stats[76], emit_outer_steps); }
-    if emit_brick_steps != 0u { atomicAdd(&stats[77], emit_brick_steps); }
-    if emit_misses      != 0u { atomicAdd(&stats[78], emit_misses); }
-    if emit_miss_steps  != 0u { atomicAdd(&stats[79], emit_miss_steps); }
-    if emit_aabb_3d_miss    != 0u { atomicAdd(&stats[80], emit_aabb_3d_miss); }
-    if emit_behind_max_dist != 0u { atomicAdd(&stats[81], emit_behind_max_dist); }
 
     // Footprint histogram: size in pixels of the finest voxel at the hit point.
     // <1px means we walked to a mip level finer than the screen can resolve.

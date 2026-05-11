@@ -183,18 +183,6 @@ fn bucket_depth(phase: u32, level: u32) {
 // only because the lib fn still references the symbol.
 fn bucket_lod_exit(level: u32) {}
 
-// Descend-body breakdown counters — same slot layout as octree_march.
-// The composer-generated `rkp_user_<id>_instance_descend` body calls
-// these per candidate; both the primary march and shadow trace
-// contribute to the same `stats[66..71]` totals (we want the combined
-// candidate count when reasoning about descend cost).
-fn record_descend_k_test()      { atomicAdd(&stats[66], 1u); }
-fn record_descend_aabb_reject() { atomicAdd(&stats[67], 1u); }
-fn record_descend_descended()   { atomicAdd(&stats[68], 1u); }
-fn record_descend_miss()        { atomicAdd(&stats[69], 1u); }
-fn record_descend_hit()         { atomicAdd(&stats[70], 1u); }
-
-
 // `slot_is_brick`, `slot_brick_id`, `slot_is_band`, `slot_band_offset`
 // are imported from `lib::octree_slot` at the top of this file.
 

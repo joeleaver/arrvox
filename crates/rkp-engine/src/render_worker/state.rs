@@ -179,12 +179,6 @@ pub(super) struct RenderState {
     pub(super) viewport_renderers: std::collections::HashMap<ViewportId, ViewportRenderer>,
     pub(super) scene_mgr: Arc<Mutex<RkpSceneManager>>,
 
-    /// User-shader instance emit pass. Per-frame compute pass that
-    /// reads `frame.painted_leaves`, calls each shader's
-    /// `instance_at` + `inst_world_matrix` hooks per leaf, and writes
-    /// `RkpInstance` records into `RkpScene::user_shader_instance_buffer`.
-    pub(super) user_shader_emit_pass: rkp_render::user_shader_emit_pass::UserShaderEmitPass,
-
     /// Per-material cache of pipelines + buffers + bind groups for
     /// the V1 mesh-path. Created on first frame a mesh-path
     /// material is painted; rebuilt on shader source-hash change.
@@ -212,18 +206,6 @@ pub(super) struct RenderState {
             >,
         >,
     >,
-
-    /// Voxel sprite instancing — scene-wide pieces. The
-    /// per-viewport march + composite live in [`ViewportRenderer`]
-    /// (Stage 6c-2). All four pieces here are constructed at startup
-    /// Phase B-redux — prototype bake pass + cache. The bake writes
-    /// each registered instance shader's prototype octree into the
-    /// host pool tail; the cache deduplicates by source hash so
-    /// re-bakes only happen on shader edit. The host march dispatches
-    /// `descend_proto_octree` against these prototypes when a band-
-    /// cell hit triggers `instance_at` derivation.
-    pub(super) instance_proto_pass: rkp_render::user_shader_proto_pass::PrototypeBakePass,
-    pub(super) instance_proto_cache: rkp_render::user_shader_proto_pass::PrototypeCache,
 
     /// Phase 7 — TLAS over instance AABBs. Session 2 ships the host
     /// CPU builder + GPU upload (called per frame from
@@ -274,17 +256,6 @@ pub(super) struct RenderState {
     /// frame, not a one-shot dirty bit).
     pub(super) last_uploaded_geometry_epoch: u64,
 
-    /// `Arc` handle to the painted-leaf vec we last uploaded to the
-    /// emit pass's `leaves_buffer`. Sim ships an `Arc<Vec<EmitLeaf>>`
-    /// in every snapshot; the inner pointer only changes when sim
-    /// rebuilds (paint or geometry epoch transition). Comparing Arc
-    /// pointers (`Arc::ptr_eq`) before each frame's upload skips a
-    /// ~130 MB `queue.write_buffer` per frame on heavy-paint scenes
-    /// in steady state.
-    pub(super) last_uploaded_painted_leaves: Option<
-        std::sync::Arc<Vec<rkp_render::user_shader_emit_pass::EmitLeaf>>,
-    >,
-
     /// `view_proj` of the most recent rendered frame, per viewport.
     /// Overrides the `prev_vp` baked into incoming snapshots before
     /// camera + volumetric uploads — without this, TAA reprojection
@@ -321,23 +292,6 @@ pub(super) struct RenderState {
 pub(super) const MIN_FRAME_CALLBACK_INTERVAL: std::time::Duration =
     std::time::Duration::from_micros(8_300);
 
-// Phase B-redux proto-cache pool capacities. Must match the
-// `PROTO_TAIL_*_BYTES` reservation `tick_instance_pipeline` requests in
-// the host scene buffers. The cache sub-allocates octree slots within
-// `pool_octree_capacity`, and the bake's overflow check uses these to
-// gate out-of-bounds writes (via the global brick / leaf-attr cursors).
-//
-// The proto tail lives inside the host pool alongside Phase C's much
-// larger transient tail, so the proto budget stays tight to keep the
-// total under `max_buffer_size`. Authors needing more proto headroom
-// should reduce paint area or cell_size, not these caps.
-const INSTANCE_PROTO_OCTREE_CAPACITY_U32: u32 =
-    (rkp_render::user_shader_proto_pass::PROTO_TAIL_OCTREE_BYTES / 8) as u32; // 2 M nodes
-const INSTANCE_PROTO_BRICK_CAPACITY_BRICKS: u32 =
-    (rkp_render::user_shader_proto_pass::PROTO_TAIL_BRICK_BYTES / 256) as u32; // 64 K bricks
-const INSTANCE_PROTO_LEAF_ATTR_CAPACITY_U32: u32 =
-    (rkp_render::user_shader_proto_pass::PROTO_TAIL_LEAF_ATTR_BYTES / 8) as u32; // 1 M slots
-
 impl RenderState {
     pub(super) fn new(init: RenderInit) -> Self {
         let device = init.device;
@@ -366,25 +320,6 @@ impl RenderState {
             mapped_at_creation: false,
         });
 
-        // Instance prototype bake pass + cache. Scene
-        // dispatches the bake when an instance shader's source hash
-        // changes; the cache deduplicates per-shader prototype slots
-        // in the host pool tail. Idle until the first instance shader
-        // registers.
-        let instance_proto_pass =
-            rkp_render::user_shader_proto_pass::PrototypeBakePass::new(&device);
-        // User-shader instance emit pass. Reads painted-leaf records
-        // each frame, dispatches the per-shader instance derivation,
-        // writes `RkpInstance` records to the scene's
-        // `user_shader_instance_buffer`.
-        let user_shader_emit_pass =
-            rkp_render::user_shader_emit_pass::UserShaderEmitPass::new(&device);
-        let instance_proto_cache =
-            rkp_render::user_shader_proto_pass::PrototypeCache::with_capacities(
-                INSTANCE_PROTO_OCTREE_CAPACITY_U32,
-                INSTANCE_PROTO_BRICK_CAPACITY_BRICKS,
-                INSTANCE_PROTO_LEAF_ATTR_CAPACITY_U32,
-            );
         // Phase 7 Session 1 — TLAS foundation.
         let tlas_pass = rkp_render::tlas_pass::TlasPass::new(&device);
         // Phase 7c — GPU TLAS build pipeline.
@@ -396,12 +331,9 @@ impl RenderState {
             renderer,
             viewport_renderers,
             scene_mgr: init.scene_mgr,
-            instance_proto_pass,
-            user_shader_emit_pass,
             mesh_user_shader_cache: std::collections::HashMap::new(),
             user_shader_mesh_draws: Vec::new(),
             last_uploaded_painted_anchors: None,
-            instance_proto_cache,
             tlas_pass,
             tlas_build_pass,
             pick_readback_buffer,
@@ -415,7 +347,6 @@ impl RenderState {
             // 0 = "never uploaded any geometry yet" — the first
             // snapshot with epoch > 0 triggers an upload.
             last_uploaded_geometry_epoch: 0,
-            last_uploaded_painted_leaves: None,
             // Empty until the first render — the first frame's
             // override falls back to the snapshot's own view_proj
             // (i.e. prev_vp == view_proj, no motion).

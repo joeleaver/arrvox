@@ -53,12 +53,6 @@ pub(super) struct PreFrameOutput {
     /// Phase 3's per-VR `shade_params.shadow_map_enabled` mirrors this
     /// (gated additionally on InSitu mode).
     pub(super) shadow_map_enabled: bool,
-    /// Upper-bound count for user-shader emitted instances:
-    /// `painted_leaves × MAX_EMITS_PER_LEAF`. Used to size the tile-bin
-    /// dispatch; the GPU shader threshold-checks against the actual
-    /// count written to `user_shader_instance_count_buffer` by the
-    /// emit pass.
-    pub(super) user_shader_instance_count: u32,
 }
 
 /// Cross-phase state from `encode_viewports` consumed by `finalize_frame`.
