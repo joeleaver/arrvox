@@ -894,7 +894,7 @@ fn parses_mesh_path_shader_minimal() {
 // @param density: f32 = 1.0, range = [0.0, 4.0]
 
 fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 {
-    return u32(ctx_param(0) * anchor.surface_area);
+    return u32(ctx_param(0) * (anchor.tile_max.x - anchor.tile_min.x) * (anchor.tile_max.z - anchor.tile_min.z));
 }
 
 fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> VsOut {
@@ -1067,17 +1067,17 @@ fn hash01(s: u32) -> f32 {
 }
 
 fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 {
-    return u32(ctx_param(0) * anchor.surface_area);
+    return u32(ctx_param(0) * (anchor.tile_max.x - anchor.tile_min.x) * (anchor.tile_max.z - anchor.tile_min.z));
 }
 
 fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> VsOut {
     let r = hash01(anchor.seed ^ spawn_idx);
     var out: VsOut;
     out.clip_pos = vec4<f32>(0.0, 0.0, 0.0, 1.0);
-    out.world_pos = anchor.world_pos;
-    out.world_normal = anchor.surface_normal;
+    out.world_pos = anchor.tile_min;
+    out.world_normal = vec3<f32>(0.0, 1.0, 0.0);
     out.material_packed = anchor.material_id;
-    out.color_rgb = anchor.host_color.rgb;
+    out.color_rgb = vec3<f32>(1.0);
     out.blend_f = r;
     out.intensity = 0u;
     return out;
@@ -1125,7 +1125,7 @@ fn compose_mesh_path_splices_user_body_into_both_templates() {
 fn helper_double(x: f32) -> f32 { return x * 2.0; }
 
 fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 {
-    return u32(helper_double(anchor.surface_area));
+    return u32(helper_double((anchor.tile_max.x - anchor.tile_min.x) * (anchor.tile_max.z - anchor.tile_min.z)));
 }
 
 fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> VsOut {

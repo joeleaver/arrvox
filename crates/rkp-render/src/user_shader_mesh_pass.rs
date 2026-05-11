@@ -34,49 +34,54 @@ const GBUFFER_PICK_FORMAT: wgpu::TextureFormat = GBUFFER_LEAF_SLOT_FORMAT;
 
 // ─── Data types shared with rkp-engine ─────────────────────────────
 
-/// One painted leaf, partitioned by user-shader material. CPU packs one
-/// per (entity × painted-leaf-cell) tuple whose material has a user
-/// shader registered against it.
+/// One painted *tile*, partitioned by user-shader material. CPU packs
+/// one per (entity × material × tile-coord) tuple whose material has
+/// a user shader registered against it. Tile size comes from the
+/// shader's `@tile_size` directive; without it, the whole entity's
+/// painted region for this material collapses into a single anchor
+/// (the tile cube falls back to the painted-leaf AABB).
+///
+/// **Bounds are the tile cube**, not the painted-leaf AABB. Stable
+/// across paint additions inside the tile, so a hashed
+/// `mix(tile_min, tile_max, r)` blade position doesn't shift when
+/// the user paints more inside the same tile. The painted-leaf
+/// bounds are tracked separately for `surface_y` only.
 ///
 /// Layout mirrors WGSL `AnchorContext` in `user_shader_mesh.wesl`:
-///   offset  0..12  world_pos          vec3<f32>
-///   offset 12..16  leaf_extent        f32       (packs with vec3's tail)
-///   offset 16..28  surface_normal     vec3<f32>
-///   offset 28..32  surface_area       f32       (packs with vec3's tail)
-///   offset 32..48  host_color         vec4<f32>
-///   offset 48..52  material_id        u32
-///   offset 52..56  material_blend     u32       (secondary:16 | blend4:4 | reserved:12)
-///   offset 56..60  leaf_slot          u32
-///   offset 60..64  seed               u32
+///   offset  0..12  tile_min           vec3<f32>
+///   offset 12..16  material_id        u32       (packs with vec3's tail)
+///   offset 16..28  tile_max           vec3<f32>
+///   offset 28..32  leaf_count         u32       (density signal)
+///   offset 32..36  object_id          u32
+///   offset 36..40  surface_y          f32       (blade base y; V1 = painted aabb.max.y)
+///   offset 40..44  seed               u32
+///   offset 44..64  _pad               5×u32
 ///
-/// 64 bytes total — aligns to 16 (WGSL std430 requirement for storage
-/// buffer element). Each field's offset is asserted at compile time.
+/// 64 B total — aligns to 16 (WGSL std430). Field offsets asserted
+/// at compile time.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
 pub struct AnchorRecord {
-    pub world_pos: [f32; 3],
-    pub leaf_extent: f32,
-    pub surface_normal: [f32; 3],
-    pub surface_area: f32,
-    pub host_color: [f32; 4],
+    pub tile_min: [f32; 3],
     pub material_id: u32,
-    pub material_blend: u32,
-    pub leaf_slot: u32,
+    pub tile_max: [f32; 3],
+    pub leaf_count: u32,
+    pub object_id: u32,
+    pub surface_y: f32,
     pub seed: u32,
+    pub _pad: [u32; 5],
 }
 
 const _: () = assert!(std::mem::size_of::<AnchorRecord>() == 64);
 const _: () = {
     use std::mem::offset_of;
-    assert!(offset_of!(AnchorRecord, world_pos) == 0);
-    assert!(offset_of!(AnchorRecord, leaf_extent) == 12);
-    assert!(offset_of!(AnchorRecord, surface_normal) == 16);
-    assert!(offset_of!(AnchorRecord, surface_area) == 28);
-    assert!(offset_of!(AnchorRecord, host_color) == 32);
-    assert!(offset_of!(AnchorRecord, material_id) == 48);
-    assert!(offset_of!(AnchorRecord, material_blend) == 52);
-    assert!(offset_of!(AnchorRecord, leaf_slot) == 56);
-    assert!(offset_of!(AnchorRecord, seed) == 60);
+    assert!(offset_of!(AnchorRecord, tile_min) == 0);
+    assert!(offset_of!(AnchorRecord, material_id) == 12);
+    assert!(offset_of!(AnchorRecord, tile_max) == 16);
+    assert!(offset_of!(AnchorRecord, leaf_count) == 28);
+    assert!(offset_of!(AnchorRecord, object_id) == 32);
+    assert!(offset_of!(AnchorRecord, surface_y) == 36);
+    assert!(offset_of!(AnchorRecord, seed) == 40);
 };
 
 /// Per-frame engine uniforms uploaded once per render. Layout matches

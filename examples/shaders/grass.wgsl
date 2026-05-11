@@ -1,42 +1,31 @@
-// grass.wgsl — V1 mesh-path reference user shader.
+// grass.wgsl — V1 mesh-path reference user shader (tile-based anchors).
 //
-// Replaces the previous Option B (proto-bake + emit-pass) demo.
-// This shader runs through the V1 mesh-path: a per-painted-leaf
-// dynamic spawn count, then a hardware-instanced vertex shader that
-// emits one triangle-quad per blade directly into the G-buffer.
+// Each painted material gets one anchor per painted tile, where tile
+// size is set by `@tile_size` below. The shader's `spawn_count` decides
+// how many blades to emit for the tile based on its world-space AABB
+// area; `vs` places blades inside that AABB.
 //
-// Drop this file (or a copy named after your material's shader name)
-// into your project's `assets/shaders/`. Then create a material whose
-// `shader` field is `"grass"` and paint that material onto a surface.
-//
-// V1 mesh-path API (see notes/user-shaders-mesh.md):
-//   · `@geometry procedural { vertex_count: N }` — N verts per blade,
-//     VS reads `@builtin(vertex_index)` 0..N-1.
-//   · `fn spawn_count(anchor, frame) -> u32` — required. Returns how
-//     many blades this painted-leaf anchor should emit.
-//   · `fn vs(anchor, spawn_idx, vid, frame) -> VsOut` — required.
-//     Computes world position + shading payload for one vertex.
-//   · `fn spawn_alive(anchor, spawn_idx, frame) -> bool` — optional
-//     last-mile filter. Default true.
-//   · `fn fs(in: VsOut) -> FsOut` — optional. Default packs anchor
-//     material + interpolated color into the G-buffer.
+// V1 limits:
+//   · No paint probe — blades scatter uniformly across the tile's
+//     painted-leaf bounding box. Boundary tiles may show grass on
+//     unpainted parts of the painted-leaf AABB.
+//   · Blades grow +Y. No per-tile normal yet; slopes will look
+//     incorrect.
+// Both lift on the V1.1 paint-probe + per-tile-normal follow-up.
 
-// ── Geometry: 6 verts (2 triangles, 1 quad) per blade ─────────────
+// ── Manifest ──────────────────────────────────────────────────────
 // @geometry procedural { vertex_count: 6 }
-// `@animated` is informational (signals wind sway in `vs`); does not
-// gate caching since spawn_count is `f(anchor)` only.
+// @tile_size 0.5
 // @animated
 
 // ── Per-material params ───────────────────────────────────────────
-// `density` is blades-per-m². At ~4 cm painted-leaf voxels each
-// anchor has ~0.0016 m² of surface; default 1000 gives ~1-2 blades
-// per anchor on average via probabilistic spawn (sub-integer
-// densities round stochastically rather than to zero).
-// @param blade_height: f32 = 0.35, range = [0.05, 1.5]
-// @param blade_width:  f32 = 0.04, range = [0.01, 0.2]
+// `density` is blades-per-m² of painted surface. Probabilistic
+// rounding spreads sub-integer expected counts across spawns.
+// @param blade_height: f32 = 0.35,   range = [0.05, 1.5]
+// @param blade_width:  f32 = 0.04,   range = [0.01, 0.2]
 // @param density:      f32 = 1000.0, range = [1.0, 8000.0]
-// @param wind_amp:     f32 = 0.08, range = [0.0, 0.3]
-// @param wind_freq:    f32 = 1.5,   range = [0.0, 6.0]
+// @param wind_amp:     f32 = 0.08,   range = [0.0, 0.3]
+// @param wind_freq:    f32 = 1.5,    range = [0.0, 6.0]
 
 // ── Helpers ───────────────────────────────────────────────────────
 fn grass_hash_u01(seed: u32) -> f32 {
@@ -50,70 +39,60 @@ fn grass_hash_u01(seed: u32) -> f32 {
 }
 
 // ── spawn_count ───────────────────────────────────────────────────
-// Density-based: `blades = density × surface_area`. `anchor.surface_area`
-// is the painted-leaf face's area (V1 def: `leaf_size²`).
-//
-// Sub-integer expected counts are handled probabilistically: the
-// integer part is emitted unconditionally and the fractional part
-// becomes the probability of one extra spawn. Uses `anchor.seed`
-// (stable across frames) so the count doesn't flicker. Without this
-// rounding, a small voxel × moderate density (e.g. 80 × 0.0016 = 0.128)
-// would floor to zero blades — the visible bug fixed here.
-//
-// Hard-capped at 64 per V1's per-anchor spawn ceiling
-// (`MAX_SPAWNS_PER_ANCHOR_V1`).
+// Density per tile XZ ground area. Tile cube bounds are stable across
+// paint additions inside the tile, so spawn count for an already-
+// painted tile doesn't change when the user adds adjacent paint.
+// Probabilistic rounding so sub-integer counts don't floor to 0.
+// Capped at the engine's per-anchor spawn ceiling (V1 = 16).
 fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 {
     let density = ctx_param(2);
-    let raw = density * anchor.surface_area;
+    let extent_x = max(anchor.tile_max.x - anchor.tile_min.x, 0.0);
+    let extent_z = max(anchor.tile_max.z - anchor.tile_min.z, 0.0);
+    let xz_area = extent_x * extent_z;
+    let raw = density * xz_area;
+
     let base = u32(floor(raw));
     let frac = raw - f32(base);
     let r = grass_hash_u01(anchor.seed ^ 0xA341316Cu);
     var n = base;
     if (r < frac) { n = n + 1u; }
-    return min(n, 64u);
+    return min(n, 16u);
 }
 
-// ── vs — one blade quad per (anchor, spawn_idx) ───────────────────
-// vid 0..5 maps to a 2-triangle quad standing upright at the anchor:
-//   tri 1: (0,0), (1,0), (1,1)
-//   tri 2: (0,0), (1,1), (0,1)
-// where (u, v) ∈ [0,1]² is local blade space (u = width axis, v = height).
+// ── vs ────────────────────────────────────────────────────────────
+// Places one blade per spawn_idx inside the tile's XZ AABB; blade base
+// sits at `aabb_max.y` (the painted surface top, V1 approximation).
+// Six-vertex tapered quad oriented around a per-blade yaw with wind
+// sway driven by `frame.time`.
 fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> VsOut {
     let blade_height = ctx_param(0);
     let blade_width  = ctx_param(1);
     let wind_amp     = ctx_param(3);
     let wind_freq    = ctx_param(4);
 
-    // Per-spawn deterministic seeds (stable across frames so blades
-    // don't shimmer).
+    // Per-spawn deterministic seeds (stable across frames).
     let s0 = anchor.seed ^ (spawn_idx * 0x9E3779B9u);
-    let r_jx     = grass_hash_u01(s0 ^ 0xBF58476Du);
-    let r_jz     = grass_hash_u01(s0 ^ 0x94D049BBu);
+    let r_px     = grass_hash_u01(s0 ^ 0xBF58476Du);
+    let r_pz     = grass_hash_u01(s0 ^ 0x94D049BBu);
     let r_yaw    = grass_hash_u01(s0 ^ 0xA2B5C7D9u);
     let r_height = grass_hash_u01(s0 ^ 0xCBF29CE4u);
     let r_phase  = grass_hash_u01(s0 ^ 0xFEEDFACEu);
 
-    // Anchor's leaf footprint — half-size. Jitter blade position
-    // inside the leaf so a 1024-leaf paint patch doesn't show a grid.
-    let jx = (r_jx - 0.5) * 2.0 * anchor.leaf_extent;
-    let jz = (r_jz - 0.5) * 2.0 * anchor.leaf_extent;
+    // Blade base position — random point in the tile cube's XZ
+    // extent (stable across paint additions inside the tile, so
+    // the blade doesn't jump when nearby paint expands).
+    // y = anchor.surface_y (painted-leaf top, stable for flat
+    // ground).
+    let base_x = mix(anchor.tile_min.x, anchor.tile_max.x, r_px);
+    let base_z = mix(anchor.tile_min.z, anchor.tile_max.z, r_pz);
+    let base_y = anchor.surface_y;
 
-    // `anchor.world_pos` is the painted-leaf cell *center* — half a
-    // voxel deep into the painted surface. Without this offset the
-    // blade base sits buried and the visible portion is just the tip.
-    // Push out along the surface normal by `leaf_extent` (= half a
-    // voxel) so the blade's base lies at the surface boundary.
-    let base_world = anchor.world_pos + anchor.surface_normal * anchor.leaf_extent;
-
-    // Per-blade height jitter.
     let h = blade_height * (0.7 + r_height * 0.6);
-
-    // Per-blade yaw rotation around Y.
     let yaw = r_yaw * 6.28318530718;
     let c = cos(yaw);
     let s = sin(yaw);
 
-    // Map vid → (u, v).
+    // vid → (u, v) in blade-local quad space.
     var u: f32 = 0.0;
     var v: f32 = 0.0;
     if (vid == 0u)      { u = 0.0; v = 0.0; }
@@ -123,26 +102,23 @@ fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> V
     else if (vid == 4u) { u = 1.0; v = 1.0; }
     else                { u = 0.0; v = 1.0; }
 
-    // Local blade-space coords. Tapered toward tip; tip width = 20%
-    // of base width.
+    // Tapered local geometry. Width narrows toward the tip.
     let local_x = (u - 0.5) * blade_width * (1.0 - v * 0.8);
     let local_y = v * h;
     let local_z = 0.0;
 
-    // Wind sway — top of blade displaces in world XZ as `v`-weighted
-    // sinusoid. Per-blade phase keeps neighbors out of phase.
+    // Wind sway — tip drifts in world XZ as sinusoid of frame.time.
     let wind_phase = r_phase * 6.28318530718;
     let wind_x = sin(frame.time * wind_freq + wind_phase) * wind_amp * v;
     let wind_z = cos(frame.time * wind_freq + wind_phase * 0.73) * wind_amp * v;
 
-    // Rotate local XZ by yaw, then translate to anchor + jitter.
     let rotated_x = local_x * c - local_z * s + wind_x;
     let rotated_z = local_x * s + local_z * c + wind_z;
 
     let world_pos = vec3<f32>(
-        base_world.x + jx + rotated_x,
-        base_world.y + local_y,
-        base_world.z + jz + rotated_z,
+        base_x + rotated_x,
+        base_y + local_y,
+        base_z + rotated_z,
     );
 
     let clip = camera.view_proj * vec4<f32>(world_pos, 1.0);
@@ -150,12 +126,11 @@ fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> V
     var out: VsOut;
     out.clip_pos = clip;
     out.world_pos = world_pos;
-    // V1 normal: anchor surface normal. Could fancy this with a
-    // blade-tangent + curvature in V1.1; this keeps the grass lit
-    // correctly relative to the painted surface.
-    out.world_normal = anchor.surface_normal;
+    // V1: assume +Y normal (flat ground). Per-tile normal averaging
+    // is a V1.1 follow-up so blades on slopes don't look wrong.
+    out.world_normal = vec3<f32>(0.0, 1.0, 0.0);
     out.material_packed = anchor.material_id;
-    out.color_rgb = anchor.host_color.rgb;
+    out.color_rgb = vec3<f32>(1.0);
     out.blend_f = 0.0;
     out.intensity = 0u;
     return out;

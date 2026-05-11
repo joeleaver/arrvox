@@ -46,14 +46,12 @@ const PREFIX_SUM_WG_SIZE: u32 = 256u;
 const PREFIX_SUM_MAX_WG_COUNT: u32 = 32u;
 
 struct AnchorContext {
-    world_pos:       vec3<f32>,
-    leaf_extent:     f32,
-    surface_normal:  vec3<f32>,
-    surface_area:    f32,
-    host_color:      vec4<f32>,
+    tile_min:        vec3<f32>,
     material_id:     u32,
-    material_blend:  u32,
-    leaf_slot:       u32,
+    tile_max:        vec3<f32>,
+    leaf_count:      u32,
+    object_id:       u32,
+    surface_y:       f32,
     seed:            u32,
 }
 

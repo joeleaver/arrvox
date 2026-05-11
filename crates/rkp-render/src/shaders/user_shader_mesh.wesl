@@ -53,19 +53,18 @@ const USER_SHADER_PICK_SENTINEL: u32 = 0xFFFFFFFEu;
 // triangle.
 const ANCHOR_IDX_DEAD: u32 = 0xFFFFFFFFu;
 
-// One painted leaf — the host position + shading context for every
-// spawn whose `instance_records[slot].anchor_idx` points at it. Layout
-// must match `rkp_render::user_shader_mesh_pass::AnchorRecord` (CPU
-// side). 64 B; std430 packing.
+// One painted *tile* — the world-space AABB of every painted leaf
+// inside this tile (tight bounds, not the tile cube) plus enough
+// shading context to drive `vs`. Layout must match
+// `rkp_render::user_shader_mesh_pass::AnchorRecord` (CPU side).
+// 64 B; std430 packing.
 struct AnchorContext {
-    world_pos:       vec3<f32>,
-    leaf_extent:     f32,
-    surface_normal:  vec3<f32>,
-    surface_area:    f32,
-    host_color:      vec4<f32>,
+    tile_min:        vec3<f32>,
     material_id:     u32,
-    material_blend:  u32,  // secondary (lo16) | blend4 (16..20) | reserved (20..32)
-    leaf_slot:       u32,
+    tile_max:        vec3<f32>,
+    leaf_count:      u32,
+    object_id:       u32,
+    surface_y:       f32,
     seed:            u32,
 }
 
@@ -155,15 +154,14 @@ const USER_BODY_BEGIN: u32 = 0u;
 
 fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> VsOut {
     var out: VsOut;
-    // NaN clip position — guaranteed culled.
     // z = -1 with w = 1 places the vertex behind the near plane —
     // reliably clipped without using NaN (which naga rejects as a
     // constant-folded literal).
     out.clip_pos = vec4<f32>(0.0, 0.0, -1.0, 1.0);
-    out.world_pos = vec3<f32>(0.0);
+    out.world_pos = anchor.tile_min;
     out.world_normal = vec3<f32>(0.0, 1.0, 0.0);
     out.material_packed = anchor.material_id;
-    out.color_rgb = anchor.host_color.rgb;
+    out.color_rgb = vec3<f32>(1.0);
     out.blend_f = 0.0;
     out.intensity = 0u;
     return out;

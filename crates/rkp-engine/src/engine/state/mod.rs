@@ -51,15 +51,6 @@ pub(crate) struct EntityPaintedCache {
         std::collections::HashMap<[i32; 3], PaintedTileEntry>,
     >,
     pub leaves: Vec<rkp_render::user_shader_emit_pass::EmitLeaf>,
-    /// Per-material anchor records for the V1 mesh-path user shader.
-    /// Same data as `leaves` but partitioned by material_id and shaped
-    /// for direct GPU upload (`AnchorRecord` is 64 B, std430-compatible).
-    /// Flat `painted_anchors` on `EngineState` is the concatenation of
-    /// every entry's contents.
-    pub anchors: std::collections::HashMap<
-        u16,
-        Vec<rkp_render::user_shader_mesh_pass::AnchorRecord>,
-    >,
 }
 
 use crate::camera::CameraControlState;

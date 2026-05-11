@@ -291,12 +291,8 @@ impl EngineState {
                         object_id,
                         &mut entry.mat_tiles,
                         &mut entry.leaves,
-                        &mut entry.anchors,
                     );
-                    if entry.mat_tiles.is_empty()
-                        && entry.leaves.is_empty()
-                        && entry.anchors.is_empty()
-                    {
+                    if entry.mat_tiles.is_empty() && entry.leaves.is_empty() {
                         self.painted_per_entity.remove(&entity);
                     } else {
                         self.painted_per_entity.insert(entity, entry);
@@ -329,18 +325,96 @@ impl EngineState {
                     Vec<rkp_render::user_shader_mesh_pass::AnchorRecord>,
                 > = std::collections::HashMap::new();
                 for (entity, entry) in &self.painted_per_entity {
-                    if let Some(&gpu_idx) = self.entity_to_gpu.get(entity) {
-                        if !entry.mat_tiles.is_empty() {
-                            self.painted_materials
-                                .insert(gpu_idx as u32, entry.mat_tiles.clone());
-                        }
+                    let Some(&gpu_idx) = self.entity_to_gpu.get(entity) else {
+                        continue;
+                    };
+                    if !entry.mat_tiles.is_empty() {
+                        self.painted_materials
+                            .insert(gpu_idx as u32, entry.mat_tiles.clone());
                     }
                     new_painted_leaves.extend_from_slice(&entry.leaves);
-                    for (mat, anchors) in &entry.anchors {
-                        new_painted_anchors
-                            .entry(*mat)
-                            .or_default()
-                            .extend_from_slice(anchors);
+
+                    // V1 mesh-path AnchorRecords from the per-tile
+                    // PaintedTileEntry table. Two bounds in play:
+                    //
+                    //   · **Tile cube** — derived from `tile_coord ×
+                    //     tile_size` (object-local), transformed to
+                    //     world. Stable across frames as paint
+                    //     extends inside the tile, so blade
+                    //     positions don't shimmer.
+                    //   · **Painted-leaf AABB** (`te.aabb`) — only
+                    //     used to pick `surface_y` (the y the blade
+                    //     base sits on). Stable for flat-ground
+                    //     paint; deferred concern for slopes.
+                    //
+                    // When `tile_size` is `None` (shader didn't
+                    // declare `@tile_size`), the tile_coord is
+                    // `NO_TILE_COORD` and tile cube bounds fall back
+                    // to the painted-leaf AABB — degraded but
+                    // deterministic.
+                    let object_id = gpu_idx as u32;
+                    let entity_world: Option<glam::Mat4> = self
+                        .gpu_instances
+                        .iter()
+                        .find(|i| i.object_id == object_id)
+                        .map(|i| glam::Mat4::from_cols_array_2d(&i.world));
+                    for (&mat, tiles) in &entry.mat_tiles {
+                        let tile_size = shader_materials
+                            .get(&mat)
+                            .and_then(|i| i.tile_size);
+                        let bucket = new_painted_anchors.entry(mat).or_default();
+                        bucket.reserve(tiles.len());
+                        for (&tile_coord, te) in tiles {
+                            // Tile cube bounds (object-local). When no
+                            // `@tile_size`, fall back to painted-leaf
+                            // bounds for a defined-but-coarse anchor.
+                            let (tile_local_min, tile_local_max) = match tile_size {
+                                Some(s) if s > 0.0
+                                    && tile_coord != [i32::MIN, i32::MIN, i32::MIN] =>
+                                {
+                                    let lo = glam::Vec3::new(
+                                        tile_coord[0] as f32 * s,
+                                        tile_coord[1] as f32 * s,
+                                        tile_coord[2] as f32 * s,
+                                    );
+                                    (lo, lo + glam::Vec3::splat(s))
+                                }
+                                _ => (te.aabb.min, te.aabb.max),
+                            };
+                            let (tile_world_min, tile_world_max) = transform_aabb_to_world(
+                                tile_local_min,
+                                tile_local_max,
+                                entity_world,
+                            );
+                            // Surface y from painted-leaf bounds —
+                            // stable for flat ground (only changes
+                            // when paint extends to a new y level
+                            // within the tile, which doesn't happen
+                            // for ground-painting).
+                            let painted_world_max_y = entity_world
+                                .map(|m| m.transform_point3(te.aabb.max).y)
+                                .unwrap_or(te.aabb.max.y);
+                            // Stable seed: tile coord + material +
+                            // object_id.
+                            let seed = rkp_render::user_shader_mesh_pass::anchor_seed([
+                                tile_coord[0] as f32,
+                                tile_coord[1] as f32,
+                                tile_coord[2] as f32,
+                            ]) ^ (mat as u32).wrapping_mul(0x9E37_79B9)
+                                ^ object_id.wrapping_mul(0x85EB_CA6B);
+                            bucket.push(
+                                rkp_render::user_shader_mesh_pass::AnchorRecord {
+                                    tile_min: tile_world_min.to_array(),
+                                    material_id: mat as u32,
+                                    tile_max: tile_world_max.to_array(),
+                                    leaf_count: te.leaf_count,
+                                    object_id,
+                                    surface_y: painted_world_max_y,
+                                    seed,
+                                    _pad: [0; 5],
+                                },
+                            );
+                        }
                     }
                 }
                 self.painted_leaves = std::sync::Arc::new(new_painted_leaves);
@@ -1114,10 +1188,6 @@ fn scan_painted_aabbs(
         std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
     >,
     out_leaves: &mut Vec<rkp_render::user_shader_emit_pass::EmitLeaf>,
-    out_anchors: &mut std::collections::HashMap<
-        u16,
-        Vec<rkp_render::user_shader_mesh_pass::AnchorRecord>,
-    >,
 ) {
     use rkp_core::sparse_octree::{
         is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE,
@@ -1145,10 +1215,6 @@ fn scan_painted_aabbs(
             std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
         >,
         out_leaves: &mut Vec<rkp_render::user_shader_emit_pass::EmitLeaf>,
-        out_anchors: &mut std::collections::HashMap<
-            u16,
-            Vec<rkp_render::user_shader_mesh_pass::AnchorRecord>,
-        >,
     ) {
         use rkp_core::sparse_octree::{
             is_brick, is_leaf, leaf_slot, brick_id, EMPTY_NODE, INTERIOR_NODE,
@@ -1229,47 +1295,6 @@ fn scan_painted_aabbs(
                                         cell_size: base_vs,
                                     },
                                 );
-                                // Per-material anchor record for the
-                                // new mesh-path user-shader pipeline.
-                                // Unpacked normal (so the WGSL vs
-                                // doesn't have to call unpack_oct);
-                                // host_color from the paint overlay
-                                // (0 if no override — downstream uses
-                                // the material's base color).
-                                let color_packed = overlay
-                                    .and_then(|o| o.get(cell))
-                                    .map(|e| e.color_packed)
-                                    .unwrap_or(0);
-                                let host_color = [
-                                    ((color_packed >> 0) & 0xFF) as f32 / 255.0,
-                                    ((color_packed >> 8) & 0xFF) as f32 / 255.0,
-                                    ((color_packed >> 16) & 0xFF) as f32 / 255.0,
-                                    ((color_packed >> 24) & 0xFF) as f32 / 255.0,
-                                ];
-                                let secondary = (attr.material_secondary_blend
-                                    & 0x0FFF)
-                                    as u32;
-                                let blend = ((attr.material_secondary_blend
-                                    >> 12)
-                                    & 0x000F)
-                                    as u32;
-                                let material_blend =
-                                    secondary | (blend << 16);
-                                let world_pos_arr = world_pos.to_array();
-                                let anchor = rkp_render::user_shader_mesh_pass::AnchorRecord {
-                                    world_pos: world_pos_arr,
-                                    leaf_extent: 0.5 * base_vs,
-                                    surface_normal: world_normal.to_array(),
-                                    surface_area: base_vs * base_vs,
-                                    host_color,
-                                    material_id: mat as u32,
-                                    material_blend,
-                                    leaf_slot: cell,
-                                    seed: rkp_render::user_shader_mesh_pass::anchor_seed(
-                                        world_pos_arr,
-                                    ),
-                                };
-                                out_anchors.entry(mat).or_default().push(anchor);
                             }
                         }
                     }
@@ -1340,7 +1365,6 @@ fn scan_painted_aabbs(
                 object_id,
                 out,
                 out_leaves,
-                out_anchors,
             );
         }
     }
@@ -1361,7 +1385,6 @@ fn scan_painted_aabbs(
         object_id,
         out,
         out_leaves,
-        out_anchors,
     );
     let _ = (is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE, BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR, BRICK_CELL_EMPTY);
 }
@@ -1548,6 +1571,32 @@ const NO_TILE_COORD: [i32; 3] = [i32::MIN, i32::MIN, i32::MIN];
 /// boundary case (leaf straddling tiles) registers it in all
 /// overlapping tiles, which slightly inflates per-tile counts but
 /// is correct for the band gate.
+/// Transform an axis-aligned bounding box from one frame to another
+/// via an arbitrary 4×4 matrix. Iterates the 8 corners and bounds the
+/// result — produces a tight AABB for axis-aligned matrices and a
+/// conservative AABB for rotated ones. When `matrix` is `None`, the
+/// input is returned as-is (caller is treating local-space as world).
+fn transform_aabb_to_world(
+    local_min: glam::Vec3,
+    local_max: glam::Vec3,
+    matrix: Option<glam::Mat4>,
+) -> (glam::Vec3, glam::Vec3) {
+    let Some(m) = matrix else {
+        return (local_min, local_max);
+    };
+    let mut min = glam::Vec3::splat(f32::INFINITY);
+    let mut max = glam::Vec3::splat(f32::NEG_INFINITY);
+    for i in 0..8u32 {
+        let cx = if (i & 1) != 0 { local_max.x } else { local_min.x };
+        let cy = if (i & 2) != 0 { local_max.y } else { local_min.y };
+        let cz = if (i & 4) != 0 { local_max.z } else { local_min.z };
+        let p = m.transform_point3(glam::Vec3::new(cx, cy, cz));
+        min = min.min(p);
+        max = max.max(p);
+    }
+    (min, max)
+}
+
 fn expand_aabb(
     out: &mut std::collections::HashMap<
         u16,
