@@ -28,11 +28,15 @@
 // @animated
 
 // ── Per-material params ───────────────────────────────────────────
+// `density` is blades-per-m². At ~4 cm painted-leaf voxels each
+// anchor has ~0.0016 m² of surface; default 1000 gives ~1-2 blades
+// per anchor on average via probabilistic spawn (sub-integer
+// densities round stochastically rather than to zero).
 // @param blade_height: f32 = 0.35, range = [0.05, 1.5]
 // @param blade_width:  f32 = 0.04, range = [0.01, 0.2]
-// @param density:      f32 = 80.0, range = [1.0, 400.0]
+// @param density:      f32 = 1000.0, range = [1.0, 8000.0]
 // @param wind_amp:     f32 = 0.08, range = [0.0, 0.3]
-// @param wind_freq:    f32 = 1.5,  range = [0.0, 6.0]
+// @param wind_freq:    f32 = 1.5,   range = [0.0, 6.0]
 
 // ── Helpers ───────────────────────────────────────────────────────
 fn grass_hash_u01(seed: u32) -> f32 {
@@ -46,13 +50,27 @@ fn grass_hash_u01(seed: u32) -> f32 {
 }
 
 // ── spawn_count ───────────────────────────────────────────────────
-// Density-based: `blades = density × surface_area`. anchor.surface_area
-// is the painted-leaf face's area (V1 def: `leaf_size²`). Hard cap at
-// 64 per V1's per-anchor spawn ceiling (`MAX_SPAWNS_PER_ANCHOR_V1`).
+// Density-based: `blades = density × surface_area`. `anchor.surface_area`
+// is the painted-leaf face's area (V1 def: `leaf_size²`).
+//
+// Sub-integer expected counts are handled probabilistically: the
+// integer part is emitted unconditionally and the fractional part
+// becomes the probability of one extra spawn. Uses `anchor.seed`
+// (stable across frames) so the count doesn't flicker. Without this
+// rounding, a small voxel × moderate density (e.g. 80 × 0.0016 = 0.128)
+// would floor to zero blades — the visible bug fixed here.
+//
+// Hard-capped at 64 per V1's per-anchor spawn ceiling
+// (`MAX_SPAWNS_PER_ANCHOR_V1`).
 fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 {
     let density = ctx_param(2);
     let raw = density * anchor.surface_area;
-    return u32(clamp(raw, 0.0, 64.0));
+    let base = u32(floor(raw));
+    let frac = raw - f32(base);
+    let r = grass_hash_u01(anchor.seed ^ 0xA341316Cu);
+    var n = base;
+    if (r < frac) { n = n + 1u; }
+    return min(n, 64u);
 }
 
 // ── vs — one blade quad per (anchor, spawn_idx) ───────────────────
@@ -79,6 +97,13 @@ fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> V
     // inside the leaf so a 1024-leaf paint patch doesn't show a grid.
     let jx = (r_jx - 0.5) * 2.0 * anchor.leaf_extent;
     let jz = (r_jz - 0.5) * 2.0 * anchor.leaf_extent;
+
+    // `anchor.world_pos` is the painted-leaf cell *center* — half a
+    // voxel deep into the painted surface. Without this offset the
+    // blade base sits buried and the visible portion is just the tip.
+    // Push out along the surface normal by `leaf_extent` (= half a
+    // voxel) so the blade's base lies at the surface boundary.
+    let base_world = anchor.world_pos + anchor.surface_normal * anchor.leaf_extent;
 
     // Per-blade height jitter.
     let h = blade_height * (0.7 + r_height * 0.6);
@@ -115,9 +140,9 @@ fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> V
     let rotated_z = local_x * s + local_z * c + wind_z;
 
     let world_pos = vec3<f32>(
-        anchor.world_pos.x + jx + rotated_x,
-        anchor.world_pos.y + local_y,
-        anchor.world_pos.z + jz + rotated_z,
+        base_world.x + jx + rotated_x,
+        base_world.y + local_y,
+        base_world.z + jz + rotated_z,
     );
 
     let clip = camera.view_proj * vec4<f32>(world_pos, 1.0);

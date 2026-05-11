@@ -22,7 +22,7 @@
 use rkp_render::user_shader_mesh_pass::{
     AnchorRecord, DispatchInfo, DrawIndirectArgs, FrameUniforms, InstanceRecord,
     UserShaderMeshDraw, UserShaderMeshPipelines, UserShaderParams,
-    MAX_ANCHORS_PER_SHADER_V1,
+    MAX_ANCHORS_PER_SHADER_V1, PREFIX_SUM_MAX_WG_COUNT,
 };
 
 use crate::render_frame::RenderFrame;
@@ -49,6 +49,7 @@ pub(super) struct MeshUserShaderMaterialState {
     pub frame_buffer: wgpu::Buffer,
     pub params_buffer: wgpu::Buffer,
     pub dispatch_buffer: wgpu::Buffer,
+    pub wg_sums_buffer: wgpu::Buffer,
     pub compute_g0: wgpu::BindGroup,
     pub raster_g1: wgpu::BindGroup,
     /// V1 stats; updated each frame.
@@ -214,18 +215,27 @@ pub(super) fn tick_user_shader_mesh(state: &mut RenderState, frame: &RenderFrame
             });
             pass.set_bind_group(0, &mat_state.compute_g0, &[]);
 
-            // 1. spawn_count — 1 thread per anchor.
+            // 1. spawn_count — 1 thread per anchor (workgroup_size 64).
             pass.set_pipeline(&mat_state.pipelines.spawn_count);
-            let wg_x = anchor_count.div_ceil(64).max(1);
-            pass.dispatch_workgroups(wg_x, 1, 1);
+            let wg_x_64 = anchor_count.div_ceil(64).max(1);
+            pass.dispatch_workgroups(wg_x_64, 1, 1);
 
-            // 2. prefix_sum — single workgroup of 1024 threads.
-            pass.set_pipeline(&mat_state.pipelines.prefix_sum);
+            // 2a. prefix_local — 1 thread per anchor at WG=256.
+            pass.set_pipeline(&mat_state.pipelines.prefix_local);
+            let wg_x_256 = anchor_count.div_ceil(256).max(1);
+            pass.dispatch_workgroups(wg_x_256, 1, 1);
+
+            // 2b. prefix_scan_sums — single workgroup scans wg_sums[].
+            pass.set_pipeline(&mat_state.pipelines.prefix_scan_sums);
             pass.dispatch_workgroups(1, 1, 1);
 
-            // 3. fill — 1 thread per anchor.
+            // 2c. prefix_add_back — add per-workgroup base back.
+            pass.set_pipeline(&mat_state.pipelines.prefix_add_back);
+            pass.dispatch_workgroups(wg_x_256, 1, 1);
+
+            // 3. fill — 1 thread per anchor (workgroup_size 64).
             pass.set_pipeline(&mat_state.pipelines.fill);
-            pass.dispatch_workgroups(wg_x, 1, 1);
+            pass.dispatch_workgroups(wg_x_64, 1, 1);
         }
         state.queue.submit(Some(encoder.finish()));
 
@@ -313,6 +323,13 @@ fn build_material_state(
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    // Prefix-sum scratch: one slot per workgroup (256 anchors each).
+    let wg_sums_buffer = state.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(&format!("{label} wg_sums")),
+        size: (PREFIX_SUM_MAX_WG_COUNT as u64) * 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
 
     let compute_g0 = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some(&format!("{label} compute g0")),
@@ -326,6 +343,7 @@ fn build_material_state(
             wgpu::BindGroupEntry { binding: 5, resource: frame_buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 6, resource: params_buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 7, resource: dispatch_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: wg_sums_buffer.as_entire_binding() },
         ],
     });
 
@@ -351,6 +369,7 @@ fn build_material_state(
         frame_buffer,
         params_buffer,
         dispatch_buffer,
+        wg_sums_buffer,
         compute_g0,
         raster_g1,
         last_anchor_count: 0,

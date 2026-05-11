@@ -1047,6 +1047,73 @@ fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> V
 }
 
 #[test]
+fn compose_mesh_path_against_real_templates_produces_valid_wgsl() {
+    // Regression for the "removed splice anchors leave dangling
+    // identifier refs in entry points" bug — composes a real
+    // mesh-path grass shader against the live skeleton WGSL
+    // templates and runs the result through naga's parser +
+    // validator. Catches at `cargo test` what otherwise only
+    // surfaces as "RenderPipeline ... is invalid" at runtime in
+    // the editor.
+    let src = r#"
+// @geometry procedural { vertex_count: 6 }
+// @param density: f32 = 80.0, range = [1.0, 400.0]
+
+fn hash01(s: u32) -> f32 {
+    var x = s;
+    x = x ^ (x >> 16u);
+    x = x * 0x7feb352du;
+    return f32(x) / 4294967295.0;
+}
+
+fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 {
+    return u32(ctx_param(0) * anchor.surface_area);
+}
+
+fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> VsOut {
+    let r = hash01(anchor.seed ^ spawn_idx);
+    var out: VsOut;
+    out.clip_pos = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    out.world_pos = anchor.world_pos;
+    out.world_normal = anchor.surface_normal;
+    out.material_packed = anchor.material_id;
+    out.color_rgb = anchor.host_color.rgb;
+    out.blend_f = r;
+    out.intensity = 0u;
+    return out;
+}
+"#;
+    let tmp = tempfile_dir("compose_mesh_real_templates");
+    write(&tmp, "grass.wgsl", src);
+    let reg = scan_dir(&tmp).unwrap();
+    let entry = &reg.entries()[0];
+    assert!(entry.is_mesh_path());
+
+    let (raster_template, compute_template) =
+        crate::user_shader_mesh_pass::UserShaderMeshPass::template_sources();
+    let (raster_wgsl, compute_wgsl) =
+        compose_mesh_path_pipeline_sources(entry, raster_template, compute_template);
+
+    let validate = |label: &str, src: &str| {
+        let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| {
+            panic!(
+                "{label} composed WGSL failed to parse:\n{}\n\n--- source ---\n{src}",
+                e.emit_to_string(src),
+            )
+        });
+        let mut v = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        v.validate(&module).unwrap_or_else(|e| {
+            panic!("{label} composed WGSL failed to validate: {e:?}\n\n--- source ---\n{src}")
+        });
+    };
+    validate("raster", &raster_wgsl);
+    validate("compute", &compute_wgsl);
+}
+
+#[test]
 fn compose_mesh_path_splices_user_body_into_both_templates() {
     // Build a registry by parsing a minimal mesh-path shader, then
     // compose against fake templates. Verify the user's vs body

@@ -172,9 +172,16 @@ pub fn anchor_seed(world_pos: [f32; 3]) -> u32 {
 }
 
 /// V1 ceiling on anchors per user-shader material — the prefix-sum
-/// compute uses a single 1024-thread workgroup. Hitting this cap is a
-/// signal to switch to a multi-pass scan (see plan doc §"Risks").
-pub const MAX_ANCHORS_PER_SHADER_V1: u32 = 1024;
+/// is a 3-pass Blelloch scan of `PREFIX_SUM_WG_SIZE *
+/// PREFIX_SUM_MAX_WG_COUNT` elements (256 × 32 = 8192). Note: the
+/// "anchor = painted-leaf" design hits this cap quickly on any
+/// reasonable hillside paint (24k+ anchors observed at ~38 m²); a
+/// shape-of-design rework lives on the V1.1 follow-up list.
+pub const MAX_ANCHORS_PER_SHADER_V1: u32 = 8192;
+
+/// Per-workgroup-sum slots used by the Blelloch scan. Must match
+/// `PREFIX_SUM_MAX_WG_COUNT` in `user_shader_mesh_compute.wesl`.
+pub const PREFIX_SUM_MAX_WG_COUNT: u32 = 32;
 
 // ─── Pipeline objects ──────────────────────────────────────────────
 
@@ -193,7 +200,9 @@ pub struct UserShaderMeshPass {
 
     pub stub_raster: wgpu::RenderPipeline,
     pub stub_spawn_count: wgpu::ComputePipeline,
-    pub stub_prefix_sum: wgpu::ComputePipeline,
+    pub stub_prefix_local: wgpu::ComputePipeline,
+    pub stub_prefix_scan_sums: wgpu::ComputePipeline,
+    pub stub_prefix_add_back: wgpu::ComputePipeline,
     pub stub_fill: wgpu::ComputePipeline,
 }
 
@@ -203,7 +212,9 @@ pub struct UserShaderMeshPass {
 pub struct UserShaderMeshPipelines {
     pub raster: wgpu::RenderPipeline,
     pub spawn_count: wgpu::ComputePipeline,
-    pub prefix_sum: wgpu::ComputePipeline,
+    pub prefix_local: wgpu::ComputePipeline,
+    pub prefix_scan_sums: wgpu::ComputePipeline,
+    pub prefix_add_back: wgpu::ComputePipeline,
     pub fill: wgpu::ComputePipeline,
 }
 
@@ -315,6 +326,9 @@ impl UserShaderMeshPass {
                     uniform_entry(6, wgpu::ShaderStages::COMPUTE),
                     // 7: dispatch (uniform)
                     uniform_entry(7, wgpu::ShaderStages::COMPUTE),
+                    // 8: wg_sums (storage, RW) — Blelloch scan
+                    //    per-workgroup-sum scratch.
+                    storage_entry(8, false, wgpu::ShaderStages::COMPUTE),
                 ],
             },
         );
@@ -346,37 +360,11 @@ impl UserShaderMeshPass {
             "user_shader_mesh stub raster",
         );
 
-        let stub_spawn_count = device.create_compute_pipeline(
-            &wgpu::ComputePipelineDescriptor {
-                label: Some("user_shader_mesh stub spawn_count"),
-                layout: Some(&compute_pipeline_layout),
-                module: &compute_module,
-                entry_point: Some("entry_spawn_count"),
-                compilation_options: Default::default(),
-                cache: None,
-            },
-        );
-
-        let stub_prefix_sum = device.create_compute_pipeline(
-            &wgpu::ComputePipelineDescriptor {
-                label: Some("user_shader_mesh stub prefix_sum"),
-                layout: Some(&compute_pipeline_layout),
-                module: &compute_module,
-                entry_point: Some("entry_prefix_sum"),
-                compilation_options: Default::default(),
-                cache: None,
-            },
-        );
-
-        let stub_fill = device.create_compute_pipeline(
-            &wgpu::ComputePipelineDescriptor {
-                label: Some("user_shader_mesh stub fill"),
-                layout: Some(&compute_pipeline_layout),
-                module: &compute_module,
-                entry_point: Some("entry_fill"),
-                compilation_options: Default::default(),
-                cache: None,
-            },
+        let stub = build_compute_pipelines(
+            device,
+            &compute_pipeline_layout,
+            &compute_module,
+            "user_shader_mesh stub",
         );
 
         Self {
@@ -386,9 +374,11 @@ impl UserShaderMeshPass {
             compute_g0_layout,
             compute_pipeline_layout,
             stub_raster,
-            stub_spawn_count,
-            stub_prefix_sum,
-            stub_fill,
+            stub_spawn_count: stub.spawn_count,
+            stub_prefix_local: stub.prefix_local,
+            stub_prefix_scan_sums: stub.prefix_scan_sums,
+            stub_prefix_add_back: stub.prefix_add_back,
+            stub_fill: stub.fill,
         }
     }
 
@@ -427,41 +417,19 @@ impl UserShaderMeshPass {
             &raster_module,
             &format!("{label} raster"),
         );
-        let spawn_count = device.create_compute_pipeline(
-            &wgpu::ComputePipelineDescriptor {
-                label: Some(&format!("{label} spawn_count")),
-                layout: Some(&self.compute_pipeline_layout),
-                module: &compute_module,
-                entry_point: Some("entry_spawn_count"),
-                compilation_options: Default::default(),
-                cache: None,
-            },
-        );
-        let prefix_sum = device.create_compute_pipeline(
-            &wgpu::ComputePipelineDescriptor {
-                label: Some(&format!("{label} prefix_sum")),
-                layout: Some(&self.compute_pipeline_layout),
-                module: &compute_module,
-                entry_point: Some("entry_prefix_sum"),
-                compilation_options: Default::default(),
-                cache: None,
-            },
-        );
-        let fill = device.create_compute_pipeline(
-            &wgpu::ComputePipelineDescriptor {
-                label: Some(&format!("{label} fill")),
-                layout: Some(&self.compute_pipeline_layout),
-                module: &compute_module,
-                entry_point: Some("entry_fill"),
-                compilation_options: Default::default(),
-                cache: None,
-            },
+        let computes = build_compute_pipelines(
+            device,
+            &self.compute_pipeline_layout,
+            &compute_module,
+            label,
         );
         UserShaderMeshPipelines {
             raster,
-            spawn_count,
-            prefix_sum,
-            fill,
+            spawn_count: computes.spawn_count,
+            prefix_local: computes.prefix_local,
+            prefix_scan_sums: computes.prefix_scan_sums,
+            prefix_add_back: computes.prefix_add_back,
+            fill: computes.fill,
         }
     }
 
@@ -564,6 +532,39 @@ fn uniform_entry(
             min_binding_size: None,
         },
         count: None,
+    }
+}
+
+struct ComputePipelineSet {
+    spawn_count: wgpu::ComputePipeline,
+    prefix_local: wgpu::ComputePipeline,
+    prefix_scan_sums: wgpu::ComputePipeline,
+    prefix_add_back: wgpu::ComputePipeline,
+    fill: wgpu::ComputePipeline,
+}
+
+fn build_compute_pipelines(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    module: &wgpu::ShaderModule,
+    label: &str,
+) -> ComputePipelineSet {
+    let build = |entry: &str, suffix: &str| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(&format!("{label} {suffix}")),
+            layout: Some(layout),
+            module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
+    ComputePipelineSet {
+        spawn_count:      build("entry_spawn_count",     "spawn_count"),
+        prefix_local:     build("entry_prefix_local",    "prefix_local"),
+        prefix_scan_sums: build("entry_prefix_scan_sums","prefix_scan_sums"),
+        prefix_add_back:  build("entry_prefix_add_back", "prefix_add_back"),
+        fill:             build("entry_fill",            "fill"),
     }
 }
 

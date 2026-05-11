@@ -295,6 +295,7 @@ impl UserShaderRegistry {
                 has_shade: e.shade_text.is_some(),
                 has_generate: e.generate_text.is_some(),
                 has_instance_at: e.instance_at_text.is_some(),
+                has_vs: e.is_mesh_path(),
                 instance_struct_name: e
                     .metadata
                     .instance_proto_struct
@@ -344,6 +345,11 @@ pub struct UserShaderInfo {
     /// (Phase 3a host-leaf dispatch + Phase 3b band-cell dispatch)
     /// instead of Option B's emit-into-instance-pool flow.
     pub has_instance_at: bool,
+    /// V1 mesh-path — true if the shader provides a `vs` hook AND
+    /// opted into `@geometry`. Such shaders route through the
+    /// `tick_user_shader_mesh` per-frame compute + indirect-draw
+    /// pipeline instead of the proto/emit/tile-bin chain.
+    pub has_vs: bool,
     /// Name of the per-instance struct (from `@instance_proto`) if any.
     pub instance_struct_name: Option<String>,
     /// Byte size of the per-instance struct, if parsed. Helpful for

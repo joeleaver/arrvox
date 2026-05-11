@@ -132,10 +132,11 @@ fn ctx_param(i: u32) -> f32 {
 }
 
 // USER_BODY anchors — `splice_const_marker` replaces everything
-// between these two top-level const decls with the composed user
-// body. The decls themselves are placeholders that survive WESL
-// compilation; the unused-const warning is silenced by referencing
-// them in entry_vert below.
+// between these two top-level const decls (inclusive) with the
+// composed user body. The decls themselves survive WESL compilation
+// because `build.rs` runs with `use_stripping(false)`; at runtime
+// the splicer removes them so no other code may reference these
+// identifiers.
 const USER_BODY_BEGIN: u32 = 0u;
 
 // The composer's splice keeps:
@@ -218,10 +219,6 @@ fn entry_vert(
     @builtin(vertex_index) vid: u32,
     @builtin(instance_index) iid: u32,
 ) -> VsOut {
-    // Touch the body anchors so they survive dead-code elimination
-    // and stay findable by the runtime splicer. `(0 + 0) * 0 = 0`
-    // adds nothing observable.
-    let _anchor_touch = (USER_BODY_BEGIN + USER_BODY_END) * 0u;
     let rec = instance_records[iid];
     if (rec.anchor_idx == ANCHOR_IDX_DEAD) {
         var dead: VsOut;

@@ -72,10 +72,19 @@ impl EngineState {
                         .map(|e| e.id)
                 },
                 &|name| {
+                    // Geometry-emitting shaders — either the legacy
+                    // `instance_at` path or the V1 mesh-path. Either
+                    // populates `GpuMaterial.instance_shader_id`; the
+                    // orchestration layer routes by entry type
+                    // (`is_mesh_path()` vs `instance_at_text.is_some()`)
+                    // to the right per-frame tick.
                     registry
                         .entries()
                         .iter()
-                        .find(|e| e.name == name && e.instance_at_text.is_some())
+                        .find(|e| {
+                            e.name == name
+                                && (e.instance_at_text.is_some() || e.is_mesh_path())
+                        })
                         .map(|e| e.id)
                 },
             );
@@ -118,13 +127,13 @@ impl EngineState {
         > = std::collections::HashMap::new();
         let any_shader_pipeline = infos
             .iter()
-            .any(|i| i.has_generate || i.has_instance_at);
+            .any(|i| i.has_generate || i.has_instance_at || i.has_vs);
         if any_shader_pipeline {
             for slot_id in 0..self.material_lib.slot_count() as u16 {
                 let Some(def) = self.material_lib.get_def(slot_id) else { continue; };
                 let Some(shader_name) = def.shader.as_deref() else { continue; };
                 let Some(info) = infos.iter().find(|i| i.name == shader_name) else { continue; };
-                if info.has_generate || info.has_instance_at {
+                if info.has_generate || info.has_instance_at || info.has_vs {
                     shader_materials.insert(slot_id, info.clone());
                 }
             }
