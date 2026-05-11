@@ -177,14 +177,23 @@ pub fn anchor_seed(world_pos: [f32; 3]) -> u32 {
 }
 
 /// V1 ceiling on anchors per user-shader material — matches the
-/// single-workgroup prefix-sum in `user_shader_mesh_compute.wesl`.
-/// At @tile_size 0.5 this still covers ~64 m² of painted surface.
-/// Multi-pass scan goes here once we need more.
-pub const MAX_ANCHORS_PER_SHADER_V1: u32 = 256;
+/// 3-pass Blelloch scan in `user_shader_mesh_compute.wesl`
+/// (`PREFIX_SUM_WG_SIZE × PREFIX_SUM_MAX_WG_COUNT = 256 × 32 = 8192`).
+/// At `@tile_size 0.5` this covers ~2000 m² of painted surface.
+/// For larger paint, add a 4th tier (one extra workgroup of
+/// inter-batch-sum scans) — the per-pass code already handles up
+/// to 256³ ≈ 16M anchors structurally.
+///
+/// Memory cost at this cap, per material:
+///   anchors  = 8192 × 64 B                   = 512 KB
+///   records  = 8192 × MAX_SPAWNS × 8 B       = 4 MB (with MAX_SPAWNS=64)
+///   counts/offsets                            = 64 KB
+///   wg_sums                                   = 128 B
+///   Total                                     = ~4.5 MB
+pub const MAX_ANCHORS_PER_SHADER_V1: u32 = 8192;
 
-/// Per-workgroup-sum slots. The scan is now single-pass; this is
-/// just a size for the now-stub `wg_sums` storage buffer (kept so
-/// the engine bind-group layout doesn't shift while we iterate).
+/// Per-workgroup-sum slots used by the Blelloch scan. Must match
+/// `PREFIX_SUM_MAX_WG_COUNT` in `user_shader_mesh_compute.wesl`.
 pub const PREFIX_SUM_MAX_WG_COUNT: u32 = 32;
 
 // ─── Pipeline objects ──────────────────────────────────────────────

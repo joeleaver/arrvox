@@ -307,9 +307,25 @@ impl EngineState {
             // object_id — without rebuilding, a frame that moves
             // entity A from object_id=3 to object_id=4 leaves a stale
             // entry under the old key.
-            let need_flat_rebuild = dirty_count > 0
-                || gpu_objects_dirty_this_frame
-                || geom_changed;
+            // The flat rebuild only needs to run when painted content
+            // or the entity-to-gpu mapping actually changed. Dropping
+            // `gpu_objects_dirty_this_frame` from the trigger so that
+            // animation-only frames (which set `gpu_objects_dirty` via
+            // `animation::tick` every frame a skeleton is playing)
+            // don't churn through cloning every entity's `mat_tiles`,
+            // re-uploading `painted_leaves` (768 KB+ at heavy paint),
+            // and re-running the new mesh-path compute trio. Animation
+            // doesn't move entity world transforms (just bones within
+            // them), so painted_anchors / painted_leaves / painted_materials
+            // are content-stable across animation ticks.
+            //
+            // Caveat: if a Renderable entity is added or removed without
+            // any paint or geometry epoch change, the `entity_to_gpu`
+            // mapping can shift but we won't refresh `painted_materials`
+            // here. In practice the entity add/remove paths already mark
+            // affected entities dirty (or bump geom_epoch), so this
+            // shouldn't trigger in normal use.
+            let need_flat_rebuild = dirty_count > 0 || geom_changed;
             if need_flat_rebuild {
                 self.painted_materials.clear();
                 let total_leaves: usize = self
