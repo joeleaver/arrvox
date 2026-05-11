@@ -185,6 +185,19 @@ pub(super) struct RenderState {
     /// `RkpInstance` records into `RkpScene::user_shader_instance_buffer`.
     pub(super) user_shader_emit_pass: rkp_render::user_shader_emit_pass::UserShaderEmitPass,
 
+    /// Per-material cache of pipelines + buffers + bind groups for
+    /// the V1 mesh-path. Created on first frame a mesh-path
+    /// material is painted; rebuilt on shader source-hash change.
+    pub(super) mesh_user_shader_cache: std::collections::HashMap<
+        u16,
+        super::user_shader_mesh_tick::MeshUserShaderMaterialState,
+    >,
+    /// Per-frame draw set for the V1 mesh-path. Repopulated each
+    /// frame by `tick_user_shader_mesh`; the renderer consumes
+    /// during the per-VR encode phase.
+    pub(super) user_shader_mesh_draws:
+        Vec<rkp_render::user_shader_mesh_pass::UserShaderMeshDraw>,
+
     /// Voxel sprite instancing — scene-wide pieces. The
     /// per-viewport march + composite live in [`ViewportRenderer`]
     /// (Stage 6c-2). All four pieces here are constructed at startup
@@ -370,6 +383,8 @@ impl RenderState {
             scene_mgr: init.scene_mgr,
             instance_proto_pass,
             user_shader_emit_pass,
+            mesh_user_shader_cache: std::collections::HashMap::new(),
+            user_shader_mesh_draws: Vec::new(),
             instance_proto_cache,
             tlas_pass,
             tlas_build_pass,

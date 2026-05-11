@@ -103,6 +103,12 @@ pub struct RkpRenderer {
     /// SDF). Writes the full G-buffer for proxy pixels directly,
     /// bypassing `splat_resolve`. One pipeline shared across viewports.
     pub mesh_proxy: crate::mesh_proxy_pass::MeshProxyPass,
+    /// V1 mesh-path user-shader pipeline owner. Holds bind-group +
+    /// pipeline layouts shared across all mesh-path shaders plus a
+    /// stub pipeline set built from the engine skeleton at startup.
+    /// Per-material pipelines + buffers live on the engine's
+    /// `RenderState::mesh_user_shader_cache`.
+    pub user_shader_mesh: crate::user_shader_mesh_pass::UserShaderMeshPass,
     /// Brush-state probe — single-thread compute reading the gbuffer
     /// at the cursor pixel, feeding the screen-space paint cursor.
     /// One pipeline shared across viewports; per-VR bind group lives
@@ -259,6 +265,7 @@ impl RkpRenderer {
             crate::mesh_lod_select_pass::MeshLodSelectPass::new(device, &splat_pass.g1_layout);
         let splat_resolve = SplatResolvePass::new(device);
         let mesh_proxy = crate::mesh_proxy_pass::MeshProxyPass::new(device);
+        let user_shader_mesh = crate::user_shader_mesh_pass::UserShaderMeshPass::new(device);
         let brush_state = crate::brush_state_pass::BrushStatePass::new(device);
         let primary_mode = PrimaryMode::from_env();
         eprintln!("[RkpRenderer] primary_mode = {primary_mode:?}");
@@ -288,6 +295,7 @@ impl RkpRenderer {
             splat_pass,
             splat_resolve,
             mesh_proxy,
+            user_shader_mesh,
             brush_state,
             splat_buffers: Vec::new(),
             mesh_pass,
@@ -682,6 +690,50 @@ impl RkpRenderer {
     }
 
     /// Rasterize procedural proxy meshes into the existing G-buffer.
+    /// V1 mesh-path user-shader raster — one indirect draw per
+    /// active user-shader material. Composites onto the G-buffer
+    /// using `LoadOp::Load` + depth-test, same shape as
+    /// `dispatch_proxy_meshes`. Caller has already dispatched the
+    /// compute trio (spawn_count → prefix_sum → fill) for each
+    /// material, so the indirect-args buffer is ready when we get
+    /// here.
+    pub fn dispatch_user_shader_mesh(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        viewport: &mut crate::viewport_renderer::ViewportRenderer,
+        draws: &[crate::user_shader_mesh_pass::UserShaderMeshDraw],
+    ) {
+        if draws.is_empty() {
+            return;
+        }
+        viewport.refresh_user_shader_mesh_g0(&self.device, &self.user_shader_mesh);
+        let g0_bg = viewport
+            .user_shader_mesh_g0_bg
+            .as_ref()
+            .expect("user_shader_mesh g0 bg present after refresh");
+
+        let q = self.profiler.begin_query("user_shader_mesh_raster", encoder);
+        {
+            let mut rp = self.user_shader_mesh.begin_raster_pass(
+                encoder,
+                &viewport.gbuffer.position_view,
+                &viewport.pick_view,
+                &viewport.gbuffer.normal_view,
+                &viewport.gbuffer.material_view,
+                &viewport.gbuffer.glass_view,
+                &viewport.gbuffer.depth_view,
+                None,
+            );
+            rp.set_bind_group(0, g0_bg, &[]);
+            for d in draws {
+                rp.set_pipeline(&d.raster_pipeline);
+                rp.set_bind_group(1, &d.raster_g1, &[]);
+                rp.draw_indirect(&d.indirect_buffer, 0);
+            }
+        }
+        self.profiler.end_query(encoder, q);
+    }
+
     /// Runs after the primary mode's main pass + `splat_resolve` so the
     /// G-buffer carries octree-mesh/splat output; proxy raster
     /// depth-composites on top using `LoadOp::Load`. Writes all five
@@ -1803,6 +1855,12 @@ impl RkpRenderer {
         // Rendered by `dispatch_proxy_meshes` after the primary mode
         // completes; composites into the G-buffer via depth-test.
         proxy_draws: &[crate::mesh_proxy_pass::ProxyDraw],
+        // V1 mesh-path user-shader draws. One per active user-shader
+        // material with painted anchors. Compute trio already ran
+        // (in engine's `tick_user_shader_mesh`); this raster
+        // consumes the indirect-args buffer the prefix_sum pass
+        // wrote.
+        user_shader_mesh_draws: &[crate::user_shader_mesh_pass::UserShaderMeshDraw],
         // Cursor pixel for the screen-space paint cursor — `Some` when
         // paint mode is active and the mouse sits inside the
         // framebuffer, `None` otherwise. Drives a single-thread
@@ -1872,6 +1930,14 @@ impl RkpRenderer {
         //      target, no scene composition).
         if !raymarch {
             self.dispatch_proxy_meshes(queue, encoder, viewport, proxy_draws);
+        }
+
+        // 1a''. V1 mesh-path user-shader raster. One indirect draw
+        //       per active user-shader material with painted
+        //       anchors. Composites onto the G-buffer same way the
+        //       proxy raster does.
+        if !raymarch {
+            self.dispatch_user_shader_mesh(encoder, viewport, user_shader_mesh_draws);
         }
 
         // 1b. Half-res shadow trace. Skipped in isolation — the shade

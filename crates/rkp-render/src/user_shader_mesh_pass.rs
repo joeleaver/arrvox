@@ -207,6 +207,20 @@ pub struct UserShaderMeshPipelines {
     pub fill: wgpu::ComputePipeline,
 }
 
+/// One per-material draw descriptor enqueued by the engine for the
+/// renderer's per-VR encode phase. wgpu types are internally
+/// reference-counted, so `clone()` here is cheap. The renderer's
+/// `dispatch_user_shader_mesh` consumes a slice of these.
+#[derive(Clone)]
+pub struct UserShaderMeshDraw {
+    pub material_id: u16,
+    pub shader_id: u32,
+    pub vertex_count_per_spawn: u32,
+    pub raster_pipeline: wgpu::RenderPipeline,
+    pub raster_g1: wgpu::BindGroup,
+    pub indirect_buffer: wgpu::Buffer,
+}
+
 impl UserShaderMeshPass {
     pub fn new(device: &wgpu::Device) -> Self {
         let raster_g0_layout = device.create_bind_group_layout(
@@ -376,6 +390,17 @@ impl UserShaderMeshPass {
             stub_prefix_sum,
             stub_fill,
         }
+    }
+
+    /// The build-emitted skeleton WGSL templates the composer
+    /// splices user code into. `wesl::include_wesl!` reads from the
+    /// emitter crate's OUT_DIR, so cross-crate callers (rkp-engine)
+    /// can't invoke the macro themselves — they call this helper.
+    pub fn template_sources() -> (&'static str, &'static str) {
+        (
+            wesl::include_wesl!("user_shader_mesh"),
+            wesl::include_wesl!("user_shader_mesh_compute"),
+        )
     }
 
     /// Build a per-shader pipeline tuple from the composed WGSL

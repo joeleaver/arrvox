@@ -244,6 +244,14 @@ pub(super) fn encode_viewports(
             state.renderer.profiler.end_query(&mut encoder, q);
         }
 
+        // Snapshot the user-shader mesh draws before the
+        // `state.renderer.render_to` mutable borrow so the
+        // immutable read above doesn't conflict. The draws are
+        // regenerated each frame by `tick_user_shader_mesh`, so a
+        // clone is structurally correct (the slices are small
+        // — ≤ N_materials entries; wgpu types inside are cheap-
+        // clone refcounted handles).
+        let user_shader_mesh_draws = state.user_shader_mesh_draws.clone();
         state.renderer.render_to(
             &mut encoder,
             &state.queue,
@@ -282,6 +290,12 @@ pub(super) fn encode_viewports(
             // visibility regardless of `primary_mode` — proxy meshes
             // are first-class scene geometry.
             &frame.proxy_draws,
+            // V1 mesh-path user-shader draws. The engine's
+            // `tick_user_shader_mesh` already ran the per-material
+            // compute trio earlier in `pre.rs`; this slice carries
+            // the per-material raster descriptors the renderer
+            // consumes after the proxy raster.
+            &user_shader_mesh_draws,
             // Cursor pixel for the screen-space paint cursor's
             // brush-state probe pass. `None` = paint mode off (or
             // mouse outside the framebuffer); the probe will write

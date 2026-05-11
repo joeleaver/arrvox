@@ -12,6 +12,7 @@ use crate::viewport::ViewportId;
 
 use super::super::frame_helpers::{compute_tlas_scene_aabb, prepare_shadow_maps};
 use super::super::state::RenderState;
+use super::super::user_shader_mesh_tick::tick_user_shader_mesh;
 use super::super::user_shader_tick::{tick_emit_pass, tick_instance_pipeline};
 
 use super::PreFrameOutput;
@@ -255,6 +256,16 @@ pub(super) fn run_pre_frame(
     //       nothing consumes it; engine logs the count behind
     //       `RKP_MARCH_STATS=1` for verification).
     tick_emit_pass(state, frame, &inst_result, proto_asset_id_base);
+
+    // 1.7d. V1 mesh-path user-shader orchestration. Reads
+    //       `frame.painted_anchors`, dispatches per-material
+    //       compute trio (spawn_count → prefix_sum → fill) for
+    //       mesh-path shaders, and stages draw descriptors on
+    //       `state.user_shader_mesh_draws`. The renderer consumes
+    //       the draw set in the per-VR encode phase (task #7 — wired
+    //       to nothing yet, so the compute trio runs but no raster
+    //       draws happen).
+    tick_user_shader_mesh(state, frame);
 
     let p_t_emit = pre_start.elapsed();
 

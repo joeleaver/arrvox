@@ -148,6 +148,11 @@ pub struct ViewportRenderer {
     /// on first dispatch; the camera uniform buffer is stable per
     /// viewport so this lives for the viewport's lifetime.
     pub proxy_g0_bg: Option<wgpu::BindGroup>,
+    /// V1 mesh-path user-shader raster g0 bind group. Same camera
+    /// buffer as `proxy_g0_bg` but built against
+    /// `UserShaderMeshPass::raster_g0_layout`. Built on first
+    /// `refresh_user_shader_mesh_g0` and reused.
+    pub user_shader_mesh_g0_bg: Option<wgpu::BindGroup>,
     /// Per-instance 80 B uniform buffers for proxy draws. Grown on
     /// demand by `ensure_proxy_instance_capacity`, reused across
     /// frames.
@@ -712,6 +717,7 @@ impl ViewportRenderer {
             splat_instance_buffers: Vec::new(),
             splat_instance_bind_groups: Vec::new(),
             proxy_g0_bg: None,
+            user_shader_mesh_g0_bg: None,
             proxy_instance_buffers: Vec::new(),
             proxy_instance_bind_groups: Vec::new(),
             splat_resolve_g0_bg: None,
@@ -1230,6 +1236,28 @@ impl ViewportRenderer {
                     .mesh_proxy
                     .create_g0_bind_group(device, &self.camera_buffer),
             );
+        }
+    }
+
+    /// Build the V1 user-shader-mesh raster g0 bind group once per
+    /// viewport. Same camera buffer as `proxy_g0_bg`; different layout
+    /// object so the bind groups can't cross-talk.
+    pub fn refresh_user_shader_mesh_g0(
+        &mut self,
+        device: &wgpu::Device,
+        pass: &crate::user_shader_mesh_pass::UserShaderMeshPass,
+    ) {
+        if self.user_shader_mesh_g0_bg.is_none() {
+            self.user_shader_mesh_g0_bg = Some(device.create_bind_group(
+                &wgpu::BindGroupDescriptor {
+                    label: Some("user_shader_mesh g0 (camera)"),
+                    layout: &pass.raster_g0_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.camera_buffer.as_entire_binding(),
+                    }],
+                },
+            ));
         }
     }
 

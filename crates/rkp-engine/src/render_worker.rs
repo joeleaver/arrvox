@@ -78,6 +78,7 @@ mod frame;
 mod frame_helpers;
 mod loop_thread;
 mod state;
+mod user_shader_mesh_tick;
 mod user_shader_tick;
 
 pub use state::{FrameCallback, RenderInbox, RenderWorker};
