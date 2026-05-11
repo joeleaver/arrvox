@@ -277,6 +277,14 @@ pub(crate) struct EngineState {
             Vec<rkp_render::user_shader_mesh_pass::AnchorRecord>,
         >,
     >,
+    /// Debug-only: last rebuild's (object_id, quantized tile_min, material_id)
+    /// → seed map. Used by `RKP_GRASS_DEBUG` to detect per-tile seed
+    /// drift across rebuilds (i.e., the "same tile" reporting different
+    /// seeds, which would indicate a stability bug). None when the env
+    /// flag is off.
+    pub(crate) debug_last_anchor_seeds: Option<
+        std::collections::HashMap<(u32, u32, u32, u32, u16), u32>,
+    >,
     /// Per-entity walk results. The flat `painted_materials` /
     /// `painted_leaves` / `painted_anchors` above are derived views
     /// over this map's values.

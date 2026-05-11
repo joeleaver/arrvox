@@ -469,12 +469,30 @@ pub(super) fn tick_emit_pass(
     // Build mat_to_proto. Indexed by material_id; entries default to
     // `(0, 0)` (= "no shader, no asset", emit-pass thread early-returns).
     // Sized to `materials.len()` so leaf.material_id can index directly.
+    //
+    // V1 mesh-path shaders take a separate rendering path (see
+    // `tick_user_shader_mesh`) and their materials must NOT also emit
+    // legacy `RkpInstance` records here — otherwise both paths
+    // render simultaneously and the old path's per-leaf-seeded
+    // instances re-randomize on every paint stamp on top of the new
+    // path's stable grass. Skip those materials by leaving
+    // `mat_to_proto[mat_id]` zero.
     let mut mat_to_proto = vec![
         MatToProto { shader_id: 0, proto_asset_id: 0 };
         frame.materials.len()
     ];
     for (mat_id, mat) in frame.materials.iter().enumerate() {
         if mat.instance_shader_id == 0 {
+            continue;
+        }
+        // Skip mesh-path shaders — they render via `tick_user_shader_mesh`
+        // + the user-shader-mesh raster pass.
+        let is_mesh_path = frame
+            .user_shader_entries
+            .iter()
+            .find(|e| e.id == mat.instance_shader_id)
+            .is_some_and(|e| e.is_mesh_path());
+        if is_mesh_path {
             continue;
         }
         // Find the proto asset for this shader_id.

@@ -73,6 +73,7 @@ impl EngineState {
             painted_materials: std::collections::HashMap::new(),
             painted_leaves: std::sync::Arc::new(Vec::new()),
             painted_anchors: std::sync::Arc::new(std::collections::HashMap::new()),
+            debug_last_anchor_seeds: None,
             painted_per_entity: std::collections::HashMap::new(),
             painted_dirty_entities: std::collections::HashSet::new(),
             painted_materials_paint_epoch: 0,

@@ -45,6 +45,10 @@ const ANCHOR_IDX_DEAD: u32 = 0xFFFFFFFFu;
 const PREFIX_SUM_WG_SIZE: u32 = 256u;
 const PREFIX_SUM_MAX_WG_COUNT: u32 = 32u;
 
+// Layout mirrors `rkp_render::user_shader_mesh_pass::AnchorRecord`.
+// The trailing `_pad` makes the WGSL struct size match Rust's 64 B
+// — without it, naga rounds the natural size (44 B → 48 B) and the
+// `array<AnchorContext>` stride diverges from the CPU upload.
 struct AnchorContext {
     tile_min:        vec3<f32>,
     material_id:     u32,
@@ -53,6 +57,7 @@ struct AnchorContext {
     object_id:       u32,
     surface_y:       f32,
     seed:            u32,
+    _pad:            array<u32, 5>,
 }
 
 struct FrameContext {
@@ -139,65 +144,28 @@ fn entry_spawn_count(@builtin(global_invocation_id) gid: vec3<u32>) {
     out_counts[i] = spawn_count(anchors[i], frame);
 }
 
-// ── Multi-pass prefix sum (Blelloch-style, 3 passes) ──────────────
+// ── Single-workgroup prefix sum ───────────────────────────────────
 //
-// Goal: exclusive scan of `out_counts[0..num_anchors]` into
-// `out_offsets[]`, plus write the total spawn count into the
-// indirect-draw args. Supports up to PREFIX_SUM_WG_SIZE ×
-// PREFIX_SUM_MAX_WG_COUNT anchors per material.
+// Single-pass exclusive scan + indirect-args write. Handles up to
+// `PREFIX_SUM_WG_SIZE` (256) anchors per material — covers
+// `MAX_ANCHORS_PER_SHADER_V1`'s current value. For larger N, a
+// multi-tier scan with wg_sums goes here later.
+//
+// Engine dispatches this with 1 workgroup of 256 threads. Threads
+// with `tid >= num_anchors` load 0 so the scan returns a correct
+// total. Thread 0 writes the draw args.
 
 var<workgroup> scan_data: array<u32, PREFIX_SUM_WG_SIZE>;
 
-// Pass 1: each workgroup scans 256 elements locally, writes its
-// total to wg_sums[workgroup_id].
 @compute @workgroup_size(PREFIX_SUM_WG_SIZE)
 fn entry_prefix_local(
-    @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wgid: vec3<u32>,
 ) {
     let tid = lid.x;
-    let idx = gid.x;
+    let n = dispatch.num_anchors;
 
     var val: u32 = 0u;
-    if (idx < dispatch.num_anchors) { val = out_counts[idx]; }
-    scan_data[tid] = val;
-    workgroupBarrier();
-
-    // Hillis-Steele inclusive scan within the workgroup.
-    var stride: u32 = 1u;
-    while (stride < PREFIX_SUM_WG_SIZE) {
-        var t: u32 = 0u;
-        if (tid >= stride) { t = scan_data[tid - stride]; }
-        workgroupBarrier();
-        if (tid >= stride) { scan_data[tid] = scan_data[tid] + t; }
-        workgroupBarrier();
-        stride = stride << 1u;
-    }
-
-    // Convert inclusive → exclusive and store the workgroup-local
-    // offset (will get the workgroup base added back in pass 3).
-    if (idx < dispatch.num_anchors) {
-        out_offsets[idx] = scan_data[tid] - val;
-    }
-
-    // Last thread in each workgroup stashes the local total.
-    if (tid == PREFIX_SUM_WG_SIZE - 1u) {
-        wg_sums[wgid.x] = scan_data[tid];
-    }
-}
-
-// Pass 2: single workgroup scans wg_sums[] in place. Each lane
-// reads its own initial value into scan_data, runs the same
-// Hillis-Steele scan, then writes its EXCLUSIVE result back to
-// wg_sums (overwriting the per-workgroup total with the cumulative
-// offset). Thread 0 also writes the indirect-draw args.
-@compute @workgroup_size(PREFIX_SUM_WG_SIZE)
-fn entry_prefix_scan_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
-    let tid = lid.x;
-
-    var val: u32 = 0u;
-    if (tid < PREFIX_SUM_MAX_WG_COUNT) { val = wg_sums[tid]; }
+    if (tid < n) { val = out_counts[tid]; }
     scan_data[tid] = val;
     workgroupBarrier();
 
@@ -211,18 +179,14 @@ fn entry_prefix_scan_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
         stride = stride << 1u;
     }
 
-    if (tid < PREFIX_SUM_MAX_WG_COUNT) {
-        wg_sums[tid] = scan_data[tid] - val;
+    if (tid < n) {
+        out_offsets[tid] = scan_data[tid] - val;
     }
 
     if (tid == 0u) {
-        let n = dispatch.num_anchors;
         var total: u32 = 0u;
         if (n > 0u) {
-            let last_wg = (n + PREFIX_SUM_WG_SIZE - 1u) / PREFIX_SUM_WG_SIZE;
-            if (last_wg > 0u && last_wg <= PREFIX_SUM_MAX_WG_COUNT) {
-                total = scan_data[last_wg - 1u];
-            }
+            total = scan_data[n - 1u];
         }
         out_indirect.vertex_count   = dispatch.verts_per_spawn;
         out_indirect.instance_count = total;
@@ -231,16 +195,21 @@ fn entry_prefix_scan_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
     }
 }
 
-// Pass 3: add the per-workgroup base back into every per-thread
-// local offset, yielding the global exclusive scan in out_offsets.
+// Stubs kept so the per-shader pipeline tuple (and the engine's
+// dispatch sequence) compile unchanged. They write nothing — the
+// real work is in `entry_prefix_local` above.
 @compute @workgroup_size(PREFIX_SUM_WG_SIZE)
-fn entry_prefix_add_back(
-    @builtin(global_invocation_id) gid: vec3<u32>,
-    @builtin(workgroup_id) wgid: vec3<u32>,
-) {
-    let idx = gid.x;
-    if (idx >= dispatch.num_anchors) { return; }
-    out_offsets[idx] = out_offsets[idx] + wg_sums[wgid.x];
+fn entry_prefix_scan_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
+    if (lid.x == 0u) {
+        wg_sums[0] = 0u;
+    }
+}
+
+@compute @workgroup_size(PREFIX_SUM_WG_SIZE)
+fn entry_prefix_add_back(@builtin(local_invocation_id) lid: vec3<u32>) {
+    if (lid.x == 0u) {
+        wg_sums[0] = 0u;
+    }
 }
 
 // ── fill entry — one thread per anchor; fans out per-spawn records ─

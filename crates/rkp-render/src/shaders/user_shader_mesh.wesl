@@ -58,6 +58,10 @@ const ANCHOR_IDX_DEAD: u32 = 0xFFFFFFFFu;
 // shading context to drive `vs`. Layout must match
 // `rkp_render::user_shader_mesh_pass::AnchorRecord` (CPU side).
 // 64 B; std430 packing.
+// Layout mirrors `rkp_render::user_shader_mesh_pass::AnchorRecord`.
+// The trailing `_pad` makes the WGSL struct size match Rust's 64 B
+// — without it, naga rounds the natural size (44 B → 48 B) and the
+// `array<AnchorContext>` stride diverges from the CPU upload.
 struct AnchorContext {
     tile_min:        vec3<f32>,
     material_id:     u32,
@@ -66,6 +70,7 @@ struct AnchorContext {
     object_id:       u32,
     surface_y:       f32,
     seed:            u32,
+    _pad:            array<u32, 5>,
 }
 
 // Per-frame engine uniforms. User shaders subscribe to these via

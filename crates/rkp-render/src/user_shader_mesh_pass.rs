@@ -176,16 +176,15 @@ pub fn anchor_seed(world_pos: [f32; 3]) -> u32 {
     x
 }
 
-/// V1 ceiling on anchors per user-shader material — the prefix-sum
-/// is a 3-pass Blelloch scan of `PREFIX_SUM_WG_SIZE *
-/// PREFIX_SUM_MAX_WG_COUNT` elements (256 × 32 = 8192). Note: the
-/// "anchor = painted-leaf" design hits this cap quickly on any
-/// reasonable hillside paint (24k+ anchors observed at ~38 m²); a
-/// shape-of-design rework lives on the V1.1 follow-up list.
-pub const MAX_ANCHORS_PER_SHADER_V1: u32 = 8192;
+/// V1 ceiling on anchors per user-shader material — matches the
+/// single-workgroup prefix-sum in `user_shader_mesh_compute.wesl`.
+/// At @tile_size 0.5 this still covers ~64 m² of painted surface.
+/// Multi-pass scan goes here once we need more.
+pub const MAX_ANCHORS_PER_SHADER_V1: u32 = 256;
 
-/// Per-workgroup-sum slots used by the Blelloch scan. Must match
-/// `PREFIX_SUM_MAX_WG_COUNT` in `user_shader_mesh_compute.wesl`.
+/// Per-workgroup-sum slots. The scan is now single-pass; this is
+/// just a size for the now-stub `wg_sums` storage buffer (kept so
+/// the engine bind-group layout doesn't shift while we iterate).
 pub const PREFIX_SUM_MAX_WG_COUNT: u32 = 32;
 
 // ─── Pipeline objects ──────────────────────────────────────────────

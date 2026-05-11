@@ -428,6 +428,74 @@ impl EngineState {
                     }
                 }
                 self.painted_leaves = std::sync::Arc::new(new_painted_leaves);
+
+                // Debug: detect per-tile seed instability. Compare each
+                // tile's (object_id, tile_min) → seed against last
+                // rebuild's value; only log when the seed for an
+                // already-known tile actually changed. Quiet when
+                // things are stable; loud only when there's a real bug.
+                // `RKP_GRASS_DEBUG=1` enables.
+                if std::env::var("RKP_GRASS_DEBUG").is_ok() {
+                    let mut changed = 0u32;
+                    let mut new_tiles = 0u32;
+                    let mut dropped = 0u32;
+                    let mut cur_map: std::collections::HashMap<
+                        (u32, u32, u32, u32, u16),
+                        u32,
+                    > = std::collections::HashMap::new();
+                    for (&mat, bucket) in &new_painted_anchors {
+                        for a in bucket {
+                            // Quantize tile_min to mm to dodge fp noise.
+                            let key = (
+                                a.object_id,
+                                (a.tile_min[0] * 1000.0).round() as i32 as u32,
+                                (a.tile_min[1] * 1000.0).round() as i32 as u32,
+                                (a.tile_min[2] * 1000.0).round() as i32 as u32,
+                                mat,
+                            );
+                            cur_map.insert(key, a.seed);
+                        }
+                    }
+                    if let Some(last) = self.debug_last_anchor_seeds.as_ref() {
+                        for (k, &cur_seed) in &cur_map {
+                            match last.get(k) {
+                                Some(&prev_seed) if prev_seed != cur_seed => {
+                                    changed += 1;
+                                    if changed <= 5 {
+                                        eprintln!(
+                                            "[grass-debug] SEED CHANGED obj={} tile_min=({:.4},{:.4},{:.4}) mat={} prev=0x{:08x} cur=0x{:08x}",
+                                            k.0,
+                                            k.1 as i32 as f32 / 1000.0,
+                                            k.2 as i32 as f32 / 1000.0,
+                                            k.3 as i32 as f32 / 1000.0,
+                                            k.4,
+                                            prev_seed,
+                                            cur_seed,
+                                        );
+                                    }
+                                }
+                                None => new_tiles += 1,
+                                _ => {}
+                            }
+                        }
+                        for k in last.keys() {
+                            if !cur_map.contains_key(k) {
+                                dropped += 1;
+                            }
+                        }
+                    } else {
+                        new_tiles = cur_map.len() as u32;
+                    }
+                    eprintln!(
+                        "[grass-debug] rebuild paint={} geom={} dirty={} mats={} anchors={} changed={} new={} dropped={}",
+                        cur_paint, cur_geom, dirty_count,
+                        new_painted_anchors.len(),
+                        cur_map.len(),
+                        changed, new_tiles, dropped,
+                    );
+                    self.debug_last_anchor_seeds = Some(cur_map);
+                }
+
                 self.painted_anchors = std::sync::Arc::new(new_painted_anchors);
             }
 

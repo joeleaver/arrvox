@@ -217,7 +217,15 @@ pub(super) fn tick_user_shader_mesh(state: &mut RenderState, frame: &RenderFrame
 
             mat_state.last_anchor_count = anchor_count;
 
-            // Encode + submit the five compute passes.
+            // Encode + submit the compute pipeline. Each pipeline
+            // stage runs in its own compute pass so wgpu's
+            // begin/end-pass implicit barriers strictly serialize
+            // the chain (spawn_count → prefix_local → prefix_scan_sums
+            // → prefix_add_back → fill). A single multi-dispatch
+            // pass *should* auto-barrier on the read-after-write
+            // hazards between these stages, but explicit
+            // pass-per-stage ordering avoids any implementation
+            // ambiguity.
             let mut encoder = state
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -225,29 +233,22 @@ pub(super) fn tick_user_shader_mesh(state: &mut RenderState, frame: &RenderFrame
                         "user_shader_mesh material {material_id} compute"
                     )),
                 });
-            {
+            let wg_x_64 = anchor_count.div_ceil(64).max(1);
+            let wg_x_256 = anchor_count.div_ceil(256).max(1);
+            for (label, pipeline, wgs) in [
+                ("spawn_count", &mat_state.pipelines.spawn_count, wg_x_64),
+                ("prefix_local", &mat_state.pipelines.prefix_local, wg_x_256),
+                ("prefix_scan_sums", &mat_state.pipelines.prefix_scan_sums, 1),
+                ("prefix_add_back", &mat_state.pipelines.prefix_add_back, wg_x_256),
+                ("fill", &mat_state.pipelines.fill, wg_x_64),
+            ] {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("user_shader_mesh compute"),
+                    label: Some(label),
                     timestamp_writes: None,
                 });
                 pass.set_bind_group(0, &mat_state.compute_g0, &[]);
-
-                pass.set_pipeline(&mat_state.pipelines.spawn_count);
-                let wg_x_64 = anchor_count.div_ceil(64).max(1);
-                pass.dispatch_workgroups(wg_x_64, 1, 1);
-
-                pass.set_pipeline(&mat_state.pipelines.prefix_local);
-                let wg_x_256 = anchor_count.div_ceil(256).max(1);
-                pass.dispatch_workgroups(wg_x_256, 1, 1);
-
-                pass.set_pipeline(&mat_state.pipelines.prefix_scan_sums);
-                pass.dispatch_workgroups(1, 1, 1);
-
-                pass.set_pipeline(&mat_state.pipelines.prefix_add_back);
-                pass.dispatch_workgroups(wg_x_256, 1, 1);
-
-                pass.set_pipeline(&mat_state.pipelines.fill);
-                pass.dispatch_workgroups(wg_x_64, 1, 1);
+                pass.set_pipeline(pipeline);
+                pass.dispatch_workgroups(wgs, 1, 1);
             }
             state.queue.submit(Some(encoder.finish()));
         }
