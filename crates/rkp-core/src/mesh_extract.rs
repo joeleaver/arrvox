@@ -244,6 +244,188 @@ pub fn extract_surface_mesh(
     (vertices, indices)
 }
 
+/// Pass 1 of mesh extraction — walk the octree and produce the dense
+/// non-empty cell map.
+///
+/// Exposed separately from [`extract_surface_mesh`] so callers that
+/// re-extract **multiple regions per stamp** (the sculpt per-cluster
+/// re-extract path in Phase B R4c) can build the map once and run
+/// [`extract_mesh_region_from_cells`] against it per region. Each
+/// rebuild of the map is O(surface area); per-region pass 2 is
+/// proportional to the region's cell count, so amortization is
+/// load-bearing for drag-paint perf.
+///
+/// Returns an empty map for empty octrees.
+pub fn collect_cell_map(
+    octree_nodes: &[u32],
+    octree_depth: u8,
+    brick_cells: &[u32],
+) -> HashMap<IVec3, u32> {
+    let mut cells = HashMap::new();
+    if octree_nodes.is_empty() {
+        return cells;
+    }
+    walk_collect_cells(
+        octree_nodes,
+        brick_cells,
+        0,
+        UVec3::ZERO,
+        0,
+        octree_depth,
+        &mut cells,
+    );
+    cells
+}
+
+/// Pass 2 of mesh extraction, scoped to a region — produce the surface
+/// mesh for cells in `[region_min, region_max)` (half-open).
+///
+/// **What gets emitted:**
+/// * For each solid cell C inside the region (or one cell outside, see
+///   pad below): for each of the 6 face directions, if C's neighbor in
+///   that direction is empty (or out-of-bounds), emit the quad of 4
+///   SN-cube vertices around the face's shared edge.
+///
+/// **Region boundary handling.** Iteration runs over cells in
+/// `[region_min - 1, region_max + 1)` — a 1-cell pad on each side. The
+/// pad catches two crack-causing cases:
+/// 1. A solid cell *outside* the region whose face-neighbor inside
+///    the region is empty: without the pad, the boundary quad on
+///    that face would be missing on the region's side.
+/// 2. An SN-cube whose vertex sits at the region's edge, with one
+///    contributing corner cell just past `region_max`: without the
+///    pad, that cube's vertex would be built from incomplete corner
+///    data.
+///
+/// The pad means some output triangles' vertex positions land slightly
+/// past `region_max` (up to 1 voxel). Callers that union region outputs
+/// (R4c) accept this overlap — duplicate boundary verts across adjacent
+/// regions are intentional under the per-cluster-owned model.
+///
+/// Output indices are *local* to the returned vertex buffer (0-based,
+/// referencing positions in the returned `Vec<MeshVertex>`). Caller
+/// can drop them straight into a [`crate::cluster_mesh_data::ClusterMesh`]
+/// without further remapping.
+pub fn extract_mesh_region_from_cells(
+    cells: &HashMap<IVec3, u32>,
+    region_min: IVec3,
+    region_max: IVec3,
+    octree_nodes: &[u32],
+    octree_depth: u8,
+    base_voxel_size: f32,
+    grid_origin: Vec3,
+    brick_cells: &[u32],
+    leaf_attr_pool: &[LeafAttr],
+    bone_voxel_pool: &[BoneVoxel],
+) -> (Vec<MeshVertex>, Vec<u32>) {
+    let mut vertices: Vec<MeshVertex> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    if cells.is_empty() {
+        return (vertices, indices);
+    }
+    // Empty-region guard (no cells to iterate).
+    if region_min.x >= region_max.x
+        || region_min.y >= region_max.y
+        || region_min.z >= region_max.z
+    {
+        return (vertices, indices);
+    }
+
+    let pad_min = region_min - IVec3::ONE;
+    let pad_max = region_max + IVec3::ONE;
+    let extent = 1i32 << octree_depth;
+    let mut cube_vertex: HashMap<IVec3, u32> = HashMap::new();
+
+    for (&cell, _slot) in cells.iter() {
+        if cell.x < pad_min.x
+            || cell.x >= pad_max.x
+            || cell.y < pad_min.y
+            || cell.y >= pad_max.y
+            || cell.z < pad_min.z
+            || cell.z >= pad_max.z
+        {
+            continue;
+        }
+        for face in 0..6 {
+            let dir = FACE_DIRS[face];
+            let neighbor = cell + dir;
+            if cells.contains_key(&neighbor) {
+                continue;
+            }
+            if is_solid_lookup(
+                octree_nodes,
+                brick_cells,
+                octree_depth,
+                neighbor,
+                extent,
+            ) {
+                continue;
+            }
+            let cube_offsets = CUBE_OFFSETS_PER_FACE[face];
+            let mut quad = [0u32; 4];
+            for i in 0..4 {
+                let cube = cell + cube_offsets[i];
+                quad[i] = match cube_vertex.get(&cube) {
+                    Some(&v) => v,
+                    None => {
+                        let vertex = build_cube_vertex(
+                            cube,
+                            cells,
+                            base_voxel_size,
+                            grid_origin,
+                            leaf_attr_pool,
+                            bone_voxel_pool,
+                        );
+                        let vid = vertices.len() as u32;
+                        vertices.push(vertex);
+                        cube_vertex.insert(cube, vid);
+                        vid
+                    }
+                };
+            }
+            indices.extend([quad[0], quad[1], quad[2]]);
+            indices.extend([quad[0], quad[2], quad[3]]);
+        }
+    }
+
+    (vertices, indices)
+}
+
+/// Convenience wrapper: full octree walk + single-region extract in one
+/// call. Equivalent to
+/// `extract_mesh_region_from_cells(collect_cell_map(..), region, ..)`.
+///
+/// Use this for one-shot region extraction (R4b unit tests, ad-hoc
+/// diagnostics); use the two-step form for sculpt's per-stamp loop
+/// across many regions ([`extract_mesh_region_from_cells`] reuses one
+/// cell map across all regions).
+#[allow(clippy::too_many_arguments)]
+pub fn extract_surface_mesh_region(
+    octree_nodes: &[u32],
+    octree_depth: u8,
+    base_voxel_size: f32,
+    grid_origin: Vec3,
+    brick_cells: &[u32],
+    leaf_attr_pool: &[LeafAttr],
+    bone_voxel_pool: &[BoneVoxel],
+    region_min: IVec3,
+    region_max: IVec3,
+) -> (Vec<MeshVertex>, Vec<u32>) {
+    let cells = collect_cell_map(octree_nodes, octree_depth, brick_cells);
+    extract_mesh_region_from_cells(
+        &cells,
+        region_min,
+        region_max,
+        octree_nodes,
+        octree_depth,
+        base_voxel_size,
+        grid_origin,
+        brick_cells,
+        leaf_attr_pool,
+        bone_voxel_pool,
+    )
+}
+
 /// Build the [`MeshVertex`] for an SN cube whose lo corner is `cube`.
 /// The cube spans cells `cube..cube+1` along each axis (8 corner cells
 /// total).
@@ -916,4 +1098,235 @@ mod tests {
         }
     }
 
+    // ── Phase B R4b — region-scoped extract ─────────────────────────
+
+    /// Triangle multiset keyed by sorted vertex-position triple. Used to
+    /// compare triangle sets across different VBO orderings.
+    fn triangle_position_set(
+        indices: &[u32],
+        verts: &[MeshVertex],
+    ) -> std::collections::HashMap<[[i32; 3]; 3], usize> {
+        let mut m = std::collections::HashMap::new();
+        for tri in indices.chunks_exact(3) {
+            let mut p = [
+                pos_key(verts[tri[0] as usize].local_pos),
+                pos_key(verts[tri[1] as usize].local_pos),
+                pos_key(verts[tri[2] as usize].local_pos),
+            ];
+            p.sort();
+            *m.entry(p).or_insert(0) += 1;
+        }
+        m
+    }
+
+    fn pos_key(p: [f32; 3]) -> [i32; 3] {
+        [
+            (p[0] * 1000.0) as i32,
+            (p[1] * 1000.0) as i32,
+            (p[2] * 1000.0) as i32,
+        ]
+    }
+
+    fn region_extent(extent: i32) -> (IVec3, IVec3) {
+        (IVec3::ZERO, IVec3::splat(extent))
+    }
+
+    /// Region covering the whole asset should produce the same triangle
+    /// set as a full-asset extract.
+    #[test]
+    fn region_extract_matches_full_extract_on_full_region() {
+        // 4×4×4 brick: two adjacent surface cells + a couple of others.
+        let nodes = vec![make_brick(0)];
+        let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
+        bricks[0] = 1; // (0,0,0)
+        bricks[1] = 2; // (1,0,0)
+        bricks[BRICK_DIM as usize * BRICK_DIM as usize] = 3; // (0,0,1)
+
+        let depth = 2u8;
+        let extent = 1i32 << depth;
+        let (full_v, full_i) =
+            extract_surface_mesh(&nodes, depth, 1.0, Vec3::ZERO, &bricks, &[], &[]);
+        let (region_v, region_i) = extract_surface_mesh_region(
+            &nodes,
+            depth,
+            1.0,
+            Vec3::ZERO,
+            &bricks,
+            &[],
+            &[],
+            IVec3::ZERO,
+            IVec3::splat(extent),
+        );
+        let _ = region_extent(extent);
+        assert_eq!(
+            triangle_position_set(&full_i, &full_v),
+            triangle_position_set(&region_i, &region_v),
+            "region covering full extent must match full-extract triangle set",
+        );
+    }
+
+    /// Region far from any solid cell yields nothing (or a degenerate
+    /// empty mesh).
+    #[test]
+    fn region_extract_in_empty_space_yields_nothing() {
+        let nodes = vec![make_brick(0)];
+        let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
+        bricks[0] = 1;
+        let (v, i) = extract_surface_mesh_region(
+            &nodes,
+            2,
+            1.0,
+            Vec3::ZERO,
+            &bricks,
+            &[],
+            &[],
+            IVec3::splat(20),
+            IVec3::splat(25),
+        );
+        assert!(v.is_empty());
+        assert!(i.is_empty());
+    }
+
+    /// Region scoped to the cell containing the single solid voxel
+    /// emits the closed-cube mesh. Pad ensures the cell's 6 face quads
+    /// are all produced.
+    #[test]
+    fn region_extract_capturing_one_cell_emits_full_cube() {
+        let nodes = vec![make_brick(0)];
+        let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
+        bricks[0] = 7; // (0,0,0)
+        let (v, i) = extract_surface_mesh_region(
+            &nodes,
+            2,
+            1.0,
+            Vec3::ZERO,
+            &bricks,
+            &[],
+            &[],
+            IVec3::ZERO,
+            IVec3::ONE, // half-open [0, 1) — covers only cell (0,0,0)
+        );
+        assert_eq!(v.len(), 8, "single cell → 8 cube vertices");
+        assert_eq!(i.len(), 36, "6 faces × 2 triangles × 3 indices");
+    }
+
+    /// Region restricted to a subset is exactly the subset of triangles
+    /// that the full extract would emit for cells in the padded subset.
+    /// Build a 2×1×1 box (cells (0,0,0) and (1,0,0)). Region [0..1)
+    /// (padded [-1..2)) covers both cells, since cell (1,0,0) is one
+    /// past region but inside the pad. Region [3..4) misses entirely.
+    #[test]
+    fn region_extract_subset_includes_padded_neighbors() {
+        let nodes = vec![make_brick(0)];
+        let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
+        bricks[0] = 1; // (0,0,0)
+        bricks[1] = 2; // (1,0,0)
+        let depth = 2u8;
+        // Full extract for reference (10 faces × 2 = 20 tris).
+        let (full_v, full_i) =
+            extract_surface_mesh(&nodes, depth, 1.0, Vec3::ZERO, &bricks, &[], &[]);
+        let full_tris = full_i.len() / 3;
+        assert_eq!(full_tris, 20, "2-cell box has 10 exposed faces × 2 tris");
+
+        // Region [0..1) padded to [-1..2). Includes both cells (0,0,0)
+        // and (1,0,0) (since (1,0,0) is at the +X edge of pad).
+        let (v_a, i_a) = extract_surface_mesh_region(
+            &nodes,
+            depth,
+            1.0,
+            Vec3::ZERO,
+            &bricks,
+            &[],
+            &[],
+            IVec3::ZERO,
+            IVec3::ONE,
+        );
+        assert_eq!(
+            triangle_position_set(&i_a, &v_a),
+            triangle_position_set(&full_i, &full_v),
+            "pad expansion of region [0..1) must reach cell (1,0,0)",
+        );
+
+        // Region [3..4) padded to [2..5) — neither solid cell is in pad.
+        let (v_b, i_b) = extract_surface_mesh_region(
+            &nodes,
+            depth,
+            1.0,
+            Vec3::ZERO,
+            &bricks,
+            &[],
+            &[],
+            IVec3::splat(3),
+            IVec3::splat(4),
+        );
+        assert!(
+            v_b.is_empty() && i_b.is_empty(),
+            "region far from solids must emit nothing"
+        );
+    }
+
+    /// `collect_cell_map` + `extract_mesh_region_from_cells` produce the
+    /// same result as `extract_surface_mesh_region` — the convenience
+    /// wrapper is just sugar over the two-step form.
+    #[test]
+    fn two_step_form_matches_convenience_wrapper() {
+        let nodes = vec![make_brick(0)];
+        let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
+        bricks[0] = 1;
+        bricks[1] = 2;
+        bricks[BRICK_DIM as usize * BRICK_DIM as usize] = 3;
+        let depth = 2u8;
+        let region_min = IVec3::ZERO;
+        let region_max = IVec3::splat(2);
+
+        let (v1, i1) = extract_surface_mesh_region(
+            &nodes,
+            depth,
+            1.0,
+            Vec3::ZERO,
+            &bricks,
+            &[],
+            &[],
+            region_min,
+            region_max,
+        );
+        let cells = collect_cell_map(&nodes, depth, &bricks);
+        let (v2, i2) = extract_mesh_region_from_cells(
+            &cells,
+            region_min,
+            region_max,
+            &nodes,
+            depth,
+            1.0,
+            Vec3::ZERO,
+            &bricks,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            triangle_position_set(&i1, &v1),
+            triangle_position_set(&i2, &v2),
+        );
+    }
+
+    /// Empty region (min == max on any axis) returns nothing.
+    #[test]
+    fn region_extract_empty_region_returns_nothing() {
+        let nodes = vec![make_brick(0)];
+        let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
+        bricks[0] = 1;
+        let (v, i) = extract_surface_mesh_region(
+            &nodes,
+            2,
+            1.0,
+            Vec3::ZERO,
+            &bricks,
+            &[],
+            &[],
+            IVec3::splat(2),
+            IVec3::splat(2), // empty
+        );
+        assert!(v.is_empty());
+        assert!(i.is_empty());
+    }
 }

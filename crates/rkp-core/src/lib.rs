@@ -13,6 +13,7 @@ pub mod asset_file;
 pub mod brick_face_links;
 pub mod brick_map;
 pub mod brick_pool;
+pub mod cluster_mesh_data;
 pub mod companion;
 pub mod constants;
 pub mod laplacian_smooth;

@@ -26,6 +26,7 @@
 
 use glam::{Affine3A, IVec3, Vec3};
 
+use rkp_core::cluster_mesh_data::{flatten_cluster_meshes, split_flat_into_cluster_meshes};
 use rkp_core::mesh_cluster::{cluster_grid_aabb, cluster_overlaps_brush_grid_aabb};
 use rkp_core::mesh_extract::extract_surface_mesh;
 use rkp_core::mesh_lod::build_cluster_dag_with_levels;
@@ -375,6 +376,7 @@ impl RkpSceneManager {
                 entry.mesh_vertices.clear();
                 entry.mesh_indices.clear();
                 entry.meshlet_clusters.clear();
+                entry.cluster_meshes.clear();
                 entry.mesh_lod0_index_count = 0;
             }
             return;
@@ -387,12 +389,28 @@ impl RkpSceneManager {
         // pop-in. R4-proper rebuilds the multi-level DAG; this
         // milestone skips it for the visual-verification win.
         let dag = build_cluster_dag_with_levels(&vertices, &indices_unc, 1);
+        let mut meshlet_clusters = dag.clusters;
+        let mesh_lod0_index_count = dag.lod0_index_range.1 - dag.lod0_index_range.0;
+
+        // Phase B R4a: same round-trip as the load path. Split into
+        // per-cluster owned mesh data; flatten back to keep the cached
+        // flat VBO/IBO consistent with what cluster_meshes describes.
+        // R4c will replace this whole-asset re-extract with per-cluster
+        // re-extract that mutates `cluster_meshes` directly.
+        let cluster_meshes = split_flat_into_cluster_meshes(
+            &vertices,
+            &dag.indices,
+            &meshlet_clusters,
+        );
+        let (mesh_vertices, mesh_indices) =
+            flatten_cluster_meshes(&cluster_meshes, &mut meshlet_clusters);
 
         let Some(entry) = self.asset_cache.get_mut(handle) else { return; };
-        entry.mesh_vertices = vertices;
-        entry.mesh_indices = dag.indices;
-        entry.meshlet_clusters = dag.clusters;
-        entry.mesh_lod0_index_count = dag.lod0_index_range.1 - dag.lod0_index_range.0;
+        entry.mesh_vertices = mesh_vertices;
+        entry.mesh_indices = mesh_indices;
+        entry.meshlet_clusters = meshlet_clusters;
+        entry.cluster_meshes = cluster_meshes;
+        entry.mesh_lod0_index_count = mesh_lod0_index_count;
 
         eprintln!(
             "[sculpt] mesh re-extract: handle={:?} verts={} indices={} clusters={} ({:.2}ms)",
@@ -468,6 +486,7 @@ mod tests {
             mesh_vertices: Vec::new(),
             mesh_indices: Vec::new(),
             mesh_lod0_index_count: 0,
+            cluster_meshes: vec![Default::default(); clusters.len()],
             meshlet_clusters: clusters,
             cpu_octree: SparseOctree::new(depth, base_vs),
         }

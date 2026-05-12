@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use rkp_core::cluster_mesh_data::ClusterMesh;
 use rkp_core::{OctreeHandle, SparseOctree};
 
 /// Face instance for CPU-side face emission (legacy — kept for scene loading
@@ -149,6 +150,19 @@ pub(super) struct AssetEntry {
     /// threshold (~lod + 1), retiring the previously-dormant voxel-
     /// LOD shadow mesh.
     pub(super) meshlet_clusters: Vec<crate::mesh_pass::MeshletCluster>,
+    /// Per-cluster owned mesh data — `cluster_meshes[i]` is the local
+    /// vertex + index list for `meshlet_clusters[i]`. **Phase B
+    /// R4-proper** source of truth for the asset's mesh: the flat
+    /// `mesh_vertices` / `mesh_indices` above are derived by
+    /// [`flatten_cluster_meshes`] at load / re-extract time.
+    ///
+    /// Why per-cluster ownership: sculpt's per-cluster re-extract (R4c)
+    /// regenerates one cluster's geometry in isolation by replacing its
+    /// entry here, then flattening to rebuild the flat buffers for GPU
+    /// upload. The legacy shared-IBO model required shifting every
+    /// downstream cluster's `index_offset` on any re-extract — R4-proper
+    /// drops that whole class of bookkeeping.
+    pub(super) cluster_meshes: Vec<ClusterMesh>,
     /// CPU-side mirror of the asset's octree, retained after upload so
     /// runtime sculpt can mutate it without round-tripping the GPU. Same
     /// node buffer the load path built and uploaded; not memory-cheap on
