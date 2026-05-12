@@ -53,6 +53,67 @@ fn brick_local(coord: UVec3) -> (u32, u32, u32) {
     (coord.x & mask, coord.y & mask, coord.z & mask)
 }
 
+/// Occupancy state of a single finest-grid cell, resolved across the
+/// octree's terminator types and (when applicable) the brick pool.
+///
+/// Sculpt / paint / runtime-edit kernels read this to decide what
+/// edits a cell is eligible for; the variants line up with the
+/// mutation primitives ([`SparseOctree::set_cell_solid`] etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellState {
+    /// Out of the octree's spatial bounds.
+    OutOfBounds,
+    /// Cell is air. No leaf_attr slot, no visible surface.
+    Empty,
+    /// Cell is occupied bulk. No visible surface; counts as mass for
+    /// neighborhood / surface-net reconstruction.
+    Interior,
+    /// Cell has a surface attribute at the given LeafAttrPool slot.
+    Solid(u32),
+}
+
+impl SparseOctree {
+    /// Resolve the occupancy state of a finest-grid cell.
+    ///
+    /// Walks the octree to the cell's terminator and (if BRICK) reads
+    /// the per-cell value from the supplied [`BrickPool`]. Returns
+    /// [`CellState::OutOfBounds`] when `coord` falls outside the tree.
+    ///
+    /// This is the kernel-side counterpart to [`Self::set_cell_solid`]
+    /// / [`Self::set_cell_empty`] / [`Self::set_cell_interior`]: read
+    /// the state, classify against the brush, decide the edit.
+    pub fn cell_state(&self, coord: UVec3, brick_pool: &BrickPool) -> CellState {
+        if !self.in_bounds(coord) {
+            return CellState::OutOfBounds;
+        }
+        let (node, _depth) = self.lookup_with_depth(coord).expect("in bounds checked above");
+        if node == EMPTY_NODE {
+            return CellState::Empty;
+        }
+        if node == INTERIOR_NODE {
+            return CellState::Interior;
+        }
+        if is_leaf(node) {
+            return CellState::Solid(leaf_slot(node));
+        }
+        if is_brick(node) {
+            let bid = brick_id(node);
+            let (lx, ly, lz) = brick_local(coord);
+            let cell = brick_pool.get_cell(bid, lx, ly, lz);
+            return match cell {
+                BRICK_EMPTY => CellState::Empty,
+                BRICK_INTERIOR => CellState::Interior,
+                slot => CellState::Solid(slot),
+            };
+        }
+        // Branch reached lookup_with_depth — shouldn't happen since
+        // lookup_with_depth returns the deepest terminator. Fall back
+        // to Empty defensively.
+        debug_assert!(false, "cell_state hit a branch node at {coord} — lookup invariant broken");
+        CellState::Empty
+    }
+}
+
 /// Return `Some(prev_slot)` if `cell` is a real leaf_attr id, else `None`.
 /// Used by the brick-cell write path to surface the slot the caller must
 /// free.

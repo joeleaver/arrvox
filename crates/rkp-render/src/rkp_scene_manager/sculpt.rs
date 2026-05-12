@@ -114,10 +114,10 @@ impl RkpSceneManager {
             (op, depth, base_vs)
         };
 
-        // ── 2. Compute edit list against current octree (read-only). ─
+        // ── 2. Compute edit list against current octree + brick pool. ─
         let delta = {
             let entry = self.asset_cache.get(handle)?;
-            compute_brush_edits(&entry.cpu_octree, op)
+            compute_brush_edits(&entry.cpu_octree, &self.brick_pool, op)
         };
         if delta.is_empty() {
             return None;

@@ -31,6 +31,8 @@ mod mutate;
 mod optimize;
 mod query;
 
+pub use mutate::CellState;
+
 #[cfg(test)]
 mod tests;
 
