@@ -17,10 +17,19 @@ mod constructor;
 /// One tile's worth of painted-material info: AABB + count of painted
 /// leaves that fall inside the tile. Used by Phase B-redux + Phase C
 /// region partitioning.
+///
+/// `normal_sum` is the unnormalized sum of every painted leaf's
+/// LeafAttr.normal that overlapped this tile (object-local). The
+/// user-shader anchor build normalizes + world-transforms this into
+/// `AnchorRecord.surface_normal` so blade orientations conform to the
+/// host surface. Sum (not running mean) lets the tile-spanning leaf
+/// path contribute the same normal once per overlapped tile without
+/// extra state.
 #[derive(Debug, Clone)]
 pub(crate) struct PaintedTileEntry {
     pub aabb: rkp_core::Aabb,
     pub leaf_count: u32,
+    pub normal_sum: glam::Vec3,
 }
 
 impl PaintedTileEntry {
@@ -31,6 +40,7 @@ impl PaintedTileEntry {
                 max: glam::Vec3::splat(f32::NEG_INFINITY),
             },
             leaf_count: 0,
+            normal_sum: glam::Vec3::ZERO,
         }
     }
 }

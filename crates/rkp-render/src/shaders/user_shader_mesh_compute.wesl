@@ -69,8 +69,9 @@ const PREFIX_SUM_WG_SIZE: u32 = 256u;
 const PREFIX_SUM_MAX_WG_COUNT: u32 = 32u;
 
 // Layout mirrors `rkp_render::user_shader_mesh_pass::AnchorRecord`.
-// 80 B std430. Trailing `_pad` keeps the WGSL struct size matching
-// Rust — without it the array stride diverges from the CPU upload.
+// 80 B std430. `surface_normal` (vec3) sits at offset 64 with `seed`
+// packing into the trailing 4 B at offset 76 — see
+// `feedback_wgsl_std430_vec3_no_padding`.
 struct AnchorContext {
     tile_min:        vec3<f32>,
     material_id:     u32,
@@ -80,8 +81,8 @@ struct AnchorContext {
     object_id:       u32,
     paint_max:       vec3<f32>,
     surface_y:       f32,
+    surface_normal:  vec3<f32>,
     seed:            u32,
-    _pad:            array<u32, 3>,
 }
 
 struct FrameContext {

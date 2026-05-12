@@ -397,6 +397,20 @@ impl EngineState {
                             // (not from the tile-cube floor, which
                             // could be tile_size below).
                             let surface_y = paint_world_max.y;
+                            // Per-tile surface normal: normalize the
+                            // object-local sum of painted-leaf normals,
+                            // rotate by the entity's world transform,
+                            // re-normalize. Fall back to +Y on either
+                            // degenerate stage (cancelling normals or
+                            // an entity transform that maps Y to 0).
+                            let local_normal = te.normal_sum
+                                .try_normalize()
+                                .unwrap_or(glam::Vec3::Y);
+                            let world_normal = entity_world
+                                .map(|m| m.transform_vector3(local_normal))
+                                .unwrap_or(local_normal)
+                                .try_normalize()
+                                .unwrap_or(glam::Vec3::Y);
                             // Stable seed: tile coord + material.
                             // Dropped `object_id` because `gpu_idx`
                             // can shuffle on `gpu_objects` rebuild
@@ -421,8 +435,8 @@ impl EngineState {
                                     object_id,
                                     paint_max: paint_world_max.to_array(),
                                     surface_y,
+                                    surface_normal: world_normal.to_array(),
                                     seed,
-                                    _pad: [0; 3],
                                 },
                             );
                         }
@@ -1322,7 +1336,8 @@ fn scan_painted_aabbs(
                             let info = shader_materials.get(&mat);
                             let tile_size = info.and_then(|i| i.tile_size);
                             super::lifecycle::expand_aabb(
-                                out, mat, cell_local, cell_max, tile_size,
+                                out, mat, cell_local, cell_max,
+                                attr.normal(), tile_size,
                             );
                         }
                     }
@@ -1356,7 +1371,8 @@ fn scan_painted_aabbs(
                 let info = shader_materials.get(&mat);
                 let tile_size = info.and_then(|i| i.tile_size);
                 super::lifecycle::expand_aabb(
-                    out, mat, leaf_min, leaf_max, tile_size,
+                    out, mat, leaf_min, leaf_max,
+                    attr.normal(), tile_size,
                 );
             }
             return;
@@ -1603,6 +1619,7 @@ fn expand_aabb(
     mat: u16,
     mn: glam::Vec3,
     mx: glam::Vec3,
+    normal: glam::Vec3,
     tile_size: Option<f32>,
 ) {
     let mat_map = out.entry(mat).or_default();
@@ -1612,15 +1629,21 @@ fn expand_aabb(
         key: [i32; 3],
         mn: glam::Vec3,
         mx: glam::Vec3,
+        normal: glam::Vec3,
     ) {
         let entry = mat_map.entry(key).or_insert_with(super::state::PaintedTileEntry::empty);
         entry.aabb.min = entry.aabb.min.min(mn);
         entry.aabb.max = entry.aabb.max.max(mx);
         entry.leaf_count = entry.leaf_count.saturating_add(1);
+        // Sum (not mean) — for leaves that span tile boundaries, the
+        // outer match below calls merge() once per overlapped tile, so
+        // each tile gets that leaf's normal added once. Normalize at
+        // anchor build time.
+        entry.normal_sum += normal;
     }
 
     match tile_size {
-        None => merge(mat_map, NO_TILE_COORD, mn, mx),
+        None => merge(mat_map, NO_TILE_COORD, mn, mx, normal),
         Some(s) if s > 0.0 => {
             // Compute tile coord range the leaf overlaps. Use a tiny
             // epsilon on the upper bound so a leaf whose max sits
@@ -1632,13 +1655,13 @@ fn expand_aabb(
             for ix in (lo.x as i32)..=(hi.x as i32) {
                 for iy in (lo.y as i32)..=(hi.y as i32) {
                     for iz in (lo.z as i32)..=(hi.z as i32) {
-                        merge(mat_map, [ix, iy, iz], mn, mx);
+                        merge(mat_map, [ix, iy, iz], mn, mx, normal);
                     }
                 }
             }
         }
         // tile_size 0 or negative → treat as non-tiled.
-        Some(_) => merge(mat_map, NO_TILE_COORD, mn, mx),
+        Some(_) => merge(mat_map, NO_TILE_COORD, mn, mx, normal),
     }
 }
 

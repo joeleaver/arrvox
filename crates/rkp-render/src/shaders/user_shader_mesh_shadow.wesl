@@ -58,8 +58,8 @@ struct AnchorContext {
     object_id:       u32,
     paint_max:       vec3<f32>,
     surface_y:       f32,
+    surface_normal:  vec3<f32>,
     seed:            u32,
-    _pad:            array<u32, 3>,
 }
 
 struct FrameContext {

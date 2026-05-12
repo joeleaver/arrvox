@@ -61,11 +61,13 @@ const GBUFFER_PICK_FORMAT: wgpu::TextureFormat = GBUFFER_LEAF_SLOT_FORMAT;
 ///   offset 44..48  object_id          u32
 ///   offset 48..60  paint_max          vec3<f32>
 ///   offset 60..64  surface_y          f32       (blade base y = paint_max.y in world)
-///   offset 64..68  seed               u32
-///   offset 68..80  _pad               3×u32
+///   offset 64..76  surface_normal     vec3<f32> (world unit normal, +Y fallback)
+///   offset 76..80  seed               u32
 ///
 /// 80 B total — aligns to 16 (WGSL std430). Field offsets asserted
-/// at compile time.
+/// at compile time. `surface_normal` sits at offset 64 to satisfy
+/// vec3's 16-byte alignment; per `feedback_wgsl_std430_vec3_no_padding`
+/// the following u32 packs immediately at offset 76 with no pad.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
 pub struct AnchorRecord {
@@ -77,8 +79,8 @@ pub struct AnchorRecord {
     pub object_id: u32,
     pub paint_max: [f32; 3],
     pub surface_y: f32,
+    pub surface_normal: [f32; 3],
     pub seed: u32,
-    pub _pad: [u32; 3],
 }
 
 const _: () = assert!(std::mem::size_of::<AnchorRecord>() == 80);
@@ -92,7 +94,8 @@ const _: () = {
     assert!(offset_of!(AnchorRecord, object_id) == 44);
     assert!(offset_of!(AnchorRecord, paint_max) == 48);
     assert!(offset_of!(AnchorRecord, surface_y) == 60);
-    assert!(offset_of!(AnchorRecord, seed) == 64);
+    assert!(offset_of!(AnchorRecord, surface_normal) == 64);
+    assert!(offset_of!(AnchorRecord, seed) == 76);
 };
 
 /// Per-frame engine uniforms uploaded once per render. Layout matches
