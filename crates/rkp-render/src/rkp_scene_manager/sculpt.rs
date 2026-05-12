@@ -27,7 +27,7 @@
 use glam::{Affine3A, Vec3};
 
 use rkp_core::sculpt::{
-    compute_brush_edits, BrushMode, BrushOp, LeafEditOp,
+    apply_delta, compute_brush_edits, BrushMode, BrushOp, LeafEditOp,
 };
 use rkp_core::sparse_octree::{is_brick, is_leaf, leaf_slot, brick_id};
 use rkp_core::brick_pool::{BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR};
@@ -178,7 +178,7 @@ impl RkpSceneManager {
         }
 
         let leaves_removed = removed.len();
-        if removed.is_empty() && leaves_add_skipped == 0 {
+        if removed.is_empty() && delta.count_added() == 0 && delta.count_interior() == 0 {
             return None;
         }
 
@@ -190,9 +190,68 @@ impl RkpSceneManager {
         removed.sort_unstable();
         removed.dedup();
 
+        // ── 4. Real-geometry mutation (Phase B R2c). ────────────────
+        //
+        // Mutate the asset's octree + the scene's brick / leaf_attr
+        // pools to reflect the delta. The overlay still rides through
+        // `removed_leaf_attr_ids` for fragment-discard parity until
+        // R4 (per-cluster re-extract) makes the mutation directly
+        // visible by regenerating the mesh.
+        //
+        // Borrows: we split `self` field-by-field (`asset_cache`,
+        // `brick_pool`, `leaf_attr_pool`) so `alloc_slot` can call
+        // back into the leaf_attr_pool while apply_delta holds
+        // mutable borrows of the octree + brick pool.
+        let applied = {
+            let Self {
+                asset_cache,
+                brick_pool,
+                leaf_attr_pool,
+                ..
+            } = self;
+            let entry = asset_cache.get_mut(handle)?;
+            let octree = &mut entry.cpu_octree;
+            apply_delta(
+                octree,
+                brick_pool,
+                &delta,
+                || {
+                    leaf_attr_pool
+                        .allocate()
+                        .expect("leaf_attr_pool exhausted during sculpt apply")
+                },
+            )
+        };
+
+        // Write LeafAttrs for newly-allocated slots. The brush picks
+        // the material; the normal is whatever the kernel emitted
+        // (outward-from-brush-center today, R7 may refine).
+        for (slot, attrs) in &applied.allocated_slots {
+            *self.leaf_attr_pool.get_mut(*slot) = attrs.to_leaf_attr();
+            // Default color (0) — sculpt-added cells fall back to the
+            // material's base_color, same convention as paint's "no
+            // override".
+            self.leaf_attr_pool.set_color(*slot, 0);
+        }
+        // Release slots vacated by Remove / displaced-by-Add edits.
+        // Done one-at-a-time since the slots aren't contiguous; the
+        // pool's free-list absorbs them.
+        for slot in &applied.freed_slots {
+            self.leaf_attr_pool.deallocate_range(*slot, 1);
+        }
+
+        // Bump the geometry epoch so the renderer re-uploads the
+        // mutated octree / brick / leaf_attr buffers next frame.
+        // The overlay path doesn't depend on this; this is for the
+        // R4 mesh-re-extract milestone where the mesh itself changes.
+        self.bump_geometry_epoch();
+
         eprintln!(
-            "[sculpt] stamp handle={:?} mode={:?} edits={} removed={} add_skipped={} (depth={}, base_vs={:.5})",
-            handle, mode, delta.len(), removed.len(), leaves_add_skipped, depth, base_vs,
+            "[sculpt] stamp handle={:?} mode={:?} edits={} removed={} \
+             applied(adds={} freed={} interior={}) (depth={}, base_vs={:.5})",
+            handle, mode, delta.len(), removed.len(),
+            applied.allocated_slots.len(), applied.freed_slots.len(),
+            delta.count_interior(), depth, base_vs,
         );
 
         Some(SculptApplyResult {
