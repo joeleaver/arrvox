@@ -24,8 +24,9 @@
 //!
 //! Raise (Add) is deferred to Phase B and skipped here with a log line.
 
-use glam::{Affine3A, Vec3};
+use glam::{Affine3A, IVec3, Vec3};
 
+use rkp_core::mesh_cluster::{cluster_grid_aabb, cluster_overlaps_brush_grid_aabb};
 use rkp_core::mesh_extract::extract_surface_mesh;
 use rkp_core::mesh_lod::build_cluster_dag_with_levels;
 use rkp_core::sculpt::{
@@ -280,6 +281,59 @@ impl RkpSceneManager {
         })
     }
 
+    /// Find every LOD-0 cluster on an asset whose grid-coord AABB
+    /// overlaps the brush's grid-coord AABB.
+    ///
+    /// **Phase B R3** — the per-cluster re-extract path's dirty-cluster
+    /// query. Inputs are integer grid coords in the same convention as
+    /// [`rkp_core::sculpt::compute_brush_edits`]: `brush_lo .. brush_hi`
+    /// is half-open, the brush walks cells in `lo.x..hi.x` etc. Cluster
+    /// AABBs are derived on the fly from each cluster's object-local
+    /// float AABB via [`cluster_grid_aabb`] (1-voxel pad on each side
+    /// so SN-cube neighbor cells are conservatively included).
+    ///
+    /// Returns LOD-0 (`lod_level == 0`) cluster ids only. Coarser
+    /// levels regenerate via the R5 lazy-ancestor path when their
+    /// children change. Order is ascending cluster id.
+    ///
+    /// Returns an empty vec for unknown handles, an empty cluster
+    /// table, or zero overlap. ~50 µs on a 46 k-cluster asset; no
+    /// allocation reuse — caller owns the returned Vec.
+    pub fn clusters_in_brush_grid_aabb(
+        &self,
+        handle: AssetHandle,
+        brush_lo: IVec3,
+        brush_hi: IVec3,
+    ) -> Vec<u32> {
+        let Some(entry) = self.asset_cache.get(handle) else {
+            return Vec::new();
+        };
+        if entry.meshlet_clusters.is_empty() {
+            return Vec::new();
+        }
+        // Empty brush AABB → no clusters can intersect.
+        if brush_lo.x >= brush_hi.x || brush_lo.y >= brush_hi.y || brush_lo.z >= brush_hi.z {
+            return Vec::new();
+        }
+        let depth = entry.spatial_handle.depth;
+        let base_vs = entry.spatial_handle.base_voxel_size;
+        let extent = (1u32 << depth) as f32 * base_vs;
+        let aabb_center = (entry.aabb.min + entry.aabb.max) * 0.5;
+        let grid_origin = aabb_center - Vec3::splat(extent * 0.5);
+
+        let mut dirty = Vec::new();
+        for (idx, c) in entry.meshlet_clusters.iter().enumerate() {
+            if c.lod_level != 0 {
+                continue;
+            }
+            let (cmin, cmax) = cluster_grid_aabb(c, grid_origin, base_vs);
+            if cluster_overlaps_brush_grid_aabb(cmin, cmax, brush_lo, brush_hi) {
+                dirty.push(idx as u32);
+            }
+        }
+        dirty
+    }
+
     /// Re-extract the surface mesh + LOD-0 cluster table for one
     /// asset, replacing the cached `mesh_vertices` / `mesh_indices` /
     /// `meshlet_clusters` / `mesh_lod0_index_count`. The geometry
@@ -347,6 +401,162 @@ impl RkpSceneManager {
             entry.mesh_indices.len(),
             entry.meshlet_clusters.len(),
             t0.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rkp_scene_manager::types::AssetEntry;
+    use rkp_core::mesh_cluster::{MeshletCluster, PARENT_GROUP_ERROR_ROOT};
+    use rkp_core::sparse_octree::SparseOctree;
+    use rkp_core::{Aabb, OctreeHandle};
+
+    fn cluster(
+        aabb_min: [f32; 3],
+        aabb_max: [f32; 3],
+        lod_level: u32,
+    ) -> MeshletCluster {
+        MeshletCluster {
+            aabb_min,
+            _pad0: 0.0,
+            aabb_max,
+            index_offset: 0,
+            index_count: 0,
+            lod_level,
+            _pad2: 0,
+            cluster_error: 0.0,
+            parent_group_error: PARENT_GROUP_ERROR_ROOT,
+            _pad3: [0; 3],
+        }
+    }
+
+    /// Build a minimal AssetEntry with caller-supplied clusters and
+    /// asset bounds, sized so `grid_origin == aabb.min` and the cluster
+    /// AABB coords map 1:1 to grid coords at `base_voxel_size = 1.0`.
+    fn make_entry(
+        clusters: Vec<MeshletCluster>,
+        depth: u8,
+    ) -> AssetEntry {
+        let base_vs = 1.0_f32;
+        let extent = (1u32 << depth) as f32 * base_vs;
+        // aabb_center - extent/2 must equal Vec3::ZERO so grid coords
+        // are read directly from the cluster's float AABB.
+        let aabb = Aabb {
+            min: Vec3::ZERO,
+            max: Vec3::splat(extent),
+        };
+        AssetEntry {
+            path: std::path::PathBuf::from("test:in-memory"),
+            refcount: 1,
+            spatial_handle: OctreeHandle {
+                root_offset: 0,
+                len: 0,
+                depth,
+                base_voxel_size: base_vs,
+            },
+            voxel_size: base_vs,
+            aabb,
+            voxel_count: 0,
+            leaf_attr_slot_start: 0,
+            leaf_attr_slot_count: 0,
+            brick_start: 0,
+            brick_count: 0,
+            skinning: None,
+            splats: Vec::new(),
+            mesh_vertices: Vec::new(),
+            mesh_indices: Vec::new(),
+            mesh_lod0_index_count: 0,
+            meshlet_clusters: clusters,
+            cpu_octree: SparseOctree::new(depth, base_vs),
+        }
+    }
+
+    #[test]
+    fn r3b_brush_overlap_returns_only_intersecting_lod0_clusters() {
+        // Three LOD-0 clusters: A near origin, B in the middle, C far.
+        // One LOD-1 cluster D that *would* overlap if it weren't filtered.
+        let clusters = vec![
+            cluster([0.0, 0.0, 0.0], [4.0, 4.0, 4.0], 0),   // A — id 0
+            cluster([10.0, 10.0, 10.0], [14.0, 14.0, 14.0], 0), // B — id 1
+            cluster([30.0, 30.0, 30.0], [40.0, 40.0, 40.0], 0), // C — id 2
+            cluster([10.0, 10.0, 10.0], [14.0, 14.0, 14.0], 1), // D — id 3 (LOD-1)
+        ];
+        let mut sm = RkpSceneManager::new(16);
+        let handle = sm.asset_cache.insert(make_entry(clusters, 8));
+
+        // Brush centered on B's volume → only B is dirty. D matches the
+        // same AABB but is LOD-1, so it must be filtered out.
+        let lo = IVec3::splat(11);
+        let hi = IVec3::splat(13);
+        let dirty = sm.clusters_in_brush_grid_aabb(handle, lo, hi);
+        assert_eq!(dirty, vec![1], "only LOD-0 cluster B should be dirty");
+
+        // Brush straddling A and B → both LOD-0 hit. D still filtered.
+        let lo = IVec3::new(3, 3, 3);
+        let hi = IVec3::new(12, 12, 12);
+        let dirty = sm.clusters_in_brush_grid_aabb(handle, lo, hi);
+        assert_eq!(dirty, vec![0, 1]);
+
+        // Brush in empty space → no clusters.
+        let lo = IVec3::splat(50);
+        let hi = IVec3::splat(60);
+        assert!(sm.clusters_in_brush_grid_aabb(handle, lo, hi).is_empty());
+    }
+
+    #[test]
+    fn r3b_empty_brush_aabb_returns_empty() {
+        let clusters = vec![cluster([0.0, 0.0, 0.0], [4.0, 4.0, 4.0], 0)];
+        let mut sm = RkpSceneManager::new(16);
+        let handle = sm.asset_cache.insert(make_entry(clusters, 8));
+        // hi <= lo on any axis → empty range, return empty regardless.
+        assert!(sm
+            .clusters_in_brush_grid_aabb(handle, IVec3::splat(5), IVec3::splat(5))
+            .is_empty());
+        assert!(sm
+            .clusters_in_brush_grid_aabb(handle, IVec3::new(0, 5, 0), IVec3::new(10, 5, 10))
+            .is_empty());
+    }
+
+    #[test]
+    fn r3b_unknown_handle_returns_empty() {
+        let sm = RkpSceneManager::new(16);
+        // No assets inserted — any handle is bogus.
+        let bogus = AssetHandle::from_raw(99);
+        assert!(sm
+            .clusters_in_brush_grid_aabb(bogus, IVec3::ZERO, IVec3::splat(10))
+            .is_empty());
+    }
+
+    #[test]
+    fn r3b_empty_cluster_table_returns_empty() {
+        let mut sm = RkpSceneManager::new(16);
+        let handle = sm.asset_cache.insert(make_entry(vec![], 8));
+        assert!(sm
+            .clusters_in_brush_grid_aabb(handle, IVec3::ZERO, IVec3::splat(10))
+            .is_empty());
+    }
+
+    #[test]
+    fn r3b_brush_at_cluster_edge_inclusive_pad_overlap() {
+        // Cluster at float AABB [4.0, 5.0] in each axis → with 1-cell
+        // pad, grid AABB is [3..6] inclusive. A brush at exactly cell 6
+        // (half-open [6, 7)) overlaps because cluster_max = 6 inclusive.
+        // A brush at cell 7 (half-open [7, 8)) does NOT overlap.
+        let clusters = vec![cluster([4.0, 4.0, 4.0], [5.0, 5.0, 5.0], 0)];
+        let mut sm = RkpSceneManager::new(16);
+        let handle = sm.asset_cache.insert(make_entry(clusters, 8));
+
+        assert_eq!(
+            sm.clusters_in_brush_grid_aabb(handle, IVec3::splat(6), IVec3::splat(7)),
+            vec![0],
+            "brush at cluster_max should overlap (inclusive bound)"
+        );
+        assert!(
+            sm.clusters_in_brush_grid_aabb(handle, IVec3::splat(7), IVec3::splat(8))
+                .is_empty(),
+            "brush past cluster_max should miss"
         );
     }
 }

@@ -16,6 +16,7 @@
 //! buys nothing and would force a parallel VBO permutation.
 
 use bytemuck::{Pod, Zeroable};
+use glam::{IVec3, Vec3};
 use meshopt::{build_meshlets, VertexDataAdapter};
 
 use crate::mesh_extract::MeshVertex;
@@ -217,6 +218,71 @@ pub fn cluster_mesh(
     }
 
     (clusters, flat_indices)
+}
+
+/// Convert a cluster's object-local float AABB to a finest-grid-coord
+/// integer AABB (inclusive on both bounds).
+///
+/// **Used by Phase B R3** — the sculpt path needs a fast "which clusters
+/// does this brush touch" query. The brush walks finest-voxel cells in
+/// integer grid coords; cluster AABBs are floats in object-local space.
+/// This lifts the cluster bounds into the brush's coordinate system once
+/// per lookup so the intersection test is a 3-axis integer compare.
+///
+/// **One-cell pad on each side.** SN-cube vertices live on grid corners
+/// (between cells); a cube at corner `c` reads cells `[c, c+1]` in each
+/// axis. A cluster's vertex-position AABB therefore covers slightly
+/// fewer cells than the cells whose state it actually depends on. We
+/// pad ±1 cell to make the lookup conservative — false positives at the
+/// boundary are cheap (re-extract a couple of extra clusters);
+/// false negatives produce cracks at cluster seams.
+///
+/// Returns an inclusive `(min, max)` IVec3 pair.
+pub fn cluster_grid_aabb(
+    cluster: &MeshletCluster,
+    grid_origin: Vec3,
+    base_voxel_size: f32,
+) -> (IVec3, IVec3) {
+    let inv_vs = 1.0 / base_voxel_size;
+    let min_local = Vec3::from(cluster.aabb_min);
+    let max_local = Vec3::from(cluster.aabb_max);
+    let min_grid_f = (min_local - grid_origin) * inv_vs;
+    let max_grid_f = (max_local - grid_origin) * inv_vs;
+    let grid_min = IVec3::new(
+        min_grid_f.x.floor() as i32 - 1,
+        min_grid_f.y.floor() as i32 - 1,
+        min_grid_f.z.floor() as i32 - 1,
+    );
+    let grid_max = IVec3::new(
+        max_grid_f.x.ceil() as i32 + 1,
+        max_grid_f.y.ceil() as i32 + 1,
+        max_grid_f.z.ceil() as i32 + 1,
+    );
+    (grid_min, grid_max)
+}
+
+/// AABB-overlap test in integer grid coords.
+///
+/// `cluster` bounds are **inclusive** (the cells at `cluster_min` and
+/// `cluster_max` are inside the cluster's footprint). `brush` bounds are
+/// **half-open** `[brush_lo, brush_hi)` to match the `brush_cell_range`
+/// convention in `rkp_core::sculpt` — the brush walks cells in
+/// `lo.x..hi.x` etc., so a cell at `hi - 1` is the last one inside the
+/// brush.
+///
+/// Returns `true` when the two ranges overlap on every axis.
+pub fn cluster_overlaps_brush_grid_aabb(
+    cluster_min: IVec3,
+    cluster_max: IVec3,
+    brush_lo: IVec3,
+    brush_hi: IVec3,
+) -> bool {
+    cluster_min.x < brush_hi.x
+        && brush_lo.x <= cluster_max.x
+        && cluster_min.y < brush_hi.y
+        && brush_lo.y <= cluster_max.y
+        && cluster_min.z < brush_hi.z
+        && brush_lo.z <= cluster_max.z
 }
 
 /// Inflate per-cluster AABBs to cover the rest-pose extents of the
@@ -591,6 +657,111 @@ mod tests {
 
         // Triangle multiset preserved (permutation, no loss/dup).
         assert_eq!(triangle_multiset(&i), triangle_multiset(&flat));
+    }
+
+    #[test]
+    fn cluster_grid_aabb_pads_one_cell_each_side() {
+        // Single triangle with a tiny float AABB at the origin should
+        // produce a 1-cell-padded grid AABB that comfortably encloses
+        // the contributing cells.
+        let c = MeshletCluster {
+            aabb_min: [0.25, 0.5, 0.75],
+            _pad0: 0.0,
+            aabb_max: [1.25, 1.5, 1.75],
+            index_offset: 0,
+            index_count: 0,
+            lod_level: 0,
+            _pad2: 0,
+            cluster_error: 0.0,
+            parent_group_error: 0.0,
+            _pad3: [0; 3],
+        };
+        let (gmin, gmax) = cluster_grid_aabb(&c, Vec3::ZERO, 1.0);
+        assert_eq!(gmin, IVec3::new(-1, -1, -1), "floor(0.x) - 1");
+        assert_eq!(gmax, IVec3::new(3, 3, 3), "ceil(1.x) + 1");
+    }
+
+    #[test]
+    fn cluster_grid_aabb_respects_grid_origin_and_voxel_size() {
+        // grid_origin shifts the cluster's float coords; base_vs scales them.
+        let c = MeshletCluster {
+            aabb_min: [4.0, 4.0, 4.0],
+            _pad0: 0.0,
+            aabb_max: [6.0, 6.0, 6.0],
+            index_offset: 0,
+            index_count: 0,
+            lod_level: 0,
+            _pad2: 0,
+            cluster_error: 0.0,
+            parent_group_error: 0.0,
+            _pad3: [0; 3],
+        };
+        // grid_origin = (2, 2, 2), base_vs = 0.5
+        // local 4.0 → grid (4-2)/0.5 = 4.0 → floor-1 = 3
+        // local 6.0 → grid (6-2)/0.5 = 8.0 → ceil+1 = 9
+        let (gmin, gmax) = cluster_grid_aabb(&c, Vec3::splat(2.0), 0.5);
+        assert_eq!(gmin, IVec3::new(3, 3, 3));
+        assert_eq!(gmax, IVec3::new(9, 9, 9));
+    }
+
+    #[test]
+    fn cluster_overlap_brush_aabb_basic_cases() {
+        // Two clusters: one at [0..2], one at [10..12] (inclusive).
+        let a_min = IVec3::ZERO;
+        let a_max = IVec3::new(2, 2, 2);
+        let b_min = IVec3::splat(10);
+        let b_max = IVec3::splat(12);
+
+        // Brush at [1..3) overlaps A (cell 1 + 2 inside both), misses B.
+        assert!(cluster_overlaps_brush_grid_aabb(a_min, a_max, IVec3::ONE, IVec3::splat(3)));
+        assert!(!cluster_overlaps_brush_grid_aabb(b_min, b_max, IVec3::ONE, IVec3::splat(3)));
+
+        // Brush at [3..10) hits neither — strictly between them.
+        assert!(!cluster_overlaps_brush_grid_aabb(a_min, a_max, IVec3::splat(3), IVec3::splat(10)));
+        assert!(!cluster_overlaps_brush_grid_aabb(b_min, b_max, IVec3::splat(3), IVec3::splat(10)));
+
+        // Brush at [10..15) overlaps B only.
+        assert!(!cluster_overlaps_brush_grid_aabb(a_min, a_max, IVec3::splat(10), IVec3::splat(15)));
+        assert!(cluster_overlaps_brush_grid_aabb(b_min, b_max, IVec3::splat(10), IVec3::splat(15)));
+    }
+
+    #[test]
+    fn cluster_overlap_brush_aabb_edge_touches_inclusive_max() {
+        // Inclusive cluster_max + half-open brush: a brush at [2..3) and
+        // a cluster ending at exactly 2 should overlap (cell 2 is the
+        // last brush cell, and is inside the cluster).
+        assert!(cluster_overlaps_brush_grid_aabb(
+            IVec3::ZERO,
+            IVec3::splat(2),
+            IVec3::splat(2),
+            IVec3::splat(3),
+        ));
+        // Whereas a brush at [3..4) and the same cluster do NOT overlap
+        // (the first brush cell is past the cluster's last cell).
+        assert!(!cluster_overlaps_brush_grid_aabb(
+            IVec3::ZERO,
+            IVec3::splat(2),
+            IVec3::splat(3),
+            IVec3::splat(4),
+        ));
+    }
+
+    #[test]
+    fn cluster_overlap_brush_aabb_per_axis_independence() {
+        // Cluster overlaps brush only on X axis — must report no overlap.
+        assert!(!cluster_overlaps_brush_grid_aabb(
+            IVec3::new(0, 100, 100),
+            IVec3::new(10, 110, 110),
+            IVec3::new(5, 0, 0),
+            IVec3::new(15, 50, 50),
+        ));
+        // Overlap on all axes — overlap reported.
+        assert!(cluster_overlaps_brush_grid_aabb(
+            IVec3::new(0, 100, 100),
+            IVec3::new(10, 110, 110),
+            IVec3::new(5, 105, 105),
+            IVec3::new(15, 115, 115),
+        ));
     }
 
     #[test]
