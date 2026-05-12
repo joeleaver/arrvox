@@ -143,18 +143,19 @@ impl EngineState {
             return 0;
         };
 
-        if result.leaves_add_skipped > 0 {
-            // Editor UI disables Raise; this path is hit only by tests
-            // or scripted commands. Log so it doesn't go silent.
-            self.console.warn(format!(
-                "Sculpt: {} Raise edits skipped — Phase B (added geometry) \
-                 not yet implemented; only Carve carves geometry away.",
-                result.leaves_add_skipped,
-            ));
-        }
+        // Phase B R2/R4-minimal: Raise + Carve both apply real
+        // mutation. `leaves_add_skipped` counts the kernel's Add
+        // edits and is no longer informational — apply_delta on the
+        // scene-manager side processes them. Kept on the result
+        // struct for backward compat; ignore here.
+        let _ = result.leaves_add_skipped;
 
-        if result.removed_leaf_attr_ids.is_empty() {
-            return 0;
+        if result.removed_leaf_attr_ids.is_empty() && result.leaves_removed == 0 {
+            // Stamp produced no overlay-eligible removes — it might
+            // still have added geometry (Raise) or carved interior
+            // bulk. Don't early-return; the geometry mutation already
+            // happened in the scene manager and the visible result
+            // comes from the mesh re-extract on the next frame.
         }
 
         // ── Merge into the per-entity sculpt overlay. ────────────────

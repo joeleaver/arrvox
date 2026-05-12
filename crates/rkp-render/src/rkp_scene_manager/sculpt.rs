@@ -26,6 +26,8 @@
 
 use glam::{Affine3A, Vec3};
 
+use rkp_core::mesh_extract::extract_surface_mesh;
+use rkp_core::mesh_lod::build_cluster_dag_with_levels;
 use rkp_core::sculpt::{
     apply_delta, compute_brush_edits, BrushMode, BrushOp, LeafEditOp,
 };
@@ -240,10 +242,27 @@ impl RkpSceneManager {
             self.leaf_attr_pool.deallocate_range(*slot, 1);
         }
 
+        // ── 5. Mesh re-extract (Phase B R4-minimal). ────────────────
+        //
+        // Rebuild the asset's surface mesh + LOD-0-only cluster DAG
+        // from the now-mutated octree. The renderer's mesh upload
+        // path re-uploads per-asset mesh buffers on every
+        // geometry_epoch bump, so updating the entry's mesh_vertices
+        // / mesh_indices / meshlet_clusters in place is enough — the
+        // next pre-frame pass picks them up.
+        //
+        // Cost: extract scans the asset's surface shell + builds the
+        // SN cube vertices (proportional to surface area). Cluster
+        // build at LOD_LEVELS=1 skips multi-level simplification, so
+        // it's roughly the same cost as load-time on a fresh-from-disk
+        // v5 asset minus the DAG-bake. Single-click stamps land
+        // visibly; drag stamps will stutter — R4-proper (per-cluster
+        // re-extract) is the perf path.
+        self.rebuild_asset_mesh(handle);
+
         // Bump the geometry epoch so the renderer re-uploads the
-        // mutated octree / brick / leaf_attr buffers next frame.
-        // The overlay path doesn't depend on this; this is for the
-        // R4 mesh-re-extract milestone where the mesh itself changes.
+        // mutated octree / brick / leaf_attr buffers AND the new
+        // mesh data on the next pre-frame pass.
         self.bump_geometry_epoch();
 
         eprintln!(
@@ -259,5 +278,75 @@ impl RkpSceneManager {
             leaves_removed,
             leaves_add_skipped,
         })
+    }
+
+    /// Re-extract the surface mesh + LOD-0 cluster table for one
+    /// asset, replacing the cached `mesh_vertices` / `mesh_indices` /
+    /// `meshlet_clusters` / `mesh_lod0_index_count`. The geometry
+    /// upload path picks up the new buffers on the next geometry
+    /// epoch.
+    ///
+    /// V1 (Phase B R4-minimal) re-extracts the **entire** asset on
+    /// every stamp. Per-cluster re-extract is the perf path the full
+    /// R4 covers; for now the cost is bounded by surface area + DAG
+    /// build at `LOD_LEVELS=1` (no multi-level simplify).
+    fn rebuild_asset_mesh(&mut self, handle: AssetHandle) {
+        let t0 = std::time::Instant::now();
+
+        // Snapshot the per-asset parameters we need to pass into
+        // `extract_surface_mesh`. We need them as owned values (not
+        // borrows of the asset entry) because the entry will be
+        // re-borrowed mutably later to write back the new mesh.
+        let Some(entry) = self.asset_cache.get(handle) else { return; };
+        let depth = entry.spatial_handle.depth;
+        let voxel_size = entry.spatial_handle.base_voxel_size;
+        let extent = (1u32 << depth) as f32 * voxel_size;
+        let aabb_center = (entry.aabb.min + entry.aabb.max) * 0.5;
+        let grid_origin = aabb_center - Vec3::splat(extent * 0.5);
+
+        let (vertices, indices_unc) = extract_surface_mesh(
+            entry.cpu_octree.as_slice(),
+            depth,
+            voxel_size,
+            grid_origin,
+            self.brick_pool.as_slice(),
+            self.leaf_attr_pool.as_slice(),
+            self.leaf_attr_pool.bones_as_slice(),
+        );
+
+        if vertices.is_empty() {
+            // Asset carved away to nothing — clear mesh state. The
+            // upload path drops the GPU buffers on empty input.
+            if let Some(entry) = self.asset_cache.get_mut(handle) {
+                entry.mesh_vertices.clear();
+                entry.mesh_indices.clear();
+                entry.meshlet_clusters.clear();
+                entry.mesh_lod0_index_count = 0;
+            }
+            return;
+        }
+
+        // LOD_LEVELS=1: pure LOD-0 clustering, no multi-level
+        // simplification. The Karis admit rule treats every cluster
+        // as "can't go coarser" (parent_group_error = ∞), so the
+        // mesh raster pass always picks LOD-0 — full detail, no
+        // pop-in. R4-proper rebuilds the multi-level DAG; this
+        // milestone skips it for the visual-verification win.
+        let dag = build_cluster_dag_with_levels(&vertices, &indices_unc, 1);
+
+        let Some(entry) = self.asset_cache.get_mut(handle) else { return; };
+        entry.mesh_vertices = vertices;
+        entry.mesh_indices = dag.indices;
+        entry.meshlet_clusters = dag.clusters;
+        entry.mesh_lod0_index_count = dag.lod0_index_range.1 - dag.lod0_index_range.0;
+
+        eprintln!(
+            "[sculpt] mesh re-extract: handle={:?} verts={} indices={} clusters={} ({:.2}ms)",
+            handle,
+            entry.mesh_vertices.len(),
+            entry.mesh_indices.len(),
+            entry.meshlet_clusters.len(),
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
     }
 }
