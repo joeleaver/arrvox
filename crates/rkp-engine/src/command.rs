@@ -389,13 +389,42 @@ pub enum EngineCommand {
 
     // ── Sculpt / Paint ───────────────────────────────────────────────
 
-    /// Apply a sculpt brush stroke.
+    /// Apply a sculpt brush stroke at an already-known world position.
+    /// Used by tests and any caller that has already resolved the hit
+    /// point. The normal UI flow uses [`SculptAtPixel`] instead, which
+    /// drives a GPU pick readback to resolve position + entity.
     Sculpt {
         position: Vec3,
         normal: Vec3,
         radius: f32,
         strength: f32,
         mode: SculptMode,
+    },
+
+    /// Toggle sculpt mode + update the cached brush radius. Mirrors
+    /// [`SetPaintActive`]. Mutually exclusive with paint mode — the
+    /// editor's toggle handler clears the other before sending.
+    SetSculptActive { active: bool, radius: f32 },
+
+    /// Apply a sculpt brush stamp at a viewport pixel. Mirrors
+    /// [`PaintAtPixel`]: the engine issues a GPU pick readback to
+    /// resolve (entity, world_pos), then routes the result through
+    /// the sculpt stamp path with these settings. Coalescing via
+    /// single-in-flight pick is automatic.
+    SculptAtPixel {
+        id: ViewportId,
+        x: u32,
+        y: u32,
+        radius: f32,
+        /// Smoothstep shoulder [0, 1]. 0 = hard edge, 1 = smoothstep
+        /// from center outward.
+        falloff: f32,
+        mode: SculptMode,
+        /// Material to assign to leaves that *transition* under the
+        /// brush (Empty→Mixed for Raise, Interior→Mixed for newly-
+        /// exposed surfaces in Carve). Pre-existing surface leaves
+        /// keep their material — sculpt is not paint.
+        material_id: u16,
     },
 
     /// Apply a paint brush stroke at an already-known world position.

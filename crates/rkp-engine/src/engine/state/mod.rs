@@ -129,6 +129,17 @@ pub(crate) struct PaintPickSettings {
     pub(crate) material_id: u16,
 }
 
+/// Sculpt-brush analogue of [`PaintPickSettings`]. Captured when a
+/// `SculptAtPixel` command queues its pick; consumed by
+/// `process_pick_result` once the matching readback returns.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SculptPickSettings {
+    pub(crate) radius: f32,
+    pub(crate) falloff: f32,
+    pub(crate) mode: crate::command::SculptMode,
+    pub(crate) material_id: u16,
+}
+
 /// A live drag-and-drop preview. While active, each `DragPreviewOver`
 /// (re)sets the pending pick at the cursor pixel. What happens when
 /// the pick result arrives depends on `kind`:
@@ -700,6 +711,17 @@ pub(crate) struct EngineState {
     /// between the cursor visualization (`shade_params.brush_radius`)
     /// and the next paint stamp's footprint. Updated by `SetPaintActive`.
     pub(crate) paint_mode_radius: f32,
+    /// Sculpt-brush stroke that issued the current pick. Same pattern
+    /// as [`Self::paint_pick_settings`]; consumed by
+    /// `process_pick_result` when the matching readback returns.
+    pub(crate) sculpt_pick_settings: Option<SculptPickSettings>,
+    /// `true` while the editor is in sculpt mode. Mutually exclusive
+    /// with `paint_mode_active` (the editor's toggle handlers clear
+    /// the other before sending). Updated by `SetSculptActive`.
+    pub(crate) sculpt_mode_active: bool,
+    /// Brush world-space radius while sculpt mode is active. Mirrors
+    /// `paint_mode_radius` for the sculpt cursor visualization.
+    pub(crate) sculpt_mode_radius: f32,
     /// Cached light count for march pass (set in light upload block, used in render).
     pub(crate) num_lights_cache: u32,
     /// Base ShadeParams (recomputed once per frame from environment +

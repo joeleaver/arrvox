@@ -179,22 +179,22 @@ fn gizmo_button(
     }
 }
 
-// ── Floating paint toolbar ──────────────────────────────────────────────
+// ── Floating brush toolbar ──────────────────────────────────────────────
 
-/// Floating pill overlay for paint-tool state, upper-right.
-///
-/// * Row 1 — always visible: Paint on/off toggle button (mirrors `P` key).
-/// * Row 2 — when paint is active: mode toggle (Material / Color / Erase)
-///   and, in Color mode, the color picker.
-/// * Row 3 — when paint is active: radius / strength / falloff sliders.
-///
-/// Radius changes push `SetPaintActive` so the engine's cached brush
-/// size (used for the shade-pass cursor ring + the per-stamp footprint)
-/// stays in sync.
+/// Floating overlay holding the Paint and Sculpt tool toggles + their
+/// settings, upper-right of the viewport. Paint and Sculpt are mutually
+/// exclusive — turning one on turns the other off. Only the active
+/// tool's settings panel is expanded.
 #[component]
-pub fn PaintToolbar() -> NodeHandle {
+pub fn BrushToolbar() -> NodeHandle {
     let store = use_context::<EditorStore>();
     let cmd = use_context::<CommandSender>();
+    // rsx!'s `if` branches generate `Fn` closures that capture by move;
+    // a single `cmd` can only be moved into one such closure. Pre-clone
+    // into one binding per if-branch, then `.clone()` again inside the
+    // branch so each re-render gets a fresh `CommandSender`.
+    let cmd_paint_settings = cmd.clone();
+    let cmd_sculpt_settings = cmd.clone();
 
     rsx! {
         div {
@@ -202,17 +202,27 @@ pub fn PaintToolbar() -> NodeHandle {
                     display:flex;flex-direction:column;gap:4px;\
                     align-items:flex-end;",
 
-            // Row 1 — always visible: Paint on/off.
-            {paint_toggle_button(__scope, store, cmd.clone())}
+            // Row 1 — both tool toggles side by side. Mutually exclusive.
+            div {
+                style: "display:flex;flex-direction:row;gap:4px;",
+                {paint_toggle_button(__scope, store, cmd.clone())}
+                {sculpt_toggle_button(__scope, store, cmd.clone())}
+            }
 
-            // Row 2 — mode toggle + color picker.
+            // Paint settings (active tool only).
             if store.paint_active.get() {
                 {paint_mode_row(__scope, store)}
             }
-
-            // Row 3 — brush settings (radius, strength, falloff).
             if store.paint_active.get() {
-                {paint_settings_panel(__scope, store, cmd.clone())}
+                {paint_settings_panel(__scope, store, cmd_paint_settings.clone())}
+            }
+
+            // Sculpt settings (active tool only).
+            if store.sculpt_active.get() {
+                {sculpt_mode_row(__scope, store)}
+            }
+            if store.sculpt_active.get() {
+                {sculpt_settings_panel(__scope, store, cmd_sculpt_settings.clone())}
             }
         }
     }
@@ -250,6 +260,16 @@ fn paint_toggle_button(
                 move || {
                     let on = !store.paint_active.get();
                     store.paint_active.set(on);
+                    // Mutual exclusion: enabling paint turns sculpt off
+                    // and pushes the engine-side off-signal so its
+                    // cursor + stamp gates clear too.
+                    if on && store.sculpt_active.get() {
+                        store.sculpt_active.set(false);
+                        let _ = cmd.0.send(rkp_engine::EngineCommand::SetSculptActive {
+                            active: false,
+                            radius: store.sculpt_radius.get(),
+                        });
+                    }
                     // Tell the engine so it knows whether to draw the
                     // cursor wireframe and at what radius.
                     let _ = cmd.0.send(rkp_engine::EngineCommand::SetPaintActive {
@@ -376,6 +396,130 @@ fn hex_to_rgb(hex: &str) -> Option<[f32; 3]> {
     let g = u8::from_str_radix(&hex[3..5], 16).ok()? as f32 / 255.0;
     let b = u8::from_str_radix(&hex[5..7], 16).ok()? as f32 / 255.0;
     Some([r, g, b])
+}
+
+// ── Sculpt toolbar pieces ───────────────────────────────────────────────
+
+fn sculpt_toggle_button(
+    __scope: &mut rinch::core::dom::RenderScope,
+    store: EditorStore,
+    cmd: CommandSender,
+) -> rinch::core::dom::NodeHandle {
+    rsx! {
+        div {
+            style: {move || {
+                if store.sculpt_active.get() {
+                    // Active — teal so it visually distinguishes from
+                    // paint's warm orange (mutual-exclusion makes them
+                    // never both active, but the color still cues which
+                    // tool you're in).
+                    "display:flex;align-items:center;gap:6px;\
+                     padding:4px 10px;border-radius:6px;cursor:pointer;\
+                     background:rgba(38,166,154,0.85);color:#1e1e1e;\
+                     border:1px solid #4db6ac;font-size:11px;font-weight:600;\
+                     backdrop-filter:blur(8px);"
+                } else {
+                    "display:flex;align-items:center;gap:6px;\
+                     padding:4px 10px;border-radius:6px;cursor:pointer;\
+                     background:rgba(30,30,30,0.85);color:#bbb;\
+                     border:1px solid #3c3c3c;font-size:11px;font-weight:500;\
+                     backdrop-filter:blur(8px);"
+                }
+            }},
+            title: {move || {
+                if store.sculpt_active.get() { "Exit sculpt mode" }
+                else { "Enter sculpt mode" }
+            }},
+            onclick: {
+                let cmd = cmd.clone();
+                move || {
+                    let on = !store.sculpt_active.get();
+                    store.sculpt_active.set(on);
+                    // Mutual exclusion with paint.
+                    if on && store.paint_active.get() {
+                        store.paint_active.set(false);
+                        let _ = cmd.0.send(rkp_engine::EngineCommand::SetPaintActive {
+                            active: false,
+                            radius: store.paint_radius.get(),
+                        });
+                    }
+                    let _ = cmd.0.send(rkp_engine::EngineCommand::SetSculptActive {
+                        active: on,
+                        radius: store.sculpt_radius.get(),
+                    });
+                }
+            },
+            span {
+                style: "width:16px;height:16px;display:inline-flex;\
+                        align-items:center;justify-content:center;",
+                {render_tabler_icon(__scope, TablerIcon::Sphere, TablerIconStyle::Outline)}
+            }
+            if store.sculpt_active.get() { {"Sculpting"} }
+            if !store.sculpt_active.get() { {"Sculpt"} }
+        }
+    }
+}
+
+fn sculpt_mode_row(
+    __scope: &mut rinch::core::dom::RenderScope,
+    store: EditorStore,
+) -> rinch::core::dom::NodeHandle {
+    use rkp_engine::SculptMode;
+    rsx! {
+        div {
+            style: "display:flex;flex-direction:row;gap:1px;\
+                    background:rgba(30,30,30,0.85);border-radius:6px;\
+                    border:1px solid #3c3c3c;padding:2px;\
+                    backdrop-filter:blur(8px);",
+
+            {gizmo_button(
+                __scope,
+                TablerIcon::Plus,
+                "Raise — add geometry (clay) under the brush",
+                Memo::new(move || store.sculpt_mode.get() == SculptMode::Raise),
+                move || store.sculpt_mode.set(SculptMode::Raise),
+            )}
+            {gizmo_button(
+                __scope,
+                TablerIcon::Minus,
+                "Carve — remove geometry (dig) under the brush",
+                Memo::new(move || store.sculpt_mode.get() == SculptMode::Carve),
+                move || store.sculpt_mode.set(SculptMode::Carve),
+            )}
+        }
+    }
+}
+
+fn sculpt_settings_panel(
+    __scope: &mut rinch::core::dom::RenderScope,
+    store: EditorStore,
+    cmd: CommandSender,
+) -> rinch::core::dom::NodeHandle {
+    let radius_on_change: Rc<dyn Fn(f32)> = {
+        let cmd = cmd.clone();
+        Rc::new(move |_r: f32| {
+            // Mirror the new radius to the engine so the cursor ring
+            // visualization (when wired) and the next stamp's footprint
+            // stay in lock-step with the slider.
+            let _ = cmd.0.send(rkp_engine::EngineCommand::SetSculptActive {
+                active: true,
+                radius: store.sculpt_radius.get(),
+            });
+        })
+    };
+    let noop: Rc<dyn Fn(f32)> = Rc::new(|_| {});
+
+    rsx! {
+        div {
+            style: "width:260px;padding:8px 10px;\
+                    background:rgba(30,30,30,0.85);border-radius:6px;\
+                    border:1px solid #3c3c3c;\
+                    backdrop-filter:blur(8px);\
+                    display:flex;flex-direction:column;gap:4px;",
+            {prop_slider(__scope, "Radius", store.sculpt_radius, 0.01, 5.0, 0.01, radius_on_change)}
+            {prop_slider(__scope, "Falloff", store.sculpt_falloff, 0.0, 1.0, 0.01, noop)}
+        }
+    }
 }
 
 fn paint_settings_panel(

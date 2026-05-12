@@ -601,6 +601,29 @@ impl EngineState {
                 });
             }
 
+            EngineCommand::Sculpt { position, normal, radius, strength, mode } => {
+                super::sculpt_ops::dispatch_sculpt(
+                    self, position, normal, radius, strength, mode,
+                );
+            }
+
+            EngineCommand::SetSculptActive { active, radius } => {
+                self.sculpt_mode_active = active;
+                self.sculpt_mode_radius = radius;
+            }
+
+            EngineCommand::SculptAtPixel {
+                id, x, y, radius, falloff, mode, material_id,
+            } => {
+                use super::state::{SculptPickSettings, PendingPick};
+                self.pending_pick = Some(PendingPick {
+                    viewport: id, x, y, ghost_pick_node_id: None,
+                });
+                self.sculpt_pick_settings = Some(SculptPickSettings {
+                    radius, falloff, mode, material_id,
+                });
+            }
+
             other => return Err(other),
         }
         Ok(())

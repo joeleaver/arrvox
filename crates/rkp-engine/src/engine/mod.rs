@@ -25,6 +25,7 @@ mod lifecycle;
 mod model_scan;
 mod paint_ops;
 mod picking_ops;
+mod sculpt_ops;
 mod procedural_gizmo;
 mod procedural_ops;
 mod procedural_params;

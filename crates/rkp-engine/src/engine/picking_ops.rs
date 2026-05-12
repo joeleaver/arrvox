@@ -67,6 +67,35 @@ impl EngineState {
             return;
         }
 
+        // Sculpt stamp: mirrors the paint branch above. Selection-locked
+        // the same way — the brush only affects the currently-selected
+        // entity. Phase 0 just logs the resolved op; Phase 1 swaps the
+        // stub for real octree mutation.
+        if let Some(settings) = self.sculpt_pick_settings.take() {
+            let hit_gpu_idx = pr.raw_payload[0];
+            let hit_entity: Option<hecs::Entity> = if hit_gpu_idx != u32::MAX {
+                let gpu_idx = hit_gpu_idx as usize;
+                self.gpu_to_entity.get(gpu_idx).copied()
+            } else {
+                None
+            };
+            let target_entity = self
+                .selected_entity
+                .filter(|sel| hit_entity == Some(*sel));
+            if let (Some(entity), Some(world_pos)) = (target_entity, pr.position) {
+                let _ = self.apply_sculpt_stamp(
+                    entity,
+                    world_pos,
+                    settings.radius,
+                    settings.falloff,
+                    settings.mode,
+                    settings.material_id,
+                );
+            }
+            self.in_flight_pick_ghost = None;
+            return;
+        }
+
         // Drop-on-geometry: if a drag-drop is queued for this viewport,
         // consume it instead of running selection. The pick was issued
         // purely to get the world-space surface position at the drop

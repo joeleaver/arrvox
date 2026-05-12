@@ -7,7 +7,7 @@ use rkp_engine::viewport::ViewportId;
 
 use crate::CommandSender;
 use crate::ui::store::EditorStore;
-use super::viewport_toolbar::{ViewportHeaderBar, EditModeToolbar, PaintToolbar};
+use super::viewport_toolbar::{ViewportHeaderBar, EditModeToolbar, BrushToolbar};
 
 /// The viewport id this panel renders. Phase 3: only the MAIN viewport has
 /// a UI panel; the build viewport gets its own component in Phase 6.
@@ -101,6 +101,19 @@ pub fn Viewport() -> NodeHandle {
             });
         };
 
+        // Sculpt equivalent — same single-in-flight coalescing as paint.
+        let send_sculpt_stamp = |x: f32, y: f32| {
+            let _ = cmd_tx.send(rkp_engine::EngineCommand::SculptAtPixel {
+                id: PANEL_VIEWPORT,
+                x: x.max(0.0) as u32,
+                y: y.max(0.0) as u32,
+                radius: store.sculpt_radius.get(),
+                falloff: store.sculpt_falloff.get(),
+                mode: store.sculpt_mode.get(),
+                material_id: store.selected_material.get().unwrap_or(0),
+            });
+        };
+
         match event {
             MouseMove { x, y } => {
                 let dx = x - last_mx.get();
@@ -119,6 +132,8 @@ pub fn Viewport() -> NodeHandle {
                     // (the brush-state probe pass reads gbuf at the
                     // engine-side `mouse_pos`), so no extra command.
                     send_paint_stamp(x, y);
+                } else if store.sculpt_active.get() && lmb_held.get() {
+                    send_sculpt_stamp(x, y);
                 }
             }
             MouseDown { button, x, y } => {
@@ -134,6 +149,9 @@ pub fn Viewport() -> NodeHandle {
                         // click-select pick so the click doesn't
                         // deselect everything while painting.
                         send_paint_stamp(x, y);
+                    } else if store.sculpt_active.get() {
+                        // Sculpt owns LMB the same way paint does.
+                        send_sculpt_stamp(x, y);
                     } else {
                         let _ = cmd_tx.send(rkp_engine::EngineCommand::Pick {
                             id: PANEL_VIEWPORT,
@@ -287,7 +305,7 @@ pub fn Viewport() -> NodeHandle {
                 style: "flex:1;min-height:0;position:relative;",
                 RenderSurface { surface: Some(surface.clone()) }
                 EditModeToolbar {}
-                PaintToolbar {}
+                BrushToolbar {}
             }
         }
     }

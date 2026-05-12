@@ -144,11 +144,21 @@ pub struct EditorStore {
     #[allow(dead_code)]
     pub editor_mode: Signal<EditorMode>,
 
-    // ── Tool settings (written by UI) ────────────────────────────
-    // Sculpt settings stay allow(dead_code) — sculpt isn't wired yet.
-
-    #[allow(dead_code)]
+    // ── Sculpt tool state ────────────────────────────────────────
+    /// Whether sculpt mode is active. Mutually exclusive with
+    /// `paint_active` — turning one on turns the other off.
+    pub sculpt_active: Signal<bool>,
+    /// Add (clay) vs Subtract (dig) using the existing `SculptMode`
+    /// enum's `Raise` / `Carve` variants. `Smooth` / `Flatten` are
+    /// V2 brushes — not exposed in the V1 UI.
+    pub sculpt_mode: Signal<rkp_engine::SculptMode>,
+    /// Brush world-space radius (meters). Range matches paint.
     pub sculpt_radius: Signal<f32>,
+    /// Smoothstep shoulder width (0..1). 0 = hard sphere, 1 = full
+    /// smoothstep from center. Controls how soft the brush boundary is.
+    pub sculpt_falloff: Signal<f32>,
+    /// Reserved for future "intensity" brushes (smooth, flatten).
+    /// Not consumed by the V1 Raise/Carve binary transition logic.
     #[allow(dead_code)]
     pub sculpt_strength: Signal<f32>,
 
@@ -350,8 +360,13 @@ impl EditorStore {
             gizmo_mode: Signal::new(GizmoMode::Translate),
             editor_mode: Signal::new(EditorMode::Default),
 
-            // Tool settings.
-            sculpt_radius: Signal::new(1.0),
+            // Sculpt tool state. Carve (Subtract) is the default — the
+            // most common destructive sculpt op, so it loads ready to
+            // "dig" with one click.
+            sculpt_active: Signal::new(false),
+            sculpt_mode: Signal::new(rkp_engine::SculptMode::Carve),
+            sculpt_radius: Signal::new(0.5),
+            sculpt_falloff: Signal::new(0.5),
             sculpt_strength: Signal::new(0.5),
 
             // Paint tool state. Red + Color mode is the Phase-2
