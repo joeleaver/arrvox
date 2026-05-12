@@ -25,6 +25,7 @@ pub mod mesh_lod;
 pub mod octree_allocator;
 pub mod prefilter;
 pub mod scene_node;
+pub mod sculpt;
 pub mod sdf;
 pub mod sdf_primitive;
 pub mod sparse_octree;
