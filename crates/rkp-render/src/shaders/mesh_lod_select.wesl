@@ -201,29 +201,32 @@ fn lod_select(@builtin(global_invocation_id) gid: vec3<u32>) {
     let karis_admit = admit_parent && admit_self;
     let level_admit = (params.force_level != 0xFFFFFFFFu) && (c.lod_level == params.force_level);
 
-    // Phase B R4d: the `CLUSTER_FLAG_LOD_DIRTY` bit is set by sculpt's
-    // per-cluster re-extract path on every cluster whose chain has been
-    // touched, but the *shader-side* response is intentionally a no-op
-    // in V1 — see the writeup in `rkp_scene_manager::sculpt` for why.
+    // Phase B R4d (V1) — when sculpt touches an asset, the CPU marks
+    // EVERY cluster of that asset with `CLUSTER_FLAG_LOD_DIRTY` (not
+    // just the brush-overlapping subset). This shader then admits
+    // ONLY the LOD-0 leaves of the affected asset and drops every
+    // LOD>0 cluster, giving an asset-wide LOD-0 clamp.
     //
-    // The flag mechanism stays in tree so R5's async ancestor-rebuild
-    // path can reuse it without re-plumbing the GPU side: once R5
-    // refreshes a cluster's geometry, it clears the bit. Until R5
-    // ships, distant views of post-sculpt regions render the
-    // (now-stale) LOD>0 geometry; close-up views render the fresh
-    // LOD-0 leaves via the standard Karis rule.
-    //
-    // Previously this branch dropped dirty LOD>0 ancestors AND
-    // force-admitted dirty LOD-0 leaves. That created cluster-shaped
-    // holes wherever a dropped ancestor's chain held a non-brush
-    // LOD-0 leaf that couldn't admit at the user's camera distance
-    // (Karis says "let the ancestor admit," but the ancestor was
-    // dropped). The fix is to leave the admit rule alone — stale
-    // geometry is preferable to missing geometry.
+    // Why asset-wide and not per-chain: the cluster DAG topology
+    // (parent ↔ child) is implicit in the cluster_error /
+    // parent_group_error chain, with no explicit cross-references in
+    // the cluster struct. Marking only brush-overlapping ancestors
+    // dirty broke chains: a non-brush LOD-0 leaf in a chain whose
+    // LOD>0 ancestor got dropped couldn't Karis-admit at the user's
+    // camera distance, leaving cluster-shaped holes. Asset-wide
+    // marking ensures every chain admits at LOD-0 — fresh for the
+    // re-extracted dirty leaves, pre-sculpt-correct for the
+    // non-dirty leaves. R5's async ancestor rebuild can refine to
+    // per-chain marking once DAG topology is exposed.
+    let lod_dirty = (c.flags & CLUSTER_FLAG_LOD_DIRTY) != 0u;
+    let force_dirty_leaf = lod_dirty && cluster_is_leaf;
+    let drop_dirty_ancestor = lod_dirty && !cluster_is_leaf;
 
-    let admit = level_admit
-        || (params.force_admit != 0u)
-        || (params.force_level == 0xFFFFFFFFu && karis_admit);
+    let admit = !drop_dirty_ancestor
+        && (level_admit
+            || (params.force_admit != 0u)
+            || force_dirty_leaf
+            || (params.force_level == 0xFFFFFFFFu && karis_admit));
 
     if (admit) {
         // Claim a compacted slot. All admitted threads atomicAdd 1

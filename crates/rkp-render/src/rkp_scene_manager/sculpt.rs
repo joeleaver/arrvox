@@ -485,9 +485,9 @@ impl RkpSceneManager {
             total_verts += new_verts.len();
             total_indices += new_indices.len();
 
-            // Write back: ClusterMesh + cluster float AABB + LOD_DIRTY
-            // flag (R4d) so the GPU admit rule force-fresh-admits this
-            // LOD-0 leaf at any camera distance.
+            // Write back: ClusterMesh + cluster float AABB. The
+            // CLUSTER_FLAG_LOD_DIRTY bit is set asset-wide below, not
+            // per dirty leaf — see the explanation there.
             let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
             entry.cluster_meshes[cid as usize] = ClusterMesh {
                 local_vertices: new_verts,
@@ -496,37 +496,33 @@ impl RkpSceneManager {
             let cluster = &mut entry.meshlet_clusters[cid as usize];
             cluster.aabb_min = new_aabb_min;
             cluster.aabb_max = new_aabb_max;
-            cluster.flags |= rkp_core::mesh_cluster::CLUSTER_FLAG_LOD_DIRTY;
         }
 
-        // R4d — propagate LOD_DIRTY to coarser-LOD ancestors. Any
-        // LOD>0 cluster whose grid AABB intersects the brush's grid
-        // AABB is a potential stale ancestor (the brush mutated the
-        // LOD-0 chain underneath it). The admit rule below skips
-        // those clusters, letting the LOD-0 force-admit path render
-        // their region with fresh geometry.
+        // R4d V1 — set CLUSTER_FLAG_LOD_DIRTY on EVERY cluster of the
+        // asset (LOD-0 + every coarser level). The shader's admit rule
+        // then drops all dirty LOD>0 clusters and force-admits all
+        // dirty LOD-0 leaves, producing an asset-wide LOD-0 clamp.
         //
-        // We use the BRUSH AABB rather than the post-re-extract LOD-0
-        // AABBs because a Carve stamp shrinks the LOD-0 cluster's
-        // AABB inward; an ancestor that only overlapped the original
-        // (pre-shrink) LOD-0 AABB would be missed by a post-AABB
-        // check, but the brush AABB always covers everything that
-        // changed.
+        // Asset-wide rather than per-chain because the cluster DAG
+        // topology isn't explicit in the cluster struct — chains are
+        // implicit via the cluster_error / parent_group_error
+        // monotonicity. A previous version marked only brush-AABB-
+        // overlapping LOD>0 clusters dirty, but that broke chains:
+        // a non-brush LOD-0 leaf whose LOD>0 ancestor got dropped
+        // couldn't Karis-admit at the user's camera distance (the
+        // load-time error normalization makes the admit decision
+        // asset-uniform, so the user saw cluster-shaped voids
+        // wherever the dropped ancestors had territory).
         //
-        // Over-includes some sibling ancestors that aren't actually
-        // in the dirty chain — they fall back to LOD-0 (fresh, same
-        // output) so the only cost is per-pixel raster instead of
-        // simplified-LOD raster.
+        // V1 cost: at distant views, the whole asset renders full
+        // LOD-0 instead of a coarser LOD — more fragment work, but
+        // correct. R5 will refine to per-chain marking once an
+        // explicit parent ↔ child DAG mapping is exposed, restoring
+        // LOD admit on the non-dirty portions.
         {
             let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
             for c in entry.meshlet_clusters.iter_mut() {
-                if c.lod_level == 0 {
-                    continue;
-                }
-                let (cmin, cmax) = cluster_grid_aabb(c, grid_origin, base_vs);
-                if cluster_overlaps_brush_grid_aabb(cmin, cmax, brush_lo, brush_hi) {
-                    c.flags |= rkp_core::mesh_cluster::CLUSTER_FLAG_LOD_DIRTY;
-                }
+                c.flags |= rkp_core::mesh_cluster::CLUSTER_FLAG_LOD_DIRTY;
             }
         }
 
