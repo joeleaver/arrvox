@@ -217,7 +217,11 @@ fn brush_outward_normal(p: Vec3, op: &BrushOp) -> Vec3 {
 
 /// Conservative axis-aligned brush bounds in finest-voxel grid units,
 /// clamped to `[0, extent)`. Returned as `(min_inclusive, max_exclusive)`.
-fn brush_cell_range(op: &BrushOp, extent: u32) -> (UVec3, UVec3) {
+/// Half-open finest-voxel grid range `[lo, hi)` that bounds the brush
+/// AABB. The compute kernel walks cells in `lo.x..hi.x` etc.; the
+/// Phase B R4c sculpt path also calls this to compute the brush's
+/// grid AABB for the cluster-overlap query.
+pub fn brush_cell_range(op: &BrushOp, extent: u32) -> (UVec3, UVec3) {
     let min_f = op.center - Vec3::splat(op.radius);
     let max_f = op.center + Vec3::splat(op.radius);
     let lo = UVec3::new(

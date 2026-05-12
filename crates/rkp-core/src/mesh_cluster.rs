@@ -50,6 +50,13 @@ const _: () = assert!(MAX_TRIS_PER_CLUSTER <= 512);
 /// `parent_group_error_proj >= threshold` arm is always true.
 pub const PARENT_GROUP_ERROR_ROOT: f32 = f32::INFINITY;
 
+/// Bit 0 of [`MeshletCluster::flags`] — set when sculpt has touched the
+/// chain this cluster belongs to. The shader's admit rule force-admits
+/// dirty LOD-0 leaves (so any camera distance gets fresh geometry) and
+/// skips dirty LOD>0 ancestors entirely (their geometry is stale until
+/// the R5 lazy-rebuild reaches them).
+pub const CLUSTER_FLAG_LOD_DIRTY: u32 = 1;
+
 /// One meshlet cluster. Stored both on `AssetEntry` (CPU side) and
 /// uploaded to the GPU verbatim via `bytemuck::cast_slice` for the
 /// Phase 6 LOD-selection compute pass to read.
@@ -89,8 +96,13 @@ pub struct MeshletCluster {
     /// LOD level this cluster lives at. 0 = finest (original
     /// surface mesh), higher = progressively simplified.          (36..40)
     pub lod_level: u32,
-    /// Reserved for future flags (cone-cull bits, etc).           (40..44)
-    pub _pad2: u32,
+    /// Per-cluster flags. Bit 0 = `LOD_DIRTY` — set by sculpt's
+    /// per-cluster re-extract path (Phase B R4d) on dirty LOD-0
+    /// clusters AND on every coarser-LOD cluster whose AABB overlaps
+    /// any dirty LOD-0 cluster. `mesh_lod_select` admits dirty LOD-0
+    /// clusters unconditionally (force-fresh) and skips dirty LOD>0
+    /// clusters (lets the chain fall through to LOD-0).            (40..44)
+    pub flags: u32,
     /// Maximum simplification error introduced at-or-below this
     /// cluster in the DAG (object-local units). Monotonically
     /// non-decreasing along chains from leaf → root. Phase 6
@@ -120,7 +132,7 @@ const _: () = {
     assert!(offset_of!(MeshletCluster, index_offset) == 28);
     assert!(offset_of!(MeshletCluster, index_count) == 32);
     assert!(offset_of!(MeshletCluster, lod_level) == 36);
-    assert!(offset_of!(MeshletCluster, _pad2) == 40);
+    assert!(offset_of!(MeshletCluster, flags) == 40);
     assert!(offset_of!(MeshletCluster, cluster_error) == 44);
     assert!(offset_of!(MeshletCluster, parent_group_error) == 48);
     assert!(offset_of!(MeshletCluster, _pad3) == 52);
@@ -210,7 +222,7 @@ pub fn cluster_mesh(
             index_offset: cluster_index_offset,
             index_count: cluster_index_count,
             lod_level: 0,
-            _pad2: 0,
+            flags: 0,
             cluster_error: 0.0,
             parent_group_error: PARENT_GROUP_ERROR_ROOT,
             _pad3: [0; 3],
@@ -671,7 +683,7 @@ mod tests {
             index_offset: 0,
             index_count: 0,
             lod_level: 0,
-            _pad2: 0,
+            flags: 0,
             cluster_error: 0.0,
             parent_group_error: 0.0,
             _pad3: [0; 3],
@@ -691,7 +703,7 @@ mod tests {
             index_offset: 0,
             index_count: 0,
             lod_level: 0,
-            _pad2: 0,
+            flags: 0,
             cluster_error: 0.0,
             parent_group_error: 0.0,
             _pad3: [0; 3],

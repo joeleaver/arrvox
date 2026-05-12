@@ -65,7 +65,7 @@ impl SurfaceMesh {
             index_offset: 0,
             index_count: self.indices.len() as u32,
             lod_level: 0,
-            _pad2: 0,
+            flags: 0,
             cluster_error: 0.0,
             parent_group_error: PARENT_GROUP_ERROR_ROOT,
             _pad3: [0; 3],

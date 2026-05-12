@@ -79,11 +79,18 @@ struct MeshletCluster {
     index_offset: u32,
     index_count: u32,
     lod_level: u32,
-    _pad2: u32,
+    /// Per-cluster flags. Bit 0 = `LOD_DIRTY` (sculpt R4d) — set on
+    /// dirty LOD-0 leaves AND on coarser-LOD ancestors whose chain
+    /// touches a dirty leaf. The admit logic below force-admits dirty
+    /// LOD-0 leaves (fresh geometry at any camera distance) and skips
+    /// dirty LOD>0 ancestors entirely.
+    flags: u32,
     cluster_error: f32,
     parent_group_error: f32,
     _pad3: vec2<u32>,
 }
+
+const CLUSTER_FLAG_LOD_DIRTY: u32 = 1u;
 
 struct DrawIndexedIndirectArgs {
     index_count: u32,
@@ -193,7 +200,23 @@ fn lod_select(@builtin(global_invocation_id) gid: vec3<u32>) {
     let admit_self = cluster_is_leaf || cluster_err_px < params.pixel_threshold;
     let karis_admit = admit_parent && admit_self;
     let level_admit = (params.force_level != 0xFFFFFFFFu) && (c.lod_level == params.force_level);
-    let admit = level_admit || (params.force_admit != 0u) || (params.force_level == 0xFFFFFFFFu && karis_admit);
+
+    // Phase B R4d — `lod_dirty` overrides the Karis rule for clusters
+    // whose chain has been touched by sculpt. Dirty LOD-0 leaves are
+    // force-admitted regardless of distance (otherwise far cameras
+    // would have no admit in the chain — LOD-1+ admits got skipped
+    // below). Dirty LOD>0 ancestors are stale (their geometry doesn't
+    // reflect the post-sculpt LOD-0 yet), so we drop them entirely
+    // and the LOD-0 force-admit picks up the slack.
+    let lod_dirty = (c.flags & CLUSTER_FLAG_LOD_DIRTY) != 0u;
+    let force_dirty_leaf = lod_dirty && cluster_is_leaf;
+    let drop_dirty_ancestor = lod_dirty && !cluster_is_leaf;
+
+    let admit = !drop_dirty_ancestor
+        && (level_admit
+            || (params.force_admit != 0u)
+            || force_dirty_leaf
+            || (params.force_level == 0xFFFFFFFFu && karis_admit));
 
     if (admit) {
         // Claim a compacted slot. All admitted threads atomicAdd 1

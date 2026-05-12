@@ -26,12 +26,16 @@
 
 use glam::{Affine3A, IVec3, Vec3};
 
-use rkp_core::cluster_mesh_data::{flatten_cluster_meshes, split_flat_into_cluster_meshes};
+use rkp_core::cluster_mesh_data::{
+    flatten_cluster_meshes, split_flat_into_cluster_meshes, ClusterMesh,
+};
 use rkp_core::mesh_cluster::{cluster_grid_aabb, cluster_overlaps_brush_grid_aabb};
-use rkp_core::mesh_extract::extract_surface_mesh;
+use rkp_core::mesh_extract::{
+    collect_cell_map, extract_mesh_region_from_cells, extract_surface_mesh,
+};
 use rkp_core::mesh_lod::build_cluster_dag_with_levels;
 use rkp_core::sculpt::{
-    apply_delta, compute_brush_edits, BrushMode, BrushOp, LeafEditOp,
+    apply_delta, brush_cell_range, compute_brush_edits, BrushMode, BrushOp, LeafEditOp,
 };
 use rkp_core::sparse_octree::{is_brick, is_leaf, leaf_slot, brick_id};
 use rkp_core::brick_pool::{BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR};
@@ -244,23 +248,27 @@ impl RkpSceneManager {
             self.leaf_attr_pool.deallocate_range(*slot, 1);
         }
 
-        // ── 5. Mesh re-extract (Phase B R4-minimal). ────────────────
+        // ── 5. Mesh re-extract (Phase B R4-proper). ─────────────────
         //
-        // Rebuild the asset's surface mesh + LOD-0-only cluster DAG
-        // from the now-mutated octree. The renderer's mesh upload
-        // path re-uploads per-asset mesh buffers on every
-        // geometry_epoch bump, so updating the entry's mesh_vertices
-        // / mesh_indices / meshlet_clusters in place is enough — the
-        // next pre-frame pass picks them up.
+        // Per-cluster region re-extract: only clusters whose grid AABB
+        // intersects the brush get re-extracted; the rest keep their
+        // existing `ClusterMesh` entries. Final flatten rebuilds the
+        // flat VBO/IBO for upload (R4e will move this into the
+        // renderer to drop the cached flat copies).
         //
-        // Cost: extract scans the asset's surface shell + builds the
-        // SN cube vertices (proportional to surface area). Cluster
-        // build at LOD_LEVELS=1 skips multi-level simplification, so
-        // it's roughly the same cost as load-time on a fresh-from-disk
-        // v5 asset minus the DAG-bake. Single-click stamps land
-        // visibly; drag stamps will stutter — R4-proper (per-cluster
-        // re-extract) is the perf path.
-        self.rebuild_asset_mesh(handle);
+        // Fallback to full re-extract when no clusters intersect AND
+        // the delta actually mutated geometry — the brush landed in a
+        // region no cluster currently owns, but new cells DID get
+        // created in the octree (Raise into far empty space). The
+        // full re-extract picks them up; cluster set then grows by
+        // whatever meshopt produces. R5 will handle this case more
+        // gracefully via re-clustering at idle.
+        let used_per_cluster = self.rebuild_dirty_clusters(handle, &op);
+        if !used_per_cluster {
+            // Per-cluster path didn't fire (empty dirty set or asset
+            // was empty before); fall back to full re-extract.
+            self.rebuild_asset_mesh(handle);
+        }
 
         // Bump the geometry epoch so the renderer re-uploads the
         // mutated octree / brick / leaf_attr buffers AND the new
@@ -333,6 +341,220 @@ impl RkpSceneManager {
             }
         }
         dirty
+    }
+
+    /// Per-cluster region re-extract (Phase B R4c).
+    ///
+    /// Identifies the LOD-0 clusters whose grid AABB intersects the
+    /// brush (via R3's `clusters_in_brush_grid_aabb`), then for each
+    /// dirty cluster:
+    ///
+    /// 1. Computes its re-extract region from the cluster's
+    ///    pre-stamp grid AABB plus a 1-cell pad (`cluster_grid_aabb`'s
+    ///    helper already adds the pad). The first dirty cluster's
+    ///    region is unioned with the brush's grid AABB so cells the
+    ///    brush created OUTSIDE all existing cluster bounds (Raise
+    ///    extending past the original surface shell) get captured —
+    ///    otherwise they'd live in the octree but never appear in any
+    ///    `ClusterMesh`.
+    /// 2. Re-extracts that region via [`extract_mesh_region_from_cells`]
+    ///    against a single cell map built once for the whole stamp.
+    /// 3. Replaces the cluster's `local_vertices` / `local_indices` in
+    ///    place; updates the cluster's float AABB from the new vertex
+    ///    positions.
+    /// 4. Re-flattens `cluster_meshes` into the cached flat VBO/IBO so
+    ///    the existing GPU upload path keeps working until R4e moves
+    ///    flatten into the renderer.
+    ///
+    /// Returns `true` when the per-cluster path fired (at least one
+    /// LOD-0 cluster was dirty); `false` when the dirty set is empty
+    /// or the asset has no mesh — the caller falls back to full
+    /// re-extract in those cases.
+    fn rebuild_dirty_clusters(&mut self, handle: AssetHandle, op: &BrushOp) -> bool {
+        let t0 = std::time::Instant::now();
+
+        // Snapshot asset parameters under a shared borrow.
+        let (depth, base_vs, grid_origin, brush_lo, brush_hi) = {
+            let Some(entry) = self.asset_cache.get(handle) else { return false; };
+            if entry.meshlet_clusters.is_empty() || entry.cluster_meshes.is_empty() {
+                return false;
+            }
+            let depth = entry.spatial_handle.depth;
+            let base_vs = entry.spatial_handle.base_voxel_size;
+            let extent_f = (1u32 << depth) as f32 * base_vs;
+            let aabb_center = (entry.aabb.min + entry.aabb.max) * 0.5;
+            let grid_origin = aabb_center - Vec3::splat(extent_f * 0.5);
+
+            let extent = 1u32 << depth;
+            let (lo, hi) = brush_cell_range(op, extent);
+            let brush_lo = IVec3::new(lo.x as i32, lo.y as i32, lo.z as i32);
+            let brush_hi = IVec3::new(hi.x as i32, hi.y as i32, hi.z as i32);
+            (depth, base_vs, grid_origin, brush_lo, brush_hi)
+        };
+
+        // Empty brush range → nothing to do (caller will skip full
+        // re-extract too since `delta` was non-empty by precondition).
+        if brush_lo.x >= brush_hi.x || brush_lo.y >= brush_hi.y || brush_lo.z >= brush_hi.z {
+            return false;
+        }
+
+        let dirty = self.clusters_in_brush_grid_aabb(handle, brush_lo, brush_hi);
+        if dirty.is_empty() {
+            return false;
+        }
+
+        // Build the dense cell map ONCE for the stamp. All dirty
+        // clusters re-extract against the same map.
+        let cells = {
+            let Some(entry) = self.asset_cache.get(handle) else { return false; };
+            collect_cell_map(
+                entry.cpu_octree.as_slice(),
+                depth,
+                self.brick_pool.as_slice(),
+            )
+        };
+
+        // Per-cluster re-extract loop. Iteration order: ascending
+        // cluster id (matches `dirty` from R3). The first dirty cluster
+        // gets the union with the brush grid AABB so newly-created
+        // cells outside all pre-stamp cluster AABBs are captured by
+        // exactly one cluster (vs duplicated across all dirty
+        // clusters, or dropped entirely).
+        let first_dirty = dirty[0];
+        let mut total_verts = 0usize;
+        let mut total_indices = 0usize;
+        for &cid in &dirty {
+            let (region_min, region_max) = {
+                let Some(entry) = self.asset_cache.get(handle) else { return false; };
+                let cluster = entry.meshlet_clusters[cid as usize];
+                let (mut cmin, mut cmax) = cluster_grid_aabb(&cluster, grid_origin, base_vs);
+                // `cluster_grid_aabb` returns inclusive bounds with 1-
+                // cell pad; convert to half-open by adding 1 to max.
+                cmax += IVec3::ONE;
+                if cid == first_dirty {
+                    // Union with brush AABB — captures Raise that
+                    // extends past existing cluster bounds.
+                    cmin = cmin.min(brush_lo);
+                    cmax = cmax.max(brush_hi);
+                }
+                (cmin, cmax)
+            };
+
+            let (new_verts, new_indices) = {
+                let Some(entry) = self.asset_cache.get(handle) else { return false; };
+                extract_mesh_region_from_cells(
+                    &cells,
+                    region_min,
+                    region_max,
+                    entry.cpu_octree.as_slice(),
+                    depth,
+                    base_vs,
+                    grid_origin,
+                    self.brick_pool.as_slice(),
+                    self.leaf_attr_pool.as_slice(),
+                    self.leaf_attr_pool.bones_as_slice(),
+                )
+            };
+
+            // Compute the new float AABB from the re-extracted verts.
+            let mut new_aabb_min = [f32::INFINITY; 3];
+            let mut new_aabb_max = [f32::NEG_INFINITY; 3];
+            for v in &new_verts {
+                for k in 0..3 {
+                    if v.local_pos[k] < new_aabb_min[k] {
+                        new_aabb_min[k] = v.local_pos[k];
+                    }
+                    if v.local_pos[k] > new_aabb_max[k] {
+                        new_aabb_max[k] = v.local_pos[k];
+                    }
+                }
+            }
+            if new_verts.is_empty() {
+                // Cluster carved away to nothing. AABB collapses; keep
+                // the cluster slot but mark it empty.
+                new_aabb_min = [0.0; 3];
+                new_aabb_max = [0.0; 3];
+            }
+
+            total_verts += new_verts.len();
+            total_indices += new_indices.len();
+
+            // Write back: ClusterMesh + cluster float AABB + LOD_DIRTY
+            // flag (R4d) so the GPU admit rule force-fresh-admits this
+            // LOD-0 leaf at any camera distance.
+            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
+            entry.cluster_meshes[cid as usize] = ClusterMesh {
+                local_vertices: new_verts,
+                local_indices: new_indices,
+            };
+            let cluster = &mut entry.meshlet_clusters[cid as usize];
+            cluster.aabb_min = new_aabb_min;
+            cluster.aabb_max = new_aabb_max;
+            cluster.flags |= rkp_core::mesh_cluster::CLUSTER_FLAG_LOD_DIRTY;
+        }
+
+        // R4d — propagate LOD_DIRTY to coarser-LOD ancestors. Any
+        // LOD>0 cluster whose grid AABB intersects the brush's grid
+        // AABB is a potential stale ancestor (the brush mutated the
+        // LOD-0 chain underneath it). The admit rule below skips
+        // those clusters, letting the LOD-0 force-admit path render
+        // their region with fresh geometry.
+        //
+        // We use the BRUSH AABB rather than the post-re-extract LOD-0
+        // AABBs because a Carve stamp shrinks the LOD-0 cluster's
+        // AABB inward; an ancestor that only overlapped the original
+        // (pre-shrink) LOD-0 AABB would be missed by a post-AABB
+        // check, but the brush AABB always covers everything that
+        // changed.
+        //
+        // Over-includes some sibling ancestors that aren't actually
+        // in the dirty chain — they fall back to LOD-0 (fresh, same
+        // output) so the only cost is per-pixel raster instead of
+        // simplified-LOD raster.
+        {
+            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
+            for c in entry.meshlet_clusters.iter_mut() {
+                if c.lod_level == 0 {
+                    continue;
+                }
+                let (cmin, cmax) = cluster_grid_aabb(c, grid_origin, base_vs);
+                if cluster_overlaps_brush_grid_aabb(cmin, cmax, brush_lo, brush_hi) {
+                    c.flags |= rkp_core::mesh_cluster::CLUSTER_FLAG_LOD_DIRTY;
+                }
+            }
+        }
+
+        // Flatten cluster_meshes → flat VBO/IBO. Updates each cluster's
+        // index_offset / index_count.
+        let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
+        let (flat_v, flat_i) =
+            flatten_cluster_meshes(&entry.cluster_meshes, &mut entry.meshlet_clusters);
+        // Recompute the LOD-0 prefix length — clusters[] order is
+        // preserved by flatten, so LOD-0 still appears first; the
+        // prefix is the sum of LOD-0 clusters' new index counts.
+        let mesh_lod0_index_count: u32 = entry
+            .meshlet_clusters
+            .iter()
+            .filter(|c| c.lod_level == 0)
+            .map(|c| c.index_count)
+            .sum();
+        entry.mesh_vertices = flat_v;
+        entry.mesh_indices = flat_i;
+        entry.mesh_lod0_index_count = mesh_lod0_index_count;
+
+        eprintln!(
+            "[sculpt] per-cluster re-extract: handle={:?} dirty={} verts={} indices={} \
+             total verts={} indices={} ({:.2}ms)",
+            handle,
+            dirty.len(),
+            total_verts,
+            total_indices,
+            entry.mesh_vertices.len(),
+            entry.mesh_indices.len(),
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        true
     }
 
     /// Re-extract the surface mesh + LOD-0 cluster table for one
@@ -443,7 +665,7 @@ mod tests {
             index_offset: 0,
             index_count: 0,
             lod_level,
-            _pad2: 0,
+            flags: 0,
             cluster_error: 0.0,
             parent_group_error: PARENT_GROUP_ERROR_ROOT,
             _pad3: [0; 3],
