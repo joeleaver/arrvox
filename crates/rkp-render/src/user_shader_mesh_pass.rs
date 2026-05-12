@@ -221,8 +221,14 @@ pub struct UserShaderMeshPass {
     pub raster_pipeline_layout: wgpu::PipelineLayout,
     pub compute_g0_layout: wgpu::BindGroupLayout,
     pub compute_pipeline_layout: wgpu::PipelineLayout,
+    /// Shadow `g0` — camera (binding 0) + light_camera (binding 1) +
+    /// shadow_params (binding 2). camera is bound for splice symmetry
+    /// only; the shadow VS overrides clip_pos with cascade VP.
+    pub shadow_g0_layout: wgpu::BindGroupLayout,
+    pub shadow_pipeline_layout: wgpu::PipelineLayout,
 
     pub stub_raster: wgpu::RenderPipeline,
+    pub stub_shadow: wgpu::RenderPipeline,
     pub stub_spawn_count: wgpu::ComputePipeline,
     pub stub_prefix_local: wgpu::ComputePipeline,
     pub stub_prefix_scan_sums: wgpu::ComputePipeline,
@@ -235,6 +241,10 @@ pub struct UserShaderMeshPass {
 /// source_hash)` and caches the result.
 pub struct UserShaderMeshPipelines {
     pub raster: wgpu::RenderPipeline,
+    /// Depth-only render pipeline for the directional shadow cascades.
+    /// Same anchor / record / frame / params bind groups as `raster`;
+    /// adds light_camera + shadow_params at group(0).
+    pub shadow: wgpu::RenderPipeline,
     pub spawn_count: wgpu::ComputePipeline,
     pub prefix_local: wgpu::ComputePipeline,
     pub prefix_scan_sums: wgpu::ComputePipeline,
@@ -252,6 +262,7 @@ pub struct UserShaderMeshDraw {
     pub shader_id: u32,
     pub vertex_count_per_spawn: u32,
     pub raster_pipeline: wgpu::RenderPipeline,
+    pub shadow_pipeline: wgpu::RenderPipeline,
     pub raster_g1: wgpu::BindGroup,
     pub indirect_buffer: wgpu::Buffer,
 }
@@ -377,6 +388,27 @@ impl UserShaderMeshPass {
             },
         );
 
+        // Shadow g0: camera (binding 0; declared for splice symmetry —
+        // the user's vs may reference it but we override clip_pos
+        // anyway), light_camera (binding 1), shadow_params (binding 2).
+        let shadow_g0_layout = device.create_bind_group_layout(
+            &wgpu::BindGroupLayoutDescriptor {
+                label: Some("user_shader_mesh shadow g0 (camera, light_camera, shadow_params)"),
+                entries: &[
+                    uniform_entry(0, wgpu::ShaderStages::VERTEX),
+                    uniform_entry(1, wgpu::ShaderStages::VERTEX),
+                    uniform_entry(2, wgpu::ShaderStages::VERTEX),
+                ],
+            },
+        );
+        let shadow_pipeline_layout = device.create_pipeline_layout(
+            &wgpu::PipelineLayoutDescriptor {
+                label: Some("user_shader_mesh shadow pipeline layout"),
+                bind_group_layouts: &[Some(&shadow_g0_layout), Some(&raster_g1_layout)],
+                immediate_size: 0,
+            },
+        );
+
         let raster_module = crate::compile_pass_shader(
             device,
             wesl::include_wesl!("user_shader_mesh"),
@@ -389,11 +421,24 @@ impl UserShaderMeshPass {
             "user_shader_mesh_compute",
         );
 
+        let shadow_module = crate::compile_pass_shader(
+            device,
+            wesl::include_wesl!("user_shader_mesh_shadow"),
+            "user_shader_mesh_shadow",
+        );
+
         let stub_raster = build_raster_pipeline(
             device,
             &raster_pipeline_layout,
             &raster_module,
             "user_shader_mesh stub raster",
+        );
+
+        let stub_shadow = build_shadow_pipeline(
+            device,
+            &shadow_pipeline_layout,
+            &shadow_module,
+            "user_shader_mesh stub shadow",
         );
 
         let stub = build_compute_pipelines(
@@ -409,7 +454,10 @@ impl UserShaderMeshPass {
             raster_pipeline_layout,
             compute_g0_layout,
             compute_pipeline_layout,
+            shadow_g0_layout,
+            shadow_pipeline_layout,
             stub_raster,
+            stub_shadow,
             stub_spawn_count: stub.spawn_count,
             stub_prefix_local: stub.prefix_local,
             stub_prefix_scan_sums: stub.prefix_scan_sums,
@@ -422,10 +470,11 @@ impl UserShaderMeshPass {
     /// splices user code into. `wesl::include_wesl!` reads from the
     /// emitter crate's OUT_DIR, so cross-crate callers (rkp-engine)
     /// can't invoke the macro themselves — they call this helper.
-    pub fn template_sources() -> (&'static str, &'static str) {
+    pub fn template_sources() -> (&'static str, &'static str, &'static str) {
         (
             wesl::include_wesl!("user_shader_mesh"),
             wesl::include_wesl!("user_shader_mesh_compute"),
+            wesl::include_wesl!("user_shader_mesh_shadow"),
         )
     }
 
@@ -437,6 +486,7 @@ impl UserShaderMeshPass {
         device: &wgpu::Device,
         raster_wgsl: &str,
         compute_wgsl: &str,
+        shadow_wgsl: &str,
         label: &str,
     ) -> UserShaderMeshPipelines {
         let raster_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -447,11 +497,21 @@ impl UserShaderMeshPass {
             label: Some(&format!("{label} compute module")),
             source: wgpu::ShaderSource::Wgsl(compute_wgsl.into()),
         });
+        let shadow_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(&format!("{label} shadow module")),
+            source: wgpu::ShaderSource::Wgsl(shadow_wgsl.into()),
+        });
         let raster = build_raster_pipeline(
             device,
             &self.raster_pipeline_layout,
             &raster_module,
             &format!("{label} raster"),
+        );
+        let shadow = build_shadow_pipeline(
+            device,
+            &self.shadow_pipeline_layout,
+            &shadow_module,
+            &format!("{label} shadow"),
         );
         let computes = build_compute_pipelines(
             device,
@@ -461,6 +521,7 @@ impl UserShaderMeshPass {
         );
         UserShaderMeshPipelines {
             raster,
+            shadow,
             spawn_count: computes.spawn_count,
             prefix_local: computes.prefix_local,
             prefix_scan_sums: computes.prefix_scan_sums,
@@ -523,6 +584,33 @@ impl UserShaderMeshPass {
                     ops: load_op_color,
                 }),
             ],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        })
+    }
+
+    /// Begin a depth-only shadow render pass for one cascade. Loads
+    /// the existing depth (the mesh shadow pass already cleared and
+    /// wrote opaque casters into the same view) and stores the result.
+    /// Grass shadows compose on top of mesh shadows in the same map.
+    pub fn begin_shadow_pass<'a>(
+        &'a self,
+        encoder: &'a mut wgpu::CommandEncoder,
+        depth_view: &wgpu::TextureView,
+        timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'a>>,
+    ) -> wgpu::RenderPass<'a> {
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("user_shader_mesh shadow"),
+            color_attachments: &[],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth_view,
                 depth_ops: Some(wgpu::Operations {
@@ -677,6 +765,60 @@ fn build_raster_pipeline(
                 }),
             ],
         }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Depth-only pipeline for the directional shadow cascades. No
+/// fragment shader (early-z stays at full strength) and no color
+/// attachments — the rasterizer just fills the cascade's depth view.
+fn build_shadow_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    module: &wgpu::ShaderModule,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module,
+            entry_point: Some("entry_vert"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            // No back-face cull — same rationale as the primary
+            // raster: user shaders may emit double-sided geometry
+            // (grass blades viewed from below, leaves). Note this is
+            // less aggressive than the mesh path's `Face::Front`
+            // cull-for-acne trick; thin grass blades don't have a
+            // meaningful back face to cull.
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            // Cascade depth attachments are Depth32Float (matches
+            // `mesh_shadow_depth_views[]` in viewport_renderer).
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: 1,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        // No fragment shader. wgpu allows depth-only pipelines.
+        fragment: None,
         multiview_mask: None,
         cache: None,
     })

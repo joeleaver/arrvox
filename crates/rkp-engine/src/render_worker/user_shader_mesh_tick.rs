@@ -293,12 +293,15 @@ pub(super) fn tick_user_shader_mesh(state: &mut RenderState, frame: &RenderFrame
             state.queue.submit(Some(encoder.finish()));
         }
 
-        // Enqueue draw descriptor.
+        // Enqueue draw descriptor. The shadow pipeline shares
+        // raster_g1 (anchors + records + frame + params) — the
+        // engine binds a per-cascade shadow_g0 separately.
         state.user_shader_mesh_draws.push(UserShaderMeshDraw {
             material_id,
             shader_id,
             vertex_count_per_spawn,
             raster_pipeline: mat_state.pipelines.raster.clone(),
+            shadow_pipeline: mat_state.pipelines.shadow.clone(),
             raster_g1: mat_state.raster_g1.clone(),
             indirect_buffer: mat_state.indirect_buffer.clone(),
         });
@@ -317,13 +320,14 @@ fn build_material_state(
     entry: &rkp_render::shader_composer::UserShaderEntry,
     source_hash: u64,
 ) -> MeshUserShaderMaterialState {
-    let (raster_template, compute_template) =
+    let (raster_template, compute_template, shadow_template) =
         rkp_render::user_shader_mesh_pass::UserShaderMeshPass::template_sources();
-    let (raster_wgsl, compute_wgsl) =
+    let (raster_wgsl, compute_wgsl, shadow_wgsl) =
         rkp_render::shader_composer::compose_mesh_path_pipeline_sources(
             entry,
             raster_template,
             compute_template,
+            shadow_template,
         );
 
     let label = format!("user_shader_mesh:{}", entry.name);
@@ -331,6 +335,7 @@ fn build_material_state(
         &state.device,
         &raster_wgsl,
         &compute_wgsl,
+        &shadow_wgsl,
         &label,
     );
 

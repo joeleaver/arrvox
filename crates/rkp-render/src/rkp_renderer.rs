@@ -737,6 +737,34 @@ impl RkpRenderer {
         self.profiler.end_query(encoder, q);
     }
 
+    /// Render user-shader-mesh blades into ONE cascade's shadow depth
+    /// view. Composes on top of the mesh-path opaque shadows already
+    /// in the same view (load + store, no clear). Caller drives the
+    /// per-cascade loop and provides the matching shadow_g0 bind
+    /// group (built per-VR per-cascade in `refresh_mesh_shadow_bindings`).
+    pub fn dispatch_user_shader_mesh_shadow(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        depth_view: &wgpu::TextureView,
+        shadow_g0: &wgpu::BindGroup,
+        draws: &[crate::user_shader_mesh_pass::UserShaderMeshDraw],
+    ) {
+        if draws.is_empty() {
+            return;
+        }
+        let mut rp = self.user_shader_mesh.begin_shadow_pass(
+            encoder,
+            depth_view,
+            None,
+        );
+        rp.set_bind_group(0, shadow_g0, &[]);
+        for d in draws {
+            rp.set_pipeline(&d.shadow_pipeline);
+            rp.set_bind_group(1, &d.raster_g1, &[]);
+            rp.draw_indirect(&d.indirect_buffer, 0);
+        }
+    }
+
     /// Runs after the primary mode's main pass + `splat_resolve` so the
     /// G-buffer carries octree-mesh/splat output; proxy raster
     /// depth-composites on top using `LoadOp::Load`. Writes all five
@@ -1312,6 +1340,7 @@ impl RkpRenderer {
         encoder: &mut wgpu::CommandEncoder,
         viewport: &mut crate::viewport_renderer::ViewportRenderer,
         draws: &[SplatDraw],
+        user_shader_mesh_draws: &[crate::user_shader_mesh_pass::UserShaderMeshDraw],
     ) {
         // Diagnostic: skip shadow visibility entirely. Used to
         // measure mesh_raster in isolation. Visuals: shadows go
@@ -1598,6 +1627,28 @@ impl RkpRenderer {
                 }
             }
             self.profiler.end_query(encoder, q_render);
+
+            // 1a. V1 user-shader-mesh blade shadows (grass / leaves /
+            //     etc). Composes onto the same cascade depth view the
+            //     mesh shadow pass just wrote into. Per-cascade
+            //     shadow_g0 is built per-VR in `refresh_mesh_shadow_bindings`.
+            if !user_shader_mesh_draws.is_empty() {
+                let q_us = self.profiler.begin_query(
+                    &format!("user_shader_mesh_shadow[{cascade}]"),
+                    encoder,
+                );
+                let us_g0 = viewport
+                    .user_shader_mesh_shadow_g0_bgs[cascade]
+                    .as_ref()
+                    .expect("user_shader_mesh shadow g0 bg present after refresh");
+                self.dispatch_user_shader_mesh_shadow(
+                    encoder,
+                    &viewport.mesh_shadow_depth_views[cascade],
+                    us_g0,
+                    user_shader_mesh_draws,
+                );
+                self.profiler.end_query(encoder, q_us);
+            }
 
             // 1b. Glass shadow front + back. Captures glass entry +
             //     exit depth from this cascade's light POV. The
@@ -1983,7 +2034,9 @@ impl RkpRenderer {
         // already samples. Per-instance uniforms were written by the
         // earlier `dispatch_mesh` call this frame.
         if in_situ && !raymarch && mesh && shadow_map_enabled {
-            self.dispatch_mesh_shadow(queue, encoder, viewport, splat_draws);
+            self.dispatch_mesh_shadow(
+                queue, encoder, viewport, splat_draws, user_shader_mesh_draws,
+            );
         }
 
         // Pipeline-statistics resolve: single per-frame point so it

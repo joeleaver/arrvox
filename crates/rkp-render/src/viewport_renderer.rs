@@ -256,6 +256,14 @@ pub struct ViewportRenderer {
     pub mesh_shadow_blit_g0_bgs: Vec<Option<wgpu::BindGroup>>,
     /// Per-cascade `MeshShadowBlitParams` uniform buffer (16 B).
     pub mesh_shadow_blit_params_buffers: Vec<wgpu::Buffer>,
+    /// Per-cascade `g0` for the V1 user-shader-mesh shadow render.
+    /// Layout: camera (uniform, this VR's camera_buffer) +
+    /// light_camera (uniform, shadow_map.uniform_buffer) +
+    /// shadow_params (uniform, mesh_shadow_render_params_buffers[i] —
+    /// shared with the mesh shadow path; both pipelines read
+    /// cascade_index from the same struct). Lazily built on first
+    /// frame any user-shader mesh material is active.
+    pub user_shader_mesh_shadow_g0_bgs: Vec<Option<wgpu::BindGroup>>,
 
     // ── Mesh per-cluster LOD-select per-VR state (Phase 6.2/6.3) ───
     /// Per-draw `MeshLodSelectParams` uniform (16 B). Slot index
@@ -703,6 +711,7 @@ impl ViewportRenderer {
             mesh_shadow_render_g0_scene_epoch: u64::MAX,
             mesh_shadow_blit_g0_bgs: vec![None; CSM_CASCADE_COUNT as usize],
             mesh_shadow_blit_params_buffers,
+            user_shader_mesh_shadow_g0_bgs: vec![None; CSM_CASCADE_COUNT as usize],
             mesh_lod_params_buffers: Vec::new(),
             mesh_lod_args_buffers: Vec::new(),
             mesh_lod_count_buffers: Vec::new(),
@@ -949,6 +958,34 @@ impl ViewportRenderer {
                         &self.shadow_map.shadow_buffer,
                         &self.mesh_shadow_blit_params_buffers[i],
                     ));
+            }
+        }
+        // V1 user-shader-mesh shadow g0. Same per-cascade
+        // ShadowParams buffer the mesh path uses (`cascade_index`
+        // matches), plus the VR's camera + the shared light_camera.
+        // Built once per VR per scene-buffers-epoch.
+        for i in 0..CSM_CASCADE_COUNT as usize {
+            if self.user_shader_mesh_shadow_g0_bgs[i].is_none() {
+                self.user_shader_mesh_shadow_g0_bgs[i] =
+                    Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("user_shader_mesh shadow g0"),
+                        layout: &renderer.user_shader_mesh.shadow_g0_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.camera_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: self.shadow_map.uniform_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: self.mesh_shadow_render_params_buffers[i]
+                                    .as_entire_binding(),
+                            },
+                        ],
+                    }));
             }
         }
     }

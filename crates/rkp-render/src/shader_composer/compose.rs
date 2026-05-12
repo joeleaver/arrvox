@@ -36,27 +36,36 @@ pub fn compose(reg: &UserShaderRegistry) -> ComposedChunks {
 /// the output keyed on `(entry.id, source_hash)` and builds
 /// pipelines via `UserShaderMeshPass::build_pipelines`.
 ///
-/// Two outputs (one per shader module):
+/// Three outputs (one per shader module):
 ///   · `raster` — `user_shader_mesh.wgsl` with the user's body
 ///     (helpers + structs + `vs` + optional `fs`) spliced between
 ///     `USER_BODY_BEGIN/END`.
 ///   · `compute` — `user_shader_mesh_compute.wgsl` with helpers +
 ///     structs + `spawn_count` + optional `spawn_alive` spliced.
+///   · `shadow` — `user_shader_mesh_shadow.wgsl` with the same body
+///     as raster (vs + helpers + structs + fs). Depth-only render
+///     path — only `world_pos` from VsOut is consumed; the engine
+///     entry overwrites clip_pos with the cascade VP. fs is
+///     included for splice symmetry but DCE'd by naga (no FS in
+///     the shadow pipeline).
 ///
-/// Helpers and struct decls land in BOTH outputs since the user
-/// might call a helper from `vs` (raster) AND from `spawn_count`
-/// (compute). Per-spawn determinism relies on identical helper
-/// behaviour across the two compilations.
+/// Helpers and struct decls land in ALL three outputs since the user
+/// might call a helper from `vs` (raster + shadow) AND from
+/// `spawn_count` (compute). Per-spawn determinism relies on
+/// identical helper behaviour across all compilations.
 pub fn compose_mesh_path_pipeline_sources(
     entry: &UserShaderEntry,
     raster_template: &str,
     compute_template: &str,
-) -> (String, String) {
+    shadow_template: &str,
+) -> (String, String, String) {
     let raster_body = build_mesh_path_raster_body(entry);
     let compute_body = build_mesh_path_compute_body(entry);
     let raster = splice_const_marker(raster_template, "USER_BODY", &raster_body);
     let compute = splice_const_marker(compute_template, "USER_BODY", &compute_body);
-    (raster, compute)
+    // Shadow shares the raster body verbatim — same vs / fs splice.
+    let shadow = splice_const_marker(shadow_template, "USER_BODY", &raster_body);
+    (raster, compute, shadow)
 }
 
 fn build_mesh_path_raster_body(entry: &UserShaderEntry) -> String {

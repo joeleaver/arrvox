@@ -695,10 +695,10 @@ fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> V
     let entry = &reg.entries()[0];
     assert!(entry.is_mesh_path());
 
-    let (raster_template, compute_template) =
+    let (raster_template, compute_template, shadow_template) =
         crate::user_shader_mesh_pass::UserShaderMeshPass::template_sources();
-    let (raster_wgsl, compute_wgsl) =
-        compose_mesh_path_pipeline_sources(entry, raster_template, compute_template);
+    let (raster_wgsl, compute_wgsl, shadow_wgsl) =
+        compose_mesh_path_pipeline_sources(entry, raster_template, compute_template, shadow_template);
 
     let validate = |label: &str, src: &str| {
         let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| {
@@ -717,6 +717,7 @@ fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> V
     };
     validate("raster", &raster_wgsl);
     validate("compute", &compute_wgsl);
+    validate("shadow", &shadow_wgsl);
 }
 
 #[test]
@@ -759,10 +760,10 @@ fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> V
     let entry = &reg.entries()[0];
     assert!(entry.is_mesh_path());
 
-    let (raster_template, compute_template) =
+    let (raster_template, compute_template, shadow_template) =
         crate::user_shader_mesh_pass::UserShaderMeshPass::template_sources();
-    let (raster_wgsl, compute_wgsl) =
-        compose_mesh_path_pipeline_sources(entry, raster_template, compute_template);
+    let (raster_wgsl, compute_wgsl, shadow_wgsl) =
+        compose_mesh_path_pipeline_sources(entry, raster_template, compute_template, shadow_template);
 
     let validate = |label: &str, src: &str| {
         let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| {
@@ -781,6 +782,7 @@ fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> V
     };
     validate("raster", &raster_wgsl);
     validate("compute", &compute_wgsl);
+    validate("shadow", &shadow_wgsl);
     // Sanity: the compose actually pulled paint_probe + the user
     // spawn_alive into the compute splice.
     assert!(compute_wgsl.contains("fn paint_probe"));
@@ -824,8 +826,14 @@ const USER_BODY_BEGIN: u32 = 0u;
 fn stub_placeholder() {}
 const USER_BODY_END: u32 = 0u;
 ";
-    let (raster_wgsl, compute_wgsl) =
-        compose_mesh_path_pipeline_sources(entry, raster_template, compute_template);
+    let shadow_template = "\
+struct VsOut { @builtin(position) clip_pos: vec4<f32> }
+const USER_BODY_BEGIN: u32 = 0u;
+fn stub_placeholder() {}
+const USER_BODY_END: u32 = 0u;
+";
+    let (raster_wgsl, compute_wgsl, _shadow_wgsl) =
+        compose_mesh_path_pipeline_sources(entry, raster_template, compute_template, shadow_template);
 
     // Raster splice received vs body + helper.
     assert!(raster_wgsl.contains("fn helper_double"));
