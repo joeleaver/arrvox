@@ -634,32 +634,16 @@ impl RkpSceneManager {
         // for that future variant; it just isn't called today.
         let _ = (mesh_indices.len(), meshlet_clusters.len());
 
-        // Phase B R4a: split the flat VBO/IBO into per-cluster owned
-        // mesh data, then round-trip through `flatten_cluster_meshes`
-        // so the rest of the load path (and the renderer) sees
-        // exactly what flatten will produce on every later re-extract.
-        // The flat `mesh_vertices` / `mesh_indices` become *derived* —
-        // their canonical source is `cluster_meshes`. R4e will move the
-        // flatten into the renderer and stop caching the flat output
-        // on `AssetEntry`; for now we keep them so unchanged GPU upload
-        // paths still work.
-        //
-        // Round-trip permutes vertex ordering (boundary verts get
-        // duplicated per-cluster, deduplication is per-cluster only),
-        // but the per-cluster triangle position set is preserved —
-        // tests in `cluster_mesh_data` cover this. The renderer never
-        // observes vertex ids across cluster boundaries, only positions,
-        // so render output is invariant.
-        let cluster_meshes = rkp_core::cluster_mesh_data::split_flat_into_cluster_meshes(
-            &mesh_vertices,
-            &mesh_indices,
-            &meshlet_clusters,
-        );
-        let (mesh_vertices, mesh_indices) =
-            rkp_core::cluster_mesh_data::flatten_cluster_meshes(
-                &cluster_meshes,
-                &mut meshlet_clusters,
-            );
+        // Note: an earlier R4a-proper version ran a per-cluster
+        // split + flatten round-trip here so sculpt could replace
+        // individual clusters' mesh data in `cluster_meshes` and
+        // re-flatten on every stamp. The round-trip *duplicated*
+        // boundary verts per-cluster — on a ~100 k-cluster
+        // multi-LOD asset that 2-3 ×'d the VBO size (~6.5 M verts
+        // vs ~2.5 M original) → "mesh asset vbo" OOM on 4-6 GB
+        // GPUs. Sculpt now uses an append-only path against the
+        // original flat VBO/IBO (see `rebuild_dirty_clusters`), so
+        // load keeps the build_cluster_dag output verbatim.
 
         // Compute brick face-links for this asset. The tree's brick ids
         // have already been remapped to global ids above, so the rows
@@ -731,7 +715,6 @@ impl RkpSceneManager {
             mesh_indices,
             mesh_lod0_index_count,
             meshlet_clusters,
-            cluster_meshes,
             cpu_octree: tree,
         })
     }
