@@ -52,9 +52,10 @@
 
 use glam::{UVec3, Vec3};
 
+use crate::brick_pool::{BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR, BrickPool};
 use crate::leaf_attr::{LeafAttr, pack_oct};
 use crate::sparse_octree::{
-    EMPTY_NODE, INTERIOR_NODE, SparseOctree, is_brick, is_leaf, leaf_slot, make_leaf,
+    EMPTY_NODE, INTERIOR_NODE, SparseOctree, brick_id, is_brick, is_leaf, leaf_slot, make_leaf,
 };
 
 /// Add (clay) vs Subtract (dig). Matches the engine-side
@@ -96,11 +97,21 @@ pub struct BrushOp {
 /// What to do at a single finest-voxel cell.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LeafEditOp {
-    /// Drop the leaf at this coord — node becomes [`EMPTY_NODE`].
+    /// Drop the surface leaf at this coord — cell becomes EMPTY. The
+    /// caller's [`LeafAttrPool`] reclaims the prior slot id surfaced
+    /// in [`AppliedDelta::freed_slots`].
     Remove,
-    /// Add a leaf at this coord. Phase 2 glue allocates a slot via the
-    /// caller-supplied `alloc_slot` and writes `material` + `normal`
-    /// into the slot's [`LeafAttr`].
+    /// Make the cell EMPTY regardless of prior state. Semantically the
+    /// same as `Remove` for kernel V1; the variant exists so future
+    /// kernel variants can distinguish "drop the surface I knew about"
+    /// from "clear bulk to air" (deep-Carve through INTERIOR).
+    Empty,
+    /// Mark the cell as INTERIOR (occupied bulk, no visible surface).
+    /// Used for deep-Raise to add solid mass beyond the brush boundary.
+    SetInterior,
+    /// Add a surface leaf at this coord. The caller's `alloc_slot`
+    /// produces the slot id; the primitive writes the LEAF/BRICK_cell
+    /// encoding referencing that slot.
     Add { material: u16, normal: Vec3 },
 }
 
@@ -125,7 +136,13 @@ impl SculptDelta {
         self.edits.iter().filter(|e| matches!(e.op, LeafEditOp::Add { .. })).count()
     }
     pub fn count_removed(&self) -> usize {
-        self.edits.iter().filter(|e| matches!(e.op, LeafEditOp::Remove)).count()
+        self.edits
+            .iter()
+            .filter(|e| matches!(e.op, LeafEditOp::Remove | LeafEditOp::Empty))
+            .count()
+    }
+    pub fn count_interior(&self) -> usize {
+        self.edits.iter().filter(|e| matches!(e.op, LeafEditOp::SetInterior)).count()
     }
 }
 
@@ -301,13 +318,25 @@ pub fn compute_brush_edits(octree: &SparseOctree, op: BrushOp) -> SculptDelta {
     SculptDelta { edits }
 }
 
-/// Apply a [`SculptDelta`] to a mutable octree.
+/// Apply a [`SculptDelta`] to a mutable octree + brick pool.
 ///
-/// For each `Remove` edit: look up the leaf's current slot id (record
-/// it in `freed_slots`) and write `EMPTY_NODE` at the finest level.
-/// For each `Add` edit: call `alloc_slot()` to get a fresh slot id,
-/// record `(slot, attrs)` in `allocated_slots`, and write a `LEAF`
-/// node referencing that slot.
+/// For each `Remove` edit: clear the cell to EMPTY via
+/// [`SparseOctree::set_cell_empty`] and surface the previous
+/// leaf_attr slot in `freed_slots` so the caller can release it
+/// from its [`LeafAttrPool`].
+///
+/// For each `Add` edit: call `alloc_slot()` to obtain a fresh
+/// slot id, write SOLID at the cell via
+/// [`SparseOctree::set_cell_solid`], and record `(slot, attrs)` in
+/// `allocated_slots` so the caller can write the [`LeafAttr`].
+/// If the cell already held a slot (rare for brush ops, but possible
+/// for cavity-wall edits that overwrite an INTERIOR-just-promoted-to-
+/// SOLID cell), the prior slot id is also surfaced in `freed_slots`.
+///
+/// `Empty` and `SetInterior` mirror Remove/Add for the cavity-wall
+/// rule set: they let the kernel emit "this cell is now bulk" or
+/// "this cell is now air" edits independent of whether it previously
+/// held a surface slot.
 ///
 /// The caller is responsible for:
 /// * Writing `attrs.to_leaf_attr()` (and a default color, if used)
@@ -316,27 +345,32 @@ pub fn compute_brush_edits(octree: &SparseOctree, op: BrushOp) -> SculptDelta {
 /// * Bumping the scene's geometry epoch so the renderer re-uploads.
 pub fn apply_delta(
     octree: &mut SparseOctree,
+    brick_pool: &mut BrickPool,
     delta: &SculptDelta,
     mut alloc_slot: impl FnMut() -> u32,
 ) -> AppliedDelta {
-    let depth = octree.depth();
     let mut allocated_slots = Vec::with_capacity(delta.count_added());
     let mut freed_slots = Vec::with_capacity(delta.count_removed());
 
     for edit in &delta.edits {
         match edit.op {
-            LeafEditOp::Remove => {
-                if let Some(node) = octree.lookup(edit.coord) {
-                    if is_leaf(node) {
-                        freed_slots.push(leaf_slot(node));
-                    }
+            LeafEditOp::Remove | LeafEditOp::Empty => {
+                if let Some(prev) = octree.set_cell_empty(edit.coord, brick_pool) {
+                    freed_slots.push(prev);
                 }
-                octree.set_at_level(edit.coord, depth, EMPTY_NODE);
+            }
+            LeafEditOp::SetInterior => {
+                if let Some(prev) = octree.set_cell_interior(edit.coord, brick_pool) {
+                    freed_slots.push(prev);
+                }
             }
             LeafEditOp::Add { material, normal } => {
                 let slot = alloc_slot();
                 allocated_slots.push((slot, LeafEditAttrs { material, normal }));
-                octree.set_at_level(edit.coord, depth, make_leaf(slot));
+                if let Some(prev) = octree.set_cell_solid(edit.coord, slot, brick_pool) {
+                    // Caller must free the displaced slot too.
+                    freed_slots.push(prev);
+                }
             }
         }
     }
@@ -362,25 +396,59 @@ mod tests {
     /// Helper: count leaves in the tree.
     fn leaf_count(t: &SparseOctree) -> usize { t.leaf_count() }
 
-    /// Helper: assert a coord is EMPTY in the tree.
-    fn assert_empty(t: &SparseOctree, coord: UVec3) {
-        assert_eq!(t.lookup(coord), Some(EMPTY_NODE), "expected EMPTY at {coord}");
-    }
-    /// Helper: assert a coord holds a leaf with the given slot id.
-    fn assert_leaf(t: &SparseOctree, coord: UVec3, slot: u32) {
+    /// Helper: assert a coord is EMPTY in the tree (works for LEAF or
+    /// BRICK encoding).
+    fn assert_empty(t: &SparseOctree, brick_pool: &BrickPool, coord: UVec3) {
         let node = t.lookup(coord).expect("in bounds");
-        assert!(is_leaf(node), "expected leaf at {coord}, got 0x{:08X}", node);
-        assert_eq!(leaf_slot(node), slot, "wrong slot at {coord}");
+        if node == EMPTY_NODE {
+            return;
+        }
+        if is_brick(node) {
+            let bid = brick_id(node);
+            let mask = BRICK_DIM - 1;
+            let cell = brick_pool.get_cell(bid, coord.x & mask, coord.y & mask, coord.z & mask);
+            assert_eq!(cell, BRICK_EMPTY, "expected BRICK_EMPTY at {coord}, got 0x{cell:08X}");
+            return;
+        }
+        panic!("expected EMPTY at {coord}, got 0x{node:08X}");
+    }
+
+    /// Helper: assert a coord holds a surface slot with the given id.
+    /// Resolves LEAF nodes directly and BRICK nodes via the brick pool.
+    fn assert_leaf(t: &SparseOctree, brick_pool: &BrickPool, coord: UVec3, slot: u32) {
+        let node = t.lookup(coord).expect("in bounds");
+        if is_leaf(node) {
+            assert_eq!(leaf_slot(node), slot, "wrong LEAF slot at {coord}");
+            return;
+        }
+        if is_brick(node) {
+            let bid = brick_id(node);
+            let mask = BRICK_DIM - 1;
+            let cell = brick_pool.get_cell(bid, coord.x & mask, coord.y & mask, coord.z & mask);
+            assert_eq!(cell, slot, "wrong BRICK cell slot at {coord}");
+            return;
+        }
+        panic!("expected surface slot at {coord}, got 0x{node:08X}");
     }
 
     /// Brush radius ≥ √3/2 covers a unit cell's diagonal — used to
     /// build brushes that surely include a particular cell center.
     const CELL_DIAG_HALF: f32 = 0.8660254; // > √3/2
 
+    /// Brick pool sized for the small synthetic trees in these tests.
+    /// Sculpt edits on depth-3 trees don't trigger brick materialization
+    /// (LEAFs live at finest depth, where mutate_at_finest handles them),
+    /// so the pool stays unused for most tests — present only because
+    /// `apply_delta` takes `&mut BrickPool` as a structural parameter.
+    fn fresh_pool() -> BrickPool { BrickPool::new(8) }
+
     #[test]
     fn carve_drops_matching_leaf() {
         // depth=3 → 8³ tree. One leaf at (4, 4, 4) with slot=42.
+        // (`insert` writes LEAF at finest depth; brick-aware mutate
+        // descends past brick_depth=1 and lands on the LEAF directly.)
         let mut t = one_leaf(3, UVec3::new(4, 4, 4), 42);
+        let mut pool = fresh_pool();
         assert_eq!(leaf_count(&t), 1);
 
         let op = BrushOp {
@@ -394,16 +462,17 @@ mod tests {
         assert_eq!(delta.count_removed(), 1);
         assert_eq!(delta.count_added(), 0);
 
-        let applied = apply_delta(&mut t, &delta, || panic!("no allocations expected"));
+        let applied = apply_delta(&mut t, &mut pool, &delta, || panic!("no allocations expected"));
         assert_eq!(applied.freed_slots, vec![42]);
         assert_eq!(leaf_count(&t), 0);
-        assert_empty(&t, UVec3::new(4, 4, 4));
+        assert_empty(&t, &pool, UVec3::new(4, 4, 4));
     }
 
     #[test]
     fn carve_misses_when_brush_outside() {
         // Brush far from the leaf — no edits.
         let mut t = one_leaf(3, UVec3::new(4, 4, 4), 42);
+        let mut pool = fresh_pool();
         let op = BrushOp {
             center: Vec3::new(0.5, 0.5, 0.5),
             radius: 1.0,
@@ -413,7 +482,7 @@ mod tests {
         };
         let delta = compute_brush_edits(&t, op);
         assert!(delta.is_empty());
-        let applied = apply_delta(&mut t, &delta, || panic!("no alloc"));
+        let applied = apply_delta(&mut t, &mut pool, &delta, || panic!("no alloc"));
         assert!(applied.allocated_slots.is_empty());
         assert!(applied.freed_slots.is_empty());
         assert_eq!(leaf_count(&t), 1);
@@ -445,15 +514,18 @@ mod tests {
         let delta = compute_brush_edits(&t, op);
         assert!(delta.is_empty(), "Phase 1 Carve emits no edits on pure-Interior cells");
 
-        let _ = apply_delta(&mut t, &delta, || panic!("no alloc"));
+        let _ = apply_delta(&mut t, &mut fresh_pool(), &delta, || panic!("no alloc"));
         // Tree is unchanged.
         assert_eq!(t.lookup(UVec3::new(2, 2, 2)), Some(INTERIOR_NODE));
     }
 
     #[test]
     fn raise_adds_into_empty() {
-        // depth=3 → 8³ tree, all EMPTY.
+        // depth=3 → 8³ tree, all EMPTY. brick_depth=1, so apply_delta's
+        // set_cell_solid will materialize a brick at level 1 covering
+        // (4..8, 4..8, 4..8) and write slot 100 into one of its cells.
         let mut t = SparseOctree::new(3, 1.0);
+        let mut pool = fresh_pool();
         let op = BrushOp {
             center: Vec3::new(4.5, 4.5, 4.5),
             radius: CELL_DIAG_HALF,
@@ -467,7 +539,7 @@ mod tests {
 
         // Allocator hands out monotonically increasing ids.
         let mut next = 100u32;
-        let applied = apply_delta(&mut t, &delta, || {
+        let applied = apply_delta(&mut t, &mut pool, &delta, || {
             let s = next;
             next += 1;
             s
@@ -480,9 +552,14 @@ mod tests {
         // falls back to +Y (see `brush_outward_normal`).
         assert!((attrs.normal - Vec3::Y).length() < 1e-6);
 
-        // The kernel did write the leaf into the tree.
-        assert_leaf(&t, UVec3::new(4, 4, 4), 100);
-        assert_eq!(leaf_count(&t), 1);
+        // The kernel wrote slot 100 into the BRICK cell that covers
+        // grid coord (4, 4, 4).
+        assert_leaf(&t, &pool, UVec3::new(4, 4, 4), 100);
+        // `leaf_count` counts LEAF terminators only — surface slots
+        // living inside BRICKs don't count. The "is there mass here"
+        // signal in the brick-encoded world is the BRICK terminator,
+        // not LEAF.
+        assert_eq!(leaf_count(&t), 0);
     }
 
     #[test]
@@ -490,6 +567,7 @@ mod tests {
         // The cell already has a surface leaf — Raise must not
         // overwrite it (sculpt is not paint).
         let mut t = one_leaf(3, UVec3::new(4, 4, 4), 42);
+        let mut pool = fresh_pool();
         let op = BrushOp {
             center: Vec3::new(4.5, 4.5, 4.5),
             radius: CELL_DIAG_HALF,
@@ -499,9 +577,9 @@ mod tests {
         };
         let delta = compute_brush_edits(&t, op);
         assert!(delta.is_empty());
-        let applied = apply_delta(&mut t, &delta, || panic!("no alloc"));
+        let applied = apply_delta(&mut t, &mut pool, &delta, || panic!("no alloc"));
         assert!(applied.allocated_slots.is_empty());
-        assert_leaf(&t, UVec3::new(4, 4, 4), 42);
+        assert_leaf(&t, &pool, UVec3::new(4, 4, 4), 42);
     }
 
     #[test]
@@ -541,7 +619,8 @@ mod tests {
         assert!(delta2.is_empty());
 
         // Sanity: applying empty delta leaves the tree untouched.
-        let applied = apply_delta(&mut t, &delta, || panic!());
+        let mut pool = fresh_pool();
+        let applied = apply_delta(&mut t, &mut pool, &delta, || panic!());
         assert!(applied.allocated_slots.is_empty());
     }
 
@@ -574,7 +653,8 @@ mod tests {
         assert!(n_removed > 0 && n_removed < total,
             "expected partial overlap, got {n_removed} of {total}");
 
-        let applied = apply_delta(&mut t, &delta, || panic!("no alloc"));
+        let mut pool = fresh_pool();
+        let applied = apply_delta(&mut t, &mut pool, &delta, || panic!("no alloc"));
         assert_eq!(applied.freed_slots.len(), n_removed);
         // The remaining leaf count matches.
         assert_eq!(leaf_count(&t), total - n_removed);
@@ -603,8 +683,9 @@ mod tests {
         assert_eq!(delta.count_removed(), 2);
         assert_eq!(delta.count_added(), 2);
 
+        let mut pool = fresh_pool();
         let mut next = 7000u32;
-        let applied = apply_delta(&mut t, &delta, || {
+        let applied = apply_delta(&mut t, &mut pool, &delta, || {
             let s = next; next += 1; s
         });
         assert_eq!(applied.allocated_slots.len(), 2);
@@ -614,14 +695,15 @@ mod tests {
         // New slots got allocated in delta order.
         assert_eq!(applied.allocated_slots[0].0, 7000);
         assert_eq!(applied.allocated_slots[1].0, 7001);
-        // Final state: rows swapped.
-        assert_empty(&t, UVec3::new(0, 0, 0));
-        assert_empty(&t, UVec3::new(1, 0, 0));
-        assert_leaf(&t, UVec3::new(0, 1, 0), 7000);
-        assert_leaf(&t, UVec3::new(1, 1, 0), 7001);
+        // Final state: rows swapped. Reading via the brick-aware
+        // helpers since Adds may have landed in a BRICK at brick_depth.
+        assert_empty(&t, &pool, UVec3::new(0, 0, 0));
+        assert_empty(&t, &pool, UVec3::new(1, 0, 0));
+        assert_leaf(&t, &pool, UVec3::new(0, 1, 0), 7000);
+        assert_leaf(&t, &pool, UVec3::new(1, 1, 0), 7001);
         // The untouched part of the row stayed.
-        assert_leaf(&t, UVec3::new(2, 0, 0), 1002);
-        assert_leaf(&t, UVec3::new(3, 0, 0), 1003);
+        assert_leaf(&t, &pool, UVec3::new(2, 0, 0), 1002);
+        assert_leaf(&t, &pool, UVec3::new(3, 0, 0), 1003);
     }
 
     #[test]

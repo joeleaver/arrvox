@@ -163,6 +163,16 @@ impl SparseOctree {
         if is_leaf(node) {
             return 1;
         }
+        if is_brick(node) {
+            // BRICK terminators don't carry LEAF nodes in `nodes[]`; the
+            // 64 cells live in the BrickPool. The caller-visible
+            // "leaf count" remains a count of LEAF terminators only —
+            // for an exhaustive surface-cell count, walk the brick pool
+            // directly. Matches the legacy semantics for shallow trees
+            // where bricks were disabled and every surface voxel was a
+            // LEAF.
+            return 0;
+        }
         let children_offset = node as usize;
         (0..8).map(|i| self.count_leaves(children_offset + i)).sum()
     }

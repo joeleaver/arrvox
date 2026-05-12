@@ -167,6 +167,13 @@ impl RkpSceneManager {
                     // reachable from tests / scripted commands.
                     leaves_add_skipped += 1;
                 }
+                LeafEditOp::Empty | LeafEditOp::SetInterior => {
+                    // R2b kernel variants — overlay path doesn't carry
+                    // ADD info or INTERIOR bulk semantics, so these
+                    // collapse to "no-op" for the legacy overlay. The
+                    // real-geometry mutation path (R2c → apply_delta)
+                    // will handle them properly.
+                }
             }
         }
 
