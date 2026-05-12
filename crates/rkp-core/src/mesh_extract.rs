@@ -336,55 +336,61 @@ pub fn extract_mesh_region_from_cells(
     let extent = 1i32 << octree_depth;
     let mut cube_vertex: HashMap<IVec3, u32> = HashMap::new();
 
-    for (&cell, _slot) in cells.iter() {
-        if cell.x < pad_min.x
-            || cell.x >= pad_max.x
-            || cell.y < pad_min.y
-            || cell.y >= pad_max.y
-            || cell.z < pad_min.z
-            || cell.z >= pad_max.z
-        {
-            continue;
-        }
-        for face in 0..6 {
-            let dir = FACE_DIRS[face];
-            let neighbor = cell + dir;
-            if cells.contains_key(&neighbor) {
-                continue;
-            }
-            if is_solid_lookup(
-                octree_nodes,
-                brick_cells,
-                octree_depth,
-                neighbor,
-                extent,
-            ) {
-                continue;
-            }
-            let cube_offsets = CUBE_OFFSETS_PER_FACE[face];
-            let mut quad = [0u32; 4];
-            for i in 0..4 {
-                let cube = cell + cube_offsets[i];
-                quad[i] = match cube_vertex.get(&cube) {
-                    Some(&v) => v,
-                    None => {
-                        let vertex = build_cube_vertex(
-                            cube,
-                            cells,
-                            base_voxel_size,
-                            grid_origin,
-                            leaf_attr_pool,
-                            bone_voxel_pool,
-                        );
-                        let vid = vertices.len() as u32;
-                        vertices.push(vertex);
-                        cube_vertex.insert(cube, vid);
-                        vid
+    // Iterate the region's bounding box with map lookups. Iterating
+    // `cells.iter()` + filtering by region was O(total cells in the
+    // asset) per region, which on a 6.5 M-cell asset and 81 dirty
+    // clusters per stamp was ~500 M filter checks (12 s wall on
+    // splat5). For a typical 10×10×10 region the new path is 1000
+    // lookups; for the union-with-brush region (first dirty cluster)
+    // it scales with the brush volume, not the asset.
+    for z in pad_min.z..pad_max.z {
+        for y in pad_min.y..pad_max.y {
+            for x in pad_min.x..pad_max.x {
+                let cell = IVec3::new(x, y, z);
+                if !cells.contains_key(&cell) {
+                    continue;
+                }
+                for face in 0..6 {
+                    let dir = FACE_DIRS[face];
+                    let neighbor = cell + dir;
+                    if cells.contains_key(&neighbor) {
+                        continue;
                     }
-                };
+                    if is_solid_lookup(
+                        octree_nodes,
+                        brick_cells,
+                        octree_depth,
+                        neighbor,
+                        extent,
+                    ) {
+                        continue;
+                    }
+                    let cube_offsets = CUBE_OFFSETS_PER_FACE[face];
+                    let mut quad = [0u32; 4];
+                    for i in 0..4 {
+                        let cube = cell + cube_offsets[i];
+                        quad[i] = match cube_vertex.get(&cube) {
+                            Some(&v) => v,
+                            None => {
+                                let vertex = build_cube_vertex(
+                                    cube,
+                                    cells,
+                                    base_voxel_size,
+                                    grid_origin,
+                                    leaf_attr_pool,
+                                    bone_voxel_pool,
+                                );
+                                let vid = vertices.len() as u32;
+                                vertices.push(vertex);
+                                cube_vertex.insert(cube, vid);
+                                vid
+                            }
+                        };
+                    }
+                    indices.extend([quad[0], quad[1], quad[2]]);
+                    indices.extend([quad[0], quad[2], quad[3]]);
+                }
             }
-            indices.extend([quad[0], quad[1], quad[2]]);
-            indices.extend([quad[0], quad[2], quad[3]]);
         }
     }
 

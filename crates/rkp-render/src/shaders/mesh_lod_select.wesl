@@ -201,22 +201,29 @@ fn lod_select(@builtin(global_invocation_id) gid: vec3<u32>) {
     let karis_admit = admit_parent && admit_self;
     let level_admit = (params.force_level != 0xFFFFFFFFu) && (c.lod_level == params.force_level);
 
-    // Phase B R4d — `lod_dirty` overrides the Karis rule for clusters
-    // whose chain has been touched by sculpt. Dirty LOD-0 leaves are
-    // force-admitted regardless of distance (otherwise far cameras
-    // would have no admit in the chain — LOD-1+ admits got skipped
-    // below). Dirty LOD>0 ancestors are stale (their geometry doesn't
-    // reflect the post-sculpt LOD-0 yet), so we drop them entirely
-    // and the LOD-0 force-admit picks up the slack.
-    let lod_dirty = (c.flags & CLUSTER_FLAG_LOD_DIRTY) != 0u;
-    let force_dirty_leaf = lod_dirty && cluster_is_leaf;
-    let drop_dirty_ancestor = lod_dirty && !cluster_is_leaf;
+    // Phase B R4d: the `CLUSTER_FLAG_LOD_DIRTY` bit is set by sculpt's
+    // per-cluster re-extract path on every cluster whose chain has been
+    // touched, but the *shader-side* response is intentionally a no-op
+    // in V1 — see the writeup in `rkp_scene_manager::sculpt` for why.
+    //
+    // The flag mechanism stays in tree so R5's async ancestor-rebuild
+    // path can reuse it without re-plumbing the GPU side: once R5
+    // refreshes a cluster's geometry, it clears the bit. Until R5
+    // ships, distant views of post-sculpt regions render the
+    // (now-stale) LOD>0 geometry; close-up views render the fresh
+    // LOD-0 leaves via the standard Karis rule.
+    //
+    // Previously this branch dropped dirty LOD>0 ancestors AND
+    // force-admitted dirty LOD-0 leaves. That created cluster-shaped
+    // holes wherever a dropped ancestor's chain held a non-brush
+    // LOD-0 leaf that couldn't admit at the user's camera distance
+    // (Karis says "let the ancestor admit," but the ancestor was
+    // dropped). The fix is to leave the admit rule alone — stale
+    // geometry is preferable to missing geometry.
 
-    let admit = !drop_dirty_ancestor
-        && (level_admit
-            || (params.force_admit != 0u)
-            || force_dirty_leaf
-            || (params.force_level == 0xFFFFFFFFu && karis_admit));
+    let admit = level_admit
+        || (params.force_admit != 0u)
+        || (params.force_level == 0xFFFFFFFFu && karis_admit);
 
     if (admit) {
         // Claim a compacted slot. All admitted threads atomicAdd 1

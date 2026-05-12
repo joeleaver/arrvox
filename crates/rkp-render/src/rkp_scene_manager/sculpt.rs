@@ -415,28 +415,34 @@ impl RkpSceneManager {
         };
 
         // Per-cluster re-extract loop. Iteration order: ascending
-        // cluster id (matches `dirty` from R3). The first dirty cluster
-        // gets the union with the brush grid AABB so newly-created
-        // cells outside all pre-stamp cluster AABBs are captured by
-        // exactly one cluster (vs duplicated across all dirty
-        // clusters, or dropped entirely).
-        let first_dirty = dirty[0];
+        // cluster id (matches `dirty` from R3).
+        //
+        // V1 limitation: each dirty cluster's region is bounded by its
+        // own pre-stamp grid AABB only. Cells the brush creates
+        // OUTSIDE all dirty clusters' AABBs (Raise extending past the
+        // original surface shell) get mutated in the octree but are
+        // not captured in any `ClusterMesh` — they're invisible in the
+        // rendered mesh until R5's re-clustering pass reaches them, or
+        // until a subsequent stamp puts those cells inside a now-
+        // expanded cluster AABB. Earlier R4c versions unioned the FIRST
+        // dirty cluster's region with the brush AABB to capture this
+        // case, but the first cluster's region then ballooned out to
+        // cover the whole brush volume + the cluster's original span,
+        // producing ~25× per-cluster vertex bloat on tightly-tiled
+        // ground-plane assets (135 k verts across 81 clusters in the
+        // 2026-05-12 splat5 test, 12 s wall). Trading correctness for
+        // Raise-past-boundary against drag-friendly perf is the right
+        // V1 call; R5 fixes both.
         let mut total_verts = 0usize;
         let mut total_indices = 0usize;
         for &cid in &dirty {
             let (region_min, region_max) = {
                 let Some(entry) = self.asset_cache.get(handle) else { return false; };
                 let cluster = entry.meshlet_clusters[cid as usize];
-                let (mut cmin, mut cmax) = cluster_grid_aabb(&cluster, grid_origin, base_vs);
+                let (cmin, mut cmax) = cluster_grid_aabb(&cluster, grid_origin, base_vs);
                 // `cluster_grid_aabb` returns inclusive bounds with 1-
                 // cell pad; convert to half-open by adding 1 to max.
                 cmax += IVec3::ONE;
-                if cid == first_dirty {
-                    // Union with brush AABB — captures Raise that
-                    // extends past existing cluster bounds.
-                    cmin = cmin.min(brush_lo);
-                    cmax = cmax.max(brush_hi);
-                }
                 (cmin, cmax)
             };
 
