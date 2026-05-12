@@ -199,16 +199,6 @@ pub(super) fn run_pre_frame(
     let assets_for_upload: &[rkp_render::rkp_gpu_object::RkpGpuAsset] = frame.gpu_assets.as_slice();
     let instances_for_upload: &[rkp_render::rkp_gpu_object::RkpGpuInstance] = gpu_instances;
 
-    // 1.7d. V1 mesh-path user-shader orchestration. Reads
-    //       `frame.painted_anchors`, dispatches per-material
-    //       compute trio (spawn_count → prefix_sum → fill) for
-    //       mesh-path shaders, and stages draw descriptors on
-    //       `state.user_shader_mesh_draws`. The renderer consumes
-    //       the draw set in the per-VR encode phase (task #7 — wired
-    //       to nothing yet, so the compute trio runs but no raster
-    //       draws happen).
-    tick_user_shader_mesh(state, frame);
-
     let p_t_mesh = pre_start.elapsed();
 
     // 1b. Per-frame upload. `gpu_instances` here may be interpolated
@@ -256,6 +246,14 @@ pub(super) fn run_pre_frame(
     );
 
     let p_t_upload_frame = pre_start.elapsed();
+
+    // V1 mesh-path user-shader orchestration. MUST run AFTER
+    // `upload_frame` — the compute trio's `spawn_alive` calls
+    // `paint_probe` which reads `instances[anchor.object_id]` and
+    // `assets[inst.asset_id]` from the scene bind group. Running
+    // before upload reads stale (or zero-init) data and rejects
+    // every spawn.
+    tick_user_shader_mesh(state, frame);
 
     // 1b''. Phase 7c — fire the GPU TLAS build. Inputs:
     //   * tile-cull scratch buffer (populated by Phase 6 tile-cull

@@ -38,26 +38,33 @@ const GBUFFER_PICK_FORMAT: wgpu::TextureFormat = GBUFFER_LEAF_SLOT_FORMAT;
 /// one per (entity × material × tile-coord) tuple whose material has
 /// a user shader registered against it. Tile size comes from the
 /// shader's `@tile_size` directive; without it, the whole entity's
-/// painted region for this material collapses into a single anchor
-/// (the tile cube falls back to the painted-leaf AABB).
+/// painted region for this material collapses into a single anchor.
 ///
-/// **Bounds are the tile cube**, not the painted-leaf AABB. Stable
-/// across paint additions inside the tile, so a hashed
-/// `mix(tile_min, tile_max, r)` blade position doesn't shift when
-/// the user paints more inside the same tile. The painted-leaf
-/// bounds are tracked separately for `surface_y` only.
+/// Two world-space AABBs travel together:
+///   - `tile_min` / `tile_max`: stable tile-cube bounds (`tile_coord ×
+///     tile_size`, world-transformed). Useful for spatial-extent or
+///     LOD queries that want the coarse cell.
+///   - `paint_min` / `paint_max`: actual painted-leaf bounding box
+///     (te.aabb world-transformed). Spawn placement uses these so
+///     blades land ON the painted area, not in the unpainted parts of
+///     the tile cube. Trade-off: this BB grows when paint extends
+///     within an existing tile, so blade positions shift. For typical
+///     "paint and leave" workflow this is invisible; for active drag-
+///     paint, blades drift slightly.
 ///
 /// Layout mirrors WGSL `AnchorContext` in `user_shader_mesh.wesl`:
 ///   offset  0..12  tile_min           vec3<f32>
 ///   offset 12..16  material_id        u32       (packs with vec3's tail)
 ///   offset 16..28  tile_max           vec3<f32>
 ///   offset 28..32  leaf_count         u32       (density signal)
-///   offset 32..36  object_id          u32
-///   offset 36..40  surface_y          f32       (blade base y; V1 = painted aabb.max.y)
-///   offset 40..44  seed               u32
-///   offset 44..64  _pad               5×u32
+///   offset 32..44  paint_min          vec3<f32>
+///   offset 44..48  object_id          u32
+///   offset 48..60  paint_max          vec3<f32>
+///   offset 60..64  surface_y          f32       (blade base y = paint_max.y in world)
+///   offset 64..68  seed               u32
+///   offset 68..80  _pad               3×u32
 ///
-/// 64 B total — aligns to 16 (WGSL std430). Field offsets asserted
+/// 80 B total — aligns to 16 (WGSL std430). Field offsets asserted
 /// at compile time.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
@@ -66,22 +73,26 @@ pub struct AnchorRecord {
     pub material_id: u32,
     pub tile_max: [f32; 3],
     pub leaf_count: u32,
+    pub paint_min: [f32; 3],
     pub object_id: u32,
+    pub paint_max: [f32; 3],
     pub surface_y: f32,
     pub seed: u32,
-    pub _pad: [u32; 5],
+    pub _pad: [u32; 3],
 }
 
-const _: () = assert!(std::mem::size_of::<AnchorRecord>() == 64);
+const _: () = assert!(std::mem::size_of::<AnchorRecord>() == 80);
 const _: () = {
     use std::mem::offset_of;
     assert!(offset_of!(AnchorRecord, tile_min) == 0);
     assert!(offset_of!(AnchorRecord, material_id) == 12);
     assert!(offset_of!(AnchorRecord, tile_max) == 16);
     assert!(offset_of!(AnchorRecord, leaf_count) == 28);
-    assert!(offset_of!(AnchorRecord, object_id) == 32);
-    assert!(offset_of!(AnchorRecord, surface_y) == 36);
-    assert!(offset_of!(AnchorRecord, seed) == 40);
+    assert!(offset_of!(AnchorRecord, paint_min) == 32);
+    assert!(offset_of!(AnchorRecord, object_id) == 44);
+    assert!(offset_of!(AnchorRecord, paint_max) == 48);
+    assert!(offset_of!(AnchorRecord, surface_y) == 60);
+    assert!(offset_of!(AnchorRecord, seed) == 64);
 };
 
 /// Per-frame engine uniforms uploaded once per render. Layout matches
@@ -246,7 +257,10 @@ pub struct UserShaderMeshDraw {
 }
 
 impl UserShaderMeshPass {
-    pub fn new(device: &wgpu::Device) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        scene_bind_group_layout: &wgpu::BindGroupLayout,
+    ) -> Self {
         let raster_g0_layout = device.create_bind_group_layout(
             &wgpu::BindGroupLayoutDescriptor {
                 label: Some("user_shader_mesh raster g0 (camera)"),
@@ -346,10 +360,19 @@ impl UserShaderMeshPass {
             },
         );
 
+        // Scene bind group lands at group(1) so the compute trio can
+        // call `paint_probe(world_pos, anchor)` from `spawn_alive` to
+        // descend the host octree + leaf-attr at the spawn position.
+        // All five compute pipelines share the layout, so the engine
+        // binds the scene group once per material's compute trio
+        // regardless of which entry point fires.
         let compute_pipeline_layout = device.create_pipeline_layout(
             &wgpu::PipelineLayoutDescriptor {
                 label: Some("user_shader_mesh compute pipeline layout"),
-                bind_group_layouts: &[Some(&compute_g0_layout)],
+                bind_group_layouts: &[
+                    Some(&compute_g0_layout),
+                    Some(scene_bind_group_layout),
+                ],
                 immediate_size: 0,
             },
         );
@@ -665,7 +688,7 @@ mod tests {
 
     #[test]
     fn anchor_record_layout() {
-        assert_eq!(std::mem::size_of::<AnchorRecord>(), 64);
+        assert_eq!(std::mem::size_of::<AnchorRecord>(), 80);
         assert_eq!(std::mem::align_of::<AnchorRecord>(), 4);
     }
 

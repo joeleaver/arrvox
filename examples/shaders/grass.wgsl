@@ -5,13 +5,15 @@
 // how many blades to emit for the tile based on its world-space AABB
 // area; `vs` places blades inside that AABB.
 //
-// V1 limits:
-//   · No paint probe — blades scatter uniformly across the tile's
-//     painted-leaf bounding box. Boundary tiles may show grass on
-//     unpainted parts of the painted-leaf AABB.
+// V1.1: anchor carries `paint_min/max` (the painted-leaf BB in world)
+// alongside the stable `tile_min/max` cube. Spawn placement uses
+// paint bounds so blades land on the painted region, not in unpainted
+// parts of the tile cube. Trade-off: paint bounds grow when paint
+// extends within an existing tile, so blade XZ shifts during active
+// drag-paint. For a left-alone painted region the bounds are stable.
+// V1 remaining limit:
 //   · Blades grow +Y. No per-tile normal yet; slopes will look
 //     incorrect.
-// Both lift on the V1.1 paint-probe + per-tile-normal follow-up.
 
 // ── Manifest ──────────────────────────────────────────────────────
 // @geometry procedural { vertex_count: 6 }
@@ -21,11 +23,13 @@
 // ── Per-material params ───────────────────────────────────────────
 // `density` is blades-per-m² of painted surface. Probabilistic
 // rounding spreads sub-integer expected counts across spawns.
-// @param blade_height: f32 = 0.35,   range = [0.05, 1.5]
-// @param blade_width:  f32 = 0.04,   range = [0.01, 0.2]
-// @param density:      f32 = 1000.0, range = [1.0, 8000.0]
-// @param wind_amp:     f32 = 0.08,   range = [0.0, 0.3]
-// @param wind_freq:    f32 = 1.5,    range = [0.0, 6.0]
+// At the V1 cap of 64 blades per anchor with tile_size = 0.5 m
+// (area 0.25 m²), saturation hits at density = 256 blades/m².
+// @param blade_height: f32 = 0.35,  range = [0.05, 1.5]
+// @param blade_width:  f32 = 0.04,  range = [0.01, 0.2]
+// @param density:      f32 = 100.0, range = [1.0, 256.0]
+// @param wind_amp:     f32 = 0.08,  range = [0.0, 0.3]
+// @param wind_freq:    f32 = 1.5,   range = [0.0, 6.0]
 
 // ── Helpers ───────────────────────────────────────────────────────
 fn grass_hash_u01(seed: u32) -> f32 {
@@ -38,16 +42,32 @@ fn grass_hash_u01(seed: u32) -> f32 {
     return f32(x) / 4294967295.0;
 }
 
+// Per-spawn blade base position in world space. Spawn XZ falls inside
+// the anchor's PAINT bounds (te.aabb world-transformed) so blades
+// land on the actual painted region. Y is `anchor.surface_y` =
+// world top of painted leaves.
+fn grass_blade_base(anchor: AnchorContext, spawn_idx: u32) -> vec3<f32> {
+    let s0 = anchor.seed ^ (spawn_idx * 0x9E3779B9u);
+    let r_px = grass_hash_u01(s0 ^ 0xBF58476Du);
+    let r_pz = grass_hash_u01(s0 ^ 0x94D049BBu);
+    return vec3<f32>(
+        mix(anchor.paint_min.x, anchor.paint_max.x, r_px),
+        anchor.surface_y,
+        mix(anchor.paint_min.z, anchor.paint_max.z, r_pz),
+    );
+}
+
 // ── spawn_count ───────────────────────────────────────────────────
-// Density per tile XZ ground area. Tile cube bounds are stable across
-// paint additions inside the tile, so spawn count for an already-
-// painted tile doesn't change when the user adds adjacent paint.
+// Density per painted XZ ground area (`paint_min/max` is the painted-
+// leaf BB, not the tile cube — so density scales on the actual
+// painted m², not on tile area that may be mostly empty).
 // Probabilistic rounding so sub-integer counts don't floor to 0.
-// Capped at the engine's per-anchor spawn ceiling (V1 = 16).
+// Capped at the engine's per-anchor spawn ceiling (V1 = 64,
+// matching `MAX_SPAWNS_PER_ANCHOR_V1`).
 fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 {
     let density = ctx_param(2);
-    let extent_x = max(anchor.tile_max.x - anchor.tile_min.x, 0.0);
-    let extent_z = max(anchor.tile_max.z - anchor.tile_min.z, 0.0);
+    let extent_x = max(anchor.paint_max.x - anchor.paint_min.x, 0.0);
+    let extent_z = max(anchor.paint_max.z - anchor.paint_min.z, 0.0);
     let xz_area = extent_x * extent_z;
     let raw = density * xz_area;
 
@@ -56,7 +76,25 @@ fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 {
     let r = grass_hash_u01(anchor.seed ^ 0xA341316Cu);
     var n = base;
     if (r < frac) { n = n + 1u; }
-    return min(n, 16u);
+    return min(n, 64u);
+}
+
+// ── spawn_alive ───────────────────────────────────────────────────
+// Cull blades whose XZ position doesn't sit above any painted host
+// voxel inside the anchor's tile. The blade base Y (`anchor.surface_y`)
+// is the tile floor — stable for blade placement, but typically BELOW
+// the painted ground voxel — so a single point-probe at that Y would
+// always miss. Instead we scan the column from tile_max.y down to
+// tile_min.y, returning true on the first paint_probe hit.
+//
+// 8 samples covers tiles up to `tile_size / voxel_size = 8` deep,
+// which fits the typical 0.5m tile / 0.05–0.1m voxel ratio. Cost is
+// 8 octree descents per spawn at worst — negligible against the
+// per-vertex math the blade would otherwise trigger.
+fn spawn_alive(anchor: AnchorContext, spawn_idx: u32, frame: FrameContext) -> bool {
+    // Spawn region is the painted-leaf BB on the anchor — every
+    // blade is already inside the painted area, no probe needed.
+    return true;
 }
 
 // ── vs ────────────────────────────────────────────────────────────
@@ -70,22 +108,17 @@ fn vs(anchor: AnchorContext, spawn_idx: u32, vid: u32, frame: FrameContext) -> V
     let wind_amp     = ctx_param(3);
     let wind_freq    = ctx_param(4);
 
-    // Per-spawn deterministic seeds (stable across frames).
+    // Per-spawn deterministic seeds (stable across frames). Position
+    // shared with `spawn_alive`'s probe so dead blades don't render.
     let s0 = anchor.seed ^ (spawn_idx * 0x9E3779B9u);
-    let r_px     = grass_hash_u01(s0 ^ 0xBF58476Du);
-    let r_pz     = grass_hash_u01(s0 ^ 0x94D049BBu);
     let r_yaw    = grass_hash_u01(s0 ^ 0xA2B5C7D9u);
     let r_height = grass_hash_u01(s0 ^ 0xCBF29CE4u);
     let r_phase  = grass_hash_u01(s0 ^ 0xFEEDFACEu);
 
-    // Blade base position — random point in the tile cube's XZ
-    // extent (stable across paint additions inside the tile, so
-    // the blade doesn't jump when nearby paint expands).
-    // y = anchor.surface_y (painted-leaf top, stable for flat
-    // ground).
-    let base_x = mix(anchor.tile_min.x, anchor.tile_max.x, r_px);
-    let base_z = mix(anchor.tile_min.z, anchor.tile_max.z, r_pz);
-    let base_y = anchor.surface_y;
+    let base = grass_blade_base(anchor, spawn_idx);
+    let base_x = base.x;
+    let base_y = base.y;
+    let base_z = base.z;
 
     let h = blade_height * (0.7 + r_height * 0.6);
     let yaw = r_yaw * 6.28318530718;

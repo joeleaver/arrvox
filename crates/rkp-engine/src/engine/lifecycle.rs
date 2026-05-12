@@ -376,18 +376,27 @@ impl EngineState {
                                 tile_local_max,
                                 entity_world,
                             );
-                            // Surface y = bottom of tile cube. Earlier
-                            // versions used `painted_aabb.max.y`,
-                            // which shifted when paint extended to a
-                            // new y level within the tile. Tile cube
-                            // bottom is determined purely by
-                            // tile_coord × tile_size, so it's stable
-                            // for a static entity even as paint
-                            // extends. For ground painted at the
-                            // tile-aligned bottom this is the surface
-                            // y; up to `tile_size` low otherwise (V1
-                            // approximation; paint-probe lifts this).
-                            let surface_y = tile_world_min.y;
+                            // Painted-leaf BB world bounds — actual
+                            // paint coverage in this tile (te.aabb is
+                            // the union of every painted leaf cell's
+                            // object-local AABB). The shader spawns
+                            // blades inside paint_min/max, so blades
+                            // land on the painted area instead of the
+                            // unpainted parts of the tile cube. This
+                            // BB grows when paint extends within the
+                            // tile (jitter on active paint; stable for
+                            // a left-alone painted region).
+                            let (paint_world_min, paint_world_max) = transform_aabb_to_world(
+                                te.aabb.min,
+                                te.aabb.max,
+                                entity_world,
+                            );
+                            // Surface y = top of painted leaves in
+                            // world. Blade base sits on this y so
+                            // blades grow up FROM the painted ground
+                            // (not from the tile-cube floor, which
+                            // could be tile_size below).
+                            let surface_y = paint_world_max.y;
                             // Stable seed: tile coord + material.
                             // Dropped `object_id` because `gpu_idx`
                             // can shuffle on `gpu_objects` rebuild
@@ -408,10 +417,12 @@ impl EngineState {
                                     material_id: mat as u32,
                                     tile_max: tile_world_max.to_array(),
                                     leaf_count: te.leaf_count,
+                                    paint_min: paint_world_min.to_array(),
                                     object_id,
+                                    paint_max: paint_world_max.to_array(),
                                     surface_y,
                                     seed,
-                                    _pad: [0; 5],
+                                    _pad: [0; 3],
                                 },
                             );
                         }

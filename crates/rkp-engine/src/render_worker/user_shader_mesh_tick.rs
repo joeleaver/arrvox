@@ -50,6 +50,13 @@ pub(super) struct MeshUserShaderMaterialState {
     pub params_buffer: wgpu::Buffer,
     pub dispatch_buffer: wgpu::Buffer,
     pub wg_sums_buffer: wgpu::Buffer,
+    /// Last per-material params snapshot we uploaded to
+    /// `params_buffer`. If the next frame's params for this material
+    /// differ, we force re-upload + compute trio rerun even when
+    /// `anchors_unchanged` would otherwise let us skip — otherwise
+    /// `@param` slider drags don't take effect on static painted
+    /// scenes. `None` until the first upload.
+    pub last_uploaded_params: Option<[f32; 8]>,
     pub compute_g0: wgpu::BindGroup,
     pub raster_g1: wgpu::BindGroup,
     /// V1 stats; updated each frame.
@@ -177,30 +184,45 @@ pub(super) fn tick_user_shader_mesh(state: &mut RenderState, frame: &RenderFrame
             bytemuck::bytes_of(&frame_uniforms),
         );
 
-        // Anchor data + params + dispatch + compute trio only run
-        // when the painted-anchor set changed. Steady-state painting
-        // pause → only the FrameUniforms write above + the draw
-        // emit below run.
-        if !anchors_unchanged {
-            let upload_slice = &anchors[..anchor_count as usize];
-            state.queue.write_buffer(
-                &mat_state.anchors_buffer,
-                0,
-                bytemuck::cast_slice(upload_slice),
-            );
+        // Per-material params change check — slider drags don't bump
+        // paint_epoch but DO change spawn_count behavior, so we have
+        // to re-run the compute trio on params change too. Without
+        // this, `anchors_unchanged` would freeze the cached spawn
+        // counts and the slider would be a no-op on a static painted
+        // scene.
+        let params = frame
+            .shader_params_slots
+            .get(material_id as usize)
+            .copied()
+            .unwrap_or([0.0; 8]);
+        let params_changed = mat_state
+            .last_uploaded_params
+            .map(|p| p != params)
+            .unwrap_or(true);
 
-            // Params — copy from the per-material shader_params_slots entry.
-            let params = frame
-                .shader_params_slots
-                .get(material_id as usize)
-                .copied()
-                .unwrap_or([0.0; 8]);
-            let params_uniform = UserShaderParams { p: params };
-            state.queue.write_buffer(
-                &mat_state.params_buffer,
-                0,
-                bytemuck::bytes_of(&params_uniform),
-            );
+        // Anchor data + params + dispatch + compute trio only run
+        // when the painted-anchor set OR the per-material params
+        // changed. Steady-state idle → only the FrameUniforms write
+        // above + the draw emit below run.
+        if !anchors_unchanged || params_changed {
+            if !anchors_unchanged {
+                let upload_slice = &anchors[..anchor_count as usize];
+                state.queue.write_buffer(
+                    &mat_state.anchors_buffer,
+                    0,
+                    bytemuck::cast_slice(upload_slice),
+                );
+            }
+
+            if params_changed {
+                let params_uniform = UserShaderParams { p: params };
+                state.queue.write_buffer(
+                    &mat_state.params_buffer,
+                    0,
+                    bytemuck::bytes_of(&params_uniform),
+                );
+                mat_state.last_uploaded_params = Some(params);
+            }
 
             // DispatchInfo — current anchor count + verts-per-spawn.
             let dispatch_info = DispatchInfo {
@@ -233,6 +255,23 @@ pub(super) fn tick_user_shader_mesh(state: &mut RenderState, frame: &RenderFrame
                         "user_shader_mesh material {material_id} compute"
                     )),
                 });
+            // Scene bind group lands at group(1) so `paint_probe` from
+            // `spawn_alive` can descend the host octree. The bind group
+            // is identical across VRs except for the camera at binding
+            // 3 (which compute doesn't read); MAIN's is canonical.
+            let scene_bg = state
+                .viewport_renderers
+                .get(&crate::viewport::ViewportId::MAIN)
+                .or_else(|| state.viewport_renderers.values().next())
+                .map(|vr| vr.scene_bind_group.clone());
+            let Some(scene_bg) = scene_bg else {
+                // No VR yet — skip the compute trio this frame; the
+                // anchors haven't moved, so the indirect draw will
+                // re-use stale results (one-frame visual flicker is
+                // acceptable here since this path only fires at startup
+                // before the first VR exists).
+                continue;
+            };
             let wg_x_64 = anchor_count.div_ceil(64).max(1);
             let wg_x_256 = anchor_count.div_ceil(256).max(1);
             for (label, pipeline, wgs) in [
@@ -247,6 +286,7 @@ pub(super) fn tick_user_shader_mesh(state: &mut RenderState, frame: &RenderFrame
                     timestamp_writes: None,
                 });
                 pass.set_bind_group(0, &mat_state.compute_g0, &[]);
+                pass.set_bind_group(1, &scene_bg, &[]);
                 pass.set_pipeline(pipeline);
                 pass.dispatch_workgroups(wgs, 1, 1);
             }
@@ -389,6 +429,7 @@ fn build_material_state(
         params_buffer,
         dispatch_buffer,
         wg_sums_buffer,
+        last_uploaded_params: None,
         compute_g0,
         raster_g1,
         last_anchor_count: 0,

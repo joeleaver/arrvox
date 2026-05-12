@@ -30,7 +30,7 @@
 //     materializes `instance_records[offset+k] = (anchor_idx, k)` or
 //     `(ANCHOR_IDX_DEAD, 0)` for dead spawns.
 //
-// Bindings (single group, all passes share the same data):
+// Bindings:
 //   @group(0) @binding(0)  anchors              (storage, read)
 //   @group(0) @binding(1)  out_counts           (storage, read_write)
 //   @group(0) @binding(2)  out_offsets          (storage, read_write)
@@ -40,24 +40,48 @@
 //   @group(0) @binding(6)  params               (uniform)
 //   @group(0) @binding(7)  dispatch             (uniform)
 //   @group(0) @binding(8)  wg_sums              (storage, read_write)
+//
+// Group 1 = scene (RkpScene::bind_group_layout). Lets `paint_probe`
+// from `spawn_alive` descend the host octree at the spawn position
+// to cull blades whose tile-cube position lands on unpainted host
+// voxels (tile-fringe culling).
+
+import package::lib::types::RkpInstance;
+import package::lib::types::RkpAsset;
+import package::lib::types::OverlayEntry;
+import package::lib::types::LeafAttr;
+import package::lib::octree::octree_lookup;
+import package::lib::octree::PHASE_SHADOW;
+import package::lib::octree_slot::slot_is_brick;
+import package::lib::octree_slot::slot_brick_id;
+import package::lib::octree_slot::OCTREE_EMPTY;
+import package::lib::octree_slot::OCTREE_INTERIOR;
+import package::lib::brick::BRICK_DIM;
+import package::lib::brick::BRICK_DIM_F;
+import package::lib::brick::BRICK_CELLS;
+import package::lib::brick::BRICK_CELL_EMPTY;
+import package::lib::brick::BRICK_CELL_INTERIOR;
+import package::lib::math::mat4_affine_inverse;
+import package::lib::leaf_attr::fetch_leaf_attr_for;
 
 const ANCHOR_IDX_DEAD: u32 = 0xFFFFFFFFu;
 const PREFIX_SUM_WG_SIZE: u32 = 256u;
 const PREFIX_SUM_MAX_WG_COUNT: u32 = 32u;
 
 // Layout mirrors `rkp_render::user_shader_mesh_pass::AnchorRecord`.
-// The trailing `_pad` makes the WGSL struct size match Rust's 64 B
-// — without it, naga rounds the natural size (44 B → 48 B) and the
-// `array<AnchorContext>` stride diverges from the CPU upload.
+// 80 B std430. Trailing `_pad` keeps the WGSL struct size matching
+// Rust — without it the array stride diverges from the CPU upload.
 struct AnchorContext {
     tile_min:        vec3<f32>,
     material_id:     u32,
     tile_max:        vec3<f32>,
     leaf_count:      u32,
+    paint_min:       vec3<f32>,
     object_id:       u32,
+    paint_max:       vec3<f32>,
     surface_y:       f32,
     seed:            u32,
-    _pad:            array<u32, 5>,
+    _pad:            array<u32, 3>,
 }
 
 struct FrameContext {
@@ -106,6 +130,117 @@ struct DispatchInfo {
 @group(0) @binding(6) var<uniform>             params:         UserParams;
 @group(0) @binding(7) var<uniform>             dispatch:       DispatchInfo;
 @group(0) @binding(8) var<storage, read_write> wg_sums:        array<u32>;
+
+// Scene group — same layout RkpScene::create_layout exposes.
+// Names locked to what `lib::octree` / `lib::leaf_attr` reference as
+// free symbols; binding numbers locked to RkpScene's slots.
+@group(1) @binding(0)  var<storage, read> brick_pool:       array<u32>;
+@group(1) @binding(1)  var<storage, read> octree_nodes:     array<vec4<u32>>;
+@group(1) @binding(2)  var<storage, read> instances:        array<RkpInstance>;
+// WESL splices an entire module on any import from it, so unused
+// helpers (descend_proto_octree, fetch_leaf_color_for) reference
+// these bindings as free names even though paint_probe never
+// calls them. Declare so naga can resolve.
+@group(1) @binding(4)  var<storage, read> color_pool_data:  array<u32>;
+@group(1) @binding(7)  var<storage, read> brick_face_links: array<u32>;
+@group(1) @binding(8)  var<storage, read> leaf_attr_pool:   array<LeafAttr>;
+@group(1) @binding(12) var<storage, read> assets:           array<RkpAsset>;
+@group(1) @binding(13) var<storage, read> instance_overlay: array<OverlayEntry>;
+
+// `octree_lookup` reads `bucket_depth` + `bucket_lod_exit` as free
+// names. We have no `stats` binding, so they're no-ops.
+fn bucket_depth(phase: u32, level: u32) {}
+fn bucket_lod_exit(level: u32) {}
+
+// Walk the host octree at `world_pos` for `anchor.object_id` and
+// return true iff the resolved leaf carries `anchor.material_id`.
+// Used by `spawn_alive` to cull blades whose tile-cube position
+// lands on unpainted host voxels (the "tile fringe" V1 limit).
+//
+// Cost per call: 1 instance read, 1 asset read, 1 affine inverse
+// (~30 ops), 1 octree descent (4-7 levels typical), 1 brick cell
+// read on brick leaves, overlay binary search if the leaf is
+// painted. Net cost is paid per spawn, not per fragment, so
+// fewer-but-correct blades are cheaper downstream than the old
+// "fill the cube" behavior.
+fn paint_probe(world_pos: vec3<f32>, anchor: AnchorContext) -> bool {
+    let inst = instances[anchor.object_id];
+    let asset = assets[inst.asset_id];
+
+    let inv_world = mat4_affine_inverse(inst.world);
+    let local_pos = (inv_world * vec4<f32>(world_pos, 1.0)).xyz;
+    // Octree coords ARE object-local-world-units centered on
+    // grid_origin (NOT divided by voxel_size). `extent` and the
+    // per-level `half` walked by octree_lookup are world-scale.
+    // See octree_march.wesl line ~778: `oc_origin = local_origin -
+    // asset.grid_origin`.
+    let oc_pos = local_pos - asset.grid_origin;
+
+    let extent = bitcast<f32>(asset.octree_extent_bits);
+    if (oc_pos.x < 0.0 || oc_pos.y < 0.0 || oc_pos.z < 0.0
+        || oc_pos.x >= extent || oc_pos.y >= extent || oc_pos.z >= extent) {
+        return false;
+    }
+
+    // Static lookup. Per the lib comment in octree.wesl, callers
+    // without a meaningful ray pass `(vec3(0), vec3(1))` to disable
+    // the per-node tight-AABB cull — otherwise oc_pos is treated as
+    // a ray origin and the cull rejects when the cell's tight
+    // content sits "behind" the ray. lod_enabled = 0 skips the LOD
+    // branch (irrelevant for a probe).
+    let lookup = octree_lookup(
+        asset.octree_root,
+        asset.octree_depth,
+        extent,
+        oc_pos,
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+        PHASE_SHADOW,
+        0u,
+        0.0,
+        1.0,
+        1.0,
+    );
+
+    if (lookup.slot == OCTREE_EMPTY) { return false; }
+    // Interior bulk regions don't carry per-cell leaf data and can't
+    // be paint targets — treat as not painted.
+    if (lookup.slot == OCTREE_INTERIOR) { return false; }
+
+    var leaf_slot: u32;
+    if (slot_is_brick(lookup.slot)) {
+        let brick_id = slot_brick_id(lookup.slot);
+        let cell_size = (lookup.cell_half * 2.0) / BRICK_DIM_F;
+        let brick_origin = lookup.cell_center - vec3<f32>(lookup.cell_half);
+        let local = (oc_pos - brick_origin) / cell_size;
+        let cell = clamp(
+            vec3<i32>(floor(local)),
+            vec3<i32>(0),
+            vec3<i32>(3),
+        );
+        let flat = u32(cell.x)
+            + u32(cell.y) * BRICK_DIM
+            + u32(cell.z) * BRICK_DIM * BRICK_DIM;
+        let c = brick_pool[brick_id * BRICK_CELLS + flat];
+        if (c == BRICK_CELL_EMPTY || c == BRICK_CELL_INTERIOR) {
+            return false;
+        }
+        leaf_slot = c;
+    } else {
+        leaf_slot = lookup.slot;
+    }
+
+    let attr = fetch_leaf_attr_for(inst, leaf_slot);
+    let primary = attr.material_packed & 0xFFFFu;
+    let secondary = (attr.material_packed >> 16u) & 0x0FFFu;
+    let blend = (attr.material_packed >> 28u) & 0xFu;
+    if (primary == anchor.material_id) { return true; }
+    // Secondary only counts when blend dial is at the high end —
+    // matches the editor's "secondary dominates if blend ≥ 12/15"
+    // visual cue.
+    if (blend >= 12u && secondary == anchor.material_id) { return true; }
+    return false;
+}
 
 fn ctx_param(i: u32) -> f32 {
     let v = params.p[i >> 2u];

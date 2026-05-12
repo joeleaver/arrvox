@@ -53,24 +53,24 @@ const USER_SHADER_PICK_SENTINEL: u32 = 0xFFFFFFFEu;
 // triangle.
 const ANCHOR_IDX_DEAD: u32 = 0xFFFFFFFFu;
 
-// One painted *tile* — the world-space AABB of every painted leaf
-// inside this tile (tight bounds, not the tile cube) plus enough
-// shading context to drive `vs`. Layout must match
-// `rkp_render::user_shader_mesh_pass::AnchorRecord` (CPU side).
-// 64 B; std430 packing.
-// Layout mirrors `rkp_render::user_shader_mesh_pass::AnchorRecord`.
-// The trailing `_pad` makes the WGSL struct size match Rust's 64 B
-// — without it, naga rounds the natural size (44 B → 48 B) and the
-// `array<AnchorContext>` stride diverges from the CPU upload.
+// One painted *tile* — see `AnchorRecord` doc for the field semantics.
+// Two BBs travel together: tile_min/max (stable tile cube) and
+// paint_min/max (actual painted-leaf BB; spawn region). Layout must
+// match `rkp_render::user_shader_mesh_pass::AnchorRecord` (CPU side).
+// 80 B; std430 packing. Trailing `_pad` keeps the WGSL struct size
+// matching Rust — without it, the array<AnchorContext> stride
+// diverges from the CPU upload.
 struct AnchorContext {
     tile_min:        vec3<f32>,
     material_id:     u32,
     tile_max:        vec3<f32>,
     leaf_count:      u32,
+    paint_min:       vec3<f32>,
     object_id:       u32,
+    paint_max:       vec3<f32>,
     surface_y:       f32,
     seed:            u32,
-    _pad:            array<u32, 5>,
+    _pad:            array<u32, 3>,
 }
 
 // Per-frame engine uniforms. User shaders subscribe to these via

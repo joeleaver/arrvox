@@ -265,7 +265,10 @@ impl RkpRenderer {
             crate::mesh_lod_select_pass::MeshLodSelectPass::new(device, &splat_pass.g1_layout);
         let splat_resolve = SplatResolvePass::new(device);
         let mesh_proxy = crate::mesh_proxy_pass::MeshProxyPass::new(device);
-        let user_shader_mesh = crate::user_shader_mesh_pass::UserShaderMeshPass::new(device);
+        let user_shader_mesh = crate::user_shader_mesh_pass::UserShaderMeshPass::new(
+            device,
+            &scene.bind_group_layout,
+        );
         let brush_state = crate::brush_state_pass::BrushStatePass::new(device);
         let primary_mode = PrimaryMode::from_env();
         eprintln!("[RkpRenderer] primary_mode = {primary_mode:?}");
