@@ -169,6 +169,30 @@ pub(super) fn run_pre_frame(
         // not. Worst case: we re-upload next frame, which is fine.
         state.last_uploaded_geometry_epoch = sm.geometry_epoch();
         drop(sm);
+
+        // Invalidate cached `mesh_lod_select_g2_bgs` (and shadow
+        // counterparts) across every viewport. The g2 bind groups
+        // hold references to the per-asset cluster table buffer; if
+        // the cluster table was replaced for any asset above, the
+        // cached BG still points at the dropped buffer and the
+        // compute pass reads stale cluster data — admit fails on
+        // every cluster and the asset's geometry vanishes from the
+        // frame. The freshness key in viewport_renderer
+        // (asset_handle_raw, args_capacity) doesn't catch this case,
+        // so wipe every cached g2 BG on geometry-epoch bumps. The
+        // first draw of the new frame will re-create them against
+        // the live buffer slot. Cost: O(viewports × draw_slots)
+        // small Option writes, sub-millisecond.
+        for vr in state.viewport_renderers.values_mut() {
+            for slot in vr.mesh_lod_select_g2_bgs.iter_mut() {
+                *slot = None;
+            }
+            for per_slot in vr.mesh_lod_shadow_g2_bgs.iter_mut() {
+                for per_cascade in per_slot.iter_mut() {
+                    *per_cascade = None;
+                }
+            }
+        }
     }
 
     // 1.5. Phase 3 — paint mutations land in per-instance overlays
