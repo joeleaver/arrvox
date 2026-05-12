@@ -878,24 +878,32 @@ impl EngineState {
             // bits — radius, color, the selected entity's
             // `gpu_idx` for the per-pixel selection-lock gate.
             let mut brush_pixel: Option<(u32, u32)> = None;
-            if viewport_id == ViewportId::MAIN && self.paint_mode_active {
+            // Paint and sculpt share the cursor visualization. Mutually
+            // exclusive — the editor's toggle handlers guarantee at most
+            // one is active. Sculpt uses a teal rim to distinguish it
+            // from paint's warm yellow.
+            let (active, radius, color): (bool, f32, [f32; 4]) =
+                if viewport_id == ViewportId::MAIN && self.paint_mode_active {
+                    (true, self.paint_mode_radius, [1.0, 0.85, 0.2, 1.0])
+                } else if viewport_id == ViewportId::MAIN && self.sculpt_mode_active {
+                    (true, self.sculpt_mode_radius, [0.2, 0.85, 0.85, 1.0])
+                } else {
+                    (false, 0.0, [0.0; 4])
+                };
+            if active {
                 shade_params_vr.brush_active = 1;
-                shade_params_vr.brush_radius = self.paint_mode_radius;
-                // Color: warm yellow rim — distinct from the light-
-                // gizmo yellow the sphere placeholder used. Alpha
-                // channel reserved; the shader does its own alpha.
-                shade_params_vr.brush_color = [1.0, 0.85, 0.2, 1.0];
-                // Selection-lock: only paint on the selected entity.
-                // `u32::MAX` keeps the cursor hidden while nothing is
-                // selected (the per-pixel match never fires).
+                shade_params_vr.brush_radius = radius;
+                shade_params_vr.brush_color = color;
+                // Selection-lock: only paint/sculpt on the selected
+                // entity. `u32::MAX` keeps the cursor hidden while
+                // nothing is selected.
                 shade_params_vr.brush_object_id = self
                     .selected_entity
                     .and_then(|e| self.entity_to_gpu.get(&e).copied())
                     .map(|i| i as u32)
                     .unwrap_or(u32::MAX);
                 // Probe at the live mouse pixel iff the cursor is
-                // inside the framebuffer. Otherwise leave `None` and
-                // the probe pass will write the miss sentinel.
+                // inside the framebuffer.
                 let mx = self.mouse_pos.x;
                 let my = self.mouse_pos.y;
                 if mx >= 0.0 && my >= 0.0 && (mx as u32) < vp_w && (my as u32) < vp_h {

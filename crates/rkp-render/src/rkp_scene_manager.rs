@@ -24,11 +24,13 @@
 mod asset_load;
 mod manager;
 mod paint;
+mod sculpt;
 mod types;
 mod voxelize;
 
 // Public re-exports — keep `rkp_render::rkp_scene_manager::Foo` stable.
 pub use manager::{RkpSceneManager, WalkSnapshot};
+pub use sculpt::SculptApplyResult;
 pub use types::{
     AssetHandle, AssetInfo, FaceInstance, ReloadResult, SkinBrick, SkinningAssetData,
     VoxelizeResult,

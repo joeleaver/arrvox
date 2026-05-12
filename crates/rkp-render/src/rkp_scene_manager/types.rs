@@ -149,6 +149,12 @@ pub(super) struct AssetEntry {
     /// threshold (~lod + 1), retiring the previously-dormant voxel-
     /// LOD shadow mesh.
     pub(super) meshlet_clusters: Vec<crate::mesh_pass::MeshletCluster>,
+    /// CPU-side mirror of the asset's octree, retained after upload so
+    /// runtime sculpt can mutate it without round-tripping the GPU. Same
+    /// node buffer the load path built and uploaded; not memory-cheap on
+    /// big assets (~4 B per node + parallel prefilter index), but mesh-
+    /// mode sculpt edits can't reconstruct it from the cluster DAG.
+    pub(super) cpu_octree: SparseOctree,
 }
 
 impl AssetEntry {

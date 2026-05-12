@@ -704,6 +704,7 @@ impl RkpSceneManager {
             mesh_indices,
             mesh_lod0_index_count,
             meshlet_clusters,
+            cpu_octree: tree,
         })
     }
 

@@ -75,26 +75,115 @@ impl EngineState {
             return 0;
         }
 
-        // ── Entity must have an octree (asset-backed Renderable) ──
-        let has_octree = self
-            .world
-            .get::<&Renderable>(entity)
-            .ok()
-            .and_then(|r| r.spatial.as_ref().and_then(|g| g.as_octree()).map(|_| ()))
-            .is_some();
-        if !has_octree {
+        // ── Entity must be asset-backed (octree + asset_handle). ─
+        let (asset_handle, entity_world) = {
+            let renderable = match self.world.get::<&Renderable>(entity) {
+                Ok(r) => r,
+                Err(_) => return 0,
+            };
+            let Some(handle) = renderable.asset_handle else {
+                // Procedurally-baked voxels carry a SpatialData but no
+                // AssetHandle. Sculpt is asset-only for V1 (procedural
+                // mutation belongs in the procedural tree, not the
+                // post-bake octree).
+                return 0;
+            };
+            if renderable.spatial.as_ref().and_then(|g| g.as_octree()).is_none() {
+                return 0;
+            }
+            let transform = match self.world.get::<&crate::components::Transform>(entity) {
+                Ok(t) => t,
+                Err(_) => return 0,
+            };
+            let entity_world = glam::Affine3A::from_scale_rotation_translation(
+                transform.scale,
+                glam::Quat::from_euler(
+                    glam::EulerRot::XYZ,
+                    transform.rotation.x.to_radians(),
+                    transform.rotation.y.to_radians(),
+                    transform.rotation.z.to_radians(),
+                ),
+                transform.position,
+            );
+            (handle, entity_world)
+        };
+
+        // ── Engine enum → core enum. Smooth / Flatten are V2 — bail
+        // with a warning until those land.
+        let brush_mode = match mode {
+            SculptMode::Raise => rkp_core::sculpt::BrushMode::Raise,
+            SculptMode::Carve => rkp_core::sculpt::BrushMode::Carve,
+            SculptMode::Smooth | SculptMode::Flatten => {
+                self.console.warn(format!(
+                    "Sculpt mode {mode:?} not implemented yet — Raise / Carve only in V1.",
+                ));
+                return 0;
+            }
+        };
+
+        // ── Mutate the asset's octree + GPU buffers under the lock. ─
+        let result = {
+            let mut scene = self.scene_mgr.lock().expect("scene_mgr poisoned");
+            scene.apply_sculpt_brush(
+                asset_handle,
+                world_pos,
+                entity_world,
+                radius,
+                falloff,
+                brush_mode,
+                material_id,
+            )
+        };
+
+        let Some(result) = result else {
+            // No edits — brush outside, or every cell under the brush
+            // was Interior / unchanged (Phase 1 semantics).
             return 0;
+        };
+
+        // ── Refresh the entity's cached Renderable.spatial with the
+        // new GPU octree handle + leaf-attr range. Without this the
+        // shader keeps reading the deallocated old octree slot range,
+        // which is a vivid "rendering goes black / wrong" bug.
+        {
+            use rkp_core::scene_node::SpatialHandle;
+            use crate::components::{RenderGeometry, SpatialData};
+            if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
+                let info = &result.new_info;
+                if let SpatialHandle::Octree { root_offset, len, depth, base_voxel_size } = info.spatial {
+                    let extent = (1u32 << depth) as f32 * base_voxel_size;
+                    let aabb_center = (info.aabb.min + info.aabb.max) * 0.5;
+                    let grid_origin = aabb_center - glam::Vec3::splat(extent * 0.5);
+                    renderable.spatial = Some(RenderGeometry::Octree(SpatialData {
+                        root_offset,
+                        len,
+                        depth,
+                        base_voxel_size,
+                        aabb: info.aabb,
+                        voxel_size: info.voxel_size,
+                        grid_origin,
+                        voxel_slot_start: info.leaf_attr_slot_start,
+                        voxel_slot_count: info.leaf_attr_slot_count,
+                        brick_ids: Vec::new(),
+                    }));
+                    renderable.voxel_count = info.voxel_count;
+                }
+            }
         }
 
-        // Phase 0: log the op so manual tests can confirm the wiring
-        // end-to-end. Phase 1 replaces this body with actual mutation.
+        // Force the next tick to rebuild gpu_instances so the new
+        // spatial handle propagates into RkpGpuInstance.
+        self.gpu_objects_dirty = true;
+        // Mark this entity's painted-material cache stale — slot ids
+        // moved, the walk needs to re-scan.
+        self.painted_dirty_entities.insert(entity);
+
         eprintln!(
-            "[sculpt] stub stamp entity={:?} pos=({:.3}, {:.3}, {:.3}) \
-             radius={:.3} falloff={:.3} mode={:?} material={}",
-            entity, world_pos.x, world_pos.y, world_pos.z,
-            radius, falloff, mode, material_id,
+            "[sculpt] stamp entity={:?} added={} removed={}",
+            entity, result.leaves_added, result.leaves_removed,
         );
-        1
+
+        result.leaves_added + result.leaves_removed
     }
 }
 
