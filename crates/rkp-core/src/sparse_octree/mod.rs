@@ -27,6 +27,7 @@ use glam::UVec3;
 use crate::brick_map::{BrickMap, EMPTY_SLOT, INTERIOR_SLOT};
 
 mod insert;
+mod mutate;
 mod optimize;
 mod query;
 
