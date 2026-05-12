@@ -472,13 +472,24 @@ fn sculpt_mode_row(
                     border:1px solid #3c3c3c;padding:2px;\
                     backdrop-filter:blur(8px);",
 
-            {gizmo_button(
-                __scope,
-                TablerIcon::Plus,
-                "Raise — add geometry (clay) under the brush",
-                Memo::new(move || store.sculpt_mode.get() == SculptMode::Raise),
-                move || store.sculpt_mode.set(SculptMode::Raise),
-            )}
+            // Phase A: Raise disabled — Carve maps to the overlay (drop
+            // an existing leaf_attr_id into the per-instance set), but
+            // Raise needs new geometry that doesn't exist yet. Phase B
+            // will add per-added-leaf proxy splats / cluster re-bake.
+            // Until then the button is greyed out + tooltipped to
+            // explain.
+            div {
+                style: "width:28px;height:28px;display:flex;align-items:center;\
+                        justify-content:center;border-radius:4px;\
+                        color:#555;background:transparent;\
+                        cursor:not-allowed;opacity:0.55;",
+                title: "Raise — disabled (requires Phase B: new geometry)",
+                span {
+                    style: "width:18px;height:18px;display:inline-flex;\
+                            align-items:center;justify-content:center;",
+                    {render_tabler_icon(__scope, TablerIcon::Plus, TablerIconStyle::Outline)}
+                }
+            }
             {gizmo_button(
                 __scope,
                 TablerIcon::Minus,

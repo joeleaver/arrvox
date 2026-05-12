@@ -130,6 +130,13 @@ impl SplatResolvePass {
                 // through to the asset's pool. Mesh-mode paint
                 // visibility depends on this binding.
                 wgpu::BindGroupLayoutEntry { binding: 7, ..storage_ro },
+                // 8 = instance_sculpt. Required because `lib::leaf_attr`
+                // now also exports `is_leaf_removed` which references
+                // `instance_sculpt` as a free name; the composer
+                // (`use_stripping(false)`) pulls the whole module in,
+                // so the binding has to be declared even if the
+                // resolve doesn't itself call `is_leaf_removed`.
+                wgpu::BindGroupLayoutEntry { binding: 8, ..storage_ro },
             ],
         });
 
@@ -197,6 +204,7 @@ impl SplatResolvePass {
         brick_pool_buffer: &wgpu::Buffer,
         brick_face_links_buffer: &wgpu::Buffer,
         instance_overlay_buffer: &wgpu::Buffer,
+        instance_sculpt_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("splat_resolve g1 bg"),
@@ -210,6 +218,7 @@ impl SplatResolvePass {
                 wgpu::BindGroupEntry { binding: 5, resource: brick_pool_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: brick_face_links_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: instance_overlay_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: instance_sculpt_buffer.as_entire_binding() },
             ],
         })
     }

@@ -29,6 +29,7 @@ import package::lib::types::OctreeResult;
 import package::lib::oct_normal::pack_oct_normal;
 import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::leaf_attr::fetch_leaf_attr_for;
+import package::lib::leaf_attr::is_leaf_removed;
 import package::lib::octree::octree_lookup;
 import package::lib::octree::PHASE_MARCH;
 import package::lib::octree_slot::OCTREE_EMPTY;
@@ -106,6 +107,10 @@ struct DualQuat {
 // (`use_stripping(false)`) pulls it in, so the binding has to be
 // declared. naga DCE drops the unused reads from compiled SPIR-V.
 @group(2) @binding(9) var<storage, read> brick_face_links: array<u32>;
+// Per-instance sculpt-carve overlay (Phase A). `is_leaf_removed`
+// discards glass fragments belonging to carved leaves so they
+// neither block primary visibility nor write into `gbuf_glass`.
+@group(2) @binding(10) var<storage, read> instance_sculpt: array<u32>;
 
 // `octree_lookup` calls `bucket_depth` / `bucket_lod_exit` by free
 // name; this pass has no stats binding so the stubs stay no-ops. The
@@ -386,6 +391,7 @@ fn frag_front(in: VsOut) -> FsFront {
     // to the per-vertex interpolated normal if the descent fails
     // (cell outside the brick neighborhood, etc.).
     let inst = instances[instance.object_id];
+    if is_leaf_removed(inst, in.leaf_attr_id) { discard; }
     let asset = assets[inst.asset_id];
     let oc_pos = in.local_rest_pos - asset.grid_origin;
     let resolved_slot = lookup_cell_at(asset, oc_pos, in.local_normal);
@@ -427,6 +433,9 @@ struct FsBack {
 fn frag_back(in: VsOut) -> FsBack {
     let cls = classify_glass(in.leaf_attr_id);
     if cls.material_id == 0xFFFFFFFFu { discard; }
+
+    let inst = instances[instance.object_id];
+    if is_leaf_removed(inst, in.leaf_attr_id) { discard; }
 
     var out: FsBack;
     out.exit_dist = length(in.world_pos - camera.position.xyz);

@@ -14,8 +14,10 @@
 
 import package::lib::types::TlasPrim;
 
-// Mirrors `RkpGpuInstance` (128 B). Only the fields this pass needs
-// are referenced.
+// Mirrors `RkpGpuInstance` (144 B). Only the fields this pass needs
+// are referenced; the rest are present so the WGSL stride matches the
+// Rust upload stride exactly (otherwise `arrayLength(&instances)`
+// miscounts and the assemble loop reads garbage).
 struct GpuInstance {
     world: mat4x4<f32>,
     asset_id: u32,
@@ -34,6 +36,10 @@ struct GpuInstance {
     bone_field_origin_z: f32,
     overlay_offset: u32,
     overlay_count: u32,
+    sculpt_offset: u32,
+    sculpt_count: u32,
+    _pad_sculpt0: u32,
+    _pad_sculpt1: u32,
 }
 
 // Mirrors `RkpGpuAsset` (80 B).

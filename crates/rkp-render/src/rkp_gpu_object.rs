@@ -88,7 +88,7 @@ pub struct RkpGpuAsset {
     pub _pad: u32,
 }
 
-/// Per-instance GPU record (128 bytes). One per scene entity; carries:
+/// Per-instance GPU record (144 bytes). One per scene entity; carries:
 /// - world transform (inverse computed on demand by the shader via
 ///   `mat4_affine_inverse(inst.world)` — ~25 ALU vs 64 B/instance saved)
 /// - asset reference (`asset_id` indexes into the assets table)
@@ -98,8 +98,10 @@ pub struct RkpGpuAsset {
 /// - per-instance paint overlay (sparse `(slot, attr, color)` entries
 ///   in a global overlay buffer; `overlay_count == 0` ⇒ asset's pool
 ///   values are used directly)
+/// - per-instance sculpt overlay (sparse `leaf_attr_id` removal set in
+///   a global sculpt buffer; `sculpt_count == 0` ⇒ no carved leaves)
 ///
-/// # Layout (128 bytes)
+/// # Layout (144 bytes)
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
@@ -120,14 +122,22 @@ pub struct RkpGpuAsset {
 /// | 116    | 4    | bone_field_origin_z (f32) |
 /// | 120    | 4    | overlay_offset (u32) |
 /// | 124    | 4    | overlay_count (u32) |
+/// | 128    | 4    | sculpt_offset (u32) |
+/// | 132    | 4    | sculpt_count (u32) |
+/// | 136    | 8    | _pad (8 B, keeps stride a 16 B multiple for mat4x4) |
 ///
 /// `overlay_offset` + `overlay_count` describe a slice into the
-/// scene-global `instance_overlay` buffer (Phase 3). The WGSL fetch
+/// scene-global `instance_overlay` buffer (Phase 3 paint). The WGSL fetch
 /// helper falls through to `leaf_attr_pool[slot]` when
 /// `overlay_count == 0`.
 ///
-/// 128 B is a multiple of 16; the mat4x4 alignment requirement is
-/// satisfied without trailing pad.
+/// `sculpt_offset` + `sculpt_count` describe a slice into the
+/// scene-global `instance_sculpt` buffer — a sorted `array<u32>` of
+/// removed `leaf_attr_id`s (Phase A sculpt overlay). The WGSL helper
+/// `is_leaf_removed` returns `false` when `sculpt_count == 0`.
+///
+/// 144 B is a multiple of 16; the mat4x4 alignment requirement is
+/// satisfied via the trailing 8-byte pad.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
 pub struct RkpGpuInstance {
@@ -148,6 +158,9 @@ pub struct RkpGpuInstance {
     pub bone_field_origin_z: f32,
     pub overlay_offset: u32,
     pub overlay_count: u32,
+    pub sculpt_offset: u32,
+    pub sculpt_count: u32,
+    pub _pad_sculpt: [u32; 2],
 }
 
 #[cfg(test)]
@@ -173,10 +186,10 @@ mod tests {
     }
 
     #[test]
-    fn instance_size_is_128_bytes() {
-        // mat4x4 alignment requires stride to be a multiple of 16; 128
-        // satisfies it without any trailing pad.
-        assert_eq!(mem::size_of::<RkpGpuInstance>(), 128);
+    fn instance_size_is_144_bytes() {
+        // mat4x4 alignment requires stride to be a multiple of 16; 144
+        // satisfies it via the 8-byte trailing _pad_sculpt.
+        assert_eq!(mem::size_of::<RkpGpuInstance>(), 144);
     }
 
     #[test]
@@ -187,6 +200,16 @@ mod tests {
         assert_eq!(field - base, 120);
         let field2 = &i.overlay_count as *const _ as usize;
         assert_eq!(field2 - base, 124);
+    }
+
+    #[test]
+    fn instance_sculpt_fields_at_offset_128() {
+        let i = RkpGpuInstance::zeroed();
+        let base = &i as *const _ as usize;
+        let f_off = &i.sculpt_offset as *const _ as usize;
+        let f_cnt = &i.sculpt_count as *const _ as usize;
+        assert_eq!(f_off - base, 128);
+        assert_eq!(f_cnt - base, 132);
     }
 
     #[test]

@@ -50,6 +50,7 @@ import package::lib::types::RkpAsset;
 import package::lib::leaf_attr::fetch_overlay_index;
 import package::lib::leaf_attr::fetch_leaf_attr_for;
 import package::lib::leaf_attr::fetch_leaf_color_for;
+import package::lib::leaf_attr::is_leaf_removed;
 
 const OPACITY_THRESHOLD: f32 = 0.05;
 // Safety-net ceiling for the outer ray-march loop. The ray already
@@ -187,6 +188,12 @@ fn rkp_object_visible(inst: RkpInstance) -> bool {
 // `color_pool_data[slot]` in that case. Layout matches
 // `rkp_core::OverlayEntry` (16 bytes).
 @group(0) @binding(13) var<storage, read> instance_overlay: array<OverlayEntry>;
+
+// Per-instance sculpt-carve overlay (Phase A) — sorted ascending u32
+// `leaf_attr_id`s. `is_leaf_removed` consults this to treat carved
+// leaves as Empty during the march descent. Short-circuits when the
+// instance has nothing carved.
+@group(0) @binding(14) var<storage, read> instance_sculpt: array<u32>;
 
 // fetch_overlay_index / fetch_leaf_attr_for / fetch_leaf_color_for
 // are imported from `lib::leaf_attr` at the top of this file
@@ -699,6 +706,11 @@ fn march_object_skinned(
             t += vs;
             continue;
         }
+        // Sculpt-carve gate (Phase A) — treat carved leaves as Empty.
+        if is_leaf_removed(inst, leaf_slot) {
+            t += vs;
+            continue;
+        }
         atomicAdd(&stats[57], 1u); // populated cell read
         atomicAdd(&stats[56], 1u); // hit
 
@@ -976,7 +988,7 @@ fn march_object_inner(
                 // BRICK_CELL_INTERIOR cells are solid-bulk markers set
                 // by mesh imports; skip them identically to empty air
                 // so the march only ever stops on the visible shell.
-                if c != BRICK_CELL_EMPTY && c != BRICK_CELL_INTERIOR {
+                if c != BRICK_CELL_EMPTY && c != BRICK_CELL_INTERIOR && !is_leaf_removed(inst, c) {
                     atomicAdd(&stats[44], 1u); // leaf_attr read
                     let attr = fetch_leaf_attr_for(inst, c);
                     let baked_normal = unpack_oct_normal(attr.normal_oct);
@@ -1112,6 +1124,13 @@ fn march_object_inner(
         var mid = 0u;
         var m_opacity = 1.0;
         if r.slot != OCTREE_INTERIOR {
+            // Sculpt-carve gate (Phase A) — treat the leaf as Empty
+            // and keep marching. Step at least half a voxel so we
+            // don't re-enter the same cell next iteration.
+            if is_leaf_removed(inst, r.slot) {
+                t += vs * 0.5;
+                continue;
+            }
             atomicAdd(&stats[44], 1u); // leaf_attr read
             let attr = fetch_leaf_attr_for(inst, r.slot);
             leaf_id = r.slot;

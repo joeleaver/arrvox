@@ -28,6 +28,7 @@ import package::lib::types::GpuMaterial;
 import package::lib::types::RkpInstance;
 import package::lib::types::OverlayEntry;
 import package::lib::leaf_attr::fetch_leaf_attr_for;
+import package::lib::leaf_attr::is_leaf_removed;
 
 struct MeshShadowInstance {
     world: mat4x4<f32>,
@@ -83,6 +84,10 @@ struct DualQuat {
 @group(2) @binding(2) var<storage, read> instances: array<RkpInstance>;
 @group(2) @binding(3) var<storage, read> instance_overlay: array<OverlayEntry>;
 @group(2) @binding(4) var<storage, read> color_pool_data: array<u32>;
+// Per-instance sculpt-carve overlay (Phase A). Same layout slot as
+// `mesh.wesl`; shadow FS discards on hit so carved leaves stop
+// casting shadows.
+@group(2) @binding(10) var<storage, read> instance_sculpt: array<u32>;
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
@@ -181,6 +186,10 @@ fn vert_main(
 @fragment
 fn frag_main(in: VsOut) {
     let inst = instances[instance.object_id];
+    // Sculpt-carve discard — carved leaves cast no shadow.
+    if is_leaf_removed(inst, in.leaf_attr_id) {
+        discard;
+    }
     let attr = fetch_leaf_attr_for(inst, in.leaf_attr_id);
     let mat_id = attr.material_packed & 0xFFFFu;
     // OOB-safe lookup — see `mesh.wesl` for the rationale. Without

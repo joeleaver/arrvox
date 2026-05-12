@@ -136,7 +136,7 @@ impl MeshGlassPass {
         // other consumers ignore 6..9 — wgpu accepts a layout with
         // bindings the shader doesn't reference.
         let g2_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mesh_glass g2 (leaf_attr_pool + materials + instances + overlay + color_pool + fs_params + octree-lookup)"),
+            label: Some("mesh_glass g2 (leaf_attr_pool + materials + instances + overlay + color_pool + fs_params + octree-lookup + sculpt)"),
             entries: &[
                 storage_ro_entry(0),
                 storage_ro_entry(1),
@@ -153,10 +153,11 @@ impl MeshGlassPass {
                     },
                     count: None,
                 },
-                storage_ro_entry(6),  // assets
-                storage_ro_entry(7),  // octree_nodes
-                storage_ro_entry(8),  // brick_pool
-                storage_ro_entry(9),  // brick_face_links
+                storage_ro_entry(6),   // assets
+                storage_ro_entry(7),   // octree_nodes
+                storage_ro_entry(8),   // brick_pool
+                storage_ro_entry(9),   // brick_face_links
+                storage_ro_entry(10),  // instance_sculpt (Phase A sculpt overlay)
             ],
         });
 

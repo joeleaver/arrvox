@@ -222,6 +222,7 @@ impl EngineState {
         }
         self.entity_tree_order.remove(&entity);
         self.paint_overlays.remove(&entity);
+        self.sculpt_overlays.remove(&entity);
         // Drop any cached painted-material walk results so the next
         // flat-rebuild doesn't carry phantom leaves for this entity.
         // The dirty set entry (if present) would also resolve to a
@@ -367,8 +368,10 @@ impl EngineState {
         self.gpu_assets.clear();
         self.gpu_instances.clear();
         self.gpu_instance_overlays.clear();
+        self.gpu_instance_sculpts.clear();
         self.gpu_to_entity.clear();
         self.paint_overlays.clear();
+        self.sculpt_overlays.clear();
         self.painted_per_entity.clear();
         self.painted_dirty_entities.clear();
         // `clear()` wipes every pool but preserves the epoch atomic

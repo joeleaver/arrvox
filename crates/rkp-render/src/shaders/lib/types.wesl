@@ -68,6 +68,12 @@ struct OverlayEntry {
 // binding for per-instance paint overlays — `overlay_count == 0` ⇒
 // unpainted, `fetch_leaf_attr` falls through to the asset's
 // `leaf_attr_pool[slot]`.
+//
+// `sculpt_offset`/`sculpt_count` slice into the `instance_sculpt`
+// binding — a sorted `array<u32>` of removed `leaf_attr_id`s. The
+// helper `is_leaf_removed` returns `false` when `sculpt_count == 0`.
+// `_pad_sculpt0`/`_pad_sculpt1` round the stride to a 16 B multiple
+// so the mat4x4 alignment requirement stays satisfied.
 struct RkpInstance {
     world: mat4x4<f32>,
     asset_id: u32,
@@ -85,6 +91,10 @@ struct RkpInstance {
     bone_field_origin_z: f32,
     overlay_offset: u32,
     overlay_count: u32,
+    sculpt_offset: u32,
+    sculpt_count: u32,
+    _pad_sculpt0: u32,
+    _pad_sculpt1: u32,
 }
 
 // Per-asset metadata (one per imported model / generated mesh). CPU

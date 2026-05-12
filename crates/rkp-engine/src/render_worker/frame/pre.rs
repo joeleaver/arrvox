@@ -195,6 +195,16 @@ pub(super) fn run_pre_frame(
             &state.device, &state.queue, overlay_bytes,
         );
     }
+    // 1.7b. Upload `instance_sculpt_buffer` for the per-instance sculpt
+    //        carve overlay (Phase A). Same out-of-band path as paint —
+    //        needs to be visible to compute passes that run before the
+    //        main `upload_frame` below (e.g. tile-cull, user-shader BFS).
+    if !frame.gpu_instance_sculpts.is_empty() {
+        let sculpt_bytes: &[u8] = bytemuck::cast_slice(&frame.gpu_instance_sculpts);
+        state.renderer.scene.upload_instance_sculpt(
+            &state.device, &state.queue, sculpt_bytes,
+        );
+    }
 
     let assets_for_upload: &[rkp_render::rkp_gpu_object::RkpGpuAsset] = frame.gpu_assets.as_slice();
     let instances_for_upload: &[rkp_render::rkp_gpu_object::RkpGpuInstance] = gpu_instances;
@@ -234,6 +244,7 @@ pub(super) fn run_pre_frame(
         assets_for_upload,
     );
     let overlay_bytes: &[u8] = bytemuck::cast_slice(&frame.gpu_instance_overlays);
+    let sculpt_bytes: &[u8] = bytemuck::cast_slice(&frame.gpu_instance_sculpts);
     state.renderer.upload_frame(
         &state.queue,
         &FrameUpload {
@@ -242,6 +253,7 @@ pub(super) fn run_pre_frame(
             bone_matrices: &frame.bone_matrix_lbs,
             bone_dual_quats: &frame.bone_matrix_dqs,
             instance_overlays: overlay_bytes,
+            instance_sculpts: sculpt_bytes,
         },
     );
 

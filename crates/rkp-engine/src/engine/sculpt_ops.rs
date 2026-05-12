@@ -121,7 +121,11 @@ impl EngineState {
             }
         };
 
-        // ── Mutate the asset's octree + GPU buffers under the lock. ─
+        // ── Resolve the stamp against the asset's octree (read-only). ─
+        // Phase A: the scene manager does *not* mutate; it returns the
+        // list of `leaf_attr_id`s to carve away. We merge that into
+        // this entity's `SculptOverlay` below and ship it on the next
+        // frame's `instance_sculpts` upload.
         let result = {
             let mut scene = self.scene_mgr.lock().expect("scene_mgr poisoned");
             scene.apply_sculpt_brush(
@@ -136,54 +140,40 @@ impl EngineState {
         };
 
         let Some(result) = result else {
-            // No edits — brush outside, or every cell under the brush
-            // was Interior / unchanged (Phase 1 semantics).
             return 0;
         };
 
-        // ── Refresh the entity's cached Renderable.spatial with the
-        // new GPU octree handle + leaf-attr range. Without this the
-        // shader keeps reading the deallocated old octree slot range,
-        // which is a vivid "rendering goes black / wrong" bug.
-        {
-            use rkp_core::scene_node::SpatialHandle;
-            use crate::components::{RenderGeometry, SpatialData};
-            if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
-                let info = &result.new_info;
-                if let SpatialHandle::Octree { root_offset, len, depth, base_voxel_size } = info.spatial {
-                    let extent = (1u32 << depth) as f32 * base_voxel_size;
-                    let aabb_center = (info.aabb.min + info.aabb.max) * 0.5;
-                    let grid_origin = aabb_center - glam::Vec3::splat(extent * 0.5);
-                    renderable.spatial = Some(RenderGeometry::Octree(SpatialData {
-                        root_offset,
-                        len,
-                        depth,
-                        base_voxel_size,
-                        aabb: info.aabb,
-                        voxel_size: info.voxel_size,
-                        grid_origin,
-                        voxel_slot_start: info.leaf_attr_slot_start,
-                        voxel_slot_count: info.leaf_attr_slot_count,
-                        brick_ids: Vec::new(),
-                    }));
-                    renderable.voxel_count = info.voxel_count;
-                }
-            }
+        if result.leaves_add_skipped > 0 {
+            // Editor UI disables Raise; this path is hit only by tests
+            // or scripted commands. Log so it doesn't go silent.
+            self.console.warn(format!(
+                "Sculpt: {} Raise edits skipped — Phase B (added geometry) \
+                 not yet implemented; only Carve carves geometry away.",
+                result.leaves_add_skipped,
+            ));
         }
 
-        // Force the next tick to rebuild gpu_instances so the new
-        // spatial handle propagates into RkpGpuInstance.
+        if result.removed_leaf_attr_ids.is_empty() {
+            return 0;
+        }
+
+        // ── Merge into the per-entity sculpt overlay. ────────────────
+        // `insert_batch` is O(N + K log K) so a drag stamp stays fast
+        // even after the overlay has accumulated thousands of entries.
+        let overlay = self.sculpt_overlays.entry(entity).or_default();
+        overlay.insert_batch(result.removed_leaf_attr_ids);
+
+        // Force the next tick to rebuild gpu_instances + flatten the
+        // overlay vec — the per-instance `sculpt_offset` / `sculpt_count`
+        // get re-assigned each frame inside `update_scene_gpu`.
         self.gpu_objects_dirty = true;
-        // Mark this entity's painted-material cache stale — slot ids
-        // moved, the walk needs to re-scan.
-        self.painted_dirty_entities.insert(entity);
 
         eprintln!(
-            "[sculpt] stamp entity={:?} added={} removed={}",
-            entity, result.leaves_added, result.leaves_removed,
+            "[sculpt] stamp entity={:?} mode={:?} overlay_size={} (+{} this stamp)",
+            entity, mode, overlay.len(), result.leaves_removed,
         );
 
-        result.leaves_added + result.leaves_removed
+        result.leaves_removed
     }
 }
 

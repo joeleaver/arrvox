@@ -329,6 +329,17 @@ pub(crate) struct EngineState {
     pub(crate) paint_overlays:
         std::collections::HashMap<hecs::Entity, rkp_core::LeafAttrOverlay>,
 
+    /// Per-entity sparse sculpt overlay — sorted set of removed
+    /// `leaf_attr_id`s. Built incrementally as the user carves with
+    /// the sculpt brush (`apply_sculpt_brush` writes here); the entry
+    /// is dropped when the entity is despawned (`delete_entity` /
+    /// `clear_scene`) or when a save flushes the overlay into the
+    /// octree. Concatenated each frame into the GPU-side
+    /// `instance_sculpt` buffer — a per-instance `(offset, count)` pair
+    /// on `RkpGpuInstance` slices into it. Phase A: Carve only.
+    pub(crate) sculpt_overlays:
+        std::collections::HashMap<hecs::Entity, rkp_core::SculptOverlay>,
+
     /// Per-material flag — `true` if the material's `opacity < 0.99`
     /// (i.e., classified as glass by the march and the mesh-mode
     /// glass passes). Indexed by material id. Rebuilt from the
@@ -397,6 +408,13 @@ pub(crate) struct EngineState {
     /// in `update_scene_gpu` from the per-entity `paint_overlays` map;
     /// shipped each tick to the render thread for upload.
     pub(crate) gpu_instance_overlays: Vec<rkp_core::OverlayEntry>,
+    /// Per-frame flattened sculpt-removal entries —
+    /// `RkpGpuInstance.sculpt_offset` + `sculpt_count` slice into this.
+    /// Built alongside `gpu_instances` in `update_scene_gpu` from the
+    /// per-entity `sculpt_overlays` map; shipped each tick to the
+    /// render thread for upload to `instance_sculpt`. Each `u32` is a
+    /// removed `leaf_attr_id`.
+    pub(crate) gpu_instance_sculpts: Vec<u32>,
     /// Splat-rasterizer per-instance draws. One entry per `Renderable`
     /// entity whose asset_handle is `Some(_)`. Built alongside
     /// `gpu_instances` in `update_scene_gpu`. Used only when the

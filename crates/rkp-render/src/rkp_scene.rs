@@ -98,6 +98,12 @@ pub struct FrameUpload<'a> {
     /// this buffer. Empty `&[]` when no entity carries paint
     /// (placeholder buffer keeps the bind valid).
     pub instance_overlays: &'a [u8],
+    /// Per-instance sculpt overlay — sorted `u32` array of removed
+    /// `leaf_attr_id`s, one slice per carved instance. Each
+    /// `RkpGpuInstance.sculpt_offset` + `sculpt_count` slices into this
+    /// buffer. Empty `&[]` when no entity has been carved (placeholder
+    /// buffer keeps the bind valid). Phase A: Carve only.
+    pub instance_sculpts: &'a [u8],
 }
 
 /// Storage stride (u32 lanes) of one octree node on the GPU. Lanes:
@@ -184,6 +190,11 @@ pub struct RkpScene {
     /// concatenated. Each `RkpGpuInstance.overlay_offset` +
     /// `overlay_count` slices into this. Bound at binding(13).
     pub instance_overlay_buffer: wgpu::Buffer,
+    /// Per-instance sculpt overlay buffer (Phase A). Sorted `u32` slice
+    /// per carved instance, each entry a removed `leaf_attr_id`. Each
+    /// `RkpGpuInstance.sculpt_offset` + `sculpt_count` slices into
+    /// this. Bound at binding(14).
+    pub instance_sculpt_buffer: wgpu::Buffer,
     /// User-shader emitted instances. Each entry is one `RkpGpuInstance`
     /// (128 B) representing a single emitted primitive (grass blade,
     /// scatter object, etc.) with a forward affine `world` matrix and
@@ -243,6 +254,12 @@ impl RkpScene {
         let instance_overlay_buffer = Self::create_storage(
             device, "rkp_instance_overlay", 16,
         );
+        // Per-instance sculpt overlay — 4-byte placeholder (one u32
+        // slot) so the bind validates before any carve happens.
+        // `upload_frame` grows it as sculpt edits accumulate.
+        let instance_sculpt_buffer = Self::create_storage(
+            device, "rkp_instance_sculpt", 4,
+        );
 
         let bind_group_layout = Self::create_layout(device);
 
@@ -254,6 +271,7 @@ impl RkpScene {
             bone_field_occ_buffer, bone_field_occ_capacity,
             bone_dual_quats_buffer,
             instance_overlay_buffer,
+            instance_sculpt_buffer,
             bind_group_layout,
             buffers_epoch: 0,
         }
@@ -280,6 +298,7 @@ impl RkpScene {
             &self.bone_weights_buffer, &self.brick_face_links_buffer, &self.leaf_attr_pool_buffer,
             &self.bone_field_buffer, &self.bone_field_occ_buffer, &self.bone_dual_quats_buffer,
             &self.assets_buffer, &self.instance_overlay_buffer,
+            &self.instance_sculpt_buffer,
         )
     }
 
@@ -492,6 +511,25 @@ impl RkpScene {
         }
     }
 
+    /// Upload only the per-instance sculpt overlay buffer. Same
+    /// out-of-band path as `upload_instance_overlay` — used when
+    /// sculpt commits a frame's worth of edits between
+    /// `apply_sculpt_brush` and the next `upload_frame`. Bumps the
+    /// epoch on reallocation so VRs rebuild their bind groups.
+    pub fn upload_instance_sculpt(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bytes: &[u8],
+    ) {
+        if Self::ensure_and_write(
+            device, queue, &mut self.instance_sculpt_buffer,
+            "rkp_instance_sculpt", bytes,
+        ) {
+            self.buffers_epoch += 1;
+        }
+    }
+
     pub fn upload_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &FrameUpload) {
         let inst_bytes: &[u8] = bytemuck::cast_slice(data.instances);
         let asset_bytes: &[u8] = bytemuck::cast_slice(data.assets);
@@ -518,6 +556,12 @@ impl RkpScene {
             needs_rebuild |= Self::ensure_and_write(
                 device, queue, &mut self.instance_overlay_buffer,
                 "rkp_instance_overlay", data.instance_overlays,
+            );
+        }
+        if !data.instance_sculpts.is_empty() {
+            needs_rebuild |= Self::ensure_and_write(
+                device, queue, &mut self.instance_sculpt_buffer,
+                "rkp_instance_sculpt", data.instance_sculpts,
             );
         }
 
@@ -601,6 +645,7 @@ impl RkpScene {
                 storage_ro(11), // bone_dual_quats (DQS precomputed palette)
                 storage_ro(12), // assets (per-asset deduped records)
                 storage_ro(13), // instance_overlay (Phase 3 per-instance paint)
+                storage_ro(14), // instance_sculpt (Phase A per-instance sculpt overlay)
             ],
         })
     }
@@ -623,6 +668,7 @@ impl RkpScene {
         bone_dual_quats: &wgpu::Buffer,
         assets: &wgpu::Buffer,
         instance_overlay: &wgpu::Buffer,
+        instance_sculpt: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rkp_scene_bind_group"),
@@ -642,6 +688,7 @@ impl RkpScene {
                 wgpu::BindGroupEntry { binding: 11, resource: bone_dual_quats.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: assets.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 13, resource: instance_overlay.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 14, resource: instance_sculpt.as_entire_binding() },
             ],
         })
     }

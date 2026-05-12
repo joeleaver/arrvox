@@ -54,7 +54,7 @@ use glam::{UVec3, Vec3};
 
 use crate::leaf_attr::{LeafAttr, pack_oct};
 use crate::sparse_octree::{
-    EMPTY_NODE, INTERIOR_NODE, SparseOctree, is_leaf, leaf_slot, make_leaf,
+    EMPTY_NODE, INTERIOR_NODE, SparseOctree, is_brick, is_leaf, leaf_slot, make_leaf,
 };
 
 /// Add (clay) vs Subtract (dig). Matches the engine-side
@@ -250,7 +250,20 @@ pub fn compute_brush_edits(octree: &SparseOctree, op: BrushOp) -> SculptDelta {
                 let Some(node) = octree.lookup(coord) else { continue };
                 match op.mode {
                     BrushMode::Carve => {
-                        if is_leaf(node) {
+                        // Phase A: also emit Remove for brick cells.
+                        // Most real .rkp assets surface as BRICK nodes
+                        // (mesh imports); without this branch Carve
+                        // silently no-oped on every visible surface
+                        // (the "Phase 1 brick-everywhere" failure mode
+                        // from `project_sculpt_poc_brick_rethink`).
+                        // The actual brick-cell occupancy check (skip
+                        // empty / interior cells inside the brick) is
+                        // done by the caller via the brick pool — the
+                        // kernel can't see the brick pool. Emitting a
+                        // Remove here is cheap and the caller's
+                        // grid_coord → leaf_attr_id resolve filters
+                        // out empty / interior cells naturally.
+                        if is_leaf(node) || is_brick(node) {
                             edits.push(LeafEdit { coord, op: LeafEditOp::Remove });
                         }
                         // Interior cells under Carve stay Interior in

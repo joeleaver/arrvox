@@ -32,6 +32,7 @@ impl EngineState {
         self.gpu_assets.clear();
         self.gpu_instances.clear();
         self.gpu_instance_overlays.clear();
+        self.gpu_instance_sculpts.clear();
         self.splat_draws.clear();
         self.proxy_draws.clear();
         self.gpu_to_entity.clear();
@@ -266,6 +267,20 @@ impl EngineState {
                         self.gpu_instance_overlays.extend_from_slice(overlay.entries());
                         inst.overlay_offset = off;
                         inst.overlay_count = count;
+                    }
+                }
+                // Per-instance sculpt overlay slice (Phase A — Carve).
+                // Empty (sculpt_count=0) when this entity has no carve
+                // edits; the WGSL `is_leaf_removed` short-circuits in
+                // that case. Appended in entity-walk order, same shape
+                // as paint above.
+                if let Some(sculpt) = self.sculpt_overlays.get(&entity) {
+                    if !sculpt.is_empty() {
+                        let off = self.gpu_instance_sculpts.len() as u32;
+                        let count = sculpt.len() as u32;
+                        self.gpu_instance_sculpts.extend_from_slice(sculpt.entries());
+                        inst.sculpt_offset = off;
+                        inst.sculpt_count = count;
                     }
                 }
                 self.entity_to_gpu.insert(entity, self.gpu_instances.len());

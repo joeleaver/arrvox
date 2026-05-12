@@ -1149,6 +1149,7 @@ impl EngineState {
             gpu_assets: self.gpu_assets.clone(),
             gpu_instances: self.gpu_instances.clone(),
             gpu_instance_overlays: self.gpu_instance_overlays.clone(),
+            gpu_instance_sculpts: self.gpu_instance_sculpts.clone(),
             splat_draws: self.splat_draws.clone(),
             proxy_draws: self.proxy_draws.clone(),
             gpu_objects_dirty: gpu_objects_dirty_this_frame,

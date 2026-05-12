@@ -1023,6 +1023,7 @@ impl ViewportRenderer {
                 &renderer.scene.brick_pool_buffer,
                 &renderer.scene.brick_face_links_buffer,
                 &renderer.scene.instance_overlay_buffer,
+                &renderer.scene.instance_sculpt_buffer,
             ));
             self.splat_resolve_scene_epoch = scene_now;
         }
@@ -1093,6 +1094,17 @@ impl ViewportRenderer {
                     wgpu::BindGroupEntry {
                         binding: 9,
                         resource: renderer.scene.brick_face_links_buffer.as_entire_binding(),
+                    },
+                    // Phase A sculpt overlay — per-instance carved-leaf
+                    // set. `mesh.wesl::frag_main` discards on a hit
+                    // via `is_leaf_removed`. Other consumers of this
+                    // layout (shadow, glass, glass_shadow) read it
+                    // through the same helper so a carved leaf
+                    // disappears in primary visibility AND no longer
+                    // casts a shadow.
+                    wgpu::BindGroupEntry {
+                        binding: 10,
+                        resource: renderer.scene.instance_sculpt_buffer.as_entire_binding(),
                     },
                 ],
             }));

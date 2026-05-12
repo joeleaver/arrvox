@@ -103,6 +103,9 @@ fn make_instance(asset_id: u32, world: [[f32; 4]; 4], material: u32) -> RkpGpuIn
         bone_field_origin_z: 0.0,
         overlay_offset: 0,
         overlay_count: 0,
+        sculpt_offset: 0,
+        sculpt_count: 0,
+        _pad_sculpt: [0; 2],
     }
 }
 

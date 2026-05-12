@@ -95,6 +95,11 @@ import package::lib::brick::BRICK_CELL_INTERIOR;
 // through to the asset's pool. Without this binding mesh-mode paint
 // stamps are invisible (the resolve reads the unpainted base).
 @group(1) @binding(7) var<storage, read> instance_overlay: array<OverlayEntry>;
+// Per-instance sculpt-carve overlay (Phase A). Free-name reference
+// pulled in by `lib::leaf_attr::is_leaf_removed` even though the
+// resolve doesn't itself call it — `use_stripping(false)` requires
+// every imported free name to resolve.
+@group(1) @binding(8) var<storage, read> instance_sculpt: array<u32>;
 
 // `octree_lookup` (in `lib::octree`) calls `bucket_depth` and
 // `bucket_lod_exit` by free name. We have no stats binding here, so

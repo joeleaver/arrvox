@@ -56,6 +56,7 @@ import package::lib::types::RkpAsset;
 import package::lib::leaf_attr::fetch_overlay_index;
 import package::lib::leaf_attr::fetch_leaf_attr_for;
 import package::lib::leaf_attr::fetch_leaf_color_for;
+import package::lib::leaf_attr::is_leaf_removed;
 // Shadow rays scan every object every ray — AABB misses short-circuit
 // cheaply, and shadow rays go in arbitrary directions so the march
 // pass's screen-space per-tile lists don't apply.
@@ -130,6 +131,12 @@ fn shadow_beer(glass_color: vec3<f32>, opacity: f32, thickness: f32) -> f32 {
 // Per-instance paint overlay (Phase 3) — see octree_march.wgsl for the
 // authoritative description. Shadow trace uses the same fetch helpers.
 @group(0) @binding(13) var<storage, read> instance_overlay: array<OverlayEntry>;
+
+// Per-instance sculpt-carve overlay (Phase A) — sorted ascending u32
+// `leaf_attr_id`s. `is_leaf_removed` consults this so carved leaves
+// don't occlude shadow rays. Otherwise a carved hole would still cast
+// shadow as if the surface were intact.
+@group(0) @binding(14) var<storage, read> instance_sculpt: array<u32>;
 
 // fetch_overlay_index / fetch_leaf_attr_for / fetch_leaf_color_for
 // are imported from `lib::leaf_attr` at the top of this file
@@ -302,6 +309,11 @@ fn trace_shadow_skinned(
 
         let leaf_slot = skinned_shadow_sample(cell_i, grid_dim, inst.bone_field_offset);
         if leaf_slot == 0u {
+            t += vs;
+            continue;
+        }
+        // Sculpt-carve gate (Phase A) — carved leaves don't occlude.
+        if is_leaf_removed(inst, leaf_slot) {
             t += vs;
             continue;
         }
@@ -523,7 +535,7 @@ fn shadow_step_one_instance(
                         transmittance *= shadow_beer(glass_albedo, obj_opacity, cell_world);
                         if transmittance < 0.01 { blocked = true; break; }
                     }
-                } else if c != BRICK_CELL_EMPTY {
+                } else if c != BRICK_CELL_EMPTY && !is_leaf_removed(inst, c) {
                     let attr = fetch_leaf_attr_for(inst, c);
                     let mid = leaf_attr_material_primary(attr);
                     let m_op = materials[mid].opacity;
@@ -579,6 +591,11 @@ fn shadow_step_one_instance(
             return 0.0;
         }
 
+        // Sculpt-carve gate (Phase A) — carved leaves don't occlude.
+        if is_leaf_removed(inst, r.slot) {
+            t += vs * 0.5;
+            continue;
+        }
         atomicAdd(&stats[44], 1u);
         let attr = fetch_leaf_attr_for(inst, r.slot);
         let mid = leaf_attr_material_primary(attr);
@@ -635,6 +652,10 @@ fn synth_inst_from_tlas_leaf(leaf: TlasInstanceLeaf) -> RkpInstance {
     inst.bone_field_origin_z = 0.0;
     inst.overlay_offset = 0u;
     inst.overlay_count = 0u;
+    inst.sculpt_offset = 0u;
+    inst.sculpt_count = 0u;
+    inst._pad_sculpt0 = 0u;
+    inst._pad_sculpt1 = 0u;
     return inst;
 }
 

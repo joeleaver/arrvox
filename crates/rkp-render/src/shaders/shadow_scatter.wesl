@@ -104,6 +104,9 @@ struct MarchParamsLite {
 @group(0) @binding(10) var<storage, read> bone_field_occ: array<u32>;
 @group(0) @binding(12) var<storage, read> assets: array<RkpAsset>;
 @group(0) @binding(13) var<storage, read> instance_overlay: array<OverlayEntry>;
+// Per-instance sculpt-carve overlay (Phase A). March-mode shadow
+// scatter skips removed leaves so carved holes don't cast shadow.
+@group(0) @binding(14) var<storage, read> instance_sculpt: array<u32>;
 
 // Group 1 — pass-private resources.
 @group(1) @binding(0) var<uniform> light_camera: LightCameraShadow;
@@ -419,6 +422,10 @@ fn synth_inst_from_scatter(s: ScatterInstance) -> RkpInstance {
     inst.bone_field_origin_z = 0.0;
     inst.overlay_offset = 0u;
     inst.overlay_count = 0u;
+    inst.sculpt_offset = 0u;
+    inst.sculpt_count = 0u;
+    inst._pad_sculpt0 = 0u;
+    inst._pad_sculpt1 = 0u;
     return inst;
 }
 

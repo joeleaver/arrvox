@@ -30,8 +30,24 @@ import package::lib::types::CameraUniforms;
 import package::lib::types::LeafAttr;
 import package::lib::types::GpuMaterial;
 import package::lib::types::RkpInstance;
+import package::lib::types::RkpAsset;
 import package::lib::types::OverlayEntry;
+import package::lib::types::OctreeResult;
+import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::leaf_attr::fetch_leaf_attr_for;
+import package::lib::leaf_attr::is_leaf_removed;
+import package::lib::octree::octree_lookup;
+import package::lib::octree::PHASE_MARCH;
+import package::lib::octree_slot::OCTREE_EMPTY;
+import package::lib::octree_slot::OCTREE_INTERIOR;
+import package::lib::octree_slot::OCTREE_PAYLOAD_MASK;
+import package::lib::octree_slot::slot_is_brick;
+import package::lib::octree_slot::slot_brick_id;
+import package::lib::brick::BRICK_DIM;
+import package::lib::brick::BRICK_DIM_F;
+import package::lib::brick::BRICK_CELLS;
+import package::lib::brick::BRICK_CELL_EMPTY;
+import package::lib::brick::BRICK_CELL_INTERIOR;
 
 // Per-instance uniform — shape-compatible with `splat.wesl`'s
 // `SplatInstance` (96 B). Skinning fields drive the VS branch —
@@ -100,6 +116,36 @@ struct DualQuat {
 @group(2) @binding(2) var<storage, read> instances: array<RkpInstance>;
 @group(2) @binding(3) var<storage, read> instance_overlay: array<OverlayEntry>;
 @group(2) @binding(4) var<storage, read> color_pool_data: array<u32>;
+// Octree-lookup bindings — feed `lookup_cell_at` so the FS can
+// per-pixel-resolve the surface cell at the fragment's mesh-frame
+// rest_pos. Without per-pixel resolve, the discard tests the flat-
+// interpolated `leaf_attr_id` (one cell per SN-cube vertex shared
+// across many triangles), and carving one slot removes whole
+// meshlet-scale regions. With per-pixel resolve, the carve hole
+// follows voxel resolution. Matches the binding set splat_resolve +
+// mesh_glass use.
+@group(2) @binding(6) var<storage, read> assets: array<RkpAsset>;
+@group(2) @binding(7) var<storage, read> octree_nodes: array<vec4<u32>>;
+@group(2) @binding(8) var<storage, read> brick_pool: array<u32>;
+// `brick_face_links` is referenced by `lib::octree::descend_proto_octree`
+// as a free name even though we don't call that function — composer
+// keeps the body (`use_stripping(false)`), so the binding has to be
+// declared. naga DCE drops the unused reads.
+@group(2) @binding(9) var<storage, read> brick_face_links: array<u32>;
+// Per-instance sculpt-carve overlay (Phase A). Sorted ascending u32
+// `leaf_attr_id`s removed from this instance; sliced by `RkpInstance.
+// sculpt_offset` + `sculpt_count`. `is_leaf_removed` (lib/leaf_attr)
+// binary-searches this; the FS discards on hit so carved leaves
+// don't appear in primary visibility. Bound at the next free slot
+// after the octree-lookup bindings (6..9).
+@group(2) @binding(10) var<storage, read> instance_sculpt: array<u32>;
+
+// `octree_lookup` calls `bucket_depth` / `bucket_lod_exit` by free
+// name. No stats binding here — declare no-op stubs. The LOD branch
+// is gated behind `lod_enabled != 0` AND `phase == PHASE_MARCH`,
+// and we pass `lod_enabled = 0` to lookup_cell_at so it never fires.
+fn bucket_depth(phase: u32, level: u32) {}
+fn bucket_lod_exit(level: u32) {}
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
@@ -113,6 +159,12 @@ struct VsOut {
     // Same value for skinned and unskinned (skinning happens AFTER this
     // is captured, so the rest pose is preserved across the wire).
     @location(2) local_rest_pos: vec3<f32>,
+    // Pre-skin per-vertex local normal (unpacked from `normal_oct`).
+    // Used by the FS as `hint_normal_oc` for `lookup_cell_at`'s
+    // ½-voxel-into-solid snap — same trick mesh_glass / splat_resolve
+    // use to land the descent on the correct surface cell (SN-vertices
+    // sit between cells; the snap nudges back inside).
+    @location(3) local_normal: vec3<f32>,
 }
 
 // Linear blend of 4 bone influences in matrix space. Weights and
@@ -192,14 +244,16 @@ fn skin_dqs(p: vec3<f32>, indices: u32, weights: u32, offset: u32) -> vec3<f32> 
     return dual_quat_transform_pos(DualQuat(acc_r * inv_len, acc_d * inv_len), p);
 }
 
-// `normal_oct` (vertex location 1) is declared in the pipeline's
-// vertex-buffer layout but isn't consumed here — the resolve compute
-// reads `LeafAttr.normal_oct` from the pool slot for each hit pixel.
-// wgpu tolerates unused locations; the buffer reader still strides
-// past them.
+// `normal_oct` (vertex location 1) is unpacked and forwarded as
+// `local_normal` for the FS's per-pixel resolve (the ½-voxel snap
+// in `lookup_cell_at`). Splat-resolve reads `LeafAttr.normal_oct`
+// from the pool slot for the final shading normal; this per-vertex
+// value is purely a hint to land the cell descent on the right side
+// of the surface.
 @vertex
 fn vert_main(
     @location(0) local_pos: vec3<f32>,
+    @location(1) normal_oct: u32,
     @location(2) leaf_attr_id: u32,
     @location(3) bone_indices: u32,
     @location(4) bone_weights: u32,
@@ -234,7 +288,87 @@ fn vert_main(
     // extractor wrote for this vertex. Interpolated per-fragment, this
     // recovers the rest-pose surface point even for skinned instances.
     out.local_rest_pos = local_pos;
+    // Per-vertex local-frame normal as the FS's `hint_normal_oc`.
+    // Interpolated as a vec3 (NOT flat) — slight smoothing across the
+    // triangle is fine since the snap is half-voxel and the normal
+    // only needs to point roughly outward.
+    out.local_normal = unpack_oct_normal(normal_oct);
     return out;
+}
+
+// Per-pixel surface-cell lookup. Lifted byte-for-byte from
+// `mesh_glass.wesl::lookup_cell_at`, which lifted it from
+// `splat_resolve.wesl`. Returns the `leaf_attr_pool` slot of the
+// surface cell at `oc_pos` (descended through the octree + brick
+// pool), or `0` ("no slot") if the descent lands on EMPTY /
+// INTERIOR or misses the brick neighborhood. Caller falls back to
+// the flat-interpolated `leaf_attr_id` on a `0` return.
+//
+// See `splat_resolve.wesl` for the full rationale on the ½-voxel
+// solid snap and the 3×3×3 brick-cell search — both compensate for
+// SN-vertices living between cells (not on them) and for
+// FP/skinning slop in the rasterized rest_pos.
+fn lookup_cell_at(asset: RkpAsset, oc_pos: vec3<f32>, hint_normal_oc: vec3<f32>) -> u32 {
+    let extent = bitcast<f32>(asset.octree_extent_bits);
+    let vs = asset.voxel_size;
+    let snapped = oc_pos - hint_normal_oc * (vs * 0.5);
+    let pos = clamp(
+        snapped,
+        vec3<f32>(vs * 0.01),
+        vec3<f32>(extent - vs * 0.01),
+    );
+
+    let r: OctreeResult = octree_lookup(
+        asset.octree_root, asset.octree_depth, extent, pos,
+        vec3<f32>(0.0), vec3<f32>(1.0),
+        PHASE_MARCH, 0u, 0.0, 1.0, 0.0,
+    );
+
+    if r.slot == OCTREE_EMPTY { return 0u; }
+    if r.slot == OCTREE_INTERIOR { return 0u; }
+
+    if slot_is_brick(r.slot) {
+        let bid = slot_brick_id(r.slot);
+        let cell_size = (r.cell_half * 2.0) / BRICK_DIM_F;
+        let brick_origin = r.cell_center - vec3<f32>(r.cell_half);
+        let local = (pos - brick_origin) / cell_size;
+        let center_cell = clamp(
+            vec3<i32>(floor(local)),
+            vec3<i32>(0),
+            vec3<i32>(i32(BRICK_DIM) - 1),
+        );
+
+        var best_slot: u32 = 0u;
+        var best_dist_sq: f32 = 1.0e30;
+        for (var dz: i32 = -1; dz <= 1; dz = dz + 1) {
+            for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+                for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+                    let cell = center_cell + vec3<i32>(dx, dy, dz);
+                    if any(cell < vec3<i32>(0)) || any(cell > vec3<i32>(i32(BRICK_DIM) - 1)) {
+                        continue;
+                    }
+                    let flat = u32(cell.x)
+                        + u32(cell.y) * BRICK_DIM
+                        + u32(cell.z) * BRICK_DIM * BRICK_DIM;
+                    let c = brick_pool[bid * BRICK_CELLS + flat];
+                    if c == BRICK_CELL_EMPTY || c == BRICK_CELL_INTERIOR {
+                        continue;
+                    }
+                    let cell_center_oc = brick_origin
+                        + (vec3<f32>(cell) + vec3<f32>(0.5)) * cell_size;
+                    let d = pos - cell_center_oc;
+                    let d_sq = dot(d, d);
+                    if d_sq < best_dist_sq {
+                        best_dist_sq = d_sq;
+                        best_slot = c;
+                    }
+                }
+            }
+        }
+        return best_slot;
+    }
+
+    return r.slot & OCTREE_PAYLOAD_MASK;
 }
 
 // Four-attachment fragment output — visibility-buffer triplet plus
@@ -261,6 +395,33 @@ fn frag_main(in: VsOut) -> FsOut {
     // (`mesh_glass.wesl`) capture entry/exit on the same triangles
     // separately and pack into `gbuf_glass` for the composite.
     let inst = instances[instance.object_id];
+    // Sculpt-carve discard (Phase A) — per-pixel resolved.
+    //
+    // The flat-interpolated `in.leaf_attr_id` is shared across many
+    // triangles (each SN-vertex picks ONE cell's slot, but multiple
+    // triangles whose provoking vertex sits at that SN-vertex all
+    // see the same id). Testing the discard against it removes
+    // whole meshlet-scale regions per carved cell — the user's
+    // first stamp produced a sharp angular bird-shape, not a divot.
+    //
+    // Per-pixel resolve via `lookup_cell_at` descends the octree at
+    // the fragment's rest_pos to recover the actual surface cell.
+    // Test that against the sculpt set; fall back to the flat id
+    // when the descent misses (rare — only the brick neighborhood
+    // boundary, where it doesn't matter for a sphere-shaped brush).
+    //
+    // Short-circuit: `is_leaf_removed` returns false in O(1) when
+    // the instance has nothing carved, so the resolve is only paid
+    // by instances under active sculpt.
+    if inst.sculpt_count != 0u {
+        let asset = assets[inst.asset_id];
+        let oc_pos = in.local_rest_pos - asset.grid_origin;
+        let resolved_slot = lookup_cell_at(asset, oc_pos, in.local_normal);
+        let test_slot = select(in.leaf_attr_id, resolved_slot, resolved_slot != 0u);
+        if is_leaf_removed(inst, test_slot) {
+            discard;
+        }
+    }
     let attr = fetch_leaf_attr_for(inst, in.leaf_attr_id);
     let mat_id = attr.material_packed & 0xFFFFu;
     // Bounds-check the material lookup. WGSL OOB array reads return

@@ -26,6 +26,7 @@ pub mod octree_allocator;
 pub mod prefilter;
 pub mod scene_node;
 pub mod sculpt;
+pub mod sculpt_overlay;
 pub mod sdf;
 pub mod sdf_primitive;
 pub mod sparse_octree;
@@ -39,6 +40,7 @@ pub use companion::{BoneBrick, BoneVoxel, ColorBrick, ColorVoxel, VolumetricBric
 pub use leaf_attr::{pack_oct, unpack_oct, LeafAttr};
 pub use leaf_attr_overlay::{LeafAttrOverlay, OverlayEntry};
 pub use leaf_attr_pool::LeafAttrPool;
+pub use sculpt_overlay::SculptOverlay;
 pub use octree_allocator::{OctreeAllocator, OctreeHandle};
 pub use scene_node::{SdfPrimitive, SpatialHandle, Transform};
 pub use sdf_primitive::evaluate_primitive;

@@ -78,6 +78,11 @@ pub struct RenderFrame {
     /// uses its `overlay_offset` + `overlay_count` to slice into this
     /// vec. Empty when no entity has been painted.
     pub gpu_instance_overlays: Vec<OverlayEntry>,
+    /// Flat per-instance sculpt-removal entries (Phase A — Carve). Each
+    /// `RkpGpuInstance` uses its `sculpt_offset` + `sculpt_count` to
+    /// slice into this vec; each `u32` is a removed `leaf_attr_id`.
+    /// Empty when no entity has been carved.
+    pub gpu_instance_sculpts: Vec<u32>,
     /// Splat-rasterizer per-instance draws. One entry per visible
     /// `Renderable` whose asset_handle is `Some(_)` — i.e. the entity
     /// references a loaded `.rkp` asset whose splat data has been
