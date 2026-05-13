@@ -733,6 +733,10 @@ pub(crate) struct EngineState {
     /// as [`Self::paint_pick_settings`]; consumed by
     /// `process_pick_result` when the matching readback returns.
     pub(crate) sculpt_pick_settings: Option<SculptPickSettings>,
+    /// Wallclock when the most recent SculptAtPixel command arrived
+    /// (set in cmd_edit.rs's SculptAtPixel handler, consumed by
+    /// `process_pick_result` to log click-to-mutation latency).
+    pub(crate) sculpt_pending_at: Option<std::time::Instant>,
     /// `true` while the editor is in sculpt mode. Mutually exclusive
     /// with `paint_mode_active` (the editor's toggle handlers clear
     /// the other before sending). Updated by `SetSculptActive`.

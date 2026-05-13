@@ -622,6 +622,11 @@ impl EngineState {
                 self.sculpt_pick_settings = Some(SculptPickSettings {
                     radius, falloff, mode, material_id,
                 });
+                // Stamp the wallclock so we can measure click-to-mutation
+                // latency end-to-end (SculptAtPixel arrival → apply_sculpt_brush
+                // call). Spans the pick round-trip + every sim/render
+                // hop in between.
+                self.sculpt_pending_at = Some(std::time::Instant::now());
             }
 
             other => return Err(other),

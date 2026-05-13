@@ -206,6 +206,7 @@ impl EngineState {
             paint_mode_active: false,
             paint_mode_radius: 0.5,
             sculpt_pick_settings: None,
+            sculpt_pending_at: None,
             sculpt_mode_active: false,
             sculpt_mode_radius: 0.5,
             num_lights_cache: 1,

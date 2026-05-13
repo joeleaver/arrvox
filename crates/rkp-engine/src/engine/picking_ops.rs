@@ -72,6 +72,11 @@ impl EngineState {
         // entity. Phase 0 just logs the resolved op; Phase 1 swaps the
         // stub for real octree mutation.
         if let Some(settings) = self.sculpt_pick_settings.take() {
+            // Log the click-to-mutation latency. This is the total wall
+            // time from SculptAtPixel arriving at the sim to the stamp
+            // about to apply — spans pick round-trip + sim ticks +
+            // render frames + GPU work.
+            let pending_at = self.sculpt_pending_at.take();
             let hit_gpu_idx = pr.raw_payload[0];
             let hit_entity: Option<hecs::Entity> = if hit_gpu_idx != u32::MAX {
                 let gpu_idx = hit_gpu_idx as usize;
@@ -83,6 +88,12 @@ impl EngineState {
                 .selected_entity
                 .filter(|sel| hit_entity == Some(*sel));
             if let (Some(entity), Some(world_pos)) = (target_entity, pr.position) {
+                if let Some(t0) = pending_at {
+                    eprintln!(
+                        "[sculpt-latency] click→pick→sculpt_start={:.2}ms",
+                        t0.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
                 let _ = self.apply_sculpt_stamp(
                     entity,
                     world_pos,
