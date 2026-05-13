@@ -546,29 +546,65 @@ impl RkpRenderer {
     /// Upload (or replace) the meshlet cluster table for an asset
     /// (Phase 5). Caller passes `AssetHandle::raw()` and the
     /// `&[MeshletCluster]` slice from
-    /// `RkpSceneManager::iter_loaded_asset_clusters`. Re-upload is
-    /// safe — the previous buffer is dropped at the end of the
-    /// call. An empty cluster list clears the entry.
+    /// `RkpSceneManager::iter_loaded_asset_clusters`.
+    ///
+    /// Reuses the existing GPU buffer in place via `queue.write_buffer`
+    /// when capacity fits; grows with 2× headroom otherwise. Sculpt's
+    /// R4c-V2 path rewrites cluster entries in place (filter-and-patch),
+    /// so the full slice is written every call — cheap because total
+    /// table size is ~1.6 MiB.
+    ///
+    /// Returns `true` when the underlying `wgpu::Buffer` object was
+    /// replaced (initial alloc, grow, or empty-clear of a present slot).
+    /// Callers use this to decide whether downstream bind groups that
+    /// reference the cluster buffer (`mesh_lod_select_g2_bgs`,
+    /// `mesh_lod_shadow_g2_bgs`) must be invalidated. Returns `false`
+    /// when the same buffer was reused — bind groups stay valid.
     pub fn upload_mesh_clusters_for_asset(
         &mut self,
+        queue: &wgpu::Queue,
         handle_raw: u32,
         clusters: &[MeshletCluster],
-    ) {
-        use wgpu::util::DeviceExt;
+    ) -> bool {
         let idx = handle_raw as usize;
         if idx >= self.mesh_cluster_buffers.len() {
             self.mesh_cluster_buffers.resize_with(idx + 1, || None);
         }
         if clusters.is_empty() {
+            let was_present = self.mesh_cluster_buffers[idx].is_some();
             self.mesh_cluster_buffers[idx] = None;
-            return;
+            return was_present;
         }
-        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh asset cluster table"),
-            contents: bytemuck::cast_slice(clusters),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
+        let bytes: &[u8] = bytemuck::cast_slice(clusters);
+        let needed = bytes.len() as u64;
+
+        let existing = self.mesh_cluster_buffers[idx].take();
+        let (buffer, replaced) = if let Some((buf, _)) = existing.as_ref() {
+            if buf.size() >= needed {
+                queue.write_buffer(buf, 0, bytes);
+                (buf.clone(), false)
+            } else {
+                let new_buf = grow_with_full_upload(
+                    &self.device, queue,
+                    Some(buf.size()),
+                    "mesh asset cluster table",
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    bytes,
+                );
+                (new_buf, true)
+            }
+        } else {
+            let new_buf = grow_with_full_upload(
+                &self.device, queue,
+                None,
+                "mesh asset cluster table",
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                bytes,
+            );
+            (new_buf, true)
+        };
         self.mesh_cluster_buffers[idx] = Some((buffer, clusters.len() as u32));
+        replaced
     }
 
     /// Drop the cached cluster table for `handle_raw`. Called when

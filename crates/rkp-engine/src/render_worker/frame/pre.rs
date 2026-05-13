@@ -192,8 +192,12 @@ pub(super) fn run_pre_frame(
         // but unused by current dispatch (validates the upload path
         // without rewiring the hot draw call).
         let mut cluster_asset_count = 0;
+        let mut any_cluster_buffer_replaced = false;
         for (handle, clusters) in sm.iter_loaded_asset_clusters() {
-            state.renderer.upload_mesh_clusters_for_asset(handle.raw(), clusters);
+            let replaced = state.renderer.upload_mesh_clusters_for_asset(
+                &state.queue, handle.raw(), clusters,
+            );
+            any_cluster_buffer_replaced |= replaced;
             cluster_asset_count += 1;
         }
         let t_cluster_upload = t_cluster_start.elapsed();
@@ -230,25 +234,32 @@ pub(super) fn run_pre_frame(
         );
 
         // Invalidate cached `mesh_lod_select_g2_bgs` (and shadow
-        // counterparts) across every viewport. The g2 bind groups
-        // hold references to the per-asset cluster table buffer; if
-        // the cluster table was replaced for any asset above, the
-        // cached BG still points at the dropped buffer and the
-        // compute pass reads stale cluster data — admit fails on
-        // every cluster and the asset's geometry vanishes from the
-        // frame. The freshness key in viewport_renderer
-        // (asset_handle_raw, args_capacity) doesn't catch this case,
-        // so wipe every cached g2 BG on geometry-epoch bumps. The
-        // first draw of the new frame will re-create them against
-        // the live buffer slot. Cost: O(viewports × draw_slots)
-        // small Option writes, sub-millisecond.
-        for vr in state.viewport_renderers.values_mut() {
-            for slot in vr.mesh_lod_select_g2_bgs.iter_mut() {
-                *slot = None;
-            }
-            for per_slot in vr.mesh_lod_shadow_g2_bgs.iter_mut() {
-                for per_cascade in per_slot.iter_mut() {
-                    *per_cascade = None;
+        // counterparts) across every viewport, but only when at least
+        // one cluster buffer was actually replaced this epoch. The g2
+        // bind groups hold references to the per-asset cluster table
+        // buffer; if the cluster table was replaced (initial alloc,
+        // grow, or empty-clear), the cached BG still points at the
+        // dropped buffer and the compute pass reads stale cluster
+        // data — admit fails on every cluster and the asset's
+        // geometry vanishes from the frame. The freshness key in
+        // viewport_renderer (asset_handle_raw, args_capacity) doesn't
+        // catch this case.
+        //
+        // When the cluster buffer is reused in place
+        // (`queue.write_buffer`, no allocation), the wgpu::Buffer
+        // object is unchanged and the cached BG still points at the
+        // correct buffer — skip the invalidation. This is the steady-
+        // state sculpt path; eliding the cascade avoids re-creating
+        // every BG per stamp.
+        if any_cluster_buffer_replaced {
+            for vr in state.viewport_renderers.values_mut() {
+                for slot in vr.mesh_lod_select_g2_bgs.iter_mut() {
+                    *slot = None;
+                }
+                for per_slot in vr.mesh_lod_shadow_g2_bgs.iter_mut() {
+                    for per_cascade in per_slot.iter_mut() {
+                        *per_cascade = None;
+                    }
                 }
             }
         }
