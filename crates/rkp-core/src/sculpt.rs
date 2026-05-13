@@ -54,7 +54,9 @@ use glam::{IVec3, UVec3, Vec3};
 
 use crate::brick_pool::BrickPool;
 use crate::leaf_attr::{LeafAttr, pack_oct};
-use crate::sparse_octree::{CellState, INTERIOR_NODE, SparseOctree};
+use crate::sparse_octree::{CellState, OctreeMutationLog, SparseOctree};
+#[cfg(test)]
+use crate::sparse_octree::INTERIOR_NODE;
 
 // The `assert_*` helpers in this file's test module reference the
 // brick-cell sentinels and the LEAF / BRICK predicates directly.
@@ -188,6 +190,15 @@ pub struct AppliedDelta {
     /// `pool.deallocate_range(slot, 1)` for each (or batch-collect into
     /// `(start, count)` ranges).
     pub freed_slots: Vec<u32>,
+    /// Every write made to the octree's `nodes[]` / `internal_attr_index[]`
+    /// during this `apply_delta`. The caller (typically the render-side
+    /// scene manager) replays these writes into its packed GPU buffer
+    /// so the CPU and GPU octrees stay in sync. The log's
+    /// `initial_node_count` lets the caller detect growth — if the
+    /// tree's `node_count()` after `apply_delta` exceeds the original,
+    /// the existing GPU allocator slot is too small and a re-allocation
+    /// is required.
+    pub octree_log: OctreeMutationLog,
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────
@@ -468,6 +479,7 @@ pub fn apply_delta(
     let mut allocated_slots = Vec::with_capacity(delta.count_added());
     let mut freed_slots = Vec::with_capacity(delta.count_removed());
 
+    octree.begin_mutation_log();
     for edit in &delta.edits {
         match edit.op {
             LeafEditOp::Remove | LeafEditOp::Empty => {
@@ -490,8 +502,9 @@ pub fn apply_delta(
             }
         }
     }
+    let octree_log = octree.take_mutation_log().unwrap_or_default();
 
-    AppliedDelta { allocated_slots, freed_slots }
+    AppliedDelta { allocated_slots, freed_slots, octree_log }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -955,6 +968,52 @@ mod tests {
             "single-layer shell has no neighboring solid OUTSIDE the brush; got {added}",
         );
         let _ = added;
+    }
+
+    #[test]
+    fn apply_delta_captures_octree_writes() {
+        // Sculpt into a tree with a brick — apply_delta should record
+        // the brick-cell mutation paths (subdivision, brick materialize,
+        // brick collapse). For a shallow tree with bricks disabled,
+        // single set_cell writes still record through the finest-leaf
+        // path.
+        let mut t = SparseOctree::new(2, 1.0); // shallow → no bricks
+        let mut pool = fresh_pool();
+        // Pre-seed a leaf so its Remove path records the finest-leaf write.
+        t.insert(UVec3::new(0, 0, 0), 42);
+
+        let delta = SculptDelta { edits: vec![
+            LeafEdit { coord: UVec3::new(0, 0, 0), op: LeafEditOp::Remove },
+            LeafEdit { coord: UVec3::new(1, 0, 0), op: LeafEditOp::Add {
+                material: 7, normal: Vec3::Y,
+            }},
+        ]};
+        let applied = apply_delta(&mut t, &mut pool, &delta, || 99);
+        // Either path mutated nodes — log must have writes.
+        assert!(
+            !applied.octree_log.node_writes.is_empty(),
+            "expected node writes to be recorded, got {applied:?}",
+        );
+        assert!(applied.octree_log.initial_node_count > 0);
+    }
+
+    #[test]
+    fn apply_delta_log_detects_growth() {
+        // Sculpting into a virgin EMPTY_NODE tree forces subdivision
+        // down to brick_depth — that grows nodes.len() past the initial
+        // count. The log's `grew()` flag should fire.
+        let mut t = SparseOctree::new(4, 1.0); // depth 4 → grows on first mutation
+        let mut pool = fresh_pool();
+        let initial = t.node_count();
+        let delta = SculptDelta { edits: vec![
+            LeafEdit { coord: UVec3::new(2, 2, 2), op: LeafEditOp::Add {
+                material: 1, normal: Vec3::Y,
+            }},
+        ]};
+        let applied = apply_delta(&mut t, &mut pool, &delta, || 0);
+        assert_eq!(applied.octree_log.initial_node_count as usize, initial);
+        // Tree grew via subdivision of the root EMPTY_NODE.
+        assert!(applied.octree_log.grew(t.node_count() as u32));
     }
 
     #[test]

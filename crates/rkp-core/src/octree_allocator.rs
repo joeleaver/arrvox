@@ -6,6 +6,15 @@
 //! onto a free list for reuse.
 
 use crate::sparse_octree::{SparseOctree, INTERNAL_ATTR_NONE};
+use crate::DirtyRanges;
+
+/// Bytes per octree slot in the interleaved GPU buffer layout used by
+/// `RkpScene::upload_geometry`: `(node, prefilter_id, 0, 0)` × u32 =
+/// 4 u32 = 16 B. The `OctreeAllocator` itself stores nodes and attrs as
+/// two separate `Vec<u32>` on the CPU, but every dirty mark covers one
+/// GPU slot so the upload pass can emit a single `queue.write_buffer`
+/// per dirty range without worrying about CPU↔GPU layout mismatch.
+pub const OCTREE_GPU_SLOT_BYTES: u32 = 4 * 4;
 
 /// Handle to an allocated octree region in the packed buffer.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -36,6 +45,12 @@ pub struct OctreeAllocator {
     /// [`INTERNAL_ATTR_NONE`] when no prefilter is available for that slot.
     internal_attrs: Vec<u32>,
     free_list: Vec<(u32, u32)>, // (offset, length)
+    /// GPU-slot byte ranges (in the interleaved `vec4<u32>` layout) that
+    /// have been mutated since the last upload. Each entry covers
+    /// `OCTREE_GPU_SLOT_BYTES` per CPU slot. Sculpt's per-stamp `write_node`
+    /// / `write_internal_attr` calls populate this; the upload pass
+    /// drains it via `dirty_ranges_mut`.
+    dirty: DirtyRanges,
 }
 
 impl OctreeAllocator {
@@ -45,6 +60,7 @@ impl OctreeAllocator {
             data: Vec::new(),
             internal_attrs: Vec::new(),
             free_list: Vec::new(),
+            dirty: DirtyRanges::new(),
         }
     }
 
@@ -54,7 +70,55 @@ impl OctreeAllocator {
             data: Vec::with_capacity(capacity),
             internal_attrs: Vec::with_capacity(capacity),
             free_list: Vec::new(),
+            dirty: DirtyRanges::new(),
         }
+    }
+
+    #[inline]
+    fn mark_slot_dirty(&mut self, absolute_slot_idx: u32) {
+        self.dirty.mark(absolute_slot_idx * OCTREE_GPU_SLOT_BYTES, OCTREE_GPU_SLOT_BYTES);
+    }
+
+    /// Write a node value at the absolute (post-rebase) packed-buffer
+    /// index. `local_value` is the value as observed in the source
+    /// `SparseOctree` — local branch offsets get rebased to absolute by
+    /// adding `base_offset`. Sentinels (EMPTY_NODE / INTERIOR_NODE) and
+    /// leaf encodings (LEAF / BRICK) are written verbatim.
+    ///
+    /// Marks the dirty range so the next `upload_geometry` will emit a
+    /// `queue.write_buffer` covering this slot.
+    pub fn write_node(&mut self, absolute_idx: u32, local_value: u32, base_offset: u32) {
+        use crate::sparse_octree::{EMPTY_NODE, INTERIOR_NODE, is_branch};
+        let to_write = if local_value == EMPTY_NODE || local_value == INTERIOR_NODE {
+            local_value
+        } else if is_branch(local_value) {
+            local_value + base_offset
+        } else {
+            // LEAF or BRICK: low 30 bits are a pool slot id, not a buffer offset.
+            local_value
+        };
+        self.data[absolute_idx as usize] = to_write;
+        self.mark_slot_dirty(absolute_idx);
+    }
+
+    /// Write an internal-attr value at the absolute packed-buffer index.
+    /// Attr values are global `leaf_attr_id`s (never rebased).
+    pub fn write_internal_attr(&mut self, absolute_idx: u32, value: u32) {
+        self.internal_attrs[absolute_idx as usize] = value;
+        self.mark_slot_dirty(absolute_idx);
+    }
+
+    /// Read-only view of the per-slot dirty range tracker.
+    #[inline]
+    pub fn dirty_ranges(&self) -> &DirtyRanges {
+        &self.dirty
+    }
+
+    /// Mutable view of the dirty range tracker. The upload pass calls
+    /// `clear()` after writing the deltas to the GPU buffer.
+    #[inline]
+    pub fn dirty_ranges_mut(&mut self) -> &mut DirtyRanges {
+        &mut self.dirty
     }
 
     /// Allocate space for an octree and copy its nodes into the packed buffer.
@@ -92,6 +156,11 @@ impl OctreeAllocator {
         // absolute indices into the packed buffer.
         self.rebase_branches(offset as usize, len as usize, offset);
 
+        // Mark the newly-written region dirty so the next upload ships it.
+        if len > 0 {
+            self.dirty.mark(offset * OCTREE_GPU_SLOT_BYTES, len * OCTREE_GPU_SLOT_BYTES);
+        }
+
         OctreeHandle {
             root_offset: offset,
             len,
@@ -121,6 +190,12 @@ impl OctreeAllocator {
         // reallocation overwrites this region.
         for entry in &mut self.internal_attrs[start..end] {
             *entry = INTERNAL_ATTR_NONE;
+        }
+        if handle.len > 0 {
+            self.dirty.mark(
+                handle.root_offset * OCTREE_GPU_SLOT_BYTES,
+                handle.len * OCTREE_GPU_SLOT_BYTES,
+            );
         }
         self.free_list.push((handle.root_offset, handle.len));
         self.coalesce_and_shrink();
@@ -563,6 +638,91 @@ mod tests {
         assert_eq!(
             alloc.internal_attrs_slice()[h.root_offset as usize + seed_idx],
             0xCAFEBABE,
+        );
+    }
+
+    #[test]
+    fn allocate_marks_region_dirty() {
+        let mut alloc = OctreeAllocator::new();
+        assert!(alloc.dirty_ranges().is_empty());
+        let h = alloc.allocate(&make_test_octree());
+        let ranges: Vec<_> = alloc.dirty_ranges().iter().collect();
+        assert_eq!(
+            ranges,
+            vec![(h.root_offset * OCTREE_GPU_SLOT_BYTES, h.len * OCTREE_GPU_SLOT_BYTES)],
+        );
+    }
+
+    #[test]
+    fn deallocate_marks_region_dirty() {
+        let mut alloc = OctreeAllocator::new();
+        let h_a = alloc.allocate(&make_test_octree());
+        let _h_b = alloc.allocate(&make_test_octree()); // pin tail
+        alloc.dirty_ranges_mut().clear();
+
+        alloc.deallocate(h_a);
+        // The freed slots get marked so the next upload writes the
+        // cleared (EMPTY_NODE / INTERNAL_ATTR_NONE) state to GPU.
+        let ranges: Vec<_> = alloc.dirty_ranges().iter().collect();
+        assert_eq!(
+            ranges,
+            vec![(h_a.root_offset * OCTREE_GPU_SLOT_BYTES, h_a.len * OCTREE_GPU_SLOT_BYTES)],
+        );
+    }
+
+    #[test]
+    fn write_node_marks_one_slot() {
+        let mut alloc = OctreeAllocator::new();
+        let h = alloc.allocate(&make_test_octree());
+        alloc.dirty_ranges_mut().clear();
+
+        let slot = h.root_offset + 0;
+        alloc.write_node(slot, 0x12345, h.root_offset);
+        let ranges: Vec<_> = alloc.dirty_ranges().iter().collect();
+        assert_eq!(ranges, vec![(slot * OCTREE_GPU_SLOT_BYTES, OCTREE_GPU_SLOT_BYTES)]);
+    }
+
+    #[test]
+    fn write_node_rebases_branch_values() {
+        let mut alloc = OctreeAllocator::new();
+        // Allocate a dummy first to push real octree to non-zero offset.
+        let _dummy = alloc.allocate(&SparseOctree::new(1, 0.1));
+        let h = alloc.allocate(&make_test_octree());
+
+        // Write a "local branch" value (i.e. a value < EMPTY_NODE that
+        // is_branch() recognizes) at the root slot. Local value 4 should
+        // be rebased to handle.root_offset + 4.
+        let slot = h.root_offset + 1;
+        alloc.write_node(slot, 4, h.root_offset);
+        assert_eq!(alloc.as_slice()[slot as usize], h.root_offset + 4);
+    }
+
+    #[test]
+    fn write_node_passes_sentinels_through() {
+        use crate::sparse_octree::{EMPTY_NODE, INTERIOR_NODE};
+        let mut alloc = OctreeAllocator::new();
+        let _dummy = alloc.allocate(&SparseOctree::new(1, 0.1));
+        let h = alloc.allocate(&make_test_octree());
+
+        alloc.write_node(h.root_offset, EMPTY_NODE, h.root_offset);
+        assert_eq!(alloc.as_slice()[h.root_offset as usize], EMPTY_NODE);
+
+        alloc.write_node(h.root_offset, INTERIOR_NODE, h.root_offset);
+        assert_eq!(alloc.as_slice()[h.root_offset as usize], INTERIOR_NODE);
+    }
+
+    #[test]
+    fn write_internal_attr_marks_slot() {
+        let mut alloc = OctreeAllocator::new();
+        let h = alloc.allocate(&make_test_octree());
+        alloc.dirty_ranges_mut().clear();
+
+        alloc.write_internal_attr(h.root_offset + 2, 0xCAFE);
+        assert_eq!(alloc.internal_attrs_slice()[(h.root_offset + 2) as usize], 0xCAFE);
+        let ranges: Vec<_> = alloc.dirty_ranges().iter().collect();
+        assert_eq!(
+            ranges,
+            vec![((h.root_offset + 2) * OCTREE_GPU_SLOT_BYTES, OCTREE_GPU_SLOT_BYTES)],
         );
     }
 

@@ -229,6 +229,38 @@ impl RkpSceneManager {
             )
         };
 
+        // ── 4b. Sync cpu_octree mutations into OctreeGpu's packed buffer.
+        //
+        // Closes the latent CPU↔GPU sync bug: `apply_delta` mutated
+        // `entry.cpu_octree.nodes`, but without this step those changes
+        // never reach the packed buffer that `upload_geometry` ships.
+        // Sculpt today only works because typical stamps stay within
+        // existing bricks (brick-pool path covers it); octree-node
+        // mutations (brick materialize/collapse, branch subdivide)
+        // would silently drop on the floor.
+        //
+        // V1 falls back to a full octree re-allocation if the tree grew
+        // past its allocator slot — rare for sculpt on dense assets,
+        // expected to fire on Raise-into-virgin-region.
+        {
+            let entry = self.asset_cache.get_mut(handle)?;
+            let spatial = entry.spatial_handle;
+            let new_node_count = entry.cpu_octree.node_count() as u32;
+            if applied.octree_log.grew(new_node_count) {
+                eprintln!(
+                    "[sculpt] octree grew {} → {} nodes — re-allocating OctreeGpu slot",
+                    applied.octree_log.initial_node_count, new_node_count,
+                );
+                self.octree.deallocate(spatial);
+                let entry = self.asset_cache.get_mut(handle)?;
+                let new_handle = self.octree.allocate(&entry.cpu_octree);
+                let entry = self.asset_cache.get_mut(handle)?;
+                entry.spatial_handle = new_handle;
+            } else if !applied.octree_log.is_empty() {
+                self.octree.apply_mutation_log(&spatial, &applied.octree_log);
+            }
+        }
+
         // Write LeafAttrs for newly-allocated slots. The brush picks
         // the material; the normal is whatever the kernel emitted
         // (outward-from-brush-center today, R7 may refine).

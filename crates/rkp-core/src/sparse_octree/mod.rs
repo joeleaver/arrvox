@@ -28,10 +28,12 @@ use crate::brick_map::{BrickMap, EMPTY_SLOT, INTERIOR_SLOT};
 
 mod insert;
 mod mutate;
+mod mutation_log;
 mod optimize;
 mod query;
 
 pub use mutate::CellState;
+pub use mutation_log::OctreeMutationLog;
 
 #[cfg(test)]
 mod tests;
@@ -158,6 +160,13 @@ pub struct SparseOctree {
     depth: u8,
     /// Voxel size at the finest (deepest) level.
     base_voxel_size: f32,
+    /// Active mutation log (when `Some`). The mutation primitives in
+    /// [`mutate`] route writes through `record_node_write` /
+    /// `record_attr_write`; callers that need a log opt in via
+    /// [`begin_mutation_log`] and take it back with
+    /// [`take_mutation_log`]. Boxed so the field stays cheap when
+    /// unused.
+    mutation_log: Option<Box<OctreeMutationLog>>,
 }
 
 impl SparseOctree {
@@ -172,6 +181,7 @@ impl SparseOctree {
             internal_attr_index: vec![INTERNAL_ATTR_NONE],
             depth,
             base_voxel_size,
+            mutation_log: None,
         }
     }
 
@@ -187,6 +197,7 @@ impl SparseOctree {
             nodes: nodes.to_vec(),
             depth,
             base_voxel_size,
+            mutation_log: None,
         }
     }
 
@@ -266,6 +277,40 @@ impl SparseOctree {
             "internal_attr_index length must match nodes length"
         );
         self.internal_attr_index = index;
+    }
+
+    /// Start a [`OctreeMutationLog`] capturing every subsequent write
+    /// to `nodes[]` and `internal_attr_index[]` made via the
+    /// `set_cell_*` primitives. Replaces any prior active log. The
+    /// log's `initial_node_count` is snapshotted now so the caller can
+    /// detect growth.
+    pub fn begin_mutation_log(&mut self) {
+        self.mutation_log = Some(Box::new(OctreeMutationLog::new(self.nodes.len() as u32)));
+    }
+
+    /// Take the active mutation log, clearing it from the tree. Returns
+    /// `None` when no log was active.
+    pub fn take_mutation_log(&mut self) -> Option<OctreeMutationLog> {
+        self.mutation_log.take().map(|b| *b)
+    }
+
+    /// Internal helper used by mutate primitives — record a single node
+    /// write if the log is active. The actual write to `self.nodes[i]`
+    /// is the caller's responsibility (kept separate to keep the
+    /// fast-path non-logging mutation a single store).
+    #[inline]
+    pub(super) fn record_node_write(&mut self, local_idx: u32, value: u32) {
+        if let Some(log) = self.mutation_log.as_mut() {
+            log.node_writes.push((local_idx, value));
+        }
+    }
+
+    /// Internal helper — record a single internal_attr_index write.
+    #[inline]
+    pub(super) fn record_attr_write(&mut self, local_idx: u32, value: u32) {
+        if let Some(log) = self.mutation_log.as_mut() {
+            log.attr_writes.push((local_idx, value));
+        }
     }
 
     /// Check if a voxel coordinate is in bounds for this tree.

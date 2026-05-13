@@ -300,10 +300,16 @@ impl SparseOctree {
         self.nodes.extend_from_slice(&[current; 8]);
         self.internal_attr_index
             .extend_from_slice(&[INTERNAL_ATTR_NONE; 8]);
+        for i in 0..8u32 {
+            self.record_node_write(children_offset as u32 + i, current);
+            self.record_attr_write(children_offset as u32 + i, INTERNAL_ATTR_NONE);
+        }
         self.nodes[node_idx] = children_offset as u32;
+        self.record_node_write(node_idx as u32, children_offset as u32);
         // The slot that was a terminator becomes a branch; its
         // (stale) prefilter attr at this index should now be NONE.
         self.internal_attr_index[node_idx] = INTERNAL_ATTR_NONE;
+        self.record_attr_write(node_idx as u32, INTERNAL_ATTR_NONE);
 
         let octant = octant_for_coord(coord, level, self.depth) as usize;
         let prev =
@@ -350,10 +356,12 @@ impl SparseOctree {
             if let Some(uniform) = brick_collapse_target(brick_pool, bid) {
                 brick_pool.deallocate(bid);
                 self.nodes[node_idx] = uniform;
+                self.record_node_write(node_idx as u32, uniform);
                 // Branch ancestors will be checked on the recursion's
                 // way up; this node's own internal_attr is now stale
                 // for a non-branch slot.
                 self.internal_attr_index[node_idx] = INTERNAL_ATTR_NONE;
+                self.record_attr_write(node_idx as u32, INTERNAL_ATTR_NONE);
             }
             return brick_cell_prev_slot(prev_cell);
         }
@@ -383,8 +391,11 @@ impl SparseOctree {
         // we just made it non-uniform.
         debug_assert!(brick_collapse_target(brick_pool, bid).is_none());
 
-        self.nodes[node_idx] = make_brick(bid);
+        let brick_node = make_brick(bid);
+        self.nodes[node_idx] = brick_node;
+        self.record_node_write(node_idx as u32, brick_node);
         self.internal_attr_index[node_idx] = INTERNAL_ATTR_NONE;
+        self.record_attr_write(node_idx as u32, INTERNAL_ATTR_NONE);
         None
     }
 
@@ -410,7 +421,9 @@ impl SparseOctree {
         };
         if self.nodes[node_idx] != new_node {
             self.nodes[node_idx] = new_node;
+            self.record_node_write(node_idx as u32, new_node);
             self.internal_attr_index[node_idx] = INTERNAL_ATTR_NONE;
+            self.record_attr_write(node_idx as u32, INTERNAL_ATTR_NONE);
         }
         prev
     }
@@ -436,7 +449,9 @@ impl SparseOctree {
             }
         }
         self.nodes[node_idx] = first;
+        self.record_node_write(node_idx as u32, first);
         self.internal_attr_index[node_idx] = INTERNAL_ATTR_NONE;
+        self.record_attr_write(node_idx as u32, INTERNAL_ATTR_NONE);
     }
 }
 

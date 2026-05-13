@@ -88,6 +88,59 @@ impl OctreeGpu {
         self.allocator.buffer_len()
     }
 
+    /// Apply a [`rkp_core::sparse_octree::OctreeMutationLog`] (typically
+    /// produced by [`rkp_core::sculpt::apply_delta`]) to the packed
+    /// buffer slot at `handle.root_offset`. Translates each local
+    /// `(idx, value)` write into an absolute packed-buffer write and
+    /// marks the affected GPU slots dirty for the next `upload_geometry`.
+    ///
+    /// Panics in debug builds if any logged index falls outside
+    /// `handle.len` — that indicates the tree grew past the allocator
+    /// slot and the caller should be doing a re-allocation instead.
+    /// Release-build behavior in the same case is to silently drop the
+    /// out-of-bounds writes; the GPU will then read stale data for the
+    /// grown region until the next full re-upload.
+    pub fn apply_mutation_log(
+        &mut self,
+        handle: &OctreeHandle,
+        log: &rkp_core::sparse_octree::OctreeMutationLog,
+    ) {
+        let base = handle.root_offset;
+        let cap = handle.len;
+        for &(local_idx, value) in &log.node_writes {
+            if local_idx >= cap {
+                debug_assert!(
+                    false,
+                    "OctreeMutationLog node write idx {local_idx} past slot len {cap} — \
+                     octree grew beyond its allocator slot. Caller must re-allocate.",
+                );
+                continue;
+            }
+            self.allocator.write_node(base + local_idx, value, base);
+        }
+        for &(local_idx, value) in &log.attr_writes {
+            if local_idx >= cap {
+                debug_assert!(
+                    false,
+                    "OctreeMutationLog attr write idx {local_idx} past slot len {cap}.",
+                );
+                continue;
+            }
+            self.allocator.write_internal_attr(base + local_idx, value);
+        }
+    }
+
+    /// Read-only view of the allocator's dirty range tracker. Used by
+    /// the upload path to drive delta writes.
+    pub fn dirty_ranges(&self) -> &rkp_core::DirtyRanges {
+        self.allocator.dirty_ranges()
+    }
+
+    /// Mutable view of the allocator's dirty range tracker. The upload
+    /// pass calls `clear()` after writing the deltas.
+    pub fn dirty_ranges_mut(&mut self) -> &mut rkp_core::DirtyRanges {
+        self.allocator.dirty_ranges_mut()
+    }
 }
 
 impl Default for OctreeGpu {
