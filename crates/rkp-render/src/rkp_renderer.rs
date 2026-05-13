@@ -151,10 +151,13 @@ pub struct RkpRenderer {
     /// for the user's material). Bisects "no glass visible" —
     /// see `mesh_glass.wesl::GlassFsParams`.
     mesh_glass_debug_force: u32,
-    /// Per-asset vertex/index buffer cache for the mesh path. Same
-    /// shape as `splat_buffers`, but each entry carries `(vbo, ibo,
-    /// index_count)`. Cleared on `release_mesh_for_asset`.
-    mesh_buffers: Vec<Option<(wgpu::Buffer, wgpu::Buffer, u32)>>,
+    /// Per-asset vertex/index buffer cache for the mesh path. Each
+    /// entry tracks the dispatch index count plus the byte count
+    /// already uploaded to each buffer; the upload path uses these to
+    /// emit tail-only `queue.write_buffer` calls when the asset only
+    /// appended new mesh data (R4c-V2 sculpt path is append-only).
+    /// Cleared on `release_mesh_for_asset`.
+    mesh_buffers: Vec<Option<MeshBuffersEntry>>,
     /// Per-asset meshlet cluster table on the GPU (Phase 5).
     /// `(buffer, cluster_count)`; the buffer holds a flat
     /// `[MeshletCluster]` array uploaded via `cast_slice` and is
@@ -185,36 +188,38 @@ pub struct RkpRenderer {
     shadow_csm_threshold_falloff: f32,
 }
 
-/// Grow-or-write a wgpu buffer: if `existing` is `Some` and big enough
-/// for `data`, do an in-place `queue.write_buffer` (async, cheap); else
-/// allocate a fresh buffer with 2× headroom and write the data into it.
-///
-/// **Why this exists.** The mesh / cluster upload path previously used
-/// `wgpu::util::DeviceExt::create_buffer_init` per stamp, which
-/// allocates a brand-new GPU buffer, memcpy's the contents into mapped
-/// memory, and unmaps. On a ~175 MB asset that's ~35 ms of CPU memcpy
-/// plus driver-side GPU allocation overhead (the dropped old buffer
-/// also queues for deferred free, building GPU memory pressure across
-/// stamps). For drag-friendly sculpt we need to amortize: 2× growth
-/// means the realloc only fires O(log N) times across N stamps; the
-/// rest hit the `queue.write_buffer` fast path.
-fn ensure_or_grow_buffer(
+/// Per-asset mesh buffer cache state. Tracks how many bytes have
+/// already been uploaded so the next `upload_mesh_for_asset` call can
+/// emit a tail-only `queue.write_buffer` for the appended region.
+struct MeshBuffersEntry {
+    vbo: wgpu::Buffer,
+    ibo: wgpu::Buffer,
+    dispatch_index_count: u32,
+    /// Bytes of vertex data already written to `vbo`. The next upload
+    /// streams `vertices_bytes[vbo_uploaded_bytes..]` at this offset.
+    vbo_uploaded_bytes: u64,
+    /// Bytes of index data already written to `ibo`.
+    ibo_uploaded_bytes: u64,
+}
+
+/// Allocate a fresh GPU buffer sized for `data` (with 2× headroom over
+/// an existing size if any) and write `data` into it. Used by D6's
+/// tail-only mesh upload path on the realloc fallback — the existing
+/// buffer is too small (CPU side overshot the GPU capacity) or the
+/// CPU side shrunk (we have to rewrite everything to invalidate the
+/// stale tail).
+fn grow_with_full_upload(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    existing: Option<wgpu::Buffer>,
+    existing_size: Option<u64>,
     label: &str,
     usage: wgpu::BufferUsages,
     data: &[u8],
 ) -> wgpu::Buffer {
     let needed = data.len() as u64;
-    if let Some(buffer) = existing.as_ref() {
-        if buffer.size() >= needed {
-            queue.write_buffer(buffer, 0, data);
-            return existing.unwrap();
-        }
-    }
-    let existing_size = existing.as_ref().map(|b| b.size()).unwrap_or(0);
-    let new_size = needed.max(existing_size.saturating_mul(2)).max(64);
+    let new_size = needed
+        .max(existing_size.unwrap_or(0).saturating_mul(2))
+        .max(64);
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: new_size,
@@ -224,6 +229,7 @@ fn ensure_or_grow_buffer(
     queue.write_buffer(&buffer, 0, data);
     buffer
 }
+
 
 impl RkpRenderer {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, _width: u32, _height: u32) -> Self {
@@ -434,36 +440,87 @@ impl RkpRenderer {
             return;
         }
 
-        // Ensure-and-write: realloc only when the buffer needs to grow,
-        // otherwise an async `queue.write_buffer` is much cheaper than
-        // a full `create_buffer_init` realloc. 2× growth amortizes the
-        // realloc cost across the geometric series of sculpt stamps
-        // (each stamp may grow the IBO by ~5 % via append-only
-        // patching; only every ~14 stamps triggers a realloc).
         let vbo_bytes: &[u8] = bytemuck::cast_slice(vertices);
         let ibo_bytes: &[u8] = bytemuck::cast_slice(indices);
+        let vbo_needed = vbo_bytes.len() as u64;
+        let ibo_needed = ibo_bytes.len() as u64;
 
-        let (existing_vbo, existing_ibo, _) = match self.mesh_buffers[idx].take() {
-            Some(t) => (Some(t.0), Some(t.1), t.2),
-            None => (None, None, 0),
+        // Take ownership of the existing entry (if any) so we can decide
+        // tail-only vs full upload below.
+        let existing = self.mesh_buffers[idx].take();
+        let (vbo, vbo_uploaded_bytes) = if let Some(e) = existing.as_ref() {
+            if e.vbo.size() >= vbo_needed && vbo_needed >= e.vbo_uploaded_bytes {
+                // Buffer fits and the CPU side only grew → tail-only.
+                // Also handles the `equal` case (skip the write entirely).
+                if vbo_needed > e.vbo_uploaded_bytes {
+                    queue.write_buffer(
+                        &e.vbo,
+                        e.vbo_uploaded_bytes,
+                        &vbo_bytes[e.vbo_uploaded_bytes as usize..],
+                    );
+                }
+                (e.vbo.clone(), vbo_needed)
+            } else {
+                // CPU side shrunk OR exceeded buffer capacity → reset.
+                let buf = grow_with_full_upload(
+                    &self.device, queue,
+                    Some(e.vbo.size()),
+                    "mesh asset vbo",
+                    wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    vbo_bytes,
+                );
+                (buf, vbo_needed)
+            }
+        } else {
+            let buf = grow_with_full_upload(
+                &self.device, queue,
+                None,
+                "mesh asset vbo",
+                wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                vbo_bytes,
+            );
+            (buf, vbo_needed)
         };
-        let vbo = ensure_or_grow_buffer(
-            &self.device, queue,
-            existing_vbo,
-            "mesh asset vbo",
-            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            vbo_bytes,
-        );
-        let ibo = ensure_or_grow_buffer(
-            &self.device, queue,
-            existing_ibo,
-            "mesh asset ibo (full DAG)",
-            wgpu::BufferUsages::INDEX
-                | wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST,
-            ibo_bytes,
-        );
-        self.mesh_buffers[idx] = Some((vbo, ibo, dispatch_index_count));
+
+        let (ibo, ibo_uploaded_bytes) = if let Some(e) = existing.as_ref() {
+            if e.ibo.size() >= ibo_needed && ibo_needed >= e.ibo_uploaded_bytes {
+                if ibo_needed > e.ibo_uploaded_bytes {
+                    queue.write_buffer(
+                        &e.ibo,
+                        e.ibo_uploaded_bytes,
+                        &ibo_bytes[e.ibo_uploaded_bytes as usize..],
+                    );
+                }
+                (e.ibo.clone(), ibo_needed)
+            } else {
+                let buf = grow_with_full_upload(
+                    &self.device, queue,
+                    Some(e.ibo.size()),
+                    "mesh asset ibo (full DAG)",
+                    wgpu::BufferUsages::INDEX
+                        | wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST,
+                    ibo_bytes,
+                );
+                (buf, ibo_needed)
+            }
+        } else {
+            let buf = grow_with_full_upload(
+                &self.device, queue,
+                None,
+                "mesh asset ibo (full DAG)",
+                wgpu::BufferUsages::INDEX
+                    | wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST,
+                ibo_bytes,
+            );
+            (buf, ibo_needed)
+        };
+
+        self.mesh_buffers[idx] = Some(MeshBuffersEntry {
+            vbo, ibo, dispatch_index_count,
+            vbo_uploaded_bytes, ibo_uploaded_bytes,
+        });
     }
 
     /// Drop the cached mesh buffers for `handle_raw`. Called when an
@@ -481,7 +538,7 @@ impl RkpRenderer {
         self.mesh_buffers
             .get(handle_raw as usize)
             .and_then(|s| s.as_ref())
-            .map(|(v, i, c)| (v, i, *c))
+            .map(|e| (&e.vbo, &e.ibo, e.dispatch_index_count))
     }
 
     /// Upload (or replace) the meshlet cluster table for an asset
