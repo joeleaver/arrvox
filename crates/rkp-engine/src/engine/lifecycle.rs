@@ -36,12 +36,25 @@ impl EngineState {
         use crate::viewport::ViewportId;
         let frame_start = std::time::Instant::now();
 
+        // ── [sculpt-pipeline-sim] phase timings ────────────────────────
+        // To debug the bump→submit gap surfaced by `[sculpt-pipeline]`,
+        // capture each major sim-side phase's wall time and emit one
+        // breakdown log when the tick processes (or carries forward)
+        // a pending geometry bump. Cheap (just Instant::elapsed) and
+        // only logs when relevant.
+        let phase_pre_drain = std::time::Instant::now();
+        let (pre_bump, pre_submit) = {
+            let sm = self.scene_mgr.lock().expect("scene_mgr poisoned");
+            (sm.last_geometry_bump_ns(), sm.last_geometry_submit_ns())
+        };
+
         // 0. Drain RenderResults that landed since last submit. The
         //    render thread runs on its own pace; the latest result it
         //    finished publishing carries the freshest pick decoding,
         //    cloud-sun atten, and GPU pass timings for us to fold back
         //    into sim state before we build the next snapshot.
         self.drain_render_results();
+        let phase_drain_ms = phase_pre_drain.elapsed().as_secs_f64() * 1000.0;
 
         // 0a. Material palette — built every tick and shipped in the
         //     snapshot. Render uploads every frame. Cheap (small Vec)
@@ -139,6 +152,7 @@ impl EngineState {
         // see last frame's overlay slice while the GPU buffer holds
         // this frame's content, missing the latest paint.
         let gpu_objects_dirty_this_frame = self.gpu_objects_dirty;
+        let phase_update_scene_gpu_t0 = std::time::Instant::now();
         if self.gpu_objects_dirty {
             let profile = self.paint_profile_active();
             let t0 = std::time::Instant::now();
@@ -162,7 +176,10 @@ impl EngineState {
             }
             self.gpu_objects_dirty = false;
         }
+        let phase_update_scene_gpu_ms =
+            phase_update_scene_gpu_t0.elapsed().as_secs_f64() * 1000.0;
 
+        let phase_painted_walk_t0 = std::time::Instant::now();
         if !shader_materials.is_empty() {
             // Reconcile the per-entity painted-material cache against
             // current paint + geometry epochs.
@@ -205,9 +222,25 @@ impl EngineState {
                 cur_geom != self.painted_materials_geometry_epoch;
             if geom_changed {
                 use crate::components::Renderable;
-                self.painted_per_entity.clear();
-                for (entity, _) in self.world.query::<&Renderable>().iter() {
-                    self.painted_dirty_entities.insert(entity);
+                // Blanket-invalidate ONLY when nobody told us which
+                // entities changed (asset load, bake worker, world
+                // reshuffle). When `painted_dirty_entities` already
+                // has specific entries — populated by `apply_sculpt_
+                // stamp`, paint, etc. — trust them: the walk below
+                // re-scans those entities' painted aabbs and updates
+                // their `painted_per_entity` cache. Other entities'
+                // cached scans stay valid (their octree topology
+                // didn't change).
+                //
+                // This is the difference between O(world)
+                // re-scan (~586 ms on splat5) and O(stamp footprint)
+                // re-scan (~ms). The dominant component of the
+                // `[sculpt-pipeline] bump→submit` gap.
+                if self.painted_dirty_entities.is_empty() {
+                    self.painted_per_entity.clear();
+                    for (entity, _) in self.world.query::<&Renderable>().iter() {
+                        self.painted_dirty_entities.insert(entity);
+                    }
                 }
             }
 
@@ -526,6 +559,8 @@ impl EngineState {
                 );
             }
         }
+        let phase_painted_walk_ms =
+            phase_painted_walk_t0.elapsed().as_secs_f64() * 1000.0;
 
         // Clear the dirty flag so any other consumers (UI, etc.)
         // know the palette they observed has been published. We
@@ -1205,9 +1240,29 @@ impl EngineState {
         // latency decomposition (bump→submit vs submit→pickup). Cheap
         // (one atomic write); no-op when there's no fresh bump to
         // attribute the submit to.
-        {
+        let post_bump = {
             let sm = self.scene_mgr.lock().expect("scene_mgr poisoned");
             sm.record_geometry_submit_now();
+            sm.last_geometry_bump_ns()
+        };
+        // Emit a phase breakdown when this tick had a bump to
+        // attribute — either a fresh one triggered during
+        // drain_render_results (sculpt) or one pending from before
+        // this tick that we're still working to submit.
+        if post_bump > pre_submit {
+            let total_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+            let other_ms = total_ms
+                - phase_drain_ms
+                - phase_update_scene_gpu_ms
+                - phase_painted_walk_ms;
+            eprintln!(
+                "[sculpt-pipeline-sim] drain={:.2}ms update_scene_gpu={:.2}ms painted_walk={:.2}ms other={:.2}ms total={:.2}ms",
+                phase_drain_ms,
+                phase_update_scene_gpu_ms,
+                phase_painted_walk_ms,
+                other_ms,
+                total_ms,
+            );
         }
         self.render_worker.inbox.submit(frame);
         let t_frame_end = frame_start.elapsed();

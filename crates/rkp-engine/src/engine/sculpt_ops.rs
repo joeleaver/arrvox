@@ -169,6 +169,15 @@ impl EngineState {
         // get re-assigned each frame inside `update_scene_gpu`.
         self.gpu_objects_dirty = true;
 
+        // Tell the painted-materials walk that THIS entity's geometry
+        // changed. Without this, the walk's `geom_changed` branch
+        // blanket-invalidates `painted_per_entity` and rewalks every
+        // entity in the world — measured at ~586 ms on a 22-entity
+        // splat5 scene (dominant component of the `[sculpt-pipeline]
+        // bump→submit` gap). With the entity in `painted_dirty_entities`,
+        // the walk re-scans only this one octree (~ms).
+        self.painted_dirty_entities.insert(entity);
+
         eprintln!(
             "[sculpt] stamp entity={:?} mode={:?} overlay_size={} (+{} this stamp)",
             entity, mode, overlay.len(), result.leaves_removed,
