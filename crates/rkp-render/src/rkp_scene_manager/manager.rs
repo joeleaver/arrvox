@@ -258,6 +258,24 @@ impl RkpSceneManager {
     // ── Geometry upload snapshot ─────────────────────────────────────
 
     pub fn geometry_upload(&self) -> GeometryUpload<'_> {
+        // Coalesce each pool's dirty ranges before handing them to the
+        // upload code: sculpt marks the same brick once per cell write
+        // (~64 cells/brick), so a 32 k-edit stamp can rack up 32 k
+        // duplicate marks of ~500 unique bricks. coalesce sorts and
+        // merges them into a minimal disjoint set, cutting both
+        // upload bytes (eliminates double-counting) and the
+        // queue.write_buffer syscall count (one call per disjoint
+        // range) by ~150× in the dense-edit case.
+        let mut octree_dirty = self.octree.dirty_ranges().clone();
+        octree_dirty.coalesce();
+        let mut leaf_attr_dirty = self.leaf_attr_pool.dirty_attrs().clone();
+        leaf_attr_dirty.coalesce();
+        let mut color_dirty = self.leaf_attr_pool.dirty_colors().clone();
+        color_dirty.coalesce();
+        let mut bone_dirty = self.leaf_attr_pool.dirty_bones().clone();
+        bone_dirty.coalesce();
+        let mut brick_dirty = self.brick_pool.dirty_ranges().clone();
+        brick_dirty.coalesce();
         GeometryUpload {
             octree_nodes: self.octree.data(),
             octree_internal_attrs: self.octree.internal_attrs_data(),
@@ -266,11 +284,11 @@ impl RkpSceneManager {
             bone_weights: self.leaf_attr_pool.bone_bytes(),
             brick_pool: self.brick_pool.as_bytes(),
             brick_face_links: rkp_core::brick_face_links::as_bytes(&self.brick_face_links),
-            octree_dirty: self.octree.dirty_ranges().clone(),
-            leaf_attr_dirty: self.leaf_attr_pool.dirty_attrs().clone(),
-            color_dirty: self.leaf_attr_pool.dirty_colors().clone(),
-            bone_dirty: self.leaf_attr_pool.dirty_bones().clone(),
-            brick_dirty: self.brick_pool.dirty_ranges().clone(),
+            octree_dirty,
+            leaf_attr_dirty,
+            color_dirty,
+            bone_dirty,
+            brick_dirty,
         }
     }
 

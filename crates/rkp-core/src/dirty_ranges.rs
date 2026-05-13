@@ -88,6 +88,46 @@ impl DirtyRanges {
     pub fn range_count(&self) -> usize {
         self.ranges.len()
     }
+
+    /// Sort marked ranges by offset and merge any that overlap or
+    /// abut. After this `iter()` yields a minimal list of disjoint
+    /// ranges and `total_dirty_bytes()` reports unique bytes (no
+    /// double-counting from repeated `mark` calls of the same region).
+    ///
+    /// Idempotent — calling twice does no extra work past the second
+    /// call's O(n) check.
+    ///
+    /// Cost: O(n log n) sort + O(n) merge, n = current range count.
+    /// Sculpt with many overlapping per-cell marks (~32k marks of
+    /// ~500 unique bricks on splat5) collapses to ~50-200 disjoint
+    /// ranges, cutting both upload bytes and `queue.write_buffer`
+    /// syscall count by ~150×.
+    pub fn coalesce(&mut self) {
+        if self.full || self.ranges.len() <= 1 {
+            return;
+        }
+        self.ranges.sort_unstable_by_key(|(off, _)| *off);
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(self.ranges.len());
+        for &(off, len) in &self.ranges {
+            if len == 0 {
+                continue;
+            }
+            let end = off.saturating_add(len);
+            if let Some(last) = merged.last_mut() {
+                let last_end = last.0.saturating_add(last.1);
+                if off <= last_end {
+                    // Overlap or touch — extend the previous range to
+                    // cover this one's end.
+                    let new_end = end.max(last_end);
+                    last.1 = new_end - last.0;
+                    continue;
+                }
+            }
+            merged.push((off, len));
+        }
+        self.ranges = merged;
+        self.total_bytes = self.ranges.iter().map(|(_, l)| *l as u64).sum();
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +210,102 @@ mod tests {
         let mut d = DirtyRanges::new();
         d.mark_full(8);
         assert!(d.should_coalesce_to_full(u64::MAX));
+    }
+
+    #[test]
+    fn coalesce_merges_duplicates() {
+        let mut d = DirtyRanges::new();
+        // Same brick marked 4 times — should collapse to one range.
+        d.mark(256, 256);
+        d.mark(256, 256);
+        d.mark(256, 256);
+        d.mark(256, 256);
+        d.coalesce();
+        let ranges: Vec<_> = d.iter().collect();
+        assert_eq!(ranges, vec![(256, 256)]);
+        assert_eq!(d.total_dirty_bytes(), 256);
+    }
+
+    #[test]
+    fn coalesce_merges_adjacent_ranges() {
+        let mut d = DirtyRanges::new();
+        d.mark(0, 256);    // [0, 256)
+        d.mark(256, 256);  // [256, 512) — touches the previous
+        d.mark(512, 256);  // [512, 768) — touches again
+        d.coalesce();
+        let ranges: Vec<_> = d.iter().collect();
+        assert_eq!(ranges, vec![(0, 768)]);
+    }
+
+    #[test]
+    fn coalesce_merges_overlapping_ranges() {
+        let mut d = DirtyRanges::new();
+        d.mark(0, 100);
+        d.mark(50, 100);  // overlaps with [0, 100)
+        d.mark(200, 50);  // disjoint
+        d.coalesce();
+        let ranges: Vec<_> = d.iter().collect();
+        assert_eq!(ranges, vec![(0, 150), (200, 50)]);
+    }
+
+    #[test]
+    fn coalesce_preserves_disjoint_ranges() {
+        let mut d = DirtyRanges::new();
+        d.mark(0, 16);
+        d.mark(100, 16);
+        d.mark(200, 16);
+        d.coalesce();
+        let ranges: Vec<_> = d.iter().collect();
+        assert_eq!(ranges, vec![(0, 16), (100, 16), (200, 16)]);
+        assert_eq!(d.total_dirty_bytes(), 48);
+    }
+
+    #[test]
+    fn coalesce_sorts_out_of_order_marks() {
+        let mut d = DirtyRanges::new();
+        d.mark(200, 16);
+        d.mark(0, 16);
+        d.mark(100, 16);
+        d.coalesce();
+        let ranges: Vec<_> = d.iter().collect();
+        assert_eq!(ranges, vec![(0, 16), (100, 16), (200, 16)]);
+    }
+
+    #[test]
+    fn coalesce_idempotent() {
+        let mut d = DirtyRanges::new();
+        d.mark(0, 50);
+        d.mark(60, 50);
+        d.coalesce();
+        let after_first: Vec<_> = d.iter().collect();
+        d.coalesce();
+        let after_second: Vec<_> = d.iter().collect();
+        assert_eq!(after_first, after_second);
+    }
+
+    #[test]
+    fn coalesce_skips_full_pool() {
+        let mut d = DirtyRanges::new();
+        d.mark_full(1024);
+        d.coalesce();
+        // Full-pool mode stays as the single (0, 1024) range.
+        assert!(d.is_full_pool(1024));
+    }
+
+    #[test]
+    fn coalesce_handles_many_duplicates() {
+        // Mimics the sculpt brick-pool case: many marks of the same
+        // brick from per-cell set_cell calls. 1000 marks of the same
+        // 256 B range → 1 range after coalesce.
+        let mut d = DirtyRanges::new();
+        for _ in 0..1000 {
+            d.mark(1024, 256);
+        }
+        assert_eq!(d.range_count(), 1000);
+        assert_eq!(d.total_dirty_bytes(), 256_000); // pre-coalesce: duplicates counted
+        d.coalesce();
+        assert_eq!(d.range_count(), 1);
+        assert_eq!(d.total_dirty_bytes(), 256);
     }
 
     #[test]
