@@ -167,6 +167,21 @@ pub(super) fn run_render_thread(
             .map(|p| iter_start.duration_since(p).as_secs_f32() * 1000.0);
         prev_render_start = Some(iter_start);
 
+        // Periodically log the frame cadence so the user can tell
+        // whether the GPU is keeping up with sim. One line every 60
+        // real frames — at 60 fps that's once a second; at 1 fps
+        // it's once a minute. The dt itself is what matters for
+        // diagnosis (>=33 ms → <30 fps → user-perceptible
+        // upload-to-visible lag).
+        if let Some(dt) = render_dt_ms {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static FRAME_LOG_COUNTER: AtomicU32 = AtomicU32::new(0);
+            let n = FRAME_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+            if n % 60 == 0 {
+                eprintln!("[render-frame] dt={dt:.1}ms (~{:.1} fps)", 1000.0 / dt.max(0.1));
+            }
+        }
+
         // Render-thread sub-phase timing, gated on
         // `RKP_RENDER_PROFILE=1`. Mirrors the sim-thread `[snap]`
         // line — emits one ms-split per real frame so we can
