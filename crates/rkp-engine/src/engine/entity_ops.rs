@@ -230,7 +230,7 @@ impl EngineState {
         // it out here keeps the dirty set tight.
         self.painted_per_entity.remove(&entity);
         self.painted_dirty_entities.remove(&entity);
-        self.entities_known_empty.remove(&entity);
+        self.painted_dirty_regions.remove(&entity);
 
         // Phase A1 mutation event — see docs/PERF_DEBT.md. Scaffolding
         // only (no consumers yet).
@@ -381,7 +381,7 @@ impl EngineState {
         self.sculpt_overlays.clear();
         self.painted_per_entity.clear();
         self.painted_dirty_entities.clear();
-        self.entities_known_empty.clear();
+        self.painted_dirty_regions.clear();
         // Phase A1 mutation event for project/scene reset. Scaffolding
         // only — see docs/PERF_DEBT.md.
         self.mutation_log.push(super::mutation_log::MutationEvent::WorldReset);

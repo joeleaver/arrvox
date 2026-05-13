@@ -180,15 +180,20 @@ impl EngineState {
         // the walk re-scans only this one octree (~ms).
         self.painted_dirty_entities.insert(entity);
 
-        // Raise mode can add a new leaf with the brush's material — if
-        // that material happens to be shader-bearing, the cached "no
-        // shader materials" verdict on this entity becomes stale.
-        // Force a re-scan by removing from the known-empty set. Carve
-        // never adds materials, so its sculpts preserve the cache and
-        // hit the fast skip path in the walk.
-        if matches!(mode, SculptMode::Raise) {
-            self.entities_known_empty.remove(&entity);
-        }
+        // Phase C1: record the brush footprint (world space) so the
+        // painted-materials walk can scope its octree scan to this
+        // region instead of walking the full entity octree. Both Raise
+        // and Carve get a region entry — Carve might evict shader-
+        // bearing leaves whose tiles need rebuilding; Raise might add
+        // new shader-bearing leaves under the brush. See
+        // `docs/PERF_DEBT.md` C1.
+        self.painted_dirty_regions
+            .entry(entity)
+            .or_default()
+            .push(rkp_core::Aabb::from_center_half_extents(
+                world_pos,
+                Vec3::splat(radius),
+            ));
 
         // Push a scope-carrying mutation event so Phase B/C consumers
         // can update their derived state incrementally. Phase A1 is

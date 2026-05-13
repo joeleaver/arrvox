@@ -75,7 +75,7 @@ impl EngineState {
             debug_last_anchor_seeds: None,
             painted_per_entity: std::collections::HashMap::new(),
             painted_dirty_entities: std::collections::HashSet::new(),
-            entities_known_empty: std::collections::HashSet::new(),
+            painted_dirty_regions: std::collections::HashMap::new(),
             mutation_log: super::super::mutation_log::MutationLog::new(),
             painted_materials_paint_epoch: 0,
             painted_materials_geometry_epoch: 0,

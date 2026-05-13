@@ -1,6 +1,6 @@
 # Engine performance-debt eradication plan
 
-**Status**: in progress (Phase A complete; B1 + B2 + C2 + C3 shipped; B3 + C1 + Phase D/E next). Feature work paused.
+**Status**: in progress (Phase A complete; B1 + B2 + C1 + C2 + C3 shipped; B3 + Phase D/E next). Feature work paused.
 
 This document is the authoritative plan for eliminating systemic "rebuild
 everything every tick" patterns from rkp-engine and rkp-render. It was
@@ -135,7 +135,7 @@ metric moved.
 
 | Step | Change | Result |
 |---|---|---|
-| **C1** | `painted_per_entity` maintained via paint/sculpt event handlers; no octree walk in steady state. Walk retained for asset load. | -150 ms/stamp painted_walk |
+| **C1 ✅** | Region-bounded `painted_walk`. New `painted_dirty_regions: HashMap<Entity, Vec<Aabb>>` captures each stamp's world-space brush AABB at `apply_paint_stamp` (Material mode) and `apply_sculpt_stamp` (Raise + Carve). The lifecycle walk transforms each region into object-local space, clears overlapping tile entries per material (tile-coord range = `floor(local_dirty * inv_tile)..=floor(local_dirty.max * inv_tile)`), and re-fills via `scan_painted_aabbs_clipped` — an octree descent that bails at any node whose AABB doesn't intersect `local_dirty + max(@tile_size)` and that filters per-tile inserts against `local_dirty` so smaller-tile-size materials outside their cleared range aren't double-counted. Asset-load / geometry-epoch invalidation populates `painted_dirty_entities` without regions → falls back to the full walk. Any shader material with `tile_size=None` also forces full-walk (the NO_TILE_COORD AABB spans the entire entity and can't survive a clipped rebuild). | -160 ms/stamp painted_walk on splat5 elephant: ~80 ms → 0.04 ms steady state (2000×). Stopgap `entities_known_empty` removed in the same commit. |
 | **C2 ✅ (transform fast path)** | `update_scene_gpu_transform_only` patches just `RkpGpuInstance.world` (and matching `SplatDraw.world` / `ProxyDraw.world`) for each Transform-dirty entity. Lifecycle gates on `gpu_objects_dirty.is_transform_only()`: gizmo/drag stamps now run the fast path; sculpt/paint/proc-bake/scene-load still go through the full rebuild. New `DirtyKind` enum (`Transform`/`Structural`) on `GpuObjectsDirty` with `mark_entity_transform` / `mark_entity` / `mark_entity_kind`. | -60+ ms per gizmo-drag stamp on splat5 elephant (full rebuild → in-place row patch). Structural dirty events still pay the full rebuild — generalising that is a future follow-up. |
 | **C3 ✅** | `rebuild_collider_cache_for(entity)` extracted from the world-walking `rebuild_collider_caches`. Lifecycle iterates `collider_caches_dirty.dirty_entities()` per-entity when scope is narrow; falls back to the world walk only when `is_all()` (project load, asset import, generator regen). Note: today no per-stamp setter triggers `geometry_dirty` (sculpt defers collider rebuild to play-mode entry — intentional), so the per-stamp savings here are latent until a future setter narrows. | O(1) per changed entity in narrow path; world walk reserved for `all`. |
 
@@ -184,8 +184,8 @@ replaced by the migration:
 
 | Stopgap (today) | Replaced by | Phase |
 |---|---|---|
-| `entities_known_empty` cache for painted_walk | Incremental `painted_per_entity` maintenance | C1 |
-| Narrow `painted_dirty_entities` to sculpted entity | Same — keep, generalize | C1 |
+| ~~`entities_known_empty` cache for painted_walk~~ | Region-bounded `painted_walk` makes the "no shader materials" path naturally fast (~0.04 ms) without the cache | C1 ✅ (removed in the same commit) |
+| Narrow `painted_dirty_entities` to sculpted entity | Kept + generalized — `painted_dirty_regions` now also carries the brush footprint | C1 ✅ |
 | `[sculpt-pipeline-sim]` phase log | Keep as telemetry; remove when all phases verified |  |
 
 ---

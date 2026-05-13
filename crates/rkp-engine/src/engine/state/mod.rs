@@ -310,27 +310,28 @@ pub(crate) struct EngineState {
     /// than holding it across all entities for the duration of the
     /// O(all-octrees) walk.
     pub(crate) painted_dirty_entities: std::collections::HashSet<hecs::Entity>,
-    /// Entities for which the most recent painted-materials walk found
-    /// ZERO shader-bearing materials. Skips re-walking these entities
-    /// on subsequent sculpt-only triggers — the sculpt mutation can't
-    /// introduce a shader-bearing material in Carve mode, so the cache
-    /// stays valid.
+    /// Per-stamp brush AABBs (world space) accumulated since the last
+    /// walk, keyed by entity. Populated alongside `painted_dirty_entities`
+    /// by `apply_paint_stamp` (Material mode) and `apply_sculpt_stamp`.
     ///
-    /// Mutated:
-    /// - **Walk** inserts when `mat_tiles` ends empty; removes when
-    ///   non-empty.
-    /// - **`apply_paint_stamp` Material mode** removes when it lands a
-    ///   stamp (the new material might be shader-bearing).
-    /// - **`apply_sculpt_stamp` Raise mode** removes (might add a leaf
-    ///   with a shader-bearing brush material).
-    /// - **Entity despawn** removes the entry.
+    /// The walk uses this to scope its octree scan to the brush
+    /// footprint plus the largest shader-material `tile_size`, instead
+    /// of walking the entire entity octree. An entity in the dirty set
+    /// *without* a region entry (e.g. the geometry-epoch fallback when
+    /// nobody told us which entities changed) falls back to the full
+    /// walk path.
     ///
-    /// The win: on the splat5 elephant with no painted shader
-    /// materials, scan_painted_aabbs walks the full 2.5M-voxel octree
-    /// each sculpt for ~150 ms only to find zero matches. Caching the
-    /// "no shader materials" result cuts this to ~0 ms after the
-    /// first walk.
-    pub(crate) entities_known_empty: std::collections::HashSet<hecs::Entity>,
+    /// Drained per tick by the walk; cleared on entity despawn and
+    /// scene clear.
+    ///
+    /// Phase C1 of `docs/PERF_DEBT.md` — replaces the
+    /// `entities_known_empty` stopgap from the 2026-05-13 sculpt
+    /// session. With region-bounded scans, "zero shader materials"
+    /// entities pay the cost of walking the brush footprint only
+    /// (~ms) instead of the full ~2.5M-voxel octree (~150 ms), so the
+    /// stopgap is no longer needed.
+    pub(crate) painted_dirty_regions:
+        std::collections::HashMap<hecs::Entity, Vec<rkp_core::Aabb>>,
     /// Typed mutation event log — every CPU-side mutation describes
     /// its scope here. Phase A1 of `docs/PERF_DEBT.md`: scaffolding
     /// only, no consumers. Drained at the start of each

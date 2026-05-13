@@ -185,11 +185,19 @@ impl EngineState {
             // 60+ Hz drag path off the O(octree) walk entirely.
             if matches!(mode, PaintMode::Material) {
                 self.painted_dirty_entities.insert(entity);
-                // Material-mode paint may introduce a shader-bearing
-                // material on this entity — force the next walk to
-                // re-scan instead of trusting the cached "no shader
-                // materials" verdict.
-                self.entities_known_empty.remove(&entity);
+                // Phase C1: record the brush footprint (world space) so
+                // the walk can scope its octree scan to this region
+                // instead of walking the full entity octree. The walk
+                // converts to object-local at consume time via the
+                // entity's current Transform — decoupling stamp-time
+                // and walk-time transforms.
+                self.painted_dirty_regions
+                    .entry(entity)
+                    .or_default()
+                    .push(rkp_core::Aabb::from_center_half_extents(
+                        world_pos,
+                        Vec3::splat(radius),
+                    ));
             }
 
             // Push a scope-carrying mutation event. Phase A1 scaffolding;
