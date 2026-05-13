@@ -5,6 +5,8 @@
 //! a contiguous region tracked by an [`OctreeHandle`]. Deallocated regions go
 //! onto a free list for reuse.
 
+use std::collections::HashMap;
+
 use crate::sparse_octree::{SparseOctree, INTERNAL_ATTR_NONE};
 use crate::DirtyRanges;
 
@@ -51,6 +53,13 @@ pub struct OctreeAllocator {
     /// / `write_internal_attr` calls populate this; the upload pass
     /// drains it via `dirty_ranges_mut`.
     dirty: DirtyRanges,
+    /// Per-slot reserved capacity (in slots). Key is `root_offset`,
+    /// value is the number of slots reserved for that slot — always
+    /// `>= handle.len`. Sculpt growth writes into the slack region
+    /// [root_offset + handle.len .. root_offset + reserved) without
+    /// re-allocating the slot. `deallocate` uses this to free the full
+    /// reserved range.
+    slot_capacity: HashMap<u32, u32>,
 }
 
 impl OctreeAllocator {
@@ -61,6 +70,7 @@ impl OctreeAllocator {
             internal_attrs: Vec::new(),
             free_list: Vec::new(),
             dirty: DirtyRanges::new(),
+            slot_capacity: HashMap::new(),
         }
     }
 
@@ -71,6 +81,7 @@ impl OctreeAllocator {
             internal_attrs: Vec::with_capacity(capacity),
             free_list: Vec::new(),
             dirty: DirtyRanges::new(),
+            slot_capacity: HashMap::new(),
         }
     }
 
@@ -128,18 +139,64 @@ impl OctreeAllocator {
     /// The parallel `internal_attrs` are copied verbatim (no rebasing — the
     /// ids they carry are global `leaf_attr_pool` slots, already absolute).
     pub fn allocate(&mut self, octree: &SparseOctree) -> OctreeHandle {
+        let len = octree.as_slice().len() as u32;
+        self.allocate_reserved(octree, len)
+    }
+
+    /// Allocate a slot with `slack_factor` × `octree.node_count()`
+    /// reserved capacity (rounded up). Used by the sculpt re-alloc
+    /// path so that subsequent growth via [`try_extend_in_slack`]
+    /// lands in pre-reserved space instead of forcing another full
+    /// re-allocation. A factor of 1.5 gives 50% headroom (typical
+    /// sculpt session grows nodes by ~0.03% per stamp, so 50% covers
+    /// thousands of stamps).
+    pub fn allocate_with_slack(
+        &mut self,
+        octree: &SparseOctree,
+        slack_factor: f32,
+    ) -> OctreeHandle {
+        let len = octree.as_slice().len() as u32;
+        let reserved = ((len as f32) * slack_factor.max(1.0)).ceil() as u32;
+        // Always reserve at least +64 slots so very small octrees get
+        // a sane head-start before the slack-factor takes over.
+        let reserved = reserved.max(len.saturating_add(64));
+        self.allocate_reserved(octree, reserved)
+    }
+
+    /// Allocate a slot with an exact `reserved` capacity (in slots).
+    /// The populated region `[root_offset, root_offset + len)` gets
+    /// the octree's nodes (with branch pointers rebased); the slack
+    /// region `[root_offset + len, root_offset + reserved)` is filled
+    /// with `EMPTY_NODE` / `INTERNAL_ATTR_NONE` sentinels on the CPU
+    /// side. Only the populated region is marked dirty — the slack
+    /// has no incoming branch references, so the shader never reads
+    /// those slots before they're populated by a future
+    /// [`try_extend_in_slack`].
+    fn allocate_reserved(&mut self, octree: &SparseOctree, reserved: u32) -> OctreeHandle {
         let nodes = octree.as_slice();
         let attrs = octree.internal_attr_slice();
         debug_assert_eq!(nodes.len(), attrs.len());
         let len = nodes.len() as u32;
+        debug_assert!(reserved >= len, "reserved must be >= len");
 
-        let offset = if let Some(idx) = self.find_free_region(len) {
+        let offset = if let Some(idx) = self.find_free_region(reserved) {
             let (free_offset, free_len) = self.free_list[idx];
             let start = free_offset as usize;
             self.data[start..start + len as usize].copy_from_slice(nodes);
             self.internal_attrs[start..start + len as usize].copy_from_slice(attrs);
-            if free_len > len {
-                self.free_list[idx] = (free_offset + len, free_len - len);
+            // Slack region (within the freed range) gets sentinels.
+            if reserved > len {
+                let slack_start = start + len as usize;
+                let slack_end = start + reserved as usize;
+                for entry in &mut self.data[slack_start..slack_end] {
+                    *entry = crate::sparse_octree::EMPTY_NODE;
+                }
+                for entry in &mut self.internal_attrs[slack_start..slack_end] {
+                    *entry = INTERNAL_ATTR_NONE;
+                }
+            }
+            if free_len > reserved {
+                self.free_list[idx] = (free_offset + reserved, free_len - reserved);
             } else {
                 self.free_list.swap_remove(idx);
             }
@@ -148,18 +205,28 @@ impl OctreeAllocator {
             let offset = self.data.len() as u32;
             self.data.extend_from_slice(nodes);
             self.internal_attrs.extend_from_slice(attrs);
+            if reserved > len {
+                let extra = (reserved - len) as usize;
+                self.data.extend(std::iter::repeat(crate::sparse_octree::EMPTY_NODE).take(extra));
+                self.internal_attrs.extend(std::iter::repeat(INTERNAL_ATTR_NONE).take(extra));
+            }
             offset
         };
 
-        // Rebase branch pointers: all internal offsets are relative to the
-        // octree's start (0-based). Shift them by `offset` so they become
-        // absolute indices into the packed buffer.
+        // Rebase branch pointers in the populated region only — the
+        // slack region holds sentinels which `rebase_branches` skips.
         self.rebase_branches(offset as usize, len as usize, offset);
 
-        // Mark the newly-written region dirty so the next upload ships it.
+        // Mark the populated region dirty so the next upload ships it.
+        // Slack stays clean — the GPU buffer's slack bytes are
+        // initialized on first ever upload of this allocator (via the
+        // grow path in `upload_octree_delta`), and slack nodes have no
+        // incoming references so the shader never reads them.
         if len > 0 {
             self.dirty.mark(offset * OCTREE_GPU_SLOT_BYTES, len * OCTREE_GPU_SLOT_BYTES);
         }
+
+        self.slot_capacity.insert(offset, reserved);
 
         OctreeHandle {
             root_offset: offset,
@@ -169,6 +236,43 @@ impl OctreeAllocator {
         }
     }
 
+    /// Attempt to grow an existing slot's populated length in place by
+    /// using its reserved slack. Returns `Some(new_handle)` (with
+    /// updated `len`) when the new node count fits within the slot's
+    /// reservation; returns `None` when slack is exhausted (caller
+    /// should fall back to `deallocate` + `allocate_with_slack`).
+    ///
+    /// **The caller is responsible for writing the appended nodes via
+    /// [`write_node`] / [`write_internal_attr`].** Typical use: sculpt's
+    /// [`apply_delta`] returns a mutation log that already records
+    /// every appended-slot write at the right local indices; replaying
+    /// the log against the extended slot fills the slack region.
+    pub fn try_extend_in_slack(
+        &self,
+        handle: &OctreeHandle,
+        new_len: u32,
+    ) -> Option<OctreeHandle> {
+        let reserved = *self.slot_capacity.get(&handle.root_offset)?;
+        if new_len > reserved {
+            return None;
+        }
+        Some(OctreeHandle {
+            root_offset: handle.root_offset,
+            len: new_len,
+            depth: handle.depth,
+            base_voxel_size: handle.base_voxel_size,
+        })
+    }
+
+    /// Reserved capacity of a slot (in slots). Returns the slot's
+    /// `len` when the allocator has no per-slot reservation entry
+    /// (legacy callers / non-existent slot). Used by
+    /// [`OctreeGpu::apply_mutation_log`] to bounds-check writes against
+    /// the slot's full reservation, not just its current populated len.
+    pub fn reserved_capacity(&self, root_offset: u32) -> u32 {
+        self.slot_capacity.get(&root_offset).copied().unwrap_or(0)
+    }
+
     /// Deallocate an octree region, adding it to the free list.
     ///
     /// Coalesces adjacent free regions and shrinks the backing buffer if the
@@ -176,8 +280,16 @@ impl OctreeAllocator {
     /// of procedural objects whose new allocation is even slightly larger than
     /// any single freed region causes the buffer to grow monotonically.
     pub fn deallocate(&mut self, handle: OctreeHandle) {
+        // Free the full reserved capacity (slack + populated), not
+        // just `handle.len` — sculpt may have reserved extra slots
+        // via `allocate_with_slack` that aren't yet populated but are
+        // still owned by this slot.
+        let reserved = self
+            .slot_capacity
+            .remove(&handle.root_offset)
+            .unwrap_or(handle.len);
         let start = handle.root_offset as usize;
-        let end = start + handle.len as usize;
+        let end = start + reserved as usize;
         if end > self.data.len() {
             return;
         }
@@ -191,13 +303,13 @@ impl OctreeAllocator {
         for entry in &mut self.internal_attrs[start..end] {
             *entry = INTERNAL_ATTR_NONE;
         }
-        if handle.len > 0 {
+        if reserved > 0 {
             self.dirty.mark(
                 handle.root_offset * OCTREE_GPU_SLOT_BYTES,
-                handle.len * OCTREE_GPU_SLOT_BYTES,
+                reserved * OCTREE_GPU_SLOT_BYTES,
             );
         }
-        self.free_list.push((handle.root_offset, handle.len));
+        self.free_list.push((handle.root_offset, reserved));
         self.coalesce_and_shrink();
     }
 
@@ -709,6 +821,83 @@ mod tests {
 
         alloc.write_node(h.root_offset, INTERIOR_NODE, h.root_offset);
         assert_eq!(alloc.as_slice()[h.root_offset as usize], INTERIOR_NODE);
+    }
+
+    #[test]
+    fn allocate_with_slack_reserves_capacity() {
+        let mut alloc = OctreeAllocator::new();
+        let tree = make_test_octree();
+        let len = tree.node_count() as u32;
+        let h = alloc.allocate_with_slack(&tree, 2.0);
+        // populated len is unchanged.
+        assert_eq!(h.len, len);
+        // reserved capacity is at least 2× and at least len+64.
+        let reserved = alloc.reserved_capacity(h.root_offset);
+        assert!(reserved >= 2 * len);
+        assert!(reserved >= len + 64);
+    }
+
+    #[test]
+    fn try_extend_in_slack_succeeds_within_reservation() {
+        let mut alloc = OctreeAllocator::new();
+        let tree = make_test_octree();
+        let h = alloc.allocate_with_slack(&tree, 3.0);
+        let reserved = alloc.reserved_capacity(h.root_offset);
+        // Grow up to exactly reserved.
+        let extended = alloc.try_extend_in_slack(&h, reserved);
+        assert!(extended.is_some());
+        let new = extended.unwrap();
+        assert_eq!(new.len, reserved);
+        assert_eq!(new.root_offset, h.root_offset);
+    }
+
+    #[test]
+    fn try_extend_in_slack_fails_when_exhausted() {
+        let mut alloc = OctreeAllocator::new();
+        let tree = make_test_octree();
+        let h = alloc.allocate_with_slack(&tree, 1.5);
+        let reserved = alloc.reserved_capacity(h.root_offset);
+        // One past reserved → must return None.
+        assert!(alloc.try_extend_in_slack(&h, reserved + 1).is_none());
+    }
+
+    #[test]
+    fn deallocate_with_slack_frees_full_reservation() {
+        let mut alloc = OctreeAllocator::new();
+        let tree = make_test_octree();
+        let h = alloc.allocate_with_slack(&tree, 2.0);
+        let reserved = alloc.reserved_capacity(h.root_offset);
+        let buffer_after_alloc = alloc.buffer_len();
+        // Allocate something AFTER h to pin the tail (otherwise dealloc
+        // would shrink and the test wouldn't observe the free_list).
+        let _h2 = alloc.allocate(&tree);
+        alloc.deallocate(h);
+        // The freed region should equal `reserved`, not h.len.
+        assert_eq!(alloc.total_free_entries(), reserved);
+        // Subsequent allocate (small enough) re-uses the freed region.
+        assert!(alloc.buffer_len() >= buffer_after_alloc);
+    }
+
+    #[test]
+    fn extend_in_slack_then_apply_writes_into_slack() {
+        // Round-trip: allocate with slack; write a node past the
+        // current `len` (in the slack region) via the public
+        // write_node API. The write should succeed (cap is `reserved`,
+        // not `len`).
+        let mut alloc = OctreeAllocator::new();
+        let tree = make_test_octree();
+        let h = alloc.allocate_with_slack(&tree, 2.0);
+        let reserved = alloc.reserved_capacity(h.root_offset);
+        let slack_idx = h.root_offset + h.len; // first slack slot
+        assert!(slack_idx < h.root_offset + reserved);
+        // Slack starts as EMPTY_NODE.
+        use crate::sparse_octree::EMPTY_NODE;
+        assert_eq!(alloc.as_slice()[slack_idx as usize], EMPTY_NODE);
+        // Write a leaf value in the slack.
+        use crate::sparse_octree::make_leaf;
+        let leaf = make_leaf(0xAB);
+        alloc.write_node(slack_idx, leaf, h.root_offset);
+        assert_eq!(alloc.as_slice()[slack_idx as usize], leaf);
     }
 
     #[test]

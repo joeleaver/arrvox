@@ -90,29 +90,29 @@ impl OctreeGpu {
 
     /// Apply a [`rkp_core::sparse_octree::OctreeMutationLog`] (typically
     /// produced by [`rkp_core::sculpt::apply_delta`]) to the packed
-    /// buffer slot at `handle.root_offset`. Translates each local
-    /// `(idx, value)` write into an absolute packed-buffer write and
-    /// marks the affected GPU slots dirty for the next `upload_geometry`.
+    /// buffer slot at `handle.root_offset`. Bounds-checks each write
+    /// against the slot's **reserved capacity** (not its `len`) so
+    /// writes into the slack region populated by [`try_extend_in_slack`]
+    /// succeed without forcing a full slot re-allocation.
     ///
-    /// Panics in debug builds if any logged index falls outside
-    /// `handle.len` — that indicates the tree grew past the allocator
-    /// slot and the caller should be doing a re-allocation instead.
-    /// Release-build behavior in the same case is to silently drop the
-    /// out-of-bounds writes; the GPU will then read stale data for the
-    /// grown region until the next full re-upload.
+    /// Drops any write whose local index falls outside the slot's
+    /// reservation — those indicate the tree grew past even the slack
+    /// and the caller must have re-allocated before calling this.
     pub fn apply_mutation_log(
         &mut self,
         handle: &OctreeHandle,
         log: &rkp_core::sparse_octree::OctreeMutationLog,
     ) {
         let base = handle.root_offset;
-        let cap = handle.len;
+        let cap = self
+            .allocator
+            .reserved_capacity(base)
+            .max(handle.len);
         for &(local_idx, value) in &log.node_writes {
             if local_idx >= cap {
                 debug_assert!(
                     false,
-                    "OctreeMutationLog node write idx {local_idx} past slot len {cap} — \
-                     octree grew beyond its allocator slot. Caller must re-allocate.",
+                    "OctreeMutationLog node write idx {local_idx} past slot reserved cap {cap}.",
                 );
                 continue;
             }
@@ -122,12 +122,36 @@ impl OctreeGpu {
             if local_idx >= cap {
                 debug_assert!(
                     false,
-                    "OctreeMutationLog attr write idx {local_idx} past slot len {cap}.",
+                    "OctreeMutationLog attr write idx {local_idx} past slot reserved cap {cap}.",
                 );
                 continue;
             }
             self.allocator.write_internal_attr(base + local_idx, value);
         }
+    }
+
+    /// Try to grow `handle.len` in place to `new_len` by consuming
+    /// slack. Returns `Some(new_handle)` on success; `None` if slack
+    /// is exhausted (caller should `deallocate` + `allocate_with_slack`).
+    pub fn try_extend_in_slack(
+        &self,
+        handle: &OctreeHandle,
+        new_len: u32,
+    ) -> Option<OctreeHandle> {
+        self.allocator.try_extend_in_slack(handle, new_len)
+    }
+
+    /// Same as [`allocate`] but reserves `slack_factor` × `node_count`
+    /// slots so subsequent growth can land in slack via
+    /// [`try_extend_in_slack`].
+    pub fn allocate_with_slack(
+        &mut self,
+        octree: &SparseOctree,
+        slack_factor: f32,
+    ) -> OctreeHandle {
+        let handle = self.allocator.allocate_with_slack(octree, slack_factor);
+        self.live_handles.push(handle);
+        handle
     }
 
     /// Read-only view of the allocator's dirty range tracker. Used by

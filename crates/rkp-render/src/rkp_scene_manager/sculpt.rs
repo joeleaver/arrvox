@@ -234,28 +234,39 @@ impl RkpSceneManager {
         // Closes the latent CPU↔GPU sync bug: `apply_delta` mutated
         // `entry.cpu_octree.nodes`, but without this step those changes
         // never reach the packed buffer that `upload_geometry` ships.
-        // Sculpt today only works because typical stamps stay within
-        // existing bricks (brick-pool path covers it); octree-node
-        // mutations (brick materialize/collapse, branch subdivide)
-        // would silently drop on the floor.
         //
-        // V1 falls back to a full octree re-allocation if the tree grew
-        // past its allocator slot — rare for sculpt on dense assets,
-        // expected to fire on Raise-into-virgin-region.
+        // Growth handling: every drag stamp typically subdivides a few
+        // empty/interior terminators (+200-400 nodes on splat5). D8's
+        // slot-slack lets us extend `handle.len` in place without a
+        // re-allocation — the mutation log already records the
+        // appended slots, so applying it after `try_extend_in_slack`
+        // populates the slack region. We only fall back to dealloc +
+        // allocate_with_slack when the slack itself is exhausted; the
+        // re-allocation then reserves more headroom for future stamps.
         {
             let entry = self.asset_cache.get_mut(handle)?;
             let spatial = entry.spatial_handle;
             let new_node_count = entry.cpu_octree.node_count() as u32;
             if applied.octree_log.grew(new_node_count) {
-                eprintln!(
-                    "[sculpt] octree grew {} → {} nodes — re-allocating OctreeGpu slot",
-                    applied.octree_log.initial_node_count, new_node_count,
-                );
-                self.octree.deallocate(spatial);
-                let entry = self.asset_cache.get_mut(handle)?;
-                let new_handle = self.octree.allocate(&entry.cpu_octree);
-                let entry = self.asset_cache.get_mut(handle)?;
-                entry.spatial_handle = new_handle;
+                let extended = self.octree.try_extend_in_slack(&spatial, new_node_count);
+                match extended {
+                    Some(new_handle) => {
+                        let entry = self.asset_cache.get_mut(handle)?;
+                        entry.spatial_handle = new_handle;
+                        self.octree.apply_mutation_log(&new_handle, &applied.octree_log);
+                    }
+                    None => {
+                        eprintln!(
+                            "[sculpt] octree slack exhausted ({} → {} nodes) — re-allocating slot",
+                            applied.octree_log.initial_node_count, new_node_count,
+                        );
+                        self.octree.deallocate(spatial);
+                        let entry = self.asset_cache.get_mut(handle)?;
+                        let new_handle = self.octree.allocate_with_slack(&entry.cpu_octree, 1.5);
+                        let entry = self.asset_cache.get_mut(handle)?;
+                        entry.spatial_handle = new_handle;
+                    }
+                }
             } else if !applied.octree_log.is_empty() {
                 self.octree.apply_mutation_log(&spatial, &applied.octree_log);
             }
