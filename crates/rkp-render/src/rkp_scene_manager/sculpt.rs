@@ -58,6 +58,91 @@ pub struct SculptApplyResult {
     pub leaves_add_skipped: usize,
 }
 
+/// Mark every meshlet cluster reachable from the brush-touched seed
+/// set with `CLUSTER_FLAG_LOD_DIRTY`, by walking the bipartite
+/// cluster ↔ DAG-group graph.
+///
+/// Each seed cluster's chain is followed through `group_above_idx`
+/// (groups consuming this cluster as a child) and `group_below_idx`
+/// (groups that produced this cluster as a parent). Within each
+/// visited group we enqueue both `consumed` (siblings + descendants)
+/// and `produced` (parents) so the walk reaches the full connected
+/// component containing the seeds — exactly what the
+/// `mesh_lod_select` admit rule needs to keep every chain consistent
+/// (force-admit dirty LOD-0 leaves; drop dirty LOD>0 ancestors).
+///
+/// Falls back to asset-wide marking when the entry has no DAG
+/// topology (`dag_groups.is_empty()`), preserving v5-load behavior.
+///
+/// Returns the number of clusters that had their `LOD_DIRTY` flag
+/// newly set (for diagnostics — narrowing perf shows up here vs
+/// total `meshlet_clusters.len()`).
+fn mark_lod_dirty_chains(
+    entry: &mut super::types::AssetEntry,
+    seeds: &[u32],
+) -> usize {
+    use rkp_core::mesh_cluster::{CLUSTER_FLAG_LOD_DIRTY, DAG_GROUP_NONE};
+    let cluster_count = entry.meshlet_clusters.len();
+
+    if entry.dag_groups.is_empty() {
+        // Pre-v6 asset — no DAG topology baked. Asset-wide marking
+        // preserves current behavior (no cluster-shaped voids, no
+        // perf narrowing). Re-bake via rkp-convert --rebuild-mesh
+        // to migrate to v6 and unlock per-chain narrowing.
+        for c in entry.meshlet_clusters.iter_mut() {
+            c.flags |= CLUSTER_FLAG_LOD_DIRTY;
+        }
+        return cluster_count;
+    }
+
+    let mut visited = vec![false; cluster_count];
+    let mut queue: std::collections::VecDeque<u32> =
+        std::collections::VecDeque::with_capacity(seeds.len());
+    for &cidx in seeds {
+        if (cidx as usize) < cluster_count && !visited[cidx as usize] {
+            visited[cidx as usize] = true;
+            queue.push_back(cidx);
+        }
+    }
+    while let Some(cidx) = queue.pop_front() {
+        let c = &entry.meshlet_clusters[cidx as usize];
+        let g_above = c.group_above_idx;
+        let g_below = c.group_below_idx;
+        for g_idx in [g_above, g_below] {
+            if g_idx == DAG_GROUP_NONE {
+                continue;
+            }
+            let g = entry.dag_groups[g_idx as usize];
+            let cons_lo = g.consumed_first as usize;
+            let cons_hi = cons_lo + g.consumed_count as usize;
+            for &nbr in &entry.dag_consumed[cons_lo..cons_hi] {
+                let n = nbr as usize;
+                if n < cluster_count && !visited[n] {
+                    visited[n] = true;
+                    queue.push_back(nbr);
+                }
+            }
+            let prod_lo = g.produced_first as usize;
+            let prod_hi = prod_lo + g.produced_count as usize;
+            for &nbr in &entry.dag_produced[prod_lo..prod_hi] {
+                let n = nbr as usize;
+                if n < cluster_count && !visited[n] {
+                    visited[n] = true;
+                    queue.push_back(nbr);
+                }
+            }
+        }
+    }
+    let mut marked = 0usize;
+    for (idx, c) in entry.meshlet_clusters.iter_mut().enumerate() {
+        if visited[idx] {
+            c.flags |= CLUSTER_FLAG_LOD_DIRTY;
+            marked += 1;
+        }
+    }
+    marked
+}
+
 impl RkpSceneManager {
     /// Apply one sculpt brush stamp against an asset's geometry.
     ///
@@ -597,13 +682,42 @@ impl RkpSceneManager {
             });
         }
 
-        // ── Phase 4: asset-wide LOD_DIRTY ─────────────────────────────
-        {
+        // ── Phase 4: per-chain LOD_DIRTY via DAG CC walk ──────────────
+        //
+        // R4d V2 (Option A from project_sculpt_drag_pick_roundtrip):
+        // walk the bipartite cluster ↔ DAG-group graph starting from
+        // every brush-touched LOD-0 cluster, and mark every cluster
+        // it reaches with `LOD_DIRTY`. The mesh_lod_select shader's
+        // admit rule force-admits dirty LOD-0 leaves and drops dirty
+        // LOD>0 ancestors — so by marking exactly the chains in the
+        // brush footprint, we keep the un-touched portion of the
+        // asset on its normal Karis admit path (renders at coarse
+        // LOD, ~188 fps) instead of the asset-wide LOD-0 clamp that
+        // R4d V1 used (~44 fps on the elephant).
+        //
+        // Correctness of the walk: the bake-time DAG records, per
+        // cluster, `group_above_idx` (the group that consumed it as
+        // a child) and `group_below_idx` (the group that produced it
+        // as a parent). For each visited cluster we enqueue both
+        // groups' full membership — `consumed` (siblings + further
+        // descendants via shared parents) and `produced` (parents /
+        // ancestors). Iterating to fixpoint gives the connected
+        // component containing the brush seeds. Every chain a
+        // brush-touched leaf belongs to is fully marked, so the
+        // shader's drop-ancestor + force-admit-leaf logic stays
+        // consistent within each chain (no cluster-shaped voids,
+        // which is what killed the earlier per-brush-AABB attempt
+        // in commit c577d85d).
+        //
+        // Fallback: assets baked before v6 carry an empty
+        // `dag_groups` — we can't run the CC walk without topology,
+        // so keep the asset-wide loop. Re-bake via
+        // `cargo run -p rkp-convert -- --rebuild-mesh <asset>.rkp`
+        // to migrate to v6 and unlock the per-chain narrowing.
+        let walk_visited_count = {
             let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
-            for c in entry.meshlet_clusters.iter_mut() {
-                c.flags |= rkp_core::mesh_cluster::CLUSTER_FLAG_LOD_DIRTY;
-            }
-        }
+            mark_lod_dirty_chains(entry, &dirty)
+        };
 
         // ── Phase 5: refresh `mesh_lod0_index_count` + dirty flags ────
         // The legacy direct-draw dispatch (debug-only) reads
@@ -624,9 +738,11 @@ impl RkpSceneManager {
         entry.mesh_dirty = true;
         entry.clusters_dirty = true;
 
+        let total_clusters = entry.meshlet_clusters.len();
         eprintln!(
             "[sculpt] V2 patch: handle={:?} dirty={} kept_tris={} dropped_tris={} \
-             brush_patch verts={} tris={} total flat verts={} indices={} ({:.2}ms)",
+             brush_patch verts={} tris={} total flat verts={} indices={} \
+             lod_dirty={}/{} ({:.0}%) ({:.2}ms)",
             handle,
             dirty.len(),
             total_kept_tris,
@@ -635,6 +751,13 @@ impl RkpSceneManager {
             brush_indices.len() / 3,
             entry.mesh_vertices.len(),
             entry.mesh_indices.len(),
+            walk_visited_count,
+            total_clusters,
+            if total_clusters > 0 {
+                100.0 * walk_visited_count as f64 / total_clusters as f64
+            } else {
+                0.0
+            },
             t0.elapsed().as_secs_f64() * 1000.0,
         );
 
@@ -855,6 +978,132 @@ mod tests {
         assert!(sm
             .clusters_in_brush_grid_aabb(handle, IVec3::ZERO, IVec3::splat(10))
             .is_empty());
+    }
+
+    /// Hand-build a small two-chain DAG and stick it onto an
+    /// `AssetEntry`, so [`mark_lod_dirty_chains`] tests can run
+    /// without invoking the full bake.
+    ///
+    /// Layout — two independent chains, each LOD-0 + LOD-1:
+    ///   chain X: c0_a, c0_b (LOD-0) →  g0  → c1_x (LOD-1)
+    ///   chain Y: c0_c, c0_d (LOD-0) →  g1  → c1_y (LOD-1)
+    /// IDs in `meshlet_clusters`: 0 = c0_a, 1 = c0_b, 2 = c0_c,
+    /// 3 = c0_d, 4 = c1_x, 5 = c1_y.
+    fn two_chain_entry() -> AssetEntry {
+        use rkp_core::mesh_lod::DagGroup;
+        let clusters = vec![
+            cluster([0.0; 3], [1.0; 3], 0),  // 0 c0_a (chain X)
+            cluster([1.0; 3], [2.0; 3], 0),  // 1 c0_b (chain X)
+            cluster([5.0; 3], [6.0; 3], 0),  // 2 c0_c (chain Y)
+            cluster([6.0; 3], [7.0; 3], 0),  // 3 c0_d (chain Y)
+            cluster([0.0; 3], [2.0; 3], 1),  // 4 c1_x (chain X)
+            cluster([5.0; 3], [7.0; 3], 1),  // 5 c1_y (chain Y)
+        ];
+        let mut entry = make_entry(clusters, 8);
+        entry.dag_groups = vec![
+            DagGroup { consumed_first: 0, consumed_count: 2, produced_first: 0, produced_count: 1 },
+            DagGroup { consumed_first: 2, consumed_count: 2, produced_first: 1, produced_count: 1 },
+        ];
+        entry.dag_consumed = vec![0, 1, 2, 3];
+        entry.dag_produced = vec![4, 5];
+        // Set per-cluster topology pointers consistent with groups.
+        entry.meshlet_clusters[0].group_above_idx = 0;
+        entry.meshlet_clusters[1].group_above_idx = 0;
+        entry.meshlet_clusters[4].group_below_idx = 0;
+        entry.meshlet_clusters[2].group_above_idx = 1;
+        entry.meshlet_clusters[3].group_above_idx = 1;
+        entry.meshlet_clusters[5].group_below_idx = 1;
+        entry
+    }
+
+    fn dirty_set(entry: &AssetEntry) -> Vec<u32> {
+        use rkp_core::mesh_cluster::CLUSTER_FLAG_LOD_DIRTY;
+        entry
+            .meshlet_clusters
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.flags & CLUSTER_FLAG_LOD_DIRTY != 0)
+            .map(|(i, _)| i as u32)
+            .collect()
+    }
+
+    #[test]
+    fn mark_lod_dirty_chains_narrows_to_seed_chain() {
+        // Seed = c0_a (id 0, chain X). Walk must mark c0_a, c0_b
+        // (sibling under g0), c1_x (parent in g0). It MUST NOT touch
+        // chain Y (c0_c, c0_d, c1_y) — that's the whole point of the
+        // per-chain narrowing vs asset-wide.
+        let mut entry = two_chain_entry();
+        let marked = mark_lod_dirty_chains(&mut entry, &[0]);
+        assert_eq!(marked, 3);
+        assert_eq!(dirty_set(&entry), vec![0, 1, 4]);
+    }
+
+    #[test]
+    fn mark_lod_dirty_chains_seeds_from_both_chains_mark_both() {
+        // Two seeds, one in each chain → both chains marked, all 6
+        // clusters dirty.
+        let mut entry = two_chain_entry();
+        let marked = mark_lod_dirty_chains(&mut entry, &[0, 2]);
+        assert_eq!(marked, 6);
+        assert_eq!(dirty_set(&entry), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn mark_lod_dirty_chains_seed_from_lod1_walks_down_to_leaves() {
+        // Seed = c1_x (id 4) — a LOD-1 parent. Walk must descend
+        // through group_below_idx to mark c0_a + c0_b. Chain Y stays
+        // untouched.
+        let mut entry = two_chain_entry();
+        let marked = mark_lod_dirty_chains(&mut entry, &[4]);
+        assert_eq!(marked, 3);
+        assert_eq!(dirty_set(&entry), vec![0, 1, 4]);
+    }
+
+    #[test]
+    fn mark_lod_dirty_chains_fallback_when_dag_empty() {
+        // V5 asset with no baked DAG topology — fallback marks
+        // every cluster (preserving the R4d V1 behavior).
+        let mut entry = two_chain_entry();
+        entry.dag_groups.clear();
+        entry.dag_consumed.clear();
+        entry.dag_produced.clear();
+        // The cluster pointers don't matter on the fallback path,
+        // but reset them anyway to model a v5 entry.
+        for c in entry.meshlet_clusters.iter_mut() {
+            c.group_above_idx = rkp_core::mesh_cluster::DAG_GROUP_NONE;
+            c.group_below_idx = rkp_core::mesh_cluster::DAG_GROUP_NONE;
+        }
+        let marked = mark_lod_dirty_chains(&mut entry, &[0]);
+        assert_eq!(marked, 6);
+        assert_eq!(dirty_set(&entry), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn mark_lod_dirty_chains_idempotent_dirty_flag() {
+        // Pre-existing LOD_DIRTY on one cluster + a separate seed
+        // must not double-flip or miss the new chain.
+        use rkp_core::mesh_cluster::CLUSTER_FLAG_LOD_DIRTY;
+        let mut entry = two_chain_entry();
+        // Pre-mark c1_y by hand (simulating a leftover from a prior
+        // stamp). The OR-set must leave it dirty.
+        entry.meshlet_clusters[5].flags |= CLUSTER_FLAG_LOD_DIRTY;
+        let marked = mark_lod_dirty_chains(&mut entry, &[0]);
+        // Walk only marks chain X this stamp. c1_y stays dirty from
+        // pre-marking; chain Y leaves stay clean.
+        assert_eq!(marked, 3, "walk only touches chain X");
+        assert_eq!(dirty_set(&entry), vec![0, 1, 4, 5]);
+    }
+
+    #[test]
+    fn mark_lod_dirty_chains_handles_out_of_range_seeds() {
+        // A stale seed pointing past the cluster table must be
+        // silently skipped — patch-cluster appends would otherwise
+        // shift cluster ids and we don't want to panic.
+        let mut entry = two_chain_entry();
+        let marked = mark_lod_dirty_chains(&mut entry, &[0, 999]);
+        assert_eq!(marked, 3);
+        assert_eq!(dirty_set(&entry), vec![0, 1, 4]);
     }
 
     #[test]
