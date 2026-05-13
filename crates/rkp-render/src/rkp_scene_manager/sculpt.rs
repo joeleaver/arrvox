@@ -27,8 +27,9 @@
 use glam::{Affine3A, IVec3, Vec3};
 
 use rkp_core::mesh_cluster::{cluster_grid_aabb, cluster_overlaps_brush_grid_aabb};
+use rkp_core::mesh_cluster::{MeshletCluster, PARENT_GROUP_ERROR_ROOT};
 use rkp_core::mesh_extract::{
-    collect_cell_map, extract_mesh_region_from_cells, extract_surface_mesh,
+    collect_cell_map_in_region, extract_mesh_region_from_cells, extract_surface_mesh,
 };
 use rkp_core::mesh_lod::build_cluster_dag_with_levels;
 use rkp_core::sculpt::{
@@ -340,43 +341,39 @@ impl RkpSceneManager {
         dirty
     }
 
-    /// Per-cluster region re-extract (Phase B R4c) — **append-only**.
+    /// Per-stamp mesh patch — **filter dirty clusters + extract brush
+    /// region once** (Phase B R4c V2).
     ///
-    /// For each LOD-0 cluster whose grid AABB intersects the brush
-    /// (via R3's `clusters_in_brush_grid_aabb`):
-    /// 1. Re-extracts the cluster's grid AABB (1-cell pad) via
-    ///    [`extract_mesh_region_from_cells`] against a single cell
-    ///    map built once per stamp.
-    /// 2. Appends the new verts to the tail of `mesh_vertices` and the
-    ///    new (rebased) indices to the tail of `mesh_indices`.
-    /// 3. Redirects the cluster's `index_offset` / `index_count` to
-    ///    the appended range — the cluster's *old* indices become
-    ///    orphaned (still in the buffer but unreferenced by any
-    ///    cluster table entry, harmless besides a small per-stamp
-    ///    leak that R5 will compact away).
+    /// The earlier "re-extract each dirty cluster's full grid AABB"
+    /// path was correct but produced ~3 000 tris per cluster on
+    /// splat5-style ground-plane assets (cluster AABBs are far bigger
+    /// than the brush sphere). With 80+ dirty clusters per stamp the
+    /// mesh grew ~25 ×/stamp unboundedly, and the per-cluster extract
+    /// loop ran 5 s/stamp.
     ///
-    /// Sets `CLUSTER_FLAG_LOD_DIRTY` on every cluster of the asset so
-    /// the shader admits only LOD-0 (force-fresh) and drops every
-    /// LOD>0 (otherwise stale-LOD ancestors render their pre-sculpt
-    /// geometry on top of the new LOD-0).
+    /// V2 flips the model: each dirty cluster's existing triangles get
+    /// *filtered* (any tri whose vertex sits inside the brush sphere
+    /// is dropped, the rest are kept); the brush region's new surface
+    /// is then re-extracted **once** and appended as a fresh LOD-0
+    /// cluster. Per-stamp growth is bounded by the brush volume, not
+    /// the dirty-cluster footprint.
     ///
-    /// **Why append-only.** An earlier per-cluster-owned design
-    /// stored each cluster's `(local_vertices, local_indices)` in
-    /// `cluster_meshes`, then re-flattened on every stamp. That
-    /// duplicated boundary verts per-cluster — on a ~100 k-cluster
-    /// multi-LOD asset that 2-3 ×'d the VBO size (~6.5 M verts vs
-    /// ~2.5 M original), OOM'd "mesh asset vbo" on a 4-6 GB GPU on
-    /// the user's first stamp. Append-only keeps the load-time flat
-    /// VBO/IBO verbatim; each stamp grows it by ~the dirty clusters'
-    /// post-extract size only.
+    /// **Boundary seam.** Pre-brush SN-cube vertex positions (centroid
+    /// of edge crossings against the OLD occupancy field) differ
+    /// sub-voxel from post-brush positions at the same cube. The
+    /// filter/keep boundary on the *dirty cluster* side uses pre-brush
+    /// verts; the new brush-region patch uses post-brush verts. A
+    /// thin band at the brush-sphere boundary may show a tiny seam.
+    /// Acceptable for V1; proper stitching is an R5 follow-up.
     ///
-    /// Returns `true` when the per-cluster path fired (at least one
-    /// LOD-0 cluster was dirty); `false` when the dirty set is empty
-    /// or the asset has no mesh — caller falls back to full re-extract.
+    /// Returns `true` when the V2 path fired; `false` when the dirty
+    /// set is empty or the asset has no mesh — caller falls back to
+    /// the full re-extract path.
     fn rebuild_dirty_clusters(&mut self, handle: AssetHandle, op: &BrushOp) -> bool {
         let t0 = std::time::Instant::now();
 
-        let (depth, base_vs, grid_origin, brush_lo, brush_hi) = {
+        let (depth, base_vs, grid_origin, brush_lo, brush_hi,
+             brush_center_local, brush_radius_sq) = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
             if entry.meshlet_clusters.is_empty() {
                 return false;
@@ -391,7 +388,16 @@ impl RkpSceneManager {
             let (lo, hi) = brush_cell_range(op, extent);
             let brush_lo = IVec3::new(lo.x as i32, lo.y as i32, lo.z as i32);
             let brush_hi = IVec3::new(hi.x as i32, hi.y as i32, hi.z as i32);
-            (depth, base_vs, grid_origin, brush_lo, brush_hi)
+
+            // Brush sphere in **object-local** space (same coords as
+            // `MeshVertex::local_pos`). `op.center` is in finest-grid
+            // units; convert to object-local via grid_origin + grid * vs.
+            let brush_center_local = grid_origin + op.center * base_vs;
+            let brush_radius_local = op.radius * base_vs;
+            let brush_radius_sq = brush_radius_local * brush_radius_local;
+
+            (depth, base_vs, grid_origin, brush_lo, brush_hi,
+             brush_center_local, brush_radius_sq)
         };
 
         if brush_lo.x >= brush_hi.x || brush_lo.y >= brush_hi.y || brush_lo.z >= brush_hi.z {
@@ -403,94 +409,143 @@ impl RkpSceneManager {
             return false;
         }
 
-        // Build the dense cell map ONCE for the stamp.
+        // ── Phase 1: filter each dirty cluster's tris ─────────────────
+        //
+        // Walk each cluster's existing tris; keep only those with ALL
+        // three verts strictly outside the brush sphere. Append the
+        // kept indices to the tail of `mesh_indices`; redirect the
+        // cluster's `index_offset` / `index_count`.
+        //
+        // Reading `mesh_vertices[idx]` is safe alongside `mesh_indices.
+        // extend(...)` because we read in a separate scope per cluster
+        // and the extend goes to the TAIL — the original cluster slot
+        // (which we read) is not touched.
+        let mut total_kept_tris = 0usize;
+        let mut total_dropped_tris = 0usize;
+        for &cid in &dirty {
+            let (start, count) = {
+                let Some(entry) = self.asset_cache.get(handle) else { return false; };
+                let c = &entry.meshlet_clusters[cid as usize];
+                (c.index_offset as usize, c.index_count as usize)
+            };
+
+            // Snapshot tri-by-tri "keep" decisions into a small vec to
+            // dodge borrow-checker fights between immutable reads of
+            // mesh_vertices/mesh_indices and the later mutable extend.
+            let kept: Vec<u32> = {
+                let Some(entry) = self.asset_cache.get(handle) else { return false; };
+                let indices = &entry.mesh_indices;
+                let verts = &entry.mesh_vertices;
+                let mut out = Vec::with_capacity(count);
+                for tri_start in (start..start + count).step_by(3) {
+                    let i0 = indices[tri_start];
+                    let i1 = indices[tri_start + 1];
+                    let i2 = indices[tri_start + 2];
+                    let p0 = Vec3::from(verts[i0 as usize].local_pos);
+                    let p1 = Vec3::from(verts[i1 as usize].local_pos);
+                    let p2 = Vec3::from(verts[i2 as usize].local_pos);
+                    let d0 = (p0 - brush_center_local).length_squared();
+                    let d1 = (p1 - brush_center_local).length_squared();
+                    let d2 = (p2 - brush_center_local).length_squared();
+                    if d0 > brush_radius_sq && d1 > brush_radius_sq && d2 > brush_radius_sq {
+                        out.push(i0);
+                        out.push(i1);
+                        out.push(i2);
+                    }
+                }
+                out
+            };
+
+            total_kept_tris += kept.len() / 3;
+            total_dropped_tris += count / 3 - kept.len() / 3;
+
+            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
+            let new_offset = entry.mesh_indices.len() as u32;
+            entry.mesh_indices.extend_from_slice(&kept);
+            let cluster = &mut entry.meshlet_clusters[cid as usize];
+            cluster.index_offset = new_offset;
+            cluster.index_count = kept.len() as u32;
+            // AABB stays at the cluster's pre-stamp bounds — the kept
+            // tris are a subset of the original, so they fit inside
+            // the original AABB. Shrinking is left to R5.
+        }
+
+        // ── Phase 2: extract brush region once ────────────────────────
+        //
+        // Use the region-scoped cell-map walker so we don't pay
+        // O(asset surface area) per stamp. Pad the map by +3 cells
+        // each side so SN-cube vertex builds at the boundary see all
+        // 8 corner cells in the map.
+        let cells_min = brush_lo - IVec3::splat(3);
+        let cells_max = brush_hi + IVec3::splat(3);
         let cells = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
-            collect_cell_map(
+            collect_cell_map_in_region(
                 entry.cpu_octree.as_slice(),
                 depth,
                 self.brick_pool.as_slice(),
+                cells_min,
+                cells_max,
             )
         };
 
-        // V1 limitation (also true for the previous design): each
-        // dirty cluster's region is bounded by its own pre-stamp grid
-        // AABB only. Raise past existing cluster bounds creates cells
-        // outside any cluster's region; those are mutated in the
-        // octree but not captured in the mesh. R5 fixes via
-        // re-clustering at idle.
-        let mut total_appended_verts = 0usize;
-        let mut total_appended_indices = 0usize;
-        let mut total_freed_indices = 0usize;
-        for &cid in &dirty {
-            let (region_min, region_max) = {
-                let Some(entry) = self.asset_cache.get(handle) else { return false; };
-                let cluster = entry.meshlet_clusters[cid as usize];
-                let (cmin, mut cmax) = cluster_grid_aabb(&cluster, grid_origin, base_vs);
-                cmax += IVec3::ONE; // inclusive → half-open
-                (cmin, cmax)
-            };
+        let (brush_verts, brush_indices) = {
+            let Some(entry) = self.asset_cache.get(handle) else { return false; };
+            extract_mesh_region_from_cells(
+                &cells,
+                brush_lo,
+                brush_hi,
+                entry.cpu_octree.as_slice(),
+                depth,
+                base_vs,
+                grid_origin,
+                self.brick_pool.as_slice(),
+                self.leaf_attr_pool.as_slice(),
+                self.leaf_attr_pool.bones_as_slice(),
+            )
+        };
 
-            let (new_verts, new_indices) = {
-                let Some(entry) = self.asset_cache.get(handle) else { return false; };
-                extract_mesh_region_from_cells(
-                    &cells,
-                    region_min,
-                    region_max,
-                    entry.cpu_octree.as_slice(),
-                    depth,
-                    base_vs,
-                    grid_origin,
-                    self.brick_pool.as_slice(),
-                    self.leaf_attr_pool.as_slice(),
-                    self.leaf_attr_pool.bones_as_slice(),
-                )
-            };
-
-            // New float AABB from re-extracted verts (collapses to
-            // origin if the cluster's region is now empty).
-            let mut new_aabb_min = [f32::INFINITY; 3];
-            let mut new_aabb_max = [f32::NEG_INFINITY; 3];
-            for v in &new_verts {
+        // ── Phase 3: append brush region as a new LOD-0 patch cluster ─
+        if !brush_verts.is_empty() {
+            let mut patch_aabb_min = [f32::INFINITY; 3];
+            let mut patch_aabb_max = [f32::NEG_INFINITY; 3];
+            for v in &brush_verts {
                 for k in 0..3 {
-                    if v.local_pos[k] < new_aabb_min[k] {
-                        new_aabb_min[k] = v.local_pos[k];
+                    if v.local_pos[k] < patch_aabb_min[k] {
+                        patch_aabb_min[k] = v.local_pos[k];
                     }
-                    if v.local_pos[k] > new_aabb_max[k] {
-                        new_aabb_max[k] = v.local_pos[k];
+                    if v.local_pos[k] > patch_aabb_max[k] {
+                        patch_aabb_max[k] = v.local_pos[k];
                     }
                 }
             }
-            if new_verts.is_empty() {
-                new_aabb_min = [0.0; 3];
-                new_aabb_max = [0.0; 3];
-            }
 
-            // Append-only update: push the new verts/indices onto the
-            // tail of the flat buffers, redirect the cluster to the
-            // new range. Old indices stay in the buffer but no cluster
-            // references them — orphaned, harmless leak.
             let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
             let vertex_offset = entry.mesh_vertices.len() as u32;
             let new_index_offset = entry.mesh_indices.len() as u32;
-            entry.mesh_vertices.extend_from_slice(&new_verts);
-            entry.mesh_indices.extend(
-                new_indices.iter().map(|&i| i + vertex_offset),
-            );
+            entry.mesh_vertices.extend_from_slice(&brush_verts);
+            entry.mesh_indices
+                .extend(brush_indices.iter().map(|&i| i + vertex_offset));
 
-            total_appended_verts += new_verts.len();
-            total_appended_indices += new_indices.len();
-
-            let cluster = &mut entry.meshlet_clusters[cid as usize];
-            total_freed_indices += cluster.index_count as usize;
-            cluster.aabb_min = new_aabb_min;
-            cluster.aabb_max = new_aabb_max;
-            cluster.index_offset = new_index_offset;
-            cluster.index_count = new_indices.len() as u32;
+            entry.meshlet_clusters.push(MeshletCluster {
+                aabb_min: patch_aabb_min,
+                _pad0: 0.0,
+                aabb_max: patch_aabb_max,
+                index_offset: new_index_offset,
+                index_count: brush_indices.len() as u32,
+                lod_level: 0,
+                // Patch cluster is born already-dirty so it admits
+                // unconditionally on the next render (its position
+                // wasn't in the original DAG so Karis would otherwise
+                // have nothing to project against).
+                flags: rkp_core::mesh_cluster::CLUSTER_FLAG_LOD_DIRTY,
+                cluster_error: 0.0,
+                parent_group_error: PARENT_GROUP_ERROR_ROOT,
+                _pad3: [0; 3],
+            });
         }
 
-        // Asset-wide LOD-0 clamp via CLUSTER_FLAG_LOD_DIRTY (see the
-        // shader's admit-rule comment for the why).
+        // ── Phase 4: asset-wide LOD_DIRTY ─────────────────────────────
         {
             let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
             for c in entry.meshlet_clusters.iter_mut() {
@@ -498,14 +553,12 @@ impl RkpSceneManager {
             }
         }
 
-        // Re-sum the LOD-0 prefix length. With append-only, dirty
-        // LOD-0 clusters' indices are now in the tail of mesh_indices
-        // (past their original LOD-0-prefix slots), but the legacy
-        // `direct_mode` debug-only dispatch still walks
-        // `0 .. mesh_lod0_index_count`. Sum is approximate since the
-        // appended tail can include both LOD-0 and (in future)
-        // LOD>0 entries; keeping the formula identical to the
-        // re-extract / build path so the field stays interpretable.
+        // ── Phase 5: refresh `mesh_lod0_index_count` ──────────────────
+        // The legacy direct-draw dispatch (debug-only) reads
+        // `[0..mesh_lod0_index_count)`. The active indirect-draw path
+        // ignores this and walks per-cluster offsets/counts, so the
+        // value is informational for the legacy path only. Sum across
+        // all LOD-0 cluster entries (including the new patch cluster).
         let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
         entry.mesh_lod0_index_count = entry
             .meshlet_clusters
@@ -515,13 +568,14 @@ impl RkpSceneManager {
             .sum();
 
         eprintln!(
-            "[sculpt] per-cluster re-extract: handle={:?} dirty={} appended verts={} \
-             indices={} freed indices={} total flat verts={} indices={} ({:.2}ms)",
+            "[sculpt] V2 patch: handle={:?} dirty={} kept_tris={} dropped_tris={} \
+             brush_patch verts={} tris={} total flat verts={} indices={} ({:.2}ms)",
             handle,
             dirty.len(),
-            total_appended_verts,
-            total_appended_indices,
-            total_freed_indices,
+            total_kept_tris,
+            total_dropped_tris,
+            brush_verts.len(),
+            brush_indices.len() / 3,
             entry.mesh_vertices.len(),
             entry.mesh_indices.len(),
             t0.elapsed().as_secs_f64() * 1000.0,

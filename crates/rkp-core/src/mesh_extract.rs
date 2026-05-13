@@ -642,6 +642,164 @@ const CUBE_OFFSETS_PER_FACE: [[IVec3; 4]; 6] = [
     ],
 ];
 
+/// Walk the octree but populate `cells` only with non-empty cells
+/// inside the half-open region `[region_min, region_max)` (plus a small
+/// pad walked at the branch level so SN-cube boundary stitching has
+/// data on either side).
+///
+/// **Phase B R4c-V2** uses this to avoid the full-asset cell-map walk
+/// per stamp. For a small brush region in a deep octree the recursive
+/// walk prunes any branch whose AABB doesn't intersect the region, so
+/// only a handful of brick-leaf nodes get expanded — sub-millisecond
+/// on splat5 vs ~500 ms-1 s for the full walk.
+pub fn collect_cell_map_in_region(
+    octree_nodes: &[u32],
+    octree_depth: u8,
+    brick_cells: &[u32],
+    region_min: IVec3,
+    region_max: IVec3,
+) -> HashMap<IVec3, u32> {
+    let mut cells = HashMap::new();
+    if octree_nodes.is_empty() {
+        return cells;
+    }
+    if region_min.x >= region_max.x
+        || region_min.y >= region_max.y
+        || region_min.z >= region_max.z
+    {
+        return cells;
+    }
+    walk_collect_cells_in_region(
+        octree_nodes,
+        brick_cells,
+        0,
+        UVec3::ZERO,
+        0,
+        octree_depth,
+        region_min,
+        region_max,
+        &mut cells,
+    );
+    cells
+}
+
+/// Recursive walker matching `walk_collect_cells` but pruning branches
+/// whose AABB doesn't intersect `[region_min, region_max)`.
+fn walk_collect_cells_in_region(
+    nodes: &[u32],
+    brick_cells: &[u32],
+    node_idx: usize,
+    origin: UVec3,
+    level: u8,
+    max_depth: u8,
+    region_min: IVec3,
+    region_max: IVec3,
+    cells: &mut HashMap<IVec3, u32>,
+) {
+    let node = nodes[node_idx];
+    if node == EMPTY_NODE || node == INTERIOR_NODE {
+        return;
+    }
+    // This node's AABB in finest-cell coords: `[origin, origin + span)`.
+    let span = 1i32 << (max_depth - level);
+    let node_min = IVec3::new(origin.x as i32, origin.y as i32, origin.z as i32);
+    let node_max = node_min + IVec3::splat(span);
+    // Intersection test (both ranges half-open).
+    if node_max.x <= region_min.x
+        || node_min.x >= region_max.x
+        || node_max.y <= region_min.y
+        || node_min.y >= region_max.y
+        || node_max.z <= region_min.z
+        || node_min.z >= region_max.z
+    {
+        return;
+    }
+    if is_leaf(node) {
+        let cell_voxels = 1u32 << (max_depth - level);
+        let slot = leaf_slot(node);
+        for dz in 0..cell_voxels {
+            for dy in 0..cell_voxels {
+                for dx in 0..cell_voxels {
+                    let c = IVec3::new(
+                        origin.x as i32 + dx as i32,
+                        origin.y as i32 + dy as i32,
+                        origin.z as i32 + dz as i32,
+                    );
+                    if c.x < region_min.x
+                        || c.x >= region_max.x
+                        || c.y < region_min.y
+                        || c.y >= region_max.y
+                        || c.z < region_min.z
+                        || c.z >= region_max.z
+                    {
+                        continue;
+                    }
+                    cells.insert(c, slot);
+                }
+            }
+        }
+        return;
+    }
+    if is_brick(node) {
+        let bid = brick_id(node);
+        let base = (bid * BRICK_CELLS) as usize;
+        for cz in 0..BRICK_DIM {
+            for cy in 0..BRICK_DIM {
+                for cx in 0..BRICK_DIM {
+                    let c = IVec3::new(
+                        origin.x as i32 + cx as i32,
+                        origin.y as i32 + cy as i32,
+                        origin.z as i32 + cz as i32,
+                    );
+                    if c.x < region_min.x
+                        || c.x >= region_max.x
+                        || c.y < region_min.y
+                        || c.y >= region_max.y
+                        || c.z < region_min.z
+                        || c.z >= region_max.z
+                    {
+                        continue;
+                    }
+                    let flat =
+                        (cx + cy * BRICK_DIM + cz * BRICK_DIM * BRICK_DIM) as usize;
+                    let v = brick_cells[base + flat];
+                    if v == BRICK_EMPTY {
+                        continue;
+                    }
+                    let stored = if v == BRICK_INTERIOR { CELL_INTERIOR } else { v };
+                    cells.insert(c, stored);
+                }
+            }
+        }
+        return;
+    }
+    if is_branch(node) {
+        let children_offset = node as usize;
+        let half = 1u32 << (max_depth - level - 1);
+        for octant in 0u32..8 {
+            let dx = octant & 1;
+            let dy = (octant >> 1) & 1;
+            let dz = (octant >> 2) & 1;
+            let child_origin = UVec3::new(
+                origin.x + dx * half,
+                origin.y + dy * half,
+                origin.z + dz * half,
+            );
+            walk_collect_cells_in_region(
+                nodes,
+                brick_cells,
+                children_offset + octant as usize,
+                child_origin,
+                level + 1,
+                max_depth,
+                region_min,
+                region_max,
+                cells,
+            );
+        }
+    }
+}
+
 /// Walk the octree and populate `cells` with one entry per non-empty
 /// cell, at finest resolution. INTERIOR_NODE-region cells are NOT
 /// expanded — `is_solid_lookup` resolves them on demand.
