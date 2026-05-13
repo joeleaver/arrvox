@@ -89,6 +89,9 @@ pub(super) fn finalize_frame(
     // EMA unchanged rather than double-counting.
     let mut delivered_dt_ms: Option<f32> = None;
     let mut shipped_any = false;
+    let post_t0 = std::time::Instant::now();
+    let mut total_drain = std::time::Duration::ZERO;
+    let mut total_ship = std::time::Duration::ZERO;
     for vp in &frame.viewports {
         let vr = state
             .viewport_renderers
@@ -97,19 +100,40 @@ pub(super) fn finalize_frame(
         let w = vr.width;
         let h = vr.height;
         let padded_row = vr.readback_padded_row();
+        let drain_t0 = std::time::Instant::now();
         vr.readback.drain_completed(w, h, padded_row);
+        total_drain += drain_t0.elapsed();
         if ship_pixels {
             if let Some((pixels, cw, ch)) = vr.readback.cached_pixels() {
+                let ship_t0 = std::time::Instant::now();
                 frame_callback(vp.id, pixels, cw, ch);
+                total_ship += ship_t0.elapsed();
                 shipped_any = true;
             }
         }
     }
     if shipped_any {
-        delivered_dt_ms = Some(
-            now.duration_since(state.last_frame_callback).as_secs_f32() * 1000.0,
-        );
+        let dt = now.duration_since(state.last_frame_callback);
+        delivered_dt_ms = Some(dt.as_secs_f32() * 1000.0);
         state.last_frame_callback = now;
+        // Periodic log of the editor-pipeline timing so the user can
+        // see where the click-to-visible latency lives. Mirrors the
+        // [render-frame] cadence (every 60 ships).
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SHIP_LOG_COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = SHIP_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if n % 60 == 0 {
+            let post_total = post_t0.elapsed();
+            eprintln!(
+                "[ship] drain={:.2}ms callback={:.2}ms post_total={:.2}ms \
+                 deliver_dt={:.2}ms (~{:.1} fps shipped)",
+                total_drain.as_secs_f64() * 1000.0,
+                total_ship.as_secs_f64() * 1000.0,
+                post_total.as_secs_f64() * 1000.0,
+                dt.as_secs_f64() * 1000.0,
+                1.0 / dt.as_secs_f64().max(0.0001),
+            );
+        }
     }
 
     RenderOutcome { cloud_sun_atten_raw, delivered_dt_ms }
