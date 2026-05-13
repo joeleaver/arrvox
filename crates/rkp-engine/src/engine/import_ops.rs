@@ -272,7 +272,7 @@ impl EngineState {
         // per-entity GpuObject list so the new AABB / octree offsets land
         // on the GPU (target_size, rotation offsets, etc. only show up in
         // the render once this runs).
-        self.geometry_dirty = true;
+        self.geometry_dirty.mark_all();
         self.gpu_objects_dirty.mark_all();
     }
 

@@ -171,7 +171,13 @@ impl EngineState {
             play_frame_count: 0,
             play_state: None,
             show_colliders: false,
-            collider_caches_dirty: true,
+            collider_caches_dirty: {
+                // Initial state matches prior `bool = true` — first
+                // tick walks every RigidBody.
+                let mut d = crate::engine::geometry_dirty::GeometryDirty::new();
+                d.mark_all();
+                d
+            },
             tick_hz_ema: 60.0,
             physics_hz_ema: 0.0,
             render_hz_ema: 0.0,
@@ -184,7 +190,7 @@ impl EngineState {
             user_shader_first_send: true,
             file_watcher: None,
             import_worker: crate::import_worker::ImportWorker::new(),
-            geometry_dirty: false,
+            geometry_dirty: crate::engine::geometry_dirty::GeometryDirty::new(),
             scene_dirty: false,
             gpu_objects_dirty: {
                 // Initial state: full rebuild on first tick. World is

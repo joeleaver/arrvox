@@ -719,13 +719,39 @@ impl EngineState {
         let geometry_epoch = self
             .geometry_epoch_handle
             .load(std::sync::atomic::Ordering::Acquire);
-        if self.geometry_dirty {
-            self.collider_caches_dirty = true;
-            self.geometry_dirty = false;
+        // Drain geometry_dirty into collider_caches_dirty: every
+        // entity whose geometry changed needs its collider cache
+        // rebuilt. PERF_DEBT B2 — the per-entity scope flows
+        // through; consumer below picks per-entity vs world-walk
+        // based on `is_all()`.
+        if self.geometry_dirty.is_dirty() {
+            if self.geometry_dirty.is_all() {
+                self.collider_caches_dirty.mark_all();
+            } else {
+                for &entity in self.geometry_dirty.dirty_entities() {
+                    self.collider_caches_dirty.mark_entity(entity);
+                }
+            }
+            self.geometry_dirty.clear();
         }
-        if self.collider_caches_dirty {
-            self.rebuild_collider_caches();
-            self.collider_caches_dirty = false;
+        if self.collider_caches_dirty.is_dirty() {
+            // PERF_DEBT C3: per-entity rebuild when scope is
+            // narrow; full world walk only when `is_all()` (project
+            // load, asset import, generator regen).
+            if self.collider_caches_dirty.is_all() {
+                self.rebuild_collider_caches();
+            } else {
+                let dirty: Vec<hecs::Entity> = self
+                    .collider_caches_dirty
+                    .dirty_entities()
+                    .iter()
+                    .copied()
+                    .collect();
+                for entity in dirty {
+                    self.rebuild_collider_cache_for(entity);
+                }
+            }
+            self.collider_caches_dirty.clear();
         }
 
         let snap_t_geom = snap_phase_start.elapsed();

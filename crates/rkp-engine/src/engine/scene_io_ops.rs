@@ -62,7 +62,7 @@ impl EngineState {
                                     material_overrides: obj.material_overrides.clone(),
                                     ..Default::default()
                                 }));
-                                self.geometry_dirty = true;
+                                self.geometry_dirty.mark_all();
                                 Some(e)
                             }
                             Err(_) => None,
@@ -130,7 +130,7 @@ impl EngineState {
                             material_overrides: obj.material_overrides.clone(),
                             ..Default::default()
                         }));
-                        self.geometry_dirty = true;
+                        self.geometry_dirty.mark_all();
                         Some(e)
                     } else if let Some(ref prim_name) = obj.primitive {
                         let primitive = match prim_name.as_str() {
@@ -158,7 +158,7 @@ impl EngineState {
                                 material_overrides: obj.material_overrides.clone(),
                                 ..Default::default()
                             }));
-                            self.geometry_dirty = true;
+                            self.geometry_dirty.mark_all();
                             e
                         })
                     } else {

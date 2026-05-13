@@ -1,6 +1,6 @@
 # Engine performance-debt eradication plan
 
-**Status**: in progress (Phase A complete; B1 + C2 transform-only fast path shipped; B2/B3 + C1/C3 next). Feature work paused.
+**Status**: in progress (Phase A complete; B1 + B2 + C2 + C3 shipped; B3 + C1 + Phase D/E next). Feature work paused.
 
 This document is the authoritative plan for eliminating systemic "rebuild
 everything every tick" patterns from rkp-engine and rkp-render. It was
@@ -128,7 +128,7 @@ metric moved.
 | Step | Change | Result |
 |---|---|---|
 | **B1 ✅ (plumbing)** | `gpu_objects_dirty: bool` → `GpuObjectsDirty` (HashSet + sticky-all). 31 setter sites migrated: hot stamp paths (sculpt/paint/gizmo/picking/proc-bake) narrowed to `mark_entity(e)`; world-level events (project load, scene clear, gameplay reset, etc.) keep `mark_all()`. **Today's consumer still does a full rebuild whenever `is_dirty()`** — the per-row fast path is the C2 work. Module: `crates/rkp-engine/src/engine/gpu_objects_dirty.rs`. | Plumbing only; perf delivers in C2. |
-| **B2** | `geometry_dirty` / `collider_caches_dirty` → per-entity. `rebuild_collider_caches` iterates the dirty set. | Collider rebuild O(changed entities), not O(all rigid bodies) |
+| **B2 ✅** | `geometry_dirty` and `collider_caches_dirty` both replaced with `GeometryDirty` (HashSet + sticky-all). New module `engine/geometry_dirty.rs`. Lifecycle drains `geometry_dirty` → `collider_caches_dirty` per-entity. Procedural-bake completion narrowed to `mark_entity(e)`; world-level events keep `mark_all()`. | Per-entity collider rebuild path (delivered together with C3 below). |
 | **B3** | `scene_dirty: bool` → typed event stream consumed by UI/inspector snapshot builder. | UI updates incrementally |
 
 ### Phase C — Incremental derived state
@@ -137,7 +137,7 @@ metric moved.
 |---|---|---|
 | **C1** | `painted_per_entity` maintained via paint/sculpt event handlers; no octree walk in steady state. Walk retained for asset load. | -150 ms/stamp painted_walk |
 | **C2 ✅ (transform fast path)** | `update_scene_gpu_transform_only` patches just `RkpGpuInstance.world` (and matching `SplatDraw.world` / `ProxyDraw.world`) for each Transform-dirty entity. Lifecycle gates on `gpu_objects_dirty.is_transform_only()`: gizmo/drag stamps now run the fast path; sculpt/paint/proc-bake/scene-load still go through the full rebuild. New `DirtyKind` enum (`Transform`/`Structural`) on `GpuObjectsDirty` with `mark_entity_transform` / `mark_entity` / `mark_entity_kind`. | -60+ ms per gizmo-drag stamp on splat5 elephant (full rebuild → in-place row patch). Structural dirty events still pay the full rebuild — generalising that is a future follow-up. |
-| **C3** | `rebuild_collider_cache_for(entity)` — single-entity collider rebuild. | O(1) per change |
+| **C3 ✅** | `rebuild_collider_cache_for(entity)` extracted from the world-walking `rebuild_collider_caches`. Lifecycle iterates `collider_caches_dirty.dirty_entities()` per-entity when scope is narrow; falls back to the world walk only when `is_all()` (project load, asset import, generator regen). Note: today no per-stamp setter triggers `geometry_dirty` (sculpt defers collider rebuild to play-mode entry — intentional), so the per-stamp savings here are latent until a future setter narrows. | O(1) per changed entity in narrow path; world walk reserved for `all`. |
 
 ### Phase D — Universal delta GPU uploads
 
@@ -214,9 +214,9 @@ replaced by the migration:
 ### Coarse dirty flags
 
 - **`gpu_objects_dirty: bool`** — `crates/rkp-engine/src/engine/state/mod.rs:658`. 13 setter sites across sculpt/paint/gameplay/gizmo/scene_tree/picking/procedural/scene_io/cmd_edit ops. Consumer: full `update_scene_gpu`. **(B1 plumbing resolved — replaced with `GpuObjectsDirty` carrying per-entity scope. Actual setter count was 31. Hot stamp paths now `mark_entity(e)`. Consumer still does full rebuild until C2.)**
-- **`geometry_dirty: bool`** — `crates/rkp-engine/src/engine/state/mod.rs:654`. 8 setter sites. Triggers `collider_caches_dirty`.
+- **`geometry_dirty: bool`** — `crates/rkp-engine/src/engine/state/mod.rs:654`. 8 setter sites. Triggers `collider_caches_dirty`. **(B2 plumbing resolved — replaced with `GeometryDirty` carrying per-entity scope. Actual setter count was 14.)**
 - **`scene_dirty: bool`** — `crates/rkp-engine/src/engine/state/mod.rs:656`. 7 setter sites. Triggers full SceneObjectInfo rebuild.
-- **`collider_caches_dirty: bool`** — `crates/rkp-engine/src/engine/state/mod.rs:594`. Derivative of `geometry_dirty`.
+- **`collider_caches_dirty: bool`** — `crates/rkp-engine/src/engine/state/mod.rs:594`. Derivative of `geometry_dirty`. **(B2+C3 resolved — same `GeometryDirty` type; per-entity rebuild via `rebuild_collider_cache_for(entity)`.)**
 - **`faces_dirty: bool`** — `crates/rkp-render/src/rkp_scene_manager/manager.rs:93`. **5 setter sites, ZERO consumer sites** — orphaned flag. Either wire a consumer or remove.
 
 ### Heavy clone patterns

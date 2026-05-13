@@ -608,8 +608,15 @@ pub(crate) struct EngineState {
     pub(crate) play_state: Option<crate::play_mode::PlayModeState>,
     /// View options.
     pub(crate) show_colliders: bool,
-    /// Collider caches need rebuild.
-    pub(crate) collider_caches_dirty: bool,
+    /// Per-entity tracking of which colliders need rebuild
+    /// (PERF_DEBT.md B2+C3). Replaces the prior `bool`. Sourced from
+    /// `geometry_dirty` (geometry mutation → collider invalidation)
+    /// plus direct setters when a `RigidBody` component is added or
+    /// modified on a single entity. Consumer in lifecycle iterates
+    /// `dirty_entities()` and calls `rebuild_collider_cache_for(e)`
+    /// per entity, falling back to the world-walking
+    /// `rebuild_collider_caches` only when `is_all()` is true.
+    pub(crate) collider_caches_dirty: super::geometry_dirty::GeometryDirty,
     /// EMA of true tick rate (1 / wall-clock tick interval, including the
     /// 60-Hz pacing sleep). Distinct from `fps` in the state update, which
     /// is `1 / frame_work_time` and ignores sleep — useful for profiling but
@@ -668,8 +675,12 @@ pub(crate) struct EngineState {
     /// Background import worker for mesh → .rkp conversion.
     pub(crate) import_worker: crate::import_worker::ImportWorker,
 
-    // Geometry dirty flag
-    pub(crate) geometry_dirty: bool,
+    /// Per-entity tracking of which entities' geometry has changed
+    /// (PERF_DEBT.md B2). Replaces the prior `bool`. Drains into
+    /// `collider_caches_dirty` at the top of each tick — every
+    /// geometry change implies a collider rebuild for the affected
+    /// entity.
+    pub(crate) geometry_dirty: super::geometry_dirty::GeometryDirty,
     /// Scene structure changed — push objects list to UI.
     pub(crate) scene_dirty: bool,
     /// Per-entity dirty tracking for `update_scene_gpu`. Replaced

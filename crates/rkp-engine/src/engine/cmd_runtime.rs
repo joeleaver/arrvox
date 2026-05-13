@@ -70,7 +70,7 @@ impl EngineState {
                                     self.gpu_objects_dirty.mark_all();
                                 }
                                 if component_name == "RigidBody" {
-                                    self.collider_caches_dirty = true;
+                                    self.collider_caches_dirty.mark_all();
                                 }
                             }
                         }
@@ -107,7 +107,7 @@ impl EngineState {
                         self.scene_dirty = true;
                         self.gpu_objects_dirty.mark_all();
                         if component_name == "RigidBody" {
-                            self.collider_caches_dirty = true;
+                            self.collider_caches_dirty.mark_all();
                         }
                     }
                 }
@@ -130,7 +130,7 @@ impl EngineState {
                         self.scene_dirty = true;
                         self.gpu_objects_dirty.mark_all();
                         if component_name == "RigidBody" {
-                            self.collider_caches_dirty = true;
+                            self.collider_caches_dirty.mark_all();
                         }
                     }
                 }
@@ -253,7 +253,7 @@ impl EngineState {
                     let count = self.remap_entity_material(entity, from_material, to_material);
                     if count > 0 {
                         eprintln!("[RkpEngine] remapped {count} voxels from material {from_material} to {to_material}");
-                        self.geometry_dirty = true;
+                        self.geometry_dirty.mark_all();
                         if let Ok(mut r) =
                             self.world.get::<&mut crate::components::Renderable>(entity)
                         {
@@ -589,9 +589,10 @@ impl EngineState {
             EngineCommand::PlayStart => {
                 if self.play_state.is_none() {
                     // Ensure collider caches are up to date before entering play mode.
-                    if self.collider_caches_dirty {
+                    // Play-mode entry is rare; full rebuild is fine here.
+                    if self.collider_caches_dirty.is_dirty() {
                         self.rebuild_collider_caches();
-                        self.collider_caches_dirty = false;
+                        self.collider_caches_dirty.clear();
                     }
                     let play = crate::play_mode::PlayModeState::start(&mut self.world);
                     self.play_state = Some(play);

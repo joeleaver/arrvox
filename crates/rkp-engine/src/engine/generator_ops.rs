@@ -173,7 +173,7 @@ impl EngineState {
                 owned.generation = generation;
             }
             self.scene_dirty = true;
-            self.geometry_dirty = true;
+            self.geometry_dirty.mark_all();
             self.gpu_objects_dirty.mark_all();
             eprintln!(
                 "[gen] reused child entity={existing:?} parent={generator_entity:?} \
@@ -233,7 +233,7 @@ impl EngineState {
         }
         self.assign_entity_uuid(child);
         self.scene_dirty = true;
-        self.geometry_dirty = true;
+        self.geometry_dirty.mark_all();
         self.gpu_objects_dirty.mark_all();
         eprintln!(
             "[gen] spawned child entity={child:?} parent={generator_entity:?} \

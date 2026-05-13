@@ -559,7 +559,7 @@ impl EngineState {
                     self.selected_procedural_node = None;
                 }
                 self.scene_dirty = true;
-                self.geometry_dirty = true;
+                self.geometry_dirty.mark_all();
                 self.gpu_objects_dirty.mark_all();
                 // Surface the new asset in the Models panel right
                 // away so it can be re-spawned later.

@@ -379,106 +379,141 @@ impl EngineState {
     }
 
     /// Rebuild collider caches for all entities with RigidBody.
-    /// Called when geometry changes, RigidBody is added/modified, etc.
+    /// Called when many entities' geometry/colliders change at once
+    /// (project load, asset import, generator regen) — anything that
+    /// flips `collider_caches_dirty` to `is_all()`. Lifecycle picks
+    /// per-entity vs world-walk based on the dirty set's scope.
     pub(crate) fn rebuild_collider_caches(&mut self) {
         use crate::components::*;
-
-        // Collect entities that need cache rebuild.
-        let entities: Vec<(hecs::Entity, RigidBody, Option<SpatialData>, glam::Vec3)> = self.world
-            .query::<(&RigidBody, Option<&Renderable>, &Transform)>()
+        let entities: Vec<hecs::Entity> = self
+            .world
+            .query::<&RigidBody>()
             .iter()
-            .map(|(e, (rb, r, t))| {
-                let spatial = r
-                    .and_then(|r| r.spatial.clone())
-                    .and_then(|g| g.into_octree());
-                (e, rb.clone(), spatial, t.scale)
-            })
+            .map(|(e, _)| e)
             .collect();
+        for entity in entities {
+            self.rebuild_collider_cache_for(entity);
+        }
+    }
+
+    /// Per-entity collider cache rebuild. PERF_DEBT.md C3 — invoked
+    /// once per dirty entity by lifecycle when
+    /// `collider_caches_dirty` carries a narrow per-entity set,
+    /// avoiding the world-walk that [`Self::rebuild_collider_caches`]
+    /// performs.
+    ///
+    /// Silently no-ops on entities without a `RigidBody` component
+    /// (the dirty set may carry an entity that no longer has the
+    /// component, or never had it).
+    pub(crate) fn rebuild_collider_cache_for(&mut self, entity: hecs::Entity) {
+        use crate::components::*;
+
+        let rb = match self.world.get::<&RigidBody>(entity) {
+            Ok(rb) => (*rb).clone(),
+            Err(_) => return,
+        };
+        let spatial = self
+            .world
+            .get::<&Renderable>(entity)
+            .ok()
+            .and_then(|r| r.spatial.clone())
+            .and_then(|g| g.into_octree());
+        let scale = self
+            .world
+            .get::<&Transform>(entity)
+            .map(|t| t.scale)
+            .unwrap_or(glam::Vec3::ONE);
+        let name = self
+            .world
+            .get::<&EditorMetadata>(entity)
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
+        let pos = self
+            .world
+            .get::<&Transform>(entity)
+            .map(|t| t.position)
+            .unwrap_or_default();
 
         let sm_guard = self.scene_mgr.lock().unwrap();
         let all_nodes = sm_guard.octree.data();
 
-        for (entity, rb, spatial, scale) in entities {
-            let name = self.world.get::<&EditorMetadata>(entity)
-                .map(|m| m.name.clone()).unwrap_or_default();
-            let pos = self.world.get::<&Transform>(entity)
-                .map(|t| t.position).unwrap_or_default();
+        // Derive the fitted-shape bounds from the actually occupied
+        // voxels. The padded `SpatialData.aabb` overshoots by ~14
+        // voxels per side (boundary-sampling margin) — fine for the
+        // renderer, wrong for Box/Sphere/Capsule sizing.
+        let tight_local = spatial.as_ref().and_then(|sp| {
+            crate::play_mode::compute_tight_local_aabb(
+                all_nodes,
+                &sm_guard.brick_pool,
+                sp.root_offset as usize,
+                sp.depth,
+                sp.len,
+                sp.base_voxel_size,
+                sp.grid_origin,
+            )
+        });
 
-            // Derive the fitted-shape bounds from the actually occupied
-            // voxels. The padded `SpatialData.aabb` overshoots by ~14 voxels
-            // per side (boundary-sampling margin) — fine for the renderer,
-            // wrong for Box/Sphere/Capsule sizing.
-            let tight_local = spatial.as_ref().and_then(|sp| {
-                crate::play_mode::compute_tight_local_aabb(
-                    all_nodes,
-                    &sm_guard.brick_pool,
-                    sp.root_offset as usize,
-                    sp.depth,
-                    sp.len,
-                    sp.base_voxel_size,
-                    sp.grid_origin,
-                )
-            });
+        let (aabb_half, local_center) = match tight_local {
+            Some(t) => (t.half_extents() * scale, (t.min + t.max) * 0.5 * scale),
+            None => (glam::Vec3::splat(0.5), glam::Vec3::ZERO),
+        };
 
-            let (aabb_half, local_center) = match tight_local {
-                Some(t) => (t.half_extents() * scale, (t.min + t.max) * 0.5 * scale),
-                None => (glam::Vec3::splat(0.5), glam::Vec3::ZERO),
-            };
-
-            if let Some(ref sp) = spatial {
-                eprintln!(
-                    "[ColliderCache] '{name}' pos={pos:?} scale={scale:?} \
-                     padded_aabb={:?}..{:?} tight_local={tight_local:?} \
-                     aabb_half={aabb_half:?} local_center={local_center:?}",
-                    sp.aabb.min, sp.aabb.max,
-                );
-            }
-
-            let (resolved_shape, voxel_coords, voxel_size) = match rb.collider_shape {
-                rkp_physics::rigid_body::ColliderShape::Auto => {
-                    if let Some(ref sp) = spatial {
-                        let (coords, cell_size) = crate::play_mode::build_coarse_collider(
-                            all_nodes,
-                            &sm_guard.brick_pool,
-                            sp.root_offset as usize,
-                            sp.depth,
-                            sp.len,
-                            sp.base_voxel_size,
-                            rb.collider_cell_size,
-                        );
-                        if coords.is_empty() {
-                            (rkp_physics::rigid_body::ColliderShape::Box, Vec::new(), 0.0)
-                        } else {
-                            (rkp_physics::rigid_body::ColliderShape::Auto, coords, cell_size)
-                        }
-                    } else {
-                        (rkp_physics::rigid_body::ColliderShape::Box, Vec::new(), 0.0)
-                    }
-                }
-                other => (other.clone(), Vec::new(), 0.0),
-            };
-
-            let (grid_origin, tree_depth) = match spatial.as_ref() {
-                Some(sp) => (sp.grid_origin, sp.depth),
-                None => (glam::Vec3::ZERO, 0),
-            };
-
-            let cache = ColliderCache {
-                shape: resolved_shape,
-                voxel_coords,
-                collider_cell_size: voxel_size, // actually the coarse cell size from build_coarse_collider
-                aabb_half,
-                local_center,
-                grid_origin,
-                tree_depth,
-            };
-
-            // Insert or replace the cache component.
-            if self.world.get::<&ColliderCache>(entity).is_ok() {
-                let _ = self.world.remove_one::<ColliderCache>(entity);
-            }
-            let _ = self.world.insert_one(entity, cache);
+        if let Some(ref sp) = spatial {
+            eprintln!(
+                "[ColliderCache] '{name}' pos={pos:?} scale={scale:?} \
+                 padded_aabb={:?}..{:?} tight_local={tight_local:?} \
+                 aabb_half={aabb_half:?} local_center={local_center:?}",
+                sp.aabb.min, sp.aabb.max,
+            );
         }
+
+        let (resolved_shape, voxel_coords, voxel_size) = match rb.collider_shape {
+            rkp_physics::rigid_body::ColliderShape::Auto => {
+                if let Some(ref sp) = spatial {
+                    let (coords, cell_size) = crate::play_mode::build_coarse_collider(
+                        all_nodes,
+                        &sm_guard.brick_pool,
+                        sp.root_offset as usize,
+                        sp.depth,
+                        sp.len,
+                        sp.base_voxel_size,
+                        rb.collider_cell_size,
+                    );
+                    if coords.is_empty() {
+                        (rkp_physics::rigid_body::ColliderShape::Box, Vec::new(), 0.0)
+                    } else {
+                        (rkp_physics::rigid_body::ColliderShape::Auto, coords, cell_size)
+                    }
+                } else {
+                    (rkp_physics::rigid_body::ColliderShape::Box, Vec::new(), 0.0)
+                }
+            }
+            other => (other.clone(), Vec::new(), 0.0),
+        };
+
+        let (grid_origin, tree_depth) = match spatial.as_ref() {
+            Some(sp) => (sp.grid_origin, sp.depth),
+            None => (glam::Vec3::ZERO, 0),
+        };
+
+        let cache = ColliderCache {
+            shape: resolved_shape,
+            voxel_coords,
+            collider_cell_size: voxel_size, // actually the coarse cell size from build_coarse_collider
+            aabb_half,
+            local_center,
+            grid_origin,
+            tree_depth,
+        };
+
+        // Drop scene_mgr before mutating the ECS so bake_worker
+        // isn't pointlessly blocked across the `insert_one`.
+        drop(sm_guard);
+
+        if self.world.get::<&ColliderCache>(entity).is_ok() {
+            let _ = self.world.remove_one::<ColliderCache>(entity);
+        }
+        let _ = self.world.insert_one(entity, cache);
     }
 
     /// Build wireframe visualization for all physics colliders from cached data.

@@ -104,7 +104,7 @@ impl EngineState {
                     },
                 ));
                 self.assign_entity_uuid(entity);
-                self.geometry_dirty = true;
+                self.geometry_dirty.mark_all();
                 self.scene_dirty = true;
                 self.gpu_objects_dirty.mark_all();
                 if verbose {
@@ -242,7 +242,7 @@ impl EngineState {
         let _ = self.world.despawn(entity);
 
         self.console.info(format!("Deleted '{name}'"));
-        self.geometry_dirty = true;
+        self.geometry_dirty.mark_all();
         self.scene_dirty = true;
         self.gpu_objects_dirty.mark_all();
     }
@@ -362,7 +362,7 @@ impl EngineState {
         self.selected_entity = Some(entity);
 
         self.console.info(format!("Duplicated '{src_name}' → '{new_name}'"));
-        self.geometry_dirty = true;
+        self.geometry_dirty.mark_all();
         self.scene_dirty = true;
         self.gpu_objects_dirty.mark_all();
     }
@@ -393,7 +393,7 @@ impl EngineState {
         // cubes after a project close+open).
         self.scene_mgr.lock().unwrap().clear(1_000_000);
         self.selected_entity = None;
-        self.geometry_dirty = true;
+        self.geometry_dirty.mark_all();
         self.scene_dirty = true;
         self.gpu_objects_dirty.mark_all();
     }
