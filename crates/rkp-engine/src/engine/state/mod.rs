@@ -425,36 +425,47 @@ pub(crate) struct EngineState {
     pub(crate) selected_procedural_node: Option<u32>,
 
     // Derived GPU data — rebuilt from world each frame.
+    //
+    // PERF_DEBT A3: each of these is `Arc<Vec<…>>` so the per-tick
+    // snapshot handoff is a refcount bump rather than a per-Vec memcpy
+    // (~30 KB each, ~230 KB combined). Mutations route through
+    // `Arc::make_mut`: in steady state (after render's last frame's
+    // snapshot has been consumed) refcount=1 and writes are in-place,
+    // preserving the previous capacity allocation. While render still
+    // holds last frame's `Arc`, the next mutation reallocates fresh —
+    // which is the same cost as today's `.clone()` would have been.
+    // Net win: the *clean* tick path (no GPU object changes) ships
+    // `Arc::clone` instead of cloning the Vec.
     /// Per-asset records, deduped by `octree_root`. Built alongside
     /// `gpu_instances` in `update_scene_gpu`.
-    pub(crate) gpu_assets: Vec<RkpGpuAsset>,
+    pub(crate) gpu_assets: std::sync::Arc<Vec<RkpGpuAsset>>,
     /// Per-instance records — one per renderable entity. Indexes into
     /// `gpu_assets` via `RkpGpuInstance::asset_id`.
-    pub(crate) gpu_instances: Vec<RkpGpuInstance>,
+    pub(crate) gpu_instances: std::sync::Arc<Vec<RkpGpuInstance>>,
     /// Per-frame flattened overlay entries — `RkpGpuInstance.overlay_offset`
     /// + `overlay_count` slice into this. Built alongside `gpu_instances`
     /// in `update_scene_gpu` from the per-entity `paint_overlays` map;
     /// shipped each tick to the render thread for upload.
-    pub(crate) gpu_instance_overlays: Vec<rkp_core::OverlayEntry>,
+    pub(crate) gpu_instance_overlays: std::sync::Arc<Vec<rkp_core::OverlayEntry>>,
     /// Per-frame flattened sculpt-removal entries —
     /// `RkpGpuInstance.sculpt_offset` + `sculpt_count` slice into this.
     /// Built alongside `gpu_instances` in `update_scene_gpu` from the
     /// per-entity `sculpt_overlays` map; shipped each tick to the
     /// render thread for upload to `instance_sculpt`. Each `u32` is a
     /// removed `leaf_attr_id`.
-    pub(crate) gpu_instance_sculpts: Vec<u32>,
+    pub(crate) gpu_instance_sculpts: std::sync::Arc<Vec<u32>>,
     /// Splat-rasterizer per-instance draws. One entry per `Renderable`
     /// entity whose asset_handle is `Some(_)`. Built alongside
     /// `gpu_instances` in `update_scene_gpu`. Used only when the
     /// renderer's primary mode is `Splat` (RKP_PRIMARY=splat); the
     /// march path ignores it.
-    pub(crate) splat_draws: Vec<rkp_render::splat_pass::SplatDraw>,
+    pub(crate) splat_draws: std::sync::Arc<Vec<rkp_render::splat_pass::SplatDraw>>,
     /// Procedural proxy-mesh draws. Built per-frame from entities
     /// whose `Renderable.spatial` is `RenderGeometry::ProxyMesh`.
     /// Disjoint from `splat_draws`: proxy meshes ride a dedicated
     /// raster pipeline (`mesh_proxy_pass`) that writes the full
     /// G-buffer directly — no LeafAttr indirection.
-    pub(crate) proxy_draws: Vec<rkp_render::mesh_proxy_pass::ProxyDraw>,
+    pub(crate) proxy_draws: std::sync::Arc<Vec<rkp_render::mesh_proxy_pass::ProxyDraw>>,
     /// Maps gpu_instance index → hecs Entity (for pick resolution).
     pub(crate) gpu_to_entity: Vec<hecs::Entity>,
     /// Maps hecs Entity → gpu_instance index.

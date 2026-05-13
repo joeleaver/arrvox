@@ -58,6 +58,9 @@ pub fn scan_dir(dir: &Path) -> Result<UserShaderRegistry, ShaderComposerError> {
     }
     wgsl_files.sort();
 
+    // Build into a local Vec, then wrap in Arc once at the end —
+    // avoids paying `Arc::make_mut`'s capacity check on every push.
+    let mut entries: Vec<UserShaderEntry> = Vec::with_capacity(wgsl_files.len());
     for (idx, path) in wgsl_files.iter().enumerate() {
         let source = std::fs::read_to_string(path).map_err(|e| ShaderComposerError::Io {
             path: path.clone(),
@@ -65,9 +68,10 @@ pub fn scan_dir(dir: &Path) -> Result<UserShaderRegistry, ShaderComposerError> {
         })?;
         let mut entry = parse_file(path, &source)?;
         entry.id = (idx as u32) + 1;
-        reg.entries.push(entry);
+        entries.push(entry);
     }
-    reg.source_hash = compute_registry_hash(&reg.entries);
+    reg.source_hash = compute_registry_hash(&entries);
+    reg.entries = std::sync::Arc::new(entries);
     Ok(reg)
 }
 

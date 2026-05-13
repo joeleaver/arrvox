@@ -1,6 +1,6 @@
 # Engine performance-debt eradication plan
 
-**Status**: in progress (Phase A1 + A2 shipped; A3 next). Feature work paused.
+**Status**: in progress (Phase A1 + A2 + A3 shipped; Phase B next). Feature work paused.
 
 This document is the authoritative plan for eliminating systemic "rebuild
 everything every tick" patterns from rkp-engine and rkp-render. It was
@@ -121,7 +121,7 @@ metric moved.
 |---|---|---|---|
 | **A1** | `MutationEvent` enum + log/subscriber scaffolding in EngineState. All mutation sites push events. No consumers yet. Existing dirty flags stay. | Universal scope-carrying mutation API. | `crates/rkp-engine/src/engine/mutation_log.rs` (new), all `*_ops.rs` |
 | **A2 ✅** | Pools (`OctreeAllocator`, `BrickPool`, `LeafAttrPool`) now hold `data: Arc<Vec<…>>` with copy-on-write via `Arc::make_mut`. `walk_snapshot()` is O(1) Arc::clone of three handles, plus the geometry epoch as a generation counter. Cache fields (`walk_snapshot_cache`, `walk_snapshot_epoch`) deleted — no longer needed. **In steady state (no outstanding snapshot) writes are in-place**; an outstanding walk forces a one-time clone-on-next-write. | -345 MB memcpy per epoch bump | `crates/rkp-core/src/{brick_pool,leaf_attr_pool,octree_allocator}.rs`, `crates/rkp-render/src/{octree_gpu,rkp_scene_manager/manager}.rs`, `crates/rkp-engine/src/engine/lifecycle.rs` |
-| **A3** | `RenderFrame` large fields become `Arc<...>` (gpu_*, bone_matrix_*, splat_draws, etc.). Lifecycle's per-frame clones become `Arc::clone`. | -58 MB/frame clone in steady state | `crates/rkp-engine/src/render_frame.rs`, `crates/rkp-engine/src/engine/lifecycle.rs` |
+| **A3 ✅** | `RenderFrame` large fields become `Arc<...>`: `bone_matrix_lbs/dqs` (BoneMatrixAllocator now stores `Arc<Vec<u8>>`, mutations via `Arc::make_mut`); `gpu_assets`/`gpu_instances`/`gpu_instance_overlays`/`gpu_instance_sculpts`/`splat_draws`/`proxy_draws` (EngineState fields now `Arc<Vec<…>>`, mutations via `Arc::make_mut` in `update_scene_gpu` + `clear_scene`); `user_shader_entries` (UserShaderRegistry now stores entries as `Arc<Vec<…>>`, parser builds via local Vec then wraps). Snapshot construction is all `Arc::clone`. Render's interp path borrows when α=1 instead of cloning. | -58 MB/frame (bone matrix) + ~280 KB/frame (gpu_*, user_shader_entries) clone in steady state | `crates/rkp-engine/src/{render_frame,scene_sync}.rs`, `crates/rkp-engine/src/engine/{lifecycle,scene_gpu,entity_ops,state/{mod,constructor}}.rs`, `crates/rkp-engine/src/render_worker/loop_thread.rs`, `crates/rkp-render/src/shader_composer/{types,parser,compose}.rs` |
 
 ### Phase B — Per-entity dirty sets
 
@@ -196,7 +196,7 @@ replaced by the migration:
 
 - **`update_scene_gpu`** — `crates/rkp-engine/src/engine/scene_gpu.rs` and called from `crates/rkp-engine/src/engine/lifecycle.rs:156-159`. Iterates all entities with `Renderable`, rebuilds `gpu_assets`, `gpu_instances`, `gpu_instance_overlays`, `gpu_instance_sculpts`, `splat_draws`, `proxy_draws`, `gpu_to_entity`, `entity_to_gpu`. Triggered by 13+ setter sites for `gpu_objects_dirty`.
 - **`bone_matrix_allocator.rebuild()`** — `crates/rkp-engine/src/engine/scene_gpu.rs:18`. Runs unconditionally every `submit_render_frame` tick.
-- **`bone_matrix.bytes().to_vec()` clones** — `crates/rkp-engine/src/engine/lifecycle.rs:712-713`. ~58 MB memcpy per frame.
+- **`bone_matrix.bytes().to_vec()` clones** — `crates/rkp-engine/src/engine/lifecycle.rs:712-713`. ~58 MB memcpy per frame. **(Resolved in A3.)** Now `bytes_arc()` returns an `Arc<Vec<u8>>` cloned from the allocator's internal storage; the allocator's `rebuild()` uses `Arc::make_mut` so the COW only fires when render still holds last frame's snapshot, and the immediate `.clear()` after means we never copy stale payload.
 - **GPU lights walk** — `crates/rkp-engine/src/engine/lifecycle.rs:613-647`. Queries every `PointLight` / `SpotLight` every tick.
 - **`rebuild_collider_caches`** — `crates/rkp-engine/src/engine/gizmo_ops.rs:379-477`. Iterates all entities with `RigidBody`, runs `compute_tight_local_aabb` + `build_coarse_collider` per entity. Triggered by `geometry_dirty` (8 setter sites) → `collider_caches_dirty`.
 - **`scene_dirty` → SceneObjectInfo rebuild** — `crates/rkp-engine/src/engine/state_update.rs:298`. Sorts + rebuilds the full UI scene list. 7 setter sites.
@@ -222,10 +222,10 @@ replaced by the migration:
 ### Heavy clone patterns
 
 - **`walk_snapshot()`** — `crates/rkp-render/src/rkp_scene_manager/manager.rs:437-442`. ~345 MB memcpy (octree + brick pool + leaf_attr). **(Resolved in A2.)** Pools were refactored to hold their data behind `Arc<Vec<…>>`; walk_snapshot is now three constant-time `Arc::clone`s, with copy-on-write (`Arc::make_mut`) on the next mutation if a snapshot is still outstanding.
-- **`gpu_*.clone()` in submit_render_frame** — `crates/rkp-engine/src/engine/lifecycle.rs:1197-1202`. ~230 KB/frame.
+- **`gpu_*.clone()` in submit_render_frame** — `crates/rkp-engine/src/engine/lifecycle.rs:1197-1202`. ~230 KB/frame. **(Resolved in A3.)** Each of the six fields is now `Arc<Vec<…>>`; snapshot construction is `Arc::clone`. Mutations route through `Arc::make_mut`, paying a one-time copy-on-write only when render still holds last frame's snapshot.
 - **`bone_matrix_lbs/dqs.to_vec()`** — `crates/rkp-engine/src/engine/lifecycle.rs:712-713`. ~58 MB/frame.
 - **`SkinBatchScratch.clone()`** — `crates/rkp-engine/src/engine/lifecycle.rs:737`. ~36 KB/frame.
-- **`user_shader_entries.to_vec()`** — `crates/rkp-engine/src/engine/lifecycle.rs:114`. ~50 KB/frame.
+- **`user_shader_entries.to_vec()`** — `crates/rkp-engine/src/engine/lifecycle.rs:114`. ~50 KB/frame. **(Resolved in A3.)** UserShaderRegistry stores entries as `Arc<Vec<UserShaderEntry>>`; sim calls `entries_arc()` and ships the Arc::clone.
 
 ---
 

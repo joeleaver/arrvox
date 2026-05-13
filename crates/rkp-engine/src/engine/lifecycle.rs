@@ -116,9 +116,10 @@ impl EngineState {
         let user_shader_infos = self.user_shader_registry.shader_infos();
         // Full registry entries — render thread reads these to drive the
         // proto bake (one bake per shader_id with an `instance_at` hook)
-        // and (TODO Phase 9) the new emit pass.
-        let user_shader_entries =
-            self.user_shader_registry.entries().to_vec();
+        // and (TODO Phase 9) the new emit pass. Cheap `Arc::clone` —
+        // the registry holds entries inside `Arc<Vec<…>>` so the per-
+        // tick handoff is a refcount bump (PERF_DEBT A3).
+        let user_shader_entries = self.user_shader_registry.entries_arc();
         // Painted-material scan: walks each entity's leaf_attr range to
         // find which shader-bearing materials are present (entity-level
         // fallback or painted leaves). Cached on (paint_epoch,
@@ -720,9 +721,13 @@ impl EngineState {
 
         let snap_t_geom = snap_phase_start.elapsed();
 
-        // 2. Bone matrix bytes for shading (LBS + DQ paths).
-        let bone_matrix_lbs = self.bone_matrix_allocator.bytes().to_vec();
-        let bone_matrix_dqs = self.bone_matrix_allocator.bytes_dq().to_vec();
+        // 2. Bone matrix bytes for shading (LBS + DQ paths). Cheap
+        //    `Arc::clone` — the allocator now holds the bytes inside
+        //    `Arc<Vec<u8>>` so the per-tick handoff costs a refcount
+        //    bump instead of the ~58 MB memcpy this used to do via
+        //    `.to_vec()`. See PERF_DEBT.md A3.
+        let bone_matrix_lbs = self.bone_matrix_allocator.bytes_arc();
+        let bone_matrix_dqs = self.bone_matrix_allocator.bytes_dq_arc();
 
         // 2b. Skin scatter — fold per-entity dispatches into one
         //     batched compute dispatch sim-side; render fires the
@@ -1206,12 +1211,16 @@ impl EngineState {
 
         let frame = crate::render_frame::RenderFrame {
             frame_index: self.frame_index,
-            gpu_assets: self.gpu_assets.clone(),
-            gpu_instances: self.gpu_instances.clone(),
-            gpu_instance_overlays: self.gpu_instance_overlays.clone(),
-            gpu_instance_sculpts: self.gpu_instance_sculpts.clone(),
-            splat_draws: self.splat_draws.clone(),
-            proxy_draws: self.proxy_draws.clone(),
+            // Cheap `Arc::clone`s — the underlying Vecs live behind
+            // `Arc<Vec<…>>` in EngineState. Per-tick handoff costs a
+            // refcount bump rather than ~30 KB × 6 of memcpy. See
+            // PERF_DEBT.md A3.
+            gpu_assets: std::sync::Arc::clone(&self.gpu_assets),
+            gpu_instances: std::sync::Arc::clone(&self.gpu_instances),
+            gpu_instance_overlays: std::sync::Arc::clone(&self.gpu_instance_overlays),
+            gpu_instance_sculpts: std::sync::Arc::clone(&self.gpu_instance_sculpts),
+            splat_draws: std::sync::Arc::clone(&self.splat_draws),
+            proxy_draws: std::sync::Arc::clone(&self.proxy_draws),
             gpu_objects_dirty: gpu_objects_dirty_this_frame,
             geometry_epoch,
             paint_epoch,

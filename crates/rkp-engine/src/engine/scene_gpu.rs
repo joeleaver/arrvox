@@ -29,12 +29,19 @@ impl EngineState {
         let mut this_frame_poses: std::collections::HashMap<hecs::Entity, Vec<glam::Mat4>>
             = std::collections::HashMap::new();
 
-        self.gpu_assets.clear();
-        self.gpu_instances.clear();
-        self.gpu_instance_overlays.clear();
-        self.gpu_instance_sculpts.clear();
-        self.splat_draws.clear();
-        self.proxy_draws.clear();
+        // Route through `Arc::make_mut`: in steady state refcount=1
+        // (render dropped last frame's snapshot) so this is a free
+        // `&mut Vec`. When render still holds the Arc, `make_mut`
+        // reallocates a fresh empty Vec — same cost as today's
+        // implicit `.clone()` would have been, but we get the
+        // wide-cap snapshot Arc-clone-only benefit on clean ticks.
+        // See PERF_DEBT.md A3.
+        std::sync::Arc::make_mut(&mut self.gpu_assets).clear();
+        std::sync::Arc::make_mut(&mut self.gpu_instances).clear();
+        std::sync::Arc::make_mut(&mut self.gpu_instance_overlays).clear();
+        std::sync::Arc::make_mut(&mut self.gpu_instance_sculpts).clear();
+        std::sync::Arc::make_mut(&mut self.splat_draws).clear();
+        std::sync::Arc::make_mut(&mut self.proxy_draws).clear();
         self.gpu_to_entity.clear();
         self.entity_to_gpu.clear();
 
@@ -230,13 +237,15 @@ impl EngineState {
                     Some(&id) => id,
                     None => {
                         let id = self.gpu_assets.len() as u32;
-                        self.gpu_assets.push(crate::scene_sync::build_gpu_asset(
-                            &spatial.aabb,
-                            spatial.grid_origin,
-                            &spatial_handle,
-                            spatial.voxel_size,
-                            bone_count_for_asset,
-                        ));
+                        std::sync::Arc::make_mut(&mut self.gpu_assets).push(
+                            crate::scene_sync::build_gpu_asset(
+                                &spatial.aabb,
+                                spatial.grid_origin,
+                                &spatial_handle,
+                                spatial.voxel_size,
+                                bone_count_for_asset,
+                            ),
+                        );
                         asset_table.insert(spatial.root_offset, id);
                         id
                     }
@@ -264,7 +273,8 @@ impl EngineState {
                     if !overlay.is_empty() {
                         let off = self.gpu_instance_overlays.len() as u32;
                         let count = overlay.len() as u32;
-                        self.gpu_instance_overlays.extend_from_slice(overlay.entries());
+                        std::sync::Arc::make_mut(&mut self.gpu_instance_overlays)
+                            .extend_from_slice(overlay.entries());
                         inst.overlay_offset = off;
                         inst.overlay_count = count;
                     }
@@ -278,14 +288,15 @@ impl EngineState {
                     if !sculpt.is_empty() {
                         let off = self.gpu_instance_sculpts.len() as u32;
                         let count = sculpt.len() as u32;
-                        self.gpu_instance_sculpts.extend_from_slice(sculpt.entries());
+                        std::sync::Arc::make_mut(&mut self.gpu_instance_sculpts)
+                            .extend_from_slice(sculpt.entries());
                         inst.sculpt_offset = off;
                         inst.sculpt_count = count;
                     }
                 }
                 self.entity_to_gpu.insert(entity, self.gpu_instances.len());
                 self.gpu_to_entity.push(entity);
-                self.gpu_instances.push(inst);
+                std::sync::Arc::make_mut(&mut self.gpu_instances).push(inst);
 
                 // Splat-rasterizer per-instance draw record. Only
                 // `Renderable` entities with an `asset_handle` (i.e.
@@ -403,16 +414,18 @@ impl EngineState {
                         });
                     let has_glass = asset_has_glass || overlay_glass;
 
-                    self.splat_draws.push(rkp_render::splat_pass::SplatDraw {
-                        asset_handle_raw: handle.raw(),
-                        world: world_matrix.to_cols_array_2d(),
-                        object_id: gpu_idx,
-                        grid_origin,
-                        bone_offset_lbs,
-                        bone_offset_dqs,
-                        skinning_mode,
-                        has_glass,
-                    });
+                    std::sync::Arc::make_mut(&mut self.splat_draws).push(
+                        rkp_render::splat_pass::SplatDraw {
+                            asset_handle_raw: handle.raw(),
+                            world: world_matrix.to_cols_array_2d(),
+                            object_id: gpu_idx,
+                            grid_origin,
+                            bone_offset_lbs,
+                            bone_offset_dqs,
+                            skinning_mode,
+                            has_glass,
+                        },
+                    );
                 }
             } else if let Some(proxy) = renderable.spatial.as_ref().and_then(|g| g.as_proxy_mesh()) {
                 // Procedural rendered as a first-class triangle proxy
@@ -451,16 +464,18 @@ impl EngineState {
                     .unwrap_or(crate::viewport::layer::DEFAULT);
                 self.entity_to_gpu.insert(entity, self.gpu_instances.len());
                 self.gpu_to_entity.push(entity);
-                self.gpu_instances.push(inst);
+                std::sync::Arc::make_mut(&mut self.gpu_instances).push(inst);
                 // Suppress unused-field warning on the proxy aabb —
                 // kept on `ProxyMeshData` for pick/overlap CPU queries.
                 let _proxy_aabb = proxy.aabb;
 
-                self.proxy_draws.push(rkp_render::mesh_proxy_pass::ProxyDraw {
-                    handle_raw: proxy.handle.raw(),
-                    world: world_matrix.to_cols_array_2d(),
-                    object_id: gpu_idx,
-                });
+                std::sync::Arc::make_mut(&mut self.proxy_draws).push(
+                    rkp_render::mesh_proxy_pass::ProxyDraw {
+                        handle_raw: proxy.handle.raw(),
+                        world: world_matrix.to_cols_array_2d(),
+                        object_id: gpu_idx,
+                    },
+                );
             }
         }
 

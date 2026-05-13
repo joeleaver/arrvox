@@ -67,22 +67,23 @@ pub struct RenderFrame {
 
     /// Per-asset GPU records — deduped by `octree_root`. Built by sim's
     /// `update_scene_gpu` alongside `gpu_instances`. The instance side's
-    /// `asset_id` indexes into this vec.
-    pub gpu_assets: Vec<RkpGpuAsset>,
+    /// `asset_id` indexes into this vec. Wrapped in `Arc<Vec<…>>` for
+    /// per-tick zero-copy handoff (PERF_DEBT A3).
+    pub gpu_assets: Arc<Vec<RkpGpuAsset>>,
     /// Per-instance GPU records — one per renderable entity. Render
     /// uploads (`upload_frame`) regardless of dirtiness — the cost is
     /// one `queue.write_buffer`, cheap; sim sets `gpu_objects_dirty`
     /// purely as a hint for stat tracking, not as a gate.
-    pub gpu_instances: Vec<RkpGpuInstance>,
+    pub gpu_instances: Arc<Vec<RkpGpuInstance>>,
     /// Flat per-instance paint overlay entries. Each `RkpGpuInstance`
     /// uses its `overlay_offset` + `overlay_count` to slice into this
     /// vec. Empty when no entity has been painted.
-    pub gpu_instance_overlays: Vec<OverlayEntry>,
+    pub gpu_instance_overlays: Arc<Vec<OverlayEntry>>,
     /// Flat per-instance sculpt-removal entries (Phase A — Carve). Each
     /// `RkpGpuInstance` uses its `sculpt_offset` + `sculpt_count` to
     /// slice into this vec; each `u32` is a removed `leaf_attr_id`.
     /// Empty when no entity has been carved.
-    pub gpu_instance_sculpts: Vec<u32>,
+    pub gpu_instance_sculpts: Arc<Vec<u32>>,
     /// Splat-rasterizer per-instance draws. One entry per visible
     /// `Renderable` whose asset_handle is `Some(_)` — i.e. the entity
     /// references a loaded `.rkp` asset whose splat data has been
@@ -90,12 +91,12 @@ pub struct RenderFrame {
     /// `AssetHandle` are not represented here and won't render under
     /// `RKP_PRIMARY=splat` (logged as known limitation; they need their
     /// own splat-extraction path later).
-    pub splat_draws: Vec<rkp_render::splat_pass::SplatDraw>,
+    pub splat_draws: Arc<Vec<rkp_render::splat_pass::SplatDraw>>,
     /// Per-frame proxy-mesh draw list (procedurals baked via GPU
     /// surface-nets-from-SDF). Rendered by `dispatch_proxy_meshes`
     /// after the primary mode's main pass; composites into the
     /// G-buffer via depth-test.
-    pub proxy_draws: Vec<rkp_render::mesh_proxy_pass::ProxyDraw>,
+    pub proxy_draws: Arc<Vec<rkp_render::mesh_proxy_pass::ProxyDraw>>,
     pub gpu_objects_dirty: bool,
 
     /// Monotonic counter from `scene_mgr.geometry_epoch()`. Render
@@ -142,9 +143,11 @@ pub struct RenderFrame {
 
     /// Full registry entries — render thread walks these to drive the
     /// per-shader mesh-path compose. Heavier than `user_shader_infos`
-    /// (carries WGSL bodies). Cost is one `Vec` clone per frame.
-    /// Empty when no shaders are registered.
-    pub user_shader_entries: Vec<rkp_render::shader_composer::UserShaderEntry>,
+    /// (carries WGSL bodies). Wrapped in `Arc<Vec<…>>` so the per-tick
+    /// handoff is a refcount bump rather than the prior ~50 KB
+    /// `.to_vec()` clone (PERF_DEBT A3). Empty when no shaders are
+    /// registered.
+    pub user_shader_entries: Arc<Vec<rkp_render::shader_composer::UserShaderEntry>>,
 
     /// Per-material anchor records for the V1 mesh-path user-shader
     /// pipeline. Each material with painted leaves carries its own
@@ -185,10 +188,12 @@ pub struct RenderFrame {
 
     /// Bytes packed by sim's `BoneMatrixAllocator` for the shade pass
     /// (LBS) — concatenated per-entity poses. Empty when no skinned
-    /// entities exist this frame.
-    pub bone_matrix_lbs: Vec<u8>,
+    /// entities exist this frame. Wrapped in `Arc<Vec<u8>>` so the
+    /// per-tick handoff is a refcount bump, not the ~58 MB memcpy of
+    /// the prior `.to_vec()` design (PERF_DEBT A3).
+    pub bone_matrix_lbs: Arc<Vec<u8>>,
     /// Same as above but in dual-quaternion form for the DQS path.
-    pub bone_matrix_dqs: Vec<u8>,
+    pub bone_matrix_dqs: Arc<Vec<u8>>,
 
     /// Pending click-pick. Render encodes the gbuf copy this frame
     /// and kicks off the async map; the result lands back via

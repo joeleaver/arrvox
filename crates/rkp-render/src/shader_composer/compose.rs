@@ -242,7 +242,7 @@ fn anchor_is_top_level(source: &str, byte_offset: usize) -> bool {
 fn compose_shade_chunk(reg: &UserShaderRegistry) -> String {
     let mut out = String::new();
     out.push_str("// ── user-shader helpers + bodies: shade ───────────────\n");
-    for entry in &reg.entries {
+    for entry in reg.entries() {
         if entry.shade_text.is_some() {
             for helper in &entry.helpers {
                 out.push_str(helper);
@@ -250,7 +250,7 @@ fn compose_shade_chunk(reg: &UserShaderRegistry) -> String {
             }
         }
     }
-    for entry in &reg.entries {
+    for entry in reg.entries() {
         if let Some(text) = &entry.shade_text {
             out.push_str(&rewrite_fn_name(
                 text,
@@ -265,7 +265,7 @@ fn compose_shade_chunk(reg: &UserShaderRegistry) -> String {
         "fn dispatch_user_shade(shader_id: u32, ctx: ShadeCtx) -> ShadeResult {\n",
     );
     out.push_str("    switch shader_id {\n");
-    for entry in &reg.entries {
+    for entry in reg.entries() {
         if entry.shade_text.is_some() {
             out.push_str(&format!(
                 "        case {}u: {{ return rkp_user_{}_shade(ctx); }}\n",
@@ -282,7 +282,7 @@ fn compose_shade_chunk(reg: &UserShaderRegistry) -> String {
 fn compose_generate_chunk(reg: &UserShaderRegistry) -> String {
     let mut out = String::new();
     out.push_str("// ── user-shader helpers + bodies: generate ────────────\n");
-    for entry in &reg.entries {
+    for entry in reg.entries() {
         if entry.generate_text.is_some() {
             for helper in &entry.helpers {
                 out.push_str(helper);
@@ -290,7 +290,7 @@ fn compose_generate_chunk(reg: &UserShaderRegistry) -> String {
             }
         }
     }
-    for entry in &reg.entries {
+    for entry in reg.entries() {
         if let Some(text) = &entry.generate_text {
             out.push_str(&rewrite_fn_name(
                 text,
@@ -307,7 +307,7 @@ fn compose_generate_chunk(reg: &UserShaderRegistry) -> String {
         "fn dispatch_user_generate(shader_id: u32, cell_world_pos: vec3<f32>, host: HostSample, ctx: UserCtx) -> VoxelEmit {\n",
     );
     out.push_str("    switch shader_id {\n");
-    for entry in &reg.entries {
+    for entry in reg.entries() {
         if entry.generate_text.is_some() {
             out.push_str(&format!(
                 "        case {}u: {{ return rkp_user_{}_generate(cell_world_pos, host, ctx); }}\n",

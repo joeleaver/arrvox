@@ -372,10 +372,10 @@ impl EngineState {
         self.entity_uuids.clear();
         self.uuid_to_entity.clear();
         self.next_entity_uuid = 1;
-        self.gpu_assets.clear();
-        self.gpu_instances.clear();
-        self.gpu_instance_overlays.clear();
-        self.gpu_instance_sculpts.clear();
+        std::sync::Arc::make_mut(&mut self.gpu_assets).clear();
+        std::sync::Arc::make_mut(&mut self.gpu_instances).clear();
+        std::sync::Arc::make_mut(&mut self.gpu_instance_overlays).clear();
+        std::sync::Arc::make_mut(&mut self.gpu_instance_sculpts).clear();
         self.gpu_to_entity.clear();
         self.paint_overlays.clear();
         self.sculpt_overlays.clear();

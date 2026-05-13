@@ -199,7 +199,11 @@ impl UserShaderEntry {
 /// generation, then a new registry replaces it on filesystem change.
 #[derive(Debug, Clone, Default)]
 pub struct UserShaderRegistry {
-    pub(super) entries: Vec<UserShaderEntry>,
+    /// `Arc<Vec<…>>` so per-tick handoff to the render snapshot is a
+    /// refcount bump rather than a `.to_vec()` clone of every captured
+    /// WGSL body (~50 KB when shaders are registered). See PERF_DEBT
+    /// A3.
+    pub(super) entries: std::sync::Arc<Vec<UserShaderEntry>>,
     /// Stable hash of the concatenation of every entry's source text
     /// in deterministic (alphabetical) order. Bake outputs use this
     /// in their cache key so editing a `.wgsl` invalidates only
@@ -216,6 +220,13 @@ impl UserShaderRegistry {
 
     pub fn entries(&self) -> &[UserShaderEntry] {
         &self.entries
+    }
+
+    /// Cheap shareable handle to the registered entries. Used by sim
+    /// to ship the registry into each `RenderFrame` snapshot without
+    /// copying ~50 KB of WGSL bodies per tick.
+    pub fn entries_arc(&self) -> std::sync::Arc<Vec<UserShaderEntry>> {
+        self.entries.clone()
     }
 
     pub fn source_hash(&self) -> u64 {

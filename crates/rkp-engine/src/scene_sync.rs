@@ -319,13 +319,20 @@ fn mat_to_dual_quat(mat: Mat4) -> DualQuat {
 #[derive(Default)]
 pub struct BoneMatrixAllocator {
     /// Concatenated palettes: per entity, `mat4x4<f32>` forward-then-
-    /// inverse, entities in iteration order.
-    bytes: Vec<u8>,
+    /// inverse, entities in iteration order. Wrapped in `Arc<Vec<u8>>`
+    /// so the per-tick snapshot handoff is a refcount bump rather than
+    /// an ~58 MB memcpy of the prior `.bytes().to_vec()` design (PERF_DEBT
+    /// A3). Mutations during [`Self::rebuild`] reach into the Vec via
+    /// [`Self::bytes_mut`] (`Arc::make_mut`); the COW happens once per
+    /// rebuild when render still holds last frame's `Arc`, but we
+    /// immediately clear the Vec, so `make_mut` on a refcount=2 Arc
+    /// reallocates fresh — no payload copy of the old contents.
+    bytes: std::sync::Arc<Vec<u8>>,
     /// Concatenated forward dual quats — one `DualQuat` per bone per
     /// entity. Parallel to the forward half of `bytes` (same entity
     /// order, same bone order), but independent byte layout because
     /// DualQuat (32 B) doesn't stride the same as mat4 (64 B).
-    bytes_dq: Vec<u8>,
+    bytes_dq: std::sync::Arc<Vec<u8>>,
     /// Entity → `SkinnedBinding` for the current frame.
     bindings: std::collections::HashMap<hecs::Entity, SkinnedBinding>,
 }
@@ -343,8 +350,14 @@ impl BoneMatrixAllocator {
     /// * `bone_dq_offset` indexes `bone_dual_quats` in DualQuat units —
     ///   forward slot at `[off + i]`. No inverse palette in this buffer.
     pub fn rebuild(&mut self, world: &hecs::World) {
-        self.bytes.clear();
-        self.bytes_dq.clear();
+        // `Arc::make_mut` reuses the Vec when refcount==1 (typical
+        // case after render dropped last frame's snapshot) and
+        // reallocates a fresh Vec when refcount>1 (last frame still
+        // in flight). The `.clear()` immediately after means we never
+        // pay the memcpy of the COW path — it just hands us a fresh
+        // empty Vec with previous capacity gone.
+        std::sync::Arc::make_mut(&mut self.bytes).clear();
+        std::sync::Arc::make_mut(&mut self.bytes_dq).clear();
         self.bindings.clear();
 
         let mut running_mat_offset: u32 = 0;
@@ -358,15 +371,17 @@ impl BoneMatrixAllocator {
             // the same length — `animation::tick` keeps them in sync.
             let fwd: &[u8] = bytemuck::cast_slice(&skel.current_pose);
             let inv: &[u8] = bytemuck::cast_slice(&skel.inverse_pose);
-            self.bytes.extend_from_slice(fwd);
-            self.bytes.extend_from_slice(inv);
+            let bytes = std::sync::Arc::make_mut(&mut self.bytes);
+            bytes.extend_from_slice(fwd);
+            bytes.extend_from_slice(inv);
 
             // Precomputed forward dual quats for the DQS scatter branch.
             // One DQ per bone — scatter doesn't need inverse dual quats.
             let dqs: Vec<DualQuat> = skel.current_pose.iter()
                 .map(|m| mat_to_dual_quat(*m))
                 .collect();
-            self.bytes_dq.extend_from_slice(bytemuck::cast_slice(&dqs));
+            std::sync::Arc::make_mut(&mut self.bytes_dq)
+                .extend_from_slice(bytemuck::cast_slice(&dqs));
 
             self.bindings.insert(entity, SkinnedBinding {
                 bone_count,
@@ -389,9 +404,19 @@ impl BoneMatrixAllocator {
     /// Flat byte buffer ready to ship in `FrameUpload.bone_matrices`.
     pub fn bytes(&self) -> &[u8] { &self.bytes }
 
+    /// Cheap shareable handle to the bone-matrix bytes for the per-tick
+    /// snapshot handoff. `Arc::clone` — no memcpy. Render holds the
+    /// returned Arc until it ships (or drops) the frame; the next
+    /// `rebuild()`'s `make_mut` will reallocate when render's clone is
+    /// still alive.
+    pub fn bytes_arc(&self) -> std::sync::Arc<Vec<u8>> { self.bytes.clone() }
+
     /// Flat byte buffer of forward-pose dual quaternions, ready to
     /// ship in `FrameUpload.bone_dual_quats`. 32 B per bone per entity.
     pub fn bytes_dq(&self) -> &[u8] { &self.bytes_dq }
+
+    /// Cheap shareable handle to the dual-quat bytes. See [`Self::bytes_arc`].
+    pub fn bytes_dq_arc(&self) -> std::sync::Arc<Vec<u8>> { self.bytes_dq.clone() }
 
     /// Lookup a skinning binding for an entity, or `None` if unskinned.
     pub fn binding(&self, entity: hecs::Entity) -> Option<SkinnedBinding> {

@@ -248,17 +248,28 @@ pub(super) fn run_render_thread(
 
         // 5. Build the instance list we'll actually upload. If there's
         //    a prev snapshot and α < 1, blend; otherwise use curr
-        //    directly (free — avoids per-object work at sim rate).
+        //    directly (free — borrows the snapshot's `Arc<Vec<…>>`,
+        //    no per-object work at sim rate).
         //    Assets don't interpolate — they're pose-static for a frame.
-        let interp_instances: Vec<rkp_render::rkp_gpu_object::RkpGpuInstance> =
+        //
+        //    `interp_owned` is `Some(_)` only when we actually had to
+        //    interpolate (allocates a fresh Vec). The non-interp branch
+        //    leaves it `None` and we deref into the snapshot's Arc
+        //    directly — saves the per-tick `Vec::clone` that the prior
+        //    `curr.gpu_instances.clone()` paid (PERF_DEBT A3).
+        let interp_owned: Option<Vec<rkp_render::rkp_gpu_object::RkpGpuInstance>> =
             match (prev.as_ref(), alpha < 0.999) {
-                (Some(p), true) => interpolate_instances(
+                (Some(p), true) => Some(interpolate_instances(
                     &p.gpu_instances,
                     &curr.gpu_instances,
                     alpha,
-                ),
-                _ => curr.gpu_instances.clone(),
+                )),
+                _ => None,
             };
+        let interp_instances: &[rkp_render::rkp_gpu_object::RkpGpuInstance] =
+            interp_owned
+                .as_deref()
+                .unwrap_or(curr.gpu_instances.as_slice());
 
         let r_t_interp = render_phase_start.elapsed();
 
