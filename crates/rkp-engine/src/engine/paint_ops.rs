@@ -179,6 +179,11 @@ impl EngineState {
             // 60+ Hz drag path off the O(octree) walk entirely.
             if matches!(mode, PaintMode::Material) {
                 self.painted_dirty_entities.insert(entity);
+                // Material-mode paint may introduce a shader-bearing
+                // material on this entity — force the next walk to
+                // re-scan instead of trusting the cached "no shader
+                // materials" verdict.
+                self.entities_known_empty.remove(&entity);
             }
         }
         written

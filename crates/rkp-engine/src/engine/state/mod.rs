@@ -310,6 +310,27 @@ pub(crate) struct EngineState {
     /// than holding it across all entities for the duration of the
     /// O(all-octrees) walk.
     pub(crate) painted_dirty_entities: std::collections::HashSet<hecs::Entity>,
+    /// Entities for which the most recent painted-materials walk found
+    /// ZERO shader-bearing materials. Skips re-walking these entities
+    /// on subsequent sculpt-only triggers — the sculpt mutation can't
+    /// introduce a shader-bearing material in Carve mode, so the cache
+    /// stays valid.
+    ///
+    /// Mutated:
+    /// - **Walk** inserts when `mat_tiles` ends empty; removes when
+    ///   non-empty.
+    /// - **`apply_paint_stamp` Material mode** removes when it lands a
+    ///   stamp (the new material might be shader-bearing).
+    /// - **`apply_sculpt_stamp` Raise mode** removes (might add a leaf
+    ///   with a shader-bearing brush material).
+    /// - **Entity despawn** removes the entry.
+    ///
+    /// The win: on the splat5 elephant with no painted shader
+    /// materials, scan_painted_aabbs walks the full 2.5M-voxel octree
+    /// each sculpt for ~150 ms only to find zero matches. Caching the
+    /// "no shader materials" result cuts this to ~0 ms after the
+    /// first walk.
+    pub(crate) entities_known_empty: std::collections::HashSet<hecs::Entity>,
     /// Epochs the cache was last reconciled against. When either
     /// moves ahead, we invalidate and re-scan affected entities.
     pub(crate) painted_materials_paint_epoch: u64,

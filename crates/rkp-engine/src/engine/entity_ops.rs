@@ -230,6 +230,7 @@ impl EngineState {
         // it out here keeps the dirty set tight.
         self.painted_per_entity.remove(&entity);
         self.painted_dirty_entities.remove(&entity);
+        self.entities_known_empty.remove(&entity);
 
         // Despawn from ECS.
         let _ = self.world.despawn(entity);
@@ -374,6 +375,7 @@ impl EngineState {
         self.sculpt_overlays.clear();
         self.painted_per_entity.clear();
         self.painted_dirty_entities.clear();
+        self.entities_known_empty.clear();
         // `clear()` wipes every pool but preserves the epoch atomic
         // identity — replacing the whole manager here would orphan
         // sim's `geometry_epoch_handle`, breaking the lock-free

@@ -178,6 +178,16 @@ impl EngineState {
         // the walk re-scans only this one octree (~ms).
         self.painted_dirty_entities.insert(entity);
 
+        // Raise mode can add a new leaf with the brush's material — if
+        // that material happens to be shader-bearing, the cached "no
+        // shader materials" verdict on this entity becomes stale.
+        // Force a re-scan by removing from the known-empty set. Carve
+        // never adds materials, so its sculpts preserve the cache and
+        // hit the fast skip path in the walk.
+        if matches!(mode, SculptMode::Raise) {
+            self.entities_known_empty.remove(&entity);
+        }
+
         eprintln!(
             "[sculpt] stamp entity={:?} mode={:?} overlay_size={} (+{} this stamp)",
             entity, mode, overlay.len(), result.leaves_removed,
