@@ -185,6 +185,14 @@ impl EngineState {
                 // materials" verdict.
                 self.entities_known_empty.remove(&entity);
             }
+
+            // Push a scope-carrying mutation event. Phase A1 scaffolding;
+            // see docs/PERF_DEBT.md.
+            self.mutation_log.push(super::mutation_log::MutationEvent::PaintStamp {
+                entity,
+                mode,
+                material_id,
+            });
         }
         written
     }

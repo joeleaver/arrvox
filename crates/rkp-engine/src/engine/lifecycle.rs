@@ -36,6 +36,13 @@ impl EngineState {
         use crate::viewport::ViewportId;
         let frame_start = std::time::Instant::now();
 
+        // Phase A1 (docs/PERF_DEBT.md) — drain the typed mutation log
+        // accumulated during the previous tick. No consumers wired
+        // yet; this just keeps the log from growing unbounded while
+        // we incrementally adopt the event-driven pattern. Phase B/C
+        // replace this with actual event-driven derived-state updates.
+        self.mutation_log.drain_and_log();
+
         // ── [sculpt-pipeline-sim] phase timings ────────────────────────
         // To debug the bump→submit gap surfaced by `[sculpt-pipeline]`,
         // capture each major sim-side phase's wall time and emit one

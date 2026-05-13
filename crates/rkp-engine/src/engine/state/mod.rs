@@ -331,6 +331,13 @@ pub(crate) struct EngineState {
     /// "no shader materials" result cuts this to ~0 ms after the
     /// first walk.
     pub(crate) entities_known_empty: std::collections::HashSet<hecs::Entity>,
+    /// Typed mutation event log — every CPU-side mutation describes
+    /// its scope here. Phase A1 of `docs/PERF_DEBT.md`: scaffolding
+    /// only, no consumers. Drained at the start of each
+    /// `submit_render_frame` tick. Phase B/C replace the existing
+    /// coarse `*_dirty` flags by reading events from this log and
+    /// translating them into per-entity dirty sets.
+    pub(crate) mutation_log: super::mutation_log::MutationLog,
     /// Epochs the cache was last reconciled against. When either
     /// moves ahead, we invalidate and re-scan affected entities.
     pub(crate) painted_materials_paint_epoch: u64,

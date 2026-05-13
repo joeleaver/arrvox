@@ -188,6 +188,15 @@ impl EngineState {
             self.entities_known_empty.remove(&entity);
         }
 
+        // Push a scope-carrying mutation event so Phase B/C consumers
+        // can update their derived state incrementally. Phase A1 is
+        // scaffolding only — the log drains unobserved every tick.
+        self.mutation_log.push(super::mutation_log::MutationEvent::SculptStamp {
+            entity,
+            mode,
+            material_id,
+        });
+
         eprintln!(
             "[sculpt] stamp entity={:?} mode={:?} overlay_size={} (+{} this stamp)",
             entity, mode, overlay.len(), result.leaves_removed,

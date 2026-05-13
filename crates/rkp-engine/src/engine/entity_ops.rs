@@ -232,6 +232,12 @@ impl EngineState {
         self.painted_dirty_entities.remove(&entity);
         self.entities_known_empty.remove(&entity);
 
+        // Phase A1 mutation event — see docs/PERF_DEBT.md. Scaffolding
+        // only (no consumers yet).
+        self.mutation_log.push(
+            super::mutation_log::MutationEvent::EntityRemoved { entity },
+        );
+
         // Despawn from ECS.
         let _ = self.world.despawn(entity);
 
@@ -376,6 +382,9 @@ impl EngineState {
         self.painted_per_entity.clear();
         self.painted_dirty_entities.clear();
         self.entities_known_empty.clear();
+        // Phase A1 mutation event for project/scene reset. Scaffolding
+        // only — see docs/PERF_DEBT.md.
+        self.mutation_log.push(super::mutation_log::MutationEvent::WorldReset);
         // `clear()` wipes every pool but preserves the epoch atomic
         // identity — replacing the whole manager here would orphan
         // sim's `geometry_epoch_handle`, breaking the lock-free
