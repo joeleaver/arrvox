@@ -70,6 +70,10 @@ pub struct BrickPool {
     next_free_brick: u32,
     /// Free list of reclaimed brick ranges — `(brick_start, brick_count)`.
     free_list: Vec<(u32, u32)>,
+    /// Byte ranges in `data` mutated since the last GPU upload. Drained
+    /// by `upload_geometry` to emit per-range `queue.write_buffer` calls
+    /// instead of rewriting the whole pool every frame.
+    dirty: crate::DirtyRanges,
 }
 
 impl BrickPool {
@@ -80,7 +84,36 @@ impl BrickPool {
             data: vec![BRICK_EMPTY; capacity_cells],
             next_free_brick: 0,
             free_list: Vec::new(),
+            dirty: crate::DirtyRanges::new(),
         }
+    }
+
+    /// Mark a brick's byte range dirty for the next upload.
+    #[inline]
+    fn mark_brick_dirty(&mut self, brick_id: u32) {
+        self.dirty.mark(brick_id * BRICK_BYTES, BRICK_BYTES);
+    }
+
+    /// Mark a contiguous range of bricks dirty for the next upload.
+    #[inline]
+    fn mark_brick_range_dirty(&mut self, start: u32, count: u32) {
+        if count == 0 {
+            return;
+        }
+        self.dirty.mark(start * BRICK_BYTES, count * BRICK_BYTES);
+    }
+
+    /// Read-only view of the dirty range tracker.
+    #[inline]
+    pub fn dirty_ranges(&self) -> &crate::DirtyRanges {
+        &self.dirty
+    }
+
+    /// Mutable view of the dirty range tracker. The upload path calls
+    /// `clear()` on this after writing the deltas to the GPU buffer.
+    #[inline]
+    pub fn dirty_ranges_mut(&mut self) -> &mut crate::DirtyRanges {
+        &mut self.dirty
     }
 
     /// Reserve `count` contiguous bricks by bumping past any freed entries.
@@ -96,6 +129,7 @@ impl BrickPool {
             self.grow(new_cap);
         }
         self.next_free_brick = end;
+        self.mark_brick_range_dirty(start, count);
         Some(start)
     }
 
@@ -110,6 +144,7 @@ impl BrickPool {
             } else {
                 self.free_list[idx] = (start + 1, count - 1);
             }
+            self.mark_brick_dirty(start);
             return Some(start);
         }
 
@@ -119,6 +154,7 @@ impl BrickPool {
         }
         let id = self.next_free_brick;
         self.next_free_brick += 1;
+        self.mark_brick_dirty(id);
         Some(id)
     }
 
@@ -153,6 +189,11 @@ impl BrickPool {
             for cell in &mut self.data[start..end] {
                 *cell = BRICK_EMPTY;
             }
+            // Freed bricks need to be re-uploaded as zeros — they're
+            // still within `next_free_brick` if any other brick at the
+            // tail survives, so the renderer would otherwise read stale
+            // leaf_attr slots.
+            self.mark_brick_dirty(id);
         }
 
         // Sort + group into (start, count) ranges.
@@ -218,6 +259,7 @@ impl BrickPool {
         for cell in &mut self.data[start..end] {
             *cell = BRICK_EMPTY;
         }
+        self.mark_brick_dirty(brick_id);
         if brick_id + 1 == self.next_free_brick {
             self.next_free_brick = brick_id;
             loop {
@@ -249,6 +291,7 @@ impl BrickPool {
         let offset = brick_id as usize * BRICK_CELLS as usize
             + brick_flat_index(x, y, z) as usize;
         self.data[offset] = value;
+        self.mark_brick_dirty(brick_id);
     }
 
     /// Raw slice of a brick's 64 cells.
@@ -258,9 +301,12 @@ impl BrickPool {
         &self.data[start..start + BRICK_CELLS as usize]
     }
 
-    /// Mutable slice of a brick's 64 cells.
+    /// Mutable slice of a brick's 64 cells. Conservatively marks the
+    /// whole brick dirty — the caller may write any subset of the 64
+    /// cells via this slice and we cannot observe which were touched.
     #[inline]
     pub fn brick_cells_mut(&mut self, brick_id: u32) -> &mut [u32] {
+        self.mark_brick_dirty(brick_id);
         let start = brick_id as usize * BRICK_CELLS as usize;
         &mut self.data[start..start + BRICK_CELLS as usize]
     }
@@ -394,5 +440,87 @@ mod tests {
         let id = pool.allocate().unwrap();
         pool.brick_cells_mut(id)[7] = 99;
         assert_eq!(pool.get_cell(id, 3, 1, 0), 99); // 3 + 1*4 + 0*16 = 7
+    }
+
+    #[test]
+    fn allocate_marks_dirty() {
+        let mut pool = BrickPool::new(4);
+        assert!(pool.dirty_ranges().is_empty());
+        let id = pool.allocate().unwrap();
+        let ranges: Vec<_> = pool.dirty_ranges().iter().collect();
+        assert_eq!(ranges, vec![(id * BRICK_BYTES, BRICK_BYTES)]);
+    }
+
+    #[test]
+    fn allocate_contiguous_bump_marks_range() {
+        let mut pool = BrickPool::new(8);
+        let start = pool.allocate_contiguous_bump(3).unwrap();
+        let ranges: Vec<_> = pool.dirty_ranges().iter().collect();
+        assert_eq!(ranges, vec![(start * BRICK_BYTES, 3 * BRICK_BYTES)]);
+    }
+
+    #[test]
+    fn allocate_contiguous_bump_zero_no_mark() {
+        let mut pool = BrickPool::new(4);
+        pool.allocate_contiguous_bump(0).unwrap();
+        assert!(pool.dirty_ranges().is_empty());
+    }
+
+    #[test]
+    fn set_cell_marks_owning_brick() {
+        let mut pool = BrickPool::new(4);
+        let a = pool.allocate().unwrap();
+        let b = pool.allocate().unwrap();
+        pool.dirty_ranges_mut().clear();
+
+        pool.set_cell(b, 0, 0, 0, 42);
+        let ranges: Vec<_> = pool.dirty_ranges().iter().collect();
+        assert_eq!(ranges, vec![(b * BRICK_BYTES, BRICK_BYTES)]);
+        let _ = a;
+    }
+
+    #[test]
+    fn brick_cells_mut_marks_brick() {
+        let mut pool = BrickPool::new(4);
+        let id = pool.allocate().unwrap();
+        pool.dirty_ranges_mut().clear();
+        let _ = pool.brick_cells_mut(id);
+        let ranges: Vec<_> = pool.dirty_ranges().iter().collect();
+        assert_eq!(ranges, vec![(id * BRICK_BYTES, BRICK_BYTES)]);
+    }
+
+    #[test]
+    fn deallocate_marks_brick() {
+        let mut pool = BrickPool::new(4);
+        let a = pool.allocate().unwrap();
+        let _b = pool.allocate().unwrap();
+        pool.dirty_ranges_mut().clear();
+        pool.deallocate(a); // interior — won't shrink tail
+        let ranges: Vec<_> = pool.dirty_ranges().iter().collect();
+        assert_eq!(ranges, vec![(a * BRICK_BYTES, BRICK_BYTES)]);
+    }
+
+    #[test]
+    fn deallocate_batch_marks_each_brick() {
+        let mut pool = BrickPool::new(4);
+        let a = pool.allocate().unwrap();
+        let b = pool.allocate().unwrap();
+        let c = pool.allocate().unwrap();
+        pool.dirty_ranges_mut().clear();
+        pool.deallocate_batch(&[a, c]); // b survives at index 1
+        let ranges: Vec<_> = pool.dirty_ranges().iter().collect();
+        assert_eq!(ranges.len(), 2);
+        assert!(ranges.contains(&(a * BRICK_BYTES, BRICK_BYTES)));
+        assert!(ranges.contains(&(c * BRICK_BYTES, BRICK_BYTES)));
+        let _ = b;
+    }
+
+    #[test]
+    fn dirty_ranges_clear_resets() {
+        let mut pool = BrickPool::new(4);
+        pool.allocate().unwrap();
+        pool.allocate().unwrap();
+        pool.dirty_ranges_mut().clear();
+        assert!(pool.dirty_ranges().is_empty());
     }
 }

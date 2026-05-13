@@ -14,6 +14,11 @@
 use crate::companion::BoneVoxel;
 
 use crate::leaf_attr::LeafAttr;
+use crate::DirtyRanges;
+
+const LEAF_ATTR_STRIDE: u32 = std::mem::size_of::<LeafAttr>() as u32;
+const COLOR_STRIDE: u32 = std::mem::size_of::<u32>() as u32;
+const BONE_STRIDE: u32 = std::mem::size_of::<BoneVoxel>() as u32;
 
 /// A flat pool of [`LeafAttr`] entries indexed by slot number, with
 /// parallel color and bone-weight arrays at the same indices.
@@ -30,6 +35,12 @@ pub struct LeafAttrPool {
     next_free: u32,
     /// Free list of reclaimed ranges — `(start, count)` pairs.
     free_list: Vec<(u32, u32)>,
+    /// Byte ranges in `data` mutated since the last GPU upload.
+    dirty_attrs: DirtyRanges,
+    /// Byte ranges in `colors` mutated since the last GPU upload.
+    dirty_colors: DirtyRanges,
+    /// Byte ranges in `bones` mutated since the last GPU upload.
+    dirty_bones: DirtyRanges,
 }
 
 impl LeafAttrPool {
@@ -41,8 +52,53 @@ impl LeafAttrPool {
             bones: vec![BoneVoxel::default(); capacity as usize],
             next_free: 0,
             free_list: Vec::new(),
+            dirty_attrs: DirtyRanges::new(),
+            dirty_colors: DirtyRanges::new(),
+            dirty_bones: DirtyRanges::new(),
         }
     }
+
+    #[inline]
+    fn mark_slot_range_all(&mut self, start: u32, count: u32) {
+        if count == 0 {
+            return;
+        }
+        self.dirty_attrs.mark(start * LEAF_ATTR_STRIDE, count * LEAF_ATTR_STRIDE);
+        self.dirty_colors.mark(start * COLOR_STRIDE, count * COLOR_STRIDE);
+        self.dirty_bones.mark(start * BONE_STRIDE, count * BONE_STRIDE);
+    }
+
+    #[inline]
+    fn mark_attr_slot(&mut self, slot: u32) {
+        self.dirty_attrs.mark(slot * LEAF_ATTR_STRIDE, LEAF_ATTR_STRIDE);
+    }
+
+    #[inline]
+    fn mark_color_slot(&mut self, slot: u32) {
+        self.dirty_colors.mark(slot * COLOR_STRIDE, COLOR_STRIDE);
+    }
+
+    #[inline]
+    fn mark_bone_slot(&mut self, slot: u32) {
+        self.dirty_bones.mark(slot * BONE_STRIDE, BONE_STRIDE);
+    }
+
+    /// Read-only views of the per-pool dirty range trackers.
+    #[inline]
+    pub fn dirty_attrs(&self) -> &DirtyRanges { &self.dirty_attrs }
+    #[inline]
+    pub fn dirty_colors(&self) -> &DirtyRanges { &self.dirty_colors }
+    #[inline]
+    pub fn dirty_bones(&self) -> &DirtyRanges { &self.dirty_bones }
+
+    /// Mutable views of the per-pool dirty range trackers. The upload
+    /// path calls `clear()` on these after writing the deltas.
+    #[inline]
+    pub fn dirty_attrs_mut(&mut self) -> &mut DirtyRanges { &mut self.dirty_attrs }
+    #[inline]
+    pub fn dirty_colors_mut(&mut self) -> &mut DirtyRanges { &mut self.dirty_colors }
+    #[inline]
+    pub fn dirty_bones_mut(&mut self) -> &mut DirtyRanges { &mut self.dirty_bones }
 
     /// Allocate `count` contiguous slots. First-fit in free list, else bump.
     pub fn allocate_range(&mut self, count: u32) -> Option<Vec<u32>> {
@@ -57,6 +113,7 @@ impl LeafAttrPool {
             } else {
                 self.free_list[idx] = (start + count, free_count - count);
             }
+            self.mark_slot_range_all(start, count);
             return Some((start..start + count).collect());
         }
 
@@ -67,6 +124,7 @@ impl LeafAttrPool {
             self.grow(new_cap);
         }
         self.next_free = end;
+        self.mark_slot_range_all(start, count);
         Some((start..end).collect())
     }
 
@@ -84,6 +142,7 @@ impl LeafAttrPool {
             self.grow(new_cap);
         }
         self.next_free = end;
+        self.mark_slot_range_all(start, count);
         Some(start)
     }
 
@@ -96,6 +155,7 @@ impl LeafAttrPool {
             } else {
                 self.free_list[idx] = (start + 1, free_count - 1);
             }
+            self.mark_slot_range_all(start, 1);
             return Some(start);
         }
 
@@ -105,6 +165,7 @@ impl LeafAttrPool {
         }
         let slot = self.next_free;
         self.next_free += 1;
+        self.mark_slot_range_all(slot, 1);
         Some(slot)
     }
 
@@ -124,6 +185,7 @@ impl LeafAttrPool {
             self.colors[s] = 0;
             self.bones[s] = BoneVoxel::default();
         }
+        self.mark_slot_range_all(start, count);
         if start + count == self.next_free {
             self.next_free = start;
             loop {
@@ -144,8 +206,14 @@ impl LeafAttrPool {
     #[inline]
     pub fn get(&self, slot: u32) -> &LeafAttr { &self.data[slot as usize] }
 
+    /// Mutable handle to the [`LeafAttr`] at `slot`. Conservatively
+    /// marks the slot dirty — caller intent is mutation, and we cannot
+    /// observe whether the caller actually writes.
     #[inline]
-    pub fn get_mut(&mut self, slot: u32) -> &mut LeafAttr { &mut self.data[slot as usize] }
+    pub fn get_mut(&mut self, slot: u32) -> &mut LeafAttr {
+        self.mark_attr_slot(slot);
+        &mut self.data[slot as usize]
+    }
 
     #[inline]
     pub fn color(&self, slot: u32) -> u32 { self.colors[slot as usize] }
@@ -153,6 +221,7 @@ impl LeafAttrPool {
     #[inline]
     pub fn set_color(&mut self, slot: u32, packed: u32) {
         self.colors[slot as usize] = packed;
+        self.mark_color_slot(slot);
     }
 
     #[inline]
@@ -161,6 +230,7 @@ impl LeafAttrPool {
     #[inline]
     pub fn set_bone(&mut self, slot: u32, bv: BoneVoxel) {
         self.bones[slot as usize] = bv;
+        self.mark_bone_slot(slot);
     }
 
     #[inline]
@@ -303,5 +373,81 @@ mod tests {
         let reused = pool.allocate_range(10).unwrap();
         assert_eq!(reused[0], 0);
         assert_eq!(pool.allocated_count(), 15);
+    }
+
+    #[test]
+    fn allocate_marks_all_pools() {
+        let mut pool = LeafAttrPool::new(16);
+        assert!(pool.dirty_attrs().is_empty());
+        let slot = pool.allocate().unwrap();
+        let a: Vec<_> = pool.dirty_attrs().iter().collect();
+        let c: Vec<_> = pool.dirty_colors().iter().collect();
+        let b: Vec<_> = pool.dirty_bones().iter().collect();
+        assert_eq!(a, vec![(slot * LEAF_ATTR_STRIDE, LEAF_ATTR_STRIDE)]);
+        assert_eq!(c, vec![(slot * COLOR_STRIDE, COLOR_STRIDE)]);
+        assert_eq!(b, vec![(slot * BONE_STRIDE, BONE_STRIDE)]);
+    }
+
+    #[test]
+    fn allocate_range_marks_full_range() {
+        let mut pool = LeafAttrPool::new(16);
+        let slots = pool.allocate_range(4).unwrap();
+        let start = slots[0];
+        let a: Vec<_> = pool.dirty_attrs().iter().collect();
+        assert_eq!(a, vec![(start * LEAF_ATTR_STRIDE, 4 * LEAF_ATTR_STRIDE)]);
+    }
+
+    #[test]
+    fn deallocate_range_marks_all_pools() {
+        let mut pool = LeafAttrPool::new(16);
+        let slots = pool.allocate_range(3).unwrap();
+        pool.dirty_attrs_mut().clear();
+        pool.dirty_colors_mut().clear();
+        pool.dirty_bones_mut().clear();
+        pool.deallocate_range(slots[0], 3);
+        // Tail-shrink path still marks per spec.
+        let a: Vec<_> = pool.dirty_attrs().iter().collect();
+        assert_eq!(a, vec![(slots[0] * LEAF_ATTR_STRIDE, 3 * LEAF_ATTR_STRIDE)]);
+    }
+
+    #[test]
+    fn get_mut_marks_attr_only() {
+        let mut pool = LeafAttrPool::new(16);
+        let slot = pool.allocate().unwrap();
+        pool.dirty_attrs_mut().clear();
+        pool.dirty_colors_mut().clear();
+        pool.dirty_bones_mut().clear();
+        let _ = pool.get_mut(slot);
+        assert!(!pool.dirty_attrs().is_empty());
+        assert!(pool.dirty_colors().is_empty());
+        assert!(pool.dirty_bones().is_empty());
+    }
+
+    #[test]
+    fn set_color_marks_color_only() {
+        let mut pool = LeafAttrPool::new(16);
+        let slot = pool.allocate().unwrap();
+        pool.dirty_attrs_mut().clear();
+        pool.dirty_colors_mut().clear();
+        pool.dirty_bones_mut().clear();
+        pool.set_color(slot, 0xCC);
+        assert!(pool.dirty_attrs().is_empty());
+        let c: Vec<_> = pool.dirty_colors().iter().collect();
+        assert_eq!(c, vec![(slot * COLOR_STRIDE, COLOR_STRIDE)]);
+        assert!(pool.dirty_bones().is_empty());
+    }
+
+    #[test]
+    fn set_bone_marks_bone_only() {
+        let mut pool = LeafAttrPool::new(16);
+        let slot = pool.allocate().unwrap();
+        pool.dirty_attrs_mut().clear();
+        pool.dirty_colors_mut().clear();
+        pool.dirty_bones_mut().clear();
+        pool.set_bone(slot, BoneVoxel::default());
+        assert!(pool.dirty_attrs().is_empty());
+        assert!(pool.dirty_colors().is_empty());
+        let b: Vec<_> = pool.dirty_bones().iter().collect();
+        assert_eq!(b, vec![(slot * BONE_STRIDE, BONE_STRIDE)]);
     }
 }
