@@ -60,6 +60,15 @@ struct Args {
     /// without re-voxelizing — much faster than a full re-import.
     #[arg(long, alias = "upgrade-v4")]
     rebuild_mesh: bool,
+
+    /// Downgrade a v6 .rkp in place to v5: drop the three trailing
+    /// DAG-topology sections and rewrite the header with version=5
+    /// and `dag_*_compressed_size=0`. All other sections (octree,
+    /// voxels, normals, bricks, color, bone, mesh_*) pass through
+    /// verbatim — no re-bake. Used by the perf bisect against the
+    /// pre-v6 editor. Fast (~ms per file).
+    #[arg(long)]
+    downgrade_to_v5: bool,
 }
 
 fn parse_rotation(s: &str) -> Result<[f32; 3], String> {
@@ -82,6 +91,16 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("rkp-convert --rebuild-mesh: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if args.downgrade_to_v5 {
+        return match downgrade_v6_to_v5(&args.input) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("rkp-convert --downgrade-to-v5: {e}");
                 ExitCode::FAILURE
             }
         };
@@ -285,6 +304,143 @@ fn rebuild_mesh_sections(path: &std::path::Path) -> Result<(), String> {
         path.display(),
         t0.elapsed().as_secs_f32(),
         cluster_count,
+    );
+    Ok(())
+}
+
+/// Downgrade a v6 `.rkp` in place to v5 by reading the existing
+/// compressed sections verbatim and re-emitting the file with the
+/// three trailing DAG sections dropped + header `version=5` +
+/// `dag_*_compressed_size=0`. All non-DAG sections (octree, voxels,
+/// normals, bricks, color, bone, mesh_*) pass through unchanged —
+/// no re-bake. The file rename is atomic via `.inprogress` tmp.
+fn downgrade_v6_to_v5(path: &std::path::Path) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let t0 = std::time::Instant::now();
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+
+    // Read first 8 bytes to peek version, then rewind.
+    let mut prefix = [0u8; 8];
+    file.read_exact(&mut prefix)
+        .map_err(|e| format!("read prefix: {e}"))?;
+    let magic: [u8; 4] = prefix[0..4].try_into().unwrap();
+    if magic != rkp_core::asset_file::RKP_MAGIC {
+        return Err("not a .rkp file (bad magic)".into());
+    }
+    let version = u32::from_le_bytes(prefix[4..8].try_into().unwrap());
+    if version == 5 {
+        eprintln!(
+            "[downgrade-to-v5] {}: already v5, skipping",
+            path.display(),
+        );
+        return Ok(());
+    }
+    if version != 6 {
+        return Err(format!("unsupported version {version} (only 6 → 5 is supported)"));
+    }
+
+    // Read full v6 header (156 B).
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek 0: {e}"))?;
+    const V6_HEADER_SIZE: usize = std::mem::size_of::<rkp_core::asset_file::RkpHeader>();
+    let mut v6_header_bytes = vec![0u8; V6_HEADER_SIZE];
+    file.read_exact(&mut v6_header_bytes)
+        .map_err(|e| format!("read v6 header: {e}"))?;
+    let v6_header: rkp_core::asset_file::RkpHeader =
+        *bytemuck::from_bytes(&v6_header_bytes);
+
+    // Compressed-section sizes from header, in file order.
+    // Order matches the writer: octree, voxels, normals, bricks,
+    // color, bone, mesh_vertices, mesh_indices, meshlet_clusters,
+    // dag_groups, dag_consumed, dag_produced.
+    let octree_sz = v6_header.octree_compressed_size as u64;
+    let voxel_sz = v6_header.voxel_compressed_size as u64;
+    let normals_sz = v6_header.normals_compressed_size as u64;
+    let bricks_sz = v6_header.bricks_compressed_size as u64;
+    let color_sz = v6_header.color_compressed_size as u64;
+    let bone_sz = v6_header.bone_compressed_size as u64;
+    let mesh_v_sz = v6_header.mesh_vertices_compressed_size as u64;
+    let mesh_i_sz = v6_header.mesh_indices_compressed_size as u64;
+    let mesh_c_sz = v6_header.meshlet_clusters_compressed_size as u64;
+    // DAG sections — dropped on downgrade. Sizes ignored.
+
+    // Read all 9 non-DAG sections as opaque bytes.
+    let mut read_section = |n: u64, label: &str| -> Result<Vec<u8>, String> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut buf = vec![0u8; n as usize];
+        file.read_exact(&mut buf)
+            .map_err(|e| format!("read {label}: {e}"))?;
+        Ok(buf)
+    };
+    let octree_bytes = read_section(octree_sz, "octree")?;
+    let voxel_bytes = read_section(voxel_sz, "voxels")?;
+    let normals_bytes = read_section(normals_sz, "normals")?;
+    let bricks_bytes = read_section(bricks_sz, "bricks")?;
+    let color_bytes = read_section(color_sz, "color")?;
+    let bone_bytes = read_section(bone_sz, "bone")?;
+    let mesh_v_bytes = read_section(mesh_v_sz, "mesh vertices")?;
+    let mesh_i_bytes = read_section(mesh_i_sz, "mesh indices")?;
+    let mesh_c_bytes = read_section(mesh_c_sz, "meshlet clusters")?;
+    drop(file);
+
+    // Build v5 header by mutating a copy of the v6 header: version=5
+    // and zero out the three DAG-section sizes. The v5 reader only
+    // reads the first 144 bytes; the trailing 12 bytes of v6 header
+    // become *omitted* output bytes.
+    let mut v5_header = v6_header;
+    v5_header.version = 5;
+    v5_header.dag_groups_compressed_size = 0;
+    v5_header.dag_consumed_compressed_size = 0;
+    v5_header.dag_produced_compressed_size = 0;
+    let v5_header_bytes = bytemuck::bytes_of(&v5_header);
+    const V5_HEADER_SIZE: usize = 144;
+    let v5_header_prefix = &v5_header_bytes[..V5_HEADER_SIZE];
+
+    // Write atomically via .inprogress.
+    let tmp = {
+        let mut s = path.as_os_str().to_owned();
+        s.push(".inprogress");
+        std::path::PathBuf::from(s)
+    };
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let f = std::fs::File::create(&tmp)
+            .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        let mut w = std::io::BufWriter::new(f);
+        w.write_all(v5_header_prefix)
+            .map_err(|e| format!("write v5 header: {e}"))?;
+        for (chunk, label) in [
+            (&octree_bytes, "octree"),
+            (&voxel_bytes, "voxels"),
+            (&normals_bytes, "normals"),
+            (&bricks_bytes, "bricks"),
+            (&color_bytes, "color"),
+            (&bone_bytes, "bone"),
+            (&mesh_v_bytes, "mesh vertices"),
+            (&mesh_i_bytes, "mesh indices"),
+            (&mesh_c_bytes, "meshlet clusters"),
+        ] {
+            if !chunk.is_empty() {
+                w.write_all(chunk)
+                    .map_err(|e| format!("write {label}: {e}"))?;
+            }
+        }
+        w.flush().map_err(|e| format!("flush: {e}"))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename: {e}")
+    })?;
+
+    eprintln!(
+        "[downgrade-to-v5] {}: in {:.3}s",
+        path.display(),
+        t0.elapsed().as_secs_f32(),
     );
     Ok(())
 }
