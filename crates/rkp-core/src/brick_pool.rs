@@ -65,7 +65,17 @@ pub const fn brick_flat_index(x: u32, y: u32, z: u32) -> u32 {
 /// slots. A brick's `id` is its starting slot divided by `BRICK_CELLS`.
 pub struct BrickPool {
     /// Flat cell storage: `data[brick_id * BRICK_CELLS + flat_index]`.
-    data: Vec<u32>,
+    ///
+    /// Wrapped in `Arc<Vec<u32>>` (instead of plain `Vec<u32>`) so the
+    /// painted-material walk's `WalkSnapshot` can take a constant-time
+    /// `Arc::clone` and traverse pool data outside the `scene_mgr` lock
+    /// without paying the ~200 MB memcpy of the prior `.to_vec()` design.
+    /// Internal mutations route through [`Self::data_mut`] which calls
+    /// `Arc::make_mut`: while no snapshot is outstanding refcount is 1
+    /// and writes are in-place; while a snapshot is held, the first
+    /// mutation pays a one-time clone (which the caller would have paid
+    /// anyway, just earlier in the timeline). See PERF_DEBT.md A2.
+    data: std::sync::Arc<Vec<u32>>,
     /// Number of allocated bricks (bump pointer, in bricks, not cells).
     next_free_brick: u32,
     /// Free list of reclaimed brick ranges — `(brick_start, brick_count)`.
@@ -81,11 +91,32 @@ impl BrickPool {
     pub fn new(capacity_bricks: u32) -> Self {
         let capacity_cells = (capacity_bricks as usize) * (BRICK_CELLS as usize);
         Self {
-            data: vec![BRICK_EMPTY; capacity_cells],
+            data: std::sync::Arc::new(vec![BRICK_EMPTY; capacity_cells]),
             next_free_brick: 0,
             free_list: Vec::new(),
             dirty: crate::DirtyRanges::new(),
         }
+    }
+
+    /// Mutable access to the inner storage for in-pool writes. Routes
+    /// through `Arc::make_mut` so an outstanding `WalkSnapshot` clone
+    /// causes a one-time copy-on-write rather than corrupting the
+    /// snapshot. In steady state (no snapshot held) this is a free
+    /// `&mut Vec<u32>` — refcount is 1, no clone happens.
+    #[inline]
+    fn data_mut(&mut self) -> &mut Vec<u32> {
+        std::sync::Arc::make_mut(&mut self.data)
+    }
+
+    /// Cheap shareable handle to the brick data, used by
+    /// `RkpSceneManager::walk_snapshot` to hand pool storage to the
+    /// painted-material walk without copying. Holding the returned
+    /// `Arc` until after a future mutation triggers copy-on-write
+    /// inside `data_mut`; release it once the walk is done so writes
+    /// stay in place.
+    #[inline]
+    pub fn data_arc(&self) -> std::sync::Arc<Vec<u32>> {
+        self.data.clone()
     }
 
     /// Mark a brick's byte range dirty for the next upload.
@@ -180,19 +211,27 @@ impl BrickPool {
         }
 
         // Clear cells first — unordered is fine.
+        let cur_len = self.data.len();
+        let data = self.data_mut();
         for &id in brick_ids {
             let start = id as usize * BRICK_CELLS as usize;
             let end = start + BRICK_CELLS as usize;
-            if end > self.data.len() {
+            if end > cur_len {
                 continue;
             }
-            for cell in &mut self.data[start..end] {
+            for cell in &mut data[start..end] {
                 *cell = BRICK_EMPTY;
             }
-            // Freed bricks need to be re-uploaded as zeros — they're
-            // still within `next_free_brick` if any other brick at the
-            // tail survives, so the renderer would otherwise read stale
-            // leaf_attr slots.
+        }
+        // Freed bricks need to be re-uploaded as zeros — they're still
+        // within `next_free_brick` if any other brick at the tail
+        // survives, so the renderer would otherwise read stale
+        // leaf_attr slots.
+        for &id in brick_ids {
+            let start = id as usize * BRICK_CELLS as usize;
+            if start + BRICK_CELLS as usize > cur_len {
+                continue;
+            }
             self.mark_brick_dirty(id);
         }
 
@@ -256,7 +295,7 @@ impl BrickPool {
         if end > self.data.len() {
             return;
         }
-        for cell in &mut self.data[start..end] {
+        for cell in &mut self.data_mut()[start..end] {
             *cell = BRICK_EMPTY;
         }
         self.mark_brick_dirty(brick_id);
@@ -290,7 +329,7 @@ impl BrickPool {
     pub fn set_cell(&mut self, brick_id: u32, x: u32, y: u32, z: u32, value: u32) {
         let offset = brick_id as usize * BRICK_CELLS as usize
             + brick_flat_index(x, y, z) as usize;
-        self.data[offset] = value;
+        self.data_mut()[offset] = value;
         self.mark_brick_dirty(brick_id);
     }
 
@@ -308,7 +347,7 @@ impl BrickPool {
     pub fn brick_cells_mut(&mut self, brick_id: u32) -> &mut [u32] {
         self.mark_brick_dirty(brick_id);
         let start = brick_id as usize * BRICK_CELLS as usize;
-        &mut self.data[start..start + BRICK_CELLS as usize]
+        &mut self.data_mut()[start..start + BRICK_CELLS as usize]
     }
 
     /// Number of bricks currently allocated (inclusive of any holes on the
@@ -328,7 +367,7 @@ impl BrickPool {
         if target_cells <= self.data.len() {
             return;
         }
-        self.data.resize(target_cells, BRICK_EMPTY);
+        self.data_mut().resize(target_cells, BRICK_EMPTY);
     }
 
     /// Raw byte view of the allocated region (for GPU upload).

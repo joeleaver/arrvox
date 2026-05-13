@@ -40,11 +40,21 @@ pub struct OctreeHandle {
 /// the interleave happens at upload time.
 #[derive(Debug)]
 pub struct OctreeAllocator {
-    data: Vec<u32>,
+    /// Packed octree-node storage. Wrapped in `Arc<Vec<u32>>` (instead
+    /// of plain `Vec<u32>`) so the painted-material walk's
+    /// `WalkSnapshot` can take a constant-time `Arc::clone` and traverse
+    /// the buffer outside the `scene_mgr` lock without paying the
+    /// ~80 MB memcpy of the prior `.to_vec()` design. Internal mutations
+    /// route through [`Self::data_mut`] (`Arc::make_mut`): refcount=1
+    /// in steady state means writes are in-place; an outstanding
+    /// snapshot triggers a one-time clone-on-write that the snapshot's
+    /// caller would otherwise have paid eagerly. See PERF_DEBT.md A2.
+    data: std::sync::Arc<Vec<u32>>,
     /// Parallel prefiltered-LOD attr ids, same length as `data`. Unlike
     /// `data`, entries here are never rebased — each entry is a global
     /// `leaf_attr_id` from the shared `LeafAttrPool`, or
     /// [`INTERNAL_ATTR_NONE`] when no prefilter is available for that slot.
+    /// Stays plain `Vec` — not part of the walk_snapshot.
     internal_attrs: Vec<u32>,
     free_list: Vec<(u32, u32)>, // (offset, length)
     /// GPU-slot byte ranges (in the interleaved `vec4<u32>` layout) that
@@ -66,7 +76,7 @@ impl OctreeAllocator {
     /// Create a new empty allocator.
     pub fn new() -> Self {
         Self {
-            data: Vec::new(),
+            data: std::sync::Arc::new(Vec::new()),
             internal_attrs: Vec::new(),
             free_list: Vec::new(),
             dirty: DirtyRanges::new(),
@@ -77,12 +87,30 @@ impl OctreeAllocator {
     /// Create an allocator with pre-allocated capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            data: Vec::with_capacity(capacity),
+            data: std::sync::Arc::new(Vec::with_capacity(capacity)),
             internal_attrs: Vec::with_capacity(capacity),
             free_list: Vec::new(),
             dirty: DirtyRanges::new(),
             slot_capacity: HashMap::new(),
         }
+    }
+
+    /// Mutable access to the packed-buffer storage for in-allocator
+    /// writes. Routes through `Arc::make_mut` so an outstanding
+    /// `WalkSnapshot` clone causes a one-time copy-on-write rather
+    /// than corrupting the snapshot. In steady state (refcount=1)
+    /// this is a free `&mut Vec<u32>`.
+    #[inline]
+    fn data_mut(&mut self) -> &mut Vec<u32> {
+        std::sync::Arc::make_mut(&mut self.data)
+    }
+
+    /// Cheap shareable handle to the packed-buffer storage, used by
+    /// `RkpSceneManager::walk_snapshot` to hand octree data to the
+    /// painted-material walk without copying.
+    #[inline]
+    pub fn data_arc(&self) -> std::sync::Arc<Vec<u32>> {
+        self.data.clone()
     }
 
     #[inline]
@@ -108,7 +136,7 @@ impl OctreeAllocator {
             // LEAF or BRICK: low 30 bits are a pool slot id, not a buffer offset.
             local_value
         };
-        self.data[absolute_idx as usize] = to_write;
+        self.data_mut()[absolute_idx as usize] = to_write;
         self.mark_slot_dirty(absolute_idx);
     }
 
@@ -182,15 +210,22 @@ impl OctreeAllocator {
         let offset = if let Some(idx) = self.find_free_region(reserved) {
             let (free_offset, free_len) = self.free_list[idx];
             let start = free_offset as usize;
-            self.data[start..start + len as usize].copy_from_slice(nodes);
+            {
+                let data = self.data_mut();
+                data[start..start + len as usize].copy_from_slice(nodes);
+                // Slack region (within the freed range) gets sentinels.
+                if reserved > len {
+                    let slack_start = start + len as usize;
+                    let slack_end = start + reserved as usize;
+                    for entry in &mut data[slack_start..slack_end] {
+                        *entry = crate::sparse_octree::EMPTY_NODE;
+                    }
+                }
+            }
             self.internal_attrs[start..start + len as usize].copy_from_slice(attrs);
-            // Slack region (within the freed range) gets sentinels.
             if reserved > len {
                 let slack_start = start + len as usize;
                 let slack_end = start + reserved as usize;
-                for entry in &mut self.data[slack_start..slack_end] {
-                    *entry = crate::sparse_octree::EMPTY_NODE;
-                }
                 for entry in &mut self.internal_attrs[slack_start..slack_end] {
                     *entry = INTERNAL_ATTR_NONE;
                 }
@@ -203,11 +238,17 @@ impl OctreeAllocator {
             free_offset
         } else {
             let offset = self.data.len() as u32;
-            self.data.extend_from_slice(nodes);
+            {
+                let data = self.data_mut();
+                data.extend_from_slice(nodes);
+                if reserved > len {
+                    let extra = (reserved - len) as usize;
+                    data.extend(std::iter::repeat(crate::sparse_octree::EMPTY_NODE).take(extra));
+                }
+            }
             self.internal_attrs.extend_from_slice(attrs);
             if reserved > len {
                 let extra = (reserved - len) as usize;
-                self.data.extend(std::iter::repeat(crate::sparse_octree::EMPTY_NODE).take(extra));
                 self.internal_attrs.extend(std::iter::repeat(INTERNAL_ATTR_NONE).take(extra));
             }
             offset
@@ -294,7 +335,7 @@ impl OctreeAllocator {
             return;
         }
         // Clear to EMPTY so stale branch offsets can't be misread.
-        for entry in &mut self.data[start..end] {
+        for entry in &mut self.data_mut()[start..end] {
             *entry = crate::sparse_octree::EMPTY_NODE;
         }
         // Clear the parallel prefilter ids too — a stale id could otherwise
@@ -335,7 +376,7 @@ impl OctreeAllocator {
         // both the free list and the backing vec — truly reclaiming space.
         while let Some(&(off, len)) = self.free_list.last() {
             if (off + len) as usize == self.data.len() {
-                self.data.truncate(off as usize);
+                self.data_mut().truncate(off as usize);
                 self.internal_attrs.truncate(off as usize);
                 self.free_list.pop();
             } else {
@@ -385,13 +426,14 @@ impl OctreeAllocator {
             return; // No rebasing needed for offset 0.
         }
         use crate::sparse_octree::{is_branch, EMPTY_NODE, INTERIOR_NODE};
+        let data = self.data_mut();
         for i in start..start + len {
-            let node = self.data[i];
+            let node = data[i];
             if node == EMPTY_NODE || node == INTERIOR_NODE {
                 continue;
             }
             if is_branch(node) {
-                self.data[i] = node + base_offset;
+                data[i] = node + base_offset;
             }
             // Leaves don't contain offsets — they store brick pool slots.
         }

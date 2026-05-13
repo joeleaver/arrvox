@@ -23,7 +23,17 @@ const BONE_STRIDE: u32 = std::mem::size_of::<BoneVoxel>() as u32;
 /// A flat pool of [`LeafAttr`] entries indexed by slot number, with
 /// parallel color and bone-weight arrays at the same indices.
 pub struct LeafAttrPool {
-    data: Vec<LeafAttr>,
+    /// Per-slot LeafAttr storage. Wrapped in `Arc<Vec<LeafAttr>>` (not
+    /// plain `Vec<LeafAttr>`) so the painted-material walk's
+    /// `WalkSnapshot` can share the buffer via constant-time
+    /// `Arc::clone` instead of paying the ~65 MB memcpy of the prior
+    /// `.to_vec()` design. Internal mutations route through
+    /// [`Self::data_mut`] (`Arc::make_mut`): refcount=1 in steady state,
+    /// so writes are in-place; an outstanding snapshot triggers a
+    /// one-time clone-on-write that the next snapshot's caller would
+    /// have paid anyway. See PERF_DEBT.md A2. `colors` and `bones` stay
+    /// plain `Vec` — they aren't part of the walk_snapshot.
+    data: std::sync::Arc<Vec<LeafAttr>>,
     /// Parallel color array: packed R|G|B|A u32 (A reserved / intensity).
     /// 0 = no override, fall back to material base_color.
     colors: Vec<u32>,
@@ -47,7 +57,7 @@ impl LeafAttrPool {
     /// Create with the given initial capacity (number of entries).
     pub fn new(capacity: u32) -> Self {
         Self {
-            data: vec![LeafAttr::EMPTY; capacity as usize],
+            data: std::sync::Arc::new(vec![LeafAttr::EMPTY; capacity as usize]),
             colors: vec![0u32; capacity as usize],
             bones: vec![BoneVoxel::default(); capacity as usize],
             next_free: 0,
@@ -56,6 +66,24 @@ impl LeafAttrPool {
             dirty_colors: DirtyRanges::new(),
             dirty_bones: DirtyRanges::new(),
         }
+    }
+
+    /// Mutable access to the inner `data` storage for in-pool writes.
+    /// Routes through `Arc::make_mut` so an outstanding `WalkSnapshot`
+    /// clone causes a one-time copy-on-write rather than corrupting
+    /// the snapshot. In steady state (refcount=1) this is a free
+    /// `&mut Vec<LeafAttr>`.
+    #[inline]
+    fn data_mut(&mut self) -> &mut Vec<LeafAttr> {
+        std::sync::Arc::make_mut(&mut self.data)
+    }
+
+    /// Cheap shareable handle to the LeafAttr data, used by
+    /// `RkpSceneManager::walk_snapshot` to hand pool storage to the
+    /// painted-material walk without copying.
+    #[inline]
+    pub fn data_arc(&self) -> std::sync::Arc<Vec<LeafAttr>> {
+        self.data.clone()
     }
 
     #[inline]
@@ -180,8 +208,11 @@ impl LeafAttrPool {
         if end > self.data.len() {
             return;
         }
+        let data = self.data_mut();
         for s in start as usize..end {
-            self.data[s] = LeafAttr::EMPTY;
+            data[s] = LeafAttr::EMPTY;
+        }
+        for s in start as usize..end {
             self.colors[s] = 0;
             self.bones[s] = BoneVoxel::default();
         }
@@ -212,7 +243,7 @@ impl LeafAttrPool {
     #[inline]
     pub fn get_mut(&mut self, slot: u32) -> &mut LeafAttr {
         self.mark_attr_slot(slot);
-        &mut self.data[slot as usize]
+        &mut self.data_mut()[slot as usize]
     }
 
     #[inline]
@@ -243,7 +274,7 @@ impl LeafAttrPool {
         if new_cap as usize <= self.data.len() {
             return;
         }
-        self.data.resize(new_cap as usize, LeafAttr::EMPTY);
+        self.data_mut().resize(new_cap as usize, LeafAttr::EMPTY);
         self.colors.resize(new_cap as usize, 0);
         self.bones.resize(new_cap as usize, BoneVoxel::default());
     }

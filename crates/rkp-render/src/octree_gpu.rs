@@ -76,6 +76,16 @@ impl OctreeGpu {
         self.allocator.as_slice()
     }
 
+    /// Cheap shareable handle to the packed octree-node storage. Used
+    /// by `RkpSceneManager::walk_snapshot` so the painted-material walk
+    /// can read the buffer outside the `scene_mgr` lock without copying.
+    /// Holding the returned `Arc` until after a future octree mutation
+    /// triggers a one-time copy-on-write inside the allocator; release
+    /// it once the walk finishes so subsequent writes stay in place.
+    pub fn data_arc(&self) -> std::sync::Arc<Vec<u32>> {
+        self.allocator.data_arc()
+    }
+
     /// Parallel slice of prefiltered-LOD attr ids, one per node slot.
     /// The GPU binding (see [`RkpScene`]) interleaves these with the node
     /// values into a single `array<vec2<u32>>` storage buffer.

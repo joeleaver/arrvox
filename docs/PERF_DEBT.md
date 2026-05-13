@@ -1,6 +1,6 @@
 # Engine performance-debt eradication plan
 
-**Status**: in progress (Phase A1 starting). Feature work paused.
+**Status**: in progress (Phase A1 + A2 shipped; A3 next). Feature work paused.
 
 This document is the authoritative plan for eliminating systemic "rebuild
 everything every tick" patterns from rkp-engine and rkp-render. It was
@@ -120,7 +120,7 @@ metric moved.
 | Step | Change | Result | Files |
 |---|---|---|---|
 | **A1** | `MutationEvent` enum + log/subscriber scaffolding in EngineState. All mutation sites push events. No consumers yet. Existing dirty flags stay. | Universal scope-carrying mutation API. | `crates/rkp-engine/src/engine/mutation_log.rs` (new), all `*_ops.rs` |
-| **A2** | `walk_snapshot()` returns Arc-shared references, not clones. Add generation counter; readers see consistent generations. | -345 MB memcpy per epoch bump | `crates/rkp-render/src/rkp_scene_manager/manager.rs` |
+| **A2 ✅** | Pools (`OctreeAllocator`, `BrickPool`, `LeafAttrPool`) now hold `data: Arc<Vec<…>>` with copy-on-write via `Arc::make_mut`. `walk_snapshot()` is O(1) Arc::clone of three handles, plus the geometry epoch as a generation counter. Cache fields (`walk_snapshot_cache`, `walk_snapshot_epoch`) deleted — no longer needed. **In steady state (no outstanding snapshot) writes are in-place**; an outstanding walk forces a one-time clone-on-next-write. | -345 MB memcpy per epoch bump | `crates/rkp-core/src/{brick_pool,leaf_attr_pool,octree_allocator}.rs`, `crates/rkp-render/src/{octree_gpu,rkp_scene_manager/manager}.rs`, `crates/rkp-engine/src/engine/lifecycle.rs` |
 | **A3** | `RenderFrame` large fields become `Arc<...>` (gpu_*, bone_matrix_*, splat_draws, etc.). Lifecycle's per-frame clones become `Arc::clone`. | -58 MB/frame clone in steady state | `crates/rkp-engine/src/render_frame.rs`, `crates/rkp-engine/src/engine/lifecycle.rs` |
 
 ### Phase B — Per-entity dirty sets
@@ -221,7 +221,7 @@ replaced by the migration:
 
 ### Heavy clone patterns
 
-- **`walk_snapshot()`** — `crates/rkp-render/src/rkp_scene_manager/manager.rs:437-442`. ~345 MB memcpy (octree + brick pool + leaf_attr). Underlying fields already `Arc<Vec<u32>>` — just need to return Arc::clone instead of `.to_vec()` wrapping.
+- **`walk_snapshot()`** — `crates/rkp-render/src/rkp_scene_manager/manager.rs:437-442`. ~345 MB memcpy (octree + brick pool + leaf_attr). **(Resolved in A2.)** Pools were refactored to hold their data behind `Arc<Vec<…>>`; walk_snapshot is now three constant-time `Arc::clone`s, with copy-on-write (`Arc::make_mut`) on the next mutation if a snapshot is still outstanding.
 - **`gpu_*.clone()` in submit_render_frame** — `crates/rkp-engine/src/engine/lifecycle.rs:1197-1202`. ~230 KB/frame.
 - **`bone_matrix_lbs/dqs.to_vec()`** — `crates/rkp-engine/src/engine/lifecycle.rs:712-713`. ~58 MB/frame.
 - **`SkinBatchScratch.clone()`** — `crates/rkp-engine/src/engine/lifecycle.rs:737`. ~36 KB/frame.

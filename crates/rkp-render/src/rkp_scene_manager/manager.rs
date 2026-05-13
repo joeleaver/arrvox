@@ -47,20 +47,27 @@ pub fn ms_since_process_ns(nanos_then: u64) -> Option<f64> {
 }
 
 /// Lock-free snapshot of the three pools the painted-material walk
-/// reads. Cloned out under a brief `scene_mgr` lock; the walk traverses
-/// the snapshot without holding any lock, so sim and render don't
-/// serialize on the duration of the walk (which is ~80 ms on big
-/// asset trees).
+/// reads. Built under a brief `scene_mgr` lock as constant-time
+/// `Arc::clone`s of the pool storage; the walk traverses the snapshot
+/// without holding any lock, so sim and render don't serialize on
+/// the duration of the walk (~80 ms on big asset trees).
 ///
-/// The snapshot is lazily rebuilt by [`RkpSceneManager::walk_snapshot`]
-/// whenever `geometry_epoch` advances. Paint stamps don't bump
-/// `geometry_epoch` (they only mutate per-entity overlays), so a long
-/// drag-paint reuses the same Arc clones across every walk.
+/// **No memcpy on construction** — each pool stores its data as
+/// `Arc<Vec<…>>` (see PERF_DEBT.md A2). The walk shares the buffer
+/// with the pool until either the walk drops its `Arc` (refcount
+/// returns to 1, future writes stay in place) or the pool's next
+/// mutation calls `Arc::make_mut` (one-time clone-on-write).
+///
+/// `epoch` is the `geometry_epoch` snapshot was taken at — purely
+/// diagnostic; lets a long-running walk verify it operated against
+/// the geometry generation it expected.
 #[derive(Clone)]
 pub struct WalkSnapshot {
     pub octree_data: std::sync::Arc<Vec<u32>>,
     pub brick_pool_data: std::sync::Arc<Vec<u32>>,
     pub leaf_attr_data: std::sync::Arc<Vec<rkp_core::LeafAttr>>,
+    /// `geometry_epoch` value at the time this snapshot was taken.
+    pub epoch: u64,
 }
 
 /// CPU-side scene manager — leaf_attr data, bricks, octrees, face instances.
@@ -139,22 +146,6 @@ pub struct RkpSceneManager {
     /// so this epoch is informational — there's no longer a paint-only
     /// fast path on the render side that gates on it.
     pub(super) paint_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
-
-    // ── Lock-free walk snapshot ─────────────────────────────────────
-    /// Cached snapshot of (octree, brick, leaf_attr) data used by the
-    /// painted-material walk. Cloned out as `Arc` references under a
-    /// brief lock so the walk itself runs lock-free. Rebuilt lazily
-    /// whenever `geometry_epoch` advances past
-    /// [`Self::walk_snapshot_epoch`]. `None` until the first
-    /// `walk_snapshot()` call after construction (or after a `clear()`).
-    pub(super) walk_snapshot_cache: Option<WalkSnapshot>,
-    /// `geometry_epoch` value at the time
-    /// [`Self::walk_snapshot_cache`] was last built. Stale-cache test
-    /// is `epoch == cur_geom`; on miss the snapshot is rebuilt by
-    /// copying the three pool buffers into fresh `Arc<Vec<…>>`. Cost
-    /// is one `~300 MB` memcpy per geometry change on big asset trees,
-    /// which is fine for the asset-load / voxelize cadence.
-    pub(super) walk_snapshot_epoch: u64,
 }
 
 impl RkpSceneManager {
@@ -172,8 +163,6 @@ impl RkpSceneManager {
             last_geometry_bump_ns: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_geometry_submit_ns: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             paint_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            walk_snapshot_cache: None,
-            walk_snapshot_epoch: 0,
         }
     }
 
@@ -194,11 +183,6 @@ impl RkpSceneManager {
         self.asset_cache = AssetCache::default();
         self.pending_faces.clear();
         self.faces_dirty = false;
-        // Drop the cached walk snapshot so the next walk rebuilds
-        // against the fresh-empty pools (the bump below would force
-        // a rebuild anyway, but explicit clear releases the old Arcs
-        // promptly rather than holding them through the next call).
-        self.walk_snapshot_cache = None;
         // Preserve the Arc identity, but bump the value so the
         // shared handle observes the wipe.
         self.bump_geometry_epoch();
@@ -410,41 +394,30 @@ impl RkpSceneManager {
     /// Returns a lock-free snapshot of the three pool buffers the
     /// painted-material walk reads. Hold the returned [`WalkSnapshot`]
     /// outside the `scene_mgr` lock to walk the octree without
-    /// blocking sim/render — the snapshot's `Arc<Vec<…>>` clones
-    /// share storage with the cached snapshot and survive any
-    /// subsequent pool mutations.
+    /// blocking sim/render.
     ///
-    /// Internally rebuilds the cached snapshot whenever
-    /// `geometry_epoch` advances. Paint stamps don't bump
-    /// `geometry_epoch` (only `paint_epoch`), so a long drag-paint
-    /// reuses the same Arcs across every walk. First call after a
-    /// geometry mutation pays a one-time `~300 MB` memcpy on
-    /// elephant-scale scenes; that cost lives in the geometry-change
-    /// path (asset load, voxelize, integrate_artifact), not in the
-    /// per-stamp paint path.
-    pub fn walk_snapshot(&mut self) -> WalkSnapshot {
-        let cur_epoch = self.geometry_epoch();
-        if let Some(s) = &self.walk_snapshot_cache {
-            if self.walk_snapshot_epoch == cur_epoch {
-                return s.clone();
-            }
+    /// **O(1)** — each pool's storage is `Arc<Vec<…>>` so the snapshot
+    /// is three `Arc::clone`s. No memcpy, regardless of pool size.
+    ///
+    /// Snapshot lifetime interacts with future pool mutations via
+    /// `Arc::make_mut`: while a snapshot is held, the next mutation
+    /// pays a one-time clone-on-write of the affected pool. Drop the
+    /// snapshot promptly after the walk so subsequent writes stay
+    /// in place.
+    ///
+    /// Note: the `LeafAttr` Arc shares the pool's *full* backing
+    /// `Vec` (length = `pool.capacity()`), not the `[..next_free]`
+    /// prefix that `as_slice()` exposes. Walks should therefore
+    /// continue to bound their indexing by `next_free` — but since
+    /// only `[..next_free]` is reachable from the octree, that
+    /// happens naturally; the surplus bytes are unread.
+    pub fn walk_snapshot(&self) -> WalkSnapshot {
+        WalkSnapshot {
+            octree_data: self.octree.data_arc(),
+            brick_pool_data: self.brick_pool.data_arc(),
+            leaf_attr_data: self.leaf_attr_pool.data_arc(),
+            epoch: self.geometry_epoch(),
         }
-        // Rebuild. `as_slice` on `LeafAttrPool` returns the allocated
-        // prefix `[..next_free]`, which is exactly the range any walk
-        // can index into via slot ids — slots beyond `next_free` are
-        // unallocated and unreachable from the octree.
-        let snap = WalkSnapshot {
-            octree_data: std::sync::Arc::new(self.octree.data().to_vec()),
-            brick_pool_data: std::sync::Arc::new(
-                self.brick_pool.as_slice().to_vec(),
-            ),
-            leaf_attr_data: std::sync::Arc::new(
-                self.leaf_attr_pool.as_slice().to_vec(),
-            ),
-        };
-        self.walk_snapshot_cache = Some(snap.clone());
-        self.walk_snapshot_epoch = cur_epoch;
-        snap
     }
 
     // ── Spatial deallocation ─────────────────────────────────────────

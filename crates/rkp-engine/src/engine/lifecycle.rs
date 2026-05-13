@@ -199,15 +199,20 @@ impl EngineState {
             //   "wipe all" behavior here: every renderable goes into the
             //   dirty set so the next walk pass rebuilds them.
             // Lock-free walk path. We acquire `scene_mgr` only long
-            // enough to (a) read both epoch counters and (b) clone an
+            // enough to (a) read both epoch counters and (b) take an
             // `Arc`-shared `WalkSnapshot` of the three pool buffers
             // the scan needs. The `O(tree)` walks themselves run
             // outside the lock — render and other sim paths can
-            // proceed in parallel. The first call after a
-            // geometry-epoch bump pays a one-time `~300 MB` memcpy
-            // inside `walk_snapshot()`; every subsequent stamp's walk
-            // hits the cached snapshot and the lock is held for
-            // microseconds.
+            // proceed in parallel.
+            //
+            // Snapshot construction is O(1) (three `Arc::clone`s) —
+            // pool data lives behind `Arc<Vec<…>>` so there is no
+            // memcpy on the geometry-bump frame either. The walk's
+            // outstanding snapshot will trigger a one-time
+            // copy-on-write inside the affected pool's next mutation
+            // (via `Arc::make_mut`); dropping the snapshot promptly
+            // after the walk lets subsequent writes stay in place.
+            // See PERF_DEBT.md A2.
             let (cur_paint, cur_geom, snapshot_opt) = {
                 let mut sm = self.scene_mgr.lock().expect("scene_mgr poisoned");
                 let cur_paint = sm.paint_epoch();
