@@ -132,6 +132,13 @@ pub(super) fn run_pre_frame(
         let mut sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
         let geo = sm.geometry_upload();
         state.renderer.upload_geometry(&state.queue, &geo);
+        // Delta-upload: the snapshot in `geo` cloned the per-pool dirty
+        // trackers; now that the writes have been queued, clear the
+        // manager-side trackers so the next epoch ships only fresh
+        // mutations rather than the same bytes again. Must run AFTER
+        // upload_geometry so a write_buffer failure (in tests, panics)
+        // leaves the trackers populated for retry.
+        sm.clear_geometry_dirty_ranges();
         // Phase B-2 — keep the splat-raster per-asset vertex-buffer
         // cache in step with the loaded asset set. Re-upload all of
         // them on every geometry-epoch bump rather than tracking which

@@ -71,6 +71,21 @@ pub struct GeometryUpload<'a> {
     /// Used by the Surface-Nets reconstruction shader to traverse into
     /// adjacent bricks for cross-boundary neighbor reads.
     pub brick_face_links: &'a [u8],
+    /// Dirty byte ranges in the **interleaved GPU layout** of the
+    /// octree buffer (each slot is 16 B = `vec4<u32>`). Drained from
+    /// `OctreeAllocator::dirty_ranges()`; empty when no octree writes
+    /// happened since the last upload. Falls back to a full upload
+    /// when the tracker has `mark_full` set or when total dirty bytes
+    /// exceed half the pool.
+    pub octree_dirty: rkp_core::DirtyRanges,
+    /// Dirty byte ranges in `leaf_attr_pool` (8 B per slot).
+    pub leaf_attr_dirty: rkp_core::DirtyRanges,
+    /// Dirty byte ranges in `color_pool` (4 B per slot).
+    pub color_dirty: rkp_core::DirtyRanges,
+    /// Dirty byte ranges in `bone_weights` (8 B per slot).
+    pub bone_dirty: rkp_core::DirtyRanges,
+    /// Dirty byte ranges in `brick_pool` (256 B per brick).
+    pub brick_dirty: rkp_core::DirtyRanges,
 }
 
 /// Per-frame data. Camera uniforms are per-viewport and uploaded
@@ -104,6 +119,16 @@ pub struct FrameUpload<'a> {
     /// buffer. Empty `&[]` when no entity has been carved (placeholder
     /// buffer keeps the bind valid). Phase A: Carve only.
     pub instance_sculpts: &'a [u8],
+}
+
+/// Per-pool delta-upload telemetry, returned by `upload_pool_delta` /
+/// `upload_octree_delta` so `upload_geometry` can log + propagate the
+/// buffer-grew signal up to `buffers_epoch`.
+#[derive(Debug, Default, Clone, Copy)]
+struct UploadStats {
+    grew: bool,
+    bytes_written: u64,
+    range_count: usize,
 }
 
 /// Storage stride (u32 lanes) of one octree node on the GPU. Lanes:
@@ -427,30 +452,22 @@ impl RkpScene {
     /// Upload geometry data. Call only when geometry changes (load, sculpt, voxelize).
     /// Grows buffers as needed; bumps the epoch on reallocation so `ViewportRenderer`
     /// rebuilds its cached bind group.
+    ///
+    /// **Delta-upload path (D5):** per-pool [`rkp_core::DirtyRanges`] from
+    /// the scene manager drive `queue.write_buffer` at the marked byte
+    /// offsets only. Falls back to a full-pool write when:
+    ///
+    /// * The buffer needed to grow (no usable pre-existing data on the GPU).
+    /// * The tracker is in `mark_full` mode (the source has signalled
+    ///   "everything's dirty" — first upload, voxelize, load).
+    /// * Total marked bytes exceed half the pool (N small `write_buffer`
+    ///   calls cost more than one big one past that threshold).
     pub fn upload_geometry(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &GeometryUpload) {
         assert_eq!(
             data.octree_nodes.len(),
             data.octree_internal_attrs.len(),
             "octree_nodes and octree_internal_attrs must have matching length",
         );
-
-        // Interleave (value, prefilter_id, aabb_lo, aabb_hi) into a
-        // `vec4<u32>`-layout buffer so a single binding slot carries
-        // all four lanes. The original (value, prefilter_id)-only
-        // interleave existed to stay under the 12-storage-buffer-per-
-        // stage limit; the .zw lanes are reserved for per-node tight
-        // bounds (Step 2 of the rollout writes real values; Step 1
-        // zeroes them). One allocation per upload; octree_nodes
-        // uploads are rare (voxelize, load) so the cost is amortized.
-        let interleaved_u32_count = data.octree_nodes.len() * OCTREE_NODE_U32S;
-        let mut interleaved: Vec<u32> = Vec::with_capacity(interleaved_u32_count);
-        for (i, &node) in data.octree_nodes.iter().enumerate() {
-            interleaved.push(node);
-            interleaved.push(data.octree_internal_attrs[i]);
-            interleaved.push(0u32);
-            interleaved.push(0u32);
-        }
-        let interleaved_bytes: &[u8] = bytemuck::cast_slice(&interleaved);
 
         // Diagnostic: how many prefilter attrs are populated in the upload?
         // Zero means prefilter didn't emit anything for this scene — LOD
@@ -464,28 +481,203 @@ impl RkpScene {
         );
 
         let mut needs_rebuild = false;
-        needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.brick_pool_buffer, "rkp_brick_pool", data.brick_pool);
-        needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.octree_nodes_buffer, "rkp_octree_nodes", interleaved_bytes);
-        needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.leaf_attr_pool_buffer, "rkp_leaf_attr_pool", data.leaf_attr_pool);
-        needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.color_pool_buffer, "rkp_color_pool", data.color_pool);
-        if !data.bone_weights.is_empty() {
-            needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.bone_weights_buffer, "rkp_bone_weights", data.bone_weights);
-        }
-        needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.brick_face_links_buffer, "rkp_brick_face_links", data.brick_face_links);
+        let mut total_uploaded: u64 = 0;
+        let mut range_count_total: usize = 0;
 
-        let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        let octree_stats = Self::upload_octree_delta(
+            device, queue, &mut self.octree_nodes_buffer, "rkp_octree_nodes",
+            data.octree_nodes, data.octree_internal_attrs, &data.octree_dirty,
+        );
+        needs_rebuild |= octree_stats.grew;
+        total_uploaded += octree_stats.bytes_written;
+        range_count_total += octree_stats.range_count;
+
+        let brick_stats = Self::upload_pool_delta(
+            device, queue, &mut self.brick_pool_buffer, "rkp_brick_pool",
+            data.brick_pool, &data.brick_dirty,
+        );
+        needs_rebuild |= brick_stats.grew;
+        total_uploaded += brick_stats.bytes_written;
+        range_count_total += brick_stats.range_count;
+
+        let leaf_stats = Self::upload_pool_delta(
+            device, queue, &mut self.leaf_attr_pool_buffer, "rkp_leaf_attr_pool",
+            data.leaf_attr_pool, &data.leaf_attr_dirty,
+        );
+        needs_rebuild |= leaf_stats.grew;
+        total_uploaded += leaf_stats.bytes_written;
+        range_count_total += leaf_stats.range_count;
+
+        let color_stats = Self::upload_pool_delta(
+            device, queue, &mut self.color_pool_buffer, "rkp_color_pool",
+            data.color_pool, &data.color_dirty,
+        );
+        needs_rebuild |= color_stats.grew;
+        total_uploaded += color_stats.bytes_written;
+        range_count_total += color_stats.range_count;
+
+        if !data.bone_weights.is_empty() {
+            let bone_stats = Self::upload_pool_delta(
+                device, queue, &mut self.bone_weights_buffer, "rkp_bone_weights",
+                data.bone_weights, &data.bone_dirty,
+            );
+            needs_rebuild |= bone_stats.grew;
+            total_uploaded += bone_stats.bytes_written;
+            range_count_total += bone_stats.range_count;
+        }
+
+        // face_links has no per-mutation tracker yet — keep the legacy
+        // full-write path. Sculpt doesn't mutate face_links per stamp;
+        // load/voxelize already pay the full cost so the path is fine
+        // until a future change benefits from delta upload here too.
+        needs_rebuild |= Self::ensure_and_write(
+            device, queue, &mut self.brick_face_links_buffer, "rkp_brick_face_links",
+            data.brick_face_links,
+        );
+
+        let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
         eprintln!(
-            "[rkp_scene] upload_geometry: octree_nodes={:.2} MiB (incl. prefilter ids)  leaf_attr={:.2} MiB  color_pool={:.2} MiB  bricks={:.2} MiB  total={:.2} MiB",
-            mib(interleaved_bytes.len()),
-            mib(data.leaf_attr_pool.len()),
-            mib(data.color_pool.len()),
-            mib(data.brick_pool.len()),
-            mib(interleaved_bytes.len() + data.leaf_attr_pool.len() + data.color_pool.len() + data.brick_pool.len()),
+            "[rkp_scene] upload_geometry delta: octree={:.3} MiB ({}r)  brick={:.3} MiB ({}r)  \
+             leaf_attr={:.3} MiB ({}r)  color={:.3} MiB ({}r)  bone={:.3} MiB ({}r)  \
+             total={:.3} MiB ({}r)",
+            mib(octree_stats.bytes_written), octree_stats.range_count,
+            mib(brick_stats.bytes_written), brick_stats.range_count,
+            mib(leaf_stats.bytes_written), leaf_stats.range_count,
+            mib(color_stats.bytes_written), color_stats.range_count,
+            mib(0), 0,
+            mib(total_uploaded), range_count_total,
         );
 
         if needs_rebuild {
             self.buffers_epoch += 1;
         }
+    }
+
+    /// Delta-aware upload for a homogeneous byte pool (brick_pool,
+    /// leaf_attr_pool, color_pool, bone_weights). Returns telemetry +
+    /// whether the buffer was reallocated.
+    fn upload_pool_delta(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer: &mut wgpu::Buffer,
+        label: &str,
+        data: &[u8],
+        dirty: &rkp_core::DirtyRanges,
+    ) -> UploadStats {
+        if data.is_empty() {
+            return UploadStats::default();
+        }
+        let needed = data.len() as u64;
+        if needed > buffer.size() {
+            // Buffer too small — reallocate with 2× headroom and full-write.
+            // Any tracked dirty ranges are subsumed by the full write.
+            let new_size = needed.max(buffer.size().saturating_mul(2)).max(64);
+            *buffer = Self::create_storage(device, label, new_size);
+            queue.write_buffer(buffer, 0, data);
+            return UploadStats { grew: true, bytes_written: data.len() as u64, range_count: 1 };
+        }
+        if dirty.is_empty() {
+            // Pool unchanged since the last upload. The caller bumped
+            // geometry_epoch for some *other* pool; we have nothing to ship.
+            return UploadStats::default();
+        }
+        let threshold = (data.len() / 2) as u64;
+        if dirty.is_full_pool(data.len() as u32)
+            || dirty.should_coalesce_to_full(threshold)
+        {
+            queue.write_buffer(buffer, 0, data);
+            return UploadStats { grew: false, bytes_written: data.len() as u64, range_count: 1 };
+        }
+        // Delta path: per-range write_buffer. Clamp each range to the
+        // current pool length so a marked-then-truncated tail doesn't
+        // try to write past the source slice end.
+        let mut bytes_written = 0u64;
+        let mut range_count = 0usize;
+        for (off, len) in dirty.iter() {
+            let off_u = off as usize;
+            if off_u >= data.len() {
+                continue;
+            }
+            let end = (off_u + len as usize).min(data.len());
+            let slice = &data[off_u..end];
+            queue.write_buffer(buffer, off as u64, slice);
+            bytes_written += slice.len() as u64;
+            range_count += 1;
+        }
+        UploadStats { grew: false, bytes_written, range_count }
+    }
+
+    /// Delta-aware upload for the octree's interleaved-vec4<u32> GPU
+    /// layout. Each CPU slot corresponds to 16 GPU bytes
+    /// (node, prefilter_id, 0, 0). The dirty tracker carries byte
+    /// offsets in the GPU layout, aligned to the 16-byte slot stride.
+    fn upload_octree_delta(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer: &mut wgpu::Buffer,
+        label: &str,
+        nodes: &[u32],
+        attrs: &[u32],
+        dirty: &rkp_core::DirtyRanges,
+    ) -> UploadStats {
+        let slot_count = nodes.len();
+        if slot_count == 0 {
+            return UploadStats::default();
+        }
+        let needed_bytes = (slot_count * OCTREE_NODE_U32S * 4) as u64;
+        let full_interleaved = |nodes: &[u32], attrs: &[u32]| -> Vec<u32> {
+            let mut v = Vec::with_capacity(slot_count * OCTREE_NODE_U32S);
+            for (i, &n) in nodes.iter().enumerate() {
+                v.push(n);
+                v.push(attrs[i]);
+                v.push(0u32);
+                v.push(0u32);
+            }
+            v
+        };
+        if needed_bytes > buffer.size() {
+            let new_size = needed_bytes
+                .max(buffer.size().saturating_mul(2))
+                .max(64);
+            *buffer = Self::create_storage(device, label, new_size);
+            let interleaved = full_interleaved(nodes, attrs);
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&interleaved));
+            return UploadStats { grew: true, bytes_written: needed_bytes, range_count: 1 };
+        }
+        if dirty.is_empty() {
+            return UploadStats::default();
+        }
+        let threshold = needed_bytes / 2;
+        if dirty.is_full_pool(needed_bytes as u32)
+            || dirty.should_coalesce_to_full(threshold)
+        {
+            let interleaved = full_interleaved(nodes, attrs);
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&interleaved));
+            return UploadStats { grew: false, bytes_written: needed_bytes, range_count: 1 };
+        }
+        // Delta: pack one tiny interleaved scratch per range, then write.
+        let mut bytes_written = 0u64;
+        let mut range_count = 0usize;
+        for (off, len) in dirty.iter() {
+            let slot_start = (off / OCTREE_NODE_BYTES as u32) as usize;
+            let slot_count_range = (len / OCTREE_NODE_BYTES as u32) as usize;
+            if slot_start >= nodes.len() || slot_count_range == 0 {
+                continue;
+            }
+            let slot_end = (slot_start + slot_count_range).min(nodes.len());
+            let actual_slots = slot_end - slot_start;
+            let mut scratch: Vec<u32> = Vec::with_capacity(actual_slots * OCTREE_NODE_U32S);
+            for i in slot_start..slot_end {
+                scratch.push(nodes[i]);
+                scratch.push(attrs[i]);
+                scratch.push(0u32);
+                scratch.push(0u32);
+            }
+            queue.write_buffer(buffer, off as u64, bytemuck::cast_slice(&scratch));
+            bytes_written += (actual_slots * OCTREE_NODE_U32S * 4) as u64;
+            range_count += 1;
+        }
+        UploadStats { grew: false, bytes_written, range_count }
     }
 
     /// Upload per-frame asset + instance data. The caller has already

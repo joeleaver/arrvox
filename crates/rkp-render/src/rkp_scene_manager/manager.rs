@@ -266,7 +266,27 @@ impl RkpSceneManager {
             bone_weights: self.leaf_attr_pool.bone_bytes(),
             brick_pool: self.brick_pool.as_bytes(),
             brick_face_links: rkp_core::brick_face_links::as_bytes(&self.brick_face_links),
+            octree_dirty: self.octree.dirty_ranges().clone(),
+            leaf_attr_dirty: self.leaf_attr_pool.dirty_attrs().clone(),
+            color_dirty: self.leaf_attr_pool.dirty_colors().clone(),
+            bone_dirty: self.leaf_attr_pool.dirty_bones().clone(),
+            brick_dirty: self.brick_pool.dirty_ranges().clone(),
         }
+    }
+
+    /// Clear every per-pool dirty range tracker. Called by the render
+    /// worker after `RkpScene::upload_geometry` succeeds — the upload
+    /// writes only marked bytes, so the trackers can be drained for
+    /// the next stamp. Failing to call this would either re-upload the
+    /// same bytes on every subsequent frame (waste) or, in the
+    /// `should_coalesce_to_full` case, force every frame to the full-
+    /// pool fallback.
+    pub fn clear_geometry_dirty_ranges(&mut self) {
+        self.octree.dirty_ranges_mut().clear();
+        self.brick_pool.dirty_ranges_mut().clear();
+        self.leaf_attr_pool.dirty_attrs_mut().clear();
+        self.leaf_attr_pool.dirty_colors_mut().clear();
+        self.leaf_attr_pool.dirty_bones_mut().clear();
     }
 
     /// Returns a lock-free snapshot of the three pool buffers the
