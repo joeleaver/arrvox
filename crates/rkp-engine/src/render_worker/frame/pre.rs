@@ -129,7 +129,7 @@ pub(super) fn run_pre_frame(
     //    catch up on the next snapshot if an intermediate one was
     //    dropped by the newest-wins inbox.
     if frame.geometry_epoch > state.last_uploaded_geometry_epoch {
-        let sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
+        let mut sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
         let geo = sm.geometry_upload();
         state.renderer.upload_geometry(&state.queue, &geo);
         // Phase B-2 — keep the splat-raster per-asset vertex-buffer
@@ -150,6 +150,7 @@ pub(super) fn run_pre_frame(
         // prefix until Phase 6.2 wires the indirect path.
         for (handle, vertices, indices, lod0_index_count) in sm.iter_loaded_asset_meshes() {
             state.renderer.upload_mesh_for_asset(
+                &state.queue,
                 handle.raw(),
                 vertices,
                 indices,
@@ -163,6 +164,13 @@ pub(super) fn run_pre_frame(
         for (handle, clusters) in sm.iter_loaded_asset_clusters() {
             state.renderer.upload_mesh_clusters_for_asset(handle.raw(), clusters);
         }
+        // Per-asset dirty-flag clean-up: every iter above only yielded
+        // assets whose `mesh_dirty / splats_dirty / clusters_dirty`
+        // flag was set; clear them now so the next epoch bump only
+        // re-uploads assets that mutated in the interim. Cut the
+        // sculpt-stamp upload cost from "every loaded asset × full
+        // realloc" to "just the one sculpted asset".
+        sm.mark_loaded_asset_uploads_clean();
         // Read-back the epoch *under the same lock* so concurrent
         // mutations (bake worker integrating an artifact mid-frame)
         // don't trick us into thinking we're caught up when we're

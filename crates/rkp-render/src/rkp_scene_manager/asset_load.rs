@@ -716,6 +716,9 @@ impl RkpSceneManager {
             mesh_lod0_index_count,
             meshlet_clusters,
             cpu_octree: tree,
+            mesh_dirty: true,
+            splats_dirty: true,
+            clusters_dirty: true,
         })
     }
 
@@ -754,7 +757,7 @@ impl RkpSceneManager {
             .enumerate()
             .filter_map(|(idx, slot)| {
                 let entry = slot.as_ref()?;
-                if entry.splats.is_empty() {
+                if entry.splats.is_empty() || !entry.splats_dirty {
                     return None;
                 }
                 Some((AssetHandle::from_raw(idx as u32), entry.splats.as_slice()))
@@ -792,7 +795,7 @@ impl RkpSceneManager {
             .enumerate()
             .filter_map(|(idx, slot)| {
                 let entry = slot.as_ref()?;
-                if entry.mesh_vertices.is_empty() {
+                if entry.mesh_vertices.is_empty() || !entry.mesh_dirty {
                     return None;
                 }
                 Some((
@@ -817,7 +820,7 @@ impl RkpSceneManager {
             .enumerate()
             .filter_map(|(idx, slot)| {
                 let entry = slot.as_ref()?;
-                if entry.meshlet_clusters.is_empty() {
+                if entry.meshlet_clusters.is_empty() || !entry.clusters_dirty {
                     return None;
                 }
                 Some((
@@ -827,4 +830,19 @@ impl RkpSceneManager {
             })
     }
 
+    /// Clear every loaded asset's `mesh_dirty / splats_dirty /
+    /// clusters_dirty` flags. The render thread calls this after each
+    /// geometry-epoch upload loop completes — assets that didn't
+    /// upload (already-clean entries) are no-op writes, but any entry
+    /// the upload touched gets its dirty flag dropped so the next
+    /// epoch bump doesn't re-upload it.
+    pub fn mark_loaded_asset_uploads_clean(&mut self) {
+        for slot in self.asset_cache.entries.iter_mut() {
+            if let Some(entry) = slot.as_mut() {
+                entry.mesh_dirty = false;
+                entry.splats_dirty = false;
+                entry.clusters_dirty = false;
+            }
+        }
+    }
 }

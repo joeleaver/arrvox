@@ -553,12 +553,15 @@ impl RkpSceneManager {
             }
         }
 
-        // ── Phase 5: refresh `mesh_lod0_index_count` ──────────────────
+        // ── Phase 5: refresh `mesh_lod0_index_count` + dirty flags ────
         // The legacy direct-draw dispatch (debug-only) reads
         // `[0..mesh_lod0_index_count)`. The active indirect-draw path
         // ignores this and walks per-cluster offsets/counts, so the
         // value is informational for the legacy path only. Sum across
         // all LOD-0 cluster entries (including the new patch cluster).
+        //
+        // Mark mesh + clusters dirty so the next geometry-epoch upload
+        // loop picks this asset up and skips all the others.
         let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
         entry.mesh_lod0_index_count = entry
             .meshlet_clusters
@@ -566,6 +569,8 @@ impl RkpSceneManager {
             .filter(|c| c.lod_level == 0)
             .map(|c| c.index_count)
             .sum();
+        entry.mesh_dirty = true;
+        entry.clusters_dirty = true;
 
         eprintln!(
             "[sculpt] V2 patch: handle={:?} dirty={} kept_tris={} dropped_tris={} \
@@ -626,6 +631,8 @@ impl RkpSceneManager {
                 entry.mesh_indices.clear();
                 entry.meshlet_clusters.clear();
                 entry.mesh_lod0_index_count = 0;
+                entry.mesh_dirty = true;
+                entry.clusters_dirty = true;
             }
             return;
         }
@@ -643,6 +650,8 @@ impl RkpSceneManager {
         entry.mesh_indices = dag.indices;
         entry.meshlet_clusters = dag.clusters;
         entry.mesh_lod0_index_count = mesh_lod0_index_count;
+        entry.mesh_dirty = true;
+        entry.clusters_dirty = true;
 
         eprintln!(
             "[sculpt] mesh re-extract: handle={:?} verts={} indices={} clusters={} ({:.2}ms)",
@@ -720,6 +729,9 @@ mod tests {
             mesh_lod0_index_count: 0,
             meshlet_clusters: clusters,
             cpu_octree: SparseOctree::new(depth, base_vs),
+            mesh_dirty: false,
+            splats_dirty: false,
+            clusters_dirty: false,
         }
     }
 

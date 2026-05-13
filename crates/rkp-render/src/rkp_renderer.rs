@@ -185,6 +185,46 @@ pub struct RkpRenderer {
     shadow_csm_threshold_falloff: f32,
 }
 
+/// Grow-or-write a wgpu buffer: if `existing` is `Some` and big enough
+/// for `data`, do an in-place `queue.write_buffer` (async, cheap); else
+/// allocate a fresh buffer with 2× headroom and write the data into it.
+///
+/// **Why this exists.** The mesh / cluster upload path previously used
+/// `wgpu::util::DeviceExt::create_buffer_init` per stamp, which
+/// allocates a brand-new GPU buffer, memcpy's the contents into mapped
+/// memory, and unmaps. On a ~175 MB asset that's ~35 ms of CPU memcpy
+/// plus driver-side GPU allocation overhead (the dropped old buffer
+/// also queues for deferred free, building GPU memory pressure across
+/// stamps). For drag-friendly sculpt we need to amortize: 2× growth
+/// means the realloc only fires O(log N) times across N stamps; the
+/// rest hit the `queue.write_buffer` fast path.
+fn ensure_or_grow_buffer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    existing: Option<wgpu::Buffer>,
+    label: &str,
+    usage: wgpu::BufferUsages,
+    data: &[u8],
+) -> wgpu::Buffer {
+    let needed = data.len() as u64;
+    if let Some(buffer) = existing.as_ref() {
+        if buffer.size() >= needed {
+            queue.write_buffer(buffer, 0, data);
+            return existing.unwrap();
+        }
+    }
+    let existing_size = existing.as_ref().map(|b| b.size()).unwrap_or(0);
+    let new_size = needed.max(existing_size.saturating_mul(2)).max(64);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: new_size,
+        usage,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buffer, 0, data);
+    buffer
+}
+
 impl RkpRenderer {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, _width: u32, _height: u32) -> Self {
         let scene = RkpScene::new(device);
@@ -379,12 +419,12 @@ impl RkpRenderer {
     /// empty mesh clears the cached entry.
     pub fn upload_mesh_for_asset(
         &mut self,
+        queue: &wgpu::Queue,
         handle_raw: u32,
         vertices: &[MeshVertex],
         indices: &[u32],
         dispatch_index_count: u32,
     ) {
-        use wgpu::util::DeviceExt;
         let idx = handle_raw as usize;
         if idx >= self.mesh_buffers.len() {
             self.mesh_buffers.resize_with(idx + 1, || None);
@@ -393,16 +433,36 @@ impl RkpRenderer {
             self.mesh_buffers[idx] = None;
             return;
         }
-        let vbo = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh asset vbo"),
-            contents: bytemuck::cast_slice(vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let ibo = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh asset ibo (full DAG)"),
-            contents: bytemuck::cast_slice(indices),
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::STORAGE,
-        });
+
+        // Ensure-and-write: realloc only when the buffer needs to grow,
+        // otherwise an async `queue.write_buffer` is much cheaper than
+        // a full `create_buffer_init` realloc. 2× growth amortizes the
+        // realloc cost across the geometric series of sculpt stamps
+        // (each stamp may grow the IBO by ~5 % via append-only
+        // patching; only every ~14 stamps triggers a realloc).
+        let vbo_bytes: &[u8] = bytemuck::cast_slice(vertices);
+        let ibo_bytes: &[u8] = bytemuck::cast_slice(indices);
+
+        let (existing_vbo, existing_ibo, _) = match self.mesh_buffers[idx].take() {
+            Some(t) => (Some(t.0), Some(t.1), t.2),
+            None => (None, None, 0),
+        };
+        let vbo = ensure_or_grow_buffer(
+            &self.device, queue,
+            existing_vbo,
+            "mesh asset vbo",
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            vbo_bytes,
+        );
+        let ibo = ensure_or_grow_buffer(
+            &self.device, queue,
+            existing_ibo,
+            "mesh asset ibo (full DAG)",
+            wgpu::BufferUsages::INDEX
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
+            ibo_bytes,
+        );
         self.mesh_buffers[idx] = Some((vbo, ibo, dispatch_index_count));
     }
 

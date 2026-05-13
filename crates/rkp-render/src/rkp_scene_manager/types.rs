@@ -155,6 +155,20 @@ pub(super) struct AssetEntry {
     /// big assets (~4 B per node + parallel prefilter index), but mesh-
     /// mode sculpt edits can't reconstruct it from the cluster DAG.
     pub(super) cpu_octree: SparseOctree,
+    /// Per-asset "needs GPU re-upload" flags. The render thread checks
+    /// these on every geometry-epoch bump and skips assets whose data
+    /// hasn't changed — cuts the ~25-asset × ~175 MB re-upload cost
+    /// (the dominant 2-4 s/stamp bottleneck on splat5) down to just
+    /// the one asset the sculpt mutated.
+    ///
+    /// Set to `true` at load. Sculpt sets `mesh_dirty` and
+    /// `clusters_dirty` true; splats never change post-load so
+    /// `splats_dirty` only fires on the first upload. The render
+    /// thread clears all three after upload via
+    /// [`RkpSceneManager::mark_loaded_asset_uploads_clean`].
+    pub(super) mesh_dirty: bool,
+    pub(super) splats_dirty: bool,
+    pub(super) clusters_dirty: bool,
 }
 
 impl AssetEntry {
