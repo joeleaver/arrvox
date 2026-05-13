@@ -17,6 +17,35 @@ use crate::rkp_scene::GeometryUpload;
 
 use super::types::{emit_faces, AssetCache, FaceInstance};
 
+/// Process-start anchor used by [`process_elapsed_ns`]. Lazy-initialised
+/// on first read; nanos-since-this-anchor fit in u64 for ~584 years.
+fn process_start() -> std::time::Instant {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    *START.get_or_init(std::time::Instant::now)
+}
+
+/// Nanoseconds elapsed since [`process_start`]. Cross-thread-readable
+/// (writable as `AtomicU64`) for cheap latency diagnostics.
+fn process_elapsed_ns() -> u64 {
+    process_start().elapsed().as_nanos() as u64
+}
+
+/// Compute the wall-clock millisecond gap between `nanos_then`
+/// (typically `last_geometry_bump_ns()`) and now. Returns `None` if
+/// `nanos_then` is zero (never set) or "in the future" (race
+/// condition between read and now-sample).
+pub fn ms_since_process_ns(nanos_then: u64) -> Option<f64> {
+    if nanos_then == 0 {
+        return None;
+    }
+    let now = process_elapsed_ns();
+    if now < nanos_then {
+        return None;
+    }
+    Some((now - nanos_then) as f64 / 1.0e6)
+}
+
 /// Lock-free snapshot of the three pools the painted-material walk
 /// reads. Cloned out under a brief `scene_mgr` lock; the walk traverses
 /// the snapshot without holding any lock, so sim and render don't
@@ -81,6 +110,17 @@ pub struct RkpSceneManager {
     /// directly; only the actual geometry-mutation methods need the
     /// Mutex (which they already hold via `&mut self`).
     pub(super) geometry_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Wall-clock nanoseconds (relative to the lazy-initialised
+    /// process-start anchor inside `bump_geometry_epoch`) of the most
+    /// recent epoch bump. Sim writes; render reads on geo-epoch start
+    /// to log the `[sculpt-pipeline] sim→render` wait — the gap that
+    /// the existing component-level timings don't capture (sim mutex
+    /// hold, render-thread cadence, vsync alignment).
+    ///
+    /// `0` until the first bump. Loosely synchronized — Relaxed
+    /// ordering is fine because the timestamp is for diagnostics, not
+    /// for correctness.
+    pub(super) last_geometry_bump_ns: std::sync::Arc<std::sync::atomic::AtomicU64>,
 
     // ── Paint data writes (Phase 3b perf) ───────────────────────────
     /// Separate epoch for paint mutations. Pre-perf: paint bumped
@@ -122,6 +162,7 @@ impl RkpSceneManager {
             pending_faces: Vec::new(),
             faces_dirty: false,
             geometry_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_geometry_bump_ns: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             paint_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             walk_snapshot_cache: None,
             walk_snapshot_epoch: 0,
@@ -249,6 +290,18 @@ impl RkpSceneManager {
     pub fn bump_geometry_epoch(&mut self) {
         self.geometry_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+        let ns = process_elapsed_ns();
+        self.last_geometry_bump_ns
+            .store(ns, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read the nanoseconds-since-process-start when
+    /// [`Self::bump_geometry_epoch`] was last called. Returns `0` if
+    /// the epoch has never been bumped. Used by the render worker to
+    /// log the sim→render wait gap (`[sculpt-pipeline]`).
+    pub fn last_geometry_bump_ns(&self) -> u64 {
+        self.last_geometry_bump_ns
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn clear_faces(&mut self) {
         self.pending_faces.clear();

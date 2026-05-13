@@ -69,34 +69,46 @@ fn local_aabb_intersects(
 }
 
 /// Mark meshlet clusters with `CLUSTER_FLAG_LOD_DIRTY` using AABB
-/// localization to narrow on connected-mesh assets.
+/// localization on LOD>0 ancestors plus DAG descent to force-admit
+/// LOD-0 leaves whose Karis-admittable ancestor was dropped.
 ///
 /// Algorithm:
-/// 1. **Seeds** — brush-touched LOD-0 clusters (from
-///    `clusters_in_brush_grid_aabb`) are force-admitted.
+/// 1. **Seeds** — brush-touched LOD-0 clusters are force-admitted.
 /// 2. **AABB-dirty LOD>0** — any LOD>0 cluster whose object-local
 ///    AABB intersects the brush AABB is marked dirty (dropped at
-///    render time). These are the would-be admitters whose territory
-///    now needs re-rendering with the post-brush geometry.
-/// 3. **Coverage check** — for each non-seeded LOD-0 leaf `L`, walk
-///    `L`'s DAG ancestors via `group_above → produced` (recursively).
-///    If ANY ancestor is non-dirty, `L` is covered by that ancestor's
-///    normal Karis admit and stays clean. If EVERY ancestor is dirty,
-///    no admitter survives at any Karis-picked LOD — force-admit `L`.
+///    render time). These are the would-be Karis admitters whose
+///    territory now contains stale geometry.
+/// 3. **DAG descent** — for each dirty LOD>0 cluster, walk its DAG
+///    descendants via `group_below → consumed[]` recursively. Mark
+///    every reached cluster dirty:
+///      - **LOD-0 descendants** → force-admit (correct, replaces the
+///        dropped ancestor's would-be geometry).
+///      - **LOD>0 descendants** → also drop, because at the camera
+///        distance where the original ancestor was Karis-picked, no
+///        intermediate non-dirty descendant could admit either (their
+///        `parent_err_proj` falls below threshold once the original
+///        ancestor is the Karis pick). Marking them explicitly is
+///        defensive and idempotent.
 ///
-/// Why this narrows where the previous symmetric CC walk could not:
-/// on a connected mesh every LOD-0 leaf shares some ancestor in the
-/// DAG with every other leaf, so a symmetric walk visits everything.
-/// Here, only LOD>0 clusters near the brush get dropped, and only
-/// LOD-0 leaves under those dropped ancestors get force-admitted —
-/// the "covered by non-dirty ancestor" check stops the dilation at
-/// the boundary of the brush's spatial neighbourhood.
+/// Why descent is required (and the earlier coverage check was wrong):
+/// when Karis would have admitted ancestor `A` at the current camera
+/// and `A` is dropped, no DAG descendant admits via Karis: the
+/// next-finer level says `parent_err_proj < threshold → parent will
+/// admit` (it would have been `A`, now dropped), and `A` itself says
+/// `drop_dirty_ancestor`. The chain unrolls down to LOD-0; only an
+/// explicit force-admit there saves us from a void. So we must
+/// force-admit every LOD-0 descendant of every dropped ancestor.
+///
+/// Locality on connected meshes: step 2 only marks LOD>0 clusters
+/// whose AABB *intersects* the brush AABB. A small brush touches a
+/// handful of clusters at each LOD; each cluster's DAG descendants
+/// are bounded by its territory (~`4^lod_level` leaves). So the
+/// total marked set scales with brush footprint, not asset size.
 ///
 /// Falls back to asset-wide marking when the entry has no DAG
 /// topology (`dag_groups.is_empty()`), preserving v5-load behavior.
 ///
-/// Returns the number of clusters that had their `LOD_DIRTY` flag
-/// newly set.
+/// Returns the number of clusters newly flagged dirty.
 fn mark_lod_dirty_chains(
     entry: &mut super::types::AssetEntry,
     seeds: &[u32],
@@ -116,8 +128,6 @@ fn mark_lod_dirty_chains(
         return cluster_count;
     }
 
-    // `dirty` doubles as the dirty-flag tracker and the visited set
-    // for the ancestor walk in step 3.
     let mut dirty = vec![false; cluster_count];
 
     // Step 1: seed brush-touched LOD-0 clusters.
@@ -128,87 +138,41 @@ fn mark_lod_dirty_chains(
     }
 
     // Step 2: LOD>0 clusters whose AABB intersects the brush AABB
-    // become dirty (dropped at render time).
+    // become dirty. Push them onto a descent stack for step 3.
+    let mut descent_stack: Vec<u32> = Vec::new();
     for (idx, c) in entry.meshlet_clusters.iter().enumerate() {
-        if c.lod_level == 0 {
-            continue;
-        }
-        if dirty[idx] {
+        if c.lod_level == 0 || dirty[idx] {
             continue;
         }
         if local_aabb_intersects(c.aabb_min, c.aabb_max, brush_aabb_min, brush_aabb_max) {
             dirty[idx] = true;
+            descent_stack.push(idx as u32);
         }
     }
 
-    // Step 3: coverage check for non-seeded LOD-0 leaves. Walk
-    // each leaf's DAG ancestors via group_above → produced. Use a
-    // per-leaf epoch in `epoch_seen[idx] == leaf_idx` to dedupe
-    // without re-allocating a HashSet every iteration.
-    let mut epoch_seen: Vec<u32> = vec![u32::MAX; cluster_count];
-    let mut ancestor_stack: Vec<u32> = Vec::new();
-    // Collect LOD-0 leaves to evaluate up front so we can borrow
-    // `entry.meshlet_clusters` immutably during the walk.
-    let lod0_leaves: Vec<u32> = entry
-        .meshlet_clusters
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, c)| {
-            if c.lod_level == 0 && !dirty[idx] {
-                Some(idx as u32)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let mut to_mark: Vec<u32> = Vec::new();
-    for lidx in lod0_leaves {
-        ancestor_stack.clear();
-        ancestor_stack.push(lidx);
-        epoch_seen[lidx as usize] = lidx;
-
-        let mut covered = false;
-        let mut has_ancestor = false;
-        while let Some(cidx) = ancestor_stack.pop() {
-            let c = &entry.meshlet_clusters[cidx as usize];
-            if c.group_above_idx == DAG_GROUP_NONE {
+    // Step 3: descend each dirty LOD>0 via group_below.consumed[]
+    // recursively. Mark every reached cluster dirty; only LOD>0
+    // descendants need to be re-pushed for further descent (LOD-0 is
+    // a leaf in the DAG). The shared `dirty` array de-dupes work
+    // when multiple ancestors share descendants.
+    while let Some(cidx) = descent_stack.pop() {
+        let c = &entry.meshlet_clusters[cidx as usize];
+        if c.group_below_idx == DAG_GROUP_NONE {
+            continue;
+        }
+        let g = entry.dag_groups[c.group_below_idx as usize];
+        let lo = g.consumed_first as usize;
+        let hi = lo + g.consumed_count as usize;
+        for &child in &entry.dag_consumed[lo..hi] {
+            let n = child as usize;
+            if n >= cluster_count || dirty[n] {
                 continue;
             }
-            let g = entry.dag_groups[c.group_above_idx as usize];
-            let lo = g.produced_first as usize;
-            let hi = lo + g.produced_count as usize;
-            for &p in &entry.dag_produced[lo..hi] {
-                let p_us = p as usize;
-                if p_us >= cluster_count || epoch_seen[p_us] == lidx {
-                    continue;
-                }
-                epoch_seen[p_us] = lidx;
-                has_ancestor = true;
-                if !dirty[p_us] {
-                    // Non-dirty ancestor exists → its normal Karis
-                    // admit covers L at whatever LOD Karis picks.
-                    covered = true;
-                    break;
-                }
-                ancestor_stack.push(p);
-            }
-            if covered {
-                break;
+            dirty[n] = true;
+            if entry.meshlet_clusters[n].lod_level > 0 {
+                descent_stack.push(child);
             }
         }
-
-        // If L has ancestors and ALL are dirty (covered == false),
-        // no admitter survives — force-admit L. If L has no
-        // ancestors at all, it's a DAG-root LOD-0 with
-        // parent_group_error == ∞, so Karis admits it on its own
-        // — leave clean.
-        if has_ancestor && !covered {
-            to_mark.push(lidx);
-        }
-    }
-    for cidx in to_mark {
-        dirty[cidx as usize] = true;
     }
 
     // Step 4: apply dirty flags to clusters.
@@ -1237,54 +1201,113 @@ mod tests {
     }
 
     #[test]
-    fn mark_lod_dirty_chains_narrows_on_connected_dag() {
-        // **The load-bearing test.** Connected DAG with one root that
-        // covers the whole asset. Brush touches chain X only ([0,1.5]).
+    fn mark_lod_dirty_chains_single_root_descent_marks_full_asset() {
+        // A connected DAG with a SINGLE root covering the whole asset
+        // is the worst case for descent: any brush intersecting the
+        // root triggers descent down to every LOD-0 leaf. This is
+        // correct — when the root is the Karis pick at some camera
+        // distance and we drop it, every chain needs force-admit at
+        // LOD-0 (no Karis-admittable intermediate level survives).
         //
-        // Naive symmetric CC walk visits everything (chain X seeds
-        // reach c2_z, which reaches chain Y). The AABB-based
-        // narrowing should mark only: {c0_a (seed), c0_b (ancestor
-        // c1_x dirty → force-admit), c1_x (AABB), c2_z (AABB —
-        // covers whole asset)}. Chain Y's c0_c, c0_d have a
-        // NON-DIRTY ancestor c1_y → covered → don't mark.
+        // Real assets (the procedural box has 9.6k LOD-3 roots, each
+        // localized) don't hit this case — they have many roots and
+        // the brush only intersects a few of them, so the descent
+        // stays local. See `multi_root_dag_narrows_to_brush_region`
+        // for the realistic narrowing test.
         let mut entry = three_lod_connected_entry();
+        let bmin = Vec3::splat(0.0);
+        let bmax = Vec3::splat(1.5);
+        let marked = mark_lod_dirty_chains(&mut entry, &[0], bmin, bmax);
+        assert_eq!(marked, 7, "single-root DAG → descent marks everything");
+        assert_eq!(dirty_set(&entry), vec![0, 1, 2, 3, 4, 5, 6]);
+    }
+
+    /// Multi-root DAG fixture matching the procedural-box structure:
+    /// two SEPARATE LOD-1 → LOD-2 chains with no shared root. Brush
+    /// in one chain's region must not reach the other.
+    ///
+    /// Chain X: c0_a [0,1], c0_b [1,2] → c1_x [0,2] → c2_x [0,2]
+    /// Chain Y: c0_c [5,6], c0_d [6,7] → c1_y [5,7] → c2_y [5,7]
+    /// IDs: 0=c0_a, 1=c0_b, 2=c0_c, 3=c0_d, 4=c1_x, 5=c1_y, 6=c2_x, 7=c2_y.
+    fn multi_root_entry() -> AssetEntry {
+        use rkp_core::mesh_lod::DagGroup;
+        let clusters = vec![
+            cluster([0.0; 3], [1.0; 3], 0),  // 0 c0_a
+            cluster([1.0; 3], [2.0; 3], 0),  // 1 c0_b
+            cluster([5.0; 3], [6.0; 3], 0),  // 2 c0_c
+            cluster([6.0; 3], [7.0; 3], 0),  // 3 c0_d
+            cluster([0.0; 3], [2.0; 3], 1),  // 4 c1_x
+            cluster([5.0; 3], [7.0; 3], 1),  // 5 c1_y
+            cluster([0.0; 3], [2.0; 3], 2),  // 6 c2_x (root X)
+            cluster([5.0; 3], [7.0; 3], 2),  // 7 c2_y (root Y)
+        ];
+        let mut entry = make_entry(clusters, 8);
+        entry.dag_groups = vec![
+            // g0: consumed [c0_a, c0_b] produced [c1_x]
+            DagGroup { consumed_first: 0, consumed_count: 2, produced_first: 0, produced_count: 1 },
+            // g1: consumed [c0_c, c0_d] produced [c1_y]
+            DagGroup { consumed_first: 2, consumed_count: 2, produced_first: 1, produced_count: 1 },
+            // g2: consumed [c1_x] produced [c2_x]
+            DagGroup { consumed_first: 4, consumed_count: 1, produced_first: 2, produced_count: 1 },
+            // g3: consumed [c1_y] produced [c2_y]
+            DagGroup { consumed_first: 5, consumed_count: 1, produced_first: 3, produced_count: 1 },
+        ];
+        entry.dag_consumed = vec![0, 1, 2, 3, 4, 5];
+        entry.dag_produced = vec![4, 5, 6, 7];
+        entry.meshlet_clusters[0].group_above_idx = 0;
+        entry.meshlet_clusters[1].group_above_idx = 0;
+        entry.meshlet_clusters[4].group_below_idx = 0;
+        entry.meshlet_clusters[2].group_above_idx = 1;
+        entry.meshlet_clusters[3].group_above_idx = 1;
+        entry.meshlet_clusters[5].group_below_idx = 1;
+        entry.meshlet_clusters[4].group_above_idx = 2;
+        entry.meshlet_clusters[6].group_below_idx = 2;
+        entry.meshlet_clusters[5].group_above_idx = 3;
+        entry.meshlet_clusters[7].group_below_idx = 3;
+        entry
+    }
+
+    #[test]
+    fn mark_lod_dirty_chains_multi_root_narrows_to_brush_region() {
+        // **The load-bearing test for connected-mesh assets.** Two
+        // separate DAG-root chains (no shared root, like the real
+        // procedural box with 9.6k LOD-3 roots). Brush touches
+        // chain X only; chain Y must stay clean.
+        //
+        // Expected dirty: {c0_a (seed), c0_b (descended from c1_x),
+        // c1_x (AABB), c2_x (AABB, descent doesn't cross into chain Y)}.
+        let mut entry = multi_root_entry();
         let bmin = Vec3::splat(0.0);
         let bmax = Vec3::splat(1.5);
         let marked = mark_lod_dirty_chains(&mut entry, &[0], bmin, bmax);
         assert_eq!(
             marked, 4,
-            "expected narrow set: c0_a + c0_b + c1_x + c2_z; chain Y stays clean"
+            "narrow to chain X: c0_a + c0_b + c1_x + c2_x"
         );
         assert_eq!(dirty_set(&entry), vec![0, 1, 4, 6]);
     }
 
     #[test]
-    fn mark_lod_dirty_chains_root_alone_does_not_force_admit_leaves() {
-        // Edge case: brush touches ONLY the root c2_z's AABB without
-        // touching any LOD-1 cluster. (Synthetic — c2_z.aabb covers
-        // [0,4] which trivially contains any sub-cluster AABB, so a
-        // brush inside c2_z always touches some LOD-1 too. Force the
-        // scenario by giving c2_z a SUPER-wide AABB beyond chain
-        // extents.)
+    fn mark_lod_dirty_chains_descent_force_admits_under_dropped_ancestor() {
+        // When a LOD>0 ancestor is dropped by AABB intersection, ALL
+        // of its DAG descendants down to LOD-0 must be force-admitted
+        // — even non-brush-touched siblings whose own AABBs don't
+        // intersect the brush. This is the load-bearing correctness
+        // property; the earlier "non-dirty ancestor covers" version
+        // missed this and produced cluster-shaped voids in-editor.
         //
-        // Construct: c2_z spans [-10, 10]; brush at [-5, -4] only.
-        // c1_x, c1_y, c0_* all have AABB in [0,4] — no AABB intersect
-        // with brush. Only c2_z is brush-AABB-dirty.
-        //
-        // For chain X leaf c0_a: walk ancestors via group_above →
-        // produces [c1_x] (NOT dirty). c0_a covered → not marked.
-        // (Even though c2_z is dirty, c1_x is not, and Karis at this
-        // distance would admit at c1_x's level, covering c0_a.)
-        let mut entry = three_lod_connected_entry();
-        entry.meshlet_clusters[6].aabb_min = [-10.0; 3];
-        entry.meshlet_clusters[6].aabb_max = [10.0; 3];
-        let bmin = Vec3::splat(-5.0);
-        let bmax = Vec3::splat(-4.0);
-        let marked = mark_lod_dirty_chains(&mut entry, &[], bmin, bmax);
-        // Only c2_z is AABB-dirty. No LOD-0 leaves get force-admitted
-        // because all of them have a non-dirty LOD-1 ancestor.
-        assert_eq!(marked, 1);
-        assert_eq!(dirty_set(&entry), vec![6]);
+        // Setup: brush hits c1_x's AABB but does NOT touch c0_b
+        // (brush only covers c0_a's spatial region). c0_b's only
+        // ancestor c1_x is dropped → c0_b must be force-admitted via
+        // descent so the chain doesn't void at the Karis-picked LOD.
+        let mut entry = multi_root_entry();
+        let bmin = Vec3::splat(0.0);
+        let bmax = Vec3::splat(0.5);  // Only touches c0_a, c1_x, c2_x.
+        let marked = mark_lod_dirty_chains(&mut entry, &[0], bmin, bmax);
+        // Chain X: c0_a seed, c1_x + c2_x AABB-dirty, c0_b force-admitted
+        // by descent through c1_x. Chain Y untouched.
+        assert_eq!(marked, 4);
+        assert_eq!(dirty_set(&entry), vec![0, 1, 4, 6]);
     }
 
     #[test]

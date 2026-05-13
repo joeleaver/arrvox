@@ -29,7 +29,7 @@ mod types;
 mod voxelize;
 
 // Public re-exports — keep `rkp_render::rkp_scene_manager::Foo` stable.
-pub use manager::{RkpSceneManager, WalkSnapshot};
+pub use manager::{ms_since_process_ns, RkpSceneManager, WalkSnapshot};
 pub use sculpt::SculptApplyResult;
 pub use types::{
     AssetHandle, AssetInfo, FaceInstance, ReloadResult, SkinBrick, SkinningAssetData,

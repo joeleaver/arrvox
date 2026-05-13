@@ -132,6 +132,20 @@ pub(super) fn run_pre_frame(
         let geo_epoch_t0 = std::time::Instant::now();
         let mut sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
         let t_lock = geo_epoch_t0.elapsed();
+        // Diagnostic: time elapsed from the sim's `bump_geometry_epoch`
+        // call (typically inside the sculpt stamp) until the render
+        // worker picked up the new epoch. Surfaces the gap that the
+        // per-component timings ([sculpt] stamp, [geo-epoch], [render-
+        // frame], [ship]) collectively don't capture: sim-mutex hold,
+        // render-thread loop cadence, vsync alignment.
+        if let Some(sim_to_render_ms) = rkp_render::rkp_scene_manager::ms_since_process_ns(
+            sm.last_geometry_bump_ns(),
+        ) {
+            eprintln!(
+                "[sculpt-pipeline] sim→render={:.2}ms (geo_epoch={})",
+                sim_to_render_ms, frame.geometry_epoch,
+            );
+        }
         let t1 = std::time::Instant::now();
         let geo = sm.geometry_upload();
         let t_snapshot = t1.elapsed();
