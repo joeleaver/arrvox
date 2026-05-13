@@ -258,24 +258,28 @@ impl RkpSceneManager {
     // ── Geometry upload snapshot ─────────────────────────────────────
 
     pub fn geometry_upload(&self) -> GeometryUpload<'_> {
-        // Coalesce each pool's dirty ranges before handing them to the
-        // upload code: sculpt marks the same brick once per cell write
-        // (~64 cells/brick), so a 32 k-edit stamp can rack up 32 k
-        // duplicate marks of ~500 unique bricks. coalesce sorts and
-        // merges them into a minimal disjoint set, cutting both
-        // upload bytes (eliminates double-counting) and the
-        // queue.write_buffer syscall count (one call per disjoint
-        // range) by ~150× in the dense-edit case.
+        // Coalesce + gap-merge each pool's dirty ranges before handing
+        // them to the upload code. Plain coalesce was the D9 win
+        // (collapse duplicate brick marks); the gap-merge added here
+        // is the D10 win — modern wgpu's queue.write_buffer pays
+        // ~1 ms of staging-buffer + command-record overhead per call,
+        // so a stamp with ~2 000 tiny disjoint writes serialized
+        // ~2 s of upload time. Merging ranges within `GAP_BYTES` of
+        // each other trades a small over-upload (the gap bytes) for
+        // ~10-50× fewer write_buffer calls. 16 KiB gap covers the
+        // typical leaf_attr / brick stride density without ballooning
+        // total bytes.
+        const GAP_BYTES: u32 = 16 * 1024;
         let mut octree_dirty = self.octree.dirty_ranges().clone();
-        octree_dirty.coalesce();
+        octree_dirty.coalesce_with_gap(GAP_BYTES);
         let mut leaf_attr_dirty = self.leaf_attr_pool.dirty_attrs().clone();
-        leaf_attr_dirty.coalesce();
+        leaf_attr_dirty.coalesce_with_gap(GAP_BYTES);
         let mut color_dirty = self.leaf_attr_pool.dirty_colors().clone();
-        color_dirty.coalesce();
+        color_dirty.coalesce_with_gap(GAP_BYTES);
         let mut bone_dirty = self.leaf_attr_pool.dirty_bones().clone();
-        bone_dirty.coalesce();
+        bone_dirty.coalesce_with_gap(GAP_BYTES);
         let mut brick_dirty = self.brick_pool.dirty_ranges().clone();
-        brick_dirty.coalesce();
+        brick_dirty.coalesce_with_gap(GAP_BYTES);
         GeometryUpload {
             octree_nodes: self.octree.data(),
             octree_internal_attrs: self.octree.internal_attrs_data(),

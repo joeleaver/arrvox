@@ -131,6 +131,16 @@ struct UploadStats {
     range_count: usize,
 }
 
+/// Maximum number of per-range `queue.write_buffer` calls per pool
+/// per upload. Past this threshold the per-call driver overhead
+/// (~0.5-2 ms each for staging-buffer acquire + command record)
+/// dominates the actual byte transfer cost, and a single full-pool
+/// write is faster end-to-end even though it transfers far more
+/// bytes. `coalesce_with_gap` in `geometry_upload` keeps the count
+/// low for typical stamps; this cap covers pathological cases (very
+/// scattered per-slot mutations).
+const MAX_DELTA_RANGES: usize = 64;
+
 /// Storage stride (u32 lanes) of one octree node on the GPU. Lanes:
 ///   .x = node value (EMPTY / INTERIOR / BRANCH offset / LEAF / BRICK id)
 ///   .y = prefiltered-LOD attr id (INTERNAL_ATTR_NONE when absent)
@@ -463,6 +473,7 @@ impl RkpScene {
     /// * Total marked bytes exceed half the pool (N small `write_buffer`
     ///   calls cost more than one big one past that threshold).
     pub fn upload_geometry(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &GeometryUpload) {
+        let upload_start = std::time::Instant::now();
         assert_eq!(
             data.octree_nodes.len(),
             data.octree_internal_attrs.len(),
@@ -536,16 +547,18 @@ impl RkpScene {
         );
 
         let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+        let elapsed = upload_start.elapsed();
         eprintln!(
             "[rkp_scene] upload_geometry delta: octree={:.3} MiB ({}r)  brick={:.3} MiB ({}r)  \
              leaf_attr={:.3} MiB ({}r)  color={:.3} MiB ({}r)  bone={:.3} MiB ({}r)  \
-             total={:.3} MiB ({}r)",
+             total={:.3} MiB ({}r)  in {:.2} ms",
             mib(octree_stats.bytes_written), octree_stats.range_count,
             mib(brick_stats.bytes_written), brick_stats.range_count,
             mib(leaf_stats.bytes_written), leaf_stats.range_count,
             mib(color_stats.bytes_written), color_stats.range_count,
             mib(0), 0,
             mib(total_uploaded), range_count_total,
+            elapsed.as_secs_f64() * 1000.0,
         );
 
         if needs_rebuild {
@@ -556,6 +569,18 @@ impl RkpScene {
     /// Delta-aware upload for a homogeneous byte pool (brick_pool,
     /// leaf_attr_pool, color_pool, bone_weights). Returns telemetry +
     /// whether the buffer was reallocated.
+    ///
+    /// Falls back to full pool upload when:
+    /// * Buffer needed to grow (no usable existing data on GPU).
+    /// * Tracker is in `mark_full` mode.
+    /// * Total marked bytes exceed `data.len() / 2`.
+    /// * Range count exceeds [`MAX_DELTA_RANGES`] — the per-call
+    ///   overhead of `queue.write_buffer` on modern wgpu drivers
+    ///   (~1 ms in staging + command record) means past ~tens of
+    ///   calls a single full-pool write is cheaper end-to-end, even
+    ///   though it transfers many more bytes. The gap-merge in
+    ///   `geometry_upload` keeps the count low for most stamps;
+    ///   this cap covers the pathological case.
     fn upload_pool_delta(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -569,28 +594,22 @@ impl RkpScene {
         }
         let needed = data.len() as u64;
         if needed > buffer.size() {
-            // Buffer too small — reallocate with 2× headroom and full-write.
-            // Any tracked dirty ranges are subsumed by the full write.
             let new_size = needed.max(buffer.size().saturating_mul(2)).max(64);
             *buffer = Self::create_storage(device, label, new_size);
             queue.write_buffer(buffer, 0, data);
             return UploadStats { grew: true, bytes_written: data.len() as u64, range_count: 1 };
         }
         if dirty.is_empty() {
-            // Pool unchanged since the last upload. The caller bumped
-            // geometry_epoch for some *other* pool; we have nothing to ship.
             return UploadStats::default();
         }
-        let threshold = (data.len() / 2) as u64;
+        let bytes_threshold = (data.len() / 2) as u64;
         if dirty.is_full_pool(data.len() as u32)
-            || dirty.should_coalesce_to_full(threshold)
+            || dirty.should_coalesce_to_full(bytes_threshold)
+            || dirty.range_count() > MAX_DELTA_RANGES
         {
             queue.write_buffer(buffer, 0, data);
             return UploadStats { grew: false, bytes_written: data.len() as u64, range_count: 1 };
         }
-        // Delta path: per-range write_buffer. Clamp each range to the
-        // current pool length so a marked-then-truncated tail doesn't
-        // try to write past the source slice end.
         let mut bytes_written = 0u64;
         let mut range_count = 0usize;
         for (off, len) in dirty.iter() {
@@ -647,9 +666,10 @@ impl RkpScene {
         if dirty.is_empty() {
             return UploadStats::default();
         }
-        let threshold = needed_bytes / 2;
+        let bytes_threshold = needed_bytes / 2;
         if dirty.is_full_pool(needed_bytes as u32)
-            || dirty.should_coalesce_to_full(threshold)
+            || dirty.should_coalesce_to_full(bytes_threshold)
+            || dirty.range_count() > MAX_DELTA_RANGES
         {
             let interleaved = full_interleaved(nodes, attrs);
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&interleaved));

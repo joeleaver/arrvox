@@ -103,6 +103,20 @@ impl DirtyRanges {
     /// ranges, cutting both upload bytes and `queue.write_buffer`
     /// syscall count by ~150×.
     pub fn coalesce(&mut self) {
+        self.coalesce_with_gap(0);
+    }
+
+    /// Coalesce ranges, additionally merging any pair separated by a
+    /// gap of `<= max_gap_bytes`. Trades a few non-dirty bytes per
+    /// merged group for fewer `queue.write_buffer` calls — the per-call
+    /// overhead in modern wgpu drivers is on the order of 0.5-2 ms
+    /// (staging buffer acquisition + command record), so cutting the
+    /// per-stamp call count from ~2 000 to ~tens is worth the small
+    /// over-upload.
+    ///
+    /// `max_gap_bytes = 0` is equivalent to plain [`coalesce`] — only
+    /// overlapping / abutting ranges merge.
+    pub fn coalesce_with_gap(&mut self, max_gap_bytes: u32) {
         if self.full || self.ranges.len() <= 1 {
             return;
         }
@@ -115,9 +129,10 @@ impl DirtyRanges {
             let end = off.saturating_add(len);
             if let Some(last) = merged.last_mut() {
                 let last_end = last.0.saturating_add(last.1);
-                if off <= last_end {
-                    // Overlap or touch — extend the previous range to
-                    // cover this one's end.
+                if off <= last_end.saturating_add(max_gap_bytes) {
+                    // Overlap, touch, or within the gap budget — extend
+                    // the previous range to swallow this one (and any
+                    // non-dirty bytes between them).
                     let new_end = end.max(last_end);
                     last.1 = new_end - last.0;
                     continue;
@@ -290,6 +305,34 @@ mod tests {
         d.coalesce();
         // Full-pool mode stays as the single (0, 1024) range.
         assert!(d.is_full_pool(1024));
+    }
+
+    #[test]
+    fn coalesce_with_gap_merges_close_ranges() {
+        let mut d = DirtyRanges::new();
+        d.mark(0, 16);
+        d.mark(100, 16);   // gap of 84 from previous
+        d.mark(200, 16);   // gap of 84 from previous
+        d.mark(10_000, 16); // far away
+        d.coalesce_with_gap(128);
+        let ranges: Vec<_> = d.iter().collect();
+        // First three merged into one (0..216), fourth stays separate.
+        assert_eq!(ranges, vec![(0, 216), (10_000, 16)]);
+    }
+
+    #[test]
+    fn coalesce_with_gap_zero_matches_plain_coalesce() {
+        let mut a = DirtyRanges::new();
+        let mut b = DirtyRanges::new();
+        for off in [0, 16, 100, 200, 216, 10_000] {
+            a.mark(off, 16);
+            b.mark(off, 16);
+        }
+        a.coalesce();
+        b.coalesce_with_gap(0);
+        let ar: Vec<_> = a.iter().collect();
+        let br: Vec<_> = b.iter().collect();
+        assert_eq!(ar, br);
     }
 
     #[test]
