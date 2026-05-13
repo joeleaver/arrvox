@@ -59,6 +59,6 @@ impl EngineState {
         }
 
         self.scene_dirty = true;
-        self.gpu_objects_dirty = true;
+        self.gpu_objects_dirty.mark_all();
     }
 }

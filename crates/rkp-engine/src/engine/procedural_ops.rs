@@ -522,7 +522,10 @@ impl EngineState {
         }
 
         self.geometry_dirty = true;
-        self.gpu_objects_dirty = true;
+        // PERF_DEBT B1: bake completed for this entity — its
+        // RenderGeometry handle changed (new asset slot / proxy
+        // mesh). C2 will replace just this entity's row.
+        self.gpu_objects_dirty.mark_entity(entity);
     }
 
     /// If `entity` currently has a `RenderGeometry::ProxyMesh`
@@ -617,7 +620,9 @@ impl EngineState {
         }
 
         self.geometry_dirty = true;
-        self.gpu_objects_dirty = true;
+        // PERF_DEBT B1: scaled the procedural's Root + transform on
+        // a single entity.
+        self.gpu_objects_dirty.mark_entity(entity);
     }
 
 }

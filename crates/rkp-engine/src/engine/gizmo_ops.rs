@@ -47,7 +47,11 @@ impl EngineState {
                     let new_pos = self.gizmo.initial_position + delta;
                     if let Ok(mut t) = self.world.get::<&mut crate::components::Transform>(selected) {
                         t.position = new_pos;
-                        self.gpu_objects_dirty = true;
+                        // PERF_DEBT B1: only the selected entity's
+                        // transform changed. C2 will use this to
+                        // patch one row in `gpu_instances` instead
+                        // of rebuilding the whole derived state.
+                        self.gpu_objects_dirty.mark_entity(selected);
                     }
                 }
                 crate::gizmo::GizmoMode::Rotate => {
@@ -58,7 +62,7 @@ impl EngineState {
                     let euler_deg = glam::Vec3::new(x.to_degrees(), y.to_degrees(), z.to_degrees());
                     if let Ok(mut t) = self.world.get::<&mut crate::components::Transform>(selected) {
                         t.rotation = euler_deg;
-                        self.gpu_objects_dirty = true;
+                        self.gpu_objects_dirty.mark_entity(selected);
                     }
                 }
                 crate::gizmo::GizmoMode::Scale => {
@@ -66,7 +70,7 @@ impl EngineState {
                     let new_scale = self.gizmo.initial_scale * delta;
                     if let Ok(mut t) = self.world.get::<&mut crate::components::Transform>(selected) {
                         t.scale = new_scale;
-                        self.gpu_objects_dirty = true;
+                        self.gpu_objects_dirty.mark_entity(selected);
                     }
                     // Same path as the properties-panel scale slider:
                     // route procedural entities' scale onto Root,

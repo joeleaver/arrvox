@@ -67,7 +67,7 @@ impl EngineState {
                                     if field_name == "scale" {
                                         self.redirect_transform_scale_to_root(entity);
                                     }
-                                    self.gpu_objects_dirty = true;
+                                    self.gpu_objects_dirty.mark_all();
                                 }
                                 if component_name == "RigidBody" {
                                     self.collider_caches_dirty = true;
@@ -99,13 +99,13 @@ impl EngineState {
                             ),
                         }
                         self.scene_dirty = true;
-                        self.gpu_objects_dirty = true;
+                        self.gpu_objects_dirty.mark_all();
                     } else if let Some(entry) = self.registry.get(&component_name) {
                         if let Err(e) = (entry.add_default)(&mut self.world, entity) {
                             eprintln!("[RkpEngine] add component failed: {e}");
                         }
                         self.scene_dirty = true;
-                        self.gpu_objects_dirty = true;
+                        self.gpu_objects_dirty.mark_all();
                         if component_name == "RigidBody" {
                             self.collider_caches_dirty = true;
                         }
@@ -128,7 +128,7 @@ impl EngineState {
                             let _ = self.world.remove_one::<crate::components::AnimationPlayer>(entity);
                         }
                         self.scene_dirty = true;
-                        self.gpu_objects_dirty = true;
+                        self.gpu_objects_dirty.mark_all();
                         if component_name == "RigidBody" {
                             self.collider_caches_dirty = true;
                         }
@@ -232,7 +232,7 @@ impl EngineState {
                 if let Some(entity) = self.resolve_entity(&entity_id) {
                     if let Ok(mut r) = self.world.get::<&mut crate::components::Renderable>(entity) {
                         r.material_id = material_id;
-                        self.gpu_objects_dirty = true;
+                        self.gpu_objects_dirty.mark_all();
                     }
                 }
             }
@@ -284,7 +284,7 @@ impl EngineState {
                 if let Some(entity) = self.resolve_entity(&object_id) {
                     if let Ok(mut r) = self.world.get::<&mut crate::components::Renderable>(entity) {
                         r.material_id = material_id;
-                        self.gpu_objects_dirty = true;
+                        self.gpu_objects_dirty.mark_all();
                     }
                 }
             }
@@ -624,7 +624,7 @@ impl EngineState {
                 if let Some(play) = self.play_state.take() {
                     play.stop(&mut self.world);
                     self.behavior_executor = None;
-                    self.gpu_objects_dirty = true;
+                    self.gpu_objects_dirty.mark_all();
                     self.console.info("Play mode stopped — transforms restored");
                     self.exit_play_mode_viewports();
                 }

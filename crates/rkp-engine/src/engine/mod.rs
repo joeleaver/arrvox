@@ -19,6 +19,7 @@ mod command_handler;
 mod entity_ops;
 mod gameplay_ops;
 mod generator_ops;
+mod gpu_objects_dirty;
 mod gizmo_ops;
 mod import_ops;
 mod lifecycle;

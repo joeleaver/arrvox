@@ -106,7 +106,7 @@ impl EngineState {
                 self.assign_entity_uuid(entity);
                 self.geometry_dirty = true;
                 self.scene_dirty = true;
-                self.gpu_objects_dirty = true;
+                self.gpu_objects_dirty.mark_all();
                 if verbose {
                     self.console.info(format!("Loaded '{name}': {} voxels", info.voxel_count));
                 }
@@ -244,7 +244,7 @@ impl EngineState {
         self.console.info(format!("Deleted '{name}'"));
         self.geometry_dirty = true;
         self.scene_dirty = true;
-        self.gpu_objects_dirty = true;
+        self.gpu_objects_dirty.mark_all();
     }
 
     /// Duplicate an entity — copies every registered component via the
@@ -364,7 +364,7 @@ impl EngineState {
         self.console.info(format!("Duplicated '{src_name}' → '{new_name}'"));
         self.geometry_dirty = true;
         self.scene_dirty = true;
-        self.gpu_objects_dirty = true;
+        self.gpu_objects_dirty.mark_all();
     }
 
     pub(crate) fn clear_scene(&mut self) {
@@ -395,6 +395,6 @@ impl EngineState {
         self.selected_entity = None;
         self.geometry_dirty = true;
         self.scene_dirty = true;
-        self.gpu_objects_dirty = true;
+        self.gpu_objects_dirty.mark_all();
     }
 }

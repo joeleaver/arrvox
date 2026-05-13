@@ -167,7 +167,9 @@ impl EngineState {
         // Force the next tick to rebuild gpu_instances + flatten the
         // overlay vec — the per-instance `sculpt_offset` / `sculpt_count`
         // get re-assigned each frame inside `update_scene_gpu`.
-        self.gpu_objects_dirty = true;
+        // PERF_DEBT B1: only the sculpted entity's sculpt overlay
+        // changed. C2 will use this to drive a per-row update.
+        self.gpu_objects_dirty.mark_entity(entity);
 
         // Tell the painted-materials walk that THIS entity's geometry
         // changed. Without this, the walk's `geom_changed` branch

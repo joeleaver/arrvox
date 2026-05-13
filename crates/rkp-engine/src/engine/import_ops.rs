@@ -273,7 +273,7 @@ impl EngineState {
         // on the GPU (target_size, rotation offsets, etc. only show up in
         // the render once this runs).
         self.geometry_dirty = true;
-        self.gpu_objects_dirty = true;
+        self.gpu_objects_dirty.mark_all();
     }
 
     /// If a sibling `.rkskel` exists alongside the `.rkp` path, load it

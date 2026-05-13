@@ -169,7 +169,13 @@ impl EngineState {
             // shrinks via erase). Force a `gpu_instances` rebuild on
             // the next tick so the GPU side picks up the new slice
             // into `instance_overlay_buffer`.
-            self.gpu_objects_dirty = true;
+            //
+            // PERF_DEBT B1: only the painted entity's overlay
+            // changed. Today's flat overlay layout means the
+            // consumer still has to patch every subsequent entity's
+            // offsets — C2 will decide between per-row patch +
+            // suffix-shift or full rebuild based on this scope.
+            self.gpu_objects_dirty.mark_entity(entity);
             // Mark this entity for an incremental painted-material
             // re-scan in the next lifecycle tick — but ONLY for
             // material-mode stamps. Color and Erase stamps keep the

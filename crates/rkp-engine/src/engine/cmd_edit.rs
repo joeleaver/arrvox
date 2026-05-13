@@ -560,7 +560,7 @@ impl EngineState {
                 }
                 self.scene_dirty = true;
                 self.geometry_dirty = true;
-                self.gpu_objects_dirty = true;
+                self.gpu_objects_dirty.mark_all();
                 // Surface the new asset in the Models panel right
                 // away so it can be re-spawned later.
                 self.scan_models();

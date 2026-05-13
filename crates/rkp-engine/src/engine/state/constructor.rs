@@ -186,7 +186,15 @@ impl EngineState {
             import_worker: crate::import_worker::ImportWorker::new(),
             geometry_dirty: false,
             scene_dirty: false,
-            gpu_objects_dirty: true,
+            gpu_objects_dirty: {
+                // Initial state: full rebuild on first tick. World is
+                // empty here, so per-entity tracking would carry no
+                // info; flagging `all` matches the prior `bool = true`
+                // semantics exactly.
+                let mut d = crate::engine::gpu_objects_dirty::GpuObjectsDirty::new();
+                d.mark_all();
+                d
+            },
             frame_index: 0,
             profiling: crate::profiling::ProfilingHistory::default(),
             behavior_fixed_accumulator: 0.0,

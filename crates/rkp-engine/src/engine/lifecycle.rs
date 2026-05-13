@@ -159,9 +159,9 @@ impl EngineState {
         // anchor. Reading stale values here causes the BFS probe to
         // see last frame's overlay slice while the GPU buffer holds
         // this frame's content, missing the latest paint.
-        let gpu_objects_dirty_this_frame = self.gpu_objects_dirty;
+        let gpu_objects_dirty_this_frame = self.gpu_objects_dirty.is_dirty();
         let phase_update_scene_gpu_t0 = std::time::Instant::now();
-        if self.gpu_objects_dirty {
+        if self.gpu_objects_dirty.is_dirty() {
             let profile = self.paint_profile_active();
             let t0 = std::time::Instant::now();
             self.update_scene_gpu();
@@ -182,7 +182,7 @@ impl EngineState {
                     gap_ms,
                 );
             }
-            self.gpu_objects_dirty = false;
+            self.gpu_objects_dirty.clear();
         }
         let phase_update_scene_gpu_ms =
             phase_update_scene_gpu_t0.elapsed().as_secs_f64() * 1000.0;

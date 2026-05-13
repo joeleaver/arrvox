@@ -1,6 +1,6 @@
 # Engine performance-debt eradication plan
 
-**Status**: in progress (Phase A1 + A2 + A3 shipped; Phase B next). Feature work paused.
+**Status**: in progress (Phase A complete; B1 plumbing shipped; per-row fast path (C2) is the next gating step for B-phase perf). Feature work paused.
 
 This document is the authoritative plan for eliminating systemic "rebuild
 everything every tick" patterns from rkp-engine and rkp-render. It was
@@ -127,7 +127,7 @@ metric moved.
 
 | Step | Change | Result |
 |---|---|---|
-| **B1** | `gpu_objects_dirty: bool` → `HashSet<Entity>`. `update_scene_gpu` iterates the set. 13+ setter sites pass the affected entity. | -60 ms full rebuild per stamp |
+| **B1 ✅ (plumbing)** | `gpu_objects_dirty: bool` → `GpuObjectsDirty` (HashSet + sticky-all). 31 setter sites migrated: hot stamp paths (sculpt/paint/gizmo/picking/proc-bake) narrowed to `mark_entity(e)`; world-level events (project load, scene clear, gameplay reset, etc.) keep `mark_all()`. **Today's consumer still does a full rebuild whenever `is_dirty()`** — the per-row fast path is the C2 work. Module: `crates/rkp-engine/src/engine/gpu_objects_dirty.rs`. | Plumbing only; perf delivers in C2. |
 | **B2** | `geometry_dirty` / `collider_caches_dirty` → per-entity. `rebuild_collider_caches` iterates the dirty set. | Collider rebuild O(changed entities), not O(all rigid bodies) |
 | **B3** | `scene_dirty: bool` → typed event stream consumed by UI/inspector snapshot builder. | UI updates incrementally |
 
@@ -213,7 +213,7 @@ replaced by the migration:
 
 ### Coarse dirty flags
 
-- **`gpu_objects_dirty: bool`** — `crates/rkp-engine/src/engine/state/mod.rs:658`. 13 setter sites across sculpt/paint/gameplay/gizmo/scene_tree/picking/procedural/scene_io/cmd_edit ops. Consumer: full `update_scene_gpu`.
+- **`gpu_objects_dirty: bool`** — `crates/rkp-engine/src/engine/state/mod.rs:658`. 13 setter sites across sculpt/paint/gameplay/gizmo/scene_tree/picking/procedural/scene_io/cmd_edit ops. Consumer: full `update_scene_gpu`. **(B1 plumbing resolved — replaced with `GpuObjectsDirty` carrying per-entity scope. Actual setter count was 31. Hot stamp paths now `mark_entity(e)`. Consumer still does full rebuild until C2.)**
 - **`geometry_dirty: bool`** — `crates/rkp-engine/src/engine/state/mod.rs:654`. 8 setter sites. Triggers `collider_caches_dirty`.
 - **`scene_dirty: bool`** — `crates/rkp-engine/src/engine/state/mod.rs:656`. 7 setter sites. Triggers full SceneObjectInfo rebuild.
 - **`collider_caches_dirty: bool`** — `crates/rkp-engine/src/engine/state/mod.rs:594`. Derivative of `geometry_dirty`.

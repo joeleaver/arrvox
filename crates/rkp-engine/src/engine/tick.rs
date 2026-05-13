@@ -117,7 +117,7 @@ pub(crate) fn tick_loop(
                     state.play_total_time,
                     state.play_frame_count,
                 );
-                state.gpu_objects_dirty = true;
+                state.gpu_objects_dirty.mark_all();
             }
 
             // Phase 2: FixedUpdate — accumulator-driven. Runs zero or
@@ -156,7 +156,7 @@ pub(crate) fn tick_loop(
             // real_dt is correct regardless of render rate.
             if let Some(ref mut play) = state.play_state {
                 if play.step(dt, &mut state.world) {
-                    state.gpu_objects_dirty = true;
+                    state.gpu_objects_dirty.mark_all();
                 }
                 let substeps = play.last_step_substeps() as f32;
                 let inst_hz = if dt > 0.0 { substeps / dt } else { 0.0 };
@@ -190,7 +190,7 @@ pub(crate) fn tick_loop(
         // frame in both edit and play modes so animated characters
         // preview correctly in the editor.
         if crate::animation::tick(&mut state.world, real_dt) {
-            state.gpu_objects_dirty = true;
+            state.gpu_objects_dirty.mark_all();
         }
 
         // 2. Update input system + camera with real_dt — fly mode

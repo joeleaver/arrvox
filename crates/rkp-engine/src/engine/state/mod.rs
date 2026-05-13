@@ -672,8 +672,14 @@ pub(crate) struct EngineState {
     pub(crate) geometry_dirty: bool,
     /// Scene structure changed — push objects list to UI.
     pub(crate) scene_dirty: bool,
-    /// GPU objects / transforms changed — rebuild gpu_objects + re-upload.
-    pub(crate) gpu_objects_dirty: bool,
+    /// Per-entity dirty tracking for `update_scene_gpu`. Replaced
+    /// the prior `bool` flag (PERF_DEBT.md B1) so each mutation can
+    /// describe its scope: stamp/gizmo/paint events flag a single
+    /// entity; world-level events (project load, scene clear) flag
+    /// "all". Today's consumer in `lifecycle.rs` still does a full
+    /// rebuild whenever `is_dirty()` is true; C2 will wire the
+    /// per-entity fast path that actually iterates `dirty_entities`.
+    pub(crate) gpu_objects_dirty: super::gpu_objects_dirty::GpuObjectsDirty,
 
     // Frame counter
     pub(crate) frame_index: u64,

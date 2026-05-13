@@ -496,7 +496,7 @@ impl EngineState {
                         self.project_loaded = true;
                         self.project_dirty = true;
                         self.scene_dirty = true;
-                        self.gpu_objects_dirty = true;
+                        self.gpu_objects_dirty.mark_all();
                         self.scan_models();
                         if let Some(ref dir) = self.project_dir {
                             // Write starter materials before scanning.
