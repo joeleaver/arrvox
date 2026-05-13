@@ -87,6 +87,7 @@ impl RkpSceneManager {
         if brush_radius <= 0.0 {
             return None;
         }
+        let _sculpt_t0 = std::time::Instant::now();
 
         // ── 1. Resolve grid coords ──────────────────────────────────
         let (op, depth, base_vs) = {
@@ -318,10 +319,11 @@ impl RkpSceneManager {
 
         eprintln!(
             "[sculpt] stamp handle={:?} mode={:?} edits={} removed={} \
-             applied(adds={} freed={} interior={}) (depth={}, base_vs={:.5})",
+             applied(adds={} freed={} interior={}) (depth={}, base_vs={:.5}) total={:.2}ms",
             handle, mode, delta.len(), removed.len(),
             applied.allocated_slots.len(), applied.freed_slots.len(),
             delta.count_interior(), depth, base_vs,
+            _sculpt_t0.elapsed().as_secs_f64() * 1000.0,
         );
 
         Some(SculptApplyResult {

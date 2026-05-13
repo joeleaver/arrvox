@@ -129,9 +129,16 @@ pub(super) fn run_pre_frame(
     //    catch up on the next snapshot if an intermediate one was
     //    dropped by the newest-wins inbox.
     if frame.geometry_epoch > state.last_uploaded_geometry_epoch {
+        let geo_epoch_t0 = std::time::Instant::now();
         let mut sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
+        let t_lock = geo_epoch_t0.elapsed();
+        let t1 = std::time::Instant::now();
         let geo = sm.geometry_upload();
+        let t_snapshot = t1.elapsed();
+        let t2 = std::time::Instant::now();
         state.renderer.upload_geometry(&state.queue, &geo);
+        let t_pool_upload = t2.elapsed();
+        let t3 = std::time::Instant::now();
         // Delta-upload: the snapshot in `geo` cloned the per-pool dirty
         // trackers; now that the writes have been queued, clear the
         // manager-side trackers so the next epoch ships only fresh
@@ -139,6 +146,7 @@ pub(super) fn run_pre_frame(
         // upload_geometry so a write_buffer failure (in tests, panics)
         // leaves the trackers populated for retry.
         sm.clear_geometry_dirty_ranges();
+        let t_clear = t3.elapsed();
         // Phase B-2 — keep the splat-raster per-asset vertex-buffer
         // cache in step with the loaded asset set. Re-upload all of
         // them on every geometry-epoch bump rather than tracking which
@@ -155,6 +163,7 @@ pub(super) fn run_pre_frame(
         // load time. Phase 6.1: indices is the full DAG IBO (LOD-0
         // first, then LOD-1, ...); dispatch draws only the LOD-0
         // prefix until Phase 6.2 wires the indirect path.
+        let t_mesh_start = std::time::Instant::now();
         let mut mesh_bytes_total: u64 = 0;
         let mut mesh_asset_count: usize = 0;
         for (handle, vertices, indices, lod0_index_count) in sm.iter_loaded_asset_meshes() {
@@ -168,19 +177,31 @@ pub(super) fn run_pre_frame(
             mesh_bytes_total += bytes;
             mesh_asset_count += 1;
         }
+        let t_mesh_upload = t_mesh_start.elapsed();
         if mesh_asset_count > 0 {
             let mib = mesh_bytes_total as f64 / (1024.0 * 1024.0);
             eprintln!(
                 "[delta upload] mesh: {mesh_asset_count} asset(s) · {mib:.3} MiB total \
-                 (VBO+IBO tail writes)",
+                 (VBO+IBO tail writes) in {:.2} ms",
+                t_mesh_upload.as_secs_f64() * 1000.0,
             );
         }
+        let t_cluster_start = std::time::Instant::now();
         // Phase 5 — per-asset meshlet cluster table. Storage buffer
         // for the Phase 6 LOD-selection compute pass; uploaded here
         // but unused by current dispatch (validates the upload path
         // without rewiring the hot draw call).
+        let mut cluster_asset_count = 0;
         for (handle, clusters) in sm.iter_loaded_asset_clusters() {
             state.renderer.upload_mesh_clusters_for_asset(handle.raw(), clusters);
+            cluster_asset_count += 1;
+        }
+        let t_cluster_upload = t_cluster_start.elapsed();
+        if cluster_asset_count > 0 {
+            eprintln!(
+                "[delta upload] cluster table: {cluster_asset_count} asset(s) in {:.2} ms",
+                t_cluster_upload.as_secs_f64() * 1000.0,
+            );
         }
         // Per-asset dirty-flag clean-up: every iter above only yielded
         // assets whose `mesh_dirty / splats_dirty / clusters_dirty`
@@ -195,6 +216,18 @@ pub(super) fn run_pre_frame(
         // not. Worst case: we re-upload next frame, which is fine.
         state.last_uploaded_geometry_epoch = sm.geometry_epoch();
         drop(sm);
+        let t_total = geo_epoch_t0.elapsed();
+        eprintln!(
+            "[geo-epoch] lock={:.2}ms snap={:.2}ms pool={:.2}ms clear={:.2}ms \
+             mesh={:.2}ms clusters={:.2}ms total={:.2}ms",
+            t_lock.as_secs_f64() * 1000.0,
+            t_snapshot.as_secs_f64() * 1000.0,
+            t_pool_upload.as_secs_f64() * 1000.0,
+            t_clear.as_secs_f64() * 1000.0,
+            t_mesh_upload.as_secs_f64() * 1000.0,
+            t_cluster_upload.as_secs_f64() * 1000.0,
+            t_total.as_secs_f64() * 1000.0,
+        );
 
         // Invalidate cached `mesh_lod_select_g2_bgs` (and shadow
         // counterparts) across every viewport. The g2 bind groups
