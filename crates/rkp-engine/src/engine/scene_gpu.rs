@@ -500,4 +500,95 @@ impl EngineState {
         self.last_skin_poses = this_frame_poses;
 
     }
+
+    /// Per-entity transform-only fast path. Patches just the
+    /// `RkpGpuInstance.world` matrix for each dirty entity in
+    /// `self.gpu_objects_dirty.dirty_entities()`. Skips the full
+    /// rebuild's per-tick work (bone_matrix repack, skin scatter
+    /// planning, asset table dedup, overlay/sculpt flatten) — those
+    /// are all bit-identical to the prior frame when only transforms
+    /// changed.
+    ///
+    /// Caller (lifecycle's `submit_render_frame`) gates this on
+    /// `gpu_objects_dirty.is_transform_only()` — i.e. all dirty
+    /// entities carry `DirtyKind::Transform` and `is_all()` is
+    /// false. Anything stricter (Structural, or `all`) routes
+    /// through the full [`Self::update_scene_gpu`] rebuild.
+    ///
+    /// PERF_DEBT.md C2. Saves ~60-75 ms per gizmo-drag stamp on
+    /// the splat5 elephant scene by avoiding the world-wide
+    /// re-walk + asset re-dedup + flat-vec re-flatten.
+    pub(crate) fn update_scene_gpu_transform_only(&mut self) {
+        use crate::components::Transform;
+
+        // `dirty_entities()` is a `&HashMap<Entity, DirtyKind>`;
+        // collect (entity, gpu_idx, new_world) eagerly so we can drop
+        // the world/state borrows before taking `Arc::make_mut` on
+        // gpu_instances/splat_draws/proxy_draws below.
+        let dirty: Vec<hecs::Entity> = self
+            .gpu_objects_dirty
+            .dirty_entities()
+            .keys()
+            .copied()
+            .collect();
+        let mut updates: Vec<(u32, [[f32; 4]; 4])> = Vec::with_capacity(dirty.len());
+        for entity in dirty {
+            let Some(&gpu_idx) = self.entity_to_gpu.get(&entity) else {
+                // No GPU row yet — entity was added since the last
+                // full rebuild. The C2 fast path doesn't handle
+                // additions; the next structural mark will trigger
+                // a full rebuild and pick this up. Skip.
+                continue;
+            };
+            let Ok(transform) = self.world.get::<&Transform>(entity) else {
+                continue;
+            };
+            let world_matrix = glam::Mat4::from_scale_rotation_translation(
+                transform.scale,
+                glam::Quat::from_euler(
+                    glam::EulerRot::XYZ,
+                    transform.rotation.x.to_radians(),
+                    transform.rotation.y.to_radians(),
+                    transform.rotation.z.to_radians(),
+                ),
+                transform.position,
+            );
+            updates.push((gpu_idx as u32, world_matrix.to_cols_array_2d()));
+        }
+
+        // Patch the matching gpu_instances row.
+        let gpu_instances = std::sync::Arc::make_mut(&mut self.gpu_instances);
+        for &(gpu_idx, world) in &updates {
+            if let Some(inst) = gpu_instances.get_mut(gpu_idx as usize) {
+                inst.world = world;
+            }
+        }
+
+        // Splat / proxy draws carry their own per-instance world too —
+        // keyed by `object_id` (= gpu_idx). Both lists are short
+        // (one entry per asset-backed / proxy entity), so a linear
+        // scan per update is cheap; no separate index map needed.
+        // `Arc::make_mut` no-ops when the list is empty (refcount=1
+        // on a fresh empty Vec).
+        if !self.splat_draws.is_empty() {
+            let splat_draws = std::sync::Arc::make_mut(&mut self.splat_draws);
+            for &(gpu_idx, world) in &updates {
+                for d in splat_draws.iter_mut() {
+                    if d.object_id == gpu_idx {
+                        d.world = world;
+                    }
+                }
+            }
+        }
+        if !self.proxy_draws.is_empty() {
+            let proxy_draws = std::sync::Arc::make_mut(&mut self.proxy_draws);
+            for &(gpu_idx, world) in &updates {
+                for d in proxy_draws.iter_mut() {
+                    if d.object_id == gpu_idx {
+                        d.world = world;
+                    }
+                }
+            }
+        }
+    }
 }

@@ -1,6 +1,6 @@
 # Engine performance-debt eradication plan
 
-**Status**: in progress (Phase A complete; B1 plumbing shipped; per-row fast path (C2) is the next gating step for B-phase perf). Feature work paused.
+**Status**: in progress (Phase A complete; B1 + C2 transform-only fast path shipped; B2/B3 + C1/C3 next). Feature work paused.
 
 This document is the authoritative plan for eliminating systemic "rebuild
 everything every tick" patterns from rkp-engine and rkp-render. It was
@@ -136,7 +136,7 @@ metric moved.
 | Step | Change | Result |
 |---|---|---|
 | **C1** | `painted_per_entity` maintained via paint/sculpt event handlers; no octree walk in steady state. Walk retained for asset load. | -150 ms/stamp painted_walk |
-| **C2** | `update_scene_gpu_entity(entity)` — per-row rebuild. Used by Phase B's dirty-set iteration. | O(1) per change |
+| **C2 ✅ (transform fast path)** | `update_scene_gpu_transform_only` patches just `RkpGpuInstance.world` (and matching `SplatDraw.world` / `ProxyDraw.world`) for each Transform-dirty entity. Lifecycle gates on `gpu_objects_dirty.is_transform_only()`: gizmo/drag stamps now run the fast path; sculpt/paint/proc-bake/scene-load still go through the full rebuild. New `DirtyKind` enum (`Transform`/`Structural`) on `GpuObjectsDirty` with `mark_entity_transform` / `mark_entity` / `mark_entity_kind`. | -60+ ms per gizmo-drag stamp on splat5 elephant (full rebuild → in-place row patch). Structural dirty events still pay the full rebuild — generalising that is a future follow-up. |
 | **C3** | `rebuild_collider_cache_for(entity)` — single-entity collider rebuild. | O(1) per change |
 
 ### Phase D — Universal delta GPU uploads

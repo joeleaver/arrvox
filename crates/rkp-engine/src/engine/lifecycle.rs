@@ -161,7 +161,16 @@ impl EngineState {
         // this frame's content, missing the latest paint.
         let gpu_objects_dirty_this_frame = self.gpu_objects_dirty.is_dirty();
         let phase_update_scene_gpu_t0 = std::time::Instant::now();
-        if self.gpu_objects_dirty.is_dirty() {
+        // C2 transform-only fast path. When every dirty entity is
+        // marked `Transform` (gizmo drag, drag-preview snap, future
+        // physics-driven rigid-body moves), patch matching matrices
+        // in place — saves ~60-75 ms vs. the full re-walk on
+        // elephant-scale scenes. Anything Structural or `all` falls
+        // through to the full rebuild below. PERF_DEBT.md C2.
+        if self.gpu_objects_dirty.is_transform_only() {
+            self.update_scene_gpu_transform_only();
+            self.gpu_objects_dirty.clear();
+        } else if self.gpu_objects_dirty.is_dirty() {
             let profile = self.paint_profile_active();
             let t0 = std::time::Instant::now();
             self.update_scene_gpu();

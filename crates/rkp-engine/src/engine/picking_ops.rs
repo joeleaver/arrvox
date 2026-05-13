@@ -177,9 +177,11 @@ impl EngineState {
                             {
                                 t.position = glam::Vec3::new(p.x, p.y - aabb_min_y, p.z);
                             }
-                            // PERF_DEBT B1: only the dragged entity's
-                            // transform changed.
-                            self.gpu_objects_dirty.mark_entity(entity);
+                            // PERF_DEBT B1+C2: only the dragged
+                            // entity's transform changed — fast path
+                            // in `update_scene_gpu` patches the
+                            // matrix in place.
+                            self.gpu_objects_dirty.mark_entity_transform(entity);
                         }
                         DragPreviewKind::Generator { .. } => {
                             // Gizmo-only — `last_surface_pos` is the
