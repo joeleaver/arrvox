@@ -70,9 +70,14 @@ pub const RKP_MAGIC: [u8; 4] = [b'R', b'K', b'P', 0x01];
 
 /// Current format version.
 ///
-/// v5 (current): adds pre-built mesh + cluster DAG sections. v4 files
-/// fail to load — re-import to migrate.
-pub const RKP_VERSION: u32 = 5;
+/// v6 (current): adds three baked DAG topology sections
+/// (`dag_groups`, `dag_consumed`, `dag_produced`) that mirror
+/// [`rkp_core::mesh_lod::ClusterDag`]. Lets sculpt's per-chain
+/// LOD-0 clamp walk the bipartite cluster ↔ group graph without
+/// rebuilding the DAG at load. v5 and v4 still load — the load
+/// path leaves the new sections empty for v5 and falls through to
+/// the in-process `build_cluster_dag` rebuild for v4.
+pub const RKP_VERSION: u32 = 6;
 
 /// Flags for optional sections.
 pub const FLAG_HAS_COLOR: u32 = 1 << 0;
@@ -129,6 +134,15 @@ pub struct RkpHeader {
     /// indices). Lets the renderer access just the LOD-0 portion
     /// without walking the cluster table. v5+. 0 if absent.
     pub mesh_lod0_index_count: u32,
+    /// Compressed size of DAG groups section. v6+. 0 if absent. Sized
+    /// `dag_groups.len() * size_of::<DagGroup>()` (16 B each).
+    pub dag_groups_compressed_size: u32,
+    /// Compressed size of DAG consumed-cluster-IDs section. v6+. 0 if
+    /// absent. Sized `dag_consumed.len() * 4` (one u32 per entry).
+    pub dag_consumed_compressed_size: u32,
+    /// Compressed size of DAG produced-cluster-IDs section. v6+. 0 if
+    /// absent. Sized `dag_produced.len() * 4` (one u32 per entry).
+    pub dag_produced_compressed_size: u32,
 }
 
 /// Per-write skin-meta input. Fed into [`write_rkp_with_progress`]'s
@@ -262,21 +276,26 @@ pub mod write_stage {
     pub const COMPRESS_MESH_VERTICES: &str = "compress_mesh_vertices";
     pub const COMPRESS_MESH_INDICES: &str = "compress_mesh_indices";
     pub const COMPRESS_MESHLET_CLUSTERS: &str = "compress_meshlet_clusters";
+    pub const COMPRESS_DAG_GROUPS: &str = "compress_dag_groups";
+    pub const COMPRESS_DAG_CONSUMED: &str = "compress_dag_consumed";
+    pub const COMPRESS_DAG_PRODUCED: &str = "compress_dag_produced";
     pub const WRITE_FILE: &str = "write_file";
 }
 
 
 /// Header size for the v4 layout (128 B). v5 added 16 trailing
-/// bytes (3 mesh-section sizes + lod0_index_count). Reader detects
-/// version after the first 8 bytes (magic + version) and reads the
-/// rest accordingly so existing v4 files keep loading while we
-/// migrate to v5.
+/// bytes (3 mesh-section sizes + lod0_index_count). v6 added another
+/// 12 bytes (3 DAG-section sizes). Reader detects version after the
+/// first 8 bytes (magic + version) and reads the rest accordingly so
+/// existing v4/v5 files keep loading.
 const V4_HEADER_SIZE: usize = 128;
-const V5_HEADER_SIZE: usize = std::mem::size_of::<RkpHeader>();
+const V5_HEADER_SIZE: usize = 144;
+const V6_HEADER_SIZE: usize = std::mem::size_of::<RkpHeader>();
 
-/// Read a .rkp file header. Accepts v4 (128 B) and v5 (144 B); the
-/// v4 path zero-fills the new mesh-section fields so the renderer's
-/// fallback (build DAG at load) kicks in. Rejects any other version.
+/// Read a .rkp file header. Accepts v4 (128 B), v5 (144 B), and v6
+/// (156 B); older paths zero-fill the missing fields so the
+/// renderer's fallbacks (build DAG at load for v4; empty DAG groups
+/// → asset-wide LOD-0 clamp for v5) kick in.
 pub fn read_rkp_header<R: Read>(reader: &mut R) -> Result<RkpHeader, RkpFileError> {
     // Peek magic + version first.
     let mut prefix = [0u8; 8];
@@ -290,16 +309,18 @@ pub fn read_rkp_header<R: Read>(reader: &mut R) -> Result<RkpHeader, RkpFileErro
     let body_len = match version {
         4 => V4_HEADER_SIZE - 8,
         5 => V5_HEADER_SIZE - 8,
+        6 => V6_HEADER_SIZE - 8,
         v => return Err(RkpFileError::UnsupportedVersion(v)),
     };
     let mut body = vec![0u8; body_len];
     reader.read_exact(&mut body)?;
 
-    // Reassemble into a fixed-size v5 buffer; v4's tail is zeroed,
-    // which leaves `mesh_*_compressed_size` and `mesh_lod0_index_count`
-    // at zero. The mesh-section readers short-circuit on size == 0
-    // and the renderer falls back to in-process DAG build.
-    let mut buf = [0u8; V5_HEADER_SIZE];
+    // Reassemble into a fixed-size v6 buffer; older versions' tails
+    // are zeroed, which leaves the corresponding section-size fields
+    // at zero. The mesh-section readers short-circuit on size == 0,
+    // and the renderer falls back to in-process DAG build (v4) or
+    // empty DAG groups → asset-wide marking (v5).
+    let mut buf = [0u8; V6_HEADER_SIZE];
     buf[..8].copy_from_slice(&prefix);
     buf[8..8 + body_len].copy_from_slice(&body);
     let header: RkpHeader = *bytemuck::from_bytes(&buf);
@@ -433,6 +454,54 @@ pub fn read_rkp_meshlet_clusters<R: Read>(
         return Ok(Vec::new());
     }
     let mut compressed = vec![0u8; header.meshlet_clusters_compressed_size as usize];
+    reader.read_exact(&mut compressed)?;
+    lz4_flex::decompress_size_prepended(&compressed)
+        .map_err(|e| RkpFileError::Decompress(e.to_string()))
+}
+
+/// Read + decompress the DAG-groups section (v6+). Bytes are
+/// `bytemuck`-castable to `DagGroup` (16 B each). Empty vec when the
+/// file is v5 or earlier.
+pub fn read_rkp_dag_groups<R: Read>(
+    reader: &mut R,
+    header: &RkpHeader,
+) -> Result<Vec<u8>, RkpFileError> {
+    if header.dag_groups_compressed_size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut compressed = vec![0u8; header.dag_groups_compressed_size as usize];
+    reader.read_exact(&mut compressed)?;
+    lz4_flex::decompress_size_prepended(&compressed)
+        .map_err(|e| RkpFileError::Decompress(e.to_string()))
+}
+
+/// Read + decompress the DAG consumed-cluster-IDs section (v6+).
+/// `bytemuck`-castable to `&[u32]`. Empty when the file is v5 or
+/// earlier.
+pub fn read_rkp_dag_consumed<R: Read>(
+    reader: &mut R,
+    header: &RkpHeader,
+) -> Result<Vec<u8>, RkpFileError> {
+    if header.dag_consumed_compressed_size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut compressed = vec![0u8; header.dag_consumed_compressed_size as usize];
+    reader.read_exact(&mut compressed)?;
+    lz4_flex::decompress_size_prepended(&compressed)
+        .map_err(|e| RkpFileError::Decompress(e.to_string()))
+}
+
+/// Read + decompress the DAG produced-cluster-IDs section (v6+).
+/// `bytemuck`-castable to `&[u32]`. Empty when the file is v5 or
+/// earlier.
+pub fn read_rkp_dag_produced<R: Read>(
+    reader: &mut R,
+    header: &RkpHeader,
+) -> Result<Vec<u8>, RkpFileError> {
+    if header.dag_produced_compressed_size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut compressed = vec![0u8; header.dag_produced_compressed_size as usize];
     reader.read_exact(&mut compressed)?;
     lz4_flex::decompress_size_prepended(&compressed)
         .map_err(|e| RkpFileError::Decompress(e.to_string()))

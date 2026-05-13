@@ -19,7 +19,7 @@
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
-use rkp_core::mesh_cluster::{MeshletCluster, PARENT_GROUP_ERROR_ROOT};
+use rkp_core::mesh_cluster::{DAG_GROUP_NONE, MeshletCluster, PARENT_GROUP_ERROR_ROOT};
 use rkp_core::mesh_extract::ProxyVertex;
 use rkp_procedural::flatten::ProcInstruction;
 
@@ -68,7 +68,9 @@ impl SurfaceMesh {
             flags: 0,
             cluster_error: 0.0,
             parent_group_error: PARENT_GROUP_ERROR_ROOT,
-            _pad3: [0; 3],
+            group_above_idx: DAG_GROUP_NONE,
+            group_below_idx: DAG_GROUP_NONE,
+            _pad3: 0,
         }
     }
 }

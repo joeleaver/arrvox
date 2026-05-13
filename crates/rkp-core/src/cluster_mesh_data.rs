@@ -162,7 +162,7 @@ pub fn flatten_cluster_meshes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mesh_cluster::{cluster_mesh, MeshletCluster, PARENT_GROUP_ERROR_ROOT};
+    use crate::mesh_cluster::{cluster_mesh, DAG_GROUP_NONE, MeshletCluster, PARENT_GROUP_ERROR_ROOT};
 
     fn vert(p: [f32; 3]) -> MeshVertex {
         MeshVertex {
@@ -328,7 +328,9 @@ mod tests {
             flags: 0,
             cluster_error: 0.0,
             parent_group_error: PARENT_GROUP_ERROR_ROOT,
-            _pad3: [0; 3],
+            group_above_idx: DAG_GROUP_NONE,
+            group_below_idx: DAG_GROUP_NONE,
+            _pad3: 0,
         };
         let cms = split_flat_into_cluster_meshes(&[], &[], &[c]);
         assert_eq!(cms.len(), 1);
@@ -367,12 +369,16 @@ mod tests {
             MeshletCluster {
                 aabb_min: [0.0; 3], _pad0: 0.0, aabb_max: [0.0; 3],
                 index_offset: 0, index_count: 0, lod_level: 0, flags: 0,
-                cluster_error: 0.0, parent_group_error: 0.0, _pad3: [0; 3],
+                cluster_error: 0.0, parent_group_error: 0.0,
+                group_above_idx: DAG_GROUP_NONE, group_below_idx: DAG_GROUP_NONE,
+                _pad3: 0,
             },
             MeshletCluster {
                 aabb_min: [0.0; 3], _pad0: 0.0, aabb_max: [0.0; 3],
                 index_offset: 0, index_count: 0, lod_level: 0, flags: 0,
-                cluster_error: 0.0, parent_group_error: 0.0, _pad3: [0; 3],
+                cluster_error: 0.0, parent_group_error: 0.0,
+                group_above_idx: DAG_GROUP_NONE, group_below_idx: DAG_GROUP_NONE,
+                _pad3: 0,
             },
         ];
         let (flat_v, flat_i) = flatten_cluster_meshes(&[a, b], &mut clusters);

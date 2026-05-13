@@ -117,8 +117,24 @@ pub struct MeshletCluster {
     /// `cluster_error_proj < pixel_threshold` — guarantees exactly
     /// one cluster picked per chain (Karis '21 SIGGRAPH).         (48..52)
     pub parent_group_error: f32,
-    /// Trailing pad to a 64-byte stride.                          (52..64)
-    pub _pad3: [u32; 3],
+    /// DAG topology: index of the [`DagGroup`] this cluster was
+    /// consumed by at the next-coarser LOD (i.e., this cluster is in
+    /// `group.consumed[...]`). Sentinel `u32::MAX` means "no parent
+    /// group" — the cluster is a DAG root at the coarsest level OR a
+    /// post-bake patch cluster appended by sculpt.
+    ///
+    /// Used by sculpt's per-chain LOD-0 clamp: brush-touched LOD-0
+    /// leaves seed a CC walk over the DAG via this pointer to mark
+    /// every cluster in their chain as `LOD_DIRTY`.                (52..56)
+    pub group_above_idx: u32,
+    /// DAG topology: index of the [`DagGroup`] this cluster was
+    /// produced by at its own LOD step (i.e., this cluster is in
+    /// `group.produced[...]`). Sentinel `u32::MAX` means "no group
+    /// below" — LOD-0 leaves are produced directly by `cluster_mesh`,
+    /// not by group simplification.                                (56..60)
+    pub group_below_idx: u32,
+    /// Trailing pad to a 64-byte stride.                          (60..64)
+    pub _pad3: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<MeshletCluster>() == 64);
@@ -135,8 +151,17 @@ const _: () = {
     assert!(offset_of!(MeshletCluster, flags) == 40);
     assert!(offset_of!(MeshletCluster, cluster_error) == 44);
     assert!(offset_of!(MeshletCluster, parent_group_error) == 48);
-    assert!(offset_of!(MeshletCluster, _pad3) == 52);
+    assert!(offset_of!(MeshletCluster, group_above_idx) == 52);
+    assert!(offset_of!(MeshletCluster, group_below_idx) == 56);
+    assert!(offset_of!(MeshletCluster, _pad3) == 60);
 };
+
+/// Sentinel value for [`MeshletCluster::group_above_idx`] /
+/// [`MeshletCluster::group_below_idx`]: "no group on this side". DAG
+/// roots have `group_above_idx == DAG_GROUP_NONE`; LOD-0 leaves have
+/// `group_below_idx == DAG_GROUP_NONE`; post-bake patch clusters
+/// appended by sculpt have both set to `DAG_GROUP_NONE`.
+pub const DAG_GROUP_NONE: u32 = u32::MAX;
 
 /// Partition a mesh into meshlet clusters with per-cluster AABBs.
 ///
@@ -225,7 +250,9 @@ pub fn cluster_mesh(
             flags: 0,
             cluster_error: 0.0,
             parent_group_error: PARENT_GROUP_ERROR_ROOT,
-            _pad3: [0; 3],
+            group_above_idx: DAG_GROUP_NONE,
+            group_below_idx: DAG_GROUP_NONE,
+            _pad3: 0,
         });
     }
 
@@ -686,7 +713,9 @@ mod tests {
             flags: 0,
             cluster_error: 0.0,
             parent_group_error: 0.0,
-            _pad3: [0; 3],
+            group_above_idx: DAG_GROUP_NONE,
+            group_below_idx: DAG_GROUP_NONE,
+            _pad3: 0,
         };
         let (gmin, gmax) = cluster_grid_aabb(&c, Vec3::ZERO, 1.0);
         assert_eq!(gmin, IVec3::new(-1, -1, -1), "floor(0.x) - 1");
@@ -706,7 +735,9 @@ mod tests {
             flags: 0,
             cluster_error: 0.0,
             parent_group_error: 0.0,
-            _pad3: [0; 3],
+            group_above_idx: DAG_GROUP_NONE,
+            group_below_idx: DAG_GROUP_NONE,
+            _pad3: 0,
         };
         // grid_origin = (2, 2, 2), base_vs = 0.5
         // local 4.0 → grid (4-2)/0.5 = 4.0 → floor-1 = 3

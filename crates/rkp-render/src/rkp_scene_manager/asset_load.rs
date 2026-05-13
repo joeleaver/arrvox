@@ -265,6 +265,21 @@ impl RkpSceneManager {
             &mut reader, &header,
         )
         .map_err(|e| format!("read meshlet clusters: {e}"))?;
+        // v6+ DAG topology sections. Empty for v4 (legacy fallback
+        // rebuilds DAG below) and v5 (no DAG metadata baked; sculpt
+        // falls back to asset-wide marking).
+        let dag_groups_bytes = rkp_core::asset_file::read_rkp_dag_groups(
+            &mut reader, &header,
+        )
+        .map_err(|e| format!("read dag groups: {e}"))?;
+        let dag_consumed_bytes = rkp_core::asset_file::read_rkp_dag_consumed(
+            &mut reader, &header,
+        )
+        .map_err(|e| format!("read dag consumed: {e}"))?;
+        let dag_produced_bytes = rkp_core::asset_file::read_rkp_dag_produced(
+            &mut reader, &header,
+        )
+        .map_err(|e| format!("read dag produced: {e}"))?;
         let mesh_lod0_index_count_from_file = header.mesh_lod0_index_count;
 
         let bytes_per_voxel = std::mem::size_of::<VoxelSample>();
@@ -466,51 +481,85 @@ impl RkpSceneManager {
         // scene-merged tree as before.
         use rkp_core::mesh_extract::MeshVertex;
         use rkp_core::mesh_cluster::{MeshletCluster, PARENT_GROUP_ERROR_ROOT};
+        use rkp_core::mesh_lod::DagGroup;
         let have_baked_mesh = !mesh_vertices_bytes.is_empty();
-        let (mut mesh_vertices, mesh_indices, mut meshlet_clusters, mesh_lod0_index_count) =
-            if have_baked_mesh {
-                let v: Vec<MeshVertex> =
-                    bytemuck::cast_slice::<u8, MeshVertex>(&mesh_vertices_bytes).to_vec();
-                let i: Vec<u32> =
-                    bytemuck::cast_slice::<u8, u32>(&mesh_indices_bytes).to_vec();
-                let c: Vec<MeshletCluster> =
-                    bytemuck::cast_slice::<u8, MeshletCluster>(&meshlet_clusters_bytes)
-                        .to_vec();
-                (v, i, c, mesh_lod0_index_count_from_file)
-            } else {
-                // Legacy v4 fallback — extract + build at load time
-                // exactly like the pre-v5 path. Logged so a slow load
-                // is attributable to a stale .rkp instead of looking
-                // like a perf regression.
+        let (
+            mut mesh_vertices,
+            mesh_indices,
+            mut meshlet_clusters,
+            mesh_lod0_index_count,
+            dag_groups,
+            dag_consumed,
+            dag_produced,
+        ) = if have_baked_mesh {
+            let v: Vec<MeshVertex> =
+                bytemuck::cast_slice::<u8, MeshVertex>(&mesh_vertices_bytes).to_vec();
+            let i: Vec<u32> =
+                bytemuck::cast_slice::<u8, u32>(&mesh_indices_bytes).to_vec();
+            let c: Vec<MeshletCluster> =
+                bytemuck::cast_slice::<u8, MeshletCluster>(&meshlet_clusters_bytes)
+                    .to_vec();
+            // v6 DAG sections — empty for v5, present + non-empty for
+            // v6 + any DAG that grew past LOD-0. Empty triplet keeps
+            // sculpt's CC walk on the asset-wide fallback path.
+            let dg: Vec<DagGroup> =
+                bytemuck::cast_slice::<u8, DagGroup>(&dag_groups_bytes).to_vec();
+            let dc: Vec<u32> =
+                bytemuck::cast_slice::<u8, u32>(&dag_consumed_bytes).to_vec();
+            let dp: Vec<u32> =
+                bytemuck::cast_slice::<u8, u32>(&dag_produced_bytes).to_vec();
+            if !dg.is_empty() {
                 eprintln!(
-                    "[RkpSceneManager] {}: v4 .rkp without baked mesh sections — extracting + building DAG at load (re-import to avoid this)",
+                    "[RkpSceneManager] {}: v6 DAG topology loaded ({} groups, {} consumed, {} produced)",
                     rkp_path.display(),
+                    dg.len(),
+                    dc.len(),
+                    dp.len(),
                 );
-                let (v, i_unc) = extract_surface_mesh(
-                    tree.as_slice(),
-                    header.octree_depth as u8,
-                    header.base_voxel_size,
-                    asset_grid_origin,
-                    self.brick_pool.as_slice(),
-                    self.leaf_attr_pool.as_slice(),
-                    // Fallback path runs against scene-merged pools, so
-                    // by the time we get here the bone slice has been
-                    // populated via `set_bone(slot, bv)` above. Skinned
-                    // v4 assets get their bone weights baked into the
-                    // newly extracted vertices on the spot.
-                    self.leaf_attr_pool.bones_as_slice(),
-                );
-                let dag_t0 = std::time::Instant::now();
-                let dag = crate::mesh_pass::build_cluster_dag(&v, &i_unc);
-                eprintln!(
-                    "[RkpSceneManager] {}: legacy DAG built in {:.2}s ({} clusters)",
-                    rkp_path.display(),
-                    dag_t0.elapsed().as_secs_f32(),
-                    dag.clusters.len(),
-                );
-                let lod0 = dag.lod0_index_range.1 - dag.lod0_index_range.0;
-                (v, dag.indices, dag.clusters, lod0)
-            };
+            }
+            (v, i, c, mesh_lod0_index_count_from_file, dg, dc, dp)
+        } else {
+            // Legacy v4 fallback — extract + build at load time
+            // exactly like the pre-v5 path. Logged so a slow load
+            // is attributable to a stale .rkp instead of looking
+            // like a perf regression.
+            eprintln!(
+                "[RkpSceneManager] {}: v4 .rkp without baked mesh sections — extracting + building DAG at load (re-import to avoid this)",
+                rkp_path.display(),
+            );
+            let (v, i_unc) = extract_surface_mesh(
+                tree.as_slice(),
+                header.octree_depth as u8,
+                header.base_voxel_size,
+                asset_grid_origin,
+                self.brick_pool.as_slice(),
+                self.leaf_attr_pool.as_slice(),
+                // Fallback path runs against scene-merged pools, so
+                // by the time we get here the bone slice has been
+                // populated via `set_bone(slot, bv)` above. Skinned
+                // v4 assets get their bone weights baked into the
+                // newly extracted vertices on the spot.
+                self.leaf_attr_pool.bones_as_slice(),
+            );
+            let dag_t0 = std::time::Instant::now();
+            let dag = crate::mesh_pass::build_cluster_dag(&v, &i_unc);
+            eprintln!(
+                "[RkpSceneManager] {}: legacy DAG built in {:.2}s ({} clusters)",
+                rkp_path.display(),
+                dag_t0.elapsed().as_secs_f32(),
+                dag.clusters.len(),
+            );
+            let lod0 = dag.lod0_index_range.1 - dag.lod0_index_range.0;
+            (
+                v,
+                dag.indices,
+                dag.clusters,
+                lod0,
+                dag.dag_groups,
+                dag.dag_consumed,
+                dag.dag_produced,
+            )
+        };
 
         // Per-LOD-level error normalization. The Karis admit rule's
         // chain consistency requires `cluster_error` of a level-N
@@ -715,6 +764,9 @@ impl RkpSceneManager {
             mesh_indices,
             mesh_lod0_index_count,
             meshlet_clusters,
+            dag_groups,
+            dag_consumed,
+            dag_produced,
             cpu_octree: tree,
             mesh_dirty: true,
             splats_dirty: true,

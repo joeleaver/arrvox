@@ -34,8 +34,55 @@ use meshopt::{
 };
 use rayon::prelude::*;
 
-use crate::mesh_cluster::{cluster_mesh, MeshletCluster, PARENT_GROUP_ERROR_ROOT};
+use crate::mesh_cluster::{
+    cluster_mesh, DAG_GROUP_NONE, MeshletCluster, PARENT_GROUP_ERROR_ROOT,
+};
 use crate::mesh_extract::MeshVertex;
+
+/// One DAG group: the unit of simplification at a LOD step. A group
+/// consumes a set of prev-level (level L) clusters and produces a set
+/// of this-level (level L+1) clusters whose merged triangle set
+/// approximates the consumed clusters' geometry.
+///
+/// Stored as `(first, count)` index pairs into the flat `dag_consumed`
+/// and `dag_produced` vectors on [`ClusterDag`]. Each cluster's
+/// `group_above_idx` points to the group that consumed it (if any),
+/// and `group_below_idx` points to the group that produced it (if
+/// any). The pair lets sculpt's per-chain LOD-0 clamp walk the DAG
+/// bipartite cluster ↔ group graph and mark every cluster in a
+/// brush-touched chain.
+///
+/// 16 B; std430-friendly (no padding) for future GPU mirroring.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DagGroup {
+    /// First index into [`ClusterDag::dag_consumed`] of this group's
+    /// prev-level (consumed) cluster IDs.
+    pub consumed_first: u32,
+    /// Number of consumed prev-level cluster IDs.
+    pub consumed_count: u32,
+    /// First index into [`ClusterDag::dag_produced`] of this group's
+    /// this-level (produced) cluster IDs.
+    pub produced_first: u32,
+    /// Number of produced this-level cluster IDs.
+    pub produced_count: u32,
+}
+
+impl DagGroup {
+    /// Slice of consumed cluster IDs in `dag_consumed`.
+    pub fn consumed<'a>(&self, dag_consumed: &'a [u32]) -> &'a [u32] {
+        let lo = self.consumed_first as usize;
+        let hi = lo + self.consumed_count as usize;
+        &dag_consumed[lo..hi]
+    }
+
+    /// Slice of produced cluster IDs in `dag_produced`.
+    pub fn produced<'a>(&self, dag_produced: &'a [u32]) -> &'a [u32] {
+        let lo = self.produced_first as usize;
+        let hi = lo + self.produced_count as usize;
+        &dag_produced[lo..hi]
+    }
+}
 
 /// Number of LOD levels the DAG attempts to build (LOD 0 is the
 /// finest; LOD `LOD_LEVELS - 1` is the coarsest the DAG converges
@@ -108,6 +155,17 @@ pub struct ClusterDag {
     pub lod0_cluster_range: (u32, u32),
     /// Index range `(start, end)` of LOD-0 indices in `indices`.
     pub lod0_index_range: (u32, u32),
+    /// One entry per simplification group across all LOD steps.
+    /// Empty for LOD-0-only builds (no simplification ran).
+    pub dag_groups: Vec<DagGroup>,
+    /// Flat per-group consumed (prev-level) cluster IDs. Each
+    /// `DagGroup` indexes a contiguous slice via
+    /// `consumed_first..consumed_first+consumed_count`.
+    pub dag_consumed: Vec<u32>,
+    /// Flat per-group produced (this-level) cluster IDs. Each
+    /// `DagGroup` indexes a contiguous slice via
+    /// `produced_first..produced_first+produced_count`.
+    pub dag_produced: Vec<u32>,
 }
 
 impl ClusterDag {
@@ -117,6 +175,9 @@ impl ClusterDag {
             indices: Vec::new(),
             lod0_cluster_range: (0, 0),
             lod0_index_range: (0, 0),
+            dag_groups: Vec::new(),
+            dag_consumed: Vec::new(),
+            dag_produced: Vec::new(),
         }
     }
 }
@@ -146,6 +207,9 @@ pub fn build_cluster_dag_with_levels(
 
     let mut all_clusters: Vec<MeshletCluster> = Vec::new();
     let mut all_indices: Vec<u32> = Vec::new();
+    let mut dag_groups: Vec<DagGroup> = Vec::new();
+    let mut dag_consumed: Vec<u32> = Vec::new();
+    let mut dag_produced: Vec<u32> = Vec::new();
 
     // LOD 0 — cluster the original mesh.
     let (lod0_clusters, lod0_indices) = cluster_mesh(vertices, indices);
@@ -241,18 +305,47 @@ pub fn build_cluster_dag_with_levels(
             consumed_prev += result.consumed_global_ids.len();
             new_cluster_errors.extend(result.sub_clusters.iter().map(|c| c.cluster_error));
 
+            // Materialize a DagGroup entry recording this group's
+            // consumed (prev-level) and produced (this-level) cluster
+            // IDs. Sculpt's per-chain LOD-0 clamp walks the bipartite
+            // cluster ↔ group graph through these entries to mark
+            // every cluster in a brush-touched chain as dirty.
+            let group_idx = dag_groups.len() as u32;
+            let consumed_first = dag_consumed.len() as u32;
+            for &gi in &result.consumed_global_ids {
+                dag_consumed.push(gi as u32);
+            }
+            let consumed_count = dag_consumed.len() as u32 - consumed_first;
+
             let sub_index_base = all_indices.len() as u32;
             all_indices.extend(result.sub_indices);
+            let produced_first = dag_produced.len() as u32;
             for mut sc in result.sub_clusters {
                 sc.index_offset += sub_index_base;
+                // This produced cluster is in `dag_produced[produced_first..]`.
+                sc.group_below_idx = group_idx;
+                let new_cluster_id = all_clusters.len() as u32;
+                dag_produced.push(new_cluster_id);
                 all_clusters.push(sc);
             }
-            // Backfill parent_group_error on prev-level clusters
-            // that this group consumed — they're no longer DAG
-            // leaves, so the LOD-selection rule needs to know what
-            // error the next coarser level introduced.
+            let produced_count = dag_produced.len() as u32 - produced_first;
+
+            dag_groups.push(DagGroup {
+                consumed_first,
+                consumed_count,
+                produced_first,
+                produced_count,
+            });
+
+            // Backfill parent_group_error AND group_above_idx on
+            // prev-level clusters that this group consumed — they're
+            // no longer DAG leaves, so the LOD-selection rule needs
+            // to know what error the next coarser level introduced,
+            // and sculpt's CC walk needs to know which group consumed
+            // them.
             for gi in result.consumed_global_ids {
                 all_clusters[gi].parent_group_error = result.group_error;
+                all_clusters[gi].group_above_idx = group_idx;
             }
         }
 
@@ -293,6 +386,9 @@ pub fn build_cluster_dag_with_levels(
         indices: all_indices,
         lod0_cluster_range,
         lod0_index_range,
+        dag_groups,
+        dag_consumed,
+        dag_produced,
     }
 }
 
@@ -705,20 +801,26 @@ mod tests {
             .map(|c| {
                 // Mask the LOD-fields the DAG sets (cluster_error
                 // and parent_group_error stay at sentinels for
-                // LOD-0 leaves; lod_level is 0).
+                // LOD-0 leaves; lod_level is 0). Also mask the new
+                // DAG topology pointer — Phase 5 leaves it as
+                // DAG_GROUP_NONE; DAG backfills it when a group
+                // consumes the cluster.
                 MeshletCluster {
                     parent_group_error: f32::INFINITY,
+                    group_above_idx: DAG_GROUP_NONE,
                     ..*c
                 }
             })
             .collect();
         // The DAG's LOD-0 entries differ from Phase 5's only in
         // `parent_group_error` (Phase 5 sets ∞; DAG may backfill
-        // when a group consumes them). Strip that for comparison.
+        // when a group consumes them) and `group_above_idx`
+        // (DAG_GROUP_NONE → group index). Strip both for comparison.
         let phase5_normalized: Vec<MeshletCluster> = phase5_clusters
             .iter()
             .map(|c| MeshletCluster {
                 parent_group_error: f32::INFINITY,
+                group_above_idx: DAG_GROUP_NONE,
                 ..*c
             })
             .collect();
@@ -865,6 +967,172 @@ mod tests {
         assert_eq!(a.indices, b.indices);
         assert_eq!(a.lod0_cluster_range, b.lod0_cluster_range);
         assert_eq!(a.lod0_index_range, b.lod0_index_range);
+        assert_eq!(a.dag_groups, b.dag_groups);
+        assert_eq!(a.dag_consumed, b.dag_consumed);
+        assert_eq!(a.dag_produced, b.dag_produced);
+    }
+
+    #[test]
+    fn dag_topology_pointers_are_consistent_with_group_spans() {
+        // For every cluster:
+        //   - group_above_idx == NONE  XOR  the cluster appears in
+        //     dag_groups[group_above_idx].consumed[].
+        //   - group_below_idx == NONE  XOR  the cluster appears in
+        //     dag_groups[group_below_idx].produced[].
+        // And the inverse: every consumed/produced entry's cluster has
+        // its group_above/below pointing back at the group.
+        //
+        // This is the load-bearing invariant for sculpt's CC walk —
+        // if either direction breaks, the walk misses chains and
+        // cluster-shaped voids reappear.
+        let (v, i) = grid_mesh(17);
+        let dag = build_cluster_dag_with_levels(&v, &i, 4);
+
+        // Forward: cluster → group_above → consumed must contain cluster.
+        for (cidx, c) in dag.clusters.iter().enumerate() {
+            if c.group_above_idx == DAG_GROUP_NONE {
+                continue;
+            }
+            let g = &dag.dag_groups[c.group_above_idx as usize];
+            let consumed = g.consumed(&dag.dag_consumed);
+            assert!(
+                consumed.contains(&(cidx as u32)),
+                "cluster {} points to group_above={} but group.consumed does not contain it",
+                cidx,
+                c.group_above_idx
+            );
+        }
+        // Forward: cluster → group_below → produced must contain cluster.
+        for (cidx, c) in dag.clusters.iter().enumerate() {
+            if c.group_below_idx == DAG_GROUP_NONE {
+                continue;
+            }
+            let g = &dag.dag_groups[c.group_below_idx as usize];
+            let produced = g.produced(&dag.dag_produced);
+            assert!(
+                produced.contains(&(cidx as u32)),
+                "cluster {} points to group_below={} but group.produced does not contain it",
+                cidx,
+                c.group_below_idx
+            );
+        }
+        // Inverse: every entry in dag_consumed has the matching cluster
+        // pointing back to its group via group_above_idx.
+        for (g_idx, g) in dag.dag_groups.iter().enumerate() {
+            for &cidx in g.consumed(&dag.dag_consumed) {
+                assert_eq!(
+                    dag.clusters[cidx as usize].group_above_idx,
+                    g_idx as u32,
+                    "group {} consumes cluster {} but cluster.group_above_idx is {}",
+                    g_idx,
+                    cidx,
+                    dag.clusters[cidx as usize].group_above_idx
+                );
+            }
+            for &cidx in g.produced(&dag.dag_produced) {
+                assert_eq!(
+                    dag.clusters[cidx as usize].group_below_idx,
+                    g_idx as u32,
+                    "group {} produces cluster {} but cluster.group_below_idx is {}",
+                    g_idx,
+                    cidx,
+                    dag.clusters[cidx as usize].group_below_idx
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dag_lod0_clusters_have_no_group_below() {
+        // LOD-0 clusters are produced directly by `cluster_mesh`, not
+        // by group simplification — their `group_below_idx` must stay
+        // at the sentinel.
+        let (v, i) = grid_mesh(17);
+        let dag = build_cluster_dag_with_levels(&v, &i, 4);
+        for c in &dag.clusters[..dag.lod0_cluster_range.1 as usize] {
+            assert_eq!(c.group_below_idx, DAG_GROUP_NONE);
+        }
+    }
+
+    #[test]
+    fn dag_root_clusters_have_no_group_above() {
+        // Clusters with `parent_group_error == ∞` are DAG roots — no
+        // higher level consumed them, so their `group_above_idx` must
+        // be the sentinel.
+        let (v, i) = grid_mesh(17);
+        let dag = build_cluster_dag_with_levels(&v, &i, 4);
+        for c in &dag.clusters {
+            if c.parent_group_error.is_infinite() {
+                assert_eq!(
+                    c.group_above_idx, DAG_GROUP_NONE,
+                    "DAG root has parent_group_error=∞ but group_above_idx={}",
+                    c.group_above_idx
+                );
+            } else {
+                assert_ne!(
+                    c.group_above_idx, DAG_GROUP_NONE,
+                    "consumed cluster has finite parent_group_error but group_above_idx=NONE"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dag_cc_walk_marks_full_chain_from_lod0_seed() {
+        // Mimic sculpt's CC walk: pick one LOD-0 cluster that was
+        // consumed (has finite parent_group_error), BFS via
+        // group_above/group_below + group's consumed/produced lists,
+        // and verify the walk reaches at least one LOD>0 cluster
+        // (otherwise asset-wide marking was the wrong choice).
+        use std::collections::VecDeque;
+        let (v, i) = grid_mesh(17);
+        let dag = build_cluster_dag_with_levels(&v, &i, 4);
+
+        let seed_idx = dag.clusters[..dag.lod0_cluster_range.1 as usize]
+            .iter()
+            .position(|c| c.group_above_idx != DAG_GROUP_NONE)
+            .expect("at least one LOD-0 cluster should have been consumed");
+
+        let mut visited = vec![false; dag.clusters.len()];
+        let mut queue = VecDeque::new();
+        visited[seed_idx] = true;
+        queue.push_back(seed_idx as u32);
+
+        while let Some(cidx) = queue.pop_front() {
+            let c = &dag.clusters[cidx as usize];
+            // Walk up: enqueue all clusters in the same parent group
+            // (siblings + parents).
+            if c.group_above_idx != DAG_GROUP_NONE {
+                let g = &dag.dag_groups[c.group_above_idx as usize];
+                for &nbr in g.consumed(&dag.dag_consumed).iter().chain(g.produced(&dag.dag_produced)) {
+                    if !visited[nbr as usize] {
+                        visited[nbr as usize] = true;
+                        queue.push_back(nbr);
+                    }
+                }
+            }
+            // Walk down: enqueue all clusters in the group I was a
+            // produced parent of (my children + sibling parents).
+            if c.group_below_idx != DAG_GROUP_NONE {
+                let g = &dag.dag_groups[c.group_below_idx as usize];
+                for &nbr in g.consumed(&dag.dag_consumed).iter().chain(g.produced(&dag.dag_produced)) {
+                    if !visited[nbr as usize] {
+                        visited[nbr as usize] = true;
+                        queue.push_back(nbr);
+                    }
+                }
+            }
+        }
+
+        // The walk must reach at least one LOD>0 cluster — that's the
+        // whole point of the DAG topology, and what makes the
+        // per-chain LOD-0 clamp work.
+        let reached_lod_gt_0 = (0..dag.clusters.len())
+            .any(|idx| visited[idx] && dag.clusters[idx].lod_level > 0);
+        assert!(
+            reached_lod_gt_0,
+            "CC walk from a consumed LOD-0 seed must reach at least one LOD>0 cluster"
+        );
     }
 
     #[test]

@@ -3,10 +3,13 @@ use std::io::{Cursor, Seek, SeekFrom, Write};
 
 
 #[test]
-fn header_size_is_144_bytes() {
+fn header_size_is_156_bytes() {
     // v5: grew from 128 → 144 with the addition of three mesh
     // section size slots + the lod0_index_count prefix (4 × u32).
-    assert_eq!(std::mem::size_of::<RkpHeader>(), 144);
+    // v6: 144 → 156 with three DAG-section size slots
+    // (`dag_groups_compressed_size`, `dag_consumed_compressed_size`,
+    // `dag_produced_compressed_size`).
+    assert_eq!(std::mem::size_of::<RkpHeader>(), 156);
 }
 
 #[test]

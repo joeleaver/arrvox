@@ -8,10 +8,15 @@ use super::{
     RKP_VERSION, RkpFileError, RkpHeader, SkinMetaIn, encode_skin_meta, write_stage,
 };
 
-/// Pre-built mesh + cluster DAG to ship in a v5 .rkp. All four
-/// fields populated together (or `None` for the whole struct);
+/// Pre-built mesh + cluster DAG to ship in a v5+ .rkp. The first
+/// four fields populated together (or `None` for the whole struct);
 /// partial population isn't supported — the renderer expects the
 /// triplet to be self-consistent.
+///
+/// The trailing three DAG-topology fields (`dag_groups`,
+/// `dag_consumed`, `dag_produced`) are v6+. v5 writers leave them
+/// empty; v5 readers see zero-size DAG sections and fall back to
+/// asset-wide LOD-0 marking on sculpt.
 #[derive(Debug, Clone, Copy)]
 pub struct MeshSectionsIn<'a> {
     /// `MeshVertex` bytes from `extract_surface_mesh`. 32 B per vertex.
@@ -23,6 +28,15 @@ pub struct MeshSectionsIn<'a> {
     pub clusters: &'a [u8],
     /// Length of the LOD-0 prefix in `indices` (number of u32 entries).
     pub lod0_index_count: u32,
+    /// `DagGroup` bytes from `build_cluster_dag`. 16 B each. Empty
+    /// `&[]` when the DAG converged at LOD 0 (no simplification).
+    pub dag_groups: &'a [u8],
+    /// Flat per-group consumed cluster IDs, `bytemuck`-castable from
+    /// `&[u32]`.
+    pub dag_consumed: &'a [u8],
+    /// Flat per-group produced cluster IDs, `bytemuck`-castable from
+    /// `&[u32]`.
+    pub dag_produced: &'a [u8],
 }
 
 /// Thin wrapper that delegates to [`write_rkp_with_progress`] without
@@ -131,6 +145,34 @@ pub fn write_rkp_with_progress<W: Write + Seek>(
         tick(write_stage::COMPRESS_MESHLET_CLUSTERS);
         lz4_flex::compress_prepend_size(m.clusters)
     });
+    // v6+ DAG topology sections. We always run the compression step
+    // when `mesh_sections` is present (even if the inner slice is
+    // empty for LOD-0-only assets) so the on-disk layout is uniform
+    // across asset sizes — readers branch on `header.dag_*_size == 0`.
+    let dag_groups_compressed = mesh_sections.and_then(|m| {
+        if m.dag_groups.is_empty() {
+            None
+        } else {
+            tick(write_stage::COMPRESS_DAG_GROUPS);
+            Some(lz4_flex::compress_prepend_size(m.dag_groups))
+        }
+    });
+    let dag_consumed_compressed = mesh_sections.and_then(|m| {
+        if m.dag_consumed.is_empty() {
+            None
+        } else {
+            tick(write_stage::COMPRESS_DAG_CONSUMED);
+            Some(lz4_flex::compress_prepend_size(m.dag_consumed))
+        }
+    });
+    let dag_produced_compressed = mesh_sections.and_then(|m| {
+        if m.dag_produced.is_empty() {
+            None
+        } else {
+            tick(write_stage::COMPRESS_DAG_PRODUCED);
+            Some(lz4_flex::compress_prepend_size(m.dag_produced))
+        }
+    });
     tick(write_stage::WRITE_FILE);
 
     let mut flags = 0u32;
@@ -170,6 +212,12 @@ pub fn write_rkp_with_progress<W: Write + Seek>(
         meshlet_clusters_compressed_size: meshlet_clusters_compressed
             .as_ref().map(|d| d.len() as u32).unwrap_or(0),
         mesh_lod0_index_count: mesh_sections.map(|m| m.lod0_index_count).unwrap_or(0),
+        dag_groups_compressed_size: dag_groups_compressed
+            .as_ref().map(|d| d.len() as u32).unwrap_or(0),
+        dag_consumed_compressed_size: dag_consumed_compressed
+            .as_ref().map(|d| d.len() as u32).unwrap_or(0),
+        dag_produced_compressed_size: dag_produced_compressed
+            .as_ref().map(|d| d.len() as u32).unwrap_or(0),
     };
 
     writer.write_all(bytemuck::bytes_of(&header))?;
@@ -194,6 +242,15 @@ pub fn write_rkp_with_progress<W: Write + Seek>(
         writer.write_all(data)?;
     }
     if let Some(ref data) = meshlet_clusters_compressed {
+        writer.write_all(data)?;
+    }
+    if let Some(ref data) = dag_groups_compressed {
+        writer.write_all(data)?;
+    }
+    if let Some(ref data) = dag_consumed_compressed {
+        writer.write_all(data)?;
+    }
+    if let Some(ref data) = dag_produced_compressed {
         writer.write_all(data)?;
     }
 
@@ -270,25 +327,19 @@ pub fn write_artifact_rkp(
     // the asset's global leaf_attr offset before any GPU upload.
     // Same one-time cost the rkp-import path pays — moves DAG
     // build out of the editor's load critical path.
-    let (mesh_vertex_bytes, mesh_index_bytes, meshlet_cluster_bytes, lod0_index_count) =
-        build_mesh_sections_blob(
-            artifact.octree.as_slice(),
-            artifact.octree.depth(),
-            voxel_size,
-            artifact.grid_origin,
-            &bricks_flat,
-            &artifact.leaf_attrs,
-            // Procedural bakes never carry skinning data — generator
-            // outputs are static geometry.
-            &[],
-        );
-    let mesh_sections = if !mesh_vertex_bytes.is_empty() {
-        Some(MeshSectionsIn {
-            vertices: &mesh_vertex_bytes,
-            indices: &mesh_index_bytes,
-            clusters: &meshlet_cluster_bytes,
-            lod0_index_count,
-        })
+    let mesh_blob = build_mesh_sections_blob(
+        artifact.octree.as_slice(),
+        artifact.octree.depth(),
+        voxel_size,
+        artifact.grid_origin,
+        &bricks_flat,
+        &artifact.leaf_attrs,
+        // Procedural bakes never carry skinning data — generator
+        // outputs are static geometry.
+        &[],
+    );
+    let mesh_sections = if !mesh_blob.vertices.is_empty() {
+        Some(mesh_blob.as_in())
     } else {
         None
     };
@@ -336,11 +387,39 @@ pub fn write_artifact_rkp(
     Ok(())
 }
 
+/// Owned byte buffers for the v6 mesh + DAG sections, ready to feed
+/// into [`MeshSectionsIn`] for [`write_rkp`]. All seven slices empty
+/// when there's no surface to extract.
+#[derive(Debug, Default, Clone)]
+pub struct MeshSectionsBlob {
+    pub vertices: Vec<u8>,
+    pub indices: Vec<u8>,
+    pub clusters: Vec<u8>,
+    pub lod0_index_count: u32,
+    pub dag_groups: Vec<u8>,
+    pub dag_consumed: Vec<u8>,
+    pub dag_produced: Vec<u8>,
+}
+
+impl MeshSectionsBlob {
+    /// Borrow as a [`MeshSectionsIn`] for the writer.
+    pub fn as_in(&self) -> MeshSectionsIn<'_> {
+        MeshSectionsIn {
+            vertices: &self.vertices,
+            indices: &self.indices,
+            clusters: &self.clusters,
+            lod0_index_count: self.lod0_index_count,
+            dag_groups: &self.dag_groups,
+            dag_consumed: &self.dag_consumed,
+            dag_produced: &self.dag_produced,
+        }
+    }
+}
+
 /// Run surface-mesh extraction + Karis-Nanite cluster-DAG build over
-/// the asset's geometry, returning the byte buffers ready for the
-/// `MeshSectionsIn` v5 sections (`vertices`, `indices`, `clusters`)
-/// plus the LOD-0 index count. Empty Vecs when there's no surface
-/// to extract (degenerate input).
+/// the asset's geometry, returning the byte buffers for the v6
+/// mesh + DAG sections. Empty fields when there's no surface to
+/// extract (degenerate input).
 ///
 /// `leaf_attr_id`s baked into the vertices are FILE-LOCAL — i.e.,
 /// indexes into the asset's own `leaf_attrs` Vec. The load path is
@@ -354,9 +433,9 @@ pub fn build_mesh_sections_blob(
     brick_pool: &[u32],
     leaf_attrs: &[crate::leaf_attr::LeafAttr],
     bone_voxels: &[crate::companion::BoneVoxel],
-) -> (Vec<u8>, Vec<u8>, Vec<u8>, u32) {
+) -> MeshSectionsBlob {
     if octree_nodes.is_empty() || leaf_attrs.is_empty() {
-        return (Vec::new(), Vec::new(), Vec::new(), 0);
+        return MeshSectionsBlob::default();
     }
     let (vertices, indices_unclustered) = crate::mesh_extract::extract_surface_mesh(
         octree_nodes,
@@ -368,14 +447,17 @@ pub fn build_mesh_sections_blob(
         bone_voxels,
     );
     if vertices.is_empty() || indices_unclustered.is_empty() {
-        return (Vec::new(), Vec::new(), Vec::new(), 0);
+        return MeshSectionsBlob::default();
     }
     let dag = crate::mesh_lod::build_cluster_dag(&vertices, &indices_unclustered);
     let lod0_index_count = dag.lod0_index_range.1 - dag.lod0_index_range.0;
-    (
-        bytemuck::cast_slice(&vertices).to_vec(),
-        bytemuck::cast_slice(&dag.indices).to_vec(),
-        bytemuck::cast_slice(&dag.clusters).to_vec(),
+    MeshSectionsBlob {
+        vertices: bytemuck::cast_slice(&vertices).to_vec(),
+        indices: bytemuck::cast_slice(&dag.indices).to_vec(),
+        clusters: bytemuck::cast_slice(&dag.clusters).to_vec(),
         lod0_index_count,
-    )
+        dag_groups: bytemuck::cast_slice(&dag.dag_groups).to_vec(),
+        dag_consumed: bytemuck::cast_slice(&dag.dag_consumed).to_vec(),
+        dag_produced: bytemuck::cast_slice(&dag.dag_produced).to_vec(),
+    }
 }

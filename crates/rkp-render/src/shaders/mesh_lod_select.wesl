@@ -87,7 +87,12 @@ struct MeshletCluster {
     flags: u32,
     cluster_error: f32,
     parent_group_error: f32,
-    _pad3: vec2<u32>,
+    /// DAG topology pointers — CPU-only (sculpt CC walk). Mirrored here
+    /// only to keep the WGSL std430 stride at 64 B; the shader doesn't
+    /// read them.
+    group_above_idx: u32,
+    group_below_idx: u32,
+    _pad3: u32,
 }
 
 const CLUSTER_FLAG_LOD_DIRTY: u32 = 1u;

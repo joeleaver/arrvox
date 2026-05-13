@@ -137,7 +137,7 @@ fn rebuild_mesh_sections(path: &std::path::Path) -> Result<(), String> {
         build_mesh_sections_blob, read_rkp_bricks, read_rkp_color, read_rkp_header,
         read_rkp_mesh_indices, read_rkp_mesh_vertices, read_rkp_meshlet_clusters,
         read_rkp_normals, read_rkp_octree, read_rkp_skin_meta, read_rkp_voxels,
-        write_rkp_with_progress, MeshSectionsIn, RkpHeader, SkinMetaIn,
+        write_rkp_with_progress, RkpHeader, SkinMetaIn,
     };
     use rkp_core::leaf_attr::LeafAttr;
 
@@ -203,29 +203,23 @@ fn rebuild_mesh_sections(path: &std::path::Path) -> Result<(), String> {
             &[]
         };
 
-    let (mesh_v_bytes, mesh_i_bytes, meshlet_bytes, lod0_index_count) =
-        build_mesh_sections_blob(
-            &octree_nodes,
-            header.octree_depth as u8,
-            header.base_voxel_size,
-            grid_origin,
-            bricks_u32,
-            &leaf_attrs,
-            bone_voxels,
-        );
-    if mesh_v_bytes.is_empty() {
+    let mesh_blob = build_mesh_sections_blob(
+        &octree_nodes,
+        header.octree_depth as u8,
+        header.base_voxel_size,
+        grid_origin,
+        bricks_u32,
+        &leaf_attrs,
+        bone_voxels,
+    );
+    if mesh_blob.vertices.is_empty() {
         eprintln!(
-            "[rebuild-mesh] {}: no surface mesh extracted (degenerate octree), wrote v5 without mesh sections",
+            "[rebuild-mesh] {}: no surface mesh extracted (degenerate octree), wrote without mesh sections",
             path.display()
         );
     }
-    let mesh_sections = if !mesh_v_bytes.is_empty() {
-        Some(MeshSectionsIn {
-            vertices: &mesh_v_bytes,
-            indices: &mesh_i_bytes,
-            clusters: &meshlet_bytes,
-            lod0_index_count,
-        })
+    let mesh_sections = if !mesh_blob.vertices.is_empty() {
+        Some(mesh_blob.as_in())
     } else {
         None
     };
@@ -285,7 +279,7 @@ fn rebuild_mesh_sections(path: &std::path::Path) -> Result<(), String> {
         format!("rename: {e}")
     })?;
 
-    let cluster_count = meshlet_bytes.len() / 64;
+    let cluster_count = mesh_blob.clusters.len() / 64;
     eprintln!(
         "[rebuild-mesh] {}: in {:.2}s ({} clusters)",
         path.display(),

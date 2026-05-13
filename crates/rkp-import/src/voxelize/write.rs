@@ -147,28 +147,22 @@ pub fn write_rkp(
     let asset_extent = (1u32 << octree_depth) as f32 * voxel_size;
     let aabb_center = (geometry_aabb.min + geometry_aabb.max) * 0.5;
     let grid_origin = aabb_center - Vec3::splat(asset_extent * 0.5);
-    let (mesh_vertex_bytes, mesh_index_bytes, meshlet_cluster_bytes, lod0_index_count) =
-        rkp_core::asset_file::build_mesh_sections_blob(
-            octree_nodes,
-            octree_depth,
-            voxel_size,
-            grid_origin,
-            &shell.file_bricks,
-            &leaf_attrs,
-            // For skinned imports, bone weights come straight from the
-            // voxelizer's per-cell BoneVoxel quads; the mesh extractor
-            // pulls them by `leaf_attr_id` and bakes them into the vertex
-            // so the mesh VS can do LBS/DQS without a runtime merge.
-            // Empty for unskinned assets — extractor zeros the fields.
-            &shell.bone_voxels,
-        );
-    let mesh_sections = if !mesh_vertex_bytes.is_empty() {
-        Some(rkp_core::asset_file::MeshSectionsIn {
-            vertices: &mesh_vertex_bytes,
-            indices: &mesh_index_bytes,
-            clusters: &meshlet_cluster_bytes,
-            lod0_index_count,
-        })
+    let mesh_blob = rkp_core::asset_file::build_mesh_sections_blob(
+        octree_nodes,
+        octree_depth,
+        voxel_size,
+        grid_origin,
+        &shell.file_bricks,
+        &leaf_attrs,
+        // For skinned imports, bone weights come straight from the
+        // voxelizer's per-cell BoneVoxel quads; the mesh extractor
+        // pulls them by `leaf_attr_id` and bakes them into the vertex
+        // so the mesh VS can do LBS/DQS without a runtime merge.
+        // Empty for unskinned assets — extractor zeros the fields.
+        &shell.bone_voxels,
+    );
+    let mesh_sections = if !mesh_blob.vertices.is_empty() {
+        Some(mesh_blob.as_in())
     } else {
         None
     };

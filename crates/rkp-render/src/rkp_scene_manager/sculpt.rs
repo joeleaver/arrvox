@@ -586,7 +586,14 @@ impl RkpSceneManager {
                 flags: rkp_core::mesh_cluster::CLUSTER_FLAG_LOD_DIRTY,
                 cluster_error: 0.0,
                 parent_group_error: PARENT_GROUP_ERROR_ROOT,
-                _pad3: [0; 3],
+                // Patch cluster is appended after the bake-time DAG;
+                // it has no group on either side. CC walks from
+                // brush-touched LOD-0 clusters don't traverse through
+                // it, which is correct — the patch is standalone-dirty
+                // and force-admits unconditionally.
+                group_above_idx: rkp_core::mesh_cluster::DAG_GROUP_NONE,
+                group_below_idx: rkp_core::mesh_cluster::DAG_GROUP_NONE,
+                _pad3: 0,
             });
         }
 
@@ -713,7 +720,7 @@ impl RkpSceneManager {
 mod tests {
     use super::*;
     use crate::rkp_scene_manager::types::AssetEntry;
-    use rkp_core::mesh_cluster::{MeshletCluster, PARENT_GROUP_ERROR_ROOT};
+    use rkp_core::mesh_cluster::{DAG_GROUP_NONE, MeshletCluster, PARENT_GROUP_ERROR_ROOT};
     use rkp_core::sparse_octree::SparseOctree;
     use rkp_core::{Aabb, OctreeHandle};
 
@@ -732,7 +739,9 @@ mod tests {
             flags: 0,
             cluster_error: 0.0,
             parent_group_error: PARENT_GROUP_ERROR_ROOT,
-            _pad3: [0; 3],
+            group_above_idx: DAG_GROUP_NONE,
+            group_below_idx: DAG_GROUP_NONE,
+            _pad3: 0,
         }
     }
 
@@ -773,6 +782,9 @@ mod tests {
             mesh_indices: Vec::new(),
             mesh_lod0_index_count: 0,
             meshlet_clusters: clusters,
+            dag_groups: Vec::new(),
+            dag_consumed: Vec::new(),
+            dag_produced: Vec::new(),
             cpu_octree: SparseOctree::new(depth, base_vs),
             mesh_dirty: false,
             splats_dirty: false,

@@ -149,6 +149,23 @@ pub(super) struct AssetEntry {
     /// threshold (~lod + 1), retiring the previously-dormant voxel-
     /// LOD shadow mesh.
     pub(super) meshlet_clusters: Vec<crate::mesh_pass::MeshletCluster>,
+    /// DAG group spans for sculpt's per-chain LOD-0 clamp. Each entry
+    /// describes one simplification group: the consumed prev-level
+    /// cluster IDs and produced this-level cluster IDs. Combined with
+    /// [`MeshletCluster::group_above_idx`] / `group_below_idx`, this
+    /// gives sculpt a CC walk over the DAG to mark every cluster in a
+    /// brush-touched chain as `LOD_DIRTY` — narrower than R4d V1's
+    /// asset-wide clamp.
+    ///
+    /// Empty for v5 assets without a baked DAG (the load-path
+    /// fallback rebuilds the DAG from the unclustered LOD-0 indices,
+    /// which populates this).
+    pub(super) dag_groups: Vec<rkp_core::mesh_lod::DagGroup>,
+    /// Flat per-group consumed cluster IDs, indexed by each
+    /// `DagGroup::consumed_first..consumed_first+consumed_count`.
+    pub(super) dag_consumed: Vec<u32>,
+    /// Flat per-group produced cluster IDs.
+    pub(super) dag_produced: Vec<u32>,
     /// CPU-side mirror of the asset's octree, retained after upload so
     /// runtime sculpt can mutate it without round-tripping the GPU. Same
     /// node buffer the load path built and uploaded; not memory-cheap on
