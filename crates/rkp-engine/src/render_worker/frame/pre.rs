@@ -155,13 +155,24 @@ pub(super) fn run_pre_frame(
         // load time. Phase 6.1: indices is the full DAG IBO (LOD-0
         // first, then LOD-1, ...); dispatch draws only the LOD-0
         // prefix until Phase 6.2 wires the indirect path.
+        let mut mesh_bytes_total: u64 = 0;
+        let mut mesh_asset_count: usize = 0;
         for (handle, vertices, indices, lod0_index_count) in sm.iter_loaded_asset_meshes() {
-            state.renderer.upload_mesh_for_asset(
+            let bytes = state.renderer.upload_mesh_for_asset(
                 &state.queue,
                 handle.raw(),
                 vertices,
                 indices,
                 lod0_index_count,
+            );
+            mesh_bytes_total += bytes;
+            mesh_asset_count += 1;
+        }
+        if mesh_asset_count > 0 {
+            let mib = mesh_bytes_total as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "[delta upload] mesh: {mesh_asset_count} asset(s) · {mib:.3} MiB total \
+                 (VBO+IBO tail writes)",
             );
         }
         // Phase 5 — per-asset meshlet cluster table. Storage buffer

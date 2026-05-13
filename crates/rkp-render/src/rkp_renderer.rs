@@ -430,20 +430,21 @@ impl RkpRenderer {
         vertices: &[MeshVertex],
         indices: &[u32],
         dispatch_index_count: u32,
-    ) {
+    ) -> u64 {
         let idx = handle_raw as usize;
         if idx >= self.mesh_buffers.len() {
             self.mesh_buffers.resize_with(idx + 1, || None);
         }
         if vertices.is_empty() || indices.is_empty() || dispatch_index_count == 0 {
             self.mesh_buffers[idx] = None;
-            return;
+            return 0;
         }
 
         let vbo_bytes: &[u8] = bytemuck::cast_slice(vertices);
         let ibo_bytes: &[u8] = bytemuck::cast_slice(indices);
         let vbo_needed = vbo_bytes.len() as u64;
         let ibo_needed = ibo_bytes.len() as u64;
+        let mut bytes_written: u64 = 0;
 
         // Take ownership of the existing entry (if any) so we can decide
         // tail-only vs full upload below.
@@ -453,11 +454,9 @@ impl RkpRenderer {
                 // Buffer fits and the CPU side only grew → tail-only.
                 // Also handles the `equal` case (skip the write entirely).
                 if vbo_needed > e.vbo_uploaded_bytes {
-                    queue.write_buffer(
-                        &e.vbo,
-                        e.vbo_uploaded_bytes,
-                        &vbo_bytes[e.vbo_uploaded_bytes as usize..],
-                    );
+                    let tail = &vbo_bytes[e.vbo_uploaded_bytes as usize..];
+                    queue.write_buffer(&e.vbo, e.vbo_uploaded_bytes, tail);
+                    bytes_written += tail.len() as u64;
                 }
                 (e.vbo.clone(), vbo_needed)
             } else {
@@ -469,6 +468,7 @@ impl RkpRenderer {
                     wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                     vbo_bytes,
                 );
+                bytes_written += vbo_needed;
                 (buf, vbo_needed)
             }
         } else {
@@ -479,17 +479,16 @@ impl RkpRenderer {
                 wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 vbo_bytes,
             );
+            bytes_written += vbo_needed;
             (buf, vbo_needed)
         };
 
         let (ibo, ibo_uploaded_bytes) = if let Some(e) = existing.as_ref() {
             if e.ibo.size() >= ibo_needed && ibo_needed >= e.ibo_uploaded_bytes {
                 if ibo_needed > e.ibo_uploaded_bytes {
-                    queue.write_buffer(
-                        &e.ibo,
-                        e.ibo_uploaded_bytes,
-                        &ibo_bytes[e.ibo_uploaded_bytes as usize..],
-                    );
+                    let tail = &ibo_bytes[e.ibo_uploaded_bytes as usize..];
+                    queue.write_buffer(&e.ibo, e.ibo_uploaded_bytes, tail);
+                    bytes_written += tail.len() as u64;
                 }
                 (e.ibo.clone(), ibo_needed)
             } else {
@@ -502,6 +501,7 @@ impl RkpRenderer {
                         | wgpu::BufferUsages::COPY_DST,
                     ibo_bytes,
                 );
+                bytes_written += ibo_needed;
                 (buf, ibo_needed)
             }
         } else {
@@ -514,6 +514,7 @@ impl RkpRenderer {
                     | wgpu::BufferUsages::COPY_DST,
                 ibo_bytes,
             );
+            bytes_written += ibo_needed;
             (buf, ibo_needed)
         };
 
@@ -521,6 +522,7 @@ impl RkpRenderer {
             vbo, ibo, dispatch_index_count,
             vbo_uploaded_bytes, ibo_uploaded_bytes,
         });
+        bytes_written
     }
 
     /// Drop the cached mesh buffers for `handle_raw`. Called when an
