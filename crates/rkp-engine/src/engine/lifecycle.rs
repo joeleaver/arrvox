@@ -1201,6 +1201,14 @@ impl EngineState {
                 to_ms(snap_t_frame),
             );
         }
+        // Record the sim-side submit timestamp for the [sculpt-pipeline]
+        // latency decomposition (bump→submit vs submit→pickup). Cheap
+        // (one atomic write); no-op when there's no fresh bump to
+        // attribute the submit to.
+        {
+            let sm = self.scene_mgr.lock().expect("scene_mgr poisoned");
+            sm.record_geometry_submit_now();
+        }
         self.render_worker.inbox.submit(frame);
         let t_frame_end = frame_start.elapsed();
 

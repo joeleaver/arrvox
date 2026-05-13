@@ -132,18 +132,36 @@ pub(super) fn run_pre_frame(
         let geo_epoch_t0 = std::time::Instant::now();
         let mut sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
         let t_lock = geo_epoch_t0.elapsed();
-        // Diagnostic: time elapsed from the sim's `bump_geometry_epoch`
-        // call (typically inside the sculpt stamp) until the render
-        // worker picked up the new epoch. Surfaces the gap that the
-        // per-component timings ([sculpt] stamp, [geo-epoch], [render-
-        // frame], [ship]) collectively don't capture: sim-mutex hold,
-        // render-thread loop cadence, vsync alignment.
-        if let Some(sim_to_render_ms) = rkp_render::rkp_scene_manager::ms_since_process_ns(
-            sm.last_geometry_bump_ns(),
-        ) {
+        // Diagnostic: decompose the wall-clock latency between sim's
+        // `bump_geometry_epoch` and the render worker noticing the new
+        // epoch into two phases:
+        //   • bump→submit — sim work post-bump in the same submit_render_
+        //     frame tick (snapshot building, palette, gpu_objects rebuild,
+        //     painted-material scan, etc.). Stays inside one sim tick by
+        //     design.
+        //   • submit→pickup — wall time from sim handing the snapshot to
+        //     the inbox until render's iteration picked it up. Captures
+        //     render-thread cadence + GPU backpressure (readback ring
+        //     full → 500 µs sleep + retry).
+        let bump_ns = sm.last_geometry_bump_ns();
+        let submit_ns = sm.last_geometry_submit_ns();
+        if let Some(sim_to_render_ms) =
+            rkp_render::rkp_scene_manager::ms_since_process_ns(bump_ns)
+        {
+            let bump_to_submit_ms = if submit_ns > bump_ns {
+                (submit_ns - bump_ns) as f64 / 1.0e6
+            } else {
+                f64::NAN
+            };
+            let submit_to_pickup_ms = if submit_ns >= bump_ns {
+                rkp_render::rkp_scene_manager::ms_since_process_ns(submit_ns)
+                    .unwrap_or(f64::NAN)
+            } else {
+                f64::NAN
+            };
             eprintln!(
-                "[sculpt-pipeline] sim→render={:.2}ms (geo_epoch={})",
-                sim_to_render_ms, frame.geometry_epoch,
+                "[sculpt-pipeline] sim→render={:.2}ms = bump→submit={:.2}ms + submit→pickup={:.2}ms (geo_epoch={})",
+                sim_to_render_ms, bump_to_submit_ms, submit_to_pickup_ms, frame.geometry_epoch,
             );
         }
         let t1 = std::time::Instant::now();

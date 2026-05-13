@@ -121,6 +121,13 @@ pub struct RkpSceneManager {
     /// ordering is fine because the timestamp is for diagnostics, not
     /// for correctness.
     pub(super) last_geometry_bump_ns: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Wall-clock nanoseconds when the sim last submitted a
+    /// `RenderFrame` carrying a fresh geometry epoch into the render
+    /// inbox. Companion to `last_geometry_bump_ns`: the `bump→submit`
+    /// delta is sim post-bump work (snapshot building, palette,
+    /// gpu_objects rebuild); the `submit→render-pickup` delta is the
+    /// render thread cadence + GPU backpressure.
+    pub(super) last_geometry_submit_ns: std::sync::Arc<std::sync::atomic::AtomicU64>,
 
     // ── Paint data writes (Phase 3b perf) ───────────────────────────
     /// Separate epoch for paint mutations. Pre-perf: paint bumped
@@ -163,6 +170,7 @@ impl RkpSceneManager {
             faces_dirty: false,
             geometry_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_geometry_bump_ns: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_geometry_submit_ns: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             paint_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             walk_snapshot_cache: None,
             walk_snapshot_epoch: 0,
@@ -301,6 +309,41 @@ impl RkpSceneManager {
     /// log the sim→render wait gap (`[sculpt-pipeline]`).
     pub fn last_geometry_bump_ns(&self) -> u64 {
         self.last_geometry_bump_ns
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record the sim-side submit timestamp for the latest bumped
+    /// geometry epoch. Called by `submit_render_frame` just before
+    /// `inbox.submit`. Lets render decompose the sim→render delta
+    /// into `bump→submit` (sim post-bump work) and `submit→pickup`
+    /// (render-thread cadence). No-op when no bump has happened.
+    pub fn record_geometry_submit_now(&self) {
+        // Only record when there's actually a bump to attribute the
+        // submit to — else the field reads as the wall-time of the
+        // last submit of a non-sculpt-mutating frame, which isn't
+        // useful for the [sculpt-pipeline] decomposition.
+        let bump = self.last_geometry_bump_ns();
+        if bump == 0 {
+            return;
+        }
+        let prev_submit = self
+            .last_geometry_submit_ns
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Don't overwrite — keep the FIRST submit timestamp for a
+        // given bump so we measure sim post-bump work, not the
+        // sim-tick frequency.
+        if prev_submit >= bump {
+            return;
+        }
+        self.last_geometry_submit_ns
+            .store(process_elapsed_ns(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read the submit timestamp recorded by
+    /// [`Self::record_geometry_submit_now`]. Returns `0` if no submit
+    /// has been recorded for the current bump.
+    pub fn last_geometry_submit_ns(&self) -> u64 {
+        self.last_geometry_submit_ns
             .load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn clear_faces(&mut self) {
