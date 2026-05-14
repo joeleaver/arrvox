@@ -81,6 +81,7 @@ impl EngineState {
             painted_materials_geometry_epoch: 0,
             painted_walk_submitted_geom_epoch: 0,
             paint_walk_worker: super::super::paint_walk::PaintWalkWorker::spawn(),
+            collider_worker: super::super::collider_worker::ColliderWorker::spawn(),
             paint_overlays: std::collections::HashMap::new(),
             sculpt_overlays: std::collections::HashMap::new(),
             material_is_glass: Vec::new(),

@@ -78,9 +78,22 @@ pub(super) fn build_collider_from_cache(
 /// Returns occupied coarse cell coordinates and the actual cell size
 /// used. The local-space position of coord `c` is `c * collider_cell_size`,
 /// offset by the `ColliderCache.grid_origin` the caller computes.
+/// Brick-pool cell read from a raw `&[u32]` slice (the same data the
+/// `BrickPool` holds inside its `Arc<Vec<u32>>`). Lets the collider
+/// walks run on a worker thread with just the pool's data Arc, no
+/// `BrickPool` borrow required. Mirrors `BrickPool::get_cell`.
+#[inline]
+fn brick_cell(pool: &[u32], brick_id: u32, x: u32, y: u32, z: u32) -> u32 {
+    let offset = brick_id as usize * rkp_core::BRICK_CELLS as usize
+        + (x
+            + y * rkp_core::BRICK_DIM
+            + z * rkp_core::BRICK_DIM * rkp_core::BRICK_DIM) as usize;
+    pool.get(offset).copied().unwrap_or(rkp_core::BRICK_EMPTY)
+}
+
 pub fn build_coarse_collider(
     octree_data: &[u32],
-    brick_pool: &rkp_core::BrickPool,
+    brick_pool: &[u32],
     root_offset: usize,
     tree_depth: u8,
     len: u32,
@@ -135,7 +148,7 @@ pub fn build_coarse_collider(
         nodes: &[u32],
         root_offset: u32,
         depth: u8,
-        brick_pool: &rkp_core::BrickPool,
+        brick_pool: &[u32],
         node_idx: usize,
         origin: glam::UVec3,
         level: u8,
@@ -167,7 +180,7 @@ pub fn build_coarse_collider(
             for cz in 0..BRICK_DIM {
                 for cy in 0..BRICK_DIM {
                     for cx in 0..BRICK_DIM {
-                        let cell = brick_pool.get_cell(bid, cx, cy, cz);
+                        let cell = brick_cell(brick_pool, bid, cx, cy, cz);
                         if cell == BRICK_EMPTY {
                             continue;
                         }
@@ -241,7 +254,7 @@ pub fn build_coarse_collider(
 /// returned AABB is in the same frame.
 pub fn compute_tight_local_aabb(
     octree_data: &[u32],
-    brick_pool: &rkp_core::BrickPool,
+    brick_pool: &[u32],
     root_offset: usize,
     tree_depth: u8,
     len: u32,
@@ -289,7 +302,7 @@ pub fn compute_tight_local_aabb(
         nodes: &[u32],
         root_offset: u32,
         depth: u8,
-        brick_pool: &rkp_core::BrickPool,
+        brick_pool: &[u32],
         node_idx: usize,
         origin: glam::UVec3,
         level: u8,
@@ -317,7 +330,7 @@ pub fn compute_tight_local_aabb(
             for cz in 0..BRICK_DIM {
                 for cy in 0..BRICK_DIM {
                     for cx in 0..BRICK_DIM {
-                        let cell = brick_pool.get_cell(bid, cx, cy, cz);
+                        let cell = brick_cell(brick_pool, bid, cx, cy, cz);
                         if cell == BRICK_EMPTY {
                             continue;
                         }

@@ -779,22 +779,113 @@ impl EngineState {
             }
             self.geometry_dirty.clear();
         }
-        if self.collider_caches_dirty.is_dirty() {
-            // PERF_DEBT C3: per-entity rebuild when scope is
-            // narrow; full world walk only when `is_all()` (project
-            // load, asset import, generator regen).
-            if self.collider_caches_dirty.is_all() {
-                self.rebuild_collider_caches();
+        // Phase E2 of `docs/PERF_DEBT.md`: drain any completed
+        // collider-worker result first, then submit a fresh batch when
+        // the worker is idle. Sim never blocks on collider rebuild —
+        // ColliderCache lands on the entity 1-2 ticks after the
+        // geometry change. Play mode (the only current reader of
+        // ColliderCache) re-reads on entry, so the lag is invisible.
+        if let Some(result) = self.collider_worker.try_recv() {
+            for (entity, cache) in result.entries {
+                if !self.world.contains(entity) {
+                    continue;
+                }
+                if self.world.get::<&crate::components::ColliderCache>(entity).is_ok() {
+                    let _ = self
+                        .world
+                        .remove_one::<crate::components::ColliderCache>(entity);
+                }
+                let _ = self.world.insert_one(entity, cache);
+            }
+            let _ = result.worker_duration;
+        }
+        if self.collider_worker.is_idle() && self.collider_caches_dirty.is_dirty() {
+            use crate::components::{EditorMetadata, Renderable, Transform};
+            // Resolve which entities need a rebuild. `is_all()` → world
+            // walk every RigidBody (project load, asset import); else
+            // iterate the narrow per-entity set populated by
+            // `geometry_dirty` callers (PERF_DEBT B2+C3).
+            let candidates: Vec<hecs::Entity> = if self.collider_caches_dirty.is_all() {
+                self.world
+                    .query::<&crate::components::RigidBody>()
+                    .iter()
+                    .map(|(e, _)| e)
+                    .collect()
             } else {
-                let dirty: Vec<hecs::Entity> = self
-                    .collider_caches_dirty
+                self.collider_caches_dirty
                     .dirty_entities()
                     .iter()
                     .copied()
-                    .collect();
-                for entity in dirty {
-                    self.rebuild_collider_cache_for(entity);
+                    .collect()
+            };
+
+            // Per-entity input capture happens on sim (the worker
+            // doesn't see the ECS). Mirrors `rebuild_collider_cache_for`
+            // pre-E2.
+            let mut jobs: Vec<super::collider_worker::ColliderJob> =
+                Vec::with_capacity(candidates.len());
+            for entity in candidates {
+                if !self.world.contains(entity) {
+                    continue;
                 }
+                let rb = match self
+                    .world
+                    .get::<&crate::components::RigidBody>(entity)
+                {
+                    Ok(rb) => (*rb).clone(),
+                    Err(_) => continue,
+                };
+                let spatial = self
+                    .world
+                    .get::<&Renderable>(entity)
+                    .ok()
+                    .and_then(|r| r.spatial.clone())
+                    .and_then(|g| g.into_octree())
+                    .map(|sp| super::collider_worker::JobSpatial {
+                        root_offset: sp.root_offset,
+                        depth: sp.depth,
+                        len: sp.len,
+                        base_voxel_size: sp.base_voxel_size,
+                        grid_origin: sp.grid_origin,
+                        aabb_min: sp.aabb.min,
+                        aabb_max: sp.aabb.max,
+                    });
+                let scale = self
+                    .world
+                    .get::<&Transform>(entity)
+                    .map(|t| t.scale)
+                    .unwrap_or(glam::Vec3::ONE);
+                let pos = self
+                    .world
+                    .get::<&Transform>(entity)
+                    .map(|t| t.position)
+                    .unwrap_or_default();
+                let name = self
+                    .world
+                    .get::<&EditorMetadata>(entity)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_default();
+                jobs.push(super::collider_worker::ColliderJob {
+                    entity,
+                    rb,
+                    spatial,
+                    scale,
+                    name,
+                    pos,
+                });
+            }
+
+            if !jobs.is_empty() {
+                let snapshot = self
+                    .scene_mgr
+                    .lock()
+                    .expect("scene_mgr poisoned")
+                    .walk_snapshot();
+                let batch = super::collider_worker::ColliderBatch {
+                    snapshot,
+                    jobs,
+                };
+                self.collider_worker.submit(batch);
             }
             self.collider_caches_dirty.clear();
         }

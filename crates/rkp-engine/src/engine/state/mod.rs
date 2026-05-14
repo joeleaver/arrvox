@@ -358,6 +358,13 @@ pub(crate) struct EngineState {
     /// `docs/PERF_DEBT.md`.
     pub(crate) paint_walk_worker: super::paint_walk::PaintWalkWorker,
 
+    /// Dedicated worker thread that runs collider-cache rebuilds off
+    /// the sim tick. Sim drains [`Self::collider_caches_dirty`] into a
+    /// batch, submits to the worker, and merges the resulting
+    /// `ColliderCache` entries into the ECS on a later tick. Phase E2
+    /// of `docs/PERF_DEBT.md`.
+    pub(crate) collider_worker: super::collider_worker::ColliderWorker,
+
     /// Per-entity sparse paint overlays. Each entry holds the leaves
     /// painted on that *specific* instance — decoupled from the
     /// asset's shared `LeafAttrPool`. Shipping these decouples paint

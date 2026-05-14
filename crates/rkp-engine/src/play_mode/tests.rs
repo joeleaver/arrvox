@@ -12,7 +12,7 @@ fn interior_node_root_fills_full_extent() {
     // Coarse cell = 2 fine voxels, so 2³ = 8 coarse cells expected.
     let nodes = vec![INTERIOR_NODE];
     let pool = BrickPool::new(0);
-    let (coords, _) = build_coarse_collider(&nodes, &pool, 0, 2, 1, 1.0, 2.0);
+    let (coords, _) = build_coarse_collider(&nodes, pool.as_slice(), 0, 2, 1, 1.0, 2.0);
     assert_eq!(coords.len(), 8);
     for z in 0..2 {
         for y in 0..2 {
@@ -31,7 +31,7 @@ fn mip_leaf_root_fills_full_extent() {
     // Same shape as the INTERIOR test but with a coarse LEAF at the root.
     let nodes = vec![make_leaf(0)];
     let pool = BrickPool::new(0);
-    let (coords, _) = build_coarse_collider(&nodes, &pool, 0, 2, 1, 1.0, 2.0);
+    let (coords, _) = build_coarse_collider(&nodes, pool.as_slice(), 0, 2, 1, 1.0, 2.0);
     assert_eq!(coords.len(), 8);
 }
 
@@ -54,7 +54,7 @@ fn brick_cells_are_walked_not_dropped() {
     pool.set_cell(bid, 1, 2, 3, 7);
 
     let nodes = vec![make_brick(bid)];
-    let (coords, _) = build_coarse_collider(&nodes, &pool, 0, 2, 1, 1.0, 2.0);
+    let (coords, _) = build_coarse_collider(&nodes, pool.as_slice(), 0, 2, 1, 1.0, 2.0);
     assert_eq!(
         coords.len(), 3,
         "got {coords:?}; pre-fix this returned 0 because iter_leaves skipped bricks",
@@ -70,7 +70,7 @@ fn empty_brick_contributes_no_coords() {
     let mut pool = BrickPool::new(4);
     let bid = pool.allocate().unwrap();
     let nodes = vec![make_brick(bid)];
-    let (coords, _) = build_coarse_collider(&nodes, &pool, 0, 2, 1, 1.0, 2.0);
+    let (coords, _) = build_coarse_collider(&nodes, pool.as_slice(), 0, 2, 1, 1.0, 2.0);
     assert!(coords.is_empty());
 }
 
@@ -103,7 +103,7 @@ fn root_offset_is_subtracted_from_branch_children() {
 
     let len = 1 + 8;
     // coarse cell = 2 fine voxels. Brick cell (0,0,0) → coarse (0,0,0).
-    let (coords, _) = build_coarse_collider(&nodes, &pool, prefix, 3, len, 1.0, 2.0);
+    let (coords, _) = build_coarse_collider(&nodes, pool.as_slice(), prefix, 3, len, 1.0, 2.0);
     let _ = BRICK_DIM;
     assert_eq!(coords, vec![IVec3::new(0, 0, 0)]);
 }
@@ -135,7 +135,7 @@ fn tight_aabb_skips_padding() {
     }
 
     let aabb = compute_tight_local_aabb(
-        &nodes, &pool, 0, 3, nodes.len() as u32, 0.5, glam::Vec3::ZERO,
+        &nodes, pool.as_slice(), 0, 3, nodes.len() as u32, 0.5, glam::Vec3::ZERO,
     )
     .expect("should find occupied region");
     assert_eq!(aabb.min, glam::Vec3::new(0.5, 0.5, 0.5));
@@ -151,7 +151,7 @@ fn tight_aabb_offsets_by_grid_origin() {
     let nodes = vec![INTERIOR_NODE];
     let pool = BrickPool::new(0);
     let aabb = compute_tight_local_aabb(
-        &nodes, &pool, 0, 2, 1, 0.25, glam::Vec3::splat(-0.5),
+        &nodes, pool.as_slice(), 0, 2, 1, 0.25, glam::Vec3::splat(-0.5),
     )
     .unwrap();
     assert_eq!(aabb.min, glam::Vec3::splat(-0.5));
@@ -164,7 +164,7 @@ fn tight_aabb_returns_none_for_empty() {
     let nodes = vec![EMPTY_NODE];
     let pool = BrickPool::new(0);
     let aabb = compute_tight_local_aabb(
-        &nodes, &pool, 0, 2, 1, 1.0, glam::Vec3::ZERO,
+        &nodes, pool.as_slice(), 0, 2, 1, 1.0, glam::Vec3::ZERO,
     );
     assert!(aabb.is_none());
 }

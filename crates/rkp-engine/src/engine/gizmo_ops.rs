@@ -436,6 +436,7 @@ impl EngineState {
 
         let sm_guard = self.scene_mgr.lock().unwrap();
         let all_nodes = sm_guard.octree.data();
+        let brick_data = sm_guard.brick_pool.as_slice();
 
         // Derive the fitted-shape bounds from the actually occupied
         // voxels. The padded `SpatialData.aabb` overshoots by ~14
@@ -444,7 +445,7 @@ impl EngineState {
         let tight_local = spatial.as_ref().and_then(|sp| {
             crate::play_mode::compute_tight_local_aabb(
                 all_nodes,
-                &sm_guard.brick_pool,
+                brick_data,
                 sp.root_offset as usize,
                 sp.depth,
                 sp.len,
@@ -472,7 +473,7 @@ impl EngineState {
                 if let Some(ref sp) = spatial {
                     let (coords, cell_size) = crate::play_mode::build_coarse_collider(
                         all_nodes,
-                        &sm_guard.brick_pool,
+                        brick_data,
                         sp.root_offset as usize,
                         sp.depth,
                         sp.len,
