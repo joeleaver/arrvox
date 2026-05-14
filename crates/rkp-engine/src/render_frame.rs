@@ -194,6 +194,15 @@ pub struct RenderFrame {
     pub bone_matrix_lbs: Arc<Vec<u8>>,
     /// Same as above but in dual-quaternion form for the DQS path.
     pub bone_matrix_dqs: Arc<Vec<u8>>,
+    /// Byte ranges in `bone_matrix_lbs` that differ from last frame's
+    /// upload. When empty, the render side skips the bone-matrix
+    /// upload entirely; when `is_full_pool`, the render side falls
+    /// back to `ensure_and_write` (covers layout shifts and buffer
+    /// growth); otherwise the render side issues one
+    /// `queue.write_buffer` per range. PERF_DEBT.md D1.
+    pub bone_matrix_lbs_dirty: rkp_core::DirtyRanges,
+    /// Same as above for `bone_matrix_dqs`.
+    pub bone_matrix_dqs_dirty: rkp_core::DirtyRanges,
 
     /// Pending click-pick. Render encodes the gbuf copy this frame
     /// and kicks off the async map; the result lands back via

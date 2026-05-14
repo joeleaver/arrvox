@@ -939,6 +939,15 @@ impl EngineState {
         //    `.to_vec()`. See PERF_DEBT.md A3.
         let bone_matrix_lbs = self.bone_matrix_allocator.bytes_arc();
         let bone_matrix_dqs = self.bone_matrix_allocator.bytes_dq_arc();
+        // PERF_DEBT.md D1: drain the dirty ranges that the last
+        // `rebuild()` produced. Empty when this tick took the
+        // C2-narrow path (no rebuild ran) or when every animated
+        // entity's pose was byte-identical to last frame; the render
+        // side reads `is_empty()` and skips the upload. The take
+        // resets the allocator's local state so a subsequent
+        // snapshot without an intervening rebuild reports empty too.
+        let bone_matrix_lbs_dirty = self.bone_matrix_allocator.take_mat_dirty();
+        let bone_matrix_dqs_dirty = self.bone_matrix_allocator.take_dq_dirty();
 
         // 2b. Skin scatter — fold per-entity dispatches into one
         //     batched compute dispatch sim-side; render fires the
@@ -1449,6 +1458,8 @@ impl EngineState {
             skin,
             bone_matrix_lbs,
             bone_matrix_dqs,
+            bone_matrix_lbs_dirty,
+            bone_matrix_dqs_dirty,
             pending_pick,
             cloud_sun_atten: self.cloud_sun_atten,
             lod_enabled: self.lod_enabled,

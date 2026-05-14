@@ -102,11 +102,22 @@ pub struct FrameUpload<'a> {
     /// are loaded (in which case the bone buffer keeps its dummy
     /// placeholder size so the shader bind still validates).
     pub bone_matrices: &'a [u8],
+    /// Byte ranges within `bone_matrices` that differ from the GPU
+    /// buffer's contents. When empty, the bone-matrix upload is
+    /// skipped entirely (no bones moved this frame, or the C2-narrow
+    /// path skipped the bone-matrix rebuild). When `is_full_pool`
+    /// the layout shifted (entity add / remove / bone count change)
+    /// and we fall back to a full ensure_and_write. Otherwise each
+    /// range becomes one `queue.write_buffer` call. PERF_DEBT.md D1.
+    pub bone_matrices_dirty: &'a rkp_core::DirtyRanges,
     /// Concatenated forward-pose dual quaternions — one 32-byte
     /// `DualQuat` per bone, parallel to the forward half of
     /// `bone_matrices`. Scatter's DQS branch reads directly from here,
     /// skipping the ~60-ALU per-influence matrix→quat extraction.
     pub bone_dual_quats: &'a [u8],
+    /// Same dirty-range protocol as [`Self::bone_matrices_dirty`]
+    /// but for [`Self::bone_dual_quats`]. PERF_DEBT.md D1.
+    pub bone_dual_quats_dirty: &'a rkp_core::DirtyRanges,
     /// Per-instance paint overlay entries — one `OverlayEntry` (16 B)
     /// per painted leaf per painted instance. Each
     /// `RkpGpuInstance.overlay_offset` + `overlay_count` slices into
@@ -748,20 +759,45 @@ impl RkpScene {
         let mut needs_rebuild = Self::ensure_and_write(device, queue, &mut self.objects_buffer, "rkp_objects", inst_bytes);
         needs_rebuild |= Self::ensure_and_write(device, queue, &mut self.assets_buffer, "rkp_assets", asset_bytes);
 
-        // Bone matrices — cheap per-frame upload. When the scene has no
-        // skinned entities the slice is empty; ensure_and_write keeps
-        // the 64-byte placeholder buffer from new() so the bind group
-        // stays valid.
+        // Bone matrices — PERF_DEBT.md D1 delta upload. The dirty
+        // ranges from sim's BoneMatrixAllocator describe which bytes
+        // changed since last upload; empty = skip entirely (no bones
+        // moved this frame, or sim took the C2-narrow path and
+        // didn't rebuild the bone buffers at all); `is_full_pool` =
+        // fall back to ensure_and_write (covers buffer grow + entity
+        // set / bone count changes). When the scene has no skinned
+        // entities the slice is empty and the buffer keeps its
+        // 64-byte placeholder from new() so the bind group stays
+        // valid.
         if !data.bone_matrices.is_empty() {
-            needs_rebuild |= Self::ensure_and_write(
+            needs_rebuild |= Self::write_with_dirty(
                 device, queue, &mut self.bone_matrices_buffer,
                 "rkp_bone_matrices", data.bone_matrices,
+                data.bone_matrices_dirty,
             );
         }
         if !data.bone_dual_quats.is_empty() {
-            needs_rebuild |= Self::ensure_and_write(
+            needs_rebuild |= Self::write_with_dirty(
                 device, queue, &mut self.bone_dual_quats_buffer,
                 "rkp_bone_dual_quats", data.bone_dual_quats,
+                data.bone_dual_quats_dirty,
+            );
+        }
+        // D1 telemetry. Quiet by default; env-gated so the validation
+        // pass on splat5 can confirm the upload bytes actually drop
+        // without spamming the console in normal runs.
+        if std::env::var("RKP_BONE_UPLOAD_PROFILE").is_ok() {
+            let mat_bytes = data.bone_matrices_dirty.total_dirty_bytes();
+            let dq_bytes = data.bone_dual_quats_dirty.total_dirty_bytes();
+            let mat_ranges = data.bone_matrices_dirty.range_count();
+            let dq_ranges = data.bone_dual_quats_dirty.range_count();
+            eprintln!(
+                "[bone-upload] mat={:.3} KiB ({} ranges) dq={:.3} KiB ({} ranges) total_buf={:.3} KiB",
+                mat_bytes as f64 / 1024.0,
+                mat_ranges,
+                dq_bytes as f64 / 1024.0,
+                dq_ranges,
+                (data.bone_matrices.len() + data.bone_dual_quats.len()) as f64 / 1024.0,
             );
         }
         if !data.instance_overlays.is_empty() {
@@ -780,6 +816,66 @@ impl RkpScene {
         if needs_rebuild {
             self.buffers_epoch += 1;
         }
+    }
+
+    /// Delta-upload variant of [`Self::ensure_and_write`]. Routes the
+    /// upload based on `dirty`:
+    /// * `is_empty()` — nothing to do (bytes match GPU buffer already).
+    /// * `is_full_pool()` — single full-buffer write (covers buffer
+    ///   grow and layout-shift cases that the dirty ranges can't
+    ///   incrementally describe).
+    /// * otherwise — one `queue.write_buffer` per range. The buffer
+    ///   must already be at least `data.len()` bytes; if not we grow
+    ///   first (which forces a full rewrite — every range becomes
+    ///   stale against the new buffer).
+    ///
+    /// Returns `true` when the buffer was reallocated (caller's
+    /// bind groups need to rebuild). PERF_DEBT.md D1.
+    fn write_with_dirty(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer: &mut wgpu::Buffer,
+        label: &str,
+        data: &[u8],
+        dirty: &rkp_core::DirtyRanges,
+    ) -> bool {
+        if data.is_empty() {
+            return false;
+        }
+        let needed = data.len() as u64;
+        if needed > buffer.size() {
+            // Grow path: reallocate + full rewrite. The 2× headroom
+            // matches ensure_and_write so streams of growing uploads
+            // reallocate O(log N) times rather than every frame.
+            let new_size = needed.max(buffer.size().saturating_mul(2)).max(64);
+            *buffer = Self::create_storage(device, label, new_size);
+            queue.write_buffer(buffer, 0, data);
+            return true;
+        }
+        if dirty.is_empty() {
+            // Sim told us nothing changed since last upload —
+            // skipping is the whole point of D1.
+            return false;
+        }
+        if dirty.is_full_pool(data.len() as u32) {
+            queue.write_buffer(buffer, 0, data);
+            return false;
+        }
+        for (off, len) in dirty.iter() {
+            let off = off as usize;
+            let len = len as usize;
+            // Defensive: cap at slice length. The allocator computes
+            // offsets in the same units we emit here, so a range past
+            // `data.len()` would mean the allocator got out of sync
+            // with the snapshot — treat as a bug surfaced at runtime
+            // by clamping rather than panicking the render thread.
+            if off >= data.len() {
+                continue;
+            }
+            let end = (off + len).min(data.len());
+            queue.write_buffer(buffer, off as u64, &data[off..end]);
+        }
+        false
     }
 
     fn ensure_and_write(

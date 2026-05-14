@@ -316,17 +316,34 @@ fn mat_to_dual_quat(mat: Mat4) -> DualQuat {
     }
 }
 
+/// One entity's slot in the flat bone-matrix layout. Held in
+/// [`BoneMatrixAllocator::layout`] across rebuilds; D1 uses it to
+/// detect "layout unchanged" frames where we can do per-entity delta
+/// uploads instead of rewriting the whole buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoneSlot {
+    entity_bits: u64,
+    bone_count: u32,
+    /// In mat4 units (forward palette start). Inverse starts at
+    /// `mat_offset + bone_count`.
+    mat_offset: u32,
+    /// In `DualQuat` (32 B) units. Forward only.
+    dq_offset: u32,
+}
+
 #[derive(Default)]
 pub struct BoneMatrixAllocator {
     /// Concatenated palettes: per entity, `mat4x4<f32>` forward-then-
-    /// inverse, entities in iteration order. Wrapped in `Arc<Vec<u8>>`
-    /// so the per-tick snapshot handoff is a refcount bump rather than
-    /// an ~58 MB memcpy of the prior `.bytes().to_vec()` design (PERF_DEBT
-    /// A3). Mutations during [`Self::rebuild`] reach into the Vec via
-    /// [`Self::bytes_mut`] (`Arc::make_mut`); the COW happens once per
-    /// rebuild when render still holds last frame's `Arc`, but we
-    /// immediately clear the Vec, so `make_mut` on a refcount=2 Arc
-    /// reallocates fresh — no payload copy of the old contents.
+    /// inverse, entities in `Entity::to_bits()` order (stable across
+    /// rebuilds — D1 depends on this for delta-upload correctness).
+    /// Wrapped in `Arc<Vec<u8>>` so the per-tick snapshot handoff is a
+    /// refcount bump rather than an ~58 MB memcpy of the prior
+    /// `.bytes().to_vec()` design (PERF_DEBT A3). Mutations during
+    /// [`Self::rebuild`] reach into the Vec via `Arc::make_mut`; the
+    /// COW happens once per rebuild when render still holds last
+    /// frame's `Arc`, but we immediately clear the Vec, so `make_mut`
+    /// on a refcount=2 Arc reallocates fresh — no payload copy of the
+    /// old contents.
     bytes: std::sync::Arc<Vec<u8>>,
     /// Concatenated forward dual quats — one `DualQuat` per bone per
     /// entity. Parallel to the forward half of `bytes` (same entity
@@ -335,6 +352,27 @@ pub struct BoneMatrixAllocator {
     bytes_dq: std::sync::Arc<Vec<u8>>,
     /// Entity → `SkinnedBinding` for the current frame.
     bindings: std::collections::HashMap<hecs::Entity, SkinnedBinding>,
+    /// Stable slot layout from the previous rebuild. Compared against
+    /// the new layout each rebuild — when identical, we know the
+    /// byte offsets of every entity's pose didn't shift, so we can
+    /// emit per-entity dirty ranges instead of a full-buffer mark.
+    /// PERF_DEBT.md D1.
+    layout: Vec<BoneSlot>,
+    /// Per-entity forward pose snapshot from the previous rebuild.
+    /// `current_pose == previous_pose[entity]` means the entity's
+    /// bones didn't move this tick and its slot bytes are identical
+    /// to last frame — no upload required. Cleared and refilled each
+    /// rebuild. PERF_DEBT.md D1.
+    previous_poses: std::collections::HashMap<hecs::Entity, Vec<Mat4>>,
+    /// Byte ranges in [`Self::bytes`] that differ from the GPU
+    /// buffer's contents (i.e. that need re-uploading). Filled in
+    /// during rebuild based on per-entity pose comparison. Drained
+    /// (via [`Self::take_mat_dirty`]) when the sim builds a render
+    /// frame; the consumer translates the ranges to
+    /// `queue.write_buffer` calls.
+    mat_dirty: rkp_core::DirtyRanges,
+    /// Same shape as [`Self::mat_dirty`] but for [`Self::bytes_dq`].
+    dq_dirty: rkp_core::DirtyRanges,
 }
 
 impl BoneMatrixAllocator {
@@ -349,6 +387,14 @@ impl BoneMatrixAllocator {
     ///   forward slot at `[off + i]`, inverse at `[off + bone_count + i]`.
     /// * `bone_dq_offset` indexes `bone_dual_quats` in DualQuat units —
     ///   forward slot at `[off + i]`. No inverse palette in this buffer.
+    ///
+    /// Entities are processed in `Entity::to_bits()` order so the
+    /// slot layout is stable across rebuilds when the entity set and
+    /// per-entity bone counts are unchanged. PERF_DEBT.md D1 uses
+    /// that stability to emit per-entity dirty ranges instead of a
+    /// full-buffer mark whenever animation::tick advanced only some
+    /// players (or none — the dirty set ends up empty and the
+    /// render-side upload becomes a no-op).
     pub fn rebuild(&mut self, world: &hecs::World) {
         // `Arc::make_mut` reuses the Vec when refcount==1 (typical
         // case after render dropped last frame's snapshot) and
@@ -359,25 +405,66 @@ impl BoneMatrixAllocator {
         std::sync::Arc::make_mut(&mut self.bytes).clear();
         std::sync::Arc::make_mut(&mut self.bytes_dq).clear();
         self.bindings.clear();
+        self.mat_dirty.clear();
+        self.dq_dirty.clear();
 
+        // Stable iteration order. hecs query iteration order shifts
+        // when archetypes change (entity add/remove with different
+        // component sets), which would shuffle per-entity offsets in
+        // the byte buffer and invalidate any per-entity dirty range
+        // we tracked against the previous rebuild. We materialize
+        // into a Vec so the query's internal QueryBorrow drops before
+        // we mutate `self.bindings` / `self.bytes` below.
+        let mut query = world.query::<&crate::components::Skeleton>();
+        let mut entities: Vec<(hecs::Entity, Vec<Mat4>, Vec<Mat4>)> = query
+            .iter()
+            .filter(|(_, skel)| !skel.current_pose.is_empty())
+            .map(|(e, skel)| (e, skel.current_pose.clone(), skel.inverse_pose.clone()))
+            .collect();
+        drop(query);
+        entities.sort_by_key(|(e, _, _)| e.to_bits());
+
+        // Compute the new slot layout up front so the layout-equality
+        // check below has both inputs before we touch the byte
+        // buffers.
+        let mut new_layout: Vec<BoneSlot> = Vec::with_capacity(entities.len());
+        {
+            let mut mat_off: u32 = 0;
+            let mut dq_off: u32 = 0;
+            for (entity, current_pose, _inverse_pose) in &entities {
+                let bone_count = current_pose.len() as u32;
+                new_layout.push(BoneSlot {
+                    entity_bits: entity.to_bits().into(),
+                    bone_count,
+                    mat_offset: mat_off,
+                    dq_offset: dq_off,
+                });
+                mat_off += bone_count * 2;
+                dq_off += bone_count;
+            }
+        }
+        let layout_unchanged = self.layout == new_layout;
+
+        // Rebuild byte buffers + bindings while tracking dirty ranges.
+        // `running_mat_offset`/`running_dq_offset` mirror `new_layout`
+        // so we don't re-derive them here.
+        let mut next_previous_poses: std::collections::HashMap<hecs::Entity, Vec<Mat4>> =
+            std::collections::HashMap::with_capacity(entities.len());
         let mut running_mat_offset: u32 = 0;
         let mut running_dq_offset: u32 = 0;
-        for (entity, skel) in world.query::<&crate::components::Skeleton>().iter() {
-            let bone_count = skel.current_pose.len() as u32;
-            if bone_count == 0 {
-                continue;
-            }
+        for (entity, current_pose, inverse_pose) in entities {
+            let bone_count = current_pose.len() as u32;
             // Forward palette first, then inverse palette. They must be
             // the same length — `animation::tick` keeps them in sync.
-            let fwd: &[u8] = bytemuck::cast_slice(&skel.current_pose);
-            let inv: &[u8] = bytemuck::cast_slice(&skel.inverse_pose);
+            let fwd: &[u8] = bytemuck::cast_slice(&current_pose);
+            let inv: &[u8] = bytemuck::cast_slice(&inverse_pose);
             let bytes = std::sync::Arc::make_mut(&mut self.bytes);
             bytes.extend_from_slice(fwd);
             bytes.extend_from_slice(inv);
 
             // Precomputed forward dual quats for the DQS scatter branch.
             // One DQ per bone — scatter doesn't need inverse dual quats.
-            let dqs: Vec<DualQuat> = skel.current_pose.iter()
+            let dqs: Vec<DualQuat> = current_pose.iter()
                 .map(|m| mat_to_dual_quat(*m))
                 .collect();
             std::sync::Arc::make_mut(&mut self.bytes_dq)
@@ -395,10 +482,66 @@ impl BoneMatrixAllocator {
                 bone_field_occ_offset: 0,
                 bone_dq_offset: running_dq_offset,
             });
+
+            // D1 per-entity dirty tracking. When the layout is
+            // unchanged across rebuilds and the entity's forward pose
+            // is bit-identical to last frame, this entity contributed
+            // nothing new to the byte buffer — leave its slot out of
+            // the dirty ranges and the render side skips its upload.
+            // Inverse pose is derived from forward in animation::tick,
+            // so a forward match implies an inverse match; we don't
+            // hash them separately. When the layout shifted (entity
+            // add / remove / bone count change) we fall through to
+            // the `mark_full` branch below.
+            if layout_unchanged {
+                let pose_changed = match self.previous_poses.get(&entity) {
+                    Some(p) => p != &current_pose,
+                    // First time we see this entity at the current
+                    // layout — must upload its slot once. (In
+                    // practice unreachable when layout_unchanged is
+                    // true, but defensive.)
+                    None => true,
+                };
+                if pose_changed {
+                    let mat_byte_off = running_mat_offset
+                        .checked_mul(64)
+                        .expect("bone palette offset overflows u32");
+                    let mat_byte_len = bone_count
+                        .checked_mul(64 * 2)
+                        .expect("bone palette slot size overflows u32");
+                    self.mat_dirty.mark(mat_byte_off, mat_byte_len);
+                    let dq_byte_off = running_dq_offset
+                        .checked_mul(32)
+                        .expect("bone dq offset overflows u32");
+                    let dq_byte_len = bone_count
+                        .checked_mul(32)
+                        .expect("bone dq slot size overflows u32");
+                    self.dq_dirty.mark(dq_byte_off, dq_byte_len);
+                }
+            }
+
+            next_previous_poses.insert(entity, current_pose);
+
             // Advance past both palettes.
             running_mat_offset += bone_count * 2;
             running_dq_offset += bone_count;
         }
+
+        if !layout_unchanged {
+            // Layout shifted — every byte in the new buffer needs to
+            // overwrite the corresponding byte in the GPU buffer (which
+            // still holds last frame's layout). Falling back to
+            // `mark_full` lets the render side use its existing
+            // grow-or-rewrite ensure_and_write path.
+            self.mat_dirty.mark_full(self.bytes.len() as u32);
+            self.dq_dirty.mark_full(self.bytes_dq.len() as u32);
+        }
+
+        // Stale `previous_poses` entries for entities that vanished
+        // would just sit there until the next rebuild that names them
+        // (never). Replace wholesale.
+        self.previous_poses = next_previous_poses;
+        self.layout = new_layout;
     }
 
     /// Flat byte buffer ready to ship in `FrameUpload.bone_matrices`.
@@ -421,6 +564,28 @@ impl BoneMatrixAllocator {
     /// Lookup a skinning binding for an entity, or `None` if unskinned.
     pub fn binding(&self, entity: hecs::Entity) -> Option<SkinnedBinding> {
         self.bindings.get(&entity).copied()
+    }
+
+    /// Consume the byte ranges that changed in [`Self::bytes`] since
+    /// the last [`Self::take_mat_dirty`] call. The sim folds the
+    /// returned ranges into the [`crate::render_frame::RenderFrame`]
+    /// snapshot it ships to the render thread; the render side
+    /// translates them to `queue.write_buffer` calls instead of
+    /// rewriting the entire bone-matrix buffer. PERF_DEBT.md D1.
+    ///
+    /// After this call the allocator's `mat_dirty` is empty — a
+    /// subsequent snapshot built without an intervening
+    /// [`Self::rebuild`] reports no dirty ranges, so the render side
+    /// skips the upload entirely. That handles the C2-narrow path
+    /// where `update_scene_gpu` (and therefore `rebuild`) doesn't
+    /// run.
+    pub fn take_mat_dirty(&mut self) -> rkp_core::DirtyRanges {
+        std::mem::take(&mut self.mat_dirty)
+    }
+
+    /// Same as [`Self::take_mat_dirty`] for [`Self::bytes_dq`].
+    pub fn take_dq_dirty(&mut self) -> rkp_core::DirtyRanges {
+        std::mem::take(&mut self.dq_dirty)
     }
 }
 
