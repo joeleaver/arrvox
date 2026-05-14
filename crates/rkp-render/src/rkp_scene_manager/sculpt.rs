@@ -644,14 +644,49 @@ impl RkpSceneManager {
         // extend(...)` because we read in a separate scope per cluster
         // and the extend goes to the TAIL — the original cluster slot
         // (which we read) is not touched.
+        //
+        // **D1 — cluster-AABB → brush-sphere rejection.** `clusters_in_
+        // brush_grid_aabb` returns every LOD-0 cluster whose grid AABB
+        // overlaps the brush AABB. A box-vs-box test admits clusters
+        // whose AABB corners touch the brush box but whose closest
+        // point to the brush *sphere* center is still outside the
+        // sphere — every triangle in those clusters would survive the
+        // per-tri test below. Pre-D1 the loop ran the per-tri test
+        // anyway: 80+ clusters × ~3000 tris × 3 length_squared = ~700k
+        // float ops/stamp on splat5 elephant. D1 short-circuits each
+        // sphere-outside cluster to a single `extend_from_slice` of
+        // its original indices — saves the per-tri loop entirely
+        // for those clusters. Sphere-inside clusters still run the
+        // per-tri test (some of their tris may be inside the sphere).
         let mut total_kept_tris = 0usize;
         let mut total_dropped_tris = 0usize;
+        // D1 telemetry — count clusters that took the sphere-outside
+        // fast path. High ratios prove the AABB → sphere filter is
+        // doing its job; low ratios mean the brush sphere genuinely
+        // touches most candidate clusters and the per-tri test is
+        // unavoidable.
+        let mut d1_clusters_sphere_outside = 0usize;
         for &cid in &dirty {
-            let (start, count) = {
+            let (start, count, cluster_aabb_min, cluster_aabb_max) = {
                 let Some(entry) = self.asset_cache.get(handle) else { return false; };
                 let c = &entry.meshlet_clusters[cid as usize];
-                (c.index_offset as usize, c.index_count as usize)
+                (
+                    c.index_offset as usize,
+                    c.index_count as usize,
+                    Vec3::from(c.aabb_min),
+                    Vec3::from(c.aabb_max),
+                )
             };
+
+            // Sphere-AABB rejection: closest point on the cluster's
+            // AABB to the brush center. If it's outside the brush
+            // sphere, no tri in this cluster can have a vertex inside.
+            let closest = brush_center_local.clamp(cluster_aabb_min, cluster_aabb_max);
+            let aabb_dist_sq = (closest - brush_center_local).length_squared();
+            let cluster_fully_outside = aabb_dist_sq > brush_radius_sq;
+            if cluster_fully_outside {
+                d1_clusters_sphere_outside += 1;
+            }
 
             // Snapshot tri-by-tri "keep" decisions into a small vec to
             // dodge borrow-checker fights between immutable reads of
@@ -659,25 +694,31 @@ impl RkpSceneManager {
             let kept: Vec<u32> = {
                 let Some(entry) = self.asset_cache.get(handle) else { return false; };
                 let indices = &entry.mesh_indices;
-                let verts = &entry.mesh_vertices;
-                let mut out = Vec::with_capacity(count);
-                for tri_start in (start..start + count).step_by(3) {
-                    let i0 = indices[tri_start];
-                    let i1 = indices[tri_start + 1];
-                    let i2 = indices[tri_start + 2];
-                    let p0 = Vec3::from(verts[i0 as usize].local_pos);
-                    let p1 = Vec3::from(verts[i1 as usize].local_pos);
-                    let p2 = Vec3::from(verts[i2 as usize].local_pos);
-                    let d0 = (p0 - brush_center_local).length_squared();
-                    let d1 = (p1 - brush_center_local).length_squared();
-                    let d2 = (p2 - brush_center_local).length_squared();
-                    if d0 > brush_radius_sq && d1 > brush_radius_sq && d2 > brush_radius_sq {
-                        out.push(i0);
-                        out.push(i1);
-                        out.push(i2);
+                if cluster_fully_outside {
+                    // Every tri is "keep" — just copy the original
+                    // index range. Saves the per-tri sphere test.
+                    indices[start..start + count].to_vec()
+                } else {
+                    let verts = &entry.mesh_vertices;
+                    let mut out = Vec::with_capacity(count);
+                    for tri_start in (start..start + count).step_by(3) {
+                        let i0 = indices[tri_start];
+                        let i1 = indices[tri_start + 1];
+                        let i2 = indices[tri_start + 2];
+                        let p0 = Vec3::from(verts[i0 as usize].local_pos);
+                        let p1 = Vec3::from(verts[i1 as usize].local_pos);
+                        let p2 = Vec3::from(verts[i2 as usize].local_pos);
+                        let d0 = (p0 - brush_center_local).length_squared();
+                        let d1 = (p1 - brush_center_local).length_squared();
+                        let d2 = (p2 - brush_center_local).length_squared();
+                        if d0 > brush_radius_sq && d1 > brush_radius_sq && d2 > brush_radius_sq {
+                            out.push(i0);
+                            out.push(i1);
+                            out.push(i2);
+                        }
                     }
+                    out
                 }
-                out
             };
 
             total_kept_tris += kept.len() / 3;
@@ -854,12 +895,13 @@ impl RkpSceneManager {
         // dominant sub-phase identifies which step of the cluster
         // patch path to target next (filter vs extract vs CC walk).
         eprintln!(
-            "[sculpt] V2 patch: handle={:?} dirty={} kept_tris={} dropped_tris={} \
+            "[sculpt] V2 patch: handle={:?} dirty={} (sphere_outside={}) kept_tris={} dropped_tris={} \
              brush_patch verts={} tris={} total flat verts={} indices={} \
              lod_dirty={}/{} ({:.0}%) ({:.2}ms) \
              [phases: setup={:.2} dirty_q={:.2} filter={:.2} extract={:.2} append={:.2} cc_walk={:.2}]",
             handle,
             dirty.len(),
+            d1_clusters_sphere_outside,
             total_kept_tris,
             total_dropped_tris,
             brush_verts.len(),
