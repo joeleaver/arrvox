@@ -1,6 +1,6 @@
 # Engine performance-debt eradication plan
 
-**Status**: in progress (Phase A complete; B1 + B2 + B3 + C1 + C2 + C2-narrow + C3 + D1 + D2 + D3 + D4 shipped; Phase E next). Feature work paused.
+**Status**: complete (Phase A + B + C + D + E all shipped). Feature work may resume.
 
 This document is the authoritative plan for eliminating systemic "rebuild
 everything every tick" patterns from rkp-engine and rkp-render. It was
@@ -149,13 +149,13 @@ metric moved.
 | **D3 ✅** | Same shape as D2 for `gpu_instance_sculpts`. `gpu_instance_sculpts_dirty: bool` bumped by sculpt stamps + sculpt-bearing entity removes + clear_scene. | Idle-frame skip for the sculpt buffer (was ~13 K × 4 B = 52 KiB ensure_and_write per frame on the splat5 elephant after a drag, regardless of motion). |
 | **D4 ✅** | Hash-gated uploads on three small buffers: `update_lights` and `update_materials` (RkpRenderer-owned, ~1-2 KiB each) cache a `last_*_hash: u64` and short-circuit the `queue.write_buffer` when the incoming bytes match. `upload_shader_params` (per-VR RkpShade-owned, ~32 B × material count) does the same. Realloc / buffer-grow paths always write (different buffer); the hash is reset there so the next identical-content tick still short-circuits. Helper: `d4_hash_bytes` (`DefaultHasher` — small enough that the ~µs hash cost dominates over `queue.write_buffer` driver overhead). | Skips 3 small writes per frame in steady state. Quiet win (small absolute bytes, but every frame counts in idle). Verified live in the editor: scene load + animation playback complete without runtime issues; hash gates are structurally identical to D1's tested path. |
 
-### Phase E — Cross-thread decoupling (optional but ideal)
+### Phase E — Cross-thread decoupling (shipped)
 
 | Step | Change | Result |
 |---|---|---|
-| **E1** | Painted-walk on worker thread. Sim submits RenderFrame without waiting; walk result lands in next snapshot. | Sim never blocks on walk |
-| **E2** | Collider rebuild on worker thread. | Sim never blocks on collider |
-| **E3** | `arc-swap` for atomic snapshot-swap of heavy state. | Render reads lock-free |
+| **E1 ✅** | Painted-walk on dedicated worker thread (`engine/paint_walk.rs`). Sim drains `painted_dirty_entities` + `painted_dirty_regions` into a `PaintWalkBatch`, submits via bounded(1) crossbeam inbox, merges the `PaintWalkResult` on a subsequent tick. Three correctness twists vs naive offload: (a) don't pre-clear `painted_per_entity` on geom-bump blanket-invalidate — old entries stay through the worker's in-flight window so the flat rebuild keeps producing anchors at last-known positions; (b) clone (don't move) the existing per-entity cache when building each job; (c) track `painted_walk_submitted_geom_epoch` to suppress redundant blanket-invalidations while a batch is in flight. Result-merge also filters out entries for entities that were despawned mid-batch. | Sim never blocks on the painted-material walk. `submit_render_frame` no longer contains an O(dirty-tree) walk at all. |
+| **E2 ✅** | Collider rebuild on dedicated worker thread (`engine/collider_worker.rs`). Mirrors E1's shape: bounded(1) crossbeam inbox + `in_flight` atomic. Sim drains `collider_caches_dirty` (or world-walks every RigidBody on `is_all()`), captures per-entity inputs into `ColliderJob`s, submits with a `WalkSnapshot`, inserts the resulting `ColliderCache` ECS components after `try_recv`. Refactored `compute_tight_local_aabb` + `build_coarse_collider` to take `brick_pool: &[u32]` (the same data the `BrickPool` holds inside its `Arc<Vec<u32>>`) instead of `&BrickPool` so the compute is worker-callable. Synchronous `rebuild_collider_caches` remains for the `PlayStart` handler in `cmd_runtime` — play-mode entry needs collider caches present immediately. | Sim never blocks on collider rebuild. (Latent today — no per-stamp setter touches `geometry_dirty`; defensive scaffolding for future setters.) |
+| **E3 ✅** | `RenderInbox` slot moves from `Mutex<Option<RenderFrame>>` to `arc_swap::ArcSwapOption<RenderFrame>`. Steady-state `try_take` (called every render iteration after bootstrap) is now lock-free — one atomic swap, no mutex. Bootstrap `take_blocking` + `submit` still use a tiny `Mutex<()> + Condvar` for the wakeup signal (held only across `notify_one` / pre-wait recheck, never across frame transit). SPSC invariant guarantees `Arc::try_unwrap` succeeds in steady state; `unwrap_inbox_arc` defensively spin+yields a few times before panicking. | Render reads frame slot lock-free. Closes the principle "sim and render are decoupled in time" by removing the last shared lock from the steady-state handoff path. |
 
 ---
 
