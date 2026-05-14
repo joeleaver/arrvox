@@ -63,6 +63,24 @@ fn pixel_threshold_env(name: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
+/// PERF_DEBT.md D4 hash gate. Tiny buffers (material palette ~1 KB,
+/// lights ~2 KB, per-VR shader_params ~32 B × material count) are
+/// shipped from sim to render every frame even when their content
+/// hasn't changed; hashing the bytes and skipping the
+/// `queue.write_buffer` when the hash matches the previous upload is
+/// a cheap win across the steady state.
+///
+/// `0` is reserved as a "never uploaded" sentinel by the callers — if
+/// content legitimately hashes to zero we just upload one extra time
+/// on first sight; the next match short-circuits.
+#[inline]
+pub(crate) fn d4_hash_bytes(data: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write(data);
+    h.finish()
+}
+
 /// The RKIPatch renderer — shared state only. Per-viewport passes live
 /// in [`ViewportRenderer`].
 pub struct RkpRenderer {
@@ -87,6 +105,16 @@ pub struct RkpRenderer {
     /// Bumps when `lights_buffer` or `materials_buffer` reallocates so
     /// ViewportRenderers know to rebuild their march + shade bindings.
     lights_materials_epoch: u64,
+    /// PERF_DEBT.md D4: hash of the last `update_lights` payload.
+    /// `update_lights` short-circuits when the incoming hash matches —
+    /// the sim ships the full Vec every tick but most ticks have
+    /// identical lights, so the per-tick `queue.write_buffer` was
+    /// pure waste. `0` is a sentinel "never uploaded yet" so the
+    /// first call always writes.
+    last_lights_hash: u64,
+    /// PERF_DEBT.md D4: same shape as [`Self::last_lights_hash`] for
+    /// the material palette upload.
+    last_materials_hash: u64,
     /// Skeletal skin-deform scatter pass — writes the per-frame
     /// deformed-space bone field (Phase 3a). See `skin_deform.rs`.
     pub skin_deform: crate::skin_deform::SkinDeformPass,
@@ -340,6 +368,8 @@ impl RkpRenderer {
             lights_buffer, lights_capacity,
             materials_buffer, materials_capacity,
             lights_materials_epoch: 0,
+            last_lights_hash: 0,
+            last_materials_hash: 0,
             skin_deform,
             splat_pass,
             splat_resolve,
@@ -2447,8 +2477,23 @@ impl RkpRenderer {
             );
             self.lights_capacity = self.lights_buffer.size();
             self.lights_materials_epoch += 1;
+            // Reset the hash gate on realloc — the new buffer has the
+            // bytes already (create_init_buffer mapped + memcpy'd), so
+            // record this content as the "last uploaded" so the next
+            // identical-content tick still short-circuits the
+            // queue.write_buffer.
+            self.last_lights_hash = d4_hash_bytes(data);
         } else {
-            queue.write_buffer(&self.lights_buffer, 0, data);
+            // PERF_DEBT.md D4: skip the upload when the content matches
+            // the prior tick's. Sim hands us the full Vec every tick;
+            // most ticks the lights are unchanged (no entity moved,
+            // no env tweak). The hash is ~few µs for a ~2 KB buffer —
+            // cheaper than the GPU upload it replaces.
+            let hash = d4_hash_bytes(data);
+            if hash != self.last_lights_hash {
+                queue.write_buffer(&self.lights_buffer, 0, data);
+                self.last_lights_hash = hash;
+            }
         }
     }
 
@@ -2464,8 +2509,14 @@ impl RkpRenderer {
             );
             self.materials_capacity = self.materials_buffer.size();
             self.lights_materials_epoch += 1;
+            self.last_materials_hash = d4_hash_bytes(data);
         } else {
-            queue.write_buffer(&self.materials_buffer, 0, data);
+            // PERF_DEBT.md D4: hash-gated skip — see `update_lights`.
+            let hash = d4_hash_bytes(data);
+            if hash != self.last_materials_hash {
+                queue.write_buffer(&self.materials_buffer, 0, data);
+                self.last_materials_hash = hash;
+            }
         }
     }
 

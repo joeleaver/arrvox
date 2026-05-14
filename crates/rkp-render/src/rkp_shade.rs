@@ -40,6 +40,12 @@ pub struct RkpShadePass {
     /// `upload_shader_params` grows it as the materials array grows.
     shader_params_buffer: wgpu::Buffer,
     shader_params_buffer_capacity: u64,
+    /// PERF_DEBT.md D4: hash of the last `upload_shader_params`
+    /// payload. The full slot array ships from sim every tick per
+    /// viewport, but the content rarely changes; the hash gate skips
+    /// the `queue.write_buffer` when the bytes match. `0` = "never
+    /// uploaded" sentinel; the first upload always writes.
+    last_shader_params_hash: u64,
     /// Hash of the user-shader chunk currently compiled into the
     /// pipeline. `0` is the "no user shaders" sentinel; matches
     /// `UserShaderRegistry::default()::source_hash()`.
@@ -505,6 +511,7 @@ impl RkpShadePass {
             brush_state_bind_group: None,
             shader_params_buffer,
             shader_params_buffer_capacity,
+            last_shader_params_hash: 0,
             source_hash: 0,
             width,
             height,
@@ -543,7 +550,8 @@ impl RkpShadePass {
         slots: &[[f32; 8]],
     ) {
         let needed = ((slots.len().max(1)) * std::mem::size_of::<[f32; 8]>()) as u64;
-        if needed > self.shader_params_buffer_capacity {
+        let grew = needed > self.shader_params_buffer_capacity;
+        if grew {
             let mut new_cap = self.shader_params_buffer_capacity.max(32);
             while new_cap < needed {
                 new_cap = new_cap.saturating_mul(2);
@@ -557,13 +565,24 @@ impl RkpShadePass {
             self.shader_params_buffer_capacity = new_cap;
             // Bind group will be rebuilt by the next `set_shade_data`.
             self.shade_bind_group = None;
+            // The freshly-created buffer is zero-initialised — last
+            // upload's hash no longer represents what's on the GPU.
+            // Force the write below by clearing the gate.
+            self.last_shader_params_hash = 0;
         }
         if !slots.is_empty() {
-            queue.write_buffer(
-                &self.shader_params_buffer,
-                0,
-                bytemuck::cast_slice(slots),
-            );
+            // PERF_DEBT.md D4: hash-gate the upload. The slot array is
+            // 32 B per material; for a typical project (~50 materials)
+            // it's ~1.5 KiB. Sim ships it on every tick per viewport;
+            // most ticks the params don't change. Hashing on the CPU
+            // costs ~few µs and lets us skip the queue.write_buffer
+            // entirely when content matches the prior upload.
+            let bytes: &[u8] = bytemuck::cast_slice(slots);
+            let hash = super::rkp_renderer::d4_hash_bytes(bytes);
+            if grew || hash != self.last_shader_params_hash {
+                queue.write_buffer(&self.shader_params_buffer, 0, bytes);
+                self.last_shader_params_hash = hash;
+            }
         }
     }
 
