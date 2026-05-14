@@ -381,7 +381,9 @@ pub(super) fn run_pre_frame(
             bone_dual_quats: &frame.bone_matrix_dqs,
             bone_dual_quats_dirty: &frame.bone_matrix_dqs_dirty,
             instance_overlays: overlay_bytes,
+            instance_overlays_dirty: &frame.gpu_instance_overlays_dirty,
             instance_sculpts: sculpt_bytes,
+            instance_sculpts_dirty: &frame.gpu_instance_sculpts_dirty,
         },
     );
 

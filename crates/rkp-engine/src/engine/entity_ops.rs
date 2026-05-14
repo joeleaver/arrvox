@@ -221,8 +221,17 @@ impl EngineState {
             self.uuid_to_entity.remove(&uuid);
         }
         self.entity_tree_order.remove(&entity);
-        self.paint_overlays.remove(&entity);
-        self.sculpt_overlays.remove(&entity);
+        // PERF_DEBT.md D2/D3: removing an entity with a non-empty
+        // overlay/sculpt drops bytes out of the concatenated GPU
+        // buffer (and shifts every later slice). Mark both dirty
+        // when the entry actually existed so an idle entity remove
+        // doesn't flip the flag unnecessarily.
+        if self.paint_overlays.remove(&entity).is_some_and(|o| !o.is_empty()) {
+            self.gpu_instance_overlays_dirty = true;
+        }
+        if self.sculpt_overlays.remove(&entity).is_some_and(|s| !s.is_empty()) {
+            self.gpu_instance_sculpts_dirty = true;
+        }
         // Drop any cached painted-material walk results so the next
         // flat-rebuild doesn't carry phantom leaves for this entity.
         // The dirty set entry (if present) would also resolve to a
@@ -377,6 +386,17 @@ impl EngineState {
         std::sync::Arc::make_mut(&mut self.gpu_instance_overlays).clear();
         std::sync::Arc::make_mut(&mut self.gpu_instance_sculpts).clear();
         self.gpu_to_entity.clear();
+        // PERF_DEBT.md D2/D3: clearing wipes all overlay/sculpt
+        // entries; mark dirty so the snapshot ships a non-empty
+        // DirtyRanges (which write_with_dirty resolves to a single
+        // upload of the post-clear empty buffer — or skipped entirely
+        // if the buffer length is zero).
+        if !self.paint_overlays.is_empty() {
+            self.gpu_instance_overlays_dirty = true;
+        }
+        if !self.sculpt_overlays.is_empty() {
+            self.gpu_instance_sculpts_dirty = true;
+        }
         self.paint_overlays.clear();
         self.sculpt_overlays.clear();
         self.painted_per_entity.clear();

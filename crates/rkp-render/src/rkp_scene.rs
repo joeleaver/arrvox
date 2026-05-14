@@ -124,12 +124,21 @@ pub struct FrameUpload<'a> {
     /// this buffer. Empty `&[]` when no entity carries paint
     /// (placeholder buffer keeps the bind valid).
     pub instance_overlays: &'a [u8],
+    /// PERF_DEBT.md D2: dirty-range protocol matching
+    /// [`Self::bone_matrices_dirty`]. Empty → skip the overlay
+    /// upload entirely (idle tick between paint stamps); else fall
+    /// through to `write_with_dirty`'s `is_full_pool` /
+    /// per-range branches.
+    pub instance_overlays_dirty: &'a rkp_core::DirtyRanges,
     /// Per-instance sculpt overlay — sorted `u32` array of removed
     /// `leaf_attr_id`s, one slice per carved instance. Each
     /// `RkpGpuInstance.sculpt_offset` + `sculpt_count` slices into this
     /// buffer. Empty `&[]` when no entity has been carved (placeholder
     /// buffer keeps the bind valid). Phase A: Carve only.
     pub instance_sculpts: &'a [u8],
+    /// PERF_DEBT.md D3: same dirty-range protocol as
+    /// [`Self::instance_overlays_dirty`] but for `instance_sculpts`.
+    pub instance_sculpts_dirty: &'a rkp_core::DirtyRanges,
 }
 
 /// Per-pool delta-upload telemetry, returned by `upload_pool_delta` /
@@ -783,33 +792,54 @@ impl RkpScene {
                 data.bone_dual_quats_dirty,
             );
         }
-        // D1 telemetry. Quiet by default; env-gated so the validation
-        // pass on splat5 can confirm the upload bytes actually drop
-        // without spamming the console in normal runs.
+        // D1/D2/D3 telemetry. Quiet by default; env-gated so the
+        // validation pass on splat5 can confirm the upload bytes
+        // actually drop without spamming the console in normal runs.
         if std::env::var("RKP_BONE_UPLOAD_PROFILE").is_ok() {
             let mat_bytes = data.bone_matrices_dirty.total_dirty_bytes();
             let dq_bytes = data.bone_dual_quats_dirty.total_dirty_bytes();
             let mat_ranges = data.bone_matrices_dirty.range_count();
             let dq_ranges = data.bone_dual_quats_dirty.range_count();
+            let ovl_bytes = data.instance_overlays_dirty.total_dirty_bytes();
+            let scu_bytes = data.instance_sculpts_dirty.total_dirty_bytes();
+            let ovl_ranges = data.instance_overlays_dirty.range_count();
+            let scu_ranges = data.instance_sculpts_dirty.range_count();
             eprintln!(
-                "[bone-upload] mat={:.3} KiB ({} ranges) dq={:.3} KiB ({} ranges) total_buf={:.3} KiB",
-                mat_bytes as f64 / 1024.0,
+                "[frame-upload] bone={:.3} KiB (mat={}r dq={}r) overlay={:.3} KiB ({}r) sculpt={:.3} KiB ({}r) total_buf bone={:.3} ovl={:.3} scu={:.3} KiB",
+                (mat_bytes + dq_bytes) as f64 / 1024.0,
                 mat_ranges,
-                dq_bytes as f64 / 1024.0,
                 dq_ranges,
+                ovl_bytes as f64 / 1024.0,
+                ovl_ranges,
+                scu_bytes as f64 / 1024.0,
+                scu_ranges,
                 (data.bone_matrices.len() + data.bone_dual_quats.len()) as f64 / 1024.0,
+                data.instance_overlays.len() as f64 / 1024.0,
+                data.instance_sculpts.len() as f64 / 1024.0,
             );
         }
+        // PERF_DEBT.md D2/D3 — delta upload for the flat overlay /
+        // sculpt buffers. Empty `*_dirty` → skip the upload; render's
+        // bind still references the buffer with last frame's content
+        // (which matches sim's `gpu_instance_overlays`/`_sculpts`
+        // since no mutation fired this tick). The mutation sites
+        // (paint stamp / sculpt stamp / entity remove / clear_scene)
+        // flip a bool that the sim's snapshot converts to
+        // `mark_full(buf_len)`; here that resolves through
+        // `write_with_dirty`'s `is_full_pool` branch into a single
+        // `queue.write_buffer`.
         if !data.instance_overlays.is_empty() {
-            needs_rebuild |= Self::ensure_and_write(
+            needs_rebuild |= Self::write_with_dirty(
                 device, queue, &mut self.instance_overlay_buffer,
                 "rkp_instance_overlay", data.instance_overlays,
+                data.instance_overlays_dirty,
             );
         }
         if !data.instance_sculpts.is_empty() {
-            needs_rebuild |= Self::ensure_and_write(
+            needs_rebuild |= Self::write_with_dirty(
                 device, queue, &mut self.instance_sculpt_buffer,
                 "rkp_instance_sculpt", data.instance_sculpts,
+                data.instance_sculpts_dirty,
             );
         }
 

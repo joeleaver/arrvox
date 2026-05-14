@@ -122,6 +122,8 @@ impl EngineState {
             gpu_instances: std::sync::Arc::new(Vec::new()),
             gpu_instance_overlays: std::sync::Arc::new(Vec::new()),
             gpu_instance_sculpts: std::sync::Arc::new(Vec::new()),
+            gpu_instance_overlays_dirty: false,
+            gpu_instance_sculpts_dirty: false,
             splat_draws: std::sync::Arc::new(Vec::new()),
             proxy_draws: std::sync::Arc::new(Vec::new()),
             gpu_to_entity: Vec::new(),

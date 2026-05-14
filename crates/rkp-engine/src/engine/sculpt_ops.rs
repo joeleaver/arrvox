@@ -165,6 +165,13 @@ impl EngineState {
         let overlay = self.sculpt_overlays.entry(entity).or_default();
         overlay.insert_batch(result.removed_leaf_attr_ids);
 
+        // PERF_DEBT.md D3: this stamp added removed-leaf-attr ids to
+        // the entity's sculpt overlay, so the concatenated
+        // `gpu_instance_sculpts` content the render side reads will
+        // differ from last frame after `update_scene_gpu` re-flattens.
+        // Drives the same "skip on idle ticks" path as D2.
+        self.gpu_instance_sculpts_dirty = true;
+
         // Force the next tick to rebuild gpu_instances + flatten the
         // overlay vec — the per-instance `sculpt_offset` / `sculpt_count`
         // get re-assigned each frame inside `update_scene_gpu`.

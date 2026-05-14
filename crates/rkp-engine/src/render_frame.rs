@@ -203,6 +203,17 @@ pub struct RenderFrame {
     pub bone_matrix_lbs_dirty: rkp_core::DirtyRanges,
     /// Same as above for `bone_matrix_dqs`.
     pub bone_matrix_dqs_dirty: rkp_core::DirtyRanges,
+    /// PERF_DEBT.md D2: dirty ranges for the
+    /// `instance_overlay_buffer` upload. `is_empty()` on ticks with
+    /// no paint stamp / overlay-bearing entity remove / scene
+    /// reset → render side skips the upload entirely (the GPU
+    /// buffer still holds last frame's content, which matches
+    /// sim's `gpu_instance_overlays`).
+    pub gpu_instance_overlays_dirty: rkp_core::DirtyRanges,
+    /// PERF_DEBT.md D3: same shape as
+    /// [`Self::gpu_instance_overlays_dirty`] but for the
+    /// `instance_sculpt_buffer` upload.
+    pub gpu_instance_sculpts_dirty: rkp_core::DirtyRanges,
 
     /// Pending click-pick. Render encodes the gbuf copy this frame
     /// and kicks off the async map; the result lands back via

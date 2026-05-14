@@ -455,6 +455,20 @@ pub(crate) struct EngineState {
     /// render thread for upload to `instance_sculpt`. Each `u32` is a
     /// removed `leaf_attr_id`.
     pub(crate) gpu_instance_sculpts: std::sync::Arc<Vec<u32>>,
+    /// PERF_DEBT.md D2: pending-mutation flag for
+    /// `gpu_instance_overlays`. Set by paint stamps / overlay-
+    /// bearing entity removes / scene reset. Drained by
+    /// `submit_render_frame` into the `RenderFrame` snapshot as a
+    /// `DirtyRanges` with the buffer's current length (so the
+    /// render side's `write_with_dirty` sees `is_full_pool` and does
+    /// a single full upload), then cleared. False on ticks where no
+    /// overlay-mutating event fired — the snapshot carries empty
+    /// `DirtyRanges` and the render skips the upload entirely.
+    pub(crate) gpu_instance_overlays_dirty: bool,
+    /// PERF_DEBT.md D3: same shape as
+    /// [`Self::gpu_instance_overlays_dirty`] but for
+    /// `gpu_instance_sculpts`.
+    pub(crate) gpu_instance_sculpts_dirty: bool,
     /// Splat-rasterizer per-instance draws. One entry per `Renderable`
     /// entity whose asset_handle is `Some(_)`. Built alongside
     /// `gpu_instances` in `update_scene_gpu`. Used only when the

@@ -164,6 +164,15 @@ impl EngineState {
             // a long pause between stamps doesn't leak into idle
             // before the user resumes the drag.
             self.last_paint_stamp_at = Some(std::time::Instant::now());
+            // PERF_DEBT.md D2: this stamp grew (or replaced) the
+            // entity's paint overlay slice, so the concatenated
+            // `gpu_instance_overlays` content the render side reads
+            // will differ from last frame after `update_scene_gpu`
+            // re-flattens. Marks the upload as dirty so the snapshot
+            // ships a non-empty `DirtyRanges`; an idle tick without a
+            // stamp leaves this false → render skips the overlay
+            // upload entirely.
+            self.gpu_instance_overlays_dirty = true;
             // Per-instance `overlay_offset` / `overlay_count` shift
             // every time the overlay vec grows (or, in theory,
             // shrinks via erase). Force a `gpu_instances` rebuild on

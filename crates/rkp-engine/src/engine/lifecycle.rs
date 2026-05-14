@@ -948,6 +948,36 @@ impl EngineState {
         // snapshot without an intervening rebuild reports empty too.
         let bone_matrix_lbs_dirty = self.bone_matrix_allocator.take_mat_dirty();
         let bone_matrix_dqs_dirty = self.bone_matrix_allocator.take_dq_dirty();
+        // PERF_DEBT.md D2/D3: convert the boolean dirty flags into
+        // DirtyRanges with the current buffer size. Set on stamps,
+        // entity removes, scene clears — empty on idle ticks. Empty
+        // → render side skips the overlay/sculpt upload entirely.
+        let gpu_instance_overlays_dirty = if self.gpu_instance_overlays_dirty {
+            self.gpu_instance_overlays_dirty = false;
+            let mut d = rkp_core::DirtyRanges::new();
+            // Buffer length in BYTES — gpu_instance_overlays stores
+            // OverlayEntry (16 B) values, so the byte length is
+            // `len * size_of::<OverlayEntry>()`.
+            let byte_len = self.gpu_instance_overlays.len()
+                .saturating_mul(std::mem::size_of::<rkp_core::OverlayEntry>())
+                as u32;
+            d.mark_full(byte_len);
+            d
+        } else {
+            rkp_core::DirtyRanges::new()
+        };
+        let gpu_instance_sculpts_dirty = if self.gpu_instance_sculpts_dirty {
+            self.gpu_instance_sculpts_dirty = false;
+            let mut d = rkp_core::DirtyRanges::new();
+            // gpu_instance_sculpts stores u32 (4 B) values.
+            let byte_len = self.gpu_instance_sculpts.len()
+                .saturating_mul(std::mem::size_of::<u32>())
+                as u32;
+            d.mark_full(byte_len);
+            d
+        } else {
+            rkp_core::DirtyRanges::new()
+        };
 
         // 2b. Skin scatter — fold per-entity dispatches into one
         //     batched compute dispatch sim-side; render fires the
@@ -1460,6 +1490,8 @@ impl EngineState {
             bone_matrix_dqs,
             bone_matrix_lbs_dirty,
             bone_matrix_dqs_dirty,
+            gpu_instance_overlays_dirty,
+            gpu_instance_sculpts_dirty,
             pending_pick,
             cloud_sun_atten: self.cloud_sun_atten,
             lod_enabled: self.lod_enabled,

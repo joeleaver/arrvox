@@ -1,6 +1,6 @@
 # Engine performance-debt eradication plan
 
-**Status**: in progress (Phase A complete; B1 + B2 + B3 + C1 + C2 + C2-narrow + C3 + D1 shipped; D2/D3/D4 + Phase E next). Feature work paused.
+**Status**: in progress (Phase A complete; B1 + B2 + B3 + C1 + C2 + C2-narrow + C3 + D1 + D2 + D3 shipped; D4 + Phase E next). Feature work paused.
 
 This document is the authoritative plan for eliminating systemic "rebuild
 everything every tick" patterns from rkp-engine and rkp-render. It was
@@ -145,8 +145,8 @@ metric moved.
 | Step | Change | Result |
 |---|---|---|
 | **D1 ✅** | `BoneMatrixAllocator` gains per-entity dirty ranges. Entities sorted by `Entity::to_bits()` for stable layout across rebuilds; layout-equality check decides per-entity-delta vs `mark_full` fallback. Each entity's slot compared bone-by-bone against the previous frame's pose (`Vec<Mat4>` equality, exact-match); identical → slot dropped from dirty ranges → render side skips its upload. `RkpScene::upload_frame` routes via new `write_with_dirty` helper: empty ranges → skip; `is_full_pool` → `ensure_and_write`; else per-range `queue.write_buffer`. Telemetry: `RKP_BONE_UPLOAD_PROFILE=1` logs `[bone-upload] mat=… ({n} ranges) dq=… total_buf=…` per frame. | Validated on splat5 (Walking ×2 + CesiumMan, ~23 KiB buffer total): every-frame upload still ~full when all 3 animate continuously, but slots correctly drop out when any pose is bit-identical to last frame (saw 16.25 KiB on the frames CesiumMan's pose held). Bigger wins on scenes with paused/static skeletons or many low-frequency animations. The C2-narrow path (no bone rebuild) now also produces zero-byte uploads instead of full-buffer rewrites. |
-| **D2** | `gpu_instance_overlays` per-instance DirtyRanges. Paint/sculpt stamps mark the affected instance's range. | Overlay uploads scale with stamps, not scene size |
-| **D3** | `gpu_instance_sculpts` same. | Same for sculpt overlay |
+| **D2 ✅** | `gpu_instance_overlays_dirty: bool` on `EngineState`. Set by paint stamps (any mode — Color/Erase also mutate the overlay), entity removes that had a non-empty overlay, and `clear_scene`. Snapshot converts to `rkp_core::DirtyRanges` with `mark_full(buf_len * 16 B)`; render-side routes through `RkpScene::write_with_dirty` (D1's helper). Empty bool → empty ranges → `write_with_dirty` skips. `FrameUpload` gains `instance_overlays_dirty: &DirtyRanges`. | Idle frames between paint stamps now skip the overlay upload entirely (was `ensure_and_write` of the full buffer every tick). Stamp frames still do one full upload — a future enhancement could narrow that to the spliced range, but the C2-narrow splice already shifts the tail so the per-stamp delta is at best ~half the buffer; the bigger win was the "every idle frame" rewrite. |
+| **D3 ✅** | Same shape as D2 for `gpu_instance_sculpts`. `gpu_instance_sculpts_dirty: bool` bumped by sculpt stamps + sculpt-bearing entity removes + clear_scene. | Idle-frame skip for the sculpt buffer (was ~13 K × 4 B = 52 KiB ensure_and_write per frame on the splat5 elephant after a drag, regardless of motion). |
 | **D4** | Material palette / lights / shader_params hash-gated upload. | -3 small uploads/frame |
 
 ### Phase E — Cross-thread decoupling (optional but ideal)
