@@ -343,6 +343,20 @@ pub(crate) struct EngineState {
     /// moves ahead, we invalidate and re-scan affected entities.
     pub(crate) painted_materials_paint_epoch: u64,
     pub(crate) painted_materials_geometry_epoch: u64,
+    /// Geometry epoch of the most recent batch we submitted to the
+    /// paint-walk worker. Used to suppress redundant
+    /// blanket-invalidations while the worker is still computing the
+    /// post-bump cache — without this we'd re-mark every renderable
+    /// dirty on each tick between submit and merge, then queue a
+    /// duplicate batch the moment the worker freed up. Phase E1.
+    pub(crate) painted_walk_submitted_geom_epoch: u64,
+
+    /// Dedicated worker thread that runs the painted-material walk
+    /// off the sim tick. Sim drains [`Self::painted_dirty_entities`]
+    /// into a batch, submits to the worker, and merges the result on a
+    /// later tick into [`Self::painted_per_entity`]. Phase E1 of
+    /// `docs/PERF_DEBT.md`.
+    pub(crate) paint_walk_worker: super::paint_walk::PaintWalkWorker,
 
     /// Per-entity sparse paint overlays. Each entry holds the leaves
     /// painted on that *specific* instance — decoupled from the

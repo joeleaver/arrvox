@@ -27,6 +27,7 @@ mod import_ops;
 mod lifecycle;
 mod model_scan;
 mod paint_ops;
+mod paint_walk;
 mod picking_ops;
 mod mutation_log;
 mod sculpt_ops;

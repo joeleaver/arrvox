@@ -212,116 +212,108 @@ impl EngineState {
             phase_update_scene_gpu_t0.elapsed().as_secs_f64() * 1000.0;
 
         let phase_painted_walk_t0 = std::time::Instant::now();
+        let painted_walk_profile = self.paint_profile_active();
+        // Phase E1 of `docs/PERF_DEBT.md`: drain any completed worker
+        // result into `painted_per_entity` first. The result may carry
+        // entries with empty `mat_tiles` — those entities had no shader-
+        // bearing materials this scan; remove them from the cache so the
+        // flat rebuild below doesn't iterate phantoms.
+        let mut painted_state_changed = false;
+        let mut painted_worker_walk_dt = std::time::Duration::ZERO;
+        let mut painted_worker_jobs = 0usize;
+        if let Some(result) = self.paint_walk_worker.try_recv() {
+            painted_worker_jobs = result.entries.len();
+            for (entity, cache) in result.entries {
+                // Filter out entries for entities that were despawned
+                // or scene-cleared while the worker was running. Without
+                // this check, a stale result could re-populate
+                // `painted_per_entity` with phantom entries that nothing
+                // else removes — `delete_entity` and `clear_scene` both
+                // wipe the cache, but the in-flight batch's output
+                // arrives after them.
+                if !self.world.contains(entity) {
+                    self.painted_per_entity.remove(&entity);
+                    continue;
+                }
+                if cache.mat_tiles.is_empty() {
+                    self.painted_per_entity.remove(&entity);
+                } else {
+                    self.painted_per_entity.insert(entity, cache);
+                }
+            }
+            self.painted_materials_paint_epoch = result.completed_paint_epoch;
+            self.painted_materials_geometry_epoch = result.completed_geom_epoch;
+            painted_worker_walk_dt = result.worker_walk_duration;
+            painted_state_changed = true;
+        }
+
+        let mut geom_changed = false;
+        let mut cur_paint_epoch_telemetry = 0u64;
+        let mut cur_geom_epoch_telemetry = 0u64;
         if !shader_materials.is_empty() {
-            // Reconcile the per-entity painted-material cache against
-            // current paint + geometry epochs.
+            // Reconcile against current paint + geometry epochs.
             //
             // - paint_epoch advances only via `apply_paint_stamp`, which
             //   also adds the painted entity to `painted_dirty_entities`.
             //   So a paint-only frame walks just that one entity.
             // - geometry_epoch advances on any voxel-pool / octree write
-            //   (asset load, voxelize, bake, sculpt). We mirror the old
-            //   "wipe all" behavior here: every renderable goes into the
-            //   dirty set so the next walk pass rebuilds them.
-            // Lock-free walk path. We acquire `scene_mgr` only long
-            // enough to (a) read both epoch counters and (b) take an
-            // `Arc`-shared `WalkSnapshot` of the three pool buffers
-            // the scan needs. The `O(tree)` walks themselves run
-            // outside the lock — render and other sim paths can
-            // proceed in parallel.
-            //
-            // Snapshot construction is O(1) (three `Arc::clone`s) —
-            // pool data lives behind `Arc<Vec<…>>` so there is no
-            // memcpy on the geometry-bump frame either. The walk's
-            // outstanding snapshot will trigger a one-time
-            // copy-on-write inside the affected pool's next mutation
-            // (via `Arc::make_mut`); dropping the snapshot promptly
-            // after the walk lets subsequent writes stay in place.
-            // See PERF_DEBT.md A2.
-            let (cur_paint, cur_geom, snapshot_opt) = {
-                let mut sm = self.scene_mgr.lock().expect("scene_mgr poisoned");
-                let cur_paint = sm.paint_epoch();
-                let cur_geom = sm.geometry_epoch();
-                // Skip the snapshot rebuild on frames where there's
-                // no work to do (no dirty entities AND no geometry
-                // change). This keeps the brief lock-and-clone path
-                // off frames that don't reach the walk loop below.
-                let want_snapshot = !self.painted_dirty_entities.is_empty()
-                    || cur_geom != self.painted_materials_geometry_epoch;
-                let snapshot = if want_snapshot {
-                    Some(sm.walk_snapshot())
-                } else {
-                    None
-                };
-                (cur_paint, cur_geom, snapshot)
+            //   (asset load, voxelize, bake, sculpt). When no specific
+            //   dirty entities are recorded, blanket-invalidate so every
+            //   renderable gets re-scanned by the next worker batch.
+            let (cur_paint, cur_geom) = {
+                let sm = self.scene_mgr.lock().expect("scene_mgr poisoned");
+                (sm.paint_epoch(), sm.geometry_epoch())
             };
-            let geom_changed =
-                cur_geom != self.painted_materials_geometry_epoch;
-            if geom_changed {
+            cur_paint_epoch_telemetry = cur_paint;
+            cur_geom_epoch_telemetry = cur_geom;
+            geom_changed = cur_geom != self.painted_materials_geometry_epoch;
+            // Blanket-invalidate ONLY when (a) nobody told us which
+            // entities changed and (b) we haven't already submitted a
+            // batch for this geom epoch. The submitted-epoch check
+            // suppresses redundant invalidations during the 1-2 ticks
+            // between submit and result-merge — without it, every tick
+            // in that window would re-stage all renderables and queue
+            // duplicate work. Specific-entity callers (sculpt/paint/
+            // proc-bake) populate `painted_dirty_entities` themselves
+            // — trust them so other entities' caches stay valid.
+            //
+            // Note: we do NOT clear `painted_per_entity` here. The OLD
+            // entries stay in place so the flat rebuild during the
+            // worker's in-flight window keeps producing anchors at the
+            // last-known positions (1-2 frame lag, invisible). The
+            // worker's result will replace each entity's cache as it
+            // returns; empty caches signal removal.
+            if geom_changed
+                && self.painted_dirty_entities.is_empty()
+                && self.painted_walk_submitted_geom_epoch != cur_geom
+            {
                 use crate::components::Renderable;
-                // Blanket-invalidate ONLY when nobody told us which
-                // entities changed (asset load, bake worker, world
-                // reshuffle). When `painted_dirty_entities` already
-                // has specific entries — populated by `apply_sculpt_
-                // stamp`, paint, etc. — trust them: the walk below
-                // re-scans those entities' painted aabbs and updates
-                // their `painted_per_entity` cache. Other entities'
-                // cached scans stay valid (their octree topology
-                // didn't change).
-                //
-                // This is the difference between O(world)
-                // re-scan (~586 ms on splat5) and O(stamp footprint)
-                // re-scan (~ms). The dominant component of the
-                // `[sculpt-pipeline] bump→submit` gap.
-                if self.painted_dirty_entities.is_empty() {
-                    self.painted_per_entity.clear();
-                    for (entity, _) in self.world.query::<&Renderable>().iter() {
-                        self.painted_dirty_entities.insert(entity);
-                    }
+                for (entity, _) in self.world.query::<&Renderable>().iter() {
+                    self.painted_dirty_entities.insert(entity);
                 }
             }
 
-            let painted_walk_profile = self.paint_profile_active();
-            let painted_walk_t0 = std::time::Instant::now();
-            let dirty_count = self.painted_dirty_entities.len();
-            if dirty_count > 0 {
+            // Submit a fresh batch when the worker is idle and we have
+            // dirty entities. While the worker is busy we leave
+            // `painted_dirty_entities` untouched so this tick's
+            // additions get picked up by the next batch — derived state
+            // lags geometry by at most one walk + one tick, which is
+            // invisible for grass-anchor positions.
+            if self.paint_walk_worker.is_idle()
+                && !self.painted_dirty_entities.is_empty()
+            {
                 use crate::components::Renderable;
-                // The snapshot is guaranteed `Some` here: `want_snapshot`
-                // was true iff dirty was non-empty OR geom_changed (which
-                // also adds to dirty above), so reaching this branch
-                // implies we asked for a snapshot.
-                let snapshot = snapshot_opt.expect(
-                    "walk_snapshot must be present when dirty set is non-empty",
-                );
-                // Drain rather than iterate-then-clear so we can mutate
-                // `painted_per_entity` from inside the loop without
-                // double-borrowing `self`. `mem::take` keeps the dirty
-                // set's allocation around for the next stamp.
-                let dirty: std::collections::HashSet<hecs::Entity> =
-                    std::mem::take(&mut self.painted_dirty_entities);
-                // Phase C1: also drain the region log so each entity's
-                // walk knows the brush footprint that caused its dirty
-                // entry. An entity in `dirty` without a regions entry
-                // (asset-load geom-epoch fallback) falls through to the
-                // full-walk path below.
-                let mut regions_drain: std::collections::HashMap<
-                    hecs::Entity,
-                    Vec<rkp_core::Aabb>,
-                > = std::mem::take(&mut self.painted_dirty_regions);
+                let snapshot = self
+                    .scene_mgr
+                    .lock()
+                    .expect("scene_mgr poisoned")
+                    .walk_snapshot();
                 // Conservative walk-clip expansion: the largest
                 // `@tile_size` across all shader materials. A leaf at
                 // position P that contributes to a tile T in M's grid
-                // can sit anywhere inside T, so the clipped octree
+                // can sit anywhere inside T, so the worker's clipped
                 // descent must reach `dirty + tile_size_M` to recover
-                // every leaf of every overlapping tile. We use the max
-                // over M (a small constant), which dominates per-
-                // material clearing without changing correctness.
-                //
-                // When *no* shader material declares `@tile_size`, the
-                // single NO_TILE_COORD entry's AABB spans the whole
-                // entity — a clipped scan can't recover that, so we
-                // fall back to the full walk for any entity with such
-                // a material.
+                // every leaf of every overlapping tile.
                 let max_tile_size: Option<f32> = shader_materials
                     .values()
                     .filter_map(|i| i.tile_size)
@@ -332,443 +324,320 @@ impl EngineState {
                 let any_unsized = shader_materials
                     .values()
                     .any(|i| i.tile_size.is_none());
+
+                let dirty: std::collections::HashSet<hecs::Entity> =
+                    std::mem::take(&mut self.painted_dirty_entities);
+                // Drain the region log so each entity's job carries the
+                // brush footprint that caused its dirty entry. An
+                // entity in `dirty` without a regions entry (asset-load
+                // geom-epoch fallback) falls through to the worker's
+                // full-walk path.
+                let mut regions: std::collections::HashMap<
+                    hecs::Entity,
+                    Vec<rkp_core::Aabb>,
+                > = std::mem::take(&mut self.painted_dirty_regions);
+
+                let mut jobs: Vec<super::paint_walk::PaintWalkJob> =
+                    Vec::with_capacity(dirty.len());
                 for entity in dirty {
                     // Despawned-while-dirty: drop any stale cache so
-                    // the flat concat below doesn't carry phantoms.
+                    // the flat rebuild doesn't carry phantoms.
                     if !self.world.contains(entity) {
                         self.painted_per_entity.remove(&entity);
-                        regions_drain.remove(&entity);
+                        regions.remove(&entity);
                         continue;
                     }
                     let (root_offset, depth, grid_origin, base_voxel_size) = {
                         let Ok(r) = self.world.get::<&Renderable>(entity) else {
                             self.painted_per_entity.remove(&entity);
-                            regions_drain.remove(&entity);
+                            regions.remove(&entity);
                             continue;
                         };
-                        let Some(spatial) = r.spatial.as_ref().and_then(|g| g.as_octree()) else {
+                        let Some(spatial) =
+                            r.spatial.as_ref().and_then(|g| g.as_octree())
+                        else {
                             self.painted_per_entity.remove(&entity);
-                            regions_drain.remove(&entity);
+                            regions.remove(&entity);
                             continue;
                         };
                         (
-                            spatial.root_offset,
+                            spatial.root_offset as usize,
                             spatial.depth,
                             spatial.grid_origin,
                             spatial.base_voxel_size,
                         )
                     };
-                    let Some(&gpu_idx) = self.entity_to_gpu.get(&entity) else {
-                        // No GPU instance yet — keep the entity dirty
-                        // for a later tick (re-add) and leave any old
-                        // cache alone. Without re-adding the walk would
-                        // never come back to it after the gpu mapping
-                        // appears (the dirty set has been drained).
+                    if self.entity_to_gpu.get(&entity).is_none() {
+                        // No GPU mapping yet — keep the entity dirty
+                        // for a later tick (re-add). Preserve regions
+                        // so the next walk stays region-bounded.
                         self.painted_dirty_entities.insert(entity);
-                        // Preserve the region info too — otherwise the
-                        // next tick would fall back to the full walk.
-                        if let Some(v) = regions_drain.remove(&entity) {
+                        if let Some(v) = regions.remove(&entity) {
                             self.painted_dirty_regions.insert(entity, v);
                         }
                         continue;
+                    }
+                    let entity_inverse = self
+                        .world
+                        .get::<&crate::components::Transform>(entity)
+                        .ok()
+                        .map(|t| {
+                            glam::Affine3A::from_scale_rotation_translation(
+                                t.scale,
+                                glam::Quat::from_euler(
+                                    glam::EulerRot::XYZ,
+                                    t.rotation.x.to_radians(),
+                                    t.rotation.y.to_radians(),
+                                    t.rotation.z.to_radians(),
+                                ),
+                                t.position,
+                            )
+                        })
+                        .map(|a| a.inverse())
+                        .unwrap_or(glam::Affine3A::IDENTITY);
+                    let overlay = self.paint_overlays.get(&entity).cloned();
+                    let regions_for_entity = regions.remove(&entity);
+                    // CLONE the existing entry (don't move out) so the
+                    // flat rebuild during the worker's in-flight window
+                    // keeps producing anchors at the last-known
+                    // positions. The worker mutates its copy and ships
+                    // the new cache back; sim replaces the entry on
+                    // result-merge. The clone cost is modest — a few µs
+                    // for a typical sculpt entity, microseconds even on
+                    // heavily-painted assets — and pays for the 1-2
+                    // frame visual continuity during the lag.
+                    //
+                    // The full-walk path inside `walk_one` ignores
+                    // `existing_mat_tiles` (it builds a fresh entry), so
+                    // for non-region-bounded jobs the clone is wasted
+                    // bytes. Acceptable; the region-bounded path is the
+                    // hot one.
+                    let existing_mat_tiles = self
+                        .painted_per_entity
+                        .get(&entity)
+                        .map(|e| e.mat_tiles.clone())
+                        .unwrap_or_default();
+                    jobs.push(super::paint_walk::PaintWalkJob {
+                        entity,
+                        root_offset,
+                        depth,
+                        grid_origin,
+                        base_voxel_size,
+                        overlay,
+                        entity_inverse,
+                        regions: regions_for_entity,
+                        existing_mat_tiles,
+                    });
+                }
+                // Any regions left in `regions` belong to entries that
+                // the loop bypassed (despawned / missing Renderable /
+                // no spatial). They've already been removed from
+                // `painted_per_entity`; drop the regions implicitly.
+                let _ = regions;
+
+                if !jobs.is_empty() {
+                    let batch = super::paint_walk::PaintWalkBatch {
+                        snapshot,
+                        jobs,
+                        shader_materials: std::sync::Arc::new(
+                            shader_materials.clone(),
+                        ),
+                        max_tile_size,
+                        any_unsized,
+                        submitted_paint_epoch: cur_paint,
+                        submitted_geom_epoch: cur_geom,
+                        submitted_at: std::time::Instant::now(),
                     };
-                    let _ = gpu_idx;
+                    self.paint_walk_worker.submit(batch);
+                    // Record the geom epoch this batch will cover so a
+                    // tick between submit and result-merge doesn't
+                    // re-fire the blanket-invalidate branch above.
+                    self.painted_walk_submitted_geom_epoch = cur_geom;
+                }
+            }
+        }
 
-                    let regions = regions_drain.remove(&entity);
-                    let can_region_bound = regions.as_ref().is_some_and(|v| !v.is_empty())
-                        && max_tile_size.is_some()
-                        && !any_unsized;
+        // Rebuild flat views whenever per-entity contents changed (a
+        // worker result merged) OR a geom-epoch jump invalidated the
+        // cache. `painted_materials` is keyed by gpu_idx, so any
+        // entity_to_gpu shift would otherwise leave stale entries — in
+        // practice the add/remove paths already mark affected entities
+        // dirty (or bump geom_epoch), so this trigger covers them.
+        let need_flat_rebuild =
+            !shader_materials.is_empty() && (painted_state_changed || geom_changed);
+        if need_flat_rebuild {
+            self.painted_materials.clear();
+            let mut new_painted_anchors: std::collections::HashMap<
+                u16,
+                Vec<rkp_render::user_shader_mesh_pass::AnchorRecord>,
+            > = std::collections::HashMap::new();
+            for (entity, entry) in &self.painted_per_entity {
+                let Some(&gpu_idx) = self.entity_to_gpu.get(entity) else {
+                    continue;
+                };
+                if !entry.mat_tiles.is_empty() {
+                    self.painted_materials
+                        .insert(gpu_idx as u32, entry.mat_tiles.clone());
+                }
 
-                    if can_region_bound {
-                        // Region-bounded path. Touch only the tiles
-                        // that overlap the brush footprint; reuse
-                        // existing entries for tiles outside the brush.
-                        let regions = regions.expect("guarded above");
-                        let max_ts = max_tile_size.expect("guarded above");
-
-                        // Build a local-space brush AABB by projecting
-                        // each world brush AABB through the entity's
-                        // inverse transform and unioning. Iterating
-                        // 8 corners per region produces a tight bound
-                        // even under rotated entities.
-                        let entity_world = self
-                            .world
-                            .get::<&crate::components::Transform>(entity)
-                            .map(|t| {
-                                glam::Affine3A::from_scale_rotation_translation(
-                                    t.scale,
-                                    glam::Quat::from_euler(
-                                        glam::EulerRot::XYZ,
-                                        t.rotation.x.to_radians(),
-                                        t.rotation.y.to_radians(),
-                                        t.rotation.z.to_radians(),
-                                    ),
-                                    t.position,
-                                )
-                            })
-                            .unwrap_or(glam::Affine3A::IDENTITY);
-                        let inv = entity_world.inverse();
-                        let mut lmin = glam::Vec3::splat(f32::INFINITY);
-                        let mut lmax = glam::Vec3::splat(f32::NEG_INFINITY);
-                        for r in &regions {
-                            for c in r.corners() {
-                                let lp = inv.transform_point3(c);
-                                lmin = lmin.min(lp);
-                                lmax = lmax.max(lp);
+                // V1 mesh-path AnchorRecords from the per-tile
+                // PaintedTileEntry table. Two bounds in play:
+                //
+                //   · **Tile cube** — derived from `tile_coord ×
+                //     tile_size` (object-local), transformed to world.
+                //     Stable across frames as paint extends inside the
+                //     tile, so blade positions don't shimmer.
+                //   · **Painted-leaf AABB** (`te.aabb`) — only used to
+                //     pick `surface_y` (the y the blade base sits on).
+                //     Stable for flat-ground paint; deferred concern
+                //     for slopes.
+                //
+                // When `tile_size` is `None` (shader didn't declare
+                // `@tile_size`), the tile_coord is `NO_TILE_COORD` and
+                // tile cube bounds fall back to the painted-leaf AABB
+                // — degraded but deterministic.
+                let object_id = gpu_idx as u32;
+                let entity_world: Option<glam::Mat4> = self
+                    .gpu_instances
+                    .iter()
+                    .find(|i| i.object_id == object_id)
+                    .map(|i| glam::Mat4::from_cols_array_2d(&i.world));
+                for (&mat, tiles) in &entry.mat_tiles {
+                    let tile_size = shader_materials
+                        .get(&mat)
+                        .and_then(|i| i.tile_size);
+                    let bucket = new_painted_anchors.entry(mat).or_default();
+                    bucket.reserve(tiles.len());
+                    for (&tile_coord, te) in tiles {
+                        let (tile_local_min, tile_local_max) = match tile_size {
+                            Some(s) if s > 0.0
+                                && tile_coord != [i32::MIN, i32::MIN, i32::MIN] =>
+                            {
+                                let lo = glam::Vec3::new(
+                                    tile_coord[0] as f32 * s,
+                                    tile_coord[1] as f32 * s,
+                                    tile_coord[2] as f32 * s,
+                                );
+                                (lo, lo + glam::Vec3::splat(s))
                             }
-                        }
-                        let local_dirty = rkp_core::Aabb { min: lmin, max: lmax };
-                        // Walk-clip = local_dirty grown by max_ts in
-                        // every direction. Guarantees every tile (for
-                        // any material in shader_materials) that
-                        // overlaps `local_dirty` is fully contained, so
-                        // every painted leaf belonging to those tiles
-                        // gets visited by the clipped scan below.
-                        let walk_clip = rkp_core::Aabb {
-                            min: lmin - glam::Vec3::splat(max_ts),
-                            max: lmax + glam::Vec3::splat(max_ts),
+                            _ => (te.aabb.min, te.aabb.max),
                         };
-
-                        // Take the existing entry out so we can mutate
-                        // it without holding a `painted_per_entity`
-                        // borrow across the scan.
-                        let mut entry = self
-                            .painted_per_entity
-                            .remove(&entity)
-                            .unwrap_or_default();
-
-                        // Clear tile entries overlapping `local_dirty`
-                        // for every material whose tile_size we know.
-                        // Without this the rescan would double-count
-                        // leaves the previous walk already merged.
-                        for (mat_id, tile_map) in entry.mat_tiles.iter_mut() {
-                            let Some(info) = shader_materials.get(mat_id) else {
-                                // Material vanished from the shader
-                                // set — clear all of its tiles; they're
-                                // unreachable from the painted_anchors
-                                // rebuild anyway.
-                                tile_map.clear();
-                                continue;
-                            };
-                            let Some(ts) = info.tile_size else {
-                                // `any_unsized` was false, so this is
-                                // unreachable, but guard defensively.
-                                continue;
-                            };
-                            if ts <= 0.0 {
-                                continue;
-                            }
-                            let inv_ts = 1.0 / ts;
-                            let lo = (local_dirty.min * inv_ts).floor();
-                            let hi = (local_dirty.max * inv_ts).floor();
-                            for ix in (lo.x as i32)..=(hi.x as i32) {
-                                for iy in (lo.y as i32)..=(hi.y as i32) {
-                                    for iz in (lo.z as i32)..=(hi.z as i32) {
-                                        tile_map.remove(&[ix, iy, iz]);
-                                    }
-                                }
-                            }
-                        }
-
-                        scan_painted_aabbs_clipped(
-                            &snapshot.octree_data,
-                            &snapshot.brick_pool_data,
-                            &snapshot.leaf_attr_data,
-                            self.paint_overlays.get(&entity),
-                            root_offset as usize,
-                            depth,
-                            grid_origin,
-                            base_voxel_size,
-                            &shader_materials,
-                            &mut entry.mat_tiles,
-                            walk_clip,
-                            local_dirty,
+                        let (tile_world_min, tile_world_max) = transform_aabb_to_world(
+                            tile_local_min,
+                            tile_local_max,
+                            entity_world,
                         );
-
-                        // Drop empty material maps so the downstream
-                        // flat rebuild doesn't iterate vacuous entries
-                        // and the entity's known-empty state is
-                        // recovered from `entry.mat_tiles.is_empty()`.
-                        entry.mat_tiles.retain(|_, m| !m.is_empty());
-                        if !entry.mat_tiles.is_empty() {
-                            self.painted_per_entity.insert(entity, entry);
-                        }
-                    } else {
-                        // Full walk path — runs on asset-load /
-                        // geometry-epoch invalidation (no regions
-                        // recorded), or whenever a shader material
-                        // declares no `@tile_size` (NO_TILE_COORD
-                        // entry's AABB needs the full entity to
-                        // remain correct).
-                        let mut entry = super::state::EntityPaintedCache::default();
-                        scan_painted_aabbs(
-                            &snapshot.octree_data,
-                            &snapshot.brick_pool_data,
-                            &snapshot.leaf_attr_data,
-                            self.paint_overlays.get(&entity),
-                            root_offset as usize,
-                            depth,
-                            grid_origin,
-                            base_voxel_size,
-                            &shader_materials,
-                            &mut entry.mat_tiles,
+                        let (paint_world_min, paint_world_max) = transform_aabb_to_world(
+                            te.aabb.min,
+                            te.aabb.max,
+                            entity_world,
                         );
-                        if entry.mat_tiles.is_empty() {
-                            self.painted_per_entity.remove(&entity);
-                        } else {
-                            self.painted_per_entity.insert(entity, entry);
-                        }
+                        let surface_y = paint_world_max.y;
+                        let local_normal = te
+                            .normal_sum
+                            .try_normalize()
+                            .unwrap_or(glam::Vec3::Y);
+                        let world_normal = entity_world
+                            .map(|m| m.transform_vector3(local_normal))
+                            .unwrap_or(local_normal)
+                            .try_normalize()
+                            .unwrap_or(glam::Vec3::Y);
+                        let seed = rkp_render::user_shader_mesh_pass::anchor_seed([
+                            tile_coord[0] as f32,
+                            tile_coord[1] as f32,
+                            tile_coord[2] as f32,
+                        ]) ^ (mat as u32).wrapping_mul(0x9E37_79B9);
+                        bucket.push(
+                            rkp_render::user_shader_mesh_pass::AnchorRecord {
+                                tile_min: tile_world_min.to_array(),
+                                material_id: mat as u32,
+                                tile_max: tile_world_max.to_array(),
+                                leaf_count: te.leaf_count,
+                                paint_min: paint_world_min.to_array(),
+                                object_id,
+                                paint_max: paint_world_max.to_array(),
+                                surface_y,
+                                surface_normal: world_normal.to_array(),
+                                seed,
+                            },
+                        );
                     }
                 }
-                // Any regions left in `regions_drain` belong to entries
-                // that the loop bypassed (despawned / missing Renderable
-                // / no spatial). They've already been removed from
-                // `painted_per_entity`; drop the regions by letting the
-                // local go out of scope.
-                let _ = regions_drain;
             }
-
-            // Rebuild the flat views whenever per-entity contents
-            // changed (dirty set was non-empty) OR object_id mappings
-            // shifted (gpu_objects rebuild this frame). The latter
-            // matters because `painted_materials` is keyed by
-            // object_id — without rebuilding, a frame that moves
-            // entity A from object_id=3 to object_id=4 leaves a stale
-            // entry under the old key.
-            // The flat rebuild only needs to run when painted content
-            // or the entity-to-gpu mapping actually changed. Dropping
-            // `gpu_objects_dirty_this_frame` from the trigger so that
-            // animation-only frames (which set `gpu_objects_dirty` via
-            // `animation::tick` every frame a skeleton is playing)
-            // don't churn through cloning every entity's `mat_tiles`
-            // and re-running the new mesh-path compute trio. Animation
-            // doesn't move entity world transforms (just bones within
-            // them), so painted_anchors / painted_materials are
-            // content-stable across animation ticks.
-            //
-            // Caveat: if a Renderable entity is added or removed without
-            // any paint or geometry epoch change, the `entity_to_gpu`
-            // mapping can shift but we won't refresh `painted_materials`
-            // here. In practice the entity add/remove paths already mark
-            // affected entities dirty (or bump geom_epoch), so this
-            // shouldn't trigger in normal use.
-            let need_flat_rebuild = dirty_count > 0 || geom_changed;
-            if need_flat_rebuild {
-                self.painted_materials.clear();
-                let mut new_painted_anchors: std::collections::HashMap<
-                    u16,
-                    Vec<rkp_render::user_shader_mesh_pass::AnchorRecord>,
+            // RKP_GRASS_DEBUG: detect per-tile seed instability. Loud
+            // only when seeds for known tiles actually change.
+            if std::env::var("RKP_GRASS_DEBUG").is_ok() {
+                let mut changed = 0u32;
+                let mut new_tiles = 0u32;
+                let mut dropped = 0u32;
+                let mut cur_map: std::collections::HashMap<
+                    (u32, u32, u32, u32, u16),
+                    u32,
                 > = std::collections::HashMap::new();
-                for (entity, entry) in &self.painted_per_entity {
-                    let Some(&gpu_idx) = self.entity_to_gpu.get(entity) else {
-                        continue;
-                    };
-                    if !entry.mat_tiles.is_empty() {
-                        self.painted_materials
-                            .insert(gpu_idx as u32, entry.mat_tiles.clone());
+                for (&mat, bucket) in &new_painted_anchors {
+                    for a in bucket {
+                        let key = (
+                            a.object_id,
+                            (a.tile_min[0] * 1000.0).round() as i32 as u32,
+                            (a.tile_min[1] * 1000.0).round() as i32 as u32,
+                            (a.tile_min[2] * 1000.0).round() as i32 as u32,
+                            mat,
+                        );
+                        cur_map.insert(key, a.seed);
                     }
-
-                    // V1 mesh-path AnchorRecords from the per-tile
-                    // PaintedTileEntry table. Two bounds in play:
-                    //
-                    //   · **Tile cube** — derived from `tile_coord ×
-                    //     tile_size` (object-local), transformed to
-                    //     world. Stable across frames as paint
-                    //     extends inside the tile, so blade
-                    //     positions don't shimmer.
-                    //   · **Painted-leaf AABB** (`te.aabb`) — only
-                    //     used to pick `surface_y` (the y the blade
-                    //     base sits on). Stable for flat-ground
-                    //     paint; deferred concern for slopes.
-                    //
-                    // When `tile_size` is `None` (shader didn't
-                    // declare `@tile_size`), the tile_coord is
-                    // `NO_TILE_COORD` and tile cube bounds fall back
-                    // to the painted-leaf AABB — degraded but
-                    // deterministic.
-                    let object_id = gpu_idx as u32;
-                    let entity_world: Option<glam::Mat4> = self
-                        .gpu_instances
-                        .iter()
-                        .find(|i| i.object_id == object_id)
-                        .map(|i| glam::Mat4::from_cols_array_2d(&i.world));
-                    for (&mat, tiles) in &entry.mat_tiles {
-                        let tile_size = shader_materials
-                            .get(&mat)
-                            .and_then(|i| i.tile_size);
-                        let bucket = new_painted_anchors.entry(mat).or_default();
-                        bucket.reserve(tiles.len());
-                        for (&tile_coord, te) in tiles {
-                            // Tile cube bounds (object-local). When no
-                            // `@tile_size`, fall back to painted-leaf
-                            // bounds for a defined-but-coarse anchor.
-                            let (tile_local_min, tile_local_max) = match tile_size {
-                                Some(s) if s > 0.0
-                                    && tile_coord != [i32::MIN, i32::MIN, i32::MIN] =>
-                                {
-                                    let lo = glam::Vec3::new(
-                                        tile_coord[0] as f32 * s,
-                                        tile_coord[1] as f32 * s,
-                                        tile_coord[2] as f32 * s,
+                }
+                if let Some(last) = self.debug_last_anchor_seeds.as_ref() {
+                    for (k, &cur_seed) in &cur_map {
+                        match last.get(k) {
+                            Some(&prev_seed) if prev_seed != cur_seed => {
+                                changed += 1;
+                                if changed <= 5 {
+                                    eprintln!(
+                                        "[grass-debug] SEED CHANGED obj={} tile_min=({:.4},{:.4},{:.4}) mat={} prev=0x{:08x} cur=0x{:08x}",
+                                        k.0,
+                                        k.1 as i32 as f32 / 1000.0,
+                                        k.2 as i32 as f32 / 1000.0,
+                                        k.3 as i32 as f32 / 1000.0,
+                                        k.4,
+                                        prev_seed,
+                                        cur_seed,
                                     );
-                                    (lo, lo + glam::Vec3::splat(s))
                                 }
-                                _ => (te.aabb.min, te.aabb.max),
-                            };
-                            let (tile_world_min, tile_world_max) = transform_aabb_to_world(
-                                tile_local_min,
-                                tile_local_max,
-                                entity_world,
-                            );
-                            // Painted-leaf BB world bounds — actual
-                            // paint coverage in this tile (te.aabb is
-                            // the union of every painted leaf cell's
-                            // object-local AABB). The shader spawns
-                            // blades inside paint_min/max, so blades
-                            // land on the painted area instead of the
-                            // unpainted parts of the tile cube. This
-                            // BB grows when paint extends within the
-                            // tile (jitter on active paint; stable for
-                            // a left-alone painted region).
-                            let (paint_world_min, paint_world_max) = transform_aabb_to_world(
-                                te.aabb.min,
-                                te.aabb.max,
-                                entity_world,
-                            );
-                            // Surface y = top of painted leaves in
-                            // world. Blade base sits on this y so
-                            // blades grow up FROM the painted ground
-                            // (not from the tile-cube floor, which
-                            // could be tile_size below).
-                            let surface_y = paint_world_max.y;
-                            // Per-tile surface normal: normalize the
-                            // object-local sum of painted-leaf normals,
-                            // rotate by the entity's world transform,
-                            // re-normalize. Fall back to +Y on either
-                            // degenerate stage (cancelling normals or
-                            // an entity transform that maps Y to 0).
-                            let local_normal = te.normal_sum
-                                .try_normalize()
-                                .unwrap_or(glam::Vec3::Y);
-                            let world_normal = entity_world
-                                .map(|m| m.transform_vector3(local_normal))
-                                .unwrap_or(local_normal)
-                                .try_normalize()
-                                .unwrap_or(glam::Vec3::Y);
-                            // Stable seed: tile coord + material.
-                            // Dropped `object_id` because `gpu_idx`
-                            // can shuffle on `gpu_objects` rebuild
-                            // (which the paint hot path triggers via
-                            // `gpu_objects_dirty`), which re-randomized
-                            // every blade on every paint stamp. Same
-                            // local tile_coord across entities will
-                            // correlate yaws/jitters; acceptable for
-                            // V1.
-                            let seed = rkp_render::user_shader_mesh_pass::anchor_seed([
-                                tile_coord[0] as f32,
-                                tile_coord[1] as f32,
-                                tile_coord[2] as f32,
-                            ]) ^ (mat as u32).wrapping_mul(0x9E37_79B9);
-                            bucket.push(
-                                rkp_render::user_shader_mesh_pass::AnchorRecord {
-                                    tile_min: tile_world_min.to_array(),
-                                    material_id: mat as u32,
-                                    tile_max: tile_world_max.to_array(),
-                                    leaf_count: te.leaf_count,
-                                    paint_min: paint_world_min.to_array(),
-                                    object_id,
-                                    paint_max: paint_world_max.to_array(),
-                                    surface_y,
-                                    surface_normal: world_normal.to_array(),
-                                    seed,
-                                },
-                            );
-                        }
-                    }
-                }
-                // Debug: detect per-tile seed instability. Compare each
-                // tile's (object_id, tile_min) → seed against last
-                // rebuild's value; only log when the seed for an
-                // already-known tile actually changed. Quiet when
-                // things are stable; loud only when there's a real bug.
-                // `RKP_GRASS_DEBUG=1` enables.
-                if std::env::var("RKP_GRASS_DEBUG").is_ok() {
-                    let mut changed = 0u32;
-                    let mut new_tiles = 0u32;
-                    let mut dropped = 0u32;
-                    let mut cur_map: std::collections::HashMap<
-                        (u32, u32, u32, u32, u16),
-                        u32,
-                    > = std::collections::HashMap::new();
-                    for (&mat, bucket) in &new_painted_anchors {
-                        for a in bucket {
-                            // Quantize tile_min to mm to dodge fp noise.
-                            let key = (
-                                a.object_id,
-                                (a.tile_min[0] * 1000.0).round() as i32 as u32,
-                                (a.tile_min[1] * 1000.0).round() as i32 as u32,
-                                (a.tile_min[2] * 1000.0).round() as i32 as u32,
-                                mat,
-                            );
-                            cur_map.insert(key, a.seed);
-                        }
-                    }
-                    if let Some(last) = self.debug_last_anchor_seeds.as_ref() {
-                        for (k, &cur_seed) in &cur_map {
-                            match last.get(k) {
-                                Some(&prev_seed) if prev_seed != cur_seed => {
-                                    changed += 1;
-                                    if changed <= 5 {
-                                        eprintln!(
-                                            "[grass-debug] SEED CHANGED obj={} tile_min=({:.4},{:.4},{:.4}) mat={} prev=0x{:08x} cur=0x{:08x}",
-                                            k.0,
-                                            k.1 as i32 as f32 / 1000.0,
-                                            k.2 as i32 as f32 / 1000.0,
-                                            k.3 as i32 as f32 / 1000.0,
-                                            k.4,
-                                            prev_seed,
-                                            cur_seed,
-                                        );
-                                    }
-                                }
-                                None => new_tiles += 1,
-                                _ => {}
                             }
+                            None => new_tiles += 1,
+                            _ => {}
                         }
-                        for k in last.keys() {
-                            if !cur_map.contains_key(k) {
-                                dropped += 1;
-                            }
-                        }
-                    } else {
-                        new_tiles = cur_map.len() as u32;
                     }
-                    eprintln!(
-                        "[grass-debug] rebuild paint={} geom={} dirty={} mats={} anchors={} changed={} new={} dropped={}",
-                        cur_paint, cur_geom, dirty_count,
-                        new_painted_anchors.len(),
-                        cur_map.len(),
-                        changed, new_tiles, dropped,
-                    );
-                    self.debug_last_anchor_seeds = Some(cur_map);
+                    for k in last.keys() {
+                        if !cur_map.contains_key(k) {
+                            dropped += 1;
+                        }
+                    }
+                } else {
+                    new_tiles = cur_map.len() as u32;
                 }
-
-                self.painted_anchors = std::sync::Arc::new(new_painted_anchors);
-            }
-
-            self.painted_materials_paint_epoch = cur_paint;
-            self.painted_materials_geometry_epoch = cur_geom;
-
-            if painted_walk_profile && (dirty_count > 0 || geom_changed) {
                 eprintln!(
-                    "[paint] painted_materials_walk dt={:?} entities_walked={} cached_entities={} shader_materials={} geom_changed={}",
-                    painted_walk_t0.elapsed(),
-                    dirty_count,
-                    self.painted_per_entity.len(),
-                    shader_materials.len(),
-                    geom_changed,
+                    "[grass-debug] rebuild paint={} geom={} mats={} anchors={} changed={} new={} dropped={}",
+                    cur_paint_epoch_telemetry, cur_geom_epoch_telemetry,
+                    new_painted_anchors.len(),
+                    cur_map.len(),
+                    changed, new_tiles, dropped,
                 );
+                self.debug_last_anchor_seeds = Some(cur_map);
             }
+
+            self.painted_anchors = std::sync::Arc::new(new_painted_anchors);
+        }
+
+        if painted_walk_profile && (painted_state_changed || geom_changed) {
+            eprintln!(
+                "[paint] painted_materials_walk worker_dt={:?} merged_jobs={} cached_entities={} shader_materials={} geom_changed={}",
+                painted_worker_walk_dt,
+                painted_worker_jobs,
+                self.painted_per_entity.len(),
+                shader_materials.len(),
+                geom_changed,
+            );
         }
         let phase_painted_walk_ms =
             phase_painted_walk_t0.elapsed().as_secs_f64() * 1000.0;
@@ -1582,413 +1451,6 @@ impl EngineState {
 
 }
 
-/// Walk an entity's octree (rooted at `root_offset` inside the
-/// global packed `octree_data` buffer) and accumulate, per
-/// shader-bearing material, the object-local AABB of leaves with
-/// that material. Used by the per-leaf-material auto-scan to size
-/// the geom-pipeline region tightly.
-///
-/// `octree_data` is the absolute-rebased packed buffer; branches
-/// store offsets directly into this slice. Bricks are flattened
-/// further — for each brick we walk its 64 cells in `brick_pool` and
-/// look up cell leaf-attrs. Leaves at higher levels (shallow trees
-/// without bricks) cover a 2^(depth-leaf_level) cube of voxel cells.
-/// Resolve the effective `LeafAttr` for `slot` on a specific instance —
-/// overlay if present (Phase 3), else the asset's shared pool. Mirrors
-/// `fetch_leaf_attr_for` in WGSL.
-#[inline]
-fn resolve_leaf_attr(
-    overlay: Option<&rkp_core::LeafAttrOverlay>,
-    leaf_attrs: &[rkp_core::LeafAttr],
-    slot: u32,
-) -> rkp_core::LeafAttr {
-    if let Some(o) = overlay {
-        if let Some(e) = o.get(slot) {
-            return e.attr();
-        }
-    }
-    leaf_attrs[slot as usize]
-}
-
-fn scan_painted_aabbs(
-    octree_data: &[u32],
-    brick_pool: &[u32],
-    leaf_attrs: &[rkp_core::LeafAttr],
-    overlay: Option<&rkp_core::LeafAttrOverlay>,
-    root_offset: usize,
-    depth: u8,
-    grid_origin: glam::Vec3,
-    base_voxel_size: f32,
-    shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
-    out: &mut std::collections::HashMap<
-        u16,
-        std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
-    >,
-) {
-    use rkp_core::sparse_octree::{
-        is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE,
-    };
-    use rkp_core::brick_pool::{BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR};
-    const BRICK_CELL_EMPTY: u32 = 0xFFFF_FFFFu32;
-
-    #[allow(clippy::too_many_arguments)]
-    fn walk(
-        octree_data: &[u32],
-        brick_pool: &[u32],
-        leaf_attrs: &[rkp_core::LeafAttr],
-        overlay: Option<&rkp_core::LeafAttrOverlay>,
-        offset: usize,
-        level: u8,
-        max_depth: u8,
-        coord_voxels: glam::UVec3,
-        grid_origin: glam::Vec3,
-        base_vs: f32,
-        shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
-        out: &mut std::collections::HashMap<
-            u16,
-            std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
-        >,
-    ) {
-        use rkp_core::sparse_octree::{
-            is_brick, is_leaf, leaf_slot, brick_id, EMPTY_NODE, INTERIOR_NODE,
-        };
-        use rkp_core::brick_pool::{BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR};
-        const BRICK_CELL_EMPTY: u32 = 0xFFFF_FFFFu32;
-
-        if offset >= octree_data.len() { return; }
-        let node = octree_data[offset];
-        if node == EMPTY_NODE || node == INTERIOR_NODE { return; }
-        if is_brick(node) {
-            let brick_id = brick_id(node);
-            let base_idx = (brick_id * BRICK_CELLS) as usize;
-            for cz in 0..BRICK_DIM {
-                for cy in 0..BRICK_DIM {
-                    for cx in 0..BRICK_DIM {
-                        let cell_idx = (cz * BRICK_DIM * BRICK_DIM + cy * BRICK_DIM + cx) as usize;
-                        let pool_idx = base_idx + cell_idx;
-                        if pool_idx >= brick_pool.len() { continue; }
-                        let cell = brick_pool[pool_idx];
-                        if cell == BRICK_CELL_EMPTY || cell == BRICK_INTERIOR { continue; }
-                        let attr = resolve_leaf_attr(overlay, leaf_attrs, cell);
-                        let primary = attr.material_primary;
-                        let secondary: u16 = attr.material_secondary_blend & 0x0FFF;
-                        let blend: u16 = (attr.material_secondary_blend >> 12) & 0xF;
-                        let painted_mat = if shader_materials.contains_key(&primary) {
-                            Some(primary)
-                        } else if blend > 0 && shader_materials.contains_key(&secondary) {
-                            Some(secondary)
-                        } else {
-                            None
-                        };
-                        if let Some(mat) = painted_mat {
-                            let cell_voxel = glam::UVec3::new(
-                                coord_voxels.x + cx,
-                                coord_voxels.y + cy,
-                                coord_voxels.z + cz,
-                            );
-                            let cell_local = grid_origin
-                                + glam::Vec3::new(
-                                    cell_voxel.x as f32,
-                                    cell_voxel.y as f32,
-                                    cell_voxel.z as f32,
-                                ) * base_vs;
-                            let cell_max = cell_local + glam::Vec3::splat(base_vs);
-                            let info = shader_materials.get(&mat);
-                            let tile_size = info.and_then(|i| i.tile_size);
-                            super::lifecycle::expand_aabb(
-                                out, mat, cell_local, cell_max,
-                                attr.normal(), tile_size, None,
-                            );
-                        }
-                    }
-                }
-            }
-            return;
-        }
-        if is_leaf(node) {
-            let slot = leaf_slot(node);
-            let attr = resolve_leaf_attr(overlay, leaf_attrs, slot);
-            let primary = attr.material_primary;
-            let secondary: u16 = attr.material_secondary_blend & 0x0FFF;
-            let blend: u16 = (attr.material_secondary_blend >> 12) & 0xF;
-            let painted_mat = if shader_materials.contains_key(&primary) {
-                Some(primary)
-            } else if blend > 0 && shader_materials.contains_key(&secondary) {
-                Some(secondary)
-            } else {
-                None
-            };
-            if let Some(mat) = painted_mat {
-                let voxels_per_side = 1u32 << (max_depth - level);
-                let leaf_size = voxels_per_side as f32 * base_vs;
-                let leaf_min = grid_origin
-                    + glam::Vec3::new(
-                        coord_voxels.x as f32,
-                        coord_voxels.y as f32,
-                        coord_voxels.z as f32,
-                    ) * base_vs;
-                let leaf_max = leaf_min + glam::Vec3::splat(leaf_size);
-                let info = shader_materials.get(&mat);
-                let tile_size = info.and_then(|i| i.tile_size);
-                super::lifecycle::expand_aabb(
-                    out, mat, leaf_min, leaf_max,
-                    attr.normal(), tile_size, None,
-                );
-            }
-            return;
-        }
-        // Branch — descend into 8 children. `node` is the absolute
-        // offset of the first child (rebased at allocation time).
-        let _ = leaf_slot(0);
-        let _ = INTERIOR_NODE;
-        if level >= max_depth { return; }
-        let child_voxels = 1u32 << (max_depth - level - 1);
-        for octant in 0u32..8 {
-            let dx = octant & 1;
-            let dy = (octant >> 1) & 1;
-            let dz = (octant >> 2) & 1;
-            let child_coord = glam::UVec3::new(
-                coord_voxels.x + dx * child_voxels,
-                coord_voxels.y + dy * child_voxels,
-                coord_voxels.z + dz * child_voxels,
-            );
-            let child_offset = node as usize + octant as usize;
-            walk(
-                octree_data,
-                brick_pool,
-                leaf_attrs,
-                overlay,
-                child_offset,
-                level + 1,
-                max_depth,
-                child_coord,
-                grid_origin,
-                base_vs,
-                shader_materials,
-                out,
-            );
-        }
-    }
-
-    walk(
-        octree_data,
-        brick_pool,
-        leaf_attrs,
-        overlay,
-        root_offset,
-        0,
-        depth,
-        glam::UVec3::ZERO,
-        grid_origin,
-        base_voxel_size,
-        shader_materials,
-        out,
-    );
-    let _ = (is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE, BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR, BRICK_CELL_EMPTY);
-}
-
-/// Phase C1 region-bounded scan. Same descent shape as
-/// [`scan_painted_aabbs`] but skips octree nodes whose cell AABB
-/// doesn't intersect `walk_clip`, and forwards `dirty_local` to
-/// [`expand_aabb`] so per-tile inserts are confined to the cleared
-/// region. The caller supplies the existing `mat_tiles` (already
-/// cleared of overlapping tiles for every material).
-///
-/// `walk_clip` is `dirty_local` grown outward by the largest shader
-/// `tile_size`, in object-local coordinates. `dirty_local` is the
-/// brush footprint (also object-local).
-#[allow(clippy::too_many_arguments)]
-fn scan_painted_aabbs_clipped(
-    octree_data: &[u32],
-    brick_pool: &[u32],
-    leaf_attrs: &[rkp_core::LeafAttr],
-    overlay: Option<&rkp_core::LeafAttrOverlay>,
-    root_offset: usize,
-    depth: u8,
-    grid_origin: glam::Vec3,
-    base_voxel_size: f32,
-    shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
-    out: &mut std::collections::HashMap<
-        u16,
-        std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
-    >,
-    walk_clip: rkp_core::Aabb,
-    dirty_local: rkp_core::Aabb,
-) {
-    use rkp_core::sparse_octree::{
-        is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE,
-    };
-    use rkp_core::brick_pool::{BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR};
-    const BRICK_CELL_EMPTY: u32 = 0xFFFF_FFFFu32;
-
-    #[allow(clippy::too_many_arguments)]
-    fn walk(
-        octree_data: &[u32],
-        brick_pool: &[u32],
-        leaf_attrs: &[rkp_core::LeafAttr],
-        overlay: Option<&rkp_core::LeafAttrOverlay>,
-        offset: usize,
-        level: u8,
-        max_depth: u8,
-        coord_voxels: glam::UVec3,
-        grid_origin: glam::Vec3,
-        base_vs: f32,
-        shader_materials: &std::collections::HashMap<u16, rkp_render::shader_composer::UserShaderInfo>,
-        out: &mut std::collections::HashMap<
-            u16,
-            std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
-        >,
-        walk_clip: rkp_core::Aabb,
-        dirty_local: rkp_core::Aabb,
-    ) {
-        use rkp_core::sparse_octree::{
-            is_brick, is_leaf, leaf_slot, brick_id, EMPTY_NODE, INTERIOR_NODE,
-        };
-        use rkp_core::brick_pool::{BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR};
-        const BRICK_CELL_EMPTY: u32 = 0xFFFF_FFFFu32;
-
-        if offset >= octree_data.len() { return; }
-        let node = octree_data[offset];
-        if node == EMPTY_NODE || node == INTERIOR_NODE { return; }
-
-        // Pre-compute this node's AABB and bail if it doesn't touch
-        // the walk clip. For branches the AABB covers all descendants,
-        // so an early bail prunes whole subtrees.
-        let voxels_per_side = 1u32 << (max_depth - level);
-        let cell_size = voxels_per_side as f32 * base_vs;
-        let cell_min = grid_origin
-            + glam::Vec3::new(
-                coord_voxels.x as f32,
-                coord_voxels.y as f32,
-                coord_voxels.z as f32,
-            ) * base_vs;
-        let cell_max = cell_min + glam::Vec3::splat(cell_size);
-        let cell_aabb = rkp_core::Aabb { min: cell_min, max: cell_max };
-        if !cell_aabb.intersects(&walk_clip) {
-            return;
-        }
-
-        if is_brick(node) {
-            let brick_id = brick_id(node);
-            let base_idx = (brick_id * BRICK_CELLS) as usize;
-            for cz in 0..BRICK_DIM {
-                for cy in 0..BRICK_DIM {
-                    for cx in 0..BRICK_DIM {
-                        let inner_idx = (cz * BRICK_DIM * BRICK_DIM + cy * BRICK_DIM + cx) as usize;
-                        let pool_idx = base_idx + inner_idx;
-                        if pool_idx >= brick_pool.len() { continue; }
-                        let cell = brick_pool[pool_idx];
-                        if cell == BRICK_CELL_EMPTY || cell == BRICK_INTERIOR { continue; }
-                        let attr = resolve_leaf_attr(overlay, leaf_attrs, cell);
-                        let primary = attr.material_primary;
-                        let secondary: u16 = attr.material_secondary_blend & 0x0FFF;
-                        let blend: u16 = (attr.material_secondary_blend >> 12) & 0xF;
-                        let painted_mat = if shader_materials.contains_key(&primary) {
-                            Some(primary)
-                        } else if blend > 0 && shader_materials.contains_key(&secondary) {
-                            Some(secondary)
-                        } else {
-                            None
-                        };
-                        if let Some(mat) = painted_mat {
-                            let cell_voxel = glam::UVec3::new(
-                                coord_voxels.x + cx,
-                                coord_voxels.y + cy,
-                                coord_voxels.z + cz,
-                            );
-                            let cell_local = grid_origin
-                                + glam::Vec3::new(
-                                    cell_voxel.x as f32,
-                                    cell_voxel.y as f32,
-                                    cell_voxel.z as f32,
-                                ) * base_vs;
-                            let cell_max = cell_local + glam::Vec3::splat(base_vs);
-                            let info = shader_materials.get(&mat);
-                            let tile_size = info.and_then(|i| i.tile_size);
-                            super::lifecycle::expand_aabb(
-                                out, mat, cell_local, cell_max,
-                                attr.normal(), tile_size, Some(dirty_local),
-                            );
-                        }
-                    }
-                }
-            }
-            return;
-        }
-        if is_leaf(node) {
-            let slot = leaf_slot(node);
-            let attr = resolve_leaf_attr(overlay, leaf_attrs, slot);
-            let primary = attr.material_primary;
-            let secondary: u16 = attr.material_secondary_blend & 0x0FFF;
-            let blend: u16 = (attr.material_secondary_blend >> 12) & 0xF;
-            let painted_mat = if shader_materials.contains_key(&primary) {
-                Some(primary)
-            } else if blend > 0 && shader_materials.contains_key(&secondary) {
-                Some(secondary)
-            } else {
-                None
-            };
-            if let Some(mat) = painted_mat {
-                let info = shader_materials.get(&mat);
-                let tile_size = info.and_then(|i| i.tile_size);
-                super::lifecycle::expand_aabb(
-                    out, mat, cell_min, cell_max,
-                    attr.normal(), tile_size, Some(dirty_local),
-                );
-            }
-            return;
-        }
-        // Branch — descend into 8 children. `node` is the absolute
-        // offset of the first child (rebased at allocation time).
-        if level >= max_depth { return; }
-        let child_voxels = 1u32 << (max_depth - level - 1);
-        for octant in 0u32..8 {
-            let dx = octant & 1;
-            let dy = (octant >> 1) & 1;
-            let dz = (octant >> 2) & 1;
-            let child_coord = glam::UVec3::new(
-                coord_voxels.x + dx * child_voxels,
-                coord_voxels.y + dy * child_voxels,
-                coord_voxels.z + dz * child_voxels,
-            );
-            let child_offset = node as usize + octant as usize;
-            walk(
-                octree_data,
-                brick_pool,
-                leaf_attrs,
-                overlay,
-                child_offset,
-                level + 1,
-                max_depth,
-                child_coord,
-                grid_origin,
-                base_vs,
-                shader_materials,
-                out,
-                walk_clip,
-                dirty_local,
-            );
-        }
-    }
-
-    walk(
-        octree_data,
-        brick_pool,
-        leaf_attrs,
-        overlay,
-        root_offset,
-        0,
-        depth,
-        glam::UVec3::ZERO,
-        grid_origin,
-        base_voxel_size,
-        shader_materials,
-        out,
-        walk_clip,
-        dirty_local,
-    );
-    let _ = (is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE, BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR, BRICK_CELL_EMPTY);
-}
 
 /// Diagnostic — count painted leaves on each side of `mid_x` (in
 /// object-local space). Mirrors the structure of `scan_painted_aabbs`
@@ -2131,23 +1593,6 @@ pub(super) fn count_painted_halves_check(
     false
 }
 
-/// Sentinel tile coord for non-tiled shaders (matching
-/// `rkp_render::user_shader_pass::NO_TILE`). Single inner-map entry
-/// for the whole painted area — V9 single-region behaviour.
-const NO_TILE_COORD: [i32; 3] = [i32::MIN, i32::MIN, i32::MIN];
-
-/// Register a painted leaf occupying `[mn, mx]` (host-local) for
-/// material `mat`. For shaders with a `@tile_size`, the leaf is
-/// bucketed into every tile coord it overlaps; for non-tiled
-/// shaders, the leaf is registered under `NO_TILE_COORD` and its
-/// AABB merged into the running painted-leaf bounds.
-///
-/// Tiling assumes the grid is anchored at host-local origin
-/// (tile_coord = floor(pos / tile_size)). For typical paint where a
-/// leaf's size ≪ tile_size, each leaf lives in a single tile — the
-/// boundary case (leaf straddling tiles) registers it in all
-/// overlapping tiles, which slightly inflates per-tile counts but
-/// is correct for the band gate.
 /// Transform an axis-aligned bounding box from one frame to another
 /// via an arbitrary 4×4 matrix. Iterates the 8 corners and bounds the
 /// result — produces a tight AABB for axis-aligned matrices and a
@@ -2173,91 +1618,3 @@ fn transform_aabb_to_world(
     }
     (min, max)
 }
-
-fn expand_aabb(
-    out: &mut std::collections::HashMap<
-        u16,
-        std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
-    >,
-    mat: u16,
-    mn: glam::Vec3,
-    mx: glam::Vec3,
-    normal: glam::Vec3,
-    tile_size: Option<f32>,
-    // Phase C1 region-bounded walk: when `Some`, per-tile inserts are
-    // skipped for tile coords whose tile cube doesn't overlap this
-    // object-local AABB. The clipped scan uses this so that leaves
-    // visited inside the walk-clip expansion (`local_dirty +
-    // max_tile_size`) but outside `local_dirty` itself don't pollute
-    // tiles that weren't cleared. Pass `None` for the full walk.
-    dirty_local: Option<rkp_core::Aabb>,
-) {
-    let mat_map = out.entry(mat).or_default();
-
-    fn merge(
-        mat_map: &mut std::collections::HashMap<[i32; 3], super::state::PaintedTileEntry>,
-        key: [i32; 3],
-        mn: glam::Vec3,
-        mx: glam::Vec3,
-        normal: glam::Vec3,
-    ) {
-        let entry = mat_map.entry(key).or_insert_with(super::state::PaintedTileEntry::empty);
-        entry.aabb.min = entry.aabb.min.min(mn);
-        entry.aabb.max = entry.aabb.max.max(mx);
-        entry.leaf_count = entry.leaf_count.saturating_add(1);
-        // Sum (not mean) — for leaves that span tile boundaries, the
-        // outer match below calls merge() once per overlapped tile, so
-        // each tile gets that leaf's normal added once. Normalize at
-        // anchor build time.
-        entry.normal_sum += normal;
-    }
-
-    match tile_size {
-        None => {
-            // NO_TILE_COORD case — only reachable from the full-walk
-            // path (region-bounded walk falls back to full when any
-            // material has tile_size=None). Always merge.
-            merge(mat_map, NO_TILE_COORD, mn, mx, normal);
-        }
-        Some(s) if s > 0.0 => {
-            // Compute tile coord range the leaf overlaps. Use a tiny
-            // epsilon on the upper bound so a leaf whose max sits
-            // exactly on a tile boundary doesn't count for the next
-            // tile too.
-            let inv = 1.0 / s;
-            let lo = (mn * inv).floor();
-            let hi = ((mx - glam::Vec3::splat(1e-6)) * inv).floor();
-            for ix in (lo.x as i32)..=(hi.x as i32) {
-                for iy in (lo.y as i32)..=(hi.y as i32) {
-                    for iz in (lo.z as i32)..=(hi.z as i32) {
-                        // Region-bounded filter: skip tiles outside the
-                        // cleared dirty region so the new fill matches
-                        // exactly the set of tiles that were cleared
-                        // beforehand. Without this the walk-clip
-                        // expansion (`dirty + max_tile_size`) would
-                        // pull in leaves of smaller-tile-size materials
-                        // outside their own cleared range and double-
-                        // count them.
-                        if let Some(d) = dirty_local {
-                            let tile_min = glam::Vec3::new(
-                                ix as f32, iy as f32, iz as f32,
-                            ) * s;
-                            let tile_max = tile_min + glam::Vec3::splat(s);
-                            let tile_aabb = rkp_core::Aabb {
-                                min: tile_min,
-                                max: tile_max,
-                            };
-                            if !d.intersects(&tile_aabb) {
-                                continue;
-                            }
-                        }
-                        merge(mat_map, [ix, iy, iz], mn, mx, normal);
-                    }
-                }
-            }
-        }
-        // tile_size 0 or negative → treat as non-tiled.
-        Some(_) => merge(mat_map, NO_TILE_COORD, mn, mx, normal),
-    }
-}
-
