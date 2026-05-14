@@ -682,8 +682,13 @@ pub(crate) struct EngineState {
     /// geometry change implies a collider rebuild for the affected
     /// entity.
     pub(crate) geometry_dirty: super::geometry_dirty::GeometryDirty,
-    /// Scene structure changed — push objects list to UI.
-    pub(crate) scene_dirty: bool,
+    /// Scene structure changed — push objects list to UI. Per-entity
+    /// dirty set + sticky-all bit; see [`super::scene_dirty::SceneDirty`]
+    /// and `docs/PERF_DEBT.md` B3. Today's consumer in
+    /// `build_state_update` still does a full sorted rebuild on
+    /// `is_dirty()`; the per-entity scope is foundation for a future
+    /// incremental UI delta path.
+    pub(crate) scene_dirty: super::scene_dirty::SceneDirty,
     /// Per-entity dirty tracking for `update_scene_gpu`. Replaced
     /// the prior `bool` flag (PERF_DEBT.md B1) so each mutation can
     /// describe its scope: stamp/gizmo/paint events flag a single

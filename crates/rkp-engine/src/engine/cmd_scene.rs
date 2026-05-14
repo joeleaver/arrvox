@@ -97,7 +97,7 @@ impl EngineState {
                     },
                 ));
                 self.assign_entity_uuid(new_entity);
-                self.scene_dirty = true;
+                self.scene_dirty.mark_entity(new_entity);
 
                 // Enqueue a bake for the copy. We're reusing the
                 // async bake pipeline but the target entity has no
@@ -154,7 +154,7 @@ impl EngineState {
                     PointLight::default(),
                 ));
                 self.assign_entity_uuid(entity);
-                self.scene_dirty = true;
+                self.scene_dirty.mark_entity(entity);
                 self.console.info(format!("Spawned '{name}'"));
             }
 
@@ -169,7 +169,7 @@ impl EngineState {
                     SpotLight::default(),
                 ));
                 self.assign_entity_uuid(entity);
-                self.scene_dirty = true;
+                self.scene_dirty.mark_entity(entity);
                 self.console.info(format!("Spawned '{name}'"));
             }
 
@@ -184,7 +184,7 @@ impl EngineState {
                     Camera::default(),
                 ));
                 self.assign_entity_uuid(entity);
-                self.scene_dirty = true;
+                self.scene_dirty.mark_entity(entity);
                 self.console.info(format!("Spawned '{name}'"));
             }
 
@@ -495,7 +495,7 @@ impl EngineState {
                         self.project_name = project_name;
                         self.project_loaded = true;
                         self.project_dirty = true;
-                        self.scene_dirty = true;
+                        self.scene_dirty.mark_all();
                         self.gpu_objects_dirty.mark_all();
                         self.scan_models();
                         if let Some(ref dir) = self.project_dir {

@@ -1,6 +1,6 @@
 # Engine performance-debt eradication plan
 
-**Status**: in progress (Phase A complete; B1 + B2 + C1 + C2 + C2-narrow + C3 shipped; B3 + Phase D/E next). Feature work paused.
+**Status**: in progress (Phase A complete; B1 + B2 + B3 + C1 + C2 + C2-narrow + C3 shipped; Phase D/E next). Feature work paused.
 
 This document is the authoritative plan for eliminating systemic "rebuild
 everything every tick" patterns from rkp-engine and rkp-render. It was
@@ -129,7 +129,7 @@ metric moved.
 |---|---|---|
 | **B1 ✅ (plumbing)** | `gpu_objects_dirty: bool` → `GpuObjectsDirty` (HashSet + sticky-all). 31 setter sites migrated: hot stamp paths (sculpt/paint/gizmo/picking/proc-bake) narrowed to `mark_entity(e)`; world-level events (project load, scene clear, gameplay reset, etc.) keep `mark_all()`. **Today's consumer still does a full rebuild whenever `is_dirty()`** — the per-row fast path is the C2 work. Module: `crates/rkp-engine/src/engine/gpu_objects_dirty.rs`. | Plumbing only; perf delivers in C2. |
 | **B2 ✅** | `geometry_dirty` and `collider_caches_dirty` both replaced with `GeometryDirty` (HashSet + sticky-all). New module `engine/geometry_dirty.rs`. Lifecycle drains `geometry_dirty` → `collider_caches_dirty` per-entity. Procedural-bake completion narrowed to `mark_entity(e)`; world-level events keep `mark_all()`. | Per-entity collider rebuild path (delivered together with C3 below). |
-| **B3** | `scene_dirty: bool` → typed event stream consumed by UI/inspector snapshot builder. | UI updates incrementally |
+| **B3 ✅ (plumbing)** | `scene_dirty: bool` → `SceneDirty` (HashSet + sticky-all), matching the B1/B2 shape. 23 setter sites migrated: spawn / delete / duplicate / reparent / component add+remove → `mark_entity(e)`; scene load / project load / clear / gameplay register / enter-mode → `mark_all()`. Today's consumer in `build_state_update` still does the full sorted rebuild on `is_dirty()`; the per-entity scope is foundation for a future delta-protocol path that sends only Added/Removed/Renamed/Reparented rows across the sim→editor boundary. Module: `crates/rkp-engine/src/engine/scene_dirty.rs`. | Plumbing only — perf delivers when a future narrow consumer lands. |
 
 ### Phase C — Incremental derived state
 

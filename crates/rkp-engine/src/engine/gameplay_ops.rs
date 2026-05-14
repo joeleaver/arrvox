@@ -93,7 +93,7 @@ impl EngineState {
                 }
                 self.generator_system.register_gameplay(gen_entries);
                 self.generators_dirty = true;
-                self.scene_dirty = true;
+                self.scene_dirty.mark_all();
             }
             Err(e) => {
                 self.console.error(format!("Failed to load gameplay dylib: {e}"));
@@ -211,7 +211,7 @@ impl EngineState {
             }
         }
 
-        self.scene_dirty = true;
+        self.scene_dirty.mark_all();
         self.gpu_objects_dirty.mark_all();
     }
 }

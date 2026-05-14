@@ -301,8 +301,14 @@ impl EngineState {
         // is paced to 60 Hz. The user-visible FPS is the render rate.
         let fps = self.render_hz_ema;
 
-        let objects = if self.scene_dirty {
-            self.scene_dirty = false;
+        // PERF_DEBT.md B3 plumbing: today's consumer still does a
+        // full sorted rebuild on any dirty signal (per-entity narrow
+        // or sticky-all). The per-entity scope carried by SceneDirty
+        // is foundation for a future delta-protocol path that sends
+        // only Added/Removed/Renamed/Reparented rows across the
+        // sim→editor boundary.
+        let objects = if self.scene_dirty.is_dirty() {
+            self.scene_dirty.clear();
             // Sort by `entity_tree_order` — user-arrangeable (via a
             // future drag-reorder command) and persisted in the scene
             // file, so the arrangement survives save/reload. Entities

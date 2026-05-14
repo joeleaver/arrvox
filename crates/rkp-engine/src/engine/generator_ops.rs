@@ -83,7 +83,9 @@ impl EngineState {
                     for child in orphans {
                         self.delete_entity(child);
                     }
-                    self.scene_dirty = true;
+                    // Multi-entity delete loop; delete_entity already
+                    // marks each removed entity narrowly.
+                    self.scene_dirty.mark_all();
                 }
                 GeneratorEvent::Failed { entity, name, error } => {
                     self.console.error(format!(
@@ -172,7 +174,7 @@ impl EngineState {
             {
                 owned.generation = generation;
             }
-            self.scene_dirty = true;
+            self.scene_dirty.mark_entity(existing);
             self.geometry_dirty.mark_all();
             self.gpu_objects_dirty.mark_all();
             eprintln!(
@@ -232,7 +234,7 @@ impl EngineState {
             );
         }
         self.assign_entity_uuid(child);
-        self.scene_dirty = true;
+        self.scene_dirty.mark_entity(child);
         self.geometry_dirty.mark_all();
         self.gpu_objects_dirty.mark_all();
         eprintln!(
@@ -330,7 +332,7 @@ impl EngineState {
         ));
         (entry.insert_default_params)(&mut self.world, entity);
         self.assign_entity_uuid(entity);
-        self.scene_dirty = true;
+        self.scene_dirty.mark_entity(entity);
         if verbose {
             self.console.info(format!("Spawned generator '{name}'"));
         }
@@ -404,7 +406,7 @@ impl EngineState {
             }
         }
         self.assign_entity_uuid(entity);
-        self.scene_dirty = true;
+        self.scene_dirty.mark_entity(entity);
         if verbose {
             self.console.info(format!(
                 "Spawned preset '{}' ({}) with {} override(s)",

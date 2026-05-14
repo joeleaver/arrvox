@@ -147,7 +147,7 @@ impl EngineState {
                     proc_geo,
                 ));
                 self.assign_entity_uuid(entity);
-                self.scene_dirty = true;
+                self.scene_dirty.mark_entity(entity);
                 self.console.info(format!("Spawned procedural '{name}' (baking…)"));
             }
 
@@ -558,7 +558,10 @@ impl EngineState {
                 if self.selected_entity == Some(entity) {
                     self.selected_procedural_node = None;
                 }
-                self.scene_dirty = true;
+                // Convert mutates the same entity in place — Renderable
+                // swapped from ProceduralGeometry to an Octree-backed
+                // asset. The other entities in the scene are unchanged.
+                self.scene_dirty.mark_entity(entity);
                 self.geometry_dirty.mark_all();
                 self.gpu_objects_dirty.mark_all();
                 // Surface the new asset in the Models panel right

@@ -336,7 +336,7 @@ impl EngineState {
                     self.next_tree_order = max_loaded + 1.0;
                 }
 
-                self.scene_dirty = true;
+                self.scene_dirty.mark_all();
                 self.gpu_objects_dirty.mark_all();
             }
             Err(e) => self.console.error(format!("Load scene failed: {e}")),

@@ -98,13 +98,13 @@ impl EngineState {
                                 "Add Skeleton: entity has no Renderable asset — attach a model first".to_string(),
                             ),
                         }
-                        self.scene_dirty = true;
+                        self.scene_dirty.mark_entity(entity);
                         self.gpu_objects_dirty.mark_all();
                     } else if let Some(entry) = self.registry.get(&component_name) {
                         if let Err(e) = (entry.add_default)(&mut self.world, entity) {
                             eprintln!("[RkpEngine] add component failed: {e}");
                         }
-                        self.scene_dirty = true;
+                        self.scene_dirty.mark_entity(entity);
                         self.gpu_objects_dirty.mark_all();
                         if component_name == "RigidBody" {
                             self.collider_caches_dirty.mark_all();
@@ -127,7 +127,7 @@ impl EngineState {
                         if component_name == "Skeleton" {
                             let _ = self.world.remove_one::<crate::components::AnimationPlayer>(entity);
                         }
-                        self.scene_dirty = true;
+                        self.scene_dirty.mark_entity(entity);
                         self.gpu_objects_dirty.mark_all();
                         if component_name == "RigidBody" {
                             self.collider_caches_dirty.mark_all();

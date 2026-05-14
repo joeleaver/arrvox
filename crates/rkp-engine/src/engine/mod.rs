@@ -21,6 +21,7 @@ mod gameplay_ops;
 mod generator_ops;
 mod geometry_dirty;
 mod gpu_objects_dirty;
+mod scene_dirty;
 mod gizmo_ops;
 mod import_ops;
 mod lifecycle;

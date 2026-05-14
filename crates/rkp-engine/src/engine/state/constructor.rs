@@ -191,7 +191,7 @@ impl EngineState {
             file_watcher: None,
             import_worker: crate::import_worker::ImportWorker::new(),
             geometry_dirty: crate::engine::geometry_dirty::GeometryDirty::new(),
-            scene_dirty: false,
+            scene_dirty: super::super::scene_dirty::SceneDirty::new(),
             gpu_objects_dirty: {
                 // Initial state: full rebuild on first tick. World is
                 // empty here, so per-entity tracking would carry no
