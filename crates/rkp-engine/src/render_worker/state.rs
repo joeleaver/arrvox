@@ -22,6 +22,8 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 
+use arc_swap::ArcSwapOption;
+
 use crossbeam::channel::{Receiver, Sender};
 
 use rkp_render::{
@@ -68,30 +70,85 @@ impl Drop for RenderWorker {
 /// is dropped. Render thread calls [`take_blocking`] to wait for the
 /// next frame; returns `None` once `shutdown` has been signalled.
 ///
+/// Phase E3 of `docs/PERF_DEBT.md`: the frame slot itself lives in an
+/// `ArcSwapOption<RenderFrame>` so [`Self::try_take`] (the steady-state
+/// poll the render thread runs every iteration) is lock-free. The
+/// blocking wait used at render-thread bootstrap still needs a wakeup
+/// primitive, which costs one tiny `Mutex<()> + Condvar` notify per
+/// submit — held only across the `notify_one` call, never across the
+/// frame transit itself.
+///
 /// [`submit`]: RenderInbox::submit
 /// [`take_blocking`]: RenderInbox::take_blocking
 pub struct RenderInbox {
-    slot: Mutex<Option<RenderFrame>>,
+    /// Newest-wins frame slot. Lock-free swap on submit / try_take.
+    slot: ArcSwapOption<RenderFrame>,
+    /// Wakeup lock — held only across the brief moment of
+    /// `notify_one` (submit) or the bootstrap-`wait` loop
+    /// (take_blocking). Never held across the frame swap.
+    sleep_mu: Mutex<()>,
     notify: Condvar,
     shutdown: AtomicBool,
+}
+
+/// Recover the inner `RenderFrame` from the inbox's sole-owner Arc.
+///
+/// SPSC invariant: sim is the only submitter, render is the only
+/// taker, the inbox holds the only `Arc<RenderFrame>` reference. When
+/// render's swap-None returns an `Arc`, the refcount should be 1.
+///
+/// arc-swap's lock-free read path can in pathological cases keep a
+/// transient extra refcount in flight; we busy-spin a few iterations
+/// to let it clear before falling back to a clone-from-shared path.
+/// In practice the spin loop should exit on the first iteration —
+/// this is belt-and-suspenders for the race against `slot.load()`
+/// inside `take_blocking`.
+#[inline]
+fn unwrap_inbox_arc(mut arc: Arc<RenderFrame>) -> RenderFrame {
+    for _ in 0..16 {
+        match Arc::try_unwrap(arc) {
+            Ok(frame) => return frame,
+            Err(shared) => {
+                arc = shared;
+                std::thread::yield_now();
+            }
+        }
+    }
+    panic!(
+        "RenderInbox: failed to recover sole ownership after spin — \
+         someone else is holding an Arc<RenderFrame> reference (this \
+         should never happen in SPSC; if you see this, the inbox has \
+         been mis-shared)"
+    );
 }
 
 impl RenderInbox {
     fn new() -> Self {
         Self {
-            slot: Mutex::new(None),
+            slot: ArcSwapOption::const_empty(),
+            sleep_mu: Mutex::new(()),
             notify: Condvar::new(),
             shutdown: AtomicBool::new(false),
         }
     }
 
     /// Place `frame` in the inbox, dropping any previously-unconsumed
-    /// frame. O(1); never blocks.
+    /// frame. O(1); lock-free swap + a one-line condvar notify.
     pub fn submit(&self, frame: RenderFrame) {
-        let mut slot = self.slot.lock().expect("RenderInbox slot poisoned");
-        *slot = Some(frame);
-        // Drop the lock before notifying — wakers grab it next.
-        drop(slot);
+        // Atomic swap — old Arc (if any) drops immediately. The render
+        // thread is the only other reader/consumer; it either took the
+        // previous Arc already or this submit observed the slot empty.
+        // Either way refcount returns to 1 at swap time.
+        let _previous = self.slot.swap(Some(Arc::new(frame)));
+        drop(_previous);
+        // Bounce the wakeup mutex so the bootstrap waiter can't miss
+        // the notification — without this, a Condvar `wait` that has
+        // released its mutex but hasn't parked yet would miss our
+        // `notify_one`. Acquiring `sleep_mu` here serializes that
+        // boundary: either the waiter is already parked (notify wakes
+        // it) or it hasn't reached `wait()` yet (its next loop re-
+        // checks the slot and finds the new frame).
+        let _g = self.sleep_mu.lock().expect("RenderInbox sleep_mu poisoned");
         self.notify.notify_one();
     }
 
@@ -100,15 +157,26 @@ impl RenderInbox {
     /// thread bootstrap — there's nothing to render before the first
     /// sim tick.
     pub(super) fn take_blocking(&self) -> Option<RenderFrame> {
-        let mut slot = self.slot.lock().expect("RenderInbox slot poisoned");
         loop {
             if self.shutdown.load(Ordering::Acquire) {
                 return None;
             }
-            if let Some(f) = slot.take() {
-                return Some(f);
+            if let Some(arc) = self.slot.swap(None) {
+                return Some(unwrap_inbox_arc(arc));
             }
-            slot = self.notify.wait(slot).expect("RenderInbox cond wait poisoned");
+            let g = self.sleep_mu.lock().expect("RenderInbox sleep_mu poisoned");
+            // Re-check the slot under the mutex — a `submit` that
+            // raced our load above will already have notified the
+            // condvar before we grabbed `sleep_mu`. Without this re-
+            // check the wait would miss that notify and park forever.
+            if self.slot.load().is_some() || self.shutdown.load(Ordering::Acquire) {
+                continue;
+            }
+            let _woken = self.notify.wait(g).expect("RenderInbox cond wait poisoned");
+            // _woken drops at end of loop iteration; next swap runs
+            // lock-free, so the brief mutex hold here covers only the
+            // park/wakeup boundary.
+            drop(_woken);
         }
     }
 
@@ -116,11 +184,11 @@ impl RenderInbox {
     /// since the last call. Used in the steady-state render loop
     /// where render has its own clock and re-renders the current
     /// snapshot (interpolated) when no newer one is waiting.
+    ///
+    /// Phase E3: lock-free — one `ArcSwap::swap`, no Mutex.
     pub(super) fn try_take(&self) -> Option<RenderFrame> {
-        self.slot
-            .lock()
-            .expect("RenderInbox slot poisoned")
-            .take()
+        let arc = self.slot.swap(None)?;
+        Some(unwrap_inbox_arc(arc))
     }
 
     /// `true` once [`Self::shutdown`] has been signalled.
@@ -131,6 +199,7 @@ impl RenderInbox {
     /// Signal the render thread to exit at its next inbox check.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
+        let _g = self.sleep_mu.lock().expect("RenderInbox sleep_mu poisoned");
         self.notify.notify_all();
     }
 }

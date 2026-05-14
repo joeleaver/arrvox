@@ -63,6 +63,7 @@ gltf = { version = "1", features = ["KHR_texture_transform"] }
 tobj = "4"
 ufbx = "0.10"
 crossbeam = "0.8"
+arc-swap = "1.7"
 inventory = "0.3"
 rapier3d = "0.32"
 meshopt = "0.6"
