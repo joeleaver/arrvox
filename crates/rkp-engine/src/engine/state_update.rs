@@ -282,6 +282,12 @@ impl EngineState {
             // next iteration; the plain `geometry_dirty` flag only
             // schedules collider rebuilds, not GPU upload.
             sm.bump_geometry_epoch();
+            drop(sm);
+            // PERF_DEBT.md C2-extension: remap can flip an asset's
+            // has_glass verdict (e.g. remapping a non-glass material
+            // to a glass one). Invalidate the cache entry so the next
+            // has_glass check rescans this asset.
+            self.asset_has_glass_cache.remove(&spatial.root_offset);
         }
         count
     }

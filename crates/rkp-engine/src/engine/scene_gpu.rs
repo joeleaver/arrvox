@@ -48,10 +48,22 @@ impl EngineState {
         // Refresh `material_is_glass` from the material library —
         // O(slot_count), typically dozens. If the resulting Vec
         // differs from last frame, clear `asset_has_glass_cache` so
-        // every asset re-scans its leaves on its next draw. Also
-        // invalidate the cache when geometry changes
-        // (`remap_entity_material` mutates leaf materials in-place
-        // and bumps geometry_epoch).
+        // every asset re-scans its leaves on its next draw.
+        //
+        // PERF_DEBT.md C2-extension: the geom_epoch-driven cache
+        // invalidation was removed. It was firing on every sculpt
+        // stamp (which bumps geom_epoch) and triggering a 2.5M-leaf
+        // rescan inside `update_scene_gpu` — ~50 ms per stamp on the
+        // splat5 elephant. Sculpt-Carve can never *add* glass (only
+        // remove), so a stale-true verdict is just a perf cost (an
+        // empty glass pass), not a correctness issue. The cases that
+        // legitimately mutate per-asset glass state — `remap_entity_
+        // material` and sculpt-Raise with a glass brush — now
+        // invalidate `asset_has_glass_cache[root_offset]` directly at
+        // the call site. `material_glass_lib_epoch` is kept as a
+        // sentinel for the material-library-change branch above so
+        // its semantics remain "the cache was last refreshed at this
+        // epoch."
         {
             let slot_count = self.material_lib.slot_count();
             let new_material_is_glass: Vec<bool> = (0..slot_count)
@@ -66,13 +78,11 @@ impl EngineState {
                 self.material_is_glass = new_material_is_glass;
                 self.asset_has_glass_cache.clear();
             }
-            let geom_epoch = self
+            // Advance the epoch marker (no cache work) so any future
+            // consumer that compares against it has a fresh value.
+            self.material_glass_lib_epoch = self
                 .geometry_epoch_handle
                 .load(std::sync::atomic::Ordering::Acquire);
-            if geom_epoch > self.material_glass_lib_epoch {
-                self.asset_has_glass_cache.clear();
-                self.material_glass_lib_epoch = geom_epoch;
-            }
         }
         // Per-frame asset table — `octree_root` → index into
         // `gpu_assets`. Two entities sharing one .rkp asset share one
@@ -590,5 +600,240 @@ impl EngineState {
                 }
             }
         }
+    }
+
+    /// Per-entity structural-narrow fast path. Handles dirty entities
+    /// whose Renderable / overlays / sculpts / material / Transform
+    /// changed but where the *set* of entities is unchanged (no
+    /// add/remove since the last full rebuild) — i.e. the common
+    /// sculpt/paint stamp case.
+    ///
+    /// Returns `false` if it can't handle the dirty set (e.g. an
+    /// entity newer than the last full rebuild has no `entity_to_gpu`
+    /// entry yet); the caller falls back to [`Self::update_scene_gpu`].
+    ///
+    /// What it does:
+    ///   - Splices each dirty entity's `paint_overlays` slice into
+    ///     `gpu_instance_overlays` in place; splices its
+    ///     `sculpt_overlays` slice into `gpu_instance_sculpts`.
+    ///   - Updates that entity's `gpu_instances` row (`world`,
+    ///     `overlay_offset/count`, `sculpt_offset/count`, `material_id`,
+    ///     `layer_mask`).
+    ///   - Shifts `overlay_offset` and `sculpt_offset` on every
+    ///     subsequent row by the delta produced by this entity's
+    ///     splice.
+    ///   - Patches `splat_draws[i].world` / `proxy_draws[i].world`
+    ///     for any Transform-dirty entity (mixed-kind ticks).
+    ///
+    /// What it skips (vs. the full rebuild):
+    ///   - `bone_matrix_allocator.rebuild` — skeleton state stable
+    ///     across sculpt/paint stamps.
+    ///   - `skin_dispatches` clear + per-skinned-entity planning —
+    ///     same.
+    ///   - `gpu_assets` rebuild — depends only on spatial.aabb /
+    ///     grid_origin / voxel_size / bone_count, none of which a
+    ///     sculpt/paint stamp mutates on a loaded asset.
+    ///   - The world-wide query + sort for `ordered`.
+    ///   - `splat_draws[i].has_glass` re-evaluation. Same staleness
+    ///     model as the C2 transform-only path: the value is left at
+    ///     its prior verdict, refreshed only when sculpt-Raise lands
+    ///     a glass brush (sculpt_ops drops the per-asset cache entry)
+    ///     or `remap_entity_material` runs. Carve cannot add glass,
+    ///     so a stale-true verdict for an emptied asset is just a
+    ///     wasted glass pass.
+    ///
+    /// On the splat5 elephant scene this drops `update_scene_gpu`
+    /// from ~60-172 ms per stamp (full rebuild + skin replan + glass
+    /// scan for 22 entities) to under 5 ms for the single dirty
+    /// entity's splice + suffix shift. On scenes where animation is
+    /// playing, `mark_all` from `animation::tick` still forces the
+    /// full rebuild — but with the glass-scan cache invalidation
+    /// moved to the call sites that legitimately flip has_glass, the
+    /// full rebuild itself is now ~0.1 ms per stamp.
+    pub(crate) fn update_scene_gpu_structural_narrow(&mut self) -> bool {
+        use crate::components::{Renderable, Transform};
+
+        // Collect (gpu_idx, entity) pairs; bail to full rebuild if
+        // any dirty entity is newer than the last gpu mapping.
+        let dirty_set = self.gpu_objects_dirty.dirty_entities();
+        let mut work: Vec<(usize, hecs::Entity)> = Vec::with_capacity(dirty_set.len());
+        for &entity in dirty_set.keys() {
+            let Some(&gpu_idx) = self.entity_to_gpu.get(&entity) else {
+                return false;
+            };
+            work.push((gpu_idx, entity));
+        }
+        // Sort by gpu_idx so each entity's splice + suffix shift
+        // updates downstream offsets in order — the next entity's
+        // already-shifted offset is what we read from gpu_instances.
+        work.sort_by_key(|&(idx, _)| idx);
+
+        for (gpu_idx, entity) in work {
+            // Re-read per-entity inputs. Each scope drops its
+            // hecs::Ref before we mutate gpu_instances below.
+            let Ok(transform) = self.world.get::<&Transform>(entity) else { continue };
+            let Ok(renderable) = self.world.get::<&Renderable>(entity) else { continue };
+            let transform_clone = (*transform).clone();
+            let new_material_id = renderable.material_id as u32;
+            let asset_handle_raw = renderable.asset_handle.map(|h| h.raw());
+            // Spatial variant decides whether the entity contributes a
+            // splat_draws row (octree assets) or a proxy_draws row
+            // (procedural proxies). `has_glass` re-eval is deliberately
+            // skipped here — see fn doc comment.
+            let is_octree = matches!(
+                renderable.spatial.as_ref(),
+                Some(crate::components::RenderGeometry::Octree(_))
+            );
+            drop(renderable);
+            drop(transform);
+
+            let new_layer_mask = self
+                .world
+                .get::<&crate::viewport::RenderLayer>(entity)
+                .map(|l| l.mask)
+                .unwrap_or(crate::viewport::layer::DEFAULT);
+
+            let world_matrix = glam::Mat4::from_scale_rotation_translation(
+                transform_clone.scale,
+                glam::Quat::from_euler(
+                    glam::EulerRot::XYZ,
+                    transform_clone.rotation.x.to_radians(),
+                    transform_clone.rotation.y.to_radians(),
+                    transform_clone.rotation.z.to_radians(),
+                ),
+                transform_clone.position,
+            );
+            let world_arr = world_matrix.to_cols_array_2d();
+
+            // Snapshot the current overlay/sculpt slice for this entity
+            // from gpu_instances, then compute the new slice content
+            // and deltas.
+            let (cur_overlay_off, cur_overlay_count, cur_sculpt_off, cur_sculpt_count) = {
+                let inst = &self.gpu_instances[gpu_idx];
+                (
+                    inst.overlay_offset,
+                    inst.overlay_count,
+                    inst.sculpt_offset,
+                    inst.sculpt_count,
+                )
+            };
+
+            // Empty-slice entries today carry overlay_offset = 0 (left
+            // at the build_gpu_instance default). When the entity
+            // gains its first non-empty slice we need a real insertion
+            // point — right after the previous entity's slice end.
+            // Same logic for sculpt below.
+            let new_overlay: Vec<_> = self
+                .paint_overlays
+                .get(&entity)
+                .map(|o| o.entries().to_vec())
+                .unwrap_or_default();
+            let new_sculpt: Vec<_> = self
+                .sculpt_overlays
+                .get(&entity)
+                .map(|s| s.entries().to_vec())
+                .unwrap_or_default();
+            let new_overlay_count = new_overlay.len() as u32;
+            let new_sculpt_count = new_sculpt.len() as u32;
+
+            let overlay_insert_off: u32 = if cur_overlay_count > 0 {
+                cur_overlay_off
+            } else if gpu_idx == 0 {
+                0
+            } else {
+                let prev = &self.gpu_instances[gpu_idx - 1];
+                prev.overlay_offset + prev.overlay_count
+            };
+            let sculpt_insert_off: u32 = if cur_sculpt_count > 0 {
+                cur_sculpt_off
+            } else if gpu_idx == 0 {
+                0
+            } else {
+                let prev = &self.gpu_instances[gpu_idx - 1];
+                prev.sculpt_offset + prev.sculpt_count
+            };
+
+            let overlay_delta =
+                new_overlay_count as i64 - cur_overlay_count as i64;
+            let sculpt_delta =
+                new_sculpt_count as i64 - cur_sculpt_count as i64;
+
+            // Splice in place. `splice(start..end, iter)` replaces the
+            // range and shifts the tail by the size difference. We
+            // unconditionally splice so paint stamps that update
+            // existing entries (same length, different content) also
+            // propagate.
+            if cur_overlay_count > 0 || new_overlay_count > 0 {
+                let overlays = std::sync::Arc::make_mut(&mut self.gpu_instance_overlays);
+                let start = overlay_insert_off as usize;
+                let end = start + cur_overlay_count as usize;
+                overlays.splice(start..end, new_overlay);
+            }
+            if cur_sculpt_count > 0 || new_sculpt_count > 0 {
+                let sculpts = std::sync::Arc::make_mut(&mut self.gpu_instance_sculpts);
+                let start = sculpt_insert_off as usize;
+                let end = start + cur_sculpt_count as usize;
+                sculpts.splice(start..end, new_sculpt);
+            }
+
+            // Patch this entity's gpu_instances row + shift downstream
+            // overlay/sculpt offsets.
+            let gpu_instances = std::sync::Arc::make_mut(&mut self.gpu_instances);
+            {
+                let inst = &mut gpu_instances[gpu_idx];
+                inst.world = world_arr;
+                inst.overlay_offset = overlay_insert_off;
+                inst.overlay_count = new_overlay_count;
+                inst.sculpt_offset = sculpt_insert_off;
+                inst.sculpt_count = new_sculpt_count;
+                inst.material_id = new_material_id;
+                inst.layer_mask = new_layer_mask;
+            }
+            if overlay_delta != 0 || sculpt_delta != 0 {
+                for inst in &mut gpu_instances[gpu_idx + 1..] {
+                    if overlay_delta > 0 {
+                        inst.overlay_offset =
+                            inst.overlay_offset.saturating_add(overlay_delta as u32);
+                    } else if overlay_delta < 0 {
+                        inst.overlay_offset =
+                            inst.overlay_offset.saturating_sub((-overlay_delta) as u32);
+                    }
+                    if sculpt_delta > 0 {
+                        inst.sculpt_offset =
+                            inst.sculpt_offset.saturating_add(sculpt_delta as u32);
+                    } else if sculpt_delta < 0 {
+                        inst.sculpt_offset =
+                            inst.sculpt_offset.saturating_sub((-sculpt_delta) as u32);
+                    }
+                }
+            }
+
+            // splat_draws / proxy_draws entry for this entity — keyed
+            // by object_id == gpu_idx. We patch only `world` (Transform-
+            // dirty case); `has_glass` stays at its prior value since
+            // re-scanning the asset's leaves on every stamp is the
+            // dominant remaining cost (see fn doc comment).
+            if is_octree {
+                if asset_handle_raw.is_some() {
+                    let splat_draws = std::sync::Arc::make_mut(&mut self.splat_draws);
+                    for d in splat_draws.iter_mut() {
+                        if d.object_id == gpu_idx as u32 {
+                            d.world = world_arr;
+                            break;
+                        }
+                    }
+                }
+            } else if !self.proxy_draws.is_empty() {
+                let proxy_draws = std::sync::Arc::make_mut(&mut self.proxy_draws);
+                for d in proxy_draws.iter_mut() {
+                    if d.object_id == gpu_idx as u32 {
+                        d.world = world_arr;
+                        break;
+                    }
+                }
+            }
+        }
+
+        true
     }
 }

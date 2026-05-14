@@ -76,7 +76,7 @@ impl EngineState {
         }
 
         // ── Entity must be asset-backed (octree + asset_handle). ─
-        let (asset_handle, entity_world) = {
+        let (asset_handle, asset_root_offset, entity_world) = {
             let renderable = match self.world.get::<&Renderable>(entity) {
                 Ok(r) => r,
                 Err(_) => return 0,
@@ -88,9 +88,10 @@ impl EngineState {
                 // post-bake octree).
                 return 0;
             };
-            if renderable.spatial.as_ref().and_then(|g| g.as_octree()).is_none() {
+            let Some(spatial) = renderable.spatial.as_ref().and_then(|g| g.as_octree()) else {
                 return 0;
-            }
+            };
+            let root_offset = spatial.root_offset;
             let transform = match self.world.get::<&crate::components::Transform>(entity) {
                 Ok(t) => t,
                 Err(_) => return 0,
@@ -105,7 +106,7 @@ impl EngineState {
                 ),
                 transform.position,
             );
-            (handle, entity_world)
+            (handle, root_offset, entity_world)
         };
 
         // ── Engine enum → core enum. Smooth / Flatten are V2 — bail
@@ -194,6 +195,20 @@ impl EngineState {
                 world_pos,
                 Vec3::splat(radius),
             ));
+
+        // PERF_DEBT.md C2-extension: sculpt-Raise with a glass brush
+        // can flip the asset's has_glass verdict from false→true.
+        // Drop the cache entry for this asset's root_offset so the
+        // next has_glass check rescans. Carve cannot *add* glass
+        // (only remove), so a stale-true verdict for the asset is
+        // just an empty glass pass — perf cost only, no visual bug.
+        if matches!(mode, SculptMode::Raise) {
+            let is_glass_brush = (material_id as usize) < self.material_is_glass.len()
+                && self.material_is_glass[material_id as usize];
+            if is_glass_brush {
+                self.asset_has_glass_cache.remove(&asset_root_offset);
+            }
+        }
 
         // Push a scope-carrying mutation event so Phase B/C consumers
         // can update their derived state incrementally. Phase A1 is

@@ -181,6 +181,17 @@ pub fn tick(world: &mut hecs::World, dt: f32) -> bool {
             continue;
         };
 
+        // Paused player: pose was set the last time we advanced time
+        // (or by the initial component build). Re-evaluating produces
+        // bit-identical matrices, so it's pure waste — and worse, the
+        // unconditional `any_changed = true` below makes the caller
+        // call `gpu_objects_dirty.mark_all()` every tick, defeating
+        // PERF_DEBT.md's per-entity dirty work (B1/C2/C2-narrow). A
+        // paused player should be invisible to the dirty system.
+        if !player.playing {
+            continue;
+        }
+
         advance_player(player, clip.duration, dt);
         let mut matrices = skel.asset.skeleton.evaluate(clip, player.time);
 

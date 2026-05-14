@@ -173,7 +173,21 @@ impl EngineState {
         } else if self.gpu_objects_dirty.is_dirty() {
             let profile = self.paint_profile_active();
             let t0 = std::time::Instant::now();
-            self.update_scene_gpu();
+            // PERF_DEBT.md C2-extension: structural-narrow fast path.
+            // When the dirty set is non-empty and `is_all()` is false,
+            // try the per-entity splice+suffix-shift path before
+            // falling back to the world-walking full rebuild. Returns
+            // false if it can't handle the dirty set (e.g. an entity
+            // spawned since the last full rebuild has no
+            // entity_to_gpu mapping); the full path catches that.
+            let used_narrow = if !self.gpu_objects_dirty.is_all() {
+                self.update_scene_gpu_structural_narrow()
+            } else {
+                false
+            };
+            if !used_narrow {
+                self.update_scene_gpu();
+            }
             if profile {
                 use std::sync::atomic::{AtomicU64, Ordering};
                 static LAST_NS: AtomicU64 = AtomicU64::new(0);
@@ -184,8 +198,9 @@ impl EngineState {
                 let prev = LAST_NS.swap(now_ns, Ordering::Relaxed);
                 let gap_ms = if prev == 0 { 0.0 } else { (now_ns.saturating_sub(prev)) as f64 / 1.0e6 };
                 eprintln!(
-                    "[paint] update_scene_gpu dt={:?} instances={} overlays={} gap_since_last={:.1}ms",
+                    "[paint] update_scene_gpu dt={:?} path={} instances={} overlays={} gap_since_last={:.1}ms",
                     t0.elapsed(),
+                    if used_narrow { "narrow" } else { "full" },
                     self.gpu_instances.len(),
                     self.gpu_instance_overlays.len(),
                     gap_ms,
