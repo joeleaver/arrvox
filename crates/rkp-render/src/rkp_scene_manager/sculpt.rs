@@ -216,6 +216,20 @@ impl RkpSceneManager {
             return None;
         }
         let _sculpt_t0 = std::time::Instant::now();
+        // D0 per-phase timings. Each `_p*` records the wall-clock cost
+        // of one internal step of `apply_sculpt_brush`. Emitted in the
+        // existing `[sculpt] stamp …` log line at the end so users
+        // (and the perf-debt drain plan) can see where the budget
+        // goes without enabling a separate flag. Cost: ~9 Instant::now
+        // calls per stamp — sub-microsecond noise.
+        let mut _p_resolve_ms = 0.0;
+        let mut _p_compute_edits_ms = 0.0;
+        let mut _p_resolve_removes_ms = 0.0;
+        let mut _p_apply_delta_ms = 0.0;
+        let mut _p_octree_sync_ms = 0.0;
+        let mut _p_leaf_attr_ms = 0.0;
+        let mut _p_rebuild_clusters_ms = 0.0;
+        let _ph_t0 = std::time::Instant::now();
 
         // ── 1. Resolve grid coords ──────────────────────────────────
         let (op, depth, base_vs) = {
@@ -248,15 +262,19 @@ impl RkpSceneManager {
             };
             (op, depth, base_vs)
         };
+        _p_resolve_ms = _ph_t0.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t1 = std::time::Instant::now();
 
         // ── 2. Compute edit list against current octree + brick pool. ─
         let delta = {
             let entry = self.asset_cache.get(handle)?;
             compute_brush_edits(&entry.cpu_octree, &self.brick_pool, op)
         };
+        _p_compute_edits_ms = _ph_t1.elapsed().as_secs_f64() * 1000.0;
         if delta.is_empty() {
             return None;
         }
+        let _ph_t2 = std::time::Instant::now();
 
         // ── 3. Resolve every Remove edit's grid coord → leaf_attr_id.
         //
@@ -324,6 +342,8 @@ impl RkpSceneManager {
         // sorting collapses the obvious duplicates.
         removed.sort_unstable();
         removed.dedup();
+        _p_resolve_removes_ms = _ph_t2.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t3 = std::time::Instant::now();
 
         // ── 4. Real-geometry mutation (Phase B R2c). ────────────────
         //
@@ -357,6 +377,8 @@ impl RkpSceneManager {
                 },
             )
         };
+        _p_apply_delta_ms = _ph_t3.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t4 = std::time::Instant::now();
 
         // ── 4b. Sync cpu_octree mutations into OctreeGpu's packed buffer.
         //
@@ -400,6 +422,8 @@ impl RkpSceneManager {
                 self.octree.apply_mutation_log(&spatial, &applied.octree_log);
             }
         }
+        _p_octree_sync_ms = _ph_t4.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t5 = std::time::Instant::now();
 
         // Write LeafAttrs for newly-allocated slots. The brush picks
         // the material; the normal is whatever the kernel emitted
@@ -417,6 +441,8 @@ impl RkpSceneManager {
         for slot in &applied.freed_slots {
             self.leaf_attr_pool.deallocate_range(*slot, 1);
         }
+        _p_leaf_attr_ms = _ph_t5.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t6 = std::time::Instant::now();
 
         // ── 5. Mesh re-extract (Phase B R4-proper). ─────────────────
         //
@@ -439,19 +465,30 @@ impl RkpSceneManager {
             // was empty before); fall back to full re-extract.
             self.rebuild_asset_mesh(handle);
         }
+        _p_rebuild_clusters_ms = _ph_t6.elapsed().as_secs_f64() * 1000.0;
 
         // Bump the geometry epoch so the renderer re-uploads the
         // mutated octree / brick / leaf_attr buffers AND the new
         // mesh data on the next pre-frame pass.
         self.bump_geometry_epoch();
 
+        // D0 — per-phase breakdown appended to the existing log line.
+        // The seven phases cover every step from grid-coord resolve
+        // through the per-cluster mesh patch; their sum should match
+        // `total` to within a few µs (Instant::now overhead). The
+        // dominant phase identifies the next drain-optimization target.
         eprintln!(
             "[sculpt] stamp handle={:?} mode={:?} edits={} removed={} \
-             applied(adds={} freed={} interior={}) (depth={}, base_vs={:.5}) total={:.2}ms",
+             applied(adds={} freed={} interior={}) (depth={}, base_vs={:.5}) total={:.2}ms \
+             [phases: resolve={:.2} edits={:.2} resolve_rm={:.2} apply_delta={:.2} \
+             octree_sync={:.2} leaf_attr={:.2} rebuild_clusters={:.2}]",
             handle, mode, delta.len(), removed.len(),
             applied.allocated_slots.len(), applied.freed_slots.len(),
             delta.count_interior(), depth, base_vs,
             _sculpt_t0.elapsed().as_secs_f64() * 1000.0,
+            _p_resolve_ms, _p_compute_edits_ms, _p_resolve_removes_ms,
+            _p_apply_delta_ms, _p_octree_sync_ms, _p_leaf_attr_ms,
+            _p_rebuild_clusters_ms,
         );
 
         Some(SculptApplyResult {
@@ -544,6 +581,16 @@ impl RkpSceneManager {
     /// the full re-extract path.
     fn rebuild_dirty_clusters(&mut self, handle: AssetHandle, op: &BrushOp) -> bool {
         let t0 = std::time::Instant::now();
+        // D0 per-phase timings inside the cluster-patch path. Mirrors
+        // the apply_sculpt_brush phase timings; written into the
+        // `[sculpt] V2 patch` log line at the end.
+        let mut _p_setup_ms = 0.0;
+        let mut _p_dirty_query_ms = 0.0;
+        let mut _p_filter_ms = 0.0;
+        let mut _p_extract_ms = 0.0;
+        let mut _p_append_patch_ms = 0.0;
+        let mut _p_cc_walk_ms = 0.0;
+        let _ph_t0 = t0;
 
         let (depth, base_vs, grid_origin, brush_lo, brush_hi,
              brush_center_local, brush_radius_local, brush_radius_sq) = {
@@ -576,11 +623,15 @@ impl RkpSceneManager {
         if brush_lo.x >= brush_hi.x || brush_lo.y >= brush_hi.y || brush_lo.z >= brush_hi.z {
             return false;
         }
+        _p_setup_ms = _ph_t0.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t1 = std::time::Instant::now();
 
         let dirty = self.clusters_in_brush_grid_aabb(handle, brush_lo, brush_hi);
+        _p_dirty_query_ms = _ph_t1.elapsed().as_secs_f64() * 1000.0;
         if dirty.is_empty() {
             return false;
         }
+        let _ph_t2 = std::time::Instant::now();
 
         // ── Phase 1: filter each dirty cluster's tris ─────────────────
         //
@@ -643,6 +694,9 @@ impl RkpSceneManager {
             // the original AABB. Shrinking is left to R5.
         }
 
+        _p_filter_ms = _ph_t2.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t3 = std::time::Instant::now();
+
         // ── Phase 2: extract brush region once ────────────────────────
         //
         // Use the region-scoped cell-map walker so we don't pay
@@ -677,6 +731,9 @@ impl RkpSceneManager {
                 self.leaf_attr_pool.bones_as_slice(),
             )
         };
+
+        _p_extract_ms = _ph_t3.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t4 = std::time::Instant::now();
 
         // ── Phase 3: append brush region as a new LOD-0 patch cluster ─
         if !brush_verts.is_empty() {
@@ -725,6 +782,9 @@ impl RkpSceneManager {
             });
         }
 
+        _p_append_patch_ms = _ph_t4.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t5 = std::time::Instant::now();
+
         // ── Phase 4: per-chain LOD_DIRTY via DAG CC walk ──────────────
         //
         // R4d V2 (Option A from project_sculpt_drag_pick_roundtrip):
@@ -768,6 +828,7 @@ impl RkpSceneManager {
             let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
             mark_lod_dirty_chains(entry, &dirty, brush_aabb_min, brush_aabb_max)
         };
+        _p_cc_walk_ms = _ph_t5.elapsed().as_secs_f64() * 1000.0;
 
         // ── Phase 5: refresh `mesh_lod0_index_count` + dirty flags ────
         // The legacy direct-draw dispatch (debug-only) reads
@@ -789,10 +850,14 @@ impl RkpSceneManager {
         entry.clusters_dirty = true;
 
         let total_clusters = entry.meshlet_clusters.len();
+        // D0 — per-phase breakdown of rebuild_dirty_clusters. The
+        // dominant sub-phase identifies which step of the cluster
+        // patch path to target next (filter vs extract vs CC walk).
         eprintln!(
             "[sculpt] V2 patch: handle={:?} dirty={} kept_tris={} dropped_tris={} \
              brush_patch verts={} tris={} total flat verts={} indices={} \
-             lod_dirty={}/{} ({:.0}%) ({:.2}ms)",
+             lod_dirty={}/{} ({:.0}%) ({:.2}ms) \
+             [phases: setup={:.2} dirty_q={:.2} filter={:.2} extract={:.2} append={:.2} cc_walk={:.2}]",
             handle,
             dirty.len(),
             total_kept_tris,
@@ -809,6 +874,8 @@ impl RkpSceneManager {
                 0.0
             },
             t0.elapsed().as_secs_f64() * 1000.0,
+            _p_setup_ms, _p_dirty_query_ms, _p_filter_ms,
+            _p_extract_ms, _p_append_patch_ms, _p_cc_walk_ms,
         );
 
         true
