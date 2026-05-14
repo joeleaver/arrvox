@@ -658,48 +658,56 @@ impl RkpSceneManager {
         // its original indices — saves the per-tri loop entirely
         // for those clusters. Sphere-inside clusters still run the
         // per-tri test (some of their tris may be inside the sphere).
-        let mut total_kept_tris = 0usize;
-        let mut total_dropped_tris = 0usize;
-        // D1 telemetry — count clusters that took the sphere-outside
-        // fast path. High ratios prove the AABB → sphere filter is
-        // doing its job; low ratios mean the brush sphere genuinely
-        // touches most candidate clusters and the per-tri test is
-        // unavoidable.
-        let mut d1_clusters_sphere_outside = 0usize;
-        for &cid in &dirty {
-            let (start, count, cluster_aabb_min, cluster_aabb_max) = {
-                let Some(entry) = self.asset_cache.get(handle) else { return false; };
-                let c = &entry.meshlet_clusters[cid as usize];
-                (
-                    c.index_offset as usize,
-                    c.index_count as usize,
-                    Vec3::from(c.aabb_min),
-                    Vec3::from(c.aabb_max),
-                )
-            };
+        // D2 — parallelize the filter across dirty clusters.
+        //
+        // Each cluster's tri filter is independent: it reads its own
+        // slice of `mesh_indices` + indexed `mesh_vertices`, produces
+        // a `Vec<u32>` of kept indices. Step 1 fans this out across
+        // rayon's pool; step 2 walks the results in-order and appends
+        // each kept vec to the tail of `mesh_indices`, assigning new
+        // `index_offset` / `index_count` on the cluster.
+        //
+        // Order preservation: rayon's `into_par_iter().map(...).collect()`
+        // preserves input order, so the sequential merge below applies
+        // results in the same order the pre-D2 serial loop did.
+        //
+        // The merge can't be parallelized — it mutates a single
+        // `mesh_indices` Vec and each step's `new_offset` depends on
+        // the previous step's growth. That's fine: the per-cluster
+        // tri filter dominates wall-clock by ~3 orders of magnitude
+        // over the `extend_from_slice` tail append.
+        use rayon::prelude::*;
 
-            // Sphere-AABB rejection: closest point on the cluster's
-            // AABB to the brush center. If it's outside the brush
-            // sphere, no tri in this cluster can have a vertex inside.
-            let closest = brush_center_local.clamp(cluster_aabb_min, cluster_aabb_max);
-            let aabb_dist_sq = (closest - brush_center_local).length_squared();
-            let cluster_fully_outside = aabb_dist_sq > brush_radius_sq;
-            if cluster_fully_outside {
-                d1_clusters_sphere_outside += 1;
-            }
+        // D1 telemetry — atomic so each rayon worker can bump it
+        // without contention concerns.
+        let d1_counter = std::sync::atomic::AtomicUsize::new(0);
 
-            // Snapshot tri-by-tri "keep" decisions into a small vec to
-            // dodge borrow-checker fights between immutable reads of
-            // mesh_vertices/mesh_indices and the later mutable extend.
-            let kept: Vec<u32> = {
-                let Some(entry) = self.asset_cache.get(handle) else { return false; };
-                let indices = &entry.mesh_indices;
-                if cluster_fully_outside {
-                    // Every tri is "keep" — just copy the original
-                    // index range. Saves the per-tri sphere test.
-                    indices[start..start + count].to_vec()
-                } else {
-                    let verts = &entry.mesh_vertices;
+        let results: Vec<(u32, Vec<u32>)> = {
+            let Some(entry) = self.asset_cache.get(handle) else { return false; };
+            let clusters = &entry.meshlet_clusters;
+            let indices = &entry.mesh_indices;
+            let verts = &entry.mesh_vertices;
+            dirty
+                .par_iter()
+                .map(|&cid| {
+                    let c = &clusters[cid as usize];
+                    let start = c.index_offset as usize;
+                    let count = c.index_count as usize;
+                    let cluster_aabb_min = Vec3::from(c.aabb_min);
+                    let cluster_aabb_max = Vec3::from(c.aabb_max);
+
+                    // Sphere-AABB rejection (D1): closest point on
+                    // the cluster's AABB to the brush center. If it's
+                    // outside the brush sphere, no tri in this
+                    // cluster can have a vertex inside.
+                    let closest = brush_center_local
+                        .clamp(cluster_aabb_min, cluster_aabb_max);
+                    let aabb_dist_sq = (closest - brush_center_local).length_squared();
+                    if aabb_dist_sq > brush_radius_sq {
+                        d1_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return (cid, indices[start..start + count].to_vec());
+                    }
+
                     let mut out = Vec::with_capacity(count);
                     for tri_start in (start..start + count).step_by(3) {
                         let i0 = indices[tri_start];
@@ -711,28 +719,42 @@ impl RkpSceneManager {
                         let d0 = (p0 - brush_center_local).length_squared();
                         let d1 = (p1 - brush_center_local).length_squared();
                         let d2 = (p2 - brush_center_local).length_squared();
-                        if d0 > brush_radius_sq && d1 > brush_radius_sq && d2 > brush_radius_sq {
+                        if d0 > brush_radius_sq
+                            && d1 > brush_radius_sq
+                            && d2 > brush_radius_sq
+                        {
                             out.push(i0);
                             out.push(i1);
                             out.push(i2);
                         }
                     }
-                    out
-                }
-            };
+                    (cid, out)
+                })
+                .collect()
+        };
+        let d1_clusters_sphere_outside =
+            d1_counter.load(std::sync::atomic::Ordering::Relaxed);
 
-            total_kept_tris += kept.len() / 3;
-            total_dropped_tris += count / 3 - kept.len() / 3;
-
+        // Sequential merge — apply each cluster's kept vec in order.
+        // `new_offset` depends on the previous step's growth so this
+        // can't be parallelized.
+        let mut total_kept_tris = 0usize;
+        let mut total_dropped_tris = 0usize;
+        {
             let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
-            let new_offset = entry.mesh_indices.len() as u32;
-            entry.mesh_indices.extend_from_slice(&kept);
-            let cluster = &mut entry.meshlet_clusters[cid as usize];
-            cluster.index_offset = new_offset;
-            cluster.index_count = kept.len() as u32;
-            // AABB stays at the cluster's pre-stamp bounds — the kept
-            // tris are a subset of the original, so they fit inside
-            // the original AABB. Shrinking is left to R5.
+            for (cid, kept) in results {
+                let count = entry.meshlet_clusters[cid as usize].index_count as usize;
+                total_kept_tris += kept.len() / 3;
+                total_dropped_tris += count / 3 - kept.len() / 3;
+                let new_offset = entry.mesh_indices.len() as u32;
+                entry.mesh_indices.extend_from_slice(&kept);
+                let cluster = &mut entry.meshlet_clusters[cid as usize];
+                cluster.index_offset = new_offset;
+                cluster.index_count = kept.len() as u32;
+                // AABB stays at the cluster's pre-stamp bounds — the
+                // kept tris are a subset of the original, so they fit
+                // inside the original AABB. Shrinking is left to R5.
+            }
         }
 
         _p_filter_ms = _ph_t2.elapsed().as_secs_f64() * 1000.0;
