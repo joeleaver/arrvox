@@ -507,6 +507,7 @@ pub fn apply_delta(
     delta: &SculptDelta,
     mut alloc_slot: impl FnMut() -> u32,
 ) -> AppliedDelta {
+    use crate::sparse_octree::BrickPathCache;
     use std::time::Instant;
 
     let mut allocated_slots = Vec::with_capacity(delta.count_added());
@@ -524,14 +525,31 @@ pub fn apply_delta(
     // original edit order is preserved. The mutation log's intermediate
     // sequence changes but the final octree state — and therefore the
     // replayed GPU state — is identical.
+    //
+    // **D5.b** — each pass threads a [`BrickPathCache`] through the
+    // `*_cached` mutation primitives. compute_brush_edits walks the
+    // brush region in row-major (x, y, z) order so consecutive edits
+    // typically share a brick (up to 4 cells in a row, plus same-row
+    // neighbors in (y, z)). Cache hits skip the 9-level descent and
+    // call `mutate_at_brick` directly — measured per-op cost on D5.a
+    // was ~60 ns (descent-dominated) on splat5 elephant Carve.
+    //
+    // A fresh cache per pass avoids cross-op-type stale entries
+    // (e.g., the Empty pass leaves the cache pointing at a brick
+    // whose state the Add pass might invalidate).
 
     let mut n_empty = 0u32;
     let t_empty = Instant::now();
-    for edit in &delta.edits {
-        if matches!(edit.op, LeafEditOp::Remove | LeafEditOp::Empty) {
-            n_empty += 1;
-            if let Some(prev) = octree.set_cell_empty(edit.coord, brick_pool) {
-                freed_slots.push(prev);
+    {
+        let mut cache = BrickPathCache::new();
+        for edit in &delta.edits {
+            if matches!(edit.op, LeafEditOp::Remove | LeafEditOp::Empty) {
+                n_empty += 1;
+                if let Some(prev) =
+                    octree.set_cell_empty_cached(edit.coord, brick_pool, &mut cache)
+                {
+                    freed_slots.push(prev);
+                }
             }
         }
     }
@@ -539,11 +557,16 @@ pub fn apply_delta(
 
     let mut n_interior = 0u32;
     let t_interior = Instant::now();
-    for edit in &delta.edits {
-        if matches!(edit.op, LeafEditOp::SetInterior) {
-            n_interior += 1;
-            if let Some(prev) = octree.set_cell_interior(edit.coord, brick_pool) {
-                freed_slots.push(prev);
+    {
+        let mut cache = BrickPathCache::new();
+        for edit in &delta.edits {
+            if matches!(edit.op, LeafEditOp::SetInterior) {
+                n_interior += 1;
+                if let Some(prev) =
+                    octree.set_cell_interior_cached(edit.coord, brick_pool, &mut cache)
+                {
+                    freed_slots.push(prev);
+                }
             }
         }
     }
@@ -551,14 +574,19 @@ pub fn apply_delta(
 
     let mut n_add = 0u32;
     let t_add = Instant::now();
-    for edit in &delta.edits {
-        if let LeafEditOp::Add { material, normal } = edit.op {
-            n_add += 1;
-            let slot = alloc_slot();
-            allocated_slots.push((slot, LeafEditAttrs { material, normal }));
-            if let Some(prev) = octree.set_cell_solid(edit.coord, slot, brick_pool) {
-                // Caller must free the displaced slot too.
-                freed_slots.push(prev);
+    {
+        let mut cache = BrickPathCache::new();
+        for edit in &delta.edits {
+            if let LeafEditOp::Add { material, normal } = edit.op {
+                n_add += 1;
+                let slot = alloc_slot();
+                allocated_slots.push((slot, LeafEditAttrs { material, normal }));
+                if let Some(prev) =
+                    octree.set_cell_solid_cached(edit.coord, slot, brick_pool, &mut cache)
+                {
+                    // Caller must free the displaced slot too.
+                    freed_slots.push(prev);
+                }
             }
         }
     }

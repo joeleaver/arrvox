@@ -53,6 +53,51 @@ fn brick_local(coord: UVec3) -> (u32, u32, u32) {
     (coord.x & mask, coord.y & mask, coord.z & mask)
 }
 
+/// Per-call cache for [`SparseOctree::set_cell_solid_cached`] and the
+/// other `*_cached` mutation primitives (D5.b). Amortises the 9-level
+/// octree descent across consecutive cell mutations that fall in the
+/// same brick.
+///
+/// `apply_delta` instantiates one of these and threads it through the
+/// per-edit loop. Consecutive edits inside the same brick (the common
+/// case under a brush stamp, where the kernel walks the brush region
+/// in row-major (x, y, z) order — i.e. up to 4 cells in a row inside
+/// one brick before crossing a brick boundary) hit the fast path,
+/// skipping the descent.
+///
+/// `Default` produces an empty cache equivalent to a fresh one — no
+/// fast-path possible on the first call.
+#[derive(Debug, Default, Clone)]
+pub struct BrickPathCache {
+    /// Coord of the brick whose path is cached, in
+    /// `coord >> BRICK_LEVELS` units. `None` means "no fast-path
+    /// available" (cache is empty or was invalidated).
+    brick_coord: Option<UVec3>,
+    /// Node index in [`SparseOctree::nodes`] where the brick's
+    /// terminator (BRICK / EMPTY_NODE / INTERIOR_NODE) lives. Only
+    /// meaningful when `brick_coord.is_some()`.
+    brick_node_idx: usize,
+    /// Indices of the branch nodes from root down to (but not
+    /// including) the brick. Reused on cache hits to walk back up for
+    /// `try_collapse_after_mutate`.
+    ancestor_path: Vec<usize>,
+}
+
+impl BrickPathCache {
+    /// Fresh cache with no entry. Same as `Default::default()`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Clear the cache so the next mutation falls back to a full
+    /// descent. Called after a collapse cascade detaches the cached
+    /// brick from the live tree.
+    pub fn invalidate(&mut self) {
+        self.brick_coord = None;
+        self.ancestor_path.clear();
+    }
+}
+
 /// Occupancy state of a single finest-grid cell, resolved across the
 /// octree's terminator types and (when applicable) the brick pool.
 ///
@@ -221,6 +266,225 @@ impl SparseOctree {
     ) -> Option<u32> {
         assert!(self.in_bounds(coord), "coord {coord} out of bounds for depth {}", self.depth);
         self.mutate_at(0, coord, 0, brick_pool, CellOp::Interior)
+    }
+
+    // ─────────────── Cached cell mutation (D5.b) ──────────────────
+
+    /// [`set_cell_solid`](Self::set_cell_solid) with a per-call brick
+    /// path cache. Equivalent semantics; the cache amortizes the
+    /// 9-level descent across consecutive mutations in the same brick.
+    pub fn set_cell_solid_cached(
+        &mut self,
+        coord: UVec3,
+        leaf_attr_id: u32,
+        brick_pool: &mut BrickPool,
+        cache: &mut BrickPathCache,
+    ) -> Option<u32> {
+        self.mutate_cell_cached(coord, CellOp::Solid(leaf_attr_id), brick_pool, cache)
+    }
+
+    /// [`set_cell_empty`](Self::set_cell_empty) with a per-call brick
+    /// path cache. See [`set_cell_solid_cached`](Self::set_cell_solid_cached).
+    pub fn set_cell_empty_cached(
+        &mut self,
+        coord: UVec3,
+        brick_pool: &mut BrickPool,
+        cache: &mut BrickPathCache,
+    ) -> Option<u32> {
+        self.mutate_cell_cached(coord, CellOp::Empty, brick_pool, cache)
+    }
+
+    /// [`set_cell_interior`](Self::set_cell_interior) with a per-call
+    /// brick path cache.
+    pub fn set_cell_interior_cached(
+        &mut self,
+        coord: UVec3,
+        brick_pool: &mut BrickPool,
+        cache: &mut BrickPathCache,
+    ) -> Option<u32> {
+        self.mutate_cell_cached(coord, CellOp::Interior, brick_pool, cache)
+    }
+
+    /// Cached cell mutation — see [`BrickPathCache`].
+    ///
+    /// **Fast path** (cache hit): the previous call mutated a cell in
+    /// the same brick, so the brick's `node_idx` and ancestor branch
+    /// path are still in [`cache`]. We skip the descent entirely and
+    /// call `mutate_at_brick` directly, then walk `cache.ancestor_path`
+    /// in reverse for `try_collapse_after_mutate`. If any ancestor's
+    /// node value changes during the collapse walk, the path is now
+    /// invalid (the brick is orphaned) and the cache is cleared so the
+    /// next call re-descends.
+    ///
+    /// **Slow path** (cache miss / shallow tree / collapsed cache): an
+    /// iterative descent equivalent to [`mutate_at`], but recording
+    /// every branch / freshly-subdivided node into
+    /// `cache.ancestor_path`. The brick's node_idx is then stashed in
+    /// the cache for the next call.
+    fn mutate_cell_cached(
+        &mut self,
+        coord: UVec3,
+        op: CellOp,
+        brick_pool: &mut BrickPool,
+        cache: &mut BrickPathCache,
+    ) -> Option<u32> {
+        assert!(
+            self.in_bounds(coord),
+            "coord {coord} out of bounds for depth {}",
+            self.depth
+        );
+
+        let bricks_enabled = self.depth > BRICK_LEVELS;
+        if !bricks_enabled {
+            // Shallow trees don't have bricks; the cache wouldn't help
+            // (one level of descent, no brick boundary). Fall back.
+            cache.invalidate();
+            return self.mutate_at(0, coord, 0, brick_pool, op);
+        }
+
+        let brick_depth = self.depth - BRICK_LEVELS;
+        let brick_coord = UVec3::new(
+            coord.x >> BRICK_LEVELS,
+            coord.y >> BRICK_LEVELS,
+            coord.z >> BRICK_LEVELS,
+        );
+
+        // ── Fast path: cache hit ──────────────────────────────────
+        if cache.brick_coord == Some(brick_coord) {
+            let n = self.nodes[cache.brick_node_idx];
+            // Cache is valid only if the slot still holds a brick-depth
+            // terminator. If the brick collapsed and an ancestor split
+            // mid-batch (rare but possible across cache-invalidating
+            // events we didn't observe), fall back to a full descent.
+            if is_brick(n) || n == EMPTY_NODE || n == INTERIOR_NODE {
+                let prev = self.mutate_at_brick(
+                    cache.brick_node_idx,
+                    n,
+                    coord,
+                    brick_pool,
+                    op,
+                );
+                let still_valid = self.run_ancestor_collapse(&cache.ancestor_path);
+                if !still_valid {
+                    // An ancestor collapsed → our brick_node_idx is now
+                    // orphaned (the parent now points at a different
+                    // terminator). Subsequent same-brick edits must
+                    // re-descend.
+                    cache.invalidate();
+                }
+                return prev;
+            }
+            // Cache is stale: the slot was overwritten in some way we
+            // didn't anticipate. Fall through to the slow path.
+            cache.invalidate();
+        }
+
+        // ── Slow path: iterative descent, capturing path ──────────
+        //
+        // Mirrors `mutate_at`'s control flow exactly: branches are
+        // descended first (regardless of level — trees deeper than
+        // `brick_depth` legitimately exist after `mutate_at`-driven
+        // subdivision in shallower regions of the same tree); brick
+        // depth is checked only when the current node is a
+        // non-branch terminator. Inverting the order is a real bug —
+        // it tries to invoke `mutate_at_brick` on a BRANCH and panics
+        // the brick-depth assertion.
+        cache.ancestor_path.clear();
+        let mut node_idx: usize = 0;
+        let mut level: u8 = 0;
+
+        loop {
+            let current = self.nodes[node_idx];
+
+            if is_branch(current) {
+                cache.ancestor_path.push(node_idx);
+                let children_offset = current as usize;
+                let octant = octant_for_coord(coord, level, self.depth) as usize;
+                node_idx = children_offset + octant;
+                level += 1;
+                continue;
+            }
+
+            if level == brick_depth {
+                // At brick depth and the node is a terminator — apply
+                // the op via the shared brick logic.
+                let prev = self.mutate_at_brick(node_idx, current, coord, brick_pool, op);
+                let still_valid = self.run_ancestor_collapse(&cache.ancestor_path);
+                let new_n = self.nodes[node_idx];
+                if still_valid
+                    && (is_brick(new_n) || new_n == EMPTY_NODE || new_n == INTERIOR_NODE)
+                {
+                    cache.brick_coord = Some(brick_coord);
+                    cache.brick_node_idx = node_idx;
+                    // ancestor_path already populated.
+                } else {
+                    cache.invalidate();
+                }
+                return prev;
+            }
+
+            if level == self.depth {
+                // The descent went past `brick_depth` via earlier
+                // branches — this happens on trees that inserted at
+                // finest level above the brick boundary (synthetic
+                // tests, shallow-tree paths). Apply via
+                // `mutate_at_finest`; the cell isn't actually
+                // brick-backed so we don't update the cache.
+                let prev = self.mutate_at_finest(node_idx, current, op);
+                let _ = self.run_ancestor_collapse(&cache.ancestor_path);
+                cache.invalidate();
+                return prev;
+            }
+
+            // Intermediate level, non-branch terminator. Subdivide
+            // (mirrors the subdivide block in `mutate_at`). After this
+            // node becomes a branch, the next loop iteration descends.
+            if is_leaf(current) {
+                debug_assert!(
+                    false,
+                    "mutate_cell_cached hit a LEAF at intermediate level {} \
+                     (depth={}, brick_depth={}). Single-cell refinement of a \
+                     coarse LEAF is not supported in R1.",
+                    level, self.depth, brick_depth
+                );
+                // Release fallback: treat as the subdivide path below.
+            }
+
+            cache.ancestor_path.push(node_idx);
+            let children_offset = self.nodes.len();
+            self.nodes.extend_from_slice(&[current; 8]);
+            self.internal_attr_index
+                .extend_from_slice(&[INTERNAL_ATTR_NONE; 8]);
+            for i in 0..8u32 {
+                self.record_node_write(children_offset as u32 + i, current);
+                self.record_attr_write(children_offset as u32 + i, INTERNAL_ATTR_NONE);
+            }
+            self.nodes[node_idx] = children_offset as u32;
+            self.record_node_write(node_idx as u32, children_offset as u32);
+            self.internal_attr_index[node_idx] = INTERNAL_ATTR_NONE;
+            self.record_attr_write(node_idx as u32, INTERNAL_ATTR_NONE);
+
+            let octant = octant_for_coord(coord, level, self.depth) as usize;
+            node_idx = children_offset + octant;
+            level += 1;
+        }
+    }
+
+    /// Walk an ancestor path bottom-up, calling
+    /// [`try_collapse_after_mutate`](Self::try_collapse_after_mutate) at
+    /// each branch. Returns `true` if no ancestor's value changed
+    /// (path still valid for cache reuse), `false` if any ancestor
+    /// collapsed (the path is broken and the cache must be invalidated).
+    fn run_ancestor_collapse(&mut self, ancestor_path: &[usize]) -> bool {
+        let mut changed = false;
+        for &idx in ancestor_path.iter().rev() {
+            let pre = self.nodes[idx];
+            self.try_collapse_after_mutate(idx);
+            if self.nodes[idx] != pre {
+                changed = true;
+            }
+        }
+        !changed
     }
 
     /// Recursive descent. Returns the previous leaf_attr slot at the
@@ -894,5 +1158,160 @@ mod tests {
             }
         }
         assert_eq!(tree.as_slice().len(), tree.internal_attr_slice().len());
+    }
+
+    // ── D5.b: BrickPathCache ──────────────────────────────────────
+
+    /// 64 cells in the same brick mutated in sequence through the
+    /// cached path must produce an identical octree + brick-pool to
+    /// the same edits through the uncached path. The cache should hit
+    /// on all but the first edit of each pass; the result is
+    /// observable through `lookup` and the cell values.
+    #[test]
+    fn cached_set_solid_matches_uncached_within_one_brick() {
+        // depth=4 → brick_depth=2; the brick at brick_coord=(0,0,0)
+        // covers cells (0..4, 0..4, 0..4) — 64 cells in one brick.
+        let (mut t_ref, mut p_ref) = deep_tree();
+        let (mut t_cached, mut p_cached) = deep_tree();
+
+        let mut cache = BrickPathCache::new();
+        for z in 0..4 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    let coord = UVec3::new(x, y, z);
+                    let slot = x + y * 4 + z * 16 + 1;
+                    let r1 = t_ref.set_cell_solid(coord, slot, &mut p_ref);
+                    let r2 =
+                        t_cached.set_cell_solid_cached(coord, slot, &mut p_cached, &mut cache);
+                    assert_eq!(r1, r2, "prev slot mismatch at {coord}");
+                }
+            }
+        }
+
+        // Compare every cell.
+        for z in 0..4 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    let coord = UVec3::new(x, y, z);
+                    assert_eq!(
+                        t_ref.cell_state(coord, &p_ref),
+                        t_cached.cell_state(coord, &p_cached),
+                        "cell mismatch at {coord}",
+                    );
+                }
+            }
+        }
+        assert_eq!(t_ref.as_slice(), t_cached.as_slice(), "node arrays diverged");
+    }
+
+    /// Mutating cells across two different bricks with one shared
+    /// cache must still produce the correct state. The cache should
+    /// miss on the first edit of the second brick and re-walk.
+    #[test]
+    fn cached_path_handles_brick_boundary_crossings() {
+        let (mut t_ref, mut p_ref) = deep_tree();
+        let (mut t_cached, mut p_cached) = deep_tree();
+        let mut cache = BrickPathCache::new();
+
+        // Alternate between two bricks: (0,0,0)-(3,3,3) and (4,0,0)-(7,3,3).
+        let coords: Vec<UVec3> = (0..8)
+            .map(|i| UVec3::new(i, 0, 0))
+            .chain((0..8).map(|i| UVec3::new(i, 1, 0)))
+            .collect();
+
+        for (idx, &coord) in coords.iter().enumerate() {
+            let slot = idx as u32 + 1;
+            let r1 = t_ref.set_cell_solid(coord, slot, &mut p_ref);
+            let r2 = t_cached.set_cell_solid_cached(coord, slot, &mut p_cached, &mut cache);
+            assert_eq!(r1, r2);
+        }
+
+        for &coord in &coords {
+            assert_eq!(
+                t_ref.cell_state(coord, &p_ref),
+                t_cached.cell_state(coord, &p_cached),
+            );
+        }
+    }
+
+    /// Mid-batch brick collapse: fill a brick fully, then empty every
+    /// cell. The brick should collapse mid-batch and the cache should
+    /// invalidate cleanly without panicking or leaving the tree in a
+    /// bad state.
+    #[test]
+    fn cached_path_handles_mid_batch_brick_collapse() {
+        let (mut t_ref, mut p_ref) = deep_tree();
+        let (mut t_cached, mut p_cached) = deep_tree();
+        let mut cache = BrickPathCache::new();
+
+        // Phase 1: fill the brick at (0,0,0).
+        for z in 0..4 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    let coord = UVec3::new(x, y, z);
+                    let slot = x + y * 4 + z * 16 + 1;
+                    t_ref.set_cell_solid(coord, slot, &mut p_ref);
+                    t_cached.set_cell_solid_cached(coord, slot, &mut p_cached, &mut cache);
+                }
+            }
+        }
+
+        // Phase 2: empty every cell in order. Both paths should end
+        // with the brick collapsed back to EMPTY_NODE.
+        for z in 0..4 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    let coord = UVec3::new(x, y, z);
+                    t_ref.set_cell_empty(coord, &mut p_ref);
+                    t_cached.set_cell_empty_cached(coord, &mut p_cached, &mut cache);
+                }
+            }
+        }
+
+        assert_eq!(
+            t_ref.as_slice(),
+            t_cached.as_slice(),
+            "node arrays diverged after collapse",
+        );
+        assert_no_collapsed_bricks_left_behind(&t_cached, &p_cached);
+    }
+
+    /// Cached mutations through an INTERIOR_NODE region exercise the
+    /// brick materialization path. Same behaviour as `set_cell_empty`
+    /// against a fresh INTERIOR_NODE.
+    #[test]
+    fn cached_path_materializes_brick_in_interior_region() {
+        let (mut t_ref, mut p_ref) = deep_tree();
+        let (mut t_cached, mut p_cached) = deep_tree();
+
+        // Seed the trees with a 4³ INTERIOR region.
+        for z in 0..4 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    t_ref.insert_interior(UVec3::new(x, y, z));
+                    t_cached.insert_interior(UVec3::new(x, y, z));
+                }
+            }
+        }
+
+        let mut cache = BrickPathCache::new();
+        // Empty out two cells within the brick. The brick must
+        // materialize and the cells must read back as EMPTY.
+        for &coord in &[UVec3::new(1, 1, 1), UVec3::new(2, 1, 1)] {
+            t_ref.set_cell_empty(coord, &mut p_ref);
+            t_cached.set_cell_empty_cached(coord, &mut p_cached, &mut cache);
+        }
+
+        for z in 0..4 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    let coord = UVec3::new(x, y, z);
+                    assert_eq!(
+                        t_ref.cell_state(coord, &p_ref),
+                        t_cached.cell_state(coord, &p_cached),
+                    );
+                }
+            }
+        }
     }
 }
