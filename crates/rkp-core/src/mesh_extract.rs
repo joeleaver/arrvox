@@ -34,6 +34,146 @@ use crate::sparse_octree::{
     brick_id, is_branch, is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE,
 };
 
+/// Sentinel value stored in [`CellGrid`] entries that have no occupant.
+/// Doubles as the empty marker for cube_vertex caches (no vertex emitted
+/// yet for that SN-cube). Real `leaf_attr_id` and `vertex_id` values are
+/// well below `u32::MAX`, so the collision risk is theoretical only.
+pub const CELL_GRID_EMPTY: u32 = u32::MAX;
+
+/// Dense 3D grid over a bounded integer-coord region. Replaces
+/// [`CellMap`] in the sculpt inner loop for two roles:
+///
+/// 1. **Cell occupancy / `leaf_attr_id` lookup.** Stores
+///    `leaf_attr_id` for solid cells (or [`CELL_INTERIOR`] for
+///    brick-INTERIOR-bulk cells), [`CELL_GRID_EMPTY`] otherwise. Built
+///    once at the start of [`extract_mesh_region_from_cells`] from the
+///    region's [`CellMap`]; from then on, every per-cell / per-face /
+///    per-corner probe is a flat-array read.
+///
+/// 2. **Cube → vertex id cache.** Stores the vertex id of the SN cube
+///    whose lo corner is at that grid coord, [`CELL_GRID_EMPTY`]
+///    when no vertex has been emitted yet for that cube.
+///
+/// D6.3 motivation: the post-D6.2 inner loop on a 50-cell brush radius
+/// does ~12 FxHashMap probes per solid cell (6 face neighbors + 4
+/// cube-vertex lookups + 8 corner cells inside `build_cube_vertex` per
+/// fresh cube). At ~50 k cells × 12 probes × ~30 ns per FxHash probe we
+/// were spending 13-22 ms on high-density stamps. A dense `Vec<u32>`
+/// lookup is one bounds check + one indexed load (~2-5 ns) — an order
+/// of magnitude faster, and the grid stays cache-resident for the
+/// 1-cluster brush footprint.
+///
+/// **Memory budget:** for a 50-cell brush radius (typical splat5 stamp)
+/// the grid covers `[region_min - 1, region_max + 1) ≈ 104³ ≈ 1.12 M
+/// entries × 4 B = 4.5 MB` per grid (two grids = ~9 MB scratch).
+/// Smaller brushes proportionally less.
+///
+/// Half-open extent: `[origin, origin + size)` along each axis.
+pub struct CellGrid {
+    data: Vec<u32>,
+    origin: IVec3,
+    size: IVec3,
+}
+
+impl CellGrid {
+    /// Allocate a fresh grid covering `[origin, origin + size)`,
+    /// pre-filled with [`CELL_GRID_EMPTY`].
+    ///
+    /// Panics if any axis of `size` is negative (callers always pass
+    /// strictly-positive sizes after the pad-min/pad-max math; a
+    /// negative `size` would mean an inside-out region).
+    pub fn new(origin: IVec3, size: IVec3) -> Self {
+        assert!(
+            size.x > 0 && size.y > 0 && size.z > 0,
+            "CellGrid size must be strictly positive (got {:?})",
+            size
+        );
+        let len = (size.x as usize) * (size.y as usize) * (size.z as usize);
+        Self {
+            data: vec![CELL_GRID_EMPTY; len],
+            origin,
+            size,
+        }
+    }
+
+    /// Linearize `coord` into the flat-`Vec<u32>` index, returning
+    /// `None` if the coord is outside `[origin, origin + size)`.
+    #[inline]
+    pub fn flat_index(&self, coord: IVec3) -> Option<usize> {
+        let local = coord - self.origin;
+        if local.x < 0
+            || local.x >= self.size.x
+            || local.y < 0
+            || local.y >= self.size.y
+            || local.z < 0
+            || local.z >= self.size.z
+        {
+            return None;
+        }
+        let sx = self.size.x as usize;
+        let sy = self.size.y as usize;
+        Some(local.x as usize + sx * (local.y as usize + sy * local.z as usize))
+    }
+
+    /// Read the slot at `coord`, returning `None` if either the coord
+    /// is out-of-bounds OR the slot holds the [`CELL_GRID_EMPTY`]
+    /// sentinel. Otherwise returns the stored `u32`.
+    #[inline]
+    pub fn get(&self, coord: IVec3) -> Option<u32> {
+        let idx = self.flat_index(coord)?;
+        let v = self.data[idx];
+        if v == CELL_GRID_EMPTY {
+            None
+        } else {
+            Some(v)
+        }
+    }
+
+    /// Faster predicate matching `CellMap::contains_key` semantics —
+    /// equivalent to `self.get(coord).is_some()` but skips wrapping
+    /// the value.
+    #[inline]
+    pub fn contains(&self, coord: IVec3) -> bool {
+        match self.flat_index(coord) {
+            Some(idx) => self.data[idx] != CELL_GRID_EMPTY,
+            None => false,
+        }
+    }
+
+    /// Write `value` at `coord`. Silently no-ops if `coord` is
+    /// out-of-bounds — callers that hand the grid coords inside its
+    /// own pre-computed range never hit this fallback, but the safe
+    /// behaviour matches `CellMap::insert` for shared callers.
+    #[inline]
+    pub fn set(&mut self, coord: IVec3, value: u32) {
+        if let Some(idx) = self.flat_index(coord) {
+            self.data[idx] = value;
+        }
+    }
+
+    /// Reset every slot back to [`CELL_GRID_EMPTY`]. Used by the
+    /// pool-reuse path (D6.3.c) — fresh allocations don't need it
+    /// because `new` already inits to the sentinel.
+    #[inline]
+    pub fn reset(&mut self) {
+        for slot in &mut self.data {
+            *slot = CELL_GRID_EMPTY;
+        }
+    }
+
+    /// Grid origin (lo corner, inclusive).
+    #[inline]
+    pub fn origin(&self) -> IVec3 {
+        self.origin
+    }
+
+    /// Grid size along each axis. Extent is `[origin, origin + size)`.
+    #[inline]
+    pub fn size(&self) -> IVec3 {
+        self.size
+    }
+}
+
 /// One surface-mesh vertex.
 ///
 /// 32 B, `repr(C)`, `bytemuck`-castable straight into a vertex buffer.
@@ -1513,5 +1653,107 @@ mod tests {
         );
         assert!(v.is_empty());
         assert!(i.is_empty());
+    }
+
+    // ─────────────── CellGrid (D6.3.a) ────────────────────────────
+
+    /// Fresh `CellGrid::new` initialises every slot to the empty
+    /// sentinel — `get` returns `None` and `contains` returns false.
+    #[test]
+    fn cellgrid_new_is_empty() {
+        let grid = CellGrid::new(IVec3::new(-3, 5, 10), IVec3::new(4, 4, 4));
+        for z in 10..14 {
+            for y in 5..9 {
+                for x in -3..1 {
+                    let c = IVec3::new(x, y, z);
+                    assert_eq!(grid.get(c), None, "coord {:?}", c);
+                    assert!(!grid.contains(c), "coord {:?}", c);
+                }
+            }
+        }
+    }
+
+    /// `set` writes a value that `get` and `contains` then surface;
+    /// the sentinel value is unreachable through the public API
+    /// because `get` filters it out.
+    #[test]
+    fn cellgrid_set_get_roundtrip() {
+        let mut grid = CellGrid::new(IVec3::new(0, 0, 0), IVec3::new(3, 3, 3));
+        let c = IVec3::new(1, 2, 1);
+        assert_eq!(grid.get(c), None);
+        grid.set(c, 42);
+        assert_eq!(grid.get(c), Some(42));
+        assert!(grid.contains(c));
+
+        // Another coord stays empty.
+        assert_eq!(grid.get(IVec3::new(0, 0, 0)), None);
+        assert!(!grid.contains(IVec3::new(0, 0, 0)));
+    }
+
+    /// `flat_index` enforces the half-open extent: lo corner inclusive,
+    /// hi corner exclusive, with one-past on every axis returning None.
+    #[test]
+    fn cellgrid_bounds_are_half_open() {
+        let grid = CellGrid::new(IVec3::new(-2, -2, -2), IVec3::new(4, 4, 4));
+
+        // Inside, corners.
+        assert!(grid.flat_index(IVec3::new(-2, -2, -2)).is_some());
+        assert!(grid.flat_index(IVec3::new(1, 1, 1)).is_some());
+
+        // One past on each axis.
+        assert!(grid.flat_index(IVec3::new(2, 1, 1)).is_none());
+        assert!(grid.flat_index(IVec3::new(1, 2, 1)).is_none());
+        assert!(grid.flat_index(IVec3::new(1, 1, 2)).is_none());
+
+        // Below origin on each axis.
+        assert!(grid.flat_index(IVec3::new(-3, 0, 0)).is_none());
+        assert!(grid.flat_index(IVec3::new(0, -3, 0)).is_none());
+        assert!(grid.flat_index(IVec3::new(0, 0, -3)).is_none());
+    }
+
+    /// `set` to an out-of-bounds coord is a silent no-op (matches the
+    /// behaviour the inner extract loop relies on for query coords
+    /// that happen to lie one cell outside the pre-sized grid).
+    #[test]
+    fn cellgrid_set_out_of_bounds_is_noop() {
+        let mut grid = CellGrid::new(IVec3::ZERO, IVec3::splat(2));
+        grid.set(IVec3::new(5, 5, 5), 99);
+        assert_eq!(grid.get(IVec3::new(5, 5, 5)), None);
+        // No panic.
+    }
+
+    /// `reset` returns the grid to its post-`new` state — useful for
+    /// the pool-reuse path (D6.3.c).
+    #[test]
+    fn cellgrid_reset_clears_all_slots() {
+        let mut grid = CellGrid::new(IVec3::ZERO, IVec3::splat(3));
+        grid.set(IVec3::new(0, 0, 0), 1);
+        grid.set(IVec3::new(2, 2, 2), 2);
+        grid.set(IVec3::new(1, 1, 1), CELL_INTERIOR);
+        assert_eq!(grid.get(IVec3::new(0, 0, 0)), Some(1));
+
+        grid.reset();
+        assert_eq!(grid.get(IVec3::new(0, 0, 0)), None);
+        assert_eq!(grid.get(IVec3::new(2, 2, 2)), None);
+        assert_eq!(grid.get(IVec3::new(1, 1, 1)), None);
+    }
+
+    /// Linearisation must be unique across the grid — two distinct
+    /// coords never share a flat index. Catches axis-stride mistakes.
+    #[test]
+    fn cellgrid_flat_index_is_unique() {
+        let size = IVec3::new(3, 4, 5);
+        let grid = CellGrid::new(IVec3::new(-1, 2, 7), size);
+        let mut seen = std::collections::HashSet::new();
+        for z in 7..12 {
+            for y in 2..6 {
+                for x in -1..2 {
+                    let c = IVec3::new(x, y, z);
+                    let idx = grid.flat_index(c).unwrap();
+                    assert!(seen.insert(idx), "duplicate index {} at {:?}", idx, c);
+                }
+            }
+        }
+        assert_eq!(seen.len() as i32, size.x * size.y * size.z);
     }
 }
