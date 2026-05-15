@@ -1,10 +1,11 @@
 # Sculpt drain optimization plan
 
-**Status:** D0 + D1 + D2 + D6.0 + D6.1 shipped (2026-05-14). Real
-measurements after D2 confirmed `extract` (10-18 ms) was the
-bottleneck, not `filter` (D1+D2 already cut filter to 0.5-1.2 ms).
-D6.1 attacks extract directly. D5 still deferred — `apply_delta`
-peaks at 4 ms but is bursty and rare.
+**Status:** D0 + D1 + D2 + D6.0 + D6.1 + D6.2 + D7 shipped. Real
+measurements after D6.1 showed extract was still the dominant phase
+(post-D6.1 mesh sub-phase still 4-10 ms because per-cell HashMap
+work outweighed the saved bounding-box iterations). D6.2 swaps in
+FxHashMap; D7 adds a spatial index for the `dirty_q` linear scan.
+D5 still deferred — `apply_delta` peaks at 4 ms but is bursty.
 
 This plan picks up where `docs/PERF_DEBT.md` Phase E left off. After
 Phase A–E, the sculpt per-stamp sim is **drain-bound at ~15 ms** —
@@ -98,6 +99,39 @@ extract=X.XX (collect=A.AA cells=N mesh=B.BB)
 for sanity-checking the iteration cost (loop size scales with
 `cells_count` after D6.1).
 
+### D6.2 — `FxHashMap` for cells + cube_vertex (`009fe74a`)
+
+D6.1's drag-stamp data showed `mesh` (the SN-vertex inner loop)
+still ran 4-10 ms per stamp. The post-D6.1 inner loop does ~12
+HashMap probes per solid cell (6 face neighbors + ~6 cube_vertex
+lookups, plus `build_cube_vertex`'s 8 corner lookups for new
+cubes). At ~27 k cells × 12 probes × ~50 ns std-SipHash ≈ 16 ms —
+matches the observed budget. The HashMap itself was the bottleneck.
+
+D6.2 replaces `HashMap<IVec3, u32>` with `rustc_hash::FxHashMap`
+on both `cells` (per-stamp solid-cell occupancy) and `cube_vertex`
+(SN-cube → vertex id cache). FxHash's single-multiply-mix is
+~3-5× faster than std SipHash on 12-byte `IVec3` keys; no
+DoS-resistance concern for internal data. New `pub type CellMap =
+FxHashMap<IVec3, u32>` in `mesh_extract` captures the contract.
+
+### D7 — spatial index for `clusters_in_brush_grid_aabb` (`bb51d050`)
+
+The per-stamp `dirty_q` query (1.1-1.8 ms in the data) was a
+linear scan over all 104 k LOD-0 clusters. D7 adds a per-asset
+`ClusterSpatialIndex` — a bucket grid keyed by `IVec3` over the
+finest-grid cell coords, divided by 50 cells (= 1 m at
+base_vs = 0.02). Each LOD-0 cluster is inserted into every bucket
+its grid AABB overlaps. Query walks the buckets touching the
+brush AABB → unions cluster lists → exact AABB filter on the
+small candidate set.
+
+Maintenance: built at asset load, rebuilt on full re-extract,
+incrementally updated on patch-cluster append. 5 unit tests
+cover empty/LOD-filter/multi-bucket/incremental/empty-brush
+behaviour. All 920+ workspace tests pass. Adds `rustc-hash` to
+rkp-render deps (already a rkp-core dep from D6.2).
+
 ### D6.1 — iterate cells map directly in extract loop (`3662ad84`)
 
 `extract_mesh_region_from_cells` walked the brush's padded bounding
@@ -152,11 +186,7 @@ needs it.
 
 ### `dirty_q` (clusters_in_brush_grid_aabb spatial index)
 
-Not in the original plan but visible in D0 data: the linear scan
-over 104 k LOD-0 clusters costs 1.2-1.8 ms per stamp. A spatial
-index (BVH or grid) over cluster AABBs could drop this to
-sub-millisecond. Worth doing if D6.1 doesn't get the headline drain
-under 8 ms.
+✅ Shipped as D7 (`bb51d050`).
 
 ### D6 follow-ups
 
