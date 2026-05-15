@@ -1,11 +1,12 @@
 # Sculpt drain optimization plan
 
-**Status:** D0 + D1 + D2 + D6.0 + D6.1 + D6.2 + D7 shipped. Real
-measurements after D6.1 showed extract was still the dominant phase
-(post-D6.1 mesh sub-phase still 4-10 ms because per-cell HashMap
-work outweighed the saved bounding-box iterations). D6.2 swaps in
-FxHashMap; D7 adds a spatial index for the `dirty_q` linear scan.
-D5 still deferred — `apply_delta` peaks at 4 ms but is bursty.
+**Status:** D0 + D1 + D2 + D6.0 + D6.1 + D6.2 + D6.3.a + D6.3.b + D7
+shipped. Post-D6.2 data showed `mesh` sub-phase still spiked to
+9.7 ms on high-density stamps (40-50 k cells × 12 FxHash probes ≈
+9-19 ms). D6.3 replaces the inner-loop HashMap probes with two dense
+`CellGrid`s (one for `leaf_attr_id`, one for the cube → vertex cache)
+sized to the brush footprint. D5 + D6.3.c still deferred — pending
+measurement to confirm whether allocator pressure is real.
 
 This plan picks up where `docs/PERF_DEBT.md` Phase E left off. After
 Phase A–E, the sculpt per-stamp sim is **drain-bound at ~15 ms** —
@@ -154,6 +155,48 @@ criterion most of the time).
 
 All 920+ workspace tests pass.
 
+### D6.3.a + D6.3.b — dense `CellGrid` in extract inner loop (`5e29f8f5`, `772cb1a3`)
+
+Post-D6.2 the `mesh` sub-phase still spiked to ~10 ms on
+high-density stamps (40-50 k cells × 12 FxHash probes per cell ≈
+9-19 ms). D6.3 replaces both internal FxHashMaps in
+`extract_mesh_region_from_cells` with a pair of dense
+`Vec<u32>`-backed grids sized to the brush footprint:
+
+* `cells_grid` — `leaf_attr_id` lookup, replaces the
+  `cells.contains_key(&neighbor)` probe (face-neighbor solidity
+  test) and the `cells.get(&corner)` probes inside
+  `build_cube_vertex`.
+* `cube_vertex_grid` — SN-cube → vertex_id cache, replacing the
+  per-stamp `FxHashMap<IVec3, u32>`.
+
+Grid extent = `[pad_min - 1, pad_max + 1)` covers every coord the
+inner loop probes (worked out from `FACE_DIRS`, `CUBE_OFFSETS_PER_FACE`,
+and `corner_offset` ranges). For a 50-cell brush radius that's
+~104³ ≈ 1.12 M entries × 4 bytes per grid = ~9 MB scratch. A grid
+read is one bounds check + one indexed load (~3-5 ns) vs ~30 ns for
+even FxHash on 12-byte `IVec3` keys.
+
+`build_cube_vertex` is now generic over the cell-lookup primitive
+(`F: Fn(IVec3) -> Option<u32>`) so the full-asset extract path can
+keep using its `CellMap` (whose surface bbox makes densification
+untenable) while the region path hands in a `CellGrid::get` closure.
+
+D6.3.a adds the `CellGrid` type + 6 unit tests; D6.3.b wires it
+into the region extract. All 932 workspace tests pass, including
+`two_step_form_matches_convenience_wrapper` which verifies the
+region path produces the same triangle set as the full extract.
+
+Expected (per the D6.3 plan):
+- 40 k-cell stamp `mesh` sub-phase: 9.71 ms → ~1.5-2 ms
+- 40 k-cell stamp total: 21.68 ms → ~7-8 ms
+- 16 k-cell stamp total: 7.27 ms → ~5-6 ms
+
+Pending: drag-paint measurement on splat5 to confirm. If the
+~9 MB scratch shows allocator pressure (1-2 ms per stamp on
+alloc + memset), D6.3.c moves the grids onto `RkpSceneManager`
+with grow-on-demand pool reuse.
+
 ---
 
 ## Deferred (still pending data)
@@ -188,15 +231,40 @@ needs it.
 
 ✅ Shipped as D7 (`bb51d050`).
 
+### D6.3.c — pool-reuse the CellGrid scratch
+
+Per-stamp `CellGrid::new(.., size)` allocates ~9 MB and `memset`s it
+to `u32::MAX`. Math: alloc ~50-200 µs + memset ~0.9 ms ≈ 1 ms per
+stamp. The memset cost is unavoidable (grids must start empty) so
+plain pool-reuse saves only the alloc overhead (~100-200 µs).
+
+Defer until measurement shows the alloc is a hotspot. If it bites,
+candidate designs:
+
+1. **Plain reuse + memset.** Store the largest-needed `CellGrid`
+   pair on `RkpSceneManager`; grow-on-demand, `memset(u32::MAX)`
+   on reuse. Saves alloc cost only.
+2. **Dirty-set reuse.** Track flat indices written during the stamp
+   in a parallel `Vec<u32>`; on reuse, walk that list and reset only
+   those slots. Cheaper reset (~12 µs for 30 k entries) but adds a
+   push per `set` call (~500 µs on 50 k cells — net negative in the
+   common case).
+3. **Memcpy from a pre-cleared template.** Allocate a "blank" grid
+   once at startup; on each stamp, memcpy from it. Same cost as the
+   memset path — no win.
+
+(1) is the only plausible candidate; whether it's worth the
+SceneManager-state addition depends on the post-D6.3.b measurement.
+
 ### D6 follow-ups
 
-If D6.1 doesn't fully resolve extract:
+If D6.3 doesn't fully resolve extract:
 - **Drag-cache for `collect_cell_map_in_region`.** Brush moves
   slowly during a drag; consecutive stamps overlap heavily. Cache
   the cell map between stamps, invalidate only the brush footprint.
 - **Parallelize `extract_mesh_region_from_cells`** via rayon over
-  sub-volumes. Cube-vertex HashMap is shared state — would need
-  either per-thread shards merged at the end or a lock-free map.
+  sub-volumes. Cube-vertex grid is shared state — would need
+  either per-thread shards merged at the end or atomics.
 - **Drop the +3 cell padding when the brush isn't near a
   boundary.** Currently the padding is unconditional.
 
