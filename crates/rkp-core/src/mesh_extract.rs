@@ -373,7 +373,7 @@ pub fn extract_surface_mesh(
                     None => {
                         let vertex = build_cube_vertex(
                             cube,
-                            &cells,
+                            |c| cells.get(&c).copied(),
                             base_voxel_size,
                             grid_origin,
                             leaf_attr_pool,
@@ -484,39 +484,62 @@ pub fn extract_mesh_region_from_cells(
     let pad_min = region_min - IVec3::ONE;
     let pad_max = region_max + IVec3::ONE;
     let extent = 1i32 << octree_depth;
-    let mut cube_vertex: CellMap = CellMap::default();
 
-    // **D6.1 — iterate solid cells instead of the region bounding box.**
+    // **D6.3 — replace `cube_vertex` and per-cell HashMap probes with
+    // a pair of dense `CellGrid`s.**
     //
-    // The previous loop walked every cell in `[pad_min, pad_max)` and
-    // ran `cells.contains_key(&cell)` to skip the empties. For a brush
-    // radius of 50 cells (≈1 m at base_vs=0.02), the iteration was
-    // ~58³ = 195 k cells but only ~10 k are solid — 95 % wasted
-    // HashMap probes. Measured 10-18 ms per stamp on splat5.
+    // Post-D6.1+D6.2 the inner loop spent 4-10 ms (peaking at ~10 ms
+    // on 40-50 k-cell stamps) inside FxHashMap probes: 6 face-neighbor
+    // checks against `cells` per cell, 4 `cube_vertex` get/insert
+    // pairs per face emission, and 8 corner-cell lookups per fresh
+    // SN-cube (inside `build_cube_vertex`). At ~30 ns per FxHash probe
+    // the budget added up; a dense `Vec<u32>`-backed lookup is ~3-5 ns
+    // (one bounds check + one indexed load) and stays cache-resident
+    // for the 9 MB scratch a 50-cell brush radius needs.
     //
-    // Iterating `cells.iter()` directly visits exactly the solid set
-    // (~10 k entries). The bounds check filters out cells in the
-    // collect-region's outer +2 ring (cells_min/max = brush_lo/hi ± 3,
-    // pad_min/max = ± 1) — those entries are kept in the map purely
-    // so `build_cube_vertex` neighbor lookups at the iteration
-    // boundary can resolve.
+    // Grid extent = `[pad_min - 1, pad_max + 1)` — the half-open
+    // bound of every coord this loop probes:
+    //   • neighbor lookups land in `[pad_min - 1, pad_max + 1)`
+    //     (cells in pad range + ±1 face offset).
+    //   • cube positions land in `[pad_min - 1, pad_max)` (cube
+    //     offsets are in `{-1, 0}`), and `build_cube_vertex` corner
+    //     lookups extend up to `[pad_min - 1, pad_max + 1)`.
     //
-    // HashMap iteration order is non-deterministic; the resulting
-    // vertex/index ordering inside the patch cluster differs from
-    // the previous version. Triangles are independent — order has no
-    // visual or correctness consequence (vertex_offset / index_offset
-    // bookkeeping at the call site is order-invariant).
-    for (&cell, _) in cells.iter() {
-        if cell.x < pad_min.x || cell.x >= pad_max.x
-            || cell.y < pad_min.y || cell.y >= pad_max.y
-            || cell.z < pad_min.z || cell.z >= pad_max.z
+    // `cells.iter()` may include entries past the grid bounds — the
+    // collect step pads by +3 to give `build_cube_vertex` boundary
+    // data, but our grid only needs ±1. `CellGrid::set` silently
+    // drops out-of-bounds writes so the populate step is bounds-safe.
+    let grid_min = pad_min - IVec3::ONE;
+    let grid_size = pad_max - pad_min + IVec3::splat(2);
+    let mut cells_grid = CellGrid::new(grid_min, grid_size);
+
+    // Combined populate + filter pass — visits `cells.iter()` once,
+    // mirroring D6.1's iteration win. Cells inside `[pad_min, pad_max)`
+    // are pushed into `solid_cells` (the inner loop's domain); cells
+    // anywhere inside grid bounds get registered in `cells_grid` for
+    // face-neighbor / corner lookups. The two ranges overlap so most
+    // cells contribute to both.
+    let mut solid_cells: Vec<IVec3> = Vec::with_capacity(cells.len());
+    for (&cell, &slot) in cells.iter() {
+        cells_grid.set(cell, slot);
+        if cell.x >= pad_min.x
+            && cell.x < pad_max.x
+            && cell.y >= pad_min.y
+            && cell.y < pad_max.y
+            && cell.z >= pad_min.z
+            && cell.z < pad_max.z
         {
-            continue;
+            solid_cells.push(cell);
         }
+    }
+
+    let mut cube_vertex_grid = CellGrid::new(grid_min, grid_size);
+
+    for &cell in &solid_cells {
         for face in 0..6 {
             let dir = FACE_DIRS[face];
             let neighbor = cell + dir;
-            if cells.contains_key(&neighbor) {
+            if cells_grid.contains(neighbor) {
                 continue;
             }
             if is_solid_lookup(
@@ -532,12 +555,12 @@ pub fn extract_mesh_region_from_cells(
             let mut quad = [0u32; 4];
             for i in 0..4 {
                 let cube = cell + cube_offsets[i];
-                quad[i] = match cube_vertex.get(&cube) {
-                    Some(&v) => v,
+                quad[i] = match cube_vertex_grid.get(cube) {
+                    Some(v) => v,
                     None => {
                         let vertex = build_cube_vertex(
                             cube,
-                            cells,
+                            |c| cells_grid.get(c),
                             base_voxel_size,
                             grid_origin,
                             leaf_attr_pool,
@@ -545,7 +568,7 @@ pub fn extract_mesh_region_from_cells(
                         );
                         let vid = vertices.len() as u32;
                         vertices.push(vertex);
-                        cube_vertex.insert(cube, vid);
+                        cube_vertex_grid.set(cube, vid);
                         vid
                     }
                 };
@@ -609,21 +632,27 @@ pub fn extract_surface_mesh_region(
 /// the original; for larger features the result tends toward the
 /// underlying surface.
 ///
-/// **Solidity** test is `cells.contains_key`. Surface and brick-INTERIOR
-/// cells are both in the map; INTERIOR_NODE-region cells aren't, but
-/// the typical 1-thick-shell guarantee means any cube near the surface
-/// is bounded by cells we already track.
+/// **Solidity** test is the caller-supplied `cell_lookup` closure —
+/// returns `Some(slot)` for solid cells (with `CELL_INTERIOR` for
+/// brick-INTERIOR-bulk cells, or the cell's `leaf_attr_id` otherwise)
+/// and `None` for empty. Generic so the full-asset extract can keep
+/// using its `CellMap` (where surface cells are sparse over a deep
+/// octree extent and a dense grid would be untenable) while the
+/// region extract hands in a `CellGrid` for ~6-10× faster probes.
 ///
 /// Falls back to the SN cube's grid corner (`cube + (1, 1, 1)`) when
 /// no edge crossings are detected — defensive only.
-fn build_cube_vertex(
+fn build_cube_vertex<F>(
     cube: IVec3,
-    cells: &CellMap,
+    cell_lookup: F,
     voxel_size: f32,
     grid_origin: Vec3,
     leaf_attr_pool: &[LeafAttr],
     bone_voxel_pool: &[BoneVoxel],
-) -> MeshVertex {
+) -> MeshVertex
+where
+    F: Fn(IVec3) -> Option<u32>,
+{
     // Pre-classify the 8 corner cells once; the edge loop reuses these.
     // Bit layout: index = bit0(+X) | bit1(+Y) | bit2(+Z).
     let mut corner_solid = [false; 8];
@@ -633,7 +662,7 @@ fn build_cube_vertex(
     for i in 0u32..8 {
         let oa = corner_offset(i);
         let c = cube + oa;
-        if let Some(&slot) = cells.get(&c) {
+        if let Some(slot) = cell_lookup(c) {
             corner_solid[i as usize] = true;
             if slot != CELL_INTERIOR {
                 if let Some(attr) = leaf_attr_pool.get(slot as usize) {
