@@ -390,15 +390,25 @@ impl BloomPass {
             );
         }
 
-        // --- Passes 5-12: Blur H then V per mip level ---
-        for i in 0..BLOOM_MIP_LEVELS as usize {
-            // Horizontal: mip[i] → scratch[i]
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some(&format!("bloom blur H mip{i}")),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.blur_pipeline);
+        // --- Pass 5: Blur H (all mips in one compute pass) ---
+        //
+        // Each mip's H blur reads `mip[i]` and writes `scratch[i]`, so
+        // the 4 dispatches touch disjoint resources and can share one
+        // compute pass — the GPU pipelines them freely. The previous
+        // code opened a separate pass per mip (8 passes total for H+V),
+        // each of which forced a pipeline barrier; merging cuts those
+        // boundaries from 8 to 2 and saved measurable frame time on
+        // the splat5 elephant scene.
+        //
+        // H and V can't share a pass — V at mip[i] reads scratch[i]
+        // which the matching H write produced, so they need a barrier.
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("bloom blur H (all mips)"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.blur_pipeline);
+            for i in 0..BLOOM_MIP_LEVELS as usize {
                 pass.set_bind_group(0, &self.blur_h_bind_groups[i], &[]);
                 pass.dispatch_workgroups(
                     self.mip_widths[i].div_ceil(8),
@@ -406,14 +416,16 @@ impl BloomPass {
                     1,
                 );
             }
+        }
 
-            // Vertical: scratch[i] → mip[i]
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some(&format!("bloom blur V mip{i}")),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.blur_pipeline);
+        // --- Pass 6: Blur V (all mips in one compute pass) ---
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("bloom blur V (all mips)"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.blur_pipeline);
+            for i in 0..BLOOM_MIP_LEVELS as usize {
                 pass.set_bind_group(0, &self.blur_v_bind_groups[i], &[]);
                 pass.dispatch_workgroups(
                     self.mip_widths[i].div_ceil(8),

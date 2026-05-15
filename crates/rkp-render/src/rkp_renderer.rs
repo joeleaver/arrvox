@@ -2527,7 +2527,12 @@ impl RkpRenderer {
         // engine writes bloom_intensity=0 per-VR so bloom_composite's
         // mip read is zero-weighted — the pass becomes a copy from its
         // HDR input (which we just populated with shade output above).
-        if in_situ {
+        //
+        // `RKP_DISABLE_BLOOM=1` skips the bloom dispatch entirely for
+        // critical-path probing. bloom_composite still runs (reads stale
+        // mip data; visually wrong but per-frame timing is what we care
+        // about for the probe).
+        if in_situ && std::env::var("RKP_DISABLE_BLOOM").is_err() {
             let q = self.profiler.begin_query("bloom", encoder);
             viewport.bloom.dispatch(encoder);
             self.profiler.end_query(encoder, q);
