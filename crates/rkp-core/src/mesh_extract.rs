@@ -13,9 +13,19 @@
 //! No GPU work in Phase 1 — this just produces `(vertices, indices)`
 //! that the per-asset cache stores alongside the splat buffer.
 
-use std::collections::HashMap;
-
 use glam::{IVec3, UVec3, Vec3};
+use rustc_hash::FxHashMap;
+
+/// Per-cell occupancy lookup used by Surface Nets — keys are
+/// finest-grid integer coords, values are `leaf_attr_id`s (or the
+/// `CELL_INTERIOR` sentinel for INTERIOR-bulk cells).
+///
+/// D6.2: backed by `FxHashMap`. The hot extract loop does
+/// hundreds of thousands of probes per stamp; FxHash's
+/// single-multiply-mix hash is ~3-5× faster than std's SipHash on
+/// 12-byte `IVec3` keys, with no DoS-resistance concern for
+/// internal data. `cells.len()` / `cells.iter()` behave identically.
+pub type CellMap = FxHashMap<IVec3, u32>;
 
 use crate::brick_pool::{BRICK_CELLS, BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR};
 use crate::companion::BoneVoxel;
@@ -171,7 +181,7 @@ pub fn extract_surface_mesh(
     // expanded — `is_solid_lookup` resolves them on demand. That keeps
     // the map size proportional to the surface shell, not the asset's
     // solid volume.
-    let mut cells: HashMap<IVec3, u32> = HashMap::new();
+    let mut cells: CellMap = CellMap::default();
     walk_collect_cells(
         octree_nodes,
         brick_cells,
@@ -189,7 +199,7 @@ pub fn extract_surface_mesh(
     // For each (solid → void) edge, the 4 SN cubes around that edge
     // form a quad. Iterating cells in `cells` (rather than scanning
     // every grid edge) keeps us proportional to surface area.
-    let mut cube_vertex: HashMap<IVec3, u32> = HashMap::new();
+    let mut cube_vertex: CellMap = CellMap::default();
     let extent = 1i32 << octree_depth;
 
     for &cell in cells.keys() {
@@ -260,8 +270,8 @@ pub fn collect_cell_map(
     octree_nodes: &[u32],
     octree_depth: u8,
     brick_cells: &[u32],
-) -> HashMap<IVec3, u32> {
-    let mut cells = HashMap::new();
+) -> CellMap {
+    let mut cells = CellMap::default();
     if octree_nodes.is_empty() {
         return cells;
     }
@@ -307,7 +317,7 @@ pub fn collect_cell_map(
 /// can drop them straight into a [`crate::cluster_mesh_data::ClusterMesh`]
 /// without further remapping.
 pub fn extract_mesh_region_from_cells(
-    cells: &HashMap<IVec3, u32>,
+    cells: &CellMap,
     region_min: IVec3,
     region_max: IVec3,
     octree_nodes: &[u32],
@@ -334,7 +344,7 @@ pub fn extract_mesh_region_from_cells(
     let pad_min = region_min - IVec3::ONE;
     let pad_max = region_max + IVec3::ONE;
     let extent = 1i32 << octree_depth;
-    let mut cube_vertex: HashMap<IVec3, u32> = HashMap::new();
+    let mut cube_vertex: CellMap = CellMap::default();
 
     // **D6.1 — iterate solid cells instead of the region bounding box.**
     //
@@ -468,7 +478,7 @@ pub fn extract_surface_mesh_region(
 /// no edge crossings are detected — defensive only.
 fn build_cube_vertex(
     cube: IVec3,
-    cells: &HashMap<IVec3, u32>,
+    cells: &CellMap,
     voxel_size: f32,
     grid_origin: Vec3,
     leaf_attr_pool: &[LeafAttr],
@@ -669,8 +679,8 @@ pub fn collect_cell_map_in_region(
     brick_cells: &[u32],
     region_min: IVec3,
     region_max: IVec3,
-) -> HashMap<IVec3, u32> {
-    let mut cells = HashMap::new();
+) -> CellMap {
+    let mut cells = CellMap::default();
     if octree_nodes.is_empty() {
         return cells;
     }
@@ -705,7 +715,7 @@ fn walk_collect_cells_in_region(
     max_depth: u8,
     region_min: IVec3,
     region_max: IVec3,
-    cells: &mut HashMap<IVec3, u32>,
+    cells: &mut CellMap,
 ) {
     let node = nodes[node_idx];
     if node == EMPTY_NODE || node == INTERIOR_NODE {
@@ -821,7 +831,7 @@ fn walk_collect_cells(
     origin: UVec3,
     level: u8,
     max_depth: u8,
-    cells: &mut HashMap<IVec3, u32>,
+    cells: &mut CellMap,
 ) {
     let node = nodes[node_idx];
     if node == EMPTY_NODE || node == INTERIOR_NODE {

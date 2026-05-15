@@ -17,6 +17,7 @@ thiserror = { workspace = true }
 # (write-time bake) and rkp-render (load-time consumer) can share them.
 meshopt = { workspace = true }
 rayon = { workspace = true }
+rustc-hash = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
