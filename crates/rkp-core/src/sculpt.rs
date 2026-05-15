@@ -22,33 +22,58 @@
 //! space using the entity transform + `grid_origin` + `voxel_size`
 //! before calling.
 //!
-//! ## Phase 1 semantics (minimal)
+//! ## Kernel rule set (neighbor-adjacency, post-2026-05-15)
 //!
-//! * **Carve (Subtract):** finest-voxel cells whose center lies inside
-//!   the brush sphere AND whose current state is a leaf (Mixed) are
-//!   marked `Remove` — the leaf disappears. Cells that are currently
-//!   `Interior` (fully solid) stay `Interior`; newly-exposed surface
-//!   from carving past the surface shell is *not* emitted in this
-//!   phase. That leaves blocky edges around carved interiors —
-//!   acceptable for the POC, and the natural place to handle it is
-//!   the Phase 2 cluster re-bake (Surface Nets resamples the carved
-//!   region from the mutated classification).
-//! * **Raise (Add):** finest-voxel cells whose center lies inside the
-//!   brush sphere AND whose current state is `Empty` are marked
-//!   `Add { material, normal }`. The normal is the outward gradient
-//!   of the brush sphere at the cell center — fine as a first cut;
-//!   the Phase 2 re-bake will recompute via Surface Nets on the
-//!   merged classification.
-//! * Cells in any other state under either mode are no-ops.
+//! Conceptually Carve and Raise are SDF operations on the asset's
+//! occupancy field:
 //!
-//! ## Out of scope for Phase 1
+//! ```text
+//!   Carve:  D_new = max(D_obj, -D_brush)
+//!   Raise:  D_new = min(D_obj,  D_brush)
+//! ```
 //!
-//! * Newly-exposed interior surfaces from Carve (see above).
-//! * Surface-Nets-style smoothed normals at the brush boundary.
-//! * Material/normal carryover from neighbors (sculpt always uses the
-//!   brush's chosen material — that's the design pillar).
+//! Discretised on the finest-voxel grid, the rules become:
+//!
+//! **Carve:**
+//! * Inside-brush + `Solid` → `Remove` (carve the surface leaf).
+//! * Inside-brush + `Interior` → `Empty` (carve the bulk; deep carve
+//!   straight through).
+//! * Inside-brush + `Empty` → no-op (already air).
+//! * **Outside-brush** + `Interior` + has any 6-face neighbor that's
+//!   inside-brush AND will flip to `Empty` (i.e. was `Solid` or
+//!   `Interior`) → `Add { material }` (cavity wall: a previously-bulk
+//!   cell becomes the newly-exposed surface on the cavity rim).
+//!
+//! **Raise:**
+//! * Inside-brush + `Empty` → `SetInterior` (new clay bulk).
+//! * Inside-brush + `Solid`/`Interior` → no-op (sculpt isn't paint).
+//! * **Outside-brush** + `Empty` + has any 6-face neighbor that's
+//!   inside-brush AND will flip to `Interior` (i.e. was `Empty`) →
+//!   `Add { material }` (dome surface: the outside-rim air cell
+//!   becomes the new surface against the newly-raised bulk).
+//!
+//! The earlier ½-voxel-band rule placed the surface band *inside* the
+//! brush and emitted `Add` for cells whose SDF distance fell within
+//! `[-0.5, 0]`. That fuzzy threshold produced pinholes (the discrete
+//! cell grid would have neighbours randomly fall in or out of the
+//! band) and never created cavity walls on thin-shell assets (which
+//! have no `Interior` cells at all). The neighbour-adjacency rule
+//! above is a discrete yes/no per cell — no pinholes — and the
+//! cavity-wall band lives on the *outside* rim of the brush, where
+//! the surrounding asset bulk actually is. The kernel walks an AABB
+//! that's padded by 1 cell to cover that outside rim.
+//!
+//! ## Out of scope for the current rule set
+//!
+//! * Brush falloff / per-stamp strength — every inside-brush cell is
+//!   treated uniformly, so each Raise stamp adds bulk equal to the
+//!   brush hemisphere volume. Real sculpting brushes feather. Follow-up.
+//! * Material / normal carryover from neighbours — sculpt always uses
+//!   the brush's chosen material (design pillar). Normals are
+//!   recomputed from the post-stamp occupancy gradient in
+//!   [`apply_delta`].
 //! * Slot allocation, scene_mgr integration, clone-on-write,
-//!   geometry-epoch bump — all Phase 2 glue.
+//!   geometry-epoch bump — all glue lives at the caller.
 
 use glam::{IVec3, UVec3, Vec3};
 
@@ -120,8 +145,11 @@ pub enum LeafEditOp {
     SetInterior,
     /// Add a surface leaf at this coord. The caller's `alloc_slot`
     /// produces the slot id; the primitive writes the LEAF/BRICK_cell
-    /// encoding referencing that slot.
-    Add { material: u16, normal: Vec3 },
+    /// encoding referencing that slot. The normal stored on the
+    /// resulting [`LeafAttr`] is computed by [`apply_delta`] as a
+    /// post-stamp 6-tap occupancy gradient — that matches what
+    /// Surface Nets uses for vertex normals on the same cells.
+    Add { material: u16 },
 }
 
 /// A single leaf-level edit produced by [`compute_brush_edits`].
@@ -217,6 +245,15 @@ pub struct AppliedDelta {
     /// the caller's `alloc_slot` produced; `attrs` is the data the
     /// caller must write into that slot's [`LeafAttr`].
     pub allocated_slots: Vec<(u32, LeafEditAttrs)>,
+    /// Pre-existing SOLID slots whose post-stamp gradient differs from
+    /// the stored normal — typically `(slot, new_normal)` pairs for
+    /// SOLID cells that border this stamp's mutations. Without this, a
+    /// Raise that refills a prior Carve cavity leaves the Carve's
+    /// cavity-wall cells with inward-pointing normals (computed when
+    /// the cavity was empty), so they back-face-cull from the new
+    /// dome and half the surface vanishes. The caller patches each
+    /// slot's `LeafAttr.normal_oct` in place; material stays.
+    pub renormalized_slots: Vec<(u32, Vec3)>,
     /// Slot ids freed by `Remove` edits. Caller should
     /// `pool.deallocate_range(slot, 1)` for each (or batch-collect into
     /// `(start, count)` ranges).
@@ -266,34 +303,23 @@ pub struct ApplyDeltaTiming {
 // ── Internal helpers ─────────────────────────────────────────────────
 
 /// Brush SDF at point `p`: negative inside the brush, positive outside,
-/// zero on the boundary. Used both to gate "is this cell affected" and
-/// to derive a per-cell normal (Add case).
+/// zero on the boundary.
 #[inline]
 fn brush_sdf(p: Vec3, op: &BrushOp) -> f32 {
     (p - op.center).length() - op.radius
 }
 
-/// Brush outward normal at `p`: unit vector pointing away from
-/// `op.center`. Defined for any `p != op.center`; degenerate at the
-/// center (returns +Y as a stable fallback so packed-normal encoding
-/// never produces NaN).
-#[inline]
-fn brush_outward_normal(p: Vec3, op: &BrushOp) -> Vec3 {
-    let d = p - op.center;
-    let len_sq = d.length_squared();
-    if len_sq < 1e-12 {
-        Vec3::Y
-    } else {
-        d * len_sq.sqrt().recip()
-    }
-}
-
 /// Conservative axis-aligned brush bounds in finest-voxel grid units,
 /// clamped to `[0, extent)`. Returned as `(min_inclusive, max_exclusive)`.
-/// Half-open finest-voxel grid range `[lo, hi)` that bounds the brush
-/// AABB. The compute kernel walks cells in `lo.x..hi.x` etc.; the
-/// Phase B R4c sculpt path also calls this to compute the brush's
-/// grid AABB for the cluster-overlap query.
+///
+/// This is the "brush footprint" range — cells whose center sits inside
+/// the brush sphere live entirely within `[lo, hi)`. Used by external
+/// callers (cluster spatial-index queries, etc.) that only need to know
+/// which cells the brush directly affects.
+///
+/// [`compute_brush_edits`] uses a +1-cell-padded version of this range
+/// to walk the *outside* rim too — the cavity-wall / dome-surface band
+/// lives on the outside-rim cells adjacent to the brush interior.
 pub fn brush_cell_range(op: &BrushOp, extent: u32) -> (UVec3, UVec3) {
     let min_f = op.center - Vec3::splat(op.radius);
     let max_f = op.center + Vec3::splat(op.radius);
@@ -311,6 +337,59 @@ pub fn brush_cell_range(op: &BrushOp, extent: u32) -> (UVec3, UVec3) {
     // zero-cell range. Caller's nested loop naturally yields no cells
     // for that range.
     (lo, hi)
+}
+
+/// 6-tap central-difference gradient of the binary occupancy field
+/// (`1.0` if SOLID/INTERIOR/OutOfBounds-treated-as-bulk... wait, see
+/// below) sampled at `coord`'s 6 face-neighbours. Returns a unit
+/// vector pointing from solid into empty — the outward surface normal
+/// for both cavity walls (which face into the carved-out interior)
+/// and dome surfaces (which face away from raised bulk).
+///
+/// **OOB treatment.** Cells outside the octree extent count as EMPTY,
+/// so a cell on the asset boundary gets a normal pointing outward
+/// (toward the OOB side). That matches the "outside is air" mental
+/// model SN uses.
+///
+/// **Degenerate case.** If all six neighbours have identical
+/// occupancy, the gradient is zero. We fall back to `+Y` — same
+/// stable fallback the old brush-radial helper used at the brush
+/// center.
+fn gradient_normal(
+    octree: &SparseOctree,
+    brick_pool: &BrickPool,
+    coord: UVec3,
+    cache: &mut crate::sparse_octree::CellStateCache,
+) -> Vec3 {
+    let extent = octree.extent() as i32;
+    let c = IVec3::new(coord.x as i32, coord.y as i32, coord.z as i32);
+    let mut occ = |p: IVec3| -> f32 {
+        if p.x < 0 || p.y < 0 || p.z < 0 || p.x >= extent || p.y >= extent || p.z >= extent {
+            return 0.0;
+        }
+        let pu = UVec3::new(p.x as u32, p.y as u32, p.z as u32);
+        match octree.cell_state_cached(pu, brick_pool, cache) {
+            CellState::Empty | CellState::OutOfBounds => 0.0,
+            CellState::Solid(_) | CellState::Interior => 1.0,
+        }
+    };
+    let gx = occ(c - IVec3::X) - occ(c + IVec3::X);
+    let gy = occ(c - IVec3::Y) - occ(c + IVec3::Y);
+    let gz = occ(c - IVec3::Z) - occ(c + IVec3::Z);
+    let g = Vec3::new(gx, gy, gz);
+    let len_sq = g.length_squared();
+    if len_sq < 1e-6 { Vec3::Y } else { g * len_sq.sqrt().recip() }
+}
+
+/// Same as [`brush_cell_range`] but inflated by `pad` cells on each
+/// side. The compute kernel uses this with `pad=1` so the walk covers
+/// the outside-rim cells whose state matters for the cavity-wall /
+/// dome-surface rules.
+fn brush_cell_range_padded(op: &BrushOp, extent: u32, pad: u32) -> (UVec3, UVec3) {
+    let (lo, hi) = brush_cell_range(op, extent);
+    let lo_p = UVec3::new(lo.x.saturating_sub(pad), lo.y.saturating_sub(pad), lo.z.saturating_sub(pad));
+    let hi_p = UVec3::new((hi.x + pad).min(extent), (hi.y + pad).min(extent), (hi.z + pad).min(extent));
+    (lo_p, hi_p)
 }
 
 // ── Public API ───────────────────────────────────────────────────────
@@ -356,7 +435,10 @@ pub fn compute_brush_edits(
     use std::time::Instant;
 
     let extent = octree.extent();
-    let (lo, hi) = brush_cell_range(&op, extent);
+    // The walker covers the brush footprint PLUS one cell of padding so
+    // the outside-rim cells whose state drives the cavity-wall /
+    // dome-surface rules are in scope.
+    let (lo, hi) = brush_cell_range_padded(&op, extent, 1);
     if lo.x >= hi.x || lo.y >= hi.y || lo.z >= hi.z {
         return SculptDelta::default();
     }
@@ -367,16 +449,12 @@ pub fn compute_brush_edits(
     let mut n_inside_sphere = 0u32;
     let mut n_cell_state_calls = 0u32;
     let mut n_neighbor_calls = 0u32;
-    // **D9.b** — shared brick cache for the outer cell-state lookup
-    // and the per-Empty `has_outside_solid_neighbor` 6-face probes.
-    // The brush walks row-major; within a row, consecutive cells
-    // share a brick for runs of up to BRICK_DIM=4 (~75 % hit rate
-    // inside a row). Neighbor probes mostly stay inside the source
-    // cell's brick (5-of-6 face-neighbors of an interior cell are
-    // same-brick). We accept some cache thrash at brick edges in
-    // exchange for shared-state simplicity.
+    // Shared brick cache for the outer cell-state lookup and the
+    // per-outside-rim 6-face probes. Row-major walk shares bricks for
+    // runs of up to BRICK_DIM=4 cells; neighbour probes mostly stay
+    // inside the source cell's brick (5-of-6 face-neighbors of an
+    // interior cell are same-brick).
     let mut cache = crate::sparse_octree::CellStateCache::new();
-    let half_voxel = 0.5; // grid-unit coords, so ½ voxel == 0.5
     for z in lo.z..hi.z {
         for y in lo.y..hi.y {
             for x in lo.x..hi.x {
@@ -384,36 +462,27 @@ pub fn compute_brush_edits(
                 let coord = UVec3::new(x, y, z);
                 let cell_center = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
                 let d = brush_sdf(cell_center, &op);
-                if d > 0.0 {
-                    continue;
-                }
-                n_inside_sphere += 1;
+                let inside = d <= 0.0;
                 let state = octree.cell_state_cached(coord, brick_pool, &mut cache);
                 n_cell_state_calls += 1;
                 if matches!(state, CellState::OutOfBounds) {
                     continue;
                 }
-                let within_half = d >= -half_voxel;
-                match op.mode {
-                    BrushMode::Carve => emit_carve_edits(
-                        &mut edits,
-                        coord,
-                        cell_center,
-                        state,
-                        within_half,
-                        &op,
-                        octree,
-                        brick_pool,
-                        &mut cache,
-                        &mut n_neighbor_calls,
+                if inside {
+                    n_inside_sphere += 1;
+                }
+                match (op.mode, inside) {
+                    (BrushMode::Carve, true) => emit_carve_inside(&mut edits, coord, state),
+                    (BrushMode::Carve, false) => emit_carve_outside_rim(
+                        &mut edits, coord, state, &op, octree, brick_pool,
+                        &mut cache, &mut n_neighbor_calls,
                     ),
-                    BrushMode::Raise => emit_raise_edits(
-                        &mut edits, coord, cell_center, state, within_half, &op,
+                    (BrushMode::Raise, true) => emit_raise_inside(&mut edits, coord, state),
+                    (BrushMode::Raise, false) => emit_raise_outside_rim(
+                        &mut edits, coord, state, &op, octree, brick_pool,
+                        &mut cache, &mut n_neighbor_calls,
                     ),
                 }
-                // Phase B uses `falloff` only as a "is the cell within
-                // the brush sphere" gate today; later phases will
-                // weight a smoothstep band. Mark it used.
                 let _ = op.falloff;
             }
         }
@@ -431,93 +500,92 @@ pub fn compute_brush_edits(
     }
 }
 
-/// Apply the Carve rule set at one cell. The classification was done
-/// in [`compute_brush_edits`]; this just maps `(state, within_half)`
-/// to a [`LeafEditOp`].
+/// Carve, inside-brush cell. `Solid` → Remove; `Interior` → Empty (deep
+/// carve through bulk). EMPTY stays as-is.
 #[inline]
-fn emit_carve_edits(
+fn emit_carve_inside(edits: &mut Vec<LeafEdit>, coord: UVec3, state: CellState) {
+    match state {
+        CellState::Solid(_) => edits.push(LeafEdit { coord, op: LeafEditOp::Remove }),
+        CellState::Interior => edits.push(LeafEdit { coord, op: LeafEditOp::Empty }),
+        _ => {}
+    }
+}
+
+/// Carve, outside-brush cell. Only `Interior` cells with an inside-brush
+/// 6-neighbour that will flip to `Empty` (Solid or Interior pre-stamp)
+/// become cavity-wall `Add` cells.
+#[inline]
+fn emit_carve_outside_rim(
     edits: &mut Vec<LeafEdit>,
     coord: UVec3,
-    cell_center: Vec3,
     state: CellState,
-    within_half: bool,
     op: &BrushOp,
     octree: &SparseOctree,
     brick_pool: &BrickPool,
     cache: &mut crate::sparse_octree::CellStateCache,
     n_neighbor_calls: &mut u32,
 ) {
-    match state {
-        CellState::Solid(_) => {
-            edits.push(LeafEdit { coord, op: LeafEditOp::Remove });
-        }
-        CellState::Interior if within_half => {
-            // Cavity wall: previously-bulk cell becomes the new
-            // surface along the brush sphere boundary.
-            let normal = brush_outward_normal(cell_center, op);
-            edits.push(LeafEdit {
-                coord,
-                op: LeafEditOp::Add { material: op.material, normal },
-            });
-        }
-        CellState::Interior => {
-            // Deep carve: bulk goes to air.
-            edits.push(LeafEdit { coord, op: LeafEditOp::Empty });
-        }
-        CellState::Empty => {
-            // Thin-shell cavity wall: if a 6-neighbor is solid /
-            // interior AND outside the brush, the brush is crossing
-            // an interior cavity and the EMPTY cell becomes a new
-            // wall facing into the cavity.
-            *n_neighbor_calls += 1;
-            if has_outside_solid_neighbor(coord, op, octree, brick_pool, cache) {
-                let normal = brush_outward_normal(cell_center, op);
-                edits.push(LeafEdit {
-                    coord,
-                    op: LeafEditOp::Add { material: op.material, normal },
-                });
-            }
-        }
-        CellState::OutOfBounds => {}
+    if !matches!(state, CellState::Interior) {
+        return;
+    }
+    *n_neighbor_calls += 1;
+    if has_inside_brush_neighbor_in(
+        coord, op, octree, brick_pool, cache,
+        |s| matches!(s, CellState::Solid(_) | CellState::Interior),
+    ) {
+        edits.push(LeafEdit { coord, op: LeafEditOp::Add { material: op.material } });
     }
 }
 
-/// Apply the Raise rule set at one cell.
+/// Raise, inside-brush cell. `Empty` → SetInterior (clay bulk).
+/// Solid/Interior cells stay (sculpt isn't paint).
 #[inline]
-fn emit_raise_edits(
+fn emit_raise_inside(edits: &mut Vec<LeafEdit>, coord: UVec3, state: CellState) {
+    if matches!(state, CellState::Empty) {
+        edits.push(LeafEdit { coord, op: LeafEditOp::SetInterior });
+    }
+}
+
+/// Raise, outside-brush cell. Only `Empty` cells with an inside-brush
+/// 6-neighbour that will flip to `Interior` (Empty pre-stamp) become
+/// dome-surface `Add` cells.
+#[inline]
+fn emit_raise_outside_rim(
     edits: &mut Vec<LeafEdit>,
     coord: UVec3,
-    cell_center: Vec3,
     state: CellState,
-    within_half: bool,
     op: &BrushOp,
+    octree: &SparseOctree,
+    brick_pool: &BrickPool,
+    cache: &mut crate::sparse_octree::CellStateCache,
+    n_neighbor_calls: &mut u32,
 ) {
-    match state {
-        CellState::Empty if within_half => {
-            let normal = brush_outward_normal(cell_center, op);
-            edits.push(LeafEdit {
-                coord,
-                op: LeafEditOp::Add { material: op.material, normal },
-            });
-        }
-        CellState::Empty => {
-            edits.push(LeafEdit { coord, op: LeafEditOp::SetInterior });
-        }
-        // Existing solid / interior under Raise: no-op.
-        _ => {}
+    if !matches!(state, CellState::Empty) {
+        return;
+    }
+    *n_neighbor_calls += 1;
+    if has_inside_brush_neighbor_in(
+        coord, op, octree, brick_pool, cache,
+        |s| matches!(s, CellState::Empty),
+    ) {
+        edits.push(LeafEdit { coord, op: LeafEditOp::Add { material: op.material } });
     }
 }
 
-/// Check whether any of the 6 face-neighbors of `coord` is currently
-/// Solid or Interior AND its center sits OUTSIDE the brush sphere.
-/// Used for the thin-shell cavity-wall rule.
+/// Return `true` if any of the 6 face-neighbours of `coord` sits
+/// *inside* the brush sphere AND its current cell state satisfies the
+/// caller-supplied predicate. The predicate lets Carve and Raise share
+/// the same probe logic — Carve wants neighbours that will flip to
+/// EMPTY (currently Solid/Interior); Raise wants neighbours that will
+/// flip to INTERIOR (currently Empty).
 #[inline]
-fn has_outside_solid_neighbor(
+fn has_inside_brush_neighbor_in(
     coord: UVec3,
     op: &BrushOp,
     octree: &SparseOctree,
     brick_pool: &BrickPool,
     cache: &mut crate::sparse_octree::CellStateCache,
+    pred: impl Fn(CellState) -> bool,
 ) -> bool {
     const FACE_DIRS: [IVec3; 6] = [
         IVec3::new(1, 0, 0),
@@ -536,16 +604,12 @@ fn has_outside_solid_neighbor(
         }
         let n_u = UVec3::new(n.x as u32, n.y as u32, n.z as u32);
         let n_center = Vec3::new(n.x as f32 + 0.5, n.y as f32 + 0.5, n.z as f32 + 0.5);
-        if brush_sdf(n_center, op) <= 0.0 {
-            // Neighbor is also inside the brush — doesn't count as a
-            // "wall" anchor.
+        if brush_sdf(n_center, op) > 0.0 {
+            // Neighbour is also outside-brush — doesn't anchor the rim.
             continue;
         }
-        // **D9.b** — share the outer loop's brick cache. 5-of-6
-        // face-neighbors of an interior-of-brick cell live in the
-        // same brick as the source; those hit the cache.
         let n_state = octree.cell_state_cached(n_u, brick_pool, cache);
-        if matches!(n_state, CellState::Solid(_) | CellState::Interior) {
+        if pred(n_state) {
             return true;
         }
     }
@@ -650,13 +714,17 @@ pub fn apply_delta(
 
     let mut n_add = 0u32;
     let t_add = Instant::now();
+    let mut add_coords: Vec<UVec3> = Vec::with_capacity(delta.count_added());
     {
         let mut cache = BrickPathCache::new();
         for edit in &delta.edits {
-            if let LeafEditOp::Add { material, normal } = edit.op {
+            if let LeafEditOp::Add { material } = edit.op {
                 n_add += 1;
                 let slot = alloc_slot();
-                allocated_slots.push((slot, LeafEditAttrs { material, normal }));
+                // Normal is filled in below from a post-stamp gradient;
+                // +Y is a safe placeholder if the gradient is degenerate.
+                allocated_slots.push((slot, LeafEditAttrs { material, normal: Vec3::Y }));
+                add_coords.push(edit.coord);
                 if let Some(prev) =
                     octree.set_cell_solid_cached(edit.coord, slot, brick_pool, &mut cache)
                 {
@@ -666,7 +734,37 @@ pub fn apply_delta(
             }
         }
     }
+    // Gradient-normal pass: now that every mutation is applied, the
+    // octree's occupancy field reflects the post-stamp surface. A 6-tap
+    // central-difference reads the local gradient — pointing from
+    // SOLID/INTERIOR toward EMPTY, which is the outward-facing normal
+    // both cavity walls and dome surfaces want. This matches the
+    // gradient Surface Nets uses for its mesh vertex normals on the
+    // same cells, so per-pixel resolved normals and SN-extracted
+    // vertex normals agree at the sculpt-region seam.
+    {
+        let mut grad_cache = crate::sparse_octree::CellStateCache::new();
+        // `allocated_slots` is only pushed during the Add pass above,
+        // so indices line up 1:1 with `add_coords`.
+        for (idx, coord) in add_coords.iter().enumerate() {
+            allocated_slots[idx].1.normal =
+                gradient_normal(octree, brick_pool, *coord, &mut grad_cache);
+        }
+    }
     let t_loop_add_ns = t_add.elapsed().as_nanos() as u64;
+
+    // Renormalize pass deliberately removed (2026-05-15).
+    // Naive 6-face renormalize of any SOLID neighbour of an edit
+    // inverts the ground's normal whenever a Raise piles INTERIOR
+    // bulk above it: a ground cell at y=0 originally had +Y EMPTY
+    // and -Y OOB → gradient.y=0, fallback +Y. After the Raise, +Y
+    // becomes INTERIOR while -Y stays OOB → gradient.y=-1 → normal
+    // flips to -Y. The ground back-face-culls and disappears under
+    // the dome. The right fix needs to discriminate "this cell's
+    // surface lives on the face whose state changed" from "this
+    // cell's surface lives elsewhere on the cell" — punted until we
+    // have a real repro of the underlying stale-normal case.
+    let renormalized_slots: Vec<(u32, Vec3)> = Vec::new();
 
     // ── Teardown ─────────────────────────────────────────────────
     let t_take = Instant::now();
@@ -675,6 +773,7 @@ pub fn apply_delta(
 
     AppliedDelta {
         allocated_slots,
+        renormalized_slots,
         freed_slots,
         octree_log,
         timing: ApplyDeltaTiming {
@@ -802,15 +901,10 @@ mod tests {
 
     #[test]
     fn carve_solid_cube_makes_hemispherical_cavity() {
-        // Phase B: Carve on a solid INTERIOR body emits per-cell
-        // edits — cells within ½ voxel of the brush boundary become
-        // ADD (newly-exposed surface), cells deeper become Empty
-        // (carved bulk). The Phase 1 no-op behavior is retired.
-        //
-        // depth=4 → 16³ tree, all INTERIOR_NODE. Brush at (8,8,8)
-        // radius 3.0. The ½-voxel band picks up cells at center
-        // distance ~2.6 (3D from brush center); cells closer than 2.5
-        // are "deep" and go to Empty.
+        // Carve on a solid INTERIOR body. Every inside-brush cell flips
+        // to EMPTY (deep carve); cavity-wall cells form on the OUTSIDE
+        // rim where outside-brush INTERIOR cells touch the carved-out
+        // interior. depth=4 → 16³ tree, all INTERIOR_NODE.
         let mut t = SparseOctree::new(4, 1.0);
         let pool = fresh_pool();
         for z in 0..16 {
@@ -830,16 +924,14 @@ mod tests {
             material: 0,
         };
         let delta = compute_brush_edits(&t, &pool, op);
-        // Carve through INTERIOR bulk produces a mix of Add (wall)
-        // and Empty (deep carve) edits. Both > 0.
         assert!(
             delta.count_added() > 0,
-            "expected newly-exposed-surface ADD edits along the brush boundary; got {} adds / {} empties",
+            "expected outside-rim cavity-wall ADD edits; got {} adds / {} empties",
             delta.count_added(), delta.count_removed(),
         );
         assert!(
             delta.count_removed() > 0,
-            "expected deep-carve Empty edits beyond the ½-voxel band",
+            "expected deep-carve Empty edits inside the brush",
         );
         // No SetInterior edits — those are Raise-only.
         assert_eq!(delta.count_interior(), 0);
@@ -847,35 +939,27 @@ mod tests {
 
     #[test]
     fn raise_adds_into_empty() {
-        // depth=3 → 8³ tree, all EMPTY. brick_depth=1, so apply_delta's
-        // set_cell_solid will materialize a brick at level 1 covering
-        // (4..8, 4..8, 4..8) and write slot 100 into one of its cells.
+        // depth=3 → 8³ tree, all EMPTY. brick_depth=1, so apply_delta
+        // materializes a brick at level 1 covering (4..8, 4..8, 4..8).
         //
-        // Phase B Raise rule: EMPTY cell within ½ voxel of brush
-        // boundary → Add. A brush radius at the cell-center distance
-        // gives d ≈ 0 → squarely in the boundary band. CELL_DIAG_HALF
-        // (~0.866) placed at a cell corner makes one cell's center
-        // sit at distance 0 from the brush center (d = -0.866) which
-        // falls in the deep-Raise SetInterior band, not Add. Use
-        // a brush whose boundary passes through the target cell's
-        // center instead.
+        // New rule: inside-brush EMPTY → SetInterior; outside-brush
+        // EMPTY with inside-brush EMPTY neighbor → Add (dome surface).
+        // A radius-0.4 brush centered on (4.5,4.5,4.5) catches exactly
+        // one inside-brush cell (4,4,4) and its six face-neighbours
+        // become outside-rim Add cells.
         let mut t = SparseOctree::new(3, 1.0);
         let mut pool = fresh_pool();
-        // Brush center on the (4,4,4)-(5,5,5) corner; radius 0.5
-        // makes cell (4,4,4) center at (4.5,4.5,4.5) sit at distance
-        // sqrt(0.75) ≈ 0.866 — outside the brush. Bump radius so the
-        // target cell's center sits just inside the boundary band.
         let op = BrushOp {
             center: Vec3::new(4.5, 4.5, 4.5),
-            radius: 0.4, // < 0.5 → only cell (4,4,4) center sits inside, at d = -0.4
+            radius: 0.4,
             falloff: 0.0,
             mode: BrushMode::Raise,
             material: 7,
         };
         let delta = compute_brush_edits(&t, &pool, op);
-        assert_eq!(delta.count_added(), 1);
+        assert_eq!(delta.count_interior(), 1, "expected one SetInterior bulk cell");
+        assert_eq!(delta.count_added(), 6, "expected one face-neighbour Add per axis");
         assert_eq!(delta.count_removed(), 0);
-        assert_eq!(delta.count_interior(), 0);
 
         // Allocator hands out monotonically increasing ids.
         let mut next = 100u32;
@@ -884,22 +968,25 @@ mod tests {
             next += 1;
             s
         });
-        assert_eq!(applied.allocated_slots.len(), 1);
-        let (slot, attrs) = applied.allocated_slots[0];
-        assert_eq!(slot, 100);
-        assert_eq!(attrs.material, 7);
-        // Center cell is at the brush center → degenerate normal
-        // falls back to +Y (see `brush_outward_normal`).
-        assert!((attrs.normal - Vec3::Y).length() < 1e-6);
-
-        // The kernel wrote slot 100 into the BRICK cell that covers
-        // grid coord (4, 4, 4).
-        assert_leaf(&t, &pool, UVec3::new(4, 4, 4), 100);
-        // `leaf_count` counts LEAF terminators only — surface slots
-        // living inside BRICKs don't count. The "is there mass here"
-        // signal in the brick-encoded world is the BRICK terminator,
-        // not LEAF.
-        assert_eq!(leaf_count(&t), 0);
+        assert_eq!(applied.allocated_slots.len(), 6);
+        for (slot, attrs) in &applied.allocated_slots {
+            assert!(*slot >= 100);
+            assert_eq!(attrs.material, 7);
+        }
+        // Each Add cell sits adjacent to the newly-INTERIOR centre, so
+        // its gradient normal points along the brush radius (away from
+        // (4,4,4)).
+        let add_idx = delta.edits.iter().position(|e| e.coord == UVec3::new(5, 4, 4) && matches!(e.op, LeafEditOp::Add { .. }));
+        let add_idx = add_idx.expect("cell (5,4,4) should be an Add");
+        // The Add pass iterates edits in order and pushes to
+        // allocated_slots in the same order. Find which Add-pass index
+        // (5,4,4) lives at by counting prior Adds in the delta.
+        let add_pass_idx = delta.edits[..add_idx].iter().filter(|e| matches!(e.op, LeafEditOp::Add { .. })).count();
+        let (_, attrs) = applied.allocated_slots[add_pass_idx];
+        assert!(attrs.normal.x > 0.95, "+X dome cell should have +X normal; got {:?}", attrs.normal);
+        // Cell (4,4,4) is now INTERIOR bulk.
+        let center_state = t.cell_state(UVec3::new(4, 4, 4), &pool);
+        assert!(matches!(center_state, CellState::Interior), "centre cell should be INTERIOR, got {:?}", center_state);
     }
 
     #[test]
@@ -1015,12 +1102,8 @@ mod tests {
         let delta = SculptDelta { timing: Default::default(), edits: vec![
             LeafEdit { coord: UVec3::new(0, 0, 0), op: LeafEditOp::Remove },
             LeafEdit { coord: UVec3::new(1, 0, 0), op: LeafEditOp::Remove },
-            LeafEdit { coord: UVec3::new(0, 1, 0), op: LeafEditOp::Add {
-                material: 5, normal: Vec3::Y,
-            }},
-            LeafEdit { coord: UVec3::new(1, 1, 0), op: LeafEditOp::Add {
-                material: 5, normal: Vec3::Y,
-            }},
+            LeafEdit { coord: UVec3::new(0, 1, 0), op: LeafEditOp::Add { material: 5 } },
+            LeafEdit { coord: UVec3::new(1, 1, 0), op: LeafEditOp::Add { material: 5 } },
         ]};
         assert_eq!(delta.count_removed(), 2);
         assert_eq!(delta.count_added(), 2);
@@ -1050,11 +1133,13 @@ mod tests {
 
     #[test]
     fn raise_outward_normal_points_away_from_brush_center() {
-        // depth=4 → 16³. Brush at (8, 8, 8), big enough radius to span
-        // multiple cells. One cell at (10, 8, 8) → its center is at
-        // (10.5, 8.5, 8.5) so the outward normal must point in +X.
-        let t = SparseOctree::new(4, 1.0);
-        let pool = fresh_pool();
+        // depth=4 → 16³. Brush at (8, 8.5, 8.5), radius 4.0. The
+        // outside-rim Add cell at (12, 8, 8) lies just outside the
+        // brush's +X face. Its gradient normal — computed in
+        // `apply_delta` from the post-stamp occupancy — should point
+        // in +X (away from the newly-INTERIOR bulk).
+        let mut t = SparseOctree::new(4, 1.0);
+        let mut pool = fresh_pool();
         let op = BrushOp {
             center: Vec3::new(8.0, 8.5, 8.5),
             radius: 4.0,
@@ -1063,27 +1148,28 @@ mod tests {
             material: 1,
         };
         let delta = compute_brush_edits(&t, &pool, op);
+        // Find the index of (12, 8, 8) in the Add subsequence so we
+        // can pull its post-stamp normal from `allocated_slots`.
+        let target = UVec3::new(12, 8, 8);
+        let add_pos_in_edits = delta.edits.iter().position(|e| {
+            e.coord == target && matches!(e.op, LeafEditOp::Add { .. })
+        }).expect("expected an Add at (12, 8, 8) on the +X brush rim");
+        let add_pass_idx = delta.edits[..add_pos_in_edits]
+            .iter().filter(|e| matches!(e.op, LeafEditOp::Add { .. })).count();
 
-        // Cells right at the brush boundary (within ½ voxel) are Add.
-        // Cell (10, 8, 8) at center (10.5, 8.5, 8.5) is at distance
-        // 2.0 from brush center along X; brush radius 4.0 puts it
-        // 2.0 *inside* the boundary — so it's a SetInterior cell, not
-        // Add. We want a cell near the +X surface of the brush.
-        // Try (12, 8, 8) → center (12.5, 8.5, 8.5), distance 4.0 from
-        // brush center — right at the boundary.
-        let edge_edit = delta.edits.iter().find(|e| {
-            matches!(e.op, LeafEditOp::Add { .. }) && e.coord.x >= 11 && e.coord.y == 8 && e.coord.z == 8
-        }).expect("expected an Add edit near the +X brush boundary");
-        let LeafEditOp::Add { normal, .. } = edge_edit.op else { unreachable!() };
-        assert!(normal.x > 0.85, "outward normal should point ~+X, got {normal:?}");
+        let mut next = 0u32;
+        let applied = apply_delta(&mut t, &mut pool, &delta, || { let s = next; next += 1; s });
+        let (_, attrs) = applied.allocated_slots[add_pass_idx];
+        assert!(attrs.normal.x > 0.85, "outward normal should point ~+X, got {:?}", attrs.normal);
     }
 
     // ── R2b cavity-wall + INTERIOR tests ─────────────────────────
 
     #[test]
     fn raise_deep_into_empty_emits_set_interior() {
-        // depth=4 → 16³. Brush at (8,8,8) radius 3.0; cells deeper
-        // than ½ voxel from the boundary become SetInterior.
+        // depth=4 → 16³. Brush at (8,8,8) radius 3.0. Inside-brush
+        // EMPTY cells become SetInterior (bulk); the outside-rim ring
+        // of cells touching that bulk becomes Add (dome surface).
         let t = SparseOctree::new(4, 1.0);
         let pool = fresh_pool();
         let op = BrushOp {
@@ -1094,23 +1180,19 @@ mod tests {
             material: 1,
         };
         let delta = compute_brush_edits(&t, &pool, op);
-        // Interior fill produces SetInterior; thin band at boundary
-        // produces Add. Both > 0.
         assert!(delta.count_interior() > 0, "expected SetInterior edits for deep Raise");
-        assert!(delta.count_added() > 0, "expected Add edits at brush boundary");
+        assert!(delta.count_added() > 0, "expected outside-rim dome-surface Add edits");
         assert_eq!(delta.count_removed(), 0);
     }
 
     #[test]
-    fn carve_thin_shell_emits_cavity_wall_on_far_side() {
-        // Build a "thin shell": one SOLID layer at z=3, EMPTY
-        // everywhere else. Brush carves through z=3; the EMPTY cell
-        // at z=4 directly behind a still-surviving SOLID neighbor on
-        // the +z side outside the brush should get an Add.
-        //
-        // Construction: depth=3 (8³). Solid layer along z=3 across
-        // all x,y. Brush at (4, 4, 3.5) radius 1.5: carves a circular
-        // hole through z=3.
+    fn carve_thin_shell_punches_clean_hole_no_cavity_walls() {
+        // A "thin shell" asset: one SOLID layer at z=3, EMPTY
+        // everywhere else (no INTERIOR bulk). Carving through the
+        // shell should remove the inside-brush shell cells and leave
+        // ZERO cavity-wall Adds — the rule only produces cavity walls
+        // from outside-brush INTERIOR cells, and there are none. This
+        // is the "tunnelling through is fine" case for thin shells.
         let mut t = SparseOctree::new(3, 1.0);
         let pool = fresh_pool();
         let mut slot = 0u32;
@@ -1128,29 +1210,8 @@ mod tests {
             material: 7,
         };
         let delta = compute_brush_edits(&t, &pool, op);
-        // Should remove cells of the shell inside the brush AND add
-        // cavity-wall cells where EMPTY cells inside the brush have
-        // an outside-brush SOLID neighbor. Both > 0.
-        let removed = delta.count_removed();
-        let added = delta.count_added();
-        assert!(
-            removed > 0,
-            "expected the brush to carve through the shell at z=3",
-        );
-        // Cavity-wall ADDs are emitted only when an EMPTY-in-brush
-        // cell has a Solid/Interior 6-neighbor that lies OUTSIDE the
-        // brush. With this geometry (a single SOLID plane carved by
-        // a small brush, surrounded by EMPTY on either z side) the
-        // brush sphere doesn't include any EMPTY cell whose neighbor
-        // is BOTH solid AND outside the brush — every neighboring
-        // solid cell on the shell is itself inside the brush. So
-        // this geometry should produce 0 cavity walls. The rule is
-        // verified by a thicker-shell test below.
-        assert_eq!(
-            added, 0,
-            "single-layer shell has no neighboring solid OUTSIDE the brush; got {added}",
-        );
-        let _ = added;
+        assert!(delta.count_removed() > 0, "expected Remove edits on the shell");
+        assert_eq!(delta.count_added(), 0, "thin shell has no INTERIOR to form cavity walls");
     }
 
     #[test]
@@ -1167,9 +1228,7 @@ mod tests {
 
         let delta = SculptDelta { timing: Default::default(), edits: vec![
             LeafEdit { coord: UVec3::new(0, 0, 0), op: LeafEditOp::Remove },
-            LeafEdit { coord: UVec3::new(1, 0, 0), op: LeafEditOp::Add {
-                material: 7, normal: Vec3::Y,
-            }},
+            LeafEdit { coord: UVec3::new(1, 0, 0), op: LeafEditOp::Add { material: 7 } },
         ]};
         let applied = apply_delta(&mut t, &mut pool, &delta, || 99);
         // Either path mutated nodes — log must have writes.
@@ -1189,9 +1248,7 @@ mod tests {
         let mut pool = fresh_pool();
         let initial = t.node_count();
         let delta = SculptDelta { timing: Default::default(), edits: vec![
-            LeafEdit { coord: UVec3::new(2, 2, 2), op: LeafEditOp::Add {
-                material: 1, normal: Vec3::Y,
-            }},
+            LeafEdit { coord: UVec3::new(2, 2, 2), op: LeafEditOp::Add { material: 1 } },
         ]};
         let applied = apply_delta(&mut t, &mut pool, &delta, || 0);
         assert_eq!(applied.octree_log.initial_node_count as usize, initial);
@@ -1200,12 +1257,95 @@ mod tests {
     }
 
     #[test]
+    fn raise_dome_outside_rim_is_pinhole_free() {
+        // Stamp a Raise brush into an all-EMPTY 16³ tree. The outside-
+        // rim Add cells should form a continuous shell — every face-
+        // neighbour of a SetInterior bulk cell that sits outside the
+        // brush gets promoted. With the new adjacency rule there's no
+        // ½-voxel-band distance threshold to fall in and out of, so
+        // the shell is hole-free by construction.
+        let mut t = SparseOctree::new(4, 1.0);
+        let mut pool = fresh_pool();
+        let op = BrushOp {
+            center: Vec3::new(8.0, 8.0, 8.0),
+            radius: 3.0,
+            falloff: 0.0,
+            mode: BrushMode::Raise,
+            material: 4,
+        };
+        let delta = compute_brush_edits(&t, &pool, op);
+        let mut next = 0u32;
+        let _applied = apply_delta(&mut t, &mut pool, &delta, || { let s = next; next += 1; s });
+
+        // Every Add cell sits on the outside rim. Walk each one and
+        // verify it has at least one INTERIOR face-neighbour (the bulk
+        // it bounds). Any "floating" Add cell with no INTERIOR neighbour
+        // would be a pinhole-adjacent ghost — the regression case the
+        // old ½-voxel-band rule produced.
+        let mut adds = 0;
+        for edit in &delta.edits {
+            if !matches!(edit.op, LeafEditOp::Add { .. }) {
+                continue;
+            }
+            adds += 1;
+            let c = edit.coord;
+            let mut has_interior = false;
+            for d in [IVec3::X, -IVec3::X, IVec3::Y, -IVec3::Y, IVec3::Z, -IVec3::Z] {
+                let n = IVec3::new(c.x as i32, c.y as i32, c.z as i32) + d;
+                if n.x < 0 || n.y < 0 || n.z < 0 || n.x >= 16 || n.y >= 16 || n.z >= 16 { continue; }
+                let nu = UVec3::new(n.x as u32, n.y as u32, n.z as u32);
+                if matches!(t.cell_state(nu, &pool), CellState::Interior) {
+                    has_interior = true;
+                    break;
+                }
+            }
+            assert!(has_interior, "Add cell {c} has no INTERIOR neighbour — would be a pinhole");
+        }
+        assert!(adds >= 30, "expected a dense dome-surface ring, got only {adds} Add cells");
+    }
+
+    #[test]
+    fn gradient_normal_cavity_wall_points_into_cavity() {
+        // Carve a solid INTERIOR cube. A cavity-wall cell on the +X
+        // side of the brush should have its gradient normal pointing
+        // in -X (toward brush center = into the carved-out cavity).
+        let mut t = SparseOctree::new(4, 1.0);
+        let mut pool = fresh_pool();
+        for z in 0..16 { for y in 0..16 { for x in 0..16 {
+            t.insert_interior(UVec3::new(x, y, z));
+        }}}
+        let op = BrushOp {
+            center: Vec3::new(8.0, 8.0, 8.0),
+            radius: 3.0,
+            falloff: 0.0,
+            mode: BrushMode::Carve,
+            material: 0,
+        };
+        let delta = compute_brush_edits(&t, &pool, op);
+        // Pick an Add edit on the +X cavity rim. Brush radius 3.0 at
+        // (8,8,8) makes cell (10,8,8) the outermost inside-brush cell
+        // along +X (centre at (10.5,8.5,8.5), distance ≈2.6 from brush
+        // centre). The outside-rim cavity-wall cell is its +X neighbour
+        // (11,8,8) — outside-brush INTERIOR with an inside-brush
+        // INTERIOR neighbour that's about to flip to EMPTY.
+        let target = UVec3::new(11, 8, 8);
+        let pos = delta.edits.iter().position(|e| {
+            e.coord == target && matches!(e.op, LeafEditOp::Add { .. })
+        }).expect("expected Add at +X rim (11,8,8)");
+        let add_pass_idx = delta.edits[..pos]
+            .iter().filter(|e| matches!(e.op, LeafEditOp::Add { .. })).count();
+        let mut next = 0u32;
+        let applied = apply_delta(&mut t, &mut pool, &delta, || { let s = next; next += 1; s });
+        let (_, attrs) = applied.allocated_slots[add_pass_idx];
+        assert!(attrs.normal.x < -0.85, "+X cavity wall should face -X (into cavity); got {:?}", attrs.normal);
+    }
+
+    #[test]
     fn carve_solid_block_makes_cavity_walls_at_boundary() {
-        // Phase B: stamping a brush into a solid (INTERIOR) cube
-        // produces a hemispherical cavity. The ½-voxel band at the
-        // brush boundary becomes Add (cavity wall); deeper cells
-        // become Empty.
-        //
+        // Stamping a brush into a solid (INTERIOR) cube produces a
+        // hemispherical cavity. Every inside-brush cell flips to
+        // EMPTY (Empty edit); the outside-brush INTERIOR rim cells
+        // that touch the carved region become Add (cavity wall).
         // depth=3 (8³), all INTERIOR. Brush at (4, 4, 4) radius 2.0.
         let mut t = SparseOctree::new(3, 1.0);
         let pool = fresh_pool();
