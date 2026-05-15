@@ -5235,6 +5235,7 @@ dependencies = [
  "rayon",
  "rkp-core",
  "rkp-procedural",
+ "rustc-hash 2.1.2",
  "thiserror 2.0.18",
  "wesl",
  "wgpu 29.0.1",

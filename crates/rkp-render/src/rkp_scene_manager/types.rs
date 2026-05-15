@@ -186,6 +186,12 @@ pub(super) struct AssetEntry {
     pub(super) mesh_dirty: bool,
     pub(super) splats_dirty: bool,
     pub(super) clusters_dirty: bool,
+    /// D7 — bucket-grid spatial index over LOD-0 `meshlet_clusters`.
+    /// Queried by `clusters_in_brush_grid_aabb` to skip the ~105 k-
+    /// entry linear scan. Built at asset load + rebuilt on full
+    /// mesh re-extract + incrementally updated on patch-cluster
+    /// append. See `cluster_spatial_index.rs`.
+    pub(super) cluster_spatial_index: super::cluster_spatial_index::ClusterSpatialIndex,
 }
 
 impl AssetEntry {

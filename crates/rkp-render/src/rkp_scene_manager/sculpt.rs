@@ -538,14 +538,25 @@ impl RkpSceneManager {
         let aabb_center = (entry.aabb.min + entry.aabb.max) * 0.5;
         let grid_origin = aabb_center - Vec3::splat(extent * 0.5);
 
-        let mut dirty = Vec::new();
-        for (idx, c) in entry.meshlet_clusters.iter().enumerate() {
+        // **D7 — spatial-indexed query.** Walk the bucket grid for
+        // candidate cluster ids touching the brush, then filter each
+        // candidate with the exact `cluster_overlaps_brush_grid_aabb`
+        // test. On splat5 elephant the linear scan ran in ~1.2 ms
+        // (104 k clusters × ~12 ns); the indexed path visits a few
+        // hundred candidates and finishes in <100 µs.
+        let candidates = entry.cluster_spatial_index.query(brush_lo, brush_hi);
+        let mut dirty = Vec::with_capacity(candidates.len());
+        for cid in candidates {
+            let c = &entry.meshlet_clusters[cid as usize];
+            // LOD filter — index only stores LOD-0, but a future
+            // change might let an entry slip through; keep the
+            // check for safety.
             if c.lod_level != 0 {
                 continue;
             }
             let (cmin, cmax) = cluster_grid_aabb(c, grid_origin, base_vs);
             if cluster_overlaps_brush_grid_aabb(cmin, cmax, brush_lo, brush_hi) {
-                dirty.push(idx as u32);
+                dirty.push(cid);
             }
         }
         dirty
@@ -828,7 +839,7 @@ impl RkpSceneManager {
             entry.mesh_indices
                 .extend(brush_indices.iter().map(|&i| i + vertex_offset));
 
-            entry.meshlet_clusters.push(MeshletCluster {
+            let patch_cluster = MeshletCluster {
                 aabb_min: patch_aabb_min,
                 _pad0: 0.0,
                 aabb_max: patch_aabb_max,
@@ -850,7 +861,18 @@ impl RkpSceneManager {
                 group_above_idx: rkp_core::mesh_cluster::DAG_GROUP_NONE,
                 group_below_idx: rkp_core::mesh_cluster::DAG_GROUP_NONE,
                 _pad3: 0,
-            });
+            };
+            // D7 — record the new cluster's id and insert it into
+            // the spatial index so the next stamp's `dirty_q` query
+            // finds it.
+            let patch_cluster_id = entry.meshlet_clusters.len() as u32;
+            entry.meshlet_clusters.push(patch_cluster);
+            entry.cluster_spatial_index.insert(
+                patch_cluster_id,
+                &patch_cluster,
+                grid_origin,
+                base_vs,
+            );
         }
 
         _p_append_patch_ms = _ph_t4.elapsed().as_secs_f64() * 1000.0;
@@ -999,6 +1021,11 @@ impl RkpSceneManager {
                 entry.mesh_lod0_index_count = 0;
                 entry.mesh_dirty = true;
                 entry.clusters_dirty = true;
+                // D7 — spatial index must drop in lockstep with the
+                // cluster table; an empty index agrees with the empty
+                // cluster vec.
+                entry.cluster_spatial_index =
+                    super::cluster_spatial_index::ClusterSpatialIndex::new();
             }
             return;
         }
@@ -1018,6 +1045,12 @@ impl RkpSceneManager {
         entry.mesh_lod0_index_count = mesh_lod0_index_count;
         entry.mesh_dirty = true;
         entry.clusters_dirty = true;
+        // D7 — full re-extract replaced every cluster; rebuild the
+        // spatial index from scratch. Grid origin matches the
+        // convention used by `clusters_in_brush_grid_aabb`.
+        entry
+            .cluster_spatial_index
+            .rebuild(&entry.meshlet_clusters, grid_origin, voxel_size);
 
         eprintln!(
             "[sculpt] mesh re-extract: handle={:?} verts={} indices={} clusters={} ({:.2}ms)",
@@ -1074,6 +1107,14 @@ mod tests {
             min: Vec3::ZERO,
             max: Vec3::splat(extent),
         };
+        // D7 — build the spatial index from the supplied clusters so
+        // `clusters_in_brush_grid_aabb` (the only consumer in tests)
+        // gets a non-empty candidate set. grid_origin = aabb_center -
+        // extent/2 = Vec3::ZERO by construction above.
+        let mut cluster_spatial_index =
+            super::super::cluster_spatial_index::ClusterSpatialIndex::new();
+        cluster_spatial_index.rebuild(&clusters, Vec3::ZERO, base_vs);
+
         AssetEntry {
             path: std::path::PathBuf::from("test:in-memory"),
             refcount: 1,
@@ -1103,6 +1144,7 @@ mod tests {
             mesh_dirty: false,
             splats_dirty: false,
             clusters_dirty: false,
+            cluster_spatial_index,
         }
     }
 

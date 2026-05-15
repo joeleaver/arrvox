@@ -22,6 +22,7 @@
 //!   + `voxelize_sdf_fn` + `integrate_artifact` + `deallocate_geometry`.
 
 mod asset_load;
+mod cluster_spatial_index;
 mod manager;
 mod paint;
 mod sculpt;

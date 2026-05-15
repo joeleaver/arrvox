@@ -747,6 +747,19 @@ impl RkpSceneManager {
             None
         };
 
+        // D7 — build the cluster spatial index over the loaded
+        // LOD-0 clusters so the first sculpt stamp doesn't pay a
+        // full linear scan. Grid origin matches the convention in
+        // `clusters_in_brush_grid_aabb`: `aabb_center - extent/2`.
+        let mut cluster_spatial_index =
+            super::cluster_spatial_index::ClusterSpatialIndex::new();
+        {
+            let extent_f = (1u32 << handle.depth) as f32 * voxel_size;
+            let aabb_center = (aabb.min + aabb.max) * 0.5;
+            let grid_origin = aabb_center - glam::Vec3::splat(extent_f * 0.5);
+            cluster_spatial_index.rebuild(&meshlet_clusters, grid_origin, voxel_size);
+        }
+
         Ok(AssetEntry {
             path: rkp_path.to_path_buf(),
             refcount: 1,
@@ -771,6 +784,7 @@ impl RkpSceneManager {
             mesh_dirty: true,
             splats_dirty: true,
             clusters_dirty: true,
+            cluster_spatial_index,
         })
     }
 
