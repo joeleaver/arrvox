@@ -768,6 +768,10 @@ impl RkpSceneManager {
         // 8 corner cells in the map.
         let cells_min = brush_lo - IVec3::splat(3);
         let cells_max = brush_hi + IVec3::splat(3);
+        // D6.0 — split extract into collect_cell_map vs
+        // extract_mesh_region. The data-driven D6 follow-up needs to
+        // know which sub-phase dominates the 10-18 ms extract budget.
+        let _ph_t3a = std::time::Instant::now();
         let cells = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
             collect_cell_map_in_region(
@@ -778,6 +782,9 @@ impl RkpSceneManager {
                 cells_max,
             )
         };
+        let _p_collect_cells_ms = _ph_t3a.elapsed().as_secs_f64() * 1000.0;
+        let cells_count = cells.len();
+        let _ph_t3b = std::time::Instant::now();
 
         let (brush_verts, brush_indices) = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
@@ -794,6 +801,7 @@ impl RkpSceneManager {
                 self.leaf_attr_pool.bones_as_slice(),
             )
         };
+        let _p_extract_mesh_ms = _ph_t3b.elapsed().as_secs_f64() * 1000.0;
 
         _p_extract_ms = _ph_t3.elapsed().as_secs_f64() * 1000.0;
         let _ph_t4 = std::time::Instant::now();
@@ -920,7 +928,7 @@ impl RkpSceneManager {
             "[sculpt] V2 patch: handle={:?} dirty={} (sphere_outside={}) kept_tris={} dropped_tris={} \
              brush_patch verts={} tris={} total flat verts={} indices={} \
              lod_dirty={}/{} ({:.0}%) ({:.2}ms) \
-             [phases: setup={:.2} dirty_q={:.2} filter={:.2} extract={:.2} append={:.2} cc_walk={:.2}]",
+             [phases: setup={:.2} dirty_q={:.2} filter={:.2} extract={:.2} (collect={:.2} cells={} mesh={:.2}) append={:.2} cc_walk={:.2}]",
             handle,
             dirty.len(),
             d1_clusters_sphere_outside,
@@ -939,7 +947,9 @@ impl RkpSceneManager {
             },
             t0.elapsed().as_secs_f64() * 1000.0,
             _p_setup_ms, _p_dirty_query_ms, _p_filter_ms,
-            _p_extract_ms, _p_append_patch_ms, _p_cc_walk_ms,
+            _p_extract_ms,
+            _p_collect_cells_ms, cells_count, _p_extract_mesh_ms,
+            _p_append_patch_ms, _p_cc_walk_ms,
         );
 
         true
