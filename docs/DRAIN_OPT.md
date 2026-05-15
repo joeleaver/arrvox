@@ -1,17 +1,20 @@
 # Sculpt drain optimization plan
 
-**Status:** D0 + D1 + D2 + D6.0 + D6.1 + D6.2 + D6.3.{a,b,bugfix,c} +
-D7 shipped. D6.3.b's first drag measurement showed the dense-grid
-approach was a clear net win on high-density stamps (44 k-cell mesh
-9.71 → 5.58 ms) but added a ~0.7 ms fixed cost from per-stamp
-`Vec<u32>` alloc + memset that regressed easy stamps (16 k mesh
-1.88 → 2.72 ms; zero stamps under 8 ms). The same session caught a
-sentinel-collision bug (CELL_INTERIOR == CELL_GRID_EMPTY) that
-silently mis-classified INTERIOR corner cells in `build_cube_vertex`.
-D6.3.bugfix remapped CELL_INTERIOR → u32::MAX-1 in the grid;
-D6.3.c moved the two grids + `solid_cells` Vec onto
-`RkpSceneManager` with dirty-tracking so the per-stamp fixed cost
-drops to ~50 µs. D5 still deferred (bursty, not steady-state).
+**Status:** Session complete (2026-05-15). All phases shipped:
+D0, D1, D2, D6.0-D6.3, D6.3.bugfix, D7, D5.a, D5.b, D9.a, D9.b.
+
+| Stamp size | Pre-D6.3 | Post-session |
+|------------|----------|--------------|
+| ~16 k cells | 6.7 ms | 6.4 ms |
+| ~44 k cells | 21.7 ms | 7-8 ms |
+| ~60-77 k cells | 18-23 ms | 9-13 ms |
+
+Carve drags are firmly under the 8 ms target. Heavy Raise stamps
+(40 k+ SetInterior) remain 10-13 ms — that load is intrinsic
+(mesh extract over ~50 k cells + apply_delta over 42 k brick
+materialisations). Further levers (heavier apply_delta batching,
+rebuild_clusters sub-phase optimisation) get diminishing returns
+and were deferred as a deliberate stop point.
 
 This plan picks up where `docs/PERF_DEBT.md` Phase E left off. After
 Phase A–E, the sculpt per-stamp sim is **drain-bound at ~15 ms** —
@@ -218,6 +221,71 @@ positions vs reference). Fix: dedicated `CELL_INTERIOR_GRID =
 u32::MAX - 1` value, remapped at populate and reversed in the
 `build_cube_vertex` lookup closure. A real `leaf_attr_id` can
 never collide with `u32::MAX - 1`.
+
+### D5.a — instrument apply_delta sub-phases (`f1e4406e`)
+
+Splits the single-loop apply_delta into three sub-passes (Empty,
+SetInterior, Add) and times each with `Instant::elapsed`.
+Reordering across op-types is correctness-neutral because
+`compute_brush_edits` emits one edit per cell; within each pass
+edit order is preserved. `ApplyDeltaTiming` field on `AppliedDelta`
+carries the breakdown back; sculpt.rs's log gains
+`[apply_delta_sub: setup=… empty=…/Nns interior=…/Nns add=…/Nns
+take=…]`. First measurement showed the Empty pass was 60-81 ns/op
+on splat5 Carve, dominantly the 9-level octree descent — set up
+D5.b.
+
+### D5.b — BrickPathCache amortizes octree descent (`17fac44b`)
+
+Per-call cache stashing `(brick_coord, brick_node_idx,
+ancestor_path)`. Fast path validates `nodes[brick_node_idx]` is
+still in a valid terminator state, calls `mutate_at_brick` directly,
+walks the cached `ancestor_path` for `try_collapse`. Invalidates if
+any ancestor's value changes during collapse (the brick became
+orphaned). Iterative slow path captures the path during descent.
+
+Three `set_cell_*_cached` variants alongside the existing
+`set_cell_*`. apply_delta uses a fresh `BrickPathCache` per
+op-type pass to avoid cross-op-type stale entries. Four tests
+cover same-brick equivalence, brick-boundary crossings, mid-batch
+collapse, INTERIOR_NODE materialisation.
+
+Measured: 60-80 ns/op → 47-60 ns/op on Empty (~20-25 % cut). Less
+than the naive 50 % cache-hit-rate model because the hit path
+still walks `ancestor_path` (~9 levels × ~3 ns = 27 ns of
+unavoidable work). 0.3-0.5 ms saved per heavy Carve stamp; enough
+to push all Carve stamps under 8 ms.
+
+### D9.a — instrument compute_brush_edits sub-phases (`b51d736b`)
+
+Post-D5.b the largest remaining phase was `edits` at 1.5-2.0 ms.
+`ComputeBrushEditsTiming` adds counters for the outer AABB walk,
+SDF-cull survivors, `cell_state` calls, and the per-Empty
+`has_outside_solid_neighbor` 6-way probe count. Log tail:
+`[edits_sub: aabb=N sphere=N state=N neighbor=N <ns>/state]`.
+
+Surfaced the hidden 6× amplifier: Carve stamps invoke neighbor
+probes ~45-60 k times per stamp, each firing up to 6 extra
+`cell_state` calls (filtered by an SDF inside-brush check, so
+real cost is ~1-3 extra per probe = 50-90 k extra octree walks).
+Raise has no neighbor probes; clean 65 k descents × ~24 ns/call.
+
+### D9.b — CellStateCache amortizes cell_state descent (`dcd0a8d3`)
+
+Read-only counterpart to D5.b. 16-byte POD holding
+`(brick_coord, brick_node)`. `SparseOctree::cell_state_cached`
+fast-paths cache hits with a brick-pool lookup; slow path
+iteratively walks to brick depth and updates the cache.
+`compute_brush_edits` threads one cache through the outer
+(z, y, x) loop and into `has_outside_solid_neighbor` — shared
+so neighbor probes hit the same cache the main lookup warmed.
+
+Measured:
+* Raise edits 1.5 → 1.1 ms (~25 % cut); per-op 24 → 13-18 ns
+  on cache-hit-heavy stamps.
+* Carve edits 2.0 → 1.7 ms (~15 % cut); less benefit because
+  neighbor probes at brick edges thrash the cache for cells on
+  the boundary.
 
 ### D6.3.c — pool-reused scratch on SceneManager (`8da446cd`)
 
