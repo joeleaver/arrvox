@@ -136,6 +136,11 @@ pub struct LeafEdit {
 #[derive(Debug, Clone, Default)]
 pub struct SculptDelta {
     pub edits: Vec<LeafEdit>,
+    /// **D9.a** — per-call breakdown of the work
+    /// [`compute_brush_edits`] did to produce `edits`. Lets the caller
+    /// log how much of the `edits` phase budget went to outer-loop
+    /// iteration vs cell-state lookups vs neighbor probes.
+    pub timing: ComputeBrushEditsTiming,
 }
 
 impl SculptDelta {
@@ -153,6 +158,32 @@ impl SculptDelta {
     pub fn count_interior(&self) -> usize {
         self.edits.iter().filter(|e| matches!(e.op, LeafEditOp::SetInterior)).count()
     }
+}
+
+/// **D9.a** — instrumentation captured during [`compute_brush_edits`].
+/// All counters are per-call.
+///
+/// The dominant unknowns are which sub-cost dominates the 1.6-2.4 ms
+/// edits phase observed on splat5 Carve drags: the AABB walk itself,
+/// the per-cell SDF cull, the [`SparseOctree::cell_state`] octree
+/// walks, or the per-Empty-cell [`has_outside_solid_neighbor`] (which
+/// fires up to 6 extra cell_state calls).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ComputeBrushEditsTiming {
+    /// Total cells the outer `(z, y, x)` triple-loop iterated.
+    pub n_aabb_cells: u32,
+    /// Cells that survived the SDF brush-sphere cull (`d <= 0`).
+    pub n_inside_sphere: u32,
+    /// Cells whose state was actually resolved via
+    /// [`SparseOctree::cell_state`] (= `n_inside_sphere`, minus any
+    /// `OutOfBounds` early-outs).
+    pub n_cell_state_calls: u32,
+    /// Invocations of [`has_outside_solid_neighbor`] from the Carve
+    /// path's "Empty cell" branch. Each fires up to 6 extra
+    /// `cell_state` calls (face-neighbor checks).
+    pub n_neighbor_calls: u32,
+    /// Wall-clock time of the whole `compute_brush_edits` call body.
+    pub t_total_ns: u64,
 }
 
 /// Attributes to write into a freshly-allocated leaf slot. Returned by
@@ -322,31 +353,49 @@ pub fn compute_brush_edits(
     brick_pool: &BrickPool,
     op: BrushOp,
 ) -> SculptDelta {
+    use std::time::Instant;
+
     let extent = octree.extent();
     let (lo, hi) = brush_cell_range(&op, extent);
     if lo.x >= hi.x || lo.y >= hi.y || lo.z >= hi.z {
         return SculptDelta::default();
     }
 
+    let t_start = Instant::now();
     let mut edits = Vec::new();
+    let mut n_aabb_cells = 0u32;
+    let mut n_inside_sphere = 0u32;
+    let mut n_cell_state_calls = 0u32;
+    let mut n_neighbor_calls = 0u32;
     let half_voxel = 0.5; // grid-unit coords, so ½ voxel == 0.5
     for z in lo.z..hi.z {
         for y in lo.y..hi.y {
             for x in lo.x..hi.x {
+                n_aabb_cells += 1;
                 let coord = UVec3::new(x, y, z);
                 let cell_center = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
                 let d = brush_sdf(cell_center, &op);
                 if d > 0.0 {
                     continue;
                 }
+                n_inside_sphere += 1;
                 let state = octree.cell_state(coord, brick_pool);
+                n_cell_state_calls += 1;
                 if matches!(state, CellState::OutOfBounds) {
                     continue;
                 }
                 let within_half = d >= -half_voxel;
                 match op.mode {
                     BrushMode::Carve => emit_carve_edits(
-                        &mut edits, coord, cell_center, state, within_half, &op, octree, brick_pool,
+                        &mut edits,
+                        coord,
+                        cell_center,
+                        state,
+                        within_half,
+                        &op,
+                        octree,
+                        brick_pool,
+                        &mut n_neighbor_calls,
                     ),
                     BrushMode::Raise => emit_raise_edits(
                         &mut edits, coord, cell_center, state, within_half, &op,
@@ -359,7 +408,17 @@ pub fn compute_brush_edits(
             }
         }
     }
-    SculptDelta { edits }
+
+    SculptDelta {
+        edits,
+        timing: ComputeBrushEditsTiming {
+            n_aabb_cells,
+            n_inside_sphere,
+            n_cell_state_calls,
+            n_neighbor_calls,
+            t_total_ns: t_start.elapsed().as_nanos() as u64,
+        },
+    }
 }
 
 /// Apply the Carve rule set at one cell. The classification was done
@@ -375,6 +434,7 @@ fn emit_carve_edits(
     op: &BrushOp,
     octree: &SparseOctree,
     brick_pool: &BrickPool,
+    n_neighbor_calls: &mut u32,
 ) {
     match state {
         CellState::Solid(_) => {
@@ -398,6 +458,7 @@ fn emit_carve_edits(
             // interior AND outside the brush, the brush is crossing
             // an interior cavity and the EMPTY cell becomes a new
             // wall facing into the cavity.
+            *n_neighbor_calls += 1;
             if has_outside_solid_neighbor(coord, op, octree, brick_pool) {
                 let normal = brush_outward_normal(cell_center, op);
                 edits.push(LeafEdit {
@@ -936,7 +997,7 @@ mod tests {
         }
 
         // Build a synthetic mixed delta manually.
-        let delta = SculptDelta { edits: vec![
+        let delta = SculptDelta { timing: Default::default(), edits: vec![
             LeafEdit { coord: UVec3::new(0, 0, 0), op: LeafEditOp::Remove },
             LeafEdit { coord: UVec3::new(1, 0, 0), op: LeafEditOp::Remove },
             LeafEdit { coord: UVec3::new(0, 1, 0), op: LeafEditOp::Add {
@@ -1089,7 +1150,7 @@ mod tests {
         // Pre-seed a leaf so its Remove path records the finest-leaf write.
         t.insert(UVec3::new(0, 0, 0), 42);
 
-        let delta = SculptDelta { edits: vec![
+        let delta = SculptDelta { timing: Default::default(), edits: vec![
             LeafEdit { coord: UVec3::new(0, 0, 0), op: LeafEditOp::Remove },
             LeafEdit { coord: UVec3::new(1, 0, 0), op: LeafEditOp::Add {
                 material: 7, normal: Vec3::Y,
@@ -1112,7 +1173,7 @@ mod tests {
         let mut t = SparseOctree::new(4, 1.0); // depth 4 → grows on first mutation
         let mut pool = fresh_pool();
         let initial = t.node_count();
-        let delta = SculptDelta { edits: vec![
+        let delta = SculptDelta { timing: Default::default(), edits: vec![
             LeafEdit { coord: UVec3::new(2, 2, 2), op: LeafEditOp::Add {
                 material: 1, normal: Vec3::Y,
             }},

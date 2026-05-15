@@ -482,14 +482,20 @@ impl RkpSceneManager {
         // wall-clock from the three split passes in `apply_delta`,
         // plus the mutation-log setup/take costs. ns/op figures
         // surface which op-type to optimize first.
+        //
+        // D9.a — compute_brush_edits sub-breakdown: counters surface
+        // how much of the `edits` phase budget went to the outer
+        // AABB walk vs cell_state octree lookups vs neighbor probes.
         let ad_timing = applied.timing;
+        let ce_timing = delta.timing;
         let ns_per = |t_ns: u64, n: u32| if n == 0 { 0.0 } else { t_ns as f64 / n as f64 };
         eprintln!(
             "[sculpt] stamp handle={:?} mode={:?} edits={} removed={} \
              applied(adds={} freed={} interior={}) (depth={}, base_vs={:.5}) total={:.2}ms \
              [phases: resolve={:.2} edits={:.2} resolve_rm={:.2} apply_delta={:.2} \
              octree_sync={:.2} leaf_attr={:.2} rebuild_clusters={:.2}] \
-             [apply_delta_sub: setup={:.3} empty={:.3}/{:.0}ns interior={:.3}/{:.0}ns add={:.3}/{:.0}ns take={:.3}]",
+             [apply_delta_sub: setup={:.3} empty={:.3}/{:.0}ns interior={:.3}/{:.0}ns add={:.3}/{:.0}ns take={:.3}] \
+             [edits_sub: aabb={} sphere={} state={} neighbor={} {:.0}ns/state]",
             handle, mode, delta.len(), removed.len(),
             applied.allocated_slots.len(), applied.freed_slots.len(),
             delta.count_interior(), depth, base_vs,
@@ -505,6 +511,16 @@ impl RkpSceneManager {
             ad_timing.t_loop_add_ns as f64 / 1.0e6,
             ns_per(ad_timing.t_loop_add_ns, ad_timing.n_add),
             ad_timing.t_log_take_ns as f64 / 1.0e6,
+            ce_timing.n_aabb_cells,
+            ce_timing.n_inside_sphere,
+            ce_timing.n_cell_state_calls + ce_timing.n_neighbor_calls * 6,
+            ce_timing.n_neighbor_calls,
+            // Total cell_state-equivalent calls (1 per inside-sphere cell
+            // + 6 per neighbor probe) divided into the whole compute time.
+            ns_per(
+                ce_timing.t_total_ns,
+                ce_timing.n_cell_state_calls + ce_timing.n_neighbor_calls * 6,
+            ),
         );
 
         Some(SculptApplyResult {
