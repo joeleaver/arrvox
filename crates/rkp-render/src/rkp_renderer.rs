@@ -193,6 +193,14 @@ pub struct RkpRenderer {
     /// Phase 5 uploads but does not yet consume — validates the
     /// upload path without touching the hot dispatch.
     mesh_cluster_buffers: Vec<Option<(wgpu::Buffer, u32)>>,
+    /// `RKP_RASTER_DIAG=1` per-asset cluster aggregate counts captured
+    /// at the most-recent `upload_mesh_clusters_for_asset` call.
+    /// Indexed by raw asset handle. `None` when no upload has happened
+    /// or the diag flag isn't set. Used by `dispatch_mesh`'s
+    /// `RKP_RASTER_DIAG=1` print to surface the per-LOD admit shape
+    /// of what's actually being rasterized this frame without paying
+    /// the per-frame scan cost when diag is off.
+    mesh_cluster_diag: Vec<Option<MeshClusterDiag>>,
     /// Per-asset vertex/index buffer cache for the procedural
     /// proxy-mesh path. Separate from `mesh_buffers` because the
     /// proxy vertex layout is `ProxyVertex` (32 B; material + color
@@ -214,6 +222,29 @@ pub struct RkpRenderer {
     /// via `set_shadow_csm_threshold_falloff`. Default 2.0; range
     /// clamped 1.0..6.0.
     shadow_csm_threshold_falloff: f32,
+}
+
+/// `RKP_RASTER_DIAG=1` aggregated cluster-state snapshot captured at
+/// upload time. Mirrors the load-time `[raster_diag load]` line but
+/// reflects whatever is currently on the GPU (post-sculpt etc.). Per-LOD
+/// vectors are sized to `max_lod + 1`.
+#[derive(Debug, Clone, Default)]
+struct MeshClusterDiag {
+    clusters_per_lod: Vec<u32>,
+    indices_per_lod: Vec<u32>,
+    lod_dirty_per_lod: Vec<u32>,
+    /// "Post-bake patch" heuristic: LOD-0 cluster with no DAG membership
+    /// on either side AND a leaf+root error pair. v5 files (no DAG
+    /// topology) light up every cluster under this rule, so the print
+    /// site qualifies the number with `dag_present` from the cluster
+    /// buffer's first entry's `group_above_idx != 0` heuristic — good
+    /// enough for diagnosing the regression.
+    patch_count: u32,
+    lod_dirty_total: u32,
+    /// Total `index_count` across every cluster (= triangle count × 3).
+    /// Compare against the actually-admitted index count surfaced in
+    /// `RKP_MESH_LOD_STATS` to see how much LOD culling is happening.
+    total_indices: u32,
 }
 
 /// Per-asset mesh buffer cache state. Tracks how many bytes have
@@ -385,6 +416,7 @@ impl RkpRenderer {
             mesh_glass_debug_force,
             mesh_buffers: Vec::new(),
             mesh_cluster_buffers: Vec::new(),
+            mesh_cluster_diag: Vec::new(),
             proxy_mesh_buffers: Vec::new(),
             primary_mode,
             device: device.clone(),
@@ -600,10 +632,63 @@ impl RkpRenderer {
         if idx >= self.mesh_cluster_buffers.len() {
             self.mesh_cluster_buffers.resize_with(idx + 1, || None);
         }
+        if idx >= self.mesh_cluster_diag.len() {
+            self.mesh_cluster_diag.resize_with(idx + 1, || None);
+        }
         if clusters.is_empty() {
             let was_present = self.mesh_cluster_buffers[idx].is_some();
             self.mesh_cluster_buffers[idx] = None;
+            self.mesh_cluster_diag[idx] = None;
             return was_present;
+        }
+        // RKP_RASTER_DIAG=1 — aggregate per-LOD counts at upload time
+        // so the per-frame dispatch print is O(active draws), not
+        // O(total clusters). The walk is ~64 ns per cluster and only
+        // fires when the diag flag is set, so it stays free in the
+        // default config.
+        if std::env::var("RKP_RASTER_DIAG").is_ok() {
+            use rkp_core::mesh_cluster::{
+                CLUSTER_FLAG_LOD_DIRTY, DAG_GROUP_NONE, PARENT_GROUP_ERROR_ROOT,
+            };
+            let max_lod = clusters.iter().map(|c| c.lod_level).max().unwrap_or(0) as usize;
+            let mut diag = MeshClusterDiag {
+                clusters_per_lod: vec![0; max_lod + 1],
+                indices_per_lod: vec![0; max_lod + 1],
+                lod_dirty_per_lod: vec![0; max_lod + 1],
+                ..Default::default()
+            };
+            // `dag_present` heuristic: any cluster with a non-NONE DAG
+            // pointer means the file is v6 (or has been sculpted into v6
+            // shape). Used to qualify the patch-count print: v5 files
+            // light up every cluster under "both DAG_GROUP_NONE", so the
+            // raw number is only meaningful when dag_present.
+            let dag_present = clusters
+                .iter()
+                .any(|c| c.group_above_idx != DAG_GROUP_NONE || c.group_below_idx != DAG_GROUP_NONE);
+            for c in clusters {
+                let l = c.lod_level as usize;
+                if l < diag.clusters_per_lod.len() {
+                    diag.clusters_per_lod[l] += 1;
+                    diag.indices_per_lod[l] += c.index_count;
+                    if c.flags & CLUSTER_FLAG_LOD_DIRTY != 0 {
+                        diag.lod_dirty_per_lod[l] += 1;
+                    }
+                }
+                if dag_present
+                    && c.lod_level == 0
+                    && c.group_above_idx == DAG_GROUP_NONE
+                    && c.group_below_idx == DAG_GROUP_NONE
+                    && c.cluster_error == 0.0
+                    && c.parent_group_error >= PARENT_GROUP_ERROR_ROOT * 0.5
+                {
+                    diag.patch_count += 1;
+                }
+                diag.total_indices += c.index_count;
+            }
+            diag.lod_dirty_total = diag.lod_dirty_per_lod.iter().sum();
+            self.mesh_cluster_diag[idx] = Some(diag);
+        } else {
+            self.mesh_cluster_diag[idx] = None;
         }
         let bytes: &[u8] = bytemuck::cast_slice(clusters);
         let needed = bytes.len() as u64;
@@ -642,6 +727,9 @@ impl RkpRenderer {
     pub fn release_mesh_clusters_for_asset(&mut self, handle_raw: u32) {
         let idx = handle_raw as usize;
         if let Some(slot) = self.mesh_cluster_buffers.get_mut(idx) {
+            *slot = None;
+        }
+        if let Some(slot) = self.mesh_cluster_diag.get_mut(idx) {
             *slot = None;
         }
     }
@@ -1281,6 +1369,72 @@ impl RkpRenderer {
             );
         }
 
+        // RKP_RASTER_DIAG=1 — per-frame, per-active-asset cluster state.
+        // Surfaces the hypothesis behind the mesh_raster regression
+        // (LOD_DIRTY clusters force-admit at LOD-0 unconditionally;
+        // post-bake patch clusters from sculpt always Karis-admit).
+        // Throttled to once per ~60 frames so the log stays readable;
+        // duplicate `asset_handle_raw` entries (multiple instances of
+        // one asset) collapse to a single line.
+        if std::env::var("RKP_RASTER_DIAG").is_ok() {
+            // Frame counter lives on the profiler-style frame counter;
+            // approximate via a static AtomicU64 so we don't need to
+            // plumb frame_idx through here.
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static DIAG_FRAME: AtomicU64 = AtomicU64::new(0);
+            let f = DIAG_FRAME.fetch_add(1, Ordering::Relaxed);
+            if f % 60 == 0 {
+                let mut printed: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+                for d in draws {
+                    if !printed.insert(d.asset_handle_raw) {
+                        continue;
+                    }
+                    let total_clusters = self
+                        .mesh_cluster_buffer(d.asset_handle_raw)
+                        .map(|(_, c)| c)
+                        .unwrap_or(0);
+                    let diag = self
+                        .mesh_cluster_diag
+                        .get(d.asset_handle_raw as usize)
+                        .and_then(|s| s.as_ref());
+                    match diag {
+                        Some(diag) => {
+                            let per_lod: String = diag
+                                .clusters_per_lod
+                                .iter()
+                                .enumerate()
+                                .map(|(l, &n)| {
+                                    format!(
+                                        "lod{l}={}c/{}tri/dirty{}",
+                                        n,
+                                        diag.indices_per_lod[l] / 3,
+                                        diag.lod_dirty_per_lod[l],
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            eprintln!(
+                                "[raster_diag frame] asset={} total_clusters={} total_tris={} | {} | LOD_DIRTY={} patch_clusters={}",
+                                d.asset_handle_raw,
+                                total_clusters,
+                                diag.total_indices / 3,
+                                per_lod,
+                                diag.lod_dirty_total,
+                                diag.patch_count,
+                            );
+                        }
+                        None => {
+                            eprintln!(
+                                "[raster_diag frame] asset={} total_clusters={} (diag not captured — upload before setting RKP_RASTER_DIAG?)",
+                                d.asset_handle_raw, total_clusters,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         if primary_disabled {
             // Diagnostic isolation mode: skip the raster + resolve
             // GPU work entirely. The per-slot setup above still ran
@@ -1545,13 +1699,17 @@ impl RkpRenderer {
 
         // Per-cascade base pixel threshold + falloff. Each cascade
         // scales the base by `falloff^cascade_index` so the far
-        // cascade culls hardest. Default base 2.0 (one LOD coarser
-        // than primary's 1.0) and falloff 4.0 → cascades 0..3 use
-        // thresholds {2, 8, 32, 128}, which keeps far-cascade cluster
-        // counts in the ~1 % range of the primary path. Override
-        // with `RKP_MESH_SHADOW_LOD_THRESHOLD` (base) and
-        // `RKP_CSM_THRESHOLD_FALLOFF` (per-cascade scale).
-        const PIXEL_THRESHOLD_SHADOW: f32 = 2.0;
+        // cascade culls hardest. Default base 4.0 (was 2.0 — bumped
+        // after measuring that base=2.0 admitted cascade-0 = 92k
+        // clusters vs primary 48k on splat5 elephant; base=4.0
+        // brings shadow admit back in line with primary and cuts
+        // mesh_shadow_render[0] from 1.6 ms to 0.8 ms with no
+        // visible shadow quality change in the test scene — ortho
+        // shadow pixels are coarser than camera pixels, so shadows
+        // can tolerate a higher pixel-error budget than primary
+        // visibility). Override with `RKP_MESH_SHADOW_LOD_THRESHOLD`
+        // (base) and `RKP_CSM_THRESHOLD_FALLOFF` (per-cascade scale).
+        const PIXEL_THRESHOLD_SHADOW: f32 = 4.0;
         let base_threshold = pixel_threshold_env(
             "RKP_MESH_SHADOW_LOD_THRESHOLD",
             PIXEL_THRESHOLD_SHADOW,
@@ -1596,26 +1754,19 @@ impl RkpRenderer {
             slot_active[slot] = true;
         }
 
-        // ── Per-cascade loop ───────────────────────────────────────
+        // ── Phase 1: per-cascade × per-slot prep (no GPU work) ─────
+        // Hoisted out of the original per-cascade render loop so all
+        // four cascades' params + count clears are queued BEFORE the
+        // merged LOD-select compute pass. Lets phase 2 issue one big
+        // compute pass instead of four small ones, which removes ~3
+        // compute-pass-boundary stalls per frame.
+        let collect_pipestats = pipestats_enabled;
+        let pixel_thresholds: Vec<f32> = (0..cascade_count)
+            .map(|c| base_threshold * threshold_falloff.powi(c as i32))
+            .collect();
         for cascade in 0..cascade_count {
-            // Cascade-scaled pixel threshold: cascade 0 admits more
-            // (sharp shadows near camera); cascade N-1 admits very
-            // few (cheap far coverage). Keeps total shadow GPU cost
-            // comparable to the single-cascade baseline.
-            let pixel_threshold =
-                base_threshold * threshold_falloff.powi(cascade as i32);
-
-            // LOD admit stats are still pass-shared (one buffer per
-            // primary/shadow), so we collect on cascade 0 only —
-            // mixing all cascades' atomicAdds would double-count.
-            // Pipestats has dedicated per-cascade slots in the query
-            // set, so it runs every cascade.
+            let pixel_threshold = pixel_thresholds[cascade];
             let collect_stats = lod_stats_enabled && cascade == 0;
-            let collect_pipestats = pipestats_enabled;
-
-            // Per-slot prep for this cascade: ensure args buffer +
-            // (re)build g2 bg + write params with this cascade's
-            // pixel threshold.
             for (slot, d) in draws.iter().enumerate() {
                 if !slot_active[slot] {
                     continue;
@@ -1671,18 +1822,23 @@ impl RkpRenderer {
                     bytemuck::bytes_of(&params),
                 );
             }
+        }
 
-            // 0. Shadow-side LOD-select compute pass for this cascade.
-            if !direct_mode {
-                if collect_stats {
-                    viewport.lod_stats_drain_shadow("shadow");
-                    viewport.lod_stats_clear_shadow(encoder);
-                }
-
-                // Zero this cascade's per-slot atomic count buffers
-                // before the dispatch — same role as the primary
-                // path; consumed by `multi_draw_indexed_indirect_count`
-                // in the matching mesh_shadow_render below.
+        // ── Phase 2: merged LOD-select compute pass (all cascades) ─
+        // One compute pass holds every cascade's dispatch back-to-back.
+        // Cascades write to disjoint args+count buffers and read shared
+        // cluster tables — no inter-dispatch data dependency, so the
+        // GPU pipelines them freely. The previous structure issued one
+        // compute pass per cascade interleaved with the shadow render
+        // passes; each compute-pass boundary serialized the GPU.
+        if !direct_mode {
+            // Stats lifecycle is once per pass, not per cascade (the
+            // admit-stats buffer is pass-shared).
+            if lod_stats_enabled {
+                viewport.lod_stats_drain_shadow("shadow");
+                viewport.lod_stats_clear_shadow(encoder);
+            }
+            for cascade in 0..cascade_count {
                 for (slot, _) in draws.iter().enumerate() {
                     if !slot_active[slot] {
                         continue;
@@ -1693,18 +1849,18 @@ impl RkpRenderer {
                         None,
                     );
                 }
+            }
 
-                let q_lod = self.profiler.begin_query(
-                    &format!("mesh_shadow_lod_select[{cascade}]"),
-                    encoder,
-                );
-                {
-                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("mesh_shadow_lod_select"),
-                        timestamp_writes: None,
-                    });
+            let q_lod_all = self
+                .profiler
+                .begin_query("mesh_shadow_lod_select_all", encoder);
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("mesh_shadow_lod_select_all"),
+                    timestamp_writes: None,
+                });
+                for cascade in 0..cascade_count {
                     if collect_pipestats {
-                        // Slots 2..6 = mesh_shadow_lod_select[0..3].
                         cpass.begin_pipeline_statistics_query(
                             &viewport.mesh_pipestats_query_set,
                             2 + cascade as u32,
@@ -1732,13 +1888,16 @@ impl RkpRenderer {
                         cpass.end_pipeline_statistics_query();
                     }
                 }
-                self.profiler.end_query(encoder, q_lod);
-
-                if collect_stats {
-                    viewport.lod_stats_finalize_shadow(encoder);
-                }
             }
+            self.profiler.end_query(encoder, q_lod_all);
 
+            if lod_stats_enabled {
+                viewport.lod_stats_finalize_shadow(encoder);
+            }
+        }
+
+        // ── Phase 3: per-cascade render passes (unchanged loop) ────
+        for cascade in 0..cascade_count {
             // 1. Depth-only render for this cascade. Vertex transforms
             //    through `cascades[cascade].view_proj`; rasterizer
             //    fills `mesh_shadow_depth_views[cascade]`.
@@ -2282,18 +2441,26 @@ impl RkpRenderer {
         // front of them, rather than stamping over the glass
         // composite.
         if in_situ {
+            // Sub-profile every dispatch under the vol pass — the original
+            // single `vol` timer hid which of the five sub-dispatches dominated.
+            // The umbrella `vol` query stays so existing dashboards / log
+            // parsers keep working; the per-dispatch queries nest inside it.
             let q = self.profiler.begin_query("vol", encoder);
-            // Fog + cloud are separate passes now. Fog runs over every pixel
-            // with only fog bindings; cloud runs over sky tiles with its own
-            // bindings. Keeping them split avoids the marker-bleed artefact
-            // the old combined shader produced when the hardware bilinear
-            // sampler blended the history validity sentinel across sky/voxel
-            // boundaries.
+            let q_fog = self.profiler.begin_query("vol_fog_march", encoder);
             viewport.volumetric.dispatch_fog_march(encoder);
+            self.profiler.end_query(encoder, q_fog);
+            let q_cloud = self.profiler.begin_query("vol_cloud_march", encoder);
             viewport.volumetric.dispatch_cloud_march(encoder);
+            self.profiler.end_query(encoder, q_cloud);
+            let q_hist = self.profiler.begin_query("vol_history", encoder);
             viewport.volumetric.update_history(encoder);
+            self.profiler.end_query(encoder, q_hist);
+            let q_sun = self.profiler.begin_query("vol_sun_atten", encoder);
             viewport.volumetric.dispatch_sun_atten(encoder);
+            self.profiler.end_query(encoder, q_sun);
+            let q_comp = self.profiler.begin_query("vol_composite", encoder);
             viewport.volumetric.dispatch_composite(encoder);
+            self.profiler.end_query(encoder, q_comp);
             self.profiler.end_query(encoder, q);
         } else {
             // Isolation: keep the texture chain valid by copying shade

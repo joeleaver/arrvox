@@ -747,6 +747,74 @@ impl RkpSceneManager {
             None
         };
 
+        // `RKP_RASTER_DIAG=1` — per-LOD breakdown of the loaded cluster
+        // table, plus counts of any flags / topology states that bypass
+        // the Karis LOD pyramid. Used to track the mesh_raster regression
+        // hypothesis: an asset whose on-disk cluster table already carries
+        // `LOD_DIRTY` flags (from sculpt's `mark_lod_dirty_chains`) or
+        // unbounded post-bake patch clusters (lod=0 + both DAG_GROUP_NONE
+        // + cluster_error=0 + parent_group_error=ROOT) will force-admit
+        // at LOD-0 on every frame, inflating raster cost.
+        if std::env::var("RKP_RASTER_DIAG").is_ok() && !meshlet_clusters.is_empty() {
+            use rkp_core::mesh_cluster::{CLUSTER_FLAG_LOD_DIRTY, DAG_GROUP_NONE, PARENT_GROUP_ERROR_ROOT};
+            let max_lod = meshlet_clusters.iter().map(|c| c.lod_level).max().unwrap_or(0);
+            let mut clusters_per_lod = vec![0u32; max_lod as usize + 1];
+            let mut indices_per_lod = vec![0u32; max_lod as usize + 1];
+            let mut lod_dirty_per_lod = vec![0u32; max_lod as usize + 1];
+            let mut patch_count = 0u32;
+            let dag_present = !dag_groups.is_empty();
+            for c in &meshlet_clusters {
+                let l = c.lod_level as usize;
+                if l < clusters_per_lod.len() {
+                    clusters_per_lod[l] += 1;
+                    indices_per_lod[l] += c.index_count;
+                    if c.flags & CLUSTER_FLAG_LOD_DIRTY != 0 {
+                        lod_dirty_per_lod[l] += 1;
+                    }
+                }
+                // "Post-bake patch" heuristic: LOD-0 cluster with no DAG
+                // membership on either side AND a leaf+root error pair.
+                // Bake-time LOD-0 leaves have `group_below_idx == NONE`
+                // but `group_above_idx` points into `dag_groups` when the
+                // DAG goes past LOD-0; only sculpt's appended patches
+                // have BOTH set to NONE. For v5 files (no DAG topology),
+                // every cluster has both = NONE so this heuristic is
+                // meaningless — gate on `dag_present`.
+                if dag_present
+                    && c.lod_level == 0
+                    && c.group_above_idx == DAG_GROUP_NONE
+                    && c.group_below_idx == DAG_GROUP_NONE
+                    && c.cluster_error == 0.0
+                    && c.parent_group_error >= PARENT_GROUP_ERROR_ROOT * 0.5
+                {
+                    patch_count += 1;
+                }
+            }
+            let per_lod_str: String = clusters_per_lod
+                .iter()
+                .enumerate()
+                .map(|(l, &n)| {
+                    format!(
+                        "lod{l}={}c/{}tri (dirty={})",
+                        n,
+                        indices_per_lod[l] / 3,
+                        lod_dirty_per_lod[l],
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let lod_dirty_total: u32 = lod_dirty_per_lod.iter().sum();
+            eprintln!(
+                "[raster_diag load] {}: total={} | {} | LOD_DIRTY={} patch_clusters={} dag_present={}",
+                rkp_path.display(),
+                meshlet_clusters.len(),
+                per_lod_str,
+                lod_dirty_total,
+                patch_count,
+                dag_present,
+            );
+        }
+
         // D7 — build the cluster spatial index over the loaded
         // LOD-0 clusters so the first sculpt stamp doesn't pay a
         // full linear scan. Grid origin matches the convention in
