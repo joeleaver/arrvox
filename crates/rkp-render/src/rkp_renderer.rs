@@ -1699,17 +1699,17 @@ impl RkpRenderer {
 
         // Per-cascade base pixel threshold + falloff. Each cascade
         // scales the base by `falloff^cascade_index` so the far
-        // cascade culls hardest. Default base 4.0 (was 2.0 — bumped
-        // after measuring that base=2.0 admitted cascade-0 = 92k
-        // clusters vs primary 48k on splat5 elephant; base=4.0
-        // brings shadow admit back in line with primary and cuts
-        // mesh_shadow_render[0] from 1.6 ms to 0.8 ms with no
-        // visible shadow quality change in the test scene — ortho
-        // shadow pixels are coarser than camera pixels, so shadows
-        // can tolerate a higher pixel-error budget than primary
-        // visibility). Override with `RKP_MESH_SHADOW_LOD_THRESHOLD`
+        // cascade culls hardest. Default base 6.0 (was 4.0 — bumped
+        // after a threshold sweep on splat5 elephant: base=4 vs base=6
+        // cut cascade-0 admit count 47.9k → 26.8k and mesh_shadow_render[0]
+        // 0.80 → 0.44 ms, gaining ~12 fps at every primary-threshold
+        // setting. Shadow visuals indistinguishable in the test scene —
+        // ortho shadow pixels are several times coarser than perspective
+        // camera pixels, so shadows can tolerate a much higher pixel-
+        // error budget than primary visibility before LOD pop is
+        // visible. Override with `RKP_MESH_SHADOW_LOD_THRESHOLD`
         // (base) and `RKP_CSM_THRESHOLD_FALLOFF` (per-cascade scale).
-        const PIXEL_THRESHOLD_SHADOW: f32 = 4.0;
+        const PIXEL_THRESHOLD_SHADOW: f32 = 6.0;
         let base_threshold = pixel_threshold_env(
             "RKP_MESH_SHADOW_LOD_THRESHOLD",
             PIXEL_THRESHOLD_SHADOW,
