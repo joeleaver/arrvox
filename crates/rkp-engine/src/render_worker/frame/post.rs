@@ -58,27 +58,27 @@ pub(super) fn finalize_frame(
     //    don't back up. Whether to fire the editor pixel callback
     //    is gated on TWO things:
     //
-    //    a) `new_snapshot_consumed` — there's no point shipping
-    //       pixels for an iteration that just re-rendered the same
-    //       sim state. The visual content is identical to whatever
-    //       we shipped last time. With Uncapped render at 200 Hz
-    //       and 60 Hz sim, this alone drops pixel ships from 200
-    //       /sec to 60 /sec — matching display refresh.
+    //    a) (HISTORICAL) `new_snapshot_consumed` — was used to gate
+    //       on fresh sim state, but that loses the benefit of render-
+    //       side interpolation: between two sim snapshots the render
+    //       thread blends per iteration (`alpha` walks 0 → 1), so each
+    //       interpolated frame is visually distinct even on the same
+    //       snapshot pair. Gating on fresh-snapshot capped the editor
+    //       at sim rate (60 fps); dropping it lets the editor see the
+    //       interpolated rate up to the rate-limit below.
     //
-    //    b) `MIN_FRAME_CALLBACK_INTERVAL` — soft cap that handles
-    //       the edge case where sim itself runs faster than
-    //       display refresh (Uncapped sim, very fast scenes).
-    //       Without this an Uncapped sim at 600 Hz would still try
-    //       to ship 600 frames/sec to the editor and saturate
-    //       rinch's surface buffer Mutex.
+    //    b) `MIN_FRAME_CALLBACK_INTERVAL` — hard cap (~120 Hz) that
+    //       protects the rinch surface buffer Mutex from starving the
+    //       editor main thread when render iterates faster than the
+    //       editor can composite. Always applied.
     //
-    //    Together: pixel ship rate = min(sim_rate, display_rate),
-    //    which is exactly what the editor surface can usefully
-    //    consume.
+    //    Net: pixel ship rate = min(render_rate, 120 Hz). Sim rate
+    //    stops gating the editor-visible fps.
+    let _ = new_snapshot_consumed; // kept in signature for callers/tests
     let now = std::time::Instant::now();
     let time_ok = now.duration_since(state.last_frame_callback)
         >= MIN_FRAME_CALLBACK_INTERVAL;
-    let ship_pixels = new_snapshot_consumed && time_ok;
+    let ship_pixels = time_ok;
     // Interval since the previous successful pixel ship. Sampled
     // BEFORE we update `last_frame_callback` below so we get the
     // gap between ship N-1 and ship N. Only populated when at least
