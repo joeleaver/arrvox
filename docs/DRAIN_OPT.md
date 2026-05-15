@@ -1,8 +1,10 @@
 # Sculpt drain optimization plan
 
-**Status:** D0 + D1 + D2 shipped (2026-05-14). D5 / D6 deferred until
-the user runs a real drag-stamp session with the new `[sculpt-detail]`
-logs and reports the per-phase breakdown.
+**Status:** D0 + D1 + D2 + D6.0 + D6.1 shipped (2026-05-14). Real
+measurements after D2 confirmed `extract` (10-18 ms) was the
+bottleneck, not `filter` (D1+D2 already cut filter to 0.5-1.2 ms).
+D6.1 attacks extract directly. D5 still deferred — `apply_delta`
+peaks at 4 ms but is bursty and rare.
 
 This plan picks up where `docs/PERF_DEBT.md` Phase E left off. After
 Phase A–E, the sculpt per-stamp sim is **drain-bound at ~15 ms** —
@@ -78,9 +80,49 @@ Order preserved (rayon `par_iter().collect()` is order-stable).
 `d1_clusters_sphere_outside` counter migrated to `AtomicUsize` so
 each rayon worker can bump it via `fetch_add(Relaxed)`.
 
+### D6.0 — split extract timing into collect + mesh (`e8771047`)
+
+Real measurements after D2 confirmed extract was the bottleneck
+(10-18 ms per stamp) — but the phase has two distinct callees
+(`collect_cell_map_in_region` and `extract_mesh_region_from_cells`)
+and the lumped log line couldn't tell them apart. D6.0 splits the
+timing so the next optimization can target the right one.
+
+The `[sculpt] V2 patch …` log gains:
+
+```
+extract=X.XX (collect=A.AA cells=N mesh=B.BB)
+```
+
+`cells` is `HashMap::len()` of the collected solid set — useful
+for sanity-checking the iteration cost (loop size scales with
+`cells_count` after D6.1).
+
+### D6.1 — iterate cells map directly in extract loop (`3662ad84`)
+
+`extract_mesh_region_from_cells` walked the brush's padded bounding
+box and ran `cells.contains_key` per cell to skip empties. For a
+~50-cell brush radius, the box was ~58³ ≈ 195 k cells but only
+~10 k were solid (matches ~10 k brush_patch verts in the data).
+**95 % of iterations were wasted HashMap probes.**
+
+D6.1 iterates `cells.iter()` directly — visits exactly the solid
+set. Bounds check filters out the +2 outer ring kept in the map
+purely for `build_cube_vertex` neighbor lookups at the iteration
+boundary. HashMap iteration order is non-deterministic; resulting
+vertex/index ordering inside the patch cluster differs but
+triangles are independent (order has no visual or correctness
+consequence).
+
+Expected impact: extract phase 10-18 ms → 1-3 ms; total
+`apply_sculpt_brush` 18 ms → 8-10 ms (hits the <8 ms success
+criterion most of the time).
+
+All 920+ workspace tests pass.
+
 ---
 
-## Deferred (need D0 measurements first)
+## Deferred (still pending data)
 
 ### D3 — strip debug prints from hot path
 
@@ -100,24 +142,33 @@ matters.
 
 ### D5 — `apply_delta` + OctreeGpu sync
 
-Phases 4-5 of `apply_sculpt_brush` mutate the octree + brick pool
-and sync the GPU packed buffer. The `try_extend_in_slack` / fallback
-`deallocate + allocate_with_slack` paths plus `apply_mutation_log`
-have non-trivial CPU work but no current breakdown. Targets if D0
-shows them >2 ms each:
-- Incremental log application instead of full sync.
-- Batch the mutation log entries before applying.
-- Track per-node mutations and skip identity rewrites.
+Phases 4-5 of `apply_sculpt_brush`. Real numbers after D2:
+`apply_delta` is 0.04-0.34 ms most stamps but spikes to 2.4-4.0 ms
+on Raise stamps that allocate many new leaf cells. `octree_sync` is
+0.01-0.03 ms (negligible). The 4 ms spikes are bursty and rare —
+not the steady-state bottleneck. Defer until either steady-state
+extract is fully optimized OR a sustained high-allocation workload
+needs it.
 
-### D6 — brush-region extract
+### `dirty_q` (clusters_in_brush_grid_aabb spatial index)
 
-`collect_cell_map_in_region` + `extract_mesh_region_from_cells`
-(Phase 2 of `rebuild_dirty_clusters`). Surface Nets bounded by brush
-volume — should be small but worth measuring. Optimization
-opportunities if D0 shows it dominates:
-- Cache cell map across consecutive overlapping stamps in a drag.
-- Parallelize SN over sub-volumes.
-- Drop the +3 cell padding when not at a brush boundary.
+Not in the original plan but visible in D0 data: the linear scan
+over 104 k LOD-0 clusters costs 1.2-1.8 ms per stamp. A spatial
+index (BVH or grid) over cluster AABBs could drop this to
+sub-millisecond. Worth doing if D6.1 doesn't get the headline drain
+under 8 ms.
+
+### D6 follow-ups
+
+If D6.1 doesn't fully resolve extract:
+- **Drag-cache for `collect_cell_map_in_region`.** Brush moves
+  slowly during a drag; consecutive stamps overlap heavily. Cache
+  the cell map between stamps, invalidate only the brush footprint.
+- **Parallelize `extract_mesh_region_from_cells`** via rayon over
+  sub-volumes. Cube-vertex HashMap is shared state — would need
+  either per-thread shards merged at the end or a lock-free map.
+- **Drop the +3 cell padding when the brush isn't near a
+  boundary.** Currently the padding is unconditional.
 
 ---
 
@@ -137,22 +188,31 @@ opportunities if D0 shows it dominates:
 ## How to verify the shipped wins
 
 Run a drag-paint session on splat5 elephant in release mode. Each
-stamp emits two log lines with the new `[phases: …]` tails:
+stamp emits two log lines with `[phases: …]` tails:
 
 ```
-[sculpt] stamp handle=… mode=Carve edits=… removed=… applied(adds=… freed=… interior=…)
+[sculpt] stamp handle=… mode=Raise edits=… removed=… applied(adds=… freed=… interior=…)
   (depth=…, base_vs=…) total=X.XXms
   [phases: resolve=… edits=… resolve_rm=… apply_delta=… octree_sync=… leaf_attr=… rebuild_clusters=…]
 
 [sculpt] V2 patch: handle=… dirty=N (sphere_outside=M) kept_tris=… dropped_tris=…
   brush_patch verts=… tris=… total flat verts=… indices=…
   lod_dirty=…/… (…%) (X.XXms)
-  [phases: setup=… dirty_q=… filter=… extract=… append=… cc_walk=…]
+  [phases: setup=… dirty_q=… filter=… extract=… (collect=… cells=N mesh=…) append=… cc_walk=…]
 ```
 
-Read `rebuild_clusters` from the outer log + `filter` from the inner
-to see the cluster-patch filter cost. `sphere_outside / dirty` is the
-D1 rejection ratio (target: ≥50% on a typical drag stamp).
+Key numbers to track:
+
+- **Outer `total`** — should drop from ~18 ms (pre-D6.1) to ~8-10 ms.
+- **`rebuild_clusters`** — should drop from ~14 ms to ~4-6 ms.
+- **Inner `extract`** — should drop from 10-18 ms to 1-3 ms.
+- **`mesh` (within extract)** — the dominant sub-phase D6.1 attacks.
+  Should drop substantially relative to its pre-D6.0 share of extract.
+- **`cells`** — useful for sanity. With D6.1, loop cost scales with
+  `cells` (was scaling with the full bounding box).
+- **`sphere_outside / dirty`** — D1 rejection ratio. Highly variable
+  (0%-80%) depending on brush position. Doesn't need to be high to
+  be worthwhile.
 
 ---
 
