@@ -1,12 +1,17 @@
 # Sculpt drain optimization plan
 
-**Status:** D0 + D1 + D2 + D6.0 + D6.1 + D6.2 + D6.3.a + D6.3.b + D7
-shipped. Post-D6.2 data showed `mesh` sub-phase still spiked to
-9.7 ms on high-density stamps (40-50 k cells × 12 FxHash probes ≈
-9-19 ms). D6.3 replaces the inner-loop HashMap probes with two dense
-`CellGrid`s (one for `leaf_attr_id`, one for the cube → vertex cache)
-sized to the brush footprint. D5 + D6.3.c still deferred — pending
-measurement to confirm whether allocator pressure is real.
+**Status:** D0 + D1 + D2 + D6.0 + D6.1 + D6.2 + D6.3.{a,b,bugfix,c} +
+D7 shipped. D6.3.b's first drag measurement showed the dense-grid
+approach was a clear net win on high-density stamps (44 k-cell mesh
+9.71 → 5.58 ms) but added a ~0.7 ms fixed cost from per-stamp
+`Vec<u32>` alloc + memset that regressed easy stamps (16 k mesh
+1.88 → 2.72 ms; zero stamps under 8 ms). The same session caught a
+sentinel-collision bug (CELL_INTERIOR == CELL_GRID_EMPTY) that
+silently mis-classified INTERIOR corner cells in `build_cube_vertex`.
+D6.3.bugfix remapped CELL_INTERIOR → u32::MAX-1 in the grid;
+D6.3.c moved the two grids + `solid_cells` Vec onto
+`RkpSceneManager` with dirty-tracking so the per-stamp fixed cost
+drops to ~50 µs. D5 still deferred (bursty, not steady-state).
 
 This plan picks up where `docs/PERF_DEBT.md` Phase E left off. After
 Phase A–E, the sculpt per-stamp sim is **drain-bound at ~15 ms** —
@@ -192,10 +197,53 @@ Expected (per the D6.3 plan):
 - 40 k-cell stamp total: 21.68 ms → ~7-8 ms
 - 16 k-cell stamp total: 7.27 ms → ~5-6 ms
 
-Pending: drag-paint measurement on splat5 to confirm. If the
-~9 MB scratch shows allocator pressure (1-2 ms per stamp on
-alloc + memset), D6.3.c moves the grids onto `RkpSceneManager`
-with grow-on-demand pool reuse.
+### D6.3.bugfix — disambiguate CELL_INTERIOR sentinel (`f895ea67`)
+
+D6.3.b stored `CELL_INTERIOR` (= `u32::MAX`) into the grid, where
+it collided with `CELL_GRID_EMPTY` (also `u32::MAX`). Two
+consequences caught only after the first drag run:
+
+* `cells_grid.contains(neighbor)` returned false for INTERIOR
+  cells → fell through to the `is_solid_lookup` octree walk.
+  Correct outcome but slow.
+* `cells_grid.get(corner)` inside `build_cube_vertex` returned
+  None for INTERIOR corners → `corner_solid` stayed false → the
+  SN-cube's edge crossings shifted, producing wrong vertex
+  positions for any cube with an INTERIOR corner.
+
+Splat5 elephant is mostly a hollow shell so the wrong positions
+didn't show up visually; a unit test that constructed an
+INTERIOR-cell scene caught it (~all SN vertices in different
+positions vs reference). Fix: dedicated `CELL_INTERIOR_GRID =
+u32::MAX - 1` value, remapped at populate and reversed in the
+`build_cube_vertex` lookup closure. A real `leaf_attr_id` can
+never collide with `u32::MAX - 1`.
+
+### D6.3.c — pool-reused scratch on SceneManager (`8da446cd`)
+
+First D6.3.b measurement showed the dense-grid approach as a
+clear win on the hard case (44 k-cell `mesh` 9.71 → 5.58 ms) and
+a small regression on the easy case (16 k-cell `mesh` 1.88 →
+2.72 ms). Linear fit: `mesh ≈ 152 ns × cells + 0.7 ms`. The
+0.7 ms intercept was per-stamp `Vec<u32>::with_capacity(..) +
+resize(.., u32::MAX)` for both grids — alloc ~50-200 µs and
+memset ~500 µs per stamp.
+
+D6.3.c moves the grids onto `RkpSceneManager.sculpt_extract_scratch`
+(a `SculptExtractScratch` holding both `CellGrid`s plus the
+`solid_cells: Vec<IVec3>` filter buffer). `CellGrid::set` now
+records first-writes in a parallel `dirty: Vec<usize>`;
+`CellGrid::reuse(origin, size)` between stamps walks the dirty
+list to reset only the touched slots — ~50 µs for a 30 k-write
+stamp vs ~450 µs for a full memset.
+
+Expected: ~500 µs saved per stamp on easy cases (small-stamp
+`mesh` back to ~2.0 ms, recovering the pre-D6.3 baseline) and
+~300 µs saved per stamp on hard cases (44 k-cell `mesh` to
+~5.1 ms). Two new tests:
+`pooled_extract_reuses_scratch_across_stamps` (cycles three
+stamps through one scratch and asserts each output matches the
+fresh-alloc reference) and the D6.3.bugfix regression test.
 
 ---
 
@@ -230,31 +278,6 @@ needs it.
 ### `dirty_q` (clusters_in_brush_grid_aabb spatial index)
 
 ✅ Shipped as D7 (`bb51d050`).
-
-### D6.3.c — pool-reuse the CellGrid scratch
-
-Per-stamp `CellGrid::new(.., size)` allocates ~9 MB and `memset`s it
-to `u32::MAX`. Math: alloc ~50-200 µs + memset ~0.9 ms ≈ 1 ms per
-stamp. The memset cost is unavoidable (grids must start empty) so
-plain pool-reuse saves only the alloc overhead (~100-200 µs).
-
-Defer until measurement shows the alloc is a hotspot. If it bites,
-candidate designs:
-
-1. **Plain reuse + memset.** Store the largest-needed `CellGrid`
-   pair on `RkpSceneManager`; grow-on-demand, `memset(u32::MAX)`
-   on reuse. Saves alloc cost only.
-2. **Dirty-set reuse.** Track flat indices written during the stamp
-   in a parallel `Vec<u32>`; on reuse, walk that list and reset only
-   those slots. Cheaper reset (~12 µs for 30 k entries) but adds a
-   push per `set` call (~500 µs on 50 k cells — net negative in the
-   common case).
-3. **Memcpy from a pre-cleared template.** Allocate a "blank" grid
-   once at startup; on each stamp, memcpy from it. Same cost as the
-   memset path — no win.
-
-(1) is the only plausible candidate; whether it's worth the
-SceneManager-state addition depends on the post-D6.3.b measurement.
 
 ### D6 follow-ups
 
