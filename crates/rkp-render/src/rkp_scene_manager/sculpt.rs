@@ -477,11 +477,19 @@ impl RkpSceneManager {
         // through the per-cluster mesh patch; their sum should match
         // `total` to within a few µs (Instant::now overhead). The
         // dominant phase identifies the next drain-optimization target.
+        //
+        // D5.a — apply_delta sub-breakdown follows: per-op-type loop
+        // wall-clock from the three split passes in `apply_delta`,
+        // plus the mutation-log setup/take costs. ns/op figures
+        // surface which op-type to optimize first.
+        let ad_timing = applied.timing;
+        let ns_per = |t_ns: u64, n: u32| if n == 0 { 0.0 } else { t_ns as f64 / n as f64 };
         eprintln!(
             "[sculpt] stamp handle={:?} mode={:?} edits={} removed={} \
              applied(adds={} freed={} interior={}) (depth={}, base_vs={:.5}) total={:.2}ms \
              [phases: resolve={:.2} edits={:.2} resolve_rm={:.2} apply_delta={:.2} \
-             octree_sync={:.2} leaf_attr={:.2} rebuild_clusters={:.2}]",
+             octree_sync={:.2} leaf_attr={:.2} rebuild_clusters={:.2}] \
+             [apply_delta_sub: setup={:.3} empty={:.3}/{:.0}ns interior={:.3}/{:.0}ns add={:.3}/{:.0}ns take={:.3}]",
             handle, mode, delta.len(), removed.len(),
             applied.allocated_slots.len(), applied.freed_slots.len(),
             delta.count_interior(), depth, base_vs,
@@ -489,6 +497,14 @@ impl RkpSceneManager {
             _p_resolve_ms, _p_compute_edits_ms, _p_resolve_removes_ms,
             _p_apply_delta_ms, _p_octree_sync_ms, _p_leaf_attr_ms,
             _p_rebuild_clusters_ms,
+            ad_timing.t_log_setup_ns as f64 / 1.0e6,
+            ad_timing.t_loop_empty_ns as f64 / 1.0e6,
+            ns_per(ad_timing.t_loop_empty_ns, ad_timing.n_empty),
+            ad_timing.t_loop_interior_ns as f64 / 1.0e6,
+            ns_per(ad_timing.t_loop_interior_ns, ad_timing.n_interior),
+            ad_timing.t_loop_add_ns as f64 / 1.0e6,
+            ns_per(ad_timing.t_loop_add_ns, ad_timing.n_add),
+            ad_timing.t_log_take_ns as f64 / 1.0e6,
         );
 
         Some(SculptApplyResult {

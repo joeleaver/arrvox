@@ -199,6 +199,37 @@ pub struct AppliedDelta {
     /// the existing GPU allocator slot is too small and a re-allocation
     /// is required.
     pub octree_log: OctreeMutationLog,
+    /// **D5.a** — per-sub-phase wall-clock timing collected inside
+    /// [`apply_delta`]. Lets the caller log a breakdown that splits
+    /// the mutation-log setup/take from the actual edit-application
+    /// loop, with per-op-type loop times.
+    pub timing: ApplyDeltaTiming,
+}
+
+/// **D5.a** — wall-clock timing breakdown for [`apply_delta`]. All
+/// fields are nanoseconds.
+///
+/// The loop is split into three sequential sub-passes (one per
+/// op-type) so each can be timed independently. compute_brush_edits
+/// emits at most one edit per cell so reordering Empty → Interior
+/// → Add across cells is correctness-neutral; within each pass
+/// edit order is preserved.
+///
+/// The mutation log records every node write in occurrence order;
+/// reordering doesn't affect the final octree state but can change
+/// the log's intermediate sequence. Downstream consumers
+/// (`OctreeGpu::apply_mutation_log`) apply writes in order and
+/// converge to the same final state.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ApplyDeltaTiming {
+    pub t_log_setup_ns: u64,
+    pub t_loop_empty_ns: u64,
+    pub t_loop_interior_ns: u64,
+    pub t_loop_add_ns: u64,
+    pub t_log_take_ns: u64,
+    pub n_empty: u32,
+    pub n_interior: u32,
+    pub n_add: u32,
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────
@@ -476,35 +507,83 @@ pub fn apply_delta(
     delta: &SculptDelta,
     mut alloc_slot: impl FnMut() -> u32,
 ) -> AppliedDelta {
+    use std::time::Instant;
+
     let mut allocated_slots = Vec::with_capacity(delta.count_added());
     let mut freed_slots = Vec::with_capacity(delta.count_removed());
 
+    // ── Setup ────────────────────────────────────────────────────
+    let t0 = Instant::now();
     octree.begin_mutation_log();
+    let t_setup_ns = t0.elapsed().as_nanos() as u64;
+
+    // ── Loop, split by op-type so each can be timed independently.
+    //
+    // compute_brush_edits guarantees one edit per cell, so reordering
+    // across op-types is correctness-neutral; within each pass the
+    // original edit order is preserved. The mutation log's intermediate
+    // sequence changes but the final octree state — and therefore the
+    // replayed GPU state — is identical.
+
+    let mut n_empty = 0u32;
+    let t_empty = Instant::now();
     for edit in &delta.edits {
-        match edit.op {
-            LeafEditOp::Remove | LeafEditOp::Empty => {
-                if let Some(prev) = octree.set_cell_empty(edit.coord, brick_pool) {
-                    freed_slots.push(prev);
-                }
-            }
-            LeafEditOp::SetInterior => {
-                if let Some(prev) = octree.set_cell_interior(edit.coord, brick_pool) {
-                    freed_slots.push(prev);
-                }
-            }
-            LeafEditOp::Add { material, normal } => {
-                let slot = alloc_slot();
-                allocated_slots.push((slot, LeafEditAttrs { material, normal }));
-                if let Some(prev) = octree.set_cell_solid(edit.coord, slot, brick_pool) {
-                    // Caller must free the displaced slot too.
-                    freed_slots.push(prev);
-                }
+        if matches!(edit.op, LeafEditOp::Remove | LeafEditOp::Empty) {
+            n_empty += 1;
+            if let Some(prev) = octree.set_cell_empty(edit.coord, brick_pool) {
+                freed_slots.push(prev);
             }
         }
     }
-    let octree_log = octree.take_mutation_log().unwrap_or_default();
+    let t_loop_empty_ns = t_empty.elapsed().as_nanos() as u64;
 
-    AppliedDelta { allocated_slots, freed_slots, octree_log }
+    let mut n_interior = 0u32;
+    let t_interior = Instant::now();
+    for edit in &delta.edits {
+        if matches!(edit.op, LeafEditOp::SetInterior) {
+            n_interior += 1;
+            if let Some(prev) = octree.set_cell_interior(edit.coord, brick_pool) {
+                freed_slots.push(prev);
+            }
+        }
+    }
+    let t_loop_interior_ns = t_interior.elapsed().as_nanos() as u64;
+
+    let mut n_add = 0u32;
+    let t_add = Instant::now();
+    for edit in &delta.edits {
+        if let LeafEditOp::Add { material, normal } = edit.op {
+            n_add += 1;
+            let slot = alloc_slot();
+            allocated_slots.push((slot, LeafEditAttrs { material, normal }));
+            if let Some(prev) = octree.set_cell_solid(edit.coord, slot, brick_pool) {
+                // Caller must free the displaced slot too.
+                freed_slots.push(prev);
+            }
+        }
+    }
+    let t_loop_add_ns = t_add.elapsed().as_nanos() as u64;
+
+    // ── Teardown ─────────────────────────────────────────────────
+    let t_take = Instant::now();
+    let octree_log = octree.take_mutation_log().unwrap_or_default();
+    let t_log_take_ns = t_take.elapsed().as_nanos() as u64;
+
+    AppliedDelta {
+        allocated_slots,
+        freed_slots,
+        octree_log,
+        timing: ApplyDeltaTiming {
+            t_log_setup_ns: t_setup_ns,
+            t_loop_empty_ns,
+            t_loop_interior_ns,
+            t_loop_add_ns,
+            t_log_take_ns,
+            n_empty,
+            n_interior,
+            n_add,
+        },
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
