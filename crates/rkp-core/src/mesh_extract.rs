@@ -277,6 +277,18 @@ const _: () = {
 /// `leaf_attr_id`, so we can't store a real slot here.
 const CELL_INTERIOR: u32 = u32::MAX;
 
+/// In-grid encoding of [`CELL_INTERIOR`]. [`CellGrid`] reserves
+/// [`CELL_GRID_EMPTY`] (= `u32::MAX`) as the "no entry" sentinel,
+/// which collides with `CELL_INTERIOR` — without this remap, INTERIOR
+/// cells stored in the grid would look identical to absent slots and
+/// `build_cube_vertex`'s corner classification would treat them as
+/// empty (wrong: INTERIOR is solid for SN purposes). At populate
+/// time the extract loop remaps `CELL_INTERIOR` → `CELL_INTERIOR_GRID`
+/// before `cells_grid.set`; the `build_cube_vertex` lookup closure
+/// reverses the remap. A real `leaf_attr_id` can never hit this
+/// value — `LeafAttrPool` capacities are well under `u32::MAX - 1`.
+const CELL_INTERIOR_GRID: u32 = u32::MAX - 1;
+
 /// Walk a brick-terminated octree and emit the surface mesh as
 /// `(vertices, indices)`.
 ///
@@ -519,9 +531,20 @@ pub fn extract_mesh_region_from_cells(
     // anywhere inside grid bounds get registered in `cells_grid` for
     // face-neighbor / corner lookups. The two ranges overlap so most
     // cells contribute to both.
+    //
+    // `CELL_INTERIOR` (= `u32::MAX`) collides with the grid's empty
+    // sentinel `CELL_GRID_EMPTY`, so remap it to `CELL_INTERIOR_GRID`
+    // before storing; the lookup closure passed into
+    // `build_cube_vertex` reverses the remap so the corner classifier
+    // sees the original `CELL_INTERIOR` value.
     let mut solid_cells: Vec<IVec3> = Vec::with_capacity(cells.len());
     for (&cell, &slot) in cells.iter() {
-        cells_grid.set(cell, slot);
+        let stored = if slot == CELL_INTERIOR {
+            CELL_INTERIOR_GRID
+        } else {
+            slot
+        };
+        cells_grid.set(cell, stored);
         if cell.x >= pad_min.x
             && cell.x < pad_max.x
             && cell.y >= pad_min.y
@@ -560,7 +583,10 @@ pub fn extract_mesh_region_from_cells(
                     None => {
                         let vertex = build_cube_vertex(
                             cube,
-                            |c| cells_grid.get(c),
+                            |c| match cells_grid.get(c) {
+                                Some(CELL_INTERIOR_GRID) => Some(CELL_INTERIOR),
+                                other => other,
+                            },
                             base_voxel_size,
                             grid_origin,
                             leaf_attr_pool,
@@ -1616,6 +1642,47 @@ mod tests {
         assert!(
             v_b.is_empty() && i_b.is_empty(),
             "region far from solids must emit nothing"
+        );
+    }
+
+    /// **D6.3 bug regression** — the region extract must classify
+    /// INTERIOR-bulk corner cells as solid, identically to the
+    /// full-asset extract. Without the `CELL_INTERIOR` →
+    /// `CELL_INTERIOR_GRID` remap inside `extract_mesh_region_from_cells`,
+    /// the grid stores `u32::MAX` for INTERIOR cells, which is
+    /// indistinguishable from `CELL_GRID_EMPTY`; `build_cube_vertex`'s
+    /// corner classifier then treats those cells as empty and
+    /// produces wrong edge crossings.
+    #[test]
+    fn region_extract_respects_interior_corner_cells() {
+        // Same setup as `interior_cells_hide_adjacent_surface_faces` —
+        // surface cell at (0,0,0), INTERIOR cell at (1,0,0). The full
+        // extract is the reference; the region extract over the same
+        // domain must produce the same triangle set.
+        let nodes = vec![make_brick(0)];
+        let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
+        bricks[0] = 5;
+        bricks[1] = BRICK_INTERIOR;
+        let depth = 2u8;
+        let extent = 1i32 << depth;
+
+        let (full_v, full_i) =
+            extract_surface_mesh(&nodes, depth, 1.0, Vec3::ZERO, &bricks, &[], &[]);
+        let (region_v, region_i) = extract_surface_mesh_region(
+            &nodes,
+            depth,
+            1.0,
+            Vec3::ZERO,
+            &bricks,
+            &[],
+            &[],
+            IVec3::ZERO,
+            IVec3::splat(extent),
+        );
+        assert_eq!(
+            triangle_position_set(&full_i, &full_v),
+            triangle_position_set(&region_i, &region_v),
+            "INTERIOR corner cells must produce the same SN vertices in both paths",
         );
     }
 
