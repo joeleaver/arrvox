@@ -32,7 +32,7 @@ mod mutation_log;
 mod optimize;
 mod query;
 
-pub use mutate::{BrickPathCache, CellState};
+pub use mutate::{BrickPathCache, CellState, CellStateCache};
 pub use mutation_log::OctreeMutationLog;
 
 #[cfg(test)]

@@ -53,6 +53,36 @@ fn brick_local(coord: UVec3) -> (u32, u32, u32) {
     (coord.x & mask, coord.y & mask, coord.z & mask)
 }
 
+/// Per-call cache for [`SparseOctree::cell_state_cached`] (D9.b).
+/// Read-only counterpart to [`BrickPathCache`] — amortises the
+/// octree descent across consecutive cell-state queries that fall in
+/// the same brick.
+///
+/// Used by [`compute_brush_edits`]'s outer (z, y, x) loop and the
+/// inner `has_outside_solid_neighbor` 6-face probe; the brush walks
+/// row-major and consecutive cells share a brick ~75 % of the time
+/// inside a row, and 5-of-6 neighbor probes hit the same brick as
+/// the source cell.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CellStateCache {
+    /// Coord of the cached brick in `coord >> BRICK_LEVELS` units.
+    /// `None` when no entry is cached (post-construction or after an
+    /// out-of-bounds query invalidated it).
+    brick_coord: Option<UVec3>,
+    /// The terminator value at brick depth for that brick — a BRICK
+    /// descriptor, EMPTY_NODE, INTERIOR_NODE, or (rarely) a LEAF on
+    /// trees where the path subdivided above brick depth. Read-only:
+    /// `cell_state_cached` reads the brick state from this and reads
+    /// the per-cell value from the `BrickPool`.
+    brick_node: u32,
+}
+
+impl CellStateCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Per-call cache for [`SparseOctree::set_cell_solid_cached`] and the
 /// other `*_cached` mutation primitives (D5.b). Amortises the 9-level
 /// octree descent across consecutive cell mutations that fall in the
@@ -156,6 +186,117 @@ impl SparseOctree {
         // to Empty defensively.
         debug_assert!(false, "cell_state hit a branch node at {coord} — lookup invariant broken");
         CellState::Empty
+    }
+
+    /// [`cell_state`](Self::cell_state) with a per-call cache that
+    /// amortises the octree descent across consecutive queries in the
+    /// same brick (D9.b).
+    ///
+    /// On cache hit (the previous query was in the same brick), this
+    /// skips the descent entirely and reads the per-cell value from
+    /// the cached brick. On miss, descends to brick depth iteratively
+    /// and updates the cache.
+    ///
+    /// Falls back to the uncached `cell_state` for shallow trees
+    /// (where bricks are disabled) and for queries that hit a LEAF
+    /// or branch above brick depth (`compute_brush_edits` shouldn't
+    /// see these on splat5-style deep octrees, but the path stays
+    /// correctness-complete).
+    pub fn cell_state_cached(
+        &self,
+        coord: UVec3,
+        brick_pool: &BrickPool,
+        cache: &mut CellStateCache,
+    ) -> CellState {
+        if !self.in_bounds(coord) {
+            return CellState::OutOfBounds;
+        }
+        let bricks_enabled = self.depth > BRICK_LEVELS;
+        if !bricks_enabled {
+            return self.cell_state(coord, brick_pool);
+        }
+
+        let brick_coord = UVec3::new(
+            coord.x >> BRICK_LEVELS,
+            coord.y >> BRICK_LEVELS,
+            coord.z >> BRICK_LEVELS,
+        );
+
+        let brick_node = if cache.brick_coord == Some(brick_coord) {
+            cache.brick_node
+        } else {
+            let node = self.walk_to_brick_node(brick_coord);
+            cache.brick_coord = Some(brick_coord);
+            cache.brick_node = node;
+            node
+        };
+
+        // Resolve the cell from the cached brick terminator.
+        match brick_node {
+            EMPTY_NODE => CellState::Empty,
+            INTERIOR_NODE => CellState::Interior,
+            n if is_brick(n) => {
+                let bid = brick_id(n);
+                let (lx, ly, lz) = brick_local(coord);
+                match brick_pool.get_cell(bid, lx, ly, lz) {
+                    BRICK_EMPTY => CellState::Empty,
+                    BRICK_INTERIOR => CellState::Interior,
+                    slot => CellState::Solid(slot),
+                }
+            }
+            n if is_leaf(n) => {
+                // Coarse LEAF at intermediate level — entire region
+                // (covering multiple finest cells) shares the slot.
+                CellState::Solid(leaf_slot(n))
+            }
+            n if is_branch(n) => {
+                // Walk subdivided past brick depth into a branch — the
+                // cell lives in a finer terminator. Bail to the
+                // uncached path; invalidate so the cache doesn't lie
+                // about subsequent queries.
+                cache.brick_coord = None;
+                self.cell_state(coord, brick_pool)
+            }
+            _ => {
+                debug_assert!(
+                    false,
+                    "cell_state_cached: unexpected brick_node 0x{:08X}",
+                    brick_node
+                );
+                CellState::Empty
+            }
+        }
+    }
+
+    /// Walk the octree from root to brick depth at any cell inside
+    /// `brick_coord`'s brick. Returns the terminator value at that
+    /// depth — BRICK / EMPTY_NODE / INTERIOR_NODE in the common case,
+    /// or LEAF / branch in the rare paths that subdivided past brick
+    /// depth (compare against `is_brick` / `EMPTY_NODE` /
+    /// `INTERIOR_NODE` first; LEAF and branch are corner-case
+    /// fallbacks).
+    fn walk_to_brick_node(&self, brick_coord: UVec3) -> u32 {
+        debug_assert!(self.depth > BRICK_LEVELS);
+        let brick_depth = self.depth - BRICK_LEVELS;
+        // Use any cell coord inside the brick — the lo corner.
+        let coord = UVec3::new(
+            brick_coord.x << BRICK_LEVELS,
+            brick_coord.y << BRICK_LEVELS,
+            brick_coord.z << BRICK_LEVELS,
+        );
+
+        let mut node_idx: usize = 0;
+        let mut level: u8 = 0;
+        loop {
+            let current = self.nodes[node_idx];
+            if level == brick_depth || !is_branch(current) {
+                return current;
+            }
+            let children_offset = current as usize;
+            let octant = octant_for_coord(coord, level, self.depth) as usize;
+            node_idx = children_offset + octant;
+            level += 1;
+        }
     }
 }
 
@@ -1274,6 +1415,44 @@ mod tests {
             "node arrays diverged after collapse",
         );
         assert_no_collapsed_bricks_left_behind(&t_cached, &p_cached);
+    }
+
+    /// **D9.b** — `cell_state_cached` must produce the same result as
+    /// `cell_state` for every cell type (Empty/Interior/Solid/OOB),
+    /// across cache hits and misses. Cycle through cells in two
+    /// adjacent bricks to force at least one cache miss + re-walk.
+    #[test]
+    fn cell_state_cached_matches_uncached() {
+        let (mut tree, mut pool) = deep_tree();
+        // Seed a mixed scene: some surface, some interior, some empty.
+        tree.set_cell_solid(UVec3::new(0, 0, 0), 1, &mut pool);
+        tree.set_cell_solid(UVec3::new(3, 1, 2), 2, &mut pool);
+        tree.set_cell_interior(UVec3::new(2, 2, 2), &mut pool);
+        tree.set_cell_solid(UVec3::new(4, 0, 0), 3, &mut pool); // adjacent brick
+        tree.set_cell_interior(UVec3::new(6, 3, 1), &mut pool);
+
+        let mut cache = CellStateCache::new();
+        // Walk both bricks. The cache should keep the answers aligned
+        // with the uncached path through both the hit and miss cases.
+        for z in 0..4 {
+            for y in 0..4 {
+                for x in 0..8 {
+                    let coord = UVec3::new(x, y, z);
+                    assert_eq!(
+                        tree.cell_state(coord, &pool),
+                        tree.cell_state_cached(coord, &pool, &mut cache),
+                        "mismatch at {coord}",
+                    );
+                }
+            }
+        }
+
+        // Out-of-bounds queries must work identically in both paths.
+        let oob = UVec3::new(0, 0, 16);
+        assert_eq!(
+            tree.cell_state(oob, &pool),
+            tree.cell_state_cached(oob, &pool, &mut cache),
+        );
     }
 
     /// Cached mutations through an INTERIOR_NODE region exercise the

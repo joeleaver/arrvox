@@ -367,6 +367,15 @@ pub fn compute_brush_edits(
     let mut n_inside_sphere = 0u32;
     let mut n_cell_state_calls = 0u32;
     let mut n_neighbor_calls = 0u32;
+    // **D9.b** — shared brick cache for the outer cell-state lookup
+    // and the per-Empty `has_outside_solid_neighbor` 6-face probes.
+    // The brush walks row-major; within a row, consecutive cells
+    // share a brick for runs of up to BRICK_DIM=4 (~75 % hit rate
+    // inside a row). Neighbor probes mostly stay inside the source
+    // cell's brick (5-of-6 face-neighbors of an interior cell are
+    // same-brick). We accept some cache thrash at brick edges in
+    // exchange for shared-state simplicity.
+    let mut cache = crate::sparse_octree::CellStateCache::new();
     let half_voxel = 0.5; // grid-unit coords, so ½ voxel == 0.5
     for z in lo.z..hi.z {
         for y in lo.y..hi.y {
@@ -379,7 +388,7 @@ pub fn compute_brush_edits(
                     continue;
                 }
                 n_inside_sphere += 1;
-                let state = octree.cell_state(coord, brick_pool);
+                let state = octree.cell_state_cached(coord, brick_pool, &mut cache);
                 n_cell_state_calls += 1;
                 if matches!(state, CellState::OutOfBounds) {
                     continue;
@@ -395,6 +404,7 @@ pub fn compute_brush_edits(
                         &op,
                         octree,
                         brick_pool,
+                        &mut cache,
                         &mut n_neighbor_calls,
                     ),
                     BrushMode::Raise => emit_raise_edits(
@@ -434,6 +444,7 @@ fn emit_carve_edits(
     op: &BrushOp,
     octree: &SparseOctree,
     brick_pool: &BrickPool,
+    cache: &mut crate::sparse_octree::CellStateCache,
     n_neighbor_calls: &mut u32,
 ) {
     match state {
@@ -459,7 +470,7 @@ fn emit_carve_edits(
             // an interior cavity and the EMPTY cell becomes a new
             // wall facing into the cavity.
             *n_neighbor_calls += 1;
-            if has_outside_solid_neighbor(coord, op, octree, brick_pool) {
+            if has_outside_solid_neighbor(coord, op, octree, brick_pool, cache) {
                 let normal = brush_outward_normal(cell_center, op);
                 edits.push(LeafEdit {
                     coord,
@@ -506,6 +517,7 @@ fn has_outside_solid_neighbor(
     op: &BrushOp,
     octree: &SparseOctree,
     brick_pool: &BrickPool,
+    cache: &mut crate::sparse_octree::CellStateCache,
 ) -> bool {
     const FACE_DIRS: [IVec3; 6] = [
         IVec3::new(1, 0, 0),
@@ -529,7 +541,10 @@ fn has_outside_solid_neighbor(
             // "wall" anchor.
             continue;
         }
-        let n_state = octree.cell_state(n_u, brick_pool);
+        // **D9.b** — share the outer loop's brick cache. 5-of-6
+        // face-neighbors of an interior-of-brick cell live in the
+        // same brick as the source; those hit the cache.
+        let n_state = octree.cell_state_cached(n_u, brick_pool, cache);
         if matches!(n_state, CellState::Solid(_) | CellState::Interior) {
             return true;
         }
