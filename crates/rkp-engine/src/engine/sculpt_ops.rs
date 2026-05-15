@@ -164,6 +164,19 @@ impl EngineState {
         // even after the overlay has accumulated thousands of entries.
         let overlay = self.sculpt_overlays.entry(entity).or_default();
         overlay.insert_batch(result.removed_leaf_attr_ids);
+        // Drop any slot IDs the stamp REUSED for new surface cells. The
+        // LeafAttrPool's free list hands back recently-freed slot IDs
+        // first, so a Raise after a Carve typically reuses the slots
+        // the Carve just freed — and those slots are sitting in the
+        // overlay's "carved" set. Leaving them there makes the mesh
+        // FS `is_leaf_removed` check discard every fragment that
+        // resolves to the reused slot, which manifests as a half-dome
+        // after the first Carve. Removing them here keeps the overlay
+        // honest: only slots whose surface cell is genuinely missing
+        // remain.
+        for slot in &result.allocated_leaf_attr_ids {
+            overlay.remove(*slot);
+        }
 
         // PERF_DEBT.md D3: this stamp added removed-leaf-attr ids to
         // the entity's sculpt overlay, so the concatenated

@@ -51,6 +51,14 @@ pub struct SculptApplyResult {
     /// May be empty when the brush footprint hit only empty / interior
     /// cells.
     pub removed_leaf_attr_ids: Vec<u32>,
+    /// `leaf_attr_id`s the brush *allocated* — fresh surface cells the
+    /// caller must REMOVE from the per-entity sculpt overlay before
+    /// the next render. Without this step, slots reused from the
+    /// LeafAttrPool free list (which the prior Carve's freed slots
+    /// populate) carry stale "removed" entries in the overlay; the
+    /// mesh FS then discards every fragment that lands on them, and
+    /// half the Raise dome vanishes after the first Carve.
+    pub allocated_leaf_attr_ids: Vec<u32>,
     /// How many cells the kernel emitted as Remove (pre-filter).
     pub leaves_removed: usize,
     /// How many Add edits were skipped (Phase B). Logged so the user
@@ -426,14 +434,25 @@ impl RkpSceneManager {
         let _ph_t5 = std::time::Instant::now();
 
         // Write LeafAttrs for newly-allocated slots. The brush picks
-        // the material; the normal is whatever the kernel emitted
-        // (outward-from-brush-center today, R7 may refine).
+        // the material; the normal is the post-stamp 6-tap gradient
+        // computed in apply_delta.
         for (slot, attrs) in &applied.allocated_slots {
             *self.leaf_attr_pool.get_mut(*slot) = attrs.to_leaf_attr();
             // Default color (0) — sculpt-added cells fall back to the
             // material's base_color, same convention as paint's "no
             // override".
             self.leaf_attr_pool.set_color(*slot, 0);
+        }
+        // Renormalize pre-existing neighbour slots whose post-stamp
+        // gradient differs from the stored normal. Patches only the
+        // normal_oct field; material/secondary_blend stay untouched.
+        // Without this, a Raise refilling a prior Carve cavity leaves
+        // the cavity-wall slots with their original inward-pointing
+        // normals — they back-face-cull from the new dome and half
+        // the surface vanishes.
+        for (slot, normal) in &applied.renormalized_slots {
+            let attr = self.leaf_attr_pool.get_mut(*slot);
+            attr.normal_oct = rkp_core::pack_oct(*normal);
         }
         // Release slots vacated by Remove / displaced-by-Add edits.
         // Done one-at-a-time since the slots aren't contiguous; the
@@ -523,8 +542,11 @@ impl RkpSceneManager {
             ),
         );
 
+        let allocated_leaf_attr_ids: Vec<u32> =
+            applied.allocated_slots.iter().map(|(s, _)| *s).collect();
         Some(SculptApplyResult {
             removed_leaf_attr_ids: removed,
+            allocated_leaf_attr_ids,
             leaves_removed,
             leaves_add_skipped,
         })
@@ -678,6 +700,20 @@ impl RkpSceneManager {
 
         // ── Phase 1: filter each dirty cluster's tris ─────────────────
         //
+        // **Carve only.** The filter drops every tri with at least one
+        // vertex inside the brush sphere — correct when those cells are
+        // being carved out (the original surface is gone). For Raise
+        // we skip the filter entirely: Raise doesn't remove any
+        // SOLID/INTERIOR cells, so the original ground geometry under
+        // the brush is still a valid post-stamp surface. The patch
+        // cluster appended in Phase 3 contributes the new dome surface
+        // *on top of* the original geometry; the z-buffer handles the
+        // visual overlap. Pre-fix, the unconditional filter deleted
+        // the ground tris under a Raise stamp, leaving a visible hole
+        // beneath the dome (the post-stamp SN re-extract can't replace
+        // them — SOLID↔INTERIOR cubes have no EMPTY corner and emit no
+        // surface).
+        //
         // Walk each cluster's existing tris; keep only those with ALL
         // three verts strictly outside the brush sphere. Append the
         // kept indices to the tail of `mesh_indices`; redirect the
@@ -725,6 +761,7 @@ impl RkpSceneManager {
         // without contention concerns.
         let d1_counter = std::sync::atomic::AtomicUsize::new(0);
 
+        let is_carve = matches!(op.mode, BrushMode::Carve);
         let results: Vec<(u32, Vec<u32>)> = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
             let clusters = &entry.meshlet_clusters;
@@ -736,6 +773,14 @@ impl RkpSceneManager {
                     let c = &clusters[cid as usize];
                     let start = c.index_offset as usize;
                     let count = c.index_count as usize;
+                    // Raise: skip the filter entirely. Carry every
+                    // original tri through to the kept list — the
+                    // original surface is still valid post-stamp
+                    // (Raise doesn't remove any SOLID/INTERIOR cells).
+                    if !is_carve {
+                        d1_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return (cid, indices[start..start + count].to_vec());
+                    }
                     let cluster_aabb_min = Vec3::from(c.aabb_min);
                     let cluster_aabb_max = Vec3::from(c.aabb_max);
 
