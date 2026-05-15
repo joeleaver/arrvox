@@ -69,8 +69,21 @@ pub const CELL_GRID_EMPTY: u32 = u32::MAX;
 /// Smaller brushes proportionally less.
 ///
 /// Half-open extent: `[origin, origin + size)` along each axis.
+///
+/// **Dirty-tracking for pool reuse (D6.3.c):** [`set`](Self::set)
+/// records every slot it writes-to-empty in a parallel `dirty` list.
+/// [`reuse`](Self::reuse) resets only those slots between stamps
+/// (~50 µs for 30 k writes) instead of memsetting the entire backing
+/// `Vec` (~450 µs for 4.5 MB), so the same scratch buffer can be
+/// held on `RkpSceneManager` and reused across stamps without paying
+/// the fresh-alloc + memset cost each time.
 pub struct CellGrid {
     data: Vec<u32>,
+    /// Flat indices that [`set`](Self::set) has written-to-empty during
+    /// the current "epoch" (since `new` / the last `reuse` call). Lets
+    /// `reuse` reset only the touched slots — cheap for a brush
+    /// footprint that touches ~3 % of a 9 MB grid.
+    dirty: Vec<usize>,
     origin: IVec3,
     size: IVec3,
 }
@@ -91,9 +104,56 @@ impl CellGrid {
         let len = (size.x as usize) * (size.y as usize) * (size.z as usize);
         Self {
             data: vec![CELL_GRID_EMPTY; len],
+            dirty: Vec::new(),
             origin,
             size,
         }
+    }
+
+    /// Empty grid suitable for the [`Default`] use case — pool-reuse
+    /// callers grow it via [`reuse`](Self::reuse) on first use.
+    pub fn empty() -> Self {
+        Self {
+            data: Vec::new(),
+            dirty: Vec::new(),
+            origin: IVec3::ZERO,
+            size: IVec3::ZERO,
+        }
+    }
+
+    /// Reset previously-touched slots back to [`CELL_GRID_EMPTY`] and
+    /// reconfigure the grid for a new region. The underlying `Vec`
+    /// grows on demand and never shrinks — D6.3.c trades a fixed
+    /// ~9 MB scratch high-water-mark for zero per-stamp allocation.
+    ///
+    /// Cheaper than a full memset when the brush touches a small
+    /// fraction of the grid: walks only the `dirty` list (~30 k
+    /// indices on a 44 k-cell stamp) instead of the full 1.12 M
+    /// slots.
+    pub fn reuse(&mut self, origin: IVec3, size: IVec3) {
+        assert!(
+            size.x > 0 && size.y > 0 && size.z > 0,
+            "CellGrid size must be strictly positive (got {:?})",
+            size
+        );
+        // Reset previously-dirty slots. Indices are guaranteed valid
+        // for the *current* `data.len()` because `set` only appends
+        // after a successful `flat_index`; the layout change below
+        // happens after reset.
+        for &idx in &self.dirty {
+            debug_assert!(idx < self.data.len());
+            self.data[idx] = CELL_GRID_EMPTY;
+        }
+        self.dirty.clear();
+
+        let new_len = (size.x as usize) * (size.y as usize) * (size.z as usize);
+        if new_len > self.data.len() {
+            self.data.resize(new_len, CELL_GRID_EMPTY);
+        }
+        // Don't shrink — keep the high-water capacity for the next stamp.
+
+        self.origin = origin;
+        self.size = size;
     }
 
     /// Linearize `coord` into the flat-`Vec<u32>` index, returning
@@ -144,21 +204,29 @@ impl CellGrid {
     /// out-of-bounds — callers that hand the grid coords inside its
     /// own pre-computed range never hit this fallback, but the safe
     /// behaviour matches `CellMap::insert` for shared callers.
+    ///
+    /// The first write to any slot pushes its flat index onto
+    /// `dirty` so [`reuse`](Self::reuse) can reset it cheaply.
+    /// Subsequent writes to the same slot skip the push.
     #[inline]
     pub fn set(&mut self, coord: IVec3, value: u32) {
         if let Some(idx) = self.flat_index(coord) {
+            if self.data[idx] == CELL_GRID_EMPTY {
+                self.dirty.push(idx);
+            }
             self.data[idx] = value;
         }
     }
 
-    /// Reset every slot back to [`CELL_GRID_EMPTY`]. Used by the
-    /// pool-reuse path (D6.3.c) — fresh allocations don't need it
-    /// because `new` already inits to the sentinel.
+    /// Reset previously-set slots back to [`CELL_GRID_EMPTY`] via the
+    /// dirty list — the layout (`origin` / `size`) is preserved.
+    /// Cheaper than a full memset for the common 3-4 % dirty fill.
     #[inline]
     pub fn reset(&mut self) {
-        for slot in &mut self.data {
-            *slot = CELL_GRID_EMPTY;
+        for &idx in &self.dirty {
+            self.data[idx] = CELL_GRID_EMPTY;
         }
+        self.dirty.clear();
     }
 
     /// Grid origin (lo corner, inclusive).
@@ -171,6 +239,42 @@ impl CellGrid {
     #[inline]
     pub fn size(&self) -> IVec3 {
         self.size
+    }
+}
+
+/// Pool-reused scratch buffers for the sculpt extract path (D6.3.c).
+///
+/// Held on `RkpSceneManager` and reused across every stamp: the two
+/// [`CellGrid`]s grow to the largest brush footprint seen so far and
+/// never shrink, while the [`Vec<IVec3>`] for pad-range cells uses
+/// `clear` (no dealloc). [`extract_mesh_region_from_cells_pooled`]
+/// resets the dirty slots and the Vec at function entry — fresh
+/// allocations only happen on first use, and on grid grow.
+///
+/// Saves ~500-700 µs per stamp vs the fresh-`new` path (one alloc +
+/// `Vec::resize(..., CELL_GRID_EMPTY)` per grid, plus the
+/// `Vec<IVec3>` allocation).
+pub struct SculptExtractScratch {
+    pub cells_grid: CellGrid,
+    pub cube_vertex_grid: CellGrid,
+    pub solid_cells: Vec<IVec3>,
+}
+
+impl SculptExtractScratch {
+    /// Empty scratch — grids size up on first
+    /// [`extract_mesh_region_from_cells_pooled`] call.
+    pub fn new() -> Self {
+        Self {
+            cells_grid: CellGrid::empty(),
+            cube_vertex_grid: CellGrid::empty(),
+            solid_cells: Vec::new(),
+        }
+    }
+}
+
+impl Default for SculptExtractScratch {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -480,6 +584,48 @@ pub fn extract_mesh_region_from_cells(
     leaf_attr_pool: &[LeafAttr],
     bone_voxel_pool: &[BoneVoxel],
 ) -> (Vec<MeshVertex>, Vec<u32>) {
+    let mut scratch = SculptExtractScratch::new();
+    extract_mesh_region_from_cells_pooled(
+        &mut scratch,
+        cells,
+        region_min,
+        region_max,
+        octree_nodes,
+        octree_depth,
+        base_voxel_size,
+        grid_origin,
+        brick_cells,
+        leaf_attr_pool,
+        bone_voxel_pool,
+    )
+}
+
+/// Pool-reused entry point — same contract as
+/// [`extract_mesh_region_from_cells`] but reuses the scratch buffers
+/// in `scratch` across stamps. The sculpt drag-paint path threads a
+/// single [`SculptExtractScratch`] held on `RkpSceneManager` through
+/// here to avoid the ~500-700 µs alloc+memset cost the
+/// fresh-allocating wrapper pays each call.
+///
+/// The grids grow to the largest brush footprint encountered and
+/// never shrink. Each call calls
+/// [`CellGrid::reuse`](CellGrid::reuse) which resets only the
+/// previously-dirty slots (~50 µs for a 30 k-write stamp vs ~450 µs
+/// for a memset of the full 4.5 MB backing Vec).
+#[allow(clippy::too_many_arguments)]
+pub fn extract_mesh_region_from_cells_pooled(
+    scratch: &mut SculptExtractScratch,
+    cells: &CellMap,
+    region_min: IVec3,
+    region_max: IVec3,
+    octree_nodes: &[u32],
+    octree_depth: u8,
+    base_voxel_size: f32,
+    grid_origin: Vec3,
+    brick_cells: &[u32],
+    leaf_attr_pool: &[LeafAttr],
+    bone_voxel_pool: &[BoneVoxel],
+) -> (Vec<MeshVertex>, Vec<u32>) {
     let mut vertices: Vec<MeshVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     if cells.is_empty() {
@@ -523,7 +669,15 @@ pub fn extract_mesh_region_from_cells(
     // drops out-of-bounds writes so the populate step is bounds-safe.
     let grid_min = pad_min - IVec3::ONE;
     let grid_size = pad_max - pad_min + IVec3::splat(2);
-    let mut cells_grid = CellGrid::new(grid_min, grid_size);
+    scratch.cells_grid.reuse(grid_min, grid_size);
+    scratch.cube_vertex_grid.reuse(grid_min, grid_size);
+    scratch.solid_cells.clear();
+    let cells_grid = &mut scratch.cells_grid;
+    let cube_vertex_grid = &mut scratch.cube_vertex_grid;
+    let solid_cells = &mut scratch.solid_cells;
+    if solid_cells.capacity() < cells.len() {
+        solid_cells.reserve(cells.len() - solid_cells.capacity());
+    }
 
     // Combined populate + filter pass — visits `cells.iter()` once,
     // mirroring D6.1's iteration win. Cells inside `[pad_min, pad_max)`
@@ -537,7 +691,6 @@ pub fn extract_mesh_region_from_cells(
     // before storing; the lookup closure passed into
     // `build_cube_vertex` reverses the remap so the corner classifier
     // sees the original `CELL_INTERIOR` value.
-    let mut solid_cells: Vec<IVec3> = Vec::with_capacity(cells.len());
     for (&cell, &slot) in cells.iter() {
         let stored = if slot == CELL_INTERIOR {
             CELL_INTERIOR_GRID
@@ -556,9 +709,7 @@ pub fn extract_mesh_region_from_cells(
         }
     }
 
-    let mut cube_vertex_grid = CellGrid::new(grid_min, grid_size);
-
-    for &cell in &solid_cells {
+    for &cell in solid_cells.iter() {
         for face in 0..6 {
             let dir = FACE_DIRS[face];
             let neighbor = cell + dir;
@@ -1642,6 +1793,77 @@ mod tests {
         assert!(
             v_b.is_empty() && i_b.is_empty(),
             "region far from solids must emit nothing"
+        );
+    }
+
+    /// **D6.3.c regression** — running the pooled extract twice
+    /// against the *same* scratch must produce the same output as
+    /// two fresh-allocating extracts. Catches stale-dirty bugs,
+    /// missed resets, and cross-stamp data leakage through the
+    /// reused grids.
+    #[test]
+    fn pooled_extract_reuses_scratch_across_stamps() {
+        // Stamp 1: 2×1×1 box at the origin.
+        let nodes1 = vec![make_brick(0)];
+        let mut bricks1 = vec![BRICK_EMPTY; BRICK_CELLS as usize];
+        bricks1[0] = 5;
+        bricks1[1] = BRICK_INTERIOR;
+
+        // Stamp 2: a different brick configuration — single cell in
+        // a different position, so the dirty regions don't overlap.
+        let nodes2 = vec![make_brick(0)];
+        let mut bricks2 = vec![BRICK_EMPTY; BRICK_CELLS as usize];
+        let dim = BRICK_DIM as usize;
+        bricks2[2 + dim * 2 + dim * dim * 2] = 7; // (2,2,2)
+
+        let depth = 2u8;
+        let region_min = IVec3::ZERO;
+        let region_max = IVec3::splat(1i32 << depth);
+
+        // Reference: each stamp via the fresh-alloc path.
+        let cells1 = collect_cell_map(&nodes1, depth, &bricks1);
+        let (ref_v1, ref_i1) = extract_mesh_region_from_cells(
+            &cells1, region_min, region_max, &nodes1, depth, 1.0,
+            Vec3::ZERO, &bricks1, &[], &[],
+        );
+        let cells2 = collect_cell_map(&nodes2, depth, &bricks2);
+        let (ref_v2, ref_i2) = extract_mesh_region_from_cells(
+            &cells2, region_min, region_max, &nodes2, depth, 1.0,
+            Vec3::ZERO, &bricks2, &[], &[],
+        );
+
+        // Pooled: both stamps share the same scratch.
+        let mut scratch = SculptExtractScratch::new();
+        let (pool_v1, pool_i1) = extract_mesh_region_from_cells_pooled(
+            &mut scratch, &cells1, region_min, region_max, &nodes1,
+            depth, 1.0, Vec3::ZERO, &bricks1, &[], &[],
+        );
+        let (pool_v2, pool_i2) = extract_mesh_region_from_cells_pooled(
+            &mut scratch, &cells2, region_min, region_max, &nodes2,
+            depth, 1.0, Vec3::ZERO, &bricks2, &[], &[],
+        );
+
+        assert_eq!(
+            triangle_position_set(&ref_i1, &ref_v1),
+            triangle_position_set(&pool_i1, &pool_v1),
+            "stamp 1 pooled output must match fresh-alloc reference",
+        );
+        assert_eq!(
+            triangle_position_set(&ref_i2, &ref_v2),
+            triangle_position_set(&pool_i2, &pool_v2),
+            "stamp 2 (post-reuse) pooled output must match fresh-alloc reference",
+        );
+
+        // And a third stamp with the original cells should re-produce
+        // stamp 1's output — the dirty-tracking reset must be complete.
+        let (pool_v3, pool_i3) = extract_mesh_region_from_cells_pooled(
+            &mut scratch, &cells1, region_min, region_max, &nodes1,
+            depth, 1.0, Vec3::ZERO, &bricks1, &[], &[],
+        );
+        assert_eq!(
+            triangle_position_set(&ref_i1, &ref_v1),
+            triangle_position_set(&pool_i3, &pool_v3),
+            "stamp 3 (cycling back to stamp 1 input) must match reference",
         );
     }
 

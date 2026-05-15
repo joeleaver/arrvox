@@ -29,7 +29,7 @@ use glam::{Affine3A, IVec3, Vec3};
 use rkp_core::mesh_cluster::{cluster_grid_aabb, cluster_overlaps_brush_grid_aabb};
 use rkp_core::mesh_cluster::{MeshletCluster, PARENT_GROUP_ERROR_ROOT};
 use rkp_core::mesh_extract::{
-    collect_cell_map_in_region, extract_mesh_region_from_cells, extract_surface_mesh,
+    collect_cell_map_in_region, extract_mesh_region_from_cells_pooled, extract_surface_mesh,
 };
 use rkp_core::mesh_lod::build_cluster_dag_with_levels;
 use rkp_core::sculpt::{
@@ -799,7 +799,8 @@ impl RkpSceneManager {
 
         let (brush_verts, brush_indices) = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
-            extract_mesh_region_from_cells(
+            extract_mesh_region_from_cells_pooled(
+                &mut self.sculpt_extract_scratch,
                 &cells,
                 brush_lo,
                 brush_hi,

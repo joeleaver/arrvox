@@ -10,6 +10,7 @@
 //! per-file `impl RkpSceneManager` blocks; private fields are
 //! `pub(super)` so sibling impls can drive them directly.
 
+use rkp_core::mesh_extract::SculptExtractScratch;
 use rkp_core::{BrickPool, LeafAttrPool, OctreeHandle, SparseOctree};
 
 use crate::octree_gpu::OctreeGpu;
@@ -146,6 +147,17 @@ pub struct RkpSceneManager {
     /// so this epoch is informational — there's no longer a paint-only
     /// fast path on the render side that gates on it.
     pub(super) paint_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+
+    // ── Sculpt drain scratch (D6.3.c) ───────────────────────────────
+    /// Pool-reused scratch buffers for the sculpt extract path. Held
+    /// here rather than allocated per-stamp because the per-stamp
+    /// `Vec<u32>` alloc + memset of two ~4.5 MB grids costs ~500-700 µs
+    /// — significant relative to the 5-10 ms per-stamp budget on
+    /// medium-density brushes. Grows on demand to the largest brush
+    /// footprint seen so far and never shrinks; `extract_*_pooled`
+    /// resets only the touched slots between stamps via the grids'
+    /// dirty lists.
+    pub(super) sculpt_extract_scratch: SculptExtractScratch,
 }
 
 impl RkpSceneManager {
@@ -163,6 +175,7 @@ impl RkpSceneManager {
             last_geometry_bump_ns: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_geometry_submit_ns: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             paint_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sculpt_extract_scratch: SculptExtractScratch::new(),
         }
     }
 
