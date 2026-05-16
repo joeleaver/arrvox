@@ -64,6 +64,41 @@ pub fn Viewport() -> NodeHandle {
     // LMB-held state — paint mode uses this to decide whether a
     // MouseMove event should fire another `PaintAtPixel` stamp.
     let lmb_held = std::cell::Cell::new(false);
+    // Stroke-spacing state for the sculpt brush. We record the screen
+    // pixel of the last sculpt stamp in the active stroke and only
+    // emit a new stamp when the cursor has moved by at least a
+    // brush-radius-scaled threshold from there. Matches Blender's
+    // "Space" stroke method (default 10% of brush radius). Reset on
+    // every MouseDown so each new click starts a fresh stroke at the
+    // cursor.
+    let last_sculpt_stamp_x = std::cell::Cell::new(f32::NEG_INFINITY);
+    let last_sculpt_stamp_y = std::cell::Cell::new(f32::NEG_INFINITY);
+    // Stroke spacing as a fraction of brush radius. Blender defaults
+    // to 0.10 for sculpt brushes; we use the same so the feel
+    // matches.
+    const STROKE_SPACING_FRACTION: f32 = 0.10;
+    // Approximate pixels-per-meter at typical viewport distance. The
+    // proper conversion needs the camera projection at the brush hit
+    // depth, which isn't readily available editor-side; this
+    // heuristic is close enough for normal sculpting cameras (1m of
+    // world space at ~5m camera distance with 60° FOV on a 1080-tall
+    // viewport projects to roughly 200 px). If the user sets a wildly
+    // different zoom and stamps come out clustered or sparse, the
+    // proper fix is to plumb the projected radius back from the
+    // engine each frame; defer until we hit that case.
+    const APPROX_PIXELS_PER_METER: f32 = 200.0;
+    // Floor on the spacing in screen pixels — a tiny world-space
+    // brush would otherwise compute a sub-pixel spacing and stamp
+    // every frame. 4 px keeps mouse jitter from compounding even at
+    // micro-brush sizes.
+    const MIN_STROKE_SPACING_PX: f32 = 4.0;
+    // Monotonic stroke counter. Incremented on every LMB-down that
+    // starts a sculpt stroke; every stamp within the same stroke
+    // ships the same value so the scene-manager can detect stroke
+    // boundaries and clear its per-stroke "already touched" cell
+    // set. Pre-increment means the first stroke uses 1; the scene
+    // mgr's initial 0 sentinel never collides with a real stroke.
+    let sculpt_stroke_seq = std::cell::Cell::new(0u64);
 
     let cmd_tx = cmd.0.clone();
     let surface_for_handler = surface.clone();
@@ -103,12 +138,18 @@ pub fn Viewport() -> NodeHandle {
 
         // Sculpt equivalent — same single-in-flight coalescing as paint.
         let send_sculpt_stamp = |x: f32, y: f32| {
+            // FalloffCurve is currently hardcoded to Smooth (Blender's
+            // default Draw / Inflate curve). The legacy
+            // `sculpt_falloff` slider isn't wired through yet — a
+            // curve-shape picker UI replaces it later.
             let _ = cmd_tx.send(rkp_engine::EngineCommand::SculptAtPixel {
                 id: PANEL_VIEWPORT,
                 x: x.max(0.0) as u32,
                 y: y.max(0.0) as u32,
                 radius: store.sculpt_radius.get(),
-                falloff: store.sculpt_falloff.get(),
+                falloff_curve: rkp_engine::FalloffCurve::Smooth,
+                strength: store.sculpt_strength.get(),
+                stroke_seq: sculpt_stroke_seq.get(),
                 mode: store.sculpt_mode.get(),
                 material_id: store.selected_material.get().unwrap_or(0),
             });
@@ -133,7 +174,23 @@ pub fn Viewport() -> NodeHandle {
                     // engine-side `mouse_pos`), so no extra command.
                     send_paint_stamp(x, y);
                 } else if store.sculpt_active.get() && lmb_held.get() {
-                    send_sculpt_stamp(x, y);
+                    // Stroke-spacing gate. Threshold scales with the
+                    // brush's world radius so small brushes fire
+                    // densely and big brushes fire sparsely — matches
+                    // how Blender's `spacing` is a percentage of
+                    // radius rather than a fixed pixel count.
+                    let world_radius = store.sculpt_radius.get();
+                    let spacing_px = (world_radius
+                        * STROKE_SPACING_FRACTION
+                        * APPROX_PIXELS_PER_METER)
+                        .max(MIN_STROKE_SPACING_PX);
+                    let dxs = x - last_sculpt_stamp_x.get();
+                    let dys = y - last_sculpt_stamp_y.get();
+                    if (dxs * dxs + dys * dys).sqrt() >= spacing_px {
+                        send_sculpt_stamp(x, y);
+                        last_sculpt_stamp_x.set(x);
+                        last_sculpt_stamp_y.set(y);
+                    }
                 }
             }
             MouseDown { button, x, y } => {
@@ -151,7 +208,18 @@ pub fn Viewport() -> NodeHandle {
                         send_paint_stamp(x, y);
                     } else if store.sculpt_active.get() {
                         // Sculpt owns LMB the same way paint does.
+                        // Bump the stroke counter FIRST so this
+                        // first stamp of the stroke ships the new
+                        // value; the scene mgr sees a stroke
+                        // transition and clears the per-stroke
+                        // touched-cell set. Then fire the stamp and
+                        // seed the spacing state at this cursor
+                        // position so subsequent MouseMove samples
+                        // are measured from here.
+                        sculpt_stroke_seq.set(sculpt_stroke_seq.get().wrapping_add(1));
                         send_sculpt_stamp(x, y);
+                        last_sculpt_stamp_x.set(x);
+                        last_sculpt_stamp_y.set(y);
                     } else {
                         let _ = cmd_tx.send(rkp_engine::EngineCommand::Pick {
                             id: PANEL_VIEWPORT,

@@ -157,9 +157,10 @@ pub struct EditorStore {
     /// Smoothstep shoulder width (0..1). 0 = hard sphere, 1 = full
     /// smoothstep from center. Controls how soft the brush boundary is.
     pub sculpt_falloff: Signal<f32>,
-    /// Reserved for future "intensity" brushes (smooth, flatten).
-    /// Not consumed by the V1 Raise/Carve binary transition logic.
-    #[allow(dead_code)]
+    /// Max-thickness amplitude in finest-voxel units for the
+    /// Inflate / Deflate brushes (ignored by Carve / Raise, which
+    /// are hard SDF Boolean ops). Higher = thicker layer added per
+    /// stamp (Inflate) or deeper erosion (Deflate).
     pub sculpt_strength: Signal<f32>,
 
     // ── Paint tool state ─────────────────────────────────────────
@@ -367,7 +368,7 @@ impl EditorStore {
             sculpt_mode: Signal::new(rkp_engine::SculptMode::Carve),
             sculpt_radius: Signal::new(0.5),
             sculpt_falloff: Signal::new(0.5),
-            sculpt_strength: Signal::new(0.5),
+            sculpt_strength: Signal::new(8.0),
 
             // Paint tool state. Red + Color mode is the Phase-2
             // validation default: visible against most scene albedos

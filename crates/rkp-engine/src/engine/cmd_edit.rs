@@ -616,14 +616,14 @@ impl EngineState {
             }
 
             EngineCommand::SculptAtPixel {
-                id, x, y, radius, falloff, mode, material_id,
+                id, x, y, radius, falloff_curve, strength, stroke_seq, mode, material_id,
             } => {
                 use super::state::{SculptPickSettings, PendingPick};
                 self.pending_pick = Some(PendingPick {
                     viewport: id, x, y, ghost_pick_node_id: None,
                 });
                 self.sculpt_pick_settings = Some(SculptPickSettings {
-                    radius, falloff, mode, material_id,
+                    radius, falloff_curve, strength, stroke_seq, mode, material_id,
                 });
                 // Stamp the wallclock so we can measure click-to-mutation
                 // latency end-to-end (SculptAtPixel arrival → apply_sculpt_brush

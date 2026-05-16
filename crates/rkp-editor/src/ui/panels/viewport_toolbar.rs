@@ -480,16 +480,30 @@ fn sculpt_mode_row(
             {gizmo_button(
                 __scope,
                 TablerIcon::Plus,
-                "Raise — add geometry (clay) under the brush",
+                "Raise — add geometry (hard SDF union) under the brush",
                 Memo::new(move || store.sculpt_mode.get() == SculptMode::Raise),
                 move || store.sculpt_mode.set(SculptMode::Raise),
             )}
             {gizmo_button(
                 __scope,
                 TablerIcon::Minus,
-                "Carve — remove geometry (dig) under the brush",
+                "Carve — remove geometry (hard SDF subtract) under the brush",
                 Memo::new(move || store.sculpt_mode.get() == SculptMode::Carve),
                 move || store.sculpt_mode.set(SculptMode::Carve),
+            )}
+            {gizmo_button(
+                __scope,
+                TablerIcon::Mountain,
+                "Inflate — soft outward dilation along the existing surface (Blender Draw / Inflate)",
+                Memo::new(move || store.sculpt_mode.get() == SculptMode::Inflate),
+                move || store.sculpt_mode.set(SculptMode::Inflate),
+            )}
+            {gizmo_button(
+                __scope,
+                TablerIcon::TrendingDown,
+                "Deflate — soft inward erosion (the 'soft Carve' most sculpt programs default to)",
+                Memo::new(move || store.sculpt_mode.get() == SculptMode::Deflate),
+                move || store.sculpt_mode.set(SculptMode::Deflate),
             )}
         }
     }
@@ -522,7 +536,13 @@ fn sculpt_settings_panel(
                     backdrop-filter:blur(8px);\
                     display:flex;flex-direction:column;gap:4px;",
             {prop_slider(__scope, "Radius", store.sculpt_radius, 0.01, 5.0, 0.01, radius_on_change)}
-            {prop_slider(__scope, "Falloff", store.sculpt_falloff, 0.0, 1.0, 0.01, noop)}
+            {prop_slider(__scope, "Falloff", store.sculpt_falloff, 0.0, 1.0, 0.01, noop.clone())}
+            // Max-thickness amplitude in finest-voxel units. Only
+            // Inflate / Deflate consume this; Carve / Raise ignore it.
+            // Range 1..32 voxels covers the typical sculpting feel —
+            // 1 voxel = barely-perceptible offset, 32 voxels = deep
+            // pit / tall ridge in one stamp.
+            {prop_slider(__scope, "Strength", store.sculpt_strength, 1.0, 32.0, 1.0, noop)}
         }
     }
 }

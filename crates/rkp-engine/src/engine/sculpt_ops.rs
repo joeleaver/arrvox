@@ -31,7 +31,9 @@ impl EngineState {
         entity: hecs::Entity,
         world_pos: Vec3,
         radius: f32,
-        falloff: f32,
+        falloff_curve: rkp_core::sculpt::FalloffCurve,
+        strength: f32,
+        stroke_seq: u64,
         mode: SculptMode,
         material_id: u16,
     ) -> usize {
@@ -109,14 +111,17 @@ impl EngineState {
             (handle, root_offset, entity_world)
         };
 
-        // ── Engine enum → core enum. Smooth / Flatten are V2 — bail
-        // with a warning until those land.
+        // ── Engine enum → core enum. Smooth / Flatten arrive in
+        // later plan phases — bail with a warning until then.
         let brush_mode = match mode {
             SculptMode::Raise => rkp_core::sculpt::BrushMode::Raise,
             SculptMode::Carve => rkp_core::sculpt::BrushMode::Carve,
+            SculptMode::Inflate => rkp_core::sculpt::BrushMode::Inflate,
+            SculptMode::Deflate => rkp_core::sculpt::BrushMode::Deflate,
             SculptMode::Smooth | SculptMode::Flatten => {
                 self.console.warn(format!(
-                    "Sculpt mode {mode:?} not implemented yet — Raise / Carve only in V1.",
+                    "Sculpt mode {mode:?} not implemented yet — \
+                     Raise / Carve / Inflate / Deflate are wired through P1.",
                 ));
                 return 0;
             }
@@ -134,7 +139,9 @@ impl EngineState {
                 world_pos,
                 entity_world,
                 radius,
-                falloff,
+                falloff_curve,
+                strength,
+                stroke_seq,
                 brush_mode,
                 material_id,
             )
@@ -257,10 +264,19 @@ pub(crate) fn dispatch_sculpt(
     position: Vec3,
     _normal: Vec3,
     radius: f32,
-    _strength: f32,
+    strength: f32,
     mode: SculptMode,
 ) {
     let Some(entity) = state.selected_entity else { return };
     let material_id = state.selected_material.unwrap_or(0);
-    let _ = state.apply_sculpt_stamp(entity, position, radius, 0.5, mode, material_id);
+    let _ = state.apply_sculpt_stamp(
+        entity,
+        position,
+        radius,
+        rkp_core::sculpt::FalloffCurve::default(),
+        strength,
+        0,
+        mode,
+        material_id,
+    );
 }

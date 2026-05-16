@@ -43,6 +43,10 @@ pub mod viewport;
 pub mod wireframe_builders;
 
 pub use command::{DragPreviewSource, EngineCommand, PaintMode, SculptMode};
+/// Re-export of [`rkp_core::sculpt::FalloffCurve`] so the editor
+/// (which does not depend on `rkp-core` directly) can name it when
+/// building [`EngineCommand::SculptAtPixel`].
+pub use rkp_core::sculpt::FalloffCurve;
 pub use snapshot::{StateUpdate, SceneObjectInfo, ModelInfo};
 pub use material_library::MaterialInfo;
 pub use engine::RkpEngine;

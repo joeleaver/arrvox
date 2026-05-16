@@ -158,6 +158,20 @@ pub struct RkpSceneManager {
     /// resets only the touched slots between stamps via the grids'
     /// dirty lists.
     pub(super) sculpt_extract_scratch: SculptExtractScratch,
+    /// Stroke-id of the active sculpt stroke. Bumped on every LMB-down
+    /// in the editor and passed through `apply_sculpt_brush`; when the
+    /// next stamp arrives with a different value, [`sculpt_stroke_touched`]
+    /// is cleared so the new stroke starts fresh.
+    pub(super) sculpt_stroke_seq: u64,
+    /// Cells (per-asset, finest-voxel grid coords) that have already
+    /// been edited in the *current* sculpt stroke. Each stamp filters
+    /// its [`SculptDelta`] against this set before applying — same
+    /// behaviour as Blender's no-accumulate sculpt brushes, where each
+    /// vertex can only be displaced once per stroke. Prevents a fast
+    /// drag-back-and-forth from compounding into a deep gouge from
+    /// what was supposed to be a single thickness offset. Reset
+    /// implicitly on stroke change (see [`sculpt_stroke_seq`]).
+    pub(super) sculpt_stroke_touched: rustc_hash::FxHashSet<glam::UVec3>,
 }
 
 impl RkpSceneManager {
@@ -176,6 +190,8 @@ impl RkpSceneManager {
             last_geometry_submit_ns: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             paint_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sculpt_extract_scratch: SculptExtractScratch::new(),
+            sculpt_stroke_seq: 0,
+            sculpt_stroke_touched: rustc_hash::FxHashSet::default(),
         }
     }
 

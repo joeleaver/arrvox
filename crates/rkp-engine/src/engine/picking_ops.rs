@@ -98,7 +98,9 @@ impl EngineState {
                     entity,
                     world_pos,
                     settings.radius,
-                    settings.falloff,
+                    settings.falloff_curve,
+                    settings.strength,
+                    settings.stroke_seq,
                     settings.mode,
                     settings.material_id,
                 );

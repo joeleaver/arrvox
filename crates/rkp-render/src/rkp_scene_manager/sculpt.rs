@@ -216,10 +216,22 @@ impl RkpSceneManager {
         world_pos: Vec3,
         entity_world: Affine3A,
         brush_radius: f32,
-        brush_falloff: f32,
+        falloff_curve: rkp_core::sculpt::FalloffCurve,
+        strength: f32,
+        stroke_seq: u64,
         mode: BrushMode,
         material: u16,
     ) -> Option<SculptApplyResult> {
+        // Detect stroke transition. The editor increments stroke_seq
+        // on every LMB-down — when we observe a different value the
+        // previous stroke has ended and the per-stroke "already
+        // touched" cell set should reset. Within a stroke, all stamps
+        // share the same stroke_seq and we keep building up the set
+        // so the no-accumulate rule applies across them.
+        if stroke_seq != self.sculpt_stroke_seq {
+            self.sculpt_stroke_seq = stroke_seq;
+            self.sculpt_stroke_touched.clear();
+        }
         if brush_radius <= 0.0 {
             return None;
         }
@@ -264,7 +276,8 @@ impl RkpSceneManager {
             let op = BrushOp {
                 center: center_grid,
                 radius: radius_grid,
-                falloff: brush_falloff,
+                falloff_curve,
+                strength,
                 mode,
                 material,
             };
@@ -274,13 +287,32 @@ impl RkpSceneManager {
         let _ph_t1 = std::time::Instant::now();
 
         // ── 2. Compute edit list against current octree + brick pool. ─
-        let delta = {
+        let mut delta = {
             let entry = self.asset_cache.get(handle)?;
-            compute_brush_edits(&entry.cpu_octree, &self.brick_pool, op)
+            compute_brush_edits(
+                &entry.cpu_octree,
+                &self.brick_pool,
+                self.leaf_attr_pool.as_slice(),
+                op,
+            )
         };
+        // No-accumulate filter: drop any edit whose coord was already
+        // touched earlier in this stroke. Once dropped, the cell stays
+        // in whatever state the earlier stamp left it in — Blender's
+        // "each vertex displaced once per stroke" behaviour. Without
+        // this, a fast drag back and forth over the same patch
+        // compounds erosion/clay layers on every stamp and tunnels
+        // through the asset in a few mouse moves.
+        delta.edits.retain(|e| !self.sculpt_stroke_touched.contains(&e.coord));
         _p_compute_edits_ms = _ph_t1.elapsed().as_secs_f64() * 1000.0;
         if delta.is_empty() {
             return None;
+        }
+        // Record every coord this stamp will actually edit. We do this
+        // BEFORE apply_delta so the set stays consistent even if
+        // apply_delta short-circuits on internal failure.
+        for edit in &delta.edits {
+            self.sculpt_stroke_touched.insert(edit.coord);
         }
         let _ph_t2 = std::time::Instant::now();
 
@@ -700,19 +732,36 @@ impl RkpSceneManager {
 
         // ── Phase 1: filter each dirty cluster's tris ─────────────────
         //
-        // **Carve only.** The filter drops every tri with at least one
-        // vertex inside the brush sphere — correct when those cells are
-        // being carved out (the original surface is gone). For Raise
-        // we skip the filter entirely: Raise doesn't remove any
-        // SOLID/INTERIOR cells, so the original ground geometry under
-        // the brush is still a valid post-stamp surface. The patch
-        // cluster appended in Phase 3 contributes the new dome surface
-        // *on top of* the original geometry; the z-buffer handles the
-        // visual overlap. Pre-fix, the unconditional filter deleted
-        // the ground tris under a Raise stamp, leaving a visible hole
-        // beneath the dome (the post-stamp SN re-extract can't replace
-        // them — SOLID↔INTERIOR cubes have no EMPTY corner and emit no
-        // surface).
+        // **Carve and Deflate filter; Raise and Inflate skip.** The
+        // filter drops every tri with at least one vertex inside the
+        // brush sphere — correct when those cells are being emptied
+        // (the original surface is gone) and safe for cells inside
+        // the sphere that *aren't* emptied because the patch in
+        // Phase 3 re-extracts the whole region and SN re-emits their
+        // surface tris.
+        //
+        // For Raise / Inflate we skip the filter entirely: neither
+        // removes any SOLID / INTERIOR cells, so the original ground
+        // geometry under the brush is still a valid post-stamp
+        // surface. The patch contributes the new dome / puffed layer
+        // *on top of* the original geometry; the z-buffer handles
+        // the visual overlap. Pre-fix, an unconditional filter
+        // deleted the ground tris under a Raise stamp, leaving a
+        // visible hole beneath the dome (the post-stamp SN
+        // re-extract can't replace them — SOLID↔INTERIOR cubes have
+        // no EMPTY corner and emit no surface).
+        //
+        // The Deflate-specific subtlety: the kernel only erodes a
+        // falloff-shaped region inside the brush sphere, so cells
+        // at the brush rim (target_thickness ≈ 0) keep their pre-
+        // stamp Solid state. Filtering drops their tris too — that's
+        // OK because those cells *still* have an Empty neighbour
+        // post-stamp (the cells above them haven't changed), so SN
+        // re-emits their tris in the patch. Without filtering Deflate
+        // the original tris in the eroded region survive and z-fight
+        // with the new cavity-wall tris from the patch, producing
+        // the "scattered cyan over original surface" artifact users
+        // saw before this fix.
         //
         // Walk each cluster's existing tris; keep only those with ALL
         // three verts strictly outside the brush sphere. Append the
@@ -761,7 +810,10 @@ impl RkpSceneManager {
         // without contention concerns.
         let d1_counter = std::sync::atomic::AtomicUsize::new(0);
 
-        let is_carve = matches!(op.mode, BrushMode::Carve);
+        // Both Carve and Deflate remove cells; the filter is correct
+        // for them. Raise and Inflate add cells without removing any,
+        // so their original tris stay valid (see the comment above).
+        let needs_filter = matches!(op.mode, BrushMode::Carve | BrushMode::Deflate);
         let results: Vec<(u32, Vec<u32>)> = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
             let clusters = &entry.meshlet_clusters;
@@ -773,11 +825,12 @@ impl RkpSceneManager {
                     let c = &clusters[cid as usize];
                     let start = c.index_offset as usize;
                     let count = c.index_count as usize;
-                    // Raise: skip the filter entirely. Carry every
-                    // original tri through to the kept list — the
-                    // original surface is still valid post-stamp
-                    // (Raise doesn't remove any SOLID/INTERIOR cells).
-                    if !is_carve {
+                    // Raise / Inflate: skip the filter entirely.
+                    // Carry every original tri through to the kept
+                    // list — the original surface is still valid
+                    // post-stamp (neither removes any SOLID /
+                    // INTERIOR cells).
+                    if !needs_filter {
                         d1_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return (cid, indices[start..start + count].to_vec());
                     }

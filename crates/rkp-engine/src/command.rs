@@ -416,9 +416,21 @@ pub enum EngineCommand {
         x: u32,
         y: u32,
         radius: f32,
-        /// Smoothstep shoulder [0, 1]. 0 = hard edge, 1 = smoothstep
-        /// from center outward.
-        falloff: f32,
+        /// 1-D falloff curve from `d/r ∈ [0, 1]` (center → rim) to
+        /// strength `∈ [0, 1]`. Used by Inflate / Deflate to shape
+        /// the per-cell thickness profile; Carve / Raise ignore it.
+        falloff_curve: rkp_core::sculpt::FalloffCurve,
+        /// Max-thickness amplitude in finest-voxel units (used by
+        /// Inflate / Deflate; ignored by Carve / Raise).
+        strength: f32,
+        /// Monotonic stroke identifier — bumped by the editor on
+        /// every LMB-down (start of a new sculpt stroke). The scene
+        /// manager uses this to detect stroke boundaries and clear
+        /// its per-stroke "already touched" cell set, so each new
+        /// stroke starts fresh ("one layer per stroke" feel,
+        /// matching Blender's no-accumulate brush behaviour). Stamps
+        /// within the same stroke share the same value.
+        stroke_seq: u64,
         mode: SculptMode,
         /// Material to assign to leaves that *transition* under the
         /// brush (Empty→Mixed for Raise, Interior→Mixed for newly-
@@ -707,9 +719,21 @@ pub enum EngineCommand {
 /// Sculpt brush mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SculptMode {
+    /// Hard SDF union — fill the brush sphere with material.
     Raise,
+    /// Hard SDF subtract — empty the brush sphere.
     Carve,
+    /// Soft outward dilation — add a falloff-shaped thickness band
+    /// outside the existing surface, masked by the brush radius.
+    /// Blender's Draw / Inflate equivalent.
+    Inflate,
+    /// Soft inward erosion — remove a falloff-shaped thickness band
+    /// from inside the existing surface, masked by the brush radius.
+    /// The "soft Carve" most sculpt programs default to.
+    Deflate,
+    /// (P2) Normal-blend smoothing.
     Smooth,
+    /// (P3) Flatten to local average plane.
     Flatten,
 }
 

@@ -135,7 +135,9 @@ pub(crate) struct PaintPickSettings {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SculptPickSettings {
     pub(crate) radius: f32,
-    pub(crate) falloff: f32,
+    pub(crate) falloff_curve: rkp_core::sculpt::FalloffCurve,
+    pub(crate) strength: f32,
+    pub(crate) stroke_seq: u64,
     pub(crate) mode: crate::command::SculptMode,
     pub(crate) material_id: u16,
 }
