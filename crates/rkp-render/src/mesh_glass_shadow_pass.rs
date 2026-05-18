@@ -20,7 +20,7 @@
 //! Bind-group shape mirrors `mesh_shadow_map_pass`:
 //!   · `g0` — `LightCameraCsm` + `MeshShadowParams` + bone palettes.
 //!     Reused from `MeshShadowMapPass::render_g0_layout`.
-//!   · `g1` — per-instance `MeshShadowInstance` (shared with splat /
+//!   · `g1` — per-instance `MeshShadowInstance` (shared with the
 //!     primary mesh raster).
 //!   · `g2` — glass-classify (leaf_attr_pool + materials + instances
 //!     + overlay + color_pool). Shared with `MeshGlassPass`.
@@ -38,14 +38,14 @@ impl MeshGlassShadowPass {
     pub fn new(
         device: &wgpu::Device,
         render_g0_layout: &wgpu::BindGroupLayout,
-        splat_g1_layout: &wgpu::BindGroupLayout,
+        mesh_g1_layout: &wgpu::BindGroupLayout,
         g2_layout: &wgpu::BindGroupLayout,
     ) -> Self {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh_glass_shadow pipeline layout"),
             bind_group_layouts: &[
                 Some(render_g0_layout),
-                Some(splat_g1_layout),
+                Some(mesh_g1_layout),
                 Some(g2_layout),
             ],
             immediate_size: 0,

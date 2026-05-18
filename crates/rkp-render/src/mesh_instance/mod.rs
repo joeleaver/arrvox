@@ -1,18 +1,15 @@
 //! Shared per-instance render infrastructure for the surface-mesh path.
 //!
-//! Historical note: this module owned the splat-rasterizer prototype.
-//! After the splat→mesh pivot the prototype was retired; the per-instance
-//! uniform layout and bind-group layouts proved general-purpose and are
-//! still used by the mesh raster, mesh shadow render, mesh LOD select,
-//! and user-shader mesh paths. The `splat_*` names will be renamed to
-//! `mesh_*` in the cleanup pass.
+//! Owns the per-instance uniform layout and the g0/g1 bind-group
+//! layouts every raster path consumes — mesh raster, mesh shadow
+//! render, mesh LOD select, mesh glass, and the user-shader mesh path.
 
 pub mod pass;
 
-pub use pass::{SplatInstanceUniform, SplatPass, SKINNING_MODE_NONE, SPLAT_INSTANCE_BYTES};
+pub use pass::{MeshInstanceLayouts, MeshInstanceUniform, MESH_INSTANCE_BYTES, SKINNING_MODE_NONE};
 
 /// One scene-instance to render in this frame's primary-visibility
-/// dispatch. The engine populates a `Vec<SplatDraw>` per visible viewport
+/// dispatch. The engine populates a `Vec<MeshDraw>` per visible viewport
 /// and passes it through to `RkpRenderer::render_to`.
 ///
 /// `asset_handle_raw` is the `AssetHandle::raw()` of the asset to draw —
@@ -26,7 +23,7 @@ pub use pass::{SplatInstanceUniform, SplatPass, SKINNING_MODE_NONE, SPLAT_INSTAN
 /// `0` (LBS) or `1` (DQS) only when this entity has both a live
 /// `Skeleton` component and a baked skin-meta payload on the asset.
 #[derive(Debug, Clone, Copy)]
-pub struct SplatDraw {
+pub struct MeshDraw {
     pub asset_handle_raw: u32,
     pub world: [[f32; 4]; 4],
     pub object_id: u32,

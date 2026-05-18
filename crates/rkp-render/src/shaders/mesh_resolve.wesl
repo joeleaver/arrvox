@@ -1,35 +1,24 @@
-// Splat-resolve compute pass — derives the rest of the G-buffer from
-// the visibility-buffer attachments the raster passes write.
+// Mesh-resolve compute pass — derives the rest of the G-buffer from
+// the visibility-buffer attachments the mesh raster writes.
 //
-// Two input regimes:
-//
-//   Mesh path: writes (position, pick, leaf_slot, rest_pos). The
-//   `rest_pos` target carries the pre-skin mesh-frame position
-//   interpolated barycentrically across each triangle, so the FS-
-//   fragment value is the per-pixel rest-pose surface point. Resolve
-//   walks the asset's octree at that point to recover the actual
-//   per-pixel cell — fixes the chunky-per-triangle look caused by
-//   `@interpolate(flat) leaf_attr_id` in `mesh.wesl`.
-//
-//   Splat path: writes (position, pick, leaf_slot) only. The rest_pos
-//   texture is cleared (so .w == 0) and resolve falls back to using
-//   `leaf_slot_in` directly. This is correct for splats — each splat
-//   IS one cell, so the visibility-buffer slot is already per-pixel
-//   accurate.
+// The mesh raster writes (position, pick, leaf_slot, rest_pos). The
+// `rest_pos` target carries the pre-skin mesh-frame position
+// interpolated barycentrically across each triangle, so the FS-
+// fragment value is the per-pixel rest-pose surface point. Resolve
+// walks the asset's octree at that point to recover the actual
+// per-pixel cell — fixes the chunky-per-triangle look caused by
+// `@interpolate(flat) leaf_attr_id` in `mesh.wesl`.
 //
 // Per pixel:
-//   leaf_slot_in == 0  →  miss. Write zeros to normal/material/glass —
-//                         matching what `octree_march` writes for
-//                         non-hits.
-//   rest_pos.w == 1    →  mesh path. Descend `assets[inst.asset_id]`'s
-//                         octree at `rest_pos.xyz - asset.grid_origin`
-//                         to find the per-pixel slot. If the descent
-//                         lands on EMPTY/INTERIOR or out-of-bounds
-//                         (e.g. mesh interpolation drift past the
-//                         surface), fall back to the visibility-
-//                         buffer `leaf_slot_in` so we never display a
-//                         garbage cell.
-//   else               →  splat path / fallback. Use `leaf_slot_in`.
+//   leaf_slot_in == 0  →  miss. Write zeros to normal/material/glass.
+//   rest_pos.w == 1    →  Descend `assets[inst.asset_id]`'s octree at
+//                         `rest_pos.xyz - asset.grid_origin` to find
+//                         the per-pixel slot. If the descent lands on
+//                         EMPTY/INTERIOR or out-of-bounds (e.g. mesh
+//                         interpolation drift past the surface), fall
+//                         back to the visibility-buffer `leaf_slot_in`
+//                         so we never display a garbage cell.
+//   else               →  fallback. Use `leaf_slot_in` directly.
 //
 // Workgroup size matches the gbuffer's tile granularity (8×8). One
 // dispatch covers the whole viewport.
@@ -256,12 +245,11 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let hint_attr = leaf_attr_pool[hint_slot];
     let hint_normal_oc = unpack_oct_normal(hint_attr.normal_oct);
 
-    // Per-pixel cell selection. Mesh path writes rest_pos.w = 1; splat
-    // path leaves it cleared (.w = 0). On mesh path, walk the asset's
-    // octree at rest_pos to recover the cell that actually contains
-    // this fragment. On splat path (or when the descent fails), use
-    // the visibility-buffer hint as the slot — the existing behaviour
-    // before Phase 6.7.
+    // Per-pixel cell selection. The mesh raster writes rest_pos.w = 1.
+    // Walk the asset's octree at rest_pos to recover the cell that
+    // actually contains this fragment. When the descent fails (mesh
+    // interpolation drift past the surface), fall back to the
+    // visibility-buffer hint slot.
     let rest = textureLoad(rest_pos_in, coord, 0);
     var leaf_slot = hint_slot;
     if (rest.w > 0.5) {
@@ -346,11 +334,11 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                  | ((ci8 & 0xFFu) << 8u)
                  | (color_rgb565 << 16u);
 
-    // gbuf_normal alpha = `accum_alpha` in the march; opaque splat hit
-    // ⇒ 1.0.
+    // gbuf_normal alpha = opaque hit ⇒ 1.0.
     textureStore(normal_out,   coord, vec4<f32>(n_world, 1.0));
     textureStore(material_out, coord, vec4<u32>(packed_r, packed_g, 0u, 0u));
-    // Splats don't write glass — transparency wasn't in scope for the
-    // Phase B-2 prototype. Always zero.
+    // Glass is handled by the dedicated front/back glass pass; the
+    // primary mesh raster discards glass fragments so resolve never
+    // sees them.
     textureStore(glass_out,    coord, vec4<u32>(0u, 0u, 0u, 0u));
 }

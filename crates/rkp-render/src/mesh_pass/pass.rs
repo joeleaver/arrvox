@@ -1,41 +1,29 @@
 //! `MeshPass` — render-pipeline owner for the surface-mesh path.
 //!
-//! Phase 2 of the splat-to-mesh pivot. Same visibility-buffer contract
-//! as `SplatPass`: write (position, pick, leaf_slot) per fragment; the
-//! existing `splat_resolve` compute pass reads those and fills in the
-//! rest of the G-buffer per-pixel. Only the primary-visibility raster
-//! is new; everything downstream is reused.
+//! Writes the visibility-buffer triplet (position, pick, leaf_slot) per
+//! fragment plus the rest-pos target. The `mesh_resolve` compute pass
+//! reads those and fills in the rest of the G-buffer per-pixel.
 //!
-//! Bind-group layouts are SHARED with `SplatPass` — `MeshPass::new`
-//! takes references to splat's layouts and uses them when building the
-//! pipeline. That lets `ViewportRenderer` reuse the splat-side g0 / g1
-//! bind groups without a parallel set of mesh-specific bind groups.
+//! Bind-group layouts come from `MeshInstanceLayouts` (`mesh_instance`
+//! module) and are shared with every other raster path — mesh shadow,
+//! mesh LOD select, mesh glass, user-shader mesh — so `ViewportRenderer`
+//! builds one set of g0 / g1 bind groups and feeds all consumers.
 //!
-//! Differences from `SplatPass`:
-//!   · `TriangleList` topology with an index buffer (vs. `TriangleStrip`
-//!     instancing-quads of 4 verts).
+//! Pipeline shape:
+//!   · `TriangleList` topology with an index buffer.
 //!   · `cull_mode: Some(Back)` — the surface-nets extractor emits
 //!     CCW-outward winding so back-face cull is safe and ~halves the
 //!     fragment work.
-//!   · Vertex layout: per-vertex (not per-instance) — `MeshVertex` at
-//!     a 32 B stride, locations matching `extract::MeshVertex`.
+//!   · Vertex layout: per-vertex — `MeshVertex` at a 32 B stride,
+//!     locations matching `extract::MeshVertex`.
 
 use crate::gbuffer::{GBUFFER_DEPTH_FORMAT, GBUFFER_POSITION_FORMAT, GBUFFER_REST_POS_FORMAT};
 
 use rkp_core::mesh_extract::MeshVertex;
 
-// Same RT formats as the splat path so the visibility-buffer contract
-// is bit-identical and `splat_resolve` accepts the output unchanged.
+// Visibility-buffer formats. `mesh_resolve` is the sole consumer.
 const GBUFFER_PICK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 const GBUFFER_LEAF_SLOT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
-
-/// One scene-instance to render in this frame's mesh dispatch. Same
-/// shape as `SplatDraw`; the engine populates a single `Vec<SplatDraw>`
-/// per frame and feeds it to whichever primary path is active.
-///
-/// (Kept as a separate alias for naming clarity at call sites; the
-/// underlying struct is `crate::splat_pass::SplatDraw`.)
-pub use crate::splat_pass::SplatDraw as MeshDraw;
 
 /// Surface-mesh GPU pass.
 pub struct MeshPass {
@@ -44,15 +32,14 @@ pub struct MeshPass {
 
 impl MeshPass {
     /// Build the mesh raster pipeline. Reuses `g0_layout` / `g1_layout`
-    /// from the splat pass so the same bind groups can drive both
-    /// pipelines. `g2_layout` carries the glass-classification
+    /// from `MeshInstanceLayouts` so the same bind groups drive every
+    /// raster pipeline. `g2_layout` carries the glass-classification
     /// bindings (`leaf_attr_pool` + `materials` + `instances` +
     /// `instance_overlay` + `color_pool_data`); the FS reads them to
     /// `discard` glass fragments so `gbuf_position` only carries
-    /// opaque-hit depth — same convention the march uses (it walks
-    /// past glass cells to find the opaque behind). Reuse
-    /// `MeshGlassPass::g2_layout` so a single bind group drives both
-    /// passes.
+    /// opaque-hit depth — glass is rasterised separately in
+    /// `mesh_glass`. Reuse `MeshGlassPass::g2_layout` so a single bind
+    /// group drives both passes.
     pub fn new(
         device: &wgpu::Device,
         g0_layout: &wgpu::BindGroupLayout,
@@ -150,7 +137,7 @@ impl MeshPass {
                 compilation_options: Default::default(),
                 // Visibility-buffer triplet + rest_pos. Order locked
                 // by `mesh.wesl`'s `FsOut`. The 4th target carries the
-                // pre-skin mesh-frame rest position so `splat_resolve`
+                // pre-skin mesh-frame rest position so `mesh_resolve`
                 // can descend the asset's octree per pixel — fixes the
                 // chunky-per-triangle look of `@interpolate(flat)
                 // leaf_attr_id`.
@@ -190,8 +177,7 @@ impl MeshPass {
     }
 
     /// Begin a mesh render pass on the supplied G-buffer attachments.
-    /// Clear values mirror the splat path so miss pixels carry the same
-    /// march-equivalent sentinels:
+    /// Clear values:
     ///
     /// | target      | clear value     |
     /// |-------------|-----------------|
@@ -203,7 +189,7 @@ impl MeshPass {
     ///
     /// `rest_pos` clears to .w = 0 (the "no rest_pos written" sentinel)
     /// so any miss pixel reads as "fall back to leaf_slot" in
-    /// `splat_resolve`.
+    /// `mesh_resolve`.
     pub fn begin_pass<'a>(
         &'a self,
         encoder: &'a mut wgpu::CommandEncoder,

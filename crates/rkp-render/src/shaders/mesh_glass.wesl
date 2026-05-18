@@ -70,7 +70,7 @@ struct DualQuat {
 
 @group(1) @binding(0) var<uniform> instance: MeshInstance;
 
-// Scene-global glass lookup tables. Same buffers `splat_resolve` and
+// Scene-global glass lookup tables. Same buffers `mesh_resolve` and
 // the march bind, just exposed as a separate group here so the mesh
 // pipeline's existing g0/g1 layouts stay unchanged.
 //
@@ -96,9 +96,9 @@ struct DualQuat {
 // Octree-lookup bindings — feed `lookup_cell_at` so the front FS can
 // resolve the actual surface cell at the fragment's mesh-frame
 // rest_pos (instead of barycentric-blending per-vertex normals).
-// Matches the splat_resolve binding set so we get the same
+// Matches the mesh_resolve binding set so we get the same
 // per-pixel quality the primary mesh path achieves via
-// `splat_resolve`.
+// `mesh_resolve`.
 @group(2) @binding(6) var<storage, read> assets: array<RkpAsset>;
 @group(2) @binding(7) var<storage, read> octree_nodes: array<vec4<u32>>;
 @group(2) @binding(8) var<storage, read> brick_pool: array<u32>;
@@ -140,7 +140,7 @@ struct VsOut {
     /// `-local_normal` to land safely inside a surface cell, then
     /// reads that cell's prefiltered `LeafAttr.normal_oct` for the
     /// final normal. This matches the per-pixel quality the primary
-    /// mesh path gets from `splat_resolve`.
+    /// mesh path gets from `mesh_resolve`.
     @location(2) world_normal: vec3<f32>,
     /// Pre-skin, mesh-frame local position. Same value the surface-
     /// nets extractor wrote per vertex; barycentric-interpolated to
@@ -257,7 +257,7 @@ fn vert_main(
     return out;
 }
 
-// Lifted byte-for-byte from `splat_resolve.wesl::lookup_cell_at`.
+// Lifted byte-for-byte from `mesh_resolve.wesl::lookup_cell_at`.
 // Walks the asset's octree at a known oc-space surface point and
 // returns the `leaf_attr_pool` slot of the surface cell visible at
 // this fragment, or `0` ("no slot") if no occupied cell is found in
@@ -347,9 +347,9 @@ struct GlassClass {
 //      and asset-pool-glass both classify identically.
 //   2. `materials[material_primary].opacity < 0.99` ⇒ glass;
 //      otherwise return the discard sentinel.
-// `instance.object_id` doubles as the instance-array index (mesh +
-// splat paths both write the slot index into `object_id`, and
-// `splat_resolve` indexes `instances[]` with the same value).
+// `instance.object_id` doubles as the instance-array index — the
+// mesh raster writes the slot index into `object_id` and
+// `mesh_resolve` indexes `instances[]` with the same value.
 fn classify_glass(leaf_attr_id: u32) -> GlassClass {
     let inst = instances[instance.object_id];
     let attr = fetch_leaf_attr_for(inst, leaf_attr_id);
@@ -385,7 +385,7 @@ fn frag_front(in: VsOut) -> FsFront {
     let cls = classify_glass(in.leaf_attr_id);
     if cls.material_id == 0xFFFFFFFFu { discard; }
 
-    // Per-pixel resolved normal — same path `splat_resolve` takes
+    // Per-pixel resolved normal — same path `mesh_resolve` takes
     // for the primary mesh G-buffer. Look up the actual surface
     // cell at this fragment's mesh-frame rest position, fall back
     // to the per-vertex interpolated normal if the descent fails

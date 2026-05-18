@@ -823,7 +823,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // how much of the painted RGB to lerp in on top of base_color, so
     // soft-falloff brushes fade smoothly into the underlying material
     // at the edge instead of stamping a hard boundary disc. Layout
-    // matches `splat_resolve.wesl` and `octree_march.wesl`.
+    // matches `mesh_resolve.wesl` and `octree_march.wesl`.
     let color_rgb565 = (packed_g >> 16u) & 0xFFFFu;
     var albedo = base_color;
     if color_rgb565 != 0u {
@@ -835,7 +835,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         );
         // intensity == 0 ⇒ keep base_color (mix with t=0); intensity
         // == 1 ⇒ full painted_rgb override. Both write paths
-        // (`splat_resolve.wesl`, `octree_march.wesl`) are responsible
+        // (`mesh_resolve.wesl`, `octree_march.wesl`) are responsible
         // for packing the brush intensity here.
         let intensity = f32((packed_g >> 8u) & 0xFFu) / 255.0;
         albedo = mix(base_color, painted_rgb, intensity);
@@ -899,10 +899,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var shadow_data = vec4<f32>(0.0);
     var w_sum = 0.0;
     var bilinear_data = vec4<f32>(0.0);
-    // Isolation: shadow_trace pass is skipped, so shadow_tex contains
+    // Isolation: shadow pass is skipped, so shadow_tex may contain
     // stale data. Force fully-lit and bypass the bilateral gather.
-    // Splat path takes the same branch via `shadow_disabled` — see
-    // ShadeParams docs.
+    // `shadow_disabled` takes the same branch — see ShadeParams docs.
     if shade_params.isolation != 0u || shade_params.shadow_disabled != 0u {
         shadow_data = vec4<f32>(1.0);
         w_sum = 1.0;

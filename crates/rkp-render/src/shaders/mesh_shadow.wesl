@@ -1,8 +1,7 @@
 // Mesh-rendered shadow map — depth-only render.
 //
-// Phase 3 of the splat-to-mesh pivot. Vertex stage projects mesh
-// triangles through the directional light's view-proj into a 1024²
-// `Depth32Float` attachment. There is NO fragment shader — the
+// Vertex stage projects mesh triangles through the directional
+// light's view-proj into a `Depth32Float` attachment. There is NO fragment shader — the
 // rasterizer fills depth on its own. This lets the GPU run early-z
 // culling at full speed; the prior atomic-min-from-fragment approach
 // disabled early-z because the fragment had a side effect, costing

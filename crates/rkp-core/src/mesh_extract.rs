@@ -7,11 +7,10 @@
 //! active sample-edge (an axis edge between a solid cell and an EMPTY
 //! cell). Vertices carry an octahedral-packed average normal and a
 //! `leaf_attr_id` slot for the resolve / shade pass to look up
-//! prefiltered surface attributes — the same indirection
-//! [`SplatVertex`](crate::splat_pass::SplatVertex) uses.
+//! prefiltered surface attributes via the `leaf_attr_pool`.
 //!
-//! No GPU work in Phase 1 — this just produces `(vertices, indices)`
-//! that the per-asset cache stores alongside the splat buffer.
+//! No GPU work here — this just produces `(vertices, indices)` that
+//! the per-asset cache stores.
 
 use glam::{IVec3, UVec3, Vec3};
 use rustc_hash::FxHashMap;
@@ -282,9 +281,7 @@ impl Default for SculptExtractScratch {
 ///
 /// 32 B, `repr(C)`, `bytemuck`-castable straight into a vertex buffer.
 /// Positions are **object-local**; the per-instance world matrix is
-/// applied in the vertex shader. Layout matches
-/// [`SplatVertex`](crate::splat_pass::SplatVertex)'s 32 B stride so the
-/// per-asset GPU cache can use the same allocation logic.
+/// applied in the vertex shader.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MeshVertex {
@@ -398,13 +395,12 @@ const CELL_INTERIOR_GRID: u32 = u32::MAX - 1;
 ///
 /// * `octree_nodes` — `tree.as_slice()` from the asset's `SparseOctree`.
 ///   Must already have its brick ids and per-cell `leaf_attr_id` slots
-///   remapped to scene-global values (matches the splat extractor's
-///   contract).
+///   remapped to scene-global values.
 /// * `octree_depth` — the asset's `depth` field (matches
 ///   `SparseOctree::depth()`).
 /// * `base_voxel_size` — finest cell edge length in object-local units.
 /// * `grid_origin` — object-local position of the octree extent's lo
-///   corner, same value used by `extract_splats`.
+///   corner.
 /// * `brick_cells` — flat brick storage; `brick_id * BRICK_CELLS + flat`
 ///   indexes into it.
 /// * `leaf_attr_pool` — the scene-global LeafAttr pool. Indexed by

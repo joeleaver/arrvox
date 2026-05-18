@@ -1,27 +1,27 @@
-//! `SplatResolvePass` — compute fixup for the splat path's G-buffer.
+//! `MeshResolvePass` — compute fixup for the mesh raster's G-buffer.
 //!
-//! The splat raster pass writes only the visibility-buffer triplet
-//! (position, pick, leaf_slot) — staying within wgpu's default 32 B/sample
-//! color-attachment limit. This pass reads that triplet and fills in
-//! the rest of the G-buffer (normal, material, glass) by chasing the
-//! same `leaf_attr_pool` / `color_pool` / `instances` indirection
-//! `octree_march` would. See `shaders/splat_resolve.wesl` for the
+//! The mesh raster writes only the visibility-buffer triplet
+//! (position, pick, leaf_slot) plus a rest-pos target — staying within
+//! wgpu's default 32 B/sample color-attachment limit. This pass reads
+//! those and fills in the rest of the G-buffer (normal, material,
+//! glass) by chasing the `leaf_attr_pool` / `color_pool` / `instances`
+//! indirection per pixel. See `shaders/mesh_resolve.wesl` for the
 //! WGSL contract.
 
-/// Compute pipeline + bind group layouts for the splat resolve pass.
+/// Compute pipeline + bind group layouts for the mesh-resolve pass.
 /// One instance shared across all viewports — the per-VR resources
 /// (texture views + scene buffers) live on `ViewportRenderer`.
-pub struct SplatResolvePass {
+pub struct MeshResolvePass {
     pub pipeline: wgpu::ComputePipeline,
     pub g0_layout: wgpu::BindGroupLayout,
     pub g1_layout: wgpu::BindGroupLayout,
 }
 
-impl SplatResolvePass {
+impl MeshResolvePass {
     pub fn new(device: &wgpu::Device) -> Self {
         // ── g0: per-VR textures ─────────────────────────────────────
         let g0_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("splat_resolve g0"),
+            label: Some("mesh_resolve g0"),
             entries: &[
                 // leaf_slot_in (R32Uint, sampled)
                 wgpu::BindGroupLayoutEntry {
@@ -106,15 +106,14 @@ impl SplatResolvePass {
             count: None,
         };
         let g1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("splat_resolve g1"),
+            label: Some("mesh_resolve g1"),
             entries: &[
-                // 0 = leaf_attr_pool, 1 = color_pool, 2 = instances —
-                // unchanged from the pre-Phase-6.7 layout.
+                // 0 = leaf_attr_pool, 1 = color_pool, 2 = instances.
                 wgpu::BindGroupLayoutEntry { binding: 0, ..storage_ro },
                 wgpu::BindGroupLayoutEntry { binding: 1, ..storage_ro },
                 wgpu::BindGroupLayoutEntry { binding: 2, ..storage_ro },
-                // 3 = assets, 4 = octree_nodes, 5 = brick_pool — added
-                // for per-pixel octree descent on the mesh path.
+                // 3 = assets, 4 = octree_nodes, 5 = brick_pool — for
+                // per-pixel octree descent on the mesh path.
                 wgpu::BindGroupLayoutEntry { binding: 3, ..storage_ro },
                 wgpu::BindGroupLayoutEntry { binding: 4, ..storage_ro },
                 wgpu::BindGroupLayoutEntry { binding: 5, ..storage_ro },
@@ -122,7 +121,7 @@ impl SplatResolvePass {
                 // but `lib::octree::descend_proto_octree` references it
                 // as a free name and the WESL composer pulls the whole
                 // module into the emitted WGSL — see the matching
-                // comment in `splat_resolve.wesl`.
+                // comment in `mesh_resolve.wesl`.
                 wgpu::BindGroupLayoutEntry { binding: 6, ..storage_ro },
                 // 7 = instance_overlay. Required so `fetch_leaf_attr_for`
                 // / `fetch_leaf_color_for` (from `lib::leaf_attr`) can
@@ -141,19 +140,19 @@ impl SplatResolvePass {
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("splat_resolve pipeline layout"),
+            label: Some("mesh_resolve pipeline layout"),
             bind_group_layouts: &[Some(&g0_layout), Some(&g1_layout)],
             immediate_size: 0,
         });
 
         let module = crate::compile_pass_shader(
             device,
-            wesl::include_wesl!("splat_resolve"),
-            "splat_resolve",
+            wesl::include_wesl!("mesh_resolve"),
+            "mesh_resolve",
         );
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("splat_resolve"),
+            label: Some("mesh_resolve"),
             layout: Some(&pipeline_layout),
             module: &module,
             entry_point: Some("cs_main"),
@@ -177,7 +176,7 @@ impl SplatResolvePass {
         rest_pos_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("splat_resolve g0 bg"),
+            label: Some("mesh_resolve g0 bg"),
             layout: &self.g0_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(leaf_slot_view) },
@@ -207,7 +206,7 @@ impl SplatResolvePass {
         instance_sculpt_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("splat_resolve g1 bg"),
+            label: Some("mesh_resolve g1 bg"),
             layout: &self.g1_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: leaf_attr_pool_buffer.as_entire_binding() },
@@ -224,7 +223,7 @@ impl SplatResolvePass {
     }
 
     /// One dispatch covers the full viewport at 8×8 tile granularity
-    /// (matching the workgroup size in `splat_resolve.wesl`).
+    /// (matching the workgroup size in `mesh_resolve.wesl`).
     pub fn dispatch(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -234,7 +233,7 @@ impl SplatResolvePass {
         height: u32,
     ) {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("splat_resolve"),
+            label: Some("mesh_resolve"),
             timestamp_writes: None,
         });
         cpass.set_pipeline(&self.pipeline);

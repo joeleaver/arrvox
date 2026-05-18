@@ -1,26 +1,19 @@
 //! Shared per-instance render infrastructure.
 //!
-//! Owns the `SplatInstanceUniform` (per-scene-instance uniform — world
+//! Owns the `MeshInstanceUniform` (per-scene-instance uniform — world
 //! matrix, object id, bone-skinning state) and the bind-group layouts
 //! every raster path consumes:
 //!  * `g0` — scene-wide: camera + leaf_attr_pool + bone_matrices +
 //!    bone_dual_quats. One bind group per pass.
-//!  * `g1` — per-instance: a 96 B `SplatInstanceUniform`. One bind group
+//!  * `g1` — per-instance: a 96 B `MeshInstanceUniform`. One bind group
 //!    per scene instance.
-//!
-//! Historical note: this file used to also own the splat-raster render
-//! pipeline. After the splat→mesh pivot the raster was retired; the
-//! per-instance uniform + layouts proved general-purpose and are still
-//! used by the mesh raster, mesh shadow render, mesh LOD select, and
-//! user-shader mesh paths. Names will be renamed `splat_*` → `mesh_*` in
-//! the cleanup audit.
 
 use crate::rkp_scene::CameraUniforms;
 
 /// Per-instance uniform — one mat4 world transform, the entity's
 /// `object_id` (written into the pick texture), and the per-instance
 /// bone-skinning state. 96 B, multiple of 16. CPU mirror of the
-/// `SplatInstance` struct in the mesh raster + shadow shaders.
+/// `MeshInstance` struct in the mesh raster + shadow shaders.
 ///
 /// **Skinning semantics:**
 /// * `skinning_mode == SKINNING_MODE_NONE` → instance is not skinned
@@ -49,7 +42,7 @@ use crate::rkp_scene::CameraUniforms;
 /// for debugging.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct SplatInstanceUniform {
+pub struct MeshInstanceUniform {
     pub world: [[f32; 4]; 4],
     /// Asset's voxel-grid origin in mesh-frame; bridge between
     /// vertex local_pos (mesh-frame) and bone-matrix input frame
@@ -73,36 +66,36 @@ pub struct SplatInstanceUniform {
 /// an extra "is_skinned" flag.
 pub const SKINNING_MODE_NONE: u32 = u32::MAX;
 
-const _: () = assert!(std::mem::size_of::<SplatInstanceUniform>() == 96);
+const _: () = assert!(std::mem::size_of::<MeshInstanceUniform>() == 96);
 // Hand-checked field offsets — must match the WGSL declaration in
 // `mesh.wesl` / `mesh_shadow.wesl`. WGSL's uniform buffer layout
 // treats vec3 as size-12-align-16, so a u32 following vec3 sits
 // immediately after at offset 76 (no auto-pad to 80).
 const _: () = {
     use std::mem::offset_of;
-    assert!(offset_of!(SplatInstanceUniform, world) == 0);
-    assert!(offset_of!(SplatInstanceUniform, grid_origin) == 64);
-    assert!(offset_of!(SplatInstanceUniform, object_id) == 76);
-    assert!(offset_of!(SplatInstanceUniform, bone_offset_lbs) == 80);
-    assert!(offset_of!(SplatInstanceUniform, bone_offset_dqs) == 84);
-    assert!(offset_of!(SplatInstanceUniform, skinning_mode) == 88);
-    assert!(offset_of!(SplatInstanceUniform, _pad) == 92);
+    assert!(offset_of!(MeshInstanceUniform, world) == 0);
+    assert!(offset_of!(MeshInstanceUniform, grid_origin) == 64);
+    assert!(offset_of!(MeshInstanceUniform, object_id) == 76);
+    assert!(offset_of!(MeshInstanceUniform, bone_offset_lbs) == 80);
+    assert!(offset_of!(MeshInstanceUniform, bone_offset_dqs) == 84);
+    assert!(offset_of!(MeshInstanceUniform, skinning_mode) == 88);
+    assert!(offset_of!(MeshInstanceUniform, _pad) == 92);
 };
-pub const SPLAT_INSTANCE_BYTES: u64 = std::mem::size_of::<SplatInstanceUniform>() as u64;
+pub const MESH_INSTANCE_BYTES: u64 = std::mem::size_of::<MeshInstanceUniform>() as u64;
 
 /// Shared per-instance bind-group layouts (g0 = scene-wide,
 /// g1 = per-instance). Owned by every raster path the renderer
 /// dispatches.
-pub struct SplatPass {
+pub struct MeshInstanceLayouts {
     pub g0_layout: wgpu::BindGroupLayout,
     pub g1_layout: wgpu::BindGroupLayout,
 }
 
-impl SplatPass {
+impl MeshInstanceLayouts {
     pub fn new(device: &wgpu::Device) -> Self {
         // ── g0: scene-wide bindings ────────────────────────────────
         let g0_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("splat g0"),
+            label: Some("mesh g0"),
             entries: &[
                 // camera (uniform)
                 wgpu::BindGroupLayoutEntry {
@@ -167,14 +160,14 @@ impl SplatPass {
         // (vertex+fragment) AND the `mesh_lod_select` compute pass —
         // one bind group, one layout.
         let g1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("splat g1"),
+            label: Some("mesh g1"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size: std::num::NonZeroU64::new(SPLAT_INSTANCE_BYTES),
+                    min_binding_size: std::num::NonZeroU64::new(MESH_INSTANCE_BYTES),
                 },
                 count: None,
             }],
@@ -194,7 +187,7 @@ impl SplatPass {
         bone_dual_quats_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("splat g0 bg"),
+            label: Some("mesh g0 bg"),
             layout: &self.g0_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -224,7 +217,7 @@ impl SplatPass {
         instance_uniform_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("splat g1 bg"),
+            label: Some("mesh g1 bg"),
             layout: &self.g1_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,

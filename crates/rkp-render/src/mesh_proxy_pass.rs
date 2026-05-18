@@ -8,17 +8,16 @@
 //!     and object_id (g1). No bones, no scene buffers, no LeafAttr
 //!     pool. Proxy meshes carry their full shading data per-vertex.
 //!   · FS writes the **full** G-buffer directly: position, pick,
-//!     normal, material, glass=0. No `splat_resolve` participation.
+//!     normal, material, glass=0. No `mesh_resolve` participation.
 //!   · Render-pass attachments load (not clear) so the proxy
-//!     composites on top of whatever the octree-mesh + splat path +
-//!     `splat_resolve` already wrote, with depth-test against the
-//!     shared depth attachment.
+//!     composites on top of whatever the mesh raster + `mesh_resolve`
+//!     already wrote, with depth-test against the shared depth
+//!     attachment.
 //!
 //! Scheduling order each frame:
-//!   1. octree-mesh raster        → visibility buffer + depth
-//!   2. splat raster              → visibility buffer + depth
-//!   3. splat_resolve compute     → gbuf_normal/material/glass
-//!   4. **mesh_proxy raster**     → gbuf_position/pick/normal/material/glass + depth
+//!   1. mesh raster              → visibility buffer + depth
+//!   2. mesh_resolve compute     → gbuf_normal/material/glass
+//!   3. **mesh_proxy raster**    → gbuf_position/pick/normal/material/glass + depth
 //!
 //! See `notes/proxy-mesh-first-class.md` for the full architecture.
 
@@ -245,9 +244,9 @@ impl MeshProxyPass {
     }
 
     /// Begin the proxy raster render pass. **Loads** all attachments —
-    /// the octree-mesh raster + splat raster + splat_resolve already
-    /// wrote the G-buffer for their pixels, and proxy meshes composite
-    /// on top via depth-test against the shared depth buffer.
+    /// the mesh raster + mesh_resolve already wrote the G-buffer for
+    /// their pixels, and proxy meshes composite on top via depth-test
+    /// against the shared depth buffer.
     pub fn begin_pass<'a>(
         &'a self,
         encoder: &'a mut wgpu::CommandEncoder,

@@ -82,7 +82,7 @@ impl RenderContext {
                     // position (Rgba32Float, 16 B) + pick (R32Uint, 4 B) +
                     // leaf_slot (R32Uint, 4 B) + rest_pos (Rgba32Float,
                     // 16 B) = 40 B/sample. rest_pos was added in Phase
-                    // 6.7 for per-pixel cell sampling in `splat_resolve`.
+                    // 6.7 for per-pixel cell sampling in `mesh_resolve`.
                     // Desktop GPUs (RTX 20+, RDNA2+) report 64-128 B; take
                     // whatever the adapter exposes so the default cap is
                     // lifted.
@@ -216,7 +216,7 @@ impl RenderContext {
                     // position (Rgba32Float, 16 B) + pick (R32Uint, 4 B) +
                     // leaf_slot (R32Uint, 4 B) + rest_pos (Rgba32Float,
                     // 16 B) = 40 B/sample. rest_pos was added in Phase
-                    // 6.7 for per-pixel cell sampling in `splat_resolve`.
+                    // 6.7 for per-pixel cell sampling in `mesh_resolve`.
                     // Desktop GPUs (RTX 20+, RDNA2+) report 64-128 B; take
                     // whatever the adapter exposes so the default cap is
                     // lifted.

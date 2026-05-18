@@ -16,8 +16,8 @@ use rkp_core::{DirtyRanges, OctreeHandle, SparseOctree};
 /// records byte offsets so it can drive `queue.write_buffer` directly.
 pub(super) const MESH_INDEX_STRIDE: u32 = 4;
 
-/// Face instance for CPU-side face emission (legacy — kept for scene loading
-/// compatibility; the splat raster pipeline it fed is not dispatched).
+/// Face instance for CPU-side face emission (legacy — kept for scene
+/// loading compatibility; nothing dispatches against this anymore).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct FaceInstance {
@@ -653,8 +653,8 @@ pub struct VoxelizeResult {
 }
 
 /// Emit face instances from an octree into the given buffer. Legacy —
-/// splat raster is not dispatched in the active pipeline. Kept for
-/// scene-loading compatibility: every leaf is a surface voxel now, so the
+/// nothing in the active pipeline reads these. Kept for scene-
+/// loading compatibility: every leaf is a surface voxel now, so the
 /// output just enumerates leaf centers with exposed-face flags.
 pub(super) fn emit_faces(
     octree: &SparseOctree,

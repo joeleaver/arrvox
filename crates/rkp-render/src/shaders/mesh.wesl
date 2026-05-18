@@ -1,10 +1,9 @@
 // Surface-mesh rasterizer — vertex + fragment entry points.
 //
-// Phase 2 of the splat-to-mesh pivot. Mirrors `splat.wesl`'s
-// visibility-buffer contract: the raster writes (position, pick,
-// leaf_slot); the existing `splat_resolve` compute pass fills in the
-// rest of the G-buffer (normal / material / glass) per-pixel via the
-// `leaf_attr_pool` indirection.
+// Visibility-buffer contract: the raster writes (position, pick,
+// leaf_slot) plus a rest-pos target; the `mesh_resolve` compute pass
+// fills in the rest of the G-buffer (normal / material / glass)
+// per-pixel via the `leaf_attr_pool` indirection.
 //
 // Pipeline contract:
 //   · Vertex buffer: one `MeshVertex` per surface-net SN-cube vertex.
@@ -20,11 +19,11 @@
 //     world matrix + bone offsets come from `instance` at @group(1)
 //     @binding(0).
 //
-// Bind-group shape is identical to `splat.wesl`'s so the same
-// `splat_g0` / `splat_instance_*` bind groups can be reused for the
-// mesh pipeline. `bone_matrices` / `bone_dual_quats` were added in
-// Phase 6.6 (mesh-VS skinning) — the splat path declares them in the
-// shared layout but doesn't read them.
+// Bind-group shape is shared with the other mesh paths (mesh shadow,
+// mesh LOD select, mesh glass, user-shader mesh) — the `mesh g0` /
+// `mesh g1` bind groups built from `MeshInstanceLayouts` drive every
+// per-instance raster. `bone_matrices` / `bone_dual_quats` are read
+// only when the per-instance `skinning_mode` selects LBS or DQS.
 
 import package::lib::types::CameraUniforms;
 import package::lib::types::LeafAttr;
@@ -49,9 +48,9 @@ import package::lib::brick::BRICK_CELLS;
 import package::lib::brick::BRICK_CELL_EMPTY;
 import package::lib::brick::BRICK_CELL_INTERIOR;
 
-// Per-instance uniform — shape-compatible with `splat.wesl`'s
-// `SplatInstance` (96 B). Skinning fields drive the VS branch —
-// see `SKINNING_MODE_NONE` below for the rest-pose sentinel.
+// Per-instance uniform — 96 B, mirror of `MeshInstanceUniform` on
+// the CPU side. Skinning fields drive the VS branch — see
+// `SKINNING_MODE_NONE` below for the rest-pose sentinel.
 //
 // `grid_origin` is the asset's voxel-grid origin in mesh-frame —
 // the same value the surface-mesh extractor added to every cell's
@@ -70,9 +69,10 @@ struct MeshInstance {
     skinning_mode: u32,
 }
 
-// Sentinel matching `splat_pass::SKINNING_MODE_NONE`. Skips skinning
-// regardless of per-vertex weights — used for rigid instances and for
-// skinned assets without a live `Skeleton` (no bone matrices uploaded).
+// Sentinel matching `mesh_instance::SKINNING_MODE_NONE`. Skips
+// skinning regardless of per-vertex weights — used for rigid
+// instances and for skinned assets without a live `Skeleton` (no
+// bone matrices uploaded).
 const SKINNING_MODE_NONE: u32 = 0xFFFFFFFFu;
 const SKINNING_MODE_LBS: u32 = 0u;
 const SKINNING_MODE_DQS: u32 = 1u;
@@ -122,7 +122,7 @@ struct DualQuat {
 // interpolated `leaf_attr_id` (one cell per SN-cube vertex shared
 // across many triangles), and carving one slot removes whole
 // meshlet-scale regions. With per-pixel resolve, the carve hole
-// follows voxel resolution. Matches the binding set splat_resolve +
+// follows voxel resolution. Matches the binding set mesh_resolve +
 // mesh_glass use.
 @group(2) @binding(6) var<storage, read> assets: array<RkpAsset>;
 @group(2) @binding(7) var<storage, read> octree_nodes: array<vec4<u32>>;
@@ -153,7 +153,7 @@ struct VsOut {
     @location(1) @interpolate(flat) leaf_attr_id: u32,
     // Pre-skin, mesh-frame local position. Interpolates barycentrically
     // across the triangle so the FS gets the per-pixel rest-pose
-    // surface point. `splat_resolve` uses this to descend the asset's
+    // surface point. `mesh_resolve` uses this to descend the asset's
     // octree per pixel and recover the actual cell — fixes the
     // chunky-per-triangle look caused by `@interpolate(flat) leaf_attr_id`.
     // Same value for skinned and unskinned (skinning happens AFTER this
@@ -161,7 +161,7 @@ struct VsOut {
     @location(2) local_rest_pos: vec3<f32>,
     // Pre-skin per-vertex local normal (unpacked from `normal_oct`).
     // Used by the FS as `hint_normal_oc` for `lookup_cell_at`'s
-    // ½-voxel-into-solid snap — same trick mesh_glass / splat_resolve
+    // ½-voxel-into-solid snap — same trick mesh_glass / mesh_resolve
     // use to land the descent on the correct surface cell (SN-vertices
     // sit between cells; the snap nudges back inside).
     @location(3) local_normal: vec3<f32>,
@@ -246,7 +246,7 @@ fn skin_dqs(p: vec3<f32>, indices: u32, weights: u32, offset: u32) -> vec3<f32> 
 
 // `normal_oct` (vertex location 1) is unpacked and forwarded as
 // `local_normal` for the FS's per-pixel resolve (the ½-voxel snap
-// in `lookup_cell_at`). Splat-resolve reads `LeafAttr.normal_oct`
+// in `lookup_cell_at`). `mesh_resolve` reads `LeafAttr.normal_oct`
 // from the pool slot for the final shading normal; this per-vertex
 // value is purely a hint to land the cell descent on the right side
 // of the surface.
@@ -298,13 +298,13 @@ fn vert_main(
 
 // Per-pixel surface-cell lookup. Lifted byte-for-byte from
 // `mesh_glass.wesl::lookup_cell_at`, which lifted it from
-// `splat_resolve.wesl`. Returns the `leaf_attr_pool` slot of the
+// `mesh_resolve.wesl`. Returns the `leaf_attr_pool` slot of the
 // surface cell at `oc_pos` (descended through the octree + brick
 // pool), or `0` ("no slot") if the descent lands on EMPTY /
 // INTERIOR or misses the brick neighborhood. Caller falls back to
 // the flat-interpolated `leaf_attr_id` on a `0` return.
 //
-// See `splat_resolve.wesl` for the full rationale on the ½-voxel
+// See `mesh_resolve.wesl` for the full rationale on the ½-voxel
 // solid snap and the 3×3×3 brick-cell search — both compensate for
 // SN-vertices living between cells (not on them) and for
 // FP/skinning slop in the rasterized rest_pos.
@@ -372,7 +372,7 @@ fn lookup_cell_at(asset: RkpAsset, oc_pos: vec3<f32>, hint_normal_oc: vec3<f32>)
 }
 
 // Four-attachment fragment output — visibility-buffer triplet plus
-// rest_pos for per-pixel cell descent in `splat_resolve`:
+// rest_pos for per-pixel cell descent in `mesh_resolve`:
 //   position   (Rgba32Float, 16 B): world.xyz + hit_distance
 //   pick       (R32Uint,      4 B): instance.object_id
 //   leaf_slot  (R32Uint,      4 B): leaf_attr_id (provoking vertex's
@@ -444,10 +444,8 @@ fn frag_main(in: VsOut) -> FsOut {
     out.position  = vec4<f32>(in.world_pos, hit_distance);
     out.pick      = instance.object_id;
     out.leaf_slot = in.leaf_attr_id;
-    // .w = 1 marks this pixel as "mesh wrote rest_pos" — splat_resolve
-    // gates the per-pixel descent on this. Splat path leaves the
-    // texture cleared so .w stays 0 there and resolve falls back to
-    // leaf_slot.
+    // .w = 1 marks this pixel as "mesh wrote rest_pos" — mesh_resolve
+    // gates the per-pixel descent on this.
     out.rest_pos  = vec4<f32>(in.local_rest_pos, 1.0);
     return out;
 }

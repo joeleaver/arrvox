@@ -239,11 +239,10 @@ pub(super) fn encode_viewports(
             vp.mode,
             vp.preview_mode,
             // Phase B-2 — splat-raster instance list. Built in
-            // `update_scene_gpu` from `Renderable.asset_handle`; the
-            // march path ignores it. Procedural entities without an
-            // `AssetHandle` don't appear here and won't render under
-            // `RKP_PRIMARY=splat`.
-            &frame.splat_draws,
+            // `update_scene_gpu` from `Renderable.asset_handle`.
+            // Procedural entities without an `AssetHandle` don't
+            // appear here — they ride `proxy_draws` instead.
+            &frame.mesh_draws,
             // Procedural proxy-mesh draws. Rendered after primary
             // visibility regardless of `primary_mode` — proxy meshes
             // are first-class scene geometry.

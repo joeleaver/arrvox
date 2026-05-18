@@ -4,7 +4,7 @@
 //! The previous design used a single `bool` flag, which gave the
 //! consumer no way to do anything other than a full O(N) rebuild of
 //! every derived structure (gpu_assets, gpu_instances, overlays,
-//! sculpts, splat_draws, proxy_draws, gpu_to_entity, entity_to_gpu)
+//! sculpts, mesh_draws, proxy_draws, gpu_to_entity, entity_to_gpu)
 //! whenever any single entity changed. On a 22-entity scene a single
 //! sculpt stamp would therefore re-process all 22 entities — wasting
 //! 60-75 ms per stamp.

@@ -1,4 +1,4 @@
-// Per-cluster LOD selection — Phase 6.2 of the splat-to-mesh pivot.
+// Per-cluster LOD selection.
 //
 // One thread per (asset_instance, cluster). Reads the asset's
 // `MeshletCluster` table; applies the Karis-Nanite admit rule

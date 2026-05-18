@@ -29,10 +29,10 @@
 //!    runs unchanged.
 //!
 //! Bind groups (raster passes):
-//!   · `g0` — camera + bones (reuses splat path's `g0_layout`).
-//!   · `g1` — per-instance `MeshInstance` (reuses splat path's
-//!            `g1_layout` and the existing `splat_instance_bind_groups`
-//!            in `ViewportRenderer`).
+//!   · `g0` — camera + bones (reuses `MeshInstanceLayouts.g0_layout`).
+//!   · `g1` — per-instance `MeshInstance` (reuses
+//!            `MeshInstanceLayouts.g1_layout` and the existing
+//!            `mesh_instance_bind_groups` in `ViewportRenderer`).
 //!   · `g2` — `leaf_attr_pool` (binding 0) + `materials` (binding 1).
 //!            Scene-global; rebuilt by the caller when either backing
 //!            buffer reallocates.

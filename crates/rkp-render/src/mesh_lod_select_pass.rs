@@ -12,8 +12,9 @@
 //! Bind-group shape:
 //!   · `g0` = camera + per-draw `MeshLodSelectParams` uniforms
 //!     (`pixel_threshold`, `focal_pixels`, `cluster_count`)
-//!   · `g1` = per-instance world matrix uniform (reuses splat's
-//!     `g1_layout` — same `MeshInstance` shape as the render path)
+//!   · `g1` = per-instance world matrix uniform (reuses
+//!     `MeshInstanceLayouts.g1_layout` — same `MeshInstance` shape
+//!     as the render path)
 //!   · `g2` = per-asset cluster table (storage, read) + per-draw
 //!     args buffer (storage, read-write) + pass-shared stats
 //!     histogram (storage, read-write) + per-draw atomic count
@@ -81,17 +82,17 @@ pub struct MeshLodSelectPass {
     /// Layout for `g0`: camera (binding 0) + LOD params (binding 1).
     pub g0_layout: wgpu::BindGroupLayout,
     /// Layout for `g2`: cluster table + args buffer. (`g1` is the
-    /// caller-passed splat g1 layout for the per-instance uniform.)
+    /// caller-passed mesh g1 layout for the per-instance uniform.)
     pub g2_layout: wgpu::BindGroupLayout,
 }
 
 impl MeshLodSelectPass {
-    /// Build the compute pipeline. `splat_g1_layout` is reused for
+    /// Build the compute pipeline. `mesh_g1_layout` is reused for
     /// `g1` directly so the existing per-VR
-    /// `splat_instance_bind_groups` drive both the render path (vertex
-    /// stage) and this compute pass without duplication. The splat
+    /// `mesh_instance_bind_groups` drive both the render path (vertex
+    /// stage) and this compute pass without duplication. The mesh
     /// g1 layout's visibility includes COMPUTE for this purpose.
-    pub fn new(device: &wgpu::Device, splat_g1_layout: &wgpu::BindGroupLayout) -> Self {
+    pub fn new(device: &wgpu::Device, mesh_g1_layout: &wgpu::BindGroupLayout) -> Self {
         let g0_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("mesh_lod_select g0 (camera + params)"),
             entries: &[
@@ -166,7 +167,7 @@ impl MeshLodSelectPass {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh_lod_select layout"),
-            bind_group_layouts: &[Some(&g0_layout), Some(splat_g1_layout), Some(&g2_layout)],
+            bind_group_layouts: &[Some(&g0_layout), Some(mesh_g1_layout), Some(&g2_layout)],
             immediate_size: 0,
         });
 

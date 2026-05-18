@@ -29,11 +29,11 @@ pub use wireframe::{WireframePass, LineVertex};
 
 /// GPU octree buffer management and GpuObject field reinterpretation.
 pub mod octree_gpu;
-/// Shared per-instance render infrastructure (`SplatInstanceUniform`,
-/// bind-group layouts, `SplatDraw`) — names date from the retired
-/// splat raster prototype; will be renamed to `Mesh*` in the cleanup
-/// audit.
-pub mod splat_pass;
+/// Shared per-instance render infrastructure (`MeshInstanceUniform`,
+/// g0/g1 bind-group layouts, `MeshDraw`) used by every raster path —
+/// mesh raster, mesh shadow render, mesh LOD select, mesh glass, and
+/// the user-shader mesh path.
+pub mod mesh_instance;
 /// Surface-mesh path — naive surface-nets extraction at asset load
 /// plus the forward triangle pipeline (`MeshPass`) that consumes the
 /// resulting `(vertices, indices)` buffer.
@@ -57,9 +57,8 @@ pub mod mesh_glass_shadow_pass;
 /// Per-pixel resolve compute pass — reads the mesh raster's
 /// visibility-buffer triplet (leaf_slot, pick) and fills in the rest
 /// of the G-buffer (normal / material / glass) via the scene's
-/// `leaf_attr_pool` / `color_pool` / `instances` indirection. Will be
-/// renamed `mesh_resolve_pass` in the cleanup audit.
-pub mod splat_resolve_pass;
+/// `leaf_attr_pool` / `color_pool` / `instances` indirection.
+pub mod mesh_resolve_pass;
 /// Procedural proxy-mesh raster pipeline. First-class triangle-mesh
 /// renderer for procedurals baked via GPU surface-nets-from-SDF.
 /// Bypasses `LeafAttr` indirection — each `ProxyVertex` carries its

@@ -15,7 +15,7 @@
 //! ## Dispatch contract
 //!
 //! - One dispatch per VR per frame, after the primary raster +
-//!   `splat_resolve` (so `gbuf_position` / `gbuf_pick` are
+//!   `mesh_resolve` (so `gbuf_position` / `gbuf_pick` are
 //!   populated) and before `rkp_shade`.
 //! - `params` carries the cursor pixel in viewport coords + an
 //!   `active` flag. When `active = 0`, the shader writes the miss

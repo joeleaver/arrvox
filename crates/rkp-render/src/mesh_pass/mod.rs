@@ -1,15 +1,11 @@
-//! Surface-mesh path — Phase 1 of the splat-to-mesh pivot.
+//! Surface-mesh path.
 //!
 //! At asset load, walk the octree once and emit a triangle mesh
-//! `(vertices, indices)` that the visibility-buffer raster (Phase 2)
-//! will draw. Vertices carry a `leaf_attr_id` so the existing
-//! splat-resolve compute pass can unpack the prefiltered normal +
-//! material straight from `leaf_attr_pool` — same indirection the
-//! splat path uses, no new shade-side machinery needed.
-//!
-//! Phase 1 is CPU-only: no GPU pipeline, no per-asset upload. The
-//! `(vertices, indices)` buffer just lives on `AssetEntry` next to
-//! `splats` until the Phase 2 forward pipeline is wired in.
+//! `(vertices, indices)` that the visibility-buffer raster will draw.
+//! Vertices carry a `leaf_attr_id` so the `mesh_resolve` compute pass
+//! unpacks the prefiltered normal + material straight from
+//! `leaf_attr_pool` — same indirection at shade time, no per-pixel
+//! gradient reconstruction.
 
 pub mod pass;
 
@@ -25,4 +21,6 @@ pub use rkp_core::mesh_cluster::{
 };
 pub use rkp_core::mesh_extract::{extract_surface_mesh, MeshVertex};
 pub use rkp_core::mesh_lod::{build_cluster_dag, ClusterDag, LOD_LEVELS};
-pub use pass::{MeshDraw, MeshPass};
+pub use pass::MeshPass;
+
+pub use crate::mesh_instance::MeshDraw;

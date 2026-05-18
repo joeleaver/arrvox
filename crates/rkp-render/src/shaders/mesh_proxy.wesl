@@ -3,7 +3,7 @@
 // First-class rendering path for procedurals baked to a triangle mesh
 // via GPU surface-nets-from-SDF (`proc_surface_nets`). Distinct from
 // `mesh.wesl` (the octree-mesh raster): proxy meshes have no octree,
-// no `LeafAttr` indirection, and no `splat_resolve` participation.
+// no `LeafAttr` indirection, and no `mesh_resolve` participation.
 // Every vertex carries its own shading payload (normal + dual-material
 // + color) and the FS writes the full G-buffer directly.
 //
@@ -23,8 +23,8 @@
 //
 // Output attachments — must match the G-buffer layout consumed by the
 // downstream PBR / shadow / GI passes. Same target set + packing
-// `splat_resolve.wesl` writes for the octree-mesh + splat paths, so
-// downstream code is agnostic to which path filled a pixel.
+// `mesh_resolve.wesl` writes for the mesh path, so downstream code
+// is agnostic to which path filled a pixel.
 //   @location(0) position: Rgba32Float  (world.xyz + hit_distance)
 //   @location(1) pick:     R32Uint      (instance object_id)
 //   @location(2) normal:   Rgba16Float  (world_normal.xyz + alpha=1)
@@ -63,7 +63,7 @@ struct VsOut {
     @location(2) @interpolate(flat) material_packed: u32,
     // RGB color, linearly interpolated across the triangle in
     // 0..1 space. Repacked back into RGB565 at FS time to match the
-    // G-buffer format `splat_resolve` writes.
+    // G-buffer format `mesh_resolve` writes.
     @location(3) color_rgb: vec3<f32>,
     // Per-vertex blend weight from the SDF tree, interpolated.
     // Matches the dual-material blend the voxel path stores per cell.
@@ -143,7 +143,7 @@ fn frag_main(in: VsOut) -> FsOut {
     let secondary = (in.material_packed >> 16u) & 0xFFFu;
 
     // Re-quantize the interpolated blend back to an 8-bit weight
-    // matching `splat_resolve`'s packing (blend4 << 4 | blend4).
+    // matching `mesh_resolve`'s packing (blend4 << 4 | blend4).
     let blend_clamped = clamp(in.blend_f, 0.0, 1.0);
     let blend4 = u32(blend_clamped * 15.0 + 0.5);
     let blend8 = (blend4 << 4u) | blend4;
@@ -158,7 +158,7 @@ fn frag_main(in: VsOut) -> FsOut {
     let cb5 = (cb8 * 31u) / 255u;
     let color_rgb565 = cr5 | (cg6 << 5u) | (cb5 << 11u);
 
-    // Material packing — must match `splat_resolve.wesl` so the PBR
+    // Material packing — must match `mesh_resolve.wesl` so the PBR
     // shading pass reads identical fields regardless of source.
     //   r: primary (lo16) | secondary (hi16)
     //   g: blend_8 (lo8) | intensity (mid8) | color_rgb565 (hi16)

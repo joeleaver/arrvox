@@ -397,7 +397,7 @@ pub(crate) struct EngineState {
     /// glass passes). Indexed by material id. Rebuilt from the
     /// material library at the start of `update_scene_gpu` whenever
     /// `material_glass_lib_epoch` doesn't match the library's
-    /// current state. Used to compute `SplatDraw.has_glass`.
+    /// current state. Used to compute `MeshDraw.has_glass`.
     pub(crate) material_is_glass: Vec<bool>,
     /// Snapshot of `MaterialLibrary::slot_count() + an opacity-checksum`
     /// at the last `material_is_glass` rebuild. Tracked so we don't
@@ -492,15 +492,13 @@ pub(crate) struct EngineState {
     /// [`Self::gpu_instance_overlays_dirty`] but for
     /// `gpu_instance_sculpts`.
     pub(crate) gpu_instance_sculpts_dirty: bool,
-    /// Splat-rasterizer per-instance draws. One entry per `Renderable`
+    /// Mesh-raster per-instance draws. One entry per `Renderable`
     /// entity whose asset_handle is `Some(_)`. Built alongside
-    /// `gpu_instances` in `update_scene_gpu`. Used only when the
-    /// renderer's primary mode is `Splat` (RKP_PRIMARY=splat); the
-    /// march path ignores it.
-    pub(crate) splat_draws: std::sync::Arc<Vec<rkp_render::splat_pass::SplatDraw>>,
+    /// `gpu_instances` in `update_scene_gpu`.
+    pub(crate) mesh_draws: std::sync::Arc<Vec<rkp_render::mesh_instance::MeshDraw>>,
     /// Procedural proxy-mesh draws. Built per-frame from entities
     /// whose `Renderable.spatial` is `RenderGeometry::ProxyMesh`.
-    /// Disjoint from `splat_draws`: proxy meshes ride a dedicated
+    /// Disjoint from `mesh_draws`: proxy meshes ride a dedicated
     /// raster pipeline (`mesh_proxy_pass`) that writes the full
     /// G-buffer directly — no LeafAttr indirection.
     pub(crate) proxy_draws: std::sync::Arc<Vec<rkp_render::mesh_proxy_pass::ProxyDraw>>,

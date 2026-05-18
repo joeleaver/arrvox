@@ -84,14 +84,12 @@ pub struct RenderFrame {
     /// slice into this vec; each `u32` is a removed `leaf_attr_id`.
     /// Empty when no entity has been carved.
     pub gpu_instance_sculpts: Arc<Vec<u32>>,
-    /// Splat-rasterizer per-instance draws. One entry per visible
+    /// Mesh-raster per-instance draws. One entry per visible
     /// `Renderable` whose asset_handle is `Some(_)` — i.e. the entity
-    /// references a loaded `.rkp` asset whose splat data has been
-    /// extracted at load time. Procedural objects without an
-    /// `AssetHandle` are not represented here and won't render under
-    /// `RKP_PRIMARY=splat` (logged as known limitation; they need their
-    /// own splat-extraction path later).
-    pub splat_draws: Arc<Vec<rkp_render::splat_pass::SplatDraw>>,
+    /// references a loaded `.rkp` asset. Procedural objects without
+    /// an `AssetHandle` are not represented here (procedurals ride
+    /// `proxy_draws` instead).
+    pub mesh_draws: Arc<Vec<rkp_render::mesh_instance::MeshDraw>>,
     /// Per-frame proxy-mesh draw list (procedurals baked via GPU
     /// surface-nets-from-SDF). Rendered by `dispatch_proxy_meshes`
     /// after the primary mode's main pass; composites into the
@@ -488,7 +486,7 @@ pub enum RenderCommand {
     /// `BakeMode::ProxyMesh` bake completes; the render thread
     /// calls `RkpRenderer::upload_mesh_for_asset` +
     /// `upload_mesh_clusters_for_asset` and the next frame's
-    /// `SplatDraw` for that entity references the handle.
+    /// `MeshDraw` for that entity references the handle.
     UploadProxyMesh {
         handle_raw: u32,
         vertices: Vec<rkp_core::mesh_extract::ProxyVertex>,

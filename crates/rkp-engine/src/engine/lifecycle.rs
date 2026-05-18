@@ -1429,7 +1429,7 @@ impl EngineState {
             gpu_instances: std::sync::Arc::clone(&self.gpu_instances),
             gpu_instance_overlays: std::sync::Arc::clone(&self.gpu_instance_overlays),
             gpu_instance_sculpts: std::sync::Arc::clone(&self.gpu_instance_sculpts),
-            splat_draws: std::sync::Arc::clone(&self.splat_draws),
+            mesh_draws: std::sync::Arc::clone(&self.mesh_draws),
             proxy_draws: std::sync::Arc::clone(&self.proxy_draws),
             gpu_objects_dirty: gpu_objects_dirty_this_frame,
             geometry_epoch,

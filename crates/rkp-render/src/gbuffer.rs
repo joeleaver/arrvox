@@ -61,15 +61,13 @@ pub struct GBuffer {
     /// (the un-skinned vertex position interpolated barycentrically
     /// across the triangle). `Rgba32Float`. Written by `mesh.wesl`'s
     /// fragment stage as a 4th visibility-buffer attachment so
-    /// `splat_resolve` can descend the asset's octree per pixel and
+    /// `mesh_resolve` can descend the asset's octree per pixel and
     /// recover the actual cell at the surface point — the mesh path's
     /// flat-interpolated `leaf_attr_id` only carries one cell's value
     /// per triangle, which appears as chunky per-triangle color
     /// patches at fine LOD.
-    /// `.w == 1` ⇒ mesh wrote a valid rest_pos; `.w == 0` ⇒ "no
-    /// rest_pos available, fall back to leaf_slot." The splat path
-    /// doesn't write this target; the texture is cleared at frame
-    /// start so .w stays 0 there.
+    /// `.w == 1` ⇒ mesh wrote a valid rest_pos; `.w == 0` ⇒ miss /
+    /// "no rest_pos available, fall back to leaf_slot."
     pub rest_pos_texture: wgpu::Texture,
     pub rest_pos_view: wgpu::TextureView,
 
@@ -121,10 +119,10 @@ pub const GBUFFER_GLASS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32U
 pub const GBUFFER_LEAF_SLOT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 /// Texture format for the mesh-path rest-pose position target.
 /// Rgba32Float for full FP precision in mesh-frame coordinates; the
-/// per-pixel octree descent in `splat_resolve` needs sub-voxel
+/// per-pixel octree descent in `mesh_resolve` needs sub-voxel
 /// accuracy and meshes can range over ~100 m of extent. Changing
 /// this format requires updating `mesh.wesl`'s 4th color target +
-/// `splat_resolve.wesl`'s sample type.
+/// `mesh_resolve.wesl`'s sample type.
 pub const GBUFFER_REST_POS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
 impl GBuffer {
@@ -223,7 +221,7 @@ impl GBuffer {
 
         // Mesh-path rest_pos target — per-pixel rest-pose mesh-frame
         // position. Written by `mesh.wesl` as a 4th MRT attachment;
-        // consumed by `splat_resolve.wesl` for per-pixel cell descent.
+        // consumed by `mesh_resolve.wesl` for per-pixel cell descent.
         // RENDER_ATTACHMENT for mesh writes, TEXTURE_BINDING for the
         // resolve read, COPY_DST so the splat path can clear it via
         // `encoder.clear_texture` (it doesn't bind this attachment).

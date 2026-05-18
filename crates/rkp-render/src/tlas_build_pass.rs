@@ -29,7 +29,7 @@
 //! shader's `inst_aabb` hook. With grass-style shaders that's a
 //! 3 m cube around each painted leaf — 5000 leaves' AABBs all
 //! overlap, BVH traversal degenerates to ~linear, shadow trace
-//! catastrophically slow (30-40 ms for one .5 m grass splat).
+//! catastrophically slow (30-40 ms for one .5 m grass patch).
 //! Phase 6's tile-cull AABB pass already evaluates `inst_aabb` on
 //! the GPU and writes tight per-instance world AABBs into scratch;
 //! the GPU-built TLAS reads that scratch directly. Tight per-leaf

@@ -231,7 +231,7 @@ fn vertex_emit(@builtin(global_invocation_id) gid: vec3<u32>) {
     let blend_u4 = u32(trunc(clamp(s.blend_weight, 0.0, 1.0) * 15.0 + 0.5));
 
     // Material packing layout — must match `LeafAttr.material_packed`
-    // as decoded by `splat_resolve.wesl` (primary lo16, secondary
+    // as decoded by `mesh_resolve.wesl` (primary lo16, secondary
     // mid12, blend hi4) so downstream packing matches the existing
     // G-buffer material consumer.
     let material_packed =

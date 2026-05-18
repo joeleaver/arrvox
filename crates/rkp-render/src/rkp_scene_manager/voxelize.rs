@@ -276,12 +276,11 @@ impl RkpSceneManager {
         let t_face_links = t_start.elapsed();
         // NOTE: previously called `emit_faces` here to populate
         // `pending_faces`, but that Vec has no consumer anywhere in
-        // the engine today (splat raster pipeline is retired). At
-        // 5-10 M voxels the per-leaf 6-neighbor-lookup pass is
-        // multi-second on the main thread for zero benefit. If a
-        // face rasterizer comes back, resurrect this + re-wire the
-        // consumer rather than routing unused work through every
-        // bake.
+        // the engine today. At 5-10 M voxels the per-leaf 6-neighbor-
+        // lookup pass is multi-second on the main thread for zero
+        // benefit. If a face rasterizer comes back, resurrect this +
+        // re-wire the consumer rather than routing unused work
+        // through every bake.
         let handle = self.octree.allocate(&artifact.octree);
         let t_octree_alloc = t_start.elapsed();
         let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;

@@ -40,7 +40,7 @@ impl EngineState {
         std::sync::Arc::make_mut(&mut self.gpu_instances).clear();
         std::sync::Arc::make_mut(&mut self.gpu_instance_overlays).clear();
         std::sync::Arc::make_mut(&mut self.gpu_instance_sculpts).clear();
-        std::sync::Arc::make_mut(&mut self.splat_draws).clear();
+        std::sync::Arc::make_mut(&mut self.mesh_draws).clear();
         std::sync::Arc::make_mut(&mut self.proxy_draws).clear();
         self.gpu_to_entity.clear();
         self.entity_to_gpu.clear();
@@ -308,10 +308,10 @@ impl EngineState {
                 self.gpu_to_entity.push(entity);
                 std::sync::Arc::make_mut(&mut self.gpu_instances).push(inst);
 
-                // Splat-rasterizer per-instance draw record. Only
+                // Mesh-raster per-instance draw record. Only
                 // `Renderable` entities with an `asset_handle` (i.e.
                 // loaded `.rkp` assets, not procedurals) make it into
-                // the splat path — procedurals don't have splat data
+                // the mesh path — procedurals ride `proxy_draws`
                 // extracted today. Built every frame because world
                 // transforms can change per-tick; the engine ships
                 // this list to the render thread alongside the
@@ -333,7 +333,7 @@ impl EngineState {
                             b.bone_dq_offset,
                         ),
                         None => (
-                            rkp_render::splat_pass::SKINNING_MODE_NONE,
+                            rkp_render::mesh_instance::SKINNING_MODE_NONE,
                             0,
                             0,
                         ),
@@ -424,8 +424,8 @@ impl EngineState {
                         });
                     let has_glass = asset_has_glass || overlay_glass;
 
-                    std::sync::Arc::make_mut(&mut self.splat_draws).push(
-                        rkp_render::splat_pass::SplatDraw {
+                    std::sync::Arc::make_mut(&mut self.mesh_draws).push(
+                        rkp_render::mesh_instance::MeshDraw {
                             asset_handle_raw: handle.raw(),
                             world: world_matrix.to_cols_array_2d(),
                             object_id: gpu_idx,
@@ -534,7 +534,7 @@ impl EngineState {
         // `dirty_entities()` is a `&HashMap<Entity, DirtyKind>`;
         // collect (entity, gpu_idx, new_world) eagerly so we can drop
         // the world/state borrows before taking `Arc::make_mut` on
-        // gpu_instances/splat_draws/proxy_draws below.
+        // gpu_instances/mesh_draws/proxy_draws below.
         let dirty: Vec<hecs::Entity> = self
             .gpu_objects_dirty
             .dirty_entities()
@@ -574,16 +574,16 @@ impl EngineState {
             }
         }
 
-        // Splat / proxy draws carry their own per-instance world too —
+        // Mesh / proxy draws carry their own per-instance world too —
         // keyed by `object_id` (= gpu_idx). Both lists are short
         // (one entry per asset-backed / proxy entity), so a linear
         // scan per update is cheap; no separate index map needed.
         // `Arc::make_mut` no-ops when the list is empty (refcount=1
         // on a fresh empty Vec).
-        if !self.splat_draws.is_empty() {
-            let splat_draws = std::sync::Arc::make_mut(&mut self.splat_draws);
+        if !self.mesh_draws.is_empty() {
+            let mesh_draws = std::sync::Arc::make_mut(&mut self.mesh_draws);
             for &(gpu_idx, world) in &updates {
-                for d in splat_draws.iter_mut() {
+                for d in mesh_draws.iter_mut() {
                     if d.object_id == gpu_idx {
                         d.world = world;
                     }
@@ -622,7 +622,7 @@ impl EngineState {
     ///   - Shifts `overlay_offset` and `sculpt_offset` on every
     ///     subsequent row by the delta produced by this entity's
     ///     splice.
-    ///   - Patches `splat_draws[i].world` / `proxy_draws[i].world`
+    ///   - Patches `mesh_draws[i].world` / `proxy_draws[i].world`
     ///     for any Transform-dirty entity (mixed-kind ticks).
     ///
     /// What it skips (vs. the full rebuild):
@@ -634,7 +634,7 @@ impl EngineState {
     ///     grid_origin / voxel_size / bone_count, none of which a
     ///     sculpt/paint stamp mutates on a loaded asset.
     ///   - The world-wide query + sort for `ordered`.
-    ///   - `splat_draws[i].has_glass` re-evaluation. Same staleness
+    ///   - `mesh_draws[i].has_glass` re-evaluation. Same staleness
     ///     model as the C2 transform-only path: the value is left at
     ///     its prior verdict, refreshed only when sculpt-Raise lands
     ///     a glass brush (sculpt_ops drops the per-asset cache entry)
@@ -677,7 +677,7 @@ impl EngineState {
             let new_material_id = renderable.material_id as u32;
             let asset_handle_raw = renderable.asset_handle.map(|h| h.raw());
             // Spatial variant decides whether the entity contributes a
-            // splat_draws row (octree assets) or a proxy_draws row
+            // mesh_draws row (octree assets) or a proxy_draws row
             // (procedural proxies). `has_glass` re-eval is deliberately
             // skipped here — see fn doc comment.
             let is_octree = matches!(
@@ -808,15 +808,15 @@ impl EngineState {
                 }
             }
 
-            // splat_draws / proxy_draws entry for this entity — keyed
+            // mesh_draws / proxy_draws entry for this entity — keyed
             // by object_id == gpu_idx. We patch only `world` (Transform-
             // dirty case); `has_glass` stays at its prior value since
             // re-scanning the asset's leaves on every stamp is the
             // dominant remaining cost (see fn doc comment).
             if is_octree {
                 if asset_handle_raw.is_some() {
-                    let splat_draws = std::sync::Arc::make_mut(&mut self.splat_draws);
-                    for d in splat_draws.iter_mut() {
+                    let mesh_draws = std::sync::Arc::make_mut(&mut self.mesh_draws);
+                    for d in mesh_draws.iter_mut() {
                         if d.object_id == gpu_idx as u32 {
                             d.world = world_arr;
                             break;

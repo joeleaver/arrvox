@@ -1,7 +1,7 @@
 //! `MeshShadowMapPass` — directional shadow map rendered from the
 //! mesh path's triangle geometry.
 //!
-//! Phase 3 of the splat-to-mesh pivot. Two-pipeline pass:
+//! Two-pipeline pass:
 //!
 //!  1. **Render** — depth-only rasterization. Vertex stage projects
 //!     the mesh through the light camera's view-proj; the rasterizer
@@ -20,7 +20,7 @@
 //!
 //! Bind groups:
 //!  · render `g0` — light_camera uniform.
-//!  · render `g1` — per-instance uniform (SHARED with `SplatPass.g1_layout`).
+//!  · render `g1` — per-instance uniform (SHARED with `MeshInstanceLayouts.g1_layout`).
 //!  · blit `g0` — depth texture (read) + shadow_buffer (write).
 
 
@@ -76,7 +76,7 @@ pub struct MeshShadowMapPass {
 impl MeshShadowMapPass {
     pub fn new(
         device: &wgpu::Device,
-        splat_g1_layout: &wgpu::BindGroupLayout,
+        mesh_g1_layout: &wgpu::BindGroupLayout,
         g2_layout: &wgpu::BindGroupLayout,
     ) -> Self {
         // ── Render pipeline (depth-only, no fragment shader) ───────
@@ -111,7 +111,7 @@ impl MeshShadowMapPass {
                     count: None,
                 },
                 // bone_matrices + bone_dual_quats — Phase 6.6 shadow
-                // VS skinning. Slot numbering matches the splat g0
+                // VS skinning. Slot numbering matches the mesh g0
                 // (binding 2 / 3) so the WGSL declarations can be
                 // copy-pasted between the two pipelines without
                 // having to remember which group holds which buffer.
@@ -140,7 +140,7 @@ impl MeshShadowMapPass {
 
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh_shadow render layout"),
-            bind_group_layouts: &[Some(&render_g0_layout), Some(splat_g1_layout), Some(g2_layout)],
+            bind_group_layouts: &[Some(&render_g0_layout), Some(mesh_g1_layout), Some(g2_layout)],
             immediate_size: 0,
         });
 

@@ -15,7 +15,7 @@
 
 use crate::rkp_renderer::RkpRenderer;
 use crate::rkp_scene::{CameraUniforms, RkpScene};
-use crate::splat_pass::{SplatInstanceUniform, SPLAT_INSTANCE_BYTES};
+use crate::mesh_instance::{MeshInstanceUniform, MESH_INSTANCE_BYTES};
 use crate::proc_raymarch::ProcRaymarchPass;
 use crate::proc_outline::ProcOutlinePass;
 use crate::proc_ghost::ProcGhostPass;
@@ -102,27 +102,24 @@ pub struct ViewportRenderer {
     /// host only dispatches it when the viewport's mode is `Isolation`.
     pub grid: RkpGridPass,
 
-    // ── Splat-rasterizer per-VR state (Phase B-2) ───────────────────
-    /// Scene-wide bind group for the splat path: camera + leaf_attr_pool
-    /// + materials + color_pool. Built lazily on first `dispatch_splat`
+    // ── Mesh raster per-VR state ────────────────────────────────────
+    /// Scene-wide bind group for the mesh raster path: camera +
+    /// leaf_attr_pool + bone_matrices + bone_dual_quats. Built lazily
     /// and rebuilt whenever the scene-buffers or lights/materials epoch
-    /// bumps (same triggers as the existing march bindings).
-    pub splat_g0_bg: Option<wgpu::BindGroup>,
-    /// Epoch the splat g0 bg was last built against — combination of
-    /// scene_buffers_epoch and lights_materials_epoch. Stored separately
-    /// from the march's `scene_epoch`/`lights_materials_epoch` because
-    /// the splat g0 has a different shape (no objects buffer, no bone
-    /// data, but adds materials + color_pool).
-    pub splat_g0_scene_epoch: u64,
-    pub splat_g0_lights_materials_epoch: u64,
-    /// Per-instance uniform buffers (80 B each) — one slot per scene
-    /// instance the splat path will draw this frame. Grown on demand
-    /// by `ensure_splat_instance_capacity`. Reused frame to frame; the
-    /// engine writes the current frame's matrices via `write_splat_instance`
-    /// before calling `dispatch_splat`.
-    pub splat_instance_buffers: Vec<wgpu::Buffer>,
-    /// Bind groups paired one-to-one with `splat_instance_buffers`.
-    pub splat_instance_bind_groups: Vec<wgpu::BindGroup>,
+    /// bumps.
+    pub mesh_g0_bg: Option<wgpu::BindGroup>,
+    /// Epoch the mesh g0 bg was last built against — combination of
+    /// scene_buffers_epoch and lights_materials_epoch.
+    pub mesh_g0_scene_epoch: u64,
+    pub mesh_g0_lights_materials_epoch: u64,
+    /// Per-instance uniform buffers (96 B each) — one slot per scene
+    /// instance to draw this frame. Grown on demand by
+    /// `ensure_mesh_instance_capacity`. Reused frame to frame; the
+    /// engine writes the current frame's matrices via
+    /// `write_mesh_instance` before dispatch.
+    pub mesh_instance_buffers: Vec<wgpu::Buffer>,
+    /// Bind groups paired one-to-one with `mesh_instance_buffers`.
+    pub mesh_instance_bind_groups: Vec<wgpu::BindGroup>,
 
     // ── Procedural proxy-mesh pass bindings ──
     /// Per-viewport camera bind group for `MeshProxyPass` (g0). Built
@@ -141,15 +138,15 @@ pub struct ViewportRenderer {
     /// Bind groups paired one-to-one with `proxy_instance_buffers`.
     pub proxy_instance_bind_groups: Vec<wgpu::BindGroup>,
 
-    /// Splat-resolve compute pass — per-VR texture bindings (g0).
+    /// Mesh-resolve compute pass — per-VR texture bindings (g0).
     /// Bound to (leaf_slot, pick) reads + (normal, material, glass)
     /// storage writes. Rebuilt on resize (gbuffer texture views move).
-    pub splat_resolve_g0_bg: Option<wgpu::BindGroup>,
-    /// Splat-resolve compute pass — scene-buffers bindings (g1).
+    pub mesh_resolve_g0_bg: Option<wgpu::BindGroup>,
+    /// Mesh-resolve compute pass — scene-buffers bindings (g1).
     /// Bound to leaf_attr_pool / color_pool / objects_buffer; rebuilt
     /// when scene_buffers_epoch bumps.
-    pub splat_resolve_g1_bg: Option<wgpu::BindGroup>,
-    pub splat_resolve_scene_epoch: u64,
+    pub mesh_resolve_g1_bg: Option<wgpu::BindGroup>,
+    pub mesh_resolve_scene_epoch: u64,
 
     // ── Paint cursor per-VR state ──────────────────────────────────
     /// 32-byte storage buffer written each frame by the brush-state
@@ -262,7 +259,7 @@ pub struct ViewportRenderer {
 
     // ── Mesh per-cluster LOD-select per-VR state (Phase 6.2/6.3) ───
     /// Per-draw `MeshLodSelectParams` uniform (16 B). Slot index
-    /// matches `splat_instance_buffers`; one buffer per draw slot.
+    /// matches `mesh_instance_buffers`; one buffer per draw slot.
     pub mesh_lod_params_buffers: Vec<wgpu::Buffer>,
     /// Per-draw `DrawIndexedIndirectArgs` storage buffer + capacity
     /// in cluster slots. Grown to fit the largest cluster count any
@@ -486,8 +483,7 @@ impl ViewportRenderer {
         );
         let shadow_fallback_view = shadow_fallback_texture.create_view(&Default::default());
 
-        // Phase 3 (splat-to-mesh pivot) + CSM — depth attachment for
-        // the mesh-shadow render pass. The render writes per-cascade
+        // CSM — depth attachment for the mesh-shadow render pass. The render writes per-cascade
         // (vertex + rasterizer + depth-only, no fragment shader); the
         // blit compute pass reads each layer back and copies
         // bitcast(depth) into the matching slice of
@@ -672,18 +668,18 @@ impl ViewportRenderer {
             composite_texture, composite_view,
             readback,
             wireframe_pass, grid,
-            splat_g0_bg: None,
-            splat_g0_scene_epoch: u64::MAX,
-            splat_g0_lights_materials_epoch: u64::MAX,
-            splat_instance_buffers: Vec::new(),
-            splat_instance_bind_groups: Vec::new(),
+            mesh_g0_bg: None,
+            mesh_g0_scene_epoch: u64::MAX,
+            mesh_g0_lights_materials_epoch: u64::MAX,
+            mesh_instance_buffers: Vec::new(),
+            mesh_instance_bind_groups: Vec::new(),
             proxy_g0_bg: None,
             user_shader_mesh_g0_bg: None,
             proxy_instance_buffers: Vec::new(),
             proxy_instance_bind_groups: Vec::new(),
-            splat_resolve_g0_bg: None,
-            splat_resolve_g1_bg: None,
-            splat_resolve_scene_epoch: u64::MAX,
+            mesh_resolve_g0_bg: None,
+            mesh_resolve_g1_bg: None,
+            mesh_resolve_scene_epoch: u64::MAX,
             brush_state_buffer,
             brush_state_params_buffer,
             brush_state_pass_bg,
@@ -793,28 +789,28 @@ impl ViewportRenderer {
         }
     }
 
-    /// Rebuild the splat-raster scene-wide (`g0`) bind group when its
+    /// Rebuild the mesh-raster scene-wide (`g0`) bind group when its
     /// referenced buffers may have moved. Cheap when no rebuild is
     /// needed (one epoch comparison). Caller invokes once before
-    /// `dispatch_splat`.
-    pub fn refresh_splat_g0(&mut self, device: &wgpu::Device, renderer: &RkpRenderer) {
+    /// `dispatch_mesh`.
+    pub fn refresh_mesh_g0(&mut self, device: &wgpu::Device, renderer: &RkpRenderer) {
         let scene_now = renderer.scene.buffers_epoch();
         let lm_now = renderer.lights_materials_epoch();
-        if self.splat_g0_bg.is_some()
-            && self.splat_g0_scene_epoch == scene_now
-            && self.splat_g0_lights_materials_epoch == lm_now
+        if self.mesh_g0_bg.is_some()
+            && self.mesh_g0_scene_epoch == scene_now
+            && self.mesh_g0_lights_materials_epoch == lm_now
         {
             return;
         }
-        self.splat_g0_bg = Some(renderer.splat_pass.create_g0_bind_group(
+        self.mesh_g0_bg = Some(renderer.mesh_instance.create_g0_bind_group(
             device,
             &self.camera_buffer,
             &renderer.scene.leaf_attr_pool_buffer,
             &renderer.scene.bone_matrices_buffer,
             &renderer.scene.bone_dual_quats_buffer,
         ));
-        self.splat_g0_scene_epoch = scene_now;
-        self.splat_g0_lights_materials_epoch = lm_now;
+        self.mesh_g0_scene_epoch = scene_now;
+        self.mesh_g0_lights_materials_epoch = lm_now;
     }
 
     /// Resize every shadow-map-sized resource on this viewport
@@ -930,7 +926,7 @@ impl ViewportRenderer {
     /// build-once. The render g0 now also references the scene's
     /// bone palettes (Phase 6.6) — those reallocate when the scene
     /// gains a deeper-skeleton entity, so the render bg is rebuilt
-    /// on a scene-buffers-epoch bump, same trigger the splat g0 uses.
+    /// on a scene-buffers-epoch bump, same trigger the mesh g0 uses.
     pub fn refresh_mesh_shadow_bindings(
         &mut self,
         device: &wgpu::Device,
@@ -993,18 +989,18 @@ impl ViewportRenderer {
         }
     }
 
-    /// Rebuild the splat-resolve compute pass's bind groups. `g0`
+    /// Rebuild the mesh-resolve compute pass's bind groups. `g0`
     /// (per-VR textures) is rebuilt unconditionally if absent —
     /// `resize` clears it. `g1` (scene buffers) follows the
     /// scene-buffers epoch, same trigger as the march's
     /// `scene_bind_group`.
-    pub fn refresh_splat_resolve_bindings(
+    pub fn refresh_mesh_resolve_bindings(
         &mut self,
         device: &wgpu::Device,
         renderer: &RkpRenderer,
     ) {
-        if self.splat_resolve_g0_bg.is_none() {
-            self.splat_resolve_g0_bg = Some(renderer.splat_resolve.create_g0_bind_group(
+        if self.mesh_resolve_g0_bg.is_none() {
+            self.mesh_resolve_g0_bg = Some(renderer.mesh_resolve.create_g0_bind_group(
                 device,
                 &self.gbuffer.leaf_slot_view,
                 &self.pick_view,
@@ -1015,8 +1011,8 @@ impl ViewportRenderer {
             ));
         }
         let scene_now = renderer.scene.buffers_epoch();
-        if self.splat_resolve_g1_bg.is_none() || self.splat_resolve_scene_epoch != scene_now {
-            self.splat_resolve_g1_bg = Some(renderer.splat_resolve.create_g1_bind_group(
+        if self.mesh_resolve_g1_bg.is_none() || self.mesh_resolve_scene_epoch != scene_now {
+            self.mesh_resolve_g1_bg = Some(renderer.mesh_resolve.create_g1_bind_group(
                 device,
                 &renderer.scene.leaf_attr_pool_buffer,
                 &renderer.scene.color_pool_buffer,
@@ -1028,7 +1024,7 @@ impl ViewportRenderer {
                 &renderer.scene.instance_overlay_buffer,
                 &renderer.scene.instance_sculpt_buffer,
             ));
-            self.splat_resolve_scene_epoch = scene_now;
+            self.mesh_resolve_scene_epoch = scene_now;
         }
     }
 
@@ -1178,30 +1174,30 @@ impl ViewportRenderer {
         );
     }
 
-    /// Grow `splat_instance_buffers` + `splat_instance_bind_groups` to
+    /// Grow `mesh_instance_buffers` + `mesh_instance_bind_groups` to
     /// at least `count` slots. Slots are reused across frames; the
     /// engine writes the current frame's matrices via
-    /// [`Self::write_splat_instance`] before [`RkpRenderer::dispatch_splat`].
+    /// [`Self::write_mesh_instance`] before [`RkpRenderer::dispatch_mesh`].
     ///
     /// Each slot is an 80 B uniform buffer holding one
-    /// `SplatInstanceUniform` (mat4 world + object_id + 12 B pad).
-    pub fn ensure_splat_instance_capacity(
+    /// `MeshInstanceUniform` (mat4 world + object_id + 12 B pad).
+    pub fn ensure_mesh_instance_capacity(
         &mut self,
         device: &wgpu::Device,
         renderer: &RkpRenderer,
         count: u32,
     ) {
         let needed = count as usize;
-        while self.splat_instance_buffers.len() < needed {
+        while self.mesh_instance_buffers.len() < needed {
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("splat instance uniform"),
-                size: SPLAT_INSTANCE_BYTES,
+                label: Some("mesh instance uniform"),
+                size: MESH_INSTANCE_BYTES,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            let bg = renderer.splat_pass.create_g1_bind_group(device, &buf);
-            self.splat_instance_buffers.push(buf);
-            self.splat_instance_bind_groups.push(bg);
+            let bg = renderer.mesh_instance.create_g1_bind_group(device, &buf);
+            self.mesh_instance_buffers.push(buf);
+            self.mesh_instance_bind_groups.push(bg);
         }
     }
 
@@ -1289,7 +1285,7 @@ impl ViewportRenderer {
     /// slots. Each slot owns a 16 B `MeshLodSelectParams` uniform +
     /// `g0` bind group; the args buffer is allocated lazily on first
     /// use, sized at the draw's cluster count. Slot index matches
-    /// `splat_instance_buffers`.
+    /// `mesh_instance_buffers`.
     pub fn ensure_mesh_lod_capacity(
         &mut self,
         device: &wgpu::Device,
@@ -1768,15 +1764,15 @@ impl ViewportRenderer {
         }
     }
 
-    /// Write one frame's `SplatInstanceUniform` for the given slot.
+    /// Write one frame's `MeshInstanceUniform` for the given slot.
     /// Caller must have already extended the slot vector via
-    /// `ensure_splat_instance_capacity`.
+    /// `ensure_mesh_instance_capacity`.
     ///
-    /// `skinning_mode` follows the [`SplatInstanceUniform`] convention
+    /// `skinning_mode` follows the [`MeshInstanceUniform`] convention
     /// (`0` LBS / `1` DQS / `SKINNING_MODE_NONE` rest-pose); the two
     /// `bone_offset_*` values are read by the mesh VS only when the
     /// matching mode is selected.
-    pub fn write_splat_instance(
+    pub fn write_mesh_instance(
         &self,
         queue: &wgpu::Queue,
         slot: u32,
@@ -1787,7 +1783,7 @@ impl ViewportRenderer {
         bone_offset_dqs: u32,
         skinning_mode: u32,
     ) {
-        let uniform = SplatInstanceUniform {
+        let uniform = MeshInstanceUniform {
             world: *world,
             grid_origin,
             object_id,
@@ -1797,7 +1793,7 @@ impl ViewportRenderer {
             _pad: 0,
         };
         queue.write_buffer(
-            &self.splat_instance_buffers[slot as usize],
+            &self.mesh_instance_buffers[slot as usize],
             0,
             bytemuck::bytes_of(&uniform),
         );
@@ -1881,9 +1877,9 @@ impl ViewportRenderer {
         self.mesh_glass_combine_bg = None;
 
         // Splat-resolve g0 references gbuffer texture views which all
-        // just moved. Drop it — `refresh_splat_resolve_bindings` will
+        // just moved. Drop it — `refresh_mesh_resolve_bindings` will
         // rebuild on next dispatch.
-        self.splat_resolve_g0_bg = None;
+        self.mesh_resolve_g0_bg = None;
 
         // Per-VR passes — resize internal textures + re-wire gbuffer bindings.
         self.proc_raymarch.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
@@ -2277,10 +2273,9 @@ fn create_pick_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::R32Uint,
-        // RENDER_ATTACHMENT for the splat raster path (splat.wesl writes
-        // pick at @location(3)). Compute march writes via STORAGE_BINDING
-        // — both bits live here so the same texture is reachable from
-        // either pipeline without reallocating.
+        // RENDER_ATTACHMENT for the mesh raster path (mesh.wesl writes
+        // pick at @location(1)). STORAGE_BINDING is kept so post-passes
+        // (paint probe, brush state) can read/write the same texture.
         usage: wgpu::TextureUsages::STORAGE_BINDING
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_SRC

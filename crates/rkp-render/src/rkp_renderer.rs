@@ -21,12 +21,12 @@ use crate::rkp_shade::{ShadeParams, GpuLight, GpuMaterial};
 use crate::rkp_atmosphere::RkpAtmospherePass;
 use crate::mesh_pass::{MeshPass, MeshVertex, MeshletCluster};
 use crate::mesh_shadow_map_pass::MeshShadowMapPass;
-use crate::splat_pass::{SplatDraw, SplatPass};
-use crate::splat_resolve_pass::SplatResolvePass;
+use crate::mesh_instance::{MeshDraw, MeshInstanceLayouts};
+use crate::mesh_resolve_pass::MeshResolvePass;
 use wgpu_profiler::GpuProfiler;
 
 // `PrimaryMode` enum + `RKP_PRIMARY` env-var read retired after the
-// march/splat path retirement. Mesh raster is now the only path.
+// Mesh raster is the only render path.
 
 /// Read a positive finite f32 from the named env var; fall back to
 /// `default` if the var is unset, unparseable, or non-positive. Used
@@ -94,17 +94,16 @@ pub struct RkpRenderer {
     last_materials_hash: u64,
     /// Per-instance bind-group layouts (g0 scene-wide + g1 per-instance).
     /// Shared across the mesh raster, mesh shadow render, mesh LOD
-    /// select compute, and user-shader mesh paths. (Type name dates from
-    /// the retired splat raster prototype — rename pending in cleanup.)
-    pub splat_pass: SplatPass,
-    /// Splat-resolve compute fixup. Reads the visibility-buffer
-    /// triplet `splat_pass` writes and fills in the remaining G-buffer
-    /// entries (normal / material / glass). One pipeline shared across
+    /// select compute, mesh glass, and user-shader mesh paths.
+    pub mesh_instance: MeshInstanceLayouts,
+    /// Mesh-resolve compute fixup. Reads the visibility-buffer triplet
+    /// `mesh_pass` writes and fills in the remaining G-buffer entries
+    /// (normal / material / glass). One pipeline shared across
     /// viewports.
-    pub splat_resolve: SplatResolvePass,
+    pub mesh_resolve: MeshResolvePass,
     /// Procedural proxy-mesh raster pipeline (GPU surface-nets-from-
     /// SDF). Writes the full G-buffer for proxy pixels directly,
-    /// bypassing `splat_resolve`. One pipeline shared across viewports.
+    /// bypassing `mesh_resolve`. One pipeline shared across viewports.
     pub mesh_proxy: crate::mesh_proxy_pass::MeshProxyPass,
     /// V1 mesh-path user-shader pipeline owner. Holds bind-group +
     /// pipeline layouts shared across all mesh-path shaders plus a
@@ -118,8 +117,7 @@ pub struct RkpRenderer {
     /// on `ViewportRenderer`.
     pub brush_state: crate::brush_state_pass::BrushStatePass,
     /// Surface-mesh raster pipeline. Shares `g0_layout` / `g1_layout`
-    /// with `splat_pass` (a stub container for those layouts after the
-    /// splat-prototype removal; will be renamed in cleanup).
+    /// with `mesh_instance` (the shared layout container).
     pub mesh_pass: MeshPass,
     /// Mesh-rendered directional shadow-map pipeline (Phase 3 of the
     /// pivot). Renders the same triangles from the light's POV; per-VR
@@ -305,36 +303,36 @@ impl RkpRenderer {
 
         let atmosphere = RkpAtmospherePass::new(device);
 
-        let splat_pass = SplatPass::new(device);
+        let mesh_instance = MeshInstanceLayouts::new(device);
         // `MeshGlassPass` owns the shared `g2_layout` (glass-classify
         // bindings) used by both the primary mesh raster and the
         // glass front/back rasters. Construct it first so the layout
         // can flow into `MeshPass::new`.
         let mesh_glass = crate::mesh_glass_pass::MeshGlassPass::new(
             device,
-            &splat_pass.g0_layout,
-            &splat_pass.g1_layout,
+            &mesh_instance.g0_layout,
+            &mesh_instance.g1_layout,
         );
         let mesh_pass = MeshPass::new(
             device,
-            &splat_pass.g0_layout,
-            &splat_pass.g1_layout,
+            &mesh_instance.g0_layout,
+            &mesh_instance.g1_layout,
             &mesh_glass.g2_layout,
         );
         let mesh_shadow_map = MeshShadowMapPass::new(
             device,
-            &splat_pass.g1_layout,
+            &mesh_instance.g1_layout,
             &mesh_glass.g2_layout,
         );
         let mesh_glass_shadow = crate::mesh_glass_shadow_pass::MeshGlassShadowPass::new(
             device,
             &mesh_shadow_map.render_g0_layout,
-            &splat_pass.g1_layout,
+            &mesh_instance.g1_layout,
             &mesh_glass.g2_layout,
         );
         let mesh_lod_select_pass =
-            crate::mesh_lod_select_pass::MeshLodSelectPass::new(device, &splat_pass.g1_layout);
-        let splat_resolve = SplatResolvePass::new(device);
+            crate::mesh_lod_select_pass::MeshLodSelectPass::new(device, &mesh_instance.g1_layout);
+        let mesh_resolve = MeshResolvePass::new(device);
         let mesh_proxy = crate::mesh_proxy_pass::MeshProxyPass::new(device);
         let user_shader_mesh = crate::user_shader_mesh_pass::UserShaderMeshPass::new(
             device,
@@ -365,8 +363,8 @@ impl RkpRenderer {
             lights_materials_epoch: 0,
             last_lights_hash: 0,
             last_materials_hash: 0,
-            splat_pass,
-            splat_resolve,
+            mesh_instance,
+            mesh_resolve,
             mesh_proxy,
             user_shader_mesh,
             brush_state,
@@ -734,10 +732,6 @@ impl RkpRenderer {
             .map(|(v, i, c)| (v, i, *c))
     }
 
-    /// Splat-raster equivalent of `OctreeMarchPass::dispatch`. Writes
-    /// the same G-buffer the compute march writes, so the downstream
-    /// shade / SSAO / etc passes are unchanged.
-    ///
     /// Rasterize procedural proxy meshes into the existing G-buffer.
     /// V1 mesh-path user-shader raster — one indirect draw per
     /// active user-shader material. Composites onto the G-buffer
@@ -811,10 +805,10 @@ impl RkpRenderer {
         }
     }
 
-    /// Runs after the primary mode's main pass + `splat_resolve` so the
-    /// G-buffer carries octree-mesh/splat output; proxy raster
+    /// Runs after the primary mode's main pass + `mesh_resolve` so the
+    /// G-buffer carries mesh-raster output; proxy raster
     /// depth-composites on top using `LoadOp::Load`. Writes all five
-    /// gbuf targets directly — no `splat_resolve` participation for
+    /// gbuf targets directly — no `mesh_resolve` participation for
     /// proxy pixels.
     pub fn dispatch_proxy_meshes(
         &self,
@@ -865,36 +859,35 @@ impl RkpRenderer {
         self.profiler.end_query(encoder, q);
     }
 
-    /// Surface-mesh equivalent of `dispatch_splat`. Phase 6.3:
-    /// per draw, runs the LOD-select compute pass that fills a
-    /// `DrawIndexedIndirectArgs` table for the asset's full DAG of
-    /// clusters; then issues `multi_draw_indexed_indirect` over that
-    /// table. Non-admitted slots carry `index_count = 0` so the no-op
-    /// draws cost nothing.
+    /// Surface-mesh raster. Per draw, runs the LOD-select compute
+    /// pass that fills a `DrawIndexedIndirectArgs` table for the
+    /// asset's full DAG of clusters; then issues
+    /// `multi_draw_indexed_indirect` over that table. Non-admitted
+    /// slots carry `index_count = 0` so the no-op draws cost nothing.
     ///
-    /// Visibility-buffer contract is unchanged from Phase 1-3 — the
-    /// splat-resolve compute pass still reads (leaf_slot, pick) +
+    /// Writes the visibility-buffer triplet (position, pick,
+    /// leaf_slot) + rest_pos. The `mesh_resolve` compute pass then
     /// fills normal / material / glass per pixel.
     pub fn dispatch_mesh(
         &mut self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         viewport: &mut crate::viewport_renderer::ViewportRenderer,
-        draws: &[SplatDraw],
+        draws: &[MeshDraw],
     ) {
         // Diagnostic: skip primary visibility GPU work. Used to
         // measure shadow_render in isolation when chasing the
         // anti-correlation pattern between the two passes. The
         // per-slot instance + bind-group setup below still runs
         // because the shadow path consumes
-        // `splat_instance_bind_groups` for per-instance world
+        // `mesh_instance_bind_groups` for per-instance world
         // matrices — early-returning here would crash shadow with
         // an empty Vec. The actual LOD-select compute + raster
         // render passes are gated separately at their dispatch
         // sites.
         let primary_disabled = std::env::var("RKP_MESH_DISABLE_PRIMARY").is_ok();
-        viewport.refresh_splat_g0(&self.device, self);
-        viewport.refresh_splat_resolve_bindings(&self.device, self);
+        viewport.refresh_mesh_g0(&self.device, self);
+        viewport.refresh_mesh_resolve_bindings(&self.device, self);
         viewport.refresh_mesh_glass_bindings(&self.device, self);
         // `RKP_MESH_GLASS_DEBUG_FORCE=2` raises the FS opacity gate
         // above 1.0 so every fragment classifies as glass with its
@@ -911,10 +904,10 @@ impl RkpRenderer {
             self.mesh_glass_debug_force,
             fs_threshold,
         );
-        viewport.ensure_splat_instance_capacity(&self.device, self, draws.len() as u32);
+        viewport.ensure_mesh_instance_capacity(&self.device, self, draws.len() as u32);
         viewport.ensure_mesh_lod_capacity(&self.device, self, draws.len() as u32);
         for (slot, d) in draws.iter().enumerate() {
-            viewport.write_splat_instance(
+            viewport.write_mesh_instance(
                 queue,
                 slot as u32,
                 &d.world,
@@ -1076,7 +1069,7 @@ impl RkpRenderer {
                         .map(|(_, c)| c)
                         .unwrap_or(0);
                     let g0 = &viewport.mesh_lod_select_g0_bgs[slot];
-                    let g1 = &viewport.splat_instance_bind_groups[slot];
+                    let g1 = &viewport.mesh_instance_bind_groups[slot];
                     let g2 = &viewport
                         .mesh_lod_select_g2_bgs[slot]
                         .as_ref()
@@ -1216,9 +1209,9 @@ impl RkpRenderer {
         }
 
         let g0_bg = viewport
-            .splat_g0_bg
+            .mesh_g0_bg
             .as_ref()
-            .expect("splat g0 bg present after refresh_splat_g0");
+            .expect("mesh g0 bg present after refresh_mesh_g0");
         // `glass_g2` is needed by the primary mesh raster (FS
         // glass-discard) AND by the glass front/back passes. Borrow
         // it once at the top so all three render passes can use the
@@ -1232,7 +1225,7 @@ impl RkpRenderer {
             .as_ref()
             .expect("mesh_glass combine bg present after refresh");
 
-        // 1. Visibility-buffer raster — same RT layout as the splat
+        // 1. Visibility-buffer raster — writes (position, pick, leaf_slot)
         //    pass; clears use the same march-equivalent miss sentinels.
         let q_raster = self.profiler.begin_query("mesh_raster", encoder);
         {
@@ -1265,7 +1258,7 @@ impl RkpRenderer {
                 if !slot_active[slot] {
                     continue;
                 }
-                let g1_bg = &viewport.splat_instance_bind_groups[slot];
+                let g1_bg = &viewport.mesh_instance_bind_groups[slot];
                 rp.set_bind_group(1, g1_bg, &[]);
                 rp.set_vertex_buffer(0, vbo.slice(..));
                 rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
@@ -1303,17 +1296,17 @@ impl RkpRenderer {
         }
         self.profiler.end_query(encoder, q_raster);
 
-        // 2. Resolve compute — identical to the splat path.
+        // 2. Resolve compute — fills normal / material / glass per pixel.
         let resolve_g0 = viewport
-            .splat_resolve_g0_bg
+            .mesh_resolve_g0_bg
             .as_ref()
-            .expect("splat_resolve g0 bg present after refresh");
+            .expect("mesh_resolve g0 bg present after refresh");
         let resolve_g1 = viewport
-            .splat_resolve_g1_bg
+            .mesh_resolve_g1_bg
             .as_ref()
-            .expect("splat_resolve g1 bg present after refresh");
+            .expect("mesh_resolve g1 bg present after refresh");
         let q_resolve = self.profiler.begin_query("mesh_resolve", encoder);
-        self.splat_resolve.dispatch(
+        self.mesh_resolve.dispatch(
             encoder,
             resolve_g0,
             resolve_g1,
@@ -1323,7 +1316,7 @@ impl RkpRenderer {
         self.profiler.end_query(encoder, q_resolve);
 
         // 3. Mesh-mode glass — front raster + back raster + combine.
-        //    Runs after `splat_resolve` (which writes zeros to
+        //    Runs after `mesh_resolve` (which writes zeros to
         //    `gbuf_glass`); the combine pass overwrites those zeros
         //    with actual glass data wherever a glass fragment was
         //    captured. `glass_g2` and `glass_combine_bg` were borrowed
@@ -1351,7 +1344,7 @@ impl RkpRenderer {
                 let Some((vbo, ibo, lod0_index_count)) = self.mesh_buffer(d.asset_handle_raw)
                 else { continue; };
                 if !slot_active[slot] { continue; }
-                let g1_bg = &viewport.splat_instance_bind_groups[slot];
+                let g1_bg = &viewport.mesh_instance_bind_groups[slot];
                 rp.set_bind_group(1, g1_bg, &[]);
                 rp.set_vertex_buffer(0, vbo.slice(..));
                 rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
@@ -1392,7 +1385,7 @@ impl RkpRenderer {
                 let Some((vbo, ibo, lod0_index_count)) = self.mesh_buffer(d.asset_handle_raw)
                 else { continue; };
                 if !slot_active[slot] { continue; }
-                let g1_bg = &viewport.splat_instance_bind_groups[slot];
+                let g1_bg = &viewport.mesh_instance_bind_groups[slot];
                 rp.set_bind_group(1, g1_bg, &[]);
                 rp.set_vertex_buffer(0, vbo.slice(..));
                 rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
@@ -1438,8 +1431,8 @@ impl RkpRenderer {
     ///   1. Have already populated `shadow_map.uniform_buffer` with a
     ///      live `LightCameraUniform` for this frame (engine does this
     ///      in `prepare_shadow_maps`).
-    ///   2. Have already populated `splat_instance_buffers` (any
-    ///      previous `dispatch_mesh`/`dispatch_splat` this frame did
+    ///   2. Have already populated `mesh_instance_buffers` (any
+    ///      previous `dispatch_mesh` this frame did
     ///      this; if mesh-shadow runs before primary mesh dispatch the
     ///      caller should write the per-instance uniforms first).
     ///
@@ -1451,7 +1444,7 @@ impl RkpRenderer {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         viewport: &mut crate::viewport_renderer::ViewportRenderer,
-        draws: &[SplatDraw],
+        draws: &[MeshDraw],
         user_shader_mesh_draws: &[crate::user_shader_mesh_pass::UserShaderMeshDraw],
     ) {
         // Diagnostic: skip shadow visibility entirely. Used to
@@ -1648,7 +1641,7 @@ impl RkpRenderer {
                             .map(|(_, c)| c)
                             .unwrap_or(0);
                         let g0 = &viewport.mesh_lod_shadow_g0_bgs[slot][cascade];
-                        let g1 = &viewport.splat_instance_bind_groups[slot];
+                        let g1 = &viewport.mesh_instance_bind_groups[slot];
                         let g2 = &viewport
                             .mesh_lod_shadow_g2_bgs[slot][cascade]
                             .as_ref()
@@ -1716,7 +1709,7 @@ impl RkpRenderer {
                     if !slot_active[slot] {
                         continue;
                     }
-                    let g1_bg = &viewport.splat_instance_bind_groups[slot];
+                    let g1_bg = &viewport.mesh_instance_bind_groups[slot];
                     rp.set_bind_group(1, g1_bg, &[]);
                     rp.set_vertex_buffer(0, vbo.slice(..));
                     rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
@@ -1795,7 +1788,7 @@ impl RkpRenderer {
                         self.mesh_buffer(d.asset_handle_raw)
                     else { continue; };
                     if !slot_active[slot] { continue; }
-                    let g1_bg = &viewport.splat_instance_bind_groups[slot];
+                    let g1_bg = &viewport.mesh_instance_bind_groups[slot];
                     rp.set_bind_group(1, g1_bg, &[]);
                     rp.set_vertex_buffer(0, vbo.slice(..));
                     rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
@@ -1843,7 +1836,7 @@ impl RkpRenderer {
                         self.mesh_buffer(d.asset_handle_raw)
                     else { continue; };
                     if !slot_active[slot] { continue; }
-                    let g1_bg = &viewport.splat_instance_bind_groups[slot];
+                    let g1_bg = &viewport.mesh_instance_bind_groups[slot];
                     rp.set_bind_group(1, g1_bg, &[]);
                     rp.set_vertex_buffer(0, vbo.slice(..));
                     rp.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
@@ -1962,12 +1955,11 @@ impl RkpRenderer {
         atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
         mode: crate::RenderMode,
         preview_mode: crate::BuildPreviewMode,
-        // Phase B-2 — splat-raster instance list. Used only when
-        // `self.primary_mode == PrimaryMode::Splat`; the march path
-        // ignores it. One entry per visible scene-instance whose asset
-        // has splat data (i.e. came from `acquire_asset`); procedural
-        // objects without splats are skipped client-side.
-        splat_draws: &[SplatDraw],
+        // Mesh-raster instance list. One entry per visible
+        // scene-instance whose asset has mesh data (i.e. came from
+        // `acquire_asset`); procedural objects without baked meshes
+        // are skipped client-side.
+        mesh_draws: &[MeshDraw],
         // Procedural proxy-mesh draws (GPU surface-nets-from-SDF).
         // Rendered by `dispatch_proxy_meshes` after the primary mode
         // completes; composites into the G-buffer via depth-test.
@@ -2009,10 +2001,10 @@ impl RkpRenderer {
             );
             self.profiler.end_query(encoder, q);
         } else {
-            // `splat_draws` records (asset_handle, world, object_id)
+            // `mesh_draws` records (asset_handle, world, object_id)
             // per scene instance — name to be renamed `mesh_draws` in
             // the cleanup audit.
-            self.dispatch_mesh(queue, encoder, viewport, splat_draws);
+            self.dispatch_mesh(queue, encoder, viewport, mesh_draws);
         }
 
         // 1a'. Proxy-mesh raster — composites procedural triangle
@@ -2040,7 +2032,7 @@ impl RkpRenderer {
         //     samples the fresh map.
         if in_situ && !raymarch && shadow_map_enabled {
             self.dispatch_mesh_shadow(
-                queue, encoder, viewport, splat_draws, user_shader_mesh_draws,
+                queue, encoder, viewport, mesh_draws, user_shader_mesh_draws,
             );
         }
 

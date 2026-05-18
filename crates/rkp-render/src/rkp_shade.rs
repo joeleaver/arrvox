@@ -97,11 +97,10 @@ pub struct ShadeParams {
     /// no live shadow map this frame).
     pub shadow_map_enabled: u32,
     /// Non-zero ⇒ shade forces shadow=1.0 instead of sampling
-    /// `shadow_tex`. Engine sets this when running the splat path
-    /// (`RKP_PRIMARY=splat`), since `shadow_trace` requires march's
-    /// params bg and can't dispatch under splat. Without this gate
-    /// the (uninitialized / stale) shadow_tex would clamp lighting
-    /// to near-zero and the whole frame would render dark.
+    /// `shadow_tex`. Used when no shadow pass has run this frame
+    /// (e.g. shadow disabled in viewport settings); without this
+    /// gate the stale `shadow_tex` would clamp lighting to near-
+    /// zero and the whole frame would render dark.
     pub shadow_disabled: u32,
     /// Per-fragment shadow-map tap count used by `sample_shadow_map`.
     /// 1 = single-tap (hard shadow, current cheapest); 4/9/16 =
