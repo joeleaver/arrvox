@@ -1,0 +1,22 @@
+[package]
+name = "arvx-import"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Mesh-to-.arvx import pipeline: load, BVH, bake opacity-octree assets"
+
+[dependencies]
+arvx-core = { workspace = true }
+arvx-animation = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true }
+rayon = { workspace = true }
+gltf = { workspace = true }
+tobj = { workspace = true }
+ufbx = { workspace = true }
+image = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+ufbx = { workspace = true }

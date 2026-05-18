@@ -1,0 +1,471 @@
+//! G-buffer textures for deferred shading.
+//!
+//! The ray march pass writes per-pixel data to 4 render targets at internal
+//! resolution. The shading pass reads these to compute final lighting.
+//!
+//! | Target | Format       | Content                                       |
+//! |--------|-------------|-----------------------------------------------|
+//! | 0      | Rgba32Float | position.xyz + hit_distance                   |
+//! | 1      | Rgba16Float | normal.xyz + material_blend_weight            |
+//! | 2      | Rg32Uint    | r: material_id(lo16) + secondary(hi16), g: blend(lo8) + object_id(8-15) |
+//! | 3      | Rgba32Float | motion_vector.xy + grad_magnitude.z           |
+
+/// Depth texture format for rasterization-based G-buffer writes.
+pub const GBUFFER_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// G-buffer: 4 render targets at internal resolution for deferred shading.
+pub struct GBuffer {
+    /// Target 0: world position (xyz) + hit distance (w). `Rgba32Float`.
+    pub position_texture: wgpu::Texture,
+    /// View for target 0.
+    pub position_view: wgpu::TextureView,
+
+    /// Target 1: normal (xyz) + blend weight (w). `Rgba16Float`.
+    pub normal_texture: wgpu::Texture,
+    /// View for target 1.
+    pub normal_view: wgpu::TextureView,
+
+    /// Target 2: r=material_ids, g=blend+object_id. `Rg32Uint`.
+    pub material_texture: wgpu::Texture,
+    /// View for target 2.
+    pub material_view: wgpu::TextureView,
+
+    /// Target 3: motion vector (xy). `Rg16Float`.
+    pub motion_texture: wgpu::Texture,
+    /// View for target 3.
+    pub motion_view: wgpu::TextureView,
+
+    /// Target "glass": per-pixel glass surface info when the primary
+    /// ray passes through a transparent voxel. The primary G-buffer
+    /// targets above record the opaque hit BEHIND the glass; this
+    /// target records the glass itself so `arvx_glass` can composite
+    /// refraction + Beer + Fresnel over the shaded behind. `Rg32Uint`:
+    /// * R = entry normal, oct-packed (2×snorm16 → u32).
+    /// * G = `(thickness_mm << 16) | material_id`.
+    /// A value of `R==0, G==0` means "no glass at this pixel" —
+    /// shaders gate on `thickness_mm != 0`.
+    pub glass_texture: wgpu::Texture,
+    /// View for the glass target.
+    pub glass_view: wgpu::TextureView,
+
+    /// Target "leaf_slot": scene-global leaf_attr slot of the primary
+    /// hit. `R32Uint` — `0` means "no hit" (sky or procedural surface
+    /// without a stable leaf slot); any other value indexes
+    /// `leaf_attr_pool` / `color_pool` / `brush_overlay` in downstream
+    /// passes. Written by the mesh raster + proc_raymarch, read by
+    /// `mesh_resolve` and `arvx_shade`.
+    pub leaf_slot_texture: wgpu::Texture,
+    pub leaf_slot_view: wgpu::TextureView,
+
+    /// Target "rest_pos": per-pixel local mesh-frame rest position
+    /// (the un-skinned vertex position interpolated barycentrically
+    /// across the triangle). `Rgba32Float`. Written by `mesh.wesl`'s
+    /// fragment stage as a 4th visibility-buffer attachment so
+    /// `mesh_resolve` can descend the asset's octree per pixel and
+    /// recover the actual cell at the surface point — the mesh path's
+    /// flat-interpolated `leaf_attr_id` only carries one cell's value
+    /// per triangle, which appears as chunky per-triangle color
+    /// patches at fine LOD.
+    /// `.w == 1` ⇒ mesh wrote a valid rest_pos; `.w == 0` ⇒ miss /
+    /// "no rest_pos available, fall back to leaf_slot."
+    pub rest_pos_texture: wgpu::Texture,
+    pub rest_pos_view: wgpu::TextureView,
+
+    /// Depth texture for rasterization-based G-buffer writes. `Depth32Float`.
+    /// Used by the forward rasterization pipeline; ignored by compute march paths.
+    pub depth_texture: wgpu::Texture,
+    /// View for the depth texture.
+    pub depth_view: wgpu::TextureView,
+
+    /// Bind group layout for writing (storage textures, used by ray march).
+    pub write_bind_group_layout: wgpu::BindGroupLayout,
+    /// Bind group for writing.
+    pub write_bind_group: wgpu::BindGroup,
+
+    /// Bind group layout for reading (sampled textures, used by shading pass).
+    pub read_bind_group_layout: wgpu::BindGroupLayout,
+    /// Bind group for reading.
+    pub read_bind_group: wgpu::BindGroup,
+
+    /// Internal resolution width.
+    pub width: u32,
+    /// Internal resolution height.
+    pub height: u32,
+}
+
+/// Texture format for G-buffer target 0 (position + hit distance).
+///
+/// Rgba32Float — full 32-bit precision per channel. Tested
+/// Rgba16Float (commit log notes the 2026-05-06 measurement) and
+/// it didn't move mesh_raster / mesh_shadow_render time at all
+/// on the splat5 elephant scene; ROP write bandwidth is not the
+/// bottleneck for either pass. Reverted to f32 to keep mm-scale
+/// world-space precision out to scene boundaries.
+pub const GBUFFER_POSITION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+/// Texture format for G-buffer target 1 (normal + blend weight).
+pub const GBUFFER_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Texture format for G-buffer target 2 (packed material IDs + blend + object_id).
+pub const GBUFFER_MATERIAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
+/// Texture format for G-buffer target 3 (motion vectors).
+pub const GBUFFER_MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+/// Texture format for the glass target — Rg32Uint carrying entry
+/// normal (R), packed thickness/material_id (G). Changing the format
+/// breaks `mesh_resolve`, `proc_raymarch`, and `arvx_glass` — all
+/// hardcode against this channel layout.
+pub const GBUFFER_GLASS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
+/// Texture format for the leaf_slot target — R32Uint carrying the
+/// primary hit's scene-global `leaf_attr_slot`. `0` = sky / no hit.
+/// Used by arvx_shade's geodesic paint cursor.
+pub const GBUFFER_LEAF_SLOT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
+/// Texture format for the mesh-path rest-pose position target.
+/// Rgba32Float for full FP precision in mesh-frame coordinates; the
+/// per-pixel octree descent in `mesh_resolve` needs sub-voxel
+/// accuracy and meshes can range over ~100 m of extent. Changing
+/// this format requires updating `mesh.wesl`'s 4th color target +
+/// `mesh_resolve.wesl`'s sample type.
+pub const GBUFFER_REST_POS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+
+impl GBuffer {
+    /// Create the G-buffer with 4 render targets at the given resolution.
+    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+
+        let usage = wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::RENDER_ATTACHMENT;
+        let usage_copy_src = usage | wgpu::TextureUsages::COPY_SRC;
+
+        // Target 0: position + hit_distance
+        let position_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gbuffer position"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GBUFFER_POSITION_FORMAT,
+            usage: usage_copy_src,
+            view_formats: &[],
+        });
+        let position_view = position_texture.create_view(&Default::default());
+
+        // Target 1: normal + blend_weight (COPY_SRC needed by SDF shader pass)
+        let normal_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gbuffer normal"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GBUFFER_NORMAL_FORMAT,
+            usage: usage_copy_src,
+            view_formats: &[],
+        });
+        let normal_view = normal_texture.create_view(&Default::default());
+
+        // Target 2: r=material_ids, g=blend+object_id (Rg32Uint)
+        let material_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gbuffer material"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GBUFFER_MATERIAL_FORMAT,
+            usage: usage_copy_src,
+            view_formats: &[],
+        });
+        let material_view = material_texture.create_view(&Default::default());
+
+        // Target 3: motion vectors
+        let motion_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gbuffer motion"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GBUFFER_MOTION_FORMAT,
+            usage,
+            view_formats: &[],
+        });
+        let motion_view = motion_texture.create_view(&Default::default());
+
+        // Glass target — oct-packed normal + (thickness_mm, material_id).
+        // See field docs on `GBuffer::glass_texture`.
+        let glass_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gbuffer glass"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GBUFFER_GLASS_FORMAT,
+            usage,
+            view_formats: &[],
+        });
+        let glass_view = glass_texture.create_view(&Default::default());
+
+        // Leaf-slot target — primary hit's leaf_attr_slot. Used by
+        // the shade pass for the geodesic paint cursor (Phase 3b).
+        let leaf_slot_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gbuffer leaf_slot"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GBUFFER_LEAF_SLOT_FORMAT,
+            usage,
+            view_formats: &[],
+        });
+        let leaf_slot_view = leaf_slot_texture.create_view(&Default::default());
+
+        // Mesh-path rest_pos target — per-pixel rest-pose mesh-frame
+        // position. Written by `mesh.wesl` as a 4th MRT attachment;
+        // consumed by `mesh_resolve.wesl` for per-pixel cell descent.
+        // RENDER_ATTACHMENT for mesh writes, TEXTURE_BINDING for the
+        // resolve read.
+        let rest_pos_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gbuffer rest_pos"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GBUFFER_REST_POS_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let rest_pos_view = rest_pos_texture.create_view(&Default::default());
+
+        // Depth texture for rasterization-based G-buffer writes
+        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gbuffer depth"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GBUFFER_DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let depth_view = depth_texture.create_view(&Default::default());
+
+        // Write bind group layout (4 storage textures, write-only)
+        let write_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gbuffer write layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: GBUFFER_POSITION_FORMAT,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: GBUFFER_NORMAL_FORMAT,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: GBUFFER_MATERIAL_FORMAT,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: GBUFFER_MOTION_FORMAT,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let write_bind_group = Self::create_write_bind_group(
+            device,
+            &write_bind_group_layout,
+            &position_view,
+            &normal_view,
+            &material_view,
+            &motion_view,
+        );
+
+        // Read bind group layout (4 sampled textures for shading pass)
+        let read_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gbuffer read layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Uint,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let read_bind_group = Self::create_read_bind_group(
+            device,
+            &read_bind_group_layout,
+            &position_view,
+            &normal_view,
+            &material_view,
+            &motion_view,
+        );
+
+        Self {
+            position_texture,
+            position_view,
+            normal_texture,
+            normal_view,
+            material_texture,
+            material_view,
+            motion_texture,
+            motion_view,
+            glass_texture,
+            glass_view,
+            leaf_slot_texture,
+            leaf_slot_view,
+            rest_pos_texture,
+            rest_pos_view,
+            depth_texture,
+            depth_view,
+            write_bind_group_layout,
+            write_bind_group,
+            read_bind_group_layout,
+            read_bind_group,
+            width,
+            height,
+        }
+    }
+
+    fn create_write_bind_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        position_view: &wgpu::TextureView,
+        normal_view: &wgpu::TextureView,
+        material_view: &wgpu::TextureView,
+        motion_view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gbuffer write bind group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(position_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(material_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(motion_view),
+                },
+            ],
+        })
+    }
+
+    fn create_read_bind_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        position_view: &wgpu::TextureView,
+        normal_view: &wgpu::TextureView,
+        material_view: &wgpu::TextureView,
+        motion_view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gbuffer read bind group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(position_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(material_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(motion_view),
+                },
+            ],
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gbuffer_format_constants() {
+        assert_eq!(GBUFFER_POSITION_FORMAT, wgpu::TextureFormat::Rgba32Float);
+        assert_eq!(GBUFFER_NORMAL_FORMAT, wgpu::TextureFormat::Rgba16Float);
+        assert_eq!(GBUFFER_MATERIAL_FORMAT, wgpu::TextureFormat::Rg32Uint);
+        assert_eq!(GBUFFER_MOTION_FORMAT, wgpu::TextureFormat::Rgba32Float);
+    }
+}

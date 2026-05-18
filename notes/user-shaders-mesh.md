@@ -12,7 +12,7 @@ The current path (`project_user_shader_emit_rebuild_2026_05_05`, tip `7cc6230`) 
 
 1. CPU collects `EmitLeaf` records from painted leaves whose material has an `instance_at` hook.
 2. `user_shader_proto_pass` bakes each shader to a canonical [0,1]³ octree prototype.
-3. `user_shader_emit_pass` walks painted leaves, dispatches per-leaf `k = 0..MAX_EMITS (=8)` calls to `instance_at`, packs accepted instances as `RkpGpuInstance` records with affine `world` matrices.
+3. `user_shader_emit_pass` walks painted leaves, dispatches per-leaf `k = 0..MAX_EMITS (=8)` calls to `instance_at`, packs accepted instances as `ArvxGpuInstance` records with affine `world` matrices.
 4. `user_shader_tile_bin_pass` projects each instance's world AABB to screen and bins into per-tile lists.
 5. Primary march scans each pixel's tile list, descends the per-instance proto octree, writes the hit into the visibility buffer.
 6. Shadow trace path was disabled when the band-cell BFS was stripped — emitted blades cast no shadows today.
@@ -205,20 +205,20 @@ The composer's existing infrastructure (lib_symbols, hash, parser) is largely re
 
 | File | Change |
 |------|--------|
-| `crates/rkp-render/src/user_shader_mesh_pass.rs` (new) | The four-pass pipeline owner: spawn_count compute, prefix_sum, fill compute, raster. Borrows shape from `mesh_proxy_pass.rs` for the raster portion. Owns per-shader pipeline objects (one set per active user-shader material). |
-| `crates/rkp-render/src/user_shader_mesh_shadow.rs` (new) | Shadow-VS variant of the raster pipeline; one per shader. Reused indirect args buffer. |
-| `crates/rkp-render/src/shaders/user_shader_mesh.wesl` (new) | Hand-authored skeleton: WGSL structs (AnchorContext, FrameContext, VsOut, FsIn, FsOut), the engine-side helpers (instance-record deref, default FS), and the splice anchors for the user's functions. |
-| `crates/rkp-render/src/shaders/user_shader_mesh_compute.wesl` (new) | Compute-pass skeletons for spawn_count + fill + (small) prefix-sum. |
-| `crates/rkp-render/src/shader_composer/compose.rs` | New `compose_spawn_count`, `compose_vs`, `compose_spawn_alive`, `compose_fs` paths. Drop `compose_proto_chunk`, `compose_emit_chunk`, `compose_inst_*`. |
-| `crates/rkp-render/src/shader_composer/parser.rs` | Parse new manifest directives: `@geometry`, `@spawn_count_cache`. Drop `@instance_proto`, `@max_emits_per_thread`, `@tile_size`, `@region_thickness`, `@max_depth`. |
-| `crates/rkp-render/src/shader_composer/hash.rs` | Hash inputs change to match new splice points. |
-| `crates/rkp-engine/src/render_worker/user_shader_tick.rs` | Replace `tick_emit_pass` / proto-bake bookkeeping with the new four-pass orchestration. Per active shader: collect anchors, upload to anchor buffer, dispatch the four passes (gated on paint-epoch for static-cache shaders), record draws. |
-| `crates/rkp-engine/src/render_frame.rs` | Replace `painted_leaves: Vec<EmitLeaf>` with `user_shader_anchors: HashMap<ShaderId, Vec<AnchorRecord>>` (per-shader, since each shader sees only its own painted leaves). Drop `user_shader_emit_chunk`. |
-| `crates/rkp-engine/src/engine/lifecycle.rs::scan_painted_aabbs` | Output per-shader anchor lists (not just a flat `EmitLeaf` Vec). Anchor record carries the new fields (`surface_area`, `leaf_extent`, `seed`, etc.). |
-| `crates/rkp-render/src/rkp_renderer.rs` | Schedule the four-pass user-shader pipeline after `mesh_proxy_pass`. Per active shader: spawn_count → prefix_sum → fill → raster → (per cascade) shadow. |
-| `crates/rkp-render/src/viewport_renderer.rs` | Per-VR bind groups for the user-shader raster (camera g0 + per-pass-uniforms). |
+| `crates/arvx-render/src/user_shader_mesh_pass.rs` (new) | The four-pass pipeline owner: spawn_count compute, prefix_sum, fill compute, raster. Borrows shape from `mesh_proxy_pass.rs` for the raster portion. Owns per-shader pipeline objects (one set per active user-shader material). |
+| `crates/arvx-render/src/user_shader_mesh_shadow.rs` (new) | Shadow-VS variant of the raster pipeline; one per shader. Reused indirect args buffer. |
+| `crates/arvx-render/src/shaders/user_shader_mesh.wesl` (new) | Hand-authored skeleton: WGSL structs (AnchorContext, FrameContext, VsOut, FsIn, FsOut), the engine-side helpers (instance-record deref, default FS), and the splice anchors for the user's functions. |
+| `crates/arvx-render/src/shaders/user_shader_mesh_compute.wesl` (new) | Compute-pass skeletons for spawn_count + fill + (small) prefix-sum. |
+| `crates/arvx-render/src/shader_composer/compose.rs` | New `compose_spawn_count`, `compose_vs`, `compose_spawn_alive`, `compose_fs` paths. Drop `compose_proto_chunk`, `compose_emit_chunk`, `compose_inst_*`. |
+| `crates/arvx-render/src/shader_composer/parser.rs` | Parse new manifest directives: `@geometry`, `@spawn_count_cache`. Drop `@instance_proto`, `@max_emits_per_thread`, `@tile_size`, `@region_thickness`, `@max_depth`. |
+| `crates/arvx-render/src/shader_composer/hash.rs` | Hash inputs change to match new splice points. |
+| `crates/arvx-engine/src/render_worker/user_shader_tick.rs` | Replace `tick_emit_pass` / proto-bake bookkeeping with the new four-pass orchestration. Per active shader: collect anchors, upload to anchor buffer, dispatch the four passes (gated on paint-epoch for static-cache shaders), record draws. |
+| `crates/arvx-engine/src/render_frame.rs` | Replace `painted_leaves: Vec<EmitLeaf>` with `user_shader_anchors: HashMap<ShaderId, Vec<AnchorRecord>>` (per-shader, since each shader sees only its own painted leaves). Drop `user_shader_emit_chunk`. |
+| `crates/arvx-engine/src/engine/lifecycle.rs::scan_painted_aabbs` | Output per-shader anchor lists (not just a flat `EmitLeaf` Vec). Anchor record carries the new fields (`surface_area`, `leaf_extent`, `seed`, etc.). |
+| `crates/arvx-render/src/arvx_renderer.rs` | Schedule the four-pass user-shader pipeline after `mesh_proxy_pass`. Per active shader: spawn_count → prefix_sum → fill → raster → (per cascade) shadow. |
+| `crates/arvx-render/src/viewport_renderer.rs` | Per-VR bind groups for the user-shader raster (camera g0 + per-pass-uniforms). |
 | `examples/shaders/grass.wgsl`, `splat5/assets/shaders/grass.wgsl` | Rewrite from scratch against the V1 API. Single VS computes blade geometry from `(spawn_idx, vid, anchor, frame)`. |
-| **Retire** | `crates/rkp-render/src/user_shader_emit_pass.rs` (453 lines), `user_shader_tile_bin_pass.rs` (210), `user_shader_proto_pass.rs` + `user_shader_proto_pass/*.rs` (~853), `shaders/user_shader_emit.wesl` (179), `shaders/user_shader_tile_bin.wesl` (169), `shaders/user_shader_proto.wesl` (291), `shaders/user_shader_proto_rollup.wesl` (129), `shaders/shadow_scatter_emit.wesl`. Drop the band-cell scan + tile-list iteration from `octree_march.wesl` and `rkp_shadow_trace.wesl`. ~2.5k+ lines retire. |
+| **Retire** | `crates/arvx-render/src/user_shader_emit_pass.rs` (453 lines), `user_shader_tile_bin_pass.rs` (210), `user_shader_proto_pass.rs` + `user_shader_proto_pass/*.rs` (~853), `shaders/user_shader_emit.wesl` (179), `shaders/user_shader_tile_bin.wesl` (169), `shaders/user_shader_proto.wesl` (291), `shaders/user_shader_proto_rollup.wesl` (129), `shaders/shadow_scatter_emit.wesl`. Drop the band-cell scan + tile-list iteration from `octree_march.wesl` and `arvx_shadow_trace.wesl`. ~2.5k+ lines retire. |
 
 ## Validation
 
@@ -254,7 +254,7 @@ Confirmed retirements once V1 lands and the rewritten `grass.wgsl` validates:
 
 - **Rust files (~1775 lines):** `user_shader_emit_pass.rs`, `user_shader_tile_bin_pass.rs`, `user_shader_proto_pass.rs` + `user_shader_proto_pass/{cache,pass,types,tests}.rs`.
 - **WGSL files (~770 lines):** `shaders/user_shader_emit.wesl`, `shaders/user_shader_tile_bin.wesl`, `shaders/user_shader_proto.wesl`, `shaders/user_shader_proto_rollup.wesl`, `shaders/shadow_scatter_emit.wesl`.
-- **In-place deletions:** band-cell descend + tile-list iteration in `octree_march.wesl`, `rkp_shadow_trace.wesl`. The `OCTREE_BAND_BIT` (bit 29) frees up.
+- **In-place deletions:** band-cell descend + tile-list iteration in `octree_march.wesl`, `arvx_shadow_trace.wesl`. The `OCTREE_BAND_BIT` (bit 29) frees up.
 - **Engine plumbing:** `RenderFrame.painted_leaves`, `RenderFrame.user_shader_emit_chunk`, the `EmitLeaf` type, the proto-bake cache fields on `EngineState`, the `tick_emit_pass` orchestration in `user_shader_tick.rs` (replaced).
 - **Composer splices:** `compose_proto_chunk`, `compose_emit_chunk`, `compose_inst_world_matrix`, `compose_inst_aabb`, `compose_inst_to_local`, `splice_emit_chunks`.
 - **Manifest directives:** `@instance_proto`, `@max_emits_per_thread`, `@max_depth` (region), `@tile_size`, `@region_thickness`.

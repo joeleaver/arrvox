@@ -1,17 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/rkp-core",
-    "crates/rkp-render",
-    "crates/rkp-convert",
-    "crates/rkp-runtime",
-    "crates/rkp-editor",
-    "crates/rkp-testbed", "crates/rkp-engine",
-    "crates/rkp-macros",
-    "crates/rkp-procedural",
-    "crates/rkp-import",
-    "crates/rkp-animation",
-    "crates/rkp-physics",
+    "crates/arvx-core",
+    "crates/arvx-render",
+    "crates/arvx-convert",
+    "crates/arvx-runtime",
+    "crates/arvx-editor",
+    "crates/arvx-testbed", "crates/arvx-engine",
+    "crates/arvx-macros",
+    "crates/arvx-procedural",
+    "crates/arvx-import",
+    "crates/arvx-animation",
+    "crates/arvx-physics",
 ]
 
 [workspace.package]
@@ -19,20 +19,20 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/joeleaver/rkipatch"
+repository = "https://github.com/joeleaver/arrvox"
 
 [workspace.dependencies]
 # Internal crates
-rkp-core = { path = "crates/rkp-core" }
-rkp-render = { path = "crates/rkp-render" }
-rkp-convert = { path = "crates/rkp-convert" }
-rkp-runtime = { path = "crates/rkp-runtime" }
-rkp-engine = { path = "crates/rkp-engine" }
-rkp-macros = { path = "crates/rkp-macros" }
-rkp-procedural = { path = "crates/rkp-procedural" }
-rkp-import = { path = "crates/rkp-import" }
-rkp-animation = { path = "crates/rkp-animation" }
-rkp-physics = { path = "crates/rkp-physics" }
+arvx-core = { path = "crates/arvx-core" }
+arvx-render = { path = "crates/arvx-render" }
+arvx-convert = { path = "crates/arvx-convert" }
+arvx-runtime = { path = "crates/arvx-runtime" }
+arvx-engine = { path = "crates/arvx-engine" }
+arvx-macros = { path = "crates/arvx-macros" }
+arvx-procedural = { path = "crates/arvx-procedural" }
+arvx-import = { path = "crates/arvx-import" }
+arvx-animation = { path = "crates/arvx-animation" }
+arvx-physics = { path = "crates/arvx-physics" }
 
 # External dependencies (versions match RKIField)
 wgpu = "29"

@@ -19,7 +19,7 @@ and were deferred as a deliberate stop point.
 This plan picks up where `docs/PERF_DEBT.md` Phase E left off. After
 Phase A–E, the sculpt per-stamp sim is **drain-bound at ~15 ms** —
 the next lever lives inside `apply_sculpt_brush`
-(`crates/rkp-render/src/rkp_scene_manager/sculpt.rs:205`), not in the
+(`crates/arvx-render/src/arvx_scene_manager/sculpt.rs:205`), not in the
 gpu-derive loop the perf-debt plan addressed.
 
 ---
@@ -139,7 +139,7 @@ Maintenance: built at asset load, rebuilt on full re-extract,
 incrementally updated on patch-cluster append. 5 unit tests
 cover empty/LOD-filter/multi-bucket/incremental/empty-brush
 behaviour. All 920+ workspace tests pass. Adds `rustc-hash` to
-rkp-render deps (already a rkp-core dep from D6.2).
+arvx-render deps (already a arvx-core dep from D6.2).
 
 ### D6.1 — iterate cells map directly in extract loop (`3662ad84`)
 
@@ -297,7 +297,7 @@ a small regression on the easy case (16 k-cell `mesh` 1.88 →
 resize(.., u32::MAX)` for both grids — alloc ~50-200 µs and
 memset ~500 µs per stamp.
 
-D6.3.c moves the grids onto `RkpSceneManager.sculpt_extract_scratch`
+D6.3.c moves the grids onto `ArvxSceneManager.sculpt_extract_scratch`
 (a `SculptExtractScratch` holding both `CellGrid`s plus the
 `solid_cells: Vec<IVec3>` filter buffer). `CellGrid::set` now
 records first-writes in a parallel `dirty: Vec<usize>`;

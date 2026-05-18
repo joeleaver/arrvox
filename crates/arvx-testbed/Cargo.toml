@@ -1,0 +1,18 @@
+[package]
+name = "arvx-testbed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Visual testing harness for the Arrvox splat engine"
+
+[dependencies]
+arvx-core = { workspace = true }
+arvx-render = { workspace = true }
+arvx-runtime = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
+glam = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+anyhow = { workspace = true }
+pollster = { workspace = true }

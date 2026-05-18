@@ -1,4 +1,4 @@
-# RKIPatch — Surface-Mesh Voxel Graphics Engine
+# Arrvox — Surface-Mesh Voxel Graphics Engine
 
 ## What This Is
 
@@ -10,7 +10,7 @@ This is a sibling project to [RKIField](../rkifield/) (SDF engine). Both share c
 
 ## Origin and where we are now
 
-RKIPatch began as a splat-accumulation rendering experiment. Over time the design converged through several pivots:
+Arrvox began as a splat-accumulation rendering experiment. Over time the design converged through several pivots:
 
 1. **Splat-accumulation rendering** — original framing, retired.
 2. **Per-pixel opacity-field surface march** — compute marcher descended the octree per pixel. Worked, but fragment-bound on dense scenes.
@@ -23,7 +23,7 @@ The project name still says "patch" from the original splat framing; the archite
 
 - **Surface defined by sparse octree leaves.** The octree-build classifier uses the 1-Lipschitz property of a signed distance function (sampled from the primitive / mesh) to decide Empty / Interior / Mixed at each octree level.
 - **Prefiltered per-leaf normals.** The SDF gradient at each voxel center is computed once during voxelization, octahedrally packed (2× snorm16 in a u32, <0.05° worst-case roundtrip error), and stored in `LeafAttr`.
-- **Surface-mesh raster.** Imported `.rkp` assets ship with pre-baked triangle meshes + meshlet clusters + DAG groups (v5/v6 file format). The mesh raster pass writes only the visibility-buffer triplet (position, pick, leaf_slot); a compute resolve pass fills in normal/material/glass per pixel via the octree → leaf_attr indirection. Mesh raster + glass + shadow all skin in VS against per-frame bone palettes.
+- **Surface-mesh raster.** Imported `.arvx` assets ship with pre-baked triangle meshes + meshlet clusters + DAG groups (v5/v6 file format). The mesh raster pass writes only the visibility-buffer triplet (position, pick, leaf_slot); a compute resolve pass fills in normal/material/glass per pixel via the octree → leaf_attr indirection. Mesh raster + glass + shadow all skin in VS against per-frame bone palettes.
 - **Procedural objects → proxy mesh.** Procedural primitives flatten to an SDF opcode stream and bake to a triangle proxy mesh via GPU surface-nets-from-SDF. No voxelization for procedurals.
 - **Deferred rendering.** Mesh raster + resolve → G-buffer. Shading is a separate pass with full PBR + CSM shadows + atmosphere + volumetrics + post-process.
 - **Dual-material blending.** `LeafAttr` carries primary material (u16), secondary material (u16), and blend weight — per-leaf material variation.
@@ -33,7 +33,7 @@ The project name still says "patch" from the original splat framing; the archite
 1. **Deferred mesh rendering** — surface-mesh raster writes G-buffer; resolve compute fills the rest. Shading reuses rkf-render's full PBR stack.
 2. **Per-voxel color** — mesh textures baked into per-voxel RGB during import. Stored in companion color pool (same infrastructure as RKIField).
 3. **Prefiltered octahedral normals** — surface normals come from `LeafAttr.normal_oct`, computed once at voxelization and read at shade time. No gradient reconstruction in the hot path.
-4. **`.rkp` file format** — LZ4-compressed sparse octree + brick pool + per-voxel color + bone weights + baked mesh + meshlet clusters + DAG groups (v6).
+4. **`.arvx` file format** — LZ4-compressed sparse octree + brick pool + per-voxel color + bone weights + baked mesh + meshlet clusters + DAG groups (v6).
 5. **Mesh import pipeline** — .glb/.gltf/.obj/.fbx → BVH → SDF function → octree voxelization → surface-nets meshing → cluster-DAG bake.
 6. **Shared infrastructure** — reuse RKIField's editor UI (rinch), ECS (hecs), MCP server, physics (Rapier), animation, asset streaming, material palette system.
 
@@ -49,8 +49,8 @@ The project name still says "patch" from the original splat framing; the archite
 | ECS | **hecs** | From RKIField (shared crate) |
 | Physics | **Rapier** | From RKIField (shared crate) |
 | Editor UI | **rinch** | From RKIField (shared crate) |
-| Mesh Import | **rkp-import** | Own crate (`crates/rkp-import`) |
-| Compression | **lz4_flex** | Section data in .rkp files |
+| Mesh Import | **arvx-import** | Own crate (`crates/arvx-import`) |
+| Compression | **lz4_flex** | Section data in .arvx files |
 
 ## Shared Crates (from RKIField)
 
@@ -60,26 +60,26 @@ These live in `../rkifield/crates/` and are referenced as path dependencies:
 |-------|---------------|
 | `rkf-core` | WorldPosition, brick pool, brick maps, spatial index, Aabb, BVH, material types, constants |
 | `rkf-physics` | Rapier integration, collision adapter |
-| `rkf-animation` | Skeletal animation, blend shapes, `SkeletonAsset` + `save_rkskel` (used by `rkp-import` for the `.rkskel` sidecar) |
+| `rkf-animation` | Skeletal animation, blend shapes, `SkeletonAsset` + `save_rkskel` (used by `arvx-import` for the `.arvxskel` sidecar) |
 | `rkf-mcp` | MCP server, tool registry, IPC bridge |
 
-## New Crates (RKIPatch-specific)
+## New Crates (Arrvox-specific)
 
 ```
-rkipatch/
+arrvox/
   crates/
-    rkp-core/        — sparse octree, brick pool, LeafAttr, mesh extract, asset_file (.rkp v6)
-    rkp-render/      — surface-mesh raster + resolve + shading + post-process pipeline
-    rkp-import/      — Mesh → .rkp import pipeline: mesh loaders (glTF/OBJ/FBX),
+    arvx-core/        — sparse octree, brick pool, LeafAttr, mesh extract, asset_file (.arvx v6)
+    arvx-render/      — surface-mesh raster + resolve + shading + post-process pipeline
+    arvx-import/      — Mesh → .arvx import pipeline: mesh loaders (glTF/OBJ/FBX),
                        triangle BVH + winding number, octree voxelization,
                        surface-nets meshing + cluster-DAG bake,
-                       skeleton extraction + .rkskel sidecar,
+                       skeleton extraction + .arvxskel sidecar,
                        structured progress events (ProgressReporter / ImportEvent).
-    rkp-convert/     — Thin CLI over rkp-import for headless / CI asset bakes
-    rkp-runtime/     — Frame scheduling, ECS glue, streaming
-    rkp-editor/      — Editor binary (reuses rinch UI from rkifield)
-    rkp-engine/      — Engine-side state, command handling, import worker thread
-    rkp-procedural/  — Procedural object nodes (sphere/box/union/etc.)
+    arvx-convert/     — Thin CLI over arvx-import for headless / CI asset bakes
+    arvx-runtime/     — Frame scheduling, ECS glue, streaming
+    arvx-editor/      — Editor binary (reuses rinch UI from rkifield)
+    arvx-engine/      — Engine-side state, command handling, import worker thread
+    arvx-procedural/  — Procedural object nodes (sphere/box/union/etc.)
 ```
 
 ## Key Data Types
@@ -103,7 +103,7 @@ rkipatch/
 // ColorVoxel { packed: u32 } — R|G|B|intensity, 4 bytes
 
 // Materials: uses rkf-core's MaterialPalette system unchanged.
-// 16-bit material IDs, dual-material blending per voxel, .rkmat files.
+// 16-bit material IDs, dual-material blending per voxel, .arvxmat files.
 ```
 
 ## Render Pipeline
@@ -138,11 +138,11 @@ can swap the primary pass for a live procedural SDF raymarcher
 
 ## Critical Rules
 
-1. **Mesh is the only render path.** No per-pixel ray-marching primary visibility, no splat raster, no `RKP_PRIMARY` env var.
+1. **Mesh is the only render path.** No per-pixel ray-marching primary visibility, no splat raster, no `ARVX_PRIMARY` env var.
 2. **Deferred rendering.** Mesh raster writes a visibility buffer; resolve compute fills the rest; shade reads the unified G-buffer.
 3. **Prefiltered octahedral normals.** No gradient reconstruction at shade time. The normal is in `LeafAttr.normal_oct`.
-4. **`.rkp` v6 ships baked mesh + clusters + DAG.** Loading is a deserialize + relocate, not a re-extract. v5 files fall back to extract + DAG-build at load time.
-5. **Procedurals bake to proxy mesh.** No voxelization of procedural objects — `BakeMode` is gone. If you need paintable/sculptable geometry, import a `.rkp`.
+4. **`.arvx` v6 ships baked mesh + clusters + DAG.** Loading is a deserialize + relocate, not a re-extract. v5 files fall back to extract + DAG-build at load time.
+5. **Procedurals bake to proxy mesh.** No voxelization of procedural objects — `BakeMode` is gone. If you need paintable/sculptable geometry, import a `.arvx`.
 6. **G-buffer compatible with rkf-render.** Same format so all downstream passes (shading, shadows, post-process) work unchanged.
 7. **WorldPosition everywhere.** Never raw Vec3 for world-space positions.
 8. **Test-driven development.** Write tests first.
@@ -156,6 +156,6 @@ can swap the primary pass for a live procedural SDF raymarcher
 cargo build --workspace          # build everything
 cargo test --workspace           # run all tests
 cargo clippy --workspace         # lint
-cargo run -p rkp-editor          # editor (primary development target)
-cargo run -p rkp-convert -- input.glb -o output.rkp  # asset conversion
+cargo run -p arvx-editor          # editor (primary development target)
+cargo run -p arvx-convert -- input.glb -o output.arvx  # asset conversion
 ```

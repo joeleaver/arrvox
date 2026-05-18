@@ -1,0 +1,2243 @@
+//! Per-viewport render-target and pass state.
+//!
+//! Each `ViewportRenderer` owns a complete resolution-coupled render
+//! chain: mesh raster → mesh_resolve → ssao → shade → volumetric →
+//! god_rays → bloom → bloom_composite → tone_map → composite. These
+//! are the passes whose intermediate textures vary with the viewport's
+//! size; duplicating them per-VR is what lets two viewports of
+//! different resolutions render in one frame without clashing on
+//! shared textures.
+//!
+//! Shared on [`ArvxRenderer`]: compute pipelines (via each pass's own
+//! internal state — small), `ArvxScene` buffers, atmosphere LUTs, the
+//! scene-wide shade params / lights / materials buffers. The `ArvxRenderer`
+//! orchestrates a `render_to` call that dispatches into a VR's passes
+//! while reading from its own shared bindings.
+
+use crate::arvx_renderer::ArvxRenderer;
+use crate::arvx_scene::{CameraUniforms, ArvxScene};
+use crate::mesh_instance::{MeshInstanceUniform, MESH_INSTANCE_BYTES};
+use crate::proc_raymarch::ProcRaymarchPass;
+use crate::proc_outline::ProcOutlinePass;
+use crate::proc_ghost::ProcGhostPass;
+use crate::shadow_map_pass::{ShadowMapPass, CSM_CASCADE_COUNT, SHADOW_MAP_DEFAULT_SIZE};
+use arvx_core::mesh_lod::LOD_LEVELS_MAX;
+
+/// Size in bytes of the LOD admit-stats histogram. 2 × `LOD_LEVELS_MAX`
+/// `u32` slots: per-LOD admitted counts then per-LOD totals. Must
+/// match `array<atomic<u32>, 16> stats` in `mesh_lod_select.wesl`.
+pub const MESH_LOD_STATS_BYTES: u64 = (2 * LOD_LEVELS_MAX as u64) * 4;
+use crate::mesh_shadow_map_pass::{MeshShadowParams, MeshShadowBlitParams};
+use crate::arvx_ssao::ArvxSsaoPass;
+use crate::arvx_shade::ArvxShadePass;
+use crate::arvx_volumetric::ArvxVolumetricPass;
+use crate::arvx_god_rays::ArvxGodRayPass;
+use crate::arvx_grid::ArvxGridPass;
+
+pub struct ViewportRenderer {
+    // ── Per-VR scene binding ────────────────────────────────────────
+    pub camera_buffer: wgpu::Buffer,
+    pub scene_bind_group: wgpu::BindGroup,
+    scene_epoch: u64,
+    /// Epoch at which mesh's `set_lights`/`set_materials` bindings were
+    /// last built. Compared against `ArvxRenderer::lights_materials_epoch`
+    /// so VRs rebuild the per-pass lights/materials bind groups after
+    /// the shared buffers reallocate.
+    lights_materials_epoch: u64,
+
+    // ── Per-VR resolution-coupled passes ───────────────────────────
+    /// Live CSG preview for the build viewport. Writes the same
+    /// G-buffer as the mesh raster, so downstream passes don't care
+    /// which path ran — only one of the two executes per frame, chosen
+    /// by the host via `render_to`'s `preview_mode` parameter.
+    pub proc_raymarch: ProcRaymarchPass,
+    /// Selected-primitive outline overlay for the procedural raymarch
+    /// preview. Reads the NodeId channel the raymarch writes and
+    /// highlights the silhouette of the currently-selected node.
+    pub proc_outline: ProcOutlinePass,
+    /// Ghost-cutter overlay — shows Subtract/Intersect operands even
+    /// where they've been carved away. No G-buffer input; runs its
+    /// own small raymarch over a filtered subset of primitives the
+    /// host selects based on the current tree selection.
+    pub proc_ghost: ProcGhostPass,
+    /// Directional shadow-buffer storage + per-frame `LightCameraCsm`.
+    /// `mesh_shadow_map_pass` writes the depth slices; shade samples
+    /// them.
+    pub shadow_map: ShadowMapPass,
+    pub ssao: ArvxSsaoPass,
+    pub shade: ArvxShadePass,
+    pub glass: crate::arvx_glass::ArvxGlassPass,
+    pub volumetric: ArvxVolumetricPass,
+    pub god_rays: ArvxGodRayPass,
+    // ── Per-VR render targets + post-process ───────────────────────
+    pub gbuffer: crate::GBuffer,
+    /// arvx-side pick G-buffer — `R32Uint` sibling of the shared
+    /// `crate::GBuffer`'s material texture. Holds `primitive_node_id`
+    /// for procedural raymarch hits so packed_r's high 16 bits in the
+    /// shared material G-buffer can carry `secondary_material_id` for
+    /// dual-material shading. Not part of `crate::GBuffer`
+    /// (sibling-project invariants) and not read by `arvx_shade` —
+    /// only `proc_outline` and the engine's pick-readback path
+    /// consume it. The mesh raster leaves this slot unwritten; MAIN
+    /// viewport resolves picks via `object_id` in packed_g.
+    pub pick_texture: wgpu::Texture,
+    pub pick_view: wgpu::TextureView,
+    pub bloom: crate::BloomPass,
+    pub bloom_composite: crate::BloomCompositePass,
+    pub tone_map: crate::ToneMapPass,
+    pub composite_texture: wgpu::Texture,
+    pub composite_view: wgpu::TextureView,
+    /// Async readback ring — the engine writes the composite into one of
+    /// the buffers each frame, kicks off `map_async` immediately after
+    /// submit, and reads pixels back **without blocking** on `device.poll`.
+    /// See [`ReadbackRing`] for the state-machine details.
+    pub readback: ReadbackRing,
+    pub wireframe_pass: crate::WireframePass,
+    /// Isolation-mode infinite grid overlay. Always constructed; the
+    /// host only dispatches it when the viewport's mode is `Isolation`.
+    pub grid: ArvxGridPass,
+
+    // ── Mesh raster per-VR state ────────────────────────────────────
+    /// Scene-wide bind group for the mesh raster path: camera +
+    /// leaf_attr_pool + bone_matrices + bone_dual_quats. Built lazily
+    /// and rebuilt whenever the scene-buffers or lights/materials epoch
+    /// bumps.
+    pub mesh_g0_bg: Option<wgpu::BindGroup>,
+    /// Epoch the mesh g0 bg was last built against — combination of
+    /// scene_buffers_epoch and lights_materials_epoch.
+    pub mesh_g0_scene_epoch: u64,
+    pub mesh_g0_lights_materials_epoch: u64,
+    /// Per-instance uniform buffers (96 B each) — one slot per scene
+    /// instance to draw this frame. Grown on demand by
+    /// `ensure_mesh_instance_capacity`. Reused frame to frame; the
+    /// engine writes the current frame's matrices via
+    /// `write_mesh_instance` before dispatch.
+    pub mesh_instance_buffers: Vec<wgpu::Buffer>,
+    /// Bind groups paired one-to-one with `mesh_instance_buffers`.
+    pub mesh_instance_bind_groups: Vec<wgpu::BindGroup>,
+
+    // ── Procedural proxy-mesh pass bindings ──
+    /// Per-viewport camera bind group for `MeshProxyPass` (g0). Built
+    /// on first dispatch; the camera uniform buffer is stable per
+    /// viewport so this lives for the viewport's lifetime.
+    pub proxy_g0_bg: Option<wgpu::BindGroup>,
+    /// V1 mesh-path user-shader raster g0 bind group. Same camera
+    /// buffer as `proxy_g0_bg` but built against
+    /// `UserShaderMeshPass::raster_g0_layout`. Built on first
+    /// `refresh_user_shader_mesh_g0` and reused.
+    pub user_shader_mesh_g0_bg: Option<wgpu::BindGroup>,
+    /// Per-instance 80 B uniform buffers for proxy draws. Grown on
+    /// demand by `ensure_proxy_instance_capacity`, reused across
+    /// frames.
+    pub proxy_instance_buffers: Vec<wgpu::Buffer>,
+    /// Bind groups paired one-to-one with `proxy_instance_buffers`.
+    pub proxy_instance_bind_groups: Vec<wgpu::BindGroup>,
+
+    /// Mesh-resolve compute pass — per-VR texture bindings (g0).
+    /// Bound to (leaf_slot, pick) reads + (normal, material, glass)
+    /// storage writes. Rebuilt on resize (gbuffer texture views move).
+    pub mesh_resolve_g0_bg: Option<wgpu::BindGroup>,
+    /// Mesh-resolve compute pass — scene-buffers bindings (g1).
+    /// Bound to leaf_attr_pool / color_pool / objects_buffer; rebuilt
+    /// when scene_buffers_epoch bumps.
+    pub mesh_resolve_g1_bg: Option<wgpu::BindGroup>,
+    pub mesh_resolve_scene_epoch: u64,
+
+    // ── Paint cursor per-VR state ──────────────────────────────────
+    /// 32-byte storage buffer written each frame by the brush-state
+    /// probe pass and consumed by `arvx_shade` for the screen-space
+    /// paint cursor. Default value (`hit_distance >= 1e9`) reads as
+    /// "no cursor" so the shader hides the ring before the first
+    /// dispatch.
+    pub brush_state_buffer: wgpu::Buffer,
+    /// Uniform driving the probe pass: `(cursor_x, cursor_y, active)`.
+    /// Engine writes to this each frame from sim's `mouse_pos` +
+    /// paint-mode flag.
+    pub brush_state_params_buffer: wgpu::Buffer,
+    /// Bind group for the probe pass — `(gbuf_position, gbuf_pick,
+    /// brush_state_buffer, brush_state_params_buffer)`. Rebuilt on
+    /// resize because the gbuffer texture views move.
+    pub brush_state_pass_bg: Option<wgpu::BindGroup>,
+
+    // ── Mesh-mode glass per-VR textures + bind groups ──────────────
+    /// Front-face glass entry data (Rgba32Uint): R = oct-packed world
+    /// entry normal, G = material_id (low 16 bits), B =
+    /// `bitcast<u32>(entry_dist)`, A = 0. Cleared with B set to
+    /// `bitcast<u32>(GLASS_ENTRY_SENTINEL)` so the combine compute
+    /// can detect "no glass at this pixel".
+    pub glass_entry_packed_texture: wgpu::Texture,
+    pub glass_entry_packed_view: wgpu::TextureView,
+    /// Back-face glass exit distance (R32Float, world-space metres).
+    /// Cleared to 0; combine compute treats `<= entry_dist` as "no
+    /// back-face hit" and falls back to a 1 mm thickness.
+    pub glass_exit_dist_texture: wgpu::Texture,
+    pub glass_exit_dist_view: wgpu::TextureView,
+    /// Depth target for the front raster (Depth32Float, clear 1.0,
+    /// compare Less). Separate from the primary G-buffer depth so
+    /// glass writes don't pollute opaque depth.
+    pub glass_depth_front_texture: wgpu::Texture,
+    pub glass_depth_front_view: wgpu::TextureView,
+    /// Depth target for the back raster (Depth32Float, clear 0.0,
+    /// compare Greater so the *farthest* back-face wins).
+    pub glass_depth_back_texture: wgpu::Texture,
+    pub glass_depth_back_view: wgpu::TextureView,
+    /// Combine-compute bind group. Per-VR; rebuilt on resize.
+    pub mesh_glass_combine_bg: Option<wgpu::BindGroup>,
+    /// Per-VR uniform for `mesh_glass_combine.wesl::CombineParams`.
+    /// Currently carries only `debug_force` (set by
+    /// `ARVX_MESH_GLASS_DEBUG_FORCE=1`); the engine writes it once
+    /// per frame in `refresh_mesh_glass_bindings`.
+    pub mesh_glass_combine_params_buffer: wgpu::Buffer,
+    /// Per-VR uniform for `mesh_glass.wesl::GlassFsParams` —
+    /// the front/back FS opacity-discard threshold.
+    pub mesh_glass_fs_params_buffer: wgpu::Buffer,
+    /// Scene-side g2 bind group for the glass front/back raster
+    /// passes — `leaf_attr_pool` + `materials`. Rebuilt when either
+    /// backing buffer reallocates.
+    pub mesh_glass_g2_bg: Option<wgpu::BindGroup>,
+    pub mesh_glass_g2_scene_epoch: u64,
+    pub mesh_glass_g2_lights_materials_epoch: u64,
+
+    // ── Mesh-rendered shadow-map per-VR state (Phase 3 + CSM) ──────
+    /// 1024×1024 `Depth32Float` texture array (4 layers — one per
+    /// cascade). Filled by depth-only rasterization, then read by
+    /// the blit compute pass which copies bitcast(depth) into the
+    /// matching slice of `shadow_map.shadow_buffer` for shade to
+    /// sample.
+    pub mesh_shadow_depth_texture: wgpu::Texture,
+    /// Per-layer views (one per cascade) for use as
+    /// `RenderPassDepthStencilAttachment.view`. Indexed by cascade.
+    pub mesh_shadow_depth_views: Vec<wgpu::TextureView>,
+
+    /// Glass shadow front-face depth — `Depth32Float` texture array,
+    /// one layer per cascade. Captures the closest glass entry depth
+    /// from the light POV; the shade pass samples this + the back
+    /// texture below to compute glass thickness for Beer
+    /// attenuation. Same dimensions as `mesh_shadow_depth_texture`
+    /// — both resize together via `resize_shadow_map_depth`.
+    pub mesh_glass_shadow_front_texture: wgpu::Texture,
+    pub mesh_glass_shadow_front_views: Vec<wgpu::TextureView>,
+    /// Whole-array view, used by the shade pass to sample any
+    /// cascade. `D2Array` so the FS can index by cascade.
+    pub mesh_glass_shadow_front_array_view: wgpu::TextureView,
+    /// Glass shadow back-face depth — farthest glass exit depth
+    /// from light POV. Pair with the front texture for thickness.
+    pub mesh_glass_shadow_back_texture: wgpu::Texture,
+    pub mesh_glass_shadow_back_views: Vec<wgpu::TextureView>,
+    pub mesh_glass_shadow_back_array_view: wgpu::TextureView,
+    /// Per-cascade render `g0` for the mesh-shadow pipeline —
+    /// `light_camera` (CSM uniform) + per-cascade `MeshShadowParams`
+    /// + bone palettes (Phase 6.6 VS skinning). Indexed by cascade.
+    /// Follows `scene.buffers_epoch()` so a bone-buffer realloc
+    /// triggers a rebuild.
+    pub mesh_shadow_render_g0_bgs: Vec<Option<wgpu::BindGroup>>,
+    /// Per-cascade `MeshShadowParams` uniform buffer (16 B). Each
+    /// holds `cascade_index = i` so the render VS can pick the
+    /// matching cascade from the shared `LightCameraCsm`.
+    pub mesh_shadow_render_params_buffers: Vec<wgpu::Buffer>,
+    /// Epoch the shadow render g0 bgs were last built against.
+    pub mesh_shadow_render_g0_scene_epoch: u64,
+    /// Per-cascade blit `g0` — depth-layer view +
+    /// `shadow_map.shadow_buffer` + per-cascade
+    /// `MeshShadowBlitParams`.
+    pub mesh_shadow_blit_g0_bgs: Vec<Option<wgpu::BindGroup>>,
+    /// Per-cascade `MeshShadowBlitParams` uniform buffer (16 B).
+    pub mesh_shadow_blit_params_buffers: Vec<wgpu::Buffer>,
+    /// Per-cascade `g0` for the V1 user-shader-mesh shadow render.
+    /// Layout: camera (uniform, this VR's camera_buffer) +
+    /// light_camera (uniform, shadow_map.uniform_buffer) +
+    /// shadow_params (uniform, mesh_shadow_render_params_buffers[i] —
+    /// shared with the mesh shadow path; both pipelines read
+    /// cascade_index from the same struct). Lazily built on first
+    /// frame any user-shader mesh material is active.
+    pub user_shader_mesh_shadow_g0_bgs: Vec<Option<wgpu::BindGroup>>,
+
+    // ── Mesh per-cluster LOD-select per-VR state (Phase 6.2/6.3) ───
+    /// Per-draw `MeshLodSelectParams` uniform (16 B). Slot index
+    /// matches `mesh_instance_buffers`; one buffer per draw slot.
+    pub mesh_lod_params_buffers: Vec<wgpu::Buffer>,
+    /// Per-draw `DrawIndexedIndirectArgs` storage buffer + capacity
+    /// in cluster slots. Grown to fit the largest cluster count any
+    /// asset draw at this slot has needed. Bound as STORAGE for
+    /// the LOD-select compute and as INDIRECT for the render path.
+    pub mesh_lod_args_buffers: Vec<(wgpu::Buffer, u32)>,
+    /// Per-draw atomic `u32` count buffer (4 B). The LOD-select
+    /// shader atomicAdds into this for every admitted cluster; the
+    /// renderer reads it via `multi_draw_indexed_indirect_count`.
+    /// Pre-cleared to 0 by the engine before each LOD-select
+    /// dispatch. STORAGE | INDIRECT | COPY_DST. Slot index matches
+    /// `mesh_lod_args_buffers`.
+    pub mesh_lod_count_buffers: Vec<wgpu::Buffer>,
+    /// Per-draw `g0` bind group: (camera, params).
+    pub mesh_lod_select_g0_bgs: Vec<wgpu::BindGroup>,
+    /// Per-draw `g2` bind group: (cluster_table, args). Cached with
+    /// `(asset_handle_raw, args_capacity)` so we rebuild on asset
+    /// change or args resize. `None` until the first dispatch
+    /// populates it; `(handle, cap)` as the freshness key.
+    pub mesh_lod_select_g2_bgs: Vec<Option<(wgpu::BindGroup, u32, u32)>>,
+
+    // ── Mesh shadow LOD-select per-VR state (Phase 6.4 + CSM) ──────
+    /// Per-cascade `CameraUniforms`-shaped buffer populated each
+    /// frame from the active cascade's light camera. Indexed by
+    /// cascade. Carries `view_proj` for the ortho focal-length
+    /// factor, `resolution = shadow_map_size`, and the eye position
+    /// derived from `view_proj_inv * (0,0,0,1)`.
+    pub mesh_lod_shadow_camera_buffers: Vec<wgpu::Buffer>,
+    /// Per-draw × per-cascade shadow LOD params. `pixel_threshold`
+    /// scales as `base * 2^cascade_index` so the far cascade culls
+    /// hardest. Outer index = draw slot, inner index = cascade.
+    pub mesh_lod_shadow_params_buffers: Vec<Vec<wgpu::Buffer>>,
+    /// Per-draw × per-cascade args storage. Separate from primary
+    /// args so each cascade can run its LOD-select + render
+    /// back-to-back without aliasing.
+    pub mesh_lod_shadow_args_buffers: Vec<Vec<(wgpu::Buffer, u32)>>,
+    /// Per-draw × per-cascade atomic `u32` count buffer (4 B). One
+    /// per (slot, cascade) pair so each cascade's LOD-select +
+    /// render can use independent counters without aliasing. Same
+    /// usage as `mesh_lod_count_buffers`.
+    pub mesh_lod_shadow_count_buffers: Vec<Vec<wgpu::Buffer>>,
+    /// Per-draw × per-cascade `g0` bind group: the cascade's
+    /// synthetic camera + the cascade's params buffer.
+    pub mesh_lod_shadow_g0_bgs: Vec<Vec<wgpu::BindGroup>>,
+    /// Per-draw × per-cascade `g2` bind group: cluster table +
+    /// cascade-specific args.
+    pub mesh_lod_shadow_g2_bgs: Vec<Vec<Option<(wgpu::BindGroup, u32, u32)>>>,
+
+    // ── Mesh LOD admit stats (ARVX_MESH_LOD_STATS=1 diagnostic) ─────
+    /// Pass-shared 64 B (16 × u32) histograms. Slots 0..8: admitted
+    /// clusters per LOD. Slots 8..16: total clusters per LOD (sized
+    /// to `LOD_LEVELS_MAX`). The shader atomic-adds into these only
+    /// when `record_stats != 0` in the per-draw params; the CPU
+    /// pre-clears at the start of each LOD-select pass and copies
+    /// to the matching staging buffer after.
+    pub mesh_lod_admit_stats_primary: wgpu::Buffer,
+    pub mesh_lod_admit_stats_shadow: wgpu::Buffer,
+    /// Per-pass staging buffer for async readback. Persistent — the
+    /// 64 B size makes one allocation cheap. State machine:
+    /// `pending = None` (idle) → `submit_copy + issue_map_async`
+    /// → `pending = Some(rx)` (in flight or mapped) → `try_recv`
+    /// returns Ok → `read + log + unmap` → `pending = None`. Skip
+    /// the copy on frames where `pending.is_some()` so we don't
+    /// double-map.
+    pub mesh_lod_admit_stats_primary_staging: wgpu::Buffer,
+    pub mesh_lod_admit_stats_shadow_staging: wgpu::Buffer,
+    pub mesh_lod_admit_stats_primary_pending:
+        Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    pub mesh_lod_admit_stats_shadow_pending:
+        Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    /// Set by `lod_stats_finalize_*` when it queues a copy this
+    /// frame; the engine calls `lod_stats_post_submit` after
+    /// `queue.submit()` to pair `map_async` with the matching submit.
+    /// Splitting it across the submit boundary avoids the
+    /// `Buffer is still mapped` validation error wgpu fires when a
+    /// submit touches a buffer the same encoder also map_async'd.
+    pub mesh_lod_admit_stats_primary_needs_map: bool,
+    pub mesh_lod_admit_stats_shadow_needs_map: bool,
+
+    // ── Mesh pipeline-statistics queries (ARVX_MESH_PIPESTATS=1) ────
+    /// One QuerySet with 4 slots covering the mesh passes:
+    /// 0 = mesh_lod_select (compute), 1 = mesh_raster (graphics),
+    /// 2 = mesh_shadow_lod_select (compute), 3 = mesh_shadow_render
+    /// (graphics). All five PipelineStatisticsTypes flags are
+    /// enabled so each slot returns 5 × u64 = 40 bytes
+    /// (vs/clipper-in/clipper-out/fs/cs invocations).
+    pub mesh_pipestats_query_set: wgpu::QuerySet,
+    /// 4 slots × 40 bytes = 160 bytes; rounded up to 256 for the
+    /// COPY_BUFFER_ALIGNMENT requirement on resolve_query_set →
+    /// copy_buffer_to_buffer.
+    pub mesh_pipestats_resolve_buffer: wgpu::Buffer,
+    /// MAP_READ staging buffer for async readback. Same 256 B size.
+    pub mesh_pipestats_staging_buffer: wgpu::Buffer,
+    pub mesh_pipestats_pending:
+        Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    pub mesh_pipestats_needs_map: bool,
+
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ViewportRenderer {
+    /// Build a viewport renderer at the given size.
+    ///
+    /// Creates its own instances of the resolution-coupled passes
+    /// (march/shadow/ssao/shade/vol/god_rays) and wires them to the
+    /// shared state on `renderer` (atmosphere LUTs, shade params,
+    /// lights, materials buffers).
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut ArvxRenderer,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        // Camera buffer + scene bind group (Phase 6a pattern).
+        let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("arvx_vr_camera"),
+            size: std::mem::size_of::<CameraUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Per-cascade synthetic camera buffers used by the mesh-shadow
+        // LOD-select compute pass (Phase 6.4 + CSM). One CameraUniforms
+        // per cascade; engine writes each before that cascade's
+        // LOD-select dispatch.
+        let mesh_lod_shadow_camera_buffers: Vec<wgpu::Buffer> = (0..CSM_CASCADE_COUNT)
+            .map(|i| device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("arvx_vr_mesh_lod_shadow_camera_csm{i}")),
+                size: std::mem::size_of::<CameraUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }))
+            .collect();
+        let (scene_bind_group, scene_epoch) = {
+            let scene: &ArvxScene = &renderer.scene;
+            (scene.build_bind_group(device, &camera_buffer), scene.buffers_epoch())
+        };
+
+        // Gbuffer.
+        let gbuffer = crate::GBuffer::new(device, width, height);
+
+        // arvx-side pick texture (R32Uint). Written by the procedural
+        // raymarch, read by `proc_outline` and the pick readback.
+        let (pick_texture, pick_view) = create_pick_texture(device, width, height);
+
+        // Mesh-mode glass scratch targets. Allocated here even when
+        // the active primary mode isn't `Mesh` so a runtime mode
+        // switch doesn't require viewport reallocation. Named
+        // `mesh_glass_tx` to avoid shadowing the `glass` shadow-pass
+        // local declared further down.
+        let mesh_glass_tx = create_glass_textures(device, width, height);
+        let mesh_glass_combine_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mesh_glass_combine params"),
+            size: std::mem::size_of::<crate::mesh_glass_pass::CombineParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mesh_glass_fs_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mesh_glass fs params"),
+            size: std::mem::size_of::<crate::mesh_glass_pass::GlassFsParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Per-VR passes. Each wired to: (a) its own gbuffer views, (b)
+        // the shared scene bind-group layout + shared buffers on renderer.
+
+        // Procedural CSG raymarch — alternative primary-visibility
+        // pass for the build viewport. Wired to the same per-VR
+        // camera + gbuffer so the host can flip between the mesh
+        // raster and the raymarch preview without touching the rest
+        // of the chain.
+        let mut proc_raymarch = ProcRaymarchPass::new(device);
+        proc_raymarch.set_camera(device, &camera_buffer);
+        proc_raymarch.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view, &gbuffer.glass_view, &gbuffer.leaf_slot_view);
+
+        // Outline overlay — rebind the pick gbuffer view on resize.
+        let mut proc_outline = ProcOutlinePass::new(device, crate::LDR_FORMAT);
+        proc_outline.set_gbuffer(device, &pick_view);
+
+        let mut proc_ghost = ProcGhostPass::new(device, crate::LDR_FORMAT);
+        proc_ghost.set_camera(device, &camera_buffer);
+
+        let mut ssao = ArvxSsaoPass::new(device, queue, width, height);
+        ssao.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view);
+
+        // Shadow-buffer storage + per-frame `LightCameraCsm` uniform.
+        // `mesh_shadow_map_pass` writes the depth slices; shade
+        // samples them.
+        let shadow_map = ShadowMapPass::new(device, SHADOW_MAP_DEFAULT_SIZE);
+
+        // CSM — depth attachment for the mesh-shadow render pass. The render writes per-cascade
+        // (vertex + rasterizer + depth-only, no fragment shader); the
+        // blit compute pass reads each layer back and copies
+        // bitcast(depth) into the matching slice of
+        // `shadow_map.shadow_buffer`. Hence both `RENDER_ATTACHMENT`
+        // and `TEXTURE_BINDING` usage. `depth_or_array_layers =
+        // CSM_CASCADE_COUNT` — one layer per cascade.
+        let mesh_shadow_depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("arvx_mesh_shadow_depth"),
+            size: wgpu::Extent3d {
+                width: SHADOW_MAP_DEFAULT_SIZE,
+                height: SHADOW_MAP_DEFAULT_SIZE,
+                depth_or_array_layers: CSM_CASCADE_COUNT,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let mesh_shadow_depth_views: Vec<wgpu::TextureView> = (0..CSM_CASCADE_COUNT)
+            .map(|i| mesh_shadow_depth_texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some(&format!("arvx_mesh_shadow_depth_csm{i}")),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: i,
+                array_layer_count: Some(1),
+                aspect: wgpu::TextureAspect::DepthOnly,
+                ..Default::default()
+            }))
+            .collect();
+
+        // Glass shadow front + back depth, one layer per cascade.
+        // Allocated at the same size as the opaque shadow depth so
+        // the per-cascade view-projection matches.
+        let mesh_glass_shadow_tx = create_glass_shadow_textures(device, SHADOW_MAP_DEFAULT_SIZE);
+
+        // Per-cascade `MeshShadowParams` (16 B) — each holds
+        // `cascade_index = i`. Static after init; the render g0
+        // bind groups bind these.
+        let mesh_shadow_render_params_buffers: Vec<wgpu::Buffer> = (0..CSM_CASCADE_COUNT)
+            .map(|i| {
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("mesh_shadow_render_params_csm{i}")),
+                    size: std::mem::size_of::<MeshShadowParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                queue.write_buffer(&buf, 0, bytemuck::bytes_of(&MeshShadowParams {
+                    cascade_index: i,
+                    _pad0: 0, _pad1: 0, _pad2: 0,
+                }));
+                buf
+            })
+            .collect();
+
+        // Per-cascade `MeshShadowBlitParams` (16 B) — same shape, also
+        // static.
+        let mesh_shadow_blit_params_buffers: Vec<wgpu::Buffer> = (0..CSM_CASCADE_COUNT)
+            .map(|i| {
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("mesh_shadow_blit_params_csm{i}")),
+                    size: std::mem::size_of::<MeshShadowBlitParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                queue.write_buffer(&buf, 0, bytemuck::bytes_of(&MeshShadowBlitParams {
+                    cascade_index: i,
+                    shadow_map_size: SHADOW_MAP_DEFAULT_SIZE,
+                    _pad1: 0, _pad2: 0,
+                }));
+                buf
+            })
+            .collect();
+
+        let mut shade = ArvxShadePass::new(device, width, height);
+        shade.set_shade_data(
+            device,
+            &renderer.shade_params_buffer,
+            &renderer.lights_buffer,
+            &renderer.materials_buffer,
+        );
+        shade.set_camera(device, &camera_buffer);
+        shade.set_atmosphere_luts(
+            device,
+            &renderer.atmosphere.transmittance_view,
+            &renderer.atmosphere.multiscatter_view,
+            &renderer.atmosphere.lut_sampler,
+            &renderer.atmosphere.sky_view_view,
+            &renderer.atmosphere.ap_view,
+        );
+        // Phase 4c — shade reads the host G-buffer directly. Phase 5
+        // retired Option B's instance-merged G-buffer; user-shader
+        // hits land in the host G-buffer through the unified march
+        // pipeline.
+        shade.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &gbuffer.glass_view, &pick_view);
+        // Per-VR brush-state probe buffers + initial bind groups. The
+        // params are zeroed (active=0) so the cursor stays hidden
+        // until paint mode arms it.
+        let brush_state_buffer =
+            crate::brush_state_pass::BrushStatePass::create_state_buffer(device);
+        let brush_state_params_buffer =
+            crate::brush_state_pass::BrushStatePass::create_params_buffer(device);
+        shade.set_brush_state(device, &brush_state_buffer);
+        let brush_state_pass_bg = Some(renderer.brush_state.create_bind_group(
+            device,
+            &gbuffer.position_view,
+            &pick_view,
+            &brush_state_buffer,
+            &brush_state_params_buffer,
+        ));
+        shade.set_shadow_and_ssao(
+            device,
+            &ssao.output_view,
+            &shadow_map.shadow_buffer,
+            &shadow_map.uniform_buffer,
+            &mesh_glass_shadow_tx.front_array_view,
+            &mesh_glass_shadow_tx.back_array_view,
+        );
+
+        // Pass order: shade → volumetric → glass → god_rays. Glass
+        // runs AFTER volumetric so clouds / fog are composited into
+        // the "behind" HDR first, and then refracted / Beer-tinted
+        // through the glass (so clouds visible through a glass pane
+        // correctly bend rather than getting stamped on top of the
+        // glass composite).
+        let mut volumetric = ArvxVolumetricPass::new(device, width, height);
+        volumetric.set_depth_view(device, &gbuffer.position_view);
+        volumetric.set_scene_hdr_view(device, &shade.output_view);
+
+        let mut glass = crate::arvx_glass::ArvxGlassPass::new(device, width, height);
+        glass.set_inputs(
+            device,
+            &volumetric.output_view,
+            &gbuffer.glass_view,
+            &camera_buffer,
+            &renderer.materials_buffer,
+            &renderer.shade_params_buffer,
+            &renderer.lights_buffer,
+        );
+
+        let mut god_rays = ArvxGodRayPass::new(device, width, height);
+        god_rays.set_inputs(device, &glass.output_view, &gbuffer.position_view, &volumetric.cloud_view);
+
+        // VR-owned bloom / tonemap chain reads this VR's god_rays output.
+        let bloom = crate::BloomPass::new(device, &god_rays.output_view, width, height);
+        let bloom_composite = crate::BloomCompositePass::new(
+            device, &god_rays.output_view, bloom.mip_views(), width, height,
+        );
+        let tone_map = crate::ToneMapPass::new(device, &bloom_composite.output_view, width, height);
+
+        let readback = ReadbackRing::new(device, width, height);
+
+        let wireframe_pass = crate::WireframePass::new(device, crate::LDR_FORMAT);
+
+        let mut grid = ArvxGridPass::new(device, crate::LDR_FORMAT);
+        grid.set_bindings(device, &camera_buffer, &gbuffer.position_view);
+        grid.update_params(queue, &crate::arvx_grid::GridParams::default());
+
+        let composite_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rkp composite"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::LDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let composite_view = composite_texture.create_view(&Default::default());
+
+        let lights_materials_epoch = renderer.lights_materials_epoch();
+
+        Self {
+            camera_buffer, scene_bind_group, scene_epoch, lights_materials_epoch,
+            proc_raymarch, proc_outline, proc_ghost,
+            shadow_map, ssao, shade, glass, volumetric, god_rays,
+            gbuffer, pick_texture, pick_view, bloom, bloom_composite, tone_map,
+            composite_texture, composite_view,
+            readback,
+            wireframe_pass, grid,
+            mesh_g0_bg: None,
+            mesh_g0_scene_epoch: u64::MAX,
+            mesh_g0_lights_materials_epoch: u64::MAX,
+            mesh_instance_buffers: Vec::new(),
+            mesh_instance_bind_groups: Vec::new(),
+            proxy_g0_bg: None,
+            user_shader_mesh_g0_bg: None,
+            proxy_instance_buffers: Vec::new(),
+            proxy_instance_bind_groups: Vec::new(),
+            mesh_resolve_g0_bg: None,
+            mesh_resolve_g1_bg: None,
+            mesh_resolve_scene_epoch: u64::MAX,
+            brush_state_buffer,
+            brush_state_params_buffer,
+            brush_state_pass_bg,
+            glass_entry_packed_texture: mesh_glass_tx.entry_packed,
+            glass_entry_packed_view:    mesh_glass_tx.entry_packed_view,
+            glass_exit_dist_texture:    mesh_glass_tx.exit_dist,
+            glass_exit_dist_view:       mesh_glass_tx.exit_dist_view,
+            glass_depth_front_texture:  mesh_glass_tx.depth_front,
+            glass_depth_front_view:     mesh_glass_tx.depth_front_view,
+            glass_depth_back_texture:   mesh_glass_tx.depth_back,
+            glass_depth_back_view:      mesh_glass_tx.depth_back_view,
+            mesh_glass_combine_bg: None,
+            mesh_glass_combine_params_buffer,
+            mesh_glass_fs_params_buffer,
+            mesh_glass_g2_bg: None,
+            mesh_glass_g2_scene_epoch: u64::MAX,
+            mesh_glass_g2_lights_materials_epoch: u64::MAX,
+            mesh_shadow_depth_texture,
+            mesh_shadow_depth_views,
+            mesh_glass_shadow_front_texture: mesh_glass_shadow_tx.front_texture,
+            mesh_glass_shadow_front_views: mesh_glass_shadow_tx.front_views,
+            mesh_glass_shadow_front_array_view: mesh_glass_shadow_tx.front_array_view,
+            mesh_glass_shadow_back_texture: mesh_glass_shadow_tx.back_texture,
+            mesh_glass_shadow_back_views: mesh_glass_shadow_tx.back_views,
+            mesh_glass_shadow_back_array_view: mesh_glass_shadow_tx.back_array_view,
+            mesh_shadow_render_g0_bgs: vec![None; CSM_CASCADE_COUNT as usize],
+            mesh_shadow_render_params_buffers,
+            mesh_shadow_render_g0_scene_epoch: u64::MAX,
+            mesh_shadow_blit_g0_bgs: vec![None; CSM_CASCADE_COUNT as usize],
+            mesh_shadow_blit_params_buffers,
+            user_shader_mesh_shadow_g0_bgs: vec![None; CSM_CASCADE_COUNT as usize],
+            mesh_lod_params_buffers: Vec::new(),
+            mesh_lod_args_buffers: Vec::new(),
+            mesh_lod_count_buffers: Vec::new(),
+            mesh_lod_select_g0_bgs: Vec::new(),
+            mesh_lod_select_g2_bgs: Vec::new(),
+            mesh_lod_shadow_camera_buffers,
+            mesh_lod_shadow_params_buffers: Vec::new(),
+            mesh_lod_shadow_args_buffers: Vec::new(),
+            mesh_lod_shadow_count_buffers: Vec::new(),
+            mesh_lod_shadow_g0_bgs: Vec::new(),
+            mesh_lod_shadow_g2_bgs: Vec::new(),
+            mesh_lod_admit_stats_primary: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("arvx_vr_mesh_lod_admit_stats_primary"),
+                size: MESH_LOD_STATS_BYTES,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            mesh_lod_admit_stats_shadow: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("arvx_vr_mesh_lod_admit_stats_shadow"),
+                size: MESH_LOD_STATS_BYTES,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            mesh_lod_admit_stats_primary_staging: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("arvx_vr_mesh_lod_admit_stats_primary_staging"),
+                size: MESH_LOD_STATS_BYTES,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            mesh_lod_admit_stats_shadow_staging: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("arvx_vr_mesh_lod_admit_stats_shadow_staging"),
+                size: MESH_LOD_STATS_BYTES,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            mesh_lod_admit_stats_primary_pending: None,
+            mesh_lod_admit_stats_shadow_pending: None,
+            mesh_lod_admit_stats_primary_needs_map: false,
+            mesh_lod_admit_stats_shadow_needs_map: false,
+            mesh_pipestats_query_set: device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("arvx_vr_mesh_pipestats"),
+                ty: wgpu::QueryType::PipelineStatistics(
+                    wgpu::PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS
+                        | wgpu::PipelineStatisticsTypes::CLIPPER_INVOCATIONS
+                        | wgpu::PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT
+                        | wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS
+                        | wgpu::PipelineStatisticsTypes::COMPUTE_SHADER_INVOCATIONS,
+                ),
+                // 0  = mesh_lod_select (compute, primary)
+                // 1  = mesh_raster (graphics, primary)
+                // 2..6 = mesh_shadow_lod_select[0..3] (compute, per cascade)
+                // 6..10 = mesh_shadow_render[0..3]    (graphics, per cascade)
+                count: 2 + 2 * CSM_CASCADE_COUNT,
+            }),
+            mesh_pipestats_resolve_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("arvx_vr_mesh_pipestats_resolve"),
+                // 10 slots × 5 × u64 = 400 B; round up to 512 for the
+                // COPY_BUFFER_ALIGNMENT requirement on resolve_query_set.
+                size: 512,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            mesh_pipestats_staging_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("arvx_vr_mesh_pipestats_staging"),
+                size: 512,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            mesh_pipestats_pending: None,
+            mesh_pipestats_needs_map: false,
+            width, height,
+        }
+    }
+
+    /// Rebuild the mesh-raster scene-wide (`g0`) bind group when its
+    /// referenced buffers may have moved. Cheap when no rebuild is
+    /// needed (one epoch comparison). Caller invokes once before
+    /// `dispatch_mesh`.
+    pub fn refresh_mesh_g0(&mut self, device: &wgpu::Device, renderer: &ArvxRenderer) {
+        let scene_now = renderer.scene.buffers_epoch();
+        let lm_now = renderer.lights_materials_epoch();
+        if self.mesh_g0_bg.is_some()
+            && self.mesh_g0_scene_epoch == scene_now
+            && self.mesh_g0_lights_materials_epoch == lm_now
+        {
+            return;
+        }
+        self.mesh_g0_bg = Some(renderer.mesh_instance.create_g0_bind_group(
+            device,
+            &self.camera_buffer,
+            &renderer.scene.leaf_attr_pool_buffer,
+            &renderer.scene.bone_matrices_buffer,
+            &renderer.scene.bone_dual_quats_buffer,
+        ));
+        self.mesh_g0_scene_epoch = scene_now;
+        self.mesh_g0_lights_materials_epoch = lm_now;
+    }
+
+    /// Resize every shadow-map-sized resource on this viewport
+    /// (depth texture + per-layer views, `shadow_map.shadow_buffer`,
+    /// the shade pass's shadow+ssao bind group, the per-cascade
+    /// blit-params uniforms that carry `shadow_map_size`) to a new
+    /// side length. No-op if the size already matches. Engine calls
+    /// this once per frame from `prepare_shadow_maps` based on
+    /// `EnvironmentSettings::shadow_csm_map_size`.
+    pub fn set_shadow_map_size(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        new_size: u32,
+    ) {
+        let buffer_changed = self.shadow_map.resize_shadow_buffer(device, new_size);
+        let depth_changed = self.resize_shadow_map_depth(device, new_size);
+        if !buffer_changed && depth_changed.is_none() {
+            return;
+        }
+        // Rebind the shade pass's shadow+ssao bind group — it holds
+        // a reference to the old shadow_buffer (just recreated).
+        self.shade.set_shadow_and_ssao(
+            device,
+            &self.ssao.output_view,
+            &self.shadow_map.shadow_buffer,
+            &self.shadow_map.uniform_buffer,
+            &self.mesh_glass_shadow_front_array_view,
+            &self.mesh_glass_shadow_back_array_view,
+        );
+        // Update the per-cascade blit-params uniforms so the blit
+        // shader's stride math matches the new size. The `cascade_index`
+        // field stays the same; only `shadow_map_size` changes.
+        for i in 0..CSM_CASCADE_COUNT as usize {
+            queue.write_buffer(
+                &self.mesh_shadow_blit_params_buffers[i],
+                0,
+                bytemuck::bytes_of(&MeshShadowBlitParams {
+                    cascade_index: i as u32,
+                    shadow_map_size: new_size,
+                    _pad1: 0,
+                    _pad2: 0,
+                }),
+            );
+        }
+    }
+
+    /// Resize the shadow map's depth texture + per-layer views to a
+    /// new side length. Returns the new size when the resources were
+    /// actually recreated, `None` when no change. Caller (engine) is
+    /// responsible for invalidating downstream bind groups via
+    /// `refresh_mesh_shadow_bindings` (blit) and rebinding the shade
+    /// pass's shadow+ssao bg (which referenced the old buffer).
+    ///
+    /// Wrapper `set_shadow_map_size` does this together with the
+    /// `shadow_map.shadow_buffer` resize and the shade rebind.
+    pub fn resize_shadow_map_depth(
+        &mut self,
+        device: &wgpu::Device,
+        new_size: u32,
+    ) -> Option<u32> {
+        let cur = self.mesh_shadow_depth_texture.width();
+        if cur == new_size {
+            return None;
+        }
+        self.mesh_shadow_depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("arvx_mesh_shadow_depth (resized)"),
+            size: wgpu::Extent3d {
+                width: new_size,
+                height: new_size,
+                depth_or_array_layers: CSM_CASCADE_COUNT,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.mesh_shadow_depth_views = (0..CSM_CASCADE_COUNT)
+            .map(|i| self.mesh_shadow_depth_texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some(&format!("arvx_mesh_shadow_depth_csm{i} (resized)")),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: i,
+                array_layer_count: Some(1),
+                aspect: wgpu::TextureAspect::DepthOnly,
+                ..Default::default()
+            }))
+            .collect();
+        // Glass shadow front + back depth — same dimensions, same
+        // resize trigger.
+        let glass_shadow = create_glass_shadow_textures(device, new_size);
+        self.mesh_glass_shadow_front_texture     = glass_shadow.front_texture;
+        self.mesh_glass_shadow_front_views       = glass_shadow.front_views;
+        self.mesh_glass_shadow_front_array_view  = glass_shadow.front_array_view;
+        self.mesh_glass_shadow_back_texture      = glass_shadow.back_texture;
+        self.mesh_glass_shadow_back_views        = glass_shadow.back_views;
+        self.mesh_glass_shadow_back_array_view   = glass_shadow.back_array_view;
+        // Force the blit g0 bind groups to rebuild against the new
+        // depth views + (presumably also resized) shadow_buffer.
+        // Shade-side bg also drops (it now references the glass
+        // shadow array views).
+        for slot in &mut self.mesh_shadow_blit_g0_bgs {
+            *slot = None;
+        }
+        Some(new_size)
+    }
+
+    /// Rebuild the mesh-shadow render + blit `g0` bind groups when
+    /// stale. The blit g0 references stable-lifetime buffers
+    /// (`shadow_map.shadow_buffer`, `mesh_shadow_depth_view`) so it's
+    /// build-once. The render g0 now also references the scene's
+    /// bone palettes (Phase 6.6) — those reallocate when the scene
+    /// gains a deeper-skeleton entity, so the render bg is rebuilt
+    /// on a scene-buffers-epoch bump, same trigger the mesh g0 uses.
+    pub fn refresh_mesh_shadow_bindings(
+        &mut self,
+        device: &wgpu::Device,
+        renderer: &ArvxRenderer,
+    ) {
+        let scene_now = renderer.scene.buffers_epoch();
+        let needs_render = self.mesh_shadow_render_g0_bgs.iter().any(Option::is_none)
+            || self.mesh_shadow_render_g0_scene_epoch != scene_now;
+        if needs_render {
+            for i in 0..CSM_CASCADE_COUNT as usize {
+                self.mesh_shadow_render_g0_bgs[i] =
+                    Some(renderer.mesh_shadow_map.create_render_g0_bind_group(
+                        device,
+                        &self.shadow_map.uniform_buffer,
+                        &self.mesh_shadow_render_params_buffers[i],
+                        &renderer.scene.bone_matrices_buffer,
+                        &renderer.scene.bone_dual_quats_buffer,
+                    ));
+            }
+            self.mesh_shadow_render_g0_scene_epoch = scene_now;
+        }
+        for i in 0..CSM_CASCADE_COUNT as usize {
+            if self.mesh_shadow_blit_g0_bgs[i].is_none() {
+                self.mesh_shadow_blit_g0_bgs[i] =
+                    Some(renderer.mesh_shadow_map.create_blit_g0_bind_group(
+                        device,
+                        &self.mesh_shadow_depth_views[i],
+                        &self.shadow_map.shadow_buffer,
+                        &self.mesh_shadow_blit_params_buffers[i],
+                    ));
+            }
+        }
+        // V1 user-shader-mesh shadow g0. Same per-cascade
+        // ShadowParams buffer the mesh path uses (`cascade_index`
+        // matches), plus the VR's camera + the shared light_camera.
+        // Built once per VR per scene-buffers-epoch.
+        for i in 0..CSM_CASCADE_COUNT as usize {
+            if self.user_shader_mesh_shadow_g0_bgs[i].is_none() {
+                self.user_shader_mesh_shadow_g0_bgs[i] =
+                    Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("user_shader_mesh shadow g0"),
+                        layout: &renderer.user_shader_mesh.shadow_g0_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.camera_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: self.shadow_map.uniform_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: self.mesh_shadow_render_params_buffers[i]
+                                    .as_entire_binding(),
+                            },
+                        ],
+                    }));
+            }
+        }
+    }
+
+    /// Rebuild the mesh-resolve compute pass's bind groups. `g0`
+    /// (per-VR textures) is rebuilt unconditionally if absent —
+    /// `resize` clears it. `g1` (scene buffers) follows the
+    /// scene-buffers epoch, same trigger as the march's
+    /// `scene_bind_group`.
+    pub fn refresh_mesh_resolve_bindings(
+        &mut self,
+        device: &wgpu::Device,
+        renderer: &ArvxRenderer,
+    ) {
+        if self.mesh_resolve_g0_bg.is_none() {
+            self.mesh_resolve_g0_bg = Some(renderer.mesh_resolve.create_g0_bind_group(
+                device,
+                &self.gbuffer.leaf_slot_view,
+                &self.pick_view,
+                &self.gbuffer.normal_view,
+                &self.gbuffer.material_view,
+                &self.gbuffer.glass_view,
+                &self.gbuffer.rest_pos_view,
+            ));
+        }
+        let scene_now = renderer.scene.buffers_epoch();
+        if self.mesh_resolve_g1_bg.is_none() || self.mesh_resolve_scene_epoch != scene_now {
+            self.mesh_resolve_g1_bg = Some(renderer.mesh_resolve.create_g1_bind_group(
+                device,
+                &renderer.scene.leaf_attr_pool_buffer,
+                &renderer.scene.color_pool_buffer,
+                &renderer.scene.objects_buffer,
+                &renderer.scene.assets_buffer,
+                &renderer.scene.octree_nodes_buffer,
+                &renderer.scene.brick_pool_buffer,
+                &renderer.scene.brick_face_links_buffer,
+                &renderer.scene.instance_overlay_buffer,
+                &renderer.scene.instance_sculpt_buffer,
+            ));
+            self.mesh_resolve_scene_epoch = scene_now;
+        }
+    }
+
+    /// Build (or rebuild) the scene-side glass `g2` bind group and the
+    /// per-VR combine-compute bind group. `g2` follows scene-buffer +
+    /// materials epochs; the combine bg is rebuilt whenever any of
+    /// the glass scratch textures or `gbuf_position` / `gbuf_glass`
+    /// view moved (resize). Cheap to call every frame — the bg-build
+    /// is skipped when no rebuild is required.
+    pub fn refresh_mesh_glass_bindings(
+        &mut self,
+        device: &wgpu::Device,
+        renderer: &ArvxRenderer,
+    ) {
+        let scene_now = renderer.scene.buffers_epoch();
+        let lm_now = renderer.lights_materials_epoch();
+        if self.mesh_glass_g2_bg.is_none()
+            || self.mesh_glass_g2_scene_epoch != scene_now
+            || self.mesh_glass_g2_lights_materials_epoch != lm_now
+        {
+            self.mesh_glass_g2_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mesh_glass g2"),
+                layout: &renderer.mesh_glass.g2_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: renderer.scene.leaf_attr_pool_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: renderer.materials_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: renderer.scene.objects_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: renderer.scene.instance_overlay_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: renderer.scene.color_pool_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: self.mesh_glass_fs_params_buffer.as_entire_binding(),
+                    },
+                    // Octree-lookup bindings — used by
+                    // `mesh_glass.wesl`'s per-pixel resolved normal
+                    // (lookup_cell_at). The other consumers of this
+                    // layout (mesh.wesl, mesh_shadow.wesl,
+                    // mesh_glass_shadow.wesl) don't reference them.
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: renderer.scene.assets_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: renderer.scene.octree_nodes_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: renderer.scene.brick_pool_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: renderer.scene.brick_face_links_buffer.as_entire_binding(),
+                    },
+                    // Phase A sculpt overlay — per-instance carved-leaf
+                    // set. `mesh.wesl::frag_main` discards on a hit
+                    // via `is_leaf_removed`. Other consumers of this
+                    // layout (shadow, glass, glass_shadow) read it
+                    // through the same helper so a carved leaf
+                    // disappears in primary visibility AND no longer
+                    // casts a shadow.
+                    wgpu::BindGroupEntry {
+                        binding: 10,
+                        resource: renderer.scene.instance_sculpt_buffer.as_entire_binding(),
+                    },
+                ],
+            }));
+            self.mesh_glass_g2_scene_epoch = scene_now;
+            self.mesh_glass_g2_lights_materials_epoch = lm_now;
+        }
+        if self.mesh_glass_combine_bg.is_none() {
+            self.mesh_glass_combine_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mesh_glass_combine g0"),
+                layout: &renderer.mesh_glass.combine_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.glass_entry_packed_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.glass_exit_dist_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.gbuffer.position_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&self.gbuffer.glass_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.mesh_glass_combine_params_buffer.as_entire_binding(),
+                    },
+                ],
+            }));
+        }
+    }
+
+    /// Write the per-frame `CombineParams` for the mesh-glass combine
+    /// compute and the FS opacity-threshold uniform. Called from
+    /// `ArvxRenderer::dispatch_mesh` once per frame; reads the cached
+    /// debug values from `ArvxRenderer`.
+    pub fn write_mesh_glass_combine_params(
+        &self,
+        queue: &wgpu::Queue,
+        debug_force: u32,
+        opacity_threshold: f32,
+    ) {
+        let params = crate::mesh_glass_pass::CombineParams {
+            debug_force,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        queue.write_buffer(
+            &self.mesh_glass_combine_params_buffer,
+            0,
+            bytemuck::bytes_of(&params),
+        );
+        let fs_params = crate::mesh_glass_pass::GlassFsParams {
+            opacity_threshold,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        queue.write_buffer(
+            &self.mesh_glass_fs_params_buffer,
+            0,
+            bytemuck::bytes_of(&fs_params),
+        );
+    }
+
+    /// Grow `mesh_instance_buffers` + `mesh_instance_bind_groups` to
+    /// at least `count` slots. Slots are reused across frames; the
+    /// engine writes the current frame's matrices via
+    /// [`Self::write_mesh_instance`] before [`ArvxRenderer::dispatch_mesh`].
+    ///
+    /// Each slot is an 80 B uniform buffer holding one
+    /// `MeshInstanceUniform` (mat4 world + object_id + 12 B pad).
+    pub fn ensure_mesh_instance_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        renderer: &ArvxRenderer,
+        count: u32,
+    ) {
+        let needed = count as usize;
+        while self.mesh_instance_buffers.len() < needed {
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mesh instance uniform"),
+                size: MESH_INSTANCE_BYTES,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bg = renderer.mesh_instance.create_g1_bind_group(device, &buf);
+            self.mesh_instance_buffers.push(buf);
+            self.mesh_instance_bind_groups.push(bg);
+        }
+    }
+
+    /// Grow per-instance uniform buffers + bind groups for the
+    /// `mesh_proxy` pass to at least `count` slots. Layout matches
+    /// `mesh_proxy.wesl::ProxyInstance` — 80 B per slot.
+    pub fn ensure_proxy_instance_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        renderer: &ArvxRenderer,
+        count: u32,
+    ) {
+        use crate::mesh_proxy_pass::PROXY_INSTANCE_BYTES;
+        let needed = count as usize;
+        while self.proxy_instance_buffers.len() < needed {
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("proxy instance uniform"),
+                size: PROXY_INSTANCE_BYTES,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bg = renderer.mesh_proxy.create_g1_bind_group(device, &buf);
+            self.proxy_instance_buffers.push(buf);
+            self.proxy_instance_bind_groups.push(bg);
+        }
+    }
+
+    /// Build the `mesh_proxy` g0 bind group once per viewport (camera
+    /// buffer doesn't move during the viewport's lifetime).
+    pub fn refresh_proxy_g0(&mut self, device: &wgpu::Device, renderer: &ArvxRenderer) {
+        if self.proxy_g0_bg.is_none() {
+            self.proxy_g0_bg = Some(
+                renderer
+                    .mesh_proxy
+                    .create_g0_bind_group(device, &self.camera_buffer),
+            );
+        }
+    }
+
+    /// Build the V1 user-shader-mesh raster g0 bind group once per
+    /// viewport. Same camera buffer as `proxy_g0_bg`; different layout
+    /// object so the bind groups can't cross-talk.
+    pub fn refresh_user_shader_mesh_g0(
+        &mut self,
+        device: &wgpu::Device,
+        pass: &crate::user_shader_mesh_pass::UserShaderMeshPass,
+    ) {
+        if self.user_shader_mesh_g0_bg.is_none() {
+            self.user_shader_mesh_g0_bg = Some(device.create_bind_group(
+                &wgpu::BindGroupDescriptor {
+                    label: Some("user_shader_mesh g0 (camera)"),
+                    layout: &pass.raster_g0_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.camera_buffer.as_entire_binding(),
+                    }],
+                },
+            ));
+        }
+    }
+
+    /// Upload one proxy instance's uniform into slot `slot`. Slots are
+    /// reused across frames; the caller must call
+    /// `ensure_proxy_instance_capacity` first.
+    pub fn write_proxy_instance(
+        &self,
+        queue: &wgpu::Queue,
+        slot: u32,
+        world: &[[f32; 4]; 4],
+        object_id: u32,
+    ) {
+        let inst = crate::mesh_proxy_pass::ProxyInstanceUniform {
+            world: *world,
+            object_id,
+            _pad: [0; 3],
+        };
+        queue.write_buffer(
+            &self.proxy_instance_buffers[slot as usize],
+            0,
+            bytemuck::bytes_of(&inst),
+        );
+    }
+
+    /// Ensure per-VR mesh LOD-select state has at least `count` draw
+    /// slots. Each slot owns a 16 B `MeshLodSelectParams` uniform +
+    /// `g0` bind group; the args buffer is allocated lazily on first
+    /// use, sized at the draw's cluster count. Slot index matches
+    /// `mesh_instance_buffers`.
+    pub fn ensure_mesh_lod_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        renderer: &crate::arvx_renderer::ArvxRenderer,
+        count: u32,
+    ) {
+        use crate::mesh_lod_select_pass::MeshLodSelectParams;
+        let needed = count as usize;
+        while self.mesh_lod_params_buffers.len() < needed {
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mesh_lod_select params"),
+                size: std::mem::size_of::<MeshLodSelectParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bg = renderer
+                .mesh_lod_select_pass
+                .create_g0_bind_group(device, &self.camera_buffer, &buf);
+            self.mesh_lod_params_buffers.push(buf);
+            self.mesh_lod_select_g0_bgs.push(bg);
+            self.mesh_lod_args_buffers.push((
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("mesh_lod_select args (placeholder)"),
+                    size: std::mem::size_of::<crate::mesh_lod_select_pass::DrawIndexedIndirectArgs>()
+                        as u64,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::INDIRECT
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                0,
+            ));
+            self.mesh_lod_count_buffers.push(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mesh_lod_select count"),
+                size: 4,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.mesh_lod_select_g2_bgs.push(None);
+        }
+    }
+
+    /// Make sure the args buffer at `slot` has capacity for at least
+    /// `cluster_count` `DrawIndexedIndirectArgs`. Grows the buffer
+    /// to a power-of-two size and invalidates the cached `g2` bind
+    /// group when it does.
+    pub fn ensure_mesh_lod_args_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        slot: u32,
+        cluster_count: u32,
+    ) {
+        use crate::mesh_lod_select_pass::DrawIndexedIndirectArgs;
+        let i = slot as usize;
+        let (_, cap) = self.mesh_lod_args_buffers[i];
+        if cap >= cluster_count {
+            return;
+        }
+        let new_cap = cluster_count.next_power_of_two().max(64);
+        let new_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mesh_lod_select args"),
+            size: (new_cap as u64) * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.mesh_lod_args_buffers[i] = (new_buf, new_cap);
+        // Invalidate cached g2 — it referenced the old args buffer.
+        self.mesh_lod_select_g2_bgs[i] = None;
+    }
+
+    /// Phase 6.4 sibling of `ensure_mesh_lod_capacity` for the
+    /// shadow LOD-select pass. One per-draw shadow params uniform +
+    /// args buffer + g0 bind group bound to the synthetic shadow
+    /// camera. Args buffer is allocated lazily by
+    /// `ensure_mesh_lod_shadow_args_capacity` to avoid waste on
+    /// frames where shadow is gated off.
+    pub fn ensure_mesh_lod_shadow_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        renderer: &crate::arvx_renderer::ArvxRenderer,
+        count: u32,
+    ) {
+        use crate::mesh_lod_select_pass::MeshLodSelectParams;
+        let needed = count as usize;
+        let n = CSM_CASCADE_COUNT as usize;
+        while self.mesh_lod_shadow_params_buffers.len() < needed {
+            // For this draw-slot, allocate one per-cascade entry in
+            // each parallel array (params buffer, g0 bind group,
+            // placeholder args, g2 cache).
+            let mut params_per_cascade: Vec<wgpu::Buffer> = Vec::with_capacity(n);
+            let mut g0_per_cascade: Vec<wgpu::BindGroup> = Vec::with_capacity(n);
+            let mut args_per_cascade: Vec<(wgpu::Buffer, u32)> = Vec::with_capacity(n);
+            let mut count_per_cascade: Vec<wgpu::Buffer> = Vec::with_capacity(n);
+            let mut g2_per_cascade: Vec<Option<(wgpu::BindGroup, u32, u32)>> =
+                Vec::with_capacity(n);
+            for i in 0..n {
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("mesh_lod_shadow params csm{i}")),
+                    size: std::mem::size_of::<MeshLodSelectParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bg = renderer.mesh_lod_select_pass.create_g0_bind_group(
+                    device,
+                    &self.mesh_lod_shadow_camera_buffers[i],
+                    &buf,
+                );
+                params_per_cascade.push(buf);
+                g0_per_cascade.push(bg);
+                args_per_cascade.push((
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(&format!("mesh_lod_shadow args csm{i} (placeholder)")),
+                        size: std::mem::size_of::<crate::mesh_lod_select_pass::DrawIndexedIndirectArgs>()
+                            as u64,
+                        usage: wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::INDIRECT
+                            | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }),
+                    0,
+                ));
+                count_per_cascade.push(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("mesh_lod_shadow count csm{i}")),
+                    size: 4,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::INDIRECT
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+                g2_per_cascade.push(None);
+            }
+            self.mesh_lod_shadow_params_buffers.push(params_per_cascade);
+            self.mesh_lod_shadow_g0_bgs.push(g0_per_cascade);
+            self.mesh_lod_shadow_args_buffers.push(args_per_cascade);
+            self.mesh_lod_shadow_count_buffers.push(count_per_cascade);
+            self.mesh_lod_shadow_g2_bgs.push(g2_per_cascade);
+        }
+    }
+
+    /// Grow the per-slot, per-cascade shadow args buffer to fit
+    /// `cluster_count` entries; invalidates the cached `g2` shadow
+    /// bind group for that cascade.
+    pub fn ensure_mesh_lod_shadow_args_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        slot: u32,
+        cascade: u32,
+        cluster_count: u32,
+    ) {
+        use crate::mesh_lod_select_pass::DrawIndexedIndirectArgs;
+        let i = slot as usize;
+        let c = cascade as usize;
+        let (_, cap) = self.mesh_lod_shadow_args_buffers[i][c];
+        if cap >= cluster_count {
+            return;
+        }
+        let new_cap = cluster_count.next_power_of_two().max(64);
+        let new_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("mesh_lod_shadow args slot{i} csm{c}")),
+            size: (new_cap as u64) * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.mesh_lod_shadow_args_buffers[i][c] = (new_buf, new_cap);
+        self.mesh_lod_shadow_g2_bgs[i][c] = None;
+    }
+
+    /// Populate `mesh_lod_shadow_camera_buffers[cascade]` from the
+    /// matching cascade's light camera. The LOD-select shader reads
+    /// `position` (eye for view_distance — unused under ortho),
+    /// `view_proj` (the [1][1] is the ortho-or-perspective focal
+    /// factor; [3][3] = 1 picks the ortho path), and `resolution.y`
+    /// (shadow map height). Other CameraUniforms fields aren't
+    /// read; we leave them zero.
+    pub fn write_mesh_lod_shadow_camera(
+        &self,
+        queue: &wgpu::Queue,
+        cascade: u32,
+        light: &crate::shadow_map_pass::LightCameraUniform,
+    ) {
+        // Eye in world space = view_proj_inv * (0,0,0,1) / w.
+        // For ortho `view_proj_inv[3][3] != 0` so the divide is fine.
+        let m = light.view_proj_inv;
+        let ex = m[3][0];
+        let ey = m[3][1];
+        let ez = m[3][2];
+        let ew = m[3][3].abs().max(1e-6) * m[3][3].signum();
+        let eye = [ex / ew, ey / ew, ez / ew, 0.0];
+
+        let cam = CameraUniforms {
+            position: eye,
+            forward: [0.0; 4],
+            right: [0.0; 4],
+            up: [0.0; 4],
+            resolution: [light.shadow_map_size[0] as f32, light.shadow_map_size[1] as f32],
+            jitter: [0.0; 2],
+            layer_mask: 0,
+            focus_object_id: 0,
+            _pad: [0; 2],
+            prev_vp: [[0.0; 4]; 4],
+            view_proj: light.view_proj,
+        };
+        queue.write_buffer(
+            &self.mesh_lod_shadow_camera_buffers[cascade as usize],
+            0,
+            bytemuck::bytes_of(&cam),
+        );
+    }
+
+    /// Mesh LOD-select admit-stats lifecycle. Called by `dispatch_mesh`
+    /// + `dispatch_mesh_shadow` when `ARVX_MESH_LOD_STATS=1`. Three
+    /// phases composed in order per frame:
+    ///
+    /// 1. `lod_stats_drain_*`: try_recv the previous frame's pending
+    ///    map; if it's mapped, read 32 B + log + unmap + reset to
+    ///    idle. Cheap when nothing is in flight.
+    /// 2. `lod_stats_clear_*`: encoder.clear_buffer the histogram so
+    ///    this frame's atomics start at zero. Always called before
+    ///    the LOD-select dispatch (no-op if stats disabled — clear
+    ///    is harmless either way and avoids an env-var-gated branch
+    ///    on the hot path).
+    /// 3. `lod_stats_finalize_*`: encoder.copy_buffer_to_buffer the
+    ///    histogram → staging buffer. Called immediately after the
+    ///    LOD-select dispatch finishes. Skipped when a map is already
+    ///    pending so we don't overwrite in-flight data.
+    pub fn lod_stats_drain_primary(&mut self, label: &str) {
+        Self::lod_stats_drain(
+            &self.mesh_lod_admit_stats_primary_staging,
+            &mut self.mesh_lod_admit_stats_primary_pending,
+            label,
+        );
+    }
+    pub fn lod_stats_drain_shadow(&mut self, label: &str) {
+        Self::lod_stats_drain(
+            &self.mesh_lod_admit_stats_shadow_staging,
+            &mut self.mesh_lod_admit_stats_shadow_pending,
+            label,
+        );
+    }
+    fn lod_stats_drain(
+        staging: &wgpu::Buffer,
+        pending: &mut Option<
+            std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+        >,
+        label: &str,
+    ) {
+        let Some(rx) = pending.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                let slice = staging.slice(..);
+                let data = slice.get_mapped_range();
+                if data.len() >= MESH_LOD_STATS_BYTES as usize {
+                    let mut admitted = [0u32; LOD_LEVELS_MAX];
+                    let mut total = [0u32; LOD_LEVELS_MAX];
+                    let total_offset = LOD_LEVELS_MAX * 4;
+                    for i in 0..LOD_LEVELS_MAX {
+                        admitted[i] = u32::from_le_bytes([
+                            data[i * 4],
+                            data[i * 4 + 1],
+                            data[i * 4 + 2],
+                            data[i * 4 + 3],
+                        ]);
+                        total[i] = u32::from_le_bytes([
+                            data[total_offset + i * 4],
+                            data[total_offset + i * 4 + 1],
+                            data[total_offset + i * 4 + 2],
+                            data[total_offset + i * 4 + 3],
+                        ]);
+                    }
+                    let admitted_total: u32 = admitted.iter().sum();
+                    let evaluated_total: u32 = total.iter().sum();
+                    let mut per_lod = String::new();
+                    for i in 0..LOD_LEVELS_MAX {
+                        if total[i] == 0 {
+                            continue;
+                        }
+                        if !per_lod.is_empty() {
+                            per_lod.push_str(" | ");
+                        }
+                        per_lod.push_str(&format!("lod{i} {}/{}", admitted[i], total[i]));
+                    }
+                    eprintln!(
+                        "[mesh_lod_stats {label}] evaluated={evaluated_total} admitted={admitted_total} | {per_lod}"
+                    );
+                }
+                drop(data);
+                staging.unmap();
+                *pending = None;
+            }
+            Ok(Err(e)) => {
+                eprintln!("[mesh_lod_stats {label}] map_async error: {e:?}");
+                *pending = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Still in flight; check again next frame.
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Sender dropped without sending — shouldn't happen
+                // since the closure stays alive until the callback
+                // fires. Reset defensively.
+                *pending = None;
+            }
+        }
+    }
+
+    pub fn lod_stats_clear_primary(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.clear_buffer(&self.mesh_lod_admit_stats_primary, 0, None);
+    }
+    pub fn lod_stats_clear_shadow(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.clear_buffer(&self.mesh_lod_admit_stats_shadow, 0, None);
+    }
+
+    /// Queue the GPU-side copy of the histogram into the staging
+    /// buffer. Returns `true` if the copy was actually queued (i.e.,
+    /// no map is in flight); the caller MUST then call
+    /// `lod_stats_issue_map_async_primary` after `queue.submit()` to
+    /// pair the map_async with this submit. Issuing map_async before
+    /// submit triggers `Buffer is still mapped` validation errors
+    /// because wgpu reads the map state at submit time.
+    pub fn lod_stats_finalize_primary(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if self.mesh_lod_admit_stats_primary_pending.is_some() {
+            return;
+        }
+        encoder.copy_buffer_to_buffer(
+            &self.mesh_lod_admit_stats_primary,
+            0,
+            &self.mesh_lod_admit_stats_primary_staging,
+            0,
+            MESH_LOD_STATS_BYTES,
+        );
+        self.mesh_lod_admit_stats_primary_needs_map = true;
+    }
+    pub fn lod_stats_finalize_shadow(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if self.mesh_lod_admit_stats_shadow_pending.is_some() {
+            return;
+        }
+        encoder.copy_buffer_to_buffer(
+            &self.mesh_lod_admit_stats_shadow,
+            0,
+            &self.mesh_lod_admit_stats_shadow_staging,
+            0,
+            MESH_LOD_STATS_BYTES,
+        );
+        self.mesh_lod_admit_stats_shadow_needs_map = true;
+    }
+
+    /// Mesh pipeline-statistics drain: read the previous frame's
+    /// 4-slot u64 array if the staging buffer is mapped, log p
+    /// er-pass VS / clipper-in / clipper-out / FS / CS counts.
+    /// Cheap when nothing's in flight.
+    pub fn pipestats_drain(&mut self) {
+        let Some(rx) = self.mesh_pipestats_pending.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                let slice = self.mesh_pipestats_staging_buffer.slice(..);
+                let data = slice.get_mapped_range();
+                let needed = (2 + 2 * CSM_CASCADE_COUNT as usize) * 40;
+                if data.len() >= needed {
+                    // Layout: N slots × 5 × u64. Stat order matches
+                    // the `PipelineStatisticsTypes` bit order:
+                    // VS, CLIPPER_IN, CLIPPER_OUT, FS, CS.
+                    let read_slot = |slot: usize| -> [u64; 5] {
+                        let base = slot * 40;
+                        let mut out = [0u64; 5];
+                        for i in 0..5 {
+                            let off = base + i * 8;
+                            out[i] = u64::from_le_bytes(
+                                data[off..off + 8].try_into().unwrap(),
+                            );
+                        }
+                        out
+                    };
+                    let log = |label: &str, s: [u64; 5]| {
+                        eprintln!(
+                            "[mesh_pipestats {label}] vs={} clipper_in={} clipper_out={} fs={} cs={}",
+                            s[0], s[1], s[2], s[3], s[4],
+                        );
+                    };
+                    log("mesh_lod_select", read_slot(0));
+                    log("mesh_raster", read_slot(1));
+                    let n = CSM_CASCADE_COUNT as usize;
+                    for c in 0..n {
+                        log(&format!("mesh_shadow_lod_select[{c}]"), read_slot(2 + c));
+                    }
+                    for c in 0..n {
+                        log(&format!("mesh_shadow_render[{c}]"), read_slot(2 + n + c));
+                    }
+                }
+                drop(data);
+                self.mesh_pipestats_staging_buffer.unmap();
+                self.mesh_pipestats_pending = None;
+            }
+            Ok(Err(e)) => {
+                eprintln!("[mesh_pipestats] map_async error: {e:?}");
+                self.mesh_pipestats_pending = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.mesh_pipestats_pending = None;
+            }
+        }
+    }
+
+    /// Resolve the query set into the resolve buffer + copy to
+    /// staging. Called once per frame after both mesh passes have
+    /// emitted their begin/end_pipeline_statistics_query pairs.
+    /// Skip when an earlier frame's map is still pending so we
+    /// don't overwrite mid-flight data.
+    pub fn pipestats_finalize(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if self.mesh_pipestats_pending.is_some() {
+            return;
+        }
+        let n = 2 + 2 * CSM_CASCADE_COUNT;
+        let bytes = (n as u64) * 40;
+        encoder.resolve_query_set(
+            &self.mesh_pipestats_query_set,
+            0..n,
+            &self.mesh_pipestats_resolve_buffer,
+            0,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.mesh_pipestats_resolve_buffer,
+            0,
+            &self.mesh_pipestats_staging_buffer,
+            0,
+            bytes,
+        );
+        self.mesh_pipestats_needs_map = true;
+    }
+
+    /// Engine call after `queue.submit()`. Issues map_async on any
+    /// staging buffers the per-frame finalize methods flagged.
+    /// Bundles all the diagnostic readback stagings (LOD admit
+    /// histograms + pipeline-statistics query results) so the
+    /// engine has one symmetric pre/post-submit pair.
+    pub fn lod_stats_post_submit(&mut self) {
+        if self.mesh_lod_admit_stats_primary_needs_map {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.mesh_lod_admit_stats_primary_staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx.send(r);
+                });
+            self.mesh_lod_admit_stats_primary_pending = Some(rx);
+            self.mesh_lod_admit_stats_primary_needs_map = false;
+        }
+        if self.mesh_lod_admit_stats_shadow_needs_map {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.mesh_lod_admit_stats_shadow_staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx.send(r);
+                });
+            self.mesh_lod_admit_stats_shadow_pending = Some(rx);
+            self.mesh_lod_admit_stats_shadow_needs_map = false;
+        }
+        if self.mesh_pipestats_needs_map {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.mesh_pipestats_staging_buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx.send(r);
+                });
+            self.mesh_pipestats_pending = Some(rx);
+            self.mesh_pipestats_needs_map = false;
+        }
+    }
+
+    /// Write one frame's `MeshInstanceUniform` for the given slot.
+    /// Caller must have already extended the slot vector via
+    /// `ensure_mesh_instance_capacity`.
+    ///
+    /// `skinning_mode` follows the [`MeshInstanceUniform`] convention
+    /// (`0` LBS / `1` DQS / `SKINNING_MODE_NONE` rest-pose); the two
+    /// `bone_offset_*` values are read by the mesh VS only when the
+    /// matching mode is selected.
+    pub fn write_mesh_instance(
+        &self,
+        queue: &wgpu::Queue,
+        slot: u32,
+        world: &[[f32; 4]; 4],
+        object_id: u32,
+        grid_origin: [f32; 3],
+        bone_offset_lbs: u32,
+        bone_offset_dqs: u32,
+        skinning_mode: u32,
+    ) {
+        let uniform = MeshInstanceUniform {
+            world: *world,
+            grid_origin,
+            object_id,
+            bone_offset_lbs,
+            bone_offset_dqs,
+            skinning_mode,
+            _pad: 0,
+        };
+        queue.write_buffer(
+            &self.mesh_instance_buffers[slot as usize],
+            0,
+            bytemuck::bytes_of(&uniform),
+        );
+    }
+
+    /// Upload this viewport's camera uniform.
+    pub fn upload_camera(&self, queue: &wgpu::Queue, camera: &CameraUniforms) {
+        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+    }
+
+    /// Rebuild scene bind group if shared scene buffers reallocated.
+    /// Also rebuild shade lights/materials bindings if those buffers
+    /// reallocated (separate epoch — different write path).
+    pub fn refresh_bindings(&mut self, device: &wgpu::Device, renderer: &ArvxRenderer) {
+        let scene_now = renderer.scene.buffers_epoch();
+        if scene_now != self.scene_epoch {
+            self.scene_bind_group = renderer.scene.build_bind_group(device, &self.camera_buffer);
+            self.scene_epoch = scene_now;
+        }
+        let lm_now = renderer.lights_materials_epoch();
+        if lm_now != self.lights_materials_epoch {
+            self.shade.set_shade_data(
+                device,
+                &renderer.shade_params_buffer,
+                &renderer.lights_buffer,
+                &renderer.materials_buffer,
+            );
+            // Glass pass also reads the materials SSBO (for glass
+            // albedo / IOR) + shade_params + lights (for GGX direct
+            // spec). Refresh all three when the lights/materials
+            // epoch bumps; any of them may reallocate. Input HDR
+            // comes from volumetric so clouds / fog land in the
+            // "behind" before glass Fresnel + refraction.
+            self.glass.set_inputs(
+                device,
+                &self.volumetric.output_view,
+                &self.gbuffer.glass_view,
+                &self.camera_buffer,
+                &renderer.materials_buffer,
+                &renderer.shade_params_buffer,
+                &renderer.lights_buffer,
+            );
+            self.lights_materials_epoch = lm_now;
+        }
+    }
+
+    /// Re-create per-resolution resources at a new size. Rebuilds the
+    /// entire pass chain because every intermediate texture is tied to
+    /// the target's dimensions.
+    pub fn resize(
+        &mut self,
+        device: &wgpu::Device,
+        renderer: &mut ArvxRenderer,
+        width: u32,
+        height: u32,
+    ) {
+        if width == self.width && height == self.height {
+            return;
+        }
+        self.width = width;
+        self.height = height;
+
+        // Gbuffer.
+        self.gbuffer = crate::GBuffer::new(device, width, height);
+        let (pick_texture, pick_view) = create_pick_texture(device, width, height);
+        self.pick_texture = pick_texture;
+        self.pick_view = pick_view;
+
+        // Mesh-mode glass scratch targets — same resolution as the
+        // gbuffer; reallocate and drop the cached bind groups so the
+        // next dispatch rebuilds against the new views.
+        let mesh_glass_tx = create_glass_textures(device, width, height);
+        self.glass_entry_packed_texture = mesh_glass_tx.entry_packed;
+        self.glass_entry_packed_view    = mesh_glass_tx.entry_packed_view;
+        self.glass_exit_dist_texture    = mesh_glass_tx.exit_dist;
+        self.glass_exit_dist_view       = mesh_glass_tx.exit_dist_view;
+        self.glass_depth_front_texture  = mesh_glass_tx.depth_front;
+        self.glass_depth_front_view     = mesh_glass_tx.depth_front_view;
+        self.glass_depth_back_texture   = mesh_glass_tx.depth_back;
+        self.glass_depth_back_view      = mesh_glass_tx.depth_back_view;
+        self.mesh_glass_combine_bg = None;
+
+        // Splat-resolve g0 references gbuffer texture views which all
+        // just moved. Drop it — `refresh_mesh_resolve_bindings` will
+        // rebuild on next dispatch.
+        self.mesh_resolve_g0_bg = None;
+
+        // Per-VR passes — resize internal textures + re-wire gbuffer bindings.
+        self.proc_raymarch.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
+        self.proc_outline.set_gbuffer(device, &self.pick_view);
+
+        self.ssao.resize(device, width, height);
+        self.ssao.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view);
+
+        self.shade.resize(device, width, height);
+        self.shade.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.gbuffer.glass_view, &self.pick_view);
+        // Brush-state probe — rebuild the bind group around the new
+        // gbuffer views. The buffer itself is unchanged.
+        self.shade.set_brush_state(device, &self.brush_state_buffer);
+        self.brush_state_pass_bg = Some(renderer.brush_state.create_bind_group(
+            device,
+            &self.gbuffer.position_view,
+            &self.pick_view,
+            &self.brush_state_buffer,
+            &self.brush_state_params_buffer,
+        ));
+        // Shadow map size doesn't track viewport resolution; the
+        // depth buffer stays at SHADOW_MAP_DEFAULT_SIZE through
+        // resize. Re-binding picks up the same buffer.
+        self.shade.set_shadow_and_ssao(
+            device,
+            &self.ssao.output_view,
+            &self.shadow_map.shadow_buffer,
+            &self.shadow_map.uniform_buffer,
+            &self.mesh_glass_shadow_front_array_view,
+            &self.mesh_glass_shadow_back_array_view,
+        );
+
+        self.volumetric.resize(device, width, height);
+        self.volumetric.set_depth_view(device, &self.gbuffer.position_view);
+        self.volumetric.set_scene_hdr_view(device, &self.shade.output_view);
+
+        self.glass.resize(device, width, height);
+        self.glass.set_inputs(
+            device,
+            &self.volumetric.output_view,
+            &self.gbuffer.glass_view,
+            &self.camera_buffer,
+            &renderer.materials_buffer,
+            &renderer.shade_params_buffer,
+            &renderer.lights_buffer,
+        );
+
+        self.god_rays.resize(device, width, height);
+        self.god_rays.set_inputs(device, &self.glass.output_view, &self.gbuffer.position_view, &self.volumetric.cloud_view);
+
+        // Bloom / tonemap chain — these hold their own output textures.
+        self.bloom = crate::BloomPass::new(device, &self.god_rays.output_view, width, height);
+        self.bloom_composite = crate::BloomCompositePass::new(
+            device, &self.god_rays.output_view, self.bloom.mip_views(), width, height,
+        );
+        self.tone_map = crate::ToneMapPass::new(device, &self.bloom_composite.output_view, width, height);
+
+        self.readback.resize(device, width, height);
+
+        self.composite_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rkp composite"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::LDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.composite_view = self.composite_texture.create_view(&Default::default());
+
+        // Grid: rebind to the new gbuffer position view (camera buffer
+        // is stable across resize so it doesn't need re-wiring).
+        self.grid.set_bindings(device, &self.camera_buffer, &self.gbuffer.position_view);
+
+        // Env-dirty path applies bloom/tonemap params — the engine re-fires it
+        // after a resize so VRs rebuilt their bloom/tonemap from defaults here
+        // end up with scene-correct values on the next frame.
+        let _ = renderer;
+    }
+
+    pub fn readback_padded_row(&self) -> u32 {
+        (self.width * 4 + 255) & !255
+    }
+
+
+    /// Encode a copy of the composite texture into the readback ring's
+    /// next idle buffer. Returns the index that was written, or `None` if
+    /// every buffer is still in flight (caller should skip readback this
+    /// frame and reuse cached pixels).
+    pub fn encode_composite_readback(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Option<usize> {
+        let idx = self.readback.acquire_write_idx()?;
+        let padded_row = self.readback_padded_row();
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.composite_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &self.readback.buffers[idx],
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row),
+                    rows_per_image: Some(self.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        Some(idx)
+    }
+}
+
+/// Triple-buffered async readback. The engine writes the composite into
+/// one buffer per frame, immediately issues `map_async` on it, and reads
+/// pixels back the frame (or two) later via [`drain_completed`]. There is
+/// no `device.poll(Wait)` anywhere on the hot path — completion is checked
+/// with `try_recv` after a non-blocking `poll(Poll)`.
+///
+/// Three buffers gives one slot for the in-flight write, one for the
+/// in-flight map, and one always-idle slot, so [`acquire_write_idx`]
+/// effectively never returns `None` when the GPU is keeping up.
+pub struct ReadbackRing {
+    pub buffers: [wgpu::Buffer; 3],
+    pending: [Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>; 3],
+    cached: Vec<u8>,
+    cached_w: u32,
+    cached_h: u32,
+}
+
+impl ReadbackRing {
+    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        Self {
+            buffers: [
+                create_readback_buffer(device, width, height),
+                create_readback_buffer(device, width, height),
+                create_readback_buffer(device, width, height),
+            ],
+            pending: [None, None, None],
+            cached: Vec::new(),
+            cached_w: 0,
+            cached_h: 0,
+        }
+    }
+
+    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        // Any in-flight maps reference the OLD buffers. Dropping the
+        // receiver is safe — the buffers themselves still exist until
+        // `Drop` runs in the next assignment, and wgpu cancels the maps
+        // when the buffer goes away.
+        self.pending = [None, None, None];
+        self.buffers = [
+            create_readback_buffer(device, width, height),
+            create_readback_buffer(device, width, height),
+            create_readback_buffer(device, width, height),
+        ];
+        self.cached.clear();
+        self.cached_w = 0;
+        self.cached_h = 0;
+    }
+
+    pub fn acquire_write_idx(&self) -> Option<usize> {
+        self.pending.iter().position(|p| p.is_none())
+    }
+
+    /// `true` when at least one readback slot is idle — i.e.
+    /// [`acquire_write_idx`] would return `Some`. Callers use this as a
+    /// GPU-backpressure signal: if every slot is still waiting for a
+    /// previously-submitted `map_async` to complete, the CPU is
+    /// outpacing the GPU and should back off rather than submit more
+    /// work (which would just deepen the queue and delay every pending
+    /// readback even further).
+    pub fn has_idle_slot(&self) -> bool {
+        self.pending.iter().any(|p| p.is_none())
+    }
+
+    /// After submit, kick off `map_async` on the buffer that was just
+    /// written. Buffer state goes from idle → in-flight; later
+    /// `drain_completed` will read it back and return it to idle.
+    pub fn issue_map_async(&mut self, idx: usize) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.buffers[idx].slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.pending[idx] = Some(rx);
+    }
+
+    /// Non-blocking: copy any completed maps' pixels into the cached
+    /// frame. Caller must have already done `device.poll(Poll)` so
+    /// callbacks can fire. Returns `true` when `cached_pixels` was
+    /// updated this call.
+    pub fn drain_completed(&mut self, width: u32, height: u32, padded_row: u32) -> bool {
+        let mut updated = false;
+        for i in 0..self.pending.len() {
+            let done = self.pending[i].as_ref().map(|rx| rx.try_recv().is_ok()).unwrap_or(false);
+            if !done {
+                continue;
+            }
+            self.pending[i] = None;
+            let slice = self.buffers[i].slice(..);
+            let data = slice.get_mapped_range();
+            let mut out = vec![0u8; (width * height * 4) as usize];
+            for y in 0..height as usize {
+                let src = y * padded_row as usize;
+                let dst = y * width as usize * 4;
+                let row = width as usize * 4;
+                if src + row <= data.len() && dst + row <= out.len() {
+                    out[dst..dst + row].copy_from_slice(&data[src..src + row]);
+                }
+            }
+            drop(data);
+            self.buffers[i].unmap();
+            self.cached = out;
+            self.cached_w = width;
+            self.cached_h = height;
+            updated = true;
+        }
+        updated
+    }
+
+    pub fn cached_pixels(&self) -> Option<(&[u8], u32, u32)> {
+        if self.cached.is_empty() {
+            None
+        } else {
+            Some((&self.cached, self.cached_w, self.cached_h))
+        }
+    }
+}
+
+fn create_readback_buffer(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Buffer {
+    let padded_row = (width * 4 + 255) & !255;
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rkp readback"),
+        size: (padded_row * height) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    })
+}
+
+/// Glass shadow depth resources for a single cascaded shadow map —
+/// front + back depth textures sized to `shadow_map_size²`, with a
+/// per-layer view per cascade and a whole-array view for shade-side
+/// sampling.
+struct GlassShadowTextures {
+    front_texture: wgpu::Texture,
+    front_views: Vec<wgpu::TextureView>,
+    front_array_view: wgpu::TextureView,
+    back_texture: wgpu::Texture,
+    back_views: Vec<wgpu::TextureView>,
+    back_array_view: wgpu::TextureView,
+}
+
+fn create_glass_shadow_textures(device: &wgpu::Device, size: u32) -> GlassShadowTextures {
+    let mk = |label: &'static str| -> (wgpu::Texture, Vec<wgpu::TextureView>, wgpu::TextureView) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: CSM_CASCADE_COUNT,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let layer_views: Vec<wgpu::TextureView> = (0..CSM_CASCADE_COUNT)
+            .map(|i| {
+                tex.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some(&format!("{label} layer {i}")),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: i,
+                    array_layer_count: Some(1),
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let array_view = tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some(&format!("{label} array")),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            aspect: wgpu::TextureAspect::DepthOnly,
+            ..Default::default()
+        });
+        (tex, layer_views, array_view)
+    };
+    let (front_texture, front_views, front_array_view) = mk("arvx_mesh_glass_shadow_front");
+    let (back_texture, back_views, back_array_view) = mk("arvx_mesh_glass_shadow_back");
+    GlassShadowTextures {
+        front_texture,
+        front_views,
+        front_array_view,
+        back_texture,
+        back_views,
+        back_array_view,
+    }
+}
+
+/// All four mesh-mode glass textures, allocated together at the
+/// internal viewport resolution. Returned in lockstep with the
+/// `glass_*` fields on `ViewportRenderer`.
+struct GlassTextures {
+    entry_packed:     wgpu::Texture,
+    entry_packed_view: wgpu::TextureView,
+    exit_dist:        wgpu::Texture,
+    exit_dist_view:   wgpu::TextureView,
+    depth_front:      wgpu::Texture,
+    depth_front_view: wgpu::TextureView,
+    depth_back:       wgpu::Texture,
+    depth_back_view:  wgpu::TextureView,
+}
+
+fn create_glass_textures(device: &wgpu::Device, width: u32, height: u32) -> GlassTextures {
+    let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+    let entry_packed = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("mesh_glass entry_packed"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: crate::mesh_glass_pass::GLASS_ENTRY_PACKED_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let entry_packed_view = entry_packed.create_view(&Default::default());
+
+    let exit_dist = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("mesh_glass exit_dist"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: crate::mesh_glass_pass::GLASS_EXIT_DIST_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let exit_dist_view = exit_dist.create_view(&Default::default());
+
+    let mk_depth = |label: &'static str| -> (wgpu::Texture, wgpu::TextureView) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::mesh_glass_pass::GLASS_DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+        (tex, view)
+    };
+    let (depth_front, depth_front_view) = mk_depth("mesh_glass depth_front");
+    let (depth_back,  depth_back_view)  = mk_depth("mesh_glass depth_back");
+
+    GlassTextures {
+        entry_packed, entry_packed_view,
+        exit_dist, exit_dist_view,
+        depth_front, depth_front_view,
+        depth_back, depth_back_view,
+    }
+}
+
+fn create_pick_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("rkp pick"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Uint,
+        // RENDER_ATTACHMENT for the mesh raster path (mesh.wesl writes
+        // pick at @location(1)). STORAGE_BINDING is kept so post-passes
+        // (paint probe, brush state) can read/write the same texture.
+        usage: wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&Default::default());
+    (tex, view)
+}

@@ -1,0 +1,29 @@
+[package]
+name = "arvx-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Engine runtime: frame scheduling, ECS glue, streaming, asset management"
+
+[features]
+gamepad = ["dep:gilrs"]
+
+[dependencies]
+arvx-core = { workspace = true }
+arvx-render = { workspace = true }
+arvx-animation = { workspace = true }
+arvx-physics = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
+hecs = { workspace = true }
+glam = { workspace = true }
+log = { workspace = true }
+anyhow = { workspace = true }
+crossbeam = { workspace = true }
+pollster = { workspace = true }
+serde = { workspace = true }
+ron = { workspace = true }
+gilrs = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"

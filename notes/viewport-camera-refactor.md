@@ -113,14 +113,14 @@ Play mode flips main's mask from `EDITOR_ONLY` → `UI`: editor gizmos vanish, H
 
 ### GPU implementation
 
-Add `layer_mask: u32` to `RkpGpuObject` and to camera uniforms. Tile-cull and march shaders gate on `(obj.layer_mask & cam.layer_mask) != 0`. Focus-entity is a second check: `obj.object_id == cam.focus_object_id`. Either one passing = visible. One gpu_objects array shared across all viewports.
+Add `layer_mask: u32` to `ArvxGpuObject` and to camera uniforms. Tile-cull and march shaders gate on `(obj.layer_mask & cam.layer_mask) != 0`. Focus-entity is a second check: `obj.object_id == cam.focus_object_id`. Either one passing = visible. One gpu_objects array shared across all viewports.
 
 ## Renderer split
 
-- `RkpRenderer` — shared GPU pipelines, scene data, pipeline objects
+- `ArvxRenderer` — shared GPU pipelines, scene data, pipeline objects
 - `ViewportRenderer` (new) — per-viewport: GBuffer at viewport size, bloom/tonemap state, camera uniform buffer
 
-Each tick, for each visible viewport, `RkpRenderer` runs its passes against the viewport's `ViewportRenderer`.
+Each tick, for each visible viewport, `ArvxRenderer` runs its passes against the viewport's `ViewportRenderer`.
 
 Memory cost: ~90 MB for a 1920×1080 main + 500×500 build. Acceptable.
 
@@ -191,8 +191,8 @@ enum EngineCommand {
 
 ### Phase 2 — Renderer split
 - `ViewportRenderer` owns GBuffer + post-process chain
-- `RkpRenderer::render_to(viewport_renderer, camera, filter)` entry point
-- Add `layer_mask` to `RkpGpuObject` + camera uniforms
+- `ArvxRenderer::render_to(viewport_renderer, camera, filter)` entry point
+- Add `layer_mask` to `ArvxGpuObject` + camera uniforms
 - Shaders gate on layer mask (focus_entity too)
 - Still one viewport — mask defaults to ALL
 

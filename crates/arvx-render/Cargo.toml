@@ -1,0 +1,28 @@
+[package]
+name = "arvx-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Splat rendering pipeline: opacity-field march to G-buffer, deferred shading, post-process"
+
+[dependencies]
+arvx-core = { workspace = true }
+arvx-procedural = { workspace = true }
+wgpu = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true }
+encase = { workspace = true }
+half = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+pollster = { workspace = true }
+rayon = { workspace = true }
+rustc-hash = { workspace = true }
+wgpu-profiler = { workspace = true }
+naga = { workspace = true }
+wesl = { workspace = true }
+meshopt = { workspace = true }
+
+[build-dependencies]
+wesl = { workspace = true }
+naga = { workspace = true }

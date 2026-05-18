@@ -1,0 +1,13 @@
+[package]
+name = "arvx-convert"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Mesh-to-.arvx CLI: runs the arvx-import pipeline from the command line"
+
+[dependencies]
+arvx-import = { workspace = true }
+arvx-core = { workspace = true }
+clap = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }

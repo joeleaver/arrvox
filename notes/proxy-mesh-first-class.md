@@ -72,11 +72,11 @@ struct MeshVertex {              // 32 B (unchanged size)
 }
 ```
 
-Pros: one vertex struct in `rkp_core`. Both pipelines bind the same vertex buffer layout.
+Pros: one vertex struct in `arvx_core`. Both pipelines bind the same vertex buffer layout.
 
 Cons: same struct means different things to different shaders; field names lie. Could mitigate by using neutral names + doc.
 
-**Option B — introduce `rkp_core::mesh_extract::ProxyVertex` (32 B), distinct from `MeshVertex`.**
+**Option B — introduce `arvx_core::mesh_extract::ProxyVertex` (32 B), distinct from `MeshVertex`.**
 
 ```
 struct ProxyVertex {             // 32 B
@@ -136,17 +136,17 @@ If only 4: skip glass (clear-to-zero already happens; proxy meshes don't write g
 
 | File | Change |
 |------|--------|
-| `crates/rkp-core/src/mesh_extract.rs` (or new file) | Add `ProxyVertex` struct (32 B, `Pod + Zeroable`). |
-| `crates/rkp-render/src/proc_surface_nets.rs` | Change `SurfaceMesh.vertices` to `Vec<ProxyVertex>`. Update extract path to read back ProxyVertex. |
-| `crates/rkp-render/src/shaders/proc_surface_nets.wesl` | `vertex_emit` uses `eval_tree`, packs full shading data. |
-| `crates/rkp-render/src/shaders/mesh_proxy.wesl` (new) | Proxy-mesh raster VS+FS. |
-| `crates/rkp-render/src/mesh_proxy_pass.rs` (new) | Raster pipeline, render-pass orchestration, per-instance uniform upload. Borrows shape from `mesh_pass.rs`. |
-| `crates/rkp-render/src/rkp_renderer.rs` | Schedule proxy-mesh raster after `splat_resolve`. |
-| `crates/rkp-engine/src/components.rs` | Drop `ProxyMeshData.leaf_attr_slot`. |
-| `crates/rkp-engine/src/engine/procedural_ops.rs::apply_proxy_mesh_result` | Drop the `LeafAttrPool::allocate()` call, the LeafAttr fill, and the per-vertex `leaf_attr_id` patch loop. Just upload geometry + spatial stamp. |
-| `crates/rkp-engine/src/engine/procedural_ops.rs::release_proxy_handle_if_any` | Drop the `deallocate_range` call (no slot to free). |
-| `crates/rkp-engine/src/engine/scene_gpu.rs` | Proxy meshes go onto a new `proxy_draws` list, not `splat_draws`. The synthesized `GpuAsset` and the entry in `gpu_instances` go away (or are slimmed to what shadow + GI need; TBD). |
-| `crates/rkp-render/src/render_frame.rs` (or wherever `RenderCommand::UploadProxyMesh` is handled) | No change in signature; the renderer's proxy bookkeeping just doesn't touch LeafAttr pool. |
+| `crates/arvx-core/src/mesh_extract.rs` (or new file) | Add `ProxyVertex` struct (32 B, `Pod + Zeroable`). |
+| `crates/arvx-render/src/proc_surface_nets.rs` | Change `SurfaceMesh.vertices` to `Vec<ProxyVertex>`. Update extract path to read back ProxyVertex. |
+| `crates/arvx-render/src/shaders/proc_surface_nets.wesl` | `vertex_emit` uses `eval_tree`, packs full shading data. |
+| `crates/arvx-render/src/shaders/mesh_proxy.wesl` (new) | Proxy-mesh raster VS+FS. |
+| `crates/arvx-render/src/mesh_proxy_pass.rs` (new) | Raster pipeline, render-pass orchestration, per-instance uniform upload. Borrows shape from `mesh_pass.rs`. |
+| `crates/arvx-render/src/arvx_renderer.rs` | Schedule proxy-mesh raster after `splat_resolve`. |
+| `crates/arvx-engine/src/components.rs` | Drop `ProxyMeshData.leaf_attr_slot`. |
+| `crates/arvx-engine/src/engine/procedural_ops.rs::apply_proxy_mesh_result` | Drop the `LeafAttrPool::allocate()` call, the LeafAttr fill, and the per-vertex `leaf_attr_id` patch loop. Just upload geometry + spatial stamp. |
+| `crates/arvx-engine/src/engine/procedural_ops.rs::release_proxy_handle_if_any` | Drop the `deallocate_range` call (no slot to free). |
+| `crates/arvx-engine/src/engine/scene_gpu.rs` | Proxy meshes go onto a new `proxy_draws` list, not `splat_draws`. The synthesized `GpuAsset` and the entry in `gpu_instances` go away (or are slimmed to what shadow + GI need; TBD). |
+| `crates/arvx-render/src/render_frame.rs` (or wherever `RenderCommand::UploadProxyMesh` is handled) | No change in signature; the renderer's proxy bookkeeping just doesn't touch LeafAttr pool. |
 
 ## Validation
 

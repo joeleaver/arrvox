@@ -1,0 +1,23 @@
+[package]
+name = "arvx-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Core data structures for the Arrvox splat engine: SplatVoxel, SH coefficients, brick format"
+
+[dependencies]
+glam = { workspace = true }
+bytemuck = { workspace = true }
+half = { workspace = true }
+serde = { workspace = true }
+log = { workspace = true }
+lz4_flex = { workspace = true }
+thiserror = { workspace = true }
+# Mesh extraction + Karis-Nanite cluster DAG live here so arvx-import
+# (write-time bake) and arvx-render (load-time consumer) can share them.
+meshopt = { workspace = true }
+rayon = { workspace = true }
+rustc-hash = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -1,0 +1,19 @@
+[package]
+name = "arvx-procedural"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Procedural object system: arena-based node trees, evaluation, adaptive voxelization"
+
+[dependencies]
+arvx-core = { workspace = true }
+glam = { workspace = true }
+serde = { workspace = true }
+smallvec = { version = "1", features = ["serde"] }
+# `flatten.rs` emits `ProcInstruction` as a `Pod`/`Zeroable` struct for
+# zero-copy upload to the GPU raymarch pass.
+bytemuck = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+approx = "0.5"
+serde_json = { workspace = true }

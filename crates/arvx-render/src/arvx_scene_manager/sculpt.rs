@@ -1,0 +1,1816 @@
+//! Sculpt-brush resolve — computes per-stamp edit lists without
+//! mutating the asset's octree.
+//!
+//! Phase A overlay path (see memory `project_sculpt_phase_a_overlay_plan`):
+//! each call hands the engine a list of `leaf_attr_id`s to insert into
+//! the per-instance [`SculptOverlay`]. No mesh re-extract, no cluster
+//! DAG rebuild, no `geometry_epoch` bump — the overlay rides through
+//! the existing per-frame upload at [`crate::arvx_scene::FrameUpload::
+//! instance_sculpts`].
+//!
+//! Why an overlay, not the Phase 2 octree mutation:
+//!
+//! * Brick-everywhere assets (the dominant case for `.arvx` mesh imports)
+//!   silently no-oped under Phase 2's Carve because the kernel only saw
+//!   LEAF nodes. The Phase A kernel extension emits `Remove` for BRICK
+//!   cells too; the caller resolves grid_coord → leaf_attr_id here so
+//!   the engine can drop slot ids into the overlay uniformly across LEAF
+//!   and BRICK cells.
+//! * Drag perf — no per-stamp re-bake. Cost is bounded by the brush
+//!   AABB walk + binary-search insert into the overlay.
+//! * Save path applies the accumulated overlay back into the octree
+//!   in one shot (Phase A task #7). The octree stays the source of
+//!   truth at rest; the overlay carries the in-session edits.
+//!
+//! Raise (Add) is deferred to Phase B and skipped here with a log line.
+
+use glam::{Affine3A, IVec3, Vec3};
+
+use arvx_core::mesh_cluster::{cluster_grid_aabb, cluster_overlaps_brush_grid_aabb};
+use arvx_core::mesh_cluster::{MeshletCluster, PARENT_GROUP_ERROR_ROOT};
+use arvx_core::mesh_extract::{
+    collect_cell_map_in_region, extract_mesh_region_from_cells_pooled, extract_surface_mesh,
+};
+use arvx_core::mesh_lod::build_cluster_dag_with_levels;
+use arvx_core::sculpt::{
+    apply_delta, brush_cell_range, compute_brush_edits_in_stroke, BrushMode, BrushOp,
+    LeafEditOp,
+};
+use arvx_core::sparse_octree::{is_brick, is_leaf, leaf_slot, brick_id};
+use arvx_core::brick_pool::{BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR};
+
+use super::manager::ArvxSceneManager;
+use super::types::AssetHandle;
+
+
+/// Outcome of [`ArvxSceneManager::apply_sculpt_brush`]. The engine
+/// merges `removed_leaf_attr_ids` into the per-entity
+/// [`arvx_core::SculptOverlay`] and re-uploads on the next frame.
+#[derive(Debug, Clone, Default)]
+pub struct SculptApplyResult {
+    /// `leaf_attr_id`s the brush carved away. Already de-duplicated
+    /// and sorted ascending so the engine can `insert_batch` directly.
+    /// May be empty when the brush footprint hit only empty / interior
+    /// cells.
+    pub removed_leaf_attr_ids: Vec<u32>,
+    /// `leaf_attr_id`s the brush *allocated* — fresh surface cells the
+    /// caller must REMOVE from the per-entity sculpt overlay before
+    /// the next render. Without this step, slots reused from the
+    /// LeafAttrPool free list (which the prior Carve's freed slots
+    /// populate) carry stale "removed" entries in the overlay; the
+    /// mesh FS then discards every fragment that lands on them, and
+    /// half the Raise dome vanishes after the first Carve.
+    pub allocated_leaf_attr_ids: Vec<u32>,
+    /// How many cells the kernel emitted as Remove (pre-filter).
+    pub leaves_removed: usize,
+    /// How many Add edits were skipped (Phase B). Logged so the user
+    /// gets feedback if they switch to Raise while it's disabled.
+    pub leaves_add_skipped: usize,
+}
+
+/// Float-AABB intersection test in object-local coordinates.
+fn local_aabb_intersects(
+    a_min: [f32; 3], a_max: [f32; 3],
+    b_min: Vec3, b_max: Vec3,
+) -> bool {
+    a_min[0] <= b_max.x && a_max[0] >= b_min.x
+        && a_min[1] <= b_max.y && a_max[1] >= b_min.y
+        && a_min[2] <= b_max.z && a_max[2] >= b_min.z
+}
+
+/// Mark meshlet clusters with `CLUSTER_FLAG_LOD_DIRTY` using AABB
+/// localization on LOD>0 ancestors plus DAG descent to force-admit
+/// LOD-0 leaves whose Karis-admittable ancestor was dropped.
+///
+/// Algorithm:
+/// 1. **Seeds** — brush-touched LOD-0 clusters are force-admitted.
+/// 2. **AABB-dirty LOD>0** — any LOD>0 cluster whose object-local
+///    AABB intersects the brush AABB is marked dirty (dropped at
+///    render time). These are the would-be Karis admitters whose
+///    territory now contains stale geometry.
+/// 3. **DAG descent** — for each dirty LOD>0 cluster, walk its DAG
+///    descendants via `group_below → consumed[]` recursively. Mark
+///    every reached cluster dirty:
+///      - **LOD-0 descendants** → force-admit (correct, replaces the
+///        dropped ancestor's would-be geometry).
+///      - **LOD>0 descendants** → also drop, because at the camera
+///        distance where the original ancestor was Karis-picked, no
+///        intermediate non-dirty descendant could admit either (their
+///        `parent_err_proj` falls below threshold once the original
+///        ancestor is the Karis pick). Marking them explicitly is
+///        defensive and idempotent.
+///
+/// Why descent is required (and the earlier coverage check was wrong):
+/// when Karis would have admitted ancestor `A` at the current camera
+/// and `A` is dropped, no DAG descendant admits via Karis: the
+/// next-finer level says `parent_err_proj < threshold → parent will
+/// admit` (it would have been `A`, now dropped), and `A` itself says
+/// `drop_dirty_ancestor`. The chain unrolls down to LOD-0; only an
+/// explicit force-admit there saves us from a void. So we must
+/// force-admit every LOD-0 descendant of every dropped ancestor.
+///
+/// Locality on connected meshes: step 2 only marks LOD>0 clusters
+/// whose AABB *intersects* the brush AABB. A small brush touches a
+/// handful of clusters at each LOD; each cluster's DAG descendants
+/// are bounded by its territory (~`4^lod_level` leaves). So the
+/// total marked set scales with brush footprint, not asset size.
+///
+/// Falls back to asset-wide marking when the entry has no DAG
+/// topology (`dag_groups.is_empty()`), preserving v5-load behavior.
+///
+/// Returns the number of clusters newly flagged dirty.
+fn mark_lod_dirty_chains(
+    entry: &mut super::types::AssetEntry,
+    seeds: &[u32],
+    brush_aabb_min: Vec3,
+    brush_aabb_max: Vec3,
+) -> usize {
+    use arvx_core::mesh_cluster::{CLUSTER_FLAG_LOD_DIRTY, DAG_GROUP_NONE};
+    let cluster_count = entry.meshlet_clusters.len();
+
+    if entry.dag_groups.is_empty() {
+        // Pre-v6 asset — no DAG topology baked. Asset-wide marking
+        // preserves current behavior. Re-bake via
+        // `arvx-convert --rebuild-mesh` to migrate to v6.
+        for c in entry.meshlet_clusters.iter_mut() {
+            c.flags |= CLUSTER_FLAG_LOD_DIRTY;
+        }
+        return cluster_count;
+    }
+
+    let mut dirty = vec![false; cluster_count];
+
+    // Step 1: seed brush-touched LOD-0 clusters.
+    for &cidx in seeds {
+        if (cidx as usize) < cluster_count {
+            dirty[cidx as usize] = true;
+        }
+    }
+
+    // Step 2: LOD>0 clusters whose AABB intersects the brush AABB
+    // become dirty. Push them onto a descent stack for step 3.
+    let mut descent_stack: Vec<u32> = Vec::new();
+    for (idx, c) in entry.meshlet_clusters.iter().enumerate() {
+        if c.lod_level == 0 || dirty[idx] {
+            continue;
+        }
+        if local_aabb_intersects(c.aabb_min, c.aabb_max, brush_aabb_min, brush_aabb_max) {
+            dirty[idx] = true;
+            descent_stack.push(idx as u32);
+        }
+    }
+
+    // Step 3: descend each dirty LOD>0 via group_below.consumed[]
+    // recursively. Mark every reached cluster dirty; only LOD>0
+    // descendants need to be re-pushed for further descent (LOD-0 is
+    // a leaf in the DAG). The shared `dirty` array de-dupes work
+    // when multiple ancestors share descendants.
+    while let Some(cidx) = descent_stack.pop() {
+        let c = &entry.meshlet_clusters[cidx as usize];
+        if c.group_below_idx == DAG_GROUP_NONE {
+            continue;
+        }
+        let g = entry.dag_groups[c.group_below_idx as usize];
+        let lo = g.consumed_first as usize;
+        let hi = lo + g.consumed_count as usize;
+        for &child in &entry.dag_consumed[lo..hi] {
+            let n = child as usize;
+            if n >= cluster_count || dirty[n] {
+                continue;
+            }
+            dirty[n] = true;
+            if entry.meshlet_clusters[n].lod_level > 0 {
+                descent_stack.push(child);
+            }
+        }
+    }
+
+    // Step 4: apply dirty flags to clusters.
+    let mut marked = 0usize;
+    for (idx, c) in entry.meshlet_clusters.iter_mut().enumerate() {
+        if dirty[idx] {
+            c.flags |= CLUSTER_FLAG_LOD_DIRTY;
+            marked += 1;
+        }
+    }
+    marked
+}
+
+impl ArvxSceneManager {
+    /// Apply one sculpt brush stamp against an asset's geometry.
+    ///
+    /// Returns `None` when:
+    /// * The handle is unknown.
+    /// * The brush footprint produces no edits (outside the asset or
+    ///   over empty / interior cells only).
+    ///
+    /// `brush_radius` is in world-space units. Object-local scale is
+    /// applied via `entity_world.to_scale_rotation_translation()` (mean
+    /// of the three scale axes, matching paint's convention).
+    ///
+    /// **Phase A:** does not mutate the octree, does not bump the
+    /// geometry epoch. Carve only — Raise edits are skipped and counted.
+    /// The caller is responsible for inserting `removed_leaf_attr_ids`
+    /// into the per-entity [`arvx_core::SculptOverlay`].
+    pub fn apply_sculpt_brush(
+        &mut self,
+        handle: AssetHandle,
+        world_pos: Vec3,
+        entity_world: Affine3A,
+        brush_radius: f32,
+        falloff_curve: arvx_core::sculpt::FalloffCurve,
+        strength: f32,
+        stroke_seq: u64,
+        mode: BrushMode,
+        material: u16,
+    ) -> Option<SculptApplyResult> {
+        // Detect stroke transition. The editor increments stroke_seq
+        // on every LMB-down — when we observe a different value the
+        // previous stroke has ended and the per-stroke "already
+        // touched" cell set should reset. Within a stroke, all stamps
+        // share the same stroke_seq and we keep building up the set
+        // so the no-accumulate rule applies across them.
+        if stroke_seq != self.sculpt_stroke_seq {
+            self.sculpt_stroke_seq = stroke_seq;
+            self.sculpt_stroke_touched.clear();
+            // First stamp of a new stroke has no previous center — the
+            // kernel evaluates a degenerate capsule (sphere) by
+            // setting `segment_start == center` below.
+            self.sculpt_stroke_prev_center = None;
+        }
+        if brush_radius <= 0.0 {
+            return None;
+        }
+        let _sculpt_t0 = std::time::Instant::now();
+        // D0 per-phase timings. Each `_p*` records the wall-clock cost
+        // of one internal step of `apply_sculpt_brush`. Emitted in the
+        // existing `[sculpt] stamp …` log line at the end so users
+        // (and the perf-debt drain plan) can see where the budget
+        // goes without enabling a separate flag. Cost: ~9 Instant::now
+        // calls per stamp — sub-microsecond noise.
+        let mut _p_resolve_ms = 0.0;
+        let mut _p_compute_edits_ms = 0.0;
+        let mut _p_resolve_removes_ms = 0.0;
+        let mut _p_apply_delta_ms = 0.0;
+        let mut _p_octree_sync_ms = 0.0;
+        let mut _p_leaf_attr_ms = 0.0;
+        let mut _p_rebuild_clusters_ms = 0.0;
+        let _ph_t0 = std::time::Instant::now();
+
+        // ── 1. Resolve grid coords ──────────────────────────────────
+        let (op, depth, base_vs) = {
+            let entry = self.asset_cache.get(handle)?;
+            let depth = entry.spatial_handle.depth;
+            let base_vs = entry.spatial_handle.base_voxel_size;
+            let extent = (1u32 << depth) as f32 * base_vs;
+            let aabb_center = (entry.aabb.min + entry.aabb.max) * 0.5;
+            let asset_grid_origin = aabb_center - Vec3::splat(extent * 0.5);
+
+            let inv_world = entity_world.inverse();
+            let center_local = inv_world.transform_point3(world_pos);
+            // Mean-of-axes scale, same as paint. Accurate enough; the
+            // user can compensate via the radius slider.
+            let (scale, _, _) = entity_world.to_scale_rotation_translation();
+            let mean_scale = (scale.x.abs() + scale.y.abs() + scale.z.abs()) / 3.0;
+            let local_radius = brush_radius / mean_scale.max(1e-6);
+
+            // Object-local → grid coords. `base_vs` is the finest-voxel
+            // size, which matches the kernel's unit convention.
+            let center_grid = (center_local - asset_grid_origin) / base_vs;
+            let radius_grid = local_radius / base_vs;
+
+            // Capsule sweep: stamps after the first in a stroke
+            // carry the previous stamp's center, so the kernel
+            // evaluates cells against the swept volume from
+            // `segment_start` to `center`. Without this, two
+            // adjacent stamps' spheres produce a visible
+            // meeting-circle crease on the carved surface
+            // (Deflate drag showed this most clearly). The first
+            // stamp of a stroke degenerates to a sphere because
+            // `segment_start == center`.
+            let segment_start = self
+                .sculpt_stroke_prev_center
+                .unwrap_or(center_grid);
+            let op = BrushOp {
+                center: center_grid,
+                segment_start,
+                radius: radius_grid,
+                falloff_curve,
+                strength,
+                mode,
+                material,
+            };
+            (op, depth, base_vs)
+        };
+        _p_resolve_ms = _ph_t0.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t1 = std::time::Instant::now();
+
+        // ── 2. Compute edit list against current octree + brick pool. ─
+        //
+        // For Inflate / Deflate, the kernel uses `sculpt_stroke_touched`
+        // as a "transit" set: cells already edited this stroke don't
+        // seed brushfire at dist=0, but brushfire propagates THROUGH
+        // them. The effect is two-fold: (1) total stroke depth is
+        // capped at one `target_thickness` layer from the ORIGINAL
+        // pre-stroke surface — fixes the "Deflate keeps digging the
+        // longer I hold the mouse" report; and (2) earlier-stamp
+        // cavity walls become reachable, so stamp N's brushfire
+        // cleans up stamp N-1's walls and the channel comes out
+        // smooth. No per-edit filter is needed downstream — the
+        // brushfire seed restriction enforces the invariant.
+        // Carve / Raise ignore the closure (they don't use brushfire).
+        let touched = &self.sculpt_stroke_touched;
+        let delta = {
+            let entry = self.asset_cache.get(handle)?;
+            compute_brush_edits_in_stroke(
+                &entry.cpu_octree,
+                &self.brick_pool,
+                self.leaf_attr_pool.as_slice(),
+                op,
+                |c| touched.contains(&c),
+            )
+        };
+        _p_compute_edits_ms = _ph_t1.elapsed().as_secs_f64() * 1000.0;
+        if delta.is_empty() {
+            return None;
+        }
+        // Record every coord this stamp edited so the next stamp in
+        // the same stroke sees it as a transit cell (or, for Carve /
+        // Raise, so future diagnostic queries can list the stroke
+        // footprint). Cheap: amortises across the stamp's edit count
+        // which is already much larger than the hash cost.
+        for edit in &delta.edits {
+            self.sculpt_stroke_touched.insert(edit.coord);
+        }
+        let _ph_t2 = std::time::Instant::now();
+
+        // ── 3. Resolve every Remove edit's grid coord → leaf_attr_id.
+        //
+        // Octree lookup returns the raw node value at the finest grid
+        // coord. For LEAF nodes we just unpack the slot id. For BRICK
+        // nodes we follow through into the brick pool — the cell's
+        // value is either a slot id, `BRICK_EMPTY`, or `BRICK_INTERIOR`
+        // (mesh-import bulk marker). Empty / interior cells get
+        // filtered out here so the overlay only carries real
+        // surface-leaf slots.
+        let mut removed: Vec<u32> = Vec::new();
+        let mut leaves_add_skipped: usize = 0;
+        for edit in &delta.edits {
+            match edit.op {
+                LeafEditOp::Remove => {
+                    let entry = self.asset_cache.get(handle)?;
+                    let Some(node) = entry.cpu_octree.lookup(edit.coord) else {
+                        continue;
+                    };
+                    if is_leaf(node) {
+                        removed.push(leaf_slot(node));
+                    } else if is_brick(node) {
+                        let bid = brick_id(node);
+                        let cx = edit.coord.x & (BRICK_DIM - 1);
+                        let cy = edit.coord.y & (BRICK_DIM - 1);
+                        let cz = edit.coord.z & (BRICK_DIM - 1);
+                        let cell = self.brick_pool.get_cell(bid, cx, cy, cz);
+                        if cell == BRICK_EMPTY || cell == BRICK_INTERIOR {
+                            // Brick covers this finest cell, but the
+                            // cell itself isn't a surface — nothing to
+                            // carve.
+                            continue;
+                        }
+                        removed.push(cell);
+                    }
+                    // EMPTY / INTERIOR / branch — no leaf_attr_id to
+                    // remove. The kernel shouldn't emit Remove for
+                    // those anyway, but defensive.
+                }
+                LeafEditOp::Add { .. } => {
+                    // Phase B. Counted, not applied. The editor
+                    // disables the Raise button so this path is only
+                    // reachable from tests / scripted commands.
+                    leaves_add_skipped += 1;
+                }
+                LeafEditOp::Empty | LeafEditOp::SetInterior => {
+                    // R2b kernel variants — overlay path doesn't carry
+                    // ADD info or INTERIOR bulk semantics, so these
+                    // collapse to "no-op" for the legacy overlay. The
+                    // real-geometry mutation path (R2c → apply_delta)
+                    // will handle them properly.
+                }
+                LeafEditOp::SetNormal { .. } => {
+                    // Smooth — no occupancy change, no slot to remove.
+                    // The real-geometry path consumes these via
+                    // `applied.renormalized_slots` further down.
+                }
+            }
+        }
+
+        let leaves_removed = removed.len();
+        if removed.is_empty()
+            && delta.count_added() == 0
+            && delta.count_interior() == 0
+            && delta.count_set_normal() == 0
+        {
+            return None;
+        }
+
+        // Sort + dedupe so the engine-side `insert_batch` walks the
+        // smallest set possible. The kernel emits coords in row-major
+        // order so adjacent finest-voxel cells inside one brick share
+        // the brick's slot ids for at-most a handful of entries —
+        // sorting collapses the obvious duplicates.
+        removed.sort_unstable();
+        removed.dedup();
+        _p_resolve_removes_ms = _ph_t2.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t3 = std::time::Instant::now();
+
+        // ── 4. Real-geometry mutation (Phase B R2c). ────────────────
+        //
+        // Mutate the asset's octree + the scene's brick / leaf_attr
+        // pools to reflect the delta. The overlay still rides through
+        // `removed_leaf_attr_ids` for fragment-discard parity until
+        // R4 (per-cluster re-extract) makes the mutation directly
+        // visible by regenerating the mesh.
+        //
+        // Borrows: we split `self` field-by-field (`asset_cache`,
+        // `brick_pool`, `leaf_attr_pool`) so `alloc_slot` can call
+        // back into the leaf_attr_pool while apply_delta holds
+        // mutable borrows of the octree + brick pool.
+        let applied = {
+            let Self {
+                asset_cache,
+                brick_pool,
+                leaf_attr_pool,
+                ..
+            } = self;
+            let entry = asset_cache.get_mut(handle)?;
+            let octree = &mut entry.cpu_octree;
+            apply_delta(
+                octree,
+                brick_pool,
+                &delta,
+                || {
+                    leaf_attr_pool
+                        .allocate()
+                        .expect("leaf_attr_pool exhausted during sculpt apply")
+                },
+            )
+        };
+        _p_apply_delta_ms = _ph_t3.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t4 = std::time::Instant::now();
+
+        // ── 4b. Sync cpu_octree mutations into OctreeGpu's packed buffer.
+        //
+        // Closes the latent CPU↔GPU sync bug: `apply_delta` mutated
+        // `entry.cpu_octree.nodes`, but without this step those changes
+        // never reach the packed buffer that `upload_geometry` ships.
+        //
+        // Growth handling: every drag stamp typically subdivides a few
+        // empty/interior terminators (+200-400 nodes on splat5). D8's
+        // slot-slack lets us extend `handle.len` in place without a
+        // re-allocation — the mutation log already records the
+        // appended slots, so applying it after `try_extend_in_slack`
+        // populates the slack region. We only fall back to dealloc +
+        // allocate_with_slack when the slack itself is exhausted; the
+        // re-allocation then reserves more headroom for future stamps.
+        {
+            let entry = self.asset_cache.get_mut(handle)?;
+            let spatial = entry.spatial_handle;
+            let new_node_count = entry.cpu_octree.node_count() as u32;
+            if applied.octree_log.grew(new_node_count) {
+                let extended = self.octree.try_extend_in_slack(&spatial, new_node_count);
+                match extended {
+                    Some(new_handle) => {
+                        let entry = self.asset_cache.get_mut(handle)?;
+                        entry.spatial_handle = new_handle;
+                        self.octree.apply_mutation_log(&new_handle, &applied.octree_log);
+                    }
+                    None => {
+                        eprintln!(
+                            "[sculpt] octree slack exhausted ({} → {} nodes) — re-allocating slot",
+                            applied.octree_log.initial_node_count, new_node_count,
+                        );
+                        self.octree.deallocate(spatial);
+                        let entry = self.asset_cache.get_mut(handle)?;
+                        let new_handle = self.octree.allocate_with_slack(&entry.cpu_octree, 1.5);
+                        let entry = self.asset_cache.get_mut(handle)?;
+                        entry.spatial_handle = new_handle;
+                    }
+                }
+            } else if !applied.octree_log.is_empty() {
+                self.octree.apply_mutation_log(&spatial, &applied.octree_log);
+            }
+        }
+        _p_octree_sync_ms = _ph_t4.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t5 = std::time::Instant::now();
+
+        // Write LeafAttrs for newly-allocated slots. The brush picks
+        // the material; the normal is the post-stamp 6-tap gradient
+        // computed in apply_delta.
+        for (slot, attrs) in &applied.allocated_slots {
+            *self.leaf_attr_pool.get_mut(*slot) = attrs.to_leaf_attr();
+            // Default color (0) — sculpt-added cells fall back to the
+            // material's base_color, same convention as paint's "no
+            // override".
+            self.leaf_attr_pool.set_color(*slot, 0);
+        }
+        // Renormalize pre-existing neighbour slots whose post-stamp
+        // gradient differs from the stored normal. Patches only the
+        // normal_oct field; material/secondary_blend stay untouched.
+        // Without this, a Raise refilling a prior Carve cavity leaves
+        // the cavity-wall slots with their original inward-pointing
+        // normals — they back-face-cull from the new dome and half
+        // the surface vanishes.
+        for (slot, normal) in &applied.renormalized_slots {
+            let attr = self.leaf_attr_pool.get_mut(*slot);
+            attr.normal_oct = arvx_core::pack_oct(*normal);
+        }
+        // Release slots vacated by Remove / displaced-by-Add edits.
+        // Done one-at-a-time since the slots aren't contiguous; the
+        // pool's free-list absorbs them.
+        for slot in &applied.freed_slots {
+            self.leaf_attr_pool.deallocate_range(*slot, 1);
+        }
+        _p_leaf_attr_ms = _ph_t5.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t6 = std::time::Instant::now();
+
+        // ── 5. Mesh re-extract (Phase B R4-proper). ─────────────────
+        //
+        // Per-cluster region re-extract: only clusters whose grid AABB
+        // intersects the brush get re-extracted; the rest keep their
+        // existing `ClusterMesh` entries. Final flatten rebuilds the
+        // flat VBO/IBO for upload (R4e will move this into the
+        // renderer to drop the cached flat copies).
+        //
+        // Fallback to full re-extract when no clusters intersect AND
+        // the delta actually mutated geometry — the brush landed in a
+        // region no cluster currently owns, but new cells DID get
+        // created in the octree (Raise into far empty space). The
+        // full re-extract picks them up; cluster set then grows by
+        // whatever meshopt produces. R5 will handle this case more
+        // gracefully via re-clustering at idle.
+        let used_per_cluster = self.rebuild_dirty_clusters(handle, &op);
+        if !used_per_cluster {
+            // Per-cluster path didn't fire (empty dirty set or asset
+            // was empty before); fall back to full re-extract.
+            self.rebuild_asset_mesh(handle);
+        }
+        _p_rebuild_clusters_ms = _ph_t6.elapsed().as_secs_f64() * 1000.0;
+
+        // Bump the geometry epoch so the renderer re-uploads the
+        // mutated octree / brick / leaf_attr buffers AND the new
+        // mesh data on the next pre-frame pass.
+        self.bump_geometry_epoch();
+
+        // D0 — per-phase breakdown appended to the existing log line.
+        // The seven phases cover every step from grid-coord resolve
+        // through the per-cluster mesh patch; their sum should match
+        // `total` to within a few µs (Instant::now overhead). The
+        // dominant phase identifies the next drain-optimization target.
+        //
+        // D5.a — apply_delta sub-breakdown follows: per-op-type loop
+        // wall-clock from the three split passes in `apply_delta`,
+        // plus the mutation-log setup/take costs. ns/op figures
+        // surface which op-type to optimize first.
+        //
+        // D9.a — compute_brush_edits sub-breakdown: counters surface
+        // how much of the `edits` phase budget went to the outer
+        // AABB walk vs cell_state octree lookups vs neighbor probes.
+        let ad_timing = applied.timing;
+        let ce_timing = delta.timing;
+        let ns_per = |t_ns: u64, n: u32| if n == 0 { 0.0 } else { t_ns as f64 / n as f64 };
+        eprintln!(
+            "[sculpt] stamp handle={:?} mode={:?} edits={} removed={} \
+             applied(adds={} freed={} interior={}) (depth={}, base_vs={:.5}) total={:.2}ms \
+             [phases: resolve={:.2} edits={:.2} resolve_rm={:.2} apply_delta={:.2} \
+             octree_sync={:.2} leaf_attr={:.2} rebuild_clusters={:.2}] \
+             [apply_delta_sub: setup={:.3} empty={:.3}/{:.0}ns interior={:.3}/{:.0}ns add={:.3}/{:.0}ns take={:.3}] \
+             [edits_sub: aabb={} sphere={} state={} neighbor={} {:.0}ns/state]",
+            handle, mode, delta.len(), removed.len(),
+            applied.allocated_slots.len(), applied.freed_slots.len(),
+            delta.count_interior(), depth, base_vs,
+            _sculpt_t0.elapsed().as_secs_f64() * 1000.0,
+            _p_resolve_ms, _p_compute_edits_ms, _p_resolve_removes_ms,
+            _p_apply_delta_ms, _p_octree_sync_ms, _p_leaf_attr_ms,
+            _p_rebuild_clusters_ms,
+            ad_timing.t_log_setup_ns as f64 / 1.0e6,
+            ad_timing.t_loop_empty_ns as f64 / 1.0e6,
+            ns_per(ad_timing.t_loop_empty_ns, ad_timing.n_empty),
+            ad_timing.t_loop_interior_ns as f64 / 1.0e6,
+            ns_per(ad_timing.t_loop_interior_ns, ad_timing.n_interior),
+            ad_timing.t_loop_add_ns as f64 / 1.0e6,
+            ns_per(ad_timing.t_loop_add_ns, ad_timing.n_add),
+            ad_timing.t_log_take_ns as f64 / 1.0e6,
+            ce_timing.n_aabb_cells,
+            ce_timing.n_inside_sphere,
+            ce_timing.n_cell_state_calls + ce_timing.n_neighbor_calls * 6,
+            ce_timing.n_neighbor_calls,
+            // Total cell_state-equivalent calls (1 per inside-sphere cell
+            // + 6 per neighbor probe) divided into the whole compute time.
+            ns_per(
+                ce_timing.t_total_ns,
+                ce_timing.n_cell_state_calls + ce_timing.n_neighbor_calls * 6,
+            ),
+        );
+
+        let allocated_leaf_attr_ids: Vec<u32> =
+            applied.allocated_slots.iter().map(|(s, _)| *s).collect();
+        // Record this stamp's center so the NEXT stamp in the stroke
+        // can sweep a capsule from here. Recorded only after the stamp
+        // has successfully applied — a no-op stamp (out of bounds,
+        // empty footprint) shouldn't advance the segment.
+        self.sculpt_stroke_prev_center = Some(op.center);
+        Some(SculptApplyResult {
+            removed_leaf_attr_ids: removed,
+            allocated_leaf_attr_ids,
+            leaves_removed,
+            leaves_add_skipped,
+        })
+    }
+
+    /// Find every LOD-0 cluster on an asset whose grid-coord AABB
+    /// overlaps the brush's grid-coord AABB.
+    ///
+    /// **Phase B R3** — the per-cluster re-extract path's dirty-cluster
+    /// query. Inputs are integer grid coords in the same convention as
+    /// [`arvx_core::sculpt::compute_brush_edits`]: `brush_lo .. brush_hi`
+    /// is half-open, the brush walks cells in `lo.x..hi.x` etc. Cluster
+    /// AABBs are derived on the fly from each cluster's object-local
+    /// float AABB via [`cluster_grid_aabb`] (1-voxel pad on each side
+    /// so SN-cube neighbor cells are conservatively included).
+    ///
+    /// Returns LOD-0 (`lod_level == 0`) cluster ids only. Coarser
+    /// levels regenerate via the R5 lazy-ancestor path when their
+    /// children change. Order is ascending cluster id.
+    ///
+    /// Returns an empty vec for unknown handles, an empty cluster
+    /// table, or zero overlap. ~50 µs on a 46 k-cluster asset; no
+    /// allocation reuse — caller owns the returned Vec.
+    pub fn clusters_in_brush_grid_aabb(
+        &self,
+        handle: AssetHandle,
+        brush_lo: IVec3,
+        brush_hi: IVec3,
+    ) -> Vec<u32> {
+        let Some(entry) = self.asset_cache.get(handle) else {
+            return Vec::new();
+        };
+        if entry.meshlet_clusters.is_empty() {
+            return Vec::new();
+        }
+        // Empty brush AABB → no clusters can intersect.
+        if brush_lo.x >= brush_hi.x || brush_lo.y >= brush_hi.y || brush_lo.z >= brush_hi.z {
+            return Vec::new();
+        }
+        let depth = entry.spatial_handle.depth;
+        let base_vs = entry.spatial_handle.base_voxel_size;
+        let extent = (1u32 << depth) as f32 * base_vs;
+        let aabb_center = (entry.aabb.min + entry.aabb.max) * 0.5;
+        let grid_origin = aabb_center - Vec3::splat(extent * 0.5);
+
+        // **D7 — spatial-indexed query.** Walk the bucket grid for
+        // candidate cluster ids touching the brush, then filter each
+        // candidate with the exact `cluster_overlaps_brush_grid_aabb`
+        // test. On splat5 elephant the linear scan ran in ~1.2 ms
+        // (104 k clusters × ~12 ns); the indexed path visits a few
+        // hundred candidates and finishes in <100 µs.
+        let candidates = entry.cluster_spatial_index.query(brush_lo, brush_hi);
+        let mut dirty = Vec::with_capacity(candidates.len());
+        for cid in candidates {
+            let c = &entry.meshlet_clusters[cid as usize];
+            // LOD filter — index only stores LOD-0, but a future
+            // change might let an entry slip through; keep the
+            // check for safety.
+            if c.lod_level != 0 {
+                continue;
+            }
+            let (cmin, cmax) = cluster_grid_aabb(c, grid_origin, base_vs);
+            if cluster_overlaps_brush_grid_aabb(cmin, cmax, brush_lo, brush_hi) {
+                dirty.push(cid);
+            }
+        }
+        dirty
+    }
+
+    /// Per-stamp mesh patch — **filter dirty clusters + extract brush
+    /// region once** (Phase B R4c V2).
+    ///
+    /// The earlier "re-extract each dirty cluster's full grid AABB"
+    /// path was correct but produced ~3 000 tris per cluster on
+    /// splat5-style ground-plane assets (cluster AABBs are far bigger
+    /// than the brush sphere). With 80+ dirty clusters per stamp the
+    /// mesh grew ~25 ×/stamp unboundedly, and the per-cluster extract
+    /// loop ran 5 s/stamp.
+    ///
+    /// V2 flips the model: each dirty cluster's existing triangles get
+    /// *filtered* (any tri whose vertex sits inside the brush sphere
+    /// is dropped, the rest are kept); the brush region's new surface
+    /// is then re-extracted **once** and appended as a fresh LOD-0
+    /// cluster. Per-stamp growth is bounded by the brush volume, not
+    /// the dirty-cluster footprint.
+    ///
+    /// **Boundary seam.** Pre-brush SN-cube vertex positions (centroid
+    /// of edge crossings against the OLD occupancy field) differ
+    /// sub-voxel from post-brush positions at the same cube. The
+    /// filter/keep boundary on the *dirty cluster* side uses pre-brush
+    /// verts; the new brush-region patch uses post-brush verts. A
+    /// thin band at the brush-sphere boundary may show a tiny seam.
+    /// Acceptable for V1; proper stitching is an R5 follow-up.
+    ///
+    /// Returns `true` when the V2 path fired; `false` when the dirty
+    /// set is empty or the asset has no mesh — caller falls back to
+    /// the full re-extract path.
+    fn rebuild_dirty_clusters(&mut self, handle: AssetHandle, op: &BrushOp) -> bool {
+        let t0 = std::time::Instant::now();
+        // D0 per-phase timings inside the cluster-patch path. Mirrors
+        // the apply_sculpt_brush phase timings; written into the
+        // `[sculpt] V2 patch` log line at the end.
+        let mut _p_setup_ms = 0.0;
+        let mut _p_dirty_query_ms = 0.0;
+        let mut _p_filter_ms = 0.0;
+        let mut _p_extract_ms = 0.0;
+        let mut _p_append_patch_ms = 0.0;
+        let mut _p_cc_walk_ms = 0.0;
+        let _ph_t0 = t0;
+
+        let (depth, base_vs, grid_origin, brush_lo, brush_hi,
+             brush_center_local, brush_radius_local, brush_radius_sq) = {
+            let Some(entry) = self.asset_cache.get(handle) else { return false; };
+            if entry.meshlet_clusters.is_empty() {
+                return false;
+            }
+            let depth = entry.spatial_handle.depth;
+            let base_vs = entry.spatial_handle.base_voxel_size;
+            let extent_f = (1u32 << depth) as f32 * base_vs;
+            let aabb_center = (entry.aabb.min + entry.aabb.max) * 0.5;
+            let grid_origin = aabb_center - Vec3::splat(extent_f * 0.5);
+
+            let extent = 1u32 << depth;
+            let (lo, hi) = brush_cell_range(op, extent);
+            let brush_lo = IVec3::new(lo.x as i32, lo.y as i32, lo.z as i32);
+            let brush_hi = IVec3::new(hi.x as i32, hi.y as i32, hi.z as i32);
+
+            // Brush sphere in **object-local** space (same coords as
+            // `MeshVertex::local_pos`). `op.center` is in finest-grid
+            // units; convert to object-local via grid_origin + grid * vs.
+            let brush_center_local = grid_origin + op.center * base_vs;
+            let brush_radius_local = op.radius * base_vs;
+            let brush_radius_sq = brush_radius_local * brush_radius_local;
+
+            (depth, base_vs, grid_origin, brush_lo, brush_hi,
+             brush_center_local, brush_radius_local, brush_radius_sq)
+        };
+
+        if brush_lo.x >= brush_hi.x || brush_lo.y >= brush_hi.y || brush_lo.z >= brush_hi.z {
+            return false;
+        }
+        _p_setup_ms = _ph_t0.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t1 = std::time::Instant::now();
+
+        let dirty = self.clusters_in_brush_grid_aabb(handle, brush_lo, brush_hi);
+        _p_dirty_query_ms = _ph_t1.elapsed().as_secs_f64() * 1000.0;
+        if dirty.is_empty() {
+            return false;
+        }
+        let _ph_t2 = std::time::Instant::now();
+
+        // ── Phase 1: filter each dirty cluster's tris ─────────────────
+        //
+        // **Carve and Deflate filter; Raise and Inflate skip.** The
+        // filter drops every tri with at least one vertex inside the
+        // brush sphere — correct when those cells are being emptied
+        // (the original surface is gone) and safe for cells inside
+        // the sphere that *aren't* emptied because the patch in
+        // Phase 3 re-extracts the whole region and SN re-emits their
+        // surface tris.
+        //
+        // For Raise / Inflate we skip the filter entirely: neither
+        // removes any SOLID / INTERIOR cells, so the original ground
+        // geometry under the brush is still a valid post-stamp
+        // surface. The patch contributes the new dome / puffed layer
+        // *on top of* the original geometry; the z-buffer handles
+        // the visual overlap. Pre-fix, an unconditional filter
+        // deleted the ground tris under a Raise stamp, leaving a
+        // visible hole beneath the dome (the post-stamp SN
+        // re-extract can't replace them — SOLID↔INTERIOR cubes have
+        // no EMPTY corner and emit no surface).
+        //
+        // The Deflate-specific subtlety: the kernel only erodes a
+        // falloff-shaped region inside the brush sphere, so cells
+        // at the brush rim (target_thickness ≈ 0) keep their pre-
+        // stamp Solid state. Filtering drops their tris too — that's
+        // OK because those cells *still* have an Empty neighbour
+        // post-stamp (the cells above them haven't changed), so SN
+        // re-emits their tris in the patch. Without filtering Deflate
+        // the original tris in the eroded region survive and z-fight
+        // with the new cavity-wall tris from the patch, producing
+        // the "scattered cyan over original surface" artifact users
+        // saw before this fix.
+        //
+        // Walk each cluster's existing tris; keep only those with ALL
+        // three verts strictly outside the brush sphere. Write the kept
+        // indices BACK INTO the cluster's existing slot (in-place) and
+        // return the unused tail of that slot to the slab allocator's
+        // free list. Old behaviour was a tail-append that orphaned the
+        // entire pre-filter range — every stamp grew `mesh_indices`
+        // monotonically until the GPU buffer hit `max_buffer_size`.
+        // See `project_sculpt_mesh_indices_slab_allocator`.
+        //
+        // Reading `mesh_vertices[idx]` is safe alongside the in-place
+        // index writes: the per-cluster filter is read-only on
+        // `mesh_indices` and the writes happen in a sequential merge
+        // step below.
+        //
+        // **D1 — cluster-AABB → brush-sphere rejection.** `clusters_in_
+        // brush_grid_aabb` returns every LOD-0 cluster whose grid AABB
+        // overlaps the brush AABB. A box-vs-box test admits clusters
+        // whose AABB corners touch the brush box but whose closest
+        // point to the brush *sphere* center is still outside the
+        // sphere — every triangle in those clusters would survive the
+        // per-tri test below. Pre-D1 the loop ran the per-tri test
+        // anyway: 80+ clusters × ~3000 tris × 3 length_squared = ~700k
+        // float ops/stamp on splat5 elephant. D1 short-circuits each
+        // sphere-outside cluster to a single `extend_from_slice` of
+        // its original indices — saves the per-tri loop entirely
+        // for those clusters. Sphere-inside clusters still run the
+        // per-tri test (some of their tris may be inside the sphere).
+        // D2 — parallelize the filter across dirty clusters.
+        //
+        // Each cluster's tri filter is independent: it reads its own
+        // slice of `mesh_indices` + indexed `mesh_vertices`, produces
+        // a `Vec<u32>` of kept indices. Step 1 fans this out across
+        // rayon's pool; step 2 walks the results in-order and appends
+        // each kept vec to the tail of `mesh_indices`, assigning new
+        // `index_offset` / `index_count` on the cluster.
+        //
+        // Order preservation: rayon's `into_par_iter().map(...).collect()`
+        // preserves input order, so the sequential merge below applies
+        // results in the same order the pre-D2 serial loop did.
+        //
+        // The merge can't be parallelized — it mutates a single
+        // `mesh_indices` Vec and each step's `new_offset` depends on
+        // the previous step's growth. That's fine: the per-cluster
+        // tri filter dominates wall-clock by ~3 orders of magnitude
+        // over the `extend_from_slice` tail append.
+        use rayon::prelude::*;
+
+        // D1 telemetry — atomic so each rayon worker can bump it
+        // without contention concerns.
+        let d1_counter = std::sync::atomic::AtomicUsize::new(0);
+
+        // Both Carve and Deflate remove cells; the filter is correct
+        // for them. Raise and Inflate add cells without removing any,
+        // so their original tris stay valid: skip the filter entirely
+        // and leave every cluster's slot untouched. Slab allocator
+        // bonus — no per-cluster work, no IBO writes, no dirty marks.
+        // Smooth joins the filter side because its patch in Phase 3
+        // re-extracts every brush-region tri with the *current*
+        // (just-updated) LeafAttrPool normals. Without the filter the
+        // original cluster's tris stay in place with their stale
+        // normals and the patch's updated normals end up rendered on
+        // top of (or instead of) them — the user-visible symptom is
+        // "Smooth does nothing". Carve and Deflate already need the
+        // same drop-and-replace dance; Smooth shares the mechanism
+        // without changing occupancy.
+        let needs_filter =
+            matches!(op.mode, BrushMode::Carve | BrushMode::Deflate | BrushMode::Smooth);
+        let results: Vec<(u32, Vec<u32>)> = if needs_filter {
+            let Some(entry) = self.asset_cache.get(handle) else { return false; };
+            let clusters = &entry.meshlet_clusters;
+            let indices = &entry.mesh_indices;
+            let verts = &entry.mesh_vertices;
+            dirty
+                .par_iter()
+                .filter_map(|&cid| {
+                    let c = &clusters[cid as usize];
+                    let start = c.index_offset as usize;
+                    let count = c.index_count as usize;
+                    let cluster_aabb_min = Vec3::from(c.aabb_min);
+                    let cluster_aabb_max = Vec3::from(c.aabb_max);
+
+                    // Sphere-AABB rejection (D1): closest point on
+                    // the cluster's AABB to the brush center. If it's
+                    // outside the brush sphere, no tri in this
+                    // cluster can have a vertex inside — leave the
+                    // cluster's slot untouched.
+                    let closest = brush_center_local
+                        .clamp(cluster_aabb_min, cluster_aabb_max);
+                    let aabb_dist_sq = (closest - brush_center_local).length_squared();
+                    if aabb_dist_sq > brush_radius_sq {
+                        d1_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return None;
+                    }
+
+                    let mut out = Vec::with_capacity(count);
+                    for tri_start in (start..start + count).step_by(3) {
+                        let i0 = indices[tri_start];
+                        let i1 = indices[tri_start + 1];
+                        let i2 = indices[tri_start + 2];
+                        let p0 = Vec3::from(verts[i0 as usize].local_pos);
+                        let p1 = Vec3::from(verts[i1 as usize].local_pos);
+                        let p2 = Vec3::from(verts[i2 as usize].local_pos);
+                        let d0 = (p0 - brush_center_local).length_squared();
+                        let d1 = (p1 - brush_center_local).length_squared();
+                        let d2 = (p2 - brush_center_local).length_squared();
+                        if d0 > brush_radius_sq
+                            && d1 > brush_radius_sq
+                            && d2 > brush_radius_sq
+                        {
+                            out.push(i0);
+                            out.push(i1);
+                            out.push(i2);
+                        }
+                    }
+                    Some((cid, out))
+                })
+                .collect()
+        } else {
+            // Raise / Inflate: nothing to filter. The atomic counter
+            // would normally fire once per cluster; bump it by the full
+            // dirty set so the `[sculpt] V2 patch` log line stays
+            // truthful about how many clusters short-circuited.
+            d1_counter.fetch_add(dirty.len(), std::sync::atomic::Ordering::Relaxed);
+            Vec::new()
+        };
+        let d1_clusters_sphere_outside =
+            d1_counter.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Sequential merge — write each cluster's kept indices BACK
+        // INTO its original slot, then return the freed tail to the
+        // slab allocator. The kept list is a strict subset of the
+        // original tris (filter only drops), so it always fits in the
+        // pre-filter range `[index_offset, index_offset + index_count)`.
+        let mut total_kept_tris = 0usize;
+        let mut total_dropped_tris = 0usize;
+        {
+            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
+            for (cid, kept) in results {
+                let old_offset = entry.meshlet_clusters[cid as usize].index_offset;
+                let old_count = entry.meshlet_clusters[cid as usize].index_count;
+                let new_count = kept.len() as u32;
+                total_kept_tris += (new_count as usize) / 3;
+                total_dropped_tris += ((old_count - new_count) as usize) / 3;
+
+                // In-place write at the existing offset, then return
+                // the (potentially empty) tail to the free list.
+                if new_count > 0 {
+                    entry.mesh_indices_write_at(old_offset, &kept);
+                }
+                if new_count < old_count {
+                    entry.free_index_range(old_offset + new_count, old_count - new_count);
+                }
+                let cluster = &mut entry.meshlet_clusters[cid as usize];
+                cluster.index_count = new_count;
+                // `index_offset` stays the same — in-place write keeps
+                // the cluster anchored at its original slot.
+                // AABB stays at the cluster's pre-stamp bounds — the
+                // kept tris are a subset of the original, so they fit
+                // inside the original AABB. Shrinking is left to R5.
+            }
+        }
+
+        _p_filter_ms = _ph_t2.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t3 = std::time::Instant::now();
+
+        // ── Phase 2: extract brush region once ────────────────────────
+        //
+        // Use the region-scoped cell-map walker so we don't pay
+        // O(asset surface area) per stamp. Pad the map by +3 cells
+        // each side so SN-cube vertex builds at the boundary see all
+        // 8 corner cells in the map.
+        let cells_min = brush_lo - IVec3::splat(3);
+        let cells_max = brush_hi + IVec3::splat(3);
+        // D6.0 — split extract into collect_cell_map vs
+        // extract_mesh_region. The data-driven D6 follow-up needs to
+        // know which sub-phase dominates the 10-18 ms extract budget.
+        let _ph_t3a = std::time::Instant::now();
+        let cells = {
+            let Some(entry) = self.asset_cache.get(handle) else { return false; };
+            collect_cell_map_in_region(
+                entry.cpu_octree.as_slice(),
+                depth,
+                self.brick_pool.as_slice(),
+                cells_min,
+                cells_max,
+            )
+        };
+        let _p_collect_cells_ms = _ph_t3a.elapsed().as_secs_f64() * 1000.0;
+        let cells_count = cells.len();
+        let _ph_t3b = std::time::Instant::now();
+
+        let (brush_verts, brush_indices) = {
+            let Some(entry) = self.asset_cache.get(handle) else { return false; };
+            extract_mesh_region_from_cells_pooled(
+                &mut self.sculpt_extract_scratch,
+                &cells,
+                brush_lo,
+                brush_hi,
+                entry.cpu_octree.as_slice(),
+                depth,
+                base_vs,
+                grid_origin,
+                self.brick_pool.as_slice(),
+                self.leaf_attr_pool.as_slice(),
+                self.leaf_attr_pool.bones_as_slice(),
+            )
+        };
+        let _p_extract_mesh_ms = _ph_t3b.elapsed().as_secs_f64() * 1000.0;
+
+        _p_extract_ms = _ph_t3.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t4 = std::time::Instant::now();
+
+        // ── Phase 3: append brush region as a new LOD-0 patch cluster ─
+        if !brush_verts.is_empty() {
+            let mut patch_aabb_min = [f32::INFINITY; 3];
+            let mut patch_aabb_max = [f32::NEG_INFINITY; 3];
+            for v in &brush_verts {
+                for k in 0..3 {
+                    if v.local_pos[k] < patch_aabb_min[k] {
+                        patch_aabb_min[k] = v.local_pos[k];
+                    }
+                    if v.local_pos[k] > patch_aabb_max[k] {
+                        patch_aabb_max[k] = v.local_pos[k];
+                    }
+                }
+            }
+
+            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
+            let vertex_offset = entry.mesh_vertices.len() as u32;
+            entry.mesh_vertices.extend_from_slice(&brush_verts);
+
+            // Slab-allocate the patch's index range. If a prior stamp
+            // freed a slot ≥ this size, we reuse it (interior write);
+            // otherwise the bump pointer extends, which is the same
+            // as the pre-slab tail-append behaviour. Indices need
+            // `vertex_offset` rebased into the asset's global vertex
+            // range before writing.
+            let patch_index_count = brush_indices.len() as u32;
+            let new_index_offset = if patch_index_count > 0 {
+                let offset = entry.alloc_index_range(patch_index_count);
+                // Build the rebased indices in a temp buffer (sized
+                // for the patch — typically a few hundred), then commit
+                // them to the slab in one mark+copy.
+                let rebased: Vec<u32> = brush_indices
+                    .iter()
+                    .map(|&i| i + vertex_offset)
+                    .collect();
+                entry.mesh_indices_write_at(offset, &rebased);
+                offset
+            } else {
+                // Defensive: extractor produced verts but no tris (no
+                // SN-cube admitted any triangle this stamp). Cluster
+                // gets index_count=0 → no draw, no slab consumption.
+                0
+            };
+
+            let patch_cluster = MeshletCluster {
+                aabb_min: patch_aabb_min,
+                _pad0: 0.0,
+                aabb_max: patch_aabb_max,
+                index_offset: new_index_offset,
+                index_count: patch_index_count,
+                lod_level: 0,
+                // Patch cluster is born already-dirty so it admits
+                // unconditionally on the next render (its position
+                // wasn't in the original DAG so Karis would otherwise
+                // have nothing to project against).
+                flags: arvx_core::mesh_cluster::CLUSTER_FLAG_LOD_DIRTY,
+                cluster_error: 0.0,
+                parent_group_error: PARENT_GROUP_ERROR_ROOT,
+                // Patch cluster is appended after the bake-time DAG;
+                // it has no group on either side. CC walks from
+                // brush-touched LOD-0 clusters don't traverse through
+                // it, which is correct — the patch is standalone-dirty
+                // and force-admits unconditionally.
+                group_above_idx: arvx_core::mesh_cluster::DAG_GROUP_NONE,
+                group_below_idx: arvx_core::mesh_cluster::DAG_GROUP_NONE,
+                _pad3: 0,
+            };
+            // D7 — record the new cluster's id and insert it into
+            // the spatial index so the next stamp's `dirty_q` query
+            // finds it.
+            let patch_cluster_id = entry.meshlet_clusters.len() as u32;
+            entry.meshlet_clusters.push(patch_cluster);
+            entry.cluster_spatial_index.insert(
+                patch_cluster_id,
+                &patch_cluster,
+                grid_origin,
+                base_vs,
+            );
+        }
+
+        _p_append_patch_ms = _ph_t4.elapsed().as_secs_f64() * 1000.0;
+        let _ph_t5 = std::time::Instant::now();
+
+        // ── Phase 4: per-chain LOD_DIRTY via DAG CC walk ──────────────
+        //
+        // R4d V2 (Option A from project_sculpt_drag_pick_roundtrip):
+        // walk the bipartite cluster ↔ DAG-group graph starting from
+        // every brush-touched LOD-0 cluster, and mark every cluster
+        // it reaches with `LOD_DIRTY`. The mesh_lod_select shader's
+        // admit rule force-admits dirty LOD-0 leaves and drops dirty
+        // LOD>0 ancestors — so by marking exactly the chains in the
+        // brush footprint, we keep the un-touched portion of the
+        // asset on its normal Karis admit path (renders at coarse
+        // LOD, ~188 fps) instead of the asset-wide LOD-0 clamp that
+        // R4d V1 used (~44 fps on the elephant).
+        //
+        // Correctness of the walk: the bake-time DAG records, per
+        // cluster, `group_above_idx` (the group that consumed it as
+        // a child) and `group_below_idx` (the group that produced it
+        // as a parent). For each visited cluster we enqueue both
+        // groups' full membership — `consumed` (siblings + further
+        // descendants via shared parents) and `produced` (parents /
+        // ancestors). Iterating to fixpoint gives the connected
+        // component containing the brush seeds. Every chain a
+        // brush-touched leaf belongs to is fully marked, so the
+        // shader's drop-ancestor + force-admit-leaf logic stays
+        // consistent within each chain (no cluster-shaped voids,
+        // which is what killed the earlier per-brush-AABB attempt
+        // in commit c577d85d).
+        //
+        // Fallback: assets baked before v6 carry an empty
+        // `dag_groups` — we can't run the CC walk without topology,
+        // so keep the asset-wide loop. Re-bake via
+        // `cargo run -p arvx-convert -- --rebuild-mesh <asset>.arvx`
+        // to migrate to v6 and unlock the per-chain narrowing.
+        // Brush AABB in object-local floats. Inflated by `base_vs` on
+        // each side so the AABB intersection check stays consistent
+        // with `clusters_in_brush_grid_aabb`'s one-cell padding on
+        // the cluster side — a brush exactly at a cluster edge still
+        // counts as overlapping.
+        let brush_aabb_min = brush_center_local - Vec3::splat(brush_radius_local + base_vs);
+        let brush_aabb_max = brush_center_local + Vec3::splat(brush_radius_local + base_vs);
+        let walk_visited_count = {
+            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
+            mark_lod_dirty_chains(entry, &dirty, brush_aabb_min, brush_aabb_max)
+        };
+        _p_cc_walk_ms = _ph_t5.elapsed().as_secs_f64() * 1000.0;
+
+        // ── Phase 4.5: compact emptied patch clusters ─────────────────
+        //
+        // Filter (Phase 1) can drop every tri in a cluster that prior
+        // stamps already partially carved — the slab allocator
+        // reclaims that cluster's index bytes, but the cluster entry
+        // itself would otherwise stay in `meshlet_clusters` with
+        // `index_count = 0` forever. After many stamps the cluster
+        // table grows without bound, the spatial index along with it,
+        // and `mesh_lod_select` walks more and more no-op entries.
+        //
+        // Compaction is patch-only: bake-time originals (id <
+        // `bake_time_cluster_count`) are referenced by
+        // `dag_consumed` / `dag_produced` and can't be relocated —
+        // they stay as zero-count tombstones. Empty patches
+        // `swap_remove` cleanly because they carry no DAG refs.
+        // Runs AFTER the CC walk so the walk's seed list (`dirty`)
+        // still indexes into the un-shifted table.
+        let compacted_patches = {
+            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
+            entry.compact_empty_patches()
+        };
+
+        // ── Phase 4.6: defrag mesh_indices when fragmentation is high ─
+        //
+        // Stage 1 (slab allocator) bounds `mesh_indices.len()` but
+        // pathological patch-size patterns can still leave a Swiss-
+        // cheese buffer that first-fit can't fully reuse. When freed
+        // bytes cross 30 % of the in-use region, walk every cluster
+        // and copy its index range into a fresh dense Vec. Every
+        // `cluster.index_offset` is rewritten; the IBO gets a full
+        // re-upload via `mesh_indices_dirty.mark_full`. Cluster
+        // table itself isn't reordered, so DAG refs and the spatial
+        // index stay valid.
+        let defrag_reclaimed_bytes = {
+            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
+            if entry.should_compact_mesh_indices() {
+                let pre_free: usize = entry
+                    .mesh_indices_free_list
+                    .iter()
+                    .map(|(_, l)| *l as usize)
+                    .sum();
+                let pre_next_free = entry.mesh_indices_next_free;
+                let pre_holes = entry.mesh_indices_free_list.len();
+                let reclaimed = entry.compact_mesh_indices();
+                eprintln!(
+                    "[sculpt] defrag mesh_indices: pre next_free={} free={} holes={} → \
+                     post next_free={} reclaimed={} B",
+                    pre_next_free,
+                    pre_free,
+                    pre_holes,
+                    entry.mesh_indices_next_free,
+                    reclaimed,
+                );
+                reclaimed
+            } else {
+                0
+            }
+        };
+
+        // ── Phase 5: refresh `mesh_lod0_index_count` + dirty flags ────
+        // The legacy direct-draw dispatch (debug-only) reads
+        // `[0..mesh_lod0_index_count)`. The active indirect-draw path
+        // ignores this and walks per-cluster offsets/counts, so the
+        // value is informational for the legacy path only. Sum across
+        // all LOD-0 cluster entries (including the new patch cluster).
+        //
+        // Mark mesh + clusters dirty so the next geometry-epoch upload
+        // loop picks this asset up and skips all the others.
+        let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
+        entry.mesh_lod0_index_count = entry
+            .meshlet_clusters
+            .iter()
+            .filter(|c| c.lod_level == 0)
+            .map(|c| c.index_count)
+            .sum();
+        entry.mesh_dirty = true;
+        entry.clusters_dirty = true;
+
+        let total_clusters = entry.meshlet_clusters.len();
+        // D0 — per-phase breakdown of rebuild_dirty_clusters. The
+        // dominant sub-phase identifies which step of the cluster
+        // patch path to target next (filter vs extract vs CC walk).
+        eprintln!(
+            "[sculpt] V2 patch: handle={:?} dirty={} (sphere_outside={}) kept_tris={} dropped_tris={} \
+             brush_patch verts={} tris={} total flat verts={} indices={} \
+             lod_dirty={}/{} ({:.0}%) compacted_patches={} defrag_reclaimed={}B ({:.2}ms) \
+             [phases: setup={:.2} dirty_q={:.2} filter={:.2} extract={:.2} (collect={:.2} cells={} mesh={:.2}) append={:.2} cc_walk={:.2}]",
+            handle,
+            dirty.len(),
+            d1_clusters_sphere_outside,
+            total_kept_tris,
+            total_dropped_tris,
+            brush_verts.len(),
+            brush_indices.len() / 3,
+            entry.mesh_vertices.len(),
+            entry.mesh_indices.len(),
+            walk_visited_count,
+            total_clusters,
+            if total_clusters > 0 {
+                100.0 * walk_visited_count as f64 / total_clusters as f64
+            } else {
+                0.0
+            },
+            compacted_patches,
+            defrag_reclaimed_bytes,
+            t0.elapsed().as_secs_f64() * 1000.0,
+            _p_setup_ms, _p_dirty_query_ms, _p_filter_ms,
+            _p_extract_ms,
+            _p_collect_cells_ms, cells_count, _p_extract_mesh_ms,
+            _p_append_patch_ms, _p_cc_walk_ms,
+        );
+
+        true
+    }
+
+    /// Re-extract the surface mesh + LOD-0 cluster table for one
+    /// asset, replacing the cached `mesh_vertices` / `mesh_indices` /
+    /// `meshlet_clusters` / `mesh_lod0_index_count`. The geometry
+    /// upload path picks up the new buffers on the next geometry
+    /// epoch.
+    ///
+    /// V1 (Phase B R4-minimal) re-extracts the **entire** asset on
+    /// every stamp. Per-cluster re-extract is the perf path the full
+    /// R4 covers; for now the cost is bounded by surface area + DAG
+    /// build at `LOD_LEVELS=1` (no multi-level simplify).
+    fn rebuild_asset_mesh(&mut self, handle: AssetHandle) {
+        let t0 = std::time::Instant::now();
+
+        // Snapshot the per-asset parameters we need to pass into
+        // `extract_surface_mesh`. We need them as owned values (not
+        // borrows of the asset entry) because the entry will be
+        // re-borrowed mutably later to write back the new mesh.
+        let Some(entry) = self.asset_cache.get(handle) else { return; };
+        let depth = entry.spatial_handle.depth;
+        let voxel_size = entry.spatial_handle.base_voxel_size;
+        let extent = (1u32 << depth) as f32 * voxel_size;
+        let aabb_center = (entry.aabb.min + entry.aabb.max) * 0.5;
+        let grid_origin = aabb_center - Vec3::splat(extent * 0.5);
+
+        let (vertices, indices_unc) = extract_surface_mesh(
+            entry.cpu_octree.as_slice(),
+            depth,
+            voxel_size,
+            grid_origin,
+            self.brick_pool.as_slice(),
+            self.leaf_attr_pool.as_slice(),
+            self.leaf_attr_pool.bones_as_slice(),
+        );
+
+        if vertices.is_empty() {
+            // Asset carved away to nothing — clear mesh state. The
+            // upload path drops the GPU buffers on empty input.
+            if let Some(entry) = self.asset_cache.get_mut(handle) {
+                entry.mesh_vertices.clear();
+                entry.mesh_indices.clear();
+                entry.meshlet_clusters.clear();
+                entry.bake_time_cluster_count = 0;
+                entry.mesh_lod0_index_count = 0;
+                // Slab allocator must reset in lockstep — the
+                // upload path uses `mesh_indices.len() == 0` to drop
+                // the GPU buffer, but the allocator state would
+                // otherwise hold stale `next_free` and free-list
+                // entries that violate the "all offsets <= len()"
+                // invariant on the next stamp.
+                entry.reset_mesh_indices_slab();
+                entry.mesh_dirty = true;
+                entry.clusters_dirty = true;
+                // D7 — spatial index must drop in lockstep with the
+                // cluster table; an empty index agrees with the empty
+                // cluster vec.
+                entry.cluster_spatial_index =
+                    super::cluster_spatial_index::ClusterSpatialIndex::new();
+            }
+            return;
+        }
+
+        // LOD_LEVELS=1: pure LOD-0 clustering, no multi-level
+        // simplification. The Karis admit rule treats every cluster
+        // as "can't go coarser" (parent_group_error = ∞), so the
+        // mesh raster pass always picks LOD-0 — full detail, no
+        // pop-in.
+        let dag = build_cluster_dag_with_levels(&vertices, &indices_unc, 1);
+        let mesh_lod0_index_count = dag.lod0_index_range.1 - dag.lod0_index_range.0;
+
+        let Some(entry) = self.asset_cache.get_mut(handle) else { return; };
+        entry.mesh_vertices = vertices;
+        entry.mesh_indices = dag.indices;
+        entry.meshlet_clusters = dag.clusters;
+        entry.bake_time_cluster_count = entry.meshlet_clusters.len() as u32;
+        entry.mesh_lod0_index_count = mesh_lod0_index_count;
+        // Full re-extract replaces every cluster + every index — slab
+        // allocator state from before the rebuild is meaningless. Reset
+        // it and mark the full new buffer dirty so the IBO upload
+        // pushes the whole new layout to the GPU.
+        entry.reset_mesh_indices_slab();
+        entry.mesh_dirty = true;
+        entry.clusters_dirty = true;
+        // D7 — full re-extract replaced every cluster; rebuild the
+        // spatial index from scratch. Grid origin matches the
+        // convention used by `clusters_in_brush_grid_aabb`.
+        entry
+            .cluster_spatial_index
+            .rebuild(&entry.meshlet_clusters, grid_origin, voxel_size);
+
+        eprintln!(
+            "[sculpt] mesh re-extract: handle={:?} verts={} indices={} clusters={} ({:.2}ms)",
+            handle,
+            entry.mesh_vertices.len(),
+            entry.mesh_indices.len(),
+            entry.meshlet_clusters.len(),
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arvx_scene_manager::types::AssetEntry;
+    use arvx_core::mesh_cluster::{DAG_GROUP_NONE, MeshletCluster, PARENT_GROUP_ERROR_ROOT};
+    use arvx_core::sparse_octree::SparseOctree;
+    use arvx_core::{Aabb, OctreeHandle};
+
+    fn cluster(
+        aabb_min: [f32; 3],
+        aabb_max: [f32; 3],
+        lod_level: u32,
+    ) -> MeshletCluster {
+        MeshletCluster {
+            aabb_min,
+            _pad0: 0.0,
+            aabb_max,
+            index_offset: 0,
+            index_count: 0,
+            lod_level,
+            flags: 0,
+            cluster_error: 0.0,
+            parent_group_error: PARENT_GROUP_ERROR_ROOT,
+            group_above_idx: DAG_GROUP_NONE,
+            group_below_idx: DAG_GROUP_NONE,
+            _pad3: 0,
+        }
+    }
+
+    /// Build a minimal AssetEntry with caller-supplied clusters and
+    /// asset bounds, sized so `grid_origin == aabb.min` and the cluster
+    /// AABB coords map 1:1 to grid coords at `base_voxel_size = 1.0`.
+    fn make_entry(
+        clusters: Vec<MeshletCluster>,
+        depth: u8,
+    ) -> AssetEntry {
+        let base_vs = 1.0_f32;
+        let extent = (1u32 << depth) as f32 * base_vs;
+        // aabb_center - extent/2 must equal Vec3::ZERO so grid coords
+        // are read directly from the cluster's float AABB.
+        let aabb = Aabb {
+            min: Vec3::ZERO,
+            max: Vec3::splat(extent),
+        };
+        // D7 — build the spatial index from the supplied clusters so
+        // `clusters_in_brush_grid_aabb` (the only consumer in tests)
+        // gets a non-empty candidate set. grid_origin = aabb_center -
+        // extent/2 = Vec3::ZERO by construction above.
+        let mut cluster_spatial_index =
+            super::super::cluster_spatial_index::ClusterSpatialIndex::new();
+        cluster_spatial_index.rebuild(&clusters, Vec3::ZERO, base_vs);
+
+        AssetEntry {
+            path: std::path::PathBuf::from("test:in-memory"),
+            refcount: 1,
+            spatial_handle: OctreeHandle {
+                root_offset: 0,
+                len: 0,
+                depth,
+                base_voxel_size: base_vs,
+            },
+            voxel_size: base_vs,
+            aabb,
+            voxel_count: 0,
+            leaf_attr_slot_start: 0,
+            leaf_attr_slot_count: 0,
+            brick_start: 0,
+            brick_count: 0,
+            skinning: None,
+            mesh_vertices: Vec::new(),
+            mesh_indices: Vec::new(),
+            mesh_indices_free_list: Vec::new(),
+            mesh_indices_next_free: 0,
+            mesh_indices_dirty: arvx_core::DirtyRanges::new(),
+            mesh_lod0_index_count: 0,
+            bake_time_cluster_count: clusters.len() as u32,
+            meshlet_clusters: clusters,
+            dag_groups: Vec::new(),
+            dag_consumed: Vec::new(),
+            dag_produced: Vec::new(),
+            cpu_octree: SparseOctree::new(depth, base_vs),
+            mesh_dirty: false,
+            clusters_dirty: false,
+            cluster_spatial_index,
+        }
+    }
+
+    #[test]
+    fn r3b_brush_overlap_returns_only_intersecting_lod0_clusters() {
+        // Three LOD-0 clusters: A near origin, B in the middle, C far.
+        // One LOD-1 cluster D that *would* overlap if it weren't filtered.
+        let clusters = vec![
+            cluster([0.0, 0.0, 0.0], [4.0, 4.0, 4.0], 0),   // A — id 0
+            cluster([10.0, 10.0, 10.0], [14.0, 14.0, 14.0], 0), // B — id 1
+            cluster([30.0, 30.0, 30.0], [40.0, 40.0, 40.0], 0), // C — id 2
+            cluster([10.0, 10.0, 10.0], [14.0, 14.0, 14.0], 1), // D — id 3 (LOD-1)
+        ];
+        let mut sm = ArvxSceneManager::new(16);
+        let handle = sm.asset_cache.insert(make_entry(clusters, 8));
+
+        // Brush centered on B's volume → only B is dirty. D matches the
+        // same AABB but is LOD-1, so it must be filtered out.
+        let lo = IVec3::splat(11);
+        let hi = IVec3::splat(13);
+        let dirty = sm.clusters_in_brush_grid_aabb(handle, lo, hi);
+        assert_eq!(dirty, vec![1], "only LOD-0 cluster B should be dirty");
+
+        // Brush straddling A and B → both LOD-0 hit. D still filtered.
+        let lo = IVec3::new(3, 3, 3);
+        let hi = IVec3::new(12, 12, 12);
+        let dirty = sm.clusters_in_brush_grid_aabb(handle, lo, hi);
+        assert_eq!(dirty, vec![0, 1]);
+
+        // Brush in empty space → no clusters.
+        let lo = IVec3::splat(50);
+        let hi = IVec3::splat(60);
+        assert!(sm.clusters_in_brush_grid_aabb(handle, lo, hi).is_empty());
+    }
+
+    #[test]
+    fn r3b_empty_brush_aabb_returns_empty() {
+        let clusters = vec![cluster([0.0, 0.0, 0.0], [4.0, 4.0, 4.0], 0)];
+        let mut sm = ArvxSceneManager::new(16);
+        let handle = sm.asset_cache.insert(make_entry(clusters, 8));
+        // hi <= lo on any axis → empty range, return empty regardless.
+        assert!(sm
+            .clusters_in_brush_grid_aabb(handle, IVec3::splat(5), IVec3::splat(5))
+            .is_empty());
+        assert!(sm
+            .clusters_in_brush_grid_aabb(handle, IVec3::new(0, 5, 0), IVec3::new(10, 5, 10))
+            .is_empty());
+    }
+
+    #[test]
+    fn r3b_unknown_handle_returns_empty() {
+        let sm = ArvxSceneManager::new(16);
+        // No assets inserted — any handle is bogus.
+        let bogus = AssetHandle::from_raw(99);
+        assert!(sm
+            .clusters_in_brush_grid_aabb(bogus, IVec3::ZERO, IVec3::splat(10))
+            .is_empty());
+    }
+
+    #[test]
+    fn r3b_empty_cluster_table_returns_empty() {
+        let mut sm = ArvxSceneManager::new(16);
+        let handle = sm.asset_cache.insert(make_entry(vec![], 8));
+        assert!(sm
+            .clusters_in_brush_grid_aabb(handle, IVec3::ZERO, IVec3::splat(10))
+            .is_empty());
+    }
+
+    /// Hand-build a small two-chain DAG and stick it onto an
+    /// `AssetEntry`, so [`mark_lod_dirty_chains`] tests can run
+    /// without invoking the full bake.
+    ///
+    /// Layout — two independent chains, each LOD-0 + LOD-1:
+    ///   chain X: c0_a, c0_b (LOD-0) →  g0  → c1_x (LOD-1)
+    ///   chain Y: c0_c, c0_d (LOD-0) →  g1  → c1_y (LOD-1)
+    /// IDs in `meshlet_clusters`: 0 = c0_a, 1 = c0_b, 2 = c0_c,
+    /// 3 = c0_d, 4 = c1_x, 5 = c1_y.
+    fn two_chain_entry() -> AssetEntry {
+        use arvx_core::mesh_lod::DagGroup;
+        let clusters = vec![
+            cluster([0.0; 3], [1.0; 3], 0),  // 0 c0_a (chain X)
+            cluster([1.0; 3], [2.0; 3], 0),  // 1 c0_b (chain X)
+            cluster([5.0; 3], [6.0; 3], 0),  // 2 c0_c (chain Y)
+            cluster([6.0; 3], [7.0; 3], 0),  // 3 c0_d (chain Y)
+            cluster([0.0; 3], [2.0; 3], 1),  // 4 c1_x (chain X)
+            cluster([5.0; 3], [7.0; 3], 1),  // 5 c1_y (chain Y)
+        ];
+        let mut entry = make_entry(clusters, 8);
+        entry.dag_groups = vec![
+            DagGroup { consumed_first: 0, consumed_count: 2, produced_first: 0, produced_count: 1 },
+            DagGroup { consumed_first: 2, consumed_count: 2, produced_first: 1, produced_count: 1 },
+        ];
+        entry.dag_consumed = vec![0, 1, 2, 3];
+        entry.dag_produced = vec![4, 5];
+        // Set per-cluster topology pointers consistent with groups.
+        entry.meshlet_clusters[0].group_above_idx = 0;
+        entry.meshlet_clusters[1].group_above_idx = 0;
+        entry.meshlet_clusters[4].group_below_idx = 0;
+        entry.meshlet_clusters[2].group_above_idx = 1;
+        entry.meshlet_clusters[3].group_above_idx = 1;
+        entry.meshlet_clusters[5].group_below_idx = 1;
+        entry
+    }
+
+    fn dirty_set(entry: &AssetEntry) -> Vec<u32> {
+        use arvx_core::mesh_cluster::CLUSTER_FLAG_LOD_DIRTY;
+        entry
+            .meshlet_clusters
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.flags & CLUSTER_FLAG_LOD_DIRTY != 0)
+            .map(|(i, _)| i as u32)
+            .collect()
+    }
+
+    /// Brush AABB covering only chain X (clusters with AABB in [0, 2]).
+    fn brush_chain_x() -> (Vec3, Vec3) {
+        (Vec3::splat(0.0), Vec3::splat(1.5))
+    }
+
+    /// Brush AABB covering both chains (spans [0, 7]).
+    fn brush_both_chains() -> (Vec3, Vec3) {
+        (Vec3::splat(0.0), Vec3::splat(7.0))
+    }
+
+    /// Brush AABB far away from every cluster (no LOD>0 will match).
+    fn brush_far_away() -> (Vec3, Vec3) {
+        (Vec3::splat(100.0), Vec3::splat(101.0))
+    }
+
+    #[test]
+    fn mark_lod_dirty_chains_narrows_to_seed_chain() {
+        // Brush covers chain X (cluster AABBs [0, 2]). Seed c0_a.
+        // Expected dirty: {c0_a (seed), c0_b (ancestor c1_x dirty →
+        // not covered), c1_x (AABB intersects brush)}. Chain Y must
+        // stay clean — its only ancestor c1_y has AABB [5,7] which
+        // doesn't intersect the brush, so c0_c / c0_d are covered.
+        let mut entry = two_chain_entry();
+        let (bmin, bmax) = brush_chain_x();
+        let marked = mark_lod_dirty_chains(&mut entry, &[0], bmin, bmax);
+        assert_eq!(marked, 3);
+        assert_eq!(dirty_set(&entry), vec![0, 1, 4]);
+    }
+
+    #[test]
+    fn mark_lod_dirty_chains_seeds_from_both_chains_mark_both() {
+        // Brush spans both chains [0, 7]. Seeds c0_a and c0_c. Both
+        // LOD-1 ancestors (c1_x, c1_y) intersect brush → dirty. Then
+        // c0_b, c0_d's only ancestor is dirty → force-admit. All 6.
+        let mut entry = two_chain_entry();
+        let (bmin, bmax) = brush_both_chains();
+        let marked = mark_lod_dirty_chains(&mut entry, &[0, 2], bmin, bmax);
+        assert_eq!(marked, 6);
+        assert_eq!(dirty_set(&entry), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn mark_lod_dirty_chains_fallback_when_dag_empty() {
+        // V5 asset with no baked DAG topology — fallback marks
+        // every cluster (preserving the R4d V1 behavior).
+        let mut entry = two_chain_entry();
+        entry.dag_groups.clear();
+        entry.dag_consumed.clear();
+        entry.dag_produced.clear();
+        for c in entry.meshlet_clusters.iter_mut() {
+            c.group_above_idx = arvx_core::mesh_cluster::DAG_GROUP_NONE;
+            c.group_below_idx = arvx_core::mesh_cluster::DAG_GROUP_NONE;
+        }
+        let (bmin, bmax) = brush_chain_x();
+        let marked = mark_lod_dirty_chains(&mut entry, &[0], bmin, bmax);
+        assert_eq!(marked, 6);
+        assert_eq!(dirty_set(&entry), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn mark_lod_dirty_chains_brush_misses_everything() {
+        // Brush far from any cluster + seeds empty. No clusters
+        // should be marked; AABB-step finds nothing, coverage check
+        // finds non-dirty ancestors for every LOD-0 leaf.
+        let mut entry = two_chain_entry();
+        let (bmin, bmax) = brush_far_away();
+        let marked = mark_lod_dirty_chains(&mut entry, &[], bmin, bmax);
+        assert_eq!(marked, 0);
+        assert!(dirty_set(&entry).is_empty());
+    }
+
+    #[test]
+    fn mark_lod_dirty_chains_handles_out_of_range_seeds() {
+        // A stale seed past the cluster table must be silently
+        // skipped — patch-cluster appends shift cluster ids and we
+        // don't want to panic.
+        let mut entry = two_chain_entry();
+        let (bmin, bmax) = brush_chain_x();
+        let marked = mark_lod_dirty_chains(&mut entry, &[0, 999], bmin, bmax);
+        assert_eq!(marked, 3);
+        assert_eq!(dirty_set(&entry), vec![0, 1, 4]);
+    }
+
+    /// Connected-DAG fixture — the worst case for the previous
+    /// symmetric CC walk. Six LOD-0 + 2 LOD-1 + 1 LOD-2 root that
+    /// covers the whole asset. Chain X: c0_a, c0_b → c1_x.
+    /// Chain Y: c0_c, c0_d → c1_y. Root: c1_x, c1_y → c2_z.
+    /// Cluster IDs: 0=c0_a, 1=c0_b, 2=c0_c, 3=c0_d, 4=c1_x, 5=c1_y, 6=c2_z.
+    fn three_lod_connected_entry() -> AssetEntry {
+        use arvx_core::mesh_lod::DagGroup;
+        let clusters = vec![
+            cluster([0.0; 3], [1.0; 3], 0),  // 0 c0_a
+            cluster([1.0; 3], [2.0; 3], 0),  // 1 c0_b
+            cluster([2.0; 3], [3.0; 3], 0),  // 2 c0_c
+            cluster([3.0; 3], [4.0; 3], 0),  // 3 c0_d
+            cluster([0.0; 3], [2.0; 3], 1),  // 4 c1_x
+            cluster([2.0; 3], [4.0; 3], 1),  // 5 c1_y
+            cluster([0.0; 3], [4.0; 3], 2),  // 6 c2_z (root, full asset)
+        ];
+        let mut entry = make_entry(clusters, 8);
+        entry.dag_groups = vec![
+            // g0: consumed [c0_a, c0_b] produced [c1_x]
+            DagGroup { consumed_first: 0, consumed_count: 2, produced_first: 0, produced_count: 1 },
+            // g1: consumed [c0_c, c0_d] produced [c1_y]
+            DagGroup { consumed_first: 2, consumed_count: 2, produced_first: 1, produced_count: 1 },
+            // g2: consumed [c1_x, c1_y] produced [c2_z]
+            DagGroup { consumed_first: 4, consumed_count: 2, produced_first: 2, produced_count: 1 },
+        ];
+        entry.dag_consumed = vec![0, 1, 2, 3, 4, 5];
+        entry.dag_produced = vec![4, 5, 6];
+        // Pointer wiring.
+        entry.meshlet_clusters[0].group_above_idx = 0;
+        entry.meshlet_clusters[1].group_above_idx = 0;
+        entry.meshlet_clusters[4].group_below_idx = 0;
+        entry.meshlet_clusters[2].group_above_idx = 1;
+        entry.meshlet_clusters[3].group_above_idx = 1;
+        entry.meshlet_clusters[5].group_below_idx = 1;
+        entry.meshlet_clusters[4].group_above_idx = 2;
+        entry.meshlet_clusters[5].group_above_idx = 2;
+        entry.meshlet_clusters[6].group_below_idx = 2;
+        entry
+    }
+
+    #[test]
+    fn mark_lod_dirty_chains_single_root_descent_marks_full_asset() {
+        // A connected DAG with a SINGLE root covering the whole asset
+        // is the worst case for descent: any brush intersecting the
+        // root triggers descent down to every LOD-0 leaf. This is
+        // correct — when the root is the Karis pick at some camera
+        // distance and we drop it, every chain needs force-admit at
+        // LOD-0 (no Karis-admittable intermediate level survives).
+        //
+        // Real assets (the procedural box has 9.6k LOD-3 roots, each
+        // localized) don't hit this case — they have many roots and
+        // the brush only intersects a few of them, so the descent
+        // stays local. See `multi_root_dag_narrows_to_brush_region`
+        // for the realistic narrowing test.
+        let mut entry = three_lod_connected_entry();
+        let bmin = Vec3::splat(0.0);
+        let bmax = Vec3::splat(1.5);
+        let marked = mark_lod_dirty_chains(&mut entry, &[0], bmin, bmax);
+        assert_eq!(marked, 7, "single-root DAG → descent marks everything");
+        assert_eq!(dirty_set(&entry), vec![0, 1, 2, 3, 4, 5, 6]);
+    }
+
+    /// Multi-root DAG fixture matching the procedural-box structure:
+    /// two SEPARATE LOD-1 → LOD-2 chains with no shared root. Brush
+    /// in one chain's region must not reach the other.
+    ///
+    /// Chain X: c0_a [0,1], c0_b [1,2] → c1_x [0,2] → c2_x [0,2]
+    /// Chain Y: c0_c [5,6], c0_d [6,7] → c1_y [5,7] → c2_y [5,7]
+    /// IDs: 0=c0_a, 1=c0_b, 2=c0_c, 3=c0_d, 4=c1_x, 5=c1_y, 6=c2_x, 7=c2_y.
+    fn multi_root_entry() -> AssetEntry {
+        use arvx_core::mesh_lod::DagGroup;
+        let clusters = vec![
+            cluster([0.0; 3], [1.0; 3], 0),  // 0 c0_a
+            cluster([1.0; 3], [2.0; 3], 0),  // 1 c0_b
+            cluster([5.0; 3], [6.0; 3], 0),  // 2 c0_c
+            cluster([6.0; 3], [7.0; 3], 0),  // 3 c0_d
+            cluster([0.0; 3], [2.0; 3], 1),  // 4 c1_x
+            cluster([5.0; 3], [7.0; 3], 1),  // 5 c1_y
+            cluster([0.0; 3], [2.0; 3], 2),  // 6 c2_x (root X)
+            cluster([5.0; 3], [7.0; 3], 2),  // 7 c2_y (root Y)
+        ];
+        let mut entry = make_entry(clusters, 8);
+        entry.dag_groups = vec![
+            // g0: consumed [c0_a, c0_b] produced [c1_x]
+            DagGroup { consumed_first: 0, consumed_count: 2, produced_first: 0, produced_count: 1 },
+            // g1: consumed [c0_c, c0_d] produced [c1_y]
+            DagGroup { consumed_first: 2, consumed_count: 2, produced_first: 1, produced_count: 1 },
+            // g2: consumed [c1_x] produced [c2_x]
+            DagGroup { consumed_first: 4, consumed_count: 1, produced_first: 2, produced_count: 1 },
+            // g3: consumed [c1_y] produced [c2_y]
+            DagGroup { consumed_first: 5, consumed_count: 1, produced_first: 3, produced_count: 1 },
+        ];
+        entry.dag_consumed = vec![0, 1, 2, 3, 4, 5];
+        entry.dag_produced = vec![4, 5, 6, 7];
+        entry.meshlet_clusters[0].group_above_idx = 0;
+        entry.meshlet_clusters[1].group_above_idx = 0;
+        entry.meshlet_clusters[4].group_below_idx = 0;
+        entry.meshlet_clusters[2].group_above_idx = 1;
+        entry.meshlet_clusters[3].group_above_idx = 1;
+        entry.meshlet_clusters[5].group_below_idx = 1;
+        entry.meshlet_clusters[4].group_above_idx = 2;
+        entry.meshlet_clusters[6].group_below_idx = 2;
+        entry.meshlet_clusters[5].group_above_idx = 3;
+        entry.meshlet_clusters[7].group_below_idx = 3;
+        entry
+    }
+
+    #[test]
+    fn mark_lod_dirty_chains_multi_root_narrows_to_brush_region() {
+        // **The load-bearing test for connected-mesh assets.** Two
+        // separate DAG-root chains (no shared root, like the real
+        // procedural box with 9.6k LOD-3 roots). Brush touches
+        // chain X only; chain Y must stay clean.
+        //
+        // Expected dirty: {c0_a (seed), c0_b (descended from c1_x),
+        // c1_x (AABB), c2_x (AABB, descent doesn't cross into chain Y)}.
+        let mut entry = multi_root_entry();
+        let bmin = Vec3::splat(0.0);
+        let bmax = Vec3::splat(1.5);
+        let marked = mark_lod_dirty_chains(&mut entry, &[0], bmin, bmax);
+        assert_eq!(
+            marked, 4,
+            "narrow to chain X: c0_a + c0_b + c1_x + c2_x"
+        );
+        assert_eq!(dirty_set(&entry), vec![0, 1, 4, 6]);
+    }
+
+    #[test]
+    fn mark_lod_dirty_chains_descent_force_admits_under_dropped_ancestor() {
+        // When a LOD>0 ancestor is dropped by AABB intersection, ALL
+        // of its DAG descendants down to LOD-0 must be force-admitted
+        // — even non-brush-touched siblings whose own AABBs don't
+        // intersect the brush. This is the load-bearing correctness
+        // property; the earlier "non-dirty ancestor covers" version
+        // missed this and produced cluster-shaped voids in-editor.
+        //
+        // Setup: brush hits c1_x's AABB but does NOT touch c0_b
+        // (brush only covers c0_a's spatial region). c0_b's only
+        // ancestor c1_x is dropped → c0_b must be force-admitted via
+        // descent so the chain doesn't void at the Karis-picked LOD.
+        let mut entry = multi_root_entry();
+        let bmin = Vec3::splat(0.0);
+        let bmax = Vec3::splat(0.5);  // Only touches c0_a, c1_x, c2_x.
+        let marked = mark_lod_dirty_chains(&mut entry, &[0], bmin, bmax);
+        // Chain X: c0_a seed, c1_x + c2_x AABB-dirty, c0_b force-admitted
+        // by descent through c1_x. Chain Y untouched.
+        assert_eq!(marked, 4);
+        assert_eq!(dirty_set(&entry), vec![0, 1, 4, 6]);
+    }
+
+    #[test]
+    fn r3b_brush_at_cluster_edge_inclusive_pad_overlap() {
+        // Cluster at float AABB [4.0, 5.0] in each axis → with 1-cell
+        // pad, grid AABB is [3..6] inclusive. A brush at exactly cell 6
+        // (half-open [6, 7)) overlaps because cluster_max = 6 inclusive.
+        // A brush at cell 7 (half-open [7, 8)) does NOT overlap.
+        let clusters = vec![cluster([4.0, 4.0, 4.0], [5.0, 5.0, 5.0], 0)];
+        let mut sm = ArvxSceneManager::new(16);
+        let handle = sm.asset_cache.insert(make_entry(clusters, 8));
+
+        assert_eq!(
+            sm.clusters_in_brush_grid_aabb(handle, IVec3::splat(6), IVec3::splat(7)),
+            vec![0],
+            "brush at cluster_max should overlap (inclusive bound)"
+        );
+        assert!(
+            sm.clusters_in_brush_grid_aabb(handle, IVec3::splat(7), IVec3::splat(8))
+                .is_empty(),
+            "brush past cluster_max should miss"
+        );
+    }
+}
