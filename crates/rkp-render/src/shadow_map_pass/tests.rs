@@ -19,61 +19,6 @@ fn light_camera_csm_offsets_are_correct() {
     assert_eq!(offset_of!(LightCameraCsm, cascade_count), 656);
 }
 
-#[test]
-fn single_cascade_helper_returns_count_one_with_inf_threshold() {
-    let cam = compute_light_camera(
-        [-2.0, 0.0, -3.0], [4.0, 5.0, 1.0],
-        Vec3::new(-0.3, -0.7, 0.5).normalize().to_array(),
-        1024, 0.001,
-    );
-    let csm = LightCameraCsm::single_cascade(cam);
-    assert_eq!(csm.cascade_count, 1);
-    assert!(csm.cascade_far_view_z[0].is_infinite());
-    // Cascade 0 view_proj round-trips through cascade 0 view_proj_inv.
-    let vp = Mat4::from_cols_array_2d(&csm.cascades[0].view_proj);
-    let vpi = Mat4::from_cols_array_2d(&csm.cascades[0].view_proj_inv);
-    let p = vp * Vec4::new(0.5, 1.0, 0.3, 1.0);
-    let p = vpi * p;
-    assert!((p.x / p.w - 0.5).abs() < 1e-3);
-    assert!((p.y / p.w - 1.0).abs() < 1e-3);
-    assert!((p.z / p.w - 0.3).abs() < 1e-3);
-}
-
-fn assert_wgsl_valid(label: &str, src: &str) {
-    let module = naga::front::wgsl::parse_str(src)
-        .unwrap_or_else(|e| panic!("[{label}] parse error:\n{}", e.emit_to_string(src)));
-    let mut v = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::all(),
-    );
-    v.validate(&module).unwrap_or_else(|e| panic!("[{label}] validation error: {e:?}"));
-}
-
-#[test]
-fn shadow_clear_shader_is_valid_wgsl() {
-    assert_wgsl_valid("shadow_clear", wesl::include_wesl!("shadow_clear"));
-}
-
-#[test]
-fn shadow_scatter_setup_shader_is_valid_wgsl() {
-    assert_wgsl_valid("shadow_scatter_setup", wesl::include_wesl!("shadow_scatter_setup"));
-}
-
-#[test]
-fn shadow_scatter_emit_shader_is_valid_wgsl() {
-    assert_wgsl_valid("shadow_scatter_emit", wesl::include_wesl!("shadow_scatter_emit"));
-}
-
-#[test]
-fn shadow_scatter_finalize_shader_is_valid_wgsl() {
-    assert_wgsl_valid("shadow_scatter_finalize", wesl::include_wesl!("shadow_scatter_finalize"));
-}
-
-#[test]
-fn shadow_scatter_shader_is_valid_wgsl() {
-    assert_wgsl_valid("shadow_scatter", wesl::include_wesl!("shadow_scatter"));
-}
-
 // ── compute_csm_cascades ─────────────────────────────────────
 
 fn default_csm_inputs() -> CsmInputs {

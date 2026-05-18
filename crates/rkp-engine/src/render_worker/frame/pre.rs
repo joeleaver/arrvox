@@ -81,35 +81,6 @@ pub(super) fn run_pre_frame(
             &state.queue,
             &frame.shader_params_slots,
         );
-        // Phase B-redux Phase 3a — refresh march's binding too.
-        // upload_shader_params may have reallocated the buffer; the
-        // existing per-frame `set_shade_data` below picks up shade's
-        // side, march mirrors that here.
-        vr.march.set_shader_params(
-            &state.device,
-            vr.shade.shader_params_buffer(),
-        );
-        // Phase 4 — shadow trace shares the params bind group that
-        // OctreeMarchPass owns (binding 10 already lives there), but
-        // we still record the buffer handle on the shadow pass for
-        // API symmetry with the rest of the chain.
-        vr.shadow_trace.set_shader_params(
-            &state.device,
-            vr.shade.shader_params_buffer(),
-        );
-        // Phase 4 — shadow-map scatter has its own scatter_pass_bg
-        // (group 1) that needs materials + shader_params bound for
-        // the band-cell dispatch. Re-wiring is cheap; the inner
-        // try-rebuild short-circuits when both handles + the
-        // scatter_instances buffer are stable.
-        vr.shadow_map.set_materials(
-            &state.device,
-            &state.renderer.materials_buffer,
-        );
-        vr.shadow_map.set_shader_params(
-            &state.device,
-            vr.shade.shader_params_buffer(),
-        );
         // Re-bind unconditionally — set_shade_data is one bind-group
         // create; cheaper than threading state for "did the buffer
         // grow" through callers, and the materials/lights buffers may
@@ -421,32 +392,11 @@ pub(super) fn run_pre_frame(
     );
     // Refresh per-VR shadow-trace bind groups so they pick up any
     // capacity-doubling reallocation of `tlas_pass.{nodes,leaves}_buffer`.
-    // Cheap when handles match.
-    for vr in state.viewport_renderers.values_mut() {
-        vr.march.set_tlas_buffers(
-            &state.device,
-            &state.tlas_pass.nodes_buffer,
-            &state.tlas_pass.leaves_buffer,
-        );
-        // Phase 8 — shadow-map setup pass reads `tlas_prims`
-        // directly (no BVH walk needed; per-prim AABB → texel rect
-        // is a flat scan). Grow scatter scratch if the prim count
-        // jumps, then rebind the prims buffer.
-        vr.shadow_map.ensure_scatter_capacity(&state.device, tlas_prim_count);
-        vr.shadow_map.set_tlas_prims_buffer(
-            &state.device,
-            &state.tlas_build_pass.tlas_prims_buffer,
-        );
-        // Phase 4 — band-cell shadow dispatch reads `time` and
-        // `asset_count` from a lite march_params uniform.
-        // `asset_count` matches what the primary march sees
-        // because both originate from the same `assets_for_upload`.
-        vr.shadow_map.update_march_params(
-            &state.queue,
-            frame.shade_params_base.time,
-            asset_count,
-        );
-    }
+    // Mesh path consumes TLAS via the mesh raster's own bindings;
+    // no per-viewport setup is needed here after the march/shadow
+    // scatter retirement.
+    let _ = tlas_prim_count;
+    let _ = asset_count;
 
     let p_t_tlas = pre_start.elapsed();
 
@@ -462,45 +412,10 @@ pub(super) fn run_pre_frame(
 
     // 2. Skin scatter (one batched compute dispatch). Sim folded every
     //    skinned entity into `frame.skin.batch`; we just fire it.
-    //
-    // **Phase 6.6 gate:** the scatter writes the voxel-march bone
-    // field that only the legacy march path samples. Mesh primary
-    // does its skinning in the vertex shader against the same per-
-    // frame `bone_matrices` / `bone_dual_quats` buffers (which the
-    // sim still uploads via `RenderFrame::bone_matrix_lbs/dqs`), so
-    // the bone-field scatter is dead weight in mesh mode — measured
-    // at ~1.6 ms p50 on splat5 elephant pre-gate. The check stays
-    // local to this dispatch so the legacy buffers + the matrix
-    // upload upstream remain wired for any viewport that's still on
-    // march (`RKP_PRIMARY=march` or default).
-    let skip_skin_deform = matches!(
-        state.renderer.primary_mode,
-        rkp_render::rkp_renderer::PrimaryMode::Mesh,
-    );
-    if let Some(skin) = &frame.skin {
-        if !skip_skin_deform {
-            let mut skin_encoder = state
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("rkp_skin_deform_encoder"),
-                });
-            let q = state
-                .renderer
-                .profiler
-                .begin_query("skin_deform", &mut skin_encoder);
-            state.renderer.prepare_bone_field(
-                &state.queue,
-                &mut skin_encoder,
-                skin.bone_field_bytes,
-                skin.bone_field_occ_bytes,
-            );
-            state
-                .renderer
-                .scatter_skin_batch(&state.queue, &mut skin_encoder, &skin.batch);
-            state.renderer.profiler.end_query(&mut skin_encoder, q);
-            state.queue.submit(std::iter::once(skin_encoder.finish()));
-        }
-    }
+    // Mesh path skins in the vertex shader against the per-frame
+    // `bone_matrices` / `bone_dual_quats` buffers — no scatter pass
+    // is needed.
+    let _ = &frame.skin;
 
     let transient_indices: Vec<u32> = Vec::new();
     let object_count = gpu_instances.len() as u32;

@@ -25,31 +25,8 @@ use crate::splat_pass::{SplatDraw, SplatPass};
 use crate::splat_resolve_pass::SplatResolvePass;
 use wgpu_profiler::GpuProfiler;
 
-/// Primary-visibility selector. Set by the `RKP_PRIMARY` env var at
-/// `RkpRenderer` construction. `Splat` swaps the compute octree-march
-/// for the splat raster path; `Mesh` swaps it for the surface-mesh
-/// raster path (Phase 2 of the splat-to-mesh pivot); `March` keeps the
-/// existing behaviour. The selector is read once at startup so per-
-/// frame env reads don't show up in profiles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrimaryMode {
-    March,
-    Splat,
-    Mesh,
-}
-
-impl PrimaryMode {
-    /// Read `RKP_PRIMARY`. `splat` (case-insensitive) selects splat,
-    /// `mesh` selects the surface-mesh path; anything else (including
-    /// unset) keeps the existing march path.
-    fn from_env() -> Self {
-        match std::env::var("RKP_PRIMARY").as_deref() {
-            Ok(s) if s.eq_ignore_ascii_case("splat") => PrimaryMode::Splat,
-            Ok(s) if s.eq_ignore_ascii_case("mesh") => PrimaryMode::Mesh,
-            _ => PrimaryMode::March,
-        }
-    }
-}
+// `PrimaryMode` enum + `RKP_PRIMARY` env-var read retired after the
+// march/splat path retirement. Mesh raster is now the only path.
 
 /// Read a positive finite f32 from the named env var; fall back to
 /// `default` if the var is unset, unparseable, or non-positive. Used
@@ -115,12 +92,10 @@ pub struct RkpRenderer {
     /// PERF_DEBT.md D4: same shape as [`Self::last_lights_hash`] for
     /// the material palette upload.
     last_materials_hash: u64,
-    /// Skeletal skin-deform scatter pass — writes the per-frame
-    /// deformed-space bone field (Phase 3a). See `skin_deform.rs`.
-    pub skin_deform: crate::skin_deform::SkinDeformPass,
-    /// Splat-rasterizer pipeline (Phase B-2). One pipeline shared
-    /// across viewports — the per-VR state lives in `ViewportRenderer`
-    /// (g0 bind group, per-instance bind groups + uniform buffers).
+    /// Per-instance bind-group layouts (g0 scene-wide + g1 per-instance).
+    /// Shared across the mesh raster, mesh shadow render, mesh LOD
+    /// select compute, and user-shader mesh paths. (Type name dates from
+    /// the retired splat raster prototype — rename pending in cleanup.)
     pub splat_pass: SplatPass,
     /// Splat-resolve compute fixup. Reads the visibility-buffer
     /// triplet `splat_pass` writes and fills in the remaining G-buffer
@@ -200,10 +175,6 @@ pub struct RkpRenderer {
     /// proxy vertex layout is `ProxyVertex` (32 B; material + color
     /// payload) — not `MeshVertex`. Indexed by `AssetHandle::raw()`.
     proxy_mesh_buffers: Vec<Option<(wgpu::Buffer, wgpu::Buffer, u32)>>,
-    /// Primary-visibility selector — `March` (compute octree march)
-    /// or `Splat` (rasterized surface splats). Read from the
-    /// `RKP_PRIMARY` env var at construction. See [`PrimaryMode`].
-    pub primary_mode: PrimaryMode,
     /// Device for buffer operations.
     pub device: wgpu::Device,
     /// GPU profiler (wgpu-profiler).
@@ -334,7 +305,6 @@ impl RkpRenderer {
 
         let atmosphere = RkpAtmospherePass::new(device);
 
-        let skin_deform = crate::skin_deform::SkinDeformPass::new(device, &scene);
         let splat_pass = SplatPass::new(device);
         // `MeshGlassPass` owns the shared `g2_layout` (glass-classify
         // bindings) used by both the primary mesh raster and the
@@ -371,8 +341,6 @@ impl RkpRenderer {
             &scene.bind_group_layout,
         );
         let brush_state = crate::brush_state_pass::BrushStatePass::new(device);
-        let primary_mode = PrimaryMode::from_env();
-        eprintln!("[RkpRenderer] primary_mode = {primary_mode:?}");
 
         let mesh_glass_debug_force = std::env::var("RKP_MESH_GLASS_DEBUG_FORCE")
             .ok()
@@ -397,7 +365,6 @@ impl RkpRenderer {
             lights_materials_epoch: 0,
             last_lights_hash: 0,
             last_materials_hash: 0,
-            skin_deform,
             splat_pass,
             splat_resolve,
             mesh_proxy,
@@ -413,7 +380,6 @@ impl RkpRenderer {
             mesh_cluster_buffers: Vec::new(),
             mesh_cluster_diag: Vec::new(),
             proxy_mesh_buffers: Vec::new(),
-            primary_mode,
             device: device.clone(),
             profiler, timestamp_period,
             shadow_csm_threshold_falloff: 2.0,
@@ -1932,66 +1898,12 @@ impl RkpRenderer {
         self.lights_materials_epoch
     }
 
-    /// Grow `scene.bone_field_buffer` + `scene.bone_field_occ_buffer`
-    /// to at least the requested sizes and clear both. Call once per
-    /// frame before any scatter dispatches.
-    pub fn prepare_bone_field(
-        &mut self,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        field_bytes: u64,
-        occ_bytes: u64,
-    ) {
-        let field_bytes = field_bytes.max(16);
-        let occ_bytes = occ_bytes.max(16);
-        let _ = queue; // unused but matches other pass signatures
-        let grew_field = self.scene.ensure_bone_field_capacity(&self.device, field_bytes);
-        let grew_occ = self.scene.ensure_bone_field_occ_capacity(&self.device, occ_bytes);
-        if grew_field || grew_occ {
-            // New buffer handle(s) — rebuild the scatter's scene bind
-            // group (the scene's main bind group was already rebuilt
-            // inside `ensure_*_capacity`).
-            self.skin_deform.refresh_scene_bind_group(&self.device, &self.scene);
-        }
-        // Clear — scattering leaves gaps by design.
-        encoder.clear_buffer(&self.scene.bone_field_buffer, 0, None);
-        encoder.clear_buffer(&self.scene.bone_field_occ_buffer, 0, None);
-    }
-
-    /// Run the batched skin-deform scatter. `batch` must have every
-    /// skinned entity's dispatch folded in via `SkinBatchScratch::push`.
-    /// Call once per frame after [`prepare_bone_field`]; fires a single
-    /// compute dispatch, so there's no ordering problem with
-    /// `queue.write_buffer` across entities.
-    pub fn scatter_skin_batch(
-        &mut self,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        batch: &crate::skin_deform::SkinBatchScratch,
-    ) {
-        self.skin_deform.run(&self.device, queue, encoder, &self.scene, batch);
-    }
-
     pub fn upload_geometry(&mut self, queue: &wgpu::Queue, data: &GeometryUpload) {
         self.scene.upload_geometry(&self.device, queue, data);
-        // upload_geometry may have grown brick_pool / bone_weights /
-        // bone_matrices; the scatter pass's scene bind group caches
-        // those resource references and needs a rebuild to pick up any
-        // new buffer handles. Cheap: one bind group alloc.
-        self.skin_deform.refresh_scene_bind_group(&self.device, &self.scene);
     }
 
     pub fn upload_frame(&mut self, queue: &wgpu::Queue, data: &FrameUpload) {
-        let prev_epoch = self.scene.buffers_epoch();
         self.scene.upload_frame(&self.device, queue, data);
-        if self.scene.buffers_epoch() != prev_epoch {
-            // `bone_matrices_buffer` and `bone_dual_quats_buffer` start
-            // life as 64 B placeholders and grow on the first non-empty
-            // upload. `skin_deform`'s scene bg references both
-            // (bindings 5 + 11), so a realloc here invalidates it.
-            // Matches the refresh in `upload_geometry`.
-            self.skin_deform.refresh_scene_bind_group(&self.device, &self.scene);
-        }
     }
 
     /// Render one frame into `viewport`. Dispatches into the VR's own
@@ -2076,15 +1988,6 @@ impl RkpRenderer {
     ) {
         let in_situ = matches!(mode, crate::RenderMode::InSitu);
         let raymarch = matches!(preview_mode, crate::BuildPreviewMode::Raymarch);
-        let splat = self.primary_mode == PrimaryMode::Splat;
-        let mesh = self.primary_mode == PrimaryMode::Mesh;
-
-        // Upload per-viewport tile-cull data. The per-object screen
-        // AABBs feed the CPU-side tile-list builder; only the built
-        // lists cross to the GPU now.
-        viewport.march.upload_tile_lists(
-            &self.device, queue, tile_offsets, tile_object_ids,
-        );
 
         // 0. Atmosphere LUTs (in-situ only — isolation uses a flat sky).
         if in_situ {
@@ -2094,16 +1997,11 @@ impl RkpRenderer {
             self.profiler.end_query(encoder, q);
         }
 
-        // 1. Primary visibility → G-buffer. Three mutually-exclusive
-        //    paths: procedural raymarch (build viewport), splat raster
-        //    (Phase B-2 A/B path, gated on `RKP_PRIMARY=splat`), or
-        //    voxel march (default). Each fully populates the G-buffer
-        //    including miss sentinels at non-hit pixels, so downstream
-        //    passes are unaware of which path ran.
-        //    Shadow_trace is skipped in raymarch mode because the
-        //    procedural preview doesn't have the world-space voxel
-        //    grid that pass needs; isolation mode already forces
-        //    shadow=1.0 inside shade.
+        // 1. Primary visibility → G-buffer. Two mutually-exclusive
+        //    paths: procedural raymarch (build viewport live SDF
+        //    preview) or surface-mesh raster (every other viewport).
+        //    Both fully populate the G-buffer including miss sentinels
+        //    so downstream passes are unaware of which path ran.
         if raymarch {
             let q = self.profiler.begin_query("proc_raymarch", encoder);
             viewport.proc_raymarch.dispatch(
@@ -2111,19 +2009,15 @@ impl RkpRenderer {
             );
             self.profiler.end_query(encoder, q);
         } else {
-            // Mesh primary visibility is the only non-preview path.
             // `splat_draws` records (asset_handle, world, object_id)
             // per scene instance — name to be renamed `mesh_draws` in
             // the cleanup audit.
             self.dispatch_mesh(queue, encoder, viewport, splat_draws);
         }
-        let _ = splat;
-        let _ = mesh;
 
         // 1a'. Proxy-mesh raster — composites procedural triangle
-        //      meshes onto the G-buffer regardless of primary mode.
-        //      Skipped in raymarch preview (single-procedural focus
-        //      target, no scene composition).
+        //      meshes onto the G-buffer. Skipped in raymarch preview
+        //      (single-procedural focus target, no scene composition).
         if !raymarch {
             self.dispatch_proxy_meshes(queue, encoder, viewport, proxy_draws);
         }
@@ -2136,46 +2030,15 @@ impl RkpRenderer {
             self.dispatch_user_shader_mesh(encoder, viewport, user_shader_mesh_draws);
         }
 
-        // 1b. Half-res shadow trace. Skipped in isolation — the shade
-        // pass forces shadow=1.0 there. Uses march's params bind group.
-        // Splat path skips this for the Phase B-2 prototype: the shadow
-        // trace expects the world-space voxel grid + march's params bg
-        // that the splat path doesn't provide. Splat A/B comparisons
-        // therefore render shadow=1.0; document this when interpreting
-        // visual diffs.
-        if in_situ && !raymarch && !splat && !mesh {
-            if let Some(params_bg) = viewport.march.params_bind_group() {
-                let q = self.profiler.begin_query("shadow", encoder);
-                viewport.shadow_trace.dispatch(encoder, &viewport.scene_bind_group, params_bg);
-                self.profiler.end_query(encoder, q);
-            }
-        }
-
-        // 1c. Phase 8 — directional shadow map. Same in-situ/non-
-        // raymarch gate as shadow_trace; the engine flips
-        // `shadow_map_enabled` based on whether a directional
-        // caster + non-empty TLAS exists this frame. The shade
-        // pass reads the resulting depth texture for directional
-        // visibility; non-directional lights still pull from the
-        // half-res shadow_trace output.
-        if in_situ && !raymarch && !splat && !mesh && shadow_map_enabled {
-            let q = self.profiler.begin_query("shadow_map", encoder);
-            viewport.shadow_map.dispatch_clear(encoder);
-            viewport.shadow_map.dispatch_setup(
-                encoder, queue, tlas_prim_count, camera_view_proj, scene_extent,
-            );
-            viewport.shadow_map.dispatch_emit(encoder, tlas_prim_count);
-            viewport.shadow_map.dispatch_finalize(encoder);
-            viewport.shadow_map.dispatch_scatter(
-                encoder, &viewport.scene_bind_group, tlas_prim_count,
-            );
-            self.profiler.end_query(encoder, q);
-        }
-        // Mesh-mode directional shadow map: real triangle rasterization
-        // from the light's POV into the same `shadow_buffer` shade
-        // already samples. Per-instance uniforms were written by the
-        // earlier `dispatch_mesh` call this frame.
-        if in_situ && !raymarch && mesh && shadow_map_enabled {
+        // 1c. Directional shadow map — mesh triangle rasterization
+        //     from the light's POV into the same `shadow_buffer` the
+        //     shade pass samples. Per-instance uniforms were written
+        //     by the earlier `dispatch_mesh` call this frame. The
+        //     engine flips `shadow_map_enabled` based on whether a
+        //     directional caster + non-empty TLAS exists this frame;
+        //     `ShadeParams.shadow_map_enabled` is in lockstep so shade
+        //     samples the fresh map.
+        if in_situ && !raymarch && shadow_map_enabled {
             self.dispatch_mesh_shadow(
                 queue, encoder, viewport, splat_draws, user_shader_mesh_draws,
             );
@@ -2186,12 +2049,8 @@ impl RkpRenderer {
         // both) ran. Each pass writes to its own slot; unwritten
         // slots come back as undefined data (caller can detect
         // by all-zero results or just trust the slot it cares about).
-        if mesh && std::env::var("RKP_MESH_PIPESTATS").is_ok() {
+        if !raymarch && std::env::var("RKP_MESH_PIPESTATS").is_ok() {
             viewport.pipestats_finalize(encoder);
-        }
-
-        if !raymarch && !splat && !mesh {
-            viewport.march.copy_stats(encoder);
         }
 
         // 2. SSAO (half-res). Kept in isolation — it's the only grounding cue.

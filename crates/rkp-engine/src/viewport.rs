@@ -252,7 +252,7 @@ impl Viewport {
             },
             background: BackgroundMode::Environment,
             mode: rkp_render::RenderMode::InSitu,
-            preview_mode: rkp_render::BuildPreviewMode::Voxel,
+            preview_mode: rkp_render::BuildPreviewMode::Baked,
             show_gizmos: true,
             prev_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
         }

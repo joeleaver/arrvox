@@ -956,7 +956,7 @@ impl EngineState {
                     uniforms: plan.uniforms,
                     bricks: &plan.bricks,
                 };
-                self.skin_batch.push(&d);
+                self.skin_batch.push(d);
             }
             Some(crate::render_frame::RenderSkin {
                 bone_field_bytes: self.skin_bone_field_bytes,
@@ -1113,7 +1113,7 @@ impl EngineState {
                 .map(|v| (v.mode, v.preview_mode))
                 .unwrap_or((
                     rkp_render::RenderMode::InSitu,
-                    rkp_render::BuildPreviewMode::Voxel,
+                    rkp_render::BuildPreviewMode::Baked,
                 ));
 
             // The procedural being previewed in raymarch mode is

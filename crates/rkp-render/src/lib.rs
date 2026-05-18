@@ -1,8 +1,9 @@
-//! RKP-Render: Gaussian splat rendering pipeline.
+//! RKP-Render: surface-mesh rendering pipeline.
 //!
-//! Forward rasterization of surface-shell voxels into a G-buffer, followed by
-//! deferred shadow/AO and PBR shading. Post-processing (tone mapping, bloom,
-//! wireframe overlay) is handled by passes in this crate.
+//! Forward rasterization of triangles (per-cluster-LOD meshlets +
+//! procedural proxy meshes) into a deferred G-buffer, followed by
+//! PBR shading, CSM shadows, atmosphere/volumetrics, and post-process
+//! (bloom, tone mapping, glass composite, wireframe overlay).
 
 /// `0xFFFFFFFFu`-as-sentinel constants shared with WGSL.
 pub mod sentinels;
@@ -28,20 +29,18 @@ pub use wireframe::{WireframePass, LineVertex};
 
 /// GPU octree buffer management and GpuObject field reinterpretation.
 pub mod octree_gpu;
-/// Octree-accelerated compute ray marcher — primary visibility pass.
-pub mod octree_march;
-/// Surface-splat rasterization prototype — Phase A walks the octree
-/// to produce a per-voxel vertex buffer; Phase B will dispatch oriented
-/// disc splats as an alternative primary visibility path.
+/// Shared per-instance render infrastructure (`SplatInstanceUniform`,
+/// bind-group layouts, `SplatDraw`) — names date from the retired
+/// splat raster prototype; will be renamed to `Mesh*` in the cleanup
+/// audit.
 pub mod splat_pass;
-/// Surface-mesh path (Phase 1 of the splat-to-mesh pivot) — naive
-/// surface-nets extraction at asset load. CPU-only; the Phase 2 forward
-/// triangle pipeline reads the resulting `(vertices, indices)` buffer.
+/// Surface-mesh path — naive surface-nets extraction at asset load
+/// plus the forward triangle pipeline (`MeshPass`) that consumes the
+/// resulting `(vertices, indices)` buffer.
 pub mod mesh_pass;
-/// Mesh-rendered directional shadow map (Phase 3 of the splat-to-mesh
-/// pivot). Renders mesh triangles from the light's POV, writes depth
-/// into the existing shadow_buffer storage so shade samples it via
-/// the unchanged `sample_shadow_map` path.
+/// Mesh-rendered directional shadow map. Renders mesh triangles from
+/// the light's POV, writes depth into `shadow_buffer` so shade samples
+/// it via the unchanged `sample_shadow_map` path.
 pub mod mesh_shadow_map_pass;
 /// Phase 6.2 LOD-select compute pass — applies the Karis-Nanite admit
 /// rule per cluster and writes a `DrawIndexedIndirectArgs` table that
@@ -55,10 +54,11 @@ pub mod mesh_glass_pass;
 /// captures so the shade pass can apply Beer attenuation on the
 /// existing CSM shadow factor.
 pub mod mesh_glass_shadow_pass;
-/// Splat-rasterizer compute fixup pass — reads the visibility-buffer
-/// triplet (leaf_slot, pick) `splat_pass` writes and fills in the
-/// remaining G-buffer entries (normal / material / glass) via the
-/// scene's `leaf_attr_pool` / `color_pool` / `instances` indirection.
+/// Per-pixel resolve compute pass — reads the mesh raster's
+/// visibility-buffer triplet (leaf_slot, pick) and fills in the rest
+/// of the G-buffer (normal / material / glass) via the scene's
+/// `leaf_attr_pool` / `color_pool` / `instances` indirection. Will be
+/// renamed `mesh_resolve_pass` in the cleanup audit.
 pub mod splat_resolve_pass;
 /// Procedural proxy-mesh raster pipeline. First-class triangle-mesh
 /// renderer for procedurals baked via GPU surface-nets-from-SDF.
@@ -66,7 +66,6 @@ pub mod splat_resolve_pass;
 /// own normal + material + color and the FS writes the full G-buffer
 /// directly. See `notes/proxy-mesh-first-class.md`.
 pub mod mesh_proxy_pass;
-pub mod rkp_shadow_trace;
 /// Per-object GPU struct — forward world transform, octree params, no inverse_world.
 pub mod rkp_gpu_object;
 /// Scene GPU buffer management — single upload path for all data.
@@ -125,13 +124,12 @@ pub mod tlas_pass;
 /// sort, Karras tree, and AABB propagation; Session 5 cuts over
 /// from the CPU `tlas_pass::build_tlas` builder.
 pub mod tlas_build_pass;
-/// Phase 8 — directional shadow maps. Replaces the per-pixel
-/// ray-traced directional shadow path with a single light-POV
-/// depth render + per-pixel sample. Sessions 1-5 ship in order:
-/// light camera (S1), shadow march (S2), shade-side query (S3),
-/// engine wiring (S4), directional cutover (S5).
+/// Directional shadow maps — `shadow_buffer` storage + per-frame
+/// `LightCameraCsm` uniform. The mesh path's `mesh_shadow_map_pass`
+/// writes the depth slices; `rkp_shade` samples them.
 pub mod shadow_map_pass;
-/// Skeletal skin-deform scatter pass — per-frame bone-field writer.
+/// Skin-deform planning types — wire format only after the scatter
+/// pipeline retirement. See module docs.
 pub mod skin_deform;
 /// CPU-side paint writes against the scene's LeafAttrPool (material +
 /// per-voxel color mutations). Used by the editor's paint tool; the
@@ -142,7 +140,7 @@ pub mod paint;
 pub use octree_gpu::OctreeGpu;
 pub use rkp_scene_manager::{AssetHandle, AssetInfo, ReloadResult, RkpSceneManager, SkinBrick, SkinningAssetData};
 pub use viewport_renderer::ViewportRenderer;
-pub use skin_deform::{SkinBatchScratch, SkinBrickEntry, SkinDeformPass, SkinDispatch, SkinUniforms};
+pub use skin_deform::{SkinBatchScratch, SkinBrickEntry, SkinDispatch, SkinUniforms};
 
 /// What a viewport's render pipeline should look like.
 ///
@@ -164,24 +162,24 @@ pub enum RenderMode {
 /// to `RenderMode` (Isolation/InSitu) — lighting look is separate from
 /// "what geometry are we showing."
 ///
-/// * `Voxel` — the usual octree ray march, same path every other
-///   viewport uses. Shows whatever's baked into the voxel pool; may be
-///   stale relative to the current procedural tree.
+/// * `Baked` — render whatever's baked into the scene (mesh raster of
+///   imported assets + procedural proxy meshes). What every other
+///   viewport uses.
 /// * `Raymarch` — the procedural CSG raymarcher. Evaluates the tree
 ///   analytically per pixel, so edits are live — no bake required.
 ///   Cheap (microseconds per frame for small trees) because there's no
 ///   voxelization and no brick bookkeeping.
 ///
-/// The main viewport and play mode are always `Voxel`.
+/// The main viewport and play mode are always `Baked`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildPreviewMode {
-    Voxel,
+    Baked,
     Raymarch,
 }
 
 impl Default for BuildPreviewMode {
     fn default() -> Self {
-        Self::Voxel
+        Self::Baked
     }
 }
 

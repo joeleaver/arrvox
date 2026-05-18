@@ -172,19 +172,9 @@ pub(super) fn prepare_shadow_maps(
 ) -> bool {
     // The voxel-march scatter shadow_map remains disabled (the
     // commit-comment context above still applies — it produced
-    // worse silhouettes than rkp_shadow_trace at higher cost).
-    //
-    // The mesh path needs an actual depth-rendered shadow map
-    // though, and it has the right input data — real triangle
-    // geometry. Re-enable the per-VR LightCameraUniform write
-    // for mesh mode; `MeshShadowMapPass` is what consumes it.
-    let mesh_mode = matches!(
-        state.renderer.primary_mode,
-        rkp_render::rkp_renderer::PrimaryMode::Mesh,
-    );
-    if !mesh_mode {
-        return false;
-    }
+    // Mesh path renders the directional shadow map via
+    // `MeshShadowMapPass`. The per-VR `LightCameraUniform` write
+    // lands the per-cascade matrices that pass consumes.
     // Stash the per-cascade LOD pixel-threshold falloff on the
     // renderer so the next `dispatch_mesh_shadow` picks it up. The
     // env-var override (`RKP_CSM_THRESHOLD_FALLOFF`) takes precedence

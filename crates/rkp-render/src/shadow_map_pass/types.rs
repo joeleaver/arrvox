@@ -29,35 +29,13 @@ pub const SHADOW_MAP_FAR_DEPTH: f32 = 1.0;
 /// works because f32 in [0, 1] is monotonic in IEEE-754.
 pub const SHADOW_MAP_FAR_DEPTH_BITS: u32 = 0x3F800000;
 
-/// Initial capacity for the per-frame TLAS-prim → ScatterInstance
-/// scratch arrays. Grows on demand if the prim count exceeds it.
-pub const SHADOW_MAP_MAX_CASTERS_INITIAL: u32 = 2048;
-
-/// Initial work-list capacity (one entry per 8×8 tile). 256 K
-/// entries ≈ 1 MB at 4 bytes / entry. Covers ~4 instances each
-/// fully covering a 2K shadow map (65 536 tiles each), or ~10 k
-/// grass blades (~25 tiles each). Grows on demand.
-pub const SHADOW_MAP_WORK_LIST_INITIAL: u32 = 262144;
-
-/// Scatter pass dispatch X dimension — must match the constant in
-/// `shadow_scatter.wgsl` and `shadow_scatter_finalize.wgsl`. The
-/// finalize pass writes `(DISPATCH_X, ceil(total / DISPATCH_X), 1)`
-/// into the indirect dispatch args.
-pub const SHADOW_SCATTER_DISPATCH_X: u32 = 256;
-
-/// Stride of a `ScatterInstance` slot — see WGSL definition. 8 ×
-/// u32 = 32 bytes.
-pub const SCATTER_INSTANCE_STRIDE: u64 = 32;
-
 /// Number of CSM cascades. 4 is the industry default and fits within
 /// wgpu's 8-storage-per-stage limit at the shade pass with the
 /// consolidated `shadow_buffer` (1 storage binding regardless of
 /// cascade count).
 ///
-/// In mesh-mode we render all `CSM_CASCADE_COUNT` slices. In
-/// march-mode the scatter chain still writes only into slice 0
-/// and the shade pass sees `LightCameraCsm.cascade_count = 1`,
-/// preserving today's single-cascade behavior bit-for-bit.
+/// All `CSM_CASCADE_COUNT` slices are rendered each frame by the
+/// mesh shadow path.
 pub const CSM_CASCADE_COUNT: u32 = 4;
 
 /// Per-cascade slice. Same wire layout as the original
@@ -79,9 +57,8 @@ pub struct LightCameraUniform {
 const _: () = assert!(std::mem::size_of::<LightCameraUniform>() == 160);
 
 /// Wire format for the CSM uniform shared between
-/// `mesh_shadow_map_pass` (writes per-cascade depth), the scatter
-/// chain (writes slice 0 in march-mode), and the shade pass (per-
-/// pixel cascade selection + shadow sample).
+/// `mesh_shadow_map_pass` (writes per-cascade depth) and the shade
+/// pass (per-pixel cascade selection + shadow sample).
 ///
 /// Layout (672 B, std140-safe — `cascades` is `array<LightCameraSlice, 4>`
 /// where each slice is 160 B and starts at a 16 B-aligned offset;
@@ -112,52 +89,3 @@ const _: () = assert!(std::mem::offset_of!(LightCameraCsm, cascades) == 0);
 const _: () = assert!(std::mem::offset_of!(LightCameraCsm, cascade_far_view_z) == 640);
 const _: () = assert!(std::mem::offset_of!(LightCameraCsm, cascade_count) == 656);
 
-impl LightCameraCsm {
-    /// Build a CSM uniform that degenerates to a single-cascade
-    /// shadow map. Used by the march-mode scatter path so the shade
-    /// pass's per-pixel cascade selection picks slice 0 and behaves
-    /// identically to today's single-shadow-map flow.
-    ///
-    /// `cascade_far_view_z[0] = +INF` so any view-space depth
-    /// selects cascade 0; trailing slots are zeroed.
-    pub fn single_cascade(cam: LightCameraUniform) -> Self {
-        let zero_slice = LightCameraUniform {
-            view_proj: [[0.0; 4]; 4],
-            view_proj_inv: [[0.0; 4]; 4],
-            light_dir: [0.0; 3],
-            depth_bias: 0.0,
-            inv_shadow_map_size: [0.0; 2],
-            shadow_map_size: [0; 2],
-        };
-        let mut cascades = [zero_slice; CSM_CASCADE_COUNT as usize];
-        cascades[0] = cam;
-        let mut cascade_far_view_z = [0.0_f32; CSM_CASCADE_COUNT as usize];
-        cascade_far_view_z[0] = f32::INFINITY;
-        Self {
-            cascades,
-            cascade_far_view_z,
-            cascade_count: 1,
-            _pad: [0; 3],
-        }
-    }
-}
-
-/// Setup-pass per-frame uniform. Layout matches WGSL struct in
-/// `shadow_scatter_setup.wgsl`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct SetupParams {
-    pub prim_count: u32,
-    /// Maximum distance a shadow can travel through the scene.
-    /// Setup uses this to extrude per-prim AABBs along
-    /// `light_dir` for the shadow-frustum cull.
-    pub scene_extent: f32,
-    pub _pad0: u32,
-    pub _pad1: u32,
-    /// Camera view-proj matrix (world → camera NDC). The cull
-    /// projects each prim's swept AABB through this and tests
-    /// the resulting NDC bounds against `[-1,1]² × [0,1]`.
-    pub camera_view_proj: [[f32; 4]; 4],
-}
-
-const _: () = assert!(std::mem::size_of::<SetupParams>() == 80);

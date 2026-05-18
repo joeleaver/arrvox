@@ -16,11 +16,9 @@
 use crate::rkp_renderer::RkpRenderer;
 use crate::rkp_scene::{CameraUniforms, RkpScene};
 use crate::splat_pass::{SplatInstanceUniform, SPLAT_INSTANCE_BYTES};
-use crate::octree_march::OctreeMarchPass;
 use crate::proc_raymarch::ProcRaymarchPass;
 use crate::proc_outline::ProcOutlinePass;
 use crate::proc_ghost::ProcGhostPass;
-use crate::rkp_shadow_trace::ShadowTracePass;
 use crate::shadow_map_pass::{ShadowMapPass, CSM_CASCADE_COUNT, SHADOW_MAP_DEFAULT_SIZE};
 use rkp_core::mesh_lod::LOD_LEVELS_MAX;
 
@@ -40,43 +38,40 @@ pub struct ViewportRenderer {
     pub camera_buffer: wgpu::Buffer,
     pub scene_bind_group: wgpu::BindGroup,
     scene_epoch: u64,
-    /// Epoch at which march's `set_lights`/`set_materials` bindings were
+    /// Epoch at which mesh's `set_lights`/`set_materials` bindings were
     /// last built. Compared against `RkpRenderer::lights_materials_epoch`
-    /// so VRs rebuild march's lights/materials bind groups after the
-    /// shared buffers reallocate.
+    /// so VRs rebuild the per-pass lights/materials bind groups after
+    /// the shared buffers reallocate.
     lights_materials_epoch: u64,
 
     // ── Per-VR resolution-coupled passes ───────────────────────────
-    pub march: OctreeMarchPass,
-    /// Live CSG preview for the build viewport. Writes the same G-buffer
-    /// as `march`, so downstream passes don't care which one ran — only
-    /// one of the two executes per frame, chosen by the host via
-    /// `render_to`'s `preview_mode` parameter.
+    /// Live CSG preview for the build viewport. Writes the same
+    /// G-buffer as the mesh raster, so downstream passes don't care
+    /// which path ran — only one of the two executes per frame, chosen
+    /// by the host via `render_to`'s `preview_mode` parameter.
     pub proc_raymarch: ProcRaymarchPass,
-    /// Selected-primitive outline overlay. Reads the NodeId channel
-    /// the raymarch writes into the material G-buffer and highlights
-    /// the silhouette of the currently-selected node. Only dispatched
-    /// when the viewport is in raymarch mode — voxel mode doesn't
-    /// carry per-primitive NodeIds in the same G-buffer slot.
+    /// Selected-primitive outline overlay for the procedural raymarch
+    /// preview. Reads the NodeId channel the raymarch writes and
+    /// highlights the silhouette of the currently-selected node.
     pub proc_outline: ProcOutlinePass,
     /// Ghost-cutter overlay — shows Subtract/Intersect operands even
     /// where they've been carved away. No G-buffer input; runs its
     /// own small raymarch over a filtered subset of primitives the
     /// host selects based on the current tree selection.
     pub proc_ghost: ProcGhostPass,
-    pub shadow_trace: ShadowTracePass,
-    /// Phase 8 — directional shadow map (light-POV depth march).
-    /// One shared per-VR depth texture; resolution is fixed at
-    /// `SHADOW_MAP_DEFAULT_SIZE` regardless of viewport size (the
-    /// map covers the whole scene). S3 just creates the pass and
-    /// binds its texture / uniform into shade; S4 will wire the
-    /// per-frame dispatch.
+    /// Directional shadow-buffer storage + per-frame `LightCameraCsm`.
+    /// `mesh_shadow_map_pass` writes the depth slices; shade samples
+    /// them.
     pub shadow_map: ShadowMapPass,
     pub ssao: RkpSsaoPass,
     pub shade: RkpShadePass,
     pub glass: crate::rkp_glass::RkpGlassPass,
     pub volumetric: RkpVolumetricPass,
     pub god_rays: RkpGodRayPass,
+    /// 1×1 Rgba8Unorm placeholder bound at shade's `shadow_tex`
+    /// binding. See the comment near construction in `new()`.
+    pub shadow_fallback_texture: wgpu::Texture,
+    pub shadow_fallback_view: wgpu::TextureView,
 
     // ── Per-VR render targets + post-process ───────────────────────
     pub gbuffer: crate::GBuffer,
@@ -436,17 +431,12 @@ impl ViewportRenderer {
 
         // Per-VR passes. Each wired to: (a) its own gbuffer views, (b)
         // the shared scene bind-group layout + shared buffers on renderer.
-        let mut march = OctreeMarchPass::new(device, &renderer.scene.bind_group_layout);
-        march.set_materials(device, &renderer.materials_buffer);
-        march.set_lights(device, &renderer.lights_buffer);
-        march.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view, &gbuffer.glass_view, &gbuffer.leaf_slot_view);
-        // shader_params binding deferred — `shade` owns the buffer
-        // and isn't constructed yet. Wired below after `shade::new`.
 
-        // Procedural CSG raymarch — alternative primary-visibility pass
-        // for the build viewport. Wired to the same per-VR camera + gbuffer
-        // so the host can flip between voxel and raymarch without touching
-        // the rest of the chain.
+        // Procedural CSG raymarch — alternative primary-visibility
+        // pass for the build viewport. Wired to the same per-VR
+        // camera + gbuffer so the host can flip between the mesh
+        // raster and the raymarch preview without touching the rest
+        // of the chain.
         let mut proc_raymarch = ProcRaymarchPass::new(device);
         proc_raymarch.set_camera(device, &camera_buffer);
         proc_raymarch.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view, &gbuffer.material_view, &pick_view, &gbuffer.glass_view, &gbuffer.leaf_slot_view);
@@ -461,23 +451,40 @@ impl ViewportRenderer {
         let mut ssao = RkpSsaoPass::new(device, queue, width, height);
         ssao.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view);
 
-        let mut shadow_trace = ShadowTracePass::new(
-            device, width, height,
-            &renderer.scene.bind_group_layout,
-            march.params_bind_group_layout(),
-        );
-        shadow_trace.set_gbuffer(device, &gbuffer.position_view, &gbuffer.normal_view);
+        // Shadow-buffer storage + per-frame `LightCameraCsm` uniform.
+        // `mesh_shadow_map_pass` writes the depth slices; shade
+        // samples them.
+        let shadow_map = ShadowMapPass::new(device, SHADOW_MAP_DEFAULT_SIZE);
 
-        // Phase 8 — shadow map pass. Three pipelines (clear /
-        // setup / scatter) over a u32 storage buffer. The engine
-        // writes the light_camera uniform + dispatches the chain
-        // each frame; the shade pass reads the buffer directly.
-        let shadow_map = ShadowMapPass::new(
-            device,
-            queue,
-            SHADOW_MAP_DEFAULT_SIZE,
-            &renderer.scene.bind_group_layout,
+        // 1×1 placeholder for shade's group(1) binding(0) `shadow_tex`.
+        // Historically this was the half-res ray-traced shadow texture
+        // for spot/point lights; that source died with the march
+        // retirement. Directional shadows now come from
+        // `shadow_buffer` (binding 3); spot/point are temporarily
+        // unshadowed. Phase 2 cleanup audit will drop this binding
+        // from the WGSL and remove the field.
+        let shadow_fallback_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rkp_shade shadow_tex fallback"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &shadow_fallback_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255_u8, 255, 255, 255],
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
         );
+        let shadow_fallback_view = shadow_fallback_texture.create_view(&Default::default());
 
         // Phase 3 (splat-to-mesh pivot) + CSM — depth attachment for
         // the mesh-shadow render pass. The render writes per-cascade
@@ -562,11 +569,6 @@ impl ViewportRenderer {
             &renderer.lights_buffer,
             &renderer.materials_buffer,
         );
-        // Phase B-redux Phase 3a — march reads the same per-material
-        // shader_params buffer the shade pass owns. set_shader_params
-        // is also called on each `refresh_bindings` and after every
-        // `upload_shader_params` realloc in render_worker.
-        march.set_shader_params(device, shade.shader_params_buffer());
         shade.set_camera(device, &camera_buffer);
         shade.set_atmosphere_luts(
             device,
@@ -598,7 +600,7 @@ impl ViewportRenderer {
         ));
         shade.set_shadow_and_ssao(
             device,
-            &shadow_trace.output_view,
+            &shadow_fallback_view,
             &ssao.output_view,
             &shadow_map.shadow_buffer,
             &shadow_map.uniform_buffer,
@@ -663,8 +665,9 @@ impl ViewportRenderer {
 
         Self {
             camera_buffer, scene_bind_group, scene_epoch, lights_materials_epoch,
-            march, proc_raymarch, proc_outline, proc_ghost,
-            shadow_trace, shadow_map, ssao, shade, glass, volumetric, god_rays,
+            proc_raymarch, proc_outline, proc_ghost,
+            shadow_map, ssao, shade, glass, volumetric, god_rays,
+            shadow_fallback_texture, shadow_fallback_view,
             gbuffer, pick_texture, pick_view, bloom, bloom_composite, tone_map,
             composite_texture, composite_view,
             readback,
@@ -836,7 +839,7 @@ impl ViewportRenderer {
         // a reference to the old shadow_buffer (just recreated).
         self.shade.set_shadow_and_ssao(
             device,
-            &self.shadow_trace.output_view,
+            &self.shadow_fallback_view,
             &self.ssao.output_view,
             &self.shadow_map.shadow_buffer,
             &self.shadow_map.uniform_buffer,
@@ -1806,8 +1809,8 @@ impl ViewportRenderer {
     }
 
     /// Rebuild scene bind group if shared scene buffers reallocated.
-    /// Also rebuild march + shade lights/materials bindings if those
-    /// buffers reallocated (separate epoch — different write path).
+    /// Also rebuild shade lights/materials bindings if those buffers
+    /// reallocated (separate epoch — different write path).
     pub fn refresh_bindings(&mut self, device: &wgpu::Device, renderer: &RkpRenderer) {
         let scene_now = renderer.scene.buffers_epoch();
         if scene_now != self.scene_epoch {
@@ -1816,18 +1819,12 @@ impl ViewportRenderer {
         }
         let lm_now = renderer.lights_materials_epoch();
         if lm_now != self.lights_materials_epoch {
-            self.march.set_materials(device, &renderer.materials_buffer);
-            self.march.set_lights(device, &renderer.lights_buffer);
             self.shade.set_shade_data(
                 device,
                 &renderer.shade_params_buffer,
                 &renderer.lights_buffer,
                 &renderer.materials_buffer,
             );
-            // Phase B-redux Phase 3a — refresh march's shader_params
-            // binding; mirrors the per-frame call in render_worker so
-            // a buffer realloc here doesn't leave march on stale data.
-            self.march.set_shader_params(device, self.shade.shader_params_buffer());
             // Glass pass also reads the materials SSBO (for glass
             // albedo / IOR) + shade_params + lights (for GGX direct
             // spec). Refresh all three when the lights/materials
@@ -1889,15 +1886,11 @@ impl ViewportRenderer {
         self.splat_resolve_g0_bg = None;
 
         // Per-VR passes — resize internal textures + re-wire gbuffer bindings.
-        self.march.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
         self.proc_raymarch.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.pick_view, &self.gbuffer.glass_view, &self.gbuffer.leaf_slot_view);
         self.proc_outline.set_gbuffer(device, &self.pick_view);
 
         self.ssao.resize(device, width, height);
         self.ssao.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view);
-
-        self.shadow_trace.resize(device, width, height);
-        self.shadow_trace.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view);
 
         self.shade.resize(device, width, height);
         self.shade.set_gbuffer(device, &self.gbuffer.position_view, &self.gbuffer.normal_view, &self.gbuffer.material_view, &self.gbuffer.glass_view, &self.pick_view);
@@ -1916,7 +1909,7 @@ impl ViewportRenderer {
         // resize. Re-binding picks up the same buffer.
         self.shade.set_shadow_and_ssao(
             device,
-            &self.shadow_trace.output_view,
+            &self.shadow_fallback_view,
             &self.ssao.output_view,
             &self.shadow_map.shadow_buffer,
             &self.shadow_map.uniform_buffer,

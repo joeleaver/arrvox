@@ -92,24 +92,13 @@ pub(super) fn encode_viewports(
         let mut shade_params = vp.shade_params;
         let in_situ = matches!(vp.mode, rkp_render::RenderMode::InSitu);
         let raymarch = matches!(vp.preview_mode, rkp_render::BuildPreviewMode::Raymarch);
-        let splat = matches!(
-            state.renderer.primary_mode,
-            rkp_render::rkp_renderer::PrimaryMode::Splat,
-        );
-        // Splat path skips shadow_trace + shadow_map dispatch (both
-        // need march's params bg). Force shade to use shadow=1.0
-        // instead of sampling the stale shadow_tex / shadow_buffer.
-        //
-        // Mesh path renders its own directional shadow map into the
-        // same `shadow_buffer` shade already samples — gated by
-        // `pre.shadow_map_enabled`, which `prepare_shadow_maps`
-        // returns true for in mesh mode whenever a directional caster
-        // is live. So mesh keeps `shadow_disabled = 0` and toggles
-        // `shadow_map_enabled` like march does.
+        // Mesh path renders its directional shadow map into
+        // `shadow_buffer` — gated by `pre.shadow_map_enabled`,
+        // which is true whenever a directional caster is live.
         let vr_shadow_map_live =
-            pre.shadow_map_enabled && in_situ && !raymarch && !splat;
+            pre.shadow_map_enabled && in_situ && !raymarch;
         shade_params.shadow_map_enabled = u32::from(vr_shadow_map_live);
-        shade_params.shadow_disabled = u32::from(splat);
+        shade_params.shadow_disabled = 0;
         // PCF tap count comes from the Shadow Quality preset; the
         // shade shader clamps 1..16 internally.
         shade_params.pcf_taps = frame.shadow_csm_pcf_taps;
@@ -136,11 +125,9 @@ pub(super) fn encode_viewports(
         // stuck-snapshot loop: state went IDLE → PENDING → READY and
         // then every subsequent frame's copy was skipped because state
         // stayed READY until the next drain.
-        let drained_stats = if std::env::var("RKP_MARCH_STATS").is_ok() {
-            vr.march.try_drain_stats()
-        } else {
-            None
-        };
+        // March stats readback retired with the march pass. Mesh path
+        // uses RKP_MESH_PIPESTATS for similar diagnostics.
+        let drained_stats: Option<()> = None;
 
         let mut encoder = state
             .device
@@ -388,12 +375,7 @@ pub(super) fn encode_viewports(
         // previously-resolved snapshot and eprintln's the descend-body
         // breakdown counters. Single staging buffer per source,
         // skip-if-busy — never blocks the render thread.
-        if std::env::var("RKP_MARCH_STATS").is_ok() {
-            if let Some(stats) = &drained_stats {
-                eprint_march_stats(vp.id, stats);
-            }
-            vr.march.submit_stats_readback();
-        }
+        let _ = drained_stats;
     }
 
     // Stash this frame's un-interpolated view_proj per viewport for

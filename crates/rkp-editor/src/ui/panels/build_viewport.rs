@@ -369,9 +369,9 @@ fn render_preview_toggle(
     let mode = store.build_preview_mode;
 
     let set_voxel = move || {
-        mode.set(BuildPreviewMode::Voxel);
+        mode.set(BuildPreviewMode::Baked);
         let _ = cmd_tx.get().send(rkp_engine::EngineCommand::SetBuildPreviewMode {
-            mode: BuildPreviewMode::Voxel,
+            mode: BuildPreviewMode::Baked,
         });
     };
     let set_raymarch = move || {
@@ -405,7 +405,7 @@ fn render_preview_toggle(
                     "Procedural"
                 }
                 button {
-                    style: {move || btn_style(matches!(mode.get(), BuildPreviewMode::Voxel))},
+                    style: {move || btn_style(matches!(mode.get(), BuildPreviewMode::Baked))},
                     onclick: set_voxel,
                     "Voxel"
                 }
