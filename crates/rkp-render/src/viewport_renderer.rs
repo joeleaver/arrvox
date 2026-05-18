@@ -68,11 +68,6 @@ pub struct ViewportRenderer {
     pub glass: crate::rkp_glass::RkpGlassPass,
     pub volumetric: RkpVolumetricPass,
     pub god_rays: RkpGodRayPass,
-    /// 1×1 Rgba8Unorm placeholder bound at shade's `shadow_tex`
-    /// binding. See the comment near construction in `new()`.
-    pub shadow_fallback_texture: wgpu::Texture,
-    pub shadow_fallback_view: wgpu::TextureView,
-
     // ── Per-VR render targets + post-process ───────────────────────
     pub gbuffer: crate::GBuffer,
     /// rkp-side pick G-buffer — `R32Uint` sibling of the shared
@@ -453,36 +448,6 @@ impl ViewportRenderer {
         // samples them.
         let shadow_map = ShadowMapPass::new(device, SHADOW_MAP_DEFAULT_SIZE);
 
-        // 1×1 placeholder for shade's group(1) binding(0) `shadow_tex`.
-        // Historically this was the half-res ray-traced shadow texture
-        // for spot/point lights; that source died with the march
-        // retirement. Directional shadows now come from
-        // `shadow_buffer` (binding 3); spot/point are temporarily
-        // unshadowed. Phase 2 cleanup audit will drop this binding
-        // from the WGSL and remove the field.
-        let shadow_fallback_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("rkp_shade shadow_tex fallback"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &shadow_fallback_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &[255_u8, 255, 255, 255],
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
-            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-        );
-        let shadow_fallback_view = shadow_fallback_texture.create_view(&Default::default());
-
         // CSM — depth attachment for the mesh-shadow render pass. The render writes per-cascade
         // (vertex + rasterizer + depth-only, no fragment shader); the
         // blit compute pass reads each layer back and copies
@@ -596,7 +561,6 @@ impl ViewportRenderer {
         ));
         shade.set_shadow_and_ssao(
             device,
-            &shadow_fallback_view,
             &ssao.output_view,
             &shadow_map.shadow_buffer,
             &shadow_map.uniform_buffer,
@@ -663,7 +627,6 @@ impl ViewportRenderer {
             camera_buffer, scene_bind_group, scene_epoch, lights_materials_epoch,
             proc_raymarch, proc_outline, proc_ghost,
             shadow_map, ssao, shade, glass, volumetric, god_rays,
-            shadow_fallback_texture, shadow_fallback_view,
             gbuffer, pick_texture, pick_view, bloom, bloom_composite, tone_map,
             composite_texture, composite_view,
             readback,
@@ -835,7 +798,6 @@ impl ViewportRenderer {
         // a reference to the old shadow_buffer (just recreated).
         self.shade.set_shadow_and_ssao(
             device,
-            &self.shadow_fallback_view,
             &self.ssao.output_view,
             &self.shadow_map.shadow_buffer,
             &self.shadow_map.uniform_buffer,
@@ -1905,7 +1867,6 @@ impl ViewportRenderer {
         // resize. Re-binding picks up the same buffer.
         self.shade.set_shadow_and_ssao(
             device,
-            &self.shadow_fallback_view,
             &self.ssao.output_view,
             &self.shadow_map.shadow_buffer,
             &self.shadow_map.uniform_buffer,

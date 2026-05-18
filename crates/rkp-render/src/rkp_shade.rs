@@ -90,17 +90,14 @@ pub struct ShadeParams {
     /// time-driven effects (hologram scroll, fresnel pulse, etc.).
     pub time: f32,
     pub brush_color: [f32; 4],
-    /// Phase 8 S3 — non-zero ⇒ directional shadow comes from the
-    /// shadow-map sample at group 1 binding 3 instead of the
-    /// half-res ray-traced shadow_tex. Zero leaves the per-pixel
-    /// path live (used pre-S5 cutover or whenever the engine has
-    /// no live shadow map this frame).
+    /// Non-zero ⇒ directional shadow comes from the CSM shadow
+    /// buffer (g1 binding 2). Zero ⇒ unshadowed (used when no CSM
+    /// render has happened this frame).
     pub shadow_map_enabled: u32,
-    /// Non-zero ⇒ shade forces shadow=1.0 instead of sampling
-    /// `shadow_tex`. Used when no shadow pass has run this frame
-    /// (e.g. shadow disabled in viewport settings); without this
-    /// gate the stale `shadow_tex` would clamp lighting to near-
-    /// zero and the whole frame would render dark.
+    /// Non-zero ⇒ all shadow sampling is bypassed and `light_shadow`
+    /// is forced to 1.0. Used when no shadow pass has run this
+    /// frame (e.g. isolation mode, or shadow disabled in viewport
+    /// settings).
     pub shadow_disabled: u32,
     /// Per-fragment shadow-map tap count used by `sample_shadow_map`.
     /// 1 = single-tap (hard shadow, current cheapest); 4/9/16 =
@@ -277,20 +274,18 @@ impl RkpShadePass {
                 ],
             });
 
-        // Group 1: shadow texture + SSAO texture + (Phase 8)
-        // light_camera uniform + shadow_buffer (atomic-u32-backed
-        // depth target written by the scatter pass; shade reads
-        // u32 + bitcast to f32).
+        // Group 1: SSAO texture + CSM (light_camera uniform +
+        // shadow_buffer atomic-u32 depth) + glass shadow texture
+        // arrays (front + back depth, one layer per cascade).
         let ssao_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("rkp_shade shadow+ssao+shadowmap"),
                 entries: &[
                     texture_entry(0),
-                    texture_entry(1),
                     // light_camera uniform — wire format mirrors
                     // `shadow_map_pass::LightCameraUniform` (160 B).
                     wgpu::BindGroupLayoutEntry {
-                        binding: 2,
+                        binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
@@ -303,7 +298,7 @@ impl RkpShadePass {
                     // holding bitcast-encoded f32 depths. Read-only
                     // here; the scatter pass owns the writes.
                     wgpu::BindGroupLayoutEntry {
-                        binding: 3,
+                        binding: 2,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -317,7 +312,7 @@ impl RkpShadePass {
                     // with integer coords (no sampler) by
                     // `glass_shadow_attenuation` in `rkp_shade.wesl`.
                     wgpu::BindGroupLayoutEntry {
-                        binding: 4,
+                        binding: 3,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Depth,
@@ -327,7 +322,7 @@ impl RkpShadePass {
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
-                        binding: 5,
+                        binding: 4,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Depth,
@@ -626,14 +621,13 @@ impl RkpShadePass {
         }));
     }
 
-    /// Set shadow texture + SSAO texture + (Phase 8) shadow buffer
-    /// + light-camera uniform. WGSL gates the directional-shadow
-    /// read on `ShadeParams.shadow_map_enabled`; spot/point still
-    /// pull from the half-res ray-traced shadow_view.
+    /// Set SSAO texture + CSM (light-camera uniform + shadow_buffer)
+    /// + glass-shadow front/back texture arrays. WGSL gates the
+    /// directional-shadow read on `ShadeParams.shadow_map_enabled`.
+    /// Spot / point lights are currently unshadowed.
     pub fn set_shadow_and_ssao(
         &mut self,
         device: &wgpu::Device,
-        shadow_view: &wgpu::TextureView,
         ssao_view: &wgpu::TextureView,
         shadow_buffer: &wgpu::Buffer,
         light_camera_buffer: &wgpu::Buffer,
@@ -646,26 +640,22 @@ impl RkpShadePass {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(shadow_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
                     resource: wgpu::BindingResource::TextureView(ssao_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 2,
+                    binding: 1,
                     resource: light_camera_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 3,
+                    binding: 2,
                     resource: shadow_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 4,
+                    binding: 3,
                     resource: wgpu::BindingResource::TextureView(glass_shadow_front_array_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 5,
+                    binding: 4,
                     resource: wgpu::BindingResource::TextureView(glass_shadow_back_array_view),
                 },
             ],

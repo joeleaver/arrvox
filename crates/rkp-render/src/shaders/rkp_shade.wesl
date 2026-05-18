@@ -136,11 +136,8 @@ fn mat_subsurface_color(m: GpuMaterial) -> vec3<f32> {
 // gate so the ring stops at the silhouette of the selected entity.
 @group(0) @binding(4) var gbuf_pick: texture_2d<u32>;
 
-// Group 1: shadow texture (read, half-res) + SSAO texture (read, half-res)
-// shadow_tex is written by rkp_shadow_trace at half-res; we upsample it
-// per-pixel with a bilateral gather guided by position + normal deltas.
-@group(1) @binding(0) var shadow_tex: texture_2d<f32>;
-@group(1) @binding(1) var ssao_tex: texture_2d<f32>;
+// Group 1: SSAO texture (read, half-res) + CSM directional shadow.
+@group(1) @binding(0) var ssao_tex: texture_2d<f32>;
 
 // CSM (Cascaded Shadow Maps) — directional shadow uniform + buffer.
 // Wire-format mirror of `rkp_render::shadow_map_pass::LightCameraCsm`
@@ -167,12 +164,12 @@ struct LightCameraShadeCsm {
     _csm_pad1: u32,
     _csm_pad2: u32,
 }
-@group(1) @binding(2) var<uniform> light_camera: LightCameraShadeCsm;
+@group(1) @binding(1) var<uniform> light_camera: LightCameraShadeCsm;
 // Phase 8 V2 — shadow_buffer is `array<u32>` holding bit-cast
 // f32 depths, written by the mesh blit (mesh-mode) or scatter pass
 // (march-mode). For CSM the buffer is `CSM_CASCADE_COUNT * SIZE²`
 // u32s laid out cascade-major: `[cascade * SIZE² + ty * SIZE + tx]`.
-@group(1) @binding(3) var<storage, read> shadow_buffer: array<u32>;
+@group(1) @binding(2) var<storage, read> shadow_buffer: array<u32>;
 // Glass-shadow per-cascade depth maps from the light POV — captured
 // by `mesh_glass_shadow.wesl`'s front/back pipelines. Cleared to 1.0
 // on the front (closest entry wins) and 0.0 on the back (farthest
@@ -181,8 +178,8 @@ struct LightCameraShadeCsm {
 // between the light and the fragment. Mesh-mode only — march mode
 // leaves these at clear values, which `glass_shadow_attenuation`
 // reads as "no glass" (front >= back) and skips.
-@group(1) @binding(4) var glass_shadow_front: texture_depth_2d_array;
-@group(1) @binding(5) var glass_shadow_back:  texture_depth_2d_array;
+@group(1) @binding(3) var glass_shadow_front: texture_depth_2d_array;
+@group(1) @binding(4) var glass_shadow_back:  texture_depth_2d_array;
 
 // Group 2: output HDR color (write, full-res)
 @group(2) @binding(0) var output: texture_storage_2d<rgba16float, write>;
@@ -877,93 +874,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let f0_dielectric = vec3<f32>(dielectric_f0(ior));
     let f0 = mix(f0_dielectric, albedo, metallic);
 
-    // Per-light shadow: bilateral upsample from the half-res shadow texture
-    // written by rkp_shadow_trace. Each half-res sample's "reference
-    // surface" is the full-res gbuf pixel at (half_coord * 2); compare
-    // that against our pixel's surface to weight the 4 nearest samples
-    // and reject neighbors on different surfaces.
-    let shadow_dims = textureDimensions(shadow_tex);
-    let gbuf_dims = textureDimensions(gbuf_position);
-    // Continuous half-res coord: our full-res pixel center in half-res UVs.
-    // Full-res pixel (x, y) maps to half-res sample at (x/2, y/2); the
-    // 4 nearest integer half-res coords straddle that point.
-    let half_coord_f = (vec2<f32>(coord) + 0.5) * 0.5 - 0.5;
-    let base_half = vec2<i32>(floor(half_coord_f));
-    let frac = half_coord_f - vec2<f32>(base_half);
-    let spatial_w = vec4<f32>(
-        (1.0 - frac.x) * (1.0 - frac.y),
-        frac.x * (1.0 - frac.y),
-        (1.0 - frac.x) * frac.y,
-        frac.x * frac.y,
-    );
-    var shadow_data = vec4<f32>(0.0);
-    var w_sum = 0.0;
-    var bilinear_data = vec4<f32>(0.0);
-    // Isolation: shadow pass is skipped, so shadow_tex may contain
-    // stale data. Force fully-lit and bypass the bilateral gather.
-    // `shadow_disabled` takes the same branch — see ShadeParams docs.
-    if shade_params.isolation != 0u || shade_params.shadow_disabled != 0u {
-        shadow_data = vec4<f32>(1.0);
-        w_sum = 1.0;
-    } else {
-    // Position sigma — in world units. The shadow trace samples one full
-    // surface per 2-pixel block, so neighbors straddling a depth
-    // discontinuity should get ~zero weight. 5 cm is tight enough to
-    // prevent bleed across surface edges at the elephant's scale.
-    let sigma_pos = 0.05;
-    let inv_sigma2 = 1.0 / (sigma_pos * sigma_pos);
-    for (var k = 0u; k < 4u; k++) {
-        let dx = i32(k & 1u);
-        let dy = i32((k >> 1u) & 1u);
-        let half_c = base_half + vec2<i32>(dx, dy);
-        if half_c.x < 0 || half_c.y < 0
-            || u32(half_c.x) >= shadow_dims.x || u32(half_c.y) >= shadow_dims.y {
-            continue;
-        }
-        // Reference surface for this half-res sample = gbuf at half_c * 2.
-        let ref_full = half_c * 2;
-        if ref_full.x < 0 || ref_full.y < 0
-            || u32(ref_full.x) >= gbuf_dims.x || u32(ref_full.y) >= gbuf_dims.y {
-            continue;
-        }
-        let ref_pos = textureLoad(gbuf_position, ref_full, 0);
-        let ref_normal = textureLoad(gbuf_normal, ref_full, 0).xyz;
-        // Sky/miss neighbor: skip — no surface to compare against.
-        if ref_pos.w >= 1e9 { continue; }
-
-        let s = textureLoad(shadow_tex, half_c, 0);
-        bilinear_data += s * spatial_w[k];
-
-        let d_pos = ref_pos.xyz - world_pos;
-        let pos_term = exp(-dot(d_pos, d_pos) * inv_sigma2);
-        let n_dot = clamp(dot(ref_normal, N), 0.0, 1.0);
-        // BILATERAL_NORMAL_POW = 8 — sharper exponent than the cosine
-        // weight under-rejects neighbors at >~25° of normal difference;
-        // 8 keeps shadow detail from bleeding across surface facets.
-        // Open-coded as repeated multiplies to avoid pow()'s log/exp.
-        let nd2 = n_dot * n_dot;
-        let nd4 = nd2 * nd2;
-        let normal_term = nd4 * nd4;
-        let w = spatial_w[k] * pos_term * normal_term;
-        shadow_data += s * w;
-        w_sum += w;
-    }
-    // Fallback: if bilateral weights all rejected, fall back to plain
-    // bilinear so we never return zero from this gather on valid surfaces.
-    if w_sum < 1e-5 {
-        shadow_data = bilinear_data;
-    } else {
-        shadow_data /= w_sum;
-    }
-    } // end !isolation block
-
     // AO from half-res SSAO texture.
     let half_coord = vec2<i32>(gid.xy) / 2;
     let ao = textureLoad(ssao_tex, half_coord, 0).r;
 
     // Accumulate direct lighting.
     var lo = vec3<f32>(0.0);
-    var shadow_idx = 0u; // tracks which shadow channel to read
+
+    // Force-fully-lit when isolation mode is on or the engine has
+    // explicitly disabled shadow sampling (no shadow pass dispatched
+    // this frame).
+    let force_lit =
+        shade_params.isolation != 0u || shade_params.shadow_disabled != 0u;
 
     for (var li = 0u; li < shade_params.num_lights; li++) {
         let light = lights[li];
@@ -987,24 +909,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
 
-        // Read per-light shadow BEFORE the n_dot_l skip — must stay in sync
-        // with the march pass which always writes shadow for every shadow-casting light.
+        // Directional lights pull from the CSM when enabled; spot /
+        // point lights are currently unshadowed (the ray-traced
+        // source died with the march path; no replacement yet).
         var light_shadow = 1.0;
         let cast_shadow = light.params.w;
-        if cast_shadow >= 0.5 && shadow_idx < 4u {
-            // Phase 8 S3 — directional lights pull from the shadow
-            // map when enabled; everything else still reads the
-            // half-res ray-traced shadow_data. We always advance
-            // `shadow_idx` so the per-pixel slot mapping (set up
-            // by rkp_shadow_trace) stays in sync regardless of
-            // which path provided the visibility.
-            if light_type == 0u && shade_params.shadow_map_enabled != 0u {
-                light_shadow = sample_shadow_map(world_pos)
-                    * glass_shadow_attenuation(world_pos);
-            } else {
-                light_shadow = shadow_data[shadow_idx];
-            }
-            shadow_idx++;
+        if cast_shadow >= 0.5
+            && !force_lit
+            && light_type == 0u
+            && shade_params.shadow_map_enabled != 0u
+        {
+            light_shadow = sample_shadow_map(world_pos)
+                * glass_shadow_attenuation(world_pos);
         }
 
         let n_dot_l_raw = dot(N, L);
