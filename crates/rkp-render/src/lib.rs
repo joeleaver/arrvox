@@ -127,9 +127,6 @@ pub mod tlas_build_pass;
 /// `LightCameraCsm` uniform. The mesh path's `mesh_shadow_map_pass`
 /// writes the depth slices; `rkp_shade` samples them.
 pub mod shadow_map_pass;
-/// Skin-deform planning types — wire format only after the scatter
-/// pipeline retirement. See module docs.
-pub mod skin_deform;
 /// CPU-side paint writes against the scene's LeafAttrPool (material +
 /// per-voxel color mutations). Used by the editor's paint tool; the
 /// shader reads the same `color_pool_data` / `leaf_attr_pool` buffers
@@ -137,9 +134,8 @@ pub mod skin_deform;
 pub mod paint;
 
 pub use octree_gpu::OctreeGpu;
-pub use rkp_scene_manager::{AssetHandle, AssetInfo, ReloadResult, RkpSceneManager, SkinBrick, SkinningAssetData};
+pub use rkp_scene_manager::{AssetHandle, AssetInfo, ReloadResult, RkpSceneManager, SkinningAssetData};
 pub use viewport_renderer::ViewportRenderer;
-pub use skin_deform::{SkinBatchScratch, SkinBrickEntry, SkinDispatch, SkinUniforms};
 
 /// What a viewport's render pipeline should look like.
 ///

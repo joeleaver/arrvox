@@ -33,6 +33,6 @@ mod voxelize;
 pub use manager::{ms_since_process_ns, RkpSceneManager, WalkSnapshot};
 pub use sculpt::SculptApplyResult;
 pub use types::{
-    AssetHandle, AssetInfo, FaceInstance, ReloadResult, SkinBrick, SkinningAssetData,
+    AssetHandle, AssetInfo, FaceInstance, ReloadResult, SkinningAssetData,
     VoxelizeResult,
 };

@@ -93,19 +93,11 @@ fn make_instance(asset_id: u32, world: [[f32; 4]; 4], material: u32) -> RkpGpuIn
         layer_mask: 0xFFFF_FFFF,
         is_skinned: 0,
         bone_buffer_offset: 0,
-        bone_field_offset: 0,
-        bone_field_occ_offset: 0,
-        bone_field_dim_x: 0,
-        bone_field_dim_y: 0,
-        bone_field_dim_z: 0,
-        bone_field_origin_x: 0.0,
-        bone_field_origin_y: 0.0,
-        bone_field_origin_z: 0.0,
         overlay_offset: 0,
         overlay_count: 0,
         sculpt_offset: 0,
         sculpt_count: 0,
-        _pad_sculpt: [0; 2],
+        _pad: [0; 2],
     }
 }
 

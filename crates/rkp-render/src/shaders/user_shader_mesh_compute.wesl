@@ -145,13 +145,13 @@ struct DispatchInfo {
 @group(1) @binding(4)  var<storage, read> color_pool_data:  array<u32>;
 @group(1) @binding(7)  var<storage, read> brick_face_links: array<u32>;
 @group(1) @binding(8)  var<storage, read> leaf_attr_pool:   array<LeafAttr>;
-@group(1) @binding(12) var<storage, read> assets:           array<RkpAsset>;
-@group(1) @binding(13) var<storage, read> instance_overlay: array<OverlayEntry>;
+@group(1) @binding(10) var<storage, read> assets:           array<RkpAsset>;
+@group(1) @binding(11) var<storage, read> instance_overlay: array<OverlayEntry>;
 // Per-instance sculpt-carve overlay (Phase A). Free-name reference
 // pulled in by `lib::leaf_attr::is_leaf_removed`. paint_probe doesn't
 // itself call `is_leaf_removed`; the binding has to exist because
 // `use_stripping(false)` keeps the helper body in the splice.
-@group(1) @binding(14) var<storage, read> instance_sculpt:  array<u32>;
+@group(1) @binding(12) var<storage, read> instance_sculpt:  array<u32>;
 
 // `octree_lookup` reads `bucket_depth` + `bucket_lod_exit` as free
 // names. We have no `stats` binding, so they're no-ops.

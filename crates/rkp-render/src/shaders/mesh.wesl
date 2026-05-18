@@ -54,12 +54,11 @@ import package::lib::brick::BRICK_CELL_INTERIOR;
 //
 // `grid_origin` is the asset's voxel-grid origin in mesh-frame —
 // the same value the surface-mesh extractor added to every cell's
-// centroid when baking `local_pos`. Bone matrices in
-// `skin_deform`'s palette operate on **grid-frame** positions
-// (origin at octree corner) per `animation::tick`'s
-// `N · pose · N⁻¹` conjugation. The VS subtracts grid_origin from
-// `local_pos` before bones and adds it back after, so bones see
-// the same frame they were trained against.
+// centroid when baking `local_pos`. Bone matrices operate on
+// **grid-frame** positions (origin at octree corner) per
+// `animation::tick`'s `N · pose · N⁻¹` conjugation. The VS subtracts
+// grid_origin from `local_pos` before bones and adds it back after,
+// so bones see the same frame they were trained against.
 struct MeshInstance {
     world: mat4x4<f32>,
     grid_origin: vec3<f32>,
@@ -79,8 +78,7 @@ const SKINNING_MODE_DQS: u32 = 1u;
 
 // Dual-quaternion form for DQS — 32 B per bone. `r` is the rotation
 // (real) part, `d` is the translation-encoded (dual) part. Matches
-// `skin_deform.wesl`'s `DualQuat` so the same per-frame buffer feeds
-// both compute and raster paths.
+// the CPU-side `DualQuat` in `scene_sync.rs`.
 struct DualQuat {
     r: vec4<f32>,
     d: vec4<f32>,
@@ -89,11 +87,10 @@ struct DualQuat {
 // `bone_matrices` matches the buffer `BoneMatrixAllocator` writes —
 // one full `mat4x4<f32>` (64 B) per bone. The trailing row is always
 // `(0,0,0,1)` for affine bones; reading the bottom row as part of
-// the matrix is harmless and keeps the WGSL layout in lockstep with
-// `skin_deform.wesl`'s declaration. (An earlier draft of this shader
-// declared `BoneMatrix { row0, row1, row2 }` at 48 B and produced
-// "stretched all over" geometry — every other bone read landed mid-
-// matrix because the actual on-GPU stride is 64.)
+// the matrix is harmless. (An earlier draft of this shader declared
+// `BoneMatrix { row0, row1, row2 }` at 48 B and produced "stretched
+// all over" geometry — every other bone read landed mid-matrix
+// because the actual on-GPU stride is 64.)
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
 @group(0) @binding(2) var<storage, read> bone_matrices: array<mat4x4<f32>>;
 @group(0) @binding(3) var<storage, read> bone_dual_quats: array<DualQuat>;
@@ -207,11 +204,10 @@ fn dual_quat_transform_pos(dq: DualQuat, p: vec3<f32>) -> vec3<f32> {
     return rotated + translation;
 }
 
-// Antipodality-correct DQS blend over 4 influences. Lifted from
-// `skin_deform.wesl`'s `blend_dual_quat` — flipping each successive
-// quat into the same hemisphere as the first prevents the rotation
-// from cancelling at bones whose quaternions straddle the double
-// cover.
+// Antipodality-correct DQS blend over 4 influences. Flipping each
+// successive quat into the same hemisphere as the first prevents the
+// rotation from cancelling at bones whose quaternions straddle the
+// double cover.
 fn skin_dqs(p: vec3<f32>, indices: u32, weights: u32, offset: u32) -> vec3<f32> {
     var acc_r = vec4<f32>(0.0);
     var acc_d = vec4<f32>(0.0);

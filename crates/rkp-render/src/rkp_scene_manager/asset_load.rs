@@ -13,7 +13,7 @@ use rkp_core::{LeafAttr, SparseOctree};
 
 use super::manager::RkpSceneManager;
 use super::types::{
-    AssetEntry, AssetHandle, AssetInfo, ReloadResult, SkinBrick, SkinningAssetData,
+    AssetEntry, AssetHandle, AssetInfo, ReloadResult, SkinningAssetData,
 };
 use crate::mesh_pass::extract_surface_mesh;
 
@@ -708,18 +708,10 @@ impl RkpSceneManager {
             meshlet_clusters.iter().map(|c| c.lod_level).max().unwrap_or(0),
         );
 
-        // Promote the baked skin-meta (file-local brick ids) into
-        // scene-global SkinBrick entries. Rest bone AABBs are already
-        // in object-local voxel space — no transform needed.
+        // Rest bone AABBs are already in object-local voxel space —
+        // no transform needed.
         let skinning = if has_bones {
-            let bricks: Vec<SkinBrick> = skin_meta.brick_origins.iter().enumerate()
-                .map(|(file_id, &origin)| SkinBrick {
-                    brick_id: scene_brick_offset + file_id as u32,
-                    origin,
-                })
-                .collect();
             Some(SkinningAssetData {
-                bricks,
                 rest_bone_aabbs: skin_meta.rest_bone_aabbs,
             })
         } else {

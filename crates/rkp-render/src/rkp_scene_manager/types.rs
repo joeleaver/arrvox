@@ -1,7 +1,7 @@
 //! Wire types + asset cache for the scene manager.
 //!
 //! All public types that callers reference (`FaceInstance`, `AssetHandle`,
-//! `AssetInfo`, `SkinBrick`, `SkinningAssetData`, `ReloadResult`,
+//! `AssetInfo`, `SkinningAssetData`, `ReloadResult`,
 //! `VoxelizeResult`) live here. Private cache machinery (`AssetEntry`,
 //! `AssetCache`) is `pub(super)` so the asset-load impl in
 //! [`super::asset_load`] can manipulate it.
@@ -61,30 +61,18 @@ pub struct AssetInfo {
     pub voxel_count: u32,
     pub leaf_attr_slot_start: u32,
     pub leaf_attr_slot_count: u32,
-    /// `true` if this asset has skinning data (bone weights + SkinBricks
-    /// + rest bone AABBs) baked in. Caller fetches the full data via
+    /// `true` if this asset has skinning data (bone weights + rest
+    /// bone AABBs) baked in. Caller fetches the full data via
     /// [`RkpSceneManager::skinning_data`].
     pub has_skinning: bool,
 }
 
-/// One populated octree brick, with its scene-global id and its origin
-/// in finest-voxel grid units. Produced at load time by shifting each
-/// baked file-local origin's id by the asset's `scene_brick_offset`.
-#[derive(Debug, Clone, Copy)]
-pub struct SkinBrick {
-    /// Scene-global brick id (matches the ids stored in octree nodes).
-    pub brick_id: u32,
-    /// Brick corner in finest-voxel grid units.
-    pub origin: [u32; 3],
-}
-
 /// Per-asset skinning metadata read from the `.rkp`'s skin-meta
-/// section. Phase-3 scatter pass consumes this to size + populate the
-/// deformed bone field each frame.
+/// section. The runtime only uses `rest_bone_aabbs.len()` as the
+/// asset's bone count today — the cluster-AABB expansion at bake
+/// time also uses the AABBs themselves, but that lives in `rkp-core`.
 #[derive(Debug, Clone, Default)]
 pub struct SkinningAssetData {
-    /// One entry per populated brick in the asset's octree.
-    pub bricks: Vec<SkinBrick>,
     /// Per-bone rest-pose AABB, in object-local voxel space. Index is
     /// the bone id (as stored in per-leaf `BoneVoxel.bone_index`).
     /// Empty AABBs (zero-extent) are sentinels for unused bone slots.

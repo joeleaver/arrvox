@@ -216,21 +216,11 @@ pub(crate) struct EngineState {
     /// buffers — render only slice-uploads the dirty slot range.
     pub(crate) paint_epoch_handle: std::sync::Arc<std::sync::atomic::AtomicU64>,
 
-    /// Sim-side cache of per-asset skinning data. Built lazily under
-    /// the scene_mgr lock only when `skinning_data_cache_epoch` falls
-    /// behind the current `geometry_epoch_handle`, i.e. when a bake
-    /// completes or an asset is (re)loaded. On most ticks there's no
-    /// epoch change, so sim reads the cache directly without touching
-    /// the scene_mgr Mutex — even when bake_worker is mid-integrate
-    /// holding the lock for 100 ms+.
-    ///
-    /// The previous pattern was `scene_mgr.lock().unwrap().skinning_data(...)`
-    /// once per skinned entity inside `update_scene_gpu`, so any bake
-    /// in flight would stall sim for the full duration of the bake's
-    /// `integrate_artifact`. Dropped sim from 60 Hz to ~5 Hz with
-    /// multiple bakes and a few skinned entities — visible as
-    /// "0.5 fps animation and camera" even though render reported
-    /// 170 fps.
+    /// Sim-side cache of per-asset skinning data. Today only the
+    /// bone count (`rest_bone_aabbs.len()`) is read at runtime; the
+    /// cache is refreshed lazily under the scene_mgr lock only when
+    /// `skinning_data_cache_epoch` falls behind the current
+    /// `geometry_epoch_handle` (bake / asset load).
     pub(crate) skinning_data_cache: std::collections::HashMap<
         rkp_render::AssetHandle,
         rkp_render::SkinningAssetData,
@@ -558,39 +548,14 @@ pub(crate) struct EngineState {
     /// `Skeleton.current_pose` into one contiguous byte buffer for GPU
     /// upload. Rebuilt whenever `update_scene_gpu` runs.
     pub(crate) bone_matrix_allocator: crate::scene_sync::BoneMatrixAllocator,
-    /// Per-frame scatter dispatches — one per skinned entity with a
-    /// resolved skinning asset. Rebuilt in `update_scene_gpu`.
-    pub(crate) skin_dispatches: Vec<crate::scene_sync::PlannedSkinDispatch>,
-    /// Reusable per-frame scratch that concatenates every
-    /// `skin_dispatches` entry into the single batched compute
-    /// dispatch `scatter_skin_batch` fires.
-    pub(crate) skin_batch: rkp_render::SkinBatchScratch,
-    /// Total bytes required in `scene.bone_field_buffer` this frame;
-    /// drives the per-frame grow+clear.
-    pub(crate) skin_bone_field_bytes: u64,
-    /// Total bytes required in `scene.bone_field_occ_buffer` this
-    /// frame (packed 1-bit-per-brick occupancy bitmap paired with
-    /// `bone_field_buffer`).
-    pub(crate) skin_bone_field_occ_bytes: u64,
-    /// Per-skinned-entity cache of last frame's `current_pose`. Used
-    /// by the pause-aware scatter-skip — if every entity's pose is
-    /// byte-identical to last frame and the set of skinned entities
-    /// hasn't changed, the previous frame's `bone_field` buffer is
-    /// still valid, so both the clear and the scatter dispatch get
-    /// skipped. Big win when the user pauses an animation.
-    pub(crate) last_skin_poses: std::collections::HashMap<hecs::Entity, Vec<glam::Mat4>>,
-    /// `true` this frame iff the scatter can be skipped. Computed in
-    /// `update_scene_gpu` after `plan_skin_dispatch` runs.
-    pub(crate) skin_reuse: bool,
-    /// Master toggle — when false, skip scatter + fall the march back
-    /// to its rigid path. Driven by the AnimationPanel checkbox.
+    /// Master toggle — when false, every entity gets
+    /// `skinning_mode = SKINNING_MODE_NONE` so the mesh VS emits the
+    /// rest pose. Driven by the AnimationPanel checkbox.
     pub(crate) skinning_enabled: bool,
-    /// `true` → Dual-Quaternion Skinning in the scatter pass; `false`
-    /// → Linear Blend Skinning. DQS preserves joint volume and fixes
-    /// axial-twist candy-wrapper at ~+13% scatter cost. The visible
-    /// payoff on gentle clips (Mixamo walks) is subtle; defaults off
-    /// so the fast path is the common path. Flip on for extreme
-    /// poses (crouch, acrobatic, twist-heavy clips) or to A/B compare.
+    /// `true` → Dual-Quaternion Skinning in the VS; `false` →
+    /// Linear Blend Skinning. DQS preserves joint volume and fixes
+    /// axial-twist candy-wrapper at a slight per-vertex cost.
+    /// Defaults off; flip on for extreme poses or A/B compare.
     pub(crate) dqs_enabled: bool,
 
     /// Latest cloud-sun attenuation read from MAIN's volumetric pass,

@@ -26,20 +26,12 @@ struct GpuInstance {
     layer_mask: u32,
     is_skinned: u32,
     bone_buffer_offset: u32,
-    bone_field_offset: u32,
-    bone_field_occ_offset: u32,
-    bone_field_dim_x: u32,
-    bone_field_dim_y: u32,
-    bone_field_dim_z: u32,
-    bone_field_origin_x: f32,
-    bone_field_origin_y: f32,
-    bone_field_origin_z: f32,
     overlay_offset: u32,
     overlay_count: u32,
     sculpt_offset: u32,
     sculpt_count: u32,
-    _pad_sculpt0: u32,
-    _pad_sculpt1: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 // Mirrors `RkpGpuAsset` (80 B).

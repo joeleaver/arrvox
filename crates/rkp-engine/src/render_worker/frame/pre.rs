@@ -410,12 +410,8 @@ pub(super) fn run_pre_frame(
 
     let p_t_shadow_prepare = pre_start.elapsed();
 
-    // 2. Skin scatter (one batched compute dispatch). Sim folded every
-    //    skinned entity into `frame.skin.batch`; we just fire it.
     // Mesh path skins in the vertex shader against the per-frame
-    // `bone_matrices` / `bone_dual_quats` buffers — no scatter pass
-    // is needed.
-    let _ = &frame.skin;
+    // `bone_matrices` / `bone_dual_quats` buffers — no scatter pass.
 
     let transient_indices: Vec<u32> = Vec::new();
     let object_count = gpu_instances.len() as u32;

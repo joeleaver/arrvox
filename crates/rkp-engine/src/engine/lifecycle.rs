@@ -939,51 +939,6 @@ impl EngineState {
             rkp_core::DirtyRanges::new()
         };
 
-        // 2b. Skin scatter — fold per-entity dispatches into one
-        //     batched compute dispatch sim-side; render fires the
-        //     batch on its thread. `skin_reuse` short-circuits when
-        //     every skinned pose was byte-identical to the previous
-        //     frame (paused animation), in which case the bone_field
-        //     buffer from last frame is still valid and the scatter
-        //     can skip entirely.
-        let skin = if self.skinning_enabled
-            && !self.skin_dispatches.is_empty()
-            && !self.skin_reuse
-        {
-            self.skin_batch.clear();
-            for plan in &self.skin_dispatches {
-                let d = rkp_render::SkinDispatch {
-                    uniforms: plan.uniforms,
-                    bricks: &plan.bricks,
-                };
-                self.skin_batch.push(d);
-            }
-            Some(crate::render_frame::RenderSkin {
-                bone_field_bytes: self.skin_bone_field_bytes,
-                bone_field_occ_bytes: self.skin_bone_field_occ_bytes,
-                batch: self.skin_batch.clone(),
-            })
-        } else {
-            if self.skinning_enabled && self.frame_index % 60 == 0 {
-                // Once a second, log why scatter isn't running when
-                // the user has the toggle on — most common reason is
-                // a stale `.rkp` without the new skin-meta section.
-                let skinned_entities = self
-                    .world
-                    .query::<&crate::components::Skeleton>()
-                    .iter()
-                    .count();
-                if skinned_entities > 0 {
-                    eprintln!(
-                        "[RkpEngine] skinning enabled, {} skinned entities, but 0 scatter dispatches this frame. \
-                         Likely cause: stale .rkp without skin-meta section — re-import the asset.",
-                        skinned_entities,
-                    );
-                }
-            }
-            None
-        };
-
         let snap_t_bone = snap_phase_start.elapsed();
 
         // 3. Per-viewport snapshot build — derive every per-VR
@@ -1445,7 +1400,6 @@ impl EngineState {
             shade_params_base: self.shade_params_base,
             env_update,
             viewports: vp_list,
-            skin,
             bone_matrix_lbs,
             bone_matrix_dqs,
             bone_matrix_lbs_dirty,

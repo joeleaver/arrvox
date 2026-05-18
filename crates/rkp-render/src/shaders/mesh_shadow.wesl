@@ -13,13 +13,11 @@
 // already samples — so the shade-side sampling code is reused
 // unchanged.
 //
-// **Phase 6.6:** the VS now does the same LBS / DQS skinning
-// `mesh.wesl` does, so shadows follow skeletal animation. The math
-// is duplicated (rather than imported from a shared lib) because the
-// bone bindings live on this pipeline's `g0`, not the shared scene
-// `g0` that `skin_deform.wesl` reads from. A shared `lib::skin`
-// helper that takes pre-fetched bone palettes is a candidate
-// follow-on, but inline keeps each render-pass self-contained.
+// The VS does the same LBS / DQS skinning `mesh.wesl` does, so
+// shadows follow skeletal animation. The math is duplicated inline
+// (rather than imported from a shared lib) so each render-pass
+// stays self-contained — a `lib::skin` helper taking pre-fetched
+// bone palettes is a candidate follow-on.
 
 import package::lib::types::LightCameraCsm;
 import package::lib::types::LeafAttr;
@@ -57,9 +55,9 @@ struct DualQuat {
     d: vec4<f32>,
 }
 
-// `bone_matrices` is a 64 B `mat4x4<f32>` per bone (matches
-// `skin_deform.wesl`). Declaring it as `mat3x4` would shave 16 B per
-// bone but mismatches the on-GPU stride that the writer uses, which
+// `bone_matrices` is a 64 B `mat4x4<f32>` per bone — matches the
+// stride `BoneMatrixAllocator` writes. Declaring it as `mat3x4`
+// would shave 16 B per bone but mismatches the on-GPU stride, which
 // produced "stretched all over" geometry in an earlier draft.
 @group(0) @binding(0) var<uniform> light_camera: LightCameraCsm;
 @group(0) @binding(1) var<uniform> shadow_params: MeshShadowParams;

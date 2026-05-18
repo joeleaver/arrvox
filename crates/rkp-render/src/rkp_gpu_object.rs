@@ -66,9 +66,6 @@ pub mod geom_type {
 /// stay populated even if a particular instance's per-frame skin plan
 /// bails (deformed AABB out of bounds, dimension cap, etc).
 ///
-/// `bone_field_dim_*` and `bone_field_origin_*` are NOT here — those
-/// describe the per-frame deformed AABB grid, which depends on the
-/// instance's current pose, so they live on `RkpGpuInstance`.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
 pub struct RkpGpuAsset {
@@ -88,20 +85,21 @@ pub struct RkpGpuAsset {
     pub _pad: u32,
 }
 
-/// Per-instance GPU record (144 bytes). One per scene entity; carries:
+/// Per-instance GPU record (112 bytes). One per scene entity; carries:
 /// - world transform (inverse computed on demand by the shader via
 ///   `mat4_affine_inverse(inst.world)` — ~25 ALU vs 64 B/instance saved)
 /// - asset reference (`asset_id` indexes into the assets table)
 /// - per-entity overrides (material, picking id, layer mask)
-/// - per-frame skinning runtime state: bone palette offset + bone-field
-///   allocation + per-pose deformed AABB grid
+/// - per-instance skinning state: bone palette offset only (the mesh
+///   VS skins per-vertex against the per-frame bone-matrix buffer; no
+///   per-instance deformed-AABB grid lives here anymore)
 /// - per-instance paint overlay (sparse `(slot, attr, color)` entries
 ///   in a global overlay buffer; `overlay_count == 0` ⇒ asset's pool
 ///   values are used directly)
 /// - per-instance sculpt overlay (sparse `leaf_attr_id` removal set in
 ///   a global sculpt buffer; `sculpt_count == 0` ⇒ no carved leaves)
 ///
-/// # Layout (144 bytes)
+/// # Layout (112 bytes)
 ///
 /// | Offset | Size | Field |
 /// |--------|------|-------|
@@ -112,19 +110,11 @@ pub struct RkpGpuAsset {
 /// | 76     | 4    | layer_mask (u32) |
 /// | 80     | 4    | is_skinned (u32) |
 /// | 84     | 4    | bone_buffer_offset (u32) |
-/// | 88     | 4    | bone_field_offset (u32) |
-/// | 92     | 4    | bone_field_occ_offset (u32) |
-/// | 96     | 4    | bone_field_dim_x (u32) |
-/// | 100    | 4    | bone_field_dim_y (u32) |
-/// | 104    | 4    | bone_field_dim_z (u32) |
-/// | 108    | 4    | bone_field_origin_x (f32) |
-/// | 112    | 4    | bone_field_origin_y (f32) |
-/// | 116    | 4    | bone_field_origin_z (f32) |
-/// | 120    | 4    | overlay_offset (u32) |
-/// | 124    | 4    | overlay_count (u32) |
-/// | 128    | 4    | sculpt_offset (u32) |
-/// | 132    | 4    | sculpt_count (u32) |
-/// | 136    | 8    | _pad (8 B, keeps stride a 16 B multiple for mat4x4) |
+/// | 88     | 4    | overlay_offset (u32) |
+/// | 92     | 4    | overlay_count (u32) |
+/// | 96     | 4    | sculpt_offset (u32) |
+/// | 100    | 4    | sculpt_count (u32) |
+/// | 104    | 8    | _pad (8 B, keeps stride a 16 B multiple for mat4x4) |
 ///
 /// `overlay_offset` + `overlay_count` describe a slice into the
 /// scene-global `instance_overlay` buffer (Phase 3 paint). The WGSL fetch
@@ -136,7 +126,7 @@ pub struct RkpGpuAsset {
 /// removed `leaf_attr_id`s (Phase A sculpt overlay). The WGSL helper
 /// `is_leaf_removed` returns `false` when `sculpt_count == 0`.
 ///
-/// 144 B is a multiple of 16; the mat4x4 alignment requirement is
+/// 112 B is a multiple of 16; the mat4x4 alignment requirement is
 /// satisfied via the trailing 8-byte pad.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
@@ -148,19 +138,11 @@ pub struct RkpGpuInstance {
     pub layer_mask: u32,
     pub is_skinned: u32,
     pub bone_buffer_offset: u32,
-    pub bone_field_offset: u32,
-    pub bone_field_occ_offset: u32,
-    pub bone_field_dim_x: u32,
-    pub bone_field_dim_y: u32,
-    pub bone_field_dim_z: u32,
-    pub bone_field_origin_x: f32,
-    pub bone_field_origin_y: f32,
-    pub bone_field_origin_z: f32,
     pub overlay_offset: u32,
     pub overlay_count: u32,
     pub sculpt_offset: u32,
     pub sculpt_count: u32,
-    pub _pad_sculpt: [u32; 2],
+    pub _pad: [u32; 2],
 }
 
 #[cfg(test)]
@@ -186,38 +168,30 @@ mod tests {
     }
 
     #[test]
-    fn instance_size_is_144_bytes() {
-        // mat4x4 alignment requires stride to be a multiple of 16; 144
-        // satisfies it via the 8-byte trailing _pad_sculpt.
-        assert_eq!(mem::size_of::<RkpGpuInstance>(), 144);
+    fn instance_size_is_112_bytes() {
+        // mat4x4 alignment requires stride to be a multiple of 16; 112
+        // satisfies it via the 8-byte trailing _pad.
+        assert_eq!(mem::size_of::<RkpGpuInstance>(), 112);
     }
 
     #[test]
-    fn instance_overlay_offset_at_offset_120() {
+    fn instance_overlay_offset_at_offset_88() {
         let i = RkpGpuInstance::zeroed();
         let base = &i as *const _ as usize;
         let field = &i.overlay_offset as *const _ as usize;
-        assert_eq!(field - base, 120);
+        assert_eq!(field - base, 88);
         let field2 = &i.overlay_count as *const _ as usize;
-        assert_eq!(field2 - base, 124);
+        assert_eq!(field2 - base, 92);
     }
 
     #[test]
-    fn instance_sculpt_fields_at_offset_128() {
+    fn instance_sculpt_fields_at_offset_96() {
         let i = RkpGpuInstance::zeroed();
         let base = &i as *const _ as usize;
         let f_off = &i.sculpt_offset as *const _ as usize;
         let f_cnt = &i.sculpt_count as *const _ as usize;
-        assert_eq!(f_off - base, 128);
-        assert_eq!(f_cnt - base, 132);
-    }
-
-    #[test]
-    fn instance_bone_field_dim_at_offset_96() {
-        let i = RkpGpuInstance::zeroed();
-        let base = &i as *const _ as usize;
-        let field = &i.bone_field_dim_x as *const _ as usize;
-        assert_eq!(field - base, 96);
+        assert_eq!(f_off - base, 96);
+        assert_eq!(f_cnt - base, 100);
     }
 
     #[test]

@@ -54,7 +54,7 @@ use rkp_render::{
     rkp_scene::CameraUniforms,
     rkp_shade::{GpuLight, GpuMaterial, ShadeParams},
     rkp_volumetric::{CloudParams, VolumetricParams},
-    BuildPreviewMode, LineVertex, RenderMode, SkinBatchScratch,
+    BuildPreviewMode, LineVertex, RenderMode,
 };
 
 use crate::viewport::ViewportId;
@@ -176,13 +176,6 @@ pub struct RenderFrame {
 
     /// One entry per visible viewport, in submission order.
     pub viewports: Vec<RenderViewport>,
-
-    /// Skin scatter dispatch payload. `None` when skinning is
-    /// disabled, no skinned entities are present, or when sim
-    /// detected the pose set was byte-identical to the previous frame
-    /// (`skin_reuse`) — in that case render leaves last frame's
-    /// `bone_field` intact and skips the scatter encoder entirely.
-    pub skin: Option<RenderSkin>,
 
     /// Bytes packed by sim's `BoneMatrixAllocator` for the shade pass
     /// (LBS) — concatenated per-entity poses. Empty when no skinned
@@ -352,17 +345,6 @@ pub struct RenderProcRaymarch {
     /// outline overlay). `None` = nothing selected → render writes
     /// `OutlineParams::NONE`.
     pub selected_node: Option<u32>,
-}
-
-/// Skin-scatter batched dispatch — folded by sim's
-/// `plan_skin_dispatch`, fired by render in one compute pass.
-pub struct RenderSkin {
-    /// Total bytes the bone-field buffer must hold this frame.
-    pub bone_field_bytes: u64,
-    /// Total bytes the bone-field occupancy bitmap must hold this frame.
-    pub bone_field_occ_bytes: u64,
-    /// Pre-built batched dispatch — every skinned entity folded in.
-    pub batch: SkinBatchScratch,
 }
 
 /// One-shot pick request. The render thread encodes the texture copy

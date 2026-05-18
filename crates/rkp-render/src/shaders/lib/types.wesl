@@ -72,8 +72,8 @@ struct OverlayEntry {
 // `sculpt_offset`/`sculpt_count` slice into the `instance_sculpt`
 // binding — a sorted `array<u32>` of removed `leaf_attr_id`s. The
 // helper `is_leaf_removed` returns `false` when `sculpt_count == 0`.
-// `_pad_sculpt0`/`_pad_sculpt1` round the stride to a 16 B multiple
-// so the mat4x4 alignment requirement stays satisfied.
+// `_pad0`/`_pad1` round the stride to a 16 B multiple so the mat4x4
+// alignment requirement stays satisfied.
 struct RkpInstance {
     world: mat4x4<f32>,
     asset_id: u32,
@@ -82,19 +82,12 @@ struct RkpInstance {
     layer_mask: u32,
     is_skinned: u32,
     bone_buffer_offset: u32,
-    bone_field_offset: u32,
-    bone_field_occ_offset: u32,
-    bone_field_dim_x: u32, bone_field_dim_y: u32,
-    bone_field_dim_z: u32,
-    bone_field_origin_x: f32,
-    bone_field_origin_y: f32,
-    bone_field_origin_z: f32,
     overlay_offset: u32,
     overlay_count: u32,
     sculpt_offset: u32,
     sculpt_count: u32,
-    _pad_sculpt0: u32,
-    _pad_sculpt1: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 // Per-asset metadata (one per imported model / generated mesh). CPU

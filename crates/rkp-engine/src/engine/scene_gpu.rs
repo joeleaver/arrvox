@@ -16,18 +16,6 @@ impl EngineState {
         // Re-pack every skinned entity's current pose into the scene
         // bone buffer. Empty when no animated entities are loaded.
         self.bone_matrix_allocator.rebuild(&self.world);
-        // Wipe last frame's scatter plan — rebuilt below per skinned
-        // entity. Bone-field cells are u64s of offset; cells × 8 B =
-        // total bone-field bytes.
-        self.skin_dispatches.clear();
-        let mut running_bone_field_cells: u32 = 0;
-        let mut running_bone_field_occ_u32s: u32 = 0;
-
-        // Pose cache for the scatter-skip check. Built in lock-step
-        // with the planning loop and swapped with `last_skin_poses`
-        // at the end of this function. Equal maps → skip scatter.
-        let mut this_frame_poses: std::collections::HashMap<hecs::Entity, Vec<glam::Mat4>>
-            = std::collections::HashMap::new();
 
         // Route through `Arc::make_mut`: in steady state refcount=1
         // (render dropped last frame's snapshot) so this is a free
@@ -168,72 +156,14 @@ impl EngineState {
                     depth: spatial.depth,
                     base_voxel_size: spatial.base_voxel_size,
                 };
-                let mut skinning = self.bone_matrix_allocator.binding(entity);
-                // Plan the skin-deform scatter for this entity if it's
-                // animated AND the asset has baked skinning metadata.
-                if self.skinning_enabled {
-                    if let (Some(bind), Some(handle)) = (skinning, renderable.asset_handle) {
-                        // Cache lookup — no scene_mgr lock here. The
-                        // cache is refreshed at the top of this fn
-                        // only when geometry epoch advances.
-                        if let (Some(skel), Some(skin_data)) = (
-                            self.world.get::<&crate::components::Skeleton>(entity).ok(),
-                            self.skinning_data_cache.get(&handle),
-                        ) {
-                            if let Some(plan) = crate::scene_sync::plan_skin_dispatch(
-                                bind.bone_buffer_offset,
-                                bind.bone_count,
-                                &skel.current_pose,
-                                skin_data,
-                                spatial.voxel_size,
-                                &mut running_bone_field_cells,
-                                &mut running_bone_field_occ_u32s,
-                                if self.dqs_enabled { 1 } else { 0 },
-                                bind.bone_dq_offset,
-                            ) {
-                                // Copy the plan's bone-field geometry
-                                // into the SkinnedBinding so the GPU
-                                // object carries the same coords the
-                                // scatter wrote to. Without this the
-                                // march would descend a bone field
-                                // sized in one frame and origin'd from
-                                // another.
-                                skinning = Some(crate::scene_sync::SkinnedBinding {
-                                    bone_count: bind.bone_count,
-                                    bone_buffer_offset: bind.bone_buffer_offset,
-                                    bone_field_offset: plan.uniforms.bone_field_offset,
-                                    bone_field_dims: [
-                                        plan.uniforms.bone_field_dim_x,
-                                        plan.uniforms.bone_field_dim_y,
-                                        plan.uniforms.bone_field_dim_z,
-                                    ],
-                                    bone_field_origin: [
-                                        plan.uniforms.grid_origin_x,
-                                        plan.uniforms.grid_origin_y,
-                                        plan.uniforms.grid_origin_z,
-                                    ],
-                                    bone_field_occ_offset: plan.uniforms.bone_field_occ_offset,
-                                    bone_dq_offset: bind.bone_dq_offset,
-                                });
-                                self.skin_dispatches.push(plan);
-                                // Cache this entity's pose for the
-                                // scatter-skip check at the end of the
-                                // function. Only records entities that
-                                // made it to a plan — a plan bail
-                                // below treats this entity as "not
-                                // animated this frame", same as last
-                                // frame's cache if it was also missing.
-                                this_frame_poses.insert(entity, skel.current_pose.clone());
-                            } else {
-                                // Plan bailed (no extent, or dims > cap).
-                                // Leave skinning = None so march falls
-                                // back to the rigid path for this
-                                // entity.
-                                skinning = None;
-                            }
-                        }
-                    }
-                }
+                // `skinning_enabled = false` forces every entity to
+                // emit the rest pose (mesh VS sees `skinning_mode =
+                // SKINNING_MODE_NONE`).
+                let skinning = if self.skinning_enabled {
+                    self.bone_matrix_allocator.binding(entity)
+                } else {
+                    None
+                };
                 // Asset side — dedupe by `octree_root`. Source the
                 // skinning template (`bone_count`, `rest_octree_*`) from
                 // the asset cache's skinning_data so it stays correct
@@ -317,15 +247,12 @@ impl EngineState {
                 // this list to the render thread alongside the
                 // existing `gpu_instances`.
                 if let Some(handle) = renderable.asset_handle {
-                    // Per-instance skinning state (Phase 6.6) — when
-                    // `skinning` is `Some(_)` the entity has both a
-                    // live `Skeleton` and a baked skin-meta payload,
-                    // and the skin_deform plan above already pushed
-                    // bone matrices into the per-frame palette. The
-                    // mesh VS picks them up via `bone_offset_*`.
-                    // `dqs_enabled` is the renderer-wide toggle that
-                    // also drives `skin_deform`'s mode — keeping mesh
-                    // raster and the legacy march path aligned.
+                    // Per-instance skinning state — when `skinning`
+                    // is `Some(_)` the entity has a live `Skeleton`
+                    // and `bone_matrix_allocator` packed its current
+                    // pose into the per-frame bone palette. The mesh
+                    // VS picks them up via `bone_offset_*`.
+                    // `dqs_enabled` selects LBS vs DQS.
                     let (skinning_mode, bone_offset_lbs, bone_offset_dqs) = match skinning {
                         Some(b) => (
                             if self.dqs_enabled { 1 } else { 0 },
@@ -341,7 +268,7 @@ impl EngineState {
                     // The asset's `grid_origin` (in object-local /
                     // mesh frame) is what the surface-mesh extractor
                     // baked into every vertex's `local_pos`. Bone
-                    // matrices in `skin_deform`'s palette operate on
+                    // matrices in the per-frame palette operate on
                     // **grid-frame** positions (origin at octree
                     // corner), so the mesh VS subtracts grid_origin
                     // before applying bones and adds it back after.
@@ -489,26 +416,6 @@ impl EngineState {
             }
         }
 
-        // Each bone-field cell is a `vec2<u32>` (packed bone indices +
-        // weights) = 8 bytes. Used by the render loop to size the
-        // scene's bone_field_buffer before the scatter dispatch.
-        self.skin_bone_field_bytes = (running_bone_field_cells as u64).saturating_mul(8);
-        self.skin_bone_field_occ_bytes = (running_bone_field_occ_u32s as u64).saturating_mul(4);
-
-
-        // Pause-aware scatter skip: if the set of skinned entities and
-        // their per-bone matrices are byte-identical to last frame,
-        // the `bone_field` buffer still holds valid data — render loop
-        // skips both the clear and the scatter dispatch. Big win when
-        // the user pauses the animation to inspect a frame.
-        //
-        // Empty-to-empty doesn't count as a reuse opportunity: there
-        // was nothing to clear last frame either, so the render loop
-        // already skips via `skin_dispatches.is_empty()`.
-        self.skin_reuse = !this_frame_poses.is_empty()
-            && this_frame_poses == self.last_skin_poses;
-        self.last_skin_poses = this_frame_poses;
-
     }
 
     /// Per-entity transform-only fast path. Patches just the
@@ -628,8 +535,6 @@ impl EngineState {
     /// What it skips (vs. the full rebuild):
     ///   - `bone_matrix_allocator.rebuild` — skeleton state stable
     ///     across sculpt/paint stamps.
-    ///   - `skin_dispatches` clear + per-skinned-entity planning —
-    ///     same.
     ///   - `gpu_assets` rebuild — depends only on spatial.aabb /
     ///     grid_origin / voxel_size / bone_count, none of which a
     ///     sculpt/paint stamp mutates on a loaded asset.
