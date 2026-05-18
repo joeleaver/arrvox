@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 fn main() {
     let project: PathBuf = "/home/joe/dev/rkifield_game/splat5".into();
-    let crate_dir = arvx_engine::scaffold::generate_gameplay_crate(&project)
+    let (crate_dir, _) = arvx_engine::scaffold::generate_gameplay_crate(&project)
         .expect("scaffold");
     println!("scaffolded -> {}", crate_dir.display());
 

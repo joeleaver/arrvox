@@ -63,8 +63,12 @@ pub fn gameplay_dylib_path(project_dir: &Path) -> PathBuf {
 /// Creates `.arvx-cache/gameplay/` with Cargo.toml, src/lib.rs, and
 /// copies of the user's component and system source files.
 ///
-/// Returns the path to the generated crate directory.
-pub fn generate_gameplay_crate(project_dir: &Path) -> Result<PathBuf, ScaffoldError> {
+/// Returns `(crate_dir, any_changed)`. `any_changed` is `true` if any
+/// scaffolded file was actually written (script edits, Cargo.toml
+/// drift, mod.rs / lib.rs regeneration) — callers use this to gate
+/// the cargo invocation so they can skip a no-op rebuild + the
+/// "Building gameplay scripts" UI phase on a clean re-open.
+pub fn generate_gameplay_crate(project_dir: &Path) -> Result<(PathBuf, bool), ScaffoldError> {
     let scripts_dir = project_dir.join("assets/scripts");
     let crate_dir = gameplay_crate_dir(project_dir);
 
@@ -81,48 +85,53 @@ pub fn generate_gameplay_crate(project_dir: &Path) -> Result<PathBuf, ScaffoldEr
     fs::create_dir_all(&sys_dir)?;
     fs::create_dir_all(&gen_dir)?;
 
+    // Track whether ANY scaffolded file was actually written. `remove_stale`
+    // also counts — orphaned source files in the cache directory are a
+    // legitimate "scripts changed" signal that needs to retrigger cargo.
+    let mut any_changed = false;
+
     // Generate Cargo.toml.
     let engine_path = engine_root().join("crates/arvx-engine");
     let macros_path = engine_root().join("crates/arvx-macros");
-    write_if_changed(&crate_dir.join("Cargo.toml"), &gen_cargo_toml(
+    any_changed |= write_if_changed(&crate_dir.join("Cargo.toml"), &gen_cargo_toml(
         &engine_path.display().to_string(),
         &macros_path.display().to_string(),
     ))?;
 
     // Remove stale source files.
-    remove_stale(&comp_dir, &components)?;
-    remove_stale(&sys_dir, &systems)?;
-    remove_stale(&gen_dir, &generators)?;
+    any_changed |= remove_stale(&comp_dir, &components)?;
+    any_changed |= remove_stale(&sys_dir, &systems)?;
+    any_changed |= remove_stale(&gen_dir, &generators)?;
 
     // Copy user source files.
     for name in &components {
-        copy_if_changed(
+        any_changed |= copy_if_changed(
             &scripts_dir.join("components").join(format!("{name}.rs")),
             &comp_dir.join(format!("{name}.rs")),
         )?;
     }
     for name in &systems {
-        copy_if_changed(
+        any_changed |= copy_if_changed(
             &scripts_dir.join("systems").join(format!("{name}.rs")),
             &sys_dir.join(format!("{name}.rs")),
         )?;
     }
     for name in &generators {
-        copy_if_changed(
+        any_changed |= copy_if_changed(
             &scripts_dir.join("generators").join(format!("{name}.rs")),
             &gen_dir.join(format!("{name}.rs")),
         )?;
     }
 
     // Generate mod.rs files.
-    write_if_changed(&comp_dir.join("mod.rs"), &gen_mod_rs(&components, true))?;
-    write_if_changed(&sys_dir.join("mod.rs"), &gen_mod_rs(&systems, false))?;
-    write_if_changed(&gen_dir.join("mod.rs"), &gen_mod_rs(&generators, false))?;
+    any_changed |= write_if_changed(&comp_dir.join("mod.rs"), &gen_mod_rs(&components, true))?;
+    any_changed |= write_if_changed(&sys_dir.join("mod.rs"), &gen_mod_rs(&systems, false))?;
+    any_changed |= write_if_changed(&gen_dir.join("mod.rs"), &gen_mod_rs(&generators, false))?;
 
     // Generate lib.rs.
-    write_if_changed(&src_dir.join("lib.rs"), &gen_lib_rs(&components, &systems, &generators))?;
+    any_changed |= write_if_changed(&src_dir.join("lib.rs"), &gen_lib_rs(&components, &systems, &generators))?;
 
-    Ok(crate_dir)
+    Ok((crate_dir, any_changed))
 }
 
 // ── File discovery ──────────────────────────────────────────────────────
@@ -170,10 +179,15 @@ fn copy_if_changed(src: &Path, dst: &Path) -> Result<bool, ScaffoldError> {
     Ok(true)
 }
 
-fn remove_stale(dir: &Path, expected: &[String]) -> Result<(), ScaffoldError> {
+/// Returns `true` if any orphaned file was removed — feeds the
+/// `any_changed` accumulator in `generate_gameplay_crate` so a script
+/// rename or deletion correctly retriggers cargo even when no
+/// remaining file's content differs.
+fn remove_stale(dir: &Path, expected: &[String]) -> Result<bool, ScaffoldError> {
     if !dir.is_dir() {
-        return Ok(());
+        return Ok(false);
     }
+    let mut removed = false;
     for entry in fs::read_dir(dir)?.flatten() {
         let path = entry.path();
         if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("rs") {
@@ -187,10 +201,12 @@ fn remove_stale(dir: &Path, expected: &[String]) -> Result<(), ScaffoldError> {
             continue;
         }
         if !expected.iter().any(|n| n == stem) {
-            let _ = fs::remove_file(&path);
+            if fs::remove_file(&path).is_ok() {
+                removed = true;
+            }
         }
     }
-    Ok(())
+    Ok(removed)
 }
 
 // ── Template generators ─────────────────────────────────────────────────
@@ -305,7 +321,7 @@ mod tests {
         fs::write(comp_dir.join("health.rs"), "// health component").unwrap();
         fs::write(sys_dir.join("spin_system.rs"), "// spin system").unwrap();
 
-        let crate_dir = generate_gameplay_crate(&project).unwrap();
+        let (crate_dir, _) = generate_gameplay_crate(&project).unwrap();
 
         assert!(crate_dir.join("Cargo.toml").is_file());
         assert!(crate_dir.join("src/lib.rs").is_file());
@@ -334,7 +350,7 @@ mod tests {
         fs::create_dir_all(project.join("assets/scripts/components")).unwrap();
         fs::create_dir_all(project.join("assets/scripts/systems")).unwrap();
 
-        let crate_dir = generate_gameplay_crate(&project).unwrap();
+        let (crate_dir, _) = generate_gameplay_crate(&project).unwrap();
         let lib_rs = fs::read_to_string(crate_dir.join("src/lib.rs")).unwrap();
         assert!(lib_rs.contains("arvx_gameplay_entries"));
         assert!(!lib_rs.contains("pub mod components;"));
@@ -352,7 +368,7 @@ mod tests {
         fs::write(gen_dir.join("rock.rs"), "// rock generator").unwrap();
         fs::write(gen_dir.join("tree.rs"), "// tree generator").unwrap();
 
-        let crate_dir = generate_gameplay_crate(&project).unwrap();
+        let (crate_dir, _) = generate_gameplay_crate(&project).unwrap();
 
         assert!(crate_dir.join("src/generators/rock.rs").exists());
         assert!(crate_dir.join("src/generators/tree.rs").exists());

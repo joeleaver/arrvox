@@ -8,26 +8,74 @@
 
 use super::state::EngineState;
 
+/// Outcome of `EngineState::scaffold_gameplay` — tells the caller
+/// whether a cargo build is required. Lets `cmd_scene` skip the
+/// "Building gameplay scripts" loading-panel phase on a clean re-open
+/// where nothing actually compiles.
+pub(crate) enum ScaffoldOutcome {
+    /// Scaffolding succeeded and a `cargo build` is required (either a
+    /// source file changed, the dylib is missing, or this is the first
+    /// build of the project).
+    BuildNeeded(std::path::PathBuf),
+    /// Scaffolding succeeded; the existing dylib is up to date and was
+    /// loaded directly. No cargo invocation occurred.
+    UpToDate,
+    /// Scaffolding itself failed — the error has been logged to the
+    /// console. Callers treat this like "no gameplay" and continue.
+    Failed,
+}
+
 impl EngineState {
-    /// Scaffold the gameplay crate from project scripts and trigger a build.
-    pub(crate) fn scaffold_and_build_gameplay(&mut self) {
-        let Some(ref project_dir) = self.project_dir else { return };
+    /// Scaffold the gameplay crate without invoking cargo. Returns
+    /// [`ScaffoldOutcome`] so the caller can decide whether to publish
+    /// a "Building gameplay scripts" phase before kicking off the
+    /// build.
+    ///
+    /// Up-to-date detection: scaffolding writes via
+    /// `write_if_changed` / `copy_if_changed`, both of which short-
+    /// circuit when content matches. If no file was touched AND the
+    /// dylib exists, the dylib is byte-equivalent to what a fresh
+    /// build would produce — we just reload it.
+    pub(crate) fn scaffold_gameplay(&mut self) -> ScaffoldOutcome {
+        let Some(ref project_dir) = self.project_dir else { return ScaffoldOutcome::Failed };
+        let project_dir = project_dir.clone();
 
         // Create assets/scripts directories if they don't exist (new projects).
         let scripts_dir = project_dir.join("assets/scripts");
         let _ = std::fs::create_dir_all(scripts_dir.join("components"));
         let _ = std::fs::create_dir_all(scripts_dir.join("systems"));
 
-        // Generate the gameplay crate.
-        match crate::scaffold::generate_gameplay_crate(project_dir) {
-            Ok(crate_dir) => {
-                self.console.info("Scaffolded gameplay crate");
-                // Build the dylib.
-                self.build_gameplay_crate(&crate_dir);
+        match crate::scaffold::generate_gameplay_crate(&project_dir) {
+            Ok((crate_dir, any_changed)) => {
+                let dylib_path = crate::scaffold::gameplay_dylib_path(&project_dir);
+                if any_changed || !dylib_path.exists() {
+                    ScaffoldOutcome::BuildNeeded(crate_dir)
+                } else {
+                    // Dylib already present and no source drift — load
+                    // it directly. Keeps the loading panel from
+                    // flashing the cargo phase on every project re-open.
+                    self.load_gameplay_dylib(&dylib_path);
+                    ScaffoldOutcome::UpToDate
+                }
             }
             Err(e) => {
                 self.console.error(format!("Scaffold failed: {e}"));
+                ScaffoldOutcome::Failed
             }
+        }
+    }
+
+    /// Scaffold + build (if needed) + load. Kept as the convenience
+    /// path for non-UI callers (the file-watcher's auto-rebuild hook
+    /// goes through here). UI orchestration in `cmd_scene` uses
+    /// `scaffold_gameplay` + `build_gameplay_crate` directly so it can
+    /// publish the loading-panel phase only when the build will run.
+    pub(crate) fn scaffold_and_build_gameplay(&mut self) {
+        match self.scaffold_gameplay() {
+            ScaffoldOutcome::BuildNeeded(crate_dir) => {
+                self.build_gameplay_crate(&crate_dir);
+            }
+            ScaffoldOutcome::UpToDate | ScaffoldOutcome::Failed => {}
         }
     }
 
