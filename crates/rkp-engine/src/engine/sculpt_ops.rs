@@ -111,17 +111,18 @@ impl EngineState {
             (handle, root_offset, entity_world)
         };
 
-        // ── Engine enum → core enum. Smooth / Flatten arrive in
-        // later plan phases — bail with a warning until then.
+        // ── Engine enum → core enum. Flatten is still deferred to
+        // a later plan phase; everything else is wired through.
         let brush_mode = match mode {
             SculptMode::Raise => rkp_core::sculpt::BrushMode::Raise,
             SculptMode::Carve => rkp_core::sculpt::BrushMode::Carve,
             SculptMode::Inflate => rkp_core::sculpt::BrushMode::Inflate,
             SculptMode::Deflate => rkp_core::sculpt::BrushMode::Deflate,
-            SculptMode::Smooth | SculptMode::Flatten => {
+            SculptMode::Smooth => rkp_core::sculpt::BrushMode::Smooth,
+            SculptMode::Flatten => {
                 self.console.warn(format!(
                     "Sculpt mode {mode:?} not implemented yet — \
-                     Raise / Carve / Inflate / Deflate are wired through P1.",
+                     Raise / Carve / Inflate / Deflate / Smooth are wired through P2.",
                 ));
                 return 0;
             }

@@ -163,15 +163,32 @@ pub struct RkpSceneManager {
     /// next stamp arrives with a different value, [`sculpt_stroke_touched`]
     /// is cleared so the new stroke starts fresh.
     pub(super) sculpt_stroke_seq: u64,
-    /// Cells (per-asset, finest-voxel grid coords) that have already
-    /// been edited in the *current* sculpt stroke. Each stamp filters
-    /// its [`SculptDelta`] against this set before applying — same
-    /// behaviour as Blender's no-accumulate sculpt brushes, where each
-    /// vertex can only be displaced once per stroke. Prevents a fast
-    /// drag-back-and-forth from compounding into a deep gouge from
-    /// what was supposed to be a single thickness offset. Reset
-    /// implicitly on stroke change (see [`sculpt_stroke_seq`]).
+    /// Cells already edited in the current sculpt stroke. The filter
+    /// runs only for `BrushMode::Inflate | BrushMode::Deflate` —
+    /// they're the "one layer per stroke" brushes (Blender's
+    /// no-accumulate semantics): without this, a continuous drag at
+    /// the same spot would let each stamp's brushfire reach past the
+    /// previous stamp's outer boundary and progressively eat / puff
+    /// deeper while the mouse is held.
+    ///
+    /// Carve and Raise skip the filter entirely. Their kernels are
+    /// already idempotent for stationary stamps (Carve's
+    /// `outside_rim` only walls Interior cells; Raise's `inside`
+    /// only fills Empty cells), and a Carve drag *needs* stamp N to
+    /// be able to Remove stamp N-1's cavity walls — otherwise the
+    /// walls survive between stamp centres as scallop ridges.
+    /// Reset implicitly on stroke change (see [`sculpt_stroke_seq`]).
     pub(super) sculpt_stroke_touched: rustc_hash::FxHashSet<glam::UVec3>,
+    /// Previous stamp's brush center in **object-local grid units**,
+    /// per the current sculpt stroke. The kernel takes this through
+    /// `BrushOp::segment_start` to evaluate cells against the swept
+    /// capsule from the previous stamp to the current one — without
+    /// it, adjacent stamp spheres along a drag produce visible
+    /// meeting-circle creases on the carved/eroded surface.
+    /// `None` between strokes and on the first stamp of a stroke (the
+    /// first stamp degenerates to a sphere because `segment_start ==
+    /// center`).
+    pub(super) sculpt_stroke_prev_center: Option<glam::Vec3>,
 }
 
 impl RkpSceneManager {
@@ -192,6 +209,7 @@ impl RkpSceneManager {
             sculpt_extract_scratch: SculptExtractScratch::new(),
             sculpt_stroke_seq: 0,
             sculpt_stroke_touched: rustc_hash::FxHashSet::default(),
+            sculpt_stroke_prev_center: None,
         }
     }
 

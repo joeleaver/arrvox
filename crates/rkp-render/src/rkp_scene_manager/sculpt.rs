@@ -33,13 +33,15 @@ use rkp_core::mesh_extract::{
 };
 use rkp_core::mesh_lod::build_cluster_dag_with_levels;
 use rkp_core::sculpt::{
-    apply_delta, brush_cell_range, compute_brush_edits, BrushMode, BrushOp, LeafEditOp,
+    apply_delta, brush_cell_range, compute_brush_edits_in_stroke, BrushMode, BrushOp,
+    LeafEditOp,
 };
 use rkp_core::sparse_octree::{is_brick, is_leaf, leaf_slot, brick_id};
 use rkp_core::brick_pool::{BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR};
 
 use super::manager::RkpSceneManager;
 use super::types::AssetHandle;
+
 
 /// Outcome of [`RkpSceneManager::apply_sculpt_brush`]. The engine
 /// merges `removed_leaf_attr_ids` into the per-entity
@@ -231,6 +233,10 @@ impl RkpSceneManager {
         if stroke_seq != self.sculpt_stroke_seq {
             self.sculpt_stroke_seq = stroke_seq;
             self.sculpt_stroke_touched.clear();
+            // First stamp of a new stroke has no previous center — the
+            // kernel evaluates a degenerate capsule (sphere) by
+            // setting `segment_start == center` below.
+            self.sculpt_stroke_prev_center = None;
         }
         if brush_radius <= 0.0 {
             return None;
@@ -273,8 +279,21 @@ impl RkpSceneManager {
             let center_grid = (center_local - asset_grid_origin) / base_vs;
             let radius_grid = local_radius / base_vs;
 
+            // Capsule sweep: stamps after the first in a stroke
+            // carry the previous stamp's center, so the kernel
+            // evaluates cells against the swept volume from
+            // `segment_start` to `center`. Without this, two
+            // adjacent stamps' spheres produce a visible
+            // meeting-circle crease on the carved surface
+            // (Deflate drag showed this most clearly). The first
+            // stamp of a stroke degenerates to a sphere because
+            // `segment_start == center`.
+            let segment_start = self
+                .sculpt_stroke_prev_center
+                .unwrap_or(center_grid);
             let op = BrushOp {
                 center: center_grid,
+                segment_start,
                 radius: radius_grid,
                 falloff_curve,
                 strength,
@@ -287,30 +306,39 @@ impl RkpSceneManager {
         let _ph_t1 = std::time::Instant::now();
 
         // ── 2. Compute edit list against current octree + brick pool. ─
-        let mut delta = {
+        //
+        // For Inflate / Deflate, the kernel uses `sculpt_stroke_touched`
+        // as a "transit" set: cells already edited this stroke don't
+        // seed brushfire at dist=0, but brushfire propagates THROUGH
+        // them. The effect is two-fold: (1) total stroke depth is
+        // capped at one `target_thickness` layer from the ORIGINAL
+        // pre-stroke surface — fixes the "Deflate keeps digging the
+        // longer I hold the mouse" report; and (2) earlier-stamp
+        // cavity walls become reachable, so stamp N's brushfire
+        // cleans up stamp N-1's walls and the channel comes out
+        // smooth. No per-edit filter is needed downstream — the
+        // brushfire seed restriction enforces the invariant.
+        // Carve / Raise ignore the closure (they don't use brushfire).
+        let touched = &self.sculpt_stroke_touched;
+        let delta = {
             let entry = self.asset_cache.get(handle)?;
-            compute_brush_edits(
+            compute_brush_edits_in_stroke(
                 &entry.cpu_octree,
                 &self.brick_pool,
                 self.leaf_attr_pool.as_slice(),
                 op,
+                |c| touched.contains(&c),
             )
         };
-        // No-accumulate filter: drop any edit whose coord was already
-        // touched earlier in this stroke. Once dropped, the cell stays
-        // in whatever state the earlier stamp left it in — Blender's
-        // "each vertex displaced once per stroke" behaviour. Without
-        // this, a fast drag back and forth over the same patch
-        // compounds erosion/clay layers on every stamp and tunnels
-        // through the asset in a few mouse moves.
-        delta.edits.retain(|e| !self.sculpt_stroke_touched.contains(&e.coord));
         _p_compute_edits_ms = _ph_t1.elapsed().as_secs_f64() * 1000.0;
         if delta.is_empty() {
             return None;
         }
-        // Record every coord this stamp will actually edit. We do this
-        // BEFORE apply_delta so the set stays consistent even if
-        // apply_delta short-circuits on internal failure.
+        // Record every coord this stamp edited so the next stamp in
+        // the same stroke sees it as a transit cell (or, for Carve /
+        // Raise, so future diagnostic queries can list the stroke
+        // footprint). Cheap: amortises across the stamp's edit count
+        // which is already much larger than the hash cost.
         for edit in &delta.edits {
             self.sculpt_stroke_touched.insert(edit.coord);
         }
@@ -367,11 +395,20 @@ impl RkpSceneManager {
                     // real-geometry mutation path (R2c → apply_delta)
                     // will handle them properly.
                 }
+                LeafEditOp::SetNormal { .. } => {
+                    // Smooth — no occupancy change, no slot to remove.
+                    // The real-geometry path consumes these via
+                    // `applied.renormalized_slots` further down.
+                }
             }
         }
 
         let leaves_removed = removed.len();
-        if removed.is_empty() && delta.count_added() == 0 && delta.count_interior() == 0 {
+        if removed.is_empty()
+            && delta.count_added() == 0
+            && delta.count_interior() == 0
+            && delta.count_set_normal() == 0
+        {
             return None;
         }
 
@@ -576,6 +613,11 @@ impl RkpSceneManager {
 
         let allocated_leaf_attr_ids: Vec<u32> =
             applied.allocated_slots.iter().map(|(s, _)| *s).collect();
+        // Record this stamp's center so the NEXT stamp in the stroke
+        // can sweep a capsule from here. Recorded only after the stamp
+        // has successfully applied — a no-op stamp (out of bounds,
+        // empty footprint) shouldn't advance the segment.
+        self.sculpt_stroke_prev_center = Some(op.center);
         Some(SculptApplyResult {
             removed_leaf_attr_ids: removed,
             allocated_leaf_attr_ids,
@@ -764,14 +806,18 @@ impl RkpSceneManager {
         // saw before this fix.
         //
         // Walk each cluster's existing tris; keep only those with ALL
-        // three verts strictly outside the brush sphere. Append the
-        // kept indices to the tail of `mesh_indices`; redirect the
-        // cluster's `index_offset` / `index_count`.
+        // three verts strictly outside the brush sphere. Write the kept
+        // indices BACK INTO the cluster's existing slot (in-place) and
+        // return the unused tail of that slot to the slab allocator's
+        // free list. Old behaviour was a tail-append that orphaned the
+        // entire pre-filter range — every stamp grew `mesh_indices`
+        // monotonically until the GPU buffer hit `max_buffer_size`.
+        // See `project_sculpt_mesh_indices_slab_allocator`.
         //
-        // Reading `mesh_vertices[idx]` is safe alongside `mesh_indices.
-        // extend(...)` because we read in a separate scope per cluster
-        // and the extend goes to the TAIL — the original cluster slot
-        // (which we read) is not touched.
+        // Reading `mesh_vertices[idx]` is safe alongside the in-place
+        // index writes: the per-cluster filter is read-only on
+        // `mesh_indices` and the writes happen in a sequential merge
+        // step below.
         //
         // **D1 — cluster-AABB → brush-sphere rejection.** `clusters_in_
         // brush_grid_aabb` returns every LOD-0 cluster whose grid AABB
@@ -812,41 +858,45 @@ impl RkpSceneManager {
 
         // Both Carve and Deflate remove cells; the filter is correct
         // for them. Raise and Inflate add cells without removing any,
-        // so their original tris stay valid (see the comment above).
-        let needs_filter = matches!(op.mode, BrushMode::Carve | BrushMode::Deflate);
-        let results: Vec<(u32, Vec<u32>)> = {
+        // so their original tris stay valid: skip the filter entirely
+        // and leave every cluster's slot untouched. Slab allocator
+        // bonus — no per-cluster work, no IBO writes, no dirty marks.
+        // Smooth joins the filter side because its patch in Phase 3
+        // re-extracts every brush-region tri with the *current*
+        // (just-updated) LeafAttrPool normals. Without the filter the
+        // original cluster's tris stay in place with their stale
+        // normals and the patch's updated normals end up rendered on
+        // top of (or instead of) them — the user-visible symptom is
+        // "Smooth does nothing". Carve and Deflate already need the
+        // same drop-and-replace dance; Smooth shares the mechanism
+        // without changing occupancy.
+        let needs_filter =
+            matches!(op.mode, BrushMode::Carve | BrushMode::Deflate | BrushMode::Smooth);
+        let results: Vec<(u32, Vec<u32>)> = if needs_filter {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
             let clusters = &entry.meshlet_clusters;
             let indices = &entry.mesh_indices;
             let verts = &entry.mesh_vertices;
             dirty
                 .par_iter()
-                .map(|&cid| {
+                .filter_map(|&cid| {
                     let c = &clusters[cid as usize];
                     let start = c.index_offset as usize;
                     let count = c.index_count as usize;
-                    // Raise / Inflate: skip the filter entirely.
-                    // Carry every original tri through to the kept
-                    // list — the original surface is still valid
-                    // post-stamp (neither removes any SOLID /
-                    // INTERIOR cells).
-                    if !needs_filter {
-                        d1_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return (cid, indices[start..start + count].to_vec());
-                    }
                     let cluster_aabb_min = Vec3::from(c.aabb_min);
                     let cluster_aabb_max = Vec3::from(c.aabb_max);
 
                     // Sphere-AABB rejection (D1): closest point on
                     // the cluster's AABB to the brush center. If it's
                     // outside the brush sphere, no tri in this
-                    // cluster can have a vertex inside.
+                    // cluster can have a vertex inside — leave the
+                    // cluster's slot untouched.
                     let closest = brush_center_local
                         .clamp(cluster_aabb_min, cluster_aabb_max);
                     let aabb_dist_sq = (closest - brush_center_local).length_squared();
                     if aabb_dist_sq > brush_radius_sq {
                         d1_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return (cid, indices[start..start + count].to_vec());
+                        return None;
                     }
 
                     let mut out = Vec::with_capacity(count);
@@ -869,29 +919,48 @@ impl RkpSceneManager {
                             out.push(i2);
                         }
                     }
-                    (cid, out)
+                    Some((cid, out))
                 })
                 .collect()
+        } else {
+            // Raise / Inflate: nothing to filter. The atomic counter
+            // would normally fire once per cluster; bump it by the full
+            // dirty set so the `[sculpt] V2 patch` log line stays
+            // truthful about how many clusters short-circuited.
+            d1_counter.fetch_add(dirty.len(), std::sync::atomic::Ordering::Relaxed);
+            Vec::new()
         };
         let d1_clusters_sphere_outside =
             d1_counter.load(std::sync::atomic::Ordering::Relaxed);
 
-        // Sequential merge — apply each cluster's kept vec in order.
-        // `new_offset` depends on the previous step's growth so this
-        // can't be parallelized.
+        // Sequential merge — write each cluster's kept indices BACK
+        // INTO its original slot, then return the freed tail to the
+        // slab allocator. The kept list is a strict subset of the
+        // original tris (filter only drops), so it always fits in the
+        // pre-filter range `[index_offset, index_offset + index_count)`.
         let mut total_kept_tris = 0usize;
         let mut total_dropped_tris = 0usize;
         {
             let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
             for (cid, kept) in results {
-                let count = entry.meshlet_clusters[cid as usize].index_count as usize;
-                total_kept_tris += kept.len() / 3;
-                total_dropped_tris += count / 3 - kept.len() / 3;
-                let new_offset = entry.mesh_indices.len() as u32;
-                entry.mesh_indices.extend_from_slice(&kept);
+                let old_offset = entry.meshlet_clusters[cid as usize].index_offset;
+                let old_count = entry.meshlet_clusters[cid as usize].index_count;
+                let new_count = kept.len() as u32;
+                total_kept_tris += (new_count as usize) / 3;
+                total_dropped_tris += ((old_count - new_count) as usize) / 3;
+
+                // In-place write at the existing offset, then return
+                // the (potentially empty) tail to the free list.
+                if new_count > 0 {
+                    entry.mesh_indices_write_at(old_offset, &kept);
+                }
+                if new_count < old_count {
+                    entry.free_index_range(old_offset + new_count, old_count - new_count);
+                }
                 let cluster = &mut entry.meshlet_clusters[cid as usize];
-                cluster.index_offset = new_offset;
-                cluster.index_count = kept.len() as u32;
+                cluster.index_count = new_count;
+                // `index_offset` stays the same — in-place write keeps
+                // the cluster anchored at its original slot.
                 // AABB stays at the cluster's pre-stamp bounds — the
                 // kept tris are a subset of the original, so they fit
                 // inside the original AABB. Shrinking is left to R5.
@@ -965,17 +1034,39 @@ impl RkpSceneManager {
 
             let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
             let vertex_offset = entry.mesh_vertices.len() as u32;
-            let new_index_offset = entry.mesh_indices.len() as u32;
             entry.mesh_vertices.extend_from_slice(&brush_verts);
-            entry.mesh_indices
-                .extend(brush_indices.iter().map(|&i| i + vertex_offset));
+
+            // Slab-allocate the patch's index range. If a prior stamp
+            // freed a slot ≥ this size, we reuse it (interior write);
+            // otherwise the bump pointer extends, which is the same
+            // as the pre-slab tail-append behaviour. Indices need
+            // `vertex_offset` rebased into the asset's global vertex
+            // range before writing.
+            let patch_index_count = brush_indices.len() as u32;
+            let new_index_offset = if patch_index_count > 0 {
+                let offset = entry.alloc_index_range(patch_index_count);
+                // Build the rebased indices in a temp buffer (sized
+                // for the patch — typically a few hundred), then commit
+                // them to the slab in one mark+copy.
+                let rebased: Vec<u32> = brush_indices
+                    .iter()
+                    .map(|&i| i + vertex_offset)
+                    .collect();
+                entry.mesh_indices_write_at(offset, &rebased);
+                offset
+            } else {
+                // Defensive: extractor produced verts but no tris (no
+                // SN-cube admitted any triangle this stamp). Cluster
+                // gets index_count=0 → no draw, no slab consumption.
+                0
+            };
 
             let patch_cluster = MeshletCluster {
                 aabb_min: patch_aabb_min,
                 _pad0: 0.0,
                 aabb_max: patch_aabb_max,
                 index_offset: new_index_offset,
-                index_count: brush_indices.len() as u32,
+                index_count: patch_index_count,
                 lod_level: 0,
                 // Patch cluster is born already-dirty so it admits
                 // unconditionally on the next render (its position
@@ -1054,6 +1145,65 @@ impl RkpSceneManager {
         };
         _p_cc_walk_ms = _ph_t5.elapsed().as_secs_f64() * 1000.0;
 
+        // ── Phase 4.5: compact emptied patch clusters ─────────────────
+        //
+        // Filter (Phase 1) can drop every tri in a cluster that prior
+        // stamps already partially carved — the slab allocator
+        // reclaims that cluster's index bytes, but the cluster entry
+        // itself would otherwise stay in `meshlet_clusters` with
+        // `index_count = 0` forever. After many stamps the cluster
+        // table grows without bound, the spatial index along with it,
+        // and `mesh_lod_select` walks more and more no-op entries.
+        //
+        // Compaction is patch-only: bake-time originals (id <
+        // `bake_time_cluster_count`) are referenced by
+        // `dag_consumed` / `dag_produced` and can't be relocated —
+        // they stay as zero-count tombstones. Empty patches
+        // `swap_remove` cleanly because they carry no DAG refs.
+        // Runs AFTER the CC walk so the walk's seed list (`dirty`)
+        // still indexes into the un-shifted table.
+        let compacted_patches = {
+            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
+            entry.compact_empty_patches()
+        };
+
+        // ── Phase 4.6: defrag mesh_indices when fragmentation is high ─
+        //
+        // Stage 1 (slab allocator) bounds `mesh_indices.len()` but
+        // pathological patch-size patterns can still leave a Swiss-
+        // cheese buffer that first-fit can't fully reuse. When freed
+        // bytes cross 30 % of the in-use region, walk every cluster
+        // and copy its index range into a fresh dense Vec. Every
+        // `cluster.index_offset` is rewritten; the IBO gets a full
+        // re-upload via `mesh_indices_dirty.mark_full`. Cluster
+        // table itself isn't reordered, so DAG refs and the spatial
+        // index stay valid.
+        let defrag_reclaimed_bytes = {
+            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
+            if entry.should_compact_mesh_indices() {
+                let pre_free: usize = entry
+                    .mesh_indices_free_list
+                    .iter()
+                    .map(|(_, l)| *l as usize)
+                    .sum();
+                let pre_next_free = entry.mesh_indices_next_free;
+                let pre_holes = entry.mesh_indices_free_list.len();
+                let reclaimed = entry.compact_mesh_indices();
+                eprintln!(
+                    "[sculpt] defrag mesh_indices: pre next_free={} free={} holes={} → \
+                     post next_free={} reclaimed={} B",
+                    pre_next_free,
+                    pre_free,
+                    pre_holes,
+                    entry.mesh_indices_next_free,
+                    reclaimed,
+                );
+                reclaimed
+            } else {
+                0
+            }
+        };
+
         // ── Phase 5: refresh `mesh_lod0_index_count` + dirty flags ────
         // The legacy direct-draw dispatch (debug-only) reads
         // `[0..mesh_lod0_index_count)`. The active indirect-draw path
@@ -1080,7 +1230,7 @@ impl RkpSceneManager {
         eprintln!(
             "[sculpt] V2 patch: handle={:?} dirty={} (sphere_outside={}) kept_tris={} dropped_tris={} \
              brush_patch verts={} tris={} total flat verts={} indices={} \
-             lod_dirty={}/{} ({:.0}%) ({:.2}ms) \
+             lod_dirty={}/{} ({:.0}%) compacted_patches={} defrag_reclaimed={}B ({:.2}ms) \
              [phases: setup={:.2} dirty_q={:.2} filter={:.2} extract={:.2} (collect={:.2} cells={} mesh={:.2}) append={:.2} cc_walk={:.2}]",
             handle,
             dirty.len(),
@@ -1098,6 +1248,8 @@ impl RkpSceneManager {
             } else {
                 0.0
             },
+            compacted_patches,
+            defrag_reclaimed_bytes,
             t0.elapsed().as_secs_f64() * 1000.0,
             _p_setup_ms, _p_dirty_query_ms, _p_filter_ms,
             _p_extract_ms,
@@ -1149,7 +1301,15 @@ impl RkpSceneManager {
                 entry.mesh_vertices.clear();
                 entry.mesh_indices.clear();
                 entry.meshlet_clusters.clear();
+                entry.bake_time_cluster_count = 0;
                 entry.mesh_lod0_index_count = 0;
+                // Slab allocator must reset in lockstep — the
+                // upload path uses `mesh_indices.len() == 0` to drop
+                // the GPU buffer, but the allocator state would
+                // otherwise hold stale `next_free` and free-list
+                // entries that violate the "all offsets <= len()"
+                // invariant on the next stamp.
+                entry.reset_mesh_indices_slab();
                 entry.mesh_dirty = true;
                 entry.clusters_dirty = true;
                 // D7 — spatial index must drop in lockstep with the
@@ -1173,7 +1333,13 @@ impl RkpSceneManager {
         entry.mesh_vertices = vertices;
         entry.mesh_indices = dag.indices;
         entry.meshlet_clusters = dag.clusters;
+        entry.bake_time_cluster_count = entry.meshlet_clusters.len() as u32;
         entry.mesh_lod0_index_count = mesh_lod0_index_count;
+        // Full re-extract replaces every cluster + every index — slab
+        // allocator state from before the rebuild is meaningless. Reset
+        // it and mark the full new buffer dirty so the IBO upload
+        // pushes the whole new layout to the GPU.
+        entry.reset_mesh_indices_slab();
         entry.mesh_dirty = true;
         entry.clusters_dirty = true;
         // D7 — full re-extract replaced every cluster; rebuild the
@@ -1266,7 +1432,11 @@ mod tests {
             splats: Vec::new(),
             mesh_vertices: Vec::new(),
             mesh_indices: Vec::new(),
+            mesh_indices_free_list: Vec::new(),
+            mesh_indices_next_free: 0,
+            mesh_indices_dirty: rkp_core::DirtyRanges::new(),
             mesh_lod0_index_count: 0,
+            bake_time_cluster_count: clusters.len() as u32,
             meshlet_clusters: clusters,
             dag_groups: Vec::new(),
             dag_consumed: Vec::new(),

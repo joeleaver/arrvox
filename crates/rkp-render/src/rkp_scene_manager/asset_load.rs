@@ -828,6 +828,20 @@ impl RkpSceneManager {
             cluster_spatial_index.rebuild(&meshlet_clusters, grid_origin, voxel_size);
         }
 
+        // The slab allocator considers the whole bake-time index buffer
+        // as "in use" (every range is owned by a `MeshletCluster`'s
+        // `(index_offset, index_count)`). New patch / filter
+        // allocations append past `next_free` or reuse interior slots
+        // we free during sculpt. Dirty range is `[0, len * 4)` so the
+        // first upload pushes the freshly-loaded IBO to the GPU.
+        let mesh_indices_next_free = mesh_indices.len() as u32;
+        let mut mesh_indices_dirty = rkp_core::DirtyRanges::new();
+        let total_bytes = (mesh_indices.len() as u32)
+            .saturating_mul(super::types::MESH_INDEX_STRIDE);
+        if total_bytes > 0 {
+            mesh_indices_dirty.mark_full(total_bytes);
+        }
+
         Ok(AssetEntry {
             path: rkp_path.to_path_buf(),
             refcount: 1,
@@ -843,7 +857,11 @@ impl RkpSceneManager {
             splats,
             mesh_vertices,
             mesh_indices,
+            mesh_indices_free_list: Vec::new(),
+            mesh_indices_next_free,
+            mesh_indices_dirty,
             mesh_lod0_index_count,
+            bake_time_cluster_count: meshlet_clusters.len() as u32,
             meshlet_clusters,
             dag_groups,
             dag_consumed,
@@ -916,13 +934,24 @@ impl RkpSceneManager {
     }
 
     /// Iterator over `(AssetHandle, &[MeshVertex], &[u32],
-    /// lod0_index_count)` for every loaded asset that produced a
-    /// non-empty surface mesh. Phase 6.1: `lod0_index_count` is the
-    /// LOD-0 prefix of the DAG IBO; the render thread caches it as
-    /// the dispatch draw count.
+    /// &DirtyRanges, lod0_index_count)` for every loaded asset that
+    /// produced a non-empty surface mesh. The `DirtyRanges` reference
+    /// targets `mesh_indices` byte offsets — the renderer iterates it
+    /// to drive partial IBO uploads when the slab allocator has done
+    /// interior writes. Phase 6.1: `lod0_index_count` is the LOD-0
+    /// prefix of the DAG IBO; the render thread caches it as the
+    /// dispatch draw count.
     pub fn iter_loaded_asset_meshes(
         &self,
-    ) -> impl Iterator<Item = (AssetHandle, &[crate::mesh_pass::MeshVertex], &[u32], u32)> {
+    ) -> impl Iterator<
+        Item = (
+            AssetHandle,
+            &[crate::mesh_pass::MeshVertex],
+            &[u32],
+            &rkp_core::DirtyRanges,
+            u32,
+        ),
+    > {
         self.asset_cache
             .entries
             .iter()
@@ -936,6 +965,7 @@ impl RkpSceneManager {
                     AssetHandle::from_raw(idx as u32),
                     entry.mesh_vertices.as_slice(),
                     entry.mesh_indices.as_slice(),
+                    &entry.mesh_indices_dirty,
                     entry.mesh_lod0_index_count,
                 ))
             })
@@ -976,6 +1006,10 @@ impl RkpSceneManager {
                 entry.mesh_dirty = false;
                 entry.splats_dirty = false;
                 entry.clusters_dirty = false;
+                // Slab-allocator dirty ranges live in lockstep with
+                // `mesh_dirty` — they were just consumed by
+                // `upload_mesh_for_asset` to drive partial IBO writes.
+                entry.mesh_indices_dirty.clear();
             }
         }
     }

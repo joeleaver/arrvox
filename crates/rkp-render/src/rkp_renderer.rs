@@ -247,9 +247,13 @@ struct MeshClusterDiag {
     total_indices: u32,
 }
 
-/// Per-asset mesh buffer cache state. Tracks how many bytes have
-/// already been uploaded so the next `upload_mesh_for_asset` call can
-/// emit a tail-only `queue.write_buffer` for the appended region.
+/// Per-asset mesh buffer cache state. Tracks how many vertex bytes
+/// have already been uploaded so the next `upload_mesh_for_asset` call
+/// can emit a tail-only `queue.write_buffer` for the appended VBO
+/// region. The IBO no longer uses a "uploaded bytes" cursor — the slab
+/// allocator over `mesh_indices` does interior writes, so partial IBO
+/// uploads are driven by per-asset `DirtyRanges` instead (see
+/// `AssetEntry::mesh_indices_dirty`).
 struct MeshBuffersEntry {
     vbo: wgpu::Buffer,
     ibo: wgpu::Buffer,
@@ -257,8 +261,6 @@ struct MeshBuffersEntry {
     /// Bytes of vertex data already written to `vbo`. The next upload
     /// streams `vertices_bytes[vbo_uploaded_bytes..]` at this offset.
     vbo_uploaded_bytes: u64,
-    /// Bytes of index data already written to `ibo`.
-    ibo_uploaded_bytes: u64,
 }
 
 /// Allocate a fresh GPU buffer sized for `data` (with 2× headroom over
@@ -491,6 +493,7 @@ impl RkpRenderer {
         handle_raw: u32,
         vertices: &[MeshVertex],
         indices: &[u32],
+        indices_dirty: &rkp_core::DirtyRanges,
         dispatch_index_count: u32,
     ) -> u64 {
         let idx = handle_raw as usize;
@@ -515,6 +518,8 @@ impl RkpRenderer {
             if e.vbo.size() >= vbo_needed && vbo_needed >= e.vbo_uploaded_bytes {
                 // Buffer fits and the CPU side only grew → tail-only.
                 // Also handles the `equal` case (skip the write entirely).
+                // VBO stays tail-only: sculpt only appends new patch
+                // verts to `mesh_vertices`, never rewrites interior.
                 if vbo_needed > e.vbo_uploaded_bytes {
                     let tail = &vbo_bytes[e.vbo_uploaded_bytes as usize..];
                     queue.write_buffer(&e.vbo, e.vbo_uploaded_bytes, tail);
@@ -545,15 +550,30 @@ impl RkpRenderer {
             (buf, vbo_needed)
         };
 
-        let (ibo, ibo_uploaded_bytes) = if let Some(e) = existing.as_ref() {
-            if e.ibo.size() >= ibo_needed && ibo_needed >= e.ibo_uploaded_bytes {
-                if ibo_needed > e.ibo_uploaded_bytes {
-                    let tail = &ibo_bytes[e.ibo_uploaded_bytes as usize..];
-                    queue.write_buffer(&e.ibo, e.ibo_uploaded_bytes, tail);
-                    bytes_written += tail.len() as u64;
+        // IBO upload is driven by `indices_dirty` instead of tail-only.
+        // The slab allocator over `mesh_indices` (see AssetEntry) does
+        // interior writes when it reuses freed slots — a pure
+        // `[uploaded_bytes..]` tail write would silently drop those.
+        // Dirty ranges record exactly which byte ranges changed; iterate
+        // them and issue one `queue.write_buffer` per range. The full
+        // re-upload path (initial alloc or grow) still writes the whole
+        // buffer; the dirty tracker is cleared on the scene-manager side
+        // by `mark_loaded_asset_uploads_clean` after this call returns.
+        let ibo = if let Some(e) = existing.as_ref() {
+            if e.ibo.size() >= ibo_needed {
+                for (off, len) in indices_dirty.iter() {
+                    let start = off as usize;
+                    let end = start + len as usize;
+                    if end <= ibo_bytes.len() {
+                        queue.write_buffer(&e.ibo, off as u64, &ibo_bytes[start..end]);
+                        bytes_written += len as u64;
+                    }
                 }
-                (e.ibo.clone(), ibo_needed)
+                e.ibo.clone()
             } else {
+                // Capacity exceeded → grow + full upload. The dirty
+                // ranges become irrelevant: every byte just got written
+                // by `grow_with_full_upload`.
                 let buf = grow_with_full_upload(
                     &self.device, queue,
                     Some(e.ibo.size()),
@@ -564,7 +584,7 @@ impl RkpRenderer {
                     ibo_bytes,
                 );
                 bytes_written += ibo_needed;
-                (buf, ibo_needed)
+                buf
             }
         } else {
             let buf = grow_with_full_upload(
@@ -577,12 +597,12 @@ impl RkpRenderer {
                 ibo_bytes,
             );
             bytes_written += ibo_needed;
-            (buf, ibo_needed)
+            buf
         };
 
         self.mesh_buffers[idx] = Some(MeshBuffersEntry {
             vbo, ibo, dispatch_index_count,
-            vbo_uploaded_bytes, ibo_uploaded_bytes,
+            vbo_uploaded_bytes,
         });
         bytes_written
     }

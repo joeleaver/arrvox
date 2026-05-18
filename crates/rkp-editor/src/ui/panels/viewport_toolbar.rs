@@ -505,6 +505,13 @@ fn sculpt_mode_row(
                 Memo::new(move || store.sculpt_mode.get() == SculptMode::Deflate),
                 move || store.sculpt_mode.set(SculptMode::Deflate),
             )}
+            {gizmo_button(
+                __scope,
+                TablerIcon::Blur,
+                "Smooth — blend surface normals toward the local 6-neighbour average (Blender Smooth equivalent)",
+                Memo::new(move || store.sculpt_mode.get() == SculptMode::Smooth),
+                move || store.sculpt_mode.set(SculptMode::Smooth),
+            )}
         }
     }
 }
