@@ -409,15 +409,17 @@ impl EngineState {
                     );
                     return Ok(());
                 }
-                // Hard requirements for promoting the procedural to a
-                // first-class asset: an open project (so we have an
-                // assets/ directory to write to) and a saved scene
-                // (so the bake worker has been writing the cache to a
-                // known location). Without either, we can't produce
-                // a persistent on-disk asset for the converted voxels.
-                let Some(project_dir) = self.project_dir.clone() else {
+                // Convert produces a scene-instance bake — a
+                // persistent .arvx that lives alongside the scene file,
+                // not in `assets/` (the Models panel scans `assets/`
+                // and would otherwise list every converted entity as
+                // a "library model"). The bake lands at
+                // `{scene}.bakes/<uuid>.arvx`, same scheme used by
+                // procedural / generator caches. That requires both a
+                // project AND a saved scene.
+                let Some(target) = self.procedural_cache_path(entity) else {
                     self.console.warn(
-                        "Convert: open or save a project first so the converted asset has somewhere to live.".to_string(),
+                        "Convert: save the scene first so the converted bake has somewhere to live.".to_string(),
                     );
                     return Ok(());
                 };
@@ -427,43 +429,14 @@ impl EngineState {
                     .map(|m| m.name.clone())
                     .unwrap_or_else(|_| format!("{entity:?}"));
 
-                // Sanitize the entity name into a filename-safe slug:
-                // lowercase, [a-z0-9_-] only, collapse runs of '_'.
-                let mut slug: String = name
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '-' {
-                            c.to_ascii_lowercase()
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                // Trim leading/trailing underscores; collapse runs.
-                while slug.contains("__") {
-                    slug = slug.replace("__", "_");
-                }
-                let slug = slug.trim_matches('_').to_string();
-                let slug = if slug.is_empty() { "converted".to_string() } else { slug };
-
-                // Drop converted assets under `assets/converted/` so
-                // they're discoverable from the Models panel (which
-                // recursively scans `assets/`) but visually grouped
-                // separately from imported meshes and authored .arvx
-                // files. The directory is created lazily.
-                let target_dir = project_dir.join("assets").join("converted");
-                if let Err(e) = std::fs::create_dir_all(&target_dir) {
-                    self.console.error(format!(
-                        "Convert: failed to create '{}': {e}",
-                        target_dir.display(),
-                    ));
-                    return Ok(());
-                }
-                let mut target = target_dir.join(format!("{slug}.arvx"));
-                let mut suffix = 1u32;
-                while target.exists() {
-                    target = target_dir.join(format!("{slug}_{suffix}.arvx"));
-                    suffix += 1;
+                if let Some(parent) = target.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        self.console.error(format!(
+                            "Convert: failed to create '{}': {e}",
+                            parent.display(),
+                        ));
+                        return Ok(());
+                    }
                 }
 
                 // Enqueue an async voxelize bake that writes the
@@ -528,8 +501,8 @@ impl EngineState {
                 }
                 self.pending_conversions.insert(entity, target.clone());
                 self.console.info(format!(
-                    "Converting '{name}' to voxel asset → assets/converted/{} (voxelizing…)",
-                    target.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+                    "Converting '{name}' to voxel object → {} (voxelizing…)",
+                    target.display(),
                 ));
             }
             EngineCommand::Paint { position, normal, radius, color, strength, mode } => {

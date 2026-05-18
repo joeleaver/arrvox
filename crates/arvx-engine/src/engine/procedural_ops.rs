@@ -495,18 +495,16 @@ impl EngineState {
             info.leaf_attr_slot_count,
             Vec::new(),
         );
-        let rel_path = self
-            .project_dir
-            .as_ref()
-            .and_then(|d| target.strip_prefix(d.join("assets")).ok())
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| target.to_string_lossy().to_string());
 
+        // No `asset_path` — the bake lives at `{scene}.bakes/<uuid>.arvx`,
+        // not under `assets/`, so the Models panel doesn't list it.
+        // Save-time `procedural_cache` emission (scene_io_ops.rs) picks
+        // up the file by uuid and restores the entity on reload.
         if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
             renderable.primitive = None;
             renderable.spatial = Some(crate::components::RenderGeometry::Octree(new_spatial));
             renderable.asset_handle = Some(handle);
-            renderable.asset_path = Some(rel_path.clone());
+            renderable.asset_path = None;
             renderable.voxel_count = info.voxel_count;
         }
         let _ = self.world.remove_one::<ProceduralGeometry>(entity);
@@ -516,14 +514,14 @@ impl EngineState {
         self.scene_dirty.mark_entity(entity);
         self.geometry_dirty.mark_all();
         self.gpu_objects_dirty.mark_all();
-        self.scan_models();
         let name = self
             .world
             .get::<&EditorMetadata>(entity)
             .map(|m| m.name.clone())
             .unwrap_or_else(|_| "procedural".into());
         self.console.info(format!(
-            "Converted '{name}' to voxel asset → assets/{rel_path} ({} voxels).",
+            "Converted '{name}' to voxel object → {} ({} voxels).",
+            target.display(),
             info.voxel_count,
         ));
     }

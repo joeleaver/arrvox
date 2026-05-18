@@ -439,7 +439,7 @@ impl EngineState {
 
             // Procedural bake cache reference — points at the .arvx
             // sidecar that holds this entity's pre-baked voxels so
-            // load can restore them without re-running anything. Two
+            // load can restore them without re-running anything. Three
             // sources flow through this same field:
             //
             //   1. Procedurals: `procedural_cache_path()` →
@@ -450,12 +450,17 @@ impl EngineState {
             //      `{scene}.bakes/gen_{parent}_{slot}.arvx` written by
             //      the bake worker via the `cache_output_path` set on
             //      the BakeRequest by `enqueue_child_bake`.
+            //   3. Convert / Copy of a procedural: writes to the same
+            //      `{scene}.bakes/{uuid}.arvx` path so the resulting
+            //      static voxel object doesn't pollute the Models
+            //      panel (which scans `assets/`). The entity has
+            //      neither `ProceduralGeometry` nor `GeneratorOwned`
+            //      at save time; we detect it by checking that the
+            //      uuid-keyed bake file exists on disk.
             //
             // Either way, only emit when the file actually exists. An
             // unsaved scratch scene (no `scene_path`) or a never-baked
-            // entity won't have one. Converted procedurals took a
-            // different route (`assets/converted/*.arvx` via
-            // `asset_path`) so they don't appear here.
+            // entity won't have one.
             let procedural_cache = {
                 let abs = if components.contains_key("ProceduralGeometry") {
                     self.procedural_cache_path(entity)
@@ -476,7 +481,12 @@ impl EngineState {
                         _ => None,
                     }
                 } else {
-                    None
+                    // Convert/Copy-produced static voxel object: the
+                    // bake file (if any) lives at the uuid-keyed path
+                    // and we fall through to the `abs.exists()` gate
+                    // below — library-asset entities (asset_path set,
+                    // no bake file) emit None as before.
+                    self.procedural_cache_path(entity)
                 };
                 match (abs, &scene_dir) {
                     (Some(abs), Some(dir)) if abs.exists() => abs

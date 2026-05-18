@@ -91,44 +91,18 @@ impl EngineState {
                 // async write-then-acquire flow as Convert (just
                 // different post-bake handling — new entity, not
                 // replace-in-place).
-                let Some(project_dir) = self.project_dir.clone() else {
+                //
+                // The .arvx is a scene-instance bake, not a library
+                // asset; it lands at `{scene}.bakes/<uuid>.arvx` so the
+                // Models panel (which scans `assets/`) doesn't list it.
+                // Requires a saved scene.
+                if self.scene_path.is_none() {
                     self.console.warn(
-                        "Copy: open or save a project first so the copy has somewhere to live."
-                            .to_string(),
+                        "Copy: save the scene first so the copy has somewhere to live.".to_string(),
                     );
                     return Ok(());
-                };
+                }
                 let new_name = self.unique_name(&format!("{src_name} (copy)"));
-                // Filename slug — same sanitiser pattern as Convert.
-                let mut slug: String = new_name
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '-' {
-                            c.to_ascii_lowercase()
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                while slug.contains("__") {
-                    slug = slug.replace("__", "_");
-                }
-                let slug = slug.trim_matches('_').to_string();
-                let slug = if slug.is_empty() { "copied".to_string() } else { slug };
-                let target_dir = project_dir.join("assets").join("converted");
-                if let Err(e) = std::fs::create_dir_all(&target_dir) {
-                    self.console.error(format!(
-                        "Copy: failed to create '{}': {e}",
-                        target_dir.display(),
-                    ));
-                    return Ok(());
-                }
-                let mut target = target_dir.join(format!("{slug}.arvx"));
-                let mut suffix = 1u32;
-                while target.exists() {
-                    target = target_dir.join(format!("{slug}_{suffix}.arvx"));
-                    suffix += 1;
-                }
 
                 // Spawn the destination entity. No ProceduralGeometry —
                 // this is the static voxel copy. Starts with
@@ -147,6 +121,25 @@ impl EngineState {
                 self.assign_entity_uuid(new_entity);
                 self.scene_dirty.mark_entity(new_entity);
                 self.selected_entity = Some(new_entity);
+
+                // UUID-keyed target path, computed after the UUID is
+                // assigned. `procedural_cache_path` returns
+                // `{scene}.bakes/<uuid>.arvx`.
+                let Some(target) = self.procedural_cache_path(new_entity) else {
+                    self.console.warn(
+                        "Copy: scene path missing — cannot derive bake target.".to_string(),
+                    );
+                    return Ok(());
+                };
+                if let Some(parent) = target.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        self.console.error(format!(
+                            "Copy: failed to create '{}': {e}",
+                            parent.display(),
+                        ));
+                        return Ok(());
+                    }
+                }
 
                 // Enqueue a ProceduralVoxelize bake on the new entity.
                 // Worker writes the artifact to `target` (including
