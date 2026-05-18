@@ -2,231 +2,201 @@
 
 A working map of the renderer's hot paths. Module-level only — the file-level rustdoc covers individual types.
 
-> **Living doc.** Update each entry when its module changes. If a section is stale, fix it before reading the rest — wrong maps are worse than no maps.
+> **Living doc.** Update each entry when its module changes. If a section is stale, fix it before reading the rest — wrong maps are worse than no maps. Last refreshed 2026-05-18b (mesh-only cleanup session).
 
 ---
 
-## User-shader pipeline (paint-grass-on-host, etc.)
+## Pipeline overview
 
-### Data flow
+Every viewport runs the same forward-raster + deferred-shade chain. Per-frame in dispatch order:
 
 ```
-[CPU sim] ECS scan: for each painted host with a user-shader material →
-   • build ShaderRegionRequest { aabb, shader_name, host_octree_*,
-     host_surface_y, host_overlay_offset/count, is_band_region, ... }
-   • RenderFrame.user_shader_regions: Vec<ShaderRegionRequest>
-
-         │  RenderFrame
-         ▼
-[GPU per-frame] tick_instance_pipeline (render_worker.rs):
-   • bake user-shader prototypes via instance_proto + user_shader_proto.wgsl
-     → asset records → host scene main pool
-
-         │  RenderFrame, prototypes ready
-         ▼
-[GPU per-frame] run_user_shader_geom (render_worker.rs → user_shader_pass):
-   • UserShaderObjectCache (cache.rs) keys (host_id, material_id, tile)
-     → BucketPoolAllocator hands out (octree, brick, leaf-attr, fill-task)
-       extents in the global pools; topology_hash + fill_hash decide
-       whether classify / fill can be skipped
-   • build_region_uniform (region.rs) packs per-region inputs into
-     RegionUniform (224 B std430)
-   • UserShaderPass.dispatch_regions (dispatch.rs):
-       1. seed active_queue[L=0] with one root cell per topology-dirty region
-       2. classify_main per BFS level — atomicAdd into global pools,
-          push child cells to L+1
-       3. brick_fill_main — runs the user's `dispatch_user_generate`,
-          OR (for `is_band_region == true`) writes one GpuBandCell per
-          max-depth band cell tagged with OCTREE_LEAF_BIT | OCTREE_BAND_BIT
-   • OverflowReadback (overflow.rs) async-reads the per-pool
-     overflow counters, logs hits
-
-         │  octree_nodes / brick_pool / leaf_attr_pool now contain
-         │  per-region BFS output, addressable via the region's
-         │  octree_root in cache entries
-         ▼
-[GPU per-pixel] octree_march.wgsl (host march):
-   • for each tile-list object: descend the host octree
-   • on band-cell hit (OCTREE_BAND_BIT) → read GpuBandCell → call
-     dispatch_user_instance_descend → descend_proto_octree into the
-     baked prototype → return hit, normal, material
-   • write G-buffer
-
-         │
-         ▼
-[GPU per-pixel] shadow_trace + shadow_scatter + shadow_map (Phase 7-8)
-[GPU per-pixel] rkp_shade — PBR using the merged G-buffer
-[GPU per-pixel] fog / GI / TAA / present
+mesh_lod_select       compute   Karis-Nanite per-cluster admit → indirect-args
+mesh raster           render    visibility-buffer (position, pick, leaf_slot, rest_pos)
+mesh_resolve          compute   per-pixel octree descent → fills normal/material/glass
+mesh_proxy raster     render    procedural triangle meshes composite (depth-test load)
+user_shader_mesh      compute   spawn_count → prefix_sum → fill (per painted material)
+user_shader_mesh      render    indirect-draw per material — composites onto G-buffer
+mesh_glass front+back render    two depth/colour captures of glass material instances
+mesh_glass_combine    compute   packs into gbuf_glass for the rkp_glass post
+mesh_shadow render    render    per-cascade depth-only raster (CSM, 4 cascades)
+mesh_shadow_blit      compute   bitcast depth into shadow_buffer the shade pass samples
+mesh_glass_shadow     render    per-cascade glass entry/exit depth for Beer attenuation
+ssao                  compute   half-res AO
+brush_state           compute   single-thread cursor-pixel probe → screen-space paint cursor
+rkp_shade             compute   deferred PBR; reads G-buffer + shadow + SSAO + atmosphere
+rkp_volumetric        compute   fog / dust / clouds (cloud march + history blend)
+rkp_glass             compute   Fresnel + Beer + screen-space refraction composite
+rkp_god_rays          compute   radial blur from sun
+bloom + composite     compute   threshold → downsample → upsample → composite
+tone_map              compute   HDR → LDR
+wireframe / grid      render    overlays (gizmo, isolation grid)
 ```
 
-### Modules
+Build viewport in `Raymarch` preview mode replaces the mesh raster with `proc_raymarch` (compute, one thread/pixel, sphere-traces the flattened RPN tree). Everything downstream is unchanged.
+
+---
+
+## Modules
+
+Grouped by role. File names map directly to `src/` paths unless noted.
+
+### Scene + GPU buffers
 
 | Module | Owns | Key types |
 |---|---|---|
-| `user_shader_pass::cache` | Persistent per-region cache + variable-size pool allocators + sim→render request type | `BucketPoolAllocator`, `ShaderRegionRequest`, `UserShaderObjectCache`, `CachedSlot`, `PoolEstimate`, `estimate_region_pool` |
-| `user_shader_pass::region` | GPU-side per-region uniform + band-cell wire format | `RegionUniform` (224 B), `GpuBandCell` (16 B), `build_region_uniform` |
-| `user_shader_pass::dispatch` | BFS pipelines, transient buffers, per-frame dispatch encoder | `UserShaderPass`, `LevelUniform`, `compose_geom_source`, `resolve_shader_id` |
-| `user_shader_pass::overflow` | Async readback ring for GPU overflow counters | `OverflowReadback` (private — internal use only) |
-| `user_shader_proto_pass` | Prototype bake (`@instance_proto` shaders → octree in host main pool) | `PrototypeUniform`, prototype cache |
-| `instance_proto` | Authoring-side prototype representation (CPU) | `InstanceProto` |
-| `octree_march.wgsl` | Per-pixel host march; on `OCTREE_BAND_BIT` hit, descends into prototypes | (WGSL) |
-| `user_shader_geom.wgsl` | BFS classify + fill compute kernels | (WGSL) |
-| `user_shader_proto.wgsl` | Prototype bake compute kernel | (WGSL) |
-| `shader_composer::types` | Public data types for the registry | `ParamDef`, `ShaderMetadata`, `UserShaderEntry`, `UserShaderRegistry`, `UserShaderInfo`, `ShaderComposerError`, `ComposedChunks` |
-| `shader_composer::parser` | WGSL source → registry: `scan_dir`, `parse_file`, header `@`-directives, low-level scanner | `scan_dir`, `parse_file` |
-| `shader_composer::compose` | Registry → per-pipeline WGSL chunks; per-shader `instance_descend` body emission; template splice | `compose`, `splice_inst_chunks` |
-| `shader_composer::hash` | Deterministic FNV-1a 64 of registry contents (cache-key stable across restarts) | `fnv1a_64` |
-| `rkp_engine::render_worker::state` | RenderWorker handle, RenderInbox mailbox, internal RenderState | `RenderWorker`, `RenderInbox`, `RenderState` |
-| `rkp_engine::render_worker::loop_thread` | Render-thread main loop + per-snapshot interpolation | `run_render_thread`, `interpolate_instances`, `lerp_world_matrix` |
-| `rkp_engine::render_worker::frame` | Per-frame orchestration (`render_one_frame` ~800 lines) | `render_one_frame`, `RenderOutcome` |
-| `rkp_engine::render_worker::frame_helpers` | Tile-list splice, AABB transforms, shadow-map setup | `splice_transient_into_tile_lists`, `merge_tile_lists`, `compute_tlas_scene_aabb`, `transform_aabb_world`, `prepare_shadow_maps` |
-| `rkp_engine::render_worker::user_shader_tick` | Per-frame user-shader bake + region BFS dispatch + cache hashing | `tick_instance_pipeline`, `run_user_shader_geom`, `topology_hash_for`, `fill_hash_for` |
-| `tlas_build_pass::types` | Wire-format types + uniform structs for the TLAS build chain | `TlasPrim`, `InstanceTileCullEntry`, `AssembleHost/Morton/Radix/Karras` uniforms, RADIX_* constants |
-| `tlas_build_pass::pass` | `TlasBuildPass` GPU pipelines + buffers + per-frame dispatch chain | `TlasBuildPass`, `GpuTlasBuildInputs` |
-| `tlas_build_pass::cpu_reference` | CPU oracle for every stage (used by integration tests) | `cpu_reference_assemble_host/_user_shader/_morton/_radix_sort/_full_tree/_karras_node`, `karras_delta`, `scene_aabb_from_prims` |
-| `rkp_scene_manager::types` | Public data types + private AssetCache machinery + emit_faces helper | `FaceInstance`, `AssetHandle`, `AssetInfo`, `SkinBrick`, `SkinningAssetData`, `ReloadResult`, `VoxelizeResult` |
-| `rkp_scene_manager::manager` | RkpSceneManager struct + core methods (construction, faces, geometry epoch, slices, deallocation) | `RkpSceneManager` |
-| `rkp_scene_manager::asset_load` | impl block for `acquire_asset` / `reload_asset` / `release_asset` / `load_asset_from_disk` / `skinning_data` | (impl methods) |
-| `rkp_scene_manager::paint` | impl block for paint_epoch + brush_overlay + apply_paint_sphere + slice accessors | (impl methods) |
-| `rkp_scene_manager::voxelize` | impl block for voxelize_primitive / voxelize_sdf_fn / integrate_artifact / deallocate_geometry | (impl methods) |
-| `paint::select` | Spatial selection: sphere brush, single-cell pick, geodesic flood. Pure octree + brick reads. | `leaves_in_sphere`, `leaf_at_local_pos`, `surface_flood_fill`, `PaintedLeaf`, `LeafHit`, `FloodedLeaf` |
-| `paint::write` | Paint write ops + brush math + color packing | `PaintStamp`, `paint_leaf_material/color`, `erase_leaf_color`, `compute_painted_attr/color`, `compute_erased_color`, `brush_weight`, `pack_color`, `unpack_color` |
-| `shadow_map_pass::types` | Constants + LightCameraUniform + SetupParams wire types | `LightCameraUniform`, `SetupParams`, `SHADOW_MAP_*`, `SCATTER_INSTANCE_STRIDE` |
-| `shadow_map_pass::light_camera` | CPU-side light-camera derivation (scene fit + frustum fit) | `compute_light_camera`, `compute_light_camera_frustum_fit` |
-| `shadow_map_pass::pass` | ShadowMapPass GPU runtime — 5 pipelines + buffers + per-frame dispatch chain | `ShadowMapPass` |
-| `user_shader_proto_pass::types` | Pool sizing constants + PrototypeEntry + depth helpers + OCTREE_EMPTY/INTERNAL_ATTR_NONE sentinels | `PrototypeEntry`, `MAX_PROTO_MAX_DEPTH`, `PROTO_*_POOL_CAPACITY` |
-| `user_shader_proto_pass::cache` | PrototypeCache + per-shader octree-extent allocator + build_internal_levels pre-builder | `PrototypeCache`, `build_internal_levels` |
-| `user_shader_proto_pass::pass` | PrototypeBakePass GPU runtime + PrototypeUniform + compose_proto_source | `PrototypeBakePass`, `PrototypeUniform`, `compose_proto_source` |
+| `rkp_scene` | Single scene bind group (13 bindings: pools + camera + bone palettes + overlays) + per-frame upload | `RkpScene`, `GeometryUpload`, `FrameUpload` |
+| `rkp_scene_manager` | Voxel pools + octree + asset cache + paint + sculpt + voxelization | `RkpSceneManager`, `AssetHandle`, `AssetInfo` |
+| `rkp_scene_manager::types` | Wire-format types + private AssetCache machinery | `AssetEntry`, `AssetInfo`, `SkinningAssetData`, `FaceInstance` (legacy), `VoxelizeResult` |
+| `rkp_scene_manager::manager` | Construction, geometry epoch, slice accessors, deallocation | `RkpSceneManager` |
+| `rkp_scene_manager::asset_load` | `.rkp` load/reload/release + `skinning_data()` | (impl methods) |
+| `rkp_scene_manager::paint` | Brush stamps + paint_epoch + per-instance overlay | (impl methods) |
+| `rkp_scene_manager::voxelize` | Primitive + SDF voxelization + integrate_artifact | (impl methods) |
+| `rkp_scene_manager::sculpt` | Per-stamp filter+patch mesh re-extract + slab IBO allocator + cluster-table compaction | (impl methods) |
+| `rkp_scene_manager::cluster_spatial_index` | Per-asset spatial index over LOD-0 clusters for brush AABB queries | (private) |
+| `rkp_gpu_object` | Per-instance + per-asset GPU records (112 + 80 B) | `RkpGpuInstance`, `RkpGpuAsset` |
+| `octree_gpu` | GPU octree buffer management | `OctreeGpu` |
+| `sentinels` | Shared `0xFFFFFFFFu` sentinel constants | `OCTREE_EMPTY`, etc. |
+
+### Mesh raster path (the only primary visibility path)
+
+| Module | Owns | Key types |
+|---|---|---|
+| `mesh_instance` | Shared g0/g1 bind-group layouts + per-instance uniform (`world`, `object_id`, `grid_origin`, bone offsets, `skinning_mode`). Used by every raster path. | `MeshInstanceLayouts`, `MeshInstanceUniform`, `MeshDraw`, `SKINNING_MODE_NONE` |
+| `mesh_pass` | Forward triangle raster — writes visibility-buffer triplet + rest_pos. CCW cull, per-vertex LBS/DQS skinning in VS. | `MeshPass`, `MeshVertex` (re-export from rkp-core) |
+| `mesh_resolve_pass` | Per-pixel resolve compute — reads (leaf_slot, pick, rest_pos), descends asset octree, fills normal/material/glass | `MeshResolvePass` |
+| `mesh_lod_select_pass` | Karis-Nanite per-cluster admit compute → DrawIndexedIndirectArgs table + draw_count | `MeshLodSelectPass`, `MeshLodSelectParams`, `DrawIndexedIndirectArgs` |
+| `mesh_shadow_map_pass` | Directional CSM render + blit (4 cascades, depth-only VS+FS, bitcast→shadow_buffer) | `MeshShadowMapPass`, `MeshShadowParams`, `MeshShadowBlitParams` |
+| `mesh_glass_pass` | Front + back glass raster + combine compute → `gbuf_glass` (Rg32Uint) | `MeshGlassPass`, `GlassFsParams` |
+| `mesh_glass_shadow_pass` | Per-cascade front + back glass depth captures for Beer-attenuated CSM | `MeshGlassShadowPass` |
+| `mesh_proxy_pass` | Procedural proxy-mesh raster (writes full G-buffer directly, no resolve indirection) | `MeshProxyPass`, `ProxyDraw`, `ProxyVertex`, `ProxyInstance` |
+| `shadow_map_pass` | CSM uniform + shared `shadow_buffer` (atomic-u32) | `ShadowMapPass`, `LightCameraCsm`, `LightCameraShadeCsm`, CsmInputs |
+
+### Shade + post
+
+| Module | Owns | Key types |
+|---|---|---|
+| `rkp_shade` | Deferred PBR compute — atmosphere, CSM sample, dual-material blend, paint cursor | `RkpShadePass`, `ShadeParams`, `GpuLight`, `GpuMaterial` |
+| `rkp_atmosphere` | Atmosphere LUTs (transmittance / multi-scatter / sky-view / aerial perspective) | `RkpAtmospherePass` |
+| `rkp_volumetric` | Fog march + cloud march + history blend + composite | `RkpVolumetricPass` |
+| `rkp_glass` | Fresnel + Beer + screen-space refraction composite | `RkpGlassPass` |
+| `rkp_god_rays` | Radial blur from sun | `RkpGodRayPass` |
+| `rkp_ssao` | Half-res ambient occlusion | `RkpSsaoPass` |
+| `bloom`, `bloom_composite` | Multi-mip threshold + downsample/upsample + final composite | `BloomPass`, `BloomCompositePass` |
+| `tone_map` | HDR → LDR | `ToneMapPass` |
+| `gbuffer` | G-buffer texture set + formats | `GBuffer`, `GBUFFER_*_FORMAT` |
+| `brush_state_pass` | Single-thread cursor-pixel probe feeding screen-space paint cursor | `BrushStatePass` |
+
+### User-shader mesh path (V1)
+
+| Module | Owns | Key types |
+|---|---|---|
+| `user_shader_mesh_pass` | spawn_count → prefix_sum → fill compute + indirect raster + shadow raster | `UserShaderMeshPass`, `UserShaderMeshDraw`, `AnchorContext`, `InstanceRecord` |
+| `shader_composer` | Public registry of user shaders + WGSL compose | `UserShaderRegistry`, `compose`, `splice_inst_chunks` |
+| `shader_composer::types` | Public types | `ParamDef`, `ShaderMetadata`, `UserShaderEntry`, `ComposedChunks` |
+| `shader_composer::parser` | Filesystem scan + `@`-directive parse | `scan_dir`, `parse_file` |
+| `shader_composer::compose` | Per-pipeline WGSL chunk emission + template splice | `compose`, `splice_inst_chunks` |
+| `shader_composer::hash` | FNV-1a 64 over registry contents | `fnv1a_64` |
+
+### Procedural (build-viewport live preview + proxy bake)
+
+| Module | Owns | Key types |
+|---|---|---|
+| `proc_raymarch` | Sphere-trace compute for build-viewport live preview | `ProcRaymarchPass`, `RaymarchParams` |
+| `proc_sample` | "Sample N positions" GPU evaluator (shared with bake path) | `ProcSamplePass`, `GpuEvaluator` |
+| `proc_surface_nets` | GPU surface-nets-from-SDF — produces a `ProxyMesh` for procedurals | `ProcSurfaceNetsPass` |
+| `proc_outline` | Selected-primitive outline overlay | `ProcOutlinePass` |
+| `proc_ghost` | Subtract/Intersect ghost-cutter overlay | `ProcGhostPass` |
+| `rkp_grid` | Infinite world-space grid (isolation mode) | `RkpGridPass` |
+| `wireframe` | Gizmo / debug line raster | `WireframePass`, `LineVertex` |
+
+### Paint (CPU-side)
+
+| Module | Owns | Key types |
+|---|---|---|
+| `paint::select` | Sphere/single-cell/flood-fill leaf selection | `leaves_in_sphere`, `leaf_at_local_pos`, `surface_flood_fill` |
+| `paint::write` | Material + colour writes against `LeafAttrPool` | `PaintStamp`, `paint_leaf_material/color`, `erase_leaf_color` |
+
+### TLAS (currently dead — see "What's NOT here")
+
+| Module | Owns | Key types |
+|---|---|---|
+| `tlas_pass` | Wire-format types + nodes/leaves storage | `TlasPass`, `TlasNode`, `TlasInstanceLeaf` |
+| `tlas_build_pass` | GPU build chain (Morton → radix sort → Karras → AABB propagate) | `TlasBuildPass`, `GpuTlasBuildInputs` |
+| `tlas_build_pass::cpu_reference` | CPU oracle for integration tests | (test helpers) |
+
+### Orchestration
+
+| Module | Owns | Key types |
+|---|---|---|
+| `rkp_renderer` | Shared GPU state + `render_to` orchestration | `RkpRenderer` |
+| `viewport_renderer` | Per-viewport render targets + per-VR bind groups | `ViewportRenderer` |
+| `context` | Device/queue wrapper | `RenderContext` |
 
 ---
 
-## What's NOT here (don't be fooled by old memory files)
+## What's NOT here
 
-These names appear in the conversation memory snapshots from 2026-04-29 / 04-30 but **do not exist in the current code**. They were shipped, then reverted in the grass debug session.
+After the 2026-05-18 mesh-only collapse + cleanup, these have been retired:
 
-| Name | Status | Where to look in git history |
+| Retired | When | Notes |
 |---|---|---|
-| Option B per-pixel pipeline | DELETED | Phase 5.2-5.5 — `9c36590` |
-| `instance_emit_pass.rs` / `user_shader_emit.wgsl` | DELETED | Phase 5.2-5.5 — `9c36590` |
-| `instance_march_pass.rs`, `instance_composite_pass.rs` | DELETED | Phase 5.2-5.5 — `9c36590` |
-| Phase 6 GPU tile cull (`user_shader_tile_count/cull/prefix/scatter`) | DELETED | Reverted in Phase 5.2-5.5 — `9c36590` |
-| `tile_cull_scratch`, `us_tile_entries`, `dispatch_user_inst_aabb`, `PREFIX_MAX_TILES` | NEVER LIVE on master HEAD | Existed only at `d9ca54d`, deleted before any commit consumed them |
-| `instance_pool_buffer`, `dispatch_user_inst_to_local/aabb` chain | DELETED | Phase 5.6 A — `13e542a` |
-| `emit_text`, `is_instance_pipeline`, `user_grass_emit` | DELETED | Phase 5.6 B+C — `c1cd310` |
+| `octree_march.wgsl` + per-pixel ray-march primary path | `955d235e` | Mesh raster replaced it |
+| Splat-rasterizer prototype + `splat_*` shaders | `0b244c78` | Was the brief Phase B-2 prototype |
+| `splat_pass/` module (renamed to `mesh_instance/`) | `4ea7ddd6` | Names dated from the prototype |
+| `splat_resolve_pass.rs` / `splat_resolve.wesl` | `4ea7ddd6` | Renamed to `mesh_resolve_pass.rs` / `mesh_resolve.wesl` |
+| `rkp_shadow_trace.wgsl` ray-traced shadow source | with march | Replaced by `mesh_shadow_map_pass` CSM |
+| `shadow_fallback_texture` 1×1 placeholder | `246c6598` | Bilateral upsample + spot/point shadow path → constant 1.0 (tracked: `project_spot_point_shadows_todo`) |
+| `skin_deform.rs` + GPU scatter pass + `bone_field_buffer` | `7641a9c0` | Mesh VS skins per-vertex; scatter+field weren't read |
+| `RkpGpuInstance.bone_field_*` (8 fields, 32 B) | `7641a9c0` | Struct shrunk 144→112 B |
+| `PrimaryMode` enum + `RKP_PRIMARY` env-var | `955d235e` | Mesh is the only path |
+| `MarchParams` WESL struct | `99d89c9d` | No shader imported it |
+| `merge_tile_lists` + CPU tile-cull merge | `99d89c9d` | Fed args that were march-only |
+| 14 `_*` args on `render_to` (`_object_count`, `_tile_*`, `_tlas_*`, `_scene_extent`, etc.) | `99d89c9d` | All march-only |
+| `eprint_march_stats` + `eprint_primary_march` | `99d89c9d` | March-only stat formatters, zero callers |
 
 If a memory file references any of these as if they were live, treat the memory as stale and confirm against the code before acting on it.
 
----
+### Known live-but-unused
 
-## V1.1 — paint-driven grass (shipped 2026-05-04)
-
-Paint-driven shaders (grass, moss, fur) now place blades that follow the painted shape exactly, including non-convex strokes (curves, L's, rings). The architecture is:
-
-**Anchor projection.** Each band cell at `L == max_depth` projects its (x, z) onto `host_surface_y` (CPU-derived from the painted leaves' world-space y centroid; flat-surface-only for now). The cell's anchor is `(center.x, host_surface_y, center.z)`. Sloped/curved hosts will need a per-cell normal-aware projection.
-
-**Per-anchor host-material probe.** Before emitting a band cell, the BFS calls `host_sample_in_region(anchor)` and checks the probed material against `region.material_id` (or its blended secondary). The probe is overlay-aware — the host octree descent consults the per-instance paint overlay (sorted-by-leaf-slot binary search) before falling back to `leaf_attr_pool`. Without overlay-awareness the probe sees only the host's asset-baseline material and rejects every painted anchor.
-
-**Frame ordering matters.** `update_scene_gpu` runs BEFORE the user_shader_regions request loop (so `inst.overlay_offset/count` are current), and `upload_instance_overlay` runs BEFORE `run_user_shader_geom` (so the GPU buffer holds this frame's paint when the BFS probes). `topology_hash_for` folds in `paint_epoch` so paint that lands in an already-allocated overlay slot still forces a re-bake.
-
-**Phase 4 band-cell shadows.** `rkp_shadow_trace.wgsl::shadow_step_one_instance`'s band-cell branch attenuates transmittance by 0.65 per cell that contains a blade hit (per-cell rather than per-blade — the cell-as-coverage-event model matches BFS granularity and avoids per-blade descent cost). Soft self-shadow accumulates across cells; the ray short-circuits at `transmittance < 0.01`.
-
-**Load-bearing artifacts:**
-- `GpuMaterial.instance_shader_id` is separate from `shader_id`. The march reads it on band-cell hits to look up the prototype asset, while `shader_id` only routes the shade pass for shaders with a `shade` hook. Conflating them either left band-cell dispatch broken (when filtered to shade-only shaders) or routed grass through the shade default arm and tone-mapped to black.
-- `RegionUniform.host_surface_y` — anchor projection target.
-- `RegionUniform.host_overlay_offset/count` — per-instance paint slice; the BFS probe consults the overlay through these.
-- `BAND_BLADE_TRANSMITTANCE = 0.65` constant in `rkp_shadow_trace.wgsl` — tunable knob for grass shadow density.
+- **TLAS pipeline.** `tlas_pass` + `tlas_build_pass` modules + 5 WESL shaders (`tlas_morton`, `tlas_radix_sort`, `tlas_karras`, `tlas_assemble_host`, `tlas_compute_dispatch_args`) still build a BVH each frame in `pre.rs`, but **nothing reads the output** (`tlas_pass.nodes_buffer` / `leaves_buffer`) after the march retirement. The BVH was the march's shadow-ray accelerator. Captured for follow-up in `project_tlas_dead_code_todo`. CPU `MARCH_TILE_SIZE` + `screen_aabbs_to_tiles` in `rkp-engine::scene_sync` are likely in the same boat — sweep alongside.
+- **Spot / point light shadows.** Currently constant 1.0. Captured in `project_spot_point_shadows_todo` — needs spot=single-perspective-map / point=cubemap renders to mirror the directional CSM design.
 
 ---
 
 ## File-size budget
 
-CLAUDE.md targets ~700 lines per file. As of the user-shader + shader_composer splits:
+CLAUDE.md targets ~700 lines per file. Current state, files at or over budget:
 
 | File | Lines | Status |
 |---|---|---|
-| `user_shader_pass.rs` (mod root) | 89 | ✅ |
-| `user_shader_pass/cache.rs` | 924 | ⚠️ slightly over; coherent (allocator + cache + estimator) — split `BucketPoolAllocator` out if it grows further |
-| `user_shader_pass/dispatch.rs` | 490 | ✅ |
-| `user_shader_pass/setup.rs` | 255 | ✅ |
-| `user_shader_pass/region.rs` | 165 | ✅ |
-| `user_shader_pass/overflow.rs` | 169 | ✅ |
-| `shader_composer.rs` (mod root) | 71 | ✅ |
-| `shader_composer/types.rs` | 325 | ✅ |
-| `shader_composer/parser.rs` | 710 | ✅ at budget |
-| `shader_composer/compose.rs` | 478 | ✅ |
-| `shader_composer/hash.rs` | 88 | ✅ |
-| `shader_composer/tests.rs` | 827 | (tests file, exempt from budget) |
-| `render_worker.rs` (mod root) | 83 | ✅ |
-| `render_worker/state.rs` | 484 | ✅ |
-| `render_worker/loop_thread.rs` | 340 | ✅ |
-| `render_worker/frame.rs` | 820 | ⚠️ over; structurally one big function (`render_one_frame`) — splitting it further is a refactor not a move |
-| `render_worker/frame_helpers.rs` | 178 | ✅ |
-| `render_worker/user_shader_tick.rs` | 578 | ✅ |
-| `tlas_build_pass.rs` (mod root) | 57 | ✅ |
-| `tlas_build_pass/types.rs` | 131 | ✅ |
-| `tlas_build_pass/pass/mod.rs` | 315 | ✅ |
-| `tlas_build_pass/pass/constructor.rs` | 355 | ✅ |
-| `tlas_build_pass/pass/build.rs` | 401 | ✅ |
-| `tlas_build_pass/cpu_reference.rs` | 387 | ✅ |
-| `tlas_build_pass/tests.rs` | 341 | (tests file, exempt) |
-| `rkp_scene_manager.rs` (mod root) | 35 | ✅ |
-| `rkp_scene_manager/types.rs` | 269 | ✅ |
-| `rkp_scene_manager/manager.rs` | 272 | ✅ |
-| `rkp_scene_manager/asset_load.rs` | 463 | ✅ |
-| `rkp_scene_manager/paint.rs` | 346 | ✅ |
-| `rkp_scene_manager/voxelize.rs` | 343 | ✅ |
-| `paint.rs` (mod root) | 39 | ✅ |
-| `paint/select.rs` | 453 | ✅ |
-| `paint/write.rs` | 220 | ✅ |
-| `paint/tests.rs` | 495 | (tests file, exempt) |
-| `shadow_map_pass.rs` (mod root) | 67 | ✅ |
-| `shadow_map_pass/types.rs` | 86 | ✅ |
-| `shadow_map_pass/light_camera.rs` | 250 | ✅ |
-| `shadow_map_pass/pass.rs` | 669 | ✅ at budget |
-| `shadow_map_pass/tests.rs` | 67 | (tests file, exempt) |
-| `user_shader_proto_pass.rs` (mod root) | 52 | ✅ |
-| `user_shader_proto_pass/types.rs` | 159 | ✅ |
-| `user_shader_proto_pass/cache.rs` | 282 | ✅ |
-| `user_shader_proto_pass/pass.rs` | 273 | ✅ |
-| `user_shader_proto_pass/tests.rs` | 259 | (tests file, exempt) |
+| `rkp_renderer.rs` | 2311 | ⚠️ over; mostly per-pass orchestration. Could split per-stage (atmosphere / mesh / shade / post) if it keeps growing. |
+| `viewport_renderer.rs` | 2243 | ⚠️ over; per-VR state owner. Bind-group rebuilds are the bulk; candidates for extraction once stable. |
+| `rkp_scene_manager/sculpt.rs` | 1816 | ⚠️ over; sculpt mutation core (slab allocator + filter+patch). |
+| `rkp_scene_manager/types.rs` | 1311 | ⚠️ over; private AssetCache machinery lives here. Candidate to extract. |
+| `rkp_scene_manager/asset_load.rs` | 948 | ⚠️ over |
+| `rkp_scene.rs` | 944 | ⚠️ over; scene-buffer upload contract. |
+| `rkp_shade.rs` | 883 | ⚠️ over; PBR shade pass — bind groups + ShadeParams + setters. |
+| `user_shader_mesh_pass.rs` | 868 | ⚠️ over |
+| `shader_composer/tests.rs` | 865 | tests file — exempt |
+| `shader_composer/parser.rs` | 819 | ⚠️ at-budget+ |
+| `proc_surface_nets.rs` | 691 | ✅ at budget |
+| `mesh_glass_pass.rs` | 527 | ✅ |
+| `bloom.rs` | 511 | ✅ |
+| `shadow_map_pass/light_camera.rs` | 501 | ✅ |
+| `proc_sample.rs` | 495 | ✅ |
+| `rkp_scene_manager/manager.rs` | 486 | ✅ |
+| `tlas_build_pass/pass/build.rs` | 471 | ✅ |
+| `gbuffer.rs` | 471 | ✅ |
+| `mesh_shadow_map_pass.rs` | 463 | ✅ |
+| `proc_raymarch.rs` | 443 | ✅ |
+| `rkp_volumetric/mod.rs` | 440 | ✅ |
+| `rkp_atmosphere.rs` | 436 | ✅ |
 
-Other crate files still over budget (in size order):
+Every other module is comfortably under 400 lines. Files marked ⚠️ have a clear extraction strategy when they grow further; the at-2k-line `rkp_renderer.rs` / `viewport_renderer.rs` are structurally one orchestration unit each, so further splitting would be a refactor (not a move).
 
-In rkp-render:
-- `rkp_volumetric.rs` 859 (NOT V1.1-touched)
-- `rkp_shade.rs` 866 (V1.1-modified — Material struct mirror)
-- `tlas_build_pass/pass.rs` 1052 (already split-once; would need per-stage refactor not module move)
-- `user_shader_pass/cache.rs` 924 (already split-once)
-- `shader_composer/parser.rs` 710 (already split-once, slightly over)
-- `user_shader_pass/dispatch.rs` 707 (already split-once, at budget)
+WESL files over budget (no hard rule, flagged):
 
-In rkp-engine:
-- `lifecycle.rs` 1579 (V1.1-modified — wait for in-flight work)
-- `component_registry.rs` 896 (NOT V1.1)
-- `engine/state.rs` 886 (NOT V1.1)
-- `render_worker/frame.rs` 820 (already split-once)
-- `play_mode.rs` 710 (NOT V1.1)
-- `command.rs` 705 (NOT V1.1)
-- `material_library.rs` 703 (V1.1-modified)
-
-In other crates (NOT touched this session):
-- `rkp-core/src/sparse_octree.rs` 1820
-- `rkp-core/src/voxelize_octree.rs` 1179
-- `rkp-runtime/src/input/system.rs` 1140
-- `rkp-procedural/src/arena.rs` 1029
-- `rkp-core/src/scene_node.rs` 892
-- `rkp-physics/src/sdf_collision.rs` 879
-- `rkp-editor/src/ui/panels/object_properties.rs` 858
-- `rkp-core/src/asset_file.rs` 821
-- `rkp-procedural/src/flatten.rs` 801
-- `rkp-editor/src/ui/panels/asset_properties.rs` 790
-- `rkp-editor/src/ui/panels/prop_controls.rs` 743
-- `rkp-core/src/companion.rs` 737
-
-WGSL files over budget (no hard 700-line rule but worth flagging):
-
-- `octree_march.wgsl` 2391 — host march + band-cell descent inlined throughout
-- `rkp_shadow_trace.wgsl` 1392 — shadow trace + Phase 4 band-cell partial-opacity shadow branch
-- `rkp_shade.wgsl` 1093
-- `user_shader_geom.wgsl` 1143 — BFS classify + V13-inline duplicate + V1.1 host-material probe
-- `shadow_scatter.wgsl` 972
+- `rkp_shade.wesl` ~1050 — PBR + atmosphere lookups + paint cursor in one entry point
+- `user_shader_mesh.wesl`, `user_shader_mesh_compute.wesl` — V1 mesh-path user-shader compute trio
+- `proc_eval.wesl` — RPN interpreter (shared)
