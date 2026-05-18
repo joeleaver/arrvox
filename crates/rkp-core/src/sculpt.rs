@@ -112,15 +112,31 @@ pub enum BrushMode {
     /// space flip to empty, and the newly-exposed interior cells
     /// emit cavity-wall Adds on the outside rim.
     Deflate,
-    /// Normal-blend smoothing. For each Solid cell inside the brush
-    /// capsule, average the non-zero normals of its Solid 6-neighbours
-    /// and blend the cell's own normal toward that average by
-    /// `falloff_curve(t) * strength_scaled`. Doesn't change occupancy
-    /// or allocate slots — just rewrites `LeafAttr.normal_oct` for the
-    /// affected cells. Multiple stamps along a stroke accumulate (each
-    /// pass nudges normals closer to the local mean), which is the
-    /// desired Smooth feel and the opposite of Inflate/Deflate's
-    /// single-layer-per-stroke cap.
+    /// Geometry-and-normal smoothing. Per cell inside the brush capsule
+    /// the kernel reads pre-stamp 6-neighbour occupancy from a dense
+    /// scratch grid and applies one of three rules:
+    ///
+    /// * **Cavity-fill** — `Empty` cell with `≥ 4` occupied 6-neighbours
+    ///   (Solid or Interior) flips to `Solid`. Fills isolated pits and
+    ///   thin concavities back into the bulk.
+    /// * **Bump-shave** — `Solid` cell with `≤ 2` occupied 6-neighbours
+    ///   (equivalently `≥ 4` Empty) is `Remove`d. Erases isolated
+    ///   1-voxel bumps and thin protrusions.
+    /// * **Normal blend** — `Solid` cells that survive the morph rule
+    ///   keep their slot but blend their `LeafAttr.normal_oct` toward
+    ///   the local 6-neighbour normal average, weighted by
+    ///   `falloff_curve(t) * (strength / 32)`.
+    ///
+    /// A second pass walks the +1 rim outside the capsule and emits
+    /// cavity-wall `Add`s for any `Interior` cell whose 6-neighbour
+    /// just got `Remove`d — same pattern Carve / Deflate use to keep
+    /// the bulk watertight when its surface shell is breached.
+    ///
+    /// Multiple stamps along a stroke accumulate: a slow drag converges
+    /// toward a locally-smooth silhouette (morph cleans up bumps; the
+    /// surviving surface gets its normals averaged). Unlike Inflate /
+    /// Deflate, Smooth has no transit-brushfire cap — each stamp is an
+    /// independent local relaxation step.
     Smooth,
 }
 
@@ -1330,32 +1346,52 @@ fn compute_deflate_edits(
     }
 }
 
-/// Normal-blend smoothing. For each Solid cell inside the brush
-/// capsule, average the non-zero normals of its Solid 6-neighbours
-/// and blend the cell's own normal toward that average by an
-/// amount shaped by the falloff curve and the strength slider.
+/// Geometry-and-normal smoothing. Three rules over the brush capsule
+/// (all from pre-stamp 6-neighbour occupancy in a dense scratch grid):
 ///
-/// **No occupancy change.** Only `LeafAttr.normal_oct` is rewritten;
-/// the octree stays untouched. That makes Smooth cheap (no slot
-/// alloc, no octree mutation, no mesh re-extract beyond the
-/// downstream cluster dirty-flag pickup) and lets multiple stamps
-/// accumulate cleanly: every pass nudges normals closer to the local
-/// neighbourhood mean, so a slow drag steadily flattens shading
-/// variation.
+/// * **Cavity-fill.** `Empty` cell with `≥ 4` of its 6 face-neighbours
+///   occupied (Solid or Interior) flips to `Solid`. Used to fill
+///   isolated 1-voxel pits and thin concavities. The new cell's
+///   `LeafAttr.normal_oct` points toward where the Empty neighbours
+///   were (averaged direction-to-empty-neighbour), so the new surface
+///   aligns with the local outward direction rather than the brush
+///   axis.
+/// * **Bump-shave.** `Solid` cell with `≤ 2` occupied 6-neighbours is
+///   `Remove`d. Erodes isolated 1-voxel bumps and thin Solid spikes.
+/// * **Normal blend.** Surviving `Solid` cells (those NOT being
+///   `Remove`d) blend their existing normal toward the average of
+///   their Solid 6-neighbours' normals by `falloff_curve(t) *
+///   (strength / 32)`. Same V1 rule, just gated by morph survival.
 ///
-/// **Strength mapping.** The editor exposes a 1..32 strength slider
-/// shared across all brushes. For Smooth that value is interpreted as
-/// "blend rate per stamp" — `blend = strength / 32` at the brush
-/// centre, falling off to 0 at the rim per the active falloff curve.
-/// Strength 16 with a Smooth curve gives ~0.25 blend at centre per
-/// stamp; the user calibrates by holding the cursor longer or
-/// increasing strength.
+/// **Cavity walls.** After the in-capsule pass, a +1-rim pass emits
+/// `Add` edits for `Interior` cells with a `Solid` 6-neighbour that
+/// just got `Remove`d. Direction of the new surface normal: average
+/// of unit-vectors toward the just-removed neighbours. Same pattern
+/// Carve / Deflate use to keep the bulk watertight when the surface
+/// shell breaks.
 ///
-/// **Skip rules.** Cells with no Solid 6-neighbour (isolated surface
-/// voxels) are degenerate — nothing to blend toward — and emit no
-/// edit. Cells whose 6-neighbour normals sum to ZERO (opposite
-/// orientations cancelling) are also skipped rather than producing
-/// an undefined blend target.
+/// **Why a dense scratch grid.** The morph rule is "majority of
+/// pre-stamp neighbours", so every cell must read consistent
+/// pre-stamp state regardless of walk order. A scratch grid pinned to
+/// the +2-padded AABB lets the morph + blend + cavity-wall passes all
+/// read the same snapshot without re-traversing the octree, and folds
+/// the per-Solid `LeafAttr` unpack into a single init pass (the V1
+/// kernel re-unpacked the same `LeafAttr` once per probing
+/// neighbour).
+///
+/// **Threshold choice.** `≥ 4 of 6` for fill and `≤ 2 of 6` for shave
+/// is "strict majority" of the 6 face-neighbours, which is the
+/// roughness-eroding rule. It's conservative enough that flat-surface
+/// patches and short grooves survive (their interior cells have
+/// 3–5 occupied neighbours, on neither side of either threshold), but
+/// aggressive enough that isolated bumps / pits flip immediately. The
+/// `falloff_curve` and `strength` slider modulate ONLY the normal
+/// blend — the morph rule is binary by design, since "partially
+/// flipping" a cell isn't a representable state.
+///
+/// **Strength mapping.** Editor strength slider is 1..32, mapped to
+/// `0..1` blend rate per stamp for the normal pass. Strength does not
+/// affect morph aggression — the threshold is fixed at 4 / 2.
 fn compute_smooth_edits(
     octree: &SparseOctree,
     brick_pool: &BrickPool,
@@ -1368,102 +1404,266 @@ fn compute_smooth_edits(
     if op.radius <= 0.0 {
         return SculptDelta::default();
     }
-    // +1 pad so 6-neighbour lookups for cells at the rim of the
-    // brush footprint can still see their neighbour just outside.
-    let (lo, hi) = brush_cell_range_padded(op, extent, 1);
+    // +2 pad: +1 covers the cavity-wall rim cells outside the capsule,
+    // +1 more so those rim cells' 6-neighbour lookups (used to spot
+    // just-removed Solids) stay inside the scratch grid.
+    let (lo, hi) = brush_cell_range_padded(op, extent, 2);
     if lo.x >= hi.x || lo.y >= hi.y || lo.z >= hi.z {
         return SculptDelta::default();
     }
 
     let t_start = Instant::now();
-    let mut edits = Vec::new();
-    let inv_r = 1.0 / op.radius;
-    // Editor strength slider is 1..32; map to a 0..1 blend rate per
-    // stamp. Clamp so accidental over-large values can't overshoot
-    // (a blend > 1 would invert the normal toward the opposite of
-    // the local mean — never useful).
-    let strength_scaled = (op.strength / 32.0).clamp(0.0, 1.0);
+    let size = hi - lo;
+    let stride_y = size.x as usize;
+    let stride_z = (size.x * size.y) as usize;
+    let total = (size.x * size.y * size.z) as usize;
+    let idx = |c: UVec3| -> usize {
+        let l = c - lo;
+        (l.x as usize) + (l.y as usize) * stride_y + (l.z as usize) * stride_z
+    };
 
+    // Pre-stamp state grid: 0 = Empty, 1 = Solid, 2 = Interior,
+    // 3 = OutOfBounds. Default to OOB so cells the init loop skips
+    // (clipped against extent) are treated as "no neighbour" by both
+    // the morph rule and the cavity-wall pass.
+    const ST_EMPTY: u8 = 0;
+    const ST_SOLID: u8 = 1;
+    const ST_INTERIOR: u8 = 2;
+    const ST_OOB: u8 = 3;
+    let mut state_grid: Vec<u8> = vec![ST_OOB; total];
+    // Slot id of each Solid cell, for the normal-blend SetNormal emit.
+    // u32::MAX = no slot stored at this cell.
+    let mut slot_grid: Vec<u32> = vec![u32::MAX; total];
+    // Pre-stamp surface normal for each Solid cell, unpacked once.
+    let mut normal_grid: Vec<Vec3> = vec![Vec3::ZERO; total];
+
+    // ── Init pass: classify every cell in the +2-padded AABB. ──
     let mut cache = crate::sparse_octree::CellStateCache::new();
     let mut n_aabb_cells = 0u32;
-    let mut n_inside_sphere = 0u32;
     let mut n_cell_state_calls = 0u32;
-
     for z in lo.z..hi.z {
         for y in lo.y..hi.y {
             for x in lo.x..hi.x {
                 n_aabb_cells += 1;
                 let c = UVec3::new(x, y, z);
-                let cell_center = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
+                let state = octree.cell_state_cached(c, brick_pool, &mut cache);
+                n_cell_state_calls += 1;
+                let i = idx(c);
+                match state {
+                    CellState::Empty => state_grid[i] = ST_EMPTY,
+                    CellState::Solid(slot) => {
+                        state_grid[i] = ST_SOLID;
+                        slot_grid[i] = slot;
+                        if let Some(attr) = leaf_attr_pool.get(slot as usize) {
+                            normal_grid[i] = unpack_oct(attr.normal_oct);
+                        }
+                    }
+                    CellState::Interior => state_grid[i] = ST_INTERIOR,
+                    CellState::OutOfBounds => state_grid[i] = ST_OOB,
+                }
+            }
+        }
+    }
 
-                // Capsule check — same gate Inflate/Deflate use, so
-                // a drag stroke smooths along the swept volume with
-                // no per-stamp seam.
+    // 6 face-neighbour offsets, indexed in pairs (+x, -x, +y, -y,
+    // +z, -z) for both occupancy counting and Add-normal averaging.
+    const FACE_DIRS: [IVec3; 6] = [
+        IVec3::new(1, 0, 0),
+        IVec3::new(-1, 0, 0),
+        IVec3::new(0, 1, 0),
+        IVec3::new(0, -1, 0),
+        IVec3::new(0, 0, 1),
+        IVec3::new(0, 0, -1),
+    ];
+
+    // Lookup helper: state at coord, or OOB if outside the scratch grid.
+    let in_grid = |c: IVec3| -> bool {
+        c.x >= lo.x as i32 && c.y >= lo.y as i32 && c.z >= lo.z as i32
+            && c.x < hi.x as i32 && c.y < hi.y as i32 && c.z < hi.z as i32
+    };
+    let state_at = |c: IVec3, grid: &[u8]| -> u8 {
+        if !in_grid(c) { ST_OOB } else { grid[idx(UVec3::new(c.x as u32, c.y as u32, c.z as u32))] }
+    };
+
+    let mut edits: Vec<LeafEdit> = Vec::new();
+    // Tracks which Solid cells the morph pass marks for removal — the
+    // cavity-wall pass reads this to spot Interior cells whose Solid
+    // neighbour just vanished.
+    let mut will_remove: Vec<bool> = vec![false; total];
+
+    let inv_r = 1.0 / op.radius;
+    let strength_scaled = (op.strength / 32.0).clamp(0.0, 1.0);
+    let mut n_inside_sphere = 0u32;
+    let mut n_neighbor_calls = 0u32;
+
+    // ── Morph + normal-blend pass: cells inside the brush capsule. ──
+    for z in lo.z..hi.z {
+        for y in lo.y..hi.y {
+            for x in lo.x..hi.x {
+                let c = UVec3::new(x, y, z);
+                let cell_center = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
                 let dist_from_brush = axis_distance(cell_center, op);
                 if dist_from_brush > op.radius {
                     continue;
                 }
                 n_inside_sphere += 1;
 
-                let state = octree.cell_state_cached(c, brick_pool, &mut cache);
-                n_cell_state_calls += 1;
-                let CellState::Solid(slot) = state else { continue };
-                let Some(attr) = leaf_attr_pool.get(slot as usize) else { continue };
-                let current = unpack_oct(attr.normal_oct);
-
-                // Average Solid 6-neighbours' normals. Skip non-Solid
-                // neighbours and the rare LeafAttrPool slot whose
-                // packed normal decodes to ZERO (uninitialised slot —
-                // shouldn't happen in baked assets, defensive only).
-                let mut sum = Vec3::ZERO;
-                let probe = |sum: &mut Vec3, nc: UVec3, cache: &mut crate::sparse_octree::CellStateCache| {
-                    let nstate = octree.cell_state_cached(nc, brick_pool, cache);
-                    if let CellState::Solid(nslot) = nstate {
-                        if let Some(nattr) = leaf_attr_pool.get(nslot as usize) {
-                            let n = unpack_oct(nattr.normal_oct);
-                            if n != Vec3::ZERO {
-                                *sum += n;
-                            }
-                        }
-                    }
-                };
-                if x > 0 { probe(&mut sum, UVec3::new(x - 1, y, z), &mut cache); }
-                if x + 1 < extent { probe(&mut sum, UVec3::new(x + 1, y, z), &mut cache); }
-                if y > 0 { probe(&mut sum, UVec3::new(x, y - 1, z), &mut cache); }
-                if y + 1 < extent { probe(&mut sum, UVec3::new(x, y + 1, z), &mut cache); }
-                if z > 0 { probe(&mut sum, UVec3::new(x, y, z - 1), &mut cache); }
-                if z + 1 < extent { probe(&mut sum, UVec3::new(x, y, z + 1), &mut cache); }
-
-                let len_sq = sum.length_squared();
-                if len_sq < 1e-6 {
-                    // No Solid neighbour with a real normal — nothing
-                    // to blend toward.
+                let i = idx(c);
+                let s = state_grid[i];
+                if s != ST_EMPTY && s != ST_SOLID {
+                    // Interior / OOB cells don't drive morph here —
+                    // Interior cavity walls are emitted by the rim
+                    // pass below; OOB doesn't have an octree slot to
+                    // operate on.
                     continue;
                 }
-                let target = sum * len_sq.sqrt().recip();
 
-                // Blend factor: falloff(t) * strength_scaled.
-                let t = (1.0 - dist_from_brush * inv_r).clamp(0.0, 1.0);
-                let s = op.falloff_curve.evaluate(t);
-                let blend = (s * strength_scaled).clamp(0.0, 1.0);
+                // Count occupied (Solid|Interior) 6-neighbours. OOB
+                // neighbours count as neither occupied nor empty —
+                // they just lower the maximum the rule sees. At the
+                // grid edge this means cells lose at most 1–2
+                // potential occupied votes, which is acceptable noise.
+                let mut occupied = 0u32;
+                let mut empty_neighbour_dirs: [Option<IVec3>; 6] = [None; 6];
+                let ci = IVec3::new(x as i32, y as i32, z as i32);
+                for (dir_idx, dir) in FACE_DIRS.iter().enumerate() {
+                    n_neighbor_calls += 1;
+                    let ns = state_at(ci + *dir, &state_grid);
+                    if ns == ST_SOLID || ns == ST_INTERIOR {
+                        occupied += 1;
+                    } else if ns == ST_EMPTY {
+                        empty_neighbour_dirs[dir_idx] = Some(*dir);
+                    }
+                }
+
+                if s == ST_EMPTY {
+                    // Cavity-fill: ≥ 4 occupied → flip to Solid.
+                    if occupied >= 4 {
+                        // Outward normal = averaged direction toward
+                        // Empty neighbours (which is where the new
+                        // surface faces).
+                        let mut sum = Vec3::ZERO;
+                        for d in empty_neighbour_dirs.iter().flatten() {
+                            sum += Vec3::new(d.x as f32, d.y as f32, d.z as f32);
+                        }
+                        let len_sq = sum.length_squared();
+                        let normal = if len_sq < 1e-6 {
+                            // All 6 occupied (or only OOB on the
+                            // Empty side) — defensive fallback to the
+                            // analytical brush gradient.
+                            brush_add_normal(c, op)
+                        } else {
+                            sum * len_sq.sqrt().recip()
+                        };
+                        edits.push(LeafEdit {
+                            coord: c,
+                            op: LeafEditOp::Add { material: op.material, normal },
+                        });
+                    }
+                    continue;
+                }
+
+                // Solid cell. Decide bump-shave vs normal-blend.
+                if occupied <= 2 {
+                    edits.push(LeafEdit { coord: c, op: LeafEditOp::Remove });
+                    will_remove[i] = true;
+                    continue;
+                }
+
+                // Normal blend on cells that survive the morph rule.
+                let mut sum = Vec3::ZERO;
+                for dir in FACE_DIRS.iter() {
+                    let n_coord = ci + *dir;
+                    if !in_grid(n_coord) { continue; }
+                    let n_i = idx(UVec3::new(n_coord.x as u32, n_coord.y as u32, n_coord.z as u32));
+                    if state_grid[n_i] != ST_SOLID { continue; }
+                    let n_normal = normal_grid[n_i];
+                    if n_normal != Vec3::ZERO {
+                        sum += n_normal;
+                    }
+                }
+                let target_len_sq = sum.length_squared();
+                if target_len_sq < 1e-6 {
+                    // No Solid neighbour with a real normal — leave
+                    // the cell's normal alone.
+                    continue;
+                }
+                let target = sum * target_len_sq.sqrt().recip();
+
+                let t_curve = (1.0 - dist_from_brush * inv_r).clamp(0.0, 1.0);
+                let s_curve = op.falloff_curve.evaluate(t_curve);
+                let blend = (s_curve * strength_scaled).clamp(0.0, 1.0);
                 if blend <= 0.0 {
                     continue;
                 }
-
+                let current = normal_grid[i];
                 let blended = current.lerp(target, blend);
                 let blended_len_sq = blended.length_squared();
                 if blended_len_sq < 1e-6 {
-                    // Cancellation between current and target.
-                    // Leave the existing normal in place rather than
-                    // emit a zero vector that octahedral packing would
-                    // misrepresent.
                     continue;
                 }
                 let new_normal = blended * blended_len_sq.sqrt().recip();
-
                 edits.push(LeafEdit {
                     coord: c,
-                    op: LeafEditOp::SetNormal { slot, normal: new_normal },
+                    op: LeafEditOp::SetNormal { slot: slot_grid[i], normal: new_normal },
+                });
+            }
+        }
+    }
+
+    // ── Cavity-wall pass: Interior cells with a just-Removed Solid
+    // 6-neighbour become the new surface shell. Walks the +1 padded
+    // range (so a Solid removed AT the capsule boundary can still
+    // expose its outside-the-capsule Interior neighbour). Skipping
+    // the outermost +1 ring of the +2 scratch grid keeps neighbour
+    // lookups in-bounds without an extra branch.
+    let walk_lo = UVec3::new(
+        (lo.x + 1).min(hi.x),
+        (lo.y + 1).min(hi.y),
+        (lo.z + 1).min(hi.z),
+    );
+    let walk_hi = UVec3::new(
+        hi.x.saturating_sub(1).max(walk_lo.x),
+        hi.y.saturating_sub(1).max(walk_lo.y),
+        hi.z.saturating_sub(1).max(walk_lo.z),
+    );
+    for z in walk_lo.z..walk_hi.z {
+        for y in walk_lo.y..walk_hi.y {
+            for x in walk_lo.x..walk_hi.x {
+                let c = UVec3::new(x, y, z);
+                let i = idx(c);
+                if state_grid[i] != ST_INTERIOR {
+                    continue;
+                }
+                let ci = IVec3::new(x as i32, y as i32, z as i32);
+                // Average direction toward the just-removed Solid
+                // neighbours — the cavity-wall surface faces the
+                // empty space those Solids used to occupy.
+                let mut sum = Vec3::ZERO;
+                let mut has_removed = false;
+                for dir in FACE_DIRS.iter() {
+                    let n_coord = ci + *dir;
+                    let n_i = idx(UVec3::new(n_coord.x as u32, n_coord.y as u32, n_coord.z as u32));
+                    if will_remove[n_i] {
+                        has_removed = true;
+                        sum += Vec3::new(dir.x as f32, dir.y as f32, dir.z as f32);
+                    }
+                }
+                if !has_removed {
+                    continue;
+                }
+                let len_sq = sum.length_squared();
+                let normal = if len_sq < 1e-6 {
+                    // Opposite-sign removals cancelled — fall back to
+                    // the brush gradient (carve-style cavity wall
+                    // direction).
+                    -brush_add_normal(c, op)
+                } else {
+                    sum * len_sq.sqrt().recip()
+                };
+                edits.push(LeafEdit {
+                    coord: c,
+                    op: LeafEditOp::Add { material: op.material, normal },
                 });
             }
         }
@@ -1475,7 +1675,7 @@ fn compute_smooth_edits(
             n_aabb_cells,
             n_inside_sphere,
             n_cell_state_calls,
-            n_neighbor_calls: 0,
+            n_neighbor_calls,
             t_total_ns: t_start.elapsed().as_nanos() as u64,
         },
     }
@@ -1614,10 +1814,10 @@ fn brush_add_normal(coord: UVec3, op: &BrushOp) -> Vec3 {
         // pocket (toward the brush center, where the empty volume
         // now lives).
         BrushMode::Carve | BrushMode::Deflate => -outward_from_brush,
-        // Smooth doesn't allocate slots — it never reaches this
-        // fallback. Returning the outward gradient is a defensive
-        // default in case future code paths route Smooth through
-        // here; the value would never feed an actual `Add`.
+        // Smooth's morph pass computes Add normals directly in
+        // compute_smooth_edits (averaging direction-to-neighbour
+        // vectors), so this fallback only fires when the in-kernel
+        // computation degenerates to zero magnitude — defensive.
         BrushMode::Smooth => outward_from_brush,
     }
 }
@@ -1792,12 +1992,13 @@ pub fn apply_delta(
     }
     let t_loop_add_ns = t_add.elapsed().as_nanos() as u64;
 
-    // Smooth's SetNormal edits land here: the cell stays Solid (no
-    // octree mutation, no slot alloc), only its `LeafAttr.normal_oct`
-    // changes. The scene-manager consumer already drains
-    // `renormalized_slots` into the LeafAttrPool unchanged, so the
-    // Smooth wiring is complete once we surface the (slot, normal)
-    // pairs here.
+    // Smooth's SetNormal edits land here: those cells stay Solid (no
+    // octree mutation, no slot alloc), only their `LeafAttr.normal_oct`
+    // changes. The scene-manager consumer drains `renormalized_slots`
+    // into the LeafAttrPool unchanged. Smooth's morph pass ALSO emits
+    // Remove + Add (cavity-fill / bump-shave / cavity-wall) edits,
+    // which flow through the regular `set_cell_empty_cached` /
+    // `set_cell_solid_cached` paths above just like Carve / Raise.
     let renormalized_slots: Vec<(u32, Vec3)> = delta
         .edits
         .iter()
@@ -3029,40 +3230,96 @@ mod tests {
             .collect()
     }
 
-    /// Isolated Solid cell (no Solid 6-neighbours): Smooth has
-    /// nothing to blend toward, must emit zero edits.
+    /// Build a 3×3×3 cube of Solid cells centred at (8,8,8). Slots
+    /// are assigned in row-major (x, y, z) order, giving each cell a
+    /// unique slot id 0..27. The centre cell (8,8,8) lands at slot 13.
+    /// Surrounding the centre in three dimensions means it has 6 Solid
+    /// face-neighbours and survives the morph rule (`occupied = 6 > 2`),
+    /// so V1-style normal-blend tests can target the centre without
+    /// the cube cells being eroded.
+    fn cube_3x3x3() -> (SparseOctree, [u32; 27]) {
+        let mut t = SparseOctree::new(4, 1.0);
+        let mut slots = [0u32; 27];
+        let mut next = 0u32;
+        for dz in 0..3u32 {
+            for dy in 0..3u32 {
+                for dx in 0..3u32 {
+                    let coord = UVec3::new(7 + dx, 7 + dy, 7 + dz);
+                    let slot = next;
+                    next += 1;
+                    t.insert(coord, slot);
+                    let i = (dz * 9 + dy * 3 + dx) as usize;
+                    slots[i] = slot;
+                }
+            }
+        }
+        (t, slots)
+    }
+
+    /// Slot id of the centre cell (8,8,8) in the [`cube_3x3x3`]
+    /// layout. Row-major (x, y, z): cell at (dx=1, dy=1, dz=1) is at
+    /// linear index 9 + 3 + 1 = 13.
+    const CUBE_CENTRE_SLOT: u32 = 13;
+
+    /// Build a `LeafAttrPool` for a 3×3×3 cube where every slot gets
+    /// the same `default_normal` except the centre, which gets
+    /// `centre_normal`. The cube's slots run 0..27 with the centre at
+    /// [`CUBE_CENTRE_SLOT`].
+    fn cube_normals(default_normal: Vec3, centre_normal: Vec3) -> Vec<LeafAttr> {
+        (0..27u32)
+            .map(|s| LeafAttr {
+                material_primary: 1,
+                material_secondary_blend: 0,
+                normal_oct: pack_oct(
+                    if s == CUBE_CENTRE_SLOT { centre_normal } else { default_normal },
+                ),
+            })
+            .collect()
+    }
+
+    /// Isolated Solid cell (no occupied 6-neighbours): the morph rule
+    /// triggers bump-shave (`occupied = 0 ≤ 2`) and emits a Remove,
+    /// since one floating voxel IS the kind of noise Smooth should
+    /// erase. V1 normal-only smoothing was a no-op here; V2 explicitly
+    /// removes the cell.
     #[test]
-    fn smooth_isolated_cell_is_noop() {
+    fn smooth_morph_erodes_isolated_cell() {
         let t = one_leaf(4, UVec3::new(8, 8, 8), 0);
         let pool_data = pool_with_normals(&[Vec3::Y]);
         let pool = fresh_pool();
         let op = smooth_op(Vec3::new(8.5, 8.5, 8.5), 2.0);
         let delta = compute_brush_edits(&t, &pool, &pool_data, op);
+        let removed = delta
+            .edits
+            .iter()
+            .filter(|e| e.coord == UVec3::new(8, 8, 8) && matches!(e.op, LeafEditOp::Remove))
+            .count();
+        assert_eq!(removed, 1, "isolated cell must morph-shave to a single Remove");
+        // No SetNormal — the cell is being deleted, not blended.
         let set_normal_count = delta
             .edits
             .iter()
             .filter(|e| matches!(e.op, LeafEditOp::SetNormal { .. }))
             .count();
-        assert_eq!(set_normal_count, 0, "isolated cell must not emit SetNormal");
+        assert_eq!(set_normal_count, 0, "shaved cell must not also emit SetNormal");
     }
 
-    /// Three collinear Solid cells with identical normals: Smooth
-    /// is a no-op because the centre cell's neighbour average
-    /// equals its own normal (blend toward yourself = identity).
+    /// 3×3×3 cube with every cell's normal = +Y. The centre cell has
+    /// 6 Solid neighbours (one per face) all carrying the same normal,
+    /// so the neighbour average IS +Y and the blend is identity. The
+    /// centre survives the morph rule (`occupied = 6 > 2`).
     #[test]
     fn smooth_uniform_normals_is_noop() {
-        let mut t = SparseOctree::new(4, 1.0);
-        t.insert(UVec3::new(7, 8, 8), 0);
-        t.insert(UVec3::new(8, 8, 8), 1);
-        t.insert(UVec3::new(9, 8, 8), 2);
-        let pool_data = pool_with_normals(&[Vec3::Y, Vec3::Y, Vec3::Y]);
+        let (t, _slots) = cube_3x3x3();
+        let pool_data = cube_normals(Vec3::Y, Vec3::Y);
         let pool = fresh_pool();
         let op = smooth_op(Vec3::new(8.5, 8.5, 8.5), 1.5);
         let delta = compute_brush_edits(&t, &pool, &pool_data, op);
-        // SetNormal may emit but the new normal must be ~equal to
-        // the existing one (blend toward self = no-op).
+        // Whatever SetNormals fire, every result must point ≈ +Y.
+        let mut any = false;
         for edit in &delta.edits {
             if let LeafEditOp::SetNormal { normal, .. } = edit.op {
+                any = true;
                 let dot = normal.dot(Vec3::Y);
                 assert!(
                     dot > 0.9999,
@@ -3070,20 +3327,20 @@ mod tests {
                 );
             }
         }
+        assert!(any, "cube centre should emit at least one SetNormal");
+        // Sanity: nothing eroded — every in-brush cube cell has ≥ 3
+        // occupied 6-neighbours.
+        assert_eq!(delta.count_removed(), 0);
+        assert_eq!(delta.count_added(), 0);
     }
 
-    /// Centre cell with normal +Y between two neighbours pointing
-    /// +Z. Smooth at strength=32 (blend=1.0) must rewrite the
-    /// centre's normal to point ≈ +Z (the neighbour average).
+    /// 3×3×3 cube. Centre normal = +Y, every surrounding cell's
+    /// normal = +Z. Smooth at full strength (32 → blend = 1.0) must
+    /// rewrite the centre's normal to ≈ +Z (the local average).
     #[test]
     fn smooth_blends_toward_neighbour_average() {
-        let mut t = SparseOctree::new(4, 1.0);
-        t.insert(UVec3::new(7, 8, 8), 0);
-        t.insert(UVec3::new(8, 8, 8), 1);
-        t.insert(UVec3::new(9, 8, 8), 2);
-        // Centre normal differs from the two neighbours': it should
-        // be pulled toward their average.
-        let pool_data = pool_with_normals(&[Vec3::Z, Vec3::Y, Vec3::Z]);
+        let (t, slots) = cube_3x3x3();
+        let pool_data = cube_normals(Vec3::Z, Vec3::Y);
         let pool = fresh_pool();
         let op = smooth_op(Vec3::new(8.5, 8.5, 8.5), 1.5);
         let delta = compute_brush_edits(&t, &pool, &pool_data, op);
@@ -3097,9 +3354,7 @@ mod tests {
         });
         let (slot, normal) =
             centre.expect("centre cell must emit a SetNormal at full-strength blend");
-        assert_eq!(slot, 1);
-        // At blend = 1.0 the result is exactly the neighbour
-        // average (+Z), not a half-and-half mix.
+        assert_eq!(slot, slots[13]);
         assert!(
             normal.dot(Vec3::Z) > 0.99,
             "centre normal should be ≈ +Z after blend, got {normal:?}",
@@ -3107,17 +3362,12 @@ mod tests {
     }
 
     /// Constant falloff + strength=16 puts blend at exactly 0.5.
-    /// The centre cell's normal is +Y, neighbours are +Z, so the
-    /// blended result is `normalize((+Y + +Z) / 2)` ≈ (+Y + +Z)
-    /// normalised. Both Y and Z components must be positive and
-    /// roughly equal magnitude.
+    /// Centre normal +Y, neighbours +Z → blended result ≈ normalize(+Y + +Z).
+    /// Both Y and Z components must be positive and roughly equal magnitude.
     #[test]
     fn smooth_half_strength_produces_midway_blend() {
-        let mut t = SparseOctree::new(4, 1.0);
-        t.insert(UVec3::new(7, 8, 8), 0);
-        t.insert(UVec3::new(8, 8, 8), 1);
-        t.insert(UVec3::new(9, 8, 8), 2);
-        let pool_data = pool_with_normals(&[Vec3::Z, Vec3::Y, Vec3::Z]);
+        let (t, _slots) = cube_3x3x3();
+        let pool_data = cube_normals(Vec3::Z, Vec3::Y);
         let pool = fresh_pool();
         let mut op = smooth_op(Vec3::new(8.5, 8.5, 8.5), 1.5);
         op.strength = 16.0;
@@ -3130,33 +3380,157 @@ mod tests {
             }
             None
         }).expect("centre cell must emit SetNormal");
-        // Both Y and Z components positive, roughly comparable.
-        // The exact pack_oct roundtrip drops a tiny amount of
-        // precision but the direction is clearly mid-arc.
         assert!(centre_normal.y > 0.3 && centre_normal.y < 0.8);
         assert!(centre_normal.z > 0.3 && centre_normal.z < 0.8);
     }
 
-    /// apply_delta surfaces SetNormal edits through
-    /// `renormalized_slots`. The scene-manager consumer drains
-    /// those onto the LeafAttrPool — verify the kernel-side
-    /// contract that links the two.
+    /// 1-voxel bump above a 5×5 flat Solid plane → bump-shave. The
+    /// brush capsule is shrunk to radius 0.6 around the bump so only
+    /// the bump cell falls inside; plane corners (which would
+    /// otherwise morph-erode in this thin-plane test scene) stay
+    /// untouched.
+    #[test]
+    fn smooth_morph_shaves_isolated_bump() {
+        let mut t = SparseOctree::new(4, 1.0);
+        let mut next = 0u32;
+        for x in 6..11u32 {
+            for y in 6..11u32 {
+                t.insert(UVec3::new(x, y, 8), next);
+                next += 1;
+            }
+        }
+        // The bump.
+        let bump_slot = next;
+        t.insert(UVec3::new(8, 8, 9), bump_slot);
+        let pool_data: Vec<LeafAttr> = (0..=bump_slot)
+            .map(|_| LeafAttr {
+                material_primary: 1,
+                material_secondary_blend: 0,
+                normal_oct: pack_oct(Vec3::Z),
+            })
+            .collect();
+        let pool = fresh_pool();
+        let mut op = smooth_op(Vec3::new(8.5, 8.5, 9.5), 0.6);
+        op.material = 7;
+        let delta = compute_brush_edits(&t, &pool, &pool_data, op);
+        let bump_removed = delta.edits.iter().any(|e| {
+            e.coord == UVec3::new(8, 8, 9) && matches!(e.op, LeafEditOp::Remove)
+        });
+        assert!(bump_removed, "1-voxel bump must morph-shave to Remove");
+        assert_eq!(delta.count_added(), 0, "no Adds expected for bump-shave-only stamp");
+    }
+
+    /// 1-voxel pit in a 5×5 Solid plane with Interior bulk below →
+    /// cavity-fill. The pit cell at (8,8,8) is Empty; its 6 neighbours
+    /// are 4 lateral Solid + 1 Empty above + 1 Interior below =
+    /// 5 occupied ≥ 4 → flip to Solid.
+    #[test]
+    fn smooth_morph_fills_isolated_pit() {
+        let mut t = SparseOctree::new(4, 1.0);
+        let mut next = 0u32;
+        for x in 6..11u32 {
+            for y in 6..11u32 {
+                if x == 8 && y == 8 {
+                    continue;
+                }
+                t.insert(UVec3::new(x, y, 8), next);
+                next += 1;
+            }
+        }
+        // Interior bulk below the plane.
+        for x in 6..11u32 {
+            for y in 6..11u32 {
+                for z in 6..8u32 {
+                    t.insert_interior(UVec3::new(x, y, z));
+                }
+            }
+        }
+        let pool_data: Vec<LeafAttr> = (0..next)
+            .map(|_| LeafAttr {
+                material_primary: 1,
+                material_secondary_blend: 0,
+                normal_oct: pack_oct(Vec3::Z),
+            })
+            .collect();
+        let pool = fresh_pool();
+        let mut op = smooth_op(Vec3::new(8.5, 8.5, 8.5), 0.6);
+        op.material = 7;
+        let delta = compute_brush_edits(&t, &pool, &pool_data, op);
+        let fill = delta.edits.iter().find_map(|e| {
+            if e.coord == UVec3::new(8, 8, 8) {
+                if let LeafEditOp::Add { material, normal } = e.op {
+                    return Some((material, normal));
+                }
+            }
+            None
+        });
+        let (material, normal) = fill.expect("pit must morph-fill to Add");
+        assert_eq!(material, 7, "fill Add should carry op.material");
+        // Outward direction is toward the Empty neighbour (above, +z).
+        assert!(
+            normal.z > 0.5,
+            "fill normal should point +z (the empty side), got {normal:?}",
+        );
+        assert_eq!(delta.count_removed(), 0, "no Removes expected for cavity-fill-only stamp");
+    }
+
+    /// Isolated Solid "thumb" with Interior bulk beneath. The thumb at
+    /// (8,8,9) has 1 occupied neighbour (the Interior below) → morph-shave
+    /// to Remove. The Interior cell at (8,8,8) then has a will-remove
+    /// 6-neighbour (+z) → cavity-wall Add, with the new surface normal
+    /// pointing toward where the thumb used to be (+z).
+    #[test]
+    fn smooth_morph_emits_cavity_wall_when_solid_exposes_interior() {
+        let mut t = SparseOctree::new(4, 1.0);
+        t.insert(UVec3::new(8, 8, 9), 0);
+        t.insert_interior(UVec3::new(8, 8, 8));
+        t.insert_interior(UVec3::new(8, 8, 7));
+        t.insert_interior(UVec3::new(8, 8, 6));
+        let pool_data = pool_with_normals(&[Vec3::Z]);
+        let pool = fresh_pool();
+        let mut op = smooth_op(Vec3::new(8.5, 8.5, 9.0), 1.0);
+        op.material = 7;
+        let delta = compute_brush_edits(&t, &pool, &pool_data, op);
+
+        let bump_removed = delta.edits.iter().any(|e| {
+            e.coord == UVec3::new(8, 8, 9) && matches!(e.op, LeafEditOp::Remove)
+        });
+        assert!(bump_removed, "isolated bump must morph-shave");
+
+        let wall = delta.edits.iter().find_map(|e| {
+            if e.coord == UVec3::new(8, 8, 8) {
+                if let LeafEditOp::Add { normal, material } = e.op {
+                    return Some((normal, material));
+                }
+            }
+            None
+        });
+        let (normal, material) =
+            wall.expect("Interior beneath the removed bump must emit cavity-wall Add");
+        assert_eq!(material, 7, "cavity-wall Add should carry op.material");
+        assert!(
+            normal.z > 0.9,
+            "cavity-wall normal should point +z toward the removed bump, got {normal:?}",
+        );
+    }
+
+    /// apply_delta round-trip: a 3×3×3 cube under Smooth produces
+    /// only SetNormal edits (no morph flips because every in-brush
+    /// cell survives), and those SetNormals show up in
+    /// `renormalized_slots` for the scene-manager consumer.
     #[test]
     fn apply_delta_surfaces_smooth_in_renormalized_slots() {
-        let mut t = SparseOctree::new(4, 1.0);
-        t.insert(UVec3::new(7, 8, 8), 0);
-        t.insert(UVec3::new(8, 8, 8), 1);
-        t.insert(UVec3::new(9, 8, 8), 2);
-        let pool_data = pool_with_normals(&[Vec3::Z, Vec3::Y, Vec3::Z]);
+        let (mut t, _slots) = cube_3x3x3();
+        let pool_data = cube_normals(Vec3::Z, Vec3::Y);
         let mut pool = fresh_pool();
         let op = smooth_op(Vec3::new(8.5, 8.5, 8.5), 1.5);
         let delta = compute_brush_edits(&t, &pool, &pool_data, op);
+        // The cube test scene has no morph flips; only SetNormals fire.
+        assert_eq!(delta.count_removed(), 0);
+        assert_eq!(delta.count_added(), 0);
         let applied = apply_delta(&mut t, &mut pool, &delta, || panic!("no alloc expected"));
-        // Smooth never allocates or frees slots.
         assert!(applied.allocated_slots.is_empty());
         assert!(applied.freed_slots.is_empty());
-        // Every SetNormal must round-trip into renormalized_slots
-        // with the same (slot, normal) pair.
         let set_normals: Vec<(u32, Vec3)> = delta
             .edits
             .iter()
