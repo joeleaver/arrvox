@@ -10,7 +10,6 @@
 
 use crate::render_frame::RenderFrame;
 
-use super::super::frame_helpers::merge_tile_lists;
 use super::super::state::RenderState;
 
 use super::{EncodeOutput, PreFrameOutput};
@@ -177,31 +176,6 @@ pub(super) fn encode_viewports(
         //     proc_raymarch, shadow, ssao, shade, vol, god_rays, bloom,
         //     bloom_composite, tone_map, composite, grid).
         //
-        // Merge per-tile object lists across two sources:
-        //   - sim's persistent objects (`vp.tile_*_bytes`, already culled)
-        //   - Phase C transient indices (broadcast to every tile;
-        //     small N, mostly used for whole-entity user-shader regions)
-        // No-op pass-through when transients are empty. User-shader
-        // instances flow through the GPU tile-cull pipeline now and
-        // don't go through this CPU merge (Phase 6 Session 4d).
-        let (effective_tile_offsets, effective_tile_object_ids);
-        let need_merge = !pre.transient_indices.is_empty();
-        let (tile_offsets_ref, tile_object_ids_ref): (&[u8], &[u8]) = if !need_merge {
-            (&vp.tile_offsets_bytes, &vp.tile_object_ids_bytes)
-        } else {
-            let (offsets, ids) = merge_tile_lists(
-                &vp.tile_offsets_bytes,
-                &vp.tile_object_ids_bytes,
-                &pre.transient_indices,
-            );
-            effective_tile_offsets = offsets;
-            effective_tile_object_ids = ids;
-            (
-                bytemuck::cast_slice(&effective_tile_offsets),
-                bytemuck::cast_slice(&effective_tile_object_ids),
-            )
-        };
-
         // Snapshot the user-shader mesh draws before the
         // `state.renderer.render_to` mutable borrow so the
         // immutable read above doesn't conflict. The draws are
@@ -214,34 +188,13 @@ pub(super) fn encode_viewports(
             &mut encoder,
             &state.queue,
             vr,
-            pre.object_count,
-            frame.shadow_steps,
-            vp.shade_params.num_lights,
-            frame.lod_enabled,
-            frame.surfacenet_enabled,
-            tile_offsets_ref,
-            tile_object_ids_ref,
-            vp.tile_count_x,
-            state.tlas_pass.last_node_count,
-            // Phase B-redux Phase 3a — frame time + asset count for
-            // user-shader instance_at derivation in march.
-            frame.shade_params_base.time,
-            pre.asset_count,
-            state.tlas_pass.last_leaf_count,
-            // Conservative scene extent for shadow-frustum cull —
-            // the longest axis of the scene AABB.
-            (pre.scene_aabb.1[0] - pre.scene_aabb.0[0])
-                .max(pre.scene_aabb.1[1] - pre.scene_aabb.0[1])
-                .max(pre.scene_aabb.1[2] - pre.scene_aabb.0[2]),
-            vp.camera.view_proj,
             pre.shadow_map_enabled,
             &vp.atmo_frame,
             vp.mode,
             vp.preview_mode,
-            // Phase B-2 — splat-raster instance list. Built in
-            // `update_scene_gpu` from `Renderable.asset_handle`.
-            // Procedural entities without an `AssetHandle` don't
-            // appear here — they ride `proxy_draws` instead.
+            // Mesh-raster instance list built in `update_scene_gpu`
+            // from `Renderable.asset_handle`. Procedural entities
+            // without an `AssetHandle` ride `proxy_draws` instead.
             &frame.mesh_draws,
             // Procedural proxy-mesh draws. Rendered after primary
             // visibility regardless of `primary_mode` — proxy meshes
@@ -388,135 +341,3 @@ pub(super) fn encode_viewports(
     EncodeOutput { pick_issued, active_pending_pick }
 }
 
-/// Format both the primary-march counters (always) and the user-shader
-/// emit-scan breakdown (only when the emit scan fired) from a stats
-/// snapshot. See `shaders/octree_march.wesl` for the full slot layout.
-fn eprint_march_stats(vp_id: crate::viewport::ViewportId, stats: &[u32]) {
-    eprint_primary_march(vp_id, stats);
-    let candidates = stats.get(71).copied().unwrap_or(0);
-    if candidates == 0 {
-        return;
-    }
-    let aabb_pass = stats.get(72).copied().unwrap_or(0);
-    let marches = stats.get(73).copied().unwrap_or(0);
-    let descent_steps = stats.get(74).copied().unwrap_or(0);
-    let hits = stats.get(75).copied().unwrap_or(0);
-    let outer_steps = stats.get(76).copied().unwrap_or(0);
-    let brick_steps = stats.get(77).copied().unwrap_or(0);
-    let misses = stats.get(78).copied().unwrap_or(0);
-    let miss_steps = stats.get(79).copied().unwrap_or(0);
-    let aabb_3d_miss = stats.get(80).copied().unwrap_or(0);
-    let behind_max_dist = stats.get(81).copied().unwrap_or(0);
-    let total_steps = stats.first().copied().unwrap_or(0);
-    let host_steps = total_steps.saturating_sub(descent_steps);
-
-    let cull_pct = 100.0 * (1.0 - (aabb_pass as f64 / candidates as f64));
-    let total_culls = aabb_3d_miss + behind_max_dist;
-    let pct_3d = if total_culls == 0 {
-        0.0
-    } else {
-        100.0 * aabb_3d_miss as f64 / total_culls as f64
-    };
-    let pct_behind = if total_culls == 0 {
-        0.0
-    } else {
-        100.0 * behind_max_dist as f64 / total_culls as f64
-    };
-    let emit_step_pct = if total_steps == 0 {
-        0.0
-    } else {
-        100.0 * descent_steps as f64 / total_steps as f64
-    };
-    let outer_pct = if descent_steps == 0 {
-        0.0
-    } else {
-        100.0 * outer_steps as f64 / descent_steps as f64
-    };
-    let hit_marches = marches.saturating_sub(misses);
-    let hit_steps = descent_steps.saturating_sub(miss_steps);
-    let steps_per_miss = if misses == 0 {
-        0.0
-    } else {
-        miss_steps as f64 / misses as f64
-    };
-    let steps_per_hit = if hit_marches == 0 {
-        0.0
-    } else {
-        hit_steps as f64 / hit_marches as f64
-    };
-    let miss_pct = if marches == 0 {
-        0.0
-    } else {
-        100.0 * misses as f64 / marches as f64
-    };
-
-    eprintln!(
-        "[emit_scan vp={vp_id:?}] candidates={candidates} \
-         aabb_pass={aabb_pass} ({cull_pct:.1}% culled) \
-         marches={marches} ({miss_pct:.1}% miss) hits={hits} | \
-         cull-reason: 3d_miss={aabb_3d_miss} ({pct_3d:.1}%) \
-         behind_max_dist={behind_max_dist} ({pct_behind:.1}%) | \
-         steps: emit={descent_steps} host={host_steps} \
-         (emit={emit_step_pct:.1}% of total) | \
-         split: outer={outer_steps} brick={brick_steps} \
-         ({outer_pct:.1}% outer) | \
-         per-march: miss={steps_per_miss:.1} hit={steps_per_hit:.1}",
-    );
-}
-
-/// Always-printed primary-march counters: total step count, hits, max
-/// per-pixel steps, depth histograms across the three march entry points
-/// (surface, normal, shadow), and pool-read counts. Tells us which axis
-/// the per-pixel march is bottlenecked on without needing the
-/// user-shader emit path to fire.
-fn eprint_primary_march(vp_id: crate::viewport::ViewportId, stats: &[u32]) {
-    let total_steps = stats.first().copied().unwrap_or(0);
-    let hits = stats.get(2).copied().unwrap_or(0);
-    let max_steps = stats.get(3).copied().unwrap_or(0);
-    if total_steps == 0 && hits == 0 {
-        return;
-    }
-    // Depth histograms: 12 buckets (L0..L11) per entry point.
-    let surf_hist: u32 = (4..16).map(|i| stats.get(i).copied().unwrap_or(0)).sum();
-    let norm_hist: u32 = (16..28).map(|i| stats.get(i).copied().unwrap_or(0)).sum();
-    let shdw_hist: u32 = (28..40).map(|i| stats.get(i).copied().unwrap_or(0)).sum();
-    // Mean depth per entry point (weighted by descend count at each level).
-    let mean_depth = |range: std::ops::Range<usize>| -> f32 {
-        let mut total: u64 = 0;
-        let mut weighted: u64 = 0;
-        for (level, slot) in range.enumerate() {
-            let n = stats.get(slot).copied().unwrap_or(0) as u64;
-            total = total.saturating_add(n);
-            weighted = weighted.saturating_add(n.saturating_mul(level as u64));
-        }
-        if total == 0 { 0.0 } else { weighted as f32 / total as f32 }
-    };
-    let surf_mean = mean_depth(4..16);
-    let norm_mean = mean_depth(16..28);
-    let shdw_mean = mean_depth(28..40);
-    // Hit footprint buckets — coarse pixel-LOD distribution at hit.
-    let foot_lt1 = stats.get(40).copied().unwrap_or(0);
-    let foot_1to2 = stats.get(41).copied().unwrap_or(0);
-    let foot_2to4 = stats.get(42).copied().unwrap_or(0);
-    let foot_ge4 = stats.get(43).copied().unwrap_or(0);
-    // Pool reads.
-    let leaf_attr = stats.get(44).copied().unwrap_or(0);
-    let voxel = stats.get(45).copied().unwrap_or(0);
-    let color = stats.get(46).copied().unwrap_or(0);
-    let materials = stats.get(47).copied().unwrap_or(0);
-
-    let steps_per_hit = if hits == 0 {
-        0.0
-    } else {
-        total_steps as f64 / hits as f64
-    };
-    eprintln!(
-        "[march vp={vp_id:?}] total_steps={total_steps} hits={hits} \
-         max_steps={max_steps} steps/hit={steps_per_hit:.1} | \
-         descend: surf={surf_hist} (mean L{surf_mean:.1}) \
-         norm={norm_hist} (mean L{norm_mean:.1}) \
-         shadow={shdw_hist} (mean L{shdw_mean:.1}) | \
-         footprint <1px={foot_lt1} 1-2={foot_1to2} 2-4={foot_2to4} >=4={foot_ge4} | \
-         pool reads: leaf_attr={leaf_attr} voxel={voxel} color={color} mat={materials}",
-    );
-}

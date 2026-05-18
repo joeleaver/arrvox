@@ -1,8 +1,9 @@
 // Procedural CSG raymarcher — live preview path for procedural objects
 // in the build viewport. One compute dispatch per frame, one thread per
 // pixel, sphere-traces the flattened RPN tree against the camera ray
-// and writes the same G-buffer layout as `octree_march.wgsl` so the
-// downstream shadow / SSAO / shade / post passes see identical inputs.
+// and writes the same G-buffer the mesh raster + `mesh_resolve` fill
+// so downstream shadow / SSAO / shade / post passes see identical
+// inputs.
 //
 // Shared with the (Phase 2+) GPU bake compute: all math — primitive
 // SDFs, combinators, effects, noise, RPN interpretation — lives in
@@ -68,9 +69,9 @@ struct RaymarchParams {
 // rkp-side pick texture — R32Uint. Holds the hit primitive's NodeId
 // for per-primitive selection / outline.
 @group(1) @binding(3) var gbuf_pick:     texture_storage_2d<r32uint, write>;
-// Glass info — proc_raymarch has no glass support; write zero here so
-// the shared buffer stays coherent with `octree_march`. Layout: R =
-// oct-packed normal, G = (thickness_mm << 16) | material_id.
+// Glass info — proc_raymarch has no glass support; write zero here
+// so the shared buffer stays coherent with the rest of the G-buffer.
+// Layout: R = oct-packed normal, G = (thickness_mm << 16) | material_id.
 @group(1) @binding(4) var gbuf_glass:    texture_storage_2d<rg32uint, write>;
 // Leaf-slot target — procedurals write 0 since they have no stable
 // leaf_attr_slot; the shade pass treats 0 as "no geodesic data for
@@ -85,9 +86,9 @@ struct RaymarchParams {
 struct Ray { origin: vec3<f32>, dir: vec3<f32> };
 
 fn make_ray(coord: vec2<i32>) -> Ray {
-    // Match `octree_march.wgsl:main`: the camera's `right` and `up`
-    // basis vectors are already pre-scaled by aspect and tan(fov/2), so
-    // the ray is just `forward + ndc.x * right + ndc.y * up`.
+    // The camera's `right` and `up` basis vectors are pre-scaled by
+    // aspect and tan(fov/2), so the ray is just
+    // `forward + ndc.x * right + ndc.y * up`.
     let uv = (vec2<f32>(coord) + vec2<f32>(0.5) + camera.jitter) / camera.resolution;
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     var r: Ray;
@@ -114,7 +115,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Transform the camera ray into the entity's local frame so we can
     // march the procedural tree (authored in local space) as if the
-    // entity were at origin. Mirrors octree_march's per-object trace.
+    // entity were at origin.
     let local_origin_h = params.entity_inverse_world * vec4<f32>(ray.origin, 1.0);
     let local_dir_h = params.entity_inverse_world * vec4<f32>(ray.dir, 0.0);
     let local_origin = local_origin_h.xyz;
@@ -210,8 +211,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let local_normal = gradient_normal(hit_local, count, SURFACE_EPS * 4.0);
     let normal = normalize((params.entity_world * vec4<f32>(local_normal, 0.0)).xyz);
 
-    // Pack material/color into the same G-buffer format octree_march
-    // uses — see that shader for the layout. Dual-material:
+    // Pack material/color into the same G-buffer format
+    // `mesh_resolve.wesl` writes. Dual-material:
     //
     //   packed_r = primary (low 16) | secondary (high 16)
     //   packed_g = blend_u8 | object_id_u8 << 8 | color_rgb565 << 16

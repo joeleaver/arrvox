@@ -192,8 +192,7 @@ struct TlasPrim {
     _pad1: u32,
 }
 
-// TLAS BVH node (32 bytes). Output of Karras construction; consumed
-// by rkp_shadow_trace's BVH descent.
+// TLAS BVH node (32 bytes). Output of Karras construction.
 //
 // `left_or_leaf` high bit (0x80000000) is the leaf marker — when set,
 // the low bits index into the TlasInstanceLeaf array; when clear, they
@@ -275,27 +274,6 @@ struct LightCameraCsm {
 // ──────────────────────────────────────────────────────────────────
 // Per-pass parameter uniforms
 // ──────────────────────────────────────────────────────────────────
-
-// Per-frame uniform shared by octree_march and rkp_shadow_trace —
-// the two passes bind the same buffer, so the layout has to match.
-// Some fields are read by only one of them; naga DCE drops the
-// unused fields from each side's SPIR-V.
-struct MarchParams {
-    object_count: u32,
-    mode: u32,
-    shadow_max_steps: u32,
-    num_lights: u32,
-    lod_enabled: u32,
-    surfacenet_enabled: u32,
-    tile_count_x: u32,
-    tlas_node_count: u32,
-    shadow_map_enabled: u32,
-    time: f32,
-    asset_count: u32,
-    // Instrumentation: 1 ⇒ skip the user-shader emit-instance scan in
-    // `octree_march::main`. CPU mirrors `MarchParams::uss_disable`.
-    uss_disable: u32,
-}
 
 // Shading-pass parameters (144 bytes). CPU mirror is
 // `rkp_shade::ShadeParams`. Bound by both the shade pass (which uses

@@ -52,8 +52,8 @@ pub struct GBuffer {
     /// hit. `R32Uint` — `0` means "no hit" (sky or procedural surface
     /// without a stable leaf slot); any other value indexes
     /// `leaf_attr_pool` / `color_pool` / `brush_overlay` in downstream
-    /// passes. Written by octree_march + proc_raymarch, read by
-    /// rkp_shade for the geodesic paint cursor (Phase 3b).
+    /// passes. Written by the mesh raster + proc_raymarch, read by
+    /// `mesh_resolve` and `rkp_shade`.
     pub leaf_slot_texture: wgpu::Texture,
     pub leaf_slot_view: wgpu::TextureView,
 
@@ -110,7 +110,7 @@ pub const GBUFFER_MATERIAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg
 pub const GBUFFER_MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 /// Texture format for the glass target — Rg32Uint carrying entry
 /// normal (R), packed thickness/material_id (G). Changing the format
-/// breaks `octree_march`, `proc_raymarch`, and `rkp_glass` — all
+/// breaks `mesh_resolve`, `proc_raymarch`, and `rkp_glass` — all
 /// hardcode against this channel layout.
 pub const GBUFFER_GLASS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
 /// Texture format for the leaf_slot target — R32Uint carrying the
@@ -223,8 +223,7 @@ impl GBuffer {
         // position. Written by `mesh.wesl` as a 4th MRT attachment;
         // consumed by `mesh_resolve.wesl` for per-pixel cell descent.
         // RENDER_ATTACHMENT for mesh writes, TEXTURE_BINDING for the
-        // resolve read, COPY_DST so the splat path can clear it via
-        // `encoder.clear_texture` (it doesn't bind this attachment).
+        // resolve read.
         let rest_pos_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("gbuffer rest_pos"),
             size,

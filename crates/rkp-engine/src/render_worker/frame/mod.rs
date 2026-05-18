@@ -36,21 +36,11 @@ pub(super) struct RenderOutcome {
 
 /// Cross-phase state from `run_pre_frame` consumed by `encode_viewports`.
 pub(super) struct PreFrameOutput {
-    /// User-shader transient region instance indices in the combined
-    /// objects buffer (= persistent_count..persistent_count+transient_count).
-    /// Phase 3 splices these into every viewport's per-tile object lists.
-    pub(super) transient_indices: Vec<u32>,
-    /// Total instance count after splicing transients onto the persistent
-    /// (sim-supplied) instance list.
-    pub(super) object_count: u32,
-    /// Total asset count after splicing instance prototypes + transient
-    /// region assets onto the persistent (sim-supplied) asset list.
-    pub(super) asset_count: u32,
-    /// CPU-derived scene AABB used by Phase 3 for the shadow-frustum
-    /// cull extent and re-derived by `prepare_shadow_maps`.
+    /// CPU-derived scene AABB, used by encode for the shadow-frustum
+    /// cull extent in the per-viewport shade params.
     pub(super) scene_aabb: ([f32; 3], [f32; 3]),
     /// Whether this frame's directional shadow map will dispatch.
-    /// Phase 3's per-VR `shade_params.shadow_map_enabled` mirrors this
+    /// The per-VR `shade_params.shadow_map_enabled` mirrors this
     /// (gated additionally on InSitu mode).
     pub(super) shadow_map_enabled: bool,
 }

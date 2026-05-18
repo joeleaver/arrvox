@@ -55,51 +55,7 @@ pub(super) fn splice_transient_into_tile_lists(
     (new_offsets, new_ids)
 }
 
-/// Phase 4 — merge sim's per-tile object lists with two render-side
-/// sources: a properly-culled per-tile user-shader-instance list (one
-/// entry per (tile, instance) where the instance's screen-AABB
-/// overlaps the tile), and a Phase C broadcast list (every tile gets
-/// every transient).
-///
-/// For each tile, output is `[sim_persistent | user_shader_in_tile |
-/// transient_broadcast]`. All three index spaces are disjoint
-/// (persistent < persistent_count ≤ user-shader < persistent+
-/// user_shader ≤ transient < object_count), so the march can dispatch
-/// any of them without aliasing.
-pub(super) fn merge_tile_lists(
-    sim_offsets_bytes: &[u8],
-    sim_ids_bytes: &[u8],
-    transient_broadcast: &[u32],
-) -> (Vec<u32>, Vec<u32>) {
-    let n_tile = if sim_offsets_bytes.is_empty() {
-        0
-    } else {
-        (sim_offsets_bytes.len() / 4).saturating_sub(1)
-    };
-    if n_tile == 0 {
-        return (
-            bytemuck::cast_slice::<u8, u32>(sim_offsets_bytes).to_vec(),
-            bytemuck::cast_slice::<u8, u32>(sim_ids_bytes).to_vec(),
-        );
-    }
-    let sim_offsets: &[u32] = bytemuck::cast_slice(sim_offsets_bytes);
-    let sim_ids: &[u32] = bytemuck::cast_slice(sim_ids_bytes);
-
-    let mut new_offsets: Vec<u32> = Vec::with_capacity(n_tile + 1);
-    let mut new_ids: Vec<u32> =
-        Vec::with_capacity(sim_ids.len() + n_tile * transient_broadcast.len());
-    new_offsets.push(0);
-    for t in 0..n_tile {
-        let sa = sim_offsets[t] as usize;
-        let sb = sim_offsets[t + 1] as usize;
-        new_ids.extend_from_slice(&sim_ids[sa..sb]);
-        new_ids.extend_from_slice(transient_broadcast);
-        new_offsets.push(new_ids.len() as u32);
-    }
-    (new_offsets, new_ids)
-}
-
-/// Phase 5.2 — derive a conservative scene AABB for the GPU TLAS
+/// Derive a conservative scene AABB for the GPU TLAS
 /// build's Morton normalization. Walks the host instances' transformed
 /// asset AABBs (Arvo). Returns `(min, max)`; falls back to
 /// `[0,0,0] → [1,1,1]` for empty input — the Morton dispatch's
@@ -151,30 +107,20 @@ pub(super) fn transform_aabb_world(
     (new_min, new_max)
 }
 
-/// Phase 8 V3 disabled — voxel-stepped shadow-map silhouettes were
-/// worse quality than `rkp_shadow_trace`'s per-pixel ray-traced path,
-/// and the floor's per-texel descent cost made the pipeline slower
-/// than the path it was meant to replace. Always returning `false`
-/// here skips the shadow_map dispatch chain, leaves
-/// `ShadeParams.shadow_map_enabled = 0`, and routes directional
-/// lights through `shadow_data[]` — the same path point/spot lights
-/// already use.
+/// Per-frame CSM setup for the mesh-mode directional shadow.
 ///
-/// All shadow_map_pass.rs + scatter shader code is kept in tree in
-/// case a follow-up revisits with a fundamentally different shadow
-/// representation. To re-enable: replace this with the frustum-fit
-/// walk from commit 0a6aeed.
+/// Picks the dominant directional shadow caster, fits per-cascade
+/// projections to the camera frustum + scene AABB, writes the
+/// `LightCameraCsm` uniform on every visible viewport, and writes
+/// the per-cascade LOD-select cameras. Returns `true` when a caster
+/// was found and the shadow render should dispatch — the shade pass
+/// reads `ShadeParams.shadow_map_enabled` (set in lockstep) to gate
+/// its sample.
 pub(super) fn prepare_shadow_maps(
     state: &mut RenderState,
     frame: &RenderFrame,
     scene_aabb: ([f32; 3], [f32; 3]),
-    _tlas_prim_count: u32,
 ) -> bool {
-    // The voxel-march scatter shadow_map remains disabled (the
-    // commit-comment context above still applies — it produced
-    // Mesh path renders the directional shadow map via
-    // `MeshShadowMapPass`. The per-VR `LightCameraUniform` write
-    // lands the per-cascade matrices that pass consumes.
     // Stash the per-cascade LOD pixel-threshold falloff on the
     // renderer so the next `dispatch_mesh_shadow` picks it up. The
     // env-var override (`RKP_CSM_THRESHOLD_FALLOFF`) takes precedence

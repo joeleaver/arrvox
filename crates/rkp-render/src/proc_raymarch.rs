@@ -1,17 +1,17 @@
 //! Procedural CSG raymarcher — live preview pass for the build viewport.
 //!
-//! Runs as a compute dispatch (one thread per pixel), sphere-traces the
-//! flattened RPN tree against each camera ray, and writes into the same
-//! G-buffer layout (`position`, `normal`, `material`) as
-//! [`crate::octree_march::OctreeMarchPass`]. Downstream passes (shadow,
-//! SSAO, shade, post) don't distinguish its output from the voxel march.
+//! Runs as a compute dispatch (one thread per pixel), sphere-traces
+//! the flattened RPN tree against each camera ray, and writes into
+//! the same G-buffer layout (`position`, `normal`, `material`) the
+//! mesh raster + `mesh_resolve` produce. Downstream passes (shadow,
+//! SSAO, shade, post) don't distinguish its output from the mesh path.
 //!
 //! The shader input is an array of `ProcInstruction` (see
 //! `rkp_procedural::flatten`) — a post-order RPN encoding of the tree.
 //! The CPU flattens once per edit; re-uploads to the GPU are cheap
-//! (O(tree size), tens of bytes per node). This replaces the voxel
-//! march in the build viewport when the user toggles live preview —
-//! the voxel path remains the source of truth elsewhere.
+//! (O(tree size), tens of bytes per node). This replaces the mesh
+//! raster in the build viewport when the user toggles live preview —
+//! the mesh path remains the source of truth elsewhere.
 //!
 //! This pass owns no shared state with `RkpScene`: it binds only the
 //! viewport's camera buffer (group 0), the G-buffer textures (group 1),
@@ -132,8 +132,7 @@ impl ProcRaymarchPass {
                     bgl_storage_tex(3, wgpu::TextureFormat::R32Uint),
                     // Glass target — procedural primitives don't do
                     // glass (yet); the shader writes 0 to keep this
-                    // buffer coherent with what octree_march wrote
-                    // elsewhere in the frame.
+                    // buffer coherent with the rest of the G-buffer.
                     bgl_storage_tex(4, wgpu::TextureFormat::Rg32Uint),
                     // Leaf-slot target — procedurals have no stable
                     // leaf_attr_slot (they're analytical), so the

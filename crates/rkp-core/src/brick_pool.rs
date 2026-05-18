@@ -43,10 +43,10 @@ pub const BRICK_LEVELS: u8 = 2;
 pub const BRICK_EMPTY: u32 = 0xFFFF_FFFFu32;
 
 /// Cell sentinel: the cell sits inside the solid of a mesh-imported
-/// asset — there's no visible surface here (the march skips past it
-/// identically to `BRICK_EMPTY`), but it counts as *occupied mass* for
-/// any neighborhood-averaging pass that needs volumetric information
-/// (see `rkp-render/src/shaders/octree_march.wgsl::reconstruct_normal_surfacenet`).
+/// asset — there's no visible surface here (identical to
+/// `BRICK_EMPTY` from a rendering standpoint), but it counts as
+/// *occupied mass* for any neighborhood-averaging pass that needs
+/// volumetric information.
 ///
 /// Costs zero memory: occupies one of the 64 pre-allocated u32 slots in
 /// a brick that was already allocated for its shell cells. Distinct

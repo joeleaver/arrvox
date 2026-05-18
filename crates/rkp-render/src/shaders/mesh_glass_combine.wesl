@@ -5,7 +5,7 @@
 // G-buffer's `position.w` (opaque hit distance), and assembles the
 // final `gbuf_glass` Rg32Uint output that `rkp_glass.wesl` consumes.
 //
-// Output layout matches `octree_march`'s glass write exactly:
+// Output layout that `rkp_glass.wesl` consumes:
 //   · R = oct-packed world entry normal.
 //   · G = `(thickness_mm << 16) | material_id` where
 //         `thickness_mm = clamp((exit - entry) * 1000, 1, 65535)`.

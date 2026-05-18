@@ -383,58 +383,41 @@ pub(super) fn run_pre_frame(
         scene_min: scene_aabb.0,
         scene_max: scene_aabb.1,
     };
-    let tlas_prim_count = state.tlas_build_pass.build_gpu_tlas(
+    state.tlas_build_pass.build_gpu_tlas(
         &state.device,
         &state.queue,
         &tlas_inputs,
         &mut state.tlas_pass,
         Some(&state.renderer.profiler),
     );
-    // Refresh per-VR shadow-trace bind groups so they pick up any
-    // capacity-doubling reallocation of `tlas_pass.{nodes,leaves}_buffer`.
-    // Mesh path consumes TLAS via the mesh raster's own bindings;
-    // no per-viewport setup is needed here after the march/shadow
-    // scatter retirement.
-    let _ = tlas_prim_count;
     let _ = asset_count;
 
     let p_t_tlas = pre_start.elapsed();
 
-    // Phase 8 — directional shadow map. Picks the first
-    // directional light, derives the light camera covering the
-    // scene AABB, writes the uniform into every VR. Returns
-    // whether the shadow map will be live this frame; the shade
-    // pass gates its sample on that. Texture dispatch happens
-    // later in `render_to`.
-    let shadow_map_enabled = prepare_shadow_maps(state, frame, scene_aabb, tlas_prim_count);
+    // Directional CSM setup — picks the dominant directional
+    // shadow caster, fits per-cascade projections to the camera
+    // frustum + scene AABB, writes per-VR `LightCameraCsm` uniforms.
+    // Returns whether the shadow render should dispatch this frame;
+    // the shade pass gates its sample on the matching
+    // `ShadeParams.shadow_map_enabled`.
+    let shadow_map_enabled = prepare_shadow_maps(state, frame, scene_aabb);
 
     let p_t_shadow_prepare = pre_start.elapsed();
 
-    // Mesh path skins in the vertex shader against the per-frame
-    // `bone_matrices` / `bone_dual_quats` buffers — no scatter pass.
-
-    let transient_indices: Vec<u32> = Vec::new();
-    let object_count = gpu_instances.len() as u32;
-
-    let p_t_skin = pre_start.elapsed();
     if pre_profile {
         let to_ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
         eprintln!(
-            "[render.pre] setup={:.2} uploads={:.2} mesh_user_shader={:.2} upload_frame={:.2} tlas={:.2} shadow={:.2} skin={:.2} | total={:.2}",
+            "[render.pre] setup={:.2} uploads={:.2} mesh_user_shader={:.2} upload_frame={:.2} tlas={:.2} shadow={:.2} | total={:.2}",
             to_ms(p_t_setup),
             to_ms(p_t_uploads) - to_ms(p_t_setup),
             to_ms(p_t_mesh) - to_ms(p_t_uploads),
             to_ms(p_t_upload_frame) - to_ms(p_t_mesh),
             to_ms(p_t_tlas) - to_ms(p_t_upload_frame),
             to_ms(p_t_shadow_prepare) - to_ms(p_t_tlas),
-            to_ms(p_t_skin) - to_ms(p_t_shadow_prepare),
-            to_ms(p_t_skin),
+            to_ms(p_t_shadow_prepare),
         );
     }
     PreFrameOutput {
-        transient_indices,
-        object_count,
-        asset_count,
         scene_aabb,
         shadow_map_enabled,
     }

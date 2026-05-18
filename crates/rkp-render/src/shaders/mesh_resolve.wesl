@@ -57,7 +57,7 @@ import package::lib::brick::BRICK_CELL_INTERIOR;
 // Group 1 — scene-wide buffers driving the lookup. The first three
 // entries match the existing layout (`leaf_attr_pool`, `color_pool`,
 // `instances`); `assets`/`octree_nodes`/`brick_pool` are added for the
-// per-pixel descent — same buffers `octree_march` binds, so the lookup
+// per-pixel descent — same buffers this resolve binds, so the lookup
 // resolves identically to a degenerate march (a single descent at a
 // known surface point, no ray walk).
 // `lib::leaf_attr` references `leaf_attr_pool`, `color_pool_data`, and
@@ -299,7 +299,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let world_basis = mat3x3<f32>(world[0].xyz, world[1].xyz, world[2].xyz);
     let n_world = normalize(world_basis * n_local);
 
-    // Material packing — must match `octree_march`'s opaque-hit path
+    // Material packing — fixed layout that `rkp_shade` decodes.
     // (search for `let packed_r =` / `let packed_g =`):
     //   r: primary (lo16) | secondary (hi16)
     //   g: blend_8 (lo8)  | color_rgb565 (hi16)
@@ -325,8 +325,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cg6 = (cg8 * 63u) / 255u;
     let cb5 = (cb8 * 31u) / 255u;
     let color_rgb565 = cr5 | (cg6 << 5u) | (cb5 << 11u);
-    // packed_g layout — must match `octree_march.wesl`'s opaque-hit
-    // path and `rkp_shade.wesl`'s decode:
+    // packed_g layout — fixed format that `rkp_shade.wesl` decodes:
     //   bits  0- 7: blend8 (dual-material weight)
     //   bits  8-15: paint intensity (0..255)
     //   bits 16-31: color_rgb565

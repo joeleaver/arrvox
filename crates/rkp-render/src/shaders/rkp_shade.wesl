@@ -175,9 +175,7 @@ struct LightCameraShadeCsm {
 // on the front (closest entry wins) and 0.0 on the back (farthest
 // exit wins). The shade pass samples both at the fragment's
 // light-space coords and applies Beer attenuation when glass sits
-// between the light and the fragment. Mesh-mode only — march mode
-// leaves these at clear values, which `glass_shadow_attenuation`
-// reads as "no glass" (front >= back) and skips.
+// between the light and the fragment.
 @group(1) @binding(3) var glass_shadow_front: texture_depth_2d_array;
 @group(1) @binding(4) var glass_shadow_back:  texture_depth_2d_array;
 
@@ -711,7 +709,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // palette; base_color is used for the albedo unless a per-voxel
     // color override (RGB565 in packed_g high 16) is present.
     //
-    // Dual-material path: octree_march (voxel) and proc_raymarch
+    // Dual-material path: `mesh_resolve` (voxel) and proc_raymarch
     // (procedural, eventually) can both write a secondary material +
     // non-zero blend_weight for smooth seams across MaterialByHeight
     // / MaterialByNoise transition zones. We lerp every PBR property
@@ -820,7 +818,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // how much of the painted RGB to lerp in on top of base_color, so
     // soft-falloff brushes fade smoothly into the underlying material
     // at the edge instead of stamping a hard boundary disc. Layout
-    // matches `mesh_resolve.wesl` and `octree_march.wesl`.
+    // matches `mesh_resolve.wesl`.
     let color_rgb565 = (packed_g >> 16u) & 0xFFFFu;
     var albedo = base_color;
     if color_rgb565 != 0u {
@@ -831,9 +829,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             f32(cr5) / 31.0, f32(cg6) / 63.0, f32(cb5) / 31.0,
         );
         // intensity == 0 ⇒ keep base_color (mix with t=0); intensity
-        // == 1 ⇒ full painted_rgb override. Both write paths
-        // (`mesh_resolve.wesl`, `octree_march.wesl`) are responsible
-        // for packing the brush intensity here.
+        // == 1 ⇒ full painted_rgb override. `mesh_resolve.wesl` packs
+        // the brush intensity here.
         let intensity = f32((packed_g >> 8u) & 0xFFu) / 255.0;
         albedo = mix(base_color, painted_rgb, intensity);
     }

@@ -203,7 +203,7 @@ pub fn compute_painted_color(cur: u32, rgb: [f32; 3], weight: f32) -> u32 {
 /// albedo. Partial strength fades toward the material over multiple
 /// strokes — same feel as Photoshop's eraser. The shade pass routes
 /// `color_pool[slot] == 0` to `mat_albedo(material)` via a 0 in the
-/// gbuffer's RGB565 channel; see `octree_march.wgsl`.
+/// gbuffer's RGB565 channel; see `rkp_shade.wesl`.
 pub fn erase_leaf_color(
     pool: &mut LeafAttrPool,
     leaf_slot: u32,

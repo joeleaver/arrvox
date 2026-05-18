@@ -24,9 +24,8 @@
 //! 3. **Combine compute** (`MeshGlassPass::combine_pipeline`) — reads
 //!    the front + back targets plus `gbuf_position.w` (opaque hit
 //!    distance), gates glass behind the closest opaque, and packs the
-//!    final Rg32Uint `gbuf_glass`. Output layout matches
-//!    `octree_march`'s glass write byte-for-byte so `rkp_glass.wesl`
-//!    runs unchanged.
+//!    final Rg32Uint `gbuf_glass`. The packing matches the
+//!    `gbuf_glass` contract `rkp_glass.wesl` consumes.
 //!
 //! Bind groups (raster passes):
 //!   · `g0` — camera + bones (reuses `MeshInstanceLayouts.g0_layout`).

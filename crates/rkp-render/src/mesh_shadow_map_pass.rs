@@ -225,10 +225,8 @@ impl MeshShadowMapPass {
             // separately by `mesh_glass_shadow.wesl` and the shade
             // pass applies Beer attenuation on top of the opaque
             // shadow factor. Adding the FS forfeits early-z on
-            // glass-bearing instances; the per-instance `has_glass`
-            // filter sends pure-opaque assets to a no-FS variant
-            // (TODO once both pipelines coexist) — for now every
-            // instance pays the FS cost in shadow.
+            // glass-bearing instances; every instance pays the FS
+            // cost in shadow until a no-FS opaque variant lands.
             fragment: Some(wgpu::FragmentState {
                 module: &render_module,
                 entry_point: Some("frag_main"),

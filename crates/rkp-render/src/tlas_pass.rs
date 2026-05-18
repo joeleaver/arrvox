@@ -54,11 +54,9 @@ const _: () = assert!(std::mem::size_of::<TlasNode>() == 32);
 /// High bit marker — set on `left_or_leaf` to flag a leaf node.
 pub const TLAS_NODE_LEAF_BIT: u32 = 0x8000_0000;
 
-/// Per-instance leaf payload. 16 bytes — same shape as
-/// [`crate::octree_march::UserShaderTileEntry`] except `instance_index`
-/// replaces the unused trailing pad. Holds enough info for the shadow
-/// trace to set up per-instance ray descent without re-reading the
-/// `instances[]` storage buffer for user-shader instances.
+/// Per-instance leaf payload. 16 bytes. Holds enough info for a
+/// consumer to set up per-instance ray descent without re-reading
+/// the `instances[]` storage buffer for user-shader instances.
 ///
 /// * Host instance: `instance_index = idx into instances[]`,
 ///   `instance_state_offset = 0` (ignored), the `instances[]` lookup
@@ -78,10 +76,7 @@ pub struct TlasInstanceLeaf {
 const _: () = assert!(std::mem::size_of::<TlasInstanceLeaf>() == 16);
 
 /// `instance_index` sentinel for user-shader leaves (no `instances[]`
-/// entry to look up). Distinct from the
-/// [`crate::octree_march`]'s `USER_SHADER_PICK_SENTINEL` (0xFFFFFFFE)
-/// only by purpose; values can collide harmlessly since both are
-/// "this isn't a real instances[] index" markers.
+/// entry to look up).
 pub const TLAS_LEAF_USER_SHADER: u32 = 0xFFFF_FFFEu32;
 
 /// Initial buffer placeholder size in bytes. Both buffers grow via

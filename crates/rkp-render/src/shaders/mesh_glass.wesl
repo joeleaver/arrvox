@@ -237,8 +237,8 @@ fn vert_main(
 
     // Per-vertex normal — decoded from the VBO and rotated into
     // world space. For unskinned / rigid-affine instances this is
-    // the upper-3x3 of `instance.world` applied to a unit vector,
-    // matching the approximation `octree_march` uses on line 1361.
+    // the upper-3x3 of `instance.world` applied to a unit vector
+    // — the same approximation other rigid passes use.
     // Skinned normals would require applying the bone-blended
     // rotation to the normal too; deferred — glass meshes are
     // typically rigid, and skinned glass would show as flat-

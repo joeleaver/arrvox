@@ -1,11 +1,12 @@
 //! Per-viewport render-target and pass state.
 //!
 //! Each `ViewportRenderer` owns a complete resolution-coupled render
-//! chain: march → shadow_trace → ssao → shade → volumetric → god_rays →
-//! bloom → bloom_composite → tone_map → composite. These are the passes
-//! whose intermediate textures vary with the viewport's size; duplicating
-//! them per-VR is what lets two viewports of different resolutions render
-//! in one frame without clashing on shared textures.
+//! chain: mesh raster → mesh_resolve → ssao → shade → volumetric →
+//! god_rays → bloom → bloom_composite → tone_map → composite. These
+//! are the passes whose intermediate textures vary with the viewport's
+//! size; duplicating them per-VR is what lets two viewports of
+//! different resolutions render in one frame without clashing on
+//! shared textures.
 //!
 //! Shared on [`RkpRenderer`]: compute pipelines (via each pass's own
 //! internal state — small), `RkpScene` buffers, atmosphere LUTs, the
@@ -77,9 +78,8 @@ pub struct ViewportRenderer {
     /// dual-material shading. Not part of `crate::GBuffer`
     /// (sibling-project invariants) and not read by `rkp_shade` —
     /// only `proc_outline` and the engine's pick-readback path
-    /// consume it. For voxel hits from `octree_march` this slot is
-    /// left unwritten; MAIN viewport resolves picks via `object_id`
-    /// in packed_g, same as before.
+    /// consume it. The mesh raster leaves this slot unwritten; MAIN
+    /// viewport resolves picks via `object_id` in packed_g.
     pub pick_texture: wgpu::Texture,
     pub pick_view: wgpu::TextureView,
     pub bloom: crate::BloomPass,
@@ -1929,11 +1929,6 @@ impl ViewportRenderer {
         (self.width * 4 + 255) & !255
     }
 
-    // Phase 5 — Option B's `dispatch_instance_overlay` was removed.
-    // User-shader instances now flow through the unified host march
-    // via `asset.shader_id` branch (see `octree_march.wgsl` and
-    // `tick_instance_pipeline`). The per-pixel march + composite
-    // pipeline is gone.
 
     /// Encode a copy of the composite texture into the readback ring's
     /// next idle buffer. Returns the index that was written, or `None` if

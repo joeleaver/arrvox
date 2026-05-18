@@ -178,8 +178,7 @@ fn paint_probe(world_pos: vec3<f32>, anchor: AnchorContext) -> bool {
     // Octree coords ARE object-local-world-units centered on
     // grid_origin (NOT divided by voxel_size). `extent` and the
     // per-level `half` walked by octree_lookup are world-scale.
-    // See octree_march.wesl line ~778: `oc_origin = local_origin -
-    // asset.grid_origin`.
+    // `oc_origin = local_origin - asset.grid_origin`.
     let oc_pos = local_pos - asset.grid_origin;
 
     let extent = bitcast<f32>(asset.octree_extent_bits);

@@ -2,7 +2,7 @@
 //!
 //! [`RkpRenderer`] holds the scene-wide buffers (scene, atmosphere LUTs,
 //! shade params, lights, materials) plus the GPU profiler. The
-//! resolution-coupled passes (march, shadow_trace, ssao, shade,
+//! resolution-coupled passes (mesh raster, mesh_resolve, ssao, shade,
 //! volumetric, god_rays) live in [`ViewportRenderer`] so each viewport
 //! can render at its own resolution without clashing on shared textures.
 //!
@@ -24,9 +24,6 @@ use crate::mesh_shadow_map_pass::MeshShadowMapPass;
 use crate::mesh_instance::{MeshDraw, MeshInstanceLayouts};
 use crate::mesh_resolve_pass::MeshResolvePass;
 use wgpu_profiler::GpuProfiler;
-
-// `PrimaryMode` enum + `RKP_PRIMARY` env-var read retired after the
-// Mesh raster is the only render path.
 
 /// Read a positive finite f32 from the named env var; fall back to
 /// `default` if the var is unset, unparseable, or non-positive. Used
@@ -1901,56 +1898,22 @@ impl RkpRenderer {
 
     /// Render one frame into `viewport`. Dispatches into the VR's own
     /// per-resolution passes; in `Isolation` mode the atmosphere /
-    /// shadow_trace / volumetric / god_rays / bloom passes are skipped
-    /// to give a clean studio look.
+    /// volumetric / god_rays / bloom passes are skipped to give a
+    /// clean studio look.
     ///
-    /// `lod_enabled` gates the prefiltered-LOD early-exit in the march;
-    /// turn it off for A/B correctness comparison.
-    /// `surfacenet_enabled` gates render-time normal reconstruction from
-    /// the 3³ in-brick occupancy neighborhood — an A/B toggle for the
-    /// Surface-Nets normal POC.
-    /// `preview_mode` selects the primary-visibility pass: `Voxel` runs
-    /// the usual octree march; `Raymarch` runs the procedural CSG
-    /// raymarcher instead. Only the build viewport uses `Raymarch`;
-    /// everywhere else passes `Voxel` (the default).
-    #[allow(clippy::too_many_arguments)]
+    /// `preview_mode` selects the primary-visibility pass: `Voxel`
+    /// runs the surface-mesh raster; `Raymarch` runs the procedural
+    /// CSG raymarcher instead. Only the build viewport uses
+    /// `Raymarch`; everywhere else passes `Voxel` (the default).
     pub fn render_to(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         queue: &wgpu::Queue,
         viewport: &mut crate::viewport_renderer::ViewportRenderer,
-        _object_count: u32,
-        _shadow_steps: u32,
-        _num_lights: u32,
-        _lod_enabled: bool,
-        _surfacenet_enabled: bool,
-        _tile_offsets: &[u8],
-        _tile_object_ids: &[u8],
-        _tile_count_x: u32,
-        _tlas_node_count: u32,
-        // Phase B-redux Phase 3a — frame time + asset count. Threaded
-        // through to march params for `instance_at` derivation.
-        _time: f32,
-        _asset_count: u32,
-        // Phase 8 — TLAS prim count (one per shadow caster). The
-        // shadow-map setup pass walks `tlas_prims[0..prim_count]`;
-        // `tlas_node_count` is the BVH node count, which is up to
-        // `2*prim_count - 1` and not what the setup needs.
-        _tlas_prim_count: u32,
-        // Phase 8 — scene extent (max world dimension) used by the
-        // setup pass to extrude per-prim AABBs along `light_dir`
-        // for the shadow-frustum cull.
-        _scene_extent: f32,
-        // Phase 8 — camera world→NDC matrix forwarded to the
-        // shadow-map setup pass so it can shadow-frustum-cull
-        // each prim against the visible region.
-        _camera_view_proj: [[f32; 4]; 4],
-        // Phase 8 — when true, dispatch the shadow-map chain
-        // (clear → setup → scatter) after primary visibility.
-        // Engine sets this when there's a live directional shadow
-        // caster (non-empty TLAS + shadow-casting directional
-        // light); ShadeParams.shadow_map_enabled is in lockstep so
-        // shade samples the fresh map.
+        // When true, dispatch the directional CSM render after
+        // primary visibility. Engine sets this when there's a live
+        // shadow-casting directional light; ShadeParams.shadow_map_
+        // enabled is in lockstep so shade samples the fresh map.
         shadow_map_enabled: bool,
         atmo_frame_params: &crate::rkp_atmosphere::AtmosphereFrameParams,
         mode: crate::RenderMode,
@@ -2001,9 +1964,6 @@ impl RkpRenderer {
             );
             self.profiler.end_query(encoder, q);
         } else {
-            // `mesh_draws` records (asset_handle, world, object_id)
-            // per scene instance — name to be renamed `mesh_draws` in
-            // the cleanup audit.
             self.dispatch_mesh(queue, encoder, viewport, mesh_draws);
         }
 
@@ -2025,11 +1985,7 @@ impl RkpRenderer {
         // 1c. Directional shadow map — mesh triangle rasterization
         //     from the light's POV into the same `shadow_buffer` the
         //     shade pass samples. Per-instance uniforms were written
-        //     by the earlier `dispatch_mesh` call this frame. The
-        //     engine flips `shadow_map_enabled` based on whether a
-        //     directional caster + non-empty TLAS exists this frame;
-        //     `ShadeParams.shadow_map_enabled` is in lockstep so shade
-        //     samples the fresh map.
+        //     by the earlier `dispatch_mesh` call this frame.
         if in_situ && !raymarch && shadow_map_enabled {
             self.dispatch_mesh_shadow(
                 queue, encoder, viewport, mesh_draws, user_shader_mesh_draws,

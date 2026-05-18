@@ -265,7 +265,7 @@ fn octree_lookup(
 // host-cell hit reveals a band-cell pointing at an instance shader.
 //
 // The phase used for stats bucketing comes in as `phase` — callers
-// pass `PHASE_MARCH` for octree_march and `PHASE_SHADOW` for the
+// pass `PHASE_MARCH` for primary lookups and `PHASE_SHADOW` for the
 // shadow paths. Proto octrees are tiny (1-3 levels deep), so the
 // LOD branch in `octree_lookup` won't fire — `lod_enabled` is
 // hardcoded 0u and the LOD-arg slots receive zeros.

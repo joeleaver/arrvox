@@ -1,11 +1,12 @@
-//! Phase 2 guard — CPU mirror of the WGSL `mat4_affine_inverse` helper
-//! (in `octree_march.wgsl` + `rkp_shadow_trace.wgsl`). The Rust side
-//! computes the same formula and compares against glam's general inverse
-//! for several non-trivial transforms.
+//! CPU mirror of the WGSL `mat4_affine_inverse` helper (in
+//! `lib/math.wesl`, currently consumed by `user_shader_mesh_compute`).
+//! The Rust side computes the same formula and compares against
+//! glam's general inverse for several non-trivial transforms.
 //!
-//! Phase 2 originally shipped a column-vs-row-vector confusion that gave
-//! R instead of R^T for rotations — invisible to syntax validation, but
-//! every shaded normal was wrong. This test fails fast instead.
+//! An earlier version shipped a column-vs-row-vector confusion that
+//! gave R instead of R^T for rotations — invisible to syntax
+//! validation, but every shaded normal was wrong. This test fails
+//! fast instead.
 
 use glam::{Mat4, Quat, Vec3};
 

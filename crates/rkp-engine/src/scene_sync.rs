@@ -15,8 +15,8 @@ pub struct ScreenAabb {
     pub max_y: f32,
 }
 
-/// Shader workgroup / tile size — must match `@workgroup_size(8, 8, 1)` in
-/// `octree_march.wgsl`. Changing this here also requires a shader edit.
+/// Tile size in pixels — historical 8×8 tile granularity. Used by the
+/// CPU-side screen-AABB→tile-list builder.
 pub const MARCH_TILE_SIZE: u32 = 8;
 
 /// Per-tile object lists. Replaces the 32-bit bitmask scheme so the
