@@ -468,11 +468,24 @@ impl EngineState {
                         self.project_dir = Some(project_dir.clone());
                         self.project_path = Some(project_file);
                         self.scene_path = Some(project_dir.join("scenes/default.arvxscene"));
-                        self.project_name = project_name;
-                        self.project_loaded = true;
+                        self.project_name = project_name.clone();
                         self.project_dirty = true;
                         self.scene_dirty.mark_all();
                         self.gpu_objects_dirty.mark_all();
+
+                        // Stream phase progress to the welcome-screen
+                        // loading panel. `project_loaded` is deferred
+                        // to the very end so the welcome screen stays
+                        // visible throughout the load — see
+                        // `publish_phase` for the channel mechanics.
+                        use crate::snapshot::{ProjectLoadPhase, ProjectLoadingStatus};
+                        let mk = |phase, detail: Option<&str>| ProjectLoadingStatus {
+                            project_name: project_name.clone(),
+                            phase,
+                            detail: detail.map(str::to_owned),
+                        };
+
+                        self.publish_phase(Some(mk(ProjectLoadPhase::ScanningAssets, None)));
                         self.scan_models();
                         if let Some(ref dir) = self.project_dir {
                             // Write starter materials before scanning.
@@ -486,13 +499,46 @@ impl EngineState {
                         // with the project. No-op if `assets/shaders/`
                         // is empty.
                         let _ = self.reload_user_shaders();
-                        self.scaffold_and_build_gameplay();
+
+                        // Scaffold first (fast — file copies). Only
+                        // flash the "Building gameplay scripts" phase
+                        // if scaffolding decided a cargo rebuild is
+                        // needed; otherwise the dylib was reloaded
+                        // directly and the loading panel skips this
+                        // phase entirely.
+                        match self.scaffold_gameplay() {
+                            super::gameplay_ops::ScaffoldOutcome::BuildNeeded(crate_dir) => {
+                                self.publish_phase(Some(mk(ProjectLoadPhase::ScaffoldGameplay, None)));
+                                self.build_gameplay_crate(&crate_dir);
+                            }
+                            super::gameplay_ops::ScaffoldOutcome::UpToDate
+                            | super::gameplay_ops::ScaffoldOutcome::Failed => {}
+                        }
+
+                        self.publish_phase(Some(mk(ProjectLoadPhase::ImportingMeshes, None)));
                         self.auto_import_meshes();
+
+                        self.publish_phase(Some(mk(ProjectLoadPhase::Finalizing, None)));
                         if let Some(ref pp) = self.project_path {
                             crate::recent_projects::add_recent(&self.project_name, &pp.to_string_lossy());
                         }
+                        self.project_loaded = true;
+                        // Don't push `publish_phase(None)` here — the
+                        // editor clears its loading signal when
+                        // `project_loaded=true` arrives in the next
+                        // regular snapshot. Doing it here would flash
+                        // the idle layout for one tick before the
+                        // welcome screen disappears.
+                        self.current_project_loading = None;
                     }
-                    Err(e) => eprintln!("[ArvxEngine] new project failed: {e}"),
+                    Err(e) => {
+                        eprintln!("[ArvxEngine] new project failed: {e}");
+                        // On failure project_loaded stays false, so we
+                        // must explicitly clear the loading panel —
+                        // otherwise the welcome screen would sit on
+                        // the last reported phase forever.
+                        self.publish_phase(None);
+                    }
                 }
             }
 
@@ -503,8 +549,7 @@ impl EngineState {
                         self.clear_scene();
                         self.project_dir = Some(project_dir.clone());
                         self.project_path = Some(path);
-                        self.project_name = project.name;
-                        self.project_loaded = true;
+                        self.project_name = project.name.clone();
                         self.project_dirty = true;
                         // Cache + flag the editor layout so the editor
                         // hydrates its docking state on the next tick.
@@ -513,10 +558,32 @@ impl EngineState {
                         self.editor_layout_json = project.editor_layout;
                         self.editor_layout_pending = true;
 
+                        // Stream phase progress to the welcome-screen
+                        // loading panel. `project_loaded` flips at the
+                        // very end so the welcome screen stays up
+                        // throughout — see `publish_phase`.
+                        use crate::snapshot::{ProjectLoadPhase, ProjectLoadingStatus};
+                        let project_name = project.name.clone();
+                        let mk = |phase, detail: Option<String>| ProjectLoadingStatus {
+                            project_name: project_name.clone(),
+                            phase,
+                            detail,
+                        };
+
                         // Scaffold + build gameplay BEFORE loading the scene,
                         // so gameplay components (Spin, Health, etc.) are registered
-                        // and can be deserialized from the scene file.
-                        self.scaffold_and_build_gameplay();
+                        // and can be deserialized from the scene file. Skip the
+                        // "Building gameplay scripts" phase when scaffolding
+                        // didn't touch anything and the dylib is already on disk
+                        // — common case on project re-open.
+                        match self.scaffold_gameplay() {
+                            super::gameplay_ops::ScaffoldOutcome::BuildNeeded(crate_dir) => {
+                                self.publish_phase(Some(mk(ProjectLoadPhase::ScaffoldGameplay, None)));
+                                self.build_gameplay_crate(&crate_dir);
+                            }
+                            super::gameplay_ops::ScaffoldOutcome::UpToDate
+                            | super::gameplay_ops::ScaffoldOutcome::Failed => {}
+                        }
 
                         // `scene_path` must be set BEFORE loading so
                         // `load_scene_from_file` can resolve
@@ -525,9 +592,14 @@ impl EngineState {
                         let scene_path = project_dir.join(format!("scenes/{}.arvxscene", project.default_scene));
                         self.scene_path = Some(scene_path.clone());
                         if scene_path.exists() {
+                            self.publish_phase(Some(mk(
+                                ProjectLoadPhase::LoadingScene,
+                                scene_path.file_name().and_then(|s| s.to_str()).map(str::to_owned),
+                            )));
                             self.load_scene_from_file(&scene_path);
                         }
 
+                        self.publish_phase(Some(mk(ProjectLoadPhase::ScanningAssets, None)));
                         self.scan_models();
                         if let Some(ref dir) = self.project_dir {
                             // Reseed any starter materials the project
@@ -541,12 +613,23 @@ impl EngineState {
                         }
                         self.init_file_watcher();
                         let _ = self.reload_user_shaders();
+
+                        self.publish_phase(Some(mk(ProjectLoadPhase::ImportingMeshes, None)));
                         self.auto_import_meshes();
+
+                        self.publish_phase(Some(mk(ProjectLoadPhase::Finalizing, None)));
                         if let Some(ref pp) = self.project_path {
                             crate::recent_projects::add_recent(&self.project_name, &pp.to_string_lossy());
                         }
+                        self.project_loaded = true;
+                        // See `NewProject` above for why we don't
+                        // publish a clearing phase here on success.
+                        self.current_project_loading = None;
                     }
-                    Err(e) => eprintln!("[ArvxEngine] open project failed: {e}"),
+                    Err(e) => {
+                        eprintln!("[ArvxEngine] open project failed: {e}");
+                        self.publish_phase(None);
+                    }
                 }
             }
 

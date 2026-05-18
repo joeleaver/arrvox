@@ -5,11 +5,15 @@
 use arvx_render::arvx_scene_manager::ArvxSceneManager;
 
 use crate::camera::CameraControlState;
-use super::super::{CameraState, EngineConfig, FrameCallback};
+use super::super::{CameraState, EngineConfig, FrameCallback, StateCallback};
 use super::EngineState;
 
 impl EngineState {
-    pub(crate) fn new(config: &EngineConfig, frame_callback: FrameCallback) -> Self {
+    pub(crate) fn new(
+        config: &EngineConfig,
+        frame_callback: FrameCallback,
+        state_callback: StateCallback,
+    ) -> Self {
         let ctx = arvx_render::RenderContext::new_headless();
         let device = ctx.device;
         let queue = ctx.queue;
@@ -161,6 +165,8 @@ impl EngineState {
             environment_dirty: true, // upload on first frame
             environment_ui_dirty: true,
             console: crate::console::ConsoleLog::new(),
+            state_callback,
+            current_project_loading: None,
             gameplay_loader: crate::gameplay_loader::GameplayLoader::new(),
             behavior_executor: None,
             behavior_commands: crate::behavior::CommandQueue::new(),

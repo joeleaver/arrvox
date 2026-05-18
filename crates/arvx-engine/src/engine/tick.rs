@@ -26,8 +26,10 @@ pub(crate) fn tick_loop(
     // EngineState::new). Sim no longer fires it directly — pixel
     // callbacks happen on the render thread after each VR's readback
     // drain. The callback closure is `Send`, so this just transfers
-    // ownership across the thread boundary at spawn time.
-    let mut state = EngineState::new(&config, frame_callback);
+    // ownership across the thread boundary at spawn time. The
+    // state_callback lives on EngineState so command handlers can
+    // publish mid-handler progress snapshots (see `publish_phase`).
+    let mut state = EngineState::new(&config, frame_callback, state_callback);
     state.console.info(format!("Engine started ({}x{})", config.width, config.height));
 
     // Try to load a pre-built gameplay dylib (if project is already set).
@@ -225,7 +227,7 @@ pub(crate) fn tick_loop(
         // 6. Push state to client.
         let frame_time = frame_start.elapsed();
         let update = state.build_state_update(frame_time);
-        state_callback(&update);
+        (state.state_callback)(&update);
 
         // 7. Clear per-frame input state for next tick.
         state.input_system.begin_frame();

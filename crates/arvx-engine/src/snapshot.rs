@@ -29,6 +29,55 @@ pub struct ImportProgressInfo {
     pub error: Option<String>,
 }
 
+/// Coarse phase the engine is currently in while opening or creating
+/// a project. Drives the welcome-screen loading panel so the user
+/// sees "Building gameplay scripts…" instead of a frozen UI while
+/// `OpenProject` runs its multi-second handler synchronously.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectLoadPhase {
+    /// `cargo build --release` on the scaffolded gameplay crate.
+    /// Cold builds dominate first-open time.
+    ScaffoldGameplay,
+    /// Walking the `.arvxscene`, acquiring each referenced `.arvx`
+    /// (decompress + GPU pool upload).
+    LoadingScene,
+    /// Models / materials / shaders directory scans + file-watcher
+    /// init.
+    ScanningAssets,
+    /// `auto_import_meshes` — re-imports `.glb`/`.fbx` sources whose
+    /// sidecar profile is newer than the cached `.arvx`.
+    ImportingMeshes,
+    /// Any remaining cleanup before flipping `project_loaded = true`.
+    Finalizing,
+}
+
+impl ProjectLoadPhase {
+    /// Human-readable label shown in the loading panel.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ScaffoldGameplay => "Building gameplay scripts",
+            Self::LoadingScene => "Loading scene",
+            Self::ScanningAssets => "Scanning assets",
+            Self::ImportingMeshes => "Re-importing meshes",
+            Self::Finalizing => "Finalizing",
+        }
+    }
+}
+
+/// Snapshot of a project that's currently being opened or created.
+/// Cleared (set to `None` in the outer field) once the handler finishes
+/// and `project_loaded = true` has been published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectLoadingStatus {
+    /// Display name (project file stem, or directory name for `new`).
+    pub project_name: String,
+    /// Coarse phase.
+    pub phase: ProjectLoadPhase,
+    /// Optional finer detail — current asset, count, etc. `None` when
+    /// no useful sub-status is available for the phase.
+    pub detail: Option<String>,
+}
+
 /// One generator preset surfaced to the editor's models panel.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GeneratorPresetEntry {
@@ -154,6 +203,13 @@ pub struct StateUpdate {
     pub procedural: Option<Option<crate::procedural_snapshot::ProceduralSnapshot>>,
     /// New console log entries since last tick.
     pub console_entries: Vec<crate::console::LogEntry>,
+    /// Project-load progress. Outer `Option` = "this tick carries an
+    /// update"; inner `Option` = `Some(status)` while a load is in
+    /// flight, `None` once the handler finished (clears the welcome
+    /// screen's loading panel). Pushed via mid-handler snapshots so
+    /// `OpenProject` / `NewProject` can stream phase changes even
+    /// though the handler runs synchronously inside a single tick.
+    pub project_loading: Option<Option<ProjectLoadingStatus>>,
     /// Latest per-frame profiling sample. Sent every tick once the
     /// first GPU timestamps resolve (~3 frames into the session). The
     /// editor maintains its own ring of these on the UI side for the

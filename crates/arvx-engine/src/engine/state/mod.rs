@@ -64,7 +64,7 @@ pub(crate) struct EntityPaintedCache {
 
 use crate::camera::CameraControlState;
 
-use super::CameraState;
+use super::{CameraState, StateCallback};
 
 /// A click-pick awaiting a G-buffer readback. The viewport tag
 /// determines interpretation: MAIN resolves to a scene entity; BUILD
@@ -591,6 +591,18 @@ pub(crate) struct EngineState {
 
     /// Console log buffer.
     pub(crate) console: crate::console::ConsoleLog,
+    /// Callback that ships `StateUpdate`s to the client (editor). Lives
+    /// on `EngineState` so command handlers can publish mid-handler
+    /// progress snapshots — see `publish_phase` for the project-load
+    /// loading panel. `tick.rs` invokes it once per tick after
+    /// `build_state_update`.
+    pub(crate) state_callback: StateCallback,
+    /// Latest project-loading status published via `publish_phase`.
+    /// Stored so we can republish the same status on the next tick if
+    /// nothing else changed — keeps the welcome-screen loading panel
+    /// stable instead of flickering between ticks that don't carry an
+    /// update.
+    pub(crate) current_project_loading: Option<crate::snapshot::ProjectLoadingStatus>,
     /// Gameplay dylib loader (hot-reload).
     pub(crate) gameplay_loader: crate::gameplay_loader::GameplayLoader,
     /// Behavior system executor (created when play starts).

@@ -429,6 +429,15 @@ fn main() -> anyhow::Result<()> {
                 }
                 if let Some(loaded) = update.project_loaded {
                     store.project_loaded.send(loaded);
+                    if loaded {
+                        // Loading panel has done its job — clear it
+                        // atomically with the welcome-screen dismissal
+                        // so the idle layout doesn't briefly flash.
+                        store.project_loading.send(None);
+                    }
+                }
+                if let Some(loading) = update.project_loading.clone() {
+                    store.project_loading.send(loading);
                 }
                 if let Some(name) = &update.project_name {
                     store.project_name.send(name.clone());

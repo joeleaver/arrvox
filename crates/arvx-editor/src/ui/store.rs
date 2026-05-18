@@ -188,6 +188,13 @@ pub struct EditorStore {
 
     /// Whether a project is loaded (controls welcome screen visibility).
     pub project_loaded: Signal<bool>,
+    /// Live project-load progress while `OpenProject` / `NewProject`
+    /// is in flight. `Some(_)` swaps the welcome screen's buttons +
+    /// recents for a phase-progress panel; `None` shows the normal
+    /// idle layout. Set optimistically by the click handler before
+    /// the engine command is dispatched, then refined by phase pings
+    /// from `publish_phase`, then cleared on completion or failure.
+    pub project_loading: Signal<Option<arvx_engine::snapshot::ProjectLoadingStatus>>,
     /// Recent projects list for the welcome screen.
     pub recent_projects: Signal<Vec<RecentProject>>,
     /// Current project name.
@@ -376,6 +383,7 @@ impl EditorStore {
 
             // Project state.
             project_loaded: Signal::new(false),
+            project_loading: Signal::new(None),
             recent_projects: Signal::new(Vec::new()),
             project_name: Signal::new(String::new()),
             project_dir: Signal::new(String::new()),

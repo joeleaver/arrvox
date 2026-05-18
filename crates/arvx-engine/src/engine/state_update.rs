@@ -292,6 +292,59 @@ impl EngineState {
         count
     }
 
+    /// Publish a project-load phase update through the state callback
+    /// without waiting for the next regular tick. Call this from
+    /// inside `OpenProject` / `NewProject` handlers at every phase
+    /// boundary so the welcome-screen loading panel updates while the
+    /// rest of the handler is still running synchronously.
+    ///
+    /// `Some(status)` shows the panel; `None` clears it (paired with
+    /// flipping `project_loaded = true` at the end of the handler).
+    ///
+    /// The published `StateUpdate` carries only the loading delta plus
+    /// always-shipped scalars mirrored from current state — change-
+    /// detected fields stay `None` so the editor doesn't re-process
+    /// scene/material/model lists for what's purely a UI ping.
+    pub(crate) fn publish_phase(
+        &mut self,
+        status: Option<crate::snapshot::ProjectLoadingStatus>,
+    ) {
+        self.current_project_loading = status.clone();
+        let update = StateUpdate {
+            fps: self.render_hz_ema,
+            delivered_fps: self.delivered_hz_ema,
+            tick_hz: self.tick_hz_ema,
+            physics_hz: self.physics_hz_ema,
+            gpu_object_count: self.gpu_instances.len() as u32,
+            camera_position: self.camera.position,
+            play_mode: self.play_state.is_some(),
+            selected_entity: None,
+            objects: None,
+            project_loaded: None,
+            project_name: None,
+            project_dir: None,
+            available_models: None,
+            available_generators: None,
+            available_generator_presets: None,
+            importing_models: None,
+            import_progress: None,
+            editor_layout: None,
+            inspector: None,
+            recent_projects: None,
+            available_components: None,
+            materials: None,
+            user_shaders: None,
+            selected_material: self.selected_material,
+            selected_model: self.selected_model.clone(),
+            environment: None,
+            procedural: None,
+            project_loading: Some(status),
+            console_entries: Vec::new(),
+            profiling: None,
+        };
+        (self.state_callback)(&update);
+    }
+
     pub(crate) fn build_state_update(&mut self, _sim_frame_time: Duration) -> StateUpdate {
         // FPS = render thread's actual iteration rate, EMA-smoothed.
         // The previous formula was `1 / sim_cpu_work_time`, which
@@ -533,6 +586,10 @@ impl EngineState {
                 }
             },
             procedural: procedural_update,
+            // Project-load progress is pushed via mid-handler snapshots
+            // from `publish_phase`; the regular per-tick update doesn't
+            // touch it.
+            project_loading: None,
             console_entries: self.console.drain_new(),
             // Pull the most recent sample whose render-thread data
             // has been stitched in. Render publishes 1-2 frames
